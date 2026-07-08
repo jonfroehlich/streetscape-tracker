@@ -20,6 +20,10 @@ python streetscape_tracker.py "Seattle, WA" --provider mapillary   # restrict to
 python streetscape_tracker.py "Seattle, WA" --force --run-date 2026-07-02
 python streetscape_tracker.py "Seattle, WA" --check-boundary   # preview search area only
 
+# Worldwide sampling frame (stratified ~50-80 cities; see docs/worldwide_sampling.md)
+python scripts/build_worldwide_frame.py            # regenerate frame from data_sources/
+python scripts/register_frame.py --dry-run         # then register + boundary-vet before enabling
+
 # Batch + scheduler
 python run_cities.py cities.txt --continue-on-error
 python -m streetscape_metadata_tracker.scheduler status
@@ -82,3 +86,4 @@ Credentials in `.env`, loaded by `streetscape_metadata_tracker/config.py` per pr
 - Legacy pre-2026 data files are undated; they're registered as `is_baseline=1` runs by the migration script and are never renamed (published URLs stay stable).
 - The sync-vs-async duplicate download path was removed in v2 (`download.py`, `gsv_tracker_single.py`); v1.0.0 tag preserves the old architecture.
 - Logs go to `logs/`, never `data/` (data/ is synced to a public web server).
+- The **worldwide frame** (`docs/worldwide_sampling.md`) is a stratified curated set (~56 cities: `continent × size-band × GSV-coverage-regime`) built deterministically from vendored GeoNames data (CC BY 4.0) in `data_sources/`. `scripts/build_worldwide_frame.py` emits `cities_worldwide.txt` + `worldwide_frame.csv`; GeoNames population is used only for large/small binning, never as a reported variable. `data_sources/` is not rsynced and not git-ignored (unlike `data/`).

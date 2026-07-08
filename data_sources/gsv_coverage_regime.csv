@@ -1,0 +1,19 @@
+# GSV coverage regime per country (hand-maintained; edit as coverage changes).
+#
+# Drives the worldwide sampling frame (scripts/build_worldwide_frame.py):
+#  - "absent"/"sparse" countries are force-included so the cross-provider
+#    (GSV-vs-Mapillary) coverage gap is represented in the frame.
+#  - every selected city is tagged with its country's regime in the manifest.
+#
+# regime is one of: present | sparse | absent
+#  - present : normal official Google Street View car coverage (the default for
+#              any iso2 not listed here).
+#  - sparse  : official coverage exists but is limited, dated, and/or heavily
+#              blurred.
+#  - absent  : effectively no official Street View car coverage.
+#
+# Columns: iso2,regime,note
+iso2,regime,note
+CN,absent,No official Street View car coverage (only scattered user photo spheres)
+DE,sparse,Limited/dated coverage; ~20 cities imaged c.2008 with many buildings blurred
+AT,sparse,Street View was restricted until 2017; coverage remains partial

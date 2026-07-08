@@ -1,0 +1,57 @@
+query_string,city,admin,iso2,country,continent,size_band,population,coverage_regime,geonameid,lat,lon
+"Kinshasa, Democratic Republic of the Congo",Kinshasa,Kinshasa,CD,Democratic Republic of the Congo,Africa,large,16000000,present,2314302,-4.32758,15.31357
+"Kambove, Haut-Katanga, Democratic Republic of the Congo",Kambove,Haut-Katanga,CD,Democratic Republic of the Congo,Africa,small,99884,present,923058,-10.87352,26.59746
+"Abidjan, Abidjan Autonomous District, Ivory Coast",Abidjan,Abidjan Autonomous District,CI,Ivory Coast,Africa,large,6321017,present,2293538,5.35444,-4.00167
+"Daoukro, Lacs District, Ivory Coast",Daoukro,Lacs District,CI,Ivory Coast,Africa,small,101136,present,2290412,7.0591,-3.9631
+"Cairo, Egypt",Cairo,Cairo,EG,Egypt,Africa,large,9606916,present,360630,30.06263,31.24967
+"Al Jammaliyah, Dakahlia, Egypt",Al Jammaliyah,Dakahlia,EG,Egypt,Africa,small,99641,present,361029,31.18065,31.86497
+"Lagos, Nigeria",Lagos,Lagos,NG,Nigeria,Africa,large,15388000,present,2332459,6.45407,3.39467
+"Kontagora, Niger State, Nigeria",Kontagora,Niger State,NG,Nigeria,Africa,small,98754,present,2334008,10.40319,5.4708
+"Johannesburg, Gauteng, South Africa",Johannesburg,Gauteng,ZA,South Africa,Africa,large,9418183,present,993800,-26.20227,28.04363
+"Ermelo, Mpumalanga, South Africa",Ermelo,Mpumalanga,ZA,South Africa,Africa,small,100324,present,1005125,-26.53333,29.98333
+"Shanghai, China",Shanghai,Shanghai,CN,China,Asia,large,24874500,absent,1796236,31.22222,121.45806
+"Kangding, Sichuan, China",Kangding,Sichuan,CN,China,Asia,small,100000,absent,1802171,30.00222,101.9569
+"Mumbai, Maharashtra, India",Mumbai,Maharashtra,IN,India,Asia,large,12691836,present,1275339,19.07283,72.88261
+"Luckeesarai, Bihar, India",Luckeesarai,Bihar,IN,India,Asia,small,99979,present,1264735,25.1765,86.0947
+"Lahore, Punjab, Pakistan",Lahore,Punjab,PK,Pakistan,Asia,large,13004135,present,1172451,31.558,74.35071
+"Renala Khurd, Punjab, Pakistan",Renala Khurd,Punjab,PK,Pakistan,Asia,small,100054,present,1166933,30.87878,73.59857
+"Istanbul, Turkey",Istanbul,Istanbul,TR,Turkey,Asia,large,15701602,present,745044,41.01384,28.94966
+"Manavgat, Antalya, Turkey",Manavgat,Antalya,TR,Turkey,Asia,small,99254,present,304854,36.78672,31.44086
+"Ho Chi Minh City, Ho Chi Minh City (HCMC), Vietnam",Ho Chi Minh City,Ho Chi Minh City (HCMC),VN,Vietnam,Asia,large,14002598,present,1566083,10.82302,106.62965
+"Ha Tien, An Giang, Vietnam",Ha Tien,An Giang,VN,Vietnam,Asia,small,100560,present,1581052,10.3831,104.48753
+"Vienna, State of Vienna, Austria",Vienna,State of Vienna,AT,Austria,Europe,large,1691468,sparse,2761369,48.20849,16.37208
+"Klagenfurt am Woerthersee, Carinthia, Austria",Klagenfurt am Woerthersee,Carinthia,AT,Austria,Europe,small,100316,sparse,2774326,46.62472,14.30528
+"Berlin, State of Berlin, Germany",Berlin,State of Berlin,DE,Germany,Europe,large,3426354,sparse,2950159,52.52437,13.41053
+"Trier, Rheinland-Pfalz, Germany",Trier,Rheinland-Pfalz,DE,Germany,Europe,small,100129,sparse,2821164,49.75565,6.63935
+"Madrid, Spain",Madrid,Madrid,ES,Spain,Europe,large,3255944,present,3117735,40.4165,-3.70256
+"Girona, Catalonia, Spain",Girona,Catalonia,ES,Spain,Europe,small,100266,present,3121456,41.98311,2.82493
+"London, England, United Kingdom",London,England,GB,United Kingdom,Europe,large,8961989,present,2643743,51.50853,-0.12574
+"Bath, England, United Kingdom",Bath,England,GB,United Kingdom,Europe,small,101557,present,2656173,51.3751,-2.36172
+"Moscow, Russia",Moscow,Moscow,RU,Russia,Europe,large,10381222,present,524901,55.75204,37.61781
+"Ust'-Ilimsk, Irkutsk Oblast, Russia",Ust'-Ilimsk,Irkutsk Oblast,RU,Russia,Europe,small,100271,present,2013952,58.00056,102.66194
+"Kyiv, Kyiv City, Ukraine",Kyiv,Kyiv City,UA,Ukraine,Europe,large,2952301,present,703448,50.45466,30.5238
+"Oleksandrivskyi, Donetsk, Ukraine",Oleksandrivskyi,Donetsk,UA,Ukraine,Europe,small,100330,present,13561149,47.96788,37.80335
+"Toronto, Ontario, Canada",Toronto,Ontario,CA,Canada,North America,large,2794356,present,6167865,43.70643,-79.39864
+"Red Deer, Alberta, Canada",Red Deer,Alberta,CA,Canada,North America,small,100844,present,6118158,52.26682,-113.802
+"Havana, Cuba",Havana,Havana,CU,Cuba,North America,large,2163824,present,3553478,23.13302,-82.38304
+"Cardenas, Matanzas Province, Cuba",Cardenas,Matanzas Province,CU,Cuba,North America,small,98515,present,3565432,23.03632,-81.20602
+"Santo Domingo, Nacional, Dominican Republic",Santo Domingo,Nacional,DO,Dominican Republic,North America,large,2201941,present,3492908,18.47186,-69.89232
+"Punta Cana, La Altagracia Province, Dominican Republic",Punta Cana,La Altagracia Province,DO,Dominican Republic,North America,small,100023,present,3494242,18.58182,-68.40431
+"Mexico City, Mexico",Mexico City,Mexico City,MX,Mexico,North America,large,12294193,present,3530597,19.42847,-99.12766
+"Rosarito, Baja California, Mexico",Rosarito,Baja California,MX,Mexico,North America,small,100660,present,3988392,32.36044,-117.04645
+"New York City, New York, United States",New York City,New York,US,United States,North America,large,8804190,present,5128581,40.71427,-74.00597
+"Roanoke, Virginia, United States",Roanoke,Virginia,US,United States,North America,small,100011,present,4782167,37.27097,-79.94143
+"Sydney, New South Wales, Australia",Sydney,New South Wales,AU,Australia,Oceania,large,5638830,present,2147714,-33.86785,151.20732
+"Bendigo, Victoria, Australia",Bendigo,Victoria,AU,Australia,Oceania,small,103034,present,2176187,-36.75818,144.28024
+"Auckland, New Zealand",Auckland,Auckland,NZ,New Zealand,Oceania,large,1547200,present,2193733,-36.84853,174.76349
+"Palmerston North, Manawatu-Wanganui, New Zealand",Palmerston North,Manawatu-Wanganui,NZ,New Zealand,Oceania,small,90500,present,2185018,-40.35636,175.61113
+"Sao Paulo, Brazil",Sao Paulo,Sao Paulo,BR,Brazil,South America,large,12400232,present,3448439,-23.5475,-46.63611
+"Campo Mourao, Parana, Brazil",Campo Mourao,Parana,BR,Brazil,South America,small,99432,present,3467717,-24.04309,-52.37929
+"Santiago, Santiago Metropolitan, Chile",Santiago,Santiago Metropolitan,CL,Chile,South America,large,4837295,present,3871336,-33.45694,-70.64827
+"Curico, Maule Region, Chile",Curico,Maule Region,CL,Chile,South America,small,102438,present,3892870,-34.98279,-71.23943
+"Bogota, Bogota D.C., Colombia",Bogota,Bogota D.C.,CO,Colombia,South America,large,7674366,present,3688689,4.60971,-74.08175
+"Santander de Quilichao, Cauca Department, Colombia",Santander de Quilichao,Cauca Department,CO,Colombia,South America,small,99354,present,3668572,3.00945,-76.48494
+"Lima, Lima Province, Peru",Lima,Lima Province,PE,Peru,South America,large,7737002,present,3936456,-12.04318,-77.02824
+"Talara, Piura, Peru",Talara,Piura,PE,Peru,South America,small,99074,present,3691582,-4.57722,-81.27194
+"Caracas, Distrito Federal, Venezuela",Caracas,Distrito Federal,VE,Venezuela,South America,large,3000000,present,3646738,10.48801,-66.87919
+"Tucupita, Delta Amacuro, Venezuela",Tucupita,Delta Amacuro,VE,Venezuela,South America,small,99778,present,3625929,9.06263,-62.05208
