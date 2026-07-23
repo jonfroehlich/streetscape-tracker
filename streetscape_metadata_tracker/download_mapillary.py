@@ -51,7 +51,7 @@ import pandas as pd
 from tqdm import tqdm
 
 from .analysis import FLAT_ONLY
-from .config import METADATA_DTYPES
+from .config import MAPILLARY_METADATA_DTYPES
 from .download_common import DownloadError, generate_grid_points, redact_credentials
 from .fileutils import load_city_csv_file
 
@@ -178,12 +178,14 @@ def decode_image_features(
     Extract image records from one raw vector tile.
 
     Returns dicts with: id (str), lon, lat, captured_at_ms (int or None),
-    creator_id, is_pano (bool). Both 360-degree panos and flat/perspective
-    images are returned, tagged by is_pano — the caller keeps every pano as a
-    census row (issue #89) but collapses flat-only grid points to a single
-    FLAT_ONLY marker (issue #116). Dropping flats here (as the original #89
-    scope did) is what made a flat-covered point indistinguishable from
-    ZERO_RESULTS.
+    creator_id, is_pano (bool), plus the free per-image extras Mapillary
+    publishes on the z14 image layer — organization_id, quality_score, on_foot
+    (tile prop `foot`), compass_angle, sequence_id (see MAPILLARY_EXTRA_DTYPES).
+    Both 360-degree panos and flat/perspective images are returned, tagged by
+    is_pano — the caller keeps every pano as a census row (issue #89) but
+    collapses flat-only grid points to a single FLAT_ONLY marker (issue #116).
+    Dropping flats here (as the original #89 scope did) is what made a
+    flat-covered point indistinguishable from ZERO_RESULTS.
     """
     decoded = mapbox_vector_tile.decode(tile_bytes)
     layer = decoded.get(IMAGE_LAYER)
@@ -207,6 +209,7 @@ def decode_image_features(
         if image_id is None:
             continue
         captured_at = props.get("captured_at")
+        organization_id = props.get("organization_id")
         records.append(
             {
                 "id": str(image_id),
@@ -215,6 +218,15 @@ def decode_image_features(
                 "captured_at_ms": captured_at,
                 "creator_id": props.get("creator_id"),
                 "is_pano": bool(props.get("is_pano")),
+                # Free per-image extras from the same tile (large int ids kept
+                # as strings; `foot` is Mapillary's on_foot flag). None when a
+                # tile omits the field (e.g. organization_id on individual
+                # contributor imagery).
+                "organization_id": (None if organization_id is None else str(organization_id)),
+                "quality_score": props.get("quality_score"),
+                "on_foot": props.get("foot"),
+                "compass_angle": props.get("compass_angle"),
+                "sequence_id": props.get("sequence_id"),
             }
         )
     return records
@@ -425,6 +437,15 @@ async def download_mapillary_metadata_async(
             "capture_date": capture_date,
             "copyright_info": copyright_info,
             "status": status,
+            # Mapillary-only extras (free from the tile). creator_id is also a
+            # clean structured column here, not only embedded in copyright_info.
+            "creator_id": (None if creator is None else str(creator)),
+            "organization_id": img["organization_id"],
+            "sequence_id": img["sequence_id"],
+            "is_pano": img["is_pano"],
+            "on_foot": img["on_foot"],
+            "quality_score": img["quality_score"],
+            "compass_angle": img["compass_angle"],
         }
 
     rows = []
@@ -474,10 +495,18 @@ async def download_mapillary_metadata_async(
                     "capture_date": None,
                     "copyright_info": None,
                     "status": "ZERO_RESULTS",
+                    # No image at this point → all Mapillary extras null.
+                    "creator_id": None,
+                    "organization_id": None,
+                    "sequence_id": None,
+                    "is_pano": None,
+                    "on_foot": None,
+                    "quality_score": None,
+                    "compass_angle": None,
                 }
             )
 
-    df = pd.DataFrame(rows, columns=list(METADATA_DTYPES.keys()))
+    df = pd.DataFrame(rows, columns=list(MAPILLARY_METADATA_DTYPES.keys()))
     csv_bytes = df.to_csv(index=False).encode("utf-8")
     with gzip.open(output_csv_gz_path, "wb") as f:
         f.write(csv_bytes)

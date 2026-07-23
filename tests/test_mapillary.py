@@ -17,8 +17,9 @@ import pandas as pd
 import pytest
 
 from streetscape_metadata_tracker import download_mapillary as dm
-from streetscape_metadata_tracker.config import METADATA_DTYPES
+from streetscape_metadata_tracker.config import MAPILLARY_METADATA_DTYPES
 from streetscape_metadata_tracker.download_common import generate_grid_points
+from streetscape_metadata_tracker.json_summarizer import compute_mapillary_meta
 
 SEATTLE = (47.6062, -122.3321)
 
@@ -133,8 +134,21 @@ def encode_tile(features, tile_x, tile_y, zoom=14, extent=4096):
     return mapbox_vector_tile.encode([{"name": dm.IMAGE_LAYER, "features": encoded_features}])
 
 
-def make_image(image_id, lon, lat, *, is_pano=True, captured_at=1650000000000, creator_id=42):
-    return {
+def make_image(
+    image_id,
+    lon,
+    lat,
+    *,
+    is_pano=True,
+    captured_at=1650000000000,
+    creator_id=42,
+    organization_id=None,
+    quality_score=None,
+    on_foot=None,
+    compass_angle=None,
+    sequence_id=None,
+):
+    img = {
         "id": image_id,
         "lon": lon,
         "lat": lat,
@@ -142,6 +156,18 @@ def make_image(image_id, lon, lat, *, is_pano=True, captured_at=1650000000000, c
         "captured_at": captured_at,
         "creator_id": creator_id,
     }
+    # Optional free tile extras. Real tiles OMIT a property when absent (e.g.
+    # organization_id on individual-contributor imagery), so only include a
+    # key when provided — and use the tile's own name `foot` for on_foot.
+    optional = {
+        "organization_id": organization_id,
+        "quality_score": quality_score,
+        "foot": on_foot,
+        "compass_angle": compass_angle,
+        "sequence_id": sequence_id,
+    }
+    img.update({k: v for k, v in optional.items() if v is not None})
+    return img
 
 
 # ── Decoding ───────────────────────────────────────────────────────────────
@@ -345,8 +371,8 @@ def test_download_end_to_end(monkeypatch, tmp_path, straddling_city):
     result, served = _run_download(monkeypatch, tmp_path, tiles_by_xy, lat, lon)
     df = result["df"]
 
-    # Contract: exact 9-column schema, every tile fetched exactly once
-    assert list(df.columns) == list(METADATA_DTYPES.keys())
+    # Contract: exact Mapillary schema (core + extras), every tile fetched once
+    assert list(df.columns) == list(MAPILLARY_METADATA_DTYPES.keys())
     assert sorted(served) == sorted(expected_tiles)
     assert result["api_requests"] == len(expected_tiles)
 
@@ -384,7 +410,7 @@ def test_download_end_to_end(monkeypatch, tmp_path, straddling_city):
     # File on disk parses through the shared loader path (result already did,
     # but verify the write is a real gzip csv)
     with gzip.open(result["filename_with_path"], "rt") as f:
-        assert f.readline().strip() == ",".join(METADATA_DTYPES.keys())
+        assert f.readline().strip() == ",".join(MAPILLARY_METADATA_DTYPES.keys())
 
     # Timestamps are ISO UTC and ordered
     started = datetime.fromisoformat(result["started_at"])
@@ -531,3 +557,156 @@ def test_assign_to_grid_matches_geodesic_grid_far_corner_mid_latitude():
     )
     assert (int(i[0]), int(j[0])) == (120, 120)
     assert bool(in_grid[0])
+
+
+# ── Free tile extras (capture all free Mapillary metadata) ──────────────────
+
+
+def test_decode_extracts_free_tile_extras():
+    # The z14 image layer carries organization_id/quality_score/foot/
+    # compass_angle/sequence_id per image — all pulled for zero extra requests.
+    lat, lon = SEATTLE
+    fx, fy = dm.lonlat_to_tile_frac(lon, lat, 14)
+    x, y = int(fx), int(fy)
+    tile = encode_tile(
+        [
+            make_image(
+                1,
+                lon,
+                lat,
+                organization_id=518073312556755,
+                quality_score=0.904,
+                on_foot=True,
+                compass_angle=337.1,
+                sequence_id="seqA",
+            ),
+            make_image(2, lon + 1e-4, lat),  # individual contributor: no extras
+        ],
+        x,
+        y,
+    )
+    by_id = {r["id"]: r for r in dm.decode_image_features(tile, x, y)}
+    rich = by_id["1"]
+    assert rich["organization_id"] == "518073312556755"  # large int coerced to str
+    assert rich["quality_score"] == pytest.approx(0.904)
+    assert rich["on_foot"] is True
+    assert rich["compass_angle"] == pytest.approx(337.1)
+    assert rich["sequence_id"] == "seqA"
+    # Omitted tile properties decode to None (not an error, not a default).
+    bare = by_id["2"]
+    assert bare["organization_id"] is None
+    assert bare["quality_score"] is None
+    assert bare["on_foot"] is None
+    assert bare["compass_angle"] is None
+    assert bare["sequence_id"] is None
+
+
+def test_extra_metadata_round_trips_to_csv(monkeypatch, tmp_path):
+    # A pano carries its extras onto its row; a flat-only point carries the
+    # representative flat's extras (is_pano False); an empty point nulls them.
+    lat, lon = SEATTLE
+    step = 20
+    expected_tiles = dm.tiles_for_bbox(*dm.grid_bbox(lat, lon, 100, 100, step))
+    east_lon = lon + 20 / (dm._M_PER_DEG_LAT * math.cos(math.radians(lat)))
+    pano = make_image(
+        201,
+        lon,
+        lat,
+        organization_id=999,
+        quality_score=0.8,
+        on_foot=True,
+        compass_angle=90.0,
+        sequence_id="drive1",
+    )
+    flat = make_image(
+        202,
+        east_lon,
+        lat,
+        is_pano=False,
+        quality_score=0.3,
+        on_foot=False,
+        sequence_id="drive2",
+    )
+
+    def features_for(x, y):
+        min_lon, min_lat = dm.tile_frac_to_lonlat(x, y + 1, 14)
+        max_lon, max_lat = dm.tile_frac_to_lonlat(x + 1, y, 14)
+        own = [
+            f for f in (flat,) if min_lon <= f["lon"] < max_lon and min_lat <= f["lat"] < max_lat
+        ]
+        return own + [pano]  # pano duplicated into every tile
+
+    tiles_by_xy = {(x, y): encode_tile(features_for(x, y), x, y) for (x, y) in expected_tiles}
+    result, _ = _run_download(monkeypatch, tmp_path, tiles_by_xy, lat, lon)
+    df = result["df"]
+
+    prow = df[df["pano_id"] == "201"].iloc[0]
+    assert prow["organization_id"] == "999"
+    assert prow["quality_score"] == pytest.approx(0.8)
+    assert prow["on_foot"] == True  # noqa: E712  (nullable boolean)
+    assert prow["is_pano"] == True  # noqa: E712
+    assert prow["compass_angle"] == pytest.approx(90.0)
+    assert prow["sequence_id"] == "drive1"
+    assert prow["creator_id"] == "42"  # clean structured column, not only in copyright
+
+    frow = df[df["status"] == dm.FLAT_ONLY].iloc[0]
+    assert frow["is_pano"] == False  # noqa: E712
+    assert frow["quality_score"] == pytest.approx(0.3)
+    assert pd.isna(frow["organization_id"])  # flat had no org
+
+    zrow = df[df["status"] == "ZERO_RESULTS"].iloc[0]
+    for col in (
+        "creator_id",
+        "organization_id",
+        "sequence_id",
+        "is_pano",
+        "on_foot",
+        "quality_score",
+        "compass_angle",
+    ):
+        assert pd.isna(zrow[col])
+
+
+def test_compute_mapillary_meta_summary():
+    cols = list(MAPILLARY_METADATA_DTYPES.keys())
+
+    def row(status, org, foot, q, is_pano=True):
+        d = dict.fromkeys(cols)
+        d.update(
+            query_lat=0.0,
+            query_lon=0.0,
+            query_timestamp="2026-07-23T00:00:00+00:00",
+            status=status,
+            organization_id=org,
+            on_foot=foot,
+            quality_score=q,
+            is_pano=is_pano,
+        )
+        return d
+
+    rows = [
+        row("OK", "111", True, 0.9),
+        row("OK", "111", False, 0.7),
+        row("NO_DATE", None, True, 0.5),
+        row("OK", "222", None, None),
+        row("ZERO_RESULTS", None, None, None, is_pano=None),  # excluded (no image)
+        row("FLAT_ONLY", "333", False, 0.2, is_pano=False),  # excluded (not a pano)
+    ]
+    df = pd.DataFrame(rows, columns=cols).astype(MAPILLARY_METADATA_DTYPES)
+    meta = compute_mapillary_meta(df)
+    assert meta["n_images"] == 4  # 3 OK + 1 NO_DATE
+    assert meta["n_distinct_orgs"] == 2  # 111, 222
+    assert meta["pct_with_org"] == 75.0  # 3 of 4 panos attributed to an org
+    assert meta["pct_on_foot"] == pytest.approx(66.7)  # 2 True of 3 known
+    assert meta["median_quality_score"] == pytest.approx(0.7)  # median of [0.9,0.7,0.5]
+
+
+def test_compute_mapillary_meta_none_for_legacy_schema():
+    # A pre-enrichment Mapillary file (core columns only) yields no block.
+    from streetscape_metadata_tracker.config import METADATA_DTYPES
+
+    df = pd.DataFrame(
+        [dict.fromkeys(METADATA_DTYPES, None) | {"status": "OK"}],
+        columns=list(METADATA_DTYPES.keys()),
+    )
+    assert compute_mapillary_meta(df) is None

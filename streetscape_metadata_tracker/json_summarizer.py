@@ -231,6 +231,55 @@ def merge_capture_date_histograms(cities_data: list[dict]) -> dict[str, dict[int
     return {key: dict(sorted(value.items())) for key, value in merged.items()}
 
 
+def compute_mapillary_meta(df: pd.DataFrame) -> dict[str, Any] | None:
+    """
+    Lightweight summary of the free per-image Mapillary metadata (issue: capture
+    all free tile metadata), for ranking candidate cities at a glance without
+    re-parsing the CSV.
+
+    Computed over the 360-degree pano census (rows with status OK or NO_DATE) —
+    the subset relevant to Project Sidewalk viability:
+        n_images            pano rows
+        n_distinct_orgs     distinct non-null organization_id (systematic
+                            city-wide programs: municipal fleets, scooter sweeps)
+        pct_with_org        % of panos attributed to an organization
+        pct_on_foot         % of panos captured on foot (vs vehicle)
+        median_quality_score median Mapillary quality_score (0-1)
+
+    Returns None for a legacy Mapillary file that predates the enriched schema
+    (the extra columns are absent) or a run with no pano rows, so callers can
+    simply omit the block.
+    """
+    if "organization_id" not in df.columns:
+        return None
+    panos = df[df["status"].isin(("OK", "NO_DATE"))]
+    n = int(len(panos))
+    if n == 0:
+        return None
+
+    org = panos["organization_id"]
+    on_foot = panos["on_foot"]
+    quality = panos["quality_score"]
+
+    n_with_org = int(org.notna().sum())
+    n_foot_known = int(on_foot.notna().sum())
+    median_quality = quality.median()  # skips NA; NA if all missing
+
+    return {
+        "n_images": n,
+        "n_distinct_orgs": int(org.nunique(dropna=True)),
+        "pct_with_org": round(100.0 * n_with_org / n, 1),
+        "pct_on_foot": (
+            round(100.0 * int((on_foot == True).sum()) / n_foot_known, 1)  # noqa: E712
+            if n_foot_known
+            else None
+        ),
+        "median_quality_score": (
+            None if pd.isna(median_quality) else round(float(median_quality), 3)
+        ),
+    }
+
+
 def generate_city_metadata_summary_as_json(
     csv_gz_path: str,
     df: pd.DataFrame,
@@ -407,6 +456,10 @@ def generate_city_metadata_summary_as_json(
             "histogram_of_capture_dates_by_year": asdict(google_pano_stats.yearly_distribution),
             "histogram_of_capture_dates": asdict(google_pano_stats.daily_distribution),
         }
+    if provider == "mapillary":
+        mapillary_meta = compute_mapillary_meta(df)
+        if mapillary_meta is not None:
+            metadata["mapillary_meta"] = mapillary_meta
 
     # Save compressed JSON (atomic; sanitized — NaN is not valid JSON)
     _write_json_gz_atomic(json_filename_with_path, metadata)

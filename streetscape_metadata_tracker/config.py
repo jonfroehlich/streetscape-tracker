@@ -8,7 +8,10 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-# Standard metadata schema for GSV download files
+# Standard metadata schema — the shared core written by BOTH providers.
+# GSV's documented metadata endpoint returns only copyright/date/location/
+# pano_id/status (audited: nothing else free to capture), so this 9-column
+# core is GSV-complete. Mapillary carries a superset (see below).
 METADATA_DTYPES = {
     "query_lat": np.float64,
     "query_lon": np.float64,
@@ -20,6 +23,34 @@ METADATA_DTYPES = {
     "copyright_info": pd.StringDtype(),  # nullable string
     "status": str,  # status is never null
 }
+
+# Mapillary-only columns appended after the core (issue: capture all free tile
+# metadata). Every one of these comes, for zero extra requests, from the z14
+# `image` layer the tile downloader already fetches — Mapillary publishes far
+# more per-image metadata than GSV's metadata endpoint exposes. Kept OUT of the
+# shared METADATA_DTYPES (like the history harvester's HISTORY_DTYPES) so the
+# GSV path and files are untouched. Readers coerce these via
+# MAPILLARY_METADATA_DTYPES below; pandas ignores dtype keys absent from a file,
+# so GSV runs and pre-change Mapillary files load unchanged.
+#   - organization_id: identifies systematic city-wide capture programs
+#     (municipal fleets, ridesharing scooter sweeps); null == individual.
+#   - on_foot: pedestrian vs vehicle capture (tile field is named `foot`).
+#   - quality_score: 0-1, for screening blurry sequences.
+#   - compass_angle: capture bearing (for a future bearing check).
+#   - sequence_id: groups images into one capture drive.
+#   - creator_id: contributor id, also embedded in copyright_info for parity.
+MAPILLARY_EXTRA_DTYPES = {
+    "creator_id": pd.StringDtype(),  # nullable string (large int id kept as string)
+    "organization_id": pd.StringDtype(),  # nullable string; null for individual contributors
+    "sequence_id": pd.StringDtype(),  # nullable string
+    "is_pano": pd.BooleanDtype(),  # nullable bool (null on ZERO_RESULTS rows)
+    "on_foot": pd.BooleanDtype(),  # nullable bool (tile prop `foot`)
+    "quality_score": pd.Float64Dtype(),  # nullable float, 0-1
+    "compass_angle": pd.Float64Dtype(),  # nullable float, degrees
+}
+
+# The full Mapillary run schema: shared core + Mapillary extras.
+MAPILLARY_METADATA_DTYPES = {**METADATA_DTYPES, **MAPILLARY_EXTRA_DTYPES}
 
 
 def warn_if_credentials_world_readable(env_path: str) -> bool:

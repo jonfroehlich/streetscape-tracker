@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from .config import METADATA_DTYPES
+from .config import MAPILLARY_METADATA_DTYPES
 from .paths import get_default_data_dir
 
 logger = logging.getLogger(__name__)
@@ -59,10 +59,14 @@ def load_city_csv_file(csv_path: str) -> pd.DataFrame:
     try:
         logger.debug(f"Reading CSV file with compression: {compression}")
 
-        # Read CSV with query_timestamp as object type first
+        # Read CSV with query_timestamp as object type first. Use the full
+        # Mapillary schema (core + Mapillary extras): pandas silently ignores
+        # dtype keys for columns a file doesn't have, so GSV runs and legacy
+        # Mapillary files (which lack the extra columns) load unchanged, while
+        # enriched Mapillary runs get their extras coerced to the right dtypes.
         df = pd.read_csv(
             csv_path,
-            dtype=METADATA_DTYPES,
+            dtype=MAPILLARY_METADATA_DTYPES,
             compression=compression,
         )
 
