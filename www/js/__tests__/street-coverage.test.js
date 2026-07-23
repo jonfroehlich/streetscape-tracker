@@ -18,6 +18,9 @@ const {
   streetTypeColor,
   streetTypeOrder,
   withStreetAlpha,
+  fractionColor,
+  normalizeStreetArtifact,
+  lookupStreetwalk,
   STREET_UNCOVERED_COLOR,
   STREET_COVERED_COLOR,
   STREET_COVERED_NODATE_COLOR,
@@ -108,4 +111,89 @@ test("styleForMode: dispatches to the right per-mode styler", () => {
 
 test("withStreetAlpha: hex to rgba() with the given alpha", () => {
   assert.equal(withStreetAlpha("#2fb974", 0.22), "rgba(47, 185, 116, 0.22)");
+});
+
+// ── Fractional coverage (road-walk / streetwalk artifact, #99/#155) ──────────
+
+test("fractionColor: 0 is the pale end, 1 is the full covered green, monotonic between", () => {
+  // Endpoints are the ramp anchors exactly.
+  assert.equal(fractionColor(0), "rgb(191, 232, 212)"); // STREET_PARTIAL_LOW_COLOR #bfe8d4
+  assert.equal(fractionColor(1), "rgb(47, 185, 116)"); // STREET_COVERED_COLOR #2fb974
+  // Green channel decreases as fraction rises (232 → 185): a simple monotonicity check.
+  const g = (c) => Number(c.match(/rgb\(\d+, (\d+),/)[1]);
+  assert.ok(g(fractionColor(0)) > g(fractionColor(0.5)));
+  assert.ok(g(fractionColor(0.5)) > g(fractionColor(1)));
+  // Out-of-range clamps rather than extrapolating.
+  assert.equal(fractionColor(-1), fractionColor(0));
+  assert.equal(fractionColor(2), fractionColor(1));
+});
+
+test("styleStreetByCoverage: fractional artifact graduates covered edges by coverage_fraction", () => {
+  const partial = styleStreetByCoverage({ properties: { covered: true, coverage_fraction: 0.5 } });
+  assert.equal(partial.color, fractionColor(0.5));
+  const full = styleStreetByCoverage({ properties: { covered: true, coverage_fraction: 1 } });
+  assert.equal(full.color, fractionColor(1)); // fraction 1 == the covered green (as rgb())
+  // Uncovered is still slate + dashed regardless of the fractional signal.
+  const none = styleStreetByCoverage({ properties: { covered: false, coverage_fraction: 0 } });
+  assert.equal(none.color, STREET_UNCOVERED_COLOR);
+  assert.equal(none.dashArray, "4 4");
+  // A grid feature (no coverage_fraction) keeps the binary green.
+  assert.equal(
+    styleStreetByCoverage({ properties: { covered: true } }).color,
+    STREET_COVERED_COLOR
+  );
+});
+
+test("normalizeStreetArtifact: streetwalk aliases age + totals keys and flags fractional", () => {
+  const fc = {
+    properties: {
+      metadata: {
+        totals: { edges: 41, edges_any_coverage: 40, uncovered_pct_by_length: 4.4 },
+        coverage_by_highway: {},
+      },
+    },
+    features: [
+      { properties: { covered: true, coverage_fraction: 0.8, median_covered_age_years: 2.5 } },
+      { properties: { covered: false, coverage_fraction: 0 } },
+    ],
+  };
+  const { meta, hasFractional } = normalizeStreetArtifact(fc, "streetwalk");
+  assert.equal(hasFractional, true);
+  // Age alias so the styler's `nearest_pano_age_years` path works.
+  assert.equal(fc.features[0].properties.nearest_pano_age_years, 2.5);
+  // Totals aliases for the panel headline.
+  assert.equal(meta.totals.segments, 41);
+  assert.equal(meta.totals.covered, 40);
+});
+
+test("normalizeStreetArtifact: grid artifact is untouched and not flagged fractional", () => {
+  const fc = {
+    properties: { metadata: { totals: { segments: 10, covered: 7 }, coverage_by_highway: {} } },
+    features: [{ properties: { covered: true, nearest_pano_age_years: 1.0 } }],
+  };
+  const { meta, hasFractional } = normalizeStreetArtifact(fc, "grid");
+  assert.equal(hasFractional, false);
+  assert.equal(fc.features[0].properties.nearest_pano_age_years, 1.0);
+  assert.equal(meta.totals.segments, 10);
+  assert.equal(meta.totals.covered, 7);
+});
+
+test("lookupStreetwalk: finds by city_id+provider, null on miss or absent manifest", () => {
+  const manifest = {
+    walks: [
+      { city_id: "seattle--wa", provider: "gsv", coverage_filename: "seattle_gsv.json.gz" },
+      { city_id: "seattle--wa", provider: "mapillary", coverage_filename: "seattle_mly.json.gz" },
+    ],
+  };
+  assert.equal(
+    lookupStreetwalk(manifest, "seattle--wa", "gsv").coverage_filename,
+    "seattle_gsv.json.gz"
+  );
+  assert.equal(
+    lookupStreetwalk(manifest, "seattle--wa", "mapillary").coverage_filename,
+    "seattle_mly.json.gz"
+  );
+  assert.equal(lookupStreetwalk(manifest, "portland--or", "gsv"), null);
+  assert.equal(lookupStreetwalk(null, "seattle--wa", "gsv"), null);
+  assert.equal(lookupStreetwalk({}, "seattle--wa", "gsv"), null);
 });

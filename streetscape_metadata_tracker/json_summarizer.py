@@ -732,3 +732,65 @@ def generate_aggregate_v2(conn, data_dir: str) -> dict[str, Any]:
     logger.info(f"Wrote v3 aggregate for {len(cities_out)} cities to {output_path}")
 
     return summary
+
+
+def generate_streetwalk_manifest(conn, data_dir: str) -> dict[str, Any]:
+    """
+    Build and write ``streetwalks.json.gz`` — a small sidecar index of the
+    latest road-walk street-coverage artifact per (city, provider), from the
+    ``street_walks`` catalog table (issue #155).
+
+    The city page needs this because the streetwalk coverage GeoJSON is NOT a
+    sibling of the grid run file (its ``sp{N}`` spacing is a free parameter and
+    its run-date differs from the grid run's), so the frontend cannot derive the
+    artifact URL the way it derives ``_streets.json.gz``. The manifest maps
+    (city_id, provider) → the exact ``coverage_filename`` plus headline stats.
+
+    Kept deliberately separate from the aggregate ``cities.json.gz`` (schema v3):
+    the aggregate contract stays untouched, and #102 later folds these stats in
+    properly. Published automatically by the ``*.json.gz`` publish glob.
+
+    Empty catalog → ``walks: []`` (the file is still written so the frontend
+    fetch succeeds and simply renders no streetwalk overlays).
+
+    Args:
+        conn: open catalog connection (db.connect).
+        data_dir: directory the manifest is written to (alongside cities.json.gz).
+
+    Returns:
+        The manifest dict.
+    """
+    from . import db  # local import to keep module import order simple
+
+    walks = []
+    for row in db.get_latest_street_walks_all(conn):
+        pct = row["coverage_pct_by_length"]
+        walks.append(
+            {
+                "city_id": row["city_id"],
+                "provider": row["provider"],
+                "coverage_filename": row["coverage_filename"],
+                "run_date": row["run_date"],
+                "spacing_m": row["spacing_m"],
+                "match_dist_m": row["match_dist_m"],
+                "coverage_pct_by_length": pct,
+                # street_walks has no uncovered column; derive it so the frontend
+                # headline ("X% of street-km have no imagery") needs no math.
+                "uncovered_pct_by_length": None if pct is None else round(100 - pct, 1),
+                "edges": row["edges_total"],
+                "edges_fully_covered": row["edges_fully_covered"],
+                "mean_edge_coverage": row["mean_edge_coverage"],
+            }
+        )
+
+    manifest = {
+        "schema_version": 1,
+        "generated_at": pd.Timestamp.now(tz="UTC").isoformat(),
+        "walks": walks,
+    }
+
+    output_path = os.path.join(data_dir, "streetwalks.json.gz")
+    _write_json_gz_atomic(output_path, manifest)
+    logger.info(f"Wrote streetwalk manifest for {len(walks)} walks to {output_path}")
+
+    return manifest

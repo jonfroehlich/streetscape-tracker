@@ -37,7 +37,11 @@ from . import db
 from .alerting import AlertConfig, send_alert, should_alert
 from .download_common import redact_credentials
 from .download_mapillary import estimate_tile_count
-from .json_summarizer import generate_aggregate_v2, regenerate_run_json
+from .json_summarizer import (
+    generate_aggregate_v2,
+    generate_streetwalk_manifest,
+    regenerate_run_json,
+)
 from .naming import KNOWN_PROVIDERS
 
 # Isolated street-coverage budget channels (issue #99). Valid api_usage
@@ -492,7 +496,11 @@ def cmd_regenerate(cfg: SchedulerConfig, publish: bool = False) -> int:
     conn = db.connect(cfg.db_path)
     logger.info("Regenerating aggregate cities.json.gz")
     agg = generate_aggregate_v2(conn, cfg.data_dir)
-    print(f"Regenerated {cfg.data_dir}/cities.json.gz ({agg['cities_count']} cities).")
+    manifest = generate_streetwalk_manifest(conn, cfg.data_dir)
+    print(
+        f"Regenerated {cfg.data_dir}/cities.json.gz ({agg['cities_count']} cities); "
+        f"streetwalks.json.gz ({len(manifest['walks'])} walks)."
+    )
 
     if publish:
         # An explicit --publish overrides [publish].enabled: the operator is
@@ -766,6 +774,7 @@ def cmd_run_due(
     if succeeded > 0:
         logger.info("Regenerating aggregate cities.json.gz")
         generate_aggregate_v2(conn, cfg.data_dir)
+        generate_streetwalk_manifest(conn, cfg.data_dir)
 
     # Nightly catalog backup (keep one rolling copy alongside the logs)
     backup_path = os.path.join(cfg.log_dir, "streetscape_tracker.db.backup")

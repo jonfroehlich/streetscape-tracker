@@ -1037,6 +1037,27 @@ def get_latest_street_walk(
     ).fetchone()
 
 
+def get_latest_street_walks_all(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """
+    The most recent road-walk collection for every (city_id, provider) that has
+    one, ordered by city then provider. Backs the published ``streetwalks.json.gz``
+    manifest (issue #155): one row per city+provider so the city page can look up
+    its coverage artifact by (city_id, provider).
+    """
+    return conn.execute(
+        """SELECT sw.* FROM street_walks sw
+           JOIN (
+               SELECT city_id, provider, MAX(run_date) AS max_date
+               FROM street_walks
+               GROUP BY city_id, provider
+           ) latest
+             ON sw.city_id = latest.city_id
+            AND sw.provider = latest.provider
+            AND sw.run_date = latest.max_date
+           ORDER BY sw.city_id, sw.provider""",
+    ).fetchall()
+
+
 # ── API budget ledger ──────────────────────────────────────────────────────
 
 

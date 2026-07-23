@@ -50,6 +50,7 @@ let copyrightAvailableGlobal = true; // false for archival GSV runs with no copy
 let providerGlobal = "gsv"; // derived from the data filename
 let oldestDateGlobal = null;
 let newestDateGlobal = null;
+let cityIdGlobal = null; // canonical city_id from the aggregate record (for the streetwalk lookup)
 
 // GSV imagery display mode. Every run streams BOTH official-Google and
 // contributor (UGC) panos into markers; `showAllGsv` is a pure display
@@ -1131,7 +1132,10 @@ async function loadData() {
       const record = providerCities.find((c) =>
         c.data_file?.filename === targetFile ||
         (c.runs || []).some((r) => r.data_file === targetFile));
-      if (record) runsGlobal = record.runs || [];
+      if (record) {
+        runsGlobal = record.runs || [];
+        cityIdGlobal = record.city_id ?? null; // for the streetwalk manifest lookup
+      }
     }
 
     // Load city-specific JSON metadata
@@ -1458,12 +1462,20 @@ async function loadData() {
       map.fitBounds(L.latLngBounds(validPoints));
     }
 
-    // Optional OSM street-coverage overlay (issue #24); a no-op when the
-    // run has no "_streets.json.gz" artifact. The setPanoDotsVisible hook lets
-    // its panel show/hide the pano markers (a coarse show-all/hide-all, like
-    // the map-background reset) so the streets can be read on their own. Goes
+    // Optional street-coverage overlay; a no-op when the city has no artifact.
+    // Prefer the road-walk (streetwalk) coverage artifact when the manifest
+    // advertises one for this city+provider (fractional per-edge coverage,
+    // issue #99/#155); otherwise fall back to the grid-attribution
+    // "_streets.json.gz" (issue #24). The streetwalk file is NOT derivable from
+    // the run filename, so it comes from the sidecar manifest keyed by city_id.
+    // The setPanoDotsVisible hook lets the panel show/hide the pano markers (a
+    // coarse show-all/hide-all) so the streets can be read on their own; it goes
     // through the reconcile model so re-showing respects the mode/year/date/cap.
+    const streetwalk = cityIdGlobal
+      ? lookupStreetwalk(await fetchStreetwalkManifest(), cityIdGlobal, providerGlobal)
+      : null;
     renderStreetCoverage(map, targetFile, providerGlobal, {
+      streetwalkFile: streetwalk?.coverage_filename,
       setPanoDotsVisible: (visible) => {
         panoDotsHidden = !visible;
         applyDesired();

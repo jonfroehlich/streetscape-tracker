@@ -101,10 +101,14 @@ module.exports = [
   },
   {
     // Only city.html loads street-coverage.js, so only city.js may consume
-    // its global (flat config merges this into city.js's entry above).
+    // its globals (flat config merges this into city.js's entry above).
     files: ["js/city.js"],
     languageOptions: {
-      globals: { renderStreetCoverage: "readonly" },
+      globals: {
+        renderStreetCoverage: "readonly",
+        fetchStreetwalkManifest: "readonly",
+        lookupStreetwalk: "readonly",
+      },
     },
   },
   {
