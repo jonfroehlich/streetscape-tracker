@@ -44,6 +44,7 @@ from streetscape_metadata_tracker.analysis import detect_systemic_failure
 from streetscape_metadata_tracker.config import load_config
 from streetscape_metadata_tracker.download_common import DownloadError
 from streetscape_metadata_tracker.download_gsv import collect_points_async
+from streetscape_metadata_tracker.json_summarizer import generate_streetwalk_manifest
 from streetscape_metadata_tracker.naming import (
     generate_streetwalk_filename,
     streetwalk_coverage_filename,
@@ -247,7 +248,20 @@ def run_collect(args: argparse.Namespace) -> int:
             finished_at=dict_results.get("finished_at") or datetime.now(UTC).isoformat(),
         )
 
-        logger.info("Wrote %s and %s", out_csv, out_coverage)
+        # Refresh the sidecar manifest so the city page can actually find this
+        # artifact (issue #155). The collector is a manual CLI outside the
+        # scheduler, and the manifest is only otherwise rebuilt by a nightly
+        # run-due or an explicit regenerate-aggregate — without this a freshly
+        # collected walk would publish but stay invisible until the next one of
+        # those. Catalog-driven and cheap (one small query, no artifact reads).
+        manifest = generate_streetwalk_manifest(conn, data_dir)
+
+        logger.info(
+            "Wrote %s and %s (manifest: %d walks)",
+            out_csv,
+            out_coverage,
+            len(manifest["walks"]),
+        )
         print(
             f"{city.city_id} [streetwalk {PROVIDER} {run_date}]: "
             f"{len(samples)} samples over {totals['edges']} edges "

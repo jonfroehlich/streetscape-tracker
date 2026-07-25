@@ -21,6 +21,8 @@ const {
   fractionColor,
   normalizeStreetArtifact,
   lookupStreetwalk,
+  fetchStreetwalkManifest,
+  renderStreetCoverage,
   STREET_UNCOVERED_COLOR,
   STREET_COVERED_COLOR,
   STREET_COVERED_NODATE_COLOR,
@@ -196,4 +198,276 @@ test("lookupStreetwalk: finds by city_id+provider, null on miss or absent manife
   assert.equal(lookupStreetwalk(manifest, "portland--or", "gsv"), null);
   assert.equal(lookupStreetwalk(null, "seattle--wa", "gsv"), null);
   assert.equal(lookupStreetwalk({}, "seattle--wa", "gsv"), null);
+});
+
+// ── normalizeStreetArtifact edge cases ───────────────────────────────────────
+
+test("normalizeStreetArtifact: does not clobber values the artifact already carries", () => {
+  const fc = {
+    properties: {
+      metadata: {
+        // A streetwalk artifact that already speaks the canonical totals names
+        // (e.g. a future schema rev) must keep its own numbers.
+        totals: { edges: 41, edges_any_coverage: 40, segments: 7, covered: 5 },
+        coverage_by_highway: {},
+      },
+    },
+    features: [
+      {
+        properties: {
+          covered: true,
+          coverage_fraction: 0.5,
+          nearest_pano_age_years: 1.5, // already present → alias must not overwrite
+          median_covered_age_years: 9.9,
+        },
+      },
+    ],
+  };
+  const { meta } = normalizeStreetArtifact(fc, "streetwalk");
+  assert.equal(fc.features[0].properties.nearest_pano_age_years, 1.5);
+  assert.equal(meta.totals.segments, 7);
+  assert.equal(meta.totals.covered, 5);
+});
+
+test("normalizeStreetArtifact: a covered edge with no median age aliases to null, not undefined", () => {
+  // The styler branches on `nearest_pano_age_years == null` for the no-date
+  // color; an undefined would take the same branch today but null is the
+  // contract the grid artifact uses, so keep them identical.
+  const fc = {
+    properties: { metadata: { totals: { edges: 1 }, coverage_by_highway: {} } },
+    features: [{ properties: { covered: true, coverage_fraction: 1 } }],
+  };
+  normalizeStreetArtifact(fc, "streetwalk");
+  assert.equal(fc.features[0].properties.nearest_pano_age_years, null);
+  assert.ok("nearest_pano_age_years" in fc.features[0].properties);
+});
+
+test("normalizeStreetArtifact: tolerates features with no properties and a missing feature list", () => {
+  const fc = { properties: { metadata: { totals: {}, coverage_by_highway: {} } }, features: [{}] };
+  assert.doesNotThrow(() => normalizeStreetArtifact(fc, "streetwalk"));
+  assert.deepEqual(fc.features[0].properties, { nearest_pano_age_years: null });
+
+  const empty = {};
+  const { meta, hasFractional } = normalizeStreetArtifact(empty, "streetwalk");
+  assert.equal(hasFractional, false);
+  assert.equal(meta, undefined);
+});
+
+test("normalizeStreetArtifact: a streetwalk artifact with no fractional signal is not flagged", () => {
+  // hasFractional drives the initial view mode; an artifact whose edges lack
+  // coverage_fraction must fall back to the age scale like the grid file.
+  const fc = {
+    properties: { metadata: { totals: { edges: 2 }, coverage_by_highway: {} } },
+    features: [{ properties: { covered: true, median_covered_age_years: 3 } }],
+  };
+  assert.equal(normalizeStreetArtifact(fc, "streetwalk").hasFractional, false);
+});
+
+// ── Manifest fetch ───────────────────────────────────────────────────────────
+
+test("fetchStreetwalkManifest: reads streetwalks.json.gz from the data base URL", async () => {
+  const seen = [];
+  global.fetchGzippedJson = async (url) => {
+    seen.push(url);
+    return { schema_version: 1, walks: [{ city_id: "bend--or", provider: "gsv" }] };
+  };
+  const manifest = await fetchStreetwalkManifest();
+  assert.deepEqual(seen, ["https://example.test/data/streetwalks.json.gz"]);
+  assert.equal(manifest.walks.length, 1);
+  delete global.fetchGzippedJson;
+});
+
+test("fetchStreetwalkManifest: a missing/unreadable manifest resolves null, never throws", async () => {
+  // Most deployments have no manifest yet — the overlay is optional, so a 404
+  // must degrade to "no road-walk overlay" rather than reject into city.js.
+  global.fetchGzippedJson = async () => {
+    throw new Error("404");
+  };
+  assert.equal(await fetchStreetwalkManifest(), null);
+  delete global.fetchGzippedJson;
+});
+
+// ── renderStreetCoverage: artifact discovery + initial mode ──────────────────
+//
+// The panel is skipped in these tests (buildStreetCoveragePanel early-returns
+// when #street-coverage-container is absent), so they exercise exactly the
+// fetch/normalize/style seam without needing a DOM or Chart.js.
+
+/** Minimal Leaflet + DOM stubs; returns a handle on what the renderer built. */
+function stubRenderEnv(fetchImpl) {
+  const captured = { urls: [], geoJsonOpts: null, added: 0 };
+  global.fetchGzippedJson = async (url) => {
+    captured.urls.push(url);
+    return fetchImpl(url);
+  };
+  global.document = { getElementById: () => null };
+  global.L = {
+    geoJSON: (fc, opts) => {
+      captured.geoJsonOpts = opts;
+      captured.fc = fc;
+      return {
+        addTo: () => {
+          captured.added += 1;
+          return this;
+        },
+      };
+    },
+  };
+  const panes = {};
+  captured.map = {
+    getPane: (n) => panes[n],
+    createPane: (n) => (panes[n] = { style: {} }),
+  };
+  return captured;
+}
+
+function teardownRenderEnv() {
+  delete global.fetchGzippedJson;
+  delete global.document;
+  delete global.L;
+}
+
+const GRID_RUN = "bend--or_width_5000_height_5000_step_20_2026-07-08.csv.gz";
+const WALK_FILE = "bend--or_width_5000_height_5000_step_20_streetwalk_sp15_2026-07-22_coverage.json.gz";
+
+function streetwalkArtifact() {
+  return {
+    properties: {
+      metadata: {
+        totals: { edges: 2, edges_any_coverage: 2, uncovered_pct_by_length: 1.6 },
+        coverage_by_highway: { residential: { length_km: 1 } },
+      },
+    },
+    features: [
+      {
+        properties: {
+          highway: "residential",
+          covered: true,
+          coverage_fraction: 0.42,
+          median_covered_age_years: 3.5,
+          nearest_pano_date: "2022-06",
+        },
+      },
+    ],
+  };
+}
+
+function gridArtifact() {
+  return {
+    properties: {
+      metadata: {
+        totals: { segments: 2, covered: 1, uncovered_pct_by_length: 12.0 },
+        coverage_by_highway: { residential: { length_km: 1 } },
+      },
+    },
+    features: [
+      {
+        properties: {
+          highway: "residential",
+          covered: true,
+          nearest_pano_age_years: 3.5,
+          nearest_pano_date: "2022-06",
+        },
+      },
+    ],
+  };
+}
+
+test("renderStreetCoverage: with a manifest filename, fetches THAT artifact — not the derived sibling", async () => {
+  // The whole point of the manifest (#155): the streetwalk file's sp{N} spacing
+  // and run-date are not derivable from the grid run filename.
+  const env = stubRenderEnv(() => streetwalkArtifact());
+  await renderStreetCoverage(env.map, GRID_RUN, "gsv", { streetwalkFile: WALK_FILE });
+  assert.deepEqual(env.urls, ["https://example.test/data/" + WALK_FILE]);
+  assert.equal(env.added, 1);
+  teardownRenderEnv();
+});
+
+test("renderStreetCoverage: with no manifest entry, falls back to the derived _streets.json.gz", async () => {
+  const env = stubRenderEnv(() => gridArtifact());
+  await renderStreetCoverage(env.map, GRID_RUN, "gsv", {});
+  assert.deepEqual(env.urls, [streetsUrlForDataFile(GRID_RUN)]);
+  assert.equal(env.added, 1);
+  teardownRenderEnv();
+});
+
+test("renderStreetCoverage: the fractional artifact opens on the coverage ramp", async () => {
+  // Observable through the style callback handed to L.geoJSON: in "coverage"
+  // mode a covered edge takes the fraction ramp color, not the age color.
+  const env = stubRenderEnv(() => streetwalkArtifact());
+  await renderStreetCoverage(env.map, GRID_RUN, "gsv", { streetwalkFile: WALK_FILE });
+  const style = env.geoJsonOpts.style(env.fc.features[0]);
+  assert.equal(style.color, fractionColor(0.42));
+  teardownRenderEnv();
+});
+
+test("renderStreetCoverage: the binary grid artifact opens on the age scale", async () => {
+  const env = stubRenderEnv(() => gridArtifact());
+  await renderStreetCoverage(env.map, GRID_RUN, "gsv", {});
+  const style = env.geoJsonOpts.style(env.fc.features[0]);
+  assert.equal(style.color, "color(3.5,gsv)"); // the getColor stub → age mode
+  teardownRenderEnv();
+});
+
+test("renderStreetCoverage: age mode still works on a streetwalk artifact via the alias", async () => {
+  // The manifest path must not break the other view modes: styleForMode("age")
+  // reads nearest_pano_age_years, which normalize aliased from the median.
+  const env = stubRenderEnv(() => streetwalkArtifact());
+  await renderStreetCoverage(env.map, GRID_RUN, "gsv", { streetwalkFile: WALK_FILE });
+  assert.equal(
+    styleForMode(env.fc.features[0], "age", "gsv").color,
+    "color(3.5,gsv)" // median_covered_age_years, aliased
+  );
+  teardownRenderEnv();
+});
+
+test("renderStreetCoverage: tooltip shows the coverage percentage for a fractional edge", async () => {
+  const env = stubRenderEnv(() => streetwalkArtifact());
+  await renderStreetCoverage(env.map, GRID_RUN, "gsv", { streetwalkFile: WALK_FILE });
+  const tips = [];
+  env.geoJsonOpts.onEachFeature(env.fc.features[0], {
+    bindTooltip: (text) => tips.push(text),
+  });
+  assert.equal(tips[0], "residential · covered 42% · 2022-06");
+  teardownRenderEnv();
+});
+
+test("renderStreetCoverage: an uncovered edge's tooltip carries no percentage", async () => {
+  const artifact = streetwalkArtifact();
+  artifact.features[0].properties = { highway: "service", covered: false, coverage_fraction: 0 };
+  const env = stubRenderEnv(() => artifact);
+  await renderStreetCoverage(env.map, GRID_RUN, "gsv", { streetwalkFile: WALK_FILE });
+  const tips = [];
+  env.geoJsonOpts.onEachFeature(env.fc.features[0], { bindTooltip: (t) => tips.push(t) });
+  assert.equal(tips[0], "service · no coverage");
+  teardownRenderEnv();
+});
+
+test("renderStreetCoverage: a missing artifact is a silent no-op (no layer added)", async () => {
+  const env = stubRenderEnv(() => {
+    throw new Error("404");
+  });
+  await assert.doesNotReject(
+    renderStreetCoverage(env.map, GRID_RUN, "gsv", { streetwalkFile: WALK_FILE })
+  );
+  assert.equal(env.added, 0);
+  teardownRenderEnv();
+});
+
+test("renderStreetCoverage: an artifact with no features or no metadata block adds nothing", async () => {
+  let env = stubRenderEnv(() => ({ type: "FeatureCollection", features: [] }));
+  await renderStreetCoverage(env.map, GRID_RUN, "gsv", { streetwalkFile: WALK_FILE });
+  assert.equal(env.added, 0);
+  teardownRenderEnv();
+
+  // Present features but a truncated/partially-uploaded metadata block: the
+  // panel is driven entirely by it, so the whole overlay bails rather than throw.
+  const noMeta = streetwalkArtifact();
+  delete noMeta.properties.metadata.coverage_by_highway;
+  env = stubRenderEnv(() => noMeta);
+  await assert.doesNotReject(
+    renderStreetCoverage(env.map, GRID_RUN, "gsv", { streetwalkFile: WALK_FILE })
+  );
+  assert.equal(env.added, 0);
+  teardownRenderEnv();
 });

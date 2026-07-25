@@ -299,10 +299,18 @@ def test_regenerate_aggregate_rebuilds_without_publish(conn, monkeypatch):
         "generate_aggregate_v2",
         lambda c, d: calls.__setitem__("agg", calls["agg"] + 1) or {"cities_count": 3},
     )
+    monkeypatch.setattr(
+        sched,
+        "generate_streetwalk_manifest",
+        lambda c, d: calls.__setitem__("manifest", calls.get("manifest", 0) + 1) or {"walks": []},
+    )
     monkeypatch.setattr(sched, "_publish", lambda cfg, ctx: calls.__setitem__("publish", 1) or 0)
 
     rc = sched.cmd_regenerate(SchedulerConfig(publish_enabled=False))
-    assert rc == 0 and calls == {"agg": 1, "publish": 0}
+    # The streetwalk manifest is rebuilt alongside the aggregate: both are
+    # catalog-derived indexes the frontend fetches, and regenerate-aggregate is
+    # the documented recovery path after a manual/killed run (issue #155).
+    assert rc == 0 and calls == {"agg": 1, "manifest": 1, "publish": 0}
 
 
 def test_regenerate_aggregate_publishes_on_flag(conn, monkeypatch):
@@ -312,6 +320,7 @@ def test_regenerate_aggregate_publishes_on_flag(conn, monkeypatch):
 
     monkeypatch.setattr(sched.db, "connect", lambda path: conn)
     monkeypatch.setattr(sched, "generate_aggregate_v2", lambda c, d: {"cities_count": 0})
+    monkeypatch.setattr(sched, "generate_streetwalk_manifest", lambda c, d: {"walks": []})
 
     published = []
     monkeypatch.setattr(sched, "_publish", lambda cfg, ctx: published.append(ctx) or 0)
@@ -519,6 +528,7 @@ def test_budget_ledger_defers_second_city_when_first_consumes_budget(conn, monke
     monkeypatch.setattr(sched.db, "connect", lambda path: conn)
     monkeypatch.setattr(sched.time, "sleep", lambda s: None)
     monkeypatch.setattr(sched, "generate_aggregate_v2", lambda c, d: None)
+    monkeypatch.setattr(sched, "generate_streetwalk_manifest", lambda c, d: {"walks": []})
 
     cfg = SchedulerConfig(daily_request_budget=4_000, publish_enabled=False)
     rc = sched.cmd_run_due(cfg, today=today)
@@ -562,6 +572,7 @@ def test_oversized_city_does_not_starve_queue(conn, monkeypatch):
     monkeypatch.setattr(sched.db, "connect", lambda path: conn)
     monkeypatch.setattr(sched.time, "sleep", lambda s: None)
     monkeypatch.setattr(sched, "generate_aggregate_v2", lambda c, d: None)
+    monkeypatch.setattr(sched, "generate_streetwalk_manifest", lambda c, d: {"walks": []})
 
     cfg = SchedulerConfig(daily_request_budget=10_000, publish_enabled=False)
     rc = sched.cmd_run_due(cfg, today=date(2026, 7, 2))
@@ -590,6 +601,7 @@ def test_run_due_pairs_providers_per_city(conn, monkeypatch):
     monkeypatch.setattr(sched.db, "connect", lambda path: conn)
     monkeypatch.setattr(sched.time, "sleep", lambda s: None)
     monkeypatch.setattr(sched, "generate_aggregate_v2", lambda c, d: None)
+    monkeypatch.setattr(sched, "generate_streetwalk_manifest", lambda c, d: {"walks": []})
 
     cfg = SchedulerConfig(
         publish_enabled=False,
@@ -639,6 +651,7 @@ def test_run_due_provider_budgets_are_independent(conn, monkeypatch):
     monkeypatch.setattr(sched.db, "connect", lambda path: conn)
     monkeypatch.setattr(sched.time, "sleep", lambda s: None)
     monkeypatch.setattr(sched, "generate_aggregate_v2", lambda c, d: None)
+    monkeypatch.setattr(sched, "generate_streetwalk_manifest", lambda c, d: {"walks": []})
 
     cfg = SchedulerConfig(
         publish_enabled=False,
@@ -650,3 +663,82 @@ def test_run_due_provider_budgets_are_independent(conn, monkeypatch):
     sched.cmd_run_due(cfg, today=date(2026, 7, 2))
 
     assert ran == [(cid, "mapillary")]  # gsv deferred, mapillary still ran
+
+
+def test_run_due_refreshes_the_manifest_only_after_a_success(conn, monkeypatch):
+    """
+    The nightly rebuild of the catalog-derived indexes is gated on ≥1 successful
+    city: a night where nothing collected leaves both `cities.json.gz` and
+    `streetwalks.json.gz` untouched (no needless republish), and a night with a
+    success refreshes both together (issue #155).
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    _register(conn, "Bend", width=1000, height=1000, step=20)
+    db.assign_schedule(conn, 90)
+    conn.execute("UPDATE schedule_state SET last_success_at = NULL")  # due
+    conn.commit()
+
+    calls = {"agg": 0, "manifest": 0}
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+    monkeypatch.setattr(sched.time, "sleep", lambda s: None)
+    monkeypatch.setattr(
+        sched, "generate_aggregate_v2", lambda c, d: calls.__setitem__("agg", calls["agg"] + 1)
+    )
+    monkeypatch.setattr(
+        sched,
+        "generate_streetwalk_manifest",
+        lambda c, d: calls.__setitem__("manifest", calls["manifest"] + 1) or {"walks": []},
+    )
+
+    # A night where the city's run fails: neither index is rebuilt.
+    monkeypatch.setattr(
+        sched,
+        "_run_one_city",
+        lambda cfg, city, today, provider="gsv", connection_limit=None: False,
+    )
+    sched.cmd_run_due(SchedulerConfig(publish_enabled=False), today=date(2026, 7, 2))
+    assert calls == {"agg": 0, "manifest": 0}
+
+    # A night with a success: both, exactly once each.
+    monkeypatch.setattr(
+        sched,
+        "_run_one_city",
+        lambda cfg, city, today, provider="gsv", connection_limit=None: True,
+    )
+    sched.cmd_run_due(SchedulerConfig(publish_enabled=False), today=date(2026, 7, 3))
+    assert calls == {"agg": 1, "manifest": 1}
+
+
+def test_regenerate_writes_both_indexes_to_the_configured_data_dir(conn, data_dir, monkeypatch):
+    """
+    End-to-end (no stubbed generators): `regenerate-aggregate` must leave BOTH
+    published indexes on disk in the configured data dir. This is the documented
+    recovery path after a killed run, so a missing `streetwalks.json.gz` here
+    means the city page silently loses every road-walk overlay.
+    """
+    import gzip
+    import json
+
+    from streetscape_metadata_tracker import scheduler as sched
+
+    city_id = _register(conn, "Bend", width=1000, height=1000, step=20)
+    db.register_street_walk(
+        conn,
+        city_id=city_id,
+        run_date=date(2026, 7, 17),
+        csv_filename="bend_streetwalk_sp15_2026-07-17.csv.gz",
+        coverage_filename="bend_streetwalk_sp15_2026-07-17_coverage.json.gz",
+        coverage_pct_by_length=88.0,
+    )
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+
+    rc = sched.cmd_regenerate(SchedulerConfig(data_dir=data_dir, publish_enabled=False))
+
+    assert rc == 0
+    assert os.path.exists(os.path.join(data_dir, "cities.json.gz"))
+    manifest_path = os.path.join(data_dir, "streetwalks.json.gz")
+    assert os.path.exists(manifest_path)
+    with gzip.open(manifest_path, "rt") as fh:
+        walks = json.load(fh)["walks"]
+    assert [w["city_id"] for w in walks] == [city_id]
