@@ -49,7 +49,11 @@ from .analysis import calculate_run_stats, detect_systemic_failure, print_df_sum
 from .diff import compute_run_diff, generate_diff_filename, write_diff_detail
 from .download_common import DownloadError
 from .fileutils import load_city_csv_file
-from .json_summarizer import generate_aggregate_v2, generate_city_metadata_summary_as_json
+from .json_summarizer import (
+    generate_aggregate_v2,
+    generate_city_metadata_summary_as_json,
+    generate_streetwalk_manifest,
+)
 from .naming import generate_run_filename, same_grid_geometry, sanitize_city_query_str
 from .paths import get_default_data_dir, get_default_vis_dir
 
@@ -479,6 +483,7 @@ async def async_main():
 
         if not args.no_publish_json:
             generate_aggregate_v2(conn, args.download_dir)
+            generate_streetwalk_manifest(conn, args.download_dir)
 
         if failed:
             print(f"FAILED: {', '.join(failed)} (see log for details)")

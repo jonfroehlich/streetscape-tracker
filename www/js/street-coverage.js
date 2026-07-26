@@ -42,8 +42,39 @@ const STREET_COVERED_COLOR = "#2fb974";
  *  dark panel and still reads on the light map basemap (CVD ΔE ~30 vs green). */
 const STREET_UNCOVERED_COLOR = "#767c85";
 
+/** Pale end of the fractional-coverage ramp (a barely-driven edge). The full
+ *  end is STREET_COVERED_COLOR, so a fully-covered edge matches the binary
+ *  green exactly — the ramp is continuous with the other modes. Only the
+ *  road-walk (streetwalk) artifact carries per-edge `coverage_fraction`; the
+ *  grid-attribution artifact is binary and never uses this. */
+const STREET_PARTIAL_LOW_COLOR = "#bfe8d4";
+
 /** Panel surface color; also used as the inter-segment gap color in the chart. */
 const STREET_PANEL_BG = "#1b1f24";
+
+/**
+ * Parse a #rrggbb hex to an [r, g, b] triple.
+ * @param {string} hex
+ * @returns {[number, number, number]}
+ */
+function hexToRgb(hex) {
+  const n = parseInt(hex.slice(1), 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+}
+
+/**
+ * Sequential green ramp for a fractional per-edge coverage value: pale green at
+ * ~0 (mostly uncovered) → the full covered green at 1 (driven end to end).
+ * @param {number} frac - Coverage fraction in [0, 1].
+ * @returns {string} An rgb() color.
+ */
+function fractionColor(frac) {
+  const f = Math.max(0, Math.min(1, Number(frac) || 0));
+  const lo = hexToRgb(STREET_PARTIAL_LOW_COLOR);
+  const hi = hexToRgb(STREET_COVERED_COLOR);
+  const mix = (a, b) => Math.round(a + (b - a) * f);
+  return `rgb(${mix(lo[0], hi[0])}, ${mix(lo[1], hi[1])}, ${mix(lo[2], hi[2])})`;
+}
 
 /**
  * Street-type categorical palette: the dataviz dark categorical slots assigned
@@ -116,14 +147,22 @@ function styleStreetFeature(feature, provider) {
 }
 
 /**
- * Leaflet style for the "coverage" view mode: binary covered green vs
- * uncovered slate (dashed).
+ * Leaflet style for the "coverage" view mode. Binary covered green vs uncovered
+ * slate (dashed) for the grid-attribution artifact; when the feature carries a
+ * per-edge `coverage_fraction` (the road-walk artifact), covered edges instead
+ * graduate along the sequential green ramp so a street driven end-to-end reads
+ * differently from one glimpsed at a single intersection — the whole point of
+ * the fractional modality.
  * @param {Object} feature - GeoJSON feature with coverage properties.
  * @returns {Object} Leaflet path style.
  */
 function styleStreetByCoverage(feature) {
-  if (!(feature.properties && feature.properties.covered)) {
+  const p = feature.properties || {};
+  if (!p.covered) {
     return { color: STREET_UNCOVERED_COLOR, weight: 2, opacity: 0.75, dashArray: "4 4" };
+  }
+  if (p.coverage_fraction != null) {
+    return { color: fractionColor(p.coverage_fraction), weight: 3, opacity: 0.95 };
   }
   return { color: STREET_COVERED_COLOR, weight: 3, opacity: 0.9 };
 }
@@ -178,36 +217,133 @@ function applyStreetStyles(layer, mode, provider, selection) {
 }
 
 /**
+ * URL of the sidecar streetwalk manifest (issue #155) — the index of the latest
+ * road-walk coverage artifact per (city, provider), keyed so the city page can
+ * find an artifact it cannot derive from the grid run filename.
+ * @returns {string}
+ */
+function streetwalkManifestUrl() {
+  return STREETSCAPE_DATA_BASE_URL + "streetwalks.json.gz";
+}
+
+/**
+ * Fetch the streetwalk manifest, or null when it's absent/unreadable (the
+ * feature is optional — most deployments won't have one yet).
+ * @returns {Promise<?Object>}
+ */
+async function fetchStreetwalkManifest() {
+  try {
+    return await fetchGzippedJson(streetwalkManifestUrl());
+  } catch (e) {
+    console.info("No streetwalk manifest (skipping road-walk overlay):", e.message);
+    return null;
+  }
+}
+
+/**
+ * Find a city+provider's streetwalk entry in the manifest, or null.
+ * @param {?Object} manifest - The parsed streetwalks.json.gz, or null.
+ * @param {string} cityId
+ * @param {string} provider
+ * @returns {?Object} The walk record (with `coverage_filename`), or null.
+ */
+function lookupStreetwalk(manifest, cityId, provider) {
+  if (!manifest || !Array.isArray(manifest.walks)) return null;
+  return (
+    manifest.walks.find((w) => w.city_id === cityId && w.provider === provider) || null
+  );
+}
+
+/**
+ * Normalize either street-coverage artifact into the single internal shape the
+ * styling + panel code consumes, so one renderer serves both:
+ *
+ *   - grid-attribution `_streets.json.gz` (from `analyze`) — already in shape;
+ *     binary per-edge `covered`, no fractional signal.
+ *   - road-walk `_streetwalk_..._coverage.json.gz` (from `collect`, #99) — uses
+ *     `median_covered_age_years` for the age color and `edges`/`edges_any_coverage`
+ *     in its totals, and adds per-edge `coverage_fraction`.
+ *
+ * Mutates the fetched object in place (it's ours) and returns it plus the
+ * derived `hasFractional` flag. Idempotent for the grid artifact (its keys are
+ * already canonical), so `kind` only gates the aliasing that the grid data
+ * doesn't need.
+ *
+ * @param {Object} fc - The parsed GeoJSON FeatureCollection.
+ * @param {"grid"|"streetwalk"} kind - Which artifact this is.
+ * @returns {{fc: Object, meta: ?Object, hasFractional: boolean}}
+ */
+function normalizeStreetArtifact(fc, kind) {
+  let hasFractional = false;
+  for (const feat of fc.features || []) {
+    const p = feat.properties || (feat.properties = {});
+    if (kind === "streetwalk" && p.nearest_pano_age_years == null) {
+      // The road-walk age signal is the median age of an edge's covered
+      // samples; the styler colors edges by `nearest_pano_age_years`.
+      p.nearest_pano_age_years = p.median_covered_age_years ?? null;
+    }
+    if (p.coverage_fraction != null) hasFractional = true;
+  }
+
+  const meta = fc.properties && fc.properties.metadata;
+  if (meta && meta.totals && kind === "streetwalk") {
+    const t = meta.totals;
+    // The panel headline reads `segments`/`covered`; the road-walk totals name
+    // these `edges`/`edges_any_coverage` (an edge with ≥1 covered sample).
+    if (t.segments == null) t.segments = t.edges;
+    if (t.covered == null) t.covered = t.edges_any_coverage;
+  }
+
+  return { fc, meta, hasFractional };
+}
+
+/**
  * Fetch and render the street-coverage overlay and breakdown panel.
  * Silently returns if no streets artifact exists for this run.
+ *
+ * Prefers the road-walk (streetwalk) artifact when the caller supplies its
+ * filename (via `options.streetwalkFile`, from the manifest); otherwise falls
+ * back to deriving the grid-attribution `_streets.json.gz` from the run file.
  *
  * @param {L.Map} map - The Leaflet map (pano markers already added).
  * @param {string} dataFile - The active run's CSV filename.
  * @param {string} provider - Provider key ("gsv" | "mapillary").
  * @param {Object} [options] - Optional hooks from the caller.
+ * @param {string} [options.streetwalkFile] - Road-walk coverage artifact filename
+ *   (from the streetwalk manifest); when set, render it instead of the grid file.
  * @param {function(boolean):void} [options.setPanoDotsVisible] - Show/hide the
  *   pano dot markers (owned by city.js); enables the "Show pano dots" toggle.
  * @returns {Promise<void>}
  */
 async function renderStreetCoverage(map, dataFile, provider, options = {}) {
+  const kind = options.streetwalkFile ? "streetwalk" : "grid";
   let fc;
   try {
-    fc = await fetchGzippedJson(streetsUrlForDataFile(dataFile));
+    const url = options.streetwalkFile
+      ? STREETSCAPE_DATA_BASE_URL + options.streetwalkFile
+      : streetsUrlForDataFile(dataFile);
+    fc = await fetchGzippedJson(url);
   } catch (e) {
     console.info("No street-coverage artifact for this run (skipping):", e.message);
     return;
   }
   if (!fc || !fc.features || !fc.features.length) return;
 
+  const { meta, hasFractional } = normalizeStreetArtifact(fc, kind);
+
   // Guard against a malformed artifact (partial upload, schema mismatch): the
   // panel is driven entirely by properties.metadata.{totals,coverage_by_highway},
   // so bail out of the whole overlay if that block is absent rather than throw
   // an unhandled rejection from this un-awaited call.
-  const meta = fc.properties && fc.properties.metadata;
   if (!meta || !meta.totals || !meta.coverage_by_highway) {
     console.warn("Street-coverage artifact missing its metadata block (skipping overlay).");
     return;
   }
+
+  // For the fractional (road-walk) artifact the coverage ramp is the payoff, so
+  // open on it; the binary grid artifact opens on the age scale (matches the
+  // pano dots).
+  const initialMode = hasFractional ? "coverage" : "age";
 
   // Dedicated pane below the pano markers (overlayPane, z-index 400) so the
   // dots always draw on top of the street lines.
@@ -218,17 +354,23 @@ async function renderStreetCoverage(map, dataFile, provider, options = {}) {
 
   const layer = L.geoJSON(fc, {
     pane: "streetCoverage",
-    style: (feature) => styleStreetFeature(feature, provider),
+    style: (feature) => styleForMode(feature, initialMode, provider),
     onEachFeature: (feature, lyr) => {
       const p = feature.properties || {};
+      const frac =
+        p.coverage_fraction != null ? ` ${Math.round(p.coverage_fraction * 100)}%` : "";
       const status = p.covered
-        ? `covered${p.nearest_pano_date ? ` · ${p.nearest_pano_date}` : ""}`
+        ? `covered${frac}${p.nearest_pano_date ? ` · ${p.nearest_pano_date}` : ""}`
         : "no coverage";
       lyr.bindTooltip(`${p.highway} · ${status}`, { sticky: true });
     },
   }).addTo(map);
 
-  buildStreetCoveragePanel(map, layer, meta, provider, options);
+  buildStreetCoveragePanel(map, layer, meta, provider, {
+    ...options,
+    hasFractional,
+    initialMode,
+  });
 }
 
 /**
@@ -254,8 +396,10 @@ function buildStreetCoveragePanel(map, layer, meta, provider, options) {
     (a, b) => byType[b].length_km - byType[a].length_km
   );
 
-  // Shared view state, mutated by the controls below.
-  let mode = "age";
+  // Shared view state, mutated by the controls below. The road-walk artifact
+  // opens on the fractional coverage ramp; the grid artifact on the age scale.
+  const hasFractional = Boolean(options.hasFractional);
+  let mode = options.initialMode || "age";
   let selection = null; // {type, covered} spotlight, or null
 
   const uncoveredPct = totals.uncovered_pct_by_length;
@@ -302,9 +446,17 @@ function buildStreetCoveragePanel(map, layer, meta, provider, options) {
 
   function renderLegend() {
     if (mode === "coverage") {
-      legendEl.innerHTML =
-        swatch(STREET_COVERED_COLOR, "covered") +
-        swatch(STREET_UNCOVERED_COLOR, "no coverage", true);
+      if (hasFractional) {
+        // Fractional (road-walk): a pale→full green ramp chip plus uncovered.
+        const stops = [STREET_PARTIAL_LOW_COLOR, STREET_COVERED_COLOR].join(",");
+        legendEl.innerHTML =
+          `<span><i style="background:linear-gradient(90deg,${stops})"></i>partial → full</span>` +
+          swatch(STREET_UNCOVERED_COLOR, "no coverage", true);
+      } else {
+        legendEl.innerHTML =
+          swatch(STREET_COVERED_COLOR, "covered") +
+          swatch(STREET_UNCOVERED_COLOR, "no coverage", true);
+      }
     } else if (mode === "type") {
       // Only the types actually present, in importance order, plus uncovered.
       legendEl.innerHTML =
@@ -324,6 +476,12 @@ function buildStreetCoveragePanel(map, layer, meta, provider, options) {
 
   // ── View-mode buttons ──────────────────────────────────────────
   const modeButtons = Array.from(container.querySelectorAll(".street-mode-btn"));
+  // Sync the active button to the initial mode (the HTML hardcodes Age active).
+  modeButtons.forEach((b) => {
+    const active = b.dataset.mode === mode;
+    b.classList.toggle("is-active", active);
+    b.setAttribute("aria-pressed", String(active));
+  });
   modeButtons.forEach((btn) => {
     btn.addEventListener("click", () => {
       mode = btn.dataset.mode;
@@ -564,10 +722,16 @@ if (typeof module !== "undefined" && module.exports) {
     streetTypeColor,
     streetTypeOrder,
     withStreetAlpha,
+    fractionColor,
+    hexToRgb,
+    normalizeStreetArtifact,
+    fetchStreetwalkManifest,
+    lookupStreetwalk,
     renderStreetCoverage,
     STREET_UNCOVERED_COLOR,
     STREET_COVERED_COLOR,
     STREET_COVERED_NODATE_COLOR,
+    STREET_PARTIAL_LOW_COLOR,
     STREET_TYPE_COLORS,
     STREET_TYPE_MINOR_COLOR,
   };

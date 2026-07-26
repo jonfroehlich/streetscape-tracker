@@ -136,6 +136,63 @@ def test_collect_writes_artifacts_catalog_and_isolated_budget(tmp_path, monkeypa
     conn.close()
 
 
+def test_collect_publishes_the_streetwalk_manifest(tmp_path, monkeypatch):
+    """
+    The collector is a manual CLI outside the scheduler, and the city page can
+    only discover a coverage artifact through `streetwalks.json.gz` (issue
+    #155). So collecting must refresh the manifest itself — otherwise a fresh
+    walk publishes but stays invisible until the next nightly run-due or an
+    explicit regenerate-aggregate.
+    """
+    data_dir = _setup(tmp_path, monkeypatch)
+    monkeypatch.setenv("GMAPS_STREETS_API_KEY", "TESTKEY")
+
+    async def fake_fetch(lat, lon, api_key, session, timeout, limiter=None):
+        return _ok_google(lat, lon)
+
+    monkeypatch.setattr(dg, "fetch_gsv_pano_metadata_async", fake_fetch)
+
+    assert collect.run_collect(_args(data_dir)) == 0
+
+    manifest_path = os.path.join(data_dir, "streetwalks.json.gz")
+    assert os.path.exists(manifest_path), "collect must write the sidecar manifest"
+    with gzip.open(manifest_path, "rt") as fh:
+        manifest = json.load(fh)
+
+    assert len(manifest["walks"]) == 1
+    walk = manifest["walks"][0]
+    assert walk["city_id"] == CITY_ID
+    assert walk["provider"] == "gsv"
+    assert walk["run_date"] == RUN_DATE
+    # The advertised filename must be the artifact actually on disk — a mismatch
+    # is a 404 in the browser, the one failure mode the manifest exists to avoid.
+    assert os.path.exists(os.path.join(data_dir, walk["coverage_filename"]))
+    assert walk["coverage_pct_by_length"] == 100.0
+    assert walk["uncovered_pct_by_length"] == 0.0
+
+
+def test_rejected_collect_leaves_no_manifest_entry(tmp_path, monkeypatch):
+    """
+    A systemically-failed walk is not cataloged, so it must not be advertised
+    either — the frontend would fetch a `.rejected` artifact that isn't there.
+    """
+    data_dir = _setup(tmp_path, monkeypatch)
+    monkeypatch.setenv("GMAPS_STREETS_API_KEY", "TESTKEY")
+
+    async def denied(lat, lon, api_key, session, timeout, limiter=None):
+        return {"status": "REQUEST_DENIED"}
+
+    monkeypatch.setattr(dg, "fetch_gsv_pano_metadata_async", denied)
+    _patch_instant_sleep(monkeypatch)
+
+    assert collect.run_collect(_args(data_dir)) == 1
+
+    manifest_path = os.path.join(data_dir, "streetwalks.json.gz")
+    if os.path.exists(manifest_path):  # not written on the reject path today
+        with gzip.open(manifest_path, "rt") as fh:
+            assert json.load(fh)["walks"] == []
+
+
 def test_estimate_needs_no_key_and_writes_nothing(tmp_path, monkeypatch):
     data_dir = _setup(tmp_path, monkeypatch)
     monkeypatch.delenv("GMAPS_STREETS_API_KEY", raising=False)

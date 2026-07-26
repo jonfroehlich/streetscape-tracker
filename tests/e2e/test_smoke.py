@@ -15,6 +15,8 @@ Assertions (seeded from the manual run):
   * provider toggle works and persists via ``?provider=``
   * city page: Chart.js canvas renders; snapshot ``<select>`` on a multi-run city
   * 0-pano city shows ``—``, not the Unix epoch date (#122 / #69)
+  * road-walk street coverage renders from the sidecar manifest, opening on the
+    fractional ramp; a city with no walk renders none, silently (#155)
   * console/page-error clean on both pages and providers
 """
 
@@ -40,10 +42,12 @@ ALPHA_LATEST = "alpha-city--alphastate--testland_width_100_height_100_step_20_20
 ZERO_CITY = "zero-city--zerostate--testland_width_100_height_100_step_20_2026-04-15.csv.gz"
 
 # Substrings of expected third-party console noise to ignore (analytics/CDN),
-# so "console clean" tracks OUR code, not the network environment. The streets
-# artifact is optional by design (issue #24) — the fixture has none, so the
-# browser logs a 404 console.error for the "_streets.json.gz" fetch that
-# street-coverage.js then handles as a silent no-op.
+# so "console clean" tracks OUR code, not the network environment. The
+# grid-attribution streets artifact is optional by design (issue #24) — the
+# fixture has none, so the browser logs a 404 console.error for the
+# "_streets.json.gz" fetch that street-coverage.js handles as a silent no-op.
+# The streetwalk manifest is NOT in this list: it is rebuilt with the aggregate
+# in production, so it always exists and must never 404 (the fixture ships one).
 _IGNORABLE_CONSOLE = (
     "favicon",
     "googletagmanager",
@@ -127,6 +131,39 @@ def _capture_errors(page: Page):
         ),
     )
     return errors
+
+
+# Counts non-transparent pixels on the street-coverage pane's canvas. city.js
+# creates the map with `preferCanvas`, so the street overlay draws onto that
+# pane's own canvas instead of SVG paths — "did it render?" has to be asked in
+# pixels. Yields 0 when the pane or its canvas is absent.
+_STREET_INK_JS = """
+  const c = document.querySelector('.leaflet-pane.leaflet-streetCoverage-pane canvas');
+  if (!c || !c.width || !c.height) return 0;
+  const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+  let n = 0;
+  for (let i = 3; i < d.length; i += 4) if (d[i] > 0) n++;
+  return n;
+"""
+
+
+def _street_pane_ink(page: Page) -> int:
+    """Non-transparent pixel count on the street-coverage pane canvas."""
+    return page.evaluate("() => {" + _STREET_INK_JS + "}")
+
+
+def _expect_street_ink(page: Page, *, drawn: bool):
+    """Wait for the street overlay to be drawn / cleared.
+
+    Leaflet's canvas renderer clears on the next animation frame, so toggling a
+    layer off is not synchronous with the click — poll instead of sampling once.
+    """
+    page.wait_for_function(
+        "(want) => { const ink = (() => {"
+        + _STREET_INK_JS
+        + "})(); return want ? ink > 0 : ink === 0; }",
+        arg=drawn,
+    )
 
 
 def test_overview_renders_without_infinity_or_nan(page: Page, base_url):
@@ -277,5 +314,79 @@ def test_zero_pano_city_shows_dash_not_epoch(page: Page, base_url):
     assert "—" in text
     for bad in ("1969", "1970"):
         assert bad not in text, f"legend showed epoch date {bad!r}:\n{text}"
+
+    assert errors == []
+
+
+def test_city_page_renders_the_road_walk_street_overlay(page: Page, base_url):
+    """
+    The road-walk (streetwalk) coverage artifact renders on the city page
+    (#155). Alpha City is the only fixture city with a walk, so this also
+    proves the manifest lookup found it — the artifact filename is NOT
+    derivable from the run filename, which is the whole reason the manifest
+    exists.
+    """
+    errors = _capture_errors(page)
+    page.goto(f"{base_url}/city.html?file={ALPHA_LATEST}")
+
+    panel = page.locator("#street-coverage-container")
+    expect(panel).to_be_visible()
+
+    # Headline reads the streetwalk totals through the key aliasing
+    # (edges/edges_any_coverage → segments/covered): 14.9% uncovered by length,
+    # 2 of 2 edges with some coverage.
+    headline = page.locator("#street-coverage-headline")
+    expect(headline).to_contain_text("14.9%")
+    expect(headline).to_contain_text("2 of 2 segments covered")
+
+    # A fractional artifact opens on the graduated Coverage ramp, not Age.
+    expect(page.locator('.street-mode-btn[data-mode="coverage"]')).to_have_attribute(
+        "aria-pressed", "true"
+    )
+    expect(page.locator('.street-mode-btn[data-mode="age"]')).to_have_attribute(
+        "aria-pressed", "false"
+    )
+    expect(page.locator("#street-legend")).to_contain_text("partial → full")
+
+    # The edges are drawn into the dedicated pane, which sits BELOW the pano
+    # markers (city.js uses preferCanvas, so the lines land on that pane's own
+    # canvas rather than as SVG paths — assert pixels, not elements). The exact
+    # per-edge ramp colors are unit-tested in www/js/__tests__.
+    _expect_street_ink(page, drawn=True)  # pane canvas must not be blank
+
+    # The by-highway breakdown chart renders (residential + service).
+    chart = page.locator("#street-coverage-chart")
+    expect(chart).to_be_visible()
+    box = chart.bounding_box()
+    assert box and box["width"] > 0 and box["height"] > 0
+
+    # Switching to Age keeps the overlay alive (the median-age alias path).
+    page.locator('.street-mode-btn[data-mode="age"]').click()
+    expect(page.locator('.street-mode-btn[data-mode="age"]')).to_have_attribute(
+        "aria-pressed", "true"
+    )
+    _expect_street_ink(page, drawn=True)
+
+    # The layer toggle removes the overlay and puts it back.
+    page.locator("#street-layer-toggle").uncheck()
+    _expect_street_ink(page, drawn=False)
+    page.locator("#street-layer-toggle").check()
+    _expect_street_ink(page, drawn=True)
+
+    assert errors == []
+
+
+def test_city_without_a_walk_falls_back_and_stays_clean(page: Page, base_url):
+    """
+    A city absent from the manifest must not render a road-walk overlay, and
+    the lookup miss must be silent — the manifest is fetched on every city page
+    load, so a noisy miss would spam the console for most cities.
+    """
+    errors = _capture_errors(page)
+    page.goto(f"{base_url}/city.html?file={ZERO_CITY}")
+
+    expect(page.locator("table.legend-stats")).to_be_visible()  # page finished
+    expect(page.locator("#street-coverage-container")).to_be_hidden()
+    assert _street_pane_ink(page) == 0
 
     assert errors == []

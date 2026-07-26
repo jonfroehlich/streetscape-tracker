@@ -12,17 +12,25 @@ Everything lands in ``tests/e2e/fixture/`` and is tiny enough to commit:
 
   * ``cities.json.gz``              aggregate schema v3, 3 cities
   * ``<city_id>_..._<date>.csv.gz`` + sibling ``.json.gz`` per run
+  * ``streetwalks.json.gz``         road-walk manifest (#155), 1 walk
+  * ``<city_id>_..._streetwalk_sp15_<date>_coverage.json.gz``
 
 The three cities cover the render paths the smoke test asserts on:
 
-  * a normal multi-run **GSV** city  — snapshot ``<select>`` + change line
+  * a normal multi-run **GSV** city  — snapshot ``<select>`` + change line,
+    plus a road-walk coverage artifact (fractional street overlay, #155)
   * a **0-pano** GSV city (#69/#122) — "—" dates, no ``Infinity%``/``NaN``
   * a **Mapillary** city             — provider toggle / ``?provider=``
+
+The manifest is written for every city (as in production, where it is rebuilt
+with the aggregate), so a city with no walk exercises the lookup-miss path.
 
 The catalog DB is built in a throwaway temp dir and discarded; only the gzipped
 data artifacts are kept (mirrors the real publish glob, which excludes the DB).
 """
 
+import gzip
+import json
 import os
 import shutil
 import sys
@@ -40,6 +48,7 @@ from streetscape_metadata_tracker.fileutils import load_city_csv_file  # noqa: E
 from streetscape_metadata_tracker.json_summarizer import (  # noqa: E402
     generate_aggregate_v2,
     generate_city_metadata_summary_as_json,
+    generate_streetwalk_manifest,
 )
 from tests.conftest import (  # noqa: E402
     make_city_df,
@@ -132,6 +141,97 @@ def _record_simple_diff(conn, city_id, from_run, to_run, added):
         points_lost_coverage=0,
         coverage_delta_pct=25.0,
         detail_filename=None,
+    )
+
+
+def _add_streetwalk(conn, city_id, run_date, grid_origin, spacing_m=15.0, match_dist_m=25.0):
+    """
+    Add a road-walk coverage artifact + catalog row for a city (issue #99/#155).
+
+    Built with the REAL sampling/coverage/GeoJSON code so the fixture tracks the
+    live artifact schema, from a hand-made two-edge network: one edge covered
+    end-to-end and one covered only partway, so the fractional ramp has both a
+    full and a partial edge to color (and the by-type chart has two classes).
+    The raw sample csv.gz is deliberately NOT written — the city page never
+    fetches it, and the fixture stays small.
+    """
+    import geopandas as gpd
+    import pandas as pd
+    from shapely.geometry import LineString
+
+    from streetscape_street_analyzer import road_sampling, street_coverage
+
+    lat, lon = grid_origin
+    edges = gpd.GeoDataFrame(
+        {
+            "edge_id": ["1_2", "2_3"],
+            "highway": ["residential", "service"],
+            "length": [222.0, 55.0],
+        },
+        geometry=[
+            LineString([(lon, lat), (lon, lat + 0.002)]),
+            LineString([(lon, lat + 0.002), (lon, lat + 0.0025)]),
+        ],
+        crs="EPSG:4326",
+    )
+    samples = road_sampling.generate_samples(edges, spacing_m=spacing_m)
+
+    # Edge 1_2: every sample covered. Edge 2_3: only its first sample.
+    def _covered(row):
+        return row.edge_id == "1_2" or row.sample_idx == 0
+
+    collected = pd.DataFrame(
+        [
+            {
+                "query_lat": r.lat,
+                "query_lon": r.lon,
+                "pano_lat": r.lat if _covered(r) else None,
+                "pano_lon": r.lon if _covered(r) else None,
+                "pano_id": f"sw{r.Index}" if _covered(r) else None,
+                "capture_date": "2022-06-01" if _covered(r) else None,
+                "copyright_info": "© Google" if _covered(r) else None,
+                "status": "OK" if _covered(r) else "ZERO_RESULTS",
+                "query_timestamp": f"{run_date.isoformat()}T00:00:00Z",
+            }
+            for r in samples.itertuples()
+        ]
+    )
+
+    csv_name = (
+        f"{city_id}_width_{W}_height_{H}_step_{STEP}"
+        f"_streetwalk_sp{int(spacing_m)}_{run_date.isoformat()}.csv.gz"
+    )
+    coverage_name = csv_name[: -len(".csv.gz")] + "_coverage.json.gz"
+
+    covered = street_coverage.compute_streetwalk_coverage(
+        edges, samples, collected, run_date.isoformat(), "gsv", match_dist_m
+    )
+    geojson = street_coverage.build_streetwalk_geojson(
+        covered,
+        city_id=city_id,
+        provider="gsv",
+        run_date=run_date.isoformat(),
+        spacing_m=spacing_m,
+        match_dist_m=match_dist_m,
+        source_csv=csv_name,
+    )
+    with gzip.open(os.path.join(FIXTURE_DIR, coverage_name), "wt", encoding="utf-8") as fh:
+        json.dump(geojson, fh)
+
+    totals = geojson["properties"]["metadata"]["totals"]
+    db.register_street_walk(
+        conn,
+        city_id=city_id,
+        run_date=run_date,
+        csv_filename=csv_name,
+        coverage_filename=coverage_name,
+        spacing_m=spacing_m,
+        match_dist_m=match_dist_m,
+        sample_points=len(samples),
+        edges_total=totals["edges"],
+        edges_fully_covered=totals["edges_fully_covered"],
+        mean_edge_coverage=totals["mean_edge_coverage"],
+        coverage_pct_by_length=totals["coverage_pct_by_length"],
     )
 
 
@@ -232,8 +332,15 @@ def build():
             grid_origin=(46.00, -119.00),
         )
 
-        # 4) Aggregate → cities.json.gz (schema v3) written into FIXTURE_DIR.
+        # 4) A road-walk coverage artifact for Alpha City only (#155): the city
+        # page must render it in place of the grid overlay, while Zero/Map Ville
+        # exercise the "manifest present, no entry for me" path.
+        _add_streetwalk(conn, alpha, date(2026, 4, 15), grid_origin=(44.00, -121.00))
+
+        # 5) Aggregate → cities.json.gz (schema v3) + the streetwalk sidecar
+        # manifest, both written into FIXTURE_DIR (as the real pipeline does).
         summary = generate_aggregate_v2(conn, FIXTURE_DIR)
+        generate_streetwalk_manifest(conn, FIXTURE_DIR)
     finally:
         conn.close()
         shutil.rmtree(db_tmp, ignore_errors=True)
