@@ -333,8 +333,23 @@ def test_regenerate_aggregate_publishes_on_flag(conn, monkeypatch):
 
 def test_makelab1_production_config_is_wired():
     # Guard the checked-in production config the systemd unit points at.
+    #
+    # This file is what prod actually reads (config/scheduler.toml is the
+    # annotated repo default and is NOT deployed), so enabling a channel in
+    # scheduler.toml alone changes nothing in production — the two must be kept
+    # in step deliberately, which is what this assertion is for.
     cfg = load_scheduler_config(os.path.join(_PROJECT_ROOT, "config", "scheduler.makelab1.toml"))
-    assert cfg.enabled_providers() == ["gsv", "mapillary"]
+    assert cfg.enabled_providers() == ["gsv", "gsv_streets", "mapillary", "mapillary_streets"]
+    # The street channels must keep their ISOLATED budgets: metered under their
+    # own api_usage provider strings against separate keys, so a road crawl can
+    # never eat the grid collectors' quota.
+    assert cfg.providers["gsv_streets"].daily_request_budget == 2_000_000
+    # Paced by the streets key's own quota, not [download]'s 48k grid pacing.
+    assert cfg.providers["gsv_streets"].max_requests_per_minute == 24_000
+    # Mapillary's 50k/day application cap is shared with the grid channel.
+    mly = cfg.providers["mapillary"].daily_request_budget
+    mly_streets = cfg.providers["mapillary_streets"].daily_request_budget
+    assert mly + mly_streets <= 50_000, "combined Mapillary budgets exceed the daily app cap"
     assert cfg.publish_enabled
     assert cfg.publish_script.endswith("sync_data_to_server.sh")
     # smtp transport (not "mail"): the local mailer is blocked by the systemd
