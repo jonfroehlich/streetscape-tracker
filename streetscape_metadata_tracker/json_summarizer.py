@@ -774,6 +774,11 @@ def generate_streetwalk_manifest(conn, data_dir: str) -> dict[str, Any]:
                 "spacing_m": row["spacing_m"],
                 "match_dist_m": row["match_dist_m"],
                 "coverage_pct_by_length": pct,
+                # Any-imagery street coverage (360° + flat). NULL on walks
+                # predating the column — deliberately NOT defaulted to `pct`, so
+                # the streets page can show "no data" instead of implying the
+                # flat footprint was measured.
+                "coverage_pct_by_length_any": row["coverage_pct_by_length_any"],
                 # street_walks has no uncovered column; derive it so the frontend
                 # headline ("X% of street-km have no imagery") needs no math.
                 "uncovered_pct_by_length": None if pct is None else round(100 - pct, 1),

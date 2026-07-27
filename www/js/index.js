@@ -22,6 +22,14 @@ const mapRectangles = [];
 let allCityBounds = null;
 let rawCitiesData = null; // the fetched cities.json.gz payload (all providers)
 
+// The streetwalks.json.gz sidecar (issue #155), or null when absent/unreadable
+// — road-walk street coverage is optional and most cities have none, so every
+// read of this is null-tolerant. Merged onto the adapted city records each
+// render by mergeStreetwalkStats(); `walkedCityCount` is what the stats banner
+// reports so a near-empty streets view explains itself.
+let streetwalkManifest = null;
+let walkedCityCount = 0;
+
 // The one live popup histogram. Popups are content-functions (built on
 // open), so at most one Chart exists at a time — destroyed on close,
 // otherwise each open leaks a Chart instance + ResizeObserver.
@@ -53,6 +61,23 @@ let legendFilterEls = null; // slider DOM refs, rebuilt with each legend
 // panos → null median age). Previously they fell through getColor(null) →
 // 0 years → newest-yellow, indistinguishable from genuinely fresh coverage.
 const NO_DATA_COLOR = "#666666";
+
+/**
+ * Baseline fill opacity for a city rectangle under the active metric.
+ *
+ * Normally 0.6 for everything. The exception is street coverage: cities are
+ * road-walked over a collection cycle, so until one completes, painting the
+ * not-yet-walked ones at full opacity buries the walked ones — they fade back
+ * instead. Used both at render time and by applyDefaultStyles(), so a hover
+ * can't restore the wrong baseline.
+ *
+ * @param {Object} city - Adapted city record.
+ * @returns {number} fillOpacity in [0, 1].
+ */
+function baseFillOpacity(city) {
+  const value = METRICS[currentMetric].valueOf(city);
+  return value == null && currentMetric === "streets" ? 0.2 : 0.6;
+}
 
 L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
   attribution: "© OpenStreetMap contributors © CARTO",
@@ -145,6 +170,20 @@ function createTooltip(city) {
     anyImageryHtml = `<li>Any Imagery: ${anyRate.toFixed(1)}% (incl. flat)</li>`;
   }
 
+  // Road-walk street coverage (issue #99/#155), when this city has been
+  // walked. Shown in EVERY metric mode, not just the streets view — the
+  // popup is where most people will discover the modality exists at all.
+  // A different denominator from Grid Coverage above (street-km driven vs.
+  // grid points with imagery), so it's labeled to keep the two apart.
+  let streetCoverageHtml = "";
+  const walk = city.street_walk;
+  if (walk && walk.coverage_pct_by_length != null) {
+    const spacing = walk.spacing_m != null ? `${walk.spacing_m} m spacing, ` : "";
+    streetCoverageHtml = `
+      <li>Street Coverage: ${walk.coverage_pct_by_length.toFixed(1)}% of street-km
+        <span style="color:#666">(road-walk, ${spacing}${escapeHtml(walk.run_date ?? "")})</span></li>`;
+  }
+
   // Snapshot history line (schema v2): "3 snapshots since 2025-01-17"
   let snapshotsHtml = "";
   if (city.runs && city.runs.length > 0) {
@@ -179,6 +218,7 @@ function createTooltip(city) {
         ? `${city.coverage_rate_percent.toFixed(1)}% of search points${city.provider === "mapillary" ? " (360°)" : ""}`
         : "No data"}</li>
       ${anyImageryHtml}
+      ${streetCoverageHtml}
       ${panoLinesHtml}
     </ul>
     <div style="margin-top:12px"><strong>Age Statistics:</strong></div>
@@ -582,7 +622,7 @@ function applyDefaultStyles() {
   });
 
   mapRectangles.forEach((rect) => {
-    rect.setStyle({ fillOpacity: 0.6, weight: 1 });
+    rect.setStyle({ fillOpacity: baseFillOpacity(rect.city), weight: 1 });
   });
 }
 
@@ -978,6 +1018,11 @@ function renderProvider(fitMap = false) {
   const metric = METRICS[currentMetric];
   const { meta, cities } = adaptCitiesPayload(rawCitiesData, currentProvider);
 
+  // Attach road-walk coverage from the sidecar manifest (issue #155). It is
+  // NOT in the aggregate — folding it in is #102 — so METRICS.streets reads
+  // what this merge writes onto each record.
+  walkedCityCount = mergeStreetwalkStats(cities, streetwalkManifest);
+
   // Clear previous provider's view
   map.closePopup();
   mapRectangles.forEach((rect) => rect.remove());
@@ -990,10 +1035,19 @@ function renderProvider(fitMap = false) {
     map.attributionControl.removeAttribution(p.attribution));
   map.attributionControl.addAttribution(providerInfo.attribution);
 
-  // Stats banner
+  // Stats banner. In streets mode much of the map is "no data": the street
+  // channels are scheduled like the grid ones, so cities fill in over a
+  // collection cycle rather than all at once. Say so outright rather than let
+  // a sparse render read as a broken one.
+  const streetsNote = currentMetric === "streets"
+    ? `<br><span class="stats-note">Road-walk street coverage: ${walkedCityCount}
+       of ${cities.length} ${providerInfo.label} cities walked
+       (<a href="streets.html">see all</a>)</span>`
+    : "";
   document.getElementById("stats").innerHTML = `
     <strong>${providerInfo.label} City Coverage Analysis</strong><br>
     ${cities.length} cities analyzed | Updated: ${new Date(meta.generatedAt).toLocaleString()}
+    ${streetsNote}
   `;
 
   if (cities.length === 0) {
@@ -1022,7 +1076,7 @@ function renderProvider(fitMap = false) {
     const rect = L.rectangle(bounds, {
       color: value != null ? metric.color(value, currentProvider) : NO_DATA_COLOR,
       weight: 1,
-      fillOpacity: 0.6,
+      fillOpacity: baseFillOpacity(city),
     }).addTo(map);
 
     rect.city = city;
@@ -1119,14 +1173,22 @@ function initMetricToggle() {
 
 // ── Data loading ──────────────────────────────────────────────
 
-/** Fetch cities.json.gz, then render the active provider's view. */
+/** Fetch cities.json.gz + the streetwalk manifest, then render the view. */
 async function loadData() {
   // Wire the toggles BEFORE the fetch so a click during loading is
   // recorded (setProvider/setMetric defer the render until data arrives).
   initProviderToggle();
   initMetricToggle();
   try {
-    rawCitiesData = await fetchGzippedJson(STREETSCAPE_DATA_BASE_URL + "cities.json.gz");
+    // The manifest is small (a few hundred bytes) and optional — fetch it
+    // alongside the aggregate rather than serially, and let its own error
+    // handling resolve it to null so a missing one never blocks the map.
+    const [cities, manifest] = await Promise.all([
+      fetchGzippedJson(STREETSCAPE_DATA_BASE_URL + "cities.json.gz"),
+      fetchStreetwalkManifest(),
+    ]);
+    rawCitiesData = cities;
+    streetwalkManifest = manifest;
     document.getElementById("loading").style.display = "none";
     renderProvider(true);
   } catch (error) {

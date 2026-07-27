@@ -27,7 +27,7 @@ from .naming import sanitize_city_query_str
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS cities (
@@ -189,6 +189,10 @@ CREATE TABLE IF NOT EXISTS street_walks (
     edges_fully_covered    INTEGER,
     mean_edge_coverage     REAL,
     coverage_pct_by_length REAL,
+    -- Any-imagery street coverage (v8): 360° + flat/perspective. Equal to
+    -- coverage_pct_by_length for GSV, which never emits FLAT_ONLY; NULL on
+    -- walks collected before the column existed.
+    coverage_pct_by_length_any REAL,
     api_requests           INTEGER,
     started_at             TEXT,
     finished_at            TEXT,
@@ -421,6 +425,9 @@ def init_schema(conn: sqlite3.Connection) -> None:
     # catalog, and the version stamp below records the upgrade.
     if user_version in (4, 5, 6):
         _migrate_v6_to_v7(conn)
+        user_version = 7
+    if user_version == 7:
+        _migrate_v7_to_v8(conn)
     conn.executescript(_SCHEMA)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
@@ -475,6 +482,23 @@ def _migrate_v6_to_v7(conn: sqlite3.Connection) -> None:
         "(adding runs.status_flat_only / any_imagery_coverage_rate_pct / num_flat_images)"
     )
     conn.executescript(_MIGRATE_V6_TO_V7)
+    conn.commit()
+
+
+def _migrate_v7_to_v8(conn: sqlite3.Connection) -> None:
+    """Add street_walks.coverage_pct_by_length_any (any-imagery road coverage).
+
+    Additive; no table rebuild. Idempotent like _migrate_v6_to_v7, so a catalog
+    created fresh at the current schema can still be stamped forward. The
+    column is nullable: walks collected before it existed keep NULL rather than
+    claiming their 360° number covers flat imagery too.
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(street_walks)").fetchall()}
+    if "coverage_pct_by_length_any" in cols or not cols:
+        # Absent table → the CREATE TABLE in _SCHEMA below builds it current.
+        return
+    logger.info("Migrating catalog schema v7 -> v8 (street_walks.coverage_pct_by_length_any)")
+    conn.execute("ALTER TABLE street_walks ADD COLUMN coverage_pct_by_length_any REAL")
     conn.commit()
 
 
@@ -970,6 +994,7 @@ def register_street_walk(
     edges_fully_covered: int | None = None,
     mean_edge_coverage: float | None = None,
     coverage_pct_by_length: float | None = None,
+    coverage_pct_by_length_any: float | None = None,
     api_requests: int | None = None,
     started_at: str | None = None,
     finished_at: str | None = None,
@@ -987,8 +1012,8 @@ def register_street_walk(
            (city_id, provider, run_date, csv_filename, coverage_filename,
             network_type, spacing_m, match_dist_m, sample_points, edges_total,
             edges_fully_covered, mean_edge_coverage, coverage_pct_by_length,
-            api_requests, started_at, finished_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            coverage_pct_by_length_any, api_requests, started_at, finished_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(city_id, provider, run_date) DO UPDATE SET
              csv_filename = excluded.csv_filename,
              coverage_filename = excluded.coverage_filename,
@@ -1000,6 +1025,7 @@ def register_street_walk(
              edges_fully_covered = excluded.edges_fully_covered,
              mean_edge_coverage = excluded.mean_edge_coverage,
              coverage_pct_by_length = excluded.coverage_pct_by_length,
+             coverage_pct_by_length_any = excluded.coverage_pct_by_length_any,
              api_requests = excluded.api_requests,
              started_at = excluded.started_at,
              finished_at = excluded.finished_at""",
@@ -1017,6 +1043,7 @@ def register_street_walk(
             edges_fully_covered,
             mean_edge_coverage,
             coverage_pct_by_length,
+            coverage_pct_by_length_any,
             api_requests,
             started_at,
             finished_at,

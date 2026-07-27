@@ -223,6 +223,42 @@ def test_streetwalk_filename_round_trips():
     assert (p.width_meters, p.step_meters, p.spacing_meters) == (5000, 20, 15)
     assert p.run_date == date(2026, 7, 8)
     assert p.slug == "bend--or"
+    # No token means GSV, exactly as for run filenames — every walk published
+    # before the token existed keeps parsing as the provider it actually was.
+    assert p.provider == "gsv"
+
+
+def test_streetwalk_filenames_differ_per_provider():
+    """
+    The two providers walk the SAME sample points and the scheduler collects
+    both on the same night with the same run_date, so the provider token is the
+    only thing keeping their artifacts apart. Without it the second collection
+    finds the first's snapshot on disk and skips as a no-op.
+    """
+    args = ("bend--or", 5000, 5000, 20, 15, date(2026, 7, 8))
+    gsv = generate_streetwalk_filename(*args)
+    mly = generate_streetwalk_filename(*args, provider="mapillary")
+    assert gsv != mly
+    assert mly == "bend--or_width_5000_height_5000_step_20_mapillary_streetwalk_sp15_2026-07-08"
+    assert streetwalk_coverage_filename(gsv + ".csv.gz") != streetwalk_coverage_filename(
+        mly + ".csv.gz"
+    )
+
+    p = parse_streetwalk_filename(mly + ".csv.gz")
+    assert p.provider == "mapillary"
+    assert (p.slug, p.step_meters, p.spacing_meters) == ("bend--or", 20, 15)
+    assert p.run_date == date(2026, 7, 8)
+
+    with pytest.raises(ValueError):
+        generate_streetwalk_filename(*args, provider="bogus")
+
+
+def test_parse_filename_rejects_provider_tagged_streetwalk_artifacts():
+    """A provider-tokened walk must still not read as a grid run of that provider."""
+    with pytest.raises(ValueError):
+        parse_filename(
+            "bend--or_width_5000_height_5000_step_20_mapillary_streetwalk_sp15_2026-07-08.csv.gz"
+        )
 
 
 def test_streetwalk_coverage_filename():

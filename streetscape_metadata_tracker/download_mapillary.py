@@ -315,46 +315,38 @@ async def _fetch_tile(
         return await response.read()
 
 
-async def download_mapillary_metadata_async(
+async def fetch_city_images_async(
     city_name: str,
-    center_lat: float,
-    center_lon: float,
-    grid_width: float,
-    grid_height: float,
-    step_length: float,
+    bbox: tuple[float, float, float, float],
     access_token: str,
-    output_csv_gz_path: str,
     connection_limit: int = 5,
     request_timeout: float = 30,
 ) -> dict[str, Any]:
     """
-    Fetch Mapillary pano metadata for a city and write it as a run csv.gz.
+    Fetch and dedupe every Mapillary image in a bbox from the z14 vector tiles.
 
-    Same calling convention as download_gsv_metadata_async: the caller
-    decides the output filename (skip policy and dated naming live in the
-    CLI/scheduler layer, not here).
+    Extracted from download_mapillary_metadata_async so the road-walk street
+    collector (issue #99) can share the exact same tile fetch and decode: the
+    two differ only in what they assign images TO afterwards — a regular grid
+    lattice for a run, on-street sample points for a road walk. Mapillary is a
+    tile census, not a per-point query API, so both callers pay the same
+    handful of tile requests no matter how many points they score.
+
+    Args:
+        city_name: label for logging/progress only.
+        bbox: (min_lon, min_lat, max_lon, max_lat), e.g. from grid_bbox.
+        access_token: Mapillary client token (rides in the tile URL).
+        connection_limit: max concurrent tile fetches.
+        request_timeout: per-request timeout in seconds.
 
     Returns:
-        Dict with:
-            df: DataFrame containing the metadata (METADATA_DTYPES schema)
-            filename_with_path: the written .csv.gz path
-            api_requests: number of tile requests issued this call
-            started_at / finished_at: UTC ISO 8601 timestamps
+        Dict with ``images`` (deduped image dicts), ``api_requests`` (tiles
+        fetched), ``tiles`` (tile count) and ``raw_feature_count`` (pre-dedupe).
+
+    Raises:
+        DownloadError: on a rejected token or tile transport failure, carrying
+            ``api_requests`` so the caller can still record what it spent.
     """
-    started_at = datetime.now(UTC).isoformat()
-    query_timestamp = started_at
-
-    if not output_csv_gz_path.endswith(".csv.gz"):
-        raise ValueError(f"output_csv_gz_path must end in .csv.gz, got: {output_csv_gz_path}")
-    Path(os.path.dirname(os.path.abspath(output_csv_gz_path))).mkdir(parents=True, exist_ok=True)
-
-    width_steps = int(grid_width / step_length)
-    height_steps = int(grid_height / step_length)
-    origin = geopy.Point(center_lat, center_lon)
-    grid_points = generate_grid_points(origin, width_steps, height_steps, step_length)
-    point_by_index = {(i, j): (lat, lon) for lat, lon, i, j in grid_points}
-
-    bbox = grid_bbox(center_lat, center_lon, grid_width, grid_height, step_length)
     tiles = tiles_for_bbox(*bbox)
     logger.info(
         f"Fetching Mapillary metadata for {city_name}: {len(tiles)} z{TILE_ZOOM} "
@@ -398,13 +390,73 @@ async def download_mapillary_metadata_async(
     for records in results:
         for record in records:
             images_by_id[record["id"]] = record
-    images = list(images_by_id.values())
+
+    return {
+        "images": list(images_by_id.values()),
+        "api_requests": api_requests,
+        "tiles": len(tiles),
+        "raw_feature_count": sum(len(r) for r in results),
+    }
+
+
+async def download_mapillary_metadata_async(
+    city_name: str,
+    center_lat: float,
+    center_lon: float,
+    grid_width: float,
+    grid_height: float,
+    step_length: float,
+    access_token: str,
+    output_csv_gz_path: str,
+    connection_limit: int = 5,
+    request_timeout: float = 30,
+) -> dict[str, Any]:
+    """
+    Fetch Mapillary pano metadata for a city and write it as a run csv.gz.
+
+    Same calling convention as download_gsv_metadata_async: the caller
+    decides the output filename (skip policy and dated naming live in the
+    CLI/scheduler layer, not here).
+
+    Returns:
+        Dict with:
+            df: DataFrame containing the metadata (METADATA_DTYPES schema)
+            filename_with_path: the written .csv.gz path
+            api_requests: number of tile requests issued this call
+            started_at / finished_at: UTC ISO 8601 timestamps
+    """
+    started_at = datetime.now(UTC).isoformat()
+    query_timestamp = started_at
+
+    if not output_csv_gz_path.endswith(".csv.gz"):
+        raise ValueError(f"output_csv_gz_path must end in .csv.gz, got: {output_csv_gz_path}")
+    Path(os.path.dirname(os.path.abspath(output_csv_gz_path))).mkdir(parents=True, exist_ok=True)
+
+    width_steps = int(grid_width / step_length)
+    height_steps = int(grid_height / step_length)
+    origin = geopy.Point(center_lat, center_lon)
+    grid_points = generate_grid_points(origin, width_steps, height_steps, step_length)
+    point_by_index = {(i, j): (lat, lon) for lat, lon, i, j in grid_points}
+
+    bbox = grid_bbox(center_lat, center_lon, grid_width, grid_height, step_length)
+
+    fetched = await fetch_city_images_async(
+        city_name,
+        bbox,
+        access_token,
+        connection_limit=connection_limit,
+        request_timeout=request_timeout,
+    )
+    images = fetched["images"]
+    api_requests = fetched["api_requests"]
+    tiles = fetched["tiles"]
+    results = fetched["raw_feature_count"]
     panos = [img for img in images if img["is_pano"]]
     flats = [img for img in images if not img["is_pano"]]
     logger.info(
-        f"Decoded {sum(len(r) for r in results)} features "
+        f"Decoded {results} features "
         f"({len(images)} unique: {len(panos)} panos, {len(flats)} flat) "
-        f"from {len(tiles)} tiles"
+        f"from {tiles} tiles"
     )
 
     def _assign(imgs: list[dict[str, Any]]) -> list[tuple[dict[str, Any], tuple[int, int]]]:

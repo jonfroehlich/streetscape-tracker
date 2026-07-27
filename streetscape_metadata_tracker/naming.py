@@ -355,17 +355,33 @@ def streets_filename_for_run(csv_filename: str) -> str:
 # Its raw snapshot is a normal METADATA_DTYPES csv.gz (one row per sampled
 # on-street location), but it carries a '_streetwalk_' marker + the walk spacing
 # so it can never be confused with a grid run: parse_filename() rejects it (the
-# 'streetwalk' token lands where a provider token would, leaving the trailing
-# '_sp{N}_' un-matchable), exactly like the history/streets contracts. The
-# derived per-edge coverage GeoJSON is a sibling '..._coverage.json.gz'.
+# marker and the trailing '_sp{N}_' leave nothing a run name can match), exactly
+# like the history/streets contracts. The derived per-edge coverage GeoJSON is a
+# sibling '..._coverage.json.gz'.
+#
+# A walk is per (city, provider, date) — both providers walk the SAME sample
+# points, so both can be collected the same night — and the artifacts therefore
+# carry a provider token on exactly the run-filename convention: it sits after
+# '_step_{S}', and gsv emits none, so every GSV walk name ever published is
+# unchanged.
+#
+#   gsv:       {city}_width_W_height_H_step_S_streetwalk_sp15_{DATE}.csv.gz
+#   mapillary: {city}_width_W_height_H_step_S_mapillary_streetwalk_sp15_{DATE}.csv.gz
 
 STREETWALK_MARKER = "streetwalk"
+
+# Spelled as an explicit alternation of the tokenized providers rather than
+# FILENAME_RE's `[a-z]+`: a wildcard here would first try to swallow the literal
+# 'streetwalk' marker and only recover by backtracking, which is needlessly
+# subtle for a naming contract.
+_STREETWALK_PROVIDER_ALT = "|".join(p for p in KNOWN_PROVIDERS if p != DEFAULT_PROVIDER)
 
 _STREETWALK_FILENAME_RE = re.compile(
     r"^(?P<slug>.+?)"
     r"_width_(?P<w>\d+)"
     r"_height_(?P<h>\d+)"
     r"_step_(?P<s>\d+)"
+    rf"(?:_(?P<provider>{_STREETWALK_PROVIDER_ALT}))?"
     r"_" + STREETWALK_MARKER + r"_sp(?P<spacing>\d+)_"
     r"(?P<date>\d{4}-\d{2}-\d{2})$"
 )
@@ -382,6 +398,7 @@ class ParsedStreetwalkFilename:
     step_meters: int
     spacing_meters: int
     run_date: date
+    provider: str = DEFAULT_PROVIDER  # 'gsv' when no token in the filename
 
 
 def generate_streetwalk_filename(
@@ -391,6 +408,7 @@ def generate_streetwalk_filename(
     step_length: float,
     spacing_m: float,
     run_date: date,
+    provider: str = DEFAULT_PROVIDER,
 ) -> str:
     """
     Base filename (no extension) for a road-walk collection snapshot.
@@ -400,14 +418,30 @@ def generate_streetwalk_filename(
     is the along-edge sample spacing in metres — the road-walk analogue of the
     grid step.
 
-    Example:
+    Args:
+        city_id: canonical sanitized city slug (see db.register_city)
+        grid_width/grid_height/step_length: frozen grid geometry in metres
+        spacing_m: along-edge sample spacing in metres
+        run_date: the walk's date, embedded as an ISO suffix
+        provider: imagery provider walked. Both providers walk the same sample
+            points, so both can be collected on the same night — the token is
+            what keeps their artifacts apart. 'gsv' emits no token, so GSV walk
+            filenames match the pre-provider convention exactly.
+
+    Examples:
         >>> from datetime import date
         >>> generate_streetwalk_filename("bend--oregon--united-states", 5000, 5000, 20, 15, date(2026, 7, 8))
         'bend--oregon--united-states_width_5000_height_5000_step_20_streetwalk_sp15_2026-07-08'
+        >>> generate_streetwalk_filename("bend--or", 5000, 5000, 20, 15, date(2026, 7, 8), provider='mapillary')
+        'bend--or_width_5000_height_5000_step_20_mapillary_streetwalk_sp15_2026-07-08'
     """
+    if provider not in KNOWN_PROVIDERS:
+        raise ValueError(f"Unknown provider {provider!r} (known: {', '.join(KNOWN_PROVIDERS)})")
+    provider_token = "" if provider == DEFAULT_PROVIDER else f"_{provider}"
     return (
         f"{city_id}_width_{int(grid_width)}_height_{int(grid_height)}"
-        f"_step_{int(step_length)}_{STREETWALK_MARKER}_sp{int(spacing_m)}_{run_date.isoformat()}"
+        f"_step_{int(step_length)}{provider_token}"
+        f"_{STREETWALK_MARKER}_sp{int(spacing_m)}_{run_date.isoformat()}"
     )
 
 
@@ -416,12 +450,16 @@ def parse_streetwalk_filename(filename: str) -> ParsedStreetwalkFilename:
     Parse a road-walk collection filename.
 
     Raises ValueError if the name is not a streetwalk file (including normal run
-    files, which never carry the '_streetwalk_' marker).
+    files, which never carry the '_streetwalk_' marker). A name with no provider
+    token is GSV, as everywhere else in the naming contract.
 
-    Example:
+    Examples:
         >>> p = parse_streetwalk_filename("bend--or_width_5000_height_5000_step_20_streetwalk_sp15_2026-07-08.csv.gz")
-        >>> (p.step_meters, p.spacing_meters, p.run_date.isoformat())
-        (20, 15, '2026-07-08')
+        >>> (p.step_meters, p.spacing_meters, p.run_date.isoformat(), p.provider)
+        (20, 15, '2026-07-08', 'gsv')
+        >>> p = parse_streetwalk_filename("bend--or_width_5000_height_5000_step_20_mapillary_streetwalk_sp15_2026-07-08.csv.gz")
+        >>> (p.slug, p.provider)
+        ('bend--or', 'mapillary')
     """
     base = os.path.basename(filename)
     for ext in _KNOWN_EXTENSIONS:
@@ -440,6 +478,7 @@ def parse_streetwalk_filename(filename: str) -> ParsedStreetwalkFilename:
         step_meters=int(match.group("s")),
         spacing_meters=int(match.group("spacing")),
         run_date=date.fromisoformat(match.group("date")),
+        provider=match.group("provider") or DEFAULT_PROVIDER,
     )
 
 

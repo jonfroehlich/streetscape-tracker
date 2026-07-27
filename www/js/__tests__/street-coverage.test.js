@@ -20,8 +20,6 @@ const {
   withStreetAlpha,
   fractionColor,
   normalizeStreetArtifact,
-  lookupStreetwalk,
-  fetchStreetwalkManifest,
   renderStreetCoverage,
   STREET_UNCOVERED_COLOR,
   STREET_COVERED_COLOR,
@@ -180,25 +178,9 @@ test("normalizeStreetArtifact: grid artifact is untouched and not flagged fracti
   assert.equal(meta.totals.covered, 7);
 });
 
-test("lookupStreetwalk: finds by city_id+provider, null on miss or absent manifest", () => {
-  const manifest = {
-    walks: [
-      { city_id: "seattle--wa", provider: "gsv", coverage_filename: "seattle_gsv.json.gz" },
-      { city_id: "seattle--wa", provider: "mapillary", coverage_filename: "seattle_mly.json.gz" },
-    ],
-  };
-  assert.equal(
-    lookupStreetwalk(manifest, "seattle--wa", "gsv").coverage_filename,
-    "seattle_gsv.json.gz"
-  );
-  assert.equal(
-    lookupStreetwalk(manifest, "seattle--wa", "mapillary").coverage_filename,
-    "seattle_mly.json.gz"
-  );
-  assert.equal(lookupStreetwalk(manifest, "portland--or", "gsv"), null);
-  assert.equal(lookupStreetwalk(null, "seattle--wa", "gsv"), null);
-  assert.equal(lookupStreetwalk({}, "seattle--wa", "gsv"), null);
-});
+// NOTE: lookupStreetwalk / fetchStreetwalkManifest moved to
+// streetscape-utils.js (the overview map and streets.html need them too);
+// their tests moved with them to streetscape-utils.test.js.
 
 // ── normalizeStreetArtifact edge cases ───────────────────────────────────────
 
@@ -261,30 +243,6 @@ test("normalizeStreetArtifact: a streetwalk artifact with no fractional signal i
     features: [{ properties: { covered: true, median_covered_age_years: 3 } }],
   };
   assert.equal(normalizeStreetArtifact(fc, "streetwalk").hasFractional, false);
-});
-
-// ── Manifest fetch ───────────────────────────────────────────────────────────
-
-test("fetchStreetwalkManifest: reads streetwalks.json.gz from the data base URL", async () => {
-  const seen = [];
-  global.fetchGzippedJson = async (url) => {
-    seen.push(url);
-    return { schema_version: 1, walks: [{ city_id: "bend--or", provider: "gsv" }] };
-  };
-  const manifest = await fetchStreetwalkManifest();
-  assert.deepEqual(seen, ["https://example.test/data/streetwalks.json.gz"]);
-  assert.equal(manifest.walks.length, 1);
-  delete global.fetchGzippedJson;
-});
-
-test("fetchStreetwalkManifest: a missing/unreadable manifest resolves null, never throws", async () => {
-  // Most deployments have no manifest yet — the overlay is optional, so a 404
-  // must degrade to "no road-walk overlay" rather than reject into city.js.
-  global.fetchGzippedJson = async () => {
-    throw new Error("404");
-  };
-  assert.equal(await fetchStreetwalkManifest(), null);
-  delete global.fetchGzippedJson;
 });
 
 // ── renderStreetCoverage: artifact discovery + initial mode ──────────────────

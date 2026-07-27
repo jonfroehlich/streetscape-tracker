@@ -43,7 +43,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from streetscape_metadata_tracker import db  # noqa: E402
+from streetscape_metadata_tracker import db, naming  # noqa: E402
 from streetscape_metadata_tracker.fileutils import load_city_csv_file  # noqa: E402
 from streetscape_metadata_tracker.json_summarizer import (  # noqa: E402
     generate_aggregate_v2,
@@ -144,7 +144,16 @@ def _record_simple_diff(conn, city_id, from_run, to_run, added):
     )
 
 
-def _add_streetwalk(conn, city_id, run_date, grid_origin, spacing_m=15.0, match_dist_m=25.0):
+def _add_streetwalk(
+    conn,
+    city_id,
+    run_date,
+    grid_origin,
+    spacing_m=15.0,
+    match_dist_m=25.0,
+    provider="gsv",
+    flat_only=False,
+):
     """
     Add a road-walk coverage artifact + catalog row for a city (issue #99/#155).
 
@@ -154,6 +163,12 @@ def _add_streetwalk(conn, city_id, run_date, grid_origin, spacing_m=15.0, match_
     full and a partial edge to color (and the by-type chart has two classes).
     The raw sample csv.gz is deliberately NOT written — the city page never
     fetches it, and the fixture stays small.
+
+    ``flat_only`` marks the covered samples as FLAT_ONLY instead of OK, which
+    is how a Mapillary walk records street that has flat/perspective imagery
+    but no 360° pano: it lifts the any-imagery number while leaving the 360°
+    number at zero (issue #116's distinction). Used to give the streets page a
+    second provider whose two coverage columns actually differ.
     """
     import geopandas as gpd
     import pandas as pd
@@ -188,28 +203,39 @@ def _add_streetwalk(conn, city_id, run_date, grid_origin, spacing_m=15.0, match_
                 "pano_lat": r.lat if _covered(r) else None,
                 "pano_lon": r.lon if _covered(r) else None,
                 "pano_id": f"sw{r.Index}" if _covered(r) else None,
-                "capture_date": "2022-06-01" if _covered(r) else None,
-                "copyright_info": "© Google" if _covered(r) else None,
-                "status": "OK" if _covered(r) else "ZERO_RESULTS",
+                "capture_date": (None if (flat_only or not _covered(r)) else "2022-06-01"),
+                "copyright_info": (
+                    None
+                    if not _covered(r)
+                    else ("© Mapillary contributor 42" if flat_only else "© Google")
+                ),
+                "status": (
+                    "ZERO_RESULTS" if not _covered(r) else ("FLAT_ONLY" if flat_only else "OK")
+                ),
                 "query_timestamp": f"{run_date.isoformat()}T00:00:00Z",
             }
             for r in samples.itertuples()
         ]
     )
 
+    # Named by the real generator so the fixture can't drift from the contract
+    # (it used to hand-build the provider token, which production code did not
+    # actually emit — the bug that let two providers collide on one filename).
     csv_name = (
-        f"{city_id}_width_{W}_height_{H}_step_{STEP}"
-        f"_streetwalk_sp{int(spacing_m)}_{run_date.isoformat()}.csv.gz"
+        naming.generate_streetwalk_filename(
+            city_id, W, H, STEP, spacing_m, run_date, provider=provider
+        )
+        + ".csv.gz"
     )
-    coverage_name = csv_name[: -len(".csv.gz")] + "_coverage.json.gz"
+    coverage_name = naming.streetwalk_coverage_filename(csv_name)
 
     covered = street_coverage.compute_streetwalk_coverage(
-        edges, samples, collected, run_date.isoformat(), "gsv", match_dist_m
+        edges, samples, collected, run_date.isoformat(), provider, match_dist_m
     )
     geojson = street_coverage.build_streetwalk_geojson(
         covered,
         city_id=city_id,
-        provider="gsv",
+        provider=provider,
         run_date=run_date.isoformat(),
         spacing_m=spacing_m,
         match_dist_m=match_dist_m,
@@ -224,6 +250,7 @@ def _add_streetwalk(conn, city_id, run_date, grid_origin, spacing_m=15.0, match_
         city_id=city_id,
         run_date=run_date,
         csv_filename=csv_name,
+        provider=provider,
         coverage_filename=coverage_name,
         spacing_m=spacing_m,
         match_dist_m=match_dist_m,
@@ -232,6 +259,7 @@ def _add_streetwalk(conn, city_id, run_date, grid_origin, spacing_m=15.0, match_
         edges_fully_covered=totals["edges_fully_covered"],
         mean_edge_coverage=totals["mean_edge_coverage"],
         coverage_pct_by_length=totals["coverage_pct_by_length"],
+        coverage_pct_by_length_any=totals["coverage_pct_by_length_any"],
     )
 
 
@@ -336,6 +364,17 @@ def build():
         # page must render it in place of the grid overlay, while Zero/Map Ville
         # exercise the "manifest present, no entry for me" path.
         _add_streetwalk(conn, alpha, date(2026, 4, 15), grid_origin=(44.00, -121.00))
+        # A Mapillary walk on the Mapillary city, recorded as flat-only imagery
+        # so the streets page has a second provider AND a row whose 360° and
+        # any-imagery numbers differ.
+        _add_streetwalk(
+            conn,
+            mapv,
+            date(2026, 4, 15),
+            grid_origin=(46.00, -119.00),
+            provider="mapillary",
+            flat_only=True,
+        )
 
         # 5) Aggregate → cities.json.gz (schema v3) + the streetwalk sidecar
         # manifest, both written into FIXTURE_DIR (as the real pipeline does).

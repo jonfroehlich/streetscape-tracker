@@ -216,43 +216,10 @@ function applyStreetStyles(layer, mode, provider, selection) {
   });
 }
 
-/**
- * URL of the sidecar streetwalk manifest (issue #155) — the index of the latest
- * road-walk coverage artifact per (city, provider), keyed so the city page can
- * find an artifact it cannot derive from the grid run filename.
- * @returns {string}
- */
-function streetwalkManifestUrl() {
-  return STREETSCAPE_DATA_BASE_URL + "streetwalks.json.gz";
-}
-
-/**
- * Fetch the streetwalk manifest, or null when it's absent/unreadable (the
- * feature is optional — most deployments won't have one yet).
- * @returns {Promise<?Object>}
- */
-async function fetchStreetwalkManifest() {
-  try {
-    return await fetchGzippedJson(streetwalkManifestUrl());
-  } catch (e) {
-    console.info("No streetwalk manifest (skipping road-walk overlay):", e.message);
-    return null;
-  }
-}
-
-/**
- * Find a city+provider's streetwalk entry in the manifest, or null.
- * @param {?Object} manifest - The parsed streetwalks.json.gz, or null.
- * @param {string} cityId
- * @param {string} provider
- * @returns {?Object} The walk record (with `coverage_filename`), or null.
- */
-function lookupStreetwalk(manifest, cityId, provider) {
-  if (!manifest || !Array.isArray(manifest.walks)) return null;
-  return (
-    manifest.walks.find((w) => w.city_id === cityId && w.provider === provider) || null
-  );
-}
+// NOTE: the streetwalk-manifest helpers (streetwalkManifestUrl,
+// fetchStreetwalkManifest, lookupStreetwalk) used to live here, but the
+// overview map and streets.html need them too — they now live in
+// streetscape-utils.js and reach this file as globals, like getColor.
 
 /**
  * Normalize either street-coverage artifact into the single internal shape the
@@ -725,8 +692,6 @@ if (typeof module !== "undefined" && module.exports) {
     fractionColor,
     hexToRgb,
     normalizeStreetArtifact,
-    fetchStreetwalkManifest,
-    lookupStreetwalk,
     renderStreetCoverage,
     STREET_UNCOVERED_COLOR,
     STREET_COVERED_COLOR,

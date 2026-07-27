@@ -17,6 +17,9 @@ Assertions (seeded from the manual run):
   * 0-pano city shows ``—``, not the Unix epoch date (#122 / #69)
   * road-walk street coverage renders from the sidecar manifest, opening on the
     fractional ramp; a city with no walk renders none, silently (#155)
+  * street coverage is discoverable from the site root: the shared header, the
+    streets.html listing, the "Street coverage" overview metric, and the
+    always-on popup line
   * console/page-error clean on both pages and providers
 """
 
@@ -372,6 +375,174 @@ def test_city_page_renders_the_road_walk_street_overlay(page: Page, base_url):
     _expect_street_ink(page, drawn=False)
     page.locator("#street-layer-toggle").check()
     _expect_street_ink(page, drawn=True)
+
+    assert errors == []
+
+
+def test_site_header_navigates_and_clears_the_floating_panels(page: Page, base_url):
+    """
+    The shared header is the site's only navigation — before it, street
+    coverage had no path from the site root at all. It floats over a
+    full-bleed map, so it must also not sit on top of the panels it shares
+    the viewport with.
+    """
+    errors = _capture_errors(page)
+    page.goto(f"{base_url}/index.html")
+
+    header = page.locator("header.site-header")
+    expect(header).to_be_visible()
+    header_box = header.bounding_box()
+    assert header_box and header_box["height"] > 0
+
+    # Panels start below the header rather than under it.
+    for selector in ("#stats", ".city-search", "#legend"):
+        box = page.locator(selector).bounding_box()
+        assert box, f"{selector} has no bounding box"
+        assert box["y"] >= header_box["y"] + header_box["height"], (
+            f"{selector} overlaps the site header (y={box['y']})"
+        )
+
+    # The Streets nav item is the entry point to the road-walk listing.
+    page.locator('.site-nav a[href="streets.html"]').click()
+    page.wait_for_url("**/streets.html")
+    expect(page.locator("h1")).to_contain_text("Street-level coverage")
+
+    # The city page carries the same header, and its "Map" item is the way
+    # back (it replaced the old standalone #back-link).
+    page.goto(f"{base_url}/city.html?file={ALPHA_LATEST}")
+    expect(page.locator("header.site-header")).to_be_visible()
+    page.locator('.site-nav a[href="index.html"]').click()
+    page.wait_for_url("**/index.html")
+
+    assert errors == []
+
+
+def test_streets_page_lists_published_road_walks(page: Page, base_url):
+    """
+    streets.html joins the manifest against the aggregate: the manifest has no
+    display name and no run filename, so a row can only name Alpha City and
+    link to its map if that join worked.
+    """
+    errors = _capture_errors(page)
+    page.goto(f"{base_url}/streets.html")
+
+    rows = page.locator("#streets-tbody tr")
+    expect(rows).to_have_count(2)  # one GSV walk, one Mapillary walk
+
+    # Default sort is best 360° coverage first, so Alpha City (85.1%) leads
+    # Map Ville (0.0% by pano, flat imagery only).
+    alpha_row = rows.first
+    expect(alpha_row).to_contain_text("Alpha City")
+    expect(alpha_row).to_contain_text("Google Street View")
+    expect(alpha_row).to_contain_text("85.1%")
+    expect(alpha_row).to_contain_text("2026-04-15")
+    expect(rows.nth(1)).to_contain_text("Mapillary")
+
+    # The link target comes from the aggregate, not the manifest.
+    expect(alpha_row.locator("a.streets-view-link")).to_have_attribute(
+        "href", f"city.html?file={ALPHA_LATEST}"
+    )
+    expect(page.locator("#streets-caption")).to_contain_text("2 published road-walk collections")
+
+    # And it actually lands on the city page with the overlay.
+    alpha_row.locator("a.streets-view-link").click()
+    page.wait_for_url(f"**/city.html?file={ALPHA_LATEST}")
+    expect(page.locator("#street-coverage-container")).to_be_visible()
+
+    assert errors == []
+
+
+def test_streets_page_separates_360_and_any_imagery_coverage(page: Page, base_url):
+    """The Mapillary fixture walk is flat-imagery-only: 0% by 360° pano, 85.1%
+    counting any imagery. The two columns must show that difference rather
+    than one silently standing in for the other."""
+    errors = _capture_errors(page)
+    page.goto(f"{base_url}/streets.html")
+
+    mapillary_row = page.locator("#streets-tbody tr", has_text="Mapillary")
+    cells = mapillary_row.locator("td.coverage-cell")
+    expect(cells).to_have_count(2)
+    expect(cells.nth(0)).to_have_text("0.0%")  # 360° only
+    expect(cells.nth(1)).to_have_text("85.1%")  # including flat imagery
+
+    assert errors == []
+
+
+def test_streets_table_sorts_on_header_click(page: Page, base_url):
+    errors = _capture_errors(page)
+    page.goto(f"{base_url}/streets.html")
+    rows = page.locator("#streets-tbody tr")
+    expect(rows).to_have_count(2)
+
+    # Opens on best-360°-coverage-first.
+    expect(page.locator('th[data-key="pct"]')).to_have_attribute("aria-sort", "descending")
+    expect(rows.first).to_contain_text("Alpha City")
+
+    # Sorting by city name ascending puts Alpha first, descending flips it.
+    page.locator('th[data-key="label"] button').click()
+    expect(page.locator('th[data-key="label"]')).to_have_attribute("aria-sort", "ascending")
+    expect(page.locator('th[data-key="pct"]')).to_have_attribute("aria-sort", "none")
+    expect(rows.first).to_contain_text("Alpha City")
+
+    page.locator('th[data-key="label"] button').click()
+    expect(page.locator('th[data-key="label"]')).to_have_attribute("aria-sort", "descending")
+    expect(rows.first).to_contain_text("Map Ville")
+
+    # Any-imagery column: both rows are 85.1%, so the city_id tiebreak keeps
+    # the order stable rather than shuffling on every click.
+    page.locator('th[data-key="pctAny"] button').click()
+    expect(rows.first).to_contain_text("Alpha City")
+
+    assert errors == []
+
+
+def test_streets_metric_colors_only_the_walked_cities(page: Page, base_url):
+    """
+    The "Street coverage" metric reads values merged from the sidecar manifest
+    (they are not in cities.json.gz — that is #102). Unwalked cities must fall
+    to "No data" rather than borrowing their grid coverage rate.
+    """
+    errors = _capture_errors(page)
+    page.goto(f"{base_url}/index.html?metric=streets")
+
+    expect(page.locator('input[name="metric"][value="streets"]')).to_be_checked()
+    expect(page.locator("#legend h4")).to_have_text("Street Coverage (% of street-km)")
+
+    # Both GSV cities still draw; only one of them has a value.
+    expect(page.locator("path.leaflet-interactive")).to_have_count(2)
+    expect(page.locator("#legend")).to_contain_text("No data (1)")
+
+    # The banner states the sparse denominator outright.
+    expect(page.locator("#stats")).to_contain_text("1 of 2 Google Street View cities walked")
+
+    assert errors == []
+
+
+def test_overview_popup_shows_street_coverage_in_the_default_metric(page: Page, base_url):
+    """
+    The popup line is the main discovery surface — it must appear without the
+    visitor first switching to the streets metric, and only for walked cities.
+    """
+    errors = _capture_errors(page)
+    page.goto(f"{base_url}/index.html")  # default age mode
+
+    rects = page.locator("path.leaflet-interactive")
+    expect(rects).to_have_count(2)
+
+    popup = page.locator(".leaflet-popup-content")
+    with_line = []
+    for i in range(rects.count()):
+        rects.nth(i).click(force=True)
+        expect(popup).to_have_count(1)
+        text = popup.inner_text()
+        if "Street Coverage" in text:
+            with_line.append(text)
+        page.keyboard.press("Escape")
+        expect(popup).to_have_count(0)
+
+    assert len(with_line) == 1, "exactly one fixture city has a road-walk"
+    assert "85.1% of street-km" in with_line[0]
+    assert "road-walk" in with_line[0]
 
     assert errors == []
 
