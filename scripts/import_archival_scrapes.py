@@ -11,8 +11,9 @@ schema plus a per-run JSON summary, registered against the catalog:
    config.METADATA_DTYPES columns. Empty status -> OK; literal "None"
    pano_id/date -> null; capture_date YYYY-MM -> YYYY-MM-01;
    copyright_info null everywhere (never captured; the run JSON carries
-   copyright_info_available=false); query_timestamp = the file's git
-   first-commit date (the honest precision of the scrape date).
+   copyright_info_available=false); query_timestamp = the file's LAST
+   git commit date (the honest precision of the scrape date — the commit
+   that produced the content actually imported from the checkout).
 2. Derive the run's grid extent from the sibling bounding_box.json
    (query-point extent when absent) for the filename's width/height;
    step is always 30 m (the predecessor's grid).
@@ -30,6 +31,13 @@ coordinates, not query coordinates, on OK rows — their grid/coverage
 stats are approximate; pano-level data is exact.
 
 Idempotent: already-registered files are skipped, so it is safe to re-run.
+Self-repairing: when a manifest date is corrected after an import, re-running
+detects the already-imported run under its old date (same city + geometry,
+different date), and with --execute re-dates it in place — old artifacts and
+catalog row are replaced by freshly translated ones under the corrected date.
+Datasets in SUPERSEDED are likewise purged if a past manifest imported them.
+After a repair, publish with `./sync_data_to_server.sh --delete` so the
+stale-dated files disappear from the web server too.
 
 Usage:
     python scripts/import_archival_scrapes.py                # dry run
@@ -91,43 +99,55 @@ class ArchivalDataset:
     identity: tuple[str, str, str] | None = None
 
 
-# Run dates are the git first-commit dates of each CSV in the
-# gsv-capture-dates repo (file mtimes are checkout times). Do not derive
-# rel_csv from the query: the Washington D.C. basenames carry a trailing
-# period and their two directories share one basename.
+# Run dates are the LAST git commit date of each CSV in the
+# gsv-capture-dates repo — the commit whose content the checkout (and thus
+# this import) carries. File mtimes are checkout times, and first-commit
+# dates are unusable: the original import derived them via `git log
+# --follow`, whose rename detection chained several single-commit files to
+# unrelated 2023-11-03 ancestors, misdating 10 runs by up to ~10 months
+# (caught post-import; the repair path below re-dates them). Do not derive
+# rel_csv from the query: the Washington D.C. basename carries a trailing
+# period.
+# Queries are pinned to each city's catalog identity (sanitized, they equal
+# the canonical city_id), so the catalog lookup never needs Nominatim once a
+# city is registered — required for the re-date repair, whose dry run must
+# resolve cities without geocoding to see their already-imported runs.
 MANIFEST = [
     ArchivalDataset(
         "Berkeley/Berkeley_30_coords.csv",
-        "Berkeley, California",
-        date(2023, 11, 5),
+        "Berkeley, California, United States",
+        date(2023, 11, 7),
         "v2_headerless",
     ),
     ArchivalDataset(
         "Burnaby, Canada/Burnaby, Canada_30_coords.csv",
         "Burnaby, British Columbia, Canada",
-        date(2023, 11, 3),
+        date(2024, 4, 11),
         "v2",
     ),
     ArchivalDataset(
-        "Chicago/Chicago_30_coords.csv", "Chicago, Illinois", date(2023, 11, 5), "v2_headerless"
+        "Chicago/Chicago_30_coords.csv", "Chicago, Illinois", date(2023, 11, 7), "v2_headerless"
     ),
     ArchivalDataset(
         "Cuenca, Ecuador/Cuenca, Ecuador_30_coords.csv", "Cuenca, Ecuador", date(2023, 12, 12), "v2"
     ),
     ArchivalDataset(
-        "Denison, Texas/Denison, Texas_30_coords.csv", "Denison, Texas", date(2023, 12, 5), "v2"
+        "Denison, Texas/Denison, Texas_30_coords.csv",
+        "Denison, Texas, United States",
+        date(2023, 12, 5),
+        "v2",
     ),
     ArchivalDataset(
         "East Hollywood, CA/East Hollywood, CA_30_coords.csv",
         "East Hollywood, Los Angeles, CA",
-        date(2023, 11, 3),
+        date(2024, 9, 16),
         "v2",
         identity=("East Hollywood", "California", "United States"),
     ),
     ArchivalDataset(
         "Hamilton, New Zealand/Hamilton, New Zealand_30_coords.csv",
-        "Hamilton, New Zealand",
-        date(2023, 11, 3),
+        "Hamilton City, Waikato, New Zealand",
+        date(2024, 7, 16),
         "v2",
     ),
     # Queries below match existing catalog display_names exactly (these
@@ -155,18 +175,18 @@ MANIFEST = [
     ArchivalDataset(
         "Oradell, New Jersey/Oradell, New Jersey_30_coords.csv",
         "Oradell, New Jersey, United States",
-        date(2023, 11, 3),
+        date(2023, 12, 5),
         "v2",
     ),
     ArchivalDataset(
         "Pittsburgh, Pennsylvania/Pittsburgh, Pennsylvania_30_coords.csv",
         "Pittsburgh, Pennsylvania, United States",
-        date(2023, 11, 3),
+        date(2023, 12, 12),
         "v2",
     ),
     ArchivalDataset(
         "Point Roberts, WA/Point Roberts, WA_30_coords.csv",
-        "Point Roberts, WA",
+        "Point Roberts, Washington, United States",
         date(2023, 11, 5),
         "v1",
     ),
@@ -179,11 +199,11 @@ MANIFEST = [
     ),
     ArchivalDataset(
         "Riverdale Park, Maryland/Riverdale Park, Maryland_30_coords.csv",
-        "Riverdale Park, Maryland",
+        "Riverdale Park, Maryland, United States",
         date(2024, 2, 14),
         "v2",
     ),
-    ArchivalDataset("Seattle/Seattle_30_coords.csv", "Seattle, WA", date(2023, 11, 5), "v1"),
+    ArchivalDataset("Seattle/Seattle_30_coords.csv", "Seattle, WA", date(2023, 11, 6), "v1"),
     # Query matches the catalog display_name exactly: "St. Louis, Missouri"
     # alone resolves nothing, and re-geocoding risks identity drift
     ArchivalDataset(
@@ -194,16 +214,13 @@ MANIFEST = [
     ),
     ArchivalDataset(
         "Swissvale, Pennsylvania/Swissvale, Pennsylvania_30_coords.csv",
-        "Swissvale, Pennsylvania",
+        "Swissvale, Pennsylvania, United States",
         date(2024, 2, 21),
         "v2",
     ),
     ArchivalDataset(
-        "Washington D.C/Washington D.C._30_coords.csv", "Washington, D.C.", date(2023, 11, 3), "v2"
-    ),
-    ArchivalDataset(
-        "Washington D.C 10000x10000/Washington D.C._30_coords.csv",
-        "Washington, D.C.",
+        "Washington D.C/Washington D.C._30_coords.csv",
+        "Washington, District of Columbia, United States",
         date(2024, 4, 11),
         "v2",
     ),
@@ -212,7 +229,7 @@ MANIFEST = [
     ArchivalDataset(
         "Zurich, Switzerland/Zurich, Switzerland_30_coords.csv",
         "Zurich, Zurich, Switzerland",
-        date(2023, 11, 3),
+        date(2023, 12, 12),
         "v2",
     ),
 ]
@@ -229,6 +246,25 @@ SKIPPED = [
         "Reinsletta, Norway 7500x5000m/Reinsletta, Norway_30_coords.csv",
         "smaller variant of the imported Reinsletta run, same scrape date "
         "(runs are unique per city+date)",
+    ),
+    (
+        "Washington D.C 10000x10000/Washington D.C._30_coords.csv",
+        "smaller variant of the imported D.C. run, same scrape date "
+        "(runs are unique per city+date; both files landed in the same "
+        "2024-04-11 commit)",
+    ),
+]
+
+# Runs a PAST manifest imported that the current one no longer includes.
+# The date-correction repair collapsed both D.C. datasets onto 2024-04-11
+# (see MANIFEST comment), so the smaller variant — imported before the
+# collision existed — must be purged before the main D.C. run can take its
+# true date. Keyed by exact registered csv_filename; ignored when absent.
+SUPERSEDED = [
+    (
+        "washington--district-of-columbia--united-states_width_9899_height_9980"
+        "_step_30_2024-04-11.csv.gz",
+        "superseded by the full-extent D.C. run re-dated to 2024-04-11",
     ),
 ]
 
@@ -371,6 +407,11 @@ def resolve_or_register_city(
     locality-grade datasets that Nominatim resolves to a parent city.
     """
     city_row = db.resolve_city(conn, entry.query)
+    # Identity-carrying entries also resolve via their derived canonical id,
+    # so a registered city is found without geocoding (the query alone may
+    # not match: "East Hollywood, Los Angeles, CA" was a geocoder hint)
+    if city_row is None and entry.identity is not None:
+        city_row = db.resolve_city(conn, db.derive_city_id(*entry.identity))
     if city_row is not None:
         return city_row, "existing city"
 
@@ -422,11 +463,69 @@ def resolve_or_register_city(
     return db.resolve_city(conn, city_id), f"NEW city registered ({width}x{height}m)"
 
 
-def load_manifest_override(path: str) -> list[ArchivalDataset]:
-    """Load a manifest override (JSON list of dataset dicts) — for tests."""
+def find_misdated_run(conn, city_id: str, width: int, height: int, run_date: date):
+    """
+    An already-imported archival run of the same city and grid extent under a
+    DIFFERENT date — the signature of a manifest date correction (the original
+    import derived dates from rename-polluted `git --follow` history). Matched
+    on the filename's geometry prefix in Python, not SQL LIKE, so underscores
+    in city ids can't act as wildcards.
+    """
+    prefix = f"{city_id}_width_{width}_height_{height}_step_{ARCHIVAL_STEP_M}_"
+    rows = conn.execute(
+        """SELECT * FROM runs
+           WHERE city_id = ? AND provider = 'gsv' AND is_baseline = 1
+             AND run_date != ?""",
+        (city_id, run_date.isoformat()),
+    ).fetchall()
+    return next((r for r in rows if r["csv_filename"].startswith(prefix)), None)
+
+
+def delete_run(conn, data_dir: str, run_row, execute: bool) -> list[str]:
+    """
+    Remove one archival run: its csv/json artifacts first, then the catalog
+    row (file-first ordering, like purge_tainted_runs, so a failed delete
+    can't orphan a published file behind a missing row). Returns the artifact
+    basenames for the stale-publish report. Refuses runs referenced by
+    run_diffs — archival runs never are, so a reference means this row is not
+    what we think it is.
+    """
+    run_id = run_row["run_id"]
+    n_diffs = conn.execute(
+        "SELECT COUNT(*) FROM run_diffs WHERE from_run_id = ? OR to_run_id = ?",
+        (run_id, run_id),
+    ).fetchone()[0]
+    if n_diffs:
+        raise RuntimeError(
+            f"Refusing to delete run {run_row['csv_filename']}: "
+            f"{n_diffs} run_diffs row(s) reference it"
+        )
+    json_filename = run_row["json_filename"] or run_row["csv_filename"].replace(
+        ".csv.gz", ".json.gz"
+    )
+    basenames = [run_row["csv_filename"], json_filename]
+    if execute:
+        for name in basenames:
+            path = os.path.join(data_dir, name)
+            if os.path.exists(path):
+                os.remove(path)
+        conn.execute("DELETE FROM runs WHERE run_id = ?", (run_id,))
+        conn.commit()
+    return basenames
+
+
+def load_manifest_override(
+    path: str,
+) -> tuple[list[ArchivalDataset], list[tuple[str, str]]]:
+    """
+    Load a manifest override — for tests. Either a JSON list of dataset dicts
+    (legacy) or an object {"datasets": [...], "superseded": [[csv, reason]]}.
+    """
     with open(path, encoding="utf-8") as f:
-        entries = json.load(f)
-    return [
+        raw = json.load(f)
+    entries = raw["datasets"] if isinstance(raw, dict) else raw
+    superseded = [tuple(s) for s in raw.get("superseded", [])] if isinstance(raw, dict) else []
+    datasets = [
         ArchivalDataset(
             rel_csv=e["rel_csv"],
             query=e["query"],
@@ -436,6 +535,7 @@ def load_manifest_override(path: str) -> list[ArchivalDataset]:
         )
         for e in entries
     ]
+    return datasets, superseded
 
 
 def main() -> int:
@@ -475,7 +575,10 @@ def main() -> int:
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
 
-    manifest = load_manifest_override(args.manifest) if args.manifest else MANIFEST
+    if args.manifest:
+        manifest, superseded = load_manifest_override(args.manifest)
+    else:
+        manifest, superseded = MANIFEST, SUPERSEDED
     db_path = args.db_path or db.get_default_db_path(args.data_dir)
     mode = "EXECUTE" if args.execute else "DRY RUN"
     print(f"=== Archival scrape import ({mode}) ===")
@@ -484,8 +587,22 @@ def main() -> int:
     print(f"Catalog:  {db_path}\n")
 
     conn = db.connect(db_path)
-    n_imported = n_already = n_skipped = 0
+    n_imported = n_already = n_skipped = n_redated = n_purged = 0
     report_lines = []
+    stale_artifacts = []  # removed basenames, possibly still on the server
+    pending_removal = set()  # csv_filenames slated for deletion this pass
+
+    # Purge superseded runs first: the D.C. date correction re-dates the main
+    # run onto the day its smaller variant occupies, so the variant must go
+    # before the re-date can register (runs are UNIQUE per city+date).
+    for fname, reason in superseded:
+        row = conn.execute("SELECT * FROM runs WHERE csv_filename = ?", (fname,)).fetchone()
+        if row is None:
+            continue
+        report_lines.append(f"  PURGE    {fname}: {reason}")
+        pending_removal.add(fname)
+        n_purged += 1
+        stale_artifacts.extend(delete_run(conn, args.data_dir, row, args.execute))
 
     for entry in manifest:
         src_path = os.path.join(args.source_root, entry.rel_csv)
@@ -531,20 +648,38 @@ def main() -> int:
             report_lines.append(f"  ALREADY  {label} -> {csv_filename}")
             n_already += 1
             continue
-        if conn.execute(
-            "SELECT 1 FROM runs WHERE city_id = ? AND provider = 'gsv' AND run_date = ?",
+
+        # A same-city+extent run under a different date is this dataset,
+        # imported before a manifest date correction: re-date it (replace row
+        # and artifacts) instead of importing a duplicate.
+        misdated = find_misdated_run(conn, city_row.city_id, width, height, entry.run_date)
+
+        conflict = conn.execute(
+            "SELECT csv_filename FROM runs WHERE city_id = ? AND provider = 'gsv' AND run_date = ?",
             (city_row.city_id, entry.run_date.isoformat()),
-        ).fetchone():
+        ).fetchone()
+        # Ignore a conflicting row already slated for removal this pass (a
+        # dry run leaves purged rows in place but the plan must match what
+        # --execute would do)
+        if conflict and conflict["csv_filename"] not in pending_removal:
             report_lines.append(
                 f"  SKIP     {label}: {city_row.city_id} already has a gsv run on {entry.run_date}"
             )
             n_skipped += 1
             continue
 
-        report_lines.append(
-            f"  IMPORT   {label} -> {csv_filename} "
-            f"({len(df)} rows, {n_ok} OK, {width}x{height}m; {note})"
-        )
+        if misdated is not None:
+            report_lines.append(
+                f"  REDATE   {label}: {misdated['run_date']} -> {entry.run_date} "
+                f"({misdated['csv_filename']} -> {csv_filename})"
+            )
+            n_redated += 1
+            stale_artifacts.extend(delete_run(conn, args.data_dir, misdated, args.execute))
+        else:
+            report_lines.append(
+                f"  IMPORT   {label} -> {csv_filename} "
+                f"({len(df)} rows, {n_ok} OK, {width}x{height}m; {note})"
+            )
 
         if not args.execute:
             n_imported += 1
@@ -588,7 +723,10 @@ def main() -> int:
 
     # ── Report ────────────────────────────────────────────────────────────
     verb = "Imported" if args.execute else "Would import"
-    print(f"{verb}: {n_imported}   already registered: {n_already}   skipped: {n_skipped}\n")
+    print(
+        f"{verb}: {n_imported}   already registered: {n_already}   "
+        f"skipped: {n_skipped}   re-dated: {n_redated}   purged: {n_purged}\n"
+    )
     for line in report_lines:
         print(line)
 
@@ -609,6 +747,13 @@ def main() -> int:
     if not args.no_publish_json:
         generate_aggregate_v2(conn, args.data_dir)
         print(f"\nRegenerated aggregate: {os.path.join(args.data_dir, 'cities.json.gz')}")
+    if stale_artifacts:
+        print(
+            "\nRemoved artifacts that may still be published; run "
+            "./sync_data_to_server.sh --delete to drop them from the server:"
+        )
+        for name in stale_artifacts:
+            print(f"  {name}")
     print(f"\nDone. {n_imported} baseline runs registered.")
     return 0
 
