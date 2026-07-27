@@ -281,7 +281,9 @@ def main() -> int:
     args = parser.parse_args()
 
     conn = db.connect(db.get_default_db_path(args.data_dir))
-    cities = db.get_all_cities(conn, enabled_only=True)
+    # Disabled cities included on purpose: sampling-frame cities register with
+    # enabled=0 precisely so this audit can vet them before collection (#110).
+    cities = db.get_all_cities(conn)
     if args.city:
         wanted = set(args.city)
         cities = [c for c in cities if c.city_id in wanted]
