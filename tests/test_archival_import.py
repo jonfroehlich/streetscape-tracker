@@ -374,6 +374,133 @@ def test_manifest_identity_registers_without_geocoding(source_root, data_dir, tm
     conn.close()
 
 
+def test_redate_after_manifest_date_correction(source_root, data_dir, tmp_path):
+    # A manifest date correction (issue #93 follow-up: the original dates
+    # came from rename-polluted `git --follow` history) re-dates the
+    # already-imported run in place instead of importing a duplicate
+    csv_path = os.path.join(source_root, "Oldtown/Oldtown_30_coords.csv")
+    _write_v1_csv(csv_path, ok_rows=[(44.001, -121.001, "pA", "2021-08")], fail_rows=[])
+    city_id = _register_city(data_dir, "Oldtown", None, "Testland")
+    entry = {
+        "rel_csv": "Oldtown/Oldtown_30_coords.csv",
+        "query": "Oldtown, Testland",
+        "run_date": "2023-11-03",
+        "fmt": "v1",
+    }
+    wrong = _write_manifest(str(tmp_path / "wrong.json"), [entry])
+    result = _run_import(source_root, data_dir, wrong, "--execute")
+    assert result.returncode == 0, result.stderr
+
+    conn = db.connect(os.path.join(data_dir, "streetscape_tracker.db"))
+    old_run = db.get_latest_run(conn, city_id)
+    conn.close()
+    assert old_run.run_date == "2023-11-03"
+
+    corrected = _write_manifest(
+        str(tmp_path / "corrected.json"), [{**entry, "run_date": "2024-07-16"}]
+    )
+
+    # Dry run narrates the re-date but changes nothing
+    result = _run_import(source_root, data_dir, corrected)
+    assert result.returncode == 0, result.stderr
+    assert "REDATE" in result.stdout
+    assert "2023-11-03 -> 2024-07-16" in result.stdout
+    assert os.path.exists(os.path.join(data_dir, old_run.csv_filename))
+
+    result = _run_import(source_root, data_dir, corrected, "--execute")
+    assert result.returncode == 0, result.stderr
+    assert "re-dated: 1" in result.stdout
+    assert "sync_data_to_server.sh --delete" in result.stdout
+
+    conn = db.connect(os.path.join(data_dir, "streetscape_tracker.db"))
+    runs = db.get_runs_for_city(conn, city_id)
+    conn.close()
+    assert [r.run_date for r in runs] == ["2024-07-16"]
+    new_run = runs[0]
+    assert new_run.is_baseline and "_step_30_2024-07-16" in new_run.csv_filename
+    # Old artifacts are gone; the new snapshot carries the corrected date
+    for name in (old_run.csv_filename, old_run.json_filename):
+        assert not os.path.exists(os.path.join(data_dir, name))
+    df = load_city_csv_file(os.path.join(data_dir, new_run.csv_filename))
+    assert df["query_timestamp"].eq("2024-07-16T00:00:00+00:00").all()
+
+    # A further re-run is a no-op
+    result = _run_import(source_root, data_dir, corrected, "--execute")
+    assert result.returncode == 0, result.stderr
+    assert "already registered: 1" in result.stdout
+    assert "re-dated: 0" in result.stdout
+
+
+def test_superseded_variant_purged_before_redate(source_root, data_dir, tmp_path):
+    # The Washington D.C. repair: the main run's corrected date lands on the
+    # day its smaller variant occupies, so the variant is purged first and
+    # the main run then takes that date
+    main = os.path.join(source_root, "DC/DC_30_coords.csv")
+    variant = os.path.join(source_root, "DC 10k/DC_30_coords.csv")
+    _write_v2_csv(
+        main,
+        [
+            (44.0011, -121.0011, 44.001, -121.001, "p1", "2020-05"),
+            (44.0021, -121.0011, 44.002, -121.001, "p2", "2021-06"),
+        ],
+        [(44.003, -121.001)],
+    )
+    _write_v2_csv(
+        variant, [(44.0011, -121.0011, 44.001, -121.001, "p1", "2020-05")], [(44.002, -121.001)]
+    )
+    _write_bbox(main, 44.0, 44.09, -121.09, -121.0)
+    _write_bbox(variant, 44.0, 44.01, -121.01, -121.0)
+    city_id = _register_city(data_dir, "Deecee", None, "Testland")
+    main_entry = {
+        "rel_csv": "DC/DC_30_coords.csv",
+        "query": "Deecee, Testland",
+        "run_date": "2023-11-03",
+        "fmt": "v2",
+    }
+    original = _write_manifest(
+        str(tmp_path / "original.json"),
+        [
+            main_entry,
+            {**main_entry, "rel_csv": "DC 10k/DC_30_coords.csv", "run_date": "2024-04-11"},
+        ],
+    )
+    result = _run_import(source_root, data_dir, original, "--execute")
+    assert result.returncode == 0, result.stderr
+
+    conn = db.connect(os.path.join(data_dir, "streetscape_tracker.db"))
+    runs = db.get_runs_for_city(conn, city_id)
+    conn.close()
+    assert [r.run_date for r in runs] == ["2023-11-03", "2024-04-11"]
+    variant_run = runs[1]
+
+    corrected = _write_manifest(
+        str(tmp_path / "corrected.json"),
+        {
+            "datasets": [{**main_entry, "run_date": "2024-04-11"}],
+            "superseded": [[variant_run.csv_filename, "superseded by the full-extent run"]],
+        },
+    )
+    result = _run_import(source_root, data_dir, corrected, "--execute")
+    assert result.returncode == 0, result.stderr
+    assert "PURGE" in result.stdout
+    assert "purged: 1" in result.stdout and "re-dated: 1" in result.stdout
+
+    conn = db.connect(os.path.join(data_dir, "streetscape_tracker.db"))
+    runs = db.get_runs_for_city(conn, city_id)
+    conn.close()
+    assert len(runs) == 1
+    run = runs[0]
+    assert run.run_date == "2024-04-11"
+    assert run.total_points == 3  # the main dataset's extent, not the variant's
+    assert not os.path.exists(os.path.join(data_dir, variant_run.csv_filename))
+
+    # Aggregate reflects the single surviving run
+    with gzip.open(os.path.join(data_dir, "cities.json.gz"), "rt") as f:
+        agg = json.load(f)
+    rec = next(c for c in agg["cities"] if c["city_id"] == city_id)
+    assert len(rec["providers"]["gsv"]["runs"]) == 1
+
+
 def test_format_mismatch_is_reported_not_fatal(source_root, data_dir, tmp_path):
     csv_path = os.path.join(source_root, "Mix/Mix_30_coords.csv")
     _write_v2_csv(
