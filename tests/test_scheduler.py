@@ -518,7 +518,7 @@ def test_budget_ledger_defers_second_city_when_first_consumes_budget(conn, monke
 
     ran = []
 
-    def fake_run(cfg, city, run_today, provider="gsv", connection_limit=None):
+    def fake_run(cfg, city, run_today, provider="gsv", connection_limit=None, budget_remaining=0, conn=None):
         # Simulate the real pipeline's ledger write for the requests spent
         db.add_api_usage(conn, run_today, sched.estimate_requests(city, provider), provider)
         ran.append(city.city_id)
@@ -565,7 +565,7 @@ def test_oversized_city_does_not_starve_queue(conn, monkeypatch):
     monkeypatch.setattr(
         sched,
         "_run_one_city",
-        lambda cfg, city, today, provider="gsv", connection_limit=None: (
+        lambda cfg, city, today, provider="gsv", connection_limit=None, budget_remaining=0, conn=None: (
             ran.append(city.city_id) or True
         ),
     )
@@ -594,7 +594,7 @@ def test_run_due_pairs_providers_per_city(conn, monkeypatch):
     monkeypatch.setattr(
         sched,
         "_run_one_city",
-        lambda cfg, city, today, provider="gsv", connection_limit=None: (
+        lambda cfg, city, today, provider="gsv", connection_limit=None, budget_remaining=0, conn=None: (
             ran.append((city.city_id, provider)) or (provider == "gsv")
         ),
     )
@@ -644,7 +644,7 @@ def test_run_due_provider_budgets_are_independent(conn, monkeypatch):
     monkeypatch.setattr(
         sched,
         "_run_one_city",
-        lambda cfg, city, today, provider="gsv", connection_limit=None: (
+        lambda cfg, city, today, provider="gsv", connection_limit=None, budget_remaining=0, conn=None: (
             ran.append((city.city_id, provider)) or True
         ),
     )
@@ -695,7 +695,7 @@ def test_run_due_refreshes_the_manifest_only_after_a_success(conn, monkeypatch):
     monkeypatch.setattr(
         sched,
         "_run_one_city",
-        lambda cfg, city, today, provider="gsv", connection_limit=None: False,
+        lambda cfg, city, today, provider="gsv", connection_limit=None, budget_remaining=0, conn=None: False,
     )
     sched.cmd_run_due(SchedulerConfig(publish_enabled=False), today=date(2026, 7, 2))
     assert calls == {"agg": 0, "manifest": 0}
@@ -704,7 +704,7 @@ def test_run_due_refreshes_the_manifest_only_after_a_success(conn, monkeypatch):
     monkeypatch.setattr(
         sched,
         "_run_one_city",
-        lambda cfg, city, today, provider="gsv", connection_limit=None: True,
+        lambda cfg, city, today, provider="gsv", connection_limit=None, budget_remaining=0, conn=None: True,
     )
     sched.cmd_run_due(SchedulerConfig(publish_enabled=False), today=date(2026, 7, 3))
     assert calls == {"agg": 1, "manifest": 1}
@@ -742,3 +742,239 @@ def test_regenerate_writes_both_indexes_to_the_configured_data_dir(conn, data_di
     with gzip.open(manifest_path, "rt") as fh:
         walks = json.load(fh)["walks"]
     assert [w["city_id"] for w in walks] == [city_id]
+
+
+# ── Street-coverage channels (issue #99) ────────────────────────────────────
+
+
+def _street_cfg(**overrides):
+    """A config with both street channels enabled alongside the grid ones."""
+    from streetscape_metadata_tracker.scheduler import ProviderConfig
+
+    providers = {
+        "gsv": ProviderConfig(enabled=True, daily_request_budget=10_000_000),
+        "gsv_streets": ProviderConfig(
+            enabled=True, daily_request_budget=2_000_000, max_requests_per_minute=24_000
+        ),
+        "mapillary": ProviderConfig(enabled=True, daily_request_budget=40_000),
+        "mapillary_streets": ProviderConfig(enabled=True, daily_request_budget=5_000),
+    }
+    return SchedulerConfig(providers=providers, **overrides)
+
+
+def test_street_channels_parse_as_real_providers(tmp_path):
+    """They used to be skipped outright by the config loader, which made the
+    [providers.gsv_streets] block inert."""
+    cfg_path = tmp_path / "s.toml"
+    cfg_path.write_text(
+        "[providers.gsv]\nenabled = true\n\n"
+        "[providers.gsv_streets]\nenabled = true\ndaily_request_budget = 2000000\n"
+        "max_requests_per_minute = 24000\nspacing_m = 20\n\n"
+        "[providers.mapillary_streets]\nenabled = true\ndaily_request_budget = 5000\n"
+    )
+    cfg = load_scheduler_config(str(cfg_path))
+    assert set(cfg.enabled_providers()) == {"gsv", "gsv_streets", "mapillary_streets"}
+    assert cfg.providers["gsv_streets"].daily_request_budget == 2_000_000
+    assert cfg.providers["gsv_streets"].max_requests_per_minute == 24_000
+    assert cfg.providers["gsv_streets"].spacing_m == 20
+
+
+def test_enabled_providers_orders_expensive_channels_first():
+    """A city's channels run back-to-back inside one night's budgets, so the
+    series that can actually exhaust a budget must claim it first."""
+    assert _street_cfg().enabled_providers() == [
+        "gsv",
+        "gsv_streets",
+        "mapillary",
+        "mapillary_streets",
+    ]
+
+
+def test_unknown_provider_still_warned_and_dropped(tmp_path):
+    cfg_path = tmp_path / "s.toml"
+    cfg_path.write_text("[providers.gsv]\nenabled = true\n\n[providers.bogus]\nenabled = true\n")
+    cfg = load_scheduler_config(str(cfg_path))
+    assert "bogus" not in cfg.providers
+
+
+def test_street_estimate_prefers_a_prior_walk_and_rescales_for_spacing(conn):
+    from streetscape_metadata_tracker.scheduler import estimate_street_samples
+
+    cid = _register(conn, "Bend", width=5000, height=5000, step=20)
+    city = db.resolve_city(conn, cid)
+    db.register_street_walk(
+        conn,
+        city_id=cid,
+        run_date=date(2026, 7, 1),
+        csv_filename="w.csv.gz",
+        spacing_m=15.0,
+        sample_points=1000,
+    )
+    # Same spacing → the exact prior count.
+    assert estimate_street_samples(conn, city, 15) == 1000
+    # Halving the spacing doubles the samples along a fixed network length.
+    assert estimate_street_samples(conn, city, 30) == 500
+
+
+def test_street_estimate_falls_back_to_frozen_network_then_area(conn):
+    from streetscape_metadata_tracker.scheduler import estimate_street_samples
+
+    cid = _register(conn, "Bend", width=5000, height=5000, step=20)
+    city = db.resolve_city(conn, cid)
+
+    # No walk, no network → the area proxy (25 km² * 7.45 km/km² / 15 m).
+    area_only = estimate_street_samples(conn, city, 15)
+    assert 10_000 < area_only < 14_000
+
+    conn.execute(
+        """INSERT INTO street_networks (city_id, network_type, graphml_filename,
+           node_count, edge_count, fetched_at)
+           VALUES (?, 'drive', 'x.graphml', 100, 1000, '2026-07-01T00:00:00+00:00')""",
+        (cid,),
+    )
+    conn.commit()
+    # A frozen network is more specific than the area proxy, so it wins.
+    assert estimate_street_samples(conn, city, 15) == int(1000 * 4.2)
+
+
+def test_mapillary_street_estimate_is_tiles_not_samples(conn):
+    cid = _register(conn, "Bend", width=5000, height=5000, step=20)
+    city = db.resolve_city(conn, cid)
+    # The whole reason Mapillary streets can be scheduled everywhere: its cost
+    # is the tile census, identical to the grid provider's and unrelated to
+    # how many sample points get scored.
+    assert estimate_requests(city, "mapillary_streets", conn=conn) == estimate_requests(
+        city, "mapillary"
+    )
+    assert estimate_requests(city, "gsv_streets", conn=conn) > estimate_requests(
+        city, "mapillary_streets", conn=conn
+    )
+
+
+def test_street_timeout_scales_like_gsv_not_the_flat_floor(conn):
+    """A 247k-sample city (Seattle) must not inherit the flat floor and get
+    SIGKILLed 20 minutes into its crawl."""
+    from streetscape_metadata_tracker.scheduler import city_timeout_seconds
+
+    cfg = _street_cfg(city_timeout_minutes=180, max_requests_per_minute=24_000)
+    floor = 180 * 60
+    cid = _register(conn, "Metropolis", width=40000, height=40000, step=20)
+    city = db.resolve_city(conn, cid)
+    db.register_street_walk(
+        conn,
+        city_id=cid,
+        run_date=date(2026, 7, 1),
+        csv_filename="w.csv.gz",
+        spacing_m=15.0,
+        sample_points=2_000_000,
+    )
+    assert city_timeout_seconds(cfg, city, "gsv_streets", conn=conn) > floor
+    # Mapillary streets reads a handful of tiles — the floor is plenty.
+    assert city_timeout_seconds(cfg, city, "mapillary_streets", conn=conn) == floor
+
+
+def test_street_channel_dispatches_to_the_road_walk_collector(conn, monkeypatch):
+    """The scheduler must run the road-walk CLI for a street channel, with the
+    imagery provider, the isolated budget remaining, and the catalog path."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    cid = _register(conn, "Bend", width=1000, height=1000, step=20)
+    city = db.resolve_city(conn, cid)
+    captured = {}
+
+    def fake_run(cmd, timeout=None, cwd=None):
+        captured["cmd"] = cmd
+
+        class R:
+            returncode = 0
+
+        return R()
+
+    monkeypatch.setattr(sched.subprocess, "run", fake_run)
+    cfg = _street_cfg(db_path="/tmp/x.db", data_dir="/tmp/data")
+    assert sched._run_one_city(
+        cfg, city, date(2026, 7, 1), "gsv_streets", budget_remaining=12345, conn=conn
+    )
+
+    cmd = captured["cmd"]
+    assert "streetscape_street_analyzer.collect" in cmd
+    assert cmd[cmd.index("--provider") + 1] == "gsv"  # the imagery provider
+    assert cmd[cmd.index("--daily-budget") + 1] == "12345"
+    assert cmd[cmd.index("--db-path") + 1] == "/tmp/x.db"
+    assert cmd[cmd.index("--spacing") + 1] == "15"
+    assert cmd[cmd.index("--run-date") + 1] == "2026-07-01"
+    assert cmd[cmd.index("--") + 1] == city.display_name
+
+
+def test_mapillary_street_dispatch_omits_per_minute_pacing(conn, monkeypatch):
+    """Pacing is meaningless for a tile census; passing it would imply the
+    collector meters per-request like the GSV arm."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    cid = _register(conn, "Bend", width=1000, height=1000, step=20)
+    city = db.resolve_city(conn, cid)
+    captured = {}
+
+    def fake_run(cmd, timeout=None, cwd=None):
+        captured["cmd"] = cmd
+
+        class R:
+            returncode = 0
+
+        return R()
+
+    monkeypatch.setattr(sched.subprocess, "run", fake_run)
+    assert sched._run_one_city(
+        _street_cfg(), city, date(2026, 7, 1), "mapillary_streets", conn=conn
+    )
+    cmd = captured["cmd"]
+    assert cmd[cmd.index("--provider") + 1] == "mapillary"
+    assert "--max-requests-per-minute" not in cmd
+
+
+def test_street_channels_share_the_grid_stagger_day(conn):
+    """Paired snapshots: a city's street walk lands the same night as its grid
+    run, because day_of_cycle is hashed from city_id alone."""
+    cid = _register(conn, "Bend", width=1000, height=1000, step=20)
+    db.assign_schedule(conn, 90, providers=("gsv", "gsv_streets", "mapillary_streets"))
+    days = {
+        r["provider"]: r["day_of_cycle"]
+        for r in conn.execute(
+            "SELECT provider, day_of_cycle FROM schedule_state WHERE city_id = ?", (cid,)
+        ).fetchall()
+    }
+    assert len(set(days.values())) == 1
+    assert set(days) == {"gsv", "gsv_streets", "mapillary_streets"}
+
+
+def test_street_channel_failure_is_not_reconciled_as_an_orphan_run(conn, monkeypatch, data_dir):
+    """Street channels write street_walks rows, not `runs` rows, so the
+    orphaned-run salvage path must not be consulted for them (it would look up
+    a run that can never exist and could mask a real failure)."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    _register(conn, "Bend", width=1000, height=1000, step=20)
+    conn.execute("UPDATE schedule_state SET last_success_at = NULL")
+    conn.commit()
+
+    called = []
+    monkeypatch.setattr(
+        sched,
+        "_reconcile_orphaned_run",
+        lambda *a, **k: called.append(a[3]) or False,
+    )
+    monkeypatch.setattr(
+        sched,
+        "_run_one_city",
+        lambda cfg, city, today, provider="gsv", connection_limit=None, budget_remaining=0, conn=None: False,
+    )
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+    monkeypatch.setattr(sched.time, "sleep", lambda s: None)
+    monkeypatch.setattr(sched, "generate_aggregate_v2", lambda c, d: None)
+    monkeypatch.setattr(sched, "generate_streetwalk_manifest", lambda c, d: {"walks": []})
+
+    sched.cmd_run_due(_street_cfg(data_dir=data_dir, publish_enabled=False), today=date(2026, 7, 2))
+
+    assert "gsv" in called
+    assert "gsv_streets" not in called
+    assert "mapillary_streets" not in called

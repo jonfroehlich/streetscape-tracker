@@ -44,11 +44,21 @@ from .json_summarizer import (
 )
 from .naming import KNOWN_PROVIDERS
 
-# Isolated street-coverage budget channels (issue #99). Valid api_usage
-# provider strings + [providers.*] config keys, but NOT scheduled run
-# providers — collected via the manual road-walk CLI, so the scheduler
-# config loader skips them without warning.
-RESERVED_STREETS_CHANNELS = frozenset({"gsv_streets", "mapillary_streets"})
+# Isolated street-coverage collection channels (issue #99). These ARE scheduled
+# channels — each cycles the catalog exactly like a grid provider, with its own
+# schedule_state cadence, failure counting and api_usage ledger — they just run
+# a different subprocess (the road-walk collector) against a different
+# credential. The map is channel -> imagery provider, which is what lands in
+# street_walks and the published artifacts.
+STREET_CHANNELS = {
+    "gsv_streets": "gsv",
+    "mapillary_streets": "mapillary",
+}
+
+
+def is_street_channel(name: str) -> bool:
+    """True for a road-walk collection channel (vs. a grid run provider)."""
+    return name in STREET_CHANNELS
 
 logger = logging.getLogger("streetscape_scheduler")
 
@@ -58,10 +68,15 @@ DEFAULT_CONFIG_PATH = _PROJECT_ROOT / "config" / "scheduler.toml"
 
 @dataclass
 class ProviderConfig:
-    """Per-provider scheduling settings ([providers.NAME] in the TOML)."""
+    """Per-channel scheduling settings ([providers.NAME] in the TOML)."""
 
     enabled: bool = True
     daily_request_budget: int = 250_000  # gsv: metadata requests; mapillary: tiles
+    # Street channels only: client-side pacing for the isolated streets key
+    # (0/None → fall back to [download].max_requests_per_minute) and the
+    # on-street sample spacing the road walk collects at.
+    max_requests_per_minute: int | None = None
+    spacing_m: int = 15
 
 
 @dataclass
@@ -124,9 +139,17 @@ class SchedulerConfig:
             self.providers = {"gsv": ProviderConfig(daily_request_budget=self.daily_request_budget)}
 
     def enabled_providers(self) -> list[str]:
-        """Enabled provider names, gsv first (the expensive series leads)."""
+        """Enabled channel names, most expensive first.
+
+        Order matters: a city's channels run back-to-back within one night's
+        budget, so the series that can actually exhaust a budget should claim
+        it before the cheap ones. gsv (grid) leads, then gsv_streets (the other
+        per-request channel), then the two tile-census Mapillary channels.
+        """
+        rank = {"gsv": 0, "gsv_streets": 1, "mapillary": 2, "mapillary_streets": 3}
         return sorted(
-            (p for p, pc in self.providers.items() if pc.enabled), key=lambda p: p != "gsv"
+            (p for p, pc in self.providers.items() if pc.enabled),
+            key=lambda p: (rank.get(p, 99), p),
         )
 
 
@@ -151,22 +174,21 @@ def load_scheduler_config(path: str | None = None) -> SchedulerConfig:
     if "providers" in raw:
         providers = {}
         for name, p in raw["providers"].items():
-            # gsv_streets / mapillary_streets are reserved isolated budget
-            # channels for street-coverage collection (issue #99), not scheduled
-            # run providers — the road-walk collector is a manual CLI. Skip them
-            # here silently (a warning would fire every scheduler run) until
-            # run-due street collection is wired up.
-            if name in RESERVED_STREETS_CHANNELS:
-                continue
-            if name not in KNOWN_PROVIDERS:
+            # Street-coverage channels (issue #99) are scheduled like grid
+            # providers but are not themselves imagery providers, so they are
+            # validated against STREET_CHANNELS rather than KNOWN_PROVIDERS.
+            if name not in KNOWN_PROVIDERS and not is_street_channel(name):
                 logger.warning(
                     f"Ignoring unknown provider [providers.{name}] "
-                    f"(known: {', '.join(KNOWN_PROVIDERS)})"
+                    f"(known: {', '.join(KNOWN_PROVIDERS)}, "
+                    f"{', '.join(sorted(STREET_CHANNELS))})"
                 )
                 continue
             providers[name] = ProviderConfig(
                 enabled=p.get("enabled", True),
                 daily_request_budget=p.get("daily_request_budget", 250_000),
+                max_requests_per_minute=p.get("max_requests_per_minute"),
+                spacing_m=p.get("spacing_m", 15),
             )
 
     return SchedulerConfig(
@@ -285,15 +307,87 @@ def plan_connection_limit(
     return limit, ("; ".join(reasons) if reasons else None)
 
 
-def estimate_requests(city: db.CityRow, provider: str = "gsv") -> int:
+# Street-km of drivable network per km² of a city's grid area, used only when
+# nothing better is known. Calibrated on Seattle (3,709 street-km over a 497.9
+# km² grid). Grid areas include water and rural fringe, so this OVER-estimates
+# most cities — deliberately, so the budget guard errs toward deferring a city
+# rather than blowing through the daily ceiling mid-run.
+_STREET_KM_PER_KM2 = 7.45
+
+
+def estimate_street_samples(conn, city: db.CityRow, spacing_m: int) -> int:
     """
-    Estimated API requests for one run: grid points for GSV (one metadata
-    request per point), z14 tile count for Mapillary (bulk metadata).
+    Estimated on-street sample points for a road walk, WITHOUT touching OSM.
+
+    The collector's own ``--estimate`` is exact but fetches (and on a first walk
+    downloads) the street network, which is far too expensive to do for every
+    due city while merely planning a night's work. Precedence, most to least
+    trustworthy:
+
+    1. This city's last road walk — exact sample count, rescaled if the
+       configured spacing changed.
+    2. Its frozen OSM network's edge count (#103) × the observed samples-per-
+       edge ratio at that spacing.
+    3. Grid area × a street-density constant.
+
+    Args:
+        conn: open catalog connection.
+        city: the city row (frozen grid geometry).
+        spacing_m: along-edge sample spacing the walk will use.
+
+    Returns:
+        Estimated number of sample points (== GSV requests; Mapillary pays
+        tiles instead — see estimate_requests).
     """
-    if provider == "mapillary":
-        return estimate_tile_count(
-            city.center_lat, city.center_lon, city.grid_width_m, city.grid_height_m, city.step_m
-        )
+    spacing = max(1, int(spacing_m))
+
+    prior = conn.execute(
+        """SELECT sample_points, spacing_m FROM street_walks
+           WHERE city_id = ? AND sample_points IS NOT NULL AND spacing_m > 0
+           ORDER BY run_date DESC LIMIT 1""",
+        (city.city_id,),
+    ).fetchone()
+    if prior:
+        # Samples scale inversely with spacing along a fixed network length.
+        return max(1, int(prior["sample_points"] * (prior["spacing_m"] / spacing)))
+
+    network = conn.execute(
+        "SELECT edge_count FROM street_networks WHERE city_id = ? ORDER BY network_id DESC LIMIT 1",
+        (city.city_id,),
+    ).fetchone()
+    if network and network["edge_count"]:
+        # Seattle: 59,218 graph edges → 247k samples at 15 m ≈ 4.2 samples per
+        # edge per 15 m of spacing.
+        return max(1, int(network["edge_count"] * 4.2 * (15.0 / spacing)))
+
+    area_km2 = (city.grid_width_m / 1000.0) * (city.grid_height_m / 1000.0)
+    street_km = area_km2 * _STREET_KM_PER_KM2
+    return max(1, int(street_km * 1000.0 / spacing))
+
+
+def estimate_requests(city: db.CityRow, provider: str = "gsv", conn=None, spacing_m: int = 15) -> int:
+    """
+    Estimated API requests for one collection.
+
+    Grid runs: one metadata request per grid point (GSV), or the z14 tile count
+    (Mapillary, bulk metadata). Street channels: one request per on-street
+    sample point (gsv_streets), or the same tile count (mapillary_streets — a
+    road walk reads the identical census, so its cost does not scale with
+    sample spacing at all).
+
+    ``conn`` is required only for ``gsv_streets``; without it the sample
+    estimate falls back to the area proxy.
+    """
+    tiles = estimate_tile_count(
+        city.center_lat, city.center_lon, city.grid_width_m, city.grid_height_m, city.step_m
+    )
+    if provider in ("mapillary", "mapillary_streets"):
+        return tiles
+    if provider == "gsv_streets":
+        if conn is None:
+            area_km2 = (city.grid_width_m / 1000.0) * (city.grid_height_m / 1000.0)
+            return max(1, int(area_km2 * _STREET_KM_PER_KM2 * 1000.0 / max(1, spacing_m)))
+        return estimate_street_samples(conn, city, spacing_m)
     return (city.grid_width_m // city.step_m + 1) * (city.grid_height_m // city.step_m + 1)
 
 
@@ -313,7 +407,7 @@ _TIMEOUT_FIXED_SLACK_S = 600
 _ACHIEVED_RATE_FRACTION = 0.5
 
 
-def city_timeout_seconds(cfg: SchedulerConfig, city: db.CityRow, provider: str) -> int:
+def city_timeout_seconds(cfg: SchedulerConfig, city: db.CityRow, provider: str, conn=None) -> int:
     """
     Per-city subprocess timeout, derived from the estimated request count and
     the *achieved* download rate rather than a single flat cap.
@@ -328,10 +422,21 @@ def city_timeout_seconds(cfg: SchedulerConfig, city: db.CityRow, provider: str) 
     Mapillary provider keep the flat timeout.
     """
     floor = cfg.city_timeout_minutes * 60
-    if provider != "gsv" or cfg.max_requests_per_minute <= 0:
+    # Only the two per-request GSV channels are paced by request count. Both
+    # Mapillary channels read a handful of tiles in seconds, so they keep the
+    # flat floor. gsv_streets scales exactly like gsv — a 247k-sample city
+    # (Seattle) needs ~20 minutes of querying, and a flat floor would SIGKILL
+    # the biggest ones.
+    if provider not in ("gsv", "gsv_streets"):
         return floor
-    effective_rate = cfg.max_requests_per_minute * _ACHIEVED_RATE_FRACTION
-    paced_seconds = estimate_requests(city, provider) / effective_rate * 60.0
+    pc = (cfg.providers or {}).get(provider)
+    rate = (pc.max_requests_per_minute if pc else None) or cfg.max_requests_per_minute
+    if rate <= 0:
+        return floor
+    spacing = pc.spacing_m if pc else 15
+    effective_rate = rate * _ACHIEVED_RATE_FRACTION
+    estimated = estimate_requests(city, provider, conn=conn, spacing_m=spacing)
+    paced_seconds = estimated / effective_rate * 60.0
     return int(max(floor, paced_seconds * _TIMEOUT_HEADROOM + _TIMEOUT_FIXED_SLACK_S))
 
 
@@ -511,20 +616,89 @@ def cmd_regenerate(cfg: SchedulerConfig, publish: bool = False) -> int:
     return 0
 
 
+def _street_collect_cmd(
+    cfg: SchedulerConfig,
+    city: db.CityRow,
+    today: date,
+    channel: str,
+    conn_limit: int,
+    budget_remaining: int,
+) -> list[str]:
+    """Argv for a road-walk collection of one (city, street channel).
+
+    No ``--min-days-since-last-run`` equivalent is needed (or exists): the
+    scheduler owns cadence through ``schedule_state``, and the collector's only
+    skip is its immutable same-run-date guard — which is exactly the behaviour
+    wanted if a night is re-run.
+    """
+    pc = (cfg.providers or {}).get(channel) or ProviderConfig()
+    cmd = [
+        sys.executable,
+        "-m",
+        "streetscape_street_analyzer.collect",
+        "--provider",
+        STREET_CHANNELS[channel],
+        "--run-date",
+        today.isoformat(),
+        "--data-dir",
+        cfg.data_dir,
+        "--db-path",
+        cfg.db_path,
+        "--spacing",
+        str(pc.spacing_m),
+        "--connection-limit",
+        str(conn_limit),
+        "--timeout",
+        str(cfg.request_timeout_s),
+        # Hard stop before the isolated street ledger overruns today's ceiling.
+        "--daily-budget",
+        str(max(0, budget_remaining)),
+        "--log-level",
+        "INFO",
+    ]
+    if channel == "gsv_streets":
+        cmd += ["--max-requests-per-minute", str(pc.max_requests_per_minute or cfg.max_requests_per_minute)]
+    # '--' so a display name can never be parsed as a flag
+    cmd += ["--", city.display_name]
+    return cmd
+
+
 def _run_one_city(
     cfg: SchedulerConfig,
     city: db.CityRow,
     today: date,
     provider: str = "gsv",
     connection_limit: int | None = None,
+    budget_remaining: int = 0,
+    conn=None,
 ) -> bool:
-    """Collect one (city, provider) via a streetscape_tracker.py subprocess.
+    """Collect one (city, channel) in a subprocess.
+
+    Grid providers run ``streetscape_tracker.py``; street channels (issue #99)
+    run the road-walk collector instead. Both are metered, timed out and
+    failure-counted the same way by the caller.
 
     ``connection_limit`` overrides ``cfg.connection_limit`` for this run (the
     resource guard lowers it when the shared host is under pressure); None uses
     the configured default.
     """
     conn_limit = cfg.connection_limit if connection_limit is None else connection_limit
+
+    if is_street_channel(provider):
+        cmd = _street_collect_cmd(cfg, city, today, provider, conn_limit, budget_remaining)
+        logger.info(
+            f"Collecting streets for {city.city_id} [{provider}] "
+            f"(~{estimate_requests(city, provider, conn=conn, spacing_m=(cfg.providers or {}).get(provider, ProviderConfig()).spacing_m):,} requests estimated)"
+        )
+        logger.debug(f"Command: {' '.join(cmd)}")
+        timeout_s = city_timeout_seconds(cfg, city, provider, conn=conn)
+        try:
+            result = subprocess.run(cmd, timeout=timeout_s, cwd=str(_PROJECT_ROOT))
+            return result.returncode == 0
+        except subprocess.TimeoutExpired:
+            logger.error(f"{city.city_id} [{provider}]: timed out after {timeout_s // 60} minutes")
+            return False
+
     cmd = [
         sys.executable,
         str(_PROJECT_ROOT / "streetscape_tracker.py"),
@@ -687,9 +861,11 @@ def cmd_run_due(
         print(f"DRY RUN — would process (budget remaining {left_str}):")
         for city in due[:day_cap]:
             for provider in providers_for_city[city.city_id]:
-                est = estimate_requests(city, provider)
+                est = estimate_requests(
+                    city, provider, conn=conn, spacing_m=cfg.providers[provider].spacing_m
+                )
                 fits = "ok" if est <= budget_left[provider] else "OVER BUDGET (deferred)"
-                print(f"  {city.city_id:60s} {provider:10s} ~{est:>9,} req  {fits}")
+                print(f"  {city.city_id:60s} {provider:16s} ~{est:>9,} req  {fits}")
                 budget_left[provider] -= est if est <= budget_left[provider] else 0
         return 0
 
@@ -702,7 +878,9 @@ def cmd_run_due(
         ran_any = False
         for provider in providers_for_city[city.city_id]:
             budget = cfg.providers[provider].daily_request_budget
-            est = estimate_requests(city, provider)
+            est = estimate_requests(
+                city, provider, conn=conn, spacing_m=cfg.providers[provider].spacing_m
+            )
             if est > budget:
                 # This city can NEVER fit the daily budget — skipping (not
                 # breaking) so it can't starve every smaller city behind it
@@ -737,14 +915,25 @@ def cmd_run_due(
                     f"Resource guard: {throttle_reason}; connection limit "
                     f"{cfg.connection_limit} → {conn_limit} for {city.city_id} [{provider}]"
                 )
-            ok = _run_one_city(cfg, city, today, provider, connection_limit=conn_limit)
+            ok = _run_one_city(
+                cfg,
+                city,
+                today,
+                provider,
+                connection_limit=conn_limit,
+                budget_remaining=budget - used,
+                conn=conn,
+            )
             ran_any = True
             attempted += 1
             # A subprocess can report failure yet still have cataloged a valid
             # run (killed in the diff/JSON tail after register_run committed);
             # salvage it rather than re-spending the whole download next cycle.
-            if not ok and _reconcile_orphaned_run(conn, cfg, city, provider, today):
-                ok = True
+            # Street channels write no `runs` row (they catalog street_walks),
+            # so there is nothing of that shape to reconcile.
+            if not ok and not is_street_channel(provider):
+                if _reconcile_orphaned_run(conn, cfg, city, provider, today):
+                    ok = True
             if ok:
                 succeeded += 1
                 db.record_attempt(conn, city.city_id, success=True, provider=provider)

@@ -34,6 +34,11 @@ const {
   spatialStrideSample,
   computeVisibilityDelta,
   markerDateStyle,
+  STREETSCAPE_DATA_BASE_URL,
+  streetwalkManifestUrl,
+  fetchStreetwalkManifest,
+  lookupStreetwalk,
+  mergeStreetwalkStats,
 } = require("../streetscape-utils.js");
 
 // --- adaptCityRecord: v1/v2/v3 aggregate flattening ------------------------
@@ -699,4 +704,133 @@ test("markerDateStyle: non-matching date → dimmed", () => {
 
 test("RENDER_CAP is a positive finite number", () => {
   assert.ok(Number.isFinite(RENDER_CAP) && RENDER_CAP > 0);
+});
+
+// --- Streetwalk manifest (issue #155) --------------------------------------
+//
+// These helpers moved here from street-coverage.js when the overview map and
+// streets.html grew a need for them. fetchGzippedJson is now an in-module
+// call, so the fetch tests stub the browser primitives (fetch + pako) rather
+// than the helper itself.
+
+/** Serve one JSON payload through the fetch+pako path fetchGzippedJson uses. */
+function stubGzippedFetch(payload, { ok = true } = {}) {
+  const seen = [];
+  global.pako = { inflate: (bytes) => Buffer.from(bytes).toString("utf8") };
+  global.fetch = async (url) => {
+    seen.push(url);
+    return {
+      ok,
+      status: ok ? 200 : 404,
+      arrayBuffer: async () => Buffer.from(JSON.stringify(payload), "utf8"),
+    };
+  };
+  return seen;
+}
+
+function restoreGzippedFetch() {
+  delete global.pako;
+  delete global.fetch;
+}
+
+test("streetwalkManifestUrl points at streetwalks.json.gz under the data base URL", () => {
+  assert.equal(
+    streetwalkManifestUrl(),
+    STREETSCAPE_DATA_BASE_URL + "streetwalks.json.gz"
+  );
+});
+
+test("fetchStreetwalkManifest: reads streetwalks.json.gz from the data base URL", async () => {
+  const seen = stubGzippedFetch({
+    schema_version: 1,
+    walks: [{ city_id: "bend--or", provider: "gsv" }],
+  });
+  try {
+    const manifest = await fetchStreetwalkManifest();
+    assert.deepEqual(seen, [STREETSCAPE_DATA_BASE_URL + "streetwalks.json.gz"]);
+    assert.equal(manifest.walks.length, 1);
+  } finally {
+    restoreGzippedFetch();
+  }
+});
+
+test("fetchStreetwalkManifest: a missing/unreadable manifest resolves null, never throws", async () => {
+  // Most deployments have no manifest yet — the road-walk layer is optional, so
+  // a 404 must degrade to "no street coverage" rather than reject into the page.
+  stubGzippedFetch({}, { ok: false });
+  try {
+    assert.equal(await fetchStreetwalkManifest(), null);
+  } finally {
+    restoreGzippedFetch();
+  }
+});
+
+test("lookupStreetwalk: finds by city_id+provider, null on miss or absent manifest", () => {
+  const manifest = {
+    walks: [
+      { city_id: "seattle--wa", provider: "gsv", coverage_filename: "seattle_gsv.json.gz" },
+      { city_id: "seattle--wa", provider: "mapillary", coverage_filename: "seattle_mly.json.gz" },
+    ],
+  };
+  assert.equal(
+    lookupStreetwalk(manifest, "seattle--wa", "gsv").coverage_filename,
+    "seattle_gsv.json.gz"
+  );
+  assert.equal(
+    lookupStreetwalk(manifest, "seattle--wa", "mapillary").coverage_filename,
+    "seattle_mly.json.gz"
+  );
+  assert.equal(lookupStreetwalk(manifest, "portland--or", "gsv"), null);
+  assert.equal(lookupStreetwalk(null, "seattle--wa", "gsv"), null);
+  assert.equal(lookupStreetwalk({}, "seattle--wa", "gsv"), null);
+});
+
+test("mergeStreetwalkStats: joins by city_id+provider and counts the matches", () => {
+  const cities = [
+    { city_id: "seattle--wa", provider: "gsv" },
+    { city_id: "bend--or", provider: "gsv" },
+  ];
+  const manifest = {
+    walks: [
+      { city_id: "seattle--wa", provider: "gsv", coverage_pct_by_length: 98.4 },
+    ],
+  };
+  assert.equal(mergeStreetwalkStats(cities, manifest), 1);
+  assert.equal(cities[0].street_coverage_pct_by_length, 98.4);
+  assert.equal(cities[0].street_walk.coverage_pct_by_length, 98.4);
+  // Unwalked cities get explicit nulls, not missing keys, so METRICS.streets
+  // and the popup both read a defined property.
+  assert.equal(cities[1].street_coverage_pct_by_length, null);
+  assert.equal(cities[1].street_walk, null);
+});
+
+test("mergeStreetwalkStats: a walk for the other provider does not leak across", () => {
+  // Each provider is an independent run series on the same grid — a Mapillary
+  // walk must never color the GSV view (and today there are no Mapillary walks).
+  const cities = [{ city_id: "seattle--wa", provider: "gsv" }];
+  const manifest = {
+    walks: [
+      { city_id: "seattle--wa", provider: "mapillary", coverage_pct_by_length: 42 },
+    ],
+  };
+  assert.equal(mergeStreetwalkStats(cities, manifest), 0);
+  assert.equal(cities[0].street_coverage_pct_by_length, null);
+});
+
+test("mergeStreetwalkStats: a null manifest leaves every city unwalked", () => {
+  const cities = [{ city_id: "seattle--wa", provider: "gsv" }];
+  assert.equal(mergeStreetwalkStats(cities, null), 0);
+  assert.equal(cities[0].street_coverage_pct_by_length, null);
+});
+
+test("METRICS.streets: reads the merged manifest value, shares coverage's buckets", () => {
+  const metric = METRICS.streets;
+  assert.equal(metric.valueOf({ street_coverage_pct_by_length: 98.4 }), 98.4);
+  // NOT a fallback to grid coverage — a different denominator entirely
+  // (street-km driven vs. grid points with imagery), so an unwalked city is
+  // "no data", never its grid rate.
+  assert.equal(metric.valueOf({ coverage_rate_percent: 77 }), null);
+  assert.equal(metric.formatValue(98.4), "98.4%");
+  assert.equal(metric.bucketOf(98.4), 9);
+  assert.equal(metric.bucketLabel(9), "90–100%");
 });

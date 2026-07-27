@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Streetscape Tracker — Street-Level Coverage</title>
+
+  <!-- Stylesheets (CDN assets carry SRI hashes: a compromised or tampered
+       CDN response is refused by the browser rather than executed).
+       No Leaflet here — this page is a list, not a map; each row links to
+       the city page for the actual overlay. -->
+  <link rel="stylesheet" href="css/streetscape-shared.css" />
+  <link rel="stylesheet" href="css/streets.css" />
+</head>
+<body class="streets-page">
+  <!-- Google Analytics -->
+  <script async src="https://www.googletagmanager.com/gtag/js?id=G-ZSQGNSTEES"></script>
+  <script>
+    window.dataLayer = window.dataLayer || [];
+    function gtag() { dataLayer.push(arguments); }
+    gtag("js", new Date());
+    gtag("config", "G-ZSQGNSTEES");
+  </script>
+
+  <!-- Site header (shared markup with index.html / city.html; styles live
+       in streetscape-shared.css) -->
+  <header class="site-header">
+    <a class="site-brand" href="index.html">Streetscape Tracker</a>
+    <nav class="site-nav" aria-label="Main">
+      <a href="index.html">Map</a>
+      <a href="streets.html" aria-current="page">Streets</a>
+    </nav>
+    <a class="site-external" href="https://github.com/jonfroehlich/streetscape-tracker"
+       target="_blank" rel="noopener">About &#8599;</a>
+  </header>
+
+  <main class="streets-main">
+    <h1>Street-level coverage</h1>
+
+    <div class="streets-intro">
+      <p>
+        The <a href="index.html">overview map</a> measures coverage by
+        <strong>area</strong>: what share of a regular grid of sample points
+        around a city has street-level imagery. This page measures it by
+        <strong>road network</strong> instead: what fraction of a city's
+        streets have actually been driven.
+      </p>
+      <p>
+        Each collection walks every edge of the city's OpenStreetMap street
+        network, samples on-street points every ~15 m along the centerline,
+        and asks the imagery provider for the nearest panorama at each point.
+        A sample counts as covered when a panorama is found within the match
+        distance, so coverage is <strong>fractional per street</strong> — a
+        road that is half driven reports 50%, not "covered". The headline
+        number below weights each street by its length.
+      </p>
+      <p class="streets-caveat">
+        Street-level collection runs on the same rolling schedule as the grid,
+        so cities appear here as they are walked and are refreshed each cycle.
+        Google Street View costs one metadata request per sample point (a large
+        city runs to a few hundred thousand), while Mapillary is derived from
+        its vector-tile census — so Mapillary cities fill in faster. Sort any
+        column by clicking its header.
+      </p>
+    </div>
+
+    <div id="streets-status" role="status" aria-live="polite">
+      Loading street-level collections…
+    </div>
+
+    <div id="streets-table-wrap" class="streets-table-wrap" hidden>
+      <table class="streets-table">
+        <caption id="streets-caption"></caption>
+        <!-- Sortable headers: the <button> is what carries the click and the
+             keyboard focus (a bare click handler on <th> is unreachable by
+             keyboard); streets.js keeps aria-sort in step with the active
+             column. The ▲/▼ glyph is decorative, hence aria-hidden. -->
+        <thead>
+          <tr>
+            <th scope="col" data-key="label" aria-sort="none">
+              <button type="button">City <span class="sort-arrow" aria-hidden="true"></span></button>
+            </th>
+            <th scope="col" data-key="providerLabel" aria-sort="none">
+              <button type="button">Provider <span class="sort-arrow" aria-hidden="true"></span></button>
+            </th>
+            <th scope="col" data-key="runDate" aria-sort="none">
+              <button type="button">Walked <span class="sort-arrow" aria-hidden="true"></span></button>
+            </th>
+            <th scope="col" data-key="spacing" aria-sort="none">
+              <button type="button">Sample spacing <span class="sort-arrow" aria-hidden="true"></span></button>
+            </th>
+            <th scope="col" data-key="pct" aria-sort="none">
+              <button type="button" title="Share of street-km covered by 360° imagery">
+                360° street-km <span class="sort-arrow" aria-hidden="true"></span></button>
+            </th>
+            <th scope="col" data-key="pctAny" aria-sort="none">
+              <button type="button" title="Including flat/perspective imagery; equals the 360° number for Google Street View">
+                Any imagery <span class="sort-arrow" aria-hidden="true"></span></button>
+            </th>
+            <th scope="col" data-key="edges" aria-sort="none">
+              <button type="button">Streets <span class="sort-arrow" aria-hidden="true"></span></button>
+            </th>
+            <th scope="col" data-key="fullyCovered" aria-sort="none">
+              <button type="button">Fully covered <span class="sort-arrow" aria-hidden="true"></span></button>
+            </th>
+            <th scope="col"><span class="visually-hidden">Link to city map</span></th>
+          </tr>
+        </thead>
+        <tbody id="streets-tbody"></tbody>
+      </table>
+    </div>
+  </main>
+
+  <!-- Scripts (order matters: libs → shared utils → page logic) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.1.0/pako.min.js"
+          integrity="sha512-g2TeAWw5GPnX7z0Kn8nFbYfeHcvAu/tx6d6mrLe/90mkCxO+RcptyYpksUz35EO337F83bZwcmUyHiHamspkfg=="
+          crossorigin="anonymous"></script>
+  <script src="js/streetscape-utils.js"></script>
+  <script src="js/streets.js"></script>
+</body>
+</html>

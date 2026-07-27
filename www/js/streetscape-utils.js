@@ -223,6 +223,24 @@ METRICS.coverage_any = {
   sliderLabel: "any-imagery coverage (%)",
 };
 
+// Road-walk street coverage (issue #99/#155). A DIFFERENT denominator from the
+// two coverage metrics above: those are area-sampled (share of frozen grid
+// points with imagery), this is the fraction of the city's OSM street network
+// length actually driven. The value is not in cities.json.gz at all — it comes
+// from the streetwalks.json.gz sidecar manifest and is attached to the city
+// record by mergeStreetwalkStats(), so it is null for every city that has not
+// been walked (which is most of them: collection is still a manual CLI).
+// Same decile/color machinery as `coverage` — only the read differs.
+METRICS.streets = {
+  ...METRICS.coverage,
+  label: "Street coverage",
+  legendTitle: "Street Coverage (% of street-km)",
+  titleNoun: "Street Coverage %",
+  axisTitle: "Street Coverage (% of street-km)",
+  valueOf: (city) => city.street_coverage_pct_by_length ?? null,
+  sliderLabel: "street coverage (%)",
+};
+
 /**
  * True iff `key` is a real "color by" metric key ("age"/"coverage").
  * Object.hasOwn for the same reason as isKnownProvider: a URL-supplied
@@ -348,6 +366,85 @@ async function fetchGzippedJson(url) {
   const compressed = await response.arrayBuffer();
   const text = pako.inflate(new Uint8Array(compressed), { to: "string" });
   return JSON.parse(text);
+}
+
+// ---------------------------------------------------------------------------
+// Streetwalk manifest (issue #155).
+//
+// `streetwalks.json.gz` is a sidecar index of the latest road-walk coverage
+// artifact per (city, provider). It is deliberately NOT part of the
+// cities.json.gz v3 aggregate (folding it in is #102), because a road-walk
+// artifact is not a sibling of a grid run: its `sp{N}` spacing is a free
+// parameter and its run date differs, so no consumer can derive its filename.
+// All three pages read it: city.js to pick the artifact to render,
+// index.js to color/annotate the overview, streets.js to list the walks.
+// ---------------------------------------------------------------------------
+
+/**
+ * URL of the sidecar streetwalk manifest.
+ * @returns {string}
+ */
+function streetwalkManifestUrl() {
+  return STREETSCAPE_DATA_BASE_URL + "streetwalks.json.gz";
+}
+
+/**
+ * Fetch the streetwalk manifest, or null when it's absent/unreadable (the
+ * feature is optional — most deployments won't have one yet).
+ * @returns {Promise<?Object>}
+ */
+async function fetchStreetwalkManifest() {
+  try {
+    return await fetchGzippedJson(streetwalkManifestUrl());
+  } catch (e) {
+    console.info("No streetwalk manifest (skipping road-walk overlay):", e.message);
+    return null;
+  }
+}
+
+/**
+ * Find a city+provider's streetwalk entry in the manifest, or null.
+ * @param {?Object} manifest - The parsed streetwalks.json.gz, or null.
+ * @param {string} cityId
+ * @param {string} provider
+ * @returns {?Object} The walk record (with `coverage_filename`), or null.
+ */
+function lookupStreetwalk(manifest, cityId, provider) {
+  if (!manifest || !Array.isArray(manifest.walks)) return null;
+  return (
+    manifest.walks.find((w) => w.city_id === cityId && w.provider === provider) || null
+  );
+}
+
+/**
+ * Attach each city's road-walk record from the manifest, in place.
+ *
+ * Adapted city records carry the canonical `city_id` and `provider`, which is
+ * exactly the manifest's key — so this is a straight join. Cities without a
+ * walk get explicit nulls rather than missing keys, so METRICS.streets.valueOf
+ * and the popup both read a defined property.
+ *
+ * The count is the honest denominator for "N of M cities walked": today it is
+ * 1 of ~1,150, and the overview says so rather than silently rendering a map
+ * of grey rectangles.
+ *
+ * @param {Object[]} cities - Adapted city records (from adaptCitiesPayload).
+ * @param {?Object} manifest - The parsed streetwalks.json.gz, or null.
+ * @returns {number} How many cities matched a walk.
+ *
+ * @example
+ *   const { cities } = adaptCitiesPayload(raw, "gsv");
+ *   const walked = mergeStreetwalkStats(cities, manifest);  // → 1
+ */
+function mergeStreetwalkStats(cities, manifest) {
+  let matched = 0;
+  for (const city of cities) {
+    const walk = lookupStreetwalk(manifest, city.city_id, city.provider);
+    city.street_walk = walk;
+    city.street_coverage_pct_by_length = walk?.coverage_pct_by_length ?? null;
+    if (walk) matched += 1;
+  }
+  return matched;
 }
 
 /**
@@ -698,6 +795,10 @@ if (typeof module !== "undefined" && module.exports) {
     isValidRunFilename,
     getProviderFromFilename,
     fetchGzippedJson,
+    streetwalkManifestUrl,
+    fetchStreetwalkManifest,
+    lookupStreetwalk,
+    mergeStreetwalkStats,
     adaptCityRecord,
     adaptCitiesPayload,
     isGoogleCopyright,

@@ -2,22 +2,34 @@
 CLI: road-walk street-coverage collection for a city (issue #99).
 
     python -m streetscape_street_analyzer.collect "Seattle, WA" \
+        [--provider gsv|mapillary] \
         [--spacing 15] [--match-dist 25] [--network-type drive] \
         [--run-date YYYY-MM-DD] [--force] [--refresh] \
         [--connection-limit N] [--max-requests-per-minute R] \
-        [--daily-budget N] [--estimate] [--data-dir DIR]
+        [--daily-budget N] [--estimate] [--data-dir DIR] [--db-path PATH]
 
 A SECOND collection modality alongside the grid downloader. It walks the city's
 frozen OSM network (issue #103), samples on-street points every ``--spacing``
-metres along each edge, and queries GSV for the nearest pano at each point,
-yielding **fractional** per-edge coverage. Unlike the grid downloader it queries
-only on-street points, and its association to streets is by construction.
+metres along each edge, and finds the nearest pano at each point, yielding
+**fractional** per-edge coverage. Unlike the grid downloader it scores only
+on-street points, and its association to streets is by construction.
 
-The provider is GSV, but the request budget is isolated in its own key/channel
-(``GMAPS_STREETS_API_KEY`` / the ``gsv_streets`` ``api_usage`` ledger, issue
-#141) so a road-crawl can't exhaust the production grid collector's quota. It
-reuses the exact rate-limiter + OVER_QUERY_LIMIT retry machinery of the grid
-downloader via ``download_gsv.collect_points_async``.
+Both providers walk the SAME deterministic sample points, so their coverage
+percentages are directly comparable — but they reach the imagery very
+differently:
+
+  * **gsv** issues one metadata request per sample location (a large city runs
+    to a few hundred thousand), reusing the grid downloader's hardened request
+    engine — rate limiter, OVER_QUERY_LIMIT retry, ``.downloading`` resume —
+    via ``download_gsv.collect_points_async``.
+  * **mapillary** has no per-point endpoint: it reads the z14 vector-tile
+    census once (tens of requests for a whole city, regardless of spacing) and
+    joins it onto the sample points locally. See ``collect_mapillary``.
+
+Each provider's requests are metered against its own ISOLATED key and ledger
+channel (``GMAPS_STREETS_API_KEY``/``gsv_streets``,
+``MAPILLARY_STREETS_ACCESS_TOKEN``/``mapillary_streets``, issue #141) so a road
+walk can never exhaust the production grid collectors' quota.
 
 Two dated artifacts are written next to the run (both published as ``*.gz``):
 a raw sample snapshot ``..._streetwalk_sp{N}_{DATE}.csv.gz`` (METADATA schema,
@@ -44,6 +56,7 @@ from streetscape_metadata_tracker.analysis import detect_systemic_failure
 from streetscape_metadata_tracker.config import load_config
 from streetscape_metadata_tracker.download_common import DownloadError
 from streetscape_metadata_tracker.download_gsv import collect_points_async
+from streetscape_metadata_tracker.download_mapillary import estimate_tile_count
 from streetscape_metadata_tracker.json_summarizer import generate_streetwalk_manifest
 from streetscape_metadata_tracker.naming import (
     generate_streetwalk_filename,
@@ -51,6 +64,7 @@ from streetscape_metadata_tracker.naming import (
 )
 from streetscape_metadata_tracker.paths import get_default_data_dir
 
+from .collect_mapillary import collect_mapillary_street_samples_async
 from .download_street_network import fetch_street_edges
 from .road_sampling import dedupe_query_points, generate_samples
 from .street_coverage import (
@@ -61,21 +75,31 @@ from .street_coverage import (
 
 logger = logging.getLogger(__name__)
 
-# Provider label stored in street_walks/for the coverage filter (imagery
-# provider). Budget is metered under the separate 'gsv_streets' ledger channel.
-PROVIDER = "gsv"
-BUDGET_CHANNEL = "gsv_streets"
+# Imagery provider → its ISOLATED street budget channel. The provider is what
+# lands in street_walks/the artifacts (the imagery series); the channel is the
+# api_usage ledger + credential the collection is metered against, kept
+# separate from the grid collectors' so a road walk can never exhaust their
+# quota (issue #141).
+STREET_BUDGET_CHANNELS = {
+    "gsv": "gsv_streets",
+    "mapillary": "mapillary_streets",
+}
+DEFAULT_PROVIDER = "gsv"
 DEFAULT_SPACING_M = 15
 
 # Defaults mirror config/scheduler.toml's [providers.gsv_streets] / [download]
-# so a manual run paces like the (future) scheduled one. The gsv_streets key
-# has its own ~30k/min GSV metadata quota; 24000 is ~80% client-side headroom.
+# so a manual run paces like the scheduled one. The gsv_streets key has its own
+# ~30k/min GSV metadata quota; 24000 is ~80% client-side headroom. Mapillary is
+# a tile census (tens of requests per city regardless of size), so per-minute
+# pacing is irrelevant there.
 DEFAULT_MAX_REQUESTS_PER_MINUTE = 24_000
 
 
 def run_collect(args: argparse.Namespace) -> int:
     data_dir = args.data_dir
-    db_path = db.get_default_db_path(data_dir)
+    provider = args.provider
+    budget_channel = STREET_BUDGET_CHANNELS[provider]
+    db_path = args.db_path or db.get_default_db_path(data_dir)
     if not os.path.exists(db_path):
         logger.error("Catalog DB not found at %s", db_path)
         return 1
@@ -96,19 +120,27 @@ def run_collect(args: argparse.Namespace) -> int:
         samples = generate_samples(edges, args.spacing)
         query_points = dedupe_query_points(samples)
         logger.info(
-            "%s: %d edges → %d samples → %d unique GSV queries (spacing %.1fm)",
+            "%s: %d edges → %d samples → %d unique locations (spacing %.1fm, %s)",
             city.city_id,
             len(edges),
             len(samples),
             len(query_points),
             args.spacing,
+            provider,
         )
 
         if args.estimate:
             # Dry run: no key, no API calls — just report the work + cost.
+            # Only GSV bills per sample location; Mapillary reads a tile census
+            # whose size is set by the city's area, not by the sample count.
+            cost = (
+                f"{len(query_points)} unique GSV queries"
+                if provider == "gsv"
+                else f"~{estimate_tile_count(city.center_lat, city.center_lon, city.grid_width_m, city.grid_height_m, city.step_m)} Mapillary tile requests (independent of spacing)"
+            )
             print(
                 f"{city.city_id} [{args.network_type}]: {len(edges)} edges, "
-                f"{len(samples)} samples, {len(query_points)} unique GSV queries "
+                f"{len(samples)} samples, {cost} "
                 f"(spacing={args.spacing}m). No requests issued (--estimate)."
             )
             return 0
@@ -147,52 +179,80 @@ def run_collect(args: argparse.Namespace) -> int:
                 if os.path.exists(stale):
                     os.remove(stale)
 
-        # Pre-flight budget guard against the isolated gsv_streets ledger.
+        # Pre-flight budget guard against the isolated street ledger. Only GSV
+        # spends per sample location; a Mapillary walk costs its tile census.
+        estimated_requests = (
+            len(query_points)
+            if provider == "gsv"
+            else estimate_tile_count(
+                city.center_lat,
+                city.center_lon,
+                city.grid_width_m,
+                city.grid_height_m,
+                city.step_m,
+            )
+        )
         if args.daily_budget is not None:
-            already = db.get_api_usage(conn, run_date, provider=BUDGET_CHANNEL)
-            if already + len(query_points) > args.daily_budget:
+            already = db.get_api_usage(conn, run_date, provider=budget_channel)
+            if already + estimated_requests > args.daily_budget:
                 logger.error(
-                    "gsv_streets daily budget %d would be exceeded: %d already spent "
-                    "+ %d estimated queries. Aborting.",
+                    "%s daily budget %d would be exceeded: %d already spent "
+                    "+ %d estimated requests. Aborting.",
+                    budget_channel,
                     args.daily_budget,
                     already,
-                    len(query_points),
+                    estimated_requests,
                 )
                 return 1
 
-        # Load .env so GMAPS_STREETS_API_KEY is picked up the same way the grid
-        # CLI loads GMAPS_API_KEY (cli.py). Done after the --estimate return so a
-        # dry run needs no key at all.
+        # Load .env so the street credential is picked up the same way the grid
+        # CLI loads its own (cli.py). Done after the --estimate return so a dry
+        # run needs no key at all.
         load_dotenv()
         cfg.warn_if_credentials_world_readable(find_dotenv(usecwd=True))
-        config = load_config(BUDGET_CHANNEL)
+        config = load_config(budget_channel)
 
         try:
-            dict_results = asyncio.run(
-                collect_points_async(
-                    query_points,
-                    config["api_key"],
-                    out_csv,
-                    city_label=city.display_name,
-                    batch_size=args.batch_size,
-                    connection_limit=args.connection_limit,
-                    request_timeout=args.timeout,
-                    max_retries=args.max_retries,
-                    max_requests_per_minute=args.max_requests_per_minute,
+            if provider == "gsv":
+                dict_results = asyncio.run(
+                    collect_points_async(
+                        query_points,
+                        config["api_key"],
+                        out_csv,
+                        city_label=city.display_name,
+                        batch_size=args.batch_size,
+                        connection_limit=args.connection_limit,
+                        request_timeout=args.timeout,
+                        max_retries=args.max_retries,
+                        max_requests_per_minute=args.max_requests_per_minute,
+                    )
                 )
-            )
+            else:
+                dict_results = asyncio.run(
+                    collect_mapillary_street_samples_async(
+                        query_points,
+                        city,
+                        config["access_token"],
+                        out_csv,
+                        match_dist_m=args.match_dist,
+                        connection_limit=args.connection_limit,
+                        request_timeout=args.timeout,
+                    )
+                )
         except DownloadError as e:
-            # Failed crawls still spent real (billable) requests; record them so
-            # a later budget check doesn't overspend the gsv_streets channel.
+            # Failed crawls still spent real requests; record them so a later
+            # budget check doesn't overspend the street channel.
             spent = getattr(e, "api_requests", 0)
             if spent:
-                db.add_api_usage(conn, run_date, spent, provider=BUDGET_CHANNEL)
-                logger.warning("Recorded %d gsv_streets requests spent by the failed crawl", spent)
+                db.add_api_usage(conn, run_date, spent, provider=budget_channel)
+                logger.warning(
+                    "Recorded %d %s requests spent by the failed crawl", spent, budget_channel
+                )
             logger.error("Collection failed: %s", e)
             return 1
 
         df = dict_results["df"]
-        db.add_api_usage(conn, run_date, dict_results["api_requests"], provider=BUDGET_CHANNEL)
+        db.add_api_usage(conn, run_date, dict_results["api_requests"], provider=budget_channel)
 
         # Reject a crawl dominated by credential/quota denials (cf. the grid
         # pipeline): it says nothing about coverage and must not be cataloged.
@@ -212,13 +272,13 @@ def run_collect(args: argparse.Namespace) -> int:
             samples,
             df,
             run_date.isoformat(),
-            provider=PROVIDER,
+            provider=provider,
             match_dist_m=args.match_dist,
         )
         geojson = build_streetwalk_geojson(
             covered,
             city_id=city.city_id,
-            provider=PROVIDER,
+            provider=provider,
             run_date=run_date.isoformat(),
             spacing_m=args.spacing,
             match_dist_m=args.match_dist,
@@ -233,7 +293,7 @@ def run_collect(args: argparse.Namespace) -> int:
             city_id=city.city_id,
             run_date=run_date,
             csv_filename=csv_name,
-            provider=PROVIDER,
+            provider=provider,
             coverage_filename=coverage_name,
             network_type=args.network_type,
             spacing_m=args.spacing,
@@ -243,6 +303,7 @@ def run_collect(args: argparse.Namespace) -> int:
             edges_fully_covered=totals["edges_fully_covered"],
             mean_edge_coverage=totals["mean_edge_coverage"],
             coverage_pct_by_length=totals["coverage_pct_by_length"],
+            coverage_pct_by_length_any=totals["coverage_pct_by_length_any"],
             api_requests=dict_results["api_requests"],
             started_at=dict_results.get("started_at"),
             finished_at=dict_results.get("finished_at") or datetime.now(UTC).isoformat(),
@@ -262,12 +323,21 @@ def run_collect(args: argparse.Namespace) -> int:
             out_coverage,
             len(manifest["walks"]),
         )
+        # The any-imagery number only says something new for Mapillary; for GSV
+        # it is the 360° number by construction, so don't print it twice.
+        any_note = (
+            ""
+            if totals["coverage_pct_by_length_any"] == totals["coverage_pct_by_length"]
+            else f", {totals['coverage_pct_by_length_any']}% including flat imagery"
+        )
+        unit = "GSV queries" if provider == "gsv" else "Mapillary tile requests"
         print(
-            f"{city.city_id} [streetwalk {PROVIDER} {run_date}]: "
+            f"{city.city_id} [streetwalk {provider} {run_date}]: "
             f"{len(samples)} samples over {totals['edges']} edges "
-            f"({dict_results['api_requests']} GSV queries); "
+            f"({dict_results['api_requests']} {unit}); "
             f"mean edge coverage {totals['mean_edge_coverage']:.3f}, "
-            f"{totals['coverage_pct_by_length']}% of street-km covered "
+            f"{totals['coverage_pct_by_length']}% of street-km covered"
+            f"{any_note} "
             f"({totals['edges_fully_covered']}/{totals['edges']} edges fully covered)"
         )
         return 0
@@ -280,6 +350,17 @@ def build_parser() -> argparse.ArgumentParser:
         description="Road-walk street-coverage collection (issue #99)."
     )
     parser.add_argument("city", help="City query or catalog slug (e.g. 'Seattle, WA')")
+    parser.add_argument(
+        "--provider",
+        choices=sorted(STREET_BUDGET_CHANNELS),
+        default=DEFAULT_PROVIDER,
+        help=(
+            "Imagery provider to walk (default: gsv). Each is metered against "
+            "its own isolated street budget channel (gsv_streets / "
+            "mapillary_streets); gsv costs one request per sample point, "
+            "mapillary reads a tile census costing tens of requests per city."
+        ),
+    )
     parser.add_argument(
         "--spacing",
         # Integer metres only: the artifact filename encodes spacing as an
@@ -341,6 +422,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="If set, abort when today's gsv_streets usage + estimated queries would exceed it",
     )
     parser.add_argument("--data-dir", default=get_default_data_dir(), help="Data directory")
+    parser.add_argument(
+        "--db-path",
+        default=None,
+        help="Catalog DB path (default: the DB inside --data-dir)",
+    )
     parser.add_argument(
         "--log-level",
         default="INFO",

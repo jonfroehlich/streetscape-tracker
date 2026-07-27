@@ -557,6 +557,66 @@ def test_migrate_v6_to_v7(tmp_path):
     conn2.close()
 
 
+def test_migrate_v7_to_v8(tmp_path):
+    """A v7 catalog gains street_walks.coverage_pct_by_length_any on connect.
+
+    Built from db._SCHEMA minus that one column (so the fixture tracks the
+    code), with a pre-v8 walk seeded to prove the existing row survives and
+    the new column reads NULL — "not measured", never a copy of the 360°
+    number, which would claim the flat footprint had been scored.
+    """
+    db_path = str(tmp_path / "v7.db")
+    raw = sqlite3.connect(db_path)
+    raw.executescript(db._SCHEMA)
+    raw.execute("ALTER TABLE street_walks DROP COLUMN coverage_pct_by_length_any")
+    raw.execute(
+        """INSERT INTO cities (city_id, display_name, city_name, center_lat,
+           center_lon, grid_width_m, grid_height_m, step_m, created_at)
+           VALUES ('bend--or', 'Bend, OR', 'Bend', 44.05, -121.31,
+                   5000, 5000, 20, '2026-01-01T00:00:00+00:00')"""
+    )
+    raw.execute(
+        """INSERT INTO street_walks (city_id, provider, run_date, csv_filename,
+           coverage_pct_by_length)
+           VALUES ('bend--or', 'gsv', '2026-05-01', 'old_streetwalk.csv.gz', 98.4)"""
+    )
+    raw.execute("PRAGMA user_version = 7")
+    raw.commit()
+    raw.close()
+
+    conn = db.connect(db_path)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(street_walks)").fetchall()}
+    assert "coverage_pct_by_length_any" in cols
+
+    walk = db.get_latest_street_walk(conn, "bend--or")
+    assert walk["coverage_pct_by_length"] == 98.4
+    assert walk["coverage_pct_by_length_any"] is None
+
+    # Idempotent: reopening must not error or re-migrate.
+    conn.close()
+    conn2 = db.connect(db_path)
+    assert conn2.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
+    conn2.close()
+
+
+def test_register_street_walk_round_trips_any_imagery_coverage(conn, city):
+    """Both street-coverage numbers persist; a GSV walk's are equal by
+    construction (GSV emits no flat imagery), a Mapillary walk's can differ."""
+    db.register_street_walk(
+        conn,
+        city_id=city,
+        run_date=date(2026, 7, 8),
+        csv_filename="w_mly.csv.gz",
+        provider="mapillary",
+        coverage_pct_by_length=1.9,
+        coverage_pct_by_length_any=9.9,
+    )
+    walk = db.get_latest_street_walk(conn, city, provider="mapillary")
+    assert walk["coverage_pct_by_length"] == 1.9
+    assert walk["coverage_pct_by_length_any"] == 9.9
+
+
 def test_register_run_round_trips_flat_only_columns(conn, city):
     rid = db.register_run(
         conn,

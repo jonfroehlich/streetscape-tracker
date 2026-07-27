@@ -22,7 +22,7 @@ from typing import Any
 import geopandas as gpd
 import pandas as pd
 
-from streetscape_metadata_tracker.analysis import is_google_copyright
+from streetscape_metadata_tracker.analysis import FLAT_ONLY, is_google_copyright
 
 from .road_sampling import quantize_coord
 
@@ -344,6 +344,8 @@ def compute_streetwalk_coverage(
             ("covered_samples", int),
             ("coverage_fraction", float),
             ("covered", bool),
+            ("covered_samples_any", int),
+            ("coverage_fraction_any", float),
             ("nearest_pano_date", object),
             ("median_covered_age_years", object),
         ):
@@ -396,6 +398,15 @@ def compute_streetwalk_coverage(
     within = sample_pts.distance(pano_pts) <= match_dist_m
     m["covered_sample"] = ok & official & has_pano & within.to_numpy()
 
+    # Any-imagery coverage (issue #116's vocabulary, applied to streets): a
+    # sample whose only nearby imagery is flat/perspective carries a FLAT_ONLY
+    # row — imagery of the street, but not a 360° pano, and with no capture
+    # date. It counts toward `*_any` only, never toward the 360° numbers or any
+    # dated statistic. GSV emits no FLAT_ONLY rows, so for GSV the any-value is
+    # identical to the 360° one by construction.
+    flat_only = (m["status"] == FLAT_ONLY) & has_pano & within.to_numpy()
+    m["covered_sample_any"] = m["covered_sample"] | flat_only
+
     cap = pd.to_datetime(m["capture_date"], errors="coerce")
     m["age_years"] = (run_ts - cap).dt.total_seconds() / _YEAR_SECONDS
 
@@ -404,6 +415,7 @@ def compute_streetwalk_coverage(
     grp = m.groupby("edge_id")
     total = grp.size()
     covered = grp["covered_sample"].sum()
+    covered_any = grp["covered_sample_any"].sum()
 
     def _edge_stats(sub: pd.DataFrame) -> pd.Series:
         cov = sub[sub["covered_sample"]]
@@ -428,6 +440,12 @@ def compute_streetwalk_coverage(
         .round(4)
     )
     out["covered"] = out["covered_samples"] > 0
+    out["covered_samples_any"] = out["edge_id"].map(covered_any).fillna(0).astype(int)
+    out["coverage_fraction_any"] = (
+        (out["covered_samples_any"] / out["total_samples"].where(out["total_samples"] > 0))
+        .fillna(0.0)
+        .round(4)
+    )
     # Edges with no covered samples carry NaN here; build_streetwalk_geojson
     # converts NaN -> None at serialization so the JSON artifact stays valid.
     out["nearest_pano_date"] = out["edge_id"].map(
@@ -448,11 +466,22 @@ def summarize_streetwalk_coverage(covered_edges: gpd.GeoDataFrame) -> dict[str, 
     edge-level mean fraction and fully-covered count.
     """
 
+    # Pre-#116 frames (and any hand-built test fixture) may lack the any-imagery
+    # column; treating it as the 360° fraction reproduces the GSV identity and
+    # keeps old callers working.
+    if "coverage_fraction_any" not in covered_edges.columns:
+        covered_edges = covered_edges.assign(
+            coverage_fraction_any=covered_edges["coverage_fraction"]
+        )
+
     def _block(group: pd.DataFrame) -> dict[str, Any]:
         edges = int(len(group))
         length_km = float(group["length_m"].sum()) / 1000.0
         # Length credited proportionally to each edge's covered fraction.
         length_km_covered = float((group["length_m"] * group["coverage_fraction"]).sum()) / 1000.0
+        length_km_covered_any = (
+            float((group["length_m"] * group["coverage_fraction_any"]).sum()) / 1000.0
+        )
         sampled = group[group["total_samples"] > 0]
         ages = pd.to_numeric(group["median_covered_age_years"], errors="coerce").dropna()
         return {
@@ -462,10 +491,16 @@ def summarize_streetwalk_coverage(covered_edges: gpd.GeoDataFrame) -> dict[str, 
             "edges_any_coverage": int((group["coverage_fraction"] > 0).sum()),
             "length_km": round(length_km, 3),
             "length_km_covered": round(length_km_covered, 3),
+            "length_km_covered_any": round(length_km_covered_any, 3),
             "mean_edge_coverage": round(float(sampled["coverage_fraction"].mean()), 4)
             if len(sampled)
             else 0.0,
             "coverage_pct_by_length": round(100.0 * length_km_covered / length_km, 1)
+            if length_km
+            else 0.0,
+            # Imagery of any type (360° + flat). Equals coverage_pct_by_length
+            # for GSV, which never emits FLAT_ONLY.
+            "coverage_pct_by_length_any": round(100.0 * length_km_covered_any / length_km, 1)
             if length_km
             else 0.0,
             "median_covered_age_years": round(float(ages.median()), 2) if len(ages) else None,
@@ -520,6 +555,10 @@ def build_streetwalk_geojson(
                     "covered_samples": int(row.covered_samples),
                     "coverage_fraction": float(row.coverage_fraction),
                     "covered": bool(row.covered),
+                    "covered_samples_any": int(getattr(row, "covered_samples_any", row.covered_samples)),
+                    "coverage_fraction_any": float(
+                        getattr(row, "coverage_fraction_any", row.coverage_fraction)
+                    ),
                     "nearest_pano_date": _none_if_nan(row.nearest_pano_date),
                     "median_covered_age_years": float(median_age)
                     if median_age is not None
