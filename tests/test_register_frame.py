@@ -60,15 +60,27 @@ def frame_row(**overrides):
 
 @pytest.fixture
 def fake_geocode(monkeypatch):
-    """Patch register_frame's geocoding seam; tunable center/dims + call count."""
-    state = {"calls": 0, "center": (10.0, 20.0), "dims": (4000.0, 6000.0)}
+    """
+    Patch register_frame's geocoding seam; tunable center/dims + call count.
+    ``fail`` lists queries that don't geocode; ``center_by_query`` overrides
+    the returned center per query (the fake loc object is the query itself).
+    """
+    state = {
+        "calls": 0,
+        "center": (10.0, 20.0),
+        "dims": (4000.0, 6000.0),
+        "fail": set(),
+        "center_by_query": {},
+    }
 
     def fake_loc(query):
         state["calls"] += 1
-        return "LOC"
+        return None if query in state["fail"] else query
 
     monkeypatch.setattr(rf, "get_city_location_data", fake_loc)
-    monkeypatch.setattr(rf, "_resolve_center", lambda loc: state["center"])
+    monkeypatch.setattr(
+        rf, "_resolve_center", lambda loc: state["center_by_query"].get(loc, state["center"])
+    )
     monkeypatch.setattr(rf, "get_search_dimensions", lambda q, w, h: state["dims"])
     return state
 
@@ -205,6 +217,69 @@ def test_execute_is_idempotent(tmp_path, catalog, fake_geocode, capsys):
     assert fake_geocode["calls"] == 1  # only the first run geocoded
     conn = db.connect(catalog)
     assert len(db.get_all_cities(conn)) == 1
+    conn.close()
+
+
+def test_fallback_query_when_manifest_query_fails_geocode(tmp_path, catalog, fake_geocode):
+    # "Testville, Badmin, Testland" doesn't geocode (Nominatim doesn't know the
+    # GeoNames admin name); the bare "Testville, Testland" fallback does.
+    fake_geocode["fail"] = {"Testville, Badmin, Testland"}
+    manifest = tmp_path / "frame.csv"
+    write_manifest(
+        manifest, [frame_row(query_string="Testville, Badmin, Testland", admin="Badmin")]
+    )
+
+    rc = rf.main(["--manifest", str(manifest), "--db-path", catalog, "--execute"])
+
+    assert rc == 0
+    conn = db.connect(catalog)
+    row = db.resolve_city(conn, "Testville, Badmin, Testland")  # aliased manifest query
+    assert row.city_id == "testville--badmin--testland"
+    assert (row.center_lat, row.center_lon) == (10.0, 20.0)
+    conn.close()
+
+
+def test_fallback_query_when_manifest_query_trips_center_guard(tmp_path, catalog, fake_geocode):
+    # The manifest query geocodes to the wrong feature entirely (Berlin was
+    # 379 km off); the fallback geocodes near the GeoNames coordinates.
+    fake_geocode["center_by_query"] = {
+        "Testville, Badmin, Testland": (14.0, 20.0),  # ~445 km off
+        "Testville, Testland": (10.1, 20.0),  # ~11 km off
+    }
+    manifest = tmp_path / "frame.csv"
+    write_manifest(
+        manifest, [frame_row(query_string="Testville, Badmin, Testland", admin="Badmin")]
+    )
+
+    rc = rf.main(["--manifest", str(manifest), "--db-path", catalog, "--execute"])
+
+    assert rc == 0
+    conn = db.connect(catalog)
+    row = db.resolve_city(conn, "Testville, Badmin, Testland")
+    assert (row.center_lat, row.center_lon) == (10.1, 20.0)  # the fallback's center
+    conn.close()
+
+
+def test_center_from_geonames_uses_first_geocoded_candidate(tmp_path, catalog, fake_geocode):
+    # Both candidates trip the guard -> with the flag, register anyway using
+    # the GeoNames coordinates as center.
+    fake_geocode["center_by_query"] = {
+        "Testville, Badmin, Testland": (14.0, 20.0),
+        "Testville, Testland": (13.0, 20.0),
+    }
+    manifest = tmp_path / "frame.csv"
+    write_manifest(
+        manifest, [frame_row(query_string="Testville, Badmin, Testland", admin="Badmin")]
+    )
+
+    rc = rf.main(
+        ["--manifest", str(manifest), "--db-path", catalog, "--execute", "--center-from-geonames"]
+    )
+
+    assert rc == 0
+    conn = db.connect(catalog)
+    row = db.resolve_city(conn, "Testville, Badmin, Testland")
+    assert (row.center_lat, row.center_lon) == (10.0, 20.0)  # GeoNames coords
     conn.close()
 
 

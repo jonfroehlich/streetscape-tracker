@@ -31,12 +31,14 @@ Safety rails (issue #110):
   * **Registered disabled.** New cities are written with ``enabled=0`` so the
     scheduler cannot pick them up before boundary vetting; flip to enabled
     after the audit workflow accepts the grid.
-  * **Center guard.** If the geocoded center lands more than
-    ``--max-center-km`` (default 50) from the GeoNames coordinates, the city is
-    NOT registered (big non-US metros can geocode to a province centroid —
-    Ho Chi Minh City once landed ~100 km off). Re-run those with
-    ``--center-from-geonames`` to use the GeoNames coordinates as the center
-    instead, or fix by hand and re-run.
+  * **Center guard + query fallback.** A geocode attempt whose center lands
+    more than ``--max-center-km`` (default 50) from the GeoNames coordinates is
+    distrusted (big non-US metros can geocode to a province centroid —
+    Ho Chi Minh City once landed ~100 km off). When the manifest query fails to
+    geocode or trips the guard, a bare "City, Country" query is tried next
+    (GeoNames admin-1 names don't always match Nominatim's). If nothing passes,
+    the city is NOT registered; re-run with ``--center-from-geonames`` to use
+    the GeoNames coordinates as the center instead, or fix by hand.
 
 Usage:
     python scripts/register_frame.py                    # dry-run preview (default)
@@ -113,6 +115,18 @@ def frame_identity(row):
     return row["city"], effective_admin(row["city"], row["admin"] or None), row["country"]
 
 
+def geocode_queries(row):
+    """
+    Query strings to try, most specific first: the manifest query, then a bare
+    "City, Country". GeoNames admin-1 names sometimes don't match Nominatim's
+    ("State of Vienna", "Matanzas Province"), which either kills the geocode
+    outright or matches the wrong feature entirely.
+    """
+    query = row["query_string"]
+    fallback = f"{row['city']}, {row['country']}"
+    return [query] if fallback == query else [query, fallback]
+
+
 def register_frame_city(conn, row, step, use_geonames_center, max_center_km):
     """
     Register one frame city with GeoNames ASCII identity + geocoded geometry.
@@ -124,37 +138,49 @@ def register_frame_city(conn, row, step, use_geonames_center, max_center_km):
     (kept out of the scheduler until boundary-vetted). Returns the registered
     CityRow.
 
-    Raises ValueError on geocoding failure, or on a center that lands more
-    than ``max_center_km`` from the GeoNames coordinates (unless
-    ``use_geonames_center``, which substitutes the GeoNames coordinates).
+    Tries each candidate from ``geocode_queries`` until one geocodes AND its
+    center passes the GeoNames distance guard. Raises ValueError when nothing
+    geocodes, or when every geocode lands more than ``max_center_km`` from the
+    GeoNames coordinates (unless ``use_geonames_center``, which registers the
+    first geocoded candidate with the GeoNames coordinates as center).
     """
     query = row["query_string"]
     geo_lat, geo_lon = float(row["lat"]), float(row["lon"])
 
-    loc = get_city_location_data(query)
-    if loc is None:
-        raise ValueError("could not geocode")
-    center = _resolve_center(loc)
-    if center is None:
-        raise ValueError("no center from geocode")
-    center_lat, center_lon = center
+    chosen = best = None  # (geocode_query, center_lat, center_lon, offset_km)
+    for candidate in geocode_queries(row):
+        loc = get_city_location_data(candidate)
+        if loc is None:
+            continue
+        center = _resolve_center(loc)
+        if center is None:
+            continue
+        offset_km = _haversine_km(center[0], center[1], geo_lat, geo_lon)
+        if best is None:
+            best = (candidate, center[0], center[1], offset_km)
+        if offset_km <= max_center_km:
+            chosen = (candidate, center[0], center[1], offset_km)
+            break
+        logger.warning(f"{candidate}: geocoded center {offset_km:.0f} km off GeoNames")
 
-    center_offset_km = _haversine_km(center_lat, center_lon, geo_lat, geo_lon)
-    if center_offset_km > max_center_km:
+    if chosen is None and best is None:
+        raise ValueError("could not geocode")
+    if chosen is None:
         if not use_geonames_center:
             raise ValueError(
-                f"geocoded center is {center_offset_km:.0f} km from the GeoNames "
+                f"geocoded center is {best[3]:.0f} km from the GeoNames "
                 f"coordinates (> {max_center_km:.0f} km) — likely a province "
                 f"centroid; re-run with --center-from-geonames or fix by hand"
             )
-        logger.warning(
-            f"{query}: geocoded center {center_offset_km:.0f} km off GeoNames; "
-            f"using GeoNames coordinates ({geo_lat}, {geo_lon}) as center"
-        )
-        center_lat, center_lon = geo_lat, geo_lon
+        logger.warning(f"{query}: using GeoNames coordinates ({geo_lat}, {geo_lon}) as center")
+        chosen = (best[0], geo_lat, geo_lon, 0.0)
 
-    grid_width, grid_height = get_search_dimensions(query, 1000, 1000)
-    grid_width, grid_height = _cap_dimensions(grid_width, grid_height, query)
+    geocode_query, center_lat, center_lon, _ = chosen
+    if geocode_query != query:
+        logger.info(f"{query}: geocoded via fallback query '{geocode_query}'")
+
+    grid_width, grid_height = get_search_dimensions(geocode_query, 1000, 1000)
+    grid_width, grid_height = _cap_dimensions(grid_width, grid_height, geocode_query)
 
     city_name, state_name, country_name = frame_identity(row)
     city_id = db.register_city(
