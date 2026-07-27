@@ -149,6 +149,10 @@ def run_collect(args: argparse.Namespace) -> int:
             logger.error("No on-street sample points generated; nothing to collect.")
             return 1
 
+        # The provider token is what keeps the two channels' artifacts apart:
+        # both walk the SAME sample points and the scheduler runs them on the
+        # same night with the same run_date, so without it the second collection
+        # would find the first's snapshot already on disk and skip as a no-op.
         stem = generate_streetwalk_filename(
             city.city_id,
             city.grid_width_m,
@@ -156,6 +160,7 @@ def run_collect(args: argparse.Namespace) -> int:
             city.step_m,
             args.spacing,
             run_date,
+            provider=provider,
         )
         csv_name = stem + ".csv.gz"
         coverage_name = streetwalk_coverage_filename(csv_name)
@@ -419,7 +424,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--daily-budget",
         type=int,
         default=None,
-        help="If set, abort when today's gsv_streets usage + estimated queries would exceed it",
+        help=(
+            "Today's FULL ceiling for this provider's street budget channel "
+            "(gsv_streets / mapillary_streets). Abort when the ledger's spend "
+            "so far plus this collection's estimated requests would exceed it — "
+            "pass the whole daily budget, not what is left of it"
+        ),
     )
     parser.add_argument("--data-dir", default=get_default_data_dir(), help="Data directory")
     parser.add_argument(

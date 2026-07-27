@@ -48,6 +48,13 @@ logger = logging.getLogger(__name__)
 
 WGS84 = "EPSG:4326"
 
+# Sample points per sjoin_nearest call. The join's peak memory is driven by the
+# match set it materializes, so a big city (hundreds of thousands of samples
+# against a multi-million-image census) is chunked rather than joined in one go.
+# Purely a memory knob — the result is identical at any block size, since each
+# sample's nearest image is decided independently.
+_JOIN_CHUNK_SIZE = 50_000
+
 
 def _image_row(
     img: dict[str, Any],
@@ -124,6 +131,14 @@ def nearest_images_to_samples(
     coverage and any-imagery coverage (issue #116's distinction, applied to
     streets).
 
+    The samples run through the join in ``_JOIN_CHUNK_SIZE`` blocks rather than
+    one call. Now that ``mapillary_streets`` is scheduled across the whole
+    catalog, a dense city pairs a multi-million-image census with a few hundred
+    thousand sample points, and a single join materializes the whole match set
+    at once. Chunking bounds peak memory at the census plus one block's matches;
+    it cannot change the result, because a sample never spans two blocks and the
+    nearest-image choice is per sample.
+
     Args:
         query_points: ``(lat, lon, seq, _)`` tuples from
             ``road_sampling.dedupe_query_points``.
@@ -140,9 +155,7 @@ def nearest_images_to_samples(
 
     samples_gdf = gpd.GeoDataFrame(
         {"sample_idx": range(len(query_points))},
-        geometry=gpd.points_from_xy(
-            [p[1] for p in query_points], [p[0] for p in query_points]
-        ),
+        geometry=gpd.points_from_xy([p[1] for p in query_points], [p[0] for p in query_points]),
         crs=WGS84,
     )
     # A city's sample points span a single UTM zone in every realistic case;
@@ -153,6 +166,8 @@ def nearest_images_to_samples(
     def _join(subset: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
         if not subset:
             return {}
+        # Built once, outside the chunk loop: the census is the same for every
+        # block, and reprojecting it per block would dominate the runtime.
         images_gdf = gpd.GeoDataFrame(
             {"image_idx": range(len(subset))},
             geometry=gpd.points_from_xy(
@@ -160,20 +175,23 @@ def nearest_images_to_samples(
             ),
             crs=WGS84,
         ).to_crs(metric_crs)
-        joined = gpd.sjoin_nearest(
-            samples_m,
-            images_gdf,
-            how="inner",
-            max_distance=match_dist_m,
-            distance_col="dist_m",
-        )
-        # sjoin_nearest emits every tied nearest neighbour; keep the closest
-        # single image per sample so each sample yields exactly one row.
-        joined = joined.sort_values("dist_m").drop_duplicates("sample_idx", keep="first")
-        return {
-            int(row.sample_idx): subset[int(row.image_idx)]
-            for row in joined.itertuples(index=False)
-        }
+
+        matches: dict[int, dict[str, Any]] = {}
+        for start in range(0, len(samples_m), _JOIN_CHUNK_SIZE):
+            block = samples_m.iloc[start : start + _JOIN_CHUNK_SIZE]
+            joined = gpd.sjoin_nearest(
+                block,
+                images_gdf,
+                how="inner",
+                max_distance=match_dist_m,
+                distance_col="dist_m",
+            )
+            # sjoin_nearest emits every tied nearest neighbour; keep the closest
+            # single image per sample so each sample yields exactly one row.
+            joined = joined.sort_values("dist_m").drop_duplicates("sample_idx", keep="first")
+            for row in joined.itertuples(index=False):
+                matches[int(row.sample_idx)] = subset[int(row.image_idx)]
+        return matches
 
     panos = [img for img in images if img["is_pano"]]
     flats = [img for img in images if not img["is_pano"]]
@@ -199,9 +217,7 @@ def build_streetwalk_rows(
         enter a dated statistic; counts only toward any-imagery coverage.
       * ``ZERO_RESULTS`` — no imagery of any kind in range.
     """
-    pano_by_index, flat_by_index = nearest_images_to_samples(
-        query_points, images, match_dist_m
-    )
+    pano_by_index, flat_by_index = nearest_images_to_samples(query_points, images, match_dist_m)
 
     rows = []
     for idx, (lat, lon, _seq, _unused) in enumerate(query_points):

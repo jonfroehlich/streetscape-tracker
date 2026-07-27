@@ -65,9 +65,9 @@ const NO_DATA_COLOR = "#666666";
 /**
  * Baseline fill opacity for a city rectangle under the active metric.
  *
- * Normally 0.6 for everything. The exception is street coverage: only a
- * handful of cities have been road-walked, so painting ~1,150 no-data
- * rectangles at full opacity buries them — the unwalked ones fade back
+ * Normally 0.6 for everything. The exception is street coverage: cities are
+ * road-walked over a collection cycle, so until one completes, painting the
+ * not-yet-walked ones at full opacity buries the walked ones — they fade back
  * instead. Used both at render time and by applyDefaultStyles(), so a hover
  * can't restore the wrong baseline.
  *
@@ -1035,9 +1035,10 @@ function renderProvider(fitMap = false) {
     map.attributionControl.removeAttribution(p.attribution));
   map.attributionControl.addAttribution(providerInfo.attribution);
 
-  // Stats banner. In streets mode the map is mostly "no data" (road-walk
-  // collection is still a manual CLI, so only a handful of cities are
-  // walked) — say so outright rather than let it read as a broken render.
+  // Stats banner. In streets mode much of the map is "no data": the street
+  // channels are scheduled like the grid ones, so cities fill in over a
+  // collection cycle rather than all at once. Say so outright rather than let
+  // a sparse render read as a broken one.
   const streetsNote = currentMetric === "streets"
     ? `<br><span class="stats-note">Road-walk street coverage: ${walkedCityCount}
        of ${cities.length} ${providerInfo.label} cities walked

@@ -43,7 +43,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from streetscape_metadata_tracker import db  # noqa: E402
+from streetscape_metadata_tracker import db, naming  # noqa: E402
 from streetscape_metadata_tracker.fileutils import load_city_csv_file  # noqa: E402
 from streetscape_metadata_tracker.json_summarizer import (  # noqa: E402
     generate_aggregate_v2,
@@ -203,18 +203,14 @@ def _add_streetwalk(
                 "pano_lat": r.lat if _covered(r) else None,
                 "pano_lon": r.lon if _covered(r) else None,
                 "pano_id": f"sw{r.Index}" if _covered(r) else None,
-                "capture_date": (
-                    None if (flat_only or not _covered(r)) else "2022-06-01"
-                ),
+                "capture_date": (None if (flat_only or not _covered(r)) else "2022-06-01"),
                 "copyright_info": (
                     None
                     if not _covered(r)
                     else ("© Mapillary contributor 42" if flat_only else "© Google")
                 ),
                 "status": (
-                    "ZERO_RESULTS"
-                    if not _covered(r)
-                    else ("FLAT_ONLY" if flat_only else "OK")
+                    "ZERO_RESULTS" if not _covered(r) else ("FLAT_ONLY" if flat_only else "OK")
                 ),
                 "query_timestamp": f"{run_date.isoformat()}T00:00:00Z",
             }
@@ -222,12 +218,16 @@ def _add_streetwalk(
         ]
     )
 
-    token = "" if provider == "gsv" else f"_{provider}"
+    # Named by the real generator so the fixture can't drift from the contract
+    # (it used to hand-build the provider token, which production code did not
+    # actually emit — the bug that let two providers collide on one filename).
     csv_name = (
-        f"{city_id}_width_{W}_height_{H}_step_{STEP}{token}"
-        f"_streetwalk_sp{int(spacing_m)}_{run_date.isoformat()}.csv.gz"
+        naming.generate_streetwalk_filename(
+            city_id, W, H, STEP, spacing_m, run_date, provider=provider
+        )
+        + ".csv.gz"
     )
-    coverage_name = csv_name[: -len(".csv.gz")] + "_coverage.json.gz"
+    coverage_name = naming.streetwalk_coverage_filename(csv_name)
 
     covered = street_coverage.compute_streetwalk_coverage(
         edges, samples, collected, run_date.isoformat(), provider, match_dist_m

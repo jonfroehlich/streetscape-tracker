@@ -518,7 +518,9 @@ def test_budget_ledger_defers_second_city_when_first_consumes_budget(conn, monke
 
     ran = []
 
-    def fake_run(cfg, city, run_today, provider="gsv", connection_limit=None, budget_remaining=0, conn=None):
+    def fake_run(
+        cfg, city, run_today, provider="gsv", connection_limit=None, daily_budget=0, conn=None
+    ):
         # Simulate the real pipeline's ledger write for the requests spent
         db.add_api_usage(conn, run_today, sched.estimate_requests(city, provider), provider)
         ran.append(city.city_id)
@@ -565,7 +567,7 @@ def test_oversized_city_does_not_starve_queue(conn, monkeypatch):
     monkeypatch.setattr(
         sched,
         "_run_one_city",
-        lambda cfg, city, today, provider="gsv", connection_limit=None, budget_remaining=0, conn=None: (
+        lambda cfg, city, today, provider="gsv", connection_limit=None, daily_budget=0, conn=None: (
             ran.append(city.city_id) or True
         ),
     )
@@ -594,7 +596,7 @@ def test_run_due_pairs_providers_per_city(conn, monkeypatch):
     monkeypatch.setattr(
         sched,
         "_run_one_city",
-        lambda cfg, city, today, provider="gsv", connection_limit=None, budget_remaining=0, conn=None: (
+        lambda cfg, city, today, provider="gsv", connection_limit=None, daily_budget=0, conn=None: (
             ran.append((city.city_id, provider)) or (provider == "gsv")
         ),
     )
@@ -644,7 +646,7 @@ def test_run_due_provider_budgets_are_independent(conn, monkeypatch):
     monkeypatch.setattr(
         sched,
         "_run_one_city",
-        lambda cfg, city, today, provider="gsv", connection_limit=None, budget_remaining=0, conn=None: (
+        lambda cfg, city, today, provider="gsv", connection_limit=None, daily_budget=0, conn=None: (
             ran.append((city.city_id, provider)) or True
         ),
     )
@@ -695,7 +697,9 @@ def test_run_due_refreshes_the_manifest_only_after_a_success(conn, monkeypatch):
     monkeypatch.setattr(
         sched,
         "_run_one_city",
-        lambda cfg, city, today, provider="gsv", connection_limit=None, budget_remaining=0, conn=None: False,
+        lambda cfg, city, today, provider="gsv", connection_limit=None, daily_budget=0, conn=None: (
+            False
+        ),
     )
     sched.cmd_run_due(SchedulerConfig(publish_enabled=False), today=date(2026, 7, 2))
     assert calls == {"agg": 0, "manifest": 0}
@@ -704,7 +708,9 @@ def test_run_due_refreshes_the_manifest_only_after_a_success(conn, monkeypatch):
     monkeypatch.setattr(
         sched,
         "_run_one_city",
-        lambda cfg, city, today, provider="gsv", connection_limit=None, budget_remaining=0, conn=None: True,
+        lambda cfg, city, today, provider="gsv", connection_limit=None, daily_budget=0, conn=None: (
+            True
+        ),
     )
     sched.cmd_run_due(SchedulerConfig(publish_enabled=False), today=date(2026, 7, 3))
     assert calls == {"agg": 1, "manifest": 1}
@@ -875,7 +881,7 @@ def test_street_timeout_scales_like_gsv_not_the_flat_floor(conn):
 
 def test_street_channel_dispatches_to_the_road_walk_collector(conn, monkeypatch):
     """The scheduler must run the road-walk CLI for a street channel, with the
-    imagery provider, the isolated budget remaining, and the catalog path."""
+    imagery provider, the isolated daily budget, and the catalog path."""
     from streetscape_metadata_tracker import scheduler as sched
 
     cid = _register(conn, "Bend", width=1000, height=1000, step=20)
@@ -893,7 +899,7 @@ def test_street_channel_dispatches_to_the_road_walk_collector(conn, monkeypatch)
     monkeypatch.setattr(sched.subprocess, "run", fake_run)
     cfg = _street_cfg(db_path="/tmp/x.db", data_dir="/tmp/data")
     assert sched._run_one_city(
-        cfg, city, date(2026, 7, 1), "gsv_streets", budget_remaining=12345, conn=conn
+        cfg, city, date(2026, 7, 1), "gsv_streets", daily_budget=12345, conn=conn
     )
 
     cmd = captured["cmd"]
@@ -932,6 +938,49 @@ def test_mapillary_street_dispatch_omits_per_minute_pacing(conn, monkeypatch):
     assert "--max-requests-per-minute" not in cmd
 
 
+def test_street_dispatch_passes_the_full_budget_not_the_remainder(conn, monkeypatch, data_dir):
+    """
+    ``--daily-budget`` is the channel's whole ceiling, because the collector
+    re-reads the same api_usage ledger and subtracts today's spend itself.
+
+    Passing ``budget - used`` made the child's guard ``2*used + est > budget``,
+    so once a street channel was ~half spent every remaining city aborted with
+    exit 1 — which the scheduler counts as a real failure, driving the city
+    toward max_consecutive_failures and out of the due set entirely.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    _register(conn, "Bend", width=1000, height=1000, step=20)
+    conn.execute("UPDATE schedule_state SET last_success_at = NULL")
+    conn.commit()
+
+    cfg = _street_cfg(data_dir=data_dir, publish_enabled=False)
+    budget = cfg.providers["gsv_streets"].daily_request_budget
+    today = date(2026, 7, 2)
+    # More than half of it already spent — the regime where the old arithmetic
+    # started rejecting cities that comfortably fit.
+    already = int(budget * 0.6)
+    db.add_api_usage(conn, today, already, provider="gsv_streets")
+
+    seen = {}
+    monkeypatch.setattr(
+        sched,
+        "_run_one_city",
+        lambda cfg, city, today, provider="gsv", connection_limit=None, daily_budget=0, conn=None: (
+            seen.setdefault(provider, daily_budget) is not None or True
+        ),
+    )
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+    monkeypatch.setattr(sched.time, "sleep", lambda s: None)
+    monkeypatch.setattr(sched, "generate_aggregate_v2", lambda c, d: None)
+    monkeypatch.setattr(sched, "generate_streetwalk_manifest", lambda c, d: {"walks": []})
+
+    sched.cmd_run_due(cfg, today=today)
+
+    assert seen["gsv_streets"] == budget
+    assert seen["gsv_streets"] != budget - already  # the old, doubled-counting value
+
+
 def test_street_channels_share_the_grid_stagger_day(conn):
     """Paired snapshots: a city's street walk lands the same night as its grid
     run, because day_of_cycle is hashed from city_id alone."""
@@ -966,7 +1015,9 @@ def test_street_channel_failure_is_not_reconciled_as_an_orphan_run(conn, monkeyp
     monkeypatch.setattr(
         sched,
         "_run_one_city",
-        lambda cfg, city, today, provider="gsv", connection_limit=None, budget_remaining=0, conn=None: False,
+        lambda cfg, city, today, provider="gsv", connection_limit=None, daily_budget=0, conn=None: (
+            False
+        ),
     )
     monkeypatch.setattr(sched.db, "connect", lambda path: conn)
     monkeypatch.setattr(sched.time, "sleep", lambda s: None)

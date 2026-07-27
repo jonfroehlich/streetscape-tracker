@@ -442,9 +442,7 @@ def test_streets_page_lists_published_road_walks(page: Page, base_url):
     expect(alpha_row.locator("a.streets-view-link")).to_have_attribute(
         "href", f"city.html?file={ALPHA_LATEST}"
     )
-    expect(page.locator("#streets-caption")).to_contain_text(
-        "2 published road-walk collections"
-    )
+    expect(page.locator("#streets-caption")).to_contain_text("2 published road-walk collections")
 
     # And it actually lands on the city page with the overlay.
     alpha_row.locator("a.streets-view-link").click()
@@ -464,7 +462,7 @@ def test_streets_page_separates_360_and_any_imagery_coverage(page: Page, base_ur
     mapillary_row = page.locator("#streets-tbody tr", has_text="Mapillary")
     cells = mapillary_row.locator("td.coverage-cell")
     expect(cells).to_have_count(2)
-    expect(cells.nth(0)).to_have_text("0.0%")   # 360° only
+    expect(cells.nth(0)).to_have_text("0.0%")  # 360° only
     expect(cells.nth(1)).to_have_text("85.1%")  # including flat imagery
 
     assert errors == []
@@ -515,9 +513,7 @@ def test_streets_metric_colors_only_the_walked_cities(page: Page, base_url):
     expect(page.locator("#legend")).to_contain_text("No data (1)")
 
     # The banner states the sparse denominator outright.
-    expect(page.locator("#stats")).to_contain_text(
-        "1 of 2 Google Street View cities walked"
-    )
+    expect(page.locator("#stats")).to_contain_text("1 of 2 Google Street View cities walked")
 
     assert errors == []
 

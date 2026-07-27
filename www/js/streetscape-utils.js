@@ -229,7 +229,8 @@ METRICS.coverage_any = {
 // length actually driven. The value is not in cities.json.gz at all — it comes
 // from the streetwalks.json.gz sidecar manifest and is attached to the city
 // record by mergeStreetwalkStats(), so it is null for every city that has not
-// been walked (which is most of them: collection is still a manual CLI).
+// been walked yet — the street channels are scheduled like the grid ones, so
+// cities fill in over a collection cycle rather than all at once.
 // Same decile/color machinery as `coverage` — only the read differs.
 METRICS.streets = {
   ...METRICS.coverage,
@@ -424,9 +425,15 @@ function lookupStreetwalk(manifest, cityId, provider) {
  * walk get explicit nulls rather than missing keys, so METRICS.streets.valueOf
  * and the popup both read a defined property.
  *
- * The count is the honest denominator for "N of M cities walked": today it is
- * 1 of ~1,150, and the overview says so rather than silently rendering a map
- * of grey rectangles.
+ * Indexes the walks once instead of scanning them per city: street collection
+ * is scheduled across the whole catalog, so both sides of this join grow to
+ * ~1,150 cities × 2 providers, and it re-runs on every provider/metric toggle.
+ * The index keeps the FIRST walk per key, matching what `lookupStreetwalk`'s
+ * `find` returns for a manifest that somehow carries duplicates.
+ *
+ * The count is the honest denominator for "N of M cities walked" that the
+ * overview banner reports, rather than silently rendering a map of grey
+ * rectangles.
  *
  * @param {Object[]} cities - Adapted city records (from adaptCitiesPayload).
  * @param {?Object} manifest - The parsed streetwalks.json.gz, or null.
@@ -437,9 +444,17 @@ function lookupStreetwalk(manifest, cityId, provider) {
  *   const walked = mergeStreetwalkStats(cities, manifest);  // → 1
  */
 function mergeStreetwalkStats(cities, manifest) {
+  const byKey = new Map();
+  if (manifest && Array.isArray(manifest.walks)) {
+    for (const walk of manifest.walks) {
+      const key = `${walk.provider}|${walk.city_id}`;
+      if (!byKey.has(key)) byKey.set(key, walk);
+    }
+  }
+
   let matched = 0;
   for (const city of cities) {
-    const walk = lookupStreetwalk(manifest, city.city_id, city.provider);
+    const walk = byKey.get(`${city.provider}|${city.city_id}`) ?? null;
     city.street_walk = walk;
     city.street_coverage_pct_by_length = walk?.coverage_pct_by_length ?? null;
     if (walk) matched += 1;

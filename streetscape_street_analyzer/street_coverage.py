@@ -555,7 +555,9 @@ def build_streetwalk_geojson(
                     "covered_samples": int(row.covered_samples),
                     "coverage_fraction": float(row.coverage_fraction),
                     "covered": bool(row.covered),
-                    "covered_samples_any": int(getattr(row, "covered_samples_any", row.covered_samples)),
+                    "covered_samples_any": int(
+                        getattr(row, "covered_samples_any", row.covered_samples)
+                    ),
                     "coverage_fraction_any": float(
                         getattr(row, "coverage_fraction_any", row.coverage_fraction)
                     ),

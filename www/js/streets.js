@@ -101,7 +101,13 @@ const DEFAULT_SORT = { key: "pct", dir: "desc" };
  * display label, which exists only after the aggregate join.
  *
  * @param {Object} walk - A manifest walk record.
- * @param {?Object} city - The joined aggregate record, or null/undefined.
+ * @param {?Object} city - The joined aggregate record for this walk's exact
+ *   (provider, city_id), or null/undefined. Supplies both the label and the
+ *   `city.html?file=` link target.
+ * @param {?Object} [labelSource] - Fallback record matched on city_id alone,
+ *   used for the display NAME only when the city has no run in this walk's
+ *   provider series. Never used for the link: city.html derives its provider
+ *   from the run filename, so a cross-provider link opens the wrong series.
  * @returns {Object} Row model.
  */
 function toRowModel(walk, city, labelSource = null) {
@@ -129,6 +135,10 @@ function toRowModel(walk, city, labelSource = null) {
  * direction (a missing number is not "small" — it is absent), and city_id is
  * the tiebreaker so the order is stable across reloads and re-sorts.
  *
+ * Text compares with `sensitivity: "base"` so the worldwide frame's accented
+ * and non-Latin city names order the way a reader expects rather than by code
+ * point ("Ávila" next to "Avila", not after "Zurich").
+ *
  * @param {Object[]} rows - Row models from toRowModel.
  * @param {string} key - A STREET_COLUMNS key.
  * @param {"asc"|"desc"} dir
@@ -137,14 +147,15 @@ function toRowModel(walk, city, labelSource = null) {
 function sortRows(rows, key, dir = "desc") {
   const column = STREET_COLUMNS.find((c) => c.key === key) ?? STREET_COLUMNS[0];
   const sign = dir === "asc" ? 1 : -1;
+  const collator = new Intl.Collator(undefined, { sensitivity: "base", numeric: true });
   return [...rows].sort((a, b) => {
     const av = a[column.key];
     const bv = b[column.key];
-    if (av == null && bv == null) return a.cityId.localeCompare(b.cityId);
+    if (av == null && bv == null) return collator.compare(a.cityId, b.cityId);
     if (av == null) return 1;
     if (bv == null) return -1;
-    const cmp = column.type === "number" ? av - bv : String(av).localeCompare(String(bv));
-    return cmp !== 0 ? cmp * sign : a.cityId.localeCompare(b.cityId);
+    const cmp = column.type === "number" ? av - bv : collator.compare(String(av), String(bv));
+    return cmp !== 0 ? cmp * sign : collator.compare(a.cityId, b.cityId);
   });
 }
 

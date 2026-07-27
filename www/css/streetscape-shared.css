@@ -76,9 +76,12 @@ body {
   background: rgba(0, 0, 0, 0.07);
 }
 
-/* The active page — same green as the checked toggle pills */
+/* The active page. A darker green than the checked toggle pills (#4CAF50),
+   which only carries ~2.8:1 against white — under WCAG AA for body text.
+   #2E7D32 clears 4.5:1 while reading as the same accent. aria-current carries
+   the state for assistive tech regardless of the color. */
 .site-nav a[aria-current="page"] {
-  background-color: #4CAF50;
+  background-color: #2E7D32;
   color: #fff;
 }
 

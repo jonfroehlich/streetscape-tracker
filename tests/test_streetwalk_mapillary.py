@@ -23,6 +23,11 @@ import geopandas as gpd
 from shapely.geometry import LineString
 
 from streetscape_metadata_tracker import db
+from streetscape_metadata_tracker import download_gsv as dg
+from streetscape_metadata_tracker.naming import (
+    generate_streetwalk_filename,
+    streetwalk_coverage_filename,
+)
 from streetscape_street_analyzer import collect
 from streetscape_street_analyzer import collect_mapillary as cm
 
@@ -91,11 +96,11 @@ def _setup(tmp_path, monkeypatch, images):
     return data_dir, calls
 
 
-def _args(data_dir, **overrides):
+def _args(data_dir, provider="mapillary", **overrides):
     argv = [
         CITY_QUERY,
         "--provider",
-        "mapillary",
+        provider,
         "--data-dir",
         data_dir,
         "--run-date",
@@ -108,11 +113,20 @@ def _args(data_dir, **overrides):
     return collect.build_parser().parse_args(argv)
 
 
-def _coverage(data_dir, spacing=15):
-    name = (
-        f"{CITY_ID}_width_200_height_200_step_20_streetwalk_sp{spacing}_"
-        f"{RUN_DATE}_coverage.json.gz"
+def _csv_name(spacing=15, provider="mapillary", run_date=RUN_DATE):
+    """Snapshot filename, via the real generator so the tests can't drift from
+    the naming contract (the provider token is what keeps the two channels'
+    artifacts from colliding)."""
+    return (
+        generate_streetwalk_filename(
+            CITY_ID, 200, 200, 20, spacing, date.fromisoformat(run_date), provider=provider
+        )
+        + ".csv.gz"
     )
+
+
+def _coverage(data_dir, spacing=15, provider="mapillary"):
+    name = streetwalk_coverage_filename(_csv_name(spacing, provider))
     with gzip.open(os.path.join(data_dir, name), "rt") as fh:
         return json.load(fh)
 
@@ -123,9 +137,7 @@ def _coverage(data_dir, spacing=15):
 def test_panos_along_the_edge_cover_it_and_meter_only_the_streets_channel(tmp_path, monkeypatch):
     # A pano every ~0.0002° of latitude (~22 m) down the long edge: dense
     # enough that every 15 m sample finds one within the 25 m match distance.
-    images = [
-        _image(f"p{i}", 44.05 + i * 0.0001, -121.30) for i in range(26)
-    ]
+    images = [_image(f"p{i}", 44.05 + i * 0.0001, -121.30) for i in range(26)]
     data_dir, calls = _setup(tmp_path, monkeypatch, images)
 
     assert collect.run_collect(_args(data_dir)) == 0
@@ -166,9 +178,7 @@ def test_flat_imagery_raises_any_coverage_but_not_360_coverage(tmp_path, monkeyp
     """Issue #116's distinction, applied to streets: flat/perspective imagery
     is imagery of the street, but it is not a 360° pano and carries no usable
     date — so it must move the any-imagery number and ONLY that one."""
-    images = [
-        _image(f"f{i}", 44.05 + i * 0.0001, -121.30, is_pano=False) for i in range(26)
-    ]
+    images = [_image(f"f{i}", 44.05 + i * 0.0001, -121.30, is_pano=False) for i in range(26)]
     data_dir, _ = _setup(tmp_path, monkeypatch, images)
 
     assert collect.run_collect(_args(data_dir)) == 0
@@ -208,8 +218,7 @@ def test_flat_only_rows_carry_no_capture_date(tmp_path, monkeypatch):
     assert collect.run_collect(_args(data_dir)) == 0
     from streetscape_metadata_tracker.fileutils import load_city_csv_file
 
-    csv_name = f"{CITY_ID}_width_200_height_200_step_20_streetwalk_sp15_{RUN_DATE}.csv.gz"
-    df = load_city_csv_file(os.path.join(data_dir, csv_name))
+    df = load_city_csv_file(os.path.join(data_dir, _csv_name()))
     flat_rows = df[df["status"] == "FLAT_ONLY"]
     assert len(flat_rows) >= 1
     assert flat_rows["capture_date"].isna().all()
@@ -224,8 +233,7 @@ def test_unusable_timestamp_becomes_no_date_not_a_bogus_year(tmp_path, monkeypat
     assert collect.run_collect(_args(data_dir)) == 0
     from streetscape_metadata_tracker.fileutils import load_city_csv_file
 
-    csv_name = f"{CITY_ID}_width_200_height_200_step_20_streetwalk_sp15_{RUN_DATE}.csv.gz"
-    df = load_city_csv_file(os.path.join(data_dir, csv_name))
+    df = load_city_csv_file(os.path.join(data_dir, _csv_name()))
     assert (df["status"] == "NO_DATE").any()
     assert not (df["capture_date"].fillna("") == "1970-01-01").any()
 
@@ -280,12 +288,75 @@ def test_estimate_reports_tiles_and_needs_no_token(tmp_path, monkeypatch, capsys
     out = capsys.readouterr().out
     assert "Mapillary tile requests" in out
     assert calls["n"] == 0  # nothing fetched
-    assert not os.path.exists(
-        os.path.join(
-            data_dir,
-            f"{CITY_ID}_width_200_height_200_step_20_streetwalk_sp15_{RUN_DATE}.csv.gz",
-        )
-    )
+    assert not os.path.exists(os.path.join(data_dir, _csv_name()))
+
+
+# --- Both channels on one night ---------------------------------------------
+
+
+def test_both_providers_can_walk_the_same_city_on_the_same_night(tmp_path, monkeypatch):
+    """
+    The scheduler runs a city's gsv_streets and mapillary_streets channels
+    back-to-back with ONE run_date, so the two collections must not collide.
+
+    They used to: the snapshot filename carried no provider token, so the
+    second collection found the first's artifact already on disk, hit the
+    immutable-per-date guard, and returned 0 — a *success* as far as the
+    scheduler is concerned, which advanced last_success_at and meant the
+    Mapillary arm never ran at all. Assert both artifacts and both catalog rows
+    exist, and that the second run actually collected rather than skipping.
+    """
+    images = [_image(f"p{i}", 44.05 + i * 0.0001, -121.30) for i in range(26)]
+    data_dir, census_calls = _setup(tmp_path, monkeypatch, images)
+    monkeypatch.setenv("GMAPS_STREETS_API_KEY", "TESTKEY")
+
+    gsv_calls = {"n": 0}
+
+    async def fake_gsv(lat, lon, api_key, session, timeout, limiter=None):
+        assert api_key == "TESTKEY"  # the gsv_streets key, not the grid one
+        gsv_calls["n"] += 1
+        return {
+            "status": "OK",
+            "location": {"lat": lat, "lng": lon},
+            "pano_id": f"pano_{lat:.6f}_{lon:.6f}",
+            "copyright": "© Google",
+            "date": "2022-06",
+        }
+
+    monkeypatch.setattr(dg, "fetch_gsv_pano_metadata_async", fake_gsv)
+
+    # Same city, same run date, in the order enabled_providers() dispatches.
+    assert collect.run_collect(_args(data_dir, provider="gsv")) == 0
+    assert collect.run_collect(_args(data_dir, provider="mapillary")) == 0
+
+    # Neither channel short-circuited: each actually reached its imagery source.
+    assert gsv_calls["n"] > 0
+    assert census_calls["n"] == 1
+
+    for provider in ("gsv", "mapillary"):
+        csv_path = os.path.join(data_dir, _csv_name(provider=provider))
+        assert os.path.exists(csv_path), f"{provider} snapshot missing"
+        assert os.path.exists(
+            os.path.join(data_dir, streetwalk_coverage_filename(_csv_name(provider=provider)))
+        ), f"{provider} coverage artifact missing"
+    assert _csv_name(provider="gsv") != _csv_name(provider="mapillary")
+
+    conn = db.connect(db.get_default_db_path(data_dir))
+    rows = conn.execute(
+        "SELECT provider, csv_filename, coverage_filename FROM street_walks ORDER BY provider"
+    ).fetchall()
+    assert [r["provider"] for r in rows] == ["gsv", "mapillary"]
+    # Each catalog row points at its own artifact, not a shared one.
+    assert rows[0]["csv_filename"] != rows[1]["csv_filename"]
+    assert rows[0]["coverage_filename"] != rows[1]["coverage_filename"]
+
+    # Isolated ledgers: each channel metered only its own spend.
+    d = date.fromisoformat(RUN_DATE)
+    assert db.get_api_usage(conn, d, provider="gsv_streets") == gsv_calls["n"]
+    assert db.get_api_usage(conn, d, provider="mapillary_streets") == 7
+    assert db.get_api_usage(conn, d, provider="gsv") == 0
+    assert db.get_api_usage(conn, d, provider="mapillary") == 0
+    conn.close()
 
 
 # --- The pure join helper ---------------------------------------------------
@@ -296,11 +367,44 @@ def test_nearest_images_to_samples_picks_the_closest_of_each_kind():
     near_pano = _image("p_near", 44.05001, -121.3000)
     far_pano = _image("p_far", 44.05015, -121.3000)  # ~17 m away
     near_flat = _image("f_near", 44.050005, -121.3000, is_pano=False)
-    panos, flats = cm.nearest_images_to_samples(
-        samples, [far_pano, near_pano, near_flat], 25.0
-    )
+    panos, flats = cm.nearest_images_to_samples(samples, [far_pano, near_pano, near_flat], 25.0)
     assert panos[0]["id"] == "p_near"
     assert flats[0]["id"] == "f_near"
+
+
+def test_chunked_join_matches_a_single_shot_join(monkeypatch):
+    """
+    The join runs the samples through sjoin_nearest in blocks so a dense city's
+    census can't materialize one enormous match set. Chunking is a memory knob
+    only: the same samples must map to the same images at any block size,
+    including a block boundary that falls mid-run.
+    """
+    samples = [(44.05 + i * 0.0001, -121.30, i, 0) for i in range(25)]
+    # Imagery near only some samples, so the result has genuine gaps to preserve.
+    images = [_image(f"p{i}", 44.05 + i * 0.0001, -121.30) for i in range(0, 25, 3)]
+    images += [
+        _image(f"f{i}", 44.05 + i * 0.0001, -121.3000, is_pano=False) for i in range(1, 25, 4)
+    ]
+
+    # A tight match distance against ~11 m sample spacing, so most samples have
+    # nothing in range and the result has real gaps to preserve.
+    match_dist = 5.0
+
+    monkeypatch.setattr(cm, "_JOIN_CHUNK_SIZE", 10_000)  # one block
+    whole_panos, whole_flats = cm.nearest_images_to_samples(samples, images, match_dist)
+
+    monkeypatch.setattr(cm, "_JOIN_CHUNK_SIZE", 7)  # boundaries at 7, 14, 21
+    chunked_panos, chunked_flats = cm.nearest_images_to_samples(samples, images, match_dist)
+
+    assert {k: v["id"] for k, v in chunked_panos.items()} == {
+        k: v["id"] for k, v in whole_panos.items()
+    }
+    assert {k: v["id"] for k, v in chunked_flats.items()} == {
+        k: v["id"] for k, v in whole_flats.items()
+    }
+    assert whole_panos, "fixture should match at least some samples"
+    # Samples out of range stay unmatched rather than being filled in.
+    assert len(whole_panos) < len(samples)
 
 
 def test_nearest_images_to_samples_handles_empty_inputs():

@@ -823,6 +823,51 @@ test("mergeStreetwalkStats: a null manifest leaves every city unwalked", () => {
   assert.equal(cities[0].street_coverage_pct_by_length, null);
 });
 
+test("mergeStreetwalkStats: a malformed manifest is treated as no walks", () => {
+  const cities = [{ city_id: "seattle--wa", provider: "gsv" }];
+  assert.equal(mergeStreetwalkStats(cities, {}), 0);
+  assert.equal(mergeStreetwalkStats(cities, { walks: "nope" }), 0);
+  assert.equal(cities[0].street_walk, null);
+});
+
+test("mergeStreetwalkStats: duplicate manifest keys keep the first walk", () => {
+  // The manifest is latest-per-(city, provider) by construction, so duplicates
+  // shouldn't occur — but the join indexes the walks rather than scanning them
+  // per city, and that index must resolve a duplicate the same way the old
+  // `find` did, so a malformed manifest can't change what the map shows.
+  const cities = [{ city_id: "seattle--wa", provider: "gsv" }];
+  const manifest = {
+    walks: [
+      { city_id: "seattle--wa", provider: "gsv", coverage_pct_by_length: 98.4 },
+      { city_id: "seattle--wa", provider: "gsv", coverage_pct_by_length: 11.1 },
+    ],
+  };
+  assert.equal(mergeStreetwalkStats(cities, manifest), 1);
+  assert.equal(cities[0].street_coverage_pct_by_length, 98.4);
+});
+
+test("mergeStreetwalkStats: joins every city once at catalog scale", () => {
+  // Both sides grow to ~1,150 cities x 2 providers now that street collection
+  // is scheduled, and this re-runs on every provider/metric toggle — so the
+  // join is indexed rather than a scan per city. Correctness at size is what
+  // this asserts; the speedup is the reason.
+  const cities = [];
+  const walks = [];
+  for (let i = 0; i < 1200; i += 1) {
+    for (const provider of ["gsv", "mapillary"]) {
+      cities.push({ city_id: `city-${i}`, provider });
+      // Only every third city has been walked.
+      if (i % 3 === 0) {
+        walks.push({ city_id: `city-${i}`, provider, coverage_pct_by_length: i % 100 });
+      }
+    }
+  }
+  const matched = mergeStreetwalkStats(cities, { walks });
+  assert.equal(matched, walks.length);
+  assert.equal(cities[0].street_coverage_pct_by_length, 0);
+  assert.equal(cities[2].street_walk, null); // city-1, unwalked
+});
+
 test("METRICS.streets: reads the merged manifest value, shares coverage's buckets", () => {
   const metric = METRICS.streets;
   assert.equal(metric.valueOf({ street_coverage_pct_by_length: 98.4 }), 98.4);

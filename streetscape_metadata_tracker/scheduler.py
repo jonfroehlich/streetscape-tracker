@@ -60,6 +60,7 @@ def is_street_channel(name: str) -> bool:
     """True for a road-walk collection channel (vs. a grid run provider)."""
     return name in STREET_CHANNELS
 
+
 logger = logging.getLogger("streetscape_scheduler")
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -365,7 +366,9 @@ def estimate_street_samples(conn, city: db.CityRow, spacing_m: int) -> int:
     return max(1, int(street_km * 1000.0 / spacing))
 
 
-def estimate_requests(city: db.CityRow, provider: str = "gsv", conn=None, spacing_m: int = 15) -> int:
+def estimate_requests(
+    city: db.CityRow, provider: str = "gsv", conn=None, spacing_m: int = 15
+) -> int:
     """
     Estimated API requests for one collection.
 
@@ -378,11 +381,11 @@ def estimate_requests(city: db.CityRow, provider: str = "gsv", conn=None, spacin
     ``conn`` is required only for ``gsv_streets``; without it the sample
     estimate falls back to the area proxy.
     """
-    tiles = estimate_tile_count(
-        city.center_lat, city.center_lon, city.grid_width_m, city.grid_height_m, city.step_m
-    )
     if provider in ("mapillary", "mapillary_streets"):
-        return tiles
+        # Both Mapillary channels read the identical z14 census.
+        return estimate_tile_count(
+            city.center_lat, city.center_lon, city.grid_width_m, city.grid_height_m, city.step_m
+        )
     if provider == "gsv_streets":
         if conn is None:
             area_km2 = (city.grid_width_m / 1000.0) * (city.grid_height_m / 1000.0)
@@ -622,7 +625,7 @@ def _street_collect_cmd(
     today: date,
     channel: str,
     conn_limit: int,
-    budget_remaining: int,
+    daily_budget: int,
 ) -> list[str]:
     """Argv for a road-walk collection of one (city, street channel).
 
@@ -630,6 +633,12 @@ def _street_collect_cmd(
     scheduler owns cadence through ``schedule_state``, and the collector's only
     skip is its immutable same-run-date guard — which is exactly the behaviour
     wanted if a night is re-run.
+
+    ``daily_budget`` is the channel's FULL daily ceiling, not what's left of it:
+    the collector reads the same ``api_usage`` ledger and subtracts today's
+    spend itself, so passing the remainder would charge that spend twice and
+    abort cities that actually fit. Its guard is then an exact re-check of the
+    caller's, using the true sample count rather than the planning estimate.
     """
     pc = (cfg.providers or {}).get(channel) or ProviderConfig()
     cmd = [
@@ -652,12 +661,15 @@ def _street_collect_cmd(
         str(cfg.request_timeout_s),
         # Hard stop before the isolated street ledger overruns today's ceiling.
         "--daily-budget",
-        str(max(0, budget_remaining)),
+        str(max(0, daily_budget)),
         "--log-level",
         "INFO",
     ]
     if channel == "gsv_streets":
-        cmd += ["--max-requests-per-minute", str(pc.max_requests_per_minute or cfg.max_requests_per_minute)]
+        cmd += [
+            "--max-requests-per-minute",
+            str(pc.max_requests_per_minute or cfg.max_requests_per_minute),
+        ]
     # '--' so a display name can never be parsed as a flag
     cmd += ["--", city.display_name]
     return cmd
@@ -669,7 +681,7 @@ def _run_one_city(
     today: date,
     provider: str = "gsv",
     connection_limit: int | None = None,
-    budget_remaining: int = 0,
+    daily_budget: int = 0,
     conn=None,
 ) -> bool:
     """Collect one (city, channel) in a subprocess.
@@ -680,15 +692,18 @@ def _run_one_city(
 
     ``connection_limit`` overrides ``cfg.connection_limit`` for this run (the
     resource guard lowers it when the shared host is under pressure); None uses
-    the configured default.
+    the configured default. ``daily_budget`` is the street channel's full daily
+    ceiling — see _street_collect_cmd on why it is not the remainder.
     """
     conn_limit = cfg.connection_limit if connection_limit is None else connection_limit
 
     if is_street_channel(provider):
-        cmd = _street_collect_cmd(cfg, city, today, provider, conn_limit, budget_remaining)
+        cmd = _street_collect_cmd(cfg, city, today, provider, conn_limit, daily_budget)
+        spacing = (cfg.providers or {}).get(provider, ProviderConfig()).spacing_m
+        estimated = estimate_requests(city, provider, conn=conn, spacing_m=spacing)
         logger.info(
             f"Collecting streets for {city.city_id} [{provider}] "
-            f"(~{estimate_requests(city, provider, conn=conn, spacing_m=(cfg.providers or {}).get(provider, ProviderConfig()).spacing_m):,} requests estimated)"
+            f"(~{estimated:,} requests estimated)"
         )
         logger.debug(f"Command: {' '.join(cmd)}")
         timeout_s = city_timeout_seconds(cfg, city, provider, conn=conn)
@@ -921,7 +936,10 @@ def cmd_run_due(
                 today,
                 provider,
                 connection_limit=conn_limit,
-                budget_remaining=budget - used,
+                # The channel's FULL ceiling, not `budget - used`: the street
+                # collector subtracts today's spend from this itself, so
+                # passing the remainder would count it twice.
+                daily_budget=budget,
                 conn=conn,
             )
             ran_any = True
