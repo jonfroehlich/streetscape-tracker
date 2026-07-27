@@ -5,7 +5,7 @@ and how each one entered the catalog.** It exists so the tracked set is not
 misdescribed (it is *not* "just US state capitals") and so the sampling
 methodology is citable in publications.
 
-The catalog (`data/gsv_tracker.db`, table `cities`) is the source of truth for
+The catalog (`data/streetscape_tracker.db`, table `cities`) is the source of truth for
 what is tracked; this doc explains *how that set was assembled*.
 
 ## Current composition (snapshot: 2026-07-08 — counts reconciled, see [#112](https://github.com/jonfroehlich/gsv-tracker/issues/112))
@@ -83,19 +83,22 @@ Any city added ad-hoc via `python gsv_tracker.py "City, Region, Country"` (or a
 line in `cities.txt`) geocodes once, freezes its grid geometry, and registers —
 becoming a permanent tracked city.
 
-### 4. Worldwide stratified frame (issue #110) — proposed, not yet integrated
+### 4. Worldwide stratified frame (issue #110)
 
 A deterministic, reproducible worldwide sample
 (`continent × size-band × GSV-coverage-regime`, ~56 cities) built from vendored
-GeoNames data. Methodology is fully specified in
-[`worldwide_sampling.md`](worldwide_sampling.md), but the frame is **not yet in
-the catalog** — the registration step is unfinished and boundary vetting is
-unrun (tracked in **issue #110**). Listed here so the intended global-expansion
-methodology is on record alongside the streams already in use.
+GeoNames data in `data_sources/`. Methodology is fully specified in
+[`worldwide_sampling.md`](worldwide_sampling.md); registration is
+`scripts/register_frame.py` (idempotent, dry-run by default, reuses
+already-registered overlapping cities via aliases, registers new cities
+`enabled = 0` until boundary-vetted). Frame cities enter the scheduler only
+after the boundary-audit workflow accepts their grids (tracked in
+**issue #110**).
 
 ## Relationship between the streams
 
-- Streams 1–3 are **already in the catalog**; stream 4 is planned.
+- Streams 1–3 are **already in the catalog**; stream 4 registers via
+  `scripts/register_frame.py` and stays out of the scheduler until vetted.
 - Streams are **additive and non-conflicting**: grid geometry is frozen per
   city, so a city registered by any stream keeps its geometry, run history, and
   published URLs regardless of how later cities are added.
@@ -107,19 +110,19 @@ methodology is on record alongside the streams already in use.
 
 ```bash
 # total registered / US vs non-US
-sqlite3 data/gsv_tracker.db \
+sqlite3 data/streetscape_tracker.db \
   "SELECT COUNT(*) FROM cities;"
-sqlite3 data/gsv_tracker.db \
+sqlite3 data/streetscape_tracker.db \
   "SELECT CASE WHEN country_code='US' THEN 'US' ELSE 'non-US' END, COUNT(*) \
    FROM cities GROUP BY 1;"
 
 # cities with real data vs registered-but-empty
-sqlite3 data/gsv_tracker.db \
+sqlite3 data/streetscape_tracker.db \
   "SELECT COUNT(DISTINCT city_id) FROM runs WHERE unique_panos > 0 OR status_ok > 0;"
 
 # baseline vs live runs, and baseline vintages
-sqlite3 data/gsv_tracker.db \
+sqlite3 data/streetscape_tracker.db \
   "SELECT is_baseline, COUNT(*) FROM runs GROUP BY is_baseline;"
-sqlite3 data/gsv_tracker.db \
+sqlite3 data/streetscape_tracker.db \
   "SELECT substr(run_date,1,4), COUNT(*) FROM runs WHERE is_baseline=1 GROUP BY 1 ORDER BY 1;"
 ```
