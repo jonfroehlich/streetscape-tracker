@@ -14,6 +14,7 @@ published to the web server. (`data/` is rsynced and git-ignored;
 | `countryInfo.txt` | GeoNames | ISO-2 → country name and continent code (`AF/AS/EU/NA/SA/OC/AN`). Leading `#` comment lines describe the columns. |
 | `admin1CodesASCII.txt` | GeoNames | `"<iso2>.<admin1code>"` → admin-1 (state/province/region) name, for building human-readable geocoding queries. |
 | `gsv_coverage_regime.csv` | Hand-maintained (this repo) | Per-country GSV coverage regime (`present`/`sparse`/`absent`). Force-includes the cross-provider (GSV-absent, Mapillary-present) story into the frame. Edit as coverage changes. |
+| `geocode_overrides.csv` | Hand-maintained (this repo) | Replacement `register_frame.py` manifest rows for frame cities whose `worldwide_frame.csv` query Nominatim cannot geocode under any Latin transliteration (currently Al Jammaliyah, Egypt — needs the Arabic "الجمالية, الدقهلية" query; the bare Arabic name matches Cairo's Gamaliya district instead). Register with `python scripts/register_frame.py --manifest data_sources/geocode_overrides.csv --execute`; identity columns stay GeoNames-pinned, only `query_string` differs. |
 
 ## Attribution / license
 

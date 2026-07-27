@@ -162,6 +162,10 @@ scheduler host (makelab2), after the merged code is deployed there.
    rejected — big non-US metros can geocode to a province centroid (Ho Chi
    Minh City once landed ~100 km off) — and listed for manual review;
    `--center-from-geonames` falls back to the GeoNames coordinates instead.
+   A city Nominatim cannot geocode under any Latin spelling gets a
+   replacement manifest row in `data_sources/geocode_overrides.csv` (native
+   script query, same GeoNames identity) — register those with
+   `--manifest data_sources/geocode_overrides.csv`.
 2. **Vet boundaries before collecting.** International OSM boundary quality
    varies, so run the boundary-audit workflow on the newly registered cities
    before enabling them: `scripts/audit_city_boundaries.py` →
