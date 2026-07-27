@@ -205,3 +205,31 @@ def test_query_string_skips_admin_equal_to_city():
         regime="present",
     )
     assert bwf.query_string(rec, {"SG.00": "Singapore"}) == "Singapore, Singapore"
+
+
+def test_query_string_drops_city_prefixed_admin():
+    # GeoNames city-state admins like "Ho Chi Minh City (HCMC)" would otherwise
+    # leak a redundant, parenthesized component into queries and slugs.
+    rec = bwf.FrameRecord(
+        city=city("v1", "Ho Chi Minh City", "VN", 14_000_000, admin1="20"),
+        iso2="VN",
+        country="Vietnam",
+        continent="Asia",
+        size_band="large",
+        regime="present",
+    )
+    admin = {"VN.20": "Ho Chi Minh City (HCMC)"}
+    assert bwf.query_string(rec, admin) == "Ho Chi Minh City, Vietnam"
+
+
+def test_effective_admin_rules():
+    assert bwf.effective_admin("Munich", "Bavaria") == "Bavaria"
+    assert bwf.effective_admin("Munich", None) is None
+    assert bwf.effective_admin("Munich", "") is None
+    # equal, city-prefixed, or parenthesized-duplicate admins are dropped
+    assert bwf.effective_admin("Singapore", "Singapore") is None
+    assert bwf.effective_admin("Lima", "Lima Province") is None
+    assert bwf.effective_admin("Bogota", "Bogota D.C.") is None
+    assert bwf.effective_admin("Ho Chi Minh City", "Ho Chi Minh City (HCMC)") is None
+    # a trailing parenthetical is stripped even when the admin is kept
+    assert bwf.effective_admin("Hue", "Thua Thien (Hue)") == "Thua Thien"

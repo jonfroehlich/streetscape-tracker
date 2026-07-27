@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Build the worldwide city-sampling frame for GSV Tracker.
+Build the worldwide city-sampling frame for Streetscape Tracker.
 
 Produces a *stratified, curated* set of ~50-80 cities spanning
 ``continent x size-band x GSV-coverage-regime``, chosen deterministically from
@@ -22,7 +22,7 @@ Everything is deterministic (population desc, then name, then geonameid — no
 randomness), so re-running against the same inputs yields the identical frame.
 
 Outputs (repo root, neither under ``data/``):
-  * ``cities_worldwide.txt``    -- run_cities.py / gsv_tracker.py query lines.
+  * ``cities_worldwide.txt``    -- run_cities.py / streetscape_tracker.py query lines.
   * ``worldwide_frame.csv``     -- the selected frame, one row per city (manifest
                                    for the paper; consumed by register_frame.py).
   * ``worldwide_candidates.csv``-- the full ranked eligible-country pool, so a
@@ -40,6 +40,7 @@ import argparse
 import csv
 import math
 import os
+import re
 import sys
 from collections import defaultdict, namedtuple
 
@@ -286,14 +287,33 @@ def select_frame(cities, countries, coverage, config=DEFAULT_CONFIG):
     return records
 
 
+def effective_admin(city_name, admin_name):
+    """
+    The admin-1 name to use in queries and catalog identity, or None when it
+    would just duplicate the city name.
+
+    Strips a trailing parenthetical (GeoNames has e.g. "Ho Chi Minh City
+    (HCMC)") and drops the admin entirely when what remains equals or starts
+    with the city name — otherwise city-state-like slugs pick up a redundant
+    (and parenthesized) middle component. Shared with scripts/register_frame.py
+    so query strings and registered identity always agree.
+    """
+    if not admin_name:
+        return None
+    admin = re.sub(r"\s*\([^)]*\)$", "", admin_name).strip()
+    if not admin or admin.lower().startswith(city_name.lower()):
+        return None
+    return admin
+
+
 def query_string(record, admin_names):
     """
     A Nominatim-friendly structured query: "City, Admin, Country", falling back
     to "City, Country" when the admin-1 name is missing or duplicates the city.
     """
     city = record.city.name
-    admin = admin_names.get(f"{record.iso2}.{record.city.admin1}")
-    if admin and admin != city:
+    admin = effective_admin(city, admin_names.get(f"{record.iso2}.{record.city.admin1}"))
+    if admin:
         return f"{city}, {admin}, {record.country}"
     return f"{city}, {record.country}"
 

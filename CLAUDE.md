@@ -22,7 +22,7 @@ python streetscape_tracker.py "Seattle, WA" --check-boundary   # preview search 
 
 # Worldwide sampling frame (stratified ~50-80 cities; see docs/worldwide_sampling.md)
 python scripts/build_worldwide_frame.py            # regenerate frame from data_sources/
-python scripts/register_frame.py --dry-run         # then register + boundary-vet before enabling
+python scripts/register_frame.py                   # dry-run preview; --execute registers (disabled until boundary-vetted)
 
 # Batch + scheduler
 python run_cities.py cities.txt --continue-on-error

@@ -9,7 +9,7 @@
 # --- Africa ---
 "Kinshasa, Democratic Republic of the Congo"  # large, present
 "Kambove, Haut-Katanga, Democratic Republic of the Congo"  # small, present
-"Abidjan, Abidjan Autonomous District, Ivory Coast"  # large, present
+"Abidjan, Ivory Coast"  # large, present
 "Daoukro, Lacs District, Ivory Coast"  # small, present
 "Cairo, Egypt"  # large, present
 "Al Jammaliyah, Dakahlia, Egypt"  # small, present
@@ -26,7 +26,7 @@
 "Renala Khurd, Punjab, Pakistan"  # small, present
 "Istanbul, Turkey"  # large, present
 "Manavgat, Antalya, Turkey"  # small, present
-"Ho Chi Minh City, Ho Chi Minh City (HCMC), Vietnam"  # large, present
+"Ho Chi Minh City, Vietnam"  # large, present
 "Ha Tien, An Giang, Vietnam"  # small, present
 # --- Europe ---
 "Vienna, State of Vienna, Austria"  # large, sparse
@@ -39,7 +39,7 @@
 "Bath, England, United Kingdom"  # small, present
 "Moscow, Russia"  # large, present
 "Ust'-Ilimsk, Irkutsk Oblast, Russia"  # small, present
-"Kyiv, Kyiv City, Ukraine"  # large, present
+"Kyiv, Ukraine"  # large, present
 "Oleksandrivskyi, Donetsk, Ukraine"  # small, present
 # --- North America ---
 "Toronto, Ontario, Canada"  # large, present
@@ -60,11 +60,11 @@
 # --- South America ---
 "Sao Paulo, Brazil"  # large, present
 "Campo Mourao, Parana, Brazil"  # small, present
-"Santiago, Santiago Metropolitan, Chile"  # large, present
+"Santiago, Chile"  # large, present
 "Curico, Maule Region, Chile"  # small, present
-"Bogota, Bogota D.C., Colombia"  # large, present
+"Bogota, Colombia"  # large, present
 "Santander de Quilichao, Cauca Department, Colombia"  # small, present
-"Lima, Lima Province, Peru"  # large, present
+"Lima, Peru"  # large, present
 "Talara, Piura, Peru"  # small, present
 "Caracas, Distrito Federal, Venezuela"  # large, present
 "Tucupita, Delta Amacuro, Venezuela"  # small, present

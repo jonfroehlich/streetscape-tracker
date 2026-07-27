@@ -502,10 +502,14 @@ def register_city(
     grid_height_m: float,
     step_m: float,
     notes: str | None = None,
+    enabled: bool = True,
 ) -> str:
     """
     Register a city with its frozen grid geometry. Idempotent: if the city
     already exists, the existing row wins (geometry is never overwritten).
+
+    ``enabled=False`` registers the city outside the scheduler rotation (e.g.
+    sampling-frame cities awaiting boundary vetting, issue #110).
 
     Returns the canonical city_id.
     """
@@ -515,8 +519,8 @@ def register_city(
         """INSERT OR IGNORE INTO cities
            (city_id, display_name, city_name, state_name, state_code,
             country_name, country_code, center_lat, center_lon,
-            grid_width_m, grid_height_m, step_m, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            grid_width_m, grid_height_m, step_m, created_at, enabled, notes)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             city_id,
             ", ".join(display_parts),
@@ -531,6 +535,8 @@ def register_city(
             int(grid_height_m),
             int(step_m),
             utc_now_iso(),
+            int(enabled),
+            notes,
         ),
     )
     conn.commit()

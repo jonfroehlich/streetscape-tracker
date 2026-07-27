@@ -1,6 +1,6 @@
 # Worldwide city-sampling frame
 
-This document is the reproducible methodology for GSV Tracker's **worldwide**
+This document is the reproducible methodology for Streetscape Tracker's **worldwide**
 city sample: the set of cities we track to compare street-level imagery coverage
 and recency across countries and providers (Google Street View and Mapillary).
 
@@ -92,7 +92,7 @@ gap in these places is a finding, not a hole in the data.
 
 Running `python scripts/build_worldwide_frame.py` writes (repo root):
 
-- `cities_worldwide.txt` — `run_cities.py`/`gsv_tracker.py`-compatible query
+- `cities_worldwide.txt` — `run_cities.py`/`streetscape_tracker.py`-compatible query
   lines (double-quoted so names with apostrophes survive shlex parsing).
 - `worldwide_frame.csv` — the selected frame, one row per city, with
   `query_string, city, iso2, country, continent, size_band, population,
@@ -127,20 +127,41 @@ structurally identical to the US slugs:
 | Query | city_id |
 |-------|---------|
 | `Sao Paulo, Brazil` | `sao-paulo--brazil` |
-| `Bogota, Bogota D.C., Colombia` | `bogota--bogota-d.c--colombia` |
+| `Bogota, Colombia` | `bogota--colombia` |
 | `Shanghai, China` | `shanghai--china` |
 
-`sanitize_city_query_str` itself is unchanged (it is a frozen contract); we
-simply feed it clean inputs. Megacities inherit the existing 80 km grid cap
-(Shanghai's ~437×308 km administrative boundary clamps to 80×80 km).
+An admin-1 name that merely restates the city (`Lima Province`, `Kyiv City`,
+`Ho Chi Minh City (HCMC)`, `Bogota D.C.`) is dropped from both the query and
+the identity (`build_worldwide_frame.effective_admin`), so city-state-like
+slugs stay clean. `sanitize_city_query_str` itself is unchanged (it is a
+frozen contract); we simply feed it clean inputs. Megacities inherit the
+existing 80 km grid cap (Shanghai's ~437×308 km administrative boundary clamps
+to 80×80 km).
+
+Some frame cities were **already registered** earlier under geocoder-derived
+slugs (e.g. `são-paulo--são-paulo--brazil`, `istanbul--marmara-region--turkey`).
+`register_frame.py` detects these by distance (an existing city within
+`--overlap-km`, default 25 km, of the GeoNames coordinates), aliases the frame
+slug to the existing `city_id`, and never creates a duplicate — the existing
+run series and published URLs stay authoritative.
 
 ## From frame to collection
 
-1. **Register + freeze geometry** (no download):
-   `python scripts/register_frame.py` geocodes each new city once (rate-limited
-   Nominatim) and freezes its grid via the same path a real run uses
-   (`cli._resolve_geometry`). Idempotent; use `--dry-run` to preview and
-   `--limit N` to do a batch at a time.
+Registration must run against the catalog the scheduler reads — i.e. on the
+scheduler host (makelab2), after the merged code is deployed there.
+
+1. **Register + freeze geometry** (no download, no provider API calls):
+   `python scripts/register_frame.py` previews (dry run is the default;
+   overlap detection needs no geocoding, so the preview is instant), then
+   `--execute` geocodes each genuinely new city once (rate-limited Nominatim)
+   and freezes its grid via the same helpers a real run uses
+   (`cli._resolve_geometry`'s new-city branch). Idempotent; `--limit N` does a
+   batch at a time. New cities are registered **disabled** (`enabled = 0`) so
+   the scheduler cannot collect them before vetting. A geocoded center more
+   than `--max-center-km` (default 50) from the GeoNames coordinates is
+   rejected — big non-US metros can geocode to a province centroid (Ho Chi
+   Minh City once landed ~100 km off) — and listed for manual review;
+   `--center-from-geonames` falls back to the GeoNames coordinates instead.
 2. **Vet boundaries before collecting.** International OSM boundary quality
    varies, so run the boundary-audit workflow on the newly registered cities
    before enabling them: `scripts/audit_city_boundaries.py` →

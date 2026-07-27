@@ -57,6 +57,29 @@ def test_alias_resolution(conn, city):
     assert db.resolve_city(conn, "Nowhere, KS") is None
 
 
+def test_register_city_disabled_with_notes(conn):
+    cid = db.register_city(
+        conn,
+        city_name="Vetville",
+        state_name=None,
+        state_code=None,
+        country_name="Testland",
+        country_code=None,
+        center_lat=1.0,
+        center_lon=2.0,
+        grid_width_m=1000,
+        grid_height_m=1000,
+        step_m=20,
+        enabled=False,
+        notes="worldwide frame; pending boundary vetting",
+    )
+    row = db.resolve_city(conn, cid)
+    assert row.enabled is False
+    assert row.notes == "worldwide frame; pending boundary vetting"
+    # disabled cities stay out of scheduler-facing queries
+    assert cid not in {c.city_id for c in db.get_all_cities(conn, enabled_only=True)}
+
+
 def test_update_city_geometry_overwrites_and_appends_note(conn, city):
     db.update_city_geometry(
         conn,
