@@ -827,6 +827,79 @@ def _street_collect_cmd(
     return cmd
 
 
+# How much of a failed child's output to copy into the scheduler log. Enough for
+# a Python traceback; the whole thing is always on disk in the per-attempt log.
+_CHILD_LOG_TAIL_LINES = 25
+
+
+def _child_log_path(cfg: SchedulerConfig, city: db.CityRow, provider: str, today: date) -> Path:
+    """Per-attempt log for one (city, channel) collection subprocess."""
+    return Path(cfg.log_dir) / f"collect_{city.city_id}_{provider}_{today.isoformat()}.log"
+
+
+def _tail_lines(path: Path, n: int) -> str:
+    """Last n lines of a file, credential-scrubbed; empty string if unreadable."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            return redact_credentials("".join(fh.readlines()[-n:]))
+    except OSError:
+        return ""
+
+
+def _run_collection_subprocess(
+    cfg: SchedulerConfig,
+    cmd: list[str],
+    timeout_s: int,
+    city: db.CityRow,
+    provider: str,
+    today: date,
+) -> bool:
+    """
+    Run one collection subprocess with its output captured to a per-attempt log.
+
+    The children (streetscape_tracker.py, streetscape_street_analyzer.collect)
+    configure logging with a bare ``basicConfig``, so everything they emit —
+    including the traceback that explains a failure — goes to stderr. Inheriting
+    the parent's stderr sent that to the systemd journal, which is not readable
+    by the service account: every ``collection failed`` line in the scheduler log
+    had its actual cause discarded. Redirecting to a file per attempt keeps the
+    full output greppable in logs/ and streams it to disk rather than buffering a
+    multi-hour run in this process's memory (``capture_output=True`` would, on a
+    host whose cgroup is capped at MemoryHigh=4G).
+
+    The tail of a failed run is also copied into the scheduler log so it reaches
+    the [alerts] email, which sends only that log's tail.
+    """
+    os.makedirs(cfg.log_dir, exist_ok=True)
+    log_path = _child_log_path(cfg, city, provider, today)
+    try:
+        # Append, not truncate: a re-run of the same city/channel/day should add
+        # to the record rather than destroy the failure being diagnosed.
+        with open(log_path, "a", encoding="utf-8") as fh:
+            fh.write(f"\n===== {datetime.now(UTC).isoformat()} =====\n")
+            fh.write(redact_credentials(" ".join(cmd)) + "\n\n")
+            fh.flush()
+            result = subprocess.run(
+                cmd,
+                timeout=timeout_s,
+                cwd=str(_PROJECT_ROOT),
+                stdout=fh,
+                stderr=subprocess.STDOUT,
+            )
+        if result.returncode == 0:
+            return True
+        why = f"exited {result.returncode}"
+    except subprocess.TimeoutExpired:
+        why = f"timed out after {timeout_s // 60} minutes"
+
+    tail = _tail_lines(log_path, _CHILD_LOG_TAIL_LINES)
+    message = f"{city.city_id} [{provider}]: {why}; full output in {log_path}"
+    if tail:
+        message += f"\n--- last {_CHILD_LOG_TAIL_LINES} lines of {log_path.name} ---\n{tail}"
+    logger.error(message)
+    return False
+
+
 def _run_one_city(
     cfg: SchedulerConfig,
     city: db.CityRow,
@@ -861,12 +934,7 @@ def _run_one_city(
         )
         logger.debug(f"Command: {' '.join(cmd)}")
         timeout_s = city_timeout_seconds(cfg, city, provider, conn=conn)
-        try:
-            result = subprocess.run(cmd, timeout=timeout_s, cwd=str(_PROJECT_ROOT))
-            return result.returncode == 0
-        except subprocess.TimeoutExpired:
-            logger.error(f"{city.city_id} [{provider}]: timed out after {timeout_s // 60} minutes")
-            return False
+        return _run_collection_subprocess(cfg, cmd, timeout_s, city, provider, today)
 
     cmd = [
         sys.executable,
@@ -908,12 +976,7 @@ def _run_one_city(
     )
     logger.debug(f"Command: {' '.join(cmd)}")
     timeout_s = city_timeout_seconds(cfg, city, provider)
-    try:
-        result = subprocess.run(cmd, timeout=timeout_s, cwd=str(_PROJECT_ROOT))
-        return result.returncode == 0
-    except subprocess.TimeoutExpired:
-        logger.error(f"{city.city_id} [{provider}]: timed out after {timeout_s // 60} minutes")
-        return False
+    return _run_collection_subprocess(cfg, cmd, timeout_s, city, provider, today)
 
 
 def _reconcile_orphaned_run(

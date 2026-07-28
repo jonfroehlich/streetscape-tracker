@@ -43,7 +43,7 @@ def _register(conn, name, width=5000, height=5000, step=20):
     )
 
 
-def test_run_one_city_command_defers_skip_policy_to_scheduler(conn, monkeypatch):
+def test_run_one_city_command_defers_skip_policy_to_scheduler(conn, monkeypatch, tmp_path):
     """
     The scheduler already decided this city is due (cycle − grace), so the
     subprocess must run with --min-days-since-last-run 0: otherwise any
@@ -59,7 +59,7 @@ def test_run_one_city_command_defers_skip_policy_to_scheduler(conn, monkeypatch)
 
     captured = {}
 
-    def fake_run(cmd, timeout=None, cwd=None):
+    def fake_run(cmd, timeout=None, cwd=None, **kwargs):
         captured["cmd"] = cmd
 
         class R:
@@ -68,7 +68,9 @@ def test_run_one_city_command_defers_skip_policy_to_scheduler(conn, monkeypatch)
         return R()
 
     monkeypatch.setattr(sched.subprocess, "run", fake_run)
-    assert sched._run_one_city(SchedulerConfig(), city, date(2026, 7, 1), "gsv")
+    assert sched._run_one_city(
+        SchedulerConfig(log_dir=str(tmp_path)), city, date(2026, 7, 1), "gsv"
+    )
 
     cmd = captured["cmd"]
     i = cmd.index("--min-days-since-last-run")
@@ -392,7 +394,7 @@ def test_makelab1_production_config_is_wired():
     assert cfg.resource_guard.enabled
 
 
-def test_run_one_city_honors_connection_limit_override(conn, monkeypatch):
+def test_run_one_city_honors_connection_limit_override(conn, monkeypatch, tmp_path):
     """The resource guard lowers concurrency by passing a connection_limit
     override, which must reach the subprocess as --connection-limit."""
     from streetscape_metadata_tracker import scheduler as sched
@@ -401,7 +403,7 @@ def test_run_one_city_honors_connection_limit_override(conn, monkeypatch):
     city = db.resolve_city(conn, cid)
     captured = {}
 
-    def fake_run(cmd, timeout=None, cwd=None):
+    def fake_run(cmd, timeout=None, cwd=None, **kwargs):
         captured["cmd"] = cmd
 
         class R:
@@ -410,7 +412,9 @@ def test_run_one_city_honors_connection_limit_override(conn, monkeypatch):
         return R()
 
     monkeypatch.setattr(sched.subprocess, "run", fake_run)
-    assert sched._run_one_city(SchedulerConfig(), city, date(2026, 7, 1), "gsv", connection_limit=7)
+    assert sched._run_one_city(
+        SchedulerConfig(log_dir=str(tmp_path)), city, date(2026, 7, 1), "gsv", connection_limit=7
+    )
     cmd = captured["cmd"]
     assert cmd[cmd.index("--connection-limit") + 1] == "7"
 
@@ -996,7 +1000,7 @@ def test_street_timeout_scales_like_gsv_not_the_flat_floor(conn):
     assert city_timeout_seconds(cfg, city, "mapillary_streets", conn=conn) == floor
 
 
-def test_street_channel_dispatches_to_the_road_walk_collector(conn, monkeypatch):
+def test_street_channel_dispatches_to_the_road_walk_collector(conn, monkeypatch, tmp_path):
     """The scheduler must run the road-walk CLI for a street channel, with the
     imagery provider, the isolated daily budget, and the catalog path."""
     from streetscape_metadata_tracker import scheduler as sched
@@ -1005,7 +1009,7 @@ def test_street_channel_dispatches_to_the_road_walk_collector(conn, monkeypatch)
     city = db.resolve_city(conn, cid)
     captured = {}
 
-    def fake_run(cmd, timeout=None, cwd=None):
+    def fake_run(cmd, timeout=None, cwd=None, **kwargs):
         captured["cmd"] = cmd
 
         class R:
@@ -1014,7 +1018,7 @@ def test_street_channel_dispatches_to_the_road_walk_collector(conn, monkeypatch)
         return R()
 
     monkeypatch.setattr(sched.subprocess, "run", fake_run)
-    cfg = _street_cfg(db_path="/tmp/x.db", data_dir="/tmp/data")
+    cfg = _street_cfg(db_path="/tmp/x.db", data_dir="/tmp/data", log_dir=str(tmp_path))
     assert sched._run_one_city(
         cfg, city, date(2026, 7, 1), "gsv_streets", daily_budget=12345, conn=conn
     )
@@ -1029,7 +1033,7 @@ def test_street_channel_dispatches_to_the_road_walk_collector(conn, monkeypatch)
     assert cmd[cmd.index("--") + 1] == city.display_name
 
 
-def test_mapillary_street_dispatch_omits_per_minute_pacing(conn, monkeypatch):
+def test_mapillary_street_dispatch_omits_per_minute_pacing(conn, monkeypatch, tmp_path):
     """Pacing is meaningless for a tile census; passing it would imply the
     collector meters per-request like the GSV arm."""
     from streetscape_metadata_tracker import scheduler as sched
@@ -1038,7 +1042,7 @@ def test_mapillary_street_dispatch_omits_per_minute_pacing(conn, monkeypatch):
     city = db.resolve_city(conn, cid)
     captured = {}
 
-    def fake_run(cmd, timeout=None, cwd=None):
+    def fake_run(cmd, timeout=None, cwd=None, **kwargs):
         captured["cmd"] = cmd
 
         class R:
@@ -1048,7 +1052,7 @@ def test_mapillary_street_dispatch_omits_per_minute_pacing(conn, monkeypatch):
 
     monkeypatch.setattr(sched.subprocess, "run", fake_run)
     assert sched._run_one_city(
-        _street_cfg(), city, date(2026, 7, 1), "mapillary_streets", conn=conn
+        _street_cfg(log_dir=str(tmp_path)), city, date(2026, 7, 1), "mapillary_streets", conn=conn
     )
     cmd = captured["cmd"]
     assert cmd[cmd.index("--provider") + 1] == "mapillary"
@@ -1403,3 +1407,49 @@ def test_street_channel_failure_is_not_reconciled_as_an_orphan_run(conn, monkeyp
     assert "gsv" in called
     assert "gsv_streets" not in called
     assert "mapillary_streets" not in called
+
+
+def test_failed_collection_captures_child_output_and_surfaces_the_tail(conn, tmp_path, caplog):
+    """A child's traceback used to be thrown away: the collectors log to stderr,
+    the scheduler inherited it, and under systemd that goes to a journal the
+    service account cannot read — so every 'collection failed' line lost its
+    cause. The output must land in a per-attempt log AND its tail must reach the
+    scheduler log, which is what the [alerts] email actually sends."""
+    import logging
+    import sys
+
+    from streetscape_metadata_tracker import scheduler as sched
+
+    cfg = SchedulerConfig(log_dir=str(tmp_path))
+    city = db.resolve_city(conn, _register(conn, "Bend"))
+    cmd = [sys.executable, "-c", "import sys; print('TRACEBACK MARKER'); sys.exit(3)"]
+
+    with caplog.at_level(logging.ERROR):
+        ok = sched._run_collection_subprocess(cfg, cmd, 60, city, "gsv", date(2026, 7, 1))
+
+    assert ok is False
+    log_path = tmp_path / f"collect_{city.city_id}_gsv_2026-07-01.log"
+    assert "TRACEBACK MARKER" in log_path.read_text()
+    assert "exited 3" in caplog.text
+    assert str(log_path) in caplog.text  # operator is told where the full log is
+    assert "TRACEBACK MARKER" in caplog.text  # and the cause travels to the alert
+
+
+def test_collection_log_appends_rather_than_truncating_a_retry(conn, tmp_path):
+    """Re-running the same city/channel/day must add to the record, not destroy
+    the failure being diagnosed."""
+    import sys
+
+    from streetscape_metadata_tracker import scheduler as sched
+
+    cfg = SchedulerConfig(log_dir=str(tmp_path))
+    city = db.resolve_city(conn, _register(conn, "Bend"))
+    today = date(2026, 7, 1)
+
+    for marker in ("FIRST ATTEMPT", "SECOND ATTEMPT"):
+        sched._run_collection_subprocess(
+            cfg, [sys.executable, "-c", f"print('{marker}')"], 60, city, "gsv", today
+        )
+
+    text = (tmp_path / f"collect_{city.city_id}_gsv_2026-07-01.log").read_text()
+    assert "FIRST ATTEMPT" in text and "SECOND ATTEMPT" in text

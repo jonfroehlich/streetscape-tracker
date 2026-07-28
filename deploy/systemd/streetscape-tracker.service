@@ -40,6 +40,17 @@ ExecStart=%h/streetscape-tracker/.venv-makelab2/bin/python -m streetscape_metada
 # A full day of cities can legitimately take hours
 TimeoutStartSec=12h
 
+# Anything not already captured by the scheduler's own rotating log or a child's
+# per-attempt log — an uncaught traceback, an OOM kill notice, output from a
+# library that writes to fd 1/2 directly. Without this it went to the journal,
+# which this service account cannot read (journalctl --user reports "no journal
+# files were opened due to insufficient permissions"), so a crash left nothing
+# to diagnose. Real path, not the %h symlink: ProtectSystem=strict below makes
+# everything outside ReadWritePaths read-only, and this file is opened inside
+# that namespace. Needs systemd >= 240 for append: (makelab2 runs 252).
+StandardOutput=append:/projects/makeabilitylab/streetscape-tracker/logs/streetscape_service_console.log
+StandardError=inherit
+
 # ── Sandboxing ─────────────────────────────────────────────────────────
 # The job needs exactly: the checkout (data/, logs/, the SQLite catalog)
 # and the NFS-mounted public docroot. Everything else is read-only.
