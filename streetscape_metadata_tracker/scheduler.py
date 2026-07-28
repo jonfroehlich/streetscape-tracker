@@ -42,7 +42,7 @@ from .json_summarizer import (
     generate_streetwalk_manifest,
     regenerate_run_json,
 )
-from .naming import KNOWN_PROVIDERS
+from .naming import DEFAULT_NETWORK_TYPE, KNOWN_PROVIDERS, STREETWALK_NETWORK_TOKENS
 
 # Isolated street-coverage collection channels (issue #99). These ARE scheduled
 # channels — each cycles the catalog exactly like a grid provider, with its own
@@ -192,12 +192,26 @@ def load_scheduler_config(path: str | None = None) -> SchedulerConfig:
                     f"{', '.join(sorted(STREET_CHANNELS))})"
                 )
                 continue
+            # An unknown network_type reaches `collect --network-type` as an
+            # argparse choices violation, i.e. exit 2 on EVERY street run of
+            # EVERY due city, night after night, with nothing in the scheduler's
+            # own output naming the config as the cause. Catch it here, where
+            # the message can point at the offending key, and fall back to the
+            # default rather than aborting the whole nightly run over one field.
+            network_type = p.get("network_type", DEFAULT_NETWORK_TYPE)
+            if network_type not in STREETWALK_NETWORK_TOKENS:
+                logger.warning(
+                    f"[providers.{name}] network_type={network_type!r} is not a known "
+                    f"OSM network type (known: {', '.join(sorted(STREETWALK_NETWORK_TOKENS))}); "
+                    f"using {DEFAULT_NETWORK_TYPE!r}"
+                )
+                network_type = DEFAULT_NETWORK_TYPE
             providers[name] = ProviderConfig(
                 enabled=p.get("enabled", True),
                 daily_request_budget=p.get("daily_request_budget", 250_000),
                 max_requests_per_minute=p.get("max_requests_per_minute"),
                 spacing_m=p.get("spacing_m", 15),
-                network_type=p.get("network_type", "drive"),
+                network_type=network_type,
             )
 
     return SchedulerConfig(

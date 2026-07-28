@@ -248,6 +248,27 @@ daily_request_budget = 1
     assert "bogus" not in cfg.providers  # unknown providers are ignored
 
 
+def test_config_rejects_an_unknown_network_type(tmp_path):
+    """A bad network_type must not reach the collector's argparse choices.
+
+    `collect --network-type` validates its argument, so an unknown value (a
+    typo, or the osmnx-1.x name 'all_private') exits 2 on EVERY street run of
+    EVERY due city, night after night, with nothing in the scheduler's output
+    naming the config as the cause. Fall back to the default series instead.
+    """
+    p = tmp_path / "s.toml"
+    p.write_text("""
+[providers.gsv_streets]
+network_type = "all_private"
+[providers.mapillary_streets]
+network_type = "all_public"
+""")
+    cfg = load_scheduler_config(str(p))
+    assert cfg.providers["gsv_streets"].network_type == "drive"
+    # A valid non-default type still comes through untouched.
+    assert cfg.providers["mapillary_streets"].network_type == "all_public"
+
+
 def test_config_provider_can_be_disabled(tmp_path):
     p = tmp_path / "s.toml"
     p.write_text("""

@@ -236,6 +236,42 @@ def test_summary_by_count_vs_length_diverge():
     assert list(summary["coverage_by_highway"]) == ["motorway", "residential"]
 
 
+def test_broad_network_buckets_are_ordered_roads_service_then_non_motorized():
+    """coverage_by_highway's key order is part of the published artifact.
+
+    A consumer reading the file straight through must get the same hierarchy the
+    city page's legend shows, so this order mirrors `streetTypeOrder` in
+    www/js/street-coverage.js: motorized road classes, then the service-road
+    family (which belongs beside the `service` class it splits off), then the
+    non-motorized ways. Membership order in _HIGHWAY_BUCKETS is NOT this order —
+    that list groups by provenance, which is why _BUCKET_DISPLAY_ORDER exists.
+    """
+    buckets = ["footway", "alley", "residential", "motorway", "path", "driveway", "living_street"]
+    edges = gpd.GeoDataFrame(
+        {
+            "highway_bucket": buckets,
+            "covered": [True] * len(buckets),
+            "length_m": [100.0] * len(buckets),
+            "nearest_pano_age_years": [1.0] * len(buckets),
+        },
+        geometry=[
+            LineString([(LON0, LAT0 + i * 0.01), (LON0 + 0.001, LAT0 + i * 0.01)])
+            for i in range(len(buckets))
+        ],
+        crs="EPSG:4326",
+    )
+
+    assert list(summarize_coverage(edges)["coverage_by_highway"]) == [
+        "motorway",
+        "residential",
+        "living_street",
+        "alley",
+        "driveway",
+        "footway",
+        "path",
+    ]
+
+
 # ── provider-specific pano selection ─────────────────────────────────────────
 
 

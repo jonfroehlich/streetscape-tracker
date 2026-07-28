@@ -97,26 +97,6 @@ const STREET_COLUMNS = [
 const DEFAULT_SORT = { key: "pct", dir: "desc" };
 
 /**
- * Human label for an OSM network type. Says what the walk COVERS rather than
- * echoing the osmnx filter name, since the distinction is the whole reason two
- * rows for one city aren't duplicates.
- * @param {?string} networkType - From the manifest; absent on pre-network walks.
- * @returns {string}
- */
-function streetNetworkLabel(networkType) {
-  const labels = {
-    drive: "Roads",
-    all_public: "Roads + paths",
-    all: "Roads + paths (incl. private)",
-    walk: "Walkable",
-    bike: "Bikeable",
-    drive_service: "Roads + service",
-  };
-  const key = networkType ?? DEFAULT_STREET_NETWORK_TYPE;
-  return labels[key] ?? key;
-}
-
-/**
  * Flatten a manifest walk + its joined aggregate record into the one shape the
  * sorter and the row renderer both read.
  *
@@ -214,9 +194,17 @@ function coverageCellHtml(pct) {
  * @returns {string} HTML for one <tr>.
  */
 function walkRowHtml(row) {
+  // The link carries THIS row's network type: city.html selects the walk to
+  // draw by network type and defaults to 'drive', so without it a "Roads +
+  // paths" row would open the city's drive walk instead — or, for a city walked
+  // only broadly, fall all the way back to the grid-attribution artifact, a
+  // different metric entirely. Advertising a row the link cannot reach is worse
+  // than not listing it.
   const link = row.filename
     ? `<a class="streets-view-link"
-          href="city.html?file=${encodeURIComponent(row.filename)}">View on map</a>`
+          href="city.html?file=${encodeURIComponent(row.filename)}&network=${encodeURIComponent(
+        row.networkType
+      )}">View on map</a>`
     : `<span class="streets-no-link" title="This city has no published run to link to">—</span>`;
 
   // City/state/country names come from OSM/Nominatim (publicly editable

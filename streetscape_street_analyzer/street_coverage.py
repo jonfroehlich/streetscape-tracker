@@ -73,6 +73,15 @@ _SERVICE_BUCKETS = ["alley", "driveway", "parking_aisle"]
 
 _HIGHWAY_BUCKETS = _MOTORIZED_BUCKETS + _NON_MOTORIZED_BUCKETS + _SERVICE_BUCKETS
 
+# Presentation order for `coverage_by_highway`, which is NOT the membership
+# order above: the service subtypes belong next to the `service` class they are
+# subtypes of, so a broad-network breakdown reads top-to-bottom as a hierarchy
+# (motorized roads → the service-road family → non-motorized ways). This is the
+# same order `streetTypeOrder` uses in www/js/street-coverage.js — the published
+# artifact's key order is a contract, and a consumer that trusts it should get
+# the hierarchy the panel's own legend shows. Keep the two in sync.
+_BUCKET_DISPLAY_ORDER = _MOTORIZED_BUCKETS + _SERVICE_BUCKETS + _NON_MOTORIZED_BUCKETS
+
 
 def _first_recognized(tag_value: Any, allowed: list[str]) -> str | None:
     """
@@ -261,10 +270,11 @@ def compute_street_coverage(
 
 
 def _bucket_order(bucket: str) -> int:
+    """Sort rank of a bucket in `coverage_by_highway` (see _BUCKET_DISPLAY_ORDER)."""
     try:
-        return _HIGHWAY_BUCKETS.index(bucket)
+        return _BUCKET_DISPLAY_ORDER.index(bucket)
     except ValueError:
-        return len(_HIGHWAY_BUCKETS)  # "other" sorts last
+        return len(_BUCKET_DISPLAY_ORDER)  # "other" sorts last
 
 
 def summarize_coverage(covered_edges: gpd.GeoDataFrame) -> dict[str, Any]:

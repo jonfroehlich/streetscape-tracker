@@ -309,7 +309,20 @@ ALTER TABLE runs ADD COLUMN num_flat_images INTEGER;
 # ALTER a UNIQUE constraint, hence the standard rebuild — the same shape as
 # _MIGRATE_V1_TO_V2. Every pre-v9 row already carries network_type='drive'
 # (column default since v5), so the copy is column-for-column.
+#
+# Wrapped in an explicit transaction: sqlite3's executescript() runs statements
+# in autocommit, so without it a crash between the DROP and the RENAME leaves NO
+# street_walks table at all — and the next connect() would take the "absent
+# table" early exit in _migrate_v8_to_v9, let _SCHEMA create it empty, and stamp
+# user_version=9, silently losing every walk row. The leading DROP of a stray
+# scratch table covers a catalog left mid-migration by a pre-transaction build
+# (a surviving street_walks_v9 would otherwise fail every later connect on
+# CREATE TABLE).
 _MIGRATE_V8_TO_V9 = """
+BEGIN;
+
+DROP TABLE IF EXISTS street_walks_v9;
+
 CREATE TABLE street_walks_v9 (
     walk_id                INTEGER PRIMARY KEY,
     city_id                TEXT NOT NULL REFERENCES cities(city_id),
@@ -346,6 +359,8 @@ FROM street_walks;
 
 DROP TABLE street_walks;
 ALTER TABLE street_walks_v9 RENAME TO street_walks;
+
+COMMIT;
 """
 
 
@@ -569,6 +584,11 @@ def _migrate_v8_to_v9(conn: sqlite3.Connection) -> None:
     copy is a straight column-for-column SELECT. Idempotent: detects the widened
     index and returns, so a catalog created fresh at the current schema can
     still be stamped forward through this step.
+
+    The rebuild itself is wrapped in a transaction (see _MIGRATE_V8_TO_V9), so
+    it either fully applies or leaves the v8 table untouched — an interrupted
+    run can never reach the "absent table" branch below with walk rows still to
+    migrate.
     """
     cols = {r[1] for r in conn.execute("PRAGMA table_info(street_walks)").fetchall()}
     if not cols:
@@ -1180,13 +1200,22 @@ def get_latest_street_walk(
 def get_latest_street_walks_all(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     """
     The most recent road-walk collection for every (city_id, provider,
-    network_type) that has one, ordered by city, provider, then network type.
-    Backs the published ``streetwalks.json.gz`` manifest (issue #155).
+    network_type) that has one, ordered by city, provider, then network type
+    DESCENDING. Backs the published ``streetwalks.json.gz`` manifest (issue
+    #155).
 
     network_type is part of the grouping, not filtered out: a city may have both
     a 'drive' walk and a broader 'all_public' one, and collapsing them would
     advertise whichever the JOIN happened to pick. The frontend selects by
     network type (defaulting to 'drive'), so the manifest must carry both.
+
+    The DESCENDING network order is deliberate. ``data/`` and ``www/`` publish
+    by separate mechanisms, and the collector regenerates this manifest on its
+    own, so a browser can hold a cached pre-network-type ``streetscape-utils.js``
+    whose lookup takes the FIRST entry matching (city, provider). Descending
+    puts 'drive' — the scheduled series, and what every such client has always
+    rendered — ahead of 'all_public' ('a' < 'd'), so a stale client degrades to
+    the right walk instead of silently switching street-km denominators.
     """
     return conn.execute(
         """SELECT sw.* FROM street_walks sw
@@ -1199,7 +1228,7 @@ def get_latest_street_walks_all(conn: sqlite3.Connection) -> list[sqlite3.Row]:
             AND sw.provider = latest.provider
             AND sw.network_type = latest.network_type
             AND sw.run_date = latest.max_date
-           ORDER BY sw.city_id, sw.provider, sw.network_type""",
+           ORDER BY sw.city_id, sw.provider, sw.network_type DESC""",
     ).fetchall()
 
 

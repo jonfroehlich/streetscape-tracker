@@ -18,6 +18,7 @@ const {
   streetTypeColor,
   streetTypeOrder,
   isNonMotorizedType,
+  typeLegendGroups,
   STREET_TYPE_COLORS,
   withStreetAlpha,
   fractionColor,
@@ -142,8 +143,60 @@ test("streetTypeOrder: roads, then the service family, then non-motorized", () =
   assert.ok(streetTypeOrder("service") < streetTypeOrder("alley"));
   assert.ok(streetTypeOrder("alley") < streetTypeOrder("footway"));
   assert.ok(streetTypeOrder("footway") < streetTypeOrder("bridleway"));
-  // living_street and other stay unlisted and sink below everything.
-  assert.ok(streetTypeOrder("bridleway") < streetTypeOrder("living_street"));
+  // living_street is a motorized road class and ranks with them, immediately
+  // after service — matching _BUCKET_DISPLAY_ORDER, which is the order the
+  // artifact's own coverage_by_highway keys come in. Only "other" sinks.
+  assert.ok(streetTypeOrder("service") < streetTypeOrder("living_street"));
+  assert.ok(streetTypeOrder("living_street") < streetTypeOrder("alley"));
+  assert.ok(streetTypeOrder("bridleway") < streetTypeOrder("other"));
+});
+
+// --- typeLegendGroups ------------------------------------------------------
+
+test("typeLegendGroups: one entry per rendered style, not per class", () => {
+  // A broad-network walk carries up to ten classes but the map draws them in
+  // two colors (service subtypes share the service hue; non-motorized ways all
+  // share the minor gray, thinner). Ten labels against two swatches reads as a
+  // broken palette — merging them says what the map actually does.
+  const groups = typeLegendGroups([
+    "footway",
+    "alley",
+    "residential",
+    "path",
+    "driveway",
+    "service",
+  ]);
+  assert.deepEqual(
+    groups.map((g) => g.labels),
+    [["residential"], ["service", "alley", "driveway"], ["footway", "path"]]
+  );
+  // Every entry in a group renders identically, which is why they merged.
+  assert.equal(groups[1].color, streetTypeColor("service"));
+  assert.equal(groups[1].thin, false);
+  assert.equal(groups[2].color, STREET_TYPE_MINOR_COLOR);
+  assert.equal(groups[2].thin, true);
+});
+
+test("typeLegendGroups: groups follow the artifact's own class order", () => {
+  const groups = typeLegendGroups(["bridleway", "motorway", "alley"]);
+  assert.deepEqual(
+    groups.map((g) => g.labels[0]),
+    ["motorway", "alley", "bridleway"]
+  );
+});
+
+test("typeLegendGroups: thickness splits the classes that share the minor gray", () => {
+  // living_street and "other" are gray but NOT thin, so they merge with each
+  // other; folding the footpaths in too would claim a visual equivalence the
+  // map does not draw (styleStreetByType renders those a step thinner).
+  const groups = typeLegendGroups(["living_street", "footway", "other"]);
+  assert.deepEqual(
+    groups.map((g) => g.labels),
+    [["living_street", "other"], ["footway"]]
+  );
+  assert.equal(groups[0].thin, false);
+  assert.equal(groups[1].thin, true);
+  assert.equal(groups[0].color, groups[1].color);
 });
 
 test("styleForMode: dispatches to the right per-mode styler", () => {

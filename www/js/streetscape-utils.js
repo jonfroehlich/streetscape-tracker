@@ -412,6 +412,48 @@ async function fetchStreetwalkManifest() {
 const DEFAULT_STREET_NETWORK_TYPE = "drive";
 
 /**
+ * Human labels for the osmnx network types a walk can be collected on. Keyed by
+ * the exact `network_type` the manifest carries, so the keys double as the set
+ * of values `?network=` accepts. Labels say what the walk COVERS rather than
+ * echoing the osmnx filter name, since that distinction is the whole reason two
+ * rows for one city are not duplicates.
+ *
+ * Mirrors naming.STREETWALK_NETWORK_TOKENS on the Python side — keep in sync.
+ */
+const STREET_NETWORK_LABELS = {
+  drive: "Roads",
+  all_public: "Roads + paths",
+  all: "Roads + paths (incl. private)",
+  walk: "Walkable",
+  bike: "Bikeable",
+  drive_service: "Roads + service",
+};
+
+/**
+ * Human label for an OSM network type; unknown types render as themselves.
+ * @param {?string} networkType - From the manifest; absent on pre-network walks.
+ * @returns {string}
+ */
+function streetNetworkLabel(networkType) {
+  const key = networkType ?? DEFAULT_STREET_NETWORK_TYPE;
+  return STREET_NETWORK_LABELS[key] ?? key;
+}
+
+/**
+ * Whether a string names a network type this site knows how to select on.
+ * Used to validate the untrusted `?network=` parameter before it reaches a
+ * manifest lookup, the same way isKnownProvider guards `?provider=`.
+ * @param {?string} networkType
+ * @returns {boolean}
+ */
+function isKnownStreetNetworkType(networkType) {
+  return (
+    typeof networkType === "string" &&
+    Object.prototype.hasOwnProperty.call(STREET_NETWORK_LABELS, networkType)
+  );
+}
+
+/**
  * Find a city+provider+network's streetwalk entry in the manifest, or null.
  *
  * A city can have one walk per network type, so this must select on network
@@ -848,6 +890,10 @@ if (typeof module !== "undefined" && module.exports) {
     fetchGzippedJson,
     streetwalkManifestUrl,
     fetchStreetwalkManifest,
+    DEFAULT_STREET_NETWORK_TYPE,
+    STREET_NETWORK_LABELS,
+    streetNetworkLabel,
+    isKnownStreetNetworkType,
     lookupStreetwalk,
     mergeStreetwalkStats,
     adaptCityRecord,

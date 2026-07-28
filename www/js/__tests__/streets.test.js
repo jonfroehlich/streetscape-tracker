@@ -14,6 +14,11 @@ global.PROVIDERS = {
   mapillary: { label: "Mapillary" },
 };
 global.DEFAULT_STREET_NETWORK_TYPE = "drive";
+global.STREET_NETWORK_LABELS = { drive: "Roads", all_public: "Roads + paths" };
+global.streetNetworkLabel = (networkType) => {
+  const key = networkType ?? global.DEFAULT_STREET_NETWORK_TYPE;
+  return global.STREET_NETWORK_LABELS[key] ?? key;
+};
 global.coverageColor = (pct) => `coverage(${pct})`;
 global.escapeHtml = (s) =>
   String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -265,8 +270,21 @@ test("walkRowHtml: links to the city page using the aggregate's run filename", (
   assert.match(html, /98\.4%/);
   assert.match(
     html,
-    /href="city\.html\?file=seattle--wa_width_1_height_1_step_20\.csv\.gz"/
+    /href="city\.html\?file=seattle--wa_width_1_height_1_step_20\.csv\.gz&network=drive"/
   );
+});
+
+test("walkRowHtml: the link carries this row's network type, not the default", () => {
+  // city.html selects the walk to draw by network type and defaults to 'drive',
+  // so a broad row whose link omits ?network= opens a DIFFERENT walk — or, for a
+  // city walked only broadly, falls back to the grid-attribution artifact.
+  const html = walkRowHtml(
+    toRowModel(
+      { ...SEATTLE_WALK, network_type: "all_public" },
+      { city: "Seattle", data_file: { filename: "seattle--wa_width_1_height_1_step_20.csv.gz" } }
+    )
+  );
+  assert.match(html, /&network=all_public"/);
 });
 
 test("walkRowHtml: a city missing from the aggregate still renders, without a link", () => {

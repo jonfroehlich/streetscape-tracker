@@ -190,6 +190,14 @@ def test_manifest_latest_is_per_network_type_too(conn, data_dir):
     # Each entry points at its own artifact, never a shared one.
     assert len({w["coverage_filename"] for w in walks}) == 2
 
+    # The drive walk is listed FIRST. data/ and www/ publish by separate
+    # mechanisms, and collect.py regenerates this manifest on its own, so a
+    # browser can hold a cached pre-network-type streetscape-utils.js whose
+    # lookup takes the first entry matching (city, provider). Listing the broad
+    # walk first would silently switch such a client's street-km denominator;
+    # drive-first degrades it to the series it has always rendered.
+    assert [w["network_type"] for w in walks] == ["drive", "all_public"]
+
 
 def test_manifest_lists_every_city_ordered_by_city_then_provider(conn, data_dir):
     """Multiple cities all appear; the order is the query's stable city→provider."""

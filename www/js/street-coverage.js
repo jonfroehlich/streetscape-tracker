@@ -162,6 +162,37 @@ function isNonMotorizedType(highway) {
 }
 
 /**
+ * Legend entries for type mode: one per DISTINCT rendered style, not one per
+ * class. Extra classes are encoded by reusing a hue (the service subtypes) or by
+ * line thickness (the non-motorized ways), so a broad-network walk has up to ten
+ * classes drawn in two colors — a swatch each would show ten labels against two
+ * hues and read as a broken palette rather than the deliberate family grouping
+ * it is. Merging them states what is actually true: these classes look the same
+ * on the map. Groups keep the artifact's own class order (streetTypeOrder),
+ * anchored at each group's first member.
+ *
+ * @param {string[]} present - Highway buckets actually in the artifact.
+ * @returns {{color: string, thin: boolean, labels: string[]}[]}
+ */
+function typeLegendGroups(present) {
+  const groups = [];
+  const byStyle = new Map();
+  for (const type of [...present].sort((a, b) => streetTypeOrder(a) - streetTypeOrder(b))) {
+    const color = streetTypeColor(type);
+    const thin = isNonMotorizedType(type);
+    const key = `${color}|${thin}`;
+    let group = byStyle.get(key);
+    if (!group) {
+      group = { color, thin, labels: [] };
+      byStyle.set(key, group);
+      groups.push(group);
+    }
+    group.labels.push(type);
+  }
+  return groups;
+}
+
+/**
  * Derive the streets artifact URL from a run's CSV filename.
  * Mirrors naming.streets_filename_for_run on the Python side — keep in sync,
  * including its suffix validation: a name that isn't a run csv.gz has no
@@ -464,8 +495,10 @@ function buildStreetCoveragePanel(map, layer, meta, provider, options) {
   const legendEl = document.getElementById("street-legend");
 
   // ── Legend (rebuilt per mode) ──────────────────────────────────
-  const swatch = (color, label, dashed = false) =>
-    `<span><i class="${dashed ? "dashed" : ""}" style="background:${color}"></i>${label}</span>`;
+  const swatch = (color, label, dashed = false, thin = false) => {
+    const cls = [dashed ? "dashed" : "", thin ? "thin" : ""].filter(Boolean).join(" ");
+    return `<span><i class="${cls}" style="background:${color}"></i>${label}</span>`;
+  };
 
   function renderLegend() {
     if (mode === "coverage") {
@@ -481,12 +514,11 @@ function buildStreetCoveragePanel(map, layer, meta, provider, options) {
           swatch(STREET_UNCOVERED_COLOR, "no coverage", true);
       }
     } else if (mode === "type") {
-      // Only the types actually present, in importance order, plus uncovered.
+      // Only the types actually present, in the artifact's own class order,
+      // merged by rendered style, plus uncovered.
       legendEl.innerHTML =
-        types
-          .slice()
-          .sort((a, b) => streetTypeOrder(a) - streetTypeOrder(b))
-          .map((t) => swatch(streetTypeColor(t), t))
+        typeLegendGroups(types)
+          .map((g) => swatch(g.color, g.labels.join(", "), false, g.thin))
           .join("") + swatch(STREET_UNCOVERED_COLOR, "no coverage", true);
     } else {
       // Age: a small newest→oldest gradient chip plus the uncovered swatch.
@@ -658,8 +690,13 @@ function buildStreetCoveragePanel(map, layer, meta, provider, options) {
  * Ordered in three runs so a broad-network walk reads top-to-bottom as a
  * hierarchy: motorized road classes by descending importance, then the
  * service-road family (alley is a real back street, driveway and parking aisle
- * are not), then non-motorized ways. `living_street` and `other` are
- * deliberately absent and sort last, as before.
+ * are not), then non-motorized ways. `other` is deliberately absent and sorts
+ * last.
+ *
+ * This list is the same order the analyzer writes `coverage_by_highway` in
+ * (`_BUCKET_DISPLAY_ORDER` in street_coverage.py) — the artifact's key order is
+ * a contract, so the legend must not present a different hierarchy than a
+ * consumer reading the file straight through would get. Keep the two in sync.
  *
  * @param {string} highway
  * @returns {number}
@@ -674,6 +711,7 @@ function streetTypeOrder(highway) {
     "residential",
     "unclassified",
     "service",
+    "living_street",
     "alley",
     "driveway",
     "parking_aisle",
@@ -762,6 +800,7 @@ if (typeof module !== "undefined" && module.exports) {
     streetTypeColor,
     streetTypeOrder,
     isNonMotorizedType,
+    typeLegendGroups,
     withStreetAlpha,
     fractionColor,
     hexToRgb,

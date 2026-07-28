@@ -422,6 +422,14 @@
   border-radius: 2px;
 }
 
+/* Non-motorized ways are drawn a step thinner on the map (styleStreetByType);
+   the swatch echoes that, since thickness — not hue — is what separates them
+   from the other classes sharing the minor gray. */
+.street-legend i.thin {
+  height: 5px;
+  border-radius: 1px;
+}
+
 /* Uncovered swatch is drawn dashed to match the map lines. */
 .street-legend i.dashed {
   background-image: repeating-linear-gradient(

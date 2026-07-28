@@ -611,15 +611,13 @@ def _unique_key_columns(conn, table, must_contain="run_date"):
     return set()
 
 
-def test_migrate_v8_to_v9(tmp_path):
-    """A v8 catalog's street_walks UNIQUE gains network_type on connect.
+def _build_v8_catalog(db_path):
+    """A real v8 catalog on disk: the narrower street_walks key plus one walk.
 
-    v8 keyed a walk on (city_id, provider, run_date), which collapses a city's
-    'drive' and 'all_public' walks onto one row — the second silently
-    overwrites the first. This is a table rebuild, so the test also proves the
-    pre-existing row survives it intact.
+    Rebuilds street_walks with the v8 (narrower) key rather than stamping the
+    current schema with an old version, so the migration under test has
+    something to actually migrate.
     """
-    db_path = str(tmp_path / "v8.db")
     raw = sqlite3.connect(db_path)
     raw.executescript(db._SCHEMA)
     # Rebuild street_walks with the v8 (narrower) key, so the fixture is a real
@@ -666,6 +664,18 @@ def test_migrate_v8_to_v9(tmp_path):
     raw.commit()
     raw.close()
 
+
+def test_migrate_v8_to_v9(tmp_path):
+    """A v8 catalog's street_walks UNIQUE gains network_type on connect.
+
+    v8 keyed a walk on (city_id, provider, run_date), which collapses a city's
+    'drive' and 'all_public' walks onto one row — the second silently
+    overwrites the first. This is a table rebuild, so the test also proves the
+    pre-existing row survives it intact.
+    """
+    db_path = str(tmp_path / "v8.db")
+    _build_v8_catalog(db_path)
+
     pre = sqlite3.connect(db_path)
     assert _unique_key_columns(pre, "street_walks") == {"city_id", "provider", "run_date"}
     pre.close()
@@ -693,6 +703,58 @@ def test_migrate_v8_to_v9(tmp_path):
     assert conn3.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
     assert conn3.execute("SELECT COUNT(*) FROM street_walks").fetchone()[0] == 1
     conn3.close()
+
+
+def test_migrate_v8_to_v9_is_atomic(tmp_path):
+    """An interrupted v8 -> v9 rebuild must leave the v8 catalog untouched.
+
+    The rebuild drops street_walks and renames a scratch table over it. Without
+    a transaction those run in autocommit, so dying in between leaves NO
+    street_walks at all — and the next connect() would take the "absent table"
+    early exit, let _SCHEMA create it empty, and stamp user_version = 9, losing
+    every walk row silently. Here the script is run with its COMMIT stripped and
+    the connection abandoned, which is exactly what a crash mid-rebuild does.
+    """
+    db_path = str(tmp_path / "v8.db")
+    _build_v8_catalog(db_path)
+
+    crashed = sqlite3.connect(db_path)
+    crashed.execute("PRAGMA foreign_keys=OFF")
+    crashed.executescript(db._MIGRATE_V8_TO_V9.replace("COMMIT;", ""))
+    crashed.close()  # no COMMIT reached → SQLite rolls the whole rebuild back
+
+    after = sqlite3.connect(db_path)
+    assert after.execute("PRAGMA user_version").fetchone()[0] == 8
+    assert _unique_key_columns(after, "street_walks") == {"city_id", "provider", "run_date"}
+    assert after.execute("SELECT COUNT(*) FROM street_walks").fetchone()[0] == 1
+    after.close()
+
+    # And the retry — the next ordinary connect() — completes it.
+    conn = db.connect(db_path)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
+    assert db.get_latest_street_walk(conn, "bend--or")["csv_filename"] == "old_streetwalk.csv.gz"
+    conn.close()
+
+
+def test_migrate_v8_to_v9_clears_a_stale_scratch_table(tmp_path):
+    """A street_walks_v9 left by a pre-transaction build must not brick connect.
+
+    CREATE TABLE street_walks_v9 has no IF NOT EXISTS, so a leftover scratch
+    table from an interrupted older run would fail every subsequent connect —
+    an unopenable catalog, not a degraded one.
+    """
+    db_path = str(tmp_path / "v8.db")
+    _build_v8_catalog(db_path)
+
+    stale = sqlite3.connect(db_path)
+    stale.execute("CREATE TABLE street_walks_v9 (walk_id INTEGER PRIMARY KEY)")
+    stale.commit()
+    stale.close()
+
+    conn = db.connect(db_path)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
+    assert db.get_latest_street_walk(conn, "bend--or")["csv_filename"] == "old_streetwalk.csv.gz"
+    conn.close()
 
 
 def test_two_network_types_coexist_on_one_date(tmp_path):
