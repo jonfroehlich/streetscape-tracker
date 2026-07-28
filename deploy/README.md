@@ -195,6 +195,19 @@ systemctl --user start streetscape-tracker.service           # trigger a run now
 Rotating file logs also go to `logs/streetscape_scheduler.log`, and a rolling
 catalog backup to `logs/streetscape_tracker.db.backup`.
 
+**Diagnosing a failed city.** `journalctl` above needs journal read access, which
+the service account does not have on makelab2 — so don't rely on it. Three file
+logs cover the same ground:
+
+| file | holds |
+|---|---|
+| `logs/streetscape_scheduler.log` | the scheduler's own decisions, plus the last 25 lines of any failed child |
+| `logs/collect_{city_id}_{channel}_{date}.log` | one collection subprocess's **full** output, appended per attempt |
+| `logs/streetscape_service_console.log` | anything else the unit emits — uncaught traceback, OOM notice |
+
+A `collection failed` line names the per-attempt log to read. The console log
+is a safety net and is **not rotated**; prune it if it ever grows.
+
 ### Watching resource use (alongside other co-tenants)
 
 ```bash
