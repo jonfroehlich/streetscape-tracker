@@ -1353,6 +1353,17 @@ def test_reconcile_walks_command_finds_and_catalogs_orphans(conn, monkeypatch, d
     assert cmd_reconcile_walks(cfg, target_date=WALK_DATE) == 0
     assert _walk_row(conn, city.city_id) is not None
 
+    # The salvage must also clear the recorded failure, or it is cosmetic: the
+    # city would stay due and be re-crawled anyway, which is the whole cost the
+    # reconcile exists to avoid.
+    state = conn.execute(
+        "SELECT last_success_at, consecutive_failures FROM schedule_state "
+        "WHERE city_id = ? AND provider = 'gsv_streets'",
+        (city.city_id,),
+    ).fetchone()
+    assert state["last_success_at"] is not None
+    assert state["consecutive_failures"] == 0
+
     # Idempotent: a second pass sees the row and reports nothing to do.
     assert cmd_reconcile_walks(cfg, target_date=WALK_DATE) == 0
     assert "No orphaned walks found" in capsys.readouterr().out

@@ -741,6 +741,12 @@ def cmd_reconcile_walks(
                 continue
             # Manifest is rebuilt once at the end, not per salvaged walk.
             if _reconcile_orphaned_walk(conn, cfg, city, channel, today, regenerate_manifest=False):
+                # Clear the failure that the orphaned walk recorded. Without
+                # this the salvage is cosmetic: the row exists but the channel
+                # still has no last_success_at, so the city stays due and gets
+                # re-crawled anyway — which is the entire cost this avoids.
+                # (run-due's inline path already does this via record_attempt.)
+                db.record_attempt(conn, city.city_id, success=True, provider=channel)
                 reconciled += 1
 
     if dry_run:
