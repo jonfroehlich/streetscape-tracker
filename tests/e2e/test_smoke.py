@@ -438,15 +438,18 @@ def test_streets_page_lists_published_road_walks(page: Page, base_url):
     expect(alpha_row).to_contain_text("2026-04-15")
     expect(rows.nth(1)).to_contain_text("Mapillary")
 
-    # The link target comes from the aggregate, not the manifest.
+    # The link target comes from the aggregate, not the manifest — plus this
+    # row's own network type, so the city page draws the walk the row advertises
+    # rather than defaulting to 'drive' (these fixtures ARE drive walks, hence
+    # the explicit token even though it matches the default).
     expect(alpha_row.locator("a.streets-view-link")).to_have_attribute(
-        "href", f"city.html?file={ALPHA_LATEST}"
+        "href", f"city.html?file={ALPHA_LATEST}&network=drive"
     )
     expect(page.locator("#streets-caption")).to_contain_text("2 published road-walk collections")
 
     # And it actually lands on the city page with the overlay.
     alpha_row.locator("a.streets-view-link").click()
-    page.wait_for_url(f"**/city.html?file={ALPHA_LATEST}")
+    page.wait_for_url(f"**/city.html?file={ALPHA_LATEST}&network=drive")
     expect(page.locator("#street-coverage-container")).to_be_visible()
 
     assert errors == []
