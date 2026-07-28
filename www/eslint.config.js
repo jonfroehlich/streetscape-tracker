@@ -44,6 +44,7 @@ const sharedGlobals = {
   streetwalkManifestUrl: "readonly",
   fetchStreetwalkManifest: "readonly",
   lookupStreetwalk: "readonly",
+  DEFAULT_STREET_NETWORK_TYPE: "readonly",
   mergeStreetwalkStats: "readonly",
   adaptCityRecord: "readonly",
   adaptCitiesPayload: "readonly",

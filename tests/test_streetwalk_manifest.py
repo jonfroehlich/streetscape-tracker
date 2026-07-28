@@ -157,6 +157,38 @@ def test_manifest_latest_is_per_provider_not_per_city(conn, data_dir):
         ("gsv", "2026-07-17"),
         ("mapillary", "2026-06-30"),
     }
+    # A walk with no explicit network type is a drive walk.
+    assert {w["network_type"] for w in walks} == {"drive"}
+
+
+def test_manifest_latest_is_per_network_type_too(conn, data_dir):
+    """A city's drive and all_public walks are separate series, so the manifest
+    must advertise both — collapsing them would make the city page render
+    whichever the JOIN happened to pick, silently switching denominators."""
+    city_id = _register_city(conn, "Adrian", "Oregon", "OR")
+    for network_type, d, pct in [
+        ("drive", date(2026, 3, 1), 90.0),
+        ("drive", date(2026, 7, 17), 95.6),
+        ("all_public", date(2026, 7, 17), 61.2),
+    ]:
+        db.register_street_walk(
+            conn,
+            city_id=city_id,
+            run_date=d,
+            network_type=network_type,
+            csv_filename=f"adrian_{network_type}_{d.isoformat()}.csv.gz",
+            coverage_filename=f"adrian_{network_type}_{d.isoformat()}_coverage.json.gz",
+            coverage_pct_by_length=pct,
+        )
+
+    walks = generate_streetwalk_manifest(conn, data_dir)["walks"]
+
+    assert {(w["network_type"], w["run_date"], w["coverage_pct_by_length"]) for w in walks} == {
+        ("drive", "2026-07-17", 95.6),
+        ("all_public", "2026-07-17", 61.2),
+    }
+    # Each entry points at its own artifact, never a shared one.
+    assert len({w["coverage_filename"] for w in walks}) == 2
 
 
 def test_manifest_lists_every_city_ordered_by_city_then_provider(conn, data_dir):

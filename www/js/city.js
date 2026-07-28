@@ -1468,6 +1468,11 @@ async function loadData() {
     // issue #99/#155); otherwise fall back to the grid-attribution
     // "_streets.json.gz" (issue #24). The streetwalk file is NOT derivable from
     // the run filename, so it comes from the sidecar manifest keyed by city_id.
+    // A city can have one walk per OSM network type; lookupStreetwalk defaults
+    // to 'drive' (motorized roads), which is the scheduled series and what this
+    // page has always shown. A broad 'all_public' walk covers a much larger
+    // network — different street-km denominator, not a better number for the
+    // same thing — so surfacing it needs a deliberate selector, not a fallback.
     // The setPanoDotsVisible hook lets the panel show/hide the pano markers (a
     // coarse show-all/hide-all) so the streets can be read on their own; it goes
     // through the reconcile model so re-showing respects the mode/year/date/cap.

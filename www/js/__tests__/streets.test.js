@@ -13,6 +13,7 @@ global.PROVIDERS = {
   gsv: { label: "Google Street View" },
   mapillary: { label: "Mapillary" },
 };
+global.DEFAULT_STREET_NETWORK_TYPE = "drive";
 global.coverageColor = (pct) => `coverage(${pct})`;
 global.escapeHtml = (s) =>
   String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -200,6 +201,34 @@ test("every sortable column key exists on a row model", () => {
     assert.ok(col.key in row, `row model is missing ${col.key}`);
   }
   assert.ok(STREET_COLUMNS.some((c) => c.key === DEFAULT_SORT.key));
+});
+
+test("a row renders one cell per column, plus the link cell", () => {
+  // The <thead> lives in streets.html and the <tr> is built here, so adding a
+  // column to one and not the other misaligns every row — invisible until the
+  // page is opened in a browser, which no test does.
+  const html = walkRowHtml(
+    toRowModel(
+      { city_id: "x", provider: "gsv", network_type: "all_public", run_date: "2026-01-01" },
+      { city: "X" }
+    )
+  );
+  const cells = (html.match(/<t[hd][\s>]/g) || []).length;
+  assert.equal(cells, STREET_COLUMNS.length + 1);
+});
+
+test("toRowModel: labels the network, defaulting a tokenless walk to roads", () => {
+  const broad = toRowModel(
+    { city_id: "x", provider: "gsv", network_type: "all_public" },
+    { city: "X" }
+  );
+  assert.equal(broad.networkType, "all_public");
+  assert.equal(broad.networkLabel, "Roads + paths");
+
+  // A walk published before network types existed carries no field at all.
+  const legacy = toRowModel({ city_id: "x", provider: "gsv" }, { city: "X" });
+  assert.equal(legacy.networkType, "drive");
+  assert.equal(legacy.networkLabel, "Roads");
 });
 
 // --- num -------------------------------------------------------------------

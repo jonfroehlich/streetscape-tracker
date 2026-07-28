@@ -785,6 +785,46 @@ test("lookupStreetwalk: finds by city_id+provider, null on miss or absent manife
   assert.equal(lookupStreetwalk({}, "seattle--wa", "gsv"), null);
 });
 
+test("lookupStreetwalk: selects on network type, defaulting to drive", () => {
+  // A city can carry one walk per network type. Taking the first match would
+  // render whichever the manifest happened to list first — and drive vs
+  // all_public coverage divide by different street-km denominators.
+  const manifest = {
+    walks: [
+      {
+        city_id: "seattle--wa",
+        provider: "gsv",
+        network_type: "all_public",
+        coverage_filename: "seattle_gsv_allpublic.json.gz",
+      },
+      {
+        city_id: "seattle--wa",
+        provider: "gsv",
+        network_type: "drive",
+        coverage_filename: "seattle_gsv_drive.json.gz",
+      },
+    ],
+  };
+  assert.equal(
+    lookupStreetwalk(manifest, "seattle--wa", "gsv").coverage_filename,
+    "seattle_gsv_drive.json.gz"
+  );
+  assert.equal(
+    lookupStreetwalk(manifest, "seattle--wa", "gsv", "all_public").coverage_filename,
+    "seattle_gsv_allpublic.json.gz"
+  );
+  assert.equal(lookupStreetwalk(manifest, "seattle--wa", "gsv", "walk"), null);
+});
+
+test("lookupStreetwalk: a walk with no network_type is a drive walk", () => {
+  // Manifest entries published before network types existed carry no field.
+  const manifest = {
+    walks: [{ city_id: "seattle--wa", provider: "gsv", coverage_filename: "legacy.json.gz" }],
+  };
+  assert.equal(lookupStreetwalk(manifest, "seattle--wa", "gsv").coverage_filename, "legacy.json.gz");
+  assert.equal(lookupStreetwalk(manifest, "seattle--wa", "gsv", "all_public"), null);
+});
+
 test("mergeStreetwalkStats: joins by city_id+provider and counts the matches", () => {
   const cities = [
     { city_id: "seattle--wa", provider: "gsv" },
@@ -844,6 +884,44 @@ test("mergeStreetwalkStats: duplicate manifest keys keep the first walk", () => 
   };
   assert.equal(mergeStreetwalkStats(cities, manifest), 1);
   assert.equal(cities[0].street_coverage_pct_by_length, 98.4);
+});
+
+test("mergeStreetwalkStats: only drive walks feed the overview metric", () => {
+  // METRICS.streets compares cities to each other. A broad walk's coverage %
+  // divides by a much larger street-km denominator, so joining it would put two
+  // incompatible scales in one choropleth. A city with only a broad walk is
+  // honestly "not measured" for the drive metric.
+  const cities = [
+    { city_id: "seattle--wa", provider: "gsv" },
+    { city_id: "corvallis--or", provider: "gsv" },
+  ];
+  const manifest = {
+    walks: [
+      {
+        city_id: "seattle--wa",
+        provider: "gsv",
+        network_type: "all_public",
+        coverage_pct_by_length: 61.2,
+      },
+      {
+        city_id: "seattle--wa",
+        provider: "gsv",
+        network_type: "drive",
+        coverage_pct_by_length: 98.4,
+      },
+      {
+        city_id: "corvallis--or",
+        provider: "gsv",
+        network_type: "all_public",
+        coverage_pct_by_length: 44.0,
+      },
+    ],
+  };
+  assert.equal(mergeStreetwalkStats(cities, manifest), 1);
+  assert.equal(cities[0].street_coverage_pct_by_length, 98.4);
+  // Walked, but not on the drive network — so no drive number to show.
+  assert.equal(cities[1].street_coverage_pct_by_length, null);
+  assert.equal(cities[1].street_walk, null);
 });
 
 test("mergeStreetwalkStats: joins every city once at catalog scale", () => {

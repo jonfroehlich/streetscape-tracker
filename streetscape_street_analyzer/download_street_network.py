@@ -181,7 +181,13 @@ def graph_to_edges(graph: nx.MultiDiGraph) -> gpd.GeoDataFrame:
         [f"{min(a, b)}_{max(a, b)}" for a, b in zip(u, v, strict=True)], index=edges.index
     )
 
-    keep = [c for c in ("highway", "length", "geometry") if c in edges.columns]
+    # `service` distinguishes an alley from a driveway or a parking aisle, all of
+    # which are highway=service; without it the by-type breakdown cannot tell a
+    # real back street from someone's driveway. It is already in
+    # ox.settings.useful_tags_way, so retaining it needs no re-fetch — but a
+    # network with no service roads (and any drive GraphML cached before this)
+    # simply won't have the column, hence the membership guard.
+    keep = [c for c in ("highway", "service", "length", "geometry") if c in edges.columns]
     edges = edges[keep].copy()
     edges["edge_id"] = edge_id
     edges = edges.loc[~undirected_key.duplicated()].reset_index(drop=True)

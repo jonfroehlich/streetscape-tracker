@@ -62,13 +62,69 @@ def _pano_gdf(points):
         ("motorway_link", "motorway"),
         (["primary", "residential"], "primary"),
         (["unknownclass", "secondary"], "secondary"),
-        ("footway", "other"),
         (None, "other"),
         ([], "other"),
+        # Non-motorized classes, reachable only from a broader network type.
+        # These used to fall through to "other"; they are first-class buckets
+        # now so a broad walk can report park-path coverage separately from
+        # road coverage.
+        ("footway", "footway"),
+        ("path", "path"),
+        ("pedestrian", "pedestrian"),
+        ("cycleway", "cycleway"),
+        ("steps", "steps"),
+        ("track", "track"),
+        ("bridleway", "bridleway"),
+        # Still unrecognized: indoor/transit-only classes that all_public lets
+        # through but which say nothing about street imagery coverage.
+        ("busway", "other"),
+        ("corridor", "other"),
+        ("elevator", "other"),
     ],
 )
 def test_normalize_highway(raw, expected):
     assert normalize_highway(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "highway,service,expected",
+    [
+        # The point of retaining the `service` tag: an alley is a real back
+        # street, a driveway is someone's parking pad, and both are
+        # highway=service. all_public admits both, so they must be separable.
+        ("service", "alley", "alley"),
+        ("service", "driveway", "driveway"),
+        ("service", "parking_aisle", "parking_aisle"),
+        # Unrecognized or absent subtype → the generic service bucket.
+        ("service", "emergency_access", "service"),
+        ("service", None, "service"),
+        ("service", float("nan"), "service"),
+        # osmnx emits lists when simplification merged differing ways.
+        (["service"], ["alley"], "alley"),
+        (["service", "residential"], ["alley"], "alley"),
+        # `service` is meaningless on a non-service highway and must be ignored
+        # rather than hijacking the bucket.
+        ("residential", "alley", "residential"),
+        ("footway", "driveway", "footway"),
+    ],
+)
+def test_normalize_highway_service_subtypes(highway, service, expected):
+    assert normalize_highway(highway, service) == expected
+
+
+def test_bucket_series_without_service_column():
+    """A drive network cached before `service` was retained has no such column."""
+    edges = _make_edges([("service", None), ("footway", None)])
+    assert "service" not in edges.columns
+    covered = compute_street_coverage(edges, _pano_gdf([]), RUN_DATE)
+    assert covered["highway_bucket"].tolist() == ["service", "footway"]
+
+
+def test_bucket_series_uses_service_column_when_present():
+    edges = _make_edges([("service", None), ("service", None)])
+    edges["service"] = ["alley", "parking_aisle"]
+    covered = compute_street_coverage(edges, _pano_gdf([]), RUN_DATE)
+    assert covered["highway_bucket"].tolist() == ["alley", "parking_aisle"]
 
 
 # ── coverage matching ────────────────────────────────────────────────────────
@@ -469,3 +525,64 @@ def test_graph_to_edges_collapses_reciprocal_edges():
     edges = graph_to_edges(g)
     assert len(edges) == 2  # 3 directed edges -> 2 unique segments
     assert sorted(edges["highway"]) == ["residential", "service"]
+
+
+def test_graph_to_edges_retains_the_service_tag():
+    """Alleys are highway=service + service=alley, so dropping `service` (as
+    graph_to_edges used to) makes a real back street indistinguishable from a
+    driveway. osmnx already carries the tag; it just has to survive the flatten.
+    """
+    import networkx as nx
+
+    from streetscape_street_analyzer.download_street_network import graph_to_edges
+
+    g = nx.MultiDiGraph(crs="EPSG:4326")
+    g.add_node(1, x=-121.310, y=44.050)
+    g.add_node(2, x=-121.309, y=44.050)
+    g.add_node(3, x=-121.308, y=44.050)
+    g.add_edge(
+        1,
+        2,
+        highway="service",
+        service="alley",
+        length=80.0,
+        geometry=LineString([(-121.310, 44.050), (-121.309, 44.050)]),
+    )
+    g.add_edge(
+        2,
+        3,
+        highway="service",
+        service="driveway",
+        length=80.0,
+        geometry=LineString([(-121.309, 44.050), (-121.308, 44.050)]),
+    )
+
+    edges = graph_to_edges(g)
+    assert "service" in edges.columns
+    assert sorted(edges["service"]) == ["alley", "driveway"]
+    covered = compute_street_coverage(edges, _pano_gdf([]), RUN_DATE)
+    assert sorted(covered["highway_bucket"]) == ["alley", "driveway"]
+
+
+def test_graph_to_edges_without_any_service_tag():
+    """A network with no service roads has no `service` column at all — normal,
+    not an error, and the same for drive GraphML cached before it was kept."""
+    import networkx as nx
+
+    from streetscape_street_analyzer.download_street_network import graph_to_edges
+
+    g = nx.MultiDiGraph(crs="EPSG:4326")
+    g.add_node(1, x=-121.310, y=44.050)
+    g.add_node(2, x=-121.309, y=44.050)
+    g.add_edge(
+        1,
+        2,
+        highway="footway",
+        length=80.0,
+        geometry=LineString([(-121.310, 44.050), (-121.309, 44.050)]),
+    )
+
+    edges = graph_to_edges(g)
+    assert "service" not in edges.columns
+    covered = compute_street_coverage(edges, _pano_gdf([]), RUN_DATE)
+    assert covered["highway_bucket"].tolist() == ["footway"]

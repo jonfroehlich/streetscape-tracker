@@ -75,6 +75,18 @@ max_requests_per_minute = 24000
 # match-distance sweep moved coverage by ~1 pp); raising it cuts requests
 # proportionally, at the cost of coarser per-edge fractions.
 spacing_m = 15
+# Which OSM network to walk. 'drive' is osmnx's motorized-public-roads filter,
+# which excludes footways, paths, pedestrian streets, cycleways, steps, tracks
+# and every highway=service way (alleys included). 'all_public' is a strict
+# superset that adds all of them — a substantially larger network (budget for
+# roughly 2.5x the samples on a first walk) and therefore a much longer night.
+#
+# Each network type is its OWN walk series: separate artifacts (a network token
+# in the filename, 'drive' tokenless), separate street_walks rows, separate
+# cadence. Changing this does NOT continue the existing series — it starts a new
+# one, and coverage_pct_by_length means something different in it (a much larger
+# street-km denominator). Leave it on 'drive' unless you mean to do that.
+#network_type = "drive"
 
 # Mapillary road-walk. Costs the z14 tile census (tens of requests for a whole
 # city) regardless of city size or sample spacing, because Mapillary has no
@@ -85,6 +97,10 @@ spacing_m = 15
 enabled = true
 daily_request_budget = 5000
 spacing_m = 15
+# See [providers.gsv_streets].network_type. A broader network costs Mapillary
+# nothing extra (the tile census is the same regardless of how many sample
+# points are scored against it) — only the local join gets bigger.
+#network_type = "drive"
 
 [download]
 # Conservative defaults; see cli.py docstring for tuning guidance.

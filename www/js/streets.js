@@ -81,6 +81,10 @@ function indexCitiesByProvider(rawCities, providers) {
 const STREET_COLUMNS = [
   { key: "label", label: "City", type: "text", initial: "asc" },
   { key: "providerLabel", label: "Provider", type: "text", initial: "asc" },
+  // Which OSM network was walked. Without this column two rows for one city
+  // would look like duplicates, when in fact their coverage percentages divide
+  // by different street-km denominators and are not comparable.
+  { key: "networkLabel", label: "Network", type: "text", initial: "asc" },
   { key: "runDate", label: "Walked", type: "text", initial: "desc" },
   { key: "spacing", label: "Sample spacing", type: "number", initial: "asc" },
   { key: "pct", label: "Street-km covered", type: "number", initial: "desc" },
@@ -91,6 +95,26 @@ const STREET_COLUMNS = [
 
 /** Default sort: best 360° coverage first (what the page opens on). */
 const DEFAULT_SORT = { key: "pct", dir: "desc" };
+
+/**
+ * Human label for an OSM network type. Says what the walk COVERS rather than
+ * echoing the osmnx filter name, since the distinction is the whole reason two
+ * rows for one city aren't duplicates.
+ * @param {?string} networkType - From the manifest; absent on pre-network walks.
+ * @returns {string}
+ */
+function streetNetworkLabel(networkType) {
+  const labels = {
+    drive: "Roads",
+    all_public: "Roads + paths",
+    all: "Roads + paths (incl. private)",
+    walk: "Walkable",
+    bike: "Bikeable",
+    drive_service: "Roads + service",
+  };
+  const key = networkType ?? DEFAULT_STREET_NETWORK_TYPE;
+  return labels[key] ?? key;
+}
 
 /**
  * Flatten a manifest walk + its joined aggregate record into the one shape the
@@ -117,6 +141,8 @@ function toRowModel(walk, city, labelSource = null) {
     label: named ? cityLabel(named) : walk.city_id,
     provider: walk.provider,
     providerLabel: PROVIDERS[walk.provider]?.label ?? walk.provider,
+    networkType: walk.network_type ?? DEFAULT_STREET_NETWORK_TYPE,
+    networkLabel: streetNetworkLabel(walk.network_type),
     runDate: walk.run_date ?? null,
     spacing: walk.spacing_m ?? null,
     pct: walk.coverage_pct_by_length ?? null,
@@ -199,6 +225,7 @@ function walkRowHtml(row) {
     <tr>
       <th scope="row">${escapeHtml(row.label)}</th>
       <td>${escapeHtml(row.providerLabel)}</td>
+      <td>${escapeHtml(row.networkLabel)}</td>
       <td>${escapeHtml(row.runDate ?? "—")}</td>
       <td>${row.spacing == null ? "—" : `${num(row.spacing)} m`}</td>
       ${coverageCellHtml(row.pct)}

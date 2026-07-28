@@ -267,3 +267,129 @@ def test_immutable_snapshot_skips_without_force(tmp_path, monkeypatch):
     # Second run, same date, no --force: skip cleanly without re-querying.
     assert collect.run_collect(_args(data_dir)) == 0
     assert calls["n"] == first
+
+
+# --- Broad networks: alleys, footpaths, park trails -------------------------
+
+FOOTWAY_EDGE = LineString([(-121.3005, 44.05), (-121.3005, 44.052)])
+ALLEY_EDGE = LineString([(-121.3010, 44.05), (-121.3010, 44.051)])
+
+
+def _edges_for_network(network_type):
+    """
+    Edges per osmnx network type, as the real fetch would return them.
+
+    'drive' is motorized public roads only. 'all_public' is a strict superset
+    that additionally carries the footway and the alley — the classes the whole
+    broad-network change exists to reach.
+    """
+    if network_type == "drive":
+        return _edges()
+    return gpd.GeoDataFrame(
+        {
+            "edge_id": ["1_2", "2_3", "3_4", "4_5"],
+            "highway": ["residential", "service", "footway", "service"],
+            "service": [None, None, None, "alley"],
+            "length": [222.0, 55.0, 222.0, 111.0],
+        },
+        geometry=[LONG_EDGE, SHORT_EDGE, FOOTWAY_EDGE, ALLEY_EDGE],
+        crs="EPSG:4326",
+    )
+
+
+def test_two_network_types_walk_one_city_on_one_date_without_colliding(tmp_path, monkeypatch):
+    """
+    A city's 'drive' and 'all_public' walks are different amounts of work over
+    different edge sets, and both can legitimately be collected the same night.
+
+    Without a network token in the filename they produce byte-identical names,
+    so the second collection finds the first's snapshot on disk, hits the
+    immutable-per-date guard, and returns 0 — a *success* that silently
+    collected nothing. That is exactly how the provider token's absence broke
+    the Mapillary arm, so it is asserted the same way: both artifacts, both
+    catalog rows, and proof the second run actually queried.
+    """
+    data_dir = _setup(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        collect,
+        "fetch_street_edges",
+        lambda *a, **k: _edges_for_network(k.get("network_type", "drive")),
+    )
+    monkeypatch.setenv("GMAPS_STREETS_API_KEY", "TESTKEY")
+    calls = {"n": 0}
+
+    async def fake_fetch(lat, lon, api_key, session, timeout, limiter=None):
+        calls["n"] += 1
+        return _ok_google(lat, lon)
+
+    monkeypatch.setattr(dg, "fetch_gsv_pano_metadata_async", fake_fetch)
+
+    assert collect.run_collect(_args(data_dir)) == 0
+    after_drive = calls["n"]
+    assert collect.run_collect(_args(data_dir, **{"network-type": "all_public"})) == 0
+    # The broad walk really ran: it queried again, over a larger network.
+    assert calls["n"] > after_drive
+
+    drive_csv = f"{CITY_ID}_width_200_height_200_step_20_streetwalk_sp15_{RUN_DATE}.csv.gz"
+    broad_csv = (
+        f"{CITY_ID}_width_200_height_200_step_20_streetwalk_allpublic_sp15_{RUN_DATE}.csv.gz"
+    )
+    assert drive_csv != broad_csv
+    for name in (drive_csv, broad_csv):
+        assert os.path.exists(os.path.join(data_dir, name)), f"{name} missing"
+        cov = name[: -len(".csv.gz")] + "_coverage.json.gz"
+        assert os.path.exists(os.path.join(data_dir, cov)), f"{cov} missing"
+
+    conn = db.connect(db.get_default_db_path(data_dir))
+    rows = conn.execute(
+        "SELECT network_type, csv_filename, edges_total FROM street_walks ORDER BY network_type"
+    ).fetchall()
+    assert [r["network_type"] for r in rows] == ["all_public", "drive"]
+    assert rows[0]["csv_filename"] != rows[1]["csv_filename"]
+    # The broad walk covers strictly more edges than the drive one.
+    assert rows[0]["edges_total"] > rows[1]["edges_total"]
+    # Each series is independently addressable.
+    assert db.get_latest_street_walk(conn, CITY_ID)["network_type"] == "drive"
+    assert (
+        db.get_latest_street_walk(conn, CITY_ID, "gsv", "all_public")["csv_filename"] == broad_csv
+    )
+    conn.close()
+
+
+def test_broad_walk_reports_footway_and_alley_buckets(tmp_path, monkeypatch):
+    """
+    The point of walking a broad network: the by-type breakdown must separate
+    park paths and back streets from roads, or the artifact can't answer
+    "how does path coverage compare to road coverage?".
+    """
+    data_dir = _setup(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        collect,
+        "fetch_street_edges",
+        lambda *a, **k: _edges_for_network(k.get("network_type", "drive")),
+    )
+    monkeypatch.setenv("GMAPS_STREETS_API_KEY", "TESTKEY")
+
+    async def fake_fetch(lat, lon, api_key, session, timeout, limiter=None):
+        return _ok_google(lat, lon)
+
+    monkeypatch.setattr(dg, "fetch_gsv_pano_metadata_async", fake_fetch)
+    assert collect.run_collect(_args(data_dir, **{"network-type": "all_public"})) == 0
+
+    cov = (
+        f"{CITY_ID}_width_200_height_200_step_20_streetwalk_allpublic_sp15_"
+        f"{RUN_DATE}_coverage.json.gz"
+    )
+    with gzip.open(os.path.join(data_dir, cov), "rt") as fh:
+        gj = json.load(fh)
+    meta = gj["properties"]["metadata"]
+    # The network type is recorded, so a reader can't mistake a drive
+    # artifact's missing footways for a city that has none.
+    assert meta["network_type"] == "all_public"
+    by_type = meta["coverage_by_highway"]
+    assert "footway" in by_type
+    # `service=alley` is split out from generic service roads.
+    assert "alley" in by_type
+    assert "residential" in by_type
+    buckets = {f["properties"]["highway"] for f in gj["features"]}
+    assert {"residential", "service", "footway", "alley"} == buckets

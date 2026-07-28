@@ -78,6 +78,13 @@ class ProviderConfig:
     # on-street sample spacing the road walk collects at.
     max_requests_per_minute: int | None = None
     spacing_m: int = 15
+    # Which OSM network the road walk covers. 'drive' (motorized public roads)
+    # is the scheduled default; 'all_public' additionally walks alleys,
+    # footways, park paths, cycleways and steps, which is a substantially
+    # larger network — see _BROAD_NETWORK_MULTIPLIER. Each type is its own walk
+    # series (own artifacts, own catalog rows, own cadence), so changing this
+    # starts a new series rather than continuing the existing one.
+    network_type: str = "drive"
 
 
 @dataclass
@@ -190,6 +197,7 @@ def load_scheduler_config(path: str | None = None) -> SchedulerConfig:
                 daily_request_budget=p.get("daily_request_budget", 250_000),
                 max_requests_per_minute=p.get("max_requests_per_minute"),
                 spacing_m=p.get("spacing_m", 15),
+                network_type=p.get("network_type", "drive"),
             )
 
     return SchedulerConfig(
@@ -316,7 +324,25 @@ def plan_connection_limit(
 _STREET_KM_PER_KM2 = 7.45
 
 
-def estimate_street_samples(conn, city: db.CityRow, spacing_m: int) -> int:
+# Multiplier on the drive-calibrated street-density constant for broader OSM
+# networks, which add footways, paths, cycleways, steps, tracks and every
+# service road (alleys, driveways, parking aisles). Measured on Corvallis at
+# 15 m: drive 2,591 edges / 25,555 samples vs all_public 30,643 edges / 83,928
+# samples — a 3.3x sample ratio (the edge ratio is far higher, 11.8x, because
+# broad-network edges are much shorter). Rounded UP from that, because like
+# _STREET_KM_PER_KM2 this must over-estimate so the budget guard defers a city
+# rather than overrunning the channel.
+#
+# Only ever applied to the last-resort area proxy. The frozen-network path above
+# already errs high for broad networks on its own (its 4.2 samples-per-edge
+# ratio is drive-calibrated, and broad networks run ~2.7), and once a city has
+# one walk of that type the exact prior-walk count takes over entirely.
+_BROAD_NETWORK_MULTIPLIER = 4.0
+
+
+def estimate_street_samples(
+    conn, city: db.CityRow, spacing_m: int, network_type: str = "drive"
+) -> int:
     """
     Estimated on-street sample points for a road walk, WITHOUT touching OSM.
 
@@ -325,16 +351,22 @@ def estimate_street_samples(conn, city: db.CityRow, spacing_m: int) -> int:
     due city while merely planning a night's work. Precedence, most to least
     trustworthy:
 
-    1. This city's last road walk — exact sample count, rescaled if the
-       configured spacing changed.
-    2. Its frozen OSM network's edge count (#103) × the observed samples-per-
+    1. This city's last road walk OF THE SAME NETWORK TYPE — exact sample count,
+       rescaled if the configured spacing changed.
+    2. Its frozen OSM network of that type (#103) × the observed samples-per-
        edge ratio at that spacing.
-    3. Grid area × a street-density constant.
+    3. Grid area × a street-density constant, scaled up for broad networks.
+
+    Every step filters on network_type. A 'drive' walk and an 'all_public' walk
+    of one city are different amounts of work — Seattle's drive network is
+    59,218 edges, its all_public network far more — so reusing one to plan the
+    other would badly misbudget the night.
 
     Args:
         conn: open catalog connection.
         city: the city row (frozen grid geometry).
         spacing_m: along-edge sample spacing the walk will use.
+        network_type: osmnx network type the walk will use.
 
     Returns:
         Estimated number of sample points (== GSV requests; Mapillary pays
@@ -344,30 +376,40 @@ def estimate_street_samples(conn, city: db.CityRow, spacing_m: int) -> int:
 
     prior = conn.execute(
         """SELECT sample_points, spacing_m FROM street_walks
-           WHERE city_id = ? AND sample_points IS NOT NULL AND spacing_m > 0
+           WHERE city_id = ? AND network_type = ?
+             AND sample_points IS NOT NULL AND spacing_m > 0
            ORDER BY run_date DESC LIMIT 1""",
-        (city.city_id,),
+        (city.city_id, network_type),
     ).fetchone()
     if prior:
         # Samples scale inversely with spacing along a fixed network length.
         return max(1, int(prior["sample_points"] * (prior["spacing_m"] / spacing)))
 
     network = conn.execute(
-        "SELECT edge_count FROM street_networks WHERE city_id = ? ORDER BY network_id DESC LIMIT 1",
-        (city.city_id,),
+        """SELECT edge_count FROM street_networks
+           WHERE city_id = ? AND network_type = ?
+           ORDER BY network_id DESC LIMIT 1""",
+        (city.city_id, network_type),
     ).fetchone()
     if network and network["edge_count"]:
         # Seattle: 59,218 graph edges → 247k samples at 15 m ≈ 4.2 samples per
-        # edge per 15 m of spacing.
+        # edge per 15 m of spacing. The ratio is a property of edge geometry
+        # (mean edge length), not of the filter, so it carries across types.
         return max(1, int(network["edge_count"] * 4.2 * (15.0 / spacing)))
 
     area_km2 = (city.grid_width_m / 1000.0) * (city.grid_height_m / 1000.0)
     street_km = area_km2 * _STREET_KM_PER_KM2
+    if network_type != "drive":
+        street_km *= _BROAD_NETWORK_MULTIPLIER
     return max(1, int(street_km * 1000.0 / spacing))
 
 
 def estimate_requests(
-    city: db.CityRow, provider: str = "gsv", conn=None, spacing_m: int = 15
+    city: db.CityRow,
+    provider: str = "gsv",
+    conn=None,
+    spacing_m: int = 15,
+    network_type: str = "drive",
 ) -> int:
     """
     Estimated API requests for one collection.
@@ -389,8 +431,11 @@ def estimate_requests(
     if provider == "gsv_streets":
         if conn is None:
             area_km2 = (city.grid_width_m / 1000.0) * (city.grid_height_m / 1000.0)
-            return max(1, int(area_km2 * _STREET_KM_PER_KM2 * 1000.0 / max(1, spacing_m)))
-        return estimate_street_samples(conn, city, spacing_m)
+            street_km = area_km2 * _STREET_KM_PER_KM2
+            if network_type != "drive":
+                street_km *= _BROAD_NETWORK_MULTIPLIER
+            return max(1, int(street_km * 1000.0 / max(1, spacing_m)))
+        return estimate_street_samples(conn, city, spacing_m, network_type)
     return (city.grid_width_m // city.step_m + 1) * (city.grid_height_m // city.step_m + 1)
 
 
@@ -437,8 +482,11 @@ def city_timeout_seconds(cfg: SchedulerConfig, city: db.CityRow, provider: str, 
     if rate <= 0:
         return floor
     spacing = pc.spacing_m if pc else 15
+    network_type = pc.network_type if pc else "drive"
     effective_rate = rate * _ACHIEVED_RATE_FRACTION
-    estimated = estimate_requests(city, provider, conn=conn, spacing_m=spacing)
+    estimated = estimate_requests(
+        city, provider, conn=conn, spacing_m=spacing, network_type=network_type
+    )
     paced_seconds = estimated / effective_rate * 60.0
     return int(max(floor, paced_seconds * _TIMEOUT_HEADROOM + _TIMEOUT_FIXED_SLACK_S))
 
@@ -655,6 +703,12 @@ def _street_collect_cmd(
         cfg.db_path,
         "--spacing",
         str(pc.spacing_m),
+        # Passed explicitly rather than relying on the collector's own default:
+        # each network type is a separate walk series, so the channel's
+        # configured type must be the one that lands in the artifact name and
+        # the catalog row.
+        "--network-type",
+        pc.network_type,
         "--connection-limit",
         str(conn_limit),
         "--timeout",
@@ -699,8 +753,10 @@ def _run_one_city(
 
     if is_street_channel(provider):
         cmd = _street_collect_cmd(cfg, city, today, provider, conn_limit, daily_budget)
-        spacing = (cfg.providers or {}).get(provider, ProviderConfig()).spacing_m
-        estimated = estimate_requests(city, provider, conn=conn, spacing_m=spacing)
+        pc = (cfg.providers or {}).get(provider) or ProviderConfig()
+        estimated = estimate_requests(
+            city, provider, conn=conn, spacing_m=pc.spacing_m, network_type=pc.network_type
+        )
         logger.info(
             f"Collecting streets for {city.city_id} [{provider}] "
             f"(~{estimated:,} requests estimated)"
@@ -877,7 +933,11 @@ def cmd_run_due(
         for city in due[:day_cap]:
             for provider in providers_for_city[city.city_id]:
                 est = estimate_requests(
-                    city, provider, conn=conn, spacing_m=cfg.providers[provider].spacing_m
+                    city,
+                    provider,
+                    conn=conn,
+                    spacing_m=cfg.providers[provider].spacing_m,
+                    network_type=cfg.providers[provider].network_type,
                 )
                 fits = "ok" if est <= budget_left[provider] else "OVER BUDGET (deferred)"
                 print(f"  {city.city_id:60s} {provider:16s} ~{est:>9,} req  {fits}")
@@ -894,7 +954,11 @@ def cmd_run_due(
         for provider in providers_for_city[city.city_id]:
             budget = cfg.providers[provider].daily_request_budget
             est = estimate_requests(
-                city, provider, conn=conn, spacing_m=cfg.providers[provider].spacing_m
+                city,
+                provider,
+                conn=conn,
+                spacing_m=cfg.providers[provider].spacing_m,
+                network_type=cfg.providers[provider].network_type,
             )
             if est > budget:
                 # This city can NEVER fit the daily budget — skipping (not

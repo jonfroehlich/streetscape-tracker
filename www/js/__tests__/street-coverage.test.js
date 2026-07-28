@@ -17,6 +17,8 @@ const {
   styleForMode,
   streetTypeColor,
   streetTypeOrder,
+  isNonMotorizedType,
+  STREET_TYPE_COLORS,
   withStreetAlpha,
   fractionColor,
   normalizeStreetArtifact,
@@ -97,9 +99,51 @@ test("streetTypeColor: unlisted classes fold into the neutral minor color", () =
   assert.equal(streetTypeColor("other"), STREET_TYPE_MINOR_COLOR);
 });
 
+test("streetTypeColor: service subtypes inherit the service hue, not a new one", () => {
+  // alley/driveway/parking_aisle are all highway=service; the analyzer splits
+  // them, but they are one visual family. The palette must stay at 8 hues.
+  for (const subtype of ["alley", "driveway", "parking_aisle"]) {
+    assert.equal(streetTypeColor(subtype), STREET_TYPE_COLORS.service);
+  }
+  assert.equal(Object.keys(STREET_TYPE_COLORS).length, 8);
+});
+
+test("streetTypeColor: non-motorized classes take the minor gray, no new hue", () => {
+  for (const cls of ["footway", "path", "pedestrian", "cycleway", "steps", "track", "bridleway"]) {
+    assert.equal(streetTypeColor(cls), STREET_TYPE_MINOR_COLOR);
+    assert.ok(isNonMotorizedType(cls));
+  }
+  assert.ok(!isNonMotorizedType("residential"));
+  assert.ok(!isNonMotorizedType("alley")); // an alley is a drivable back street
+});
+
+test("styleStreetByType: non-motorized ways draw thinner than roads", () => {
+  // Gray is shared with living_street/other, so thickness is what separates a
+  // footpath from an unhued road class. Dash and opacity are already taken by
+  // covered/uncovered and the spotlight.
+  const road = styleStreetByType({ properties: { covered: true, highway: "residential" } });
+  const foot = styleStreetByType({ properties: { covered: true, highway: "footway" } });
+  assert.ok(foot.weight < road.weight);
+  assert.equal(foot.dashArray, undefined); // still reads as covered
+
+  const footUncovered = styleStreetByType({ properties: { covered: false, highway: "footway" } });
+  const roadUncovered = styleStreetByType({ properties: { covered: false, highway: "residential" } });
+  assert.ok(footUncovered.weight < roadUncovered.weight);
+  assert.equal(footUncovered.dashArray, "4 4");
+});
+
 test("streetTypeOrder: importance rank, unlisted classes sort last", () => {
   assert.ok(streetTypeOrder("motorway") < streetTypeOrder("residential"));
   assert.ok(streetTypeOrder("residential") < streetTypeOrder("other"));
+});
+
+test("streetTypeOrder: roads, then the service family, then non-motorized", () => {
+  assert.ok(streetTypeOrder("residential") < streetTypeOrder("service"));
+  assert.ok(streetTypeOrder("service") < streetTypeOrder("alley"));
+  assert.ok(streetTypeOrder("alley") < streetTypeOrder("footway"));
+  assert.ok(streetTypeOrder("footway") < streetTypeOrder("bridleway"));
+  // living_street and other stay unlisted and sink below everything.
+  assert.ok(streetTypeOrder("bridleway") < streetTypeOrder("living_street"));
 });
 
 test("styleForMode: dispatches to the right per-mode styler", () => {

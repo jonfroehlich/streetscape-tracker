@@ -858,6 +858,79 @@ def test_street_estimate_falls_back_to_frozen_network_then_area(conn):
     assert estimate_street_samples(conn, city, 15) == int(1000 * 4.2)
 
 
+def test_street_estimate_does_not_reuse_another_network_types_walk(conn):
+    """A drive walk says nothing about how much work an all_public walk is.
+
+    Reusing it would badly under-budget the night (all_public adds every
+    footway, path, cycleway, alley and driveway), so each step of the estimate
+    filters on network type. Falling through to the area proxy is scaled UP for
+    a broad network, deliberately over-estimating so the guard defers rather
+    than overruns.
+    """
+    from streetscape_metadata_tracker.scheduler import estimate_street_samples
+
+    cid = _register(conn, "Bend", width=5000, height=5000, step=20)
+    city = db.resolve_city(conn, cid)
+    db.register_street_walk(
+        conn,
+        city_id=cid,
+        run_date=date(2026, 7, 1),
+        csv_filename="w_drive.csv.gz",
+        network_type="drive",
+        spacing_m=15.0,
+        sample_points=1000,
+    )
+    conn.execute(
+        """INSERT INTO street_networks (city_id, network_type, graphml_filename,
+           node_count, edge_count, fetched_at)
+           VALUES (?, 'drive', 'x.graphml', 100, 1000, '2026-07-01T00:00:00+00:00')""",
+        (cid,),
+    )
+    conn.commit()
+
+    assert estimate_street_samples(conn, city, 15, "drive") == 1000
+    broad = estimate_street_samples(conn, city, 15, "all_public")
+    assert broad != 1000  # neither the drive walk nor the drive network leaked
+    assert broad > 1000  # and the broad fallback over-estimates, never under
+
+    # Once the city has its OWN broad walk, that exact count takes over.
+    db.register_street_walk(
+        conn,
+        city_id=cid,
+        run_date=date(2026, 7, 2),
+        csv_filename="w_broad.csv.gz",
+        network_type="all_public",
+        spacing_m=15.0,
+        sample_points=2600,
+    )
+    assert estimate_street_samples(conn, city, 15, "all_public") == 2600
+    assert estimate_street_samples(conn, city, 15, "drive") == 1000
+
+
+def test_street_channel_passes_its_network_type_to_the_collector(conn):
+    """Each network type is its own series, so the configured type must reach
+    the collector — otherwise the channel silently walks 'drive' forever."""
+    from streetscape_metadata_tracker.scheduler import ProviderConfig, _street_collect_cmd
+
+    cid = _register(conn, "Bend", width=5000, height=5000, step=20)
+    city = db.resolve_city(conn, cid)
+    cfg = SchedulerConfig(providers={"gsv_streets": ProviderConfig(network_type="all_public")})
+    cmd = _street_collect_cmd(cfg, city, date(2026, 7, 8), "gsv_streets", 10, 100)
+    assert "--network-type" in cmd
+    assert cmd[cmd.index("--network-type") + 1] == "all_public"
+
+    # Default config still walks the drive network.
+    default_cmd = _street_collect_cmd(
+        SchedulerConfig(providers={"gsv_streets": ProviderConfig()}),
+        city,
+        date(2026, 7, 8),
+        "gsv_streets",
+        10,
+        100,
+    )
+    assert default_cmd[default_cmd.index("--network-type") + 1] == "drive"
+
+
 def test_mapillary_street_estimate_is_tiles_not_samples(conn):
     cid = _register(conn, "Bend", width=5000, height=5000, step=20)
     city = db.resolve_city(conn, cid)

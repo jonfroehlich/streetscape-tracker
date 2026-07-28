@@ -359,22 +359,52 @@ def streets_filename_for_run(csv_filename: str) -> str:
 # like the history/streets contracts. The derived per-edge coverage GeoJSON is a
 # sibling '..._coverage.json.gz'.
 #
-# A walk is per (city, provider, date) — both providers walk the SAME sample
-# points, so both can be collected the same night — and the artifacts therefore
-# carry a provider token on exactly the run-filename convention: it sits after
-# '_step_{S}', and gsv emits none, so every GSV walk name ever published is
-# unchanged.
+# A walk is per (city, provider, network type, date) — both providers walk the
+# SAME sample points, so both can be collected the same night — and the
+# artifacts therefore carry a provider token on exactly the run-filename
+# convention: it sits after '_step_{S}', and gsv emits none, so every GSV walk
+# name ever published is unchanged.
 #
-#   gsv:       {city}_width_W_height_H_step_S_streetwalk_sp15_{DATE}.csv.gz
-#   mapillary: {city}_width_W_height_H_step_S_mapillary_streetwalk_sp15_{DATE}.csv.gz
+# The OSM network type is a property of the WALK, not of the city geometry (the
+# same frozen grid bbox yields a 'drive' network and a much larger 'all_public'
+# one), so its token sits beside the spacing rather than in the provider slot.
+# 'drive' emits no token for the same backwards-compatibility reason gsv emits
+# none. Without it, walking a second network type on a date already walked would
+# generate a byte-identical filename, and the collector's immutable-snapshot
+# guard would skip it as a silent no-op reported as success — precisely the bug
+# the provider token was added to fix.
+#
+#   gsv / drive:            {city}_width_W_height_H_step_S_streetwalk_sp15_{DATE}.csv.gz
+#   gsv / all_public:       {city}_width_W_height_H_step_S_streetwalk_allpublic_sp15_{DATE}.csv.gz
+#   mapillary / drive:      {city}_width_W_height_H_step_S_mapillary_streetwalk_sp15_{DATE}.csv.gz
+#   mapillary / all_public: {city}_width_W_height_H_step_S_mapillary_streetwalk_allpublic_sp15_{DATE}.csv.gz
 
 STREETWALK_MARKER = "streetwalk"
+
+DEFAULT_NETWORK_TYPE = "drive"
+
+# osmnx network type -> filename token. Underscore is the field separator in
+# this naming scheme, so tokens strip it ('all_public' -> 'allpublic'). The
+# default type maps to the empty string and emits nothing.
+STREETWALK_NETWORK_TOKENS = {
+    DEFAULT_NETWORK_TYPE: "",
+    "all_public": "allpublic",
+    "all": "all",
+    "walk": "walk",
+    "bike": "bike",
+    "drive_service": "driveservice",
+}
+_STREETWALK_TOKEN_TO_NETWORK = {
+    token: network for network, token in STREETWALK_NETWORK_TOKENS.items() if token
+}
 
 # Spelled as an explicit alternation of the tokenized providers rather than
 # FILENAME_RE's `[a-z]+`: a wildcard here would first try to swallow the literal
 # 'streetwalk' marker and only recover by backtracking, which is needlessly
-# subtle for a naming contract.
+# subtle for a naming contract. Same reasoning for the network alternation,
+# which is additionally sorted longest-first so 'all' cannot shadow 'allpublic'.
 _STREETWALK_PROVIDER_ALT = "|".join(p for p in KNOWN_PROVIDERS if p != DEFAULT_PROVIDER)
+_STREETWALK_NETWORK_ALT = "|".join(sorted(_STREETWALK_TOKEN_TO_NETWORK, key=len, reverse=True))
 
 _STREETWALK_FILENAME_RE = re.compile(
     r"^(?P<slug>.+?)"
@@ -382,7 +412,8 @@ _STREETWALK_FILENAME_RE = re.compile(
     r"_height_(?P<h>\d+)"
     r"_step_(?P<s>\d+)"
     rf"(?:_(?P<provider>{_STREETWALK_PROVIDER_ALT}))?"
-    r"_" + STREETWALK_MARKER + r"_sp(?P<spacing>\d+)_"
+    r"_" + STREETWALK_MARKER + rf"(?:_(?P<network>{_STREETWALK_NETWORK_ALT}))?"
+    r"_sp(?P<spacing>\d+)_"
     r"(?P<date>\d{4}-\d{2}-\d{2})$"
 )
 
@@ -399,6 +430,7 @@ class ParsedStreetwalkFilename:
     spacing_meters: int
     run_date: date
     provider: str = DEFAULT_PROVIDER  # 'gsv' when no token in the filename
+    network_type: str = DEFAULT_NETWORK_TYPE  # 'drive' when no token in the filename
 
 
 def generate_streetwalk_filename(
@@ -409,14 +441,16 @@ def generate_streetwalk_filename(
     spacing_m: float,
     run_date: date,
     provider: str = DEFAULT_PROVIDER,
+    network_type: str = DEFAULT_NETWORK_TYPE,
 ) -> str:
     """
     Base filename (no extension) for a road-walk collection snapshot.
 
     The grid ``width/height/step`` identify the city's frozen geometry (and thus
-    its frozen OSM network, whose bbox is derived from that geometry); ``sp{N}``
-    is the along-edge sample spacing in metres — the road-walk analogue of the
-    grid step.
+    the bbox its frozen OSM networks are derived from); ``sp{N}`` is the
+    along-edge sample spacing in metres — the road-walk analogue of the grid
+    step — and the optional network token says WHICH network was walked, since
+    one bbox yields a small 'drive' network and a much larger 'all_public' one.
 
     Args:
         city_id: canonical sanitized city slug (see db.register_city)
@@ -427,6 +461,10 @@ def generate_streetwalk_filename(
             points, so both can be collected on the same night — the token is
             what keeps their artifacts apart. 'gsv' emits no token, so GSV walk
             filenames match the pre-provider convention exactly.
+        network_type: osmnx network type walked (see STREETWALK_NETWORK_TOKENS).
+            'drive' emits no token, so every pre-existing walk filename is
+            unchanged; any other type must be tokenized or a same-date walk of a
+            second network would collide with the first and be skipped.
 
     Examples:
         >>> from datetime import date
@@ -434,14 +472,21 @@ def generate_streetwalk_filename(
         'bend--oregon--united-states_width_5000_height_5000_step_20_streetwalk_sp15_2026-07-08'
         >>> generate_streetwalk_filename("bend--or", 5000, 5000, 20, 15, date(2026, 7, 8), provider='mapillary')
         'bend--or_width_5000_height_5000_step_20_mapillary_streetwalk_sp15_2026-07-08'
+        >>> generate_streetwalk_filename("bend--or", 5000, 5000, 20, 15, date(2026, 7, 8), network_type='all_public')
+        'bend--or_width_5000_height_5000_step_20_streetwalk_allpublic_sp15_2026-07-08'
     """
     if provider not in KNOWN_PROVIDERS:
         raise ValueError(f"Unknown provider {provider!r} (known: {', '.join(KNOWN_PROVIDERS)})")
+    if network_type not in STREETWALK_NETWORK_TOKENS:
+        known = ", ".join(STREETWALK_NETWORK_TOKENS)
+        raise ValueError(f"Unknown network type {network_type!r} (known: {known})")
     provider_token = "" if provider == DEFAULT_PROVIDER else f"_{provider}"
+    token = STREETWALK_NETWORK_TOKENS[network_type]
+    network_token = f"_{token}" if token else ""
     return (
         f"{city_id}_width_{int(grid_width)}_height_{int(grid_height)}"
         f"_step_{int(step_length)}{provider_token}"
-        f"_{STREETWALK_MARKER}_sp{int(spacing_m)}_{run_date.isoformat()}"
+        f"_{STREETWALK_MARKER}{network_token}_sp{int(spacing_m)}_{run_date.isoformat()}"
     )
 
 
@@ -451,15 +496,19 @@ def parse_streetwalk_filename(filename: str) -> ParsedStreetwalkFilename:
 
     Raises ValueError if the name is not a streetwalk file (including normal run
     files, which never carry the '_streetwalk_' marker). A name with no provider
-    token is GSV, as everywhere else in the naming contract.
+    token is GSV and one with no network token is 'drive', as everywhere else in
+    the naming contract.
 
     Examples:
         >>> p = parse_streetwalk_filename("bend--or_width_5000_height_5000_step_20_streetwalk_sp15_2026-07-08.csv.gz")
-        >>> (p.step_meters, p.spacing_meters, p.run_date.isoformat(), p.provider)
-        (20, 15, '2026-07-08', 'gsv')
+        >>> (p.step_meters, p.spacing_meters, p.run_date.isoformat(), p.provider, p.network_type)
+        (20, 15, '2026-07-08', 'gsv', 'drive')
         >>> p = parse_streetwalk_filename("bend--or_width_5000_height_5000_step_20_mapillary_streetwalk_sp15_2026-07-08.csv.gz")
         >>> (p.slug, p.provider)
         ('bend--or', 'mapillary')
+        >>> p = parse_streetwalk_filename("bend--or_width_5000_height_5000_step_20_streetwalk_allpublic_sp15_2026-07-08.csv.gz")
+        >>> (p.provider, p.network_type)
+        ('gsv', 'all_public')
     """
     base = os.path.basename(filename)
     for ext in _KNOWN_EXTENSIONS:
@@ -479,6 +528,7 @@ def parse_streetwalk_filename(filename: str) -> ParsedStreetwalkFilename:
         spacing_meters=int(match.group("spacing")),
         run_date=date.fromisoformat(match.group("date")),
         provider=match.group("provider") or DEFAULT_PROVIDER,
+        network_type=_STREETWALK_TOKEN_TO_NETWORK.get(match.group("network"), DEFAULT_NETWORK_TYPE),
     )
 
 
