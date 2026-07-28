@@ -37,9 +37,16 @@ daily_request_budget = 40000
 # a nightly runtime knob rather than a cost limit (metadata is free). Paced by
 # its own key's quota, NOT [download].max_requests_per_minute — the streets key
 # is a fresh key at Google's ~30,000/min default, so 24,000 is ~80% headroom.
+#
+# Sizing: the whole frame is ~133M on-street samples at 15 m, so a full pass at
+# 20 cities/night averages ~1.5M/night. The ceiling is 2x that because nightly
+# demand is lumpy, not average — a single Berlin-scale city is ~850k, and three
+# of them landing on one night would exhaust a tighter budget and defer the rest
+# (graceful, but it stalls the first pass). The requests are free; only wall
+# clock is spent, ~1 h/night at the pacing above.
 [providers.gsv_streets]
 enabled = true
-daily_request_budget = 2000000
+daily_request_budget = 3000000
 max_requests_per_minute = 24000
 spacing_m = 15
 

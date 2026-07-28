@@ -62,14 +62,17 @@ daily_request_budget = 40000
 # crawl can never exhaust the grid collectors' quota.
 #
 # GSV: one metadata request per on-street sample point. Cycling the full
-# catalog at 15 m spacing is on the order of 1M requests/night averaged over a
-# 90-day cycle (Seattle alone is ~247k), so the ceiling below is a nightly
-# runtime knob, not a cost limit — metadata requests are free of charge. The
-# real limit is the streets key's own per-minute quota (a fresh key resets to
-# Google's default ~30,000/min), paced client-side at ~80% below.
+# catalog at 15 m spacing is on the order of 1.5M requests/night averaged over a
+# 90-day cycle (Seattle alone is ~247k, Berlin ~850k), so the ceiling below is a
+# nightly runtime knob, not a cost limit — metadata requests are free of charge.
+# It is set at ~2x the average because nightly demand is lumpy: a few large
+# cities landing together would otherwise exhaust it and defer the rest, which
+# is graceful but stalls the first pass through the catalog. The real limit is
+# the streets key's own per-minute quota (a fresh key resets to Google's default
+# ~30,000/min), paced client-side at ~80% below.
 [providers.gsv_streets]
 enabled = true
-daily_request_budget = 2000000
+daily_request_budget = 3000000
 max_requests_per_minute = 24000
 # Along-edge sample spacing in metres. 15 m is the validated default (a
 # match-distance sweep moved coverage by ~1 pp); raising it cuts requests

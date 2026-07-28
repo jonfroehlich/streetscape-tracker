@@ -26,6 +26,10 @@
 #   ./deploy_makelab1.sh --dry-run       # show what would change, touch nothing
 #   ./deploy_makelab1.sh --yes           # skip the confirmation prompt
 #   ./deploy_makelab1.sh --skip-pull     # just re-publish the site (no git pull)
+#   ./deploy_makelab1.sh --force-during-run  # pull even while the nightly is collecting
+#
+# Refuses to pull code while streetscape-tracker.service is running (see the
+# deploy race guard below); --skip-pull and --dry-run are always allowed.
 #
 # Environment overrides:
 #   STREETSCAPE_DOCROOT   public docroot (default: /cse/web/research/makelab/public/streetscape-tracker)
@@ -39,14 +43,16 @@ DOCROOT="${STREETSCAPE_DOCROOT:-/cse/web/research/makelab/public/streetscape-tra
 DRY_RUN=""
 ASSUME_YES=""
 SKIP_PULL=""
+FORCE_DURING_RUN=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run|-n) DRY_RUN="--dry-run"; shift ;;
     --yes|-y)     ASSUME_YES="1"; shift ;;
     --skip-pull)  SKIP_PULL="1"; shift ;;
+    --force-during-run) FORCE_DURING_RUN="1"; shift ;;
     --help|-h)
-      sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,35p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *) echo "Error: unknown option: $1 (try --help)"; exit 1 ;;
@@ -66,6 +72,27 @@ if [[ ! -d "$DOCROOT" ]]; then
   exit 1
 fi
 command -v rsync >/dev/null || { echo "Error: rsync not installed."; exit 1; }
+
+# ──────────────────────────────────────────────
+# Deploy race guard
+# ──────────────────────────────────────────────
+# A fast-forward that lands new code — especially a catalog schema migration —
+# under a RUNNING nightly collector kills that collector in its tail. On
+# 2026-07-28 a mid-crawl pull migrated street_walks v8->v9 while a Berlin road
+# walk was still running: the crawl finished and wrote both artifacts, then died
+# registering them, stranding 611k requests' worth of work. Only code-changing
+# runs are blocked — a site-only re-publish (--skip-pull) is always safe.
+if [[ -z "$SKIP_PULL" && -z "$DRY_RUN" && -z "$FORCE_DURING_RUN" ]]; then
+  if command -v systemctl >/dev/null 2>&1 && \
+     systemctl --user is-active --quiet streetscape-tracker.service 2>/dev/null; then
+    echo "Error: streetscape-tracker.service is RUNNING — refusing to pull code under it."
+    echo "  A mid-run pull can strand a finished collection in its catalog tail."
+    echo "  Options: wait for it to finish (systemctl --user status streetscape-tracker.service),"
+    echo "           re-run with --skip-pull to publish the site only,"
+    echo "           or --force-during-run if you accept the risk."
+    exit 1
+  fi
+fi
 
 echo "═══════════════════════════════════════════"
 echo " Streetscape Tracker: code + website deploy"

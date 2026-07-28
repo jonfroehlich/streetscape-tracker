@@ -13,11 +13,14 @@ Usage (--config accepted on either side of the subcommand):
     python -m streetscape_metadata_tracker.scheduler [--config PATH] assign
     python -m streetscape_metadata_tracker.scheduler [--config PATH] run-due [--dry-run] [--limit N]
     python -m streetscape_metadata_tracker.scheduler [--config PATH] regenerate-aggregate [--publish]
+    python -m streetscape_metadata_tracker.scheduler [--config PATH] reconcile-walks [--date D] [--dry-run]
 
 Config: TOML (see config/scheduler.toml). Requires Python 3.11+ (tomllib).
 """
 
 import argparse
+import gzip
+import json
 import logging
 import logging.handlers
 import os
@@ -42,7 +45,13 @@ from .json_summarizer import (
     generate_streetwalk_manifest,
     regenerate_run_json,
 )
-from .naming import DEFAULT_NETWORK_TYPE, KNOWN_PROVIDERS, STREETWALK_NETWORK_TOKENS
+from .naming import (
+    DEFAULT_NETWORK_TYPE,
+    KNOWN_PROVIDERS,
+    STREETWALK_NETWORK_TOKENS,
+    generate_streetwalk_filename,
+    streetwalk_coverage_filename,
+)
 
 # Isolated street-coverage collection channels (issue #99). These ARE scheduled
 # channels — each cycles the catalog exactly like a grid provider, with its own
@@ -681,6 +690,81 @@ def cmd_regenerate(cfg: SchedulerConfig, publish: bool = False) -> int:
     return 0
 
 
+def cmd_reconcile_walks(
+    cfg: SchedulerConfig, target_date: date | None = None, dry_run: bool = False
+) -> int:
+    """
+    Catalog road walks that finished but were never registered.
+
+    ``run-due`` now reconciles these inline, so this is the operator handle for
+    orphans it couldn't catch: a walk collected by the manual CLI, one left by a
+    nightly run that predates the inline path, or one whose scheduler process
+    itself died. Checks each enabled city's expected artifact names for the date
+    and salvages any whose coverage file is on disk with no catalog row —
+    stat-per-candidate rather than a glob, since data/ holds thousands of files.
+    """
+    conn = db.connect(cfg.db_path)
+    today = target_date or datetime.now(UTC).date()
+    channels = [p for p in cfg.enabled_providers() if is_street_channel(p)]
+    if not channels:
+        print("No street channels enabled; nothing to reconcile.")
+        return 0
+
+    cities = db.get_all_cities(conn, enabled_only=True)
+    reconciled = 0
+    for channel in channels:
+        provider = STREET_CHANNELS[channel]
+        pc = (cfg.providers or {}).get(channel) or ProviderConfig()
+        for city in cities:
+            existing = conn.execute(
+                "SELECT 1 FROM street_walks WHERE city_id = ? AND provider = ? "
+                "AND network_type = ? AND run_date = ?",
+                (city.city_id, provider, pc.network_type, today.isoformat()),
+            ).fetchone()
+            if existing:
+                continue
+            if dry_run:
+                stem = generate_streetwalk_filename(
+                    city.city_id,
+                    city.grid_width_m,
+                    city.grid_height_m,
+                    city.step_m,
+                    pc.spacing_m,
+                    today,
+                    provider=provider,
+                    network_type=pc.network_type,
+                )
+                coverage_name = streetwalk_coverage_filename(stem + ".csv.gz")
+                if (Path(cfg.data_dir) / coverage_name).exists():
+                    print(f"  would reconcile {city.city_id} [{channel}] from {coverage_name}")
+                    reconciled += 1
+                continue
+            # Manifest is rebuilt once at the end, not per salvaged walk.
+            if _reconcile_orphaned_walk(conn, cfg, city, channel, today, regenerate_manifest=False):
+                # Clear the failure that the orphaned walk recorded. Without
+                # this the salvage is cosmetic: the row exists but the channel
+                # still has no last_success_at, so the city stays due and gets
+                # re-crawled anyway — which is the entire cost this avoids.
+                # (run-due's inline path already does this via record_attempt.)
+                db.record_attempt(conn, city.city_id, success=True, provider=channel)
+                reconciled += 1
+
+    if dry_run:
+        print(f"DRY RUN — {reconciled} orphaned walk(s) for {today}.")
+        return 0
+
+    if reconciled:
+        manifest = generate_streetwalk_manifest(conn, cfg.data_dir)
+        print(
+            f"Reconciled {reconciled} orphaned walk(s) for {today}; "
+            f"streetwalks.json.gz now lists {len(manifest['walks'])} walks. "
+            f"Run regenerate-aggregate --publish to publish."
+        )
+    else:
+        print(f"No orphaned walks found for {today}.")
+    return 0
+
+
 def _street_collect_cmd(
     cfg: SchedulerConfig,
     city: db.CityRow,
@@ -875,6 +959,134 @@ def _reconcile_orphaned_run(
     return True
 
 
+def _count_streetwalk_samples(csv_path: Path) -> int | None:
+    """
+    Number of sampled locations in a road-walk snapshot: its data rows.
+
+    The walk writes exactly one row per on-street sample point, so the row count
+    recovers ``sample_points`` — which the artifact itself does not carry and
+    which ``estimate_street_samples`` prefers over every other precedence step
+    when budgeting a later walk of the same city. Counted line-by-line rather
+    than via pandas: the caller may be reconciling a multi-hundred-MB snapshot
+    inside the scheduler's memory-capped cgroup, and only the count is wanted.
+
+    Returns None if the snapshot is missing or unreadable.
+    """
+    try:
+        with gzip.open(csv_path, "rt", encoding="utf-8") as fh:
+            return max(sum(1 for _ in fh) - 1, 0)  # minus the header
+    except (OSError, EOFError, UnicodeDecodeError) as e:
+        logger.warning(f"Could not count samples in {csv_path.name}: {e}")
+        return None
+
+
+def _reconcile_orphaned_walk(
+    conn,
+    cfg: SchedulerConfig,
+    city: db.CityRow,
+    channel: str,
+    today: date,
+    *,
+    regenerate_manifest: bool = True,
+) -> bool:
+    """
+    Salvage a road walk whose subprocess reported failure but which actually
+    finished and left its artifacts on disk.
+
+    The street analogue of ``_reconcile_orphaned_run``, and needed for a
+    stronger reason. A grid run commits ``register_run`` *before* its diff/JSON
+    tail, so only the tail can be lost; a road walk catalogs nothing until the
+    single ``register_street_walk`` call at the very end of ``collect.py``, so
+    ANY failure after the crawl — a DB write racing a schema migration, an OOM
+    kill, a timeout landing in the tail — discards a complete, fully-paid-for
+    crawl. Berlin lost 611k requests exactly that way on 2026-07-28.
+
+    The coverage GeoJSON is self-describing (it carries the same per-edge
+    totals that were about to be cataloged), so the row is rebuilt from the
+    artifact rather than recomputed.
+
+    Returns True if a walk was cataloged from artifacts on disk; False when
+    there is nothing to salvage — a genuine failure the caller records normally.
+    """
+    pc = (cfg.providers or {}).get(channel) or ProviderConfig()
+    provider = STREET_CHANNELS[channel]
+
+    # Rebuild the names the collector would have written, never by hand: the
+    # provider and network tokens are what keep same-night walks apart, and a
+    # hand-built name is how the streetwalk artifacts got silently collided
+    # before (see scripts/repair_streetwalk_names.py).
+    stem = generate_streetwalk_filename(
+        city.city_id,
+        city.grid_width_m,
+        city.grid_height_m,
+        city.step_m,
+        pc.spacing_m,
+        today,
+        provider=provider,
+        network_type=pc.network_type,
+    )
+    csv_name = stem + ".csv.gz"
+    coverage_name = streetwalk_coverage_filename(csv_name)
+    coverage_path = Path(cfg.data_dir) / coverage_name
+    if not coverage_path.exists():
+        return False
+
+    try:
+        with gzip.open(coverage_path, "rt", encoding="utf-8") as fh:
+            geojson = json.load(fh)
+        meta = geojson["properties"]["metadata"]
+        totals = meta["totals"]
+        edges_total = totals["edges"]
+    except (OSError, EOFError, ValueError, KeyError, TypeError) as e:
+        # A truncated or malformed artifact says nothing about coverage and
+        # must not become a catalog row; treat it as the real failure it is.
+        logger.error(
+            f"{city.city_id} [{channel}]: coverage artifact {coverage_name} exists "
+            f"but could not be read ({e}); recording failure"
+        )
+        return False
+
+    sample_points = _count_streetwalk_samples(Path(cfg.data_dir) / csv_name)
+    db.register_street_walk(
+        conn,
+        city_id=city.city_id,
+        run_date=today,
+        csv_filename=csv_name,
+        provider=provider,
+        coverage_filename=coverage_name,
+        # From the channel's config, NOT the artifact: walks written before the
+        # network-type series existed carry no network_type key at all, and the
+        # configured type is what this channel actually asked the collector for.
+        network_type=pc.network_type,
+        spacing_m=meta.get("spacing_m", pc.spacing_m),
+        match_dist_m=meta.get("match_dist_m"),
+        sample_points=sample_points,
+        edges_total=edges_total,
+        edges_fully_covered=totals.get("edges_fully_covered"),
+        mean_edge_coverage=totals.get("mean_edge_coverage"),
+        coverage_pct_by_length=totals.get("coverage_pct_by_length"),
+        coverage_pct_by_length_any=totals.get("coverage_pct_by_length_any"),
+        # GSV issues one metadata request per sample point, so the row count is
+        # the request count. Mapillary's cost is a z14 tile census independent
+        # of the sample count, which the artifacts don't record — leave it NULL
+        # ("not measured") rather than writing a number that isn't its cost.
+        api_requests=sample_points if provider == "gsv" else None,
+        started_at=None,
+        finished_at=datetime.fromtimestamp(coverage_path.stat().st_mtime, UTC).isoformat(),
+    )
+    if regenerate_manifest:
+        # Without this the salvaged walk publishes but stays invisible: the city
+        # page finds streetwalk artifacts only through the sidecar manifest.
+        generate_streetwalk_manifest(conn, cfg.data_dir)
+
+    logger.info(
+        f"{city.city_id} [{channel}]: subprocess reported failure but the walk "
+        f"finished ({edges_total:,} edges, {totals.get('coverage_pct_by_length')}% "
+        f"by length) and was cataloged from {coverage_name}; reconciled as success"
+    )
+    return True
+
+
 def _collect_due(conn, cfg: SchedulerConfig, today: date):
     """
     Due work for today: an ordered city list (stalest-first, gsv's order
@@ -1022,14 +1234,17 @@ def cmd_run_due(
             )
             ran_any = True
             attempted += 1
-            # A subprocess can report failure yet still have cataloged a valid
-            # run (killed in the diff/JSON tail after register_run committed);
-            # salvage it rather than re-spending the whole download next cycle.
-            # Street channels write no `runs` row (they catalog street_walks),
-            # so there is nothing of that shape to reconcile.
-            if not ok and not is_street_channel(provider):
-                if _reconcile_orphaned_run(conn, cfg, city, provider, today):
-                    ok = True
+            # A subprocess can report failure yet still have done the expensive,
+            # budgeted part of its job; salvage that rather than re-spending the
+            # whole crawl next cycle. The two channel kinds fail differently: a
+            # grid run commits its `runs` row before the diff/JSON tail, while a
+            # road walk catalogs nothing until the very end and so is salvaged
+            # from the artifacts it left on disk.
+            if not ok:
+                if is_street_channel(provider):
+                    ok = _reconcile_orphaned_walk(conn, cfg, city, provider, today)
+                else:
+                    ok = _reconcile_orphaned_run(conn, cfg, city, provider, today)
             if ok:
                 succeeded += 1
                 db.record_attempt(conn, city.city_id, success=True, provider=provider)
@@ -1125,6 +1340,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_regen.add_argument(
         "--publish", action="store_true", help="Also rsync data/ to the web server afterward"
     )
+    p_rec = sub.add_parser(
+        "reconcile-walks",
+        help="Catalog road walks that finished but were never registered",
+    )
+    _add_global_flags(p_rec)
+    p_rec.add_argument(
+        "--date", default=None, help="Walk date to scan, YYYY-MM-DD (default: today, UTC)"
+    )
+    p_rec.add_argument(
+        "--dry-run", action="store_true", help="List what would be reconciled; no catalog writes"
+    )
     p_run = sub.add_parser("run-due", help="Collect today's due cities")
     _add_global_flags(p_run)
     p_run.add_argument("--dry-run", action="store_true", help="Print what would run; no downloads")
@@ -1151,6 +1377,9 @@ def main() -> int:
         return cmd_regenerate(cfg, publish=args.publish)
     if args.command == "notify-failure":
         return cmd_notify_failure(cfg)
+    if args.command == "reconcile-walks":
+        target = date.fromisoformat(args.date) if args.date else None
+        return cmd_reconcile_walks(cfg, target_date=target, dry_run=args.dry_run)
     if args.command == "run-due":
         try:
             return cmd_run_due(cfg, dry_run=args.dry_run, limit=args.limit)
