@@ -65,3 +65,65 @@ def test_deploy_dryrun_protects_data_sweeps_junk_excludes_devtooling(tmp_path):
     # The site is flattened to the docroot root.
     assert "index.html" in out
     assert "city.html" in out
+
+
+def _fake_systemctl(tmp_path, state):
+    """A stub `systemctl` earlier on PATH than the real one, reporting the given
+    is-active state. Lets the guard be tested on any host, including one with no
+    systemd at all."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    stub = bindir / "systemctl"
+    stub.write_text(f"#!/usr/bin/env bash\nexit {0 if state == 'active' else 3}\n")
+    stub.chmod(0o755)
+    return str(bindir)
+
+
+def test_deploy_refuses_to_pull_while_the_nightly_collector_is_running(tmp_path):
+    """A fast-forward under a running collector kills it in its catalog tail —
+    on 2026-07-28 that stranded a finished 611k-request Berlin road walk. The
+    deploy must refuse before it pulls or rsyncs anything."""
+    docroot = tmp_path / "docroot"
+    (docroot / "data").mkdir(parents=True)
+    (docroot / "data" / "seattle.csv.gz").write_text("PRECIOUS 15GB")
+
+    env = {
+        **os.environ,
+        "STREETSCAPE_DOCROOT": str(docroot),
+        "PATH": _fake_systemctl(tmp_path, "active") + os.pathsep + os.environ["PATH"],
+    }
+    r = subprocess.run(
+        ["bash", _SCRIPT, "--yes"],
+        cwd=_PROJECT_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert r.returncode == 1
+    assert "refusing to pull code under it" in r.stdout
+    # Refused BEFORE doing anything: no pull, no rsync.
+    assert "git pull" not in r.stdout
+    assert "index.html" not in r.stdout
+
+
+def test_deploy_guard_allows_a_site_only_republish_during_a_run(tmp_path):
+    """--skip-pull lands no new code, so it is safe (and often needed) while the
+    nightly is mid-collection — the guard must not block it."""
+    docroot = tmp_path / "docroot"
+    (docroot / "data").mkdir(parents=True)
+
+    env = {
+        **os.environ,
+        "STREETSCAPE_DOCROOT": str(docroot),
+        "PATH": _fake_systemctl(tmp_path, "active") + os.pathsep + os.environ["PATH"],
+    }
+    r = subprocess.run(
+        ["bash", _SCRIPT, "--skip-pull", "--dry-run"],
+        cwd=_PROJECT_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert r.returncode == 0, f"stderr:\n{r.stderr}"
+    assert "refusing to pull" not in r.stdout
+    assert "index.html" in r.stdout

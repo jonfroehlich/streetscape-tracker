@@ -1,15 +1,23 @@
 """Scheduler logic tests — pure logic only, no network or subprocesses."""
 
+import gzip
+import json
 import os
 from datetime import date
 
 from streetscape_metadata_tracker import db
+from streetscape_metadata_tracker.naming import (
+    generate_streetwalk_filename,
+    streetwalk_coverage_filename,
+)
 from streetscape_metadata_tracker.scheduler import (
     ResourceGuardConfig,
     SchedulerConfig,
     SystemPressure,
     _reconcile_orphaned_run,
+    _reconcile_orphaned_walk,
     build_parser,
+    cmd_reconcile_walks,
     estimate_requests,
     load_scheduler_config,
     plan_connection_limit,
@@ -364,7 +372,7 @@ def test_makelab1_production_config_is_wired():
     # The street channels must keep their ISOLATED budgets: metered under their
     # own api_usage provider strings against separate keys, so a road crawl can
     # never eat the grid collectors' quota.
-    assert cfg.providers["gsv_streets"].daily_request_budget == 2_000_000
+    assert cfg.providers["gsv_streets"].daily_request_budget == 3_000_000
     # Paced by the streets key's own quota, not [download]'s 48k grid pacing.
     assert cfg.providers["gsv_streets"].max_requests_per_minute == 24_000
     # Mapillary's 50k/day application cap is shared with the grid channel.
@@ -1105,10 +1113,256 @@ def test_street_channels_share_the_grid_stagger_day(conn):
     assert set(days) == {"gsv", "gsv_streets", "mapillary_streets"}
 
 
+WALK_DATE = date(2026, 7, 28)
+
+
+def _orphan_walk(
+    conn,
+    data_dir,
+    *,
+    provider="gsv",
+    network_type="drive",
+    spacing=15,
+    samples=4,
+    with_network_type_key=True,
+    corrupt=False,
+    write_csv=True,
+):
+    """A finished road walk with artifacts on disk but no catalog row — the
+    Berlin shape: the crawl completed and both files were written, then the
+    subprocess died before register_street_walk.
+
+    ``with_network_type_key=False`` reproduces an artifact written before the
+    network-type series existed (it carries no such key at all)."""
+    cid = _register(conn, "Bend", width=1000, height=1000, step=20)
+    city = db.resolve_city(conn, cid)
+    stem = generate_streetwalk_filename(
+        city.city_id,
+        city.grid_width_m,
+        city.grid_height_m,
+        city.step_m,
+        spacing,
+        WALK_DATE,
+        provider=provider,
+        network_type=network_type,
+    )
+    csv_name = stem + ".csv.gz"
+    coverage_name = streetwalk_coverage_filename(csv_name)
+
+    if write_csv:
+        with gzip.open(os.path.join(data_dir, csv_name), "wt", encoding="utf-8") as fh:
+            fh.write("query_lat,query_lon,status\n")
+            for i in range(samples):
+                fh.write(f"44.0{i},-121.0{i},OK\n")
+
+    if corrupt:
+        with gzip.open(os.path.join(data_dir, coverage_name), "wt", encoding="utf-8") as fh:
+            fh.write('{"type": "FeatureCollection", "featur')  # truncated mid-write
+    else:
+        metadata = {
+            "schema_version": 1,
+            "kind": "streetwalk_coverage",
+            "city_id": city.city_id,
+            "provider": provider,
+            "run_date": WALK_DATE.isoformat(),
+            "spacing_m": spacing,
+            "match_dist_m": 25.0,
+            "source_csv": csv_name,
+            "totals": {
+                "edges": 120,
+                "edges_fully_covered": 100,
+                "mean_edge_coverage": 0.82,
+                "coverage_pct_by_length": 82.2,
+                "coverage_pct_by_length_any": 85.0,
+            },
+        }
+        if with_network_type_key:
+            metadata["network_type"] = network_type
+        with gzip.open(os.path.join(data_dir, coverage_name), "wt", encoding="utf-8") as fh:
+            json.dump(
+                {"type": "FeatureCollection", "features": [], "properties": {"metadata": metadata}},
+                fh,
+            )
+
+    return city, csv_name, coverage_name
+
+
+def _walk_row(conn, city_id, provider="gsv", network_type="drive"):
+    return conn.execute(
+        "SELECT * FROM street_walks WHERE city_id = ? AND provider = ? "
+        "AND network_type = ? AND run_date = ?",
+        (city_id, provider, network_type, WALK_DATE.isoformat()),
+    ).fetchone()
+
+
+def test_reconcile_orphaned_walk_catalogs_a_finished_crawl(conn, data_dir, monkeypatch):
+    """The Berlin regression: a walk that crawled, wrote both artifacts, then died
+    before register_street_walk must be salvaged from those artifacts rather than
+    re-crawled at full cost next cycle."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    monkeypatch.setattr(sched, "generate_streetwalk_manifest", lambda c, d: {"walks": []})
+    city, csv_name, coverage_name = _orphan_walk(conn, data_dir, samples=4)
+    cfg = _street_cfg(data_dir=data_dir)
+
+    assert _reconcile_orphaned_walk(conn, cfg, city, "gsv_streets", WALK_DATE) is True
+
+    row = _walk_row(conn, city.city_id)
+    assert row is not None
+    assert row["csv_filename"] == csv_name
+    assert row["coverage_filename"] == coverage_name
+    assert row["edges_total"] == 120
+    assert row["coverage_pct_by_length"] == 82.2
+    assert row["coverage_pct_by_length_any"] == 85.0
+    assert row["match_dist_m"] == 25.0
+    # sample_points is not in the artifact; it comes from the snapshot's rows,
+    # and for GSV that row count is also the request count (one request each).
+    assert row["sample_points"] == 4
+    assert row["api_requests"] == 4
+
+
+def test_reconcile_orphaned_walk_refreshes_the_manifest(conn, data_dir, monkeypatch):
+    """A salvaged walk that isn't advertised is invisible: the city page finds
+    streetwalk artifacts only through the sidecar manifest."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    regenerated = []
+    monkeypatch.setattr(
+        sched,
+        "generate_streetwalk_manifest",
+        lambda c, d: regenerated.append(d) or {"walks": []},
+    )
+    city, _, _ = _orphan_walk(conn, data_dir)
+    cfg = _street_cfg(data_dir=data_dir)
+    assert _reconcile_orphaned_walk(conn, cfg, city, "gsv_streets", WALK_DATE)
+    assert regenerated == [cfg.data_dir]
+
+
+def test_reconcile_orphaned_walk_without_artifacts_is_a_genuine_failure(conn, data_dir):
+    """Nothing on disk → nothing to salvage; the caller records a real failure."""
+    cid = _register(conn, "Bend", width=1000, height=1000, step=20)
+    city = db.resolve_city(conn, cid)
+    cfg = _street_cfg(data_dir=data_dir)
+
+    assert _reconcile_orphaned_walk(conn, cfg, city, "gsv_streets", WALK_DATE) is False
+    assert _walk_row(conn, city.city_id) is None
+
+
+def test_reconcile_orphaned_walk_rejects_a_corrupt_artifact(conn, data_dir):
+    """A truncated coverage file says nothing about coverage and must not become
+    a catalog row — that would publish a walk with no numbers behind it."""
+    city, _, _ = _orphan_walk(conn, data_dir, corrupt=True)
+    cfg = _street_cfg(data_dir=data_dir)
+
+    assert _reconcile_orphaned_walk(conn, cfg, city, "gsv_streets", WALK_DATE) is False
+    assert _walk_row(conn, city.city_id) is None
+
+
+def test_reconcile_orphaned_walk_takes_network_type_from_the_channel(conn, data_dir, monkeypatch):
+    """Walks written before the network-type series carry no network_type key
+    (Berlin's does not), so the channel's configured type is authoritative —
+    and it is part of the street_walks key, so getting it wrong mis-files the row."""
+    from streetscape_metadata_tracker import scheduler as sched
+    from streetscape_metadata_tracker.scheduler import ProviderConfig
+
+    monkeypatch.setattr(sched, "generate_streetwalk_manifest", lambda c, d: {"walks": []})
+    city, csv_name, _ = _orphan_walk(
+        conn, data_dir, network_type="all_public", with_network_type_key=False
+    )
+    cfg = _street_cfg(data_dir=data_dir)
+    cfg.providers["gsv_streets"] = ProviderConfig(network_type="all_public")
+
+    assert _reconcile_orphaned_walk(conn, cfg, city, "gsv_streets", WALK_DATE) is True
+
+    row = _walk_row(conn, city.city_id, network_type="all_public")
+    assert row is not None
+    assert "allpublic" in row["csv_filename"]  # the artifact it actually salvaged
+
+
+def test_reconcile_orphaned_walk_leaves_mapillary_requests_null(conn, data_dir, monkeypatch):
+    """Mapillary's cost is a z14 tile census independent of the sample count, and
+    the artifacts don't record it. NULL means 'not measured' — writing the sample
+    count there would invent a cost the walk never paid."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    monkeypatch.setattr(sched, "generate_streetwalk_manifest", lambda c, d: {"walks": []})
+    city, _, _ = _orphan_walk(conn, data_dir, provider="mapillary", samples=6)
+    cfg = _street_cfg(data_dir=data_dir)
+
+    assert _reconcile_orphaned_walk(conn, cfg, city, "mapillary_streets", WALK_DATE) is True
+
+    row = _walk_row(conn, city.city_id, provider="mapillary")
+    assert row["sample_points"] == 6
+    assert row["api_requests"] is None
+
+
+def test_run_due_salvages_a_finished_walk_instead_of_recording_failure(conn, monkeypatch, data_dir):
+    """End-to-end: the collector subprocess reports failure but left a complete
+    walk on disk. run-due must catalog it and count the channel a success, so the
+    city isn't re-walked at full cost when it next comes due."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    city, _, _ = _orphan_walk(conn, data_dir)
+    conn.execute("UPDATE schedule_state SET last_success_at = NULL")
+    conn.commit()
+
+    monkeypatch.setattr(
+        sched,
+        "_run_one_city",
+        lambda cfg, city, today, provider="gsv", connection_limit=None, daily_budget=0, conn=None: (
+            False
+        ),
+    )
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+    monkeypatch.setattr(sched.time, "sleep", lambda s: None)
+    monkeypatch.setattr(sched, "generate_aggregate_v2", lambda c, d: None)
+    monkeypatch.setattr(sched, "generate_streetwalk_manifest", lambda c, d: {"walks": []})
+
+    sched.cmd_run_due(_street_cfg(data_dir=data_dir, publish_enabled=False), today=WALK_DATE)
+
+    assert _walk_row(conn, city.city_id) is not None
+    state = conn.execute(
+        "SELECT last_success_at, consecutive_failures FROM schedule_state "
+        "WHERE city_id = ? AND provider = 'gsv_streets'",
+        (city.city_id,),
+    ).fetchone()
+    assert state["last_success_at"] is not None
+    assert state["consecutive_failures"] == 0
+    # The grid channel genuinely failed and must still be recorded as such.
+    grid = conn.execute(
+        "SELECT last_success_at FROM schedule_state WHERE city_id = ? AND provider = 'gsv'",
+        (city.city_id,),
+    ).fetchone()
+    assert grid["last_success_at"] is None
+
+
+def test_reconcile_walks_command_finds_and_catalogs_orphans(conn, monkeypatch, data_dir, capsys):
+    """The operator handle for orphans run-due can't catch — a walk from the
+    manual CLI, or one whose scheduler process itself died."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+    monkeypatch.setattr(sched, "generate_streetwalk_manifest", lambda c, d: {"walks": [1]})
+    city, _, coverage_name = _orphan_walk(conn, data_dir)
+    cfg = _street_cfg(data_dir=data_dir)
+
+    assert cmd_reconcile_walks(cfg, target_date=WALK_DATE, dry_run=True) == 0
+    assert coverage_name in capsys.readouterr().out
+    assert _walk_row(conn, city.city_id) is None  # dry run wrote nothing
+
+    assert cmd_reconcile_walks(cfg, target_date=WALK_DATE) == 0
+    assert _walk_row(conn, city.city_id) is not None
+
+    # Idempotent: a second pass sees the row and reports nothing to do.
+    assert cmd_reconcile_walks(cfg, target_date=WALK_DATE) == 0
+    assert "No orphaned walks found" in capsys.readouterr().out
+
+
 def test_street_channel_failure_is_not_reconciled_as_an_orphan_run(conn, monkeypatch, data_dir):
     """Street channels write street_walks rows, not `runs` rows, so the
     orphaned-run salvage path must not be consulted for them (it would look up
-    a run that can never exist and could mask a real failure)."""
+    a run that can never exist and could mask a real failure). They get their own
+    artifact-based salvage instead — see _reconcile_orphaned_walk."""
     from streetscape_metadata_tracker import scheduler as sched
 
     _register(conn, "Bend", width=1000, height=1000, step=20)
