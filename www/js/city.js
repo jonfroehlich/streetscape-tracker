@@ -497,11 +497,18 @@ function toggleFlatOnly() {
  * Navigate to another snapshot of the same city (full reload keeps the
  * streaming pipeline simple — each run is its own csv.gz/json.gz pair).
  *
+ * Carries ?network= forward: it selects which road walk the street panel draws,
+ * and that choice belongs to the city, not to the snapshot being viewed.
+ *
  * @param {string} dataFile - csv.gz filename of the selected run.
  */
 function switchRun(dataFile) {
   if (dataFile && dataFile !== currentFileGlobal) {
-    window.location.href = `city.html?file=${encodeURIComponent(dataFile)}`;
+    const network =
+      streetNetworkType === DEFAULT_STREET_NETWORK_TYPE
+        ? ""
+        : `&network=${encodeURIComponent(streetNetworkType)}`;
+    window.location.href = `city.html?file=${encodeURIComponent(dataFile)}${network}`;
   }
 }
 
@@ -569,6 +576,18 @@ const rawCsvFileParam = urlParams.get("file");
 const csvFile = isValidRunFilename(rawCsvFileParam) ? rawCsvFileParam : null;
 if (rawCsvFileParam && !csvFile) {
   console.warn("Ignoring invalid ?file= parameter:", rawCsvFileParam);
+}
+// ?network= selects WHICH road walk to draw, since a city can have one per OSM
+// network type and their coverage numbers divide by different street-km
+// denominators. Untrusted like ?file=, so an unknown value falls back to the
+// default series ('drive') rather than silently rendering nothing. streets.html
+// sets it so each listed walk links to itself.
+const rawNetworkParam = urlParams.get("network");
+const streetNetworkType = isKnownStreetNetworkType(rawNetworkParam)
+  ? rawNetworkParam
+  : DEFAULT_STREET_NETWORK_TYPE;
+if (rawNetworkParam && rawNetworkParam !== streetNetworkType) {
+  console.warn("Ignoring unknown ?network= parameter:", rawNetworkParam);
 }
 const cityQuery = urlParams.get("city");
 const decodedCityQuery = cityQuery
@@ -1468,11 +1487,21 @@ async function loadData() {
     // issue #99/#155); otherwise fall back to the grid-attribution
     // "_streets.json.gz" (issue #24). The streetwalk file is NOT derivable from
     // the run filename, so it comes from the sidecar manifest keyed by city_id.
+    // A city can have one walk per OSM network type, chosen by ?network= and
+    // defaulting to 'drive' (motorized roads), the scheduled series and what
+    // this page has always shown. A broad 'all_public' walk covers a much larger
+    // network — different street-km denominator, not a better number for the
+    // same thing — so it is selected deliberately, never fallen back to.
     // The setPanoDotsVisible hook lets the panel show/hide the pano markers (a
     // coarse show-all/hide-all) so the streets can be read on their own; it goes
     // through the reconcile model so re-showing respects the mode/year/date/cap.
     const streetwalk = cityIdGlobal
-      ? lookupStreetwalk(await fetchStreetwalkManifest(), cityIdGlobal, providerGlobal)
+      ? lookupStreetwalk(
+          await fetchStreetwalkManifest(),
+          cityIdGlobal,
+          providerGlobal,
+          streetNetworkType
+        )
       : null;
     renderStreetCoverage(map, targetFile, providerGlobal, {
       streetwalkFile: streetwalk?.coverage_filename,

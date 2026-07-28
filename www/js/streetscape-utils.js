@@ -404,16 +404,85 @@ async function fetchStreetwalkManifest() {
 }
 
 /**
- * Find a city+provider's streetwalk entry in the manifest, or null.
+ * The OSM network a road walk covers when none is stated. 'drive' is the
+ * original and still-scheduled series (motorized public roads only); a broad
+ * 'all_public' walk additionally covers alleys, footways, park paths, cycleways
+ * and steps, and is a SEPARATE series with a much larger street-km denominator.
+ */
+const DEFAULT_STREET_NETWORK_TYPE = "drive";
+
+/**
+ * Human labels for the osmnx network types a walk can be collected on. Keyed by
+ * the exact `network_type` the manifest carries, so the keys double as the set
+ * of values `?network=` accepts. Labels say what the walk COVERS rather than
+ * echoing the osmnx filter name, since that distinction is the whole reason two
+ * rows for one city are not duplicates.
+ *
+ * Mirrors naming.STREETWALK_NETWORK_TOKENS on the Python side — keep in sync.
+ */
+const STREET_NETWORK_LABELS = {
+  drive: "Roads",
+  all_public: "Roads + paths",
+  all: "Roads + paths (incl. private)",
+  walk: "Walkable",
+  bike: "Bikeable",
+  drive_service: "Roads + service",
+};
+
+/**
+ * Human label for an OSM network type; unknown types render as themselves.
+ * @param {?string} networkType - From the manifest; absent on pre-network walks.
+ * @returns {string}
+ */
+function streetNetworkLabel(networkType) {
+  const key = networkType ?? DEFAULT_STREET_NETWORK_TYPE;
+  return STREET_NETWORK_LABELS[key] ?? key;
+}
+
+/**
+ * Whether a string names a network type this site knows how to select on.
+ * Used to validate the untrusted `?network=` parameter before it reaches a
+ * manifest lookup, the same way isKnownProvider guards `?provider=`.
+ * @param {?string} networkType
+ * @returns {boolean}
+ */
+function isKnownStreetNetworkType(networkType) {
+  return (
+    typeof networkType === "string" &&
+    Object.prototype.hasOwnProperty.call(STREET_NETWORK_LABELS, networkType)
+  );
+}
+
+/**
+ * Find a city+provider+network's streetwalk entry in the manifest, or null.
+ *
+ * A city can have one walk per network type, so this must select on network
+ * type rather than take the first match — otherwise a city with both a drive
+ * and an all_public walk would render whichever the manifest happened to list
+ * first, and its headline coverage % would silently switch denominators.
+ * Manifest entries written before network types existed have no `network_type`
+ * field; they are drive walks, hence the `?? DEFAULT` on the record side.
+ *
  * @param {?Object} manifest - The parsed streetwalks.json.gz, or null.
  * @param {string} cityId
  * @param {string} provider
+ * @param {string} [networkType] - Defaults to "drive".
  * @returns {?Object} The walk record (with `coverage_filename`), or null.
  */
-function lookupStreetwalk(manifest, cityId, provider) {
+function lookupStreetwalk(
+  manifest,
+  cityId,
+  provider,
+  networkType = DEFAULT_STREET_NETWORK_TYPE,
+) {
   if (!manifest || !Array.isArray(manifest.walks)) return null;
   return (
-    manifest.walks.find((w) => w.city_id === cityId && w.provider === provider) || null
+    manifest.walks.find(
+      (w) =>
+        w.city_id === cityId &&
+        w.provider === provider &&
+        (w.network_type ?? DEFAULT_STREET_NETWORK_TYPE) === networkType,
+    ) || null
   );
 }
 
@@ -431,6 +500,12 @@ function lookupStreetwalk(manifest, cityId, provider) {
  * The index keeps the FIRST walk per key, matching what `lookupStreetwalk`'s
  * `find` returns for a manifest that somehow carries duplicates.
  *
+ * Only DRIVE walks are joined. METRICS.streets compares cities to each other,
+ * and drive vs all_public coverage are not comparable numbers — they divide by
+ * different street-km denominators — so mixing them would put two scales in one
+ * choropleth. A city with only a broad walk therefore reads "No data" here,
+ * which is honest: its drive coverage genuinely has not been measured.
+ *
  * The count is the honest denominator for "N of M cities walked" that the
  * overview banner reports, rather than silently rendering a map of grey
  * rectangles.
@@ -447,6 +522,9 @@ function mergeStreetwalkStats(cities, manifest) {
   const byKey = new Map();
   if (manifest && Array.isArray(manifest.walks)) {
     for (const walk of manifest.walks) {
+      if ((walk.network_type ?? DEFAULT_STREET_NETWORK_TYPE) !== DEFAULT_STREET_NETWORK_TYPE) {
+        continue;
+      }
       const key = `${walk.provider}|${walk.city_id}`;
       if (!byKey.has(key)) byKey.set(key, walk);
     }
@@ -812,6 +890,10 @@ if (typeof module !== "undefined" && module.exports) {
     fetchGzippedJson,
     streetwalkManifestUrl,
     fetchStreetwalkManifest,
+    DEFAULT_STREET_NETWORK_TYPE,
+    STREET_NETWORK_LABELS,
+    streetNetworkLabel,
+    isKnownStreetNetworkType,
     lookupStreetwalk,
     mergeStreetwalkStats,
     adaptCityRecord,

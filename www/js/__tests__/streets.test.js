@@ -13,6 +13,12 @@ global.PROVIDERS = {
   gsv: { label: "Google Street View" },
   mapillary: { label: "Mapillary" },
 };
+global.DEFAULT_STREET_NETWORK_TYPE = "drive";
+global.STREET_NETWORK_LABELS = { drive: "Roads", all_public: "Roads + paths" };
+global.streetNetworkLabel = (networkType) => {
+  const key = networkType ?? global.DEFAULT_STREET_NETWORK_TYPE;
+  return global.STREET_NETWORK_LABELS[key] ?? key;
+};
 global.coverageColor = (pct) => `coverage(${pct})`;
 global.escapeHtml = (s) =>
   String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -202,6 +208,34 @@ test("every sortable column key exists on a row model", () => {
   assert.ok(STREET_COLUMNS.some((c) => c.key === DEFAULT_SORT.key));
 });
 
+test("a row renders one cell per column, plus the link cell", () => {
+  // The <thead> lives in streets.html and the <tr> is built here, so adding a
+  // column to one and not the other misaligns every row — invisible until the
+  // page is opened in a browser, which no test does.
+  const html = walkRowHtml(
+    toRowModel(
+      { city_id: "x", provider: "gsv", network_type: "all_public", run_date: "2026-01-01" },
+      { city: "X" }
+    )
+  );
+  const cells = (html.match(/<t[hd][\s>]/g) || []).length;
+  assert.equal(cells, STREET_COLUMNS.length + 1);
+});
+
+test("toRowModel: labels the network, defaulting a tokenless walk to roads", () => {
+  const broad = toRowModel(
+    { city_id: "x", provider: "gsv", network_type: "all_public" },
+    { city: "X" }
+  );
+  assert.equal(broad.networkType, "all_public");
+  assert.equal(broad.networkLabel, "Roads + paths");
+
+  // A walk published before network types existed carries no field at all.
+  const legacy = toRowModel({ city_id: "x", provider: "gsv" }, { city: "X" });
+  assert.equal(legacy.networkType, "drive");
+  assert.equal(legacy.networkLabel, "Roads");
+});
+
 // --- num -------------------------------------------------------------------
 
 test("num: renders an em dash for null/undefined rather than 'null'", () => {
@@ -236,8 +270,21 @@ test("walkRowHtml: links to the city page using the aggregate's run filename", (
   assert.match(html, /98\.4%/);
   assert.match(
     html,
-    /href="city\.html\?file=seattle--wa_width_1_height_1_step_20\.csv\.gz"/
+    /href="city\.html\?file=seattle--wa_width_1_height_1_step_20\.csv\.gz&network=drive"/
   );
+});
+
+test("walkRowHtml: the link carries this row's network type, not the default", () => {
+  // city.html selects the walk to draw by network type and defaults to 'drive',
+  // so a broad row whose link omits ?network= opens a DIFFERENT walk — or, for a
+  // city walked only broadly, falls back to the grid-attribution artifact.
+  const html = walkRowHtml(
+    toRowModel(
+      { ...SEATTLE_WALK, network_type: "all_public" },
+      { city: "Seattle", data_file: { filename: "seattle--wa_width_1_height_1_step_20.csv.gz" } }
+    )
+  );
+  assert.match(html, /&network=all_public"/);
 });
 
 test("walkRowHtml: a city missing from the aggregate still renders, without a link", () => {

@@ -3,7 +3,7 @@ CLI: road-walk street-coverage collection for a city (issue #99).
 
     python -m streetscape_street_analyzer.collect "Seattle, WA" \
         [--provider gsv|mapillary] \
-        [--spacing 15] [--match-dist 25] [--network-type drive] \
+        [--spacing 15] [--match-dist 25] [--network-type drive|all_public|...] \
         [--run-date YYYY-MM-DD] [--force] [--refresh] \
         [--connection-limit N] [--max-requests-per-minute R] \
         [--daily-budget N] [--estimate] [--data-dir DIR] [--db-path PATH]
@@ -35,6 +35,22 @@ Two dated artifacts are written next to the run (both published as ``*.gz``):
 a raw sample snapshot ``..._streetwalk_sp{N}_{DATE}.csv.gz`` (METADATA schema,
 one row per sampled location) and the derived per-edge coverage GeoJSON
 ``..._streetwalk_sp{N}_{DATE}_coverage.json.gz``.
+
+**Which streets get walked** is set by ``--network-type``. The default
+``drive`` is osmnx's motorized-public-roads filter, which excludes footways,
+paths, pedestrian streets, cycleways, steps, tracks and every ``highway=service``
+way (so alleys too). ``all_public`` is a strict superset that includes all of
+them, letting the same city be compared across edge classes — GSV vs Mapillary
+on park trails, say. Each network type is its OWN walk series: the artifacts
+carry a network token (``drive`` emits none) and ``street_walks`` keys on it, so
+walking a second network never overwrites the first.
+
+Caveat on broad networks: ``--match-dist`` (default 25 m) is a plain proximity
+test with no bearing check (#97/#98), so a footway mapped a few metres from its
+road is scored covered by that road's pano. **Sidewalk coverage therefore reads
+high.** Park trails are typically well beyond 25 m from any road, so they are
+much less affected. The raw snapshot records each matched pano's coordinates, so
+a tighter threshold can be re-cut offline without re-collecting.
 """
 
 from __future__ import annotations
@@ -59,6 +75,8 @@ from streetscape_metadata_tracker.download_gsv import collect_points_async
 from streetscape_metadata_tracker.download_mapillary import estimate_tile_count
 from streetscape_metadata_tracker.json_summarizer import generate_streetwalk_manifest
 from streetscape_metadata_tracker.naming import (
+    DEFAULT_NETWORK_TYPE,
+    STREETWALK_NETWORK_TOKENS,
     generate_streetwalk_filename,
     streetwalk_coverage_filename,
 )
@@ -149,10 +167,12 @@ def run_collect(args: argparse.Namespace) -> int:
             logger.error("No on-street sample points generated; nothing to collect.")
             return 1
 
-        # The provider token is what keeps the two channels' artifacts apart:
-        # both walk the SAME sample points and the scheduler runs them on the
-        # same night with the same run_date, so without it the second collection
-        # would find the first's snapshot already on disk and skip as a no-op.
+        # The provider and network-type tokens are what keep same-night walks
+        # apart. Both providers walk the SAME sample points and the scheduler
+        # runs them on one run_date; and one frozen bbox yields both a 'drive'
+        # network and a much larger 'all_public' one. Without either token the
+        # second collection would find the first's snapshot already on disk and
+        # skip as a silent no-op reported as success.
         stem = generate_streetwalk_filename(
             city.city_id,
             city.grid_width_m,
@@ -161,6 +181,7 @@ def run_collect(args: argparse.Namespace) -> int:
             args.spacing,
             run_date,
             provider=provider,
+            network_type=args.network_type,
         )
         csv_name = stem + ".csv.gz"
         coverage_name = streetwalk_coverage_filename(csv_name)
@@ -172,9 +193,11 @@ def run_collect(args: argparse.Namespace) -> int:
         if os.path.exists(out_csv):
             if not args.force:
                 logger.info(
-                    "Streetwalk snapshot already exists for %s on %s; skipping "
+                    "Streetwalk snapshot already exists for %s [%s/%s] on %s; skipping "
                     "(use --force to re-collect, or a different --run-date).",
                     city.city_id,
+                    provider,
+                    args.network_type,
                     run_date,
                 )
                 return 0
@@ -288,6 +311,7 @@ def run_collect(args: argparse.Namespace) -> int:
             spacing_m=args.spacing,
             match_dist_m=args.match_dist,
             source_csv=csv_name,
+            network_type=args.network_type,
         )
         with gzip.open(out_coverage, "wt", encoding="utf-8") as fh:
             json.dump(geojson, fh)
@@ -337,7 +361,7 @@ def run_collect(args: argparse.Namespace) -> int:
         )
         unit = "GSV queries" if provider == "gsv" else "Mapillary tile requests"
         print(
-            f"{city.city_id} [streetwalk {provider} {run_date}]: "
+            f"{city.city_id} [streetwalk {provider}/{args.network_type} {run_date}]: "
             f"{len(samples)} samples over {totals['edges']} edges "
             f"({dict_results['api_requests']} {unit}); "
             f"mean edge coverage {totals['mean_edge_coverage']:.3f}, "
@@ -384,8 +408,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--network-type",
-        default="drive",
-        help="OSM network type to walk (default: drive; 'walk'/'all' are broader)",
+        default=DEFAULT_NETWORK_TYPE,
+        choices=sorted(STREETWALK_NETWORK_TOKENS),
+        help=(
+            "OSM network to walk (default: drive — motorized public roads only). "
+            "'all_public' adds alleys, footways, park paths, pedestrian streets, "
+            "cycleways and steps. Each network type is its own walk series: the "
+            "artifacts carry a network token and the catalog keys on it, so a "
+            "broad walk never overwrites a drive walk"
+        ),
     )
     parser.add_argument(
         "--run-date",

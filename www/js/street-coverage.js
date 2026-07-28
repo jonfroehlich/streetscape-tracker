@@ -78,15 +78,26 @@ function fractionColor(frac) {
 
 /**
  * Street-type categorical palette: the dataviz dark categorical slots assigned
- * to OSM highway classes in importance order. Any class outside this set
- * (living_street, other, unknown) folds into a neutral "minor" gray rather than
- * cycling a hue — per the dataviz rule that a 9th category is never a new color.
+ * to OSM highway classes in importance order. Exactly eight hues, and that is a
+ * ceiling, not an accident — the dataviz rule is that a 9th category is never a
+ * generated hue.
  *
- * This is DELIBERATELY narrower than the Python side's `_HIGHWAY_BUCKETS`
- * (street_coverage.py), which recognizes `living_street` as its own bucket.
- * Don't "sync" them by adding a 9th color here: the analyzer may emit a
- * `living_street` bucket, and it is meant to render as the minor gray. Only
- * these eight get a dedicated hue.
+ * The Python side's `_HIGHWAY_BUCKETS` (street_coverage.py) is much wider: a
+ * broad-network walk (`--network-type all_public`) emits alleys, footways,
+ * paths, pedestrian streets, cycleways, steps, tracks and bridleways too. Do
+ * NOT "sync" the two by adding hues here. Extra classes are encoded without
+ * new color instead:
+ *
+ *   - Service subtypes (alley, driveway, parking_aisle) are all `highway=service`
+ *     and inherit the service hue via STREET_TYPE_FAMILY — a family mapping, not
+ *     a new slot.
+ *   - Non-motorized classes fold into the neutral "minor" gray, and render
+ *     thinner in type mode (they are physically narrower ways). Thickness is
+ *     the only free channel left: dash already means "uncovered" and opacity
+ *     already means "not spotlighted".
+ *   - To isolate one specific class, click its bar in the breakdown panel — the
+ *     existing spotlight filters the map by {highway, covered}, which scales to
+ *     any number of classes without a single new hue.
  */
 const STREET_TYPE_COLORS = {
   motorway: "#3987e5",
@@ -98,6 +109,34 @@ const STREET_TYPE_COLORS = {
   unclassified: "#d55181",
   service: "#d95926",
 };
+
+/**
+ * Classes that borrow another class's hue because they are a subtype of it.
+ * `highway=service` + `service=alley|driveway|parking_aisle` are all service
+ * roads; the analyzer splits them because an alley is a real back street while
+ * a driveway is not, but on the map they belong to one visual family.
+ */
+const STREET_TYPE_FAMILY = {
+  alley: "service",
+  driveway: "service",
+  parking_aisle: "service",
+};
+
+/**
+ * Non-motorized OSM classes, present only in broad-network walks. They share
+ * the minor gray and are drawn thinner — see STREET_TYPE_COLORS on why they get
+ * no hue of their own.
+ */
+const STREET_TYPE_NON_MOTORIZED = new Set([
+  "pedestrian",
+  "footway",
+  "path",
+  "cycleway",
+  "steps",
+  "track",
+  "bridleway",
+]);
+
 /** Fallback for highway classes outside STREET_TYPE_COLORS. */
 const STREET_TYPE_MINOR_COLOR = "#8a8f97";
 
@@ -107,9 +146,50 @@ const STREET_TYPE_MINOR_COLOR = "#8a8f97";
  * @returns {string} A CSS color; the neutral "minor" gray for unlisted classes.
  */
 function streetTypeColor(highway) {
-  return Object.prototype.hasOwnProperty.call(STREET_TYPE_COLORS, highway)
-    ? STREET_TYPE_COLORS[highway]
+  const key = STREET_TYPE_FAMILY[highway] || highway;
+  return Object.prototype.hasOwnProperty.call(STREET_TYPE_COLORS, key)
+    ? STREET_TYPE_COLORS[key]
     : STREET_TYPE_MINOR_COLOR;
+}
+
+/**
+ * Whether a bucket is a non-motorized way (footpath, park trail, steps, ...).
+ * @param {string} highway - The segment's `highway` bucket.
+ * @returns {boolean}
+ */
+function isNonMotorizedType(highway) {
+  return STREET_TYPE_NON_MOTORIZED.has(highway);
+}
+
+/**
+ * Legend entries for type mode: one per DISTINCT rendered style, not one per
+ * class. Extra classes are encoded by reusing a hue (the service subtypes) or by
+ * line thickness (the non-motorized ways), so a broad-network walk has up to ten
+ * classes drawn in two colors — a swatch each would show ten labels against two
+ * hues and read as a broken palette rather than the deliberate family grouping
+ * it is. Merging them states what is actually true: these classes look the same
+ * on the map. Groups keep the artifact's own class order (streetTypeOrder),
+ * anchored at each group's first member.
+ *
+ * @param {string[]} present - Highway buckets actually in the artifact.
+ * @returns {{color: string, thin: boolean, labels: string[]}[]}
+ */
+function typeLegendGroups(present) {
+  const groups = [];
+  const byStyle = new Map();
+  for (const type of [...present].sort((a, b) => streetTypeOrder(a) - streetTypeOrder(b))) {
+    const color = streetTypeColor(type);
+    const thin = isNonMotorizedType(type);
+    const key = `${color}|${thin}`;
+    let group = byStyle.get(key);
+    if (!group) {
+      group = { color, thin, labels: [] };
+      byStyle.set(key, group);
+      groups.push(group);
+    }
+    group.labels.push(type);
+  }
+  return groups;
 }
 
 /**
@@ -171,16 +251,23 @@ function styleStreetByCoverage(feature) {
  * Leaflet style for the "type" view mode: colored by highway class. Uncovered
  * segments keep their type color but are faded and dashed so coverage still
  * reads at a glance.
+ *
+ * Non-motorized ways (footpaths, park trails, steps — only present in a
+ * broad-network walk) are drawn a step thinner. They share the minor gray with
+ * living_street/other, so thickness is what separates "a narrow way for people"
+ * from "a road class we don't give a hue to"; see STREET_TYPE_COLORS.
+ *
  * @param {Object} feature - GeoJSON feature with coverage properties.
  * @returns {Object} Leaflet path style.
  */
 function styleStreetByType(feature) {
   const p = feature.properties || {};
   const color = streetTypeColor(p.highway);
+  const thin = isNonMotorizedType(p.highway) ? 1 : 0;
   if (!p.covered) {
-    return { color, weight: 2, opacity: 0.5, dashArray: "4 4" };
+    return { color, weight: 2 - thin * 0.5, opacity: 0.5, dashArray: "4 4" };
   }
-  return { color, weight: 3, opacity: 0.9 };
+  return { color, weight: 3 - thin, opacity: 0.9 };
 }
 
 /**
@@ -408,8 +495,10 @@ function buildStreetCoveragePanel(map, layer, meta, provider, options) {
   const legendEl = document.getElementById("street-legend");
 
   // ── Legend (rebuilt per mode) ──────────────────────────────────
-  const swatch = (color, label, dashed = false) =>
-    `<span><i class="${dashed ? "dashed" : ""}" style="background:${color}"></i>${label}</span>`;
+  const swatch = (color, label, dashed = false, thin = false) => {
+    const cls = [dashed ? "dashed" : "", thin ? "thin" : ""].filter(Boolean).join(" ");
+    return `<span><i class="${cls}" style="background:${color}"></i>${label}</span>`;
+  };
 
   function renderLegend() {
     if (mode === "coverage") {
@@ -425,12 +514,11 @@ function buildStreetCoveragePanel(map, layer, meta, provider, options) {
           swatch(STREET_UNCOVERED_COLOR, "no coverage", true);
       }
     } else if (mode === "type") {
-      // Only the types actually present, in importance order, plus uncovered.
+      // Only the types actually present, in the artifact's own class order,
+      // merged by rendered style, plus uncovered.
       legendEl.innerHTML =
-        types
-          .slice()
-          .sort((a, b) => streetTypeOrder(a) - streetTypeOrder(b))
-          .map((t) => swatch(streetTypeColor(t), t))
+        typeLegendGroups(types)
+          .map((g) => swatch(g.color, g.labels.join(", "), false, g.thin))
           .join("") + swatch(STREET_UNCOVERED_COLOR, "no coverage", true);
     } else {
       // Age: a small newest→oldest gradient chip plus the uncovered swatch.
@@ -598,6 +686,18 @@ function buildStreetCoveragePanel(map, layer, meta, provider, options) {
 /**
  * Importance rank of a highway bucket (for legend ordering); unlisted classes
  * sort last.
+ *
+ * Ordered in three runs so a broad-network walk reads top-to-bottom as a
+ * hierarchy: motorized road classes by descending importance, then the
+ * service-road family (alley is a real back street, driveway and parking aisle
+ * are not), then non-motorized ways. `other` is deliberately absent and sorts
+ * last.
+ *
+ * This list is the same order the analyzer writes `coverage_by_highway` in
+ * (`_BUCKET_DISPLAY_ORDER` in street_coverage.py) — the artifact's key order is
+ * a contract, so the legend must not present a different hierarchy than a
+ * consumer reading the file straight through would get. Keep the two in sync.
+ *
  * @param {string} highway
  * @returns {number}
  */
@@ -611,6 +711,17 @@ function streetTypeOrder(highway) {
     "residential",
     "unclassified",
     "service",
+    "living_street",
+    "alley",
+    "driveway",
+    "parking_aisle",
+    "pedestrian",
+    "footway",
+    "path",
+    "cycleway",
+    "steps",
+    "track",
+    "bridleway",
   ];
   const i = order.indexOf(highway);
   return i === -1 ? order.length : i;
@@ -688,6 +799,8 @@ if (typeof module !== "undefined" && module.exports) {
     styleForMode,
     streetTypeColor,
     streetTypeOrder,
+    isNonMotorizedType,
+    typeLegendGroups,
     withStreetAlpha,
     fractionColor,
     hexToRgb,
@@ -699,5 +812,6 @@ if (typeof module !== "undefined" && module.exports) {
     STREET_PARTIAL_LOW_COLOR,
     STREET_TYPE_COLORS,
     STREET_TYPE_MINOR_COLOR,
+    STREET_TYPE_FAMILY,
   };
 }

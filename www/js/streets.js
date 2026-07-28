@@ -81,6 +81,10 @@ function indexCitiesByProvider(rawCities, providers) {
 const STREET_COLUMNS = [
   { key: "label", label: "City", type: "text", initial: "asc" },
   { key: "providerLabel", label: "Provider", type: "text", initial: "asc" },
+  // Which OSM network was walked. Without this column two rows for one city
+  // would look like duplicates, when in fact their coverage percentages divide
+  // by different street-km denominators and are not comparable.
+  { key: "networkLabel", label: "Network", type: "text", initial: "asc" },
   { key: "runDate", label: "Walked", type: "text", initial: "desc" },
   { key: "spacing", label: "Sample spacing", type: "number", initial: "asc" },
   { key: "pct", label: "Street-km covered", type: "number", initial: "desc" },
@@ -117,6 +121,8 @@ function toRowModel(walk, city, labelSource = null) {
     label: named ? cityLabel(named) : walk.city_id,
     provider: walk.provider,
     providerLabel: PROVIDERS[walk.provider]?.label ?? walk.provider,
+    networkType: walk.network_type ?? DEFAULT_STREET_NETWORK_TYPE,
+    networkLabel: streetNetworkLabel(walk.network_type),
     runDate: walk.run_date ?? null,
     spacing: walk.spacing_m ?? null,
     pct: walk.coverage_pct_by_length ?? null,
@@ -188,9 +194,17 @@ function coverageCellHtml(pct) {
  * @returns {string} HTML for one <tr>.
  */
 function walkRowHtml(row) {
+  // The link carries THIS row's network type: city.html selects the walk to
+  // draw by network type and defaults to 'drive', so without it a "Roads +
+  // paths" row would open the city's drive walk instead — or, for a city walked
+  // only broadly, fall all the way back to the grid-attribution artifact, a
+  // different metric entirely. Advertising a row the link cannot reach is worse
+  // than not listing it.
   const link = row.filename
     ? `<a class="streets-view-link"
-          href="city.html?file=${encodeURIComponent(row.filename)}">View on map</a>`
+          href="city.html?file=${encodeURIComponent(row.filename)}&network=${encodeURIComponent(
+        row.networkType
+      )}">View on map</a>`
     : `<span class="streets-no-link" title="This city has no published run to link to">—</span>`;
 
   // City/state/country names come from OSM/Nominatim (publicly editable
@@ -199,6 +213,7 @@ function walkRowHtml(row) {
     <tr>
       <th scope="row">${escapeHtml(row.label)}</th>
       <td>${escapeHtml(row.providerLabel)}</td>
+      <td>${escapeHtml(row.networkLabel)}</td>
       <td>${escapeHtml(row.runDate ?? "—")}</td>
       <td>${row.spacing == null ? "—" : `${num(row.spacing)} m`}</td>
       ${coverageCellHtml(row.pct)}

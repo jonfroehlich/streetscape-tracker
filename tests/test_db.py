@@ -600,6 +600,219 @@ def test_migrate_v7_to_v8(tmp_path):
     conn2.close()
 
 
+def _unique_key_columns(conn, table, must_contain="run_date"):
+    """Columns of the UNIQUE index over `table` that includes `must_contain`."""
+    for (name,) in conn.execute(
+        f"SELECT name FROM pragma_index_list('{table}') WHERE \"unique\" = 1"
+    ).fetchall():
+        cols = [r[0] for r in conn.execute("SELECT name FROM pragma_index_info(?)", (name,))]
+        if must_contain in cols:
+            return set(cols)
+    return set()
+
+
+def _build_v8_catalog(db_path):
+    """A real v8 catalog on disk: the narrower street_walks key plus one walk.
+
+    Rebuilds street_walks with the v8 (narrower) key rather than stamping the
+    current schema with an old version, so the migration under test has
+    something to actually migrate.
+    """
+    raw = sqlite3.connect(db_path)
+    raw.executescript(db._SCHEMA)
+    # Rebuild street_walks with the v8 (narrower) key, so the fixture is a real
+    # v8 catalog rather than the current schema wearing an old version stamp.
+    raw.execute("DROP TABLE street_walks")
+    raw.executescript(
+        """
+        CREATE TABLE street_walks (
+            walk_id                INTEGER PRIMARY KEY,
+            city_id                TEXT NOT NULL REFERENCES cities(city_id),
+            provider               TEXT NOT NULL DEFAULT 'gsv',
+            run_date               TEXT NOT NULL,
+            csv_filename           TEXT NOT NULL UNIQUE,
+            coverage_filename      TEXT,
+            network_type           TEXT NOT NULL DEFAULT 'drive',
+            spacing_m              REAL,
+            match_dist_m           REAL,
+            sample_points          INTEGER,
+            edges_total            INTEGER,
+            edges_fully_covered    INTEGER,
+            mean_edge_coverage     REAL,
+            coverage_pct_by_length REAL,
+            coverage_pct_by_length_any REAL,
+            api_requests           INTEGER,
+            started_at             TEXT,
+            finished_at            TEXT,
+            UNIQUE (city_id, provider, run_date)
+        );
+        """
+    )
+    raw.execute(
+        """INSERT INTO cities (city_id, display_name, city_name, center_lat,
+           center_lon, grid_width_m, grid_height_m, step_m, created_at)
+           VALUES ('bend--or', 'Bend, OR', 'Bend', 44.05, -121.31,
+                   5000, 5000, 20, '2026-01-01T00:00:00+00:00')"""
+    )
+    raw.execute(
+        """INSERT INTO street_walks (city_id, provider, run_date, csv_filename,
+           coverage_filename, spacing_m, edges_total, coverage_pct_by_length)
+           VALUES ('bend--or', 'gsv', '2026-05-01', 'old_streetwalk.csv.gz',
+                   'old_streetwalk_coverage.json.gz', 15.0, 41, 95.6)"""
+    )
+    raw.execute("PRAGMA user_version = 8")
+    raw.commit()
+    raw.close()
+
+
+def test_migrate_v8_to_v9(tmp_path):
+    """A v8 catalog's street_walks UNIQUE gains network_type on connect.
+
+    v8 keyed a walk on (city_id, provider, run_date), which collapses a city's
+    'drive' and 'all_public' walks onto one row — the second silently
+    overwrites the first. This is a table rebuild, so the test also proves the
+    pre-existing row survives it intact.
+    """
+    db_path = str(tmp_path / "v8.db")
+    _build_v8_catalog(db_path)
+
+    pre = sqlite3.connect(db_path)
+    assert _unique_key_columns(pre, "street_walks") == {"city_id", "provider", "run_date"}
+    pre.close()
+
+    conn = db.connect(db_path)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
+    assert _unique_key_columns(conn, "street_walks") == {
+        "city_id",
+        "provider",
+        "network_type",
+        "run_date",
+    }
+
+    # The rebuild preserved the row, and a pre-v9 walk is a drive walk.
+    walk = db.get_latest_street_walk(conn, "bend--or")
+    assert walk["csv_filename"] == "old_streetwalk.csv.gz"
+    assert walk["coverage_filename"] == "old_streetwalk_coverage.json.gz"
+    assert walk["coverage_pct_by_length"] == 95.6
+    assert walk["edges_total"] == 41
+    assert walk["network_type"] == "drive"
+
+    # Idempotent: reopening must not error or re-run the rebuild.
+    conn.close()
+    conn3 = db.connect(db_path)
+    assert conn3.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
+    assert conn3.execute("SELECT COUNT(*) FROM street_walks").fetchone()[0] == 1
+    conn3.close()
+
+
+def test_migrate_v8_to_v9_is_atomic(tmp_path):
+    """An interrupted v8 -> v9 rebuild must leave the v8 catalog untouched.
+
+    The rebuild drops street_walks and renames a scratch table over it. Without
+    a transaction those run in autocommit, so dying in between leaves NO
+    street_walks at all — and the next connect() would take the "absent table"
+    early exit, let _SCHEMA create it empty, and stamp user_version = 9, losing
+    every walk row silently. Here the script is run with its COMMIT stripped and
+    the connection abandoned, which is exactly what a crash mid-rebuild does.
+    """
+    db_path = str(tmp_path / "v8.db")
+    _build_v8_catalog(db_path)
+
+    crashed = sqlite3.connect(db_path)
+    crashed.execute("PRAGMA foreign_keys=OFF")
+    crashed.executescript(db._MIGRATE_V8_TO_V9.replace("COMMIT;", ""))
+    crashed.close()  # no COMMIT reached → SQLite rolls the whole rebuild back
+
+    after = sqlite3.connect(db_path)
+    assert after.execute("PRAGMA user_version").fetchone()[0] == 8
+    assert _unique_key_columns(after, "street_walks") == {"city_id", "provider", "run_date"}
+    assert after.execute("SELECT COUNT(*) FROM street_walks").fetchone()[0] == 1
+    after.close()
+
+    # And the retry — the next ordinary connect() — completes it.
+    conn = db.connect(db_path)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
+    assert db.get_latest_street_walk(conn, "bend--or")["csv_filename"] == "old_streetwalk.csv.gz"
+    conn.close()
+
+
+def test_migrate_v8_to_v9_clears_a_stale_scratch_table(tmp_path):
+    """A street_walks_v9 left by a pre-transaction build must not brick connect.
+
+    CREATE TABLE street_walks_v9 has no IF NOT EXISTS, so a leftover scratch
+    table from an interrupted older run would fail every subsequent connect —
+    an unopenable catalog, not a degraded one.
+    """
+    db_path = str(tmp_path / "v8.db")
+    _build_v8_catalog(db_path)
+
+    stale = sqlite3.connect(db_path)
+    stale.execute("CREATE TABLE street_walks_v9 (walk_id INTEGER PRIMARY KEY)")
+    stale.commit()
+    stale.close()
+
+    conn = db.connect(db_path)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
+    assert db.get_latest_street_walk(conn, "bend--or")["csv_filename"] == "old_streetwalk.csv.gz"
+    conn.close()
+
+
+def test_two_network_types_coexist_on_one_date(tmp_path):
+    """The widened key is what lets both walks of a city survive the same night."""
+    conn = db.connect(str(tmp_path / "c.db"))
+    db.register_city(
+        conn,
+        city_name="Bend",
+        state_name="Oregon",
+        state_code="OR",
+        country_name="United States",
+        country_code="US",
+        center_lat=44.05,
+        center_lon=-121.31,
+        grid_width_m=5000,
+        grid_height_m=5000,
+        step_m=20,
+    )
+    cid = "bend--oregon--united-states"
+    run_date = date(2026, 7, 8)
+    for network_type, pct in (("drive", 98.4), ("all_public", 61.2)):
+        db.register_street_walk(
+            conn,
+            city_id=cid,
+            run_date=run_date,
+            csv_filename=f"walk_{network_type}.csv.gz",
+            provider="gsv",
+            network_type=network_type,
+            coverage_pct_by_length=pct,
+        )
+    assert conn.execute("SELECT COUNT(*) FROM street_walks").fetchone()[0] == 2
+    assert db.get_latest_street_walk(conn, cid)["coverage_pct_by_length"] == 98.4
+    assert (
+        db.get_latest_street_walk(conn, cid, "gsv", "all_public")["coverage_pct_by_length"] == 61.2
+    )
+
+    # Re-collecting ONE network type on the same date replaces only its own row.
+    db.register_street_walk(
+        conn,
+        city_id=cid,
+        run_date=run_date,
+        csv_filename="walk_drive.csv.gz",
+        provider="gsv",
+        network_type="drive",
+        coverage_pct_by_length=97.0,
+    )
+    assert conn.execute("SELECT COUNT(*) FROM street_walks").fetchone()[0] == 2
+    assert db.get_latest_street_walk(conn, cid)["coverage_pct_by_length"] == 97.0
+    assert (
+        db.get_latest_street_walk(conn, cid, "gsv", "all_public")["coverage_pct_by_length"] == 61.2
+    )
+
+    # And the manifest source must advertise BOTH, not collapse to one.
+    latest = db.get_latest_street_walks_all(conn)
+    assert sorted(r["network_type"] for r in latest) == ["all_public", "drive"]
+    conn.close()
+
+
 def test_register_street_walk_round_trips_any_imagery_coverage(conn, city):
     """Both street-coverage numbers persist; a GSV walk's are equal by
     construction (GSV emits no flat imagery), a Mapillary walk's can differ."""

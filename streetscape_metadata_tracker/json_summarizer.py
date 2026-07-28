@@ -737,14 +737,15 @@ def generate_aggregate_v2(conn, data_dir: str) -> dict[str, Any]:
 def generate_streetwalk_manifest(conn, data_dir: str) -> dict[str, Any]:
     """
     Build and write ``streetwalks.json.gz`` — a small sidecar index of the
-    latest road-walk street-coverage artifact per (city, provider), from the
-    ``street_walks`` catalog table (issue #155).
+    latest road-walk street-coverage artifact per (city, provider, network
+    type), from the ``street_walks`` catalog table (issue #155).
 
     The city page needs this because the streetwalk coverage GeoJSON is NOT a
     sibling of the grid run file (its ``sp{N}`` spacing is a free parameter and
     its run-date differs from the grid run's), so the frontend cannot derive the
     artifact URL the way it derives ``_streets.json.gz``. The manifest maps
-    (city_id, provider) → the exact ``coverage_filename`` plus headline stats.
+    (city_id, provider, network_type) → the exact ``coverage_filename`` plus
+    headline stats.
 
     Kept deliberately separate from the aggregate ``cities.json.gz`` (schema v3):
     the aggregate contract stays untouched, and #102 later folds these stats in
@@ -769,6 +770,12 @@ def generate_streetwalk_manifest(conn, data_dir: str) -> dict[str, Any]:
             {
                 "city_id": row["city_id"],
                 "provider": row["provider"],
+                # Which OSM network was walked. 'drive' (motorized roads only)
+                # is the original and still-scheduled series; 'all_public' adds
+                # alleys, footways, park paths, cycleways and steps. A city can
+                # have an entry for each, so consumers must select on this —
+                # the frontend defaults to 'drive'.
+                "network_type": row["network_type"],
                 "coverage_filename": row["coverage_filename"],
                 "run_date": row["run_date"],
                 "spacing_m": row["spacing_m"],
