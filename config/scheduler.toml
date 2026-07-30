@@ -23,6 +23,20 @@ max_consecutive_failures = 5
 # applies to small cities and to the fast Mapillary provider.
 city_timeout_minutes = 180
 
+# Wall-clock ceiling on the city loop. Once this much of the night has elapsed,
+# run-due stops STARTING new cities (the one in flight is also capped to what is
+# left) and goes straight to regenerating the aggregate + streetwalk manifest
+# and publishing. Cities not reached simply stay due and lead tomorrow's
+# stalest-first queue.
+#
+# This exists because the tail is what makes a night VISIBLE. run-due is a
+# oneshot systemd unit under TimeoutStartSec, and before this a batch that
+# overran was SIGKILLed mid-loop — every city it had already collected sat in
+# the catalog, correct but unpublished, until an operator noticed and ran
+# regenerate-aggregate by hand (issue #167). Keep it comfortably under the
+# unit's TimeoutStartSec so this deadline, not systemd, ends a long night.
+max_batch_hours = 10
+
 # Legacy fallback: when no [providers.*] sections exist below, this is the
 # GSV daily budget and only GSV is collected.
 daily_request_budget = 10000000

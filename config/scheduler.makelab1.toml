@@ -11,6 +11,10 @@ grace_days = 7
 max_cities_per_day = 20    # cities/day (a city runs all enabled providers)
 max_consecutive_failures = 5
 city_timeout_minutes = 180
+# Stop STARTING cities after this many hours so the aggregate/manifest/publish
+# tail still runs. Must stay below the unit's TimeoutStartSec (14h) — before
+# this existed, a 12h systemd kill discarded a whole night's publish (#167).
+max_batch_hours = 10
 daily_request_budget = 10000000   # legacy fallback; superseded by [providers.*]
 
 # Per-provider daily request budgets (own run series, ledger, failure tracking).

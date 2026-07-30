@@ -3,7 +3,10 @@
 import gzip
 import json
 import os
+import re
+import signal
 from datetime import date
+from pathlib import Path
 
 from streetscape_metadata_tracker import db
 from streetscape_metadata_tracker.naming import (
@@ -392,6 +395,14 @@ def test_makelab1_production_config_is_wired():
     assert "/cse/web/" not in cfg.db_path and "/cse/web/" not in cfg.data_dir
     # Shared-host resource guard is active in production.
     assert cfg.resource_guard.enabled
+    # The batch deadline must stay strictly below the unit's TimeoutStartSec, or
+    # systemd kills the loop first and the night publishes nothing (#167). These
+    # two live in different files and only mean something together.
+    unit = Path(_PROJECT_ROOT, "deploy", "systemd", "streetscape-tracker.service").read_text()
+    unit_timeout_h = int(re.search(r"^TimeoutStartSec=(\d+)h", unit, re.M).group(1))
+    assert cfg.max_batch_hours < unit_timeout_h, (
+        f"max_batch_hours={cfg.max_batch_hours} must be under TimeoutStartSec={unit_timeout_h}h"
+    )
 
 
 def test_run_one_city_honors_connection_limit_override(conn, monkeypatch, tmp_path):
@@ -567,7 +578,14 @@ def test_budget_ledger_defers_second_city_when_first_consumes_budget(conn, monke
     ran = []
 
     def fake_run(
-        cfg, city, run_today, provider="gsv", connection_limit=None, daily_budget=0, conn=None
+        cfg,
+        city,
+        run_today,
+        provider="gsv",
+        connection_limit=None,
+        daily_budget=0,
+        conn=None,
+        remaining_s=None,
     ):
         # Simulate the real pipeline's ledger write for the requests spent
         db.add_api_usage(conn, run_today, sched.estimate_requests(city, provider), provider)
@@ -615,7 +633,7 @@ def test_oversized_city_does_not_starve_queue(conn, monkeypatch):
     monkeypatch.setattr(
         sched,
         "_run_one_city",
-        lambda cfg, city, today, provider="gsv", connection_limit=None, daily_budget=0, conn=None: (
+        lambda cfg, city, today, provider="gsv", connection_limit=None, daily_budget=0, conn=None, remaining_s=None: (
             ran.append(city.city_id) or True
         ),
     )
@@ -644,7 +662,7 @@ def test_run_due_pairs_providers_per_city(conn, monkeypatch):
     monkeypatch.setattr(
         sched,
         "_run_one_city",
-        lambda cfg, city, today, provider="gsv", connection_limit=None, daily_budget=0, conn=None: (
+        lambda cfg, city, today, provider="gsv", connection_limit=None, daily_budget=0, conn=None, remaining_s=None: (
             ran.append((city.city_id, provider)) or (provider == "gsv")
         ),
     )
@@ -694,7 +712,7 @@ def test_run_due_provider_budgets_are_independent(conn, monkeypatch):
     monkeypatch.setattr(
         sched,
         "_run_one_city",
-        lambda cfg, city, today, provider="gsv", connection_limit=None, daily_budget=0, conn=None: (
+        lambda cfg, city, today, provider="gsv", connection_limit=None, daily_budget=0, conn=None, remaining_s=None: (
             ran.append((city.city_id, provider)) or True
         ),
     )
@@ -745,7 +763,7 @@ def test_run_due_refreshes_the_manifest_only_after_a_success(conn, monkeypatch):
     monkeypatch.setattr(
         sched,
         "_run_one_city",
-        lambda cfg, city, today, provider="gsv", connection_limit=None, daily_budget=0, conn=None: (
+        lambda cfg, city, today, provider="gsv", connection_limit=None, daily_budget=0, conn=None, remaining_s=None: (
             False
         ),
     )
@@ -756,7 +774,7 @@ def test_run_due_refreshes_the_manifest_only_after_a_success(conn, monkeypatch):
     monkeypatch.setattr(
         sched,
         "_run_one_city",
-        lambda cfg, city, today, provider="gsv", connection_limit=None, daily_budget=0, conn=None: (
+        lambda cfg, city, today, provider="gsv", connection_limit=None, daily_budget=0, conn=None, remaining_s=None: (
             True
         ),
     )
@@ -1087,7 +1105,7 @@ def test_street_dispatch_passes_the_full_budget_not_the_remainder(conn, monkeypa
     monkeypatch.setattr(
         sched,
         "_run_one_city",
-        lambda cfg, city, today, provider="gsv", connection_limit=None, daily_budget=0, conn=None: (
+        lambda cfg, city, today, provider="gsv", connection_limit=None, daily_budget=0, conn=None, remaining_s=None: (
             seen.setdefault(provider, daily_budget) is not None or True
         ),
     )
@@ -1313,7 +1331,7 @@ def test_run_due_salvages_a_finished_walk_instead_of_recording_failure(conn, mon
     monkeypatch.setattr(
         sched,
         "_run_one_city",
-        lambda cfg, city, today, provider="gsv", connection_limit=None, daily_budget=0, conn=None: (
+        lambda cfg, city, today, provider="gsv", connection_limit=None, daily_budget=0, conn=None, remaining_s=None: (
             False
         ),
     )
@@ -1393,7 +1411,7 @@ def test_street_channel_failure_is_not_reconciled_as_an_orphan_run(conn, monkeyp
     monkeypatch.setattr(
         sched,
         "_run_one_city",
-        lambda cfg, city, today, provider="gsv", connection_limit=None, daily_budget=0, conn=None: (
+        lambda cfg, city, today, provider="gsv", connection_limit=None, daily_budget=0, conn=None, remaining_s=None: (
             False
         ),
     )
@@ -1453,3 +1471,136 @@ def test_collection_log_appends_rather_than_truncating_a_retry(conn, tmp_path):
 
     text = (tmp_path / f"collect_{city.city_id}_gsv_2026-07-01.log").read_text()
     assert "FIRST ATTEMPT" in text and "SECOND ATTEMPT" in text
+
+
+# ── Batch deadline / always-publish (issue #167) ───────────────────────────
+
+
+def _publishing_cfg(**overrides):
+    """A config whose tail is fully observable: publish on, alerts off."""
+    base = dict(
+        daily_request_budget=10_000_000,
+        publish_enabled=True,
+        max_cities_per_day=20,
+    )
+    base.update(overrides)
+    return SchedulerConfig(**base)
+
+
+def _stub_tail(monkeypatch, sched, conn, published):
+    """Stub the batch tail so a test can assert it ran, without touching disk."""
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+    monkeypatch.setattr(sched.time, "sleep", lambda s: None)
+    monkeypatch.setattr(sched, "generate_aggregate_v2", lambda c, d: published.append("aggregate"))
+    monkeypatch.setattr(
+        sched, "generate_streetwalk_manifest", lambda c, d: published.append("manifest") or {}
+    )
+    monkeypatch.setattr(sched, "_publish", lambda cfg, summary: published.append("publish") or 0)
+
+
+def test_batch_deadline_stops_the_loop_but_still_publishes(conn, monkeypatch):
+    """The whole point of the deadline: a night that runs long stops STARTING
+    cities and still regenerates + publishes. Before this, systemd's
+    TimeoutStartSec SIGKILLed the loop and every city already collected stayed
+    invisible on the public site (issue #167)."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    for name in ("Alpha", "Beta", "Gamma"):
+        _register(conn, name, width=1000, height=1000, step=20)
+    db.assign_schedule(conn, 90)
+    conn.execute("UPDATE schedule_state SET last_success_at = NULL")
+    conn.commit()
+
+    ran, published = [], []
+    # Each city "takes" an hour of the batch's wall clock.
+    clock = iter(range(0, 100_000, 3600))
+    monkeypatch.setattr(sched.time, "monotonic", lambda: next(clock))
+
+    def fake_run(cfg, city, today, provider="gsv", **kwargs):
+        ran.append(city.city_id)
+        return True
+
+    monkeypatch.setattr(sched, "_run_one_city", fake_run)
+    _stub_tail(monkeypatch, sched, conn, published)
+
+    # 2 h of budget: the deadline bites well before the 3 due cities are done.
+    rc = sched.cmd_run_due(_publishing_cfg(max_batch_hours=2), today=date(2026, 7, 2))
+
+    assert len(ran) < 3, "deadline should have stopped the loop early"
+    assert published == ["aggregate", "manifest", "publish"], (
+        "a deadline-stopped night must still publish what it collected"
+    )
+    assert rc == 0, "stopping at the deadline is not a failure"
+
+
+def test_sigterm_winds_the_batch_down_instead_of_killing_the_publish(conn, monkeypatch):
+    """systemd stops the unit with SIGTERM. Under the default handler that lands
+    mid-loop and the night publishes nothing; the handler turns it into a stop
+    request checked between cities."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    for name in ("Alpha", "Beta", "Gamma"):
+        _register(conn, name, width=1000, height=1000, step=20)
+    db.assign_schedule(conn, 90)
+    conn.execute("UPDATE schedule_state SET last_success_at = NULL")
+    conn.commit()
+
+    ran, published = [], []
+
+    def fake_run(cfg, city, today, provider="gsv", **kwargs):
+        ran.append(city.city_id)
+        os.kill(os.getpid(), signal.SIGTERM)  # as systemd would, mid-batch
+        return True
+
+    monkeypatch.setattr(sched, "_run_one_city", fake_run)
+    _stub_tail(monkeypatch, sched, conn, published)
+
+    rc = sched.cmd_run_due(_publishing_cfg(), today=date(2026, 7, 2))
+
+    assert len(ran) == 1, "the loop should stop after the city that saw SIGTERM"
+    assert published == ["aggregate", "manifest", "publish"]
+    assert rc == 0
+    # The handler must be uninstalled again, or a later SIGTERM is swallowed.
+    assert signal.getsignal(signal.SIGTERM) in (signal.SIG_DFL, signal.default_int_handler)
+
+
+def test_loop_error_still_publishes_but_reports_an_unhealthy_night(conn, monkeypatch):
+    """Publishing what was collected must not silence a real bug: the batch
+    still exits nonzero and alerts."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    _register(conn, "Alpha", width=1000, height=1000, step=20)
+    db.assign_schedule(conn, 90)
+    conn.execute("UPDATE schedule_state SET last_success_at = NULL")
+    conn.commit()
+
+    published, alerts = [], []
+
+    def boom(cfg, city, today, provider="gsv", **kwargs):
+        raise RuntimeError("something unexpected")
+
+    monkeypatch.setattr(sched, "_run_one_city", boom)
+    monkeypatch.setattr(sched, "send_alert", lambda *a, **k: alerts.append(a))
+    _stub_tail(monkeypatch, sched, conn, published)
+
+    rc = sched.cmd_run_due(_publishing_cfg(), today=date(2026, 7, 2))
+
+    assert rc == 1, "a crashed loop is an unhealthy night even though it published"
+    assert alerts, "the operator must still be told"
+
+
+def test_city_timeout_is_clamped_to_the_remaining_batch_budget(conn):
+    """A big city started just inside the deadline would otherwise run its full
+    derived timeout and blow straight through it."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    city = db.resolve_city(conn, _register(conn, "Huge", width=60_000, height=60_000, step=20))
+    cfg = SchedulerConfig()
+
+    unclamped = sched.city_timeout_seconds(cfg, city, "gsv")
+    clamped = sched.city_timeout_seconds(cfg, city, "gsv", remaining_s=1800)
+
+    assert unclamped > 1800, "this city is meant to want more than the remainder"
+    assert clamped == 1800
+    # Never clamp below the floor that lets a child reach its first request.
+    assert sched.city_timeout_seconds(cfg, city, "gsv", remaining_s=1) == 300

@@ -37,8 +37,14 @@ Environment=STREETSCAPE_PUBLISH_LOCAL=1
 # config file is named makelab1 for historical reasons but is the single shared
 # production config (paths are identical on both boxes via the shared ZFS).
 ExecStart=%h/streetscape-tracker/.venv-makelab2/bin/python -m streetscape_metadata_tracker.scheduler --config %h/streetscape-tracker/config/scheduler.makelab1.toml run-due
-# A full day of cities can legitimately take hours
-TimeoutStartSec=12h
+# A full day of cities can legitimately take hours. This must stay ABOVE
+# [schedule].max_batch_hours (10h) so the scheduler's own deadline is what ends
+# a long night: it stops starting cities and still regenerates the aggregate and
+# publishes. Reaching THIS limit instead means a SIGKILL mid-loop, which throws
+# away the publish for every city already collected that night (issue #167 —
+# observed 2026-07-29, when a batch died at exactly 12h and the public site went
+# two days stale while the catalog kept advancing).
+TimeoutStartSec=14h
 
 # Anything not already captured by the scheduler's own rotating log or a child's
 # per-attempt log — an uncaught traceback, an OOM kill notice, output from a
