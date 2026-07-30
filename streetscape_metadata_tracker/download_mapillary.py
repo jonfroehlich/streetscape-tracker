@@ -50,7 +50,7 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-from .analysis import FLAT_ONLY
+from .analysis import FLAT_ONLY, REQUEST_FAILED
 from .config import MAPILLARY_METADATA_DTYPES
 from .download_common import (
     DownloadError,
@@ -299,11 +299,60 @@ def assign_to_grid(
     return i, j, in_grid
 
 
+def _points_in_tiles(
+    lats: np.ndarray, lons: np.ndarray, tiles: list[tuple[int, int]], zoom: int = TILE_ZOOM
+) -> np.ndarray:
+    """
+    Boolean mask of which (lat, lon) points fall inside any of ``tiles``.
+
+    Vectorized form of ``lonlat_to_tile_frac``; used to attribute undownloaded
+    tiles back to the grid points they cover (issue #168). Deliberately ignores
+    the tiles' render buffer: a point just outside a failed tile may in fact
+    have been covered by a neighbour, and calling it "unknown" errs toward
+    admitting we don't know rather than claiming empty.
+    """
+    if len(lats) == 0:
+        return np.zeros(0, dtype=bool)
+    n = 2**zoom
+    fx = (lons + 180.0) / 360.0 * n
+    fy = (1.0 - np.arcsinh(np.tan(np.radians(lats))) / np.pi) / 2.0 * n
+    # One packed int per tile so membership is a single sorted-array lookup
+    # instead of a Python loop over the (usually tiny) failed-tile list.
+    keys = fx.astype(np.int64) * n + fy.astype(np.int64)
+    failed_keys = np.array(sorted(x * n + y for x, y in tiles), dtype=np.int64)
+    return np.isin(keys, failed_keys)
+
+
 # ── Download ───────────────────────────────────────────────────────────────
 
 
+# A city whose permanently-failed tiles exceed this fraction of the tile set is
+# abandoned rather than finalized as an immutable snapshot. Mirrors
+# download_gsv.MAX_FAILED_POINT_FRACTION: tolerate a blip, refuse a hole.
+#
+# It is a FRACTION rather than an absolute count on purpose, and the
+# consequence is worth being explicit about: a big city (Chicago, 480 tiles)
+# absorbs a stray 404 at 0.2%, while a small city (16 tiles) gets no tolerance
+# at all, because there one tile is ~6% of its entire area. That asymmetry is
+# the right way round — the threshold is bounding the size of the unknown
+# region in a snapshot that is immutable once published, not counting requests.
+# A small city that loses a tile simply fails and is retried on its next
+# nightly slot, which costs a few tile requests.
+MAX_FAILED_TILE_FRACTION = 0.02
+
+# The tiles CDN can return a transient 404 for a tile that serves fine minutes
+# later (observed on Chicago, 2026-07-29: z14/4196/6084 404'd through every
+# retry, then returned 2.1M features the next day). Three tries inside a
+# 60-second window was too thin a budget for that.
+_TILE_MAX_TRIES = 5
+_TILE_MAX_TIME_S = 120
+
+
 @backoff.on_exception(
-    backoff.expo, (asyncio.TimeoutError, aiohttp.ClientError), max_tries=3, max_time=60
+    backoff.expo,
+    (asyncio.TimeoutError, aiohttp.ClientError),
+    max_tries=_TILE_MAX_TRIES,
+    max_time=_TILE_MAX_TIME_S,
 )
 async def _fetch_tile(
     session: aiohttp.ClientSession, url: str, timeout: aiohttp.ClientTimeout
@@ -375,8 +424,14 @@ async def fetch_city_images_async(
     try:
         # Token rides in each tile URL as ?access_token= — see TILE_URL_TEMPLATE
         # comment (the tiles CDN 403s the Authorization header).
+        #
+        # return_exceptions: one bad tile out of hundreds used to discard the
+        # whole city, for both the grid run and the road walk (issue #168). A
+        # transient 404 is worth one tile, not a city.
         async with aiohttp.ClientSession() as session:
-            results = await asyncio.gather(*(fetch_one(x, y) for x, y in tiles))
+            settled = await asyncio.gather(
+                *(fetch_one(x, y) for x, y in tiles), return_exceptions=True
+            )
     except DownloadError as e:
         # e.g. the rejected-token error from _fetch_tile; attach the spent
         # request count so the caller can still record it in the ledger.
@@ -388,6 +443,38 @@ async def fetch_city_images_async(
         raise error from e
     finally:
         progress_bar.close()
+
+    results = []
+    failed_tiles: list[tuple[int, int]] = []
+    first_error: BaseException | None = None
+    for (x, y), outcome in zip(tiles, settled, strict=True):
+        if isinstance(outcome, BaseException):
+            # A bad token is a whole-city condition, not a per-tile one: every
+            # remaining tile would fail the same way, so don't dress it up as
+            # partial coverage.
+            if isinstance(outcome, DownloadError):
+                outcome.api_requests = api_requests
+                raise outcome
+            failed_tiles.append((x, y))
+            first_error = first_error or outcome
+        else:
+            results.append(outcome)
+
+    if failed_tiles:
+        failed_fraction = len(failed_tiles) / len(tiles)
+        detail = f"{len(failed_tiles)}/{len(tiles)} tiles failed: {redact_credentials(first_error)}"
+        if failed_fraction > MAX_FAILED_TILE_FRACTION:
+            error = DownloadError(
+                f"Mapillary tile download failed: {detail} "
+                f"({failed_fraction:.1%} > {MAX_FAILED_TILE_FRACTION:.0%} tolerated); "
+                f"refusing to finalize an incomplete snapshot"
+            )
+            error.api_requests = api_requests
+            raise error from first_error
+        # Under the threshold the run continues, but the caller must mark the
+        # affected grid points REQUEST_FAILED rather than let them look like
+        # genuine no-imagery — see download_mapillary_metadata_async.
+        logger.warning(f"Continuing with {detail}; affected grid points marked REQUEST_FAILED")
 
     # Tiles are encoded with a buffer, so features near tile edges appear in
     # two tiles — dedup on image id (panos and flats share the id space).
@@ -401,6 +488,8 @@ async def fetch_city_images_async(
         "api_requests": api_requests,
         "tiles": len(tiles),
         "raw_feature_count": sum(len(r) for r in results),
+        # (x, y) of tiles that never came back. Empty on a clean run.
+        "failed_tiles": failed_tiles,
     }
 
 
@@ -468,6 +557,7 @@ async def download_mapillary_metadata_async(
     api_requests = fetched["api_requests"]
     tiles = fetched["tiles"]
     results = fetched["raw_feature_count"]
+    failed_tiles = fetched.get("failed_tiles") or []
     panos = [img for img in images if img["is_pano"]]
     flats = [img for img in images if not img["is_pano"]]
     logger.info(
@@ -587,6 +677,23 @@ async def download_mapillary_metadata_async(
         },
         columns=columns,
     )
+    # An uncovered point inside a tile that never downloaded is UNKNOWN, not
+    # empty. Left as ZERO_RESULTS it would be indistinguishable from genuine
+    # no-imagery and would quietly understate coverage and pollute the
+    # run-to-run diff, so it gets its own status — the same shape as the GSV
+    # downloader writing REQUEST_FAILED rows for its sub-threshold holes
+    # (issue #168). REQUEST_FAILED counts toward neither 360° nor any-imagery
+    # coverage, and is already one of analysis.SYSTEMIC_FAILURE_STATUSES.
+    if failed_tiles:
+        in_failed_tile = _points_in_tiles(
+            grid_lats[empty_ordinals], grid_lons[empty_ordinals], failed_tiles
+        )
+        empty_df.loc[in_failed_tile, "status"] = REQUEST_FAILED
+        num_failed_points = int(in_failed_tile.sum())
+        logger.warning(
+            f"{num_failed_points:,} grid points fall in {len(failed_tiles)} undownloaded "
+            f"tile(s); written as {REQUEST_FAILED} rather than empty"
+        )
     num_empty_points = len(empty_ordinals)
     del empty_ordinals
 

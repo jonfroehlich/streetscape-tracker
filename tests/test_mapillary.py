@@ -10,15 +10,18 @@ import math
 import re
 from datetime import UTC, datetime
 
+import aiohttp
 import geopy
 import mapbox_vector_tile
 import numpy as np
 import pandas as pd
 import pytest
+import yarl
+from multidict import CIMultiDict, CIMultiDictProxy
 
 from streetscape_metadata_tracker import download_mapillary as dm
 from streetscape_metadata_tracker.config import MAPILLARY_METADATA_DTYPES
-from streetscape_metadata_tracker.download_common import generate_grid_points
+from streetscape_metadata_tracker.download_common import DownloadError, generate_grid_points
 from streetscape_metadata_tracker.json_summarizer import compute_mapillary_meta
 
 SEATTLE = (47.6062, -122.3321)
@@ -710,3 +713,123 @@ def test_compute_mapillary_meta_none_for_legacy_schema():
         columns=list(METADATA_DTYPES.keys()),
     )
     assert compute_mapillary_meta(df) is None
+
+
+# ── Tile fault tolerance (issue #168) ──────────────────────────────────────
+
+
+def _failing_fetch(fail_xy, tiles_by_xy=None, status=404):
+    """A _fetch_tile stand-in where one chosen tile always errors."""
+
+    async def fake_fetch(session, url, timeout):
+        m = re.search(r"/2/14/(\d+)/(\d+)\?", url)
+        xy = (int(m.group(1)), int(m.group(2)))
+        if xy in fail_xy:
+            # A real RequestInfo: aiohttp's __str__ dereferences it, and the
+            # error text goes through redact_credentials, so the URL (which
+            # carries the access token) must be present and scrubbable.
+            request_info = aiohttp.RequestInfo(
+                url=yarl.URL(url),
+                method="GET",
+                headers=CIMultiDictProxy(CIMultiDict()),
+                real_url=yarl.URL(url),
+            )
+            raise aiohttp.ClientResponseError(
+                request_info=request_info, history=(), status=status, message="Not Found"
+            )
+        return (tiles_by_xy or {}).get(xy, mapbox_vector_tile.encode([]))
+
+    return fake_fetch
+
+
+def _fetch_city(monkeypatch, fetch, lat, lon, width=30000, height=30000, step=2000):
+    monkeypatch.setattr(dm, "_fetch_tile", fetch)
+    return asyncio.run(
+        dm.fetch_city_images_async(
+            "Test City", dm.grid_bbox(lat, lon, width, height, step), "MLY|test|token"
+        )
+    )
+
+
+def test_one_bad_tile_no_longer_kills_the_whole_city(monkeypatch):
+    """The regression this exists for: Chicago 2026-07-29 lost both Mapillary
+    channels to a single transient 404 on z14/4196/6084, and the same tile
+    served 2.1M features the next day."""
+    lat, lon = 41.8, -87.7
+    all_tiles = dm.tiles_for_bbox(*dm.grid_bbox(lat, lon, 30000, 30000, 2000))
+    assert 1 / len(all_tiles) <= dm.MAX_FAILED_TILE_FRACTION, "one tile must be under threshold"
+
+    result = _fetch_city(monkeypatch, _failing_fetch({all_tiles[0]}), lat, lon)
+
+    assert result["failed_tiles"] == [all_tiles[0]]
+    assert result["tiles"] == len(all_tiles), "the tile set is still reported in full"
+
+
+def test_too_many_failed_tiles_still_refuses_to_finalize(monkeypatch):
+    """Tolerating a blip must not mean tolerating a hole."""
+    lat, lon = 41.8, -87.7
+    all_tiles = dm.tiles_for_bbox(*dm.grid_bbox(lat, lon, 30000, 30000, 2000))
+
+    with pytest.raises(DownloadError) as excinfo:
+        _fetch_city(monkeypatch, _failing_fetch(set(all_tiles)), lat, lon)
+
+    assert "refusing to finalize" in str(excinfo.value)
+    # The ledger still learns what the doomed attempt spent.
+    assert getattr(excinfo.value, "api_requests", 0) > 0
+
+
+def test_a_rejected_token_is_never_treated_as_a_partial_failure(monkeypatch):
+    """401/403 is a whole-city condition — every other tile would fail the same
+    way, so it must not be dressed up as one tolerable bad tile."""
+    lat, lon = 41.8, -87.7
+
+    async def bad_token(session, url, timeout):
+        raise DownloadError("Mapillary rejected the access token (HTTP 401).")
+
+    with pytest.raises(DownloadError) as excinfo:
+        _fetch_city(monkeypatch, bad_token, lat, lon)
+
+    assert "rejected the access token" in str(excinfo.value)
+    assert "refusing to finalize" not in str(excinfo.value)
+
+
+def test_points_under_a_failed_tile_are_request_failed_not_empty(monkeypatch, tmp_path):
+    """An uncovered point under an undownloaded tile is UNKNOWN. Left as
+    ZERO_RESULTS it is indistinguishable from genuine no-imagery and quietly
+    understates coverage."""
+    lat, lon = 41.8, -87.7
+    width = height = 30000
+    step = 500  # coarse: many tiles (so one failure is tolerated), few points
+    all_tiles = dm.tiles_for_bbox(*dm.grid_bbox(lat, lon, width, height, step))
+    failed = all_tiles[len(all_tiles) // 2]  # an interior tile, not a corner
+
+    monkeypatch.setattr(dm, "_fetch_tile", _failing_fetch({failed}))
+    out_path = str(tmp_path / "test_mapillary_2026-07-05.csv.gz")
+    result = asyncio.run(
+        dm.download_mapillary_metadata_async(
+            "Test City", lat, lon, width, height, step, "MLY|test|token", out_path
+        )
+    )
+
+    df = result["df"]
+    failed_rows = df[df["status"] == "REQUEST_FAILED"]
+    assert len(failed_rows) > 0, "the failed tile covers part of this grid"
+
+    # Every REQUEST_FAILED row really does sit inside the failed tile...
+    inside = dm._points_in_tiles(
+        failed_rows["query_lat"].to_numpy(), failed_rows["query_lon"].to_numpy(), [failed]
+    )
+    assert inside.all()
+    # ...and no point outside it was mislabelled.
+    empty_rows = df[df["status"] == "ZERO_RESULTS"]
+    outside = dm._points_in_tiles(
+        empty_rows["query_lat"].to_numpy(), empty_rows["query_lon"].to_numpy(), [failed]
+    )
+    assert not outside.any()
+
+
+def test_a_clean_run_reports_no_failed_tiles(monkeypatch, straddling_city):
+    """The tolerance path must be inert when nothing goes wrong."""
+    lat, lon = straddling_city
+    result = _fetch_city(monkeypatch, _failing_fetch(set()), lat, lon)
+    assert result["failed_tiles"] == []
