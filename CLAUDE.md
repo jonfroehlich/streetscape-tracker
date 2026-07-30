@@ -34,6 +34,11 @@ python -m streetscape_metadata_tracker.scheduler reconcile-walks --dry-run      
 # One-time migration of legacy (undated) data files into the catalog
 python scripts/migrate_to_db.py            # dry run; --execute to apply
 
+# Manually resize one city's frozen grid (escape hatch for point-box bboxes that
+# issue #91's bulk re-registration can't fix). Catalog-only, no API calls; dry
+# run by default, and refuses a city with real runs unless --force.
+python scripts/resize_city.py "Browning, MT" --width 2500 --height 2500 --execute
+
 # One-time rename of road-walk artifacts collected before streetwalk filenames
 # carried a provider token (non-gsv walks only); dry run, --execute to apply
 python scripts/repair_streetwalk_names.py
