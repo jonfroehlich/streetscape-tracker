@@ -23,6 +23,18 @@
     gtag("config", "G-ZSQGNSTEES");
   </script>
 
+  <!-- Site header (shared markup with city.html / streets.html; styles live
+       in streetscape-shared.css) -->
+  <header class="site-header">
+    <a class="site-brand" href="index.html">Streetscape Tracker</a>
+    <nav class="site-nav" aria-label="Main">
+      <a href="index.html" aria-current="page">Map</a>
+      <a href="streets.html">Streets</a>
+    </nav>
+    <a class="site-external" href="https://github.com/jonfroehlich/streetscape-tracker"
+       target="_blank" rel="noopener">About &#8599;</a>
+  </header>
+
   <fieldset id="provider-toggle" class="provider-toggle"
             aria-label="Imagery provider">
     <legend class="visually-hidden">Imagery provider</legend>
@@ -50,6 +62,10 @@
     <label>
       <input type="radio" name="metric" value="coverage_any">
       <span title="Mapillary's full footprint including flat imagery; equals Coverage for Google Street View">Any imagery</span>
+    </label>
+    <label>
+      <input type="radio" name="metric" value="streets">
+      <span title="Share of the city's OSM street network driven, from road-walk collection. Only available for cities that have been walked — see the Streets page.">Street coverage</span>
     </label>
   </fieldset>
 

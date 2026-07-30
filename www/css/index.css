@@ -8,10 +8,12 @@ body {
   overflow: hidden;
 }
 
+/* Every `top` below clears the 44px .site-header (streetscape-shared.css). */
+
 /* ── Stats banner (top-center) ──────────────────────────────── */
 #stats {
   position: fixed;
-  top: 20px;
+  top: 64px;
   left: 50%;
   transform: translateX(-50%);
   background: rgba(255, 255, 255, 0.75);
@@ -20,6 +22,13 @@ body {
   box-shadow: 0 0 10px rgba(0, 0, 0, 0.2);
   z-index: 1000;
   text-align: center;
+}
+
+/* Secondary line in the stats banner (e.g. the streets-mode "N of M cities
+   walked" note) — smaller and quieter than the headline counts. */
+.stats-note {
+  font-size: 12px;
+  color: #444;
 }
 
 /* ── Loading overlay ────────────────────────────────────────── */
@@ -61,7 +70,7 @@ body {
 /* ── Legend (top-right) ─────────────────────────────────────── */
 .legend {
   position: fixed;
-  top: 20px;
+  top: 64px;
   right: 20px;
   max-height: 80vh;
   overflow-y: auto;
@@ -270,7 +279,7 @@ a.view-details-btn:focus-visible {
 /* ── City search (top-left) ──────────────────────────────────── */
 .city-search {
   position: fixed;
-  top: 20px;
+  top: 64px;
   left: 60px;
   z-index: 1000;
   display: flex;
@@ -358,7 +367,7 @@ a.view-details-btn:focus-visible {
 /* ── Imagery provider toggle (GSV / Mapillary) ──────────────── */
 .provider-toggle {
   position: fixed;
-  top: 70px;
+  top: 114px;
   left: 60px;
   z-index: 1000;
   display: flex;
@@ -402,7 +411,7 @@ a.view-details-btn:focus-visible {
 /* Shares .provider-toggle's chrome; only the vertical offset differs
    (stacked directly below the provider toggle). */
 .metric-toggle {
-  top: 112px;
+  top: 156px;
 }
 
 /* .visually-hidden lives in streetscape-shared.css (used by both pages) */

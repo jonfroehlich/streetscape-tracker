@@ -1,15 +1,23 @@
 """Scheduler logic tests — pure logic only, no network or subprocesses."""
 
+import gzip
+import json
 import os
 from datetime import date
 
 from streetscape_metadata_tracker import db
+from streetscape_metadata_tracker.naming import (
+    generate_streetwalk_filename,
+    streetwalk_coverage_filename,
+)
 from streetscape_metadata_tracker.scheduler import (
     ResourceGuardConfig,
     SchedulerConfig,
     SystemPressure,
     _reconcile_orphaned_run,
+    _reconcile_orphaned_walk,
     build_parser,
+    cmd_reconcile_walks,
     estimate_requests,
     load_scheduler_config,
     plan_connection_limit,
@@ -35,7 +43,7 @@ def _register(conn, name, width=5000, height=5000, step=20):
     )
 
 
-def test_run_one_city_command_defers_skip_policy_to_scheduler(conn, monkeypatch):
+def test_run_one_city_command_defers_skip_policy_to_scheduler(conn, monkeypatch, tmp_path):
     """
     The scheduler already decided this city is due (cycle − grace), so the
     subprocess must run with --min-days-since-last-run 0: otherwise any
@@ -51,7 +59,7 @@ def test_run_one_city_command_defers_skip_policy_to_scheduler(conn, monkeypatch)
 
     captured = {}
 
-    def fake_run(cmd, timeout=None, cwd=None):
+    def fake_run(cmd, timeout=None, cwd=None, **kwargs):
         captured["cmd"] = cmd
 
         class R:
@@ -60,7 +68,9 @@ def test_run_one_city_command_defers_skip_policy_to_scheduler(conn, monkeypatch)
         return R()
 
     monkeypatch.setattr(sched.subprocess, "run", fake_run)
-    assert sched._run_one_city(SchedulerConfig(), city, date(2026, 7, 1), "gsv")
+    assert sched._run_one_city(
+        SchedulerConfig(log_dir=str(tmp_path)), city, date(2026, 7, 1), "gsv"
+    )
 
     cmd = captured["cmd"]
     i = cmd.index("--min-days-since-last-run")
@@ -248,6 +258,27 @@ daily_request_budget = 1
     assert "bogus" not in cfg.providers  # unknown providers are ignored
 
 
+def test_config_rejects_an_unknown_network_type(tmp_path):
+    """A bad network_type must not reach the collector's argparse choices.
+
+    `collect --network-type` validates its argument, so an unknown value (a
+    typo, or the osmnx-1.x name 'all_private') exits 2 on EVERY street run of
+    EVERY due city, night after night, with nothing in the scheduler's output
+    naming the config as the cause. Fall back to the default series instead.
+    """
+    p = tmp_path / "s.toml"
+    p.write_text("""
+[providers.gsv_streets]
+network_type = "all_private"
+[providers.mapillary_streets]
+network_type = "all_public"
+""")
+    cfg = load_scheduler_config(str(p))
+    assert cfg.providers["gsv_streets"].network_type == "drive"
+    # A valid non-default type still comes through untouched.
+    assert cfg.providers["mapillary_streets"].network_type == "all_public"
+
+
 def test_config_provider_can_be_disabled(tmp_path):
     p = tmp_path / "s.toml"
     p.write_text("""
@@ -299,10 +330,18 @@ def test_regenerate_aggregate_rebuilds_without_publish(conn, monkeypatch):
         "generate_aggregate_v2",
         lambda c, d: calls.__setitem__("agg", calls["agg"] + 1) or {"cities_count": 3},
     )
+    monkeypatch.setattr(
+        sched,
+        "generate_streetwalk_manifest",
+        lambda c, d: calls.__setitem__("manifest", calls.get("manifest", 0) + 1) or {"walks": []},
+    )
     monkeypatch.setattr(sched, "_publish", lambda cfg, ctx: calls.__setitem__("publish", 1) or 0)
 
     rc = sched.cmd_regenerate(SchedulerConfig(publish_enabled=False))
-    assert rc == 0 and calls == {"agg": 1, "publish": 0}
+    # The streetwalk manifest is rebuilt alongside the aggregate: both are
+    # catalog-derived indexes the frontend fetches, and regenerate-aggregate is
+    # the documented recovery path after a manual/killed run (issue #155).
+    assert rc == 0 and calls == {"agg": 1, "manifest": 1, "publish": 0}
 
 
 def test_regenerate_aggregate_publishes_on_flag(conn, monkeypatch):
@@ -312,6 +351,7 @@ def test_regenerate_aggregate_publishes_on_flag(conn, monkeypatch):
 
     monkeypatch.setattr(sched.db, "connect", lambda path: conn)
     monkeypatch.setattr(sched, "generate_aggregate_v2", lambda c, d: {"cities_count": 0})
+    monkeypatch.setattr(sched, "generate_streetwalk_manifest", lambda c, d: {"walks": []})
 
     published = []
     monkeypatch.setattr(sched, "_publish", lambda cfg, ctx: published.append(ctx) or 0)
@@ -324,8 +364,23 @@ def test_regenerate_aggregate_publishes_on_flag(conn, monkeypatch):
 
 def test_makelab1_production_config_is_wired():
     # Guard the checked-in production config the systemd unit points at.
+    #
+    # This file is what prod actually reads (config/scheduler.toml is the
+    # annotated repo default and is NOT deployed), so enabling a channel in
+    # scheduler.toml alone changes nothing in production — the two must be kept
+    # in step deliberately, which is what this assertion is for.
     cfg = load_scheduler_config(os.path.join(_PROJECT_ROOT, "config", "scheduler.makelab1.toml"))
-    assert cfg.enabled_providers() == ["gsv", "mapillary"]
+    assert cfg.enabled_providers() == ["gsv", "gsv_streets", "mapillary", "mapillary_streets"]
+    # The street channels must keep their ISOLATED budgets: metered under their
+    # own api_usage provider strings against separate keys, so a road crawl can
+    # never eat the grid collectors' quota.
+    assert cfg.providers["gsv_streets"].daily_request_budget == 3_000_000
+    # Paced by the streets key's own quota, not [download]'s 48k grid pacing.
+    assert cfg.providers["gsv_streets"].max_requests_per_minute == 24_000
+    # Mapillary's 50k/day application cap is shared with the grid channel.
+    mly = cfg.providers["mapillary"].daily_request_budget
+    mly_streets = cfg.providers["mapillary_streets"].daily_request_budget
+    assert mly + mly_streets <= 50_000, "combined Mapillary budgets exceed the daily app cap"
     assert cfg.publish_enabled
     assert cfg.publish_script.endswith("sync_data_to_server.sh")
     # smtp transport (not "mail"): the local mailer is blocked by the systemd
@@ -339,7 +394,7 @@ def test_makelab1_production_config_is_wired():
     assert cfg.resource_guard.enabled
 
 
-def test_run_one_city_honors_connection_limit_override(conn, monkeypatch):
+def test_run_one_city_honors_connection_limit_override(conn, monkeypatch, tmp_path):
     """The resource guard lowers concurrency by passing a connection_limit
     override, which must reach the subprocess as --connection-limit."""
     from streetscape_metadata_tracker import scheduler as sched
@@ -348,7 +403,7 @@ def test_run_one_city_honors_connection_limit_override(conn, monkeypatch):
     city = db.resolve_city(conn, cid)
     captured = {}
 
-    def fake_run(cmd, timeout=None, cwd=None):
+    def fake_run(cmd, timeout=None, cwd=None, **kwargs):
         captured["cmd"] = cmd
 
         class R:
@@ -357,7 +412,9 @@ def test_run_one_city_honors_connection_limit_override(conn, monkeypatch):
         return R()
 
     monkeypatch.setattr(sched.subprocess, "run", fake_run)
-    assert sched._run_one_city(SchedulerConfig(), city, date(2026, 7, 1), "gsv", connection_limit=7)
+    assert sched._run_one_city(
+        SchedulerConfig(log_dir=str(tmp_path)), city, date(2026, 7, 1), "gsv", connection_limit=7
+    )
     cmd = captured["cmd"]
     assert cmd[cmd.index("--connection-limit") + 1] == "7"
 
@@ -509,7 +566,9 @@ def test_budget_ledger_defers_second_city_when_first_consumes_budget(conn, monke
 
     ran = []
 
-    def fake_run(cfg, city, run_today, provider="gsv", connection_limit=None):
+    def fake_run(
+        cfg, city, run_today, provider="gsv", connection_limit=None, daily_budget=0, conn=None
+    ):
         # Simulate the real pipeline's ledger write for the requests spent
         db.add_api_usage(conn, run_today, sched.estimate_requests(city, provider), provider)
         ran.append(city.city_id)
@@ -519,6 +578,7 @@ def test_budget_ledger_defers_second_city_when_first_consumes_budget(conn, monke
     monkeypatch.setattr(sched.db, "connect", lambda path: conn)
     monkeypatch.setattr(sched.time, "sleep", lambda s: None)
     monkeypatch.setattr(sched, "generate_aggregate_v2", lambda c, d: None)
+    monkeypatch.setattr(sched, "generate_streetwalk_manifest", lambda c, d: {"walks": []})
 
     cfg = SchedulerConfig(daily_request_budget=4_000, publish_enabled=False)
     rc = sched.cmd_run_due(cfg, today=today)
@@ -555,13 +615,14 @@ def test_oversized_city_does_not_starve_queue(conn, monkeypatch):
     monkeypatch.setattr(
         sched,
         "_run_one_city",
-        lambda cfg, city, today, provider="gsv", connection_limit=None: (
+        lambda cfg, city, today, provider="gsv", connection_limit=None, daily_budget=0, conn=None: (
             ran.append(city.city_id) or True
         ),
     )
     monkeypatch.setattr(sched.db, "connect", lambda path: conn)
     monkeypatch.setattr(sched.time, "sleep", lambda s: None)
     monkeypatch.setattr(sched, "generate_aggregate_v2", lambda c, d: None)
+    monkeypatch.setattr(sched, "generate_streetwalk_manifest", lambda c, d: {"walks": []})
 
     cfg = SchedulerConfig(daily_request_budget=10_000, publish_enabled=False)
     rc = sched.cmd_run_due(cfg, today=date(2026, 7, 2))
@@ -583,13 +644,14 @@ def test_run_due_pairs_providers_per_city(conn, monkeypatch):
     monkeypatch.setattr(
         sched,
         "_run_one_city",
-        lambda cfg, city, today, provider="gsv", connection_limit=None: (
+        lambda cfg, city, today, provider="gsv", connection_limit=None, daily_budget=0, conn=None: (
             ran.append((city.city_id, provider)) or (provider == "gsv")
         ),
     )
     monkeypatch.setattr(sched.db, "connect", lambda path: conn)
     monkeypatch.setattr(sched.time, "sleep", lambda s: None)
     monkeypatch.setattr(sched, "generate_aggregate_v2", lambda c, d: None)
+    monkeypatch.setattr(sched, "generate_streetwalk_manifest", lambda c, d: {"walks": []})
 
     cfg = SchedulerConfig(
         publish_enabled=False,
@@ -632,13 +694,14 @@ def test_run_due_provider_budgets_are_independent(conn, monkeypatch):
     monkeypatch.setattr(
         sched,
         "_run_one_city",
-        lambda cfg, city, today, provider="gsv", connection_limit=None: (
+        lambda cfg, city, today, provider="gsv", connection_limit=None, daily_budget=0, conn=None: (
             ran.append((city.city_id, provider)) or True
         ),
     )
     monkeypatch.setattr(sched.db, "connect", lambda path: conn)
     monkeypatch.setattr(sched.time, "sleep", lambda s: None)
     monkeypatch.setattr(sched, "generate_aggregate_v2", lambda c, d: None)
+    monkeypatch.setattr(sched, "generate_streetwalk_manifest", lambda c, d: {"walks": []})
 
     cfg = SchedulerConfig(
         publish_enabled=False,
@@ -650,3 +713,743 @@ def test_run_due_provider_budgets_are_independent(conn, monkeypatch):
     sched.cmd_run_due(cfg, today=date(2026, 7, 2))
 
     assert ran == [(cid, "mapillary")]  # gsv deferred, mapillary still ran
+
+
+def test_run_due_refreshes_the_manifest_only_after_a_success(conn, monkeypatch):
+    """
+    The nightly rebuild of the catalog-derived indexes is gated on ≥1 successful
+    city: a night where nothing collected leaves both `cities.json.gz` and
+    `streetwalks.json.gz` untouched (no needless republish), and a night with a
+    success refreshes both together (issue #155).
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    _register(conn, "Bend", width=1000, height=1000, step=20)
+    db.assign_schedule(conn, 90)
+    conn.execute("UPDATE schedule_state SET last_success_at = NULL")  # due
+    conn.commit()
+
+    calls = {"agg": 0, "manifest": 0}
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+    monkeypatch.setattr(sched.time, "sleep", lambda s: None)
+    monkeypatch.setattr(
+        sched, "generate_aggregate_v2", lambda c, d: calls.__setitem__("agg", calls["agg"] + 1)
+    )
+    monkeypatch.setattr(
+        sched,
+        "generate_streetwalk_manifest",
+        lambda c, d: calls.__setitem__("manifest", calls["manifest"] + 1) or {"walks": []},
+    )
+
+    # A night where the city's run fails: neither index is rebuilt.
+    monkeypatch.setattr(
+        sched,
+        "_run_one_city",
+        lambda cfg, city, today, provider="gsv", connection_limit=None, daily_budget=0, conn=None: (
+            False
+        ),
+    )
+    sched.cmd_run_due(SchedulerConfig(publish_enabled=False), today=date(2026, 7, 2))
+    assert calls == {"agg": 0, "manifest": 0}
+
+    # A night with a success: both, exactly once each.
+    monkeypatch.setattr(
+        sched,
+        "_run_one_city",
+        lambda cfg, city, today, provider="gsv", connection_limit=None, daily_budget=0, conn=None: (
+            True
+        ),
+    )
+    sched.cmd_run_due(SchedulerConfig(publish_enabled=False), today=date(2026, 7, 3))
+    assert calls == {"agg": 1, "manifest": 1}
+
+
+def test_regenerate_writes_both_indexes_to_the_configured_data_dir(conn, data_dir, monkeypatch):
+    """
+    End-to-end (no stubbed generators): `regenerate-aggregate` must leave BOTH
+    published indexes on disk in the configured data dir. This is the documented
+    recovery path after a killed run, so a missing `streetwalks.json.gz` here
+    means the city page silently loses every road-walk overlay.
+    """
+    import gzip
+    import json
+
+    from streetscape_metadata_tracker import scheduler as sched
+
+    city_id = _register(conn, "Bend", width=1000, height=1000, step=20)
+    db.register_street_walk(
+        conn,
+        city_id=city_id,
+        run_date=date(2026, 7, 17),
+        csv_filename="bend_streetwalk_sp15_2026-07-17.csv.gz",
+        coverage_filename="bend_streetwalk_sp15_2026-07-17_coverage.json.gz",
+        coverage_pct_by_length=88.0,
+    )
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+
+    rc = sched.cmd_regenerate(SchedulerConfig(data_dir=data_dir, publish_enabled=False))
+
+    assert rc == 0
+    assert os.path.exists(os.path.join(data_dir, "cities.json.gz"))
+    manifest_path = os.path.join(data_dir, "streetwalks.json.gz")
+    assert os.path.exists(manifest_path)
+    with gzip.open(manifest_path, "rt") as fh:
+        walks = json.load(fh)["walks"]
+    assert [w["city_id"] for w in walks] == [city_id]
+
+
+# ── Street-coverage channels (issue #99) ────────────────────────────────────
+
+
+def _street_cfg(**overrides):
+    """A config with both street channels enabled alongside the grid ones."""
+    from streetscape_metadata_tracker.scheduler import ProviderConfig
+
+    providers = {
+        "gsv": ProviderConfig(enabled=True, daily_request_budget=10_000_000),
+        "gsv_streets": ProviderConfig(
+            enabled=True, daily_request_budget=2_000_000, max_requests_per_minute=24_000
+        ),
+        "mapillary": ProviderConfig(enabled=True, daily_request_budget=40_000),
+        "mapillary_streets": ProviderConfig(enabled=True, daily_request_budget=5_000),
+    }
+    return SchedulerConfig(providers=providers, **overrides)
+
+
+def test_street_channels_parse_as_real_providers(tmp_path):
+    """They used to be skipped outright by the config loader, which made the
+    [providers.gsv_streets] block inert."""
+    cfg_path = tmp_path / "s.toml"
+    cfg_path.write_text(
+        "[providers.gsv]\nenabled = true\n\n"
+        "[providers.gsv_streets]\nenabled = true\ndaily_request_budget = 2000000\n"
+        "max_requests_per_minute = 24000\nspacing_m = 20\n\n"
+        "[providers.mapillary_streets]\nenabled = true\ndaily_request_budget = 5000\n"
+    )
+    cfg = load_scheduler_config(str(cfg_path))
+    assert set(cfg.enabled_providers()) == {"gsv", "gsv_streets", "mapillary_streets"}
+    assert cfg.providers["gsv_streets"].daily_request_budget == 2_000_000
+    assert cfg.providers["gsv_streets"].max_requests_per_minute == 24_000
+    assert cfg.providers["gsv_streets"].spacing_m == 20
+
+
+def test_enabled_providers_orders_expensive_channels_first():
+    """A city's channels run back-to-back inside one night's budgets, so the
+    series that can actually exhaust a budget must claim it first."""
+    assert _street_cfg().enabled_providers() == [
+        "gsv",
+        "gsv_streets",
+        "mapillary",
+        "mapillary_streets",
+    ]
+
+
+def test_unknown_provider_still_warned_and_dropped(tmp_path):
+    cfg_path = tmp_path / "s.toml"
+    cfg_path.write_text("[providers.gsv]\nenabled = true\n\n[providers.bogus]\nenabled = true\n")
+    cfg = load_scheduler_config(str(cfg_path))
+    assert "bogus" not in cfg.providers
+
+
+def test_street_estimate_prefers_a_prior_walk_and_rescales_for_spacing(conn):
+    from streetscape_metadata_tracker.scheduler import estimate_street_samples
+
+    cid = _register(conn, "Bend", width=5000, height=5000, step=20)
+    city = db.resolve_city(conn, cid)
+    db.register_street_walk(
+        conn,
+        city_id=cid,
+        run_date=date(2026, 7, 1),
+        csv_filename="w.csv.gz",
+        spacing_m=15.0,
+        sample_points=1000,
+    )
+    # Same spacing → the exact prior count.
+    assert estimate_street_samples(conn, city, 15) == 1000
+    # Halving the spacing doubles the samples along a fixed network length.
+    assert estimate_street_samples(conn, city, 30) == 500
+
+
+def test_street_estimate_falls_back_to_frozen_network_then_area(conn):
+    from streetscape_metadata_tracker.scheduler import estimate_street_samples
+
+    cid = _register(conn, "Bend", width=5000, height=5000, step=20)
+    city = db.resolve_city(conn, cid)
+
+    # No walk, no network → the area proxy (25 km² * 7.45 km/km² / 15 m).
+    area_only = estimate_street_samples(conn, city, 15)
+    assert 10_000 < area_only < 14_000
+
+    conn.execute(
+        """INSERT INTO street_networks (city_id, network_type, graphml_filename,
+           node_count, edge_count, fetched_at)
+           VALUES (?, 'drive', 'x.graphml', 100, 1000, '2026-07-01T00:00:00+00:00')""",
+        (cid,),
+    )
+    conn.commit()
+    # A frozen network is more specific than the area proxy, so it wins.
+    assert estimate_street_samples(conn, city, 15) == int(1000 * 4.2)
+
+
+def test_street_estimate_does_not_reuse_another_network_types_walk(conn):
+    """A drive walk says nothing about how much work an all_public walk is.
+
+    Reusing it would badly under-budget the night (all_public adds every
+    footway, path, cycleway, alley and driveway), so each step of the estimate
+    filters on network type. Falling through to the area proxy is scaled UP for
+    a broad network, deliberately over-estimating so the guard defers rather
+    than overruns.
+    """
+    from streetscape_metadata_tracker.scheduler import estimate_street_samples
+
+    cid = _register(conn, "Bend", width=5000, height=5000, step=20)
+    city = db.resolve_city(conn, cid)
+    db.register_street_walk(
+        conn,
+        city_id=cid,
+        run_date=date(2026, 7, 1),
+        csv_filename="w_drive.csv.gz",
+        network_type="drive",
+        spacing_m=15.0,
+        sample_points=1000,
+    )
+    conn.execute(
+        """INSERT INTO street_networks (city_id, network_type, graphml_filename,
+           node_count, edge_count, fetched_at)
+           VALUES (?, 'drive', 'x.graphml', 100, 1000, '2026-07-01T00:00:00+00:00')""",
+        (cid,),
+    )
+    conn.commit()
+
+    assert estimate_street_samples(conn, city, 15, "drive") == 1000
+    broad = estimate_street_samples(conn, city, 15, "all_public")
+    assert broad != 1000  # neither the drive walk nor the drive network leaked
+    assert broad > 1000  # and the broad fallback over-estimates, never under
+
+    # Once the city has its OWN broad walk, that exact count takes over.
+    db.register_street_walk(
+        conn,
+        city_id=cid,
+        run_date=date(2026, 7, 2),
+        csv_filename="w_broad.csv.gz",
+        network_type="all_public",
+        spacing_m=15.0,
+        sample_points=2600,
+    )
+    assert estimate_street_samples(conn, city, 15, "all_public") == 2600
+    assert estimate_street_samples(conn, city, 15, "drive") == 1000
+
+
+def test_street_channel_passes_its_network_type_to_the_collector(conn):
+    """Each network type is its own series, so the configured type must reach
+    the collector — otherwise the channel silently walks 'drive' forever."""
+    from streetscape_metadata_tracker.scheduler import ProviderConfig, _street_collect_cmd
+
+    cid = _register(conn, "Bend", width=5000, height=5000, step=20)
+    city = db.resolve_city(conn, cid)
+    cfg = SchedulerConfig(providers={"gsv_streets": ProviderConfig(network_type="all_public")})
+    cmd = _street_collect_cmd(cfg, city, date(2026, 7, 8), "gsv_streets", 10, 100)
+    assert "--network-type" in cmd
+    assert cmd[cmd.index("--network-type") + 1] == "all_public"
+
+    # Default config still walks the drive network.
+    default_cmd = _street_collect_cmd(
+        SchedulerConfig(providers={"gsv_streets": ProviderConfig()}),
+        city,
+        date(2026, 7, 8),
+        "gsv_streets",
+        10,
+        100,
+    )
+    assert default_cmd[default_cmd.index("--network-type") + 1] == "drive"
+
+
+def test_mapillary_street_estimate_is_tiles_not_samples(conn):
+    cid = _register(conn, "Bend", width=5000, height=5000, step=20)
+    city = db.resolve_city(conn, cid)
+    # The whole reason Mapillary streets can be scheduled everywhere: its cost
+    # is the tile census, identical to the grid provider's and unrelated to
+    # how many sample points get scored.
+    assert estimate_requests(city, "mapillary_streets", conn=conn) == estimate_requests(
+        city, "mapillary"
+    )
+    assert estimate_requests(city, "gsv_streets", conn=conn) > estimate_requests(
+        city, "mapillary_streets", conn=conn
+    )
+
+
+def test_street_timeout_scales_like_gsv_not_the_flat_floor(conn):
+    """A 247k-sample city (Seattle) must not inherit the flat floor and get
+    SIGKILLed 20 minutes into its crawl."""
+    from streetscape_metadata_tracker.scheduler import city_timeout_seconds
+
+    cfg = _street_cfg(city_timeout_minutes=180, max_requests_per_minute=24_000)
+    floor = 180 * 60
+    cid = _register(conn, "Metropolis", width=40000, height=40000, step=20)
+    city = db.resolve_city(conn, cid)
+    db.register_street_walk(
+        conn,
+        city_id=cid,
+        run_date=date(2026, 7, 1),
+        csv_filename="w.csv.gz",
+        spacing_m=15.0,
+        sample_points=2_000_000,
+    )
+    assert city_timeout_seconds(cfg, city, "gsv_streets", conn=conn) > floor
+    # Mapillary streets reads a handful of tiles — the floor is plenty.
+    assert city_timeout_seconds(cfg, city, "mapillary_streets", conn=conn) == floor
+
+
+def test_street_channel_dispatches_to_the_road_walk_collector(conn, monkeypatch, tmp_path):
+    """The scheduler must run the road-walk CLI for a street channel, with the
+    imagery provider, the isolated daily budget, and the catalog path."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    cid = _register(conn, "Bend", width=1000, height=1000, step=20)
+    city = db.resolve_city(conn, cid)
+    captured = {}
+
+    def fake_run(cmd, timeout=None, cwd=None, **kwargs):
+        captured["cmd"] = cmd
+
+        class R:
+            returncode = 0
+
+        return R()
+
+    monkeypatch.setattr(sched.subprocess, "run", fake_run)
+    cfg = _street_cfg(db_path="/tmp/x.db", data_dir="/tmp/data", log_dir=str(tmp_path))
+    assert sched._run_one_city(
+        cfg, city, date(2026, 7, 1), "gsv_streets", daily_budget=12345, conn=conn
+    )
+
+    cmd = captured["cmd"]
+    assert "streetscape_street_analyzer.collect" in cmd
+    assert cmd[cmd.index("--provider") + 1] == "gsv"  # the imagery provider
+    assert cmd[cmd.index("--daily-budget") + 1] == "12345"
+    assert cmd[cmd.index("--db-path") + 1] == "/tmp/x.db"
+    assert cmd[cmd.index("--spacing") + 1] == "15"
+    assert cmd[cmd.index("--run-date") + 1] == "2026-07-01"
+    assert cmd[cmd.index("--") + 1] == city.display_name
+
+
+def test_mapillary_street_dispatch_omits_per_minute_pacing(conn, monkeypatch, tmp_path):
+    """Pacing is meaningless for a tile census; passing it would imply the
+    collector meters per-request like the GSV arm."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    cid = _register(conn, "Bend", width=1000, height=1000, step=20)
+    city = db.resolve_city(conn, cid)
+    captured = {}
+
+    def fake_run(cmd, timeout=None, cwd=None, **kwargs):
+        captured["cmd"] = cmd
+
+        class R:
+            returncode = 0
+
+        return R()
+
+    monkeypatch.setattr(sched.subprocess, "run", fake_run)
+    assert sched._run_one_city(
+        _street_cfg(log_dir=str(tmp_path)), city, date(2026, 7, 1), "mapillary_streets", conn=conn
+    )
+    cmd = captured["cmd"]
+    assert cmd[cmd.index("--provider") + 1] == "mapillary"
+    assert "--max-requests-per-minute" not in cmd
+
+
+def test_street_dispatch_passes_the_full_budget_not_the_remainder(conn, monkeypatch, data_dir):
+    """
+    ``--daily-budget`` is the channel's whole ceiling, because the collector
+    re-reads the same api_usage ledger and subtracts today's spend itself.
+
+    Passing ``budget - used`` made the child's guard ``2*used + est > budget``,
+    so once a street channel was ~half spent every remaining city aborted with
+    exit 1 — which the scheduler counts as a real failure, driving the city
+    toward max_consecutive_failures and out of the due set entirely.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    _register(conn, "Bend", width=1000, height=1000, step=20)
+    conn.execute("UPDATE schedule_state SET last_success_at = NULL")
+    conn.commit()
+
+    cfg = _street_cfg(data_dir=data_dir, publish_enabled=False)
+    budget = cfg.providers["gsv_streets"].daily_request_budget
+    today = date(2026, 7, 2)
+    # More than half of it already spent — the regime where the old arithmetic
+    # started rejecting cities that comfortably fit.
+    already = int(budget * 0.6)
+    db.add_api_usage(conn, today, already, provider="gsv_streets")
+
+    seen = {}
+    monkeypatch.setattr(
+        sched,
+        "_run_one_city",
+        lambda cfg, city, today, provider="gsv", connection_limit=None, daily_budget=0, conn=None: (
+            seen.setdefault(provider, daily_budget) is not None or True
+        ),
+    )
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+    monkeypatch.setattr(sched.time, "sleep", lambda s: None)
+    monkeypatch.setattr(sched, "generate_aggregate_v2", lambda c, d: None)
+    monkeypatch.setattr(sched, "generate_streetwalk_manifest", lambda c, d: {"walks": []})
+
+    sched.cmd_run_due(cfg, today=today)
+
+    assert seen["gsv_streets"] == budget
+    assert seen["gsv_streets"] != budget - already  # the old, doubled-counting value
+
+
+def test_street_channels_share_the_grid_stagger_day(conn):
+    """Paired snapshots: a city's street walk lands the same night as its grid
+    run, because day_of_cycle is hashed from city_id alone."""
+    cid = _register(conn, "Bend", width=1000, height=1000, step=20)
+    db.assign_schedule(conn, 90, providers=("gsv", "gsv_streets", "mapillary_streets"))
+    days = {
+        r["provider"]: r["day_of_cycle"]
+        for r in conn.execute(
+            "SELECT provider, day_of_cycle FROM schedule_state WHERE city_id = ?", (cid,)
+        ).fetchall()
+    }
+    assert len(set(days.values())) == 1
+    assert set(days) == {"gsv", "gsv_streets", "mapillary_streets"}
+
+
+WALK_DATE = date(2026, 7, 28)
+
+
+def _orphan_walk(
+    conn,
+    data_dir,
+    *,
+    provider="gsv",
+    network_type="drive",
+    spacing=15,
+    samples=4,
+    with_network_type_key=True,
+    corrupt=False,
+    write_csv=True,
+):
+    """A finished road walk with artifacts on disk but no catalog row — the
+    Berlin shape: the crawl completed and both files were written, then the
+    subprocess died before register_street_walk.
+
+    ``with_network_type_key=False`` reproduces an artifact written before the
+    network-type series existed (it carries no such key at all)."""
+    cid = _register(conn, "Bend", width=1000, height=1000, step=20)
+    city = db.resolve_city(conn, cid)
+    stem = generate_streetwalk_filename(
+        city.city_id,
+        city.grid_width_m,
+        city.grid_height_m,
+        city.step_m,
+        spacing,
+        WALK_DATE,
+        provider=provider,
+        network_type=network_type,
+    )
+    csv_name = stem + ".csv.gz"
+    coverage_name = streetwalk_coverage_filename(csv_name)
+
+    if write_csv:
+        with gzip.open(os.path.join(data_dir, csv_name), "wt", encoding="utf-8") as fh:
+            fh.write("query_lat,query_lon,status\n")
+            for i in range(samples):
+                fh.write(f"44.0{i},-121.0{i},OK\n")
+
+    if corrupt:
+        with gzip.open(os.path.join(data_dir, coverage_name), "wt", encoding="utf-8") as fh:
+            fh.write('{"type": "FeatureCollection", "featur')  # truncated mid-write
+    else:
+        metadata = {
+            "schema_version": 1,
+            "kind": "streetwalk_coverage",
+            "city_id": city.city_id,
+            "provider": provider,
+            "run_date": WALK_DATE.isoformat(),
+            "spacing_m": spacing,
+            "match_dist_m": 25.0,
+            "source_csv": csv_name,
+            "totals": {
+                "edges": 120,
+                "edges_fully_covered": 100,
+                "mean_edge_coverage": 0.82,
+                "coverage_pct_by_length": 82.2,
+                "coverage_pct_by_length_any": 85.0,
+            },
+        }
+        if with_network_type_key:
+            metadata["network_type"] = network_type
+        with gzip.open(os.path.join(data_dir, coverage_name), "wt", encoding="utf-8") as fh:
+            json.dump(
+                {"type": "FeatureCollection", "features": [], "properties": {"metadata": metadata}},
+                fh,
+            )
+
+    return city, csv_name, coverage_name
+
+
+def _walk_row(conn, city_id, provider="gsv", network_type="drive"):
+    return conn.execute(
+        "SELECT * FROM street_walks WHERE city_id = ? AND provider = ? "
+        "AND network_type = ? AND run_date = ?",
+        (city_id, provider, network_type, WALK_DATE.isoformat()),
+    ).fetchone()
+
+
+def test_reconcile_orphaned_walk_catalogs_a_finished_crawl(conn, data_dir, monkeypatch):
+    """The Berlin regression: a walk that crawled, wrote both artifacts, then died
+    before register_street_walk must be salvaged from those artifacts rather than
+    re-crawled at full cost next cycle."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    monkeypatch.setattr(sched, "generate_streetwalk_manifest", lambda c, d: {"walks": []})
+    city, csv_name, coverage_name = _orphan_walk(conn, data_dir, samples=4)
+    cfg = _street_cfg(data_dir=data_dir)
+
+    assert _reconcile_orphaned_walk(conn, cfg, city, "gsv_streets", WALK_DATE) is True
+
+    row = _walk_row(conn, city.city_id)
+    assert row is not None
+    assert row["csv_filename"] == csv_name
+    assert row["coverage_filename"] == coverage_name
+    assert row["edges_total"] == 120
+    assert row["coverage_pct_by_length"] == 82.2
+    assert row["coverage_pct_by_length_any"] == 85.0
+    assert row["match_dist_m"] == 25.0
+    # sample_points is not in the artifact; it comes from the snapshot's rows,
+    # and for GSV that row count is also the request count (one request each).
+    assert row["sample_points"] == 4
+    assert row["api_requests"] == 4
+
+
+def test_reconcile_orphaned_walk_refreshes_the_manifest(conn, data_dir, monkeypatch):
+    """A salvaged walk that isn't advertised is invisible: the city page finds
+    streetwalk artifacts only through the sidecar manifest."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    regenerated = []
+    monkeypatch.setattr(
+        sched,
+        "generate_streetwalk_manifest",
+        lambda c, d: regenerated.append(d) or {"walks": []},
+    )
+    city, _, _ = _orphan_walk(conn, data_dir)
+    cfg = _street_cfg(data_dir=data_dir)
+    assert _reconcile_orphaned_walk(conn, cfg, city, "gsv_streets", WALK_DATE)
+    assert regenerated == [cfg.data_dir]
+
+
+def test_reconcile_orphaned_walk_without_artifacts_is_a_genuine_failure(conn, data_dir):
+    """Nothing on disk → nothing to salvage; the caller records a real failure."""
+    cid = _register(conn, "Bend", width=1000, height=1000, step=20)
+    city = db.resolve_city(conn, cid)
+    cfg = _street_cfg(data_dir=data_dir)
+
+    assert _reconcile_orphaned_walk(conn, cfg, city, "gsv_streets", WALK_DATE) is False
+    assert _walk_row(conn, city.city_id) is None
+
+
+def test_reconcile_orphaned_walk_rejects_a_corrupt_artifact(conn, data_dir):
+    """A truncated coverage file says nothing about coverage and must not become
+    a catalog row — that would publish a walk with no numbers behind it."""
+    city, _, _ = _orphan_walk(conn, data_dir, corrupt=True)
+    cfg = _street_cfg(data_dir=data_dir)
+
+    assert _reconcile_orphaned_walk(conn, cfg, city, "gsv_streets", WALK_DATE) is False
+    assert _walk_row(conn, city.city_id) is None
+
+
+def test_reconcile_orphaned_walk_takes_network_type_from_the_channel(conn, data_dir, monkeypatch):
+    """Walks written before the network-type series carry no network_type key
+    (Berlin's does not), so the channel's configured type is authoritative —
+    and it is part of the street_walks key, so getting it wrong mis-files the row."""
+    from streetscape_metadata_tracker import scheduler as sched
+    from streetscape_metadata_tracker.scheduler import ProviderConfig
+
+    monkeypatch.setattr(sched, "generate_streetwalk_manifest", lambda c, d: {"walks": []})
+    city, csv_name, _ = _orphan_walk(
+        conn, data_dir, network_type="all_public", with_network_type_key=False
+    )
+    cfg = _street_cfg(data_dir=data_dir)
+    cfg.providers["gsv_streets"] = ProviderConfig(network_type="all_public")
+
+    assert _reconcile_orphaned_walk(conn, cfg, city, "gsv_streets", WALK_DATE) is True
+
+    row = _walk_row(conn, city.city_id, network_type="all_public")
+    assert row is not None
+    assert "allpublic" in row["csv_filename"]  # the artifact it actually salvaged
+
+
+def test_reconcile_orphaned_walk_leaves_mapillary_requests_null(conn, data_dir, monkeypatch):
+    """Mapillary's cost is a z14 tile census independent of the sample count, and
+    the artifacts don't record it. NULL means 'not measured' — writing the sample
+    count there would invent a cost the walk never paid."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    monkeypatch.setattr(sched, "generate_streetwalk_manifest", lambda c, d: {"walks": []})
+    city, _, _ = _orphan_walk(conn, data_dir, provider="mapillary", samples=6)
+    cfg = _street_cfg(data_dir=data_dir)
+
+    assert _reconcile_orphaned_walk(conn, cfg, city, "mapillary_streets", WALK_DATE) is True
+
+    row = _walk_row(conn, city.city_id, provider="mapillary")
+    assert row["sample_points"] == 6
+    assert row["api_requests"] is None
+
+
+def test_run_due_salvages_a_finished_walk_instead_of_recording_failure(conn, monkeypatch, data_dir):
+    """End-to-end: the collector subprocess reports failure but left a complete
+    walk on disk. run-due must catalog it and count the channel a success, so the
+    city isn't re-walked at full cost when it next comes due."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    city, _, _ = _orphan_walk(conn, data_dir)
+    conn.execute("UPDATE schedule_state SET last_success_at = NULL")
+    conn.commit()
+
+    monkeypatch.setattr(
+        sched,
+        "_run_one_city",
+        lambda cfg, city, today, provider="gsv", connection_limit=None, daily_budget=0, conn=None: (
+            False
+        ),
+    )
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+    monkeypatch.setattr(sched.time, "sleep", lambda s: None)
+    monkeypatch.setattr(sched, "generate_aggregate_v2", lambda c, d: None)
+    monkeypatch.setattr(sched, "generate_streetwalk_manifest", lambda c, d: {"walks": []})
+
+    sched.cmd_run_due(_street_cfg(data_dir=data_dir, publish_enabled=False), today=WALK_DATE)
+
+    assert _walk_row(conn, city.city_id) is not None
+    state = conn.execute(
+        "SELECT last_success_at, consecutive_failures FROM schedule_state "
+        "WHERE city_id = ? AND provider = 'gsv_streets'",
+        (city.city_id,),
+    ).fetchone()
+    assert state["last_success_at"] is not None
+    assert state["consecutive_failures"] == 0
+    # The grid channel genuinely failed and must still be recorded as such.
+    grid = conn.execute(
+        "SELECT last_success_at FROM schedule_state WHERE city_id = ? AND provider = 'gsv'",
+        (city.city_id,),
+    ).fetchone()
+    assert grid["last_success_at"] is None
+
+
+def test_reconcile_walks_command_finds_and_catalogs_orphans(conn, monkeypatch, data_dir, capsys):
+    """The operator handle for orphans run-due can't catch — a walk from the
+    manual CLI, or one whose scheduler process itself died."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+    monkeypatch.setattr(sched, "generate_streetwalk_manifest", lambda c, d: {"walks": [1]})
+    city, _, coverage_name = _orphan_walk(conn, data_dir)
+    cfg = _street_cfg(data_dir=data_dir)
+
+    assert cmd_reconcile_walks(cfg, target_date=WALK_DATE, dry_run=True) == 0
+    assert coverage_name in capsys.readouterr().out
+    assert _walk_row(conn, city.city_id) is None  # dry run wrote nothing
+
+    assert cmd_reconcile_walks(cfg, target_date=WALK_DATE) == 0
+    assert _walk_row(conn, city.city_id) is not None
+
+    # The salvage must also clear the recorded failure, or it is cosmetic: the
+    # city would stay due and be re-crawled anyway, which is the whole cost the
+    # reconcile exists to avoid.
+    state = conn.execute(
+        "SELECT last_success_at, consecutive_failures FROM schedule_state "
+        "WHERE city_id = ? AND provider = 'gsv_streets'",
+        (city.city_id,),
+    ).fetchone()
+    assert state["last_success_at"] is not None
+    assert state["consecutive_failures"] == 0
+
+    # Idempotent: a second pass sees the row and reports nothing to do.
+    assert cmd_reconcile_walks(cfg, target_date=WALK_DATE) == 0
+    assert "No orphaned walks found" in capsys.readouterr().out
+
+
+def test_street_channel_failure_is_not_reconciled_as_an_orphan_run(conn, monkeypatch, data_dir):
+    """Street channels write street_walks rows, not `runs` rows, so the
+    orphaned-run salvage path must not be consulted for them (it would look up
+    a run that can never exist and could mask a real failure). They get their own
+    artifact-based salvage instead — see _reconcile_orphaned_walk."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    _register(conn, "Bend", width=1000, height=1000, step=20)
+    conn.execute("UPDATE schedule_state SET last_success_at = NULL")
+    conn.commit()
+
+    called = []
+    monkeypatch.setattr(
+        sched,
+        "_reconcile_orphaned_run",
+        lambda *a, **k: called.append(a[3]) or False,
+    )
+    monkeypatch.setattr(
+        sched,
+        "_run_one_city",
+        lambda cfg, city, today, provider="gsv", connection_limit=None, daily_budget=0, conn=None: (
+            False
+        ),
+    )
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+    monkeypatch.setattr(sched.time, "sleep", lambda s: None)
+    monkeypatch.setattr(sched, "generate_aggregate_v2", lambda c, d: None)
+    monkeypatch.setattr(sched, "generate_streetwalk_manifest", lambda c, d: {"walks": []})
+
+    sched.cmd_run_due(_street_cfg(data_dir=data_dir, publish_enabled=False), today=date(2026, 7, 2))
+
+    assert "gsv" in called
+    assert "gsv_streets" not in called
+    assert "mapillary_streets" not in called
+
+
+def test_failed_collection_captures_child_output_and_surfaces_the_tail(conn, tmp_path, caplog):
+    """A child's traceback used to be thrown away: the collectors log to stderr,
+    the scheduler inherited it, and under systemd that goes to a journal the
+    service account cannot read — so every 'collection failed' line lost its
+    cause. The output must land in a per-attempt log AND its tail must reach the
+    scheduler log, which is what the [alerts] email actually sends."""
+    import logging
+    import sys
+
+    from streetscape_metadata_tracker import scheduler as sched
+
+    cfg = SchedulerConfig(log_dir=str(tmp_path))
+    city = db.resolve_city(conn, _register(conn, "Bend"))
+    cmd = [sys.executable, "-c", "import sys; print('TRACEBACK MARKER'); sys.exit(3)"]
+
+    with caplog.at_level(logging.ERROR):
+        ok = sched._run_collection_subprocess(cfg, cmd, 60, city, "gsv", date(2026, 7, 1))
+
+    assert ok is False
+    log_path = tmp_path / f"collect_{city.city_id}_gsv_2026-07-01.log"
+    assert "TRACEBACK MARKER" in log_path.read_text()
+    assert "exited 3" in caplog.text
+    assert str(log_path) in caplog.text  # operator is told where the full log is
+    assert "TRACEBACK MARKER" in caplog.text  # and the cause travels to the alert
+
+
+def test_collection_log_appends_rather_than_truncating_a_retry(conn, tmp_path):
+    """Re-running the same city/channel/day must add to the record, not destroy
+    the failure being diagnosed."""
+    import sys
+
+    from streetscape_metadata_tracker import scheduler as sched
+
+    cfg = SchedulerConfig(log_dir=str(tmp_path))
+    city = db.resolve_city(conn, _register(conn, "Bend"))
+    today = date(2026, 7, 1)
+
+    for marker in ("FIRST ATTEMPT", "SECOND ATTEMPT"):
+        sched._run_collection_subprocess(
+            cfg, [sys.executable, "-c", f"print('{marker}')"], 60, city, "gsv", today
+        )
+
+    text = (tmp_path / f"collect_{city.city_id}_gsv_2026-07-01.log").read_text()
+    assert "FIRST ATTEMPT" in text and "SECOND ATTEMPT" in text

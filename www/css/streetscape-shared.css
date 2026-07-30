@@ -24,6 +24,94 @@ body {
   background-color: #0f0f0f; /* Matches CARTO dark map tiles */
 }
 
+/* ── Site header ────────────────────────────────────────────────
+   The map is full-bleed (inset: 0) and every panel floats over it at
+   position: fixed, so the header floats too rather than reflowing the
+   document. Everything below it is offset by SITE_HEADER_H (44px):
+   the fixed panels in index.css / city.css carry the offset in their
+   own `top` values, and Leaflet's own controls get it from the
+   .leaflet-top rule at the bottom of this block.
+   z-index sits above the 1000-level panels, below the 2000-level
+   loading overlay. */
+.site-header {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 44px;
+  z-index: 1100;
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  padding: 0 16px;
+  background: rgba(255, 255, 255, 0.94);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.3);
+  font-size: 14px;
+}
+
+.site-brand {
+  font-weight: bold;
+  font-size: 15px;
+  color: #222;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.site-nav {
+  display: flex;
+  gap: 4px;
+}
+
+.site-nav a,
+.site-external {
+  padding: 4px 10px;
+  border-radius: 4px;
+  color: #333;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.site-nav a:hover,
+.site-external:hover {
+  background: rgba(0, 0, 0, 0.07);
+}
+
+/* The active page. A darker green than the checked toggle pills (#4CAF50),
+   which only carries ~2.8:1 against white — under WCAG AA for body text.
+   #2E7D32 clears 4.5:1 while reading as the same accent. aria-current carries
+   the state for assistive tech regardless of the color. */
+.site-nav a[aria-current="page"] {
+  background-color: #2E7D32;
+  color: #fff;
+}
+
+.site-nav a:focus-visible,
+.site-brand:focus-visible,
+.site-external:focus-visible {
+  outline: 2px solid #1a73e8;
+  outline-offset: 1px;
+}
+
+/* Pushed to the right edge */
+.site-external {
+  margin-left: auto;
+}
+
+/* Leaflet's own controls (zoom on both pages; the legend control on
+   city.html) are positioned inside the map pane, which the header
+   overlaps — nudge them clear of it. */
+.leaflet-top .leaflet-control {
+  margin-top: 54px;
+}
+
+/* On narrow viewports the brand alone would crowd out the nav; the
+   nav is the part that has to survive. */
+@media (max-width: 560px) {
+  .site-brand {
+    display: none;
+  }
+}
+
 /* ── Screen-reader-only content ─────────────────────────────── */
 .visually-hidden {
   position: absolute;

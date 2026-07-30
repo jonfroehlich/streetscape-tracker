@@ -22,7 +22,7 @@ from typing import Any
 import geopandas as gpd
 import pandas as pd
 
-from streetscape_metadata_tracker.analysis import is_google_copyright
+from streetscape_metadata_tracker.analysis import FLAT_ONLY, is_google_copyright
 
 from .road_sampling import quantize_coord
 
@@ -34,7 +34,10 @@ _YEAR_SECONDS = 365.25 * 24 * 3600
 
 # OSM `highway` values collapsed into a small, ordered set of buckets for the
 # by-type breakdown. Anything unrecognized falls through to "other".
-_HIGHWAY_BUCKETS = [
+#
+# Motorized classes: present in every network type, including the default
+# 'drive'. These are the only buckets a pre-#164 drive walk can produce.
+_MOTORIZED_BUCKETS = [
     "motorway",
     "trunk",
     "primary",
@@ -46,26 +49,110 @@ _HIGHWAY_BUCKETS = [
     "living_street",
 ]
 
+# Non-motorized classes, reachable only from a broader network type
+# ('all_public', 'all', 'walk', 'bike'). osmnx's 'drive' Overpass filter
+# excludes every one of them by name, which is why walks collected before the
+# broad-network work could not see alleys, sidewalks, or park trails at all.
+_NON_MOTORIZED_BUCKETS = [
+    "pedestrian",
+    "footway",
+    "path",
+    "cycleway",
+    "steps",
+    "track",
+    "bridleway",
+]
 
-def normalize_highway(highway: Any) -> str:
-    """
-    Collapse an OSM `highway` tag to a canonical bucket.
+# Subtypes of `highway=service`, read off the `service` tag. 'all_public'
+# filters out only `service=private`, so public driveways and parking aisles DO
+# come through — bucketing them explicitly keeps them visible and filterable
+# rather than silently inflating the plain `service` class with places no
+# imagery provider would ever drive. Alleys are the interesting one here: they
+# are real streets that the 'drive' filter drops.
+_SERVICE_BUCKETS = ["alley", "driveway", "parking_aisle"]
 
-    OSM (and osmnx after simplification) may give a single string or a list of
-    strings when a simplified edge merged ways of different classes; we take the
-    first recognized bucket, dropping the common ``_link`` suffix so e.g.
-    ``motorway_link`` counts as ``motorway``.
+_HIGHWAY_BUCKETS = _MOTORIZED_BUCKETS + _NON_MOTORIZED_BUCKETS + _SERVICE_BUCKETS
+
+# Presentation order for `coverage_by_highway`, which is NOT the membership
+# order above: the service subtypes belong next to the `service` class they are
+# subtypes of, so a broad-network breakdown reads top-to-bottom as a hierarchy
+# (motorized roads → the service-road family → non-motorized ways). This is the
+# same order `streetTypeOrder` uses in www/js/street-coverage.js — the published
+# artifact's key order is a contract, and a consumer that trusts it should get
+# the hierarchy the panel's own legend shows. Keep the two in sync.
+_BUCKET_DISPLAY_ORDER = _MOTORIZED_BUCKETS + _SERVICE_BUCKETS + _NON_MOTORIZED_BUCKETS
+
+
+def _first_recognized(tag_value: Any, allowed: list[str]) -> str | None:
     """
-    values = highway if isinstance(highway, (list, tuple)) else [highway]
+    First recognized tag in a possibly list-valued OSM tag, or None.
+
+    osmnx emits a list when simplification merged ways carrying different values
+    for the tag, so every tag read here has to tolerate both shapes.
+    """
+    values = tag_value if isinstance(tag_value, (list, tuple)) else [tag_value]
     for value in values:
-        if value is None:
+        if value is None or (isinstance(value, float) and pd.isna(value)):
             continue
         tag = str(value).strip().lower()
         if tag.endswith("_link"):
             tag = tag[: -len("_link")]
-        if tag in _HIGHWAY_BUCKETS:
+        if tag in allowed:
             return tag
-    return "other"
+    return None
+
+
+def normalize_highway(highway: Any, service: Any = None) -> str:
+    """
+    Collapse an OSM `highway` (+ optional `service`) tag to a canonical bucket.
+
+    The ``_link`` suffix is dropped, so e.g. ``motorway_link`` counts as
+    ``motorway``. When ``highway`` is ``service`` and the ``service`` tag names a
+    recognized subtype, that subtype wins: an alley is reported as ``alley``
+    rather than folded into the generic ``service`` class.
+
+    ``service`` is optional and defaults to None so pre-existing single-argument
+    callers keep working; drive networks cached before the tag was retained have
+    no ``service`` column at all.
+
+    Examples:
+        >>> normalize_highway("motorway_link")
+        'motorway'
+        >>> normalize_highway("footway")
+        'footway'
+        >>> normalize_highway("service", "alley")
+        'alley'
+        >>> normalize_highway("service", "drive-through")
+        'service'
+        >>> normalize_highway(["service", "residential"], ["alley"])
+        'alley'
+        >>> normalize_highway("busway")
+        'other'
+    """
+    bucket = _first_recognized(highway, _HIGHWAY_BUCKETS)
+    if bucket is None:
+        return "other"
+    if bucket == "service":
+        subtype = _first_recognized(service, _SERVICE_BUCKETS)
+        if subtype is not None:
+            return subtype
+    return bucket
+
+
+def _bucket_series(edges: pd.DataFrame) -> pd.Series:
+    """
+    ``highway_bucket`` for every edge, reading the ``service`` tag when present.
+
+    Older cached drive GraphML has no ``service`` column (graph_to_edges did not
+    retain it), and a network with no service roads at all won't have one
+    either, so its absence is normal rather than an error.
+    """
+    if "service" not in edges.columns:
+        return edges["highway"].apply(normalize_highway)
+    return pd.Series(
+        [normalize_highway(h, s) for h, s in zip(edges["highway"], edges["service"], strict=True)],
+        index=edges.index,
+    )
 
 
 def select_pano_points(df: pd.DataFrame, provider: str) -> gpd.GeoDataFrame:
@@ -132,7 +219,7 @@ def compute_street_coverage(
     """
     run_ts = pd.Timestamp(run_date)
     out = edges.reset_index(drop=True).copy()
-    out["highway_bucket"] = out["highway"].apply(normalize_highway)
+    out["highway_bucket"] = _bucket_series(out)
 
     # An empty network (tiny/invalid bbox, or a network_type that filtered every
     # edge) has no geometry for estimate_utm_crs() to work from — it raises. Return
@@ -183,10 +270,11 @@ def compute_street_coverage(
 
 
 def _bucket_order(bucket: str) -> int:
+    """Sort rank of a bucket in `coverage_by_highway` (see _BUCKET_DISPLAY_ORDER)."""
     try:
-        return _HIGHWAY_BUCKETS.index(bucket)
+        return _BUCKET_DISPLAY_ORDER.index(bucket)
     except ValueError:
-        return len(_HIGHWAY_BUCKETS)  # "other" sorts last
+        return len(_BUCKET_DISPLAY_ORDER)  # "other" sorts last
 
 
 def summarize_coverage(covered_edges: gpd.GeoDataFrame) -> dict[str, Any]:
@@ -332,7 +420,7 @@ def compute_streetwalk_coverage(
     run_ts = pd.Timestamp(run_date)
     out = edges.reset_index(drop=True).copy()
     if "highway" in out.columns:
-        out["highway_bucket"] = out["highway"].apply(normalize_highway)
+        out["highway_bucket"] = _bucket_series(out)
     else:
         out["highway_bucket"] = "other"
 
@@ -344,6 +432,8 @@ def compute_streetwalk_coverage(
             ("covered_samples", int),
             ("coverage_fraction", float),
             ("covered", bool),
+            ("covered_samples_any", int),
+            ("coverage_fraction_any", float),
             ("nearest_pano_date", object),
             ("median_covered_age_years", object),
         ):
@@ -396,6 +486,15 @@ def compute_streetwalk_coverage(
     within = sample_pts.distance(pano_pts) <= match_dist_m
     m["covered_sample"] = ok & official & has_pano & within.to_numpy()
 
+    # Any-imagery coverage (issue #116's vocabulary, applied to streets): a
+    # sample whose only nearby imagery is flat/perspective carries a FLAT_ONLY
+    # row — imagery of the street, but not a 360° pano, and with no capture
+    # date. It counts toward `*_any` only, never toward the 360° numbers or any
+    # dated statistic. GSV emits no FLAT_ONLY rows, so for GSV the any-value is
+    # identical to the 360° one by construction.
+    flat_only = (m["status"] == FLAT_ONLY) & has_pano & within.to_numpy()
+    m["covered_sample_any"] = m["covered_sample"] | flat_only
+
     cap = pd.to_datetime(m["capture_date"], errors="coerce")
     m["age_years"] = (run_ts - cap).dt.total_seconds() / _YEAR_SECONDS
 
@@ -404,6 +503,7 @@ def compute_streetwalk_coverage(
     grp = m.groupby("edge_id")
     total = grp.size()
     covered = grp["covered_sample"].sum()
+    covered_any = grp["covered_sample_any"].sum()
 
     def _edge_stats(sub: pd.DataFrame) -> pd.Series:
         cov = sub[sub["covered_sample"]]
@@ -428,6 +528,12 @@ def compute_streetwalk_coverage(
         .round(4)
     )
     out["covered"] = out["covered_samples"] > 0
+    out["covered_samples_any"] = out["edge_id"].map(covered_any).fillna(0).astype(int)
+    out["coverage_fraction_any"] = (
+        (out["covered_samples_any"] / out["total_samples"].where(out["total_samples"] > 0))
+        .fillna(0.0)
+        .round(4)
+    )
     # Edges with no covered samples carry NaN here; build_streetwalk_geojson
     # converts NaN -> None at serialization so the JSON artifact stays valid.
     out["nearest_pano_date"] = out["edge_id"].map(
@@ -448,11 +554,22 @@ def summarize_streetwalk_coverage(covered_edges: gpd.GeoDataFrame) -> dict[str, 
     edge-level mean fraction and fully-covered count.
     """
 
+    # Pre-#116 frames (and any hand-built test fixture) may lack the any-imagery
+    # column; treating it as the 360° fraction reproduces the GSV identity and
+    # keeps old callers working.
+    if "coverage_fraction_any" not in covered_edges.columns:
+        covered_edges = covered_edges.assign(
+            coverage_fraction_any=covered_edges["coverage_fraction"]
+        )
+
     def _block(group: pd.DataFrame) -> dict[str, Any]:
         edges = int(len(group))
         length_km = float(group["length_m"].sum()) / 1000.0
         # Length credited proportionally to each edge's covered fraction.
         length_km_covered = float((group["length_m"] * group["coverage_fraction"]).sum()) / 1000.0
+        length_km_covered_any = (
+            float((group["length_m"] * group["coverage_fraction_any"]).sum()) / 1000.0
+        )
         sampled = group[group["total_samples"] > 0]
         ages = pd.to_numeric(group["median_covered_age_years"], errors="coerce").dropna()
         return {
@@ -462,10 +579,16 @@ def summarize_streetwalk_coverage(covered_edges: gpd.GeoDataFrame) -> dict[str, 
             "edges_any_coverage": int((group["coverage_fraction"] > 0).sum()),
             "length_km": round(length_km, 3),
             "length_km_covered": round(length_km_covered, 3),
+            "length_km_covered_any": round(length_km_covered_any, 3),
             "mean_edge_coverage": round(float(sampled["coverage_fraction"].mean()), 4)
             if len(sampled)
             else 0.0,
             "coverage_pct_by_length": round(100.0 * length_km_covered / length_km, 1)
+            if length_km
+            else 0.0,
+            # Imagery of any type (360° + flat). Equals coverage_pct_by_length
+            # for GSV, which never emits FLAT_ONLY.
+            "coverage_pct_by_length_any": round(100.0 * length_km_covered_any / length_km, 1)
             if length_km
             else 0.0,
             "median_covered_age_years": round(float(ages.median()), 2) if len(ages) else None,
@@ -489,6 +612,7 @@ def build_streetwalk_geojson(
     spacing_m: float,
     match_dist_m: float,
     source_csv: str,
+    network_type: str = "drive",
 ) -> dict[str, Any]:
     """
     Assemble the published road-walk coverage GeoJSON FeatureCollection.
@@ -496,6 +620,12 @@ def build_streetwalk_geojson(
     Each feature is a street edge carrying its fractional coverage and sample
     counts; ``properties.metadata`` holds the by-type/overall summary so the
     frontend can draw both the map layer and the breakdown from one file.
+
+    ``network_type`` is recorded in the metadata because it sets which edge
+    classes could appear at all: a 'drive' artifact has no footway/path/alley
+    features by construction, so a reader must not mistake their absence for a
+    city with no footpaths. Defaults to 'drive' for callers predating the
+    broader networks.
     """
     summary = summarize_streetwalk_coverage(covered_edges)
 
@@ -520,6 +650,12 @@ def build_streetwalk_geojson(
                     "covered_samples": int(row.covered_samples),
                     "coverage_fraction": float(row.coverage_fraction),
                     "covered": bool(row.covered),
+                    "covered_samples_any": int(
+                        getattr(row, "covered_samples_any", row.covered_samples)
+                    ),
+                    "coverage_fraction_any": float(
+                        getattr(row, "coverage_fraction_any", row.coverage_fraction)
+                    ),
                     "nearest_pano_date": _none_if_nan(row.nearest_pano_date),
                     "median_covered_age_years": float(median_age)
                     if median_age is not None
@@ -536,6 +672,7 @@ def build_streetwalk_geojson(
                 "kind": "streetwalk_coverage",
                 "city_id": city_id,
                 "provider": provider,
+                "network_type": network_type,
                 "run_date": run_date,
                 "spacing_m": spacing_m,
                 "match_dist_m": match_dist_m,

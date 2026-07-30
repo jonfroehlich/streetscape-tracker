@@ -27,7 +27,7 @@ from .naming import sanitize_city_query_str
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 9
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS cities (
@@ -189,10 +189,17 @@ CREATE TABLE IF NOT EXISTS street_walks (
     edges_fully_covered    INTEGER,
     mean_edge_coverage     REAL,
     coverage_pct_by_length REAL,
+    -- Any-imagery street coverage (v8): 360° + flat/perspective. Equal to
+    -- coverage_pct_by_length for GSV, which never emits FLAT_ONLY; NULL on
+    -- walks collected before the column existed.
+    coverage_pct_by_length_any REAL,
     api_requests           INTEGER,
     started_at             TEXT,
     finished_at            TEXT,
-    UNIQUE (city_id, provider, run_date)
+    -- network_type is part of the key (v9): one frozen bbox yields a small
+    -- 'drive' network and a much larger 'all_public' one (alleys, footways,
+    -- park paths, cycleways, steps), and both can be walked the same night.
+    UNIQUE (city_id, provider, network_type, run_date)
 );
 """
 
@@ -293,6 +300,67 @@ _MIGRATE_V6_TO_V7 = """
 ALTER TABLE runs ADD COLUMN status_flat_only INTEGER;
 ALTER TABLE runs ADD COLUMN any_imagery_coverage_rate_pct REAL;
 ALTER TABLE runs ADD COLUMN num_flat_images INTEGER;
+"""
+
+# v8 -> v9: a walk is per (city, provider, network type, date). One frozen grid
+# bbox yields a small 'drive' OSM network and a much larger 'all_public' one
+# (which adds alleys, footways, park paths, cycleways, steps), and both can be
+# walked on the same night, so network_type belongs in the key. SQLite cannot
+# ALTER a UNIQUE constraint, hence the standard rebuild — the same shape as
+# _MIGRATE_V1_TO_V2. Every pre-v9 row already carries network_type='drive'
+# (column default since v5), so the copy is column-for-column.
+#
+# Wrapped in an explicit transaction: sqlite3's executescript() runs statements
+# in autocommit, so without it a crash between the DROP and the RENAME leaves NO
+# street_walks table at all — and the next connect() would take the "absent
+# table" early exit in _migrate_v8_to_v9, let _SCHEMA create it empty, and stamp
+# user_version=9, silently losing every walk row. The leading DROP of a stray
+# scratch table covers a catalog left mid-migration by a pre-transaction build
+# (a surviving street_walks_v9 would otherwise fail every later connect on
+# CREATE TABLE).
+_MIGRATE_V8_TO_V9 = """
+BEGIN;
+
+DROP TABLE IF EXISTS street_walks_v9;
+
+CREATE TABLE street_walks_v9 (
+    walk_id                INTEGER PRIMARY KEY,
+    city_id                TEXT NOT NULL REFERENCES cities(city_id),
+    provider               TEXT NOT NULL DEFAULT 'gsv',
+    run_date               TEXT NOT NULL,
+    csv_filename           TEXT NOT NULL UNIQUE,
+    coverage_filename      TEXT,
+    network_type           TEXT NOT NULL DEFAULT 'drive',
+    spacing_m              REAL,
+    match_dist_m           REAL,
+    sample_points          INTEGER,
+    edges_total            INTEGER,
+    edges_fully_covered    INTEGER,
+    mean_edge_coverage     REAL,
+    coverage_pct_by_length REAL,
+    coverage_pct_by_length_any REAL,
+    api_requests           INTEGER,
+    started_at             TEXT,
+    finished_at            TEXT,
+    UNIQUE (city_id, provider, network_type, run_date)
+);
+
+INSERT INTO street_walks_v9
+    (walk_id, city_id, provider, run_date, csv_filename, coverage_filename,
+     network_type, spacing_m, match_dist_m, sample_points, edges_total,
+     edges_fully_covered, mean_edge_coverage, coverage_pct_by_length,
+     coverage_pct_by_length_any, api_requests, started_at, finished_at)
+SELECT
+     walk_id, city_id, provider, run_date, csv_filename, coverage_filename,
+     network_type, spacing_m, match_dist_m, sample_points, edges_total,
+     edges_fully_covered, mean_edge_coverage, coverage_pct_by_length,
+     coverage_pct_by_length_any, api_requests, started_at, finished_at
+FROM street_walks;
+
+DROP TABLE street_walks;
+ALTER TABLE street_walks_v9 RENAME TO street_walks;
+
+COMMIT;
 """
 
 
@@ -421,6 +489,12 @@ def init_schema(conn: sqlite3.Connection) -> None:
     # catalog, and the version stamp below records the upgrade.
     if user_version in (4, 5, 6):
         _migrate_v6_to_v7(conn)
+        user_version = 7
+    if user_version == 7:
+        _migrate_v7_to_v8(conn)
+        user_version = 8
+    if user_version == 8:
+        _migrate_v8_to_v9(conn)
     conn.executescript(_SCHEMA)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
@@ -478,6 +552,74 @@ def _migrate_v6_to_v7(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _migrate_v7_to_v8(conn: sqlite3.Connection) -> None:
+    """Add street_walks.coverage_pct_by_length_any (any-imagery road coverage).
+
+    Additive; no table rebuild. Idempotent like _migrate_v6_to_v7, so a catalog
+    created fresh at the current schema can still be stamped forward. The
+    column is nullable: walks collected before it existed keep NULL rather than
+    claiming their 360° number covers flat imagery too.
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(street_walks)").fetchall()}
+    if "coverage_pct_by_length_any" in cols or not cols:
+        # Absent table → the CREATE TABLE in _SCHEMA below builds it current.
+        return
+    logger.info("Migrating catalog schema v7 -> v8 (street_walks.coverage_pct_by_length_any)")
+    conn.execute("ALTER TABLE street_walks ADD COLUMN coverage_pct_by_length_any REAL")
+    conn.commit()
+
+
+def _migrate_v8_to_v9(conn: sqlite3.Connection) -> None:
+    """Widen street_walks' UNIQUE to include network_type.
+
+    A walk is per (city, provider, OSM network type, date): one frozen grid bbox
+    yields a small 'drive' network and a much larger 'all_public' one, and both
+    can legitimately be walked on the same night. The v8 key
+    (city_id, provider, run_date) collapses them onto one row, so the second
+    walk's register_street_walk would overwrite the first's.
+
+    SQLite cannot ALTER a UNIQUE constraint, so this is the standard rebuild
+    (create/copy/drop/rename), following _migrate_v1_to_v2. Every existing row
+    already carries a non-null network_type ('drive' by column default), so the
+    copy is a straight column-for-column SELECT. Idempotent: detects the widened
+    index and returns, so a catalog created fresh at the current schema can
+    still be stamped forward through this step.
+
+    The rebuild itself is wrapped in a transaction (see _MIGRATE_V8_TO_V9), so
+    it either fully applies or leaves the v8 table untouched — an interrupted
+    run can never reach the "absent table" branch below with walk rows still to
+    migrate.
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(street_walks)").fetchall()}
+    if not cols:
+        # Absent table → the CREATE TABLE in _SCHEMA builds it already widened.
+        return
+    # The UNIQUE constraint surfaces as an auto-index; find the one over the key
+    # columns and check whether network_type is already part of it.
+    # The pragma table-valued functions (rather than bare PRAGMA statements) so
+    # the index name can be bound as a parameter, and so the columns can be
+    # selected by name whether or not the caller set a Row factory.
+    unique_indexes = conn.execute(
+        "SELECT name FROM pragma_index_list('street_walks') WHERE \"unique\" = 1"
+    ).fetchall()
+    for (index_name,) in unique_indexes:
+        index_cols = {
+            row[0] for row in conn.execute("SELECT name FROM pragma_index_info(?)", (index_name,))
+        }
+        if "run_date" in index_cols and "network_type" in index_cols:
+            return
+    logger.info("Migrating catalog schema v8 -> v9 (street_walks UNIQUE gains network_type)")
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        conn.executescript(_MIGRATE_V8_TO_V9)
+        violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise RuntimeError(f"Schema migration produced foreign key violations: {violations}")
+        conn.commit()
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")
+
+
 def derive_city_id(city_name: str, state_name: str | None, country_name: str | None) -> str:
     """
     Canonical city id: the sanitized slug of the full (never abbreviated)
@@ -502,10 +644,14 @@ def register_city(
     grid_height_m: float,
     step_m: float,
     notes: str | None = None,
+    enabled: bool = True,
 ) -> str:
     """
     Register a city with its frozen grid geometry. Idempotent: if the city
     already exists, the existing row wins (geometry is never overwritten).
+
+    ``enabled=False`` registers the city outside the scheduler rotation (e.g.
+    sampling-frame cities awaiting boundary vetting, issue #110).
 
     Returns the canonical city_id.
     """
@@ -515,8 +661,8 @@ def register_city(
         """INSERT OR IGNORE INTO cities
            (city_id, display_name, city_name, state_name, state_code,
             country_name, country_code, center_lat, center_lon,
-            grid_width_m, grid_height_m, step_m, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            grid_width_m, grid_height_m, step_m, created_at, enabled, notes)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             city_id,
             ", ".join(display_parts),
@@ -531,6 +677,8 @@ def register_city(
             int(grid_height_m),
             int(step_m),
             utc_now_iso(),
+            int(enabled),
+            notes,
         ),
     )
     conn.commit()
@@ -964,15 +1112,19 @@ def register_street_walk(
     edges_fully_covered: int | None = None,
     mean_edge_coverage: float | None = None,
     coverage_pct_by_length: float | None = None,
+    coverage_pct_by_length_any: float | None = None,
     api_requests: int | None = None,
     started_at: str | None = None,
     finished_at: str | None = None,
 ) -> int:
     """
     Catalog a completed road-walk collection. Idempotent on the filename and on
-    (city_id, provider, run_date): re-collecting the same city/provider on the
-    same day replaces the prior row rather than erroring (a road-walk is a full
-    re-census of the frozen network, not an incremental append).
+    (city_id, provider, network_type, run_date): re-collecting the same
+    city/provider/network on the same day replaces the prior row rather than
+    erroring (a road-walk is a full re-census of the frozen network, not an
+    incremental append). network_type is part of the key because 'drive' and
+    'all_public' are different networks that can be walked on the same night —
+    without it the second walk would silently overwrite the first's row.
 
     Returns the walk_id.
     """
@@ -981,12 +1133,11 @@ def register_street_walk(
            (city_id, provider, run_date, csv_filename, coverage_filename,
             network_type, spacing_m, match_dist_m, sample_points, edges_total,
             edges_fully_covered, mean_edge_coverage, coverage_pct_by_length,
-            api_requests, started_at, finished_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT(city_id, provider, run_date) DO UPDATE SET
+            coverage_pct_by_length_any, api_requests, started_at, finished_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(city_id, provider, network_type, run_date) DO UPDATE SET
              csv_filename = excluded.csv_filename,
              coverage_filename = excluded.coverage_filename,
-             network_type = excluded.network_type,
              spacing_m = excluded.spacing_m,
              match_dist_m = excluded.match_dist_m,
              sample_points = excluded.sample_points,
@@ -994,6 +1145,7 @@ def register_street_walk(
              edges_fully_covered = excluded.edges_fully_covered,
              mean_edge_coverage = excluded.mean_edge_coverage,
              coverage_pct_by_length = excluded.coverage_pct_by_length,
+             coverage_pct_by_length_any = excluded.coverage_pct_by_length_any,
              api_requests = excluded.api_requests,
              started_at = excluded.started_at,
              finished_at = excluded.finished_at""",
@@ -1011,6 +1163,7 @@ def register_street_walk(
             edges_fully_covered,
             mean_edge_coverage,
             coverage_pct_by_length,
+            coverage_pct_by_length_any,
             api_requests,
             started_at,
             finished_at,
@@ -1019,22 +1172,64 @@ def register_street_walk(
     conn.commit()
     row = conn.execute(
         """SELECT walk_id FROM street_walks
-           WHERE city_id = ? AND provider = ? AND run_date = ?""",
-        (city_id, provider, run_date.isoformat()),
+           WHERE city_id = ? AND provider = ? AND network_type = ? AND run_date = ?""",
+        (city_id, provider, network_type, run_date.isoformat()),
     ).fetchone()
     return row["walk_id"]
 
 
 def get_latest_street_walk(
-    conn: sqlite3.Connection, city_id: str, provider: str = "gsv"
+    conn: sqlite3.Connection,
+    city_id: str,
+    provider: str = "gsv",
+    network_type: str = "drive",
 ) -> sqlite3.Row | None:
-    """Most recent road-walk collection for a (city, provider), or None."""
+    """Most recent road-walk collection for a (city, provider, network), or None.
+
+    network_type defaults to 'drive' — the original and still-scheduled network
+    — so callers that predate the broader networks keep their exact behaviour.
+    """
     return conn.execute(
         """SELECT * FROM street_walks
-           WHERE city_id = ? AND provider = ?
+           WHERE city_id = ? AND provider = ? AND network_type = ?
            ORDER BY run_date DESC LIMIT 1""",
-        (city_id, provider),
+        (city_id, provider, network_type),
     ).fetchone()
+
+
+def get_latest_street_walks_all(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """
+    The most recent road-walk collection for every (city_id, provider,
+    network_type) that has one, ordered by city, provider, then network type
+    DESCENDING. Backs the published ``streetwalks.json.gz`` manifest (issue
+    #155).
+
+    network_type is part of the grouping, not filtered out: a city may have both
+    a 'drive' walk and a broader 'all_public' one, and collapsing them would
+    advertise whichever the JOIN happened to pick. The frontend selects by
+    network type (defaulting to 'drive'), so the manifest must carry both.
+
+    The DESCENDING network order is deliberate. ``data/`` and ``www/`` publish
+    by separate mechanisms, and the collector regenerates this manifest on its
+    own, so a browser can hold a cached pre-network-type ``streetscape-utils.js``
+    whose lookup takes the FIRST entry matching (city, provider). Descending
+    puts 'drive' — the scheduled series, and what every such client has always
+    rendered — ahead of 'all_public' ('a' < 'd'), so a stale client degrades to
+    the right walk instead of silently switching street-km denominators.
+    """
+    return conn.execute(
+        """SELECT sw.* FROM street_walks sw
+           JOIN (
+               SELECT city_id, provider, network_type, MAX(run_date) AS max_date
+               FROM street_walks
+               GROUP BY city_id, provider, network_type
+           ) latest
+             ON sw.city_id = latest.city_id
+            AND sw.provider = latest.provider
+            AND sw.network_type = latest.network_type
+            AND sw.run_date = latest.max_date
+           ORDER BY sw.city_id, sw.provider, sw.network_type DESC""",
+    ).fetchall()
 
 
 # ── API budget ledger ──────────────────────────────────────────────────────

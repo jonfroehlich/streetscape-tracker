@@ -25,14 +25,40 @@ enabled = true
 # Counted in z14 vector-tile requests; Mapillary caps at 50,000/day per app.
 daily_request_budget = 40000
 
-# Road-walk street-coverage collection (issue #99). Isolated gsv_streets budget
-# channel (separate GMAPS_STREETS_API_KEY). Disabled + not yet in `run-due`;
-# the collector is a manual CLI whose built-in defaults mirror these values
-# (it does not read this file).
+# Road-walk street-coverage collection (issue #99). SCHEDULED channels like the
+# two above — same cycle, same stagger day (a city's grid and street snapshots
+# pair), same failure counting — but `run-due` runs the road-walk collector for
+# them instead of streetscape_tracker.py, against ISOLATED credentials and
+# ledgers (GMAPS_STREETS_API_KEY / MAPILLARY_STREETS_ACCESS_TOKEN, metered under
+# gsv_streets / mapillary_streets) so a road crawl can never exhaust the grid
+# collectors' quota.
+#
+# GSV: one metadata request per on-street sample point, so the ceiling below is
+# a nightly runtime knob rather than a cost limit (metadata is free). Paced by
+# its own key's quota, NOT [download].max_requests_per_minute — the streets key
+# is a fresh key at Google's ~30,000/min default, so 24,000 is ~80% headroom.
+#
+# Sizing: the whole frame is ~133M on-street samples at 15 m, so a full pass at
+# 20 cities/night averages ~1.5M/night. The ceiling is 2x that because nightly
+# demand is lumpy, not average — a single Berlin-scale city is ~850k, and three
+# of them landing on one night would exhaust a tighter budget and defer the rest
+# (graceful, but it stalls the first pass). The requests are free; only wall
+# clock is spent, ~1 h/night at the pacing above.
 [providers.gsv_streets]
-enabled = false
-daily_request_budget = 2000000
+enabled = true
+daily_request_budget = 3000000
 max_requests_per_minute = 24000
+spacing_m = 15
+
+# Mapillary road-walk: costs the z14 tile census (tens of requests for a whole
+# city) regardless of city size or spacing, because Mapillary has no per-point
+# endpoint — the walk is a local spatial join against the tiles. Budgeted in
+# tile requests against Mapillary's 50,000/day application cap, which is SHARED
+# with [providers.mapillary] above (40,000), hence the modest ceiling.
+[providers.mapillary_streets]
+enabled = true
+daily_request_budget = 5000
+spacing_m = 15
 
 [download]
 batch_size = 100

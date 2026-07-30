@@ -23,6 +23,19 @@
     gtag("config", "G-ZSQGNSTEES");
   </script>
 
+  <!-- Site header (shared markup with index.html / streets.html; styles live
+       in streetscape-shared.css). The "Map" nav item replaces what used to be
+       a standalone "← Back to Overview Map" link. -->
+  <header class="site-header">
+    <a class="site-brand" href="index.html">Streetscape Tracker</a>
+    <nav class="site-nav" aria-label="Main">
+      <a href="index.html">Map</a>
+      <a href="streets.html">Streets</a>
+    </nav>
+    <a class="site-external" href="https://github.com/jonfroehlich/streetscape-tracker"
+       target="_blank" rel="noopener">About &#8599;</a>
+  </header>
+
   <div id="map" role="application" aria-label="City panorama age map"></div>
 
   <div id="temporal-plot-container">
@@ -40,8 +53,6 @@
        hidden until a run has a "_streets.json.gz" artifact) -->
   <div id="street-coverage-container" role="region"
        aria-label="OSM street coverage"></div>
-
-  <a href="index.html" id="back-link">← Back to Overview Map</a>
 
   <div id="progress-container" role="status" aria-live="polite">
     <div id="progress-bar">

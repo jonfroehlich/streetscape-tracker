@@ -1,0 +1,168 @@
+/**
+ * streets.css
+ * Styles specific to the street-level coverage page (streets.html).
+ *
+ * Unlike index.html / city.html this page is a normal scrolling document,
+ * not a full-bleed map with floating panels — so it clears the fixed
+ * .site-header with padding rather than per-panel `top` offsets.
+ */
+
+.streets-page {
+  background: #f7f7f7;
+  color: #222;
+  line-height: 1.5;
+}
+
+/* Wide enough that the table's nowrap columns fit without scrolling at
+   desktop widths; the intro keeps its own reading measure below. */
+.streets-main {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 64px 20px 60px; /* 44px header + breathing room */
+}
+
+.streets-main h1 {
+  margin: 0 0 12px;
+  font-size: 24px;
+}
+
+.streets-intro {
+  max-width: 68ch;
+  margin-bottom: 24px;
+}
+
+.streets-intro p {
+  margin: 0 0 10px;
+}
+
+.streets-caveat {
+  color: #555;
+  font-size: 14px;
+}
+
+#streets-status {
+  padding: 12px 0;
+  color: #555;
+}
+
+/* Wide tables scroll inside their own container rather than making the
+   whole page scroll sideways on narrow screens. */
+.streets-table-wrap {
+  /* Contains the header's .visually-hidden span: it is position:absolute, so
+     without a positioned ancestor it resolves against the initial containing
+     block and escapes this scroll container, making the whole PAGE scroll
+     sideways once the table is wider than the viewport. */
+  position: relative;
+  overflow-x: auto;
+  background: #fff;
+  border-radius: 6px;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.15);
+}
+
+.streets-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+}
+
+.streets-table caption {
+  caption-side: bottom;
+  padding: 10px 12px;
+  color: #666;
+  font-size: 12px;
+  text-align: left;
+}
+
+.streets-table th,
+.streets-table td {
+  padding: 8px 12px;
+  text-align: left;
+  white-space: nowrap;
+  border-bottom: 1px solid #eee;
+}
+
+.streets-table thead th {
+  background: #f0f0f0;
+  font-size: 13px;
+  padding: 0; /* the sort button fills the cell so its hit area is the header */
+}
+
+/* Sort control: looks like a header label, behaves like a button. */
+.streets-table thead th button {
+  width: 100%;
+  padding: 8px 12px;
+  border: 0;
+  background: none;
+  font: inherit;
+  font-weight: bold;
+  color: inherit;
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.streets-table thead th button:hover {
+  background: #e6e6e6;
+}
+
+.streets-table thead th button:focus-visible {
+  outline: 2px solid #1a73e8;
+  outline-offset: -2px;
+}
+
+/* Reserve the arrow's width so re-sorting doesn't shift column widths. */
+.sort-arrow {
+  display: inline-block;
+  min-width: 1em;
+  color: #1a6b1d;
+}
+
+.streets-table thead th[aria-sort="none"] button:hover .sort-arrow::after {
+  content: "▼";
+  opacity: 0.35;
+}
+
+.streets-table tbody th {
+  font-weight: bold;
+}
+
+.streets-table tbody tr:hover {
+  background: #fafafa;
+}
+
+/* Coverage cell: a proportional bar behind the number. The bar is
+   aria-hidden — the percentage text is the accessible content. */
+.coverage-cell {
+  position: relative;
+  min-width: 140px;
+}
+
+/* The coverage scale runs light-at-high (see coverageColor), so the bar needs
+   most of its opacity to stay visible on white at the top of the range. */
+.coverage-bar {
+  position: absolute;
+  left: 0;
+  top: 4px;
+  bottom: 4px;
+  border-radius: 2px;
+  opacity: 0.6;
+}
+
+.coverage-value {
+  position: relative;
+}
+
+.streets-view-link {
+  color: #1a6b1d;
+  text-decoration: none;
+  font-weight: bold;
+}
+
+.streets-view-link:hover,
+.streets-view-link:focus-visible {
+  text-decoration: underline;
+}
+
+.streets-no-link {
+  color: #999;
+}

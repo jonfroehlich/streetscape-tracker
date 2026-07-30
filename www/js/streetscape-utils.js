@@ -223,6 +223,25 @@ METRICS.coverage_any = {
   sliderLabel: "any-imagery coverage (%)",
 };
 
+// Road-walk street coverage (issue #99/#155). A DIFFERENT denominator from the
+// two coverage metrics above: those are area-sampled (share of frozen grid
+// points with imagery), this is the fraction of the city's OSM street network
+// length actually driven. The value is not in cities.json.gz at all — it comes
+// from the streetwalks.json.gz sidecar manifest and is attached to the city
+// record by mergeStreetwalkStats(), so it is null for every city that has not
+// been walked yet — the street channels are scheduled like the grid ones, so
+// cities fill in over a collection cycle rather than all at once.
+// Same decile/color machinery as `coverage` — only the read differs.
+METRICS.streets = {
+  ...METRICS.coverage,
+  label: "Street coverage",
+  legendTitle: "Street Coverage (% of street-km)",
+  titleNoun: "Street Coverage %",
+  axisTitle: "Street Coverage (% of street-km)",
+  valueOf: (city) => city.street_coverage_pct_by_length ?? null,
+  sliderLabel: "street coverage (%)",
+};
+
 /**
  * True iff `key` is a real "color by" metric key ("age"/"coverage").
  * Object.hasOwn for the same reason as isKnownProvider: a URL-supplied
@@ -348,6 +367,177 @@ async function fetchGzippedJson(url) {
   const compressed = await response.arrayBuffer();
   const text = pako.inflate(new Uint8Array(compressed), { to: "string" });
   return JSON.parse(text);
+}
+
+// ---------------------------------------------------------------------------
+// Streetwalk manifest (issue #155).
+//
+// `streetwalks.json.gz` is a sidecar index of the latest road-walk coverage
+// artifact per (city, provider). It is deliberately NOT part of the
+// cities.json.gz v3 aggregate (folding it in is #102), because a road-walk
+// artifact is not a sibling of a grid run: its `sp{N}` spacing is a free
+// parameter and its run date differs, so no consumer can derive its filename.
+// All three pages read it: city.js to pick the artifact to render,
+// index.js to color/annotate the overview, streets.js to list the walks.
+// ---------------------------------------------------------------------------
+
+/**
+ * URL of the sidecar streetwalk manifest.
+ * @returns {string}
+ */
+function streetwalkManifestUrl() {
+  return STREETSCAPE_DATA_BASE_URL + "streetwalks.json.gz";
+}
+
+/**
+ * Fetch the streetwalk manifest, or null when it's absent/unreadable (the
+ * feature is optional — most deployments won't have one yet).
+ * @returns {Promise<?Object>}
+ */
+async function fetchStreetwalkManifest() {
+  try {
+    return await fetchGzippedJson(streetwalkManifestUrl());
+  } catch (e) {
+    console.info("No streetwalk manifest (skipping road-walk overlay):", e.message);
+    return null;
+  }
+}
+
+/**
+ * The OSM network a road walk covers when none is stated. 'drive' is the
+ * original and still-scheduled series (motorized public roads only); a broad
+ * 'all_public' walk additionally covers alleys, footways, park paths, cycleways
+ * and steps, and is a SEPARATE series with a much larger street-km denominator.
+ */
+const DEFAULT_STREET_NETWORK_TYPE = "drive";
+
+/**
+ * Human labels for the osmnx network types a walk can be collected on. Keyed by
+ * the exact `network_type` the manifest carries, so the keys double as the set
+ * of values `?network=` accepts. Labels say what the walk COVERS rather than
+ * echoing the osmnx filter name, since that distinction is the whole reason two
+ * rows for one city are not duplicates.
+ *
+ * Mirrors naming.STREETWALK_NETWORK_TOKENS on the Python side — keep in sync.
+ */
+const STREET_NETWORK_LABELS = {
+  drive: "Roads",
+  all_public: "Roads + paths",
+  all: "Roads + paths (incl. private)",
+  walk: "Walkable",
+  bike: "Bikeable",
+  drive_service: "Roads + service",
+};
+
+/**
+ * Human label for an OSM network type; unknown types render as themselves.
+ * @param {?string} networkType - From the manifest; absent on pre-network walks.
+ * @returns {string}
+ */
+function streetNetworkLabel(networkType) {
+  const key = networkType ?? DEFAULT_STREET_NETWORK_TYPE;
+  return STREET_NETWORK_LABELS[key] ?? key;
+}
+
+/**
+ * Whether a string names a network type this site knows how to select on.
+ * Used to validate the untrusted `?network=` parameter before it reaches a
+ * manifest lookup, the same way isKnownProvider guards `?provider=`.
+ * @param {?string} networkType
+ * @returns {boolean}
+ */
+function isKnownStreetNetworkType(networkType) {
+  return (
+    typeof networkType === "string" &&
+    Object.prototype.hasOwnProperty.call(STREET_NETWORK_LABELS, networkType)
+  );
+}
+
+/**
+ * Find a city+provider+network's streetwalk entry in the manifest, or null.
+ *
+ * A city can have one walk per network type, so this must select on network
+ * type rather than take the first match — otherwise a city with both a drive
+ * and an all_public walk would render whichever the manifest happened to list
+ * first, and its headline coverage % would silently switch denominators.
+ * Manifest entries written before network types existed have no `network_type`
+ * field; they are drive walks, hence the `?? DEFAULT` on the record side.
+ *
+ * @param {?Object} manifest - The parsed streetwalks.json.gz, or null.
+ * @param {string} cityId
+ * @param {string} provider
+ * @param {string} [networkType] - Defaults to "drive".
+ * @returns {?Object} The walk record (with `coverage_filename`), or null.
+ */
+function lookupStreetwalk(
+  manifest,
+  cityId,
+  provider,
+  networkType = DEFAULT_STREET_NETWORK_TYPE,
+) {
+  if (!manifest || !Array.isArray(manifest.walks)) return null;
+  return (
+    manifest.walks.find(
+      (w) =>
+        w.city_id === cityId &&
+        w.provider === provider &&
+        (w.network_type ?? DEFAULT_STREET_NETWORK_TYPE) === networkType,
+    ) || null
+  );
+}
+
+/**
+ * Attach each city's road-walk record from the manifest, in place.
+ *
+ * Adapted city records carry the canonical `city_id` and `provider`, which is
+ * exactly the manifest's key — so this is a straight join. Cities without a
+ * walk get explicit nulls rather than missing keys, so METRICS.streets.valueOf
+ * and the popup both read a defined property.
+ *
+ * Indexes the walks once instead of scanning them per city: street collection
+ * is scheduled across the whole catalog, so both sides of this join grow to
+ * ~1,150 cities × 2 providers, and it re-runs on every provider/metric toggle.
+ * The index keeps the FIRST walk per key, matching what `lookupStreetwalk`'s
+ * `find` returns for a manifest that somehow carries duplicates.
+ *
+ * Only DRIVE walks are joined. METRICS.streets compares cities to each other,
+ * and drive vs all_public coverage are not comparable numbers — they divide by
+ * different street-km denominators — so mixing them would put two scales in one
+ * choropleth. A city with only a broad walk therefore reads "No data" here,
+ * which is honest: its drive coverage genuinely has not been measured.
+ *
+ * The count is the honest denominator for "N of M cities walked" that the
+ * overview banner reports, rather than silently rendering a map of grey
+ * rectangles.
+ *
+ * @param {Object[]} cities - Adapted city records (from adaptCitiesPayload).
+ * @param {?Object} manifest - The parsed streetwalks.json.gz, or null.
+ * @returns {number} How many cities matched a walk.
+ *
+ * @example
+ *   const { cities } = adaptCitiesPayload(raw, "gsv");
+ *   const walked = mergeStreetwalkStats(cities, manifest);  // → 1
+ */
+function mergeStreetwalkStats(cities, manifest) {
+  const byKey = new Map();
+  if (manifest && Array.isArray(manifest.walks)) {
+    for (const walk of manifest.walks) {
+      if ((walk.network_type ?? DEFAULT_STREET_NETWORK_TYPE) !== DEFAULT_STREET_NETWORK_TYPE) {
+        continue;
+      }
+      const key = `${walk.provider}|${walk.city_id}`;
+      if (!byKey.has(key)) byKey.set(key, walk);
+    }
+  }
+
+  let matched = 0;
+  for (const city of cities) {
+    const walk = byKey.get(`${city.provider}|${city.city_id}`) ?? null;
+    city.street_walk = walk;
+    city.street_coverage_pct_by_length = walk?.coverage_pct_by_length ?? null;
+    if (walk) matched += 1;
+  }
+  return matched;
 }
 
 /**
@@ -698,6 +888,14 @@ if (typeof module !== "undefined" && module.exports) {
     isValidRunFilename,
     getProviderFromFilename,
     fetchGzippedJson,
+    streetwalkManifestUrl,
+    fetchStreetwalkManifest,
+    DEFAULT_STREET_NETWORK_TYPE,
+    STREET_NETWORK_LABELS,
+    streetNetworkLabel,
+    isKnownStreetNetworkType,
+    lookupStreetwalk,
+    mergeStreetwalkStats,
     adaptCityRecord,
     adaptCitiesPayload,
     isGoogleCopyright,

@@ -223,6 +223,97 @@ def test_streetwalk_filename_round_trips():
     assert (p.width_meters, p.step_meters, p.spacing_meters) == (5000, 20, 15)
     assert p.run_date == date(2026, 7, 8)
     assert p.slug == "bend--or"
+    # No token means GSV, exactly as for run filenames — every walk published
+    # before the token existed keeps parsing as the provider it actually was.
+    assert p.provider == "gsv"
+    # Same for the network: tokenless is 'drive', so pre-existing walk names
+    # (which have no network token at all) stay byte-identical and keep parsing.
+    assert p.network_type == "drive"
+
+
+def test_streetwalk_filenames_differ_per_network_type():
+    """
+    A 'drive' walk and an 'all_public' walk of one city cover different edge
+    sets and can be collected the same night. Without a network token their
+    filenames are identical, so the second collection would find the first's
+    snapshot on disk and skip as a silent no-op — the same failure the provider
+    token exists to prevent.
+    """
+    args = ("bend--or", 5000, 5000, 20, 15, date(2026, 7, 8))
+    drive = generate_streetwalk_filename(*args)
+    broad = generate_streetwalk_filename(*args, network_type="all_public")
+    assert drive != broad
+    assert broad == "bend--or_width_5000_height_5000_step_20_streetwalk_allpublic_sp15_2026-07-08"
+    assert streetwalk_coverage_filename(drive + ".csv.gz") != streetwalk_coverage_filename(
+        broad + ".csv.gz"
+    )
+    p = parse_streetwalk_filename(broad + ".csv.gz")
+    assert p.network_type == "all_public"
+    assert (p.provider, p.slug, p.spacing_meters) == ("gsv", "bend--or", 15)
+
+    with pytest.raises(ValueError):
+        generate_streetwalk_filename(*args, network_type="bogus")
+
+
+@pytest.mark.parametrize(
+    "network_type", ["drive", "all_public", "all", "walk", "bike", "drive_service"]
+)
+@pytest.mark.parametrize("provider", ["gsv", "mapillary"])
+def test_streetwalk_filename_round_trips_every_provider_and_network(provider, network_type):
+    """Every (provider, network) pair must generate a name that parses back to it.
+
+    Note 'all' vs 'allpublic': the token alternation is matched longest-first so
+    the shorter one cannot shadow the longer.
+    """
+    stem = generate_streetwalk_filename(
+        "bend--or",
+        5000,
+        5000,
+        20,
+        15,
+        date(2026, 7, 8),
+        provider=provider,
+        network_type=network_type,
+    )
+    p = parse_streetwalk_filename(stem + ".csv.gz")
+    assert (p.provider, p.network_type) == (provider, network_type)
+    assert (p.slug, p.step_meters, p.spacing_meters) == ("bend--or", 20, 15)
+    # A walk name must never read as a grid run, whatever tokens it carries.
+    with pytest.raises(ValueError):
+        parse_filename(stem + ".csv.gz")
+
+
+def test_streetwalk_filenames_differ_per_provider():
+    """
+    The two providers walk the SAME sample points and the scheduler collects
+    both on the same night with the same run_date, so the provider token is the
+    only thing keeping their artifacts apart. Without it the second collection
+    finds the first's snapshot on disk and skips as a no-op.
+    """
+    args = ("bend--or", 5000, 5000, 20, 15, date(2026, 7, 8))
+    gsv = generate_streetwalk_filename(*args)
+    mly = generate_streetwalk_filename(*args, provider="mapillary")
+    assert gsv != mly
+    assert mly == "bend--or_width_5000_height_5000_step_20_mapillary_streetwalk_sp15_2026-07-08"
+    assert streetwalk_coverage_filename(gsv + ".csv.gz") != streetwalk_coverage_filename(
+        mly + ".csv.gz"
+    )
+
+    p = parse_streetwalk_filename(mly + ".csv.gz")
+    assert p.provider == "mapillary"
+    assert (p.slug, p.step_meters, p.spacing_meters) == ("bend--or", 20, 15)
+    assert p.run_date == date(2026, 7, 8)
+
+    with pytest.raises(ValueError):
+        generate_streetwalk_filename(*args, provider="bogus")
+
+
+def test_parse_filename_rejects_provider_tagged_streetwalk_artifacts():
+    """A provider-tokened walk must still not read as a grid run of that provider."""
+    with pytest.raises(ValueError):
+        parse_filename(
+            "bend--or_width_5000_height_5000_step_20_mapillary_streetwalk_sp15_2026-07-08.csv.gz"
+        )
 
 
 def test_streetwalk_coverage_filename():

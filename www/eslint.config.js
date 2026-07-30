@@ -41,6 +41,14 @@ const sharedGlobals = {
   isValidRunFilename: "readonly",
   getProviderFromFilename: "readonly",
   fetchGzippedJson: "readonly",
+  streetwalkManifestUrl: "readonly",
+  fetchStreetwalkManifest: "readonly",
+  lookupStreetwalk: "readonly",
+  DEFAULT_STREET_NETWORK_TYPE: "readonly",
+  STREET_NETWORK_LABELS: "readonly",
+  streetNetworkLabel: "readonly",
+  isKnownStreetNetworkType: "readonly",
+  mergeStreetwalkStats: "readonly",
   adaptCityRecord: "readonly",
   adaptCitiesPayload: "readonly",
   isGoogleCopyright: "readonly",
@@ -100,11 +108,27 @@ module.exports = [
     rules: browserRules,
   },
   {
+    // Street-level coverage page (issue #99/#155): consumes the
+    // streetscape-utils.js globals and, like the two files above, carries a
+    // Node export shim (`module`) so its pure helpers can be unit-tested.
+    files: ["js/streets.js"],
+    languageOptions: {
+      ecmaVersion: 2022,
+      sourceType: "script",
+      globals: { ...globals.browser, ...vendorGlobals, ...sharedGlobals, module: "readonly" },
+    },
+    rules: browserRules,
+  },
+  {
     // Only city.html loads street-coverage.js, so only city.js may consume
-    // its global (flat config merges this into city.js's entry above).
+    // its globals (flat config merges this into city.js's entry above).
+    // The manifest helpers moved to streetscape-utils.js (they are needed by
+    // index.js/streets.js too) and are declared in sharedGlobals instead.
     files: ["js/city.js"],
     languageOptions: {
-      globals: { renderStreetCoverage: "readonly" },
+      globals: {
+        renderStreetCoverage: "readonly",
+      },
     },
   },
   {
