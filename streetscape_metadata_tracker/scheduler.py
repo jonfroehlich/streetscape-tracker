@@ -19,14 +19,17 @@ Config: TOML (see config/scheduler.toml). Requires Python 3.11+ (tomllib).
 """
 
 import argparse
+import contextlib
 import gzip
 import json
 import logging
 import logging.handlers
 import os
+import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import tomllib
 import traceback
@@ -126,6 +129,16 @@ class SchedulerConfig:
     max_cities_per_day: int = 20
     max_consecutive_failures: int = 5
     city_timeout_minutes: int = 180
+    # Wall-clock ceiling on the CITY LOOP, leaving the tail (aggregate,
+    # manifest, catalog backup, publish) room to run inside whatever budget the
+    # supervisor allows. The unit is Type=oneshot under TimeoutStartSec, so a
+    # batch that overruns is killed mid-loop and publishes NOTHING — every city
+    # it already collected stays invisible on the public site until someone runs
+    # regenerate-aggregate by hand (issue #167; on 2026-07-29 a batch died at
+    # exactly 12 h having collected most of the night). Keep this comfortably
+    # below the unit's TimeoutStartSec so this deadline, not systemd, ends a
+    # long night.
+    max_batch_hours: float = 10.0
     # [download]
     batch_size: int = 100
     connection_limit: int = 50
@@ -230,6 +243,7 @@ def load_scheduler_config(path: str | None = None) -> SchedulerConfig:
         max_cities_per_day=sched.get("max_cities_per_day", 20),
         max_consecutive_failures=sched.get("max_consecutive_failures", 5),
         city_timeout_minutes=sched.get("city_timeout_minutes", 180),
+        max_batch_hours=sched.get("max_batch_hours", 10.0),
         batch_size=dl.get("batch_size", 100),
         connection_limit=dl.get("connection_limit", 50),
         request_timeout_s=dl.get("request_timeout_s", 30.0),
@@ -476,9 +490,58 @@ _TIMEOUT_FIXED_SLACK_S = 600
 # alone eats the whole floor and the child is SIGKILLed during the diff/JSON
 # tail (leaving a valid run row with no JSON — see cmd_run_due reconciliation).
 _ACHIEVED_RATE_FRACTION = 0.5
+# Floor for a deadline-clamped timeout. A city is only started while the batch
+# deadline still has room, so the clamp should shorten a run — never hand a
+# child a timeout too short to reach its first request.
+_MIN_CLAMPED_TIMEOUT_S = 300
+# Stop reason for an exception escaping the city loop. Distinct from the benign
+# early exits (day cap, deadline, SIGTERM) because it must still fail the run:
+# the batch publishes what it collected, but the night is not healthy.
+_STOP_REASON_ERROR = "unexpected error in the city loop"
 
 
-def city_timeout_seconds(cfg: SchedulerConfig, city: db.CityRow, provider: str, conn=None) -> int:
+@contextlib.contextmanager
+def _stop_on_sigterm():
+    """Turn SIGTERM into a stop *request* instead of an abrupt death.
+
+    systemd stops a unit with SIGTERM (and escalates to SIGKILL only after
+    TimeoutStopSec). Under the default handler that lands wherever the loop
+    happens to be, so the night's aggregate/manifest/publish tail never runs and
+    everything already collected stays unpublished (issue #167). Here it just
+    sets a flag the city loop checks between cities, letting the batch wind down
+    and still publish.
+
+    Because the unit's default KillMode is control-group, the SIGTERM also
+    reaches the running child, so the in-flight ``subprocess.run`` returns
+    promptly rather than holding the loop for the rest of its timeout.
+
+    Yields an ``Event`` that is set once SIGTERM has been seen. Restores the
+    previous handler on exit, and no-ops off the main thread (signal handlers
+    can only be installed there) — the deadline check still bounds the batch.
+    """
+    requested = threading.Event()
+
+    def handler(signum, frame):
+        requested.set()
+
+    try:
+        previous = signal.signal(signal.SIGTERM, handler)
+    except ValueError:
+        yield requested
+        return
+    try:
+        yield requested
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
+def city_timeout_seconds(
+    cfg: SchedulerConfig,
+    city: db.CityRow,
+    provider: str,
+    conn=None,
+    remaining_s: float | None = None,
+) -> int:
     """
     Per-city subprocess timeout, derived from the estimated request count and
     the *achieved* download rate rather than a single flat cap.
@@ -491,19 +554,30 @@ def city_timeout_seconds(cfg: SchedulerConfig, city: db.CityRow, provider: str, 
     is not actually achieved (see the constant). The derived value never drops
     below the configured floor, so small cities and the (fast, bulk-metadata)
     Mapillary provider keep the flat timeout.
+
+    ``remaining_s`` clamps the result to what is left of the batch deadline
+    (issue #167). Without it, a city started just inside the deadline still runs
+    its full derived timeout and pushes the batch past the supervisor's ceiling,
+    which is the overrun the deadline exists to prevent.
     """
     floor = cfg.city_timeout_minutes * 60
+
+    def clamp(value: int) -> int:
+        if remaining_s is None:
+            return value
+        return int(max(_MIN_CLAMPED_TIMEOUT_S, min(value, remaining_s)))
+
     # Only the two per-request GSV channels are paced by request count. Both
     # Mapillary channels read a handful of tiles in seconds, so they keep the
     # flat floor. gsv_streets scales exactly like gsv — a 247k-sample city
     # (Seattle) needs ~20 minutes of querying, and a flat floor would SIGKILL
     # the biggest ones.
     if provider not in ("gsv", "gsv_streets"):
-        return floor
+        return clamp(floor)
     pc = (cfg.providers or {}).get(provider)
     rate = (pc.max_requests_per_minute if pc else None) or cfg.max_requests_per_minute
     if rate <= 0:
-        return floor
+        return clamp(floor)
     spacing = pc.spacing_m if pc else 15
     network_type = pc.network_type if pc else "drive"
     effective_rate = rate * _ACHIEVED_RATE_FRACTION
@@ -511,7 +585,7 @@ def city_timeout_seconds(cfg: SchedulerConfig, city: db.CityRow, provider: str, 
         city, provider, conn=conn, spacing_m=spacing, network_type=network_type
     )
     paced_seconds = estimated / effective_rate * 60.0
-    return int(max(floor, paced_seconds * _TIMEOUT_HEADROOM + _TIMEOUT_FIXED_SLACK_S))
+    return clamp(int(max(floor, paced_seconds * _TIMEOUT_HEADROOM + _TIMEOUT_FIXED_SLACK_S)))
 
 
 def setup_logging(cfg: SchedulerConfig, verbose: bool = False) -> None:
@@ -908,6 +982,7 @@ def _run_one_city(
     connection_limit: int | None = None,
     daily_budget: int = 0,
     conn=None,
+    remaining_s: float | None = None,
 ) -> bool:
     """Collect one (city, channel) in a subprocess.
 
@@ -919,6 +994,8 @@ def _run_one_city(
     resource guard lowers it when the shared host is under pressure); None uses
     the configured default. ``daily_budget`` is the street channel's full daily
     ceiling — see _street_collect_cmd on why it is not the remainder.
+    ``remaining_s`` is what is left of the batch deadline, which caps this
+    child's timeout (issue #167).
     """
     conn_limit = cfg.connection_limit if connection_limit is None else connection_limit
 
@@ -933,7 +1010,7 @@ def _run_one_city(
             f"(~{estimated:,} requests estimated)"
         )
         logger.debug(f"Command: {' '.join(cmd)}")
-        timeout_s = city_timeout_seconds(cfg, city, provider, conn=conn)
+        timeout_s = city_timeout_seconds(cfg, city, provider, conn=conn, remaining_s=remaining_s)
         return _run_collection_subprocess(cfg, cmd, timeout_s, city, provider, today)
 
     cmd = [
@@ -975,7 +1052,7 @@ def _run_one_city(
         f"(~{estimate_requests(city, provider):,} requests estimated)"
     )
     logger.debug(f"Command: {' '.join(cmd)}")
-    timeout_s = city_timeout_seconds(cfg, city, provider)
+    timeout_s = city_timeout_seconds(cfg, city, provider, remaining_s=remaining_s)
     return _run_collection_subprocess(cfg, cmd, timeout_s, city, provider, today)
 
 
@@ -1196,6 +1273,7 @@ def cmd_run_due(
     if today is None:
         today = datetime.now(UTC).date()
     providers = cfg.enabled_providers()
+    batch_deadline = time.monotonic() + cfg.max_batch_hours * 3600.0
 
     # Ensure new cities (and newly enabled providers) have stagger assignments
     db.assign_schedule(conn, cfg.cycle_days, providers=tuple(providers))
@@ -1233,106 +1311,181 @@ def cmd_run_due(
                 budget_left[provider] -= est if est <= budget_left[provider] else 0
         return 0
 
-    processed = succeeded = attempted = skipped_budget = 0
-    for city in due:
-        if processed >= cfg.max_cities_per_day:
-            logger.info("Daily city cap reached; stopping for today")
-            break
+    # The tail below (aggregate, manifest, backup, publish) is what makes a
+    # night visible, and it only runs if the loop returns. Everything that can
+    # end the loop early therefore lives inside _run_city_loop, which always
+    # returns counters rather than propagating (issue #167).
+    with _stop_on_sigterm() as sigterm_seen:
+        processed, succeeded, attempted, skipped_budget, stop_reason = _run_city_loop(
+            cfg, conn, today, due, providers_for_city, batch_deadline, sigterm_seen
+        )
 
-        ran_any = False
-        for provider in providers_for_city[city.city_id]:
-            budget = cfg.providers[provider].daily_request_budget
-            est = estimate_requests(
-                city,
-                provider,
-                conn=conn,
-                spacing_m=cfg.providers[provider].spacing_m,
-                network_type=cfg.providers[provider].network_type,
-            )
-            if est > budget:
-                # This city can NEVER fit the daily budget — skipping (not
-                # breaking) so it can't starve every smaller city behind it
-                # in the stalest-first queue. Needs a manual run or a config
-                # change; surfaced loudly so it doesn't rot silently.
-                logger.warning(
-                    f"{city.city_id} [{provider}]: ~{est:,} estimated requests "
-                    f"exceeds the entire daily budget ({budget:,}). "
-                    f"Skipping — run manually with streetscape_tracker.py --force, "
-                    f"raise daily_request_budget, or set enabled=0."
-                )
-                skipped_budget += 1
-                continue
-
-            used = db.get_api_usage(conn, today, provider)
-            if used + est > budget:
-                # Doesn't fit in what's LEFT today — try the next (smaller)
-                # city rather than ending the day; this one rolls to tomorrow
-                # when the budget is fresh.
-                logger.info(
-                    f"{city.city_id} [{provider}] (~{est:,} req) doesn't fit "
-                    f"remaining budget ({budget - used:,} left); skipping."
-                )
-                skipped_budget += 1
-                continue
-
-            conn_limit, throttle_reason = plan_connection_limit(
-                cfg.connection_limit, read_system_pressure(), cfg.resource_guard
-            )
-            if throttle_reason:
-                logger.info(
-                    f"Resource guard: {throttle_reason}; connection limit "
-                    f"{cfg.connection_limit} → {conn_limit} for {city.city_id} [{provider}]"
-                )
-            ok = _run_one_city(
-                cfg,
-                city,
-                today,
-                provider,
-                connection_limit=conn_limit,
-                # The channel's FULL ceiling, not `budget - used`: the street
-                # collector subtracts today's spend from this itself, so
-                # passing the remainder would count it twice.
-                daily_budget=budget,
-                conn=conn,
-            )
-            ran_any = True
-            attempted += 1
-            # A subprocess can report failure yet still have done the expensive,
-            # budgeted part of its job; salvage that rather than re-spending the
-            # whole crawl next cycle. The two channel kinds fail differently: a
-            # grid run commits its `runs` row before the diff/JSON tail, while a
-            # road walk catalogs nothing until the very end and so is salvaged
-            # from the artifacts it left on disk.
-            if not ok:
-                if is_street_channel(provider):
-                    ok = _reconcile_orphaned_walk(conn, cfg, city, provider, today)
-                else:
-                    ok = _reconcile_orphaned_run(conn, cfg, city, provider, today)
-            if ok:
-                succeeded += 1
-                db.record_attempt(conn, city.city_id, success=True, provider=provider)
-            else:
-                db.record_attempt(
-                    conn,
-                    city.city_id,
-                    success=False,
-                    error=f"subprocess failed on {today}",
-                    provider=provider,
-                )
-                logger.error(f"{city.city_id} [{provider}]: collection failed")
-
-        if ran_any:
-            processed += 1
-            if processed < len(due):
-                time.sleep(cfg.sleep_between_cities_s)
+    if stop_reason:
+        logger.info(f"Stopped early: {stop_reason}")
 
     summary = (
         f"run-due {today}: {succeeded}/{attempted} runs succeeded across "
         f"{processed} cities"
         + (f"; {skipped_budget} deferred for budget" if skipped_budget else "")
+        + (f"; stopped early ({stop_reason})" if stop_reason else "")
     )
     logger.info("Done: " + summary)
+    return _finish_batch(
+        cfg, conn, summary, succeeded, attempted, errored=stop_reason == _STOP_REASON_ERROR
+    )
 
+
+def _run_city_loop(
+    cfg: SchedulerConfig,
+    conn,
+    today: date,
+    due: list,
+    providers_for_city: dict[str, list[str]],
+    batch_deadline: float,
+    sigterm_seen,
+) -> tuple[int, int, int, int, str | None]:
+    """Collect due cities until the day cap, the batch deadline, or SIGTERM.
+
+    Returns ``(processed, succeeded, attempted, skipped_budget, stop_reason)``;
+    ``stop_reason`` is None when the whole due list was worked through. Split
+    out of ``cmd_run_due`` so that every way of ending the night still reaches
+    the publish tail — an unexpected exception here is logged and converted into
+    a stop reason rather than discarding a night's collected data (issue #167).
+    """
+    processed = succeeded = attempted = skipped_budget = 0
+    stop_reason: str | None = None
+    try:
+        for city in due:
+            if processed >= cfg.max_cities_per_day:
+                stop_reason = "daily city cap reached"
+                break
+            if sigterm_seen.is_set():
+                stop_reason = "received SIGTERM"
+                break
+            remaining_s = batch_deadline - time.monotonic()
+            if remaining_s <= _MIN_CLAMPED_TIMEOUT_S:
+                stop_reason = (
+                    f"batch deadline reached ({cfg.max_batch_hours:g} h); "
+                    f"{len(due) - processed:,} due cities not attempted"
+                )
+                break
+
+            ran_any = False
+            for provider in providers_for_city[city.city_id]:
+                budget = cfg.providers[provider].daily_request_budget
+                est = estimate_requests(
+                    city,
+                    provider,
+                    conn=conn,
+                    spacing_m=cfg.providers[provider].spacing_m,
+                    network_type=cfg.providers[provider].network_type,
+                )
+                if est > budget:
+                    # This city can NEVER fit the daily budget — skipping (not
+                    # breaking) so it can't starve every smaller city behind it
+                    # in the stalest-first queue. Needs a manual run or a config
+                    # change; surfaced loudly so it doesn't rot silently.
+                    logger.warning(
+                        f"{city.city_id} [{provider}]: ~{est:,} estimated requests "
+                        f"exceeds the entire daily budget ({budget:,}). "
+                        f"Skipping — run manually with streetscape_tracker.py --force, "
+                        f"raise daily_request_budget, or set enabled=0."
+                    )
+                    skipped_budget += 1
+                    continue
+
+                used = db.get_api_usage(conn, today, provider)
+                if used + est > budget:
+                    # Doesn't fit in what's LEFT today — try the next (smaller)
+                    # city rather than ending the day; this one rolls to tomorrow
+                    # when the budget is fresh.
+                    logger.info(
+                        f"{city.city_id} [{provider}] (~{est:,} req) doesn't fit "
+                        f"remaining budget ({budget - used:,} left); skipping."
+                    )
+                    skipped_budget += 1
+                    continue
+
+                conn_limit, throttle_reason = plan_connection_limit(
+                    cfg.connection_limit, read_system_pressure(), cfg.resource_guard
+                )
+                if throttle_reason:
+                    logger.info(
+                        f"Resource guard: {throttle_reason}; connection limit "
+                        f"{cfg.connection_limit} → {conn_limit} for {city.city_id} [{provider}]"
+                    )
+                ok = _run_one_city(
+                    cfg,
+                    city,
+                    today,
+                    provider,
+                    connection_limit=conn_limit,
+                    # The channel's FULL ceiling, not `budget - used`: the street
+                    # collector subtracts today's spend from this itself, so
+                    # passing the remainder would count it twice.
+                    daily_budget=budget,
+                    conn=conn,
+                    # Never let one child run past the batch deadline; the point
+                    # of the deadline is to reserve time for the publish tail.
+                    remaining_s=batch_deadline - time.monotonic(),
+                )
+                ran_any = True
+                attempted += 1
+                # A subprocess can report failure yet still have done the expensive,
+                # budgeted part of its job; salvage that rather than re-spending the
+                # whole crawl next cycle. The two channel kinds fail differently: a
+                # grid run commits its `runs` row before the diff/JSON tail, while a
+                # road walk catalogs nothing until the very end and so is salvaged
+                # from the artifacts it left on disk.
+                if not ok:
+                    if is_street_channel(provider):
+                        ok = _reconcile_orphaned_walk(conn, cfg, city, provider, today)
+                    else:
+                        ok = _reconcile_orphaned_run(conn, cfg, city, provider, today)
+                if ok:
+                    succeeded += 1
+                    db.record_attempt(conn, city.city_id, success=True, provider=provider)
+                else:
+                    db.record_attempt(
+                        conn,
+                        city.city_id,
+                        success=False,
+                        error=f"subprocess failed on {today}",
+                        provider=provider,
+                    )
+                    logger.error(f"{city.city_id} [{provider}]: collection failed")
+
+            if ran_any:
+                processed += 1
+                if processed < len(due):
+                    time.sleep(cfg.sleep_between_cities_s)
+    except Exception:
+        # One city's unexpected error must not cost the night its publish:
+        # everything collected so far is already committed to the catalog but
+        # stays invisible on the public site until the aggregate is rebuilt.
+        # The caller still treats this as an unhealthy night (nonzero exit +
+        # alert) — swallowing it here buys the publish, not silence.
+        logger.exception("City loop aborted by an unexpected error")
+        stop_reason = _STOP_REASON_ERROR
+
+    return processed, succeeded, attempted, skipped_budget, stop_reason
+
+
+def _finish_batch(
+    cfg: SchedulerConfig,
+    conn,
+    summary: str,
+    succeeded: int,
+    attempted: int,
+    errored: bool = False,
+) -> int:
+    """Rebuild the published indexes, back up the catalog, publish, alert.
+
+    Kept separate from the city loop so it runs no matter how the night ended
+    (issue #167). ``errored`` marks a night whose loop raised: it still
+    publishes what was collected, but the batch reports failure and alerts, so
+    a bug in the loop can't hide behind a green exit code.
+    """
     # Regenerate the aggregate once for the whole batch
     if succeeded > 0:
         logger.info("Regenerating aggregate cities.json.gz")
@@ -1358,14 +1511,14 @@ def cmd_run_due(
     # an occasional single flaky city doesn't page every night). No-op unless
     # [alerts] enabled.
     failures = attempted - succeeded
-    if should_alert(failures, cfg.alerts.failure_threshold):
+    if errored or should_alert(failures, cfg.alerts.failure_threshold):
         send_alert(
             cfg.alerts,
             f"{failures} failed collection(s) on {socket.gethostname()}",
             f"{summary}\n\nRecent log:\n{_recent_log_tail(cfg)}",
         )
 
-    return 0 if succeeded == attempted else 1
+    return 0 if succeeded == attempted and not errored else 1
 
 
 def _add_global_flags(p: argparse.ArgumentParser) -> None:
