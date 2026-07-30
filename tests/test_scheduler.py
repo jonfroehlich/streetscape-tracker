@@ -1445,7 +1445,9 @@ def test_failed_collection_captures_child_output_and_surfaces_the_tail(conn, tmp
     with caplog.at_level(logging.ERROR):
         ok = sched._run_collection_subprocess(cfg, cmd, 60, city, "gsv", date(2026, 7, 1))
 
-    assert ok is False
+    assert not ok, "a nonzero exit is a failed collection"
+    # The reason rides back to the caller so it can reach schedule_state.
+    assert "exited 3" in ok.reason and "collect_" in ok.reason
     log_path = tmp_path / f"collect_{city.city_id}_gsv_2026-07-01.log"
     assert "TRACEBACK MARKER" in log_path.read_text()
     assert "exited 3" in caplog.text
@@ -1604,3 +1606,68 @@ def test_city_timeout_is_clamped_to_the_remaining_batch_budget(conn):
     assert clamped == 1800
     # Never clamp below the floor that lets a child reach its first request.
     assert sched.city_timeout_seconds(cfg, city, "gsv", remaining_s=1) == 300
+
+
+def test_last_error_records_the_real_cause_not_a_generic_string(conn, tmp_path, monkeypatch):
+    """Every failure in the catalog used to read "subprocess failed on <date>",
+    so a bad night had to be re-derived from daily-rotated logs the next
+    morning. The recorded cause must name what actually happened and which log
+    to read (issue #169)."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    _register(conn, "Alpha", width=1000, height=1000, step=20)
+    db.assign_schedule(conn, 90)
+    conn.execute("UPDATE schedule_state SET last_success_at = NULL")
+    conn.commit()
+
+    monkeypatch.setattr(
+        sched,
+        "_run_one_city",
+        lambda *a, **k: sched.CollectionOutcome(
+            False, "timed out after 180 minutes (see collect_alpha_mapillary_2026-07-02.log)"
+        ),
+    )
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+    monkeypatch.setattr(sched.time, "sleep", lambda s: None)
+    monkeypatch.setattr(sched, "generate_aggregate_v2", lambda c, d: None)
+    monkeypatch.setattr(sched, "generate_streetwalk_manifest", lambda c, d: {"walks": []})
+    monkeypatch.setattr(sched, "_reconcile_orphaned_run", lambda *a, **k: False)
+
+    sched.cmd_run_due(
+        SchedulerConfig(publish_enabled=False, log_dir=str(tmp_path)), today=date(2026, 7, 2)
+    )
+
+    recorded = conn.execute(
+        "SELECT last_error FROM schedule_state WHERE provider = 'gsv'"
+    ).fetchone()["last_error"]
+    assert "timed out after 180 minutes" in recorded
+    assert "collect_alpha_mapillary_2026-07-02.log" in recorded, "must name the log to read"
+    assert "subprocess failed on" not in recorded
+
+
+def test_a_plain_bool_from_run_one_city_still_works(conn, tmp_path, monkeypatch):
+    """CollectionOutcome is deliberately bool-compatible; a caller returning a
+    bare False must still record a failure rather than crash."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    _register(conn, "Alpha", width=1000, height=1000, step=20)
+    db.assign_schedule(conn, 90)
+    conn.execute("UPDATE schedule_state SET last_success_at = NULL")
+    conn.commit()
+
+    monkeypatch.setattr(sched, "_run_one_city", lambda *a, **k: False)
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+    monkeypatch.setattr(sched.time, "sleep", lambda s: None)
+    monkeypatch.setattr(sched, "generate_aggregate_v2", lambda c, d: None)
+    monkeypatch.setattr(sched, "generate_streetwalk_manifest", lambda c, d: {"walks": []})
+    monkeypatch.setattr(sched, "_reconcile_orphaned_run", lambda *a, **k: False)
+
+    sched.cmd_run_due(
+        SchedulerConfig(publish_enabled=False, log_dir=str(tmp_path)), today=date(2026, 7, 2)
+    )
+
+    row = conn.execute(
+        "SELECT consecutive_failures, last_error FROM schedule_state WHERE provider = 'gsv'"
+    ).fetchone()
+    assert row["consecutive_failures"] == 1
+    assert "subprocess failed on 2026-07-02" in row["last_error"]  # the fallback

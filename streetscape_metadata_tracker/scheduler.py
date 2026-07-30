@@ -654,6 +654,11 @@ def cmd_notify_failure(cfg: SchedulerConfig) -> int:
     return 0 if sent or not cfg.alerts.enabled else 1
 
 
+# Cap the failure list in `status` so one systemically bad night (every city
+# failing the same way) doesn't bury the budget summary underneath it.
+_STATUS_MAX_FAILURES = 40
+
+
 def cmd_status(cfg: SchedulerConfig) -> int:
     """Print a per-(city, provider) schedule table plus today's budgets."""
     conn = db.connect(cfg.db_path)
@@ -715,6 +720,28 @@ def cmd_status(cfg: SchedulerConfig) -> int:
             tablefmt="simple",
         )
     )
+
+    # Failing (city, channel) pairs with their recorded cause. The main table is
+    # ~1200 rows, so a last_error column there would be noise on every healthy
+    # row; what an operator actually wants after a bad night is just this list
+    # (issue #169).
+    failing = [
+        [r["city_id"], r["provider"], r["consecutive_failures"], (r["last_error"] or "—")[:90]]
+        for r in rows
+        if (r["consecutive_failures"] or 0) > 0 and (r["provider"] in providers)
+    ]
+    if failing:
+        failing.sort(key=lambda row: (-row[2], row[0]))
+        print(f"\n{len(failing)} failing (city, channel) pairs:")
+        print(
+            tabulate(
+                failing[:_STATUS_MAX_FAILURES],
+                headers=["city", "provider", "failures", "last error"],
+                tablefmt="simple",
+            )
+        )
+        if len(failing) > _STATUS_MAX_FAILURES:
+            print(f"... and {len(failing) - _STATUS_MAX_FAILURES} more.")
 
     n_cities = conn.execute("SELECT COUNT(*) FROM cities").fetchone()[0]
     due_str = ", ".join(f"{due_counts[p]} {p}" for p in providers)
@@ -906,6 +933,25 @@ def _street_collect_cmd(
 _CHILD_LOG_TAIL_LINES = 25
 
 
+@dataclass(frozen=True)
+class CollectionOutcome:
+    """Whether one collection subprocess worked, and if not, why.
+
+    Deliberately truthy/falsy like the plain bool it replaced, so callers (and
+    the test fakes that still return bare bools) read unchanged. The point is
+    ``reason``: it is what finally reaches ``schedule_state.last_error``, which
+    until now recorded only "subprocess failed on <date>" for every failure in
+    the catalog — so a bad night had to be re-derived from scratch the next
+    morning, if the daily-rotated logs still had it (issue #169).
+    """
+
+    ok: bool
+    reason: str | None = None
+
+    def __bool__(self) -> bool:
+        return self.ok
+
+
 def _child_log_path(cfg: SchedulerConfig, city: db.CityRow, provider: str, today: date) -> Path:
     """Per-attempt log for one (city, channel) collection subprocess."""
     return Path(cfg.log_dir) / f"collect_{city.city_id}_{provider}_{today.isoformat()}.log"
@@ -927,7 +973,7 @@ def _run_collection_subprocess(
     city: db.CityRow,
     provider: str,
     today: date,
-) -> bool:
+) -> CollectionOutcome:
     """
     Run one collection subprocess with its output captured to a per-attempt log.
 
@@ -961,7 +1007,7 @@ def _run_collection_subprocess(
                 stderr=subprocess.STDOUT,
             )
         if result.returncode == 0:
-            return True
+            return CollectionOutcome(True)
         why = f"exited {result.returncode}"
     except subprocess.TimeoutExpired:
         why = f"timed out after {timeout_s // 60} minutes"
@@ -971,7 +1017,9 @@ def _run_collection_subprocess(
     if tail:
         message += f"\n--- last {_CHILD_LOG_TAIL_LINES} lines of {log_path.name} ---\n{tail}"
     logger.error(message)
-    return False
+    # The log name, not the full path: the catalog outlives any given checkout
+    # location, and `logs/<name>` is what an operator actually greps for.
+    return CollectionOutcome(False, f"{why} (see {log_path.name})")
 
 
 def _run_one_city(
@@ -983,7 +1031,7 @@ def _run_one_city(
     daily_budget: int = 0,
     conn=None,
     remaining_s: float | None = None,
-) -> bool:
+) -> CollectionOutcome:
     """Collect one (city, channel) in a subprocess.
 
     Grid providers run ``streetscape_tracker.py``; street channels (issue #99)
@@ -1431,6 +1479,11 @@ def _run_city_loop(
                 )
                 ran_any = True
                 attempted += 1
+                # getattr, not attribute access: tests (and any future caller)
+                # may hand back a plain bool, which CollectionOutcome is
+                # deliberately compatible with.
+                reason = getattr(ok, "reason", None)
+                ok = bool(ok)
                 # A subprocess can report failure yet still have done the expensive,
                 # budgeted part of its job; salvage that rather than re-spending the
                 # whole crawl next cycle. The two channel kinds fail differently: a
@@ -1450,7 +1503,7 @@ def _run_city_loop(
                         conn,
                         city.city_id,
                         success=False,
-                        error=f"subprocess failed on {today}",
+                        error=reason or f"subprocess failed on {today}",
                         provider=provider,
                     )
                     logger.error(f"{city.city_id} [{provider}]: collection failed")
