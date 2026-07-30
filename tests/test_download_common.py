@@ -11,7 +11,9 @@ import pytest
 from streetscape_metadata_tracker.download_common import (
     AsyncRateLimiter,
     DownloadError,
+    generate_grid_arrays,
     generate_grid_points,
+    grid_index_ranges,
     standardize_capture_date,
 )
 
@@ -209,3 +211,74 @@ def test_rate_limiter_zero_or_negative_disables(monkeypatch):
 
     _run(scenario())
     assert sleeps == []
+
+
+# ── generate_grid_arrays (issue #157) ───────────────────────────────────────
+
+
+def _reference_grid(origin, width_steps, height_steps, step_length):
+    """The original nested-loop grid, kept verbatim as the frozen-geometry oracle.
+
+    Grid geometry is immutable by design: every future run of a city re-derives
+    these coordinates so its diffs align on an identical rectangle. Any drift
+    here silently misaligns a city against its own history, which no other test
+    would catch — so the fast paths are checked against the slow original rather
+    than against each other.
+    """
+    points = []
+    for i in range(-height_steps // 2, height_steps // 2 + 1):
+        for j in range(-width_steps // 2, width_steps // 2 + 1):
+            north = geopy.distance.distance(meters=i * step_length).destination(origin, 0)
+            point = geopy.distance.distance(meters=j * step_length).destination(north, 90)
+            points.append((point.latitude, point.longitude, i, j))
+    return points
+
+
+@pytest.mark.parametrize(
+    ("origin", "w", "h", "step"),
+    [
+        (SEATTLE, 11, 7, 20),  # odd/odd: exercises the // 2 fencepost asymmetry
+        (SEATTLE, 4, 6, 20),
+        (geopy.Point(-33.8688, 151.2093), 8, 8, 20),  # southern hemisphere
+        (geopy.Point(30.0444, 31.2357), 5, 5, 50),
+        (geopy.Point(64.1466, -21.9426), 3, 8, 15),  # high latitude
+        (SEATTLE, 0, 0, 20),  # degenerate single point
+    ],
+)
+def test_both_generators_match_the_original_loop_exactly(origin, w, h, step):
+    reference = _reference_grid(origin, w, h, step)
+
+    assert generate_grid_points(origin, w, h, step) == reference
+
+    lats, lons, i_idx, j_idx = generate_grid_arrays(origin, w, h, step)
+    as_tuples = [
+        (lat, lon, int(i), int(j))
+        for lat, lon, i, j in zip(
+            lats.tolist(), lons.tolist(), i_idx.tolist(), j_idx.tolist(), strict=True
+        )
+    ]
+    assert as_tuples == reference, "array grid must be bit-identical, not merely close"
+
+
+def test_grid_index_ranges_match_the_generated_order():
+    w, h = 11, 7
+    i_values, j_values = grid_index_ranges(w, h)
+    _, _, i_idx, j_idx = generate_grid_arrays(SEATTLE, w, h, 20)
+
+    # The ordinal formula the Mapillary downloader uses to replace its
+    # (i, j) -> (lat, lon) dict depends on this exact ordering.
+    expected = [(i, j) for i in i_values for j in j_values]
+    assert list(zip(i_idx.tolist(), j_idx.tolist(), strict=True)) == expected
+
+
+def test_grid_ordinal_arithmetic_locates_every_point():
+    """The downloader indexes grid points by arithmetic instead of a dict."""
+    w, h = 9, 5
+    i_values, j_values = grid_index_ranges(w, h)
+    lats, lons, i_idx, j_idx = generate_grid_arrays(SEATTLE, w, h, 20)
+    n_j = len(j_values)
+
+    for ordinal, (i, j) in enumerate(zip(i_idx.tolist(), j_idx.tolist(), strict=True)):
+        computed = (i - i_values[0]) * n_j + (j - j_values[0])
+        assert computed == ordinal
+        assert (lats[computed], lons[computed]) == (lats[ordinal], lons[ordinal])
