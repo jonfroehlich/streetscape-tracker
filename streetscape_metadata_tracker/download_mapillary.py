@@ -52,7 +52,12 @@ from tqdm import tqdm
 
 from .analysis import FLAT_ONLY
 from .config import MAPILLARY_METADATA_DTYPES
-from .download_common import DownloadError, generate_grid_points, redact_credentials
+from .download_common import (
+    DownloadError,
+    generate_grid_arrays,
+    grid_index_ranges,
+    redact_credentials,
+)
 from .fileutils import load_city_csv_file
 
 logger = logging.getLogger(__name__)
@@ -435,8 +440,20 @@ async def download_mapillary_metadata_async(
     width_steps = int(grid_width / step_length)
     height_steps = int(grid_height / step_length)
     origin = geopy.Point(center_lat, center_lon)
-    grid_points = generate_grid_points(origin, width_steps, height_steps, step_length)
-    point_by_index = {(i, j): (lat, lon) for lat, lon, i, j in grid_points}
+    # Arrays, not a list of tuples and a dict keyed by (i, j): at Cairo's ~10.5M
+    # points those two cost ~4.5 GB between them against an 8 GB cgroup, which
+    # is most of why a big city looked like a hang here (issue #157). The grid
+    # is a regular lattice, so a point's position is arithmetic — see
+    # _grid_ordinal below — and needs no lookup table.
+    grid_lats, grid_lons, _, _ = generate_grid_arrays(
+        origin, width_steps, height_steps, step_length
+    )
+    i_values, j_values = grid_index_ranges(width_steps, height_steps)
+    i_min, n_j, num_grid_points = i_values[0], len(j_values), len(grid_lats)
+
+    def _grid_ordinal(i: np.ndarray | int, j: np.ndarray | int):
+        """Position of grid index (i, j) in the generation order."""
+        return (i - i_min) * n_j + (j - j_values[0])
 
     bbox = grid_bbox(center_lat, center_lon, grid_width, grid_height, step_length)
 
@@ -503,7 +520,8 @@ async def download_mapillary_metadata_async(
     rows = []
     pano_covered_points = set()
     for img, point in _assign(panos):
-        grid_lat, grid_lon = point_by_index[point]
+        ordinal = _grid_ordinal(*point)
+        grid_lat, grid_lon = grid_lats[ordinal], grid_lons[ordinal]
         capture_date = captured_at_to_iso_date(img["captured_at_ms"])
         # Mirror GSV's convention: a pano without a usable capture date is
         # present but doesn't count toward dated stats (NO_DATE).
@@ -526,7 +544,8 @@ async def download_mapillary_metadata_async(
     for point, img in flat_representative.items():
         if point in pano_covered_points:
             continue  # the pano already covers this grid point
-        grid_lat, grid_lon = point_by_index[point]
+        ordinal = _grid_ordinal(*point)
+        grid_lat, grid_lon = grid_lats[ordinal], grid_lons[ordinal]
         # capture_date is deliberately null for FLAT_ONLY: this row is a
         # coverage-presence marker, and a null date keeps flat timestamps out
         # of every date/age/histogram path (which key on status == 'OK').
@@ -534,34 +553,52 @@ async def download_mapillary_metadata_async(
         flat_only_points.add(point)
 
     covered_points = pano_covered_points | flat_only_points
-    for (i, j), (grid_lat, grid_lon) in point_by_index.items():
-        if (i, j) not in covered_points:
-            rows.append(
-                {
-                    "query_lat": grid_lat,
-                    "query_lon": grid_lon,
-                    "query_timestamp": query_timestamp,
-                    "pano_lat": None,
-                    "pano_lon": None,
-                    "pano_id": None,
-                    "capture_date": None,
-                    "copyright_info": None,
-                    "status": "ZERO_RESULTS",
-                    # No image at this point → all Mapillary extras null.
-                    "creator_id": None,
-                    "organization_id": None,
-                    "sequence_id": None,
-                    "is_pano": None,
-                    "on_foot": None,
-                    "quality_score": None,
-                    "compass_angle": None,
-                }
-            )
+    columns = list(MAPILLARY_METADATA_DTYPES.keys())
+    covered_df = pd.DataFrame(rows, columns=columns)
+    del rows
 
-    df = pd.DataFrame(rows, columns=list(MAPILLARY_METADATA_DTYPES.keys()))
-    csv_bytes = df.to_csv(index=False).encode("utf-8")
-    with gzip.open(output_csv_gz_path, "wb") as f:
-        f.write(csv_bytes)
+    # The empty-grid-point fill, built COLUMN-WISE rather than as one dict per
+    # point. This is the single biggest allocation in the whole pipeline: a
+    # 16-key dict is 464 bytes, so Cairo's ~10.5M points cost ~4.9 GB of dicts
+    # plus another ~6 GB when pandas turns them into an N x 16 object matrix —
+    # on a cgroup capped at 8 GB (issue #157). As arrays the same fill is two
+    # float columns and a handful of all-null ones.
+    empty_ordinals = np.setdiff1d(
+        np.arange(num_grid_points, dtype=np.int64),
+        np.fromiter(
+            (_grid_ordinal(i, j) for i, j in covered_points),
+            dtype=np.int64,
+            count=len(covered_points),
+        ),
+        assume_unique=True,
+    )
+    empty_df = pd.DataFrame(
+        {
+            "query_lat": grid_lats[empty_ordinals],
+            "query_lon": grid_lons[empty_ordinals],
+            "query_timestamp": query_timestamp,
+            "status": "ZERO_RESULTS",
+            # No image at this point → all Mapillary extras null.
+            **{
+                c: None
+                for c in columns
+                if c not in ("query_lat", "query_lon", "query_timestamp", "status")
+            },
+        },
+        columns=columns,
+    )
+    num_empty_points = len(empty_ordinals)
+    del empty_ordinals
+
+    df = pd.concat([covered_df, empty_df], ignore_index=True) if num_empty_points else covered_df
+    del covered_df, empty_df
+    # Stream straight into the gzip handle. df.to_csv() with no path built the
+    # ENTIRE csv as one Python str and then a second full copy as bytes — about
+    # 1.7 GB of pure duplication at Cairo scale, for a file we are writing out
+    # anyway.
+    with gzip.open(output_csv_gz_path, "wt", encoding="utf-8", newline="") as f:
+        df.to_csv(f, index=False)
+    del df
 
     # Read back through the shared loader so dtypes match GSV runs exactly
     df = load_city_csv_file(output_csv_gz_path)
@@ -569,7 +606,7 @@ async def download_mapillary_metadata_async(
     logger.info(
         f"Wrote {len(df)} rows ({n_pano_rows} pano rows, "
         f"{len(flat_only_points)} flat-only points, {num_flat_images} flat images, "
-        f"{len(point_by_index) - len(covered_points)} empty grid points) "
+        f"{num_empty_points} empty grid points) "
         f"to {output_csv_gz_path}"
     )
 

@@ -9,10 +9,11 @@ provider importing from another's module.
 
 import asyncio
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import datetime
 
 import geopy.distance
+import numpy as np
 from tqdm import tqdm
 
 
@@ -106,6 +107,46 @@ def redact_credentials(text: str) -> str:
     return _CREDENTIAL_PATTERN.sub(r"\1=REDACTED", str(text))
 
 
+def grid_index_ranges(width_steps: int, height_steps: int) -> tuple[range, range]:
+    """The (i, j) index ranges of a grid, in the order points are generated."""
+    return (
+        range(-height_steps // 2, height_steps // 2 + 1),
+        range(-width_steps // 2, width_steps // 2 + 1),
+    )
+
+
+def _grid_rows(
+    origin: geopy.Point, width_steps: int, height_steps: int, step_length: float
+) -> Iterator[tuple[int, list[float], list[float]]]:
+    """
+    Yield one grid ROW at a time as ``(i, row_lats, row_lons)``.
+
+    Shared by the two public generators below so the per-point geodesic math
+    lives in exactly one place. Grid geometry is FROZEN — every future run of a
+    city re-derives these same coordinates so its diffs align on an identical
+    rectangle — so this math must never drift. The one change from the original
+    nested loop is hoisting the northward displacement out of the inner loop,
+    where it never depended on ``j``: identical output, half the geodesic
+    solves. That is worth real time on a big city (the solve is pure-Python
+    geographiclib, and a 10M-point grid spent ~13 minutes here before a single
+    tile was fetched).
+    """
+    i_values, j_values = grid_index_ranges(width_steps, height_steps)
+    total_points = (width_steps + 1) * (height_steps + 1)
+
+    with tqdm(total=total_points, desc="Generating search grid points") as pbar:
+        for i in i_values:
+            north_point = geopy.distance.distance(meters=i * step_length).destination(origin, 0)
+            row_lats: list[float] = []
+            row_lons: list[float] = []
+            for j in j_values:
+                point = geopy.distance.distance(meters=j * step_length).destination(north_point, 90)
+                row_lats.append(point.latitude)
+                row_lons.append(point.longitude)
+            pbar.update(len(j_values))
+            yield i, row_lats, row_lons
+
+
 def generate_grid_points(
     origin: geopy.Point, width_steps: int, height_steps: int, step_length: float
 ) -> list[tuple[float, float, int, int]]:
@@ -121,18 +162,41 @@ def generate_grid_points(
     Returns:
         List of tuples containing (latitude, longitude, i, j) for each point
     """
+    _, j_values = grid_index_ranges(width_steps, height_steps)
     points = []
-    total_points = (width_steps + 1) * (height_steps + 1)
-
-    with tqdm(total=total_points, desc="Generating search grid points") as pbar:
-        for i in range(-height_steps // 2, height_steps // 2 + 1):
-            for j in range(-width_steps // 2, width_steps // 2 + 1):
-                north_point = geopy.distance.distance(meters=i * step_length).destination(origin, 0)
-                point = geopy.distance.distance(meters=j * step_length).destination(north_point, 90)
-                points.append((point.latitude, point.longitude, i, j))
-                pbar.update(1)
-
+    for i, row_lats, row_lons in _grid_rows(origin, width_steps, height_steps, step_length):
+        points.extend(
+            (lat, lon, i, j) for lat, lon, j in zip(row_lats, row_lons, j_values, strict=True)
+        )
     return points
+
+
+def generate_grid_arrays(
+    origin: geopy.Point, width_steps: int, height_steps: int, step_length: float
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    The same grid as :func:`generate_grid_points`, as ``(lats, lons, i, j)``
+    arrays in the same order.
+
+    For a caller that only needs coordinates, this never materializes the list
+    of Python tuples — which at Cairo's ~10.5M points is about 2.2 GB on its
+    own, against a cgroup capped at 8 GB (issue #157). The arrays are ~24 bytes
+    per point instead of ~120.
+    """
+    i_values, j_values = grid_index_ranges(width_steps, height_steps)
+    n_i, n_j = len(i_values), len(j_values)
+
+    lats = np.empty(n_i * n_j, dtype=np.float64)
+    lons = np.empty(n_i * n_j, dtype=np.float64)
+    pos = 0
+    for _i, row_lats, row_lons in _grid_rows(origin, width_steps, height_steps, step_length):
+        lats[pos : pos + n_j] = row_lats
+        lons[pos : pos + n_j] = row_lons
+        pos += n_j
+
+    i_idx = np.repeat(np.fromiter(i_values, dtype=np.int32, count=n_i), n_j)
+    j_idx = np.tile(np.fromiter(j_values, dtype=np.int32, count=n_j), n_i)
+    return lats, lons, i_idx, j_idx
 
 
 def standardize_capture_date(date_str: str | None) -> str | None:
