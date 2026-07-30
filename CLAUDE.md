@@ -39,6 +39,12 @@ python scripts/migrate_to_db.py            # dry run; --execute to apply
 # run by default, and refuses a city with real runs unless --force.
 python scripts/resize_city.py "Browning, MT" --width 2500 --height 2500 --execute
 
+# Cap every oversized frozen grid at once (issue #166). Same catalog-only,
+# dry-run-by-default contract; skips cities with real dated runs unless
+# --include-collected (that breaks their diff continuity — no files are deleted).
+python scripts/cap_oversized_grids.py                      # preview
+python scripts/cap_oversized_grids.py --execute
+
 # One-time rename of road-walk artifacts collected before streetwalk filenames
 # carried a provider token (non-gsv walks only); dry run, --execute to apply
 python scripts/repair_streetwalk_names.py
