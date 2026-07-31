@@ -1,7 +1,7 @@
-/* exported switchRun, toggleYear, setGsvMode, toggleFlatOnly, setRenderAll */
-// (switchRun/toggleYear/setGsvMode/toggleFlatOnly/setRenderAll are invoked from onchange/onclick
-// attributes in the HTML this file generates, so ESLint can't see those
-// string references.)
+/* exported switchRun, toggleYear, setGsvMode, toggleFlatOnly, setRenderAll, toggleDiffOverlay */
+// (switchRun/toggleYear/setGsvMode/toggleFlatOnly/setRenderAll/toggleDiffOverlay
+// are invoked from onchange/onclick attributes in the HTML this file
+// generates, so ESLint can't see those string references.)
 /**
  * city.js
  * Per-city detail-view logic for Streetscape City Explorer.
@@ -102,6 +102,14 @@ let temporalKeyboardIdx = -1;
 let runsGlobal = [];        // this city's run history from the aggregate
 let currentFileGlobal = ""; // csv.gz filename of the run being displayed
 let changeGlobal = null;    // change_from_previous_run block of this run
+
+// "Changes since previous run" overlay (diff-overlay.js renders it; the diff
+// detail CSV is fetched lazily on first toggle and the layer cached after).
+let diffOverlay = { shown: false, loading: false, layer: null, counts: null, drawn: null, error: false };
+
+// Run-history mini-chart handle: updateLegend repaints via innerHTML (which
+// destroys the canvas), so the chart is destroyed/recreated alongside it.
+let runHistoryChart = null;
 
 // ── Map interaction ────────────────────────────────────────────
 
@@ -342,6 +350,14 @@ function updateLegend(years) {
     html += `<p class="legend-meta">Dated panos: ${totalPanosGlobal.toLocaleString()}</p>`;
   }
 
+  // Archival imports carry no copyright column, so the Google-vs-contributor
+  // split below is unavailable and the counts above include every pano. Said
+  // here because this is now the only place that caveat appears.
+  if (!copyrightAvailableGlobal) {
+    html += `<p class="legend-meta"><em>Copyright not recorded (archival import);
+      counts include all panoramas</em></p>`;
+  }
+
   // ── Cap notice (issues #77/#58) ───────────────────────────
   // Only for cities above the render cap. The stat table above always shows the
   // full count; this line is the one place the *drawn* count is exposed, plus
@@ -354,7 +370,11 @@ function updateLegend(years) {
       <div class="legend-cap-notice">
         <p class="legend-meta">Drawing ${shown.toLocaleString()} of
           ${totalInMode.toLocaleString()} panos${renderAllOverride ? "" : "; filter or zoom for detail"}.</p>
-        <button type="button" class="gsv-mode-btn" onclick="setRenderAll(${!renderAllOverride})">
+        <button type="button" class="gsv-mode-btn"
+                title="${renderAllOverride
+                  ? "Return to the capped spatial subsample (faster on dense cities)"
+                  : "Draw every panorama dot — can be slow on dense cities"}"
+                onclick="setRenderAll(${!renderAllOverride})">
           ${renderAllOverride ? `Show ~${RENDER_CAP.toLocaleString()}` : "Render all"}
         </button>
       </div>`;
@@ -376,21 +396,50 @@ function updateLegend(years) {
         <label for="run-select">Snapshot (${runsGlobal.length} runs)</label>
       </div>
       <select id="run-select" aria-label="Select collection snapshot"
+              title="View an earlier collection snapshot of this city"
               style="width:100%;margin-top:4px"
-              onchange="switchRun(this.value)">${options}</select>`;
+              onchange="switchRun(this.value)">${options}</select>
+      <div id="run-history-wrap">
+        <canvas id="run-history-chart" role="img"
+                aria-label="Panorama count across ${runsGlobal.length} collection runs; click a point to open that snapshot"></canvas>
+      </div>`;
   }
 
+  // ── Section 2b: change since previous run + diff overlay ──
+  // The counts come from the run's own JSON (no fetch); the "Show changes on
+  // map" button lazily fetches the published diff detail CSV and overlays
+  // added/removed/re-dated dots (diff-overlay.js).
   const change = formatChangeSummary(changeGlobal);
-  if (change) {
+  const diffFile = currentDiffFilename();
+  if (change || diffFile) {
+    const from = change?.from || previousRunDate() || "";
     html += `
       <div class="legend-divider"></div>
-      <div class="legend-year-header">Since ${escapeHtml(change.from)}</div>
+      <div class="legend-year-header">Since ${escapeHtml(from)}</div>`;
+    if (change) {
+      html += `
       <p class="legend-meta" style="margin:4px 0 0">
-        <span style="color:#7bd88f">${change.added}</span> /
-        <span style="color:#ff8a80">${change.removed}</span>
+        <span class="change-added">${change.added}</span> /
+        <span class="change-removed">${change.removed}</span>
         ${change.redated ? `<br>${change.redated}` : ""}
         ${change.coverage ? `<br>Coverage ${change.coverage}` : ""}
       </p>`;
+    }
+    if (diffFile) {
+      const btnLabel = diffOverlay.loading
+        ? "Loading…"
+        : diffOverlay.shown ? "Hide changes on map" : "Show changes on map";
+      html += `
+      <button type="button" class="gsv-mode-btn" id="diff-overlay-btn"
+              style="width:100%;margin-top:6px"
+              aria-pressed="${diffOverlay.shown}"${diffOverlay.loading ? " disabled" : ""}
+              title="Overlay the panoramas added (green), removed (red), or re-dated (amber) since the previous snapshot"
+              onclick="toggleDiffOverlay()">${btnLabel}</button>`;
+      const status = diffStatusHtml();
+      if (status) {
+        html += `<p class="legend-meta" id="diff-overlay-status" style="margin:4px 0 0">${status}</p>`;
+      }
+    }
   }
 
   // ── Section 3: GSV imagery mode toggle ────────────────────
@@ -409,11 +458,13 @@ function updateLegend(years) {
       <div class="gsv-mode-toggle" role="radiogroup" aria-label="Google Street View imagery filter">
         <button type="button" class="gsv-mode-btn ${!showAllGsv ? "active" : ""}"
                 role="radio" aria-checked="${!showAllGsv}"
+                title="Only official Google panoramas (copyright exactly '© Google') — the imagery Google's own cars collected"
                 onclick="setGsvMode(false)">
           Google only <span class="year-count">(${googleCount.toLocaleString()})</span>
         </button>
         <button type="button" class="gsv-mode-btn ${showAllGsv ? "active" : ""}"
                 role="radio" aria-checked="${showAllGsv}"
+                title="All panoramas served by Street View, including contributor-uploaded (user-generated) imagery"
                 onclick="setGsvMode(true)">
           All GSV <span class="year-count">(${allCount.toLocaleString()})</span>
         </button>
@@ -432,6 +483,7 @@ function updateLegend(years) {
       <button type="button" class="year-item ${showFlatOnly ? "active-item" : ""}"
               aria-pressed="${showFlatOnly}"
               aria-label="Toggle flat-only imagery markers, ${flatOnlyMarkers.length.toLocaleString()} points"
+              title="Grid points covered only by flat/perspective imagery (no 360° panorama) — undated, so they sit outside the age coloring"
               onclick="toggleFlatOnly()">
         <i style="background:${FLAT_ONLY_COLOR}" class="${showFlatOnly ? "active" : ""}"
            aria-hidden="true"></i>
@@ -480,6 +532,9 @@ function updateLegend(years) {
   if (focusedYear != null) {
     div.querySelector(`.year-item[data-year="${focusedYear}"]`)?.focus();
   }
+
+  // The innerHTML swap above destroyed any previous chart canvas — rebuild.
+  rebuildRunHistoryChart();
 }
 
 /**
@@ -510,6 +565,160 @@ function switchRun(dataFile) {
         : `&network=${encodeURIComponent(streetNetworkType)}`;
     window.location.href = `city.html?file=${encodeURIComponent(dataFile)}${network}`;
   }
+}
+
+// ── Change-since-previous-run overlay (diff-overlay.js renders it) ──
+
+/** Index of the displayed run in runsGlobal, or -1. */
+function currentRunIndex() {
+  return runsGlobal.findIndex((r) => r.data_file === currentFileGlobal);
+}
+
+/** The previous run's date ("YYYY-MM-DD"), or null on a first/unknown run. */
+function previousRunDate() {
+  const i = currentRunIndex();
+  return i > 0 ? runsGlobal[i - 1].run_date : null;
+}
+
+/**
+ * The diff detail filename for the CURRENT run, validated, or null.
+ *
+ * The run's own stats JSON is authoritative when present: its
+ * change_from_previous_run.diff_file is null exactly when no detail was
+ * published (no changes, or grids didn't align). Only when the whole change
+ * block is absent (regenerated JSONs carry change_from_previous_run=null) is
+ * the name constructed from the run history — in which case the fetch itself
+ * discovers whether the pair predates diff publishing.
+ *
+ * NEVER read from the URL; both sources still pass isValidDiffFilename before
+ * any fetch (see the security note on that validator).
+ *
+ * @returns {?string}
+ */
+function currentDiffFilename() {
+  if (changeGlobal) {
+    return isValidDiffFilename(changeGlobal.diff_file) ? changeGlobal.diff_file : null;
+  }
+  const i = currentRunIndex();
+  if (i < 1 || !cityIdGlobal) return null;
+  const name = diffFilenameFor(
+    cityIdGlobal, providerGlobal, runsGlobal[i - 1].run_date, runsGlobal[i].run_date);
+  return isValidDiffFilename(name) ? name : null;
+}
+
+/** Status line under the diff button: error text or colored counts. */
+function diffStatusHtml() {
+  if (diffOverlay.error) return "Change detail not published for this run.";
+  if (!diffOverlay.counts) return "";
+  const c = diffOverlay.counts;
+  const d = diffOverlay.drawn ?? c;
+  const total = c.added + c.removed + c.redated;
+  const totalDrawn = d.added + d.removed + d.redated;
+  const capNote = totalDrawn < total
+    ? `<br>Drawing ${totalDrawn.toLocaleString()} of ${total.toLocaleString()} changes`
+    : "";
+  return `<span class="change-added">●&nbsp;${c.added.toLocaleString()} added</span> ·
+          <span class="change-removed">●&nbsp;${c.removed.toLocaleString()} removed</span> ·
+          <span class="change-redated">●&nbsp;${c.redated.toLocaleString()} re-dated</span>${capNote}`;
+}
+
+/**
+ * Show/hide the "changes since previous run" overlay. The diff detail CSV is
+ * fetched once (on first show) and the built layer cached; later toggles just
+ * add/remove it. A missing file — older pairs predate diff publishing — turns
+ * into a status message, never a page error.
+ */
+async function toggleDiffOverlay() {
+  const refreshLegend = () => updateLegend(Object.keys(markersByYear).map(Number));
+  if (diffOverlay.loading) return;
+
+  if (diffOverlay.layer) {
+    diffOverlay.shown = !diffOverlay.shown;
+    if (diffOverlay.shown) diffOverlay.layer.addTo(map);
+    else map.removeLayer(diffOverlay.layer);
+    refreshLegend();
+    return;
+  }
+
+  const diffFile = currentDiffFilename();
+  if (!diffFile) return;
+  diffOverlay.loading = true;
+  refreshLegend();
+  try {
+    const { layer, counts, drawn } = await renderDiffOverlay(map, diffFile);
+    Object.assign(diffOverlay, { layer, counts, drawn, shown: true });
+  } catch (e) {
+    console.info("Change detail unavailable for this run:", e.message);
+    diffOverlay.error = true;
+  }
+  diffOverlay.loading = false;
+  refreshLegend();
+}
+
+// ── Run-history mini-chart ─────────────────────────────────────
+
+/**
+ * (Re)build the pano-count-per-snapshot line chart under the snapshot
+ * selector. Destroys the previous instance first — updateLegend repaints the
+ * legend via innerHTML, which orphans the old canvas. Cheap: one point per
+ * run, and cities have at most a few dozen runs. Clicking a point navigates
+ * to that snapshot; coverage/median-age ride along in the tooltip (one axis —
+ * two scales on one plot is a chart-crime).
+ */
+function rebuildRunHistoryChart() {
+  runHistoryChart?.destroy();
+  runHistoryChart = null;
+  const canvas = document.getElementById("run-history-chart");
+  if (!canvas) return;
+  const idx = currentRunIndex();
+  runHistoryChart = new Chart(canvas, {
+    type: "line",
+    data: {
+      labels: runsGlobal.map((r) => r.run_date),
+      datasets: [{
+        data: runsGlobal.map((r) => r.unique_panos ?? null),
+        borderColor: "#1a73e8",
+        backgroundColor: "#1a73e8",
+        borderWidth: 2,
+        pointRadius: runsGlobal.map((_, i) => (i === idx ? 5 : 3)),
+        pointBackgroundColor: runsGlobal.map((_, i) => (i === idx ? "#1a73e8" : "#8ab0ea")),
+        spanGaps: true, // old runs can carry null counts — bridge, don't break
+      }],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      onClick: (evt, elements) => {
+        if (elements.length) switchRun(runsGlobal[elements[0].index]?.data_file);
+      },
+      onHover: (evt, elements) => {
+        evt.native.target.style.cursor = elements.length ? "pointer" : "default";
+      },
+      scales: {
+        x: { ticks: { font: { size: 9 }, maxRotation: 0, autoSkip: true }, grid: { display: false } },
+        y: { beginAtZero: true, ticks: { font: { size: 9 } }, grid: { color: "rgba(0,0,0,0.08)" } },
+      },
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            label: (ctx) => {
+              const r = runsGlobal[ctx.dataIndex];
+              const lines = [`${(r.unique_panos ?? 0).toLocaleString()} panos`];
+              if (r.coverage_rate_percent != null) {
+                lines.push(`Coverage: ${r.coverage_rate_percent.toFixed(1)}%`);
+              }
+              if (r.median_pano_age_years != null) {
+                lines.push(`Median age: ${r.median_pano_age_years.toFixed(1)} yrs`);
+              }
+              lines.push("Click to open this snapshot");
+              return lines;
+            },
+          },
+        },
+      },
+    },
+  });
 }
 
 /**
@@ -1193,40 +1402,19 @@ async function loadData() {
       [bounds.max_lat, bounds.min_lon],
     ];
 
-    const oldestDate = panoDateOrNull(panoStatsGlobal.age_stats.oldest_pano_date);
-    const newestDate = panoDateOrNull(panoStatsGlobal.age_stats.newest_pano_date);
-
-    const googleLine = stats.google_panos
-      ? `Google panoramas: ${stats.google_panos.duplicate_stats.total_unique_panos.toLocaleString()}<br>`
-      : "";
-    const copyrightNote = !copyrightAvailableGlobal
-      ? `<em>Copyright info not recorded (archival import); counts include all panoramas</em><br>`
-      : "";
-    // fmtYears comes from streetscape-utils.js
-    const tooltipHtml = `
-      <div style="font-family:sans-serif">
-        <strong>${escapeHtml(cityLabel)}</strong><br>
-        <em>${PROVIDERS[providerGlobal].label}</em><br><br>
-        Total panoramas: ${stats.all_panos.duplicate_stats.total_unique_panos.toLocaleString()}<br>
-        ${googleLine}${copyrightNote}<br>
-        Search grid area: ${stats.search_grid.area_km2.toFixed(1)} km²<br>
-        Total search points: ${stats.search_grid.total_search_points.toLocaleString()}<br>
-        Grid step size: ${stats.search_grid.step_length_meters} meters<br><br>
-        Oldest pano: ${oldestDate ? oldestDate.toLocaleDateString() : "—"}<br>
-        Newest pano: ${newestDate ? newestDate.toLocaleDateString() : "—"}<br>
-        Median age: ${fmtYears(panoStatsGlobal.age_stats.median_pano_age_years)}<br>
-        Average age: ${fmtYears(panoStatsGlobal.age_stats.avg_pano_age_years)}
-        ${panoStatsGlobal.age_stats.stdev_pano_age_years != null ? `(SD=${panoStatsGlobal.age_stats.stdev_pano_age_years.toFixed(1)} years)` : ""}<br><br>
-        Data collected: ${collectionDateGlobal || "Unknown"}
-      </div>
-    `;
-
+    // Pure decoration: no tooltip, and explicitly non-interactive. Under
+    // preferCanvas Leaflet hit-tests a polygon's whole interior regardless of
+    // `fill: false` (Polygon._containsPoint is a point-in-polygon test), so an
+    // interactive region outline would capture every mouseover inside the grid
+    // and mask the pano markers' own hovers. The run-level stats it used to
+    // show are all in the legend panel (updateLegend, section 1).
     L.polygon(regionCoords, {
       color: "cyan",
       weight: 2,
       opacity: 0.8,
       fill: false,
-    }).addTo(map).bindTooltip(tooltipHtml, { sticky: true, opacity: 0.9, direction: "auto" });
+      interactive: false,
+    }).addTo(map);
 
     // ── Streaming pipeline ─────────────────────────────────────
     //

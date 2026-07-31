@@ -10,7 +10,7 @@
        No Leaflet here — this page is a list, not a map; each row links to
        the city page for the actual overlay. -->
   <link rel="stylesheet" href="css/streetscape-shared.css" />
-  <link rel="stylesheet" href="css/streets.css" />
+  <link rel="stylesheet" href="css/data-table.css" />
 </head>
 <body class="streets-page">
   <!-- Google Analytics -->
@@ -27,8 +27,10 @@
   <header class="site-header">
     <a class="site-brand" href="index.html">Streetscape Tracker</a>
     <nav class="site-nav" aria-label="Main">
-      <a href="index.html">Map</a>
-      <a href="streets.html" aria-current="page">Streets</a>
+      <a href="index.html" title="World map of city imagery coverage">Map</a>
+      <a href="grid.html" title="Per-city table of grid-sampling coverage: share of area sample points with imagery">Grid</a>
+      <a href="streets.html" aria-current="page"
+         title="Per-city table of road-walk coverage: fraction of the street network driven">Streets</a>
     </nav>
     <a class="site-external" href="https://github.com/jonfroehlich/streetscape-tracker"
        target="_blank" rel="noopener">About &#8599;</a>
@@ -64,7 +66,7 @@
       </p>
     </div>
 
-    <div id="streets-status" role="status" aria-live="polite">
+    <div id="streets-status" class="table-status" role="status" aria-live="polite">
       Loading street-level collections…
     </div>
 
@@ -120,6 +122,7 @@
           integrity="sha512-g2TeAWw5GPnX7z0Kn8nFbYfeHcvAu/tx6d6mrLe/90mkCxO+RcptyYpksUz35EO337F83bZwcmUyHiHamspkfg=="
           crossorigin="anonymous"></script>
   <script src="js/streetscape-utils.js"></script>
+  <script src="js/table-utils.js"></script>
   <script src="js/streets.js"></script>
 </body>
 </html>

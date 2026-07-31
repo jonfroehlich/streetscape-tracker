@@ -45,18 +45,72 @@ body {
   text-align: center;
 }
 
-/* ── Chart panel (bottom-right) ─────────────────────────────── */
-.chart-container {
+/* ── Right rail: legend above the chart drawer ──────────────────
+   One fixed flex column owns the whole right edge, so the legend and the
+   charts divide the height between them instead of overlapping (the old
+   layout anchored the legend top-right and the charts bottom-right
+   independently; on short viewports they collided). The rail itself is
+   pointer-transparent so the map stays draggable between the panels. */
+#right-rail {
   position: fixed;
-  bottom: 20px;
+  top: 64px;
   right: 20px;
+  bottom: 20px;
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 10px;
+  pointer-events: none;
+}
+
+/* ── Chart drawer (bottom of the rail) ──────────────────────── */
+.chart-container {
   background: rgba(255, 255, 255, 0.65);
   padding: 10px;
   border-radius: 8px;
   box-shadow: 0 0 10px rgba(0, 0, 0, 0.2);
-  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: auto; /* pin to the rail's bottom even when the legend is short */
+  pointer-events: auto;
+}
+
+#chart-drawer-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 13px;
+  font-weight: bold;
+  color: #333;
+}
+
+#chart-drawer-toggle {
+  border: none;
+  background: rgba(0, 0, 0, 0.06);
+  border-radius: 4px;
+  width: 22px;
+  height: 22px;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  color: #333;
+}
+
+#chart-drawer-toggle:hover,
+#chart-drawer-toggle:focus-visible {
+  background: rgba(0, 0, 0, 0.15);
+}
+
+#chart-drawer-body {
   display: flex;
   gap: 10px;
+}
+
+.chart-container.collapsed #chart-drawer-body {
+  display: none;
 }
 
 .scatter-plot-container {
@@ -67,17 +121,15 @@ body {
   background-color: rgba(255, 255, 255, 0.75);
 }
 
-/* ── Legend (top-right) ─────────────────────────────────────── */
+/* ── Legend (top of the rail) ───────────────────────────────── */
 .legend {
-  position: fixed;
-  top: 64px;
-  right: 20px;
-  max-height: 80vh;
+  flex: 0 1 auto;
+  min-height: 0; /* lets the flex item actually shrink below content height */
   overflow-y: auto;
   padding: 10px;
   background: rgba(255, 255, 255, 0.7);
   border-radius: 5px;
-  z-index: 1000;
+  pointer-events: auto;
 }
 
 .legend h4 {
@@ -95,18 +147,41 @@ body {
 button.legend-item {
   width: 100%;
   border: none;
+  border-radius: 4px;
   background: none;
   font: inherit;
   text-align: left;
   cursor: pointer;
 }
 
+/* Hover/focus reveal a right-aligned "filter" affordance — the rows ARE
+   buttons but didn't look like it. Rendered at opacity 0 the rest of the
+   time so revealing it never shifts the row's layout. */
+button.legend-item::after {
+  content: "filter";
+  margin-left: auto;
+  padding-left: 12px;
+  font-size: 0.75em;
+  color: #1a73e8;
+  opacity: 0;
+}
+
+button.legend-item:hover::after,
+button.legend-item:focus-visible::after {
+  opacity: 1;
+}
+
+button.legend-item.selected::after {
+  content: "✓";
+  opacity: 1;
+}
+
 button.legend-item:hover {
-  background-color: rgba(0, 0, 0, 0.05);
+  background-color: rgba(26, 115, 232, 0.08);
 }
 
 button.legend-item:focus-visible {
-  background-color: rgba(0, 0, 0, 0.05);
+  background-color: rgba(26, 115, 232, 0.08);
   outline: 2px solid #1a73e8;
   outline-offset: -2px;
 }
@@ -242,15 +317,26 @@ button.legend-item:focus-visible {
 }
 
 /* ── Leaflet popup overrides ────────────────────────────────── */
+/* Slimmer than the old 400×600: the popup lives INSIDE the map pane's
+   stacking context and can never paint above the fixed chrome, so Leaflet's
+   autoPan (padded in index.js's bindPopup options) has to be able to place
+   it clear of the header, search column, and right rail. */
 .leaflet-popup-content {
-  width: 400px !important;
-  max-height: 600px;
+  width: 340px !important;
+  max-height: 440px;
   overflow-y: auto;
+}
+
+/* The bolded "Collected" line under the city name (freshness at a glance) */
+.popup-collected {
+  margin: 2px 0 8px;
+  font-size: 13px;
+  color: #333;
 }
 
 .popup-chart-container {
   width: 100%;
-  height: 200px;
+  height: 170px;
   margin-top: 10px;
   position: relative;
 }
@@ -358,7 +444,7 @@ a.view-details-btn:focus-visible {
   font-weight: bold;
 }
 
-/* Add to index.css */
+/* A row inside the active filter range */
 .legend-item.selected {
   background-color: rgba(0, 0, 0, 0.15);
   font-weight: bold;

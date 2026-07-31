@@ -112,6 +112,23 @@ body {
   }
 }
 
+/* ── Run-change colors ──────────────────────────────────────────
+   Added/removed/re-dated pano counts, shared by the overview popup and the
+   city legend. Both surfaces are near-white, so these are the DARK
+   green/red/amber pair (≥4.5:1 on white) — the original light #7bd88f/#ff8a80
+   pair was picked for a dark surface and was illegible here. */
+.change-added {
+  color: #2e7d32;
+}
+
+.change-removed {
+  color: #c62828;
+}
+
+.change-redated {
+  color: #8a5a00;
+}
+
 /* ── Screen-reader-only content ─────────────────────────────── */
 .visually-hidden {
   position: absolute;

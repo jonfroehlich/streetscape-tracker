@@ -43,6 +43,9 @@ FIXTURE_DIR = os.path.join(HERE, "fixture")
 # Latest-run csv.gz filenames the fixture emits (see build_fixture.py).
 ALPHA_LATEST = "alpha-city--alphastate--testland_width_100_height_100_step_20_2026-04-15.csv.gz"
 ZERO_CITY = "zero-city--zerostate--testland_width_100_height_100_step_20_2026-04-15.csv.gz"
+# The published diff detail between Alpha City's two runs (real compute_run_diff
+# output: one pano_added row), fetched by the city page's change overlay.
+ALPHA_DIFF = "alpha-city--alphastate--testland_diff_2026-01-15_to_2026-04-15.csv.gz"
 
 # Substrings of expected third-party console noise to ignore (analytics/CDN),
 # so "console clean" tracks OUR code, not the network environment. The
@@ -136,23 +139,38 @@ def _capture_errors(page: Page):
     return errors
 
 
-# Counts non-transparent pixels on the street-coverage pane's canvas. city.js
-# creates the map with `preferCanvas`, so the street overlay draws onto that
-# pane's own canvas instead of SVG paths — "did it render?" has to be asked in
-# pixels. Yields 0 when the pane or its canvas is absent.
-_STREET_INK_JS = """
-  const c = document.querySelector('.leaflet-pane.leaflet-streetCoverage-pane canvas');
-  if (!c || !c.width || !c.height) return 0;
-  const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
-  let n = 0;
-  for (let i = 3; i < d.length; i += 4) if (d[i] > 0) n++;
-  return n;
-"""
+# Counts non-transparent pixels on a named Leaflet pane's canvas. city.js
+# creates the map with `preferCanvas`, so both the street overlay and the diff
+# overlay draw onto their pane's own canvas instead of SVG paths — "did it
+# render?" has to be asked in pixels. Yields 0 when the pane or its canvas is
+# absent.
+def _pane_ink_js(pane: str) -> str:
+    return f"""
+      const c = document.querySelector('.leaflet-pane.leaflet-{pane}-pane canvas');
+      if (!c || !c.width || !c.height) return 0;
+      const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+      let n = 0;
+      for (let i = 3; i < d.length; i += 4) if (d[i] > 0) n++;
+      return n;
+    """
+
+
+_STREET_INK_JS = _pane_ink_js("streetCoverage")
 
 
 def _street_pane_ink(page: Page) -> int:
     """Non-transparent pixel count on the street-coverage pane canvas."""
     return page.evaluate("() => {" + _STREET_INK_JS + "}")
+
+
+def _expect_pane_ink(page: Page, pane: str, *, drawn: bool):
+    """Wait for a pane's canvas to be drawn / cleared (Leaflet's canvas
+    renderer clears on the next animation frame, so poll)."""
+    page.wait_for_function(
+        "(want) => { const ink = (() => {" + _pane_ink_js(pane) + "})(); "
+        "return want ? ink > 0 : ink === 0; }",
+        arg=drawn,
+    )
 
 
 def _expect_street_ink(page: Page, *, drawn: bool):
@@ -376,6 +394,15 @@ def test_city_page_renders_the_road_walk_street_overlay(page: Page, base_url):
     page.locator("#street-layer-toggle").check()
     _expect_street_ink(page, drawn=True)
 
+    # "Highlight gaps" restyles in place (uncovered → red, covered faded) —
+    # the overlay must stay drawn through the toggle, both ways.
+    gaps = page.locator("#street-gaps-toggle")
+    expect(gaps).not_to_be_checked()
+    gaps.check()
+    _expect_street_ink(page, drawn=True)
+    gaps.uncheck()
+    _expect_street_ink(page, drawn=True)
+
     assert errors == []
 
 
@@ -406,6 +433,11 @@ def test_site_header_navigates_and_clears_the_floating_panels(page: Page, base_u
     page.locator('.site-nav a[href="streets.html"]').click()
     page.wait_for_url("**/streets.html")
     expect(page.locator("h1")).to_contain_text("Street-level coverage")
+
+    # The Grid nav item is the tabular counterpart of the overview map.
+    page.locator('.site-nav a[href="grid.html"]').click()
+    page.wait_for_url("**/grid.html")
+    expect(page.locator("h1")).to_contain_text("Grid coverage")
 
     # The city page carries the same header, and its "Map" item is the way
     # back (it replaced the old standalone #back-link).
@@ -562,5 +594,140 @@ def test_city_without_a_walk_falls_back_and_stays_clean(page: Page, base_url):
     expect(page.locator("table.legend-stats")).to_be_visible()  # page finished
     expect(page.locator("#street-coverage-container")).to_be_hidden()
     assert _street_pane_ink(page) == 0
+
+    assert errors == []
+
+
+def test_grid_page_lists_city_runs(page: Page, base_url):
+    """
+    grid.html is the tabular counterpart of the overview map: one row per
+    (city, provider) run series from the aggregate, linking into city.html.
+    """
+    errors = _capture_errors(page)
+    page.goto(f"{base_url}/grid.html")
+
+    rows = page.locator("#grid-tbody tr")
+    expect(rows).to_have_count(3)  # Alpha (gsv), Zero (gsv), Map Ville (mapillary)
+
+    # Default sort is alphabetical (a browsable index).
+    expect(page.locator('th[data-key="label"]')).to_have_attribute("aria-sort", "ascending")
+    expect(rows.first).to_contain_text("Alpha City")
+    expect(rows.nth(1)).to_contain_text("Map Ville")
+    expect(rows.nth(2)).to_contain_text("Zero City")
+
+    # Rows link to the city page via the latest run filename.
+    expect(rows.first.locator("a.streets-view-link")).to_have_attribute(
+        "href", f"city.html?file={ALPHA_LATEST}"
+    )
+    expect(page.locator("#grid-caption")).to_contain_text("3 city grid-run series")
+
+    # A header click re-sorts (grid coverage, best first: the 0-pano city sinks).
+    page.locator('th[data-key="pct"] button').click()
+    expect(page.locator('th[data-key="pct"]')).to_have_attribute("aria-sort", "descending")
+    expect(page.locator("#grid-tbody tr").last).to_contain_text("Zero City")
+
+    # And it actually lands on the city page.
+    page.locator("#grid-tbody tr", has_text="Alpha City").locator("a.streets-view-link").click()
+    page.wait_for_url(f"**/city.html?file={ALPHA_LATEST}")
+    expect(page.locator("table.legend-stats")).to_be_visible()
+
+    assert errors == []
+
+
+def test_freshness_metric_recolors_by_collection_recency(page: Page, base_url):
+    """
+    The Freshness metric colors cities by how recently they were collected —
+    the direct answer to "which cities were just scraped?". Bucket membership
+    shifts as the fixture ages, so assert the fixed bucket set rather than
+    which bucket the fixture cities land in today.
+    """
+    errors = _capture_errors(page)
+    page.goto(f"{base_url}/index.html?metric=freshness")
+
+    expect(page.locator('input[name="metric"][value="freshness"]')).to_be_checked()
+    expect(page.locator("#legend h4")).to_have_text("Data Freshness (last collected)")
+    expect(page.locator("path.leaflet-interactive")).to_have_count(2)
+
+    # All five recency buckets always render (fixed set, freshest first).
+    legend_rows = page.locator("button.legend-item")
+    expect(legend_rows).to_have_count(5)
+    expect(legend_rows.first).to_contain_text("Last 3 months")
+    expect(legend_rows.last).to_contain_text("Over 1.5 years")
+
+    # The popup leads with the collected date.
+    page.locator("path.leaflet-interactive").first.click(force=True)
+    popup = page.locator(".leaflet-popup-content")
+    expect(popup).to_have_count(1)
+    expect(popup.locator(".popup-collected")).to_contain_text("Collected")
+
+    # The choice survives a reload (persisted in the URL, re-read on load).
+    page.keyboard.press("Escape")
+    page.reload()
+    expect(page.locator('input[name="metric"][value="freshness"]')).to_be_checked()
+    expect(page.locator("#legend h4")).to_have_text("Data Freshness (last collected)")
+
+    assert errors == []
+
+
+def test_overview_chart_drawer_collapses_and_persists(page: Page, base_url):
+    """The scatter plots live in a collapsible drawer at the bottom of the
+    right rail (the rail is what stops the legend/chart overlap); the
+    collapsed choice persists in localStorage."""
+    errors = _capture_errors(page)
+    page.goto(f"{base_url}/index.html")
+    expect(page.locator("path.leaflet-interactive")).to_have_count(2)
+
+    body = page.locator("#chart-drawer-body")
+    expect(body).to_be_visible()
+
+    page.locator("#chart-drawer-toggle").click()
+    expect(body).to_be_hidden()
+    # With the drawer collapsed the legend still sits clear of the header.
+    header_box = page.locator("header.site-header").bounding_box()
+    legend_box = page.locator("#legend").bounding_box()
+    assert legend_box["y"] >= header_box["y"] + header_box["height"]
+
+    page.reload()
+    expect(page.locator("path.leaflet-interactive")).to_have_count(2)
+    expect(page.locator("#chart-drawer-body")).to_be_hidden()
+
+    page.locator("#chart-drawer-toggle").click()
+    expect(page.locator("#chart-drawer-body")).to_be_visible()
+
+    assert errors == []
+
+
+def test_city_page_change_overlay_draws_the_published_diff(page: Page, base_url):
+    """
+    "Show changes on map" fetches the published diff detail CSV (Alpha City's
+    two fixture runs differ by one added pano) and draws it as a dot layer;
+    the run-history mini-chart renders alongside the snapshot selector.
+    """
+    errors = _capture_errors(page)
+    page.goto(f"{base_url}/city.html?file={ALPHA_LATEST}")
+    expect(page.locator("table.legend-stats")).to_be_visible()
+
+    # Multi-run city: the run-history mini-chart accompanies the selector.
+    expect(page.locator("#run-history-chart")).to_be_visible()
+
+    # The change section names the predecessor run.
+    expect(page.locator(".legend")).to_contain_text("Since 2026-01-15")
+
+    btn = page.locator("#diff-overlay-btn")
+    expect(btn).to_have_text("Show changes on map")
+    btn.click()
+
+    # The fetch resolves, counts appear, and the dots land on their own pane.
+    status = page.locator("#diff-overlay-status")
+    expect(status).to_contain_text("1 added")
+    expect(status).to_contain_text("0 removed")
+    _expect_pane_ink(page, "diffOverlay", drawn=True)
+    expect(page.locator("#diff-overlay-btn")).to_have_text("Hide changes on map")
+
+    # Toggling off clears the pane; back on restores it from the cached layer.
+    page.locator("#diff-overlay-btn").click()
+    _expect_pane_ink(page, "diffOverlay", drawn=False)
+    page.locator("#diff-overlay-btn").click()
+    _expect_pane_ink(page, "diffOverlay", drawn=True)
 
     assert errors == []

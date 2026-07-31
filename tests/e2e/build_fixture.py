@@ -44,6 +44,11 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from streetscape_metadata_tracker import db, naming  # noqa: E402
+from streetscape_metadata_tracker.diff import (  # noqa: E402
+    compute_run_diff,
+    generate_diff_filename,
+    write_diff_detail,
+)
 from streetscape_metadata_tracker.fileutils import load_city_csv_file  # noqa: E402
 from streetscape_metadata_tracker.json_summarizer import (  # noqa: E402
     generate_aggregate_v2,
@@ -125,22 +130,34 @@ def _add_mapillary_run(conn, city_id, city_name, state, country, panos, run_date
     )
 
 
-def _record_simple_diff(conn, city_id, from_run, to_run, added):
-    """A minimal grid-aligned diff so the aggregate carries a 'change' block."""
+def _record_real_diff(conn, city_id, from_run, to_run, from_date, to_date):
+    """Diff the two runs with the REAL pipeline code and publish the detail CSV.
+
+    Computing (rather than hand-recording) the diff keeps the fixture on the
+    live detail schema, and the published csv.gz is what lets the e2e exercise
+    the city page's "Show changes on map" overlay end-to-end.
+    """
+    df_old = load_city_csv_file(os.path.join(FIXTURE_DIR, _run_name(city_id, from_date)))
+    df_new = load_city_csv_file(os.path.join(FIXTURE_DIR, _run_name(city_id, to_date)))
+    diff = compute_run_diff(df_old, df_new)
+
+    detail_filename = generate_diff_filename(city_id, from_date.isoformat(), to_date.isoformat())
+    write_diff_detail(diff, os.path.join(FIXTURE_DIR, detail_filename))
+
     db.record_diff(
         conn,
         city_id=city_id,
         from_run_id=from_run,
         to_run_id=to_run,
-        grid_aligned=True,
-        panos_added=added,
-        panos_removed=0,
-        panos_persisted=1,
-        capture_date_changed=0,
-        points_gained_coverage=added,
-        points_lost_coverage=0,
-        coverage_delta_pct=25.0,
-        detail_filename=None,
+        grid_aligned=diff.grid_aligned,
+        panos_added=diff.panos_added,
+        panos_removed=diff.panos_removed,
+        panos_persisted=diff.panos_persisted,
+        capture_date_changed=diff.capture_date_changed,
+        points_gained_coverage=diff.points_gained_coverage,
+        points_lost_coverage=diff.points_lost_coverage,
+        coverage_delta_pct=diff.coverage_delta_pct,
+        detail_filename=detail_filename,
     )
 
 
@@ -307,7 +324,7 @@ def build():
             date(2026, 4, 15),
             grid_origin=(44.00, -121.00),
         )
-        _record_simple_diff(conn, alpha, r1, r2, added=1)
+        _record_real_diff(conn, alpha, r1, r2, date(2026, 1, 15), date(2026, 4, 15))
 
         # 2) 0-pano GSV city (#69/#122): a run with no panos at all.
         zero = db.register_city(

@@ -7,16 +7,23 @@
  * streetscape_street_analyzer.analyze) and draws each OSM street segment on
  * the map. Three view modes restyle the same layer in place:
  *
- *   - "age"      (default) covered segments use the provider age scale
- *                (matching the pano dots); uncovered are gray and dashed.
- *   - "coverage" binary covered (green) vs uncovered (gray, dashed).
+ *   - "age"      covered segments use the provider age scale (matching the
+ *                pano dots); uncovered are slate and dashed.
+ *   - "coverage" (labeled "Amount") fractional pale→full green ramp per edge
+ *                on road-walk artifacts; binary green on grid artifacts.
  *   - "type"     each segment colored by OSM highway class; uncovered
  *                segments are faded + dashed so coverage still reads.
  *
- * The panel also renders a "coverage by street type" stacked bar chart.
- * Clicking a chart segment spotlights the matching street segments on the
- * map (all others dim); hovering previews the same. A "Show pano dots"
- * toggle hides the pano markers so the streets can be read on their own.
+ * A "Highlight gaps" toggle inverts the emphasis in any mode: uncovered
+ * segments flip to an unmissable red while covered ones fade to a whisper —
+ * the direct answer to "which streets have no imagery?".
+ *
+ * The panel also renders a "coverage by street type" stacked bar chart whose
+ * covered bars wear each row's type hue with a matching swatch beside the row
+ * label — the chart doubles as the type legend. Clicking a chart segment
+ * spotlights the matching street segments on the map (all others dim);
+ * hovering previews the same. A "Pano dots" toggle hides the pano markers so
+ * the streets can be read on their own.
  *
  * The artifact is optional: most cities have no streets file yet, so a missing
  * file is a silent no-op (the rest of the page is unaffected).
@@ -38,16 +45,27 @@
 const STREET_COVERED_NODATE_COLOR = "#2fb974";
 /** Binary "covered" color for the coverage view mode. */
 const STREET_COVERED_COLOR = "#2fb974";
-/** Segments with no imagery coverage — slate, drawn dashed. Clears 3:1 on the
- *  dark panel and still reads on the light map basemap (CVD ΔE ~30 vs green). */
-const STREET_UNCOVERED_COLOR = "#767c85";
+/** Segments with no imagery coverage — slate, drawn dashed. Brightened from
+ *  the original #767c85, which sat too close to the dark basemap: gaps are a
+ *  finding, not background. Clears 3:1 on both the dark panel and basemap. */
+const STREET_UNCOVERED_COLOR = "#9aa3ad";
+
+/** Uncovered segments while "Highlight gaps" is on: an unmissable red. Safe
+ *  as an attention color here because the covered hues are simultaneously
+ *  dimmed to near-invisible — it never competes with the categorical hues. */
+const STREET_GAP_HIGHLIGHT_COLOR = "#ff5252";
 
 /** Pale end of the fractional-coverage ramp (a barely-driven edge). The full
  *  end is STREET_COVERED_COLOR, so a fully-covered edge matches the binary
  *  green exactly — the ramp is continuous with the other modes. Only the
  *  road-walk (streetwalk) artifact carries per-edge `coverage_fraction`; the
  *  grid-attribution artifact is binary and never uses this. */
-const STREET_PARTIAL_LOW_COLOR = "#bfe8d4";
+const STREET_PARTIAL_LOW_COLOR = "#e2f5ea";
+
+/** Midpoint of the fractional ramp. A third stop widens the pale→full sweep —
+ *  the old two-stop lerp left a 20%-driven street nearly indistinguishable
+ *  from a fully-driven one. Green channel stays monotone across all three. */
+const STREET_PARTIAL_MID_COLOR = "#7ccf9f";
 
 /** Panel surface color; also used as the inter-segment gap color in the chart. */
 const STREET_PANEL_BG = "#1b1f24";
@@ -64,15 +82,20 @@ function hexToRgb(hex) {
 
 /**
  * Sequential green ramp for a fractional per-edge coverage value: pale green at
- * ~0 (mostly uncovered) → the full covered green at 1 (driven end to end).
+ * ~0 (mostly uncovered) → mid green → the full covered green at 1 (driven end
+ * to end). Three stops, so the low half of the range is visually spread out
+ * instead of collapsing into near-identical greens.
  * @param {number} frac - Coverage fraction in [0, 1].
  * @returns {string} An rgb() color.
  */
 function fractionColor(frac) {
   const f = Math.max(0, Math.min(1, Number(frac) || 0));
-  const lo = hexToRgb(STREET_PARTIAL_LOW_COLOR);
-  const hi = hexToRgb(STREET_COVERED_COLOR);
-  const mix = (a, b) => Math.round(a + (b - a) * f);
+  const stops = [STREET_PARTIAL_LOW_COLOR, STREET_PARTIAL_MID_COLOR, STREET_COVERED_COLOR]
+    .map(hexToRgb);
+  const [lo, hi, t] = f < 0.5
+    ? [stops[0], stops[1], f * 2]
+    : [stops[1], stops[2], (f - 0.5) * 2];
+  const mix = (a, b) => Math.round(a + (b - a) * t);
   return `rgb(${mix(lo[0], hi[0])}, ${mix(lo[1], hi[1])}, ${mix(lo[2], hi[2])})`;
 }
 
@@ -193,6 +216,19 @@ function typeLegendGroups(present) {
 }
 
 /**
+ * The artifact's highway buckets in canonical display order (streetTypeOrder).
+ * The chart rows, the type-mode map legend, and the artifact's own key order
+ * all follow this one hierarchy — the chart used to sort by length instead,
+ * which put the same categories in a different order than the legend chips
+ * right above it.
+ * @param {Object} byType - The metadata `coverage_by_highway` block.
+ * @returns {string[]}
+ */
+function orderedStreetTypes(byType) {
+  return Object.keys(byType).sort((a, b) => streetTypeOrder(a) - streetTypeOrder(b));
+}
+
+/**
  * Derive the streets artifact URL from a run's CSV filename.
  * Mirrors naming.streets_filename_for_run on the Python side — keep in sync,
  * including its suffix validation: a name that isn't a run csv.gz has no
@@ -284,17 +320,34 @@ function styleForMode(feature, mode, provider) {
 }
 
 /**
+ * Style override while "Highlight gaps" is on: uncovered segments flip to the
+ * unmissable red at full opacity; covered segments dim to a whisper. Pure and
+ * Leaflet-free (node-testable) — the per-feature decision behind the toggle.
+ * @param {Object} base - The mode's base style for this feature.
+ * @param {boolean} covered - The feature's coverage flag.
+ * @returns {Object} Leaflet path style.
+ */
+function styleWithGapHighlight(base, covered) {
+  if (covered) return { ...base, opacity: 0.15 };
+  return { color: STREET_GAP_HIGHLIGHT_COLOR, weight: 3, opacity: 1, dashArray: "4 4" };
+}
+
+/**
  * Restyle the whole street layer for the current mode, applying a spotlight
  * when a selection is active: segments matching {highway, covered} keep full
- * opacity and thicken; everything else dims.
+ * opacity and thicken; everything else dims. With `gapsOnly`, the gap
+ * highlight replaces the spotlight entirely (the two answer different
+ * questions and never compose).
  * @param {L.GeoJSON} layer - The street layer.
  * @param {string} mode - Current view mode.
  * @param {string} provider - Provider key.
  * @param {?{type: string, covered: boolean}} selection - Active spotlight, or null.
+ * @param {boolean} [gapsOnly=false] - "Highlight gaps" toggle state.
  */
-function applyStreetStyles(layer, mode, provider, selection) {
+function applyStreetStyles(layer, mode, provider, selection, gapsOnly = false) {
   layer.setStyle((feature) => {
     const base = styleForMode(feature, mode, provider);
+    if (gapsOnly) return styleWithGapHighlight(base, Boolean(feature.properties?.covered));
     if (!selection) return base;
     const p = feature.properties;
     const match = p.highway === selection.type && Boolean(p.covered) === selection.covered;
@@ -445,43 +498,53 @@ function buildStreetCoveragePanel(map, layer, meta, provider, options) {
   const totals = meta.totals;
   const byType = meta.coverage_by_highway;
 
-  // Types sorted by total length desc — the chart's row order.
-  const types = Object.keys(byType).sort(
-    (a, b) => byType[b].length_km - byType[a].length_km
-  );
+  // Chart rows follow the canonical class hierarchy, the same order the
+  // artifact writes coverage_by_highway in — one order everywhere.
+  const types = orderedStreetTypes(byType);
 
   // Shared view state, mutated by the controls below. The road-walk artifact
   // opens on the fractional coverage ramp; the grid artifact on the age scale.
   const hasFractional = Boolean(options.hasFractional);
   let mode = options.initialMode || "age";
   let selection = null; // {type, covered} spotlight, or null
+  let gapsOnly = false; // "Highlight gaps" toggle
 
   const uncoveredPct = totals.uncovered_pct_by_length;
   container.innerHTML = `
     <div id="street-coverage-header">
       <strong>Street coverage</strong>
-      <label class="street-toggle">
-        <input type="checkbox" id="street-layer-toggle" checked> streets
-      </label>
     </div>
     <p id="street-coverage-headline">
-      <span class="street-headline-pct">${uncoveredPct}%</span> of street-km have
-      no ${providerLabel} imagery
+      <span class="street-headline-pct">${uncoveredPct}%</span>
+      <span class="street-headline-text">of street-km have
+      no ${providerLabel} imagery</span>
       <span class="street-headline-sub">
         (${totals.covered.toLocaleString()} of
         ${totals.segments.toLocaleString()} segments covered)
       </span>
     </p>
-    <div class="street-controls">
+    <div class="street-controls street-panel-section">
       <div class="street-mode" role="group" aria-label="Color streets by">
         <span class="street-mode-label">Color by</span>
-        <button type="button" class="street-mode-btn is-active" data-mode="age" aria-pressed="true">Age</button>
-        <button type="button" class="street-mode-btn" data-mode="coverage" aria-pressed="false">Coverage</button>
-        <button type="button" class="street-mode-btn" data-mode="type" aria-pressed="false">Type</button>
+        <button type="button" class="street-mode-btn is-active" data-mode="age" aria-pressed="true"
+                title="Color covered streets by how old their imagery is (same scale as the pano dots)">Age</button>
+        <button type="button" class="street-mode-btn" data-mode="coverage" aria-pressed="false"
+                title="Color covered streets by how much of their length is covered — pale (barely sampled) to full green (driven end to end)">Amount</button>
+        <button type="button" class="street-mode-btn" data-mode="type" aria-pressed="false"
+                title="Color streets by their OSM classification (motorway, residential, …)">Type</button>
       </div>
-      <label class="street-toggle street-dots-toggle">
-        <input type="checkbox" id="street-dots-toggle" checked> Show pano dots
-      </label>
+      <div class="street-toggles">
+        <label class="street-toggle" title="Show or hide the street lines">
+          <input type="checkbox" id="street-layer-toggle" checked> Streets
+        </label>
+        <label class="street-toggle street-dots-toggle" title="Show or hide the panorama dot markers">
+          <input type="checkbox" id="street-dots-toggle" checked> Pano dots
+        </label>
+        <label class="street-toggle street-gaps-toggle"
+               title="Spotlight the streets with NO imagery in red; everything covered fades back">
+          <input type="checkbox" id="street-gaps-toggle"> Highlight gaps
+        </label>
+      </div>
     </div>
     <div class="street-legend" id="street-legend"></div>
     <div id="street-chart-head">
@@ -495,38 +558,46 @@ function buildStreetCoveragePanel(map, layer, meta, provider, options) {
   const legendEl = document.getElementById("street-legend");
 
   // ── Legend (rebuilt per mode) ──────────────────────────────────
+  // Dashed chips paint their stripes/border with currentColor, so `color`
+  // (not background) carries the hue — that lets the "no coverage" chip flip
+  // to the gap-highlight red when the gaps toggle is on.
   const swatch = (color, label, dashed = false, thin = false) => {
     const cls = [dashed ? "dashed" : "", thin ? "thin" : ""].filter(Boolean).join(" ");
-    return `<span><i class="${cls}" style="background:${color}"></i>${label}</span>`;
+    const style = dashed ? `color:${color}` : `background:${color}`;
+    return `<span><i class="${cls}" style="${style}"></i>${label}</span>`;
   };
 
   function renderLegend() {
+    const gapColor = gapsOnly ? STREET_GAP_HIGHLIGHT_COLOR : STREET_UNCOVERED_COLOR;
+    const gapChip = swatch(gapColor, "no coverage", true);
     if (mode === "coverage") {
       if (hasFractional) {
         // Fractional (road-walk): a pale→full green ramp chip plus uncovered.
-        const stops = [STREET_PARTIAL_LOW_COLOR, STREET_COVERED_COLOR].join(",");
+        const stops =
+          [STREET_PARTIAL_LOW_COLOR, STREET_PARTIAL_MID_COLOR, STREET_COVERED_COLOR].join(",");
         legendEl.innerHTML =
           `<span><i style="background:linear-gradient(90deg,${stops})"></i>partial → full</span>` +
-          swatch(STREET_UNCOVERED_COLOR, "no coverage", true);
+          gapChip;
       } else {
-        legendEl.innerHTML =
-          swatch(STREET_COVERED_COLOR, "covered") +
-          swatch(STREET_UNCOVERED_COLOR, "no coverage", true);
+        legendEl.innerHTML = swatch(STREET_COVERED_COLOR, "covered") + gapChip;
       }
     } else if (mode === "type") {
-      // Only the types actually present, in the artifact's own class order,
-      // merged by rendered style, plus uncovered.
-      legendEl.innerHTML =
-        typeLegendGroups(types)
-          .map((g) => swatch(g.color, g.labels.join(", "), false, g.thin))
-          .join("") + swatch(STREET_UNCOVERED_COLOR, "no coverage", true);
+      // The chart below IS the type legend (type-colored bars + swatched row
+      // labels), so the map legend only needs the one style the chart rows
+      // can't show: the dashed no-coverage line.
+      legendEl.innerHTML = gapChip;
     } else {
       // Age: a small newest→oldest gradient chip plus the uncovered swatch.
       const stops = [0, 3, 6, 10].map((a) => getColor(a, provider)).join(",");
       legendEl.innerHTML =
         `<span><i style="background:linear-gradient(90deg,${stops})"></i>newer → older</span>` +
-        swatch(STREET_UNCOVERED_COLOR, "no coverage", true);
+        gapChip;
     }
+  }
+
+  /** Repaint the street layer for the current mode/selection/gaps state. */
+  function repaint() {
+    applyStreetStyles(layer, mode, provider, selection, gapsOnly);
   }
 
   // ── View-mode buttons ──────────────────────────────────────────
@@ -546,11 +617,11 @@ function buildStreetCoveragePanel(map, layer, meta, provider, options) {
         b.setAttribute("aria-pressed", String(active));
       });
       renderLegend();
-      applyStreetStyles(layer, mode, provider, selection);
+      repaint();
     });
   });
 
-  // ── Layer + pano-dot toggles ───────────────────────────────────
+  // ── Layer / pano-dot / gaps toggles ────────────────────────────
   document.getElementById("street-layer-toggle").addEventListener("change", (e) => {
     if (e.target.checked) layer.addTo(map);
     else map.removeLayer(layer);
@@ -566,12 +637,25 @@ function buildStreetCoveragePanel(map, layer, meta, provider, options) {
     dotsToggle.closest(".street-dots-toggle").style.display = "none";
   }
 
+  document.getElementById("street-gaps-toggle").addEventListener("change", (e) => {
+    gapsOnly = e.target.checked;
+    if (gapsOnly && selection) {
+      // The gap highlight replaces the spotlight — clear it rather than
+      // leave a pinned chart selection that no longer matches the map.
+      selection = null;
+      clearBtn.hidden = true;
+      paintChartSelection(chart, null);
+    }
+    renderLegend();
+    repaint();
+  });
+
   // ── Selection plumbing ─────────────────────────────────────────
   const clearBtn = document.getElementById("street-clear-selection");
   function setSelection(next) {
     selection = next;
     clearBtn.hidden = next == null;
-    applyStreetStyles(layer, mode, provider, selection);
+    repaint();
   }
   clearBtn.addEventListener("click", () => {
     setSelection(null);
@@ -595,9 +679,13 @@ function buildStreetCoveragePanel(map, layer, meta, provider, options) {
       labels: types,
       datasets: [
         {
+          // Covered length wears each row's TYPE hue (with a matching swatch
+          // beside the row label, via streetTypeSwatchPlugin) — the chart is
+          // its own legend, replacing the old separate Covered/No-coverage
+          // Chart.js legend that duplicated the map chips.
           label: "Covered",
           data: coveredKm,
-          backgroundColor: types.map(() => STREET_COVERED_COLOR),
+          backgroundColor: types.map((t) => streetTypeColor(t)),
           borderColor: STREET_PANEL_BG,
           borderWidth: 2,
           borderRadius: 2,
@@ -620,13 +708,13 @@ function buildStreetCoveragePanel(map, layer, meta, provider, options) {
       maintainAspectRatio: false,
       onHover: (evt, elements) => {
         evt.native.target.style.cursor = elements.length ? "pointer" : "default";
-        // Preview only when nothing is pinned by a click.
-        if (selection) return;
+        // Preview only when nothing is pinned and the gaps view isn't on.
+        if (selection || gapsOnly) return;
         const hovered = elements.length ? selectionFor(elements[0]) : null;
         applyStreetStyles(layer, mode, provider, hovered);
       },
       onClick: (evt, elements) => {
-        if (!elements.length) return;
+        if (gapsOnly || !elements.length) return;
         const clicked = selectionFor(elements[0]);
         if (!clicked) return; // zero-length segment
         const same =
@@ -643,12 +731,16 @@ function buildStreetCoveragePanel(map, layer, meta, provider, options) {
         },
         y: {
           stacked: true,
-          ticks: { color: "#e6e6e6", autoSkip: false },
+          // padding reserves the gutter the row swatches draw into
+          ticks: { color: "#e6e6e6", autoSkip: false, padding: 14 },
           grid: { display: false },
         },
       },
       plugins: {
-        legend: { labels: { color: "#e6e6e6", boxWidth: 12 } },
+        // No built-in legend: the type hue + row swatch identify each row,
+        // and the neutral remainder is explained by the map legend's
+        // "no coverage" chip.
+        legend: { display: false },
         tooltip: {
           callbacks: {
             label: (ctx) => {
@@ -661,12 +753,13 @@ function buildStreetCoveragePanel(map, layer, meta, provider, options) {
         },
       },
     },
-    plugins: [coveragePctLabelPlugin],
+    plugins: [coveragePctLabelPlugin, streetTypeSwatchPlugin],
   });
 
-  // Reset the map spotlight when the pointer leaves the chart (unless pinned).
+  // Reset the map spotlight when the pointer leaves the chart (unless pinned
+  // or the gaps view owns the styling).
   document.getElementById("street-chart-wrap").addEventListener("mouseleave", () => {
-    if (!selection) applyStreetStyles(layer, mode, provider, null);
+    if (!selection && !gapsOnly) applyStreetStyles(layer, mode, provider, null);
   });
 
   /**
@@ -728,6 +821,17 @@ function streetTypeOrder(highway) {
 }
 
 /**
+ * Base bar color for a chart cell: the row's type hue for the covered
+ * dataset, the neutral gap slate for the uncovered one.
+ * @param {number} datasetIndex - 0 = covered, 1 = no coverage.
+ * @param {string} label - The row's highway bucket.
+ * @returns {string} A #rrggbb hex.
+ */
+function chartBarBaseColor(datasetIndex, label) {
+  return datasetIndex === 0 ? streetTypeColor(label) : STREET_UNCOVERED_COLOR;
+}
+
+/**
  * Fade the chart's non-selected segments to echo the map spotlight; pass null
  * to restore full color. Mutates per-bar backgroundColor arrays in place.
  * @param {Chart} chart
@@ -735,12 +839,12 @@ function streetTypeOrder(highway) {
  */
 function paintChartSelection(chart, selection) {
   const labels = chart.data.labels;
-  const base = [STREET_COVERED_COLOR, STREET_UNCOVERED_COLOR];
   chart.data.datasets.forEach((ds, di) => {
-    ds.backgroundColor = labels.map((label, li) => {
-      if (!selection) return base[di];
+    ds.backgroundColor = labels.map((label) => {
+      const base = chartBarBaseColor(di, label);
+      if (!selection) return base;
       const match = label === selection.type && di === (selection.covered ? 0 : 1);
-      return match ? base[di] : withStreetAlpha(base[di], 0.22);
+      return match ? base : withStreetAlpha(base, 0.22);
     });
   });
   chart.update("none");
@@ -758,6 +862,20 @@ function withStreetAlpha(hex, alpha) {
 }
 
 /**
+ * In-bar label ink for a given bar fill: near-black on light fills, white on
+ * dark ones. The covered bars now wear the categorical type hues, which span
+ * light (residential coral) to dark (secondary green) — one fixed label color
+ * cannot clear both.
+ * @param {string} color - #rrggbb bar fill.
+ * @returns {string} "#0e1a12" or "#fff".
+ */
+function labelTextColorFor(color) {
+  const [r, g, b] = hexToRgb(color);
+  const luma = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
+  return luma > 0.45 ? "#0e1a12" : "#fff";
+}
+
+/**
  * Inline Chart.js plugin: draw each covered segment's coverage % at the right
  * edge of its bar, when the segment is wide enough to fit the text. Keeps the
  * headline number close to the data without an external datalabels dependency.
@@ -770,7 +888,6 @@ const coveragePctLabelPlugin = {
     if (!meta || meta.hidden) return;
     ctx.save();
     ctx.font = "600 10px system-ui, -apple-system, sans-serif";
-    ctx.fillStyle = "#0e1a12";
     ctx.textBaseline = "middle";
     ctx.textAlign = "right";
     meta.data.forEach((bar, i) => {
@@ -779,8 +896,31 @@ const coveragePctLabelPlugin = {
       const pct = chart.data.datasets[0].data[i];
       const total = pct + chart.data.datasets[1].data[i];
       if (!total) return;
+      // Ink follows the row's base hue (not the possibly-dimmed live color).
+      ctx.fillStyle = labelTextColorFor(chartBarBaseColor(0, chart.data.labels[i]));
       const label = `${Math.round((100 * pct) / total)}%`;
       ctx.fillText(label, bar.x - 4, bar.y);
+    });
+    ctx.restore();
+  },
+};
+
+/**
+ * Inline Chart.js plugin: a small type-hue swatch beside each y-axis row
+ * label, in the gutter the y ticks' `padding` reserves — the "colored boxes
+ * next to the names" that let the chart double as the type legend.
+ */
+const streetTypeSwatchPlugin = {
+  id: "streetTypeSwatch",
+  afterDraw(chart) {
+    const yScale = chart.scales.y;
+    if (!yScale) return;
+    const { ctx, chartArea } = chart;
+    ctx.save();
+    chart.data.labels.forEach((label, i) => {
+      const py = yScale.getPixelForTick(i);
+      ctx.fillStyle = streetTypeColor(label);
+      ctx.fillRect(chartArea.left - 11, py - 4, 8, 8);
     });
     ctx.restore();
   },
@@ -797,19 +937,26 @@ if (typeof module !== "undefined" && module.exports) {
     styleStreetByCoverage,
     styleStreetByType,
     styleForMode,
+    styleWithGapHighlight,
+    applyStreetStyles,
     streetTypeColor,
     streetTypeOrder,
+    orderedStreetTypes,
     isNonMotorizedType,
     typeLegendGroups,
     withStreetAlpha,
     fractionColor,
     hexToRgb,
+    labelTextColorFor,
+    chartBarBaseColor,
     normalizeStreetArtifact,
     renderStreetCoverage,
     STREET_UNCOVERED_COLOR,
     STREET_COVERED_COLOR,
     STREET_COVERED_NODATE_COLOR,
     STREET_PARTIAL_LOW_COLOR,
+    STREET_PARTIAL_MID_COLOR,
+    STREET_GAP_HIGHLIGHT_COLOR,
     STREET_TYPE_COLORS,
     STREET_TYPE_MINOR_COLOR,
     STREET_TYPE_FAMILY,

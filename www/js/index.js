@@ -198,8 +198,8 @@ function createTooltip(city) {
     changeHtml = `
       <div style="margin-top:12px"><strong>Since ${escapeHtml(change.from)}:</strong></div>
       <ul class="popup-stats-list">
-        <li><span style="color:#2e7d32">${change.added}</span> /
-            <span style="color:#c62828">${change.removed}</span> panoramas</li>
+        <li><span class="change-added">${change.added}</span> /
+            <span class="change-removed">${change.removed}</span> panoramas</li>
         ${change.redated ? `<li>${change.redated}</li>` : ""}
         ${change.coverage ? `<li>Coverage: ${change.coverage}</li>` : ""}
       </ul>`;
@@ -209,9 +209,10 @@ function createTooltip(city) {
   // third-party data) — escape everything data-derived entering innerHTML.
   container.innerHTML = `
     <h3>${escapeHtml(getCityLabel(city))}</h3>
+    <p class="popup-collected">Collected
+      <strong>${escapeHtml(city.latest_run_date) || (city.collection_info?.end_time ? new Date(city.collection_info.end_time).toLocaleDateString() : "Unknown")}</strong></p>
     <strong>Coverage Statistics:</strong>
     <ul class="popup-stats-list">
-      <li>Data Collected: ${escapeHtml(city.latest_run_date) || (city.collection_info?.end_time ? new Date(city.collection_info.end_time).toLocaleDateString() : "Unknown")}</li>
       ${snapshotsHtml}
       <li>Area: ${city.search_area_km2.toFixed(1)} km²</li>
       <li>Grid Coverage: ${city.coverage_rate_percent != null
@@ -904,6 +905,18 @@ function createScatterPlots(cities) {
           ],
         },
       },
+      // Wheel/pinch zoom + drag pan (chartjs-plugin-zoom; double-click
+      // resets — wired in initChartZoomReset). ~1,100 overlapping dots need
+      // zoom to disambiguate. `limits: original` stops panning/zooming out
+      // beyond the data extent.
+      zoom: {
+        zoom: { wheel: { enabled: true }, pinch: { enabled: true }, mode: "xy" },
+        pan: { enabled: true, mode: "xy" },
+        limits: {
+          x: { min: "original", max: "original" },
+          y: { min: "original", max: "original" },
+        },
+      },
     },
     scales: {
       y: {
@@ -1083,7 +1096,19 @@ function renderProvider(fitMap = false) {
     // Content function: the popup DOM (including its Chart.js histogram)
     // is built on OPEN, not eagerly for all ~1,100 cities at render time —
     // and rebuilt each open, so a provider toggle can't leak stale charts.
-    rect.bindPopup(() => createTooltip(city));
+    //
+    // The popup lives inside the map pane's stacking context (the pane's
+    // translate3d transform creates one), so NO z-index can lift it above
+    // the fixed header/search/rail chrome — instead, autoPan padding makes
+    // Leaflet pan the map until the popup sits clear of all of it: 390px
+    // left covers the search column (left:60 + 320 wide), 130px top covers
+    // the 44px header plus the #stats banner, and the right padding keeps
+    // it out from under the right rail's legend.
+    rect.bindPopup(() => createTooltip(city), {
+      maxWidth: 340,
+      autoPanPaddingTopLeft: L.point(390, 130),
+      autoPanPaddingBottomRight: L.point(260, 40),
+    });
     mapRectangles.push(rect);
 
     rect.on("mouseover", () => highlightCity(city));
@@ -1171,6 +1196,54 @@ function initMetricToggle() {
   });
 }
 
+// ── Chart drawer & zoom reset ─────────────────────────────────
+
+/**
+ * Wire the scatter-plot drawer's minimize/expand toggle. Collapsed state
+ * persists across visits; on expand the charts are re-measured (Chart.js
+ * can't size a canvas inside display:none).
+ */
+function initChartDrawer() {
+  const container = document.querySelector(".chart-container");
+  const toggle = document.getElementById("chart-drawer-toggle");
+  const KEY = "streetscape-overview-charts-collapsed";
+
+  function setCollapsed(collapsed) {
+    container.classList.toggle("collapsed", collapsed);
+    toggle.setAttribute("aria-expanded", String(!collapsed));
+    toggle.setAttribute("aria-label", collapsed ? "Expand charts" : "Minimize charts");
+    toggle.textContent = collapsed ? "+" : "–";
+    try {
+      localStorage.setItem(KEY, String(collapsed));
+    } catch { /* private browsing: collapse still works, just not persisted */ }
+    if (!collapsed) {
+      charts.pano?.resize();
+      charts.area?.resize();
+    }
+  }
+
+  toggle.addEventListener("click", () =>
+    setCollapsed(!container.classList.contains("collapsed")));
+
+  let stored = null;
+  try {
+    stored = localStorage.getItem(KEY);
+  } catch { /* ignore */ }
+  if (stored === "true") setCollapsed(true);
+}
+
+/**
+ * Double-click on a scatter canvas resets its zoom/pan. Wired once on the
+ * (static) canvases; routed through the live `charts.*` handles because the
+ * Chart instances are destroyed and rebuilt on every provider/metric switch.
+ */
+function initChartZoomReset() {
+  document.getElementById("panoScatter").addEventListener("dblclick", () =>
+    charts.pano?.resetZoom());
+  document.getElementById("areaScatter").addEventListener("dblclick", () =>
+    charts.area?.resetZoom());
+}
+
 // ── Data loading ──────────────────────────────────────────────
 
 /** Fetch cities.json.gz + the streetwalk manifest, then render the view. */
@@ -1179,6 +1252,8 @@ async function loadData() {
   // recorded (setProvider/setMetric defer the render until data arrives).
   initProviderToggle();
   initMetricToggle();
+  initChartDrawer();
+  initChartZoomReset();
   try {
     // The manifest is small (a few hundred bytes) and optional — fetch it
     // alongside the aggregate rather than serially, and let its own error

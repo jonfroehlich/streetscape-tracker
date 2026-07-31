@@ -37,10 +37,15 @@ const sharedGlobals = {
   parseFilterParam: "readonly",
   getColor: "readonly",
   coverageColor: "readonly",
+  recencyColor: "readonly",
+  FRESHNESS_BUCKETS: "readonly",
   escapeHtml: "readonly",
   isValidRunFilename: "readonly",
+  diffFilenameFor: "readonly",
+  isValidDiffFilename: "readonly",
   getProviderFromFilename: "readonly",
   fetchGzippedJson: "readonly",
+  fetchGzippedText: "readonly",
   streetwalkManifestUrl: "readonly",
   fetchStreetwalkManifest: "readonly",
   lookupStreetwalk: "readonly",
@@ -61,6 +66,17 @@ const sharedGlobals = {
   spatialStrideSample: "readonly",
   computeVisibilityDelta: "readonly",
   markerDateStyle: "readonly",
+};
+
+// Symbols table-utils.js DEFINES and the two table pages (grid.js,
+// streets.js) CONSUME as globals (table-utils.js is loaded between
+// streetscape-utils.js and the page script).
+const tableGlobals = {
+  cityDisplayLabel: "readonly",
+  sortRowsBy: "readonly",
+  formatCellNumber: "readonly",
+  coverageCellHtml: "readonly",
+  createSortableTable: "readonly",
 };
 
 const browserRules = {
@@ -108,10 +124,10 @@ module.exports = [
     rules: browserRules,
   },
   {
-    // Street-level coverage page (issue #99/#155): consumes the
-    // streetscape-utils.js globals and, like the two files above, carries a
-    // Node export shim (`module`) so its pure helpers can be unit-tested.
-    files: ["js/streets.js"],
+    // Shared sortable-table machinery for the grid/streets table pages:
+    // consumes streetscape-utils.js globals (coverageColor) and defines the
+    // tableGlobals. Node export shim (`module`) for the unit tests.
+    files: ["js/table-utils.js"],
     languageOptions: {
       ecmaVersion: 2022,
       sourceType: "script",
@@ -120,14 +136,47 @@ module.exports = [
     rules: browserRules,
   },
   {
-    // Only city.html loads street-coverage.js, so only city.js may consume
-    // its globals (flat config merges this into city.js's entry above).
-    // The manifest helpers moved to streetscape-utils.js (they are needed by
-    // index.js/streets.js too) and are declared in sharedGlobals instead.
+    // The two table pages (issues #99/#155 and the grid table): consume the
+    // streetscape-utils.js and table-utils.js globals and, like the files
+    // above, carry a Node export shim (`module`) so their pure helpers can be
+    // unit-tested.
+    files: ["js/streets.js", "js/grid.js"],
+    languageOptions: {
+      ecmaVersion: 2022,
+      sourceType: "script",
+      globals: {
+        ...globals.browser,
+        ...vendorGlobals,
+        ...sharedGlobals,
+        ...tableGlobals,
+        module: "readonly",
+      },
+    },
+    rules: browserRules,
+  },
+  {
+    // Diff overlay (change-since-previous-run dots): consumes
+    // streetscape-utils.js globals and defines renderDiffOverlay for city.js.
+    // Node export shim (`module`) for the unit tests.
+    files: ["js/diff-overlay.js"],
+    languageOptions: {
+      ecmaVersion: 2022,
+      sourceType: "script",
+      globals: { ...globals.browser, ...vendorGlobals, ...sharedGlobals, module: "readonly" },
+    },
+    rules: browserRules,
+  },
+  {
+    // Only city.html loads street-coverage.js and diff-overlay.js, so only
+    // city.js may consume their globals (flat config merges this into
+    // city.js's entry above). The manifest helpers moved to
+    // streetscape-utils.js (they are needed by index.js/streets.js too) and
+    // are declared in sharedGlobals instead.
     files: ["js/city.js"],
     languageOptions: {
       globals: {
         renderStreetCoverage: "readonly",
+        renderDiffOverlay: "readonly",
       },
     },
   },

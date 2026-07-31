@@ -242,6 +242,61 @@ METRICS.streets = {
   sliderLabel: "street coverage (%)",
 };
 
+// Data freshness (how recently each city was collected). The distribution is
+// strongly bimodal — a large 2025-01/02 initial-collection cohort plus a small
+// continuously-refreshed tail — so fixed categorical recency buckets read far
+// better than linear time buckets (which would put ~everything in one bar).
+const MS_PER_MONTH = MS_PER_YEAR / 12;
+
+/** Freshness buckets, freshest first; index = bucket id (non-negative, so
+ *  parseFilterParam and the legend slider work unchanged). */
+const FRESHNESS_BUCKETS = [
+  { label: "Last 3 months", maxMonths: 3 },
+  { label: "3–6 months", maxMonths: 6 },
+  { label: "6–12 months", maxMonths: 12 },
+  { label: "1–1.5 years", maxMonths: 18 },
+  { label: "Over 1.5 years", maxMonths: Infinity },
+];
+
+/**
+ * Color for a freshness bucket: a violet sequential ramp, bright (just
+ * collected — glows on the dark basemap) → dark (stale — recedes), monotone
+ * in lightness. Deliberately a third hue family, so age (YlOrRd), coverage
+ * (teal), and freshness are never confusable.
+ *
+ * @param {number} bucket - FRESHNESS_BUCKETS index (clamped).
+ * @returns {string} CSS hex color.
+ */
+function recencyColor(bucket) {
+  const colors = ["#ecdcff", "#c19cf0", "#9666d1", "#6d3fa6", "#452a69"];
+  return colors[Math.min(Math.max(bucket, 0), colors.length - 1)];
+}
+
+METRICS.freshness = {
+  label: "Freshness",
+  legendTitle: "Data Freshness (last collected)",
+  titleNoun: "Data Age",
+  axisTitle: "Months since collection",
+  yMax: null,
+  // Months since the latest run. panoDateOrNull parses the date-only run
+  // date at LOCAL midnight (the UTC-shift guard all date reads share).
+  valueOf: (city) => {
+    const d = panoDateOrNull(city.latest_run_date);
+    return d ? (Date.now() - d.getTime()) / MS_PER_MONTH : null;
+  },
+  color: (value) => recencyColor(METRICS.freshness.bucketOf(value)),
+  bucketOf: (months) => FRESHNESS_BUCKETS.findIndex((b) => months <= b.maxMonths),
+  bucketLabel: (bucket) => FRESHNESS_BUCKETS[bucket].label,
+  bucketColor: (bucket) => recencyColor(bucket),
+  // Fixed bucket set, freshest first — unlike age's data-driven range
+  legendBuckets: () => FRESHNESS_BUCKETS.map((_, i) => i),
+  rangeLabel: (min, max) => min === max
+    ? FRESHNESS_BUCKETS[min].label
+    : `${FRESHNESS_BUCKETS[min].label} – ${FRESHNESS_BUCKETS[max].label.toLowerCase()}`,
+  sliderLabel: "data age",
+  formatValue: (v) => (v < 1 ? "collected this month" : `collected ${v.toFixed(1)} months ago`),
+};
+
 /**
  * True iff `key` is a real "color by" metric key ("age"/"coverage").
  * Object.hasOwn for the same reason as isKnownProvider: a URL-supplied
@@ -341,6 +396,59 @@ function isValidRunFilename(filename) {
   if (typeof filename !== "string") return false;
   return /^[^/\\?#]+_width_\d+_height_\d+_step_\d+(?:\.\d+)?(?:_[a-z]+)?(?:_\d{4}-\d{2}-\d{2})?\.csv\.gz$/
     .test(filename);
+}
+
+/**
+ * Build a run-diff detail filename — the JS mirror of
+ * diff.generate_diff_filename (diff.py): GSV keeps the tokenless form, other
+ * providers carry their token between "diff" and the date pair.
+ *
+ * @param {string} cityId - Canonical city_id (may contain dots, e.g. "st.-louis--mo").
+ * @param {string} provider - Provider key ("gsv" emits no token).
+ * @param {string} fromDate - "YYYY-MM-DD" of the earlier run.
+ * @param {string} toDate - "YYYY-MM-DD" of the later run.
+ * @returns {string} e.g. "bend--or_diff_2026-04-01_to_2026-07-01.csv.gz"
+ */
+function diffFilenameFor(cityId, provider, fromDate, toDate) {
+  const token = provider === "gsv" ? "" : `${provider}_`;
+  return `${cityId}_diff_${token}${fromDate}_to_${toDate}.csv.gz`;
+}
+
+/**
+ * Strict validator for a diff detail filename, applied before ANY fetch —
+ * whether the name came from a run's JSON (`change_from_previous_run
+ * .diff_file`) or was constructed by diffFilenameFor. Mirrors
+ * isValidRunFilename's hostile-input stance (no path separators/traversal/
+ * query chars), and the two contracts stay disjoint: isValidRunFilename
+ * continues to REJECT diff names for `?file=`, and this rejects run names —
+ * a poisoned aggregate/stats payload cannot turn the page into a fetch proxy
+ * beyond the published data directory.
+ *
+ * @param {?string} filename - Candidate filename (no directories).
+ * @returns {boolean} True iff it looks like a published diff detail csv.gz.
+ */
+function isValidDiffFilename(filename) {
+  if (typeof filename !== "string") return false;
+  return /^[^/\\?#]+_diff_(?:[a-z]+_)?\d{4}-\d{2}-\d{2}_to_\d{4}-\d{2}-\d{2}\.csv\.gz$/
+    .test(filename);
+}
+
+/**
+ * Fetch a small `.csv.gz` file, decompress it with pako, and return the text.
+ * Diff detail files hold only the churn between two runs, so the streaming
+ * pipeline city.js uses for full run CSVs is unnecessary here.
+ *
+ * @param {string} url - Full URL to the `.csv.gz` resource.
+ * @returns {Promise<string>} The decompressed text.
+ * @throws {Error} On HTTP error or decompression failure.
+ */
+async function fetchGzippedText(url) {
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status} fetching ${url}`);
+  }
+  const compressed = await response.arrayBuffer();
+  return pako.inflate(new Uint8Array(compressed), { to: "string" });
 }
 
 /**
@@ -884,10 +992,15 @@ if (typeof module !== "undefined" && module.exports) {
     parseFilterParam,
     getColor,
     coverageColor,
+    recencyColor,
+    FRESHNESS_BUCKETS,
     escapeHtml,
     isValidRunFilename,
+    diffFilenameFor,
+    isValidDiffFilename,
     getProviderFromFilename,
     fetchGzippedJson,
+    fetchGzippedText,
     streetwalkManifestUrl,
     fetchStreetwalkManifest,
     DEFAULT_STREET_NETWORK_TYPE,
