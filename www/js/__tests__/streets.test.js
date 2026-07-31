@@ -28,6 +28,10 @@ global.adaptCitiesPayload = (raw, provider) => ({
     .map((c) => ({ ...c })),
 });
 
+// streets.js now delegates to the shared table machinery, which it reads as
+// browser globals — mirror that here (must precede the streets.js require).
+Object.assign(global, require("../table-utils.js"));
+
 const {
   cityLabel,
   indexCitiesByProvider,

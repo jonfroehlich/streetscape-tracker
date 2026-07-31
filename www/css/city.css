@@ -3,6 +3,26 @@
  * Styles specific to the per-city detail page (city.html).
  */
 
+/* ── Map surface cursor ─────────────────────────────────────────
+   The city map runs `preferCanvas`, so Leaflet hit-tests its layers itself
+   and toggles the `leaflet-interactive` class (cursor: pointer) on the
+   marker canvas as the pointer enters and leaves each shape. With tens of
+   thousands of ~3px dots — and street lines under them — that fires every
+   few pixels of mouse travel, so the cursor visibly flickers between the
+   pan hand and the pointer while you move across the city.
+
+   The map is one big pannable surface, so pin the pan cursor for it. Dots
+   still open their popup on click; the flickering pointer was never a
+   usable affordance at this density. The second rule keeps Leaflet's
+   grabbing cursor during an actual drag (it must out-specify the first). */
+#map .leaflet-interactive {
+  cursor: grab;
+}
+
+.leaflet-dragging #map .leaflet-interactive {
+  cursor: grabbing;
+}
+
 /* ── Legend (Leaflet control, top-right) ────────────────────── */
 .legend {
   padding: 8px 10px;
@@ -69,6 +89,15 @@
 .legend-stats-sd {
   font-weight: normal;
   color: #666;
+}
+
+/* ── Run-history mini-chart (under the snapshot selector) ────── */
+/* Chart.js needs an explicitly-sized positioned box (maintainAspectRatio is
+   off); one point per run, so 90px is plenty. */
+#run-history-wrap {
+  position: relative;
+  height: 90px;
+  margin-top: 6px;
 }
 
 /* ── Divider between overview and year filter sections ───────── */
@@ -341,6 +370,7 @@
   font-size: 12px;
   line-height: 1.4;
   color: #d6d6d0;
+  text-wrap: balance; /* no widowed last word in the headline sentence */
 }
 
 .street-headline-pct {
@@ -355,9 +385,24 @@
   font-size: 11px;
 }
 
-/* View-mode segmented control + pano-dot toggle */
+/* Panel section rhythm: a hairline above each grouped block. */
+.street-panel-section {
+  padding-top: 8px;
+  border-top: 1px solid #2b3138;
+}
+
+/* View-mode segmented control + the layer checkboxes, one grouped block */
 .street-controls {
   margin: 8px 0 6px;
+}
+
+/* All three checkboxes live on one row (wrapping on narrow panels) so the
+   layer switches read as one group rather than being scattered around the
+   panel. */
+.street-toggles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 12px;
 }
 
 .street-mode {
@@ -400,8 +445,9 @@
   outline-offset: 1px;
 }
 
-.street-dots-toggle {
-  display: block;
+.street-dots-toggle,
+.street-gaps-toggle {
+  display: inline-block;
 }
 
 .street-legend {
@@ -430,7 +476,9 @@
   border-radius: 1px;
 }
 
-/* Uncovered swatch is drawn dashed to match the map lines. */
+/* Uncovered swatch is drawn dashed to match the map lines. The hue rides in
+   on the chip's inline `color` (set by the swatch helper), so the same chip
+   renders slate normally and red while "Highlight gaps" is on. */
 .street-legend i.dashed {
   background-image: repeating-linear-gradient(
     90deg,
@@ -438,8 +486,7 @@
     transparent 3px 6px
   );
   background-color: transparent !important;
-  border: 1px solid #767c85;
-  color: #767c85;
+  border: 1px solid currentColor;
 }
 
 #street-chart-head {

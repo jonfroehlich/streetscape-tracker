@@ -23,6 +23,10 @@ const {
   isKnownMetric,
   parseFilterParam,
   isValidRunFilename,
+  diffFilenameFor,
+  isValidDiffFilename,
+  recencyColor,
+  FRESHNESS_BUCKETS,
   isGoogleCopyright,
   panoDateOrNull,
   googleSharePercent,
@@ -956,4 +960,102 @@ test("METRICS.streets: reads the merged manifest value, shares coverage's bucket
   assert.equal(metric.formatValue(98.4), "98.4%");
   assert.equal(metric.bucketOf(98.4), 9);
   assert.equal(metric.bucketLabel(9), "90–100%");
+});
+
+// --- METRICS.freshness: months-since-collection recency buckets --------------
+
+test("METRICS.freshness: valueOf is months since latest_run_date, null when absent", () => {
+  const metric = METRICS.freshness;
+  assert.equal(metric.valueOf({}), null);
+  assert.equal(metric.valueOf({ latest_run_date: null }), null);
+  // A run dated today is ~0 months old.
+  const today = new Date();
+  const iso = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
+  const months = metric.valueOf({ latest_run_date: iso });
+  assert.ok(months >= 0 && months < 1, `expected ~0 months, got ${months}`);
+});
+
+test("METRICS.freshness: bucket boundaries land at 3/6/12/18 months", () => {
+  const metric = METRICS.freshness;
+  assert.equal(metric.bucketOf(0), 0);
+  assert.equal(metric.bucketOf(3), 0); // inclusive upper edge
+  assert.equal(metric.bucketOf(3.1), 1);
+  assert.equal(metric.bucketOf(6), 1);
+  assert.equal(metric.bucketOf(12), 2);
+  assert.equal(metric.bucketOf(18), 3);
+  assert.equal(metric.bucketOf(19), 4);
+  assert.equal(metric.bucketOf(200), 4); // no age falls off the scale
+});
+
+test("METRICS.freshness: fixed non-negative-integer buckets, freshest first", () => {
+  // parseFilterParam only accepts non-negative integers, so the slider/URL
+  // machinery works iff every bucket id is one.
+  const buckets = METRICS.freshness.legendBuckets([1, 40]);
+  assert.deepEqual(buckets, [0, 1, 2, 3, 4]);
+  for (const b of buckets) {
+    assert.ok(Number.isInteger(b) && b >= 0);
+    assert.equal(typeof METRICS.freshness.bucketLabel(b), "string");
+  }
+  assert.equal(METRICS.freshness.bucketLabel(0), "Last 3 months");
+  assert.equal(buckets.length, FRESHNESS_BUCKETS.length);
+});
+
+test("recencyColor: five distinct colors, clamped outside the bucket range", () => {
+  const colors = [0, 1, 2, 3, 4].map(recencyColor);
+  assert.equal(new Set(colors).size, 5);
+  assert.equal(recencyColor(-1), recencyColor(0));
+  assert.equal(recencyColor(99), recencyColor(4));
+});
+
+test("METRICS.freshness: formatValue reads as a recency, not a bare number", () => {
+  assert.equal(METRICS.freshness.formatValue(0.4), "collected this month");
+  assert.equal(METRICS.freshness.formatValue(17.5), "collected 17.5 months ago");
+});
+
+// --- diffFilenameFor / isValidDiffFilename (change-overlay plumbing) ---------
+
+test("diffFilenameFor: GSV is tokenless, other providers carry their token", () => {
+  // Mirrors diff.generate_diff_filename (diff.py) — the provider token sits
+  // between "diff" and the date pair, and gsv emits none so pre-provider
+  // names stay stable.
+  assert.equal(
+    diffFilenameFor("bend--or", "gsv", "2026-04-01", "2026-07-01"),
+    "bend--or_diff_2026-04-01_to_2026-07-01.csv.gz"
+  );
+  assert.equal(
+    diffFilenameFor("bend--or", "mapillary", "2026-04-01", "2026-07-01"),
+    "bend--or_diff_mapillary_2026-04-01_to_2026-07-01.csv.gz"
+  );
+});
+
+test("isValidDiffFilename: accepts published diff names, dotted city ids included", () => {
+  assert.ok(isValidDiffFilename("bend--or_diff_2026-04-01_to_2026-07-01.csv.gz"));
+  assert.ok(isValidDiffFilename("bend--or_diff_mapillary_2026-04-01_to_2026-07-01.csv.gz"));
+  // sanitize_city_query_str preserves interior periods (st.-louis).
+  assert.ok(isValidDiffFilename("st.-louis--mo_diff_2025-02-03_to_2026-07-01.csv.gz"));
+  // Constructed and validated names agree by construction.
+  assert.ok(isValidDiffFilename(diffFilenameFor("a--b", "gsv", "2025-01-01", "2025-04-01")));
+});
+
+test("isValidDiffFilename: rejects traversal, hostile chars, and non-diff names", () => {
+  assert.equal(isValidDiffFilename(null), false);
+  assert.equal(isValidDiffFilename(""), false);
+  assert.equal(isValidDiffFilename("../../../etc/passwd"), false);
+  assert.equal(isValidDiffFilename("a/b_diff_2026-04-01_to_2026-07-01.csv.gz"), false);
+  assert.equal(isValidDiffFilename("a\\b_diff_2026-04-01_to_2026-07-01.csv.gz"), false);
+  assert.equal(isValidDiffFilename("a?x=1_diff_2026-04-01_to_2026-07-01.csv.gz"), false);
+  assert.equal(isValidDiffFilename("a#f_diff_2026-04-01_to_2026-07-01.csv.gz"), false);
+  assert.equal(isValidDiffFilename("bend--or_diff_2026-04-01.csv.gz"), false); // no _to_ pair
+  assert.equal(isValidDiffFilename("bend--or_diff_2026-04-01_to_2026-07-01.csv"), false);
+});
+
+test("run and diff filename contracts stay disjoint", () => {
+  // ?file= must never fetch a diff, and the diff path must never accept a
+  // run file — each validator rejects the other's names.
+  const runName = "bend--or_width_5000_height_5000_step_20_2026-07-05.csv.gz";
+  const diffName = "bend--or_diff_2026-04-01_to_2026-07-01.csv.gz";
+  assert.ok(isValidRunFilename(runName));
+  assert.equal(isValidDiffFilename(runName), false);
+  assert.ok(isValidDiffFilename(diffName));
+  assert.equal(isValidRunFilename(diffName), false);
 });

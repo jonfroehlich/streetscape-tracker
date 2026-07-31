@@ -28,8 +28,9 @@
   <header class="site-header">
     <a class="site-brand" href="index.html">Streetscape Tracker</a>
     <nav class="site-nav" aria-label="Main">
-      <a href="index.html" aria-current="page">Map</a>
-      <a href="streets.html">Streets</a>
+      <a href="index.html" aria-current="page" title="World map of city imagery coverage">Map</a>
+      <a href="grid.html" title="Per-city table of grid-sampling coverage: share of area sample points with imagery">Grid</a>
+      <a href="streets.html" title="Per-city table of road-walk coverage: fraction of the street network driven">Streets</a>
     </nav>
     <a class="site-external" href="https://github.com/jonfroehlich/streetscape-tracker"
        target="_blank" rel="noopener">About &#8599;</a>
@@ -40,11 +41,11 @@
     <legend class="visually-hidden">Imagery provider</legend>
     <label>
       <input type="radio" name="provider" value="gsv" checked>
-      <span>Google Street View</span>
+      <span title="Official Google Street View metadata, sampled at each grid point">Google Street View</span>
     </label>
     <label>
       <input type="radio" name="provider" value="mapillary">
-      <span>Mapillary</span>
+      <span title="Crowdsourced Mapillary imagery: a census of every 360° panorama">Mapillary</span>
     </label>
   </fieldset>
 
@@ -53,11 +54,11 @@
     <legend class="visually-hidden">Color cities by</legend>
     <label>
       <input type="radio" name="metric" value="age" checked>
-      <span>Median age</span>
+      <span title="Median age of each city's panoramas — bright yellow (new) through dark red (old)">Median age</span>
     </label>
     <label>
       <input type="radio" name="metric" value="coverage">
-      <span>Coverage</span>
+      <span title="Share of each city's grid sample points with a 360° panorama">Coverage</span>
     </label>
     <label>
       <input type="radio" name="metric" value="coverage_any">
@@ -66,6 +67,10 @@
     <label>
       <input type="radio" name="metric" value="streets">
       <span title="Share of the city's OSM street network driven, from road-walk collection. Only available for cities that have been walked — see the Streets page.">Street coverage</span>
+    </label>
+    <label>
+      <input type="radio" name="metric" value="freshness">
+      <span title="How recently each city's data was collected — bright (just collected) through dark (stale)">Freshness</span>
     </label>
   </fieldset>
 
@@ -93,18 +98,32 @@
 
   <div id="stats" aria-live="polite"></div>
 
-  <div class="chart-container" aria-label="Scatter-plot charts">
-    <div class="scatter-plot-container">
-      <canvas id="panoScatter" role="img"
-              aria-label="Scatter plot of total panorama count versus median age for each city"></canvas>
-    </div>
-    <div class="scatter-plot-container">
-      <canvas id="areaScatter" role="img"
-              aria-label="Scatter plot of city area versus median age for each city"></canvas>
+  <!-- Right rail: legend on top, charts below, one fixed flex column — the
+       two can never overlap, and collapsing the charts gives the legend the
+       whole rail. The rail itself ignores pointer events so the map stays
+       draggable in the empty space between the panels. -->
+  <div id="right-rail">
+    <div id="legend" class="legend" role="group" aria-label="Median age legend"></div>
+
+    <div class="chart-container" aria-label="Scatter-plot charts">
+      <div id="chart-drawer-head">
+        <span id="chart-drawer-title">City scatter plots</span>
+        <button type="button" id="chart-drawer-toggle" aria-expanded="true"
+                aria-controls="chart-drawer-body" aria-label="Minimize charts"
+                title="Minimize the scatter plots (gives the legend more room)">–</button>
+      </div>
+      <div id="chart-drawer-body">
+        <div class="scatter-plot-container">
+          <canvas id="panoScatter" role="img"
+                  aria-label="Scatter plot of total panorama count versus median age for each city"></canvas>
+        </div>
+        <div class="scatter-plot-container">
+          <canvas id="areaScatter" role="img"
+                  aria-label="Scatter plot of city area versus median age for each city"></canvas>
+        </div>
+      </div>
     </div>
   </div>
-
-  <div id="legend" class="legend" role="group" aria-label="Median age legend"></div>
 
   <!-- Scripts (order matters: libs → shared utils → page logic) -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"
@@ -112,6 +131,16 @@
           crossorigin="anonymous"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"
           integrity="sha512-ZwR1/gSZM3ai6vCdI+LVF1zSq/5HznD3ZSTk7kajkaj4D292NLuduDCO1c/NT8Id+jE58KYLKT7hXnbtryGmMg=="
+          crossorigin="anonymous"></script>
+  <!-- Scatter-plot zoom/pan (wheel + pinch + drag; double-click resets).
+       hammer.js supplies the touch gestures; the zoom plugin's UMD build
+       self-registers with Chart.js, so load order is Chart.js → hammer →
+       plugin. -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/hammer.js/2.0.8/hammer.min.js"
+          integrity="sha512-UXumZrZNiOwnTcZSHLOfcTs0aos2MzBWHXOHOuB0J/R44QB0dwY5JgfbvljXcklVf65Gc4El6RjZ+lnwd2az2g=="
+          crossorigin="anonymous"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/chartjs-plugin-zoom/2.0.1/chartjs-plugin-zoom.min.js"
+          integrity="sha512-wUYbRPLV5zs6IqvWd88HIqZU/b8TBx+I8LEioQ/UC0t5EMCLApqhIAnUg7EsAzdbhhdgW07TqYDdH3QEXRcPOQ=="
           crossorigin="anonymous"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.1.0/pako.min.js"
           integrity="sha512-g2TeAWw5GPnX7z0Kn8nFbYfeHcvAu/tx6d6mrLe/90mkCxO+RcptyYpksUz35EO337F83bZwcmUyHiHamspkfg=="

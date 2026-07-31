@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Streetscape Tracker — Grid Coverage</title>
+
+  <!-- Stylesheets (CDN assets carry SRI hashes: a compromised or tampered
+       CDN response is refused by the browser rather than executed).
+       No Leaflet here — this page is a list, not a map; each row links to
+       the city page for the actual map. -->
+  <link rel="stylesheet" href="css/streetscape-shared.css" />
+  <link rel="stylesheet" href="css/data-table.css" />
+</head>
+<body class="streets-page">
+  <!-- Google Analytics -->
+  <script async src="https://www.googletagmanager.com/gtag/js?id=G-ZSQGNSTEES"></script>
+  <script>
+    window.dataLayer = window.dataLayer || [];
+    function gtag() { dataLayer.push(arguments); }
+    gtag("js", new Date());
+    gtag("config", "G-ZSQGNSTEES");
+  </script>
+
+  <!-- Site header (shared markup with index.html / city.html / streets.html;
+       styles live in streetscape-shared.css) -->
+  <header class="site-header">
+    <a class="site-brand" href="index.html">Streetscape Tracker</a>
+    <nav class="site-nav" aria-label="Main">
+      <a href="index.html" title="World map of city imagery coverage">Map</a>
+      <a href="grid.html" aria-current="page"
+         title="Per-city table of grid-sampling coverage: share of area sample points with imagery">Grid</a>
+      <a href="streets.html" title="Per-city table of road-walk coverage: fraction of the street network driven">Streets</a>
+    </nav>
+    <a class="site-external" href="https://github.com/jonfroehlich/streetscape-tracker"
+       target="_blank" rel="noopener">About &#8599;</a>
+  </header>
+
+  <main class="streets-main">
+    <h1>Grid coverage</h1>
+
+    <div class="streets-intro">
+      <p>
+        Every city in the tracker is sampled on a fixed geographic
+        <strong>grid</strong>: a lattice of points around the city center,
+        each asked for its nearest street-level panorama. Grid coverage is
+        the share of those sample points with imagery — an
+        <strong>area</strong> measure, comparable across providers because
+        both are queried on the same frozen grid. The
+        <a href="streets.html">Streets page</a> measures coverage by
+        <strong>road network</strong> instead: what fraction of a city's
+        streets have actually been driven.
+      </p>
+      <p class="streets-caveat">
+        A city collected by both Google Street View and Mapillary appears
+        once per provider. Coverage percentages are cross-provider
+        comparable; raw panorama counts are not — GSV samples the nearest
+        pano per grid point while Mapillary is a census of every 360° pano.
+        Sort any column by clicking its header.
+      </p>
+    </div>
+
+    <div id="grid-status" class="table-status" role="status" aria-live="polite">
+      Loading city collections…
+    </div>
+
+    <div id="grid-table-wrap" class="streets-table-wrap" hidden>
+      <table class="streets-table">
+        <caption id="grid-caption"></caption>
+        <!-- Sortable headers: the <button> is what carries the click and the
+             keyboard focus (a bare click handler on <th> is unreachable by
+             keyboard); table-utils.js keeps aria-sort in step with the active
+             column. The ▲/▼ glyph is decorative, hence aria-hidden. -->
+        <thead>
+          <tr>
+            <th scope="col" data-key="label" aria-sort="none">
+              <button type="button">City <span class="sort-arrow" aria-hidden="true"></span></button>
+            </th>
+            <th scope="col" data-key="providerLabel" aria-sort="none">
+              <button type="button" title="Imagery provider. Each provider is an independent run series on the same frozen grid.">
+                Provider <span class="sort-arrow" aria-hidden="true"></span></button>
+            </th>
+            <th scope="col" data-key="pct" aria-sort="none">
+              <button type="button" title="Share of the city's grid sample points with a 360° panorama">
+                Grid coverage <span class="sort-arrow" aria-hidden="true"></span></button>
+            </th>
+            <th scope="col" data-key="pctAny" aria-sort="none">
+              <button type="button" title="Including flat/perspective imagery (Mapillary); equals Grid coverage for Google Street View">
+                Any imagery <span class="sort-arrow" aria-hidden="true"></span></button>
+            </th>
+            <th scope="col" data-key="medianAge" aria-sort="none">
+              <button type="button" title="Median age of the city's panoramas at its latest snapshot">
+                Median age <span class="sort-arrow" aria-hidden="true"></span></button>
+            </th>
+            <th scope="col" data-key="panos" aria-sort="none">
+              <button type="button" title="Unique panoramas in the latest snapshot: official © Google panos for GSV, all 360° panos for Mapillary. Not comparable across providers (sample vs census).">
+                Panoramas <span class="sort-arrow" aria-hidden="true"></span></button>
+            </th>
+            <th scope="col" data-key="collected" aria-sort="none">
+              <button type="button" title="Date of the latest collection run — how fresh this row's data is">
+                Last collected <span class="sort-arrow" aria-hidden="true"></span></button>
+            </th>
+            <th scope="col" data-key="snapshots" aria-sort="none">
+              <button type="button" title="Number of dated collection runs; repeat runs enable change tracking over time">
+                Snapshots <span class="sort-arrow" aria-hidden="true"></span></button>
+            </th>
+            <th scope="col"><span class="visually-hidden">Link to city map</span></th>
+          </tr>
+        </thead>
+        <tbody id="grid-tbody"></tbody>
+      </table>
+    </div>
+  </main>
+
+  <!-- Scripts (order matters: libs → shared utils → page logic) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.1.0/pako.min.js"
+          integrity="sha512-g2TeAWw5GPnX7z0Kn8nFbYfeHcvAu/tx6d6mrLe/90mkCxO+RcptyYpksUz35EO337F83bZwcmUyHiHamspkfg=="
+          crossorigin="anonymous"></script>
+  <script src="js/streetscape-utils.js"></script>
+  <script src="js/table-utils.js"></script>
+  <script src="js/grid.js"></script>
+</body>
+</html>

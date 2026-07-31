@@ -28,6 +28,11 @@ const {
   STREET_COVERED_COLOR,
   STREET_COVERED_NODATE_COLOR,
   STREET_TYPE_MINOR_COLOR,
+  STREET_GAP_HIGHLIGHT_COLOR,
+  styleWithGapHighlight,
+  orderedStreetTypes,
+  labelTextColorFor,
+  chartBarBaseColor,
 } = require("../street-coverage.js");
 
 test("streetsUrlForDataFile swaps .csv.gz for _streets.json.gz under the data base URL", () => {
@@ -213,13 +218,16 @@ test("withStreetAlpha: hex to rgba() with the given alpha", () => {
 // ── Fractional coverage (road-walk / streetwalk artifact, #99/#155) ──────────
 
 test("fractionColor: 0 is the pale end, 1 is the full covered green, monotonic between", () => {
-  // Endpoints are the ramp anchors exactly.
-  assert.equal(fractionColor(0), "rgb(191, 232, 212)"); // STREET_PARTIAL_LOW_COLOR #bfe8d4
+  // Endpoints are the ramp anchors exactly (3-stop ramp: low → mid → covered).
+  assert.equal(fractionColor(0), "rgb(226, 245, 234)"); // STREET_PARTIAL_LOW_COLOR #e2f5ea
+  assert.equal(fractionColor(0.5), "rgb(124, 207, 159)"); // STREET_PARTIAL_MID_COLOR #7ccf9f
   assert.equal(fractionColor(1), "rgb(47, 185, 116)"); // STREET_COVERED_COLOR #2fb974
-  // Green channel decreases as fraction rises (232 → 185): a simple monotonicity check.
+  // Green channel decreases as fraction rises (245 → 207 → 185): monotonicity.
   const g = (c) => Number(c.match(/rgb\(\d+, (\d+),/)[1]);
-  assert.ok(g(fractionColor(0)) > g(fractionColor(0.5)));
-  assert.ok(g(fractionColor(0.5)) > g(fractionColor(1)));
+  assert.ok(g(fractionColor(0)) > g(fractionColor(0.25)));
+  assert.ok(g(fractionColor(0.25)) > g(fractionColor(0.5)));
+  assert.ok(g(fractionColor(0.5)) > g(fractionColor(0.75)));
+  assert.ok(g(fractionColor(0.75)) > g(fractionColor(1)));
   // Out-of-range clamps rather than extrapolating.
   assert.equal(fractionColor(-1), fractionColor(0));
   assert.equal(fractionColor(2), fractionColor(1));
@@ -525,4 +533,62 @@ test("renderStreetCoverage: an artifact with no features or no metadata block ad
   );
   assert.equal(env.added, 0);
   teardownRenderEnv();
+});
+
+// --- gap highlight ("Highlight gaps" toggle) --------------------------------
+
+test("styleWithGapHighlight: uncovered flips to the red gap color, dashed, full opacity", () => {
+  const base = styleStreetByType({ properties: { highway: "residential", covered: false } });
+  const s = styleWithGapHighlight(base, false);
+  assert.equal(s.color, STREET_GAP_HIGHLIGHT_COLOR);
+  assert.equal(s.opacity, 1);
+  assert.equal(s.dashArray, "4 4");
+  assert.equal(s.weight, 3);
+});
+
+test("styleWithGapHighlight: covered keeps its base style but fades to a whisper", () => {
+  const base = styleStreetByCoverage({ properties: { covered: true, coverage_fraction: 0.8 } });
+  const s = styleWithGapHighlight(base, true);
+  assert.equal(s.color, base.color); // hue preserved — only emphasis changes
+  assert.equal(s.opacity, 0.15);
+  assert.equal(s.dashArray, undefined);
+});
+
+// --- orderedStreetTypes (chart row order = legend order = artifact order) ----
+
+test("orderedStreetTypes: canonical hierarchy, not length order", () => {
+  const byType = {
+    residential: { length_km: 100 },
+    motorway: { length_km: 1 },
+    footway: { length_km: 500 },
+    alley: { length_km: 2 },
+  };
+  assert.deepEqual(orderedStreetTypes(byType), [
+    "motorway",
+    "residential",
+    "alley",
+    "footway",
+  ]);
+});
+
+test("orderedStreetTypes: unknown buckets sort last", () => {
+  assert.deepEqual(orderedStreetTypes({ zzz_mystery: {}, trunk: {} }), ["trunk", "zzz_mystery"]);
+});
+
+// --- chart bar colors + in-bar label ink ------------------------------------
+
+test("chartBarBaseColor: covered wears the row's type hue, uncovered the gap slate", () => {
+  assert.equal(chartBarBaseColor(0, "residential"), STREET_TYPE_COLORS.residential);
+  assert.equal(chartBarBaseColor(0, "alley"), STREET_TYPE_COLORS.service); // family hue
+  assert.equal(chartBarBaseColor(1, "residential"), STREET_UNCOVERED_COLOR);
+});
+
+test("labelTextColorFor: dark ink on light fills, white on dark fills", () => {
+  assert.equal(labelTextColorFor("#e2f5ea"), "#0e1a12"); // pale green
+  assert.equal(labelTextColorFor(STREET_TYPE_COLORS.residential), "#0e1a12"); // coral, light
+  assert.equal(labelTextColorFor(STREET_TYPE_COLORS.secondary), "#fff"); // dark green
+  // Medium hues sit near the boundary — motorway blue takes dark ink, which
+  // is its higher-contrast pairing (≈4.6:1 vs ≈3.7:1 for white).
+  assert.equal(labelTextColorFor(STREET_TYPE_COLORS.motorway), "#0e1a12");
+  assert.equal(labelTextColorFor("#000000"), "#fff");
 });
