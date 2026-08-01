@@ -25,3 +25,7 @@ cities/SUB-IP-EST2023-POP.csv
 *.db-shm
 __pycache__/
 .pytest_cache/
+# Experiment artifacts (snapshots, metrics, generated reports/figures). The
+# findings that matter are written up in docs/experiments/; these are the raw
+# outputs, and they stay out of data/ so the publisher can't rsync them public.
+/experiments/

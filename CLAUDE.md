@@ -110,6 +110,7 @@ Credentials in `.env`, loaded by `streetscape_metadata_tracker/config.py` per pr
 
 ## Notes
 
+- **Measured findings are recorded in `docs/experiments/`** — one writeup per settled question, with the decision it justifies, the caveats, and how to replicate it. So far: `grid-density.md` (issue #106 — why production stays on the 20 m grid; below ~10 m you buy redundancy, not information, since official panos sit ~10 m apart). The generating code is `scripts/{topic}_{collect,analyze,common}.py` (kept so the result can be reproduced, not because it runs routinely), its test pins the sampling invariant, and raw outputs land in the gitignored `/experiments/{topic}/` — **never** under `data/`, which the publisher rsyncs to the public web server. Answer "should we sample finer / differently?" questions from these before re-running anything.
 - Architecture decisions are recorded in `docs/adr/`. Notably **ADR 0001: stay fully static, no backend** — the public site has zero server-side runtime by design; large/dense-city rendering (#77, #58) is fixed with static artifacts (grid-binned overview → PMTiles), never a server.
 - `data/` contains thousands of files — avoid globbing/listing it wholesale.
 - Legacy pre-2026 data files are undated; they're registered as `is_baseline=1` runs by the migration script and are never renamed (published URLs stay stable).
