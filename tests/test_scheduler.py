@@ -8,7 +8,10 @@ import signal
 from datetime import date
 from pathlib import Path
 
+import pytest
+
 from streetscape_metadata_tracker import db
+from streetscape_metadata_tracker import scheduler as _sched
 from streetscape_metadata_tracker.naming import (
     generate_streetwalk_filename,
     streetwalk_coverage_filename,
@@ -20,6 +23,7 @@ from streetscape_metadata_tracker.scheduler import (
     _reconcile_orphaned_run,
     _reconcile_orphaned_walk,
     build_parser,
+    cmd_fetch_driving_plan,
     cmd_reconcile_walks,
     estimate_requests,
     load_scheduler_config,
@@ -28,6 +32,19 @@ from streetscape_metadata_tracker.scheduler import (
 from tests.conftest import make_city_df, write_city_csv_gz
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# The real nightly hook, saved before the autouse stub below replaces it so the
+# dedicated driving-plan tests can exercise it.
+_REAL_DRIVING_PLAN_HOOK = _sched._fetch_driving_plan_nightly
+
+
+@pytest.fixture(autouse=True)
+def _no_driving_plan_fetch(monkeypatch):
+    """run-due snapshots the driving-plan feed before the city loop (issue
+    #176). Stub the hook for every test so the suite stays hermetic — no
+    network, no writes to the real archive/ dir; the driving-plan tests
+    restore _REAL_DRIVING_PLAN_HOOK explicitly."""
+    monkeypatch.setattr(_sched, "_fetch_driving_plan_nightly", lambda cfg, conn, today: None)
 
 
 def _register(conn, name, width=5000, height=5000, step=20):
@@ -395,6 +412,11 @@ def test_makelab1_production_config_is_wired():
     assert "/cse/web/" not in cfg.db_path and "/cse/web/" not in cfg.data_dir
     # Shared-host resource guard is active in production.
     assert cfg.resource_guard.enabled
+    # Nightly driving-plan snapshot (issue #176): on, and archived on lab
+    # storage OUTSIDE data/ so the publish rsync never sees it.
+    assert cfg.driving_plan.enabled
+    assert "/archive/gsv_driving_plan" in cfg.driving_plan.archive_dir
+    assert not cfg.driving_plan.archive_dir.startswith(cfg.data_dir)
     # The batch deadline must stay strictly below the unit's TimeoutStartSec, or
     # systemd kills the loop first and the night publishes nothing (#167). These
     # two live in different files and only mean something together.
@@ -1671,3 +1693,152 @@ def test_a_plain_bool_from_run_one_city_still_works(conn, tmp_path, monkeypatch)
     ).fetchone()
     assert row["consecutive_failures"] == 1
     assert "subprocess failed on 2026-07-02" in row["last_error"]  # the fallback
+
+
+# ── Driving-plan feed snapshots (issue #176) ───────────────────────────────
+
+
+_PLAN_RECORD = {
+    "country": "United States",
+    "code": "US",
+    "svspc": "SV",
+    "region": "Kentucky",
+    "districts": "Jefferson, Bullitt",
+    "publish": "Yes",
+    "datestart": "2026-02-02T08:00:00.000Z",
+    "dateend": "2026-12-31T08:00:00.000Z",
+}
+
+
+def test_config_parses_driving_plan_section(tmp_path):
+    p = tmp_path / "s.toml"
+    p.write_text(
+        '[driving_plan]\nenabled = false\narchive_dir = "/somewhere/plans"\n'
+        'url = "https://example.com/feed.json"\ntimeout_s = 10.0\n'
+    )
+    cfg = load_scheduler_config(str(p))
+    assert not cfg.driving_plan.enabled
+    assert cfg.driving_plan.archive_dir == "/somewhere/plans"
+    assert cfg.driving_plan.url == "https://example.com/feed.json"
+    assert cfg.driving_plan.timeout_s == 10.0
+
+
+def test_config_driving_plan_defaults_when_section_missing(tmp_path):
+    """No [driving_plan] section means ON with the repo-local archive dir, so
+    prod picks the feature up on deploy without a config edit."""
+    p = tmp_path / "s.toml"
+    p.write_text("[schedule]\ncycle_days = 90\n")
+    cfg = load_scheduler_config(str(p))
+    assert cfg.driving_plan.enabled
+    assert cfg.driving_plan.archive_dir.endswith(os.path.join("archive", "gsv_driving_plan"))
+
+
+def test_run_due_snapshots_driving_plan_even_on_a_zero_due_night(conn, monkeypatch):
+    """The hook sits BEFORE the city loop, so a night with nothing due still
+    archives the feed — the whole point of a daily observation series."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    monkeypatch.setattr(sched, "_fetch_driving_plan_nightly", _REAL_DRIVING_PLAN_HOOK)
+    ingested = []
+    monkeypatch.setattr(
+        sched.driving_plan,
+        "ingest",
+        lambda c, **kw: ingested.append(kw["fetch_date"]) or _ingest_result(),
+    )
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+
+    rc = sched.cmd_run_due(SchedulerConfig(publish_enabled=False), today=date(2026, 7, 2))
+
+    assert ingested == [date(2026, 7, 2)]
+    assert rc == 0
+
+
+def _ingest_result(**overrides):
+    from streetscape_metadata_tracker.driving_plan import IngestResult
+
+    base = dict(
+        snapshot_id=1,
+        fetch_date="2026-07-02",
+        skipped=False,
+        changed=False,
+        record_count=1,
+        entry_count=0,
+    )
+    base.update(overrides)
+    return IngestResult(**base)
+
+
+def test_driving_plan_failure_never_fails_the_night(conn, monkeypatch):
+    """The feed is an undocumented asset with no uptime contract; it breaking
+    must not cost a night of collection (the issue #167 posture)."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    _register(conn, "Alpha", width=1000, height=1000, step=20)
+    db.assign_schedule(conn, 90)
+    conn.execute("UPDATE schedule_state SET last_success_at = NULL")
+    conn.commit()
+
+    monkeypatch.setattr(sched, "_fetch_driving_plan_nightly", _REAL_DRIVING_PLAN_HOOK)
+
+    def boom(c, **kw):
+        raise RuntimeError("feed gone")
+
+    monkeypatch.setattr(sched.driving_plan, "ingest", boom)
+    ran, published = [], []
+    monkeypatch.setattr(
+        sched,
+        "_run_one_city",
+        lambda cfg, city, today, provider="gsv", **kw: ran.append(city.city_id) or True,
+    )
+    _stub_tail(monkeypatch, sched, conn, published)
+
+    rc = sched.cmd_run_due(_publishing_cfg(), today=date(2026, 7, 2))
+
+    assert len(ran) == 1, "the city loop must still run"
+    assert published == ["aggregate", "manifest", "publish"]
+    assert rc == 0, "a plan-fetch failure alone is not an unhealthy night"
+
+
+def test_driving_plan_hook_respects_dry_run_and_enabled_flag(conn, monkeypatch, capsys):
+    from streetscape_metadata_tracker import scheduler as sched
+
+    monkeypatch.setattr(sched, "_fetch_driving_plan_nightly", _REAL_DRIVING_PLAN_HOOK)
+    ingested = []
+    monkeypatch.setattr(
+        sched.driving_plan, "ingest", lambda c, **kw: ingested.append(1) or _ingest_result()
+    )
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+
+    # Dry run: announced but not fetched.
+    rc = sched.cmd_run_due(SchedulerConfig(), dry_run=True, today=date(2026, 7, 2))
+    assert rc == 0 and not ingested
+    assert "driving-plan" in capsys.readouterr().out
+
+    # Disabled: not fetched, not announced.
+    cfg = SchedulerConfig()
+    cfg.driving_plan.enabled = False
+    rc = sched.cmd_run_due(cfg, today=date(2026, 7, 2))
+    assert rc == 0 and not ingested
+
+
+def test_cmd_fetch_driving_plan_backfills_from_file(conn, monkeypatch, tmp_path, capsys):
+    """--from-file + --date ingests an already-saved raw feed — the handle for
+    cataloging the manual snapshot kept on prod before this existed."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    saved = tmp_path / "data.json"
+    saved.write_text(json.dumps([_PLAN_RECORD]))
+    archive = tmp_path / "archive"
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+    cfg = SchedulerConfig()
+    cfg.driving_plan.archive_dir = str(archive)
+
+    rc = cmd_fetch_driving_plan(cfg, from_file=str(saved), target_date=date(2026, 7, 31))
+
+    assert rc == 0
+    assert "CHANGED" in capsys.readouterr().out
+    row = conn.execute("SELECT * FROM driving_plan_snapshots").fetchone()
+    assert row["fetch_date"] == "2026-07-31" and row["changed"] == 1
+    assert (archive / "gsv_driving_plan_2026-07-31.json.gz").exists()
+    districts = {r["district"] for r in conn.execute("SELECT district FROM driving_plan_entries")}
+    assert districts == {"Jefferson", "Bullitt"}

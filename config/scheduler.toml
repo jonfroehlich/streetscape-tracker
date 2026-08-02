@@ -191,3 +191,19 @@ min_available_memory_gb = 8.0
 max_load_per_core = 0.9
 # Never throttle concurrency below this floor.
 min_connection_limit = 5
+
+[driving_plan]
+# Nightly snapshot of Google's published Street View driving-plan feed
+# (issue #176): a single mutable URL Google overwrites in place, so revisions
+# are lost to anyone not archiving. One unauthenticated request per night —
+# no API key, no provider budget — run by run-due before the city loop (so it
+# happens even on zero-due nights and can't be eaten by the batch deadline).
+# A snapshot catalog row is written every fetch; the gzipped artifact and the
+# per-district DB entries only when the feed content actually changed.
+enabled = true
+# Artifacts live OUTSIDE data/ on purpose: data/ is rsynced to the public web
+# server and its whitelist publishes every *.json.gz — archiving there would
+# republish Google's content.
+#archive_dir = "archive/gsv_driving_plan"   # default: <repo>/archive/gsv_driving_plan
+#url = "https://www.google.com/streetview/static/feed/driving/data.json"
+#timeout_s = 60.0

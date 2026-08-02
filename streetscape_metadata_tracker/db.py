@@ -27,7 +27,7 @@ from .naming import sanitize_city_query_str
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS cities (
@@ -201,6 +201,51 @@ CREATE TABLE IF NOT EXISTS street_walks (
     -- park paths, cycleways, steps), and both can be walked the same night.
     UNIQUE (city_id, provider, network_type, run_date)
 );
+
+-- Snapshots of Google's published Street View driving-plan feed (issue #176).
+-- The feed is a single mutable URL Google overwrites in place, so revisions
+-- are unobservable without our own dated archive. One row per fetch, even when
+-- the content is unchanged — the row IS the observation "we looked, it was X".
+-- The gzipped artifact and the exploded entries below exist only for fetches
+-- whose sha256 differs from the previous snapshot. First catalog family (bar
+-- api_usage) that is not city-keyed: the unit of observation is Google's whole
+-- worldwide plan. Artifacts live OUTSIDE data/ (archive/gsv_driving_plan/)
+-- because data/ is rsynced to the public web server and the whitelist would
+-- republish Google's content.
+CREATE TABLE IF NOT EXISTS driving_plan_snapshots (
+    snapshot_id       INTEGER PRIMARY KEY,
+    fetch_date        TEXT NOT NULL UNIQUE,
+    fetched_at        TEXT NOT NULL,
+    sha256            TEXT NOT NULL,
+    record_count      INTEGER NOT NULL,
+    changed           INTEGER NOT NULL,
+    artifact_filename TEXT,
+    source_url        TEXT
+);
+
+-- One row per (feed record, district): the feed's `districts` field is a
+-- comma-joined string (US districts are counties, which join onto catalog
+-- places). `publish` is stored verbatim and NEVER filtered at ingest — the
+-- Yes -> No transition across snapshots is the campaign-closed signal, data in
+-- its own right. Dirty datestart/dateend values (e.g. '13/1/19', 'Septemb…')
+-- keep the raw string beside a NULL parsed date; a row is never dropped
+-- because its date failed to parse. Rows exist only for changed snapshots.
+CREATE TABLE IF NOT EXISTS driving_plan_entries (
+    entry_id       INTEGER PRIMARY KEY,
+    snapshot_id    INTEGER NOT NULL REFERENCES driving_plan_snapshots(snapshot_id),
+    country        TEXT,
+    code           TEXT,
+    svspc          TEXT,
+    region         TEXT,
+    district       TEXT,
+    publish        TEXT,
+    date_start_raw TEXT,
+    date_start     TEXT,
+    date_end_raw   TEXT,
+    date_end       TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_dpe_snapshot ON driving_plan_entries(snapshot_id);
+CREATE INDEX IF NOT EXISTS idx_dpe_country_region ON driving_plan_entries(country, region);
 """
 
 # v1 → v2: add the provider dimension. Three tables need constraint changes
@@ -495,6 +540,13 @@ def init_schema(conn: sqlite3.Connection) -> None:
         user_version = 8
     if user_version == 8:
         _migrate_v8_to_v9(conn)
+        user_version = 9
+    # v9 -> v10 is purely additive (driving_plan_snapshots / driving_plan_entries,
+    # issue #176), so like v2 -> v3 it needs no rebuild migration: the CREATE
+    # TABLE IF NOT EXISTS in _SCHEMA creates the tables on any older catalog,
+    # and the version stamp below records the upgrade.
+    if user_version == 9:
+        user_version = 10
     conn.executescript(_SCHEMA)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
@@ -1366,3 +1418,124 @@ def record_attempt(
             (city_id, provider, now, error, now, error),
         )
     conn.commit()
+
+
+# ── GSV driving-plan feed (issue #176) ─────────────────────────────────────
+
+
+def register_driving_plan_snapshot(
+    conn: sqlite3.Connection,
+    *,
+    fetch_date: date,
+    sha256: str,
+    record_count: int,
+    changed: bool,
+    artifact_filename: str | None,
+    source_url: str | None = None,
+) -> int:
+    """
+    Catalog one fetch of the driving-plan feed. Idempotent on fetch_date: a
+    forced same-day re-fetch replaces the prior row rather than erroring, since
+    a snapshot is a full re-census of the feed, not an incremental append.
+
+    Returns the snapshot_id.
+    """
+    conn.execute(
+        """INSERT INTO driving_plan_snapshots
+           (fetch_date, fetched_at, sha256, record_count, changed,
+            artifact_filename, source_url)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(fetch_date) DO UPDATE SET
+             fetched_at = excluded.fetched_at,
+             sha256 = excluded.sha256,
+             record_count = excluded.record_count,
+             changed = excluded.changed,
+             artifact_filename = excluded.artifact_filename,
+             source_url = excluded.source_url""",
+        (
+            fetch_date.isoformat(),
+            utc_now_iso(),
+            sha256,
+            record_count,
+            int(changed),
+            artifact_filename,
+            source_url,
+        ),
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT snapshot_id FROM driving_plan_snapshots WHERE fetch_date = ?",
+        (fetch_date.isoformat(),),
+    ).fetchone()
+    return row["snapshot_id"]
+
+
+def replace_driving_plan_entries(
+    conn: sqlite3.Connection, snapshot_id: int, entries: list[tuple]
+) -> int:
+    """
+    Replace the exploded per-district entries of one snapshot. Delete-then-
+    insert so a forced same-day re-ingest is idempotent rather than
+    duplicating rows. Each entry tuple must match the column order below.
+
+    Returns the number of rows inserted.
+    """
+    conn.execute("DELETE FROM driving_plan_entries WHERE snapshot_id = ?", (snapshot_id,))
+    conn.executemany(
+        """INSERT INTO driving_plan_entries
+           (snapshot_id, country, code, svspc, region, district, publish,
+            date_start_raw, date_start, date_end_raw, date_end)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        entries,
+    )
+    conn.commit()
+    return len(entries)
+
+
+def get_latest_driving_plan_snapshot(
+    conn: sqlite3.Connection, *, before_date: str | None = None
+) -> sqlite3.Row | None:
+    """
+    Most recent driving-plan snapshot, or None. `before_date` (exclusive,
+    'YYYY-MM-DD') lets ingest compare against the snapshot preceding today's
+    own row, so a forced re-fetch never compares against itself.
+    """
+    if before_date is not None:
+        return conn.execute(
+            """SELECT * FROM driving_plan_snapshots WHERE fetch_date < ?
+               ORDER BY fetch_date DESC LIMIT 1""",
+            (before_date,),
+        ).fetchone()
+    return conn.execute(
+        "SELECT * FROM driving_plan_snapshots ORDER BY fetch_date DESC LIMIT 1"
+    ).fetchone()
+
+
+def get_driving_plan_snapshot(conn: sqlite3.Connection, fetch_date: date) -> sqlite3.Row | None:
+    """The snapshot row for one fetch date, or None."""
+    return conn.execute(
+        "SELECT * FROM driving_plan_snapshots WHERE fetch_date = ?",
+        (fetch_date.isoformat(),),
+    ).fetchone()
+
+
+def get_active_driving_plans(
+    conn: sqlite3.Connection, *, country: str = "United States"
+) -> list[sqlite3.Row]:
+    """
+    Entries of the latest content-changed snapshot for one country — the
+    current picture of Google's published plan. Includes publish='No' rows
+    (retired windows); filter in the caller if only live campaigns matter.
+    """
+    latest = conn.execute(
+        """SELECT snapshot_id FROM driving_plan_snapshots WHERE changed = 1
+           ORDER BY fetch_date DESC LIMIT 1"""
+    ).fetchone()
+    if latest is None:
+        return []
+    return conn.execute(
+        """SELECT * FROM driving_plan_entries
+           WHERE snapshot_id = ? AND country = ?
+           ORDER BY region, district""",
+        (latest["snapshot_id"], country),
+    ).fetchall()
