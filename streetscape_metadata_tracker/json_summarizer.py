@@ -766,34 +766,49 @@ def generate_streetwalk_manifest(conn, data_dir: str) -> dict[str, Any]:
     walks = []
     for row in db.get_latest_street_walks_all(conn):
         pct = row["coverage_pct_by_length"]
-        walks.append(
-            {
-                "city_id": row["city_id"],
-                "provider": row["provider"],
-                # Which OSM network was walked. 'drive' (motorized roads only)
-                # is the original and still-scheduled series; 'all_public' adds
-                # alleys, footways, park paths, cycleways and steps. A city can
-                # have an entry for each, so consumers must select on this —
-                # the frontend defaults to 'drive'.
-                "network_type": row["network_type"],
-                "coverage_filename": row["coverage_filename"],
-                "run_date": row["run_date"],
-                "spacing_m": row["spacing_m"],
-                "match_dist_m": row["match_dist_m"],
-                "coverage_pct_by_length": pct,
-                # Any-imagery street coverage (360° + flat). NULL on walks
-                # predating the column — deliberately NOT defaulted to `pct`, so
-                # the streets page can show "no data" instead of implying the
-                # flat footprint was measured.
-                "coverage_pct_by_length_any": row["coverage_pct_by_length_any"],
-                # street_walks has no uncovered column; derive it so the frontend
-                # headline ("X% of street-km have no imagery") needs no math.
-                "uncovered_pct_by_length": None if pct is None else round(100 - pct, 1),
-                "edges": row["edges_total"],
-                "edges_fully_covered": row["edges_fully_covered"],
-                "mean_edge_coverage": row["mean_edge_coverage"],
+        entry = {
+            "city_id": row["city_id"],
+            "provider": row["provider"],
+            # Which OSM network was walked. 'drive' (motorized roads only)
+            # is the original and still-scheduled series; 'all_public' adds
+            # alleys, footways, park paths, cycleways and steps. A city can
+            # have an entry for each, so consumers must select on this —
+            # the frontend defaults to 'drive'.
+            "network_type": row["network_type"],
+            "coverage_filename": row["coverage_filename"],
+            "run_date": row["run_date"],
+            "spacing_m": row["spacing_m"],
+            "match_dist_m": row["match_dist_m"],
+            "coverage_pct_by_length": pct,
+            # Any-imagery street coverage (360° + flat). NULL on walks
+            # predating the column — deliberately NOT defaulted to `pct`, so
+            # the streets page can show "no data" instead of implying the
+            # flat footprint was measured.
+            "coverage_pct_by_length_any": row["coverage_pct_by_length_any"],
+            # street_walks has no uncovered column; derive it so the frontend
+            # headline ("X% of street-km have no imagery") needs no math.
+            "uncovered_pct_by_length": None if pct is None else round(100 - pct, 1),
+            "edges": row["edges_total"],
+            "edges_fully_covered": row["edges_fully_covered"],
+            "mean_edge_coverage": row["mean_edge_coverage"],
+        }
+        # "Since the last walk" change block (issue #101), from the walk-diff
+        # catalog like the aggregate's change key. Key ABSENT (not null) when
+        # no diff exists — most walks are still first walks, and an additive
+        # manifest key shouldn't sprinkle nulls into every prior entry.
+        diff_row = db.get_walk_diff_for_walk(conn, row["walk_id"])
+        if diff_row is not None:
+            entry["change"] = {
+                "from": diff_row["from_run_date"],
+                "to": row["run_date"],
+                "edges_gained_coverage": diff_row["edges_gained_coverage"],
+                "edges_lost_coverage": diff_row["edges_lost_coverage"],
+                "coverage_pct_by_length_delta": diff_row["coverage_pct_by_length_delta"],
+                "coverage_pct_by_length_any_delta": diff_row["coverage_pct_by_length_any_delta"],
+                "nearest_pano_date_changed": diff_row["nearest_pano_date_changed"],
+                "diff_file": diff_row["detail_filename"],
             }
-        )
+        walks.append(entry)
 
     manifest = {
         "schema_version": 1,

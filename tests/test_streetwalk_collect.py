@@ -393,3 +393,157 @@ def test_broad_walk_reports_footway_and_alley_buckets(tmp_path, monkeypatch):
     assert "residential" in by_type
     buckets = {f["properties"]["highway"] for f in gj["features"]}
     assert {"residential", "service", "footway", "alley"} == buckets
+
+
+# ── Walk-to-walk diffs at the CLI seam (issue #101) ─────────────────────────
+
+SECOND_DATE = "2026-10-01"
+
+
+def _collect_ok(data_dir, monkeypatch, **overrides):
+    """Run one collect with every sample answered © Google OK."""
+
+    async def fake_fetch(lat, lon, api_key, session, timeout, limiter=None):
+        return _ok_google(lat, lon)
+
+    monkeypatch.setattr(dg, "fetch_gsv_pano_metadata_async", fake_fetch)
+    return collect.run_collect(_args(data_dir, **overrides))
+
+
+def _walk_diff_rows(data_dir):
+    conn = db.connect(db.get_default_db_path(data_dir))
+    try:
+        return conn.execute("SELECT * FROM street_walk_diffs").fetchall()
+    finally:
+        conn.close()
+
+
+def _read_manifest(data_dir):
+    with gzip.open(os.path.join(data_dir, "streetwalks.json.gz"), "rt") as fh:
+        return json.load(fh)
+
+
+def test_first_walk_is_diff_free_everywhere(tmp_path, monkeypatch):
+    """A first walk has nothing to diff against: no street_walk_diffs row, no
+    detail file, and no 'change' key in its manifest entry."""
+    data_dir = _setup(tmp_path, monkeypatch)
+    monkeypatch.setenv("GMAPS_STREETS_API_KEY", "TESTKEY")
+
+    assert _collect_ok(data_dir, monkeypatch) == 0
+
+    assert _walk_diff_rows(data_dir) == []
+    assert not [f for f in os.listdir(data_dir) if "streetwalkdiff" in f]
+    (entry,) = _read_manifest(data_dir)["walks"]
+    assert "change" not in entry
+
+
+def test_second_walk_records_diff_detail_and_manifest_change(tmp_path, monkeypatch):
+    """A second walk with degraded imagery yields the whole temporal payoff:
+    a street_walk_diffs row, a published detail csv.gz, and a manifest entry
+    carrying the change block with the right date span."""
+    data_dir = _setup(tmp_path, monkeypatch)
+    monkeypatch.setenv("GMAPS_STREETS_API_KEY", "TESTKEY")
+
+    assert _collect_ok(data_dir, monkeypatch) == 0
+
+    # Second walk: samples on the short edge (lat >= ~44.052) lose coverage.
+    async def degraded_fetch(lat, lon, api_key, session, timeout, limiter=None):
+        if lat >= 44.0519:
+            return {"status": "ZERO_RESULTS"}
+        return _ok_google(lat, lon)
+
+    monkeypatch.setattr(dg, "fetch_gsv_pano_metadata_async", degraded_fetch)
+    assert collect.run_collect(_args(data_dir, **{"run-date": SECOND_DATE})) == 0
+
+    (row,) = _walk_diff_rows(data_dir)
+    assert row["edges_lost_coverage"] >= 1
+    assert row["edges_gained_coverage"] == 0
+    assert row["edges_added"] == 0 and row["edges_removed"] == 0
+    assert row["coverage_pct_by_length_delta"] < 0
+    detail_name = row["detail_filename"]
+    assert detail_name == f"{CITY_ID}_streetwalkdiff_{RUN_DATE}_to_{SECOND_DATE}.csv.gz"
+    assert os.path.exists(os.path.join(data_dir, detail_name))
+
+    (entry,) = _read_manifest(data_dir)["walks"]
+    assert entry["run_date"] == SECOND_DATE
+    assert entry["change"]["from"] == RUN_DATE
+    assert entry["change"]["to"] == SECOND_DATE
+    assert entry["change"]["diff_file"] == detail_name
+    assert entry["change"]["edges_lost_coverage"] == row["edges_lost_coverage"]
+
+
+def test_identical_second_walk_records_row_without_detail_file(tmp_path, monkeypatch):
+    """'Diffed, nothing changed' is a recorded fact — a row with NULL
+    detail_filename and no file on disk (mirrors the grid diff)."""
+    data_dir = _setup(tmp_path, monkeypatch)
+    monkeypatch.setenv("GMAPS_STREETS_API_KEY", "TESTKEY")
+
+    assert _collect_ok(data_dir, monkeypatch) == 0
+    assert _collect_ok(data_dir, monkeypatch, **{"run-date": SECOND_DATE}) == 0
+
+    (row,) = _walk_diff_rows(data_dir)
+    assert row["detail_filename"] is None
+    assert row["edges_aligned"] == 2
+    assert not [f for f in os.listdir(data_dir) if "streetwalkdiff" in f]
+    # The manifest still advertises the (empty) change: "no change since X"
+    # is a statement, not an absence.
+    (entry,) = _read_manifest(data_dir)["walks"]
+    assert entry["change"]["edges_gained_coverage"] == 0
+    assert entry["change"]["diff_file"] is None
+
+
+def test_spacing_change_skips_the_diff(tmp_path, monkeypatch):
+    """A different --spacing is a different sample frame; the walk catalogs
+    fine but no diff is recorded (the same_grid_geometry gate semantics)."""
+    data_dir = _setup(tmp_path, monkeypatch)
+    monkeypatch.setenv("GMAPS_STREETS_API_KEY", "TESTKEY")
+
+    assert _collect_ok(data_dir, monkeypatch) == 0
+    assert _collect_ok(data_dir, monkeypatch, **{"run-date": SECOND_DATE, "spacing": 30}) == 0
+
+    conn = db.connect(db.get_default_db_path(data_dir))
+    walks = conn.execute("SELECT COUNT(*) FROM street_walks").fetchone()[0]
+    conn.close()
+    assert walks == 2
+    assert _walk_diff_rows(data_dir) == []
+
+
+def test_diff_failure_never_fails_the_collect(tmp_path, monkeypatch):
+    """A diff bug must never fail a fully-paid-for, already-cataloged crawl."""
+    data_dir = _setup(tmp_path, monkeypatch)
+    monkeypatch.setenv("GMAPS_STREETS_API_KEY", "TESTKEY")
+
+    assert _collect_ok(data_dir, monkeypatch) == 0
+
+    def boom(*a, **k):
+        raise RuntimeError("diff exploded")
+
+    monkeypatch.setattr(collect, "compute_and_record_walk_diff", boom)
+    assert _collect_ok(data_dir, monkeypatch, **{"run-date": SECOND_DATE}) == 0
+
+    conn = db.connect(db.get_default_db_path(data_dir))
+    walk = db.get_latest_street_walk(conn, CITY_ID)
+    conn.close()
+    assert walk["run_date"] == SECOND_DATE  # the walk itself was cataloged
+    (entry,) = _read_manifest(data_dir)["walks"]  # and the manifest refreshed
+    assert entry["run_date"] == SECOND_DATE
+
+
+def test_collect_catalogs_coverage_by_highway(tmp_path, monkeypatch):
+    """The catalog column carries the artifact's per-bucket dict verbatim."""
+    data_dir = _setup(tmp_path, monkeypatch)
+    monkeypatch.setenv("GMAPS_STREETS_API_KEY", "TESTKEY")
+
+    assert _collect_ok(data_dir, monkeypatch) == 0
+
+    csv_name = f"{CITY_ID}_width_200_height_200_step_20_streetwalk_sp15_{RUN_DATE}.csv.gz"
+    with gzip.open(
+        os.path.join(data_dir, csv_name[: -len(".csv.gz")] + "_coverage.json.gz"), "rt"
+    ) as fh:
+        artifact_breakdown = json.load(fh)["properties"]["metadata"]["coverage_by_highway"]
+
+    conn = db.connect(db.get_default_db_path(data_dir))
+    walk = db.get_latest_street_walk(conn, CITY_ID)
+    conn.close()
+    assert json.loads(walk["coverage_by_highway"]) == artifact_breakdown
+    assert "residential" in artifact_breakdown

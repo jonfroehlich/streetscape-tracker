@@ -86,6 +86,10 @@ const STREET_COLUMNS = [
   { key: "spacing", label: "Sample spacing", type: "number", initial: "asc" },
   { key: "pct", label: "Street-km covered", type: "number", initial: "desc" },
   { key: "pctAny", label: "Any imagery", type: "number", initial: "desc" },
+  // "Since last walk" coverage delta (issue #101), from the manifest's
+  // optional change block. Null for first walks — most cities, until their
+  // second walk lands — which the number comparator sorts to the end.
+  { key: "changeDelta", label: "Δ coverage", type: "number", initial: "desc" },
   { key: "edges", label: "Streets", type: "number", initial: "desc" },
   { key: "fullyCovered", label: "Fully covered", type: "number", initial: "desc" },
 ];
@@ -127,6 +131,10 @@ function toRowModel(walk, city, labelSource = null) {
     // counts as covered too). For GSV it equals the 360° number, and it is
     // null for walks collected before the field existed.
     pctAny: walk.coverage_pct_by_length_any ?? null,
+    // "Since last walk" change block (issue #101). Absent from the manifest
+    // for first walks, so both stay null and the cell renders an em-dash.
+    change: walk.change ?? null,
+    changeDelta: walk.change?.coverage_pct_by_length_delta ?? null,
     edges: walk.edges ?? null,
     fullyCovered: walk.edges_fully_covered ?? null,
     filename: city?.data_file?.filename ?? null,
@@ -152,6 +160,23 @@ function num(value, digits = 0) {
 }
 
 // ── Rendering ─────────────────────────────────────────────────
+
+/**
+ * Cell for the "since last walk" coverage delta: an em-dash for a first walk
+ * (no change block in the manifest), else a signed percentage-point figure
+ * whose title carries the comparison date and the edge churn behind it.
+ *
+ * @param {Object} row - From toRowModel.
+ * @returns {string} HTML for one <td>.
+ */
+function walkChangeCellHtml(row) {
+  if (row.changeDelta == null) return `<td>—</td>`;
+  const sign = row.changeDelta >= 0 ? "+" : "";
+  const title =
+    `Since ${row.change.from}: ${row.change.edges_gained_coverage ?? 0} streets gained ` +
+    `coverage, ${row.change.edges_lost_coverage ?? 0} lost it`;
+  return `<td title="${escapeHtml(title)}">${sign}${row.changeDelta.toFixed(1)} pp</td>`;
+}
 
 /**
  * Build one table row from a row model.
@@ -184,6 +209,7 @@ function walkRowHtml(row) {
       <td>${row.spacing == null ? "—" : `${num(row.spacing)} m`}</td>
       ${coverageCellHtml(row.pct)}
       ${coverageCellHtml(row.pctAny)}
+      ${walkChangeCellHtml(row)}
       <td>${num(row.edges)}</td>
       <td>${num(row.fullyCovered)}</td>
       <td>${link}</td>
@@ -281,6 +307,7 @@ if (typeof module !== "undefined" && module.exports) {
     toRowModel,
     sortRows,
     num,
+    walkChangeCellHtml,
     walkRowHtml,
     renderStreetWalks,
     STREET_COLUMNS,

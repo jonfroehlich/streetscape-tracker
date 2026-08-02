@@ -550,6 +550,55 @@ def streetwalk_coverage_filename(csv_filename: str) -> str:
     return csv_filename[: -len(".csv.gz")] + "_coverage.json.gz"
 
 
+STREETWALK_DIFF_MARKER = "streetwalkdiff"
+
+
+def generate_streetwalk_diff_filename(
+    city_id: str,
+    from_date: str,
+    to_date: str,
+    provider: str = DEFAULT_PROVIDER,
+    network_type: str = DEFAULT_NETWORK_TYPE,
+) -> str:
+    """
+    Basename for a published walk-to-walk diff detail file (issue #101).
+
+    ``{city_id}_streetwalkdiff_[{provider}_][{network_token}_]{FROM}_to_{TO}.csv.gz``
+
+    Follows the grid diff's shape (``generate_diff_filename`` in diff.py) with
+    gsv and 'drive' tokenless. BOTH tokens are required context: a city can
+    have gsv+mapillary and drive+all_public diffs over the same date pair, and
+    a tokenless name would collide them — the exact failure the streetwalk
+    provider token exists for. No spacing token: street_walks is UNIQUE on
+    (city, provider, network_type, run_date), so the date pair already
+    identifies the walk pair, and cross-spacing pairs are never diffed.
+
+    The '_streetwalkdiff_' marker (and the missing '_width_..._step_' spine)
+    keeps parse_filename() and parse_streetwalk_filename() rejecting it, like
+    every other non-run artifact family.
+
+    Examples:
+        >>> generate_streetwalk_diff_filename("bend--or", "2026-07-08", "2026-10-01")
+        'bend--or_streetwalkdiff_2026-07-08_to_2026-10-01.csv.gz'
+        >>> generate_streetwalk_diff_filename("bend--or", "2026-07-08", "2026-10-01", provider="mapillary")
+        'bend--or_streetwalkdiff_mapillary_2026-07-08_to_2026-10-01.csv.gz'
+        >>> generate_streetwalk_diff_filename("bend--or", "2026-07-08", "2026-10-01", network_type="all_public")
+        'bend--or_streetwalkdiff_allpublic_2026-07-08_to_2026-10-01.csv.gz'
+    """
+    if provider not in KNOWN_PROVIDERS:
+        raise ValueError(f"Unknown provider {provider!r} (known: {', '.join(KNOWN_PROVIDERS)})")
+    if network_type not in STREETWALK_NETWORK_TOKENS:
+        known = ", ".join(STREETWALK_NETWORK_TOKENS)
+        raise ValueError(f"Unknown network type {network_type!r} (known: {known})")
+    provider_token = "" if provider == DEFAULT_PROVIDER else f"{provider}_"
+    token = STREETWALK_NETWORK_TOKENS[network_type]
+    network_token = f"{token}_" if token else ""
+    return (
+        f"{city_id}_{STREETWALK_DIFF_MARKER}_{provider_token}{network_token}"
+        f"{from_date}_to_{to_date}.csv.gz"
+    )
+
+
 def same_grid_geometry(filename_a: str, filename_b: str) -> bool:
     """
     True when both filenames parse and encode the same grid geometry

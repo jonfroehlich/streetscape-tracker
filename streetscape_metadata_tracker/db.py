@@ -27,7 +27,7 @@ from .naming import sanitize_city_query_str
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS cities (
@@ -193,6 +193,12 @@ CREATE TABLE IF NOT EXISTS street_walks (
     -- coverage_pct_by_length for GSV, which never emits FLAT_ONLY; NULL on
     -- walks collected before the column existed.
     coverage_pct_by_length_any REAL,
+    -- Per-highway-bucket breakdown (v11, issue #101): json.dumps of the
+    -- coverage artifact's coverage_by_highway dict, stored verbatim so
+    -- "how did residential coverage change?" is answerable from the catalog
+    -- (json_extract) without reading artifacts off disk. NULL = not captured
+    -- (a pre-v11 walk not yet backfilled), never an empty object.
+    coverage_by_highway    TEXT,
     api_requests           INTEGER,
     started_at             TEXT,
     finished_at            TEXT,
@@ -246,6 +252,37 @@ CREATE TABLE IF NOT EXISTS driving_plan_entries (
 );
 CREATE INDEX IF NOT EXISTS idx_dpe_snapshot ON driving_plan_entries(snapshot_id);
 CREATE INDEX IF NOT EXISTS idx_dpe_country_region ON driving_plan_entries(country, region);
+
+-- Run-to-run road-walk diffs (issue #101) — the street analogue of run_diffs.
+-- Compares two coverage GeoJSONs of the same (city, provider, network_type)
+-- series per edge_id (the stable unordered OSM node pair). edges_aligned is
+-- the edge_id intersection size; a --refresh'd network shrinks it, and
+-- one-sided edges are counted as added/removed but NEVER as coverage gained/
+-- lost (network churn is not imagery churn). Headline counters overlap by
+-- design: an edge can both gain coverage and change its nearest-pano date.
+-- Purely additive (v11): no migration function, CREATE TABLE IF NOT EXISTS
+-- suffices (the v2 -> v3 pattern).
+CREATE TABLE IF NOT EXISTS street_walk_diffs (
+    diff_id                          INTEGER PRIMARY KEY,
+    city_id                          TEXT NOT NULL REFERENCES cities(city_id),
+    from_walk_id                     INTEGER NOT NULL REFERENCES street_walks(walk_id),
+    to_walk_id                       INTEGER NOT NULL REFERENCES street_walks(walk_id),
+    edges_aligned                    INTEGER NOT NULL,
+    edges_added                      INTEGER,
+    edges_removed                    INTEGER,
+    edges_gained_coverage            INTEGER,
+    edges_lost_coverage              INTEGER,
+    coverage_fraction_changed        INTEGER,
+    nearest_pano_date_changed        INTEGER,
+    edges_fully_covered_delta        INTEGER,
+    coverage_pct_by_length_delta     REAL,
+    -- NULL when either side predates the v8 any-imagery column ("not
+    -- measured", never a copy of the 360° delta).
+    coverage_pct_by_length_any_delta REAL,
+    detail_filename                  TEXT,
+    computed_at                      TEXT NOT NULL,
+    UNIQUE (from_walk_id, to_walk_id)
+);
 """
 
 # v1 → v2: add the provider dimension. Three tables need constraint changes
@@ -547,6 +584,11 @@ def init_schema(conn: sqlite3.Connection) -> None:
     # and the version stamp below records the upgrade.
     if user_version == 9:
         user_version = 10
+    # v10 -> v11 (issue #101): street_walks gains coverage_by_highway; the
+    # street_walk_diffs table is purely additive and needs no migration
+    # function (the CREATE TABLE IF NOT EXISTS in _SCHEMA creates it).
+    if user_version == 10:
+        _migrate_v10_to_v11(conn)
     conn.executescript(_SCHEMA)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
@@ -670,6 +712,27 @@ def _migrate_v8_to_v9(conn: sqlite3.Connection) -> None:
         conn.commit()
     finally:
         conn.execute("PRAGMA foreign_keys=ON")
+
+
+def _migrate_v10_to_v11(conn: sqlite3.Connection) -> None:
+    """Add street_walks.coverage_by_highway (per-bucket JSON, issue #101).
+
+    Additive; no table rebuild. Idempotent like _migrate_v7_to_v8: skips when
+    the column exists (fresh catalog stamped forward) or the table is absent
+    (the CREATE TABLE in _SCHEMA below builds it current). A pre-v9 catalog
+    arriving here mid-connect has just been rebuilt to the v9 shape by
+    _MIGRATE_V8_TO_V9 (whose frozen SQL must NOT gain this column), so the
+    ADD COLUMN applies to it too. The column is nullable: walks cataloged
+    before it existed keep NULL ("not captured") until backfilled from their
+    coverage artifacts (scripts/backfill_streetwalk_coverage.py).
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(street_walks)").fetchall()}
+    if "coverage_by_highway" in cols or not cols:
+        # Absent table → the CREATE TABLE in _SCHEMA below builds it current.
+        return
+    logger.info("Migrating catalog schema v10 -> v11 (street_walks.coverage_by_highway)")
+    conn.execute("ALTER TABLE street_walks ADD COLUMN coverage_by_highway TEXT")
+    conn.commit()
 
 
 def derive_city_id(city_name: str, state_name: str | None, country_name: str | None) -> str:
@@ -1165,6 +1228,7 @@ def register_street_walk(
     mean_edge_coverage: float | None = None,
     coverage_pct_by_length: float | None = None,
     coverage_pct_by_length_any: float | None = None,
+    coverage_by_highway: str | None = None,
     api_requests: int | None = None,
     started_at: str | None = None,
     finished_at: str | None = None,
@@ -1185,8 +1249,9 @@ def register_street_walk(
            (city_id, provider, run_date, csv_filename, coverage_filename,
             network_type, spacing_m, match_dist_m, sample_points, edges_total,
             edges_fully_covered, mean_edge_coverage, coverage_pct_by_length,
-            coverage_pct_by_length_any, api_requests, started_at, finished_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            coverage_pct_by_length_any, coverage_by_highway, api_requests,
+            started_at, finished_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(city_id, provider, network_type, run_date) DO UPDATE SET
              csv_filename = excluded.csv_filename,
              coverage_filename = excluded.coverage_filename,
@@ -1198,6 +1263,7 @@ def register_street_walk(
              mean_edge_coverage = excluded.mean_edge_coverage,
              coverage_pct_by_length = excluded.coverage_pct_by_length,
              coverage_pct_by_length_any = excluded.coverage_pct_by_length_any,
+             coverage_by_highway = excluded.coverage_by_highway,
              api_requests = excluded.api_requests,
              started_at = excluded.started_at,
              finished_at = excluded.finished_at""",
@@ -1216,6 +1282,7 @@ def register_street_walk(
             mean_edge_coverage,
             coverage_pct_by_length,
             coverage_pct_by_length_any,
+            coverage_by_highway,
             api_requests,
             started_at,
             finished_at,
@@ -1282,6 +1349,99 @@ def get_latest_street_walks_all(conn: sqlite3.Connection) -> list[sqlite3.Row]:
             AND sw.run_date = latest.max_date
            ORDER BY sw.city_id, sw.provider, sw.network_type DESC""",
     ).fetchall()
+
+
+# ── Road-walk diffs (issue #101) ───────────────────────────────────────────
+
+
+def get_previous_street_walk(
+    conn: sqlite3.Connection,
+    city_id: str,
+    before_date: date,
+    provider: str = "gsv",
+    network_type: str = "drive",
+) -> sqlite3.Row | None:
+    """Most recent walk of the same series strictly before the date, or None.
+
+    The series identity is (city, provider, network_type) — the street_walks
+    UNIQUE key minus the date. Spacing and match-distance are deliberately NOT
+    filtered here: the caller gates on them so a changed sample frame diffs
+    against nothing, rather than silently reaching past the immediate
+    predecessor to an older same-frame walk (the same_grid_geometry gate
+    semantics of the grid pipeline).
+    """
+    return conn.execute(
+        """SELECT * FROM street_walks
+           WHERE city_id = ? AND provider = ? AND network_type = ?
+             AND run_date < ?
+           ORDER BY run_date DESC LIMIT 1""",
+        (city_id, provider, network_type, before_date.isoformat()),
+    ).fetchone()
+
+
+def record_street_walk_diff(
+    conn: sqlite3.Connection,
+    *,
+    city_id: str,
+    from_walk_id: int,
+    to_walk_id: int,
+    edges_aligned: int,
+    edges_added: int,
+    edges_removed: int,
+    edges_gained_coverage: int,
+    edges_lost_coverage: int,
+    coverage_fraction_changed: int,
+    nearest_pano_date_changed: int,
+    edges_fully_covered_delta: int | None,
+    coverage_pct_by_length_delta: float | None,
+    coverage_pct_by_length_any_delta: float | None,
+    detail_filename: str | None,
+) -> int:
+    """Store a walk-to-walk diff summary. Idempotent on (from_walk, to_walk)."""
+    cur = conn.execute(
+        """INSERT OR REPLACE INTO street_walk_diffs
+           (city_id, from_walk_id, to_walk_id, edges_aligned,
+            edges_added, edges_removed, edges_gained_coverage,
+            edges_lost_coverage, coverage_fraction_changed,
+            nearest_pano_date_changed, edges_fully_covered_delta,
+            coverage_pct_by_length_delta, coverage_pct_by_length_any_delta,
+            detail_filename, computed_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            city_id,
+            from_walk_id,
+            to_walk_id,
+            edges_aligned,
+            edges_added,
+            edges_removed,
+            edges_gained_coverage,
+            edges_lost_coverage,
+            coverage_fraction_changed,
+            nearest_pano_date_changed,
+            edges_fully_covered_delta,
+            coverage_pct_by_length_delta,
+            coverage_pct_by_length_any_delta,
+            detail_filename,
+            utc_now_iso(),
+        ),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def get_walk_diff_for_walk(conn: sqlite3.Connection, to_walk_id: int) -> sqlite3.Row | None:
+    """The diff whose 'to' side is the given walk, or None.
+
+    Joins the from-walk to expose its run_date as ``from_run_date``, so the
+    manifest can state the comparison span without a second query.
+    """
+    return conn.execute(
+        """SELECT d.*, fw.run_date AS from_run_date
+           FROM street_walk_diffs d
+           JOIN street_walks fw ON fw.walk_id = d.from_walk_id
+           WHERE d.to_walk_id = ?""",
+        (to_walk_id,),
+    ).fetchone()
 
 
 # ── API budget ledger ──────────────────────────────────────────────────────

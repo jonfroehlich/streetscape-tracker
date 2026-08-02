@@ -81,6 +81,7 @@ from streetscape_metadata_tracker.naming import (
     streetwalk_coverage_filename,
 )
 from streetscape_metadata_tracker.paths import get_default_data_dir
+from streetscape_metadata_tracker.walk_diff import compute_and_record_walk_diff
 
 from .collect_mapillary import collect_mapillary_street_samples_async
 from .download_street_network import fetch_street_edges
@@ -317,7 +318,7 @@ def run_collect(args: argparse.Namespace) -> int:
             json.dump(geojson, fh)
 
         totals = geojson["properties"]["metadata"]["totals"]
-        db.register_street_walk(
+        walk_id = db.register_street_walk(
             conn,
             city_id=city.city_id,
             run_date=run_date,
@@ -333,10 +334,35 @@ def run_collect(args: argparse.Namespace) -> int:
             mean_edge_coverage=totals["mean_edge_coverage"],
             coverage_pct_by_length=totals["coverage_pct_by_length"],
             coverage_pct_by_length_any=totals["coverage_pct_by_length_any"],
+            coverage_by_highway=json.dumps(
+                geojson["properties"]["metadata"]["coverage_by_highway"]
+            ),
             api_requests=dict_results["api_requests"],
             started_at=dict_results.get("started_at"),
             finished_at=dict_results.get("finished_at") or datetime.now(UTC).isoformat(),
         )
+
+        # Diff against the previous walk of this series (issue #101) — before
+        # the manifest refresh below so the manifest immediately advertises
+        # the change block. A no-op on every first walk. Never fail a fully
+        # paid-for, already-cataloged crawl over its diff: the pair can be
+        # re-diffed offline.
+        change = None
+        try:
+            change = compute_and_record_walk_diff(
+                conn,
+                data_dir=data_dir,
+                city_id=city.city_id,
+                walk_id=walk_id,
+                run_date=run_date,
+                provider=provider,
+                network_type=args.network_type,
+                spacing_m=float(args.spacing),
+                match_dist_m=float(args.match_dist),
+                fc_new=geojson,
+            )
+        except Exception:
+            logger.exception("Walk diff failed; continuing (walk is cataloged)")
 
         # Refresh the sidecar manifest so the city page can actually find this
         # artifact (issue #155). The collector is a manual CLI outside the
@@ -369,6 +395,15 @@ def run_collect(args: argparse.Namespace) -> int:
             f"{any_note} "
             f"({totals['edges_fully_covered']}/{totals['edges']} edges fully covered)"
         )
+        if change is not None:
+            delta = change["coverage_pct_by_length_delta"]
+            delta_note = f"{delta:+.1f} pp by length" if delta is not None else "delta n/a"
+            print(
+                f"  since {change['from']}: {delta_note}, "
+                f"{change['edges_gained_coverage']} edges gained / "
+                f"{change['edges_lost_coverage']} lost coverage, "
+                f"{change['nearest_pano_date_changed']} pano-date changes"
+            )
         return 0
     finally:
         conn.close()

@@ -1171,6 +1171,7 @@ def _orphan_walk(
     with_network_type_key=True,
     corrupt=False,
     write_csv=True,
+    coverage_by_highway=None,
 ):
     """A finished road walk with artifacts on disk but no catalog row — the
     Berlin shape: the crawl completed and both files were written, then the
@@ -1222,6 +1223,8 @@ def _orphan_walk(
         }
         if with_network_type_key:
             metadata["network_type"] = network_type
+        if coverage_by_highway is not None:
+            metadata["coverage_by_highway"] = coverage_by_highway
         with gzip.open(os.path.join(data_dir, coverage_name), "wt", encoding="utf-8") as fh:
             json.dump(
                 {"type": "FeatureCollection", "features": [], "properties": {"metadata": metadata}},
@@ -1338,6 +1341,99 @@ def test_reconcile_orphaned_walk_leaves_mapillary_requests_null(conn, data_dir, 
     row = _walk_row(conn, city.city_id, provider="mapillary")
     assert row["sample_points"] == 6
     assert row["api_requests"] is None
+
+
+def test_reconcile_salvages_coverage_by_highway(conn, data_dir, monkeypatch):
+    """The per-bucket breakdown rides along in the artifact metadata (issue
+    #101), so the salvage catalogs it like every other stat."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    monkeypatch.setattr(sched, "generate_streetwalk_manifest", lambda c, d: {"walks": []})
+    breakdown = {"residential": {"edges": 80, "coverage_pct_by_length": 84.0}}
+    city, _, _ = _orphan_walk(conn, data_dir, coverage_by_highway=breakdown)
+    cfg = _street_cfg(data_dir=data_dir)
+
+    assert _reconcile_orphaned_walk(conn, cfg, city, "gsv_streets", WALK_DATE) is True
+    row = _walk_row(conn, city.city_id)
+    assert json.loads(row["coverage_by_highway"]) == breakdown
+
+
+def test_reconcile_tolerates_artifact_without_breakdown(conn, data_dir, monkeypatch):
+    """A pre-#101 artifact carries no coverage_by_highway key; the column stays
+    NULL and the salvage still succeeds — a missing breakdown must never cost
+    a fully-paid-for crawl its catalog row."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    monkeypatch.setattr(sched, "generate_streetwalk_manifest", lambda c, d: {"walks": []})
+    city, _, _ = _orphan_walk(conn, data_dir)  # default: no breakdown key
+    cfg = _street_cfg(data_dir=data_dir)
+
+    assert _reconcile_orphaned_walk(conn, cfg, city, "gsv_streets", WALK_DATE) is True
+    assert _walk_row(conn, city.city_id)["coverage_by_highway"] is None
+
+
+def test_reconcile_computes_diff_when_previous_walk_exists(conn, data_dir, monkeypatch):
+    """The salvage path is exactly where the collect-side diff was lost (the
+    crash landed in the tail), so reconcile computes it too (issue #101)."""
+    from streetscape_metadata_tracker import scheduler as sched
+    from streetscape_metadata_tracker.naming import generate_streetwalk_filename as gen_walk
+
+    monkeypatch.setattr(sched, "generate_streetwalk_manifest", lambda c, d: {"walks": []})
+    city, _, _ = _orphan_walk(conn, data_dir)
+
+    # A prior cataloged walk of the same series and sample frame, with its
+    # artifact on disk (empty feature list — the diff still records a row).
+    prev_date = date(2026, 5, 1)
+    prev_stem = gen_walk(
+        city.city_id, city.grid_width_m, city.grid_height_m, city.step_m, 15, prev_date
+    )
+    prev_csv = prev_stem + ".csv.gz"
+    prev_coverage = streetwalk_coverage_filename(prev_csv)
+    with gzip.open(os.path.join(data_dir, prev_coverage), "wt", encoding="utf-8") as fh:
+        json.dump(
+            {
+                "type": "FeatureCollection",
+                "features": [],
+                "properties": {"metadata": {"totals": {"coverage_pct_by_length": 80.0}}},
+            },
+            fh,
+        )
+    prev_walk_id = db.register_street_walk(
+        conn,
+        city_id=city.city_id,
+        run_date=prev_date,
+        csv_filename=prev_csv,
+        coverage_filename=prev_coverage,
+        spacing_m=15.0,
+        match_dist_m=25.0,
+    )
+    cfg = _street_cfg(data_dir=data_dir)
+
+    assert _reconcile_orphaned_walk(conn, cfg, city, "gsv_streets", WALK_DATE) is True
+
+    salvaged = _walk_row(conn, city.city_id)
+    diff_row = db.get_walk_diff_for_walk(conn, salvaged["walk_id"])
+    assert diff_row is not None
+    assert diff_row["from_walk_id"] == prev_walk_id
+    assert diff_row["from_run_date"] == prev_date.isoformat()
+
+
+def test_reconcile_diff_failure_still_salvages(conn, data_dir, monkeypatch):
+    """A diff bug must never turn a successful salvage into a recorded failure
+    — that would re-crawl the city at full cost, defeating the salvage."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    monkeypatch.setattr(sched, "generate_streetwalk_manifest", lambda c, d: {"walks": []})
+
+    def boom(*a, **k):
+        raise RuntimeError("diff exploded")
+
+    monkeypatch.setattr(sched, "compute_and_record_walk_diff", boom)
+    city, _, _ = _orphan_walk(conn, data_dir)
+    cfg = _street_cfg(data_dir=data_dir)
+
+    assert _reconcile_orphaned_walk(conn, cfg, city, "gsv_streets", WALK_DATE) is True
+    assert _walk_row(conn, city.city_id) is not None
 
 
 def test_run_due_salvages_a_finished_walk_instead_of_recording_failure(conn, monkeypatch, data_dir):
