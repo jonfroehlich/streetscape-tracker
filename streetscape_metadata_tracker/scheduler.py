@@ -1428,8 +1428,9 @@ def _fetch_driving_plan_nightly(cfg: SchedulerConfig, conn, today: date) -> str 
         outcome = f"CHANGED — archived, {result.entry_count:,} entries"
     else:
         outcome = "unchanged"
-    logger.info(f"Driving-plan snapshot {result.fetch_date}: {outcome} "
-                f"({result.record_count:,} records)")
+    logger.info(
+        f"Driving-plan snapshot {result.fetch_date}: {outcome} ({result.record_count:,} records)"
+    )
     return None
 
 

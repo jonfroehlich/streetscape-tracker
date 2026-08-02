@@ -1713,8 +1713,8 @@ _PLAN_RECORD = {
 def test_config_parses_driving_plan_section(tmp_path):
     p = tmp_path / "s.toml"
     p.write_text(
-        "[driving_plan]\nenabled = false\narchive_dir = \"/somewhere/plans\"\n"
-        "url = \"https://example.com/feed.json\"\ntimeout_s = 10.0\n"
+        '[driving_plan]\nenabled = false\narchive_dir = "/somewhere/plans"\n'
+        'url = "https://example.com/feed.json"\ntimeout_s = 10.0\n'
     )
     cfg = load_scheduler_config(str(p))
     assert not cfg.driving_plan.enabled
@@ -1833,16 +1833,12 @@ def test_cmd_fetch_driving_plan_backfills_from_file(conn, monkeypatch, tmp_path,
     cfg = SchedulerConfig()
     cfg.driving_plan.archive_dir = str(archive)
 
-    rc = cmd_fetch_driving_plan(
-        cfg, from_file=str(saved), target_date=date(2026, 7, 31)
-    )
+    rc = cmd_fetch_driving_plan(cfg, from_file=str(saved), target_date=date(2026, 7, 31))
 
     assert rc == 0
     assert "CHANGED" in capsys.readouterr().out
     row = conn.execute("SELECT * FROM driving_plan_snapshots").fetchone()
     assert row["fetch_date"] == "2026-07-31" and row["changed"] == 1
     assert (archive / "gsv_driving_plan_2026-07-31.json.gz").exists()
-    districts = {
-        r["district"] for r in conn.execute("SELECT district FROM driving_plan_entries")
-    }
+    districts = {r["district"] for r in conn.execute("SELECT district FROM driving_plan_entries")}
     assert districts == {"Jefferson", "Bullitt"}

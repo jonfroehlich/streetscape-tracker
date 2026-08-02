@@ -78,7 +78,10 @@ def fetch_feed(url: str = FEED_URL, *, timeout_s: float = 60.0, retries: int = 3
                 delay = 5.0 * (attempt + 1)
                 logger.warning(
                     "Driving-plan fetch attempt %d/%d failed (%s); retrying in %.0fs",
-                    attempt + 1, retries, e, delay,
+                    attempt + 1,
+                    retries,
+                    e,
+                    delay,
                 )
                 time.sleep(delay)
     raise last_error
