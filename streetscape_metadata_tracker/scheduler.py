@@ -14,6 +14,7 @@ Usage (--config accepted on either side of the subcommand):
     python -m streetscape_metadata_tracker.scheduler [--config PATH] run-due [--dry-run] [--limit N]
     python -m streetscape_metadata_tracker.scheduler [--config PATH] regenerate-aggregate [--publish]
     python -m streetscape_metadata_tracker.scheduler [--config PATH] reconcile-walks [--date D] [--dry-run]
+    python -m streetscape_metadata_tracker.scheduler [--config PATH] fetch-driving-plan [--force] [--from-file P --date D]
 
 Config: TOML (see config/scheduler.toml). Requires Python 3.11+ (tomllib).
 """
@@ -39,7 +40,7 @@ from pathlib import Path
 
 from tabulate import tabulate
 
-from . import db
+from . import db, driving_plan
 from .alerting import AlertConfig, send_alert, should_alert
 from .download_common import redact_credentials
 from .download_mapillary import estimate_tile_count
@@ -121,6 +122,23 @@ class ResourceGuardConfig:
 
 
 @dataclass
+class DrivingPlanConfig:
+    """[driving_plan] — nightly snapshot of Google's published Street View
+    driving-plan feed (issue #176).
+
+    NOT a [providers.*] channel on purpose: it has no API key, no request
+    budget, no per-city cadence — one unauthenticated request per night for
+    the whole worldwide feed. Artifacts live OUTSIDE data/ so the publish
+    rsync never sees them (its whitelist would republish Google's content).
+    """
+
+    enabled: bool = True
+    archive_dir: str = str(_PROJECT_ROOT / "archive" / "gsv_driving_plan")
+    url: str = driving_plan.FEED_URL
+    timeout_s: float = 60.0
+
+
+@dataclass
 class SchedulerConfig:
     # [schedule]
     cycle_days: int = 90
@@ -161,6 +179,8 @@ class SchedulerConfig:
     alerts: AlertConfig = field(default_factory=AlertConfig)
     # [resource_guard] — load/RAM-aware concurrency backoff on shared hosts
     resource_guard: ResourceGuardConfig = field(default_factory=ResourceGuardConfig)
+    # [driving_plan] — nightly driving-plan feed snapshot (issue #176)
+    driving_plan: DrivingPlanConfig = field(default_factory=DrivingPlanConfig)
 
     def __post_init__(self):
         if not self.db_path:
@@ -199,6 +219,7 @@ def load_scheduler_config(path: str | None = None) -> SchedulerConfig:
     pub = raw.get("publish", {})
     al = raw.get("alerts", {})
     rg = raw.get("resource_guard", {})
+    dp = raw.get("driving_plan", {})
 
     providers = None
     if "providers" in raw:
@@ -274,6 +295,12 @@ def load_scheduler_config(path: str | None = None) -> SchedulerConfig:
             min_available_memory_gb=rg.get("min_available_memory_gb", 8.0),
             max_load_per_core=rg.get("max_load_per_core", 0.9),
             min_connection_limit=rg.get("min_connection_limit", 5),
+        ),
+        driving_plan=DrivingPlanConfig(
+            enabled=dp.get("enabled", True),
+            archive_dir=dp.get("archive_dir", str(_PROJECT_ROOT / "archive" / "gsv_driving_plan")),
+            url=dp.get("url", driving_plan.FEED_URL),
+            timeout_s=dp.get("timeout_s", 60.0),
         ),
     )
 
@@ -750,6 +777,22 @@ def cmd_status(cfg: SchedulerConfig) -> int:
         used = db.get_api_usage(conn, today, provider)
         budget = cfg.providers[provider].daily_request_budget
         print(f"{provider} budget today: {used:,} / {budget:,} requests used.")
+
+    if cfg.driving_plan.enabled:
+        latest = db.get_latest_driving_plan_snapshot(conn)
+        if latest is None:
+            print("driving plan: never fetched.")
+        else:
+            last_changed = conn.execute(
+                """SELECT fetch_date FROM driving_plan_snapshots WHERE changed = 1
+                   ORDER BY fetch_date DESC LIMIT 1"""
+            ).fetchone()
+            state = "changed" if latest["changed"] else "unchanged"
+            print(
+                f"driving plan: last fetch {latest['fetch_date']} ({state}, "
+                f"{latest['record_count']:,} records; last change "
+                f"{last_changed['fetch_date'] if last_changed else '—'})."
+            )
     return 0
 
 
@@ -788,6 +831,60 @@ def cmd_regenerate(cfg: SchedulerConfig, publish: bool = False) -> int:
         if _publish(cfg, "regenerate-aggregate (manual)") != 0:
             return 1
         print("Published to the web server.")
+    return 0
+
+
+def cmd_fetch_driving_plan(
+    cfg: SchedulerConfig,
+    *,
+    force: bool = False,
+    from_file: str | None = None,
+    target_date: date | None = None,
+) -> int:
+    """
+    Snapshot the GSV driving-plan feed once, outside the nightly cycle
+    (issue #176). Same driving_plan.ingest() code path as run-due's hook.
+
+    ``--from-file`` ingests already-saved raw feed JSON instead of fetching —
+    the backfill handle for snapshots saved by hand before this existed (pair
+    it with ``--date`` for the date the bytes were actually fetched).
+    """
+    conn = db.connect(cfg.db_path)
+    raw = None
+    if from_file is not None:
+        opener = gzip.open if from_file.endswith(".gz") else open
+        with opener(from_file, "rb") as f:
+            raw = f.read()
+    try:
+        result = driving_plan.ingest(
+            conn,
+            archive_dir=cfg.driving_plan.archive_dir,
+            fetch_date=target_date,
+            raw=raw,
+            force=force,
+            url=cfg.driving_plan.url,
+            timeout_s=cfg.driving_plan.timeout_s,
+        )
+    except Exception as e:
+        logger.exception("Driving-plan fetch failed")
+        print(f"Driving-plan fetch failed: {e}")
+        return 1
+    if result.skipped:
+        print(
+            f"Snapshot for {result.fetch_date} already exists "
+            f"({result.record_count:,} records); use --force to re-fetch."
+        )
+    elif result.changed:
+        print(
+            f"Snapshot {result.fetch_date}: feed CHANGED — archived "
+            f"{driving_plan.generate_snapshot_filename(date.fromisoformat(result.fetch_date))} "
+            f"({result.record_count:,} records, {result.entry_count:,} entries)."
+        )
+    else:
+        print(
+            f"Snapshot {result.fetch_date}: feed unchanged since the previous "
+            f"snapshot ({result.record_count:,} records); no artifact written."
+        )
     return 0
 
 
@@ -1305,6 +1402,37 @@ def _collect_due(conn, cfg: SchedulerConfig, today: date):
     return ordered, providers_for_city
 
 
+def _fetch_driving_plan_nightly(cfg: SchedulerConfig, conn, today: date) -> str | None:
+    """
+    Snapshot the driving-plan feed (issue #176). Returns an error string for
+    the batch summary, or None. Never raises: a broken Google feed must not
+    cost a night of collection (the issue #167 lesson), and a failure here is
+    advisory — the feed is an undocumented asset with no uptime contract.
+    """
+    if not cfg.driving_plan.enabled:
+        return None
+    try:
+        result = driving_plan.ingest(
+            conn,
+            archive_dir=cfg.driving_plan.archive_dir,
+            fetch_date=today,
+            url=cfg.driving_plan.url,
+            timeout_s=cfg.driving_plan.timeout_s,
+        )
+    except Exception as e:
+        logger.exception("Driving-plan snapshot failed")
+        return f"driving-plan fetch failed: {e}"
+    if result.skipped:
+        outcome = "already snapshotted today"
+    elif result.changed:
+        outcome = f"CHANGED — archived, {result.entry_count:,} entries"
+    else:
+        outcome = "unchanged"
+    logger.info(f"Driving-plan snapshot {result.fetch_date}: {outcome} "
+                f"({result.record_count:,} records)")
+    return None
+
+
 def cmd_run_due(
     cfg: SchedulerConfig,
     dry_run: bool = False,
@@ -1357,7 +1485,14 @@ def cmd_run_due(
                 fits = "ok" if est <= budget_left[provider] else "OVER BUDGET (deferred)"
                 print(f"  {city.city_id:60s} {provider:16s} ~{est:>9,} req  {fits}")
                 budget_left[provider] -= est if est <= budget_left[provider] else 0
+        if cfg.driving_plan.enabled:
+            print("Would also snapshot the GSV driving-plan feed (issue #176).")
         return 0
+
+    # Snapshot the driving-plan feed BEFORE the city loop: upstream of the
+    # batch deadline and any mid-loop kill, and on zero-due nights too. Cheap
+    # (one request), and a failure never fails the night.
+    plan_error = _fetch_driving_plan_nightly(cfg, conn, today)
 
     # The tail below (aggregate, manifest, backup, publish) is what makes a
     # night visible, and it only runs if the loop returns. Everything that can
@@ -1376,6 +1511,7 @@ def cmd_run_due(
         f"{processed} cities"
         + (f"; {skipped_budget} deferred for budget" if skipped_budget else "")
         + (f"; stopped early ({stop_reason})" if stop_reason else "")
+        + (f"; {plan_error}" if plan_error else "")
     )
     logger.info("Done: " + summary)
     return _finish_batch(
@@ -1620,6 +1756,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_rec.add_argument(
         "--dry-run", action="store_true", help="List what would be reconciled; no catalog writes"
     )
+    p_plan = sub.add_parser(
+        "fetch-driving-plan",
+        help="Snapshot Google's published Street View driving-plan feed",
+    )
+    _add_global_flags(p_plan)
+    p_plan.add_argument(
+        "--force", action="store_true", help="Re-fetch even if today's snapshot exists"
+    )
+    p_plan.add_argument(
+        "--from-file",
+        default=None,
+        help="Ingest saved raw feed JSON (.json or .json.gz) instead of fetching (backfill)",
+    )
+    p_plan.add_argument(
+        "--date",
+        default=None,
+        help="Snapshot date YYYY-MM-DD (default: today, UTC); use with --from-file for backfill",
+    )
     p_run = sub.add_parser("run-due", help="Collect today's due cities")
     _add_global_flags(p_run)
     p_run.add_argument("--dry-run", action="store_true", help="Print what would run; no downloads")
@@ -1649,6 +1803,11 @@ def main() -> int:
     if args.command == "reconcile-walks":
         target = date.fromisoformat(args.date) if args.date else None
         return cmd_reconcile_walks(cfg, target_date=target, dry_run=args.dry_run)
+    if args.command == "fetch-driving-plan":
+        target = date.fromisoformat(args.date) if args.date else None
+        return cmd_fetch_driving_plan(
+            cfg, force=args.force, from_file=args.from_file, target_date=target
+        )
     if args.command == "run-due":
         try:
             return cmd_run_due(cfg, dry_run=args.dry_run, limit=args.limit)

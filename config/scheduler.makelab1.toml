@@ -117,3 +117,10 @@ enabled = true
 min_available_memory_gb = 8.0
 max_load_per_core = 0.9
 min_connection_limit = 5
+
+[driving_plan]
+# Nightly snapshot of Google's published driving-plan feed (issue #176).
+# Matches the manual snapshot dir already on prod; outside data/ so the
+# publish rsync never sees it. See config/scheduler.toml for field docs.
+enabled = true
+archive_dir = "/projects/makeabilitylab/streetscape-tracker/archive/gsv_driving_plan"

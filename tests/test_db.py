@@ -757,6 +757,42 @@ def test_migrate_v8_to_v9_clears_a_stale_scratch_table(tmp_path):
     conn.close()
 
 
+def test_migrate_v9_to_v10(tmp_path):
+    """A v9 catalog gains the driving-plan tables on connect (issue #176).
+
+    A v9 catalog is exactly the current schema minus the two driving_plan
+    tables, so the fixture is built from db._SCHEMA with them dropped (keeping
+    the fixture in sync with the code) and stamped user_version = 9.
+    """
+    db_path = str(tmp_path / "v9.db")
+    raw = sqlite3.connect(db_path)
+    raw.executescript(db._SCHEMA)
+    raw.execute("DROP TABLE driving_plan_entries")
+    raw.execute("DROP TABLE driving_plan_snapshots")
+    raw.execute(
+        """INSERT INTO cities (city_id, display_name, city_name, center_lat,
+           center_lon, grid_width_m, grid_height_m, step_m, created_at)
+           VALUES ('bend--or', 'Bend, OR', 'Bend', 44.05, -121.31,
+                   5000, 5000, 20, '2026-01-01T00:00:00+00:00')"""
+    )
+    raw.execute("PRAGMA user_version = 9")
+    raw.commit()
+    raw.close()
+
+    conn = db.connect(db_path)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
+    assert conn.execute("SELECT COUNT(*) FROM driving_plan_snapshots").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM driving_plan_entries").fetchone()[0] == 0
+    # Existing data is untouched by the additive migration.
+    assert db.resolve_city(conn, "bend--or").city_id == "bend--or"
+
+    # Idempotent: reopening must not error or re-migrate.
+    conn.close()
+    conn2 = db.connect(db_path)
+    assert conn2.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
+    conn2.close()
+
+
 def test_two_network_types_coexist_on_one_date(tmp_path):
     """The widened key is what lets both walks of a city survive the same night."""
     conn = db.connect(str(tmp_path / "c.db"))
