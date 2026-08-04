@@ -472,3 +472,49 @@ def test_fc_new_loaded_from_catalog_when_not_passed(conn, data_dir):
     )
     assert change is not None
     assert change["coverage_pct_by_length_delta"] == pytest.approx(70.0)
+
+
+def test_recollection_with_changed_frame_clears_stale_diff(conn, data_dir):
+    """A same-day re-collection replaces the walk row in place (the register
+    upsert keeps walk_id). If the re-collection changed the sample frame, the
+    diff recorded by the earlier collection describes a replaced artifact —
+    the skip path must clear it, or the manifest keeps advertising a stale
+    change block."""
+    city_id = _register_city(conn)
+    old_fc = _fc([_edge("1-2", fraction=0.2)], totals={"coverage_pct_by_length": 20.0})
+    new_fc = _fc([_edge("1-2", fraction=0.9)], totals={"coverage_pct_by_length": 90.0})
+    _register_walk(conn, data_dir, city_id, date(2026, 4, 1), old_fc)
+    walk_id, _ = _register_walk(conn, data_dir, city_id, date(2026, 7, 1), new_fc)
+    change = compute_and_record_walk_diff(
+        conn,
+        data_dir=data_dir,
+        city_id=city_id,
+        walk_id=walk_id,
+        run_date=date(2026, 7, 1),
+        provider="gsv",
+        network_type="drive",
+        spacing_m=15.0,
+        match_dist_m=25.0,
+        fc_new=new_fc,
+    )
+    assert change is not None  # the first collection diffed normally
+
+    # Re-collect the same date at a different spacing: same walk_id, new frame.
+    recollected_id, _ = _register_walk(
+        conn, data_dir, city_id, date(2026, 7, 1), new_fc, spacing_m=30.0
+    )
+    assert recollected_id == walk_id
+    change = compute_and_record_walk_diff(
+        conn,
+        data_dir=data_dir,
+        city_id=city_id,
+        walk_id=walk_id,
+        run_date=date(2026, 7, 1),
+        provider="gsv",
+        network_type="drive",
+        spacing_m=30.0,
+        match_dist_m=25.0,
+        fc_new=new_fc,
+    )
+    assert change is None
+    assert _walk_diff_rows(conn) == []  # the stale diff row is gone

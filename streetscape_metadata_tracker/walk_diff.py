@@ -32,6 +32,7 @@ import os
 from dataclasses import dataclass, field
 from datetime import date
 
+import numpy as np
 import pandas as pd
 
 from . import db
@@ -199,68 +200,75 @@ def compute_walk_diff(fc_old: dict, fc_new: dict) -> WalkDiff:
     new_dates = new_aligned["nearest_pano_date"].map(_date_str)
     date_changed_mask = old_dates.fillna("") != new_dates.fillna("")
 
-    detail_rows = []
-    for edge_id in added_ids:
-        row = new_edges.loc[edge_id]
-        detail_rows.append(
-            {
-                "edge_id": edge_id,
-                "change_type": "edge_added",
-                "highway": row["highway"],
-                "length_m": row["length_m"],
-                "old_coverage_fraction": None,
-                "new_coverage_fraction": row["coverage_fraction"],
-                "old_coverage_fraction_any": None,
-                "new_coverage_fraction_any": row["coverage_fraction_any"],
-                "old_nearest_pano_date": None,
-                "new_nearest_pano_date": _date_str(row["nearest_pano_date"]),
-            }
-        )
-    for edge_id in removed_ids:
-        row = old_edges.loc[edge_id]
-        detail_rows.append(
-            {
-                "edge_id": edge_id,
-                "change_type": "edge_removed",
-                "highway": row["highway"],
-                "length_m": row["length_m"],
-                "old_coverage_fraction": row["coverage_fraction"],
-                "new_coverage_fraction": None,
-                "old_coverage_fraction_any": row["coverage_fraction_any"],
-                "new_coverage_fraction_any": None,
-                "old_nearest_pano_date": _date_str(row["nearest_pano_date"]),
-                "new_nearest_pano_date": None,
-            }
-        )
+    # Detail rows are built column-wise, not edge-by-edge: a big city's first
+    # re-walk can change most of its network (every nearest-pano date shifts on
+    # a full refresh), and per-edge .loc lookups over hundreds of thousands of
+    # edges turn the diff tail into minutes of scalar indexing.
+    added = new_edges.loc[added_ids]
+    removed = old_edges.loc[removed_ids]
+    changed_ids = old_aligned.index[fraction_changed_mask | date_changed_mask]
+    # One row per changed aligned edge, labeled by the most specific type:
+    # gained/lost beat a bare fraction shift, which beats a date-only change.
+    change_type = np.select(
+        [
+            gained_mask.loc[changed_ids],
+            lost_mask.loc[changed_ids],
+            fraction_changed_mask.loc[changed_ids],
+        ],
+        ["gained_coverage", "lost_coverage", "coverage_changed"],
+        default="pano_date_changed",
+    )
 
-    changed_mask = fraction_changed_mask | date_changed_mask
-    for edge_id in old_aligned.index[changed_mask]:
-        if gained_mask.loc[edge_id]:
-            change_type = "gained_coverage"
-        elif lost_mask.loc[edge_id]:
-            change_type = "lost_coverage"
-        elif fraction_changed_mask.loc[edge_id]:
-            change_type = "coverage_changed"
-        else:
-            change_type = "pano_date_changed"
-        new_row = new_aligned.loc[edge_id]
-        old_row = old_aligned.loc[edge_id]
-        detail_rows.append(
-            {
-                "edge_id": edge_id,
-                "change_type": change_type,
-                "highway": new_row["highway"],
-                "length_m": new_row["length_m"],
-                "old_coverage_fraction": old_row["coverage_fraction"],
-                "new_coverage_fraction": new_row["coverage_fraction"],
-                "old_coverage_fraction_any": old_row["coverage_fraction_any"],
-                "new_coverage_fraction_any": new_row["coverage_fraction_any"],
-                "old_nearest_pano_date": _date_str(old_row["nearest_pano_date"]),
-                "new_nearest_pano_date": _date_str(new_row["nearest_pano_date"]),
-            }
-        )
-
-    detail = pd.DataFrame(detail_rows, columns=DETAIL_COLUMNS)
+    detail = pd.concat(
+        [
+            pd.DataFrame(
+                {
+                    "edge_id": added.index,
+                    "change_type": "edge_added",
+                    "highway": added["highway"].to_numpy(),
+                    "length_m": added["length_m"].to_numpy(),
+                    "old_coverage_fraction": None,
+                    "new_coverage_fraction": added["coverage_fraction"].to_numpy(),
+                    "old_coverage_fraction_any": None,
+                    "new_coverage_fraction_any": added["coverage_fraction_any"].to_numpy(),
+                    "old_nearest_pano_date": None,
+                    "new_nearest_pano_date": added["nearest_pano_date"].map(_date_str).to_numpy(),
+                },
+                columns=DETAIL_COLUMNS,
+            ),
+            pd.DataFrame(
+                {
+                    "edge_id": removed.index,
+                    "change_type": "edge_removed",
+                    "highway": removed["highway"].to_numpy(),
+                    "length_m": removed["length_m"].to_numpy(),
+                    "old_coverage_fraction": removed["coverage_fraction"].to_numpy(),
+                    "new_coverage_fraction": None,
+                    "old_coverage_fraction_any": removed["coverage_fraction_any"].to_numpy(),
+                    "new_coverage_fraction_any": None,
+                    "old_nearest_pano_date": removed["nearest_pano_date"].map(_date_str).to_numpy(),
+                    "new_nearest_pano_date": None,
+                },
+                columns=DETAIL_COLUMNS,
+            ),
+            pd.DataFrame(
+                {
+                    "edge_id": changed_ids,
+                    "change_type": change_type,
+                    "highway": new_aligned.loc[changed_ids, "highway"].to_numpy(),
+                    "length_m": new_aligned.loc[changed_ids, "length_m"].to_numpy(),
+                    "old_coverage_fraction": old_frac.loc[changed_ids].to_numpy(),
+                    "new_coverage_fraction": new_frac.loc[changed_ids].to_numpy(),
+                    "old_coverage_fraction_any": old_any.loc[changed_ids].to_numpy(),
+                    "new_coverage_fraction_any": new_any.loc[changed_ids].to_numpy(),
+                    "old_nearest_pano_date": old_dates.loc[changed_ids].to_numpy(),
+                    "new_nearest_pano_date": new_dates.loc[changed_ids].to_numpy(),
+                },
+                columns=DETAIL_COLUMNS,
+            ),
+        ],
+        ignore_index=True,
+    )
 
     # Fully-covered counts over each FULL artifact (not just aligned edges),
     # matching summarize_streetwalk_coverage's definition, so the delta agrees
@@ -324,11 +332,20 @@ def compute_and_record_walk_diff(
     and "never diffed" are different facts — but the detail file is only
     written when there are changes, mirroring the grid diff.
 
+    Any diff previously recorded into this walk is cleared up front: a
+    same-day re-collection replaces the street_walks row in place (the
+    register upsert keeps walk_id), so a diff recorded by the earlier
+    collection describes a replaced artifact — the happy path re-records it
+    below, and a skip (e.g. the re-collection changed --spacing) must not
+    leave the manifest advertising a stale change block.
+
     Args:
         fc_new: the new walk's coverage FeatureCollection when the caller
             already holds it in memory (the collector does); loaded from the
             walk's cataloged coverage_filename otherwise.
     """
+    db.delete_walk_diff_for_walk(conn, walk_id)
+
     prev = db.get_previous_street_walk(
         conn, city_id, run_date, provider=provider, network_type=network_type
     )

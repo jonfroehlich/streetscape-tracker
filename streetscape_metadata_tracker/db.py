@@ -283,6 +283,9 @@ CREATE TABLE IF NOT EXISTS street_walk_diffs (
     computed_at                      TEXT NOT NULL,
     UNIQUE (from_walk_id, to_walk_id)
 );
+-- The manifest looks diffs up by their 'to' walk; the UNIQUE index above
+-- leads with from_walk_id and can't serve that.
+CREATE INDEX IF NOT EXISTS idx_swd_to_walk ON street_walk_diffs(to_walk_id);
 """
 
 # v1 → v2: add the provider dimension. Three tables need constraint changes
@@ -589,6 +592,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
     # function (the CREATE TABLE IF NOT EXISTS in _SCHEMA creates it).
     if user_version == 10:
         _migrate_v10_to_v11(conn)
+        user_version = 11
     conn.executescript(_SCHEMA)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
@@ -1442,6 +1446,19 @@ def get_walk_diff_for_walk(conn: sqlite3.Connection, to_walk_id: int) -> sqlite3
            WHERE d.to_walk_id = ?""",
         (to_walk_id,),
     ).fetchone()
+
+
+def delete_walk_diff_for_walk(conn: sqlite3.Connection, to_walk_id: int) -> None:
+    """Drop any recorded diff whose 'to' side is the given walk.
+
+    A same-day re-collection replaces the walk's street_walks row in place
+    (the register upsert keeps walk_id), so a diff recorded against the
+    replaced artifact is stale the moment the walk is re-registered. The
+    orchestrator clears it before deciding whether a fresh diff is possible;
+    a no-op when no diff exists (every nightly walk).
+    """
+    conn.execute("DELETE FROM street_walk_diffs WHERE to_walk_id = ?", (to_walk_id,))
+    conn.commit()
 
 
 # ── API budget ledger ──────────────────────────────────────────────────────

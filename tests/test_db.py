@@ -1138,6 +1138,12 @@ def test_record_and_get_walk_diff(conn, city):
     # No diff recorded for the 'from' walk.
     assert db.get_walk_diff_for_walk(conn, walk_a) is None
 
+    # Deleting by 'to' walk drops the row; a second delete is a no-op.
+    db.delete_walk_diff_for_walk(conn, walk_b)
+    assert db.get_walk_diff_for_walk(conn, walk_b) is None
+    db.delete_walk_diff_for_walk(conn, walk_b)
+    assert conn.execute("SELECT COUNT(*) FROM street_walk_diffs").fetchone()[0] == 0
+
 
 def test_street_network_register_and_get(conn, city):
     network_id = db.register_street_network(
