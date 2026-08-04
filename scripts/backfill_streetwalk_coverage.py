@@ -48,11 +48,17 @@ def backfill(conn, data_dir: str, execute: bool = False) -> dict[str, int]:
     Populate coverage_by_highway on every NULL row whose artifact carries it.
 
     Returns counts: updated (or would-update on a dry run), missing_artifact,
-    missing_key (artifact readable but no coverage_by_highway — pre-breakdown
-    or corrupt), and skipped_no_filename (row never cataloged a coverage
-    artifact at all).
+    unreadable (artifact present but not valid gzip/JSON), missing_key
+    (artifact readable but carries no coverage_by_highway — pre-breakdown),
+    and skipped_no_filename (row never cataloged a coverage artifact at all).
     """
-    counts = {"updated": 0, "missing_artifact": 0, "missing_key": 0, "skipped_no_filename": 0}
+    counts = {
+        "updated": 0,
+        "missing_artifact": 0,
+        "unreadable": 0,
+        "missing_key": 0,
+        "skipped_no_filename": 0,
+    }
     rows = conn.execute(
         """SELECT walk_id, city_id, provider, network_type, run_date, coverage_filename
            FROM street_walks WHERE coverage_by_highway IS NULL
@@ -73,13 +79,16 @@ def backfill(conn, data_dir: str, execute: bool = False) -> dict[str, int]:
         try:
             with gzip.open(path, "rt", encoding="utf-8") as fh:
                 geojson = json.load(fh)
-            breakdown = geojson["properties"]["metadata"].get("coverage_by_highway")
-        except (OSError, EOFError, ValueError, KeyError, TypeError) as e:
+        except (OSError, EOFError, ValueError) as e:
             logger.warning(
                 f"{label}: could not read {row['coverage_filename']} ({e}); leaving NULL"
             )
-            counts["missing_key"] += 1
+            counts["unreadable"] += 1
             continue
+        try:
+            breakdown = geojson["properties"]["metadata"].get("coverage_by_highway")
+        except (KeyError, TypeError, AttributeError):
+            breakdown = None
         if not breakdown:
             logger.warning(f"{label}: artifact carries no coverage_by_highway; leaving NULL")
             counts["missing_key"] += 1
@@ -120,6 +129,7 @@ def main() -> int:
         logger.info(
             f"\n{verb} {counts['updated']} walk(s); "
             f"{counts['missing_artifact']} missing artifact(s), "
+            f"{counts['unreadable']} unreadable, "
             f"{counts['missing_key']} without a breakdown, "
             f"{counts['skipped_no_filename']} with no artifact cataloged."
         )

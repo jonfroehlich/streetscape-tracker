@@ -1382,10 +1382,8 @@ def _reconcile_orphaned_walk(
             match_dist_m=meta.get("match_dist_m"),
             fc_new=geojson,
         )
-    except Exception as e:
-        logger.warning(
-            f"{city.city_id} [{channel}]: walk diff failed during salvage ({e}); continuing"
-        )
+    except Exception:
+        logger.exception(f"{city.city_id} [{channel}]: walk diff failed during salvage; continuing")
     if regenerate_manifest:
         # Without this the salvaged walk publishes but stays invisible: the city
         # page finds streetwalk artifacts only through the sidecar manifest.

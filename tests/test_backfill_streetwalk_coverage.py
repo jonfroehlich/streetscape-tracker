@@ -27,11 +27,16 @@ def _register_city(conn, name="Bend"):
     )
 
 
-def _walk(conn, data_dir, city_id, run_date, *, breakdown=BREAKDOWN, write_artifact=True):
+def _walk(
+    conn, data_dir, city_id, run_date, *, breakdown=BREAKDOWN, write_artifact=True, corrupt=False
+):
     """Catalog a pre-v11 walk (NULL breakdown column) with its artifact on disk."""
     stem = f"{city_id}_width_5000_height_5000_step_20_streetwalk_sp15_{run_date.isoformat()}"
     coverage_name = stem + "_coverage.json.gz"
-    if write_artifact:
+    if corrupt:
+        with open(os.path.join(data_dir, coverage_name), "wb") as fh:
+            fh.write(b"not gzip at all")
+    elif write_artifact:
         metadata = {"totals": {"coverage_pct_by_length": 80.0}}
         if breakdown is not None:
             metadata["coverage_by_highway"] = breakdown
@@ -85,8 +90,22 @@ def test_missing_artifact_or_key_is_counted_and_skipped(conn, data_dir):
     assert counts["updated"] == 0
     assert counts["missing_artifact"] == 1
     assert counts["missing_key"] == 1
+    assert counts["unreadable"] == 0
     assert _column(conn, gone) is None
     assert _column(conn, keyless) is None
+
+
+def test_unreadable_artifact_is_counted_separately(conn, data_dir):
+    """A present-but-corrupt artifact (truncated gzip, bad JSON) is its own
+    count — not conflated with a readable artifact that lacks the key."""
+    city_id = _register_city(conn)
+    walk_id = _walk(conn, data_dir, city_id, date(2026, 5, 1), corrupt=True)
+
+    counts = backfill(conn, data_dir, execute=True)
+    assert counts["updated"] == 0
+    assert counts["unreadable"] == 1
+    assert counts["missing_key"] == 0
+    assert _column(conn, walk_id) is None
 
 
 def test_populated_rows_are_untouched(conn, data_dir):
@@ -108,6 +127,7 @@ def test_populated_rows_are_untouched(conn, data_dir):
     assert counts == {
         "updated": 0,
         "missing_artifact": 0,
+        "unreadable": 0,
         "missing_key": 0,
         "skipped_no_filename": 0,
     }
