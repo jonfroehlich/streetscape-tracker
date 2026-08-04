@@ -7,6 +7,7 @@ import pytest
 from streetscape_metadata_tracker.naming import (
     generate_base_filename,
     generate_run_filename,
+    generate_streetwalk_diff_filename,
     generate_streetwalk_filename,
     parse_filename,
     parse_streetwalk_filename,
@@ -341,3 +342,65 @@ def test_parse_filename_rejects_streetwalk_artifacts():
 def test_parse_streetwalk_rejects_normal_run_files():
     with pytest.raises(ValueError):
         parse_streetwalk_filename("bend--or_width_5000_height_5000_step_20_2026-07-08.csv.gz")
+
+
+# ── Road-walk diff artifacts (issue #101) ───────────────────────────────────
+
+
+def test_streetwalk_diff_filename_tokens():
+    """gsv and 'drive' are tokenless; any other provider/network must be
+    tokenized or a same-date-pair diff of a second series would collide —
+    the exact failure mode the streetwalk provider token exists for."""
+    assert (
+        generate_streetwalk_diff_filename("bend--or", "2026-07-08", "2026-10-01")
+        == "bend--or_streetwalkdiff_2026-07-08_to_2026-10-01.csv.gz"
+    )
+    assert (
+        generate_streetwalk_diff_filename(
+            "bend--or", "2026-07-08", "2026-10-01", provider="mapillary"
+        )
+        == "bend--or_streetwalkdiff_mapillary_2026-07-08_to_2026-10-01.csv.gz"
+    )
+    assert (
+        generate_streetwalk_diff_filename(
+            "bend--or", "2026-07-08", "2026-10-01", network_type="all_public"
+        )
+        == "bend--or_streetwalkdiff_allpublic_2026-07-08_to_2026-10-01.csv.gz"
+    )
+    assert (
+        generate_streetwalk_diff_filename(
+            "bend--or", "2026-07-08", "2026-10-01", provider="mapillary", network_type="all_public"
+        )
+        == "bend--or_streetwalkdiff_mapillary_allpublic_2026-07-08_to_2026-10-01.csv.gz"
+    )
+
+
+def test_streetwalk_diff_filename_rejects_unknown_tokens():
+    with pytest.raises(ValueError):
+        generate_streetwalk_diff_filename("bend--or", "2026-07-08", "2026-10-01", provider="bing")
+    with pytest.raises(ValueError):
+        generate_streetwalk_diff_filename(
+            "bend--or", "2026-07-08", "2026-10-01", network_type="all-public"
+        )
+
+
+def test_parse_filename_rejects_streetwalk_diff_artifacts():
+    """Walk-diff detail files must never parse as run or streetwalk files —
+    the same ValueError-means-not-mine contract every artifact family keeps."""
+    names = [
+        generate_streetwalk_diff_filename("bend--or", "2026-07-08", "2026-10-01"),
+        generate_streetwalk_diff_filename(
+            "bend--or", "2026-07-08", "2026-10-01", provider="mapillary"
+        ),
+        generate_streetwalk_diff_filename(
+            "bend--or", "2026-07-08", "2026-10-01", network_type="all_public"
+        ),
+        generate_streetwalk_diff_filename(
+            "bend--or", "2026-07-08", "2026-10-01", provider="mapillary", network_type="all_public"
+        ),
+    ]
+    for name in names:
+        with pytest.raises(ValueError):
+            parse_filename(name)
+        with pytest.raises(ValueError):
+            parse_streetwalk_filename(name)

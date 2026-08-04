@@ -1,5 +1,6 @@
 """Catalog tests: registration, aliases, runs, diffs, budget, scheduling."""
 
+import json
 import os
 import sqlite3
 from datetime import date
@@ -793,6 +794,87 @@ def test_migrate_v9_to_v10(tmp_path):
     conn2.close()
 
 
+def test_migrate_v10_to_v11(tmp_path):
+    """A v10 catalog gains street_walks.coverage_by_highway and the
+    street_walk_diffs table on connect (issue #101).
+
+    Built from db._SCHEMA minus that column and table (so the fixture tracks
+    the code), with a pre-v11 walk seeded to prove the existing row survives
+    and the new column reads NULL — "not captured", awaiting backfill.
+    """
+    db_path = str(tmp_path / "v10.db")
+    raw = sqlite3.connect(db_path)
+    raw.executescript(db._SCHEMA)
+    raw.execute("DROP TABLE street_walk_diffs")
+    raw.execute("ALTER TABLE street_walks DROP COLUMN coverage_by_highway")
+    raw.execute(
+        """INSERT INTO cities (city_id, display_name, city_name, center_lat,
+           center_lon, grid_width_m, grid_height_m, step_m, created_at)
+           VALUES ('bend--or', 'Bend, OR', 'Bend', 44.05, -121.31,
+                   5000, 5000, 20, '2026-01-01T00:00:00+00:00')"""
+    )
+    raw.execute(
+        """INSERT INTO street_walks (city_id, provider, run_date, csv_filename,
+           coverage_pct_by_length)
+           VALUES ('bend--or', 'gsv', '2026-05-01', 'old_streetwalk.csv.gz', 98.4)"""
+    )
+    raw.execute("PRAGMA user_version = 10")
+    raw.commit()
+    raw.close()
+
+    conn = db.connect(db_path)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(street_walks)").fetchall()}
+    assert "coverage_by_highway" in cols
+    assert conn.execute("SELECT COUNT(*) FROM street_walk_diffs").fetchone()[0] == 0
+
+    walk = db.get_latest_street_walk(conn, "bend--or")
+    assert walk["coverage_pct_by_length"] == 98.4
+    assert walk["coverage_by_highway"] is None
+
+    # Idempotent: reopening must not error or re-migrate.
+    conn.close()
+    conn2 = db.connect(db_path)
+    assert conn2.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
+    conn2.close()
+
+
+def test_migrate_v8_catalog_reaches_current_schema_in_one_connect(tmp_path):
+    """A v8 catalog must flow through every terminal ladder step in ONE connect.
+
+    Regression test for the ladder's reassignment bug: the v8 -> v9 step
+    originally did not set user_version = 9, so any step gated on
+    `user_version == 9` (or later) would silently never fire for a catalog
+    arriving at v8 — it would get the rebuild, the version stamp, and NONE of
+    the newer columns. Asserts the v9 rebuild, the v10 tables, and the v11
+    column all land together.
+    """
+    db_path = str(tmp_path / "v8.db")
+    _build_v8_catalog(db_path)
+
+    conn = db.connect(db_path)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
+    # v9: the widened UNIQUE key.
+    assert _unique_key_columns(conn, "street_walks") == {
+        "city_id",
+        "provider",
+        "network_type",
+        "run_date",
+    }
+    # v10: the driving-plan tables.
+    assert conn.execute("SELECT COUNT(*) FROM driving_plan_snapshots").fetchone()[0] == 0
+    # v11: the per-highway column and the walk-diff table.
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(street_walks)").fetchall()}
+    assert "coverage_by_highway" in cols
+    assert conn.execute("SELECT COUNT(*) FROM street_walk_diffs").fetchone()[0] == 0
+    # And the seeded v8 walk survived the whole ladder.
+    walk = db.get_latest_street_walk(conn, "bend--or")
+    assert walk["csv_filename"] == "old_streetwalk.csv.gz"
+    assert walk["coverage_pct_by_length"] == 95.6
+    assert walk["coverage_by_highway"] is None
+    conn.close()
+
+
 def test_two_network_types_coexist_on_one_date(tmp_path):
     """The widened key is what lets both walks of a city survive the same night."""
     conn = db.connect(str(tmp_path / "c.db"))
@@ -933,6 +1015,128 @@ def test_street_walk_register_and_get(conn, city):
     )
     assert walk_id2 == walk_id
     assert db.get_latest_street_walk(conn, city)["sample_points"] == 1100
+
+
+def test_register_street_walk_persists_coverage_by_highway(conn, city):
+    """The per-bucket JSON round-trips, and a same-day re-register replaces it
+    (ON CONFLICT covers the new column like every other stat)."""
+    breakdown = json.dumps({"residential": {"edges": 100, "coverage_pct_by_length": 80.1}})
+    db.register_street_walk(
+        conn,
+        city_id=city,
+        run_date=date(2026, 7, 8),
+        csv_filename=f"{city}_width_5000_height_5000_step_20_streetwalk_sp15_2026-07-08.csv.gz",
+        coverage_by_highway=breakdown,
+    )
+    row = db.get_latest_street_walk(conn, city)
+    assert json.loads(row["coverage_by_highway"])["residential"]["edges"] == 100
+
+    replacement = json.dumps({"residential": {"edges": 101, "coverage_pct_by_length": 81.0}})
+    db.register_street_walk(
+        conn,
+        city_id=city,
+        run_date=date(2026, 7, 8),
+        csv_filename=f"{city}_width_5000_height_5000_step_20_streetwalk_sp15_2026-07-08.csv.gz",
+        coverage_by_highway=replacement,
+    )
+    assert json.loads(db.get_latest_street_walk(conn, city)["coverage_by_highway"]) == {
+        "residential": {"edges": 101, "coverage_pct_by_length": 81.0}
+    }
+
+
+def test_get_previous_street_walk_filters_series_and_date(conn, city):
+    """The predecessor lookup is per (city, provider, network_type) and
+    strictly before the date — never the walk itself, never another series."""
+
+    def _walk(run_date, provider="gsv", network_type="drive"):
+        from streetscape_metadata_tracker.naming import generate_streetwalk_filename
+
+        stem = generate_streetwalk_filename(
+            city, 5000, 5000, 20, 15, run_date, provider=provider, network_type=network_type
+        )
+        return db.register_street_walk(
+            conn,
+            city_id=city,
+            run_date=run_date,
+            csv_filename=stem + ".csv.gz",
+            provider=provider,
+            network_type=network_type,
+        )
+
+    first_id = _walk(date(2026, 4, 1))
+    _walk(date(2026, 5, 1), provider="mapillary")
+    _walk(date(2026, 6, 1), network_type="all_public")
+    _walk(date(2026, 7, 1))
+
+    prev = db.get_previous_street_walk(conn, city, date(2026, 7, 1))
+    assert prev["walk_id"] == first_id  # skips the other series entirely
+    assert prev["run_date"] == "2026-04-01"
+
+    # Strictly before: the first walk of a series has no predecessor.
+    assert db.get_previous_street_walk(conn, city, date(2026, 4, 1)) is None
+    assert db.get_previous_street_walk(conn, city, date(2026, 5, 1), provider="mapillary") is None
+
+
+def test_record_and_get_walk_diff(conn, city):
+    walk_a = db.register_street_walk(
+        conn,
+        city_id=city,
+        run_date=date(2026, 4, 1),
+        csv_filename="a_streetwalk.csv.gz",
+    )
+    walk_b = db.register_street_walk(
+        conn,
+        city_id=city,
+        run_date=date(2026, 7, 1),
+        csv_filename="b_streetwalk.csv.gz",
+    )
+    db.record_street_walk_diff(
+        conn,
+        city_id=city,
+        from_walk_id=walk_a,
+        to_walk_id=walk_b,
+        edges_aligned=200,
+        edges_added=0,
+        edges_removed=0,
+        edges_gained_coverage=12,
+        edges_lost_coverage=3,
+        coverage_fraction_changed=40,
+        nearest_pano_date_changed=25,
+        edges_fully_covered_delta=9,
+        coverage_pct_by_length_delta=4.2,
+        coverage_pct_by_length_any_delta=None,
+        detail_filename="diff.csv.gz",
+    )
+    row = db.get_walk_diff_for_walk(conn, walk_b)
+    assert row["edges_gained_coverage"] == 12
+    assert row["coverage_pct_by_length_delta"] == 4.2
+    assert row["coverage_pct_by_length_any_delta"] is None
+    assert row["from_run_date"] == "2026-04-01"
+    assert row["computed_at"]
+
+    # Idempotent on the pair: a re-diff replaces, never duplicates.
+    db.record_street_walk_diff(
+        conn,
+        city_id=city,
+        from_walk_id=walk_a,
+        to_walk_id=walk_b,
+        edges_aligned=200,
+        edges_added=0,
+        edges_removed=0,
+        edges_gained_coverage=13,
+        edges_lost_coverage=3,
+        coverage_fraction_changed=41,
+        nearest_pano_date_changed=25,
+        edges_fully_covered_delta=9,
+        coverage_pct_by_length_delta=4.3,
+        coverage_pct_by_length_any_delta=None,
+        detail_filename="diff.csv.gz",
+    )
+    assert conn.execute("SELECT COUNT(*) FROM street_walk_diffs").fetchone()[0] == 1
+    assert db.get_walk_diff_for_walk(conn, walk_b)["edges_gained_coverage"] == 13
+
+    # No diff recorded for the 'from' walk.
+    assert db.get_walk_diff_for_walk(conn, walk_a) is None
 
 
 def test_street_network_register_and_get(conn, city):

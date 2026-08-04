@@ -56,6 +56,7 @@ from .naming import (
     generate_streetwalk_filename,
     streetwalk_coverage_filename,
 )
+from .walk_diff import compute_and_record_walk_diff
 
 # Isolated street-coverage collection channels (issue #99). These ARE scheduled
 # channels — each cycles the catalog exactly like a grid provider, with its own
@@ -1332,7 +1333,10 @@ def _reconcile_orphaned_walk(
         return False
 
     sample_points = _count_streetwalk_samples(Path(cfg.data_dir) / csv_name)
-    db.register_street_walk(
+    # .get()-guarded like the other stats: an artifact written before issue
+    # #101 carries no such key, and its absence must never fail the salvage.
+    breakdown = meta.get("coverage_by_highway")
+    walk_id = db.register_street_walk(
         conn,
         city_id=city.city_id,
         run_date=today,
@@ -1351,6 +1355,7 @@ def _reconcile_orphaned_walk(
         mean_edge_coverage=totals.get("mean_edge_coverage"),
         coverage_pct_by_length=totals.get("coverage_pct_by_length"),
         coverage_pct_by_length_any=totals.get("coverage_pct_by_length_any"),
+        coverage_by_highway=json.dumps(breakdown) if breakdown else None,
         # GSV issues one metadata request per sample point, so the row count is
         # the request count. Mapillary's cost is a z14 tile census independent
         # of the sample count, which the artifacts don't record — leave it NULL
@@ -1359,6 +1364,28 @@ def _reconcile_orphaned_walk(
         started_at=None,
         finished_at=datetime.fromtimestamp(coverage_path.stat().st_mtime, UTC).isoformat(),
     )
+    # The salvage path is precisely where the collect-side diff was lost (the
+    # crash landed in the tail), and the previous walk's artifact is on disk —
+    # so compute it here too (issue #101). Failure-guarded: a diff bug must
+    # never turn a successful salvage into a recorded failure, which would
+    # re-crawl the city at full cost and defeat the salvage's purpose.
+    try:
+        compute_and_record_walk_diff(
+            conn,
+            data_dir=cfg.data_dir,
+            city_id=city.city_id,
+            walk_id=walk_id,
+            run_date=today,
+            provider=provider,
+            network_type=pc.network_type,
+            spacing_m=meta.get("spacing_m", pc.spacing_m),
+            match_dist_m=meta.get("match_dist_m"),
+            fc_new=geojson,
+        )
+    except Exception as e:
+        logger.warning(
+            f"{city.city_id} [{channel}]: walk diff failed during salvage ({e}); continuing"
+        )
     if regenerate_manifest:
         # Without this the salvaged walk publishes but stays invisible: the city
         # page finds streetwalk artifacts only through the sidecar manifest.

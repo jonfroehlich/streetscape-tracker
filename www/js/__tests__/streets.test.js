@@ -38,6 +38,7 @@ const {
   toRowModel,
   sortRows,
   num,
+  walkChangeCellHtml,
   walkRowHtml,
   STREET_COLUMNS,
   DEFAULT_SORT,
@@ -328,4 +329,84 @@ test("walkRowHtml: city names are HTML-escaped (OSM data is publicly editable)",
   const html = walkRowHtml(toRowModel(SEATTLE_WALK, { city: "<script>alert(1)</script>" }));
   assert.doesNotMatch(html, /<script>/);
   assert.match(html, /&lt;script&gt;/);
+});
+
+// --- walkChangeCellHtml (issue #101) ---------------------------------------
+
+const CHANGE_BLOCK = {
+  from: "2026-04-01",
+  to: "2026-07-26",
+  edges_gained_coverage: 12,
+  edges_lost_coverage: 3,
+  coverage_pct_by_length_delta: 4.2,
+  coverage_pct_by_length_any_delta: null,
+  nearest_pano_date_changed: 40,
+  diff_file: "seattle_streetwalkdiff_2026-04-01_to_2026-07-26.csv.gz",
+};
+
+test("toRowModel: maps the manifest change block onto change/changeDelta", () => {
+  const row = toRowModel({ ...SEATTLE_WALK, change: CHANGE_BLOCK }, null);
+  assert.equal(row.changeDelta, 4.2);
+  assert.equal(row.change.from, "2026-04-01");
+});
+
+test("toRowModel: first walks (no change block) leave both null", () => {
+  const row = toRowModel(SEATTLE_WALK, null);
+  assert.equal(row.change, null);
+  assert.equal(row.changeDelta, null);
+});
+
+test("walkChangeCellHtml: em dash for a first walk", () => {
+  assert.equal(walkChangeCellHtml(toRowModel(SEATTLE_WALK, null)), "<td>—</td>");
+});
+
+test("walkChangeCellHtml: signed pp figure with a churn title", () => {
+  const html = walkChangeCellHtml(toRowModel({ ...SEATTLE_WALK, change: CHANGE_BLOCK }, null));
+  assert.match(html, />\+4\.2 pp</);
+  assert.match(html, /Since 2026-04-01/);
+  assert.match(html, /12 streets gained/);
+  assert.match(html, /3 lost/);
+
+  const negative = walkChangeCellHtml(
+    toRowModel(
+      { ...SEATTLE_WALK, change: { ...CHANGE_BLOCK, coverage_pct_by_length_delta: -0.3 } },
+      null
+    )
+  );
+  assert.match(negative, />-0\.3 pp</);
+});
+
+test("walkChangeCellHtml: a zero delta still renders (imagery churned, net flat)", () => {
+  const html = walkChangeCellHtml(
+    toRowModel(
+      { ...SEATTLE_WALK, change: { ...CHANGE_BLOCK, coverage_pct_by_length_delta: 0 } },
+      null
+    )
+  );
+  assert.match(html, />\+0\.0 pp</);
+});
+
+test("walkRowHtml: cell count matches STREET_COLUMNS plus the link column", () => {
+  const html = walkRowHtml(toRowModel({ ...SEATTLE_WALK, change: CHANGE_BLOCK }, null));
+  const cells = (html.match(/<t[dh][ >]/g) || []).length;
+  assert.equal(cells, STREET_COLUMNS.length + 1);
+});
+
+test("sortRows: changeDelta sorts numerically with first walks (null) last", () => {
+  const rows = [
+    toRowModel({ ...SEATTLE_WALK, city_id: "a" }, null),
+    toRowModel(
+      { ...SEATTLE_WALK, city_id: "b", change: { ...CHANGE_BLOCK, coverage_pct_by_length_delta: -0.3 } },
+      null
+    ),
+    toRowModel(
+      { ...SEATTLE_WALK, city_id: "c", change: { ...CHANGE_BLOCK, coverage_pct_by_length_delta: 4.2 } },
+      null
+    ),
+  ];
+  const sorted = sortRows(rows, "changeDelta", "desc");
+  assert.deepEqual(
+    sorted.map((r) => r.cityId),
+    ["c", "b", "a"]
+  );
 });

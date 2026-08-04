@@ -323,3 +323,83 @@ def test_manifest_overwrites_a_previous_manifest(conn, data_dir):
     generate_streetwalk_manifest(conn, data_dir)
 
     assert _read_manifest(data_dir)["walks"] == []
+
+
+# ── The "since last walk" change block (issue #101) ─────────────────────────
+
+
+def _two_walks_with_diff(conn):
+    """A city with two cataloged walks and a recorded diff between them."""
+    city_id = _register_city(conn, "Sisters", "Oregon", "OR")
+    from_id = db.register_street_walk(
+        conn,
+        city_id=city_id,
+        run_date=date(2026, 4, 1),
+        csv_filename="sisters_a_streetwalk.csv.gz",
+        coverage_pct_by_length=61.0,
+    )
+    to_id = db.register_street_walk(
+        conn,
+        city_id=city_id,
+        run_date=date(2026, 7, 1),
+        csv_filename="sisters_b_streetwalk.csv.gz",
+        coverage_pct_by_length=65.2,
+    )
+    db.record_street_walk_diff(
+        conn,
+        city_id=city_id,
+        from_walk_id=from_id,
+        to_walk_id=to_id,
+        edges_aligned=120,
+        edges_added=0,
+        edges_removed=0,
+        edges_gained_coverage=8,
+        edges_lost_coverage=1,
+        coverage_fraction_changed=14,
+        nearest_pano_date_changed=30,
+        edges_fully_covered_delta=5,
+        coverage_pct_by_length_delta=4.2,
+        coverage_pct_by_length_any_delta=None,
+        detail_filename="sisters_streetwalkdiff_2026-04-01_to_2026-07-01.csv.gz",
+    )
+    return city_id
+
+
+def test_manifest_carries_change_block_for_diffed_walk(conn, data_dir):
+    _two_walks_with_diff(conn)
+    (entry,) = generate_streetwalk_manifest(conn, data_dir)["walks"]
+    assert entry["run_date"] == "2026-07-01"
+    assert entry["change"] == {
+        "from": "2026-04-01",
+        "to": "2026-07-01",
+        "edges_gained_coverage": 8,
+        "edges_lost_coverage": 1,
+        "coverage_pct_by_length_delta": 4.2,
+        "coverage_pct_by_length_any_delta": None,
+        "nearest_pano_date_changed": 30,
+        "diff_file": "sisters_streetwalkdiff_2026-04-01_to_2026-07-01.csv.gz",
+    }
+
+
+def test_manifest_omits_change_key_when_no_diff(conn, data_dir):
+    """First walks — still most of production — carry NO change key at all,
+    not a null one: the key is additive and its absence means 'never diffed'."""
+    city_id = _register_city(conn, "Adrian", "Oregon", "OR")
+    db.register_street_walk(
+        conn,
+        city_id=city_id,
+        run_date=date(2026, 7, 17),
+        csv_filename="adrian_streetwalk.csv.gz",
+    )
+    (entry,) = generate_streetwalk_manifest(conn, data_dir)["walks"]
+    assert "change" not in entry
+
+
+def test_manifest_change_survives_a_json_roundtrip(conn, data_dir):
+    """The change block must survive the gzip/JSON write like every other
+    field — what the browser parses is the file, not the returned dict."""
+    _two_walks_with_diff(conn)
+    generate_streetwalk_manifest(conn, data_dir)
+    (entry,) = _read_manifest(data_dir)["walks"]
+    assert entry["change"]["coverage_pct_by_length_delta"] == 4.2
+    assert entry["change"]["from"] == "2026-04-01"
