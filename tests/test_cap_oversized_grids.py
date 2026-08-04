@@ -180,3 +180,12 @@ def test_disabled_cities_are_left_alone(conn):
     conn.commit()
 
     assert find_oversized(conn, 40_000) == []
+
+
+def test_default_cap_matches_registration_ceiling():
+    """The retroactive cap and cli.py's registration-time clamp must agree,
+    or a city registered today could need capping tomorrow."""
+    from scripts.cap_oversized_grids import DEFAULT_MAX_EXTENT_M
+    from streetscape_metadata_tracker.cli import MAX_GRID_DIM_M
+
+    assert DEFAULT_MAX_EXTENT_M == MAX_GRID_DIM_M == 40_000

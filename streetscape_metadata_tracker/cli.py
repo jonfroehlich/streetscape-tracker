@@ -59,15 +59,17 @@ from .paths import get_default_data_dir, get_default_vis_dir
 
 logger = logging.getLogger(__name__)
 
-# Practical ceiling for auto-derived grid dimensions (issue #91). We bias grids
-# BIGGER not smaller — the full OSM bounding box, so a future analysis can clip
-# to the (always-smaller) polygon boundary; oversampling is free (GSV metadata
-# has no quota) and recoverable, undersampling loses coverage permanently. The
-# only real limit is collection time, so we clamp (with a warning) just the
-# handful of enormous administrative units — e.g. Đà Nẵng's 194×153 km
-# municipality — that would otherwise take ~hundreds of days. Override with
-# --width/--height for a genuinely larger area.
-MAX_GRID_DIM_M = 80000
+# Ceiling for auto-derived grid dimensions, per side (issue #166; supersedes
+# the 80 km value from #91). At the standard 20 m step, 40 km/side is ~4M grid
+# points — inside the production gsv daily budget (10M) with room for other
+# cities, and roughly twice Seattle's grid, comfortably more than an urban
+# core. Production data showed the old 80 km clamp still admitted grids no
+# night can absorb (Cairo ~10.5M points was skipped as over-budget every night,
+# and its ZERO_RESULTS fill alone OOMed the Mapillary tail — see #157/#166).
+# scripts/cap_oversized_grids.py applies this same cap retroactively; keep the
+# two in sync by importing this constant. Override with --width/--height for a
+# genuinely larger area.
+MAX_GRID_DIM_M = 40_000
 
 
 def _resolve_center(city_loc_data):

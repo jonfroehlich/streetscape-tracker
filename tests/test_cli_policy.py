@@ -279,3 +279,22 @@ def test_refuses_to_overwrite_existing_uncataloged_snapshot(monkeypatch, catalog
     assert calls == [], "must refuse before issuing any request"
     with open(out_path, "rb") as f:
         assert f.read() == b"orphan or concurrent run in flight", "existing file untouched"
+
+
+# ── Registration-time grid cap (issue #166) ─────────────────────────────────
+
+
+def test_cap_dimensions_clamps_each_side_to_40km():
+    """Auto-derived grids are capped at 40 km/side at registration (issue
+    #166), so newly registered cities can't recreate the oversized grids that
+    scripts/cap_oversized_grids.py had to fix retroactively."""
+    # Cairo's real pre-cap OSM-derived geometry
+    w, h = cli._cap_dimensions(66_453, 63_475, "Cairo, Egypt")
+    assert (w, h) == (40_000, 40_000)
+
+    # One long side clamps independently; the sane side is untouched
+    w, h = cli._cap_dimensions(51_568, 25_146, "Caracas, Venezuela")
+    assert (w, h) == (40_000, 25_146)
+
+    # At or under the cap passes through unchanged
+    assert cli._cap_dimensions(40_000, 12_000, "Fine") == (40_000, 12_000)
