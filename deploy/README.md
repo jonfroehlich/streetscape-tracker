@@ -195,6 +195,37 @@ systemctl --user start streetscape-tracker.service           # trigger a run now
 Rotating file logs also go to `logs/streetscape_scheduler.log`, and a rolling
 catalog backup to `logs/streetscape_tracker.db.backup`.
 
+### Backups (verified with CSE IT, 2026-08-05 — issue #145)
+
+What CSE IT confirmed when we asked, after the 2026-07 quota incident (#143)
+prompted the question:
+
+- **`/projects/makeabilitylab` (the makelab2 array, NFS-mounted) was not being
+  snapshotted or backed up at all** until 2026-08-05, when CSE IT fixed the
+  configuration: ZFS snapshots (first one 2026-08-05 12:00), nightly filesystem
+  sync to the CSE backup servers, and an off-site sync to UW's **lolo** service
+  after that. They also swept *all* makelab data volumes into backups at the
+  same time, after finding the setup "woefully incorrectly configured" for the
+  second time in two months — so treat "it's on lab storage" as **not** implying
+  "it's backed up" for any future deployment, and ask again.
+- **The public docroot** `/cse/web/research/makelab` (which serves both our
+  published `data/` and the Makeability Lab website's `/media` + `/public`) was
+  already on the standard rotation: hourly/weekly/monthly snapshots plus lolo,
+  **snapshots retained 1 year**.
+- **SQLite + ZFS caveat:** a snapshot of the *live* WAL-mode catalog may still
+  be torn (recent ZFS waits for an in-flight write, but CSE IT wouldn't vouch
+  for it). Their recommendation — keep a periodic dumped copy in the same
+  directory — is already what the scheduler does: every `run-due` tail writes a
+  **consistent** copy via SQLite's online backup API (`conn.backup()`) to
+  `logs/streetscape_tracker.db.backup`. That file is safe to snapshot at any
+  instant, and the ZFS snapshot history of it provides point-in-time restores.
+  **When restoring, prefer the `.backup` file** (or a `PRAGMA wal_checkpoint`ed
+  live DB) over a raw copy of `streetscape_tracker.db` + sidecars from a
+  snapshot.
+- **Restore procedure:** through CSE IT (support@cs.washington.edu). Retention
+  for `/projects/makeabilitylab` beyond the snapshot/sync/lolo tiers wasn't
+  stated explicitly — ask when it matters.
+
 **Diagnosing a failed city.** `journalctl` above needs journal read access, which
 the service account does not have on makelab2 — so don't rely on it. Three file
 logs cover the same ground:
