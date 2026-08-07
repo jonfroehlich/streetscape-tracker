@@ -67,8 +67,10 @@ logger = logging.getLogger(__name__)
 # night can absorb (Cairo ~10.5M points was skipped as over-budget every night,
 # and its ZERO_RESULTS fill alone OOMed the Mapillary tail — see #157/#166).
 # scripts/cap_oversized_grids.py applies this same cap retroactively; keep the
-# two in sync by importing this constant. Override with --width/--height for a
-# genuinely larger area.
+# two in sync by importing this constant. NB the budget math above assumes the
+# standard 20 m step — this is a *dimension* cap, so a finer --step re-inflates
+# the point count (40 km/side at step 10 is ~16M points, over budget again).
+# Override with --width/--height for a genuinely larger area.
 MAX_GRID_DIM_M = 40_000
 
 
