@@ -135,8 +135,12 @@ An admin-1 name that merely restates the city (`Lima Province`, `Kyiv City`,
 the identity (`build_worldwide_frame.effective_admin`), so city-state-like
 slugs stay clean. `sanitize_city_query_str` itself is unchanged (it is a
 frozen contract); we simply feed it clean inputs. Megacities inherit the
-existing 80 km grid cap (Shanghai's ~437×308 km administrative boundary clamps
-to 80×80 km).
+registration-time grid cap of 40 km/side (`cli.MAX_GRID_DIM_M`), so Shanghai's
+~437×308 km administrative boundary clamps to 40×40 km. That ceiling was 80 km
+until issue #166, when production showed 80 km still admitted grids no night
+could collect — Cairo's ~10.5M points exceeded the entire daily gsv budget and
+were skipped every night. `scripts/cap_oversized_grids.py` applied the same
+40 km cap retroactively to already-registered cities.
 
 Some frame cities were **already registered** earlier under geocoder-derived
 slugs (e.g. `são-paulo--são-paulo--brazil`, `istanbul--marmara-region--turkey`).

@@ -61,11 +61,13 @@ logger = logging.getLogger("reregister")
 # conservative — smaller than the recommendation ceiling below.
 REVIEW_THRESHOLD_M = 30000
 
-# Ceiling for the "best size" RECOMMENDATION written to the manual-review file
-# (and the going-forward cli.MAX_GRID_DIM_M). We bias BIGGER — recommend the
-# full OSM bbox so an analysis can later clip to the always-smaller polygon —
-# capping only the enormous administrative units (Đà Nẵng's 194×153 km) whose
-# collection time is impractical.
+# Ceiling for the "best size" RECOMMENDATION written to the manual-review file.
+# We bias BIGGER — recommend the full OSM bbox so an analysis can later clip to
+# the always-smaller polygon — capping only the enormous administrative units
+# (Đà Nẵng's 194×153 km) whose collection time is impractical. Kept at the
+# historical 80 km this one-time #91 tool actually ran with; the going-forward
+# registration ceiling (cli.MAX_GRID_DIM_M) has since dropped to 40 km
+# (issue #166), enforced retroactively by scripts/cap_oversized_grids.py.
 REC_CEILING_M = 80000
 
 # Default locations, relative to the repo root.

@@ -180,3 +180,37 @@ def test_disabled_cities_are_left_alone(conn):
     conn.commit()
 
     assert find_oversized(conn, 40_000) == []
+
+
+def test_include_disabled_finds_the_landmine_cities(conn):
+    """A disabled city costs nothing tonight, but nothing else ever caps it —
+    the registration clamp runs only at registration — so enabling one later
+    reintroduces #166. --include-disabled is the way to reach them."""
+    disabled = _register(conn, "Dormant", width=100_000, height=100_000)
+    enabled = _register(conn, "Active", width=90_000, height=90_000)
+    conn.execute("UPDATE cities SET enabled = 0 WHERE city_id = ?", (disabled,))
+    conn.commit()
+
+    default_run = find_oversized(conn, 40_000)
+    assert [c["city_id"] for c in default_run] == [enabled]
+
+    swept = find_oversized(conn, 40_000, include_disabled=True)
+    assert sorted(c["city_id"] for c in swept) == sorted([disabled, enabled])
+    assert {c["city_id"]: c["enabled"] for c in swept} == {disabled: False, enabled: True}
+    assert all(c["new_width_m"] == 40_000 for c in swept)
+
+
+def test_default_cap_matches_registration_ceiling():
+    """The retroactive cap and cli.py's registration-time clamp must agree, or a
+    city registered today could need capping tomorrow.
+
+    The first equality holds by construction (``DEFAULT_MAX_EXTENT_M`` *is*
+    ``cli.MAX_GRID_DIM_M``) and only guards against someone re-hardcoding it.
+    The load-bearing half is ``== 40_000``: a deliberate change-detector on a
+    number the production budget depends on, so moving it is a decision rather
+    than an edit. If policy really changes, update this line with the reason.
+    """
+    from scripts.cap_oversized_grids import DEFAULT_MAX_EXTENT_M
+    from streetscape_metadata_tracker.cli import MAX_GRID_DIM_M
+
+    assert DEFAULT_MAX_EXTENT_M == MAX_GRID_DIM_M == 40_000
