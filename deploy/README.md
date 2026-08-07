@@ -211,7 +211,9 @@ prompted the question:
 - **The public docroot** `/cse/web/research/makelab` (which serves both our
   published `data/` and the Makeability Lab website's `/media` + `/public`) was
   already on the standard rotation: hourly/weekly/monthly snapshots plus lolo,
-  **snapshots retained 1 year**.
+  **snapshots retained 1 year**. (The website's *postgres* volume has the same
+  torn-snapshot problem the catalog does; the nightly `pg_dump` fix lives in
+  that repo — `makeabilitylab/makeabilitylabwebsite#1443`, still open.)
 - **SQLite + ZFS caveat:** a snapshot of the *live* WAL-mode catalog may still
   be torn (recent ZFS waits for an in-flight write, but CSE IT wouldn't vouch
   for it). Their recommendation — keep a periodic dumped copy in the same
