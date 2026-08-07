@@ -215,16 +215,29 @@ prompted the question:
 - **SQLite + ZFS caveat:** a snapshot of the *live* WAL-mode catalog may still
   be torn (recent ZFS waits for an in-flight write, but CSE IT wouldn't vouch
   for it). Their recommendation — keep a periodic dumped copy in the same
-  directory — is already what the scheduler does: every `run-due` tail writes a
-  **consistent** copy via SQLite's online backup API (`conn.backup()`) to
-  `logs/streetscape_tracker.db.backup`. That file is safe to snapshot at any
-  instant, and the ZFS snapshot history of it provides point-in-time restores.
+  directory — is already what the scheduler does: the `run-due` tail
+  (`_finish_batch`) writes a **consistent** copy via SQLite's online backup API
+  (`conn.backup()`) to `logs/streetscape_tracker.db.backup`. The ZFS snapshot
+  history of that file is what gives us point-in-time restores.
   **When restoring, prefer the `.backup` file** (or a `PRAGMA wal_checkpoint`ed
   live DB) over a raw copy of `streetscape_tracker.db` + sidecars from a
   snapshot.
+- **Two caveats on the `.backup` file itself**, both worth knowing before you
+  trust it in an incident:
+  - It is a *single rolling copy*, rewritten in place each night. A snapshot
+    landing inside those few seconds catches the destination mid-transaction —
+    still recoverable, because a ZFS snapshot is filesystem-atomic and captures
+    SQLite's rollback journal alongside it, but it is not literally "safe at any
+    instant." Any snapshot from outside that window is clean.
+  - The tail runs after any *loop-level* failure (errored city loop, batch
+    deadline, SIGTERM — see #167), but **not** if the process is SIGKILLed,
+    which is the documented OOM mode on the Mapillary post-decode path (#157).
+    So on exactly the nights something went badly wrong, the `.backup` may be a
+    day or more stale — **check its mtime before trusting it.**
 - **Restore procedure:** through CSE IT (support@cs.washington.edu). Retention
   for `/projects/makeabilitylab` beyond the snapshot/sync/lolo tiers wasn't
-  stated explicitly — ask when it matters.
+  stated explicitly — ask when it matters. **A restore has never been
+  exercised** (true as of 2026-08-05) — budget time for surprises.
 
 **Diagnosing a failed city.** `journalctl` above needs journal read access, which
 the service account does not have on makelab2 — so don't rely on it. Three file
