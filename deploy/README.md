@@ -195,6 +195,52 @@ systemctl --user start streetscape-tracker.service           # trigger a run now
 Rotating file logs also go to `logs/streetscape_scheduler.log`, and a rolling
 catalog backup to `logs/streetscape_tracker.db.backup`.
 
+### Backups (verified with CSE IT, 2026-08-05 — issue #145)
+
+What CSE IT confirmed when we asked, after the 2026-07 quota incident (#143)
+prompted the question:
+
+- **`/projects/makeabilitylab` (the makelab2 array, NFS-mounted) was not being
+  snapshotted or backed up at all** until 2026-08-05, when CSE IT fixed the
+  configuration: ZFS snapshots (first one 2026-08-05 12:00), nightly filesystem
+  sync to the CSE backup servers, and an off-site sync to UW's **lolo** service
+  after that. They also swept *all* makelab data volumes into backups at the
+  same time, after finding the setup "woefully incorrectly configured" for the
+  second time in two months — so treat "it's on lab storage" as **not** implying
+  "it's backed up" for any future deployment, and ask again.
+- **The public docroot** `/cse/web/research/makelab` (which serves both our
+  published `data/` and the Makeability Lab website's `/media` + `/public`) was
+  already on the standard rotation: hourly/weekly/monthly snapshots plus lolo,
+  **snapshots retained 1 year**. (The website's *postgres* volume has the same
+  torn-snapshot problem the catalog does; the nightly `pg_dump` fix lives in
+  that repo — `makeabilitylab/makeabilitylabwebsite#1443`, still open.)
+- **SQLite + ZFS caveat:** a snapshot of the *live* WAL-mode catalog may still
+  be torn (recent ZFS waits for an in-flight write, but CSE IT wouldn't vouch
+  for it). Their recommendation — keep a periodic dumped copy in the same
+  directory — is already what the scheduler does: the `run-due` tail
+  (`_finish_batch`) writes a **consistent** copy via SQLite's online backup API
+  (`conn.backup()`) to `logs/streetscape_tracker.db.backup`. The ZFS snapshot
+  history of that file is what gives us point-in-time restores.
+  **When restoring, prefer the `.backup` file** (or a `PRAGMA wal_checkpoint`ed
+  live DB) over a raw copy of `streetscape_tracker.db` + sidecars from a
+  snapshot.
+- **Two caveats on the `.backup` file itself**, both worth knowing before you
+  trust it in an incident:
+  - It is a *single rolling copy*, rewritten in place each night. A snapshot
+    landing inside those few seconds catches the destination mid-transaction —
+    still recoverable, because a ZFS snapshot is filesystem-atomic and captures
+    SQLite's rollback journal alongside it, but it is not literally "safe at any
+    instant." Any snapshot from outside that window is clean.
+  - The tail runs after any *loop-level* failure (errored city loop, batch
+    deadline, SIGTERM — see #167), but **not** if the process is SIGKILLed,
+    which is the documented OOM mode on the Mapillary post-decode path (#157).
+    So on exactly the nights something went badly wrong, the `.backup` may be a
+    day or more stale — **check its mtime before trusting it.**
+- **Restore procedure:** through CSE IT (support@cs.washington.edu). Retention
+  for `/projects/makeabilitylab` beyond the snapshot/sync/lolo tiers wasn't
+  stated explicitly — ask when it matters. **A restore has never been
+  exercised** (true as of 2026-08-05) — budget time for surprises.
+
 **Diagnosing a failed city.** `journalctl` above needs journal read access, which
 the service account does not have on makelab2 — so don't rely on it. Three file
 logs cover the same ground:
