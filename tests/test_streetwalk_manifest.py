@@ -403,3 +403,137 @@ def test_manifest_change_survives_a_json_roundtrip(conn, data_dir):
     (entry,) = _read_manifest(data_dir)["walks"]
     assert entry["change"]["coverage_pct_by_length_delta"] == 4.2
     assert entry["change"]["from"] == "2026-04-01"
+
+
+# ── Absolute street length + per-class breakdown (schema v12) ──────────────
+
+# One bucket carrying every published field, plus fields the manifest must
+# drop. Mirrors the artifact shape summarize_streetwalk_coverage emits.
+_FULL_BUCKET = {
+    "edges": 4762,
+    "edges_sampled": 4762,
+    "edges_fully_covered": 3900,
+    "edges_any_coverage": 4100,
+    "length_km": 237.048,
+    "length_km_covered": 220.439,
+    "length_km_covered_any": 220.439,
+    "mean_edge_coverage": 0.93,
+    "coverage_pct_by_length": 93.0,
+    "coverage_pct_by_length_any": 93.0,
+    "median_covered_age_years": 2.32,
+}
+
+
+def _walk_with_lengths(conn, city_id, *, breakdown=None, **overrides):
+    kwargs = {
+        "length_km": 1172.091,
+        "length_km_covered": 872.853,
+        "length_km_covered_any": 880.0,
+        "median_covered_age_years": 2.32,
+    }
+    kwargs.update(overrides)
+    return db.register_street_walk(
+        conn,
+        city_id=city_id,
+        run_date=date(2026, 7, 27),
+        csv_filename="corvallis_streetwalk.csv.gz",
+        coverage_filename="corvallis_streetwalk_coverage.json.gz",
+        coverage_pct_by_length=74.5,
+        coverage_by_highway=json.dumps(breakdown) if breakdown is not None else None,
+        **kwargs,
+    )
+
+
+def test_manifest_publishes_absolute_street_lengths(conn, data_dir):
+    """The kilometres, not just the share. A percentage cannot be turned back
+    into kilometres without the denominator, and the denominator is the point:
+    74.5% of Corvallis is 873 km, 74.5% of a village is 5 km."""
+    city_id = _register_city(conn, "Corvallis", "Oregon", "OR")
+    _walk_with_lengths(conn, city_id)
+
+    (entry,) = generate_streetwalk_manifest(conn, data_dir)["walks"]
+    assert entry["length_km"] == 1172.091
+    assert entry["length_km_covered"] == 872.853
+    assert entry["length_km_covered_any"] == 880.0
+    assert entry["median_covered_age_years"] == 2.32
+    # And the published percentage still agrees with the published lengths.
+    assert 100.0 * entry["length_km_covered"] / entry["length_km"] == pytest.approx(
+        entry["coverage_pct_by_length"], abs=0.05
+    )
+
+
+def test_manifest_lengths_are_null_on_unbackfilled_walks(conn, data_dir):
+    """A pre-v12 walk that has not been backfilled publishes nulls, not
+    zeros: "not measured" and "no street kilometres" are different claims."""
+    city_id = _register_city(conn, "Adrian", "Oregon", "OR")
+    db.register_street_walk(
+        conn,
+        city_id=city_id,
+        run_date=date(2026, 7, 17),
+        csv_filename="adrian_streetwalk.csv.gz",
+        coverage_pct_by_length=95.6,
+    )
+    (entry,) = generate_streetwalk_manifest(conn, data_dir)["walks"]
+    assert entry["length_km"] is None
+    assert entry["length_km_covered"] is None
+    assert entry["median_covered_age_years"] is None
+
+
+def test_manifest_publishes_trimmed_per_class_breakdown(conn, data_dir):
+    """The by-highway cut is what answers "is there imagery where pedestrians
+    walk" — but only the fields the page renders are published; the manifest
+    is fetched by every visitor."""
+    city_id = _register_city(conn, "Corvallis", "Oregon", "OR")
+    _walk_with_lengths(conn, city_id, breakdown={"residential": _FULL_BUCKET})
+
+    (entry,) = generate_streetwalk_manifest(conn, data_dir)["walks"]
+    assert entry["coverage_by_highway"] == {
+        "residential": {
+            "edges": 4762,
+            "length_km": 237.048,
+            "length_km_covered": 220.439,
+            "length_km_covered_any": 220.439,
+            "coverage_pct_by_length": 93.0,
+            "coverage_pct_by_length_any": 93.0,
+            "median_covered_age_years": 2.32,
+        }
+    }
+
+
+def test_manifest_preserves_highway_bucket_order(conn, data_dir):
+    """The artifact's key order is the road -> service -> non-motorized
+    hierarchy the frontend legend renders in. Re-serializing must not
+    re-sort it alphabetically."""
+    city_id = _register_city(conn, "Corvallis", "Oregon", "OR")
+    ordered = ["trunk", "primary", "residential", "alley", "footway"]
+    _walk_with_lengths(conn, city_id, breakdown={k: dict(_FULL_BUCKET) for k in ordered})
+
+    generate_streetwalk_manifest(conn, data_dir)
+    (entry,) = _read_manifest(data_dir)["walks"]  # order must survive the file, too
+    assert list(entry["coverage_by_highway"]) == ordered
+
+
+def test_manifest_omits_breakdown_key_when_not_captured(conn, data_dir):
+    """Absent, not null — the same additive convention the change block uses."""
+    city_id = _register_city(conn, "Adrian", "Oregon", "OR")
+    _walk_with_lengths(conn, city_id, breakdown=None)
+    (entry,) = generate_streetwalk_manifest(conn, data_dir)["walks"]
+    assert "coverage_by_highway" not in entry
+
+
+def test_manifest_survives_an_unparseable_breakdown(conn, data_dir):
+    """A corrupt breakdown on one row must not take down the whole manifest:
+    the walk's headline stats are still sound, so it publishes without it."""
+    city_id = _register_city(conn, "Adrian", "Oregon", "OR")
+    db.register_street_walk(
+        conn,
+        city_id=city_id,
+        run_date=date(2026, 7, 17),
+        csv_filename="adrian_streetwalk.csv.gz",
+        coverage_pct_by_length=95.6,
+        coverage_by_highway="{not json at all",
+        length_km=7.0,
+    )
+    (entry,) = generate_streetwalk_manifest(conn, data_dir)["walks"]
+    assert "coverage_by_highway" not in entry
+    assert entry["length_km"] == 7.0

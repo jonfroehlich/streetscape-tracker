@@ -1356,6 +1356,13 @@ def _reconcile_orphaned_walk(
         coverage_pct_by_length=totals.get("coverage_pct_by_length"),
         coverage_pct_by_length_any=totals.get("coverage_pct_by_length_any"),
         coverage_by_highway=json.dumps(breakdown) if breakdown else None,
+        # Absolute street length (v12). All four are .get()-guarded for the same
+        # reason the breakdown above is: the salvage path reads whatever artifact
+        # happens to be on disk, including ones written before these keys existed.
+        length_km=totals.get("length_km"),
+        length_km_covered=totals.get("length_km_covered"),
+        length_km_covered_any=totals.get("length_km_covered_any"),
+        median_covered_age_years=totals.get("median_covered_age_years"),
         # GSV issues one metadata request per sample point, so the row count is
         # the request count. Mapillary's cost is a z14 tile census independent
         # of the sample count, which the artifacts don't record — leave it NULL

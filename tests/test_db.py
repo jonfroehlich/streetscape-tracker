@@ -839,6 +839,112 @@ def test_migrate_v10_to_v11(tmp_path):
     conn2.close()
 
 
+def test_migrate_v11_to_v12(tmp_path):
+    """A v11 catalog gains the street_walks absolute-length columns on connect.
+
+    Built from db._SCHEMA minus those columns (so the fixture tracks the code),
+    with a pre-v12 walk seeded to prove the existing row survives and the new
+    columns read NULL — "not captured", awaiting
+    scripts/backfill_streetwalk_length.py.
+    """
+    db_path = str(tmp_path / "v11.db")
+    raw = sqlite3.connect(db_path)
+    raw.executescript(db._SCHEMA)
+    for column in db._V12_STREET_WALK_COLUMNS:
+        raw.execute(f"ALTER TABLE street_walks DROP COLUMN {column}")
+    raw.execute(
+        """INSERT INTO cities (city_id, display_name, city_name, center_lat,
+           center_lon, grid_width_m, grid_height_m, step_m, created_at)
+           VALUES ('bend--or', 'Bend, OR', 'Bend', 44.05, -121.31,
+                   5000, 5000, 20, '2026-01-01T00:00:00+00:00')"""
+    )
+    raw.execute(
+        """INSERT INTO street_walks (city_id, provider, run_date, csv_filename,
+           coverage_pct_by_length)
+           VALUES ('bend--or', 'gsv', '2026-05-01', 'old_streetwalk.csv.gz', 98.4)"""
+    )
+    raw.execute("PRAGMA user_version = 11")
+    raw.commit()
+    raw.close()
+
+    conn = db.connect(db_path)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(street_walks)").fetchall()}
+    assert set(db._V12_STREET_WALK_COLUMNS) <= cols
+
+    walk = db.get_latest_street_walk(conn, "bend--or")
+    assert walk["coverage_pct_by_length"] == 98.4  # the pre-v12 row survived
+    for column in db._V12_STREET_WALK_COLUMNS:
+        assert walk[column] is None
+
+    # Idempotent: reopening must not error or re-migrate.
+    conn.close()
+    conn2 = db.connect(db_path)
+    assert conn2.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
+    conn2.close()
+
+
+def test_migrate_v11_to_v12_resumes_after_a_partial_migration(tmp_path):
+    """
+    A catalog interrupted midway through the v12 ADD COLUMNs must complete on
+    the next connect. The columns are added one statement at a time, so a crash
+    (or a kill -9 mid-night) can leave some present and some not — a guard that
+    checked only the FIRST column would declare the migration done and leave
+    the rest permanently missing.
+    """
+    db_path = str(tmp_path / "partial.db")
+    raw = sqlite3.connect(db_path)
+    raw.executescript(db._SCHEMA)
+    # Drop only the last two: simulates a migration that got halfway.
+    for column in db._V12_STREET_WALK_COLUMNS[2:]:
+        raw.execute(f"ALTER TABLE street_walks DROP COLUMN {column}")
+    raw.execute("PRAGMA user_version = 11")
+    raw.commit()
+    raw.close()
+
+    conn = db.connect(db_path)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(street_walks)").fetchall()}
+    assert set(db._V12_STREET_WALK_COLUMNS) <= cols
+    conn.close()
+
+
+def test_register_street_walk_round_trips_the_v12_lengths(tmp_path):
+    """The lengths reach the row, and re-collecting the same day replaces them
+    rather than keeping the first walk's figures (the upsert covers v12 too)."""
+    conn = db.connect(str(tmp_path / "c.db"))
+    db.register_city(
+        conn,
+        city_name="Bend",
+        state_name="Oregon",
+        state_code="OR",
+        country_name="United States",
+        country_code="US",
+        center_lat=44.05,
+        center_lon=-121.31,
+        grid_width_m=5000,
+        grid_height_m=5000,
+        step_m=20,
+    )
+    cid = "bend--oregon--united-states"
+    for csv_name, length_km, covered in [("a.csv.gz", 100.0, 40.0), ("b.csv.gz", 101.5, 90.0)]:
+        db.register_street_walk(
+            conn,
+            city_id=cid,
+            run_date=date(2026, 5, 1),
+            csv_filename=csv_name,
+            length_km=length_km,
+            length_km_covered=covered,
+            length_km_covered_any=covered,
+            median_covered_age_years=2.5,
+        )
+
+    walk = db.get_latest_street_walk(conn, cid)
+    assert walk["length_km"] == 101.5
+    assert walk["length_km_covered"] == 90.0
+    assert walk["median_covered_age_years"] == 2.5
+    conn.close()
+
+
 def test_migrate_v8_catalog_reaches_current_schema_in_one_connect(tmp_path):
     """A v8 catalog must flow through every terminal ladder step in ONE connect.
 
@@ -867,6 +973,8 @@ def test_migrate_v8_catalog_reaches_current_schema_in_one_connect(tmp_path):
     cols = {r[1] for r in conn.execute("PRAGMA table_info(street_walks)").fetchall()}
     assert "coverage_by_highway" in cols
     assert conn.execute("SELECT COUNT(*) FROM street_walk_diffs").fetchone()[0] == 0
+    # v12: the absolute-length columns.
+    assert set(db._V12_STREET_WALK_COLUMNS) <= cols
     # And the seeded v8 walk survived the whole ladder.
     walk = db.get_latest_street_walk(conn, "bend--or")
     assert walk["csv_filename"] == "old_streetwalk.csv.gz"

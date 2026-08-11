@@ -570,6 +570,18 @@ def _build_provider_summary(runs, latest_json, data_dir, conn) -> dict[str, Any]
         },
         "json_file": latest.json_filename,
         "search_area_km2": latest_json["search_grid"]["area_km2"],
+        # The grid's size in sample points, and the geometry that produced it.
+        # coverage_rate_percent is a share OF these points, so without the
+        # denominator a reader cannot tell a 40% built from 1,681 points from a
+        # 40% built from 2 million — the difference between a village and a
+        # metro. `.get()`-guarded: per-run JSONs written before search_grid
+        # gained these keys are still read at aggregate time.
+        "total_search_points": latest_json["search_grid"].get("total_search_points"),
+        "grid": {
+            "width_meters": latest_json["search_grid"].get("width_meters"),
+            "height_meters": latest_json["search_grid"].get("height_meters"),
+            "step_length_meters": latest_json["search_grid"].get("step_length_meters"),
+        },
         # From the DB, not the per-run JSON: the DB holds the
         # points-with-pano coverage definition for every generation
         # (issue #90), while per-run JSONs written before the fix may
@@ -734,6 +746,59 @@ def generate_aggregate_v2(conn, data_dir: str) -> dict[str, Any]:
     return summary
 
 
+# Per-highway-class fields the streets page renders, in display order. The
+# stored breakdown carries more (edges_sampled, edges_any_coverage,
+# mean_edge_coverage, coverage_pct_by_count on the grid-attribution variant),
+# none of which any consumer reads — and the manifest is fetched by every
+# visitor, so it carries only what is used. The catalog keeps the full block.
+_PUBLISHED_HIGHWAY_FIELDS = (
+    "edges",
+    "length_km",
+    "length_km_covered",
+    "length_km_covered_any",
+    "coverage_pct_by_length",
+    "coverage_pct_by_length_any",
+    "median_covered_age_years",
+)
+
+
+def _trim_coverage_by_highway(raw: str | None) -> dict[str, dict[str, Any]] | None:
+    """
+    Parse the stored ``coverage_by_highway`` JSON down to the published fields.
+
+    Returns None for a NULL column, unparseable JSON, or an empty breakdown, so
+    the caller can omit the key entirely rather than publishing a null. Bucket
+    ORDER is preserved: the artifact's key order is the road → service →
+    non-motorized hierarchy (`_BUCKET_DISPLAY_ORDER` in
+    streetscape_street_analyzer/street_coverage.py) and the frontend legend
+    trusts it. Per-bucket fields absent from an older artifact are simply not
+    emitted, the same "not measured" convention used elsewhere.
+
+    Args:
+        raw: the street_walks.coverage_by_highway TEXT value, or None.
+
+    Returns:
+        {bucket: {field: value}} in stored order, or None.
+    """
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError):
+        # A malformed breakdown is a bad row, not a bad manifest: the walk's
+        # headline stats are still sound, so publish the entry without it.
+        logger.warning("Skipping unparseable coverage_by_highway in streetwalk manifest")
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    trimmed = {}
+    for bucket, block in parsed.items():
+        if not isinstance(block, dict):
+            continue
+        trimmed[bucket] = {f: block[f] for f in _PUBLISHED_HIGHWAY_FIELDS if f in block}
+    return trimmed or None
+
+
 def generate_streetwalk_manifest(conn, data_dir: str) -> dict[str, Any]:
     """
     Build and write ``streetwalks.json.gz`` — a small sidecar index of the
@@ -791,7 +856,30 @@ def generate_streetwalk_manifest(conn, data_dir: str) -> dict[str, Any]:
             "edges": row["edges_total"],
             "edges_fully_covered": row["edges_fully_covered"],
             "mean_edge_coverage": row["mean_edge_coverage"],
+            # Absolute street length (schema v12). The percentages above are
+            # shares; these are the kilometres a deployment estimate or a paper
+            # actually quotes, and no percentage recovers them without the
+            # denominator. NULL on walks cataloged before v12 and not yet
+            # backfilled (scripts/backfill_streetwalk_length.py).
+            "length_km": row["length_km"],
+            "length_km_covered": row["length_km_covered"],
+            "length_km_covered_any": row["length_km_covered_any"],
+            # Median age of the imagery covering this walk's streets. Not
+            # derivable from the per-bucket medians below (a median of medians
+            # is not the median), which is why it is stored and published.
+            "median_covered_age_years": row["median_covered_age_years"],
         }
+        # Per-highway-class breakdown (residential vs footway vs alley …), the
+        # cut that answers "is there imagery where pedestrians actually walk".
+        # Key ABSENT (not null) when the column is NULL, matching the `change`
+        # block below: an additive key should not sprinkle nulls through every
+        # entry that predates it. Trimmed to the fields the frontend renders —
+        # the full block carries per-class edge counts and sampled/any-coverage
+        # tallies that no consumer reads, and this file is fetched by every
+        # visitor to the streets page.
+        breakdown = _trim_coverage_by_highway(row["coverage_by_highway"])
+        if breakdown:
+            entry["coverage_by_highway"] = breakdown
         # "Since the last walk" change block (issue #101), from the walk-diff
         # catalog like the aggregate's change key. Key ABSENT (not null) when
         # no diff exists — most walks are still first walks, and an additive

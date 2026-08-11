@@ -689,6 +689,11 @@ function adaptCityRecord(rec, provider = "gsv") {
       // v1 is gsv-only; any-imagery coverage equals the 360° rate there.
       any_imagery_coverage_rate_percent: rec.coverage_rate_percent ?? null,
       num_flat_images: null,
+      // v1 predates the grid-size keys and will never gain them; null so
+      // consumers read one shape rather than distinguishing null from
+      // undefined.
+      total_search_points: null,
+      grid: null,
       pano_count: v1Counts.unique_google_panos ?? v1Counts.unique_panos,
       pano_age_stats: rec.google_panos_age_stats ?? rec.all_panos_age_stats,
       capture_year_histogram: v1Histograms.google_panos ?? v1Histograms.all_panos,
@@ -719,6 +724,12 @@ function adaptCityRecord(rec, provider = "gsv") {
     data_file: latest.data_file,
     json_file: latest.json_file,
     search_area_km2: latest.search_area_km2,
+    // Grid size in sample points, and the geometry behind it. Null on records
+    // published before the aggregate carried them (and on v1/v2 records, which
+    // never will) — the denominator of coverage_rate_percent, so the tables can
+    // show what a percentage is a percentage OF.
+    total_search_points: latest.total_search_points ?? null,
+    grid: latest.grid ?? null,
     coverage_rate_percent: latest.coverage_rate_percent,
     // Any-imagery (360° + flat) coverage, issue #116. Missing (GSV / pre-v7
     // runs) falls back to the 360° rate so the two views coincide there.
