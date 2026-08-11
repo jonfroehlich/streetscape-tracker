@@ -118,6 +118,24 @@ def test_missing_artifact_or_totals_is_counted_and_skipped(conn, data_dir):
     assert _columns(conn, keyless) == dict.fromkeys(_COLUMNS)
 
 
+def test_artifact_with_a_length_but_no_covered_length_is_skipped_not_crashed(conn, data_dir):
+    """
+    summarize_streetwalk_coverage has emitted length_km and length_km_covered
+    together since the collector shipped, so one without the other is a
+    malformed artifact. It must be counted and skipped — the cross-check needs
+    both, and the progress log formats both, so a half-guarded key would raise
+    mid-run instead of reporting a bad artifact.
+    """
+    city_id = _register_city(conn)
+    totals = {k: v for k, v in TOTALS.items() if k != "length_km_covered"}
+    walk_id = _walk(conn, data_dir, city_id, date(2026, 5, 1), totals=totals)
+
+    counts = backfill(conn, data_dir, execute=True)
+    assert counts["missing_key"] == 1
+    assert counts["updated"] == 0
+    assert _columns(conn, walk_id) == dict.fromkeys(_COLUMNS)
+
+
 def test_unreadable_artifact_is_counted_separately(conn, data_dir):
     """A present-but-corrupt artifact (truncated gzip, bad JSON) is its own
     count — not conflated with a readable artifact that lacks the totals."""

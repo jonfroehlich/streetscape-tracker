@@ -207,9 +207,15 @@ CREATE TABLE IF NOT EXISTS street_walks (
     -- road contributes half its length), matching coverage_pct_by_length.
     length_km              REAL,
     length_km_covered      REAL,
-    -- Any-imagery (360° + flat) covered length. NULL — not equal to
-    -- length_km_covered — on walks predating the any-imagery split, the same
-    -- "not measured" convention coverage_pct_by_length_any uses.
+    -- Any-imagery (360° + flat) covered length. NULL — never a copy of
+    -- length_km_covered — is the "not measured" convention
+    -- coverage_pct_by_length_any uses. Two routes to it: a pre-v12 walk not
+    -- yet backfilled, and a walk salvaged or backfilled from an artifact
+    -- written between #99 (which added length_km) and the any-imagery split
+    -- (which added this one). The collector itself always writes a value:
+    -- summarize_streetwalk_coverage synthesizes the any-imagery fraction from
+    -- the 360° one when the column is absent, so a fresh artifact always
+    -- carries the figure.
     length_km_covered_any  REAL,
     -- Median age of the imagery covering this walk's streets, in years. Stored
     -- rather than derived because a median cannot be recovered from the

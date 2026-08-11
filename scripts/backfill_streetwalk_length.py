@@ -16,11 +16,16 @@ with a NULL `length_km`, so a second run finds nothing to do. Rows whose
 artifact is missing from --data-dir (or predates the totals) are reported and
 left NULL rather than guessed at.
 
-`length_km` alone gates candidacy. The other three are legitimately NULL on
-rows that do have a length: a pre-#116 artifact carries no any-imagery length,
-and `median_covered_age_years` is null whenever nothing was covered or no
-covered edge carried a capture date. Keying on those would make such rows
+The column `length_km` alone gates candidacy. The other three are legitimately
+NULL on rows that do have a length: a pre-#116 artifact carries no any-imagery
+length, and `median_covered_age_years` is null whenever nothing was covered or
+no covered edge carried a capture date. Keying on those would make such rows
 permanent candidates that never resolve.
+
+Distinct from that, an artifact must carry BOTH `length_km` and
+`length_km_covered` to be usable — they have been emitted together since the
+collector shipped, so one without the other is a malformed artifact rather
+than an old one, and the cross-check below needs both anyway.
 
 Cross-check: each artifact's lengths are verified against the percentage
 already stored on the row (100 * covered / total ≈ coverage_pct_by_length). A
@@ -59,15 +64,20 @@ def _percent_mismatch(totals: dict, stored_pct: float | None) -> float | None:
     """
     Absolute gap in percentage points between the percentage recomputed from
     the artifact's lengths and the one already cataloged, or None when the
-    comparison cannot be made (no stored percentage, or a zero-length network).
+    comparison cannot be made.
+
+    Callers reach this only after establishing that both length keys are
+    present, so the two None results left are the genuinely uncomparable
+    cases: a row with no cataloged percentage to check against, and a
+    zero-length network (nothing to divide by — and 0 km of street is not a
+    wrong-artifact signal).
     """
     if stored_pct is None:
         return None
-    length_km = totals.get("length_km")
-    covered_km = totals.get("length_km_covered")
-    if not length_km or covered_km is None:
+    length_km = totals["length_km"]
+    if not length_km:
         return None
-    return abs(100.0 * covered_km / length_km - stored_pct)
+    return abs(100.0 * totals["length_km_covered"] / length_km - stored_pct)
 
 
 def backfill(conn, data_dir: str, execute: bool = False) -> dict[str, int]:
@@ -120,7 +130,12 @@ def backfill(conn, data_dir: str, execute: bool = False) -> dict[str, int]:
             totals = geojson["properties"]["metadata"].get("totals") or {}
         except (KeyError, TypeError, AttributeError):
             totals = {}
-        if totals.get("length_km") is None:
+        # Both keys, not just length_km: summarize_streetwalk_coverage has
+        # emitted them together since the road-walk collector shipped (05f3a2e),
+        # so an artifact with one and not the other is malformed rather than
+        # merely old. Requiring both here lets every use below index directly
+        # instead of half-guarding a key that cannot legitimately be absent.
+        if totals.get("length_km") is None or totals.get("length_km_covered") is None:
             logger.warning(f"{label}: artifact carries no length totals; leaving NULL")
             counts["missing_key"] += 1
             continue
@@ -149,7 +164,12 @@ def backfill(conn, data_dir: str, execute: bool = False) -> dict[str, int]:
                    WHERE walk_id = ?""",
                 (
                     totals["length_km"],
-                    totals.get("length_km_covered"),
+                    totals["length_km_covered"],
+                    # These two stay `.get()`-guarded, and for a real reason:
+                    # length_km landed in 05f3a2e (#99) but length_km_covered_any
+                    # only in 3446d88, so artifacts written between those commits
+                    # genuinely carry the former without the latter. NULL there
+                    # means "not measured" — never a copy of the 360° length.
                     totals.get("length_km_covered_any"),
                     totals.get("median_covered_age_years"),
                     row["walk_id"],

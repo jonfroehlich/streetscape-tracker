@@ -728,6 +728,13 @@ function adaptCityRecord(rec, provider = "gsv") {
     // published before the aggregate carried them (and on v1/v2 records, which
     // never will) — the denominator of coverage_rate_percent, so the tables can
     // show what a percentage is a percentage OF.
+    //
+    // `grid` is either null or fully populated, never an object of nulls: the
+    // aggregate indexes the three keys rather than guarding them, so
+    // `if (rec.grid)` is a sound test. It describes the LATEST RUN's grid, not
+    // the city's current frozen geometry — the two diverge for cities resized
+    // catalog-only by cap_oversized_grids.py (#166) until their next
+    // collection, so label it as the run's grid rather than the city's.
     total_search_points: latest.total_search_points ?? null,
     grid: latest.grid ?? null,
     coverage_rate_percent: latest.coverage_rate_percent,

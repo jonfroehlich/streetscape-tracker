@@ -574,13 +574,28 @@ def _build_provider_summary(runs, latest_json, data_dir, conn) -> dict[str, Any]
         # coverage_rate_percent is a share OF these points, so without the
         # denominator a reader cannot tell a 40% built from 1,681 points from a
         # 40% built from 2 million — the difference between a village and a
-        # metro. `.get()`-guarded: per-run JSONs written before search_grid
-        # gained these keys are still read at aggregate time.
-        "total_search_points": latest_json["search_grid"].get("total_search_points"),
+        # metro.
+        #
+        # Indexed, not `.get()`-guarded, exactly like search_area_km2 above:
+        # all four keys are written by one dict literal in
+        # generate_city_metadata_summary_as_json and have coexisted since the
+        # file's earliest tracked form, so a search_grid missing one is a
+        # corrupt JSON worth failing on, not a generation to tolerate. A guard
+        # here would also emit {width: null, height: null, step: null} — a
+        # truthy all-null block that no `if (rec.grid)` consumer can reject,
+        # which is precisely what the absent-not-null convention exists to
+        # avoid (see _trim_coverage_by_highway below).
+        #
+        # NOTE: this is the LATEST RUN's grid, not the city's current frozen
+        # geometry — the two diverge for cities resized catalog-only by
+        # scripts/cap_oversized_grids.py (#166) until their next collection.
+        # That is the right pairing here: total_search_points is this run's
+        # denominator, so it must travel with the geometry that produced it.
+        "total_search_points": latest_json["search_grid"]["total_search_points"],
         "grid": {
-            "width_meters": latest_json["search_grid"].get("width_meters"),
-            "height_meters": latest_json["search_grid"].get("height_meters"),
-            "step_length_meters": latest_json["search_grid"].get("step_length_meters"),
+            "width_meters": latest_json["search_grid"]["width_meters"],
+            "height_meters": latest_json["search_grid"]["height_meters"],
+            "step_length_meters": latest_json["search_grid"]["step_length_meters"],
         },
         # From the DB, not the per-run JSON: the DB holds the
         # points-with-pano coverage definition for every generation
@@ -751,6 +766,11 @@ def generate_aggregate_v2(conn, data_dir: str) -> dict[str, Any]:
 # mean_edge_coverage, coverage_pct_by_count on the grid-attribution variant),
 # none of which any consumer reads — and the manifest is fetched by every
 # visitor, so it carries only what is used. The catalog keeps the full block.
+#
+# Extending this list is cheap and needs no re-collection: the catalog already
+# holds every field, so `scheduler regenerate-aggregate --publish` rebuilds the
+# manifest from it with no API calls. Trim aggressively here rather than
+# publishing fields speculatively against an unwritten frontend.
 _PUBLISHED_HIGHWAY_FIELDS = (
     "edges",
     "length_km",
@@ -815,6 +835,16 @@ def generate_streetwalk_manifest(conn, data_dir: str) -> dict[str, Any]:
     Kept deliberately separate from the aggregate ``cities.json.gz`` (schema v3):
     the aggregate contract stays untouched, and #102 later folds these stats in
     properly. Published automatically by the ``*.json.gz`` publish glob.
+
+    ``schema_version`` stays 1 across the v12 additions (``length_km``,
+    ``length_km_covered``, ``length_km_covered_any``,
+    ``median_covered_age_years`` and the optional ``coverage_by_highway``
+    block) because every one of them is additive — no existing key changed
+    shape or meaning. Consumers must therefore treat a missing/NULL length as
+    "this walk has no length cataloged", NOT as "this manifest predates
+    lengths": a v1 manifest can legitimately contain both, since a walk
+    cataloged before schema v12 reads NULL until
+    ``scripts/backfill_streetwalk_length.py`` runs.
 
     Empty catalog → ``walks: []`` (the file is still written so the frontend
     fetch succeeds and simply renders no streetwalk overlays).
