@@ -27,7 +27,7 @@ from .naming import sanitize_city_query_str
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS cities (
@@ -199,6 +199,30 @@ CREATE TABLE IF NOT EXISTS street_walks (
     -- (json_extract) without reading artifacts off disk. NULL = not captured
     -- (a pre-v11 walk not yet backfilled), never an empty object.
     coverage_by_highway    TEXT,
+    -- Absolute street length (v12). The percentages above answer "what share
+    -- of this city was covered"; these answer "how many kilometres", which is
+    -- the figure a deployment estimate or a paper actually quotes, and which
+    -- no percentage can reconstruct without the denominator. Length is
+    -- credited PROPORTIONALLY to each edge's covered fraction (a half-driven
+    -- road contributes half its length), matching coverage_pct_by_length.
+    length_km              REAL,
+    length_km_covered      REAL,
+    -- Any-imagery (360° + flat) covered length. NULL — never a copy of
+    -- length_km_covered — is the "not measured" convention
+    -- coverage_pct_by_length_any uses. Two routes to it: a pre-v12 walk not
+    -- yet backfilled, and a walk salvaged or backfilled from an artifact
+    -- written between #99 (which added length_km) and the any-imagery split
+    -- (which added this one). The collector itself always writes a value:
+    -- summarize_streetwalk_coverage synthesizes the any-imagery fraction from
+    -- the 360° one when the column is absent, so a fresh artifact always
+    -- carries the figure.
+    length_km_covered_any  REAL,
+    -- Median age of the imagery covering this walk's streets, in years. Stored
+    -- rather than derived because a median cannot be recovered from the
+    -- per-bucket medians in coverage_by_highway (a median of medians is not
+    -- the median). NULL when nothing was covered, or when no covered edge
+    -- carried a capture date.
+    median_covered_age_years REAL,
     api_requests           INTEGER,
     started_at             TEXT,
     finished_at            TEXT,
@@ -593,6 +617,10 @@ def init_schema(conn: sqlite3.Connection) -> None:
     if user_version == 10:
         _migrate_v10_to_v11(conn)
         user_version = 11
+    # v11 -> v12: street_walks gains the absolute street-length columns.
+    if user_version == 11:
+        _migrate_v11_to_v12(conn)
+        user_version = 12
     conn.executescript(_SCHEMA)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
@@ -736,6 +764,42 @@ def _migrate_v10_to_v11(conn: sqlite3.Connection) -> None:
         return
     logger.info("Migrating catalog schema v10 -> v11 (street_walks.coverage_by_highway)")
     conn.execute("ALTER TABLE street_walks ADD COLUMN coverage_by_highway TEXT")
+    conn.commit()
+
+
+# The v12 street-length columns, in DDL order. Named once so the migration and
+# its idempotency guard cannot drift apart.
+_V12_STREET_WALK_COLUMNS = (
+    "length_km",
+    "length_km_covered",
+    "length_km_covered_any",
+    "median_covered_age_years",
+)
+
+
+def _migrate_v11_to_v12(conn: sqlite3.Connection) -> None:
+    """Add the street_walks absolute-length columns (v12).
+
+    Additive; no table rebuild, exactly like _migrate_v10_to_v11. Idempotent:
+    each ADD COLUMN is skipped when that column already exists, so a catalog
+    interrupted midway through this migration completes on the next connect
+    rather than failing on the first duplicate. An absent table means the
+    CREATE TABLE in _SCHEMA below builds it current.
+
+    Every column is nullable: walks cataloged before v12 keep NULL ("not
+    captured") until backfilled from their coverage artifacts by
+    scripts/backfill_streetwalk_length.py.
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(street_walks)").fetchall()}
+    if not cols:
+        # Absent table → the CREATE TABLE in _SCHEMA below builds it current.
+        return
+    missing = [c for c in _V12_STREET_WALK_COLUMNS if c not in cols]
+    if not missing:
+        return
+    logger.info(f"Migrating catalog schema v11 -> v12 (street_walks: {', '.join(missing)})")
+    for column in missing:
+        conn.execute(f"ALTER TABLE street_walks ADD COLUMN {column} REAL")
     conn.commit()
 
 
@@ -1233,6 +1297,10 @@ def register_street_walk(
     coverage_pct_by_length: float | None = None,
     coverage_pct_by_length_any: float | None = None,
     coverage_by_highway: str | None = None,
+    length_km: float | None = None,
+    length_km_covered: float | None = None,
+    length_km_covered_any: float | None = None,
+    median_covered_age_years: float | None = None,
     api_requests: int | None = None,
     started_at: str | None = None,
     finished_at: str | None = None,
@@ -1253,9 +1321,10 @@ def register_street_walk(
            (city_id, provider, run_date, csv_filename, coverage_filename,
             network_type, spacing_m, match_dist_m, sample_points, edges_total,
             edges_fully_covered, mean_edge_coverage, coverage_pct_by_length,
-            coverage_pct_by_length_any, coverage_by_highway, api_requests,
-            started_at, finished_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            coverage_pct_by_length_any, coverage_by_highway, length_km,
+            length_km_covered, length_km_covered_any, median_covered_age_years,
+            api_requests, started_at, finished_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(city_id, provider, network_type, run_date) DO UPDATE SET
              csv_filename = excluded.csv_filename,
              coverage_filename = excluded.coverage_filename,
@@ -1268,6 +1337,10 @@ def register_street_walk(
              coverage_pct_by_length = excluded.coverage_pct_by_length,
              coverage_pct_by_length_any = excluded.coverage_pct_by_length_any,
              coverage_by_highway = excluded.coverage_by_highway,
+             length_km = excluded.length_km,
+             length_km_covered = excluded.length_km_covered,
+             length_km_covered_any = excluded.length_km_covered_any,
+             median_covered_age_years = excluded.median_covered_age_years,
              api_requests = excluded.api_requests,
              started_at = excluded.started_at,
              finished_at = excluded.finished_at""",
@@ -1287,6 +1360,10 @@ def register_street_walk(
             coverage_pct_by_length,
             coverage_pct_by_length_any,
             coverage_by_highway,
+            length_km,
+            length_km_covered,
+            length_km_covered_any,
+            median_covered_age_years,
             api_requests,
             started_at,
             finished_at,

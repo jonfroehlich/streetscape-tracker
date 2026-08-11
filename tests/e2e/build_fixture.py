@@ -277,6 +277,15 @@ def _add_streetwalk(
         mean_edge_coverage=totals["mean_edge_coverage"],
         coverage_pct_by_length=totals["coverage_pct_by_length"],
         coverage_pct_by_length_any=totals["coverage_pct_by_length_any"],
+        coverage_by_highway=json.dumps(geojson["properties"]["metadata"]["coverage_by_highway"]),
+        # Schema v12: the fixture must carry the absolute lengths and the
+        # per-class breakdown, or the streets page's km columns and expandable
+        # rows would render as em-dashes and the e2e assertions would pass
+        # against an empty UI.
+        length_km=totals["length_km"],
+        length_km_covered=totals["length_km_covered"],
+        length_km_covered_any=totals["length_km_covered_any"],
+        median_covered_age_years=totals["median_covered_age_years"],
     )
 
 

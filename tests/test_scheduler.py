@@ -1172,6 +1172,7 @@ def _orphan_walk(
     corrupt=False,
     write_csv=True,
     coverage_by_highway=None,
+    lengths=None,
 ):
     """A finished road walk with artifacts on disk but no catalog row — the
     Berlin shape: the crawl completed and both files were written, then the
@@ -1221,6 +1222,11 @@ def _orphan_walk(
                 "coverage_pct_by_length_any": 85.0,
             },
         }
+        # Left out by default: the base totals block above reproduces an
+        # artifact written BEFORE the v12 length keys existed, which the
+        # salvage path must tolerate. Pass `lengths` for a current artifact.
+        if lengths is not None:
+            metadata["totals"].update(lengths)
         if with_network_type_key:
             metadata["network_type"] = network_type
         if coverage_by_highway is not None:
@@ -1266,6 +1272,54 @@ def test_reconcile_orphaned_walk_catalogs_a_finished_crawl(conn, data_dir, monke
     # and for GSV that row count is also the request count (one request each).
     assert row["sample_points"] == 4
     assert row["api_requests"] == 4
+
+
+def test_reconcile_orphaned_walk_salvages_the_v12_lengths(conn, data_dir, monkeypatch):
+    """A salvaged walk carries its street kilometres too. Without this the
+    streets page would show the walk with a blank length forever: the backfill
+    script only targets rows whose artifact it can still find, and nothing else
+    ever revisits a salvaged row."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    monkeypatch.setattr(sched, "generate_streetwalk_manifest", lambda c, d: {"walks": []})
+    city, _, _ = _orphan_walk(
+        conn,
+        data_dir,
+        lengths={
+            "length_km": 382.3,
+            "length_km_covered": 314.25,
+            "length_km_covered_any": 325.0,
+            "median_covered_age_years": 1.75,
+        },
+    )
+    cfg = _street_cfg(data_dir=data_dir)
+
+    assert _reconcile_orphaned_walk(conn, cfg, city, "gsv_streets", WALK_DATE) is True
+
+    row = _walk_row(conn, city.city_id)
+    assert row["length_km"] == 382.3
+    assert row["length_km_covered"] == 314.25
+    assert row["length_km_covered_any"] == 325.0
+    assert row["median_covered_age_years"] == 1.75
+
+
+def test_reconcile_orphaned_walk_tolerates_an_artifact_without_lengths(conn, data_dir, monkeypatch):
+    """The salvage path reads whatever artifact is on disk, including ones
+    written before the v12 keys existed. Their absence must leave NULLs, not
+    raise — a KeyError here would turn a recoverable walk into a re-crawl at
+    full API cost, which is the whole thing the salvage exists to prevent."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    monkeypatch.setattr(sched, "generate_streetwalk_manifest", lambda c, d: {"walks": []})
+    city, _, _ = _orphan_walk(conn, data_dir)  # no `lengths` → pre-v12 artifact
+    cfg = _street_cfg(data_dir=data_dir)
+
+    assert _reconcile_orphaned_walk(conn, cfg, city, "gsv_streets", WALK_DATE) is True
+
+    row = _walk_row(conn, city.city_id)
+    assert row["coverage_pct_by_length"] == 82.2  # the walk is still cataloged
+    assert row["length_km"] is None
+    assert row["median_covered_age_years"] is None
 
 
 def test_reconcile_orphaned_walk_refreshes_the_manifest(conn, data_dir, monkeypatch):

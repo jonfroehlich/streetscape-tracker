@@ -337,6 +337,21 @@ def run_collect(args: argparse.Namespace) -> int:
             coverage_by_highway=json.dumps(
                 geojson["properties"]["metadata"]["coverage_by_highway"]
             ),
+            # Absolute street length (v12), fraction-weighted like the
+            # percentages beside it. All indexed, not `.get()`-guarded: this
+            # artifact was just built above by the CURRENT
+            # summarize_streetwalk_coverage, which emits all four
+            # unconditionally — a pre-#116 frame lacking coverage_fraction_any
+            # still yields a length, because that function synthesizes the
+            # column from coverage_fraction before summing. The salvage and
+            # backfill paths DO guard the any-imagery length, for the reason
+            # that does not apply here: they read artifacts off disk, and ones
+            # written between #99 and the any-imagery split carry length_km
+            # without length_km_covered_any.
+            length_km=totals["length_km"],
+            length_km_covered=totals["length_km_covered"],
+            length_km_covered_any=totals["length_km_covered_any"],
+            median_covered_age_years=totals["median_covered_age_years"],
             api_requests=dict_results["api_requests"],
             started_at=dict_results.get("started_at"),
             finished_at=dict_results.get("finished_at") or datetime.now(UTC).isoformat(),

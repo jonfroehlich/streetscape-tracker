@@ -13,6 +13,7 @@ import json
 import os
 
 import geopandas as gpd
+import pytest
 from shapely.geometry import LineString
 
 from streetscape_metadata_tracker import db
@@ -547,3 +548,32 @@ def test_collect_catalogs_coverage_by_highway(tmp_path, monkeypatch):
     conn.close()
     assert json.loads(walk["coverage_by_highway"]) == artifact_breakdown
     assert "residential" in artifact_breakdown
+
+
+def test_collect_catalogs_absolute_street_lengths(tmp_path, monkeypatch):
+    """The v12 length columns come from the artifact's totals, and the stored
+    percentage must agree with the stored lengths — they are published side by
+    side, so a disagreement would be visible on the streets page."""
+    data_dir = _setup(tmp_path, monkeypatch)
+    monkeypatch.setenv("GMAPS_STREETS_API_KEY", "TESTKEY")
+
+    assert _collect_ok(data_dir, monkeypatch) == 0
+
+    csv_name = f"{CITY_ID}_width_200_height_200_step_20_streetwalk_sp15_{RUN_DATE}.csv.gz"
+    with gzip.open(
+        os.path.join(data_dir, csv_name[: -len(".csv.gz")] + "_coverage.json.gz"), "rt"
+    ) as fh:
+        totals = json.load(fh)["properties"]["metadata"]["totals"]
+
+    conn = db.connect(db.get_default_db_path(data_dir))
+    walk = db.get_latest_street_walk(conn, CITY_ID)
+    conn.close()
+
+    assert walk["length_km"] == totals["length_km"]
+    assert walk["length_km_covered"] == totals["length_km_covered"]
+    assert walk["length_km_covered_any"] == totals["length_km_covered_any"]
+    assert walk["median_covered_age_years"] == totals["median_covered_age_years"]
+    assert walk["length_km"] > 0
+    assert 100.0 * walk["length_km_covered"] / walk["length_km"] == pytest.approx(
+        walk["coverage_pct_by_length"], abs=0.05
+    )

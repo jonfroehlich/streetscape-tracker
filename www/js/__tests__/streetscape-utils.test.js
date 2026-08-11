@@ -208,6 +208,69 @@ test("adaptCityRecord: any-imagery falls back to 360° when absent (GSV / pre-v7
   assert.equal(gsv.num_flat_images, null);
 });
 
+// --- schema v12: grid size in sample points --------------------------------
+
+test("adaptCityRecord: grid size and geometry are surfaced from a v3 record", () => {
+  const v3 = {
+    city_id: "corvallis--or",
+    city: { name: "Corvallis", state: "OR", country: "USA" },
+    providers: {
+      gsv: {
+        latest: {
+          run_date: "2026-07-05",
+          panorama_counts: { unique_panos: 10, unique_google_panos: 8 },
+          histogram_of_capture_dates_by_year: {},
+          all_panos_age_stats: {},
+          coverage_rate_percent: 40,
+          search_area_km2: 25,
+          total_search_points: 62_500,
+          grid: { width_meters: 5000, height_meters: 5000, step_length_meters: 20 },
+          data_file: "c",
+          json_file: "d",
+        },
+        runs: [],
+      },
+    },
+  };
+  const gsv = adaptCityRecord(v3, "gsv");
+  // The denominator coverage_rate_percent is a percentage OF: without it a
+  // village's 40% and a metro's 40% are indistinguishable.
+  assert.equal(gsv.total_search_points, 62_500);
+  assert.deepEqual(gsv.grid, {
+    width_meters: 5000,
+    height_meters: 5000,
+    step_length_meters: 20,
+  });
+});
+
+test("adaptCityRecord: grid keys are null — not undefined, not all-null objects — when absent", () => {
+  // v2 records will never carry them, and v1 predates them entirely. Both must
+  // read as an explicit null so a consumer can write `if (rec.grid)` and get a
+  // sound answer; an object of nulls would be truthy and render "null × null".
+  const v2 = {
+    city_id: "x--y",
+    city: { name: "X", state: null, country: "USA" },
+    latest: {
+      run_date: "2026-07-05",
+      panorama_counts: { unique_panos: 10 },
+      histogram_of_capture_dates_by_year: {},
+      all_panos_age_stats: {},
+      coverage_rate_percent: 88,
+      search_area_km2: 9,
+      data_file: "c",
+      json_file: "d",
+    },
+    runs: [],
+  };
+  const fromV2 = adaptCityRecord(v2, "gsv");
+  assert.equal(fromV2.total_search_points, null);
+  assert.equal(fromV2.grid, null);
+
+  const fromV1 = adaptCityRecord(V1_RECORD, "gsv");
+  assert.equal(fromV1.total_search_points, null);
+  assert.equal(fromV1.grid, null);
+});
+
 test("METRICS.coverage_any: reads any-imagery rate, falls back to 360°", () => {
   const m = METRICS.coverage_any;
   assert.equal(isKnownMetric("coverage_any"), true);

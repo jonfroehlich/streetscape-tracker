@@ -461,6 +461,19 @@ def test_aggregate_v2_groups_runs_and_reports_change(conn, data_dir):
     assert gsv["change"]["panos_added"] == 1
     assert list(summary["histogram_of_capture_dates"]) == ["gsv"]
 
+    # The grid's size in sample points, promoted from the per-run JSON's
+    # search_grid block. coverage_rate_percent is a share OF these points, so
+    # publishing the rate without its denominator leaves a reader unable to
+    # tell a village's 40% from a metro's.
+    # Distinct query points in the run CSV (json_summarizer:433), which is
+    # exactly the denominator coverage_rate_percent divides by.
+    assert gsv["latest"]["total_search_points"] == 3
+    assert gsv["latest"]["grid"] == {
+        "width_meters": 100,
+        "height_meters": 100,
+        "step_length_meters": 20,
+    }
+
     # The written aggregate must be strict-parseable
     strict_load(os.path.join(data_dir, "cities.json.gz"))
 
