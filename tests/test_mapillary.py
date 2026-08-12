@@ -7,8 +7,10 @@ served from memory. No network.
 import asyncio
 import gzip
 import math
+import os
 import re
 from datetime import UTC, datetime
+from pathlib import Path
 
 import aiohttp
 import geopy
@@ -250,6 +252,42 @@ def test_captured_at_valid_epoch_ms():
 )
 def test_captured_at_bogus_values_rejected(bogus):
     assert dm.captured_at_to_iso_date(bogus) == ""
+
+
+def test_vectorized_capture_dates_match_the_scalar_rules():
+    """
+    The collection paths call the vectorized form over a whole census (issue
+    #157), but the rules are only written out once, in the scalar function.
+    Pin them together element-wise, including the values that make the two
+    implementations most likely to disagree: pandas coerces out-of-range
+    timestamps where datetime.fromtimestamp raises, and a null has to survive
+    as '' rather than becoming 'NaT'.
+    """
+    values = [
+        1641206630491,  # ordinary, dated
+        1650000000000,
+        None,  # property absent from the tile
+        0,  # epoch zero (dead device clock)
+        -1000,  # negative
+        915148800000,  # 1999, before street-level imagery
+        4102444800000,  # 2100, future device clock
+        1072915199000,  # 2003-12-31, just under the 2004 floor
+        1072915200000,  # 2004-01-01, the first instant above it
+        9_999_999_999_999_999,  # absurd: OverflowError scalar-side
+        -9_999_999_999_999_999,
+    ]
+    expected = [dm.captured_at_to_iso_date(v) for v in values]
+    assert list(dm.captured_at_to_iso_dates(values)) == expected
+    # Guard the guard: were every case '', the comparison above would pass
+    # vacuously — and the 2004 floor in particular is only meaningfully tested
+    # if the pair straddling it lands on opposite sides.
+    assert expected[:2] == ["2022-01-03", "2022-04-15"]
+    assert expected[7:9] == ["", "2004-01-01"]
+    assert [e for e in expected if e == ""] == [""] * 8
+
+
+def test_vectorized_capture_dates_on_an_empty_census():
+    assert list(dm.captured_at_to_iso_dates([])) == []
 
 
 # ── Grid assignment ────────────────────────────────────────────────────────
@@ -668,6 +706,157 @@ def test_extra_metadata_round_trips_to_csv(monkeypatch, tmp_path):
         "compass_angle",
     ):
         assert pd.isna(zrow[col])
+
+
+# ── Golden output (issue #157) ─────────────────────────────────────────────
+#
+# A run file is an IMMUTABLE dated snapshot, and diff.py compares one run to
+# the previous one of the same series. So a purely internal change to how the
+# census is assembled must not alter a single byte of the written CSV: if the
+# float formatting, the null rendering, or the row order shifted, every
+# Mapillary city's next run would report a large phantom diff and there would
+# be no way to tell it from real imagery churn.
+#
+# This fixture was generated from the row-wise implementation that preceded the
+# columnar rewrite, and it is the contract that rewrite had to satisfy. To
+# change it deliberately, run with REGEN_MAPILLARY_GOLDEN=1 and review the diff
+# in tests/fixtures/mapillary_golden_run.csv as part of the change.
+
+GOLDEN_PATH = Path(__file__).parent / "fixtures" / "mapillary_golden_run.csv"
+# Pinned so the fixture never depends on the wall clock. Every row carries the
+# run's query_timestamp, which is datetime.now() at call time.
+GOLDEN_TIMESTAMP_PLACEHOLDER = "<QUERY_TIMESTAMP>"
+
+
+def _golden_features(lat, lon):
+    """
+    A census exercising every branch of the grid downloader's row assembly.
+
+    Returns (features_by_tile_role, expectations) where the first element maps
+    a role to the images that tile should carry — "all" goes into every tile,
+    "first"/"last" into the first and last tile of the bbox respectively (the
+    city straddles a tile boundary, so both cover the center longitude).
+    """
+    m_lat = dm._M_PER_DEG_LAT
+    m_lon = m_lat * math.cos(math.radians(lat))
+
+    def at(north_m, east_m):
+        return lon + east_m / m_lon, lat + north_m / m_lat
+
+    def img(image_id, north_m, east_m, **kw):
+        image_lon, image_lat = at(north_m, east_m)
+        return make_image(image_id, image_lon, image_lat, **kw)
+
+    everywhere = [
+        # ── panos, one per capture-date branch ──
+        # a fully-populated pano: OK, and every free tile extra present
+        img(
+            101,
+            0,
+            0,
+            captured_at=1641206630491,
+            creator_id=42,
+            organization_id=999,
+            quality_score=0.8,
+            on_foot=True,
+            compass_angle=90.0,
+            sequence_id="drive1",
+        ),
+        # a SECOND pano on the same grid point — Mapillary is a census, so both
+        # get rows (this is what makes pano counts census-vs-sample). creator
+        # None also exercises the bare "© Mapillary" copyright form.
+        img(102, 3, 0, captured_at=1650000000000, creator_id=None),
+        # the four ways a capture date is unusable -> NO_DATE with an empty date
+        img(103, 20, 0, captured_at=0),  # epoch zero (dead device clock)
+        img(104, 40, 0, captured_at=None),  # property absent from the tile
+        img(105, 60, 0, captured_at=1000000000000),  # 2001, before Mapillary
+        img(106, 80, 0, captured_at=32503680000000),  # year 3000, in the future
+        # ── flats (issue #116) ──
+        # a flat at a pano-covered point: counted in the flat census magnitude,
+        # but NOT written as a row (the pano already covers that point)
+        img(107, 2, 0, is_pano=False),
+        # a flat at a point with no pano -> one FLAT_ONLY marker row, null date
+        img(108, 0, 20, is_pano=False, quality_score=0.3, sequence_id="walk1"),
+        # a second flat on that same point: the FIRST stays the representative
+        img(109, 3, 20, is_pano=False, quality_score=0.9),
+        # ── out of grid (the grid is +/-100 m) -> dropped entirely ──
+        img(110, 500, 0),
+        img(111, -500, 0, is_pano=False),
+    ]
+    # Same id in two tiles at very different positions. Real duplicates come
+    # from the render buffer and differ only by tile quantization, but the
+    # dedup rule still has to be pinned: last tile wins, so this lands SOUTH.
+    first_only = [img(112, 60, 0, captured_at=1650000000000)]
+    last_only = [img(112, -60, 0, captured_at=1650000000000)]
+    return everywhere, first_only, last_only
+
+
+def test_written_csv_matches_the_golden_fixture(monkeypatch, tmp_path, straddling_city):
+    lat, lon = straddling_city
+    tiles = dm.tiles_for_bbox(*dm.grid_bbox(lat, lon, 200, 200, 20))
+    assert len(tiles) >= 2, "the straddle must span tiles for the dedup case to mean anything"
+
+    everywhere, first_only, last_only = _golden_features(lat, lon)
+    tiles_by_xy = {
+        (x, y): encode_tile(
+            everywhere
+            + (first_only if (x, y) == tiles[0] else [])
+            + (last_only if (x, y) == tiles[-1] else []),
+            x,
+            y,
+        )
+        for (x, y) in tiles
+    }
+
+    result, _ = _run_download(
+        monkeypatch, tmp_path, tiles_by_xy, lat, lon, width=200, height=200, step=20
+    )
+    with gzip.open(result["filename_with_path"], "rt", encoding="utf-8") as f:
+        written = f.read()
+    # The one genuinely non-deterministic field: pin it rather than exclude it,
+    # so a change in how the timestamp is rendered still fails this test.
+    assert result["started_at"] in written
+    written = written.replace(result["started_at"], GOLDEN_TIMESTAMP_PLACEHOLDER)
+
+    if os.environ.get("REGEN_MAPILLARY_GOLDEN"):
+        GOLDEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+        GOLDEN_PATH.write_text(written, encoding="utf-8")
+        pytest.skip(f"regenerated {GOLDEN_PATH}")
+
+    assert written == GOLDEN_PATH.read_text(encoding="utf-8"), (
+        "the written run CSV changed. If that is deliberate, regenerate with "
+        "REGEN_MAPILLARY_GOLDEN=1 and review the fixture diff — but note that "
+        "shipping it makes every Mapillary city's next run-to-run diff report "
+        "changes that did not happen."
+    )
+
+
+def test_golden_fixture_covers_every_status_and_the_dedup_rule(straddling_city):
+    """
+    Guards the fixture itself: a golden file only protects the branches it
+    actually exercises, and a silently-narrowed fixture would still pass the
+    byte comparison above while protecting nothing.
+    """
+    lat, _ = straddling_city
+    golden = pd.read_csv(GOLDEN_PATH, dtype=str, keep_default_na=False)
+
+    assert set(golden["status"]) == {"OK", "NO_DATE", dm.FLAT_ONLY, "ZERO_RESULTS"}
+    # One row per grid point on an 11x11 grid, plus one extra for the second
+    # pano sharing the center point — that census-vs-sample duplication is
+    # exactly what the row assembly must not collapse.
+    assert len(golden) == 121 + 1
+    assert (golden[["query_lat", "query_lon"]].drop_duplicates().shape[0]) == 121
+    # Both copyright forms, and a dated pano alongside the undated ones.
+    assert {"© Mapillary contributor 42", "© Mapillary"} <= set(golden["copyright_info"])
+    assert (golden["capture_date"] == "2022-01-03").sum() == 1
+    assert (golden["status"] == "NO_DATE").sum() == 4
+    # FLAT_ONLY carries the FIRST flat at that point and never a capture date.
+    flat_only = golden[golden["status"] == dm.FLAT_ONLY]
+    assert list(flat_only["pano_id"]) == ["108"]
+    assert list(flat_only["capture_date"]) == [""]
+    # Last tile wins the duplicate id: 112 landed south of center, not north.
+    dup = golden[golden["pano_id"] == "112"].iloc[0]
+    assert float(dup["pano_lat"]) < lat
 
 
 def test_compute_mapillary_meta_summary():
