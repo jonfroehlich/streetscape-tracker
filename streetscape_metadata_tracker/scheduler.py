@@ -46,7 +46,7 @@ from tabulate import tabulate
 from . import catalog_backup, db, driving_plan
 from .alerting import AlertConfig, send_alert, should_alert
 from .download_common import redact_credentials
-from .download_mapillary import estimate_tile_count
+from .download_mapillary import DEFAULT_TILE_REQUESTS_PER_MINUTE, estimate_tile_count
 from .json_summarizer import (
     generate_aggregate_v2,
     generate_streetwalk_manifest,
@@ -528,6 +528,12 @@ _TIMEOUT_FIXED_SLACK_S = 600
 # alone eats the whole floor and the child is SIGKILLed during the diff/JSON
 # tail (leaving a valid run row with no JSON — see cmd_run_due reconciliation).
 _ACHIEVED_RATE_FRACTION = 0.5
+# The Mapillary equivalent, and much closer to 1 on purpose: the tile limiter is
+# a hard client-side ceiling the fetch tracks closely (one token, one request —
+# retries included since #198), where the GSV figure above is a project quota
+# the async engine never approaches. The shortfall being budgeted for here is
+# per-request latency and the occasional retry, not structural undershoot.
+_TILE_ACHIEVED_RATE_FRACTION = 0.8
 # Floor for a deadline-clamped timeout. A city is only started while the batch
 # deadline still has room, so the clamp should shorten a run — never hand a
 # child a timeout too short to reach its first request.
@@ -573,6 +579,33 @@ def _stop_on_sigterm():
         signal.signal(signal.SIGTERM, previous)
 
 
+def _mapillary_timeout_seconds(
+    city: db.CityRow, provider: str, pc: ProviderConfig | None, floor: int
+) -> int:
+    """
+    Derived timeout for a paced Mapillary tile census (issue #198).
+
+    Both Mapillary channels read the SAME census over the city's frozen bbox —
+    the road walk joins it onto sample points locally rather than issuing more
+    requests — so spacing and network type do not enter, unlike the GSV street
+    estimate. Cost is purely tile count, and wall-clock is that divided by the
+    pacing rate.
+
+    Uses ``_TILE_ACHIEVED_RATE_FRACTION`` rather than gsv's ``_ACHIEVED_RATE
+    _FRACTION``: here the limiter IS the binding constraint (it is a hard
+    ceiling the fetch tracks closely), where gsv's cap is a project quota the
+    async engine never approaches. Never returns below the configured floor.
+    """
+    # `is None`, not falsy: 0 means "pacing disabled", not "use the default".
+    configured = pc.max_requests_per_minute if pc else None
+    rate = DEFAULT_TILE_REQUESTS_PER_MINUTE if configured is None else configured
+    if rate <= 0:  # pacing disabled: nothing to derive from
+        return floor
+    tiles = estimate_requests(city, provider)  # the same z14 count the budget uses
+    paced_seconds = tiles / (rate * _TILE_ACHIEVED_RATE_FRACTION) * 60.0
+    return int(max(floor, paced_seconds * _TIMEOUT_HEADROOM + _TIMEOUT_FIXED_SLACK_S))
+
+
 def city_timeout_seconds(
     cfg: SchedulerConfig,
     city: db.CityRow,
@@ -589,9 +622,11 @@ def city_timeout_seconds(
     mid-run (Austin/Houston/NYC …), and a killed child records no api_usage, so
     its already-spent requests vanish from the budget ledger. The estimate uses
     ``max_requests_per_minute * _ACHIEVED_RATE_FRACTION`` because the pacing cap
-    is not actually achieved (see the constant). The derived value never drops
-    below the configured floor, so small cities and the (fast, bulk-metadata)
-    Mapillary provider keep the flat timeout.
+    is not actually achieved (see the constant). Every channel is now paced, so
+    every channel scales — the Mapillary pair off tile count and their own
+    per-IP rate (see _mapillary_timeout_seconds). The derived value never drops
+    below the configured floor, so small cities keep the flat timeout whatever
+    their provider.
 
     ``remaining_s`` clamps the result to what is left of the batch deadline
     (issue #167). Without it, a city started just inside the deadline still runs
@@ -605,14 +640,22 @@ def city_timeout_seconds(
             return value
         return int(max(_MIN_CLAMPED_TIMEOUT_S, min(value, remaining_s)))
 
-    # Only the two per-request GSV channels are paced by request count. Both
-    # Mapillary channels read a handful of tiles in seconds, so they keep the
-    # flat floor. gsv_streets scales exactly like gsv — a 247k-sample city
-    # (Seattle) needs ~20 minutes of querying, and a flat floor would SIGKILL
-    # the biggest ones.
-    if provider not in ("gsv", "gsv_streets"):
+    # gsv_streets scales exactly like gsv — a 247k-sample city (Seattle) needs
+    # ~20 minutes of querying, and a flat floor would SIGKILL the biggest ones.
+    #
+    # Mapillary used to keep the flat floor on the grounds that a tile census is
+    # "a handful of tiles in seconds". Client-side pacing (issue #198) ended
+    # that: a run's wall-clock is now tile_count / rate, and the frozen grids
+    # are not all small. At the shipped 60/min the median city is ~12 tiles but
+    # Anchorage's 105x84 km grid is ~6,480, i.e. ~108 minutes of deliberate
+    # sleeping before the decode/assignment/CSV tail even starts — against a
+    # 180-minute floor. A SIGKILL there costs the requests already spent AND
+    # counts a failure, so the derivation has to see the pacing.
+    if provider not in ("gsv", "gsv_streets", "mapillary", "mapillary_streets"):
         return clamp(floor)
     pc = (cfg.providers or {}).get(provider)
+    if provider in ("mapillary", "mapillary_streets"):
+        return clamp(_mapillary_timeout_seconds(city, provider, pc, floor))
     rate = (pc.max_requests_per_minute if pc else None) or cfg.max_requests_per_minute
     if rate <= 0:
         return clamp(floor)
@@ -1168,9 +1211,12 @@ def _street_collect_cmd(
         "INFO",
     ]
     if channel == "gsv_streets":
+        # `is not None`, not `or`: 0 is documented as "disable pacing", and a
+        # falsy test silently promoted it to the 24k/48k GSV project figure.
+        rate = pc.max_requests_per_minute
         cmd += [
             "--max-requests-per-minute",
-            str(pc.max_requests_per_minute or cfg.max_requests_per_minute),
+            str(cfg.max_requests_per_minute if rate is None else rate),
         ]
     elif channel == "mapillary_streets" and pc.max_requests_per_minute is not None:
         # Paces the tile CDN, which limits per IP rather than per token — so

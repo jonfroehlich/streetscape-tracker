@@ -38,6 +38,7 @@ import gzip
 import logging
 import math
 import os
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -360,9 +361,15 @@ _TILE_MAX_TIME_S = 120
 # 60/min is a deliberately conservative guess. The true ceiling is unknown (370
 # is merely confirmed too high), and being wrong is expensive in a way slowness
 # is not: the nightly scheduler shares the host IP, so a ban takes out its
-# `mapillary` and `mapillary_streets` channels too. Pacing costs almost nothing
-# here — a whole city is tens of tile requests, and a nightly batch spends ~700
-# across ~20 cities, so this adds ~12 minutes spread over a night.
+# `mapillary` and `mapillary_streets` channels too.
+#
+# What pacing costs, measured over the enabled cities' frozen geometry rather
+# than guessed: a median city is 12 z14 tiles and the mean is 59, so a 20-city
+# night is ~1,200 tiles on the grid channel (~20 min at this rate) and ~2,400
+# across both Mapillary channels (~40 min), against a 10 h batch deadline. The
+# distribution has a long tail — Anchorage's 105x84 km grid alone is ~6,480
+# tiles, ~108 min — which is why scheduler.city_timeout_seconds derives a
+# Mapillary timeout from the tile count instead of using the flat floor.
 #
 # Per-process, like the GSV limiter: N concurrent collections present N times
 # this rate to the CDN. Do not run Mapillary collections in parallel.
@@ -383,8 +390,22 @@ _TILE_ERROR_CONTENT_TYPES = ("text/html", "application/json")
     max_time=_TILE_MAX_TIME_S,
 )
 async def _fetch_tile(
-    session: aiohttp.ClientSession, url: str, timeout: aiohttp.ClientTimeout
+    session: aiohttp.ClientSession,
+    url: str,
+    timeout: aiohttp.ClientTimeout,
+    rate_limiter: AsyncRateLimiter | None = None,
+    on_request: Callable[[], None] | None = None,
 ) -> bytes:
+    # Pacing and counting sit INSIDE the retried body on purpose (issue #198).
+    # This function may issue up to _TILE_MAX_TRIES requests; taking one token
+    # in the caller would let a retrying tile present up to five times the
+    # configured rate — during a 429/5xx storm, i.e. exactly when the CDN is
+    # least willing to absorb it — and would under-report the same factor to
+    # the api_usage ledger. One token, one counted request, one HTTP request.
+    if rate_limiter is not None:
+        await rate_limiter.acquire()
+    if on_request is not None:
+        on_request()
     # allow_redirects=False is load-bearing (issue #199). When the tile CDN
     # rate-limits a host it answers 302 → www.mapillary.com/login/, and aiohttp
     # follows redirects by default — so the login page's own perfectly good HTTP
@@ -476,15 +497,22 @@ async def fetch_city_images_async(
     # caps concurrency, which on a fast link still meant ~5 tiles/s (~300/min)
     # from a single city before this (issue #198).
     rate_limiter = AsyncRateLimiter(max_requests_per_minute)
+    logger.info(
+        f"Pacing tile requests at {max_requests_per_minute}/min"
+        if max_requests_per_minute > 0
+        else "Tile pacing DISABLED (max_requests_per_minute <= 0)"
+    )
     progress_bar = tqdm(total=len(tiles), desc=f"Downloading Mapillary tiles for {city_name}")
 
-    async def fetch_one(x: int, y: int) -> list[dict[str, Any]]:
+    def count_request() -> None:
         nonlocal api_requests
+        api_requests += 1
+
+    async def fetch_one(x: int, y: int) -> list[dict[str, Any]]:
         url = f"{TILE_URL_TEMPLATE.format(z=TILE_ZOOM, x=x, y=y)}?access_token={access_token}"
         async with semaphore:
-            await rate_limiter.acquire()
-            api_requests += 1
-            tile_bytes = await _fetch_tile(session, url, timeout)
+            # Pacing/counting happen inside _fetch_tile, per retried attempt.
+            tile_bytes = await _fetch_tile(session, url, timeout, rate_limiter, count_request)
         progress_bar.update(1)
         return decode_image_features(tile_bytes, x, y)
 

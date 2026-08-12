@@ -74,10 +74,11 @@ daily_request_budget = 40000
 # with [providers.mapillary_streets] below and with any manual collection on
 # this host, and a second token would not isolate it.
 #
-# 60/min is a conservative guess; 370 is merely confirmed too high. Slowness
-# is nearly free here (a nightly batch spends ~700 requests across ~20 cities,
-# so this adds ~12 minutes to a night) and a ban is not: it takes out every
-# Mapillary channel on the host until it lifts.
+# 60/min is a conservative guess; 370 is merely confirmed too high. Measured
+# over the enabled cities' frozen grids, a 20-city night is ~1,200 tiles on
+# this channel (~20 min at this rate) and ~2,400 across both Mapillary channels
+# (~40 min) — cheap against max_batch_hours. A ban is not cheap: it takes out
+# every Mapillary channel on the host until it lifts.
 max_requests_per_minute = 60
 
 # Road-walk street-coverage collection (issue #99). These are SCHEDULED

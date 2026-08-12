@@ -193,10 +193,89 @@ def test_city_timeout_floor_for_mapillary_and_disabled_pacing(conn):
 
     big = db.resolve_city(conn, _register(conn, "Metropolis", width=40000, height=40000, step=20))
     floor = 180 * 60
-    # Mapillary is fast bulk metadata — keep the flat floor regardless of grid.
+    # A 40 km grid is ~550 z14 tiles: minutes even at the paced 60/min, so the
+    # flat floor still covers it comfortably. (What does NOT is a grid several
+    # times that — see the Anchorage-shaped case below.)
     assert city_timeout_seconds(SchedulerConfig(), big, "mapillary") == floor
     # No client-side pacing -> no basis to scale, keep the floor.
     assert city_timeout_seconds(SchedulerConfig(max_requests_per_minute=0), big, "gsv") == floor
+
+
+def _register_at(conn, name, lat, lon, width, height, step=20):
+    return db.register_city(
+        conn,
+        city_name=name,
+        state_name=None,
+        state_code=None,
+        country_name="United States",
+        country_code="US",
+        center_lat=lat,
+        center_lon=lon,
+        grid_width_m=width,
+        grid_height_m=height,
+        step_m=step,
+    )
+
+
+@pytest.mark.parametrize("provider", ["mapillary", "mapillary_streets"])
+def test_a_paced_tile_census_outgrows_the_flat_timeout(conn, provider):
+    """Pacing (issue #198) made Mapillary wall-clock scale with tile count, so
+    the timeout has to see it.
+
+    Anchorage's frozen grid is 105 x 84 km at latitude 61, where a z14 tile is
+    only ~1.2 km across: ~6,500 tiles, i.e. ~108 minutes of deliberate sleeping
+    at 60/min before the decode/assignment/CSV tail even starts. The old flat
+    180-minute floor left that a coin flip, and losing it costs the requests
+    already spent AND counts a failure.
+
+    Both channels, because they read the identical census — the road walk joins
+    it onto sample points locally rather than issuing more requests.
+    """
+    from streetscape_metadata_tracker.scheduler import city_timeout_seconds
+
+    city = db.resolve_city(
+        conn, _register_at(conn, "Anchorage", 61.2, -149.9, width=105588, height=83676)
+    )
+    cfg = SchedulerConfig(providers={provider: ProviderConfig(max_requests_per_minute=60)})
+    floor = 180 * 60
+
+    derived = city_timeout_seconds(cfg, city, provider)
+    assert derived > floor, "a 6,500-tile census must not be squeezed into the flat floor"
+    # And it must cover the pacing itself with room for the tail.
+    paced_seconds = 6_480 / 60 * 60
+    assert derived > paced_seconds
+
+
+def test_a_paced_tile_census_uses_the_channels_own_rate(conn):
+    """Halving the configured rate doubles the pacing, so the timeout must
+    follow the channel's own figure rather than a constant."""
+    from streetscape_metadata_tracker.scheduler import city_timeout_seconds
+
+    city = db.resolve_city(
+        conn, _register_at(conn, "Anchorage", 61.2, -149.9, width=105588, height=83676)
+    )
+    fast = city_timeout_seconds(
+        SchedulerConfig(providers={"mapillary": ProviderConfig(max_requests_per_minute=120)}),
+        city,
+        "mapillary",
+    )
+    slow = city_timeout_seconds(
+        SchedulerConfig(providers={"mapillary": ProviderConfig(max_requests_per_minute=30)}),
+        city,
+        "mapillary",
+    )
+    assert slow > fast
+
+
+def test_an_unpaced_mapillary_channel_keeps_the_flat_floor(conn):
+    """0 disables pacing, which leaves nothing to derive a duration from."""
+    from streetscape_metadata_tracker.scheduler import city_timeout_seconds
+
+    city = db.resolve_city(
+        conn, _register_at(conn, "Anchorage", 61.2, -149.9, width=105588, height=83676)
+    )
+    cfg = SchedulerConfig(providers={"mapillary": ProviderConfig(max_requests_per_minute=0)})
+    assert city_timeout_seconds(cfg, city, "mapillary") == 180 * 60
 
 
 def _orphan_run(conn, data_dir, *, run_date=date(2026, 4, 15), write_csv=True):
@@ -2489,6 +2568,29 @@ def test_a_gsv_grid_child_never_gets_the_mapillary_flag(conn, monkeypatch, tmp_p
     cfg = SchedulerConfig(providers={"mapillary": ProviderConfig(max_requests_per_minute=60)})
     cmd, _ = _grid_cmd(monkeypatch, tmp_path, conn, "gsv", cfg)
     assert "--mapillary-max-requests-per-minute" not in cmd
+
+
+def test_an_explicit_zero_disables_gsv_street_pacing_instead_of_reverting(conn):
+    """0 is documented as 'disables pacing'. A falsy `or` fallback silently
+    promoted it to [download].max_requests_per_minute — a 24k/48k project
+    figure, i.e. the opposite of what was asked for."""
+    from streetscape_metadata_tracker.scheduler import _street_collect_cmd
+
+    city = db.resolve_city(conn, _register(conn, "Bend", width=5000, height=5000, step=20))
+    cfg = SchedulerConfig(providers={"gsv_streets": ProviderConfig(max_requests_per_minute=0)})
+
+    cmd = _street_collect_cmd(cfg, city, date(2026, 7, 8), "gsv_streets", 10, 100)
+    assert cmd[cmd.index("--max-requests-per-minute") + 1] == "0"
+
+
+def test_an_unset_gsv_street_pace_falls_back_to_the_download_figure(conn):
+    from streetscape_metadata_tracker.scheduler import _street_collect_cmd
+
+    city = db.resolve_city(conn, _register(conn, "Bend", width=5000, height=5000, step=20))
+    cfg = SchedulerConfig(providers={"gsv_streets": ProviderConfig()})
+
+    cmd = _street_collect_cmd(cfg, city, date(2026, 7, 8), "gsv_streets", 10, 100)
+    assert cmd[cmd.index("--max-requests-per-minute") + 1] == str(cfg.max_requests_per_minute)
 
 
 def test_mapillary_street_child_gets_the_tile_pace(conn):

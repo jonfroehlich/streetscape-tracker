@@ -24,6 +24,7 @@ from shapely.geometry import LineString
 
 from streetscape_metadata_tracker import db
 from streetscape_metadata_tracker import download_gsv as dg
+from streetscape_metadata_tracker.download_mapillary import DEFAULT_TILE_REQUESTS_PER_MINUTE
 from streetscape_metadata_tracker.naming import (
     generate_streetwalk_filename,
     streetwalk_coverage_filename,
@@ -278,6 +279,43 @@ def test_tile_cost_is_independent_of_sample_spacing(tmp_path, monkeypatch):
     # ...for the same number of requests.
     assert by_spacing[15]["api_requests"] == by_spacing[30]["api_requests"] == 7
     conn.close()
+
+
+def test_the_road_walk_forwards_the_tile_pace_to_the_census(tmp_path, monkeypatch):
+    """The grid run and the road walk share fetch_city_images_async and share
+    the per-IP tile limit (issue #198), so the walk must not be the unpaced way
+    in. Driven through the real CLI: a signature check would not notice
+    collect.py dropping the argument between argparse and the census."""
+    data_dir, _ = _setup(tmp_path, monkeypatch, [_image("i-1", 44.0500, -121.3000)])
+    census = cm.fetch_city_images_async  # the local stand-in installed by _setup
+    seen = {}
+
+    async def capture(city_name, bbox, access_token, **kwargs):
+        seen.update(kwargs)
+        return await census(city_name, bbox, access_token, **kwargs)
+
+    monkeypatch.setattr(cm, "fetch_city_images_async", capture)
+
+    args = _args(data_dir, **{"mapillary-max-requests-per-minute": 42})
+    assert collect.run_collect(args) == 0
+    assert seen["max_requests_per_minute"] == 42
+
+
+def test_an_unset_road_walk_pace_still_paces(tmp_path, monkeypatch):
+    """Unset must mean the collector's own conservative default, never unpaced
+    and never the gsv_streets figure."""
+    data_dir, _ = _setup(tmp_path, monkeypatch, [_image("i-1", 44.0500, -121.3000)])
+    census = cm.fetch_city_images_async
+    seen = {}
+
+    async def capture(city_name, bbox, access_token, **kwargs):
+        seen.update(kwargs)
+        return await census(city_name, bbox, access_token, **kwargs)
+
+    monkeypatch.setattr(cm, "fetch_city_images_async", capture)
+
+    assert collect.run_collect(_args(data_dir)) == 0
+    assert seen["max_requests_per_minute"] == DEFAULT_TILE_REQUESTS_PER_MINUTE
 
 
 def test_estimate_reports_tiles_and_needs_no_token(tmp_path, monkeypatch, capsys):
