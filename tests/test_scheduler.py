@@ -5,6 +5,7 @@ import json
 import os
 import re
 import signal
+import time
 from datetime import date
 from pathlib import Path
 
@@ -2242,6 +2243,88 @@ def test_cmd_backup_status_reports_and_exits_nonzero_when_missing(
     assert "1 files" in out
 
 
+def test_backup_status_exits_nonzero_when_the_newest_copy_is_stale(
+    conn, monkeypatch, tmp_path, capsys
+):
+    """
+    A monitor check has to catch "nothing has run in weeks", not just "the last
+    thing we tried failed". The newest copy is never pruned, so an abandoned
+    scheduler leaves one ancient file next to an ok status — #145's shape.
+    """
+    from streetscape_metadata_tracker import catalog_backup as cb
+    from streetscape_metadata_tracker import scheduler as sched
+
+    monkeypatch.setattr(sched.catalog_backup, "write_backup", _REAL_WRITE_BACKUP)
+    cfg = _real_backup_cfg(tmp_path, data_dir=str(tmp_path / "data"))
+    cfg.driving_plan.archive_dir = str(tmp_path / "archive")
+    result = sched.catalog_backup.write_backup(conn, cfg.backup_dir, date(2026, 8, 7))
+
+    assert sched.cmd_backup_status(cfg) == 0
+    capsys.readouterr()
+
+    # Nothing changes but the file's age: same file, same successful status.
+    old = time.time() - (cb.STALE_AFTER_HOURS + 2) * 3600
+    os.utime(result.path, (old, old))
+
+    assert sched.cmd_backup_status(cfg) == 1
+    out = capsys.readouterr().out
+    assert "STALE" in out
+    assert "last attempt" in out and "FAILED" not in out
+
+
+def test_restore_backup_subcommand_restores_and_then_refuses(conn, monkeypatch, tmp_path, capsys):
+    """The incident-time handle. It must work, and it must refuse the second
+    time — restoring onto a catalog that is already there would destroy the
+    thing being recovered."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    monkeypatch.setattr(sched.catalog_backup, "write_backup", _REAL_WRITE_BACKUP)
+    cfg = _real_backup_cfg(tmp_path)
+    result = sched.catalog_backup.write_backup(conn, cfg.backup_dir, date(2026, 8, 7))
+    dest = str(tmp_path / "restored" / "streetscape_tracker.db")
+
+    assert sched.cmd_restore_backup(cfg, result.path, dest) == 0
+    assert os.path.exists(dest)
+
+    rc = sched.cmd_restore_backup(cfg, result.path, dest)
+    assert rc == 1
+    assert "Restore refused" in capsys.readouterr().out
+
+
+def test_alert_subject_names_both_the_backup_and_the_collection_failures(conn, monkeypatch):
+    """A subject line is often all that gets read; a failed backup must not mask
+    a failed night, or vice versa."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    alerts = []
+    monkeypatch.setattr(sched, "send_alert", lambda cfg, subj, body: alerts.append(subj))
+    monkeypatch.setattr(sched, "_recent_log_tail", lambda cfg, n=40: "")
+
+    sched._finish_batch(
+        _publishing_cfg(),
+        conn,
+        "summary",
+        succeeded=0,
+        attempted=2,
+        today=date(2026, 7, 2),
+        errored=True,
+        backup_error="catalog backup failed: io error",
+    )
+
+    assert len(alerts) == 1
+    assert "CATALOG BACKUP FAILED" in alerts[0]
+    assert "2 failed collection(s)" in alerts[0]
+
+
 def test_backup_status_subcommand_is_wired(capsys):
     args = build_parser().parse_args(["backup-status"])
     assert args.command == "backup-status"
+
+
+def test_restore_backup_subcommand_is_wired():
+    args = build_parser().parse_args(["restore-backup", "/b/x.backup", "--to", "/tmp/d.db"])
+    assert (args.command, args.backup_path, args.dest) == (
+        "restore-backup",
+        "/b/x.backup",
+        "/tmp/d.db",
+    )

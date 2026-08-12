@@ -249,6 +249,17 @@ Properties worth knowing before an incident:
   nonzero so systemd shows the unit red. It does *not* withhold publishing — the
   #167 posture: never hide what the night collected. Backups that fail silently
   are the whole reason #145 existed.
+- **Bounded, never hung.** `sqlite3`'s backup API retries `SQLITE_BUSY` in an
+  unbounded loop (`PRAGMA busy_timeout` does not apply), and the pre-flight copy
+  runs *before* the city loop — so a stuck copy would cost the entire night and
+  end in a SIGKILL at `TimeoutStartSec`. A progress-callback deadline
+  (`BACKUP_TIMEOUT_S`, 10 min) supplies the timeout sqlite3 lacks, and an open
+  transaction on the source connection is rejected outright rather than retried.
+- **No stray `-wal`/`-shm`.** Each dated copy inherits WAL format from the
+  catalog, so *any* read of one — including a read-only one, which cannot clean
+  up after itself — leaves a sidecar pair behind. They are cleared at promotion
+  and prune time, because nothing binds a WAL to a particular database file:
+  left beside a replaced copy, SQLite would replay it into the new one.
 - **Provenance.** `backups/backup_status.json` records the last attempt —
   outcome, source DB path, hostname, per-table row counts — written on failure
   as well as success, because a failed backup that wrote nothing is otherwise
@@ -260,8 +271,13 @@ Properties worth knowing before an incident:
 .venv/bin/python -m streetscape_metadata_tracker.scheduler --config config/scheduler.makelab1.toml backup-status
 ```
 
-Exits nonzero when the newest backup is missing or the last attempt failed, so
-it works as a monitor check.
+Exits nonzero when the newest backup is missing, **older than 48 h**, or the
+last attempt failed, so it works as a monitor check. The age gate is not
+redundant with the outcome: "the last attempt succeeded" stays true forever once
+the scheduler simply stops running — a masked timer, a disabled unit, a
+`ConditionHost` that no longer matches after a host cutover — and since the
+newest copy is never pruned, that state otherwise looks like one file plus an
+`ok` status. Which is #145 again.
 
 #### Assets that exist in only one place
 
@@ -276,13 +292,35 @@ and `backup-status` inventories both:
 
 #### Restore
 
-`catalog_backup.restore_backup(backup_path, dest)` verifies the backup, restores
-via the online backup API, and **refuses to overwrite an existing catalog**
-(move the live one aside first). Drilled end to end in
-`tests/test_catalog_backup.py::test_restore_drill_rebuilds_a_destroyed_catalog`,
-which genuinely deletes a populated catalog plus its `-wal`/`-shm` sidecars and
-asserts the restored copy is intact, complete, and still carries its frozen grid
-geometry and schema version.
+```bash
+# Verifies the backup, then restores it. Refuses if anything is already there.
+.venv/bin/python -m streetscape_metadata_tracker.scheduler --config config/scheduler.makelab1.toml \
+    restore-backup backups/streetscape_tracker.db.2026-08-07.backup --to /tmp/recovered.db
+```
+
+`--to` defaults to the configured `db_path`. Stop the timer first, and restore
+to a scratch path and inspect it before putting it in the catalog's place.
+
+Two refusals, both deliberate — a restore that quietly does something plausible
+is worse than one that stops:
+
+- **An existing destination.** Recovering onto a live catalog would destroy the
+  thing you are recovering. Move it aside first.
+- **Orphaned `-wal`/`-shm` beside the destination.** This is what a real
+  incident looks like: the catalog goes bad, you move `streetscape_tracker.db`
+  aside, and the sidecars of the process that died stay behind. Nothing binds a
+  WAL to a particular database file, so SQLite would replay those frames into
+  the restored copy on its first open — handing back the exact state you were
+  escaping, with `integrity_check` still saying `ok`. They are **not** deleted
+  for you: an orphaned WAL can hold the only copy of the last committed writes,
+  so whether it is garbage or your best remaining evidence is your call. Move
+  them aside and re-run.
+
+Drilled end to end in `tests/test_catalog_backup.py` — the drill genuinely
+deletes a populated catalog plus its `-wal`/`-shm` sidecars and asserts the
+restored copy is intact, complete, and still carries its frozen grid geometry
+and schema version; a second test leaves the sidecars in place and asserts the
+restore refuses rather than silently resurrecting the pre-restore rows.
 
 Recovering files older than our 14-day window goes through CSE IT
 (support@cs.washington.edu). **Retention for `/projects/makeabilitylab` beyond

@@ -80,6 +80,13 @@ max_requests_per_minute = 48000
 data_dir = "/projects/makeabilitylab/streetscape-tracker/data"
 db_path  = "/projects/makeabilitylab/streetscape-tracker/data/streetscape_tracker.db"
 log_dir  = "/projects/makeabilitylab/streetscape-tracker/logs"
+# Dated catalog backups (issue #145), retained 14 days. Stated explicitly like
+# its neighbours rather than left to the default: the default resolves off the
+# package location, which under the systemd unit reaches this same directory
+# only by way of the ~/streetscape-tracker symlink. OUTSIDE data_dir (the
+# publish rsync walks data/ and would ship catalog copies to the public web
+# server) and INSIDE the tree CSE IT snapshots. Health: scheduler backup-status
+backup_dir = "/projects/makeabilitylab/streetscape-tracker/backups"
 
 [publish]
 # After each successful nightly batch, publish *.csv.gz/*.json.gz to the public

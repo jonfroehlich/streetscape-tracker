@@ -11,7 +11,8 @@ from a dated backup.
 import json
 import os
 import sqlite3
-from datetime import date, timedelta
+import time
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
@@ -117,6 +118,59 @@ def test_restore_drill_rebuilds_a_destroyed_catalog(conn, tmp_path, data_dir):
         restored.close()
 
 
+def test_restore_refuses_when_orphaned_wal_sidecars_remain(conn, tmp_path):
+    """
+    The drill above deletes the sidecars; a real incident often does not. The
+    catalog goes bad, the operator moves ``streetscape_tracker.db`` aside, and
+    the ``-wal``/``-shm`` of the process that died stay behind.
+
+    Nothing binds a WAL file to a particular database: SQLite replays whatever
+    valid frames sit next to the main file. Restoring into that leaves you with
+    the pre-restore state — silently, with integrity_check reporting "ok" — so
+    the restore must refuse rather than produce a plausible-looking wrong
+    catalog. Deleting them for the operator is not the answer either: an
+    orphaned WAL can hold the only copy of the last committed writes.
+    """
+    live = str(tmp_path / "live.db")
+    live_conn = sqlite3.connect(live)
+    live_conn.execute("PRAGMA journal_mode=WAL")
+    live_conn.execute("CREATE TABLE t (x TEXT)")
+    live_conn.execute("INSERT INTO t VALUES ('in-the-backup')")
+    live_conn.commit()
+
+    backup_dir = str(tmp_path / "backups")
+    result = catalog_backup.write_backup(live_conn, backup_dir, date(2026, 8, 7))
+    assert result.ok
+
+    # Writes that land in the WAL and are never checkpointed, then a kill.
+    for i in range(300):
+        live_conn.execute("INSERT INTO t VALUES (?)", (f"after-the-backup-{i}",))
+    live_conn.commit()
+    assert os.path.getsize(live + "-wal") > 0
+    # Deliberately NOT closed: a clean close checkpoints and removes the
+    # sidecars, and the case being modelled is a process that was killed.
+    os.rename(live, live + ".corrupt-aside")
+    assert os.path.exists(live + "-wal")
+
+    with pytest.raises(FileExistsError) as excinfo:
+        catalog_backup.restore_backup(result.path, live)
+    assert "-wal" in str(excinfo.value)
+    assert not os.path.exists(live), "a refused restore must leave no file behind"
+
+    # Once the operator moves them aside, the restore is the backup's contents —
+    # NOT the post-backup rows the stale WAL was carrying.
+    for suffix in ("-wal", "-shm"):
+        if os.path.exists(live + suffix):
+            os.rename(live + suffix, live + suffix + ".aside")
+    catalog_backup.restore_backup(result.path, live)
+    restored = sqlite3.connect(live)
+    try:
+        rows = [r[0] for r in restored.execute("SELECT x FROM t")]
+    finally:
+        restored.close()
+    assert rows == ["in-the-backup"]
+
+
 def test_restore_refuses_to_clobber_an_existing_catalog(conn, tmp_path, data_dir):
     """Restoring onto a live catalog is an operator decision, not a silent
     overwrite — the wrong default here loses the very data you're recovering."""
@@ -158,8 +212,12 @@ def test_backup_is_dated_verified_and_atomically_promoted(conn, tmp_path):
     assert result.integrity == "ok"
     assert result.bytes_written > 0
     assert result.row_counts["cities"] == 3
-    # No temp file survives a successful promotion.
-    assert not any(p.endswith(".tmp") for p in os.listdir(backup_dir))
+    # Nothing but the copy and its status survives a successful promotion — an
+    # endswith(".tmp") check would miss orphaned .tmp-wal/.tmp-shm sidecars.
+    assert sorted(os.listdir(backup_dir)) == [
+        catalog_backup.STATUS_FILENAME,
+        "streetscape_tracker.db.2026-08-07.backup",
+    ]
 
 
 def test_failed_integrity_check_keeps_the_previous_good_backup(conn, tmp_path, monkeypatch):
@@ -201,6 +259,70 @@ def test_same_day_rebackup_replaces_in_place(conn, tmp_path):
     assert second.path == first.path
     assert len(catalog_backup.list_backups(backup_dir)) == 1
     assert second.row_counts["runs"] > first_rows, "the tail copy must see the night's runs"
+
+
+def test_row_counts_describe_the_copy_not_the_live_catalog(conn, tmp_path):
+    """
+    Provenance has to describe the file an operator is holding. Counting the
+    source would report whatever the live catalog says at that moment, which is
+    not necessarily what the copy contains.
+    """
+    _populate(conn, n_cities=2)
+    backup_dir = str(tmp_path / "backups")
+    result = catalog_backup.write_backup(conn, backup_dir, date(2026, 8, 7))
+
+    copy = sqlite3.connect(result.path)
+    try:
+        in_file = {
+            t: copy.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in result.row_counts
+        }
+    finally:
+        copy.close()
+    catalog_backup._remove_sidecars(result.path)
+
+    assert result.row_counts == in_file
+
+
+def test_an_open_source_transaction_fails_fast_instead_of_hanging(conn, tmp_path):
+    """
+    sqlite3's backup API retries SQLITE_BUSY forever, and an uncommitted write
+    on the SOURCE connection is a busy source. In the pre-flight position that
+    would stall the whole night into a systemd SIGKILL, so name it immediately.
+    """
+    _populate(conn, n_cities=1)
+    conn.execute("UPDATE cities SET grid_width_m = grid_width_m")  # uncommitted write
+    assert conn.in_transaction
+
+    result = catalog_backup.write_backup(conn, str(tmp_path / "backups"), date(2026, 8, 7))
+
+    assert not result.ok
+    assert "open transaction" in result.error
+    conn.rollback()
+
+
+def test_a_busy_source_times_out_instead_of_hanging(tmp_path, monkeypatch):
+    """The general case of the above: a lock held by somebody else. The copy is
+    bounded by BACKUP_TIMEOUT_S via the progress callback, which sqlite3 invokes
+    on busy retries too — without it there is no timeout at any layer."""
+    src_path = str(tmp_path / "busy.db")
+    # Rollback-journal mode (not WAL), so a competing writer genuinely blocks
+    # the backup's reader instead of being invisible to it.
+    source = sqlite3.connect(src_path)
+    source.execute("CREATE TABLE t (x)")
+    source.commit()
+    blocker = sqlite3.connect(src_path, timeout=0.1)
+    blocker.execute("BEGIN EXCLUSIVE")
+    blocker.execute("INSERT INTO t VALUES (1)")
+
+    monkeypatch.setattr(catalog_backup, "BACKUP_TIMEOUT_S", 1.0)
+    started = time.monotonic()
+    result = catalog_backup.write_backup(source, str(tmp_path / "backups"), date(2026, 8, 7))
+    elapsed = time.monotonic() - started
+    blocker.rollback()
+
+    assert not result.ok
+    assert "exceeded" in result.error
+    assert elapsed < 30, "the copy must be bounded, not merely eventually interrupted"
 
 
 def test_backup_never_raises_on_a_broken_destination(conn, tmp_path):
@@ -261,6 +383,54 @@ def test_prune_keeps_newest_even_when_every_file_is_stale(conn, tmp_path):
     kept = [d for d, _ in catalog_backup.list_backups(backup_dir)]
 
     assert kept == [date(2026, 3, 1)], "the newest survives; the rest age out"
+
+
+def test_promotion_clears_stale_sidecars_beside_the_backup(conn, tmp_path):
+    """
+    The backup inherits WAL format from the source, so *any* read of a dated
+    copy — including a read-only one, which cannot clean up after itself —
+    leaves a -wal/-shm pair beside it. The tail then replaces the file under
+    them, and on the next open SQLite would replay frames belonging to the copy
+    that is no longer there.
+    """
+    _populate(conn, n_cities=1)
+    backup_dir = str(tmp_path / "backups")
+    first = catalog_backup.write_backup(conn, backup_dir, date(2026, 8, 7))
+
+    # Reading the pre-flight copy the way an operator (or restore_backup) would.
+    ro = sqlite3.connect(f"file:{first.path}?mode=ro", uri=True)
+    ro.execute("PRAGMA integrity_check").fetchone()
+    ro.close()
+    assert any(os.path.exists(p) for p in catalog_backup.sidecar_paths(first.path))
+
+    # The tail's second copy of the night.
+    catalog_backup.write_backup(conn, backup_dir, date(2026, 8, 7))
+
+    assert not any(os.path.exists(p) for p in catalog_backup.sidecar_paths(first.path))
+    assert sorted(os.listdir(backup_dir)) == [
+        catalog_backup.STATUS_FILENAME,
+        "streetscape_tracker.db.2026-08-07.backup",
+    ]
+
+
+def test_prune_takes_sidecars_with_the_file(conn, tmp_path):
+    """An orphaned sidecar is invisible to list_backups/backup_status and
+    replayable into a future file of the same name, so it must not outlive the
+    backup it belonged to."""
+    _populate(conn, n_cities=1)
+    backup_dir = str(tmp_path / "backups")
+    # Newest first, so the stale copy is written without being pruned on the way
+    # in (write_backup prunes relative to the date it is given).
+    catalog_backup.write_backup(conn, backup_dir, date(2026, 8, 7))
+    old = catalog_backup.write_backup(conn, backup_dir, date(2026, 1, 1))
+    for path in catalog_backup.sidecar_paths(old.path):
+        with open(path, "wb") as f:
+            f.write(b"stale")
+
+    pruned = catalog_backup.prune_backups(backup_dir, date(2026, 8, 7))
+
+    assert pruned == [old.path]
+    assert not any(os.path.exists(p) for p in catalog_backup.sidecar_paths(old.path))
 
 
 def test_list_backups_ignores_unrelated_files(conn, tmp_path):
@@ -328,6 +498,28 @@ def test_backup_status_reports_age_and_totals(conn, tmp_path):
     assert st.total_bytes > 0
     assert st.age_hours is not None and st.age_hours >= 0
     assert st.last_attempt["ok"] is True
+
+
+def test_backup_status_flags_a_stale_newest_copy(conn, tmp_path):
+    """
+    "The last attempt succeeded" stays true forever once nothing is running —
+    a masked timer, a disabled unit, a ConditionHost that stopped matching after
+    a host cutover. Since the newest copy is deliberately never pruned, that
+    state otherwise presents as one file plus an ok status, which is #145's
+    exact shape. Age is the signal that survives it.
+    """
+    _populate(conn, n_cities=1)
+    backup_dir = str(tmp_path / "backups")
+    catalog_backup.write_backup(conn, backup_dir, date(2026, 8, 7))
+
+    fresh = catalog_backup.backup_status(backup_dir)
+    assert fresh.stale is False
+
+    # Same directory, same successful status file — only the clock moved on.
+    later = datetime.now(UTC) + timedelta(hours=catalog_backup.STALE_AFTER_HOURS + 1)
+    stale = catalog_backup.backup_status(backup_dir, now=later)
+    assert stale.stale is True
+    assert stale.last_attempt["ok"] is True, "the outcome alone would still say healthy"
 
 
 def test_backup_status_on_a_missing_directory(tmp_path):
