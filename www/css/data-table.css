@@ -130,6 +130,18 @@
 
 .streets-table tbody th {
   font-weight: bold;
+  /* The row label ("City, State, Country") comes from OSM/Nominatim and is
+     unbounded — the worldwide frame (issue #115) put labels in the table up
+     to 60+ characters ("Stara Pazova Municipality, Srem Administrative
+     District, Serbia"). Left to `white-space: nowrap` alone (see the shared
+     th/td rule above) a label that long single-handedly pushes the table past
+     its 1200px measure; the committed e2e fixture never catches this because
+     its synthetic city names are short. Truncate with an ellipsis instead and
+     carry the untruncated name in `title` (set alongside the cell markup) so
+     it's still available on hover/long-press. */
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .streets-table tbody tr:hover {
@@ -161,6 +173,12 @@
   position: relative;
 }
 
+/* The city-name link (issue #188 follow-up: absorbed the old separate "View
+   on map" column — every row already has one natural place for its one
+   link). Bold like the row header it lives inside, colored to still read as
+   a link. A row with nothing to link to just renders the plain label — no
+   dedicated "unlinked" styling needed since it isn't a distinct column
+   anymore. */
 .streets-view-link {
   color: #1a6b1d;
   text-decoration: none;
@@ -170,10 +188,6 @@
 .streets-view-link:hover,
 .streets-view-link:focus-visible {
   text-decoration: underline;
-}
-
-.streets-no-link {
-  color: #999;
 }
 
 /* ── Exploration controls (issue #188) ─────────────────────────────────────
@@ -360,6 +374,30 @@
   min-width: 2px;
   background: #6c8ba0; /* 3.6:1 on the white surface — above the 3:1 floor */
   border-radius: 2px 2px 0 0; /* rounded data-end, anchored to the baseline */
+  /* Reset browser <button> chrome (border/padding/font/background) — a bar is
+     a <button> exactly when its bucket is clickable (renderDistributionStrip
+     emits a plain, non-interactive <span> otherwise), and these are no-ops on
+     a <span>, so one rule covers both without a tag selector. */
+  display: block;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  appearance: none;
+}
+
+/* Only a <button> (a clickable bucket) gets pointer affordance and
+   interaction states; the plain <span> case has nothing to hover into. */
+button.strip-bar {
+  cursor: pointer;
+}
+
+button.strip-bar:hover {
+  background: #557089;
+}
+
+button.strip-bar:focus-visible {
+  outline: 2px solid #1a73e8;
+  outline-offset: 1px;
 }
 
 .strip-summary {

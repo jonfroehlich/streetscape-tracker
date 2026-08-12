@@ -94,7 +94,14 @@ function walkChangeCellHtml(row) {
 }
 
 /**
- * Cell for the "View on map" link.
+ * Cell for the "City" column: the label, hyperlinked to the city page when
+ * this row has a published run to link to.
+ *
+ * Absorbs the "View on map" link — a follow-up to issue #188. A whole extra
+ * trailing column existed only to carry one link per row, when every row
+ * already has exactly one natural place for it: its own name. A row with
+ * nothing to link to (no published run) still renders, just as plain text —
+ * the same degrade-not-disappear posture the old placeholder cell had.
  *
  * The link carries THIS row's network type: city.html selects the walk to draw
  * by network type and defaults to 'drive', so without it a "Roads + paths" row
@@ -103,17 +110,22 @@ function walkChangeCellHtml(row) {
  * metric entirely. Advertising a row the link cannot reach is worse than not
  * listing it.
  *
+ * `title` carries the full, untruncated label either way — the cell itself is
+ * ellipsis-truncated in CSS (data-table.css) because OSM/Nominatim labels are
+ * unbounded and a long one alone can push the table past its measure.
+ *
  * @param {Object} row - From toRowModel.
- * @returns {string} HTML for one <td>.
+ * @returns {string} HTML for one <th scope="row">.
  */
-function walkLinkCellHtml(row) {
-  const link = row.filename
+function walkLabelCellHtml(row) {
+  const label = escapeHtml(row.label);
+  const content = row.filename
     ? `<a class="streets-view-link"
           href="city.html?file=${encodeURIComponent(row.filename)}&network=${encodeURIComponent(
         row.networkType
-      )}">View on map</a>`
-    : `<span class="streets-no-link" title="This city has no published run to link to">—</span>`;
-  return `<td>${link}</td>`;
+      )}">${label}</a>`
+    : label;
+  return `<th scope="row" title="${label}">${content}</th>`;
 }
 
 /**
@@ -138,7 +150,7 @@ const STREET_COLUMNS = [
     type: "text",
     initial: "asc",
     always: true,
-    cell: (r) => `<th scope="row">${escapeHtml(r.label)}</th>`,
+    cell: walkLabelCellHtml,
   },
   {
     key: "providerLabel",
@@ -269,14 +281,6 @@ const STREET_COLUMNS = [
     type: "number",
     initial: "desc",
     cell: (r) => `<td>${num(r.fullyCovered)}</td>`,
-  },
-  {
-    key: "actions",
-    label: "",
-    sortable: false,
-    always: true,
-    srLabel: "Link to city map",
-    cell: walkLinkCellHtml,
   },
 ];
 

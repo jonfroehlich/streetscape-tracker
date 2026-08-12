@@ -102,8 +102,9 @@ function coverageCellHtml(pct) {
  * @returns {string} HTML for one <th>.
  */
 function headerCellHtml(column, activeSort) {
-  // The trailing link column has nothing to sort and no visible label; it
-  // still needs a header cell so the column count matches the body rows.
+  // A non-sortable column (none currently defined, but the mechanism stays
+  // general) still needs a header cell so the column count matches the body
+  // rows, even with nothing to sort and no visible label.
   if (column.sortable === false) {
     return `<th scope="col"><span class="visually-hidden">${column.srLabel ?? ""}</span></th>`;
   }

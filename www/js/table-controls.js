@@ -143,9 +143,9 @@ function applyFilters(rows, { filters, values, query, searchFields }) {
  * URL was assembled. Unknown keys are ignored rather than throwing: a stale
  * link from before a column was renamed should degrade, not break the page.
  *
- * Non-sortable trailing columns (the "View on map" link) are `always: true`
- * and appear in every preset — including when the picker has zeroed out
- * every optional column.
+ * Structural columns — currently just City, which also carries the row's
+ * link out to the city page — are `always: true` and appear in every preset,
+ * including when the picker has zeroed out every optional column.
  *
  * @param {Object[]} columns - All column descriptors.
  * @param {Object[]} presets - Preset descriptors ({id, label, columns}).
@@ -350,11 +350,22 @@ function formatStripSummary(column, values) {
  * deliberately NOT painted with `coverageColor` — these encode row counts, and
  * reusing the coverage ramp here would imply the height meant coverage.
  *
+ * When the active sort column has a matching range filter, each bucket
+ * becomes a real `<button>` carrying its bounds in `data-from`/`data-to` —
+ * `createTableControls` delegates a click listener to the container (bars are
+ * rebuilt on every repaint, so a per-bar listener would need re-binding every
+ * time; delegation on the container survives the innerHTML replacement, the
+ * same reason the header's sort click is delegated to the `<thead>`). Without
+ * a matching filter the bars stay plain, `aria-hidden` `<span>`s exactly as
+ * before — there is nothing a click on them could narrow.
+ *
  * @param {Element} el - Container.
  * @param {Object} column - Active sort column descriptor.
  * @param {Array<?number>} values
+ * @param {boolean} [clickable] - Whether the active sort column has a range
+ *   filter a bar click can set.
  */
-function renderDistributionStrip(el, column, values) {
+function renderDistributionStrip(el, column, values, clickable = false) {
   const stats = histogramBuckets(values);
   const summary = formatStripSummary(column, values);
   if (!stats || column.type !== "number") {
@@ -366,21 +377,31 @@ function renderDistributionStrip(el, column, values) {
   const tallest = Math.max(...stats.buckets.map((b) => b.count));
   const unit = column.unit ?? "";
   const digits = column.digits ?? 1;
+  // Bucket bounds are rounded to the column's own display precision before
+  // being used anywhere — as the label text AND as the value a click writes
+  // into the filter — so a bar's tooltip and the range it actually selects
+  // always agree (rather than a label reading "58.7%" while the click quietly
+  // filters to the unrounded 58.6987…%).
+  const roundToDigits = (v) => Math.round(v * 10 ** digits) / 10 ** digits;
   const bars = stats.buckets
     .map((bucket) => {
       const height = tallest === 0 ? 0 : Math.round((bucket.count / tallest) * 100);
+      const from = roundToDigits(bucket.from);
+      const to = roundToDigits(bucket.to);
       const label =
-        `${formatCellNumber(bucket.from, digits)}${unit}–` +
-        `${formatCellNumber(bucket.to, digits)}${unit}: ` +
-        `${formatCellNumber(bucket.count)} row${bucket.count === 1 ? "" : "s"}`;
+        `${formatCellNumber(from, digits)}${unit}–${formatCellNumber(to, digits)}${unit}: ` +
+        `${formatCellNumber(bucket.count)} row${bucket.count === 1 ? "" : "s"}` +
+        (clickable ? " — click to filter to this range" : "");
       // min-height keeps a non-empty bucket visible instead of rounding it away.
-      return `<span class="strip-bar" title="${label}" style="height:${
-        bucket.count > 0 ? Math.max(height, 2) : 0
-      }%"></span>`;
+      const heightPct = bucket.count > 0 ? Math.max(height, 2) : 0;
+      return clickable
+        ? `<button type="button" class="strip-bar" data-from="${from}" data-to="${to}"
+                   title="${label}" aria-label="${label}" style="height:${heightPct}%"></button>`
+        : `<span class="strip-bar" title="${label}" style="height:${heightPct}%"></span>`;
     })
     .join("");
   el.innerHTML =
-    `<div class="strip-bars" aria-hidden="true">${bars}</div>` +
+    `<div class="strip-bars"${clickable ? "" : ' aria-hidden="true"'}>${bars}</div>` +
     `<p class="strip-summary">${summary}</p>`;
 }
 
@@ -555,10 +576,22 @@ function createTableControls({
     history.replaceState(null, "", qs ? `?${qs}` : location.pathname);
   }
 
+  /** The range filter a click on the strip's bars would set, if any. */
+  function rangeFilterFor(column) {
+    return filters.find((f) => f.type === "range" && f.field === column.key);
+  }
+
   function repaintStrip() {
     const sort = table.getSort();
     const column = columns.find((c) => c.key === sort.key);
-    if (column) renderDistributionStrip(stripEl, column, filtered.map((r) => r[column.key]));
+    if (column) {
+      renderDistributionStrip(
+        stripEl,
+        column,
+        filtered.map((r) => r[column.key]),
+        Boolean(rangeFilterFor(column))
+      );
+    }
   }
 
   /** Re-filter, repaint the table, the strip, and the URL. */
@@ -648,6 +681,30 @@ function createTableControls({
     // settled figure is ever applied.
     clearTimeout(rangeTimer);
     rangeTimer = setTimeout(() => handleControlChange(event.target), 150);
+  });
+
+  // Distribution strip: a bar click sets the range filter matching the
+  // ACTIVE SORT COLUMN to that bucket's bounds (renderDistributionStrip only
+  // emits <button>s, rather than the plain aria-hidden <span>s, when such a
+  // filter exists — so a stray click elsewhere in the strip's whitespace is
+  // simply not on a `.strip-bar[data-from]` and no-ops here). Delegated on
+  // the container rather than bound per-bar: repaintStrip replaces the strip's
+  // innerHTML on every sort/filter change, which would silently drop a
+  // per-button listener the same way an un-delegated header click would (see
+  // createSortableTable's own listener for that exact regression).
+  stripEl.addEventListener("click", (event) => {
+    const bar = event.target.closest?.(".strip-bar[data-from]");
+    if (!bar) return;
+    const sort = table.getSort();
+    const column = columns.find((c) => c.key === sort.key);
+    const filter = column && rangeFilterFor(column);
+    if (!filter) return;
+    state.values[filter.key] = {
+      min: Number.parseFloat(bar.dataset.from),
+      max: Number.parseFloat(bar.dataset.to),
+    };
+    syncControlsToState();
+    apply();
   });
 
   rootEl.querySelector(".col-reset").addEventListener("click", () => {

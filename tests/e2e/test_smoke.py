@@ -474,13 +474,20 @@ def test_streets_page_lists_published_road_walks(page: Page, base_url):
     # row's own network type, so the city page draws the walk the row advertises
     # rather than defaulting to 'drive' (these fixtures ARE drive walks, hence
     # the explicit token even though it matches the default).
-    expect(alpha_row.locator("a.streets-view-link")).to_have_attribute(
-        "href", f"city.html?file={ALPHA_LATEST}&network=drive"
-    )
+    link = alpha_row.locator("a.streets-view-link")
+    expect(link).to_have_attribute("href", f"city.html?file={ALPHA_LATEST}&network=drive")
+    # The link lives on the row's own name cell now (issue #188 follow-up: the
+    # separate "View on map" column was folded in) — a whole trailing column
+    # existed only to carry the one link every row already has a natural home
+    # for. There is no longer a dedicated actions/link header, and every row
+    # with a published run links out through its own <th>.
+    expect(link).to_have_text("Alpha City, Alphastate, Testland")
+    expect(page.locator("th[scope='row'] a.streets-view-link")).to_have_count(2)
+    expect(page.locator("thead").get_by_text("Link to city map")).to_have_count(0)
     expect(page.locator("#streets-caption")).to_contain_text("2 published road-walk collections")
 
     # And it actually lands on the city page with the overlay.
-    alpha_row.locator("a.streets-view-link").click()
+    link.click()
     page.wait_for_url(f"**/city.html?file={ALPHA_LATEST}&network=drive")
     expect(page.locator("#street-coverage-container")).to_be_visible()
 
@@ -615,10 +622,13 @@ def test_grid_page_lists_city_runs(page: Page, base_url):
     expect(rows.nth(1)).to_contain_text("Map Ville")
     expect(rows.nth(2)).to_contain_text("Zero City")
 
-    # Rows link to the city page via the latest run filename.
+    # Rows link to the city page via the latest run filename, from the row's
+    # own name cell — there is no separate "View on map" column (issue #188
+    # follow-up: folded into City, the one place every row already has).
     expect(rows.first.locator("a.streets-view-link")).to_have_attribute(
         "href", f"city.html?file={ALPHA_LATEST}"
     )
+    expect(page.locator("thead").get_by_text("Link to city map")).to_have_count(0)
     expect(page.locator("#grid-caption")).to_contain_text("3 city grid-run series")
 
     # A header click re-sorts (grid coverage, best first: the 0-pano city sinks).
@@ -878,8 +888,10 @@ def test_unchecking_every_optional_column_actually_empties_the_table(page: Page,
     """Regression: resolveVisibleColumns used to treat an explicit "every box
     unchecked" selection the same as "no picker override" and silently kept
     rendering the preset's columns while the checkboxes read unchecked. Only
-    the always-on columns (City, the link) should survive unchecking
-    everything, and a reload of the resulting link must reproduce that."""
+    the always-on City column (which also carries the row's link, since the
+    separate "View on map" column was folded into it) should survive
+    unchecking everything, and a reload of the resulting link must reproduce
+    that."""
     errors = _capture_errors(page)
     page.goto(f"{base_url}/grid.html")
 
@@ -889,8 +901,8 @@ def test_unchecking_every_optional_column_actually_empties_the_table(page: Page,
     for i in range(count):
         boxes.nth(i).uncheck()
 
-    # Only the two always-on columns remain: City and the trailing link.
-    expect(page.locator("#grid-thead th")).to_have_count(2)
+    # Only the one always-on column remains: City.
+    expect(page.locator("#grid-thead th")).to_have_count(1)
     expect(page.locator('th[data-key="providerLabel"]')).to_have_count(0)
     for i in range(count):
         expect(boxes.nth(i)).not_to_be_checked()
@@ -902,7 +914,7 @@ def test_unchecking_every_optional_column_actually_empties_the_table(page: Page,
     # ...and reloading it cold reproduces the same empty-but-not-default view,
     # rather than snapping back to the preset's columns.
     page.goto(reload_url)
-    expect(page.locator("#grid-thead th")).to_have_count(2)
+    expect(page.locator("#grid-thead th")).to_have_count(1)
     page.locator(".col-picker summary").click()
     for i in range(page.locator("input[data-column]").count()):
         expect(page.locator("input[data-column]").nth(i)).not_to_be_checked()
@@ -927,6 +939,85 @@ def test_distribution_strip_describes_the_sorted_column(page: Page, base_url):
     # Filtering repoints it at the narrowed set.
     page.locator('select[data-filter="provider"]').select_option("gsv")
     expect(summary).to_contain_text("across 1 rows")
+
+    assert errors == []
+
+
+def test_distribution_strip_bars_are_clickable_when_a_matching_filter_exists(page: Page, base_url):
+    """A bucket becomes a real, focusable <button> exactly when the active sort
+    column has a matching range filter, and clicking it sets that filter to the
+    bucket's bounds — both narrowing the table and populating the min/max
+    inputs, not just one or the other."""
+    errors = _capture_errors(page)
+    page.goto(f"{base_url}/streets.html")
+
+    # Default sort is 360° street-km % (pct), which the "cov" range filter
+    # matches, so the strip's two buckets (Alpha City ~85%, Map Ville 0%) are
+    # clickable — spans on any other page would not be.
+    bars = page.locator("#distribution-strip .strip-bar")
+    expect(bars).to_have_count(2)
+    assert page.evaluate("() => document.querySelector('.strip-bar').tagName") == "BUTTON"
+
+    # The higher bucket covers Alpha City's ~85% (two buckets split the 0-85.1%
+    # range at its midpoint, not at wherever the values actually cluster, so
+    # the exact bound is a data-shape detail — read it off the button rather
+    # than hardcoding it). The DOM is rebuilt on click, so read data-from/-to
+    # before clicking rather than off a now-stale locator afterward.
+    last_bar = bars.last
+    expected_min = last_bar.get_attribute("data-from")
+    expected_max = last_bar.get_attribute("data-to")
+    last_bar.click()
+
+    rows = page.locator("#streets-tbody tr")
+    expect(rows).to_have_count(1)
+    expect(rows.first).to_contain_text("Alpha City")
+    min_val = page.locator('input[data-filter="cov"][data-bound="min"]').input_value()
+    max_val = page.locator('input[data-filter="cov"][data-bound="max"]').input_value()
+    assert min_val == expected_min, (
+        f"expected the min bound to match the clicked bucket's data-from "
+        f"({expected_min!r}), got {min_val!r}"
+    )
+    assert max_val == expected_max, (
+        f"expected the max bound to match the clicked bucket's data-to "
+        f"({expected_max!r}), got {max_val!r}"
+    )
+
+    assert errors == []
+
+
+def test_distribution_strip_bars_are_inert_without_a_matching_filter(page: Page, base_url):
+    """Sorting by a column with no matching range filter (e.g. Median age has
+    none on streets.html) must not offer a click that goes nowhere."""
+    errors = _capture_errors(page)
+    page.goto(f"{base_url}/streets.html")
+
+    page.locator('th[data-key="medianAge"] button').click()
+    assert page.evaluate("() => document.querySelector('.strip-bar').tagName") == "SPAN"
+    expect(page.locator("#distribution-strip .strip-bars")).to_have_attribute("aria-hidden", "true")
+
+    assert errors == []
+
+
+@pytest.mark.parametrize("path", ["grid.html", "streets.html"])
+def test_city_name_cell_is_truncated_not_left_to_overflow(page: Page, base_url, path):
+    """The committed fixture's city names are short ("Alpha City"), so this
+    can't observe an actual ellipsis firing — it instead confirms the CSS rule
+    that handles the real worldwide-frame names (60+ chars, issue #115) is
+    actually wired onto the live cell, not just sitting unused in the
+    stylesheet. Regression: this column used to have no width limit at all, so
+    a single long production label could push the whole table into horizontal
+    scroll even though the short-named fixture never triggered it."""
+    errors = _capture_errors(page)
+    page.goto(f"{base_url}/{path}")
+    cell = page.locator("tbody th[scope='row']").first
+    expect(cell).to_be_visible()
+    style = cell.evaluate(
+        "el => { const s = getComputedStyle(el); "
+        "return {maxWidth: s.maxWidth, overflow: s.overflow, textOverflow: s.textOverflow}; }"
+    )
+    assert style["maxWidth"] not in ("none", ""), "city-name cell has no max-width set"
+    assert style["overflow"] == "hidden"
+    assert style["textOverflow"] == "ellipsis"
 
     assert errors == []
 

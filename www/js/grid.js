@@ -16,17 +16,28 @@
  */
 
 /**
- * Cell for the "View on map" link.
+ * Cell for the "City" column: the label, hyperlinked to the city page when
+ * this row has a published run to link to.
+ *
+ * Absorbs the "View on map" link — a follow-up to issue #188. A whole extra
+ * trailing column existed only to carry one link per row, when every row
+ * already has exactly one natural place for it: its own name. A row with
+ * nothing to link to (no published run) still renders, just as plain text —
+ * the same degrade-not-disappear posture the old placeholder cell had.
+ *
+ * `title` carries the full, untruncated label either way — the cell itself is
+ * ellipsis-truncated in CSS (data-table.css) because OSM/Nominatim labels are
+ * unbounded and a long one alone can push the table past its measure.
  *
  * @param {Object} row - From gridRowModel.
- * @returns {string} HTML for one <td>.
+ * @returns {string} HTML for one <th scope="row">.
  */
-function gridLinkCellHtml(row) {
-  const link = row.filename
-    ? `<a class="streets-view-link"
-          href="city.html?file=${encodeURIComponent(row.filename)}">View on map</a>`
-    : `<span class="streets-no-link" title="This city has no published run to link to">—</span>`;
-  return `<td>${link}</td>`;
+function gridLabelCellHtml(row) {
+  const label = escapeHtml(row.label);
+  const content = row.filename
+    ? `<a class="streets-view-link" href="city.html?file=${encodeURIComponent(row.filename)}">${label}</a>`
+    : label;
+  return `<th scope="row" title="${label}">${content}</th>`;
 }
 
 /**
@@ -51,7 +62,7 @@ const GRID_COLUMNS = [
     type: "text",
     initial: "asc",
     always: true,
-    cell: (r) => `<th scope="row">${escapeHtml(r.label)}</th>`,
+    cell: gridLabelCellHtml,
   },
   {
     key: "providerLabel",
@@ -158,14 +169,6 @@ const GRID_COLUMNS = [
     initial: "desc",
     title: "Number of dated collection runs; repeat runs enable change tracking over time",
     cell: (r) => `<td>${formatCellNumber(r.snapshots)}</td>`,
-  },
-  {
-    key: "actions",
-    label: "",
-    sortable: false,
-    always: true,
-    srLabel: "Link to city map",
-    cell: gridLinkCellHtml,
   },
 ];
 
