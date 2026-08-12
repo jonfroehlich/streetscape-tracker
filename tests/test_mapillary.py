@@ -833,3 +833,143 @@ def test_a_clean_run_reports_no_failed_tiles(monkeypatch, straddling_city):
     lat, lon = straddling_city
     result = _fetch_city(monkeypatch, _failing_fetch(set()), lat, lon)
     assert result["failed_tiles"] == []
+
+
+# ── Tile-CDN blocks are not tile corruption (issue #199) ───────────────────
+#
+# On 2026-08-12 a bulk collection sustained ~370 tile requests/min and got the
+# host's IP blocked: every tile request 302'd to www.mapillary.com/login/.
+# aiohttp followed the redirect, the login page returned a perfectly good HTTP
+# 200, and its HTML body reached mapbox_vector_tile.decode() — so a banned host
+# surfaced as `DecodeError: Error parsing message with type 'vector_tile.tile'`,
+# indistinguishable from #168's transient bad tile. These pin the diagnosis.
+
+# The real block page, verbatim: "尚未登录 / 请登录查看这一页面" ("Not logged in /
+# Please log in to view this page"). Meta serves it localized to unauthenticated
+# requests; the language carries no meaning here.
+_LOGIN_PAGE_BODY = (
+    b"<h1>\xe5\xb0\x9a\xe6\x9c\xaa\xe7\x99\xbb\xe5\xbd\x95</h1>"
+    b"<p>\xe8\xaf\xb7\xe7\x99\xbb\xe5\xbd\x95\xe6\x9f\xa5\xe7\x9c\x8b"
+    b"\xe8\xbf\x99\xe4\xb8\x80\xe9\xa1\xb5\xe9\x9d\xa2\xe3\x80\x82</p>"
+)
+
+_TILE_URL = "https://tiles.mapillary.com/maps/vtp/mly1_public/2/14/4196/6084?access_token=MLY|s3cret"
+
+
+class _FakeTileResponse:
+    def __init__(self, status, headers=None, body=b""):
+        self.status = status
+        self.headers = headers or {}
+        self._body = body
+
+    async def read(self):
+        return self._body
+
+
+class _FakeTileSession:
+    """Minimal aiohttp.ClientSession stand-in: .get() as an async CM."""
+
+    def __init__(self, response):
+        self._response = response
+        self.get_kwargs = []
+
+    def get(self, url, **kwargs):
+        self.get_kwargs.append(kwargs)
+        response = self._response
+
+        class _Ctx:
+            async def __aenter__(self):
+                return response
+
+            async def __aexit__(self, *exc):
+                return False
+
+        return _Ctx()
+
+
+def _fetch_tile(response):
+    session = _FakeTileSession(response)
+    with pytest.raises(DownloadError) as excinfo:
+        asyncio.run(_fetch_tile_coro(session))
+    return session, excinfo.value
+
+
+def _fetch_tile_coro(session):
+    return dm._fetch_tile(session, _TILE_URL, aiohttp.ClientTimeout(total=5))
+
+
+def test_tile_requests_do_not_follow_redirects():
+    """The fix hinges on seeing the 302 itself: if aiohttp follows it, the login
+    page's own HTTP 200 is what the status checks see."""
+    session = _FakeTileSession(_FakeTileResponse(200, {"Content-Type": "application/x-protobuf"}))
+    asyncio.run(_fetch_tile_coro(session))
+    assert session.get_kwargs[0]["allow_redirects"] is False
+
+
+def test_a_login_redirect_names_the_ip_rate_limit():
+    _, error = _fetch_tile(
+        _FakeTileResponse(
+            302,
+            {"Location": "https://www.mapillary.com/login/?next=" + _TILE_URL},
+        )
+    )
+    text = str(error)
+    assert "rate-limited" in text
+    assert "login" in text.lower()
+    # The old symptom must not be how this reads any more.
+    assert "parsing message" not in text
+
+
+def test_a_login_redirect_does_not_leak_the_token():
+    """Location echoes the request URL, token and all, and this text reaches
+    logs and the scheduler's alert emails."""
+    _, error = _fetch_tile(
+        _FakeTileResponse(
+            302,
+            {"Location": "https://www.mapillary.com/login/?next=" + _TILE_URL},
+        )
+    )
+    assert "s3cret" not in str(error)
+    assert "REDACTED" in str(error)
+
+
+def test_an_html_error_page_is_not_fed_to_the_protobuf_decoder():
+    """The 200-with-HTML case, i.e. what we would have seen had the redirect
+    been followed for us by something upstream."""
+    _, error = _fetch_tile(
+        _FakeTileResponse(
+            200, {"Content-Type": 'text/html; charset="utf-8"'}, _LOGIN_PAGE_BODY
+        )
+    )
+    assert "error page instead of a vector tile" in str(error)
+    assert "rate limit" in str(error)
+
+
+def test_an_unlabelled_tile_is_still_accepted():
+    """A deny-list, not an allow-list: if Mapillary relabels real tiles, an
+    allow-list would reject every tile and halt collection everywhere."""
+    body = mapbox_vector_tile.encode([])
+    session = _FakeTileSession(
+        _FakeTileResponse(200, {"Content-Type": "application/vnd.mapbox-vector-tile"}, body)
+    )
+    assert asyncio.run(_fetch_tile_coro(session)) == body
+
+
+def test_a_blocked_host_fails_the_city_by_name_not_as_a_partial_snapshot(monkeypatch):
+    """Like a rejected token, a block is a whole-city condition — every
+    remaining tile fails identically, so it must not be dressed up as tolerable
+    partial coverage."""
+    lat, lon = 41.8, -87.7
+
+    async def blocked(session, url, timeout):
+        raise DownloadError(
+            "Mapillary tile CDN redirected to a login page (HTTP 302 → "
+            "https://www.mapillary.com/login/?next=REDACTED). This host's IP is "
+            "likely rate-limited on tiles.mapillary.com"
+        )
+
+    with pytest.raises(DownloadError) as excinfo:
+        _fetch_city(monkeypatch, blocked, lat, lon)
+
+    assert "rate-limited" in str(excinfo.value)
+    assert "refusing to finalize" not in str(excinfo.value)
