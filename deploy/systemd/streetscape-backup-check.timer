@@ -1,0 +1,18 @@
+# Daily trigger for streetscape-backup-check.service (user unit, issue #193).
+[Unit]
+Description=Check Streetscape Tracker catalog-backup health daily
+
+[Timer]
+# Midday Pacific, deliberately NOT 02:00: the point is to report on the night
+# that just ran, and a midday mail lands when somebody is awake to act on it.
+# The exact hour is not delicate — the staleness gate is 48h, so a long night
+# still in progress (max_batch_hours is 10h, so up to ~12:15) cannot trip it:
+# that night's PRE-FLIGHT backup is only hours old by then.
+OnCalendar=*-*-* 12:00:00 America/Los_Angeles
+RandomizedDelaySec=10m
+# If the box was down at noon, still check on the next boot — a host that was
+# off is precisely a host whose backups may have stopped.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

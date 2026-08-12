@@ -1,0 +1,56 @@
+# Out-of-band catalog-backup health check (user unit, issue #193).
+# Install: see deploy/README.md
+#
+# WHY A SECOND UNIT: `backup-status` already exits nonzero when the newest
+# backup is missing, older than 48h, or the last attempt failed — but before
+# this, nothing ever ran it. The only caller would have been the scheduler
+# itself, i.e. the very process whose absence the staleness gate exists to
+# detect. A stopped scheduler (masked timer, disabled unit, a ConditionHost that
+# stops matching after a cutover) leaves one never-pruned backup file and a
+# backup_status.json that says "ok" forever, which looks exactly like health.
+# So the check has to be scheduled independently of the thing it checks.
+[Unit]
+Description=Streetscape Tracker: check catalog-backup health (issue #193)
+# Same shared-NFS-home model as streetscape-tracker.service: $HOME is shared
+# across makelab1 and makelab2, so enablement is identical on both and the
+# active host is pinned by ConditionHost + linger. Check where the backups are
+# actually written; on the wrong host this would report a directory nobody
+# maintains. Cutover = flip this alongside the collection unit's ConditionHost.
+ConditionHost=makelab2*
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/streetscape-tracker
+# Optional (leading '-'): the check needs no API keys, and the campus SMTP relay
+# is unauthenticated, so a missing .env must not fail the monitor.
+EnvironmentFile=-%h/streetscape-tracker/.env
+# --alert emails the report through [alerts] when unhealthy. The exit status is
+# unchanged by the flag, so systemd still marks the unit failed and the command
+# stays usable as a plain monitor check. NB: --config is a global arg and MUST
+# precede the subcommand (argparse).
+ExecStart=%h/streetscape-tracker/.venv-makelab2/bin/python -m streetscape_metadata_tracker.scheduler --config %h/streetscape-tracker/config/scheduler.makelab1.toml backup-status --alert
+# Reads a directory listing and a small JSON file, then maybe sends one mail.
+# Nothing here should ever take minutes.
+TimeoutStartSec=5m
+
+# The scheduler's log dir is on the checkout, and setup_logging opens a rotating
+# file handler there, so the unit needs the checkout writable even though the
+# check itself only reads.
+StandardOutput=append:/projects/makeabilitylab/streetscape-tracker/logs/streetscape_service_console.log
+StandardError=inherit
+
+# ── Sandboxing (same rationale as streetscape-tracker.service) ─────────
+# Narrower than the collection unit: no docroot access, since this never
+# publishes. RestrictSUIDSGID can stay ON here — the rsync/setgid conflict that
+# forces it off next door does not apply to a unit that never runs rsync.
+PrivateUsers=true
+NoNewPrivileges=true
+RestrictSUIDSGID=true
+PrivateTmp=true
+ProtectSystem=strict
+# Real path, not the %h symlink — mount namespacing resolves symlinks.
+ReadWritePaths=/projects/makeabilitylab/streetscape-tracker
+
+Nice=15
+MemoryAccounting=true
+MemoryMax=512M

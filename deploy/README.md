@@ -292,6 +292,43 @@ the scheduler simply stops running — a masked timer, a disabled unit, a
 newest copy is never pruned, that state otherwise looks like one file plus an
 `ok` status. Which is #145 again.
 
+#### The out-of-band check (issue #193)
+
+The exit code above is only worth anything if something *runs* it. Until #193
+nothing did: the sole caller would have been the scheduler, i.e. the very
+process whose absence the staleness gate exists to detect. So the check is
+scheduled independently, in its own user timer:
+
+```bash
+cp deploy/systemd/streetscape-backup-check.{service,timer} ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now streetscape-backup-check.timer
+systemctl --user start streetscape-backup-check.service   # run once now
+```
+
+- Fires **daily at 12:00 Pacific** (±10 min), deliberately not 02:00: it should
+  report on the night that just finished, at an hour when someone is awake. The
+  hour is not delicate — the gate is 48 h, so even a 10-hour night still running
+  at noon cannot trip it (that night's *pre-flight* copy is hours old).
+- `backup-status --alert` emails the report through the same `[alerts]` SMTP
+  transport when the verdict is unhealthy, and is **silent when healthy** — a
+  daily mail nobody needs is a daily mail nobody reads. The subject names the
+  verdict (`NO BACKUPS` / `STALE (N h old)` / `last attempt FAILED`) because on
+  a monitor mail the subject is often all that gets read, and those call for
+  different first moves.
+- `--alert` does **not** change the exit status, so the unit still goes red and
+  the command stays usable as a plain check.
+- It is **not** wired to `OnFailure=streetscape-tracker-notify@.service`: that
+  unit is not installed on makelab2 and `OnFailure=` is commented out in the
+  installed collection unit, so building on it would mean building on something
+  dormant — and `notify-failure` mails the *scheduler log tail*, where the
+  useful body here is the backup report itself.
+- Same `ConditionHost=makelab2*` pin as the collection unit, for the same
+  shared-NFS-home reason: on the wrong box it would report on a backup directory
+  nobody maintains. **A host cutover must flip both.**
+  `tests/test_scheduler.py::test_backup_check_unit_matches_the_collection_unit`
+  pins that agreement, along with the interpreter and config path.
+
 #### Assets that exist in only one place
 
 Most of `data/` is doubly covered — the project array *and* the docroot's 1-year

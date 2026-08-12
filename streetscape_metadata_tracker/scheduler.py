@@ -908,7 +908,7 @@ def _fmt_bytes(n: float) -> str:
     raise AssertionError("unreachable: the GB branch always returns")
 
 
-def cmd_backup_status(cfg: SchedulerConfig) -> int:
+def cmd_backup_status(cfg: SchedulerConfig, *, alert: bool = False) -> int:
     """
     Report catalog-backup health and inventory the un-republishable assets.
 
@@ -933,42 +933,51 @@ def cmd_backup_status(cfg: SchedulerConfig) -> int:
     ``ConditionHost`` that no longer matches after a host cutover — and since
     the newest copy is deliberately never pruned, that state otherwise presents
     as one ancient file plus an ``ok`` status. Which is #145 again.
+
+    ``alert=True`` (issue #193) additionally emails the report through the
+    ``[alerts]`` transport when the verdict is unhealthy, which is what makes
+    this a *monitor* rather than a command someone has to remember to type.
+    Deliberately not wired to the ``OnFailure=`` notify unit: that unit is not
+    installed on makelab2 and mails the scheduler log tail, whereas the useful
+    body here is the report itself. The exit status is unchanged either way, so
+    a systemd unit still goes red and an external monitor still sees nonzero.
     """
     st = catalog_backup.backup_status(cfg.backup_dir)
+    out: list[str] = []
 
-    print(f"Catalog backups: {st.backup_dir}")
+    out.append(f"Catalog backups: {st.backup_dir}")
     if not st.exists:
-        print("  MISSING — the backup directory does not exist yet.")
+        out.append("  MISSING — the backup directory does not exist yet.")
     elif st.file_count == 0:
-        print("  EMPTY — no dated backups present.")
+        out.append("  EMPTY — no dated backups present.")
     else:
-        print(
+        out.append(
             f"  {st.file_count} dated copies, {_fmt_bytes(st.total_bytes)} total, "
             f"retention {catalog_backup.KEEP_DAYS} days"
         )
-        print(
+        out.append(
             f"  newest: {os.path.basename(st.newest_path)} "
             f"({st.age_hours:,.1f} h old, {_fmt_bytes(os.path.getsize(st.newest_path))})"
         )
         if st.stale:
-            print(
+            out.append(
                 f"  STALE — the newest backup is {st.age_hours:,.1f} h old "
                 f"(limit {st.max_age_hours:,.0f} h). Is run-due still running on this host?"
             )
 
     last = st.last_attempt
     if last is None:
-        print("  last attempt: UNKNOWN (no backup_status.json)")
+        out.append("  last attempt: UNKNOWN (no backup_status.json)")
     else:
         verdict = "ok" if last.get("ok") else f"FAILED — {last.get('error')}"
-        print(f"  last attempt: {last.get('last_attempt_at')} — {verdict}")
-        print(f"  source: {last.get('source_db')} on {last.get('source_host')}")
+        out.append(f"  last attempt: {last.get('last_attempt_at')} — {verdict}")
+        out.append(f"  source: {last.get('source_db')} on {last.get('source_host')}")
         counts = last.get("row_counts") or {}
         if counts:
-            print("  rows: " + ", ".join(f"{t}={n:,}" for t, n in sorted(counts.items())))
+            out.append("  rows: " + ", ".join(f"{t}={n:,}" for t, n in sorted(counts.items())))
 
-    print()
-    print("Assets that exist ONLY on lab storage (published nowhere):")
+    out.append("")
+    out.append("Assets that exist ONLY on lab storage (published nowhere):")
     inventory = catalog_backup.inventory_single_copy(
         {
             "driving-plan archive": cfg.driving_plan.archive_dir,
@@ -977,15 +986,35 @@ def cmd_backup_status(cfg: SchedulerConfig) -> int:
     )
     for asset in inventory:
         if not asset.exists:
-            print(f"  {asset.label:22s} {asset.path} — absent")
+            out.append(f"  {asset.label:22s} {asset.path} — absent")
             continue
-        print(
+        out.append(
             f"  {asset.label:22s} {asset.file_count:,} files, "
             f"{_fmt_bytes(asset.total_bytes)}, newest {asset.newest_mtime}"
         )
-        print(f"  {'':22s} {asset.path}")
+        out.append(f"  {'':22s} {asset.path}")
+
+    report = "\n".join(out)
+    print(report)
 
     healthy = st.exists and st.file_count > 0 and not st.stale and bool(last and last.get("ok"))
+    if alert and not healthy:
+        # Name the reason in the subject: the whole point of the out-of-band
+        # check is the case where nobody is reading anything but the subject
+        # line, and "stale" vs "the last attempt failed" call for different
+        # responses (is the scheduler running at all? vs. why did the copy fail?).
+        if not st.exists or st.file_count == 0:
+            why = "NO BACKUPS"
+        elif st.stale:
+            why = f"STALE ({st.age_hours:,.0f} h old)"
+        else:
+            why = "last attempt FAILED"
+        send_alert(
+            cfg.alerts,
+            f"catalog backup unhealthy on {socket.gethostname()} — {why}",
+            "The out-of-band catalog-backup check (issue #193) found an unhealthy "
+            "state.\n\n" + report,
+        )
     return 0 if healthy else 1
 
 
@@ -1997,11 +2026,16 @@ def build_parser() -> argparse.ArgumentParser:
             "notify-failure", help="Email the recent log (for a systemd OnFailure= hook)"
         )
     )
-    _add_global_flags(
-        sub.add_parser(
-            "backup-status",
-            help="Report catalog-backup health and single-copy asset inventory (issue #145)",
-        )
+    p_bstatus = sub.add_parser(
+        "backup-status",
+        help="Report catalog-backup health and single-copy asset inventory (issue #145)",
+    )
+    _add_global_flags(p_bstatus)
+    p_bstatus.add_argument(
+        "--alert",
+        action="store_true",
+        help="Also email the report via [alerts] when unhealthy (for the "
+        "out-of-band monitor timer, issue #193). Exit status is unchanged.",
     )
     p_restore = sub.add_parser(
         "restore-backup", help="Restore a dated catalog backup (refuses to clobber a live catalog)"
@@ -2032,7 +2066,7 @@ def main() -> int:
     if args.command == "notify-failure":
         return cmd_notify_failure(cfg)
     if args.command == "backup-status":
-        return cmd_backup_status(cfg)
+        return cmd_backup_status(cfg, alert=args.alert)
     if args.command == "restore-backup":
         return cmd_restore_backup(cfg, args.backup_path, args.dest)
     if args.command == "reconcile-walks":
