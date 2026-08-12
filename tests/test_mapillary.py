@@ -712,20 +712,74 @@ def test_extra_metadata_round_trips_to_csv(monkeypatch, tmp_path):
 #
 # A run file is an IMMUTABLE dated snapshot, and diff.py compares one run to
 # the previous one of the same series. So a purely internal change to how the
-# census is assembled must not alter a single byte of the written CSV: if the
-# float formatting, the null rendering, or the row order shifted, every
-# Mapillary city's next run would report a large phantom diff and there would
-# be no way to tell it from real imagery churn.
+# census is assembled must not alter the written CSV: if the float formatting,
+# the null rendering, or the row order shifted, every Mapillary city's next run
+# would report a large phantom diff and there would be no way to tell it from
+# real imagery churn.
 #
 # This fixture was generated from the row-wise implementation that preceded the
 # columnar rewrite, and it is the contract that rewrite had to satisfy. To
 # change it deliberately, run with REGEN_MAPILLARY_GOLDEN=1 and review the diff
 # in tests/fixtures/mapillary_golden_run.csv as part of the change.
+#
+# Every field is compared byte for byte EXCEPT the two grid columns, which are
+# the one part of a run CSV that is not bit-reproducible across machines:
+# query_lat/query_lon come from geographiclib's geodesic solve, and libm's
+# sin/cos/atan2 are not correctly rounded, so macOS and glibc disagree in the
+# last ULP (~6e-15 deg — well under a nanometre; this is what reddened CI on
+# the columnar PR while the same fixture passed on the laptop that made it).
+# Production is already immune: diff.py keys grid points at its own
+# _COORD_DECIMALS = 6, i.e. ~11 cm, so a difference this small is invisible to
+# the very diff this fixture exists to protect. The gate below is still about
+# four orders of magnitude tighter than the coarsest regression it must catch
+# (a float32 cast, which at this latitude lands ~6e-6 deg off).
 
 GOLDEN_PATH = Path(__file__).parent / "fixtures" / "mapillary_golden_run.csv"
 # Pinned so the fixture never depends on the wall clock. Every row carries the
 # run's query_timestamp, which is datetime.now() at call time.
 GOLDEN_TIMESTAMP_PLACEHOLDER = "<QUERY_TIMESTAMP>"
+_GRID_COORD_TOLERANCE_DEG = 1e-9
+
+
+def _assert_csv_matches_golden(written: str, golden: str) -> None:
+    """
+    Compare a written run CSV to the golden fixture line by line, exactly
+    except for the platform-dependent last ULP of the grid coordinates.
+
+    Deliberately not ``pd.read_csv`` + ``assert_frame_equal``: parsing would
+    discard precisely what this fixture exists to pin — the float repr, the
+    empty-vs-NaN rendering, the column order, and the row order.
+    """
+    written_lines, golden_lines = written.splitlines(), golden.splitlines()
+    drift = (
+        "the written run CSV changed. If that is deliberate, regenerate with "
+        "REGEN_MAPILLARY_GOLDEN=1 and review the fixture diff — but note that "
+        "shipping it makes every Mapillary city's next run-to-run diff report "
+        "changes that did not happen."
+    )
+    assert len(written_lines) == len(golden_lines), f"{drift} (row count)"
+    assert written_lines[0] == golden_lines[0], f"{drift} (header)"
+
+    header = golden_lines[0].split(",")
+    # Safe as positional indices even though a later field could be quoted and
+    # contain a comma: the grid columns lead every row.
+    grid_columns = (header.index("query_lat"), header.index("query_lon"))
+    assert grid_columns == (0, 1)
+
+    for n, (written_line, golden_line) in enumerate(
+        zip(written_lines[1:], golden_lines[1:], strict=True), start=2
+    ):
+        written_fields, golden_fields = written_line.split(","), golden_line.split(",")
+        assert len(written_fields) == len(golden_fields), f"{drift} (line {n}: field count)"
+        for column in grid_columns:
+            delta = abs(float(written_fields[column]) - float(golden_fields[column]))
+            assert delta < _GRID_COORD_TOLERANCE_DEG, (
+                f"{drift} (line {n}: {header[column]} moved by {delta:g} deg, which is "
+                "too far to be the cross-platform geodesic noise this tolerance allows)"
+            )
+        assert [f for k, f in enumerate(written_fields) if k not in grid_columns] == [
+            f for k, f in enumerate(golden_fields) if k not in grid_columns
+        ], f"{drift} (line {n})"
 
 
 def _golden_features(lat, lon):
@@ -823,12 +877,7 @@ def test_written_csv_matches_the_golden_fixture(monkeypatch, tmp_path, straddlin
         GOLDEN_PATH.write_text(written, encoding="utf-8")
         pytest.skip(f"regenerated {GOLDEN_PATH}")
 
-    assert written == GOLDEN_PATH.read_text(encoding="utf-8"), (
-        "the written run CSV changed. If that is deliberate, regenerate with "
-        "REGEN_MAPILLARY_GOLDEN=1 and review the fixture diff — but note that "
-        "shipping it makes every Mapillary city's next run-to-run diff report "
-        "changes that did not happen."
-    )
+    _assert_csv_matches_golden(written, GOLDEN_PATH.read_text(encoding="utf-8"))
 
 
 def test_golden_fixture_covers_every_status_and_the_dedup_rule(straddling_city):
@@ -857,6 +906,61 @@ def test_golden_fixture_covers_every_status_and_the_dedup_rule(straddling_city):
     # Last tile wins the duplicate id: 112 landed south of center, not north.
     dup = golden[golden["pano_id"] == "112"].iloc[0]
     assert float(dup["pano_lat"]) < lat
+
+
+def test_golden_comparison_tolerates_only_cross_platform_grid_noise():
+    """
+    Guards the comparison itself. Relaxing the grid columns off an exact byte
+    match is what let this fixture run on both macOS and glibc, and the way
+    that goes wrong is silently: a tolerance wide enough to swallow a real
+    regression leaves a golden test that passes no matter what ships.
+    """
+    golden = GOLDEN_PATH.read_text(encoding="utf-8")
+    lines = golden.splitlines()
+
+    def perturb(line, column, delta):
+        fields = line.split(",")
+        fields[column] = repr(float(fields[column]) + delta)
+        return ",".join(fields)
+
+    def mutated(new_lines):
+        return "\n".join(new_lines) + "\n"
+
+    # Accepted: last-ULP drift in BOTH grid columns on every row, which is the
+    # real macOS-vs-glibc geodesic difference (~6e-15 deg) this exists for.
+    nudged = [lines[0]] + [perturb(perturb(line, 0, 7e-15), 1, -7e-15) for line in lines[1:]]
+    _assert_csv_matches_golden(mutated(nudged), golden)
+
+    # Rejected: a grid point that actually moved. 6e-6 deg is where a float32
+    # cast of these coordinates lands — the coarsest thing the tolerance has
+    # to catch, and still far below diff.py's 11 cm keying.
+    with pytest.raises(AssertionError, match="query_lat moved by"):
+        _assert_csv_matches_golden(
+            mutated([lines[0], perturb(lines[1], 0, 6e-6), *lines[2:]]), golden
+        )
+
+    # Rejected: everything the fixture is actually for — row order, image
+    # coordinates (which are exact everywhere; only the GRID math is fuzzy),
+    # a dropped row, a changed status, and a null rendered differently.
+    reordered = [lines[0], lines[2], lines[1], *lines[3:]]
+    with pytest.raises(AssertionError):
+        _assert_csv_matches_golden(mutated(reordered), golden)
+
+    with pytest.raises(AssertionError):
+        _assert_csv_matches_golden(
+            mutated([lines[0], perturb(lines[1], 3, 1e-12), *lines[2:]]), golden
+        )
+
+    with pytest.raises(AssertionError, match="row count"):
+        _assert_csv_matches_golden(mutated([lines[0], *lines[2:]]), golden)
+
+    with pytest.raises(AssertionError):
+        _assert_csv_matches_golden(
+            mutated([line.replace("NO_DATE", "OK") for line in lines]), golden
+        )
+
+    with pytest.raises(AssertionError):
+        _assert_csv_matches_golden(golden.replace(",,", ",nan,"), golden)
 
 
 def test_compute_mapillary_meta_summary():
