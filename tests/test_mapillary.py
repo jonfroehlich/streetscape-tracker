@@ -8,6 +8,7 @@ import asyncio
 import gzip
 import math
 import re
+import urllib.parse
 from datetime import UTC, datetime
 
 import aiohttp
@@ -853,7 +854,9 @@ _LOGIN_PAGE_BODY = (
     b"\xe8\xbf\x99\xe4\xb8\x80\xe9\xa1\xb5\xe9\x9d\xa2\xe3\x80\x82</p>"
 )
 
-_TILE_URL = "https://tiles.mapillary.com/maps/vtp/mly1_public/2/14/4196/6084?access_token=MLY|s3cret"
+_TILE_URL = (
+    "https://tiles.mapillary.com/maps/vtp/mly1_public/2/14/4196/6084?access_token=MLY|s3cret"
+)
 
 
 class _FakeTileResponse:
@@ -864,6 +867,21 @@ class _FakeTileResponse:
 
     async def read(self):
         return self._body
+
+    def raise_for_status(self):
+        """As aiohttp does it — without this the fake cannot reach the 4xx/5xx
+        path at all, and a test aimed at the block checks fails with an
+        AttributeError instead of its own assertion."""
+        if self.status >= 400:
+            request_info = aiohttp.RequestInfo(
+                url=yarl.URL(_TILE_URL),
+                method="GET",
+                headers=CIMultiDictProxy(CIMultiDict()),
+                real_url=yarl.URL(_TILE_URL),
+            )
+            raise aiohttp.ClientResponseError(
+                request_info=request_info, history=(), status=self.status, message="error"
+            )
 
 
 class _FakeTileSession:
@@ -920,14 +938,24 @@ def test_a_login_redirect_names_the_ip_rate_limit():
     assert "parsing message" not in text
 
 
-def test_a_login_redirect_does_not_leak_the_token():
+@pytest.mark.parametrize(
+    "next_param",
+    [
+        _TILE_URL,
+        # The shape a real Location takes: the request URL percent-encoded into
+        # the login page's own query string. `access_token=` becomes
+        # `access_token%3D`, which the pre-#199 redaction pattern did not match
+        # at all — so the token travelled to the logs in full.
+        urllib.parse.quote(_TILE_URL, safe=""),
+        urllib.parse.quote_plus(_TILE_URL),
+    ],
+    ids=["unencoded", "quoted", "quoted_plus"],
+)
+def test_a_login_redirect_does_not_leak_the_token(next_param):
     """Location echoes the request URL, token and all, and this text reaches
     logs and the scheduler's alert emails."""
     _, error = _fetch_tile(
-        _FakeTileResponse(
-            302,
-            {"Location": "https://www.mapillary.com/login/?next=" + _TILE_URL},
-        )
+        _FakeTileResponse(302, {"Location": "https://www.mapillary.com/login/?next=" + next_param})
     )
     assert "s3cret" not in str(error)
     assert "REDACTED" in str(error)
@@ -937,12 +965,21 @@ def test_an_html_error_page_is_not_fed_to_the_protobuf_decoder():
     """The 200-with-HTML case, i.e. what we would have seen had the redirect
     been followed for us by something upstream."""
     _, error = _fetch_tile(
-        _FakeTileResponse(
-            200, {"Content-Type": 'text/html; charset="utf-8"'}, _LOGIN_PAGE_BODY
-        )
+        _FakeTileResponse(200, {"Content-Type": 'text/html; charset="utf-8"'}, _LOGIN_PAGE_BODY)
     )
     assert "error page instead of a vector tile" in str(error)
     assert "rate limit" in str(error)
+
+
+def test_a_5xx_tile_is_left_to_the_retry_layer():
+    """The new checks must not swallow the transient path. A 429/5xx is still
+    a ClientResponseError for backoff to retry and, past that, one tolerable
+    bad tile under MAX_FAILED_TILE_FRACTION (issue #168) — NOT a DownloadError,
+    which would fail the whole city. Called through __wrapped__ to skip the
+    retry sleeps."""
+    session = _FakeTileSession(_FakeTileResponse(503))
+    with pytest.raises(aiohttp.ClientResponseError):
+        asyncio.run(dm._fetch_tile.__wrapped__(session, _TILE_URL, aiohttp.ClientTimeout(total=5)))
 
 
 def test_an_unlabelled_tile_is_still_accepted():

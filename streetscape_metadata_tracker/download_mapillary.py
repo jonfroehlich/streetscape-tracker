@@ -386,11 +386,13 @@ async def _fetch_tile(
             # The Location echoes the request URL, hence redact_credentials.
             location = redact_credentials(response.headers.get("Location", "(none)"))
             raise DownloadError(
-                f"Mapillary tile CDN redirected to a login page (HTTP "
-                f"{response.status} → {location}). This host's IP is likely "
-                f"rate-limited on tiles.mapillary.com — the access token itself "
-                f"may still be valid (the Graph API and other IPs are "
-                f"unaffected). Retry later and collect Mapillary more slowly."
+                f"Mapillary tile CDN redirected instead of serving a tile (HTTP "
+                f"{response.status} → {location}). A redirect to a login page "
+                f"means this host's IP is rate-limited on tiles.mapillary.com — "
+                f"the access token itself may still be valid (the Graph API and "
+                f"other IPs are unaffected), so retry later and collect "
+                f"Mapillary more slowly. A redirect anywhere else means the tile "
+                f"endpoint has moved and this code needs updating."
             )
         if response.status != 200:
             # 429/5xx raise ClientResponseError, which backoff retries
