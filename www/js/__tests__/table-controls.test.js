@@ -169,6 +169,15 @@ test("resolveVisibleColumns: unknown preset or column degrades instead of throwi
   );
 });
 
+test("resolveVisibleColumns: an explicit empty selection shows only the always-on columns", () => {
+  // `[]` is the picker having every optional box unchecked — a real, distinct
+  // selection, not "no override, fall back to the preset". Confusing this
+  // with `null` would silently re-show the preset's columns while the
+  // checkboxes still read unchecked.
+  const keys = resolveVisibleColumns(COLUMNS, PRESETS, "overview", []).map((c) => c.key);
+  assert.deepEqual(keys, ["label", "actions"]);
+});
+
 // --- URL round-trip ---------------------------------------------------------
 
 test("parseTableState/serializeTableState: a full view round-trips", () => {
@@ -195,6 +204,21 @@ test("serializeTableState: an untouched view writes nothing but the sort", () =>
     { filters: FILTERS, defaultPreset: "overview" }
   );
   assert.equal(qs, "");
+});
+
+test("parseTableState/serializeTableState: an explicit empty column selection round-trips as [], not null", () => {
+  // The picker zeroed out to no optional columns is a real selection, distinct
+  // from "no picker override" (cols: null) — a shared link for that view must
+  // reopen with zero optional columns, not silently regain the preset's.
+  const qs = serializeTableState(
+    { query: "", preset: "overview", cols: [], sort: null, values: {} },
+    { filters: FILTERS, defaultPreset: "overview" }
+  );
+  assert.equal(qs, "cols=");
+  assert.deepEqual(parseTableState(qs, { filters: FILTERS }).cols, []);
+
+  // A URL with no `cols` param at all is still "no override".
+  assert.equal(parseTableState("", { filters: FILTERS }).cols, null);
 });
 
 test("parseTableState: one-sided and malformed ranges degrade rather than throw", () => {

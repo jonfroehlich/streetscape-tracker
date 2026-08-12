@@ -132,24 +132,31 @@ function applyFilters(rows, { filters, values, query, searchFields }) {
 /**
  * Resolve the visible column descriptors for a preset or an explicit key list.
  *
- * Explicit keys win when present (the column picker deviating from a preset).
+ * Explicit keys win whenever the picker has been touched at all — including
+ * down to zero optional columns. That is `explicitKeys` being a non-null
+ * array (possibly empty), which is distinct from `null` ("no picker
+ * deviation, use the preset"). Testing `.length > 0` instead would treat
+ * "every box unchecked" as "no override" and silently snap back to the
+ * preset's columns while the checkboxes still read unchecked.
  * Order always follows the canonical `columns` order rather than the order the
  * keys arrived in, so the table's column sequence is stable no matter how the
  * URL was assembled. Unknown keys are ignored rather than throwing: a stale
  * link from before a column was renamed should degrade, not break the page.
  *
  * Non-sortable trailing columns (the "View on map" link) are `always: true`
- * and appear in every preset.
+ * and appear in every preset — including when the picker has zeroed out
+ * every optional column.
  *
  * @param {Object[]} columns - All column descriptors.
  * @param {Object[]} presets - Preset descriptors ({id, label, columns}).
  * @param {?string} presetId
- * @param {?string[]} explicitKeys
+ * @param {?string[]} explicitKeys - `null` means "no picker override"; an
+ *   array (including `[]`) is an explicit selection.
  * @returns {Object[]} Visible descriptors, in canonical order.
  */
 function resolveVisibleColumns(columns, presets, presetId, explicitKeys) {
   let wanted;
-  if (explicitKeys && explicitKeys.length > 0) {
+  if (explicitKeys != null) {
     wanted = new Set(explicitKeys);
   } else {
     const preset = presets.find((p) => p.id === presetId) ?? presets[0];
@@ -179,7 +186,7 @@ function parseTableState(search, { filters }) {
     const raw = params.get(filter.key);
     if (raw == null || raw === "") continue;
     if (filter.type === "range") {
-      // "10-90", "10-" (min only), "-90" (max only). Bare "-" is unset.
+      // "10~90", "10~" (min only), "~90" (max only). Bare "~" is unset.
       const [minRaw, maxRaw] = raw.split("~");
       const min = Number.parseFloat(minRaw);
       const max = Number.parseFloat(maxRaw);
@@ -197,11 +204,15 @@ function parseTableState(search, { filters }) {
 
   const dir = params.get("dir");
   const sortKey = params.get("sort");
-  const colsRaw = params.get("cols");
+  // `?cols=` (present, empty) is an explicit "picker zeroed out every optional
+  // column" and must round-trip as `[]`, not fall back to `null` ("no picker
+  // override, use the preset") the way a plain falsy check on the raw string
+  // would. Presence of the param is what carries that distinction, not its
+  // content.
   return {
     query: params.get("q") ?? "",
     preset: params.get("preset"),
-    cols: colsRaw ? colsRaw.split(",").filter(Boolean) : null,
+    cols: params.has("cols") ? params.get("cols").split(",").filter(Boolean) : null,
     sort: sortKey ? { key: sortKey, dir: dir === "asc" ? "asc" : "desc" } : null,
     values,
   };
@@ -221,7 +232,11 @@ function serializeTableState(state, { filters, defaultPreset }) {
   const params = new URLSearchParams();
   if (state.query) params.set("q", state.query);
   if (state.preset && state.preset !== defaultPreset) params.set("preset", state.preset);
-  if (state.cols && state.cols.length > 0) params.set("cols", state.cols.join(","));
+  // `state.cols` is `null` for "no picker override" and an array (possibly
+  // `[]`, when every optional column has been unchecked) for an explicit
+  // selection — both must be distinguishable after a round trip, so an empty
+  // selection still writes `cols=` rather than being dropped like `null` is.
+  if (state.cols) params.set("cols", state.cols.join(","));
   if (state.sort) {
     params.set("sort", state.sort.key);
     params.set("dir", state.sort.dir);
@@ -494,12 +509,15 @@ function createTableControls({
   const defaultPreset = presets[0].id;
   let allRows = [];
   let filtered = [];
+  // No `sort` field here: the sort is owned entirely by `table` (the
+  // createSortableTable controller), read via `table.getSort()` wherever it's
+  // needed (updateUrl, repaintStrip). Duplicating it into this state object
+  // would just be a second, driftable copy of the same fact.
   const state = {
     query: "",
     preset: defaultPreset,
     cols: null,
     values: {},
-    sort: null,
   };
 
   rootEl.innerHTML = controlsHtml({ filters, presets, columns });
@@ -620,8 +638,16 @@ function createTableControls({
     if (event.target.dataset?.bound) return;
     handleControlChange(event.target);
   });
+  let rangeTimer = null;
   rootEl.addEventListener("input", (event) => {
-    if (event.target.dataset?.bound) handleControlChange(event.target);
+    if (!event.target.dataset?.bound) return;
+    // Debounced for the same reason the search box is: a range bound applies
+    // on every keystroke (see above), and on grid.html that is up to 1,501
+    // rows re-filtered and re-rendered per digit typed. handleControlChange
+    // re-reads the input's live value when the timer fires, so only the
+    // settled figure is ever applied.
+    clearTimeout(rangeTimer);
+    rangeTimer = setTimeout(() => handleControlChange(event.target), 150);
   });
 
   rootEl.querySelector(".col-reset").addEventListener("click", () => {

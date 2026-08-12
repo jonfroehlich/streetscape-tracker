@@ -874,6 +874,42 @@ def test_column_picker_adds_and_drops_columns(page: Page, base_url):
     assert errors == []
 
 
+def test_unchecking_every_optional_column_actually_empties_the_table(page: Page, base_url):
+    """Regression: resolveVisibleColumns used to treat an explicit "every box
+    unchecked" selection the same as "no picker override" and silently kept
+    rendering the preset's columns while the checkboxes read unchecked. Only
+    the always-on columns (City, the link) should survive unchecking
+    everything, and a reload of the resulting link must reproduce that."""
+    errors = _capture_errors(page)
+    page.goto(f"{base_url}/grid.html")
+
+    page.locator(".col-picker summary").click()
+    boxes = page.locator("input[data-column]")
+    count = boxes.count()
+    for i in range(count):
+        boxes.nth(i).uncheck()
+
+    # Only the two always-on columns remain: City and the trailing link.
+    expect(page.locator("#grid-thead th")).to_have_count(2)
+    expect(page.locator('th[data-key="providerLabel"]')).to_have_count(0)
+    for i in range(count):
+        expect(boxes.nth(i)).not_to_be_checked()
+
+    # The URL carries the explicit empty selection...
+    assert "cols=" in page.url
+    reload_url = page.url
+
+    # ...and reloading it cold reproduces the same empty-but-not-default view,
+    # rather than snapping back to the preset's columns.
+    page.goto(reload_url)
+    expect(page.locator("#grid-thead th")).to_have_count(2)
+    page.locator(".col-picker summary").click()
+    for i in range(page.locator("input[data-column]").count()):
+        expect(page.locator("input[data-column]").nth(i)).not_to_be_checked()
+
+    assert errors == []
+
+
 def test_distribution_strip_describes_the_sorted_column(page: Page, base_url):
     """The strip is a histogram of the ACTIVE SORT COLUMN over the CURRENTLY
     FILTERED rows. Its bars are decorative; the summary sentence beside them is
