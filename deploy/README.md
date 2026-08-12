@@ -244,6 +244,19 @@ Properties worth knowing before an incident:
 - **14 days of dated copies**, matching the website's `pg_dump` retention. The
   **newest file is never pruned regardless of age** — otherwise a backup failing
   for longer than the window would end with pruning deleting the last good copy.
+- **One file per date: the tail copy replaces the pre-flight one.** Deliberate,
+  and the one case where it costs you: if something during the night damages the
+  catalog *logically* rather than structurally — a bad migration, a write that
+  leaves the file valid but wrong — the tail faithfully copies that state over
+  the pre-night copy that was fine, and `integrity_check` passes because the file
+  is not corrupt, only wrong. The fallback is then yesterday's copy, i.e. one
+  night stale. Accepted because the tail copy is the more useful one on every
+  ordinary night (it contains the runs the night registered) and the worst case
+  is bounded at one night. The alternative — retaining the pre-flight copy under
+  its own name, or having the tail decline to promote when the source's row
+  counts look worse than what it would overwrite — doubles the footprint or adds
+  a heuristic that can refuse a legitimate backup. Revisit if same-day
+  point-in-time recovery ever matters.
 - **A failed backup is a failed night.** It alerts unconditionally (subject
   `CATALOG BACKUP FAILED`, ignoring `[alerts].failure_threshold`) and exits
   nonzero so systemd shows the unit red. It does *not* withhold publishing — the
