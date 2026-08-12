@@ -46,3 +46,12 @@ __pycache__/
 # ordinary untracked file and sweep it into a `git add -A`.
 .claude/settings.local.json
 .claude/worktrees/
+# Virtualenvs and the uv toolchain. Python's `venv` writes a self-ignoring
+# `.venv/.gitignore` containing `*`, which is why this repo got away without an
+# entry — but that protection lives INSIDE the venv, so it is absent from any
+# env created another way. On makelab2 the checkout's `.venv/` has no such file,
+# and `git add -A` there would have staged 7,362 files into this public repo.
+# Cover every variant, since the production interpreter is `.venv-makelab2/`.
+.venv/
+.venv-*/
+.tooling/
