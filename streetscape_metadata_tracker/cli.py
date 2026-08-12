@@ -48,6 +48,7 @@ from . import (
 from .analysis import calculate_run_stats, detect_systemic_failure, print_df_summary
 from .diff import compute_run_diff, generate_diff_filename, write_diff_detail
 from .download_common import DownloadError
+from .download_mapillary import DEFAULT_TILE_REQUESTS_PER_MINUTE
 from .fileutils import load_city_csv_file
 from .json_summarizer import (
     generate_aggregate_v2,
@@ -241,6 +242,19 @@ def parse_args():
              0 disables pacing. Exceeding the server-side quota returns
              OVER_QUERY_LIMIT responses, which burn retries and can abort
              the run.""",
+    )
+
+    concurrency_group.add_argument(
+        "--mapillary-max-requests-per-minute",
+        type=int,
+        default=DEFAULT_TILE_REQUESTS_PER_MINUTE,
+        help=f"""Client-side cap on Mapillary vector-tile requests per minute
+             (mapillary provider only). Separate from the GSV cap above
+             because the limit it respects is a different KIND: Mapillary's
+             tile CDN rate-limits per IP rather than per token or project,
+             and exceeding it blocks the whole host — every Mapillary channel
+             at once, including the nightly scheduler's. Default
+             {DEFAULT_TILE_REQUESTS_PER_MINUTE}; 0 disables pacing.""",
     )
 
     parser.add_argument(
@@ -563,6 +577,7 @@ async def _collect_one_run(conn, args, city_row, run_date, provider, config, vis
                 access_token=config["access_token"],
                 output_csv_gz_path=output_csv_gz_path,
                 request_timeout=args.timeout,
+                max_requests_per_minute=args.mapillary_max_requests_per_minute,
             )
         else:
             logging.info(

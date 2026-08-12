@@ -70,7 +70,8 @@ def test_mapillary_tile_url_has_no_token():
 def test_mapillary_download_error_is_scrubbed(monkeypatch, tmp_path):
     # A failing tile fetch whose exception text contains a credential must
     # surface as a DownloadError WITHOUT the credential.
-    async def exploding_fetch(session, url, timeout):
+    # *args absorbs the rate limiter and request counter #198 passes through.
+    async def exploding_fetch(session, url, timeout, *args):
         raise aiohttp.ClientError("HTTP 429 for https://tiles/x?access_token=SECRET123")
 
     monkeypatch.setattr(dm, "_fetch_tile", exploding_fetch)

@@ -316,6 +316,30 @@ def straddling_city():
     return lat, boundary_lon
 
 
+def _stub_fetch_tile(monkeypatch, fetch):
+    """Install ``fetch`` as the tile fetcher, keeping stubs on the plain
+    ``(session, url, timeout)`` signature.
+
+    Stubbing ``_fetch_tile`` also stubs out its retry decorator, which is what
+    keeps these tests instant. But #198 moved pacing and request counting
+    *inside* that function — deliberately, so a retried attempt re-paces and is
+    re-counted — so a stub that ignored the limiter and counter would leave
+    every city-level test seeing zero of both. This adapter honours them on the
+    stub's behalf. What it cannot pin is the per-retry behaviour itself;
+    ``test_a_retried_tile_re_paces_and_is_re_counted`` drives the real
+    ``_fetch_tile`` for that.
+    """
+
+    async def paced(session, url, timeout, rate_limiter=None, on_request=None):
+        if rate_limiter is not None:
+            await rate_limiter.acquire()
+        if on_request is not None:
+            on_request()
+        return await fetch(session, url, timeout)
+
+    monkeypatch.setattr(dm, "_fetch_tile", paced)
+
+
 def _run_download(
     monkeypatch, tmp_path, tiles_by_xy, center_lat, center_lon, width=100, height=100, step=20
 ):
@@ -334,7 +358,7 @@ def _run_download(
         served.append(xy)
         return tiles_by_xy.get(xy, mapbox_vector_tile.encode([]))
 
-    monkeypatch.setattr(dm, "_fetch_tile", fake_fetch)
+    _stub_fetch_tile(monkeypatch, fake_fetch)
     out_path = str(tmp_path / "test_mapillary_2026-07-05.csv.gz")
     result = asyncio.run(
         dm.download_mapillary_metadata_async(
@@ -744,7 +768,8 @@ def _failing_fetch(fail_xy, tiles_by_xy=None, status=404):
 
 
 def _fetch_city(monkeypatch, fetch, lat, lon, width=30000, height=30000, step=2000):
-    monkeypatch.setattr(dm, "_fetch_tile", fetch)
+    """Run a whole-city fetch with ``fetch`` standing in for one tile request."""
+    _stub_fetch_tile(monkeypatch, fetch)
     return asyncio.run(
         dm.fetch_city_images_async(
             "Test City", dm.grid_bbox(lat, lon, width, height, step), "MLY|test|token"
@@ -804,7 +829,7 @@ def test_points_under_a_failed_tile_are_request_failed_not_empty(monkeypatch, tm
     all_tiles = dm.tiles_for_bbox(*dm.grid_bbox(lat, lon, width, height, step))
     failed = all_tiles[len(all_tiles) // 2]  # an interior tile, not a corner
 
-    monkeypatch.setattr(dm, "_fetch_tile", _failing_fetch({failed}))
+    _stub_fetch_tile(monkeypatch, _failing_fetch({failed}))
     out_path = str(tmp_path / "test_mapillary_2026-07-05.csv.gz")
     result = asyncio.run(
         dm.download_mapillary_metadata_async(
@@ -1010,3 +1035,102 @@ def test_a_blocked_host_fails_the_city_by_name_not_as_a_partial_snapshot(monkeyp
 
     assert "rate-limited" in str(excinfo.value)
     assert "refusing to finalize" not in str(excinfo.value)
+
+
+# ── Tile-CDN pacing (issue #198) ───────────────────────────────────────────
+
+
+def test_every_tile_request_passes_through_the_rate_limiter(monkeypatch, straddling_city):
+    """The prevention half of the 2026-08-12 ban: before this, nothing bounded
+    the aggregate rate — connection_limit caps concurrency, which on a fast link
+    still meant ~5 tiles/s from a single city."""
+    lat, lon = straddling_city
+    acquires = []
+
+    class _SpyLimiter:
+        def __init__(self, max_per_minute):
+            self.max_per_minute = max_per_minute
+
+        async def acquire(self):
+            acquires.append(self.max_per_minute)
+
+    monkeypatch.setattr(dm, "AsyncRateLimiter", _SpyLimiter)
+    result = _fetch_city(monkeypatch, _failing_fetch(set()), lat, lon)
+
+    assert acquires, "no tile request was paced"
+    assert len(acquires) == result["api_requests"]
+    assert set(acquires) == {dm.DEFAULT_TILE_REQUESTS_PER_MINUTE}
+
+
+def test_the_default_pace_is_well_under_the_rate_that_got_us_banned():
+    """370/min is confirmed too high (2026-08-12). The default is a guess, but
+    it must stay a conservative one — this is the guard on someone 'tuning' it
+    up without new evidence about where the real ceiling is."""
+    assert 0 < dm.DEFAULT_TILE_REQUESTS_PER_MINUTE <= 120
+
+
+class _SequencedTileSession:
+    """A session whose .get() serves a scripted outcome per attempt.
+
+    Distinct from _FakeTileSession, which replays one response forever: the
+    point here is that attempt 1 and attempt 3 differ, so a retry is
+    observable.
+    """
+
+    def __init__(self, outcomes):
+        self._outcomes = list(outcomes)
+        self.attempts = 0
+
+    def get(self, url, **kwargs):
+        self.attempts += 1
+        outcome = self._outcomes.pop(0)
+
+        class _Ctx:
+            async def __aenter__(self):
+                if isinstance(outcome, BaseException):
+                    raise outcome
+                return outcome
+
+            async def __aexit__(self, *exc):
+                return False
+
+        return _Ctx()
+
+
+def test_a_retried_tile_re_paces_and_is_re_counted():
+    """One token per HTTP request, not per tile.
+
+    _fetch_tile may issue up to _TILE_MAX_TRIES requests. Pacing in the caller
+    bought one token for all of them, so a retrying tile could present five
+    times the configured rate — during a 429/5xx storm, i.e. exactly when the
+    CDN is least willing to absorb it — and report a fifth of its true spend to
+    the api_usage ledger.
+    """
+    tile = mapbox_vector_tile.encode([])
+    session = _SequencedTileSession(
+        [
+            aiohttp.ClientConnectionError("connection reset"),
+            aiohttp.ClientConnectionError("connection reset"),
+            _FakeTileResponse(200, {"Content-Type": "application/x-protobuf"}, tile),
+        ]
+    )
+    acquires, counted = [], []
+
+    class _SpyLimiter:
+        async def acquire(self):
+            acquires.append(1)
+
+    body = asyncio.run(
+        dm._fetch_tile(
+            session,
+            _TILE_URL,
+            aiohttp.ClientTimeout(total=5),
+            _SpyLimiter(),
+            lambda: counted.append(1),
+        )
+    )
+
+    assert body == tile
+    assert session.attempts == 3, "the fixture must actually exercise a retry"
+    assert len(acquires) == session.attempts
+    assert len(counted) == session.attempts
