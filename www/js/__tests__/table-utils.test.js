@@ -15,6 +15,8 @@ const {
   sortRowsBy,
   formatCellNumber,
   coverageCellHtml,
+  headerCellHtml,
+  rowHtmlFromColumns,
   createSortableTable,
 } = require("../table-utils.js");
 
@@ -42,8 +44,21 @@ test("cityDisplayLabel: city-states don't repeat, empty records fall to Unknown"
 // --- sortRowsBy -------------------------------------------------------------
 
 const COLUMNS = [
-  { key: "label", label: "City", type: "text", initial: "asc" },
-  { key: "pct", label: "Coverage", type: "number", initial: "desc" },
+  {
+    key: "label",
+    label: "City",
+    type: "text",
+    initial: "asc",
+    always: true,
+    cell: (r) => `<th scope="row">${r.label}</th>`,
+  },
+  {
+    key: "pct",
+    label: "Coverage",
+    type: "number",
+    initial: "desc",
+    cell: (r) => `<td>${r.pct}</td>`,
+  },
 ];
 
 const ROWS = [
@@ -93,82 +108,152 @@ test("coverageCellHtml: bar clamped to 0–100%, dash cell for null", () => {
   assert.equal(coverageCellHtml(null), `<td class="coverage-cell">—</td>`);
 });
 
+// --- headerCellHtml / rowHtmlFromColumns ------------------------------------
+
+test("headerCellHtml: marks the active column and reserves the arrow", () => {
+  const active = headerCellHtml(COLUMNS[1], { key: "pct", dir: "desc" });
+  assert.match(active, /data-key="pct"/);
+  assert.match(active, /aria-sort="descending"/);
+  assert.match(active, /▼/);
+
+  const idle = headerCellHtml(COLUMNS[0], { key: "pct", dir: "desc" });
+  assert.match(idle, /aria-sort="none"/);
+  assert.doesNotMatch(idle, /[▲▼]/);
+});
+
+test("headerCellHtml: a non-sortable column gets a label-less header, no data-key", () => {
+  // The trailing link column: no sort affordance, but it still needs a <th> or
+  // every body row would have one more cell than the header.
+  const html = headerCellHtml(
+    { key: "actions", sortable: false, srLabel: "Link to city map" },
+    { key: "pct", dir: "desc" }
+  );
+  assert.doesNotMatch(html, /data-key/);
+  assert.doesNotMatch(html, /<button/);
+  assert.match(html, /Link to city map/);
+});
+
+test("rowHtmlFromColumns: renders exactly the columns it is given", () => {
+  const html = rowHtmlFromColumns(COLUMNS, ROWS[0]);
+  assert.equal(html, "<tr><th scope=\"row\">Cee</th><td>50</td></tr>");
+  // One column in, one cell out — this is the invariant that replaced the old
+  // hand-maintained thead/tbody pairing.
+  assert.equal(rowHtmlFromColumns([COLUMNS[1]], ROWS[0]), "<tr><td>50</td></tr>");
+});
+
 // --- createSortableTable (stub-DOM, same approach as streets.test.js) --------
 
-/** A minimal Element stand-in for the pieces createSortableTable touches. */
-function stubTh(key) {
+/**
+ * A minimal <thead> stand-in. The controller replaces the element's innerHTML
+ * and delegates clicks to it, so the stub records the markup and can replay a
+ * click for a given column key — asserting along the way that the key is
+ * actually present in the rendered header.
+ */
+function stubThead() {
   const listeners = [];
-  const arrow = { textContent: "" };
-  const th = {
-    dataset: { key },
-    attrs: {},
-    setAttribute(name, value) { this.attrs[name] = value; },
-    querySelector(sel) {
-      if (sel === "button") {
-        return { addEventListener: (_type, fn) => listeners.push(fn) };
-      }
-      if (sel === ".sort-arrow") return arrow;
-      return null;
+  return {
+    innerHTML: "",
+    addEventListener(type, fn) {
+      if (type === "click") listeners.push(fn);
     },
-    click: () => listeners.forEach((fn) => fn()),
-    arrow,
+    clickKey(key) {
+      assert.ok(
+        this.innerHTML.includes(`data-key="${key}"`),
+        `header has no sortable column ${key}`
+      );
+      const target = {
+        closest: (sel) => (sel === "th[data-key]" ? { dataset: { key } } : null),
+      };
+      for (const fn of listeners) fn({ target });
+    },
   };
-  return th;
 }
 
-function stubTable(columns) {
-  const ths = columns.map((c) => stubTh(c.key));
-  const wrapEl = { querySelectorAll: () => ths };
-  const tbodyEl = { innerHTML: "" };
-  return { ths, wrapEl, tbodyEl };
+function stubTable() {
+  return { theadEl: stubThead(), tbodyEl: { innerHTML: "" } };
+}
+
+function makeTable(overrides = {}) {
+  const { theadEl, tbodyEl } = stubTable();
+  const table = createSortableTable({
+    columns: COLUMNS,
+    defaultSort: { key: "pct", dir: "desc" },
+    theadEl,
+    tbodyEl,
+    ...overrides,
+  });
+  return { table, theadEl, tbodyEl };
 }
 
 test("createSortableTable: renders sorted rows and keeps aria-sort in step", () => {
-  const { ths, wrapEl, tbodyEl } = stubTable(COLUMNS);
-  const table = createSortableTable({
-    columns: COLUMNS,
-    defaultSort: { key: "pct", dir: "desc" },
-    wrapEl,
-    tbodyEl,
-    rowHtml: (r) => `<tr><td>${r.cityId}</td></tr>`,
-  });
+  const { table, theadEl, tbodyEl } = makeTable();
   table.setRows(ROWS);
-  assert.match(tbodyEl.innerHTML, /^<tr><td>b<\/td><\/tr>/);
-  assert.equal(ths[1].attrs["aria-sort"], "descending");
-  assert.equal(ths[0].attrs["aria-sort"], "none");
-  assert.equal(ths[1].arrow.textContent, "▼");
+  assert.match(tbodyEl.innerHTML, /^<tr><th scope="row">Bee<\/th>/);
+  assert.match(theadEl.innerHTML, /data-key="pct" aria-sort="descending"/);
+  assert.match(theadEl.innerHTML, /data-key="label" aria-sort="none"/);
 });
 
 test("createSortableTable: header click sorts a new column at its natural direction, re-click reverses", () => {
-  const { ths, tbodyEl, wrapEl } = stubTable(COLUMNS);
-  const table = createSortableTable({
-    columns: COLUMNS,
-    defaultSort: { key: "pct", dir: "desc" },
-    wrapEl,
-    tbodyEl,
-    rowHtml: (r) => `[${r.cityId}]`,
-  });
+  const { table, theadEl, tbodyEl } = makeTable();
   table.setRows(ROWS);
 
-  ths[0].click(); // label column: initial asc
-  assert.equal(tbodyEl.innerHTML, "[a][b][c][d]");
-  assert.equal(ths[0].attrs["aria-sort"], "ascending");
-  assert.equal(ths[0].arrow.textContent, "▲");
+  theadEl.clickKey("label"); // label column: initial asc
+  assert.match(tbodyEl.innerHTML, /^<tr><th scope="row">Aye<\/th>/);
+  assert.match(theadEl.innerHTML, /data-key="label" aria-sort="ascending"/);
 
-  ths[0].click(); // same column: reverses
-  assert.equal(tbodyEl.innerHTML, "[d][c][b][a]");
-  assert.equal(ths[0].attrs["aria-sort"], "descending");
+  theadEl.clickKey("label"); // same column: reverses
+  assert.match(tbodyEl.innerHTML, /^<tr><th scope="row">Dee<\/th>/);
+  assert.match(theadEl.innerHTML, /data-key="label" aria-sort="descending"/);
+});
+
+test("createSortableTable: sorting still works after a column change re-renders the header", () => {
+  // The regression the delegated listener exists for. Listeners bound to each
+  // <th>'s button at construction die the first time setColumns replaces the
+  // thead's innerHTML, leaving a table whose headers look clickable and are not.
+  const { table, theadEl, tbodyEl } = makeTable();
+  table.setRows(ROWS);
+  table.setColumns(COLUMNS); // re-render, same columns
+  theadEl.clickKey("label");
+  assert.match(tbodyEl.innerHTML, /^<tr><th scope="row">Aye<\/th>/);
+  assert.equal(table.getSort().key, "label");
+});
+
+test("createSortableTable: dropping the sorted column falls back to a visible one", () => {
+  // Otherwise the table stays ordered by a column the reader can no longer see.
+  const { table, tbodyEl } = makeTable();
+  table.setRows(ROWS);
+  assert.equal(table.getSort().key, "pct");
+  table.setColumns([COLUMNS[0]]);
+  assert.equal(table.getSort().key, "label");
+  assert.match(tbodyEl.innerHTML, /^<tr><th scope="row">Aye<\/th>/);
+});
+
+test("createSortableTable: setSortTo restores a direction instead of toggling it", () => {
+  // A "?sort=pct&dir=desc" link must land descending even though the page
+  // already opens on that column — click semantics would reverse it.
+  const { table } = makeTable();
+  table.setRows(ROWS);
+  table.setSortTo("pct", "desc");
+  assert.deepEqual(table.getSort(), { key: "pct", dir: "desc" });
+  table.setSortTo("label", "asc");
+  assert.deepEqual(table.getSort(), { key: "label", dir: "asc" });
+});
+
+test("createSortableTable: onSortChange fires for header clicks, not for setSortTo", () => {
+  // table-controls.js listens here to repaint the strip and rewrite the URL;
+  // echoing a restore straight back into the URL would be circular.
+  const { table, theadEl } = makeTable();
+  const seen = [];
+  table.onSortChange((sort) => seen.push(sort.key));
+  table.setRows(ROWS);
+  theadEl.clickKey("label");
+  assert.deepEqual(seen, ["label"]);
+  table.setSortTo("pct", "desc");
+  assert.deepEqual(seen, ["label"]);
 });
 
 test("createSortableTable: setSort with an unknown key is a no-op", () => {
-  const { tbodyEl, wrapEl } = stubTable(COLUMNS);
-  const table = createSortableTable({
-    columns: COLUMNS,
-    defaultSort: { key: "pct", dir: "desc" },
-    wrapEl,
-    tbodyEl,
-    rowHtml: (r) => `[${r.cityId}]`,
-  });
+  const { table, tbodyEl } = makeTable();
   table.setRows(ROWS);
   const before = tbodyEl.innerHTML;
   table.setSort("nope");

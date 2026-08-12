@@ -76,7 +76,28 @@ const tableGlobals = {
   sortRowsBy: "readonly",
   formatCellNumber: "readonly",
   coverageCellHtml: "readonly",
+  headerCellHtml: "readonly",
+  rowHtmlFromColumns: "readonly",
   createSortableTable: "readonly",
+};
+
+// Symbols table-controls.js DEFINES and the two table pages CONSUME (issue
+// #188). Loaded after table-utils.js, whose formatCellNumber it consumes.
+const tableControlGlobals = {
+  foldForSearch: "readonly",
+  matchesSearch: "readonly",
+  isFilterUnset: "readonly",
+  rowPassesFilter: "readonly",
+  applyFilters: "readonly",
+  resolveVisibleColumns: "readonly",
+  parseTableState: "readonly",
+  serializeTableState: "readonly",
+  histogramBuckets: "readonly",
+  medianOf: "readonly",
+  formatStripSummary: "readonly",
+  renderDistributionStrip: "readonly",
+  controlsHtml: "readonly",
+  createTableControls: "readonly",
 };
 
 const browserRules = {
@@ -136,10 +157,28 @@ module.exports = [
     rules: browserRules,
   },
   {
+    // The exploration chassis (issue #188): consumes table-utils.js's
+    // formatCellNumber and defines the tableControlGlobals. Node export shim
+    // (`module`) for the unit tests.
+    files: ["js/table-controls.js"],
+    languageOptions: {
+      ecmaVersion: 2022,
+      sourceType: "script",
+      globals: {
+        ...globals.browser,
+        ...vendorGlobals,
+        ...sharedGlobals,
+        ...tableGlobals,
+        module: "readonly",
+      },
+    },
+    rules: browserRules,
+  },
+  {
     // The two table pages (issues #99/#155 and the grid table): consume the
-    // streetscape-utils.js and table-utils.js globals and, like the files
-    // above, carry a Node export shim (`module`) so their pure helpers can be
-    // unit-tested.
+    // streetscape-utils.js, table-utils.js and table-controls.js globals and,
+    // like the files above, carry a Node export shim (`module`) so their pure
+    // helpers can be unit-tested.
     files: ["js/streets.js", "js/grid.js"],
     languageOptions: {
       ecmaVersion: 2022,
@@ -149,6 +188,7 @@ module.exports = [
         ...vendorGlobals,
         ...sharedGlobals,
         ...tableGlobals,
+        ...tableControlGlobals,
         module: "readonly",
       },
     },

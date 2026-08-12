@@ -7,6 +7,14 @@
  * these helpers emit (.coverage-cell, .streets-view-link, …) predate the
  * extraction and are shared by both pages via data-table.css.
  *
+ * Column descriptors are the single source of truth for BOTH the header and
+ * the body (issue #188). A descriptor carries its `label`/`title` (so the
+ * header can be rendered from JS once presets make the visible set dynamic)
+ * and a `cell(row)` function (so a column that is not in the header cannot
+ * emit a body cell). Before #188 the `<thead>` was hand-authored in each HTML
+ * file and the row renderers emitted a matching, hand-maintained sequence of
+ * `<td>`s — two parallel lists that a column change had to update in step.
+ *
  * Depends on globals from streetscape-utils.js (loaded first): coverageColor.
  */
 
@@ -78,48 +86,107 @@ function coverageCellHtml(pct) {
 }
 
 /**
- * Wire a sortable table: paints the tbody for the active sort, keeps
- * `aria-sort` and the ▲/▼ glyph in step on the headers, and re-sorts on
- * header-button clicks. A new column starts at its natural direction
- * (numbers best-first, text A–Z); clicking the active column reverses it.
+ * Header cell for one column descriptor.
  *
  * `aria-sort` on the <th> is what a screen reader announces; the ▲/▼ glyph is
  * decorative and hidden from the accessibility tree so the column is not read
- * as "City ▲".
+ * as "City ▲". The <button> is what carries the click and the keyboard focus —
+ * a click handler on a bare <th> is unreachable by keyboard.
+ *
+ * Labels and titles are code constants, not data, so they are interpolated
+ * unescaped — unlike anything row-derived, which is OSM/Nominatim content and
+ * is escaped at the point it enters innerHTML.
+ *
+ * @param {Object} column - Column descriptor.
+ * @param {{key: string, dir: string}} activeSort
+ * @returns {string} HTML for one <th>.
+ */
+function headerCellHtml(column, activeSort) {
+  // The trailing link column has nothing to sort and no visible label; it
+  // still needs a header cell so the column count matches the body rows.
+  if (column.sortable === false) {
+    return `<th scope="col"><span class="visually-hidden">${column.srLabel ?? ""}</span></th>`;
+  }
+  const isActive = column.key === activeSort.key;
+  const ariaSort = isActive ? (activeSort.dir === "asc" ? "ascending" : "descending") : "none";
+  const arrow = isActive ? (activeSort.dir === "asc" ? "▲" : "▼") : "";
+  const title = column.title ? ` title="${column.title}"` : "";
+  return `
+    <th scope="col" data-key="${column.key}" aria-sort="${ariaSort}">
+      <button type="button"${title}>${column.label} <span class="sort-arrow" aria-hidden="true">${arrow}</span></button>
+    </th>`;
+}
+
+/**
+ * Build one body row from the visible columns.
+ *
+ * Each descriptor's `cell(row)` returns its own complete cell — normally a
+ * <td>, but the first column returns a <th scope="row"> so the row has a
+ * header. Rendering from the same list the header came from is what keeps the
+ * two in step when a preset changes the visible set.
+ *
+ * @param {Object[]} columns - Visible column descriptors.
+ * @param {Object} row - A row model.
+ * @returns {string} HTML for one <tr>.
+ */
+function rowHtmlFromColumns(columns, row) {
+  return `<tr>${columns.map((column) => column.cell(row)).join("")}</tr>`;
+}
+
+/**
+ * Wire a sortable table: renders the header and body for the active sort and
+ * the active column set, and re-sorts on header clicks.
+ *
+ * The click listener is DELEGATED to the <thead> element rather than bound to
+ * each <th>'s button. The thead's innerHTML is replaced whenever the visible
+ * columns change, which destroys any per-button listeners bound at
+ * construction — delegation survives because the thead element itself is never
+ * replaced.
  *
  * @param {{columns: Object[], defaultSort: {key: string, dir: string},
- *          wrapEl: Element, tbodyEl: Element,
- *          rowHtml: (row: Object) => string}} cfg
- * @returns {{setRows: (rows: Object[]) => void, setSort: (key: string) => void,
- *            render: () => void}}
+ *          theadEl: Element, tbodyEl: Element, tieKey?: string}} cfg
+ *   `columns` is the initially visible set; change it later with setColumns.
+ * @returns {{setRows: Function, setSort: Function, setColumns: Function,
+ *            getSort: Function, getColumns: Function, render: Function}}
  */
-function createSortableTable({ columns, defaultSort, wrapEl, tbodyEl, rowHtml }) {
+function createSortableTable({ columns, defaultSort, theadEl, tbodyEl, tieKey = "cityId" }) {
   let rows = [];
+  let visible = [...columns];
   let activeSort = { ...defaultSort };
+  const sortListeners = [];
 
   function render() {
-    tbodyEl.innerHTML = sortRowsBy(columns, rows, activeSort.key, activeSort.dir)
-      .map(rowHtml)
+    theadEl.innerHTML = `<tr>${visible
+      .map((column) => headerCellHtml(column, activeSort))
+      .join("")}</tr>`;
+    tbodyEl.innerHTML = sortRowsBy(visible, rows, activeSort.key, activeSort.dir, tieKey)
+      .map((row) => rowHtmlFromColumns(visible, row))
       .join("");
-
-    for (const th of wrapEl.querySelectorAll("th[data-key]")) {
-      const isActive = th.dataset.key === activeSort.key;
-      th.setAttribute(
-        "aria-sort",
-        isActive ? (activeSort.dir === "asc" ? "ascending" : "descending") : "none"
-      );
-      const arrow = th.querySelector(".sort-arrow");
-      if (arrow) arrow.textContent = isActive ? (activeSort.dir === "asc" ? "▲" : "▼") : "";
-    }
   }
 
   function setSort(key) {
-    const column = columns.find((c) => c.key === key);
+    const column = visible.find((c) => c.key === key);
     if (!column) return;
     activeSort =
       activeSort.key === key
         ? { key, dir: activeSort.dir === "asc" ? "desc" : "asc" }
         : { key, dir: column.initial };
+    render();
+    for (const fn of sortListeners) fn(getSort());
+  }
+
+  /**
+   * Set the sort explicitly, without the click semantics (which reverse the
+   * active column). This is how a `?sort=&dir=` URL is restored: a link that
+   * says "descending" must land descending, not toggle into ascending because
+   * the page happened to open on that column.
+   *
+   * Does not notify sort listeners — the caller is the one restoring state, so
+   * echoing it straight back into the URL would be circular.
+   */
+  function setSortTo(key, dir) {
+    if (!visible.some((c) => c.key === key)) return;
+    activeSort = { key, dir: dir === "asc" ? "asc" : "desc" };
     render();
   }
 
@@ -128,11 +195,54 @@ function createSortableTable({ columns, defaultSort, wrapEl, tbodyEl, rowHtml })
     render();
   }
 
-  for (const th of wrapEl.querySelectorAll("th[data-key]")) {
-    th.querySelector("button")?.addEventListener("click", () => setSort(th.dataset.key));
+  /**
+   * Swap the visible column set (a preset change, or the column picker).
+   *
+   * If the active sort column is dropped from the view, sorting falls back to
+   * the first sortable column rather than silently sorting by a column the
+   * reader can no longer see.
+   */
+  function setColumns(next) {
+    visible = [...next];
+    if (!visible.some((c) => c.key === activeSort.key)) {
+      const fallback = visible.find((c) => c.sortable !== false);
+      if (fallback) activeSort = { key: fallback.key, dir: fallback.initial };
+    }
+    render();
   }
 
-  return { setRows, setSort, render };
+  function getSort() {
+    return { ...activeSort };
+  }
+
+  /**
+   * Subscribe to sort changes made through the header.
+   *
+   * The table controller deliberately knows nothing about the URL or the
+   * distribution strip; table-controls.js registers here to keep both in step
+   * with a header click.
+   *
+   * @param {(sort: {key: string, dir: string}) => void} fn
+   */
+  function onSortChange(fn) {
+    sortListeners.push(fn);
+  }
+
+  theadEl.addEventListener("click", (event) => {
+    const th = event.target.closest?.("th[data-key]");
+    if (th?.dataset?.key) setSort(th.dataset.key);
+  });
+
+  return {
+    setRows,
+    setSort,
+    setSortTo,
+    setColumns,
+    render,
+    getSort,
+    onSortChange,
+    getColumns: () => [...visible],
+  };
 }
 
 // Node/CommonJS export shim for the unit tests. No-op in the browser, where
@@ -143,6 +253,8 @@ if (typeof module !== "undefined" && module.exports) {
     sortRowsBy,
     formatCellNumber,
     coverageCellHtml,
+    headerCellHtml,
+    rowHtmlFromColumns,
     createSortableTable,
   };
 }

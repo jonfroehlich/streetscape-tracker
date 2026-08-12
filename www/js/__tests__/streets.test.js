@@ -201,22 +201,32 @@ test("sortRows: does not mutate its input", () => {
 });
 
 test("every sortable column key exists on a row model", () => {
-  // Guards the html/js seam: a th[data-key] with no matching model field
-  // would silently sort every row as null.
+  // Guards the column/model seam: a sortable column with no matching model
+  // field would silently sort every row as null.
   const row = toRowModel(
     { city_id: "x", provider: "gsv", run_date: "2026-01-01", spacing_m: 15 },
     { city: "X" }
   );
-  for (const col of STREET_COLUMNS) {
+  for (const col of STREET_COLUMNS.filter((c) => c.sortable !== false)) {
     assert.ok(col.key in row, `row model is missing ${col.key}`);
   }
   assert.ok(STREET_COLUMNS.some((c) => c.key === DEFAULT_SORT.key));
 });
 
-test("a row renders one cell per column, plus the link cell", () => {
-  // The <thead> lives in streets.html and the <tr> is built here, so adding a
-  // column to one and not the other misaligns every row — invisible until the
-  // page is opened in a browser, which no test does.
+test("every column can render a cell, including from a fully null row model", () => {
+  // The header and the body are both generated from STREET_COLUMNS now, so a
+  // column that throws on a sparse walk takes the whole table down rather than
+  // rendering one bad cell.
+  const sparse = toRowModel({ city_id: "x", provider: "gsv" }, null);
+  for (const col of STREET_COLUMNS) {
+    assert.equal(typeof col.cell, "function", `${col.key} has no cell renderer`);
+    assert.match(col.cell(sparse), /^<t[hd][\s>]/, `${col.key} did not render a cell`);
+  }
+});
+
+test("a row renders one cell per column", () => {
+  // The link column is now a STREET_COLUMNS entry like any other (it renders
+  // its own cell), so the count is exact rather than "columns plus one".
   const html = walkRowHtml(
     toRowModel(
       { city_id: "x", provider: "gsv", network_type: "all_public", run_date: "2026-01-01" },
@@ -224,7 +234,7 @@ test("a row renders one cell per column, plus the link cell", () => {
     )
   );
   const cells = (html.match(/<t[hd][\s>]/g) || []).length;
-  assert.equal(cells, STREET_COLUMNS.length + 1);
+  assert.equal(cells, STREET_COLUMNS.length);
 });
 
 test("toRowModel: labels the network, defaulting a tokenless walk to roads", () => {
@@ -386,10 +396,10 @@ test("walkChangeCellHtml: a zero delta still renders (imagery churned, net flat)
   assert.match(html, />\+0\.0 pp</);
 });
 
-test("walkRowHtml: cell count matches STREET_COLUMNS plus the link column", () => {
+test("walkRowHtml: cell count matches STREET_COLUMNS, change block included", () => {
   const html = walkRowHtml(toRowModel({ ...SEATTLE_WALK, change: CHANGE_BLOCK }, null));
   const cells = (html.match(/<t[dh][ >]/g) || []).length;
-  assert.equal(cells, STREET_COLUMNS.length + 1);
+  assert.equal(cells, STREET_COLUMNS.length);
 });
 
 test("sortRows: changeDelta sorts numerically with first walks (null) last", () => {
