@@ -72,7 +72,10 @@ from streetscape_metadata_tracker.analysis import detect_systemic_failure
 from streetscape_metadata_tracker.config import load_config
 from streetscape_metadata_tracker.download_common import DownloadError
 from streetscape_metadata_tracker.download_gsv import collect_points_async
-from streetscape_metadata_tracker.download_mapillary import estimate_tile_count
+from streetscape_metadata_tracker.download_mapillary import (
+    DEFAULT_TILE_REQUESTS_PER_MINUTE,
+    estimate_tile_count,
+)
 from streetscape_metadata_tracker.json_summarizer import generate_streetwalk_manifest
 from streetscape_metadata_tracker.naming import (
     DEFAULT_NETWORK_TYPE,
@@ -266,6 +269,7 @@ def run_collect(args: argparse.Namespace) -> int:
                         match_dist_m=args.match_dist,
                         connection_limit=args.connection_limit,
                         request_timeout=args.timeout,
+                        max_requests_per_minute=args.mapillary_max_requests_per_minute,
                     )
                 )
         except DownloadError as e:
@@ -499,6 +503,18 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Client-side pacing cap for the gsv_streets key "
             f"(default: {DEFAULT_MAX_REQUESTS_PER_MINUTE}); <= 0 disables pacing"
+        ),
+    )
+    parser.add_argument(
+        "--mapillary-max-requests-per-minute",
+        type=int,
+        default=DEFAULT_TILE_REQUESTS_PER_MINUTE,
+        help=(
+            "Client-side pacing cap for Mapillary vector-tile requests "
+            f"(default: {DEFAULT_TILE_REQUESTS_PER_MINUTE}); <= 0 disables "
+            "pacing. Separate from the gsv_streets cap because Mapillary's "
+            "tile CDN rate-limits per IP, so exceeding it blocks every "
+            "Mapillary channel on this host at once (issue #198)"
         ),
     )
     parser.add_argument(

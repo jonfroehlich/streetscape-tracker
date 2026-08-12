@@ -1172,6 +1172,15 @@ def _street_collect_cmd(
             "--max-requests-per-minute",
             str(pc.max_requests_per_minute or cfg.max_requests_per_minute),
         ]
+    elif channel == "mapillary_streets" and pc.max_requests_per_minute is not None:
+        # Paces the tile CDN, which limits per IP rather than per token — so
+        # this channel and the grid one can ban each other (issue #198). Unset
+        # leaves the collector's own conservative default in force; the GSV
+        # fallback above would be nonsensically large here.
+        cmd += [
+            "--mapillary-max-requests-per-minute",
+            str(pc.max_requests_per_minute),
+        ]
     # '--' so a display name can never be parsed as a flag
     cmd += ["--", city.display_name]
     return cmd
@@ -1340,10 +1349,18 @@ def _run_one_city(
         "--no-publish-json",
         "--log-level",
         "INFO",
-        # '--' so a display name can never be parsed as a flag
-        "--",
-        city.display_name,
     ]
+    if provider == "mapillary":
+        # The --max-requests-per-minute above is a GSV number ([download], 48k
+        # on prod) and the CLI applies it only to the GSV path. Mapillary needs
+        # its own, far smaller cap against a per-IP limit on the tile CDN
+        # (issue #198); omitting the flag would leave the CLI's own
+        # conservative default in force, which is also correct.
+        rate = ((cfg.providers or {}).get(provider) or ProviderConfig()).max_requests_per_minute
+        if rate is not None:
+            cmd += ["--mapillary-max-requests-per-minute", str(rate)]
+    # '--' so a display name can never be parsed as a flag
+    cmd += ["--", city.display_name]
     logger.info(
         f"Collecting {city.city_id} [{provider}] "
         f"(~{estimate_requests(city, provider):,} requests estimated)"

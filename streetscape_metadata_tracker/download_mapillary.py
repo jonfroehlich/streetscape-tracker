@@ -53,6 +53,7 @@ from tqdm import tqdm
 from .analysis import FLAT_ONLY, REQUEST_FAILED
 from .config import MAPILLARY_METADATA_DTYPES
 from .download_common import (
+    AsyncRateLimiter,
     DownloadError,
     generate_grid_arrays,
     grid_index_ranges,
@@ -347,6 +348,26 @@ MAX_FAILED_TILE_FRACTION = 0.02
 _TILE_MAX_TRIES = 5
 _TILE_MAX_TIME_S = 120
 
+# Client-side pacing for the tile CDN (issue #198). This bounds a limit
+# Mapillary does not document and that is enforced PER IP, not per token: on
+# 2026-08-12 a bulk collection sustaining ~370 tile requests/min got the host
+# redirected to a login page for every tile, across BOTH of our Mapillary
+# applications at once, at a total spend of 10,659 requests — about 21% of the
+# 50,000/day per-application cap the config has always paced against. So the
+# daily budget is not the binding constraint and a second token buys nothing;
+# only rate does.
+#
+# 60/min is a deliberately conservative guess. The true ceiling is unknown (370
+# is merely confirmed too high), and being wrong is expensive in a way slowness
+# is not: the nightly scheduler shares the host IP, so a ban takes out its
+# `mapillary` and `mapillary_streets` channels too. Pacing costs almost nothing
+# here — a whole city is tens of tile requests, and a nightly batch spends ~700
+# across ~20 cities, so this adds ~12 minutes spread over a night.
+#
+# Per-process, like the GSV limiter: N concurrent collections present N times
+# this rate to the CDN. Do not run Mapillary collections in parallel.
+DEFAULT_TILE_REQUESTS_PER_MINUTE = 60
+
 # Content types that are an error page rather than a tile (issue #199). A
 # DENY-list, not an allow-list of protobuf types: if Mapillary ever relabels
 # real tiles (say `application/vnd.mapbox-vector-tile`), an allow-list would
@@ -413,6 +434,7 @@ async def fetch_city_images_async(
     access_token: str,
     connection_limit: int = 5,
     request_timeout: float = 30,
+    max_requests_per_minute: int = DEFAULT_TILE_REQUESTS_PER_MINUTE,
 ) -> dict[str, Any]:
     """
     Fetch and dedupe every Mapillary image in a bbox from the z14 vector tiles.
@@ -430,6 +452,8 @@ async def fetch_city_images_async(
         access_token: Mapillary client token (rides in the tile URL).
         connection_limit: max concurrent tile fetches.
         request_timeout: per-request timeout in seconds.
+        max_requests_per_minute: client-side pacing cap for the tile CDN,
+            which rate-limits per IP (issue #198). <= 0 disables pacing.
 
     Returns:
         Dict with ``images`` (deduped image dicts), ``api_requests`` (tiles
@@ -448,12 +472,17 @@ async def fetch_city_images_async(
     api_requests = 0
     timeout = aiohttp.ClientTimeout(total=request_timeout)
     semaphore = asyncio.Semaphore(connection_limit)
+    # Bounds the aggregate rate regardless of connection_limit — the semaphore
+    # caps concurrency, which on a fast link still meant ~5 tiles/s (~300/min)
+    # from a single city before this (issue #198).
+    rate_limiter = AsyncRateLimiter(max_requests_per_minute)
     progress_bar = tqdm(total=len(tiles), desc=f"Downloading Mapillary tiles for {city_name}")
 
     async def fetch_one(x: int, y: int) -> list[dict[str, Any]]:
         nonlocal api_requests
         url = f"{TILE_URL_TEMPLATE.format(z=TILE_ZOOM, x=x, y=y)}?access_token={access_token}"
         async with semaphore:
+            await rate_limiter.acquire()
             api_requests += 1
             tile_bytes = await _fetch_tile(session, url, timeout)
         progress_bar.update(1)
@@ -542,6 +571,7 @@ async def download_mapillary_metadata_async(
     output_csv_gz_path: str,
     connection_limit: int = 5,
     request_timeout: float = 30,
+    max_requests_per_minute: int = DEFAULT_TILE_REQUESTS_PER_MINUTE,
 ) -> dict[str, Any]:
     """
     Fetch Mapillary pano metadata for a city and write it as a run csv.gz.
@@ -590,6 +620,7 @@ async def download_mapillary_metadata_async(
         access_token,
         connection_limit=connection_limit,
         request_timeout=request_timeout,
+        max_requests_per_minute=max_requests_per_minute,
     )
     images = fetched["images"]
     api_requests = fetched["api_requests"]

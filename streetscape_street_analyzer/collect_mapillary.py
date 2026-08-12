@@ -38,6 +38,7 @@ import pandas as pd
 from streetscape_metadata_tracker.analysis import FLAT_ONLY
 from streetscape_metadata_tracker.config import MAPILLARY_METADATA_DTYPES
 from streetscape_metadata_tracker.download_mapillary import (
+    DEFAULT_TILE_REQUESTS_PER_MINUTE,
     captured_at_to_iso_date,
     fetch_city_images_async,
     grid_bbox,
@@ -251,6 +252,7 @@ async def collect_mapillary_street_samples_async(
     match_dist_m: float,
     connection_limit: int = 5,
     request_timeout: float = 30,
+    max_requests_per_minute: int = DEFAULT_TILE_REQUESTS_PER_MINUTE,
 ) -> dict[str, Any]:
     """
     Collect Mapillary street samples for a city and write the snapshot csv.gz.
@@ -278,6 +280,7 @@ async def collect_mapillary_street_samples_async(
         access_token,
         connection_limit=connection_limit,
         request_timeout=request_timeout,
+        max_requests_per_minute=max_requests_per_minute,
     )
     images = fetched["images"]
     num_flat_images = sum(1 for img in images if not img["is_pano"])

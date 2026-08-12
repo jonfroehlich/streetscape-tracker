@@ -172,3 +172,27 @@ def conn(data_dir):
 @pytest.fixture
 def city_df_factory():
     return make_city_df
+
+
+@pytest.fixture(autouse=True)
+def _no_mapillary_tile_pacing(monkeypatch):
+    """
+    Disable the Mapillary tile rate limiter (issue #198) for the whole suite.
+
+    The production default is deliberately slow — 60 tile requests/minute
+    against a per-IP limit on Mapillary's CDN — so a fixture city of a couple
+    hundred tiles would otherwise pace a single test out to several minutes of
+    real sleeping. Tests that care about pacing (rather than about what the
+    fetch returns) monkeypatch ``AsyncRateLimiter`` themselves, which runs after
+    this fixture and so wins.
+    """
+    from streetscape_metadata_tracker import download_mapillary as dm
+
+    class _NoPacing:
+        def __init__(self, max_per_minute):
+            pass
+
+        async def acquire(self):
+            return None
+
+    monkeypatch.setattr(dm, "AsyncRateLimiter", _NoPacing)

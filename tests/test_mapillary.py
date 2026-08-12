@@ -1010,3 +1010,47 @@ def test_a_blocked_host_fails_the_city_by_name_not_as_a_partial_snapshot(monkeyp
 
     assert "rate-limited" in str(excinfo.value)
     assert "refusing to finalize" not in str(excinfo.value)
+
+
+# ── Tile-CDN pacing (issue #198) ───────────────────────────────────────────
+
+
+def test_every_tile_request_passes_through_the_rate_limiter(monkeypatch, straddling_city):
+    """The prevention half of the 2026-08-12 ban: before this, nothing bounded
+    the aggregate rate — connection_limit caps concurrency, which on a fast link
+    still meant ~5 tiles/s from a single city."""
+    lat, lon = straddling_city
+    acquires = []
+
+    class _SpyLimiter:
+        def __init__(self, max_per_minute):
+            self.max_per_minute = max_per_minute
+
+        async def acquire(self):
+            acquires.append(self.max_per_minute)
+
+    monkeypatch.setattr(dm, "AsyncRateLimiter", _SpyLimiter)
+    result = _fetch_city(monkeypatch, _failing_fetch(set()), lat, lon)
+
+    assert acquires, "no tile request was paced"
+    assert len(acquires) == result["api_requests"]
+    assert set(acquires) == {dm.DEFAULT_TILE_REQUESTS_PER_MINUTE}
+
+
+def test_the_default_pace_is_well_under_the_rate_that_got_us_banned():
+    """370/min is confirmed too high (2026-08-12). The default is a guess, but
+    it must stay a conservative one — this is the guard on someone 'tuning' it
+    up without new evidence about where the real ceiling is."""
+    assert 0 < dm.DEFAULT_TILE_REQUESTS_PER_MINUTE <= 120
+
+
+def test_the_road_walk_paces_the_same_census(monkeypatch):
+    """The grid run and the road walk share fetch_city_images_async and share
+    the per-IP limit, so the walk must not be the unpaced way in."""
+    import inspect
+
+    from streetscape_street_analyzer import collect_mapillary as cm
+
+    sig = inspect.signature(cm.collect_mapillary_street_samples_async)
+    assert "max_requests_per_minute" in sig.parameters
+    assert sig.parameters["max_requests_per_minute"].default == dm.DEFAULT_TILE_REQUESTS_PER_MINUTE

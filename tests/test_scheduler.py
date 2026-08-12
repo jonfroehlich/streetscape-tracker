@@ -1,5 +1,6 @@
 """Scheduler logic tests — pure logic only, no network or subprocesses."""
 
+import dataclasses
 import gzip
 import json
 import os
@@ -19,6 +20,7 @@ from streetscape_metadata_tracker.naming import (
     streetwalk_coverage_filename,
 )
 from streetscape_metadata_tracker.scheduler import (
+    ProviderConfig,
     ResourceGuardConfig,
     SchedulerConfig,
     SystemPressure,
@@ -2430,3 +2432,78 @@ def test_restore_backup_subcommand_is_wired():
         "/b/x.backup",
         "/tmp/d.db",
     )
+
+
+# ── Mapillary tile pacing reaches the children (issue #198) ────────────────
+
+
+def _grid_cmd(monkeypatch, tmp_path, conn, provider, cfg):
+    """Capture the argv the scheduler hands a grid subprocess."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    cid = _register(conn, "Bend", width=5000, height=5000, step=20)
+    city = db.resolve_city(conn, cid)
+    captured = {}
+
+    def fake_run(cmd, timeout=None, cwd=None, **kwargs):
+        captured["cmd"] = cmd
+
+        class R:
+            returncode = 0
+
+        return R()
+
+    monkeypatch.setattr(sched.subprocess, "run", fake_run)
+    cfg = dataclasses.replace(cfg, log_dir=str(tmp_path))
+    assert sched._run_one_city(cfg, city, date(2026, 7, 1), provider)
+    return captured["cmd"], city
+
+
+def test_mapillary_grid_child_gets_the_tile_pace_not_the_gsv_one(conn, monkeypatch, tmp_path):
+    """The --max-requests-per-minute already on the grid command is a GSV number
+    ([download], 48k on prod) and the CLI applies it only to the GSV path.
+    Mapillary's cap is a different KIND of limit — per IP on the tile CDN — and
+    orders of magnitude smaller, so it needs its own flag."""
+    cfg = SchedulerConfig(providers={"mapillary": ProviderConfig(max_requests_per_minute=60)})
+    cmd, city = _grid_cmd(monkeypatch, tmp_path, conn, "mapillary", cfg)
+
+    assert cmd[cmd.index("--mapillary-max-requests-per-minute") + 1] == "60"
+    # The GSV flag is still passed and still untouched — the CLI ignores it for
+    # this provider, and nothing here should change GSV's behaviour.
+    assert cmd[cmd.index("--max-requests-per-minute") + 1] == str(cfg.max_requests_per_minute)
+    # '--' terminator must stay last so a display name is never read as a flag.
+    assert cmd[cmd.index("--") + 1] == city.display_name
+    assert cmd[-1] == city.display_name
+
+
+def test_an_unset_mapillary_pace_leaves_the_cli_default_in_force(conn, monkeypatch, tmp_path):
+    """Omitting the flag is correct: the CLI's own default is conservative. The
+    wrong fallback would be [download].max_requests_per_minute, a GSV figure
+    that would disable pacing in practice."""
+    cfg = SchedulerConfig(providers={"mapillary": ProviderConfig()})
+    cmd, _ = _grid_cmd(monkeypatch, tmp_path, conn, "mapillary", cfg)
+    assert "--mapillary-max-requests-per-minute" not in cmd
+
+
+def test_a_gsv_grid_child_never_gets_the_mapillary_flag(conn, monkeypatch, tmp_path):
+    cfg = SchedulerConfig(providers={"mapillary": ProviderConfig(max_requests_per_minute=60)})
+    cmd, _ = _grid_cmd(monkeypatch, tmp_path, conn, "gsv", cfg)
+    assert "--mapillary-max-requests-per-minute" not in cmd
+
+
+def test_mapillary_street_child_gets_the_tile_pace(conn):
+    """The walk and the grid share one per-IP budget, so the walk must not be
+    the unpaced way in."""
+    from streetscape_metadata_tracker.scheduler import _street_collect_cmd
+
+    cid = _register(conn, "Bend", width=5000, height=5000, step=20)
+    city = db.resolve_city(conn, cid)
+    cfg = SchedulerConfig(
+        providers={"mapillary_streets": ProviderConfig(max_requests_per_minute=60)}
+    )
+
+    cmd = _street_collect_cmd(cfg, city, date(2026, 7, 8), "mapillary_streets", 10, 100)
+    assert cmd[cmd.index("--mapillary-max-requests-per-minute") + 1] == "60"
+    # gsv_streets' own pacing flag must not leak onto a Mapillary walk: its
+    # value is a GSV-scale number the collector would apply to tile requests.
+    assert "--max-requests-per-minute" not in cmd
