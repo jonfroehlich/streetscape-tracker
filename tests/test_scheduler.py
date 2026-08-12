@@ -2272,6 +2272,108 @@ def test_backup_status_exits_nonzero_when_the_newest_copy_is_stale(
     assert "last attempt" in out and "FAILED" not in out
 
 
+def test_backup_status_alert_fires_only_when_unhealthy(conn, monkeypatch, tmp_path, capsys):
+    """
+    The out-of-band monitor (issue #193). --alert must be silent on a healthy
+    day — a daily mail nobody needs is a daily mail nobody reads — and must not
+    change the exit status, which is what systemd and any external check use.
+    """
+    from streetscape_metadata_tracker import catalog_backup as cb
+    from streetscape_metadata_tracker import scheduler as sched
+
+    monkeypatch.setattr(sched.catalog_backup, "write_backup", _REAL_WRITE_BACKUP)
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(sched, "send_alert", lambda a, s, b: sent.append((s, b)) or True)
+
+    cfg = _real_backup_cfg(tmp_path, data_dir=str(tmp_path / "data"))
+    cfg.driving_plan.archive_dir = str(tmp_path / "archive")
+    result = sched.catalog_backup.write_backup(conn, cfg.backup_dir, date(2026, 8, 7))
+
+    assert sched.cmd_backup_status(cfg, alert=True) == 0
+    assert sent == [], "a healthy check must not email"
+    capsys.readouterr()
+
+    # Age the copy past the staleness gate — the abandoned-scheduler shape.
+    old = time.time() - (cb.STALE_AFTER_HOURS + 2) * 3600
+    os.utime(result.path, (old, old))
+
+    assert sched.cmd_backup_status(cfg, alert=True) == 1, "--alert must not change the exit status"
+    assert len(sent) == 1
+    subject, body = sent[0]
+    # The subject has to carry the verdict: on a monitor mail, the subject line
+    # is often the only part read, and "stale" (is the scheduler running?) and
+    # "the copy failed" (why?) call for different first moves.
+    assert "STALE" in subject
+    # The body is the report itself, not a scheduler log tail.
+    assert "Catalog backups:" in body and "STALE" in body
+
+
+def test_backup_status_alert_names_the_reason_and_stays_opt_in(conn, monkeypatch, tmp_path, capsys):
+    """Each unhealthy shape gets its own subject, and the default (no --alert)
+    never sends — the plain CLI stays a plain CLI."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    monkeypatch.setattr(sched.catalog_backup, "write_backup", _REAL_WRITE_BACKUP)
+    sent: list[str] = []
+    monkeypatch.setattr(sched, "send_alert", lambda a, s, b: sent.append(s) or True)
+
+    cfg = _real_backup_cfg(tmp_path, data_dir=str(tmp_path / "data"))
+    cfg.driving_plan.archive_dir = str(tmp_path / "archive")
+
+    # Unhealthy, but not asked to alert: silent.
+    assert sched.cmd_backup_status(cfg) == 1
+    assert sent == []
+
+    # No backups at all.
+    assert sched.cmd_backup_status(cfg, alert=True) == 1
+    assert "NO BACKUPS" in sent[-1]
+
+    # A recorded failure, with a copy present: a different question entirely.
+    sched.catalog_backup.write_backup(conn, cfg.backup_dir, date(2026, 8, 7))
+    status_path = os.path.join(cfg.backup_dir, "backup_status.json")
+    st = json.loads(Path(status_path).read_text())
+    st["ok"] = False
+    st["error"] = "integrity_check failed: page 3 is never used"
+    Path(status_path).write_text(json.dumps(st))
+
+    assert sched.cmd_backup_status(cfg, alert=True) == 1
+    assert "last attempt FAILED" in sent[-1]
+    capsys.readouterr()
+
+
+def test_backup_check_unit_matches_the_collection_unit(tmp_path):
+    """
+    The monitor is only a monitor if it runs on the host that writes the
+    backups and against the production config. These live in three files
+    (two units + the toml) and only mean anything together — the same
+    cross-file agreement the max_batch_hours/TimeoutStartSec test pins.
+    """
+    unit_dir = Path(_PROJECT_ROOT, "deploy", "systemd")
+    check = (unit_dir / "streetscape-backup-check.service").read_text()
+    collect = (unit_dir / "streetscape-tracker.service").read_text()
+    timer = (unit_dir / "streetscape-backup-check.timer").read_text()
+
+    # Same host pin: $HOME is shared NFS across both boxes, so without this the
+    # check could report on a machine that never writes a backup.
+    host = re.search(r"^ConditionHost=(.+)$", collect, re.M).group(1)
+    assert re.search(rf"^ConditionHost={re.escape(host)}$", check, re.M), (
+        "the check must be pinned to the same host as the collection unit"
+    )
+    # Same interpreter and same production config as the collection unit.
+    for fragment in (".venv-makelab2/bin/python", "config/scheduler.makelab1.toml"):
+        assert fragment in check and fragment in collect
+
+    # Assert against the ExecStart line itself — the file's prose mentions
+    # backup-status too, and a comment is not what systemd runs.
+    exec_line = re.search(r"^ExecStart=(.+)$", check, re.M).group(1)
+    # It must actually pass --alert; without it the timer runs a check whose
+    # only output goes to a log nobody reads, which is the bug being fixed.
+    assert "backup-status --alert" in exec_line
+    # --config is a global arg: argparse rejects it after the subcommand.
+    assert exec_line.index("--config") < exec_line.index("backup-status")
+    assert "[Install]" in timer and "OnCalendar=" in timer
+
+
 def test_restore_backup_subcommand_restores_and_then_refuses(conn, monkeypatch, tmp_path, capsys):
     """The incident-time handle. It must work, and it must refuse the second
     time — restoring onto a catalog that is already there would destroy the
