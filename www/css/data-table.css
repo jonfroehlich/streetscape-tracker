@@ -138,9 +138,12 @@
 
 /* Coverage cell: a proportional bar behind the number. The bar is
    aria-hidden — the percentage text is the accessible content. */
+/* Wide enough for the bar to read as a proportion, narrow enough that the two
+   coverage columns in a default preset still fit the 1200px measure without
+   the table overflowing its container (issue #188). */
 .coverage-cell {
   position: relative;
-  min-width: 140px;
+  min-width: 128px;
 }
 
 /* The coverage scale runs light-at-high (see coverageColor), so the bar needs
@@ -171,4 +174,202 @@
 
 .streets-no-link {
   color: #999;
+}
+
+/* ── Exploration controls (issue #188) ─────────────────────────────────────
+   Search, filters, the column preset/picker and the distribution strip. The
+   whole region is rendered by table-controls.js; nothing here is authored in
+   the HTML. */
+
+.controls-region {
+  margin-bottom: 16px;
+}
+
+.table-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 10px 16px;
+  padding: 12px 14px;
+  background: #fff;
+  border-radius: 6px;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.15);
+}
+
+.control {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 13px;
+}
+
+.control label,
+.control-legend {
+  color: #555;
+  font-size: 12px;
+}
+
+.control input,
+.control select {
+  font: inherit;
+  font-size: 13px;
+  padding: 4px 6px;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  background: #fff;
+  color: #222;
+}
+
+.control-search input {
+  min-width: 220px;
+}
+
+/* Two bounds on one line; each input stays wide enough for a 4-digit figure
+   plus the spinner the browser adds to number inputs. */
+.control-range {
+  flex-direction: row;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.control-range .control-legend {
+  flex-basis: 100%;
+}
+
+.control-range input {
+  width: 78px;
+}
+
+.control-dash {
+  color: #999;
+}
+
+/* A checkbox reads as a control + label on one line, not stacked. */
+.control-check {
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+  align-self: flex-end;
+  padding-bottom: 5px;
+}
+
+.control-check label {
+  font-size: 13px;
+  color: #222;
+}
+
+.col-picker {
+  position: relative; /* the open panel positions against this, not the page */
+  font-size: 13px;
+  align-self: flex-end;
+  padding-bottom: 4px;
+}
+
+.col-picker summary {
+  cursor: pointer;
+  color: #1a6b1d;
+  font-weight: bold;
+}
+
+/* Floated over the table rather than pushing it down, so opening the picker
+   does not reflow the rows you are reading. */
+.col-picker .col-panel {
+  position: absolute;
+  z-index: 5;
+  left: 0;
+  margin-top: 6px;
+  padding: 10px 12px;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  background: #fff;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+}
+
+.col-picker .col-panel fieldset {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(140px, 1fr));
+  gap: 2px 14px;
+  margin: 0 0 8px;
+  padding: 0;
+  border: 0;
+}
+
+.col-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.col-picker .col-reset,
+.controls-clear {
+  font: inherit;
+  font-size: 12px;
+  padding: 4px 8px;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  background: #f7f7f7;
+  color: #333;
+  cursor: pointer;
+}
+
+.controls-clear {
+  align-self: flex-end;
+}
+
+.controls-clear:hover,
+.col-picker .col-reset:hover {
+  background: #ececec;
+}
+
+.control input:focus-visible,
+.control select:focus-visible,
+.col-picker summary:focus-visible,
+.controls-clear:focus-visible,
+.col-reset:focus-visible,
+.col-toggle input:focus-visible {
+  outline: 2px solid #1a73e8;
+  outline-offset: 1px;
+}
+
+/* ── Distribution strip ────────────────────────────────────────────────────
+   A histogram of the ACTIVE SORT COLUMN over the CURRENTLY FILTERED rows, so
+   it describes what you have selected rather than the whole table. Single
+   series, so: one flat hue, no legend, no axis furniture. Deliberately not
+   painted with coverageColor — these bars encode row counts, and reusing the
+   coverage ramp would imply the height meant coverage. */
+
+.distribution-strip {
+  margin-top: 10px;
+  padding: 10px 14px;
+  background: #fff;
+  border-radius: 6px;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.15);
+}
+
+.strip-bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px; /* the surface gap that keeps adjacent bars readable as separate */
+  height: 40px;
+}
+
+.strip-bar {
+  flex: 1;
+  min-width: 2px;
+  background: #6c8ba0; /* 3.6:1 on the white surface — above the 3:1 floor */
+  border-radius: 2px 2px 0 0; /* rounded data-end, anchored to the baseline */
+}
+
+.strip-summary {
+  margin: 6px 0 0;
+  color: #555;
+  font-size: 12px;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .strip-bar {
+    transition: height 120ms ease-out;
+  }
 }

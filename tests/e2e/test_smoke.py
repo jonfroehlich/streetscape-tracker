@@ -731,3 +731,194 @@ def test_city_page_change_overlay_draws_the_published_diff(page: Page, base_url)
     _expect_pane_ink(page, "diffOverlay", drawn=True)
 
     assert errors == []
+
+
+# ── Exploration chassis (issue #188) ──────────────────────────────────────────
+# The pure logic (filter predicates, URL round-trip, bucketing, preset
+# resolution) is unit-tested offline in www/js/__tests__/table-controls.test.js.
+# What can only be checked in a real browser is the wiring: that a control
+# actually narrows the rendered table, that reloading the URL the page wrote
+# reproduces the view, and that the default column set fits without pushing the
+# page sideways.
+
+
+def test_table_search_and_filters_narrow_the_rendered_rows(page: Page, base_url):
+    """Typing in the search box and setting a filter must change what is in the
+    tbody — and the caption must say "N of M" rather than continuing to report
+    the full dataset."""
+    errors = _capture_errors(page)
+    page.goto(f"{base_url}/streets.html")
+    rows = page.locator("#streets-tbody tr")
+    expect(rows).to_have_count(2)
+
+    # Free-text search is debounced, so assert on the settled state.
+    page.locator("#table-search").fill("map ville")
+    expect(rows).to_have_count(1)
+    expect(rows.first).to_contain_text("Map Ville")
+    expect(page.locator("#streets-caption")).to_contain_text("1 of 2")
+
+    # Clearing restores every row and the unqualified caption.
+    page.locator(".controls-clear").click()
+    expect(rows).to_have_count(2)
+    expect(page.locator("#streets-caption")).to_contain_text("2 published road-walk collections")
+
+    # A structured filter narrows the same way.
+    page.locator('select[data-filter="provider"]').select_option("mapillary")
+    expect(rows).to_have_count(1)
+    expect(rows.first).to_contain_text("Mapillary")
+
+    assert errors == []
+
+
+def test_range_filter_excludes_rows_with_no_measured_value(page: Page, base_url):
+    """A numeric window is a question about a measured quantity: the Mapillary
+    fixture walk is 0.0% by 360° pano, so a 50–100 window must drop it rather
+    than treating "no imagery" as somewhere in range."""
+    errors = _capture_errors(page)
+    page.goto(f"{base_url}/streets.html")
+    rows = page.locator("#streets-tbody tr")
+
+    page.locator('input[data-filter="cov"][data-bound="min"]').fill("50")
+    expect(rows).to_have_count(1)
+    expect(rows.first).to_contain_text("Alpha City")
+
+    assert errors == []
+
+
+def test_the_view_round_trips_through_the_url(page: Page, base_url):
+    """The address bar carries the whole view, so a finding can be linked. The
+    page writes it with replaceState; reloading that exact URL must reproduce
+    the filtered, sorted, preset-selected table."""
+    errors = _capture_errors(page)
+    page.goto(f"{base_url}/streets.html")
+    rows = page.locator("#streets-tbody tr")
+
+    page.locator('select[data-filter="provider"]').select_option("gsv")
+    page.locator("#table-preset").select_option("kilometres")
+    page.locator('th[data-key="label"] button').click()
+    expect(rows).to_have_count(1)
+
+    shared_url = page.url
+    assert "provider=gsv" in shared_url
+    assert "preset=kilometres" in shared_url
+    assert "sort=label" in shared_url
+
+    # Reload the link cold: the controls, the column set and the sort all come
+    # back, not just the row filter.
+    page.goto(shared_url)
+    expect(page.locator("#streets-tbody tr")).to_have_count(1)
+    expect(page.locator('select[data-filter="provider"]')).to_have_value("gsv")
+    expect(page.locator("#table-preset")).to_have_value("kilometres")
+    expect(page.locator('th[data-key="label"]')).to_have_attribute("aria-sort", "ascending")
+    # The Kilometres preset shows street length and hides the Walked date.
+    expect(page.locator('th[data-key="lengthKm"]')).to_have_count(1)
+    expect(page.locator('th[data-key="runDate"]')).to_have_count(0)
+
+    assert errors == []
+
+
+def test_sorting_survives_a_column_preset_change(page: Page, base_url):
+    """The regression the delegated header listener exists for: switching
+    presets re-renders the <thead>, which would destroy click handlers bound to
+    each button at construction — leaving headers that look sortable and are
+    not."""
+    errors = _capture_errors(page)
+    page.goto(f"{base_url}/streets.html")
+
+    # Kilometres keeps the sorted column (pct), so the sort carries across the
+    # re-render rather than being reset by the drop-the-sorted-column fallback.
+    page.locator("#table-preset").select_option("kilometres")
+    expect(page.locator('th[data-key="pct"]')).to_have_attribute("aria-sort", "descending")
+
+    page.locator('th[data-key="label"] button').click()
+    expect(page.locator('th[data-key="label"]')).to_have_attribute("aria-sort", "ascending")
+    expect(page.locator("#streets-tbody tr").first).to_contain_text("Alpha City")
+
+    page.locator('th[data-key="label"] button').click()
+    expect(page.locator('th[data-key="label"]')).to_have_attribute("aria-sort", "descending")
+    expect(page.locator("#streets-tbody tr").first).to_contain_text("Map Ville")
+
+    assert errors == []
+
+
+def test_dropping_the_sorted_column_falls_back_to_a_visible_one(page: Page, base_url):
+    """A preset that omits the active sort column must not leave the table
+    ordered by something the reader can no longer see."""
+    errors = _capture_errors(page)
+    page.goto(f"{base_url}/streets.html")
+    expect(page.locator('th[data-key="pct"]')).to_have_attribute("aria-sort", "descending")
+
+    # Network drops the coverage column entirely.
+    page.locator("#table-preset").select_option("network")
+    expect(page.locator('th[data-key="pct"]')).to_have_count(0)
+    expect(page.locator('th[data-key="label"]')).to_have_attribute("aria-sort", "ascending")
+
+    assert errors == []
+
+
+def test_column_picker_adds_and_drops_columns(page: Page, base_url):
+    errors = _capture_errors(page)
+    page.goto(f"{base_url}/grid.html")
+
+    # "Grid points" is not in the default Overview preset.
+    expect(page.locator('th[data-key="searchPoints"]')).to_have_count(0)
+    page.locator(".col-picker summary").click()
+    page.locator('input[data-column="searchPoints"]').check()
+    expect(page.locator('th[data-key="searchPoints"]')).to_have_count(1)
+    # The fixture publishes total_search_points = 4 for Alpha City.
+    expect(page.locator("#grid-tbody tr", has_text="Alpha City")).to_contain_text("4")
+
+    page.locator(".col-reset").click()
+    expect(page.locator('th[data-key="searchPoints"]')).to_have_count(0)
+
+    assert errors == []
+
+
+def test_distribution_strip_describes_the_sorted_column(page: Page, base_url):
+    """The strip is a histogram of the ACTIVE SORT COLUMN over the CURRENTLY
+    FILTERED rows. Its bars are decorative; the summary sentence beside them is
+    the accessible equivalent and must track both."""
+    errors = _capture_errors(page)
+    page.goto(f"{base_url}/streets.html")
+
+    summary = page.locator("#distribution-strip .strip-summary")
+    expect(summary).to_contain_text("360° street-km across 2 rows")
+
+    # Re-sorting repoints the strip at the newly sorted column.
+    page.locator('th[data-key="medianAge"] button').click()
+    expect(summary).to_contain_text("Median age")
+
+    # Filtering repoints it at the narrowed set.
+    page.locator('select[data-filter="provider"]').select_option("gsv")
+    expect(summary).to_contain_text("across 1 rows")
+
+    assert errors == []
+
+
+@pytest.mark.parametrize("path", ["grid.html", "streets.html"])
+def test_default_columns_fit_without_scrolling_the_page_sideways(page: Page, base_url, path):
+    """Both tables scrolled horizontally before #188, which is treated as a bug
+    rather than a layout choice. The default preset exists to fit the page's
+    1200px measure at desktop width."""
+    errors = _capture_errors(page)
+    page.set_viewport_size({"width": 1440, "height": 900})
+    page.goto(f"{base_url}/{path}")
+    expect(page.locator("tbody tr").first).to_be_visible()
+
+    # The document itself must not scroll sideways...
+    overflow = page.evaluate(
+        "() => document.documentElement.scrollWidth - document.documentElement.clientWidth"
+    )
+    assert overflow <= 0, f"{path} scrolls sideways by {overflow}px at 1440px wide"
+
+    # ...nor may the table overflow its own scroll container, which is the
+    # narrow-viewport safety net rather than the desktop layout.
+    table_overflow = page.evaluate(
+        """() => {
+             const wrap = document.querySelector('.streets-table-wrap');
+             return wrap.scrollWidth - wrap.clientWidth;
+           }"""
+    )
+    assert table_overflow <= 0, f"{path} table overflows its container by {table_overflow}px"
+
+    assert errors == []

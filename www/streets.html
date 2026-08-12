@@ -61,8 +61,11 @@
         so cities appear here as they are walked and are refreshed each cycle.
         Google Street View costs one metadata request per sample point (a large
         city runs to a few hundred thousand), while Mapillary is derived from
-        its vector-tile census — so Mapillary cities fill in faster. Sort any
-        column by clicking its header.
+        its vector-tile census — so Mapillary cities fill in faster.
+        Search, filter and re-sort to narrow the table; the strip below the
+        controls shows how the sorted column is distributed across the rows
+        currently in view, and the address bar always carries the view you are
+        looking at so it can be shared.
       </p>
     </div>
 
@@ -70,52 +73,20 @@
       Loading street-level collections…
     </div>
 
+    <!-- Search, filters, column preset/picker and the distribution strip are
+         rendered into this container by table-controls.js once the data has
+         loaded (issue #188). -->
+    <div id="streets-controls" class="controls-region"></div>
+
     <div id="streets-table-wrap" class="streets-table-wrap" hidden>
       <table class="streets-table">
         <caption id="streets-caption"></caption>
-        <!-- Sortable headers: the <button> is what carries the click and the
-             keyboard focus (a bare click handler on <th> is unreachable by
-             keyboard); streets.js keeps aria-sort in step with the active
-             column. The ▲/▼ glyph is decorative, hence aria-hidden. -->
-        <thead>
-          <tr>
-            <th scope="col" data-key="label" aria-sort="none">
-              <button type="button">City <span class="sort-arrow" aria-hidden="true"></span></button>
-            </th>
-            <th scope="col" data-key="providerLabel" aria-sort="none">
-              <button type="button">Provider <span class="sort-arrow" aria-hidden="true"></span></button>
-            </th>
-            <th scope="col" data-key="networkLabel" aria-sort="none">
-              <button type="button" title="Which OSM network was walked. &quot;Roads&quot; is motorized public roads only; &quot;Roads + paths&quot; also covers alleys, footpaths, park trails, cycleways and steps. Coverage percentages are only comparable within the same network.">
-                Network <span class="sort-arrow" aria-hidden="true"></span></button>
-            </th>
-            <th scope="col" data-key="runDate" aria-sort="none">
-              <button type="button">Walked <span class="sort-arrow" aria-hidden="true"></span></button>
-            </th>
-            <th scope="col" data-key="spacing" aria-sort="none">
-              <button type="button">Sample spacing <span class="sort-arrow" aria-hidden="true"></span></button>
-            </th>
-            <th scope="col" data-key="pct" aria-sort="none">
-              <button type="button" title="Share of street-km covered by 360° imagery">
-                360° street-km <span class="sort-arrow" aria-hidden="true"></span></button>
-            </th>
-            <th scope="col" data-key="pctAny" aria-sort="none">
-              <button type="button" title="Including flat/perspective imagery; equals the 360° number for Google Street View">
-                Any imagery <span class="sort-arrow" aria-hidden="true"></span></button>
-            </th>
-            <th scope="col" data-key="changeDelta" aria-sort="none">
-              <button type="button" title="Change in 360° street-km coverage since the previous walk of this city, in percentage points. Blank for first walks.">
-                Δ coverage <span class="sort-arrow" aria-hidden="true"></span></button>
-            </th>
-            <th scope="col" data-key="edges" aria-sort="none">
-              <button type="button">Streets <span class="sort-arrow" aria-hidden="true"></span></button>
-            </th>
-            <th scope="col" data-key="fullyCovered" aria-sort="none">
-              <button type="button">Fully covered <span class="sort-arrow" aria-hidden="true"></span></button>
-            </th>
-            <th scope="col"><span class="visually-hidden">Link to city map</span></th>
-          </tr>
-        </thead>
+        <!-- Header cells are rendered by table-utils.js from the page's column
+             descriptors (STREETS_COLUMNS), not authored here: column presets
+             change the visible set at runtime, so the header and the body have
+             to come from one list or they drift. Sorting is delegated from this
+             element, which is why it survives a re-render. -->
+        <thead id="streets-thead"></thead>
         <tbody id="streets-tbody"></tbody>
       </table>
     </div>
@@ -127,6 +98,7 @@
           crossorigin="anonymous"></script>
   <script src="js/streetscape-utils.js"></script>
   <script src="js/table-utils.js"></script>
+  <script src="js/table-controls.js"></script>
   <script src="js/streets.js"></script>
 </body>
 </html>

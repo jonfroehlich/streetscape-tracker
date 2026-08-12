@@ -19,8 +19,9 @@
  *
  * Depends on globals from streetscape-utils.js (loaded first): PROVIDERS,
  * STREETSCAPE_DATA_BASE_URL, fetchGzippedJson, fetchStreetwalkManifest,
- * adaptCitiesPayload, escapeHtml — and from table-utils.js: cityDisplayLabel,
- * sortRowsBy, formatCellNumber, coverageCellHtml, createSortableTable.
+ * adaptCitiesPayload, escapeHtml — from table-utils.js: cityDisplayLabel,
+ * sortRowsBy, formatCellNumber, coverageCellHtml, createSortableTable — and
+ * from table-controls.js: createTableControls.
  */
 
 // ── Display helpers ───────────────────────────────────────────
@@ -70,29 +71,307 @@ function indexCitiesByProvider(rawCities, providers) {
   return index;
 }
 
+/** Format a nullable number for a table cell (table-utils alias). */
+function num(value, digits = 0) {
+  return formatCellNumber(value, digits);
+}
+
 /**
- * The sortable columns, in table order. `key` is the row-model field, `type`
- * picks the comparator, and `initial` is the direction a first click applies
- * (numbers read best-first, text reads A–Z).
+ * Cell for the "since last walk" coverage delta: an em-dash for a first walk
+ * (no change block in the manifest), else a signed percentage-point figure
+ * whose title carries the comparison date and the edge churn behind it.
+ *
+ * @param {Object} row - From toRowModel.
+ * @returns {string} HTML for one <td>.
+ */
+function walkChangeCellHtml(row) {
+  if (row.changeDelta == null) return `<td>—</td>`;
+  const sign = row.changeDelta >= 0 ? "+" : "";
+  const title =
+    `Since ${row.change.from}: ${row.change.edges_gained_coverage ?? 0} streets gained ` +
+    `coverage, ${row.change.edges_lost_coverage ?? 0} lost it`;
+  return `<td title="${escapeHtml(title)}">${sign}${row.changeDelta.toFixed(1)} pp</td>`;
+}
+
+/**
+ * Cell for the "View on map" link.
+ *
+ * The link carries THIS row's network type: city.html selects the walk to draw
+ * by network type and defaults to 'drive', so without it a "Roads + paths" row
+ * would open the city's drive walk instead — or, for a city walked only
+ * broadly, fall all the way back to the grid-attribution artifact, a different
+ * metric entirely. Advertising a row the link cannot reach is worse than not
+ * listing it.
+ *
+ * @param {Object} row - From toRowModel.
+ * @returns {string} HTML for one <td>.
+ */
+function walkLinkCellHtml(row) {
+  const link = row.filename
+    ? `<a class="streets-view-link"
+          href="city.html?file=${encodeURIComponent(row.filename)}&network=${encodeURIComponent(
+        row.networkType
+      )}">View on map</a>`
+    : `<span class="streets-no-link" title="This city has no published run to link to">—</span>`;
+  return `<td>${link}</td>`;
+}
+
+/**
+ * The columns, in table order.
+ *
+ * `key` is the row-model field, `type` picks the comparator, `initial` is the
+ * direction a first click applies (numbers read best-first, text reads A–Z),
+ * and `cell(row)` renders that column's own cell — the header and the body are
+ * both generated from this list so they cannot drift (see table-utils.js).
+ *
+ * `unit`/`digits` are read by the distribution strip; `title` becomes the
+ * header tooltip (these lived in streets.html before the header became
+ * JS-rendered).
+ *
+ * City/state/country names come from OSM/Nominatim (publicly editable
+ * third-party data) — escape everything data-derived entering innerHTML.
  */
 const STREET_COLUMNS = [
-  { key: "label", label: "City", type: "text", initial: "asc" },
-  { key: "providerLabel", label: "Provider", type: "text", initial: "asc" },
+  {
+    key: "label",
+    label: "City",
+    type: "text",
+    initial: "asc",
+    always: true,
+    cell: (r) => `<th scope="row">${escapeHtml(r.label)}</th>`,
+  },
+  {
+    key: "providerLabel",
+    label: "Provider",
+    type: "text",
+    initial: "asc",
+    cell: (r) => `<td>${escapeHtml(r.providerLabel)}</td>`,
+  },
   // Which OSM network was walked. Without this column two rows for one city
   // would look like duplicates, when in fact their coverage percentages divide
   // by different street-km denominators and are not comparable.
-  { key: "networkLabel", label: "Network", type: "text", initial: "asc" },
-  { key: "runDate", label: "Walked", type: "text", initial: "desc" },
-  { key: "spacing", label: "Sample spacing", type: "number", initial: "asc" },
-  { key: "pct", label: "Street-km covered", type: "number", initial: "desc" },
-  { key: "pctAny", label: "Any imagery", type: "number", initial: "desc" },
+  {
+    key: "networkLabel",
+    label: "Network",
+    type: "text",
+    initial: "asc",
+    title:
+      "Which OSM network was walked. &quot;Roads&quot; is motorized public roads only; " +
+      "&quot;Roads + paths&quot; also covers alleys, footpaths, park trails, cycleways and " +
+      "steps. Coverage percentages are only comparable within the same network.",
+    cell: (r) => `<td>${escapeHtml(r.networkLabel)}</td>`,
+  },
+  {
+    key: "runDate",
+    label: "Walked",
+    type: "text",
+    initial: "desc",
+    cell: (r) => `<td>${escapeHtml(r.runDate ?? "—")}</td>`,
+  },
+  {
+    key: "spacing",
+    label: "Sample spacing",
+    type: "number",
+    initial: "asc",
+    unit: " m",
+    cell: (r) => `<td>${r.spacing == null ? "—" : `${num(r.spacing)} m`}</td>`,
+  },
+  {
+    key: "pct",
+    label: "360° street-km",
+    type: "number",
+    initial: "desc",
+    unit: "%",
+    title: "Share of street-km covered by 360° imagery",
+    cell: (r) => coverageCellHtml(r.pct),
+  },
+  {
+    key: "pctAny",
+    label: "Any imagery",
+    type: "number",
+    initial: "desc",
+    unit: "%",
+    title:
+      "Including flat/perspective imagery; equals the 360° number for Google Street View",
+    cell: (r) => coverageCellHtml(r.pctAny),
+  },
   // "Since last walk" coverage delta (issue #101), from the manifest's
   // optional change block. Null for first walks — most cities, until their
   // second walk lands — which the number comparator sorts to the end.
-  { key: "changeDelta", label: "Δ coverage", type: "number", initial: "desc" },
-  { key: "edges", label: "Streets", type: "number", initial: "desc" },
-  { key: "fullyCovered", label: "Fully covered", type: "number", initial: "desc" },
+  {
+    key: "changeDelta",
+    label: "Δ coverage",
+    type: "number",
+    initial: "desc",
+    unit: " pp",
+    title:
+      "Change in 360° street-km coverage since the previous walk of this city, in " +
+      "percentage points. Blank for first walks.",
+    cell: walkChangeCellHtml,
+  },
+  // Absolute street length (schema v12, issue #189). A share cannot be turned
+  // back into kilometres without its denominator — 74.5% of Corvallis is 873 km
+  // and the same 74.5% of a village is 5 km — and deployment estimates are
+  // quoted in km, not percent.
+  {
+    key: "lengthKm",
+    label: "Street km",
+    type: "number",
+    initial: "desc",
+    unit: " km",
+    digits: 1,
+    title: "Total length of the walked network, in kilometres",
+    cell: (r) => `<td>${r.lengthKm == null ? "—" : `${num(r.lengthKm, 1)} km`}</td>`,
+  },
+  {
+    key: "lengthKmCovered",
+    label: "Covered km",
+    type: "number",
+    initial: "desc",
+    unit: " km",
+    digits: 1,
+    title: "Kilometres of street covered by 360° imagery",
+    cell: (r) => `<td>${r.lengthKmCovered == null ? "—" : `${num(r.lengthKmCovered, 1)} km`}</td>`,
+  },
+  {
+    key: "lengthKmCoveredAny",
+    label: "Covered km (any)",
+    type: "number",
+    initial: "desc",
+    unit: " km",
+    digits: 1,
+    title: "Kilometres of street covered by any imagery, including flat/perspective",
+    cell: (r) =>
+      `<td>${r.lengthKmCoveredAny == null ? "—" : `${num(r.lengthKmCoveredAny, 1)} km`}</td>`,
+  },
+  {
+    key: "medianAge",
+    label: "Median age",
+    type: "number",
+    initial: "asc",
+    unit: " yrs",
+    digits: 1,
+    title:
+      "Median age of the imagery covering this walk's streets. Stored rather than " +
+      "derived — a median of the per-class medians is not the median.",
+    cell: (r) => `<td>${r.medianAge == null ? "—" : `${num(r.medianAge, 1)} yrs`}</td>`,
+  },
+  {
+    key: "edges",
+    label: "Streets",
+    type: "number",
+    initial: "desc",
+    cell: (r) => `<td>${num(r.edges)}</td>`,
+  },
+  {
+    key: "fullyCovered",
+    label: "Fully covered",
+    type: "number",
+    initial: "desc",
+    cell: (r) => `<td>${num(r.fullyCovered)}</td>`,
+  },
+  {
+    key: "actions",
+    label: "",
+    sortable: false,
+    always: true,
+    srLabel: "Link to city map",
+    cell: walkLinkCellHtml,
+  },
 ];
+
+/**
+ * Column presets. The first is the default and must fit the page's 1200px
+ * measure without horizontal scrolling — that is what these exist for.
+ */
+const STREET_PRESETS = [
+  {
+    id: "overview",
+    label: "Overview",
+    title: "The headline read: who walked what, how much of it, and how fresh",
+    // pctAny stays in the default view: the 360°-vs-any-imagery split (issue
+    // #116) is the page's headline distinction for Mapillary, not a detail to
+    // be discovered behind a preset.
+    columns: [
+      "providerLabel",
+      "networkLabel",
+      "runDate",
+      "pct",
+      "pctAny",
+      "lengthKm",
+      "medianAge",
+    ],
+  },
+  {
+    id: "kilometres",
+    label: "Kilometres",
+    title: "Absolute street length rather than shares (schema v12)",
+    columns: ["providerLabel", "pct", "pctAny", "lengthKm", "lengthKmCovered", "lengthKmCoveredAny"],
+  },
+  {
+    id: "change",
+    label: "Change",
+    title: "Walk-to-walk movement (issue #101); blank until a city's second walk lands",
+    columns: ["providerLabel", "networkLabel", "runDate", "pct", "changeDelta", "lengthKm"],
+  },
+  {
+    id: "network",
+    label: "Network",
+    title: "The shape of the walked network itself",
+    columns: ["providerLabel", "networkLabel", "spacing", "edges", "fullyCovered", "lengthKm"],
+  },
+];
+
+/** Filters offered above the table. */
+const STREET_FILTERS = [
+  {
+    key: "provider",
+    label: "Provider",
+    type: "select",
+    anyLabel: "All providers",
+    options: [
+      { value: "gsv", label: "Google Street View" },
+      { value: "mapillary", label: "Mapillary" },
+    ],
+    test: (row, value) => row.provider === value,
+  },
+  {
+    key: "network",
+    label: "Network",
+    type: "select",
+    anyLabel: "All networks",
+    options: [
+      { value: "drive", label: "Roads" },
+      { value: "all_public", label: "Roads + paths" },
+    ],
+    test: (row, value) => row.networkType === value,
+  },
+  {
+    key: "cov",
+    label: "360° street-km %",
+    type: "range",
+    field: "pct",
+    min: 0,
+    max: 100,
+  },
+  {
+    key: "km",
+    label: "Street km",
+    type: "range",
+    field: "lengthKm",
+    min: 0,
+  },
+  {
+    key: "changed",
+    label: "Has Δ coverage",
+    type: "boolean",
+    title: "Only cities walked at least twice, so a change could be computed (issue #101)",
+    test: (row) => row.changeDelta != null,
+  },
+];
+
+/** Row fields the free-text search box looks at. */
+const STREET_SEARCH_FIELDS = ["label", "cityId", "providerLabel", "networkLabel"];
 
 /** Default sort: best 360° coverage first (what the page opens on). */
 const DEFAULT_SORT = { key: "pct", dir: "desc" };
@@ -135,6 +414,16 @@ function toRowModel(walk, city, labelSource = null) {
     // for first walks, so both stay null and the cell renders an em-dash.
     change: walk.change ?? null,
     changeDelta: walk.change?.coverage_pct_by_length_delta ?? null,
+    // Absolute lengths and median covered age (schema v12). NULL on walks
+    // cataloged before v12 and not yet backfilled.
+    lengthKm: walk.length_km ?? null,
+    lengthKmCovered: walk.length_km_covered ?? null,
+    lengthKmCoveredAny: walk.length_km_covered_any ?? null,
+    medianAge: walk.median_covered_age_years ?? null,
+    // Per-highway-class breakdown, absent-not-null in the manifest. Carried on
+    // the row model for the class-level filter now and the row expansion in
+    // the follow-up PR.
+    coverageByHighway: walk.coverage_by_highway ?? null,
     edges: walk.edges ?? null,
     fullyCovered: walk.edges_fully_covered ?? null,
     filename: city?.data_file?.filename ?? null,
@@ -154,71 +443,23 @@ function sortRows(rows, key, dir = "desc") {
   return sortRowsBy(STREET_COLUMNS, rows, key, dir);
 }
 
-/** Format a nullable number for a table cell (table-utils alias). */
-function num(value, digits = 0) {
-  return formatCellNumber(value, digits);
-}
-
 // ── Rendering ─────────────────────────────────────────────────
-
-/**
- * Cell for the "since last walk" coverage delta: an em-dash for a first walk
- * (no change block in the manifest), else a signed percentage-point figure
- * whose title carries the comparison date and the edge churn behind it.
- *
- * @param {Object} row - From toRowModel.
- * @returns {string} HTML for one <td>.
- */
-function walkChangeCellHtml(row) {
-  if (row.changeDelta == null) return `<td>—</td>`;
-  const sign = row.changeDelta >= 0 ? "+" : "";
-  const title =
-    `Since ${row.change.from}: ${row.change.edges_gained_coverage ?? 0} streets gained ` +
-    `coverage, ${row.change.edges_lost_coverage ?? 0} lost it`;
-  return `<td title="${escapeHtml(title)}">${sign}${row.changeDelta.toFixed(1)} pp</td>`;
-}
 
 /**
  * Build one table row from a row model.
  *
  * @param {Object} row - From toRowModel.
+ * @param {Object[]} [columns] - Visible columns; defaults to all of them.
  * @returns {string} HTML for one <tr>.
  */
-function walkRowHtml(row) {
-  // The link carries THIS row's network type: city.html selects the walk to
-  // draw by network type and defaults to 'drive', so without it a "Roads +
-  // paths" row would open the city's drive walk instead — or, for a city walked
-  // only broadly, fall all the way back to the grid-attribution artifact, a
-  // different metric entirely. Advertising a row the link cannot reach is worse
-  // than not listing it.
-  const link = row.filename
-    ? `<a class="streets-view-link"
-          href="city.html?file=${encodeURIComponent(row.filename)}&network=${encodeURIComponent(
-        row.networkType
-      )}">View on map</a>`
-    : `<span class="streets-no-link" title="This city has no published run to link to">—</span>`;
-
-  // City/state/country names come from OSM/Nominatim (publicly editable
-  // third-party data) — escape everything data-derived entering innerHTML.
-  return `
-    <tr>
-      <th scope="row">${escapeHtml(row.label)}</th>
-      <td>${escapeHtml(row.providerLabel)}</td>
-      <td>${escapeHtml(row.networkLabel)}</td>
-      <td>${escapeHtml(row.runDate ?? "—")}</td>
-      <td>${row.spacing == null ? "—" : `${num(row.spacing)} m`}</td>
-      ${coverageCellHtml(row.pct)}
-      ${coverageCellHtml(row.pctAny)}
-      ${walkChangeCellHtml(row)}
-      <td>${num(row.edges)}</td>
-      <td>${num(row.fullyCovered)}</td>
-      <td>${link}</td>
-    </tr>`;
+function walkRowHtml(row, columns = STREET_COLUMNS) {
+  return rowHtmlFromColumns(columns, row);
 }
 
-// The table controller (created on first render so a header click can
-// re-sort without refetching or re-joining).
+// The table + controls controllers (created on first render so a header click
+// or a filter change can repaint without refetching or re-joining).
 let streetsTable = null;
+let streetsControls = null;
 
 /**
  * Render the table (or the empty state) from a manifest + aggregate.
@@ -253,20 +494,46 @@ function renderStreetWalks(manifest, rawCities) {
   streetsTable ??= createSortableTable({
     columns: STREET_COLUMNS,
     defaultSort: DEFAULT_SORT,
-    wrapEl,
+    theadEl: document.getElementById("streets-thead"),
     tbodyEl: document.getElementById("streets-tbody"),
-    rowHtml: walkRowHtml,
   });
-  streetsTable.setRows(rows);
-
-  document.getElementById("streets-caption").textContent =
-    `${walks.length} published road-walk collection${walks.length === 1 ? "" : "s"}` +
-    (manifest.generated_at
-      ? ` · manifest updated ${new Date(manifest.generated_at).toLocaleString()}`
-      : "");
+  streetsControls ??= createTableControls({
+    rootEl: document.getElementById("streets-controls"),
+    table: streetsTable,
+    columns: STREET_COLUMNS,
+    presets: STREET_PRESETS,
+    filters: STREET_FILTERS,
+    searchFields: STREET_SEARCH_FIELDS,
+    onChange: (shown, all) => updateStreetsCaption(shown, all, manifest),
+  });
+  streetsControls.setRows(rows);
 
   statusEl.hidden = true;
   wrapEl.hidden = false;
+}
+
+/**
+ * Keep the caption reporting what is actually on screen.
+ *
+ * The count is the live result count for the current filters, so it must say
+ * how many of how many — a bare "12 collections" after a filter reads as the
+ * whole dataset.
+ *
+ * @param {Object[]} shown - Filtered rows.
+ * @param {Object[]} all - Every row.
+ * @param {?Object} manifest - For the generated-at stamp.
+ */
+function updateStreetsCaption(shown, all, manifest) {
+  const noun = `road-walk collection${all.length === 1 ? "" : "s"}`;
+  const counts =
+    shown.length === all.length
+      ? `${all.length} published ${noun}`
+      : `${shown.length} of ${all.length} published ${noun}`;
+  document.getElementById("streets-caption").textContent =
+    counts +
+    (manifest?.generated_at
+      ? ` · manifest updated ${new Date(manifest.generated_at).toLocaleString()}`
+      : "");
 }
 
 // ── Data loading ──────────────────────────────────────────────
@@ -310,7 +577,11 @@ if (typeof module !== "undefined" && module.exports) {
     walkChangeCellHtml,
     walkRowHtml,
     renderStreetWalks,
+    updateStreetsCaption,
     STREET_COLUMNS,
+    STREET_PRESETS,
+    STREET_FILTERS,
+    STREET_SEARCH_FIELDS,
     DEFAULT_SORT,
   };
 }

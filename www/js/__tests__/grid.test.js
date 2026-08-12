@@ -67,21 +67,34 @@ test("gridRowModel: missing stats become nulls, never NaN or 'undefined'", () =>
 });
 
 test("every sortable column key exists on a row model", () => {
-  // Guards the html/js seam: a th[data-key] with no matching model field
-  // would silently sort every row as null.
+  // Guards the column/model seam: a sortable column with no matching model
+  // field would silently sort every row as null.
   const row = gridRowModel(SEATTLE);
-  for (const col of GRID_COLUMNS) {
+  for (const col of GRID_COLUMNS.filter((c) => c.sortable !== false)) {
     assert.ok(col.key in row, `row model is missing ${col.key}`);
   }
   assert.ok(GRID_COLUMNS.some((c) => c.key === GRID_DEFAULT_SORT.key));
 });
 
+test("every column can render a cell, including from a fully null row model", () => {
+  // The header and the body are both generated from GRID_COLUMNS now, so a
+  // column that throws on a sparse record takes the whole table down rather
+  // than rendering one bad cell.
+  const sparse = gridRowModel({ provider: "gsv", city_id: "x--y", city: "X" });
+  for (const col of GRID_COLUMNS) {
+    assert.equal(typeof col.cell, "function", `${col.key} has no cell renderer`);
+    assert.match(col.cell(sparse), /^<t[hd][\s>]/, `${col.key} did not render a cell`);
+  }
+});
+
 // --- gridRowHtml ------------------------------------------------------------
 
-test("gridRowHtml: one cell per column plus the link cell, linking to city.html", () => {
+test("gridRowHtml: one cell per column, linking to city.html", () => {
+  // The link column is now a GRID_COLUMNS entry like any other (it renders its
+  // own cell), so the count is exact rather than "columns plus one".
   const html = gridRowHtml(gridRowModel(SEATTLE));
   const cells = (html.match(/<t[hd][\s>]/g) || []).length;
-  assert.equal(cells, GRID_COLUMNS.length + 1);
+  assert.equal(cells, GRID_COLUMNS.length);
   assert.match(
     html,
     /href="city\.html\?file=seattle--wa_width_5000_height_5000_step_20_2026-07-05\.csv\.gz"/

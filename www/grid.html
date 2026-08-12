@@ -56,7 +56,10 @@
         once per provider. Coverage percentages are cross-provider
         comparable; raw panorama counts are not — GSV samples the nearest
         pano per grid point while Mapillary is a census of every 360° pano.
-        Sort any column by clicking its header.
+        Search, filter and re-sort to narrow the table; the strip below the
+        controls shows how the sorted column is distributed across the rows
+        currently in view, and the address bar always carries the view you are
+        looking at so it can be shared.
       </p>
     </div>
 
@@ -64,49 +67,20 @@
       Loading city collections…
     </div>
 
+    <!-- Search, filters, column preset/picker and the distribution strip are
+         rendered into this container by table-controls.js once the data has
+         loaded (issue #188). -->
+    <div id="grid-controls" class="controls-region"></div>
+
     <div id="grid-table-wrap" class="streets-table-wrap" hidden>
       <table class="streets-table">
         <caption id="grid-caption"></caption>
-        <!-- Sortable headers: the <button> is what carries the click and the
-             keyboard focus (a bare click handler on <th> is unreachable by
-             keyboard); table-utils.js keeps aria-sort in step with the active
-             column. The ▲/▼ glyph is decorative, hence aria-hidden. -->
-        <thead>
-          <tr>
-            <th scope="col" data-key="label" aria-sort="none">
-              <button type="button">City <span class="sort-arrow" aria-hidden="true"></span></button>
-            </th>
-            <th scope="col" data-key="providerLabel" aria-sort="none">
-              <button type="button" title="Imagery provider. Each provider is an independent run series on the same frozen grid.">
-                Provider <span class="sort-arrow" aria-hidden="true"></span></button>
-            </th>
-            <th scope="col" data-key="pct" aria-sort="none">
-              <button type="button" title="Share of the city's grid sample points with a 360° panorama">
-                Grid coverage <span class="sort-arrow" aria-hidden="true"></span></button>
-            </th>
-            <th scope="col" data-key="pctAny" aria-sort="none">
-              <button type="button" title="Including flat/perspective imagery (Mapillary); equals Grid coverage for Google Street View">
-                Any imagery <span class="sort-arrow" aria-hidden="true"></span></button>
-            </th>
-            <th scope="col" data-key="medianAge" aria-sort="none">
-              <button type="button" title="Median age of the city's panoramas at its latest snapshot">
-                Median age <span class="sort-arrow" aria-hidden="true"></span></button>
-            </th>
-            <th scope="col" data-key="panos" aria-sort="none">
-              <button type="button" title="Unique panoramas in the latest snapshot: official © Google panos for GSV, all 360° panos for Mapillary. Not comparable across providers (sample vs census).">
-                Panoramas <span class="sort-arrow" aria-hidden="true"></span></button>
-            </th>
-            <th scope="col" data-key="collected" aria-sort="none">
-              <button type="button" title="Date of the latest collection run — how fresh this row's data is">
-                Last collected <span class="sort-arrow" aria-hidden="true"></span></button>
-            </th>
-            <th scope="col" data-key="snapshots" aria-sort="none">
-              <button type="button" title="Number of dated collection runs; repeat runs enable change tracking over time">
-                Snapshots <span class="sort-arrow" aria-hidden="true"></span></button>
-            </th>
-            <th scope="col"><span class="visually-hidden">Link to city map</span></th>
-          </tr>
-        </thead>
+        <!-- Header cells are rendered by table-utils.js from the page's column
+             descriptors (GRID_COLUMNS), not authored here: column presets
+             change the visible set at runtime, so the header and the body have
+             to come from one list or they drift. Sorting is delegated from this
+             element, which is why it survives a re-render. -->
+        <thead id="grid-thead"></thead>
         <tbody id="grid-tbody"></tbody>
       </table>
     </div>
@@ -118,6 +92,7 @@
           crossorigin="anonymous"></script>
   <script src="js/streetscape-utils.js"></script>
   <script src="js/table-utils.js"></script>
+  <script src="js/table-controls.js"></script>
   <script src="js/grid.js"></script>
 </body>
 </html>
