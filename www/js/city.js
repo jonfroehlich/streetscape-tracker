@@ -1261,6 +1261,43 @@ function buildPopupHtml(captureDate, ageFormatted, panoId, photographer) {
 }
 
 /**
+ * Build a popup HTML string for a flat-only marker (issue #116).
+ *
+ * A FLAT_ONLY row is a presence marker: the grid point has flat/perspective
+ * imagery but no 360° pano. It carries the nearest flat image's id and
+ * copyright, but its capture_date is deliberately null — flat timestamps are
+ * kept out of every dated-stat path — so this popup shows no date or age.
+ * The image itself is still viewable, and `viewerUrl` takes any image key,
+ * pano or flat, so the deep-link works unchanged.
+ *
+ * Falls back to the bare explanation when the row carries no image id (every
+ * FLAT_ONLY row written to date does, but a link to nowhere is worse than none).
+ *
+ * @param {string} panoId - Mapillary image id, possibly empty.
+ * @param {string} photographer - Mapillary contributor credit, possibly empty.
+ * @returns {string} HTML string.
+ */
+function buildFlatOnlyPopupHtml(panoId, photographer) {
+  const provider = PROVIDERS[providerGlobal];
+  const note = "Flat imagery only — no 360° panorama here";
+  if (!panoId) return `<div style="font-family:sans-serif">${note}</div>`;
+  // photographer and panoId are third-party content straight from the CSV —
+  // both must be escaped before entering popup HTML (cf. buildPopupHtml).
+  return `
+    <div style="font-family:sans-serif">
+      ${note}<br><br>
+      ${photographer ? `<strong>Photographer:</strong> ${escapeHtml(photographer)}<br>` : ""}
+      <strong>Image ID:</strong> ${escapeHtml(panoId)}<br><br>
+      <a href="${provider.viewerUrl(panoId)}"
+         target="_blank" rel="noopener"
+         style="color:#2196F3;text-decoration:none">
+         ${provider.viewerLabel}
+      </a>
+    </div>
+  `;
+}
+
+/**
  * Load, decompress, and parse the CSV data file for the target city.
  *
  * Uses a native browser streaming pipeline to avoid V8's string-length
@@ -1498,7 +1535,8 @@ async function loadData() {
             weight: 0,
             fillOpacity: 0.55,
           });
-          flatMarker.bindPopup("Flat imagery only — no 360° panorama here");
+          flatMarker.bindPopup(
+            buildFlatOnlyPopupHtml(row.pano_id, row.copyright_info));
           flatOnlyMarkers.push(flatMarker);
           if (showFlatOnly) flatMarker.addTo(map);
           continue;
