@@ -37,3 +37,12 @@ __pycache__/
 # /archive/ — the publish rsync only walks data/, so nothing here can reach the
 # public web server. Inside the project root so CSE IT's snapshots cover it.
 /backups/
+# Claude Code. settings.json is shared project config and IS tracked (team
+# settings: permissions, hooks); the local override and worktree metadata are
+# per-machine. Claude Code normally protects settings.local.json by adding it
+# to the GLOBAL git excludes file (~/.config/git/ignore) on the machine where
+# it first writes one — which does not travel with the repo, so a checkout on
+# another host (makelab2 has no global excludes at all) would see it as an
+# ordinary untracked file and sweep it into a `git add -A`.
+.claude/settings.local.json
+.claude/worktrees/
