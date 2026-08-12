@@ -347,6 +347,13 @@ MAX_FAILED_TILE_FRACTION = 0.02
 _TILE_MAX_TRIES = 5
 _TILE_MAX_TIME_S = 120
 
+# Content types that are an error page rather than a tile (issue #199). A
+# DENY-list, not an allow-list of protobuf types: if Mapillary ever relabels
+# real tiles (say `application/vnd.mapbox-vector-tile`), an allow-list would
+# reject every tile and halt all collection, whereas this only ever misreads a
+# genuine tile if one is served as HTML or JSON.
+_TILE_ERROR_CONTENT_TYPES = ("text/html", "application/json")
+
 
 @backoff.on_exception(
     backoff.expo,
@@ -357,15 +364,46 @@ _TILE_MAX_TIME_S = 120
 async def _fetch_tile(
     session: aiohttp.ClientSession, url: str, timeout: aiohttp.ClientTimeout
 ) -> bytes:
-    async with session.get(url, timeout=timeout) as response:
+    # allow_redirects=False is load-bearing (issue #199). When the tile CDN
+    # rate-limits a host it answers 302 → www.mapillary.com/login/, and aiohttp
+    # follows redirects by default — so the login page's own perfectly good HTTP
+    # 200 passed the status checks below and 58 bytes of HTML reached the
+    # protobuf decoder. A host-wide block then read as `DecodeError: Error
+    # parsing message with type 'vector_tile.tile'`, i.e. as corrupt data.
+    async with session.get(url, timeout=timeout, allow_redirects=False) as response:
         if response.status in (401, 403):
             raise DownloadError(
                 f"Mapillary rejected the access token (HTTP {response.status}). "
                 "Check MAPILLARY_ACCESS_TOKEN."
             )
+        if response.status in (301, 302, 303, 307, 308):
+            # Whole-city (indeed whole-host) condition, so DownloadError: the
+            # caller re-raises those immediately instead of counting them
+            # against MAX_FAILED_TILE_FRACTION, since every remaining tile
+            # would fail identically. Observed 2026-08-12 after sustaining
+            # ~370 tile requests/min from one IP; the ban is per-IP, so tokens
+            # and the Graph API keep working and only this host is refused.
+            # The Location echoes the request URL, hence redact_credentials.
+            location = redact_credentials(response.headers.get("Location", "(none)"))
+            raise DownloadError(
+                f"Mapillary tile CDN redirected instead of serving a tile (HTTP "
+                f"{response.status} → {location}). A redirect to a login page "
+                f"means this host's IP is rate-limited on tiles.mapillary.com — "
+                f"the access token itself may still be valid (the Graph API and "
+                f"other IPs are unaffected), so retry later and collect "
+                f"Mapillary more slowly. A redirect anywhere else means the tile "
+                f"endpoint has moved and this code needs updating."
+            )
         if response.status != 200:
             # 429/5xx raise ClientResponseError, which backoff retries
             response.raise_for_status()
+        content_type = response.headers.get("Content-Type", "")
+        if any(bad in content_type.lower() for bad in _TILE_ERROR_CONTENT_TYPES):
+            raise DownloadError(
+                f"Mapillary served an error page instead of a vector tile "
+                f"(HTTP 200, Content-Type: {content_type}). This is usually a "
+                f"rate limit or a block on this host's IP, not a corrupt tile."
+            )
         return await response.read()
 
 
