@@ -103,6 +103,14 @@ test("gridRowHtml: one cell per column, linking to city.html", () => {
   assert.match(html, /3\.4 yrs/);
 });
 
+test("gridRowHtml: the label cell carries its full text as a title, for ellipsis truncation", () => {
+  // OSM/Nominatim labels are unbounded (issue #115's worldwide names run 60+
+  // chars); the CSS truncates the cell with an ellipsis, so the untruncated
+  // name needs to survive on hover via `title`.
+  const html = gridRowHtml(gridRowModel(SEATTLE));
+  assert.match(html, /<th scope="row" title="Seattle, Washington, United States">/);
+});
+
 test("gridRowHtml: null stats render em dashes and no link", () => {
   const html = gridRowHtml(gridRowModel({ provider: "gsv", city_id: "x--y", city: "X" }));
   assert.match(html, /—/);

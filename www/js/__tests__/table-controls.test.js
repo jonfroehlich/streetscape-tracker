@@ -26,6 +26,7 @@ const {
   histogramBuckets,
   medianOf,
   formatStripSummary,
+  renderDistributionStrip,
   controlsHtml,
 } = require("../table-controls.js");
 
@@ -305,6 +306,36 @@ test("formatStripSummary: carries min/median/max as text for screen readers", ()
 test("formatStripSummary: says so plainly when the filtered view has no values", () => {
   const column = { key: "pct", label: "Grid coverage", type: "number" };
   assert.match(formatStripSummary(column, [null, null]), /No grid coverage values/);
+});
+
+// --- renderDistributionStrip (clickable bars) --------------------------------
+
+const STRIP_EL = () => ({ innerHTML: "" });
+const STRIP_COLUMN = { key: "pct", label: "Coverage", type: "number", unit: "%", digits: 1 };
+
+test("renderDistributionStrip: plain, non-interactive spans when the caller passes no filter", () => {
+  const el = STRIP_EL();
+  renderDistributionStrip(el, STRIP_COLUMN, [10, 50, 90]);
+  assert.match(el.innerHTML, /<div class="strip-bars" aria-hidden="true">/);
+  assert.match(el.innerHTML, /<span class="strip-bar"/);
+  assert.doesNotMatch(el.innerHTML, /<button/);
+});
+
+test("renderDistributionStrip: clickable buttons carrying rounded bounds when a matching filter exists", () => {
+  const el = STRIP_EL();
+  renderDistributionStrip(el, STRIP_COLUMN, [10, 50, 90], true);
+  // No aria-hidden on the container once its bars are real, focusable buttons.
+  assert.doesNotMatch(el.innerHTML, /aria-hidden="true"/);
+  assert.match(el.innerHTML, /<button type="button" class="strip-bar" data-from="[\d.]+" data-to="[\d.]+"/);
+  assert.match(el.innerHTML, /click to filter to this range/);
+});
+
+test("renderDistributionStrip: a non-numeric or empty column never renders buttons, even if asked", () => {
+  // clickable=true from a stale sort state must not produce a strip with
+  // nothing behind it to filter.
+  const el = STRIP_EL();
+  renderDistributionStrip(el, { key: "label", label: "City", type: "text" }, [], true);
+  assert.doesNotMatch(el.innerHTML, /<button/);
 });
 
 // --- controls markup --------------------------------------------------------

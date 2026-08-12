@@ -341,6 +341,19 @@ test("walkRowHtml: city names are HTML-escaped (OSM data is publicly editable)",
   assert.match(html, /&lt;script&gt;/);
 });
 
+test("walkRowHtml: the label cell carries its full text as a title, for ellipsis truncation", () => {
+  // Worldwide-frame labels (issue #115) run 60+ chars; the CSS truncates the
+  // cell with an ellipsis, so the untruncated name needs to survive on hover.
+  const html = walkRowHtml(
+    toRowModel(SEATTLE_WALK, {
+      city: "Seattle",
+      state: { name: "Washington" },
+      country: { name: "United States" },
+    })
+  );
+  assert.match(html, /<th scope="row" title="Seattle, Washington, United States">/);
+});
+
 // --- walkChangeCellHtml (issue #101) ---------------------------------------
 
 const CHANGE_BLOCK = {
