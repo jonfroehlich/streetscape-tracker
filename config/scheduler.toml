@@ -134,10 +134,17 @@ sleep_between_cities_s = 60
 
 [paths]
 # Absolute paths recommended for the systemd deployment. Defaults (when
-# omitted) are relative to the repo: ./data, ./data/streetscape_tracker.db, ./logs
+# omitted) are relative to the repo: ./data, ./data/streetscape_tracker.db,
+# ./logs, ./backups
 #data_dir = "/homes/gws/jonf/streetscape-tracker/data"
 #db_path  = "/homes/gws/jonf/streetscape-tracker/data/streetscape_tracker.db"
 #log_dir  = "/homes/gws/jonf/streetscape-tracker/logs"
+# Dated, integrity-verified catalog backups (issue #145), retained 14 days.
+# Must stay OUTSIDE data_dir — the publish rsync walks data/ and would ship
+# catalog backups to the public web server — and INSIDE whatever path CSE IT
+# snapshots, since the ZFS snapshot history of these files is what provides
+# point-in-time recovery. Check health with: scheduler backup-status
+#backup_dir = "/homes/gws/jonf/streetscape-tracker/backups"
 
 [publish]
 # When true, run the publish script after each successful daily batch.

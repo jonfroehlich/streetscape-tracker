@@ -5,6 +5,7 @@ import json
 import os
 import re
 import signal
+import time
 from datetime import date
 from pathlib import Path
 
@@ -12,6 +13,7 @@ import pytest
 
 from streetscape_metadata_tracker import db
 from streetscape_metadata_tracker import scheduler as _sched
+from streetscape_metadata_tracker.alerting import AlertConfig
 from streetscape_metadata_tracker.naming import (
     generate_streetwalk_filename,
     streetwalk_coverage_filename,
@@ -33,9 +35,11 @@ from tests.conftest import make_city_df, write_city_csv_gz
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# The real nightly hook, saved before the autouse stub below replaces it so the
-# dedicated driving-plan tests can exercise it.
+# The real nightly hooks, saved before the autouse stubs below replace them so
+# the dedicated driving-plan / backup tests can exercise them.
 _REAL_DRIVING_PLAN_HOOK = _sched._fetch_driving_plan_nightly
+_REAL_WRITE_BACKUP = _sched.catalog_backup.write_backup
+_REAL_BACKUP_HOOK = _sched._backup_catalog_nightly
 
 
 @pytest.fixture(autouse=True)
@@ -45,6 +49,29 @@ def _no_driving_plan_fetch(monkeypatch):
     network, no writes to the real archive/ dir; the driving-plan tests
     restore _REAL_DRIVING_PLAN_HOOK explicitly."""
     monkeypatch.setattr(_sched, "_fetch_driving_plan_nightly", lambda cfg, conn, today: None)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_catalog_backup(monkeypatch):
+    """
+    run-due backs the catalog up before the city loop AND in the tail (issue
+    #145). Stub it for every test, because SchedulerConfig's backup_dir defaults
+    to <repo>/backups: without this, every test reaching either hook writes a
+    real backup of its fixture catalog into the developer's working tree. That
+    is not hypothetical — the tail backup predates this fixture and had been
+    dropping fixture-sized files into the repo's logs/ for as long as it
+    existed, where they were indistinguishable from a real catalog backup.
+
+    The dedicated backup tests restore _REAL_WRITE_BACKUP and point backup_dir
+    at tmp_path.
+    """
+    monkeypatch.setattr(
+        _sched.catalog_backup,
+        "write_backup",
+        lambda conn, backup_dir, when, **kw: _sched.catalog_backup.BackupResult(
+            ok=True, path=os.path.join(backup_dir, "stubbed.backup")
+        ),
+    )
 
 
 def _register(conn, name, width=5000, height=5000, step=20):
@@ -1992,3 +2019,312 @@ def test_cmd_fetch_driving_plan_backfills_from_file(conn, monkeypatch, tmp_path,
     assert (archive / "gsv_driving_plan_2026-07-31.json.gz").exists()
     districts = {r["district"] for r in conn.execute("SELECT district FROM driving_plan_entries")}
     assert districts == {"Jefferson", "Bullitt"}
+
+
+# ───────────────────── catalog backup wiring (issue #145) ─────────────────────
+
+
+def _real_backup_cfg(tmp_path, **overrides):
+    """A config whose backup hooks write real files, into tmp_path."""
+    base = dict(publish_enabled=False, backup_dir=str(tmp_path / "backups"))
+    base.update(overrides)
+    return SchedulerConfig(**base)
+
+
+def test_backup_runs_before_the_city_loop(conn, monkeypatch, tmp_path):
+    """
+    The ordering IS the feature. _finish_batch runs after any loop-level failure
+    (errored loop, deadline, SIGTERM — #167) but NOT after a SIGKILL, which is
+    the documented OOM mode on the Mapillary post-decode path (#157). A
+    tail-only backup is therefore missing on exactly the nights something went
+    badly wrong, so the night's copy has to exist before the loop starts.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    _register(conn, "Alpha", width=1000, height=1000, step=20)
+    db.assign_schedule(conn, 90)
+    conn.execute("UPDATE schedule_state SET last_success_at = NULL")
+    conn.commit()
+
+    monkeypatch.setattr(sched.catalog_backup, "write_backup", _REAL_WRITE_BACKUP)
+
+    order = []
+    monkeypatch.setattr(
+        sched,
+        "_backup_catalog_nightly",
+        lambda cfg, c, today: order.append("backup") or _REAL_BACKUP_HOOK(cfg, c, today),
+    )
+    monkeypatch.setattr(
+        sched,
+        "_run_one_city",
+        lambda cfg, city, today, provider="gsv", **kw: order.append("city") or True,
+    )
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+    monkeypatch.setattr(sched.time, "sleep", lambda s: None)
+    monkeypatch.setattr(sched, "generate_aggregate_v2", lambda c, d: None)
+    monkeypatch.setattr(sched, "generate_streetwalk_manifest", lambda c, d: {})
+
+    rc = sched.cmd_run_due(_real_backup_cfg(tmp_path), today=date(2026, 7, 2))
+
+    assert rc == 0
+    assert order[0] == "backup", f"backup must precede the city loop, got {order}"
+    assert "city" in order
+    assert (tmp_path / "backups" / "streetscape_tracker.db.2026-07-02.backup").exists()
+
+
+def test_backup_happens_on_a_zero_due_night(conn, monkeypatch, tmp_path):
+    """No cities due still means the catalog changed yesterday and is worth a
+    dated copy — and the tail's aggregate step is skipped on such nights, so a
+    tail-only backup would silently not happen."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    monkeypatch.setattr(sched.catalog_backup, "write_backup", _REAL_WRITE_BACKUP)
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+
+    rc = sched.cmd_run_due(_real_backup_cfg(tmp_path), today=date(2026, 7, 2))
+
+    assert rc == 0
+    assert (tmp_path / "backups" / "streetscape_tracker.db.2026-07-02.backup").exists()
+
+
+def test_a_failed_backup_makes_the_night_unhealthy_but_still_publishes(conn, monkeypatch):
+    """
+    Two halves of the #145 lesson at once. A backup that fails silently is how
+    /projects/makeabilitylab went unbacked-up for months, so it must alert and
+    turn the unit red even when every city landed. But it must NOT withhold
+    publishing — that is the #167 posture: never hide what the night collected.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    _register(conn, "Alpha", width=1000, height=1000, step=20)
+    db.assign_schedule(conn, 90)
+    conn.execute("UPDATE schedule_state SET last_success_at = NULL")
+    conn.commit()
+
+    monkeypatch.setattr(
+        sched.catalog_backup,
+        "write_backup",
+        lambda c, d, w, **kw: sched.catalog_backup.BackupResult(ok=False, error="disk full"),
+    )
+    ran, published = [], []
+    monkeypatch.setattr(
+        sched,
+        "_run_one_city",
+        lambda cfg, city, today, provider="gsv", **kw: ran.append(city.city_id) or True,
+    )
+    _stub_tail(monkeypatch, sched, conn, published)
+
+    alerts = []
+    monkeypatch.setattr(sched, "send_alert", lambda cfg, subj, body: alerts.append((subj, body)))
+
+    rc = sched.cmd_run_due(_publishing_cfg(), today=date(2026, 7, 2))
+
+    assert len(ran) == 1, "the city loop must still run"
+    assert published == ["aggregate", "manifest", "publish"], (
+        "a backup failure must not withhold what the night collected"
+    )
+    assert rc == 1, "a failed backup is an unhealthy night"
+    assert len(alerts) == 1
+    assert "CATALOG BACKUP FAILED" in alerts[0][0]
+    assert "disk full" in alerts[0][1]
+
+
+def test_backup_failure_alerts_even_below_the_failure_threshold(conn, monkeypatch):
+    """The collection-failure threshold exists so one flaky city doesn't page
+    every night. Backups get no such grace: there is no such thing as an
+    acceptable number of nights without one."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    monkeypatch.setattr(
+        sched.catalog_backup,
+        "write_backup",
+        lambda c, d, w, **kw: sched.catalog_backup.BackupResult(ok=False, error="io error"),
+    )
+    alerts = []
+    monkeypatch.setattr(sched, "send_alert", lambda cfg, subj, body: alerts.append(subj))
+    monkeypatch.setattr(sched, "_recent_log_tail", lambda cfg, n=40: "")
+
+    # Zero attempted, zero failed — nothing here would alert on its own.
+    rc = sched._finish_batch(
+        _publishing_cfg(alerts=AlertConfig(enabled=True, recipient="x@y", failure_threshold=99)),
+        conn,
+        "summary",
+        succeeded=0,
+        attempted=0,
+        today=date(2026, 7, 2),
+        backup_error="catalog backup failed: io error",
+    )
+
+    assert rc == 1
+    assert alerts and "CATALOG BACKUP FAILED" in alerts[0]
+
+
+def test_tail_backup_captures_the_nights_runs(conn, monkeypatch, tmp_path):
+    """Why the tail backs up a second time: the pre-flight copy proves a copy
+    EXISTS, but it predates every run the night registered."""
+    from streetscape_metadata_tracker import catalog_backup as cb
+    from streetscape_metadata_tracker import scheduler as sched
+
+    monkeypatch.setattr(sched.catalog_backup, "write_backup", _REAL_WRITE_BACKUP)
+    monkeypatch.setattr(sched, "generate_aggregate_v2", lambda c, d: None)
+    monkeypatch.setattr(sched, "generate_streetwalk_manifest", lambda c, d: {})
+    monkeypatch.setattr(sched, "_recent_log_tail", lambda cfg, n=40: "")
+    cfg = _real_backup_cfg(tmp_path)
+
+    # Pre-flight copy of an empty-ish catalog.
+    assert sched._backup_catalog_nightly(cfg, conn, date(2026, 7, 2)) is None
+    before = cb.read_status(cfg.backup_dir)["row_counts"].get("cities", 0)
+
+    # The "night" registers a city, then the tail runs.
+    _register(conn, "Alpha", width=1000, height=1000, step=20)
+    sched._finish_batch(cfg, conn, "summary", succeeded=1, attempted=1, today=date(2026, 7, 2))
+
+    after = cb.read_status(cfg.backup_dir)["row_counts"].get("cities", 0)
+    assert after == before + 1
+    assert len(cb.list_backups(cfg.backup_dir)) == 1, "same date replaces, never accumulates"
+
+
+def test_dry_run_announces_the_backup_without_writing_one(conn, monkeypatch, tmp_path, capsys):
+    from streetscape_metadata_tracker import scheduler as sched
+
+    monkeypatch.setattr(sched.catalog_backup, "write_backup", _REAL_WRITE_BACKUP)
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+    cfg = _real_backup_cfg(tmp_path)
+
+    rc = sched.cmd_run_due(cfg, dry_run=True, today=date(2026, 7, 2))
+
+    assert rc == 0
+    assert "back up the catalog" in capsys.readouterr().out
+    assert not os.path.isdir(cfg.backup_dir), "a dry run must not write a backup"
+
+
+def test_config_parses_backup_dir(tmp_path):
+    p = tmp_path / "s.toml"
+    p.write_text('[paths]\nbackup_dir = "/srv/backups"\n')
+    assert load_scheduler_config(str(p)).backup_dir == "/srv/backups"
+
+
+def test_backup_dir_defaults_beside_the_project_not_inside_data(tmp_path):
+    """It must not live under data_dir: the publish rsync walks data/ and would
+    ship catalog backups to the public web server."""
+    p = tmp_path / "s.toml"
+    p.write_text("[schedule]\ncycle_days = 90\n")
+    cfg = load_scheduler_config(str(p))
+    assert cfg.backup_dir.endswith("backups")
+    assert not cfg.backup_dir.startswith(cfg.data_dir)
+
+
+def test_cmd_backup_status_reports_and_exits_nonzero_when_missing(
+    conn, monkeypatch, tmp_path, capsys
+):
+    from streetscape_metadata_tracker import scheduler as sched
+
+    monkeypatch.setattr(sched.catalog_backup, "write_backup", _REAL_WRITE_BACKUP)
+    cfg = _real_backup_cfg(tmp_path, data_dir=str(tmp_path / "data"))
+    cfg.driving_plan.archive_dir = str(tmp_path / "archive" / "gsv_driving_plan")
+
+    # No backups yet → unhealthy.
+    assert sched.cmd_backup_status(cfg) == 1
+    out = capsys.readouterr().out
+    assert "MISSING" in out or "EMPTY" in out
+
+    # After a real backup → healthy, and the inventory is reported.
+    os.makedirs(cfg.driving_plan.archive_dir)
+    with open(
+        os.path.join(cfg.driving_plan.archive_dir, "gsv_driving_plan_2026-08-01.json.gz"), "wb"
+    ) as f:
+        f.write(b"x" * 64)
+    sched.catalog_backup.write_backup(conn, cfg.backup_dir, date(2026, 8, 7), source_db=cfg.db_path)
+
+    assert sched.cmd_backup_status(cfg) == 0
+    out = capsys.readouterr().out
+    assert "streetscape_tracker.db.2026-08-07.backup" in out
+    assert "driving-plan archive" in out
+    assert "1 files" in out
+
+
+def test_backup_status_exits_nonzero_when_the_newest_copy_is_stale(
+    conn, monkeypatch, tmp_path, capsys
+):
+    """
+    A monitor check has to catch "nothing has run in weeks", not just "the last
+    thing we tried failed". The newest copy is never pruned, so an abandoned
+    scheduler leaves one ancient file next to an ok status — #145's shape.
+    """
+    from streetscape_metadata_tracker import catalog_backup as cb
+    from streetscape_metadata_tracker import scheduler as sched
+
+    monkeypatch.setattr(sched.catalog_backup, "write_backup", _REAL_WRITE_BACKUP)
+    cfg = _real_backup_cfg(tmp_path, data_dir=str(tmp_path / "data"))
+    cfg.driving_plan.archive_dir = str(tmp_path / "archive")
+    result = sched.catalog_backup.write_backup(conn, cfg.backup_dir, date(2026, 8, 7))
+
+    assert sched.cmd_backup_status(cfg) == 0
+    capsys.readouterr()
+
+    # Nothing changes but the file's age: same file, same successful status.
+    old = time.time() - (cb.STALE_AFTER_HOURS + 2) * 3600
+    os.utime(result.path, (old, old))
+
+    assert sched.cmd_backup_status(cfg) == 1
+    out = capsys.readouterr().out
+    assert "STALE" in out
+    assert "last attempt" in out and "FAILED" not in out
+
+
+def test_restore_backup_subcommand_restores_and_then_refuses(conn, monkeypatch, tmp_path, capsys):
+    """The incident-time handle. It must work, and it must refuse the second
+    time — restoring onto a catalog that is already there would destroy the
+    thing being recovered."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    monkeypatch.setattr(sched.catalog_backup, "write_backup", _REAL_WRITE_BACKUP)
+    cfg = _real_backup_cfg(tmp_path)
+    result = sched.catalog_backup.write_backup(conn, cfg.backup_dir, date(2026, 8, 7))
+    dest = str(tmp_path / "restored" / "streetscape_tracker.db")
+
+    assert sched.cmd_restore_backup(cfg, result.path, dest) == 0
+    assert os.path.exists(dest)
+
+    rc = sched.cmd_restore_backup(cfg, result.path, dest)
+    assert rc == 1
+    assert "Restore refused" in capsys.readouterr().out
+
+
+def test_alert_subject_names_both_the_backup_and_the_collection_failures(conn, monkeypatch):
+    """A subject line is often all that gets read; a failed backup must not mask
+    a failed night, or vice versa."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    alerts = []
+    monkeypatch.setattr(sched, "send_alert", lambda cfg, subj, body: alerts.append(subj))
+    monkeypatch.setattr(sched, "_recent_log_tail", lambda cfg, n=40: "")
+
+    sched._finish_batch(
+        _publishing_cfg(),
+        conn,
+        "summary",
+        succeeded=0,
+        attempted=2,
+        today=date(2026, 7, 2),
+        errored=True,
+        backup_error="catalog backup failed: io error",
+    )
+
+    assert len(alerts) == 1
+    assert "CATALOG BACKUP FAILED" in alerts[0]
+    assert "2 failed collection(s)" in alerts[0]
+
+
+def test_backup_status_subcommand_is_wired(capsys):
+    args = build_parser().parse_args(["backup-status"])
+    assert args.command == "backup-status"
+
+
+def test_restore_backup_subcommand_is_wired():
+    args = build_parser().parse_args(["restore-backup", "/b/x.backup", "--to", "/tmp/d.db"])
+    assert (args.command, args.backup_path, args.dest) == (
+        "restore-backup",
+        "/b/x.backup",
+        "/tmp/d.db",
+    )

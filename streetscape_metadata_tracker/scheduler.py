@@ -15,6 +15,8 @@ Usage (--config accepted on either side of the subcommand):
     python -m streetscape_metadata_tracker.scheduler [--config PATH] regenerate-aggregate [--publish]
     python -m streetscape_metadata_tracker.scheduler [--config PATH] reconcile-walks [--date D] [--dry-run]
     python -m streetscape_metadata_tracker.scheduler [--config PATH] fetch-driving-plan [--force] [--from-file P --date D]
+    python -m streetscape_metadata_tracker.scheduler [--config PATH] backup-status
+    python -m streetscape_metadata_tracker.scheduler [--config PATH] restore-backup PATH [--to DEST]
 
 Config: TOML (see config/scheduler.toml). Requires Python 3.11+ (tomllib).
 """
@@ -28,6 +30,7 @@ import logging.handlers
 import os
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -40,7 +43,7 @@ from pathlib import Path
 
 from tabulate import tabulate
 
-from . import db, driving_plan
+from . import catalog_backup, db, driving_plan
 from .alerting import AlertConfig, send_alert, should_alert
 from .download_common import redact_credentials
 from .download_mapillary import estimate_tile_count
@@ -170,6 +173,12 @@ class SchedulerConfig:
     data_dir: str = str(_PROJECT_ROOT / "data")
     db_path: str = ""
     log_dir: str = str(_PROJECT_ROOT / "logs")
+    # Dated catalog backups (issue #145). Its own directory rather than log_dir:
+    # that tree is size-rotated, and a backup that ages out with the logs is not
+    # a backup. Must sit inside the path CSE IT snapshots — under the project
+    # root it does, and the publish rsync only ever walks data_dir, so nothing
+    # here can leak to the public web server.
+    backup_dir: str = str(_PROJECT_ROOT / "backups")
     # [publish]
     publish_enabled: bool = False
     publish_script: str = str(_PROJECT_ROOT / "sync_data_to_server.sh")
@@ -274,6 +283,7 @@ def load_scheduler_config(path: str | None = None) -> SchedulerConfig:
         data_dir=paths.get("data_dir", str(_PROJECT_ROOT / "data")),
         db_path=paths.get("db_path", ""),
         log_dir=paths.get("log_dir", str(_PROJECT_ROOT / "logs")),
+        backup_dir=paths.get("backup_dir", str(_PROJECT_ROOT / "backups")),
         publish_enabled=pub.get("enabled", False),
         publish_script=pub.get("publish_script", str(_PROJECT_ROOT / "sync_data_to_server.sh")),
         providers=providers,
@@ -889,6 +899,118 @@ def cmd_fetch_driving_plan(
     return 0
 
 
+def _fmt_bytes(n: float) -> str:
+    """Human-readable size for the operator-facing report."""
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:,.1f} {unit}"
+        n /= 1024.0
+    raise AssertionError("unreachable: the GB branch always returns")
+
+
+def cmd_backup_status(cfg: SchedulerConfig) -> int:
+    """
+    Report catalog-backup health and inventory the un-republishable assets.
+
+    The operator handle for issue #145. Two halves, for two different questions:
+
+    1. *Are the catalog backups working?* Read from ``backup_status.json``, which
+       is written on failure as well as success — a backup that fails silently
+       every night is exactly how ``/projects/makeabilitylab`` sat unbacked-up
+       for months.
+    2. *What exists in only one place?* ``archive/gsv_driving_plan`` and
+       ``data/osm_cache`` are published nowhere (the driving-plan archive
+       deliberately so — #176 keeps it outside ``data/`` so the rsync can't
+       republish Google's feed), so lab-storage backups are their only copy.
+       Printing counts and bytes here is what lets us hand CSE IT concrete paths
+       and sizes to confirm against their configuration.
+
+    Exit status is nonzero when the newest backup is missing, **older than
+    ``STALE_AFTER_HOURS``**, or the last recorded attempt failed, so it doubles
+    as a check a cron/monitor can run. The age gate is not redundant with the
+    outcome: "the last thing we tried worked" stays true forever once the
+    scheduler stops running at all — a masked timer, a disabled unit, a
+    ``ConditionHost`` that no longer matches after a host cutover — and since
+    the newest copy is deliberately never pruned, that state otherwise presents
+    as one ancient file plus an ``ok`` status. Which is #145 again.
+    """
+    st = catalog_backup.backup_status(cfg.backup_dir)
+
+    print(f"Catalog backups: {st.backup_dir}")
+    if not st.exists:
+        print("  MISSING — the backup directory does not exist yet.")
+    elif st.file_count == 0:
+        print("  EMPTY — no dated backups present.")
+    else:
+        print(
+            f"  {st.file_count} dated copies, {_fmt_bytes(st.total_bytes)} total, "
+            f"retention {catalog_backup.KEEP_DAYS} days"
+        )
+        print(
+            f"  newest: {os.path.basename(st.newest_path)} "
+            f"({st.age_hours:,.1f} h old, {_fmt_bytes(os.path.getsize(st.newest_path))})"
+        )
+        if st.stale:
+            print(
+                f"  STALE — the newest backup is {st.age_hours:,.1f} h old "
+                f"(limit {st.max_age_hours:,.0f} h). Is run-due still running on this host?"
+            )
+
+    last = st.last_attempt
+    if last is None:
+        print("  last attempt: UNKNOWN (no backup_status.json)")
+    else:
+        verdict = "ok" if last.get("ok") else f"FAILED — {last.get('error')}"
+        print(f"  last attempt: {last.get('last_attempt_at')} — {verdict}")
+        print(f"  source: {last.get('source_db')} on {last.get('source_host')}")
+        counts = last.get("row_counts") or {}
+        if counts:
+            print("  rows: " + ", ".join(f"{t}={n:,}" for t, n in sorted(counts.items())))
+
+    print()
+    print("Assets that exist ONLY on lab storage (published nowhere):")
+    inventory = catalog_backup.inventory_single_copy(
+        {
+            "driving-plan archive": cfg.driving_plan.archive_dir,
+            "frozen OSM networks": os.path.join(cfg.data_dir, "osm_cache"),
+        }
+    )
+    for asset in inventory:
+        if not asset.exists:
+            print(f"  {asset.label:22s} {asset.path} — absent")
+            continue
+        print(
+            f"  {asset.label:22s} {asset.file_count:,} files, "
+            f"{_fmt_bytes(asset.total_bytes)}, newest {asset.newest_mtime}"
+        )
+        print(f"  {'':22s} {asset.path}")
+
+    healthy = st.exists and st.file_count > 0 and not st.stale and bool(last and last.get("ok"))
+    return 0 if healthy else 1
+
+
+def cmd_restore_backup(cfg: SchedulerConfig, backup_path: str, dest: str | None) -> int:
+    """
+    Restore a dated backup onto ``dest`` (default: the configured catalog).
+
+    A subcommand rather than a documented ``python -c``, for the same reason the
+    restore is drilled in the tests: the moment you need it is the worst moment
+    to be composing one. It inherits ``restore_backup``'s refusals — an existing
+    catalog, or orphaned ``-wal``/``-shm`` sidecars beside the destination — and
+    reports them as an operator error rather than a traceback.
+    """
+    target = dest or cfg.db_path or os.path.join(cfg.data_dir, "streetscape_tracker.db")
+    try:
+        catalog_backup.restore_backup(backup_path, target)
+    except (FileNotFoundError, FileExistsError, RuntimeError, sqlite3.Error) as e:
+        print(f"Restore refused: {e}")
+        return 1
+    print(f"Restored {backup_path} -> {target}")
+    print("Check it before pointing the scheduler at it:")
+    print(f"  sqlite3 {target} 'PRAGMA integrity_check; PRAGMA user_version;'")
+    return 0
+
+
 def cmd_reconcile_walks(
     cfg: SchedulerConfig, target_date: date | None = None, dry_run: bool = False
 ) -> int:
@@ -1434,6 +1556,32 @@ def _collect_due(conn, cfg: SchedulerConfig, today: date):
     return ordered, providers_for_city
 
 
+def _backup_catalog_nightly(cfg: SchedulerConfig, conn, today: date) -> str | None:
+    """
+    Write the night's dated catalog backup (issue #145). Returns an error string
+    for the batch summary, or None.
+
+    Called BEFORE the city loop, and again in the tail. The pre-flight copy is
+    the one that matters for durability: ``_finish_batch`` runs after any
+    *loop-level* failure (errored loop, batch deadline, SIGTERM — see #167) but
+    NOT after a SIGKILL, which is the documented OOM/timeout mode on the
+    Mapillary post-decode path (#157). A tail-only backup is therefore missing
+    on exactly the nights something went badly wrong. Running here first means
+    the night has a verified copy before anything can kill the process, and it
+    also covers zero-due nights, where the tail's work is skipped.
+
+    Unlike the driving-plan hook next door, a failure here is NOT advisory: see
+    _finish_batch, which reports it as an unhealthy night. A backup nobody
+    notices failing is how #145 happened.
+    """
+    try:
+        result = catalog_backup.write_backup(conn, cfg.backup_dir, today, source_db=cfg.db_path)
+    except Exception as e:  # defensive — write_backup already swallows its own
+        logger.exception("Catalog backup raised")
+        return f"catalog backup failed: {e}"
+    return None if result.ok else f"catalog backup failed: {result.error}"
+
+
 def _fetch_driving_plan_nightly(cfg: SchedulerConfig, conn, today: date) -> str | None:
     """
     Snapshot the driving-plan feed (issue #176). Returns an error string for
@@ -1520,7 +1668,14 @@ def cmd_run_due(
                 budget_left[provider] -= est if est <= budget_left[provider] else 0
         if cfg.driving_plan.enabled:
             print("Would also snapshot the GSV driving-plan feed (issue #176).")
+        print(f"Would also back up the catalog to {cfg.backup_dir} (issue #145).")
         return 0
+
+    # Back up the catalog BEFORE the city loop, so the night has a verified
+    # copy even if the process is SIGKILLed mid-loop (issue #145; the tail
+    # can't be reached in that case). Repeated in the tail to capture the
+    # night's registered runs.
+    backup_error = _backup_catalog_nightly(cfg, conn, today)
 
     # Snapshot the driving-plan feed BEFORE the city loop: upstream of the
     # batch deadline and any mid-loop kill, and on zero-due nights too. Cheap
@@ -1548,7 +1703,14 @@ def cmd_run_due(
     )
     logger.info("Done: " + summary)
     return _finish_batch(
-        cfg, conn, summary, succeeded, attempted, errored=stop_reason == _STOP_REASON_ERROR
+        cfg,
+        conn,
+        summary,
+        succeeded,
+        attempted,
+        today,
+        errored=stop_reason == _STOP_REASON_ERROR,
+        backup_error=backup_error,
     )
 
 
@@ -1699,7 +1861,9 @@ def _finish_batch(
     summary: str,
     succeeded: int,
     attempted: int,
+    today: date,
     errored: bool = False,
+    backup_error: str | None = None,
 ) -> int:
     """Rebuild the published indexes, back up the catalog, publish, alert.
 
@@ -1707,6 +1871,11 @@ def _finish_batch(
     (issue #167). ``errored`` marks a night whose loop raised: it still
     publishes what was collected, but the batch reports failure and alerts, so
     a bug in the loop can't hide behind a green exit code.
+
+    ``backup_error`` carries the pre-flight backup's outcome (issue #145) so a
+    failure that happened before the loop is still reported here, where the
+    alert is sent. ``today`` is passed in rather than read from the clock so a
+    long night stamps the backup with the date the batch belongs to.
     """
     # Regenerate the aggregate once for the whole batch
     if succeeded > 0:
@@ -1714,16 +1883,13 @@ def _finish_batch(
         generate_aggregate_v2(conn, cfg.data_dir)
         generate_streetwalk_manifest(conn, cfg.data_dir)
 
-    # Nightly catalog backup (keep one rolling copy alongside the logs)
-    backup_path = os.path.join(cfg.log_dir, "streetscape_tracker.db.backup")
-    try:
-        import sqlite3
-
-        with sqlite3.connect(backup_path) as backup_conn:
-            conn.backup(backup_conn)
-        logger.info(f"Catalog backed up to {backup_path}")
-    except Exception as e:
-        logger.error(f"Catalog backup failed: {e}")
+    # Back up again now that the night's runs, diffs and walks are registered:
+    # the pre-flight copy (see _backup_catalog_nightly) guarantees a copy
+    # EXISTS, this one makes the retained copy reflect what the night actually
+    # collected. Same dated filename, atomically replaced.
+    tail_backup = catalog_backup.write_backup(conn, cfg.backup_dir, today, source_db=cfg.db_path)
+    if not tail_backup.ok:
+        backup_error = f"catalog backup failed: {tail_backup.error}"
 
     if cfg.publish_enabled and succeeded > 0:
         if _publish(cfg, summary) != 0:
@@ -1732,15 +1898,30 @@ def _finish_batch(
     # Operator email when the batch finished unhealthy (threshold-controlled so
     # an occasional single flaky city doesn't page every night). No-op unless
     # [alerts] enabled.
+    #
+    # A failed backup alerts unconditionally, threshold or not. Backups that
+    # fail silently are the entire reason #145 existed: /projects/makeabilitylab
+    # went unbacked-up for months because nothing was watching. This is the one
+    # thing in the tail that must never degrade quietly.
     failures = attempted - succeeded
-    if errored or should_alert(failures, cfg.alerts.failure_threshold):
-        send_alert(
-            cfg.alerts,
-            f"{failures} failed collection(s) on {socket.gethostname()}",
-            f"{summary}\n\nRecent log:\n{_recent_log_tail(cfg)}",
-        )
+    if errored or backup_error or should_alert(failures, cfg.alerts.failure_threshold):
+        host = socket.gethostname()
+        # Both can be true at once, and the subject line is often all that gets
+        # read on a phone at 03:00 — so say both rather than letting the backup
+        # failure mask the collection one.
+        parts = []
+        if backup_error:
+            parts.append("CATALOG BACKUP FAILED")
+        if failures or not backup_error:
+            parts.append(f"{failures} failed collection(s)")
+        subject = f"{' + '.join(parts)} on {host}"
+        body = summary + (f"\n\n{backup_error}" if backup_error else "")
+        send_alert(cfg.alerts, subject, f"{body}\n\nRecent log:\n{_recent_log_tail(cfg)}")
 
-    return 0 if succeeded == attempted and not errored else 1
+    # A backup failure makes the night unhealthy even when every city landed —
+    # publishing still happened above (the #167 posture: never withhold what was
+    # collected), but the unit should go red so systemd and [alerts] both show it.
+    return 0 if succeeded == attempted and not errored and not backup_error else 1
 
 
 def _add_global_flags(p: argparse.ArgumentParser) -> None:
@@ -1816,6 +1997,23 @@ def build_parser() -> argparse.ArgumentParser:
             "notify-failure", help="Email the recent log (for a systemd OnFailure= hook)"
         )
     )
+    _add_global_flags(
+        sub.add_parser(
+            "backup-status",
+            help="Report catalog-backup health and single-copy asset inventory (issue #145)",
+        )
+    )
+    p_restore = sub.add_parser(
+        "restore-backup", help="Restore a dated catalog backup (refuses to clobber a live catalog)"
+    )
+    _add_global_flags(p_restore)
+    p_restore.add_argument("backup_path", help="Path to a backups/*.backup file")
+    p_restore.add_argument(
+        "--to",
+        dest="dest",
+        default=None,
+        help="Destination path (default: the configured db_path). Must not already exist.",
+    )
     return parser
 
 
@@ -1833,6 +2031,10 @@ def main() -> int:
         return cmd_regenerate(cfg, publish=args.publish)
     if args.command == "notify-failure":
         return cmd_notify_failure(cfg)
+    if args.command == "backup-status":
+        return cmd_backup_status(cfg)
+    if args.command == "restore-backup":
+        return cmd_restore_backup(cfg, args.backup_path, args.dest)
     if args.command == "reconcile-walks":
         target = date.fromisoformat(args.date) if args.date else None
         return cmd_reconcile_walks(cfg, target_date=target, dry_run=args.dry_run)

@@ -192,8 +192,8 @@ systemctl --user start streetscape-tracker.service           # trigger a run now
 .venv/bin/python -m streetscape_metadata_tracker.scheduler --config config/scheduler.makelab1.toml status
 ```
 
-Rotating file logs also go to `logs/streetscape_scheduler.log`, and a rolling
-catalog backup to `logs/streetscape_tracker.db.backup`.
+Rotating file logs also go to `logs/streetscape_scheduler.log`, and dated
+catalog backups to `backups/` (see below).
 
 ### Backups (verified with CSE IT, 2026-08-05 — issue #145)
 
@@ -211,35 +211,135 @@ prompted the question:
 - **The public docroot** `/cse/web/research/makelab` (which serves both our
   published `data/` and the Makeability Lab website's `/media` + `/public`) was
   already on the standard rotation: hourly/weekly/monthly snapshots plus lolo,
-  **snapshots retained 1 year**. (The website's *postgres* volume has the same
-  torn-snapshot problem the catalog does; the nightly `pg_dump` fix lives in
-  that repo — `makeabilitylab/makeabilitylabwebsite#1443`, still open.)
+  **snapshots retained 1 year**. (The website's *postgres* volume had the same
+  torn-snapshot problem the catalog does; its nightly `pg_dump` sidecar shipped
+  as `makeabilitylab/makeabilitylabwebsite#1444`, merged 2026-08-07.)
 - **SQLite + ZFS caveat:** a snapshot of the *live* WAL-mode catalog may still
   be torn (recent ZFS waits for an in-flight write, but CSE IT wouldn't vouch
   for it). Their recommendation — keep a periodic dumped copy in the same
-  directory — is already what the scheduler does: the `run-due` tail
-  (`_finish_batch`) writes a **consistent** copy via SQLite's online backup API
-  (`conn.backup()`) to `logs/streetscape_tracker.db.backup`. The ZFS snapshot
-  history of that file is what gives us point-in-time restores.
-  **When restoring, prefer the `.backup` file** (or a `PRAGMA wal_checkpoint`ed
-  live DB) over a raw copy of `streetscape_tracker.db` + sidecars from a
-  snapshot.
-- **Two caveats on the `.backup` file itself**, both worth knowing before you
-  trust it in an incident:
-  - It is a *single rolling copy*, rewritten in place each night. A snapshot
-    landing inside those few seconds catches the destination mid-transaction —
-    still recoverable, because a ZFS snapshot is filesystem-atomic and captures
-    SQLite's rollback journal alongside it, but it is not literally "safe at any
-    instant." Any snapshot from outside that window is clean.
-  - The tail runs after any *loop-level* failure (errored city loop, batch
-    deadline, SIGTERM — see #167), but **not** if the process is SIGKILLed,
-    which is the documented OOM mode on the Mapillary post-decode path (#157).
-    So on exactly the nights something went badly wrong, the `.backup` may be a
-    day or more stale — **check its mtime before trusting it.**
-- **Restore procedure:** through CSE IT (support@cs.washington.edu). Retention
-  for `/projects/makeabilitylab` beyond the snapshot/sync/lolo tiers wasn't
-  stated explicitly — ask when it matters. **A restore has never been
-  exercised** (true as of 2026-08-05) — budget time for surprises.
+  directory — is what our own mechanism does, via SQLite's online backup API
+  (`conn.backup()`), which is transactionally consistent against a live WAL
+  database. **No `VACUUM INTO` is needed.** The ZFS snapshot history of those
+  files is what gives us point-in-time recovery beyond our own 14-day window.
+  **When restoring, prefer a dated `.backup` file** over a raw copy of
+  `streetscape_tracker.db` + sidecars from a snapshot.
+
+#### What the scheduler does (`streetscape_metadata_tracker/catalog_backup.py`)
+
+`run-due` writes `backups/streetscape_tracker.db.{YYYY-MM-DD}.backup` **twice a
+night**, and both times matter:
+
+| when | why |
+|---|---|
+| **before the city loop** (`_backup_catalog_nightly`) | The tail runs after any *loop-level* failure (errored loop, batch deadline, SIGTERM — #167) but **not** after a SIGKILL, which is the documented OOM mode on the Mapillary post-decode path (#157). A tail-only backup is missing on exactly the nights something went badly wrong. Also covers zero-due nights. |
+| **in the tail** (`_finish_batch`) | Makes the retained copy reflect the runs, diffs and walks the night actually registered, not the state it started in. Same filename, atomically replaced. |
+
+Properties worth knowing before an incident:
+
+- **Verified before promotion.** Each copy is written to a `.tmp` sibling,
+  checked with `PRAGMA integrity_check`, and only then `os.replace()`d into
+  place. So a filesystem snapshot can never catch a half-written backup, and a
+  bad copy can never overwrite a good one. (This retires the "not literally safe
+  at any instant" caveat that applied to the old single rolling file.)
+- **14 days of dated copies**, matching the website's `pg_dump` retention. The
+  **newest file is never pruned regardless of age** — otherwise a backup failing
+  for longer than the window would end with pruning deleting the last good copy.
+- **One file per date: the tail copy replaces the pre-flight one.** Deliberate,
+  and the one case where it costs you: if something during the night damages the
+  catalog *logically* rather than structurally — a bad migration, a write that
+  leaves the file valid but wrong — the tail faithfully copies that state over
+  the pre-night copy that was fine, and `integrity_check` passes because the file
+  is not corrupt, only wrong. The fallback is then yesterday's copy, i.e. one
+  night stale. Accepted because the tail copy is the more useful one on every
+  ordinary night (it contains the runs the night registered) and the worst case
+  is bounded at one night. The alternative — retaining the pre-flight copy under
+  its own name, or having the tail decline to promote when the source's row
+  counts look worse than what it would overwrite — doubles the footprint or adds
+  a heuristic that can refuse a legitimate backup. Revisit if same-day
+  point-in-time recovery ever matters.
+- **A failed backup is a failed night.** It alerts unconditionally (subject
+  `CATALOG BACKUP FAILED`, ignoring `[alerts].failure_threshold`) and exits
+  nonzero so systemd shows the unit red. It does *not* withhold publishing — the
+  #167 posture: never hide what the night collected. Backups that fail silently
+  are the whole reason #145 existed.
+- **Bounded, never hung.** `sqlite3`'s backup API retries `SQLITE_BUSY` in an
+  unbounded loop (`PRAGMA busy_timeout` does not apply), and the pre-flight copy
+  runs *before* the city loop — so a stuck copy would cost the entire night and
+  end in a SIGKILL at `TimeoutStartSec`. A progress-callback deadline
+  (`BACKUP_TIMEOUT_S`, 10 min) supplies the timeout sqlite3 lacks, and an open
+  transaction on the source connection is rejected outright rather than retried.
+- **No stray `-wal`/`-shm`.** Each dated copy inherits WAL format from the
+  catalog, so *any* read of one — including a read-only one, which cannot clean
+  up after itself — leaves a sidecar pair behind. They are cleared at promotion
+  and prune time, because nothing binds a WAL to a particular database file:
+  left beside a replaced copy, SQLite would replay it into the new one.
+- **Provenance.** `backups/backup_status.json` records the last attempt —
+  outcome, source DB path, hostname, per-table row counts — written on failure
+  as well as success, because a failed backup that wrote nothing is otherwise
+  indistinguishable from one that never ran. Row counts exist because a backup
+  of a *test-fixture* catalog was once mistaken for the production one.
+
+```bash
+# Health of the backups plus an inventory of what exists in only one place
+.venv/bin/python -m streetscape_metadata_tracker.scheduler --config config/scheduler.makelab1.toml backup-status
+```
+
+Exits nonzero when the newest backup is missing, **older than 48 h**, or the
+last attempt failed, so it works as a monitor check. The age gate is not
+redundant with the outcome: "the last attempt succeeded" stays true forever once
+the scheduler simply stops running — a masked timer, a disabled unit, a
+`ConditionHost` that no longer matches after a host cutover — and since the
+newest copy is never pruned, that state otherwise looks like one file plus an
+`ok` status. Which is #145 again.
+
+#### Assets that exist in only one place
+
+Most of `data/` is doubly covered — the project array *and* the docroot's 1-year
+rotation. Two things are not, because they are deliberately published nowhere,
+and `backup-status` inventories both:
+
+| path | why it is irreplaceable |
+|---|---|
+| `archive/gsv_driving_plan/` | Google **overwrites** its driving-plan feed in place, so a lost dated snapshot is gone permanently — unlike a run CSV, which can at worst be re-collected at a later date. Kept outside `data/` so the publish rsync can't republish Google's content (#176). |
+| `data/osm_cache/` | Frozen OSM networks. Refetching does not restore them: today's OSM yields different edge IDs and sample points, which breaks road-walk diff continuity (#101) rather than merely costing a download. |
+
+#### Restore
+
+```bash
+# Verifies the backup, then restores it. Refuses if anything is already there.
+.venv/bin/python -m streetscape_metadata_tracker.scheduler --config config/scheduler.makelab1.toml \
+    restore-backup backups/streetscape_tracker.db.2026-08-07.backup --to /tmp/recovered.db
+```
+
+`--to` defaults to the configured `db_path`. Stop the timer first, and restore
+to a scratch path and inspect it before putting it in the catalog's place.
+
+Two refusals, both deliberate — a restore that quietly does something plausible
+is worse than one that stops:
+
+- **An existing destination.** Recovering onto a live catalog would destroy the
+  thing you are recovering. Move it aside first.
+- **Orphaned `-wal`/`-shm` beside the destination.** This is what a real
+  incident looks like: the catalog goes bad, you move `streetscape_tracker.db`
+  aside, and the sidecars of the process that died stay behind. Nothing binds a
+  WAL to a particular database file, so SQLite would replay those frames into
+  the restored copy on its first open — handing back the exact state you were
+  escaping, with `integrity_check` still saying `ok`. They are **not** deleted
+  for you: an orphaned WAL can hold the only copy of the last committed writes,
+  so whether it is garbage or your best remaining evidence is your call. Move
+  them aside and re-run.
+
+Drilled end to end in `tests/test_catalog_backup.py` — the drill genuinely
+deletes a populated catalog plus its `-wal`/`-shm` sidecars and asserts the
+restored copy is intact, complete, and still carries its frozen grid geometry
+and schema version; a second test leaves the sidecars in place and asserts the
+restore refuses rather than silently resurrecting the pre-restore rows.
+
+Recovering files older than our 14-day window goes through CSE IT
+(support@cs.washington.edu). **Retention for `/projects/makeabilitylab` beyond
+the snapshot/sync/lolo tiers has still not been stated** — ask when it matters.
+A restore from CSE IT's tiers (as opposed to our own dated copies) has never
+been exercised — budget time for surprises.
 
 **Diagnosing a failed city.** `journalctl` above needs journal read access, which
 the service account does not have on makelab2 — so don't rely on it. Three file

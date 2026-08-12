@@ -33,3 +33,7 @@ __pycache__/
 # published feed. Outside data/ so the publish rsync never sees it; never
 # committed.
 /archive/
+# Dated catalog backups (issue #145). Outside data/ for the same reason as
+# /archive/ — the publish rsync only walks data/, so nothing here can reach the
+# public web server. Inside the project root so CSE IT's snapshots cover it.
+/backups/
