@@ -9,6 +9,7 @@ emailed log tail.
 """
 
 import asyncio
+import urllib.parse
 
 import aiohttp
 import pytest
@@ -26,6 +27,19 @@ def test_redact_credentials_scrubs_query_params():
         redact_credentials("https://tiles.mapillary.com/t?access_token=MLY%7Csecret%7C123")
         == "https://tiles.mapillary.com/t?access_token=REDACTED"
     )
+
+
+def test_redact_credentials_scrubs_a_url_nested_in_another_urls_query():
+    """A redirect's Location echoes the request URL percent-encoded inside its
+    own query string (issue #199), so `access_token=` arrives as
+    `access_token%3D`. Matching only the literal form let the token straight
+    through into logs and the alert email."""
+    tile = "https://tiles.mapillary.com/t/2/14/1/2?access_token=MLY%7CSECRET"
+    for encoder in (urllib.parse.quote, urllib.parse.quote_plus):
+        location = "https://www.mapillary.com/login/?next=" + encoder(tile, safe="")
+        out = redact_credentials(location)
+        assert "SECRET" not in out, out
+        assert "REDACTED" in out
 
 
 def test_redact_credentials_handles_multiple_and_mixed_case():
@@ -56,7 +70,8 @@ def test_mapillary_tile_url_has_no_token():
 def test_mapillary_download_error_is_scrubbed(monkeypatch, tmp_path):
     # A failing tile fetch whose exception text contains a credential must
     # surface as a DownloadError WITHOUT the credential.
-    async def exploding_fetch(session, url, timeout):
+    # *args absorbs the rate limiter and request counter #198 passes through.
+    async def exploding_fetch(session, url, timeout, *args):
         raise aiohttp.ClientError("HTTP 429 for https://tiles/x?access_token=SECRET123")
 
     monkeypatch.setattr(dm, "_fetch_tile", exploding_fetch)

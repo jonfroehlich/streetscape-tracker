@@ -28,6 +28,12 @@ daily_request_budget = 10000000
 enabled = true
 # Counted in z14 vector-tile requests; Mapillary caps at 50,000/day per app.
 daily_request_budget = 40000
+# Client-side tile pacing (issue #198). The daily cap is NOT what binds: on
+# 2026-08-12 sustaining ~370 tile req/min got makelab2's IP redirected to a
+# login page for every tile, across BOTH Mapillary applications, at a total
+# spend of 10,659 (~21% of the 50k). The limit is per IP, so it is shared with
+# mapillary_streets below and with any manual run on this host.
+max_requests_per_minute = 60
 
 # Road-walk street-coverage collection (issue #99). SCHEDULED channels like the
 # two above — same cycle, same stagger day (a city's grid and street snapshots
@@ -63,6 +69,8 @@ spacing_m = 15
 enabled = true
 daily_request_budget = 5000
 spacing_m = 15
+# See [providers.mapillary] — one per-IP rate budget, two channels.
+max_requests_per_minute = 60
 
 [download]
 batch_size = 100

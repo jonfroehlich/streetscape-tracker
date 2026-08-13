@@ -66,6 +66,20 @@ enabled = true
 # metadata for a ~2 km square — a city is typically 10-100 tiles).
 # Mapillary caps tile requests at 50,000/day per application.
 daily_request_budget = 40000
+# Client-side pacing for the tile CDN (issue #198). The daily cap above is NOT
+# the binding constraint: on 2026-08-12 a bulk collection sustaining ~370
+# tile requests/min got the host's IP redirected to a login page for every
+# tile — across BOTH Mapillary applications at once — at a total spend of
+# 10,659 requests, ~21% of that 50,000. The limit is per IP, so it is shared
+# with [providers.mapillary_streets] below and with any manual collection on
+# this host, and a second token would not isolate it.
+#
+# 60/min is a conservative guess; 370 is merely confirmed too high. Measured
+# over the enabled cities' frozen grids, a 20-city night is ~1,200 tiles on
+# this channel (~20 min at this rate) and ~2,400 across both Mapillary channels
+# (~40 min) — cheap against max_batch_hours. A ban is not cheap: it takes out
+# every Mapillary channel on the host until it lifts.
+max_requests_per_minute = 60
 
 # Road-walk street-coverage collection (issue #99). These are SCHEDULED
 # channels like the two above — same cycle_days, same stagger day (a city's
@@ -114,6 +128,11 @@ spacing_m = 15
 enabled = true
 daily_request_budget = 5000
 spacing_m = 15
+# See [providers.mapillary].max_requests_per_minute. The tile CDN's rate limit
+# is per IP, so this channel and the grid one draw on ONE budget no matter that
+# they hold separate tokens — the scheduler runs them sequentially, which is
+# what keeps the combined rate at this figure rather than double it.
+max_requests_per_minute = 60
 # See [providers.gsv_streets].network_type. A broader network costs Mapillary
 # nothing extra (the tile census is the same regardless of how many sample
 # points are scored against it) — only the local join gets bigger.

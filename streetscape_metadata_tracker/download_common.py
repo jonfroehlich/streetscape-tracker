@@ -87,7 +87,18 @@ class AsyncRateLimiter:
 
 # Credential-bearing query parameters (GSV's key=, Mapillary's
 # access_token=) as they appear inside request URLs.
-_CREDENTIAL_PATTERN = re.compile(r"(?i)\b(key|access_token|token)=[^&\s'\"]+")
+#
+# The `%3f`/`%26`/`%3d` alternatives cover a URL that has been percent-encoded
+# *into another URL's query string*, which is exactly the shape a redirect's
+# Location takes: `.../login/?next=https%3A%2F%2F…%3Faccess_token%3DMLY…`
+# (issue #199). Matching only the literal `?key=` form let that through
+# unscrubbed — and unlike an ordinary log line, a Location is echoed straight
+# back from the provider with the token still in it.
+#
+# The value pattern deliberately does not stop at an encoded `&` (`%26`), so an
+# encoded URL is redacted through to its end. Over-redaction is the safe
+# direction: this text reaches logs and cleartext alert emails.
+_CREDENTIAL_PATTERN = re.compile(r"(?i)(\b|%3f|%26)(key|access_token|token)(?:=|%3d)[^&\s'\"]+")
 
 
 def redact_credentials(text: str) -> str:
@@ -101,10 +112,15 @@ def redact_credentials(text: str) -> str:
     key, and the scheduler pastes log tails into operator alert emails.
     Every log/raise of provider-HTTP error text must pass through here.
 
+    Handles the percent-encoded form too, since a redirect's Location carries
+    the request URL nested inside its own query string:
+
     >>> redact_credentials("HTTP 403 for https://x/tile?access_token=MLY123")
     'HTTP 403 for https://x/tile?access_token=REDACTED'
+    >>> redact_credentials("https://x/login/?next=https%3A%2F%2Fy%3Faccess_token%3DMLY123")
+    'https://x/login/?next=https%3A%2F%2Fy%3Faccess_token=REDACTED'
     """
-    return _CREDENTIAL_PATTERN.sub(r"\1=REDACTED", str(text))
+    return _CREDENTIAL_PATTERN.sub(r"\1\2=REDACTED", str(text))
 
 
 def grid_index_ranges(width_steps: int, height_steps: int) -> tuple[range, range]:

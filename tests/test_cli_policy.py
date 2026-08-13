@@ -18,6 +18,7 @@ import pytest
 
 from streetscape_metadata_tracker import cli, db
 from streetscape_metadata_tracker.download_common import DownloadError
+from streetscape_metadata_tracker.download_mapillary import DEFAULT_TILE_REQUESTS_PER_MINUTE
 from streetscape_metadata_tracker.fileutils import load_city_csv_file
 from streetscape_metadata_tracker.naming import generate_run_filename
 from tests.conftest import COLUMNS, make_city_df, make_mapillary_city_df, write_city_csv_gz
@@ -165,6 +166,44 @@ def test_max_requests_per_minute_defaults_to_80pct_of_default_quota(monkeypatch,
 
     assert run_cli(monkeypatch, city_id, data_dir) == 0
     assert calls[0]["max_requests_per_minute"] == 24_000
+
+
+def _mapillary_stub(calls):
+    return stub_downloader(
+        calls, df_factory=lambda: make_mapillary_city_df([("m1", "2023-01-01")]), api_requests=4
+    )
+
+
+def test_mapillary_tile_pace_threads_to_the_downloader(monkeypatch, catalog):
+    """The GSV flag above is a project-quota figure three orders of magnitude
+    larger and the CLI applies it only to the GSV path, so Mapillary's per-IP
+    tile cap needs its own flag reaching its own downloader (issue #198)."""
+    conn, city_id, data_dir = catalog
+    calls = []
+    gsv_configs(monkeypatch)
+    monkeypatch.setattr(cli, "download_mapillary_metadata_async", _mapillary_stub(calls))
+
+    exit_code = run_cli(
+        monkeypatch,
+        city_id,
+        data_dir,
+        "--mapillary-max-requests-per-minute",
+        "30",
+        provider="mapillary",
+    )
+    assert exit_code == 0
+    assert calls[0]["max_requests_per_minute"] == 30
+
+
+def test_mapillary_tile_pace_defaults_to_the_conservative_tile_rate(monkeypatch, catalog):
+    """Unset must not mean unpaced, and must not mean the GSV number."""
+    conn, city_id, data_dir = catalog
+    calls = []
+    gsv_configs(monkeypatch)
+    monkeypatch.setattr(cli, "download_mapillary_metadata_async", _mapillary_stub(calls))
+
+    assert run_cli(monkeypatch, city_id, data_dir, provider="mapillary") == 0
+    assert calls[0]["max_requests_per_minute"] == DEFAULT_TILE_REQUESTS_PER_MINUTE
 
 
 def test_same_run_date_is_noop(monkeypatch, catalog):

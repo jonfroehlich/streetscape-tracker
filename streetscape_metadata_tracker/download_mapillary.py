@@ -38,6 +38,7 @@ import gzip
 import logging
 import math
 import os
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -53,6 +54,7 @@ from tqdm import tqdm
 from .analysis import FLAT_ONLY, REQUEST_FAILED
 from .config import MAPILLARY_METADATA_DTYPES
 from .download_common import (
+    AsyncRateLimiter,
     DownloadError,
     generate_grid_arrays,
     grid_index_ranges,
@@ -619,6 +621,39 @@ MAX_FAILED_TILE_FRACTION = 0.02
 _TILE_MAX_TRIES = 5
 _TILE_MAX_TIME_S = 120
 
+# Client-side pacing for the tile CDN (issue #198). This bounds a limit
+# Mapillary does not document and that is enforced PER IP, not per token: on
+# 2026-08-12 a bulk collection sustaining ~370 tile requests/min got the host
+# redirected to a login page for every tile, across BOTH of our Mapillary
+# applications at once, at a total spend of 10,659 requests — about 21% of the
+# 50,000/day per-application cap the config has always paced against. So the
+# daily budget is not the binding constraint and a second token buys nothing;
+# only rate does.
+#
+# 60/min is a deliberately conservative guess. The true ceiling is unknown (370
+# is merely confirmed too high), and being wrong is expensive in a way slowness
+# is not: the nightly scheduler shares the host IP, so a ban takes out its
+# `mapillary` and `mapillary_streets` channels too.
+#
+# What pacing costs, measured over the enabled cities' frozen geometry rather
+# than guessed: a median city is 12 z14 tiles and the mean is 59, so a 20-city
+# night is ~1,200 tiles on the grid channel (~20 min at this rate) and ~2,400
+# across both Mapillary channels (~40 min), against a 10 h batch deadline. The
+# distribution has a long tail — Anchorage's 105x84 km grid alone is ~6,480
+# tiles, ~108 min — which is why scheduler.city_timeout_seconds derives a
+# Mapillary timeout from the tile count instead of using the flat floor.
+#
+# Per-process, like the GSV limiter: N concurrent collections present N times
+# this rate to the CDN. Do not run Mapillary collections in parallel.
+DEFAULT_TILE_REQUESTS_PER_MINUTE = 60
+
+# Content types that are an error page rather than a tile (issue #199). A
+# DENY-list, not an allow-list of protobuf types: if Mapillary ever relabels
+# real tiles (say `application/vnd.mapbox-vector-tile`), an allow-list would
+# reject every tile and halt all collection, whereas this only ever misreads a
+# genuine tile if one is served as HTML or JSON.
+_TILE_ERROR_CONTENT_TYPES = ("text/html", "application/json")
+
 
 @backoff.on_exception(
     backoff.expo,
@@ -627,17 +662,62 @@ _TILE_MAX_TIME_S = 120
     max_time=_TILE_MAX_TIME_S,
 )
 async def _fetch_tile(
-    session: aiohttp.ClientSession, url: str, timeout: aiohttp.ClientTimeout
+    session: aiohttp.ClientSession,
+    url: str,
+    timeout: aiohttp.ClientTimeout,
+    rate_limiter: AsyncRateLimiter | None = None,
+    on_request: Callable[[], None] | None = None,
 ) -> bytes:
-    async with session.get(url, timeout=timeout) as response:
+    # Pacing and counting sit INSIDE the retried body on purpose (issue #198).
+    # This function may issue up to _TILE_MAX_TRIES requests; taking one token
+    # in the caller would let a retrying tile present up to five times the
+    # configured rate — during a 429/5xx storm, i.e. exactly when the CDN is
+    # least willing to absorb it — and would under-report the same factor to
+    # the api_usage ledger. One token, one counted request, one HTTP request.
+    if rate_limiter is not None:
+        await rate_limiter.acquire()
+    if on_request is not None:
+        on_request()
+    # allow_redirects=False is load-bearing (issue #199). When the tile CDN
+    # rate-limits a host it answers 302 → www.mapillary.com/login/, and aiohttp
+    # follows redirects by default — so the login page's own perfectly good HTTP
+    # 200 passed the status checks below and 58 bytes of HTML reached the
+    # protobuf decoder. A host-wide block then read as `DecodeError: Error
+    # parsing message with type 'vector_tile.tile'`, i.e. as corrupt data.
+    async with session.get(url, timeout=timeout, allow_redirects=False) as response:
         if response.status in (401, 403):
             raise DownloadError(
                 f"Mapillary rejected the access token (HTTP {response.status}). "
                 "Check MAPILLARY_ACCESS_TOKEN."
             )
+        if response.status in (301, 302, 303, 307, 308):
+            # Whole-city (indeed whole-host) condition, so DownloadError: the
+            # caller re-raises those immediately instead of counting them
+            # against MAX_FAILED_TILE_FRACTION, since every remaining tile
+            # would fail identically. Observed 2026-08-12 after sustaining
+            # ~370 tile requests/min from one IP; the ban is per-IP, so tokens
+            # and the Graph API keep working and only this host is refused.
+            # The Location echoes the request URL, hence redact_credentials.
+            location = redact_credentials(response.headers.get("Location", "(none)"))
+            raise DownloadError(
+                f"Mapillary tile CDN redirected instead of serving a tile (HTTP "
+                f"{response.status} → {location}). A redirect to a login page "
+                f"means this host's IP is rate-limited on tiles.mapillary.com — "
+                f"the access token itself may still be valid (the Graph API and "
+                f"other IPs are unaffected), so retry later and collect "
+                f"Mapillary more slowly. A redirect anywhere else means the tile "
+                f"endpoint has moved and this code needs updating."
+            )
         if response.status != 200:
             # 429/5xx raise ClientResponseError, which backoff retries
             response.raise_for_status()
+        content_type = response.headers.get("Content-Type", "")
+        if any(bad in content_type.lower() for bad in _TILE_ERROR_CONTENT_TYPES):
+            raise DownloadError(
+                f"Mapillary served an error page instead of a vector tile "
+                f"(HTTP 200, Content-Type: {content_type}). This is usually a "
+                f"rate limit or a block on this host's IP, not a corrupt tile."
+            )
         return await response.read()
 
 
@@ -647,6 +727,7 @@ async def fetch_city_images_async(
     access_token: str,
     connection_limit: int = 5,
     request_timeout: float = 30,
+    max_requests_per_minute: int = DEFAULT_TILE_REQUESTS_PER_MINUTE,
 ) -> dict[str, Any]:
     """
     Fetch and dedupe every Mapillary image in a bbox from the z14 vector tiles.
@@ -664,6 +745,8 @@ async def fetch_city_images_async(
         access_token: Mapillary client token (rides in the tile URL).
         connection_limit: max concurrent tile fetches.
         request_timeout: per-request timeout in seconds.
+        max_requests_per_minute: client-side pacing cap for the tile CDN,
+            which rate-limits per IP (issue #198). <= 0 disables pacing.
 
     Returns:
         Dict with ``census`` (the deduped columnar census — see
@@ -683,14 +766,26 @@ async def fetch_city_images_async(
     api_requests = 0
     timeout = aiohttp.ClientTimeout(total=request_timeout)
     semaphore = asyncio.Semaphore(connection_limit)
+    # Bounds the aggregate rate regardless of connection_limit — the semaphore
+    # caps concurrency, which on a fast link still meant ~5 tiles/s (~300/min)
+    # from a single city before this (issue #198).
+    rate_limiter = AsyncRateLimiter(max_requests_per_minute)
+    logger.info(
+        f"Pacing tile requests at {max_requests_per_minute}/min"
+        if max_requests_per_minute > 0
+        else "Tile pacing DISABLED (max_requests_per_minute <= 0)"
+    )
     progress_bar = tqdm(total=len(tiles), desc=f"Downloading Mapillary tiles for {city_name}")
 
-    async def fetch_one(x: int, y: int) -> pd.DataFrame:
+    def count_request() -> None:
         nonlocal api_requests
+        api_requests += 1
+
+    async def fetch_one(x: int, y: int) -> pd.DataFrame:
         url = f"{TILE_URL_TEMPLATE.format(z=TILE_ZOOM, x=x, y=y)}?access_token={access_token}"
         async with semaphore:
-            api_requests += 1
-            tile_bytes = await _fetch_tile(session, url, timeout)
+            # Pacing/counting happen inside _fetch_tile, per retried attempt.
+            tile_bytes = await _fetch_tile(session, url, timeout, rate_limiter, count_request)
         progress_bar.update(1)
         # Convert to columns HERE, not after the gather: asyncio.gather holds
         # every tile's result until the last one lands, so returning dicts kept
@@ -782,6 +877,7 @@ async def download_mapillary_metadata_async(
     output_csv_gz_path: str,
     connection_limit: int = 5,
     request_timeout: float = 30,
+    max_requests_per_minute: int = DEFAULT_TILE_REQUESTS_PER_MINUTE,
 ) -> dict[str, Any]:
     """
     Fetch Mapillary pano metadata for a city and write it as a run csv.gz.
@@ -830,6 +926,7 @@ async def download_mapillary_metadata_async(
         access_token,
         connection_limit=connection_limit,
         request_timeout=request_timeout,
+        max_requests_per_minute=max_requests_per_minute,
     )
     # pop, not [] — `fetched` stays a live local until this function returns, so
     # indexing it would pin the whole census in memory straight through

@@ -38,6 +38,7 @@ import pandas as pd
 
 from streetscape_metadata_tracker.analysis import FLAT_ONLY
 from streetscape_metadata_tracker.download_mapillary import (
+    DEFAULT_TILE_REQUESTS_PER_MINUTE,
     build_empty_rows,
     build_image_rows,
     captured_at_to_iso_dates,
@@ -223,6 +224,7 @@ async def collect_mapillary_street_samples_async(
     match_dist_m: float,
     connection_limit: int = 5,
     request_timeout: float = 30,
+    max_requests_per_minute: int = DEFAULT_TILE_REQUESTS_PER_MINUTE,
 ) -> dict[str, Any]:
     """
     Collect Mapillary street samples for a city and write the snapshot csv.gz.
@@ -250,6 +252,7 @@ async def collect_mapillary_street_samples_async(
         access_token,
         connection_limit=connection_limit,
         request_timeout=request_timeout,
+        max_requests_per_minute=max_requests_per_minute,
     )
     # pop, not [] — `fetched` is a live local until this function returns, so
     # indexing it would keep the whole census resident past the `del` below,

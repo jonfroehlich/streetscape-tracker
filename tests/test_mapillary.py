@@ -9,6 +9,7 @@ import gzip
 import math
 import os
 import re
+import urllib.parse
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -454,6 +455,30 @@ def straddling_city():
     return lat, boundary_lon
 
 
+def _stub_fetch_tile(monkeypatch, fetch):
+    """Install ``fetch`` as the tile fetcher, keeping stubs on the plain
+    ``(session, url, timeout)`` signature.
+
+    Stubbing ``_fetch_tile`` also stubs out its retry decorator, which is what
+    keeps these tests instant. But #198 moved pacing and request counting
+    *inside* that function — deliberately, so a retried attempt re-paces and is
+    re-counted — so a stub that ignored the limiter and counter would leave
+    every city-level test seeing zero of both. This adapter honours them on the
+    stub's behalf. What it cannot pin is the per-retry behaviour itself;
+    ``test_a_retried_tile_re_paces_and_is_re_counted`` drives the real
+    ``_fetch_tile`` for that.
+    """
+
+    async def paced(session, url, timeout, rate_limiter=None, on_request=None):
+        if rate_limiter is not None:
+            await rate_limiter.acquire()
+        if on_request is not None:
+            on_request()
+        return await fetch(session, url, timeout)
+
+    monkeypatch.setattr(dm, "_fetch_tile", paced)
+
+
 def _run_download(
     monkeypatch, tmp_path, tiles_by_xy, center_lat, center_lon, width=100, height=100, step=20
 ):
@@ -472,7 +497,7 @@ def _run_download(
         served.append(xy)
         return tiles_by_xy.get(xy, mapbox_vector_tile.encode([]))
 
-    monkeypatch.setattr(dm, "_fetch_tile", fake_fetch)
+    _stub_fetch_tile(monkeypatch, fake_fetch)
     out_path = str(tmp_path / "test_mapillary_2026-07-05.csv.gz")
     result = asyncio.run(
         dm.download_mapillary_metadata_async(
@@ -1156,7 +1181,8 @@ def _failing_fetch(fail_xy, tiles_by_xy=None, status=404):
 
 
 def _fetch_city(monkeypatch, fetch, lat, lon, width=30000, height=30000, step=2000):
-    monkeypatch.setattr(dm, "_fetch_tile", fetch)
+    """Run a whole-city fetch with ``fetch`` standing in for one tile request."""
+    _stub_fetch_tile(monkeypatch, fetch)
     return asyncio.run(
         dm.fetch_city_images_async(
             "Test City", dm.grid_bbox(lat, lon, width, height, step), "MLY|test|token"
@@ -1216,7 +1242,7 @@ def test_points_under_a_failed_tile_are_request_failed_not_empty(monkeypatch, tm
     all_tiles = dm.tiles_for_bbox(*dm.grid_bbox(lat, lon, width, height, step))
     failed = all_tiles[len(all_tiles) // 2]  # an interior tile, not a corner
 
-    monkeypatch.setattr(dm, "_fetch_tile", _failing_fetch({failed}))
+    _stub_fetch_tile(monkeypatch, _failing_fetch({failed}))
     out_path = str(tmp_path / "test_mapillary_2026-07-05.csv.gz")
     result = asyncio.run(
         dm.download_mapillary_metadata_async(
@@ -1246,3 +1272,278 @@ def test_a_clean_run_reports_no_failed_tiles(monkeypatch, straddling_city):
     lat, lon = straddling_city
     result = _fetch_city(monkeypatch, _failing_fetch(set()), lat, lon)
     assert result["failed_tiles"] == []
+
+
+# ── Tile-CDN blocks are not tile corruption (issue #199) ───────────────────
+#
+# On 2026-08-12 a bulk collection sustained ~370 tile requests/min and got the
+# host's IP blocked: every tile request 302'd to www.mapillary.com/login/.
+# aiohttp followed the redirect, the login page returned a perfectly good HTTP
+# 200, and its HTML body reached mapbox_vector_tile.decode() — so a banned host
+# surfaced as `DecodeError: Error parsing message with type 'vector_tile.tile'`,
+# indistinguishable from #168's transient bad tile. These pin the diagnosis.
+
+# The real block page, verbatim: "尚未登录 / 请登录查看这一页面" ("Not logged in /
+# Please log in to view this page"). Meta serves it localized to unauthenticated
+# requests; the language carries no meaning here.
+_LOGIN_PAGE_BODY = (
+    b"<h1>\xe5\xb0\x9a\xe6\x9c\xaa\xe7\x99\xbb\xe5\xbd\x95</h1>"
+    b"<p>\xe8\xaf\xb7\xe7\x99\xbb\xe5\xbd\x95\xe6\x9f\xa5\xe7\x9c\x8b"
+    b"\xe8\xbf\x99\xe4\xb8\x80\xe9\xa1\xb5\xe9\x9d\xa2\xe3\x80\x82</p>"
+)
+
+_TILE_URL = (
+    "https://tiles.mapillary.com/maps/vtp/mly1_public/2/14/4196/6084?access_token=MLY|s3cret"
+)
+
+
+class _FakeTileResponse:
+    def __init__(self, status, headers=None, body=b""):
+        self.status = status
+        self.headers = headers or {}
+        self._body = body
+
+    async def read(self):
+        return self._body
+
+    def raise_for_status(self):
+        """As aiohttp does it — without this the fake cannot reach the 4xx/5xx
+        path at all, and a test aimed at the block checks fails with an
+        AttributeError instead of its own assertion."""
+        if self.status >= 400:
+            request_info = aiohttp.RequestInfo(
+                url=yarl.URL(_TILE_URL),
+                method="GET",
+                headers=CIMultiDictProxy(CIMultiDict()),
+                real_url=yarl.URL(_TILE_URL),
+            )
+            raise aiohttp.ClientResponseError(
+                request_info=request_info, history=(), status=self.status, message="error"
+            )
+
+
+class _FakeTileSession:
+    """Minimal aiohttp.ClientSession stand-in: .get() as an async CM."""
+
+    def __init__(self, response):
+        self._response = response
+        self.get_kwargs = []
+
+    def get(self, url, **kwargs):
+        self.get_kwargs.append(kwargs)
+        response = self._response
+
+        class _Ctx:
+            async def __aenter__(self):
+                return response
+
+            async def __aexit__(self, *exc):
+                return False
+
+        return _Ctx()
+
+
+def _fetch_tile(response):
+    session = _FakeTileSession(response)
+    with pytest.raises(DownloadError) as excinfo:
+        asyncio.run(_fetch_tile_coro(session))
+    return session, excinfo.value
+
+
+def _fetch_tile_coro(session):
+    return dm._fetch_tile(session, _TILE_URL, aiohttp.ClientTimeout(total=5))
+
+
+def test_tile_requests_do_not_follow_redirects():
+    """The fix hinges on seeing the 302 itself: if aiohttp follows it, the login
+    page's own HTTP 200 is what the status checks see."""
+    session = _FakeTileSession(_FakeTileResponse(200, {"Content-Type": "application/x-protobuf"}))
+    asyncio.run(_fetch_tile_coro(session))
+    assert session.get_kwargs[0]["allow_redirects"] is False
+
+
+def test_a_login_redirect_names_the_ip_rate_limit():
+    _, error = _fetch_tile(
+        _FakeTileResponse(
+            302,
+            {"Location": "https://www.mapillary.com/login/?next=" + _TILE_URL},
+        )
+    )
+    text = str(error)
+    assert "rate-limited" in text
+    assert "login" in text.lower()
+    # The old symptom must not be how this reads any more.
+    assert "parsing message" not in text
+
+
+@pytest.mark.parametrize(
+    "next_param",
+    [
+        _TILE_URL,
+        # The shape a real Location takes: the request URL percent-encoded into
+        # the login page's own query string. `access_token=` becomes
+        # `access_token%3D`, which the pre-#199 redaction pattern did not match
+        # at all — so the token travelled to the logs in full.
+        urllib.parse.quote(_TILE_URL, safe=""),
+        urllib.parse.quote_plus(_TILE_URL),
+    ],
+    ids=["unencoded", "quoted", "quoted_plus"],
+)
+def test_a_login_redirect_does_not_leak_the_token(next_param):
+    """Location echoes the request URL, token and all, and this text reaches
+    logs and the scheduler's alert emails."""
+    _, error = _fetch_tile(
+        _FakeTileResponse(302, {"Location": "https://www.mapillary.com/login/?next=" + next_param})
+    )
+    assert "s3cret" not in str(error)
+    assert "REDACTED" in str(error)
+
+
+def test_an_html_error_page_is_not_fed_to_the_protobuf_decoder():
+    """The 200-with-HTML case, i.e. what we would have seen had the redirect
+    been followed for us by something upstream."""
+    _, error = _fetch_tile(
+        _FakeTileResponse(200, {"Content-Type": 'text/html; charset="utf-8"'}, _LOGIN_PAGE_BODY)
+    )
+    assert "error page instead of a vector tile" in str(error)
+    assert "rate limit" in str(error)
+
+
+def test_a_5xx_tile_is_left_to_the_retry_layer():
+    """The new checks must not swallow the transient path. A 429/5xx is still
+    a ClientResponseError for backoff to retry and, past that, one tolerable
+    bad tile under MAX_FAILED_TILE_FRACTION (issue #168) — NOT a DownloadError,
+    which would fail the whole city. Called through __wrapped__ to skip the
+    retry sleeps."""
+    session = _FakeTileSession(_FakeTileResponse(503))
+    with pytest.raises(aiohttp.ClientResponseError):
+        asyncio.run(dm._fetch_tile.__wrapped__(session, _TILE_URL, aiohttp.ClientTimeout(total=5)))
+
+
+def test_an_unlabelled_tile_is_still_accepted():
+    """A deny-list, not an allow-list: if Mapillary relabels real tiles, an
+    allow-list would reject every tile and halt collection everywhere."""
+    body = mapbox_vector_tile.encode([])
+    session = _FakeTileSession(
+        _FakeTileResponse(200, {"Content-Type": "application/vnd.mapbox-vector-tile"}, body)
+    )
+    assert asyncio.run(_fetch_tile_coro(session)) == body
+
+
+def test_a_blocked_host_fails_the_city_by_name_not_as_a_partial_snapshot(monkeypatch):
+    """Like a rejected token, a block is a whole-city condition — every
+    remaining tile fails identically, so it must not be dressed up as tolerable
+    partial coverage."""
+    lat, lon = 41.8, -87.7
+
+    async def blocked(session, url, timeout):
+        raise DownloadError(
+            "Mapillary tile CDN redirected to a login page (HTTP 302 → "
+            "https://www.mapillary.com/login/?next=REDACTED). This host's IP is "
+            "likely rate-limited on tiles.mapillary.com"
+        )
+
+    with pytest.raises(DownloadError) as excinfo:
+        _fetch_city(monkeypatch, blocked, lat, lon)
+
+    assert "rate-limited" in str(excinfo.value)
+    assert "refusing to finalize" not in str(excinfo.value)
+
+
+# ── Tile-CDN pacing (issue #198) ───────────────────────────────────────────
+
+
+def test_every_tile_request_passes_through_the_rate_limiter(monkeypatch, straddling_city):
+    """The prevention half of the 2026-08-12 ban: before this, nothing bounded
+    the aggregate rate — connection_limit caps concurrency, which on a fast link
+    still meant ~5 tiles/s from a single city."""
+    lat, lon = straddling_city
+    acquires = []
+
+    class _SpyLimiter:
+        def __init__(self, max_per_minute):
+            self.max_per_minute = max_per_minute
+
+        async def acquire(self):
+            acquires.append(self.max_per_minute)
+
+    monkeypatch.setattr(dm, "AsyncRateLimiter", _SpyLimiter)
+    result = _fetch_city(monkeypatch, _failing_fetch(set()), lat, lon)
+
+    assert acquires, "no tile request was paced"
+    assert len(acquires) == result["api_requests"]
+    assert set(acquires) == {dm.DEFAULT_TILE_REQUESTS_PER_MINUTE}
+
+
+def test_the_default_pace_is_well_under_the_rate_that_got_us_banned():
+    """370/min is confirmed too high (2026-08-12). The default is a guess, but
+    it must stay a conservative one — this is the guard on someone 'tuning' it
+    up without new evidence about where the real ceiling is."""
+    assert 0 < dm.DEFAULT_TILE_REQUESTS_PER_MINUTE <= 120
+
+
+class _SequencedTileSession:
+    """A session whose .get() serves a scripted outcome per attempt.
+
+    Distinct from _FakeTileSession, which replays one response forever: the
+    point here is that attempt 1 and attempt 3 differ, so a retry is
+    observable.
+    """
+
+    def __init__(self, outcomes):
+        self._outcomes = list(outcomes)
+        self.attempts = 0
+
+    def get(self, url, **kwargs):
+        self.attempts += 1
+        outcome = self._outcomes.pop(0)
+
+        class _Ctx:
+            async def __aenter__(self):
+                if isinstance(outcome, BaseException):
+                    raise outcome
+                return outcome
+
+            async def __aexit__(self, *exc):
+                return False
+
+        return _Ctx()
+
+
+def test_a_retried_tile_re_paces_and_is_re_counted():
+    """One token per HTTP request, not per tile.
+
+    _fetch_tile may issue up to _TILE_MAX_TRIES requests. Pacing in the caller
+    bought one token for all of them, so a retrying tile could present five
+    times the configured rate — during a 429/5xx storm, i.e. exactly when the
+    CDN is least willing to absorb it — and report a fifth of its true spend to
+    the api_usage ledger.
+    """
+    tile = mapbox_vector_tile.encode([])
+    session = _SequencedTileSession(
+        [
+            aiohttp.ClientConnectionError("connection reset"),
+            aiohttp.ClientConnectionError("connection reset"),
+            _FakeTileResponse(200, {"Content-Type": "application/x-protobuf"}, tile),
+        ]
+    )
+    acquires, counted = [], []
+
+    class _SpyLimiter:
+        async def acquire(self):
+            acquires.append(1)
+
+    body = asyncio.run(
+        dm._fetch_tile(
+            session,
+            _TILE_URL,
+            aiohttp.ClientTimeout(total=5),
+            _SpyLimiter(),
+            lambda: counted.append(1),
+        )
+    )
+
+    assert body == tile
+    assert session.attempts == 3, "the fixture must actually exercise a retry"
+    assert len(acquires) == session.attempts
+    assert len(counted) == session.attempts
