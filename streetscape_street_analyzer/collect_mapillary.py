@@ -33,15 +33,18 @@ from datetime import UTC, datetime
 from typing import Any
 
 import geopandas as gpd
+import numpy as np
 import pandas as pd
 
 from streetscape_metadata_tracker.analysis import FLAT_ONLY
-from streetscape_metadata_tracker.config import MAPILLARY_METADATA_DTYPES
 from streetscape_metadata_tracker.download_mapillary import (
     DEFAULT_TILE_REQUESTS_PER_MINUTE,
-    captured_at_to_iso_date,
+    build_empty_rows,
+    build_image_rows,
+    captured_at_to_iso_dates,
     fetch_city_images_async,
     grid_bbox,
+    status_for_capture_dates,
 )
 from streetscape_metadata_tracker.fileutils import load_city_csv_file
 
@@ -57,70 +60,11 @@ WGS84 = "EPSG:4326"
 _JOIN_CHUNK_SIZE = 50_000
 
 
-def _image_row(
-    img: dict[str, Any],
-    query_lat: float,
-    query_lon: float,
-    query_timestamp: str,
-    status: str,
-    capture_date: str | None,
-) -> dict[str, Any]:
-    """One METADATA row for a sample location matched to a Mapillary image.
-
-    Mirrors download_mapillary._image_row (same columns, same copyright
-    convention) but keyed to an on-street sample location rather than a grid
-    point.
-    """
-    creator = img["creator_id"]
-    return {
-        "query_lat": query_lat,
-        "query_lon": query_lon,
-        "query_timestamp": query_timestamp,
-        "pano_lat": img["lat"],
-        "pano_lon": img["lon"],
-        "pano_id": img["id"],
-        "capture_date": capture_date,
-        "copyright_info": (
-            f"© Mapillary contributor {creator}" if creator is not None else "© Mapillary"
-        ),
-        "status": status,
-        "creator_id": (None if creator is None else str(creator)),
-        "organization_id": img["organization_id"],
-        "sequence_id": img["sequence_id"],
-        "is_pano": img["is_pano"],
-        "on_foot": img["on_foot"],
-        "quality_score": img["quality_score"],
-        "compass_angle": img["compass_angle"],
-    }
-
-
-def _empty_row(query_lat: float, query_lon: float, query_timestamp: str) -> dict[str, Any]:
-    """A sample location with no Mapillary imagery within the match distance."""
-    return {
-        "query_lat": query_lat,
-        "query_lon": query_lon,
-        "query_timestamp": query_timestamp,
-        "pano_lat": None,
-        "pano_lon": None,
-        "pano_id": None,
-        "capture_date": None,
-        "copyright_info": None,
-        "status": "ZERO_RESULTS",
-        "creator_id": None,
-        "organization_id": None,
-        "sequence_id": None,
-        "is_pano": None,
-        "on_foot": None,
-        "quality_score": None,
-        "compass_angle": None,
-    }
-
-
 def nearest_images_to_samples(
     query_points: list[tuple[float, float, int, int]],
-    images: list[dict[str, Any]],
+    census: pd.DataFrame,
     match_dist_m: float,
-) -> tuple[dict[int, dict[str, Any]], dict[int, dict[str, Any]]]:
+) -> tuple[np.ndarray, np.ndarray]:
     """
     For each sample location, the nearest 360° pano and the nearest flat image
     within ``match_dist_m``.
@@ -143,19 +87,24 @@ def nearest_images_to_samples(
     Args:
         query_points: ``(lat, lon, seq, _)`` tuples from
             ``road_sampling.dedupe_query_points``.
-        images: decoded Mapillary image dicts (``fetch_city_images_async``).
+        census: the columnar Mapillary census (``fetch_city_images_async``).
         match_dist_m: max sample-to-image distance in metres.
 
     Returns:
-        ``(pano_by_index, flat_by_index)`` — dicts keyed by the sample's
-        position in ``query_points``, holding the nearest qualifying image.
-        A sample with nothing in range is absent from both.
+        ``(pano_positions, flat_positions)`` — two int arrays as long as
+        ``query_points``, holding the census position of the nearest qualifying
+        image per sample and ``-1`` where nothing is in range. Positions rather
+        than image records: Colorado Springs pairs 360k samples with a 6.5M
+        image census, and a dict of per-sample image dicts is a copy of the
+        census the arrays do not need (issue #157).
     """
-    if not query_points:
-        return {}, {}
+    n_samples = len(query_points)
+    none_matched = np.full(n_samples, -1, dtype=np.int64)
+    if not n_samples or not len(census):
+        return none_matched, none_matched.copy()
 
     samples_gdf = gpd.GeoDataFrame(
-        {"sample_idx": range(len(query_points))},
+        {"sample_idx": range(n_samples)},
         geometry=gpd.points_from_xy([p[1] for p in query_points], [p[0] for p in query_points]),
         crs=WGS84,
     )
@@ -164,20 +113,22 @@ def nearest_images_to_samples(
     metric_crs = samples_gdf.estimate_utm_crs()
     samples_m = samples_gdf.to_crs(metric_crs)
 
-    def _join(subset: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
-        if not subset:
-            return {}
+    def _join(positions: np.ndarray) -> np.ndarray:
+        matches = np.full(n_samples, -1, dtype=np.int64)
+        if not len(positions):
+            return matches
+        # image_idx carries the position in the FULL census, not in this
+        # subset, so the caller can index the census directly.
         # Built once, outside the chunk loop: the census is the same for every
         # block, and reprojecting it per block would dominate the runtime.
         images_gdf = gpd.GeoDataFrame(
-            {"image_idx": range(len(subset))},
+            {"image_idx": positions},
             geometry=gpd.points_from_xy(
-                [img["lon"] for img in subset], [img["lat"] for img in subset]
+                census["lon"].to_numpy()[positions], census["lat"].to_numpy()[positions]
             ),
             crs=WGS84,
         ).to_crs(metric_crs)
 
-        matches: dict[int, dict[str, Any]] = {}
         for start in range(0, len(samples_m), _JOIN_CHUNK_SIZE):
             block = samples_m.iloc[start : start + _JOIN_CHUNK_SIZE]
             joined = gpd.sjoin_nearest(
@@ -190,25 +141,24 @@ def nearest_images_to_samples(
             # sjoin_nearest emits every tied nearest neighbour; keep the closest
             # single image per sample so each sample yields exactly one row.
             joined = joined.sort_values("dist_m").drop_duplicates("sample_idx", keep="first")
-            for row in joined.itertuples(index=False):
-                matches[int(row.sample_idx)] = subset[int(row.image_idx)]
+            matches[joined["sample_idx"].to_numpy()] = joined["image_idx"].to_numpy()
         return matches
 
-    panos = [img for img in images if img["is_pano"]]
-    flats = [img for img in images if not img["is_pano"]]
-    return _join(panos), _join(flats)
+    is_pano = census["is_pano"].to_numpy()
+    return _join(np.flatnonzero(is_pano)), _join(np.flatnonzero(~is_pano))
 
 
 def build_streetwalk_rows(
     query_points: list[tuple[float, float, int, int]],
-    images: list[dict[str, Any]],
+    census: pd.DataFrame,
     match_dist_m: float,
     query_timestamp: str,
-) -> list[dict[str, Any]]:
+) -> pd.DataFrame:
     """
     Score every sample location against the census into METADATA rows.
 
-    Status vocabulary matches the grid downloader exactly (issue #116):
+    Exactly one row per sample, in ``query_points`` order. Status vocabulary
+    matches the grid downloader exactly (issue #116):
 
       * ``OK`` / ``NO_DATE`` — a 360° pano is in range (NO_DATE when its
         contributor timestamp is unusable), which is what 360° street coverage
@@ -218,30 +168,52 @@ def build_streetwalk_rows(
         enter a dated statistic; counts only toward any-imagery coverage.
       * ``ZERO_RESULTS`` — no imagery of any kind in range.
     """
-    pano_by_index, flat_by_index = nearest_images_to_samples(query_points, images, match_dist_m)
+    pano_positions, flat_positions = nearest_images_to_samples(query_points, census, match_dist_m)
+    sample_lats = np.array([p[0] for p in query_points], dtype=np.float64)
+    sample_lons = np.array([p[1] for p in query_points], dtype=np.float64)
 
-    rows = []
-    for idx, (lat, lon, _seq, _unused) in enumerate(query_points):
-        pano = pano_by_index.get(idx)
-        if pano is not None:
-            capture_date = captured_at_to_iso_date(pano["captured_at_ms"])
-            rows.append(
-                _image_row(
-                    pano,
-                    lat,
-                    lon,
-                    query_timestamp,
-                    "OK" if capture_date else "NO_DATE",
-                    capture_date,
-                )
-            )
-            continue
-        flat = flat_by_index.get(idx)
-        if flat is not None:
-            rows.append(_image_row(flat, lat, lon, query_timestamp, FLAT_ONLY, None))
-            continue
-        rows.append(_empty_row(lat, lon, query_timestamp))
-    return rows
+    has_pano = pano_positions >= 0
+    # A pano wins wherever there is one; a flat only speaks for samples no pano
+    # reached, which is exactly what makes the row FLAT_ONLY rather than OK.
+    matched = has_pano | (flat_positions >= 0)
+    chosen = np.where(has_pano, pano_positions, flat_positions)
+
+    matched_idx = np.flatnonzero(matched)
+    capture_dates = np.full(len(matched_idx), None, dtype=object)
+    pano_of_matched = has_pano[matched_idx]
+    capture_dates[pano_of_matched] = captured_at_to_iso_dates(
+        census["captured_at_ms"].to_numpy()[chosen[matched_idx][pano_of_matched]]
+    ).to_numpy()
+    # status_for_capture_dates is evaluated over every matched row, including
+    # the flat ones whose capture_date is None — those transiently read "OK"
+    # (None != "") and are then overridden by the outer where. Kept whole-array
+    # rather than masked so the OK/NO_DATE rule has exactly one statement,
+    # shared with the grid downloader; a flat row's status never escapes it.
+    status = np.where(~pano_of_matched, FLAT_ONLY, status_for_capture_dates(capture_dates))
+    image_rows = build_image_rows(
+        census,
+        chosen[matched_idx],
+        sample_lats[matched_idx],
+        sample_lons[matched_idx],
+        query_timestamp,
+        status,
+        capture_dates,
+    )
+
+    empty_idx = np.flatnonzero(~matched)
+    if not len(empty_idx):
+        return image_rows
+    empty_rows = build_empty_rows(
+        sample_lats[empty_idx],
+        sample_lons[empty_idx],
+        query_timestamp,
+        "ZERO_RESULTS",
+    )
+    # Restore sample order: the two frames were built by kind, not by position.
+    combined = pd.concat([image_rows, empty_rows], ignore_index=True)
+    return combined.iloc[
+        np.argsort(np.concatenate([matched_idx, empty_idx]), kind="stable")
+    ].reset_index(drop=True)
 
 
 async def collect_mapillary_street_samples_async(
@@ -282,22 +254,28 @@ async def collect_mapillary_street_samples_async(
         request_timeout=request_timeout,
         max_requests_per_minute=max_requests_per_minute,
     )
-    images = fetched["images"]
-    num_flat_images = sum(1 for img in images if not img["is_pano"])
+    # pop, not [] — `fetched` is a live local until this function returns, so
+    # indexing it would keep the whole census resident past the `del` below,
+    # through the join, the row build and the CSV write.
+    census = fetched.pop("census")
+    num_flat_images = int((~census["is_pano"].to_numpy()).sum())
     logger.info(
         "%s: %d Mapillary images (%d panos, %d flat) from %d tiles → scoring %d sample points",
         city.city_id,
-        len(images),
-        len(images) - num_flat_images,
+        len(census),
+        len(census) - num_flat_images,
         num_flat_images,
         fetched["tiles"],
         len(query_points),
     )
 
-    rows = build_streetwalk_rows(query_points, images, match_dist_m, started_at)
-    df = pd.DataFrame(rows, columns=list(MAPILLARY_METADATA_DTYPES.keys()))
-    with gzip.open(output_csv_gz_path, "wb") as f:
-        f.write(df.to_csv(index=False).encode("utf-8"))
+    df = build_streetwalk_rows(query_points, census, match_dist_m, started_at)
+    del census
+    # Straight into the gzip handle: to_csv() with no path builds the whole CSV
+    # as a str and then a second copy as bytes, which at a big city's sample
+    # count is pure duplication of a file being written out anyway (issue #157).
+    with gzip.open(output_csv_gz_path, "wt", encoding="utf-8", newline="") as f:
+        df.to_csv(f, index=False)
 
     # Read back through the shared loader so dtypes match the GSV path exactly.
     df = load_city_csv_file(output_csv_gz_path)

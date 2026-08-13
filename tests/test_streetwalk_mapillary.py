@@ -24,7 +24,10 @@ from shapely.geometry import LineString
 
 from streetscape_metadata_tracker import db
 from streetscape_metadata_tracker import download_gsv as dg
-from streetscape_metadata_tracker.download_mapillary import DEFAULT_TILE_REQUESTS_PER_MINUTE
+from streetscape_metadata_tracker.download_mapillary import (
+    DEFAULT_TILE_REQUESTS_PER_MINUTE,
+    records_to_census,
+)
 from streetscape_metadata_tracker.naming import (
     generate_streetwalk_filename,
     streetwalk_coverage_filename,
@@ -90,7 +93,12 @@ def _setup(tmp_path, monkeypatch, images):
     async def fake_fetch_images(city_name, bbox, access_token, **kwargs):
         assert access_token == "MLY|TESTTOKEN"  # the streets token, not the grid one
         calls["n"] += 1
-        return {"images": images, "api_requests": 7, "tiles": 7, "raw_feature_count": len(images)}
+        return {
+            "census": records_to_census(images),
+            "api_requests": 7,
+            "tiles": 7,
+            "raw_feature_count": len(images),
+        }
 
     monkeypatch.setattr(cm, "fetch_city_images_async", fake_fetch_images)
     monkeypatch.setenv("MAPILLARY_STREETS_ACCESS_TOKEN", "MLY|TESTTOKEN")
@@ -400,14 +408,21 @@ def test_both_providers_can_walk_the_same_city_on_the_same_night(tmp_path, monke
 # --- The pure join helper ---------------------------------------------------
 
 
+def _ids(census, positions):
+    """Matched image ids per sample, with None where nothing was in range."""
+    ids = census["id"].to_numpy(dtype=object)
+    return [None if p < 0 else ids[p] for p in positions]
+
+
 def test_nearest_images_to_samples_picks_the_closest_of_each_kind():
     samples = [(44.0500, -121.3000, 0, 0)]
     near_pano = _image("p_near", 44.05001, -121.3000)
     far_pano = _image("p_far", 44.05015, -121.3000)  # ~17 m away
     near_flat = _image("f_near", 44.050005, -121.3000, is_pano=False)
-    panos, flats = cm.nearest_images_to_samples(samples, [far_pano, near_pano, near_flat], 25.0)
-    assert panos[0]["id"] == "p_near"
-    assert flats[0]["id"] == "f_near"
+    census = records_to_census([far_pano, near_pano, near_flat])
+    panos, flats = cm.nearest_images_to_samples(samples, census, 25.0)
+    assert _ids(census, panos) == ["p_near"]
+    assert _ids(census, flats) == ["f_near"]
 
 
 def test_chunked_join_matches_a_single_shot_join(monkeypatch):
@@ -427,24 +442,26 @@ def test_chunked_join_matches_a_single_shot_join(monkeypatch):
     # A tight match distance against ~11 m sample spacing, so most samples have
     # nothing in range and the result has real gaps to preserve.
     match_dist = 5.0
+    census = records_to_census(images)
 
     monkeypatch.setattr(cm, "_JOIN_CHUNK_SIZE", 10_000)  # one block
-    whole_panos, whole_flats = cm.nearest_images_to_samples(samples, images, match_dist)
+    whole_panos, whole_flats = cm.nearest_images_to_samples(samples, census, match_dist)
 
     monkeypatch.setattr(cm, "_JOIN_CHUNK_SIZE", 7)  # boundaries at 7, 14, 21
-    chunked_panos, chunked_flats = cm.nearest_images_to_samples(samples, images, match_dist)
+    chunked_panos, chunked_flats = cm.nearest_images_to_samples(samples, census, match_dist)
 
-    assert {k: v["id"] for k, v in chunked_panos.items()} == {
-        k: v["id"] for k, v in whole_panos.items()
-    }
-    assert {k: v["id"] for k, v in chunked_flats.items()} == {
-        k: v["id"] for k, v in whole_flats.items()
-    }
-    assert whole_panos, "fixture should match at least some samples"
+    assert _ids(census, chunked_panos) == _ids(census, whole_panos)
+    assert _ids(census, chunked_flats) == _ids(census, whole_flats)
+    matched = (whole_panos >= 0).sum()
+    assert matched, "fixture should match at least some samples"
     # Samples out of range stay unmatched rather than being filled in.
-    assert len(whole_panos) < len(samples)
+    assert matched < len(samples)
 
 
 def test_nearest_images_to_samples_handles_empty_inputs():
-    assert cm.nearest_images_to_samples([], [_image("p", 44.05, -121.3)], 25.0) == ({}, {})
-    assert cm.nearest_images_to_samples([(44.05, -121.3, 0, 0)], [], 25.0) == ({}, {})
+    one_image = records_to_census([_image("p", 44.05, -121.3)])
+    no_samples = cm.nearest_images_to_samples([], one_image, 25.0)
+    assert all(len(m) == 0 for m in no_samples)
+    # An empty census leaves every sample unmatched rather than raising.
+    no_images = cm.nearest_images_to_samples([(44.05, -121.3, 0, 0)], records_to_census([]), 25.0)
+    assert all(list(m) == [-1] for m in no_images)
