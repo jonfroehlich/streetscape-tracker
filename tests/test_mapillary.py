@@ -290,6 +290,107 @@ def test_vectorized_capture_dates_on_an_empty_census():
     assert list(dm.captured_at_to_iso_dates([])) == []
 
 
+# ── Cross-tile dedup (issue #157) ──────────────────────────────────────────
+
+
+def _census_of_tile(features, x, y):
+    return dm.records_to_census(dm.decode_image_features(encode_tile(features, x, y), x, y))
+
+
+def test_cross_tile_dedup_keeps_the_last_copy_at_the_first_position():
+    """
+    The row-wise census deduped with ``images_by_id[record["id"]] = record``,
+    and a dict is TWO rules: a repeated id takes the LAST copy's values but
+    keeps the position of its FIRST appearance, because assigning to an
+    existing key overwrites the value without reordering the key.
+
+    ``drop_duplicates(subset="id", keep="last")`` satisfies only the first —
+    it moves the surviving row to the last occurrence. Render-buffer duplicates
+    are ubiquitous, so that reorders essentially every real city's run CSV, and
+    the golden fixture structurally cannot catch it: its duplicate is the last
+    feature of the last tile, which is the one arrangement where the two
+    orderings coincide. Hence this test, on an arrangement where they don't.
+    """
+    x, y = 2620, 5722
+    lon_a, lat_a = dm.tile_frac_to_lonlat(x + 0.25, y + 0.25, dm.TILE_ZOOM)
+    lon_b, lat_b = dm.tile_frac_to_lonlat(x + 0.75, y + 0.75, dm.TILE_ZOOM)
+
+    # "200" is published in both tiles; "100" only in the first.
+    first_tile = _census_of_tile(
+        [make_image(200, lon_a, lat_a), make_image(100, lon_a, lat_a)], x, y
+    )
+    second_tile = _census_of_tile([make_image(200, lon_b, lat_b)], x, y)
+    deduped = dm.dedupe_census(dm.concat_census([first_tile, second_tile]))
+
+    # Order: "200" stays where it FIRST appeared. keep="last" gives ["100", "200"].
+    assert list(deduped["id"]) == ["200", "100"]
+    # Values: the LAST copy wins. The two copies are quantized to their own
+    # tile's extent, and preferring the other one can move an edge image to a
+    # neighbouring grid point — a phantom change in the next run-to-run diff.
+    survivor_lat = deduped.loc[0, "lat"]
+    assert abs(survivor_lat - lat_b) < abs(survivor_lat - lat_a)
+
+
+def test_dedup_leaves_a_duplicate_free_census_alone():
+    """The no-duplicates fast path must be a genuine no-op, not a reordering."""
+    x, y = 2620, 5722
+    lon, lat = dm.tile_frac_to_lonlat(x + 0.5, y + 0.5, dm.TILE_ZOOM)
+    census = _census_of_tile(
+        [make_image(i, lon, lat) for i in (300, 100, 200)],
+        x,
+        y,
+    )
+    assert list(dm.dedupe_census(census)["id"]) == ["300", "100", "200"]
+
+
+def test_a_non_integral_captured_at_does_not_cost_the_whole_tile():
+    """
+    Contributor-supplied tile properties are cast with pd.array(dtype="Int64"),
+    which is a SAFE cast — it raises rather than coercing. That raise happens
+    inside fetch_one, BEFORE any of the capture-date guards run, so an
+    unguarded cast would have the tile scored as failed and every other image
+    in it discarded (one z14 tile has been observed carrying 2.1M features),
+    and on a small city would push the run past MAX_FAILED_TILE_FRACTION. The
+    row-wise census carried such a value untouched to captured_at_to_iso_date,
+    which is why that function catches OverflowError explicitly.
+
+    A captured_at encoded as an MVT double rather than an int is the reachable
+    form of this: the wire format carries doubles, and 42.5 is not a safe
+    int64.
+    """
+    x, y = 2620, 5722
+    lon, lat = dm.tile_frac_to_lonlat(x + 0.5, y + 0.5, dm.TILE_ZOOM)
+    dirty = make_image(101, lon, lat)
+    dirty["captured_at"] = 42.5
+
+    census = _census_of_tile([make_image(100, lon, lat), dirty], x, y)
+
+    # Both images survive the tile; only the unusable field is nulled.
+    assert list(census["id"]) == ["100", "101"]
+    assert census.loc[0, "captured_at_ms"] == 1650000000000
+    assert pd.isna(census.loc[1, "captured_at_ms"])
+
+
+def test_an_out_of_int64_tile_value_is_nulled_rather_than_raising():
+    """
+    The other reachable dirty value, applied to the decoded record rather than
+    the tile: MVT carries uint64, whose top half does not fit int64 — and
+    mapbox_vector_tile's own encoder refuses to emit one, so this cannot be
+    built as a tile here even though a producer can publish it.
+    """
+    x, y = 2620, 5722
+    lon, lat = dm.tile_frac_to_lonlat(x + 0.5, y + 0.5, dm.TILE_ZOOM)
+    records = dm.decode_image_features(
+        encode_tile([make_image(100, lon, lat), make_image(101, lon, lat)], x, y), x, y
+    )
+    records[1]["captured_at_ms"] = 2**64 - 1
+
+    census = dm.records_to_census(records)
+
+    assert list(census["id"]) == ["100", "101"]
+    assert pd.isna(census.loc[1, "captured_at_ms"])
+
+
 # ── Grid assignment ────────────────────────────────────────────────────────
 
 
@@ -923,12 +1024,31 @@ def test_golden_comparison_tolerates_only_cross_platform_grid_noise():
         fields[column] = repr(float(fields[column]) + delta)
         return ",".join(fields)
 
+    def nudge(line, column, ulps):
+        """Move a coordinate by whole ULPs AT ITS OWN MAGNITUDE."""
+        value = float(line.split(",")[column])
+        return perturb(line, column, ulps * math.ulp(value))
+
     def mutated(new_lines):
         return "\n".join(new_lines) + "\n"
 
     # Accepted: last-ULP drift in BOTH grid columns on every row, which is the
-    # real macOS-vs-glibc geodesic difference (~6e-15 deg) this exists for.
-    nudged = [lines[0]] + [perturb(perturb(line, 0, 7e-15), 1, -7e-15) for line in lines[1:]]
+    # real macOS-vs-glibc geodesic difference (~7e-15 deg) this exists for.
+    nudged = [lines[0]] + [nudge(nudge(line, 0, 1), 1, -1) for line in lines[1:]]
+    # The nudge has to be magnitude-relative, and this asserts that it was: a
+    # fixed 7e-15 is a whole ULP at latitude ~47 but BELOW HALF a ULP at
+    # longitude ~122 (ULP 1.42e-14), where it rounds straight back to the
+    # original repr. Measured on this fixture, it moved 122 of 122 query_lat
+    # values and 0 of 122 query_lon values — so the acceptance half of this
+    # test demonstrated nothing whatsoever about query_lon, and a comparison
+    # that had silently gone back to requiring exact bytes there would have
+    # passed it. That is the same "passes no matter what ships" failure this
+    # test exists to prevent, one level up.
+    for column in (0, 1):
+        assert all(
+            n.split(",")[column] != g.split(",")[column]
+            for n, g in zip(nudged[1:], lines[1:], strict=True)
+        ), f"the nudge never moved column {column}, so its tolerance is untested here"
     _assert_csv_matches_golden(mutated(nudged), golden)
 
     # Rejected: a grid point that actually moved. 6e-6 deg is where a float32

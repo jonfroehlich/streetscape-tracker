@@ -43,6 +43,7 @@ from streetscape_metadata_tracker.download_mapillary import (
     captured_at_to_iso_dates,
     fetch_city_images_async,
     grid_bbox,
+    status_for_capture_dates,
 )
 from streetscape_metadata_tracker.fileutils import load_city_csv_file
 
@@ -182,11 +183,12 @@ def build_streetwalk_rows(
     capture_dates[pano_of_matched] = captured_at_to_iso_dates(
         census["captured_at_ms"].to_numpy()[chosen[matched_idx][pano_of_matched]]
     ).to_numpy()
-    status = np.where(
-        ~pano_of_matched,
-        FLAT_ONLY,
-        np.where(capture_dates != "", "OK", "NO_DATE"),
-    )
+    # status_for_capture_dates is evaluated over every matched row, including
+    # the flat ones whose capture_date is None — those transiently read "OK"
+    # (None != "") and are then overridden by the outer where. Kept whole-array
+    # rather than masked so the OK/NO_DATE rule has exactly one statement,
+    # shared with the grid downloader; a flat row's status never escapes it.
+    status = np.where(~pano_of_matched, FLAT_ONLY, status_for_capture_dates(capture_dates))
     image_rows = build_image_rows(
         census,
         chosen[matched_idx],
@@ -205,7 +207,6 @@ def build_streetwalk_rows(
         sample_lons[empty_idx],
         query_timestamp,
         "ZERO_RESULTS",
-        len(empty_idx),
     )
     # Restore sample order: the two frames were built by kind, not by position.
     combined = pd.concat([image_rows, empty_rows], ignore_index=True)
@@ -250,7 +251,10 @@ async def collect_mapillary_street_samples_async(
         connection_limit=connection_limit,
         request_timeout=request_timeout,
     )
-    census = fetched["census"]
+    # pop, not [] — `fetched` is a live local until this function returns, so
+    # indexing it would keep the whole census resident past the `del` below,
+    # through the join, the row build and the CSV write.
+    census = fetched.pop("census")
     num_flat_images = int((~census["is_pano"].to_numpy()).sum())
     logger.info(
         "%s: %d Mapillary images (%d panos, %d flat) from %d tiles → scoring %d sample points",

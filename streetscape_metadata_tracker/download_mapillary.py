@@ -309,6 +309,43 @@ _CENSUS_DTYPES = {
 }
 
 
+def _census_column(records: list[dict[str, Any]], column: str, dtype):
+    """
+    Build one census column, so that a single dirty value can't cost a tile.
+
+    ``pd.array(..., dtype="Int64"/"boolean")`` is a SAFE cast: a contributor
+    device clock reporting a captured_at outside int64's range, or a
+    non-integral one, raises rather than coercing (verified: 10**25 ->
+    OverflowError, 42.5 -> TypeError). That exception would be raised inside
+    ``fetch_one`` — i.e. before any of the capture-date guards run — so
+    ``fetch_city_images_async`` would score the tile as failed, discarding
+    every other image in it (one z14 tile has been observed carrying 2.1M
+    features) and, on a small city, pushing the run straight past
+    MAX_FAILED_TILE_FRACTION. The row-wise census kept such a value untouched
+    and let :func:`captured_at_to_iso_date` turn it into NO_DATE, which is
+    exactly why that function catches OverflowError explicitly.
+
+    So: the vectorized cast whenever it works, and a per-value pass only for a
+    tile that actually holds something unusable. That fallback is a Python loop
+    over one tile and is slow — and still far cheaper than dropping the tile.
+    """
+    values = [r[column] for r in records]
+    try:
+        return pd.array(values, dtype=dtype)
+    except (TypeError, ValueError, OverflowError) as e:
+        logger.warning(
+            f"Unusable {column} value(s) in a tile ({e}); coercing the bad "
+            f"entries to null rather than failing the whole tile"
+        )
+    coerced = []
+    for value in values:
+        try:
+            coerced.append(pd.array([value], dtype=dtype)[0])
+        except (TypeError, ValueError, OverflowError):
+            coerced.append(None)
+    return pd.array(coerced, dtype=dtype)
+
+
 def records_to_census(records: list[dict[str, Any]]) -> pd.DataFrame:
     """
     Turn one tile's decoded records into a columnar census frame.
@@ -326,10 +363,7 @@ def records_to_census(records: list[dict[str, Any]]) -> pd.DataFrame:
     if not records:
         return pd.DataFrame({c: pd.Series(dtype=d) for c, d in _CENSUS_DTYPES.items()})
     return pd.DataFrame(
-        {
-            column: pd.array([r[column] for r in records], dtype=dtype)
-            for column, dtype in _CENSUS_DTYPES.items()
-        }
+        {column: _census_column(records, column, dtype) for column, dtype in _CENSUS_DTYPES.items()}
     )
 
 
@@ -339,6 +373,64 @@ def concat_census(frames: list[pd.DataFrame]) -> pd.DataFrame:
     if not frames:
         return records_to_census([])
     return pd.concat(frames, ignore_index=True)
+
+
+def dedupe_census(census: pd.DataFrame) -> pd.DataFrame:
+    """
+    Collapse cross-tile duplicate image ids, exactly as the row-wise census did.
+
+    Tiles are encoded with a render buffer, so an image near an edge is
+    published in two tiles. The row-wise form deduped them with
+    ``images_by_id[record["id"]] = record``, and a dict is TWO rules, not one:
+    a repeated id takes the **last** copy's values, but keeps the position of
+    its **first** appearance (assigning to an existing key overwrites the value
+    without reordering the key).
+
+    Both halves matter and pandas has no single call for the pair:
+
+    * Values — the two copies carry coordinates quantized to their own tile's
+      extent, so preferring the other one can shift an edge image to a
+      neighbouring grid point and surface as a phantom change in the next
+      run-to-run diff.
+    * Order — a run file is an immutable dated snapshot, so its row order is
+      part of what must not drift. ``drop_duplicates(keep="last")`` gets the
+      values right and the order wrong: given tiles ``[B, A]`` and ``[B]`` it
+      yields ``[A, B]`` where the dict yielded ``[B, A]``. Buffer duplicates
+      are ubiquitous, so that reorders essentially every real city.
+
+    Args:
+        census: the concatenated per-tile census, in tile order.
+
+    Returns:
+        The deduped census, re-indexed from 0.
+    """
+    # factorize numbers the ids in order of FIRST appearance, so `codes` is
+    # already the dict's key order; the scatter below then overwrites each
+    # code's slot with every later position it occurs at, leaving the LAST.
+    # (NumPy specifies last-wins for repeated indices in a plain assignment.)
+    codes, uniques = pd.factorize(census["id"])
+    if len(uniques) == len(census):  # no duplicates: skip the copy entirely
+        return census
+    last_position = np.empty(len(uniques), dtype=np.int64)
+    last_position[codes] = np.arange(len(codes), dtype=np.int64)
+    return census.take(last_position).reset_index(drop=True)
+
+
+def status_for_capture_dates(capture_dates) -> np.ndarray:
+    """
+    Per-row OK / NO_DATE from already-parsed capture dates.
+
+    Mirrors GSV's convention: an image whose contributor timestamp is unusable
+    still proves coverage, so it is present-but-NO_DATE rather than a row
+    quietly carrying a bogus date into the dated statistics. Shared by the grid
+    downloader and the road-walk collector so one provider's status vocabulary
+    can't drift from the other's.
+
+    Args:
+        capture_dates: array-like of 'YYYY-MM-DD'/'' from
+            :func:`captured_at_to_iso_dates`.
+    """
+    return np.where(np.asarray(capture_dates) != "", "OK", "NO_DATE")
 
 
 def build_image_rows(
@@ -403,14 +495,18 @@ def build_image_rows(
     )
 
 
-def build_empty_rows(query_lat, query_lon, query_timestamp: str, status, n: int) -> pd.DataFrame:
+def build_empty_rows(query_lat, query_lon, query_timestamp: str, status) -> pd.DataFrame:
     """
     Rows for query locations with no imagery — the ZERO_RESULTS fill, plus the
     REQUEST_FAILED variant for points under an undownloaded tile.
 
     Built column-wise: at a 4M-point grid the equivalent list of per-point
     dicts was the single largest allocation in the pipeline (issue #157).
+    The row count comes from ``query_lat`` rather than a separate argument —
+    the two can only ever disagree by caller error, and the disagreement would
+    surface as a length mismatch raised from inside the DataFrame constructor.
     """
+    n = len(query_lat)
     return pd.DataFrame(
         {
             "query_lat": query_lat,
@@ -418,8 +514,11 @@ def build_empty_rows(query_lat, query_lon, query_timestamp: str, status, n: int)
             "query_timestamp": query_timestamp,
             "status": status,
             # No image at this location -> every image-derived column is null.
+            # np.full rather than [None] * n: at Cairo's ~10.5M grid points the
+            # Python list is ~84 MB of pure transient, per column, on the
+            # allocation this function exists to keep small.
             **{
-                c: pd.Series([None] * n, dtype=object)
+                c: np.full(n, None, dtype=object)
                 for c in MAPILLARY_METADATA_DTYPES
                 if c not in ("query_lat", "query_lon", "query_timestamp", "status")
             },
@@ -655,16 +754,12 @@ async def fetch_city_images_async(
         logger.warning(f"Continuing with {detail}; affected grid points marked REQUEST_FAILED")
 
     raw_feature_count = sum(len(r) for r in results)
-    # Tiles are encoded with a buffer, so features near tile edges appear in
-    # two tiles — dedup on image id (panos and flats share the id space).
-    # keep="last" is load-bearing, not a default: it reproduces the previous
-    # `images_by_id[record["id"]] = record`, and the two copies of an image
-    # carry coordinates quantized to their own tile's extent, so preferring the
-    # other one could shift an edge image to a neighbouring grid point and show
-    # up as a phantom change in the next run-to-run diff.
     census = concat_census(results)
-    del results
-    census = census.drop_duplicates(subset="id", keep="last").reset_index(drop=True)
+    # BOTH names have to go before the dedup copy: `settled` and `results` hold
+    # references to the same per-tile frames, so dropping either one alone frees
+    # nothing and leaves a third full census resident through dedupe_census.
+    del results, settled
+    census = dedupe_census(census)
 
     return {
         "census": census,
@@ -736,7 +831,10 @@ async def download_mapillary_metadata_async(
         connection_limit=connection_limit,
         request_timeout=request_timeout,
     )
-    census = fetched["census"]
+    # pop, not [] — `fetched` stays a live local until this function returns, so
+    # indexing it would pin the whole census in memory straight through
+    # build_empty_rows and both CSV writes, defeating the `del census` below.
+    census = fetched.pop("census")
     api_requests = fetched["api_requests"]
     tiles = fetched["tiles"]
     results = fetched["raw_feature_count"]
@@ -770,17 +868,17 @@ async def download_mapillary_metadata_async(
     # loop visited them in, and therefore the row order of the output file.
     pano_positions = np.flatnonzero(in_grid & is_pano)
     pano_ordinals = ordinals[pano_positions]
-    capture_dates = captured_at_to_iso_dates(census["captured_at_ms"].to_numpy()[pano_positions])
+    capture_dates = captured_at_to_iso_dates(
+        census["captured_at_ms"].to_numpy()[pano_positions]
+    ).to_numpy()
     covered_df = build_image_rows(
         census,
         pano_positions,
         grid_lats[pano_ordinals],
         grid_lons[pano_ordinals],
         query_timestamp,
-        # Mirror GSV's convention: a pano without a usable capture date is
-        # present but doesn't count toward dated stats (NO_DATE).
-        np.where(capture_dates.to_numpy() != "", "OK", "NO_DATE"),
-        capture_dates.to_numpy(),
+        status_for_capture_dates(capture_dates),
+        capture_dates,
     )
     del capture_dates
 
@@ -813,12 +911,24 @@ async def download_mapillary_metadata_async(
         None,
     )
     num_flat_only_points = len(flat_positions)
-    covered_df = (
-        pd.concat([covered_df, flat_only_df], ignore_index=True)
-        if num_flat_only_points
-        else covered_df
-    )
-    del flat_only_df, census, is_pano, in_grid
+    # Deliberately NOT pd.concat'd onto covered_df. covered_df is one row per
+    # in-grid pano — 6.5M rows of mostly-object columns at Colorado Springs —
+    # and concatenating copies all of it to append a frame that is at most one
+    # row per grid point. The two are written to the gzip handle in sequence
+    # instead, which is byte-identical, for the same reason the empty fill is
+    # (see the write below).
+    del census, is_pano, in_grid
+
+    # Which grid points nothing covered, via a bitmap rather than np.setdiff1d:
+    # setdiff1d sorts and uniques BOTH operands, including the
+    # num_grid_points-long arange that is unique by construction — O(n log n)
+    # plus several int64 temporaries over the biggest array in the function.
+    # This is O(n) and one byte per point, and needs no concatenate either.
+    covered = np.zeros(num_grid_points, dtype=bool)
+    covered[pano_ordinals] = True
+    covered[flat_ordinals] = True
+    empty_ordinals = np.flatnonzero(~covered)
+    del covered, pano_ordinals, flat_ordinals, ordinals
 
     # The empty-grid-point fill, built COLUMN-WISE rather than as one dict per
     # point. This is the single biggest allocation in the whole pipeline: a
@@ -826,18 +936,11 @@ async def download_mapillary_metadata_async(
     # plus another ~6 GB when pandas turns them into an N x 16 object matrix —
     # on a cgroup capped at 8 GB (issue #157). As arrays the same fill is two
     # float columns and a handful of all-null ones.
-    empty_ordinals = np.setdiff1d(
-        np.arange(num_grid_points, dtype=np.int64),
-        np.concatenate([pano_ordinals, flat_ordinals]),
-        assume_unique=False,
-    )
-    del pano_ordinals, flat_ordinals, ordinals
     empty_df = build_empty_rows(
         grid_lats[empty_ordinals],
         grid_lons[empty_ordinals],
         query_timestamp,
         "ZERO_RESULTS",
-        len(empty_ordinals),
     )
     # An uncovered point inside a tile that never downloaded is UNKNOWN, not
     # empty. Left as ZERO_RESULTS it would be indistinguishable from genuine
@@ -859,18 +962,20 @@ async def download_mapillary_metadata_async(
     num_empty_points = len(empty_ordinals)
     del empty_ordinals
 
-    # Stream straight into the gzip handle, and write the two frames in
+    # Stream straight into the gzip handle, and write the three frames in
     # sequence rather than pd.concat'ing them first. df.to_csv() with no path
     # built the ENTIRE csv as one Python str and then a second full copy as
     # bytes — about 1.7 GB of pure duplication at Cairo scale, for a file we
-    # are writing out anyway — and the concat was a third full copy of both
-    # frames. Appending with header=False is byte-identical to concatenating:
-    # same columns, same order, covered rows first.
+    # are writing out anyway — and each concat was another full copy of the
+    # frames it joined. Appending with header=False is byte-identical to
+    # concatenating: same columns, same order, panos then flat-only then empty.
     with gzip.open(output_csv_gz_path, "wt", encoding="utf-8", newline="") as f:
         covered_df.to_csv(f, index=False)
+        if num_flat_only_points:
+            flat_only_df.to_csv(f, index=False, header=False)
         if num_empty_points:
             empty_df.to_csv(f, index=False, header=False)
-    del covered_df, empty_df
+    del covered_df, flat_only_df, empty_df
 
     # Read back through the shared loader so dtypes match GSV runs exactly
     df = load_city_csv_file(output_csv_gz_path)
