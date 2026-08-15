@@ -17,7 +17,12 @@ logger = logging.getLogger(__name__)
 # Configure OSMnx
 ox.settings.log_console = True
 ox.settings.use_cache = True
-ox.settings.timeout = 30
+# osmnx 2.x renamed this to requests_timeout; `ox.settings` is a plain module,
+# so the old `ox.settings.timeout = 30` here silently created an attribute
+# nothing read. This module is legacy and unused by the active pipeline, but a
+# known-wrong line invites being copied — see issue #209 and the live version
+# in streetscape_street_analyzer/download_street_network.py.
+ox.settings.requests_timeout = 180
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
