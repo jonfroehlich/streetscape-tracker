@@ -70,7 +70,11 @@ from streetscape_metadata_tracker import config as cfg
 from streetscape_metadata_tracker import db
 from streetscape_metadata_tracker.analysis import detect_systemic_failure
 from streetscape_metadata_tracker.config import load_config
-from streetscape_metadata_tracker.download_common import DownloadError
+from streetscape_metadata_tracker.download_common import (
+    HOST_EXIT_CODES,
+    DownloadError,
+    HostUnavailableError,
+)
 from streetscape_metadata_tracker.download_gsv import collect_points_async
 from streetscape_metadata_tracker.download_mapillary import (
     DEFAULT_TILE_REQUESTS_PER_MINUTE,
@@ -136,9 +140,16 @@ def run_collect(args: argparse.Namespace) -> int:
         run_date = date.fromisoformat(args.run_date) if args.run_date else date.today()
 
         # Frozen network → edges (registers the #103 network row via conn).
-        edges = fetch_street_edges(
-            city, data_dir, refresh=args.refresh, network_type=args.network_type, conn=conn
-        )
+        # A cached network costs nothing; a cold one goes to Overpass, which
+        # meters by IP — so a busy or blocked host exits with that host's code
+        # rather than an anonymous 1 (issue #208).
+        try:
+            edges = fetch_street_edges(
+                city, data_dir, refresh=args.refresh, network_type=args.network_type, conn=conn
+            )
+        except HostUnavailableError as e:
+            logger.error("Street network unavailable: %s", e)
+            return HOST_EXIT_CODES[e.host]
         samples = generate_samples(edges, args.spacing)
         query_points = dedupe_query_points(samples)
         logger.info(
@@ -274,7 +285,11 @@ def run_collect(args: argparse.Namespace) -> int:
                 )
         except DownloadError as e:
             # Failed crawls still spent real requests; record them so a later
-            # budget check doesn't overspend the street channel.
+            # budget check doesn't overspend the street channel. This runs for
+            # a host-unavailable failure too (HostUnavailableError IS a
+            # DownloadError) — a Mapillary walk blocked partway through the
+            # tile census has spent real requests, and a busy-lock failure has
+            # spent none, so the same accounting is correct for both.
             spent = getattr(e, "api_requests", 0)
             if spent:
                 db.add_api_usage(conn, run_date, spent, provider=budget_channel)
@@ -282,6 +297,8 @@ def run_collect(args: argparse.Namespace) -> int:
                     "Recorded %d %s requests spent by the failed crawl", spent, budget_channel
                 )
             logger.error("Collection failed: %s", e)
+            if isinstance(e, HostUnavailableError):
+                return HOST_EXIT_CODES[e.host]
             return 1
 
         df = dict_results["df"]

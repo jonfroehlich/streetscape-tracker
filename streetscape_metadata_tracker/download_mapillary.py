@@ -54,6 +54,7 @@ from tqdm import tqdm
 from .analysis import FLAT_ONLY, REQUEST_FAILED
 from .config import MAPILLARY_METADATA_DTYPES
 from .download_common import (
+    HOST_MAPILLARY_TILES,
     AsyncRateLimiter,
     DownloadError,
     generate_grid_arrays,
@@ -61,6 +62,7 @@ from .download_common import (
     redact_credentials,
 )
 from .fileutils import load_city_csv_file
+from .host_lock import host_lock
 
 logger = logging.getLogger(__name__)
 
@@ -722,6 +724,41 @@ async def _fetch_tile(
 
 
 async def fetch_city_images_async(
+    city_name: str,
+    bbox: tuple[float, float, float, float],
+    access_token: str,
+    connection_limit: int = 5,
+    request_timeout: float = 30,
+    max_requests_per_minute: int = DEFAULT_TILE_REQUESTS_PER_MINUTE,
+) -> dict[str, Any]:
+    """
+    Fetch a city's Mapillary tile census, serialized against other processes.
+
+    Every tile request in the repo passes through here — the grid run and the
+    road walk both — which is what makes this the one place the machine-wide
+    tile lock has to be taken. The CDN rate-limits per IP, so ``AsyncRateLimiter``
+    bounding this process is only half the guarantee; the lock supplies the
+    other half by ensuring no second process is pacing itself at the same time
+    (issue #208).
+
+    See :func:`_fetch_city_images` for the arguments and return value.
+
+    Raises:
+        HostBusyError: another process on this machine is already fetching
+            tiles. Raised before any request is issued.
+    """
+    with host_lock(HOST_MAPILLARY_TILES):
+        return await _fetch_city_images(
+            city_name,
+            bbox,
+            access_token,
+            connection_limit=connection_limit,
+            request_timeout=request_timeout,
+            max_requests_per_minute=max_requests_per_minute,
+        )
+
+
+async def _fetch_city_images(
     city_name: str,
     bbox: tuple[float, float, float, float],
     access_token: str,

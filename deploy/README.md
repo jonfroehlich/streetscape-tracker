@@ -195,6 +195,49 @@ systemctl --user start streetscape-tracker.service           # trigger a run now
 Rotating file logs also go to `logs/streetscape_scheduler.log`, and dated
 catalog backups to `backups/` (see below).
 
+### Running anything by hand alongside the scheduler (issue #208)
+
+Mapillary's tile CDN and the Overpass API both rate-limit **per IP**, not per
+credential. Our client-side pacing is per *process*, so two collections running
+at once on this box present double the configured rate — which is exactly how
+makelab2 earned bans from both services in one night on 2026-08-14, from a
+detached catch-up script that outlived every config change made to stop it.
+
+A file lock in `locks/` now enforces this. A second process that reaches one of
+those hosts **fails immediately** rather than queueing, naming the pid that
+holds the lock:
+
+```bash
+# Both of these are safe to start at any time: they fail fast instead of
+# doubling the rate, and GSV grid collection is unaffected either way.
+python streetscape_tracker.py "Bend, OR" --provider mapillary
+python -m streetscape_street_analyzer.collect "Bend, OR"
+```
+
+Two rules for manual work:
+
+1. **Use the same lock directory as the scheduler.** The unit sets
+   `STREETSCAPE_LOCK_DIR=/projects/makeabilitylab/streetscape-tracker/locks`
+   explicitly, because `PrivateTmp=true` and the `%h` symlink would otherwise
+   make the two processes derive different paths and never see each other. If
+   you run from the real checkout path the default already matches; if you run
+   from `~/streetscape-tracker`, export it.
+2. **A leftover `locks/*.lock` file is not a held lock.** `flock` is released by
+   the kernel when the process dies, SIGKILL included. Do not delete lock files
+   to "unstick" anything — check `locks/*.lock.owner` for the pid instead.
+
+Exit codes a collection child uses to report a host-level condition:
+
+| code | meaning |
+|---|---|
+| `75` | Mapillary's tile CDN is unavailable to this host (blocked, or another local process holds the lock) |
+| `76` | The Overpass API is unavailable to this host |
+
+`run-due` reads these: the first one skips that host's remaining channels for
+the night, alerts unconditionally, exits nonzero, and still publishes — but
+records **no** per-city failure, so the affected cities stay due and lead the
+next night's queue rather than burning their `consecutive_failures` budget.
+
 ### Backups (verified with CSE IT, 2026-08-05 — issue #145)
 
 What CSE IT confirmed when we asked, after the 2026-07 quota incident (#143)

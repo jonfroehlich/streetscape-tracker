@@ -37,6 +37,11 @@ __pycache__/
 # /archive/ — the publish rsync only walks data/, so nothing here can reach the
 # public web server. Inside the project root so CSE IT's snapshots cover it.
 /backups/
+# Per-host lock files (issue #208), serializing access to third parties that
+# meter by IP. Runtime state, never committed. Here rather than /tmp because the
+# systemd unit sets PrivateTmp=true, which would hide these from exactly the
+# detached operator processes the lock exists to serialize against.
+/locks/
 # Claude Code. settings.json is shared project config and IS tracked (team
 # settings: permissions, hooks); the local override and worktree metadata are
 # per-machine. Claude Code normally protects settings.local.json by adding it

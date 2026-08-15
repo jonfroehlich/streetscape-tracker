@@ -30,6 +30,16 @@ WorkingDirectory=%h/streetscape-tracker
 EnvironmentFile=%h/streetscape-tracker/.env
 # Publish straight to the NFS-mounted docroot (no SSH) — see sync_data_to_server.sh
 Environment=STREETSCAPE_PUBLISH_LOCAL=1
+# Where the per-IP host locks live (issue #208). Set EXPLICITLY, and to the real
+# path rather than %h, for two independent reasons — either alone would make the
+# lock a silent no-op against a detached operator process:
+#   1. PrivateTmp=true (below) gives this unit and its children a private /tmp,
+#      so a /tmp-based lock would be invisible to anything outside the unit.
+#   2. WorkingDirectory is the %h SYMLINK, and paths.get_project_root() uses
+#      abspath, which does not resolve symlinks — so a scheduler child and an
+#      operator shell in /projects/makeabilitylab would derive different paths.
+# Any manual or detached collection on this host MUST use this same value.
+Environment=STREETSCAPE_LOCK_DIR=/projects/makeabilitylab/streetscape-tracker/locks
 # .venv-makelab2 is a uv-managed venv whose base CPython lives on the shared ZFS
 # checkout (.tooling/), so it runs on BOTH boxes — unlike the old %h/.../.venv,
 # whose base /usr/bin/python3.11 exists only on makelab1. See deploy/README.md.

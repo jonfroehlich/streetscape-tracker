@@ -196,3 +196,24 @@ def _no_mapillary_tile_pacing(monkeypatch):
             return None
 
     monkeypatch.setattr(dm, "AsyncRateLimiter", _NoPacing)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_host_locks(tmp_path, monkeypatch):
+    """
+    Point the per-host locks (issue #208) at a per-test directory.
+
+    Without this the suite would take the SAME lock files a real collection
+    uses, so running pytest during a nightly batch — or two test processes at
+    once — would fail tests for reasons that have nothing to do with the code
+    under test. ``timeout=0`` means the symptom is a spurious ``HostBusyError``
+    rather than a hang, but it is still a false failure.
+
+    ``tmp_path`` is per-test, so tests cannot contend with each other either.
+    Tests that exercise the lock take a second ``FileLock`` on the same path,
+    which behaves exactly like a competing process (see
+    ``tests/test_host_lock.py``).
+    """
+    from streetscape_metadata_tracker import host_lock
+
+    monkeypatch.setenv(host_lock.LOCK_DIR_ENV, str(tmp_path / "locks"))

@@ -23,6 +23,58 @@ class DownloadError(Exception):
     pass
 
 
+# Third-party hosts that meter us by IP rather than by credential (issue #208).
+#
+# Deliberately NOT here: GSV metadata. Google meters the Street View Static API
+# per *project*, so two processes on one host share a quota that the daily
+# ledger already tracks — serializing them would cost throughput and buy
+# nothing. Membership in this list means "a second concurrent process on this
+# host is a hazard to the whole host", which is only true of per-IP limits.
+HOST_MAPILLARY_TILES = "mapillary_tiles"
+HOST_OVERPASS = "overpass"
+
+HOST_LABELS = {
+    HOST_MAPILLARY_TILES: "Mapillary's tile CDN (tiles.mapillary.com)",
+    HOST_OVERPASS: "the Overpass API (overpass-api.de)",
+}
+
+
+class HostUnavailableError(DownloadError):
+    """
+    A whole-HOST condition: every remaining request to this host would fail
+    identically, so the caller should stop rather than work through its queue.
+
+    Distinct from a per-request failure (a 404 on one tile) and from a
+    per-credential failure (a rejected token — that is scoped to the key, and
+    our two Mapillary channels hold different keys, so it must not be treated
+    as host-wide).
+    """
+
+    def __init__(self, message: str, host: str):
+        super().__init__(message)
+        self.host = host
+
+
+class HostBusyError(HostUnavailableError):
+    """Another process ON THIS MACHINE holds the host lock (issue #208)."""
+
+
+class HostBlockedError(HostUnavailableError):
+    """The third party itself is refusing this host's IP (issues #199/#209)."""
+
+
+# Exit codes a collection child uses to tell the scheduler *which* host is
+# unavailable. The message never crosses the process boundary — the scheduler
+# only sees `subprocess.run(...).returncode` — so the host identity has to ride
+# in the status. Values sit in the 75/76 range by analogy with sysexits.h's
+# EX_TEMPFAIL (75): a retryable, environmental condition rather than a bug.
+HOST_EXIT_CODES = {
+    HOST_MAPILLARY_TILES: 75,
+    HOST_OVERPASS: 76,
+}
+HOST_BY_EXIT_CODE = {code: host for host, code in HOST_EXIT_CODES.items()}
+
+
 class AsyncRateLimiter:
     """
     Token-bucket rate limiter for provider APIs with a per-minute quota

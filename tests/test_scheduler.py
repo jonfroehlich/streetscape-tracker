@@ -7,7 +7,7 @@ import os
 import re
 import signal
 import time
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
@@ -2609,3 +2609,202 @@ def test_mapillary_street_child_gets_the_tile_pace(conn):
     # gsv_streets' own pacing flag must not leak onto a Mapillary walk: its
     # value is a GSV-scale number the collector would apply to tile requests.
     assert "--max-requests-per-minute" not in cmd
+
+
+# ---------------------------------------------------------------------------
+# Per-IP host breaker (issue #208)
+#
+# A host that refuses this machine refuses it for every city, so the loop stops
+# asking. The subtle requirement is that a breaker skip must NOT be recorded as
+# a city failure: get_due_cities filters on consecutive_failures and nothing
+# resets that counter except a success.
+# ---------------------------------------------------------------------------
+
+
+def _blocked_outcome(host):
+    from streetscape_metadata_tracker.download_common import HOST_EXIT_CODES
+    from streetscape_metadata_tracker.scheduler import CollectionOutcome
+
+    return CollectionOutcome(
+        False, f"exited {HOST_EXIT_CODES[host]} (blocked)", exit_code=HOST_EXIT_CODES[host]
+    )
+
+
+def _run_loop_with(monkeypatch, conn, cfg, run_one, today=date(2026, 7, 2)):
+    """Drive cmd_run_due with a fake _run_one_city, tail stubbed out."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    monkeypatch.setattr(
+        sched,
+        "_run_one_city",
+        lambda cfg, city, today, provider="gsv", connection_limit=None, daily_budget=0, conn=None, remaining_s=None: (
+            run_one(city, provider)
+        ),
+    )
+    _stub_tail(monkeypatch, sched, conn, [])
+    monkeypatch.setattr(sched, "send_alert", lambda *a, **k: None)
+    return sched.cmd_run_due(cfg, today=today)
+
+
+def test_a_blocked_host_skips_its_channels_for_the_rest_of_the_night(conn, monkeypatch):
+    """One refusal is enough: asking again with the next city cannot produce a
+    different answer, and every ask costs real requests into a blocked host."""
+    from streetscape_metadata_tracker.download_common import HOST_MAPILLARY_TILES
+
+    for name in ("Bend", "Corvallis", "Eugene"):
+        _register(conn, name, width=1000, height=1000, step=20)
+
+    ran = []
+
+    def run_one(city, provider):
+        ran.append((city.city_id, provider))
+        if provider == "mapillary":
+            return _blocked_outcome(HOST_MAPILLARY_TILES)
+        return True
+
+    _run_loop_with(monkeypatch, conn, _street_cfg(publish_enabled=False), run_one)
+
+    mapillary_attempts = [p for _, p in ran if p == "mapillary"]
+    assert len(mapillary_attempts) == 1, "must stop after the first refusal"
+    # ...while the GSV channels, which do not use that host, run for every city.
+    assert len([p for _, p in ran if p == "gsv"]) == 3
+
+
+def test_a_blocked_host_is_not_recorded_as_a_city_failure(conn, monkeypatch):
+    """
+    The city did nothing wrong and we never reached its imagery. Recording a
+    failure would burn one of its five consecutive_failures — and nothing in the
+    codebase resets that counter except a success, so a run of blocked nights
+    would quarantine the city for a whole cycle with no way back but hand SQL.
+    """
+    from streetscape_metadata_tracker.download_common import HOST_MAPILLARY_TILES
+
+    cid = _register(conn, "Bend", width=1000, height=1000, step=20)
+
+    def run_one(city, provider):
+        return True if provider.startswith("gsv") else _blocked_outcome(HOST_MAPILLARY_TILES)
+
+    _run_loop_with(monkeypatch, conn, _street_cfg(publish_enabled=False), run_one)
+
+    rows = {
+        r["provider"]: r
+        for r in conn.execute(
+            "SELECT provider, consecutive_failures, last_error FROM schedule_state "
+            "WHERE city_id = ?",
+            (cid,),
+        )
+    }
+    for channel in ("mapillary", "mapillary_streets"):
+        row = rows.get(channel)
+        # Either no row at all, or a row that records no failure. Both are fine;
+        # what must never happen is a counted failure.
+        if row is not None:
+            assert row["consecutive_failures"] == 0
+            assert row["last_error"] is None
+
+
+def test_repeated_blocked_nights_never_quarantine_a_city(conn, monkeypatch):
+    """The regression this breaker exists to prevent, run end to end: five
+    blocked nights in a row must leave the city as due as it started."""
+    from streetscape_metadata_tracker import db as sdb
+    from streetscape_metadata_tracker.download_common import HOST_MAPILLARY_TILES
+
+    cid = _register(conn, "Bend", width=1000, height=1000, step=20)
+    cfg = _street_cfg(publish_enabled=False)
+
+    def run_one(city, provider):
+        return _blocked_outcome(HOST_MAPILLARY_TILES) if provider == "mapillary" else True
+
+    for day in range(5):
+        _run_loop_with(
+            monkeypatch, conn, cfg, run_one, today=date(2026, 7, 2) + timedelta(days=day)
+        )
+
+    row = conn.execute(
+        "SELECT consecutive_failures FROM schedule_state WHERE city_id = ? AND provider = ?",
+        (cid, "mapillary"),
+    ).fetchone()
+    assert row is None or row["consecutive_failures"] == 0
+
+    # The real contract: it is still returned as due for that channel.
+    due = sdb.get_due_cities(
+        conn,
+        today=date(2026, 7, 20),
+        cycle_days=1,
+        grace_days=0,
+        max_consecutive_failures=5,
+        provider="mapillary",
+    )
+    assert cid in [c.city_id for c in due]
+
+
+def test_only_the_channels_that_need_the_blocked_host_are_skipped(conn, monkeypatch):
+    """Overpass blocks the two road-walk channels; the grid channels are
+    untouched, because a grid run never asks OSM for anything."""
+    from streetscape_metadata_tracker.download_common import HOST_OVERPASS
+
+    for name in ("Bend", "Corvallis"):
+        _register(conn, name, width=1000, height=1000, step=20)
+
+    ran = []
+
+    def run_one(city, provider):
+        ran.append(provider)
+        return _blocked_outcome(HOST_OVERPASS) if provider == "gsv_streets" else True
+
+    _run_loop_with(monkeypatch, conn, _street_cfg(publish_enabled=False), run_one)
+
+    assert ran.count("gsv_streets") == 1
+    assert ran.count("mapillary_streets") == 0, "also needs Overpass for the network"
+    # Grid channels are per-project (gsv) or per-IP on a DIFFERENT host
+    # (mapillary tiles), so neither is affected by an Overpass block.
+    assert ran.count("gsv") == 2
+    assert ran.count("mapillary") == 2
+
+
+def test_a_blocked_night_alerts_unconditionally_exits_nonzero_and_still_publishes(
+    conn, monkeypatch
+):
+    """
+    The breaker records no failure, so without an explicit signal a night that
+    collected zero Mapillary would look like a clean success. It must alert
+    regardless of failure_threshold — same posture as a failed catalog backup —
+    while still publishing what the GSV channels did collect (#167).
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+    from streetscape_metadata_tracker.download_common import HOST_MAPILLARY_TILES
+    from streetscape_metadata_tracker.scheduler import AlertConfig
+
+    _register(conn, "Bend", width=1000, height=1000, step=20)
+
+    published, alerts = [], []
+
+    monkeypatch.setattr(
+        sched,
+        "_run_one_city",
+        lambda cfg, city, today, provider="gsv", connection_limit=None, daily_budget=0, conn=None, remaining_s=None: (
+            _blocked_outcome(HOST_MAPILLARY_TILES) if provider == "mapillary" else True
+        ),
+    )
+    _stub_tail(monkeypatch, sched, conn, published)
+    monkeypatch.setattr(
+        sched, "send_alert", lambda cfg, subject, body: alerts.append((subject, body))
+    )
+
+    cfg = _street_cfg(
+        publish_enabled=True,
+        # A threshold high enough that ordinary failure counting would stay
+        # silent — the alert here must come from the block, not the threshold.
+        alerts=AlertConfig(enabled=True, failure_threshold=99),
+    )
+    rc = sched.cmd_run_due(cfg, today=date(2026, 7, 2))
+
+    assert rc == 1, "a blocked host makes the night unhealthy"
+    assert "publish" in published, "still publishes what was collected (#167)"
+    assert len(alerts) == 1
+    subject, body = alerts[0]
+    assert "UNAVAILABLE" in subject
+    assert "Mapillary" in body
+    # The operator needs to know the cities were not blamed, or the obvious
+    # next move is to go hunting for a per-city problem that does not exist.
+    assert "NO city was marked failed" in body
