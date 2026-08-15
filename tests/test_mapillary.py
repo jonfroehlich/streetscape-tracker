@@ -24,7 +24,13 @@ from multidict import CIMultiDict, CIMultiDictProxy
 
 from streetscape_metadata_tracker import download_mapillary as dm
 from streetscape_metadata_tracker.config import MAPILLARY_METADATA_DTYPES
-from streetscape_metadata_tracker.download_common import DownloadError, generate_grid_points
+from streetscape_metadata_tracker.download_common import (
+    HOST_MAPILLARY_TILES,
+    DownloadError,
+    HostBlockedError,
+    HostUnavailableError,
+    generate_grid_points,
+)
 from streetscape_metadata_tracker.json_summarizer import compute_mapillary_meta
 
 SEATTLE = (47.6062, -122.3321)
@@ -1547,3 +1553,127 @@ def test_a_retried_tile_re_paces_and_is_re_counted():
     assert session.attempts == 3, "the fixture must actually exercise a retry"
     assert len(acquires) == session.attempts
     assert len(counted) == session.attempts
+
+
+# ---------------------------------------------------------------------------
+# Fail fast on a whole-host condition (issue #205)
+#
+# The block/token/error-page classes are whole-CITY conditions, but gather()
+# used to settle every tile before the settle loop could re-raise — so a blocked
+# host spent its complete tile count at the paced 60/min to learn what the first
+# response already said. Fresno: 210 requests, 3.5 min, twice a night.
+#
+# Pacing is disabled suite-wide by conftest, so these assert on REQUEST COUNTS,
+# never on elapsed time.
+# ---------------------------------------------------------------------------
+
+
+_ALL_TILES = len(dm.tiles_for_bbox(*dm.grid_bbox(41.8, -87.7, 30000, 30000, 2000)))
+_CONNECTION_LIMIT = 5  # fetch_city_images_async's default semaphore width
+
+
+def _counting_fatal_fetch(error):
+    """A tile fetcher that records every request and always fails fatally."""
+    served = []
+
+    async def fetch(session, url, timeout):
+        served.append(url)
+        raise error()
+
+    return fetch, served
+
+
+def test_a_blocked_host_stops_instead_of_paying_for_every_tile(monkeypatch):
+    """The headline fix: learn it once, not 361 times."""
+    fetch, served = _counting_fatal_fetch(
+        lambda: HostBlockedError(
+            "Mapillary tile CDN redirected instead of serving a tile (HTTP 302 → "
+            "https://www.mapillary.com/login/?next=REDACTED). ... rate-limited ...",
+            host=HOST_MAPILLARY_TILES,
+        )
+    )
+
+    with pytest.raises(HostBlockedError) as excinfo:
+        _fetch_city(monkeypatch, fetch, 41.8, -87.7)
+
+    assert len(served) <= _CONNECTION_LIMIT, (
+        f"a blocked host must stop after the in-flight tiles drain, not issue all {_ALL_TILES}"
+    )
+    assert len(served) < _ALL_TILES
+    # The ledger must agree with what was actually issued, or the budget guard
+    # starts working from fiction.
+    assert excinfo.value.api_requests == len(served)
+
+
+def test_a_rejected_token_also_stops_early(monkeypatch):
+    """Same shape, different cause: every remaining tile carries the same key."""
+    fetch, served = _counting_fatal_fetch(
+        lambda: DownloadError("Mapillary rejected the access token (HTTP 401).")
+    )
+
+    with pytest.raises(DownloadError):
+        _fetch_city(monkeypatch, fetch, 41.8, -87.7)
+
+    assert len(served) <= _CONNECTION_LIMIT
+
+
+def test_one_bad_tile_still_fans_out_to_every_tile(monkeypatch):
+    """
+    The #168 regression guard, and the reason the abort keys on DownloadError
+    alone. A transient per-tile 404 is worth one tile, not a city — it must NOT
+    trip the early abort, or a single flaky tile would truncate the census and
+    still "succeed" under MAX_FAILED_TILE_FRACTION.
+    """
+    served = []
+    inner = _failing_fetch({(0, 0)})  # a tile that is never in this bbox
+
+    async def counting(session, url, timeout):
+        served.append(url)
+        return await inner(session, url, timeout)
+
+    result = _fetch_city(monkeypatch, counting, 41.8, -87.7)
+
+    assert len(served) == _ALL_TILES, "every tile must still be requested"
+    assert result["api_requests"] == _ALL_TILES
+
+
+def test_a_tolerated_per_tile_failure_does_not_truncate_the_city(monkeypatch):
+    """One genuinely failing tile, under the 2% tolerance: the other 360 are
+    still fetched rather than being skipped by an over-eager abort."""
+    tiles = dm.tiles_for_bbox(*dm.grid_bbox(41.8, -87.7, 30000, 30000, 2000))
+    served = []
+    inner = _failing_fetch({tiles[0]})
+
+    async def counting(session, url, timeout):
+        served.append(url)
+        return await inner(session, url, timeout)
+
+    result = _fetch_city(monkeypatch, counting, 41.8, -87.7)
+
+    assert len(served) == _ALL_TILES
+    assert result["failed_tiles"] == [tiles[0]]
+
+
+def test_a_host_block_is_typed_but_a_bad_token_is_not():
+    """
+    A block belongs to the IP; a rejected token belongs to the credential, and
+    our two Mapillary channels hold DIFFERENT tokens. Typing 401 host-wide would
+    let one channel's bad key stop the other, which is working fine.
+    """
+    _, blocked = _fetch_tile(
+        _FakeTileResponse(302, {"Location": "https://www.mapillary.com/login/?next=x"})
+    )
+    assert isinstance(blocked, HostBlockedError)
+    assert blocked.host == HOST_MAPILLARY_TILES
+
+    _, rejected = _fetch_tile(_FakeTileResponse(401, {}))
+    assert isinstance(rejected, DownloadError)
+    assert not isinstance(rejected, HostUnavailableError)
+
+
+def test_an_html_error_page_is_also_a_host_block():
+    """The pre-#199 symptom: HTTP 200 whose body is a login page. Same host
+    condition as the 302, so it must carry the same type."""
+    _, error = _fetch_tile(_FakeTileResponse(200, {"Content-Type": "text/html"}, b"<html>"))
+    assert isinstance(error, HostBlockedError)
+    assert error.host == HOST_MAPILLARY_TILES

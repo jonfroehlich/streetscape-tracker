@@ -57,6 +57,7 @@ from .download_common import (
     HOST_MAPILLARY_TILES,
     AsyncRateLimiter,
     DownloadError,
+    HostBlockedError,
     generate_grid_arrays,
     grid_index_ranges,
     redact_credentials,
@@ -688,6 +689,10 @@ async def _fetch_tile(
     # parsing message with type 'vector_tile.tile'`, i.e. as corrupt data.
     async with session.get(url, timeout=timeout, allow_redirects=False) as response:
         if response.status in (401, 403):
+            # Deliberately NOT a HostBlockedError: a rejected token is scoped to
+            # the CREDENTIAL, and our two Mapillary channels hold different
+            # tokens. Typing it host-wide would let one channel's bad key stop
+            # the other channel — which is working fine — for the whole night.
             raise DownloadError(
                 f"Mapillary rejected the access token (HTTP {response.status}). "
                 "Check MAPILLARY_ACCESS_TOKEN."
@@ -701,24 +706,26 @@ async def _fetch_tile(
             # and the Graph API keep working and only this host is refused.
             # The Location echoes the request URL, hence redact_credentials.
             location = redact_credentials(response.headers.get("Location", "(none)"))
-            raise DownloadError(
+            raise HostBlockedError(
                 f"Mapillary tile CDN redirected instead of serving a tile (HTTP "
                 f"{response.status} → {location}). A redirect to a login page "
                 f"means this host's IP is rate-limited on tiles.mapillary.com — "
                 f"the access token itself may still be valid (the Graph API and "
                 f"other IPs are unaffected), so retry later and collect "
                 f"Mapillary more slowly. A redirect anywhere else means the tile "
-                f"endpoint has moved and this code needs updating."
+                f"endpoint has moved and this code needs updating.",
+                host=HOST_MAPILLARY_TILES,
             )
         if response.status != 200:
             # 429/5xx raise ClientResponseError, which backoff retries
             response.raise_for_status()
         content_type = response.headers.get("Content-Type", "")
         if any(bad in content_type.lower() for bad in _TILE_ERROR_CONTENT_TYPES):
-            raise DownloadError(
+            raise HostBlockedError(
                 f"Mapillary served an error page instead of a vector tile "
                 f"(HTTP 200, Content-Type: {content_type}). This is usually a "
-                f"rate limit or a block on this host's IP, not a corrupt tile."
+                f"rate limit or a block on this host's IP, not a corrupt tile.",
+                host=HOST_MAPILLARY_TILES,
             )
         return await response.read()
 
@@ -818,11 +825,42 @@ async def _fetch_city_images(
         nonlocal api_requests
         api_requests += 1
 
+    # First whole-city condition seen: a rejected token, a host block, or an
+    # error page. Every remaining tile would fail identically, so stop issuing
+    # them (issue #205). Before this, `gather(return_exceptions=True)` had to
+    # settle ALL tiles before the loop below could re-raise, so a blocked host
+    # spent its ENTIRE tile count at the paced 60/min to learn what the first
+    # response already said — Fresno: 210 requests over 3.5 minutes, twice a
+    # night, into a CDN refusing every one.
+    fatal: DownloadError | None = None
+
     async def fetch_one(x: int, y: int) -> pd.DataFrame:
+        nonlocal fatal
         url = f"{TILE_URL_TEMPLATE.format(z=TILE_ZOOM, x=x, y=y)}?access_token={access_token}"
         async with semaphore:
-            # Pacing/counting happen inside _fetch_tile, per retried attempt.
-            tile_bytes = await _fetch_tile(session, url, timeout, rate_limiter, count_request)
+            # The abort check belongs HERE, inside the semaphore, not at the top
+            # of the coroutine: gather starts every task at once and each runs to
+            # its first suspension point, so a check above this line would be
+            # evaluated by all N tasks before any response has come back. Behind
+            # the semaphore, tasks resume a few at a time as in-flight ones
+            # drain, see the flag, and return without taking a rate-limiter
+            # token or counting a request. Worst case is connection_limit
+            # requests instead of the whole city.
+            if fatal is not None:
+                return records_to_census([])
+            try:
+                # Pacing/counting happen inside _fetch_tile, per retried attempt.
+                tile_bytes = await _fetch_tile(session, url, timeout, rate_limiter, count_request)
+            except DownloadError as e:
+                # ONLY DownloadError trips the abort. Per-tile failures
+                # (aiohttp.ClientResponseError from a 404/429/5xx, or a decode
+                # error) must still fan out to every tile — that is #168's
+                # guarantee that one bad tile cannot discard a city, and it is
+                # what the settle loop's MAX_FAILED_TILE_FRACTION tolerance is
+                # for. Assigned before leaving the semaphore block, so no
+                # waiting task can slip past the check above.
+                fatal = fatal or e
+                raise
         progress_bar.update(1)
         # Convert to columns HERE, not after the gather: asyncio.gather holds
         # every tile's result until the last one lands, so returning dicts kept
