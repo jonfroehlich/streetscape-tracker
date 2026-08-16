@@ -217,3 +217,24 @@ def _isolate_host_locks(tmp_path, monkeypatch):
     from streetscape_metadata_tracker import host_lock
 
     monkeypatch.setenv(host_lock.LOCK_DIR_ENV, str(tmp_path / "locks"))
+
+
+@pytest.fixture(autouse=True)
+def _no_overpass_status_probe(monkeypatch):
+    """
+    Stub the Overpass /status pre-flight (issue #209) for the whole suite.
+
+    It is a real HTTP GET that runs before every uncached graph fetch, so
+    without this the street tests would hit overpass-api.de — breaking the
+    suite's no-network rule, making it fail offline or in CI, and pointing
+    avoidable traffic at a volunteer-run service from every developer machine
+    and every CI job.
+
+    Returning None means "nothing looks wrong, proceed", which is the same
+    answer the real probe gives when it cannot tell. Tests that exercise the
+    probe monkeypatch ``requests.get`` (or the probe itself) directly, which
+    runs after this fixture and so wins.
+    """
+    from streetscape_street_analyzer import download_street_network as dsn
+
+    monkeypatch.setattr(dsn, "_overpass_refusing", lambda url=None: None)
