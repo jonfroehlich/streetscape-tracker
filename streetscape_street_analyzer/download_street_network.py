@@ -17,7 +17,6 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
-import re
 import signal
 import sqlite3
 import threading
@@ -81,11 +80,26 @@ ox.settings.http_user_agent = "streetscape_metadata_tracker (jonf@cs.uw.edu)"
 ox.settings.http_referer = "https://github.com/jonfroehlich/streetscape-tracker"
 
 # Incident-time escape hatch: point at a mirror when the main instance is
-# refusing this host. Read at import so a single env var covers the whole
-# child process, and left at osmnx's default otherwise.
+# refusing this host.
 OVERPASS_URL_ENV = "OVERPASS_URL"
-if os.environ.get(OVERPASS_URL_ENV):
-    ox.settings.overpass_url = os.environ[OVERPASS_URL_ENV]
+
+
+def _apply_overpass_url() -> None:
+    """
+    Point osmnx at ``$OVERPASS_URL`` if it is set, else leave its default.
+
+    Read at CALL time rather than import time (and called again from
+    ``fetch_graph``), for the same reason ``host_lock.lock_dir()`` is: this is
+    the handle an operator reaches for at 03:00 during an incident, and an
+    import-time read cannot be exercised by a test or changed without a
+    restart. Idempotent, so calling it per fetch costs nothing.
+    """
+    override = os.environ.get(OVERPASS_URL_ENV)
+    if override:
+        ox.settings.overpass_url = override
+
+
+_apply_overpass_url()
 
 # Ceiling on one whole graph fetch, retries included.
 #
@@ -93,17 +107,33 @@ if os.environ.get(OVERPASS_URL_ENV):
 # depth limit (osmnx/_overpass.py:477-486), and nothing configurable changes
 # that. So a rate-limit-flavoured refusal never fails — it hangs until the
 # scheduler's per-city timeout SIGKILLs the child, and a SIGKILL carries no
-# exit code, so the #208 breaker can never learn what happened. 15 minutes sits
-# comfortably above the worst legitimate case (3 tenacity attempts × 180 s plus
-# osmnx's own status pauses) while bounding a refusal at ~16 wasted requests
-# instead of unbounded. A real 504 was observed from Overpass on 2026-08-15, so
-# this path is live, not theoretical.
-OVERPASS_DEADLINE_S = 900
+# exit code, so the #208 breaker can never learn what happened. A real 504 was
+# observed from Overpass on 2026-08-15, so this path is live, not theoretical.
+#
+# Derived rather than a flat 15 minutes, because what it has to clear is the
+# worst LEGITIMATE fetch: three tenacity attempts, each a full request timeout
+# plus osmnx's own pre-request pause. That pause is the loose term — with
+# `overpass_rate_limit = True`, `_get_overpass_pause` sleeps the entire slot
+# wait the server advertises, so a busy instance can legitimately add minutes.
+# 120 s of slack per attempt is the assumption being made here; exceeding it is
+# reported as a refusal, which is the conservative direction (the night's other
+# street channels are skipped, no city is blamed, and an alert names the host).
+# If that turns out to fire on healthy-but-busy nights, raise the slack rather
+# than removing the bound — unbounded is how the SIGKILL happens.
+OVERPASS_DEADLINE_S = 3 * (OVERPASS_TIMEOUT_S + 120)  # 900 s
 
-# How long the /status pre-flight will wait for a free slot before treating the
-# instance as unusable. Overpass grants 2 slots per IP; a wait beyond this means
-# we are queued behind our own earlier queries or someone else's.
-OVERPASS_MAX_SLOT_WAIT_S = 120
+# HTTP statuses from /status that mean "this instance is refusing this host".
+#
+# An ALLOW-list of refusals, not a deny-list of everything that isn't 200, and
+# the asymmetry is the reason: a false negative costs one wasted fetch that
+# produces the real error anyway, while a false positive skips every street
+# channel of every city for the night. 502/503 from a front-end proxy while
+# /interpreter is perfectly healthy is an ordinary thing on a volunteer-run
+# instance, so anything not listed here means "can't tell — proceed".
+#
+# 509 is Bandwidth Limit Exceeded, which some Overpass front ends use for
+# per-IP quota; 403 and 429 are the shapes actually seen from overpass-api.de.
+_OVERPASS_REFUSAL_STATUSES = frozenset({403, 429, 509})
 
 # Errors worth retrying: transport faults that a second attempt can plausibly
 # fix. Everything else (a ban page, an empty bbox, a malformed response) is a
@@ -140,6 +170,17 @@ def network_cache_path(city_id: str, data_dir: str, network_type: str = NETWORK_
     return os.path.join(_cache_dir(data_dir), network_cache_filename(city_id, network_type))
 
 
+class _DeadlineExceeded(TimeoutError):
+    """Raised by :func:`_deadline`'s alarm, and by nothing else.
+
+    A distinct type rather than a bare ``TimeoutError`` because the builtin is
+    also ``socket.timeout``: catching the builtin would let a stray socket
+    timeout escaping urllib3 by a path ``requests`` didn't wrap be reported as
+    "Overpass did not complete within 900s — most likely repeated 429/504",
+    sending an operator after entirely the wrong thing.
+    """
+
+
 @contextlib.contextmanager
 def _deadline(seconds: float):
     """
@@ -160,7 +201,7 @@ def _deadline(seconds: float):
         return
 
     def _fire(signum, frame):
-        raise TimeoutError(f"Overpass fetch exceeded {seconds:g}s")
+        raise _DeadlineExceeded(f"Overpass fetch exceeded {seconds:g}s")
 
     previous = signal.signal(signal.SIGALRM, _fire)
     signal.setitimer(signal.ITIMER_REAL, seconds)
@@ -185,10 +226,19 @@ def _overpass_refusing(url: str | None = None) -> str | None:
         Rate limit: 2
         2 slots available now.
 
-    Advisory ONLY: anything unexpected — unreachable, unparseable, a format
-    change — returns None and lets the real fetch proceed. A pre-flight that
-    can fail a healthy collection is worse than no pre-flight, and this endpoint
-    is not part of any documented contract.
+    Advisory ONLY, and the bar for saying "refusing" is deliberately high:
+    anything unexpected — unreachable, unparseable, a format change, a 5xx from
+    a front end — returns None and lets the real fetch proceed. A pre-flight
+    that can fail a healthy collection is worse than no pre-flight (see the UA
+    note below for how nearly that shipped), and this endpoint is not part of
+    any documented contract.
+
+    Deliberately NOT treated as a refusal: a queued slot. Overpass grants 2
+    slots per IP and reports "Slot available after: <ts>, in N seconds" when
+    both are in use — but osmnx reads the same endpoint in
+    ``_overpass._get_overpass_pause`` and simply sleeps the wait off, so the
+    fetch we would be cancelling was going to succeed. Being briefly queued
+    behind our own previous query is the normal state of a working night.
 
     Sends osmnx's headers rather than plain ``requests`` defaults, and NOT as a
     nicety: overpass-api.de answers **HTTP 406** to the stock
@@ -197,24 +247,20 @@ def _overpass_refusing(url: str | None = None) -> str | None:
     a refusal and skipped every city of every night. Reusing osmnx's builder
     also keeps the probe indistinguishable from the query it is speaking for,
     which is what the Overpass usage policy asks for.
+
+    The whole body is guarded, not just the request. ``ox._http`` is a private
+    osmnx API and ``requirements.txt`` pins ``osmnx>=2.0`` with no ceiling, so a
+    rename would otherwise raise ``AttributeError`` from an advisory pre-flight
+    — inside the host lock, before any real request, failing every street
+    collection on the machine. Advisory means advisory.
     """
-    base = (url or ox.settings.overpass_url).rstrip("/")
     try:
+        base = (url or ox.settings.overpass_url).rstrip("/")
         response = requests.get(f"{base}/status", timeout=15, headers=ox._http._get_http_headers())
-    except requests.exceptions.RequestException:
+        if response.status_code in _OVERPASS_REFUSAL_STATUSES:
+            return f"its status endpoint answered HTTP {response.status_code}"
+    except Exception:  # noqa: BLE001 - advisory by contract; see docstring
         return None  # Can't tell. Let the real request produce the real error.
-
-    if response.status_code != 200:
-        return f"its status endpoint answered HTTP {response.status_code}"
-
-    text = response.text
-    if "slots available now" in text:
-        return None
-    # "Slot available after: <ts>, in N seconds." — queued rather than refused,
-    # so only call it unusable when the wait is long enough to matter.
-    match = re.search(r"in (\d+) seconds", text)
-    if match and int(match.group(1)) > OVERPASS_MAX_SLOT_WAIT_S:
-        return f"no query slot free for another {match.group(1)}s"
     return None
 
 
@@ -264,6 +310,20 @@ def _download_graph_named(bbox, network_type: str) -> nx.MultiDiGraph:
     purpose. A local network outage and a remote ban are indistinguishable from
     here and want the same action anyway (stop, blame no city, alert), so the
     message names both possibilities rather than guessing.
+
+    **Known gap, deliberately not fixed here.** osmnx raises
+    ``InsufficientResponseError`` from two unrelated situations: "the server
+    returned no data elements" (genuinely about this bbox) *and* "the response
+    was HTTP 200 but would not parse as JSON" (``_http._parse_response``, which
+    picks that type over ``ResponseStatusCodeError`` precisely because the
+    status was ok). So a captive portal, a middlebox interstitial, or an
+    Overpass error page served with a 200 arrives here typed as a city failure
+    and every city of the night re-asks — structurally the same bug #199 fixed
+    for Mapillary tiles, where a 200 + ``text/html`` had been reading as a
+    corrupt tile rather than a block. It is not fixed because osmnx does not
+    hand the caller the response, so any fix would be a sniff of the exception
+    message; the ``/status`` pre-flight above is the mitigation that actually
+    catches the realistic version of this.
     """
     try:
         with _deadline(OVERPASS_DEADLINE_S):
@@ -284,7 +344,7 @@ def _download_graph_named(bbox, network_type: str) -> nx.MultiDiGraph:
             f"{OVERPASS_URL_ENV} to a mirror (issue #209).",
             host=HOST_OVERPASS,
         ) from e
-    except TimeoutError as e:
+    except _DeadlineExceeded as e:
         # Only reachable via _deadline: osmnx's 429/504 recursion never returns
         # on its own, so without this the child would be SIGKILLed with no exit
         # code and the breaker would never learn the host was refusing us.
@@ -345,6 +405,9 @@ def fetch_graph(
     # Keep osmnx's raw HTTP response cache inside the (unpublished) osm_cache
     # dir rather than a stray ./cache in the cwd.
     ox.settings.cache_folder = os.path.join(_cache_dir(data_dir), "osmnx")
+    # Re-read $OVERPASS_URL: the incident-time mirror must be settable without
+    # a restart, and a call-time read is the only version a test can exercise.
+    _apply_overpass_url()
 
     cache_path = network_cache_path(city_row.city_id, data_dir, network_type)
     if not refresh and os.path.exists(cache_path):
@@ -377,6 +440,14 @@ def fetch_graph(
         # Ask before working: one cheap GET names a refusal in ~1s instead of
         # after three timing-out attempts (issue #209). Inside the lock so the
         # probe and the fetch see the same serialized world.
+        #
+        # This is a SECOND /status GET — osmnx makes its own before every query
+        # (`_get_overpass_pause`) — and that duplication is the price of the
+        # fast refusal, not an oversight. osmnx's call answers "how long until a
+        # slot?" and treats everything else as a reason to pause and proceed;
+        # ours answers "is this host refused?" and is the only thing that can
+        # short-circuit. /status is unmetered, so the extra request costs
+        # nothing. Do not "de-duplicate" these into one.
         refusing = _overpass_refusing()
         if refusing:
             raise HostBlockedError(

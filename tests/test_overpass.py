@@ -191,6 +191,48 @@ def test_the_probe_names_a_refusing_instance(monkeypatch):
     assert "429" in _REAL_PROBE()
 
 
+def test_the_probe_treats_a_server_error_as_unknown_not_a_refusal(monkeypatch):
+    """
+    The asymmetry that governs this whole function: a false negative costs one
+    wasted fetch that produces the real error anyway, while a false positive
+    skips every street channel of every city for the night. A 502/503 from a
+    front end while /interpreter is healthy is ordinary on a volunteer-run
+    instance — so refusal is an allow-list, not "anything that isn't 200".
+    """
+    for code in (500, 502, 503, 504, 406, 404):
+        monkeypatch.setattr(dsn.requests, "get", lambda *a, c=code, **k: _FakeStatus(c, "nope"))
+        assert _REAL_PROBE() is None, f"HTTP {code} must not skip the night"
+
+
+def test_a_queued_slot_is_not_a_refusal(monkeypatch):
+    """
+    Overpass grants 2 slots per IP and reports a wait when both are in use.
+    osmnx reads the same endpoint in `_get_overpass_pause` and sleeps the wait
+    off, so cancelling here would cancel a fetch that was going to succeed —
+    and being briefly queued behind our own previous query is the normal state
+    of a working night.
+    """
+    for seconds in (5, 120, 600, 3600):
+        queued = f"Slot available after: 2026-08-15T18:00:00Z, in {seconds} seconds."
+        monkeypatch.setattr(dsn.requests, "get", lambda *a, t=queued, **k: _FakeStatus(200, t))
+        assert _REAL_PROBE() is None
+
+
+def test_the_probe_survives_an_osmnx_internal_going_away(monkeypatch):
+    """
+    `ox._http._get_http_headers` is private and requirements.txt pins
+    `osmnx>=2.0` with no ceiling. An AttributeError here would fire inside the
+    host lock, before any real request, and fail every street collection on the
+    machine — from a pre-flight whose entire contract is "advisory".
+    """
+
+    def gone(*a, **k):
+        raise AttributeError("module 'osmnx._http' has no attribute '_get_http_headers'")
+
+    monkeypatch.setattr(dsn.ox._http, "_get_http_headers", gone)
+    assert _REAL_PROBE() is None
+
+
 def test_the_probe_sends_our_user_agent_not_the_requests_default(monkeypatch):
     """
     Measured 2026-08-15: overpass-api.de answers HTTP 406 to the stock
@@ -223,16 +265,6 @@ def test_the_probe_never_fails_a_healthy_fetch(monkeypatch):
     assert _REAL_PROBE() is None
 
 
-def test_a_queued_slot_is_tolerated_but_a_long_wait_is_not(monkeypatch):
-    soon = f"Slot available after: 2026-08-15T18:00:00Z, in {dsn.OVERPASS_MAX_SLOT_WAIT_S - 10} seconds."
-    monkeypatch.setattr(dsn.requests, "get", lambda *a, **k: _FakeStatus(200, soon))
-    assert _REAL_PROBE() is None
-
-    later = f"Slot available after: 2026-08-15T18:00:00Z, in {dsn.OVERPASS_MAX_SLOT_WAIT_S + 60} seconds."
-    monkeypatch.setattr(dsn.requests, "get", lambda *a, **k: _FakeStatus(200, later))
-    assert "no query slot free" in _REAL_PROBE()
-
-
 def test_a_refusing_probe_stops_the_fetch_before_any_query(monkeypatch, tmp_path):
     """The point of the pre-flight: name it in ~1s instead of after three
     timing-out attempts, having issued nothing."""
@@ -252,6 +284,39 @@ def test_a_refusing_probe_stops_the_fetch_before_any_query(monkeypatch, tmp_path
 # ---------------------------------------------------------------------------
 # The hang guard
 # ---------------------------------------------------------------------------
+
+
+def test_only_the_alarm_raises_the_deadline_type():
+    """
+    Builtin TimeoutError IS socket.timeout, so catching it would let a stray
+    socket timeout escaping urllib3 be reported as "did not complete within
+    900s — most likely repeated 429/504", sending an operator after the wrong
+    thing entirely. The alarm gets its own type.
+    """
+    import socket
+
+    assert issubclass(dsn._DeadlineExceeded, TimeoutError)
+    assert socket.timeout is TimeoutError, "the whole hazard: they are the same class"
+    assert not isinstance(TimeoutError("connection timed out"), dsn._DeadlineExceeded)
+
+
+def test_a_stray_socket_timeout_is_not_reported_as_a_hang(monkeypatch):
+    monkeypatch.setattr(
+        dsn,
+        "_download_graph",
+        lambda bbox, nt: (_ for _ in ()).throw(TimeoutError("socket timed out")),
+    )
+    # Not swallowed into a misleading HostBlockedError — it propagates as itself.
+    with pytest.raises(TimeoutError) as excinfo:
+        dsn._download_graph_named((0, 0, 1, 1), "drive")
+    assert not isinstance(excinfo.value, HostBlockedError)
+
+
+def test_the_deadline_bound_clears_the_worst_legitimate_fetch():
+    """Three tenacity attempts, each a full request timeout plus osmnx's own
+    pre-request slot pause. Derived, so lowering OVERPASS_TIMEOUT_S can't
+    silently leave the bound below the thing it has to clear."""
+    assert dsn.OVERPASS_DEADLINE_S > 3 * dsn.OVERPASS_TIMEOUT_S
 
 
 def test_the_deadline_interrupts_a_blocking_call():
@@ -310,6 +375,33 @@ def test_the_deadline_is_a_no_op_off_the_main_thread():
 # ---------------------------------------------------------------------------
 # Mirror override
 # ---------------------------------------------------------------------------
+
+
+def test_a_mirror_url_can_be_set_without_restarting(monkeypatch, tmp_path):
+    """
+    The incident-time escape hatch, and the reason it is read at call time: it
+    is what you reach for at 03:00 when the main instance is refusing this host,
+    and an import-time read could neither be exercised by a test nor changed
+    without restarting the process.
+    """
+    from tests.test_host_lock import _city_row
+
+    graph = nx.MultiDiGraph()
+    graph.add_edge(1, 2)
+    monkeypatch.setattr(dsn, "_download_graph_named", lambda bbox, nt: graph)
+    monkeypatch.setattr(dsn.ox, "save_graphml", lambda g, p: open(p, "w").close())
+    monkeypatch.setattr(ox.settings, "overpass_url", "https://overpass-api.de/api")
+
+    monkeypatch.setenv(dsn.OVERPASS_URL_ENV, "https://overpass.example.org/api")
+    dsn.fetch_graph(_city_row(), str(tmp_path))
+    assert ox.settings.overpass_url == "https://overpass.example.org/api"
+
+
+def test_an_unset_mirror_leaves_the_default_alone(monkeypatch):
+    monkeypatch.delenv(dsn.OVERPASS_URL_ENV, raising=False)
+    monkeypatch.setattr(ox.settings, "overpass_url", "https://overpass-api.de/api")
+    dsn._apply_overpass_url()
+    assert ox.settings.overpass_url == "https://overpass-api.de/api"
 
 
 def test_a_successful_fetch_still_works_end_to_end(monkeypatch, tmp_path):
