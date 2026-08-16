@@ -71,9 +71,9 @@ from streetscape_metadata_tracker import db
 from streetscape_metadata_tracker.analysis import detect_systemic_failure
 from streetscape_metadata_tracker.config import load_config
 from streetscape_metadata_tracker.download_common import (
-    HOST_EXIT_CODES,
     DownloadError,
     HostUnavailableError,
+    host_exit_code,
 )
 from streetscape_metadata_tracker.download_gsv import collect_points_async
 from streetscape_metadata_tracker.download_mapillary import (
@@ -149,7 +149,7 @@ def run_collect(args: argparse.Namespace) -> int:
             )
         except HostUnavailableError as e:
             logger.error("Street network unavailable: %s", e)
-            return HOST_EXIT_CODES[e.host]
+            return host_exit_code(e)
         samples = generate_samples(edges, args.spacing)
         query_points = dedupe_query_points(samples)
         logger.info(
@@ -298,7 +298,7 @@ def run_collect(args: argparse.Namespace) -> int:
                 )
             logger.error("Collection failed: %s", e)
             if isinstance(e, HostUnavailableError):
-                return HOST_EXIT_CODES[e.host]
+                return host_exit_code(e)
             return 1
 
         df = dict_results["df"]

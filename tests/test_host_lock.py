@@ -23,13 +23,17 @@ from filelock import FileLock
 
 from streetscape_metadata_tracker import host_lock as hl
 from streetscape_metadata_tracker.download_common import (
+    HOST_BUSY_EXIT_CODES,
+    HOST_BY_BUSY_EXIT_CODE,
     HOST_BY_EXIT_CODE,
     HOST_EXIT_CODES,
     HOST_MAPILLARY_TILES,
     HOST_OVERPASS,
     DownloadError,
+    HostBlockedError,
     HostBusyError,
     HostUnavailableError,
+    host_exit_code,
 )
 
 # --------------------------------------------------------------------------
@@ -156,7 +160,41 @@ def test_the_lock_dir_env_override_wins(monkeypatch, tmp_path):
     """The systemd unit sets this explicitly, because PrivateTmp=true and the
     symlinked WorkingDirectory both make the derived path unreliable there."""
     monkeypatch.setenv(hl.LOCK_DIR_ENV, str(tmp_path / "elsewhere"))
-    assert hl.lock_dir() == str(tmp_path / "elsewhere")
+    assert hl.lock_dir() == os.path.realpath(tmp_path / "elsewhere")
+
+
+def test_the_override_is_resolved_the_same_way_the_default_is(monkeypatch, tmp_path):
+    """
+    The override must be realpath'd too, or constraint 2 comes straight back
+    with no symptom: the unit sets the real path while an operator exports
+    `~/streetscape-tracker/locks`, and the two processes take different locks
+    while both believing they hold "the" lock.
+    """
+    real = tmp_path / "real_checkout"
+    (real / "locks").mkdir(parents=True)
+    link = tmp_path / "linked_checkout"
+    link.symlink_to(real)
+
+    monkeypatch.setenv(hl.LOCK_DIR_ENV, str(link / "locks"))
+    via_link = hl.lock_path(HOST_MAPILLARY_TILES)
+    monkeypatch.setenv(hl.LOCK_DIR_ENV, str(real / "locks"))
+    via_real = hl.lock_path(HOST_MAPILLARY_TILES)
+
+    assert via_link == via_real
+    assert str(link) not in via_link
+
+
+def test_the_override_resolves_even_before_the_lock_dir_exists(monkeypatch, tmp_path):
+    """realpath resolves the existing prefix, so a first-ever run on a fresh
+    checkout still agrees with every later one."""
+    real = tmp_path / "real_checkout"
+    real.mkdir()
+    link = tmp_path / "linked_checkout"
+    link.symlink_to(real)
+
+    monkeypatch.setenv(hl.LOCK_DIR_ENV, str(link / "locks"))
+    assert hl.lock_dir() == str(real / "locks")
+    assert not (real / "locks").exists(), "lock_dir() must not create anything"
 
 
 def test_the_lock_dir_is_read_at_call_time_not_import_time(monkeypatch, tmp_path):
@@ -278,12 +316,40 @@ def _city_row(city_id="bend--or"):
 def test_every_locked_host_has_a_distinct_exit_code():
     """The child's message never crosses the process boundary — the scheduler
     sees only returncode — so the mapping has to be total and injective."""
-    assert set(HOST_EXIT_CODES) == {HOST_MAPILLARY_TILES, HOST_OVERPASS}
-    assert len(set(HOST_EXIT_CODES.values())) == len(HOST_EXIT_CODES)
+    for table in (HOST_EXIT_CODES, HOST_BUSY_EXIT_CODES):
+        assert set(table) == {HOST_MAPILLARY_TILES, HOST_OVERPASS}
+        assert len(set(table.values())) == len(table)
     assert HOST_BY_EXIT_CODE == {v: k for k, v in HOST_EXIT_CODES.items()}
+    assert HOST_BY_BUSY_EXIT_CODE == {v: k for k, v in HOST_BUSY_EXIT_CODES.items()}
+    # Blocked and busy must never share a number: the scheduler's whole
+    # reaction — night-wide breaker vs. skip one channel — keys off which
+    # table the code lands in.
+    assert not set(HOST_EXIT_CODES.values()) & set(HOST_BUSY_EXIT_CODES.values())
     # 0 would read as success and 1 is the generic failure every other path
     # already returns; either would make the breaker fire on ordinary bugs.
-    assert 0 not in HOST_BY_EXIT_CODE and 1 not in HOST_BY_EXIT_CODE
+    for code in (0, 1):
+        assert code not in HOST_BY_EXIT_CODE and code not in HOST_BY_BUSY_EXIT_CODE
+
+
+def test_the_exit_code_distinguishes_a_busy_lock_from_a_refusal():
+    """
+    The two conditions have opposite lifetimes. A refusal is durable and trips
+    the night-wide breaker; a busy lock ends when the other local process does,
+    so escalating it would let a two-minute manual run cost the batch every
+    Mapillary city of the night.
+    """
+    busy = HostBusyError("another process holds it", host=HOST_MAPILLARY_TILES)
+    blocked = HostBlockedError("the CDN refused us", host=HOST_MAPILLARY_TILES)
+
+    assert host_exit_code(busy) == HOST_BUSY_EXIT_CODES[HOST_MAPILLARY_TILES]
+    assert host_exit_code(blocked) == HOST_EXIT_CODES[HOST_MAPILLARY_TILES]
+    assert host_exit_code(busy) != host_exit_code(blocked)
+    # A bare HostUnavailableError is the conservative case: treat it as a
+    # refusal, since under-reacting means firing into a host already saying no.
+    assert (
+        host_exit_code(HostUnavailableError("unspecified", host=HOST_OVERPASS))
+        == HOST_EXIT_CODES[HOST_OVERPASS]
+    )
 
 
 def test_the_scheduler_parent_never_takes_a_host_lock():

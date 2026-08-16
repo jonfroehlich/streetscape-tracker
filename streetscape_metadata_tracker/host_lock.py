@@ -71,10 +71,17 @@ def lock_dir() -> str:
     Landing beside ``logs/``, ``backups/`` and ``archive/`` satisfies all three
     and keeps the lock on the host's local disk (``flock`` over NFS is not
     something to rely on).
+
+    The env override is resolved the same way the default is. It would be easy
+    to take it verbatim — the systemd unit sets the real path already — but then
+    an operator exporting ``~/streetscape-tracker/locks`` would derive a
+    different path from the unit's and both processes would happily take "the
+    lock", which is constraint 2 back again with no symptom. ``realpath``
+    resolves the existing prefix even when ``locks/`` does not exist yet.
     """
     override = os.environ.get(LOCK_DIR_ENV)
     if override:
-        return override
+        return os.path.realpath(override)
     return os.path.join(os.path.realpath(get_project_root()), "locks")
 
 
@@ -92,14 +99,24 @@ def _write_owner(host: str) -> None:
     Record who holds the lock, for the benefit of the *next* process's error
     message. Best effort in every sense: this is diagnostics, and must never be
     what fails a collection.
+
+    Written to a ``.tmp`` sibling and ``os.replace``d, the same verify-then-
+    promote shape ``catalog_backup`` uses: the waiting process reads this file
+    without any lock of its own, so a plain in-place write can hand it a
+    truncated line. A message that names half a pid is worse than none — the
+    whole point of the sidecar is to tell an operator exactly who to wait for.
     """
+    path = _owner_path(host)
+    tmp = f"{path}.tmp"
     try:
-        with open(_owner_path(host), "w", encoding="utf-8") as fh:
+        with open(tmp, "w", encoding="utf-8") as fh:
             fh.write(f"pid {os.getpid()}\n")
             fh.write(f"since {datetime.now(UTC).isoformat()}\n")
             fh.write(f"argv {redact_credentials(' '.join(sys.argv))}\n")
+        os.replace(tmp, path)
     except OSError:
-        pass
+        with contextlib.suppress(OSError):
+            os.remove(tmp)
 
 
 def _read_owner(host: str) -> str:

@@ -47,7 +47,12 @@ from . import (
 )
 from .analysis import calculate_run_stats, detect_systemic_failure, print_df_summary
 from .diff import compute_run_diff, generate_diff_filename, write_diff_detail
-from .download_common import HOST_EXIT_CODES, DownloadError, HostUnavailableError
+from .download_common import (
+    DownloadError,
+    HostBusyError,
+    HostUnavailableError,
+    host_exit_code,
+)
 from .download_mapillary import DEFAULT_TILE_REQUESTS_PER_MINUTE
 from .fileutils import load_city_csv_file
 from .json_summarizer import (
@@ -490,11 +495,11 @@ async def async_main():
         # Collect each provider in turn (same run_date, so series pair up).
         # One provider failing must not prevent the other from collecting.
         failed = []
-        # Hosts that refused us (or are busy with another local process). These
-        # are whole-machine conditions, so they get their own exit code and the
-        # scheduler skips that host's remaining channels for the night rather
-        # than counting a per-city failure (issue #208).
-        unavailable_hosts: list[str] = []
+        # Hosts that refused us, or that another local process is already
+        # talking to. These are whole-machine conditions, so they get their own
+        # exit code and the scheduler reacts to the host rather than counting a
+        # per-city failure (issue #208).
+        unavailable: list[HostUnavailableError] = []
         for provider in providers:
             try:
                 await _collect_one_run(
@@ -505,7 +510,7 @@ async def async_main():
                 # (which names the host and what to do) without a traceback.
                 logging.error(f"{provider} collection stopped: {e}")
                 failed.append(provider)
-                unavailable_hosts.append(e.host)
+                unavailable.append(e)
             except Exception as e:
                 logging.exception(f"{provider} collection failed: {e}")
                 failed.append(provider)
@@ -519,8 +524,16 @@ async def async_main():
             # Only report a host-level exit when EVERY failure was that host:
             # a mixed night (Mapillary blocked, GSV genuinely broken) must not
             # let the breaker mask a real bug behind an environmental code.
-            if len(unavailable_hosts) == len(failed) and len(set(unavailable_hosts)) == 1:
-                return HOST_EXIT_CODES[unavailable_hosts[0]]
+            hosts = {e.host for e in unavailable}
+            if len(unavailable) == len(failed) and len(hosts) == 1:
+                # If one channel found the host blocked and another merely found
+                # it busy, report BLOCKED: over-reacting costs the night's
+                # remaining channels on that host, under-reacting keeps firing
+                # into a CDN that is already refusing us.
+                worst = next(
+                    (e for e in unavailable if not isinstance(e, HostBusyError)), unavailable[0]
+                )
+                return host_exit_code(worst)
             return 1
         return 0
 
