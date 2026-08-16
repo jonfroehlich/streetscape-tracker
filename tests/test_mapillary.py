@@ -6,6 +6,7 @@ served from memory. No network.
 
 import asyncio
 import gzip
+import inspect
 import math
 import os
 import re
@@ -1569,7 +1570,10 @@ def test_a_retried_tile_re_paces_and_is_re_counted():
 
 
 _ALL_TILES = len(dm.tiles_for_bbox(*dm.grid_bbox(41.8, -87.7, 30000, 30000, 2000)))
-_CONNECTION_LIMIT = 5  # fetch_city_images_async's default semaphore width
+# Read from the signature rather than copied: this bounds what a blocked host
+# costs, so a hand-written 5 would silently get looser (or wrongly tight) the
+# day the default changes, which is exactly when the bound needs checking.
+_CONNECTION_LIMIT = inspect.signature(dm._fetch_city_images).parameters["connection_limit"].default
 
 
 def _counting_fatal_fetch(error):
@@ -1677,3 +1681,42 @@ def test_an_html_error_page_is_also_a_host_block():
     _, error = _fetch_tile(_FakeTileResponse(200, {"Content-Type": "text/html"}, b"<html>"))
     assert isinstance(error, HostBlockedError)
     assert error.host == HOST_MAPILLARY_TILES
+
+
+def test_a_swallowed_fatal_error_can_never_publish_an_empty_census(monkeypatch):
+    """
+    The invariant behind the fail-fast, made structural rather than emergent.
+
+    Aborted tiles return an EMPTY CENSUS, which the settle loop reads as a
+    successful tile. Today that is safe because the task that set `fatal` also
+    re-raised, so its exception is in `settled`. If a later edit makes
+    `fetch_one` swallow or wrap that error, nothing else would object: no tile
+    is in `failed_tiles`, `detect_systemic_failure` only looks for
+    REQUEST_DENIED/OVER_QUERY_LIMIT, and a 0-pano census would register,
+    publish, and diff as "every pano in the city removed" — against an
+    immutable dated snapshot.
+
+    Simulated at the seam rather than by editing fetch_one: drop the exceptions
+    out of `settled` after the gather, which is precisely the state such an edit
+    would leave behind — every tile a clean, empty success.
+    """
+    served = []
+
+    async def blocked(session, url, timeout):
+        served.append(url)
+        raise HostBlockedError("tile CDN redirected", host=HOST_MAPILLARY_TILES)
+
+    real_gather = asyncio.gather
+
+    async def gather_swallowing_exceptions(*aws, **kwargs):
+        settled = await real_gather(*aws, **kwargs)
+        return [dm.records_to_census([]) if isinstance(s, BaseException) else s for s in settled]
+
+    monkeypatch.setattr(asyncio, "gather", gather_swallowing_exceptions)
+
+    with pytest.raises(HostBlockedError) as excinfo:
+        _fetch_city(monkeypatch, blocked, 41.8, -87.7)
+
+    assert excinfo.value.host == HOST_MAPILLARY_TILES
+    # Still the error that caused the abort, and still agreeing with the ledger.
+    assert excinfo.value.api_requests == len(served)

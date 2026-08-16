@@ -847,6 +847,12 @@ async def _fetch_city_images(
             # token or counting a request. Worst case is connection_limit
             # requests instead of the whole city.
             if fatal is not None:
+                # Nothing was requested for this tile, so keep the progress bar
+                # honest: a city that stopped at request 1 must not read like a
+                # city that hung at tile 3. That line in
+                # logs/collect_{city}_{channel}_{date}.log is how an operator
+                # tells those two apart.
+                progress_bar.update(1)
                 return records_to_census([])
             try:
                 # Pacing/counting happen inside _fetch_tile, per retried attempt.
@@ -890,6 +896,20 @@ async def _fetch_city_images(
         raise error from e
     finally:
         progress_bar.close()
+
+    # Belt and braces, and deliberately unreachable today: the task that set
+    # `fatal` also re-raised, so its exception is in `settled` and the loop
+    # below finds it. What this guards is a future edit that makes `fetch_one`
+    # swallow or wrap that error — then every aborted tile becomes an empty
+    # SUCCESS (they return an empty census, not an exception), `failed_tiles` is
+    # empty, `detect_systemic_failure` doesn't reject (it only looks for
+    # REQUEST_DENIED/OVER_QUERY_LIMIT), and a 0-pano census registers, publishes
+    # and diffs as "every pano in the city removed" — against an immutable dated
+    # snapshot. It also reports the error that actually caused the abort, rather
+    # than whichever DownloadError happens to sit earliest in tile order.
+    if fatal is not None:
+        fatal.api_requests = api_requests
+        raise fatal
 
     results = []
     failed_tiles: list[tuple[int, int]] = []
