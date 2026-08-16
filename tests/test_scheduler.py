@@ -3163,6 +3163,97 @@ def test_a_busy_night_alerts_and_exits_nonzero_but_says_it_was_local(conn, monke
     assert "NO city was marked failed" in body
 
 
+# ---------------------------------------------------------------------------
+# Block evidence (issue #214). The Mapillary daily budgets bet that the tile
+# block is triggered by throughput, not daily volume. The falsifier — a block on
+# a night that never exceeded the paced rate — is worthless if nobody captures
+# it, which is the #145 lesson applied to a measurement instead of a backup.
+# ---------------------------------------------------------------------------
+
+
+def _alerting_block_night(conn, monkeypatch, spend_today, today=date(2026, 7, 2)):
+    """Run a night where the tile CDN refuses us, with `spend_today` already on
+    the Mapillary ledger; return the alert (subject, body)."""
+    from streetscape_metadata_tracker import scheduler as sched
+    from streetscape_metadata_tracker.download_common import HOST_MAPILLARY_TILES
+    from streetscape_metadata_tracker.scheduler import AlertConfig
+
+    _register(conn, "Bend", width=1000, height=1000, step=20)
+    for channel, spent in spend_today.items():
+        db.add_api_usage(conn, today, spent, provider=channel)
+
+    published, alerts = [], []
+    monkeypatch.setattr(
+        sched,
+        "_run_one_city",
+        lambda cfg, city, today, provider="gsv", connection_limit=None, daily_budget=0, conn=None, remaining_s=None: (
+            _blocked_outcome(HOST_MAPILLARY_TILES) if provider == "mapillary" else True
+        ),
+    )
+    _stub_tail(monkeypatch, sched, conn, published)
+    monkeypatch.setattr(
+        sched, "send_alert", lambda cfg, subject, body: alerts.append((subject, body))
+    )
+    sched.cmd_run_due(
+        _street_cfg(publish_enabled=True, alerts=AlertConfig(enabled=True, failure_threshold=99)),
+        today=today,
+    )
+    assert len(alerts) == 1
+    return alerts[0]
+
+
+def test_a_mapillary_block_reports_the_days_tile_spend_in_the_alert(conn, monkeypatch):
+    """
+    The night that can falsify the throughput bet must report its own evidence.
+    An operator reading this at 03:00 gets the number without knowing to go and
+    query api_usage — and 'go query the ledger' written in a doc is precisely
+    the observation-nobody-makes failure that #145 exists to rule out.
+    """
+    subject, body = _alerting_block_night(
+        conn, monkeypatch, {"mapillary": 1_200, "mapillary_streets": 300}
+    )
+
+    assert "UNAVAILABLE" in subject
+    assert "EVIDENCE" in body
+    assert "1,500" in body, "the day's combined tile spend across BOTH channels"
+    assert "mapillary=1,200" in body and "mapillary_streets=300" in body
+    assert "10,659" in body, "compared against the one measured-bad daily figure"
+
+
+def test_a_low_volume_block_says_the_throughput_bet_survived(conn, monkeypatch):
+    """A block at a fraction of the known-bad daily figure is the outcome that
+    CONFIRMS volume wasn't the trigger. The alert has to say which way the
+    evidence points, or it is just a number nobody interprets."""
+    _, body = _alerting_block_night(conn, monkeypatch, {"mapillary": 800})
+
+    assert "did NOT trigger this block" in body
+    assert "HOLDS" in body
+
+
+def test_a_high_volume_block_says_the_bet_may_be_wrong(conn, monkeypatch):
+    """The opposite verdict, which is the one that should change the config.
+    Same alert, opposite reading — the test exists because a helper that always
+    reported reassurance would pass the previous test and be worthless."""
+    _, body = _alerting_block_night(
+        conn, monkeypatch, {"mapillary": 12_000, "mapillary_streets": 400}
+    )
+
+    assert "may be WRONG" in body
+    assert "consider lowering the budgets" in body
+
+
+def test_block_evidence_is_silent_for_a_non_mapillary_host(conn, monkeypatch):
+    """Overpass has no equivalent measured figure, so there is nothing to
+    falsify and the evidence block must not appear — an alert that cites a
+    Mapillary number during an Overpass ban sends the operator somewhere
+    irrelevant."""
+    from streetscape_metadata_tracker import scheduler as sched
+    from streetscape_metadata_tracker.download_common import HOST_OVERPASS
+
+    assert sched._host_block_evidence(_street_cfg(), conn, date(2026, 7, 2), {HOST_OVERPASS}) == ""
+    assert sched._host_block_evidence(_street_cfg(), conn, date(2026, 7, 2), set()) == ""
+
+
 def test_the_subprocess_outcome_carries_the_childs_exit_code(monkeypatch, tmp_path):
     """
     The seam the whole breaker rests on: the child's message never crosses the

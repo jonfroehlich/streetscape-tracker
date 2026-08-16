@@ -102,6 +102,16 @@ CHANNEL_HOSTS: dict[str, tuple[str, ...]] = {
     "mapillary_streets": (HOST_OVERPASS, HOST_MAPILLARY_TILES),
 }
 
+# The single measured data point on the Mapillary tile block (2026-08-12): the
+# day's spend at the moment this host's whole IP was refused, sustained at ~370
+# requests/min. BOTH quantities were in play at once, and Mapillary documents
+# neither — its tile docs give "50,000 per day (not per minute)" per app and a
+# 4xx, where we got a 302-to-login per IP at ~21% of that cap — so which one
+# triggered the block is unknown. The Mapillary daily budgets bet on throughput;
+# this constant is what makes that bet falsifiable rather than a matter of
+# opinion, and _host_block_evidence below is what actually collects the evidence.
+MAPILLARY_BLOCK_KNOWN_BAD_DAILY = 10_659
+
 
 logger = logging.getLogger("streetscape_scheduler")
 
@@ -2115,12 +2125,21 @@ def _run_city_loop(
                     # walk's first step, and the tile census is a Mapillary run's
                     # first step, so there is never a paid-for artifact to salvage
                     # here. Keep that true if either fetch ever moves later.
+                    first_refusal = blocked_host not in blocked_hosts
                     blocked_hosts.add(blocked_host)
                     logger.error(
                         f"{city.city_id} [{provider}]: {HOST_LABELS[blocked_host]} is "
                         f"unavailable to this host — skipping its remaining channels "
                         f"tonight. Not counted as a failure for this city. ({reason})"
                     )
+                    # Capture the falsifier at the moment it is exactly true, not
+                    # just in the tail (issue #214). _finish_batch reports the
+                    # day's totals in the alert; this is the trip-time reading,
+                    # before anything else on the box can move the ledger.
+                    if first_refusal:
+                        evidence = _host_block_evidence(cfg, conn, today, {blocked_host})
+                        if evidence:
+                            logger.error(evidence)
                     continue
 
                 ran_any = True
@@ -2164,6 +2183,63 @@ def _run_city_loop(
         stop_reason = _STOP_REASON_ERROR
 
     return processed, succeeded, attempted, skipped_budget, stop_reason, blocked_hosts, busy_hosts
+
+
+def _host_block_evidence(cfg: SchedulerConfig, conn, today: date, hosts) -> str:
+    """
+    The measurement that settles rate-vs-volume for a Mapillary tile block, or
+    "" when no such block is in ``hosts`` (issue #214).
+
+    The Mapillary daily budgets encode a *bet* that the block is triggered by
+    throughput rather than daily volume — the documented tile limit is a daily
+    one we tripped at ~21% of, and the forum's ~15-minute cooldown fits a burst
+    throttle. The falsifier is specific and cheap: a block arriving on a night
+    that never exceeded the paced rate means volume was the trigger after all.
+
+    Leaving that to "record what happens" in a doc is exactly the #145 mistake.
+    An observation nobody captures is indistinguishable from no observation, and
+    the person who could capture it is asleep — the block happens at 03:00 and
+    the ledger is a SQLite row nobody thinks to read. So the one night that can
+    falsify the bet reports its own evidence, unprompted, in the alert that is
+    already being sent.
+
+    Reported figures are the DAY's totals, read in the tail: the breaker stops
+    this process from spending more on that host, so they are the trip-time
+    numbers unless another local process was also collecting — which the
+    reported per-channel split would itself reveal, and which is worth knowing.
+    """
+    if HOST_MAPILLARY_TILES not in set(hosts or ()):
+        return ""
+    channels = [c for c, hs in CHANNEL_HOSTS.items() if HOST_MAPILLARY_TILES in hs]
+    spend = {c: db.get_api_usage(conn, today, c) for c in channels}
+    total = sum(spend.values())
+    per_channel = ", ".join(f"{c}={spend[c]:,}" for c in sorted(spend))
+    rates = {
+        c: (cfg.providers.get(c).max_requests_per_minute if cfg.providers.get(c) else None)
+        for c in channels
+    }
+    paced = ", ".join(
+        f"{c}={'unpaced' if rates[c] == 0 else rates[c] or 'default'}" for c in sorted(rates)
+    )
+    verdict = (
+        "WELL UNDER the known-bad daily figure, so daily volume did NOT trigger this "
+        "block and the throughput bet HOLDS"
+        if total < MAPILLARY_BLOCK_KNOWN_BAD_DAILY * 0.75
+        else "AT OR ABOVE the known-bad daily figure, so volume is a live explanation "
+        "and the throughput bet may be WRONG — consider lowering the budgets"
+    )
+    return (
+        "EVIDENCE — record this before changing anything (issue #214).\n"
+        f"Tile requests spent today when the block landed: {total:,} ({per_channel}), "
+        f"against the one measured-bad figure of {MAPILLARY_BLOCK_KNOWN_BAD_DAILY:,}/day.\n"
+        f"Configured pace (requests/min): {paced}.\n"
+        f"That total is {verdict}.\n"
+        "Why this matters: Mapillary documents the tile CDN as 50,000/day per app "
+        "'(not per minute)' returning 4xx, and our blocks match that in no attribute "
+        "(per IP, ~21% of the cap, 302-to-login). The daily budgets are a BET that the "
+        "trigger is throughput, not volume. This line is the only thing that can settle "
+        "it, and nobody outside Mapillary has published the answer."
+    )
 
 
 def _finish_batch(
@@ -2273,10 +2349,12 @@ def _finish_batch(
         if failures or not (backup_error or blocked_hosts or busy_hosts):
             parts.append(f"{failures} failed collection(s)")
         subject = f"{' + '.join(parts)} on {host}"
+        block_evidence = _host_block_evidence(cfg, conn, today, blocked_hosts)
         body = (
             summary
             + (f"\n\n{backup_error}" if backup_error else "")
             + (f"\n\n{blocked_note}" if blocked_note else "")
+            + (f"\n\n{block_evidence}" if block_evidence else "")
             + (f"\n\n{busy_note}" if busy_note else "")
         )
         send_alert(cfg.alerts, subject, f"{body}\n\nRecent log:\n{_recent_log_tail(cfg)}")
