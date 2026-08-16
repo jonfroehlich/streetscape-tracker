@@ -526,10 +526,28 @@ def test_makelab1_production_config_is_wired():
     assert cfg.providers["gsv_streets"].daily_request_budget == 3_000_000
     # Paced by the streets key's own quota, not [download]'s 48k grid pacing.
     assert cfg.providers["gsv_streets"].max_requests_per_minute == 24_000
-    # Mapillary's 50k/day application cap is shared with the grid channel.
+    # The Mapillary budgets are NOT derived from the documented 50,000/day
+    # per-app cap — our block matched that limit in no attribute (per IP not per
+    # app, at ~21% of it, 302 not 4xx). They encode a deliberate bet that the
+    # trigger is throughput rather than daily volume (issue #214), which puts the
+    # per-IP total ABOVE the one daily figure measured going badly. Pinned
+    # exactly, not bounded loosely: this is the sort of number that drifts
+    # upwards one "just a bit more" at a time, and the whole point is that a
+    # change to it is a decision someone made on purpose.
     mly = cfg.providers["mapillary"].daily_request_budget
     mly_streets = cfg.providers["mapillary_streets"].daily_request_budget
-    assert mly + mly_streets <= 50_000, "combined Mapillary budgets exceed the daily app cap"
+    assert mly == 15_000
+    assert mly_streets == 5_000
+    assert mly + mly_streets == 20_000, (
+        "the tile block is per IP, so the two channels' budgets SUM — this total "
+        "is the number on the line, and at 20,000 it is ~1.9x the 10,659/day "
+        "that got this host blocked on 2026-08-12 (a considered bet, see CLAUDE.md)"
+    )
+    # Under that bet the per-minute pace is the ACTUAL protection, so it matters
+    # more here than it did before and was previously unguarded. Both channels
+    # draw on one per-IP rate, so both must carry the conservative figure.
+    assert cfg.providers["mapillary"].max_requests_per_minute == 60
+    assert cfg.providers["mapillary_streets"].max_requests_per_minute == 60
     assert cfg.publish_enabled
     assert cfg.publish_script.endswith("sync_data_to_server.sh")
     # smtp transport (not "mail"): the local mailer is blocked by the systemd
@@ -882,6 +900,202 @@ def test_run_due_provider_budgets_are_independent(conn, monkeypatch):
     sched.cmd_run_due(cfg, today=date(2026, 7, 2))
 
     assert ran == [(cid, "mapillary")]  # gsv deferred, mapillary still ran
+
+
+# ---------------------------------------------------------------------------
+# run-due --provider / --limit (issue #214): the on-demand catch-up path.
+#
+# The point of routing a bulk Mapillary catch-up through the scheduler rather
+# than a script is that it inherits the budget ledger, the host lock, the
+# breaker, failure counting and the publish tail — the detached script that had
+# none of those is what got this host per-IP banned on 2026-08-14.
+# ---------------------------------------------------------------------------
+
+
+def _mly_cfg(**overrides):
+    """gsv + mapillary both enabled, budgets generous enough not to interfere."""
+    base = dict(
+        publish_enabled=False,
+        providers={
+            "gsv": ProviderConfig(daily_request_budget=10_000_000),
+            "mapillary": ProviderConfig(daily_request_budget=10_000),
+        },
+    )
+    base.update(overrides)
+    return SchedulerConfig(**base)
+
+
+def _record_runs(sched, monkeypatch, conn, ran):
+    monkeypatch.setattr(
+        sched,
+        "_run_one_city",
+        lambda cfg, city, today, provider="gsv", connection_limit=None, daily_budget=0, conn=None, remaining_s=None: (
+            ran.append((city.city_id, provider)) or True
+        ),
+    )
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+    monkeypatch.setattr(sched.time, "sleep", lambda s: None)
+    monkeypatch.setattr(sched, "generate_aggregate_v2", lambda c, d: None)
+    monkeypatch.setattr(sched, "generate_streetwalk_manifest", lambda c, d: {"walks": []})
+
+
+def test_run_due_parses_the_provider_filter():
+    """--provider is repeatable and collects into args.providers; absent, it is
+    None (which means "every enabled channel", not "no channels")."""
+    args = build_parser().parse_args(
+        ["run-due", "--provider", "mapillary", "--provider", "mapillary_streets", "--limit", "40"]
+    )
+    assert args.providers == ["mapillary", "mapillary_streets"]
+    assert args.limit == 40
+    assert build_parser().parse_args(["run-due"]).providers is None
+
+
+def test_provider_filter_runs_only_the_named_channel(conn, monkeypatch):
+    """The whole mechanism is _collect_due's filter: a channel left out of
+    providers_for_city is never priced, budgeted or launched."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    cid = _register(conn, "Bend", width=1000, height=1000, step=20)
+    ran = []
+    _record_runs(sched, monkeypatch, conn, ran)
+
+    rc = sched.cmd_run_due(_mly_cfg(), today=date(2026, 7, 2), requested_providers=["mapillary"])
+
+    assert ran == [(cid, "mapillary")]  # gsv enabled but not requested
+    assert rc == 0
+    # ...and gsv's schedule_state is untouched, so it stays due for the nightly
+    # batch. A catch-up must not consume another channel's turn.
+    row = conn.execute(
+        "SELECT last_success_at FROM schedule_state WHERE city_id = ? AND provider = 'gsv'",
+        (cid,),
+    ).fetchone()
+    assert row["last_success_at"] is None
+
+
+def test_provider_filter_accepts_a_comma_list(conn, monkeypatch):
+    """`--provider a,b` is what an operator types; it must mean the same as the
+    repeated form, and the result keeps the canonical gsv-first ordering rather
+    than the order given on the command line."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    cid = _register(conn, "Bend", width=1000, height=1000, step=20)
+    ran = []
+    _record_runs(sched, monkeypatch, conn, ran)
+
+    sched.cmd_run_due(_mly_cfg(), today=date(2026, 7, 2), requested_providers=["mapillary,gsv"])
+
+    assert ran == [(cid, "gsv"), (cid, "mapillary")]
+
+
+def test_provider_filter_rejects_an_unknown_channel(conn, monkeypatch):
+    """A typo exits 2 WITHOUT opening the catalog. Returning (not raising) is
+    deliberate: main()'s run-due branch emails an alert on an exception, and an
+    operator typo is not a nightly crash."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    _register(conn, "Bend", width=1000, height=1000, step=20)
+    connected = []
+    monkeypatch.setattr(sched.db, "connect", lambda path: connected.append(path) or conn)
+
+    rc = sched.cmd_run_due(_mly_cfg(), today=date(2026, 7, 2), requested_providers=["mapilary"])
+
+    assert rc == 2
+    assert connected == []
+
+
+def test_provider_filter_rejects_a_disabled_channel(conn, monkeypatch):
+    """The prod-shaped case: while the Mapillary channels are switched off after
+    a per-IP block, `--provider mapillary` must say so rather than run a zero-due
+    night — which would still fire the publish tail and read as a success."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    _register(conn, "Bend", width=1000, height=1000, step=20)
+    connected = []
+    monkeypatch.setattr(sched.db, "connect", lambda path: connected.append(path) or conn)
+
+    cfg = _mly_cfg(
+        providers={
+            "gsv": ProviderConfig(daily_request_budget=10_000_000),
+            "mapillary": ProviderConfig(enabled=False, daily_request_budget=10_000),
+        }
+    )
+    rc = sched.cmd_run_due(cfg, today=date(2026, 7, 2), requested_providers=["mapillary"])
+
+    assert rc == 2
+    assert connected == []
+
+
+def test_limit_overrides_the_daily_city_cap(conn, monkeypatch):
+    """An explicit --limit IS the cap for that run. Without this the config's
+    max_cities_per_day silently wins and `--limit 40` quietly does 20, which
+    leaves a Mapillary catch-up at ~61 nights per pass instead of ~14."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    for i in range(5):
+        _register(conn, f"City{i}", width=1000, height=1000, step=20)
+    ran = []
+    _record_runs(sched, monkeypatch, conn, ran)
+
+    rc = sched.cmd_run_due(
+        _mly_cfg(max_cities_per_day=2),
+        today=date(2026, 7, 2),
+        limit=5,
+        requested_providers=["mapillary"],
+    )
+
+    assert len(ran) == 5
+    assert rc == 0
+
+
+def test_limit_below_the_cap_still_narrows(conn, monkeypatch):
+    """The pre-#214 meaning of --limit is unchanged: it may narrow as well as
+    widen, so `--limit 1` is still a one-city smoke test."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    for i in range(5):
+        _register(conn, f"City{i}", width=1000, height=1000, step=20)
+    ran = []
+    _record_runs(sched, monkeypatch, conn, ran)
+
+    sched.cmd_run_due(
+        _mly_cfg(max_cities_per_day=20),
+        today=date(2026, 7, 2),
+        limit=1,
+        requested_providers=["mapillary"],
+    )
+
+    assert len(ran) == 1
+
+
+def test_run_due_without_a_filter_still_runs_every_enabled_channel(conn, monkeypatch):
+    """The nightly path (no --provider, no --limit) is untouched by #214."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    cid = _register(conn, "Bend", width=1000, height=1000, step=20)
+    ran = []
+    _record_runs(sched, monkeypatch, conn, ran)
+
+    sched.cmd_run_due(_mly_cfg(), today=date(2026, 7, 2))
+
+    assert ran == [(cid, "gsv"), (cid, "mapillary")]
+
+
+def test_provider_filter_still_registers_stagger_for_every_channel(conn, monkeypatch):
+    """assign_schedule runs over the FULL enabled set even under a filter: a
+    Mapillary-only catch-up must not leave a newly registered city without a gsv
+    stagger row, which would silently delay its first grid collection."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    cid = _register(conn, "Bend", width=1000, height=1000, step=20)
+    _record_runs(sched, monkeypatch, conn, [])
+
+    sched.cmd_run_due(_mly_cfg(), today=date(2026, 7, 2), requested_providers=["mapillary"])
+
+    providers = {
+        r["provider"]
+        for r in conn.execute("SELECT provider FROM schedule_state WHERE city_id = ?", (cid,))
+    }
+    assert providers == {"gsv", "mapillary"}
 
 
 def test_run_due_refreshes_the_manifest_only_after_a_success(conn, monkeypatch):
