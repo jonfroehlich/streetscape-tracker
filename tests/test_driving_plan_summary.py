@@ -15,8 +15,11 @@ from datetime import date
 
 import pytest
 
-from streetscape_metadata_tracker import db
-from streetscape_metadata_tracker.json_summarizer import generate_driving_plan_summary
+from streetscape_metadata_tracker import db, plan_match
+from streetscape_metadata_tracker.json_summarizer import (
+    _compact_capture_years,
+    generate_driving_plan_summary,
+)
 
 
 def strict_load(path):
@@ -184,9 +187,7 @@ def test_israel_reads_as_driven_unplanned_end_to_end(conn, data_dir):
 
 def test_a_clean_window_carries_no_approximate_flag(conn, data_dir):
     city_id = _register_city(conn, "Boise", "Idaho")
-    db.register_run(
-        conn, city_id=city_id, run_date=date(2026, 7, 20), csv_filename="b.csv.gz"
-    )
+    db.register_run(conn, city_id=city_id, run_date=date(2026, 7, 20), csv_filename="b.csv.gz")
     _entries(conn, _snapshot(conn), [IDAHO])
     doc = generate_driving_plan_summary(conn, data_dir)
     assert "window_approximate" not in doc["cities"][0]["plan"]
@@ -485,18 +486,50 @@ def test_capture_years_are_absent_not_null_when_unavailable(conn, data_dir):
     assert all("capture_years" not in c for c in doc["cities"])
 
 
-def test_an_absurd_capture_year_does_not_stretch_the_histogram(conn, data_dir):
+def test_an_absurd_capture_year_is_dropped_without_erasing_the_histogram(conn, data_dir):
     # A 2611 year (issue #213) would otherwise produce a 600-element array per
-    # city. Refusing the whole histogram is right: one impossible year means
-    # the run's dates cannot be trusted to plot.
+    # city. It is dropped INDIVIDUALLY: one corrupt bucket is exactly what #213
+    # looks like, and refusing the whole histogram would let a single bad year
+    # erase a city's entire real capture history.
     city_id = _register_city(conn, "Chicago", "Illinois")
-    _write_run_json(data_dir, "chi.json.gz", {"2019": 10, "2611": 1})
+    _write_run_json(data_dir, "chi.json.gz", {"2019": 10, "2020": 3, "2611": 1})
     db.register_run(
         conn,
         city_id=city_id,
         run_date=date(2026, 7, 30),
         csv_filename="chi.csv.gz",
         json_filename="chi.json.gz",
+    )
+    doc = generate_driving_plan_summary(conn, data_dir)
+    assert doc["cities"][0]["capture_years"] == [2019, [10, 3]]
+
+
+def test_capture_years_are_filtered_by_the_projects_one_plausibility_window():
+    # Both ends of plan_match's window and nothing else: a year before Street
+    # View existed and a year after `today` are dropped, the years inside are
+    # kept. Reusing that bound rather than a second span rule is the point —
+    # two plausibility rules in one codebase drift apart. Unit-level because
+    # `today` is where the upper bound enters, and pinning it keeps the
+    # expected array from changing shape as real time passes.
+    counts = {"1970": 5, "2006": 5, "2007": 2, "2026": 4, "2027": 9}
+    first, dense = _compact_capture_years(counts, date(2026, 7, 30))
+    assert first == plan_match.EARLIEST_PLAUSIBLE_CAPTURE.year == 2007
+    assert len(dense) == 2026 - 2007 + 1
+    assert dense[0] == 2 and dense[-1] == 4
+    assert sum(dense) == 6  # 1970, 2006 and 2027 contributed nothing
+
+
+def test_a_histogram_of_only_absurd_years_is_absent_not_empty(conn, data_dir):
+    # Nothing plausible left is the same fact as "no histogram" — the key must
+    # not appear as an empty array the frontend would try to plot.
+    city_id = _register_city(conn, "Phoenix", "Arizona")
+    _write_run_json(data_dir, "phx.json.gz", {"1970": 5, "2611": 1})
+    db.register_run(
+        conn,
+        city_id=city_id,
+        run_date=date(2026, 7, 30),
+        csv_filename="phx.csv.gz",
+        json_filename="phx.json.gz",
     )
     doc = generate_driving_plan_summary(conn, data_dir)
     assert "capture_years" not in doc["cities"][0]

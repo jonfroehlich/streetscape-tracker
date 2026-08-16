@@ -1,5 +1,6 @@
 import gzip
 import hashlib
+import itertools
 import json
 import logging
 import os
@@ -39,21 +40,27 @@ def sanitize_for_json(obj: Any) -> Any:
     return obj
 
 
-def _write_json_gz_atomic(path: str, payload: Any) -> None:
+def _write_json_gz_atomic(path: str, payload: Any, *, create_parent: bool = False) -> None:
     """
     Write a ``.json.gz`` via a temp sibling + ``os.replace`` so a crash or
     concurrent reader (including the publish rsync, whose glob skips the
     ``.tmp`` name) never sees a truncated file.
 
-    Creates the parent directory if it is missing. Every caller before the
-    driving-plan summary ran only after a collection had already populated
-    ``data_dir``, so the directory's existence was incidental rather than
-    guaranteed; the plan summary regenerates even on a night that collected
-    nothing, which is exactly the case a fresh deployment starts from.
+    ``create_parent`` is opt-in, and only the driving-plan summary passes it.
+    Every other caller runs after a collection has already populated
+    ``data_dir``, so a missing directory there means a misconfigured path — a
+    mistyped ``--download-dir``, an unmounted volume — and raising
+    FileNotFoundError is the correct, loud answer. Creating it unconditionally
+    would write cities.json.gz into the typo, report success, and leave the
+    publish rsync shipping nothing from the real data/, which reads as a
+    scheduler fault rather than the path error it is. The plan summary needs
+    the opposite because it regenerates even on a night that collected nothing
+    — the case a fresh deployment starts from.
     """
-    parent = os.path.dirname(path)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
+    if create_parent:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
     tmp_path = path + ".tmp"
     with gzip.open(tmp_path, "wt", encoding="utf-8") as f:
         json.dump(sanitize_for_json(payload), f, indent=2, allow_nan=False)
@@ -967,6 +974,10 @@ _PLAN_DISCLAIMER = (
 # history rather than a complete one; the catalog keeps every snapshot.
 _MAX_REVISIONS = 26
 
+# District names published per CITY row (see _plan_block). Bounds both the
+# artifact's size and what the page's search box can match on a city row.
+_MAX_CITY_DISTRICTS = 8
+
 
 def _clean(value: Any) -> Any:
     """Strip surrounding whitespace from a feed string, leaving None alone."""
@@ -1011,7 +1022,7 @@ def _capture_year_counts(block: Any) -> dict[str, Any] | None:
     return counts if isinstance(counts, dict) else None
 
 
-def _compact_capture_years(counts: dict[str, Any] | None) -> list[Any] | None:
+def _compact_capture_years(counts: dict[str, Any] | None, today: date) -> list[Any] | None:
     """
     A capture-year histogram as ``[first_year, [counts…]]``, or None.
 
@@ -1029,20 +1040,28 @@ def _compact_capture_years(counts: dict[str, Any] | None) -> list[Any] | None:
     """
     if not counts:
         return None
+    # Implausible years are dropped INDIVIDUALLY, against the one plausibility
+    # window the project already defines (plan_match.EARLIEST_PLAUSIBLE_CAPTURE
+    # → today, the same bound _observation_block filters newest_capture with).
+    # Rejecting the whole histogram when its span exceeded some separate
+    # threshold — what this did before — meant a single corrupt 1970 or 2611
+    # bucket, exactly issue #213's signature, erased a city's entire real
+    # capture history rather than the one bad year. Two plausibility rules in
+    # one codebase also drift; this keeps it at one.
+    earliest = plan_match.EARLIEST_PLAUSIBLE_CAPTURE.year
+    latest = today.year
     years = []
     for raw, count in counts.items():
         try:
-            years.append((int(raw), int(count)))
+            year, n = int(raw), int(count)
         except (TypeError, ValueError):
             continue
+        if earliest <= year <= latest:
+            years.append((year, n))
     if not years:
         return None
     years.sort()
     first, last = years[0][0], years[-1][0]
-    # A corrupt year (issue #213 territory) would otherwise stretch the array to
-    # hundreds of buckets; clamp to a span that can only be real imagery.
-    if last - first > 40:
-        return None
     dense = [0] * (last - first + 1)
     for year, count in years:
         dense[year - first] += count
@@ -1111,10 +1130,19 @@ def _plan_block(summary: plan_match.PlanSummary, tier: str) -> dict[str, Any]:
     if summary.approximate:
         block["window_approximate"] = True
     # A handful of district names, enough to show WHY a city matched without
-    # shipping all 91 counties of Idaho to every visitor.
+    # shipping all 44 counties of Idaho — or all 254 of Texas — to every
+    # visitor, once per city in that state.
+    #
+    # NOTE this cap also bounds what the page's search box can find, since
+    # driving.js joins exactly this list into its searchable string. Districts
+    # are sorted, so "Ada" still finds Boise, but a late-alphabet county will
+    # not find its city. Plan-AREA rows carry their record's full district list
+    # (there is one row per record, not per city, so it costs nothing there),
+    # which is why the affordance is stronger for untracked places than tracked
+    # ones. Raising this is a size decision, not a correctness one.
     if summary.districts:
-        block["districts"] = summary.districts[:8]
-        if len(summary.districts) > 8:
+        block["districts"] = summary.districts[:_MAX_CITY_DISTRICTS]
+        if len(summary.districts) > _MAX_CITY_DISTRICTS:
             block["districts_total"] = len(summary.districts)
     return block
 
@@ -1159,8 +1187,6 @@ def generate_driving_plan_summary(conn, data_dir: str) -> dict[str, Any]:
     Returns:
         The summary dict.
     """
-    from . import db  # local import to keep module import order simple
-
     today = date.today()
     entries = db.get_active_driving_plans(conn, country=None)
     index = plan_match.build_index(entries)
@@ -1204,9 +1230,16 @@ def generate_driving_plan_summary(conn, data_dir: str) -> dict[str, Any]:
         # When was this city actually driven, not just how old is the median?
         # A city with 2019 + 2022 + 2024 imagery and one with a single 2021
         # pass can share a median and mean entirely different things. Read from
-        # the latest gsv run's per-run JSON — the same files generate_aggregate_v2
-        # reads in this pipeline run, so the cost is already paid — and absent
-        # (not null) when the run has no JSON or no dated official imagery.
+        # the latest gsv run's per-run JSON, and absent (not null) when the run
+        # has no JSON or no dated official imagery.
+        #
+        # This is a SECOND read of files generate_aggregate_v2 also opens:
+        # _load_city_json does no caching, and the aggregate holds nothing open
+        # for us. Up to ~1,200 gzip decompressions, a few seconds, and paid on
+        # quiet nights too (the aggregate is gated on succeeded > 0, this is
+        # not). Sharing a cache across the two would mean holding every city's
+        # parsed JSON in memory at once, which is the trade this deliberately
+        # does not make — #157 is what a memory contract costs here.
         if gsv_run is not None and gsv_run["json_filename"]:
             run_json = _load_city_json(os.path.join(data_dir, gsv_run["json_filename"]))
             years = _compact_capture_years(
@@ -1214,7 +1247,8 @@ def generate_driving_plan_summary(conn, data_dir: str) -> dict[str, Any]:
                     ((run_json or {}).get("google_panos") or {}).get(
                         "histogram_of_capture_dates_by_year"
                     )
-                )
+                ),
+                today,
             )
             if years:
                 record["capture_years"] = years
@@ -1264,10 +1298,27 @@ def generate_driving_plan_summary(conn, data_dir: str) -> dict[str, Any]:
                 "country": _clean(entry["country"]),
                 "country_matched": plan_match.normalize_country(entry["country"]),
                 "region": _clean(entry["region"]),
-                "publish": entry["publish"],
+                # Trimmed like the three above, and for a sharper reason than
+                # display: the browser reads this flag to label a row's plan
+                # status, and it compares against the literal "Yes". Python
+                # reads the same flag through plan_match.is_published, which
+                # strips and casefolds. Publishing " Yes " verbatim would put a
+                # verdict of "Driving now" beside a plan status of "Closed" on
+                # the same row. The CATALOG still stores the feed's own bytes
+                # untouched (driving_plan.py never filters); this is the
+                # published join, where one reading has to win.
+                "publish": _clean(entry["publish"]),
                 "window_start": start,
                 "window_end": end,
                 "districts": [],
+                # Published although the page reads only `matched_city_count`
+                # below. It is the evidence behind that count — the same
+                # "verdict plus every metric behind it" convention the verdict
+                # column follows — and it is the only place the join is
+                # auditable from the artifact alone: without it, a reader who
+                # thinks a record should have matched their city has no way to
+                # tell a tier decision from a normalization miss. Roughly one
+                # entry per (city, matching record), so ~1.7k short strings.
                 "matched_city_ids": sorted(set(matched_city_ids.get(key, ()))),
             }
             if start_approx or end_approx:
@@ -1296,14 +1347,19 @@ def generate_driving_plan_summary(conn, data_dir: str) -> dict[str, Any]:
     # exactly the comparable pairs — no gap to reason about, no need to
     # reconstruct an unchanged fetch. Capped: the archive grows one revision a
     # week and every visitor fetches this file.
+    #
+    # Each snapshot's entries are read ONCE and carried forward: walking
+    # newest-first, every snapshot is the "newer" side of one pair and the
+    # "older" side of the next, so fetching per pair read all ~11.7k entries of
+    # each snapshot twice over.
     changed = db.get_changed_driving_plan_snapshots(conn, limit=_MAX_REVISIONS + 1)
     revisions = []
-    for newer, older in zip(changed, changed[1:]):
-        diff = plan_match.diff_snapshots(
-            db.get_driving_plan_entries(conn, older["snapshot_id"]),
-            db.get_driving_plan_entries(conn, newer["snapshot_id"]),
-        )
+    newer_entries = db.get_driving_plan_entries(conn, changed[0]["snapshot_id"]) if changed else []
+    for newer, older in itertools.pairwise(changed):
+        older_entries = db.get_driving_plan_entries(conn, older["snapshot_id"])
+        diff = plan_match.diff_snapshots(older_entries, newer_entries)
         revisions.append({"from": older["fetch_date"], "to": newer["fetch_date"], **diff})
+        newer_entries = older_entries
 
     history = db.get_driving_plan_history(conn)
     plan_meta = {
@@ -1326,7 +1382,10 @@ def generate_driving_plan_summary(conn, data_dir: str) -> dict[str, Any]:
     }
 
     output_path = os.path.join(data_dir, "driving_plan.json.gz")
-    _write_json_gz_atomic(output_path, summary_doc)
+    # The one caller that creates its parent: this regenerates on nights that
+    # collected nothing, so data_dir may legitimately not exist yet on a fresh
+    # deployment. See _write_json_gz_atomic for why that is not the default.
+    _write_json_gz_atomic(output_path, summary_doc, create_parent=True)
     logger.info(
         f"Wrote driving-plan summary for {len(cities_out)} cities and "
         f"{len(records_out)} plan records to {output_path}"

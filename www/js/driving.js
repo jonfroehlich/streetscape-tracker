@@ -291,9 +291,9 @@ const DRIVING_COLUMNS = [
     type: "text",
     initial: "asc",
     title:
-      "Google's publish flag read together with the window: Active while the window is open, " +
-      "Elapsed when Google still lists it as published but the window has run out, Closed once " +
-      "the flag itself reads No.",
+      "Google's publish flag read together with the window: Upcoming before the window opens, " +
+      "Active while it is open, Elapsed when Google still lists it as published but the window " +
+      "has run out, Closed once the flag itself reads No.",
     cell: (r) => `<td>${escapeHtml(r.planStatus ?? "—")}</td>`,
   },
   // One column, not two. A bare date headed "Window closes" reads as a
@@ -532,6 +532,7 @@ const DRIVING_FILTERS = [
     anyLabel: "Any plan status",
     options: [
       { value: "Active", label: "Window open now" },
+      { value: "Upcoming", label: "Published, window not yet open" },
       { value: "Elapsed", label: "Published, window elapsed" },
       { value: "Closed", label: "Campaign closed" },
       { value: "None", label: "Not in the plan" },
@@ -573,7 +574,13 @@ const DRIVING_FILTERS = [
 /** Row fields the free-text search box looks at. */
 const DRIVING_SEARCH_FIELDS = ["label", "cityId", "country", "region", "districts"];
 
-/** Default sort: the contradiction first, then alphabetical within it. */
+/**
+ * Default sort: alphabetical by place name.
+ *
+ * Deliberately not verdict-first. A reader arriving from a link usually wants
+ * to find one place, and the Verdict column header sorts the contradictions to
+ * the top in one click for anyone who came to browse them instead.
+ */
 const DRIVING_DEFAULT_SORT = { key: "label", dir: "asc" };
 
 /**
@@ -590,16 +597,31 @@ const DRIVING_DEFAULT_SORT = { key: "label", dir: "asc" };
  * different fact from Google saying "no", and the difference is exactly the
  * kind of feed staleness this page exists to surface.
  *
- * @param {?string} publishFlag - Google's raw publish value, or null.
+ * "Upcoming" is the symmetric case, and it has to exist for the same reason:
+ * a published window that has not opened yet is not "Active" either. Reporting
+ * it as Active put "Plan status: Active" beside the verdict "Planned" — which
+ * plan_match.classify derives correctly as `planned_upcoming` — under a column
+ * tooltip promising Active meant the window was open, and made the "Window
+ * open now" filter select campaigns that have not started.
+ *
+ * The publish flag is read the way plan_match.is_published reads it, trimmed
+ * and case-insensitively: the catalog stores Google's bytes verbatim, and a
+ * stricter test here than on the Python side is how the two halves of one row
+ * end up contradicting each other.
+ *
+ * @param {?string} publishFlag - Google's publish value, or null.
+ * @param {?string} windowStart - ISO start date, or null.
  * @param {?string} windowEnd - ISO end date, or null.
  * @param {Date} today - Reference date.
  * @returns {?string} "Active", "Upcoming", "Elapsed", "Closed", or null.
  */
-function planStatusFor(publishFlag, windowEnd, today) {
+function planStatusFor(publishFlag, windowStart, windowEnd, today) {
   if (publishFlag == null) return null;
-  if (publishFlag !== "Yes") return "Closed";
-  const days = daysUntil(windowEnd, today);
-  if (days != null && days < 0) return "Elapsed";
+  if (String(publishFlag).trim().toLowerCase() !== "yes") return "Closed";
+  const daysToEnd = daysUntil(windowEnd, today);
+  if (daysToEnd != null && daysToEnd < 0) return "Elapsed";
+  const daysToStart = daysUntil(windowStart, today);
+  if (daysToStart != null && daysToStart > 0) return "Upcoming";
   return "Active";
 }
 
@@ -636,8 +658,23 @@ function drivingRowModel(city, today = new Date()) {
   const gsv = observed.gsv ?? null;
   const mly = observed.mapillary ?? null;
 
+  // [firstYear, counts[]] or nothing. Validated once here so both the sort key
+  // and the sparkline renderer can trust it.
+  const raw = city.capture_years;
+  const captureYears =
+    Array.isArray(raw) && Number.isFinite(raw[0]) && Array.isArray(raw[1]) && raw[1].length
+      ? raw
+      : null;
+
   const planStatus = plan
-    ? planStatusFor(plan.active_count > 0 ? "Yes" : "No", plan.window_end ?? null, today)
+    ? planStatusFor(
+        // active_count is already computed with plan_match.is_published, so
+        // this synthesizes the flag rather than re-reading a raw one.
+        plan.active_count > 0 ? "Yes" : "No",
+        plan.window_start ?? null,
+        plan.window_end ?? null,
+        today
+      )
     : null;
 
   return {
@@ -648,10 +685,16 @@ function drivingRowModel(city, today = new Date()) {
     scope: "city",
     enabled: city.enabled === true,
     verdict: city.verdict ?? "not_listed",
-    captureYears: city.capture_years ?? null,
+    captureYears,
     // Sorts the sparkline column: the number of years between a place's first
     // and last observed capture. A wide span means repeat drives.
-    captureSpanYears: city.capture_years ? city.capture_years[1].length - 1 : null,
+    //
+    // Shape-guarded like sparklineCellHtml below, and for a harder reason: a
+    // malformed `capture_years` here throws inside buildPlaceRows' map, which
+    // aborts renderDrivingPlan before the table exists and leaves the whole
+    // page showing "Error loading the driving plan" over one bad cell's worth
+    // of data.
+    captureSpanYears: captureYears ? captureYears[1].length - 1 : null,
 
     planStatus,
     windowStart: plan?.window_start ?? null,
@@ -661,6 +704,9 @@ function drivingRowModel(city, today = new Date()) {
     matchTier: plan?.match_tier ?? null,
     // Joined into one string so the search box can find a city by the district
     // Google actually listed ("Ada" finds Boise) without a column for it.
+    // Bounded by _MAX_CITY_DISTRICTS in json_summarizer: the artifact ships the
+    // first few districts per city, sorted, so an early-alphabet county is
+    // findable and a late one is not. Area rows carry their record's full list.
     districts: (plan?.districts ?? []).join(" "),
 
     coveragePct: gsv?.coverage_rate_pct ?? null,
@@ -728,7 +774,12 @@ function planAreaRowModel(record, today = new Date()) {
     captureYears: null,
     captureSpanYears: null,
 
-    planStatus: planStatusFor(record.publish ?? null, record.window_end ?? null, today),
+    planStatus: planStatusFor(
+      record.publish ?? null,
+      record.window_start ?? null,
+      record.window_end ?? null,
+      today
+    ),
     windowStart: record.window_start ?? null,
     windowEnd: record.window_end ?? null,
     windowApproximate: record.window_approximate === true,

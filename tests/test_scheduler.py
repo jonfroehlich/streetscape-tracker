@@ -2078,6 +2078,58 @@ def test_driving_plan_failure_never_fails_the_night(conn, monkeypatch):
     assert rc == 0, "a plan-fetch failure alone is not an unhealthy night"
 
 
+def test_a_failing_plan_summary_does_not_take_down_the_rest_of_the_tail(conn, monkeypatch):
+    """
+    The tail's plan-summary regeneration sits AHEAD of the tail catalog backup
+    and the publish, and — unlike the aggregate and the manifest — is ungated,
+    so it runs on every night including quiet ones. It also touches up to
+    ~1,200 per-run JSONs on disk, which is real exposure to an OSError. Before
+    the guard, one of those would have cost a completely healthy night its
+    backup AND its publish: issue #167's exact failure mode, paid for the
+    least important artifact in the tail.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    _register(conn, "Alpha", width=1000, height=1000, step=20)
+    db.assign_schedule(conn, 90)
+    conn.execute("UPDATE schedule_state SET last_success_at = NULL")
+    conn.commit()
+
+    def boom(c, data_dir):
+        raise OSError("data_dir vanished mid-tail")
+
+    monkeypatch.setattr(sched, "generate_driving_plan_summary", boom)
+
+    backups = []
+    monkeypatch.setattr(
+        sched.catalog_backup,
+        "write_backup",
+        lambda conn, backup_dir, when, **kw: (
+            backups.append(when)
+            or sched.catalog_backup.BackupResult(
+                ok=True, path=os.path.join(backup_dir, "stubbed.backup")
+            )
+        ),
+    )
+
+    ran, published = [], []
+    monkeypatch.setattr(
+        sched,
+        "_run_one_city",
+        lambda cfg, city, today, provider="gsv", **kw: ran.append(city.city_id) or True,
+    )
+    _stub_tail(monkeypatch, sched, conn, published)
+
+    rc = sched.cmd_run_due(_publishing_cfg(), today=date(2026, 7, 2))
+
+    assert len(ran) == 1
+    assert published == ["aggregate", "manifest", "publish"], (
+        "a stale plan page costs a day; an unpublished night costs the runs"
+    )
+    assert len(backups) == 2, "both the pre-flight and the TAIL backup must still happen"
+    assert rc == 0, "a plan-summary failure alone is not an unhealthy night"
+
+
 def test_driving_plan_hook_respects_dry_run_and_enabled_flag(conn, monkeypatch, capsys):
     from streetscape_metadata_tracker import scheduler as sched
 

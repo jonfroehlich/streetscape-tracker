@@ -2135,8 +2135,20 @@ def _finish_batch(
     # which changes on its own schedule — roughly weekly, independent of
     # whether any city was due. Gating it would leave the published plan stale
     # on exactly the quiet nights, which are most of them.
+    #
+    # Failure-guarded for the same reason _fetch_driving_plan_nightly is, and
+    # more urgently: this runs on EVERY night, ahead of the tail backup, the
+    # publish and the operator alert. Because it is ungated it is the only tail
+    # work a quiet night does at all, and it touches up to ~1,200 per-run JSONs
+    # on disk — so an OSError here would have taken down the backup and the
+    # publish of a night that was otherwise completely healthy. That is #167's
+    # failure mode, and this artifact is the least important thing in the tail:
+    # a stale plan page costs a day, an unpublished night costs the runs.
     logger.info("Regenerating driving_plan.json.gz")
-    generate_driving_plan_summary(conn, cfg.data_dir)
+    try:
+        generate_driving_plan_summary(conn, cfg.data_dir)
+    except Exception:
+        logger.exception("Driving-plan summary failed; continuing with the rest of the tail")
 
     # Back up again now that the night's runs, diffs and walks are registered:
     # the pre-flight copy (see _backup_catalog_nightly) guarantees a copy

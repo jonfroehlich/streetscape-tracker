@@ -1150,6 +1150,15 @@ def get_latest_runs_all(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     catalog, twice over if it also wants diffs). Same "latest row per group"
     shape as ``get_latest_street_walks_all``, with the diff's headline counter
     joined on so callers need no second pass.
+
+    The diff join picks ONE row explicitly. ``run_diffs`` is UNIQUE on
+    (from_run_id, to_run_id), not on to_run_id alone, so a run diffed against
+    two different predecessors — which is what happens when an earlier run is
+    purged and the diff recomputed — matches twice. A bare LEFT JOIN would then
+    emit that (city, provider) twice and leave a last-write-wins caller
+    advertising whichever baseline SQLite happened to return last. Taking the
+    newest ``diff_id`` makes the choice explicit: the most recently computed
+    comparison wins.
     """
     return conn.execute(
         """SELECT r.*, d.capture_date_changed, d.coverage_delta_pct,
@@ -1160,7 +1169,9 @@ def get_latest_runs_all(conn: sqlite3.Connection) -> list[sqlite3.Row]:
              ON latest.city_id = r.city_id
             AND latest.provider = r.provider
             AND latest.run_date = r.run_date
-           LEFT JOIN run_diffs d ON d.to_run_id = r.run_id
+           LEFT JOIN run_diffs d
+             ON d.diff_id = (SELECT MAX(diff_id) FROM run_diffs
+                             WHERE to_run_id = r.run_id)
            LEFT JOIN runs f ON f.run_id = d.from_run_id
            ORDER BY r.city_id, r.provider"""
     ).fetchall()

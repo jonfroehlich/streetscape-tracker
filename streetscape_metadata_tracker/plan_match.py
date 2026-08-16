@@ -30,9 +30,10 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, timedelta
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any
 
 # ── Verdict vocabulary ─────────────────────────────────────────────────────
 #
@@ -58,8 +59,12 @@ UNPLANNED_DRIVE_SLACK = timedelta(days=183)
 # The feed writes some country names in the local language and misspells
 # others, so a naive join silently reports zero plan entries for countries we
 # actively track. Every alias below was confirmed present in the production
-# catalog — without them Spain, Mexico and Brazil all read as "not in plan"
-# while their entries sit there under another spelling.
+# catalog — without them Spain and Brazil read as "not in plan" while their
+# entries sit there under another spelling.
+#
+# Case and diacritics are NOT handled here: `country_key` folds both sides of
+# the join, so "México"/"Mexico" and "ITALIA"/"Italia" already agree without an
+# entry. Only genuinely different *words* belong in this table.
 _COUNTRY_ALIASES = {
     "brasil": "Brazil",
     "espana": "Spain",  # España, after diacritic folding
@@ -133,7 +138,13 @@ def _fold(value: str) -> str:
 
 def normalize_country(name: str | None) -> str:
     """
-    Canonical country name for joining, or "" for a missing value.
+    Canonical country name for DISPLAY, or "" for a missing value.
+
+    Resolves the feed's local-language and misspelled spellings to one name a
+    reader recognizes. Deliberately case- and diacritic-preserving for anything
+    the alias table does not cover, because this value is published (a plan
+    record's ``country_matched``) and folding it would put "mexico" on screen.
+    Join on `country_key` instead — never on this.
 
     >>> normalize_country("Brasil")
     'Brazil'
@@ -146,6 +157,27 @@ def normalize_country(name: str | None) -> str:
         return ""
     folded = _fold(name)
     return _COUNTRY_ALIASES.get(folded, name.strip())
+
+
+def country_key(name: str | None) -> str:
+    """
+    The key both sides of the country join are bucketed under.
+
+    `normalize_country` alone is not enough: it folds a name only to *look up*
+    the alias table and then returns the raw spelling, so every country outside
+    that 15-entry table stayed case- and diacritic-sensitive. The feed demonstrably
+    writes names in the local script ("España", "Brasil"), so a country whose
+    catalog and feed spellings differ by an accent alone — "México" vs "Mexico" —
+    would bucket under one key and be looked up under the other, resolving every
+    city there to `not_listed` while its records simultaneously appeared as
+    untracked plan areas. Folding after aliasing makes the join agree on both.
+
+    >>> country_key("México") == country_key("Mexico")
+    True
+    >>> country_key("Brasil") == country_key("BRAZIL")
+    True
+    """
+    return _fold(normalize_country(name))
 
 
 def normalize_admin(name: str | None) -> str:
@@ -195,7 +227,7 @@ def build_index(entries: Iterable[Any]) -> PlanIndex:
     by_region: dict[tuple[str, str], list[Any]] = {}
     by_district: dict[tuple[str, str], list[Any]] = {}
     for entry in entries:
-        country = normalize_country(entry["country"])
+        country = country_key(entry["country"])
         by_country.setdefault(country, []).append(entry)
         region = normalize_admin(entry["region"])
         if region:
@@ -224,12 +256,12 @@ def match_city(city: Any, index: PlanIndex) -> tuple[str | None, list[Any]]:
     precisely because both counties share Idaho's single window, but it is the
     reason district does not outrank region.
     """
-    country = normalize_country(getattr(city, "country_name", None))
+    country = country_key(getattr(city, "country_name", None))
 
     manual = MANUAL_LINKS.get(city.city_id)
     if manual is not None:
         manual_country, manual_name = manual
-        key = (normalize_country(manual_country), normalize_admin(manual_name))
+        key = (country_key(manual_country), normalize_admin(manual_name))
         hits = list(index.by_region.get(key, ())) or list(index.by_district.get(key, ()))
         if hits:
             return "manual", hits
@@ -298,6 +330,28 @@ def parse_loose_date(value: str | None) -> date | None:
         return None
 
 
+def is_published(publish: str | None) -> bool:
+    """
+    Whether Google still flags this record as published.
+
+    ONE reading of the flag, shared by every consumer. The catalog stores
+    `publish` verbatim (driving_plan.py deliberately never filters the feed),
+    and the feed is known to ship untrimmed values — `_clean` exists in
+    json_summarizer because at least one region arrives as " Leningrad region".
+    Three call sites used to test this three different ways: `.strip().casefold()`
+    here, `.strip()` alone in `diff_snapshots`, and an exact `!== "Yes"` in
+    driving.js. A value of " Yes " would therefore have counted as live in one
+    place, closed in another, and produced a row whose Verdict said "Driving now"
+    beside a Plan status of "Closed".
+
+    >>> is_published(" yes ")
+    True
+    >>> is_published("No") or is_published(None)
+    False
+    """
+    return (publish or "").strip().casefold() == "yes"
+
+
 def record_key(entry: Any) -> tuple:
     """
     The identity of the feed *record* an exploded entry came from.
@@ -328,8 +382,29 @@ def region_key(entry: Any) -> tuple[str, str]:
     the record key but not the region, which is what lets a revision diff say
     "Idaho's window moved" instead of "one record vanished and another
     appeared". Regions are the level Google actually schedules at.
+
+    Uses `country_key`, not `normalize_country`: this is a grouping key, so two
+    spellings of one country must collapse, or a re-spelled row would read as a
+    region removed plus an unrelated region added.
     """
-    return (normalize_country(entry["country"]), normalize_admin(entry["region"]))
+    return (country_key(entry["country"]), normalize_admin(entry["region"]))
+
+
+def _window_span(windows: Iterable[tuple[str | None, str | None]]) -> list[str | None]:
+    """
+    A region's whole drive window as ``[earliest start, latest end]``.
+
+    A region can hold more than one window — Idaho and Oregon each carry an
+    active 2026 campaign beside a closed 2025-12 one — so the bounds have to be
+    taken from the right halves of the pairs. Flattening the pairs and slicing
+    the two smallest values (what this did before) returned Idaho's 2025 window
+    and silently dropped the live one, and, when an end date was dirty enough to
+    drop out, could pair two different campaigns' START dates and publish them
+    as a from→to range.
+    """
+    starts = sorted(start for start, _ in windows if start)
+    ends = sorted(end for _, end in windows if end)
+    return [starts[0] if starts else None, ends[-1] if ends else None]
 
 
 def diff_snapshots(before: Sequence[Any], after: Sequence[Any]) -> dict[str, Any]:
@@ -356,6 +431,7 @@ def diff_snapshots(before: Sequence[Any], after: Sequence[Any]) -> dict[str, Any
     Returns counters plus per-region detail, both bounded: a revision that
     rewrote half the feed should not publish half the feed again.
     """
+
     def _by_region(entries: Sequence[Any]) -> dict[tuple[str, str], dict[str, Any]]:
         out: dict[tuple[str, str], dict[str, Any]] = {}
         for entry in entries:
@@ -372,7 +448,7 @@ def diff_snapshots(before: Sequence[Any], after: Sequence[Any]) -> dict[str, Any
             )
             if entry["district"]:
                 slot["districts"].add(entry["district"])
-            slot["publish"].add((entry["publish"] or "").strip())
+            slot["publish"].add(is_published(entry["publish"]))
             start, _ = entry_date(entry, "date_start", "date_start_raw")
             end, _ = entry_date(entry, "date_end", "date_end_raw")
             slot["windows"].add((start, end))
@@ -393,7 +469,7 @@ def diff_snapshots(before: Sequence[Any], after: Sequence[Any]) -> dict[str, Any
         entry = {"country": b["country"], "region": b["region"]}
 
         # The campaign-closed signal: something was published and no longer is.
-        was_live, is_live = "Yes" in a["publish"], "Yes" in b["publish"]
+        was_live, is_live = True in a["publish"], True in b["publish"]
         if was_live and not is_live:
             closed.append(entry)
         elif is_live and not was_live:
@@ -401,8 +477,7 @@ def diff_snapshots(before: Sequence[Any], after: Sequence[Any]) -> dict[str, Any
 
         if a["windows"] != b["windows"]:
             window_changed.append(
-                {**entry, "from": sorted(filter(None, (w for p in a["windows"] for w in p)))[:2],
-                 "to": sorted(filter(None, (w for p in b["windows"] for w in p)))[:2]}
+                {**entry, "from": _window_span(a["windows"]), "to": _window_span(b["windows"])}
             )
 
         if a["districts"] != b["districts"]:
@@ -426,10 +501,12 @@ def diff_snapshots(before: Sequence[Any], after: Sequence[Any]) -> dict[str, Any
         "windows_changed": len(window_changed),
         "districts_changed": len(districts_changed),
         "detail": {
-            "added": [{"country": r["country"], "region": r["region"]} for r in added][:_MAX_DETAIL],
-            "removed": [
-                {"country": r["country"], "region": r["region"]} for r in removed
-            ][:_MAX_DETAIL],
+            "added": [{"country": r["country"], "region": r["region"]} for r in added][
+                :_MAX_DETAIL
+            ],
+            "removed": [{"country": r["country"], "region": r["region"]} for r in removed][
+                :_MAX_DETAIL
+            ],
             "closed": closed[:_MAX_DETAIL],
             "reopened": reopened[:_MAX_DETAIL],
             "windows": window_changed[:_MAX_DETAIL],
@@ -486,18 +563,18 @@ def summarize_entries(entries: Sequence[Any]) -> PlanSummary:
     reported window back seven years. With nothing active, the span covers all
     entries, which is what makes "this campaign ended on <date>" answerable.
     """
-    active = [e for e in entries if (e["publish"] or "").strip().casefold() == "yes"]
+    active = [e for e in entries if is_published(e["publish"])]
     considered = active or list(entries)
 
     starts: list[str] = []
     ends: list[str] = []
     approximate = False
     for entry in considered:
-        iso, approx = entry_date(entry,"date_start", "date_start_raw")
+        iso, approx = entry_date(entry, "date_start", "date_start_raw")
         if iso:
             starts.append(iso)
             approximate = approximate or approx
-        iso, approx = entry_date(entry,"date_end", "date_end_raw")
+        iso, approx = entry_date(entry, "date_end", "date_end_raw")
         if iso:
             ends.append(iso)
             approximate = approximate or approx

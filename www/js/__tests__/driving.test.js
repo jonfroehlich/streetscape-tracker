@@ -14,8 +14,19 @@ global.lookupStreetwalk = (manifest, cityId, provider, networkType) =>
     (w) => w.city_id === cityId && w.provider === provider && w.network_type === networkType
   ) ?? null;
 
-global.escapeHtml = (s) =>
-  String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+// Mirrors streetscape-utils.js exactly, quotes included. A stub that escaped
+// only &<> would pass every assertion here while leaving the real risk — the
+// feed-derived strings this page interpolates into title="…" attributes —
+// untested, so a regression in attribute escaping would look green.
+global.escapeHtml = (value) => {
+  if (value == null) return "";
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+};
 global.coverageColor = (pct) => `coverage(${pct})`;
 // Local-midnight parse, matching streetscape-utils.js — a bare YYYY-MM-DD read
 // as UTC can shift a date by a day, which would show up as an off-by-one in
@@ -313,6 +324,36 @@ test("plan status distinguishes an elapsed window from a live one", () => {
   assert.equal(closed.planStatus, "Closed");
 });
 
+test("plan status distinguishes a window that has not opened yet", () => {
+  // The symmetric case to Elapsed, and it exists for the same reason: a
+  // published window starting next year is not "Active" either. Reporting it
+  // as Active put "Plan status: Active" beside the verdict "Planned", under a
+  // tooltip promising Active meant the window was open — and made the
+  // "Window open now" filter select campaigns that had not started.
+  const upcoming = planAreaRowModel(
+    { ...CHUBUT, window_start: "2027-01-01", window_end: "2027-12-31" },
+    TODAY
+  );
+  assert.equal(upcoming.planStatus, "Upcoming");
+
+  // A window that opened today is Active, not Upcoming — the boundary is
+  // inclusive, matching plan_match.classify's `planned_open`.
+  const opensToday = planAreaRowModel(
+    { ...CHUBUT, window_start: "2026-08-16", window_end: "2026-12-31" },
+    TODAY
+  );
+  assert.equal(opensToday.planStatus, "Active");
+
+  // And with no start date at all there is nothing to be upcoming about: a
+  // published, unelapsed window stays Active rather than silently changing
+  // state on the ~half of feed records that carry only one dirty date.
+  const noStart = planAreaRowModel(
+    { ...CHUBUT, window_start: null, window_end: "2026-12-31" },
+    TODAY
+  );
+  assert.equal(noStart.planStatus, "Active");
+});
+
 test("plan status agrees with the verdict on an elapsed window", () => {
   // The two are computed independently (verdict in Python, status in JS), so
   // this pins the case where they used to disagree on screen.
@@ -324,7 +365,7 @@ test("plan status agrees with the verdict on an elapsed window", () => {
   assert.equal(VERDICTS[row.verdict].label, "Campaign closed");
 });
 
-test("a city row's plan status uses the same three states", () => {
+test("a city row's plan status uses the same states", () => {
   const elapsed = drivingRowModel(
     {
       city_id: "x",
@@ -359,6 +400,13 @@ test("every plan-status filter value is one the row models can actually produce"
       planAreaRowModel({ ...CHUBUT, window_end: "2026-12-31" }, TODAY),
       planAreaRowModel({ ...CHUBUT, window_end: "2025-10-01" }, TODAY),
       planAreaRowModel({ ...CHUBUT, publish: "No" }, TODAY),
+      // Published, but the window has not opened yet — "Active" would put the
+      // column in contradiction with the row's own "Planned" verdict, and make
+      // the window-open filter select campaigns that have not started.
+      planAreaRowModel(
+        { ...CHUBUT, window_start: "2027-01-01", window_end: "2027-12-31" },
+        TODAY
+      ),
       drivingRowModel(ADDIS, TODAY),
     ].map((r) => r.planStatus ?? "None")
   );

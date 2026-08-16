@@ -74,6 +74,98 @@ def test_normalize_country_tolerates_missing_values():
     assert plan_match.normalize_country("") == ""
 
 
+def test_normalize_country_preserves_the_spelling_it_publishes():
+    # It is a DISPLAY name — a record's published `country_matched` — so
+    # anything the alias table does not cover keeps its case and diacritics.
+    # Folding here would put "mexico" on screen; `country_key` is the join.
+    assert plan_match.normalize_country("México") == "México"
+    assert plan_match.normalize_country("  Japan  ") == "Japan"
+
+
+@pytest.mark.parametrize(
+    "catalog_spelling,feed_spelling",
+    [
+        ("México", "Mexico"),  # the case the alias table never covered
+        ("Mexico", "MEXICO"),
+        ("Brasil", "BRAZIL"),  # alias AND case, together
+        ("Panamá", "panama"),
+        ("Türkiye", "TURKIYE"),
+    ],
+)
+def test_country_key_joins_spellings_that_differ_only_by_case_or_accent(
+    catalog_spelling, feed_spelling
+):
+    # `normalize_country` folds a name only to LOOK UP the alias table and then
+    # returns the raw spelling, so every country outside that 15-entry table
+    # stayed case- and diacritic-sensitive. A catalog "México" bucketed under a
+    # different key than a feed "Mexico" resolved every city there to
+    # `not_listed` while its records simultaneously showed up as untracked plan
+    # areas — the same country on the page twice, disagreeing with itself.
+    assert plan_match.country_key(catalog_spelling) == plan_match.country_key(feed_spelling)
+
+
+def test_country_key_still_separates_genuinely_different_countries():
+    # Folding must not over-merge: the guard against "fix the join by making
+    # every key collide".
+    assert plan_match.country_key("Austria") != plan_match.country_key("Australia")
+    assert plan_match.country_key(None) == ""
+
+
+def test_a_city_matches_a_feed_country_spelled_with_an_accent():
+    # End-to-end through the index, which is where the bug actually bit: both
+    # `build_index` and `match_city` have to agree on the key.
+    index = plan_match.build_index([_entry(country="México", region="Jalisco")])
+    tier, hits = plan_match.match_city(
+        _city(city_id="guadalajara--jalisco--mexico", state_name="Jalisco", country_name="Mexico"),
+        index,
+    )
+    assert tier == "region"
+    assert len(hits) == 1
+
+
+def test_region_key_groups_two_spellings_of_one_country_together():
+    # A grouping key, so a re-spelled row must collapse rather than read as a
+    # region removed plus an unrelated region added.
+    assert plan_match.region_key(
+        _entry(country="México", region="Jalisco")
+    ) == plan_match.region_key(_entry(country="Mexico", region="Jalisco"))
+
+
+# ── The publish flag ───────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("Yes", True),
+        (" Yes ", True),  # the feed ships untrimmed values
+        ("yes", True),
+        ("YES", True),
+        ("No", False),
+        (" no ", False),
+        ("", False),
+        (None, False),
+    ],
+)
+def test_is_published_is_one_reading_of_the_flag(raw, expected):
+    # Three call sites used to test this three different ways: `.strip()
+    # .casefold()` in summarize_entries, a bare `.strip()` in diff_snapshots,
+    # and an exact `!== "Yes"` in driving.js. A " Yes " counted as live in one
+    # place and closed in another, producing a row whose Verdict said "Driving
+    # now" beside a Plan status of "Closed".
+    assert plan_match.is_published(raw) is expected
+
+
+def test_an_untrimmed_publish_flag_is_live_everywhere_it_is_read():
+    # The two Python readers, on the same value, must agree.
+    padded = _entry(publish=" Yes ")
+    assert plan_match.summarize_entries([padded]).active_count == 1
+
+    diff = plan_match.diff_snapshots([_entry(publish="No")], [padded])
+    assert diff["campaigns_reopened"] == 1
+    assert diff["campaigns_closed"] == 0
+
+
 @pytest.mark.parametrize(
     "catalog_name,feed_name",
     [
@@ -309,12 +401,9 @@ def test_an_open_window_with_older_imagery_is_still_planned_open():
 
 
 def test_a_future_window_reads_as_upcoming():
-    summary = plan_match.summarize_entries(
-        [_entry(date_start="2027-04-01", date_end="2027-11-01")]
-    )
+    summary = plan_match.summarize_entries([_entry(date_start="2027-04-01", date_end="2027-11-01")])
     assert (
-        plan_match.classify(summary, date(2024, 1, 1), TODAY)
-        == plan_match.VERDICT_PLANNED_UPCOMING
+        plan_match.classify(summary, date(2024, 1, 1), TODAY) == plan_match.VERDICT_PLANNED_UPCOMING
     )
 
 
@@ -418,6 +507,43 @@ def test_a_shifted_window_is_reported_without_touching_the_district_count():
     assert diff["windows_changed"] == 1
     assert diff["districts_changed"] == 0
     assert diff["campaigns_closed"] == 0
+
+
+def test_a_multi_window_regions_span_covers_all_of_its_campaigns():
+    # Idaho and Oregon each carry an ACTIVE 2026 window beside a closed 2025-12
+    # one. Flattening the (start, end) pairs and taking the two globally
+    # smallest values published the dead window and dropped the live one, so
+    # the revision log reported the wrong campaign as the region's window.
+    # The span is [earliest start, latest end], taken from the right halves.
+    before = [_entry(date_start="2025-04-01", date_end="2025-12-01")]
+    after = [
+        _entry(district="Ada", date_start="2025-04-01", date_end="2025-12-01"),
+        _entry(district="Adams", date_start="2026-04-13", date_end="2026-11-01"),
+    ]
+    diff = plan_match.diff_snapshots(before, after)
+
+    assert diff["windows_changed"] == 1
+    detail = diff["detail"]["windows"][0]
+    assert detail["from"] == ["2025-04-01", "2025-12-01"]
+    assert detail["to"] == ["2025-04-01", "2026-11-01"], "must reach the live window's end"
+
+
+def test_a_window_span_never_pairs_two_campaigns_start_dates():
+    # With ends dirty beyond even parse_loose_date's day-first recovery (the
+    # feed's truncated month names), the old flatten-and-slice took the two
+    # smallest SURVIVING values — here two different campaigns' starts — and
+    # published them as a from→to range: a window that never existed. A span
+    # with no usable end is now simply a null end.
+    before = [_entry(date_start="2019-01-01", date_end="2019-06-01")]
+    after = [
+        _entry(district="Ada", date_start="2026-04-13", date_end=None, date_end_raw="Sept"),
+        _entry(district="Adams", date_start="2026-05-01", date_end=None, date_end_raw=None),
+    ]
+    diff = plan_match.diff_snapshots(before, after)
+
+    to_span = diff["detail"]["windows"][0]["to"]
+    assert to_span[0] == "2026-04-13"
+    assert to_span[1] is None, "no usable end date is a null end, never another start"
 
 
 def test_a_wholly_new_or_dropped_region_is_counted_as_such():
