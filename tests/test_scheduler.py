@@ -3023,3 +3023,28 @@ def test_every_scheduled_channel_declares_its_per_ip_hosts():
     from streetscape_metadata_tracker.scheduler import CHANNEL_HOSTS, STREET_CHANNELS
 
     assert set(CHANNEL_HOSTS) == set(KNOWN_PROVIDERS) | set(STREET_CHANNELS)
+
+
+def test_a_mapillary_block_skips_both_mapillary_channels(conn, monkeypatch):
+    """
+    The grid channel and the road walk hit the SAME per-IP CDN, so one block
+    takes out both (CHANNEL_HOSTS). Neither GSV channel is affected: gsv is
+    metered per Google project, and gsv_streets uses Overpass.
+    """
+    from streetscape_metadata_tracker.download_common import HOST_MAPILLARY_TILES
+
+    for name in ("Bend", "Corvallis"):
+        _register(conn, name, width=1000, height=1000, step=20)
+
+    ran = []
+
+    def run_one(city, provider):
+        ran.append(provider)
+        return _blocked_outcome(HOST_MAPILLARY_TILES) if provider == "mapillary" else True
+
+    _run_loop_with(monkeypatch, conn, _street_cfg(publish_enabled=False), run_one)
+
+    assert ran.count("mapillary") == 1
+    assert ran.count("mapillary_streets") == 0, "same CDN, same block"
+    assert ran.count("gsv") == 2
+    assert ran.count("gsv_streets") == 2
