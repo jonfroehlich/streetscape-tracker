@@ -68,8 +68,8 @@ const sharedGlobals = {
   markerDateStyle: "readonly",
 };
 
-// Symbols table-utils.js DEFINES and the two table pages (grid.js,
-// streets.js) CONSUME as globals (table-utils.js is loaded between
+// Symbols table-utils.js DEFINES and the table pages (grid.js, streets.js,
+// driving.js) CONSUME as globals (table-utils.js is loaded between
 // streetscape-utils.js and the page script).
 const tableGlobals = {
   cityDisplayLabel: "readonly",
@@ -81,7 +81,7 @@ const tableGlobals = {
   createSortableTable: "readonly",
 };
 
-// Symbols table-controls.js DEFINES and the two table pages CONSUME (issue
+// Symbols table-controls.js DEFINES and the table pages CONSUME (issue
 // #188). Loaded after table-utils.js, whose formatCellNumber it consumes.
 const tableControlGlobals = {
   foldForSearch: "readonly",
@@ -179,7 +179,7 @@ module.exports = [
     // streetscape-utils.js, table-utils.js and table-controls.js globals and,
     // like the files above, carry a Node export shim (`module`) so their pure
     // helpers can be unit-tested.
-    files: ["js/streets.js", "js/grid.js"],
+    files: ["js/streets.js", "js/grid.js", "js/driving.js"],
     languageOptions: {
       ecmaVersion: 2022,
       sourceType: "script",

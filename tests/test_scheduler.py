@@ -42,6 +42,7 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _REAL_DRIVING_PLAN_HOOK = _sched._fetch_driving_plan_nightly
 _REAL_WRITE_BACKUP = _sched.catalog_backup.write_backup
 _REAL_BACKUP_HOOK = _sched._backup_catalog_nightly
+_REAL_PLAN_SUMMARY = _sched.generate_driving_plan_summary
 
 
 @pytest.fixture(autouse=True)
@@ -73,6 +74,26 @@ def _no_real_catalog_backup(monkeypatch):
         lambda conn, backup_dir, when, **kw: _sched.catalog_backup.BackupResult(
             ok=True, path=os.path.join(backup_dir, "stubbed.backup")
         ),
+    )
+
+
+@pytest.fixture(autouse=True)
+def _no_driving_plan_summary(monkeypatch):
+    """
+    The tail regenerates driving_plan.json.gz UNCONDITIONALLY — deliberately
+    not gated on `succeeded > 0`, since Google's feed changes on its own
+    schedule and gating would leave the published plan stale on exactly the
+    quiet nights. That means every run-due test reaches it, and
+    SchedulerConfig's data_dir defaults to <repo>/data, so without this stub
+    the suite writes a fixture-sized artifact into the developer's working
+    tree — the same hazard _no_real_catalog_backup exists for, and the reason
+    the writer now creates its parent directory rather than failing.
+
+    The dedicated driving-plan tests restore _REAL_PLAN_SUMMARY and point
+    data_dir at tmp_path.
+    """
+    monkeypatch.setattr(
+        _sched, "generate_driving_plan_summary", lambda conn, data_dir: {"records": []}
     )
 
 
@@ -2166,6 +2187,32 @@ def test_backup_happens_on_a_zero_due_night(conn, monkeypatch, tmp_path):
 
     assert rc == 0
     assert (tmp_path / "backups" / "streetscape_tracker.db.2026-07-02.backup").exists()
+
+
+def test_driving_plan_summary_is_regenerated_on_a_zero_due_night(conn, monkeypatch, tmp_path):
+    """
+    The tail's aggregate and streetwalk manifest are gated on `succeeded > 0`
+    because they describe the runs the night collected. The driving-plan
+    summary must NOT be: it describes Google's feed, which the pre-loop hook
+    refreshes independently and which changes roughly weekly regardless of
+    whether any city was due. Gating it would leave the published plan stale on
+    exactly the quiet nights, which are most of them.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    monkeypatch.setattr(sched, "generate_driving_plan_summary", _REAL_PLAN_SUMMARY)
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+
+    data_dir = tmp_path / "data"
+    rc = sched.cmd_run_due(
+        _real_backup_cfg(tmp_path, data_dir=str(data_dir)), today=date(2026, 7, 2)
+    )
+
+    assert rc == 0
+    artifact = data_dir / "driving_plan.json.gz"
+    assert artifact.exists(), "a zero-due night must still refresh the published plan"
+    with gzip.open(artifact, "rt", encoding="utf-8") as f:
+        assert json.load(f)["schema_version"] == 1
 
 
 def test_a_failed_backup_makes_the_night_unhealthy_but_still_publishes(conn, monkeypatch):

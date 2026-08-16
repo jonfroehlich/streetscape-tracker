@@ -1,0 +1,206 @@
+/* driving.css — styles unique to the Driving page (driving.html).
+ *
+ * The page reuses data-table.css for the table, controls and distribution
+ * strip; only the verdict pills, the archive-provenance block and the
+ * unwatched-areas summary are page-specific.
+ *
+ * Colour note: the four tones below are the same family the rest of the site
+ * uses, but every foreground is a dark shade rather than the vivid one, for
+ * the same reason streetscape-shared.css picks #2E7D32 for the active nav
+ * link — the vivid greens and ambers fail 4.5:1 against a pale fill.
+ */
+
+/* ── Archive provenance ────────────────────────────────────────────────────
+   How much plan history actually exists. Sits above the table because it is
+   the page's principal caveat, not a footnote: the archive starts 2026-07-31,
+   so an empty plan cell for an older drive means "we were not watching yet",
+   not "Google had no plans". */
+.driving-provenance {
+  max-width: 68ch;
+  margin: 0 0 20px;
+  padding: 10px 14px;
+  border-left: 3px solid #1a73e8;
+  background: #f5f8ff;
+  border-radius: 0 4px 4px 0;
+  font-size: 14px;
+}
+
+.driving-provenance p {
+  margin: 0 0 6px;
+}
+
+.driving-provenance p:last-child {
+  margin-bottom: 0;
+}
+
+/* ── Verdict pills ─────────────────────────────────────────────────────────
+   The verdict is the one column a reader scans first, so it is the one thing
+   on the page carrying colour. Each pill also has a title attribute (set in
+   driving.js) with the caveat the label alone cannot carry — notably that a
+   "Campaign closed" verdict is not evidence an area was not driven. */
+.verdict-pill {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  border: 1px solid transparent;
+}
+
+/* Imagery observed inside an archived window — the drive is confirmed. */
+.verdict-good {
+  background: #e6f4ea;
+  color: #1e6b34;
+  border-color: #b7e0c4;
+}
+
+/* An open or upcoming published window. */
+.verdict-active {
+  background: #e8f0fe;
+  color: #174ea6;
+  border-color: #c3d5fb;
+}
+
+/* Driven well after the last published window closed — the finding this page
+   exists to surface. Deliberately the most prominent tone: it is the case a
+   reader would otherwise never think to look for. */
+.verdict-warn {
+  background: #fef3e0;
+  color: #8a4b00;
+  border-color: #f5d5a3;
+}
+
+/* No open window, or no entry at all. Muted because it is an ABSENCE of
+   evidence, and the palette should not let it read as a negative finding. */
+.verdict-muted {
+  background: #f1f3f4;
+  color: #4a4f54;
+  border-color: #dadce0;
+}
+
+/* Marks a date recovered from a malformed value in Google's feed by a
+   day-first reading, so a heuristic never reads as published fact. */
+.approx-flag {
+  color: #8a4b00;
+  font-weight: 700;
+  margin-left: 2px;
+}
+
+/* ── Tracked / not-tracked pills ───────────────────────────────────────────
+   Quieter than the verdict pills on purpose: this column says who is watching,
+   which is a property of THIS project, not a finding about Google. */
+.scope-pill {
+  display: inline-block;
+  padding: 1px 7px;
+  border-radius: 9px;
+  font-size: 12px;
+  white-space: nowrap;
+  border: 1px solid #dadce0;
+  background: #f8f9fa;
+  color: #4a4f54;
+}
+
+.scope-city {
+  border-color: #c3d5fb;
+  background: #f2f6fe;
+  color: #174ea6;
+}
+
+.scope-paused {
+  border-style: dashed;
+}
+
+/* ── Capture-history sparkline ─────────────────────────────────────────────
+   One bar per year of official © Google imagery. The point is repeat drives:
+   a city driven in 2019, 2022 and 2024 looks identical to a once-driven city
+   under a median age, and completely different here. Bars are aria-hidden;
+   the accessible content is the text span beside them, the same split
+   coverageCellHtml uses. */
+.spark-cell {
+  white-space: nowrap;
+}
+
+.spark {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 1px;
+  height: 20px;
+  min-width: 60px;
+}
+
+.spark-bar {
+  width: 3px;
+  background: #1a73e8;
+  border-radius: 1px 1px 0 0;
+  min-height: 1px;
+}
+
+/* A year with no imagery is a real observation — the gap between drives — so
+   it keeps its slot rather than closing up. */
+.spark-empty {
+  background: #e4e6e8;
+  height: 2px !important;
+}
+
+/* ── Plan revisions ────────────────────────────────────────────────────────
+   What Google changed between archived snapshots. The feed is overwritten in
+   place, so this list is the only record that these edits ever happened. */
+.driving-revisions {
+  margin: 36px 0 0;
+  max-width: 78ch;
+}
+
+.driving-revisions h2 {
+  font-size: 18px;
+  margin: 0 0 8px;
+}
+
+.revision-list {
+  list-style: none;
+  padding: 0;
+  margin: 12px 0 0;
+}
+
+.revision-list li {
+  display: grid;
+  grid-template-columns: minmax(170px, auto) 1fr;
+  gap: 4px 16px;
+  padding: 8px 0;
+  border-bottom: 1px solid #eee;
+  font-size: 14px;
+}
+
+.revision-date {
+  font-variant-numeric: tabular-nums;
+  color: #555;
+  white-space: nowrap;
+}
+
+.revision-headline {
+  font-weight: 600;
+}
+
+.revision-examples {
+  grid-column: 2;
+  color: #555;
+  font-size: 13px;
+}
+
+/* ── Limits of the record ──────────────────────────────────────────────────
+   Sits beside the history rather than in the intro: it is a caveat about
+   historical depth, and stacking it above the table pushed the data itself
+   below the fold. */
+.driving-limits {
+  margin: 32px 0 0;
+  max-width: 68ch;
+}
+
+.driving-limits h2 {
+  font-size: 18px;
+  margin: 0 0 8px;
+}
+
+.driving-limits p {
+  margin: 0 0 8px;
+}

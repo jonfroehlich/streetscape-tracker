@@ -33,6 +33,12 @@ PUBLISHED = [
     "seattle--wa_diff_2025-10-01_to_2026-01-05.csv.gz",
     "seattle--wa_width_20_height_20_step_1_gsv_history_2026-01-05.csv.gz",
     "cities.json.gz",
+    "streetwalks.json.gz",
+    # The DERIVED driving-plan join (issue #176). Its raw counterpart lives in
+    # archive/gsv_driving_plan/ — outside data/ entirely, so the rsync never
+    # walks it — while this join of Google's plan against our own observations
+    # is published on purpose. See driving_plan.py's module docstring.
+    "driving_plan.json.gz",
 ]
 PRIVATE = [
     # Rejected runs (raw REQUEST_DENIED/quota dumps; cli.py renames to *.rejected)

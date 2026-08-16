@@ -58,6 +58,7 @@ from .fileutils import load_city_csv_file
 from .json_summarizer import (
     generate_aggregate_v2,
     generate_city_metadata_summary_as_json,
+    generate_driving_plan_summary,
     generate_streetwalk_manifest,
 )
 from .naming import generate_run_filename, same_grid_geometry, sanitize_city_query_str
@@ -518,6 +519,7 @@ async def async_main():
         if not args.no_publish_json:
             generate_aggregate_v2(conn, args.download_dir)
             generate_streetwalk_manifest(conn, args.download_dir)
+            generate_driving_plan_summary(conn, args.download_dir)
 
         if failed:
             print(f"FAILED: {', '.join(failed)} (see log for details)")

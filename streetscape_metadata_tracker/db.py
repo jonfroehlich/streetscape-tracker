@@ -239,9 +239,11 @@ CREATE TABLE IF NOT EXISTS street_walks (
 -- The gzipped artifact and the exploded entries below exist only for fetches
 -- whose sha256 differs from the previous snapshot. First catalog family (bar
 -- api_usage) that is not city-keyed: the unit of observation is Google's whole
--- worldwide plan. Artifacts live OUTSIDE data/ (archive/gsv_driving_plan/)
+-- worldwide plan. RAW artifacts live OUTSIDE data/ (archive/gsv_driving_plan/)
 -- because data/ is rsynced to the public web server and the whitelist would
--- republish Google's content.
+-- republish Google's feed verbatim. The DERIVED join built from these tables
+-- (data/driving_plan.json.gz, json_summarizer.generate_driving_plan_summary)
+-- is published deliberately — mirror vs. analysis; see driving_plan.py.
 CREATE TABLE IF NOT EXISTS driving_plan_snapshots (
     snapshot_id       INTEGER PRIMARY KEY,
     fetch_date        TEXT NOT NULL UNIQUE,
@@ -1138,6 +1140,32 @@ def get_diff_for_run(conn: sqlite3.Connection, to_run_id: int) -> sqlite3.Row | 
     return conn.execute("SELECT * FROM run_diffs WHERE to_run_id = ?", (to_run_id,)).fetchone()
 
 
+def get_latest_runs_all(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """
+    The latest run of every (city, provider), in one query.
+
+    The aggregate builder walks runs city-by-city because it needs each city's
+    full run history; a consumer that only wants the current state of all
+    cities would otherwise issue one query per city (1,214 on the production
+    catalog, twice over if it also wants diffs). Same "latest row per group"
+    shape as ``get_latest_street_walks_all``, with the diff's headline counter
+    joined on so callers need no second pass.
+    """
+    return conn.execute(
+        """SELECT r.*, d.capture_date_changed, d.coverage_delta_pct,
+                  d.panos_added, d.panos_removed, f.run_date AS diff_from_run_date
+           FROM runs r
+           JOIN (SELECT city_id, provider, MAX(run_date) AS run_date
+                 FROM runs GROUP BY city_id, provider) latest
+             ON latest.city_id = r.city_id
+            AND latest.provider = r.provider
+            AND latest.run_date = r.run_date
+           LEFT JOIN run_diffs d ON d.to_run_id = r.run_id
+           LEFT JOIN runs f ON f.run_id = d.from_run_id
+           ORDER BY r.city_id, r.provider"""
+    ).fetchall()
+
+
 # ── Historical-dates harvests (issue #2) ───────────────────────────────────
 
 
@@ -1774,12 +1802,16 @@ def get_driving_plan_snapshot(conn: sqlite3.Connection, fetch_date: date) -> sql
 
 
 def get_active_driving_plans(
-    conn: sqlite3.Connection, *, country: str = "United States"
+    conn: sqlite3.Connection, *, country: str | None = "United States"
 ) -> list[sqlite3.Row]:
     """
-    Entries of the latest content-changed snapshot for one country — the
-    current picture of Google's published plan. Includes publish='No' rows
-    (retired windows); filter in the caller if only live campaigns matter.
+    Entries of the latest content-changed snapshot — the current picture of
+    Google's published plan. Includes publish='No' rows (retired windows);
+    filter in the caller if only live campaigns matter.
+
+    ``country=None`` returns every country's entries, which is what the
+    driving-plan artifact builds from: it matches the whole catalog at once and
+    cannot know in advance which countries are represented.
     """
     latest = conn.execute(
         """SELECT snapshot_id FROM driving_plan_snapshots WHERE changed = 1
@@ -1787,9 +1819,60 @@ def get_active_driving_plans(
     ).fetchone()
     if latest is None:
         return []
+    if country is None:
+        return conn.execute(
+            """SELECT * FROM driving_plan_entries WHERE snapshot_id = ?
+               ORDER BY country, region, district""",
+            (latest["snapshot_id"],),
+        ).fetchall()
     return conn.execute(
         """SELECT * FROM driving_plan_entries
            WHERE snapshot_id = ? AND country = ?
            ORDER BY region, district""",
         (latest["snapshot_id"], country),
     ).fetchall()
+
+
+def get_changed_driving_plan_snapshots(
+    conn: sqlite3.Connection, *, limit: int | None = None
+) -> list[sqlite3.Row]:
+    """
+    Snapshots whose content differed from the previous fetch, newest first.
+
+    Only these carry `driving_plan_entries` — an unchanged fetch writes a
+    snapshot row and nothing else — so consecutive members of this list are
+    exactly the pairs a revision log can diff, with no gaps to reason about.
+    """
+    sql = "SELECT * FROM driving_plan_snapshots WHERE changed = 1 ORDER BY fetch_date DESC"
+    if limit is not None:
+        sql += f" LIMIT {int(limit)}"
+    return conn.execute(sql).fetchall()
+
+
+def get_driving_plan_entries(conn: sqlite3.Connection, snapshot_id: int) -> list[sqlite3.Row]:
+    """Every exploded entry of one snapshot, ordered for stable comparison."""
+    return conn.execute(
+        """SELECT * FROM driving_plan_entries WHERE snapshot_id = ?
+           ORDER BY country, region, district""",
+        (snapshot_id,),
+    ).fetchall()
+
+
+def get_driving_plan_history(conn: sqlite3.Connection) -> sqlite3.Row | None:
+    """
+    Aggregate shape of the archive: how many times we have fetched the feed,
+    how many of those saw a content change, and the span covered.
+
+    The page states this outright because it is the archive's main caveat: the
+    first fetch is 2026-07-31, so for any drive that already happened the join
+    can only report "the plan is silent or stale" — never "it was not planned".
+    A reader has to be able to see how thin the record still is.
+    """
+    return conn.execute(
+        """SELECT COUNT(*) AS fetch_count,
+                  SUM(changed) AS change_count,
+                  MIN(fetch_date) AS first_fetch,
+                  MAX(fetch_date) AS latest_fetch,
+                  MAX(CASE WHEN changed = 1 THEN fetch_date END) AS latest_change
+           FROM driving_plan_snapshots"""
+    ).fetchone()

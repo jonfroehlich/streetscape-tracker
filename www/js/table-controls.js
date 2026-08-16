@@ -417,7 +417,7 @@ function renderDistributionStrip(el, column, values, clickable = false) {
  * @param {Object} cfg - {filters, presets, columns}.
  * @returns {string} HTML.
  */
-function controlsHtml({ filters, presets, columns }) {
+function controlsHtml({ filters, presets, columns, searchPlaceholder }) {
   const filterControls = filters
     .map((filter) => {
       if (filter.type === "select") {
@@ -473,7 +473,8 @@ function controlsHtml({ filters, presets, columns }) {
     <div class="table-controls">
       <div class="control control-search">
         <label for="table-search">Search</label>
-        <input type="search" id="table-search" placeholder="City, provider…"
+        <input type="search" id="table-search"
+               placeholder="${searchPlaceholder ?? "City, provider…"}"
                autocomplete="off" spellcheck="false">
       </div>
       ${filterControls}
@@ -525,6 +526,7 @@ function createTableControls({
   presets,
   filters,
   searchFields,
+  searchPlaceholder,
   onChange,
 }) {
   const defaultPreset = presets[0].id;
@@ -541,7 +543,7 @@ function createTableControls({
     values: {},
   };
 
-  rootEl.innerHTML = controlsHtml({ filters, presets, columns });
+  rootEl.innerHTML = controlsHtml({ filters, presets, columns, searchPlaceholder });
   const searchEl = rootEl.querySelector("#table-search");
   const presetEl = rootEl.querySelector("#table-preset");
   const stripEl = rootEl.querySelector("#distribution-strip");

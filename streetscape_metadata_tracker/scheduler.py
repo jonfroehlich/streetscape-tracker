@@ -57,6 +57,7 @@ from .download_common import (
 from .download_mapillary import DEFAULT_TILE_REQUESTS_PER_MINUTE, estimate_tile_count
 from .json_summarizer import (
     generate_aggregate_v2,
+    generate_driving_plan_summary,
     generate_streetwalk_manifest,
     regenerate_run_json,
 )
@@ -157,8 +158,10 @@ class DrivingPlanConfig:
 
     NOT a [providers.*] channel on purpose: it has no API key, no request
     budget, no per-city cadence — one unauthenticated request per night for
-    the whole worldwide feed. Artifacts live OUTSIDE data/ so the publish
-    rsync never sees them (its whitelist would republish Google's content).
+    the whole worldwide feed. RAW artifacts live OUTSIDE data/ so the publish
+    rsync never sees them (its whitelist would republish Google's feed
+    verbatim); the derived join in data/driving_plan.json.gz IS published on
+    purpose. See driving_plan.py for the mirror-vs-analysis distinction.
     """
 
     enabled: bool = True
@@ -899,9 +902,11 @@ def cmd_regenerate(cfg: SchedulerConfig, publish: bool = False) -> int:
     logger.info("Regenerating aggregate cities.json.gz")
     agg = generate_aggregate_v2(conn, cfg.data_dir)
     manifest = generate_streetwalk_manifest(conn, cfg.data_dir)
+    plan = generate_driving_plan_summary(conn, cfg.data_dir)
     print(
         f"Regenerated {cfg.data_dir}/cities.json.gz ({agg['cities_count']} cities); "
-        f"streetwalks.json.gz ({len(manifest['walks'])} walks)."
+        f"streetwalks.json.gz ({len(manifest['walks'])} walks); "
+        f"driving_plan.json.gz ({len(plan['records'])} plan records)."
     )
 
     if publish:
@@ -2122,6 +2127,16 @@ def _finish_batch(
         logger.info("Regenerating aggregate cities.json.gz")
         generate_aggregate_v2(conn, cfg.data_dir)
         generate_streetwalk_manifest(conn, cfg.data_dir)
+
+    # Deliberately NOT gated on succeeded > 0, unlike the two above. Those
+    # describe the runs the night collected, so with nothing collected there is
+    # nothing to rebuild. The driving-plan summary describes Google's feed,
+    # which _fetch_driving_plan_nightly refreshed BEFORE the city loop and
+    # which changes on its own schedule — roughly weekly, independent of
+    # whether any city was due. Gating it would leave the published plan stale
+    # on exactly the quiet nights, which are most of them.
+    logger.info("Regenerating driving_plan.json.gz")
+    generate_driving_plan_summary(conn, cfg.data_dir)
 
     # Back up again now that the night's runs, diffs and walks are registered:
     # the pre-flight copy (see _backup_catalog_nightly) guarantees a copy

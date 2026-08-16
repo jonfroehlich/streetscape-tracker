@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Streetscape Tracker — Driving Plan</title>
+
+  <!-- Stylesheets (CDN assets carry SRI hashes: a compromised or tampered
+       CDN response is refused by the browser rather than executed).
+       No Leaflet here — this page is a list, not a map; each row links to
+       the city page for the actual map. -->
+  <link rel="stylesheet" href="css/streetscape-shared.css" />
+  <link rel="stylesheet" href="css/data-table.css" />
+  <link rel="stylesheet" href="css/driving.css" />
+</head>
+<body class="streets-page">
+  <!-- Google Analytics -->
+  <script async src="https://www.googletagmanager.com/gtag/js?id=G-ZSQGNSTEES"></script>
+  <script>
+    window.dataLayer = window.dataLayer || [];
+    function gtag() { dataLayer.push(arguments); }
+    gtag("js", new Date());
+    gtag("config", "G-ZSQGNSTEES");
+  </script>
+
+  <!-- Site header (shared markup with index.html / city.html / grid.html /
+       streets.html; styles live in streetscape-shared.css) -->
+  <header class="site-header">
+    <a class="site-brand" href="index.html">Streetscape Tracker</a>
+    <nav class="site-nav" aria-label="Main">
+      <a href="index.html" title="World map of city imagery coverage">Map</a>
+      <a href="grid.html" title="Per-city table of grid-sampling coverage: share of area sample points with imagery">Grid</a>
+      <a href="streets.html" title="Per-city table of road-walk coverage: fraction of the street network driven">Streets</a>
+      <a href="driving.html" aria-current="page"
+         title="Google's published driving plan compared against the imagery we have actually observed">GSV Driving</a>
+    </nav>
+    <a class="site-external" href="https://github.com/jonfroehlich/streetscape-tracker"
+       target="_blank" rel="noopener">About &#8599;</a>
+  </header>
+
+  <main class="streets-main">
+    <h1>Driving plan vs. observed imagery</h1>
+
+    <div class="streets-intro">
+      <p>
+        Google publishes where it plans to drive next, at a single URL it
+        <strong>overwrites in place</strong> — so every revision is lost unless
+        someone keeps a dated copy. This tracker does. This page reads that
+        archived plan together with the imagery we have actually measured, and
+        reports where the two agree and where they do not.
+      </p>
+      <p>
+        Every row is a <strong>place</strong>: either a city this project
+        collects, or a region named in Google's plan that it does not — so the
+        <em>Tracked</em> column tells you both whether imagery is coming and
+        whether anyone here is watching for it. The
+        <em>Capture history</em> column shows the years a place's official
+        Google imagery was actually taken, which is where repeat drives show up
+        that a single median age hides.
+      </p>
+      <p class="streets-caveat">
+        <strong>A closed or absent plan entry is not evidence that an area was
+        not driven.</strong> Google's Israeli entries all read
+        <em>publish&nbsp;=&nbsp;No</em> with 2018–19 windows, while our own runs
+        record captures in September and October 2023 — Google drove Israel four
+        years after the feed said the campaign had closed, and never revised it.
+        Rows like that are labelled <em>Driven, unplanned</em>, and they are the
+        clearest measure of how much the plan under-reports. Treat the plan as
+        advisory, never as a contract.
+      </p>
+    </div>
+
+    <!-- Archive provenance + Google's own disclaimer, rendered by driving.js
+         from the artifact's `plan` block. This is the page's principal caveat
+         (the archive is young), so it sits above the table, not below it. -->
+    <div id="driving-provenance" class="driving-provenance" hidden></div>
+
+    <div id="driving-status" class="table-status" role="status" aria-live="polite">
+      Loading the driving plan…
+    </div>
+
+    <!-- Search, filters, column preset/picker and the distribution strip are
+         rendered into this container by table-controls.js once the data has
+         loaded. -->
+    <div id="driving-controls" class="controls-region"></div>
+
+    <div id="driving-table-wrap" class="streets-table-wrap" hidden>
+      <table class="streets-table">
+        <caption id="driving-caption"></caption>
+        <!-- Header cells are rendered by table-utils.js from the page's column
+             descriptors (DRIVING_COLUMNS), not authored here: column presets
+             change the visible set at runtime, so the header and the body have
+             to come from one list or they drift. -->
+        <thead id="driving-thead"></thead>
+        <tbody id="driving-tbody"></tbody>
+      </table>
+    </div>
+
+    <!-- What Google actually changed between archived snapshots. Rendered by
+         driving.js from the artifact's `revisions`. This is the archive's own
+         reason to exist: the feed is overwritten in place, so these edits are
+         observable only because they were captured at the time. -->
+    <section id="driving-revisions" class="driving-revisions" hidden></section>
+
+    <!-- The limits of "the past". Deliberately placed HERE rather than in the
+         intro: it is a caveat about historical depth, so it belongs beside the
+         history, and stacking a third caveat above the table pushed the data
+         itself below the fold. -->
+    <section class="driving-limits">
+      <h2>What this page cannot tell you</h2>
+      <p class="streets-caveat">
+        The capture history is built from dates attached to imagery that is
+        <em>currently</em> published, so a drive whose panoramas have since
+        been replaced leaves no trace in it. Recovering the full per-panorama
+        capture history — every past drive-through and its month — is possible
+        through an unpublished Google endpoint, but that harvester has not been
+        run for any city yet.
+      </p>
+      <p class="streets-caveat">
+        The plan archive itself only begins in July 2026. For any drive before
+        that, this page can report that the plan is silent or stale, never that
+        the drive was genuinely unplanned — the record simply does not go back
+        far enough.
+      </p>
+    </section>
+  </main>
+
+  <!-- Scripts (order matters: libs → shared utils → page logic) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.1.0/pako.min.js"
+          integrity="sha512-g2TeAWw5GPnX7z0Kn8nFbYfeHcvAu/tx6d6mrLe/90mkCxO+RcptyYpksUz35EO337F83bZwcmUyHiHamspkfg=="
+          crossorigin="anonymous"></script>
+  <script src="js/streetscape-utils.js"></script>
+  <script src="js/table-utils.js"></script>
+  <script src="js/table-controls.js"></script>
+  <script src="js/driving.js"></script>
+</body>
+</html>
