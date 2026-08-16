@@ -22,6 +22,7 @@ import sys
 
 from streetscape_metadata_tracker import db
 from streetscape_metadata_tracker.db import RunRow
+from streetscape_metadata_tracker.download_common import HostUnavailableError, host_exit_code
 from streetscape_metadata_tracker.fileutils import load_city_csv_file
 from streetscape_metadata_tracker.naming import streets_filename_for_run
 from streetscape_metadata_tracker.paths import get_default_data_dir
@@ -119,7 +120,13 @@ def run_analysis(args: argparse.Namespace) -> int:
         if len(panos) == 0:
             _warn_no_panos(df, args.provider)
 
-        edges = fetch_street_edges(city, data_dir, refresh=args.refresh, conn=conn)
+        # See collect.py: a cold network goes to Overpass, which meters by IP,
+        # so name the host in the exit code rather than exiting 1 (issue #208).
+        try:
+            edges = fetch_street_edges(city, data_dir, refresh=args.refresh, conn=conn)
+        except HostUnavailableError as e:
+            logger.error("Street network unavailable: %s", e)
+            return host_exit_code(e)
         logger.info("Fetched %d street segments", len(edges))
 
         covered = compute_street_coverage(edges, panos, run.run_date, match_dist_m=args.match_dist)

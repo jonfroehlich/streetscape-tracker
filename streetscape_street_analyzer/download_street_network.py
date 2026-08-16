@@ -26,7 +26,9 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 from streetscape_metadata_tracker import db
 from streetscape_metadata_tracker.db import CityRow
+from streetscape_metadata_tracker.download_common import HOST_OVERPASS
 from streetscape_metadata_tracker.download_mapillary import grid_bbox
+from streetscape_metadata_tracker.host_lock import host_lock
 
 logger = logging.getLogger(__name__)
 
@@ -138,7 +140,13 @@ def fetch_graph(
         city_row.city_id,
         bbox,
     )
-    graph = _download_graph(bbox, network_type)
+    # Serialized machine-wide: Overpass meters by IP, so a second concurrent
+    # process here is a hazard to the whole host (issue #208). Taken around the
+    # whole retry stack rather than inside _download_graph, so a competing
+    # process cannot slip in between our retries — and AFTER the cache-hit
+    # return above, so a warm city never contends for it.
+    with host_lock(HOST_OVERPASS):
+        graph = _download_graph(bbox, network_type)
     logger.info("Downloaded %d nodes / %d edges", graph.number_of_nodes(), graph.number_of_edges())
 
     os.makedirs(_cache_dir(data_dir), exist_ok=True)

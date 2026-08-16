@@ -23,6 +23,107 @@ class DownloadError(Exception):
     pass
 
 
+# Third-party hosts that meter us by IP rather than by credential (issue #208).
+#
+# Deliberately NOT here: GSV metadata. Google meters the Street View Static API
+# per *project*, so two processes on one host share a quota that the daily
+# ledger already tracks — serializing them would cost throughput and buy
+# nothing. Membership in this list means "a second concurrent process on this
+# host is a hazard to the whole host", which is only true of per-IP limits.
+#
+# This is the set we LOCK, not an exhaustive list of our per-IP third parties.
+# Two others are per-IP and are knowingly uncovered, both because they are
+# low-volume and out-of-band rather than because they are safe:
+#   * Nominatim (geoutils.py) — its usage policy is explicitly per-IP with a
+#     hard 1 req/s. Only runs when an UNKNOWN city is registered, so a nightly
+#     batch of frozen cities never touches it; a bulk register_frame.py run
+#     alongside a batch is the same collision shape as the ones below.
+#   * GeoPhotoService.SingleImageSearch (download_gsv_history.py) — undocumented
+#     and IP-identified rather than key-metered, which is why it already carries
+#     its own circuit breaker. A harvest is long-running and manual, i.e. the
+#     "detached process that cannot read the rule" profile exactly.
+# Add them here if either ever runs on the same schedule as a collection.
+HOST_MAPILLARY_TILES = "mapillary_tiles"
+HOST_OVERPASS = "overpass"
+
+HOST_LABELS = {
+    HOST_MAPILLARY_TILES: "Mapillary's tile CDN (tiles.mapillary.com)",
+    HOST_OVERPASS: "the Overpass API (overpass-api.de)",
+}
+
+
+class HostUnavailableError(DownloadError):
+    """
+    A whole-HOST condition: every remaining request to this host would fail
+    identically, so the caller should stop rather than work through its queue.
+
+    Distinct from a per-request failure (a 404 on one tile) and from a
+    per-credential failure (a rejected token — that is scoped to the key, and
+    our two Mapillary channels hold different keys, so it must not be treated
+    as host-wide).
+    """
+
+    def __init__(self, message: str, host: str):
+        super().__init__(message)
+        self.host = host
+
+
+class HostBusyError(HostUnavailableError):
+    """Another process ON THIS MACHINE holds the host lock (issue #208)."""
+
+
+class HostBlockedError(HostUnavailableError):
+    """The third party itself is refusing this host's IP (issues #199/#209)."""
+
+
+# Exit codes a collection child uses to tell the scheduler *which* host is
+# unavailable, and in WHICH of the two senses. The message never crosses the
+# process boundary — the scheduler only sees `subprocess.run(...).returncode` —
+# so both facts have to ride in the status.
+#
+# The distinction is not cosmetic; the two conditions have opposite lifetimes
+# and the scheduler reacts to them differently:
+#
+#   BLOCKED — the third party is refusing this machine's IP. Durable. Asking
+#     again with the next city cannot answer differently, so the first one trips
+#     a night-level breaker that skips that host's channels for the rest of the
+#     run (scheduler.CHANNEL_HOSTS).
+#   BUSY — another process on this box holds the lock. Transient, and it
+#     resolves itself the moment that process finishes. Escalating it to the
+#     breaker would mean a 90-second manual run costs the batch every Mapillary
+#     city of the night, so the scheduler skips only that one channel of that
+#     one city — and still alerts, because a city that quietly did not collect
+#     is the failure mode #145 exists to prevent.
+#
+# 75/76 sit in sysexits.h's EX_TEMPFAIL (75) range by analogy: a retryable,
+# environmental condition rather than a bug. The busy codes deliberately sit
+# PAST the end of sysexits (which stops at 78) so they carry no false analogy —
+# 77/78 would silently read as EX_NOPERM/EX_CONFIG to anyone who looks them up.
+HOST_EXIT_CODES = {
+    HOST_MAPILLARY_TILES: 75,
+    HOST_OVERPASS: 76,
+}
+HOST_BUSY_EXIT_CODES = {
+    HOST_MAPILLARY_TILES: 79,
+    HOST_OVERPASS: 80,
+}
+HOST_BY_EXIT_CODE = {code: host for host, code in HOST_EXIT_CODES.items()}
+HOST_BY_BUSY_EXIT_CODE = {code: host for host, code in HOST_BUSY_EXIT_CODES.items()}
+
+
+def host_exit_code(error: HostUnavailableError) -> int:
+    """
+    The exit code a collection child should return for ``error``.
+
+    The single place the busy/blocked distinction becomes a number, so the three
+    child entry points (``cli.py``, ``collect.py``, ``analyze.py``) cannot drift
+    from each other or from the scheduler's reverse maps.
+    """
+    if isinstance(error, HostBusyError):
+        return HOST_BUSY_EXIT_CODES[error.host]
+    return HOST_EXIT_CODES[error.host]
+
+
 class AsyncRateLimiter:
     """
     Token-bucket rate limiter for provider APIs with a per-minute quota

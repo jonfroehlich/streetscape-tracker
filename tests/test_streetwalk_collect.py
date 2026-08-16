@@ -577,3 +577,66 @@ def test_collect_catalogs_absolute_street_lengths(tmp_path, monkeypatch):
     assert 100.0 * walk["length_km_covered"] / walk["length_km"] == pytest.approx(
         walk["coverage_pct_by_length"], abs=0.05
     )
+
+
+# ---------------------------------------------------------------------------
+# Host-level exit codes (issue #208)
+#
+# A road walk starts at Overpass, which meters by IP — and 1134 of 1144 enabled
+# cities have no cached GraphML, so a first walk always goes to the network.
+# The scheduler sees only `returncode`, so this layer is where the breaker's
+# input is actually produced: return a plain 1 and the breaker is inert.
+# ---------------------------------------------------------------------------
+
+
+def _raise_from_network(monkeypatch, error):
+    def boom(*a, **k):
+        raise error
+
+    monkeypatch.setattr(collect, "fetch_street_edges", boom)
+
+
+def test_a_refusing_overpass_exits_with_the_overpass_code(tmp_path, monkeypatch):
+    from streetscape_metadata_tracker.download_common import (
+        HOST_EXIT_CODES,
+        HOST_OVERPASS,
+        HostBlockedError,
+    )
+
+    data_dir = _setup(tmp_path, monkeypatch)
+    monkeypatch.setenv("GMAPS_STREETS_API_KEY", "TESTKEY")
+    _raise_from_network(monkeypatch, HostBlockedError("refused this host", host=HOST_OVERPASS))
+
+    assert collect.run_collect(_args(data_dir)) == HOST_EXIT_CODES[HOST_OVERPASS]
+
+
+def test_a_busy_overpass_lock_exits_with_the_busy_code(tmp_path, monkeypatch):
+    """Distinct from a refusal: this one ends when the local holder does, so the
+    scheduler must skip one channel rather than the night's street work."""
+    from streetscape_metadata_tracker.download_common import (
+        HOST_BUSY_EXIT_CODES,
+        HOST_EXIT_CODES,
+        HOST_OVERPASS,
+        HostBusyError,
+    )
+
+    data_dir = _setup(tmp_path, monkeypatch)
+    monkeypatch.setenv("GMAPS_STREETS_API_KEY", "TESTKEY")
+    _raise_from_network(monkeypatch, HostBusyError("pid 123 holds it", host=HOST_OVERPASS))
+
+    rc = collect.run_collect(_args(data_dir))
+    assert rc == HOST_BUSY_EXIT_CODES[HOST_OVERPASS]
+    assert rc != HOST_EXIT_CODES[HOST_OVERPASS]
+
+
+def test_an_ordinary_network_failure_still_exits_1(tmp_path, monkeypatch):
+    """A roadless bbox is about the CITY, not the host. Typing it host-wide
+    would cancel the night's other nineteen cities over one village."""
+    from streetscape_metadata_tracker.download_common import DownloadError
+
+    data_dir = _setup(tmp_path, monkeypatch)
+    monkeypatch.setenv("GMAPS_STREETS_API_KEY", "TESTKEY")
+    _raise_from_network(monkeypatch, DownloadError("no drivable ways in this bbox"))
+
+    with pytest.raises(DownloadError):
+        collect.run_collect(_args(data_dir))

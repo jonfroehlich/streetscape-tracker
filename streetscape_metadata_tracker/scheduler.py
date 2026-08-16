@@ -37,6 +37,7 @@ import threading
 import time
 import tomllib
 import traceback
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -45,7 +46,14 @@ from tabulate import tabulate
 
 from . import catalog_backup, db, driving_plan
 from .alerting import AlertConfig, send_alert, should_alert
-from .download_common import redact_credentials
+from .download_common import (
+    HOST_BY_BUSY_EXIT_CODE,
+    HOST_BY_EXIT_CODE,
+    HOST_LABELS,
+    HOST_MAPILLARY_TILES,
+    HOST_OVERPASS,
+    redact_credentials,
+)
 from .download_mapillary import DEFAULT_TILE_REQUESTS_PER_MINUTE, estimate_tile_count
 from .json_summarizer import (
     generate_aggregate_v2,
@@ -76,6 +84,23 @@ STREET_CHANNELS = {
 def is_street_channel(name: str) -> bool:
     """True for a road-walk collection channel (vs. a grid run provider)."""
     return name in STREET_CHANNELS
+
+
+# Which per-IP third-party hosts each channel depends on (issue #208). When one
+# of them refuses us, every channel listed against it would fail identically
+# for the rest of the night, so the loop stops trying them.
+#
+# 'gsv' is empty on purpose: Google meters the Street View Static API per
+# project, not per IP, so a GSV failure is never a whole-host condition.
+# 'gsv_streets' needs Overpass because a road walk starts by fetching the
+# city's street network, and 1134 of 1144 enabled cities have no cached
+# GraphML — a first walk always goes to the network.
+CHANNEL_HOSTS: dict[str, tuple[str, ...]] = {
+    "gsv": (),
+    "gsv_streets": (HOST_OVERPASS,),
+    "mapillary": (HOST_MAPILLARY_TILES,),
+    "mapillary_streets": (HOST_OVERPASS, HOST_MAPILLARY_TILES),
+}
 
 
 logger = logging.getLogger("streetscape_scheduler")
@@ -1251,6 +1276,11 @@ class CollectionOutcome:
 
     ok: bool
     reason: str | None = None
+    # The child's exit status, when there was one. None on a timeout, because a
+    # SIGKILLed child has no exit code to report. Carried so the loop can map
+    # HOST_EXIT_CODES back to "which per-IP host is unavailable" — the child's
+    # error message never crosses the process boundary (issue #208).
+    exit_code: int | None = None
 
     def __bool__(self) -> bool:
         return self.ok
@@ -1312,8 +1342,20 @@ def _run_collection_subprocess(
             )
         if result.returncode == 0:
             return CollectionOutcome(True)
-        why = f"exited {result.returncode}"
+        exit_code = result.returncode
+        # Name the host-level conditions, and which of the two they are: the
+        # scheduler reacts very differently to "refused by the third party" and
+        # "another local process is already talking to it" (issue #208).
+        blocked = HOST_BY_EXIT_CODE.get(exit_code)
+        busy = HOST_BY_BUSY_EXIT_CODE.get(exit_code)
+        if blocked:
+            why = f"exited {exit_code} ({HOST_LABELS[blocked]} unavailable to this host)"
+        elif busy:
+            why = f"exited {exit_code} ({HOST_LABELS[busy]} busy with another local process)"
+        else:
+            why = f"exited {exit_code}"
     except subprocess.TimeoutExpired:
+        exit_code = None
         why = f"timed out after {timeout_s // 60} minutes"
 
     tail = _tail_lines(log_path, _CHILD_LOG_TAIL_LINES)
@@ -1323,7 +1365,7 @@ def _run_collection_subprocess(
     logger.error(message)
     # The log name, not the full path: the catalog outlives any given checkout
     # location, and `logs/<name>` is what an operator actually greps for.
-    return CollectionOutcome(False, f"{why} (see {log_path.name})")
+    return CollectionOutcome(False, f"{why} (see {log_path.name})", exit_code=exit_code)
 
 
 def _run_one_city(
@@ -1779,17 +1821,37 @@ def cmd_run_due(
     # end the loop early therefore lives inside _run_city_loop, which always
     # returns counters rather than propagating (issue #167).
     with _stop_on_sigterm() as sigterm_seen:
-        processed, succeeded, attempted, skipped_budget, stop_reason = _run_city_loop(
-            cfg, conn, today, due, providers_for_city, batch_deadline, sigterm_seen
-        )
+        (
+            processed,
+            succeeded,
+            attempted,
+            skipped_budget,
+            stop_reason,
+            blocked_hosts,
+            busy_hosts,
+        ) = _run_city_loop(cfg, conn, today, due, providers_for_city, batch_deadline, sigterm_seen)
 
     if stop_reason:
         logger.info(f"Stopped early: {stop_reason}")
 
+    blocked_note = (
+        "; ".join(sorted(HOST_LABELS.get(h, h) for h in blocked_hosts)) + " unavailable"
+        if blocked_hosts
+        else ""
+    )
+    busy_note = (
+        f"{sum(busy_hosts.values())} channel(s) skipped, "
+        + ", ".join(sorted(HOST_LABELS.get(h, h) for h in busy_hosts))
+        + " busy locally"
+        if busy_hosts
+        else ""
+    )
     summary = (
         f"run-due {today}: {succeeded}/{attempted} runs succeeded across "
         f"{processed} cities"
         + (f"; {skipped_budget} deferred for budget" if skipped_budget else "")
+        + (f"; {blocked_note}" if blocked_note else "")
+        + (f"; {busy_note}" if busy_note else "")
         + (f"; stopped early ({stop_reason})" if stop_reason else "")
         + (f"; {plan_error}" if plan_error else "")
     )
@@ -1803,6 +1865,8 @@ def cmd_run_due(
         today,
         errored=stop_reason == _STOP_REASON_ERROR,
         backup_error=backup_error,
+        blocked_hosts=blocked_hosts,
+        busy_hosts=busy_hosts,
     )
 
 
@@ -1814,17 +1878,32 @@ def _run_city_loop(
     providers_for_city: dict[str, list[str]],
     batch_deadline: float,
     sigterm_seen,
-) -> tuple[int, int, int, int, str | None]:
+) -> tuple[int, int, int, int, str | None, set[str], Counter[str]]:
     """Collect due cities until the day cap, the batch deadline, or SIGTERM.
 
-    Returns ``(processed, succeeded, attempted, skipped_budget, stop_reason)``;
-    ``stop_reason`` is None when the whole due list was worked through. Split
-    out of ``cmd_run_due`` so that every way of ending the night still reaches
-    the publish tail — an unexpected exception here is logged and converted into
-    a stop reason rather than discarding a night's collected data (issue #167).
+    Returns ``(processed, succeeded, attempted, skipped_budget, stop_reason,
+    blocked_hosts, busy_hosts)``; ``stop_reason`` is None when the whole due
+    list was worked through. Split out of ``cmd_run_due`` so every way of ending
+    the night still reaches the publish tail — an unexpected exception here is
+    logged and converted into a stop reason rather than discarding a night's
+    collected data (issue #167).
+
+    ``blocked_hosts`` holds the per-IP hosts that refused us mid-night (issue
+    #208). Once a host is in there its channels are skipped for the remainder of
+    the run: the condition is a property of this machine, not of a city, so
+    asking again with the next city cannot produce a different answer.
+
+    ``busy_hosts`` counts channels skipped because another process on this box
+    held the host lock. Deliberately NOT a breaker: that condition ends when the
+    other process does, so escalating it would let a two-minute manual run cost
+    the batch every Mapillary city of the night. It is still reported, because a
+    city that quietly did not collect is exactly the shape of failure #145
+    exists to make impossible.
     """
     processed = succeeded = attempted = skipped_budget = 0
     stop_reason: str | None = None
+    blocked_hosts: set[str] = set()
+    busy_hosts: Counter[str] = Counter()
     try:
         for city in due:
             if processed >= cfg.max_cities_per_day:
@@ -1843,6 +1922,20 @@ def _run_city_loop(
 
             ran_any = False
             for provider in providers_for_city[city.city_id]:
+                # A host this channel needs already refused us tonight. Skip
+                # (not break) for the same reason the budget guard skips: the
+                # other channels of this and later cities are still worth
+                # running. Deliberately BEFORE the budget checks — there is no
+                # point pricing work we already know we will not do.
+                unavailable = blocked_hosts.intersection(CHANNEL_HOSTS.get(provider, ()))
+                if unavailable:
+                    logger.info(
+                        f"{city.city_id} [{provider}]: skipping — "
+                        f"{', '.join(sorted(HOST_LABELS.get(h, h) for h in unavailable))} "
+                        f"already refused this host tonight."
+                    )
+                    continue
+
                 budget = cfg.providers[provider].daily_request_budget
                 est = estimate_requests(
                     city,
@@ -1900,12 +1993,56 @@ def _run_city_loop(
                     # of the deadline is to reserve time for the publish tail.
                     remaining_s=batch_deadline - time.monotonic(),
                 )
-                ran_any = True
-                attempted += 1
                 # getattr, not attribute access: tests (and any future caller)
                 # may hand back a plain bool, which CollectionOutcome is
                 # deliberately compatible with.
                 reason = getattr(ok, "reason", None)
+                exit_code = getattr(ok, "exit_code", None)
+
+                busy_host = HOST_BY_BUSY_EXIT_CODE.get(exit_code)
+                if busy_host is not None:
+                    # Another process on this machine holds that host's lock.
+                    # Transient — it ends when that process does — so this skips
+                    # ONE channel of ONE city and does not trip the breaker.
+                    # Like a blocked skip it records no `record_attempt`: the
+                    # city didn't fail, we simply never asked it. _finish_batch
+                    # still alerts, so it cannot pass as a clean night.
+                    busy_hosts[busy_host] += 1
+                    logger.warning(
+                        f"{city.city_id} [{provider}]: {HOST_LABELS[busy_host]} is busy with "
+                        f"another process on this machine — skipping this channel. Not counted "
+                        f"as a failure for this city, and not a night-wide skip: the lock frees "
+                        f"when that process finishes. ({reason})"
+                    )
+                    continue
+
+                blocked_host = HOST_BY_EXIT_CODE.get(exit_code)
+                if blocked_host is not None:
+                    # A whole-host condition, so this is NOT the city's failure
+                    # and must not be recorded as one: get_due_cities filters on
+                    # `consecutive_failures < max_consecutive_failures` and
+                    # nothing in the codebase resets that counter except a
+                    # success, so a few blocked nights would quietly quarantine
+                    # a city for an entire cycle. It stays due and leads
+                    # tomorrow's stalest-first queue instead. _finish_batch
+                    # alerts on blocked_hosts, so this is loud, not silent.
+                    #
+                    # Skipping `_reconcile_orphaned_run`/`_reconcile_orphaned_walk`
+                    # is safe rather than incidental: every host-unavailable exit
+                    # happens before the child writes anything. Overpass is a road
+                    # walk's first step, and the tile census is a Mapillary run's
+                    # first step, so there is never a paid-for artifact to salvage
+                    # here. Keep that true if either fetch ever moves later.
+                    blocked_hosts.add(blocked_host)
+                    logger.error(
+                        f"{city.city_id} [{provider}]: {HOST_LABELS[blocked_host]} is "
+                        f"unavailable to this host — skipping its remaining channels "
+                        f"tonight. Not counted as a failure for this city. ({reason})"
+                    )
+                    continue
+
+                ran_any = True
+                attempted += 1
                 ok = bool(ok)
                 # A subprocess can report failure yet still have done the expensive,
                 # budgeted part of its job; salvage that rather than re-spending the
@@ -1944,7 +2081,7 @@ def _run_city_loop(
         logger.exception("City loop aborted by an unexpected error")
         stop_reason = _STOP_REASON_ERROR
 
-    return processed, succeeded, attempted, skipped_budget, stop_reason
+    return processed, succeeded, attempted, skipped_budget, stop_reason, blocked_hosts, busy_hosts
 
 
 def _finish_batch(
@@ -1956,6 +2093,8 @@ def _finish_batch(
     today: date,
     errored: bool = False,
     backup_error: str | None = None,
+    blocked_hosts: set[str] | None = None,
+    busy_hosts: Counter[str] | None = None,
 ) -> int:
     """Rebuild the published indexes, back up the catalog, publish, alert.
 
@@ -1968,6 +2107,15 @@ def _finish_batch(
     failure that happened before the loop is still reported here, where the
     alert is sent. ``today`` is passed in rather than read from the clock so a
     long night stamps the backup with the date the batch belongs to.
+
+    ``blocked_hosts`` names the per-IP hosts that refused us, and ``busy_hosts``
+    counts channels skipped because another local process held a host lock
+    (issue #208). Both alert unconditionally and exit nonzero, for the same
+    reason a failed backup does: neither records a per-city failure, so without
+    this a night that collected nothing from Mapillary — because it was refused,
+    or because a manual run was holding the lock — would report a clean, silent
+    success. They stay separate in the subject line because the operator's next
+    move differs: a block is waited out, a busy lock is somebody's stray process.
     """
     # Regenerate the aggregate once for the whole batch
     if succeeded > 0:
@@ -1995,25 +2143,77 @@ def _finish_batch(
     # fail silently are the entire reason #145 existed: /projects/makeabilitylab
     # went unbacked-up for months because nothing was watching. This is the one
     # thing in the tail that must never degrade quietly.
+    blocked_hosts = blocked_hosts or set()
+    blocked_note = (
+        "This host's IP was refused by "
+        + ", ".join(sorted(HOST_LABELS.get(h, h) for h in blocked_hosts))
+        + ". Those channels were skipped for the rest of the night and NO city was "
+        "marked failed, so they stay due and lead tomorrow's queue. If this repeats, "
+        "check whether another process on this machine is collecting concurrently "
+        "(issue #208)."
+        if blocked_hosts
+        else ""
+    )
+
+    busy_hosts = busy_hosts or Counter()
+    busy_note = (
+        f"{sum(busy_hosts.values())} channel(s) were skipped because another process on this "
+        "machine held the lock for "
+        + ", ".join(sorted(HOST_LABELS.get(h, h) for h in busy_hosts))
+        + ". Those hosts meter by IP, so the two processes together would have presented double "
+        "the paced rate — which is how this machine earned its bans. NO city was marked failed; "
+        "they stay due and lead tomorrow's queue. Find the other process (its pid is in "
+        "locks/*.lock.owner and in the child log tail above) and check whether it should have "
+        "been running at all (issue #208)."
+        if busy_hosts
+        else ""
+    )
+
     failures = attempted - succeeded
-    if errored or backup_error or should_alert(failures, cfg.alerts.failure_threshold):
+    if (
+        errored
+        or backup_error
+        or blocked_hosts
+        or busy_hosts
+        or should_alert(failures, cfg.alerts.failure_threshold)
+    ):
         host = socket.gethostname()
-        # Both can be true at once, and the subject line is often all that gets
-        # read on a phone at 03:00 — so say both rather than letting the backup
-        # failure mask the collection one.
+        # Several can be true at once, and the subject line is often all that
+        # gets read on a phone at 03:00 — so say each rather than letting one
+        # mask the others.
         parts = []
         if backup_error:
             parts.append("CATALOG BACKUP FAILED")
-        if failures or not backup_error:
+        if blocked_hosts:
+            parts.append(f"{len(blocked_hosts)} host(s) UNAVAILABLE")
+        if busy_hosts:
+            parts.append(f"{sum(busy_hosts.values())} channel(s) SKIPPED (host busy)")
+        if failures or not (backup_error or blocked_hosts or busy_hosts):
             parts.append(f"{failures} failed collection(s)")
         subject = f"{' + '.join(parts)} on {host}"
-        body = summary + (f"\n\n{backup_error}" if backup_error else "")
+        body = (
+            summary
+            + (f"\n\n{backup_error}" if backup_error else "")
+            + (f"\n\n{blocked_note}" if blocked_note else "")
+            + (f"\n\n{busy_note}" if busy_note else "")
+        )
         send_alert(cfg.alerts, subject, f"{body}\n\nRecent log:\n{_recent_log_tail(cfg)}")
 
-    # A backup failure makes the night unhealthy even when every city landed —
-    # publishing still happened above (the #167 posture: never withhold what was
-    # collected), but the unit should go red so systemd and [alerts] both show it.
-    return 0 if succeeded == attempted and not errored and not backup_error else 1
+    # A backup failure, a blocked host or a locally-busy one makes the night
+    # unhealthy even when every attempted city landed — publishing still happened
+    # above (the #167 posture: never withhold what was collected), but the unit
+    # should go red so systemd and [alerts] both show it. For the two host
+    # conditions this is the ONLY signal, since neither records a per-city
+    # failure by design.
+    if (
+        succeeded == attempted
+        and not errored
+        and not backup_error
+        and not blocked_hosts
+        and not busy_hosts
+    ):
+        return 0
+    return 1
 
 
 def _add_global_flags(p: argparse.ArgumentParser) -> None:

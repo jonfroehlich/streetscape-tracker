@@ -195,6 +195,71 @@ systemctl --user start streetscape-tracker.service           # trigger a run now
 Rotating file logs also go to `logs/streetscape_scheduler.log`, and dated
 catalog backups to `backups/` (see below).
 
+### Running anything by hand alongside the scheduler (issue #208)
+
+Mapillary's tile CDN and the Overpass API both rate-limit **per IP**, not per
+credential. Our client-side pacing is per *process*, so two collections running
+at once on this box present double the configured rate — which is exactly how
+makelab2 earned bans from both services in one night on 2026-08-14, from a
+detached catch-up script that outlived every config change made to stop it.
+
+A file lock in `locks/` now enforces this. A second process that reaches one of
+those hosts **fails immediately** rather than queueing, naming the pid that
+holds the lock:
+
+```bash
+# Safe to START at any time — neither can double the rate any more. But see
+# below: whichever process loses the race gives up, and if that's the batch,
+# the city it was on skips that channel tonight. GSV grid collection is
+# unaffected either way (Google meters per project, not per IP).
+python streetscape_tracker.py "Bend, OR" --provider mapillary
+python -m streetscape_street_analyzer.collect "Bend, OR"
+```
+
+**What it costs the batch.** The lock is not polite about who wins: whoever
+asks second fails. If you start a manual Mapillary run while the scheduler is
+mid-city, the scheduler's child is the one that loses, and that city's Mapillary
+channel is skipped for the night. The city is **not** marked failed — it stays
+due and leads tomorrow's queue — but the night alerts and the unit goes red, so
+you'll get an email you caused. That is the intended trade: the alternative is a
+skipped collection nobody notices. Prefer running manual work when
+`systemctl --user status streetscape-tracker.service` shows the timer idle.
+
+Two rules for manual work:
+
+1. **Use the same lock directory as the scheduler.** The unit sets
+   `STREETSCAPE_LOCK_DIR=/projects/makeabilitylab/streetscape-tracker/locks`
+   explicitly, because `PrivateTmp=true` and the `%h` symlink would otherwise
+   make the two processes derive different paths and never see each other. Both
+   the default and the override are `realpath`'d, so `~/streetscape-tracker/locks`
+   and `/projects/makeabilitylab/streetscape-tracker/locks` resolve to the same
+   lock — but export the unit's value anyway if you are unsure.
+2. **A leftover `locks/*.lock` file is not a held lock.** `flock` is released by
+   the kernel when the process dies, SIGKILL included. Do not delete lock files
+   to "unstick" anything — check `locks/*.lock.owner` for the pid instead.
+
+Exit codes a collection child uses to report a host-level condition. The
+blocked/busy split matters: the two have opposite lifetimes, and `run-due`
+reacts to them differently.
+
+| code | meaning | what `run-due` does |
+|---|---|---|
+| `75` | Mapillary's tile CDN refused this host's IP | skips **all** Mapillary channels for the rest of the night |
+| `76` | The Overpass API refused this host's IP | skips **all** street channels for the rest of the night |
+| `79` | Another local process holds the Mapillary tile lock | skips **only that channel of that city** |
+| `80` | Another local process holds the Overpass lock | skips **only that channel of that city** |
+
+A refusal (75/76) is durable — asking again with the next city cannot answer
+differently — so the first one trips a night-level breaker. A busy lock (79/80)
+ends when the other process does, so escalating it would let a two-minute manual
+run cost the batch every Mapillary city of the night.
+
+Both alert unconditionally, exit nonzero, and still publish — and both record
+**no** per-city failure, so affected cities stay due and lead the next night's
+queue rather than burning their `consecutive_failures` budget (five of those
+would quarantine a city for a whole 90-day cycle, and nothing but a success ever
+resets that counter).
+
 ### Backups (verified with CSE IT, 2026-08-05 — issue #145)
 
 What CSE IT confirmed when we asked, after the 2026-07 quota incident (#143)

@@ -17,7 +17,14 @@ import pandas as pd
 import pytest
 
 from streetscape_metadata_tracker import cli, db
-from streetscape_metadata_tracker.download_common import DownloadError
+from streetscape_metadata_tracker.download_common import (
+    HOST_BUSY_EXIT_CODES,
+    HOST_EXIT_CODES,
+    HOST_MAPILLARY_TILES,
+    DownloadError,
+    HostBlockedError,
+    HostBusyError,
+)
 from streetscape_metadata_tracker.download_mapillary import DEFAULT_TILE_REQUESTS_PER_MINUTE
 from streetscape_metadata_tracker.fileutils import load_city_csv_file
 from streetscape_metadata_tracker.naming import generate_run_filename
@@ -318,6 +325,99 @@ def test_refuses_to_overwrite_existing_uncataloged_snapshot(monkeypatch, catalog
     assert calls == [], "must refuse before issuing any request"
     with open(out_path, "rb") as f:
         assert f.read() == b"orphan or concurrent run in flight", "existing file untouched"
+
+
+# ── Host-level exit codes (issue #208) ──────────────────────────────────────
+#
+# The child half of the breaker's contract, and the only place it is testable:
+# the scheduler sees nothing but `returncode`, so if this layer returns a plain
+# 1 the whole night-level breaker is silently inert and the symptom is the
+# pre-#208 behaviour it was built to remove — cities marked failed, and
+# `consecutive_failures` climbing toward a 90-day quarantine.
+
+
+def test_a_blocked_host_exits_with_that_hosts_code(monkeypatch, catalog):
+    _, city_id, data_dir = catalog
+    gsv_configs(monkeypatch)
+    monkeypatch.setattr(
+        cli,
+        "download_mapillary_metadata_async",
+        stub_downloader(
+            [], error=HostBlockedError("tile CDN redirected", host=HOST_MAPILLARY_TILES)
+        ),
+    )
+
+    rc = run_cli(monkeypatch, city_id, data_dir, provider="mapillary")
+    assert rc == HOST_EXIT_CODES[HOST_MAPILLARY_TILES]
+
+
+def test_a_busy_lock_exits_with_the_busy_code_not_the_blocked_one(monkeypatch, catalog):
+    """A local collision must not present as a provider refusal — the scheduler
+    would skip that host's channels for the whole night over a process that is
+    about to finish."""
+    _, city_id, data_dir = catalog
+    gsv_configs(monkeypatch)
+    monkeypatch.setattr(
+        cli,
+        "download_mapillary_metadata_async",
+        stub_downloader([], error=HostBusyError("pid 123 holds it", host=HOST_MAPILLARY_TILES)),
+    )
+
+    rc = run_cli(monkeypatch, city_id, data_dir, provider="mapillary")
+    assert rc == HOST_BUSY_EXIT_CODES[HOST_MAPILLARY_TILES]
+    assert rc != HOST_EXIT_CODES[HOST_MAPILLARY_TILES]
+
+
+def test_a_mixed_failure_exits_1_rather_than_a_host_code(monkeypatch, catalog):
+    """
+    Mapillary blocked AND GSV genuinely broken. Reporting the host code would
+    let the breaker's "no city failure recorded" posture swallow a real bug in
+    the GSV path, which is nothing to do with the host.
+    """
+    conn, city_id, data_dir = catalog
+    gsv_configs(monkeypatch)
+    monkeypatch.setattr(
+        cli, "download_gsv_metadata_async", stub_downloader([], error=DownloadError("boom"))
+    )
+    monkeypatch.setattr(
+        cli,
+        "download_mapillary_metadata_async",
+        stub_downloader([], error=HostBlockedError("refused", host=HOST_MAPILLARY_TILES)),
+    )
+
+    assert run_cli(monkeypatch, city_id, data_dir, provider="both") == 1
+
+
+def test_a_host_failure_alongside_a_success_still_reports_the_host(monkeypatch, catalog):
+    """GSV collected fine; only Mapillary hit the host. Every FAILURE was the
+    host, so the breaker should hear about it."""
+    conn, city_id, data_dir = catalog
+    gsv_configs(monkeypatch)
+    monkeypatch.setattr(cli, "download_gsv_metadata_async", stub_downloader([]))
+    monkeypatch.setattr(
+        cli,
+        "download_mapillary_metadata_async",
+        stub_downloader([], error=HostBlockedError("refused", host=HOST_MAPILLARY_TILES)),
+    )
+
+    assert (
+        run_cli(monkeypatch, city_id, data_dir, provider="both")
+        == (HOST_EXIT_CODES[HOST_MAPILLARY_TILES])
+    )
+    assert db.get_latest_run(conn, city_id, provider="gsv") is not None
+
+
+def test_a_blocked_host_still_records_what_it_spent(monkeypatch, catalog):
+    """The refused requests were issued and the CDN counted them (#198/#203's
+    one-token-one-increment invariant), so the ledger must learn about them."""
+    conn, city_id, data_dir = catalog
+    gsv_configs(monkeypatch)
+    error = HostBlockedError("refused", host=HOST_MAPILLARY_TILES)
+    error.api_requests = 5
+    monkeypatch.setattr(cli, "download_mapillary_metadata_async", stub_downloader([], error=error))
+
+    run_cli(monkeypatch, city_id, data_dir, provider="mapillary")
+    assert db.get_api_usage(conn, RUN_DATE, provider="mapillary") == 5
 
 
 # ── Registration-time grid cap (issue #166) ─────────────────────────────────
