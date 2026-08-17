@@ -79,9 +79,30 @@ countries despite the US-focused sampling tool. Two common triggers:
   evaluated for GSV data quality, so candidate cities get added and collected to
   assess coverage/recency before committing.
 
-Any city added ad-hoc via `python gsv_tracker.py "City, Region, Country"` (or a
-line in `cities.txt`) geocodes once, freezes its grid geometry, and registers —
-becoming a permanent tracked city.
+Any city added ad-hoc via `python streetscape_tracker.py "City, Region, Country"`
+(or a line in `cities.txt`) geocodes once, freezes its grid geometry, and
+registers — becoming a permanent tracked city.
+
+**For a deployment inquiry, use `scheduler assess-city` instead** (issue #215):
+
+```bash
+# Boundary fit + per-channel cost, no provider requests
+python -m streetscape_metadata_tracker.scheduler assess-city "Newport, Kentucky" --estimate
+# Then collect: both road walks + the cheap Mapillary grid run, publish, print the numbers
+python -m streetscape_metadata_tracker.scheduler assess-city "Newport, Kentucky" --yes
+```
+
+It answers from **street coverage** (share of road-km with imagery), which is
+what a deployment decision turns on, rather than grid coverage — the two diverge
+badly, because grid points land on river, rail, parkland and rooftops. Highland
+Heights measured 55.6% grid vs **92.8% of street-km**; Covington 8.2% vs
+**50.8%** on Mapillary. It also reports what share of the sampled rectangle is
+actually inside the city boundary before anything is spent: for the four NKY
+counties that was only 49–69%, with the remainder largely Cincinnati.
+
+The expensive GSV **grid** run is deliberately not part of it — a newly
+registered city is enabled and immediately due, so it leads the next nightly
+batch's queue on its own.
 
 ### 4. Worldwide stratified frame (issue #110)
 

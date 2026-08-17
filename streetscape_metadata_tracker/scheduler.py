@@ -46,6 +46,11 @@ from tabulate import tabulate
 
 from . import catalog_backup, db, driving_plan
 from .alerting import AlertConfig, send_alert, should_alert
+from .city_registration import (
+    MAX_GRID_DIM_M,
+    CityResolutionError,
+    resolve_or_register_city,
+)
 from .download_common import (
     HOST_BY_BUSY_EXIT_CODE,
     HOST_BY_EXIT_CODE,
@@ -210,6 +215,18 @@ class SchedulerConfig:
     # [publish]
     publish_enabled: bool = False
     publish_script: str = str(_PROJECT_ROOT / "sync_data_to_server.sh")
+    # Publish by local rsync to an NFS-mounted docroot instead of over SSH.
+    # The publish script has always supported this, but only by reading
+    # STREETSCAPE_PUBLISH_LOCAL from the environment — which the nightly unit
+    # sets and an operator shell does not, so a hand-run `regenerate-aggregate
+    # --publish` on makelab2 took the SSH path, failed with rsync code 12, and
+    # emailed a publish-FAILED alert that looked like an outage (issue #215).
+    # Declaring it in config makes publishing a property of the host's
+    # configuration rather than of whoever's shell happened to invoke it.
+    publish_local: bool = False
+    # Public base URL of the site, used only to print operator-facing links
+    # (e.g. assess-city's city page). Empty means print relative URLs.
+    site_url: str = ""
     # [providers.*] — when None (no section in the TOML), falls back to
     # gsv-only with the legacy [schedule].daily_request_budget
     providers: dict[str, ProviderConfig] | None = None
@@ -314,6 +331,8 @@ def load_scheduler_config(path: str | None = None) -> SchedulerConfig:
         backup_dir=paths.get("backup_dir", str(_PROJECT_ROOT / "backups")),
         publish_enabled=pub.get("enabled", False),
         publish_script=pub.get("publish_script", str(_PROJECT_ROOT / "sync_data_to_server.sh")),
+        publish_local=pub.get("local", False),
+        site_url=pub.get("site_url", ""),
         providers=providers,
         alerts=AlertConfig(
             enabled=al.get("enabled", False),
@@ -760,9 +779,19 @@ def _publish(cfg: SchedulerConfig, context: str) -> int:
     Run the publish script (rsync data/ to the web server), returning its exit
     code and emailing the operator on failure. ``context`` (e.g. the run-due
     summary) is prepended to the alert body so the email is self-explanatory.
+
+    ``[publish].local`` becomes an explicit ``--local`` argument rather than
+    being left to STREETSCAPE_PUBLISH_LOCAL in the environment: the nightly
+    systemd unit exports that variable and an operator shell does not, so any
+    hand-run publish on a local-docroot host took the SSH path and emailed a
+    false publish-FAILED alert (issue #215). Passing it explicitly makes the
+    two paths identical.
     """
-    logger.info(f"Publishing via {cfg.publish_script}")
-    result = subprocess.run(["bash", cfg.publish_script], cwd=str(_PROJECT_ROOT))
+    cmd = ["bash", cfg.publish_script]
+    if cfg.publish_local:
+        cmd.append("--local")
+    logger.info(f"Publishing via {' '.join(cmd[1:])}")
+    result = subprocess.run(cmd, cwd=str(_PROJECT_ROOT))
     if result.returncode != 0:
         logger.error("Publish script failed")
         send_alert(
@@ -919,6 +948,33 @@ def cmd_assign(cfg: SchedulerConfig) -> int:
     return 0
 
 
+def _regenerate_published_json(conn, cfg: SchedulerConfig) -> str:
+    """
+    Rebuild every catalog-derived published artifact and return a one-line
+    operator summary. No collection, no API calls, no publish.
+
+    Shared by ``regenerate-aggregate`` and ``assess-city`` so the two cannot
+    drift into publishing different sets of files — the failure mode being an
+    artifact whose companion index still describes the previous state.
+    """
+    logger.info("Regenerating aggregate cities.json.gz")
+    agg = generate_aggregate_v2(conn, cfg.data_dir)
+    manifest = generate_streetwalk_manifest(conn, cfg.data_dir)
+    # The driving-plan join is the least load-bearing of the three and reads
+    # ~1,200 per-run JSONs, so it is guarded the way _finish_batch guards it: an
+    # OSError here must not cost the caller its publish (#167).
+    try:
+        plan = generate_driving_plan_summary(conn, cfg.data_dir)
+        plan_note = f"driving_plan.json.gz ({len(plan['records'])} plan records)."
+    except Exception:
+        logger.exception("Driving-plan summary regeneration failed")
+        plan_note = "driving_plan.json.gz NOT regenerated (see log)."
+    return (
+        f"Regenerated {cfg.data_dir}/cities.json.gz ({agg['cities_count']} cities); "
+        f"streetwalks.json.gz ({len(manifest['walks'])} walks); " + plan_note
+    )
+
+
 def cmd_regenerate(cfg: SchedulerConfig, publish: bool = False) -> int:
     """
     Rebuild the aggregate ``cities.json.gz`` from the catalog without collecting
@@ -927,15 +983,7 @@ def cmd_regenerate(cfg: SchedulerConfig, publish: bool = False) -> int:
     data — a clean one-liner instead of an inline Python snippet.
     """
     conn = db.connect(cfg.db_path)
-    logger.info("Regenerating aggregate cities.json.gz")
-    agg = generate_aggregate_v2(conn, cfg.data_dir)
-    manifest = generate_streetwalk_manifest(conn, cfg.data_dir)
-    plan = generate_driving_plan_summary(conn, cfg.data_dir)
-    print(
-        f"Regenerated {cfg.data_dir}/cities.json.gz ({agg['cities_count']} cities); "
-        f"streetwalks.json.gz ({len(manifest['walks'])} walks); "
-        f"driving_plan.json.gz ({len(plan['records'])} plan records)."
-    )
+    print(_regenerate_published_json(conn, cfg))
 
     if publish:
         # An explicit --publish overrides [publish].enabled: the operator is
@@ -1214,6 +1262,407 @@ def cmd_reconcile_walks(
     else:
         print(f"No orphaned walks found for {today}.")
     return 0
+
+
+# ---------------------------------------------------------------------------
+# assess-city: same-day answer for a new city (issue #215)
+# ---------------------------------------------------------------------------
+
+# The channels assess-city runs, in the order enabled_providers() ranks them.
+#
+# The two road walks are the point: a deployment decision turns on street
+# coverage, not grid coverage, and the two disagree badly. Highland Heights
+# reads 55.6% of grid points but 92.8% of street-km; Covington 8.2% vs 50.8% on
+# Mapillary. Grid points land on river, rail, parkland and rooftops, so a grid
+# percentage understates what a Sidewalk deployment would actually get.
+#
+# The Mapillary GRID run is here for a different reason: it is the same z14 tile
+# census the Mapillary walk already pays for, and it is what makes the answer
+# linkable the same day. generate_aggregate_v2 skips a city with no `runs` row,
+# so without it the new city is absent from cities.json.gz — streets.html would
+# show the walk under a raw slug with nothing to click, because city.html is
+# addressed by run-CSV filename.
+#
+# The GSV GRID run is deliberately absent: it is the expensive half (one request
+# per grid point) and it needs no help arriving. A newly registered city is
+# enabled with last_success_at NULL, which puts it at the head of the next
+# night's stalest-first queue.
+ASSESS_CHANNELS = ("gsv_streets", "mapillary", "mapillary_streets")
+
+# Below this share of the search rectangle lying inside the city/county
+# boundary, warn before spending. Calibrated on the Northern Kentucky round
+# (2026-07-30), where four county rectangles scored 0.49-0.69 and the remainder
+# was largely Cincinnati — whose dense recent GSV would have flattered every
+# number quoted to the partner.
+_LOW_IN_BOUNDARY_FRAC = 0.70
+
+
+def _host_names(hosts) -> str:
+    """Human-readable, stably ordered host list for a log line or alert subject."""
+    return ", ".join(sorted(HOST_LABELS.get(h, h) for h in hosts))
+
+
+def _boundary_preflight(city: db.CityRow) -> tuple[float | None, float | None]:
+    """
+    (in_boundary_frac, boundary_coverage_frac) for a city's frozen rectangle.
+
+    Advisory ONLY, and that shapes the implementation: this is one unlocked,
+    per-IP Nominatim call (geoutils rate-limits it to ~1/s) whose entire job is
+    to print two numbers, so every failure — timeout, service unavailable, a
+    Point instead of a polygon, a schema surprise — degrades to (None, None)
+    rather than costing a collection. Same posture as the Overpass /status
+    probe: a probe must never be able to fail the work it speaks for.
+    """
+    try:
+        from .boundary_audit import frozen_rect_bounds, rect_in_boundary_frac
+        from .boundary_audit import rect_polygon_coverage as _coverage
+        from .geoutils import geocode_boundary_raw
+
+        raw = geocode_boundary_raw(city.city_name, city.state_name, city.country_name)
+        geometry = (raw or {}).get("geojson")
+        rect = frozen_rect_bounds(
+            city.center_lat, city.center_lon, city.grid_width_m, city.grid_height_m
+        )
+        return rect_in_boundary_frac(geometry, rect), _coverage(geometry, rect)
+    except Exception as e:
+        logger.warning(f"Boundary pre-flight for {city.city_id} unavailable: {e}")
+        return None, None
+
+
+def _assess_preflight_report(
+    cfg: SchedulerConfig, conn, city: db.CityRow, today: date, channels: list[str]
+) -> str:
+    """
+    The operator-facing report printed before anything is spent: what geometry
+    we froze, whether it is actually about this place, and what each channel
+    will cost against today's remaining budget.
+    """
+    area_km2 = (city.grid_width_m / 1000.0) * (city.grid_height_m / 1000.0)
+    lines = [
+        f"{city.display_name} — {city.city_id}",
+        f"  grid    {city.grid_width_m:,} x {city.grid_height_m:,} m "
+        f"({area_km2:,.0f} km²), step {city.step_m} m, "
+        f"center {city.center_lat:.5f},{city.center_lon:.5f}",
+    ]
+    if city.grid_width_m >= MAX_GRID_DIM_M or city.grid_height_m >= MAX_GRID_DIM_M:
+        lines.append(f"          (at the {MAX_GRID_DIM_M // 1000} km per-side cap)")
+
+    in_frac, coverage = _boundary_preflight(city)
+    if in_frac is None:
+        lines.append("  boundary  no polygon from Nominatim — in-boundary fraction unknown")
+    else:
+        cov = "unknown" if coverage is None else f"{coverage:.0%}"
+        lines.append(
+            f"  boundary  {in_frac:.0%} of the sampled rectangle is inside the "
+            f"boundary; the rectangle covers {cov} of the boundary"
+        )
+        if in_frac < _LOW_IN_BOUNDARY_FRAC:
+            # One element, not one per output line: the sentences here get edited
+            # (and asserted on by substring), and hand-balanced fragments make a
+            # reword mean re-breaking every line.
+            lines.append(
+                f"  ⚠ Only {in_frac:.0%} of what we are about to sample is actually "
+                f"{city.display_name}.\n"
+                "    Imagery outside the boundary still lands in the numbers. In the "
+                "Northern Kentucky\n"
+                "    round (2026-07-30) the out-of-county remainder was largely "
+                "Cincinnati, whose dense\n"
+                "    recent GSV would have flattered every figure quoted to the "
+                "partner. Consider a\n"
+                "    compact city grid instead: --width/--height TOGETHER WITH "
+                "--lat/--lng (size alone\n"
+                "    centers on the OSM bbox midpoint, not downtown)."
+            )
+
+    lines.append("  cost")
+    mapillary_tiles = 0
+    tile_rate = DEFAULT_TILE_REQUESTS_PER_MINUTE
+    for channel in channels:
+        pc = cfg.providers[channel]
+        est = estimate_requests(
+            city, channel, conn=conn, spacing_m=pc.spacing_m, network_type=pc.network_type
+        )
+        used = db.get_api_usage(conn, today, channel)
+        left = pc.daily_request_budget - used
+        # Wording matched to run-due --dry-run's: over-budget work is deferred,
+        # not abandoned, and saying "skipped" alone reads as the latter.
+        fits = "" if est <= left else "  ← OVER REMAINING BUDGET, deferred to a later run"
+        lines.append(
+            f"    {channel:<18} ~{est:>9,} requests   "
+            f"({used:,} of {pc.daily_request_budget:,} spent today){fits}"
+        )
+        # Derived from CHANNEL_HOSTS rather than a hardcoded channel list, and
+        # the pacing figure is taken from the channels actually in play: a config
+        # can enable mapillary_streets with no [providers.mapillary] section at
+        # all, and reaching for that sibling would KeyError in the pre-flight.
+        if HOST_MAPILLARY_TILES in CHANNEL_HOSTS.get(channel, ()):
+            mapillary_tiles += est
+            if pc.max_requests_per_minute is not None:
+                tile_rate = pc.max_requests_per_minute
+    if mapillary_tiles:
+        lines.append(
+            f"    Mapillary total {mapillary_tiles:,} tile requests from THIS HOST's IP "
+            f"(the block is per-IP, not per-token — issues #198/#205), paced at "
+            f"{tile_rate}/min."
+        )
+    return "\n".join(lines)
+
+
+def _assess_answer_report(cfg: SchedulerConfig, conn, city: db.CityRow) -> str:
+    """
+    The partner-facing numbers, read back from the catalog rather than parsed
+    out of a child's stdout (the children print for humans; the catalog is the
+    contract).
+
+    Leads with street coverage and labels grid coverage as the area measure it
+    is, because quoting grid coverage to a partner is the specific mistake this
+    command exists to stop.
+    """
+    lines = [f"ANSWER — {city.display_name} ({city.city_id})", "  Street coverage (drive network)"]
+    walked = False
+    for provider in ("gsv", "mapillary"):
+        walk = db.get_latest_street_walk(conn, city.city_id, provider, DEFAULT_NETWORK_TYPE)
+        if walk is None:
+            lines.append(f"    {provider:<10} not walked")
+            continue
+        walked = True
+        length = walk["length_km"]
+        pct = walk["coverage_pct_by_length"]
+        covered = walk["length_km_covered"]
+        detail = (
+            f"    {provider:<10} {pct:.1f}% of street-km"
+            if pct is not None
+            else f"    {provider:<10} coverage not recorded"
+        )
+        if length is not None and covered is not None:
+            detail += f"  ({covered:,.1f} of {length:,.1f} km)"
+        # Any-imagery is Mapillary-only information: GSV emits no FLAT_ONLY, so
+        # its any-value equals its 360° value by construction, and printing it
+        # as a second figure would invent a distinction. NULL means "not
+        # measured" (a pre-v8 walk), never a copy — so only a real, differing
+        # value is worth a partner's attention.
+        any_pct = walk["coverage_pct_by_length_any"]
+        if provider == "mapillary" and any_pct is not None and pct is not None and any_pct > pct:
+            detail += f"; {any_pct:.1f}% including flat imagery"
+        age = walk["median_covered_age_years"]
+        if age is not None:
+            detail += f"; median covered imagery {age:.1f} y old"
+        lines.append(f"{detail}  [{walk['run_date']}]")
+    if not walked:
+        lines.append("    (no road walk completed — the numbers above are all this run produced)")
+
+    run = db.get_latest_run(conn, city.city_id, "mapillary")
+    if run is not None:
+        rate = run.coverage_rate_pct
+        lines.append(
+            f"  Grid coverage (mapillary) {rate:.1f}% of grid points — an AREA measure "
+            f"over water, parks and rooftops too. NOT the deployment number."
+            if rate is not None
+            else "  Grid coverage (mapillary) not recorded."
+        )
+        # site_url defaults to "", which leaves a relative link — usable as-is on
+        # a host with no configured public base.
+        link = f"city.html?file={run.csv_filename}&network={DEFAULT_NETWORK_TYPE}"
+        lines.append(f"  City page  {cfg.site_url}{link}")
+    else:
+        lines.append(
+            "  No grid run yet, so there is no city page to link. The GSV grid run "
+            "lands on the next nightly batch (this city is now due and leads the queue)."
+        )
+    return "\n".join(lines)
+
+
+def _select_assess_channels(cfg: SchedulerConfig, requested: list[str] | None) -> list[str]:
+    """
+    Resolve ``assess-city --provider`` into a channel list.
+
+    Reuses ``_select_providers`` for the unknown/disabled/empty checks so both
+    commands refuse the same things the same way, then restricts the result to
+    ASSESS_CHANNELS. A grid GSV request is refused with a pointer rather than
+    honoured: it is the expensive half and ``run-due`` is where a grid run
+    belongs, with the batch deadline and city cap around it.
+
+    Raises ``_UsageError`` — never returns an empty list. A config with no
+    assess channel enabled is an error for the same reason #214's disabled
+    channel is: the run would publish, exit 0, and have collected nothing.
+    """
+    if requested is None:
+        channels = [p for p in cfg.enabled_providers() if p in ASSESS_CHANNELS]
+        if not channels:
+            raise _UsageError(
+                f"none of {', '.join(ASSESS_CHANNELS)} is enabled in this config "
+                f"(enabled: {', '.join(cfg.enabled_providers()) or '(none)'}), so "
+                f"assess-city has nothing to collect."
+            )
+        return channels
+    selected = _select_providers(cfg, requested)
+    rejected = [p for p in selected if p not in ASSESS_CHANNELS]
+    if rejected:
+        raise _UsageError(
+            f"--provider {', '.join(rejected)}: assess-city collects only "
+            f"{', '.join(ASSESS_CHANNELS)}. The GSV grid run is the expensive half "
+            f"and belongs to the nightly cycle — use `run-due --provider gsv` if you "
+            f"really want it now."
+        )
+    return selected
+
+
+def cmd_assess_city(
+    cfg: SchedulerConfig,
+    query: str,
+    *,
+    lat: float | None = None,
+    lng: float | None = None,
+    width: float | None = None,
+    height: float | None = None,
+    step: float = 20,
+    requested_providers: list[str] | None = None,
+    estimate_only: bool = False,
+    assume_yes: bool = False,
+    publish: bool = True,
+    today: date | None = None,
+) -> int:
+    """
+    Register a city if new, walk its streets on both providers, publish, and
+    print the numbers a deployment inquiry actually turns on (issue #215).
+
+    This is the supported same-day path, and routing it through the scheduler is
+    the whole point: it inherits the daily budget ledgers, the per-IP host lock
+    and its exit-code contract, #205's fail-fast, orphan salvage, and the
+    publish tail. A bespoke script with none of those is what got this host
+    banned by both Mapillary and Overpass in one night.
+
+    It deliberately does NOT collect the GSV grid — see ASSESS_CHANNELS — and it
+    deliberately does not record a channel failure; see ``_run_city_channels``.
+
+    ``today`` is injectable so tests can pin a date; production callers omit it.
+    """
+    # Validate BEFORE opening the catalog or geocoding, so a typo costs nothing.
+    try:
+        if (lat is None) != (lng is None):
+            raise _UsageError("--lat and --lng must be given together")
+        if (width is None) != (height is None):
+            raise _UsageError("--width and --height must be given together")
+        if width is not None and lat is None:
+            # cli.py tolerates this and silently centers the grid on the OSM
+            # bounding-box midpoint, which for an irregular or river-bounded
+            # place is not downtown — the grid ends up the right SIZE in the
+            # wrong PLACE, frozen forever. Refusing is the cheap fix.
+            raise _UsageError(
+                "--width/--height without --lat/--lng would freeze the grid on the "
+                "OSM bounding-box midpoint rather than the city center. Pass "
+                "--lat/--lng too (or omit both and let the boundary derive them)."
+            )
+        channels = _select_assess_channels(cfg, requested_providers)
+    except _UsageError as e:
+        logger.error(str(e))
+        return USAGE_EXIT_CODE
+
+    conn = db.connect(cfg.db_path)
+    if today is None:
+        today = datetime.now(UTC).date()
+
+    try:
+        city, newly_registered = resolve_or_register_city(
+            conn, query=query, lat=lat, lng=lng, width=width, height=height, step=step
+        )
+    except CityResolutionError as e:
+        logger.error(str(e))
+        return 1
+    print(
+        f"{'Registered' if newly_registered else 'Already registered'}: "
+        f"{city.city_id} (geometry is frozen from here on)"
+    )
+    print(_assess_preflight_report(cfg, conn, city, today, channels))
+
+    if estimate_only:
+        print(
+            "\n--estimate: the city is registered (a catalog-only write) and no "
+            "provider request was issued. Re-run without --estimate to collect."
+        )
+        return 0
+
+    if not assume_yes:
+        if not sys.stdin.isatty():
+            logger.error(
+                "Refusing to collect without confirmation on a non-interactive stdin. "
+                "Re-run with --yes (or --estimate to see the costs only)."
+            )
+            return USAGE_EXIT_CODE
+        answer = input(f"\nCollect {', '.join(channels)} for {city.city_id}? [y/N] ")
+        if answer.strip().lower() not in ("y", "yes"):
+            print("Aborted; nothing collected.")
+            return 0
+
+    blocked_hosts: set[str] = set()
+    busy_hosts: Counter[str] = Counter()
+    attempted, succeeded, skipped_budget = _run_city_channels(
+        cfg,
+        conn,
+        city,
+        today,
+        channels,
+        blocked_hosts=blocked_hosts,
+        busy_hosts=busy_hosts,
+        # No batch deadline: an operator run has nothing queued behind it, and
+        # each child still carries its own derived per-city timeout.
+        batch_deadline=None,
+        # A manual probe must not be able to quarantine a city.
+        record_failures=False,
+    )
+
+    # The tail runs even on a partial failure (#167): everything collected is
+    # already in the catalog but invisible on the public site until the aggregate
+    # is rebuilt, and a partial answer is still an answer.
+    print(_regenerate_published_json(conn, cfg))
+    publish_wanted = publish and cfg.publish_enabled
+    published = False
+    if publish_wanted:
+        if succeeded == 0:
+            # Mirrors _finish_batch's `succeeded > 0` gate: an rsync shipping no
+            # new artifact is noise, and a failed one would email an alert for it.
+            logger.warning("Nothing collected successfully; not publishing.")
+        elif _publish(cfg, f"assess-city {city.city_id} (manual)") != 0:
+            logger.error("Publish failed; the numbers below are cataloged but not public.")
+        else:
+            published = True
+
+    print()
+    print(_assess_answer_report(cfg, conn, city))
+    blocked_note = f", {_host_names(blocked_hosts)} refused this host" if blocked_hosts else ""
+    busy_note = f", {_host_names(busy_hosts)} busy locally" if busy_hosts else ""
+    summary = (
+        f"{succeeded}/{attempted} channel(s) collected"
+        + (f", {skipped_budget} skipped on budget" if skipped_budget else "")
+        + blocked_note
+        + busy_note
+        + ("; published" if published else "")
+    )
+    print(f"  {summary}")
+    if newly_registered:
+        print(
+            "  The GSV grid run is not part of this command: this city is now due on "
+            "every channel and leads the next nightly batch's queue."
+        )
+    # Exit 0 only for a run that produced a COMPLETE, public answer, on every
+    # channel that was asked for. Three of these differ from how a nightly run
+    # scores itself, and deliberately:
+    #
+    #   - `attempted == 0` is a failure, not a no-op. Every channel was skipped,
+    #     so the operator has nothing to reply to the partner with.
+    #   - a budget skip counts against it. On a nightly run a skip is a normal
+    #     deferral — the city rolls to tomorrow inside a 90-day cycle, and
+    #     _finish_batch scores only `attempted - succeeded`. Here the skipped
+    #     channel IS the job, and today is the deadline.
+    #   - a refused or busy host is never clean, which _finish_batch does agree
+    #     with (it alerts unconditionally on either).
+    collected_everything = attempted > 0 and succeeded == attempted
+    nothing_deferred = skipped_budget == 0
+    hosts_were_fine = not blocked_hosts and not busy_hosts
+    complete = collected_everything and nothing_deferred and hosts_were_fine
+    if complete and (published or not publish_wanted):
+        return 0
+    return 1
 
 
 def _street_collect_cmd(
@@ -1992,7 +2441,7 @@ def cmd_run_due(
     )
     busy_note = (
         f"{sum(busy_hosts.values())} channel(s) skipped, "
-        + ", ".join(sorted(HOST_LABELS.get(h, h) for h in busy_hosts))
+        + _host_names(busy_hosts)
         + " busy locally"
         if busy_hosts
         else ""
@@ -2026,6 +2475,205 @@ def cmd_run_due(
         blocked_hosts=blocked_hosts,
         busy_hosts=busy_hosts,
     )
+
+
+def _run_city_channels(
+    cfg: SchedulerConfig,
+    conn,
+    city: db.CityRow,
+    today: date,
+    providers: list[str],
+    *,
+    blocked_hosts: set[str],
+    busy_hosts: Counter[str],
+    batch_deadline: float | None,
+    record_failures: bool = True,
+) -> tuple[int, int, int]:
+    """
+    Collect one city on each of ``providers``, in order, with every guard the
+    nightly batch applies: the per-IP host breaker, both daily-budget checks,
+    the resource guard, orphan salvage, and cadence bookkeeping.
+
+    Split out of ``_run_city_loop`` so the on-demand single-city path
+    (``assess-city``, issue #215) inherits all of it rather than reimplementing
+    a simplified — i.e. eventually divergent — copy. ``_run_city_loop`` keeps
+    what is genuinely about a *batch*: the city cap, the SIGTERM wind-down, the
+    deadline, and the inter-city sleep.
+
+    ``blocked_hosts`` and ``busy_hosts`` are owned by the caller and mutated in
+    place, because the breaker's scope is the whole run, not one city: a host
+    that refused us cannot answer differently for the next city, so its channels
+    stay skipped once seen. A *busy* host is only counted — that condition ends
+    when the other local process does.
+
+    ``batch_deadline`` (a ``time.monotonic()`` value) clamps each child's
+    timeout so no collection outlives the window reserved for the publish tail;
+    None means no deadline, which is right for a single-city operator run. It has
+    no default deliberately — the same reason ``_collect_due``'s ``providers``
+    doesn't (issue #214): a caller that silently inherited "no deadline" would
+    lose the guard that keeps a night from being SIGKILLed before it publishes.
+
+    ``record_failures=False`` records a success but never a failure. Manual runs
+    use it because ``get_due_cities`` filters on ``consecutive_failures <
+    max_consecutive_failures`` and nothing resets that counter except a success —
+    so letting an operator's ad-hoc probe increment it would let a few of them
+    quarantine a city for a whole cycle. A recorded *success* is still wanted:
+    it says this channel genuinely has today's data, which is what stops the
+    next nightly batch from re-spending the same crawl hours later.
+
+    Returns ``(attempted, succeeded, skipped_budget)``. ``attempted == 0`` means
+    every channel was skipped, which is what tells the batch loop this city
+    should not count against the city cap or earn an inter-city sleep.
+    """
+    attempted = succeeded = skipped_budget = 0
+    for provider in providers:
+        # A host this channel needs already refused us during this run. Skip
+        # (not break) for the same reason the budget guard skips: the other
+        # channels of this and later cities are still worth running.
+        # Deliberately BEFORE the budget checks — there is no point pricing
+        # work we already know we will not do.
+        unavailable = blocked_hosts.intersection(CHANNEL_HOSTS.get(provider, ()))
+        if unavailable:
+            logger.info(
+                f"{city.city_id} [{provider}]: skipping — "
+                f"{_host_names(unavailable)} "
+                f"already refused this host."
+            )
+            continue
+
+        budget = cfg.providers[provider].daily_request_budget
+        est = estimate_requests(
+            city,
+            provider,
+            conn=conn,
+            spacing_m=cfg.providers[provider].spacing_m,
+            network_type=cfg.providers[provider].network_type,
+        )
+        if est > budget:
+            # This city can NEVER fit the daily budget — skipping (not
+            # breaking) so it can't starve every smaller city behind it
+            # in the stalest-first queue. Needs a manual run or a config
+            # change; surfaced loudly so it doesn't rot silently.
+            logger.warning(
+                f"{city.city_id} [{provider}]: ~{est:,} estimated requests "
+                f"exceeds the entire daily budget ({budget:,}). "
+                f"Skipping — run manually with streetscape_tracker.py --force, "
+                f"raise daily_request_budget, or set enabled=0."
+            )
+            skipped_budget += 1
+            continue
+
+        used = db.get_api_usage(conn, today, provider)
+        if used + est > budget:
+            # Doesn't fit in what's LEFT today — try the next (smaller)
+            # city rather than ending the day; this one rolls to tomorrow
+            # when the budget is fresh.
+            logger.info(
+                f"{city.city_id} [{provider}] (~{est:,} req) doesn't fit "
+                f"remaining budget ({budget - used:,} left); skipping."
+            )
+            skipped_budget += 1
+            continue
+
+        conn_limit, throttle_reason = plan_connection_limit(
+            cfg.connection_limit, read_system_pressure(), cfg.resource_guard
+        )
+        if throttle_reason:
+            logger.info(
+                f"Resource guard: {throttle_reason}; connection limit "
+                f"{cfg.connection_limit} → {conn_limit} for {city.city_id} [{provider}]"
+            )
+        ok = _run_one_city(
+            cfg,
+            city,
+            today,
+            provider,
+            connection_limit=conn_limit,
+            # The channel's FULL ceiling, not `budget - used`: the street
+            # collector subtracts today's spend from this itself, so
+            # passing the remainder would count it twice.
+            daily_budget=budget,
+            conn=conn,
+            # Never let one child run past the batch deadline; the point
+            # of the deadline is to reserve time for the publish tail.
+            remaining_s=None if batch_deadline is None else batch_deadline - time.monotonic(),
+        )
+        # getattr, not attribute access: tests (and any future caller)
+        # may hand back a plain bool, which CollectionOutcome is
+        # deliberately compatible with.
+        reason = getattr(ok, "reason", None)
+        exit_code = getattr(ok, "exit_code", None)
+
+        busy_host = HOST_BY_BUSY_EXIT_CODE.get(exit_code)
+        if busy_host is not None:
+            # Another process on this machine holds that host's lock.
+            # Transient — it ends when that process does — so this skips
+            # ONE channel of ONE city and does not trip the breaker.
+            # Like a blocked skip it records no `record_attempt`: the
+            # city didn't fail, we simply never asked it. _finish_batch
+            # still alerts, so it cannot pass as a clean night.
+            busy_hosts[busy_host] += 1
+            logger.warning(
+                f"{city.city_id} [{provider}]: {HOST_LABELS[busy_host]} is busy with "
+                f"another process on this machine — skipping this channel. Not counted "
+                f"as a failure for this city, and not a run-wide skip: the lock frees "
+                f"when that process finishes. ({reason})"
+            )
+            continue
+
+        blocked_host = HOST_BY_EXIT_CODE.get(exit_code)
+        if blocked_host is not None:
+            # A whole-host condition, so this is NOT the city's failure
+            # and must not be recorded as one: get_due_cities filters on
+            # `consecutive_failures < max_consecutive_failures` and
+            # nothing in the codebase resets that counter except a
+            # success, so a few blocked nights would quietly quarantine
+            # a city for an entire cycle. It stays due and leads
+            # tomorrow's stalest-first queue instead. _finish_batch
+            # alerts on blocked_hosts, so this is loud, not silent.
+            #
+            # Skipping `_reconcile_orphaned_run`/`_reconcile_orphaned_walk`
+            # is safe rather than incidental: every host-unavailable exit
+            # happens before the child writes anything. Overpass is a road
+            # walk's first step, and the tile census is a Mapillary run's
+            # first step, so there is never a paid-for artifact to salvage
+            # here. Keep that true if either fetch ever moves later.
+            blocked_hosts.add(blocked_host)
+            logger.error(
+                f"{city.city_id} [{provider}]: {HOST_LABELS[blocked_host]} is "
+                f"unavailable to this host — skipping its remaining channels. "
+                f"Not counted as a failure for this city. ({reason})"
+            )
+            continue
+
+        attempted += 1
+        ok = bool(ok)
+        # A subprocess can report failure yet still have done the expensive,
+        # budgeted part of its job; salvage that rather than re-spending the
+        # whole crawl next cycle. The two channel kinds fail differently: a
+        # grid run commits its `runs` row before the diff/JSON tail, while a
+        # road walk catalogs nothing until the very end and so is salvaged
+        # from the artifacts it left on disk.
+        if not ok:
+            if is_street_channel(provider):
+                ok = _reconcile_orphaned_walk(conn, cfg, city, provider, today)
+            else:
+                ok = _reconcile_orphaned_run(conn, cfg, city, provider, today)
+        if ok:
+            succeeded += 1
+            db.record_attempt(conn, city.city_id, success=True, provider=provider)
+        else:
+            if record_failures:
+                db.record_attempt(
+                    conn,
+                    city.city_id,
+                    success=False,
+                    error=reason or f"subprocess failed on {today}",
+                    provider=provider,
+                )
+            logger.error(f"{city.city_id} [{provider}]: collection failed")
+
+    return attempted, succeeded, skipped_budget
 
 
 def _run_city_loop(
@@ -2088,155 +2736,21 @@ def _run_city_loop(
                 )
                 break
 
-            ran_any = False
-            for provider in providers_for_city[city.city_id]:
-                # A host this channel needs already refused us tonight. Skip
-                # (not break) for the same reason the budget guard skips: the
-                # other channels of this and later cities are still worth
-                # running. Deliberately BEFORE the budget checks — there is no
-                # point pricing work we already know we will not do.
-                unavailable = blocked_hosts.intersection(CHANNEL_HOSTS.get(provider, ()))
-                if unavailable:
-                    logger.info(
-                        f"{city.city_id} [{provider}]: skipping — "
-                        f"{', '.join(sorted(HOST_LABELS.get(h, h) for h in unavailable))} "
-                        f"already refused this host tonight."
-                    )
-                    continue
+            city_attempted, city_succeeded, city_skipped = _run_city_channels(
+                cfg,
+                conn,
+                city,
+                today,
+                providers_for_city[city.city_id],
+                blocked_hosts=blocked_hosts,
+                busy_hosts=busy_hosts,
+                batch_deadline=batch_deadline,
+            )
+            attempted += city_attempted
+            succeeded += city_succeeded
+            skipped_budget += city_skipped
 
-                budget = cfg.providers[provider].daily_request_budget
-                est = estimate_requests(
-                    city,
-                    provider,
-                    conn=conn,
-                    spacing_m=cfg.providers[provider].spacing_m,
-                    network_type=cfg.providers[provider].network_type,
-                )
-                if est > budget:
-                    # This city can NEVER fit the daily budget — skipping (not
-                    # breaking) so it can't starve every smaller city behind it
-                    # in the stalest-first queue. Needs a manual run or a config
-                    # change; surfaced loudly so it doesn't rot silently.
-                    logger.warning(
-                        f"{city.city_id} [{provider}]: ~{est:,} estimated requests "
-                        f"exceeds the entire daily budget ({budget:,}). "
-                        f"Skipping — run manually with streetscape_tracker.py --force, "
-                        f"raise daily_request_budget, or set enabled=0."
-                    )
-                    skipped_budget += 1
-                    continue
-
-                used = db.get_api_usage(conn, today, provider)
-                if used + est > budget:
-                    # Doesn't fit in what's LEFT today — try the next (smaller)
-                    # city rather than ending the day; this one rolls to tomorrow
-                    # when the budget is fresh.
-                    logger.info(
-                        f"{city.city_id} [{provider}] (~{est:,} req) doesn't fit "
-                        f"remaining budget ({budget - used:,} left); skipping."
-                    )
-                    skipped_budget += 1
-                    continue
-
-                conn_limit, throttle_reason = plan_connection_limit(
-                    cfg.connection_limit, read_system_pressure(), cfg.resource_guard
-                )
-                if throttle_reason:
-                    logger.info(
-                        f"Resource guard: {throttle_reason}; connection limit "
-                        f"{cfg.connection_limit} → {conn_limit} for {city.city_id} [{provider}]"
-                    )
-                ok = _run_one_city(
-                    cfg,
-                    city,
-                    today,
-                    provider,
-                    connection_limit=conn_limit,
-                    # The channel's FULL ceiling, not `budget - used`: the street
-                    # collector subtracts today's spend from this itself, so
-                    # passing the remainder would count it twice.
-                    daily_budget=budget,
-                    conn=conn,
-                    # Never let one child run past the batch deadline; the point
-                    # of the deadline is to reserve time for the publish tail.
-                    remaining_s=batch_deadline - time.monotonic(),
-                )
-                # getattr, not attribute access: tests (and any future caller)
-                # may hand back a plain bool, which CollectionOutcome is
-                # deliberately compatible with.
-                reason = getattr(ok, "reason", None)
-                exit_code = getattr(ok, "exit_code", None)
-
-                busy_host = HOST_BY_BUSY_EXIT_CODE.get(exit_code)
-                if busy_host is not None:
-                    # Another process on this machine holds that host's lock.
-                    # Transient — it ends when that process does — so this skips
-                    # ONE channel of ONE city and does not trip the breaker.
-                    # Like a blocked skip it records no `record_attempt`: the
-                    # city didn't fail, we simply never asked it. _finish_batch
-                    # still alerts, so it cannot pass as a clean night.
-                    busy_hosts[busy_host] += 1
-                    logger.warning(
-                        f"{city.city_id} [{provider}]: {HOST_LABELS[busy_host]} is busy with "
-                        f"another process on this machine — skipping this channel. Not counted "
-                        f"as a failure for this city, and not a night-wide skip: the lock frees "
-                        f"when that process finishes. ({reason})"
-                    )
-                    continue
-
-                blocked_host = HOST_BY_EXIT_CODE.get(exit_code)
-                if blocked_host is not None:
-                    # A whole-host condition, so this is NOT the city's failure
-                    # and must not be recorded as one: get_due_cities filters on
-                    # `consecutive_failures < max_consecutive_failures` and
-                    # nothing in the codebase resets that counter except a
-                    # success, so a few blocked nights would quietly quarantine
-                    # a city for an entire cycle. It stays due and leads
-                    # tomorrow's stalest-first queue instead. _finish_batch
-                    # alerts on blocked_hosts, so this is loud, not silent.
-                    #
-                    # Skipping `_reconcile_orphaned_run`/`_reconcile_orphaned_walk`
-                    # is safe rather than incidental: every host-unavailable exit
-                    # happens before the child writes anything. Overpass is a road
-                    # walk's first step, and the tile census is a Mapillary run's
-                    # first step, so there is never a paid-for artifact to salvage
-                    # here. Keep that true if either fetch ever moves later.
-                    blocked_hosts.add(blocked_host)
-                    logger.error(
-                        f"{city.city_id} [{provider}]: {HOST_LABELS[blocked_host]} is "
-                        f"unavailable to this host — skipping its remaining channels "
-                        f"tonight. Not counted as a failure for this city. ({reason})"
-                    )
-                    continue
-
-                ran_any = True
-                attempted += 1
-                ok = bool(ok)
-                # A subprocess can report failure yet still have done the expensive,
-                # budgeted part of its job; salvage that rather than re-spending the
-                # whole crawl next cycle. The two channel kinds fail differently: a
-                # grid run commits its `runs` row before the diff/JSON tail, while a
-                # road walk catalogs nothing until the very end and so is salvaged
-                # from the artifacts it left on disk.
-                if not ok:
-                    if is_street_channel(provider):
-                        ok = _reconcile_orphaned_walk(conn, cfg, city, provider, today)
-                    else:
-                        ok = _reconcile_orphaned_run(conn, cfg, city, provider, today)
-                if ok:
-                    succeeded += 1
-                    db.record_attempt(conn, city.city_id, success=True, provider=provider)
-                else:
-                    db.record_attempt(
-                        conn,
-                        city.city_id,
-                        success=False,
-                        error=reason or f"subprocess failed on {today}",
-                        provider=provider,
-                    )
-                    logger.error(f"{city.city_id} [{provider}]: collection failed")
-
-            if ran_any:
+            if city_attempted:
                 processed += 1
                 # Pause only when another city is actually going to be started.
                 # `due` is the full candidate list (cmd_run_due deliberately does
@@ -2341,7 +2855,7 @@ def _finish_batch(
     blocked_hosts = blocked_hosts or set()
     blocked_note = (
         "This host's IP was refused by "
-        + ", ".join(sorted(HOST_LABELS.get(h, h) for h in blocked_hosts))
+        + _host_names(blocked_hosts)
         + ". Those channels were skipped for the rest of the night and NO city was "
         "marked failed, so they stay due and lead tomorrow's queue. If this repeats, "
         "check whether another process on this machine is collecting concurrently "
@@ -2354,7 +2868,7 @@ def _finish_batch(
     busy_note = (
         f"{sum(busy_hosts.values())} channel(s) were skipped because another process on this "
         "machine held the lock for "
-        + ", ".join(sorted(HOST_LABELS.get(h, h) for h in busy_hosts))
+        + _host_names(busy_hosts)
         + ". Those hosts meter by IP, so the two processes together would have presented double "
         "the paced rate — which is how this machine earned its bans. NO city was marked failed; "
         "they stay due and lead tomorrow's queue. Find the other process (its pid is in "
@@ -2496,6 +3010,53 @@ def build_parser() -> argparse.ArgumentParser:
         "--limit, this is the supported way to run an on-demand catch-up for one "
         "provider (issue #214) — never a detached bespoke script.",
     )
+    p_assess = sub.add_parser(
+        "assess-city",
+        help="Register a new city, walk its streets on both providers, publish, "
+        "and print the deployment numbers (issue #215)",
+    )
+    _add_global_flags(p_assess)
+    p_assess.add_argument("city", help='City query, e.g. "Newport, Kentucky"')
+    p_assess.add_argument(
+        "--lat", type=float, default=None, help="Grid center latitude (with --lng)"
+    )
+    p_assess.add_argument(
+        "--lng", type=float, default=None, help="Grid center longitude (with --lat)"
+    )
+    p_assess.add_argument(
+        "--width",
+        type=float,
+        default=None,
+        help="Grid width in meters. Must be given with --height AND --lat/--lng, "
+        "because size alone would center the grid on the OSM bounding-box "
+        "midpoint rather than the city.",
+    )
+    p_assess.add_argument(
+        "--height", type=float, default=None, help="Grid height in meters. See --width."
+    )
+    p_assess.add_argument(
+        "--step", type=float, default=20, help="Grid spacing in meters (new cities only)"
+    )
+    p_assess.add_argument(
+        "--provider",
+        action="append",
+        dest="providers",
+        metavar="CHANNEL",
+        help=f"Restrict to a subset of {', '.join(ASSESS_CHANNELS)} (repeatable, or "
+        f"comma-separated). The GSV grid run is never part of this command.",
+    )
+    p_assess.add_argument(
+        "--estimate",
+        action="store_true",
+        help="Register the city and report boundary fit and per-channel cost, then "
+        "stop. No provider request is issued.",
+    )
+    p_assess.add_argument(
+        "--yes", action="store_true", help="Skip the confirmation prompt (required on a non-TTY)"
+    )
+    p_assess.add_argument(
+        "--no-publish", action="store_true", help="Regenerate the published JSON but do not rsync"
+    )
     _add_global_flags(
         sub.add_parser(
             "notify-failure", help="Email the recent log (for a systemd OnFailure= hook)"
@@ -2551,6 +3112,20 @@ def main() -> int:
         target = date.fromisoformat(args.date) if args.date else None
         return cmd_fetch_driving_plan(
             cfg, force=args.force, from_file=args.from_file, target_date=target
+        )
+    if args.command == "assess-city":
+        return cmd_assess_city(
+            cfg,
+            args.city,
+            lat=args.lat,
+            lng=args.lng,
+            width=args.width,
+            height=args.height,
+            step=args.step,
+            requested_providers=args.providers,
+            estimate_only=args.estimate,
+            assume_yes=args.yes,
+            publish=not args.no_publish,
         )
     if args.command == "run-due":
         try:

@@ -56,19 +56,20 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from streetscape_metadata_tracker import cli, db  # noqa: E402
+from streetscape_metadata_tracker import db  # noqa: E402
+from streetscape_metadata_tracker.city_registration import MAX_GRID_DIM_M  # noqa: E402
 from streetscape_metadata_tracker.paths import get_default_data_dir  # noqa: E402
 
 logger = logging.getLogger("cap_oversized_grids")
 
-# Default cap per side — the same ceiling cli.py applies to newly registered
+# Default cap per side — the same ceiling registration applies to newly registered
 # cities, so a city registered today can't need capping tomorrow. At the
 # standard 20 m step this is ~4M grid points, which fits inside the production
 # gsv daily budget (10M) with room for other cities, and is still roughly twice
 # Seattle's grid — comfortably more than an urban core. Deliberately a
 # *dimension* cap rather than a point cap so the resulting rectangle stays
 # square-ish and legible on the map.
-DEFAULT_MAX_EXTENT_M = cli.MAX_GRID_DIM_M
+DEFAULT_MAX_EXTENT_M = MAX_GRID_DIM_M
 
 CAP_NOTE = "grid capped to {extent} m/side (scripts/cap_oversized_grids.py, issue #166)"
 
