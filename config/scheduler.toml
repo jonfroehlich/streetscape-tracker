@@ -11,7 +11,11 @@ cycle_days = 90
 grace_days = 7
 
 # max_cities_per_day counts cities, not runs — a city due for both
-# providers runs both back-to-back with the same run date.
+# providers runs both back-to-back with the same run date. This is the NIGHTLY
+# cap; `run-due --limit N` (N >= 1) overrides it for one invocation, which is how
+# an on-demand single-channel catch-up gets past it (issue #214). At 20 a full
+# pass over the 1,214 enabled cities is ~61 nights; the Mapillary daily budget
+# would allow ~5, which is the gap --limit exists to close.
 max_cities_per_day = 20
 
 # A (city, provider) pair is skipped after this many consecutive failures
@@ -64,20 +68,77 @@ daily_request_budget = 10000000
 enabled = true
 # Counted in z14 vector-tile requests (each tile carries every image's
 # metadata for a ~2 km square — a city is typically 10-100 tiles).
-# Mapillary caps tile requests at 50,000/day per application.
-daily_request_budget = 40000
-# Client-side pacing for the tile CDN (issue #198). The daily cap above is NOT
-# the binding constraint: on 2026-08-12 a bulk collection sustaining ~370
-# tile requests/min got the host's IP redirected to a login page for every
-# tile — across BOTH Mapillary applications at once — at a total spend of
-# 10,659 requests, ~21% of that 50,000. The limit is per IP, so it is shared
-# with [providers.mapillary_streets] below and with any manual collection on
-# this host, and a second token would not isolate it.
 #
-# 60/min is a conservative guess; 370 is merely confirmed too high. Measured
-# over the enabled cities' frozen grids, a 20-city night is ~1,200 tiles on
-# this channel (~20 min at this rate) and ~2,400 across both Mapillary channels
-# (~40 min) — cheap against max_batch_hours. A ban is not cheap: it takes out
+# WHAT MAPILLARY DOCUMENTS for this endpoint (read it before touching either
+# this number or the rate below — see the top-of-file rule in CLAUDE.md):
+#   tiles.mapillary.com          50,000 per day, "(not per minute)", per app
+#                                 exceeding it -> status code 4xx
+#   graph.mapillary.com/:id      60,000 per minute per app
+#   graph.mapillary.com/images   10,000 per minute per app
+# So the tile CDN has NO documented throughput limit at all; per-minute limits
+# are a Graph API property. (Mapillary's own numbers are not self-consistent: a
+# staff reply on forum.mapillary.com/t/hitting-request-limit/5820 gives graph as
+# 50,000/min, against the 60,000 + 10,000 on the docs page.)
+#
+# WHAT ACTUALLY HAPPENED matched none of that. On 2026-08-12 the host's whole IP
+# was redirected 302 to a login page for every tile — across BOTH Mapillary
+# applications at once — at a day's spend of 10,659 requests (~21% of the
+# documented daily cap) sustained at ~370 requests/min. Wrong scope (IP, not
+# app), wrong threshold, wrong status (302, not 4xx). The mechanism that hit us
+# is undocumented in every respect, so neither number below is derived from the
+# docs; they are bets (issue #214).
+#
+# THE BET: that the trigger is throughput, not daily volume. Two things point
+# that way and one of our own measurements points away, so read all three.
+#   FOR: the documented tile limit is a DAILY one and we tripped at 21% of it,
+#     so the published volume ceiling is demonstrably not the mechanism — that
+#     rules out the number, not the volume hypothesis (an undocumented lower
+#     daily threshold fits just as well).
+#   FOR: a ~15-minute cooldown is reported on
+#     forum.mapillary.com/t/inconsistent-authentication-issues/5821, and a
+#     15-minute reset fits a burst throttle where a daily cap would reset at a
+#     day boundary.
+#   AGAINST, and it is ours rather than a forum report: the 2026-08-12 block
+#     refused this host for ~20.5 h, lifting only after true silence. By the
+#     reset-interval criterion just used, that reads as the day-scale answer.
+#     (Duration constrains the trigger only weakly — a burst throttle can carry
+#     a long penalty box — but applied honestly the criterion cuts both ways.)
+# So max_requests_per_minute below is treated as the real protection and this is
+# a loose backstop. It is a considered bet against our one daily datapoint, not
+# an inference from evidence.
+#
+# DIRECTION OF THIS CHANGE, so nobody mis-reads it as a raise: 40,000 -> 15,000
+# LOWERS the combined per-IP ceiling from 45,000 to 20,000, and 40,000 was never
+# reachable anyway. At 60/min a 10 h max_batch_hours night affords 36,000 tiles
+# of pure fetching, and with sleep_between_cities_s = 60 the real per-night
+# ceiling is ~300 cities / ~17,000 tiles before the publish tail needs its time.
+# 15,000 sits just under where the deadline bites — roughly "as much as a night
+# can actually spend."
+#
+# THE EXPOSURE, stated plainly: the tile block is per IP, so what is actually on
+# the line is this budget PLUS [providers.mapillary_streets]' below — 15,000 +
+# 5,000 = 20,000/day on one address, ~1.9x the only daily figure we have ever
+# measured going badly. A second token would not isolate them.
+#
+# AND A THIRD AXIS the rate-vs-volume framing omits: sustained duration. The
+# 2026-08-12 block came from ~29 min at ~370/min; a budget-sized catch-up is ~4 h
+# of UNINTERRUPTED paced fetching. Peak rate is unchanged and daily volume is
+# down, but time-under-load rises by an order of magnitude, and nothing we know
+# excludes a sliding-window or sustained-load trigger. So if a block ever arrives
+# on a night that never exceeded 60/min, record BOTH that night's api_usage row
+# AND how long the fetching ran — a total alone cannot separate "spent too much"
+# from "spent too long."
+#
+# Sizing, measured over the 1,214 enabled cities on 2026-08-16: the largest
+# frozen grid is 870 tiles (Moscow), so no city is ever skipped as "exceeds the
+# entire daily budget"; the mean is 57.8, so 15,000 reaches ~260 cities, and the
+# 70,168-tile catalog is one full pass in ~5 nights.
+daily_request_budget = 15000
+# Client-side pacing for the tile CDN (issue #198). 60/min is a conservative
+# guess; 370 is merely confirmed too high. Shared per IP with
+# [providers.mapillary_streets] below and with any manual collection on this
+# host — the cross-process host lock (issue #208) is what makes this figure the
+# real one rather than a per-process wish. A ban is not cheap: it takes out
 # every Mapillary channel on the host until it lifts.
 max_requests_per_minute = 60
 
@@ -122,8 +183,11 @@ spacing_m = 15
 # Mapillary road-walk. Costs the z14 tile census (tens of requests for a whole
 # city) regardless of city size or sample spacing, because Mapillary has no
 # per-point metadata endpoint — the walk is a local spatial join against the
-# tiles. Budgeted in tile requests against Mapillary's 50,000/day application
-# cap, shared with the grid channel above, hence the modest ceiling.
+# tiles. Budgeted in tile requests against the same PER-IP ceiling as the grid
+# channel above (see its comment for the documented limits and the bet we are
+# making), not against the per-app cap: different tokens, one address, so the
+# number that matters is the SUM — 15,000 + 5,000 = 20,000/day. Kept as the
+# smaller half because the grid census is the series being caught up.
 [providers.mapillary_streets]
 enabled = true
 daily_request_budget = 5000

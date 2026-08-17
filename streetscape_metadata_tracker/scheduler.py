@@ -11,7 +11,7 @@ selection is ordered stalest-first).
 Usage (--config accepted on either side of the subcommand):
     python -m streetscape_metadata_tracker.scheduler [--config PATH] status
     python -m streetscape_metadata_tracker.scheduler [--config PATH] assign
-    python -m streetscape_metadata_tracker.scheduler [--config PATH] run-due [--dry-run] [--limit N]
+    python -m streetscape_metadata_tracker.scheduler [--config PATH] run-due [--dry-run] [--limit N] [--provider CHANNEL]
     python -m streetscape_metadata_tracker.scheduler [--config PATH] regenerate-aggregate [--publish]
     python -m streetscape_metadata_tracker.scheduler [--config PATH] reconcile-walks [--date D] [--dry-run]
     python -m streetscape_metadata_tracker.scheduler [--config PATH] fetch-driving-plan [--force] [--from-file P --date D]
@@ -571,6 +571,30 @@ _MIN_CLAMPED_TIMEOUT_S = 300
 # the batch publishes what it collected, but the night is not healthy.
 _STOP_REASON_ERROR = "unexpected error in the city loop"
 
+# Exit status for a bad `run-due` argument (issue #214). This is `sysexits.h`'s
+# EX_USAGE, and unlike HOST_BUSY_EXIT_CODES (79/80, deliberately past the end of
+# that header so they carry no false analogy) the analogy here is a true one: it
+# really is a command-line usage error.
+#
+# It has to be its own number rather than the obvious 2, because 2 is already
+# taken twice over — argparse exits 2 on any parse error, and main() ends with a
+# catch-all `return 2` for an unknown subcommand. A wrapper around the on-demand
+# catch-up has to tell "you typed the channel wrong, fix it and retry" apart from
+# both of those, and from the 0/1 the run-due path already owns.
+USAGE_EXIT_CODE = 64
+
+
+class _UsageError(ValueError):
+    """
+    A rejected ``run-due`` argument, carrying the operator-facing message.
+
+    A dedicated type rather than a ``None`` return, because ``None`` already
+    means the opposite thing one call away: ``_collect_due(providers=None)`` used
+    to mean "every enabled channel". Handing an error sentinel to a function that
+    reads the same value as "no filter" fails *open* — a rejected channel name
+    would run the full night, GSV included. Raising cannot be mistaken that way.
+    """
+
 
 @contextlib.contextmanager
 def _stop_on_sigterm():
@@ -673,12 +697,16 @@ def city_timeout_seconds(
     #
     # Mapillary used to keep the flat floor on the grounds that a tile census is
     # "a handful of tiles in seconds". Client-side pacing (issue #198) ended
-    # that: a run's wall-clock is now tile_count / rate, and the frozen grids
-    # are not all small. At the shipped 60/min the median city is ~12 tiles but
-    # Anchorage's 105x84 km grid is ~6,480, i.e. ~108 minutes of deliberate
-    # sleeping before the decode/assignment/CSV tail even starts — against a
-    # 180-minute floor. A SIGKILL there costs the requests already spent AND
-    # counts a failure, so the derivation has to see the pacing.
+    # that: a run's wall-clock is now tile_count / rate, not a constant. On
+    # today's catalog that mostly resolves to the floor — measured over the
+    # 1,214 enabled cities (2026-08-16), the median is 12 tiles and the largest
+    # frozen grid is 870 (Moscow), ~15 minutes at 60/min, well inside the
+    # 180-minute floor. It was NOT always so: before the #166 grid caps,
+    # Anchorage's 105x84 km grid was ~6,480 tiles (~108 min of deliberate
+    # sleeping before the decode/assignment/CSV tail even starts) and today it
+    # is 575. The derivation stays because a grid can be re-registered larger at
+    # any time, and a SIGKILL costs the requests already spent AND counts a
+    # failure — the guard must not depend on today's geometry staying capped.
     if provider not in ("gsv", "gsv_streets", "mapillary", "mapillary_streets"):
         return clamp(floor)
     pc = (cfg.providers or {}).get(provider)
@@ -1665,13 +1693,23 @@ def _reconcile_orphaned_walk(
     return True
 
 
-def _collect_due(conn, cfg: SchedulerConfig, today: date):
+def _collect_due(conn, cfg: SchedulerConfig, today: date, providers: list[str]):
     """
     Due work for today: an ordered city list (stalest-first, gsv's order
-    leading since it's the expensive series) and, per city, which enabled
-    providers are due. Providers pair on the same cycle day by design, so
+    leading since it's the expensive series) and, per city, which of
+    ``providers`` are due. Providers pair on the same cycle day by design, so
     most cities are due for all providers at once; they only diverge after
     per-provider failures or when a provider was enabled later.
+
+    ``providers`` is **required** — the caller states the channel set, which for
+    a nightly run is ``cfg.enabled_providers()`` and for ``run-due --provider``
+    is a subset of it (issue #214). It used to default to None-means-everything,
+    which made "no channels named" and "every channel" the same value and left a
+    fail-open path one refactor away; see ``_UsageError``.
+
+    Filtering here is the whole mechanism: ``_run_city_loop`` works from
+    ``providers_for_city``, so a channel absent from this mapping is never
+    priced, never budgeted and never launched.
     """
     due_by_provider = {
         provider: db.get_due_cities(
@@ -1682,7 +1720,7 @@ def _collect_due(conn, cfg: SchedulerConfig, today: date):
             max_consecutive_failures=cfg.max_consecutive_failures,
             provider=provider,
         )
-        for provider in cfg.enabled_providers()
+        for provider in providers
     }
     ordered, seen = [], set()
     providers_for_city = {}
@@ -1753,38 +1791,137 @@ def _fetch_driving_plan_nightly(cfg: SchedulerConfig, conn, today: date) -> str 
     return None
 
 
+def _select_providers(cfg: SchedulerConfig, requested: list[str]) -> list[str]:
+    """
+    Resolve ``run-due --provider`` into a channel list (issue #214).
+
+    Accepts both the repeated form (``--provider a --provider b``) and a comma
+    list (``--provider a,b``). The result is filtered out of
+    ``cfg.enabled_providers()`` rather than taken in CLI order, so the canonical
+    gsv-first ranking survives whatever order an operator types.
+
+    Raises ``_UsageError`` — never returns an empty list — when the flag names no
+    channel, or names one that is unknown OR configured ``enabled = false``. That
+    is an error rather than a silent no-op: on a host where Mapillary is switched
+    off, accepting ``--provider mapillary`` would run a zero-due night, and its
+    full publish tail, while looking like it collected something.
+    """
+    enabled = cfg.enabled_providers()
+    names = [n.strip() for value in requested for n in value.split(",") if n.strip()]
+    if not names:
+        # Reachable: argparse takes any string, so `--provider ""` and
+        # `--provider ,` both land here. Falling through with an empty list would
+        # be the zero-due night this function exists to refuse.
+        raise _UsageError(f"--provider given with no channel name (got {requested!r})")
+    unusable = [n for n in names if n not in enabled]
+    if unusable:
+        raise _UsageError(
+            f"--provider {', '.join(unusable)}: not an enabled channel. "
+            f"Enabled in this config: {', '.join(enabled) or '(none)'}"
+        )
+    return [p for p in enabled if p in set(names)]
+
+
 def cmd_run_due(
     cfg: SchedulerConfig,
     dry_run: bool = False,
     limit: int | None = None,
     today: date | None = None,
+    requested_providers: list[str] | None = None,
 ) -> int:
     """
     Collect all cities due today, within per-provider budgets, publish.
 
     ``today`` is injectable so tests can pin a date (a wall-clock read here
     can cross UTC midnight mid-test and flake); production callers omit it.
+
+    ``requested_providers`` restricts the night to a subset of the enabled
+    channels, and an explicit ``limit`` overrides ``max_cities_per_day``.
+    Together they are the supported way to run an on-demand catch-up for one
+    provider (issue #214) — the point being that it inherits the daily budget
+    ledger, stalest-first ordering, per-channel cadence and failure counting,
+    the host lock, fail-fast, the night-level breaker, alerting, orphan salvage
+    and the publish tail. The bespoke detached script that had none of those is
+    what got this host per-IP banned on 2026-08-14.
+
+    A filtered run is NOT the nightly run with fewer channels: it advances only
+    the named channels' ``schedule_state``, so the cities it touches stop sharing
+    a run date with their other channels. That is the feature (catching one
+    channel up means moving its clock alone), not a defect — see the warning
+    logged below.
     """
+    # Validate BEFORE opening the catalog, so an operator typo costs nothing.
+    # Returning rather than propagating is deliberate: main()'s run-due branch
+    # emails an alert on an exception, and a typo is not a nightly crash.
+    try:
+        providers = (
+            _select_providers(cfg, requested_providers)
+            if requested_providers is not None
+            else cfg.enabled_providers()
+        )
+        if limit is not None and limit < 1:
+            # Left unchecked, `--limit 0`/`-1` makes `processed >= max_cities`
+            # true on the first iteration: zero cities collected, no publish,
+            # exit 0. That is the same "a night that did nothing reads as a
+            # success" failure the channel check refuses, reached through the
+            # sibling flag.
+            raise _UsageError(f"--limit must be at least 1 (got {limit})")
+    except _UsageError as e:
+        logger.error(str(e))
+        return USAGE_EXIT_CODE
+
     conn = db.connect(cfg.db_path)
     if today is None:
         today = datetime.now(UTC).date()
-    providers = cfg.enabled_providers()
-    batch_deadline = time.monotonic() + cfg.max_batch_hours * 3600.0
+    batch_started = time.monotonic()
+    batch_deadline = batch_started + cfg.max_batch_hours * 3600.0
 
-    # Ensure new cities (and newly enabled providers) have stagger assignments
-    db.assign_schedule(conn, cfg.cycle_days, providers=tuple(providers))
+    # Ensure new cities (and newly enabled providers) have stagger assignments.
+    # Deliberately over the FULL enabled set, not the filtered one: a
+    # Mapillary-only catch-up must not leave new cities unregistered on the
+    # channels it isn't running tonight.
+    db.assign_schedule(conn, cfg.cycle_days, providers=tuple(cfg.enabled_providers()))
 
-    due, providers_for_city = _collect_due(conn, cfg, today)
-    if limit is not None:
-        due = due[:limit]
-    day_cap = min(len(due), cfg.max_cities_per_day)
+    due, providers_for_city = _collect_due(conn, cfg, today, providers)
+    # An explicit --limit IS the cap for this run. Without this the config's
+    # max_cities_per_day silently wins, and `--limit 40` quietly does 20 — which
+    # would leave a Mapillary catch-up at the nightly cap's ~61 nights per pass
+    # rather than the ~5 the daily budget allows.
+    #
+    # There is deliberately NO `due = due[:limit]` here, and that omission is the
+    # whole fix rather than a tidy-up. The loop's cap counts cities it actually
+    # *processed*, and a candidate can be skipped without processing (budget
+    # guard, host breaker, busy lock), so pre-truncating the candidate list to N
+    # lets the loop run out of list below N — `--limit 40` silently doing 30 and
+    # reporting a clean night, which is this flag's own bug one layer down.
+    max_cities = limit if limit is not None else cfg.max_cities_per_day
+    day_cap = min(len(due), max_cities)
 
     budget_str = ", ".join(f"{cfg.providers[p].daily_request_budget:,} {p}" for p in providers)
+    filter_note = f" [--provider {','.join(providers)}]" if requested_providers is not None else ""
     logger.info(
-        f"{len(due)} cities due on {today}; "
+        f"{len(due)} cities due on {today}{filter_note}; "
         f"processing up to {day_cap} within daily budgets of "
         f"{budget_str} requests"
     )
+    if requested_providers is not None and set(providers) != set(cfg.enabled_providers()):
+        # Say out loud what a filtered run costs, because nothing downstream
+        # will. `get_due_cities` derives dueness from `schedule_state
+        # .last_success_at` alone and never reads `day_of_cycle`, so the
+        # same-run-date pairing of a city's channels is a *consequence* of their
+        # clocks being in lockstep, not a constraint the scheduler maintains.
+        # Advancing one channel's clock alone therefore un-pairs every city this
+        # run collects, permanently, until their cadences happen to re-converge.
+        # That is exactly what a catch-up is for — but an operator reaching for
+        # this flag to "just run the one channel tonight" should know it is not a
+        # narrower version of the nightly run.
+        logger.warning(
+            f"--provider advances only {', '.join(providers)}: each city collected "
+            f"tonight will stop sharing a run date with its other channels "
+            f"({', '.join(p for p in cfg.enabled_providers() if p not in set(providers))}) "
+            f"until their cadences re-converge. Intended for a catch-up; not a "
+            f"narrower nightly run."
+        )
 
     if dry_run:
         budget_left = {
@@ -1834,7 +1971,16 @@ def cmd_run_due(
             stop_reason,
             blocked_hosts,
             busy_hosts,
-        ) = _run_city_loop(cfg, conn, today, due, providers_for_city, batch_deadline, sigterm_seen)
+        ) = _run_city_loop(
+            cfg,
+            conn,
+            today,
+            due,
+            providers_for_city,
+            batch_deadline,
+            sigterm_seen,
+            max_cities=max_cities,
+        )
 
     if stop_reason:
         logger.info(f"Stopped early: {stop_reason}")
@@ -1851,9 +1997,16 @@ def cmd_run_due(
         if busy_hosts
         else ""
     )
+    # Elapsed is in the summary because the Mapillary per-IP block may have a
+    # sustained-load component and nothing else records time-under-load: peak rate
+    # is a config value and `api_usage` is a daily total, so "we spent too much"
+    # and "we spent too long" are indistinguishable after the fact. The summary is
+    # what the [alerts] email carries, so this is where an operator can read it
+    # off. See the falsifier in CLAUDE.md's Mapillary budget section.
+    elapsed_h = (time.monotonic() - batch_started) / 3600.0
     summary = (
-        f"run-due {today}: {succeeded}/{attempted} runs succeeded across "
-        f"{processed} cities"
+        f"run-due {today}{filter_note}: {succeeded}/{attempted} runs succeeded across "
+        f"{processed} cities in {elapsed_h:.2f} h"
         + (f"; {skipped_budget} deferred for budget" if skipped_budget else "")
         + (f"; {blocked_note}" if blocked_note else "")
         + (f"; {busy_note}" if busy_note else "")
@@ -1883,8 +2036,15 @@ def _run_city_loop(
     providers_for_city: dict[str, list[str]],
     batch_deadline: float,
     sigterm_seen,
+    max_cities: int,
 ) -> tuple[int, int, int, int, str | None, set[str], Counter[str]]:
-    """Collect due cities until the day cap, the batch deadline, or SIGTERM.
+    """Collect due cities until the city cap, the batch deadline, or SIGTERM.
+
+    ``max_cities`` is ``cfg.max_cities_per_day`` on a nightly run and an explicit
+    ``--limit`` on an on-demand catch-up (issue #214). Required rather than
+    defaulting to the config value, for the same reason ``_collect_due``'s
+    ``providers`` is: the caller resolves the policy, and a default here would be
+    dead code that also reads as a second opinion on what the cap is.
 
     Returns ``(processed, succeeded, attempted, skipped_budget, stop_reason,
     blocked_hosts, busy_hosts)``; ``stop_reason`` is None when the whole due
@@ -1911,8 +2071,11 @@ def _run_city_loop(
     busy_hosts: Counter[str] = Counter()
     try:
         for city in due:
-            if processed >= cfg.max_cities_per_day:
-                stop_reason = "daily city cap reached"
+            if processed >= max_cities:
+                # Named with the number because the cap has two sources now: the
+                # config's nightly max_cities_per_day, or an explicit --limit
+                # overriding it for one on-demand run (issue #214).
+                stop_reason = f"city cap reached ({max_cities})"
                 break
             if sigterm_seen.is_set():
                 stop_reason = "received SIGTERM"
@@ -2075,7 +2238,12 @@ def _run_city_loop(
 
             if ran_any:
                 processed += 1
-                if processed < len(due):
+                # Pause only when another city is actually going to be started.
+                # `due` is the full candidate list (cmd_run_due deliberately does
+                # not pre-truncate it to --limit), so gating on `len(due)` alone
+                # would add a trailing sleep_between_cities_s to every capped run
+                # — including `--limit 1`, the one-city smoke test.
+                if processed < min(len(due), max_cities):
                     time.sleep(cfg.sleep_between_cities_s)
     except Exception:
         # One city's unexpected error must not cost the night its publish:
@@ -2310,7 +2478,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_run = sub.add_parser("run-due", help="Collect today's due cities")
     _add_global_flags(p_run)
     p_run.add_argument("--dry-run", action="store_true", help="Print what would run; no downloads")
-    p_run.add_argument("--limit", type=int, default=None, help="Process at most N cities (testing)")
+    p_run.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Process at most N cities (N >= 1; a smaller value exits "
+        f"{USAGE_EXIT_CODE} rather than collecting nothing). Given explicitly, "
+        "this OVERRIDES [schedule].max_cities_per_day for this run (issue #214).",
+    )
+    p_run.add_argument(
+        "--provider",
+        action="append",
+        dest="providers",
+        metavar="CHANNEL",
+        help="Restrict this run to one or more enabled channels (repeatable, or "
+        "comma-separated): gsv, gsv_streets, mapillary, mapillary_streets. With "
+        "--limit, this is the supported way to run an on-demand catch-up for one "
+        "provider (issue #214) — never a detached bespoke script.",
+    )
     _add_global_flags(
         sub.add_parser(
             "notify-failure", help="Email the recent log (for a systemd OnFailure= hook)"
@@ -2369,7 +2554,12 @@ def main() -> int:
         )
     if args.command == "run-due":
         try:
-            return cmd_run_due(cfg, dry_run=args.dry_run, limit=args.limit)
+            return cmd_run_due(
+                cfg,
+                dry_run=args.dry_run,
+                limit=args.limit,
+                requested_providers=args.providers,
+            )
         except Exception:
             # A crash (not just a failed city) — email the traceback before the
             # process dies, so a silent nightly failure can't go unnoticed.
@@ -2379,6 +2569,10 @@ def main() -> int:
                 f"Uncaught exception in run-due:\n\n{traceback.format_exc()}",
             )
             raise
+    # Unknown subcommand. Kept as 2 (argparse's own usage status) rather than
+    # USAGE_EXIT_CODE precisely so the two stay distinguishable: a wrapper seeing
+    # 2 has a malformed command line, while 64 means the command line parsed and
+    # run-due rejected an argument's value.
     return 2
 
 

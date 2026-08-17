@@ -8,6 +8,8 @@
 [schedule]
 cycle_days = 90            # re-collect each city ~quarterly
 grace_days = 7
+# Nightly cap; `run-due --limit N` (N >= 1) overrides it for one invocation
+# (issue #214). At 20, a full pass over the enabled cities is ~61 nights.
 max_cities_per_day = 20    # cities/day (a city runs all enabled providers)
 max_consecutive_failures = 5
 city_timeout_minutes = 180
@@ -26,13 +28,40 @@ daily_request_budget = 10000000
 
 [providers.mapillary]
 enabled = true
-# Counted in z14 vector-tile requests; Mapillary caps at 50,000/day per app.
-daily_request_budget = 40000
-# Client-side tile pacing (issue #198). The daily cap is NOT what binds: on
-# 2026-08-12 sustaining ~370 tile req/min got makelab2's IP redirected to a
-# login page for every tile, across BOTH Mapillary applications, at a total
-# spend of 10,659 (~21% of the 50k). The limit is per IP, so it is shared with
-# mapillary_streets below and with any manual run on this host.
+# Counted in z14 vector-tile requests. Mapillary documents this endpoint as
+# "50,000 per day (not per minute)" per app — i.e. NO documented throughput
+# limit at all — and 4xx on exceeding it. Our block matched none of that: on
+# 2026-08-12 makelab2's whole IP was redirected 302 to a login page for every
+# tile, across BOTH applications, at a day's spend of 10,659 (~21% of the
+# documented cap) sustained at ~370 req/min. Wrong scope, wrong threshold, wrong
+# status — so the mechanism that hit us is undocumented in every respect.
+#
+# We deliberately bet on the THROUGHPUT reading (issue #214): the forum's
+# reported ~15-minute cooldown fits a burst throttle better than a daily volume
+# cap, which would reset at a day boundary. But our OWN measurement cuts the
+# other way — the 2026-08-12 block refused this host for ~20.5 h, which by that
+# same reset-interval criterion is the day-scale answer — so this is a considered
+# bet against our one daily datapoint, not an inference from it. See
+# config/scheduler.toml's comment on this key for the full reasoning.
+#
+# NOT A RAISE: 40,000 -> 15,000 lowers the combined per-IP ceiling from 45,000 to
+# 20,000, and 40,000 was never reachable. At 60/min with max_batch_hours = 10 and
+# sleep_between_cities_s = 60, a night tops out near ~300 cities / ~17,000 tiles,
+# so 15,000 is roughly as much as a night can actually spend. Full pass over the
+# 70,168-tile catalog: ~5 nights (vs ~61 at the 20-city nightly cap, which is
+# what `--limit N` exists to override).
+#
+# BE HONEST ABOUT WHAT THIS IS: 15,000 + mapillary_streets' 5,000 = 20,000/day
+# on one IP, ~1.9x the only daily figure we have ever measured going badly. If
+# the trigger turns out to be volume after all, this is the line that caused it.
+# Also watch the third axis: a budget-sized catch-up is ~4 h of UNINTERRUPTED
+# fetching where the 2026-08-12 block took ~29 min at ~370/min, so if a block
+# arrives on a night that never exceeded 60/min, record BOTH the day's api_usage
+# AND how long the fetching ran before changing anything.
+daily_request_budget = 15000
+# Client-side tile pacing (issue #198). Shared per-IP with mapillary_streets
+# below and with any manual run on this host — the host lock (#208) is what
+# makes this figure the real one rather than a per-process wish.
 max_requests_per_minute = 60
 
 # Road-walk street-coverage collection (issue #99). SCHEDULED channels like the
@@ -62,9 +91,11 @@ spacing_m = 15
 
 # Mapillary road-walk: costs the z14 tile census (tens of requests for a whole
 # city) regardless of city size or spacing, because Mapillary has no per-point
-# endpoint — the walk is a local spatial join against the tiles. Budgeted in
-# tile requests against Mapillary's 50,000/day application cap, which is SHARED
-# with [providers.mapillary] above (40,000), hence the modest ceiling.
+# endpoint — the walk is a local spatial join against the tiles. Budgeted in tile
+# requests against the SAME per-IP ceiling as [providers.mapillary] above, not
+# against the per-app cap: different tokens, one address, so the number that
+# matters is the SUM (15,000 + 5,000 = 20,000/day). Kept as the smaller half
+# because the grid census is the series we are actually catching up.
 [providers.mapillary_streets]
 enabled = true
 daily_request_budget = 5000

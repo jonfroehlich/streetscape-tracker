@@ -29,7 +29,10 @@ Design notes worth keeping:
 - **Atomic promotion.** The copy is written to a ``.tmp`` sibling, verified with
   ``PRAGMA integrity_check``, and only then ``os.replace()``'d into place. A
   filesystem snapshot therefore can never catch a half-written backup, and a
-  failed verification leaves the previous good backup untouched.
+  failed verification leaves the previous good backup untouched. The staging name
+  identifies the **writing process**, because two ``run-due`` runs can overlap and
+  a shared staging name turns "verify then promote" into "verify mine, promote
+  theirs" — see ``_staging_path``.
 - **Never prune the newest file**, whatever its age. Retention that ignores this
   turns a long-running backup failure into data loss: the window slides past the
   last good copy and prunes it. (Same guard as the Makeability Lab website's
@@ -106,6 +109,12 @@ _BACKUP_PAGES = 2048
 _BASENAME = "streetscape_tracker.db"
 _SUFFIX = ".backup"
 STATUS_FILENAME = "backup_status.json"
+
+# A staging file older than this cannot belong to a copy still in progress: every
+# copy is hard-bounded by BACKUP_TIMEOUT_S, and sqlite3 writes to the file as it
+# steps, so the mtime advances throughout. Doubled for slack. Used only to decide
+# which abandoned .tmp files are safe to delete — never to interrupt a copy.
+_STALE_TMP_AFTER_S = 2 * BACKUP_TIMEOUT_S
 
 # SQLite writes these beside a database file; they are meaningless without it,
 # and actively dangerous when they outlive it (see _remove_sidecars).
@@ -214,6 +223,57 @@ def _remove_sidecars(db_path: str) -> list[str]:
     return removed
 
 
+def _staging_path(final_path: str) -> str:
+    """
+    Per-writer staging path for ``final_path``.
+
+    The suffix names the writing process, and that is a correctness requirement
+    rather than hygiene. Two ``run-due`` invocations can overlap — the nightly
+    systemd timer and an operator's on-demand catch-up (issue #214) are both
+    supported, and nothing serializes them — and both would stage the SAME date's
+    copy. With one shared ``.tmp`` name the interleaving is silent and ugly: B's
+    "clear any leftover staging file" unlinks the file A is mid-copy into, A goes
+    on writing to an unlinked inode, A verifies *its own* copy with
+    ``integrity_check``, and A's ``os.replace`` then promotes whatever now sits at
+    that path — B's partially written file — as the day's verified backup. The one
+    artifact this module exists to guarantee would be torn, with a clean "ok" in
+    ``backup_status.json`` beside it.
+
+    Host as well as pid because pids are only unique per host and ``backup_dir``
+    can live on shared lab storage.
+    """
+    return f"{final_path}.{socket.gethostname()}.{os.getpid()}.tmp"
+
+
+def _sweep_stale_staging(backup_dir: str) -> list[str]:
+    """
+    Delete abandoned ``*.tmp`` staging files (and their sidecars) in ``backup_dir``.
+
+    Replaces the old "unlink this exact ``.tmp`` first" step, which only worked
+    because the staging name was deterministic. Now that it names the writer, a
+    crashed copy leaves a file nobody would ever open again — so age is the test,
+    with ``_STALE_TMP_AFTER_S`` chosen so a *live* concurrent copy is never
+    touched. Nothing else in this directory uses a ``.tmp`` suffix, and none of
+    these files are visible to ``list_backups`` (its regex requires the name to
+    end at ``.backup``), so an uncollected one is invisible rather than mistakable
+    for a backup — worth clearing, never worth failing over.
+    """
+    removed = []
+    cutoff = time.time() - _STALE_TMP_AFTER_S
+    for path in glob.glob(os.path.join(backup_dir, "*.tmp")):
+        try:
+            if os.path.getmtime(path) > cutoff:
+                continue
+            os.unlink(path)
+        except OSError:
+            continue
+        removed.append(path)
+        _remove_sidecars(path)
+    if removed:
+        logger.info(f"Cleared {len(removed)} abandoned backup staging file(s)")
+    return removed
+
+
 def _deadline_guard(seconds: float):
     """
     A ``conn.backup()`` progress callback that aborts once ``seconds`` elapse.
@@ -282,7 +342,9 @@ def write_backup(
     allowed to abort or stall a collection night.
     """
     final_path = os.path.join(backup_dir, backup_filename(when))
-    tmp_path = final_path + ".tmp"
+    # Named for this process, so an overlapping run-due cannot stage into the same
+    # file and get a torn copy promoted as verified — see _staging_path.
+    tmp_path = _staging_path(final_path)
 
     try:
         # An open write transaction on the SOURCE connection makes every
@@ -303,7 +365,10 @@ def write_backup(
 
         # A leftover .tmp from a previous crash would otherwise be opened as an
         # existing database and backed up *into*, which is harmless but muddles
-        # the failure mode; start clean.
+        # the failure mode; start clean. Age-based rather than name-based now that
+        # the staging name identifies the writer, and deliberately unable to touch
+        # a concurrent live copy.
+        _sweep_stale_staging(backup_dir)
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
         _remove_sidecars(tmp_path)
@@ -453,7 +518,10 @@ def _record(
     try:
         os.makedirs(backup_dir, exist_ok=True)
         status_path = os.path.join(backup_dir, STATUS_FILENAME)
-        tmp = status_path + ".tmp"
+        # Per-writer staging name for the same reason write_backup uses one: two
+        # overlapping run-due processes writing one shared `.tmp` with mode "w"
+        # would truncate each other mid-write and promote a spliced JSON file.
+        tmp = _staging_path(status_path)
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(status, f, indent=2, sort_keys=True)
         os.replace(tmp, status_path)
