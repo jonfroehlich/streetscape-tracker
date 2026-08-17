@@ -99,10 +99,11 @@ roughly a lane width, not a deck-over-road coincidence. That is suggestive, not 
 roadways crossing at an angle still separate by a few metres in projection, so the
 mechanisms are not cleanly separable by distance alone.
 
-Testing it needs no new collection. The cached GraphML for these areas already retains
-`bridge`, `tunnel`, `junction`, `lanes`, `oneway` and node `street_count`, so tagging each
-sub-5 m pano by what it sits on is an offline join against artifacts already on disk.
-Until that runs, treat the mechanism as unattributed.
+Testing it needs no new collection, and is tracked in
+[#223](https://github.com/jonfroehlich/streetscape-tracker/issues/223): the cached GraphML
+for these areas already retains `bridge`, `tunnel`, `junction`, `lanes`, `oneway` and node
+`street_count`, so tagging each sub-5 m pano by what it sits on is an offline join against
+artifacts already on disk. Until that runs, treat the mechanism as unattributed.
 
 GSV exposes no run/sequence identifier, so none of this can be corrected for at the pano
 level; Mapillary's `sequence_id` makes the same correction trivial, which is the sharpest
