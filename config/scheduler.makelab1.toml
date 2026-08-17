@@ -8,7 +8,8 @@
 [schedule]
 cycle_days = 90            # re-collect each city ~quarterly
 grace_days = 7
-# Nightly cap; `run-due --limit N` overrides it for one invocation (issue #214).
+# Nightly cap; `run-due --limit N` (N >= 1) overrides it for one invocation
+# (issue #214). At 20, a full pass over the enabled cities is ~61 nights.
 max_cities_per_day = 20    # cities/day (a city runs all enabled providers)
 max_consecutive_failures = 5
 city_timeout_minutes = 180
@@ -36,16 +37,27 @@ enabled = true
 # status — so the mechanism that hit us is undocumented in every respect.
 #
 # We deliberately bet on the THROUGHPUT reading (issue #214): the forum's
-# reported ~15-minute cooldown fits a burst throttle far better than a daily
-# volume cap, which would reset at a day boundary. So the rate below is treated
-# as the real protection and this number as a loose backstop, sized for catch-up
-# speed — a full pass over the catalog in ~4 nights rather than ~14.
+# reported ~15-minute cooldown fits a burst throttle better than a daily volume
+# cap, which would reset at a day boundary. But our OWN measurement cuts the
+# other way — the 2026-08-12 block refused this host for ~20.5 h, which by that
+# same reset-interval criterion is the day-scale answer — so this is a considered
+# bet against our one daily datapoint, not an inference from it. See
+# config/scheduler.toml's comment on this key for the full reasoning.
+#
+# NOT A RAISE: 40,000 -> 15,000 lowers the combined per-IP ceiling from 45,000 to
+# 20,000, and 40,000 was never reachable. At 60/min with max_batch_hours = 10 and
+# sleep_between_cities_s = 60, a night tops out near ~300 cities / ~17,000 tiles,
+# so 15,000 is roughly as much as a night can actually spend. Full pass over the
+# 70,168-tile catalog: ~5 nights (vs ~61 at the 20-city nightly cap, which is
+# what `--limit N` exists to override).
 #
 # BE HONEST ABOUT WHAT THIS IS: 15,000 + mapillary_streets' 5,000 = 20,000/day
 # on one IP, ~1.9x the only daily figure we have ever measured going badly. If
 # the trigger turns out to be volume after all, this is the line that caused it.
-# The evidence that would say so is a block arriving on a night that never
-# exceeded 60/min — record the day's api_usage before changing anything.
+# Also watch the third axis: a budget-sized catch-up is ~4 h of UNINTERRUPTED
+# fetching where the 2026-08-12 block took ~29 min at ~370/min, so if a block
+# arrives on a night that never exceeded 60/min, record BOTH the day's api_usage
+# AND how long the fetching ran before changing anything.
 daily_request_budget = 15000
 # Client-side tile pacing (issue #198). Shared per-IP with mapillary_streets
 # below and with any manual run on this host — the host lock (#208) is what

@@ -12,8 +12,10 @@ grace_days = 7
 
 # max_cities_per_day counts cities, not runs — a city due for both
 # providers runs both back-to-back with the same run date. This is the NIGHTLY
-# cap; `run-due --limit N` overrides it for one invocation, which is how an
-# on-demand single-channel catch-up gets past it (issue #214).
+# cap; `run-due --limit N` (N >= 1) overrides it for one invocation, which is how
+# an on-demand single-channel catch-up gets past it (issue #214). At 20 a full
+# pass over the 1,214 enabled cities is ~61 nights; the Mapillary daily budget
+# would allow ~5, which is the gap --limit exists to close.
 max_cities_per_day = 20
 
 # A (city, provider) pair is skipped after this many consecutive failures
@@ -86,27 +88,51 @@ enabled = true
 # is undocumented in every respect, so neither number below is derived from the
 # docs; they are bets (issue #214).
 #
-# THE BET: that the trigger is throughput, not daily volume. The one piece of
-# evidence pointing that way is the ~15-minute cooldown reported on
-# forum.mapillary.com/t/inconsistent-authentication-issues/5821 — a 15-minute
-# reset fits a burst throttle, where a daily cap would reset at a day boundary.
-# So max_requests_per_minute below is treated as the real protection, and this
-# is a loose backstop sized for catch-up speed: ~4 nights for a full pass over
-# the catalog instead of ~14.
+# THE BET: that the trigger is throughput, not daily volume. Two things point
+# that way and one of our own measurements points away, so read all three.
+#   FOR: the documented tile limit is a DAILY one and we tripped at 21% of it,
+#     so the published volume ceiling is demonstrably not the mechanism — that
+#     rules out the number, not the volume hypothesis (an undocumented lower
+#     daily threshold fits just as well).
+#   FOR: a ~15-minute cooldown is reported on
+#     forum.mapillary.com/t/inconsistent-authentication-issues/5821, and a
+#     15-minute reset fits a burst throttle where a daily cap would reset at a
+#     day boundary.
+#   AGAINST, and it is ours rather than a forum report: the 2026-08-12 block
+#     refused this host for ~20.5 h, lifting only after true silence. By the
+#     reset-interval criterion just used, that reads as the day-scale answer.
+#     (Duration constrains the trigger only weakly — a burst throttle can carry
+#     a long penalty box — but applied honestly the criterion cuts both ways.)
+# So max_requests_per_minute below is treated as the real protection and this is
+# a loose backstop. It is a considered bet against our one daily datapoint, not
+# an inference from evidence.
+#
+# DIRECTION OF THIS CHANGE, so nobody mis-reads it as a raise: 40,000 -> 15,000
+# LOWERS the combined per-IP ceiling from 45,000 to 20,000, and 40,000 was never
+# reachable anyway. At 60/min a 10 h max_batch_hours night affords 36,000 tiles
+# of pure fetching, and with sleep_between_cities_s = 60 the real per-night
+# ceiling is ~300 cities / ~17,000 tiles before the publish tail needs its time.
+# 15,000 sits just under where the deadline bites — roughly "as much as a night
+# can actually spend."
 #
 # THE EXPOSURE, stated plainly: the tile block is per IP, so what is actually on
 # the line is this budget PLUS [providers.mapillary_streets]' below — 15,000 +
 # 5,000 = 20,000/day on one address, ~1.9x the only daily figure we have ever
-# measured going badly. A second token would not isolate them. If a block ever
-# arrives on a night that never exceeded 60/min, the throughput bet was wrong
-# and this is the line that caused it; record that night's api_usage.
+# measured going badly. A second token would not isolate them.
+#
+# AND A THIRD AXIS the rate-vs-volume framing omits: sustained duration. The
+# 2026-08-12 block came from ~29 min at ~370/min; a budget-sized catch-up is ~4 h
+# of UNINTERRUPTED paced fetching. Peak rate is unchanged and daily volume is
+# down, but time-under-load rises by an order of magnitude, and nothing we know
+# excludes a sliding-window or sustained-load trigger. So if a block ever arrives
+# on a night that never exceeded 60/min, record BOTH that night's api_usage row
+# AND how long the fetching ran — a total alone cannot separate "spent too much"
+# from "spent too long."
 #
 # Sizing, measured over the 1,214 enabled cities on 2026-08-16: the largest
 # frozen grid is 870 tiles (Moscow), so no city is ever skipped as "exceeds the
-# entire daily budget"; the mean is 57.8, so 15,000 reaches ~260 cities; the
-# whole catalog is one 70,168-tile pass. Note a full-budget night is ~250 min of
-# paced fetching PLUS sleep_between_cities_s per city, so it approaches
-# max_batch_hours — the deadline, not this number, may end such a night.
+# entire daily budget"; the mean is 57.8, so 15,000 reaches ~260 cities, and the
+# 70,168-tile catalog is one full pass in ~5 nights.
 daily_request_budget = 15000
 # Client-side pacing for the tile CDN (issue #198). 60/min is a conservative
 # guess; 370 is merely confirmed too high. Shared per IP with

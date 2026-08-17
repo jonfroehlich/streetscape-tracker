@@ -261,6 +261,93 @@ def test_same_day_rebackup_replaces_in_place(conn, tmp_path):
     assert second.row_counts["runs"] > first_rows, "the tail copy must see the night's runs"
 
 
+def test_the_staging_name_identifies_the_writing_process(tmp_path, monkeypatch):
+    """
+    Two processes must never derive the same staging path for one date, and
+    neither staging file may be mistakable for a backup.
+    """
+    backup_dir = str(tmp_path / "backups")
+    os.makedirs(backup_dir)
+    final = os.path.join(backup_dir, catalog_backup.backup_filename(date(2026, 8, 7)))
+
+    monkeypatch.setattr(catalog_backup.os, "getpid", lambda: 111)
+    a = catalog_backup._staging_path(final)
+    monkeypatch.setattr(catalog_backup.os, "getpid", lambda: 222)
+    b = catalog_backup._staging_path(final)
+
+    assert a != b
+    for path in (a, b):
+        assert path.startswith(final) and path.endswith(".tmp")
+        open(path, "wb").close()
+    # list_backups' regex requires the name to END at .backup, so a staging file
+    # is invisible rather than reported as a restore point.
+    assert catalog_backup.list_backups(backup_dir) == []
+
+
+def test_a_concurrent_writer_cannot_have_its_staging_file_stolen(conn, tmp_path, monkeypatch):
+    """
+    Two ``run-due`` runs can overlap — the nightly timer and an operator's
+    on-demand catch-up (issue #214) are both supported and nothing serializes
+    them — and both stage the SAME date's copy. With one shared ``.tmp`` name that
+    interleaving silently tore the day's backup: B's "clear any leftover staging
+    file" unlinked the file A was mid-copy into, A went on writing to the unlinked
+    inode, A verified *its own* copy, and A's ``os.replace`` then promoted whatever
+    now sat at that path — B's half-written file — as the day's verified backup.
+
+    Stand in for process A with a staging file it is still copying into, and
+    assert the writer running here neither removes nor promotes it. A's path is
+    derived THROUGH the module under a different pid, deliberately: revert the
+    staging name to a shared one and both writers resolve to the same file, so
+    this fails rather than passing on a name the test invented.
+    """
+    _populate(conn)
+    backup_dir = str(tmp_path / "backups")
+    os.makedirs(backup_dir)
+    final = os.path.join(backup_dir, catalog_backup.backup_filename(date(2026, 8, 7)))
+    real_pid = os.getpid()
+    with monkeypatch.context() as m:
+        m.setattr(os, "getpid", lambda: real_pid + 1)
+        in_flight = catalog_backup._staging_path(final)
+    with open(in_flight, "wb") as f:
+        f.write(b"process A is still copying into this")
+
+    result = catalog_backup.write_backup(conn, backup_dir, date(2026, 8, 7))
+
+    assert result.ok
+    assert open(in_flight, "rb").read() == b"process A is still copying into this", (
+        "a live concurrent copy's staging file was disturbed"
+    )
+    # The promoted file is this process's verified copy, not the other writer's.
+    assert result.row_counts["cities"] == 3
+    assert os.path.getsize(result.path) > len(b"process A is still copying into this")
+
+
+def test_stale_staging_files_are_swept_but_live_ones_survive(conn, tmp_path):
+    """
+    The old code cleared exactly one ``.tmp`` because the name was deterministic.
+    Now that it names the writer, an abandoned copy would otherwise accumulate
+    forever in the directory an operator inspects during an incident — so age is
+    the test, with a threshold no live copy can fall under (every copy is bounded
+    by BACKUP_TIMEOUT_S). A stranded sidecar goes with the file it belonged to.
+    """
+    _populate(conn, n_cities=1)
+    backup_dir = str(tmp_path / "backups")
+    os.makedirs(backup_dir)
+    final = os.path.join(backup_dir, catalog_backup.backup_filename(date(2026, 8, 7)))
+    stale, fresh = f"{final}.deadhost.1.tmp", f"{final}.livehost.2.tmp"
+    for path in (stale, fresh, stale + "-wal"):
+        open(path, "wb").close()
+    old = time.time() - catalog_backup._STALE_TMP_AFTER_S - 60
+    for path in (stale, stale + "-wal"):
+        os.utime(path, (old, old))
+
+    assert catalog_backup.write_backup(conn, backup_dir, date(2026, 8, 7)).ok
+
+    assert not os.path.exists(stale)
+    assert not os.path.exists(stale + "-wal")
+    assert os.path.exists(fresh), "a live concurrent copy must never be swept"
+
+
 def test_row_counts_describe_the_copy_not_the_live_catalog(conn, tmp_path):
     """
     Provenance has to describe the file an operator is holding. Counting the
