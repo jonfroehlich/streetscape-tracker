@@ -14,10 +14,13 @@ from datetime import date
 import pandas as pd
 import pytest
 
+from streetscape_metadata_tracker import plan_match
 from streetscape_metadata_tracker.analysis import (
+    EARLIEST_PLAUSIBLE_CAPTURE,
     calculate_coverage_stats,
     calculate_pano_stats,
     calculate_run_stats,
+    implausible_capture_date_count,
 )
 from streetscape_metadata_tracker.download_common import standardize_capture_date
 from streetscape_metadata_tracker.json_summarizer import merge_capture_date_histograms
@@ -357,6 +360,147 @@ def test_google_only_age_stats_exclude_third_party():
     assert google_stats.duplicate_stats.total_unique_panos == 1
     assert google_stats.yearly_distribution.counts == {2022: 1}
     assert google_stats.photographer_stats.photographer_counts == {"© Google": 1}
+
+    # The stored catalog columns take the same view for gsv (issue #213): the
+    # third-party pano is the OLDEST imagery in this frame, so an unfiltered
+    # column would report 2018 as the city's oldest capture and 6.0 as its
+    # median age — neither of which describes any Google drive.
+    stats = calculate_run_stats(df, RUN_DATE)
+    assert stats["unique_panos"] == 2  # headline count still counts both
+    assert stats["unique_google_panos"] == 1
+    assert stats["oldest_capture_date"] == "2022-01-15T00:00:00"
+    assert stats["newest_capture_date"] == "2022-01-15T00:00:00"
+    assert stats["median_pano_age_years"] == pytest.approx(4.0, abs=1e-9)
+
+
+def test_run_stats_age_columns_keep_every_pano_when_copyright_unrecorded():
+    """Archival imports (issue #93) recorded no copyright at all, so their
+    Google subset is unknown — the age columns then describe every pano rather
+    than silently reporting an empty subset as 'no imagery'. Median of ages
+    {4.0, 8.0} = 6.0, and the run is otherwise indistinguishable from the
+    filtered case above."""
+    df = make_city_df([("a", CAPTURE_4Y), ("b", CAPTURE_8Y)], copyright_info=None)
+
+    stats = calculate_run_stats(df, RUN_DATE)
+    assert stats["unique_google_panos"] is None  # unknown, not zero
+    assert stats["oldest_capture_date"] == "2018-01-15T00:00:00"
+    assert stats["newest_capture_date"] == "2022-01-15T00:00:00"
+    assert stats["median_pano_age_years"] == pytest.approx(6.0, abs=1e-9)
+
+
+def test_mapillary_run_stats_unaffected_by_copyright_filter():
+    """Mapillary has no copyright concept — every row is provider imagery — so
+    the gsv-only '© Google' narrowing must not touch it. The same frame read as
+    mapillary keeps both panos in the age columns (median 6.0) where gsv would
+    keep neither (the copyright string is not '© Google')."""
+    df = make_city_df([("a", CAPTURE_4Y), ("b", CAPTURE_8Y)], copyright_info="© contributor")
+
+    stats = calculate_run_stats(df, RUN_DATE, provider="mapillary")
+    assert stats["unique_google_panos"] is None
+    assert stats["median_pano_age_years"] == pytest.approx(6.0, abs=1e-9)
+    assert stats["oldest_capture_date"] == "2018-01-15T00:00:00"
+
+    gsv_stats = calculate_run_stats(df, RUN_DATE)
+    assert gsv_stats["unique_google_panos"] == 0
+    assert gsv_stats["median_pano_age_years"] is None
+
+
+# ── Impossible capture dates (issue #213) ───────────────────────────────────
+
+
+def test_impossible_capture_dates_excluded_from_every_dated_stat():
+    """A pano dated after the run that observed it, and one dated before Street
+    View existed, are both dropped from every date-derived statistic — they are
+    real rows in the CSV whose dates cannot be true (corrupt contributor EXIF).
+    Left alone they own the min AND the max, so oldest/newest report 1970 and
+    2611 for the whole city; the surviving 4y/8y panos give median 6.0."""
+    df = pd.DataFrame(
+        [
+            _row(44.000, "ok1", CAPTURE_4Y, "© Google", "OK"),
+            _row(44.001, "ok2", CAPTURE_8Y, "© Google", "OK"),
+            _row(44.002, "future", "2611-09-01", "© Google", "OK"),
+            _row(44.003, "ancient", "1970-08-01", "© Google", "OK"),
+        ],
+        columns=COLUMNS,
+    )
+
+    stats = calculate_run_stats(df, RUN_DATE)
+    # Pano/coverage totals are NOT narrowed: the imagery exists, only its
+    # claimed date is impossible.
+    assert stats["unique_panos"] == 4
+    assert stats["unique_google_panos"] == 4
+    assert stats["status_ok"] == 4
+    assert stats["oldest_capture_date"] == "2018-01-15T00:00:00"
+    assert stats["newest_capture_date"] == "2022-01-15T00:00:00"
+    assert stats["median_pano_age_years"] == pytest.approx(6.0, abs=1e-9)
+
+    # Same narrowing on the per-run JSON path, which is a separate seam: the
+    # histograms would otherwise publish 1970 and 2611 buckets.
+    results = calculate_pano_stats(df, NOW)
+    assert results.age_stats.count == 2
+    assert results.age_stats.avg_pano_age_years == pytest.approx(6.0, abs=1e-9)
+    assert results.age_stats.stdev_pano_age_years == pytest.approx(2.8284271, abs=1e-6)
+    assert results.age_stats.age_percentiles_years["p90"] == pytest.approx(7.6, abs=1e-9)
+    assert results.yearly_distribution.counts == {2018: 1, 2022: 1}
+    assert results.daily_distribution.counts == {"2018-01-15": 1, "2022-01-15": 1}
+    # ...while the headline pano count still sees all four
+    assert results.duplicate_stats.total_unique_panos == 4
+
+
+def test_earliest_plausible_capture_is_provider_specific():
+    """2005 imagery is impossible for Street View (launched 2007) but ordinary
+    for Mapillary, whose contributors upload genuinely old photographs — the
+    same frame therefore ages differently per provider, and neither answer is a
+    fallback for the other."""
+    df = make_city_df([("old", "2005-06-01"), ("new", CAPTURE_4Y)], copyright_info=None)
+
+    gsv = calculate_run_stats(df, RUN_DATE)
+    assert gsv["oldest_capture_date"] == "2022-01-15T00:00:00"
+
+    mapillary = calculate_run_stats(df, RUN_DATE, provider="mapillary")
+    assert mapillary["oldest_capture_date"] == "2005-06-01T00:00:00"
+
+
+def test_capture_date_on_run_date_survives_the_upper_bound():
+    """The ceiling is inclusive: a pano captured ON the run date is ordinary
+    (GSV's month-precision dates are pinned to the 1st, so they can only round
+    toward the past), and dropping it would erase the freshest imagery of every
+    city collected the day it was driven."""
+    df = make_city_df([("fresh", RUN_DATE.isoformat())])
+    stats = calculate_run_stats(df, RUN_DATE)
+    assert stats["median_pano_age_years"] == 0.0
+    assert stats["newest_capture_date"] == "2026-01-15T00:00:00"
+
+    # One day past it is not ordinary — that pano was captured after the query
+    # that saw it.
+    df = make_city_df([("fresh", "2026-01-16"), ("real", CAPTURE_4Y)])
+    stats = calculate_run_stats(df, RUN_DATE)
+    assert stats["newest_capture_date"] == "2022-01-15T00:00:00"
+
+
+def test_implausible_capture_date_count_reports_the_repairable_runs():
+    """The count a repair pass keys on (scripts/recompute_run_stats.py) reads
+    the same rule the stats do, so 'this run's published JSON is wrong' can
+    never disagree with 'this run's stats dropped something'."""
+    df = pd.DataFrame(
+        [
+            _row(44.000, "ok1", CAPTURE_4Y, "© Google", "OK"),
+            _row(44.001, "future", "2611-09-01", "© Google", "OK"),
+            _row(44.002, "ancient", "1970-08-01", "© Google", "OK"),
+            _row(44.003, "nodate", None, "© Google", "NO_DATE"),
+            _row(44.004, None, None, None, "ZERO_RESULTS"),
+        ],
+        columns=COLUMNS,
+    )
+    assert implausible_capture_date_count(df, NOW) == 2
+    # A dateless pano is not an implausible one — it never claimed a date.
+    assert implausible_capture_date_count(make_city_df([("a", CAPTURE_4Y)]), NOW) == 0
+
+
+def test_plausibility_floor_agrees_with_the_driving_page_guard():
+    """plan_match keeps its own literal so the pure-logic module stays
+    stdlib-only; two copies of a rule drift, so pin them together here."""
+    assert plan_match.EARLIEST_PLAUSIBLE_CAPTURE == EARLIEST_PLAUSIBLE_CAPTURE["gsv"]
 
 
 # ── json_summarizer.merge_capture_date_histograms ───────────────────────────

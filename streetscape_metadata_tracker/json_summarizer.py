@@ -396,7 +396,7 @@ def generate_city_metadata_summary_as_json(
     # Calculate all pano statistics. Archival GSV imports (issue #93) never
     # captured copyright_info; for those runs the Google subset is unknown,
     # so the google_panos block is omitted and a flag records why.
-    all_pano_stats = calculate_pano_stats(df, now)
+    all_pano_stats = calculate_pano_stats(df, now, provider=provider)
     gsv_copyright_available = True
     if provider == "gsv":
         present_rows = df[df["status"].isin(PRESENT_STATUSES)]
@@ -404,7 +404,7 @@ def generate_city_metadata_summary_as_json(
             present_rows["copyright_info"].notna().any()
         )
     google_pano_stats = (
-        calculate_pano_stats(df, now, google_only=True)
+        calculate_pano_stats(df, now, google_only=True, provider=provider)
         if provider == "gsv" and gsv_copyright_available
         else None
     )
@@ -528,6 +528,21 @@ def regenerate_run_json(conn, run_id: int, data_dir: str) -> str | None:
         logger.warning(f"regenerate_run_json: city {row['city_id']} unresolvable")
         return None
 
+    # Grid geometry comes from the RUN's own filename, not the city's current
+    # frozen grid. For the self-heal case the two are identical — the filename
+    # was generated from that frozen grid seconds earlier — but a historical run
+    # may have been collected on a different lattice: a legacy import, or a city
+    # since resized catalog-only by scripts/cap_oversized_grids.py (#166). In one
+    # catalog snapshot 161 of 1,160 runs were in that position, and relabelling
+    # such a snapshot with today's geometry would misreport what was sampled
+    # (width/height/step and the area_km2 derived from them). An unparseable
+    # name can only be a hand-made file, so fall back to the city's grid.
+    try:
+        parsed = parse_filename(row["csv_filename"])
+        grid_w, grid_h, grid_step = parsed.width_meters, parsed.height_meters, parsed.step_meters
+    except ValueError:
+        grid_w, grid_h, grid_step = city.grid_width_m, city.grid_height_m, city.step_m
+
     df = load_city_csv_file(csv_path)
     y, m, d = (int(x) for x in row["run_date"].split("-"))
     json_path = generate_city_metadata_summary_as_json(
@@ -536,9 +551,9 @@ def regenerate_run_json(conn, run_id: int, data_dir: str) -> str | None:
         city.city_name,
         city.state_name,
         city.country_name,
-        city.grid_width_m,
-        city.grid_height_m,
-        city.step_m,
+        grid_w,
+        grid_h,
+        grid_step,
         force_recreate_file=True,
         run_date=date(y, m, d),
         is_baseline=bool(row["is_baseline"]),
@@ -1033,10 +1048,11 @@ def _compact_capture_years(counts: dict[str, Any] | None, today: date) -> list[A
     themselves meaningful — a gap between drives).
 
     Source is deliberately the per-run JSON's ``google_panos`` block, which is
-    already filtered to official ``© Google`` imagery. That makes the sparkline
-    *more* trustworthy than the ``newest_capture_date`` column beside it, since
-    issue #213's corrupt third-party EXIF only contaminates the ``all_panos``
-    path.
+    already filtered to official ``© Google`` imagery. Until issue #213 that
+    made the sparkline *more* trustworthy than the ``newest_capture_date``
+    column beside it, whose ``all_panos`` source carried corrupt third-party
+    EXIF; the catalog's capture-date columns are now filtered the same way, so
+    the two views finally describe one population.
     """
     if not counts:
         return None
@@ -1072,13 +1088,14 @@ def _observation_block(run: Any, today: date) -> dict[str, Any]:
     """
     One provider's observed imagery for a city, as the page renders it.
 
-    ``newest_capture`` is filtered through ``plan_match.plausible_capture_date``
-    rather than copied: the catalog's capture-date columns are computed over
-    every pano in a run, including third-party photospheres whose EXIF can be
-    corrupt, so 21 production runs currently read as captured in 2611-2612 and
-    75 as captured before Street View existed. Publishing those would put an
-    absurd date on the page and manufacture a ``driven_unplanned`` verdict —
-    the exact claim this page exists to make — out of a typo.
+    ``newest_capture`` is still filtered through
+    ``plan_match.plausible_capture_date`` rather than copied, even though issue
+    #213 fixed the columns at the source: a catalog row written before that fix
+    and not yet recomputed still carries 2611, and the fix cannot help a
+    corrupt date that happens to carry a ``© Google`` copyright. Publishing one
+    would put an absurd date on the page and manufacture a ``driven_unplanned``
+    verdict — the exact claim this page exists to make — out of a typo, so the
+    render-time guard stays as the last line rather than the only one.
     """
     newest = plan_match.plausible_capture_date(run["newest_capture_date"], today)
     block: dict[str, Any] = {

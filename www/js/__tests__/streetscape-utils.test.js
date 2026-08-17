@@ -28,6 +28,7 @@ const {
   recencyColor,
   FRESHNESS_BUCKETS,
   isGoogleCopyright,
+  isPlausibleCaptureDate,
   panoDateOrNull,
   googleSharePercent,
   buildFilledHistogram,
@@ -447,6 +448,38 @@ test("isGoogleCopyright: matches only the exact © Google string", () => {
   assert.equal(isGoogleCopyright(null), false);
   assert.equal(isGoogleCopyright(undefined), false);
   assert.equal(isGoogleCopyright(""), false);
+});
+
+// --- isPlausibleCaptureDate: the JS mirror of the #213 bound ----------------
+
+test("isPlausibleCaptureDate: rejects impossible dates, keeps real ones", () => {
+  assert.equal(isPlausibleCaptureDate(panoDateOrNull("2022-06-01"), "gsv"), true);
+  // The two shapes seen in production contributor EXIF
+  assert.equal(isPlausibleCaptureDate(panoDateOrNull("2611-09-01"), "gsv"), false);
+  assert.equal(isPlausibleCaptureDate(panoDateOrNull("1970-08-01"), "gsv"), false);
+  // Absent/unparseable is handled here too, so callers need one check
+  assert.equal(isPlausibleCaptureDate(null, "gsv"), false);
+  assert.equal(isPlausibleCaptureDate(panoDateOrNull("nonsense"), "gsv"), false);
+});
+
+test("isPlausibleCaptureDate: the floor is per-provider, not the color-scale launch date", () => {
+  // 2005 predates Street View but is ordinary for Mapillary, whose
+  // contributors upload genuinely old photographs.
+  assert.equal(isPlausibleCaptureDate(panoDateOrNull("2005-06-01"), "gsv"), false);
+  assert.equal(isPlausibleCaptureDate(panoDateOrNull("2005-06-01"), "mapillary"), true);
+  // ...and the bound is NOT PROVIDERS[p].launchDate, which anchors the color
+  // ramp: 2010 Mapillary imagery predates that date and must still pass.
+  assert.ok(panoDateOrNull("2010-01-01") < PROVIDERS.mapillary.launchDate);
+  assert.equal(isPlausibleCaptureDate(panoDateOrNull("2010-01-01"), "mapillary"), true);
+  // An unknown provider falls back to the loosest floor rather than dropping
+  // everything before 2007.
+  assert.equal(isPlausibleCaptureDate(panoDateOrNull("2005-06-01"), "who"), true);
+});
+
+test("isPlausibleCaptureDate: the mirrored floors match analysis.EARLIEST_PLAUSIBLE_CAPTURE", () => {
+  assert.equal(PROVIDERS.gsv.earliestPlausibleCapture.toISOString().slice(0, 10), "2007-01-01");
+  assert.equal(
+    PROVIDERS.mapillary.earliestPlausibleCapture.toISOString().slice(0, 10), "2004-01-01");
 });
 
 // --- googleSharePercent: divide-by-zero guard (B1–B4) ----------------------

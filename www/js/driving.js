@@ -167,9 +167,10 @@ const SPARK_BARS_MAX = 20;
  * harvester, which has never been run.
  *
  * Data comes from the per-run JSON's `google_panos` block, which is already
- * filtered to official © Google imagery — so unlike the median-age column
- * beside it, this is unaffected by the corrupt third-party capture dates in
- * issue #213.
+ * filtered to official © Google imagery. That used to make it the only column
+ * here immune to the corrupt third-party capture dates of issue #213; the
+ * catalog's capture-date columns are now filtered the same way, so this and
+ * the median-age column beside it finally describe one population.
  *
  * Bars are `aria-hidden`; the accessible content is the text summary, the same
  * split `coverageCellHtml` uses for its bar.
@@ -374,8 +375,9 @@ const DRIVING_COLUMNS = [
     type: "text",
     initial: "desc",
     title:
-      "Most recent capture date observed in the latest snapshot. Blank where the catalog's " +
-      "value is impossible (a corrupt third-party EXIF date) and was therefore suppressed.",
+      "Most recent official © Google capture date observed in the latest snapshot. Blank for a " +
+      "city with no Google imagery, or where the catalog's value is impossible (a corrupt EXIF " +
+      "date) and was therefore suppressed.",
     cell: (r) => `<td>${escapeHtml(r.newestCapture ?? "—")}</td>`,
   },
   {
@@ -397,8 +399,9 @@ const DRIVING_COLUMNS = [
     unit: " yrs",
     digits: 1,
     title:
-      "Median age of the city's panoramas. A recent newest-capture with a high median means a " +
-      "partial refresh, not a full re-drive.",
+      "Median age of the city's official © Google panoramas. A recent newest-capture with a " +
+      "high median means a partial refresh, not a full re-drive. Blank where a city's only " +
+      "imagery is third-party photospheres — no Google drive to date.",
     cell: (r) =>
       `<td>${r.medianAge == null ? "—" : `${formatCellNumber(r.medianAge, 1)} yrs`}</td>`,
   },
