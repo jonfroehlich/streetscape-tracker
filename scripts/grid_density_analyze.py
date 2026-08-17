@@ -749,10 +749,14 @@ def make_distribution_figures(areas: dict, fig_dir: str) -> list[str]:
     ax.axvline(10.0, color=INK_2, linewidth=1, linestyle="--", alpha=0.55)
     # The secondary sub-5 m mode is a finding, not noise: it is where nearest
     # neighbour stops measuring the along-track capture interval and starts
-    # measuring overlapping passes (one-way pairs, re-drives, multi-lane).
+    # measuring the distance to a *different roadway*. Which roadway (a second
+    # pass, a bridge deck over the road beneath, an intersection) is deliberately
+    # NOT claimed here — see the writeup's mechanism table; the label says only
+    # what the distance data supports.
     worst = max(sub5, key=lambda k: sub5[k])
     ax.annotate(
-        f"second mode ≈2.6 m\n{worst.title()}: {sub5[worst]:.1f}% under 5 m\n(overlapping passes)",
+        f"second mode ≈2.6 m\n{worst.title()}: {sub5[worst]:.1f}% under 5 m\n"
+        f"(neighbour on another roadway)",
         xy=(2.7, 4.0),
         xytext=(0.6, 17),
         textcoords="data",

@@ -74,15 +74,39 @@ share, not the median, is the evidence the interval is machine-regulated, since 
 distribution can have the same median. The second mode sits at **≈2.6 m** and carries
 **0.4% / 0.7% / 11.4%** of panos respectively.
 
-That sub-5 m mode is where the statistic stops answering the question. Nearest-neighbour
-is a *point-set* measure, not an along-track capture interval: where two passes of a
-one-way pair, a divided road, or a re-drive coexist, a pano's nearest neighbour belongs to
-a *different pass*. So Seattle's 11.4% is not evidence of finer sampling downtown — it is
-overlapping coverage, and it is why Seattle's p25 (7.9 m) drops below the regulated
-interval while its p75 (10.1 m) does not. **Quote the 9–11 m band share, not the median,
-when the question is how finely GSV samples.** GSV exposes no run/sequence identifier, so
-this cannot be corrected for here; Mapillary's `sequence_id` makes the same correction
-trivial, which is the sharpest methodological difference between the two providers.
+That sub-5 m mode is where the statistic stops answering the question. Nearest-neighbour is
+a *point-set* measure, not an along-track capture interval: wherever two roadways run close
+together in plan view, a pano's nearest neighbour is on the *other* roadway rather than
+ahead of or behind it on its own. So Seattle's 11.4% is not evidence of finer sampling
+downtown, and it is why Seattle's p25 (7.9 m) drops below the regulated interval while its
+p75 (10.1 m) does not. **Quote the 9–11 m band share, not the median, when the question is
+how finely GSV samples.**
+
+**Which roadways produce it is an open question — the candidate mechanisms are not
+distinguished here.** At least three would produce sub-5 m neighbours, and they predict
+different things:
+
+| mechanism | predicts |
+|---|---|
+| a second pass on the same roadway (opposite direction, or an adjacent lane) | mass at roughly lane-width scale, concentrated on `oneway=False` edges |
+| **bridges, overpasses and interchanges** | near-**zero** planar separation, since projecting to 2D collapses the vertical gap between a deck and the road beneath it; concentrated on `bridge`/`tunnel` edges |
+| intersections | concentrated near nodes with `street_count` >= 3 |
+
+The one discriminator the distance data alone supplies argues **against** vertical stacking
+being the main driver: it would put mass at near-zero, and there is almost none. Seattle
+has **0.19%** under 1 m, while **10.05%** sits in 2–4 m in a tight peak centred ≈2.6 m —
+roughly a lane width, not a deck-over-road coincidence. That is suggestive, not a test:
+roadways crossing at an angle still separate by a few metres in projection, so the
+mechanisms are not cleanly separable by distance alone.
+
+Testing it needs no new collection. The cached GraphML for these areas already retains
+`bridge`, `tunnel`, `junction`, `lanes`, `oneway` and node `street_count`, so tagging each
+sub-5 m pano by what it sits on is an offline join against artifacts already on disk.
+Until that runs, treat the mechanism as unattributed.
+
+GSV exposes no run/sequence identifier, so none of this can be corrected for at the pano
+level; Mapillary's `sequence_id` makes the same correction trivial, which is the sharpest
+methodological difference between the two providers.
 
 **1b. Query→pano offsets do not match Google's documented default radius.** The collector
 sets no `radius`, so the documented 50 m default should apply, and it describes the bulk
