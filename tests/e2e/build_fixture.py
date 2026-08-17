@@ -53,6 +53,7 @@ from streetscape_metadata_tracker.fileutils import load_city_csv_file  # noqa: E
 from streetscape_metadata_tracker.json_summarizer import (  # noqa: E402
     generate_aggregate_v2,
     generate_city_metadata_summary_as_json,
+    generate_driving_plan_summary,
     generate_streetwalk_manifest,
 )
 from tests.conftest import (  # noqa: E402
@@ -101,6 +102,12 @@ def _add_gsv_run(conn, city_id, city_name, state, country, panos, run_date, grid
         make_city_df(panos, run_date=run_date, grid_origin=grid_origin, n_empty=n_empty), csv_path
     )
     json_path = _write_summary(csv_path, city_name, state, country, run_date)
+    # Capture dates come straight from the synthetic panos rather than being
+    # invented here, so the driving-plan join (issue #176) has real imagery
+    # dates to contradict Google's published windows with — that contradiction
+    # is the whole point of the Driving page, and it cannot be observed at all
+    # without a newest_capture_date on the run.
+    captures = sorted(capture for _, capture in panos if capture)
     return db.register_run(
         conn,
         city_id=city_id,
@@ -109,6 +116,8 @@ def _add_gsv_run(conn, city_id, city_name, state, country, panos, run_date, grid
         json_filename=os.path.basename(json_path),
         unique_panos=len(panos),
         unique_google_panos=len(panos),
+        oldest_capture_date=captures[0] if captures else None,
+        newest_capture_date=captures[-1] if captures else None,
     )
 
 
@@ -402,10 +411,163 @@ def build():
             flat_only=True,
         )
 
-        # 5) Aggregate → cities.json.gz (schema v3) + the streetwalk sidecar
-        # manifest, both written into FIXTURE_DIR (as the real pipeline does).
+        # 5) A driving-plan snapshot to join against (issue #176), covering the
+        # three cases the Driving page has to render:
+        #   - Alphastate: a CLOSED 2019 window against Alpha City's 2020s GSV
+        #     imagery — the driven_unplanned contradiction the page exists for,
+        #     and the only verdict that needs a gsv run to observe.
+        #   - Zerostate: an OPEN window, so the page also renders planned_open.
+        #   - Mapstate: closed, and Map-Ville is Mapillary-only, so it has no
+        #     GSV capture date to contradict the plan with — the ordinary
+        #     "campaign closed, nothing observed" row.
+        #   - Chubut: matches no tracked city, the collection-target case the
+        #     summary below the table reports.
+        # An earlier snapshot in which Alphastate's campaign was still open,
+        # so the published artifact carries a real revision (Yes -> No) and the
+        # page's revision log has something to render. Google overwrites the
+        # feed in place, so this pair is the whole reason the archive exists.
+        earlier_id = db.register_driving_plan_snapshot(
+            conn,
+            fetch_date=date(2026, 4, 10),
+            sha256="e2efixture-earlier",
+            record_count=3,
+            changed=True,
+            artifact_filename="gsv_driving_plan_2026-04-10.json.gz",
+        )
+        db.replace_driving_plan_entries(
+            conn,
+            earlier_id,
+            [
+                (
+                    earlier_id,
+                    "Testland",
+                    "TL",
+                    "SV",
+                    "Alphastate",
+                    "Alpha County",
+                    "Yes",
+                    "2019-01-01T08:00:00.000Z",
+                    "2019-01-01",
+                    "2019-06-01T07:00:00.000Z",
+                    "2019-06-01",
+                ),
+                (
+                    earlier_id,
+                    "Testland",
+                    "TL",
+                    "SV",
+                    "Zerostate",
+                    "Zero County",
+                    "Yes",
+                    "2026-03-01T08:00:00.000Z",
+                    "2026-03-01",
+                    "2026-11-01T07:00:00.000Z",
+                    "2026-11-01",
+                ),
+                (
+                    earlier_id,
+                    "Testland",
+                    "TL",
+                    "SV",
+                    "Mapstate",
+                    "Map County",
+                    "No",
+                    "2019-01-01T08:00:00.000Z",
+                    "2019-01-01",
+                    "2019-06-01T07:00:00.000Z",
+                    "2019-06-01",
+                ),
+                (
+                    earlier_id,
+                    "Argentina",
+                    "AR",
+                    "SV",
+                    "Chubut",
+                    "Esquel",
+                    "Yes",
+                    "2026-01-01T08:00:00.000Z",
+                    "2026-01-01",
+                    "2026-12-31T08:00:00.000Z",
+                    "2026-12-31",
+                ),
+            ],
+        )
+
+        snapshot_id = db.register_driving_plan_snapshot(
+            conn,
+            fetch_date=date(2026, 4, 20),
+            sha256="e2efixture",
+            record_count=3,
+            changed=True,
+            artifact_filename="gsv_driving_plan_2026-04-20.json.gz",
+        )
+        db.replace_driving_plan_entries(
+            conn,
+            snapshot_id,
+            [
+                # (snapshot, country, code, svspc, region, district, publish,
+                #  start_raw, start, end_raw, end) — raw precedes parsed.
+                (
+                    snapshot_id,
+                    "Testland",
+                    "TL",
+                    "SV",
+                    "Alphastate",
+                    "Alpha County",
+                    "No",
+                    "2019-01-01T08:00:00.000Z",
+                    "2019-01-01",
+                    "2019-06-01T07:00:00.000Z",
+                    "2019-06-01",
+                ),
+                (
+                    snapshot_id,
+                    "Testland",
+                    "TL",
+                    "SV",
+                    "Zerostate",
+                    "Zero County",
+                    "Yes",
+                    "2026-03-01T08:00:00.000Z",
+                    "2026-03-01",
+                    "2026-11-01T07:00:00.000Z",
+                    "2026-11-01",
+                ),
+                (
+                    snapshot_id,
+                    "Testland",
+                    "TL",
+                    "SV",
+                    "Mapstate",
+                    "Map County",
+                    "No",
+                    "2019-01-01T08:00:00.000Z",
+                    "2019-01-01",
+                    "2019-06-01T07:00:00.000Z",
+                    "2019-06-01",
+                ),
+                (
+                    snapshot_id,
+                    "Argentina",
+                    "AR",
+                    "SV",
+                    "Chubut",
+                    "Esquel",
+                    "Yes",
+                    "2026-01-01T08:00:00.000Z",
+                    "2026-01-01",
+                    "2026-12-31T08:00:00.000Z",
+                    "2026-12-31",
+                ),
+            ],
+        )
+
+        # 6) Aggregate → cities.json.gz (schema v3), the streetwalk sidecar
+        # manifest and the driving-plan join, all written into FIXTURE_DIR (as
+        # the real pipeline does).
         summary = generate_aggregate_v2(conn, FIXTURE_DIR)
         generate_streetwalk_manifest(conn, FIXTURE_DIR)
+        generate_driving_plan_summary(conn, FIXTURE_DIR)
     finally:
         conn.close()
         shutil.rmtree(db_tmp, ignore_errors=True)

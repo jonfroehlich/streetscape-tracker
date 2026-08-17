@@ -439,6 +439,11 @@ def test_site_header_navigates_and_clears_the_floating_panels(page: Page, base_u
     page.wait_for_url("**/grid.html")
     expect(page.locator("h1")).to_contain_text("Grid coverage")
 
+    # The Driving nav item reaches the plan-vs-observed join (issue #176).
+    page.locator('.site-nav a[href="driving.html"]').click()
+    page.wait_for_url("**/driving.html")
+    expect(page.locator("h1")).to_contain_text("Driving plan")
+
     # The city page carries the same header, and its "Map" item is the way
     # back (it replaced the old standalone #back-link).
     page.goto(f"{base_url}/city.html?file={ALPHA_LATEST}")
@@ -998,7 +1003,98 @@ def test_distribution_strip_bars_are_inert_without_a_matching_filter(page: Page,
     assert errors == []
 
 
-@pytest.mark.parametrize("path", ["grid.html", "streets.html"])
+def test_driving_page_joins_the_plan_against_observed_imagery(page: Page, base_url):
+    """
+    The Driving page's whole reason to exist is the contradiction: Google's
+    feed says Alphastate's campaign closed in 2019, while Alpha City's imagery
+    was captured in 2024. If that row ever renders as a bare "campaign closed",
+    the page is actively misleading — a closed plan entry would read as
+    evidence the area was not driven, which is exactly the inference the real
+    Israel data disproves.
+    """
+    errors = _capture_errors(page)
+    page.goto(f"{base_url}/driving.html")
+
+    expect(page.locator("#driving-table-wrap")).to_be_visible()
+    row = page.locator("tbody tr", has=page.locator("th", has_text="Alpha City"))
+    expect(row).to_contain_text("Driven, unplanned")
+
+    # The archive's own thinness is stated, not left for the reader to assume.
+    expect(page.locator("#driving-provenance")).to_contain_text("2026-04-20")
+    expect(page.locator("#driving-provenance")).to_contain_text("driving distance")
+
+    # A city Google has an open window for reads as such.
+    zero = page.locator("tbody tr", has=page.locator("th", has_text="Zero City"))
+    expect(zero).to_contain_text("Driving now")
+
+    assert errors == []
+
+
+def test_driving_page_lists_untracked_plan_areas_as_rows(page: Page, base_url):
+    """
+    The "Tracked?" column only carries information if untracked places are rows
+    too — otherwise it reads "yes" on every row and answers nothing. Chubut is
+    in Google's plan and has no city in the fixture, so it must appear as a row
+    marked not tracked, with its observed columns empty rather than zeroed.
+    """
+    errors = _capture_errors(page)
+    page.goto(f"{base_url}/driving.html")
+    expect(page.locator("#driving-table-wrap")).to_be_visible()
+
+    row = page.locator("tbody tr", has=page.locator("th", has_text="Chubut"))
+    expect(row).to_contain_text("Not tracked")
+    expect(row).to_contain_text("Driving now")
+    # No run to open, so no link out — degrade, don't fabricate.
+    expect(row.locator("th a")).to_have_count(0)
+
+    # And the filter can isolate either universe.
+    page.select_option("[data-filter='scope']", "area")
+    expect(page.locator("tbody tr")).to_have_count(1)
+
+    assert errors == []
+
+
+def test_driving_page_shows_capture_history_and_plan_revisions(page: Page, base_url):
+    """
+    The two halves of "the past". The sparkline is the observable drive history
+    (Alpha City was captured in 2018, 2020 and 2024 — three drives a single
+    median age would hide), and the revision log is the archive's own reason to
+    exist: Google overwrites the feed in place, so a Yes->No flip is
+    unobservable to anyone who was not watching at the time.
+    """
+    errors = _capture_errors(page)
+    page.goto(f"{base_url}/driving.html")
+    expect(page.locator("#driving-table-wrap")).to_be_visible()
+
+    row = page.locator("tbody tr", has=page.locator("th", has_text="Alpha City"))
+    spark = row.locator(".spark-bar")
+    expect(spark.first).to_be_attached()
+    # 2018..2024 inclusive is seven year slots, four of them empty.
+    assert spark.count() == 7
+
+    revisions = page.locator("#driving-revisions")
+    expect(revisions).to_be_visible()
+    expect(revisions).to_contain_text("2026-04-10")
+    expect(revisions).to_contain_text("1 campaign closed")
+    expect(revisions).to_contain_text("Alphastate")
+
+    assert errors == []
+
+
+def test_driving_page_row_links_to_the_city_page(page: Page, base_url):
+    """The artifact carries csv_filename precisely so a row can link out —
+    city.html is addressed by run filename, not city_id."""
+    errors = _capture_errors(page)
+    page.goto(f"{base_url}/driving.html")
+    expect(page.locator("#driving-table-wrap")).to_be_visible()
+
+    page.locator("tbody th a").first.click()
+    page.wait_for_url("**/city.html?file=**")
+
+    assert errors == []
+
+
+@pytest.mark.parametrize("path", ["grid.html", "streets.html", "driving.html"])
 def test_city_name_cell_is_truncated_not_left_to_overflow(page: Page, base_url, path):
     """The committed fixture's city names are short ("Alpha City"), so this
     can't observe an actual ellipsis firing — it instead confirms the CSS rule
@@ -1022,7 +1118,7 @@ def test_city_name_cell_is_truncated_not_left_to_overflow(page: Page, base_url, 
     assert errors == []
 
 
-@pytest.mark.parametrize("path", ["grid.html", "streets.html"])
+@pytest.mark.parametrize("path", ["grid.html", "streets.html", "driving.html"])
 def test_default_columns_fit_without_scrolling_the_page_sideways(page: Page, base_url, path):
     """Both tables scrolled horizontally before #188, which is treated as a bug
     rather than a layout choice. The default preset exists to fit the page's

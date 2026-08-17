@@ -21,9 +21,20 @@ Politeness: one unauthenticated request per day, enforced by the ingest gate
 uses stdlib urllib — deliberately not the aiohttp/backoff machinery the
 collectors need, since this is one request to one static URL once a day.
 
-Storage: artifacts live OUTSIDE data/ (default: <repo>/archive/gsv_driving_plan/)
-because data/ is rsynced to the public web server and its whitelist publishes
-every *.json.gz — archiving there would republish Google's content.
+Storage: the RAW artifacts live OUTSIDE data/ (default:
+<repo>/archive/gsv_driving_plan/) because data/ is rsynced to the public web
+server and its whitelist publishes every *.json.gz — archiving there would
+republish Google's feed verbatim. That still holds and is why this directory
+has not moved.
+
+What DID change: `json_summarizer.generate_driving_plan_summary` publishes
+`data/driving_plan.json.gz`, a DERIVED join keyed by our own cities that
+carries only the plan fields a verdict rests on, with attribution and the
+source URL. Shipping that was a deliberate reversal — the feed is a public,
+unauthenticated URL, this is a university research tool, and since Google
+overwrites the feed in place the dated archive is the contribution nobody else
+is keeping. The distinction the layout preserves is mirror vs. analysis: the
+raw bytes stay here, the derived join ships.
 """
 
 import gzip

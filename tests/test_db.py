@@ -181,6 +181,55 @@ def test_diff_storage(conn, city):
     assert row["panos_added"] == 5 and row["grid_aligned"] == 1
 
 
+def _diff(conn, city, from_run_id, to_run_id, **overrides):
+    kwargs = dict(
+        city_id=city,
+        from_run_id=from_run_id,
+        to_run_id=to_run_id,
+        grid_aligned=True,
+        panos_added=0,
+        panos_removed=0,
+        panos_persisted=0,
+        capture_date_changed=0,
+        points_gained_coverage=0,
+        points_lost_coverage=0,
+        coverage_delta_pct=0.0,
+        detail_filename=None,
+    )
+    kwargs.update(overrides)
+    return db.record_diff(conn, **kwargs)
+
+
+def test_latest_runs_emits_one_row_per_city_provider_even_when_re_diffed(conn, city):
+    # run_diffs is UNIQUE on (from_run_id, to_run_id), NOT on to_run_id alone,
+    # so a run diffed against two different predecessors — what happens when an
+    # earlier run is purged and the diff recomputed — matches the join twice. A
+    # bare LEFT JOIN emitted that (city, provider) twice, and the caller's
+    # last-write-wins dict then advertised whichever baseline SQLite happened
+    # to return last.
+    r1 = db.register_run(conn, city_id=city, run_date=date(2026, 1, 1), csv_filename="a.csv.gz")
+    r2 = db.register_run(conn, city_id=city, run_date=date(2026, 4, 1), csv_filename="b.csv.gz")
+    r3 = db.register_run(conn, city_id=city, run_date=date(2026, 7, 1), csv_filename="c.csv.gz")
+    _diff(conn, city, r1, r3, capture_date_changed=11)
+    _diff(conn, city, r2, r3, capture_date_changed=22)
+
+    rows = db.get_latest_runs_all(conn)
+
+    assert len(rows) == 1, "one row per (city, provider), regardless of how many diffs point at it"
+    # And the choice is explicit rather than arbitrary: the most recently
+    # computed comparison (highest diff_id) wins.
+    assert rows[0]["capture_date_changed"] == 22
+
+
+def test_latest_runs_still_returns_a_run_that_was_never_diffed(conn, city):
+    # The join must stay a LEFT one — a first run has no diff, and dropping it
+    # from the aggregate would erase every newly-collected city.
+    db.register_run(conn, city_id=city, run_date=date(2026, 7, 1), csv_filename="only.csv.gz")
+    rows = db.get_latest_runs_all(conn)
+    assert len(rows) == 1
+    assert rows[0]["capture_date_changed"] is None
+
+
 def test_api_usage_ledger(conn):
     d = date(2026, 7, 1)
     assert db.get_api_usage(conn, d) == 0
