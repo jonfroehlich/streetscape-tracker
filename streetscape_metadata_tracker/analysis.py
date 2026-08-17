@@ -9,6 +9,7 @@ components like json_summarizer.py, check_status_codes.py, and cli.py.
 import logging
 from collections import Counter
 from dataclasses import dataclass
+from datetime import date
 from typing import Any, ClassVar
 
 import numpy as np
@@ -63,6 +64,106 @@ def is_google_copyright(copyright_info: pd.Series) -> pd.Series:
     NaN (copyright never recorded, e.g. archival imports) compares False.
     """
     return copyright_info == GOOGLE_COPYRIGHT
+
+
+# Earliest date each provider's imagery can plausibly carry. A capture date
+# outside [this, the date we observed it] cannot be true, and a date that
+# cannot be true is not a usable date (issue #213) — contributor photospheres
+# reach us with corrupt EXIF, and on the production catalog that put 22 runs in
+# 2611-2612 and 75 before Street View existed, poisoning oldest/newest/median
+# for the whole city off one bad pano.
+#
+# The Mapillary floor is deliberately looser than its 2013 founding and matches
+# download_mapillary.captured_at_to_iso_date, which applies the identical rule
+# at decode: contributors upload genuinely old photographs, so the bound marks
+# impossible values, not merely surprising ones.
+EARLIEST_PLAUSIBLE_CAPTURE = {
+    "gsv": date(2007, 1, 1),  # Street View launched 2007-05-25
+    "mapillary": date(2004, 1, 1),
+}
+# Floor for a provider not listed above. GSV's is the stricter of the two, but
+# an unknown provider is more likely to resemble a contributor-fed archive than
+# a fleet, so default to the loose one and let it be tightened deliberately.
+_DEFAULT_EARLIEST_PLAUSIBLE_CAPTURE = EARLIEST_PLAUSIBLE_CAPTURE["mapillary"]
+
+
+def plausible_capture_mask(
+    capture_dates: pd.Series, now: pd.Timestamp, provider: str = "gsv"
+) -> pd.Series:
+    """
+    Boolean mask: capture dates that could actually be true.
+
+    Args:
+        capture_dates: datetime64 Series of capture dates (NaT allowed).
+        now: the moment the imagery was observed — a run's run_date for stored
+            stats, wall-clock for a live summary. Nothing can be captured after
+            the query that saw it, so this is the upper bound; it is inclusive,
+            because a pano captured on the run date is ordinary (and GSV's
+            month-precision dates are pinned to the 1st, so they can only ever
+            round *down* toward the past).
+        provider: imagery provider, selecting the earliest plausible date.
+
+    Returns:
+        Boolean Series aligned to the input. NaT compares False: an unreadable
+        date is no more usable than an impossible one.
+    """
+    earliest = EARLIEST_PLAUSIBLE_CAPTURE.get(provider, _DEFAULT_EARLIEST_PLAUSIBLE_CAPTURE)
+    return capture_dates.between(pd.Timestamp(earliest), now)
+
+
+def _dated_unique(df: pd.DataFrame) -> pd.DataFrame:
+    """One row per dated pano (status OK, deduped), capture_date as datetime64."""
+    dated = df[df["status"] == "OK"].drop_duplicates(subset=["pano_id"]).copy()
+    if not pd.api.types.is_datetime64_any_dtype(dated["capture_date"]):
+        # coerce, not raise: an unparseable date reaches the same fate as an
+        # implausible one (dropped by the mask) rather than killing a whole run
+        dated["capture_date"] = pd.to_datetime(dated["capture_date"], errors="coerce")
+    return dated
+
+
+def dated_unique_panos(df: pd.DataFrame, now: pd.Timestamp, provider: str = "gsv") -> pd.DataFrame:
+    """
+    The subset of a run every date-derived statistic is computed over.
+
+    One pano per pano_id (a pano snapped from several grid points must
+    contribute its age once), status OK (a NO_DATE pano carries no usable
+    date), and a capture date that passes plausible_capture_mask. Age stats,
+    the capture-year histogram and the daily histogram all read this one
+    frame, so they can never disagree about which panos count.
+
+    Args:
+        df: run DataFrame, or a copyright-filtered subset of one.
+        now: observation date; also the upper plausibility bound.
+        provider: imagery provider (selects the earliest plausible date).
+
+    Returns:
+        A new DataFrame with capture_date coerced to datetime64.
+    """
+    dated = _dated_unique(df)
+    return dated[plausible_capture_mask(dated["capture_date"], now, provider)]
+
+
+def implausible_capture_date_count(
+    df: pd.DataFrame, now: pd.Timestamp, provider: str = "gsv"
+) -> int:
+    """
+    How many of a run's dated panos carry a date that cannot be true.
+
+    Not used by the stats themselves — dated_unique_panos simply drops them —
+    but a repair pass needs to know which runs on disk were affected at all,
+    and asking here keeps that question answered by the same rule rather than
+    by a second copy of it (scripts/recompute_run_stats.py).
+
+    Counts ONLY dates that are present and impossible. plausible_capture_mask
+    also rejects NaT, but a pano whose date was absent or unreadable never
+    claimed a date to begin with — it is dropped from the dated stats for a
+    different reason, and folding it in here would inflate the operator-facing
+    "N runs hold an impossible capture date" report and send --regenerate-json
+    at runs whose published JSON is fine.
+    """
+    dated = _dated_unique(df)
+    dates = dated["capture_date"]
+    return int((dates.notna() & ~plausible_capture_mask(dates, now, provider)).sum())
 
 
 @dataclass
@@ -441,10 +542,11 @@ class DailyDistribution:
         total_panos = sum(self.counts.values())
         rows = []
 
-        for date in sorted(self.counts.keys()):
-            count = self.counts[date]
+        # `day`, not `date`: the module imports datetime.date at the top
+        for day in sorted(self.counts.keys()):
+            count = self.counts[day]
             percentage = (count / total_panos) * 100
-            rows.append([date, str(count), f"{percentage:.2f}%"])
+            rows.append([day, str(count), f"{percentage:.2f}%"])
 
         # Add total row
         rows.append(["TOTAL", str(total_panos), "100.00%"])
@@ -576,7 +678,7 @@ def calculate_photographer_stats(df: pd.DataFrame) -> PhotographerStats:
 
 
 def calculate_pano_stats(
-    df: pd.DataFrame, now: pd.Timestamp, google_only: bool = False
+    df: pd.DataFrame, now: pd.Timestamp, google_only: bool = False, provider: str = "gsv"
 ) -> GSVAnalysisResults:
     """
     Calculate comprehensive panorama statistics from a DataFrame.
@@ -586,6 +688,8 @@ def calculate_pano_stats(
         now: Timestamp to use for age calculations
         google_only: When True, restrict to official Google imagery
             (exact '© Google' copyright; see is_google_copyright)
+        provider: imagery provider, selecting the earliest plausible capture
+            date (see dated_unique_panos)
 
     Returns:
         GSVAnalysisResults containing all calculated statistics
@@ -619,8 +723,8 @@ def calculate_pano_stats(
     # skewing our statistics for duplicate pano ids that are referenced multiple times
     # from different query points
 
-    # Age / capture-year / daily stats need a real date, so use dated panos only
-    dated_unique = filtered_df[filtered_df["status"] == "OK"].drop_duplicates(subset=["pano_id"])
+    # Age / capture-year / daily stats need a real — and possible — date
+    dated_unique = dated_unique_panos(filtered_df, now, provider)
     age_stats = calculate_age_stats(dated_unique, now)
 
     # Coverage describes the sampled grid, not the copyright subset, so it
@@ -665,6 +769,10 @@ def calculate_run_stats(df: pd.DataFrame, run_date, provider: str = "gsv") -> di
     Ages are computed relative to run_date (not wall-clock now), so the
     stored stats are deterministic and comparable across runs.
 
+    The three capture-date columns (oldest/newest/median age) describe
+    official '© Google' imagery for gsv and every pano for other providers;
+    see the comment at the age_source assignment for why.
+
     Args:
         df: loaded run DataFrame (load_city_csv_file format)
         run_date: datetime.date of the collection run
@@ -693,13 +801,29 @@ def calculate_run_stats(df: pd.DataFrame, run_date, provider: str = "gsv") -> di
     # the dated subset, since NO_DATE panos carry no usable capture date.
     present = df[df["status"].isin(PRESENT_STATUSES)]
     unique = present.drop_duplicates(subset=["pano_id"])
+    # Whether this run recorded copyright at all. Archival imports (issue #93)
+    # never did, so their Google subset is unknown rather than empty — one
+    # condition, decided once, because it governs both the Google pano count
+    # and whether the age columns below can be restricted to Google imagery.
+    copyright_recorded = not (len(unique) > 0 and unique["copyright_info"].isna().all())
     unique_google_panos = None
-    if provider == "gsv" and not (len(unique) > 0 and unique["copyright_info"].isna().all()):
-        is_google = is_google_copyright(unique["copyright_info"])
-        unique_google_panos = int(is_google.sum())
+    if provider == "gsv" and copyright_recorded:
+        unique_google_panos = int(is_google_copyright(unique["copyright_info"]).sum())
 
-    dated_unique = df[df["status"] == "OK"].drop_duplicates(subset=["pano_id"])
-    age_stats = calculate_age_stats(dated_unique.copy(), now)
+    # For gsv the age columns describe OFFICIAL GOOGLE imagery, not every pano
+    # (issue #213). Two reasons, and the second is the load-bearing one:
+    # third-party photospheres carry corrupt EXIF that a min/max cannot survive,
+    # and the site has always displayed the Google-filtered figures — the
+    # aggregate's `latest` block reads the per-run JSON's google_panos stats —
+    # so an all-panos column published under the same name as the map's "median
+    # age" was two different numbers wearing one label. A run with no copyright
+    # recorded keeps every pano, mirroring the frontend's
+    # `google_panos_age_stats ?? all_panos_age_stats` fallback; other providers
+    # have no copyright concept and are unaffected.
+    age_source = df
+    if provider == "gsv" and copyright_recorded:
+        age_source = df[is_google_copyright(df["copyright_info"])]
+    age_stats = calculate_age_stats(dated_unique_panos(age_source, now, provider), now)
     coverage = calculate_coverage_stats(df)
 
     return {
@@ -817,14 +941,14 @@ def print_df_summary(
     # Use provided timestamp or current time
     timestamp = now if now is not None else pd.Timestamp.now()
 
-    all_stats = calculate_pano_stats(df, timestamp)
+    all_stats = calculate_pano_stats(df, timestamp, provider=provider)
 
     print("\nAll Panoramas")
     print("=" * 40)
     all_stats.print_summary()
 
     if provider == "gsv":
-        google_stats = calculate_pano_stats(df, timestamp, google_only=True)
+        google_stats = calculate_pano_stats(df, timestamp, google_only=True, provider=provider)
         print("\nGoogle Panoramas Only")
         print("=" * 40)
         google_stats.print_summary()

@@ -15,7 +15,7 @@ import pandas as pd
 import seaborn as sns
 from tqdm import tqdm
 
-from .analysis import is_google_copyright
+from .analysis import is_google_copyright, plausible_capture_mask
 from .geoutils import get_best_folium_zoom_level, get_bounding_box, get_bounding_box_size
 
 logger = logging.getLogger(__name__)
@@ -224,6 +224,30 @@ def create_visualization_map(df: pd.DataFrame, city_name: str, provider: str = "
     valid_rows = valid_rows.dropna(subset=["capture_date"])
     logger.info(f"Filtered rows with valid capture dates: {len(valid_rows)}")
 
+    # ...and for dates that could be true. A contributor photosphere with
+    # corrupt EXIF (issue #213) would otherwise stretch the color scale and the
+    # temporal histogram across centuries, hiding the real spread of a whole
+    # city. The © Google filter above already removes most of them for gsv, so
+    # this mostly protects Mapillary and the rare corrupt official date.
+    #
+    # Unreadable and impossible are counted separately: both leave the frame
+    # here, but they are different defects with different responses — a 2611
+    # date is a contributor's corrupt EXIF and expected in small numbers, while
+    # a value we cannot parse at all points at the CSV or the decoder.
+    dates = pd.to_datetime(valid_rows["capture_date"], errors="coerce")
+    unreadable = int(dates.isna().sum())
+    if unreadable:
+        logger.warning(f"Dropped {unreadable} pano(s) whose capture date could not be parsed")
+    plausible = plausible_capture_mask(dates, pd.Timestamp(datetime.now()), provider)
+    impossible = int((~plausible).sum()) - unreadable
+    if impossible:
+        logger.warning(f"Dropped {impossible} pano(s) whose capture date cannot be true")
+    # Keep the parsed dates rather than re-parsing the raw column further down:
+    # this is the whole surviving census of a large Mapillary city.
+    valid_rows = valid_rows.copy()
+    valid_rows["capture_date"] = dates
+    valid_rows = valid_rows[plausible.to_numpy()]
+
     # Filter for unique pano_ids
     valid_rows = valid_rows.drop_duplicates(subset="pano_id")
     logger.info(f"Final valid rows with unique pano_ids: {len(valid_rows)}")
@@ -253,12 +277,10 @@ def create_visualization_map(df: pd.DataFrame, city_name: str, provider: str = "
 
     logger.debug(f"Map center: {map_center}, Bounding box: {bbox_coords}, Area: {area_km2:.1f} km²")
 
-    # Calculate temporal statistics
+    # Calculate temporal statistics. capture_date is already datetime64 — it was
+    # parsed once for the plausibility filter above and kept.
     logger.debug(f"Calculating temporal statistics for {len(valid_rows)} rows")
-    # print(valid_rows['capture_date'].dtypes)
-    # print(valid_rows['capture_date'].head())
     now = datetime.now()
-    valid_rows["capture_date"] = pd.to_datetime(valid_rows["capture_date"])
     valid_rows["age_years"] = (now - valid_rows["capture_date"]).dt.days / 365.25
 
     avg_age = valid_rows["age_years"].mean()
@@ -792,6 +814,25 @@ def plot_status_distribution(df: pd.DataFrame, city_name: str, figsize: tuple = 
     plt.show()
 
 
+def _plottable_dated_rows(df: pd.DataFrame, provider: str = "gsv") -> pd.DataFrame:
+    """
+    Rows a temporal plot can honestly draw: status OK, with a capture date that
+    parses AND could be true (issue #213).
+
+    Deliberately does NOT dedupe by pano_id, unlike analysis.dated_unique_panos:
+    these plots have always counted rows (pano references, one per grid point
+    that saw the pano), and narrowing that here would silently change what every
+    existing histogram means. Only impossible dates are removed.
+    """
+    rows = df[df["status"] == "OK"].copy()
+    rows["capture_date"] = pd.to_datetime(rows["capture_date"], errors="coerce")
+    keep = plausible_capture_mask(rows["capture_date"], pd.Timestamp(datetime.now()), provider)
+    dropped = int((rows["capture_date"].notna() & ~keep).sum())
+    if dropped:
+        logger.warning(f"Excluded {dropped} pano(s) whose capture date cannot be true")
+    return rows[keep.to_numpy()]
+
+
 def plot_temporal_distribution(
     df: pd.DataFrame,
     city_name: str,
@@ -799,6 +840,7 @@ def plot_temporal_distribution(
     bin_freq: str = "M",  # 'M' for month, 'Y' for year, etc.
     color: str = "blue",
     kde: bool = False,
+    provider: str = "gsv",
 ) -> None:
     """
     Create a histogram showing the distribution of GSV images over time.
@@ -810,9 +852,13 @@ def plot_temporal_distribution(
         bin_freq: Frequency for binning dates ('M' for monthly, 'Y' for yearly)
         color: Color for the histogram bars
         kde: Whether to show the kernel density estimation curve
+        provider: imagery provider, selecting the earliest plausible capture
+            date (see analysis.plausible_capture_mask)
     """
-    # Filter for successful panos with valid dates
-    valid_data = df[(df["status"] == "OK") & (df["capture_date"].notna())].copy()
+    # Filter for successful panos with a date that could be true: one corrupt
+    # contributor EXIF date (issue #213) sets the x-axis range for the whole
+    # plot, squeezing every real capture into a single bin.
+    valid_data = _plottable_dated_rows(df, provider)
 
     if len(valid_data) == 0:
         logger.warning("No valid data for temporal distribution plot")
@@ -820,9 +866,6 @@ def plot_temporal_distribution(
 
     # Create figure and axes
     fig, ax = plt.subplots(figsize=figsize)
-
-    # Convert capture_date to datetime if it isn't already
-    valid_data["capture_date"] = pd.to_datetime(valid_data["capture_date"])
 
     # Create the histogram
     sns.histplot(data=valid_data, x="capture_date", bins=30, kde=kde, color=color, ax=ax)
@@ -858,7 +901,7 @@ def plot_temporal_distribution(
     plt.show()
 
 
-def create_summary_visualization(df: pd.DataFrame, city_name: str) -> None:
+def create_summary_visualization(df: pd.DataFrame, city_name: str, provider: str = "gsv") -> None:
     """
     Create a comprehensive statistical visualization including status distribution
     and temporal distribution.
@@ -866,6 +909,8 @@ def create_summary_visualization(df: pd.DataFrame, city_name: str) -> None:
     Args:
         df: DataFrame containing the GSV metadata
         city_name: Name of the city being analyzed
+        provider: imagery provider, selecting the earliest plausible capture
+            date (see analysis.plausible_capture_mask)
     """
     # Create a figure with two subplots
     plt.figure(figsize=(15, 6))
@@ -887,9 +932,9 @@ def create_summary_visualization(df: pd.DataFrame, city_name: str) -> None:
             va="bottom",
         )
 
-    # Add temporal distribution subplot
+    # Add temporal distribution subplot (impossible dates excluded, #213)
     plt.subplot(122)
-    valid_data = df[(df["status"] == "OK") & (df["capture_date"].notna())].copy()
+    valid_data = _plottable_dated_rows(df, provider)
 
     if len(valid_data) > 0:
         sns.histplot(data=valid_data, x="capture_date", bins=30, color="blue")

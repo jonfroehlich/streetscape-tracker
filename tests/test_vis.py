@@ -56,3 +56,32 @@ def test_multi_pano_city_still_builds():
     rows = [_row("p1", 47.60, -122.33), _row("p2", 47.62, -122.35), _row("p3", 47.64, -122.31)]
     result = vis.create_visualization_map(_frame(rows), "Seattle, WA")
     assert isinstance(result, folium.Map)
+
+
+def test_impossible_capture_dates_are_excluded(caplog):
+    """Issue #213: a pano dated 2611 would set the age color scale and the
+    temporal histogram's range for the whole city, squeezing every real capture
+    into one bin. It is dropped — and said aloud, since a plot that silently
+    omits data is its own trap."""
+    rows = [_row("p1", 47.60, -122.33), _row("p2", 47.62, -122.35)]
+    corrupt = _row("bad", 47.64, -122.31)
+    corrupt["capture_date"] = "2611-09-01"
+    ancient = _row("old", 47.66, -122.29)
+    ancient["capture_date"] = "1970-08-01"
+
+    kept = vis._plottable_dated_rows(_frame([*rows, corrupt, ancient]))
+    assert sorted(kept["pano_id"]) == ["p1", "p2"]
+
+    with caplog.at_level("WARNING"):
+        result = vis.create_visualization_map(_frame([*rows, corrupt, ancient]), "Seattle, WA")
+    assert isinstance(result, folium.Map)
+    assert "2 pano(s) whose capture date cannot be true" in caplog.text
+
+
+def test_plottable_rows_keep_duplicate_pano_references():
+    """The plot helper narrows dates only. It must NOT adopt
+    dated_unique_panos' pano_id dedup: these histograms have always counted
+    pano references (one per grid point that saw the pano), so deduping here
+    would quietly redefine every existing plot."""
+    same_pano_twice = [_row("p1", 47.60, -122.33), _row("p1", 47.601, -122.331)]
+    assert len(vis._plottable_dated_rows(_frame(same_pano_twice))) == 2

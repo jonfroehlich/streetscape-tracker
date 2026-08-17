@@ -14,9 +14,9 @@
  * BEFORE it reaches renderDiffOverlay — never taken from the URL.
  *
  * Relies on globals from streetscape-utils.js: STREETSCAPE_DATA_BASE_URL,
- * fetchGzippedText, escapeHtml, spatialStrideSample, RENDER_CAP — plus
- * Leaflet (L) and PapaParse (Papa). Loaded before city.js, which calls
- * renderDiffOverlay().
+ * fetchGzippedText, escapeHtml, spatialStrideSample, RENDER_CAP,
+ * panoDateOrNull, isPlausibleCaptureDate — plus Leaflet (L) and PapaParse
+ * (Papa). Loaded before city.js, which calls renderDiffOverlay().
  *
  * @module diff-overlay
  */
@@ -82,19 +82,43 @@ function diffMarkerStyle(changeType) {
 }
 
 /**
+ * A diff row's capture date as popup text: the date itself, or "unknown" when
+ * it is absent or cannot be true.
+ *
+ * The diff detail CSV is a RAW date stream, exactly like the run CSV city.js
+ * streams — diff.py records what the provider said on both sides of the
+ * comparison, and the published summaries are the only place issue #213's
+ * narrowing is applied. So the guard is repeated here too, or a contributor
+ * photosphere whose corrupt EXIF changed between two runs renders as
+ * "2611-09-01 → 2612-01-01" in the popup.
+ *
+ * @param {?string} raw - old_capture_date or new_capture_date, as in the CSV.
+ * @param {?string} provider - Provider key (see PROVIDERS).
+ * @returns {string} Escaped date text, or "unknown".
+ */
+function diffCaptureDateText(raw, provider) {
+  if (!raw) return "unknown";
+  return isPlausibleCaptureDate(panoDateOrNull(raw), provider) ? escapeHtml(raw) : "unknown";
+}
+
+/**
  * Popup HTML for one diff row. Everything data-derived is escaped.
  *
  * @param {Object} row - A diff CSV row.
+ * @param {?string} [provider="gsv"] - Provider key, for the date plausibility
+ *   bounds (see diffCaptureDateText).
  * @returns {string}
  */
-function diffPopupHtml(row) {
+function diffPopupHtml(row, provider) {
   const label = DIFF_LABELS[row.change_type] ?? row.change_type;
+  const oldDate = diffCaptureDateText(row.old_capture_date, provider);
+  const newDate = diffCaptureDateText(row.new_capture_date, provider);
   const dates =
     row.change_type === "capture_date_changed"
-      ? `<br><strong>Capture date:</strong> ${escapeHtml(row.old_capture_date)} → ${escapeHtml(row.new_capture_date)}`
+      ? `<br><strong>Capture date:</strong> ${oldDate} → ${newDate}`
       : row.change_type === "pano_removed"
-        ? `<br><strong>Was captured:</strong> ${escapeHtml(row.old_capture_date) || "unknown"}`
-        : `<br><strong>Captured:</strong> ${escapeHtml(row.new_capture_date) || "unknown"}`;
+        ? `<br><strong>Was captured:</strong> ${oldDate}`
+        : `<br><strong>Captured:</strong> ${newDate}`;
   return `
     <div style="font-family:sans-serif">
       <strong>${escapeHtml(label)}</strong> since the previous run${dates}<br>
@@ -108,13 +132,15 @@ function diffPopupHtml(row) {
  * @param {L.Map} map - The Leaflet map.
  * @param {string} diffFile - A VALIDATED diff detail filename (the caller
  *   runs isValidDiffFilename first).
+ * @param {?string} [provider="gsv"] - Provider key, threaded through to the
+ *   popups' capture-date plausibility bounds.
  * @returns {Promise<{layer: L.LayerGroup,
  *   counts: {added: number, removed: number, redated: number},
  *   drawn: {added: number, removed: number, redated: number}}>}
  * @throws {Error} On HTTP/decompression failure (e.g. the pair predates diff
  *   publishing) — the caller renders the graceful message.
  */
-async function renderDiffOverlay(map, diffFile) {
+async function renderDiffOverlay(map, diffFile, provider) {
   // Own pane above the streets overlay (250) and the pano-dot canvas
   // (overlayPane, 400) — change dots are the question being asked, so they
   // draw on top. The map runs preferCanvas, and a marker's `pane` option
@@ -156,7 +182,7 @@ async function renderDiffOverlay(map, diffFile) {
           ...diffMarkerStyle(row.change_type),
           pane: "diffOverlay",
           renderer,
-        }).bindPopup(diffPopupHtml(row))
+        }).bindPopup(diffPopupHtml(row, provider))
       );
     }
   }
@@ -175,6 +201,7 @@ if (typeof module !== "undefined" && module.exports) {
     DIFF_RENDER_CAP,
     partitionDiffRows,
     diffMarkerStyle,
+    diffCaptureDateText,
     diffPopupHtml,
     renderDiffOverlay,
   };

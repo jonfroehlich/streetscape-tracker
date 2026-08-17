@@ -28,12 +28,28 @@ const RENDER_CAP = 40000;
  * Imagery provider registry. Each provider's color scale is anchored to
  * its launch date (oldest possible imagery = dark red), and each supplies
  * its own pano viewer deep-link and required attribution.
+ *
+ * `earliestPlausibleCapture` is a SEPARATE date from `launchDate` and must
+ * stay that way: the launch date anchors the color ramp, while this is the
+ * floor below which a capture date cannot be true (issue #213). It mirrors
+ * analysis.EARLIEST_PLAUSIBLE_CAPTURE — Mapillary's is far earlier than its
+ * founding because contributors upload genuinely old photographs.
+ *
+ * It is built with the LOCAL-midnight constructor, not `new Date("2007-01-01")`,
+ * because it is compared against `panoDateOrNull` output, which parses a
+ * date-only string as local midnight (deliberately — see that function). Mixing
+ * the two makes the floor exclusive east of UTC and inclusive west of it, so a
+ * pano captured exactly on the floor would be kept in every published artifact
+ * (analysis.plausible_capture_mask uses an inclusive `between`) but dropped
+ * from the map for some visitors. `launchDate` stays an ISO literal: it only
+ * anchors a color ramp, where a one-day shift is invisible.
  */
 const PROVIDERS = {
   gsv: {
     label: "Google Street View",
     panoNoun: "Google Panoramas",
     launchDate: new Date("2007-05-25"),
+    earliestPlausibleCapture: new Date(2007, 0, 1), // local midnight; see above
     attribution: "Panorama metadata © Google",
     viewerLabel: "View in Google Street View",
     viewerUrl: (panoId) =>
@@ -43,6 +59,7 @@ const PROVIDERS = {
     label: "Mapillary",
     panoNoun: "Mapillary Panoramas",
     launchDate: new Date("2014-01-01"),
+    earliestPlausibleCapture: new Date(2004, 0, 1), // local midnight; see above
     attribution:
       'Image metadata © <a href="https://www.mapillary.com">Mapillary</a>, CC BY-SA',
     viewerLabel: "View in Mapillary",
@@ -812,6 +829,38 @@ function isGoogleCopyright(copyright) {
 }
 
 /**
+ * Could this capture date actually be true? The JS mirror of
+ * analysis.plausible_capture_mask (issue #213).
+ *
+ * Contributor photospheres reach us with corrupt EXIF — production runs carry
+ * panos dated 2611-09-01 and 1970-08-01 — and the published artifacts now drop
+ * those before they are summarized. The raw run CSV that city.js streams does
+ * NOT: it records what the provider said, deliberately, so the check has to
+ * happen here as well or a 2611 pano is drawn at age −585.
+ *
+ * The upper bound is today rather than the snapshot's run date: nothing can be
+ * captured after we look at it, and being lenient by the age of the snapshot
+ * costs nothing when the values this rejects are centuries out.
+ *
+ * @param {?Date} date - Parsed capture date (from panoDateOrNull).
+ * @param {?string} [provider="gsv"] - Provider key (see PROVIDERS).
+ * @returns {boolean} True iff the date falls in the provider's possible range.
+ */
+function isPlausibleCaptureDate(date, provider) {
+  if (!date || isNaN(date.getTime())) return false;
+  // `provider || "gsv"` rather than a default parameter: a default only fires
+  // on undefined, so an explicit null or "" — an unset provider threaded in
+  // from a caller — skipped it, missed PROVIDERS, and fell through the ?? to
+  // Mapillary's floor, accepting a GSV pano dated 2005. An UNKNOWN provider
+  // name still lands on that loose floor deliberately, mirroring
+  // analysis._DEFAULT_EARLIEST_PLAUSIBLE_CAPTURE.
+  const earliest = PROVIDERS[provider || "gsv"]?.earliestPlausibleCapture
+    ?? PROVIDERS.mapillary.earliestPlausibleCapture;
+  const t = date.getTime();
+  return t >= earliest.getTime() && t <= Date.now();
+}
+
+/**
  * Parse a pano capture date, returning null when the date is absent
  * (age_stats are all null for a 0-pano run). Guards against
  * `new Date(null)` silently rendering as the Unix epoch (12/31/1969)
@@ -1030,6 +1079,7 @@ if (typeof module !== "undefined" && module.exports) {
     adaptCityRecord,
     adaptCitiesPayload,
     isGoogleCopyright,
+    isPlausibleCaptureDate,
     panoDateOrNull,
     googleSharePercent,
     buildFilledHistogram,

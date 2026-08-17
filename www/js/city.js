@@ -97,8 +97,9 @@ let temporalChartGlobal = null;
 let temporalDataGlobal = [];
 let temporalKeyboardIdx = -1;
 
-// panoDateOrNull() and isGoogleCopyright() are shared helpers from streetscape-utils.js
-// (loaded first), reused here for the info-panel dates and the © Google filter.
+// panoDateOrNull(), isGoogleCopyright() and isPlausibleCaptureDate() are shared
+// helpers from streetscape-utils.js (loaded first), reused here for the
+// info-panel dates, the © Google filter, and the #213 impossible-date guard.
 let runsGlobal = [];        // this city's run history from the aggregate
 let currentFileGlobal = ""; // csv.gz filename of the run being displayed
 let changeGlobal = null;    // change_from_previous_run block of this run
@@ -586,9 +587,11 @@ function previousRunDate() {
  * The run's own stats JSON is authoritative when present: its
  * change_from_previous_run.diff_file is null exactly when no detail was
  * published (no changes, or grids didn't align). Only when the whole change
- * block is absent (regenerated JSONs carry change_from_previous_run=null) is
- * the name constructed from the run history — in which case the fetch itself
- * discovers whether the pair predates diff publishing.
+ * block is absent — a first run, or a run whose diff was never recorded — is
+ * the name constructed from the run history, in which case the fetch itself
+ * discovers whether the pair predates diff publishing. A rebuilt JSON
+ * (json_summarizer.regenerate_run_json) replays its block from the run_diffs
+ * row precisely so it does NOT land in that fallback.
  *
  * NEVER read from the URL; both sources still pass isValidDiffFilename before
  * any fetch (see the security note on that validator).
@@ -645,7 +648,7 @@ async function toggleDiffOverlay() {
   diffOverlay.loading = true;
   refreshLegend();
   try {
-    const { layer, counts, drawn } = await renderDiffOverlay(map, diffFile);
+    const { layer, counts, drawn } = await renderDiffOverlay(map, diffFile, providerGlobal);
     Object.assign(diffOverlay, { layer, counts, drawn, shown: true });
   } catch (e) {
     console.info("Change detail unavailable for this run:", e.message);
@@ -1558,7 +1561,14 @@ async function loadData() {
         // parse shifted Jan/year-precision dates into the previous year
         // for visitors west of UTC).
         const captureDate = panoDateOrNull(row.capture_date);
-        if (!captureDate || isNaN(captureDate.getTime())) continue; // skip unparseable dates
+        // Unreadable and IMPOSSIBLE dates are treated alike (issue #213): the
+        // run CSV keeps whatever the provider said, so a contributor
+        // photosphere dated 2611 arrives here intact and would otherwise be
+        // drawn at age −585 and open a 2611 bucket in the temporal plot. This
+        // map is date-coloured throughout, which is why it already draws no
+        // NO_DATE pano at all — a date that cannot be true is no more
+        // plottable than one that is missing.
+        if (!isPlausibleCaptureDate(captureDate, providerGlobal)) continue;
 
         const year = captureDate.getFullYear();
         const age = currentYear - year;

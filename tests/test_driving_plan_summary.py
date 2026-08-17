@@ -194,9 +194,13 @@ def test_a_clean_window_carries_no_approximate_flag(conn, data_dir):
 
 
 def test_impossible_capture_dates_are_suppressed_not_published(conn, data_dir):
-    # 21 production runs read 2611-2612 because the capture-date columns are
+    # 22 production runs read 2611-2612 because the capture-date columns are
     # computed over third-party photospheres too. Publishing one would both
     # look absurd and manufacture a driven_unplanned verdict from a typo.
+    #
+    # median_pano_age_years goes with it: it is derived from the SAME panos, so
+    # a row carrying 2611 carries -292.0 beside it, and blanking one column
+    # while the other renders "-292.0 yrs" leaves the page self-contradicting.
     city_id = _register_city(conn, "Chicago", "Illinois")
     db.register_run(
         conn,
@@ -205,6 +209,7 @@ def test_impossible_capture_dates_are_suppressed_not_published(conn, data_dir):
         csv_filename="chicago_2026-07-30.csv.gz",
         coverage_rate_pct=70.0,
         newest_capture_date="2611-09-01T00:00:00",
+        median_pano_age_years=-292.0,
     )
     _entries(
         conn,
@@ -216,8 +221,54 @@ def test_impossible_capture_dates_are_suppressed_not_published(conn, data_dir):
     observed = doc["cities"][0]["observed"]["gsv"]
 
     assert observed["newest_capture"] is None
+    assert observed["median_pano_age_years"] is None
     assert "years_since_newest_capture" not in observed
     assert doc["cities"][0]["verdict"] != "driven_unplanned"
+
+
+def test_a_negative_median_age_is_suppressed_on_its_own_terms(conn, data_dir):
+    """A corrupt date can poison the median without owning the maximum.
+
+    The guard above keys on newest_capture_date, which is the column a 2611
+    pano usually captures — but a run whose newest date is ordinary can still
+    carry a median dragged negative by a future-dated pano that lost the max to
+    an even later one, or by a pre-repair row whose columns disagree. An age
+    measured from the run date cannot be negative: nothing is captured after
+    the query that observed it.
+    """
+    city_id = _register_city(conn, "Denver", "Colorado")
+    db.register_run(
+        conn,
+        city_id=city_id,
+        run_date=date(2026, 7, 30),
+        csv_filename="denver_2026-07-30.csv.gz",
+        coverage_rate_pct=70.0,
+        newest_capture_date="2024-05-01T00:00:00",
+        median_pano_age_years=-3.5,
+    )
+    observed = generate_driving_plan_summary(conn, data_dir)["cities"][0]["observed"]["gsv"]
+
+    # The plausible max survives; only the impossible median is withheld.
+    assert observed["newest_capture"] == "2024-05-01"
+    assert observed["median_pano_age_years"] is None
+
+
+def test_a_healthy_median_is_published_untouched(conn, data_dir):
+    """The guards above are exception paths, not a filter on ordinary rows."""
+    city_id = _register_city(conn, "Boise", "Idaho")
+    db.register_run(
+        conn,
+        city_id=city_id,
+        run_date=date(2026, 7, 30),
+        csv_filename="boise_2026-07-30.csv.gz",
+        coverage_rate_pct=70.0,
+        newest_capture_date="2024-05-01T00:00:00",
+        median_pano_age_years=3.5,
+    )
+    observed = generate_driving_plan_summary(conn, data_dir)["cities"][0]["observed"]["gsv"]
+
+    assert observed["newest_capture"] == "2024-05-01"
+    assert observed["median_pano_age_years"] == 3.5
 
 
 def test_records_are_grouped_by_feed_record_not_exploded_districts(conn, data_dir):

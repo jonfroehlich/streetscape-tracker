@@ -75,6 +75,14 @@ CREATE TABLE IF NOT EXISTS runs (
     coverage_rate_pct   REAL,
     any_imagery_coverage_rate_pct REAL,
     num_flat_images     INTEGER,
+    -- The three capture-date columns describe official '© Google' imagery for
+    -- gsv and every pano for other providers, and exclude dates outside
+    -- [provider launch, run_date] (issue #213 — third-party photospheres reach
+    -- us with EXIF dated 2611 or 1970, and a min/max cannot survive one).
+    -- Unlike unique_panos/unique_google_panos there is only one such column
+    -- per statistic, so it carries the population the site displays; a gsv run
+    -- that recorded no copyright at all (archival imports, issue #93) falls
+    -- back to every pano. See analysis.calculate_run_stats.
     oldest_capture_date TEXT,
     newest_capture_date TEXT,
     median_pano_age_years REAL,

@@ -651,22 +651,27 @@ def plausible_capture_date(value: str | None, today: date) -> date | None:
     """
     A run's capture date, or None when the catalog's value cannot be true.
 
-    ``runs.oldest_capture_date`` / ``newest_capture_date`` are computed over
-    EVERY pano in a run, not just the official ``© Google`` ones, so a single
-    user-contributed photosphere with corrupt EXIF poisons the column for the
-    whole city. On the production catalog as of 2026-08-16 that is 21 runs
-    dated in the future (Ho Chi Minh City and Covington read ``2612-01-01``;
-    Chicago, San Francisco, Toronto, Cape Town and São Paulo read
-    ``2611-09-01``) and 75 dated before Street View existed (``1970-08-01``,
-    ``1980-01-01``).
+    ``runs.oldest_capture_date`` / ``newest_capture_date`` used to be computed
+    over EVERY pano in a run, not just the official ``© Google`` ones, so a
+    single user-contributed photosphere with corrupt EXIF poisoned the column
+    for the whole city. On the production catalog as of 2026-08-16 that was 22
+    runs dated in the future (Ho Chi Minh City and Covington read
+    ``2612-01-01``; Chicago, San Francisco, Toronto, Cape Town and São Paulo
+    read ``2611-09-01``) and 75 dated before Street View existed
+    (``1970-08-01``, ``1980-01-01``).
 
-    Publishing those would put an absurd "newest capture" on the page and, far
-    worse, manufacture a ``driven_unplanned`` verdict out of nothing — the
-    claim this page exists to make, invented by a typo. So an implausible value
-    is treated as absent, consistent with the absent-not-null convention: we
-    would rather say "no data" than publish a number known to be wrong.
+    Issue #213 fixed that at the source — ``analysis.dated_unique_panos`` now
+    drops impossible dates and, for gsv, third-party imagery — but this guard
+    stays, because it answers a question the fix cannot: a row written before
+    the backfill still holds 2611, and a corrupt date carrying a ``© Google``
+    copyright would survive the filter. An implausible value is treated as
+    absent, consistent with the absent-not-null convention: we would rather say
+    "no data" than publish a number known to be wrong.
 
-    Fixing the underlying columns is a separate concern from rendering them.
+    The bound below must agree with ``analysis.EARLIEST_PLAUSIBLE_CAPTURE``
+    ("gsv"); a test pins the two together. It is kept as a separate literal so
+    this module stays stdlib-only — it is the pure-logic layer, and importing
+    the pandas-backed analysis module for one constant would end that.
     """
     parsed = _parse_iso(value)
     if parsed is None:
