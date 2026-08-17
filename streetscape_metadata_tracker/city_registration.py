@@ -134,7 +134,10 @@ def resolve_or_register_city(
 
     if lat is not None:
         center_lat, center_lng = lat, lng
-        print(f"Using user-provided coordinates: {center_lat}, {center_lng}")
+        # logger, not print: this module is imported by the scheduler as well as
+        # the CLI, and a library that writes to stdout puts its own diagnostics
+        # in the middle of a report the caller is composing.
+        logger.info(f"Using user-provided coordinates: {center_lat}, {center_lng}")
     elif city_loc_data:
         center_lat, center_lng = resolve_center(city_loc_data)
     else:
@@ -144,7 +147,7 @@ def resolve_or_register_city(
 
     if width is not None:
         grid_width, grid_height = width, height
-        print(f"Using provided dimensions: {grid_width:.1f}m x {grid_height:.1f}m")
+        logger.info(f"Using provided dimensions: {grid_width:.1f}m x {grid_height:.1f}m")
     else:
         grid_width, grid_height = get_search_dimensions(query, 1000, 1000)
         grid_width, grid_height = cap_dimensions(grid_width, grid_height, query)

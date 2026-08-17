@@ -331,7 +331,16 @@ Notes:
   re-run them later. The command never marks the city failed.
 - **It does not run the GSV grid run.** That is the expensive half, and it needs
   no help: a newly registered city is enabled with no successful run yet, so it
-  leads the next night's stalest-first queue.
+  leads the next night's stalest-first queue. The channels it *does* collect
+  record a success, so they are not due again for a cycle — the closing report
+  says so, along with the paired-snapshot cost that carries (same as
+  `run-due --provider`).
+- **There is no `--publish` flag, only `--no-publish`.** Publishing follows
+  `[publish].enabled`, which is the host's declaration; the override lives on
+  `regenerate-aggregate --publish`, the incident-time handle. If publishing is
+  switched off in the config, the run prints a NOTE beside the city-page link
+  saying the link describes the catalog rather than what is live — read it
+  before sending that link to a partner.
 - **Publishing needs no environment variable.** `[publish].local = true` in the
   prod config makes `_publish` pass `--local` explicitly. Before that, a
   hand-run publish took the SSH path, failed with rsync code 12, and emailed a

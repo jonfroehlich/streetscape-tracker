@@ -116,7 +116,9 @@ def _no_published_json(monkeypatch):
     here, but building them needs per-run JSON on disk that these tests never
     write, so stub the whole helper and let the tail tests assert on the marker.
     """
-    monkeypatch.setattr(_sched, "_regenerate_published_json", lambda conn, cfg: "regenerated")
+    monkeypatch.setattr(
+        _sched, "_regenerate_published_json", lambda conn, cfg: ("regenerated", True)
+    )
 
 
 def _stub_collection(monkeypatch, conn, *, outcome=None):
@@ -390,6 +392,27 @@ def test_the_preflight_prices_every_channel_against_todays_remaining_budget(
     assert "OVER REMAINING BUDGET, deferred" in out
 
 
+def test_a_channel_over_the_whole_budget_is_not_called_deferred(
+    conn, monkeypatch, tmp_path, capsys
+):
+    """
+    The two budget guards in _run_city_channels mean different things and the
+    operator's next move differs. "Deferred to a later run" is right for work
+    that does not fit what is LEFT today; for work that exceeds the whole budget
+    it promises a later run that never comes, because tomorrow's budget is the
+    same size. That one needs a config change or a smaller grid.
+    """
+    _stub_collection(monkeypatch, conn)
+    cfg = _cfg(tmp_path)
+    cfg.providers["mapillary"].daily_request_budget = 2  # below the 9-tile estimate
+
+    _sched.cmd_assess_city(cfg, QUERY, today=TODAY, assume_yes=True, estimate_only=True)
+
+    out = capsys.readouterr().out
+    assert "EXCEEDS THE ENTIRE DAILY BUDGET" in out
+    assert "deferred to a later run" not in out
+
+
 def test_the_preflight_names_the_combined_per_ip_mapillary_exposure(
     conn, monkeypatch, tmp_path, capsys
 ):
@@ -399,7 +422,24 @@ def test_the_preflight_names_the_combined_per_ip_mapillary_exposure(
 
     _assess(tmp_path, estimate_only=True)
 
-    assert "tile requests from THIS HOST's IP" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "tile requests from THIS HOST's IP" in out
+    assert "paced at 60/min" in out
+
+
+def test_differently_paced_mapillary_channels_are_both_reported(
+    conn, monkeypatch, tmp_path, capsys
+):
+    """The two channels hold independent [providers.*] blocks and run
+    back-to-back, so one rate beside a summed total would misreport a config
+    that paces them apart."""
+    _stub_collection(monkeypatch, conn)
+    cfg = _cfg(tmp_path)
+    cfg.providers["mapillary_streets"].max_requests_per_minute = 30
+
+    _sched.cmd_assess_city(cfg, QUERY, today=TODAY, assume_yes=True, estimate_only=True)
+
+    assert "paced at 30/min and 60/min" in capsys.readouterr().out
 
 
 # --------------------------------------------------------------------------
@@ -598,6 +638,62 @@ def test_success_starts_only_the_collected_channels_clocks(conn, monkeypatch, tm
     assert "gsv" not in state
 
 
+def test_the_closing_note_says_which_channels_are_actually_due(conn, monkeypatch, tmp_path, capsys):
+    """
+    The report used to close with "this city is now due on every channel", which
+    is the opposite of true for the three channels it just collected: recording a
+    success stamps last_success_at, get_due_cities reads only that, and so the
+    collected channels are the LEAST stale rows in the catalog. Only `gsv` — the
+    one deliberately left alone — is due. Asserted against get_due_cities rather
+    than against the wording alone, so the sentence cannot drift back out of
+    agreement with the scheduler.
+    """
+    _stub_collection(monkeypatch, conn)
+
+    _assess(tmp_path)
+
+    out = capsys.readouterr().out
+    tomorrow = date(2026, 8, 18)
+    due = {
+        p: [
+            c.city_id
+            for c in db.get_due_cities(
+                conn,
+                today=tomorrow,
+                cycle_days=90,
+                grace_days=10,
+                max_consecutive_failures=5,
+                provider=p,
+            )
+        ]
+        for p in ("gsv", *ASSESS_CHANNELS)
+    }
+    assert due["gsv"] == [CITY_ID]
+    assert all(due[c] == [] for c in ASSESS_CHANNELS)
+
+    assert "due on every channel" not in out
+    assert "no schedule_state row yet, so it is due" in out
+    assert "NOT due tonight" in out
+    # And the paired-snapshot cost is named, the way run-due --provider names it
+    # (issue #214) rather than leaving it to be discovered.
+    assert "no longer share one run date" in out
+
+
+def test_the_paired_snapshot_note_is_absent_when_nothing_was_collected(
+    conn, monkeypatch, tmp_path, capsys
+):
+    """No success, no clock started, nothing un-paired — so claiming otherwise
+    would send an operator looking for a desync that never happened."""
+    _stub_collection(monkeypatch, conn, outcome=lambda city, provider: False)
+
+    _assess(tmp_path)
+
+    out = capsys.readouterr().out
+    assert "no longer share one run date" not in out
+    # The GSV note still applies: that channel was never given a row either way.
+    assert "so it is due" in out
+
+
 def test_a_failed_channel_records_no_failure(conn, monkeypatch, tmp_path):
     """
     get_due_cities filters on `consecutive_failures < max_consecutive_failures`
@@ -719,7 +815,9 @@ def test_a_busy_host_skips_one_channel_without_tripping_the_breaker(conn, monkey
 def test_the_tail_regenerates_then_publishes(conn, monkeypatch, tmp_path):
     order = []
     monkeypatch.setattr(
-        _sched, "_regenerate_published_json", lambda c, cfg: order.append("regen") or "ok"
+        _sched,
+        "_regenerate_published_json",
+        lambda c, cfg: (order.append("regen") or "ok", True),
     )
     monkeypatch.setattr(_sched, "_publish", lambda cfg, ctx: order.append("publish") or 0)
     _stub_collection(monkeypatch, conn)
@@ -765,6 +863,63 @@ def test_no_publish_regenerates_but_does_not_rsync(conn, monkeypatch, tmp_path):
 
     assert published == []
     assert rc == 0
+
+
+def test_publishing_disabled_in_config_says_so_beside_the_link(conn, monkeypatch, tmp_path, capsys):
+    """
+    The city-page link is built from the CATALOG, not from what is live, so with
+    publishing switched off it reads exactly like an answer while pointing at
+    stale or absent data — and the only other signal is the ABSENCE of
+    "; published" from the summary, which nobody reads as "not published". The
+    case that matters is not a dev laptop but prod with publishing off during a
+    block or a maintenance window, where the operator emails a partner a dead
+    link. Same class of bug as the false publish-FAILED alert this PR fixes:
+    publishing decided by config with no feedback at the point of use.
+    """
+    published = []
+    monkeypatch.setattr(_sched, "_publish", lambda cfg, ctx: published.append("publish") or 0)
+    _stub_collection(monkeypatch, conn)
+
+    rc = _assess(tmp_path, cfg=_cfg(tmp_path, publish_enabled=False))
+
+    out = capsys.readouterr().out
+    assert published == []
+    assert "[publish].enabled is false" in out
+    assert "not what is live" in out
+    # A config that declares this host does not publish is not a failure — the
+    # same reasoning that makes --no-publish exit 0. Only an ATTEMPTED publish
+    # that failed is, which is why the notice above has to exist.
+    assert rc == 0
+
+
+def test_no_publish_does_not_print_the_publishing_disabled_notice(
+    conn, monkeypatch, tmp_path, capsys
+):
+    """The operator asked for it, so it is not a surprise worth a warning — the
+    notice is for the case they did not choose."""
+    monkeypatch.setattr(_sched, "_publish", lambda cfg, ctx: 0)
+    _stub_collection(monkeypatch, conn)
+
+    _assess(tmp_path, cfg=_cfg(tmp_path, publish_enabled=True), publish=False)
+
+    assert "[publish].enabled is false" not in capsys.readouterr().out
+
+
+def test_assess_city_has_no_publish_override_flag():
+    """
+    Deliberate asymmetry with `regenerate-aggregate --publish`, pinned so it
+    reads as a decision rather than an omission (issue #215). [publish].enabled
+    is the host's own declaration, and moving publishing OUT of ambient state and
+    INTO config is what the rest of this change does; an override belongs to the
+    command whose job genuinely is "push the catalog to the site right now", not
+    to a collection command whose publish is a consequence. It is also the one
+    flag that would let a non-prod checkout overwrite prod's cities.json.gz,
+    which _regenerate_published_json rebuilds from the LOCAL catalog.
+    """
+    args = build_parser().parse_args(["assess-city", "--yes", QUERY])
+
+    assert args.no_publish is False
+    assert not hasattr(args, "publish")
 
 
 # --------------------------------------------------------------------------
@@ -902,7 +1057,7 @@ def test_the_city_page_link_uses_the_grid_runs_filename(conn, monkeypatch, tmp_p
     assert "17.0% of grid points" in out
 
 
-def test_without_a_grid_run_the_report_says_there_is_no_city_page(
+def test_without_a_grid_run_on_any_provider_the_report_says_there_is_no_city_page(
     conn, monkeypatch, tmp_path, capsys
 ):
     """A walk-only city is absent from cities.json.gz (generate_aggregate_v2
@@ -910,6 +1065,74 @@ def test_without_a_grid_run_the_report_says_there_is_no_city_page(
     _stub_collection(monkeypatch, conn)
     _assess(tmp_path, requested_providers=["gsv_streets"])
     assert "no city page to link" in _report(conn, tmp_path)
+
+
+def test_the_city_page_link_falls_back_to_the_gsv_grid_run(conn, monkeypatch, tmp_path):
+    """
+    The Mapillary grid run is what USUALLY supplies the link, but it is routinely
+    absent from an assess run — the channel switched off after a per-IP block,
+    narrowed away by --provider, over budget, or skipped by the host breaker. An
+    already-tracked city still has a GSV run, and city.html is addressed by
+    run-CSV filename whatever the provider, so the link exists. Reporting "no
+    city page" there sent the operator away without the one thing they ran this
+    command for, and told them to wait for a nightly batch that already ran.
+    """
+    _stub_collection(monkeypatch, conn)
+    _assess(tmp_path, requested_providers=["gsv_streets"])
+    csv_name = f"{CITY_ID}_width_3892_height_4182_step_20_2026-08-01.csv.gz"
+    db.register_run(
+        conn,
+        city_id=CITY_ID,
+        run_date=date(2026, 8, 1),
+        csv_filename=csv_name,
+        provider="gsv",
+        coverage_rate_pct=61.2,
+    )
+
+    out = _report(conn, tmp_path, site_url="https://example.test/tracker/")
+
+    assert f"https://example.test/tracker/city.html?file={csv_name}&network=drive" in out
+    # Named, because the page it opens shows that provider's imagery — and the
+    # grid-coverage line above stays Mapillary-only, so an unlabelled link would
+    # read as belonging to a Mapillary run that does not exist.
+    assert "City page (gsv run)" in out
+    assert "no city page to link" not in out
+    # Grid coverage stays a Mapillary-only figure: GSV grid coverage is exactly
+    # the number this command exists to stop anyone quoting.
+    assert "61.2%" not in out
+
+
+def test_the_mapillary_grid_run_still_wins_the_link_when_both_exist(conn, monkeypatch, tmp_path):
+    """It is the run this command collects, and the one whose page shows the
+    Mapillary walk beside it."""
+    _stub_collection(monkeypatch, conn)
+    _assess(tmp_path)
+    mapillary_csv = _register_grid_run(conn, coverage_rate_pct=17.0)
+    db.register_run(
+        conn,
+        city_id=CITY_ID,
+        run_date=date(2026, 8, 1),
+        csv_filename=f"{CITY_ID}_width_3892_height_4182_step_20_2026-08-01.csv.gz",
+        provider="gsv",
+        coverage_rate_pct=61.2,
+    )
+
+    out = _report(conn, tmp_path)
+
+    assert f"file={mapillary_csv}" in out
+    assert "City page (mapillary run)" in out
+
+
+def test_a_site_url_without_a_trailing_slash_still_builds_a_valid_link(conn, monkeypatch, tmp_path):
+    """Link building is bare concatenation, so an operator omitting the slash
+    would otherwise get '…/streetscape-trackercity.html'."""
+    _stub_collection(monkeypatch, conn)
+    _assess(tmp_path)
+    csv_name = _register_grid_run(conn)
+
+    out = _report(conn, tmp_path, site_url="https://example.test/tracker")
+
+    assert f"https://example.test/tracker/city.html?file={csv_name}" in out
 
 
 # --------------------------------------------------------------------------

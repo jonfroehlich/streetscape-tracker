@@ -239,7 +239,8 @@ enabled = false
 # nightly one — see issue #215 and the note in scheduler.makelab1.toml.
 #local = true
 # Public base URL of the site; only used to print operator-facing links
-# (assess-city's city page). Relative links are printed when unset.
+# (assess-city's city page). Relative links are printed when unset. A trailing
+# slash is added if you omit one.
 #site_url = "https://makeabilitylab.cs.washington.edu/public/streetscape-tracker/"
 
 [alerts]

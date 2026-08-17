@@ -225,7 +225,10 @@ class SchedulerConfig:
     # configuration rather than of whoever's shell happened to invoke it.
     publish_local: bool = False
     # Public base URL of the site, used only to print operator-facing links
-    # (e.g. assess-city's city page). Empty means print relative URLs.
+    # (e.g. assess-city's city page). Empty means print relative URLs. A missing
+    # trailing slash is added in __post_init__ rather than required of the
+    # operator: link building is bare concatenation, so "…/streetscape-tracker"
+    # would silently emit "…/streetscape-trackercity.html".
     site_url: str = ""
     # [providers.*] — when None (no section in the TOML), falls back to
     # gsv-only with the legacy [schedule].daily_request_budget
@@ -240,6 +243,8 @@ class SchedulerConfig:
     def __post_init__(self):
         if not self.db_path:
             self.db_path = db.get_default_db_path(self.data_dir)
+        if self.site_url and not self.site_url.endswith("/"):
+            self.site_url += "/"
         if self.providers is None:
             self.providers = {"gsv": ProviderConfig(daily_request_budget=self.daily_request_budget)}
 
@@ -948,31 +953,43 @@ def cmd_assign(cfg: SchedulerConfig) -> int:
     return 0
 
 
-def _regenerate_published_json(conn, cfg: SchedulerConfig) -> str:
+def _regenerate_published_json(conn, cfg: SchedulerConfig) -> tuple[str, bool]:
     """
-    Rebuild every catalog-derived published artifact and return a one-line
-    operator summary. No collection, no API calls, no publish.
+    Rebuild every catalog-derived published artifact.
+
+    Returns ``(operator summary, complete)``. No collection, no API calls, no
+    publish.
 
     Shared by ``regenerate-aggregate`` and ``assess-city`` so the two cannot
     drift into publishing different sets of files — the failure mode being an
     artifact whose companion index still describes the previous state.
+
+    ``complete`` is False when the driving-plan join failed. That join is the
+    least load-bearing of the three and reads ~1,200 per-run JSONs, so it is
+    guarded the way _finish_batch guards it: an OSError there must not cost the
+    caller its publish (#167). But swallowing it and returning success too would
+    leave a scripted `regenerate-aggregate` unable to tell a full rebuild from a
+    partial one, so the outcome is returned rather than only logged — and each
+    caller decides what it means for ITS exit code. The two other artifacts stay
+    unguarded, matching _finish_batch: they describe the runs themselves, and a
+    caller must not publish an aggregate it failed to rebuild.
     """
     logger.info("Regenerating aggregate cities.json.gz")
     agg = generate_aggregate_v2(conn, cfg.data_dir)
     manifest = generate_streetwalk_manifest(conn, cfg.data_dir)
-    # The driving-plan join is the least load-bearing of the three and reads
-    # ~1,200 per-run JSONs, so it is guarded the way _finish_batch guards it: an
-    # OSError here must not cost the caller its publish (#167).
+    complete = True
     try:
         plan = generate_driving_plan_summary(conn, cfg.data_dir)
         plan_note = f"driving_plan.json.gz ({len(plan['records'])} plan records)."
     except Exception:
         logger.exception("Driving-plan summary regeneration failed")
         plan_note = "driving_plan.json.gz NOT regenerated (see log)."
-    return (
+        complete = False
+    summary = (
         f"Regenerated {cfg.data_dir}/cities.json.gz ({agg['cities_count']} cities); "
         f"streetwalks.json.gz ({len(manifest['walks'])} walks); " + plan_note
     )
+    return summary, complete
 
 
 def cmd_regenerate(cfg: SchedulerConfig, publish: bool = False) -> int:
@@ -981,9 +998,16 @@ def cmd_regenerate(cfg: SchedulerConfig, publish: bool = False) -> int:
     anything, then optionally publish. Useful after a code change to the
     aggregate schema, a manual/back-filled run, or to refresh stale published
     data — a clean one-liner instead of an inline Python snippet.
+
+    Exits nonzero if any artifact was left un-regenerated, while still
+    publishing the ones that were: the whole job of this command is to rebuild
+    the published JSON, so "it rebuilt two of three" must not read as success to
+    a wrapper. (``assess-city`` scores the same partial rebuild differently — it
+    is not what that command was asked to do.)
     """
     conn = db.connect(cfg.db_path)
-    print(_regenerate_published_json(conn, cfg))
+    summary, complete = _regenerate_published_json(conn, cfg)
+    print(summary)
 
     if publish:
         # An explicit --publish overrides [publish].enabled: the operator is
@@ -991,7 +1015,7 @@ def cmd_regenerate(cfg: SchedulerConfig, publish: bool = False) -> int:
         if _publish(cfg, "regenerate-aggregate (manual)") != 0:
             return 1
         print("Published to the web server.")
-    return 0
+    return 0 if complete else 1
 
 
 def cmd_fetch_driving_plan(
@@ -1376,17 +1400,24 @@ def _assess_preflight_report(
 
     lines.append("  cost")
     mapillary_tiles = 0
-    tile_rate = DEFAULT_TILE_REQUESTS_PER_MINUTE
+    tile_rates: set[int] = set()
     for channel in channels:
         pc = cfg.providers[channel]
         est = estimate_requests(
             city, channel, conn=conn, spacing_m=pc.spacing_m, network_type=pc.network_type
         )
         used = db.get_api_usage(conn, today, channel)
-        left = pc.daily_request_budget - used
-        # Wording matched to run-due --dry-run's: over-budget work is deferred,
-        # not abandoned, and saying "skipped" alone reads as the latter.
-        fits = "" if est <= left else "  ← OVER REMAINING BUDGET, deferred to a later run"
+        # The same two guards _run_city_channels applies, named apart because the
+        # operator's next move differs. Over the WHOLE budget can never succeed —
+        # tomorrow's fresh budget is the same size — so it needs a config change
+        # or a smaller grid, and calling it "deferred" (run-due --dry-run's
+        # wording for the other case) would promise a later run that never comes.
+        if est > pc.daily_request_budget:
+            fits = "  ← EXCEEDS THE ENTIRE DAILY BUDGET; raise it or shrink the grid"
+        elif est > pc.daily_request_budget - used:
+            fits = "  ← OVER REMAINING BUDGET, deferred to a later run"
+        else:
+            fits = ""
         lines.append(
             f"    {channel:<18} ~{est:>9,} requests   "
             f"({used:,} of {pc.daily_request_budget:,} spent today){fits}"
@@ -1397,13 +1428,16 @@ def _assess_preflight_report(
         # all, and reaching for that sibling would KeyError in the pre-flight.
         if HOST_MAPILLARY_TILES in CHANNEL_HOSTS.get(channel, ()):
             mapillary_tiles += est
-            if pc.max_requests_per_minute is not None:
-                tile_rate = pc.max_requests_per_minute
+            tile_rates.add(pc.max_requests_per_minute or DEFAULT_TILE_REQUESTS_PER_MINUTE)
     if mapillary_tiles:
+        # Every rate in play, not just the last channel's: the two Mapillary
+        # channels hold independent [providers.*] blocks and run back-to-back, so
+        # one figure beside a summed total would misreport a config that paces
+        # them differently.
+        rates = " and ".join(f"{r}/min" for r in sorted(tile_rates))
         lines.append(
             f"    Mapillary total {mapillary_tiles:,} tile requests from THIS HOST's IP "
-            f"(the block is per-IP, not per-token — issues #198/#205), paced at "
-            f"{tile_rate}/min."
+            f"(the block is per-IP, not per-token — issues #198/#205), paced at {rates}."
         )
     return "\n".join(lines)
 
@@ -1451,23 +1485,35 @@ def _assess_answer_report(cfg: SchedulerConfig, conn, city: db.CityRow) -> str:
     if not walked:
         lines.append("    (no road walk completed — the numbers above are all this run produced)")
 
-    run = db.get_latest_run(conn, city.city_id, "mapillary")
-    if run is not None:
-        rate = run.coverage_rate_pct
+    mapillary_run = db.get_latest_run(conn, city.city_id, "mapillary")
+    if mapillary_run is not None:
+        rate = mapillary_run.coverage_rate_pct
         lines.append(
             f"  Grid coverage (mapillary) {rate:.1f}% of grid points — an AREA measure "
             f"over water, parks and rooftops too. NOT the deployment number."
             if rate is not None
             else "  Grid coverage (mapillary) not recorded."
         )
+
+    # city.html is addressed by run-CSV filename and city.js derives the provider
+    # from that filename's token, so the link needs SOME grid run — which is why
+    # the Mapillary one is in ASSESS_CHANNELS. Fall back to the GSV run rather
+    # than only asking about Mapillary: an already-tracked city has one, and the
+    # Mapillary channel is routinely absent here (switched off after a per-IP
+    # block, narrowed away by --provider, over budget, or skipped by the host
+    # breaker). Claiming "no city page" while a perfectly good one exists sent
+    # the operator away without the link they ran this command for.
+    link_run = mapillary_run or db.get_latest_run(conn, city.city_id, "gsv")
+    if link_run is not None:
         # site_url defaults to "", which leaves a relative link — usable as-is on
         # a host with no configured public base.
-        link = f"city.html?file={run.csv_filename}&network={DEFAULT_NETWORK_TYPE}"
-        lines.append(f"  City page  {cfg.site_url}{link}")
+        link = f"city.html?file={link_run.csv_filename}&network={DEFAULT_NETWORK_TYPE}"
+        lines.append(f"  City page ({link_run.provider} run)  {cfg.site_url}{link}")
     else:
         lines.append(
-            "  No grid run yet, so there is no city page to link. The GSV grid run "
-            "lands on the next nightly batch (this city is now due and leads the queue)."
+            "  No grid run on any provider yet, so there is no city page to link "
+            "(generate_aggregate_v2 skips a city with no runs row). The GSV grid run "
+            "lands on the next nightly batch — that channel is due and leads the queue."
         )
     return "\n".join(lines)
 
@@ -1613,8 +1659,12 @@ def cmd_assess_city(
 
     # The tail runs even on a partial failure (#167): everything collected is
     # already in the catalog but invisible on the public site until the aggregate
-    # is rebuilt, and a partial answer is still an answer.
-    print(_regenerate_published_json(conn, cfg))
+    # is rebuilt, and a partial answer is still an answer. A failed driving-plan
+    # rebuild is deliberately NOT scored here, unlike in cmd_regenerate: it is
+    # unrelated to this city's numbers, and failing an answered inquiry over it
+    # would be the tail wagging the dog.
+    regen_summary, _regen_complete = _regenerate_published_json(conn, cfg)
+    print(regen_summary)
     publish_wanted = publish and cfg.publish_enabled
     published = False
     if publish_wanted:
@@ -1629,6 +1679,26 @@ def cmd_assess_city(
 
     print()
     print(_assess_answer_report(cfg, conn, city))
+    if publish and not cfg.publish_enabled:
+        # Said HERE, beside the link, because the link is built from the CATALOG
+        # rather than from what is live: with publishing off it reads exactly
+        # like an answer while pointing at stale or absent data, and the only
+        # other signal is the ABSENCE of "; published" from the summary line —
+        # which nobody reads as "not published". The realistic case is not a dev
+        # laptop but prod with publishing switched off during a block or a
+        # maintenance window, where the operator emails a partner a dead link.
+        #
+        # Deliberately a notice and not a --publish override: [publish].enabled
+        # is the host's own declaration, and moving publishing OUT of ambient
+        # state and INTO config is what the rest of issue #215 does. An override
+        # belongs to `regenerate-aggregate --publish`, whose job genuinely is
+        # "push the catalog to the site right now" — this is a collection
+        # command whose publish is a consequence, not the point.
+        print(
+            "  NOTE  [publish].enabled is false in this config, so nothing was rsynced. "
+            "The link above describes the catalog, not what is live. Publish with "
+            "`regenerate-aggregate --publish` when you mean to."
+        )
     blocked_note = f", {_host_names(blocked_hosts)} refused this host" if blocked_hosts else ""
     busy_note = f", {_host_names(busy_hosts)} busy locally" if busy_hosts else ""
     summary = (
@@ -1639,14 +1709,35 @@ def cmd_assess_city(
         + ("; published" if published else "")
     )
     print(f"  {summary}")
+    # What is due after this run, stated per channel rather than as a blanket
+    # "due on every channel" — which was the opposite of true for the channels
+    # this command just collected. A recorded success stamps last_success_at, and
+    # get_due_cities reads only that, so every collected channel is now the least
+    # stale thing in the catalog. That IS the intent (it stops tonight's batch
+    # re-spending the crawl), but it has the same cost `run-due --provider`
+    # carries, and #214 warns about it out loud rather than leaving it to be
+    # discovered.
     if newly_registered:
         print(
-            "  The GSV grid run is not part of this command: this city is now due on "
-            "every channel and leads the next nightly batch's queue."
+            "  The GSV grid run is not part of this command: it has no schedule_state "
+            "row yet, so it is due and leads the next nightly batch's queue."
         )
-    # Exit 0 only for a run that produced a COMPLETE, public answer, on every
-    # channel that was asked for. Three of these differ from how a nightly run
-    # scores itself, and deliberately:
+    if succeeded:
+        print(
+            f"  The {succeeded} channel(s) collected here recorded a success, which starts "
+            f"their own {cfg.cycle_days}-day clocks — so they are NOT due tonight, and this "
+            f"city's channels no longer share one run date until their cadences re-converge "
+            f"(the paired-snapshot cost `run-due --provider` also carries, issue #214)."
+        )
+    # Exit 0 only for a run that produced a COMPLETE answer on every channel that
+    # was asked for, and got it published if publishing was on the table at all.
+    # "Public" is conditional deliberately: `--no-publish` and a config with
+    # `[publish].enabled = false` are both declarations that this invocation does
+    # not publish, so neither is a failure — while a publish that was attempted
+    # and FAILED is (that is the `published or not publish_wanted` below, and the
+    # printed NOTE above is what keeps the two silent cases from passing
+    # unnoticed). Three of these differ from how a nightly run scores itself, and
+    # deliberately:
     #
     #   - `attempted == 0` is a failure, not a no-op. Every channel was skipped,
     #     so the operator has nothing to reply to the partner with.
