@@ -288,6 +288,50 @@ def rect_polygon_coverage(geometry: dict[str, Any] | None, bbox: BBox | None) ->
     return max(0.0, min(1.0, inside / total))
 
 
+def rect_in_boundary_frac(geometry: dict[str, Any] | None, bbox: BBox | None) -> float | None:
+    """
+    Fraction of the SEARCH RECTANGLE that lies inside a GeoJSON boundary
+    polygon — the reciprocal of rect_polygon_coverage, and the one that says
+    whether the imagery numbers a run produces are actually about this place.
+
+    The two answer different questions and both matter. Coverage asks "does the
+    grid capture the whole city?"; this asks "is what the grid samples the city
+    at all?". Northern Kentucky (2026-07-30) is the case study: county
+    rectangles whose in-boundary fraction was only 49-69%, where the remainder
+    was largely Cincinnati — whose dense recent GSV would have silently
+    flattered a coverage number quoted to a prospective deployment partner.
+
+    Uses the same shoelace-in-a-local-equirectangular-frame math as
+    polygon_area_m2 (no shapely). The rectangle's area is measured in a frame
+    anchored at its own mean latitude and the clipped polygon in one anchored
+    at the clipped ring's, which differ negligibly at city scale — the same
+    tolerance the rest of this module documents.
+
+    Args:
+        geometry: Nominatim's ``geojson`` for the place (see
+            geoutils.geocode_boundary_raw), or None.
+        bbox: the frozen search rectangle as (south, north, west, east) —
+            boundary_audit.frozen_rect_bounds produces it from catalog geometry.
+
+    Returns:
+        Fraction in [0, 1], or None when there is no usable polygon (Nominatim
+        answers with a Point for many places) or the rectangle is degenerate.
+    """
+    if not isinstance(geometry, dict) or bbox is None:
+        return None
+    # Rejects Point/LineString and zero-area multipolygons before any clipping.
+    if not polygon_area_m2(geometry):
+        return None
+    south, north, west, east = bbox
+    rect_area = _ring_area_m2(
+        [[west, south], [east, south], [east, north], [west, north]],
+    )
+    if rect_area <= 0:
+        return None
+    inside = _clipped_polygon_area_m2(geometry, bbox)
+    return max(0.0, min(1.0, inside / rect_area))
+
+
 # Module-level singleton so the default isn't a function call in the signature (B008).
 _DEFAULT_THRESHOLDS = Thresholds()
 

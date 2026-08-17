@@ -46,6 +46,12 @@ from . import (
     open_in_browser,
 )
 from .analysis import calculate_run_stats, detect_systemic_failure, print_df_summary
+from .city_registration import (
+    CityResolutionError,
+    cap_dimensions,
+    resolve_center,
+    resolve_or_register_city,
+)
 from .diff import compute_run_diff, generate_diff_filename, write_diff_detail
 from .download_common import (
     DownloadError,
@@ -61,52 +67,10 @@ from .json_summarizer import (
     generate_driving_plan_summary,
     generate_streetwalk_manifest,
 )
-from .naming import generate_run_filename, same_grid_geometry, sanitize_city_query_str
+from .naming import generate_run_filename, same_grid_geometry
 from .paths import get_default_data_dir, get_default_vis_dir
 
 logger = logging.getLogger(__name__)
-
-# Ceiling for auto-derived grid dimensions, per side (issue #166; supersedes
-# the 80 km value from #91). At the standard 20 m step, 40 km/side is ~4M grid
-# points — inside the production gsv daily budget (10M) with room for other
-# cities, and roughly twice Seattle's grid, comfortably more than an urban
-# core. Production data showed the old 80 km clamp still admitted grids no
-# night can absorb (Cairo ~10.5M points was skipped as over-budget every night,
-# and its ZERO_RESULTS fill alone OOMed the Mapillary tail — see #157/#166).
-# scripts/cap_oversized_grids.py applies this same cap retroactively; keep the
-# two in sync by importing this constant. NB the budget math above assumes the
-# standard 20 m step — this is a *dimension* cap, so a finer --step re-inflates
-# the point count (40 km/side at step 10 is ~16M points, over budget again).
-# Override with --width/--height for a genuinely larger area.
-MAX_GRID_DIM_M = 40_000
-
-
-def _resolve_center(city_loc_data):
-    """
-    Grid center from a geocode result: the OSM bounding-box midpoint when
-    available (correct — the grid dimensions are derived from that same bbox,
-    so the sampled rectangle actually covers the boundary), else the geocoder's
-    reported point as a fallback. Returns (lat, lng) or None.
-    """
-    if city_loc_data is None:
-        return None
-    center = city_loc_data.bbox_center
-    if center is not None:
-        return center
-    return (city_loc_data.latitude, city_loc_data.longitude)
-
-
-def _cap_dimensions(grid_width, grid_height, city):
-    """Clamp auto-derived grid dimensions to MAX_GRID_DIM_M, warning if clamped."""
-    capped_w = min(grid_width, MAX_GRID_DIM_M)
-    capped_h = min(grid_height, MAX_GRID_DIM_M)
-    if capped_w < grid_width or capped_h < grid_height:
-        logger.warning(
-            f"Derived grid for '{city}' is {grid_width:.0f}x{grid_height:.0f}m; "
-            f"clamping to {capped_w:.0f}x{capped_h:.0f}m (the OSM boundary is far "
-            f"larger than a typical city sample). Use --width/--height to override."
-        )
-    return capped_w, capped_h
 
 
 def parse_args():
@@ -316,74 +280,23 @@ def _resolve_geometry(conn, args):
     Returns:
         (city_row: db.CityRow, newly_registered: bool)
     """
-    city_row = db.resolve_city(conn, args.city)
-    if city_row is not None:
-        overrides = [
-            o
-            for o, v in (("--lat/--lng", args.lat), ("--width/--height", args.width))
-            if v is not None
-        ]
-        if overrides:
-            logger.warning(
-                f"{' and '.join(overrides)} ignored: '{args.city}' is already "
-                f"registered as {city_row.city_id} with frozen grid geometry "
-                f"(center {city_row.center_lat:.5f},{city_row.center_lon:.5f}, "
-                f"{city_row.grid_width_m}x{city_row.grid_height_m}m, "
-                f"step {city_row.step_m}m). Changing geometry would break "
-                f"run-to-run diffs."
-            )
-        return city_row, False
-
-    # Unknown city: geocode once and register with frozen geometry
-    city_loc_data = get_city_location_data(args.city)
-
-    if args.lat is not None:
-        center_lat, center_lng = args.lat, args.lng
-        print(f"Using user-provided coordinates: {center_lat}, {center_lng}")
-    elif city_loc_data:
-        center_lat, center_lng = _resolve_center(city_loc_data)
-    else:
-        logger.error(
-            f"Could not find coordinates for {args.city}. "
-            f"Use --lat and --lng to provide them manually."
+    # The logic itself lives in city_registration so the scheduler can register a
+    # city without importing this module's collectors (issue #215). Only the CLI's
+    # exit-on-failure policy stays here: a bad city query is a usage error for a
+    # one-shot command, but a raised exception for a library caller.
+    try:
+        return resolve_or_register_city(
+            conn,
+            query=args.city,
+            lat=args.lat,
+            lng=args.lng,
+            width=args.width,
+            height=args.height,
+            step=args.step,
         )
+    except CityResolutionError as e:
+        logger.error(str(e))
         sys.exit(1)
-
-    if args.width is not None:
-        grid_width, grid_height = args.width, args.height
-        print(f"Using provided dimensions: {grid_width:.1f}m x {grid_height:.1f}m")
-    else:
-        grid_width, grid_height = get_search_dimensions(args.city, 1000, 1000)
-        grid_width, grid_height = _cap_dimensions(grid_width, grid_height, args.city)
-
-    city_name = city_loc_data.city if city_loc_data else args.city.split(",")[0].strip()
-    state_name = city_loc_data.state if city_loc_data else None
-    state_code = city_loc_data.state_code if city_loc_data else None
-    country_name = city_loc_data.country if city_loc_data else None
-    country_code = city_loc_data.country_code if city_loc_data else None
-
-    city_id = db.register_city(
-        conn,
-        city_name=city_name,
-        state_name=state_name,
-        state_code=state_code,
-        country_name=country_name,
-        country_code=country_code,
-        center_lat=center_lat,
-        center_lon=center_lng,
-        grid_width_m=grid_width,
-        grid_height_m=grid_height,
-        step_m=args.step,
-    )
-    # Alias the user's query slug to the canonical id so future invocations
-    # with the same query resolve without geocoding (and geocoder naming
-    # drift can't re-register the city under a different id)
-    query_slug = sanitize_city_query_str(args.city)
-    if query_slug != city_id:
-        db.add_alias(conn, query_slug, city_id)
-
-    logger.info(f"Registered new city {city_id} with frozen geometry")
-    return db.resolve_city(conn, city_id), True
 
 
 def _compute_and_record_diff(
@@ -765,7 +678,7 @@ def _check_boundary(conn, args, vis_path: str) -> int:
         if args.lat is not None:
             center_lat, center_lng = args.lat, args.lng
         elif city_loc_data:
-            center_lat, center_lng = _resolve_center(city_loc_data)
+            center_lat, center_lng = resolve_center(city_loc_data)
         else:
             logging.error(
                 f"Could not find coordinates for {args.city}. "
@@ -777,7 +690,7 @@ def _check_boundary(conn, args, vis_path: str) -> int:
             grid_width, grid_height = args.width, args.height
         else:
             grid_width, grid_height = get_search_dimensions(args.city, 1000, 1000)
-            grid_width, grid_height = _cap_dimensions(grid_width, grid_height, args.city)
+            grid_width, grid_height = cap_dimensions(grid_width, grid_height, args.city)
         step = args.step
 
         # Same canonical id register_city would derive, so the preview

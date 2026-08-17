@@ -17,6 +17,7 @@ import pandas as pd
 import pytest
 
 from streetscape_metadata_tracker import cli, db
+from streetscape_metadata_tracker.city_registration import cap_dimensions
 from streetscape_metadata_tracker.download_common import (
     HOST_BUSY_EXIT_CODES,
     HOST_EXIT_CODES,
@@ -428,12 +429,12 @@ def test_cap_dimensions_clamps_each_side_to_40km():
     #166), so newly registered cities can't recreate the oversized grids that
     scripts/cap_oversized_grids.py had to fix retroactively."""
     # Cairo's real pre-cap OSM-derived geometry
-    w, h = cli._cap_dimensions(66_453, 63_475, "Cairo, Egypt")
+    w, h = cap_dimensions(66_453, 63_475, "Cairo, Egypt")
     assert (w, h) == (40_000, 40_000)
 
     # One long side clamps independently; the sane side is untouched
-    w, h = cli._cap_dimensions(51_568, 25_146, "Caracas, Venezuela")
+    w, h = cap_dimensions(51_568, 25_146, "Caracas, Venezuela")
     assert (w, h) == (40_000, 25_146)
 
     # At or under the cap passes through unchanged
-    assert cli._cap_dimensions(40_000, 12_000, "Fine") == (40_000, 12_000)
+    assert cap_dimensions(40_000, 12_000, "Fine") == (40_000, 12_000)

@@ -91,7 +91,7 @@ The repository includes several scripts divided into core data collection tools 
 
 * **`streetscape_tracker.py`**: The primary asynchronous data collection script. Each invocation collects one dated snapshot of a city, catalogs it, and diffs it against the previous run.
 * **`run_cities.py`**: A batch-processing wrapper that runs `streetscape_tracker.py` across multiple cities sequentially by reading configurations from a text file (e.g., `cities.txt`).
-* **`python -m streetscape_metadata_tracker.scheduler`**: The staggered quarterly scheduler (`status`, `assign`, `run-due`, `regenerate-aggregate` subcommands). `regenerate-aggregate [--publish]` rebuilds `cities.json.gz` from the catalog without collecting — handy after a schema change or manual run. See `deploy/README.md` for running it as a systemd timer.
+* **`python -m streetscape_metadata_tracker.scheduler`**: The staggered quarterly scheduler (`status`, `assign`, `run-due`, `regenerate-aggregate`, `assess-city` subcommands). `regenerate-aggregate [--publish]` rebuilds `cities.json.gz` from the catalog without collecting — handy after a schema change or manual run. `assess-city "City, Region"` is the same-day answer for a city we don't track yet: it registers the city, walks its streets on both providers, publishes, and prints the street-km coverage a deployment decision actually turns on (`--estimate` reports boundary fit and cost first, with no provider requests). See `deploy/README.md` for running it as a systemd timer.
 
 ### Data Utilities & Analysis
 

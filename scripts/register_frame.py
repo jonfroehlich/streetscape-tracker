@@ -61,7 +61,12 @@ from streetscape_metadata_tracker import (  # noqa: E402
     get_city_location_data,
     get_search_dimensions,
 )
-from streetscape_metadata_tracker.cli import _cap_dimensions, _resolve_center  # noqa: E402
+from streetscape_metadata_tracker.city_registration import (  # noqa: E402
+    cap_dimensions as _cap_dimensions,
+)
+from streetscape_metadata_tracker.city_registration import (  # noqa: E402
+    resolve_center as _resolve_center,
+)
 from streetscape_metadata_tracker.naming import sanitize_city_query_str  # noqa: E402
 from streetscape_metadata_tracker.paths import get_default_data_dir  # noqa: E402
 

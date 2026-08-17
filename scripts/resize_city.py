@@ -59,14 +59,14 @@ def _grid_points(width_m: float, height_m: float, step_m: float) -> int:
 def _resolve_recenter(city_query: str, lat: float, lon: float) -> tuple[float, float]:
     """
     OSM bbox midpoint for ``city_query`` (a single geocode), falling back to the
-    current center on any failure. Uses the same _resolve_center logic as a real
+    current center on any failure. Uses the same resolve_center logic as a real
     collection run so the recentered grid matches what the pipeline would pick.
     """
-    from streetscape_metadata_tracker.cli import _resolve_center
+    from streetscape_metadata_tracker.city_registration import resolve_center
     from streetscape_metadata_tracker.geoutils import get_city_location_data
 
     loc = get_city_location_data(city_query, lat, lon)
-    center = _resolve_center(loc)
+    center = resolve_center(loc)
     if center is None:
         logger.warning("Geocode for '%s' returned no center; keeping current center.", city_query)
         return lat, lon
