@@ -113,7 +113,7 @@ def generate_missing_city_json_files(data_dir: str) -> None:
     )
 
     cnt_generated_json_files = 0
-    for csv_path in tqdm(missing_json_files, desc="Generating metadata .json files"):
+    for csv_path in tqdm(missing_json_files, desc="Generating metadata .json files", disable=None):
         try:
             params = parse_filename(csv_path)
             city_query_str = params.city_query_str
@@ -781,7 +781,19 @@ def generate_aggregate_v2(conn, data_dir: str) -> dict[str, Any]:
     # Raw per-run JSON of each city's latest run per provider, for the merge
     latest_run_jsons_by_provider: dict[str, list[dict]] = {}
 
-    for city in tqdm(db.get_all_cities(conn), desc="Aggregating cities", unit="city"):
+    # disable=None is tqdm's "off unless the stream is a TTY", and it is load
+    # bearing here rather than cosmetic. This bar is the FIRST statement of the
+    # scheduler's tail (_finish_batch), and tqdm's status_printer flushes the raw
+    # sys.stderr/sys.stdout — outside the DisableOnWriteError wrapper that guards
+    # its own writes — so a dead output stream raises instead of quietly
+    # disabling the bar. On 2026-08-17 a manual `run-due ... | tail -40` whose
+    # reader had gone away collected 10/10 cities and then published none of
+    # them: BrokenPipeError here took out the aggregate, the manifest, the
+    # driving-plan summary, the tail catalog backup and the publish. Every other
+    # tqdm in this package carries the flag for the same reason (a child
+    # collector's stdout is a log file, not a terminal), which also keeps the \r
+    # refresh frames out of the per-attempt logs an operator has to read.
+    for city in tqdm(db.get_all_cities(conn), desc="Aggregating cities", unit="city", disable=None):
         runs_by_provider: dict[str, list] = {}
         for run in db.get_runs_for_city(conn, city.city_id, provider=None):
             runs_by_provider.setdefault(run.provider, []).append(run)

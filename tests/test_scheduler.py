@@ -2573,6 +2573,12 @@ def test_a_failing_plan_summary_does_not_take_down_the_rest_of_the_tail(conn, mo
     the guard, one of those would have cost a completely healthy night its
     backup AND its publish: issue #167's exact failure mode, paid for the
     least important artifact in the tail.
+
+    "Least important" bounds the BLAST RADIUS, not the reporting: the failure
+    also alerts and exits nonzero. Logging and continuing silently — the
+    original behavior — let a permanently broken plan page rot while every night
+    still reported a clean success, which is the observability half of #145's
+    lesson.
     """
     from streetscape_metadata_tracker import scheduler as sched
 
@@ -2606,6 +2612,10 @@ def test_a_failing_plan_summary_does_not_take_down_the_rest_of_the_tail(conn, mo
     )
     _stub_tail(monkeypatch, sched, conn, published)
 
+    alerts = []
+    monkeypatch.setattr(sched, "send_alert", lambda cfg, subj, body: alerts.append((subj, body)))
+    monkeypatch.setattr(sched, "_recent_log_tail", lambda cfg, n=40: "")
+
     rc = sched.cmd_run_due(_publishing_cfg(), today=date(2026, 7, 2))
 
     assert len(ran) == 1
@@ -2613,7 +2623,11 @@ def test_a_failing_plan_summary_does_not_take_down_the_rest_of_the_tail(conn, mo
         "a stale plan page costs a day; an unpublished night costs the runs"
     )
     assert len(backups) == 2, "both the pre-flight and the TAIL backup must still happen"
-    assert rc == 0, "a plan-summary failure alone is not an unhealthy night"
+    assert rc == 1, "a failed index is reported even though it cost the tail nothing"
+    assert len(alerts) == 1
+    assert "1 published index(es) FAILED" in alerts[0][0]
+    assert "driving-plan summary failed" in alerts[0][1], "the alert must name WHICH index broke"
+    assert "data_dir vanished mid-tail" in alerts[0][1]
 
 
 def test_driving_plan_hook_respects_dry_run_and_enabled_flag(conn, monkeypatch, capsys):
@@ -2793,6 +2807,75 @@ def test_a_failed_backup_makes_the_night_unhealthy_but_still_publishes(conn, mon
     assert len(alerts) == 1
     assert "CATALOG BACKUP FAILED" in alerts[0][0]
     assert "disk full" in alerts[0][1]
+
+
+def test_a_failed_aggregate_still_backs_up_and_publishes(conn, monkeypatch):
+    """
+    The aggregate rebuild is the FIRST statement of the tail, and until this
+    guard it was unguarded — so a crash there skipped the streetwalk manifest,
+    the plan summary, the tail catalog backup AND the publish. That happened on
+    2026-08-17: a manual `run-due ... | tail -40` whose pipe reader had gone away
+    collected 10/10 cities, then died on a BrokenPipeError out of the aggregate's
+    progress bar and published none of them. #167's failure mode, relocated from
+    the city loop into the tail.
+
+    Continuing is safe because every index is written via
+    _write_json_gz_atomic, so a failed rebuild leaves the PREVIOUS good file in
+    place: the publish ships a stale-but-valid index, never a truncated one. A
+    stale index costs a day and one `regenerate-aggregate`; an unpublished night
+    costs every artifact the night collected plus its backup.
+
+    The manifest must still be attempted — separate file, separate reader
+    (streets.html) — which is why each rebuild is wrapped individually.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    _register(conn, "Alpha", width=1000, height=1000, step=20)
+    db.assign_schedule(conn, 90)
+    conn.execute("UPDATE schedule_state SET last_success_at = NULL")
+    conn.commit()
+
+    backups = []
+    monkeypatch.setattr(
+        sched.catalog_backup,
+        "write_backup",
+        lambda conn, backup_dir, when, **kw: (
+            backups.append(when)
+            or sched.catalog_backup.BackupResult(
+                ok=True, path=os.path.join(backup_dir, "stubbed.backup")
+            )
+        ),
+    )
+
+    ran, published = [], []
+    monkeypatch.setattr(
+        sched,
+        "_run_one_city",
+        lambda cfg, city, today, provider="gsv", **kw: ran.append(city.city_id) or True,
+    )
+    _stub_tail(monkeypatch, sched, conn, published)
+
+    def boom(c, data_dir):
+        raise BrokenPipeError(32, "Broken pipe")
+
+    monkeypatch.setattr(sched, "generate_aggregate_v2", boom)
+
+    alerts = []
+    monkeypatch.setattr(sched, "send_alert", lambda cfg, subj, body: alerts.append((subj, body)))
+    monkeypatch.setattr(sched, "_recent_log_tail", lambda cfg, n=40: "")
+
+    rc = sched.cmd_run_due(_publishing_cfg(), today=date(2026, 7, 2))
+
+    assert len(ran) == 1, "the city loop must still run"
+    assert published == ["manifest", "publish"], (
+        "a broken aggregate must cost neither the manifest nor the publish"
+    )
+    assert len(backups) == 2, "both the pre-flight and the TAIL backup must still happen"
+    assert rc == 1, "a failed index is an unhealthy night"
+    assert len(alerts) == 1
+    assert "1 published index(es) FAILED" in alerts[0][0]
+    assert "aggregate index failed" in alerts[0][1]
+    assert "BrokenPipeError" in alerts[0][1], "the alert must carry the cause, not just the label"
 
 
 def test_backup_failure_alerts_even_below_the_failure_threshold(conn, monkeypatch):

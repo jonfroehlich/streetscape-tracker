@@ -819,7 +819,9 @@ async def _fetch_city_images(
         if max_requests_per_minute > 0
         else "Tile pacing DISABLED (max_requests_per_minute <= 0)"
     )
-    progress_bar = tqdm(total=len(tiles), desc=f"Downloading Mapillary tiles for {city_name}")
+    progress_bar = tqdm(
+        total=len(tiles), desc=f"Downloading Mapillary tiles for {city_name}", disable=None
+    )
 
     def count_request() -> None:
         nonlocal api_requests

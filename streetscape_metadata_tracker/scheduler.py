@@ -2862,6 +2862,39 @@ def _run_city_loop(
     return processed, succeeded, attempted, skipped_budget, stop_reason, blocked_hosts, busy_hosts
 
 
+def _tail_artifact(label: str, fn, conn, data_dir: str) -> str | None:
+    """
+    Rebuild one published index, turning a crash into a reported error rather
+    than a lost tail (issue #167).
+
+    The tail — indexes, catalog backup, publish — is what makes a night visible,
+    and #167's lesson is that it must survive every way the work before it can
+    fail. That was applied to the city loop but not to the tail's own first
+    statements: on 2026-08-17 a `run-due ... | tail -40` whose pipe reader had
+    gone away collected 10/10 cities and published none of them, because a
+    BrokenPipeError out of the aggregate's progress bar (see the disable=None
+    comment in json_summarizer.generate_aggregate_v2) skipped the manifest, the
+    driving-plan summary, the tail backup AND the publish.
+
+    Continuing past a failure is safe because all three indexes are written via
+    json_summarizer._write_json_gz_atomic, so a failed rebuild leaves the
+    PREVIOUS good file in place — the publish that follows ships a stale-but-
+    valid index, never a truncated one. That is the cheaper loss by a wide
+    margin: a stale index costs a day and one `regenerate-aggregate`, while an
+    unpublished night costs every artifact the night collected plus its backup.
+
+    Returns None on success, or a one-line error for the caller to report. The
+    error is REPORTED, not swallowed: an index that fails forever is exactly the
+    kind of thing #145 was about, so the night alerts and exits nonzero.
+    """
+    try:
+        fn(conn, data_dir)
+        return None
+    except Exception as e:
+        logger.exception(f"{label} failed; continuing with the rest of the tail")
+        return f"{label} failed: {type(e).__name__}: {e}"
+
+
 def _finish_batch(
     cfg: SchedulerConfig,
     conn,
@@ -2886,6 +2919,10 @@ def _finish_batch(
     alert is sent. ``today`` is passed in rather than read from the clock so a
     long night stamps the backup with the date the batch belongs to.
 
+    The index rebuilds go through ``_tail_artifact``, so a crash in one of them
+    is reported (alert + nonzero exit) without costing the catalog backup and
+    the publish that follow — the same #167 posture the city loop already had.
+
     ``blocked_hosts`` names the per-IP hosts that refused us, and ``busy_hosts``
     counts channels skipped because another local process held a host lock
     (issue #208). Both alert unconditionally and exit nonzero, for the same
@@ -2895,11 +2932,24 @@ def _finish_batch(
     success. They stay separate in the subject line because the operator's next
     move differs: a block is waited out, a busy lock is somebody's stray process.
     """
+    # Every index rebuild goes through _tail_artifact, which reports a failure
+    # instead of propagating it — see there for why a lost tail is the worse
+    # outcome. Each is wrapped SEPARATELY: they are independent files with
+    # independent readers (cities.json.gz feeds the overview map,
+    # streetwalks.json.gz feeds streets.html), so a broken aggregate must not
+    # also cost the manifest.
+    tail_errors: list[str] = []
+
+    def rebuild(label: str, fn) -> None:
+        error = _tail_artifact(label, fn, conn, cfg.data_dir)
+        if error:
+            tail_errors.append(error)
+
     # Regenerate the aggregate once for the whole batch
     if succeeded > 0:
         logger.info("Regenerating aggregate cities.json.gz")
-        generate_aggregate_v2(conn, cfg.data_dir)
-        generate_streetwalk_manifest(conn, cfg.data_dir)
+        rebuild("aggregate index", generate_aggregate_v2)
+        rebuild("streetwalk manifest", generate_streetwalk_manifest)
 
     # Deliberately NOT gated on succeeded > 0, unlike the two above. Those
     # describe the runs the night collected, so with nothing collected there is
@@ -2917,11 +2967,14 @@ def _finish_batch(
     # publish of a night that was otherwise completely healthy. That is #167's
     # failure mode, and this artifact is the least important thing in the tail:
     # a stale plan page costs a day, an unpublished night costs the runs.
+    #
+    # "Least important" argued only against taking the tail down, never against
+    # being reported — so it goes through _tail_artifact like the two above and
+    # now alerts and exits nonzero. Before that it logged and continued, which
+    # meant a permanently broken plan page could rot indefinitely with every
+    # night still reporting a clean success.
     logger.info("Regenerating driving_plan.json.gz")
-    try:
-        generate_driving_plan_summary(conn, cfg.data_dir)
-    except Exception:
-        logger.exception("Driving-plan summary failed; continuing with the rest of the tail")
+    rebuild("driving-plan summary", generate_driving_plan_summary)
 
     # Back up again now that the night's runs, diffs and walks are registered:
     # the pre-flight copy (see _backup_catalog_nightly) guarantees a copy
@@ -2973,6 +3026,7 @@ def _finish_batch(
     if (
         errored
         or backup_error
+        or tail_errors
         or blocked_hosts
         or busy_hosts
         or should_alert(failures, cfg.alerts.failure_threshold)
@@ -2984,31 +3038,38 @@ def _finish_batch(
         parts = []
         if backup_error:
             parts.append("CATALOG BACKUP FAILED")
+        if tail_errors:
+            parts.append(f"{len(tail_errors)} published index(es) FAILED")
         if blocked_hosts:
             parts.append(f"{len(blocked_hosts)} host(s) UNAVAILABLE")
         if busy_hosts:
             parts.append(f"{sum(busy_hosts.values())} channel(s) SKIPPED (host busy)")
-        if failures or not (backup_error or blocked_hosts or busy_hosts):
+        if failures or not (backup_error or tail_errors or blocked_hosts or busy_hosts):
             parts.append(f"{failures} failed collection(s)")
         subject = f"{' + '.join(parts)} on {host}"
         body = (
             summary
             + (f"\n\n{backup_error}" if backup_error else "")
+            # Named individually: which index broke decides the operator's next
+            # move (a `regenerate-aggregate --publish` fixes a bad rebuild, but a
+            # failing driving-plan summary means Google's feed changed shape).
+            + ("\n\n" + "\n".join(tail_errors) if tail_errors else "")
             + (f"\n\n{blocked_note}" if blocked_note else "")
             + (f"\n\n{busy_note}" if busy_note else "")
         )
         send_alert(cfg.alerts, subject, f"{body}\n\nRecent log:\n{_recent_log_tail(cfg)}")
 
-    # A backup failure, a blocked host or a locally-busy one makes the night
-    # unhealthy even when every attempted city landed — publishing still happened
-    # above (the #167 posture: never withhold what was collected), but the unit
-    # should go red so systemd and [alerts] both show it. For the two host
-    # conditions this is the ONLY signal, since neither records a per-city
-    # failure by design.
+    # A backup failure, a failed index rebuild, a blocked host or a locally-busy
+    # one makes the night unhealthy even when every attempted city landed —
+    # publishing still happened above (the #167 posture: never withhold what was
+    # collected), but the unit should go red so systemd and [alerts] both show
+    # it. For the two host conditions this is the ONLY signal, since neither
+    # records a per-city failure by design.
     if (
         succeeded == attempted
         and not errored
         and not backup_error
+        and not tail_errors
         and not blocked_hosts
         and not busy_hosts
     ):

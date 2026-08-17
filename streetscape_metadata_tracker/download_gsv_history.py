@@ -327,7 +327,10 @@ async def harvest_gsv_history_async(
     semaphore = asyncio.Semaphore(connection_limit)
     timeout = aiohttp.ClientTimeout(total=request_timeout)
     progress = tqdm(
-        total=len(grid_points), initial=len(done), desc=f"Harvesting GSV history for {city_name}"
+        total=len(grid_points),
+        initial=len(done),
+        desc=f"Harvesting GSV history for {city_name}",
+        disable=None,
     )
 
     async def query_point(session, lat, lon, i, j):

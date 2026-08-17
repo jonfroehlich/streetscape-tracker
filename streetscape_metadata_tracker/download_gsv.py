@@ -537,6 +537,7 @@ async def collect_points_async(
                 total=len(all_points),
                 initial=len(processed_points),
                 desc=f"Downloading GSV pano data{f' for {city_label}' if city_label else ''}",
+                disable=None,
             )
 
             # Process initial points in batches

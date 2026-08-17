@@ -367,7 +367,10 @@ def create_visualization_map(df: pd.DataFrame, city_name: str, provider: str = "
     marker_data = []
     markers_fg = folium.FeatureGroup(name="Pano Markers")  # Create feature group for markers
     for idx, row in tqdm(
-        valid_rows.iterrows(), total=len(valid_rows), desc=f"Creating {label} point map markers"
+        valid_rows.iterrows(),
+        total=len(valid_rows),
+        desc=f"Creating {label} point map markers",
+        disable=None,
     ):
         capture_date = row["capture_date"]
         date_str = capture_date.strftime("%Y-%m")
