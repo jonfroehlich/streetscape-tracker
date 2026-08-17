@@ -55,7 +55,13 @@ from streetscape_metadata_tracker.analysis import (  # noqa: E402
 )
 from streetscape_metadata_tracker.fileutils import load_city_csv_file  # noqa: E402
 from streetscape_metadata_tracker.paths import get_default_data_dir  # noqa: E402
-from streetscape_street_analyzer.download_street_network import fetch_street_edges  # noqa: E402
+
+# NOTE: streetscape_street_analyzer.download_street_network is imported lazily in
+# analyze_area() rather than here — it pulls the whole geo stack (geopandas,
+# osmnx, shapely) at import time, and --figures-from-metrics must be runnable
+# without it. That flag exists so the committed figures can be regenerated from
+# the committed metrics JSON on any machine; requiring geopandas to redraw a
+# line chart would defeat it.
 
 logger = logging.getLogger(__name__)
 
@@ -338,6 +344,8 @@ def analyze_area(args, conn, area_key: str) -> dict:
     lattice = lattice_frame(generate_lattice(origin, i5, j5, FINE_STEP_M))
     df_idx = attach_indices(df, lattice)
     run_date = pd.to_datetime(df_idx["query_timestamp"].iloc[0]).date()
+
+    from streetscape_street_analyzer.download_street_network import fetch_street_edges
 
     edges = fetch_street_edges(city, args.data_dir, conn=None)
     road_mask_lattice = road_clip_mask(lattice, edges, args.clip_dist)
@@ -673,6 +681,161 @@ def write_report(results: list[dict], out_dir: str) -> str:
     return path
 
 
+def _ecdf(hist: dict) -> tuple[np.ndarray, np.ndarray]:
+    """Cumulative % at each bin's right edge, from a committed histogram block."""
+    counts = np.asarray(hist["counts"], dtype=float)
+    edges = np.asarray(hist["bin_edges"], dtype=float)
+    return edges[1:], 100.0 * np.cumsum(counts) / hist["n_total"]
+
+
+def make_distribution_figures(areas: dict, fig_dir: str) -> list[str]:
+    """
+    The two distance-distribution figures, plotted from the committed
+    `grid-density_metrics.json` histograms rather than the (gitignored) raw
+    CSVs — so they regenerate from what is in git.
+
+    Deliberately two different forms, because the questions differ: spacing asks
+    about SHAPE (is the interval regulated?), so it gets a density curve where
+    the ~10 m spike is the message; offset asks about THRESHOLD EXCEEDANCE (how
+    much lands beyond Google's documented radius?), so it gets an ECDF where a
+    reference line and the share past it can be read directly.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    os.makedirs(fig_dir, exist_ok=True)
+    written = []
+    ordered = [(k, areas[k]) for k in AREA_COLORS if k in areas]
+
+    # 1. Pano-to-pano spacing density. Share per bin, not counts: the areas
+    # differ ~18x in pano count and the SHAPE is the finding.
+    fig, ax = plt.subplots(figsize=(7, 4.5), facecolor=SURFACE)
+    _style_axis(ax)
+    sub5 = {}
+    for key, blk in ordered:
+        h = blk["distributions"]["pano_nearest_neighbor_m"]
+        edges = np.asarray(h["bin_edges"], dtype=float)
+        centers = (edges[:-1] + edges[1:]) / 2.0
+        share = 100.0 * np.asarray(h["counts"], dtype=float) / h["n_total"]
+        # The share landing in a +-1 m band around 10 m is the actual evidence
+        # that the interval is regulated; the median alone cannot show it,
+        # because a bimodal distribution can have the same median.
+        band = share[(centers >= 9.0) & (centers <= 11.0)].sum()
+        sub5[key] = share[centers < 5.0].sum()
+        ax.plot(
+            centers,
+            share,
+            drawstyle="steps-mid",
+            color=AREA_COLORS[key],
+            linewidth=2,
+            label=f"{blk['label'].split('(')[0].strip()} (n={h['n_total']:,})",
+        )
+        # Direct label at each peak — identity is never color-alone. Peaks sit
+        # at clearly different heights, so a plain right-offset cannot collide.
+        pk = int(np.argmax(share))
+        ax.annotate(
+            f"{band:.0f}% within 9–11 m",
+            xy=(centers[pk], share[pk]),
+            xytext=(9, -3),
+            textcoords="offset points",
+            color=AREA_COLORS[key],
+            fontsize=9,
+            fontweight="bold",
+        )
+    # No text label on this line: the x-axis tick sits on 10 and every direct
+    # label already names the 9-11 m band, so a "10 m" tag only adds collisions.
+    ax.axvline(10.0, color=INK_2, linewidth=1, linestyle="--", alpha=0.55)
+    # The secondary sub-5 m mode is a finding, not noise: it is where nearest
+    # neighbour stops measuring the along-track capture interval and starts
+    # measuring overlapping passes (one-way pairs, re-drives, multi-lane).
+    worst = max(sub5, key=lambda k: sub5[k])
+    ax.annotate(
+        f"second mode ≈2.6 m\n{worst.title()}: {sub5[worst]:.1f}% under 5 m\n(overlapping passes)",
+        xy=(2.7, 4.0),
+        xytext=(0.6, 17),
+        textcoords="data",
+        color=INK_2,
+        fontsize=8.5,
+        arrowprops={"arrowstyle": "-", "color": INK_2, "alpha": 0.5, "linewidth": 1},
+    )
+    ax.set_xlim(0, 20)
+    ax.set_xlabel("Distance to nearest other official pano (m)", color=INK_2, fontsize=10)
+    ax.set_ylabel("Share of official panos (% per 0.25 m bin)", color=INK_2, fontsize=10)
+    ax.legend(frameon=False, fontsize=9, labelcolor=INK_2, loc="upper left")
+    ax.set_title(
+        "Official GSV panos sit on a regulated ~10 m interval",
+        color=INK,
+        fontsize=11,
+        loc="left",
+    )
+    fig.tight_layout()
+    p = os.path.join(fig_dir, "grid-density-pano_spacing.png")
+    fig.savefig(p, dpi=150, facecolor=SURFACE)
+    plt.close(fig)
+    written.append(p)
+
+    # 2. Query-to-pano offset ECDF, against the documented 50 m default radius.
+    fig, ax = plt.subplots(figsize=(7, 4.5), facecolor=SURFACE)
+    _style_axis(ax)
+    for i, (key, blk) in enumerate(ordered):
+        h = blk["distributions"]["query_to_pano_m"]
+        xs_, ys_ = _ecdf(h)
+        ax.plot(
+            xs_,
+            ys_,
+            color=AREA_COLORS[key],
+            linewidth=2,
+            label=blk["label"].split("(")[0].strip(),
+        )
+        # All three curves are near-saturated at x=50, so labels anchored to the
+        # curve would overlap. Stack them in the empty mid-right of the plot and
+        # lead back to the crossing point.
+        at50 = float(np.interp(50.0, xs_, ys_))
+        ax.annotate(
+            f"{100.0 - at50:.1f}% beyond 50 m",
+            xy=(50.0, at50),
+            xytext=(74.0, 74.0 - i * 9.0),
+            textcoords="data",
+            color=AREA_COLORS[key],
+            fontsize=9,
+            fontweight="bold",
+            arrowprops={
+                "arrowstyle": "-",
+                "color": AREA_COLORS[key],
+                "alpha": 0.45,
+                "linewidth": 1,
+            },
+        )
+    ax.axvline(50.0, color=INK_2, linewidth=1, linestyle="--", alpha=0.55)
+    ax.annotate(
+        "Google's documented\ndefault radius (50 m)",
+        xy=(50.0, 8),
+        xytext=(-96, 0),
+        textcoords="offset points",
+        color=INK_2,
+        fontsize=9,
+    )
+    ax.set_xlim(0, 160)
+    ax.set_ylim(0, 101)
+    ax.set_xlabel("Distance from query point to returned pano (m)", color=INK_2, fontsize=10)
+    ax.set_ylabel("Cumulative share of official returns (%)", color=INK_2, fontsize=10)
+    ax.legend(frameon=False, fontsize=9, labelcolor=INK_2, loc="lower right")
+    ax.set_title(
+        "Returns exceed Google's documented 50 m default radius (we set none)",
+        color=INK,
+        fontsize=11,
+        loc="left",
+    )
+    fig.tight_layout()
+    p = os.path.join(fig_dir, "grid-density-query_offset_ecdf.png")
+    fig.savefig(p, dpi=150, facecolor=SURFACE)
+    plt.close(fig)
+    written.append(p)
+    return written
+
+
 def main(argv: list | None = None) -> int:
     parser = argparse.ArgumentParser(description="Issue #106 grid-density experiment analysis.")
     parser.add_argument("--area", default="all", choices=[*STUDY_AREAS, "all"])
@@ -682,12 +845,30 @@ def main(argv: list | None = None) -> int:
     parser.add_argument("--match-dist", type=float, default=25.0)
     parser.add_argument("--no-figures", action="store_true")
     parser.add_argument(
+        "--figures-from-metrics",
+        metavar="PATH",
+        help=(
+            "Regenerate only the distance-distribution figures from a committed "
+            "grid-density_metrics.json and exit. Needs no DB, no raw CSVs and no "
+            "geo stack — the point is that these figures survive without the "
+            "(gitignored) raw collection."
+        ),
+    )
+    parser.add_argument(
         "--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"]
     )
     args = parser.parse_args(argv)
     logging.basicConfig(
         level=getattr(logging, args.log_level), format="%(asctime)s - %(levelname)s - %(message)s"
     )
+
+    if args.figures_from_metrics:
+        with open(args.figures_from_metrics, encoding="utf-8") as fh:
+            metrics = json.load(fh)
+        fig_dir = os.path.join(os.path.dirname(args.figures_from_metrics), "figures")
+        for p in make_distribution_figures(metrics["areas"], fig_dir):
+            print(f"Figure: {p}")
+        return 0
 
     conn = db.connect(db.get_default_db_path(args.data_dir))
     try:
