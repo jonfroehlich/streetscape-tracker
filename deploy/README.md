@@ -20,7 +20,10 @@ this is deliberately split:
 | Public web docroot | `/cse/web/research/makelab/public/streetscape-tracker/` | On a *different* host (the web-file server); served at `makeabilitylab.cs.washington.edu/public/streetscape-tracker/`. Holds only the flattened website + published `*.csv.gz`/`*.json.gz`. |
 
 Because makelab1 mounts the docroot directly, **publishing is a local
-rsync — no SSH to the docroot host** (`STREETSCAPE_PUBLISH_LOCAL=1`, set in the systemd unit).
+rsync — no SSH to the docroot host**. That is declared as `local = true` in the
+config's `[publish]` block, so a hand-run publish behaves like the nightly one;
+the systemd unit also still exports `STREETSCAPE_PUBLISH_LOCAL=1` as a
+belt-and-braces fallback for older checkouts (issue #215).
 
 ## 1. One-time setup
 
@@ -259,6 +262,90 @@ Both alert unconditionally, exit nonzero, and still publish — and both record
 queue rather than burning their `consecutive_failures` budget (five of those
 would quarantine a city for a whole 90-day cycle, and nothing but a success ever
 resets that counter).
+
+### On-demand catch-up for one channel (issue #214)
+
+The supported way to catch a channel up — **never** a detached bespoke script,
+which is what earned the 2026-08-14 bans:
+
+```bash
+python -m streetscape_metadata_tracker.scheduler --config <prod.toml> \
+  run-due --provider mapillary --limit 40
+```
+
+`--provider` takes enabled channel names (repeatable, or comma-separated) and
+`--limit N` overrides `[schedule].max_cities_per_day` for that invocation only
+(the nightly unit passes no `--limit` and is unaffected). Both refuse a bad value
+with exit **64** rather than running a night that collects nothing: an unknown or
+`enabled = false` channel, a value naming no channel at all, or `--limit < 1`.
+Exit 64 is deliberately distinct from argparse's own 2.
+
+Routing through `run-due` is the point — it inherits the daily budget ledger,
+stalest-first ordering, per-channel cadence and failure counting, the host lock,
+fail-fast, the night-level breaker, alerting, orphan salvage and the publish tail.
+
+One real cost: it advances **only** the named channels' clocks, so the cities it
+touches stop sharing a run date with their other channels until the cadences
+re-converge. The run logs a warning naming the channels left behind.
+
+### Answering a deployment inquiry the same day (issue #215)
+
+A Project Sidewalk inquiry arrives about a city we don't track and the useful
+reply happens *today*, not after the next nightly cycle:
+
+```bash
+# 1. Price it first: registers the city, reports boundary fit and per-channel
+#    cost, issues ZERO provider requests.
+python -m streetscape_metadata_tracker.scheduler --config <prod.toml> \
+  assess-city "Newport, Kentucky" --estimate
+
+# 2. Then collect + publish + print the numbers.
+python -m streetscape_metadata_tracker.scheduler --config <prod.toml> \
+  assess-city "Newport, Kentucky" --yes
+```
+
+It runs the **GSV road walk**, the **Mapillary road walk** and the cheap
+**Mapillary grid run**, regenerates the published JSON, publishes, and prints the
+street-km figures plus a city-page link.
+
+**Answer from street coverage, not grid coverage.** Grid points land on river,
+rail, parkland and rooftops, so grid percentages understate street availability
+badly: Highland Heights measured 55.6% grid vs **92.8% of street-km**, Covington
+8.2% vs **50.8%** on Mapillary. The printed report leads with street-km and
+labels grid coverage as an area measure that is not the deployment number.
+
+**Read the in-boundary line before spending.** The tracker samples a rectangle.
+For the four NKY counties only **49–69%** of each rectangle fell inside the
+county, and the remainder was largely Cincinnati — whose dense recent GSV would
+have flattered every figure quoted to the partner. Newport, KY scores 46% on
+today's geometry. When the fraction is low, consider a compact city grid
+alongside the county: pass `--width/--height` **together with `--lat/--lng`**
+(size alone is refused, because it would freeze the grid on the OSM bounding-box
+midpoint rather than downtown — and geometry is frozen forever).
+
+Notes:
+
+- **Safe to run while the nightly batch is going.** The GSV walk is metered per
+  Google *project*, so it carries no per-IP exposure; the Mapillary channels go
+  through the host lock and, if the batch holds it, fail fast with exit 79 —
+  re-run them later. The command never marks the city failed.
+- **It does not run the GSV grid run.** That is the expensive half, and it needs
+  no help: a newly registered city is enabled with no successful run yet, so it
+  leads the next night's stalest-first queue. The channels it *does* collect
+  record a success, so they are not due again for a cycle — the closing report
+  says so, along with the paired-snapshot cost that carries (same as
+  `run-due --provider`).
+- **There is no `--publish` flag, only `--no-publish`.** Publishing follows
+  `[publish].enabled`, which is the host's declaration; the override lives on
+  `regenerate-aggregate --publish`, the incident-time handle. If publishing is
+  switched off in the config, the run prints a NOTE beside the city-page link
+  saying the link describes the catalog rather than what is live — read it
+  before sending that link to a partner.
+- **Publishing needs no environment variable.** `[publish].local = true` in the
+  prod config makes `_publish` pass `--local` explicitly. Before that, a
+  hand-run publish took the SSH path, failed with rsync code 12, and emailed a
+  publish-FAILED alert that looked like an outage — if you see that on an older
+  checkout, `export STREETSCAPE_PUBLISH_LOCAL=1` first.
 
 ### Backups (verified with CSE IT, 2026-08-05 — issue #145)
 

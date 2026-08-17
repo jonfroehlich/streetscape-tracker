@@ -23,8 +23,9 @@ differently:
     engine — rate limiter, OVER_QUERY_LIMIT retry, ``.downloading`` resume —
     via ``download_gsv.collect_points_async``.
   * **mapillary** has no per-point endpoint: it reads the z14 vector-tile
-    census once (tens of requests for a whole city, regardless of spacing) and
-    joins it onto the sample points locally. See ``collect_mapillary``.
+    census once — a cost set by the bbox area alone (catalog median 12 tiles,
+    max 870), independent of spacing but not of city size — and joins it onto
+    the sample points locally. See ``collect_mapillary``.
 
 Each provider's requests are metered against its own ISOLATED key and ledger
 channel (``GMAPS_STREETS_API_KEY``/``gsv_streets``,
@@ -115,9 +116,9 @@ DEFAULT_SPACING_M = 15
 
 # Defaults mirror config/scheduler.toml's [providers.gsv_streets] / [download]
 # so a manual run paces like the scheduled one. The gsv_streets key has its own
-# ~30k/min GSV metadata quota; 24000 is ~80% client-side headroom. Mapillary is
-# a tile census (tens of requests per city regardless of size), so per-minute
-# pacing is irrelevant there.
+# ~30k/min GSV metadata quota; 24000 is ~80% client-side headroom. Mapillary has
+# its own, far smaller pacing flag (a per-IP tile limit, issue #198), which is
+# why this GSV figure must never be applied to it.
 DEFAULT_MAX_REQUESTS_PER_MINUTE = 24_000
 
 
@@ -458,7 +459,9 @@ def build_parser() -> argparse.ArgumentParser:
             "Imagery provider to walk (default: gsv). Each is metered against "
             "its own isolated street budget channel (gsv_streets / "
             "mapillary_streets); gsv costs one request per sample point, "
-            "mapillary reads a tile census costing tens of requests per city."
+            "mapillary reads a tile census whose cost depends on the city's "
+            "bbox area (catalog median 12 tiles, max 870) but not on spacing. "
+            "Use --estimate to price a city before spending."
         ),
     )
     parser.add_argument(

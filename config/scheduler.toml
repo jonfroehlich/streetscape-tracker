@@ -180,10 +180,10 @@ spacing_m = 15
 # street-km denominator). Leave it on 'drive' unless you mean to do that.
 #network_type = "drive"
 
-# Mapillary road-walk. Costs the z14 tile census (tens of requests for a whole
-# city) regardless of city size or sample spacing, because Mapillary has no
-# per-point metadata endpoint — the walk is a local spatial join against the
-# tiles. Budgeted in tile requests against the same PER-IP ceiling as the grid
+# Mapillary road-walk. Costs the z14 tile census — set by the frozen bbox's area
+# (catalog median 12 tiles, mean 58, max 870) and independent of sample SPACING,
+# though not of city size — because Mapillary has no per-point metadata endpoint;
+# the walk is a local spatial join against the tiles. Budgeted in tile requests against the same PER-IP ceiling as the grid
 # channel above (see its comment for the documented limits and the bet we are
 # making), not against the per-app cap: different tokens, one address, so the
 # number that matters is the SUM — 15,000 + 5,000 = 20,000/day. Kept as the
@@ -233,6 +233,15 @@ sleep_between_cities_s = 60
 # When true, run the publish script after each successful daily batch.
 enabled = false
 #publish_script = "/homes/gws/jonf/streetscape-tracker/sync_data_to_server.sh"
+# Set on a host that NFS-mounts the public docroot: publishing becomes a local
+# rsync (`--local`) instead of an SSH hop. Prefer this over exporting
+# STREETSCAPE_PUBLISH_LOCAL, so a hand-run publish behaves the same as the
+# nightly one — see issue #215 and the note in scheduler.makelab1.toml.
+#local = true
+# Public base URL of the site; only used to print operator-facing links
+# (assess-city's city page). Relative links are printed when unset. A trailing
+# slash is added if you omit one.
+#site_url = "https://makeabilitylab.cs.washington.edu/public/streetscape-tracker/"
 
 [alerts]
 # Email the operator when a nightly run finishes unhealthy (>= failure_threshold

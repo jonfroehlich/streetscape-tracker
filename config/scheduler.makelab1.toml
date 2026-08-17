@@ -89,9 +89,10 @@ daily_request_budget = 3000000
 max_requests_per_minute = 24000
 spacing_m = 15
 
-# Mapillary road-walk: costs the z14 tile census (tens of requests for a whole
-# city) regardless of city size or spacing, because Mapillary has no per-point
-# endpoint — the walk is a local spatial join against the tiles. Budgeted in tile
+# Mapillary road-walk: costs the z14 tile census — set by the frozen bbox's area
+# (catalog median 12 tiles, mean 58, max 870) and independent of SPACING, though
+# not of city size — because Mapillary has no per-point endpoint; the walk is a
+# local spatial join against the tiles. Budgeted in tile
 # requests against the SAME per-IP ceiling as [providers.mapillary] above, not
 # against the per-app cap: different tokens, one address, so the number that
 # matters is the SUM (15,000 + 5,000 = 20,000/day). Kept as the smaller half
@@ -129,11 +130,21 @@ backup_dir = "/projects/makeabilitylab/streetscape-tracker/backups"
 
 [publish]
 # After each successful nightly batch, publish *.csv.gz/*.json.gz to the public
-# docroot. STREETSCAPE_PUBLISH_LOCAL=1 (set in the systemd unit) makes this a LOCAL rsync
-# into the NFS-mounted docroot — no SSH hop. The script excludes the DB/logs/bare
-# CSVs, so only sanitized artifacts ever reach the web server.
+# docroot. This host NFS-mounts the docroot, so publishing is a LOCAL rsync with
+# no SSH hop. The script excludes the DB/logs/bare CSVs, so only sanitized
+# artifacts ever reach the web server.
 enabled = true
 publish_script = "/projects/makeabilitylab/streetscape-tracker/sync_data_to_server.sh"
+# local = true passes --local to the publish script. Declaring it HERE rather
+# than relying on STREETSCAPE_PUBLISH_LOCAL=1 in the systemd unit is the point
+# (issue #215): the unit exports that variable and an operator shell does not, so
+# a hand-run `regenerate-aggregate --publish` or `assess-city` took the SSH path,
+# failed with rsync code 12, and emailed a publish-FAILED alert that read as an
+# outage. The unit still sets the env var too, harmlessly, so a rollback of the
+# code cannot break nightly publishing.
+local = true
+# Public base URL, used only to print operator-facing links (assess-city).
+site_url = "https://makeabilitylab.cs.washington.edu/public/streetscape-tracker/"
 
 [alerts]
 # Email on an unhealthy night (>= failure_threshold failed collections) or crash.

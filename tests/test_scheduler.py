@@ -562,6 +562,33 @@ def test_regenerate_aggregate_publishes_on_flag(conn, monkeypatch):
     assert sched.cmd_regenerate(SchedulerConfig(publish_enabled=False), publish=True) == 1
 
 
+def test_regenerate_aggregate_reports_a_failed_driving_plan_rebuild(conn, monkeypatch, capsys):
+    """
+    The driving-plan join is failure-guarded so an OSError there cannot cost the
+    caller its publish (#167) — but rebuilding the published JSON is this
+    command's whole job, so "two of three" must not exit 0 to a wrapper. It still
+    publishes the two it did rebuild.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+    monkeypatch.setattr(sched, "generate_aggregate_v2", lambda c, d: {"cities_count": 3})
+    monkeypatch.setattr(sched, "generate_streetwalk_manifest", lambda c, d: {"walks": []})
+    monkeypatch.setattr(
+        sched,
+        "generate_driving_plan_summary",
+        lambda c, d: (_ for _ in ()).throw(OSError("disk full")),
+    )
+    published = []
+    monkeypatch.setattr(sched, "_publish", lambda cfg, ctx: published.append(ctx) or 0)
+
+    rc = sched.cmd_regenerate(SchedulerConfig(publish_enabled=False), publish=True)
+
+    assert rc == 1
+    assert published  # the two artifacts that DID rebuild still reach the site
+    assert "driving_plan.json.gz NOT regenerated" in capsys.readouterr().out
+
+
 def test_makelab1_production_config_is_wired():
     # Guard the checked-in production config the systemd unit points at.
     #

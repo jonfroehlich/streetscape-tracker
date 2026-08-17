@@ -12,7 +12,11 @@ points the GSV walk uses.
 Two consequences worth keeping in mind when reading the numbers:
 
   * **Cost.** A Mapillary street collection costs what a Mapillary grid run
-    costs (tens of tile requests), independent of city size or sample spacing.
+    costs — the z14 tile count over the frozen bbox — which is independent of
+    sample spacing (that half is pinned by a test) but NOT of city size: tile
+    count scales with bbox area, measured at a median of 12 and a max of 870
+    across the catalog on 2026-08-16. Compare a GSV walk, which is one request
+    per sample point and so runs into the hundreds of thousands.
   * **Comparability.** Both providers score the *same* deterministic sample
     points from the same frozen OSM network, so their `coverage_pct_by_length`
     are directly comparable — unlike raw pano counts, which are census vs.

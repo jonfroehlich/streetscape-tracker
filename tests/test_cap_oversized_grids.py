@@ -205,12 +205,12 @@ def test_default_cap_matches_registration_ceiling():
     city registered today could need capping tomorrow.
 
     The first equality holds by construction (``DEFAULT_MAX_EXTENT_M`` *is*
-    ``cli.MAX_GRID_DIM_M``) and only guards against someone re-hardcoding it.
+    ``city_registration.MAX_GRID_DIM_M``) and only guards against someone re-hardcoding it.
     The load-bearing half is ``== 40_000``: a deliberate change-detector on a
     number the production budget depends on, so moving it is a decision rather
     than an edit. If policy really changes, update this line with the reason.
     """
     from scripts.cap_oversized_grids import DEFAULT_MAX_EXTENT_M
-    from streetscape_metadata_tracker.cli import MAX_GRID_DIM_M
+    from streetscape_metadata_tracker.city_registration import MAX_GRID_DIM_M
 
     assert DEFAULT_MAX_EXTENT_M == MAX_GRID_DIM_M == 40_000

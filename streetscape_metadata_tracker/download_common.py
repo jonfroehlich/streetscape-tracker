@@ -35,9 +35,13 @@ class DownloadError(Exception):
 # Two others are per-IP and are knowingly uncovered, both because they are
 # low-volume and out-of-band rather than because they are safe:
 #   * Nominatim (geoutils.py) — its usage policy is explicitly per-IP with a
-#     hard 1 req/s. Only runs when an UNKNOWN city is registered, so a nightly
-#     batch of frozen cities never touches it; a bulk register_frame.py run
-#     alongside a batch is the same collision shape as the ones below.
+#     hard 1 req/s. A nightly batch of frozen cities never touches it: it runs
+#     only when an UNKNOWN city is registered, and once per invocation of
+#     `scheduler assess-city` (its boundary pre-flight, issue #215, which asks
+#     even for an already-registered city). Both are one operator-initiated
+#     call at a time, which is why the volume argument still holds; a bulk
+#     register_frame.py run alongside a batch is the same collision shape as
+#     the ones below.
 #   * GeoPhotoService.SingleImageSearch (download_gsv_history.py) — undocumented
 #     and IP-identified rather than key-metered, which is why it already carries
 #     its own circuit breaker. A harvest is long-running and manual, i.e. the
