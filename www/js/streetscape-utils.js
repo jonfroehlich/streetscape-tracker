@@ -34,13 +34,22 @@ const RENDER_CAP = 40000;
  * floor below which a capture date cannot be true (issue #213). It mirrors
  * analysis.EARLIEST_PLAUSIBLE_CAPTURE — Mapillary's is far earlier than its
  * founding because contributors upload genuinely old photographs.
+ *
+ * It is built with the LOCAL-midnight constructor, not `new Date("2007-01-01")`,
+ * because it is compared against `panoDateOrNull` output, which parses a
+ * date-only string as local midnight (deliberately — see that function). Mixing
+ * the two makes the floor exclusive east of UTC and inclusive west of it, so a
+ * pano captured exactly on the floor would be kept in every published artifact
+ * (analysis.plausible_capture_mask uses an inclusive `between`) but dropped
+ * from the map for some visitors. `launchDate` stays an ISO literal: it only
+ * anchors a color ramp, where a one-day shift is invisible.
  */
 const PROVIDERS = {
   gsv: {
     label: "Google Street View",
     panoNoun: "Google Panoramas",
     launchDate: new Date("2007-05-25"),
-    earliestPlausibleCapture: new Date("2007-01-01"),
+    earliestPlausibleCapture: new Date(2007, 0, 1), // local midnight; see above
     attribution: "Panorama metadata © Google",
     viewerLabel: "View in Google Street View",
     viewerUrl: (panoId) =>
@@ -50,7 +59,7 @@ const PROVIDERS = {
     label: "Mapillary",
     panoNoun: "Mapillary Panoramas",
     launchDate: new Date("2014-01-01"),
-    earliestPlausibleCapture: new Date("2004-01-01"),
+    earliestPlausibleCapture: new Date(2004, 0, 1), // local midnight; see above
     attribution:
       'Image metadata © <a href="https://www.mapillary.com">Mapillary</a>, CC BY-SA',
     viewerLabel: "View in Mapillary",
@@ -834,12 +843,18 @@ function isGoogleCopyright(copyright) {
  * costs nothing when the values this rejects are centuries out.
  *
  * @param {?Date} date - Parsed capture date (from panoDateOrNull).
- * @param {string} [provider="gsv"] - Provider key (see PROVIDERS).
+ * @param {?string} [provider="gsv"] - Provider key (see PROVIDERS).
  * @returns {boolean} True iff the date falls in the provider's possible range.
  */
-function isPlausibleCaptureDate(date, provider = "gsv") {
+function isPlausibleCaptureDate(date, provider) {
   if (!date || isNaN(date.getTime())) return false;
-  const earliest = PROVIDERS[provider]?.earliestPlausibleCapture
+  // `provider || "gsv"` rather than a default parameter: a default only fires
+  // on undefined, so an explicit null or "" — an unset provider threaded in
+  // from a caller — skipped it, missed PROVIDERS, and fell through the ?? to
+  // Mapillary's floor, accepting a GSV pano dated 2005. An UNKNOWN provider
+  // name still lands on that loose floor deliberately, mirroring
+  // analysis._DEFAULT_EARLIEST_PLAUSIBLE_CAPTURE.
+  const earliest = PROVIDERS[provider || "gsv"]?.earliestPlausibleCapture
     ?? PROVIDERS.mapillary.earliestPlausibleCapture;
   const t = date.getTime();
   return t >= earliest.getTime() && t <= Date.now();

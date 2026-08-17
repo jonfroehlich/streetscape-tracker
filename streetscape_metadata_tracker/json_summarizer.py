@@ -486,6 +486,42 @@ def generate_city_metadata_summary_as_json(
     return json_filename_with_path
 
 
+def _replay_change_block(conn, run_id: int) -> dict[str, Any] | None:
+    """
+    Rebuild a run's ``change_from_previous_run`` block from its ``run_diffs``
+    row, in the shape ``cli._compute_and_record_diff`` returns.
+
+    Read-only and CSV-free: the diff was computed once and its result is in the
+    catalog, so a JSON rebuild can restore the published block without redoing
+    the comparison. Returns None when the run has no diff row.
+    """
+    from . import db  # local import to keep module import order simple
+
+    diff = db.get_diff_for_run(conn, run_id)
+    if diff is None:
+        return None
+    # from_run_date lives on the runs row, not the diff; the block is keyed by
+    # date because that is what the page prints ("Since 2026-05-01: …").
+    from_run = conn.execute(
+        "SELECT run_date FROM runs WHERE run_id = ?", (diff["from_run_id"],)
+    ).fetchone()
+    if from_run is None:
+        logger.warning(
+            f"regenerate_run_json: diff for run {run_id} references missing "
+            f"run {diff['from_run_id']}; publishing without a change block"
+        )
+        return None
+    return {
+        "from_run_date": from_run["run_date"],
+        "panos_added": diff["panos_added"],
+        "panos_removed": diff["panos_removed"],
+        "capture_date_changed": diff["capture_date_changed"],
+        "coverage_delta_pct": diff["coverage_delta_pct"],
+        "grid_aligned": bool(diff["grid_aligned"]),
+        "diff_file": diff["detail_filename"],
+    }
+
+
 def regenerate_run_json(conn, run_id: int, data_dir: str) -> str | None:
     """
     Rebuild the per-run summary JSON for an already-cataloged run from its CSV
@@ -500,10 +536,22 @@ def regenerate_run_json(conn, run_id: int, data_dir: str) -> str | None:
 
     Reuses the exact functions the live pipeline uses
     (``generate_city_metadata_summary_as_json``), so the output is identical to
-    a normal run's JSON. The diff change-block is intentionally omitted
-    (``change_from_previous_run=None``): it is cosmetic and self-heals on the
-    city's next run, and recomputing it would re-load the previous run's CSV —
-    the very cost that caused the interruption.
+    a normal run's JSON, INCLUDING the change block: it is REPLAYED from the
+    ``run_diffs`` row rather than recomputed, so no CSV beyond this run's own is
+    read. That distinction matters because the two callers want opposite things
+    from a missing block. For the self-heal case (``cmd_run_due``, which only
+    calls this when ``json_filename IS NULL``) the run never had a JSON, so
+    dropping the block cost nothing. Issue #213's repair pass points this at
+    runs whose JSON is complete and merely holds an impossible capture date, and
+    there a dropped block is a regression: ``city.js`` renders "Since <date>:
+    +N new / −N removed / …" straight from it, and falls back to constructing
+    the detail filename from run history when it is absent — so a pair that
+    legitimately published no detail file starts 404ing. Recomputing the diff
+    would re-load the previous run's CSV (the cost that caused the interruption
+    in the first place); replaying the catalog row costs two indexed queries.
+
+    A run with no ``run_diffs`` row still gets ``None`` — a first run, or one
+    whose diff was skipped for mismatched grid geometry, has nothing to replay.
 
     Returns the JSON basename, or ``None`` if the run's CSV is missing on disk.
     """
@@ -540,7 +588,15 @@ def regenerate_run_json(conn, run_id: int, data_dir: str) -> str | None:
     try:
         parsed = parse_filename(row["csv_filename"])
         grid_w, grid_h, grid_step = parsed.width_meters, parsed.height_meters, parsed.step_meters
-    except ValueError:
+    except ValueError as e:
+        # Warn rather than fall back silently: this branch does the very
+        # relabelling the block above argues against, and an operator watching a
+        # multi-hour repair pass has no other signal that it happened.
+        logger.warning(
+            f"regenerate_run_json: cannot parse grid geometry from "
+            f"{row['csv_filename']} ({e}); labelling run {run_id} with the "
+            f"city's current grid, which may not be what was sampled"
+        )
         grid_w, grid_h, grid_step = city.grid_width_m, city.grid_height_m, city.step_m
 
     df = load_city_csv_file(csv_path)
@@ -557,7 +613,7 @@ def regenerate_run_json(conn, run_id: int, data_dir: str) -> str | None:
         force_recreate_file=True,
         run_date=date(y, m, d),
         is_baseline=bool(row["is_baseline"]),
-        change_from_previous_run=None,
+        change_from_previous_run=_replay_change_block(conn, run_id),
         provider=row["provider"],
     )
     basename = os.path.basename(json_path)
@@ -1096,8 +1152,21 @@ def _observation_block(run: Any, today: date) -> dict[str, Any]:
     would put an absurd date on the page and manufacture a ``driven_unplanned``
     verdict — the exact claim this page exists to make — out of a typo, so the
     render-time guard stays as the last line rather than the only one.
+
+    ``median_pano_age_years`` is suppressed alongside it, because it is derived
+    from the SAME pano set: a row carrying ``newest 2611-09-01`` carries a
+    median of ``-292.0`` beside it. Blanking one column while the other renders
+    "-292.0 yrs" would leave the page self-contradicting, so the two travel
+    together. A negative median is rejected on its own terms as well — imagery
+    cannot be captured after the run that observed it — which catches the case
+    where a corrupt date poisoned the median without owning the maximum.
     """
     newest = plan_match.plausible_capture_date(run["newest_capture_date"], today)
+    median_age = run["median_pano_age_years"]
+    if median_age is not None and (
+        (run["newest_capture_date"] is not None and newest is None) or median_age < 0
+    ):
+        median_age = None
     block: dict[str, Any] = {
         "run_date": run["run_date"],
         # The city page is addressed by run filename (city.html?file=…), not by
@@ -1106,7 +1175,7 @@ def _observation_block(run: Any, today: date) -> dict[str, Any]:
         "coverage_rate_pct": run["coverage_rate_pct"],
         "any_imagery_coverage_rate_pct": run["any_imagery_coverage_rate_pct"],
         "newest_capture": newest.isoformat() if newest else None,
-        "median_pano_age_years": run["median_pano_age_years"],
+        "median_pano_age_years": median_age,
     }
     # Years since the newest capture — the "who is overdue" sort. Derived here
     # rather than in the browser so the page and any downstream analysis agree

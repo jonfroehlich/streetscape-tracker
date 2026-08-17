@@ -654,7 +654,7 @@ def plausible_capture_date(value: str | None, today: date) -> date | None:
     ``runs.oldest_capture_date`` / ``newest_capture_date`` used to be computed
     over EVERY pano in a run, not just the official ``© Google`` ones, so a
     single user-contributed photosphere with corrupt EXIF poisoned the column
-    for the whole city. On the production catalog as of 2026-08-16 that was 21
+    for the whole city. On the production catalog as of 2026-08-16 that was 22
     runs dated in the future (Ho Chi Minh City and Covington read
     ``2612-01-01``; Chicago, San Francisco, Toronto, Cape Town and São Paulo
     read ``2611-09-01``) and 75 dated before Street View existed

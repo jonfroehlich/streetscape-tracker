@@ -229,11 +229,23 @@ def create_visualization_map(df: pd.DataFrame, city_name: str, provider: str = "
     # temporal histogram across centuries, hiding the real spread of a whole
     # city. The © Google filter above already removes most of them for gsv, so
     # this mostly protects Mapillary and the rare corrupt official date.
+    #
+    # Unreadable and impossible are counted separately: both leave the frame
+    # here, but they are different defects with different responses — a 2611
+    # date is a contributor's corrupt EXIF and expected in small numbers, while
+    # a value we cannot parse at all points at the CSV or the decoder.
     dates = pd.to_datetime(valid_rows["capture_date"], errors="coerce")
+    unreadable = int(dates.isna().sum())
+    if unreadable:
+        logger.warning(f"Dropped {unreadable} pano(s) whose capture date could not be parsed")
     plausible = plausible_capture_mask(dates, pd.Timestamp(datetime.now()), provider)
-    dropped = int((~plausible).sum())
-    if dropped:
-        logger.warning(f"Dropped {dropped} pano(s) whose capture date cannot be true")
+    impossible = int((~plausible).sum()) - unreadable
+    if impossible:
+        logger.warning(f"Dropped {impossible} pano(s) whose capture date cannot be true")
+    # Keep the parsed dates rather than re-parsing the raw column further down:
+    # this is the whole surviving census of a large Mapillary city.
+    valid_rows = valid_rows.copy()
+    valid_rows["capture_date"] = dates
     valid_rows = valid_rows[plausible.to_numpy()]
 
     # Filter for unique pano_ids
@@ -265,12 +277,10 @@ def create_visualization_map(df: pd.DataFrame, city_name: str, provider: str = "
 
     logger.debug(f"Map center: {map_center}, Bounding box: {bbox_coords}, Area: {area_km2:.1f} km²")
 
-    # Calculate temporal statistics
+    # Calculate temporal statistics. capture_date is already datetime64 — it was
+    # parsed once for the plausibility filter above and kept.
     logger.debug(f"Calculating temporal statistics for {len(valid_rows)} rows")
-    # print(valid_rows['capture_date'].dtypes)
-    # print(valid_rows['capture_date'].head())
     now = datetime.now()
-    valid_rows["capture_date"] = pd.to_datetime(valid_rows["capture_date"])
     valid_rows["age_years"] = (now - valid_rows["capture_date"]).dt.days / 365.25
 
     avg_age = valid_rows["age_years"].mean()

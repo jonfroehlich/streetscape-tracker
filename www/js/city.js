@@ -587,9 +587,11 @@ function previousRunDate() {
  * The run's own stats JSON is authoritative when present: its
  * change_from_previous_run.diff_file is null exactly when no detail was
  * published (no changes, or grids didn't align). Only when the whole change
- * block is absent (regenerated JSONs carry change_from_previous_run=null) is
- * the name constructed from the run history — in which case the fetch itself
- * discovers whether the pair predates diff publishing.
+ * block is absent — a first run, or a run whose diff was never recorded — is
+ * the name constructed from the run history, in which case the fetch itself
+ * discovers whether the pair predates diff publishing. A rebuilt JSON
+ * (json_summarizer.regenerate_run_json) replays its block from the run_diffs
+ * row precisely so it does NOT land in that fallback.
  *
  * NEVER read from the URL; both sources still pass isValidDiffFilename before
  * any fetch (see the security note on that validator).
@@ -646,7 +648,7 @@ async function toggleDiffOverlay() {
   diffOverlay.loading = true;
   refreshLegend();
   try {
-    const { layer, counts, drawn } = await renderDiffOverlay(map, diffFile);
+    const { layer, counts, drawn } = await renderDiffOverlay(map, diffFile, providerGlobal);
     Object.assign(diffOverlay, { layer, counts, drawn, shown: true });
   } catch (e) {
     console.info("Change detail unavailable for this run:", e.message);

@@ -12,6 +12,11 @@ global.escapeHtml = (s) =>
   s == null ? "" : String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 global.spatialStrideSample = (points, cap) =>
   points.slice(0, cap).map((_, i) => i);
+// The REAL date helpers, not stubs: the popup's capture-date guard is the same
+// issue #213 rule the map applies, and a stub here would let the two drift.
+const utils = require("../streetscape-utils.js");
+global.panoDateOrNull = utils.panoDateOrNull;
+global.isPlausibleCaptureDate = utils.isPlausibleCaptureDate;
 
 const {
   DIFF_COLORS,
@@ -91,6 +96,37 @@ test("diffPopupHtml: re-dated rows show old → new; content is escaped", () => 
   assert.match(html, /2024-03-01/);
   assert.doesNotMatch(html, /<img/);
   assert.match(html, /&lt;img/);
+});
+
+test("diffPopupHtml: an impossible capture date reads 'unknown', not 2611", () => {
+  // The diff detail CSV is a RAW date stream like the run CSV — diff.py records
+  // what the provider said — so issue #213's guard has to be repeated here or a
+  // re-dated photosphere renders "2611-09-01 → 2612-01-01".
+  const html = diffPopupHtml({
+    change_type: "capture_date_changed",
+    pano_id: "abc",
+    old_capture_date: "2611-09-01",
+    new_capture_date: "2024-03-01",
+  }, "gsv");
+  assert.doesNotMatch(html, /2611/);
+  assert.match(html, /unknown → 2024-03-01/);
+
+  // Both sides can be bad, and the removed/added variants use the same guard.
+  assert.doesNotMatch(
+    diffPopupHtml({ change_type: "pano_removed", pano_id: "a", old_capture_date: "1970-08-01" },
+      "gsv"),
+    /1970/);
+  assert.match(
+    diffPopupHtml({ change_type: "pano_added", pano_id: "a", new_capture_date: null }, "gsv"),
+    /unknown/);
+});
+
+test("diffPopupHtml: the plausibility floor follows the provider", () => {
+  // 2005 predates Street View but is ordinary Mapillary imagery, so the same
+  // row must survive on one provider and be suppressed on the other.
+  const row = { change_type: "pano_added", pano_id: "a", new_capture_date: "2005-06-01" };
+  assert.doesNotMatch(diffPopupHtml(row, "gsv"), /2005/);
+  assert.match(diffPopupHtml(row, "mapillary"), /2005-06-01/);
 });
 
 test("DIFF_RENDER_CAP: a fraction of the pano render cap, not the whole budget", () => {

@@ -153,9 +153,17 @@ def implausible_capture_date_count(
     but a repair pass needs to know which runs on disk were affected at all,
     and asking here keeps that question answered by the same rule rather than
     by a second copy of it (scripts/recompute_run_stats.py).
+
+    Counts ONLY dates that are present and impossible. plausible_capture_mask
+    also rejects NaT, but a pano whose date was absent or unreadable never
+    claimed a date to begin with — it is dropped from the dated stats for a
+    different reason, and folding it in here would inflate the operator-facing
+    "N runs hold an impossible capture date" report and send --regenerate-json
+    at runs whose published JSON is fine.
     """
     dated = _dated_unique(df)
-    return int((~plausible_capture_mask(dated["capture_date"], now, provider)).sum())
+    dates = dated["capture_date"]
+    return int((dates.notna() & ~plausible_capture_mask(dates, now, provider)).sum())
 
 
 @dataclass

@@ -20,6 +20,7 @@ from streetscape_metadata_tracker.analysis import (
     calculate_coverage_stats,
     calculate_pano_stats,
     calculate_run_stats,
+    dated_unique_panos,
     implausible_capture_date_count,
 )
 from streetscape_metadata_tracker.download_common import standardize_capture_date
@@ -495,6 +496,30 @@ def test_implausible_capture_date_count_reports_the_repairable_runs():
     assert implausible_capture_date_count(df, NOW) == 2
     # A dateless pano is not an implausible one — it never claimed a date.
     assert implausible_capture_date_count(make_city_df([("a", CAPTURE_4Y)]), NOW) == 0
+
+
+def test_implausible_capture_date_count_ignores_unreadable_dates():
+    """...and that holds for a date the row DOES carry but we cannot read.
+
+    plausible_capture_mask rejects NaT along with 2611, deliberately — an
+    unreadable date is no more usable than an impossible one — but this counter
+    negates that mask, and a status-OK row whose capture_date is blank or
+    garbage coerces to NaT. Folding those in would overstate the operator-facing
+    'N runs hold an impossible capture date' report and point --regenerate-json
+    at runs whose published JSON is perfectly fine.
+    """
+    df = pd.DataFrame(
+        [
+            _row(44.000, "ok1", CAPTURE_4Y, "© Google", "OK"),
+            _row(44.001, "blank", "", "© Google", "OK"),
+            _row(44.002, "garbage", "not-a-date", "© Google", "OK"),
+            _row(44.003, "future", "2611-09-01", "© Google", "OK"),
+        ],
+        columns=COLUMNS,
+    )
+    assert implausible_capture_date_count(df, NOW) == 1
+    # The stats still drop all three: only the REPORT distinguishes them.
+    assert len(dated_unique_panos(df, NOW)) == 1
 
 
 def test_plausibility_floor_agrees_with_the_driving_page_guard():

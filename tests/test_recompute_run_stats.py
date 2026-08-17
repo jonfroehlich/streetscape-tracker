@@ -113,6 +113,10 @@ def test_recompute_repairs_impossible_capture_dates_and_rebuilds_json(conn, data
 
     The JSON repair is keyed on the CSV, not on whether the catalog changed:
     the second pass below finds nothing left to update and must still rebuild.
+
+    The SCAN for affected runs is gated on the same flag, not just the rebuild:
+    it is a second dedup + date-parse pass over every CSV in the catalog, and
+    this loop is already the whole cost of the script.
     """
     run_date = date(2026, 4, 15)
     cid = db.register_city(
@@ -145,12 +149,11 @@ def test_recompute_repairs_impossible_capture_dates_and_rebuilds_json(conn, data
     )
     json_path = csv_path.replace(".csv.gz", ".json.gz")
 
-    # Pass 1: catalog only. The impossible date is reported but the published
-    # JSON is left alone without the flag.
+    # Pass 1: catalog only. Without the flag the published JSON is neither
+    # inspected nor rebuilt, and the output says so rather than staying silent.
     result = _run_script(data_dir, "--execute")
     assert result.returncode == 0, result.stderr
-    assert "1 runs hold an impossible capture date (1 panos in all)" in result.stdout
-    assert "is NOT rebuilt" in result.stdout
+    assert "Per-run JSONs not inspected" in result.stdout
     assert not os.path.exists(json_path)
 
     row = conn.execute(
@@ -183,6 +186,148 @@ def test_recompute_repairs_impossible_capture_dates_and_rebuilds_json(conn, data
     scoped = _run_script(data_dir, "--provider", "mapillary")
     assert scoped.returncode == 0, scoped.stderr
     assert "0 runs scanned" in scoped.stdout
+
+
+def test_regenerated_json_keeps_the_change_block(conn, data_dir):
+    """A rebuilt per-run JSON replays its change block from the catalog.
+
+    regenerate_run_json's original caller only ever fires on runs with NO json
+    at all (scheduler self-heal), where dropping the block is free. Issue #213's
+    repair points it at runs whose JSON is complete and merely holds an
+    impossible date, and there a dropped block is a regression the operator
+    cannot undo before the city's next collection: city.js renders the
+    "Since <date>: +N new / −N removed" panel straight from it, and falls back
+    to CONSTRUCTING the diff detail filename from run history when it is absent
+    — so a pair that legitimately published no detail file starts 404ing.
+    """
+    cid = db.register_city(
+        conn,
+        city_name="Bend",
+        state_name="Oregon",
+        state_code="OR",
+        country_name="United States",
+        country_code="US",
+        center_lat=44.0,
+        center_lon=-121.0,
+        grid_width_m=1000,
+        grid_height_m=1000,
+        step_m=20,
+    )
+    stem = "bend--oregon--united-states_width_1000_height_1000_step_20"
+    run_ids = []
+    for run_date, panos in (
+        (date(2026, 1, 15), [("good", "2020-06-15")]),
+        # The later run is the one carrying the corrupt date, i.e. the one the
+        # repair rebuilds — and the one whose change block must survive.
+        (date(2026, 4, 15), [("good", "2020-06-15"), ("corrupt", "2611-09-01")]),
+    ):
+        csv_name = f"{stem}_{run_date.isoformat()}.csv.gz"
+        write_city_csv_gz(
+            make_city_df(panos, run_date=run_date, n_empty=1),
+            os.path.join(data_dir, csv_name),
+        )
+        run_ids.append(db.register_run(conn, city_id=cid, run_date=run_date, csv_filename=csv_name))
+    db.record_diff(
+        conn,
+        city_id=cid,
+        from_run_id=run_ids[0],
+        to_run_id=run_ids[1],
+        grid_aligned=True,
+        panos_added=7,
+        panos_removed=2,
+        panos_persisted=11,
+        capture_date_changed=3,
+        points_gained_coverage=5,
+        points_lost_coverage=1,
+        coverage_delta_pct=1.25,
+        detail_filename="bend--oregon--united-states_diff_2026-01-15_to_2026-04-15.csv.gz",
+    )
+
+    result = _run_script(data_dir, "--execute", "--regenerate-json")
+    assert result.returncode == 0, result.stderr
+    assert "Rebuilt 1 of 1" in result.stdout
+
+    json_path = os.path.join(data_dir, f"{stem}_2026-04-15.json.gz")
+    with gzip.open(json_path, "rt", encoding="utf-8") as fh:
+        published = json.load(fh)
+    change = published["change_from_previous_run"]
+    assert change is not None, "the rebuild dropped the change block"
+    assert change["from_run_date"] == "2026-01-15"
+    assert change["panos_added"] == 7
+    assert change["panos_removed"] == 2
+    assert change["capture_date_changed"] == 3
+    assert change["coverage_delta_pct"] == 1.25
+    assert change["grid_aligned"] is True
+    # diff_file is what stops city.js constructing (and 404ing on) a name.
+    assert change["diff_file"].endswith("_diff_2026-01-15_to_2026-04-15.csv.gz")
+
+    # The FIRST run has no diff to replay, and must publish no block rather
+    # than a fabricated one — "nothing to compare against" is not "no change".
+    first_json = os.path.join(data_dir, f"{stem}_2026-01-15.json.gz")
+    if os.path.exists(first_json):
+        with gzip.open(first_json, "rt", encoding="utf-8") as fh:
+            assert json.load(fh)["change_from_previous_run"] is None
+
+
+def test_recompute_republishes_the_driving_plan(conn, data_dir):
+    """The repaired catalog columns reach the page that actually reads them.
+
+    cities.json.gz takes its age stats from the per-run JSONs; the columns this
+    script repairs (newest_capture_date, median_pano_age_years) are read
+    DIRECTLY off `runs` by exactly one published artifact —
+    generate_driving_plan_summary, which powers driving.html. Publishing only
+    the aggregate would leave the driving page showing the pre-repair dates and
+    the driven_unplanned verdicts derived from them.
+    """
+    cid = db.register_city(
+        conn,
+        city_name="Bend",
+        state_name="Oregon",
+        state_code="OR",
+        country_name="United States",
+        country_code="US",
+        center_lat=44.0,
+        center_lon=-121.0,
+        grid_width_m=1000,
+        grid_height_m=1000,
+        step_m=20,
+    )
+    run_date = date(2026, 4, 15)
+    csv_name = "bend--oregon--united-states_width_1000_height_1000_step_20_2026-04-15.csv.gz"
+    write_city_csv_gz(
+        make_city_df([("good", "2020-06-15"), ("corrupt", "2611-09-01")], run_date=run_date),
+        os.path.join(data_dir, csv_name),
+    )
+    db.register_run(
+        conn,
+        city_id=cid,
+        run_date=run_date,
+        csv_filename=csv_name,
+        newest_capture_date="2611-09-01T00:00:00",
+        median_pano_age_years=-292.0,
+    )
+
+    # NOTE: no --no-publish-json, unlike _run_script's default.
+    result = subprocess.run(
+        [sys.executable, _SCRIPT, "--data-dir", data_dir, "--execute"],
+        cwd=_PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stderr
+    assert os.path.exists(os.path.join(data_dir, "cities.json.gz"))
+
+    plan_path = os.path.join(data_dir, "driving_plan.json.gz")
+    assert os.path.exists(plan_path), "driving_plan.json.gz was not republished"
+    with gzip.open(plan_path, "rt", encoding="utf-8") as fh:
+        plan = json.load(fh)
+    observed = next(c for c in plan["cities"] if c["city_id"] == cid)["observed"]["gsv"]
+    assert observed["newest_capture"] == "2020-06-15"
+    # The median is derived from the same panos as the max, so the two travel
+    # together: blanking one while rendering "-292.0 yrs" beside it would leave
+    # the page contradicting itself.
+    assert observed["median_pano_age_years"] > 0
 
 
 def test_recompute_skips_runs_with_missing_csv(conn, data_dir):

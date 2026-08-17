@@ -10,6 +10,7 @@ process.env.TZ = "America/Los_Angeles";
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const { execFileSync } = require("node:child_process");
 
 const {
   PROVIDERS,
@@ -476,10 +477,63 @@ test("isPlausibleCaptureDate: the floor is per-provider, not the color-scale lau
   assert.equal(isPlausibleCaptureDate(panoDateOrNull("2005-06-01"), "who"), true);
 });
 
+test("isPlausibleCaptureDate: an absent provider means gsv, not the loose fallback", () => {
+  // A default parameter fires only on undefined, so an explicit null or "" —
+  // an unset provider threaded in from a caller — used to skip it, miss
+  // PROVIDERS, and land on Mapillary's deliberately-loose 2004 floor, quietly
+  // accepting a GSV pano dated 2005. Failing open is the wrong direction for a
+  // helper whose signature advertises gsv.
+  for (const absent of [undefined, null, ""]) {
+    assert.equal(isPlausibleCaptureDate(panoDateOrNull("2005-06-01"), absent), false);
+    assert.equal(isPlausibleCaptureDate(panoDateOrNull("2022-06-01"), absent), true);
+  }
+});
+
 test("isPlausibleCaptureDate: the mirrored floors match analysis.EARLIEST_PLAUSIBLE_CAPTURE", () => {
-  assert.equal(PROVIDERS.gsv.earliestPlausibleCapture.toISOString().slice(0, 10), "2007-01-01");
-  assert.equal(
-    PROVIDERS.mapillary.earliestPlausibleCapture.toISOString().slice(0, 10), "2004-01-01");
+  // Asserted on LOCAL fields, not toISOString(): the floors are built in the
+  // same frame as the dates they bound (see below), so a UTC reading of them
+  // is off by a day in half the world.
+  const floors = [
+    [PROVIDERS.gsv.earliestPlausibleCapture, 2007],
+    [PROVIDERS.mapillary.earliestPlausibleCapture, 2004],
+  ];
+  for (const [floor, year] of floors) {
+    assert.equal(floor.getFullYear(), year);
+    assert.equal(floor.getMonth(), 0);
+    assert.equal(floor.getDate(), 1);
+  }
+});
+
+test("isPlausibleCaptureDate: the floor is inclusive in every timezone", () => {
+  // The floor must be built the way panoDateOrNull builds its input — local
+  // midnight — or the comparison mixes frames and a capture dated exactly ON
+  // the floor is rejected east of UTC while analysis.plausible_capture_mask
+  // (an inclusive `between`) keeps it in every published artifact. The map's
+  // pano set would then depend on the viewer's timezone.
+  for (const p of ["gsv", "mapillary"]) {
+    assert.equal(PROVIDERS[p].earliestPlausibleCapture.getHours(), 0);
+    const onTheFloor = panoDateOrNull(
+      `${PROVIDERS[p].earliestPlausibleCapture.getFullYear()}-01-01`);
+    assert.equal(isPlausibleCaptureDate(onTheFloor, p), true);
+  }
+  // Under TZ=UTC the two spellings coincide, so the assertions above cannot
+  // catch a regression on a CI runner that sets no timezone. Re-check in a
+  // zone on each side of UTC, in a child process — TZ has to be set before the
+  // module builds its Date constants.
+  const probe = `
+    const {panoDateOrNull, isPlausibleCaptureDate} = require(${JSON.stringify(
+      require.resolve("../streetscape-utils.js"))});
+    const ok = isPlausibleCaptureDate(panoDateOrNull("2007-01-01"), "gsv")
+      && isPlausibleCaptureDate(panoDateOrNull("2004-01-01"), "mapillary");
+    process.stdout.write(ok ? "inclusive" : "EXCLUSIVE");
+  `;
+  for (const tz of ["Asia/Tokyo", "America/Los_Angeles", "UTC"]) {
+    const out = execFileSync(process.execPath, ["-e", probe], {
+      env: { ...process.env, TZ: tz },
+      encoding: "utf8",
+    });
+    assert.equal(out, "inclusive", `floor is exclusive under TZ=${tz}`);
+  }
 });
 
 // --- googleSharePercent: divide-by-zero guard (B1–B4) ----------------------
