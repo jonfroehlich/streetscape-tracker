@@ -55,6 +55,23 @@ ExecStart=%h/streetscape-tracker/.venv-makelab2/bin/python -m streetscape_metada
 # observed 2026-07-29, when a batch died at exactly 12h and the public site went
 # two days stale while the catalog kept advancing).
 TimeoutStartSec=14h
+# Stopping is a WIND-DOWN request, not a kill: the SIGTERM handler sets a flag
+# the city loop checks at a city boundary, then lets the tail run so the night's
+# collected runs are actually published. Without this line systemd applies its
+# 90-SECOND default, which cannot reach the next boundary — measured 2026-08-13:
+# `systemctl stop` -> SIGTERM 06:23:28 -> SIGKILL 06:24:58 -> no tail, and that
+# night's runs sat unpublished until a manual `regenerate-aggregate --publish`.
+# 30min is a compromise, not a guarantee: it covers the in-flight channel plus
+# the tail for an ordinary city, but NOT an exceptional one (Ho Chi Minh City
+# spent 6.5 h across its four channels on 2026-08-18), and reaching it is a
+# SIGKILL — i.e. exactly today's behaviour, so this can only improve on it. An
+# operator who needs the batch dead immediately should `systemctl --user kill`
+# rather than wait this out.
+# NB: this is only the UNIT half of issue #206. The code half is still open —
+# `sigterm_seen` is checked in _run_city_loop's outer `for city in due` but not
+# in the inner `for provider in providers_for_city[...]`, so a stop still
+# launches every remaining channel of the city already in flight.
+TimeoutStopSec=30min
 
 # Anything not already captured by the scheduler's own rotating log or a child's
 # per-attempt log — an uncaught traceback, an OOM kill notice, output from a
@@ -99,13 +116,25 @@ ReadWritePaths=/cse/web/research/makelab/public/streetscape-tracker
 # run could degrade NFS serving too. These STATIC caps keep it from starving
 # co-tenants; the scheduler's [resource_guard] adds a DYNAMIC pre-flight backoff
 # on top (lowers --connection-limit when load/RAM are already tight — issue #146).
-# The workload is I/O-bound async HTTP + pandas, so real peaks are modest;
-# validate after a live night and tune:
+# "Real peaks are modest" was the original rationale for 4G/8G here, and a live
+# night falsified it — do not lower these back without re-measuring first.
+# Measured 2026-08-18 on Ho Chi Minh City's Mapillary census (5.26M CSV rows,
+# 3.69M panos): the per-run JSON tail alone peaks at 4.81 GiB and does ~16 s of
+# actual work. Under MemoryHigh=4G that 16 s became >28 min of continuous
+# reclaim producing no output, and the scheduler's 180-min city timeout then
+# SIGKILLed the child (the same failure shape as issue #157's census half, which
+# PR #202 fixed at 7.1 -> 3.2 GB — that left this TAIL as the new high-water
+# mark, still above 4G, which is why it looked like a separate "aggregate-tail
+# hang"). That night's cgroup read MemoryPeak=4297121792 — about 2 MiB above the
+# 4G threshold, i.e. held right at it, which is what a throttled cgroup looks
+# like, not a comfortable one. 12G gives the measured tail ~2.5x headroom on top
+# of the concurrently-live census structures; 24G is the hard stop.
+# Re-validate after a live night and tune:
 #   systemctl --user show streetscape-tracker.service -p MemoryPeak -p CPUUsageNSec
 Nice=10
 MemoryAccounting=true
-MemoryHigh=4G
-MemoryMax=8G
+MemoryHigh=12G
+MemoryMax=24G
 CPUAccounting=true
 # Hard ceiling: never use more than 4 of the host's cores.
 CPUQuota=400%
