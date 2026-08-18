@@ -481,6 +481,19 @@ DOCS_FIGURE_PREFIX = "pano-spacing-"
 DOCS_GENERATED_BY = "scripts/pano_spacing_analyze.py --docs-dir docs/experiments"
 
 
+def docs_generated_by(docs_dir: str) -> str:
+    """
+    The command that actually produced the record, for `_about.generated_by`.
+
+    A fixed constant would let `--docs-dir /tmp/scratch` write a file claiming it
+    came from the canonical invocation — a provenance claim true of no run in
+    particular, which is what CLAUDE.md's "Notes" rule asks this field to rule
+    out. The canonical run renders exactly DOCS_GENERATED_BY, so the committed
+    file is unchanged by this. Mirrors grid_density_analyze.docs_generated_by.
+    """
+    return f"scripts/pano_spacing_analyze.py --docs-dir {docs_dir}"
+
+
 def _style_axis(ax):
     # No y-grid: these are density and dot-and-whisker panels, and horizontal
     # rules would run straight through the interval rows. grid-density's panels
@@ -778,7 +791,10 @@ def make_figures(cities: dict, fig_dir: str, gsv_metrics_path: str = GSV_METRICS
 
 
 def write_docs_record(
-    results: list[dict], docs_dir: str, gsv_metrics: str = GSV_METRICS
+    results: list[dict],
+    docs_dir: str,
+    gsv_metrics: str = GSV_METRICS,
+    generated_by: str = DOCS_GENERATED_BY,
 ) -> list[str]:
     """
     Write the durable record committed beside the writeup: the merged metrics
@@ -800,7 +816,7 @@ def write_docs_record(
         "_about": {
             "experiment": "pano-spacing",
             "writeup": "docs/experiments/pano-spacing.md",
-            "generated_by": DOCS_GENERATED_BY,
+            "generated_by": generated_by,
             "note": (
                 "Committed metrics for the capture-spacing study. The Mapillary census "
                 "CSVs stay in the gitignored /experiments/pano-spacing/ (pulled from "
@@ -859,8 +875,24 @@ def main(argv: list | None = None) -> int:
     if args.figures_from_metrics:
         with open(args.figures_from_metrics, encoding="utf-8") as fh:
             metrics = json.load(fh)
+        cities = metrics.get("cities")
+        if not isinstance(cities, dict):
+            parser.error(
+                f"{args.figures_from_metrics} has no 'cities' block — this flag wants the "
+                f"merged {DOCS_METRICS_NAME}, not a per-city {{city}}_metrics.json"
+            )
+        absent = sorted(set(STUDY_CITIES) - set(cities))
+        if absent:
+            # This path writes the SAME committed filenames --docs-dir does, into
+            # figures/ beside the file it read, so without this guard a partial or
+            # hand-edited JSON silently republishes the record's figures with a
+            # city missing and exits 0 — the --docs-dir guard, one door down.
+            parser.error(
+                f"{args.figures_from_metrics} is missing city/cities {absent}; refusing to "
+                "redraw, because these figures overwrite the committed record in place"
+            )
         fig_dir = os.path.join(os.path.dirname(args.figures_from_metrics), "figures")
-        for p in make_figures(metrics["cities"], fig_dir, args.gsv_metrics):
+        for p in make_figures(cities, fig_dir, args.gsv_metrics):
             print(f"Figure: {p}")
         return 0
 
@@ -915,7 +947,8 @@ def main(argv: list | None = None) -> int:
     print(f"Metrics: {combined}")
 
     if args.docs_dir:
-        for path in write_docs_record(results, args.docs_dir, args.gsv_metrics):
+        stamp = docs_generated_by(args.docs_dir)
+        for path in write_docs_record(results, args.docs_dir, args.gsv_metrics, stamp):
             print(f"Committed record: {path}")
     return 0
 

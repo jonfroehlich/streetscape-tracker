@@ -546,3 +546,34 @@ def test_both_studies_draw_from_one_palette():
 
     assert psa.CITY_COLORS == list(experiment_style.CATEGORICAL)
     assert psa.PROVIDER_COLORS["gsv"] == experiment_style.CATEGORICAL[0]
+
+
+def test_generated_by_names_the_invocation_not_a_constant(tmp_path):
+    """
+    A fixed stamp would let `--docs-dir /tmp/scratch` write a record claiming it
+    came from the canonical run — provenance true of no run in particular.
+    """
+    assert psa.docs_generated_by("docs/experiments") == psa.DOCS_GENERATED_BY
+    assert str(tmp_path) in psa.docs_generated_by(str(tmp_path))
+    assert psa.docs_generated_by(str(tmp_path)) != psa.DOCS_GENERATED_BY
+
+
+def test_figures_from_metrics_refuses_an_incomplete_record(tmp_path):
+    """
+    This path overwrites the committed figures in place, so a partial or
+    hand-edited JSON must not silently republish them a city short.
+    """
+    partial = tmp_path / psa.DOCS_METRICS_NAME
+    with open(COMMITTED_JSON, encoding="utf-8") as fh:
+        full = json.load(fh)
+    dropped = psa.STUDY_CITIES[0]
+    full["cities"] = {k: v for k, v in full["cities"].items() if k != dropped}
+    partial.write_text(json.dumps(full))
+    with pytest.raises(SystemExit):
+        psa.main(["--figures-from-metrics", str(partial)])
+
+    # A per-city metrics file is not the merged record either.
+    lone = tmp_path / "one.json"
+    lone.write_text(json.dumps({"city": "x"}))
+    with pytest.raises(SystemExit):
+        psa.main(["--figures-from-metrics", str(lone)])
