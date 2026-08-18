@@ -4,9 +4,18 @@ variants from each area's single aligned 5 m snapshot and measure where finer
 sampling stops paying.
 
     python scripts/grid_density_analyze.py [--area all] [--out-dir experiments/grid-density]
+    python scripts/grid_density_analyze.py --area all --docs-dir docs/experiments
+    python scripts/grid_density_analyze.py --figures-from-metrics docs/experiments/grid-density_metrics.json
 
 Per area, writes {area}_metrics.json; across areas, variants_summary.csv,
-figures/*.png, and report.md — all under the (gitignored) out-dir.
+figures/*.png, and report.md — all under the (gitignored) out-dir. With
+--docs-dir it ALSO writes the durable record that is committed beside the
+writeup: the merged grid-density_metrics.json (every area, including the
+binned distance histograms), grid-density_variants_summary.csv, and the five
+figures under docs/experiments/figures/ with a `grid-density-` prefix. That
+record is what the writeup's numbers must trace to (CLAUDE.md, "Notes").
+--figures-from-metrics redraws only the two distribution figures from that
+committed JSON — no DB, no raw CSVs, no geo stack.
 
 Metric semantics deliberately mirror the production pipeline: grid coverage is
 analysis.PRESENT_STATUSES over total points; street/pano metrics filter to
@@ -140,10 +149,12 @@ def _points_gdf(lats, lons, metric_crs):
     return gpd.GeoDataFrame(geometry=gpd.points_from_xy(lons, lats), crs=WGS84).to_crs(metric_crs)
 
 
-def offset_metrics(df5: pd.DataFrame, metric_crs) -> dict:
+def offset_arrays(df5: pd.DataFrame, metric_crs) -> tuple[np.ndarray, np.ndarray]:
     """
-    Query→pano offsets and pano↔pano nearest-neighbor spacing on the 5 m
-    variant, in a metric CRS (never the degree-based approximation).
+    The two distance arrays behind `offsets` and `distributions`, on the 5 m
+    variant in a metric CRS (never the degree-based approximation): query→pano
+    offset per official return, and pano↔pano nearest-neighbour spacing per
+    unique official pano (`sjoin_nearest`, the street_coverage.py idiom).
     """
     import geopandas as gpd
 
@@ -160,6 +171,11 @@ def offset_metrics(df5: pd.DataFrame, metric_crs) -> dict:
         .min()
         .to_numpy()
     )
+    return offsets, nn
+
+
+def offset_metrics(offsets: np.ndarray, nn: np.ndarray) -> dict:
+    """Percentile summary of `offset_arrays` — the writeup's `offsets` block."""
 
     def pct(arr, q_):
         return round(float(np.percentile(arr, q_)), 1) if len(arr) else None
@@ -170,14 +186,58 @@ def offset_metrics(df5: pd.DataFrame, metric_crs) -> dict:
             "p50": pct(offsets, 50),
             "p90": pct(offsets, 90),
             "p99": pct(offsets, 99),
+            "max": round(float(offsets.max()), 1) if len(offsets) else None,
         },
-        "n_unique_official_panos": int(len(panos)),
+        "n_unique_official_panos": int(len(nn)),
         "pano_nearest_neighbor_m": {
             "p25": pct(nn, 25),
             "p50": pct(nn, 50),
             "p75": pct(nn, 75),
             "p90": pct(nn, 90),
         },
+    }
+
+
+# Fixed histogram frames for the committed `distributions` block. Fixed, not
+# data-driven, so two collections (or two areas) bin identically and the
+# committed figures/tests can read a bin by position. Values at or beyond the
+# last edge are counted in `n_above_last_edge`, never silently dropped — that
+# is where the writeup's far offset tail (Corvallis, 2026-07-26) lives.
+NN_HIST_EDGES_M = np.linspace(0.0, 30.0, 121)  # 0.25 m bins
+OFFSET_HIST_EDGES_M = np.linspace(0.0, 200.0, 101)  # 2 m bins
+
+
+def distance_histogram(values: np.ndarray, edges: np.ndarray) -> dict:
+    """Binned counts over a fixed frame; the tail past the last edge is kept as a count."""
+    values = np.asarray(values, dtype=float)
+    # np.histogram closes its LAST bin on the right, which would count a value
+    # sitting exactly on the last edge both in that bin and in the tail below.
+    counts, _ = np.histogram(values[values < edges[-1]], bins=edges)
+    return {
+        "bin_edges": [float(e) for e in edges],
+        "counts": [int(c) for c in counts],
+        "n_above_last_edge": int((values >= edges[-1]).sum()),
+        "n_total": int(len(values)),
+    }
+
+
+def distance_distributions(offsets: np.ndarray, nn: np.ndarray) -> dict:
+    """
+    Compact histograms of the SAME two arrays `offset_metrics` summarizes as
+    percentiles, so the ECDF/density figures regenerate from the committed
+    JSON alone while the raw 5 m CSVs stay gitignored.
+    """
+    return {
+        "_note": (
+            "Compact histograms of the same two distances `offsets` summarizes as "
+            "percentiles, computed from the identical arrays in the identical UTM CRS "
+            "and committed so the ECDF/density figures regenerate from this file alone "
+            "(the raw 5 m CSVs stay gitignored). tests/test_grid_density.py checks that "
+            "each `offsets` percentile falls in the histogram bin its cumulative share "
+            "implies, and that every share the writeup quotes recomputes from these bins."
+        ),
+        "pano_nearest_neighbor_m": distance_histogram(nn, NN_HIST_EDGES_M),
+        "query_to_pano_m": distance_histogram(offsets, OFFSET_HIST_EDGES_M),
     }
 
 
@@ -370,7 +430,9 @@ def analyze_area(args, conn, area_key: str) -> dict:
     marginal = marginal_metrics(variants, metrics)
 
     metric_crs = edges.estimate_utm_crs()
-    offsets = offset_metrics(variants["step5"], metric_crs)
+    offsets_m, nn_m = offset_arrays(variants["step5"], metric_crs)
+    offsets = offset_metrics(offsets_m, nn_m)
+    distributions = distance_distributions(offsets_m, nn_m)
 
     # Envelope: edges intersecting the lattice bbox (+ match-dist margin).
     lat_pts = _points_gdf(lattice["lat"], lattice["lon"], metric_crs)
@@ -426,6 +488,7 @@ def analyze_area(args, conn, area_key: str) -> dict:
         "street_edges_in_envelope": int(len(edges_env)),
         "streetwalk_comparison": walk_cmp,
         "production_cross_check": cross,
+        "distributions": distributions,
     }
     out_json = os.path.join(args.out_dir, f"{area.key}_metrics.json")
     with open(out_json, "w", encoding="utf-8") as fh:
@@ -456,7 +519,7 @@ def _style_axis(ax):
     ax.set_axisbelow(True)
 
 
-def make_figures(results: list[dict], fig_dir: str) -> list[str]:
+def make_figures(results: list[dict], fig_dir: str, prefix: str = "") -> list[str]:
     import matplotlib
 
     matplotlib.use("Agg")
@@ -500,7 +563,7 @@ def make_figures(results: list[dict], fig_dir: str) -> list[str]:
         loc="left",
     )
     fig.tight_layout()
-    p = os.path.join(fig_dir, "marginal_panos_vs_queries.png")
+    p = os.path.join(fig_dir, f"{prefix}marginal_panos_vs_queries.png")
     fig.savefig(p, dpi=150, facecolor=SURFACE)
     plt.close(fig)
     written.append(p)
@@ -530,7 +593,7 @@ def make_figures(results: list[dict], fig_dir: str) -> list[str]:
     ax.set_title("Coverage rate by sampling variant", color=INK, fontsize=11, loc="left")
     ax.legend(frameon=False, fontsize=9, labelcolor=INK_2)
     fig.tight_layout()
-    p = os.path.join(fig_dir, "coverage_by_variant.png")
+    p = os.path.join(fig_dir, f"{prefix}coverage_by_variant.png")
     fig.savefig(p, dpi=150, facecolor=SURFACE)
     plt.close(fig)
     written.append(p)
@@ -558,14 +621,16 @@ def make_figures(results: list[dict], fig_dir: str) -> list[str]:
     ax.set_title("Street-network coverage by sampling variant", color=INK, fontsize=11, loc="left")
     ax.legend(frameon=False, fontsize=9, labelcolor=INK_2)
     fig.tight_layout()
-    p = os.path.join(fig_dir, "street_coverage_by_variant.png")
+    p = os.path.join(fig_dir, f"{prefix}street_coverage_by_variant.png")
     fig.savefig(p, dpi=150, facecolor=SURFACE)
     plt.close(fig)
     written.append(p)
     return written
 
 
-def write_summary_csv(results: list[dict], out_dir: str) -> str:
+def write_summary_csv(
+    results: list[dict], out_dir: str, filename: str = "variants_summary.csv"
+) -> str:
     rows = []
     for r in results:
         for v in VARIANT_ORDER:
@@ -582,7 +647,7 @@ def write_summary_csv(results: list[dict], out_dir: str) -> str:
                     "street_length_covered_pct": r["street"][v]["length_covered_pct"],
                 }
             )
-    path = os.path.join(out_dir, "variants_summary.csv")
+    path = os.path.join(out_dir, filename)
     pd.DataFrame(rows).to_csv(path, index=False)
     return path
 
@@ -681,6 +746,42 @@ def write_report(results: list[dict], out_dir: str) -> str:
     return path
 
 
+def spacing_shares(hist: dict) -> dict:
+    """
+    The shares the writeup quotes from a `pano_nearest_neighbor_m` histogram:
+    the +-1 m band around 10 m (the evidence the interval is regulated — a
+    bimodal distribution can have the same median), the sub-5 m share (a
+    neighbour on a *different* roadway), and where that sub-5 m mass peaks.
+    `sub5_peak_m` is None when the sub-5 m mass has no bin above 1% of the
+    total, i.e. there is no second mode to place.
+    """
+    edges = np.asarray(hist["bin_edges"], dtype=float)
+    centers = (edges[:-1] + edges[1:]) / 2.0
+    share = 100.0 * np.asarray(hist["counts"], dtype=float) / hist["n_total"]
+    sub5_mask = centers < 5.0
+    sub5_share = share[sub5_mask]
+    peak_idx = int(np.argmax(sub5_share)) if sub5_share.size else None
+    has_mode = peak_idx is not None and sub5_share[peak_idx] >= 1.0
+    return {
+        "band_9_11_pct": float(share[(centers >= 9.0) & (centers <= 11.0)].sum()),
+        "sub5_pct": float(sub5_share.sum()),
+        "under_1m_pct": float(share[centers < 1.0].sum()),
+        "band_2_4_pct": float(share[(centers >= 2.0) & (centers < 4.0)].sum()),
+        "sub5_peak_m": float(centers[sub5_mask][peak_idx]) if has_mode else None,
+        "sub5_peak_pct": float(sub5_share[peak_idx]) if has_mode else None,
+    }
+
+
+def offset_shares(hist: dict) -> dict:
+    """Beyond-50 m share (Google's documented default radius) and the far tail."""
+    xs_, ys_ = _ecdf(hist)
+    return {
+        "beyond_50m_pct": float(100.0 - np.interp(50.0, xs_, ys_)),
+        "n_beyond_last_edge": int(hist["n_above_last_edge"]),
+        "last_edge_m": float(hist["bin_edges"][-1]),
+    }
+
+
 def _ecdf(hist: dict) -> tuple[np.ndarray, np.ndarray]:
     """Cumulative % at each bin's right edge, from a committed histogram block."""
     counts = np.asarray(hist["counts"], dtype=float)
@@ -713,7 +814,7 @@ def make_distribution_figures(areas: dict, fig_dir: str) -> list[str]:
     # differ ~18x in pano count and the SHAPE is the finding.
     fig, ax = plt.subplots(figsize=(7, 4.5), facecolor=SURFACE)
     _style_axis(ax)
-    sub5 = {}
+    shares = {}
     for key, blk in ordered:
         h = blk["distributions"]["pano_nearest_neighbor_m"]
         edges = np.asarray(h["bin_edges"], dtype=float)
@@ -722,8 +823,8 @@ def make_distribution_figures(areas: dict, fig_dir: str) -> list[str]:
         # The share landing in a +-1 m band around 10 m is the actual evidence
         # that the interval is regulated; the median alone cannot show it,
         # because a bimodal distribution can have the same median.
-        band = share[(centers >= 9.0) & (centers <= 11.0)].sum()
-        sub5[key] = share[centers < 5.0].sum()
+        shares[key] = spacing_shares(h)
+        band = shares[key]["band_9_11_pct"]
         ax.plot(
             centers,
             share,
@@ -752,18 +853,22 @@ def make_distribution_figures(areas: dict, fig_dir: str) -> list[str]:
     # measuring the distance to a *different roadway*. Which roadway (a second
     # pass, a bridge deck over the road beneath, an intersection) is deliberately
     # NOT claimed here — see the writeup's mechanism table; the label says only
-    # what the distance data supports.
-    worst = max(sub5, key=lambda k: sub5[k])
-    ax.annotate(
-        f"second mode ≈2.6 m\n{worst.title()}: {sub5[worst]:.1f}% under 5 m\n"
-        f"(neighbour on another roadway)",
-        xy=(2.7, 4.0),
-        xytext=(0.6, 17),
-        textcoords="data",
-        color=INK_2,
-        fontsize=8.5,
-        arrowprops={"arrowstyle": "-", "color": INK_2, "alpha": 0.5, "linewidth": 1},
-    )
+    # what the distance data supports. Where the mode sits is READ from the
+    # histogram, not hard-coded, so a re-collection or another city relabels
+    # itself; the annotation is drawn only if some area actually has one.
+    worst = max(shares, key=lambda k: shares[k]["sub5_pct"])
+    peak_m = shares[worst]["sub5_peak_m"]
+    if peak_m is not None:
+        ax.annotate(
+            f"second mode ≈{peak_m:.1f} m\n{worst.title()}: "
+            f"{shares[worst]['sub5_pct']:.1f}% under 5 m\n(neighbour on another roadway)",
+            xy=(peak_m, shares[worst]["sub5_peak_pct"]),
+            xytext=(0.6, 17),
+            textcoords="data",
+            color=INK_2,
+            fontsize=8.5,
+            arrowprops={"arrowstyle": "-", "color": INK_2, "alpha": 0.5, "linewidth": 1},
+        )
     ax.set_xlim(0, 20)
     ax.set_xlabel("Distance to nearest other official pano (m)", color=INK_2, fontsize=10)
     ax.set_ylabel("Share of official panos (% per 0.25 m bin)", color=INK_2, fontsize=10)
@@ -840,6 +945,57 @@ def make_distribution_figures(areas: dict, fig_dir: str) -> list[str]:
     return written
 
 
+# ── The committed record (docs/experiments) ─────────────────────────────────
+
+DOCS_METRICS_NAME = "grid-density_metrics.json"
+DOCS_SUMMARY_NAME = "grid-density_variants_summary.csv"
+DOCS_FIGURE_PREFIX = "grid-density-"
+DOCS_GENERATED_BY = "scripts/grid_density_analyze.py --area all --docs-dir docs/experiments"
+
+
+def build_committed_metrics(results: list[dict]) -> dict:
+    """
+    Merge the per-area results into the single JSON committed beside the
+    writeup. Pure assembly: every number is the per-area result verbatim.
+    """
+    return {
+        "_about": {
+            "experiment": "grid-density",
+            "writeup": "docs/experiments/grid-density.md",
+            "issue": 106,
+            "generated_by": DOCS_GENERATED_BY,
+            "note": (
+                "Committed metrics for the grid-density experiment (issue #106). The raw 5 m "
+                "collection CSVs stay in the gitignored /experiments/grid-density/ and are "
+                "regenerable via scripts/grid_density_collect.py; this file is the durable "
+                "record of the derived numbers the writeup cites. Per-area distributions[] "
+                "carries binned histograms so the figures are reproducible without the raw "
+                "collection."
+            ),
+        },
+        "areas": {r["area"]: r for r in results},
+    }
+
+
+def write_docs_record(results: list[dict], docs_dir: str) -> list[str]:
+    """
+    Write the durable record: merged metrics JSON, summary CSV, and the five
+    figures (prefixed, under docs_dir/figures). This is the ONLY producer of
+    those files — the writeup's numbers must trace to what it writes.
+    """
+    os.makedirs(docs_dir, exist_ok=True)
+    metrics = build_committed_metrics(results)
+    json_path = os.path.join(docs_dir, DOCS_METRICS_NAME)
+    with open(json_path, "w", encoding="utf-8") as fh:
+        json.dump(metrics, fh, indent=2)
+        fh.write("\n")
+    written = [json_path, write_summary_csv(results, docs_dir, DOCS_SUMMARY_NAME)]
+    fig_dir = os.path.join(docs_dir, "figures")
+    written += make_figures(results, fig_dir, prefix=DOCS_FIGURE_PREFIX)
+    written += make_distribution_figures(metrics["areas"], fig_dir)
+    return written
+
+
 def main(argv: list | None = None) -> int:
     parser = argparse.ArgumentParser(description="Issue #106 grid-density experiment analysis.")
     parser.add_argument("--area", default="all", choices=[*STUDY_AREAS, "all"])
@@ -848,6 +1004,17 @@ def main(argv: list | None = None) -> int:
     parser.add_argument("--clip-dist", type=float, default=CLIP_DIST_M_DEFAULT)
     parser.add_argument("--match-dist", type=float, default=25.0)
     parser.add_argument("--no-figures", action="store_true")
+    parser.add_argument(
+        "--docs-dir",
+        metavar="DIR",
+        help=(
+            f"Also write the committed record beside the writeup: {DOCS_METRICS_NAME} "
+            f"(all areas merged, with the binned distributions), {DOCS_SUMMARY_NAME}, and "
+            f"the five figures under DIR/figures with a '{DOCS_FIGURE_PREFIX}' prefix. "
+            "Requires --area all, so a partial run can never overwrite the record with a "
+            "subset of areas."
+        ),
+    )
     parser.add_argument(
         "--figures-from-metrics",
         metavar="PATH",
@@ -862,6 +1029,8 @@ def main(argv: list | None = None) -> int:
         "--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"]
     )
     args = parser.parse_args(argv)
+    if args.docs_dir and args.area != "all":
+        parser.error("--docs-dir requires --area all (the record covers every area)")
     logging.basicConfig(
         level=getattr(logging, args.log_level), format="%(asctime)s - %(levelname)s - %(message)s"
     )
@@ -886,6 +1055,9 @@ def main(argv: list | None = None) -> int:
         for p in make_figures(results, os.path.join(args.out_dir, "figures")):
             print(f"Figure: {p}")
     print(f"Report: {write_report(results, args.out_dir)}")
+    if args.docs_dir:
+        for p in write_docs_record(results, args.docs_dir):
+            print(f"Docs: {p}")
     return 0
 
 
