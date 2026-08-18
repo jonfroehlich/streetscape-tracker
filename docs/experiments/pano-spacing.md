@@ -206,10 +206,13 @@ is clear of the per-IP constraints in #208/#209. Derived numbers are committed a
 regenerate from git alone); the census CSVs stay in the gitignored `experiments/pano-spacing/`
 and are **never** placed under `data/`, which the publisher rsyncs to the public web server.
 
-The JSON regenerates exactly; the **figure PNGs do not compare byte-for-byte across
-machines** (font rasterization differs — the committed set was generated with this repo's
-`.venv`), so re-running the producer elsewhere will show four modified binaries even when
-every plotted value is identical — verify a figure change by diffing the
+The JSON regenerates exactly; the **figure PNGs are only byte-reproducible under the same
+rendering stack**. The committed set was produced by this repo's `.venv` (matplotlib 3.10.8,
+freetype 2.6.1); a different matplotlib or freetype build re-rasterizes every glyph while
+leaving the canvas size and every plotted value identical, so re-running the producer
+elsewhere shows four modified binaries that mean nothing. Note this machine carries several
+matplotlib versions across sibling checkouts sharing one `~/.matplotlib` cache, so "elsewhere"
+can mean another venv on the same box. Verify a figure change by diffing the
 JSON, not the PNG bytes.
 
 ## Open
