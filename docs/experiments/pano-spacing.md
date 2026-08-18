@@ -44,7 +44,7 @@ than silently falling back to the pooled estimator.
 
 ## Findings
 
-| provider · city | p25 | **p50** | p75 | p90 | IQR | n panos |
+| provider · city | p25 | **p50** | p75 | p90 | IQR | n panos measured |
 |---|---|---|---|---|---|---|
 | GSV · Adrian, OR | 9.90 | **10.10** | 10.20 | 10.50 | 0.30 | 469 |
 | GSV · Corvallis, OR | 9.50 | **9.90** | 10.20 | 10.60 | 0.70 | 5,644 |
@@ -52,6 +52,12 @@ than silently falling back to the pooled estimator.
 | Mapillary · San Francisco | 1.49 | **2.87** | 3.81 | 6.76 | 2.32 | 499,572 |
 | Mapillary · Hamtramck, MI | 4.77 | **4.92** | 4.93 | 5.02 | **0.16** | 300,980 |
 | Mapillary · Budapest | 2.91 | **6.65** | 12.10 | 22.85 | 9.19 | 871,609 |
+
+`n panos measured` is the number of panos carrying a nearest-neighbour measurement, which
+is what the percentiles are computed over. For Mapillary it excludes panos in sequences
+shorter than three images (`distributions.within_sequence_m.n_total`), so it sits just below
+the full census in `n_panos` — Budapest 871,609 measured of 871,831. For GSV it is
+`offsets.n_unique_official_panos` from `grid-density_metrics.json`.
 
 ![provider comparison](figures/pano-spacing-provider_comparison.png)
 
@@ -80,7 +86,8 @@ Pedestrian capture is **3.5× denser than vehicle capture in the same city** (Bu
 larger gap than the 2.1× between the two cities' vehicle medians. The expectation that
 Mapillary spacing depends on the contributor's setup is confirmed, with the refinement
 that *mode of travel* dominates and organization-vs-individual barely matters (Hamtramck's
-two strata differ by 0.03 m; both are the same program).
+two strata have the *same* median, 4.92 m, and separate only in the tails — p90 4.94 vs
+5.14 m; both are the same program).
 
 **4. Three distinct capture regimes are visible in the shape.**
 
@@ -89,11 +96,18 @@ two strata differ by 0.03 m; both are the same program).
 - **Hamtramck — regulated.** One spike, nothing else.
 - **San Francisco — urban-dense.** Mass at 1.5–4 m, 26% of panos captured on foot.
 - **Budapest — mixed.** A broad 5–15 m hump *plus* **12.6% beyond 20 m** (highway capture,
-  where Mapillary's smart spacing targets 20 m) *plus* a stationary spike: **7.2% of
-  consecutive captures are within one tile-quantization unit of each other**, i.e. the
-  camera did not move. That is the signature of a **time-triggered** device idling at a
-  light, coexisting in the same corpus with distance-triggered ones. San Francisco shows
-  6.0%; Hamtramck's fleet, 0.55%.
+  where Mapillary's smart spacing targets 20 m) *plus* a stationary spike: **6.5% of
+  consecutive captures are within one tile-quantization unit of each other** (Budapest's
+  unit is 0.403 m), i.e. the camera did not measurably move. That is the signature of a
+  **time-triggered** device idling at a light, coexisting in the same corpus with
+  distance-triggered ones. San Francisco shows 4.4% (unit 0.472 m); Hamtramck's fleet,
+  0.35% (unit 0.441 m).
+
+  This share is `stationary_pct` in the metrics JSON and is computed from the raw
+  distances, not from the committed 0.5 m histogram — the threshold is *finer than one
+  bin*, so a histogram-derived cut can only ever mean "below 0.5 m" whatever the city's
+  actual floor is. An earlier version of this writeup quoted 7.2 / 6.0 / 0.55% from exactly
+  that mistaken cut, which is a fixed threshold wearing a per-city label.
 
 **5. Pooling costs a factor of 2–8, measured.**
 
@@ -133,8 +147,12 @@ than just confirming the number:
 
 1. **For coverage comparisons:** Mapillary's finer spacing does *not* mean better coverage.
    Coverage is measured on the grid and is a separate question — Budapest's 872k panos give
-   **5.5%** grid coverage while Hamtramck's 301k give **47.6%**. Dense sampling of a few
-   corridors is not broad coverage, and the census magnitude tells you nothing about which.
+   **5.55%** grid coverage while Hamtramck's 301k give **47.63%** (San Francisco: 8.28%).
+   Dense sampling of a few corridors is not broad coverage, and the census magnitude tells
+   you nothing about which. These are `grid_coverage_pct` in the metrics JSON, recomputed
+   from the same run CSVs by the same command — distinct grid points carrying a 360 pano
+   over all distinct grid points, the definition `json_summarizer.py` uses — rather than
+   read out of the local catalog, which is never published.
 2. **For any per-pano analysis:** group by `sequence_id` first. This applies beyond spacing
    to anything that treats panos as independent samples.
 3. **For quoting GSV's interval:** use the 9–11 m band share from `grid-density.md`, not the
@@ -171,15 +189,28 @@ than just confirming the number:
 ```bash
 # Census CSVs come from prod; any run from 2026-07-23 carries the extras columns.
 rsync makelab2:'~/streetscape-tracker/data/CITY_*_mapillary_DATE.csv.gz' experiments/pano-spacing/
-python scripts/pano_spacing_analyze.py                    # metrics per city + combined
+python scripts/pano_spacing_analyze.py                    # working copies in --out-dir only
+python scripts/pano_spacing_analyze.py --docs-dir docs/experiments   # THE COMMITTED RECORD
 python scripts/pano_spacing_analyze.py --figures-from-metrics docs/experiments/pano-spacing_metrics.json
 ```
+
+The second command is the one `generated_by` names, and the only thing that writes
+`docs/experiments/`; the bare first command writes `combined_metrics.json` into the
+gitignored `--out-dir` and deliberately does **not** share the committed record's filename,
+so it cannot overwrite it with a copy carrying no provenance block. `--docs-dir` requires
+every study city to be present, not merely `--city all`.
 
 No API calls: this reads census artifacts already collected by the nightly scheduler, so it
 is clear of the per-IP constraints in #208/#209. Derived numbers are committed as
 `pano-spacing_metrics.json` (percentiles, strata and 0.5 m histograms, so the figures
 regenerate from git alone); the census CSVs stay in the gitignored `experiments/pano-spacing/`
 and are **never** placed under `data/`, which the publisher rsyncs to the public web server.
+
+The JSON regenerates exactly; the **figure PNGs do not compare byte-for-byte across
+machines** (font rasterization differs — the committed set was generated with this repo's
+`.venv`), so re-running the producer elsewhere will show four modified binaries even when
+every plotted value is identical — verify a figure change by diffing the
+JSON, not the PNG bytes.
 
 ## Open
 

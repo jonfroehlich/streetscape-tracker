@@ -49,28 +49,60 @@ import sys
 import numpy as np
 import pandas as pd
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _REPO_ROOT)
 
+from streetscape_metadata_tracker import naming  # noqa: E402
 from streetscape_metadata_tracker.analysis import PRESENT_STATUSES  # noqa: E402
+from streetscape_metadata_tracker.config import MAPILLARY_METADATA_DTYPES  # noqa: E402
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from experiment_style import (  # noqa: E402
+    CATEGORICAL,
+    GRID,
+    INK,
+    INK_2,
+    SURFACE,
+    agg_pyplot,
+    style_axis,
+)
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_IO_DIR = "experiments/pano-spacing"
+# Anchored to the checkout rather than the process CWD. The documented command
+# rewrites the committed record, and a CWD-relative default fails LATE — after
+# the JSON is written but before the figures are — which leaves new numbers
+# beside stale figures. grid_density_common.DEFAULT_OUT_DIR is anchored for the
+# same reason.
+DEFAULT_IO_DIR = os.path.join(_REPO_ROOT, "experiments", "pano-spacing")
 WGS84 = "EPSG:4326"
 
-# Only the columns the estimator needs. A census CSV is hundreds of MB and the
-# query_* / copyright_info columns are the bulky redundant ones.
+# The committed record covers exactly these cities. --docs-dir refuses a partial
+# set: the writeup's claims are cross-city, so a record missing one would
+# silently under-report the spread that is the whole finding.
+STUDY_CITIES = (
+    "budapest--budapest--hungary",
+    "hamtramck--michigan--united-states",
+    "san-francisco--california--united-states",
+)
+
+# Only the columns something here actually reads — a census CSV is hundreds of
+# MB, so an unused column is parsed for every one of ~872k rows for nothing.
+# pano_lat/lon position the imagery; query_lat/lon are the grid points the
+# coverage denominator counts; status/is_pano select 360 panos; organization_id
+# and on_foot are the capture-setup strata. pano_id, capture_date and
+# quality_score were dropped when it turned out nothing referenced them.
 USECOLS = [
+    "query_lat",
+    "query_lon",
     "pano_lat",
     "pano_lon",
-    "pano_id",
-    "capture_date",
     "status",
     "organization_id",
     "sequence_id",
     "is_pano",
     "on_foot",
-    "quality_score",
 ]
 
 # Bin width must stay ABOVE the measurement floor. z14 tile coordinates quantize
@@ -100,9 +132,46 @@ def quantization_m(lat_deg: float, zoom: int = 14, extent: int = 4096) -> float:
     return float(tile_width_m / extent)
 
 
+def city_id_from_run(path: str) -> str:
+    """
+    The canonical city_id, via the repo's single source of truth for filenames.
+
+    naming.parse_filename also rejects streetwalk / diff / history artifacts,
+    which a `*_mapillary_*.csv.gz` glob happily matches — see is_mapillary_run.
+    """
+    return naming.parse_filename(path).slug
+
+
+def is_mapillary_run(path: str) -> bool:
+    """
+    True iff this is a Mapillary GRID RUN csv, not some other Mapillary artifact.
+
+    The Replicating block tells the reader to rsync `CITY_*_mapillary_DATE.csv.gz`;
+    a wildcard date also matches `..._streetwalk_sp15_DATE.csv.gz` and
+    `CITY_diff_mapillary_A_to_B.csv.gz`. Neither carries sequence_id, so without
+    this they reach load_census and fail with a vintage diagnosis that is simply
+    wrong for a 2026-08 file. parse_filename rejects them by design.
+    """
+    try:
+        return naming.parse_filename(path).provider == "mapillary"
+    except ValueError:
+        return False
+
+
 def load_census(path: str) -> pd.DataFrame:
-    """Load one Mapillary run CSV down to 360 panos with usable positions."""
-    df = pd.read_csv(path, usecols=lambda c: c in USECOLS, low_memory=False)
+    """
+    Load one Mapillary run CSV — every row — with the repo's own column types.
+
+    Types come from config.MAPILLARY_METADATA_DTYPES rather than pandas'
+    inference: Mapillary ids are 16-19-digit integers, which infer as float64
+    and silently round above 2**53. pandas ignores dtype keys absent from a
+    file, so this keeps working as the schema grows.
+    """
+    df = pd.read_csv(
+        path,
+        usecols=lambda c: c in USECOLS,
+        dtype={k: v for k, v in MAPILLARY_METADATA_DTYPES.items() if k in USECOLS},
+    )
     missing = [c for c in ("sequence_id", "is_pano") if c not in df.columns]
     if missing:
         # Pre-2026-07-23 vintage: the extras columns do not exist, so the
@@ -112,13 +181,41 @@ def load_census(path: str) -> pd.DataFrame:
             f"{os.path.basename(path)} predates the Mapillary extras columns "
             f"(missing {missing}); re-collect or choose a run from 2026-07-23 on."
         )
-    df = df[df["is_pano"].fillna(False).astype(bool)]
-    df = df[df["status"].isin(PRESENT_STATUSES)]
-    return df.dropna(subset=["pano_lat", "pano_lon", "sequence_id"])
+    return df
+
+
+def pano_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """The 360 panos with usable positions — the rows the estimator measures."""
+    out = df[df["is_pano"].fillna(False).astype(bool)]
+    out = out[out["status"].isin(PRESENT_STATUSES)]
+    return out.dropna(subset=["pano_lat", "pano_lon", "sequence_id"])
+
+
+def grid_coverage_pct(df: pd.DataFrame) -> float | None:
+    """
+    360 grid coverage: share of the run's grid points that carry a 360 pano.
+
+    Computed the way json_summarizer does — distinct (query_lat, query_lon)
+    pairs with a PRESENT status, over all distinct pairs — so the writeup can
+    cite a coverage figure that traces to this committed record instead of to
+    `runs.coverage_rate_pct` in the local catalog, which is never published
+    (CLAUDE.md, "Notes": a number that lives only in a transcript is the
+    single-copy failure the committed record exists to prevent).
+
+    None when the run CSV predates the query_* columns.
+    """
+    if not {"query_lat", "query_lon"}.issubset(df.columns):
+        return None
+    points = df[["query_lat", "query_lon"]]
+    total = len(points.drop_duplicates())
+    if not total:
+        return None
+    present = points[df["status"].isin(PRESENT_STATUSES).to_numpy()]
+    return round(100.0 * len(present.drop_duplicates()) / total, 2)
 
 
 def project(df: pd.DataFrame):
-    """Project to the city's UTM zone; returns (x, y) metre arrays."""
+    """Project to the city's UTM zone; returns (x, y) metre arrays and the frame."""
     import geopandas as gpd
 
     gdf = gpd.GeoDataFrame(geometry=gpd.points_from_xy(df["pano_lon"], df["pano_lat"]), crs=WGS84)
@@ -150,7 +247,7 @@ def pooled_nn(gdf) -> np.ndarray:
 
     Published as the size of the contamination, not as a spacing metric — see the
     module docstring. Uses the same sjoin_nearest idiom as
-    scripts/grid_density_analyze.py:offset_metrics so the two studies' pooled
+    scripts/grid_density_analyze.py:offset_arrays so the two studies' pooled
     numbers are computed identically.
     """
     import geopandas as gpd
@@ -164,6 +261,16 @@ def pooled_nn(gdf) -> np.ndarray:
 
 
 def hist(values: np.ndarray, bins: np.ndarray = SPACING_BINS) -> dict:
+    """
+    Binned distribution plus the tail past the last edge.
+
+    Last-edge convention: np.histogram closes the final bin on the RIGHT, so a
+    value exactly equal to bins[-1] lands in the last bin and the tail counts
+    only values strictly above it. grid_density_analyze.distance_histogram uses
+    the opposite convention (>= edges[-1] is tail). The two are self-consistent
+    but NOT interchangeable — do not read one module's bins with the other's
+    helper.
+    """
     counts, _ = np.histogram(values, bins=bins)
     return {
         "bin_edges": [round(float(b), 3) for b in bins],
@@ -179,25 +286,36 @@ def pcts(a: np.ndarray) -> dict:
     return {f"p{q}": round(float(np.percentile(a, q)), 2) for q in (5, 10, 25, 50, 75, 90, 95, 99)}
 
 
-def spacing_shares(h: dict, quantization_m_: float) -> dict:
+def histogram_shares(h: dict) -> dict:
     """
-    The shares docs/experiments/pano-spacing.md quotes, recomputed from a
-    committed histogram — so the writeup's numbers trace to the JSON rather than
-    to a transcript (CLAUDE.md, "Notes").
+    The shares docs/experiments/pano-spacing.md quotes that a committed
+    histogram can express exactly — so the writeup's numbers trace to the JSON
+    rather than to a transcript (CLAUDE.md, "Notes").
 
-    `stationary_pct` is the share whose adjacent capture sits at or below one
-    tile-coordinate unit, i.e. the camera did not measurably move. It is
-    deliberately keyed to the city's own `quantization_m`, not a fixed cut:
-    the floor is a function of latitude.
+    Every cut here (1.0 m, 20.0 m) lands ON a SPACING_BINS edge, which is what
+    makes the recomputation exact. `stationary_pct` deliberately does NOT live
+    here: its threshold is the city's own `quantization_m` (~0.40-0.47 m at
+    these latitudes, ~0.6 m near the equator), which falls strictly INSIDE the
+    first 0.5 m bin, so a histogram-derived cut could only ever return "share
+    below 0.5 m" — a fixed cut wearing a per-city label, and one that silently
+    excludes the genuinely sub-quantization [0.5, 0.6) band for an equatorial
+    city. It is computed from the raw distances in analyze_city and stored as a
+    scalar instead, on the same footing as the percentiles beside it.
+
+    Named histogram_shares, not spacing_shares: grid_density_analyze.py has its
+    own spacing_shares taking different arguments and returning different keys,
+    and two same-named helpers over near-identical data is how one module's
+    semantics get applied to the other's.
     """
     edges = np.asarray(h["bin_edges"], dtype=float)
     counts = np.asarray(h["counts"], dtype=float)
     centers = (edges[:-1] + edges[1:]) / 2.0
     n = h["n_total"]
+    if not n:
+        raise ValueError("histogram_shares needs a non-empty histogram")
     tail = h["n_above_last_edge"]
     peak = int(np.argmax(counts))
     return {
-        "stationary_pct": 100.0 * float(counts[centers < quantization_m_].sum()) / n,
         "under_1m_pct": 100.0 * float(counts[centers < 1.0].sum()) / n,
         # The tail past the last edge is beyond 20 m too — dropping it would
         # under-report exactly the highway captures this share exists to show.
@@ -206,6 +324,19 @@ def spacing_shares(h: dict, quantization_m_: float) -> dict:
         "peak_m": float(centers[peak]),
         "n_total": int(n),
     }
+
+
+def stationary_share_pct(within: np.ndarray, quantization_m_: float) -> float:
+    """
+    Share of captures whose nearest in-sequence neighbour sits at or below one
+    tile-coordinate unit — i.e. the camera did not measurably move.
+
+    Takes the RAW distances, because the threshold is finer than the histogram
+    bin width; see histogram_shares for why that distinction is load-bearing.
+    """
+    if not len(within):
+        raise ValueError("stationary_share_pct needs at least one distance")
+    return round(100.0 * float((within <= quantization_m_).sum()) / len(within), 2)
 
 
 def within_sequence_spacing(df: pd.DataFrame, x: np.ndarray, y: np.ndarray) -> tuple:
@@ -234,14 +365,27 @@ def within_sequence_spacing(df: pd.DataFrame, x: np.ndarray, y: np.ndarray) -> t
 
 
 def analyze_city(path: str) -> dict:
-    name = os.path.basename(path).split("_width_")[0]
+    name = city_id_from_run(path)
     logger.info("loading %s", name)
-    df = load_census(path).reset_index(drop=True)
+    raw = load_census(path)
+    coverage_pct = grid_coverage_pct(raw)
+    df = pano_rows(raw).reset_index(drop=True)
+    del raw
     x, y, gdf = project(df)
     lat0 = float(df["pano_lat"].mean())
 
     seq_sizes = df.groupby("sequence_id").size()
     within, within_idx = within_sequence_spacing(df, x, y)
+    if not len(within):
+        # No sequence reaches MIN_SEQUENCE_LEN (a small city, or a run whose
+        # sequence_id is mostly null). The estimator this study exists for is
+        # undefined; emitting empty percentile blocks instead would defer the
+        # failure to a KeyError deep in make_figures and write a broken record
+        # on the way there.
+        raise SystemExit(
+            f"{name}: no sequence reaches {MIN_SEQUENCE_LEN} images, so the "
+            "within-sequence estimator is undefined for this run."
+        )
     pooled = pooled_nn(gdf)
 
     logger.info(
@@ -257,9 +401,18 @@ def analyze_city(path: str) -> dict:
     # columns that describe the rig, and the hypothesis the study exists to test
     # is that they explain the spread.
     sub = df.iloc[within_idx]
+    # `on_foot` is NULLABLE, and null means the tile omitted the field — mode
+    # UNKNOWN, not "vehicle". Folding unknowns into the vehicle stratum would
+    # contaminate the vehicle median that the pedestrian-vs-vehicle finding
+    # rests on, undetectably from the committed record. json_summarizer.py
+    # divides by the non-null count for exactly this reason, so unknowns are
+    # excluded from BOTH strata here and n_foot_known is published beside the
+    # share so a future contaminated city is visible in the JSON.
+    foot_true = sub["on_foot"].fillna(False).astype(bool).to_numpy()
+    foot_known = sub["on_foot"].notna().to_numpy()
     strata = {
-        "vehicle": within[~sub["on_foot"].fillna(False).astype(bool).to_numpy()],
-        "on_foot": within[sub["on_foot"].fillna(False).astype(bool).to_numpy()],
+        "vehicle": within[foot_known & ~foot_true],
+        "on_foot": within[foot_true],
         "organization": within[sub["organization_id"].notna().to_numpy()],
         "individual": within[sub["organization_id"].isna().to_numpy()],
     }
@@ -277,7 +430,20 @@ def analyze_city(path: str) -> dict:
             "max": int(seq_sizes.max()),
         },
         "quantization_m": round(quantization_m(lat0), 3),
-        "share_on_foot_pct": round(100.0 * df["on_foot"].fillna(False).mean(), 2),
+        # From the RAW distances: the threshold is finer than the 0.5 m bins, so
+        # this is the one writeup share a histogram cannot express — see
+        # histogram_shares.
+        "stationary_pct": stationary_share_pct(within, quantization_m(lat0)),
+        # The grid-coverage figure the writeup's Implications section quotes.
+        # Published here so it traces to committed code + committed data rather
+        # than to the unpublished catalog.
+        "grid_coverage_pct": coverage_pct,
+        "n_foot_known": int(df["on_foot"].notna().sum()),
+        "share_on_foot_pct": (
+            round(100.0 * float(df["on_foot"].dropna().mean()), 2)
+            if bool(df["on_foot"].notna().any())
+            else None
+        ),
         "share_organization_pct": round(100.0 * df["organization_id"].notna().mean(), 2),
         "within_sequence_m": pcts(within),
         "pooled_m": pcts(pooled),
@@ -292,32 +458,34 @@ def analyze_city(path: str) -> dict:
 
 # Provider palette (two slots, validated: normal-vision dE 33.6, worst-CVD 24.7,
 # both >= 3:1 on the surface). Per-city hues reuse the grid-density set so the two
-# writeups' figures read as one system.
-PROVIDER_COLORS = {"gsv": "#2a78d6", "mapillary": "#eb6834"}
-CITY_COLORS = ["#2a78d6", "#eb6834", "#1baf7a"]
-INK = "#0b0b0b"
-INK_2 = "#52514e"
-GRID = "#e5e4e1"
-SURFACE = "#fcfcfb"
+# writeups' figures read as one system — which is why the palette itself lives in
+# experiment_style rather than being copied here.
+PROVIDER_COLORS = {"gsv": CATEGORICAL[0], "mapillary": CATEGORICAL[1]}
+CITY_COLORS = list(CATEGORICAL)
 
-GSV_METRICS = "docs/experiments/grid-density_metrics.json"
+GSV_METRICS = os.path.join(_REPO_ROOT, "docs", "experiments", "grid-density_metrics.json")
 
-# The committed record beside the writeup. This module is its ONLY producer —
-# CLAUDE.md requires the JSON a writeup cites to be written by committed code,
-# and `generated_by` below must stay a command the repo can actually run.
+# The committed record beside the writeup. write_docs_record is its ONLY
+# producer — CLAUDE.md requires the JSON a writeup cites to be written by
+# committed code, and `generated_by` below must stay a command the repo can
+# actually run.
 DOCS_METRICS_NAME = "pano-spacing_metrics.json"
+
+# The working combined file dropped in the gitignored --out-dir. It MUST NOT
+# share DOCS_METRICS_NAME: it carries no `_about` block, so `--out-dir
+# docs/experiments` would otherwise overwrite the committed record with a
+# provenance-less copy and break the producer contract above.
+# grid_density_analyze.py keeps the two apart the same way.
+WORKING_METRICS_NAME = "combined_metrics.json"
 DOCS_FIGURE_PREFIX = "pano-spacing-"
 DOCS_GENERATED_BY = "scripts/pano_spacing_analyze.py --docs-dir docs/experiments"
 
 
 def _style_axis(ax):
-    ax.set_facecolor(SURFACE)
-    for side in ("top", "right"):
-        ax.spines[side].set_visible(False)
-    for side in ("left", "bottom"):
-        ax.spines[side].set_color(GRID)
-    ax.tick_params(colors=INK_2, labelsize=9)
-    ax.set_axisbelow(True)
+    # No y-grid: these are density and dot-and-whisker panels, and horizontal
+    # rules would run straight through the interval rows. grid-density's panels
+    # want the opposite, which is why experiment_style takes a flag.
+    style_axis(ax, ygrid=False)
 
 
 def pct_from_hist(h: dict, q: float) -> float:
@@ -327,10 +495,25 @@ def pct_from_hist(h: dict, q: float) -> float:
     Lets the GSV arm supply p10/p25/p50/p75/p90 on the same footing as Mapillary
     even though grid-density_metrics.json stores only p25-p90 as scalars — the
     figures must not compare a stored percentile against a derived one.
+
+    CLAMPS, and says so. The denominator includes n_above_last_edge, so `cum`
+    never reaches 100 when the distribution has mass past the last edge, and
+    np.interp then returns the last edge for any quantile above cum.max() —
+    drawing a whisker flush against the histogram frame as if it were measured.
+    Only GSV's missing p10 takes this path today, so the warning is the guard:
+    a silent clamp is indistinguishable from a real percentile in the figure.
     """
     edges = np.asarray(h["bin_edges"], dtype=float)
     counts = np.asarray(h["counts"], dtype=float)
     cum = 100.0 * np.cumsum(counts) / h["n_total"]
+    if q > cum[-1] or q < cum[0]:
+        logger.warning(
+            "p%s is outside the histogram's representable range (%.2f-%.2f%%); "
+            "clamping to the bin edge — the figure will show a bound, not a percentile",
+            q,
+            float(cum[0]),
+            float(cum[-1]),
+        )
     return float(np.interp(q, cum, edges[1:]))
 
 
@@ -367,11 +550,8 @@ def _interval_row(ax, y, h, color, stats=None, label_fmt="{:.2f} m"):
 
 
 def make_figures(cities: dict, fig_dir: str, gsv_metrics_path: str = GSV_METRICS) -> list[str]:
-    """The three spacing figures. Reads the GSV arm from the grid-density metrics."""
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    """The four spacing figures. Reads the GSV arm from the grid-density metrics."""
+    plt = agg_pyplot()
 
     os.makedirs(fig_dir, exist_ok=True)
     written = []
@@ -454,10 +634,10 @@ def make_figures(cities: dict, fig_dir: str, gsv_metrics_path: str = GSV_METRICS
 
     # 2. The SHAPE of the within-sequence distribution, which is where the three
     # capture regimes are visible and an interval plot cannot show them. Y is
-    # clipped: Hamtramck's fleet capture is so regular that its peak is ~70% in a
-    # single 0.25 m bin, which on a shared linear axis flattens the other two
-    # cities into the baseline. The clipped peak is annotated with its true
-    # height rather than silently cropped.
+    # clipped: Hamtramck's fleet capture is so regular that its peak is ~77% in a
+    # single 0.5 m bin (SPACING_BINS), which on a shared linear axis flattens the
+    # other two cities into the baseline. The clipped peak is annotated with its
+    # true height rather than silently cropped.
     fig, ax = plt.subplots(figsize=(7.6, 4.6), facecolor=SURFACE)
     _style_axis(ax)
     ax.yaxis.grid(True, color=GRID, linewidth=0.8)
@@ -477,9 +657,9 @@ def make_figures(cities: dict, fig_dir: str, gsv_metrics_path: str = GSV_METRICS
             linewidth=2,
             label=f"{name} (p50 {r['within_sequence_m']['p50']:.2f} m)",
         )
-        # Through spacing_shares so the annotated peak is literally the number
+        # Through histogram_shares so the annotated peak is literally the number
         # the writeup quotes and the test pins, not a parallel computation.
-        sh = spacing_shares(h, r["quantization_m"])
+        sh = histogram_shares(h)
         if sh["peak_share_pct"] > y_clip:
             ax.annotate(
                 f"{name} peaks at {sh['peak_share_pct']:.0f}%\nin one 0.5 m bin",
@@ -549,7 +729,7 @@ def make_figures(cities: dict, fig_dir: str, gsv_metrics_path: str = GSV_METRICS
     plt.close(fig)
     written.append(p)
 
-    # 3. Capture setup. The hypothesis the study exists to test is that the rig
+    # 4. Capture setup. The hypothesis the study exists to test is that the rig
     # explains the spread, so the strata get their own comparison.
     strata_rows = []
     for i, (c, r) in enumerate(sorted(cities.items())):
@@ -605,6 +785,15 @@ def write_docs_record(
     JSON (every city, including the binned histograms) and the figures under
     docs_dir/figures. The ONLY producer of those paths.
     """
+    # Fail BEFORE writing anything. The figures are the last step and they read
+    # the GSV arm from a separate file; if that read raises, a record written
+    # first is left with a new JSON beside stale figures — a half-updated
+    # committed record is worse than an unwritten one.
+    if not os.path.exists(gsv_metrics):
+        raise SystemExit(
+            f"cannot write the committed record: {gsv_metrics} is missing, and the "
+            "figures need the GSV arm. Run from the repo checkout, or pass --gsv-metrics."
+        )
     os.makedirs(docs_dir, exist_ok=True)
     cities = {r["city"]: r for r in results}
     payload = {
@@ -618,8 +807,11 @@ def write_docs_record(
                 "prod; any run from 2026-07-23 carries the extras columns); this file "
                 "is the durable record of the derived numbers the writeup cites. "
                 "distributions[] carries 0.5 m histograms so the figures are "
-                "reproducible without the census, and spacing_shares() recomputes "
-                "every share the writeup quotes from those bins."
+                "reproducible without the census, and histogram_shares() recomputes "
+                "the bin-aligned shares the writeup quotes from those bins. "
+                "stationary_pct and the percentiles are stored scalars computed "
+                "from the raw distances, because their thresholds are finer than "
+                "the bin width."
             ),
         },
         "cities": cities,
@@ -678,10 +870,36 @@ def main(argv: list | None = None) -> int:
         raise SystemExit("--docs-dir requires --city all")
 
     paths = sorted(glob.glob(os.path.join(args.in_dir, "*_mapillary_*.csv.gz")))
+    # The glob also matches streetwalk snapshots and diff files; naming.py is the
+    # single source of truth for which of them is a grid run.
+    skipped = [p for p in paths if not is_mapillary_run(p)]
+    paths = [p for p in paths if is_mapillary_run(p)]
+    for p in skipped:
+        logger.info("skipping non-run artifact %s", os.path.basename(p))
     if args.city != "all":
         paths = [p for p in paths if args.city in os.path.basename(p)]
     if not paths:
         raise SystemExit(f"no Mapillary run CSVs matching {args.city!r} in {args.in_dir}")
+
+    by_city: dict[str, list[str]] = {}
+    for p in paths:
+        by_city.setdefault(city_id_from_run(p), []).append(p)
+    dupes = {c: sorted(os.path.basename(p) for p in v) for c, v in by_city.items() if len(v) > 1}
+    if dupes:
+        # Everything downstream keys on city, so a second run date would be
+        # dropped from the record with the last glob entry silently winning.
+        raise SystemExit(f"more than one run per city in {args.in_dir}: {dupes}")
+
+    if args.docs_dir:
+        # --city all only means "do not filter the glob"; it says nothing about
+        # what is actually on disk. Without this, a half-populated --in-dir
+        # writes a committed record covering fewer cities and exits 0 — the very
+        # under-reporting the --city guard above claims to prevent.
+        absent = sorted(set(STUDY_CITIES) - set(by_city))
+        if absent:
+            raise SystemExit(
+                f"--docs-dir needs every study city; {absent} missing from {args.in_dir}"
+            )
 
     os.makedirs(args.out_dir, exist_ok=True)
     results = []
@@ -691,7 +909,7 @@ def main(argv: list | None = None) -> int:
         with open(os.path.join(args.out_dir, f"{r['city']}_metrics.json"), "w") as fh:
             json.dump(r, fh, indent=2)
 
-    combined = os.path.join(args.out_dir, DOCS_METRICS_NAME)
+    combined = os.path.join(args.out_dir, WORKING_METRICS_NAME)
     with open(combined, "w") as fh:
         json.dump({"cities": {r["city"]: r for r in results}}, fh, indent=2)
     print(f"Metrics: {combined}")

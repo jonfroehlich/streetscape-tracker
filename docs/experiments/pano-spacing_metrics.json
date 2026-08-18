@@ -3,7 +3,7 @@
     "experiment": "pano-spacing",
     "writeup": "docs/experiments/pano-spacing.md",
     "generated_by": "scripts/pano_spacing_analyze.py --docs-dir docs/experiments",
-    "note": "Committed metrics for the capture-spacing study. The Mapillary census CSVs stay in the gitignored /experiments/pano-spacing/ (pulled from prod; any run from 2026-07-23 carries the extras columns); this file is the durable record of the derived numbers the writeup cites. distributions[] carries 0.5 m histograms so the figures are reproducible without the census, and spacing_shares() recomputes every share the writeup quotes from those bins."
+    "note": "Committed metrics for the capture-spacing study. The Mapillary census CSVs stay in the gitignored /experiments/pano-spacing/ (pulled from prod; any run from 2026-07-23 carries the extras columns); this file is the durable record of the derived numbers the writeup cites. distributions[] carries 0.5 m histograms so the figures are reproducible without the census, and histogram_shares() recomputes the bin-aligned shares the writeup quotes from those bins. stationary_pct and the percentiles are stored scalars computed from the raw distances, because their thresholds are finer than the bin width."
   },
   "cities": {
     "budapest--budapest--hungary": {
@@ -19,6 +19,9 @@
         "max": 2927
       },
       "quantization_m": 0.403,
+      "stationary_pct": 6.45,
+      "grid_coverage_pct": 5.55,
+      "n_foot_known": 871831,
       "share_on_foot_pct": 4.09,
       "share_organization_pct": 30.66,
       "within_sequence_m": {
@@ -1597,6 +1600,9 @@
         "max": 640
       },
       "quantization_m": 0.441,
+      "stationary_pct": 0.35,
+      "grid_coverage_pct": 47.63,
+      "n_foot_known": 300997,
       "share_on_foot_pct": 0.0,
       "share_organization_pct": 46.23,
       "within_sequence_m": {
@@ -2918,6 +2924,9 @@
         "max": 1379
       },
       "quantization_m": 0.472,
+      "stationary_pct": 4.42,
+      "grid_coverage_pct": 8.28,
+      "n_foot_known": 499844,
       "share_on_foot_pct": 26.02,
       "share_organization_pct": 4.86,
       "within_sequence_m": {
