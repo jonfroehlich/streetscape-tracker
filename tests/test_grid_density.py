@@ -13,6 +13,7 @@ import io
 import json
 import os
 import shutil
+import subprocess
 import sys
 from dataclasses import dataclass
 
@@ -291,6 +292,19 @@ def test_committed_summary_csv_regenerates_from_committed_json(committed, tmp_pa
 
 def test_committed_json_names_its_producer(committed):
     assert committed["_about"]["generated_by"] == ga.DOCS_GENERATED_BY
+    # ...and the constant is what the canonical invocation actually renders, so
+    # the stamp names the run that wrote the file rather than a string any run
+    # can copy onto any file. A moved knob or another output directory shows.
+    assert (
+        ga.docs_generated_by("docs/experiments", gd.CLIP_DIST_M_DEFAULT, ga.MATCH_DIST_M_DEFAULT)
+        == ga.DOCS_GENERATED_BY
+    )
+    assert ga.docs_generated_by("/tmp/scratch", 30.0, ga.MATCH_DIST_M_DEFAULT) == (
+        "scripts/grid_density_analyze.py --area all --docs-dir /tmp/scratch --clip-dist 30"
+    )
+    assert ga.docs_generated_by("docs/experiments", gd.CLIP_DIST_M_DEFAULT, 40.0).endswith(
+        "--match-dist 40"
+    )
     fake = [{"area": "adrian", "variants": {}}, {"area": "seattle", "variants": {}}]
     merged = ga.build_committed_metrics(fake)
     assert merged["_about"]["generated_by"] == ga.DOCS_GENERATED_BY
@@ -353,3 +367,131 @@ def test_figures_from_metrics_needs_only_the_committed_json(tmp_path):
     written = sorted(p.name for p in (tmp_path / "figures").iterdir())
     assert written == ["grid-density-pano_spacing.png", "grid-density-query_offset_ecdf.png"]
     assert all((tmp_path / "figures" / n).stat().st_size > 10_000 for n in written)
+
+
+def test_writeup_coverage_stability_recomputes_from_committed_json(committed):
+    """
+    Finding 2's headline number. It read "<=0.4 pp everywhere" across the 16x
+    query increase while the JSON committed beside it put Adrian at 0.82 pp --
+    the per-transition figure quoted as if it were the cumulative one. Pinned
+    here because the rest of the writeup's shares are pinned and this one, the
+    headline of the finding, was the one that drifted.
+    """
+
+    def cov(area, variant):
+        return committed["areas"][area]["variants"][variant]["coverage_rate_pct"]
+
+    assert {a: round(cov(a, "step5") - cov(a, "step20"), 1) for a in gd.STUDY_AREAS} == {
+        "adrian": 0.8,
+        "corvallis": 0.2,
+        "seattle": 0.2,
+    }
+    steps = [
+        round(cov(a, hi) - cov(a, lo), 2)
+        for a in gd.STUDY_AREAS
+        for lo, hi in (("step20", "step10"), ("step10", "step5"))
+    ]
+    assert max(steps) == 0.43  # "the largest single transition is 0.43 pp (Adrian, 20 -> 10 m)"
+
+
+def test_distance_histogram_drops_nan_rather_than_diluting_shares():
+    """NaN < edge and NaN >= edge are both False, so an unfiltered NaN lands in
+    neither the bins nor the tail while len() still counts it -- silently
+    breaking bins + tail == n_total and every share computed from it."""
+    edges = np.array([0.0, 1.0, 2.0])
+    h = ga.distance_histogram(np.array([0.5, np.nan, 1.5, 7.0]), edges)
+    assert sum(h["counts"]) + h["n_above_last_edge"] == h["n_total"] == 3
+    # +-inf is a real ordering, not a missing value: it belongs in the tail.
+    h_inf = ga.distance_histogram(np.array([0.5, np.inf]), edges)
+    assert h_inf["n_above_last_edge"] == 1 and h_inf["n_total"] == 2
+
+
+def test_offset_arrays_refuses_an_area_with_one_official_pano():
+    """sjoin_nearest(exclusive=True) drops the lone pano, which would report
+    n_unique_official_panos: 0 and divide every spacing share by it."""
+    pytest.importorskip("geopandas")
+    df = pd.DataFrame(
+        {
+            "query_lat": [43.74, 43.74],
+            "query_lon": [-117.07, -117.07],
+            "pano_lat": [43.7401, 43.7401],
+            "pano_lon": [-117.0701, -117.0701],
+            "pano_id": ["one", "one"],  # same pano returned by two query points
+            "status": ["OK", "OK"],
+            "copyright_info": ["© Google", "© Google"],
+        }
+    )
+    with pytest.raises(ValueError, match="unique official panos"):
+        ga.offset_arrays(df, "EPSG:32611")
+
+
+def test_figures_from_metrics_refuses_a_partial_or_per_area_file(tmp_path):
+    """This path writes the SAME filenames --docs-dir does, into figures/ beside
+    the file it reads, so a partial JSON would silently republish the committed
+    record with an area missing."""
+    with open(COMMITTED_JSON, encoding="utf-8") as fh:
+        full = json.load(fh)
+
+    partial = tmp_path / ga.DOCS_METRICS_NAME
+    partial.write_text(
+        json.dumps({"_about": full["_about"], "areas": {"adrian": full["areas"]["adrian"]}}),
+        encoding="utf-8",
+    )
+    with pytest.raises(SystemExit) as excinfo:
+        ga.main(["--figures-from-metrics", str(partial)])
+    assert excinfo.value.code == 2
+    assert not (tmp_path / "figures").exists()
+
+    per_area = tmp_path / "adrian_metrics.json"
+    per_area.write_text(json.dumps(full["areas"]["adrian"]), encoding="utf-8")
+    with pytest.raises(SystemExit) as excinfo:
+        ga.main(["--figures-from-metrics", str(per_area)])
+    assert excinfo.value.code == 2
+    assert not (tmp_path / "figures").exists()
+
+
+def test_docs_dir_refuses_no_figures(tmp_path):
+    """Silently ignoring it, which is what used to happen, would let a
+    numbers-only refresh leave the record's figures describing older numbers."""
+    with pytest.raises(SystemExit) as excinfo:
+        ga.main(["--area", "all", "--docs-dir", str(tmp_path), "--no-figures"])
+    assert excinfo.value.code == 2
+    assert not list(tmp_path.iterdir())
+
+
+def test_distribution_figures_reject_an_area_they_cannot_colour(committed, tmp_path):
+    """Adding a fourth study area must not write a JSON and CSV containing it
+    beside two figures that silently omit it."""
+    pytest.importorskip("matplotlib")
+    areas = dict(committed["areas"])
+    areas["portland"] = areas["adrian"]
+    with pytest.raises(ValueError, match="portland"):
+        ga.make_distribution_figures(areas, str(tmp_path), ga.DOCS_FIGURE_PREFIX)
+    with pytest.raises(ValueError, match="nothing to plot"):
+        ga.make_distribution_figures({}, str(tmp_path), ga.DOCS_FIGURE_PREFIX)
+
+
+def test_distribution_figures_honour_the_prefix(committed, tmp_path):
+    """Both figure builders take the prefix, so DOCS_FIGURE_PREFIX renames all
+    five together rather than three of them."""
+    pytest.importorskip("matplotlib")
+    written = ga.make_distribution_figures(committed["areas"], str(tmp_path), "xy-")
+    assert sorted(os.path.basename(p) for p in written) == [
+        "xy-pano_spacing.png",
+        "xy-query_offset_ecdf.png",
+    ]
+
+
+def test_analyzer_imports_without_a_pre_registered_sibling():
+    """The loader at the top of this section must not depend on `gd` having
+    registered grid_density_common in sys.modules 180 lines earlier -- otherwise
+    reordering the two blocks breaks collection with an unrelated error."""
+    code = (
+        "import importlib.util, sys;"
+        f"spec = importlib.util.spec_from_file_location('gda', {ga.__file__!r});"
+        "m = importlib.util.module_from_spec(spec); sys.modules['gda'] = m;"
+        "spec.loader.exec_module(m); print(m.DOCS_FIGURE_PREFIX)"
+    )
+    proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == ga.DOCS_FIGURE_PREFIX

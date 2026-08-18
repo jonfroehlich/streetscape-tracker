@@ -126,7 +126,7 @@ but not the tail:
 
 ![query-to-pano offset ECDF](figures/grid-density-query_offset_ecdf.png)
 
-Adrian's p90 sits exactly on the documented 50 m, yet **9.6% of its 14,923 successful
+Adrian's p90 sits just under the documented 50 m (49.6 m), yet **9.6% of its 14,923 successful
 official returns come from beyond it** (Corvallis 2.5% of 109,906, Seattle 0.6% of 82,113),
 out to 146 m at p99. The share rises as imagery gets sparser, which is the shape you would
 expect if the radius were larger than documented — or absent — rather than if a 50 m cutoff
@@ -138,9 +138,10 @@ legibility, so that cluster is off the plot; it is not off the record. Unexplain
 rather than relying on the 50 m figure, and set `radius` explicitly in any study where the
 search neighbourhood needs to be a known quantity.
 
-**2. Coverage % — the headline metric — is already stable at 20 m.** Across a 16× query
-increase it moves by ≤0.4 pp everywhere. Whatever a denser grid buys, it is not a
-different answer to "what fraction of this city has imagery".
+**2. Coverage % — the headline metric — is already stable at 20 m.** Across the full 16×
+query increase (20 → 5 m) it moves **+0.8 pp** in Adrian and **+0.2 pp** in Corvallis and
+Seattle; the largest single transition is 0.43 pp (Adrian, 20 → 10 m). Whatever a denser
+grid buys, it is not a different answer to "what fraction of this city has imagery".
 
 ![coverage by variant](figures/grid-density-coverage_by_variant.png)
 
@@ -202,7 +203,9 @@ Derived results are committed beside this writeup and do not require re-collecti
 binned `distributions` the two distance figures are drawn from),
 `grid-density_variants_summary.csv`, and the five figures under `figures/grid-density-*.png`.
 **`--docs-dir` is the only producer of those files** (`write_docs_record`; it requires
-`--area all`, so a partial run can never overwrite the record with a subset of areas), and
+`--area all`, so a partial run can never overwrite the record with a subset of areas, and it
+stages all seven artifacts before promoting them together, so a figure that fails to render
+cannot leave new numbers committed beside stale PNGs), and
 `tests/test_grid_density.py` pins them: the CSV regenerates byte-for-byte from the JSON,
 every `offsets` percentile falls in the histogram bin its cumulative share implies, and
 every share quoted above recomputes from the committed bins. The raw 5 m collection CSVs
@@ -215,6 +218,9 @@ rsyncs any `*.csv.gz` it finds there to the public web server. There the analysi
 regenerates `report.md` (the full per-area tables this document summarizes),
 `variants_summary.csv`, `{area}_metrics.json`, and unprefixed copies of the first three
 figures; the two distribution figures are drawn only from the merged JSON, by `--docs-dir`
-or by `--figures-from-metrics`, which needs no DB, no raw CSVs and no geo stack and writes
-into `figures/` beside the JSON it reads — i.e. into `docs/experiments/figures/` when
-pointed at the committed file.
+or by `--figures-from-metrics`, which needs no DB, no raw CSVs and no geopandas/osmnx — it
+does still need numpy/pandas/matplotlib, and shapely arrives transitively through the
+tracker package, so this is not a geo-stack-free path — and writes into `figures/` beside
+the JSON it reads, i.e. into `docs/experiments/figures/` when pointed at the committed file.
+Because that overwrites the committed figures in place, it refuses a metrics file missing
+any study area, which is the same guard `--docs-dir` applies through `--area all`.

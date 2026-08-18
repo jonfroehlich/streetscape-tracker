@@ -31,6 +31,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import sys
 from datetime import date
 
@@ -38,6 +39,13 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# ...and the script's own directory, because `grid_density_common` is a sibling
+# MODULE, not a package. tests/test_grid_density.py loads this file by path and
+# treats it as a library; without this, its `from grid_density_common import ...`
+# below resolves only if the importer happened to pre-register that name in
+# sys.modules first, so reordering two blocks in the test file would break
+# collection with a ModuleNotFoundError that names neither.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import geopy  # noqa: E402
 from grid_density_common import (  # noqa: E402
@@ -66,13 +74,23 @@ from streetscape_metadata_tracker.fileutils import load_city_csv_file  # noqa: E
 from streetscape_metadata_tracker.paths import get_default_data_dir  # noqa: E402
 
 # NOTE: streetscape_street_analyzer.download_street_network is imported lazily in
-# analyze_area() rather than here — it pulls the whole geo stack (geopandas,
-# osmnx, shapely) at import time, and --figures-from-metrics must be runnable
-# without it. That flag exists so the committed figures can be regenerated from
-# the committed metrics JSON on any machine; requiring geopandas to redraw a
+# analyze_area() rather than here — it pulls geopandas and osmnx at import time,
+# and --figures-from-metrics exists so the committed figures can be regenerated
+# from the committed metrics JSON without them; requiring geopandas to redraw a
 # line chart would defeat it.
+#
+# Be precise about what that buys, because an earlier version of this comment
+# claimed the flag needed "no geo stack" at all, and that is false: the imports
+# below pull streetscape_metadata_tracker, whose __init__ reaches
+# download_mapillary, which imports mapbox_vector_tile -> shapely (and aiohttp)
+# at module scope. Measured, not assumed. So the honest claim is "no
+# geopandas/osmnx", and the redraw still needs numpy/pandas/matplotlib/shapely.
 
 logger = logging.getLogger(__name__)
+
+# Named rather than inlined into add_argument, so docs_generated_by can tell a
+# canonical run from one with the knob moved.
+MATCH_DIST_M_DEFAULT = 25.0
 
 VARIANT_ORDER = ["step20", "step10", "step5_road", "step5"]
 VARIANT_LABELS = {
@@ -171,6 +189,19 @@ def offset_arrays(df5: pd.DataFrame, metric_crs) -> tuple[np.ndarray, np.ndarray
         .min()
         .to_numpy()
     )
+    # `nn` carries one distance per unique official pano, which is what lets
+    # offset_metrics report len(nn) as `n_unique_official_panos` and the writeup
+    # print it as an "n official panos" column. exclusive=True + how="inner"
+    # drops a pano with no other pano to pair with, which happens only for a
+    # degenerate area holding a single official pano — and there the count would
+    # silently read 0 and every share in spacing_shares would divide by it into
+    # NaN. Fail loudly instead of publishing that.
+    if len(nn) != len(panos):
+        raise ValueError(
+            f"nearest-neighbour spacing covers {len(nn)} of {len(panos)} unique official "
+            "panos; `n_unique_official_panos` would not be a pano count. An area needs at "
+            "least two official panos for a spacing distribution to mean anything."
+        )
     return offsets, nn
 
 
@@ -188,6 +219,8 @@ def offset_metrics(offsets: np.ndarray, nn: np.ndarray) -> dict:
             "p99": pct(offsets, 99),
             "max": round(float(offsets.max()), 1) if len(offsets) else None,
         },
+        # One entry per unique official pano — offset_arrays guarantees the
+        # 1:1, so this is a pano count and not a neighbour-pair count.
         "n_unique_official_panos": int(len(nn)),
         "pano_nearest_neighbor_m": {
             "p25": pct(nn, 25),
@@ -210,6 +243,14 @@ OFFSET_HIST_EDGES_M = np.linspace(0.0, 200.0, 101)  # 2 m bins
 def distance_histogram(values: np.ndarray, edges: np.ndarray) -> dict:
     """Binned counts over a fixed frame; the tail past the last edge is kept as a count."""
     values = np.asarray(values, dtype=float)
+    # Drop NaN before anything counts it. `NaN < edge` and `NaN >= edge` are BOTH
+    # False, so a NaN lands in neither `counts` nor `n_above_last_edge` while
+    # len() still counts it in `n_total` — quietly breaking the
+    # bins + tail == n_total invariant stated below and asserted by
+    # tests/test_grid_density.py, and diluting every share in spacing_shares /
+    # offset_shares by an amount nothing reports. +-inf is kept: it is a real
+    # distance ordering and lands in the tail where it belongs.
+    values = values[~np.isnan(values)]
     # np.histogram closes its LAST bin on the right, which would count a value
     # sitting exactly on the last edge both in that bin and in the tail below.
     counts, _ = np.histogram(values[values < edges[-1]], bins=edges)
@@ -789,7 +830,7 @@ def _ecdf(hist: dict) -> tuple[np.ndarray, np.ndarray]:
     return edges[1:], 100.0 * np.cumsum(counts) / hist["n_total"]
 
 
-def make_distribution_figures(areas: dict, fig_dir: str) -> list[str]:
+def make_distribution_figures(areas: dict, fig_dir: str, prefix: str) -> list[str]:
     """
     The two distance-distribution figures, plotted from the committed
     `grid-density_metrics.json` histograms rather than the (gitignored) raw
@@ -806,6 +847,19 @@ def make_distribution_figures(areas: dict, fig_dir: str) -> list[str]:
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    # Plot every area the record contains, or refuse. Filtering through
+    # AREA_COLORS alone was silent in the direction that matters: adding a fourth
+    # study area would write a JSON and CSV containing it beside two committed
+    # figures that omit it, exit 0. (make_figures raises KeyError on the same
+    # input, so silence here also made the two figure paths disagree.)
+    unknown = sorted(set(areas) - set(AREA_COLORS))
+    if unknown:
+        raise ValueError(
+            f"no plot colour for area(s) {unknown}; add them to AREA_COLORS rather than "
+            "publishing figures that omit an area the JSON and CSV beside them contain"
+        )
+    if not areas:
+        raise ValueError(f"nothing to plot: expected areas from {sorted(AREA_COLORS)}")
     os.makedirs(fig_dir, exist_ok=True)
     written = []
     ordered = [(k, areas[k]) for k in AREA_COLORS if k in areas]
@@ -837,7 +891,7 @@ def make_distribution_figures(areas: dict, fig_dir: str) -> list[str]:
         # at clearly different heights, so a plain right-offset cannot collide.
         pk = int(np.argmax(share))
         ax.annotate(
-            f"{band:.0f}% within 9–11 m",
+            f"{band:.1f}% within 9–11 m",
             xy=(centers[pk], share[pk]),
             xytext=(9, -3),
             textcoords="offset points",
@@ -880,7 +934,7 @@ def make_distribution_figures(areas: dict, fig_dir: str) -> list[str]:
         loc="left",
     )
     fig.tight_layout()
-    p = os.path.join(fig_dir, "grid-density-pano_spacing.png")
+    p = os.path.join(fig_dir, f"{prefix}pano_spacing.png")
     fig.savefig(p, dpi=150, facecolor=SURFACE)
     plt.close(fig)
     written.append(p)
@@ -901,9 +955,14 @@ def make_distribution_figures(areas: dict, fig_dir: str) -> list[str]:
         # All three curves are near-saturated at x=50, so labels anchored to the
         # curve would overlap. Stack them in the empty mid-right of the plot and
         # lead back to the crossing point.
-        at50 = float(np.interp(50.0, xs_, ys_))
+        # Through offset_shares, not a second inline copy of its expression, so
+        # the plotted number IS the tested one: tests/test_grid_density.py pins
+        # that helper to the writeup's 9.6 / 2.5 / 0.6. The spacing figure above
+        # routes through spacing_shares for the same reason.
+        beyond50 = offset_shares(h)["beyond_50m_pct"]
+        at50 = 100.0 - beyond50
         ax.annotate(
-            f"{100.0 - at50:.1f}% beyond 50 m",
+            f"{beyond50:.1f}% beyond 50 m",
             xy=(50.0, at50),
             xytext=(74.0, 74.0 - i * 9.0),
             textcoords="data",
@@ -938,7 +997,7 @@ def make_distribution_figures(areas: dict, fig_dir: str) -> list[str]:
         loc="left",
     )
     fig.tight_layout()
-    p = os.path.join(fig_dir, "grid-density-query_offset_ecdf.png")
+    p = os.path.join(fig_dir, f"{prefix}query_offset_ecdf.png")
     fig.savefig(p, dpi=150, facecolor=SURFACE)
     plt.close(fig)
     written.append(p)
@@ -951,9 +1010,31 @@ DOCS_METRICS_NAME = "grid-density_metrics.json"
 DOCS_SUMMARY_NAME = "grid-density_variants_summary.csv"
 DOCS_FIGURE_PREFIX = "grid-density-"
 DOCS_GENERATED_BY = "scripts/grid_density_analyze.py --area all --docs-dir docs/experiments"
+# Staging directory for the atomic promote in write_docs_record; per-pid so two
+# concurrent writers cannot promote each other's half-rendered artifacts.
+DOCS_STAGING_PREFIX = ".grid-density-staging-"
 
 
-def build_committed_metrics(results: list[dict]) -> dict:
+def docs_generated_by(docs_dir: str, clip_dist: float, match_dist: float) -> str:
+    """
+    The command that actually produced the record, for `_about.generated_by`.
+
+    Stamping a fixed constant would let `--docs-dir /tmp/scratch --clip-dist 30`
+    write a file claiming it came from the canonical invocation — a provenance
+    claim that is true of no run in particular, which is exactly what CLAUDE.md's
+    "Notes" rule (the JSON must be produced by committed code) asks this field to
+    rule out. Defaults are omitted, so the canonical run renders exactly
+    DOCS_GENERATED_BY and the committed file is unchanged by this.
+    """
+    cmd = f"scripts/grid_density_analyze.py --area all --docs-dir {docs_dir}"
+    if clip_dist != CLIP_DIST_M_DEFAULT:
+        cmd += f" --clip-dist {clip_dist:g}"
+    if match_dist != MATCH_DIST_M_DEFAULT:
+        cmd += f" --match-dist {match_dist:g}"
+    return cmd
+
+
+def build_committed_metrics(results: list[dict], generated_by: str = DOCS_GENERATED_BY) -> dict:
     """
     Merge the per-area results into the single JSON committed beside the
     writeup. Pure assembly: every number is the per-area result verbatim.
@@ -963,7 +1044,7 @@ def build_committed_metrics(results: list[dict]) -> dict:
             "experiment": "grid-density",
             "writeup": "docs/experiments/grid-density.md",
             "issue": 106,
-            "generated_by": DOCS_GENERATED_BY,
+            "generated_by": generated_by,
             "note": (
                 "Committed metrics for the grid-density experiment (issue #106). The raw 5 m "
                 "collection CSVs stay in the gitignored /experiments/grid-density/ and are "
@@ -977,22 +1058,43 @@ def build_committed_metrics(results: list[dict]) -> dict:
     }
 
 
-def write_docs_record(results: list[dict], docs_dir: str) -> list[str]:
+def write_docs_record(
+    results: list[dict], docs_dir: str, generated_by: str = DOCS_GENERATED_BY
+) -> list[str]:
     """
     Write the durable record: merged metrics JSON, summary CSV, and the five
     figures (prefixed, under docs_dir/figures). This is the ONLY producer of
     those files — the writeup's numbers must trace to what it writes.
+
+    Everything is rendered into a staging directory and promoted with os.replace
+    only once all seven artifacts exist. Writing the JSON and CSV first, as this
+    used to, meant a figure failing to render (missing backend, stale font cache,
+    an area with no colour) left new numbers on disk beside stale PNGs, with
+    `git status` flagging only the two files that changed — easy to commit, and
+    the one thing a "durable record" must not be. Same verify-then-promote
+    posture as catalog_backup.
     """
-    os.makedirs(docs_dir, exist_ok=True)
-    metrics = build_committed_metrics(results)
-    json_path = os.path.join(docs_dir, DOCS_METRICS_NAME)
-    with open(json_path, "w", encoding="utf-8") as fh:
-        json.dump(metrics, fh, indent=2)
-        fh.write("\n")
-    written = [json_path, write_summary_csv(results, docs_dir, DOCS_SUMMARY_NAME)]
-    fig_dir = os.path.join(docs_dir, "figures")
-    written += make_figures(results, fig_dir, prefix=DOCS_FIGURE_PREFIX)
-    written += make_distribution_figures(metrics["areas"], fig_dir)
+    os.makedirs(os.path.join(docs_dir, "figures"), exist_ok=True)
+    staging = os.path.join(docs_dir, f"{DOCS_STAGING_PREFIX}{os.getpid()}")
+    shutil.rmtree(staging, ignore_errors=True)
+    os.makedirs(os.path.join(staging, "figures"))
+    try:
+        metrics = build_committed_metrics(results, generated_by)
+        staged = [os.path.join(staging, DOCS_METRICS_NAME)]
+        with open(staged[0], "w", encoding="utf-8") as fh:
+            json.dump(metrics, fh, indent=2)
+            fh.write("\n")
+        staged.append(write_summary_csv(results, staging, DOCS_SUMMARY_NAME))
+        fig_dir = os.path.join(staging, "figures")
+        staged += make_figures(results, fig_dir, prefix=DOCS_FIGURE_PREFIX)
+        staged += make_distribution_figures(metrics["areas"], fig_dir, DOCS_FIGURE_PREFIX)
+        written = []
+        for path in staged:
+            dst = os.path.join(docs_dir, os.path.relpath(path, staging))
+            os.replace(path, dst)
+            written.append(dst)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
     return written
 
 
@@ -1002,7 +1104,7 @@ def main(argv: list | None = None) -> int:
     parser.add_argument("--out-dir", default=DEFAULT_OUT_DIR)
     parser.add_argument("--data-dir", default=get_default_data_dir())
     parser.add_argument("--clip-dist", type=float, default=CLIP_DIST_M_DEFAULT)
-    parser.add_argument("--match-dist", type=float, default=25.0)
+    parser.add_argument("--match-dist", type=float, default=MATCH_DIST_M_DEFAULT)
     parser.add_argument("--no-figures", action="store_true")
     parser.add_argument(
         "--docs-dir",
@@ -1019,10 +1121,13 @@ def main(argv: list | None = None) -> int:
         "--figures-from-metrics",
         metavar="PATH",
         help=(
-            "Regenerate only the distance-distribution figures from a committed "
-            "grid-density_metrics.json and exit. Needs no DB, no raw CSVs and no "
-            "geo stack — the point is that these figures survive without the "
-            "(gitignored) raw collection."
+            "Regenerate only the distance-distribution figures from a merged "
+            f"{DOCS_METRICS_NAME} and exit. Needs no DB, no raw CSVs and no "
+            "geopandas/osmnx — the point is that these figures survive without the "
+            "(gitignored) raw collection (it does still need numpy/pandas/matplotlib, "
+            "and shapely arrives transitively). Requires every study area, for the "
+            "same reason --docs-dir requires --area all: it overwrites the committed "
+            "record's figures in place."
         ),
     )
     parser.add_argument(
@@ -1031,6 +1136,15 @@ def main(argv: list | None = None) -> int:
     args = parser.parse_args(argv)
     if args.docs_dir and args.area != "all":
         parser.error("--docs-dir requires --area all (the record covers every area)")
+    if args.docs_dir and args.no_figures:
+        # Refusing beats honouring it: the record's figures are drawn from the
+        # numbers beside them, so a numbers-only refresh is precisely the stale
+        # pairing write_docs_record stages its artifacts to avoid. Silently
+        # ignoring the flag, which is what used to happen, is worse than both.
+        parser.error(
+            "--no-figures cannot be combined with --docs-dir: the record's figures must "
+            "be regenerated with its numbers, or they no longer describe it"
+        )
     logging.basicConfig(
         level=getattr(logging, args.log_level), format="%(asctime)s - %(levelname)s - %(message)s"
     )
@@ -1038,8 +1152,24 @@ def main(argv: list | None = None) -> int:
     if args.figures_from_metrics:
         with open(args.figures_from_metrics, encoding="utf-8") as fh:
             metrics = json.load(fh)
+        areas = metrics.get("areas")
+        if not isinstance(areas, dict):
+            parser.error(
+                f"{args.figures_from_metrics} has no 'areas' block — this flag wants the "
+                f"merged {DOCS_METRICS_NAME}, not a per-area {{area}}_metrics.json"
+            )
+        missing = sorted(set(STUDY_AREAS) - set(areas))
+        if missing:
+            # This path writes the SAME committed filenames --docs-dir does, into
+            # figures/ beside the file it read, so without this guard a partial or
+            # hand-edited JSON silently republishes the record's figures with an
+            # area missing and exits 0 — the --area all guard, one door down.
+            parser.error(
+                f"{args.figures_from_metrics} is missing area(s) {missing}; refusing to "
+                "redraw, because these figures overwrite the committed record in place"
+            )
         fig_dir = os.path.join(os.path.dirname(args.figures_from_metrics), "figures")
-        for p in make_distribution_figures(metrics["areas"], fig_dir):
+        for p in make_distribution_figures(areas, fig_dir, DOCS_FIGURE_PREFIX):
             print(f"Figure: {p}")
         return 0
 
@@ -1056,7 +1186,8 @@ def main(argv: list | None = None) -> int:
             print(f"Figure: {p}")
     print(f"Report: {write_report(results, args.out_dir)}")
     if args.docs_dir:
-        for p in write_docs_record(results, args.docs_dir):
+        stamp = docs_generated_by(args.docs_dir, args.clip_dist, args.match_dist)
+        for p in write_docs_record(results, args.docs_dir, stamp):
             print(f"Docs: {p}")
     return 0
 
