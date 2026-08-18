@@ -49,7 +49,6 @@ import geopy.distance
 import mapbox_vector_tile
 import numpy as np
 import pandas as pd
-from tqdm import tqdm
 
 from .analysis import FLAT_ONLY, REQUEST_FAILED
 from .config import MAPILLARY_METADATA_DTYPES
@@ -64,6 +63,7 @@ from .download_common import (
 )
 from .fileutils import load_city_csv_file
 from .host_lock import host_lock
+from .progress import progress
 
 logger = logging.getLogger(__name__)
 
@@ -819,7 +819,14 @@ async def _fetch_city_images(
         if max_requests_per_minute > 0
         else "Tile pacing DISABLED (max_requests_per_minute <= 0)"
     )
-    progress_bar = tqdm(total=len(tiles), desc=f"Downloading Mapillary tiles for {city_name}")
+    progress_bar = progress(
+        total=len(tiles),
+        desc=f"Downloading Mapillary tiles for {city_name}",
+        unit="tile",
+        # Paced at 60 tiles/min (issue #198), so a large city is tens of minutes
+        # of deliberately slow fetching under the scheduler's redirected log.
+        logger=logger,
+    )
 
     def count_request() -> None:
         nonlocal api_requests

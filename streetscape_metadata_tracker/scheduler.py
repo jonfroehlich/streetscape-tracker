@@ -41,6 +41,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from pathlib import Path
+from typing import Any
 
 from tabulate import tabulate
 
@@ -763,6 +764,24 @@ def setup_logging(cfg: SchedulerConfig, verbose: bool = False) -> None:
     )
 
 
+def _emit(message: str) -> None:
+    """``print`` that a vanished reader cannot turn into a failure.
+
+    Used where a print sits on a path whose *remaining* work matters more than
+    the message — cmd_regenerate, whose print precedes the publish that is the
+    whole reason the operator ran it. A dead pipe there aborted the recovery
+    before it recovered anything.
+
+    Deliberately not applied to the interactive read-only subcommands (status,
+    restore-backup, the dry runs): there the output IS the product, and a
+    swallowed BrokenPipeError would hide that the reader is gone.
+    """
+    try:
+        print(message)
+    except BrokenPipeError:
+        logger.debug("stdout closed; continuing")
+
+
 def _recent_log_tail(cfg: SchedulerConfig, n: int = 40) -> str:
     """
     Last n lines of the scheduler log, for pasting into an alert email.
@@ -779,11 +798,9 @@ def _recent_log_tail(cfg: SchedulerConfig, n: int = 40) -> str:
         return f"(could not read {log_path}: {e})"
 
 
-def _publish(cfg: SchedulerConfig, context: str) -> int:
+def _publish(cfg: SchedulerConfig, context: str, alert_on_failure: bool = True) -> int:
     """
-    Run the publish script (rsync data/ to the web server), returning its exit
-    code and emailing the operator on failure. ``context`` (e.g. the run-due
-    summary) is prepended to the alert body so the email is self-explanatory.
+    Run the publish script (rsync data/ to the web server), returning its exit code.
 
     ``[publish].local`` becomes an explicit ``--local`` argument rather than
     being left to STREETSCAPE_PUBLISH_LOCAL in the environment: the nightly
@@ -791,19 +808,60 @@ def _publish(cfg: SchedulerConfig, context: str) -> int:
     hand-run publish on a local-docroot host took the SSH path and emailed a
     false publish-FAILED alert (issue #215). Passing it explicitly makes the
     two paths identical.
+
+    The child's output goes to a per-day log rather than being inherited, for the
+    same reason ``_run_collection_subprocess`` redirects its children — and here
+    for a second, sharper one. Python ignores SIGPIPE only for *itself*;
+    ``subprocess`` restores it to SIG_DFL in children. So on a ``run-due ... |
+    tail -40`` whose reader has gone away, an inherited fd 1 means
+    sync_data_to_server.sh (``set -euo pipefail``) takes SIGPIPE on its first
+    echo, before any rsync, and dies with returncode -13. That is the 2026-08-17
+    incident surviving every other guard in this file: the tail would run, reach
+    here, and still publish nothing.
+
+    ``alert_on_failure`` is off when the caller reports failures itself. The
+    batch tail does, so that one email names the failed publish alongside the
+    failed index or backup it usually accompanies (a full data_dir breaks both),
+    instead of sending a partial email and returning early.
     """
     cmd = ["bash", cfg.publish_script]
     if cfg.publish_local:
         cmd.append("--local")
     logger.info(f"Publishing via {' '.join(cmd[1:])}")
-    result = subprocess.run(cmd, cwd=str(_PROJECT_ROOT))
+    os.makedirs(cfg.log_dir, exist_ok=True)
+    log_path = Path(cfg.log_dir) / f"publish_{date.today().isoformat()}.log"
+    try:
+        # Append, not truncate: a night can publish more than once (a manual
+        # regenerate-aggregate after the batch), and the earlier attempt is
+        # exactly what an operator is trying to read.
+        with open(log_path, "a", encoding="utf-8") as fh:
+            fh.write(f"\n===== {datetime.now(UTC).isoformat()} =====\n")
+            fh.write(redact_credentials(" ".join(cmd)) + "\n\n")
+            fh.flush()
+            result = subprocess.run(
+                cmd,
+                cwd=str(_PROJECT_ROOT),
+                stdout=fh,
+                stderr=subprocess.STDOUT,
+            )
+    except OSError as e:
+        # The log itself is unwritable (full or read-only disk) — which is also
+        # a good reason for the publish to be about to fail. Report it as the
+        # publish failing rather than taking down the tail.
+        logger.error(f"Could not open {log_path} for the publish script: {e}")
+        return 1
+
     if result.returncode != 0:
-        logger.error("Publish script failed")
-        send_alert(
-            cfg.alerts,
-            f"publish script FAILED on {socket.gethostname()}",
-            f"{context}\n\nPublish step exited nonzero.\n\nRecent log:\n{_recent_log_tail(cfg)}",
-        )
+        logger.error(f"Publish script failed (exit {result.returncode}); output in {log_path}")
+        if alert_on_failure:
+            tail = _tail_lines(log_path, _CHILD_LOG_TAIL_LINES)
+            send_alert(
+                cfg.alerts,
+                f"publish script FAILED on {socket.gethostname()}",
+                f"{context}\n\nPublish step exited {result.returncode}.\n\n"
+                f"--- last {_CHILD_LOG_TAIL_LINES} lines of {log_path.name} ---\n{tail}\n\n"
+                f"Recent log:\n{_recent_log_tail(cfg)}",
+            )
     return result.returncode
 
 
@@ -964,32 +1022,49 @@ def _regenerate_published_json(conn, cfg: SchedulerConfig) -> tuple[str, bool]:
     drift into publishing different sets of files — the failure mode being an
     artifact whose companion index still describes the previous state.
 
-    ``complete`` is False when the driving-plan join failed. That join is the
-    least load-bearing of the three and reads ~1,200 per-run JSONs, so it is
-    guarded the way _finish_batch guards it: an OSError there must not cost the
-    caller its publish (#167). But swallowing it and returning success too would
-    leave a scripted `regenerate-aggregate` unable to tell a full rebuild from a
-    partial one, so the outcome is returned rather than only logged — and each
-    caller decides what it means for ITS exit code. The two other artifacts stay
-    unguarded, matching _finish_batch: they describe the runs themselves, and a
-    caller must not publish an aggregate it failed to rebuild.
+    ``complete`` is False when ANY of the three failed. Swallowing a failure and
+    returning success would leave a scripted `regenerate-aggregate` unable to
+    tell a full rebuild from a partial one, so the outcome is returned rather
+    than only logged — and each caller decides what it means for ITS exit code.
+
+    All three go through _tail_artifact, matching what _finish_batch does with
+    the same three functions. An earlier version guarded only the driving-plan
+    join and let the other two propagate, on the reasoning that a caller must
+    not publish an aggregate it failed to rebuild. That is the wrong half of the
+    trade, and it is the bug this whole path exists to fix: the aggregate's own
+    progress bar is where the 2026-08-17 BrokenPipeError landed, so an
+    unguarded rebuild here means a dead stdout takes down `regenerate-aggregate`
+    — the command prescribed as the RECOVERY from a stale index — and
+    `assess-city` with it, in both cases before their publish. Continuing is
+    safe because every artifact is written via _write_json_gz_atomic, so a
+    failed rebuild leaves the PREVIOUS good file in place: the publish ships a
+    stale-but-valid index, never a truncated one, and the caller still learns
+    what happened from ``complete`` and from the summary line.
     """
     logger.info("Regenerating aggregate cities.json.gz")
-    agg = generate_aggregate_v2(conn, cfg.data_dir)
-    manifest = generate_streetwalk_manifest(conn, cfg.data_dir)
-    complete = True
-    try:
-        plan = generate_driving_plan_summary(conn, cfg.data_dir)
-        plan_note = f"driving_plan.json.gz ({len(plan['records'])} plan records)."
-    except Exception:
-        logger.exception("Driving-plan summary regeneration failed")
-        plan_note = "driving_plan.json.gz NOT regenerated (see log)."
-        complete = False
-    summary = (
-        f"Regenerated {cfg.data_dir}/cities.json.gz ({agg['cities_count']} cities); "
-        f"streetwalks.json.gz ({len(manifest['walks'])} walks); " + plan_note
+    agg, agg_err = _tail_artifact("aggregate index", generate_aggregate_v2, conn, cfg.data_dir)
+    manifest, man_err = _tail_artifact(
+        "streetwalk manifest", generate_streetwalk_manifest, conn, cfg.data_dir
     )
-    return summary, complete
+    plan, plan_err = _tail_artifact(
+        "driving-plan summary", generate_driving_plan_summary, conn, cfg.data_dir
+    )
+
+    def _count(result, key: str, noun: str, filename: str) -> str:
+        """One artifact's clause of the summary — its count, or that it is stale."""
+        if result is None:
+            return f"{filename} NOT regenerated (see log)"
+        value = result[key]
+        return f"{filename} ({value if isinstance(value, int) else len(value)} {noun})"
+
+    summary = f"Regenerated in {cfg.data_dir}: " + "; ".join(
+        (
+            _count(agg, "cities_count", "cities", "cities.json.gz"),
+            _count(manifest, "walks", "walks", "streetwalks.json.gz"),
+            _count(plan, "records", "plan records", "driving_plan.json.gz"),
+        )
+    )
+    return summary, not (agg_err or man_err or plan_err)
 
 
 def cmd_regenerate(cfg: SchedulerConfig, publish: bool = False) -> int:
@@ -1004,17 +1079,28 @@ def cmd_regenerate(cfg: SchedulerConfig, publish: bool = False) -> int:
     the published JSON, so "it rebuilt two of three" must not read as success to
     a wrapper. (``assess-city`` scores the same partial rebuild differently — it
     is not what that command was asked to do.)
+
+    This is also the command _tail_artifact's docstring prescribes as the
+    recovery from a stale index, so it has to survive the conditions that make
+    an index go stale. Its rebuilds are guarded in _regenerate_published_json,
+    and its prints go through _emit, because an operator runs this as
+    ``... --publish | tail -20`` or over an ssh session that drops — and the
+    print sat BEFORE the publish, so a dead stdout aborted the recovery before
+    it recovered anything.
     """
     conn = db.connect(cfg.db_path)
     summary, complete = _regenerate_published_json(conn, cfg)
-    print(summary)
+    _emit(summary)
 
     if publish:
         # An explicit --publish overrides [publish].enabled: the operator is
-        # asking for it directly on the command line.
+        # asking for it directly on the command line. Publish even when a
+        # rebuild failed: the others are fresh, the failed one left its previous
+        # good file in place (_write_json_gz_atomic), and shipping a stale-but-
+        # valid index beats shipping nothing.
         if _publish(cfg, "regenerate-aggregate (manual)") != 0:
             return 1
-        print("Published to the web server.")
+        _emit("Published to the web server.")
     return 0 if complete else 1
 
 
@@ -1664,7 +1750,9 @@ def cmd_assess_city(
     # unrelated to this city's numbers, and failing an answered inquiry over it
     # would be the tail wagging the dog.
     regen_summary, _regen_complete = _regenerate_published_json(conn, cfg)
-    print(regen_summary)
+    # _emit, not print: this line sits in front of the publish below, so a
+    # reader that has gone away must not cost this command its rsync.
+    _emit(regen_summary)
     publish_wanted = publish and cfg.publish_enabled
     published = False
     if publish_wanted:
@@ -2303,8 +2391,14 @@ def _fetch_driving_plan_nightly(cfg: SchedulerConfig, conn, today: date) -> str 
     """
     Snapshot the driving-plan feed (issue #176). Returns an error string for
     the batch summary, or None. Never raises: a broken Google feed must not
-    cost a night of collection (the issue #167 lesson), and a failure here is
-    advisory — the feed is an undocumented asset with no uptime contract.
+    cost a night of collection (the issue #167 lesson), and the feed is an
+    undocumented asset with no uptime contract.
+
+    "Never raises" is not "never reported", though — the returned error reaches
+    _finish_batch, which alerts and exits nonzero on it. Google overwrites this
+    feed in place, so a night we do not snapshot is a revision nobody can ever
+    recover; that deserves louder handling than the plan *summary* rebuild
+    beside it, which can be regenerated from the catalog at any time.
     """
     if not cfg.driving_plan.enabled:
         return None
@@ -2495,7 +2589,8 @@ def cmd_run_due(
 
     # Snapshot the driving-plan feed BEFORE the city loop: upstream of the
     # batch deadline and any mid-loop kill, and on zero-due nights too. Cheap
-    # (one request), and a failure never fails the night.
+    # (one request), and a failure never *stops* the night — though it does
+    # make it report unhealthy, since a missed snapshot is unrecoverable.
     plan_error = _fetch_driving_plan_nightly(cfg, conn, today)
 
     # The tail below (aggregate, manifest, backup, publish) is what makes a
@@ -2563,6 +2658,7 @@ def cmd_run_due(
         today,
         errored=stop_reason == _STOP_REASON_ERROR,
         backup_error=backup_error,
+        plan_error=plan_error,
         blocked_hosts=blocked_hosts,
         busy_hosts=busy_hosts,
     )
@@ -2862,6 +2958,40 @@ def _run_city_loop(
     return processed, succeeded, attempted, skipped_budget, stop_reason, blocked_hosts, busy_hosts
 
 
+def _tail_artifact(label: str, fn, conn, data_dir: str) -> tuple[Any, str | None]:
+    """
+    Rebuild one published index, turning a crash into a reported error rather
+    than a lost tail (issue #167).
+
+    The tail — indexes, catalog backup, publish — is what makes a night visible,
+    and #167's lesson is that it must survive every way the work before it can
+    fail. That was applied to the city loop but not to the tail's own first
+    statements: on 2026-08-17 a `run-due ... | tail -40` whose pipe reader had
+    gone away collected 10/10 cities and published none of them, because a
+    BrokenPipeError out of the aggregate's progress bar (see the disable=None
+    comment in json_summarizer.generate_aggregate_v2) skipped the manifest, the
+    driving-plan summary, the tail backup AND the publish.
+
+    Continuing past a failure is safe because all three indexes are written via
+    json_summarizer._write_json_gz_atomic, so a failed rebuild leaves the
+    PREVIOUS good file in place — the publish that follows ships a stale-but-
+    valid index, never a truncated one. That is the cheaper loss by a wide
+    margin: a stale index costs a day and one `regenerate-aggregate`, while an
+    unpublished night costs every artifact the night collected plus its backup.
+
+    Returns ``(result, None)`` on success, or ``(None, error)`` — a one-line
+    error for the caller to report. The error is REPORTED, not swallowed: an
+    index that fails forever is exactly the kind of thing #145 was about, so the
+    night alerts and exits nonzero. The result is returned because
+    ``cmd_regenerate`` prints counts out of it.
+    """
+    try:
+        return fn(conn, data_dir), None
+    except Exception as e:
+        logger.exception(f"{label} failed; continuing with the rest of the tail")
+        return None, f"{label} failed: {type(e).__name__}: {e}"
+
+
 def _finish_batch(
     cfg: SchedulerConfig,
     conn,
@@ -2871,6 +3001,7 @@ def _finish_batch(
     today: date,
     errored: bool = False,
     backup_error: str | None = None,
+    plan_error: str | None = None,
     blocked_hosts: set[str] | None = None,
     busy_hosts: Counter[str] | None = None,
 ) -> int:
@@ -2886,6 +3017,18 @@ def _finish_batch(
     alert is sent. ``today`` is passed in rather than read from the clock so a
     long night stamps the backup with the date the batch belongs to.
 
+    ``plan_error`` carries the driving-plan FETCH's outcome, for the same
+    reason and with more urgency than the plan *summary* rebuild below. Google
+    overwrites that feed in place, so a night we fail to snapshot it is
+    permanently unrecoverable — while the summary is regenerable from the
+    catalog whenever we like. Before this it was folded into ``summary`` and
+    nothing else, so a week of blocked fetches was a week of clean green nights
+    and seven snapshots gone for good.
+
+    The index rebuilds go through ``_tail_artifact``, so a crash in one of them
+    is reported (alert + nonzero exit) without costing the catalog backup and
+    the publish that follow — the same #167 posture the city loop already had.
+
     ``blocked_hosts`` names the per-IP hosts that refused us, and ``busy_hosts``
     counts channels skipped because another local process held a host lock
     (issue #208). Both alert unconditionally and exit nonzero, for the same
@@ -2895,11 +3038,24 @@ def _finish_batch(
     success. They stay separate in the subject line because the operator's next
     move differs: a block is waited out, a busy lock is somebody's stray process.
     """
+    # Every index rebuild goes through _tail_artifact, which reports a failure
+    # instead of propagating it — see there for why a lost tail is the worse
+    # outcome. Each is wrapped SEPARATELY: they are independent files with
+    # independent readers (cities.json.gz feeds the overview map,
+    # streetwalks.json.gz feeds streets.html), so a broken aggregate must not
+    # also cost the manifest.
+    tail_errors: list[str] = []
+
+    def rebuild(label: str, fn) -> None:
+        _result, error = _tail_artifact(label, fn, conn, cfg.data_dir)
+        if error:
+            tail_errors.append(error)
+
     # Regenerate the aggregate once for the whole batch
     if succeeded > 0:
         logger.info("Regenerating aggregate cities.json.gz")
-        generate_aggregate_v2(conn, cfg.data_dir)
-        generate_streetwalk_manifest(conn, cfg.data_dir)
+        rebuild("aggregate index", generate_aggregate_v2)
+        rebuild("streetwalk manifest", generate_streetwalk_manifest)
 
     # Deliberately NOT gated on succeeded > 0, unlike the two above. Those
     # describe the runs the night collected, so with nothing collected there is
@@ -2917,11 +3073,14 @@ def _finish_batch(
     # publish of a night that was otherwise completely healthy. That is #167's
     # failure mode, and this artifact is the least important thing in the tail:
     # a stale plan page costs a day, an unpublished night costs the runs.
+    #
+    # "Least important" argued only against taking the tail down, never against
+    # being reported — so it goes through _tail_artifact like the two above and
+    # now alerts and exits nonzero. Before that it logged and continued, which
+    # meant a permanently broken plan page could rot indefinitely with every
+    # night still reporting a clean success.
     logger.info("Regenerating driving_plan.json.gz")
-    try:
-        generate_driving_plan_summary(conn, cfg.data_dir)
-    except Exception:
-        logger.exception("Driving-plan summary failed; continuing with the rest of the tail")
+    rebuild("driving-plan summary", generate_driving_plan_summary)
 
     # Back up again now that the night's runs, diffs and walks are registered:
     # the pre-flight copy (see _backup_catalog_nightly) guarantees a copy
@@ -2931,9 +3090,17 @@ def _finish_batch(
     if not tail_backup.ok:
         backup_error = f"catalog backup failed: {tail_backup.error}"
 
+    # Publish BEFORE the alert, and report its failure through the alert rather
+    # than returning here. The two failures share causes — a vanished,
+    # unwritable or full data_dir breaks generate_aggregate_v2 AND makes
+    # sync_data_to_server.sh exit 1 — so returning early sent the operator a
+    # bare "publish script FAILED" and dropped the tail_errors, the backup
+    # failure and the host conditions that explain it. One complete email.
+    publish_error: str | None = None
     if cfg.publish_enabled and succeeded > 0:
-        if _publish(cfg, summary) != 0:
-            return 1
+        rc = _publish(cfg, summary, alert_on_failure=False)
+        if rc != 0:
+            publish_error = f"publish script FAILED (exit {rc}); see logs/publish_*.log"
 
     # Operator email when the batch finished unhealthy (threshold-controlled so
     # an occasional single flaky city doesn't page every night). No-op unless
@@ -2970,13 +3137,16 @@ def _finish_batch(
     )
 
     failures = attempted - succeeded
-    if (
-        errored
-        or backup_error
-        or blocked_hosts
-        or busy_hosts
-        or should_alert(failures, cfg.alerts.failure_threshold)
-    ):
+    unhealthy = (
+        errored,
+        backup_error,
+        plan_error,
+        tail_errors,
+        publish_error,
+        blocked_hosts,
+        busy_hosts,
+    )
+    if any(unhealthy) or should_alert(failures, cfg.alerts.failure_threshold):
         host = socket.gethostname()
         # Several can be true at once, and the subject line is often all that
         # gets read on a phone at 03:00 — so say each rather than letting one
@@ -2984,34 +3154,47 @@ def _finish_batch(
         parts = []
         if backup_error:
             parts.append("CATALOG BACKUP FAILED")
+        if publish_error:
+            parts.append("PUBLISH FAILED")
+        if errored:
+            # Without its own part, a night that BOTH crashed in the loop and
+            # failed an index reported only the index — the crash, the more
+            # serious of the two, appeared nowhere in the subject.
+            parts.append("LOOP CRASHED")
+        if tail_errors:
+            parts.append(f"{len(tail_errors)} published index(es) FAILED")
+        if plan_error:
+            parts.append("DRIVING-PLAN FETCH FAILED")
         if blocked_hosts:
             parts.append(f"{len(blocked_hosts)} host(s) UNAVAILABLE")
         if busy_hosts:
             parts.append(f"{sum(busy_hosts.values())} channel(s) SKIPPED (host busy)")
-        if failures or not (backup_error or blocked_hosts or busy_hosts):
+        # The failure count is the subject on an ordinary bad night, and noise
+        # ("0 failed collection(s)") when something above already carries it.
+        if failures or not any(unhealthy):
             parts.append(f"{failures} failed collection(s)")
         subject = f"{' + '.join(parts)} on {host}"
         body = (
             summary
             + (f"\n\n{backup_error}" if backup_error else "")
+            + (f"\n\n{publish_error}" if publish_error else "")
+            # Named individually: which index broke decides the operator's next
+            # move (a `regenerate-aggregate --publish` fixes a bad rebuild, but a
+            # failing driving-plan summary means Google's feed changed shape).
+            + ("\n\n" + "\n".join(tail_errors) if tail_errors else "")
             + (f"\n\n{blocked_note}" if blocked_note else "")
             + (f"\n\n{busy_note}" if busy_note else "")
         )
         send_alert(cfg.alerts, subject, f"{body}\n\nRecent log:\n{_recent_log_tail(cfg)}")
 
-    # A backup failure, a blocked host or a locally-busy one makes the night
-    # unhealthy even when every attempted city landed — publishing still happened
-    # above (the #167 posture: never withhold what was collected), but the unit
-    # should go red so systemd and [alerts] both show it. For the two host
-    # conditions this is the ONLY signal, since neither records a per-city
-    # failure by design.
-    if (
-        succeeded == attempted
-        and not errored
-        and not backup_error
-        and not blocked_hosts
-        and not busy_hosts
-    ):
+    # A backup failure, a failed index rebuild, a failed publish, a missed
+    # driving-plan snapshot, a blocked host or a locally-busy one makes the
+    # night unhealthy even when every attempted city landed — publishing was
+    # still attempted above (the #167 posture: never withhold what was
+    # collected), but the unit should go red so systemd and [alerts] both show
+    # it. For the two host conditions this is the ONLY signal, since neither
+    # records a per-city failure by design.
+    if succeeded == attempted and not any(unhealthy):
         return 0
     return 1
 
@@ -3242,5 +3425,38 @@ def main() -> int:
     return 2
 
 
+def _exit(rc: int) -> None:
+    """Exit with ``rc``, surviving an output stream whose reader has gone away.
+
+    CPython flushes sys.stdout/sys.stderr during finalization and, if that flush
+    fails, **replaces the process exit status with 120**. That silently clobbers
+    this module's whole exit-code vocabulary — 0/1, USAGE_EXIT_CODE (64), the
+    host codes (75/76) and the host-busy codes (79/80) — and there is reliably
+    something buffered to fail on, because setup_logging installs a
+    StreamHandler(sys.stdout) whose per-emit flush errors are swallowed by
+    logging's own handleError while the unwritten bytes stay in the buffer.
+
+    So a piped `run-due` that this file's other guards carried all the way
+    through a healthy night still reported failure to systemd. Flushing here
+    ourselves, and pointing a broken fd at /dev/null so finalization's flush
+    finds nothing to write, makes the status we computed the status we report.
+
+    Both streams, not just stdout: finalization flushes both.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        if stream is None:
+            continue  # a detached interpreter has no stream to flush
+        try:
+            stream.flush()
+        except (BrokenPipeError, ValueError, OSError):
+            # ValueError covers an already-closed stream; OSError catches the
+            # rest of the EPIPE/EBADF family. A stream we cannot even take a
+            # fileno() from (pytest capture, an embedded interpreter) has no
+            # fd to redirect and no finalization flush to break.
+            with contextlib.suppress(Exception):
+                os.dup2(os.open(os.devnull, os.O_WRONLY), stream.fileno())
+    sys.exit(rc)
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    _exit(main())

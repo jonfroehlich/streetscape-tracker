@@ -13,7 +13,6 @@ import backoff
 import geopy.distance
 import pandas as pd
 from filelock import FileLock, Timeout
-from tqdm import tqdm
 
 from .analysis import REQUEST_FAILED, RETRYABLE_STATUSES
 from .config import METADATA_DTYPES
@@ -25,6 +24,7 @@ from .download_common import (
     standardize_capture_date,
 )
 from .fileutils import load_city_csv_file
+from .progress import progress
 
 logger = logging.getLogger(__name__)
 
@@ -533,10 +533,16 @@ async def collect_points_async(
             failed_points_queue = asyncio.Queue()
 
             # Create progress bar
-            progress_bar = tqdm(
+            progress_bar = progress(
                 total=len(all_points),
                 initial=len(processed_points),
                 desc=f"Downloading GSV pano data{f' for {city_label}' if city_label else ''}",
+                unit="point",
+                # Headless under the scheduler (output goes to a per-attempt log
+                # file), and long: a road walk is ~247k requests. Without the
+                # tick this writes nothing between its first and last line, and
+                # a SIGKILLed child becomes impossible to tell from a slow one.
+                logger=logger,
             )
 
             # Process initial points in batches

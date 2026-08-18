@@ -3,6 +3,7 @@
 import gzip
 import json
 import os
+import sys
 from datetime import date
 
 import pandas as pd
@@ -677,3 +678,72 @@ def test_aggregate_still_skips_provider_when_json_truly_missing(conn, data_dir):
     )
     summary = generate_aggregate_v2(conn, data_dir)
     assert all(c["city_id"] != city_id for c in summary["cities"])
+
+
+def test_aggregate_survives_a_dead_output_stream(conn, data_dir, monkeypatch):
+    """
+    A broken stdout/stderr pipe must not take down the aggregate.
+
+    On 2026-08-17 a manual catch-up (`run-due ... | tail -40`) whose pipe reader
+    had gone away collected 10/10 cities and published NONE of them: this
+    function's "Aggregating cities" tqdm bar is the first statement of the
+    scheduler's tail, and tqdm's status_printer flushes the RAW sys.stderr —
+    outside the DisableOnWriteError wrapper that guards its own writes — so
+    EPIPE surfaced as a hard exception and skipped the manifest, the plan
+    summary, the tail catalog backup and the publish.
+
+    The fix is tqdm's own disable=None ("off unless the stream is a TTY"), which
+    returns from __init__ before status_printer is ever built. This test
+    reproduces the real thing rather than the symptom: an os.pipe() whose read
+    end is closed, so the first write genuinely raises BrokenPipeError.
+    """
+    city_id = db.register_city(
+        conn,
+        city_name="Piped",
+        state_name=None,
+        state_code=None,
+        country_name="Testland",
+        country_code=None,
+        center_lat=44.0,
+        center_lon=-121.0,
+        grid_width_m=100,
+        grid_height_m=100,
+        step_m=20,
+    )
+    csv_name = f"{city_id}_width_100_height_100_step_20_2026-01-15.csv.gz"
+    csv_path = _write_run(data_dir, [("p1", "2020-01-15")], date(2026, 1, 15), csv_name)
+    df = load_city_csv_file(csv_path)
+    json_path = generate_city_metadata_summary_as_json(
+        csv_path, df, "Piped", None, "Testland", 100, 100, 20, run_date=date(2026, 1, 15)
+    )
+    db.register_run(
+        conn,
+        city_id=city_id,
+        run_date=date(2026, 1, 15),
+        csv_filename=csv_name,
+        json_filename=os.path.basename(json_path),
+        unique_panos=1,
+        unique_google_panos=1,
+    )
+
+    read_fd, write_fd = os.pipe()
+    os.close(read_fd)  # nobody is listening: the next write raises EPIPE
+    dead = os.fdopen(write_fd, "w")
+    monkeypatch.setattr(sys, "stderr", dead)
+    monkeypatch.setattr(sys, "stdout", dead)
+    try:
+        with pytest.raises(BrokenPipeError):
+            dead.write("x")
+            dead.flush()
+        summary = generate_aggregate_v2(conn, data_dir)
+    finally:
+        # Closing flushes, which raises again on a broken pipe; the fd is
+        # reclaimed either way and the test's assertion is what matters.
+        try:
+            dead.close()
+        except BrokenPipeError:
+            pass
+
+    assert summary["schema_version"] == 3
+    assert os.path.exists(os.path.join(data_dir, "cities.json.gz"))
+    assert any(c["city_id"] == city_id for c in summary["cities"])

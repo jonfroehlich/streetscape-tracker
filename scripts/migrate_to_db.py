@@ -34,7 +34,6 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 
 import pandas as pd
-from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -51,6 +50,7 @@ from streetscape_metadata_tracker.json_summarizer import (  # noqa: E402
 )
 from streetscape_metadata_tracker.naming import parse_filename, slug_to_query_str  # noqa: E402
 from streetscape_metadata_tracker.paths import get_default_data_dir  # noqa: E402
+from streetscape_metadata_tracker.progress import progress  # noqa: E402
 
 logger = logging.getLogger("migrate")
 
@@ -114,7 +114,7 @@ def scan_files(data_dir: str, use_nominatim_fallback: bool) -> tuple[list[FileIn
     all_csvs = sorted(glob.glob(os.path.join(data_dir, "**/*.csv.gz"), recursive=True))
     infos, unparseable = [], []
 
-    for csv_path in tqdm(all_csvs, desc="Scanning data files", unit="file"):
+    for csv_path in progress(all_csvs, desc="Scanning data files", unit="file"):
         try:
             parsed = parse_filename(csv_path)
         except ValueError:
@@ -309,7 +309,7 @@ def main() -> int:
     conn = db.connect(db_path)
     n_cities = n_runs = n_regen = n_skipped = 0
 
-    for city_id, baseline, aliases, _dup_files, _ in tqdm(
+    for city_id, baseline, aliases, _dup_files, _ in progress(
         plan_rows, desc="Registering", unit="city"
     ):
         already = conn.execute(

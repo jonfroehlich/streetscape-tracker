@@ -14,7 +14,8 @@ from datetime import datetime
 
 import geopy.distance
 import numpy as np
-from tqdm import tqdm
+
+from .progress import progress
 
 
 class DownloadError(Exception):
@@ -255,7 +256,7 @@ def _grid_rows(
     i_values, j_values = grid_index_ranges(width_steps, height_steps)
     total_points = (width_steps + 1) * (height_steps + 1)
 
-    with tqdm(total=total_points, desc="Generating search grid points") as pbar:
+    with progress(total=total_points, desc="Generating search grid points") as pbar:
         for i in i_values:
             north_point = geopy.distance.distance(meters=i * step_length).destination(origin, 0)
             row_lats: list[float] = []
