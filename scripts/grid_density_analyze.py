@@ -48,6 +48,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import geopy  # noqa: E402
+from experiment_style import (  # noqa: E402
+    CATEGORICAL,
+    INK,
+    INK_2,
+    SURFACE,
+    agg_pyplot,
+    style_axis,
+)
 from grid_density_common import (  # noqa: E402
     CLIP_DIST_M_DEFAULT,
     DEFAULT_OUT_DIR,
@@ -540,31 +548,19 @@ def analyze_area(args, conn, area_key: str) -> dict:
 
 # ── Figures + report ────────────────────────────────────────────────────────
 
-# dataviz reference palette: fixed categorical order (blue, orange, aqua) for
-# the three areas; text/grid stay in neutral ink.
-AREA_COLORS = {"adrian": "#2a78d6", "corvallis": "#eb6834", "seattle": "#1baf7a"}
-INK = "#0b0b0b"
-INK_2 = "#52514e"
-GRID = "#e5e4e1"
-SURFACE = "#fcfcfb"
+# Fixed categorical order (blue, orange, aqua) for the three areas. The palette
+# and the axis treatment are shared with the other experiment writeups; see
+# scripts/experiment_style.py.
+AREA_COLORS = dict(zip(("adrian", "corvallis", "seattle"), CATEGORICAL, strict=True))
 
 
 def _style_axis(ax):
-    ax.set_facecolor(SURFACE)
-    for side in ("top", "right"):
-        ax.spines[side].set_visible(False)
-    for side in ("left", "bottom"):
-        ax.spines[side].set_color(GRID)
-    ax.tick_params(colors=INK_2, labelsize=9)
-    ax.yaxis.grid(True, color=GRID, linewidth=0.8)
-    ax.set_axisbelow(True)
+    # y-grid on: the bar and ECDF panels here are read against horizontal rules.
+    style_axis(ax, ygrid=True)
 
 
 def make_figures(results: list[dict], fig_dir: str, prefix: str = "") -> list[str]:
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    plt = agg_pyplot()
 
     os.makedirs(fig_dir, exist_ok=True)
     written = []
@@ -842,10 +838,7 @@ def make_distribution_figures(areas: dict, fig_dir: str, prefix: str) -> list[st
     much lands beyond Google's documented radius?), so it gets an ECDF where a
     reference line and the share past it can be read directly.
     """
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    plt = agg_pyplot()
 
     # Plot every area the record contains, or refuse. Filtering through
     # AREA_COLORS alone was silent in the direction that matters: adding a fourth
