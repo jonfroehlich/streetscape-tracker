@@ -1,11 +1,14 @@
 """Scheduler logic tests — pure logic only, no network or subprocesses."""
 
+import contextlib
 import dataclasses
 import gzip
+import io
 import json
 import os
 import re
 import signal
+import subprocess
 import time
 from datetime import date, timedelta
 from pathlib import Path
@@ -2284,7 +2287,9 @@ def _stub_tail(monkeypatch, sched, conn, published):
     monkeypatch.setattr(
         sched, "generate_streetwalk_manifest", lambda c, d: published.append("manifest") or {}
     )
-    monkeypatch.setattr(sched, "_publish", lambda cfg, summary: published.append("publish") or 0)
+    monkeypatch.setattr(
+        sched, "_publish", lambda cfg, summary, **kw: published.append("publish") or 0
+    )
 
 
 def test_batch_deadline_stops_the_loop_but_still_publishes(conn, monkeypatch):
@@ -2533,9 +2538,19 @@ def _ingest_result(**overrides):
     return IngestResult(**base)
 
 
-def test_driving_plan_failure_never_fails_the_night(conn, monkeypatch):
-    """The feed is an undocumented asset with no uptime contract; it breaking
-    must not cost a night of collection (the issue #167 posture)."""
+def test_driving_plan_failure_never_stops_the_night_but_does_report_it(conn, monkeypatch):
+    """The feed is an undocumented asset with no uptime contract, so it breaking
+    must not cost a night of collection (the issue #167 posture) — the loop runs,
+    the indexes rebuild, the publish happens.
+
+    It IS reported, though, and that is the half this test used to have
+    backwards. Google overwrites the feed in place, so a night we fail to
+    snapshot is a revision that no later run can recover — strictly worse than
+    the plan *summary* rebuild beside it, which is regenerable from the catalog
+    whenever we like and which already alerted and exited nonzero. Leaving the
+    fetch silent and green meant a week of blocked fetches was a week of clean
+    nights and seven snapshots gone for good.
+    """
     from streetscape_metadata_tracker import scheduler as sched
 
     _register(conn, "Alpha", width=1000, height=1000, step=20)
@@ -2557,11 +2572,22 @@ def test_driving_plan_failure_never_fails_the_night(conn, monkeypatch):
     )
     _stub_tail(monkeypatch, sched, conn, published)
 
+    alerts = []
+    monkeypatch.setattr(sched, "send_alert", lambda cfg, subj, body: alerts.append((subj, body)))
+    monkeypatch.setattr(sched, "_recent_log_tail", lambda cfg, n=40: "")
+
     rc = sched.cmd_run_due(_publishing_cfg(), today=date(2026, 7, 2))
 
     assert len(ran) == 1, "the city loop must still run"
-    assert published == ["aggregate", "manifest", "publish"]
-    assert rc == 0, "a plan-fetch failure alone is not an unhealthy night"
+    assert published == ["aggregate", "manifest", "publish"], (
+        "a missed snapshot must never withhold what the night collected"
+    )
+    assert rc == 1, "a permanently unrecoverable miss is an unhealthy night"
+    assert len(alerts) == 1
+    assert "DRIVING-PLAN FETCH FAILED" in alerts[0][0], (
+        "the subject is often all that gets read; it has to name this"
+    )
+    assert "feed gone" in alerts[0][1], "the alert must carry the cause"
 
 
 def test_a_failing_plan_summary_does_not_take_down_the_rest_of_the_tail(conn, monkeypatch):
@@ -3716,3 +3742,267 @@ def test_a_mapillary_block_skips_both_mapillary_channels(conn, monkeypatch):
     assert ran.count("mapillary_streets") == 0, "same CDN, same block"
     assert ran.count("gsv") == 2
     assert ran.count("gsv_streets") == 2
+
+
+# ── the tail reports every condition, and the publish is not a crash surface ──
+
+
+def _ok_backup(monkeypatch, sched):
+    monkeypatch.setattr(
+        sched.catalog_backup,
+        "write_backup",
+        lambda conn, backup_dir, when, **kw: sched.catalog_backup.BackupResult(
+            ok=True, path=os.path.join(backup_dir, "stubbed.backup")
+        ),
+    )
+
+
+def test_a_failed_index_and_a_failed_publish_arrive_in_ONE_complete_alert(conn, monkeypatch):
+    """
+    These two fail together far more often than separately — a vanished,
+    unwritable or full data_dir breaks generate_aggregate_v2 AND makes
+    sync_data_to_server.sh exit 1 — and the publish used to `return 1` above
+    the alert block. So the operator got a bare "publish script FAILED" and
+    never learned which index broke, or that the catalog backup went with it.
+
+    _stub_tail hid this: it always returned 0 from _publish, so no existing test
+    ever had both true at once.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    _register(conn, "Alpha", width=1000, height=1000, step=20)
+    db.assign_schedule(conn, 90)
+    conn.execute("UPDATE schedule_state SET last_success_at = NULL")
+    conn.commit()
+
+    _ok_backup(monkeypatch, sched)
+    ran, published = [], []
+    monkeypatch.setattr(
+        sched,
+        "_run_one_city",
+        lambda cfg, city, today, provider="gsv", **kw: ran.append(city.city_id) or True,
+    )
+    _stub_tail(monkeypatch, sched, conn, published)
+
+    def boom(c, data_dir):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(sched, "generate_aggregate_v2", boom)
+    monkeypatch.setattr(
+        sched, "_publish", lambda cfg, summary, **kw: published.append("publish") or 1
+    )
+
+    alerts = []
+    monkeypatch.setattr(sched, "send_alert", lambda cfg, subj, body: alerts.append((subj, body)))
+    monkeypatch.setattr(sched, "_recent_log_tail", lambda cfg, n=40: "")
+
+    rc = sched.cmd_run_due(_publishing_cfg(), today=date(2026, 7, 2))
+
+    assert "publish" in published, "the publish must still be ATTEMPTED (#167)"
+    assert rc == 1
+    assert len(alerts) == 1, "one email, not a partial one plus an early return"
+    subject, body = alerts[0]
+    assert "PUBLISH FAILED" in subject
+    assert "1 published index(es) FAILED" in subject, (
+        "the subject must name the index too — it is what the operator acts on"
+    )
+    assert "aggregate index failed" in body
+    assert "No space left on device" in body, "the shared root cause must reach the body"
+
+
+def test_the_publish_child_never_inherits_a_dead_pipe(monkeypatch, tmp_path):
+    """
+    THE fix for 2026-08-17. Python ignores SIGPIPE only for itself; subprocess
+    restores SIG_DFL in children. With stdio inherited, a `run-due ... |
+    tail -40` whose reader has gone away means sync_data_to_server.sh (set -euo
+    pipefail) takes SIGPIPE on its first echo — before any rsync — and the night
+    publishes nothing. Every other guard in this file would have run, and the
+    public site would still be stale.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen.update(kwargs)
+        seen["cmd"] = cmd
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(sched.subprocess, "run", fake_run)
+    cfg = _publishing_cfg(log_dir=str(tmp_path))
+
+    assert sched._publish(cfg, "ctx") == 0
+    assert seen["stdout"] is not None, "stdout must be redirected, never inherited"
+    assert seen["stderr"] == subprocess.STDOUT
+    assert seen["stdout"].name.startswith(str(tmp_path)), "…and it must go to a log file"
+    assert len(list(tmp_path.glob("publish_*.log"))) == 1
+
+
+def test_a_failed_publish_alert_carries_the_scripts_own_output(monkeypatch, tmp_path):
+    """The publish log is the only place the rsync error text exists; an alert
+    that omits it sends the operator back to the machine to find out why."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    def fake_run(cmd, **kwargs):
+        kwargs["stdout"].write("rsync: connection unexpectedly closed\n")
+        kwargs["stdout"].flush()
+        return subprocess.CompletedProcess(cmd, 12)
+
+    monkeypatch.setattr(sched.subprocess, "run", fake_run)
+    alerts = []
+    monkeypatch.setattr(sched, "send_alert", lambda cfg, subj, body: alerts.append((subj, body)))
+    monkeypatch.setattr(sched, "_recent_log_tail", lambda cfg, n=40: "")
+
+    rc = sched._publish(_publishing_cfg(log_dir=str(tmp_path)), "ctx")
+
+    assert rc == 12
+    assert len(alerts) == 1
+    assert "rsync: connection unexpectedly closed" in alerts[0][1]
+
+    alerts.clear()
+    sched._publish(_publishing_cfg(log_dir=str(tmp_path)), "ctx", alert_on_failure=False)
+    assert alerts == [], "the batch tail reports the failure itself, in one combined email"
+
+
+def test_a_loop_crash_still_names_itself_when_an_index_also_failed(conn, monkeypatch):
+    """`errored` had no subject part, so a night that BOTH crashed in the city
+    loop and failed an index reported only the index — and the crash, the more
+    serious of the two, appeared nowhere in the line that actually gets read."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    alerts = []
+    monkeypatch.setattr(sched, "send_alert", lambda cfg, subj, body: alerts.append((subj, body)))
+    monkeypatch.setattr(sched, "_recent_log_tail", lambda cfg, n=40: "")
+    _ok_backup(monkeypatch, sched)
+    monkeypatch.setattr(sched, "generate_streetwalk_manifest", lambda c, d: {})
+    monkeypatch.setattr(sched, "generate_driving_plan_summary", lambda c, d: {})
+
+    def boom(c, data_dir):
+        raise RuntimeError("index broke")
+
+    monkeypatch.setattr(sched, "generate_aggregate_v2", boom)
+
+    rc = sched._finish_batch(
+        _publishing_cfg(publish_enabled=False),
+        conn,
+        "summary line",
+        succeeded=1,
+        attempted=1,
+        today=date(2026, 7, 2),
+        errored=True,
+    )
+
+    assert rc == 1
+    subject = alerts[0][0]
+    assert "LOOP CRASHED" in subject
+    assert "1 published index(es) FAILED" in subject
+    assert "0 failed collection(s)" not in subject, "no zero-noise when a real condition exists"
+
+
+def test_an_errored_night_alone_reads_cleanly(conn, monkeypatch):
+    """The flip side: with nothing else wrong, the subject should be the crash,
+    not the crash plus a meaningless '0 failed collection(s)'."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    alerts = []
+    monkeypatch.setattr(sched, "send_alert", lambda cfg, subj, body: alerts.append((subj, body)))
+    monkeypatch.setattr(sched, "_recent_log_tail", lambda cfg, n=40: "")
+    _ok_backup(monkeypatch, sched)
+    monkeypatch.setattr(sched, "generate_aggregate_v2", lambda c, d: {"cities_count": 0})
+    monkeypatch.setattr(sched, "generate_streetwalk_manifest", lambda c, d: {"walks": []})
+    monkeypatch.setattr(sched, "generate_driving_plan_summary", lambda c, d: {"records": []})
+
+    rc = sched._finish_batch(
+        _publishing_cfg(publish_enabled=False),
+        conn,
+        "summary line",
+        succeeded=1,
+        attempted=1,
+        today=date(2026, 7, 2),
+        errored=True,
+    )
+
+    assert rc == 1
+    assert alerts[0][0].startswith("LOOP CRASHED on ")
+
+
+def test_regenerate_still_publishes_when_an_index_fails(conn, monkeypatch, capsys):
+    """
+    cmd_regenerate is what _tail_artifact's docstring prescribes as the recovery
+    from a stale index, so it has to survive the conditions that make one stale.
+    It used to call all three builders unguarded and then print BEFORE
+    publishing — so a dead stdout, or one broken index, aborted the recovery
+    before it recovered anything.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+
+    def boom(c, data_dir):
+        raise BrokenPipeError(32, "Broken pipe")
+
+    monkeypatch.setattr(sched, "generate_aggregate_v2", boom)
+    monkeypatch.setattr(sched, "generate_streetwalk_manifest", lambda c, d: {"walks": [1, 2]})
+    monkeypatch.setattr(sched, "generate_driving_plan_summary", lambda c, d: {"records": [1]})
+
+    published = []
+    monkeypatch.setattr(sched, "_publish", lambda cfg, ctx, **kw: published.append("publish") or 0)
+
+    rc = sched.cmd_regenerate(_publishing_cfg(), publish=True)
+
+    assert published == ["publish"], (
+        "the two healthy indexes and the previous good aggregate must still ship"
+    )
+    assert rc == 1, "but the failure is reported, not swallowed"
+    out = capsys.readouterr().out
+    assert "cities.json.gz NOT regenerated" in out, (
+        "the operator must see WHICH index did not rebuild"
+    )
+    assert "2 walks" in out, "…and the ones that did must still report their counts"
+
+
+def test_emit_survives_a_reader_that_went_away():
+    """cmd_regenerate's prints sit in front of its publish; a dead pipe there
+    must not abort the recovery."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    class DeadStdout:
+        def write(self, *a, **kw):
+            raise BrokenPipeError(32, "Broken pipe")
+
+        def flush(self):
+            raise BrokenPipeError(32, "Broken pipe")
+
+    with contextlib.redirect_stdout(DeadStdout()):
+        sched._emit("this must not raise")
+
+
+def test_exit_reports_the_status_we_computed_even_with_a_broken_stdout(monkeypatch):
+    """
+    CPython replaces the exit status with 120 when finalization's flush of
+    sys.stdout fails — and setup_logging's StreamHandler(sys.stdout) guarantees
+    there is buffered data to fail on. That silently clobbered the whole exit
+    vocabulary (0/1, 64, 75/76, 79/80): a healthy piped night reported failure
+    to systemd, and a wrapper could not read 64 as "bad argument" any more.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    class DeadStream:
+        def flush(self):
+            raise BrokenPipeError(32, "Broken pipe")
+
+        def fileno(self):
+            raise io.UnsupportedOperation("no fd here")
+
+    monkeypatch.setattr(sched.sys, "stdout", DeadStream())
+    monkeypatch.setattr(sched.sys, "stderr", DeadStream())
+
+    with pytest.raises(SystemExit) as excinfo:
+        sched._exit(sched.USAGE_EXIT_CODE)
+    assert excinfo.value.code == sched.USAGE_EXIT_CODE, (
+        "a broken pipe must not rewrite the status this module chose"
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        sched._exit(0)
+    assert excinfo.value.code == 0

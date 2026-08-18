@@ -13,10 +13,10 @@ import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
-from tqdm import tqdm
 
 from .analysis import is_google_copyright, plausible_capture_mask
 from .geoutils import get_best_folium_zoom_level, get_bounding_box, get_bounding_box_size
+from .progress import progress
 
 logger = logging.getLogger(__name__)
 
@@ -366,11 +366,11 @@ def create_visualization_map(df: pd.DataFrame, city_name: str, provider: str = "
     # Add markers
     marker_data = []
     markers_fg = folium.FeatureGroup(name="Pano Markers")  # Create feature group for markers
-    for idx, row in tqdm(
+    for idx, row in progress(
         valid_rows.iterrows(),
         total=len(valid_rows),
         desc=f"Creating {label} point map markers",
-        disable=None,
+        unit="marker",
     ):
         capture_date = row["capture_date"]
         date_str = capture_date.strftime("%Y-%m")

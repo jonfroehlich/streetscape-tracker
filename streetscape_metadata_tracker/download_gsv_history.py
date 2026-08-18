@@ -55,9 +55,9 @@ import backoff
 import geopy
 import numpy as np
 import pandas as pd
-from tqdm import tqdm
 
 from .download_common import DownloadError, generate_grid_points, standardize_capture_date
+from .progress import progress
 
 logger = logging.getLogger(__name__)
 
@@ -326,11 +326,15 @@ async def harvest_gsv_history_async(
     breaker = _CircuitBreaker(limit=circuit_breaker_limit)
     semaphore = asyncio.Semaphore(connection_limit)
     timeout = aiohttp.ClientTimeout(total=request_timeout)
-    progress = tqdm(
+    progress_bar = progress(
         total=len(grid_points),
         initial=len(done),
         desc=f"Harvesting GSV history for {city_name}",
-        disable=None,
+        unit="point",
+        # A full-grid sweep against a deliberately gentle, jittered endpoint, so
+        # this is the slowest thing in the repo per request. Ticks are the only
+        # way to tell a live harvest from a wedged one in a redirected log.
+        logger=logger,
     )
 
     async def query_point(session, lat, lon, i, j):
@@ -368,7 +372,7 @@ async def harvest_gsv_history_async(
                 for i, j, lat, lon, found, err in results:
                     if err is not None:
                         continue  # failed point; stays out of `done` for the next pass
-                    progress.update(1)
+                    progress_bar.update(1)
                     done.add((i, j))
                     for p in found:
                         # First grid point to surface a pano wins its query coords;
@@ -386,7 +390,7 @@ async def harvest_gsv_history_async(
                 if breaker.tripped:
                     blocked = True
                     break
-    progress.close()
+    progress_bar.close()
 
     if blocked:
         raise HarvestBlockedError(
