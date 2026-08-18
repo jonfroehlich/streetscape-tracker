@@ -1,0 +1,1677 @@
+{
+  "_about": {
+    "experiment": "kartaview-feasibility",
+    "writeup": "docs/experiments/kartaview-feasibility.md",
+    "generated_by": "scripts/kartaview_probe.py --area all --all-radii --docs-dir docs/experiments",
+    "issue": 225,
+    "probed_at_utc": "2026-08-18T23:34:37.259783+00:00",
+    "authenticated": true,
+    "rate_limit_used_per_hour": 1000,
+    "note": "Feasibility probe for adding KartaView as a third provider. Radius-mode /1.0/list/nearby-photos/ only -- there is no metadata tile endpoint and the v2 spatial query returns apiCode 408. Percentages are over the SAMPLED page (<= ipp), not over total_filtered_items, so pct_sphere is an estimate of the local mix rather than a census. A target where every radius failed is recorded with max_working_radius_m = null and is NOT evidence of absent imagery."
+  },
+  "targets": [
+    {
+      "target": "yogyakarta",
+      "lat": -7.8033342,
+      "lng": 110.37552685,
+      "max_working_radius_m": 500,
+      "total_filtered_items": 5578,
+      "attempts": [
+        {
+          "radius_m": 1000,
+          "ok": false,
+          "error": "backpressure: apiCode 690 (' An unexpected server error has occurred') at radius 1000 m"
+        },
+        {
+          "radius_m": 500,
+          "ok": true,
+          "total_filtered_items": 5578,
+          "n_returned": 200
+        },
+        {
+          "radius_m": 400,
+          "ok": true,
+          "total_filtered_items": 3431,
+          "n_returned": 200
+        },
+        {
+          "radius_m": 300,
+          "ok": true,
+          "total_filtered_items": 1673,
+          "n_returned": 200
+        },
+        {
+          "radius_m": 200,
+          "ok": true,
+          "total_filtered_items": 576,
+          "n_returned": 200
+        },
+        {
+          "radius_m": 100,
+          "ok": true,
+          "total_filtered_items": 163,
+          "n_returned": 163
+        }
+      ],
+      "per_radius": [
+        {
+          "radius_m": 1000,
+          "ok": false,
+          "error": "backpressure: apiCode 690 (' An unexpected server error has occurred') at radius 1000 m"
+        },
+        {
+          "radius_m": 500,
+          "ok": true,
+          "total_filtered_items": 5578,
+          "n_sampled": 200,
+          "projection_counts": {
+            "SPHERE": 29,
+            "PLANE": 171
+          },
+          "pct_sphere": 14.5,
+          "shot_date_null": 0,
+          "pct_shot_date_null": 0.0,
+          "distinct_sequences": 33,
+          "distinct_usernames": 3,
+          "usernames_top": {
+            "puput-puspananda": 93,
+            "djalu": 78,
+            "OpenStreetView": 29
+          },
+          "capture_year_counts_shot_date": {
+            "2019": 5,
+            "2020": 171,
+            "2022": 11,
+            "2024": 13
+          },
+          "upload_year_counts_date_added": {
+            "2020": 171,
+            "2022": 3,
+            "2023": 11,
+            "2025": 15
+          }
+        },
+        {
+          "radius_m": 400,
+          "ok": true,
+          "total_filtered_items": 3431,
+          "n_sampled": 200,
+          "projection_counts": {
+            "SPHERE": 15,
+            "PLANE": 185
+          },
+          "pct_sphere": 7.5,
+          "shot_date_null": 0,
+          "pct_shot_date_null": 0.0,
+          "distinct_sequences": 20,
+          "distinct_usernames": 3,
+          "usernames_top": {
+            "puput-puspananda": 160,
+            "djalu": 25,
+            "OpenStreetView": 15
+          },
+          "capture_year_counts_shot_date": {
+            "2019": 3,
+            "2020": 185,
+            "2022": 6,
+            "2024": 6
+          },
+          "upload_year_counts_date_added": {
+            "2020": 185,
+            "2022": 2,
+            "2023": 7,
+            "2025": 6
+          }
+        },
+        {
+          "radius_m": 300,
+          "ok": true,
+          "total_filtered_items": 1673,
+          "n_sampled": 200,
+          "projection_counts": {
+            "SPHERE": 8,
+            "PLANE": 192
+          },
+          "pct_sphere": 4.0,
+          "shot_date_null": 0,
+          "pct_shot_date_null": 0.0,
+          "distinct_sequences": 10,
+          "distinct_usernames": 2,
+          "usernames_top": {
+            "puput-puspananda": 192,
+            "OpenStreetView": 8
+          },
+          "capture_year_counts_shot_date": {
+            "2019": 2,
+            "2020": 192,
+            "2022": 1,
+            "2024": 5
+          },
+          "upload_year_counts_date_added": {
+            "2020": 192,
+            "2022": 1,
+            "2023": 2,
+            "2025": 5
+          }
+        },
+        {
+          "radius_m": 200,
+          "ok": true,
+          "total_filtered_items": 576,
+          "n_sampled": 200,
+          "projection_counts": {
+            "SPHERE": 1,
+            "PLANE": 199
+          },
+          "pct_sphere": 0.5,
+          "shot_date_null": 0,
+          "pct_shot_date_null": 0.0,
+          "distinct_sequences": 8,
+          "distinct_usernames": 3,
+          "usernames_top": {
+            "puput-puspananda": 168,
+            "g-rudik-prasetyo": 31,
+            "OpenStreetView": 1
+          },
+          "capture_year_counts_shot_date": {
+            "2019": 1,
+            "2020": 199
+          },
+          "upload_year_counts_date_added": {
+            "2020": 199,
+            "2022": 1
+          }
+        },
+        {
+          "radius_m": 100,
+          "ok": true,
+          "total_filtered_items": 163,
+          "n_sampled": 163,
+          "projection_counts": {
+            "PLANE": 163
+          },
+          "pct_sphere": 0.0,
+          "shot_date_null": 0,
+          "pct_shot_date_null": 0.0,
+          "distinct_sequences": 12,
+          "distinct_usernames": 4,
+          "usernames_top": {
+            "puput-puspananda": 122,
+            "djalu": 20,
+            "dwi-heridani": 14,
+            "g-rudik-prasetyo": 7
+          },
+          "capture_year_counts_shot_date": {
+            "2020": 163
+          },
+          "upload_year_counts_date_added": {
+            "2020": 163
+          }
+        }
+      ],
+      "n_sampled": 200,
+      "projection_counts": {
+        "SPHERE": 29,
+        "PLANE": 171
+      },
+      "pct_sphere": 14.5,
+      "shot_date_null": 0,
+      "pct_shot_date_null": 0.0,
+      "distinct_sequences": 33,
+      "distinct_usernames": 3,
+      "usernames_top": {
+        "puput-puspananda": 93,
+        "djalu": 78,
+        "OpenStreetView": 29
+      },
+      "capture_year_counts_shot_date": {
+        "2019": 5,
+        "2020": 171,
+        "2022": 11,
+        "2024": 13
+      },
+      "upload_year_counts_date_added": {
+        "2020": 171,
+        "2022": 3,
+        "2023": 11,
+        "2025": 15
+      }
+    },
+    {
+      "target": "yogyakarta-malioboro",
+      "lat": -7.7956,
+      "lng": 110.3695,
+      "max_working_radius_m": 500,
+      "total_filtered_items": 3609,
+      "attempts": [
+        {
+          "radius_m": 1000,
+          "ok": false,
+          "error": "backpressure: apiCode 690 (' An unexpected server error has occurred') at radius 1000 m"
+        },
+        {
+          "radius_m": 500,
+          "ok": true,
+          "total_filtered_items": 3609,
+          "n_returned": 200
+        },
+        {
+          "radius_m": 400,
+          "ok": true,
+          "total_filtered_items": 2485,
+          "n_returned": 200
+        },
+        {
+          "radius_m": 300,
+          "ok": true,
+          "total_filtered_items": 1773,
+          "n_returned": 200
+        },
+        {
+          "radius_m": 200,
+          "ok": true,
+          "total_filtered_items": 1054,
+          "n_returned": 200
+        },
+        {
+          "radius_m": 100,
+          "ok": true,
+          "total_filtered_items": 274,
+          "n_returned": 200
+        }
+      ],
+      "per_radius": [
+        {
+          "radius_m": 1000,
+          "ok": false,
+          "error": "backpressure: apiCode 690 (' An unexpected server error has occurred') at radius 1000 m"
+        },
+        {
+          "radius_m": 500,
+          "ok": true,
+          "total_filtered_items": 3609,
+          "n_sampled": 200,
+          "projection_counts": {
+            "SPHERE": 200
+          },
+          "pct_sphere": 100.0,
+          "shot_date_null": 200,
+          "pct_shot_date_null": 100.0,
+          "distinct_sequences": 1,
+          "distinct_usernames": 1,
+          "usernames_top": {
+            "OpenStreetView": 200
+          },
+          "capture_year_counts_shot_date": {},
+          "upload_year_counts_date_added": {
+            "2025": 200
+          }
+        },
+        {
+          "radius_m": 400,
+          "ok": true,
+          "total_filtered_items": 2485,
+          "n_sampled": 200,
+          "projection_counts": {
+            "SPHERE": 200
+          },
+          "pct_sphere": 100.0,
+          "shot_date_null": 200,
+          "pct_shot_date_null": 100.0,
+          "distinct_sequences": 2,
+          "distinct_usernames": 1,
+          "usernames_top": {
+            "OpenStreetView": 200
+          },
+          "capture_year_counts_shot_date": {},
+          "upload_year_counts_date_added": {
+            "2025": 200
+          }
+        },
+        {
+          "radius_m": 300,
+          "ok": true,
+          "total_filtered_items": 1773,
+          "n_sampled": 200,
+          "projection_counts": {
+            "SPHERE": 200
+          },
+          "pct_sphere": 100.0,
+          "shot_date_null": 200,
+          "pct_shot_date_null": 100.0,
+          "distinct_sequences": 2,
+          "distinct_usernames": 1,
+          "usernames_top": {
+            "OpenStreetView": 200
+          },
+          "capture_year_counts_shot_date": {},
+          "upload_year_counts_date_added": {
+            "2025": 200
+          }
+        },
+        {
+          "radius_m": 200,
+          "ok": true,
+          "total_filtered_items": 1054,
+          "n_sampled": 200,
+          "projection_counts": {
+            "SPHERE": 127,
+            "PLANE": 73
+          },
+          "pct_sphere": 63.5,
+          "shot_date_null": 126,
+          "pct_shot_date_null": 63.0,
+          "distinct_sequences": 5,
+          "distinct_usernames": 2,
+          "usernames_top": {
+            "OpenStreetView": 127,
+            "puput-puspananda": 73
+          },
+          "capture_year_counts_shot_date": {
+            "2019": 1,
+            "2020": 73
+          },
+          "upload_year_counts_date_added": {
+            "2020": 73,
+            "2022": 1,
+            "2025": 126
+          }
+        },
+        {
+          "radius_m": 100,
+          "ok": true,
+          "total_filtered_items": 274,
+          "n_sampled": 200,
+          "projection_counts": {
+            "SPHERE": 38,
+            "PLANE": 162
+          },
+          "pct_sphere": 19.0,
+          "shot_date_null": 38,
+          "pct_shot_date_null": 19.0,
+          "distinct_sequences": 14,
+          "distinct_usernames": 5,
+          "usernames_top": {
+            "puput-puspananda": 84,
+            "dwi-heridani": 43,
+            "OpenStreetView": 38,
+            "eka-yus": 23,
+            "vina-tandjung": 12
+          },
+          "capture_year_counts_shot_date": {
+            "2020": 162
+          },
+          "upload_year_counts_date_added": {
+            "2020": 162,
+            "2025": 38
+          }
+        }
+      ],
+      "n_sampled": 200,
+      "projection_counts": {
+        "SPHERE": 200
+      },
+      "pct_sphere": 100.0,
+      "shot_date_null": 200,
+      "pct_shot_date_null": 100.0,
+      "distinct_sequences": 1,
+      "distinct_usernames": 1,
+      "usernames_top": {
+        "OpenStreetView": 200
+      },
+      "capture_year_counts_shot_date": {},
+      "upload_year_counts_date_added": {
+        "2025": 200
+      }
+    },
+    {
+      "target": "krabi",
+      "lat": 8.0634637,
+      "lng": 98.9162345,
+      "max_working_radius_m": 1000,
+      "total_filtered_items": 4380,
+      "attempts": [
+        {
+          "radius_m": 1000,
+          "ok": true,
+          "total_filtered_items": 4380,
+          "n_returned": 200
+        },
+        {
+          "radius_m": 500,
+          "ok": true,
+          "total_filtered_items": 1476,
+          "n_returned": 200
+        },
+        {
+          "radius_m": 400,
+          "ok": true,
+          "total_filtered_items": 1112,
+          "n_returned": 200
+        },
+        {
+          "radius_m": 300,
+          "ok": true,
+          "total_filtered_items": 737,
+          "n_returned": 200
+        },
+        {
+          "radius_m": 200,
+          "ok": true,
+          "total_filtered_items": 403,
+          "n_returned": 200
+        },
+        {
+          "radius_m": 100,
+          "ok": true,
+          "total_filtered_items": 125,
+          "n_returned": 125
+        }
+      ],
+      "per_radius": [
+        {
+          "radius_m": 1000,
+          "ok": true,
+          "total_filtered_items": 4380,
+          "n_sampled": 200,
+          "projection_counts": {
+            "SPHERE": 200
+          },
+          "pct_sphere": 100.0,
+          "shot_date_null": 200,
+          "pct_shot_date_null": 100.0,
+          "distinct_sequences": 3,
+          "distinct_usernames": 1,
+          "usernames_top": {
+            "OpenStreetView": 200
+          },
+          "capture_year_counts_shot_date": {},
+          "upload_year_counts_date_added": {
+            "2025": 200
+          }
+        },
+        {
+          "radius_m": 500,
+          "ok": true,
+          "total_filtered_items": 1476,
+          "n_sampled": 200,
+          "projection_counts": {
+            "SPHERE": 200
+          },
+          "pct_sphere": 100.0,
+          "shot_date_null": 200,
+          "pct_shot_date_null": 100.0,
+          "distinct_sequences": 5,
+          "distinct_usernames": 1,
+          "usernames_top": {
+            "OpenStreetView": 200
+          },
+          "capture_year_counts_shot_date": {},
+          "upload_year_counts_date_added": {
+            "2025": 200
+          }
+        },
+        {
+          "radius_m": 400,
+          "ok": true,
+          "total_filtered_items": 1112,
+          "n_sampled": 200,
+          "projection_counts": {
+            "SPHERE": 200
+          },
+          "pct_sphere": 100.0,
+          "shot_date_null": 200,
+          "pct_shot_date_null": 100.0,
+          "distinct_sequences": 6,
+          "distinct_usernames": 1,
+          "usernames_top": {
+            "OpenStreetView": 200
+          },
+          "capture_year_counts_shot_date": {},
+          "upload_year_counts_date_added": {
+            "2025": 200
+          }
+        },
+        {
+          "radius_m": 300,
+          "ok": true,
+          "total_filtered_items": 737,
+          "n_sampled": 200,
+          "projection_counts": {
+            "SPHERE": 200
+          },
+          "pct_sphere": 100.0,
+          "shot_date_null": 200,
+          "pct_shot_date_null": 100.0,
+          "distinct_sequences": 7,
+          "distinct_usernames": 1,
+          "usernames_top": {
+            "OpenStreetView": 200
+          },
+          "capture_year_counts_shot_date": {},
+          "upload_year_counts_date_added": {
+            "2025": 200
+          }
+        },
+        {
+          "radius_m": 200,
+          "ok": true,
+          "total_filtered_items": 403,
+          "n_sampled": 200,
+          "projection_counts": {
+            "SPHERE": 200
+          },
+          "pct_sphere": 100.0,
+          "shot_date_null": 180,
+          "pct_shot_date_null": 90.0,
+          "distinct_sequences": 5,
+          "distinct_usernames": 1,
+          "usernames_top": {
+            "OpenStreetView": 200
+          },
+          "capture_year_counts_shot_date": {
+            "2023": 20
+          },
+          "upload_year_counts_date_added": {
+            "2023": 20,
+            "2025": 180
+          }
+        },
+        {
+          "radius_m": 100,
+          "ok": true,
+          "total_filtered_items": 125,
+          "n_sampled": 125,
+          "projection_counts": {
+            "SPHERE": 125
+          },
+          "pct_sphere": 100.0,
+          "shot_date_null": 39,
+          "pct_shot_date_null": 31.2,
+          "distinct_sequences": 3,
+          "distinct_usernames": 1,
+          "usernames_top": {
+            "OpenStreetView": 125
+          },
+          "capture_year_counts_shot_date": {
+            "2023": 86
+          },
+          "upload_year_counts_date_added": {
+            "2023": 86,
+            "2025": 39
+          }
+        }
+      ],
+      "n_sampled": 200,
+      "projection_counts": {
+        "SPHERE": 200
+      },
+      "pct_sphere": 100.0,
+      "shot_date_null": 200,
+      "pct_shot_date_null": 100.0,
+      "distinct_sequences": 3,
+      "distinct_usernames": 1,
+      "usernames_top": {
+        "OpenStreetView": 200
+      },
+      "capture_year_counts_shot_date": {},
+      "upload_year_counts_date_added": {
+        "2025": 200
+      }
+    },
+    {
+      "target": "seattle",
+      "lat": 47.6097,
+      "lng": -122.3331,
+      "max_working_radius_m": 500,
+      "total_filtered_items": 2030,
+      "attempts": [
+        {
+          "radius_m": 1000,
+          "ok": false,
+          "error": "backpressure: apiCode 690 (' An unexpected server error has occurred') at radius 1000 m"
+        },
+        {
+          "radius_m": 500,
+          "ok": true,
+          "total_filtered_items": 2030,
+          "n_returned": 200
+        },
+        {
+          "radius_m": 400,
+          "ok": true,
+          "total_filtered_items": 1534,
+          "n_returned": 200
+        },
+        {
+          "radius_m": 300,
+          "ok": true,
+          "total_filtered_items": 1077,
+          "n_returned": 200
+        },
+        {
+          "radius_m": 200,
+          "ok": true,
+          "total_filtered_items": 630,
+          "n_returned": 200
+        },
+        {
+          "radius_m": 100,
+          "ok": true,
+          "total_filtered_items": 88,
+          "n_returned": 88
+        }
+      ],
+      "per_radius": [
+        {
+          "radius_m": 1000,
+          "ok": false,
+          "error": "backpressure: apiCode 690 (' An unexpected server error has occurred') at radius 1000 m"
+        },
+        {
+          "radius_m": 500,
+          "ok": true,
+          "total_filtered_items": 2030,
+          "n_sampled": 200,
+          "projection_counts": {
+            "SPHERE": 200
+          },
+          "pct_sphere": 100.0,
+          "shot_date_null": 0,
+          "pct_shot_date_null": 0.0,
+          "distinct_sequences": 1,
+          "distinct_usernames": 1,
+          "usernames_top": {
+            "lowestpotential": 200
+          },
+          "capture_year_counts_shot_date": {
+            "2025": 200
+          },
+          "upload_year_counts_date_added": {
+            "2025": 200
+          }
+        },
+        {
+          "radius_m": 400,
+          "ok": true,
+          "total_filtered_items": 1534,
+          "n_sampled": 200,
+          "projection_counts": {
+            "SPHERE": 181,
+            "PLANE": 19
+          },
+          "pct_sphere": 90.5,
+          "shot_date_null": 0,
+          "pct_shot_date_null": 0.0,
+          "distinct_sequences": 2,
+          "distinct_usernames": 2,
+          "usernames_top": {
+            "lowestpotential": 181,
+            "Nick_T": 19
+          },
+          "capture_year_counts_shot_date": {
+            "2024": 19,
+            "2025": 181
+          },
+          "upload_year_counts_date_added": {
+            "2024": 19,
+            "2025": 181
+          }
+        },
+        {
+          "radius_m": 300,
+          "ok": true,
+          "total_filtered_items": 1077,
+          "n_sampled": 200,
+          "projection_counts": {
+            "SPHERE": 108,
+            "PLANE": 92
+          },
+          "pct_sphere": 54.0,
+          "shot_date_null": 53,
+          "pct_shot_date_null": 26.5,
+          "distinct_sequences": 6,
+          "distinct_usernames": 4,
+          "usernames_top": {
+            "lowestpotential": 108,
+            "Glassman": 53,
+            "Nick_T": 23,
+            "pnorman": 16
+          },
+          "capture_year_counts_shot_date": {
+            "2019": 16,
+            "2024": 23,
+            "2025": 108
+          },
+          "upload_year_counts_date_added": {
+            "2019": 69,
+            "2024": 23,
+            "2025": 108
+          }
+        },
+        {
+          "radius_m": 200,
+          "ok": true,
+          "total_filtered_items": 630,
+          "n_sampled": 200,
+          "projection_counts": {
+            "SPHERE": 41,
+            "PLANE": 159
+          },
+          "pct_sphere": 20.5,
+          "shot_date_null": 21,
+          "pct_shot_date_null": 10.5,
+          "distinct_sequences": 10,
+          "distinct_usernames": 5,
+          "usernames_top": {
+            "pnorman": 82,
+            "SalD": 43,
+            "lowestpotential": 41,
+            "Glassman": 21,
+            "outofband": 13
+          },
+          "capture_year_counts_shot_date": {
+            "2017": 43,
+            "2018": 13,
+            "2019": 82,
+            "2025": 41
+          },
+          "upload_year_counts_date_added": {
+            "2017": 43,
+            "2018": 13,
+            "2019": 103,
+            "2025": 41
+          }
+        },
+        {
+          "radius_m": 100,
+          "ok": true,
+          "total_filtered_items": 88,
+          "n_sampled": 88,
+          "projection_counts": {
+            "SPHERE": 7,
+            "PLANE": 81
+          },
+          "pct_sphere": 7.95,
+          "shot_date_null": 0,
+          "pct_shot_date_null": 0.0,
+          "distinct_sequences": 12,
+          "distinct_usernames": 9,
+          "usernames_top": {
+            "kalissa-landa": 24,
+            "pnorman": 17,
+            "SalD": 11,
+            "ronnie-swirl": 10,
+            "Rhvspeed": 8
+          },
+          "capture_year_counts_shot_date": {
+            "2016": 1,
+            "2017": 62,
+            "2018": 1,
+            "2019": 17,
+            "2025": 7
+          },
+          "upload_year_counts_date_added": {
+            "2016": 1,
+            "2017": 62,
+            "2018": 1,
+            "2019": 17,
+            "2025": 7
+          }
+        }
+      ],
+      "n_sampled": 200,
+      "projection_counts": {
+        "SPHERE": 200
+      },
+      "pct_sphere": 100.0,
+      "shot_date_null": 0,
+      "pct_shot_date_null": 0.0,
+      "distinct_sequences": 1,
+      "distinct_usernames": 1,
+      "usernames_top": {
+        "lowestpotential": 200
+      },
+      "capture_year_counts_shot_date": {
+        "2025": 200
+      },
+      "upload_year_counts_date_added": {
+        "2025": 200
+      }
+    },
+    {
+      "target": "singapore",
+      "lat": 1.283,
+      "lng": 103.86,
+      "max_working_radius_m": 1000,
+      "total_filtered_items": 10903,
+      "attempts": [
+        {
+          "radius_m": 1000,
+          "ok": true,
+          "total_filtered_items": 10903,
+          "n_returned": 200
+        },
+        {
+          "radius_m": 500,
+          "ok": true,
+          "total_filtered_items": 3348,
+          "n_returned": 200
+        },
+        {
+          "radius_m": 400,
+          "ok": true,
+          "total_filtered_items": 2753,
+          "n_returned": 200
+        },
+        {
+          "radius_m": 300,
+          "ok": true,
+          "total_filtered_items": 2072,
+          "n_returned": 200
+        },
+        {
+          "radius_m": 200,
+          "ok": true,
+          "total_filtered_items": 1224,
+          "n_returned": 200
+        },
+        {
+          "radius_m": 100,
+          "ok": true,
+          "total_filtered_items": 336,
+          "n_returned": 200
+        }
+      ],
+      "per_radius": [
+        {
+          "radius_m": 1000,
+          "ok": true,
+          "total_filtered_items": 10903,
+          "n_sampled": 200,
+          "projection_counts": {
+            "SPHERE": 200
+          },
+          "pct_sphere": 100.0,
+          "shot_date_null": 0,
+          "pct_shot_date_null": 0.0,
+          "distinct_sequences": 1,
+          "distinct_usernames": 1,
+          "usernames_top": {
+            "OpenStreetView": 200
+          },
+          "capture_year_counts_shot_date": {
+            "2023": 200
+          },
+          "upload_year_counts_date_added": {
+            "2023": 200
+          }
+        },
+        {
+          "radius_m": 500,
+          "ok": true,
+          "total_filtered_items": 3348,
+          "n_sampled": 200,
+          "projection_counts": {
+            "SPHERE": 200
+          },
+          "pct_sphere": 100.0,
+          "shot_date_null": 0,
+          "pct_shot_date_null": 0.0,
+          "distinct_sequences": 2,
+          "distinct_usernames": 1,
+          "usernames_top": {
+            "OpenStreetView": 200
+          },
+          "capture_year_counts_shot_date": {
+            "2023": 200
+          },
+          "upload_year_counts_date_added": {
+            "2023": 200
+          }
+        },
+        {
+          "radius_m": 400,
+          "ok": true,
+          "total_filtered_items": 2753,
+          "n_sampled": 200,
+          "projection_counts": {
+            "SPHERE": 200
+          },
+          "pct_sphere": 100.0,
+          "shot_date_null": 0,
+          "pct_shot_date_null": 0.0,
+          "distinct_sequences": 2,
+          "distinct_usernames": 1,
+          "usernames_top": {
+            "OpenStreetView": 200
+          },
+          "capture_year_counts_shot_date": {
+            "2023": 200
+          },
+          "upload_year_counts_date_added": {
+            "2023": 200
+          }
+        },
+        {
+          "radius_m": 300,
+          "ok": true,
+          "total_filtered_items": 2072,
+          "n_sampled": 200,
+          "projection_counts": {
+            "SPHERE": 200
+          },
+          "pct_sphere": 100.0,
+          "shot_date_null": 0,
+          "pct_shot_date_null": 0.0,
+          "distinct_sequences": 3,
+          "distinct_usernames": 1,
+          "usernames_top": {
+            "OpenStreetView": 200
+          },
+          "capture_year_counts_shot_date": {
+            "2023": 200
+          },
+          "upload_year_counts_date_added": {
+            "2023": 200
+          }
+        },
+        {
+          "radius_m": 200,
+          "ok": true,
+          "total_filtered_items": 1224,
+          "n_sampled": 200,
+          "projection_counts": {
+            "SPHERE": 200
+          },
+          "pct_sphere": 100.0,
+          "shot_date_null": 0,
+          "pct_shot_date_null": 0.0,
+          "distinct_sequences": 3,
+          "distinct_usernames": 1,
+          "usernames_top": {
+            "OpenStreetView": 200
+          },
+          "capture_year_counts_shot_date": {
+            "2023": 200
+          },
+          "upload_year_counts_date_added": {
+            "2023": 200
+          }
+        },
+        {
+          "radius_m": 100,
+          "ok": true,
+          "total_filtered_items": 336,
+          "n_sampled": 200,
+          "projection_counts": {
+            "SPHERE": 174,
+            "PLANE": 26
+          },
+          "pct_sphere": 87.0,
+          "shot_date_null": 0,
+          "pct_shot_date_null": 0.0,
+          "distinct_sequences": 3,
+          "distinct_usernames": 2,
+          "usernames_top": {
+            "OpenStreetView": 174,
+            "grabsg": 26
+          },
+          "capture_year_counts_shot_date": {
+            "2019": 26,
+            "2023": 174
+          },
+          "upload_year_counts_date_added": {
+            "2019": 26,
+            "2023": 174
+          }
+        }
+      ],
+      "n_sampled": 200,
+      "projection_counts": {
+        "SPHERE": 200
+      },
+      "pct_sphere": 100.0,
+      "shot_date_null": 0,
+      "pct_shot_date_null": 0.0,
+      "distinct_sequences": 1,
+      "distinct_usernames": 1,
+      "usernames_top": {
+        "OpenStreetView": 200
+      },
+      "capture_year_counts_shot_date": {
+        "2023": 200
+      },
+      "upload_year_counts_date_added": {
+        "2023": 200
+      }
+    },
+    {
+      "target": "nyc",
+      "lat": 40.758,
+      "lng": -73.9855,
+      "max_working_radius_m": 1000,
+      "total_filtered_items": 17096,
+      "attempts": [
+        {
+          "radius_m": 1000,
+          "ok": true,
+          "total_filtered_items": 17096,
+          "n_returned": 200
+        },
+        {
+          "radius_m": 500,
+          "ok": true,
+          "total_filtered_items": 4048,
+          "n_returned": 200
+        },
+        {
+          "radius_m": 400,
+          "ok": true,
+          "total_filtered_items": 2595,
+          "n_returned": 200
+        },
+        {
+          "radius_m": 300,
+          "ok": true,
+          "total_filtered_items": 1374,
+          "n_returned": 200
+        },
+        {
+          "radius_m": 200,
+          "ok": true,
+          "total_filtered_items": 787,
+          "n_returned": 200
+        },
+        {
+          "radius_m": 100,
+          "ok": true,
+          "total_filtered_items": 326,
+          "n_returned": 200
+        }
+      ],
+      "per_radius": [
+        {
+          "radius_m": 1000,
+          "ok": true,
+          "total_filtered_items": 17096,
+          "n_sampled": 200,
+          "projection_counts": {
+            "SPHERE": 200
+          },
+          "pct_sphere": 100.0,
+          "shot_date_null": 0,
+          "pct_shot_date_null": 0.0,
+          "distinct_sequences": 13,
+          "distinct_usernames": 1,
+          "usernames_top": {
+            "OpenStreetView": 200
+          },
+          "capture_year_counts_shot_date": {
+            "2024": 188,
+            "2025": 12
+          },
+          "upload_year_counts_date_added": {
+            "2024": 188,
+            "2025": 1,
+            "2026": 11
+          }
+        },
+        {
+          "radius_m": 500,
+          "ok": true,
+          "total_filtered_items": 4048,
+          "n_sampled": 200,
+          "projection_counts": {
+            "SPHERE": 200
+          },
+          "pct_sphere": 100.0,
+          "shot_date_null": 0,
+          "pct_shot_date_null": 0.0,
+          "distinct_sequences": 1,
+          "distinct_usernames": 1,
+          "usernames_top": {
+            "OpenStreetView": 200
+          },
+          "capture_year_counts_shot_date": {
+            "2024": 200
+          },
+          "upload_year_counts_date_added": {
+            "2024": 200
+          }
+        },
+        {
+          "radius_m": 400,
+          "ok": true,
+          "total_filtered_items": 2595,
+          "n_sampled": 200,
+          "projection_counts": {
+            "SPHERE": 185,
+            "PLANE": 15
+          },
+          "pct_sphere": 92.5,
+          "shot_date_null": 0,
+          "pct_shot_date_null": 0.0,
+          "distinct_sequences": 3,
+          "distinct_usernames": 2,
+          "usernames_top": {
+            "OpenStreetView": 185,
+            "mdroads": 15
+          },
+          "capture_year_counts_shot_date": {
+            "2021": 15,
+            "2024": 185
+          },
+          "upload_year_counts_date_added": {
+            "2021": 15,
+            "2024": 185
+          }
+        },
+        {
+          "radius_m": 300,
+          "ok": true,
+          "total_filtered_items": 1374,
+          "n_sampled": 200,
+          "projection_counts": {
+            "SPHERE": 97,
+            "PLANE": 103
+          },
+          "pct_sphere": 48.5,
+          "shot_date_null": 0,
+          "pct_shot_date_null": 0.0,
+          "distinct_sequences": 7,
+          "distinct_usernames": 4,
+          "usernames_top": {
+            "OpenStreetView": 97,
+            "kriss-omana": 71,
+            "mdroads": 27,
+            "a-tze": 5
+          },
+          "capture_year_counts_shot_date": {
+            "2019": 71,
+            "2020": 5,
+            "2021": 27,
+            "2024": 97
+          },
+          "upload_year_counts_date_added": {
+            "2019": 71,
+            "2021": 32,
+            "2024": 97
+          }
+        },
+        {
+          "radius_m": 200,
+          "ok": true,
+          "total_filtered_items": 787,
+          "n_sampled": 200,
+          "projection_counts": {
+            "SPHERE": 61,
+            "PLANE": 139
+          },
+          "pct_sphere": 30.5,
+          "shot_date_null": 0,
+          "pct_shot_date_null": 0.0,
+          "distinct_sequences": 5,
+          "distinct_usernames": 2,
+          "usernames_top": {
+            "kriss-omana": 139,
+            "OpenStreetView": 61
+          },
+          "capture_year_counts_shot_date": {
+            "2019": 139,
+            "2024": 61
+          },
+          "upload_year_counts_date_added": {
+            "2019": 139,
+            "2024": 61
+          }
+        },
+        {
+          "radius_m": 100,
+          "ok": true,
+          "total_filtered_items": 326,
+          "n_sampled": 200,
+          "projection_counts": {
+            "SPHERE": 27,
+            "PLANE": 173
+          },
+          "pct_sphere": 13.5,
+          "shot_date_null": 0,
+          "pct_shot_date_null": 0.0,
+          "distinct_sequences": 6,
+          "distinct_usernames": 3,
+          "usernames_top": {
+            "kriss-omana": 137,
+            "nichan-iskandarian": 36,
+            "OpenStreetView": 27
+          },
+          "capture_year_counts_shot_date": {
+            "2018": 20,
+            "2019": 153,
+            "2024": 27
+          },
+          "upload_year_counts_date_added": {
+            "2018": 20,
+            "2019": 153,
+            "2024": 27
+          }
+        }
+      ],
+      "n_sampled": 200,
+      "projection_counts": {
+        "SPHERE": 200
+      },
+      "pct_sphere": 100.0,
+      "shot_date_null": 0,
+      "pct_shot_date_null": 0.0,
+      "distinct_sequences": 13,
+      "distinct_usernames": 1,
+      "usernames_top": {
+        "OpenStreetView": 200
+      },
+      "capture_year_counts_shot_date": {
+        "2024": 188,
+        "2025": 12
+      },
+      "upload_year_counts_date_added": {
+        "2024": 188,
+        "2025": 1,
+        "2026": 11
+      }
+    },
+    {
+      "target": "langkawi",
+      "lat": 6.32,
+      "lng": 99.85,
+      "max_working_radius_m": 1000,
+      "total_filtered_items": 11,
+      "attempts": [
+        {
+          "radius_m": 1000,
+          "ok": true,
+          "total_filtered_items": 11,
+          "n_returned": 11
+        },
+        {
+          "radius_m": 500,
+          "ok": true,
+          "total_filtered_items": 1,
+          "n_returned": 1
+        },
+        {
+          "radius_m": 400,
+          "ok": true,
+          "total_filtered_items": 0,
+          "n_returned": 0
+        },
+        {
+          "radius_m": 300,
+          "ok": true,
+          "total_filtered_items": 0,
+          "n_returned": 0
+        },
+        {
+          "radius_m": 200,
+          "ok": true,
+          "total_filtered_items": 0,
+          "n_returned": 0
+        },
+        {
+          "radius_m": 100,
+          "ok": true,
+          "total_filtered_items": 0,
+          "n_returned": 0
+        }
+      ],
+      "per_radius": [
+        {
+          "radius_m": 1000,
+          "ok": true,
+          "total_filtered_items": 11,
+          "n_sampled": 11,
+          "projection_counts": {
+            "SPHERE": 11
+          },
+          "pct_sphere": 100.0,
+          "shot_date_null": 9,
+          "pct_shot_date_null": 81.82,
+          "distinct_sequences": 3,
+          "distinct_usernames": 1,
+          "usernames_top": {
+            "OpenStreetView": 11
+          },
+          "capture_year_counts_shot_date": {
+            "2023": 2
+          },
+          "upload_year_counts_date_added": {
+            "2025": 11
+          }
+        },
+        {
+          "radius_m": 500,
+          "ok": true,
+          "total_filtered_items": 1,
+          "n_sampled": 1,
+          "projection_counts": {
+            "SPHERE": 1
+          },
+          "pct_sphere": 100.0,
+          "shot_date_null": 0,
+          "pct_shot_date_null": 0.0,
+          "distinct_sequences": 1,
+          "distinct_usernames": 1,
+          "usernames_top": {
+            "OpenStreetView": 1
+          },
+          "capture_year_counts_shot_date": {
+            "2023": 1
+          },
+          "upload_year_counts_date_added": {
+            "2025": 1
+          }
+        },
+        {
+          "radius_m": 400,
+          "ok": true,
+          "total_filtered_items": 0,
+          "n_sampled": 0,
+          "projection_counts": {},
+          "pct_sphere": null,
+          "shot_date_null": 0,
+          "pct_shot_date_null": null,
+          "distinct_sequences": 0,
+          "distinct_usernames": 0,
+          "usernames_top": {},
+          "capture_year_counts_shot_date": {},
+          "upload_year_counts_date_added": {}
+        },
+        {
+          "radius_m": 300,
+          "ok": true,
+          "total_filtered_items": 0,
+          "n_sampled": 0,
+          "projection_counts": {},
+          "pct_sphere": null,
+          "shot_date_null": 0,
+          "pct_shot_date_null": null,
+          "distinct_sequences": 0,
+          "distinct_usernames": 0,
+          "usernames_top": {},
+          "capture_year_counts_shot_date": {},
+          "upload_year_counts_date_added": {}
+        },
+        {
+          "radius_m": 200,
+          "ok": true,
+          "total_filtered_items": 0,
+          "n_sampled": 0,
+          "projection_counts": {},
+          "pct_sphere": null,
+          "shot_date_null": 0,
+          "pct_shot_date_null": null,
+          "distinct_sequences": 0,
+          "distinct_usernames": 0,
+          "usernames_top": {},
+          "capture_year_counts_shot_date": {},
+          "upload_year_counts_date_added": {}
+        },
+        {
+          "radius_m": 100,
+          "ok": true,
+          "total_filtered_items": 0,
+          "n_sampled": 0,
+          "projection_counts": {},
+          "pct_sphere": null,
+          "shot_date_null": 0,
+          "pct_shot_date_null": null,
+          "distinct_sequences": 0,
+          "distinct_usernames": 0,
+          "usernames_top": {},
+          "capture_year_counts_shot_date": {},
+          "upload_year_counts_date_added": {}
+        }
+      ],
+      "n_sampled": 11,
+      "projection_counts": {
+        "SPHERE": 11
+      },
+      "pct_sphere": 100.0,
+      "shot_date_null": 9,
+      "pct_shot_date_null": 81.82,
+      "distinct_sequences": 3,
+      "distinct_usernames": 1,
+      "usernames_top": {
+        "OpenStreetView": 11
+      },
+      "capture_year_counts_shot_date": {
+        "2023": 2
+      },
+      "upload_year_counts_date_added": {
+        "2025": 11
+      }
+    },
+    {
+      "target": "bucharest",
+      "lat": 44.436,
+      "lng": 26.091,
+      "max_working_radius_m": 1000,
+      "total_filtered_items": 2107,
+      "attempts": [
+        {
+          "radius_m": 1000,
+          "ok": true,
+          "total_filtered_items": 2107,
+          "n_returned": 200
+        },
+        {
+          "radius_m": 500,
+          "ok": true,
+          "total_filtered_items": 507,
+          "n_returned": 200
+        },
+        {
+          "radius_m": 400,
+          "ok": true,
+          "total_filtered_items": 256,
+          "n_returned": 200
+        },
+        {
+          "radius_m": 300,
+          "ok": true,
+          "total_filtered_items": 145,
+          "n_returned": 145
+        },
+        {
+          "radius_m": 200,
+          "ok": true,
+          "total_filtered_items": 67,
+          "n_returned": 67
+        },
+        {
+          "radius_m": 100,
+          "ok": true,
+          "total_filtered_items": 21,
+          "n_returned": 21
+        }
+      ],
+      "per_radius": [
+        {
+          "radius_m": 1000,
+          "ok": true,
+          "total_filtered_items": 2107,
+          "n_sampled": 200,
+          "projection_counts": {
+            "PLANE": 200
+          },
+          "pct_sphere": 0.0,
+          "shot_date_null": 0,
+          "pct_shot_date_null": 0.0,
+          "distinct_sequences": 2,
+          "distinct_usernames": 1,
+          "usernames_top": {
+            "razvan-sandu2": 200
+          },
+          "capture_year_counts_shot_date": {
+            "2023": 92,
+            "2024": 108
+          },
+          "upload_year_counts_date_added": {
+            "2023": 92,
+            "2024": 108
+          }
+        },
+        {
+          "radius_m": 500,
+          "ok": true,
+          "total_filtered_items": 507,
+          "n_sampled": 200,
+          "projection_counts": {
+            "PLANE": 200
+          },
+          "pct_sphere": 0.0,
+          "shot_date_null": 0,
+          "pct_shot_date_null": 0.0,
+          "distinct_sequences": 3,
+          "distinct_usernames": 1,
+          "usernames_top": {
+            "razvan-sandu2": 200
+          },
+          "capture_year_counts_shot_date": {
+            "2022": 106,
+            "2023": 94
+          },
+          "upload_year_counts_date_added": {
+            "2022": 106,
+            "2023": 94
+          }
+        },
+        {
+          "radius_m": 400,
+          "ok": true,
+          "total_filtered_items": 256,
+          "n_sampled": 200,
+          "projection_counts": {
+            "PLANE": 200
+          },
+          "pct_sphere": 0.0,
+          "shot_date_null": 27,
+          "pct_shot_date_null": 13.5,
+          "distinct_sequences": 6,
+          "distinct_usernames": 3,
+          "usernames_top": {
+            "mco21": 92,
+            "razvan-sandu2": 89,
+            "iulian-petridean": 19
+          },
+          "capture_year_counts_shot_date": {
+            "2016": 65,
+            "2019": 19,
+            "2022": 1,
+            "2023": 88
+          },
+          "upload_year_counts_date_added": {
+            "2016": 92,
+            "2019": 19,
+            "2022": 1,
+            "2023": 88
+          }
+        },
+        {
+          "radius_m": 300,
+          "ok": true,
+          "total_filtered_items": 145,
+          "n_sampled": 145,
+          "projection_counts": {
+            "PLANE": 145
+          },
+          "pct_sphere": 0.0,
+          "shot_date_null": 30,
+          "pct_shot_date_null": 20.69,
+          "distinct_sequences": 3,
+          "distinct_usernames": 2,
+          "usernames_top": {
+            "razvan-sandu2": 73,
+            "mco21": 72
+          },
+          "capture_year_counts_shot_date": {
+            "2016": 42,
+            "2023": 73
+          },
+          "upload_year_counts_date_added": {
+            "2016": 72,
+            "2023": 73
+          }
+        },
+        {
+          "radius_m": 200,
+          "ok": true,
+          "total_filtered_items": 67,
+          "n_sampled": 67,
+          "projection_counts": {
+            "PLANE": 67
+          },
+          "pct_sphere": 0.0,
+          "shot_date_null": 9,
+          "pct_shot_date_null": 13.43,
+          "distinct_sequences": 3,
+          "distinct_usernames": 2,
+          "usernames_top": {
+            "razvan-sandu2": 51,
+            "mco21": 16
+          },
+          "capture_year_counts_shot_date": {
+            "2016": 7,
+            "2023": 51
+          },
+          "upload_year_counts_date_added": {
+            "2016": 16,
+            "2023": 51
+          }
+        },
+        {
+          "radius_m": 100,
+          "ok": true,
+          "total_filtered_items": 21,
+          "n_sampled": 21,
+          "projection_counts": {
+            "PLANE": 21
+          },
+          "pct_sphere": 0.0,
+          "shot_date_null": 0,
+          "pct_shot_date_null": 0.0,
+          "distinct_sequences": 1,
+          "distinct_usernames": 1,
+          "usernames_top": {
+            "razvan-sandu2": 21
+          },
+          "capture_year_counts_shot_date": {
+            "2023": 21
+          },
+          "upload_year_counts_date_added": {
+            "2023": 21
+          }
+        }
+      ],
+      "n_sampled": 200,
+      "projection_counts": {
+        "PLANE": 200
+      },
+      "pct_sphere": 0.0,
+      "shot_date_null": 0,
+      "pct_shot_date_null": 0.0,
+      "distinct_sequences": 2,
+      "distinct_usernames": 1,
+      "usernames_top": {
+        "razvan-sandu2": 200
+      },
+      "capture_year_counts_shot_date": {
+        "2023": 92,
+        "2024": 108
+      },
+      "upload_year_counts_date_added": {
+        "2023": 92,
+        "2024": 108
+      }
+    }
+  ]
+}
