@@ -10,7 +10,10 @@ naive int(dim/5) sizing would drop the most-negative row/col.
 
 import importlib.util
 import io
+import json
 import os
+import shutil
+import subprocess
 import sys
 from dataclasses import dataclass
 
@@ -198,3 +201,297 @@ def test_estimate_counts_pinned():
         assert len(i5) * len(j5) == 160_801
 
     assert 25_921 + 2 * 160_801 == 347_523
+
+
+# ── The committed record (docs/experiments/grid-density_*) ──────────────────
+#
+# The writeup's numbers must trace to the committed JSON, and the JSON must be
+# produced by committed code (CLAUDE.md, "Notes"). These tests are that
+# contract: the summary CSV regenerates byte-for-byte from the JSON, each
+# `offsets` percentile sits in the histogram bin its cumulative share implies,
+# and every share the writeup quotes recomputes from the committed bins.
+
+_aspec = importlib.util.spec_from_file_location(
+    "grid_density_analyze", os.path.join(PROJECT_ROOT, "scripts", "grid_density_analyze.py")
+)
+ga = importlib.util.module_from_spec(_aspec)
+sys.modules[_aspec.name] = ga
+_aspec.loader.exec_module(ga)
+
+DOCS_DIR = os.path.join(PROJECT_ROOT, "docs", "experiments")
+COMMITTED_JSON = os.path.join(DOCS_DIR, ga.DOCS_METRICS_NAME)
+COMMITTED_CSV = os.path.join(DOCS_DIR, ga.DOCS_SUMMARY_NAME)
+
+
+@pytest.fixture(scope="module")
+def committed():
+    with open(COMMITTED_JSON, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def test_distance_histogram_keeps_the_tail_as_a_count():
+    edges = np.array([0.0, 1.0, 2.0])
+    h = ga.distance_histogram(np.array([0.5, 1.5, 1.99, 2.0, 7.0]), edges)
+    assert h == {
+        "bin_edges": [0.0, 1.0, 2.0],
+        "counts": [1, 2],
+        "n_above_last_edge": 2,
+        "n_total": 5,
+    }
+    # Nothing is silently dropped: bins plus tail account for every value.
+    assert sum(h["counts"]) + h["n_above_last_edge"] == h["n_total"]
+
+
+def test_offset_metrics_and_distributions_describe_the_same_arrays():
+    rng = np.random.default_rng(106)
+    offsets = rng.uniform(0.0, 60.0, 500)
+    nn = rng.normal(10.0, 0.3, 300)
+    m = ga.offset_metrics(offsets, nn)
+    d = ga.distance_distributions(offsets, nn)
+    assert m["n_offset_pairs"] == d["query_to_pano_m"]["n_total"] == 500
+    assert m["n_unique_official_panos"] == d["pano_nearest_neighbor_m"]["n_total"] == 300
+    assert m["query_to_pano_m"]["max"] == round(float(offsets.max()), 1)
+    assert len(d["pano_nearest_neighbor_m"]["bin_edges"]) == 121  # 0.25 m bins to 30 m
+    assert len(d["query_to_pano_m"]["bin_edges"]) == 101  # 2 m bins to 200 m
+
+
+def _cum_share_below(hist: dict, edge: float) -> float:
+    edges = np.asarray(hist["bin_edges"], dtype=float)
+    idx = int(np.searchsorted(edges, edge))
+    assert edges[idx] == edge
+    return 100.0 * float(np.sum(hist["counts"][:idx])) / hist["n_total"]
+
+
+@pytest.mark.parametrize("dist_key", ["pano_nearest_neighbor_m", "query_to_pano_m"])
+def test_committed_percentiles_sit_in_their_histogram_bins(committed, dist_key):
+    """The two blocks of the JSON describe the same arrays; a swapped or stale
+    histogram, a wrong n_total or a wrong percentile all break this."""
+    for area, blk in committed["areas"].items():
+        hist = blk["distributions"][dist_key]
+        assert sum(hist["counts"]) + hist["n_above_last_edge"] == hist["n_total"], area
+        edges = np.asarray(hist["bin_edges"], dtype=float)
+        for pkey, value in blk["offsets"][dist_key].items():
+            if not pkey.startswith("p"):
+                continue
+            q = float(pkey[1:])
+            b = int(np.searchsorted(edges, value, side="right")) - 1
+            # One bin of slack each side: percentiles are rounded to 0.1 m and
+            # a bin is 0.25 m / 2 m wide, so the rounded value can cross an edge.
+            lo = _cum_share_below(hist, edges[max(b - 1, 0)])
+            hi = _cum_share_below(hist, edges[min(b + 2, len(edges) - 1)])
+            assert lo <= q <= hi, (area, dist_key, pkey, value, lo, hi)
+
+
+def test_committed_summary_csv_regenerates_from_committed_json(committed, tmp_path):
+    assert set(committed["areas"]) == set(gd.STUDY_AREAS)
+    results = [committed["areas"][k] for k in gd.STUDY_AREAS]
+    path = ga.write_summary_csv(results, str(tmp_path), ga.DOCS_SUMMARY_NAME)
+    with open(path, "rb") as fh, open(COMMITTED_CSV, "rb") as committed_fh:
+        assert fh.read() == committed_fh.read()
+
+
+def test_committed_json_names_its_producer(committed):
+    assert committed["_about"]["generated_by"] == ga.DOCS_GENERATED_BY
+    # ...and the constant is what the canonical invocation actually renders, so
+    # the stamp names the run that wrote the file rather than a string any run
+    # can copy onto any file. A moved knob or another output directory shows.
+    assert (
+        ga.docs_generated_by("docs/experiments", gd.CLIP_DIST_M_DEFAULT, ga.MATCH_DIST_M_DEFAULT)
+        == ga.DOCS_GENERATED_BY
+    )
+    assert ga.docs_generated_by("/tmp/scratch", 30.0, ga.MATCH_DIST_M_DEFAULT) == (
+        "scripts/grid_density_analyze.py --area all --docs-dir /tmp/scratch --clip-dist 30"
+    )
+    assert ga.docs_generated_by("docs/experiments", gd.CLIP_DIST_M_DEFAULT, 40.0).endswith(
+        "--match-dist 40"
+    )
+    fake = [{"area": "adrian", "variants": {}}, {"area": "seattle", "variants": {}}]
+    merged = ga.build_committed_metrics(fake)
+    assert merged["_about"]["generated_by"] == ga.DOCS_GENERATED_BY
+    assert merged["areas"] == {"adrian": fake[0], "seattle": fake[1]}
+
+
+def test_docs_dir_refuses_a_partial_area_set(tmp_path):
+    """A single-area run must never overwrite the committed record with a subset."""
+    with pytest.raises(SystemExit) as excinfo:
+        ga.main(["--area", "adrian", "--docs-dir", str(tmp_path)])
+    assert excinfo.value.code == 2  # argparse usage error, before any DB is opened
+    assert not list(tmp_path.iterdir())
+
+
+def test_writeup_shares_recompute_from_committed_histograms(committed):
+    """Every share docs/experiments/grid-density.md quotes, pinned to the bins."""
+    sp = {
+        k: ga.spacing_shares(b["distributions"]["pano_nearest_neighbor_m"])
+        for k, b in committed["areas"].items()
+    }
+    assert {k: round(v["band_9_11_pct"], 1) for k, v in sp.items()} == {
+        "adrian": 92.5,
+        "corvallis": 79.5,
+        "seattle": 57.2,
+    }
+    assert {k: round(v["sub5_pct"], 1) for k, v in sp.items()} == {
+        "adrian": 0.4,
+        "corvallis": 0.7,
+        "seattle": 11.4,
+    }
+    assert round(sp["seattle"]["under_1m_pct"], 2) == 0.19
+    assert round(sp["seattle"]["band_2_4_pct"], 2) == 10.05
+    # Only Seattle has a second mode to place: the 2.50–2.75 m bin ("≈2.6 m").
+    assert sp["seattle"]["sub5_peak_m"] == 2.625
+    assert sp["adrian"]["sub5_peak_m"] is None
+    assert sp["corvallis"]["sub5_peak_m"] is None
+
+    off = {
+        k: ga.offset_shares(b["distributions"]["query_to_pano_m"])
+        for k, b in committed["areas"].items()
+    }
+    assert {k: round(v["beyond_50m_pct"], 1) for k, v in off.items()} == {
+        "adrian": 9.6,
+        "corvallis": 2.5,
+        "seattle": 0.6,
+    }
+    # The Corvallis far tail: past the histogram's last edge, so it can only be
+    # seen through the tail count and `max` — never through the clipped ECDF.
+    assert off["corvallis"]["n_beyond_last_edge"] == 313
+    assert off["corvallis"]["last_edge_m"] == 200.0
+    assert committed["areas"]["corvallis"]["offsets"]["query_to_pano_m"]["max"] == 573.0
+    assert committed["areas"]["adrian"]["offsets"]["query_to_pano_m"]["p99"] == 146.1
+
+
+def test_figures_from_metrics_needs_only_the_committed_json(tmp_path):
+    pytest.importorskip("matplotlib")
+    src = tmp_path / ga.DOCS_METRICS_NAME
+    shutil.copy(COMMITTED_JSON, src)
+    assert ga.main(["--figures-from-metrics", str(src)]) == 0
+    written = sorted(p.name for p in (tmp_path / "figures").iterdir())
+    assert written == ["grid-density-pano_spacing.png", "grid-density-query_offset_ecdf.png"]
+    assert all((tmp_path / "figures" / n).stat().st_size > 10_000 for n in written)
+
+
+def test_writeup_coverage_stability_recomputes_from_committed_json(committed):
+    """
+    Finding 2's headline number. It read "<=0.4 pp everywhere" across the 16x
+    query increase while the JSON committed beside it put Adrian at 0.82 pp --
+    the per-transition figure quoted as if it were the cumulative one. Pinned
+    here because the rest of the writeup's shares are pinned and this one, the
+    headline of the finding, was the one that drifted.
+    """
+
+    def cov(area, variant):
+        return committed["areas"][area]["variants"][variant]["coverage_rate_pct"]
+
+    assert {a: round(cov(a, "step5") - cov(a, "step20"), 1) for a in gd.STUDY_AREAS} == {
+        "adrian": 0.8,
+        "corvallis": 0.2,
+        "seattle": 0.2,
+    }
+    steps = [
+        round(cov(a, hi) - cov(a, lo), 2)
+        for a in gd.STUDY_AREAS
+        for lo, hi in (("step20", "step10"), ("step10", "step5"))
+    ]
+    assert max(steps) == 0.43  # "the largest single transition is 0.43 pp (Adrian, 20 -> 10 m)"
+
+
+def test_distance_histogram_drops_nan_rather_than_diluting_shares():
+    """NaN < edge and NaN >= edge are both False, so an unfiltered NaN lands in
+    neither the bins nor the tail while len() still counts it -- silently
+    breaking bins + tail == n_total and every share computed from it."""
+    edges = np.array([0.0, 1.0, 2.0])
+    h = ga.distance_histogram(np.array([0.5, np.nan, 1.5, 7.0]), edges)
+    assert sum(h["counts"]) + h["n_above_last_edge"] == h["n_total"] == 3
+    # +-inf is a real ordering, not a missing value: it belongs in the tail.
+    h_inf = ga.distance_histogram(np.array([0.5, np.inf]), edges)
+    assert h_inf["n_above_last_edge"] == 1 and h_inf["n_total"] == 2
+
+
+def test_offset_arrays_refuses_an_area_with_one_official_pano():
+    """sjoin_nearest(exclusive=True) drops the lone pano, which would report
+    n_unique_official_panos: 0 and divide every spacing share by it."""
+    pytest.importorskip("geopandas")
+    df = pd.DataFrame(
+        {
+            "query_lat": [43.74, 43.74],
+            "query_lon": [-117.07, -117.07],
+            "pano_lat": [43.7401, 43.7401],
+            "pano_lon": [-117.0701, -117.0701],
+            "pano_id": ["one", "one"],  # same pano returned by two query points
+            "status": ["OK", "OK"],
+            "copyright_info": ["© Google", "© Google"],
+        }
+    )
+    with pytest.raises(ValueError, match="unique official panos"):
+        ga.offset_arrays(df, "EPSG:32611")
+
+
+def test_figures_from_metrics_refuses_a_partial_or_per_area_file(tmp_path):
+    """This path writes the SAME filenames --docs-dir does, into figures/ beside
+    the file it reads, so a partial JSON would silently republish the committed
+    record with an area missing."""
+    with open(COMMITTED_JSON, encoding="utf-8") as fh:
+        full = json.load(fh)
+
+    partial = tmp_path / ga.DOCS_METRICS_NAME
+    partial.write_text(
+        json.dumps({"_about": full["_about"], "areas": {"adrian": full["areas"]["adrian"]}}),
+        encoding="utf-8",
+    )
+    with pytest.raises(SystemExit) as excinfo:
+        ga.main(["--figures-from-metrics", str(partial)])
+    assert excinfo.value.code == 2
+    assert not (tmp_path / "figures").exists()
+
+    per_area = tmp_path / "adrian_metrics.json"
+    per_area.write_text(json.dumps(full["areas"]["adrian"]), encoding="utf-8")
+    with pytest.raises(SystemExit) as excinfo:
+        ga.main(["--figures-from-metrics", str(per_area)])
+    assert excinfo.value.code == 2
+    assert not (tmp_path / "figures").exists()
+
+
+def test_docs_dir_refuses_no_figures(tmp_path):
+    """Silently ignoring it, which is what used to happen, would let a
+    numbers-only refresh leave the record's figures describing older numbers."""
+    with pytest.raises(SystemExit) as excinfo:
+        ga.main(["--area", "all", "--docs-dir", str(tmp_path), "--no-figures"])
+    assert excinfo.value.code == 2
+    assert not list(tmp_path.iterdir())
+
+
+def test_distribution_figures_reject_an_area_they_cannot_colour(committed, tmp_path):
+    """Adding a fourth study area must not write a JSON and CSV containing it
+    beside two figures that silently omit it."""
+    pytest.importorskip("matplotlib")
+    areas = dict(committed["areas"])
+    areas["portland"] = areas["adrian"]
+    with pytest.raises(ValueError, match="portland"):
+        ga.make_distribution_figures(areas, str(tmp_path), ga.DOCS_FIGURE_PREFIX)
+    with pytest.raises(ValueError, match="nothing to plot"):
+        ga.make_distribution_figures({}, str(tmp_path), ga.DOCS_FIGURE_PREFIX)
+
+
+def test_distribution_figures_honour_the_prefix(committed, tmp_path):
+    """Both figure builders take the prefix, so DOCS_FIGURE_PREFIX renames all
+    five together rather than three of them."""
+    pytest.importorskip("matplotlib")
+    written = ga.make_distribution_figures(committed["areas"], str(tmp_path), "xy-")
+    assert sorted(os.path.basename(p) for p in written) == [
+        "xy-pano_spacing.png",
+        "xy-query_offset_ecdf.png",
+    ]
+
+
+def test_analyzer_imports_without_a_pre_registered_sibling():
+    """The loader at the top of this section must not depend on `gd` having
+    registered grid_density_common in sys.modules 180 lines earlier -- otherwise
+    reordering the two blocks breaks collection with an unrelated error."""
+    code = (
+        "import importlib.util, sys;"
+        f"spec = importlib.util.spec_from_file_location('gda', {ga.__file__!r});"
+        "m = importlib.util.module_from_spec(spec); sys.modules['gda'] = m;"
+        "spec.loader.exec_module(m); print(m.DOCS_FIGURE_PREFIX)"
+    )
+    proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == ga.DOCS_FIGURE_PREFIX

@@ -55,9 +55,93 @@ road — measured nearest-neighbour spacing p50 9.5–10.1 m in all three areas 
 lattice mostly re-queries panos it already has. Rows per official pano climbs to 9.6
 (Seattle) / 19.5 (Corvallis) / 31.8 (Adrian) at 5 m: that is the redundancy, priced.
 
-**2. Coverage % — the headline metric — is already stable at 20 m.** Across a 16× query
-increase it moves by ≤0.4 pp everywhere. Whatever a denser grid buys, it is not a
-different answer to "what fraction of this city has imagery".
+The full distribution, from the 5 m near-census (the `offsets` percentiles and the
+`distributions` histograms in `grid-density_metrics.json`), matters more than the median —
+**the shape is what shows the interval is machine-regulated**: specifically the 9–11 m band
+share below, which neither the median nor a percentile spread can stand in for (Seattle's
+IQR is 2.2 m on the same regulated interval, because of the second mode). That band share
+is the number to cite when asked how finely GSV samples:
+
+| area | p25 | p50 | p75 | p90 | IQR | n official panos |
+|---|---|---|---|---|---|---|
+| Adrian | 9.9 | 10.1 | 10.2 | 10.5 | 0.3 | 469 |
+| Corvallis | 9.5 | 9.9 | 10.2 | 10.6 | 0.7 | 5,644 |
+| Seattle | 7.9 | 9.5 | 10.1 | 10.4 | 2.2 | 8,531 |
+
+![official pano spacing distribution](figures/grid-density-pano_spacing.png)
+
+**The distribution is bimodal, and the percentiles hide it.** The share landing in a ±1 m
+band around 10 m is **92.5% (Adrian) / 79.5% (Corvallis) / 57.2% (Seattle)** — that band
+share, not the median, is the evidence the interval is machine-regulated, since a bimodal
+distribution can have the same median. The sub-5 m share is **0.4% / 0.7% / 11.4%**
+respectively, and only Seattle's is a real second mode: it peaks in the 2.50–2.75 m bin
+(**≈2.6 m**; 296 of 8,531 panos), whereas Adrian's 0.4% is two panos and Corvallis's 0.7% is
+40 panos spread across 0–5 m with no peak (0.18% in 2–4 m). The figure reads the mode's
+position from the histogram (`spacing_shares`) rather than asserting it.
+
+That sub-5 m mode is where the statistic stops answering the question. Nearest-neighbour is
+a *point-set* measure, not an along-track capture interval: wherever two roadways run close
+together in plan view, a pano's nearest neighbour is on the *other* roadway rather than
+ahead of or behind it on its own. So Seattle's 11.4% is not evidence of finer sampling
+downtown, and it is why Seattle's p25 (7.9 m) drops below the regulated interval while its
+p75 (10.1 m) does not. **Quote the 9–11 m band share, not the median, when the question is
+how finely GSV samples.**
+
+**Which roadways produce it is an open question — the candidate mechanisms are not
+distinguished here.** At least three would produce sub-5 m neighbours, and they predict
+different things:
+
+| mechanism | predicts |
+|---|---|
+| a second pass on the same roadway (opposite direction, or an adjacent lane) | mass at roughly lane-width scale, concentrated on `oneway=False` edges |
+| **bridges, overpasses and interchanges** | near-**zero** planar separation, since projecting to 2D collapses the vertical gap between a deck and the road beneath it; concentrated on `bridge`/`tunnel` edges |
+| intersections | concentrated near nodes with `street_count` >= 3 |
+
+The one discriminator the distance data alone supplies argues **against** vertical stacking
+being the main driver: it would put mass at near-zero, and there is almost none. Seattle
+has **0.19%** under 1 m, while **10.05%** sits in 2–4 m in a tight peak centred ≈2.6 m —
+roughly a lane width, not a deck-over-road coincidence. That is suggestive, not a test:
+roadways crossing at an angle still separate by a few metres in projection, so the
+mechanisms are not cleanly separable by distance alone.
+
+Testing it needs no new collection, and is tracked in
+[#223](https://github.com/jonfroehlich/streetscape-tracker/issues/223): the cached GraphML
+for these areas already retains `bridge`, `tunnel`, `junction`, `lanes`, `oneway` and node
+`street_count`, so tagging each sub-5 m pano by what it sits on is an offline join against
+artifacts already on disk. Until that runs, treat the mechanism as unattributed.
+
+GSV exposes no run/sequence identifier, so none of this can be corrected for at the pano
+level; Mapillary's `sequence_id` makes the same correction trivial, which is the sharpest
+methodological difference between the two providers.
+
+**1b. Query→pano offsets do not match Google's documented default radius.** The collector
+sets no `radius`, so the documented 50 m default should apply, and it describes the bulk
+but not the tail:
+
+| area | p50 | p90 | p99 | max | n official returns |
+|---|---|---|---|---|---|
+| Adrian | 21.7 | 49.6 | 146.1 | 178.2 | 14,923 |
+| Corvallis | 14.3 | 37.3 | 74.5 | **573.0** | 109,906 |
+| Seattle | 8.3 | 26.6 | 48.1 | 136.4 | 82,113 |
+
+![query-to-pano offset ECDF](figures/grid-density-query_offset_ecdf.png)
+
+Adrian's p90 sits just under the documented 50 m (49.6 m), yet **9.6% of its 14,923 successful
+official returns come from beyond it** (Corvallis 2.5% of 109,906, Seattle 0.6% of 82,113),
+out to 146 m at p99. The share rises as imagery gets sparser, which is the shape you would
+expect if the radius were larger than documented — or absent — rather than if a 50 m cutoff
+were being applied at all. And the tail is longer than the p99 column suggests: Corvallis,
+whose p99 is only 74.5 m, has a detached far cluster — **313 returns (0.28%) land beyond
+the histogram's 200 m last edge, the farthest at 573 m** (`n_above_last_edge` and `max` in
+the JSON), more than eleven times the documented radius. The ECDF is clipped at 160 m for
+legibility, so that cluster is off the plot; it is not off the record. Unexplained; flag it
+rather than relying on the 50 m figure, and set `radius` explicitly in any study where the
+search neighbourhood needs to be a known quantity.
+
+**2. Coverage % — the headline metric — is already stable at 20 m.** Across the full 16×
+query increase (20 → 5 m) it moves **+0.8 pp** in Adrian and **+0.2 pp** in Corvallis and
+Seattle; the largest single transition is 0.43 pp (Adrian, 20 → 10 m). Whatever a denser
+grid buys, it is not a different answer to "what fraction of this city has imagery".
 
 ![coverage by variant](figures/grid-density-coverage_by_variant.png)
 
@@ -96,16 +180,47 @@ construction and coverage is fractional per edge.
   `grid_aligned=False`). Adrian and Corvallis cross-check at 100% key match / 99% same-pano
   against their production runs.
 
+- Nearest-neighbour spacing is measured over *unique* official panos, so it understates the
+  along-track capture interval wherever passes overlap (see finding 1). It is also only
+  as complete as the 5 m lattice: the API returns one nearest pano per query, so the pano
+  set is the image of the lattice under a nearest-neighbour map. Saturation at 10→5 m
+  (finding 1) is the evidence that the residual thinning is small, not a proof of census.
+- Three areas, all US, two of them 2×2 km tiles. Do not generalize the spacing figure to
+  non-US GSV coverage without re-measuring.
+
 ## Replicating
 
 ```bash
 python scripts/grid_density_collect.py --estimate --area all   # query counts, no key needed
 python scripts/grid_density_collect.py --area all              # ~348k queries on gsv_streets
 python scripts/grid_density_analyze.py --area all              # derives variants, writes report
+python scripts/grid_density_analyze.py --area all --docs-dir docs/experiments   # rewrite the committed record
+python scripts/grid_density_analyze.py --figures-from-metrics docs/experiments/grid-density_metrics.json
 ```
 
-Collection needs `GMAPS_STREETS_API_KEY`; analysis is offline given the snapshots. Both
-write to `experiments/grid-density/` — **gitignored, and never under `data/`**, because the
-publisher rsyncs any `*.csv.gz` it finds there to the public web server. The analysis
+Derived results are committed beside this writeup and do not require re-collection:
+`grid-density_metrics.json` (per-area `variants`, `marginal`, `offsets`, `street`, and the
+binned `distributions` the two distance figures are drawn from),
+`grid-density_variants_summary.csv`, and the five figures under `figures/grid-density-*.png`.
+**`--docs-dir` is the only producer of those files** (`write_docs_record`; it requires
+`--area all`, so a partial run can never overwrite the record with a subset of areas, and it
+stages all seven artifacts before promoting them together, so a figure that fails to render
+cannot leave new numbers committed beside stale PNGs), and
+`tests/test_grid_density.py` pins them: the CSV regenerates byte-for-byte from the JSON,
+every `offsets` percentile falls in the histogram bin its cumulative share implies, and
+every share quoted above recomputes from the committed bins. The raw 5 m collection CSVs
+stay in the gitignored `/experiments/grid-density/`.
+
+Collection needs `GMAPS_STREETS_API_KEY`; analysis is offline given the snapshots and the
+cached OSM networks. Without `--docs-dir`, both scripts write only to
+`experiments/grid-density/` — **gitignored, and never under `data/`**, because the publisher
+rsyncs any `*.csv.gz` it finds there to the public web server. There the analysis
 regenerates `report.md` (the full per-area tables this document summarizes),
-`variants_summary.csv`, `{area}_metrics.json`, and the three figures above.
+`variants_summary.csv`, `{area}_metrics.json`, and unprefixed copies of the first three
+figures; the two distribution figures are drawn only from the merged JSON, by `--docs-dir`
+or by `--figures-from-metrics`, which needs no DB, no raw CSVs and no geopandas/osmnx — it
+does still need numpy/pandas/matplotlib, and shapely arrives transitively through the
+tracker package, so this is not a geo-stack-free path — and writes into `figures/` beside
+the JSON it reads, i.e. into `docs/experiments/figures/` when pointed at the committed file.
+Because that overwrites the committed figures in place, it refuses a metrics file missing
+any study area, which is the same guard `--docs-dir` applies through `--area all`.

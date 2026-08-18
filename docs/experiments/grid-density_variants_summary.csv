@@ -1,0 +1,13 @@
+area,variant,points,coverage_rate_pct,unique_google_panos,rows_per_official_pano,official_panos_per_1k_queries,street_length_covered_pct
+adrian,step20,1681,56.75,286,3.34,170.1,100.0
+adrian,step10,6561,57.19,466,8.05,71.0,100.0
+adrian,step5_road,5401,95.65,436,11.85,80.7,100.0
+adrian,step5,25921,57.57,469,31.82,18.1,100.0
+corvallis,step20,10201,70.9,4290,1.62,420.5,100.0
+corvallis,step10,40401,71.06,5594,4.93,138.5,100.0
+corvallis,step5_road,49183,99.94,4832,10.07,98.2,100.0
+corvallis,step5,160801,71.11,5644,19.47,35.1,100.0
+seattle,step20,10201,74.56,4350,1.2,426.4,97.8
+seattle,step10,40401,74.65,7954,2.59,196.9,97.8
+seattle,step5_road,51666,99.99,6516,6.71,126.1,97.3
+seattle,step5,160801,74.72,8531,9.63,53.1,98.0
