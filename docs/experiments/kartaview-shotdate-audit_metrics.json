@@ -1,0 +1,1063 @@
+{
+  "_about": {
+    "experiment": "kartaview-shotdate-audit",
+    "writeup": "docs/experiments/kartaview-feasibility.md",
+    "generated_by": "scripts/kartaview_shotdate_audit.py --docs-dir docs/experiments",
+    "issue": 225,
+    "probed_at_utc": "2026-08-19T00:40:47.576315+00:00",
+    "authenticated": true,
+    "invariant": "shotDate < dateAdded; shotDate >= dateAdded is invalid",
+    "note": "Photo counts are countActivePhotos from /2.0/sequence/{id} -- the sequence's FULL size, not the sampled page -- so photos_invalid is the real number of affected photos in the sequences reached, and still a LOWER BOUND on the batch as a whole."
+  },
+  "summary": {
+    "sequences_audited": 48,
+    "photos_audited": 59263,
+    "sequences_invalid": 10,
+    "photos_invalid": 5665,
+    "by_verdict": {
+      "ok": {
+        "sequences": 38,
+        "photos": 53598
+      },
+      "invalid": {
+        "sequences": 10,
+        "photos": 5665
+      }
+    },
+    "by_city": {
+      "Bangkok": {
+        "sequences": 6,
+        "photos": 21990
+      },
+      "Singapore": {
+        "sequences": 2,
+        "photos": 17504
+      },
+      "Yogyakarta": {
+        "sequences": 18,
+        "photos": 7785
+      },
+      "Krabi": {
+        "sequences": 8,
+        "photos": 6242
+      },
+      "Seattle": {
+        "sequences": 2,
+        "photos": 4590
+      },
+      "Ho Chi Minh City": {
+        "sequences": 8,
+        "photos": 1007
+      },
+      "Langkawi": {
+        "sequences": 4,
+        "photos": 145
+      }
+    },
+    "by_device": {
+      "KartaCam360LiteV1": {
+        "sequences": 7,
+        "photos": 22917
+      },
+      "realme RMX3363": {
+        "sequences": 3,
+        "photos": 21903
+      },
+      "KartaCam2": {
+        "sequences": 22,
+        "photos": 5677
+      },
+      "GoPro Max": {
+        "sequences": 1,
+        "photos": 2346
+      },
+      "iPhone15,3": {
+        "sequences": 1,
+        "photos": 2244
+      },
+      "iPhone8,1": {
+        "sequences": 1,
+        "photos": 1000
+      },
+      "samsung SM-C710F": {
+        "sequences": 2,
+        "photos": 883
+      },
+      "Xiaomi MI MAX": {
+        "sequences": 2,
+        "photos": 783
+      },
+      "OPPO CPH1729": {
+        "sequences": 2,
+        "photos": 672
+      },
+      "Xiaomi Redmi Note 8": {
+        "sequences": 1,
+        "photos": 455
+      },
+      "Xiaomi Redmi 8": {
+        "sequences": 1,
+        "photos": 193
+      },
+      "iPhone10,5": {
+        "sequences": 1,
+        "photos": 102
+      },
+      "vivo vivo 1906": {
+        "sequences": 3,
+        "photos": 87
+      },
+      "GoPro Fusion": {
+        "sequences": 1,
+        "photos": 1
+      }
+    },
+    "invalid_upload_dates": [
+      "2025-11-19"
+    ],
+    "invalid_devices": [
+      "KartaCam2"
+    ],
+    "ok_upload_dates": [
+      "2019-08-01",
+      "2020-06-08",
+      "2020-06-13",
+      "2020-06-14",
+      "2020-06-16",
+      "2020-06-26",
+      "2020-06-28",
+      "2023-10-26",
+      "2023-11-23",
+      "2023-12-06",
+      "2023-12-08",
+      "2024-06-12",
+      "2024-11-11",
+      "2025-03-13",
+      "2025-06-06",
+      "2025-06-12",
+      "2025-09-13",
+      "2025-09-20",
+      "2025-10-02",
+      "2025-11-17",
+      "2026-06-01",
+      "2026-08-12",
+      "2026-08-17"
+    ]
+  },
+  "sequences": [
+    {
+      "sequence_id": "11616154",
+      "city": "Krabi",
+      "band": "release",
+      "seen_at": [
+        "Krabi@8.0634637,98.9162345"
+      ],
+      "device": "KartaCam2",
+      "user_id": "44",
+      "username": "OpenStreetView",
+      "projection": "SPHERE",
+      "count_active_photos": 60,
+      "sequence_date_added": "2025-11-19 11:16:17",
+      "sampled_photo_id": "2627370567",
+      "v1_shot_date": null,
+      "v2_shot_date": "2025-11-19 11:16:25",
+      "v2_date_added": "2025-11-19 11:16:24",
+      "verdict": "invalid"
+    },
+    {
+      "sequence_id": "11616155",
+      "city": "Krabi",
+      "band": "release",
+      "seen_at": [
+        "Krabi@8.0634637,98.9162345",
+        "Krabi@8.07,98.92"
+      ],
+      "device": "KartaCam2",
+      "user_id": "44",
+      "username": "OpenStreetView",
+      "projection": "SPHERE",
+      "count_active_photos": 134,
+      "sequence_date_added": "2025-11-19 11:16:53",
+      "sampled_photo_id": "2627370627",
+      "v1_shot_date": null,
+      "v2_shot_date": "2025-11-19 11:17:00",
+      "v2_date_added": "2025-11-19 11:17:00",
+      "verdict": "invalid"
+    },
+    {
+      "sequence_id": "11616152",
+      "city": "Krabi",
+      "band": "release",
+      "seen_at": [
+        "Krabi@8.0634637,98.9162345"
+      ],
+      "device": "KartaCam2",
+      "user_id": "44",
+      "username": "OpenStreetView",
+      "projection": "SPHERE",
+      "count_active_photos": 71,
+      "sequence_date_added": "2025-11-19 11:15:08",
+      "sampled_photo_id": "2627370496",
+      "v1_shot_date": null,
+      "v2_shot_date": "2025-11-19 11:16:04",
+      "v2_date_added": "2025-11-19 11:15:32",
+      "verdict": "invalid"
+    },
+    {
+      "sequence_id": "11616153",
+      "city": "Krabi",
+      "band": "release",
+      "seen_at": [
+        "Krabi@8.0634637,98.9162345"
+      ],
+      "device": "KartaCam2",
+      "user_id": "44",
+      "username": "OpenStreetView",
+      "projection": "SPHERE",
+      "count_active_photos": 34,
+      "sequence_date_added": "2025-11-19 11:15:53",
+      "sampled_photo_id": "2627370533",
+      "v1_shot_date": null,
+      "v2_shot_date": "2025-11-19 11:16:05",
+      "v2_date_added": "2025-11-19 11:16:00",
+      "verdict": "invalid"
+    },
+    {
+      "sequence_id": "11616156",
+      "city": "Krabi",
+      "band": "release",
+      "seen_at": [
+        "Krabi@8.0634637,98.9162345"
+      ],
+      "device": "KartaCam2",
+      "user_id": "44",
+      "username": "OpenStreetView",
+      "projection": "SPHERE",
+      "count_active_photos": 10,
+      "sequence_date_added": "2025-11-19 11:18:10",
+      "sampled_photo_id": "2627370761",
+      "v1_shot_date": null,
+      "v2_shot_date": "2025-11-19 11:18:17",
+      "v2_date_added": "2025-11-19 11:18:17",
+      "verdict": "invalid"
+    },
+    {
+      "sequence_id": "8313849",
+      "city": "Krabi",
+      "band": "release",
+      "seen_at": [
+        "Krabi@8.07,98.92"
+      ],
+      "device": "KartaCam360LiteV1",
+      "user_id": "44",
+      "username": "OpenStreetView",
+      "projection": "SPHERE",
+      "count_active_photos": 5409,
+      "sequence_date_added": "2023-11-23 14:17:41",
+      "sampled_photo_id": "1855791625",
+      "v1_shot_date": "2023-03-19 07:12:58.000",
+      "v2_shot_date": "2023-03-19 07:12:58.000",
+      "v2_date_added": "2023-11-23 14:40:04",
+      "verdict": "ok"
+    },
+    {
+      "sequence_id": "11616147",
+      "city": "Krabi",
+      "band": "release",
+      "seen_at": [
+        "Krabi@8.07,98.92",
+        "Krabi@8.055,98.91"
+      ],
+      "device": "KartaCam2",
+      "user_id": "44",
+      "username": "OpenStreetView",
+      "projection": "SPHERE",
+      "count_active_photos": 406,
+      "sequence_date_added": "2025-11-19 11:10:18",
+      "sampled_photo_id": "2627370256",
+      "v1_shot_date": null,
+      "v2_shot_date": "2025-11-19 11:18:32",
+      "v2_date_added": "2025-11-19 11:13:13",
+      "verdict": "invalid"
+    },
+    {
+      "sequence_id": "11616151",
+      "city": "Krabi",
+      "band": "release",
+      "seen_at": [
+        "Krabi@8.055,98.91"
+      ],
+      "device": "KartaCam2",
+      "user_id": "44",
+      "username": "OpenStreetView",
+      "projection": "SPHERE",
+      "count_active_photos": 118,
+      "sequence_date_added": "2025-11-19 11:14:00",
+      "sampled_photo_id": "2627370354",
+      "v1_shot_date": null,
+      "v2_shot_date": "2025-11-19 11:14:24",
+      "v2_date_added": "2025-11-19 11:14:10",
+      "verdict": "invalid"
+    },
+    {
+      "sequence_id": "11616132",
+      "city": "Yogyakarta",
+      "band": "release",
+      "seen_at": [
+        "Yogyakarta@-7.7956,110.3695"
+      ],
+      "device": "KartaCam2",
+      "user_id": "44",
+      "username": "OpenStreetView",
+      "projection": "SPHERE",
+      "count_active_photos": 3242,
+      "sequence_date_added": "2025-11-19 10:42:29",
+      "sampled_photo_id": "2627367953",
+      "v1_shot_date": null,
+      "v2_shot_date": "2025-11-19 11:18:35",
+      "v2_date_added": "2025-11-19 10:54:07",
+      "verdict": "invalid"
+    },
+    {
+      "sequence_id": "11616126",
+      "city": "Yogyakarta",
+      "band": "release",
+      "seen_at": [
+        "Yogyakarta@-7.7956,110.3695"
+      ],
+      "device": "KartaCam2",
+      "user_id": "44",
+      "username": "OpenStreetView",
+      "projection": "SPHERE",
+      "count_active_photos": 1549,
+      "sequence_date_added": "2025-11-19 10:24:49",
+      "sampled_photo_id": "2627365448",
+      "v1_shot_date": null,
+      "v2_shot_date": "2025-11-19 10:53:46",
+      "v2_date_added": "2025-11-19 10:34:12",
+      "verdict": "invalid"
+    },
+    {
+      "sequence_id": "2724422",
+      "city": "Yogyakarta",
+      "band": "release",
+      "seen_at": [
+        "Yogyakarta@-7.8033342,110.37552685"
+      ],
+      "device": "samsung SM-C710F",
+      "user_id": "31862",
+      "username": "puput-puspananda",
+      "projection": "PLANE",
+      "count_active_photos": 480,
+      "sequence_date_added": "2020-06-28 14:39:19",
+      "sampled_photo_id": "898312706",
+      "v1_shot_date": "2020-06-27 02:49:59.000",
+      "v2_shot_date": "2020-06-27 02:49:59.000",
+      "v2_date_added": "2020-06-28 14:39:23",
+      "verdict": "ok"
+    },
+    {
+      "sequence_id": "2724402",
+      "city": "Yogyakarta",
+      "band": "release",
+      "seen_at": [
+        "Yogyakarta@-7.8033342,110.37552685"
+      ],
+      "device": "samsung SM-C710F",
+      "user_id": "31862",
+      "username": "puput-puspananda",
+      "projection": "PLANE",
+      "count_active_photos": 403,
+      "sequence_date_added": "2020-06-28 14:28:00",
+      "sampled_photo_id": "898299394",
+      "v1_shot_date": "2020-06-27 02:26:46.000",
+      "v2_shot_date": "2020-06-27 02:26:46.000",
+      "v2_date_added": "2020-06-28 14:28:02",
+      "verdict": "ok"
+    },
+    {
+      "sequence_id": "11385433",
+      "city": "Yogyakarta",
+      "band": "release",
+      "seen_at": [
+        "Yogyakarta@-7.8033342,110.37552685"
+      ],
+      "device": "KartaCam2",
+      "user_id": "44",
+      "username": "OpenStreetView",
+      "projection": "SPHERE",
+      "count_active_photos": 1,
+      "sequence_date_added": "2025-06-12 09:20:38",
+      "sampled_photo_id": "2577425577",
+      "v1_shot_date": "2024-03-11 05:11:03.000",
+      "v2_shot_date": "2024-03-11 05:11:03.000",
+      "v2_date_added": "2025-06-12 09:20:45",
+      "verdict": "ok"
+    },
+    {
+      "sequence_id": "11385417",
+      "city": "Yogyakarta",
+      "band": "release",
+      "seen_at": [
+        "Yogyakarta@-7.8033342,110.37552685"
+      ],
+      "device": "KartaCam2",
+      "user_id": "44",
+      "username": "OpenStreetView",
+      "projection": "SPHERE",
+      "count_active_photos": 1,
+      "sequence_date_added": "2025-06-12 09:20:29",
+      "sampled_photo_id": "2577425561",
+      "v1_shot_date": "2024-03-11 05:10:59.000",
+      "v2_shot_date": "2024-03-11 05:10:59.000",
+      "v2_date_added": "2025-06-12 09:20:36",
+      "verdict": "ok"
+    },
+    {
+      "sequence_id": "11385401",
+      "city": "Yogyakarta",
+      "band": "release",
+      "seen_at": [
+        "Yogyakarta@-7.8033342,110.37552685"
+      ],
+      "device": "KartaCam2",
+      "user_id": "44",
+      "username": "OpenStreetView",
+      "projection": "SPHERE",
+      "count_active_photos": 1,
+      "sequence_date_added": "2025-06-12 09:20:21",
+      "sampled_photo_id": "2577425545",
+      "v1_shot_date": "2024-03-11 05:10:47.000",
+      "v2_shot_date": "2024-03-11 05:10:47.000",
+      "v2_date_added": "2025-06-12 09:20:27",
+      "verdict": "ok"
+    },
+    {
+      "sequence_id": "11385385",
+      "city": "Yogyakarta",
+      "band": "release",
+      "seen_at": [
+        "Yogyakarta@-7.8033342,110.37552685"
+      ],
+      "device": "KartaCam2",
+      "user_id": "44",
+      "username": "OpenStreetView",
+      "projection": "SPHERE",
+      "count_active_photos": 1,
+      "sequence_date_added": "2025-06-12 09:20:13",
+      "sampled_photo_id": "2577425529",
+      "v1_shot_date": "2024-03-11 05:10:22.000",
+      "v2_shot_date": "2024-03-11 05:10:22.000",
+      "v2_date_added": "2025-06-12 09:20:19",
+      "verdict": "ok"
+    },
+    {
+      "sequence_id": "11385369",
+      "city": "Yogyakarta",
+      "band": "release",
+      "seen_at": [
+        "Yogyakarta@-7.8033342,110.37552685"
+      ],
+      "device": "KartaCam2",
+      "user_id": "44",
+      "username": "OpenStreetView",
+      "projection": "SPHERE",
+      "count_active_photos": 1,
+      "sequence_date_added": "2025-06-12 09:20:04",
+      "sampled_photo_id": "2577425513",
+      "v1_shot_date": "2024-03-11 05:10:26.000",
+      "v2_shot_date": "2024-03-11 05:10:26.000",
+      "v2_date_added": "2025-06-12 09:20:11",
+      "verdict": "ok"
+    },
+    {
+      "sequence_id": "8071049",
+      "city": "Yogyakarta",
+      "band": "release",
+      "seen_at": [
+        "Yogyakarta@-7.8033342,110.37552685"
+      ],
+      "device": "GoPro Fusion",
+      "user_id": "44",
+      "username": "OpenStreetView",
+      "projection": "SPHERE",
+      "count_active_photos": 1,
+      "sequence_date_added": "2023-10-26 08:40:31",
+      "sampled_photo_id": "1832326537",
+      "v1_shot_date": "2019-10-21 04:29:08.000",
+      "v2_shot_date": "2019-10-21 04:29:08.000",
+      "v2_date_added": "2023-10-26 08:40:33",
+      "verdict": "ok"
+    },
+    {
+      "sequence_id": "2354906",
+      "city": "Yogyakarta",
+      "band": "release",
+      "seen_at": [
+        "Yogyakarta@-7.78,110.37"
+      ],
+      "device": "OPPO CPH1729",
+      "user_id": "33174",
+      "username": "dwi-heridani",
+      "projection": "PLANE",
+      "count_active_photos": 445,
+      "sequence_date_added": "2020-06-08 09:19:28",
+      "sampled_photo_id": "785618446",
+      "v1_shot_date": "2020-06-08 06:50:11.000",
+      "v2_shot_date": "2020-06-08 06:50:11.000",
+      "v2_date_added": "2020-06-08 09:20:37",
+      "verdict": "ok"
+    },
+    {
+      "sequence_id": "2715986",
+      "city": "Yogyakarta",
+      "band": "release",
+      "seen_at": [
+        "Yogyakarta@-7.78,110.37"
+      ],
+      "device": "Xiaomi Redmi Note 8",
+      "user_id": "31810",
+      "username": "eka-yus",
+      "projection": "PLANE",
+      "count_active_photos": 455,
+      "sequence_date_added": "2020-06-26 10:40:08",
+      "sampled_photo_id": "964366598",
+      "v1_shot_date": "2020-06-26 09:57:01.000",
+      "v2_shot_date": "2020-06-26 09:57:01.000",
+      "v2_date_added": "2020-07-03 20:56:02",
+      "verdict": "ok"
+    },
+    {
+      "sequence_id": "2385262",
+      "city": "Yogyakarta",
+      "band": "release",
+      "seen_at": [
+        "Yogyakarta@-7.78,110.37"
+      ],
+      "device": "Xiaomi MI MAX",
+      "user_id": "32598",
+      "username": "irwan-widhiatmoko",
+      "projection": "PLANE",
+      "count_active_photos": 504,
+      "sequence_date_added": "2020-06-13 14:13:18",
+      "sampled_photo_id": "807397970",
+      "v1_shot_date": "2020-06-13 09:45:01.000",
+      "v2_shot_date": "2020-06-13 09:45:01.000",
+      "v2_date_added": "2020-06-13 14:13:27",
+      "verdict": "ok"
+    },
+    {
+      "sequence_id": "2388894",
+      "city": "Yogyakarta",
+      "band": "release",
+      "seen_at": [
+        "Yogyakarta@-7.78,110.37"
+      ],
+      "device": "Xiaomi MI MAX",
+      "user_id": "32598",
+      "username": "irwan-widhiatmoko",
+      "projection": "PLANE",
+      "count_active_photos": 279,
+      "sequence_date_added": "2020-06-14 10:41:24",
+      "sampled_photo_id": "809579370",
+      "v1_shot_date": "2020-06-14 06:47:37.000",
+      "v2_shot_date": "2020-06-14 06:47:37.000",
+      "v2_date_added": "2020-06-14 10:42:27",
+      "verdict": "ok"
+    },
+    {
+      "sequence_id": "2353434",
+      "city": "Yogyakarta",
+      "band": "release",
+      "seen_at": [
+        "Yogyakarta@-7.78,110.37"
+      ],
+      "device": "Xiaomi Redmi 8",
+      "user_id": "31810",
+      "username": "eka-yus",
+      "projection": "PLANE",
+      "count_active_photos": 193,
+      "sequence_date_added": "2020-06-08 03:43:46",
+      "sampled_photo_id": "784654602",
+      "v1_shot_date": "2020-06-08 03:28:40.000",
+      "v2_shot_date": "2020-06-08 03:28:40.000",
+      "v2_date_added": "2020-06-08 03:46:23",
+      "verdict": "ok"
+    },
+    {
+      "sequence_id": "2400606",
+      "city": "Yogyakarta",
+      "band": "release",
+      "seen_at": [
+        "Yogyakarta@-7.78,110.37"
+      ],
+      "device": "OPPO CPH1729",
+      "user_id": "31846",
+      "username": "suhar-yanto",
+      "projection": "PLANE",
+      "count_active_photos": 227,
+      "sequence_date_added": "2020-06-16 13:03:39",
+      "sampled_photo_id": "818180102",
+      "v1_shot_date": "2020-06-15 08:07:53.000",
+      "v2_shot_date": "2020-06-15 08:07:53.000",
+      "v2_date_added": "2020-06-16 13:04:43",
+      "verdict": "ok"
+    },
+    {
+      "sequence_id": "11352489",
+      "city": "Yogyakarta",
+      "band": "release",
+      "seen_at": [
+        "Yogyakarta@-7.78,110.37"
+      ],
+      "device": "KartaCam360LiteV1",
+      "user_id": "44",
+      "username": "OpenStreetView",
+      "projection": "SPHERE",
+      "count_active_photos": 1,
+      "sequence_date_added": "2025-06-06 09:20:31",
+      "sampled_photo_id": "2573949513",
+      "v1_shot_date": "2022-07-22 02:47:21.000",
+      "v2_shot_date": "2022-07-22 02:47:21.000",
+      "v2_date_added": "2025-06-06 09:20:39",
+      "verdict": "ok"
+    },
+    {
+      "sequence_id": "11352473",
+      "city": "Yogyakarta",
+      "band": "release",
+      "seen_at": [
+        "Yogyakarta@-7.78,110.37"
+      ],
+      "device": "KartaCam360LiteV1",
+      "user_id": "44",
+      "username": "OpenStreetView",
+      "projection": "SPHERE",
+      "count_active_photos": 1,
+      "sequence_date_added": "2025-06-06 09:20:22",
+      "sampled_photo_id": "2573949497",
+      "v1_shot_date": "2022-07-22 02:47:02.000",
+      "v2_shot_date": "2022-07-22 02:47:02.000",
+      "v2_date_added": "2025-06-06 09:20:29",
+      "verdict": "ok"
+    },
+    {
+      "sequence_id": "11616157",
+      "city": "Langkawi",
+      "band": "release",
+      "seen_at": [
+        "Langkawi@6.32,99.85"
+      ],
+      "device": "KartaCam2",
+      "user_id": "44",
+      "username": "OpenStreetView",
+      "projection": "SPHERE",
+      "count_active_photos": 41,
+      "sequence_date_added": "2025-11-19 11:18:22",
+      "sampled_photo_id": "2627370771",
+      "v1_shot_date": null,
+      "v2_shot_date": "2025-11-19 11:18:29",
+      "v2_date_added": "2025-11-19 11:18:29",
+      "verdict": "invalid"
+    },
+    {
+      "sequence_id": "10629513",
+      "city": "Langkawi",
+      "band": "release",
+      "seen_at": [
+        "Langkawi@6.32,99.85"
+      ],
+      "device": "KartaCam360LiteV1",
+      "user_id": "44",
+      "username": "OpenStreetView",
+      "projection": "SPHERE",
+      "count_active_photos": 1,
+      "sequence_date_added": "2025-03-13 13:30:32",
+      "sampled_photo_id": "2546303881",
+      "v1_shot_date": "2023-11-16 09:34:31.000",
+      "v2_shot_date": "2023-11-16 09:34:31.000",
+      "v2_date_added": "2025-03-13 13:30:55",
+      "verdict": "ok"
+    },
+    {
+      "sequence_id": "10629481",
+      "city": "Langkawi",
+      "band": "release",
+      "seen_at": [
+        "Langkawi@6.32,99.85"
+      ],
+      "device": "KartaCam360LiteV1",
+      "user_id": "44",
+      "username": "OpenStreetView",
+      "projection": "SPHERE",
+      "count_active_photos": 1,
+      "sequence_date_added": "2025-03-13 13:30:12",
+      "sampled_photo_id": "2546303849",
+      "v1_shot_date": "2023-11-16 09:34:15.000",
+      "v2_shot_date": "2023-11-16 09:34:15.000",
+      "v2_date_added": "2025-03-13 13:30:20",
+      "verdict": "ok"
+    },
+    {
+      "sequence_id": "1929037",
+      "city": "Langkawi",
+      "band": "release",
+      "seen_at": [
+        "Langkawi@6.335,99.728"
+      ],
+      "device": "iPhone10,5",
+      "user_id": "2",
+      "username": "AlexIlisei",
+      "projection": "PLANE",
+      "count_active_photos": 102,
+      "sequence_date_added": "2019-08-01 16:59:10",
+      "sampled_photo_id": "472160929",
+      "v1_shot_date": "2019-07-21 06:03:36.000",
+      "v2_shot_date": "2019-07-21 06:03:36.000",
+      "v2_date_added": "2019-08-01 14:59:11",
+      "verdict": "ok"
+    },
+    {
+      "sequence_id": "8343753",
+      "city": "Singapore",
+      "band": "grab-market",
+      "seen_at": [
+        "Singapore@1.283,103.86"
+      ],
+      "device": "KartaCam360LiteV1",
+      "user_id": "44",
+      "username": "OpenStreetView",
+      "projection": "SPHERE",
+      "count_active_photos": 8940,
+      "sequence_date_added": "2023-12-06 14:47:20",
+      "sampled_photo_id": "1881621001",
+      "v1_shot_date": "2023-07-25 03:06:49.000",
+      "v2_shot_date": "2023-07-25 03:06:49.000",
+      "v2_date_added": "2023-12-06 15:46:11",
+      "verdict": "ok"
+    },
+    {
+      "sequence_id": "8358329",
+      "city": "Singapore",
+      "band": "grab-market",
+      "seen_at": [
+        "Singapore@1.283,103.86"
+      ],
+      "device": "KartaCam360LiteV1",
+      "user_id": "44",
+      "username": "OpenStreetView",
+      "projection": "SPHERE",
+      "count_active_photos": 8564,
+      "sequence_date_added": "2023-12-08 15:14:25",
+      "sampled_photo_id": "1887896841",
+      "v1_shot_date": "2023-07-21 06:03:13.000",
+      "v2_shot_date": "2023-07-21 06:03:13.000",
+      "v2_date_added": "2023-12-08 16:41:33",
+      "verdict": "ok"
+    },
+    {
+      "sequence_id": "11604901",
+      "city": "Bangkok",
+      "band": "grab-market",
+      "seen_at": [
+        "Bangkok@13.7563,100.5018"
+      ],
+      "device": "realme RMX3363",
+      "user_id": "221721",
+      "username": "koki2529",
+      "projection": "PLANE",
+      "count_active_photos": 5589,
+      "sequence_date_added": "2025-09-13 18:43:10",
+      "sampled_photo_id": "2625712384",
+      "v1_shot_date": "2025-09-13 14:50:18.000",
+      "v2_shot_date": "2025-09-13 14:50:18.000",
+      "v2_date_added": "2025-09-13 18:43:56",
+      "verdict": "ok"
+    },
+    {
+      "sequence_id": "11611599",
+      "city": "Bangkok",
+      "band": "grab-market",
+      "seen_at": [
+        "Bangkok@13.7563,100.5018"
+      ],
+      "device": "realme RMX3363",
+      "user_id": "221721",
+      "username": "koki2529",
+      "projection": "PLANE",
+      "count_active_photos": 8228,
+      "sequence_date_added": "2025-10-02 10:41:56",
+      "sampled_photo_id": "2626229760",
+      "v1_shot_date": "2025-10-02 05:25:29.000",
+      "v2_shot_date": "2025-10-02 05:25:29.000",
+      "v2_date_added": "2025-10-02 10:42:50",
+      "verdict": "ok"
+    },
+    {
+      "sequence_id": "11659301",
+      "city": "Bangkok",
+      "band": "grab-market",
+      "seen_at": [
+        "Bangkok@13.7563,100.5018"
+      ],
+      "device": "vivo vivo 1906",
+      "user_id": "253865",
+      "username": "heart-tachote",
+      "projection": "PLANE",
+      "count_active_photos": 32,
+      "sequence_date_added": "2026-06-01 08:02:02",
+      "sampled_photo_id": "2630007770",
+      "v1_shot_date": "2026-06-01 02:13:19.000",
+      "v2_shot_date": "2026-06-01 02:13:19.000",
+      "v2_date_added": "2026-06-01 08:02:03",
+      "verdict": "ok"
+    },
+    {
+      "sequence_id": "11689870",
+      "city": "Bangkok",
+      "band": "grab-market",
+      "seen_at": [
+        "Bangkok@13.7563,100.5018"
+      ],
+      "device": "vivo vivo 1906",
+      "user_id": "253865",
+      "username": "heart-tachote",
+      "projection": "PLANE",
+      "count_active_photos": 19,
+      "sequence_date_added": "2026-08-12 15:58:16",
+      "sampled_photo_id": "2632419594",
+      "v1_shot_date": "2026-08-12 02:21:31.000",
+      "v2_shot_date": "2026-08-12 02:21:31.000",
+      "v2_date_added": "2026-08-12 15:58:29",
+      "verdict": "ok"
+    },
+    {
+      "sequence_id": "11659303",
+      "city": "Bangkok",
+      "band": "grab-market",
+      "seen_at": [
+        "Bangkok@13.7563,100.5018"
+      ],
+      "device": "vivo vivo 1906",
+      "user_id": "253865",
+      "username": "heart-tachote",
+      "projection": "PLANE",
+      "count_active_photos": 36,
+      "sequence_date_added": "2026-06-01 08:06:56",
+      "sampled_photo_id": "2630007808",
+      "v1_shot_date": "2026-06-01 02:16:03.000",
+      "v2_shot_date": "2026-06-01 02:16:03.000",
+      "v2_date_added": "2026-06-01 08:06:56",
+      "verdict": "ok"
+    },
+    {
+      "sequence_id": "11615914",
+      "city": "Bangkok",
+      "band": "grab-market",
+      "seen_at": [
+        "Bangkok@13.7563,100.5018"
+      ],
+      "device": "realme RMX3363",
+      "user_id": "221721",
+      "username": "koki2529",
+      "projection": "PLANE",
+      "count_active_photos": 8086,
+      "sequence_date_added": "2025-11-17 13:55:02",
+      "sampled_photo_id": "2627331638",
+      "v1_shot_date": "2025-11-17 07:15:57.000",
+      "v2_shot_date": "2025-11-17 07:15:57.000",
+      "v2_date_added": "2025-11-17 13:55:38",
+      "verdict": "ok"
+    },
+    {
+      "sequence_id": "9031433",
+      "city": "Ho Chi Minh City",
+      "band": "grab-market",
+      "seen_at": [
+        "Ho Chi Minh City@10.7769,106.7009"
+      ],
+      "device": "iPhone8,1",
+      "user_id": "53705",
+      "username": "chicharito-phung",
+      "projection": "PLANE",
+      "count_active_photos": 1000,
+      "sequence_date_added": "2024-06-12 15:48:48",
+      "sampled_photo_id": "1973754633",
+      "v1_shot_date": "2024-06-12 10:19:27.000",
+      "v2_shot_date": "2024-06-12 10:19:27.000",
+      "v2_date_added": "2024-06-12 15:49:26",
+      "verdict": "ok"
+    },
+    {
+      "sequence_id": "11692957",
+      "city": "Ho Chi Minh City",
+      "band": "grab-market",
+      "seen_at": [
+        "Ho Chi Minh City@10.7769,106.7009"
+      ],
+      "device": "KartaCam2",
+      "user_id": "44",
+      "username": "OpenStreetView",
+      "projection": "SPHERE",
+      "count_active_photos": 1,
+      "sequence_date_added": "2026-08-17 14:30:55",
+      "sampled_photo_id": "2632517284",
+      "v1_shot_date": "2026-05-18 04:07:45.000",
+      "v2_shot_date": "2026-05-18 04:07:45.000",
+      "v2_date_added": "2026-08-17 14:31:00",
+      "verdict": "ok"
+    },
+    {
+      "sequence_id": "11692956",
+      "city": "Ho Chi Minh City",
+      "band": "grab-market",
+      "seen_at": [
+        "Ho Chi Minh City@10.7769,106.7009"
+      ],
+      "device": "KartaCam2",
+      "user_id": "44",
+      "username": "OpenStreetView",
+      "projection": "SPHERE",
+      "count_active_photos": 1,
+      "sequence_date_added": "2026-08-17 14:30:47",
+      "sampled_photo_id": "2632517283",
+      "v1_shot_date": "2026-05-18 04:07:25.000",
+      "v2_shot_date": "2026-05-18 04:07:25.000",
+      "v2_date_added": "2026-08-17 14:30:52",
+      "verdict": "ok"
+    },
+    {
+      "sequence_id": "11692955",
+      "city": "Ho Chi Minh City",
+      "band": "grab-market",
+      "seen_at": [
+        "Ho Chi Minh City@10.7769,106.7009"
+      ],
+      "device": "KartaCam2",
+      "user_id": "44",
+      "username": "OpenStreetView",
+      "projection": "SPHERE",
+      "count_active_photos": 1,
+      "sequence_date_added": "2026-08-17 14:30:41",
+      "sampled_photo_id": "2632517282",
+      "v1_shot_date": "2026-05-18 04:08:25.000",
+      "v2_shot_date": "2026-05-18 04:08:25.000",
+      "v2_date_added": "2026-08-17 14:30:45",
+      "verdict": "ok"
+    },
+    {
+      "sequence_id": "11692954",
+      "city": "Ho Chi Minh City",
+      "band": "grab-market",
+      "seen_at": [
+        "Ho Chi Minh City@10.7769,106.7009"
+      ],
+      "device": "KartaCam2",
+      "user_id": "44",
+      "username": "OpenStreetView",
+      "projection": "SPHERE",
+      "count_active_photos": 1,
+      "sequence_date_added": "2026-08-17 14:30:33",
+      "sampled_photo_id": "2632517281",
+      "v1_shot_date": "2026-05-18 04:08:36.000",
+      "v2_shot_date": "2026-05-18 04:08:36.000",
+      "v2_date_added": "2026-08-17 14:30:38",
+      "verdict": "ok"
+    },
+    {
+      "sequence_id": "11692953",
+      "city": "Ho Chi Minh City",
+      "band": "grab-market",
+      "seen_at": [
+        "Ho Chi Minh City@10.7769,106.7009"
+      ],
+      "device": "KartaCam2",
+      "user_id": "44",
+      "username": "OpenStreetView",
+      "projection": "SPHERE",
+      "count_active_photos": 1,
+      "sequence_date_added": "2026-08-17 14:30:26",
+      "sampled_photo_id": "2632517280",
+      "v1_shot_date": "2026-05-18 04:07:15.000",
+      "v2_shot_date": "2026-05-18 04:07:15.000",
+      "v2_date_added": "2026-08-17 14:30:31",
+      "verdict": "ok"
+    },
+    {
+      "sequence_id": "11692952",
+      "city": "Ho Chi Minh City",
+      "band": "grab-market",
+      "seen_at": [
+        "Ho Chi Minh City@10.7769,106.7009"
+      ],
+      "device": "KartaCam2",
+      "user_id": "44",
+      "username": "OpenStreetView",
+      "projection": "SPHERE",
+      "count_active_photos": 1,
+      "sequence_date_added": "2026-08-17 14:30:20",
+      "sampled_photo_id": "2632517279",
+      "v1_shot_date": "2026-05-18 04:07:20.000",
+      "v2_shot_date": "2026-05-18 04:07:20.000",
+      "v2_date_added": "2026-08-17 14:30:25",
+      "verdict": "ok"
+    },
+    {
+      "sequence_id": "11692951",
+      "city": "Ho Chi Minh City",
+      "band": "grab-market",
+      "seen_at": [
+        "Ho Chi Minh City@10.7769,106.7009"
+      ],
+      "device": "KartaCam2",
+      "user_id": "44",
+      "username": "OpenStreetView",
+      "projection": "SPHERE",
+      "count_active_photos": 1,
+      "sequence_date_added": "2026-08-17 14:30:13",
+      "sampled_photo_id": "2632517278",
+      "v1_shot_date": "2026-05-18 04:08:45.000",
+      "v2_shot_date": "2026-05-18 04:08:45.000",
+      "v2_date_added": "2026-08-17 14:30:18",
+      "verdict": "ok"
+    },
+    {
+      "sequence_id": "11606856",
+      "city": "Seattle",
+      "band": "community-control",
+      "seen_at": [
+        "Seattle@47.6097,-122.3331"
+      ],
+      "device": "GoPro Max",
+      "user_id": "247577",
+      "username": "lowestpotential",
+      "projection": "SPHERE",
+      "count_active_photos": 2346,
+      "sequence_date_added": "2025-09-20 21:07:05",
+      "sampled_photo_id": "2625911808",
+      "v1_shot_date": "2025-09-01 17:58:17.000",
+      "v2_shot_date": "2025-09-01 17:58:17.000",
+      "v2_date_added": "2025-09-20 21:09:19",
+      "verdict": "ok"
+    },
+    {
+      "sequence_id": "10140585",
+      "city": "Seattle",
+      "band": "community-control",
+      "seen_at": [
+        "Seattle@47.6097,-122.3331"
+      ],
+      "device": "iPhone15,3",
+      "user_id": "570",
+      "username": "Nick_T",
+      "projection": "PLANE",
+      "count_active_photos": 2244,
+      "sequence_date_added": "2024-11-11 14:08:17",
+      "sampled_photo_id": "2498545161",
+      "v1_shot_date": "2024-11-06 16:22:35.000",
+      "v2_shot_date": "2024-11-06 16:22:35.000",
+      "v2_date_added": "2024-11-11 14:08:23",
+      "verdict": "ok"
+    }
+  ]
+}
