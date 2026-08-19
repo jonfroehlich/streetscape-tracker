@@ -595,6 +595,13 @@ _MIN_CLAMPED_TIMEOUT_S = 300
 # early exits (day cap, deadline, SIGTERM) because it must still fail the run:
 # the batch publishes what it collected, but the night is not healthy.
 _STOP_REASON_ERROR = "unexpected error in the city loop"
+# Stop reason for an operator-requested wind-down. A named constant rather than a
+# literal because there are now TWO assignment sites in _run_city_loop — between
+# cities and after a city's channels (issue #206) — and a drifted spelling would
+# be invisible. Unlike _STOP_REASON_ERROR this value is never *compared* against;
+# it is benign, so the night still publishes and exits 0. Keep it a constant
+# anyway: the pair of assignment sites is the reason, not the comparison.
+_STOP_REASON_SIGTERM = "received SIGTERM"
 
 # Exit status for a bad `run-due` argument (issue #214). This is `sysexits.h`'s
 # EX_USAGE, and unlike HOST_BUSY_EXIT_CODES (79/80, deliberately past the end of
@@ -629,12 +636,20 @@ def _stop_on_sigterm():
     TimeoutStopSec). Under the default handler that lands wherever the loop
     happens to be, so the night's aggregate/manifest/publish tail never runs and
     everything already collected stays unpublished (issue #167). Here it just
-    sets a flag the city loop checks between cities, letting the batch wind down
-    and still publish.
+    sets a flag, letting the batch wind down and still publish. The flag is
+    checked at BOTH levels — between cities in ``_run_city_loop`` and between a
+    city's channels in ``_run_city_channels``, which takes it as its required
+    ``stop_requested`` argument. Only the outer check existed until issue #206,
+    so a stop still launched every remaining channel of the in-flight city.
 
     Because the unit's default KillMode is control-group, the SIGTERM also
     reaches the running child, so the in-flight ``subprocess.run`` returns
-    promptly rather than holding the loop for the rest of its timeout.
+    promptly rather than holding the loop for the rest of its timeout. That
+    child is then NOT recorded as the city's failure — see ``_run_city_channels``
+    — since it is one we killed on purpose.
+
+    The unit must also set ``TimeoutStopSec`` (30min) for any of this to be
+    reachable: systemd's 90-second default expires long before the tail can run.
 
     Yields an ``Event`` that is set once SIGTERM has been seen. Restores the
     previous handler on exit, and no-ops off the main thread (signal handlers
@@ -830,6 +845,15 @@ def _publish(cfg: SchedulerConfig, context: str, alert_on_failure: bool = True) 
     logger.info(f"Publishing via {' '.join(cmd[1:])}")
     os.makedirs(cfg.log_dir, exist_ok=True)
     log_path = Path(cfg.log_dir) / f"publish_{date.today().isoformat()}.log"
+    # Time the rsync. It is the publish tail's largest component (~6,300 files)
+    # and was its only UNMEASURED one: everything else in the tail is either
+    # bounded in code (catalog_backup.BACKUP_TIMEOUT_S) or already visible in the
+    # log's timestamps. The tail is exactly what the unit's TimeoutStopSec has to
+    # cover when `systemctl stop` winds a night down, so this line is what any
+    # future re-sizing of that number should be argued from (issue #206).
+    # Monotonic rather than wall clock: an NTP step must not be able to report a
+    # negative publish.
+    started = time.monotonic()
     try:
         # Append, not truncate: a night can publish more than once (a manual
         # regenerate-aggregate after the batch), and the earlier attempt is
@@ -851,8 +875,16 @@ def _publish(cfg: SchedulerConfig, context: str, alert_on_failure: bool = True) 
         logger.error(f"Could not open {log_path} for the publish script: {e}")
         return 1
 
+    elapsed = time.monotonic() - started
     if result.returncode != 0:
-        logger.error(f"Publish script failed (exit {result.returncode}); output in {log_path}")
+        # Elapsed on the failure line too: a publish that failed in 2 s (bad
+        # path, auth) is a different incident from one that failed at 25 minutes
+        # (a stalled NFS transfer), and the message alone could not tell them
+        # apart.
+        logger.error(
+            f"Publish script failed (exit {result.returncode}) after {elapsed:.1f} s; "
+            f"output in {log_path}"
+        )
         if alert_on_failure:
             tail = _tail_lines(log_path, _CHILD_LOG_TAIL_LINES)
             send_alert(
@@ -862,6 +894,9 @@ def _publish(cfg: SchedulerConfig, context: str, alert_on_failure: bool = True) 
                 f"--- last {_CHILD_LOG_TAIL_LINES} lines of {log_path.name} ---\n{tail}\n\n"
                 f"Recent log:\n{_recent_log_tail(cfg)}",
             )
+        return result.returncode
+
+    logger.info(f"Published in {elapsed:.1f} s")
     return result.returncode
 
 
@@ -1739,6 +1774,13 @@ def cmd_assess_city(
         # No batch deadline: an operator run has nothing queued behind it, and
         # each child still carries its own derived per-city timeout.
         batch_deadline=None,
+        # No stop signal either: this runs in an operator's foreground shell,
+        # not under a supervisor that stops units, and a foreground command is
+        # interrupted with Ctrl-C (SIGINT) rather than SIGTERM. There is also no
+        # batch behind this city to wind down — the tail below already runs on a
+        # partial failure. Passed explicitly because the parameter has no
+        # default: see _run_city_channels' docstring (issue #206).
+        stop_requested=None,
         # A manual probe must not be able to quarantine a city.
         record_failures=False,
     )
@@ -2664,6 +2706,34 @@ def cmd_run_due(
     )
 
 
+def _log_stop_declined(city_id: str, declined: list[str]) -> None:
+    """Name the channels a wind-down is choosing not to start (issue #206).
+
+    Shared by BOTH of ``_run_city_channels``' stop exits, because the one an
+    operator actually hits is not the one that reads like the main path. The
+    unit's ``KillMode`` defaults to control-group, so a ``systemctl stop``
+    reaches the in-flight child too: it dies first, and the loop therefore
+    leaves via the killed-child branch and never comes back around to the
+    top-of-loop check. While this message lived only at the top of the loop, a
+    real stop named no declined channel at all — and with Mapillary enabled
+    those are exactly the ones that would otherwise have fired into a live
+    per-IP tile block (#205), i.e. usually the thing the operator typing
+    ``stop`` was trying to prevent. Duplicating the wording at both exits would
+    have re-opened the same gap on the next edit, so it lives here once.
+
+    Silent when there is nothing left to decline (a stop landing on a city's
+    last channel), so the log can never claim a wind-down skipped work that did
+    not exist.
+    """
+    if not declined:
+        return
+    logger.info(
+        f"{city_id}: stop requested — not starting {', '.join(declined)}. "
+        f"Not counted as failures; these channels keep their cadence and lead "
+        f"the next batch's queue."
+    )
+
+
 def _run_city_channels(
     cfg: SchedulerConfig,
     conn,
@@ -2674,18 +2744,20 @@ def _run_city_channels(
     blocked_hosts: set[str],
     busy_hosts: Counter[str],
     batch_deadline: float | None,
+    stop_requested: threading.Event | None,
     record_failures: bool = True,
 ) -> tuple[int, int, int]:
     """
     Collect one city on each of ``providers``, in order, with every guard the
     nightly batch applies: the per-IP host breaker, both daily-budget checks,
-    the resource guard, orphan salvage, and cadence bookkeeping.
+    the resource guard, the stop signal, orphan salvage, and cadence
+    bookkeeping.
 
     Split out of ``_run_city_loop`` so the on-demand single-city path
     (``assess-city``, issue #215) inherits all of it rather than reimplementing
     a simplified — i.e. eventually divergent — copy. ``_run_city_loop`` keeps
-    what is genuinely about a *batch*: the city cap, the SIGTERM wind-down, the
-    deadline, and the inter-city sleep.
+    what is genuinely about a *batch*: the city cap, the deadline, and the
+    inter-city sleep.
 
     ``blocked_hosts`` and ``busy_hosts`` are owned by the caller and mutated in
     place, because the breaker's scope is the whole run, not one city: a host
@@ -2700,6 +2772,15 @@ def _run_city_channels(
     doesn't (issue #214): a caller that silently inherited "no deadline" would
     lose the guard that keeps a night from being SIGKILLed before it publishes.
 
+    ``stop_requested`` is the wind-down flag from ``_stop_on_sigterm``, and has
+    no default for exactly the same reason: a caller that silently inherited
+    "nothing can stop this" would look correct until someone typed
+    ``systemctl stop``, which is the one moment it matters (issue #206). ``None``
+    means no supervisor can ask this run to stop — right for an operator's
+    foreground command, wrong for a batch. It is named for the *contract* rather
+    than the mechanism so ``None`` reads as "nothing can ask us to stop" rather
+    than "we don't know whether SIGTERM was seen".
+
     ``record_failures=False`` records a success but never a failure. Manual runs
     use it because ``get_due_cities`` filters on ``consecutive_failures <
     max_consecutive_failures`` and nothing resets that counter except a success —
@@ -2713,7 +2794,23 @@ def _run_city_channels(
     should not count against the city cap or earn an inter-city sleep.
     """
     attempted = succeeded = skipped_budget = 0
-    for provider in providers:
+    for i, provider in enumerate(providers):
+        # A stop was requested (systemd's SIGTERM) while this city was in
+        # flight. BREAK, not continue: every other guard in this loop is a
+        # property of one CHANNEL — this host refused us, this channel's budget
+        # is spent — so a later channel can still answer differently. A stop is
+        # a property of the PROCESS, so none of them can. It sits FIRST, above
+        # the blocked-host guard, for that guard's own stated reason: there is
+        # no point pricing work we already know we will not do.
+        #
+        # This is NOT the exit a real `systemctl stop` usually takes — see
+        # _log_stop_declined, which both exits share. It fires when the stop
+        # lands in a gap between children (the budget queries, the resource
+        # guard) or when a child finished before the signal reached it.
+        if stop_requested is not None and stop_requested.is_set():
+            _log_stop_declined(city.city_id, providers[i:])
+            break
+
         # A host this channel needs already refused us during this run. Skip
         # (not break) for the same reason the budget guard skips: the other
         # channels of this and later cities are still worth running.
@@ -2833,7 +2930,6 @@ def _run_city_channels(
             )
             continue
 
-        attempted += 1
         ok = bool(ok)
         # A subprocess can report failure yet still have done the expensive,
         # budgeted part of its job; salvage that rather than re-spending the
@@ -2846,6 +2942,39 @@ def _run_city_channels(
                 ok = _reconcile_orphaned_walk(conn, cfg, city, provider, today)
             else:
                 ok = _reconcile_orphaned_run(conn, cfg, city, provider, today)
+
+        # This child died of the SIGTERM that is stopping US. The unit's default
+        # KillMode is control-group, so a `systemctl stop` reaches the whole
+        # cgroup — the 2026-08-13 log shows the in-flight child as "exited -15",
+        # which is in neither HOST_BY_EXIT_CODE nor HOST_BY_BUSY_EXIT_CODE and
+        # therefore reads as an ordinary collection failure. Charging it to the
+        # city would be wrong twice over, and both are the argument the blocked-
+        # and busy-host branches above already make: it burns one of five
+        # `consecutive_failures` that ONLY a success ever resets, and it makes
+        # attempted > succeeded, so every deliberate stop would email a failure
+        # alert and end the unit red (issue #206).
+        #
+        # Deliberately AFTER salvage, so anything the child actually finished
+        # and left on disk is still cataloged — and BEFORE `attempted += 1`, so
+        # a channel we killed is not counted as attempted at all, matching how
+        # the two host branches `continue` before that same line.
+        #
+        # A child that failed for its own reasons AND was still running when the
+        # stop arrived is credited to the stop. That is the safe direction and
+        # the same call the busy-lock branch makes.
+        if not ok and stop_requested is not None and stop_requested.is_set():
+            logger.warning(
+                f"{city.city_id} [{provider}]: child was killed by the stop "
+                f"signal ({reason}) — not counted as a failure for this city."
+            )
+            # `i + 1`, not `i`: this channel WAS started, and the line above
+            # already accounts for it. Everything after it is what the stop
+            # declines, and this is the exit that actually reaches an operator's
+            # log — see _log_stop_declined.
+            _log_stop_declined(city.city_id, providers[i + 1 :])
+            break
+
+        attempted += 1
         if ok:
             succeeded += 1
             db.record_attempt(conn, city.city_id, success=True, provider=provider)
@@ -2870,10 +2999,14 @@ def _run_city_loop(
     due: list,
     providers_for_city: dict[str, list[str]],
     batch_deadline: float,
-    sigterm_seen,
+    sigterm_seen: threading.Event,
     max_cities: int,
 ) -> tuple[int, int, int, int, str | None, set[str], Counter[str]]:
     """Collect due cities until the city cap, the batch deadline, or SIGTERM.
+
+    ``sigterm_seen`` is both checked here (between cities) and forwarded to
+    ``_run_city_channels`` as ``stop_requested`` (between a city's channels), so
+    a stop cannot launch the rest of the in-flight city's work — issue #206.
 
     ``max_cities`` is ``cfg.max_cities_per_day`` on a nightly run and an explicit
     ``--limit`` on an on-demand catch-up (issue #214). Required rather than
@@ -2913,7 +3046,7 @@ def _run_city_loop(
                 stop_reason = f"city cap reached ({max_cities})"
                 break
             if sigterm_seen.is_set():
-                stop_reason = "received SIGTERM"
+                stop_reason = _STOP_REASON_SIGTERM
                 break
             remaining_s = batch_deadline - time.monotonic()
             if remaining_s <= _MIN_CLAMPED_TIMEOUT_S:
@@ -2932,6 +3065,7 @@ def _run_city_loop(
                 blocked_hosts=blocked_hosts,
                 busy_hosts=busy_hosts,
                 batch_deadline=batch_deadline,
+                stop_requested=sigterm_seen,
             )
             attempted += city_attempted
             succeeded += city_succeeded
@@ -2939,13 +3073,27 @@ def _run_city_loop(
 
             if city_attempted:
                 processed += 1
-                # Pause only when another city is actually going to be started.
-                # `due` is the full candidate list (cmd_run_due deliberately does
-                # not pre-truncate it to --limit), so gating on `len(due)` alone
-                # would add a trailing sleep_between_cities_s to every capped run
-                # — including `--limit 1`, the one-city smoke test.
-                if processed < min(len(due), max_cities):
-                    time.sleep(cfg.sleep_between_cities_s)
+
+            # Re-check HERE, not only at the top of the next iteration. Two
+            # things sit in between, and a stop has to survive both (issue #206):
+            # the inter-city sleep below, which would spend a full minute of a
+            # stop window whose entire purpose is the publish tail — and worse,
+            # PEP 475 makes time.sleep RESUME after the handler runs rather than
+            # returning early, so the flag is set and ignored for the whole
+            # interval; and, on the LAST due city, nothing at all, so the `for`
+            # would simply end and the night would summarize as complete while
+            # that city's remaining channels went uncollected.
+            if sigterm_seen.is_set():
+                stop_reason = _STOP_REASON_SIGTERM
+                break
+
+            # Pause only when another city is actually going to be started.
+            # `due` is the full candidate list (cmd_run_due deliberately does
+            # not pre-truncate it to --limit), so gating on `len(due)` alone
+            # would add a trailing sleep_between_cities_s to every capped run
+            # — including `--limit 1`, the one-city smoke test.
+            if city_attempted and processed < min(len(due), max_cities):
+                time.sleep(cfg.sleep_between_cities_s)
     except Exception:
         # One city's unexpected error must not cost the night its publish:
         # everything collected so far is already committed to the catalog but
