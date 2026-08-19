@@ -473,11 +473,14 @@ function updateLegend(years) {
   }
 
   // ── Section 3b: Flat-only imagery toggle (issue #116) ─────
-  // Mapillary runs can cover a grid point with flat imagery but no 360° pano
+  // A census run can cover a grid point with flat imagery but no 360° pano
   // (a FLAT_ONLY row). Those markers are off by default; this reveals them so
   // any-imagery coverage is visible alongside the pano layer. Shown only when
-  // the run actually has flat-only points.
-  if (providerGlobal === "mapillary" && flatOnlyMarkers.length > 0) {
+  // the run actually has flat-only points -- which is the whole condition. The
+  // provider test that used to sit beside it was redundant (only a provider
+  // emitting FLAT_ONLY rows can have any) AND wrong for a third one: the
+  // markers were parsed and built, and then had no way to be shown.
+  if (flatOnlyMarkers.length > 0) {
     html += `
       <div class="legend-divider"></div>
       <div class="legend-year-header">Any imagery</div>

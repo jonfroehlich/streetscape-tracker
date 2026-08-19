@@ -54,6 +54,8 @@ const PROVIDERS = {
     viewerLabel: "View in Google Street View",
     viewerUrl: (panoId) =>
       `https://www.google.com/maps/@?api=1&map_action=pano&pano=${encodeURIComponent(panoId)}`,
+    hasCopyrightFilter: true,
+    hasFlatImagery: false,
   },
   mapillary: {
     label: "Mapillary",
@@ -65,8 +67,24 @@ const PROVIDERS = {
     viewerLabel: "View in Mapillary",
     viewerUrl: (panoId) =>
       `https://www.mapillary.com/app/?pKey=${encodeURIComponent(panoId)}`,
+    hasCopyrightFilter: false,
+    hasFlatImagery: true,
   },
 };
+
+/**
+ * Fallback floor for a provider that is not in the registry.
+ *
+ * Deliberately the LOOSEST floor any provider declares, computed rather than
+ * spelled as one provider's name: `?? PROVIDERS.mapillary.earliestPlausibleCapture`
+ * reads as "Mapillary is special" when what is meant is "when in doubt, drop
+ * as little as possible". A too-tight fallback silently deletes real imagery
+ * from the map; a too-loose one shows a handful of bad dates, which is the
+ * cheaper error.
+ */
+const LOOSEST_EARLIEST_PLAUSIBLE_CAPTURE = new Date(
+  Math.min(...Object.values(PROVIDERS).map((p) => p.earliestPlausibleCapture.getTime()))
+);
 
 const MS_PER_YEAR = 1000 * 60 * 60 * 24 * 365.25;
 
@@ -726,7 +744,13 @@ function adaptCityRecord(rec, provider = "gsv") {
   if (!block?.latest) return null;
 
   const latest = block.latest;
-  const isGsv = provider === "gsv";
+  // All three normalizations below ask ONE question -- does this provider
+  // publish a copyright-filtered subset of its own imagery? -- so they read it
+  // off the registry rather than each testing for "gsv". A third provider
+  // hitting `isGsv ? ... : ...` silently inherited Mapillary's shape, which
+  // happens to be right for a census provider and would be wrong for the first
+  // one that isn't.
+  const copyrightFiltered = PROVIDERS[provider]?.hasCopyrightFilter ?? false;
   const counts = latest.panorama_counts || {};
   const histograms = latest.histogram_of_capture_dates_by_year || {};
 
@@ -772,12 +796,15 @@ function adaptCityRecord(rec, provider = "gsv") {
     // (their Google subset is unknown; the fallbacks below kick in)
     copyright_info_available: latest.copyright_info_available ?? true,
     // Normalized provider-agnostic fields (prefer these in UI code)
-    pano_count: isGsv ? (counts.unique_google_panos ?? counts.unique_panos)
-                      : counts.unique_panos,
-    pano_age_stats: isGsv ? (latest.google_panos_age_stats ?? latest.all_panos_age_stats)
-                          : latest.all_panos_age_stats,
-    capture_year_histogram: isGsv ? (histograms.google_panos ?? histograms.all_panos)
-                                  : histograms.all_panos,
+    pano_count: copyrightFiltered
+      ? (counts.unique_google_panos ?? counts.unique_panos)
+      : counts.unique_panos,
+    pano_age_stats: copyrightFiltered
+      ? (latest.google_panos_age_stats ?? latest.all_panos_age_stats)
+      : latest.all_panos_age_stats,
+    capture_year_histogram: copyrightFiltered
+      ? (histograms.google_panos ?? histograms.all_panos)
+      : histograms.all_panos,
   };
 }
 
@@ -855,7 +882,7 @@ function isPlausibleCaptureDate(date, provider) {
   // name still lands on that loose floor deliberately, mirroring
   // analysis._DEFAULT_EARLIEST_PLAUSIBLE_CAPTURE.
   const earliest = PROVIDERS[provider || "gsv"]?.earliestPlausibleCapture
-    ?? PROVIDERS.mapillary.earliestPlausibleCapture;
+    ?? LOOSEST_EARLIEST_PLAUSIBLE_CAPTURE;
   const t = date.getTime();
   return t >= earliest.getTime() && t <= Date.now();
 }
@@ -1053,6 +1080,7 @@ if (typeof module !== "undefined" && module.exports) {
     STREETSCAPE_DATA_BASE_URL,
     RENDER_CAP,
     PROVIDERS,
+    LOOSEST_EARLIEST_PLAUSIBLE_CAPTURE,
     METRICS,
     isKnownProvider,
     isKnownMetric,

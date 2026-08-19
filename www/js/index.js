@@ -147,22 +147,27 @@ function createTooltip(city) {
   const ageStats = city.pano_age_stats;
 
   // For GSV, break out the official-Google share of all found panoramas;
-  // for other providers every pano is already provider imagery
+  // for other providers every pano is already provider imagery. The null test
+  // alone decides it: unique_google_panos is NULL for every provider that does
+  // not publish a copyright field, so naming "gsv" here asked an identity
+  // question where the data already answers a capability one.
   let panoLinesHtml = `<li>Total Panoramas: ${panoStats.unique_panos.toLocaleString()}</li>`;
-  if (city.provider === "gsv" && panoStats.unique_google_panos != null) {
+  if (panoStats.unique_google_panos != null) {
     // googleSharePercent guards the 0-pano divide-by-zero "Infinity%" (#69).
     const googlePct = googleSharePercent(
       panoStats.unique_google_panos, panoStats.unique_panos);
     panoLinesHtml += `<li>Google Panoramas: ${panoStats.unique_google_panos.toLocaleString()} (${googlePct}%)</li>`;
   }
 
-  // Any-imagery coverage line (issue #116): shown only for Mapillary, and
-  // only when flat imagery actually widens the footprint beyond the 360°
-  // panos — otherwise it would just repeat the Grid Coverage number.
+  // Any-imagery coverage line (issue #116): shown when flat imagery actually
+  // widens the footprint beyond the 360° panos — otherwise it would just
+  // repeat the Grid Coverage number. The widening IS the condition, so no
+  // provider test is needed: adaptCityRecord falls the any-imagery rate back
+  // to the 360° rate for providers that emit no flat imagery, which makes the
+  // difference exactly zero for them.
   let anyImageryHtml = "";
   const anyRate = city.any_imagery_coverage_rate_percent;
   if (
-    city.provider === "mapillary" &&
     anyRate != null &&
     city.coverage_rate_percent != null &&
     anyRate - city.coverage_rate_percent > 0.05
@@ -216,7 +221,7 @@ function createTooltip(city) {
       ${snapshotsHtml}
       <li>Area: ${city.search_area_km2.toFixed(1)} km²</li>
       <li>Grid Coverage: ${city.coverage_rate_percent != null
-        ? `${city.coverage_rate_percent.toFixed(1)}% of search points${city.provider === "mapillary" ? " (360°)" : ""}`
+        ? `${city.coverage_rate_percent.toFixed(1)}% of search points${PROVIDERS[city.provider]?.hasFlatImagery ? " (360°)" : ""}`
         : "No data"}</li>
       ${anyImageryHtml}
       ${streetCoverageHtml}
