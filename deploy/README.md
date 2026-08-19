@@ -198,6 +198,47 @@ systemctl --user start streetscape-tracker.service           # trigger a run now
 Rotating file logs also go to `logs/streetscape_scheduler.log`, and dated
 catalog backups to `backups/` (see below).
 
+### Stopping a run in flight (issue #206)
+
+```bash
+systemctl --user stop streetscape-tracker.service     # graceful wind-down
+systemctl --user kill streetscape-tracker.service     # immediate death, no tail
+```
+
+**`stop` is a wind-down, not a kill.** The in-flight collection child dies with
+the cgroup, the loop declines to start any further channel *or* city, and the
+tail still runs — aggregate, streetwalk manifest, driving-plan summary, catalog
+backup, publish — so the night's collected runs reach the public site. It exits
+**0** and sends no alert. The stopped city's remaining channels are not marked
+failed: they keep their cadence, stay due, and lead the next batch's queue.
+
+It is bounded by `TimeoutStopSec=30min`. Reaching that is a SIGKILL with no tail
+— the 2026-08-13 shape, where a night's runs sat unpublished until someone ran
+`regenerate-aggregate --publish` by hand. If you need the batch dead *now*, use
+`kill` and expect to publish by hand afterwards.
+
+Two cautions:
+
+- **Do not type `stop` twice.** The tail runs outside the SIGTERM handler's
+  scope, so a second stop during it kills the publish with the default
+  disposition. systemd itself only sends SIGTERM once, so one `stop` is safe.
+- **A stop mid-city releases the Mapillary and Overpass host locks**, so it is a
+  reasonable prelude to the manual work described in the next section.
+
+**The installed unit is a COPY, not a symlink** — editing `deploy/systemd/`
+changes nothing about the running service until you copy it over and reload:
+
+```bash
+cp deploy/systemd/streetscape-tracker.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+# Verify the stop timeout is actually live — this is also how the old
+# 90-second default was originally confirmed:
+systemctl --user show streetscape-tracker.service -p TimeoutStopUSec
+#   want: TimeoutStopUSec=30min      NOT: TimeoutStopUSec=1min 30s
+```
+
+`daemon-reload` is safe during a live batch; `stop` obviously is not.
+
 ### Running anything by hand alongside the scheduler (issue #208)
 
 Mapillary's tile CDN and the Overpass API both rate-limit **per IP**, not per

@@ -55,22 +55,30 @@ ExecStart=%h/streetscape-tracker/.venv-makelab2/bin/python -m streetscape_metada
 # observed 2026-07-29, when a batch died at exactly 12h and the public site went
 # two days stale while the catalog kept advancing).
 TimeoutStartSec=14h
-# Stopping is a WIND-DOWN request, not a kill: the SIGTERM handler sets a flag
-# the city loop checks at a city boundary, then lets the tail run so the night's
-# collected runs are actually published. Without this line systemd applies its
-# 90-SECOND default, which cannot reach the next boundary — measured 2026-08-13:
+# Stopping is a WIND-DOWN request, not a kill: the SIGTERM handler sets a flag,
+# the loop stops launching work, and the tail still runs so the night's collected
+# runs are actually published. Without this line systemd applies its 90-SECOND
+# default, which cannot reach even the first of those — measured 2026-08-13:
 # `systemctl stop` -> SIGTERM 06:23:28 -> SIGKILL 06:24:58 -> no tail, and that
 # night's runs sat unpublished until a manual `regenerate-aggregate --publish`.
-# 30min is a compromise, not a guarantee: it covers the in-flight channel plus
-# the tail for an ordinary city, but NOT an exceptional one (Ho Chi Minh City
-# spent 6.5 h across its four channels on 2026-08-18), and reaching it is a
-# SIGKILL — i.e. exactly today's behaviour, so this can only improve on it. An
+#
+# What this timeout has to cover is just the TAIL, and that is a consequence of
+# issue #206's code half: the stop waits on neither a city nor a channel. KillMode
+# defaults to control-group, so the same SIGTERM kills the in-flight child, and
+# the loop then declines to start the rest of that city's channels (the flag is
+# checked between a city's channels, not only between cities). Tail components:
+#   - aggregate + streetwalk manifest — 7m15s measured on the 19-city night of
+#     2026-08-18; ~1.6 s on a small one
+#   - driving-plan summary            — 2-20 s
+#   - catalog backup                  — hard-bounded at BACKUP_TIMEOUT_S (10 min)
+#   - publish rsync (~6,300 files)    — logged as "Published in N.N s" since #206,
+#                                       which is where to look before changing
+#                                       this number
+# 30min is roughly 2x the worst tail we have measured, and a test pins
+# TimeoutStopSec > BACKUP_TIMEOUT_S and < max_batch_hours. Reaching it is still a
+# SIGKILL — i.e. the pre-#206 behaviour — so this can only improve on it. An
 # operator who needs the batch dead immediately should `systemctl --user kill`
 # rather than wait this out.
-# NB: this is only the UNIT half of issue #206. The code half is still open —
-# `sigterm_seen` is checked in _run_city_loop's outer `for city in due` but not
-# in the inner `for provider in providers_for_city[...]`, so a stop still
-# launches every remaining channel of the city already in flight.
 TimeoutStopSec=30min
 
 # Anything not already captured by the scheduler's own rotating log or a child's
