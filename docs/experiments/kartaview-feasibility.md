@@ -2,11 +2,14 @@
 
 **Ran:** 2026-08-18 ·
 **Verdict:** The 360° imagery is real and openly licensed, and two things bite.
-**Grab's 2025-11 upload batch carries no capture date at all** — the field this
-project exists to track — though their 2023 batch does, so it reads as a fixable
-regression rather than a policy. And **`/1.0/list/nearby-photos/` does not return
-a spatial sample**, so almost every percentage computed from it is a paging
-artifact, including several in the first draft of this document.
+**Grab's 2025-11 upload batch reports no honest capture date on either
+endpoint** — the field this project exists to track. v1 returns
+`shot_date: null`; v2 returns a `shotDate` at or after that same photo's own
+upload time, i.e. the ingest timestamp wearing a capture-date label. Their 2023
+batch is clean on both, so it reads as a fixable regression in one ingest rather
+than a policy. And **`/1.0/list/nearby-photos/` does not return a spatial
+sample**, so almost every percentage computed from it is a paging artifact,
+including several in the first draft of this document.
 
 ## The question
 
@@ -52,7 +55,7 @@ Both were the artifact above.
 
 ## Findings
 
-### 1. Missing capture dates are one 2025 upload batch, not a policy
+### 1. One 2025 upload batch has no honest date — and v2 invents one
 
 `shot_date` is contributor EXIF; `date_added` is server-side upload time.
 **Missingness is per-SEQUENCE and absolute** — every drive examined is either
@@ -76,6 +79,38 @@ neither "Grab never publishes dates" nor "360° imagery is undated" — it reads
 a regression in one 2025 ingest, and therefore as something that could be fixed
 or backfilled.
 
+**But the v2 endpoint does not report that batch as undated — it reports an
+ingest timestamp as the capture date.** A photo cannot be captured after it was
+uploaded, so `shotDate < dateAdded` is an invariant every honest record
+satisfies. A second pass audited it directly across 12 points in 7 cities
+([`kartaview-shotdate-audit_metrics.json`](kartaview-shotdate-audit_metrics.json)),
+asking v2 for one photo per sequence:
+
+| | sequences | photos |
+|---|---|---|
+| audited | 48 | 59,263 |
+| **violating `shotDate < dateAdded`** | **10** | **5,665** |
+
+Every violating sequence is the same population: id `1161…`, `SPHERE`,
+`deviceName KartaCam2`, uploader `OpenStreetView` (Grab, `userId 44`),
+`date_added` **2025-11-19** — spread across all three open-release cities (Krabi
+7, Yogyakarta 2, Langkawi 1). The grab-market points (Singapore, Bangkok, Ho Chi
+Minh City) and the Seattle community control are clean, which is what makes "one
+bad ingest" a measurement rather than a guess. And the two endpoints agree
+exactly on *which* sequences are affected: **v1-null ⟺ v2-invalid**, with no
+sequence being one without the other.
+
+The photo counts are `countActivePhotos` — each sequence's full size, not the
+sampled page — so 5,665 is the real number of photos affected in the sequences
+reached, and still a **lower bound** on the batch as a whole.
+
+The violation is not always "later": 3 of the 10 (185 photos) read
+`shotDate == dateAdded` to the second — Langkawi sequence `11616157` is
+`2025-11-19 11:18:29` on both. So the predicate has to be `>=`, not `>`; a strict
+`>` is exactly the near-miss guard that lets bad data through. The rest run ahead
+of their own upload by seconds to minutes (`11616132`: captured 11:18:35,
+uploaded 10:54:07).
+
 Two lags fall out of the same table, and they differ by an order of magnitude:
 **community uploaders publish in the month they shoot** (2017-09/2017-09,
 2020-05/2020-05, 2025-09/2025-09), while **Grab's 2023 batch lagged 8 months**
@@ -87,6 +122,12 @@ field it used**. Publishing an upload year in the same column as a capture year
 would silently invalidate every temporal claim built on it — a mistake this
 study's own tooling made before it was split into
 `capture_year_counts_shot_date` and `upload_year_counts_date_added`.
+
+And a collector reading **v2 cannot detect this by null-checking**, because v2
+hands it a non-null, entirely plausible-looking timestamp. It has to apply the
+invariant — the same posture as `plan_match.plausible_capture_date`, which exists
+because #213 found corrupt third-party EXIF poisoning GSV's capture statistics.
+A null is honest and can be handled; a wrong date that looks right cannot.
 
 **What our own dated snapshots add**, given `date_added` already timestamps
 uploads per photo to the second (finer than any collection cadence): not capture
@@ -152,7 +193,9 @@ at all**, so a client cannot observe its own budget. We pace to the documented
 figure regardless — CLAUDE.md's corollary, that undocumented behaviour is unknown
 rather than unlimited.
 
-The whole of this study fits inside the anonymous tier.
+The probe fits inside the anonymous tier (48 requests). The shot-date audit does
+not — ~110 requests, two per sequence reached — so both passes were in fact run
+authenticated, which each record states in `_about.authenticated`.
 
 ### 6. What is better than Mapillary
 
@@ -165,8 +208,11 @@ The whole of this study fits inside the anonymous tier.
   Given finding 1, **the sequence is the unit at which datedness is decided**, so
   a collector can determine a whole drive's date availability from one photo of
   it rather than per-row.
-- **Licence**: CC BY-SA 4.0 on imagery and metadata, with a publisher-specified
-  citation string. ShareAlike is viral over derived data.
+- **Licence**: CC BY-SA 4.0 on the imagery, with a publisher-specified citation
+  string; ShareAlike is viral over derived data. Whether photo *metadata* is
+  separately licensed is **unverified** — and metadata, not imagery, is what this
+  project would republish, so it has to be settled with
+  `geo.kartaview@grabtaxi.com` before a collector ships.
 
 ### 7. The issue's coverage claims
 
@@ -174,7 +220,7 @@ The whole of this study fits inside the anonymous tier.
 |---|---|
 | Yogyakarta ~1.6M images / 11,400 km of roads | **unsourced** — on no Grab or KartaView page. Published figures are 85 GB open, 23.8 TB by request. |
 | Singapore in the Grab open-360 release | **No** — the release is Yogyakarta / **Langkawi** / Krabi. Singapore does have dense imagery (10,903 in one r=1000 m circle) but no complete sample was obtainable. |
-| Langkawi released with 360 coverage | **11 photos** at r=1000 m (complete), vs thousands elsewhere; coverage tile 2 KB against 15–24 KB. Effectively empty on the live API. |
+| Langkawi released with 360 coverage | **11 photos** in one r=1000 m circle (complete), vs thousands elsewhere; coverage tile 2 KB against 15–24 KB. Sparse, but *not* empty island-wide: a second point 14 km away reached a 102-photo community sequence. |
 | Bucharest dense legacy Telenav | Present but **0% 360** — complete samples at three radii, all `PLANE`. |
 | North America overwhelmingly flat dashcam | **Probably true — an earlier draft of this document wrongly called it stale.** Seattle's only complete sample is **7.95% SPHERE across 9 uploaders**. The 100% figure that suggested otherwise was one 360° sequence filling a page. |
 
@@ -209,8 +255,10 @@ provenance built in.
 2. **A sweep must paginate, not sample.** Finding 3 means one page per circle
    measures a drive, not a neighbourhood. This is the single biggest cost
    unknown remaining and should be measured before PR 2 is scoped.
-3. **Carry the date's source.** A `date_source` column beside `capture_date`, or
-   nulls — never a silent `shot_date or date_added`.
+3. **Carry the date's source, and check the invariant.** A `date_source` column
+   beside `capture_date`, or nulls — never a silent `shot_date or date_added`.
+   And reject any `shotDate >= dateAdded`: finding 1 shows v2 serving ingest
+   timestamps that no null-check can catch.
 4. **Grid census (PR 3) is lower value**, because the per-run JSON and aggregate
    are built around capture-date statistics KartaView cannot supply for its best
    imagery.
@@ -226,8 +274,10 @@ provenance built in.
 - **One session, one IP, one afternoon.** The rate limit was never enforced
   against us, so nothing here bounds behaviour under sustained load — the axis
   that produced the Mapillary ban (#198).
-- Langkawi's emptiness is measured on the **live API**; its imagery may exist only
-  in the 85 GB downloadable bundle.
+- Langkawi's sparseness is measured on the **live API**, and at *one* point per
+  pass; the audit's second point found imagery the probe's circle did not, so
+  treat it as sparse-where-sampled, not empty. Its bulk imagery may also exist
+  only in the 85 GB downloadable bundle.
 
 ## Replicating
 
@@ -238,18 +288,24 @@ python scripts/kartaview_probe.py --area nyc --repeat 4     # repeatability at f
 
 # the canonical record — every rung of the radius ladder, ~48 requests
 python scripts/kartaview_probe.py --area all --all-radii --docs-dir docs/experiments
+
+# finding 1's capture-date audit — 12 points, then two calls per sequence
+# reached, ~110 requests
+python scripts/kartaview_shotdate_audit.py --docs-dir docs/experiments
 ```
 
-The last command is the **sole producer** of
-[`kartaview-feasibility_metrics.json`](kartaview-feasibility_metrics.json), and
-every number above is drawn from it. `--all-radii` is what makes the paging
-finding checkable: without it the ladder stops at the first success and records
+The last two commands are the **sole producers** of, respectively,
+[`kartaview-feasibility_metrics.json`](kartaview-feasibility_metrics.json) and
+[`kartaview-shotdate-audit_metrics.json`](kartaview-shotdate-audit_metrics.json),
+and every number above is drawn from one of them. `--all-radii` is what makes
+the paging finding checkable: without it the ladder stops at the first success and records
 only that rung, which is precisely the rung that misleads. Each target's
 `per_radius[]` carries `n_sampled` beside `total_filtered_items`, so completeness
 is verifiable per row; `_about.generated_by` is spelled from the actual
 arguments, so a scratch run cannot claim the canonical invocation.
 
-No credential is required; set `KARTAVIEW_ACCESS_TOKEN` in `.env` to pace at
-1,000 req/hr instead of 100. The script **refuses to run on a `makelab*` host** —
+No credential is required for the probe; the audit needs one to stay inside an
+hour. Set `KARTAVIEW_ACCESS_TOKEN` in `.env` to pace at 1,000 req/hr instead of
+100. The script **refuses to run on a `makelab*` host** —
 finding a provider's limits with the nightly batch's IP is how the last two bans
 happened.
