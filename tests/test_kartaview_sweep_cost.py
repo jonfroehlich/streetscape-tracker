@@ -28,6 +28,7 @@ import os
 import sys
 
 import pytest
+import requests
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPTS_DIR = os.path.join(PROJECT_ROOT, "scripts")
@@ -166,7 +167,10 @@ class _FakeSession:
 
     def post(self, url, data=None, params=None, timeout=None):
         self.calls.append(dict(data))
-        return _FakeResponse(self.answer(data))
+        answer = self.answer(data)
+        if isinstance(answer, BaseException):
+            raise answer
+        return _FakeResponse(answer)
 
 
 class _FakeResponse:
@@ -196,9 +200,26 @@ class _NoSleep:
         pass
 
 
+def _seattle_bbox():
+    return ks.grid_bbox(
+        SEATTLE["center_lat"],
+        SEATTLE["center_lon"],
+        SEATTLE["grid_width_m"],
+        SEATTLE["grid_height_m"],
+        SEATTLE["step_m"],
+    )
+
+
 def _plan(answer, **kw):
     session = _FakeSession(answer)
-    opts = dict(ipp=2000, start_radius_m=1000, max_requests=10_000, access_token=None, seed=225)
+    opts = dict(
+        ipp=2000,
+        start_radius_m=1000,
+        max_requests=10_000,
+        access_token=None,
+        seed=225,
+        probes_per_rung=2,
+    )
     opts.update(kw)
     return ks.plan_city(session, _NoSleep(), SEATTLE, **opts), session
 
@@ -226,33 +247,122 @@ def test_a_refusal_that_clears_on_retry_does_not_subdivide():
     assert out["cells_visited"] == out["root_cells"]
 
 
-def test_a_persistent_refusal_subdivides_and_the_wasted_page_one_is_counted():
-    """A cell that refuses at depth 0 but answers at depth 1 costs 1 + 4."""
+# ── calibration: the working radius is a property of the LOCATION ──────────
+
+
+def test_calibration_picks_the_largest_radius_the_server_answers():
+    """
+    Measured 2026-08-19: Horace ND -- which holds NO imagery -- refused r=1000
+    on 10 of 10 attempts across two page sizes and answered r=250 on 4 of 4.
+    So the walk must tile at a radius the server will actually serve, and
+    discovering that per CELL costs a cascade per cell.
+    """
+    out, _ = _plan(lambda data: _REFUSAL if data["radius"] > 600 else _page(5))
+    assert out["calibrated_radius_m"] == 500
+    # Tiling happened at 500, not at the 1000 we started the ladder from.
+    assert out["root_cells"] == len(ks.cells_for_bbox(*_seattle_bbox(), 500 * math.sqrt(2)))
+    # And having calibrated, no cell had to be subdivided at all.
+    assert out["subdivisions"] == 0
+    assert out["refusals"] == 0
+
+
+def test_calibration_accepts_a_rung_only_if_every_probe_answers():
+    """One lucky point would set a radius the rest of the city re-discovers."""
+    centre_lat = ks.calibration_points(_seattle_bbox(), 2)[0][0]
 
     def answer(data):
-        return _REFUSAL if data["radius"] > 600 else _page(5)
+        # r=1000 answers at the centre but ALWAYS refuses at the inset corner,
+        # so no number of retries can rescue the rung.
+        if data["radius"] == 1000 and data["lat"] != centre_lat:
+            return _REFUSAL
+        return _page(5)
 
-    out, _ = _plan(answer)
-    assert out["refusals"] == out["root_cells"]
-    assert out["subdivisions"] == out["root_cells"]
-    assert out["leaf_cells"] == 4 * out["root_cells"]
-    assert out["cells_visited"] == 5 * out["root_cells"]
-    assert out["floor_failures"] == 0
+    out, _ = _plan(answer, probes_per_rung=2)
+    assert out["calibrated_radius_m"] == 500
+    assert out["calibration"][0] == {"radius_m": 1000, "probes": 2, "answered": 1}
 
 
-def test_a_cell_that_refuses_all_the_way_down_is_recorded_not_swallowed():
+def test_calibration_costs_are_counted_into_the_citys_spend():
+    out, _ = _plan(lambda data: _page(5), probes_per_rung=2)
+    assert out["calibration_requests"] == 2  # r=1000 answered both probes
+    assert out["requests_spent_planning"] >= out["calibration_requests"]
+
+
+def test_a_city_where_no_radius_answers_is_null_not_zero():
     """
-    Refusing everywhere must not read as a cheap city. It bottoms out at the
-    radius floor and is counted, because the alternative -- a silent zero -- is
-    how a refused sweep would register as 'this city has no imagery'.
+    Refusing everywhere must not read as the CHEAPEST city in the study. Zero
+    would sort to the front of the cost distribution; null says what happened.
+    This is the same "refused is not empty" distinction the feasibility probe
+    makes with max_working_radius_m: null.
     """
     out, _ = _plan(lambda data: _REFUSAL)
-    assert out["leaf_cells"] == 0
-    assert out["floor_failures"] > 0
-    assert out["refusals"] == out["cells_visited"]
-    assert out["photos_seen_sum_over_cells"] == 0
-    # Every cell was still PAID for, so the cost is not zero.
-    assert out["sweep_requests_estimate"] >= out["cells_visited"]
+    assert out["reachable"] is False
+    assert out["calibrated_radius_m"] is None
+    assert out["sweep_requests_estimate"] is None
+    assert out["photos_in_bbox_estimate"] is None
+    assert "NOT evidence of an empty city" in out["note"]
+    # It cost the full ladder x probes, and that is recorded.
+    assert out["requests_spent_planning"] == out["calibration_requests"] > 0
+
+
+def test_an_unreachable_city_is_excluded_from_the_distribution_not_counted_as_zero():
+    cities = [
+        {
+            "sweep_requests_estimate": 40,
+            "calibrated_radius_m": 1000,
+            "plan_complete": True,
+            "cells_visited": 10,
+            "refusals": 0,
+            "retries_cleared": 0,
+            "retries_attempted": 0,
+            "floor_failures": 0,
+            "broken_cells": 0,
+            "requests_spent_planning": 10,
+        },
+        {
+            "sweep_requests_estimate": None,
+            "calibrated_radius_m": None,
+            "plan_complete": False,
+            "cells_visited": 0,
+            "refusals": 0,
+            "retries_cleared": 0,
+            "retries_attempted": 0,
+            "floor_failures": 0,
+            "broken_cells": 0,
+            "requests_spent_planning": 12,
+        },
+    ]
+    s = ks.summarize(cities)
+    assert s["n"] == 1
+    assert s["unreachable"] == 1
+    assert s["sweep_requests_estimate"]["min"] == 40
+
+
+# ── a non-backpressure failure must never subdivide ────────────────────────
+
+
+def test_a_transport_failure_does_not_subdivide():
+    """
+    Subdividing after a timeout asks a server that just failed to serve one
+    request for four. That is the shape of the Mapillary block (#198), not a
+    fix for it -- so only BackpressureError may shrink the query.
+    """
+    out, session = _plan(lambda data: requests.ConnectionError("reset"))
+    assert out["reachable"] is False  # calibration could not land either
+    assert out["subdivisions"] == 0
+    # Bounded: the ladder x probes x (retries + 1), and not one request more.
+    assert len(session.calls) == len(ks.RADIUS_LADDER_M) * 2 * (ks.DEFAULT_BACKPRESSURE_RETRIES + 1)
+
+
+def test_an_unparseable_body_is_not_even_retried():
+    """
+    The server gave a definite answer we cannot use. Re-asking cannot change
+    it, and a rejected credential re-asked at every cell looks like an attack.
+    """
+    out, session = _plan(lambda data: {"status": {"apiCode": 600}, "no_items_key": True})
+    assert out["subdivisions"] == 0
+    assert out["reachable"] is False
+    assert len(session.calls) == len(ks.RADIUS_LADDER_M) * 2  # one try per probe
 
 
 def test_a_cell_too_deep_to_page_is_subdivided_rather_than_paged_forever():
@@ -391,12 +501,14 @@ def test_summary_quotes_the_distribution_not_a_headline():
     cities = [
         {
             "sweep_requests_estimate": v,
+            "calibrated_radius_m": 1000,
             "plan_complete": v < 500,
             "cells_visited": 10,
             "refusals": 1,
             "retries_cleared": 0,
             "retries_attempted": 0,
             "floor_failures": 0,
+            "broken_cells": 0,
             "requests_spent_planning": 10,
         }
         for v in (10, 100, 250, 900, 4000)
@@ -411,7 +523,7 @@ def test_summary_quotes_the_distribution_not_a_headline():
 
 
 def test_summary_of_an_empty_study_set_is_not_a_crash():
-    assert ks.summarize([]) == {"n": 0}
+    assert ks.summarize([]) == {"n": 0, "unreachable": 0}
 
 
 def test_the_script_refuses_to_run_on_a_collection_host():

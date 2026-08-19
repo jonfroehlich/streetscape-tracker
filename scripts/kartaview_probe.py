@@ -253,6 +253,26 @@ class ProbeError(RuntimeError):
         super().__init__(redact_credentials(str(message)))
 
 
+class BackpressureError(ProbeError):
+    """
+    The server declined the QUERY: HTTP 400 carrying apiCode 690 or 408.
+
+    The remedy is to ask for less -- retry, then shrink the radius. Kept
+    distinct from the two below because that remedy is exactly wrong for them:
+    subdividing a circle after a timeout asks a struggling server for four
+    requests where it just failed to serve one, which is the shape of the
+    Mapillary incident (#198) rather than a fix for it.
+    """
+
+
+class TransportError(ProbeError):
+    """The request never got an answer: connection reset, timeout, DNS."""
+
+
+class ResponseError(ProbeError):
+    """An answer arrived that we could not use: non-JSON body, HTTP >= 400."""
+
+
 def _post_nearby(
     session: requests.Session,
     limiter: HourlyRateLimiter,
@@ -283,7 +303,7 @@ def _post_nearby(
     try:
         resp = session.post(NEARBY_PHOTOS_URL, data=data, params=params, timeout=timeout_s)
     except requests.RequestException as e:
-        raise ProbeError(f"transport failure: {type(e).__name__}: {e}") from e
+        raise TransportError(f"transport failure: {type(e).__name__}: {e}") from e
 
     try:
         body = resp.json()
@@ -291,7 +311,7 @@ def _post_nearby(
         # An HTML error page on a 200 is how Mapillary's block manifested
         # (#199); name it rather than letting it reach a parser.
         ctype = resp.headers.get("Content-Type", "?")
-        raise ProbeError(f"non-JSON body (HTTP {resp.status_code}, {ctype})") from e
+        raise ResponseError(f"non-JSON body (HTTP {resp.status_code}, {ctype})") from e
 
     status = body.get("status") or {}
     api_code = status.get("apiCode")
@@ -301,12 +321,12 @@ def _post_nearby(
         api_code = None
 
     if api_code in BACKPRESSURE_API_CODES:
-        raise ProbeError(
+        raise BackpressureError(
             f"backpressure: apiCode {api_code} ({status.get('apiMessage', '')!r}) "
             f"at radius {radius_m} m"
         )
     if resp.status_code >= 400:
-        raise ProbeError(f"HTTP {resp.status_code}, apiCode {api_code}, body keys {list(body)}")
+        raise ResponseError(f"HTTP {resp.status_code}, apiCode {api_code}, body keys {list(body)}")
 
     # The v1 envelope has varied across deployments; accept both shapes rather
     # than KeyError on a server that answered perfectly well.
@@ -314,7 +334,7 @@ def _post_nearby(
     if items is None:
         items = (body.get("osv") or {}).get("currentPageItems")
     if items is None:
-        raise ProbeError(f"no currentPageItems in body (keys: {list(body)})")
+        raise ResponseError(f"no currentPageItems in body (keys: {list(body)})")
 
     total = body.get("totalFilteredItems")
     if total is None:

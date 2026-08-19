@@ -71,10 +71,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from kartaview_probe import (  # noqa: E402
     IPP_MAX,
+    RADIUS_LADDER_M,
     REQUESTS_PER_HOUR_ANON,
     REQUESTS_PER_HOUR_AUTH,
+    BackpressureError,
     HourlyRateLimiter,
     ProbeError,
+    TransportError,
     _post_nearby,
     refuse_on_collection_host,
 )
@@ -108,8 +111,15 @@ RADIUS_FLOOR_M = 100
 # page-1 for four shallower circles.
 MAX_PAGES_PER_CELL = 10
 
-# Fact 2: a refusal is retried before it is believed.
-BACKPRESSURE_RETRIES = 1
+# Fact 2: a refusal is retried before it is believed -- and retrying is 4x
+# cheaper than subdividing (1 request vs 4, each of which may cascade), so
+# the budget is generous rather than minimal. See _probe_cell.
+DEFAULT_BACKPRESSURE_RETRIES = 3
+
+# Probes per rung during calibration. A rung is accepted only if every one
+# answers, so this trades requests for confidence that the radius holds
+# across the bbox rather than at one lucky point.
+DEFAULT_CALIBRATION_PROBES = 2
 
 # The study set, in two halves that answer two different questions.
 #
@@ -266,6 +276,138 @@ def redundancy_factor() -> float:
     return math.pi / 2.0
 
 
+# ── Per-city radius calibration ────────────────────────────────────────────
+
+
+def calibration_points(
+    bbox: tuple[float, float, float, float], n: int
+) -> list[tuple[float, float]]:
+    """
+    Spread ``n`` sample points across a bbox: the centre first, then corners.
+
+    Deterministic, so a re-run calibrates identically. Centre-first because a
+    one-point calibration should look at the middle of the city rather than at
+    a corner that may be open water.
+    """
+    min_lon, min_lat, max_lon, max_lat = bbox
+    mid_lat, mid_lon = (min_lat + max_lat) / 2, (min_lon + max_lon) / 2
+    # Inset the corners by a quarter so they sample the city, not its edge.
+    qy, qx = (max_lat - min_lat) / 4, (max_lon - min_lon) / 4
+    candidates = [
+        (mid_lat, mid_lon),
+        (mid_lat - qy, mid_lon - qx),
+        (mid_lat + qy, mid_lon + qx),
+        (mid_lat - qy, mid_lon + qx),
+        (mid_lat + qy, mid_lon - qx),
+    ]
+    return candidates[:n]
+
+
+def calibrate_radius(
+    session: requests.Session,
+    limiter: HourlyRateLimiter,
+    bbox: tuple[float, float, float, float],
+    *,
+    ipp: int,
+    access_token: str | None,
+    probes_per_rung: int,
+    retries: int,
+) -> tuple[int | None, list[dict], int]:
+    """
+    Find the largest radius this city's server will actually answer.
+
+    THE REASON THIS EXISTS. The working radius is a property of the LOCATION,
+    not of how much imagery is there, and it varies by at least 4x across the
+    catalog. Measured 2026-08-19: Ithaca MI answered r=1000 at 12 of 12 cells;
+    Bend OR answered r=1000 at 4 of 8 first tries and 8 of 8 with one retry; and
+    Horace ND -- which holds NO imagery at all -- refused r=1000 on 10 of 10
+    attempts across two page sizes while answering r=250 on 4 of 4. Page size
+    does not predict it either: Horace refused r=1000 identically at ipp=200 and
+    ipp=2000, and Singapore refused r=1000 at ipp=10 and ipp=100 while answering
+    it at ipp=2000.
+
+    So a per-cell adaptive descent pays that discovery cost at EVERY cell: a
+    root that will never answer costs its retries plus a 1 + 4 + 16 cascade to
+    the floor, and it pays that again for each of the city's other roots. One
+    calibration up front costs at most ``len(RADIUS_LADDER_M) * probes_per_rung``
+    requests for the whole city.
+
+    A rung is accepted only if EVERY probe on it answers, because one lucky
+    point would set a radius the rest of the city then re-discovers the hard
+    way.
+
+    Returns:
+        ``(radius or None, trace, requests_spent)``. ``None`` means no rung
+        answered anywhere -- which is NOT the same as "no imagery here", and the
+        caller must not record it as a cheap city.
+    """
+    points = calibration_points(bbox, probes_per_rung)
+    trace: list[dict] = []
+    spent = 0
+    for radius in RADIUS_LADDER_M:
+        outcomes = []
+        for lat, lon in points:
+            cell = Cell(lat=lat, lon=lon, size_m=radius * math.sqrt(2))
+            _, cost, outcome = _probe_cell(
+                session, limiter, cell, ipp=ipp, access_token=access_token, retries=retries
+            )
+            spent += cost
+            outcomes.append(outcome)
+        answered = sum(o.startswith("ok") for o in outcomes)
+        trace.append({"radius_m": radius, "probes": len(points), "answered": answered})
+        logger.info(f"  calibrate r={radius}m: {answered}/{len(points)} answered")
+        if answered == len(points):
+            return radius, trace, spent
+    return None, trace, spent
+
+
+def _unreachable_city(
+    city: dict,
+    bbox: tuple[float, float, float, float],
+    start_radius_m: int,
+    trace: list[dict],
+    spent: int,
+) -> dict:
+    """
+    A city where NO rung answered anywhere.
+
+    Recorded with null estimates rather than zero. Zero would sort to the front
+    of the cost distribution and read as the cheapest city in the study, when
+    what actually happened is that we never got an answer -- the same
+    "refused is not empty" distinction the feasibility probe makes for
+    ``max_working_radius_m: null``.
+    """
+    return {
+        "city_id": city["city_id"],
+        "bbox_area_km2": round(_bbox_area_km2(bbox), 1),
+        "grid_width_m": city["grid_width_m"],
+        "grid_height_m": city["grid_height_m"],
+        "start_radius_m": start_radius_m,
+        "calibrated_radius_m": None,
+        "calibration": trace,
+        "calibration_requests": spent,
+        "reachable": False,
+        "note": "no radius answered at any calibration point; NOT evidence of an empty city",
+        "root_cells": None,
+        "roots_probed": 0,
+        "plan_complete": False,
+        "requests_spent_planning": spent,
+        "cells_visited": 0,
+        "leaf_cells": 0,
+        "subdivisions": 0,
+        "refusals": 0,
+        "retries_attempted": 0,
+        "retries_cleared": 0,
+        "floor_failures": 0,
+        "broken_cells": 0,
+        "deepest_refusal_radius_m": min(RADIUS_LADDER_M),
+        "photos_seen_sum_over_cells": None,
+        "photos_in_bbox_estimate": None,
+        "sweep_requests_over_probed_roots": None,
+        "sweep_requests_estimate": None,
+    }
+
+
 # ── The adaptive walk (this is the part that spends requests) ──────────────
 
 
@@ -279,15 +421,23 @@ def plan_city(
     max_requests: int,
     access_token: str | None,
     seed: int,
+    retries: int = DEFAULT_BACKPRESSURE_RETRIES,
+    probes_per_rung: int = DEFAULT_CALIBRATION_PROBES,
 ) -> dict:
     """
-    Walk one city's bbox adaptively, spending one page-1 request per cell.
+    Calibrate this city's working radius, then walk its bbox at that radius.
+
+    Two phases, because the working radius is a property of the location rather
+    than of its imagery (see :func:`calibrate_radius`). Calibration costs at
+    most a dozen requests for the whole city; discovering the same thing per
+    cell costs a cascade per cell.
 
     Root cells are visited in a seeded shuffle so that a run stopped by
     ``max_requests`` has sampled the bbox uniformly rather than its northern
-    strip. Refusals are retried before a cell is subdivided (docstring fact 2),
-    and a cell that still refuses at ``RADIUS_FLOOR_M`` is recorded as a failure
-    rather than silently costing nothing.
+    strip. A cell that still refuses at the calibrated radius is retried and
+    only then subdivided, and one that refuses all the way to
+    ``RADIUS_FLOOR_M`` is recorded as a failure rather than silently costing
+    nothing.
     """
     bbox = grid_bbox(
         city["center_lat"],
@@ -296,16 +446,32 @@ def plan_city(
         city["grid_height_m"],
         city["step_m"],
     )
-    cell_size = start_radius_m * math.sqrt(2)
+    calibrated_m, calibration_trace, calibration_spent = calibrate_radius(
+        session,
+        limiter,
+        bbox,
+        ipp=ipp,
+        access_token=access_token,
+        probes_per_rung=probes_per_rung,
+        retries=retries,
+    )
+    # No rung answered anywhere: record it and spend nothing more. This is NOT
+    # evidence of an empty city, so it must not be reported as a cheap one.
+    if calibrated_m is None:
+        return _unreachable_city(city, bbox, start_radius_m, calibration_trace, calibration_spent)
+
+    cell_size = calibrated_m * math.sqrt(2)
     roots = cells_for_bbox(*bbox, cell_size)
     order = list(range(len(roots)))
     random.Random(seed).shuffle(order)
 
-    spent = 0
+    spent = calibration_spent
     cells_visited = 0
     leaf_totals: list[int | None] = []
     refusals = subdivisions = retries_attempted = retries_cleared = floor_failures = 0
+    broken_cells = 0
     roots_probed = 0
+    deepest_refusal_radius_m: int | None = None
 
     for root_index in order:
         if spent >= max_requests:
@@ -317,15 +483,24 @@ def plan_city(
                 break
             cell = stack.pop()
             total, cost, outcome = _probe_cell(
-                session, limiter, cell, ipp=ipp, access_token=access_token
+                session, limiter, cell, ipp=ipp, access_token=access_token, retries=retries
             )
             spent += cost
             cells_visited += 1
             retries_attempted += cost - 1
             if outcome == "ok_after_retry":
                 retries_cleared += 1
+            if outcome == "broken":
+                # Not backpressure: the server failed to answer at all. Asking
+                # it for four requests where it just failed to serve one is how
+                # a struggling host gets pushed over, so this cell stops here.
+                broken_cells += 1
+                continue
             if outcome == "refused":
                 refusals += 1
+                deepest_refusal_radius_m = min(
+                    cell.radius_m, deepest_refusal_radius_m or cell.radius_m
+                )
                 if not can_subdivide(cell):
                     floor_failures += 1
                     continue
@@ -349,6 +524,10 @@ def plan_city(
         "grid_width_m": city["grid_width_m"],
         "grid_height_m": city["grid_height_m"],
         "start_radius_m": start_radius_m,
+        "calibrated_radius_m": calibrated_m,
+        "reachable": True,
+        "calibration": calibration_trace,
+        "calibration_requests": calibration_spent,
         "root_cells": len(roots),
         "roots_probed": roots_probed,
         "plan_complete": plan_complete,
@@ -360,6 +539,12 @@ def plan_city(
         "retries_attempted": retries_attempted,
         "retries_cleared": retries_cleared,
         "floor_failures": floor_failures,
+        "broken_cells": broken_cells,
+        # The smallest radius that still got refused. If this sits well above
+        # the floor the walk is converging; at or near the floor, the refusal
+        # is not about how much was asked for -- Horace ND refuses an EMPTY
+        # circle at r >= 250 and answers 0 photos at r=125.
+        "deepest_refusal_radius_m": deepest_refusal_radius_m,
         # Sum over overlapping circles, so it double-counts by ~pi/2. Both the
         # raw sum and the de-overlapped estimate are kept: the first is what
         # the sweep pays to fetch, the second is what the city holds.
@@ -377,18 +562,35 @@ def _probe_cell(
     *,
     ipp: int,
     access_token: str | None,
+    retries: int,
 ) -> tuple[int | None, int, str]:
     """
     Page 1 of one cell. Returns ``(total, requests_spent, outcome)``.
 
-    ``outcome`` is one of ``ok`` / ``ok_after_retry`` / ``refused``. The retry is
-    the whole reason this is a function: a 690 that clears on a second ask would
-    otherwise subdivide a cell into four that did not need subdividing, which
-    inflates every number this script exists to measure.
+    ``outcome`` is ``ok`` / ``ok_after_retry`` / ``refused`` / ``broken``.
+
+    RETRYING IS FOUR TIMES CHEAPER THAN SUBDIVIDING, which is why the retry
+    budget is generous and is the whole reason this is a function. A retry costs
+    one request; a subdivision costs four, each of which may retry and subdivide
+    in turn -- a cascade to the radius floor is 1 + 4 + 16 = 21 requests. Since
+    apiCode 690 was measured flaky (Bend: 4 of 8 cells refused, 4 of 4 cleared on
+    one retry), a cell that clears on any retry saves at least 20.
+
+    ``broken`` is kept apart from ``refused`` deliberately. Only a
+    BackpressureError means "you asked for too much", so only it may subdivide.
+    Asking a server for four requests where it just failed to serve one is how
+    the Mapillary block got extended (#198), not a fix for it.
+
+    The two non-backpressure classes are then retried differently, because they
+    are different facts. A ``TransportError`` -- reset, timeout, DNS -- is
+    transient by nature and gets the same retry budget. A ``ResponseError`` is
+    the server giving a definite answer we cannot use (a rejected token, an
+    unparseable body); re-asking cannot change it, and a rejected credential
+    retried at every cell is a great way to look like an attack.
     """
-    for attempt in range(BACKPRESSURE_RETRIES + 1):
+    for attempt in range(retries + 1):
         try:
-            items, total = _post_nearby(
+            _, total = _post_nearby(
                 session,
                 limiter,
                 cell.lat,
@@ -398,11 +600,22 @@ def _probe_cell(
                 ipp=ipp,
                 access_token=access_token,
             )
-        except ProbeError as e:
+        except BackpressureError as e:
             logger.debug(f"r={cell.radius_m}m @ {cell.lat:.4f},{cell.lon:.4f}: {e}")
             continue
+        except TransportError as e:
+            logger.debug(f"r={cell.radius_m}m @ {cell.lat:.4f},{cell.lon:.4f}: transport: {e}")
+            if attempt == retries:
+                return None, attempt + 1, "broken"
+            continue
+        except ProbeError as e:
+            logger.warning(
+                f"r={cell.radius_m}m @ {cell.lat:.4f},{cell.lon:.4f}: not backpressure and "
+                f"not transient, NOT retrying and NOT subdividing: {e}"
+            )
+            return None, attempt + 1, "broken"
         return total, attempt + 1, ("ok_after_retry" if attempt else "ok")
-    return None, BACKPRESSURE_RETRIES + 1, "refused"
+    return None, retries + 1, "refused"
 
 
 def _bbox_area_km2(bbox: tuple[float, float, float, float]) -> float:
@@ -458,14 +671,16 @@ DEFAULT_MAX_REQUESTS_PER_CITY = 60
 
 def summarize(cities: list[dict]) -> dict:
     """Distribution over the study set. CLAUDE.md: quote the shape, not a headline."""
-    if not cities:
-        return {"n": 0}
-    est = sorted(c["sweep_requests_estimate"] for c in cities)
+    reachable = [c for c in cities if c.get("sweep_requests_estimate") is not None]
+    if not reachable:
+        return {"n": 0, "unreachable": len(cities)}
+    est = sorted(c["sweep_requests_estimate"] for c in reachable)
 
     def pct(q: float) -> int:
         return est[min(len(est) - 1, int(q * (len(est) - 1)))]
 
     visited = sum(c["cells_visited"] for c in cities)
+    radii = sorted(c["calibrated_radius_m"] for c in reachable)
     return {
         "n": len(est),
         "sweep_requests_estimate": {
@@ -476,13 +691,18 @@ def summarize(cities: list[dict]) -> dict:
             "mean": int(round(sum(est) / len(est))),
         },
         "plans_complete": sum(1 for c in cities if c["plan_complete"]),
-        "plans_truncated": sum(1 for c in cities if not c["plan_complete"]),
+        "plans_truncated": sum(1 for c in reachable if not c["plan_complete"]),
+        "unreachable": len(cities) - len(reachable),
+        # The finding this study turns on: the working radius is a property
+        # of the LOCATION, and it is what sets the cost.
+        "calibrated_radius_m": {"min": radii[0], "max": radii[-1], "p50": radii[len(radii) // 2]},
         "refusal_rate_over_cells_visited": (
             round(sum(c["refusals"] for c in cities) / visited, 4) if visited else None
         ),
         "retries_cleared": sum(c["retries_cleared"] for c in cities),
         "retries_attempted": sum(c["retries_attempted"] for c in cities),
         "floor_failures": sum(c["floor_failures"] for c in cities),
+        "broken_cells": sum(c.get("broken_cells", 0) for c in cities),
         "requests_spent_measuring": sum(c["requests_spent_planning"] for c in cities),
     }
 
