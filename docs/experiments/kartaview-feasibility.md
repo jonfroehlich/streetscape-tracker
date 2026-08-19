@@ -1,11 +1,12 @@
 # KartaView as a third provider: what the API actually gives us
 
 **Ran:** 2026-08-18 ·
-**Verdict:** The 360° imagery is real and openly licensed, but two things bite.
-**Grab's fleet imagery carries no capture date**, which is the field this project
-exists to track. And **`/1.0/list/nearby-photos/` does not return a spatial
-sample**, so almost every percentage you can compute from it is a paging
-artifact — including several in the first draft of this document.
+**Verdict:** The 360° imagery is real and openly licensed, and two things bite.
+**Grab's 2025-11 upload batch carries no capture date at all** — the field this
+project exists to track — though their 2023 batch does, so it reads as a fixable
+regression rather than a policy. And **`/1.0/list/nearby-photos/` does not return
+a spatial sample**, so almost every percentage computed from it is a paging
+artifact, including several in the first draft of this document.
 
 ## The question
 
@@ -51,32 +52,48 @@ Both were the artifact above.
 
 ## Findings
 
-### 1. Grab fleet imagery has no capture date — and that is per-uploader, not per-city
+### 1. Missing capture dates are one 2025 upload batch, not a policy
 
-`shot_date` is contributor EXIF; `date_added` is server-side upload time. The
-durable relationship is visible where 360° share and null-date share track each
-other almost exactly, at Malioboro (uploader `OpenStreetView`, the Grab fleet
-account, `userId 44`):
+`shot_date` is contributor EXIF; `date_added` is server-side upload time.
+**Missingness is per-SEQUENCE and absolute** — every drive examined is either
+100% dated or 0% dated, never mixed, so a date cannot be borrowed from a
+sequence-mate:
 
-| Malioboro | r=100 | r=200 | r=300 | r=400 | r=500 |
-|---|---|---|---|---|---|
-| % SPHERE | 19.0 | 63.5 | 100.0 | 100.0 | 100.0 |
-| % null `shot_date` | 19.0 | 63.0 | 100.0 | 100.0 | 100.0 |
+| point | sequence | n | dated | projection | uploader | `shot_date` | `date_added` |
+|---|---|---|---|---|---|---|---|
+| Krabi | 8313353 | 80 | **100%** | SPHERE | `OpenStreetView` | 2023-03-18 | 2023-11-23 |
+| Krabi | 8313849 | 6 | **100%** | SPHERE | `OpenStreetView` | 2023-03-19 | 2023-11-23 |
+| Krabi | 11616147 | 39 | **0%** | SPHERE | `OpenStreetView` | — | 2025-11-19 |
+| Malioboro | 11616132 | 19 | **0%** | SPHERE | `OpenStreetView` | — | 2025-11 |
+| Malioboro | 2746902 | 38 | **100%** | PLANE | community | 2020-07 | 2020-07 |
+| Seattle | 11606856 | 7 | **100%** | **SPHERE** | community | 2025-09 | 2025-09 |
+| Seattle | 583523 | 19 | **100%** | PLANE | community | 2017-09 | 2017-09 |
 
-The two move together to within half a point across five radii: **the Grab 360°
-sequences are exactly the undated ones.** Seattle is the control that shows this
-is about the *uploader*, not the projection — its r=500 page is 100% SPHERE and
-**0% null**, from a single community contributor. Community 360° is dated; Grab
-fleet 360° is not.
+The pattern is narrow and specific: **the only undated sequences are Grab's
+2025-11 bulk upload** (ids `1161…`). Grab's *own* 2023 upload of Krabi is fully
+dated, and a community **360°** sequence in Seattle is fully dated. So this is
+neither "Grab never publishes dates" nor "360° imagery is undated" — it reads as
+a regression in one 2025 ingest, and therefore as something that could be fixed
+or backfilled.
 
-The only fallback is `date_added`, which is *upload* time: Krabi's and
-Yogyakarta's Grab sequences were bulk-uploaded on the same day (2025-11-19, with
-adjacent sequence ids) though their imagery was captured at unknown and certainly
-different times. So a collector may fall back to `date_added`, but **must record
-which field it used**. Publishing an upload year in the same column as a capture
-year would silently invalidate every temporal claim built on it — a mistake this
+Two lags fall out of the same table, and they differ by an order of magnitude:
+**community uploaders publish in the month they shoot** (2017-09/2017-09,
+2020-05/2020-05, 2025-09/2025-09), while **Grab's 2023 batch lagged 8 months**
+(shot 2023-03, uploaded 2023-11). So `date_added` is a usable proxy for capture
+on community imagery and a weak upper bound on Grab imagery.
+
+A collector may therefore fall back to `date_added`, but **must record which
+field it used**. Publishing an upload year in the same column as a capture year
+would silently invalidate every temporal claim built on it — a mistake this
 study's own tooling made before it was split into
 `capture_year_counts_shot_date` and `upload_year_counts_date_added`.
+
+**What our own dated snapshots add**, given `date_added` already timestamps
+uploads per photo to the second (finer than any collection cadence): not capture
+bounds, but *removal* detection, detection of a later `shot_date` backfill, and
+— each time a future batch does carry `shot_date` — another measurement of the
+capture→upload lag, which is the only route from `date_added` to a capture
+estimate.
 
 ### 2. There is no bulk metadata endpoint — the shape is a radius sweep
 
@@ -144,9 +161,10 @@ The whole of this study fits inside the anonymous tier.
   `projection=` filter causes timeouts.)
 - **Sequence identity**: `sequence_id` is first-class and richer than Mapillary's
   — per-drive bbox, `deviceName` (`KartaCam2`), photo count, and `userId`, which
-  is what separates the Grab fleet (`userId 44`, `OpenStreetView`) from
-  individuals. Given finding 1, **`userId` is the field that tells you whether a
-  photo can be dated at all.**
+  separates the Grab fleet (`userId 44`, `OpenStreetView`) from individuals.
+  Given finding 1, **the sequence is the unit at which datedness is decided**, so
+  a collector can determine a whole drive's date availability from one photo of
+  it rather than per-row.
 - **Licence**: CC BY-SA 4.0 on imagery and metadata, with a publisher-specified
   citation string. ShareAlike is viral over derived data.
 
