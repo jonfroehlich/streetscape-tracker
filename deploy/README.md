@@ -142,10 +142,30 @@ systemctl --user enable --now streetscape-tracker.timer
 loginctl enable-linger $USER       # user services must survive logout
 ```
 
-The service ships with resource caps (`MemoryMax=8G`, `CPUQuota=400%`,
-`Nice=10`, `CPUWeight=50`) so nightly collection can't starve the other lab
-services that share the box and the storage array. If `enable-linger` is
-disallowed by policy, ask CSE IT to enable lingering for your account.
+The service ships with resource caps (`MemoryHigh=12G`, `MemoryMax=24G`,
+`CPUQuota=400%`, `Nice=10`, `CPUWeight=50`) so nightly collection can't starve
+the other lab services that share the box and the storage array. The memory
+numbers are measured, not guessed, and the unit file carries the measurement
+and the date beside them — read that before changing either. If `enable-linger`
+is disallowed by policy, ask CSE IT to enable lingering for your account.
+
+**`systemctl --user set-property` overrides this unit file, permanently and
+invisibly.** It writes a drop-in under
+`~/.config/systemd/user.control/streetscape-tracker.service.d/`, and drop-ins
+take precedence over the main unit — so a property set that way keeps winning
+after you copy a new unit over, and every later edit to that property in
+`deploy/systemd/` is silently ignored. This is not hypothetical: the 12G/24G
+caps ran on makelab2 that way from 2026-08-18 until the unit caught up. If you
+ever use `set-property` for a live emergency, fold the value into the unit file
+afterwards and then revert the override, so the repo stays authoritative:
+
+```bash
+systemctl --user revert streetscape-tracker.service        # drop ALL set-property overrides
+cp deploy/systemd/streetscape-tracker.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user show streetscape-tracker.service -p MemoryHigh -p MemoryMax
+#   want whatever deploy/systemd/ says — if it doesn't match, a drop-in is still winning
+```
 
 ### Host = makelab2, and the shared-home cutover model
 
@@ -208,9 +228,18 @@ systemctl --user kill streetscape-tracker.service     # immediate death, no tail
 **`stop` is a wind-down, not a kill.** The in-flight collection child dies with
 the cgroup, the loop declines to start any further channel *or* city, and the
 tail still runs — aggregate, streetwalk manifest, driving-plan summary, catalog
-backup, publish — so the night's collected runs reach the public site. It exits
-**0** and sends no alert. The stopped city's remaining channels are not marked
-failed: they keep their cadence, stay due, and lead the next batch's queue.
+backup, publish — so the night's collected runs reach the public site. The
+stopped city's remaining channels are not marked failed: they keep their
+cadence, stay due, and lead the next batch's queue, and the log names them
+(`stop requested — not starting mapillary, mapillary_streets`).
+
+**The stop itself exits 0 and sends no alert — but the night can still be
+unhealthy for its own reasons.** A stop does not suppress anything that had
+already gone wrong, and three conditions alert unconditionally, ignoring
+`[alerts].failure_threshold`: a host that refused this IP (#208), a failed
+catalog backup (#145), and a failed driving-plan fetch (#176). So a
+`host(s) UNAVAILABLE` email arriving after you typed `stop` is the wind-down
+working, not failing — read the subject before assuming otherwise.
 
 It is bounded by `TimeoutStopSec=30min`. Reaching that is a SIGKILL with no tail
 — the 2026-08-13 shape, where a night's runs sat unpublished until someone ran
@@ -591,10 +620,17 @@ systemd-cgtop                                        # live CPU/mem per cgroup �
 systemctl --user show streetscape-tracker.service -p MemoryPeak -p CPUUsageNSec
 ```
 
-Validate the caps after the first live night: if `MemoryPeak` approaches
-`MemoryMax`, raise it (or lower `batch_size`/`connection_limit` in the TOML).
-Data lives on NFS, so IO is network (not block-device) — CPU/memory caps and
-`Nice` are the real levers; `IOWeight` would not govern it.
+Validate the caps after the first live night. Watch `MemoryPeak` against
+**`MemoryHigh`**, not just `MemoryMax`: `MemoryHigh` is a throttle, so crossing
+it costs hours of silent reclaim ending in a timeout SIGKILL, while `MemoryMax`
+is a fast OOM kill you can actually read in a log. A run pinned a couple of MiB
+above `MemoryHigh` is a throttled run, not a comfortable one — that is precisely
+how the 2026-08-18 Ho Chi Minh City hang presented (see the unit file's own
+rationale block, and issue #157).
+
+On makelab2 `data/` is on a **local** ZFS pool, so IO here *is* block-device —
+add `IOWeight=` if a night is ever found to compete with the box's NFS serving.
+CPU and memory caps plus `Nice` remain the levers that have actually mattered.
 
 ### Failure alerts (email)
 

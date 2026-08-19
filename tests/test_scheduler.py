@@ -2383,7 +2383,9 @@ def _sigterm_cfg(**overrides):
     return _street_cfg(publish_enabled=True, max_cities_per_day=20, **overrides)
 
 
-def test_sigterm_stops_the_city_mid_channel_instead_of_finishing_its_channels(conn, monkeypatch):
+def test_sigterm_stops_the_city_mid_channel_instead_of_finishing_its_channels(
+    conn, monkeypatch, caplog
+):
     """A stop must not launch the rest of the in-flight city's channels.
 
     Before #206 it did: `sigterm_seen` was checked only in _run_city_loop's outer
@@ -2391,7 +2393,15 @@ def test_sigterm_stops_the_city_mid_channel_instead_of_finishing_its_channels(co
     other three. With Mapillary enabled those are fired straight into a live
     per-IP tile block (#205) — the exact thing an operator typing `stop` is
     usually trying to prevent.
+
+    The child here RETURNS before the signal reaches it, which is the uncommon
+    shape: it exercises the top-of-loop exit. The common one — the child dying
+    of the same cgroup SIGTERM — is
+    test_a_child_killed_by_the_stop_… below, and both must name the channels
+    they declined.
     """
+    import logging
+
     from streetscape_metadata_tracker import scheduler as sched
 
     for name in ("Alpha", "Beta"):
@@ -2411,7 +2421,8 @@ def test_sigterm_stops_the_city_mid_channel_instead_of_finishing_its_channels(co
     monkeypatch.setattr(sched, "_run_one_city", fake_run)
     _stub_tail(monkeypatch, sched, conn, published)
 
-    rc = sched.cmd_run_due(_sigterm_cfg(), today=date(2026, 7, 2))
+    with caplog.at_level(logging.INFO):
+        rc = sched.cmd_run_due(_sigterm_cfg(), today=date(2026, 7, 2))
 
     assert [p for _, p in ran] == ["gsv"], (
         "the stop must land before the city's next channel is launched"
@@ -2424,6 +2435,12 @@ def test_sigterm_stops_the_city_mid_channel_instead_of_finishing_its_channels(co
         "a stopped night must still publish what it collected"
     )
     assert rc == 0, "an operator-requested stop is not an unhealthy night"
+    assert "not starting gsv_streets, mapillary, mapillary_streets" in caplog.text, (
+        "a wind-down must NAME the channels it declined: they are the ones an "
+        "operator stopped the batch to keep away from a live tile block, and "
+        "'nothing was collected' and 'three channels were declined' are "
+        "different facts"
+    )
 
 
 def test_a_stop_skips_the_inter_city_sleep(conn, monkeypatch):
@@ -2490,7 +2507,7 @@ def test_a_stop_on_the_last_due_city_still_reports_the_night_was_cut_short(
     assert rc == 0
 
 
-def test_a_child_killed_by_the_stop_is_not_recorded_as_the_citys_failure(conn, monkeypatch):
+def test_a_child_killed_by_the_stop_is_not_recorded_as_the_citys_failure(conn, monkeypatch, caplog):
     """KillMode defaults to control-group, so the stop that ends the batch also
     kills the in-flight child — the 2026-08-13 log shows it as `exited -15`, a
     code in neither HOST_BY_EXIT_CODE nor HOST_BY_BUSY_EXIT_CODE, i.e. an
@@ -2501,7 +2518,16 @@ def test_a_child_killed_by_the_stop_is_not_recorded_as_the_citys_failure(conn, m
     one of five `consecutive_failures` that ONLY a success ever resets, and it
     makes attempted > succeeded, so every deliberate `systemctl stop` would email
     a failure alert and end the unit red.
+
+    This is also the exit a real stop TAKES — the child dies before the loop can
+    come back around to the top-of-loop check — so it is the one that has to
+    name the declined channels. While that message lived only at the top of the
+    loop, the entire operator-visible record of a stopped four-channel night was
+    "child was killed by the stop signal" and nothing about the three channels
+    silently dropped with it.
     """
+    import logging
+
     from streetscape_metadata_tracker import scheduler as sched
 
     _register(conn, "Alpha", width=1000, height=1000, step=20)
@@ -2520,10 +2546,20 @@ def test_a_child_killed_by_the_stop_is_not_recorded_as_the_citys_failure(conn, m
     monkeypatch.setattr(sched, "send_alert", lambda *a, **k: alerts.append(a))
     _stub_tail(monkeypatch, sched, conn, [])
 
-    rc = sched.cmd_run_due(_sigterm_cfg(), today=date(2026, 7, 2))
+    with caplog.at_level(logging.INFO):
+        rc = sched.cmd_run_due(_sigterm_cfg(), today=date(2026, 7, 2))
 
     assert rc == 0, "a child we killed on purpose is not an unhealthy night"
     assert alerts == [], "stopping the batch must not email a failure alert"
+    assert "not starting gsv_streets, mapillary, mapillary_streets" in caplog.text, (
+        "the exit a real stop takes must name the declined channels too — the "
+        "killed child is reported on its own line, so this lists what comes "
+        "AFTER it, not including it"
+    )
+    assert "not starting gsv," not in caplog.text, (
+        "the killed channel was started; listing it as declined would misreport "
+        "where the batch actually stopped"
+    )
     failures = conn.execute(
         "SELECT consecutive_failures FROM schedule_state WHERE provider = 'gsv'"
     ).fetchone()[0]
@@ -2531,6 +2567,26 @@ def test_a_child_killed_by_the_stop_is_not_recorded_as_the_citys_failure(conn, m
         "nothing resets consecutive_failures except a success, so a handful of "
         "stops would quarantine the city for a whole cycle"
     )
+
+
+def test_a_stop_on_a_citys_last_channel_declines_nothing_out_loud(caplog):
+    """The killed-child exit passes `providers[i + 1:]`, which is EMPTY when the
+    stop lands on a city's last channel. A wind-down that logged "not starting"
+    with an empty list would read as work skipped that never existed — the
+    inverse of the bug this message exists to fix, and just as misleading in an
+    incident.
+    """
+    import logging
+
+    from streetscape_metadata_tracker import scheduler as sched
+
+    with caplog.at_level(logging.INFO):
+        sched._log_stop_declined("alpha", [])
+    assert "not starting" not in caplog.text
+
+    with caplog.at_level(logging.INFO):
+        sched._log_stop_declined("alpha", ["mapillary_streets"])
+    assert "alpha: stop requested — not starting mapillary_streets" in caplog.text
 
 
 def test_run_city_channels_requires_an_explicit_stop_signal():
@@ -3345,6 +3401,15 @@ def test_backup_check_unit_matches_the_collection_unit(tmp_path):
     assert "[Install]" in timer and "OnCalendar=" in timer
 
 
+# Worst aggregate + streetwalk-manifest rebuild measured on prod: 7m15s on the
+# 19-city night of 2026-08-18 (a small night is ~1.6 s). A named constant rather
+# than a literal because it is a MEASUREMENT — the unit file quotes the same
+# figure, and the next re-sizing of TimeoutStopSec has to argue from a number
+# with a date on it. Re-measure from the scheduler log's own timestamps; the
+# publish half of the tail is now the `Published in N.N s` line (issue #206).
+_MEASURED_TAIL_AGGREGATE_S = 435
+
+
 def test_stop_timeout_covers_the_publish_tail_it_waits_for():
     """
     `systemctl stop` is a wind-down that still runs the tail, so the unit's stop
@@ -3367,12 +3432,19 @@ def test_stop_timeout_covers_the_publish_tail_it_waits_for():
     assert m, "the unit must set TimeoutStopSec explicitly; systemd's default is 90 s (#206)"
     stop_s = int(m.group(1)) * {None: 1, "s": 1, "min": 60, "h": 3600}[m.group(2)]
 
-    assert stop_s > catalog_backup.BACKUP_TIMEOUT_S, (
-        f"TimeoutStopSec={stop_s:.0f}s cannot even reach the publish: the tail's "
+    # The floor is the SUM of the tail's two large known terms, not the larger of
+    # them. Asserting only `> BACKUP_TIMEOUT_S` accepted 11min — which the very
+    # sentence justifying that bound rules out, since the aggregate runs BEFORE
+    # the backup and neither term substitutes for the other.
+    floor_s = catalog_backup.BACKUP_TIMEOUT_S + _MEASURED_TAIL_AGGREGATE_S
+    assert stop_s > floor_s, (
+        f"TimeoutStopSec={stop_s:.0f}s cannot reach the publish: the tail's "
         f"catalog backup ALONE is hard-bounded at "
-        f"{catalog_backup.BACKUP_TIMEOUT_S:.0f}s, and aggregate+manifest measured "
-        f"7m15s on the 19-city night of 2026-08-18. This is why #206's suggested "
-        f"10min would have been wrong."
+        f"{catalog_backup.BACKUP_TIMEOUT_S:.0f}s and aggregate+manifest measured "
+        f"{_MEASURED_TAIL_AGGREGATE_S:.0f}s on the 19-city night of 2026-08-18, "
+        f"so anything at or below {floor_s:.0f}s SIGKILLs the wind-down before "
+        f"the rsync it exists to reach. This is why #206's suggested 10min would "
+        f"have been wrong — and 11min would have been too."
     )
     cfg = load_scheduler_config(os.path.join(_PROJECT_ROOT, "config", "scheduler.makelab1.toml"))
     assert stop_s < cfg.max_batch_hours * 3600, (

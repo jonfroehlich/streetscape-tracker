@@ -137,6 +137,17 @@ ReadWritePaths=/cse/web/research/makelab/public/streetscape-tracker
 # 4G threshold, i.e. held right at it, which is what a throttled cgroup looks
 # like, not a comfortable one. 12G gives the measured tail ~2.5x headroom on top
 # of the concurrently-live census structures; 24G is the hard stop.
+#
+# KNOWN REMAINING GAP: 12G does not cover the largest cities. Peak scales at
+# ~0.914 GiB per million CSV rows (5.26M -> 4.81 GiB measured), so Detroit's
+# ~16.7M rows extrapolate to ~15.3 GiB — over MemoryHigh, under MemoryMax.
+# That matters because of WHICH cap it crosses: MemoryHigh is a throttle, not a
+# limit, so exceeding it reproduces exactly the failure diagnosed above — hours
+# of silent reclaim ending in the scheduler's 180-min city timeout — rather than
+# a fast, legible OOM kill at MemoryMax. If a big-city night hangs again with no
+# output, check MemoryPeak against 12G FIRST; the fix is a bigger MemoryHigh (or
+# no MemoryHigh at all), not a longer city timeout.
+#
 # Re-validate after a live night and tune:
 #   systemctl --user show streetscape-tracker.service -p MemoryPeak -p CPUUsageNSec
 Nice=10

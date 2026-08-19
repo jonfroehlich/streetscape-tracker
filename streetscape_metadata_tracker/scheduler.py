@@ -2706,6 +2706,34 @@ def cmd_run_due(
     )
 
 
+def _log_stop_declined(city_id: str, declined: list[str]) -> None:
+    """Name the channels a wind-down is choosing not to start (issue #206).
+
+    Shared by BOTH of ``_run_city_channels``' stop exits, because the one an
+    operator actually hits is not the one that reads like the main path. The
+    unit's ``KillMode`` defaults to control-group, so a ``systemctl stop``
+    reaches the in-flight child too: it dies first, and the loop therefore
+    leaves via the killed-child branch and never comes back around to the
+    top-of-loop check. While this message lived only at the top of the loop, a
+    real stop named no declined channel at all — and with Mapillary enabled
+    those are exactly the ones that would otherwise have fired into a live
+    per-IP tile block (#205), i.e. usually the thing the operator typing
+    ``stop`` was trying to prevent. Duplicating the wording at both exits would
+    have re-opened the same gap on the next edit, so it lives here once.
+
+    Silent when there is nothing left to decline (a stop landing on a city's
+    last channel), so the log can never claim a wind-down skipped work that did
+    not exist.
+    """
+    if not declined:
+        return
+    logger.info(
+        f"{city_id}: stop requested — not starting {', '.join(declined)}. "
+        f"Not counted as failures; these channels keep their cadence and lead "
+        f"the next batch's queue."
+    )
+
+
 def _run_city_channels(
     cfg: SchedulerConfig,
     conn,
@@ -2775,16 +2803,12 @@ def _run_city_channels(
         # the blocked-host guard, for that guard's own stated reason: there is
         # no point pricing work we already know we will not do.
         #
-        # Naming the declined channels matters more here than in the skip paths
-        # above: with Mapillary enabled these are the ones that would have fired
-        # into a live per-IP tile block (#205) — which is usually the exact
-        # thing the operator typing `stop` was trying to prevent (issue #206).
+        # This is NOT the exit a real `systemctl stop` usually takes — see
+        # _log_stop_declined, which both exits share. It fires when the stop
+        # lands in a gap between children (the budget queries, the resource
+        # guard) or when a child finished before the signal reached it.
         if stop_requested is not None and stop_requested.is_set():
-            logger.info(
-                f"{city.city_id}: stop requested — not starting "
-                f"{', '.join(providers[i:])}. Not counted as failures; these "
-                f"channels keep their cadence and lead the next batch's queue."
-            )
+            _log_stop_declined(city.city_id, providers[i:])
             break
 
         # A host this channel needs already refused us during this run. Skip
@@ -2943,6 +2967,11 @@ def _run_city_channels(
                 f"{city.city_id} [{provider}]: child was killed by the stop "
                 f"signal ({reason}) — not counted as a failure for this city."
             )
+            # `i + 1`, not `i`: this channel WAS started, and the line above
+            # already accounts for it. Everything after it is what the stop
+            # declines, and this is the exit that actually reaches an operator's
+            # log — see _log_stop_declined.
+            _log_stop_declined(city.city_id, providers[i + 1 :])
             break
 
         attempted += 1
