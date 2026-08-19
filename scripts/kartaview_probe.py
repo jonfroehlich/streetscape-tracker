@@ -150,6 +150,26 @@ TARGETS: dict[str, dict[str, Any]] = {
 
 DOCS_METRICS_NAME = "kartaview-feasibility_metrics.json"
 
+# The record's own method note, hoisted to a constant so a test can pin the
+# COMMITTED record against it. It drifted once already: it claimed the reported
+# rung was the smallest complete one for as long as the code took the largest,
+# and because nothing compared the two it regenerated wrong on every run.
+DOCS_RECORD_NOTE = (
+    "Feasibility probe for adding KartaView as a third provider. Radius-mode "
+    "/1.0/list/nearby-photos/ only -- there is no metadata tile endpoint and the v2 "
+    "spatial query returns apiCode 408. READ COMPLETENESS BEFORE QUOTING ANY SHARE: "
+    "the endpoint fills a page by SEQUENCE, not by space, so a percentage over an "
+    "incomplete page describes one drive rather than one neighbourhood -- it is NOT "
+    "an estimate of the local mix. A rung is quotable only where complete == true "
+    "(n_sampled >= total_filtered_items with n_sampled > 0); each target's "
+    "reported_* fields are taken from the LARGEST complete rung -- once nothing "
+    "was paged away, a bigger circle is strictly more evidence -- while "
+    "max_working_radius_m is a separate cost measurement (the largest circle the "
+    "server answers) and its shares are usually the artifact. A target where every "
+    "radius failed is recorded with max_working_radius_m = null and is NOT evidence "
+    "of absent imagery."
+)
+
 
 def docs_generated_by(args: argparse.Namespace) -> str:
     """
@@ -547,20 +567,7 @@ def write_docs_record(results: list[dict], args: argparse.Namespace, authed: boo
             else REQUESTS_PER_HOUR_ANON,
             "ipp": args.ipp,
             "radius_ladder_m": list(RADIUS_LADDER_M),
-            "note": (
-                "Feasibility probe for adding KartaView as a third provider. Radius-mode "
-                "/1.0/list/nearby-photos/ only -- there is no metadata tile endpoint and the v2 "
-                "spatial query returns apiCode 408. READ COMPLETENESS BEFORE QUOTING ANY SHARE: "
-                "the endpoint fills a page by SEQUENCE, not by space, so a percentage over an "
-                "incomplete page describes one drive rather than one neighbourhood -- it is NOT "
-                "an estimate of the local mix. A rung is quotable only where complete == true "
-                "(n_sampled >= total_filtered_items with n_sampled > 0); each target's "
-                "reported_* fields are taken from the SMALLEST complete rung, while "
-                "max_working_radius_m is a separate cost measurement (the largest circle the "
-                "server answers) and its shares are usually the artifact. A target where every "
-                "radius failed is recorded with max_working_radius_m = null and is NOT evidence "
-                "of absent imagery."
-            ),
+            "note": DOCS_RECORD_NOTE,
         },
         "targets": results,
     }
