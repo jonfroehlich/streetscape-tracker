@@ -50,7 +50,12 @@ import mapbox_vector_tile
 import numpy as np
 import pandas as pd
 
-from . import census
+# Aliased, because `census` is also the name of the local DataFrame this
+# module passes around (see fetch_city_images_async). Importing the module
+# as `census` would work today only because those locals live in other
+# functions -- and would break the first time someone called a census
+# helper from one of them, with a DataFrame AttributeError.
+from . import census as census_core
 from .analysis import FLAT_ONLY, REQUEST_FAILED
 from .census import dedupe_census, status_for_capture_dates
 from .config import MAPILLARY_METADATA_DTYPES
@@ -324,7 +329,7 @@ def records_to_census(records: list[dict[str, Any]]) -> pd.DataFrame:
     tile's dicts are freed before the next tile is decoded rather than every
     tile's surviving until the whole city has downloaded.
 
-    Mapillary's binding of :func:`census.records_to_census`.
+    Mapillary's binding of :func:`census_core.records_to_census`.
 
     Args:
         records: decoded image dicts from :func:`decode_image_features`.
@@ -332,19 +337,19 @@ def records_to_census(records: list[dict[str, Any]]) -> pd.DataFrame:
     Returns:
         A DataFrame with the :data:`_CENSUS_DTYPES` columns, one row per image.
     """
-    return census.records_to_census(records, _CENSUS_DTYPES)
+    return census_core.records_to_census(records, _CENSUS_DTYPES)
 
 
 def concat_census(frames: list[pd.DataFrame]) -> pd.DataFrame:
     """Combine per-tile census frames into one, preserving tile order."""
-    return census.concat_census(frames, _CENSUS_DTYPES)
+    return census_core.concat_census(frames, _CENSUS_DTYPES)
 
 
 def _mapillary_image_columns(picked: pd.DataFrame) -> dict[str, Any]:
     """
     Mapillary's own output columns: the copyright convention plus its extras.
 
-    Handed to :func:`census.build_image_rows`, which fills the shared core.
+    Handed to :func:`census_core.build_image_rows`, which fills the shared core.
     """
     # As text once: the contributor id is published both as its own structured
     # column and (for parity with GSV's "© <photographer>") inside the
@@ -379,10 +384,10 @@ def build_image_rows(
 
     Shared by the grid downloader (query location = a frozen grid point) and
     the road-walk collector (query location = an on-street sample point).
-    Mapillary's binding of :func:`census.build_image_rows`; see there for the
+    Mapillary's binding of :func:`census_core.build_image_rows`; see there for the
     argument contract.
     """
-    return census.build_image_rows(
+    return census_core.build_image_rows(
         census_frame,
         image_positions,
         query_lat,
@@ -400,9 +405,9 @@ def build_empty_rows(query_lat, query_lon, query_timestamp: str, status) -> pd.D
     Rows for query locations with no imagery — the ZERO_RESULTS fill, plus the
     REQUEST_FAILED variant for points under an undownloaded tile.
 
-    Mapillary's binding of :func:`census.build_empty_rows`.
+    Mapillary's binding of :func:`census_core.build_empty_rows`.
     """
-    return census.build_empty_rows(
+    return census_core.build_empty_rows(
         query_lat, query_lon, query_timestamp, status, dtypes=MAPILLARY_METADATA_DTYPES
     )
 
