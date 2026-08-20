@@ -11,9 +11,11 @@ process.env.TZ = "America/Los_Angeles";
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const { execFileSync } = require("node:child_process");
+const { readFileSync } = require("node:fs");
 
 const {
   PROVIDERS,
+  LOOSEST_EARLIEST_PLAUSIBLE_CAPTURE,
   METRICS,
   adaptCityRecord,
   escapeHtml,
@@ -154,6 +156,129 @@ test("adaptCityRecord: v3 per-provider block, null when provider missing", () =>
   assert.deepEqual(gsv.capture_year_histogram, { counts: { 2020: 5 } });
   // No mapillary block on this city → adapted record is null (omitted upstream).
   assert.equal(adaptCityRecord(v3, "mapillary"), null);
+});
+
+// --- the registry is the authority, not a two-provider `if` ----------------
+//
+// These drive a THIRD provider that is not in PROVIDERS today. Every one of
+// them passed before the registry flags existed -- by accident, because the
+// old `isGsv ? ... : ...` happened to fall to Mapillary's shape. What they pin
+// is that the fallback is a decision the registry makes, not a coincidence.
+
+const THIRD_PROVIDER_V3 = {
+  city_id: "bend--or",
+  city: { name: "Bend", state: "OR", country: "USA" },
+  providers: {
+    thirdparty: {
+      latest: {
+        run_date: "2026-07-05",
+        panorama_counts: { unique_panos: 40, unique_google_panos: 7 },
+        histogram_of_capture_dates_by_year: {
+          google_panos: { counts: { 2020: 1 } },
+          all_panos: { counts: { 2021: 3 } },
+        },
+        google_panos_age_stats: { median_pano_age_years: 1 },
+        all_panos_age_stats: { median_pano_age_years: 5 },
+        coverage_rate_percent: 50,
+        search_area_km2: 25,
+        data_file: "c",
+        json_file: "d",
+      },
+      runs: [],
+      change: null,
+    },
+  },
+};
+
+test("adaptCityRecord: a provider with no copyright filter reads the all-panos blocks", () => {
+  // Not registered at all, so hasCopyrightFilter is absent -> false. A census
+  // provider must never inherit GSV's google-filtered preference, or its
+  // headline pano count silently becomes a subset it does not publish.
+  const rec = adaptCityRecord(THIRD_PROVIDER_V3, "thirdparty");
+  assert.equal(rec.pano_count, 40);
+  assert.deepEqual(rec.pano_age_stats, { median_pano_age_years: 5 });
+  assert.deepEqual(rec.capture_year_histogram, { counts: { 2021: 3 } });
+});
+
+test("adaptCityRecord: the copyright-filtered preference is read off the registry", () => {
+  // The same record, adapted as a provider the registry DOES mark as
+  // copyright-filtered, must take the google_* blocks -- proving the choice
+  // follows the flag rather than the literal string "gsv".
+  const restore = PROVIDERS.thirdparty;
+  PROVIDERS.thirdparty = { ...PROVIDERS.gsv, hasCopyrightFilter: true };
+  try {
+    const rec = adaptCityRecord(THIRD_PROVIDER_V3, "thirdparty");
+    assert.equal(rec.pano_count, 7);
+    assert.deepEqual(rec.pano_age_stats, { median_pano_age_years: 1 });
+    assert.deepEqual(rec.capture_year_histogram, { counts: { 2020: 1 } });
+  } finally {
+    if (restore === undefined) delete PROVIDERS.thirdparty;
+    else PROVIDERS.thirdparty = restore;
+  }
+});
+
+test("every registered provider declares both capability flags", () => {
+  // A missing flag is falsy, so an omission is not an error -- it silently
+  // means "no flat imagery, no copyright filter", which for a census provider
+  // is wrong in a way nothing else would surface.
+  for (const [key, p] of Object.entries(PROVIDERS)) {
+    assert.equal(typeof p.hasCopyrightFilter, "boolean", key);
+    assert.equal(typeof p.hasFlatImagery, "boolean", key);
+  }
+});
+
+/**
+ * Drop comments from JS source so a source-inspection test reads only code.
+ *
+ * Deliberately crude: block comments, and lines that are ENTIRELY a line
+ * comment. A trailing `// …` on a code line survives, which is fine here —
+ * the point is that a comment ABOUT the old branch (there is one, in city.js's
+ * providerHasCopyrightFilter docblock) must not read as the branch itself.
+ *
+ * @param {string} src - JavaScript source.
+ * @returns {string} The same source with comments blanked out.
+ */
+function stripComments(src) {
+  return src
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .split("\n")
+    .filter((line) => !/^\s*\/\//.test(line))
+    .join("\n");
+}
+
+test("city.js asks the registry for the copyright split, not for the provider's name", () => {
+  // A source check because no behavioural one can catch this: city.js has FOUR
+  // branches deciding the same thing (does this provider publish a copyright
+  // field?), and with only gsv and mapillary registered, `=== "gsv"` and
+  // hasCopyrightFilter agree on every input. The fifth site that spells it the
+  // old way would therefore ship green and only misbehave for a provider that
+  // does not exist yet.
+  //
+  // Scoped to city.js on purpose: index.js still compares against "gsv" in
+  // setProvider and at load, but those are the URL-param DEFAULT (?provider=
+  // is omitted for gsv), not a question about what the provider publishes.
+  const src = stripComments(readFileSync(require.resolve("../city.js"), "utf8"));
+  for (const forbidden of [
+    'providerGlobal === "gsv"',
+    'providerGlobal !== "gsv"',
+    'providerGlobal === "mapillary"',
+    'providerGlobal !== "mapillary"',
+  ]) {
+    assert.ok(!src.includes(forbidden), `city.js still branches on ${forbidden}`);
+  }
+  // ...and what it asks instead is a flag the registry actually declares.
+  assert.match(src, /PROVIDERS\[providerGlobal\]\?\.hasCopyrightFilter/);
+  assert.equal(typeof PROVIDERS.gsv.hasCopyrightFilter, "boolean");
+});
+
+test("the unknown-provider date floor is the loosest registered one, not a named provider", () => {
+  const floors = Object.values(PROVIDERS).map((p) => p.earliestPlausibleCapture.getTime());
+  assert.equal(LOOSEST_EARLIEST_PLAUSIBLE_CAPTURE.getTime(), Math.min(...floors));
+  // An unknown provider drops as little as possible: a too-tight fallback
+  // deletes real imagery from the map, which is the more expensive error.
+  const old = panoDateOrNull("2005-06-01");
+  assert.equal(isPlausibleCaptureDate(old, "notaprovider"), true);
+  assert.equal(isPlausibleCaptureDate(old, "gsv"), false);
 });
 
 // --- issue #116: any-imagery coverage stratification -----------------------
@@ -366,7 +491,7 @@ test("isValidRunFilename: rejects traversal and non-run artifacts", () => {
 test("isKnownProvider: real keys yes, prototype members no", () => {
   assert.equal(isKnownProvider("gsv"), true);
   assert.equal(isKnownProvider("mapillary"), true);
-  assert.equal(isKnownProvider("kartaview"), false);
+  assert.equal(isKnownProvider("notaprovider"), false);
   // Object.prototype members are truthy via PROVIDERS[key] but are NOT
   // providers — ?provider=constructor used to break the whole UI.
   assert.equal(isKnownProvider("constructor"), false);
@@ -384,7 +509,7 @@ test("getProviderFromFilename: token detection is prototype-safe", () => {
     "mapillary");
   // Unknown and prototype-member tokens both fall back to gsv.
   assert.equal(
-    getProviderFromFilename("bend--or_width_5000_height_5000_step_20_kartaview_2026-07-05.csv.gz"),
+    getProviderFromFilename("bend--or_width_5000_height_5000_step_20_notaprovider_2026-07-05.csv.gz"),
     "gsv");
   assert.equal(
     getProviderFromFilename("bend--or_width_5000_height_5000_step_20_constructor_2026-07-05.csv.gz"),
@@ -510,7 +635,7 @@ test("isPlausibleCaptureDate: the floor is inclusive in every timezone", () => {
   // the floor is rejected east of UTC while analysis.plausible_capture_mask
   // (an inclusive `between`) keeps it in every published artifact. The map's
   // pano set would then depend on the viewer's timezone.
-  for (const p of ["gsv", "mapillary"]) {
+  for (const p of Object.keys(PROVIDERS)) {
     assert.equal(PROVIDERS[p].earliestPlausibleCapture.getHours(), 0);
     const onTheFloor = panoDateOrNull(
       `${PROVIDERS[p].earliestPlausibleCapture.getFullYear()}-01-01`);
@@ -612,7 +737,7 @@ test("getColor: half the provider max is the orange middle stop", () => {
 });
 
 test("getColor: unknown provider falls back to the gsv scale", () => {
-  assert.equal(getColor(7, "kartaview"), getColor(7, "gsv"));
+  assert.equal(getColor(7, "notaprovider"), getColor(7, "gsv"));
 });
 
 test("getColor: null age (0-pano run) coerces to the newest stop, not NaN", () => {

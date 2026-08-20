@@ -146,23 +146,40 @@ function createTooltip(city) {
   const panoStats = city.panorama_counts;
   const ageStats = city.pano_age_stats;
 
-  // For GSV, break out the official-Google share of all found panoramas;
-  // for other providers every pano is already provider imagery
+  // Break out the official-Google share of all found panoramas wherever there
+  // IS one. The DATA decides that, not the provider name: a `latest` block
+  // whose provider publishes no copyright field simply has no
+  // `unique_google_panos` key — measured on the production cities.json.gz
+  // (1,144 cities), the key is ABSENT rather than null — so `!= null` already
+  // answers the capability question the old `city.provider === "gsv"` was
+  // asking by identity.
+  //
+  // Do NOT "finish the job" by swapping that data test for
+  // PROVIDERS[...].hasCopyrightFilter. Copyright availability varies per RUN
+  // *within* GSV, not per provider: nine GSV cities (the #93 archival imports
+  // — berkeley, denison, point-roberts, …) carry copyright_info_available:
+  // false and no unique_google_panos at all, so a flag-driven branch would
+  // reach .toLocaleString() on undefined and throw out of createTooltip,
+  // taking the whole popup with it. The flag is the right question for a
+  // LABEL (see the "(360°)" suffix below, which has no value to test); a
+  // value that may or may not be present is still a data test.
   let panoLinesHtml = `<li>Total Panoramas: ${panoStats.unique_panos.toLocaleString()}</li>`;
-  if (city.provider === "gsv" && panoStats.unique_google_panos != null) {
+  if (panoStats.unique_google_panos != null) {
     // googleSharePercent guards the 0-pano divide-by-zero "Infinity%" (#69).
     const googlePct = googleSharePercent(
       panoStats.unique_google_panos, panoStats.unique_panos);
     panoLinesHtml += `<li>Google Panoramas: ${panoStats.unique_google_panos.toLocaleString()} (${googlePct}%)</li>`;
   }
 
-  // Any-imagery coverage line (issue #116): shown only for Mapillary, and
-  // only when flat imagery actually widens the footprint beyond the 360°
-  // panos — otherwise it would just repeat the Grid Coverage number.
+  // Any-imagery coverage line (issue #116): shown when flat imagery actually
+  // widens the footprint beyond the 360° panos — otherwise it would just
+  // repeat the Grid Coverage number. The widening IS the condition, so no
+  // provider test is needed: adaptCityRecord falls the any-imagery rate back
+  // to the 360° rate for providers that emit no flat imagery, which makes the
+  // difference exactly zero for them.
   let anyImageryHtml = "";
   const anyRate = city.any_imagery_coverage_rate_percent;
   if (
-    city.provider === "mapillary" &&
     anyRate != null &&
     city.coverage_rate_percent != null &&
     anyRate - city.coverage_rate_percent > 0.05
@@ -216,7 +233,7 @@ function createTooltip(city) {
       ${snapshotsHtml}
       <li>Area: ${city.search_area_km2.toFixed(1)} km²</li>
       <li>Grid Coverage: ${city.coverage_rate_percent != null
-        ? `${city.coverage_rate_percent.toFixed(1)}% of search points${city.provider === "mapillary" ? " (360°)" : ""}`
+        ? `${city.coverage_rate_percent.toFixed(1)}% of search points${PROVIDERS[city.provider]?.hasFlatImagery ? " (360°)" : ""}`
         : "No data"}</li>
       ${anyImageryHtml}
       ${streetCoverageHtml}
@@ -1156,8 +1173,46 @@ function setProvider(provider) {
   if (rawCitiesData) renderProvider();
 }
 
-/** Wire up the provider radio group and reflect the initial state. */
+/**
+ * Markup for the provider radio group's options — one <label> per registered
+ * provider, exactly one of them checked.
+ *
+ * Generated rather than hardcoded in index.html (issue #225). `?provider=` is
+ * validated against the registry (isKnownProvider), so the day a third
+ * provider is registered a two-radio group would leave `currentProvider` with
+ * no radio at all and NOTHING checked — a keyboard user tabbing in lands on
+ * the first option and their first arrow-press silently switches provider,
+ * which is the a11y failure a radio group's checked state exists to prevent.
+ * The fieldset and its visually-hidden <legend> (the group's accessible name)
+ * stay in the markup; only the options are rendered.
+ *
+ * @param {Object} providers - Provider registry (PROVIDERS; a subset in tests).
+ * @param {string} current - Active provider key — the one radio marked checked.
+ * @returns {string} HTML for the inside of the #provider-toggle fieldset.
+ */
+function providerToggleHtml(providers, current) {
+  return Object.entries(providers).map(([key, p]) => {
+    // Registry values are code rather than fetched data, but they land in an
+    // attribute, so they go through escapeHtml like every other interpolation
+    // on this page. An entry with no description gets no tooltip at all rather
+    // than an empty one, which some screen readers announce.
+    const title = p.description ? ` title="${escapeHtml(p.description)}"` : "";
+    return `
+    <label>
+      <input type="radio" name="provider" value="${escapeHtml(key)}"${key === current ? " checked" : ""}>
+      <span${title}>${escapeHtml(p.label)}</span>
+    </label>`;
+  }).join("");
+}
+
+/** Render the provider radio group from the registry and wire up its events. */
 function initProviderToggle() {
+  const fieldset = document.getElementById("provider-toggle");
+  // insertAdjacentHTML rather than innerHTML: the <legend> already in the
+  // markup is the group's accessible name and must survive.
+  if (fieldset) {
+    fieldset.insertAdjacentHTML("beforeend", providerToggleHtml(PROVIDERS, currentProvider));
+  }
   document.querySelectorAll('input[name="provider"]').forEach((radio) => {
     radio.checked = radio.value === currentProvider;
     radio.addEventListener("change", () => {
@@ -1273,4 +1328,19 @@ async function loadData() {
   }
 }
 
-document.addEventListener("DOMContentLoaded", loadData);
+// Guarded so `require`ing this file under Node's test runner (which stubs the
+// browser globals it touches at load) exercises the pure helpers without
+// trying to load anything — the same shape as streets.js/grid.js.
+if (typeof document !== "undefined") {
+  document.addEventListener("DOMContentLoaded", loadData);
+}
+
+// Node/CommonJS export shim for the unit tests. No-op in the browser, where
+// these are plain globals loaded via <script>.
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = {
+    createTooltip,
+    providerToggleHtml,
+    initProviderToggle,
+  };
+}

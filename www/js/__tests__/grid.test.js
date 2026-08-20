@@ -6,9 +6,13 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
+// A THIRD provider the page has never heard of: the filter options are
+// derived from this registry, so a hardcoded two-element list fails here
+// rather than the day one is really registered (issue #225).
 global.PROVIDERS = {
   gsv: { label: "Google Street View" },
   mapillary: { label: "Mapillary" },
+  thirdparty: { label: "Third Party" },
 };
 global.coverageColor = (pct) => `coverage(${pct})`;
 global.escapeHtml = (s) =>
@@ -23,6 +27,7 @@ const {
   gridRowHtml,
   GRID_COLUMNS,
   GRID_DEFAULT_SORT,
+  GRID_FILTERS,
 } = require("../grid.js");
 
 const SEATTLE = {
@@ -124,4 +129,28 @@ test("gridRowHtml: city names are HTML-escaped (OSM data is publicly editable)",
   );
   assert.doesNotMatch(html, /<script>/);
   assert.match(html, /&lt;script&gt;/);
+});
+
+// --- GRID_FILTERS -----------------------------------------------------------
+
+test("GRID_FILTERS: the Provider filter offers one option per registered provider", () => {
+  // renderGridRuns builds its rows by iterating PROVIDERS, so a filter that
+  // does not would list a third provider's rows with no way to isolate them.
+  const provider = GRID_FILTERS.find((f) => f.key === "provider");
+  assert.deepEqual(
+    provider.options,
+    Object.entries(global.PROVIDERS).map(([value, p]) => ({ value, label: p.label }))
+  );
+  assert.ok(provider.options.some((o) => o.value === "thirdparty"));
+  // The option values are what `test` compares against a row's provider key.
+  assert.ok(provider.test({ provider: "thirdparty" }, "thirdparty"));
+  assert.ok(!provider.test({ provider: "gsv" }, "thirdparty"));
+});
+
+test("GRID_FILTERS: the multi-provider filter is labeled by arity, not by two names", () => {
+  // The test has always been `size > 1` (markBothProviders); only the label
+  // claimed there were exactly two providers.
+  const both = GRID_FILTERS.find((f) => f.key === "both");
+  assert.doesNotMatch(both.label, /both/i);
+  assert.doesNotMatch(both.title, /Mapillary/);
 });

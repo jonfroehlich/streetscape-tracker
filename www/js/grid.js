@@ -204,10 +204,11 @@ const GRID_FILTERS = [
     label: "Provider",
     type: "select",
     anyLabel: "All providers",
-    options: [
-      { value: "gsv", label: "Google Street View" },
-      { value: "mapillary", label: "Mapillary" },
-    ],
+    // One option per REGISTERED provider (issue #225). renderGridRuns already
+    // builds its rows by iterating the registry, so a hardcoded pair meant a
+    // third provider's rows appeared in the table with no filter able to
+    // isolate them.
+    options: Object.entries(PROVIDERS).map(([value, p]) => ({ value, label: p.label })),
     test: (row, value) => row.provider === value,
   },
   {
@@ -227,11 +228,13 @@ const GRID_FILTERS = [
   },
   {
     key: "both",
-    label: "Both providers",
+    // "Both" was arity-wrong the moment a third provider could be registered;
+    // the test below has always been `size > 1`, not "these two".
+    label: "Multiple providers",
     type: "boolean",
     title:
-      "Only cities collected by BOTH Google Street View and Mapillary, where the two series " +
-      "are directly comparable on the same frozen grid",
+      "Only cities collected by more than one provider, where the series are " +
+      "directly comparable on the same frozen grid",
     test: (row) => row.hasBothProviders === true,
   },
 ];

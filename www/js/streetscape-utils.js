@@ -43,10 +43,24 @@ const RENDER_CAP = 40000;
  * (analysis.plausible_capture_mask uses an inclusive `between`) but dropped
  * from the map for some visitors. `launchDate` stays an ISO literal: it only
  * anchors a color ramp, where a one-day shift is invisible.
+ *
+ * The `has*` entries are CAPABILITIES, not identity. Every UI branch that used
+ * to ask `provider === "gsv"` asks one of them instead (issue #225), so adding
+ * a third provider is a registry edit rather than a hunt through the `=== "gsv"`
+ * comparisons that were scattered over three files:
+ *   hasCopyrightFilter — publishes a copyright field, so its imagery splits
+ *     into an official-fleet subset and contributor uploads (GSV's `© Google`).
+ *   hasFlatImagery — publishes flat/perspective imagery alongside 360°
+ *     panoramas, so a coverage number has to say which of the two it counts.
+ *
+ * `description` is the one-line "what is this provider's data" text; index.js
+ * renders it as the provider toggle's tooltip, so a newly registered provider
+ * arrives in that radio group with its own explanation rather than a blank.
  */
 const PROVIDERS = {
   gsv: {
     label: "Google Street View",
+    description: "Official Google Street View metadata, sampled at each grid point",
     panoNoun: "Google Panoramas",
     launchDate: new Date("2007-05-25"),
     earliestPlausibleCapture: new Date(2007, 0, 1), // local midnight; see above
@@ -54,9 +68,12 @@ const PROVIDERS = {
     viewerLabel: "View in Google Street View",
     viewerUrl: (panoId) =>
       `https://www.google.com/maps/@?api=1&map_action=pano&pano=${encodeURIComponent(panoId)}`,
+    hasCopyrightFilter: true,
+    hasFlatImagery: false,
   },
   mapillary: {
     label: "Mapillary",
+    description: "Crowdsourced Mapillary imagery: a census of every 360° panorama",
     panoNoun: "Mapillary Panoramas",
     launchDate: new Date("2014-01-01"),
     earliestPlausibleCapture: new Date(2004, 0, 1), // local midnight; see above
@@ -65,8 +82,34 @@ const PROVIDERS = {
     viewerLabel: "View in Mapillary",
     viewerUrl: (panoId) =>
       `https://www.mapillary.com/app/?pKey=${encodeURIComponent(panoId)}`,
+    hasCopyrightFilter: false,
+    hasFlatImagery: true,
   },
 };
+
+/**
+ * Fallback floor for a provider that is not in the registry.
+ *
+ * Deliberately the LOOSEST floor any provider declares, computed rather than
+ * spelled as one provider's name: `?? PROVIDERS.mapillary.earliestPlausibleCapture`
+ * reads as "Mapillary is special" when what is meant is "when in doubt, drop
+ * as little as possible". A too-tight fallback silently deletes real imagery
+ * from the map; a too-loose one shows a handful of bad dates, which is the
+ * cheaper error.
+ *
+ * This DIVERGES from the Python side on purpose, and the divergence is worth
+ * knowing about rather than papering over: analysis._DEFAULT_EARLIEST_PLAUSIBLE_CAPTURE
+ * pins the same fallback to a NAMED provider (`EARLIEST_PLAUSIBLE_CAPTURE["mapillary"]`),
+ * which is a min only by coincidence. Both read 2004-01-01 today, so nothing
+ * observable differs. They part company the day a provider is registered with
+ * a floor earlier than Mapillary's — this one would loosen automatically and
+ * Python's would not, and the map would then draw a pano the published stats
+ * dropped. Whoever registers that provider owns the choice: give Python the
+ * same min, or tighten this to match whatever Python names.
+ */
+const LOOSEST_EARLIEST_PLAUSIBLE_CAPTURE = new Date(
+  Math.min(...Object.values(PROVIDERS).map((p) => p.earliestPlausibleCapture.getTime()))
+);
 
 const MS_PER_YEAR = 1000 * 60 * 60 * 24 * 365.25;
 
@@ -224,11 +267,12 @@ const METRICS = {
   },
 };
 
-// Any-imagery coverage (issue #116): Mapillary's full footprint including
+// Any-imagery coverage (issue #116): a provider's full footprint including
 // flat-only points, vs the 360°-only `coverage` metric. Identical color/bucket
 // machinery — only the read differs — so it's derived from `coverage` rather
-// than duplicated. For GSV (and pre-v7 data) the value falls back to the 360°
-// rate, so the two views coincide there.
+// than duplicated. For a provider that publishes no flat imagery (hasFlatImagery
+// false — GSV today) and for pre-v7 data the value falls back to the 360° rate,
+// so the two views coincide there.
 METRICS.coverage_any = {
   ...METRICS.coverage,
   label: "Any imagery",
@@ -726,7 +770,13 @@ function adaptCityRecord(rec, provider = "gsv") {
   if (!block?.latest) return null;
 
   const latest = block.latest;
-  const isGsv = provider === "gsv";
+  // All three normalizations below ask ONE question -- does this provider
+  // publish a copyright-filtered subset of its own imagery? -- so they read it
+  // off the registry rather than each testing for "gsv". A third provider
+  // hitting `isGsv ? ... : ...` silently inherited Mapillary's shape, which
+  // happens to be right for a census provider and would be wrong for the first
+  // one that isn't.
+  const copyrightFiltered = PROVIDERS[provider]?.hasCopyrightFilter ?? false;
   const counts = latest.panorama_counts || {};
   const histograms = latest.histogram_of_capture_dates_by_year || {};
 
@@ -772,12 +822,15 @@ function adaptCityRecord(rec, provider = "gsv") {
     // (their Google subset is unknown; the fallbacks below kick in)
     copyright_info_available: latest.copyright_info_available ?? true,
     // Normalized provider-agnostic fields (prefer these in UI code)
-    pano_count: isGsv ? (counts.unique_google_panos ?? counts.unique_panos)
-                      : counts.unique_panos,
-    pano_age_stats: isGsv ? (latest.google_panos_age_stats ?? latest.all_panos_age_stats)
-                          : latest.all_panos_age_stats,
-    capture_year_histogram: isGsv ? (histograms.google_panos ?? histograms.all_panos)
-                                  : histograms.all_panos,
+    pano_count: copyrightFiltered
+      ? (counts.unique_google_panos ?? counts.unique_panos)
+      : counts.unique_panos,
+    pano_age_stats: copyrightFiltered
+      ? (latest.google_panos_age_stats ?? latest.all_panos_age_stats)
+      : latest.all_panos_age_stats,
+    capture_year_histogram: copyrightFiltered
+      ? (histograms.google_panos ?? histograms.all_panos)
+      : histograms.all_panos,
   };
 }
 
@@ -852,10 +905,11 @@ function isPlausibleCaptureDate(date, provider) {
   // on undefined, so an explicit null or "" — an unset provider threaded in
   // from a caller — skipped it, missed PROVIDERS, and fell through the ?? to
   // Mapillary's floor, accepting a GSV pano dated 2005. An UNKNOWN provider
-  // name still lands on that loose floor deliberately, mirroring
-  // analysis._DEFAULT_EARLIEST_PLAUSIBLE_CAPTURE.
+  // name still lands on that loose floor deliberately — the same posture as
+  // analysis._DEFAULT_EARLIEST_PLAUSIBLE_CAPTURE, though computed rather than
+  // named after a provider (see LOOSEST_EARLIEST_PLAUSIBLE_CAPTURE).
   const earliest = PROVIDERS[provider || "gsv"]?.earliestPlausibleCapture
-    ?? PROVIDERS.mapillary.earliestPlausibleCapture;
+    ?? LOOSEST_EARLIEST_PLAUSIBLE_CAPTURE;
   const t = date.getTime();
   return t >= earliest.getTime() && t <= Date.now();
 }
@@ -1053,6 +1107,7 @@ if (typeof module !== "undefined" && module.exports) {
     STREETSCAPE_DATA_BASE_URL,
     RENDER_CAP,
     PROVIDERS,
+    LOOSEST_EARLIEST_PLAUSIBLE_CAPTURE,
     METRICS,
     isKnownProvider,
     isKnownMetric,
