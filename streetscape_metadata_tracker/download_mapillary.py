@@ -50,7 +50,14 @@ import mapbox_vector_tile
 import numpy as np
 import pandas as pd
 
+# Aliased, because `census` is also the name of the local DataFrame this
+# module passes around (see fetch_city_images_async). Importing the module
+# as `census` would work today only because those locals live in other
+# functions -- and would break the first time someone called a census
+# helper from one of them, with a DataFrame AttributeError.
+from . import census as census_core
 from .analysis import FLAT_ONLY, REQUEST_FAILED
+from .census import dedupe_census, status_for_capture_dates
 from .config import MAPILLARY_METADATA_DTYPES
 from .download_common import (
     HOST_MAPILLARY_TILES,
@@ -314,43 +321,6 @@ _CENSUS_DTYPES = {
 }
 
 
-def _census_column(records: list[dict[str, Any]], column: str, dtype):
-    """
-    Build one census column, so that a single dirty value can't cost a tile.
-
-    ``pd.array(..., dtype="Int64"/"boolean")`` is a SAFE cast: a contributor
-    device clock reporting a captured_at outside int64's range, or a
-    non-integral one, raises rather than coercing (verified: 10**25 ->
-    OverflowError, 42.5 -> TypeError). That exception would be raised inside
-    ``fetch_one`` — i.e. before any of the capture-date guards run — so
-    ``fetch_city_images_async`` would score the tile as failed, discarding
-    every other image in it (one z14 tile has been observed carrying 2.1M
-    features) and, on a small city, pushing the run straight past
-    MAX_FAILED_TILE_FRACTION. The row-wise census kept such a value untouched
-    and let :func:`captured_at_to_iso_date` turn it into NO_DATE, which is
-    exactly why that function catches OverflowError explicitly.
-
-    So: the vectorized cast whenever it works, and a per-value pass only for a
-    tile that actually holds something unusable. That fallback is a Python loop
-    over one tile and is slow — and still far cheaper than dropping the tile.
-    """
-    values = [r[column] for r in records]
-    try:
-        return pd.array(values, dtype=dtype)
-    except (TypeError, ValueError, OverflowError) as e:
-        logger.warning(
-            f"Unusable {column} value(s) in a tile ({e}); coercing the bad "
-            f"entries to null rather than failing the whole tile"
-        )
-    coerced = []
-    for value in values:
-        try:
-            coerced.append(pd.array([value], dtype=dtype)[0])
-        except (TypeError, ValueError, OverflowError):
-            coerced.append(None)
-    return pd.array(coerced, dtype=dtype)
-
-
 def records_to_census(records: list[dict[str, Any]]) -> pd.DataFrame:
     """
     Turn one tile's decoded records into a columnar census frame.
@@ -359,87 +329,49 @@ def records_to_census(records: list[dict[str, Any]]) -> pd.DataFrame:
     tile's dicts are freed before the next tile is decoded rather than every
     tile's surviving until the whole city has downloaded.
 
+    Mapillary's binding of :func:`census_core.records_to_census`.
+
     Args:
         records: decoded image dicts from :func:`decode_image_features`.
 
     Returns:
         A DataFrame with the :data:`_CENSUS_DTYPES` columns, one row per image.
     """
-    if not records:
-        return pd.DataFrame({c: pd.Series(dtype=d) for c, d in _CENSUS_DTYPES.items()})
-    return pd.DataFrame(
-        {column: _census_column(records, column, dtype) for column, dtype in _CENSUS_DTYPES.items()}
-    )
+    return census_core.records_to_census(records, _CENSUS_DTYPES)
 
 
 def concat_census(frames: list[pd.DataFrame]) -> pd.DataFrame:
     """Combine per-tile census frames into one, preserving tile order."""
-    frames = [f for f in frames if len(f)]
-    if not frames:
-        return records_to_census([])
-    return pd.concat(frames, ignore_index=True)
+    return census_core.concat_census(frames, _CENSUS_DTYPES)
 
 
-def dedupe_census(census: pd.DataFrame) -> pd.DataFrame:
+def _mapillary_image_columns(picked: pd.DataFrame) -> dict[str, Any]:
     """
-    Collapse cross-tile duplicate image ids, exactly as the row-wise census did.
+    Mapillary's own output columns: the copyright convention plus its extras.
 
-    Tiles are encoded with a render buffer, so an image near an edge is
-    published in two tiles. The row-wise form deduped them with
-    ``images_by_id[record["id"]] = record``, and a dict is TWO rules, not one:
-    a repeated id takes the **last** copy's values, but keeps the position of
-    its **first** appearance (assigning to an existing key overwrites the value
-    without reordering the key).
-
-    Both halves matter and pandas has no single call for the pair:
-
-    * Values — the two copies carry coordinates quantized to their own tile's
-      extent, so preferring the other one can shift an edge image to a
-      neighbouring grid point and surface as a phantom change in the next
-      run-to-run diff.
-    * Order — a run file is an immutable dated snapshot, so its row order is
-      part of what must not drift. ``drop_duplicates(keep="last")`` gets the
-      values right and the order wrong: given tiles ``[B, A]`` and ``[B]`` it
-      yields ``[A, B]`` where the dict yielded ``[B, A]``. Buffer duplicates
-      are ubiquitous, so that reorders essentially every real city.
-
-    Args:
-        census: the concatenated per-tile census, in tile order.
-
-    Returns:
-        The deduped census, re-indexed from 0.
+    Handed to :func:`census_core.build_image_rows`, which fills the shared core.
     """
-    # factorize numbers the ids in order of FIRST appearance, so `codes` is
-    # already the dict's key order; the scatter below then overwrites each
-    # code's slot with every later position it occurs at, leaving the LAST.
-    # (NumPy specifies last-wins for repeated indices in a plain assignment.)
-    codes, uniques = pd.factorize(census["id"])
-    if len(uniques) == len(census):  # no duplicates: skip the copy entirely
-        return census
-    last_position = np.empty(len(uniques), dtype=np.int64)
-    last_position[codes] = np.arange(len(codes), dtype=np.int64)
-    return census.take(last_position).reset_index(drop=True)
-
-
-def status_for_capture_dates(capture_dates) -> np.ndarray:
-    """
-    Per-row OK / NO_DATE from already-parsed capture dates.
-
-    Mirrors GSV's convention: an image whose contributor timestamp is unusable
-    still proves coverage, so it is present-but-NO_DATE rather than a row
-    quietly carrying a bogus date into the dated statistics. Shared by the grid
-    downloader and the road-walk collector so one provider's status vocabulary
-    can't drift from the other's.
-
-    Args:
-        capture_dates: array-like of 'YYYY-MM-DD'/'' from
-            :func:`captured_at_to_iso_dates`.
-    """
-    return np.where(np.asarray(capture_dates) != "", "OK", "NO_DATE")
+    # As text once: the contributor id is published both as its own structured
+    # column and (for parity with GSV's "© <photographer>") inside the
+    # copyright string. Going through the nullable string dtype rather than
+    # astype(str) keeps a missing id missing instead of rendering it "<NA>".
+    creator = picked["creator_id"].astype("string")
+    return {
+        "copyright_info": ("© Mapillary contributor " + creator)
+        .fillna("© Mapillary")
+        .to_numpy(dtype=object),
+        "creator_id": creator.to_numpy(dtype=object),
+        "organization_id": picked["organization_id"].to_numpy(dtype=object),
+        "sequence_id": picked["sequence_id"].to_numpy(dtype=object),
+        "is_pano": picked["is_pano"].to_numpy(),
+        "on_foot": picked["on_foot"].astype(object).to_numpy(),
+        "quality_score": picked["quality_score"].to_numpy(),
+        "compass_angle": picked["compass_angle"].to_numpy(),
+    }
 
 
 def build_image_rows(
-    census: pd.DataFrame,
+    census_frame: pd.DataFrame,
     image_positions: np.ndarray,
     query_lat,
     query_lon,
@@ -448,55 +380,23 @@ def build_image_rows(
     capture_date,
 ) -> pd.DataFrame:
     """
-    METADATA-schema rows for query locations matched to census images.
+    MAPILLARY_METADATA_DTYPES rows for query locations matched to census images.
 
     Shared by the grid downloader (query location = a frozen grid point) and
-    the road-walk collector (query location = an on-street sample point). The
-    two carried near-identical per-row builders before; the columns, the
-    copyright convention and the null handling are one implementation now.
-
-    Args:
-        census: the columnar census.
-        image_positions: positional index into ``census``, one per output row.
-        query_lat/query_lon: the queried location per output row.
-        query_timestamp: run-level ISO timestamp, identical on every row.
-        status: per-row status string (or a scalar applied to every row).
-        capture_date: per-row 'YYYY-MM-DD'/'' (or a scalar), already filtered
-            by :func:`captured_at_to_iso_dates`. FLAT_ONLY rows pass None: a
-            flat image is a coverage-presence marker, and a null date keeps
-            contributor flat timestamps out of every dated statistic.
-
-    Returns:
-        A DataFrame with the MAPILLARY_METADATA_DTYPES columns in order.
+    the road-walk collector (query location = an on-street sample point).
+    Mapillary's binding of :func:`census_core.build_image_rows`; see there for the
+    argument contract.
     """
-    picked = census.take(image_positions)
-    # As text once: the contributor id is published both as its own structured
-    # column and (for parity with GSV's "© <photographer>") inside the
-    # copyright string. Going through the nullable string dtype rather than
-    # astype(str) keeps a missing id missing instead of rendering it "<NA>".
-    creator = picked["creator_id"].astype("string")
-    return pd.DataFrame(
-        {
-            "query_lat": query_lat,
-            "query_lon": query_lon,
-            "query_timestamp": query_timestamp,
-            "pano_lat": picked["lat"].to_numpy(),
-            "pano_lon": picked["lon"].to_numpy(),
-            "pano_id": picked["id"].to_numpy(dtype=object),
-            "capture_date": capture_date,
-            "copyright_info": ("© Mapillary contributor " + creator)
-            .fillna("© Mapillary")
-            .to_numpy(dtype=object),
-            "status": status,
-            "creator_id": creator.to_numpy(dtype=object),
-            "organization_id": picked["organization_id"].to_numpy(dtype=object),
-            "sequence_id": picked["sequence_id"].to_numpy(dtype=object),
-            "is_pano": picked["is_pano"].to_numpy(),
-            "on_foot": picked["on_foot"].astype(object).to_numpy(),
-            "quality_score": picked["quality_score"].to_numpy(),
-            "compass_angle": picked["compass_angle"].to_numpy(),
-        },
-        columns=list(MAPILLARY_METADATA_DTYPES.keys()),
+    return census_core.build_image_rows(
+        census_frame,
+        image_positions,
+        query_lat,
+        query_lon,
+        query_timestamp,
+        status,
+        capture_date,
+        dtypes=MAPILLARY_METADATA_DTYPES,
+        image_columns=_mapillary_image_columns,
     )
 
 
@@ -505,30 +405,10 @@ def build_empty_rows(query_lat, query_lon, query_timestamp: str, status) -> pd.D
     Rows for query locations with no imagery — the ZERO_RESULTS fill, plus the
     REQUEST_FAILED variant for points under an undownloaded tile.
 
-    Built column-wise: at a 4M-point grid the equivalent list of per-point
-    dicts was the single largest allocation in the pipeline (issue #157).
-    The row count comes from ``query_lat`` rather than a separate argument —
-    the two can only ever disagree by caller error, and the disagreement would
-    surface as a length mismatch raised from inside the DataFrame constructor.
+    Mapillary's binding of :func:`census_core.build_empty_rows`.
     """
-    n = len(query_lat)
-    return pd.DataFrame(
-        {
-            "query_lat": query_lat,
-            "query_lon": query_lon,
-            "query_timestamp": query_timestamp,
-            "status": status,
-            # No image at this location -> every image-derived column is null.
-            # np.full rather than [None] * n: at Cairo's ~10.5M grid points the
-            # Python list is ~84 MB of pure transient, per column, on the
-            # allocation this function exists to keep small.
-            **{
-                c: np.full(n, None, dtype=object)
-                for c in MAPILLARY_METADATA_DTYPES
-                if c not in ("query_lat", "query_lon", "query_timestamp", "status")
-            },
-        },
-        columns=list(MAPILLARY_METADATA_DTYPES.keys()),
+    return census_core.build_empty_rows(
+        query_lat, query_lon, query_timestamp, status, dtypes=MAPILLARY_METADATA_DTYPES
     )
 
 
