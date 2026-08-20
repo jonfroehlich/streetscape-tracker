@@ -150,6 +150,26 @@ TARGETS: dict[str, dict[str, Any]] = {
 
 DOCS_METRICS_NAME = "kartaview-feasibility_metrics.json"
 
+# The record's own method note, hoisted to a constant so a test can pin the
+# COMMITTED record against it. It drifted once already: it claimed the reported
+# rung was the smallest complete one for as long as the code took the largest,
+# and because nothing compared the two it regenerated wrong on every run.
+DOCS_RECORD_NOTE = (
+    "Feasibility probe for adding KartaView as a third provider. Radius-mode "
+    "/1.0/list/nearby-photos/ only -- there is no metadata tile endpoint and the v2 "
+    "spatial query returns apiCode 408. READ COMPLETENESS BEFORE QUOTING ANY SHARE: "
+    "the endpoint fills a page by SEQUENCE, not by space, so a percentage over an "
+    "incomplete page describes one drive rather than one neighbourhood -- it is NOT "
+    "an estimate of the local mix. A rung is quotable only where complete == true "
+    "(n_sampled >= total_filtered_items with n_sampled > 0); each target's "
+    "reported_* fields are taken from the LARGEST complete rung -- once nothing "
+    "was paged away, a bigger circle is strictly more evidence -- while "
+    "max_working_radius_m is a separate cost measurement (the largest circle the "
+    "server answers) and its shares are usually the artifact. A target where every "
+    "radius failed is recorded with max_working_radius_m = null and is NOT evidence "
+    "of absent imagery."
+)
+
 
 def docs_generated_by(args: argparse.Namespace) -> str:
     """
@@ -233,6 +253,26 @@ class ProbeError(RuntimeError):
         super().__init__(redact_credentials(str(message)))
 
 
+class BackpressureError(ProbeError):
+    """
+    The server declined the QUERY: HTTP 400 carrying apiCode 690 or 408.
+
+    The remedy is to ask for less -- retry, then shrink the radius. Kept
+    distinct from the two below because that remedy is exactly wrong for them:
+    subdividing a circle after a timeout asks a struggling server for four
+    requests where it just failed to serve one, which is the shape of the
+    Mapillary incident (#198) rather than a fix for it.
+    """
+
+
+class TransportError(ProbeError):
+    """The request never got an answer: connection reset, timeout, DNS."""
+
+
+class ResponseError(ProbeError):
+    """An answer arrived that we could not use: non-JSON body, HTTP >= 400."""
+
+
 def _post_nearby(
     session: requests.Session,
     limiter: HourlyRateLimiter,
@@ -263,7 +303,7 @@ def _post_nearby(
     try:
         resp = session.post(NEARBY_PHOTOS_URL, data=data, params=params, timeout=timeout_s)
     except requests.RequestException as e:
-        raise ProbeError(f"transport failure: {type(e).__name__}: {e}") from e
+        raise TransportError(f"transport failure: {type(e).__name__}: {e}") from e
 
     try:
         body = resp.json()
@@ -271,7 +311,7 @@ def _post_nearby(
         # An HTML error page on a 200 is how Mapillary's block manifested
         # (#199); name it rather than letting it reach a parser.
         ctype = resp.headers.get("Content-Type", "?")
-        raise ProbeError(f"non-JSON body (HTTP {resp.status_code}, {ctype})") from e
+        raise ResponseError(f"non-JSON body (HTTP {resp.status_code}, {ctype})") from e
 
     status = body.get("status") or {}
     api_code = status.get("apiCode")
@@ -281,12 +321,12 @@ def _post_nearby(
         api_code = None
 
     if api_code in BACKPRESSURE_API_CODES:
-        raise ProbeError(
+        raise BackpressureError(
             f"backpressure: apiCode {api_code} ({status.get('apiMessage', '')!r}) "
             f"at radius {radius_m} m"
         )
     if resp.status_code >= 400:
-        raise ProbeError(f"HTTP {resp.status_code}, apiCode {api_code}, body keys {list(body)}")
+        raise ResponseError(f"HTTP {resp.status_code}, apiCode {api_code}, body keys {list(body)}")
 
     # The v1 envelope has varied across deployments; accept both shapes rather
     # than KeyError on a server that answered perfectly well.
@@ -294,7 +334,7 @@ def _post_nearby(
     if items is None:
         items = (body.get("osv") or {}).get("currentPageItems")
     if items is None:
-        raise ProbeError(f"no currentPageItems in body (keys: {list(body)})")
+        raise ResponseError(f"no currentPageItems in body (keys: {list(body)})")
 
     total = body.get("totalFilteredItems")
     if total is None:
@@ -547,20 +587,7 @@ def write_docs_record(results: list[dict], args: argparse.Namespace, authed: boo
             else REQUESTS_PER_HOUR_ANON,
             "ipp": args.ipp,
             "radius_ladder_m": list(RADIUS_LADDER_M),
-            "note": (
-                "Feasibility probe for adding KartaView as a third provider. Radius-mode "
-                "/1.0/list/nearby-photos/ only -- there is no metadata tile endpoint and the v2 "
-                "spatial query returns apiCode 408. READ COMPLETENESS BEFORE QUOTING ANY SHARE: "
-                "the endpoint fills a page by SEQUENCE, not by space, so a percentage over an "
-                "incomplete page describes one drive rather than one neighbourhood -- it is NOT "
-                "an estimate of the local mix. A rung is quotable only where complete == true "
-                "(n_sampled >= total_filtered_items with n_sampled > 0); each target's "
-                "reported_* fields are taken from the SMALLEST complete rung, while "
-                "max_working_radius_m is a separate cost measurement (the largest circle the "
-                "server answers) and its shares are usually the artifact. A target where every "
-                "radius failed is recorded with max_working_radius_m = null and is NOT evidence "
-                "of absent imagery."
-            ),
+            "note": DOCS_RECORD_NOTE,
         },
         "targets": results,
     }

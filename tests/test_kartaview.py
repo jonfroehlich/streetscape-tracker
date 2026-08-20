@@ -490,6 +490,18 @@ def test_committed_records_name_their_producers(probe, audit):
         assert rec["_about"]["issue"] == 225
 
 
+def test_the_committed_record_carries_the_producers_current_method_note(probe):
+    """
+    The record's `_about.note` tells the next reader HOW to read the numbers, so
+    a drifted copy is worse than none. This one drifted for real: it said the
+    reported rung was the SMALLEST complete one for as long as the code took the
+    LARGEST, and nothing compared the two, so every run regenerated it wrong.
+    """
+    assert probe["_about"]["note"] == kp.DOCS_RECORD_NOTE
+    assert "LARGEST complete rung" in kp.DOCS_RECORD_NOTE
+    assert "SMALLEST" not in kp.DOCS_RECORD_NOTE
+
+
 def test_generated_by_names_the_invocation_not_a_constant():
     """
     A fixed stamp would let a scratch run write a record claiming the canonical
