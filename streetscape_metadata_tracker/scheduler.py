@@ -2021,8 +2021,10 @@ def _run_collection_subprocess(
     by the service account: every ``collection failed`` line in the scheduler log
     had its actual cause discarded. Redirecting to a file per attempt keeps the
     full output greppable in logs/ and streams it to disk rather than buffering a
-    multi-hour run in this process's memory (``capture_output=True`` would, on a
-    host whose cgroup is capped at MemoryHigh=4G).
+    multi-hour run in this process's memory (``capture_output=True`` would, inside
+    a cgroup whose memory is capped — see deploy/systemd/; deliberately not
+    quoting the cap here, since it has moved twice and the argument does not
+    depend on its value).
 
     The tail of a failed run is also copied into the scheduler log so it reaches
     the [alerts] email, which sends only that log's tail.

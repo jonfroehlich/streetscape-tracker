@@ -3401,6 +3401,33 @@ def test_backup_check_unit_matches_the_collection_unit(tmp_path):
     assert "[Install]" in timer and "OnCalendar=" in timer
 
 
+def _assert_unit_quotes(unit, rendered, constant):
+    """Pin the two copies of a measurement to each other.
+
+    The figures the resource directives are sized from live twice by design: as
+    a constant here, which is what the test ENFORCES, and in the unit file's
+    rationale block, which is what the next person re-sizing a directive
+    actually READS. Nothing else stops those drifting, and the drift is silent
+    and bad in a specific way — the cap ends up justified by one number and
+    enforced against another, so an operator argues from a figure no test holds
+    anyone to. Cheap to assert, so assert it.
+
+    It is a SUBSTRING check, so it only pins the constant as tightly as the
+    prose is unambiguous: if the unit spells a near-miss of the same quantity
+    the same way — the unrounded product beside the rounded floor, both suffixed
+    `GiB` — then lowering the constant to that near-miss still passes. Which is
+    why the unit writes the product bare (`extrapolates to 15.1`) and reserves
+    the unit suffix for the figure the caps are actually sized from. Keep it
+    that way rather than making this matcher cleverer.
+    """
+    assert rendered in unit, (
+        f"{constant} renders as {rendered!r}, which no longer appears in "
+        f"deploy/systemd/streetscape-tracker.service. Update BOTH copies — the "
+        f"constant is what this suite enforces, the unit's prose is what the "
+        f"next operator reads before changing the directive."
+    )
+
+
 # Worst aggregate + streetwalk-manifest rebuild measured on prod: 7m15s on the
 # 19-city night of 2026-08-18 (a small night is ~1.6 s). A named constant rather
 # than a literal because it is a MEASUREMENT — the unit file quotes the same
@@ -3421,6 +3448,12 @@ def test_stop_timeout_covers_the_publish_tail_it_waits_for():
 
     Asserted against the DIRECTIVE line, not the prose around it — a comment is
     not what systemd runs.
+
+    It ALSO pins the unit's prose to `_MEASURED_TAIL_AGGREGATE_S` via
+    `_assert_unit_quotes`, which the test name does not advertise: that constant
+    has no other test, and a failure here can therefore be about the quoted
+    figure rather than about TimeoutStopSec itself. The assertion message says
+    which.
     """
     from streetscape_metadata_tracker import catalog_backup
 
@@ -3431,6 +3464,11 @@ def test_stop_timeout_covers_the_publish_tail_it_waits_for():
     m = re.search(r"^TimeoutStopSec=(\d+)(s|min|h)?\s*$", unit, re.M)
     assert m, "the unit must set TimeoutStopSec explicitly; systemd's default is 90 s (#206)"
     stop_s = int(m.group(1)) * {None: 1, "s": 1, "min": 60, "h": 3600}[m.group(2)]
+    _assert_unit_quotes(
+        unit,
+        f"{_MEASURED_TAIL_AGGREGATE_S // 60}m{_MEASURED_TAIL_AGGREGATE_S % 60:02d}s",
+        "_MEASURED_TAIL_AGGREGATE_S",
+    )
 
     # The floor is the SUM of the tail's two large known terms, not the larger of
     # them. Asserting only `> BACKUP_TIMEOUT_S` accepted 11min — which the very
@@ -3450,6 +3488,135 @@ def test_stop_timeout_covers_the_publish_tail_it_waits_for():
     assert stop_s < cfg.max_batch_hours * 3600, (
         "a stop timeout at or above the batch's own deadline makes `systemctl "
         "stop` and host shutdown hang for longer than letting the night finish"
+    )
+
+
+# Extrapolated peak RSS of the largest city we track, in GiB. Both inputs are
+# traceable, which matters because this figure is a floor the caps are sized
+# against: the per-run JSON tail measured 4.81 GiB on Ho Chi Minh City's 5.26M-row
+# census (2026-08-18), i.e. ~0.914 GiB per million rows, and the largest census
+# in the catalog is Detroit's 16,569,307 rows —
+#
+#   sqlite3 data/streetscape_tracker.db \
+#     "SELECT city_id, run_date, MAX(total_points) FROM runs WHERE provider='mapillary';"
+#
+# (runs.total_points IS the CSV row count for a Mapillary census: one row per
+# pano plus the ZERO_RESULTS/FLAT_ONLY fill, and it sums the status columns
+# exactly). 16.569M x 0.914 = 15.1 GiB, rounded UP to 15.3 here — a floor should
+# err high, and the slope is one city's.
+#
+# WHY THE QUERY FILTERS ON PROVIDER, since dropping the filter finds a bigger
+# number and the exclusion should be an argument rather than an omission: the
+# slope is a property of the CSV row count, not of the provider, and
+# analysis.calculate_run_stats writes total_points as len(df) for every one. Run
+# it without the WHERE and the top row is juneau--alaska--united-states, gsv,
+# 2025-01-08, 39,346,564 rows — 2.4x Detroit. Those are is_baseline=1 archival
+# imports (issue #93) on pre-#166 geometry, and no future night re-collects at
+# that size: the 40 km cap bounds a fresh gsv run at (40000/20)^2 = 4M points,
+# hence 4M rows, hence ~3.7 GiB. A census has no such bound — its rows are
+# imagery, not lattice points — which is why the largest live workload is a
+# Mapillary one and why the filter belongs there.
+#
+# Also worth re-running on PROD rather than a dev checkout before trusting it as
+# a catalog-wide maximum: a laptop catalog may hold only a handful of Mapillary
+# runs, in which case the query returns the largest of those and not the largest
+# we collect.
+#
+# A named constant for the same reason _MEASURED_TAIL_AGGREGATE_S is one: the
+# unit file quotes this figure and the next re-sizing has to argue from it. NOTE
+# it is an EXTRAPOLATION from one city's slope, not a measurement; replace it
+# with a real MemoryPeak the first night a big city runs to completion.
+_EXTRAPOLATED_LARGEST_CITY_PEAK_GIB = 15.3
+
+
+def test_memory_high_is_a_throttle_below_the_hard_limit_and_clears_the_worst_city():
+    """
+    The two memory caps do different jobs and only mean something together.
+    MemoryHigh is a THROTTLE: crossing it costs hours of silent reclaim that end
+    in the scheduler's 180-min city timeout SIGKILLing a child that printed
+    nothing (measured 2026-08-18, issue #157). MemoryMax is a hard limit, whose
+    breach is a fast OOM kill an operator can actually read.
+
+    So the hard limit must clear the largest city's peak no matter what, and IF
+    a soft brake is configured it has to sit in the band where it is useful:
+    strictly below MemoryMax (at or above it the brake is INERT — it never
+    engages and every overrun becomes the hard kill) and above the largest
+    city's peak (below it, the biggest nights throttle into the 180-min city
+    timeout — the 2026-08-18 failure).
+
+    "IF" is load-bearing: the unit file offers "no MemoryHigh at all" as a valid
+    answer to a big-city hang, so this must not be the test that forbids the fix
+    its own subject recommends. Absent — and systemd's `infinity` spelling of
+    the same thing — is accepted, and the MemoryMax floor below is then the only
+    thing standing between a big city and an OOM kill, which is why that
+    assertion is unconditional rather than part of the MemoryHigh branch.
+
+    Asserted against the directive lines, not the prose around them.
+    """
+    unit = Path(_PROJECT_ROOT, "deploy", "systemd", "streetscape-tracker.service").read_text()
+    floor = _EXTRAPOLATED_LARGEST_CITY_PEAK_GIB * 2**30
+    _assert_unit_quotes(
+        unit, f"{_EXTRAPOLATED_LARGEST_CITY_PEAK_GIB} GiB", "_EXTRAPOLATED_LARGEST_CITY_PEAK_GIB"
+    )
+
+    def _raw(directive):
+        # LAST match, not the first: systemd is last-wins for a repeated
+        # directive, so a duplicated MemoryHigh= line would otherwise be
+        # validated at the copy the kernel ignores — this test passing on a
+        # value that is not in force is the one way it could mislead.
+        found = re.findall(rf"^{directive}=(\S+)\s*$", unit, re.M)
+        return found[-1] if found else None
+
+    def _bytes(directive, value):
+        # Decimal sizes are accepted because systemd accepts them and they are
+        # still comparable. PERCENTAGES are not, and that is a requirement
+        # rather than a parser limitation: the floor below is an absolute
+        # measurement in GiB, so a percentage would silently re-scale both caps
+        # with the host's RAM and make the comparison meaningless on any box but
+        # the one it was written for. Say so, rather than failing as "cannot
+        # interpret that spelling".
+        m = re.fullmatch(r"(\d+(?:\.\d+)?)([KMGT]?)", value)
+        assert m, (
+            f"{directive}={value} must be an absolute byte size (e.g. 20G). This "
+            f"test compares the caps against a measured GiB floor, so a "
+            f"percentage-of-RAM spelling cannot be checked and would mean a "
+            f"different cap on every host the unit is copied to."
+        )
+        return (
+            float(m.group(1)) * {"": 1, "K": 2**10, "M": 2**20, "G": 2**30, "T": 2**40}[m.group(2)]
+        )
+
+    hard_raw = _raw("MemoryMax")
+    assert hard_raw and hard_raw != "infinity", (
+        "the unit must set MemoryMax to a real ceiling: it is the only cap whose "
+        "breach is a fast, legible OOM kill rather than silent reclaim"
+    )
+    hard = _bytes("MemoryMax", hard_raw)
+    assert hard > floor, (
+        f"MemoryMax={hard / 2**30:.1f}G is under the largest city's "
+        f"~{_EXTRAPOLATED_LARGEST_CITY_PEAK_GIB}GiB extrapolated peak, so the "
+        f"biggest nights are OOM-killed outright (issue #157)."
+    )
+
+    high_raw = _raw("MemoryHigh")
+    if high_raw is None or high_raw == "infinity":
+        return  # No soft brake by choice — see the docstring.
+    high = _bytes("MemoryHigh", high_raw)
+
+    assert high < hard, (
+        f"MemoryHigh={high / 2**30:.1f}G is not below MemoryMax={hard / 2**30:.1f}G: "
+        f"the soft brake can never engage, so every overrun skips the throttle and "
+        f"becomes an OOM kill. If that is genuinely wanted, DROP MemoryHigh (or set "
+        f"it to `infinity`) rather than raising it to meet MemoryMax, so the intent "
+        f"is visible in the unit."
+    )
+    assert high > floor, (
+        f"MemoryHigh={high / 2**30:.1f}G is under the largest city's "
+        f"~{_EXTRAPOLATED_LARGEST_CITY_PEAK_GIB}GiB extrapolated peak, so the "
+        f"biggest nights throttle into the 180-min city timeout instead of "
+        f"finishing — the 2026-08-18 failure, which is what raising this cap "
+        f"exists to prevent (issues #157/#206). If a real measurement lands above "
+        f"MemoryMax={hard / 2**30:.1f}G, both caps have to move, not just this one."
     )
 
 

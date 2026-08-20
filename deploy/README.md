@@ -142,7 +142,7 @@ systemctl --user enable --now streetscape-tracker.timer
 loginctl enable-linger $USER       # user services must survive logout
 ```
 
-The service ships with resource caps (`MemoryHigh=12G`, `MemoryMax=24G`,
+The service ships with resource caps (`MemoryHigh=20G`, `MemoryMax=24G`,
 `CPUQuota=400%`, `Nice=10`, `CPUWeight=50`) so nightly collection can't starve
 the other lab services that share the box and the storage array. The memory
 numbers are measured, not guessed, and the unit file carries the measurement
@@ -155,7 +155,11 @@ invisibly.** It writes a drop-in under
 take precedence over the main unit — so a property set that way keeps winning
 after you copy a new unit over, and every later edit to that property in
 `deploy/systemd/` is silently ignored. This is not hypothetical: the 12G/24G
-caps ran on makelab2 that way from 2026-08-18 until the unit caught up. If you
+caps ran on makelab2 that way from 2026-08-18 until the unit caught up, and on
+2026-08-20 the live service still read `MemoryHigh=12G` from that drop-in while
+`deploy/systemd/` said otherwise. **Raising `MemoryHigh` in this repo therefore
+changes nothing on makelab2 until the drop-in is reverted** — the two-line
+recipe below is the whole deployment step, not a cleanup afterthought. If you
 ever use `set-property` for a live emergency, fold the value into the unit file
 afterwards and then revert the override, so the repo stays authoritative:
 
