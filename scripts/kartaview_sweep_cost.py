@@ -5,6 +5,11 @@ Issue #225 follow-up: what does it actually COST to sweep a city's frozen grid?
     python scripts/kartaview_sweep_cost.py --city bend--oregon--united-states
     python scripts/kartaview_sweep_cost.py --sample default --docs-dir docs/experiments
 
+    # offline: re-derive the record's computed fields from its own raw counters
+    # and refresh the catalog block. No network, no provider request.
+    python scripts/kartaview_sweep_cost.py --recompute-from-record --catalog-summary \
+        --docs-dir docs/experiments
+
 This is the number that gates a production KartaView channel and it is the one
 number kartaview-feasibility.md could not supply: **circles x pages to cover a
 frozen grid bbox**. Mapillary's median city is 12 tile requests; until this is
@@ -12,13 +17,28 @@ measured, nothing about cadence, daily budget or city-set size can be sized.
 
 WHAT THIS COSTS, AND WHY THE PLAN IS THE MEASUREMENT. A sweep's requests are
 
-    requests = cells_visited + sum over leaves of (pages(total) - 1)
+    requests = calibration + cells_visited + retries + sum over leaves of (pages(total) - 1)
 
 because every cell -- whether it ends up a leaf or gets subdivided -- costs one
 page-1 request, and page 1 reports `totalFilteredItems` for that circle. So
 planning the sweep IS paying its first half, and it predicts the second half
 exactly. This script therefore issues page 1 only, never pages 2+: it measures
 `cells_visited` for real and computes the page count from the totals it sees.
+
+TWO COST NUMBERS, AND THEY ARE NOT INTERCHANGEABLE. `sweep_requests_estimate` is
+the GEOMETRIC FLOOR -- cells plus pages -- i.e. what a sweep would cost if every
+circle answered first time and its radius were already known. It is kept because
+it is the term a collector can compute up front from bbox area alone (the
+analogue of Mapillary's `estimate_tile_count`), so it is what a budget guard
+gets to work with. `sweep_requests_observed` is what the walk ACTUALLY issued,
+scaled the same way: the floor PLUS the retries and PLUS the per-city
+calibration ladder. Both of those take a rate-limiter token and a
+`count_request` exactly like any other request, so pricing them at zero is the
+same under-count this file exists to avoid -- over the study the retries alone
+were 174 requests against 392 cells visited (44% on top) and calibration another
+72, which is why the floor reads 19,173 for the study set where the observed
+cost was 29,589. Quote the observed number for "what does a sweep cost"; quote
+the floor only as the floor.
 
 THREE MEASURED FACTS THIS DESIGN RESTS ON (2026-08-19, laptop, authenticated):
 
@@ -145,8 +165,12 @@ DECILE_SAMPLE = (
 # ...and a density half, because sweep cost per km2 is worst exactly where the
 # imagery is richest. These are the registered cities in the regimes the
 # feasibility study measured: SE-Asian Grab markets against North American
-# community uploads. Bend is the control that fits a COMPLETE plan cheaply,
-# which is what validates the extrapolation the truncated ones rely on.
+# community uploads. Bend was CHOSEN as the control that fits a complete plan
+# cheaply -- the thing that would validate the extrapolation the truncated ones
+# rely on -- and at 80 root cells against a 60-request cap it did not complete
+# either (51 of 80). The largest plan that DID complete is Ithaca's 12 cells, so
+# the scaling is unvalidated above that; a future run wanting the control it was
+# meant to be should give Bend its own --max-requests-per-city 100.
 DENSITY_SAMPLE = (
     "singapore--singapore",
     "manila--capital-district--philippines",
@@ -261,22 +285,188 @@ def pages_for_total(total_filtered_items: int | None, ipp: int) -> int:
 
 def sweep_requests(cells_visited: int, leaf_totals: list[int | None], ipp: int) -> int:
     """
-    Total requests a real sweep would issue, given a completed plan.
+    The GEOMETRIC FLOOR: cells plus pages, for a sweep that never had to retry.
 
     ``cells_visited`` already includes page 1 of every cell -- internal nodes
     that got subdivided included, because their page-1 was spent before the
     refusal was known -- so only pages 2+ of the leaves are added here.
+
+    This is deliberately NOT what a sweep costs, and the name of the record
+    field it feeds (``sweep_requests_estimate``) is the one that must never be
+    quoted as one. It is the term a collector can compute up front from bbox
+    area alone -- the analogue of Mapillary's ``estimate_tile_count`` -- which
+    is what a budget guard has to work with before it has walked anything. What
+    the walk really pays is :func:`sweep_requests_observed`.
     """
     extra = sum(pages_for_total(t, ipp) - 1 for t in leaf_totals)
     return cells_visited + extra
 
 
+def sweep_requests_observed(
+    *,
+    cells_visited: int,
+    retries_attempted: int,
+    extra_pages: int,
+    calibration_requests: int,
+    scale: float,
+) -> int:
+    """
+    What a sweep ACTUALLY issues: the floor plus retries plus calibration.
+
+    A retry is not free. ``_probe_cell`` issues ``attempt + 1`` requests, each
+    taking a rate-limiter token and (in the collector) a ``count_request``, so a
+    model that prices retries at zero under-counts a real night -- and it does
+    so worst on exactly the cities that refuse most, which is the direction that
+    gets a per-IP-metered provider angry at us. Over this study the retries were
+    174 requests against 392 cells visited, 44% on top of the floor.
+
+    Calibration is added AFTER the scaling and the retries before it, because
+    they scale differently: the ladder is paid once for the whole city no matter
+    how many roots get walked, while retries are a property of the cells and so
+    grow with them. Scaling the ladder too would multiply a fixed cost by
+    ``root_cells / roots_probed`` -- 247x on New York.
+    """
+    per_probed_roots = cells_visited + retries_attempted + extra_pages
+    return int(round(per_probed_roots * scale)) + calibration_requests
+
+
 def redundancy_factor() -> float:
-    """Circle area over cell area: how many times the sweep sees each photo."""
+    """
+    Circle area over cell area: how many times the sweep sees each photo.
+
+    An INTERIOR figure, and ``photos_in_bbox_estimate`` divides by it anyway,
+    so that estimate carries two biases this study cannot separate. The lattice
+    is a ceiling fit, so its outermost circles hang over the bbox edge and count
+    photos that are not in the city at all (biasing the estimate HIGH, worst on
+    a bbox a few cells across -- Buck Grove is one cell); and a photo near that
+    edge is covered by fewer circles than pi/2, so dividing it by pi/2 charges
+    it an overlap it never had (biasing LOW). Neither is corrected here: the
+    number exists to give the density regime an order of magnitude, and the
+    honest count of what a sweep FETCHES is photos_seen_sum_over_cells.
+    """
     return math.pi / 2.0
 
 
+# Every raw counter a city record carries -- i.e. everything that was MEASURED
+# rather than derived. ``--recompute-from-record`` reads exactly these back out
+# of the committed JSON and re-derives the rest, so a derived field can be fixed
+# without re-spending a paced run against the provider.
+RAW_CITY_FIELDS = (
+    "city_id",
+    "bbox_area_km2",
+    "grid_width_m",
+    "grid_height_m",
+    "start_radius_m",
+    "calibrated_radius_m",
+    "reachable",
+    "note",
+    "calibration",
+    "calibration_requests",
+    "root_cells",
+    "roots_probed",
+    "plan_complete",
+    "requests_spent_planning",
+    "cells_visited",
+    "leaf_cells",
+    "subdivisions",
+    "refusals",
+    "retries_attempted",
+    "retries_cleared",
+    "floor_failures",
+    "broken_cells",
+    "deepest_refusal_radius_m",
+    "photos_seen_sum_over_cells",
+    "sweep_requests_over_probed_roots",
+)
+
+
+def city_record(raw: dict) -> dict:
+    """
+    Assemble one city's record: its raw counters, then everything derived.
+
+    ONE assembler for both producers. The walk calls it with what it just
+    measured and ``--recompute-from-record`` calls it with what the committed
+    JSON already holds, so the two cannot drift -- a re-derivation is a fixed
+    point on its own output, which is what makes an offline repair of a derived
+    field trustworthy without re-spending the paced run that measured it.
+
+    THE PARTIAL-ROOT CORRECTION (and why it is recorded rather than hidden).
+    ``--max-requests-per-city`` can bite in the middle of a root's subdivision
+    cascade, and the cells still on the stack are never visited. That root is
+    counted in ``roots_probed`` -- the denominator of the scaling -- while its
+    unvisited children are missing from the numerator, so its share of the cost
+    is under-charged and every scaled estimate for that city is biased LOW.
+    ``cells_pending_at_cutoff`` is the exact size of that hole, and it is
+    derivable rather than needing its own counter: every visited cell either
+    ends the branch or pushes four children, so the stack ever held
+    ``roots_probed + 4 * subdivisions`` cells and the walk popped
+    ``cells_visited`` of them. Two of the fourteen study cities are affected
+    (Horace ND and New York, 4 cells each).
+    """
+    out = {k: raw[k] for k in RAW_CITY_FIELDS if k in raw}
+    if not raw.get("reachable") or not raw.get("roots_probed"):
+        # No radius answered anywhere: nothing here is scalable, and a zero
+        # would sort to the front of the cost distribution as the cheapest
+        # city in the study. See _unreachable_city.
+        out.update(
+            {
+                "cells_pending_at_cutoff": 0,
+                "roots_partial": 0,
+                "photos_seen_scaled_to_bbox": None,
+                "photos_in_bbox_estimate": None,
+                "sweep_requests_over_probed_roots": raw.get("sweep_requests_over_probed_roots"),
+                "sweep_requests_estimate": None,
+                "sweep_requests_observed": None,
+            }
+        )
+        return out
+
+    scale = raw["root_cells"] / raw["roots_probed"]
+    pending = raw["roots_probed"] + 4 * raw["subdivisions"] - raw["cells_visited"]
+    extra_pages = raw["sweep_requests_over_probed_roots"] - raw["cells_visited"]
+    seen = raw["photos_seen_sum_over_cells"] or 0
+    out.update(
+        {
+            "cells_pending_at_cutoff": pending,
+            "roots_partial": 1 if pending else 0,
+            # Sum over overlapping circles, so it double-counts by ~pi/2, and
+            # over the PROBED roots only. Three numbers rather than two,
+            # because the first two used to sit side by side with only one of
+            # them scaled -- which is how Attleboro's 227 seen could read as
+            # 231 "in the bbox" and look like a division that ran backwards.
+            "photos_seen_scaled_to_bbox": int(round(seen * scale)),
+            "photos_in_bbox_estimate": int(round(seen / redundancy_factor() * scale)),
+            "sweep_requests_estimate": int(round(raw["sweep_requests_over_probed_roots"] * scale)),
+            "sweep_requests_observed": sweep_requests_observed(
+                cells_visited=raw["cells_visited"],
+                retries_attempted=raw["retries_attempted"],
+                extra_pages=extra_pages,
+                calibration_requests=raw["calibration_requests"],
+                scale=scale,
+            ),
+        }
+    )
+    return out
+
+
 # ── Per-city radius calibration ────────────────────────────────────────────
+
+
+def ladder_from(start_radius_m: int) -> tuple[int, ...]:
+    """
+    The calibration ladder capped at ``start_radius_m``, largest rung first.
+
+    ``--start-radius-m`` was a knob that changed nothing for one commit: the
+    walk always began at ``RADIUS_LADDER_M[0]`` while the record dutifully
+    reported whatever the operator had passed. A record asserting a
+    configuration the run did not have is worse than no record, so the knob is
+    wired here rather than deleted -- capping the ladder is what "the walk only
+    shrinks from here" was always supposed to mean.
+
+    A value below every rung leaves nothing to try, which is a usage error
+    rather than an unreachable city; the caller reports it as one.
+    """
+    return tuple(r for r in RADIUS_LADDER_M if r <= start_radius_m)
 
 
 def calibration_points(
@@ -312,6 +502,7 @@ def calibrate_radius(
     access_token: str | None,
     probes_per_rung: int,
     retries: int,
+    start_radius_m: int,
 ) -> tuple[int | None, list[dict], int]:
     """
     Find the largest radius this city's server will actually answer.
@@ -336,6 +527,12 @@ def calibrate_radius(
     point would set a radius the rest of the city then re-discovers the hard
     way.
 
+    ``start_radius_m`` caps the ladder rather than replacing it: rungs above it
+    are never asked for, and the walk only shrinks from there. It can only lower
+    the ceiling, because ``RADIUS_LADDER_M[0]`` is already the largest radius the
+    feasibility study ever saw answered and asking for more would be a radius no
+    rung has evidence for.
+
     Returns:
         ``(radius or None, trace, requests_spent)``. ``None`` means no rung
         answered anywhere -- which is NOT the same as "no imagery here", and the
@@ -344,7 +541,7 @@ def calibrate_radius(
     points = calibration_points(bbox, probes_per_rung)
     trace: list[dict] = []
     spent = 0
-    for radius in RADIUS_LADDER_M:
+    for radius in ladder_from(start_radius_m):
         outcomes = []
         for lat, lon in points:
             cell = Cell(lat=lat, lon=lon, size_m=radius * math.sqrt(2))
@@ -377,35 +574,35 @@ def _unreachable_city(
     "refused is not empty" distinction the feasibility probe makes for
     ``max_working_radius_m: null``.
     """
-    return {
-        "city_id": city["city_id"],
-        "bbox_area_km2": round(_bbox_area_km2(bbox), 1),
-        "grid_width_m": city["grid_width_m"],
-        "grid_height_m": city["grid_height_m"],
-        "start_radius_m": start_radius_m,
-        "calibrated_radius_m": None,
-        "calibration": trace,
-        "calibration_requests": spent,
-        "reachable": False,
-        "note": "no radius answered at any calibration point; NOT evidence of an empty city",
-        "root_cells": None,
-        "roots_probed": 0,
-        "plan_complete": False,
-        "requests_spent_planning": spent,
-        "cells_visited": 0,
-        "leaf_cells": 0,
-        "subdivisions": 0,
-        "refusals": 0,
-        "retries_attempted": 0,
-        "retries_cleared": 0,
-        "floor_failures": 0,
-        "broken_cells": 0,
-        "deepest_refusal_radius_m": min(RADIUS_LADDER_M),
-        "photos_seen_sum_over_cells": None,
-        "photos_in_bbox_estimate": None,
-        "sweep_requests_over_probed_roots": None,
-        "sweep_requests_estimate": None,
-    }
+    return city_record(
+        {
+            "city_id": city["city_id"],
+            "bbox_area_km2": round(_bbox_area_km2(bbox), 1),
+            "grid_width_m": city["grid_width_m"],
+            "grid_height_m": city["grid_height_m"],
+            "start_radius_m": start_radius_m,
+            "calibrated_radius_m": None,
+            "reachable": False,
+            "note": "no radius answered at any calibration point; NOT evidence of an empty city",
+            "calibration": trace,
+            "calibration_requests": spent,
+            "root_cells": None,
+            "roots_probed": 0,
+            "plan_complete": False,
+            "requests_spent_planning": spent,
+            "cells_visited": 0,
+            "leaf_cells": 0,
+            "subdivisions": 0,
+            "refusals": 0,
+            "retries_attempted": 0,
+            "retries_cleared": 0,
+            "floor_failures": 0,
+            "broken_cells": 0,
+            "deepest_refusal_radius_m": min(ladder_from(start_radius_m), default=None),
+            "photos_seen_sum_over_cells": None,
+            "sweep_requests_over_probed_roots": None,
+        }
+    )
 
 
 # ── The adaptive walk (this is the part that spends requests) ──────────────
@@ -454,6 +651,7 @@ def plan_city(
         access_token=access_token,
         probes_per_rung=probes_per_rung,
         retries=retries,
+        start_radius_m=start_radius_m,
     )
     # No rung answered anywhere: record it and spend nothing more. This is NOT
     # evidence of an empty city, so it must not be reported as a cheap one.
@@ -472,6 +670,9 @@ def plan_city(
     broken_cells = 0
     roots_probed = 0
     deepest_refusal_radius_m: int | None = None
+    # Non-empty only if max_requests cut a root's cascade mid-descent, which is
+    # the case city_record's cells_pending_at_cutoff exists to make visible.
+    stack: list[Cell] = []
 
     for root_index in order:
         if spent >= max_requests:
@@ -514,45 +715,56 @@ def plan_city(
             leaf_totals.append(total)
 
     plan_complete = roots_probed == len(roots) and spent < max_requests
-    scale = len(roots) / roots_probed if roots_probed else 0.0
-    sampled_requests = sweep_requests(cells_visited, leaf_totals, ipp)
     seen = sum(t for t in leaf_totals if t)
 
-    return {
-        "city_id": city["city_id"],
-        "bbox_area_km2": round(_bbox_area_km2(bbox), 1),
-        "grid_width_m": city["grid_width_m"],
-        "grid_height_m": city["grid_height_m"],
-        "start_radius_m": start_radius_m,
-        "calibrated_radius_m": calibrated_m,
-        "reachable": True,
-        "calibration": calibration_trace,
-        "calibration_requests": calibration_spent,
-        "root_cells": len(roots),
-        "roots_probed": roots_probed,
-        "plan_complete": plan_complete,
-        "requests_spent_planning": spent,
-        "cells_visited": cells_visited,
-        "leaf_cells": len(leaf_totals),
-        "subdivisions": subdivisions,
-        "refusals": refusals,
-        "retries_attempted": retries_attempted,
-        "retries_cleared": retries_cleared,
-        "floor_failures": floor_failures,
-        "broken_cells": broken_cells,
-        # The smallest radius that still got refused. If this sits well above
-        # the floor the walk is converging; at or near the floor, the refusal
-        # is not about how much was asked for -- Horace ND refuses an EMPTY
-        # circle at r >= 250 and answers 0 photos at r=125.
-        "deepest_refusal_radius_m": deepest_refusal_radius_m,
-        # Sum over overlapping circles, so it double-counts by ~pi/2. Both the
-        # raw sum and the de-overlapped estimate are kept: the first is what
-        # the sweep pays to fetch, the second is what the city holds.
-        "photos_seen_sum_over_cells": seen,
-        "photos_in_bbox_estimate": int(round(seen / redundancy_factor() * scale)),
-        "sweep_requests_over_probed_roots": sampled_requests,
-        "sweep_requests_estimate": int(round(sampled_requests * scale)),
-    }
+    record = city_record(
+        {
+            "city_id": city["city_id"],
+            "bbox_area_km2": round(_bbox_area_km2(bbox), 1),
+            "grid_width_m": city["grid_width_m"],
+            "grid_height_m": city["grid_height_m"],
+            "start_radius_m": start_radius_m,
+            "calibrated_radius_m": calibrated_m,
+            "reachable": True,
+            "calibration": calibration_trace,
+            "calibration_requests": calibration_spent,
+            "root_cells": len(roots),
+            "roots_probed": roots_probed,
+            "plan_complete": plan_complete,
+            "requests_spent_planning": spent,
+            "cells_visited": cells_visited,
+            "leaf_cells": len(leaf_totals),
+            "subdivisions": subdivisions,
+            "refusals": refusals,
+            "retries_attempted": retries_attempted,
+            "retries_cleared": retries_cleared,
+            "floor_failures": floor_failures,
+            "broken_cells": broken_cells,
+            # The smallest radius that still got refused. If this sits well
+            # above the floor the walk is converging; at or near the floor, the
+            # refusal is not about how much was asked for -- Horace ND refuses
+            # an EMPTY circle at r >= 250 and answers 0 photos at r=125.
+            "deepest_refusal_radius_m": deepest_refusal_radius_m,
+            # Sum over overlapping circles and over the PROBED roots only, so
+            # it is neither a photo count nor comparable to the scaled fields
+            # beside it; city_record derives both of those from it.
+            "photos_seen_sum_over_cells": seen,
+            "sweep_requests_over_probed_roots": sweep_requests(cells_visited, leaf_totals, ipp),
+        }
+    )
+    # The derivation is exact -- every visited cell either ends its branch or
+    # pushes four children -- so it must agree with the cells the budget really
+    # left unwalked, and this is the only place both numbers exist at once.
+    # Logged rather than asserted: a multi-hour paced run must not be discarded
+    # by a bookkeeping disagreement, for the same reason the record is written
+    # before the summary table is printed.
+    if record["cells_pending_at_cutoff"] != len(stack):
+        logger.warning(
+            f"{city['city_id']}: cells_pending_at_cutoff "
+            f"{record['cells_pending_at_cutoff']} != {len(stack)} cells left unwalked; "
+            f"the scaled estimates for this city are suspect"
+        )
+    return record
 
 
 def _probe_cell(
@@ -647,12 +859,30 @@ def load_cities(city_ids: list[str]) -> tuple[list[dict], list[str]]:
 
 
 def docs_generated_by(args: argparse.Namespace) -> str:
-    """The command that produced the record, spelled from the real arguments."""
+    """
+    The command that produced the record, spelled from the real arguments.
+
+    Every argument that changes a number in the record has to appear here or
+    the stamp is a claim the run cannot back. ``--seed`` is the sharp one: it
+    decides WHICH roots a truncated plan probes, so two runs with different
+    seeds produce different overheads under the same command line -- it was
+    missing while this docstring already claimed a scratch run could not pass
+    itself off as the canonical one.
+    """
+    # Plain attribute access, never getattr with a default: a Namespace missing
+    # an argument is exactly how --seed went unrecorded, and a default would
+    # have swallowed that too.
     parts = ["scripts/kartaview_sweep_cost.py"]
+    if args.recompute_from_record:
+        parts += ["--recompute-from-record"]
+    if args.catalog_summary:
+        parts += ["--catalog-summary"]
     if args.city:
         for c in args.city:
             parts += ["--city", c]
-    else:
+    elif not args.recompute_from_record:
+        # A recompute reads the record's own cities; naming a sample it did not
+        # consult would be the same false claim as an unwired --start-radius-m.
         parts += ["--sample", str(args.sample)]
     if args.ipp != IPP_MAX:
         parts += ["--ipp", str(args.ipp)]
@@ -660,6 +890,8 @@ def docs_generated_by(args: argparse.Namespace) -> str:
         parts += ["--start-radius-m", str(args.start_radius_m)]
     if args.max_requests_per_city != DEFAULT_MAX_REQUESTS_PER_CITY:
         parts += ["--max-requests-per-city", str(args.max_requests_per_city)]
+    if args.seed != DEFAULT_SEED:
+        parts += ["--seed", str(args.seed)]
     parts += ["--docs-dir", str(args.docs_dir)]
     return " ".join(parts)
 
@@ -668,91 +900,322 @@ def docs_generated_by(args: argparse.Namespace) -> str:
 # keeping a 14-city run inside one paced hour. Small cities finish complete.
 DEFAULT_MAX_REQUESTS_PER_CITY = 60
 
+# The root-cell shuffle seed. It decides WHICH roots a truncated plan probes and
+# therefore what overhead the record reports, so it is a named constant that
+# docs_generated_by compares against rather than an argparse literal.
+DEFAULT_SEED = 225
+
+# Published verbatim in the record and pasted into the writeup, because the
+# catalog totals are the one set of numbers in that document that no per-city
+# record can back: they come from a local table nobody else can query. A reader
+# checking "1,144 enabled cities" should be able to run this line.
+CATALOG_SQL = (
+    "SELECT city_id, center_lat, center_lon, grid_width_m, grid_height_m, step_m "
+    "FROM cities WHERE enabled = 1"
+)
+
+
+def catalog_path() -> str:
+    """The operational catalog. Read-only, local, never a network call."""
+    return os.path.join(paths.get_project_root(), "data", "streetscape_tracker.db")
+
+
+def catalog_summary(overhead_over_root_cells: float, db: str | None = None) -> dict:
+    """
+    What a KartaView pass over the WHOLE catalog would cost, from local geometry.
+
+    No provider request is involved: every frozen grid is already in the
+    catalog, and the sweep's cost is a function of its bbox (finding 1), so the
+    catalog-wide totals the writeup quotes are computable rather than sampled.
+    They were not, before -- "1,144 enabled cities", "191,835 km2" and
+    "~96,000 requests" appeared in the prose with no committed JSON behind them
+    and no committed code that produced them, which is exactly the single-copy
+    failure CLAUDE.md's experiment rules exist to prevent.
+
+    Two costs are reported and they must not be conflated. The floor is the
+    exact lattice count at ``DEFAULT_START_RADIUS_M`` -- ``ceil(W/s) * ceil(H/s)``
+    per city, which is 7.6% above the ``area / (2 r^2)`` the writeup used to
+    quote, all of it the small-city ceiling. On top of that,
+    ``overhead_over_root_cells`` is the study's measured per-city median of
+    observed requests over root cells, which carries the retries and the
+    calibration ladder. It is a MEDIAN over 14 cities with a heavy tail (Horace
+    ND is 13.7x), so the projection is an order of magnitude, not a budget.
+
+    Areas here are bbox areas -- the frozen grid plus its half-step margin, the
+    same measure every per-city record uses -- so they run ~1% above the raw
+    grid areas the study set was originally chosen on.
+    """
+    db = db or catalog_path()
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(CATALOG_SQL).fetchall()
+    conn.close()
+
+    areas, cells = [], []
+    for r in rows:
+        bbox = grid_bbox(
+            r["center_lat"], r["center_lon"], r["grid_width_m"], r["grid_height_m"], r["step_m"]
+        )
+        areas.append(_bbox_area_km2(bbox))
+        cells.append(len(cells_for_bbox(*bbox, DEFAULT_START_RADIUS_M * math.sqrt(2))))
+    areas.sort()
+    cells.sort()
+
+    floor = sum(cells)
+    return {
+        "measured_at_utc": datetime.now(UTC).isoformat(),
+        "db": os.path.relpath(db, paths.get_project_root()),
+        "sql": CATALOG_SQL,
+        "enabled_cities": len(rows),
+        "radius_m": DEFAULT_START_RADIUS_M,
+        "bbox_area_km2": {
+            "total": round(sum(areas), 1),
+            **{f"p{int(q * 100)}": round(percentile(areas, q), 1) for q in _CATALOG_DECILES},
+        },
+        "root_cells": {
+            "total": floor,
+            **{f"p{int(q * 100)}": int(round(percentile(cells, q))) for q in _CATALOG_DECILES},
+            "max": cells[-1],
+        },
+        "one_pass_requests": {
+            "geometric_floor": floor,
+            "overhead_over_root_cells": overhead_over_root_cells,
+            "at_study_median_overhead": int(round(floor * overhead_over_root_cells)),
+        },
+    }
+
+
+# The percentiles the study set was drawn on, so the record's catalog block and
+# the study's own city list are read against one ruler.
+_CATALOG_DECILES = (0.05, 0.20, 0.35, 0.50, 0.65, 0.80, 0.90, 0.95, 0.99)
+
+
+def percentile(sorted_values: list[float], q: float) -> float:
+    """
+    Linearly interpolated percentile -- i.e. the one that gives a real median.
+
+    The obvious spelling, ``values[int(q * (n - 1))]``, is a lower-index pick
+    and is NOT a median on an even-sized sample: over this study's 14 cities it
+    returned the 7th value, 210, where the median is 297. A study that exists to
+    publish a distribution cannot mislabel its own middle, so this is numpy's
+    default linear interpolation, written out rather than adding a dependency to
+    a stdlib-only script. n is small (14), so the record reports it beside every
+    percentile -- a p90 over 14 points sits between the 12th and 13th value and
+    is a shape, not a precise quantile.
+    """
+    if not sorted_values:
+        raise ValueError("percentile of an empty sample")
+    pos = q * (len(sorted_values) - 1)
+    lo, hi = math.floor(pos), math.ceil(pos)
+    if lo == hi:
+        return float(sorted_values[lo])
+    return sorted_values[lo] + (sorted_values[hi] - sorted_values[lo]) * (pos - lo)
+
+
+def _distribution(values: list[int]) -> dict:
+    """min / p50 / p90 / max / mean / total for one cost column."""
+    v = sorted(values)
+    return {
+        "min": v[0],
+        "p50": int(round(percentile(v, 0.5))),
+        "p90": int(round(percentile(v, 0.9))),
+        "max": v[-1],
+        "mean": int(round(sum(v) / len(v))),
+        "total": sum(v),
+    }
+
 
 def summarize(cities: list[dict]) -> dict:
     """Distribution over the study set. CLAUDE.md: quote the shape, not a headline."""
     reachable = [c for c in cities if c.get("sweep_requests_estimate") is not None]
     if not reachable:
         return {"n": 0, "unreachable": len(cities)}
-    est = sorted(c["sweep_requests_estimate"] for c in reachable)
-
-    def pct(q: float) -> int:
-        return est[min(len(est) - 1, int(q * (len(est) - 1)))]
 
     visited = sum(c["cells_visited"] for c in cities)
     radii = sorted(c["calibrated_radius_m"] for c in reachable)
+    observed = [c["sweep_requests_observed"] for c in reachable]
     return {
-        "n": len(est),
-        "sweep_requests_estimate": {
-            "min": est[0],
-            "p50": pct(0.5),
-            "p90": pct(0.9),
-            "max": est[-1],
-            "mean": int(round(sum(est) / len(est))),
+        "n": len(reachable),
+        # THE cost number: what the walk issued, retries and calibration ladder
+        # included, scaled to the whole bbox. Read this one.
+        "sweep_requests_observed": _distribution(observed),
+        # The geometric floor beneath it -- cells plus pages, no retries, no
+        # calibration. Kept because it is what a budget guard can compute from
+        # bbox area before it has walked anything, NOT because it is the cost.
+        "sweep_requests_estimate": _distribution([c["sweep_requests_estimate"] for c in reachable]),
+        "observed_over_floor": round(
+            sum(observed) / sum(c["sweep_requests_estimate"] for c in reachable), 3
+        ),
+        # Overhead against the pure geometry, per city, because the total is
+        # dominated by the two metros: this is the multiplier to apply to a
+        # bbox-area budget for a city nobody has walked yet.
+        "observed_over_root_cells": {
+            "p50": round(
+                percentile(
+                    sorted(c["sweep_requests_observed"] / c["root_cells"] for c in reachable), 0.5
+                ),
+                2,
+            ),
+            "max": round(max(c["sweep_requests_observed"] / c["root_cells"] for c in reachable), 2),
         },
         "plans_complete": sum(1 for c in cities if c["plan_complete"]),
         "plans_truncated": sum(1 for c in reachable if not c["plan_complete"]),
+        # A plan whose LAST root was cut mid-cascade: its unvisited children are
+        # missing from the numerator while the root itself is in the scaling
+        # denominator, so that city's scaled figures are biased low.
+        "plans_with_a_partial_root": sum(1 for c in reachable if c.get("roots_partial")),
         "unreachable": len(cities) - len(reachable),
         # The finding this study turns on: the working radius is a property
         # of the LOCATION, and it is what sets the cost.
-        "calibrated_radius_m": {"min": radii[0], "max": radii[-1], "p50": radii[len(radii) // 2]},
+        "calibrated_radius_m": {
+            "min": radii[0],
+            "max": radii[-1],
+            "p50": int(round(percentile(radii, 0.5))),
+        },
         "refusal_rate_over_cells_visited": (
             round(sum(c["refusals"] for c in cities) / visited, 4) if visited else None
         ),
-        "retries_cleared": sum(c["retries_cleared"] for c in cities),
-        "retries_attempted": sum(c["retries_attempted"] for c in cities),
+        # Two different units, and they were quoted as one ("88 of 174 retries
+        # cleared") until this comment: cells_cleared_on_retry counts CELLS that
+        # answered after at least one retry, retry_requests_spent counts the
+        # extra REQUESTS those retries cost across every cell that made any.
+        "cells_cleared_on_retry": sum(c["retries_cleared"] for c in cities),
+        "retry_requests_spent": sum(c["retries_attempted"] for c in cities),
+        "cells_visited": visited,
+        "calibration_requests": sum(c["calibration_requests"] for c in cities),
         "floor_failures": sum(c["floor_failures"] for c in cities),
         "broken_cells": sum(c.get("broken_cells", 0) for c in cities),
         "requests_spent_measuring": sum(c["requests_spent_planning"] for c in cities),
     }
 
 
-def write_docs_record(cities, missing, args, authed) -> str:
+def measurement_about(args: argparse.Namespace, missing: list[str], authed: bool) -> dict:
+    """The provenance block for a run that actually went to the provider."""
+    return {
+        "experiment": "kartaview-sweep-cost",
+        "writeup": "docs/experiments/kartaview-sweep-cost.md",
+        "generated_by": docs_generated_by(args),
+        "measured_by": docs_generated_by(args),
+        "issue": 225,
+        "probed_at_utc": datetime.now(UTC).isoformat(),
+        "authenticated": authed,
+        "rate_limit_used_per_hour": REQUESTS_PER_HOUR_AUTH if authed else REQUESTS_PER_HOUR_ANON,
+        "ipp": args.ipp,
+        "start_radius_m": args.start_radius_m,
+        "max_requests_per_city": args.max_requests_per_city,
+        "seed": args.seed,
+        "cities_not_registered": list(missing),
+        "note": DOCS_RECORD_NOTE,
+    }
+
+
+def recompute_about(previous: dict, args: argparse.Namespace) -> dict:
+    """
+    The provenance block for an OFFLINE re-derivation of an existing record.
+
+    ``measured_by`` keeps the invocation that spent the requests and
+    ``generated_by`` names what wrote the bytes now on disk, because the two
+    stopped being the same thing the moment a derived field could be repaired
+    without re-measuring. Collapsing them either way loses one of the two facts
+    a reader needs: what was asked of the provider, and what produced this file.
+    """
+    about = dict(previous)
+    about.setdefault("measured_by", previous.get("generated_by"))
+    about["generated_by"] = docs_generated_by(args)
+    about["recomputed_at_utc"] = datetime.now(UTC).isoformat()
+    about["note"] = DOCS_RECORD_NOTE
+    return about
+
+
+def write_docs_record(cities, about, args, catalog=None) -> str:
     """Write the committed metrics record beside the writeup. Sole producer."""
     os.makedirs(args.docs_dir, exist_ok=True)
     path = os.path.join(args.docs_dir, DOCS_METRICS_NAME)
-    payload = {
-        "_about": {
-            "experiment": "kartaview-sweep-cost",
-            "writeup": "docs/experiments/kartaview-sweep-cost.md",
-            "generated_by": docs_generated_by(args),
-            "issue": 225,
-            "probed_at_utc": datetime.now(UTC).isoformat(),
-            "authenticated": authed,
-            "rate_limit_used_per_hour": (
-                REQUESTS_PER_HOUR_AUTH if authed else REQUESTS_PER_HOUR_ANON
-            ),
-            "ipp": args.ipp,
-            "start_radius_m": args.start_radius_m,
-            "max_requests_per_city": args.max_requests_per_city,
-            "seed": args.seed,
-            "cities_not_registered": list(missing),
-            "note": DOCS_RECORD_NOTE,
-        },
-        "summary": summarize(cities),
-        "cities": cities,
-    }
+    payload = {"_about": about, "summary": summarize(cities)}
+    if catalog is not None:
+        payload["catalog"] = catalog
+    payload["cities"] = cities
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, sort_keys=False)
         f.write("\n")
     return path
 
 
+def recompute_from_record(args: argparse.Namespace) -> int:
+    """
+    Re-derive an existing record's computed fields, offline, from its own rows.
+
+    WHY THIS EXISTS. The record's raw counters are the expensive part -- 638
+    paced requests against a per-IP-metered provider, on a laptop, over two
+    hours -- and its derived fields are arithmetic. When the arithmetic turns
+    out to be wrong (the published cost model priced retries and calibration at
+    zero, which is what ``sweep_requests_observed`` fixes), re-running the
+    measurement to correct a division is both wasteful and, on a provider that
+    has already banned this project twice, actively unwise. So the derivation is
+    one function (:func:`city_record`), both producers call it, and this path
+    reads the committed JSON back through it.
+
+    It is deliberately NOT a way to change a measurement: only fields in
+    ``RAW_CITY_FIELDS`` are read, everything else is discarded and rebuilt, so a
+    recompute cannot smuggle a hand-edited count into the record.
+    """
+    path = os.path.join(args.docs_dir, DOCS_METRICS_NAME)
+    if not os.path.exists(path):
+        logger.error(f"no record to recompute at {path}")
+        return 64
+    with open(path, encoding="utf-8") as fh:
+        previous = json.load(fh)
+
+    cities = [city_record(c) for c in previous["cities"]]
+    catalog = previous.get("catalog")
+    if args.catalog_summary:
+        catalog = catalog_summary(summarize(cities)["observed_over_root_cells"]["p50"], args.db)
+    written = write_docs_record(cities, recompute_about(previous["_about"], args), args, catalog)
+    logger.info(f"recomputed {len(cities)} cities from the record; wrote {written}")
+    _print_table(cities)
+    return 0
+
+
+def _print_table(results: list[dict]) -> None:
+    print(f"\n{'city':<44} {'km2':>8} {'roots':>12} {'spent':>7} {'floor':>7} {'observed':>9}")
+    for r in results:
+        flag = "" if r["plan_complete"] else "  <- extrapolated"
+        print(
+            f"{r['city_id']:<44} {r['bbox_area_km2']:>8.1f} "
+            f"{r['roots_probed']:>5}/{str(r['root_cells']):<6} "
+            f"{r['requests_spent_planning']:>7} {str(r['sweep_requests_estimate']):>7} "
+            f"{str(r['sweep_requests_observed']):>9}{flag}"
+        )
+
+
 DOCS_RECORD_NOTE = (
-    "Sweep cost for a KartaView census over each city's FROZEN GRID bbox. A sweep's "
-    "requests are cells_visited + sum over leaves of (pages - 1); page 1 of every cell "
-    "reports totalFilteredItems, so planning the sweep pays its first half and prices "
-    "the second exactly. This run issued page 1 ONLY -- it never fetched pages 2+, so "
-    "sweep_requests_* are measured for the cell half and computed for the page half. "
-    "Cells are squares covered by their circumscribed circle, so the sweep sees each "
-    "photo ~pi/2 times; photos_seen_sum_over_cells is what a sweep fetches and "
-    "photos_in_bbox_estimate divides that out. Where plan_complete is false, "
-    "max_requests_per_city stopped the walk and every *_estimate is scaled by "
-    "root_cells / roots_probed -- roots are walked in a SEEDED SHUFFLE so a truncated "
-    "plan is a uniform sample of the bbox rather than its northern strip. A refusal "
-    "(HTTP 400, apiCode 690/408) is BACKPRESSURE: it is retried once and only then "
-    "subdivided, because apiCode 690 was measured to be flaky rather than a function "
-    "of (radius, ipp)."
+    "Sweep cost for a KartaView census over each city's FROZEN GRID bbox. READ "
+    "sweep_requests_observed, NOT sweep_requests_estimate: the estimate is the "
+    "GEOMETRIC FLOOR (cells_visited + sum over leaves of (pages - 1)), i.e. what the "
+    "sweep would cost if no circle ever had to be retried and the radius were already "
+    "known, and it is kept only because that term is what a collector can compute up "
+    "front from bbox area. sweep_requests_observed adds what the walk actually issued "
+    "-- the retry requests, which take a rate-limiter token apiece, and the per-city "
+    "calibration ladder, which is added after the scaling because it is paid once per "
+    "city rather than once per cell. Page 1 of every cell reports totalFilteredItems, "
+    "so planning the sweep pays its first half and prices the second exactly; this run "
+    "issued page 1 ONLY -- it never fetched pages 2+, so every figure is measured for "
+    "the cell half and computed for the page half. Cells are squares covered by their "
+    "circumscribed circle, so the sweep sees each photo ~pi/2 times: "
+    "photos_seen_sum_over_cells is the raw sum over PROBED roots (what a sweep "
+    "fetches), photos_seen_scaled_to_bbox scales it to the whole bbox, and "
+    "photos_in_bbox_estimate divides the overlap out -- an order of magnitude only, "
+    "since edge circles overhang the bbox in one direction and see less overlap in the "
+    "other. Where plan_complete is false, max_requests_per_city stopped the walk and "
+    "every scaled field is multiplied by root_cells / roots_probed -- roots are walked "
+    "in a SEEDED SHUFFLE so a truncated plan is a uniform sample of the bbox rather "
+    "than its northern strip. cells_pending_at_cutoff > 0 means the cap fell inside "
+    "one root's subdivision cascade: that root is in the scaling denominator while its "
+    "unvisited children are missing from the numerator, so that city's scaled figures "
+    "are biased LOW. A refusal (HTTP 400, apiCode 690/408) is BACKPRESSURE: it is "
+    f"retried up to {DEFAULT_BACKPRESSURE_RETRIES} times and only then subdivided, "
+    "because apiCode 690 was measured to be flaky rather than a function of "
+    "(radius, ipp)."
 )
 
 
@@ -765,12 +1228,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=f"named study set ({', '.join(SAMPLES)})",
     )
     p.add_argument("--cities", action="store_true", help="list the default study set and exit")
+    p.add_argument(
+        "--recompute-from-record",
+        action="store_true",
+        help="re-derive the committed record's computed fields from its own raw "
+        "counters and rewrite it. No network, no provider request: the measurement "
+        "is the expensive half and the arithmetic on top of it is not",
+    )
+    p.add_argument(
+        "--catalog-summary",
+        action="store_true",
+        help="add the catalog-wide area and cost block, read from the local "
+        "cities table. A local DB read, never an API call",
+    )
+    p.add_argument(
+        "--db", default=None, help="catalog to read for --catalog-summary (default: data/)"
+    )
     p.add_argument("--ipp", type=int, default=IPP_MAX, help=f"items per page (cap {IPP_MAX})")
     p.add_argument(
         "--start-radius-m",
         type=int,
         default=DEFAULT_START_RADIUS_M,
-        help="radius of the top-level cells; the walk only ever shrinks from here",
+        help="cap on the calibration ladder: the largest rung it may try, and so "
+        "the largest radius the walk can tile at -- it only shrinks from here",
     )
     p.add_argument(
         "--max-requests-per-city",
@@ -779,7 +1259,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="bound on the paced walk; when it bites, plan_complete is false and "
         "the estimates are scaled from the roots actually probed",
     )
-    p.add_argument("--seed", type=int, default=225, help="root-cell shuffle seed")
+    p.add_argument("--seed", type=int, default=DEFAULT_SEED, help="root-cell shuffle seed")
     p.add_argument("--docs-dir", default="docs/experiments")
     p.add_argument("--log-level", default="INFO")
     return p.parse_args(argv)
@@ -789,16 +1269,34 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     logging.basicConfig(level=args.log_level.upper(), format="%(levelname)s %(message)s")
 
+    # Validated ABOVE --cities, which used to sit on top of it: `--cities
+    # --sample bogus` raised a KeyError traceback where the identical mistake on
+    # the collection path exits 64, so the cheap listing mode was the one that
+    # answered a usage error worst.
+    if args.sample not in SAMPLES:
+        logger.error(f"unknown sample {args.sample!r}; known: {', '.join(SAMPLES)}")
+        return 64
+    if not ladder_from(args.start_radius_m):
+        logger.error(
+            f"--start-radius-m {args.start_radius_m} is below every rung of "
+            f"{RADIUS_LADDER_M}; there is nothing to calibrate with"
+        )
+        return 64
+
     if args.cities:
         for c in SAMPLES[args.sample]:
             print(c)
         return 0
 
+    # The offline mode issues no provider request at all -- it reads the
+    # committed record and, optionally, the local catalog -- so it runs before
+    # the collection-host refusal rather than being blocked by it. That guard is
+    # about not discovering a per-IP limit with the nightly batch's address.
+    if args.recompute_from_record:
+        return recompute_from_record(args)
+
     refuse_on_collection_host()
 
-    if args.sample not in SAMPLES:
-        logger.error(f"unknown sample {args.sample!r}; known: {', '.join(SAMPLES)}")
-        return 64
     city_ids = args.city or list(SAMPLES[args.sample])
     cities, missing = load_cities(city_ids)
     if missing:
@@ -842,23 +1340,22 @@ def main(argv: list[str] | None = None) -> int:
         logger.info(
             f"{r['city_id']}: {r['bbox_area_km2']} km2, {r['roots_probed']}/{r['root_cells']} "
             f"roots, spent {r['requests_spent_planning']} -> sweep ~"
-            f"{r['sweep_requests_estimate']} requests"
+            f"{r['sweep_requests_observed']} requests "
+            f"(floor {r['sweep_requests_estimate']})"
             f"{'' if r['plan_complete'] else ' (EXTRAPOLATED)'}"
         )
 
+    catalog = (
+        catalog_summary(summarize(results)["observed_over_root_cells"]["p50"], args.db)
+        if args.catalog_summary
+        else None
+    )
+
     # Write BEFORE printing: a formatting error in the table must not discard a
     # multi-hour paced run.
-    path = write_docs_record(results, missing, args, bool(token))
+    path = write_docs_record(results, measurement_about(args, missing, bool(token)), args, catalog)
     logger.info(f"wrote {path}")
-
-    print(f"\n{'city':<44} {'km2':>8} {'roots':>12} {'spent':>7} {'sweep req':>10}")
-    for r in results:
-        flag = "" if r["plan_complete"] else "  <- extrapolated"
-        print(
-            f"{r['city_id']:<44} {r['bbox_area_km2']:>8.1f} "
-            f"{r['roots_probed']:>5}/{r['root_cells']:<6} "
-            f"{r['requests_spent_planning']:>7} {r['sweep_requests_estimate']:>10}{flag}"
-        )
+    _print_table(results)
     return 0
 
 

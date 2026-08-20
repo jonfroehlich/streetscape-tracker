@@ -2,7 +2,7 @@
   "_about": {
     "experiment": "kartaview-sweep-cost",
     "writeup": "docs/experiments/kartaview-sweep-cost.md",
-    "generated_by": "scripts/kartaview_sweep_cost.py --sample default --docs-dir docs/experiments",
+    "generated_by": "scripts/kartaview_sweep_cost.py --recompute-from-record --catalog-summary --docs-dir docs/experiments",
     "issue": 225,
     "probed_at_utc": "2026-08-20T00:51:00.843746+00:00",
     "authenticated": true,
@@ -12,19 +12,36 @@
     "max_requests_per_city": 60,
     "seed": 225,
     "cities_not_registered": [],
-    "note": "Sweep cost for a KartaView census over each city's FROZEN GRID bbox. A sweep's requests are cells_visited + sum over leaves of (pages - 1); page 1 of every cell reports totalFilteredItems, so planning the sweep pays its first half and prices the second exactly. This run issued page 1 ONLY -- it never fetched pages 2+, so sweep_requests_* are measured for the cell half and computed for the page half. Cells are squares covered by their circumscribed circle, so the sweep sees each photo ~pi/2 times; photos_seen_sum_over_cells is what a sweep fetches and photos_in_bbox_estimate divides that out. Where plan_complete is false, max_requests_per_city stopped the walk and every *_estimate is scaled by root_cells / roots_probed -- roots are walked in a SEEDED SHUFFLE so a truncated plan is a uniform sample of the bbox rather than its northern strip. A refusal (HTTP 400, apiCode 690/408) is BACKPRESSURE: it is retried once and only then subdivided, because apiCode 690 was measured to be flaky rather than a function of (radius, ipp)."
+    "note": "Sweep cost for a KartaView census over each city's FROZEN GRID bbox. READ sweep_requests_observed, NOT sweep_requests_estimate: the estimate is the GEOMETRIC FLOOR (cells_visited + sum over leaves of (pages - 1)), i.e. what the sweep would cost if no circle ever had to be retried and the radius were already known, and it is kept only because that term is what a collector can compute up front from bbox area. sweep_requests_observed adds what the walk actually issued -- the retry requests, which take a rate-limiter token apiece, and the per-city calibration ladder, which is added after the scaling because it is paid once per city rather than once per cell. Page 1 of every cell reports totalFilteredItems, so planning the sweep pays its first half and prices the second exactly; this run issued page 1 ONLY -- it never fetched pages 2+, so every figure is measured for the cell half and computed for the page half. Cells are squares covered by their circumscribed circle, so the sweep sees each photo ~pi/2 times: photos_seen_sum_over_cells is the raw sum over PROBED roots (what a sweep fetches), photos_seen_scaled_to_bbox scales it to the whole bbox, and photos_in_bbox_estimate divides the overlap out -- an order of magnitude only, since edge circles overhang the bbox in one direction and see less overlap in the other. Where plan_complete is false, max_requests_per_city stopped the walk and every scaled field is multiplied by root_cells / roots_probed -- roots are walked in a SEEDED SHUFFLE so a truncated plan is a uniform sample of the bbox rather than its northern strip. cells_pending_at_cutoff > 0 means the cap fell inside one root's subdivision cascade: that root is in the scaling denominator while its unvisited children are missing from the numerator, so that city's scaled figures are biased LOW. A refusal (HTTP 400, apiCode 690/408) is BACKPRESSURE: it is retried up to 3 times and only then subdivided, because apiCode 690 was measured to be flaky rather than a function of (radius, ipp).",
+    "measured_by": "scripts/kartaview_sweep_cost.py --sample default --docs-dir docs/experiments",
+    "recomputed_at_utc": "2026-08-20T16:09:56.009002+00:00"
   },
   "summary": {
     "n": 14,
+    "sweep_requests_observed": {
+      "min": 4,
+      "p50": 557,
+      "p90": 7624,
+      "max": 12355,
+      "mean": 2114,
+      "total": 29589
+    },
     "sweep_requests_estimate": {
       "min": 1,
-      "p50": 210,
-      "p90": 1551,
+      "p50": 297,
+      "p90": 5131,
       "max": 7329,
-      "mean": 1370
+      "mean": 1370,
+      "total": 19173
+    },
+    "observed_over_floor": 1.543,
+    "observed_over_root_cells": {
+      "p50": 1.8,
+      "max": 13.66
     },
     "plans_complete": 4,
     "plans_truncated": 10,
+    "plans_with_a_partial_root": 2,
     "unreachable": 0,
     "calibrated_radius_m": {
       "min": 500,
@@ -32,11 +49,50 @@
       "p50": 1000
     },
     "refusal_rate_over_cells_visited": 0.0357,
-    "retries_cleared": 88,
-    "retries_attempted": 174,
+    "cells_cleared_on_retry": 88,
+    "retry_requests_spent": 174,
+    "cells_visited": 392,
+    "calibration_requests": 72,
     "floor_failures": 0,
     "broken_cells": 0,
     "requests_spent_measuring": 638
+  },
+  "catalog": {
+    "measured_at_utc": "2026-08-20T16:09:56.008830+00:00",
+    "db": "data/streetscape_tracker.db",
+    "sql": "SELECT city_id, center_lat, center_lon, grid_width_m, grid_height_m, step_m FROM cities WHERE enabled = 1",
+    "enabled_cities": 1144,
+    "radius_m": 1000,
+    "bbox_area_km2": {
+      "total": 192568.3,
+      "p5": 1.0,
+      "p20": 3.3,
+      "p35": 8.0,
+      "p50": 19.7,
+      "p65": 56.1,
+      "p80": 150.4,
+      "p90": 357.6,
+      "p95": 741.5,
+      "p99": 2428.7
+    },
+    "root_cells": {
+      "total": 103561,
+      "p5": 1,
+      "p20": 4,
+      "p35": 6,
+      "p50": 12,
+      "p65": 35,
+      "p80": 82,
+      "p90": 195,
+      "p95": 399,
+      "p99": 1249,
+      "max": 4500
+    },
+    "one_pass_requests": {
+      "geometric_floor": 103561,
+      "overhead_over_root_cells": 1.8,
+      "at_study_median_overhead": 186410
+    }
   },
   "cities": [
     {
@@ -69,9 +125,13 @@
       "broken_cells": 0,
       "deepest_refusal_radius_m": null,
       "photos_seen_sum_over_cells": 0,
-      "photos_in_bbox_estimate": 0,
       "sweep_requests_over_probed_roots": 1,
-      "sweep_requests_estimate": 1
+      "cells_pending_at_cutoff": 0,
+      "roots_partial": 0,
+      "photos_seen_scaled_to_bbox": 0,
+      "photos_in_bbox_estimate": 0,
+      "sweep_requests_estimate": 1,
+      "sweep_requests_observed": 4
     },
     {
       "city_id": "south-tucson--arizona--united-states",
@@ -103,9 +163,13 @@
       "broken_cells": 0,
       "deepest_refusal_radius_m": null,
       "photos_seen_sum_over_cells": 2411,
-      "photos_in_bbox_estimate": 1535,
       "sweep_requests_over_probed_roots": 4,
-      "sweep_requests_estimate": 4
+      "cells_pending_at_cutoff": 0,
+      "roots_partial": 0,
+      "photos_seen_scaled_to_bbox": 2411,
+      "photos_in_bbox_estimate": 1535,
+      "sweep_requests_estimate": 4,
+      "sweep_requests_observed": 6
     },
     {
       "city_id": "emmitsburg--maryland--united-states",
@@ -137,9 +201,13 @@
       "broken_cells": 0,
       "deepest_refusal_radius_m": null,
       "photos_seen_sum_over_cells": 1596,
-      "photos_in_bbox_estimate": 1016,
       "sweep_requests_over_probed_roots": 6,
-      "sweep_requests_estimate": 6
+      "cells_pending_at_cutoff": 0,
+      "roots_partial": 0,
+      "photos_seen_scaled_to_bbox": 1596,
+      "photos_in_bbox_estimate": 1016,
+      "sweep_requests_estimate": 6,
+      "sweep_requests_observed": 9
     },
     {
       "city_id": "ithaca--michigan--united-states",
@@ -171,9 +239,13 @@
       "broken_cells": 0,
       "deepest_refusal_radius_m": null,
       "photos_seen_sum_over_cells": 2429,
-      "photos_in_bbox_estimate": 1546,
       "sweep_requests_over_probed_roots": 12,
-      "sweep_requests_estimate": 12
+      "cells_pending_at_cutoff": 0,
+      "roots_partial": 0,
+      "photos_seen_scaled_to_bbox": 2429,
+      "photos_in_bbox_estimate": 1546,
+      "sweep_requests_estimate": 12,
+      "sweep_requests_observed": 16
     },
     {
       "city_id": "horace--north-dakota--united-states",
@@ -205,9 +277,13 @@
       "broken_cells": 0,
       "deepest_refusal_radius_m": 500,
       "photos_seen_sum_over_cells": 0,
-      "photos_in_bbox_estimate": 0,
       "sweep_requests_over_probed_roots": 24,
-      "sweep_requests_estimate": 210
+      "cells_pending_at_cutoff": 4,
+      "roots_partial": 1,
+      "photos_seen_scaled_to_bbox": 0,
+      "photos_in_bbox_estimate": 0,
+      "sweep_requests_estimate": 210,
+      "sweep_requests_observed": 478
     },
     {
       "city_id": "attleboro--massachusetts--united-states",
@@ -239,9 +315,13 @@
       "broken_cells": 0,
       "deepest_refusal_radius_m": null,
       "photos_seen_sum_over_cells": 227,
-      "photos_in_bbox_estimate": 231,
       "sweep_requests_over_probed_roots": 55,
-      "sweep_requests_estimate": 88
+      "cells_pending_at_cutoff": 0,
+      "roots_partial": 0,
+      "photos_seen_scaled_to_bbox": 363,
+      "photos_in_bbox_estimate": 231,
+      "sweep_requests_estimate": 88,
+      "sweep_requests_observed": 94
     },
     {
       "city_id": "chandler--arizona--united-states",
@@ -273,9 +353,13 @@
       "broken_cells": 0,
       "deepest_refusal_radius_m": 1000,
       "photos_seen_sum_over_cells": 140924,
-      "photos_in_bbox_estimate": 1029084,
       "sweep_requests_over_probed_roots": 85,
-      "sweep_requests_estimate": 975
+      "cells_pending_at_cutoff": 0,
+      "roots_partial": 0,
+      "photos_seen_scaled_to_bbox": 1616481,
+      "photos_in_bbox_estimate": 1029084,
+      "sweep_requests_estimate": 975,
+      "sweep_requests_observed": 1257
     },
     {
       "city_id": "milwaukee--wisconsin--united-states",
@@ -307,9 +391,13 @@
       "broken_cells": 0,
       "deepest_refusal_radius_m": null,
       "photos_seen_sum_over_cells": 4786,
-      "photos_in_bbox_estimate": 34412,
       "sweep_requests_over_probed_roots": 34,
-      "sweep_requests_estimate": 384
+      "cells_pending_at_cutoff": 0,
+      "roots_partial": 0,
+      "photos_seen_scaled_to_bbox": 54054,
+      "photos_in_bbox_estimate": 34412,
+      "sweep_requests_estimate": 384,
+      "sweep_requests_observed": 636
     },
     {
       "city_id": "las-vegas--nevada--united-states",
@@ -341,9 +429,13 @@
       "broken_cells": 0,
       "deepest_refusal_radius_m": 1000,
       "photos_seen_sum_over_cells": 14400,
-      "photos_in_bbox_estimate": 302522,
       "sweep_requests_over_probed_roots": 47,
-      "sweep_requests_estimate": 1551
+      "cells_pending_at_cutoff": 0,
+      "roots_partial": 0,
+      "photos_seen_scaled_to_bbox": 475200,
+      "photos_in_bbox_estimate": 302522,
+      "sweep_requests_estimate": 1551,
+      "sweep_requests_observed": 1885
     },
     {
       "city_id": "singapore--singapore",
@@ -380,9 +472,13 @@
       "broken_cells": 0,
       "deepest_refusal_radius_m": null,
       "photos_seen_sum_over_cells": 40094,
-      "photos_in_bbox_estimate": 3741182,
       "sweep_requests_over_probed_roots": 50,
-      "sweep_requests_estimate": 7329
+      "cells_pending_at_cutoff": 0,
+      "roots_partial": 0,
+      "photos_seen_scaled_to_bbox": 5876635,
+      "photos_in_bbox_estimate": 3741182,
+      "sweep_requests_estimate": 7329,
+      "sweep_requests_observed": 9974
     },
     {
       "city_id": "manila--capital-district--philippines",
@@ -419,9 +515,13 @@
       "broken_cells": 0,
       "deepest_refusal_radius_m": 500,
       "photos_seen_sum_over_cells": 1142,
-      "photos_in_bbox_estimate": 30360,
       "sweep_requests_over_probed_roots": 33,
-      "sweep_requests_estimate": 1378
+      "cells_pending_at_cutoff": 0,
+      "roots_partial": 0,
+      "photos_seen_scaled_to_bbox": 47690,
+      "photos_in_bbox_estimate": 30360,
+      "sweep_requests_estimate": 1378,
+      "sweep_requests_observed": 2139
     },
     {
       "city_id": "seattle--washington--united-states",
@@ -453,9 +553,13 @@
       "broken_cells": 0,
       "deepest_refusal_radius_m": null,
       "photos_seen_sum_over_cells": 81463,
-      "photos_in_bbox_estimate": 385253,
       "sweep_requests_over_probed_roots": 66,
-      "sweep_requests_estimate": 490
+      "cells_pending_at_cutoff": 0,
+      "roots_partial": 0,
+      "photos_seen_scaled_to_bbox": 605154,
+      "photos_in_bbox_estimate": 385253,
+      "sweep_requests_estimate": 490,
+      "sweep_requests_observed": 644
     },
     {
       "city_id": "new-york--new-york--united-states",
@@ -492,9 +596,13 @@
       "broken_cells": 0,
       "deepest_refusal_radius_m": 500,
       "photos_seen_sum_over_cells": 2337,
-      "photos_in_bbox_estimate": 367247,
       "sweep_requests_over_probed_roots": 27,
-      "sweep_requests_estimate": 6665
+      "cells_pending_at_cutoff": 4,
+      "roots_partial": 1,
+      "photos_seen_scaled_to_bbox": 576870,
+      "photos_in_bbox_estimate": 367247,
+      "sweep_requests_estimate": 6665,
+      "sweep_requests_observed": 12355
     },
     {
       "city_id": "bend--oregon--united-states",
@@ -526,9 +634,13 @@
       "broken_cells": 0,
       "deepest_refusal_radius_m": null,
       "photos_seen_sum_over_cells": 3507,
-      "photos_in_bbox_estimate": 3502,
       "sweep_requests_over_probed_roots": 51,
-      "sweep_requests_estimate": 80
+      "cells_pending_at_cutoff": 0,
+      "roots_partial": 0,
+      "photos_seen_scaled_to_bbox": 5501,
+      "photos_in_bbox_estimate": 3502,
+      "sweep_requests_estimate": 80,
+      "sweep_requests_observed": 92
     }
   ]
 }

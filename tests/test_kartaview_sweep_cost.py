@@ -19,9 +19,13 @@ Four properties carry it:
 (4) TRUNCATION IS VISIBLE AND UNBIASED. When --max-requests-per-city bites, the
     record says so and the roots that were probed are a seeded shuffle, not the
     northern strip of the map.
+(5) THE PUBLISHED COST INCLUDES WHAT WAS ACTUALLY SPENT. A retry and a
+    calibration probe are HTTP requests like any other, and a model that prices
+    them at zero under-counts by 54% on this study's own numbers -- worst on the
+    cities that refuse most, which is precisely where a per-IP-metered provider
+    is already unhappy with us.
 """
 
-import argparse
 import importlib.util
 import math
 import os
@@ -153,6 +157,41 @@ def test_sweep_requests_adds_only_pages_two_and_up():
 def test_sweep_requests_never_undercounts_the_cells_already_spent():
     """Internal nodes paid a page-1 before their refusal was known."""
     assert ks.sweep_requests(7, [], 2000) == 7
+
+
+def test_the_observed_cost_charges_for_every_request_the_walk_issued():
+    """
+    A retry is an HTTP request: it takes a limiter token and, in the collector,
+    a count_request. The floor prices it at zero, which is the direction that
+    under-counts a per-IP-metered provider -- 44% on this study's own numbers.
+    """
+    # One leaf of 2,500 photos is a second page: extra_pages == 1.
+    floor_only = ks.sweep_requests_observed(
+        cells_visited=10, retries_attempted=0, extra_pages=1, calibration_requests=0, scale=1.0
+    )
+    assert floor_only == ks.sweep_requests(10, [0, 2500], 2000)
+    with_overhead = ks.sweep_requests_observed(
+        cells_visited=10, retries_attempted=5, extra_pages=1, calibration_requests=3, scale=1.0
+    )
+    assert with_overhead == floor_only + 5 + 3
+
+
+def test_the_calibration_ladder_is_not_scaled_but_the_retries_are():
+    """
+    They scale differently and conflating them is a large error, not a rounding
+    one: the ladder is paid ONCE per city however few roots get walked, while
+    retries belong to the cells and grow with them. Scaling the ladder too would
+    multiply a fixed cost by root_cells / roots_probed -- 247x on New York.
+    """
+    scaled = ks.sweep_requests_observed(
+        cells_visited=10, retries_attempted=4, extra_pages=0, calibration_requests=7, scale=100.0
+    )
+    assert scaled == (10 + 4) * 100 + 7
+    # Same city walked to completion: no scaling, so no divergence to hide.
+    unscaled = ks.sweep_requests_observed(
+        cells_visited=1000, retries_attempted=400, extra_pages=0, calibration_requests=7, scale=1.0
+    )
+    assert unscaled == scaled
 
 
 # ── (3) the walk: retries, subdivision, floors ─────────────────────────────
@@ -305,34 +344,71 @@ def test_a_city_where_no_radius_answers_is_null_not_zero():
     assert out["requests_spent_planning"] == out["calibration_requests"] > 0
 
 
-def test_an_unreachable_city_is_excluded_from_the_distribution_not_counted_as_zero():
-    cities = [
+def _fake_city(floor, *, complete=True, cells=10, retries=0, calibration=2, refusals=1):
+    """
+    A city record in the shape summarize() consumes, built through the REAL
+    assembler.
+
+    Hand-written dicts here went stale the moment city_record grew a field: the
+    summary reads keys the fixture did not have, and the test fails for a reason
+    that has nothing to do with what it is checking. Roots probed == root cells,
+    so the scale is 1 and ``floor`` lands verbatim in sweep_requests_estimate.
+    """
+    return ks.city_record(
         {
-            "sweep_requests_estimate": 40,
+            "city_id": f"city-{floor}",
+            "bbox_area_km2": 10.0,
             "calibrated_radius_m": 1000,
-            "plan_complete": True,
-            "cells_visited": 10,
-            "refusals": 0,
+            "reachable": True,
+            "calibration": [],
+            "calibration_requests": calibration,
+            "root_cells": cells,
+            "roots_probed": cells,
+            "plan_complete": complete,
+            "requests_spent_planning": cells + calibration,
+            "cells_visited": cells,
+            "leaf_cells": cells,
+            "subdivisions": 0,
+            "refusals": refusals,
+            "retries_attempted": retries,
             "retries_cleared": 0,
-            "retries_attempted": 0,
             "floor_failures": 0,
             "broken_cells": 0,
-            "requests_spent_planning": 10,
-        },
+            "photos_seen_sum_over_cells": 0,
+            "sweep_requests_over_probed_roots": floor,
+        }
+    )
+
+
+def _fake_unreachable_city():
+    return ks.city_record(
         {
-            "sweep_requests_estimate": None,
+            "city_id": "nowhere",
+            "bbox_area_km2": 10.0,
             "calibrated_radius_m": None,
+            "reachable": False,
+            "calibration": [],
+            "calibration_requests": 12,
+            "root_cells": None,
+            "roots_probed": 0,
             "plan_complete": False,
+            "requests_spent_planning": 12,
             "cells_visited": 0,
+            "leaf_cells": 0,
+            "subdivisions": 0,
             "refusals": 0,
-            "retries_cleared": 0,
             "retries_attempted": 0,
+            "retries_cleared": 0,
             "floor_failures": 0,
             "broken_cells": 0,
-            "requests_spent_planning": 12,
-        },
-    ]
-    s = ks.summarize(cities)
+            "photos_seen_sum_over_cells": None,
+            "sweep_requests_over_probed_roots": None,
+        }
+    )
+
+
+def test_an_unreachable_city_is_excluded_from_the_distribution_not_counted_as_zero():
+    s = ks.summarize([_fake_city(40), _fake_unreachable_city()])
     assert s["n"] == 1
     assert s["unreachable"] == 1
     assert s["sweep_requests_estimate"]["min"] == 40
@@ -459,30 +535,82 @@ def test_the_shuffle_is_seeded_so_a_rerun_probes_the_same_roots():
     assert [x["lat"] for x in c.calls] != [x["lat"] for x in a.calls]
 
 
+def _refuse_away_from_the_calibration_points():
+    """
+    An answer that lets calibration settle on r=1000 and then refuses every
+    ROOT at that radius, so each root subdivides into four children that answer.
+    A whole root cascade is therefore 4 refused attempts + 4 children = 8
+    requests over 5 cells, which is what makes a mid-cascade cut reproducible.
+    """
+    calib = set(ks.calibration_points(_seattle_bbox(), 2))
+
+    def answer(data):
+        if (data["lat"], data["lng"]) in calib:
+            return _page(5)
+        return _REFUSAL if data["radius"] >= 1000 else _page(5)
+
+    return answer
+
+
+def test_a_root_whose_cascade_the_budget_cut_is_recorded_not_hidden():
+    """
+    --max-requests-per-city can stop the walk INSIDE a root's subdivision
+    cascade. That root is counted in roots_probed -- the scaling denominator --
+    while the children still on the stack never reach the numerator, so the
+    city's scaled estimates come out biased LOW. Two of the study's fourteen
+    cities are in exactly this state, and both are showcase rows, so the record
+    has to say so rather than leaving it to be spotted arithmetically.
+    """
+    out, _ = _plan(_refuse_away_from_the_calibration_points(), max_requests=14)
+    assert out["calibrated_radius_m"] == 1000
+    assert out["roots_partial"] == 1
+    assert out["cells_pending_at_cutoff"] == 4  # one root's four children
+    # The identity the derivation rests on: every visited cell either ends its
+    # branch or pushes four, so the stack ever held roots + 4 * subdivisions.
+    assert out["cells_pending_at_cutoff"] == (
+        out["roots_probed"] + 4 * out["subdivisions"] - out["cells_visited"]
+    )
+
+
+def test_a_plan_that_finished_every_cascade_reports_no_partial_root():
+    """The flag must mean something, i.e. it must be off on an ordinary walk."""
+    out, _ = _plan(lambda data: _page(100), max_requests=25)
+    assert out["plan_complete"] is False  # truncated between roots, not inside one
+    assert out["roots_partial"] == 0
+    assert out["cells_pending_at_cutoff"] == 0
+
+
 # ── the record's own contract ──────────────────────────────────────────────
 
 
+def _args(**kw):
+    """
+    An argparse.Namespace with every attribute the real parser produces.
+
+    Built from ``parse_args`` rather than hand-listed, because a hand-listed
+    Namespace is how --seed stayed invisible: the test omitted the attribute, so
+    docs_generated_by never had a chance to read it and the record's stamp
+    quietly dropped the one argument that changes which roots get probed.
+    """
+    args = ks.parse_args(["--docs-dir", "docs/experiments"])
+    for k, v in kw.items():
+        assert hasattr(args, k), k
+        setattr(args, k, v)
+    return args
+
+
 def test_generated_by_names_the_invocation_not_a_constant():
-    canonical = ks.docs_generated_by(
-        argparse.Namespace(
-            city=None,
-            sample="default",
-            ipp=ks.IPP_MAX,
-            start_radius_m=ks.DEFAULT_START_RADIUS_M,
-            max_requests_per_city=ks.DEFAULT_MAX_REQUESTS_PER_CITY,
-            docs_dir="docs/experiments",
-        )
-    )
+    canonical = ks.docs_generated_by(_args())
     assert canonical == (
         "scripts/kartaview_sweep_cost.py --sample default --docs-dir docs/experiments"
     )
     scratch = ks.docs_generated_by(
-        argparse.Namespace(
+        _args(
             city=["bend--oregon--united-states"],
-            sample="default",
             ipp=200,
             start_radius_m=500,
             max_requests_per_city=10,
+            seed=999,
             docs_dir="/tmp/scratch",
         )
     )
@@ -491,35 +619,83 @@ def test_generated_by_names_the_invocation_not_a_constant():
         "--ipp 200",
         "--start-radius-m 500",
         "--max-requests-per-city 10",
+        "--seed 999",
         "/tmp/scratch",
     ):
         assert fragment in scratch
 
 
+def test_generated_by_carries_the_seed_because_it_changes_which_roots_are_probed():
+    """
+    Ten of fourteen plans are truncated, so the seed decides WHICH roots were
+    walked and therefore what overhead the record reports. A stamp that omits it
+    lets a differently-seeded scratch run claim the canonical invocation -- the
+    exact thing docs_generated_by exists to prevent, and it was doing it.
+    """
+    assert "--seed" not in ks.docs_generated_by(_args(seed=ks.DEFAULT_SEED))
+    assert "--seed 7" in ks.docs_generated_by(_args(seed=7))
+    # And the default the parser hands out is the constant, not a stray literal.
+    assert ks.parse_args([]).seed == ks.DEFAULT_SEED
+
+
+def test_generated_by_names_the_offline_modes_it_was_run_in():
+    """A recomputed record was not produced by the measuring command."""
+    stamp = ks.docs_generated_by(_args(recompute_from_record=True, catalog_summary=True))
+    assert stamp == (
+        "scripts/kartaview_sweep_cost.py --recompute-from-record --catalog-summary "
+        "--docs-dir docs/experiments"
+    )
+    # --sample is dropped: a recompute reads the record's cities, not a set.
+    assert "--sample" not in stamp
+
+
 def test_summary_quotes_the_distribution_not_a_headline():
     """CLAUDE.md: a writeup must quote the shape, so the record must carry it."""
-    cities = [
-        {
-            "sweep_requests_estimate": v,
-            "calibrated_radius_m": 1000,
-            "plan_complete": v < 500,
-            "cells_visited": 10,
-            "refusals": 1,
-            "retries_cleared": 0,
-            "retries_attempted": 0,
-            "floor_failures": 0,
-            "broken_cells": 0,
-            "requests_spent_planning": 10,
-        }
-        for v in (10, 100, 250, 900, 4000)
-    ]
+    cities = [_fake_city(v, complete=v < 500) for v in (10, 100, 250, 900, 4000)]
     s = ks.summarize(cities)
     assert s["n"] == 5
     assert s["sweep_requests_estimate"]["min"] == 10
     assert s["sweep_requests_estimate"]["max"] == 4000
     assert s["sweep_requests_estimate"]["p50"] == 250
+    assert s["sweep_requests_estimate"]["total"] == 5260
     assert s["plans_truncated"] == 2
     assert s["refusal_rate_over_cells_visited"] == pytest.approx(0.1)
+
+
+def test_the_summary_reports_both_cost_columns_and_the_floor_is_the_smaller():
+    """
+    The floor is kept because a budget guard can compute it from bbox area; it
+    is NOT the cost, and a record that published only one of the two published
+    the wrong one.
+    """
+    cities = [_fake_city(v, retries=3, calibration=2) for v in (10, 100, 250)]
+    s = ks.summarize(cities)
+    assert s["sweep_requests_estimate"]["total"] == 360
+    assert s["sweep_requests_observed"]["total"] == 360 + 3 * (3 + 2)
+    assert s["observed_over_floor"] > 1.0
+    # Per-city overhead against pure geometry -- the multiplier a bbox-area
+    # budget has to carry for a city nobody has walked yet.
+    assert s["observed_over_root_cells"]["p50"] >= 1.0
+
+
+def test_a_percentile_is_a_percentile_and_p50_is_a_real_median():
+    """
+    The obvious spelling, values[int(q * (n - 1))], is a lower-index pick: over
+    the study's 14 cities it called 210 the median where the median is 297, i.e.
+    a study whose whole job is to publish a distribution mislabelled its middle.
+    """
+    even = [1, 2, 3, 4]
+    assert ks.percentile(even, 0.5) == pytest.approx(2.5)
+    odd = [1, 2, 3, 4, 5]
+    assert ks.percentile(odd, 0.5) == pytest.approx(3)
+    assert ks.percentile(even, 0.0) == 1
+    assert ks.percentile(even, 1.0) == 4
+    # Monotone in q, which the index-truncating version was not obliged to be.
+    values = sorted([5, 9, 1, 40, 3, 17])
+    quantiles = [ks.percentile(values, q / 10) for q in range(11)]
+    assert quantiles == sorted(quantiles)
+    with pytest.raises(ValueError):
+        ks.percentile([], 0.5)
 
 
 def test_summary_of_an_empty_study_set_is_not_a_crash():
@@ -529,6 +705,121 @@ def test_summary_of_an_empty_study_set_is_not_a_crash():
 def test_the_script_refuses_to_run_on_a_collection_host():
     """Identity, so the refusal cannot drift a copy (same guard as the probe)."""
     assert ks.refuse_on_collection_host is kp.refuse_on_collection_host
+
+
+# ── the offline modes: re-derive and re-read, never re-measure ─────────────
+
+
+def test_re_deriving_a_city_record_is_a_fixed_point():
+    """
+    Both producers call city_record -- the walk with what it just measured, and
+    --recompute-from-record with what the committed JSON holds -- so an offline
+    repair of a derived field is trustworthy only if running it twice changes
+    nothing. This is what lets a wrong division be fixed without re-spending 638
+    paced requests against a provider that has banned this project twice.
+    """
+    once = _fake_city(120, cells=8, retries=4, calibration=3)
+    assert ks.city_record(once) == once
+    assert ks.city_record(ks.city_record(once)) == once
+
+
+def test_a_recompute_rebuilds_derived_fields_rather_than_trusting_them():
+    """
+    A recompute must not be a way to edit a measurement. Only RAW_CITY_FIELDS
+    are read back; anything else in the input is discarded and recomputed, so a
+    hand-written cost cannot survive one.
+    """
+    honest = _fake_city(120, cells=8, retries=4, calibration=3)
+    tampered = dict(honest, sweep_requests_observed=1, photos_in_bbox_estimate=999_999)
+    assert ks.city_record(tampered) == honest
+    assert "sweep_requests_observed" not in ks.RAW_CITY_FIELDS
+
+
+def test_an_unreachable_city_survives_a_recompute_as_null_not_zero(record):
+    """The 'refused is not empty' distinction has to hold through the offline path."""
+    out = ks.city_record(_fake_unreachable_city())
+    assert out["reachable"] is False
+    assert out["sweep_requests_estimate"] is None
+    assert out["sweep_requests_observed"] is None
+    assert out["photos_in_bbox_estimate"] is None
+    assert out["roots_partial"] == 0
+    # And nothing in the committed record is in that state, so the study's
+    # numbers are not quietly resting on one.
+    assert record["summary"]["unreachable"] == 0
+
+
+def test_the_catalog_summary_reads_the_local_catalog_and_never_the_provider(tmp_path):
+    """
+    The catalog-wide totals are computable from frozen geometry we already own
+    (finding 1: cost is a function of the bbox), so they are a local DB read
+    rather than a sampled claim. A fake catalog of two known bboxes pins the
+    arithmetic without needing the real one.
+    """
+    import sqlite3
+
+    db = tmp_path / "catalog.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE cities (city_id TEXT, center_lat REAL, center_lon REAL, "
+        "grid_width_m INTEGER, grid_height_m INTEGER, step_m INTEGER, enabled INTEGER)"
+    )
+    conn.executemany(
+        "INSERT INTO cities VALUES (?, ?, ?, ?, ?, ?, ?)",
+        [
+            ("small", 47.6, -122.3, 1000, 1000, 20, 1),
+            ("big", 47.6, -122.3, 20000, 20000, 20, 1),
+            ("switched-off", 47.6, -122.3, 40000, 40000, 20, 0),
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    cat = ks.catalog_summary(2.0, db=str(db))
+    assert cat["enabled_cities"] == 2  # the disabled city is not a cost
+    assert cat["sql"] == ks.CATALOG_SQL
+    assert cat["radius_m"] == ks.DEFAULT_START_RADIUS_M
+    # A 1 km bbox is one cell however small it is; a 20 km one is a 15x15
+    # lattice of 1414 m cells -- the ceiling, which is the excess finding 1
+    # measures and never rounds away.
+    assert cat["root_cells"]["total"] == 1 + 15 * 15
+    assert cat["bbox_area_km2"]["total"] == pytest.approx(1 + 400, rel=0.05)
+    # The projection is the floor times the overhead it was handed, named so a
+    # reader can see which multiplier produced it.
+    assert cat["one_pass_requests"]["overhead_over_root_cells"] == 2.0
+    assert cat["one_pass_requests"]["at_study_median_overhead"] == (
+        2 * cat["one_pass_requests"]["geometric_floor"]
+    )
+
+
+def test_the_calibration_ladder_is_capped_by_start_radius_m():
+    """
+    --start-radius-m was threaded into generated_by and the record while
+    changing nothing at all: the walk always began at RADIUS_LADDER_M[0]. A
+    record asserting a configuration the run did not have is a provenance
+    hazard, so the knob caps the ladder instead of being decorative.
+    """
+    assert ks.ladder_from(ks.DEFAULT_START_RADIUS_M) == ks.RADIUS_LADDER_M
+    assert ks.ladder_from(400) == tuple(r for r in ks.RADIUS_LADDER_M if r <= 400)
+    assert ks.ladder_from(10) == ()
+
+    out, session = _plan(lambda data: _page(5), start_radius_m=400)
+    assert out["calibrated_radius_m"] == 400
+    assert max(c["radius"] for c in session.calls) == 400  # 1000 never asked for
+
+
+def test_a_start_radius_below_every_rung_is_a_usage_error_not_an_empty_walk():
+    assert ks.main(["--start-radius-m", "10"]) == 64
+
+
+def test_listing_the_study_set_validates_the_sample_like_the_real_path_does():
+    """
+    `--cities --sample bogus` raised a KeyError traceback because the listing
+    early-exit sat above the validation, so the cheapest mode answered a usage
+    error worst. Same mistake, same exit code, either way.
+    """
+    assert ks.main(["--sample", "bogus"]) == 64
+    assert ks.main(["--cities", "--sample", "bogus"]) == 64
+    assert ks.main(["--cities"]) == 0  # and the listing itself still works
 
 
 # ── the committed record, and the writeup's traceability ───────────────────
@@ -556,8 +847,15 @@ def by_city(record):
 
 
 def test_the_record_names_its_producer_and_its_writeup(record):
-    assert record["_about"]["generated_by"] == (
+    # Two producers, named apart: what spent the requests, and what wrote the
+    # bytes. They stopped being one thing when a derived field became repairable
+    # offline, and collapsing them either way loses a fact a reader needs.
+    assert record["_about"]["measured_by"] == (
         "scripts/kartaview_sweep_cost.py --sample default --docs-dir docs/experiments"
+    )
+    assert record["_about"]["generated_by"] == (
+        "scripts/kartaview_sweep_cost.py --recompute-from-record --catalog-summary "
+        "--docs-dir docs/experiments"
     )
     assert record["_about"]["writeup"] == "docs/experiments/kartaview-sweep-cost.md"
     assert record["_about"]["issue"] == 225
@@ -567,6 +865,20 @@ def test_the_record_names_its_producer_and_its_writeup(record):
     assert {c["city_id"] for c in record["cities"]} == set(ks.SAMPLES["default"])
 
 
+def test_the_record_note_tracks_the_retry_budget_the_code_actually_uses(record):
+    """
+    Pinned against the CONSTANT, not against the note's own wording. The note
+    said a refusal "is retried once and only then subdivided" while
+    DEFAULT_BACKPRESSURE_RETRIES was 3 and the writeup said three -- and the
+    only test on it compared the record to the note, so the two agreed with each
+    other and with nothing else. Constant-vs-prose drift has to fail here.
+    """
+    assert ks.DEFAULT_BACKPRESSURE_RETRIES == 3
+    assert f"retried up to {ks.DEFAULT_BACKPRESSURE_RETRIES} times" in ks.DOCS_RECORD_NOTE
+    assert "retried once" not in ks.DOCS_RECORD_NOTE
+    assert record["_about"]["note"] == ks.DOCS_RECORD_NOTE
+
+
 def test_the_summary_recomputes_from_its_own_rows(record):
     assert ks.summarize(record["cities"]) == record["summary"]
 
@@ -574,40 +886,42 @@ def test_the_summary_recomputes_from_its_own_rows(record):
 def test_the_writeups_decile_table_matches_the_record(by_city):
     """Finding 2: cost by catalog percentile. The headline table."""
     expected = {
-        # city_id                                  area   r    cells  sweep
-        "buck-grove--iowa--united-states": (1.0, 1000, 1, 1),
-        "south-tucson--arizona--united-states": (3.3, 1000, 4, 4),
-        "emmitsburg--maryland--united-states": (8.0, 1000, 6, 6),
-        "ithaca--michigan--united-states": (19.7, 1000, 12, 12),
-        "horace--north-dakota--united-states": (55.9, 1000, 35, 210),
-        "attleboro--massachusetts--united-states": (150.3, 1000, 88, 88),
-        "chandler--arizona--united-states": (354.8, 1000, 195, 975),
-        "milwaukee--wisconsin--united-states": (737.6, 1000, 384, 384),
-        "las-vegas--nevada--united-states": (2413.7, 1000, 1254, 1551),
+        # city_id                                  area   r    cells floor observed
+        "buck-grove--iowa--united-states": (1.0, 1000, 1, 1, 4),
+        "south-tucson--arizona--united-states": (3.3, 1000, 4, 4, 6),
+        "emmitsburg--maryland--united-states": (8.0, 1000, 6, 6, 9),
+        "ithaca--michigan--united-states": (19.7, 1000, 12, 12, 16),
+        "horace--north-dakota--united-states": (55.9, 1000, 35, 210, 478),
+        "attleboro--massachusetts--united-states": (150.3, 1000, 88, 88, 94),
+        "chandler--arizona--united-states": (354.8, 1000, 195, 975, 1257),
+        "milwaukee--wisconsin--united-states": (737.6, 1000, 384, 384, 636),
+        "las-vegas--nevada--united-states": (2413.7, 1000, 1254, 1551, 1885),
     }
-    for city_id, (area, radius, cells, sweep) in expected.items():
+    for city_id, (area, radius, cells, floor, observed) in expected.items():
         c = by_city[city_id]
         assert c["bbox_area_km2"] == pytest.approx(area, abs=0.05), city_id
         assert c["calibrated_radius_m"] == radius, city_id
         assert c["root_cells"] == cells, city_id
-        assert c["sweep_requests_estimate"] == sweep, city_id
+        assert c["sweep_requests_estimate"] == floor, city_id
+        assert c["sweep_requests_observed"] == observed, city_id
 
 
 def test_the_writeups_density_table_matches_the_record(by_city):
     """Finding 3: three cities calibrated to r=500 and paid ~4x the cells."""
     expected = {
-        "singapore--singapore": (2547.2, 500, 5130, 7329),
-        "new-york--new-york--united-states": (2316.6, 500, 4690, 6665),
-        "manila--capital-district--philippines": (509.1, 500, 1044, 1378),
-        "seattle--washington--united-states": (498.5, 1000, 260, 490),
-        "bend--oregon--united-states": (154.9, 1000, 80, 80),
+        "singapore--singapore": (2547.2, 500, 5130, 7329, 9974),
+        "new-york--new-york--united-states": (2316.6, 500, 4690, 6665, 12355),
+        "manila--capital-district--philippines": (509.1, 500, 1044, 1378, 2139),
+        "seattle--washington--united-states": (498.5, 1000, 260, 490, 644),
+        "bend--oregon--united-states": (154.9, 1000, 80, 80, 92),
     }
-    for city_id, (area, radius, cells, sweep) in expected.items():
+    for city_id, (area, radius, cells, floor, observed) in expected.items():
         c = by_city[city_id]
         assert c["bbox_area_km2"] == pytest.approx(area, abs=0.05), city_id
         assert c["calibrated_radius_m"] == radius, city_id
         assert c["root_cells"] == cells, city_id
-        assert c["sweep_requests_estimate"] == sweep, city_id
+        assert c["sweep_requests_estimate"] == floor, city_id
+        assert c["sweep_requests_observed"] == observed, city_id
     # The claim the table is making: r=500 is a 4x lever, and it is NOT
     # predicted by density -- Seattle held r=1000 at a higher photo density
     # than New York and Manila, which both calibrated down.
@@ -638,11 +952,118 @@ def test_the_geometric_model_holds_to_the_quoted_tolerance(by_city):
             assert ratio <= 1.30, (c["city_id"], ratio)
 
 
-def test_seven_of_fourteen_cities_cost_exactly_their_cell_count(by_city):
-    """The claim that the cost IS the geometric term for most cities."""
+def test_seven_of_fourteen_cities_have_a_floor_equal_to_their_cell_count(by_city):
+    """
+    The claim that the geometric term IS the cost for most cities -- of the
+    FLOOR, which is the version of that claim the record supports. Not one city
+    achieves it on the observed number, because every city pays a calibration
+    ladder, so the writeup says "floor" where it used to say "cost".
+    """
     exact = [c for c in by_city.values() if c["sweep_requests_estimate"] == c["root_cells"]]
     assert len(exact) == 7
     assert len(by_city) == 14
+    assert not [c for c in by_city.values() if c["sweep_requests_observed"] == c["root_cells"]]
+
+
+def test_the_published_cost_adds_the_retries_and_the_calibration_ladder(record, by_city):
+    """
+    THE finding this file's fifth property exists for. The floor prices a retry
+    at zero while the writeup argues at length that retrying is 4x cheaper than
+    subdividing -- an argument made free by the very model publishing it.
+    """
+    for c in by_city.values():
+        # Never below the floor, and never below the floor plus the ladder,
+        # which is a fixed per-city cost that no scaling can dilute.
+        assert c["sweep_requests_observed"] >= c["sweep_requests_estimate"]
+        assert c["sweep_requests_observed"] >= (
+            c["sweep_requests_estimate"] + c["calibration_requests"]
+        )
+    s = record["summary"]
+    assert s["sweep_requests_estimate"]["total"] == 19173
+    assert s["sweep_requests_observed"]["total"] == 29589
+    assert s["observed_over_floor"] == pytest.approx(1.543, abs=0.001)
+    assert s["calibration_requests"] == 72
+    # And the two headline percentiles the writeup quotes.
+    assert s["sweep_requests_estimate"]["p50"] == 297
+    assert s["sweep_requests_observed"]["p50"] == 557
+
+
+def test_the_overhead_multiplier_a_bbox_area_budget_has_to_carry(record):
+    """
+    Finding: budget by bbox area x ~1.8, not by bbox area. The floor is what a
+    collector can compute before it has walked anything, and on this study it is
+    systematically 1.5x under -- so the guard needs the multiplier or it defers
+    nothing it should.
+    """
+    s = record["summary"]
+    assert s["observed_over_root_cells"]["p50"] == pytest.approx(1.8, abs=0.05)
+    # Heavy tail, which is why the writeup calls the projection an order of
+    # magnitude: Horace's cascades cost 13.7x its cell count.
+    assert s["observed_over_root_cells"]["max"] == pytest.approx(13.66, abs=0.01)
+
+
+def test_the_catalog_block_backs_the_writeups_catalog_wide_totals(record):
+    """
+    "1,144 enabled cities", "192,568 km2" and the one-pass projection are the
+    only numbers in the writeup that no per-city row can back -- they come from
+    a local table. Before the catalog block they were in the prose with nothing
+    behind them, which is CLAUDE.md's single-copy failure one layer up.
+    """
+    cat = record["catalog"]
+    assert cat["enabled_cities"] == 1144
+    assert cat["bbox_area_km2"]["total"] == pytest.approx(192568.3, abs=0.1)
+    assert cat["radius_m"] == ks.DEFAULT_START_RADIUS_M
+    # The median catalog city is 12 circles -- the headline, and the same order
+    # as Mapillary's median 12 tiles.
+    assert cat["root_cells"]["p50"] == 12
+    assert cat["root_cells"]["total"] == 103561
+    assert cat["one_pass_requests"]["geometric_floor"] == cat["root_cells"]["total"]
+    assert cat["one_pass_requests"]["at_study_median_overhead"] == 186410
+    # The query is published verbatim so a reader can re-run it, and it is the
+    # one the code actually executed.
+    assert cat["sql"] == ks.CATALOG_SQL
+    # The decile cities really do sit at the percentiles the table claims.
+    assert cat["bbox_area_km2"]["p50"] == pytest.approx(19.7, abs=0.1)
+    assert cat["bbox_area_km2"]["p95"] == pytest.approx(741.5, abs=0.1)
+
+
+def test_the_record_names_the_two_cities_whose_last_root_was_cut_mid_cascade(record, by_city):
+    """
+    --max-requests-per-city can bite inside a root's subdivision cascade: the
+    root is in the scaling denominator while its unvisited children are missing
+    from the numerator, so those cities read LOW. Two of fourteen, and they are
+    the study's two showcase rows, so this has to be stated rather than found.
+    """
+    partial = {
+        c["city_id"]: c["cells_pending_at_cutoff"] for c in record["cities"] if c["roots_partial"]
+    }
+    assert partial == {
+        "horace--north-dakota--united-states": 4,
+        "new-york--new-york--united-states": 4,
+    }
+    assert record["summary"]["plans_with_a_partial_root"] == 2
+    # The derivation is the stack identity, checked against the raw counters.
+    for c in record["cities"]:
+        assert c["cells_pending_at_cutoff"] == (
+            c["roots_probed"] + 4 * c["subdivisions"] - c["cells_visited"]
+        ), c["city_id"]
+
+
+def test_the_photo_columns_are_reported_on_one_scale(by_city):
+    """
+    photos_seen_sum_over_cells is over the PROBED roots and the estimate beside
+    it is scaled to the whole bbox, so on a truncated plan the "estimate" could
+    exceed the "sum" and read as a division that ran backwards -- Attleboro, 227
+    seen against 231 estimated. The scaled column is what makes the pair legible.
+    """
+    a = by_city["attleboro--massachusetts--united-states"]
+    assert a["photos_seen_sum_over_cells"] == 227
+    assert a["photos_seen_scaled_to_bbox"] == 363
+    assert a["photos_in_bbox_estimate"] == 231
+    for c in by_city.values():
+        if c["photos_seen_scaled_to_bbox"]:
+            # De-overlapping can only ever reduce the scaled sum.
+            assert c["photos_in_bbox_estimate"] < c["photos_seen_scaled_to_bbox"]
 
 
 def test_the_two_overhead_causes_are_separable_in_the_record(by_city):
@@ -654,6 +1075,9 @@ def test_the_two_overhead_causes_are_separable_in_the_record(by_city):
     """
     horace = by_city["horace--north-dakota--united-states"]
     assert horace["sweep_requests_estimate"] / horace["root_cells"] == 6.0
+    assert horace["sweep_requests_observed"] / horace["root_cells"] == pytest.approx(
+        13.66, abs=0.01
+    )
     extra_pages = horace["sweep_requests_over_probed_roots"] - horace["cells_visited"]
     assert extra_pages == 0  # pure cascade, no paging
     assert horace["refusals"] > 0 and horace["subdivisions"] > 0
@@ -666,13 +1090,18 @@ def test_the_two_overhead_causes_are_separable_in_the_record(by_city):
 
 def test_the_retry_policy_paid_for_itself(by_city, record):
     """
-    88 of 174 retries cleared, and with them the refusal rate is 3.57% with
-    zero floor failures. Believing the first refusal would have turned each of
-    those 88 cells into four.
+    88 CELLS cleared on retry, for 174 extra REQUESTS -- two different units,
+    published as one ("88 of 174 retries cleared") until this test named them.
+    With them the refusal rate is 3.57% and there are zero floor failures;
+    believing the first refusal would have turned each of those 88 cells into
+    four, which is the trade the observed cost number now actually prices.
     """
     s = record["summary"]
-    assert s["retries_cleared"] == 88
-    assert s["retries_attempted"] == 174
+    assert s["cells_cleared_on_retry"] == 88
+    assert s["retry_requests_spent"] == 174
+    assert s["cells_visited"] == 392
+    # 174 requests bought 88 rescued cells; subdividing them costs 88 x 4.
+    assert s["retry_requests_spent"] < 4 * s["cells_cleared_on_retry"]
     assert s["refusal_rate_over_cells_visited"] == pytest.approx(0.0357, abs=0.0001)
     assert s["floor_failures"] == 0
     assert s["broken_cells"] == 0
