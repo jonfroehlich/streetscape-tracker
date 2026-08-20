@@ -27,6 +27,7 @@ from streetscape_metadata_tracker.download_common import (
     HOST_BY_BUSY_EXIT_CODE,
     HOST_BY_EXIT_CODE,
     HOST_EXIT_CODES,
+    HOST_LABELS,
     HOST_MAPILLARY_TILES,
     HOST_OVERPASS,
     DownloadError,
@@ -316,8 +317,12 @@ def _city_row(city_id="bend--or"):
 def test_every_locked_host_has_a_distinct_exit_code():
     """The child's message never crosses the process boundary — the scheduler
     sees only returncode — so the mapping has to be total and injective."""
+    # Read from HOST_LABELS -- the registry of hosts we lock -- rather than
+    # from a list repeated here, so adding a fourth locked host without giving
+    # it exit codes fails this test instead of silently returning 1 to the
+    # scheduler and reading as an ordinary collection failure.
     for table in (HOST_EXIT_CODES, HOST_BUSY_EXIT_CODES):
-        assert set(table) == {HOST_MAPILLARY_TILES, HOST_OVERPASS}
+        assert set(table) == set(HOST_LABELS)
         assert len(set(table.values())) == len(table)
     assert HOST_BY_EXIT_CODE == {v: k for k, v in HOST_EXIT_CODES.items()}
     assert HOST_BY_BUSY_EXIT_CODE == {v: k for k, v in HOST_BUSY_EXIT_CODES.items()}

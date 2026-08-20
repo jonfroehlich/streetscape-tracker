@@ -52,6 +52,41 @@ MAPILLARY_EXTRA_DTYPES = {
 # The full Mapillary run schema: shared core + Mapillary extras.
 MAPILLARY_METADATA_DTYPES = {**METADATA_DTYPES, **MAPILLARY_EXTRA_DTYPES}
 
+# KartaView-only columns, same posture as the Mapillary block above: every one
+# of these rides on the bulk `nearby-photos` row the sweep already fetched, so
+# capturing them costs nothing and re-fetching them later would cost a full
+# census (issue #225).
+#   - username: contributor, also embedded in copyright_info for parity. The
+#     imagery is CC BY-SA 4.0, so that string is an attribution requirement
+#     rather than the drive-vs-photosphere filter it is for GSV.
+#   - sequence_id / sequence_index: the drive and the position in it. KartaView
+#     publishes a drive id, so pano-spacing analysis can group by drive before
+#     measuring — the correction that is impossible for GSV (pano-spacing.md).
+#   - is_pano: projection == "SPHERE"; PLANE is flat dashcam imagery (#116).
+#   - field_of_view: published beside the projection, not used to derive it.
+#   - compass_angle: KartaView's `heading`, named for the Mapillary column that
+#     measures the same thing so one bearing check can read both (#97).
+#   - date_added: server-side upload time. Published because capture_date may be
+#     null BECAUSE of it — see download_kartaview.shot_date_to_iso_date — so
+#     dropping it would destroy the provenance of the date rule.
+#   - org_code: publisher code (e.g. "CMNT" for a community upload), which is
+#     what separates a Grab fleet ingest from an individual contributor.
+#   - way_id: the OSM way KartaView snapped the photo to.
+KARTAVIEW_EXTRA_DTYPES = {
+    "username": pd.StringDtype(),  # nullable string
+    "sequence_id": pd.StringDtype(),  # nullable string
+    "sequence_index": pd.Int64Dtype(),  # nullable int; position within the drive
+    "is_pano": pd.BooleanDtype(),  # nullable bool (null on ZERO_RESULTS rows)
+    "field_of_view": pd.Float64Dtype(),  # nullable float, degrees
+    "compass_angle": pd.Float64Dtype(),  # nullable float, degrees
+    "date_added": pd.StringDtype(),  # nullable string; upload time, NOT a capture date
+    "org_code": pd.StringDtype(),  # nullable string
+    "way_id": pd.StringDtype(),  # nullable string
+}
+
+# The full KartaView run schema: shared core + KartaView extras.
+KARTAVIEW_METADATA_DTYPES = {**METADATA_DTYPES, **KARTAVIEW_EXTRA_DTYPES}
+
 
 def warn_if_credentials_world_readable(env_path: str) -> bool:
     """
@@ -136,6 +171,28 @@ def load_config(provider: str = "gsv") -> dict[str, Any]:
                 "    > export MAPILLARY_ACCESS_TOKEN='MLY|YOUR|TOKEN'\n\n"
                 "Create a (free) client token by registering an application at "
                 "https://www.mapillary.com/dashboard/developers"
+            )
+        return config
+
+    if provider == "kartaview":
+        config = {
+            "access_token": os.environ.get("KARTAVIEW_ACCESS_TOKEN"),
+        }
+        if not config["access_token"]:
+            raise ValueError(
+                "KARTAVIEW_ACCESS_TOKEN not found in environment variables.\n\n"
+                "KartaView serves anonymous clients at 100 requests/hour and "
+                "authenticated ones at 1,000 (issue #225). The token is required "
+                "rather than optional because the anonymous rate is not a slower "
+                "channel, it is no channel: a p95 city is 384 requests (3.8 hours) "
+                "and Singapore is ~7,300 (73 hours), against a nightly batch.\n\n"
+                "Add it to the .env file in your project root:\n"
+                "  KARTAVIEW_ACCESS_TOKEN=YOUR_TOKEN\n\n"
+                "Sign in at https://kartaview.org with Google or Facebook and read "
+                "the token from the session. NOTE: their OpenStreetMap login has "
+                "been broken since 2024-06 (they call OSM's OAuth2 endpoint with "
+                "OAuth1 parameters), so OSM is not a usable sign-in route — see "
+                "https://github.com/kartaview/openstreetcam.org/issues/404"
             )
         return config
 

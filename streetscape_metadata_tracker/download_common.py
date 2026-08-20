@@ -50,10 +50,17 @@ class DownloadError(Exception):
 # Add them here if either ever runs on the same schedule as a collection.
 HOST_MAPILLARY_TILES = "mapillary_tiles"
 HOST_OVERPASS = "overpass"
+# KartaView documents an hourly ceiling per API key and returns no rate-limit
+# headers of any kind, so a client cannot observe its own budget and nothing
+# published says the ENFORCED limit is the documented one. Both of this
+# project's prior bans were on limits no document described, which is why this
+# is locked on the documented-per-key reading rather than exempted by it.
+HOST_KARTAVIEW = "kartaview"
 
 HOST_LABELS = {
     HOST_MAPILLARY_TILES: "Mapillary's tile CDN (tiles.mapillary.com)",
     HOST_OVERPASS: "the Overpass API (overpass-api.de)",
+    HOST_KARTAVIEW: "the KartaView API (kartaview.org)",
 }
 
 
@@ -104,13 +111,21 @@ class HostBlockedError(HostUnavailableError):
 # environmental condition rather than a bug. The busy codes deliberately sit
 # PAST the end of sysexits (which stops at 78) so they carry no false analogy —
 # 77/78 would silently read as EX_NOPERM/EX_CONFIG to anyone who looks them up.
+#
+# 77 and 78 are skipped for the same reason: they are EX_NOPERM and EX_CONFIG,
+# so a third host taking 77 would read to anyone looking it up as "permission
+# denied" — a plausible-sounding wrong answer, which is worse than an
+# unallocated number. The families are defined by these dicts rather than by
+# being contiguous, so the numbering has a gap and each entry is justified.
 HOST_EXIT_CODES = {
     HOST_MAPILLARY_TILES: 75,
     HOST_OVERPASS: 76,
+    HOST_KARTAVIEW: 81,
 }
 HOST_BUSY_EXIT_CODES = {
     HOST_MAPILLARY_TILES: 79,
     HOST_OVERPASS: 80,
+    HOST_KARTAVIEW: 82,
 }
 HOST_BY_EXIT_CODE = {code: host for host, code in HOST_EXIT_CODES.items()}
 HOST_BY_BUSY_EXIT_CODE = {code: host for host, code in HOST_BUSY_EXIT_CODES.items()}
