@@ -8,7 +8,8 @@ from pathlib import Path
 
 import pandas as pd
 
-from .config import MAPILLARY_METADATA_DTYPES
+from . import naming
+from .config import MAPILLARY_METADATA_DTYPES, PROVIDER_RUN_DTYPES
 from .paths import get_default_data_dir
 
 logger = logging.getLogger(__name__)
@@ -22,6 +23,34 @@ def get_list_of_city_csv_files(data_dir=None) -> list[str]:
     return csv_files
 
 
+def dtypes_for_run_path(csv_path: str) -> dict:
+    """
+    The run schema a CSV should be read with, derived from its own filename.
+
+    A run CSV is self-describing only through its name -- the provider token
+    after ``_step_{S}`` (absent = gsv). That matters because pandas INFERS any
+    column the dtype mapping omits, so reading one census provider's run with
+    another's schema is silent corruption rather than an error: a nullable
+    Int64 sequence index becomes float64 and a numeric-looking string way_id
+    becomes a float, differently depending on which module opened the file.
+
+    Falls back to the Mapillary schema for any name the naming contract does
+    not parse (fixtures, ad-hoc exports). That is the historical default and is
+    a superset of the shared core, so pandas ignores the keys such a file lacks
+    and legacy/GSV reads are unchanged.
+
+    Args:
+        csv_path: path or bare filename of a run or road-walk snapshot CSV.
+    """
+    for parse in (naming.parse_filename, naming.parse_streetwalk_filename):
+        try:
+            provider = parse(csv_path).provider
+        except ValueError:
+            continue
+        return PROVIDER_RUN_DTYPES.get(provider, MAPILLARY_METADATA_DTYPES)
+    return MAPILLARY_METADATA_DTYPES
+
+
 def load_city_csv_file(csv_path: str, dtypes: dict | None = None) -> pd.DataFrame:
     """
     Read a CSV file into a DataFrame, automatically detecting if it's gzipped based on file extension.
@@ -31,13 +60,14 @@ def load_city_csv_file(csv_path: str, dtypes: dict | None = None) -> pd.DataFram
 
     Args:
         csv_path: Path to the CSV file (can be either .csv or .csv.gz)
-        dtypes: Column dtypes to coerce, defaulting to the Mapillary run schema.
-            pandas ignores dtype keys a file lacks, so the default reads GSV
-            runs and legacy files unchanged -- but the reverse is NOT true: a
-            column present in the file and absent from this mapping gets
-            INFERRED. A census provider with its own extras must therefore pass
-            its own schema, or e.g. a nullable-Int64 sequence index silently
-            becomes float64 and a numeric-looking string id becomes a float.
+        dtypes: Column dtypes to coerce. Defaults to the schema named by the
+            file's OWN provider token (:func:`dtypes_for_run_path`), because
+            pandas ignores dtype keys a file lacks but INFERS any column the
+            mapping omits -- so reading one census provider's run with
+            another's schema silently turns a nullable-Int64 sequence index
+            into float64 and a numeric-looking string id into a float. Pass a
+            schema explicitly only when the caller already knows the provider
+            and the path may not carry a parseable name.
 
     Returns:
         pd.DataFrame: Loaded and processed DataFrame
@@ -66,14 +96,14 @@ def load_city_csv_file(csv_path: str, dtypes: dict | None = None) -> pd.DataFram
     try:
         logger.debug(f"Reading CSV file with compression: {compression}")
 
-        # Read CSV with query_timestamp as object type first. The default is
-        # the full Mapillary schema (core + Mapillary extras): pandas silently
+        # Read CSV with query_timestamp as object type first. With no schema
+        # given, the file's own provider token picks one: pandas silently
         # ignores dtype keys for columns a file doesn't have, so GSV runs and
-        # legacy Mapillary files (which lack the extra columns) load unchanged,
-        # while enriched Mapillary runs get their extras coerced correctly.
+        # legacy files load unchanged, while each census provider's extras are
+        # coerced by ITS schema rather than by whichever module opened the file.
         df = pd.read_csv(
             csv_path,
-            dtype=MAPILLARY_METADATA_DTYPES if dtypes is None else dtypes,
+            dtype=dtypes_for_run_path(csv_path) if dtypes is None else dtypes,
             compression=compression,
         )
 

@@ -33,8 +33,10 @@ from __future__ import annotations
 
 import gzip
 import logging
+import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import geopy
@@ -179,6 +181,44 @@ def dedupe_census(census: pd.DataFrame) -> pd.DataFrame:
     last_position = np.empty(len(uniques), dtype=np.int64)
     last_position[codes] = np.arange(len(codes), dtype=np.int64)
     return census.take(last_position).reset_index(drop=True)
+
+
+def census_is_pano(census: pd.DataFrame) -> np.ndarray:
+    """
+    The shared 360 boolean as a plain NumPy bool array.
+
+    ``is_pano`` is the one census column the provider-agnostic tail indexes by
+    name (issue #116), and it is read through here rather than inline because
+    the dtype a provider declares for it decides whether the tail works at all.
+    A non-nullable ``"bool"`` (what every provider declares today) converts
+    straight through. A nullable ``"boolean"`` also converts cleanly WHILE it
+    holds no nulls -- which is the trap: the first census carrying one degrades
+    ``.to_numpy()`` to an object array, and ``~is_pano`` then yields ints, so
+    the tail raises ``TypeError: boolean value of NA is ambiguous`` AFTER the
+    whole paced fetch has been paid for, naming neither the column nor the
+    provider.
+
+    A null projection is not a 360 pano, so it is read as False -- the imagery
+    is still recorded, as flat -- but it is a decoder bug, so it is counted and
+    logged rather than absorbed silently.
+
+    A non-nullable column returns immediately without an ``isna`` pass: at
+    Detroit's 19M rows this function sits on the path whose whole justification
+    is #157's memory and time budget, and a dtype that cannot hold a null needs
+    no scan to prove it holds none.
+    """
+    column = census["is_pano"]
+    if column.dtype == bool:
+        return column.to_numpy()
+    num_null = int(column.isna().sum())
+    if num_null:
+        logger.warning(
+            f"{num_null:,} census rows have a null 'is_pano'; reading them as flat "
+            "imagery. The provider's decoder should map every image to a 360 "
+            "boolean -- a null here means an unhandled projection value."
+        )
+        return column.fillna(False).to_numpy(dtype=bool)
+    return np.asarray(column.to_numpy(), dtype=bool)
 
 
 def status_for_capture_dates(capture_dates) -> np.ndarray:
@@ -374,6 +414,26 @@ class CensusGrid:
         return (i - self.i_min) * self.n_j + (j - self.j_min)
 
 
+def prepare_output_path(output_csv_gz_path: str) -> None:
+    """
+    Validate a run destination and create its parent directory.
+
+    Called TWICE by design, and both calls matter. A provider's wrapper calls it
+    before the fetch, where a bad path costs nothing;
+    :func:`write_census_grid_run` calls it again as it takes ownership of the
+    write, so a wrapper that forgets cannot fail at ``gzip.open`` with the whole
+    paced fetch already spent (Singapore is ~9,974 KartaView requests). One
+    implementation, so the two can't drift; ``mkdir(exist_ok=True)`` makes the
+    second call free.
+
+    Raises:
+        ValueError: if the path is not a ``.csv.gz``.
+    """
+    if not output_csv_gz_path.endswith(".csv.gz"):
+        raise ValueError(f"output_csv_gz_path must end in .csv.gz, got: {output_csv_gz_path}")
+    Path(os.path.dirname(os.path.abspath(output_csv_gz_path))).mkdir(parents=True, exist_ok=True)
+
+
 def build_grid(
     center_lat: float,
     center_lon: float,
@@ -419,7 +479,7 @@ def write_census_grid_run(
     image_columns: Callable[[pd.DataFrame], Mapping[str, Any]],
     dtypes: Mapping[str, Any],
     unmeasured_mask: Callable[[np.ndarray, np.ndarray], np.ndarray] | None = None,
-    unmeasured_desc: str = "",
+    unmeasured_desc: str | None = None,
 ) -> dict[str, Any]:
     """
     Turn a fetched census into a run CSV: the back half of every grid collector.
@@ -439,7 +499,10 @@ def write_census_grid_run(
     Args:
         fetched: the provider's fetch result; its ``census`` key is consumed.
         grid: the city's frozen lattice, from :func:`build_grid`.
-        output_csv_gz_path: destination; the caller validates and creates it.
+        output_csv_gz_path: destination, re-validated here via
+            :func:`prepare_output_path` so a wrapper that forgot cannot fail at
+            the gzip open with the whole paced fetch already spent. Wrappers
+            should still call it themselves BEFORE fetching, where it is free.
         query_timestamp: run-level ISO timestamp, identical on every row.
         capture_dates_for: ``(census, positions) -> array`` of 'YYYY-MM-DD'/'',
             applying the provider's own date rules. Takes positions rather than
@@ -453,12 +516,24 @@ def write_census_grid_run(
             area never downloaded, or None when the fetch was complete.
         unmeasured_desc: operator-facing noun phrase for what failed (e.g.
             "3 undownloaded tile(s)"), logged with the resulting point count.
+            Required whenever ``unmeasured_mask`` is given.
 
     Returns:
-        Dict with the read-back ``df`` and the four population counts.
+        Dict with the read-back ``df`` and the five population counts:
+        ``num_pano_rows``, ``num_flat_images``, ``num_flat_only_points``,
+        ``num_empty_points`` and ``num_unmeasured_points`` -- the last being
+        what distinguishes a partially-measured snapshot from a complete one.
+
+    Raises:
+        ValueError: if the output path is not a ``.csv.gz``, or a mask is given
+            with no description of what went unmeasured.
     """
+    prepare_output_path(output_csv_gz_path)
+    if unmeasured_mask is not None and not unmeasured_desc:
+        raise ValueError("unmeasured_desc is required whenever unmeasured_mask is given")
+
     census = fetched.pop("census")
-    is_pano = census["is_pano"].to_numpy()
+    is_pano = census_is_pano(census)
 
     # Nearest-grid-point assignment for the WHOLE census at once. Everything
     # from here to the CSV write is array work on positional indices into the
@@ -570,10 +645,16 @@ def write_census_grid_run(
         in_unmeasured = unmeasured_mask(grid.lats[empty_ordinals], grid.lons[empty_ordinals])
         empty_df.loc[in_unmeasured, "status"] = REQUEST_FAILED
         num_unmeasured_points = int(in_unmeasured.sum())
-        logger.warning(
-            f"{num_unmeasured_points:,} grid points fall in {unmeasured_desc}; "
-            f"written as {REQUEST_FAILED} rather than empty"
-        )
+        # Only warn if points were actually degraded. A failed fetch unit can
+        # legitimately cover no grid point (margin tiles; a cell whose points a
+        # neighbour already covered), and a WARNING asserting degradation that
+        # did not happen goes straight into the log tail the [alerts] email
+        # ships -- which is where a real one has to stand out.
+        if num_unmeasured_points:
+            logger.warning(
+                f"{num_unmeasured_points:,} grid points fall in {unmeasured_desc}; "
+                f"written as {REQUEST_FAILED} rather than empty"
+            )
     num_empty_points = len(empty_ordinals)
     del empty_ordinals
 

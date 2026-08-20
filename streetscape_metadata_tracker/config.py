@@ -87,6 +87,19 @@ KARTAVIEW_EXTRA_DTYPES = {
 # The full KartaView run schema: shared core + KartaView extras.
 KARTAVIEW_METADATA_DTYPES = {**METADATA_DTYPES, **KARTAVIEW_EXTRA_DTYPES}
 
+# Provider token (as it appears in a run filename) -> that provider's run
+# schema. The read side of the naming contract: a run CSV is only self-
+# describing through its filename, and pandas INFERS any column a dtype
+# mapping omits -- so reading a census provider's run with another's schema
+# silently turns a nullable Int64 index into float64 and a numeric-looking
+# string id into a float. fileutils.dtypes_for_run_path is the lookup; keep a
+# provider here in step with naming.KNOWN_PROVIDERS or its runs read as gsv.
+PROVIDER_RUN_DTYPES = {
+    "gsv": METADATA_DTYPES,
+    "mapillary": MAPILLARY_METADATA_DTYPES,
+    "kartaview": KARTAVIEW_METADATA_DTYPES,
+}
+
 
 def warn_if_credentials_world_readable(env_path: str) -> bool:
     """

@@ -35,8 +35,8 @@ from streetscape_metadata_tracker.download_common import (
     HOST_OVERPASS,
     DownloadError,
     HostBlockedError,
+    grid_bbox,
 )
-from streetscape_metadata_tracker.download_mapillary import grid_bbox
 from streetscape_metadata_tracker.host_lock import host_lock
 
 logger = logging.getLogger(__name__)

@@ -36,10 +36,8 @@ per-point requests for GSV), so an interrupted run just restarts.
 import asyncio
 import logging
 import math
-import os
 from collections.abc import Callable
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any
 
 import aiohttp
@@ -781,6 +779,13 @@ async def _fetch_city_images(
         "api_requests": api_requests,
         "tiles": len(tiles),
         "raw_feature_count": raw_feature_count,
+        # Summarized HERE, where the census is already in hand: the caller may
+        # not bind it to a local (write_census_grid_run pops and releases it),
+        # so counting there would mean a second full pass over the column --
+        # 19M rows at Detroit, on the path whose whole justification is #157's
+        # memory and time budget.
+        "num_images": len(census),
+        "num_panos": int(census_core.census_is_pano(census).sum()),
         # (x, y) of tiles that never came back. Empty on a clean run.
         "failed_tiles": failed_tiles,
     }
@@ -816,9 +821,10 @@ async def download_mapillary_metadata_async(
     started_at = datetime.now(UTC).isoformat()
     query_timestamp = started_at
 
-    if not output_csv_gz_path.endswith(".csv.gz"):
-        raise ValueError(f"output_csv_gz_path must end in .csv.gz, got: {output_csv_gz_path}")
-    Path(os.path.dirname(os.path.abspath(output_csv_gz_path))).mkdir(parents=True, exist_ok=True)
+    # Checked before a single tile is fetched, though write_census_grid_run
+    # re-checks as it takes ownership of the write: one implementation, called
+    # at the point where failing is free.
+    census_core.prepare_output_path(output_csv_gz_path)
 
     # Built before the fetch (its bbox bounds the tile set) and consumed after
     # it, so it is derived once and threaded through -- see census_core.build_grid.
@@ -834,12 +840,12 @@ async def download_mapillary_metadata_async(
     )
     api_requests = fetched["api_requests"]
     failed_tiles = fetched.get("failed_tiles") or []
-    # Read through the dict rather than binding the census to a local: the tail
-    # below pops it and drops it as soon as the last frame is built, and a name
-    # here would pin the whole census (19M rows at Detroit) alive through both
-    # CSV writes (issue #157).
-    num_images = len(fetched["census"])
-    num_panos = int(fetched["census"]["is_pano"].sum())
+    # Counted by the fetch, not recomputed here: binding the census to a local
+    # would pin the whole thing (19M rows at Detroit) alive through both CSV
+    # writes, defeating the tail's release, and re-reading it through the dict
+    # would cost a second full pass for a log line (issue #157).
+    num_images = fetched["num_images"]
+    num_panos = fetched["num_panos"]
     logger.info(
         f"Decoded {fetched['raw_feature_count']} features "
         f"({num_images} unique: {num_panos} panos, {num_images - num_panos} flat) "
