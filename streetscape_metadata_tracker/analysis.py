@@ -80,6 +80,12 @@ def is_google_copyright(copyright_info: pd.Series) -> pd.Series:
 EARLIEST_PLAUSIBLE_CAPTURE = {
     "gsv": date(2007, 1, 1),  # Street View launched 2007-05-25
     "mapillary": date(2004, 1, 1),
+    # Deliberately looser than KartaView's own 2016 launch (as OpenStreetCam)
+    # and far looser than Grab's fleet: the imagery is overwhelmingly community
+    # dashcam footage and contributors upload genuinely old recordings, which is
+    # the same reason Mapillary's floor is 2004 rather than its 2013 founding.
+    # download_kartaview applies this at decode, as Mapillary's parser does.
+    "kartaview": date(2004, 1, 1),
 }
 # Floor for a provider not listed above. GSV's is the stricter of the two, but
 # an unknown provider is more likely to resemble a contributor-fed archive than

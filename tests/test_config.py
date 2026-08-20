@@ -43,6 +43,7 @@ def test_load_config_streets_channels_are_isolated(monkeypatch):
         ("mapillary", "MAPILLARY_ACCESS_TOKEN"),
         ("gsv_streets", "GMAPS_STREETS_API_KEY"),
         ("mapillary_streets", "MAPILLARY_STREETS_ACCESS_TOKEN"),
+        ("kartaview", "KARTAVIEW_ACCESS_TOKEN"),
     ],
 )
 def test_load_config_missing_credential_raises_with_var_name(monkeypatch, provider, env_var):
@@ -59,8 +60,11 @@ def test_load_config_empty_credential_raises(monkeypatch, provider, env_var):
 
 
 def test_load_config_unknown_provider_raises():
+    # NOT "kartaview": that is a real channel now (issue #225), and a sentinel
+    # that a later phase registers turns this test from a guard into a failure
+    # nobody expected.
     with pytest.raises(ValueError, match="[Uu]nknown provider"):
-        load_config("kartaview")
+        load_config("not-a-provider")
 
 
 # --- warn_if_credentials_world_readable: .env mode check --------------------

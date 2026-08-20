@@ -112,12 +112,14 @@ def test_generate_mapillary_run_filename_roundtrip():
 
 def test_parse_rejects_unknown_provider_token():
     with pytest.raises(ValueError):
-        parse_filename("bend--or_width_5000_height_5000_step_20_kartaview_2026-07-05.csv.gz")
+        parse_filename("bend--or_width_5000_height_5000_step_20_notaprovider_2026-07-05.csv.gz")
 
 
 def test_generate_run_filename_rejects_unknown_provider():
     with pytest.raises(ValueError):
-        generate_run_filename("bend--or", 5000, 5000, 20, date(2026, 7, 5), provider="kartaview")
+        generate_run_filename(
+            "bend--or", 5000, 5000, 20, date(2026, 7, 5), provider="not-a-provider"
+        )
 
 
 def test_parse_archival_step_30_dated_name():
