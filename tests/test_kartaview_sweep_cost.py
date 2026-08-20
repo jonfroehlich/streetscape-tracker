@@ -529,3 +529,175 @@ def test_summary_of_an_empty_study_set_is_not_a_crash():
 def test_the_script_refuses_to_run_on_a_collection_host():
     """Identity, so the refusal cannot drift a copy (same guard as the probe)."""
     assert ks.refuse_on_collection_host is kp.refuse_on_collection_host
+
+
+# ── the committed record, and the writeup's traceability ───────────────────
+#
+# CLAUDE.md: numbers cited in a writeup must be traceable to the committed
+# JSON, and that JSON must be produced by committed code. These recompute the
+# writeup's tables from the record rather than restating them, so a re-run that
+# moves a number fails here instead of silently contradicting the prose.
+
+import json  # noqa: E402
+
+DOCS_DIR = os.path.join(PROJECT_ROOT, "docs", "experiments")
+RECORD_PATH = os.path.join(DOCS_DIR, ks.DOCS_METRICS_NAME)
+
+
+@pytest.fixture(scope="module")
+def record():
+    with open(RECORD_PATH, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+@pytest.fixture(scope="module")
+def by_city(record):
+    return {c["city_id"]: c for c in record["cities"]}
+
+
+def test_the_record_names_its_producer_and_its_writeup(record):
+    assert record["_about"]["generated_by"] == (
+        "scripts/kartaview_sweep_cost.py --sample default --docs-dir docs/experiments"
+    )
+    assert record["_about"]["writeup"] == "docs/experiments/kartaview-sweep-cost.md"
+    assert record["_about"]["issue"] == 225
+    assert record["_about"]["note"] == ks.DOCS_RECORD_NOTE
+    # Every city named in the study set was registered and planned.
+    assert record["_about"]["cities_not_registered"] == []
+    assert {c["city_id"] for c in record["cities"]} == set(ks.SAMPLES["default"])
+
+
+def test_the_summary_recomputes_from_its_own_rows(record):
+    assert ks.summarize(record["cities"]) == record["summary"]
+
+
+def test_the_writeups_decile_table_matches_the_record(by_city):
+    """Finding 2: cost by catalog percentile. The headline table."""
+    expected = {
+        # city_id                                  area   r    cells  sweep
+        "buck-grove--iowa--united-states": (1.0, 1000, 1, 1),
+        "south-tucson--arizona--united-states": (3.3, 1000, 4, 4),
+        "emmitsburg--maryland--united-states": (8.0, 1000, 6, 6),
+        "ithaca--michigan--united-states": (19.7, 1000, 12, 12),
+        "horace--north-dakota--united-states": (55.9, 1000, 35, 210),
+        "attleboro--massachusetts--united-states": (150.3, 1000, 88, 88),
+        "chandler--arizona--united-states": (354.8, 1000, 195, 975),
+        "milwaukee--wisconsin--united-states": (737.6, 1000, 384, 384),
+        "las-vegas--nevada--united-states": (2413.7, 1000, 1254, 1551),
+    }
+    for city_id, (area, radius, cells, sweep) in expected.items():
+        c = by_city[city_id]
+        assert c["bbox_area_km2"] == pytest.approx(area, abs=0.05), city_id
+        assert c["calibrated_radius_m"] == radius, city_id
+        assert c["root_cells"] == cells, city_id
+        assert c["sweep_requests_estimate"] == sweep, city_id
+
+
+def test_the_writeups_density_table_matches_the_record(by_city):
+    """Finding 3: three cities calibrated to r=500 and paid ~4x the cells."""
+    expected = {
+        "singapore--singapore": (2547.2, 500, 5130, 7329),
+        "new-york--new-york--united-states": (2316.6, 500, 4690, 6665),
+        "manila--capital-district--philippines": (509.1, 500, 1044, 1378),
+        "seattle--washington--united-states": (498.5, 1000, 260, 490),
+        "bend--oregon--united-states": (154.9, 1000, 80, 80),
+    }
+    for city_id, (area, radius, cells, sweep) in expected.items():
+        c = by_city[city_id]
+        assert c["bbox_area_km2"] == pytest.approx(area, abs=0.05), city_id
+        assert c["calibrated_radius_m"] == radius, city_id
+        assert c["root_cells"] == cells, city_id
+        assert c["sweep_requests_estimate"] == sweep, city_id
+    # The claim the table is making: r=500 is a 4x lever, and it is NOT
+    # predicted by density -- Seattle held r=1000 at a higher photo density
+    # than New York and Manila, which both calibrated down.
+    dens = {
+        k: by_city[k]["photos_in_bbox_estimate"] / by_city[k]["bbox_area_km2"] for k in expected
+    }
+    assert dens["seattle--washington--united-states"] > dens["new-york--new-york--united-states"]
+    assert by_city["seattle--washington--united-states"]["calibrated_radius_m"] == 1000
+    assert by_city["new-york--new-york--united-states"]["calibrated_radius_m"] == 500
+
+
+def test_the_geometric_model_holds_to_the_quoted_tolerance(by_city):
+    """
+    Finding 1: root_cells tracks bbox_area / (2 r^2), and the excess over it is
+    pure ceiling -- ceil(W/s) * ceil(H/s) against W*H/s^2 -- so it shrinks as
+    the bbox grows. Banded by area at the measured values. If this drifts, the
+    writeup's whole "budget by bbox area" recommendation goes with it.
+    """
+    for c in by_city.values():
+        predicted = c["bbox_area_km2"] * 1e6 / (2 * c["calibrated_radius_m"] ** 2)
+        ratio = c["root_cells"] / predicted
+        assert ratio >= 1.0, c["city_id"]  # the lattice never UNDER-covers
+        if c["bbox_area_km2"] >= 350:
+            assert ratio <= 1.10, (c["city_id"], ratio)
+        elif c["bbox_area_km2"] >= 150:
+            assert ratio <= 1.20, (c["city_id"], ratio)
+        elif c["bbox_area_km2"] >= 50:
+            assert ratio <= 1.30, (c["city_id"], ratio)
+
+
+def test_seven_of_fourteen_cities_cost_exactly_their_cell_count(by_city):
+    """The claim that the cost IS the geometric term for most cities."""
+    exact = [c for c in by_city.values() if c["sweep_requests_estimate"] == c["root_cells"]]
+    assert len(exact) == 7
+    assert len(by_city) == 14
+
+
+def test_the_two_overhead_causes_are_separable_in_the_record(by_city):
+    """
+    Pages and refusal cascades are unrelated, and the writeup reports them
+    apart. Horace is the case that matters: the most expensive city per km2 in
+    the decile half is a SPARSE one, which inverts the feasibility study's
+    expectation that cost is worst where imagery is richest.
+    """
+    horace = by_city["horace--north-dakota--united-states"]
+    assert horace["sweep_requests_estimate"] / horace["root_cells"] == 6.0
+    extra_pages = horace["sweep_requests_over_probed_roots"] - horace["cells_visited"]
+    assert extra_pages == 0  # pure cascade, no paging
+    assert horace["refusals"] > 0 and horace["subdivisions"] > 0
+    assert horace["photos_in_bbox_estimate"] == 0  # and it holds NO imagery
+
+    # Chandler is the opposite: overhead from pages, not refusals.
+    chandler = by_city["chandler--arizona--united-states"]
+    assert chandler["sweep_requests_over_probed_roots"] - chandler["cells_visited"] == 56
+
+
+def test_the_retry_policy_paid_for_itself(by_city, record):
+    """
+    88 of 174 retries cleared, and with them the refusal rate is 3.57% with
+    zero floor failures. Believing the first refusal would have turned each of
+    those 88 cells into four.
+    """
+    s = record["summary"]
+    assert s["retries_cleared"] == 88
+    assert s["retries_attempted"] == 174
+    assert s["refusal_rate_over_cells_visited"] == pytest.approx(0.0357, abs=0.0001)
+    assert s["floor_failures"] == 0
+    assert s["broken_cells"] == 0
+
+
+def test_the_truncated_plans_are_flagged_with_how_thin_they_are(record, by_city):
+    """
+    Ten of fourteen plans are truncated and the writeup quotes the two worst
+    sampling fractions. A record that quietly completed them would make the
+    caveat read as false modesty rather than as the live limitation it is.
+    """
+    truncated = [c for c in record["cities"] if not c["plan_complete"]]
+    assert len(truncated) == 10
+    assert record["summary"]["plans_truncated"] == 10
+    assert record["summary"]["plans_complete"] == 4
+
+    def sampled(city_id):
+        c = by_city[city_id]
+        return c["roots_probed"] / c["root_cells"]
+
+    assert sampled("new-york--new-york--united-states") == pytest.approx(0.004, abs=0.001)
+    assert sampled("singapore--singapore") == pytest.approx(0.007, abs=0.001)
+
+
+def test_the_measurement_cost_the_writeup_quotes(record):
+    assert record["summary"]["requests_spent_measuring"] == 638
+    assert record["_about"]["rate_limit_used_per_hour"] == 1000
+    assert record["_about"]["authenticated"] is True
