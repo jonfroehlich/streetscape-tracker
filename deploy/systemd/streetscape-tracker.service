@@ -142,7 +142,7 @@ ReadWritePaths=/cse/web/research/makelab/public/streetscape-tracker
 # that is expensive rather than legible. Peak scales at ~0.914 GiB per million
 # CSV rows (5.26M -> 4.81 GiB measured), and the largest census in the catalog
 # is Detroit's 16,569,307 rows (runs.total_points, mapillary, 2026-07-24), so it
-# extrapolates to 15.1 GiB — call it ~15.3 GiB, rounding a floor up rather than
+# extrapolates to 15.1 — carried as ~15.3 GiB, rounding a floor up rather than
 # down: over 12G, under MemoryMax. Crossing MemoryHigh reproduces exactly
 # the failure diagnosed above — hours of silent reclaim ending in the
 # scheduler's 180-min city timeout — while crossing MemoryMax is a fast OOM kill
@@ -150,10 +150,24 @@ ReadWritePaths=/cse/web/research/makelab/public/streetscape-tracker
 # ~30%, with a deliberately narrow 20->24 gap so a genuine runaway still reaches
 # the hard stop quickly instead of reclaiming for hours on the way there.
 #
+# THE FLOOR PRICES A FIRST RUN, and Detroit's next run is not one. 15.3 GiB is
+# one census frame plus the per-run JSON tail — the shape of 2026-07-24, which
+# had no previous Mapillary run to diff against. A run that DOES have one holds
+# both frames at once by construction: cli.py hands the live new frame to
+# _compute_and_record_diff and still needs it afterwards for the per-run JSON,
+# the diff loads the previous run's CSV alongside it, and compute_run_diff then
+# builds two deduplicated copies plus a Python set of every pano_id on each side
+# (~15.3M boxed strings apiece for Detroit). Unmeasured, so no multiplier is
+# quoted here — but it is several times one frame, i.e. plausibly through
+# MemoryMax as well as MemoryHigh. That is the LEGIBLE failure by the argument
+# above, so it is not on its own a reason to move a number; it IS a reason not
+# to read "worst city plus ~30%" as covering every night. Measure a diff night
+# (the next Detroit collection is one) before sizing against it.
+#
 # Two things to keep straight about that number. It RAISES NO CEILING — the
 # limit is MemoryMax and it is unchanged; MemoryHigh only moves where we start
 # throttling ourselves, which is the one burden on this host that has actually
-# been measured (its load is ZFS; CPU sits 97-99% idle). And 15.3 GiB is an
+# been measured (its load is ZFS; CPU sits 97-99% idle). And ~15.3 GiB is an
 # EXTRAPOLATION from one city's slope, not a measurement: capture MemoryPeak on
 # a real Detroit night before treating it as settled. For scale, makelab2 has
 # 188 GiB and 48 cores (checked 2026-08-20), so 20G/24G is ~11%/~13% of the box.

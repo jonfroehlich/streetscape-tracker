@@ -3411,6 +3411,14 @@ def _assert_unit_quotes(unit, rendered, constant):
     and bad in a specific way — the cap ends up justified by one number and
     enforced against another, so an operator argues from a figure no test holds
     anyone to. Cheap to assert, so assert it.
+
+    It is a SUBSTRING check, so it only pins the constant as tightly as the
+    prose is unambiguous: if the unit spells a near-miss of the same quantity
+    the same way — the unrounded product beside the rounded floor, both suffixed
+    `GiB` — then lowering the constant to that near-miss still passes. Which is
+    why the unit writes the product bare (`extrapolates to 15.1`) and reserves
+    the unit suffix for the figure the caps are actually sized from. Keep it
+    that way rather than making this matcher cleverer.
     """
     assert rendered in unit, (
         f"{constant} renders as {rendered!r}, which no longer appears in "
@@ -3497,6 +3505,23 @@ def test_stop_timeout_covers_the_publish_tail_it_waits_for():
 # exactly). 16.569M x 0.914 = 15.1 GiB, rounded UP to 15.3 here — a floor should
 # err high, and the slope is one city's.
 #
+# WHY THE QUERY FILTERS ON PROVIDER, since dropping the filter finds a bigger
+# number and the exclusion should be an argument rather than an omission: the
+# slope is a property of the CSV row count, not of the provider, and
+# analysis.calculate_run_stats writes total_points as len(df) for every one. Run
+# it without the WHERE and the top row is juneau--alaska--united-states, gsv,
+# 2025-01-08, 39,346,564 rows — 2.4x Detroit. Those are is_baseline=1 archival
+# imports (issue #93) on pre-#166 geometry, and no future night re-collects at
+# that size: the 40 km cap bounds a fresh gsv run at (40000/20)^2 = 4M points,
+# hence 4M rows, hence ~3.7 GiB. A census has no such bound — its rows are
+# imagery, not lattice points — which is why the largest live workload is a
+# Mapillary one and why the filter belongs there.
+#
+# Also worth re-running on PROD rather than a dev checkout before trusting it as
+# a catalog-wide maximum: a laptop catalog may hold only a handful of Mapillary
+# runs, in which case the query returns the largest of those and not the largest
+# we collect.
+#
 # A named constant for the same reason _MEASURED_TAIL_AGGREGATE_S is one: the
 # unit file quotes this figure and the next re-sizing has to argue from it. NOTE
 # it is an EXTRAPOLATION from one city's slope, not a measurement; replace it
@@ -3543,12 +3568,23 @@ def test_memory_high_is_a_throttle_below_the_hard_limit_and_clears_the_worst_cit
         return found[-1] if found else None
 
     def _bytes(directive, value):
-        m = re.fullmatch(r"(\d+)([KMGT]?)", value)
+        # Decimal sizes are accepted because systemd accepts them and they are
+        # still comparable. PERCENTAGES are not, and that is a requirement
+        # rather than a parser limitation: the floor below is an absolute
+        # measurement in GiB, so a percentage would silently re-scale both caps
+        # with the host's RAM and make the comparison meaningless on any box but
+        # the one it was written for. Say so, rather than failing as "cannot
+        # interpret that spelling".
+        m = re.fullmatch(r"(\d+(?:\.\d+)?)([KMGT]?)", value)
         assert m, (
-            f"{directive}={value} is not a plain byte size; this test compares "
-            f"the two caps numerically and cannot interpret that spelling"
+            f"{directive}={value} must be an absolute byte size (e.g. 20G). This "
+            f"test compares the caps against a measured GiB floor, so a "
+            f"percentage-of-RAM spelling cannot be checked and would mean a "
+            f"different cap on every host the unit is copied to."
         )
-        return int(m.group(1)) * {"": 1, "K": 2**10, "M": 2**20, "G": 2**30, "T": 2**40}[m.group(2)]
+        return (
+            float(m.group(1)) * {"": 1, "K": 2**10, "M": 2**20, "G": 2**30, "T": 2**40}[m.group(2)]
+        )
 
     hard_raw = _raw("MemoryMax")
     assert hard_raw and hard_raw != "infinity", (
