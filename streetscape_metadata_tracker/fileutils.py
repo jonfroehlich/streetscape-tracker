@@ -22,7 +22,7 @@ def get_list_of_city_csv_files(data_dir=None) -> list[str]:
     return csv_files
 
 
-def load_city_csv_file(csv_path: str) -> pd.DataFrame:
+def load_city_csv_file(csv_path: str, dtypes: dict | None = None) -> pd.DataFrame:
     """
     Read a CSV file into a DataFrame, automatically detecting if it's gzipped based on file extension.
     capture_date must be YYYY-MM-DD (the on-disk schema — standardize_capture_date
@@ -31,6 +31,13 @@ def load_city_csv_file(csv_path: str) -> pd.DataFrame:
 
     Args:
         csv_path: Path to the CSV file (can be either .csv or .csv.gz)
+        dtypes: Column dtypes to coerce, defaulting to the Mapillary run schema.
+            pandas ignores dtype keys a file lacks, so the default reads GSV
+            runs and legacy files unchanged -- but the reverse is NOT true: a
+            column present in the file and absent from this mapping gets
+            INFERRED. A census provider with its own extras must therefore pass
+            its own schema, or e.g. a nullable-Int64 sequence index silently
+            becomes float64 and a numeric-looking string id becomes a float.
 
     Returns:
         pd.DataFrame: Loaded and processed DataFrame
@@ -59,14 +66,14 @@ def load_city_csv_file(csv_path: str) -> pd.DataFrame:
     try:
         logger.debug(f"Reading CSV file with compression: {compression}")
 
-        # Read CSV with query_timestamp as object type first. Use the full
-        # Mapillary schema (core + Mapillary extras): pandas silently ignores
-        # dtype keys for columns a file doesn't have, so GSV runs and legacy
-        # Mapillary files (which lack the extra columns) load unchanged, while
-        # enriched Mapillary runs get their extras coerced to the right dtypes.
+        # Read CSV with query_timestamp as object type first. The default is
+        # the full Mapillary schema (core + Mapillary extras): pandas silently
+        # ignores dtype keys for columns a file doesn't have, so GSV runs and
+        # legacy Mapillary files (which lack the extra columns) load unchanged,
+        # while enriched Mapillary runs get their extras coerced correctly.
         df = pd.read_csv(
             csv_path,
-            dtype=MAPILLARY_METADATA_DTYPES,
+            dtype=MAPILLARY_METADATA_DTYPES if dtypes is None else dtypes,
             compression=compression,
         )
 

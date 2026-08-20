@@ -34,7 +34,6 @@ per-point requests for GSV), so an interrupted run just restarts.
 """
 
 import asyncio
-import gzip
 import logging
 import math
 import os
@@ -45,7 +44,6 @@ from typing import Any
 
 import aiohttp
 import backoff
-import geopy.distance
 import mapbox_vector_tile
 import numpy as np
 import pandas as pd
@@ -56,19 +54,28 @@ import pandas as pd
 # functions -- and would break the first time someone called a census
 # helper from one of them, with a DataFrame AttributeError.
 from . import census as census_core
-from .analysis import FLAT_ONLY, REQUEST_FAILED
-from .census import dedupe_census, status_for_capture_dates
+
+# A name imported below in the redundant `X as X` form is a RE-EXPORT this
+# module does not itself use (the form is what tells ruff that, rather than a
+# per-line noqa). Each one used to be DEFINED here and has since moved -- the
+# grid geodesy down to download_common, so a second census provider can reach it
+# without importing this module, and the census row/status helpers into
+# census.py. The aliases keep every existing `download_mapillary.X` call site
+# working: the street analyzer's collect_mapillary, and ~20 test references.
+from .analysis import FLAT_ONLY as FLAT_ONLY
+from .census import dedupe_census
+from .census import status_for_capture_dates as status_for_capture_dates
 from .config import MAPILLARY_METADATA_DTYPES
+from .download_common import _M_PER_DEG_LAT as _M_PER_DEG_LAT
 from .download_common import (
     HOST_MAPILLARY_TILES,
     AsyncRateLimiter,
     DownloadError,
     HostBlockedError,
-    generate_grid_arrays,
-    grid_index_ranges,
     redact_credentials,
 )
-from .fileutils import load_city_csv_file
+from .download_common import assign_to_grid as assign_to_grid
+from .download_common import grid_bbox as grid_bbox
 from .host_lock import host_lock
 from .progress import progress
 
@@ -84,27 +91,6 @@ TILE_ZOOM = 14  # the only zoom level whose tiles carry per-image metadata
 # download_common.redact_credentials (which scrubs `access_token=`).
 TILE_URL_TEMPLATE = "https://tiles.mapillary.com/maps/vtp/mly1_computed_public/2/{z}/{x}/{y}"
 IMAGE_LAYER = "image"
-
-# Meters per degree of latitude (WGS84 mean). Kept for rough offset math in
-# tests/estimates; the actual grid assignment uses the latitude-local series
-# below (the mean constant mis-assigned edge panos by whole grid rows —
-# ~0.7% error at the equator is +1 row at 2.5 km from center).
-_M_PER_DEG_LAT = 111320.0
-
-
-def _meters_per_degree(lat_deg):
-    """
-    (m_per_deg_lat, m_per_deg_lon) at a latitude, via the standard WGS84
-    series expansion. Accepts scalars or numpy arrays. Matches the geodesic
-    math that builds the grid to well under a meter over a city-sized area,
-    so nearest-grid-point assignment can't drift by rows near the edges.
-    """
-    phi = np.radians(lat_deg)
-    m_lat = (
-        111132.92 - 559.82 * np.cos(2 * phi) + 1.175 * np.cos(4 * phi) - 0.0023 * np.cos(6 * phi)
-    )
-    m_lon = 111412.84 * np.cos(phi) - 93.5 * np.cos(3 * phi) + 0.118 * np.cos(5 * phi)
-    return m_lat, m_lon
 
 
 # ── Slippy-map tile math (stdlib only) ─────────────────────────────────────
@@ -148,25 +134,6 @@ def tiles_for_bbox(
         x_indices = list(range(max(0, int(fx_min)), min(n - 1, int(fx_max)) + 1))
     y_range = range(max(0, int(fy_min)), min(n - 1, int(fy_max)) + 1)
     return [(x, y) for x in x_indices for y in y_range]
-
-
-def grid_bbox(
-    center_lat: float, center_lon: float, grid_width: float, grid_height: float, step_length: float
-) -> tuple[float, float, float, float]:
-    """
-    (min_lon, min_lat, max_lon, max_lat) covering the sampling grid plus a
-    half-step margin, computed with the same geodesic math that builds the
-    grid so the two always agree. The margin admits images that lie just
-    outside the outermost grid points but are still nearest to them.
-    """
-    origin = geopy.Point(center_lat, center_lon)
-    half_h = grid_height / 2 + step_length / 2
-    half_w = grid_width / 2 + step_length / 2
-    north = geopy.distance.distance(meters=half_h).destination(origin, 0)
-    south = geopy.distance.distance(meters=half_h).destination(origin, 180)
-    east = geopy.distance.distance(meters=half_w).destination(origin, 90)
-    west = geopy.distance.distance(meters=half_w).destination(origin, 270)
-    return west.longitude, south.latitude, east.longitude, north.latitude
 
 
 def estimate_tile_count(
@@ -370,6 +337,18 @@ def _mapillary_image_columns(picked: pd.DataFrame) -> dict[str, Any]:
     }
 
 
+def _mapillary_capture_dates(census_frame: pd.DataFrame, positions: np.ndarray) -> np.ndarray:
+    """
+    Capture dates for the census rows at ``positions``, per Mapillary's rules.
+
+    Handed to :func:`census_core.write_census_grid_run`. Takes positions rather
+    than a taken sub-frame so this indexes the ONE column it needs -- a full
+    ``.take()`` here would materialize every column of a multi-million-row
+    census a second time (issue #157).
+    """
+    return captured_at_to_iso_dates(census_frame["captured_at_ms"].to_numpy()[positions]).to_numpy()
+
+
 def build_image_rows(
     census_frame: pd.DataFrame,
     image_positions: np.ndarray,
@@ -413,47 +392,6 @@ def build_empty_rows(query_lat, query_lon, query_timestamp: str, status) -> pd.D
 
 
 # ── Grid assignment ────────────────────────────────────────────────────────
-
-
-def assign_to_grid(
-    image_lats: np.ndarray,
-    image_lons: np.ndarray,
-    center_lat: float,
-    center_lon: float,
-    width_steps: int,
-    height_steps: int,
-    step_length: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Vectorized nearest-grid-point assignment.
-
-    The grid is a regular lattice of step_length meters indexed by
-    (i, j) = (north, east) offsets from the center (see
-    generate_grid_points), so the nearest point is just a rounded division
-    in a local equirectangular projection — no spatial index needed.
-
-    Returns (i, j, in_grid) arrays; in_grid is False for images farther
-    than half a step beyond the outermost grid points, which the caller
-    drops.
-    """
-    # Latitude-local scales: the grid is built geodesically, so a global
-    # mean m/° mis-assigns by whole rows near the grid edges. dy uses the
-    # series at the center↔image midpoint latitude; dx uses each image's
-    # own latitude (grid rows are constant-latitude, and their east-west
-    # spacing shrinks with cos φ at THAT row, not at the center).
-    m_lat_mid, _ = _meters_per_degree((image_lats + center_lat) / 2)
-    _, m_lon_local = _meters_per_degree(image_lats)
-    dy_m = (image_lats - center_lat) * m_lat_mid
-    dx_m = (image_lons - center_lon) * m_lon_local
-    i = np.rint(dy_m / step_length).astype(int)
-    j = np.rint(dx_m / step_length).astype(int)
-
-    # Replicate generate_grid_points' index ranges exactly (note: Python
-    # floor division makes the ranges asymmetric for odd step counts).
-    i_min, i_max = -height_steps // 2, height_steps // 2
-    j_min, j_max = -width_steps // 2, width_steps // 2
-    in_grid = (i >= i_min) & (i <= i_max) & (j >= j_min) & (j <= j_max)
-    return i, j, in_grid
 
 
 def _points_in_tiles(
@@ -882,199 +820,59 @@ async def download_mapillary_metadata_async(
         raise ValueError(f"output_csv_gz_path must end in .csv.gz, got: {output_csv_gz_path}")
     Path(os.path.dirname(os.path.abspath(output_csv_gz_path))).mkdir(parents=True, exist_ok=True)
 
-    width_steps = int(grid_width / step_length)
-    height_steps = int(grid_height / step_length)
-    origin = geopy.Point(center_lat, center_lon)
-    # Arrays, not a list of tuples and a dict keyed by (i, j): at Cairo's ~10.5M
-    # points those two cost ~4.5 GB between them against an 8 GB cgroup, which
-    # is most of why a big city looked like a hang here (issue #157). The grid
-    # is a regular lattice, so a point's position is arithmetic — see
-    # _grid_ordinal below — and needs no lookup table.
-    grid_lats, grid_lons, _, _ = generate_grid_arrays(
-        origin, width_steps, height_steps, step_length
-    )
-    i_values, j_values = grid_index_ranges(width_steps, height_steps)
-    i_min, n_j, num_grid_points = i_values[0], len(j_values), len(grid_lats)
-
-    def _grid_ordinal(i: np.ndarray | int, j: np.ndarray | int):
-        """Position of grid index (i, j) in the generation order."""
-        return (i - i_min) * n_j + (j - j_values[0])
-
-    bbox = grid_bbox(center_lat, center_lon, grid_width, grid_height, step_length)
+    # Built before the fetch (its bbox bounds the tile set) and consumed after
+    # it, so it is derived once and threaded through -- see census_core.build_grid.
+    grid = census_core.build_grid(center_lat, center_lon, grid_width, grid_height, step_length)
 
     fetched = await fetch_city_images_async(
         city_name,
-        bbox,
+        grid.bbox,
         access_token,
         connection_limit=connection_limit,
         request_timeout=request_timeout,
         max_requests_per_minute=max_requests_per_minute,
     )
-    # pop, not [] — `fetched` stays a live local until this function returns, so
-    # indexing it would pin the whole census in memory straight through
-    # build_empty_rows and both CSV writes, defeating the `del census` below.
-    census = fetched.pop("census")
     api_requests = fetched["api_requests"]
-    tiles = fetched["tiles"]
-    results = fetched["raw_feature_count"]
     failed_tiles = fetched.get("failed_tiles") or []
-    is_pano = census["is_pano"].to_numpy()
-    num_panos = int(is_pano.sum())
+    # Read through the dict rather than binding the census to a local: the tail
+    # below pops it and drops it as soon as the last frame is built, and a name
+    # here would pin the whole census (19M rows at Detroit) alive through both
+    # CSV writes (issue #157).
+    num_images = len(fetched["census"])
+    num_panos = int(fetched["census"]["is_pano"].sum())
     logger.info(
-        f"Decoded {results} features "
-        f"({len(census)} unique: {num_panos} panos, {len(census) - num_panos} flat) "
-        f"from {tiles} tiles"
+        f"Decoded {fetched['raw_feature_count']} features "
+        f"({num_images} unique: {num_panos} panos, {num_images - num_panos} flat) "
+        f"from {fetched['tiles']} tiles"
     )
 
-    # Nearest-grid-point assignment for the WHOLE census at once. Everything
-    # from here to the CSV write is array work on positional indices into the
-    # census: the row-wise form built an (image, (i, j)) tuple pair and then a
-    # 16-key dict per image, which is ~1.4 GB per million images and is what
-    # made a census-heavy city unschedulable (issue #157).
-    i_idx, j_idx, in_grid = assign_to_grid(
-        census["lat"].to_numpy(),
-        census["lon"].to_numpy(),
-        center_lat,
-        center_lon,
-        width_steps,
-        height_steps,
-        step_length,
-    )
-    ordinals = _grid_ordinal(i_idx, j_idx)
-    del i_idx, j_idx
-
-    # Positions of the in-grid panos, in census order — the order the row-wise
-    # loop visited them in, and therefore the row order of the output file.
-    pano_positions = np.flatnonzero(in_grid & is_pano)
-    pano_ordinals = ordinals[pano_positions]
-    capture_dates = captured_at_to_iso_dates(
-        census["captured_at_ms"].to_numpy()[pano_positions]
-    ).to_numpy()
-    covered_df = build_image_rows(
-        census,
-        pano_positions,
-        grid_lats[pano_ordinals],
-        grid_lons[pano_ordinals],
+    written = census_core.write_census_grid_run(
+        fetched,
+        grid,
+        output_csv_gz_path,
         query_timestamp,
-        status_for_capture_dates(capture_dates),
-        capture_dates,
-    )
-    del capture_dates
-
-    # Flat imagery (issue #116): tally every in-grid flat image for the census
-    # magnitude, and keep one representative per grid point so a flat-only
-    # point (a point with flats but no pano) can be written as a single
-    # FLAT_ONLY marker row.
-    flat_positions = np.flatnonzero(in_grid & ~is_pano)
-    num_flat_images = len(flat_positions)
-    # return_index gives the FIRST occurrence of each ordinal, matching the
-    # dict.setdefault this replaces — the earliest flat in census order stays
-    # the representative for its point.
-    _, first_of_point = np.unique(ordinals[flat_positions], return_index=True)
-    flat_positions = flat_positions[np.sort(first_of_point)]
-    # A pano already covers that point, so it is not flat-ONLY.
-    flat_positions = flat_positions[
-        ~np.isin(ordinals[flat_positions], pano_ordinals, assume_unique=False)
-    ]
-    flat_ordinals = ordinals[flat_positions]
-    flat_only_df = build_image_rows(
-        census,
-        flat_positions,
-        grid_lats[flat_ordinals],
-        grid_lons[flat_ordinals],
-        query_timestamp,
-        FLAT_ONLY,
-        # capture_date is deliberately null for FLAT_ONLY: this row is a
-        # coverage-presence marker, and a null date keeps flat timestamps out
-        # of every date/age/histogram path (which key on status == 'OK').
-        None,
-    )
-    num_flat_only_points = len(flat_positions)
-    # Deliberately NOT pd.concat'd onto covered_df. covered_df is one row per
-    # in-grid pano — 6.5M rows of mostly-object columns at Colorado Springs —
-    # and concatenating copies all of it to append a frame that is at most one
-    # row per grid point. The two are written to the gzip handle in sequence
-    # instead, which is byte-identical, for the same reason the empty fill is
-    # (see the write below).
-    del census, is_pano, in_grid
-
-    # Which grid points nothing covered, via a bitmap rather than np.setdiff1d:
-    # setdiff1d sorts and uniques BOTH operands, including the
-    # num_grid_points-long arange that is unique by construction — O(n log n)
-    # plus several int64 temporaries over the biggest array in the function.
-    # This is O(n) and one byte per point, and needs no concatenate either.
-    covered = np.zeros(num_grid_points, dtype=bool)
-    covered[pano_ordinals] = True
-    covered[flat_ordinals] = True
-    empty_ordinals = np.flatnonzero(~covered)
-    del covered, pano_ordinals, flat_ordinals, ordinals
-
-    # The empty-grid-point fill, built COLUMN-WISE rather than as one dict per
-    # point. This is the single biggest allocation in the whole pipeline: a
-    # 16-key dict is 464 bytes, so Cairo's ~10.5M points cost ~4.9 GB of dicts
-    # plus another ~6 GB when pandas turns them into an N x 16 object matrix —
-    # on a cgroup capped at 8 GB (issue #157). As arrays the same fill is two
-    # float columns and a handful of all-null ones.
-    empty_df = build_empty_rows(
-        grid_lats[empty_ordinals],
-        grid_lons[empty_ordinals],
-        query_timestamp,
-        "ZERO_RESULTS",
-    )
-    # An uncovered point inside a tile that never downloaded is UNKNOWN, not
-    # empty. Left as ZERO_RESULTS it would be indistinguishable from genuine
-    # no-imagery and would quietly understate coverage and pollute the
-    # run-to-run diff, so it gets its own status — the same shape as the GSV
-    # downloader writing REQUEST_FAILED rows for its sub-threshold holes
-    # (issue #168). REQUEST_FAILED counts toward neither 360° nor any-imagery
-    # coverage, and is already one of analysis.SYSTEMIC_FAILURE_STATUSES.
-    if failed_tiles:
-        in_failed_tile = _points_in_tiles(
-            grid_lats[empty_ordinals], grid_lons[empty_ordinals], failed_tiles
-        )
-        empty_df.loc[in_failed_tile, "status"] = REQUEST_FAILED
-        num_failed_points = int(in_failed_tile.sum())
-        logger.warning(
-            f"{num_failed_points:,} grid points fall in {len(failed_tiles)} undownloaded "
-            f"tile(s); written as {REQUEST_FAILED} rather than empty"
-        )
-    num_empty_points = len(empty_ordinals)
-    del empty_ordinals
-
-    # Stream straight into the gzip handle, and write the three frames in
-    # sequence rather than pd.concat'ing them first. df.to_csv() with no path
-    # built the ENTIRE csv as one Python str and then a second full copy as
-    # bytes — about 1.7 GB of pure duplication at Cairo scale, for a file we
-    # are writing out anyway — and each concat was another full copy of the
-    # frames it joined. Appending with header=False is byte-identical to
-    # concatenating: same columns, same order, panos then flat-only then empty.
-    with gzip.open(output_csv_gz_path, "wt", encoding="utf-8", newline="") as f:
-        covered_df.to_csv(f, index=False)
-        if num_flat_only_points:
-            flat_only_df.to_csv(f, index=False, header=False)
-        if num_empty_points:
-            empty_df.to_csv(f, index=False, header=False)
-    del covered_df, flat_only_df, empty_df
-
-    # Read back through the shared loader so dtypes match GSV runs exactly
-    df = load_city_csv_file(output_csv_gz_path)
-    n_pano_rows = int(df["status"].isin(("OK", "NO_DATE")).sum())
-    logger.info(
-        f"Wrote {len(df)} rows ({n_pano_rows} pano rows, "
-        f"{num_flat_only_points} flat-only points, {num_flat_images} flat images, "
-        f"{num_empty_points} empty grid points) "
-        f"to {output_csv_gz_path}"
+        capture_dates_for=_mapillary_capture_dates,
+        image_columns=_mapillary_image_columns,
+        dtypes=MAPILLARY_METADATA_DTYPES,
+        # A tile that never downloaded leaves its grid points UNKNOWN rather
+        # than empty (issue #168); a clean fetch passes None and pays nothing.
+        unmeasured_mask=(
+            (lambda lats, lons: _points_in_tiles(lats, lons, failed_tiles))
+            if failed_tiles
+            else None
+        ),
+        unmeasured_desc=f"{len(failed_tiles)} undownloaded tile(s)",
     )
 
     return {
-        "df": df,
+        "df": written["df"],
         "filename_with_path": output_csv_gz_path,
         "api_requests": api_requests,
         # Census magnitude of flat imagery (issue #116): every in-grid flat
         # image, including those at points that also hold a pano. Not
         # reconstructable from the CSV (flat-only points collapse to one
         # FLAT_ONLY row), so it is threaded to the catalog separately.
-        "num_flat_images": num_flat_images,
+        "num_flat_images": written["num_flat_images"],
         "started_at": started_at,
         "finished_at": datetime.now(UTC).isoformat(),
     }

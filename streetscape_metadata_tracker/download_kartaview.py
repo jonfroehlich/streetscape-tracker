@@ -97,6 +97,7 @@ from .download_common import (
     AsyncRateLimiter,
     DownloadError,
     HostBlockedError,
+    grid_bbox,
     redact_credentials,
 )
 from .host_lock import host_lock
@@ -345,11 +346,6 @@ def estimate_sweep_requests(
             A city that calibrates to 500 m costs about 4x this estimate, which
             is why the previous run's calibrated value is worth storing.
     """
-    # Imported here rather than at module scope: grid_bbox is pure geodesy that
-    # happens to live in the Mapillary module, and a top-level import would make
-    # every KartaView import pull in mapbox_vector_tile.
-    from .download_mapillary import grid_bbox
-
     bbox = grid_bbox(center_lat, center_lon, grid_width, grid_height, step_length)
     return len(cells_for_bbox(*bbox, radius_m * math.sqrt(2)))
 

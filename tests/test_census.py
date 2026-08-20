@@ -13,12 +13,17 @@ So these tests drive the generic layer with a DIFFERENT schema from Mapillary's
 and assert the properties hold there too.
 """
 
+import ast
+import inspect
+import textwrap
+
 import numpy as np
 import pandas as pd
 import pytest
 
 from streetscape_metadata_tracker import census
 from streetscape_metadata_tracker import download_mapillary as dm
+from streetscape_metadata_tracker.analysis import FLAT_ONLY, REQUEST_FAILED
 
 # A deliberately un-Mapillary-like schema: different column names, a different
 # count, a different order, and no `is_pano`/`captured_at_ms` at all.
@@ -336,3 +341,303 @@ def test_the_mapillary_names_are_bindings_of_the_generic_ones():
     """
     assert dm.dedupe_census is census.dedupe_census
     assert dm.status_for_capture_dates is census.status_for_capture_dates
+
+
+# ── the grid run: a census becomes a run CSV ───────────────────────────────
+#
+# write_census_grid_run is the ~150-line back half every census provider needs:
+# grid assignment, the pano / flat-only / empty three-frame build, the
+# sequential gzip write. It carries #157's memory shape and #116's flat-only
+# rule, so a forked copy loses both silently. Same posture as the tests above --
+# drive it with a schema that is NOT Mapillary's.
+
+# `is_pano` is the one column the tail requires BY NAME, and that is a contract
+# rather than Mapillary-shapedness: it is the shared 360-degree boolean (issue
+# #116) that each census provider normalizes its own flag into (KartaView:
+# projection == "SPHERE"). Everything else here still differs from Mapillary's
+# schema in name, count and order.
+OTHER_GRID_CENSUS_DTYPES = {**OTHER_CENSUS_DTYPES, "is_pano": "boolean"}
+
+TS = "2026-08-20T00:00:00+00:00"
+
+
+def _grid_record(id_, lat, lon, *, is_pano=True, idx=0, shot="2020-01-01"):
+    return {**_record(id_, lat, lon, idx, shot), "is_pano": is_pano}
+
+
+def _other_capture_dates(census_frame, positions):
+    """This provider's date binding: it indexes its OWN column, by position."""
+    picked = census_frame["shot_date"].to_numpy()[positions]
+    return np.array(["" if pd.isna(v) else str(v) for v in picked], dtype=object)
+
+
+def _tiny_grid():
+    """3x3 points, 20 m apart. Images are placed ON grid points, so an image's
+    intended ordinal is exact and the test never depends on rounding."""
+    return census.build_grid(47.6, -122.3, 40, 40, 20)
+
+
+def _run_grid(tmp_path, records, *, grid=None, capture_dates_for=None, **kwargs):
+    grid = grid if grid is not None else _tiny_grid()
+    fetched = {
+        "census": census.records_to_census(records, OTHER_GRID_CENSUS_DTYPES),
+        "api_requests": 1,
+    }
+    written = census.write_census_grid_run(
+        fetched,
+        grid,
+        str(tmp_path / "run.csv.gz"),
+        TS,
+        capture_dates_for=capture_dates_for or _other_capture_dates,
+        image_columns=_other_image_columns,
+        dtypes=OTHER_OUTPUT_DTYPES,
+        **kwargs,
+    )
+    return grid, fetched, written
+
+
+def test_the_grid_run_writes_panos_then_flat_only_then_the_empty_fill(tmp_path):
+    grid = _tiny_grid()
+    _, _, written = _run_grid(
+        tmp_path,
+        [
+            _grid_record("p0", grid.lats[0], grid.lons[0]),
+            _grid_record("f4", grid.lats[4], grid.lons[4], is_pano=False),
+        ],
+        grid=grid,
+    )
+    df = written["df"]
+
+    # Column order is the provider's dtypes key order, not this module's.
+    assert list(df.columns) == list(OTHER_OUTPUT_DTYPES)
+    # Every grid point is accounted for exactly once.
+    assert len(df) == grid.num_points == 9
+    assert written["num_flat_images"] == 1
+    assert written["num_flat_only_points"] == 1
+    assert written["num_empty_points"] == 7
+    # ...in the three-frame write order the fixture pins for Mapillary.
+    assert list(df["status"]) == ["OK", FLAT_ONLY] + ["ZERO_RESULTS"] * 7
+    assert df["pano_id"].iloc[0] == "p0"
+    assert df["pano_id"].iloc[1] == "f4"
+    # The query columns are the GRID point, not the image's own position.
+    assert df["query_lat"].iloc[0] == pytest.approx(grid.lats[0])
+    assert df["query_lon"].iloc[0] == pytest.approx(grid.lons[0])
+
+
+def test_a_flat_only_point_carries_a_null_capture_date(tmp_path):
+    """
+    Issue #116: a FLAT_ONLY row is a coverage-presence marker. A real date there
+    would put contributor flat timestamps into every dated statistic, which key
+    on status == 'OK'.
+    """
+    grid = _tiny_grid()
+    _, _, written = _run_grid(
+        tmp_path,
+        [_grid_record("f0", grid.lats[0], grid.lons[0], is_pano=False, shot="2021-05-05")],
+        grid=grid,
+    )
+    flat = written["df"][written["df"]["status"] == FLAT_ONLY]
+    assert len(flat) == 1
+    assert pd.isna(flat["capture_date"].iloc[0])
+    # ...but the image itself is still identified, so coverage is attributable.
+    assert flat["pano_id"].iloc[0] == "f0"
+
+
+def test_a_point_holding_both_a_pano_and_a_flat_is_not_flat_only(tmp_path):
+    grid = _tiny_grid()
+    _, _, written = _run_grid(
+        tmp_path,
+        [
+            _grid_record("flat", grid.lats[3], grid.lons[3], is_pano=False),
+            _grid_record("pano", grid.lats[3], grid.lons[3]),
+        ],
+        grid=grid,
+    )
+    df = written["df"]
+    assert written["num_flat_only_points"] == 0
+    # The flat image still counts toward the census magnitude of flat imagery.
+    assert written["num_flat_images"] == 1
+    assert list(df["status"]) == ["OK"] + ["ZERO_RESULTS"] * 8
+    assert df["pano_id"].iloc[0] == "pano"
+
+
+def test_the_first_flat_at_a_point_is_its_representative(tmp_path):
+    """
+    Mirrors the dict.setdefault the vectorized form replaced: earliest in census
+    order wins. np.unique returns first occurrences but SORTED by value, so the
+    positions have to be re-sorted -- dropping that re-sort silently changes
+    which image represents a point, and therefore the row's coordinates.
+    """
+    grid = _tiny_grid()
+    _, _, written = _run_grid(
+        tmp_path,
+        [
+            _grid_record("second_point", grid.lats[5], grid.lons[5], is_pano=False),
+            _grid_record("first_here", grid.lats[1], grid.lons[1], is_pano=False),
+            _grid_record("later_here", grid.lats[1], grid.lons[1], is_pano=False),
+        ],
+        grid=grid,
+    )
+    df = written["df"]
+    flat_ids = list(df[df["status"] == FLAT_ONLY]["pano_id"])
+    # Census order, not ordinal order: the point seen first is written first.
+    assert flat_ids == ["second_point", "first_here"]
+    assert written["num_flat_images"] == 3
+    assert written["num_flat_only_points"] == 2
+
+
+def test_points_under_an_unmeasured_area_are_request_failed_not_empty(tmp_path):
+    """
+    Issue #168: an uncovered point whose area never downloaded is UNKNOWN. Left
+    as ZERO_RESULTS it is indistinguishable from genuine no-imagery, which
+    understates coverage and pollutes the next run-to-run diff.
+    """
+    grid = _tiny_grid()
+
+    # Everything strictly north of the centre row is "unmeasured".
+    def mask(lats, lons):
+        return np.asarray(lats) > grid.center_lat
+
+    _, _, written = _run_grid(
+        tmp_path, [], grid=grid, unmeasured_mask=mask, unmeasured_desc="1 bad cell"
+    )
+    df = written["df"]
+    assert written["num_empty_points"] == 9
+    assert written["num_unmeasured_points"] == 3
+    assert set(df["status"]) == {"ZERO_RESULTS", REQUEST_FAILED}
+    assert (df["status"] == REQUEST_FAILED).sum() == 3
+    # ...and only north of centre.
+    assert (df[df["status"] == REQUEST_FAILED]["query_lat"] > grid.center_lat).all()
+
+
+def test_a_clean_fetch_pays_nothing_for_the_unmeasured_check(tmp_path):
+    _, _, written = _run_grid(tmp_path, [], unmeasured_mask=None)
+    assert written["num_unmeasured_points"] == 0
+    assert set(written["df"]["status"]) == {"ZERO_RESULTS"}
+
+
+def test_images_outside_the_grid_are_dropped(tmp_path):
+    grid = _tiny_grid()
+    _, _, written = _run_grid(
+        tmp_path,
+        [_grid_record("far", grid.center_lat + 1.0, grid.center_lon + 1.0)],
+        grid=grid,
+    )
+    assert written["num_flat_images"] == 0
+    assert set(written["df"]["status"]) == {"ZERO_RESULTS"}
+
+
+def test_the_tail_takes_ownership_of_the_census(tmp_path):
+    """
+    The census is POPPED out of the fetch result, so this function is its sole
+    owner and can release it before the CSV writes. A caller that kept its own
+    name would pin the whole census (19M rows at Detroit) alive through both
+    writes and defeat the release entirely -- issue #157's actual failure mode.
+    """
+    grid = _tiny_grid()
+    _, fetched, _ = _run_grid(tmp_path, [_grid_record("p", grid.lats[0], grid.lons[0])], grid=grid)
+    assert "census" not in fetched
+    # The rest of the fetch result is untouched -- the caller still needs it.
+    assert fetched["api_requests"] == 1
+
+
+def test_the_date_binding_is_handed_the_whole_census_and_positions(tmp_path):
+    """
+    capture_dates_for takes (census, positions), NOT a pre-taken sub-frame, so a
+    provider indexes only the one or two columns it needs. A seam that took a
+    taken frame would materialize every column of the census a second time.
+    """
+    grid = _tiny_grid()
+    seen = {}
+
+    def spy(census_frame, positions):
+        seen["rows"] = len(census_frame)
+        seen["positions"] = np.asarray(positions).tolist()
+        return _other_capture_dates(census_frame, positions)
+
+    _run_grid(
+        tmp_path,
+        [
+            _grid_record("p0", grid.lats[0], grid.lons[0]),
+            _grid_record("flat", grid.lats[1], grid.lons[1], is_pano=False),
+            _grid_record("p2", grid.lats[2], grid.lons[2]),
+        ],
+        grid=grid,
+        capture_dates_for=spy,
+    )
+    assert seen["rows"] == 3  # the WHOLE census, not the 2 panos
+    assert seen["positions"] == [0, 2]  # ...selected by position
+
+
+def test_a_missing_date_is_no_date_rather_than_a_dropped_row(tmp_path):
+    grid = _tiny_grid()
+    _, _, written = _run_grid(
+        tmp_path,
+        [
+            _grid_record("dated", grid.lats[0], grid.lons[0], shot="2019-03-03"),
+            _grid_record("undated", grid.lats[1], grid.lons[1], shot=None),
+        ],
+        grid=grid,
+    )
+    df = written["df"]
+    assert list(df["status"])[:2] == ["OK", "NO_DATE"]
+    assert pd.isna(df["capture_date"].iloc[1])
+
+
+def test_build_grid_ordinals_round_trip_to_the_coordinate_arrays(tmp_path):
+    """
+    ordinals() is arithmetic on a regular lattice, standing in for the
+    {(i, j): position} dict that cost ~4.5 GB at Cairo scale (issue #157).
+    """
+    grid = _tiny_grid()
+    assert grid.num_points == len(grid.lats) == len(grid.lons) == 9
+    # The generation order is row-major from the lowest (i, j).
+    assert grid.ordinals(grid.i_min, grid.j_min) == 0
+    assert grid.ordinals(grid.i_min + 2, grid.j_min + 2) == 8
+    # Vectorized over arrays, which is how the tail calls it.
+    got = grid.ordinals(
+        np.array([grid.i_min, grid.i_min + 1]), np.array([grid.j_min + 1, grid.j_min])
+    )
+    assert got.tolist() == [1, 3]
+    # The bbox the fetch is bounded by contains every point it will assign to.
+    min_lon, min_lat, max_lon, max_lat = grid.bbox
+    assert (grid.lats >= min_lat).all() and (grid.lats <= max_lat).all()
+    assert (grid.lons >= min_lon).all() and (grid.lons <= max_lon).all()
+
+
+# Every grid collector that hands its census to write_census_grid_run. Add a
+# provider's entry point here when it is wired up -- the check below is cheap
+# and the bug it catches is invisible at runtime.
+GRID_COLLECTORS = [dm.download_mapillary_metadata_async]
+
+
+@pytest.mark.parametrize("collector", GRID_COLLECTORS, ids=lambda f: f.__name__)
+def test_no_grid_collector_binds_the_census_to_a_local(collector):
+    """
+    The other half of the ownership contract, and the half no runtime test can
+    see. write_census_grid_run pops the census so it can drop it before the CSV
+    writes, but a caller that ALSO holds ``census = fetched["census"]`` pins the
+    whole thing (19M rows at Detroit) alive through both writes -- the release
+    buys nothing, peak memory returns to its pre-#157 level, and every test in
+    this file still passes. So the caller's discipline is asserted on its source.
+
+    Reading `fetched["census"]` inline (for a log line, say) is fine and stays
+    allowed; what is banned is giving it a NAME that outlives the call.
+    """
+    tree = ast.parse(textwrap.dedent(inspect.getsource(collector)))
+    for node in ast.walk(tree):
+        targets = []
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, ast.AnnAssign | ast.NamedExpr):
+            targets = [node.target]
+        if not targets or not isinstance(node.value, ast.Subscript):
+            continue
+        key = node.value.slice
+        if isinstance(key, ast.Constant) and key.value == "census":
+            name = getattr(targets[0], "id", "<expr>")
+            raise AssertionError(
+                f"{collector.__name__} binds the census to a local ({name!r}); "
+                "read it inline instead, or write_census_grid_run's release is "
+                "defeated and #157's memory shape silently regresses"
+            )

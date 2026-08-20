@@ -31,12 +31,24 @@ extras), and nothing else.
 
 from __future__ import annotations
 
+import gzip
 import logging
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from typing import Any
 
+import geopy
 import numpy as np
 import pandas as pd
+
+from .analysis import FLAT_ONLY, REQUEST_FAILED
+from .download_common import (
+    assign_to_grid,
+    generate_grid_arrays,
+    grid_bbox,
+    grid_index_ranges,
+)
+from .fileutils import load_city_csv_file
 
 logger = logging.getLogger(__name__)
 
@@ -312,3 +324,288 @@ def build_empty_rows(
         },
         columns=list(dtypes.keys()),
     )
+
+
+# ── The grid run: a census becomes a METADATA-schema CSV ───────────────────
+
+
+@dataclass(frozen=True, eq=False)
+class CensusGrid:
+    """
+    A city's frozen sampling lattice, built once per run.
+
+    Built BEFORE the fetch (``bbox`` is what bounds it) and consumed AFTER it
+    (``lats``/``lons`` become the query columns of every output row), so the
+    caller builds one and threads it through rather than deriving it twice: at
+    Cairo's ~10.5M points the coordinate arrays are ~170 MB and the pure-Python
+    geodesic solve that produces them ran ~13 minutes before a single tile was
+    fetched (issue #157).
+
+    ``eq=False`` because the fields are arrays: the generated ``__eq__`` would
+    return an array rather than a bool, and the generated ``__hash__`` would
+    raise. Nothing needs either.
+    """
+
+    lats: np.ndarray
+    lons: np.ndarray
+    center_lat: float
+    center_lon: float
+    step_length: float
+    width_steps: int
+    height_steps: int
+    bbox: tuple[float, float, float, float]
+    # Enough of grid_index_ranges to turn an (i, j) back into a position.
+    i_min: int
+    j_min: int
+    n_j: int
+
+    @property
+    def num_points(self) -> int:
+        return len(self.lats)
+
+    def ordinals(self, i, j):
+        """
+        Position of grid index ``(i, j)`` in generation order; scalars or arrays.
+
+        The grid is a regular lattice, so a point's position is arithmetic and
+        needs no lookup table -- the ``{(i, j): position}`` dict this replaces
+        cost ~4.5 GB at Cairo scale against an 8 GB cgroup (issue #157).
+        """
+        return (i - self.i_min) * self.n_j + (j - self.j_min)
+
+
+def build_grid(
+    center_lat: float,
+    center_lon: float,
+    grid_width: float,
+    grid_height: float,
+    step_length: float,
+) -> CensusGrid:
+    """
+    Build the frozen lattice for a city, plus the bbox that bounds a fetch of it.
+
+    Grid geometry is frozen per city, so every future run re-derives these same
+    coordinates and its diffs align on an identical rectangle. Shared by every
+    census provider so one provider's lattice can never drift from another's.
+    """
+    width_steps = int(grid_width / step_length)
+    height_steps = int(grid_height / step_length)
+    lats, lons, _, _ = generate_grid_arrays(
+        geopy.Point(center_lat, center_lon), width_steps, height_steps, step_length
+    )
+    i_values, j_values = grid_index_ranges(width_steps, height_steps)
+    return CensusGrid(
+        lats=lats,
+        lons=lons,
+        center_lat=center_lat,
+        center_lon=center_lon,
+        step_length=step_length,
+        width_steps=width_steps,
+        height_steps=height_steps,
+        bbox=grid_bbox(center_lat, center_lon, grid_width, grid_height, step_length),
+        i_min=i_values[0],
+        j_min=j_values[0],
+        n_j=len(j_values),
+    )
+
+
+def write_census_grid_run(
+    fetched: dict[str, Any],
+    grid: CensusGrid,
+    output_csv_gz_path: str,
+    query_timestamp: str,
+    *,
+    capture_dates_for: Callable[[pd.DataFrame, np.ndarray], Any],
+    image_columns: Callable[[pd.DataFrame], Mapping[str, Any]],
+    dtypes: Mapping[str, Any],
+    unmeasured_mask: Callable[[np.ndarray, np.ndarray], np.ndarray] | None = None,
+    unmeasured_desc: str = "",
+) -> dict[str, Any]:
+    """
+    Turn a fetched census into a run CSV: the back half of every grid collector.
+
+    Assigns every image to its nearest grid point, then writes three populations
+    in one pass -- 360 panos, FLAT_ONLY markers for points that hold only flat
+    imagery (issue #116), and the ZERO_RESULTS/REQUEST_FAILED fill for points
+    nothing covered.
+
+    THE CENSUS IS POPPED OUT OF ``fetched``, and the caller must not keep its own
+    reference. That is not a style choice: this function drops the census as soon
+    as the last frame is built, and a caller-side name would pin the whole thing
+    (19M rows at Detroit) alive through both CSV writes, defeating the release
+    entirely. Passing the fetch-result dict rather than the frame is what makes
+    this function the sole owner. A test pins it.
+
+    Args:
+        fetched: the provider's fetch result; its ``census`` key is consumed.
+        grid: the city's frozen lattice, from :func:`build_grid`.
+        output_csv_gz_path: destination; the caller validates and creates it.
+        query_timestamp: run-level ISO timestamp, identical on every row.
+        capture_dates_for: ``(census, positions) -> array`` of 'YYYY-MM-DD'/'',
+            applying the provider's own date rules. Takes positions rather than
+            a taken sub-frame so a provider can index the one or two columns it
+            needs instead of materializing the whole census again.
+        image_columns: the provider's own output columns; see
+            :func:`build_image_rows`.
+        dtypes: the provider's OUTPUT schema; its key order is the CSV's column
+            order and part of the byte-identical contract.
+        unmeasured_mask: ``(lats, lons) -> bool mask`` marking query points whose
+            area never downloaded, or None when the fetch was complete.
+        unmeasured_desc: operator-facing noun phrase for what failed (e.g.
+            "3 undownloaded tile(s)"), logged with the resulting point count.
+
+    Returns:
+        Dict with the read-back ``df`` and the four population counts.
+    """
+    census = fetched.pop("census")
+    is_pano = census["is_pano"].to_numpy()
+
+    # Nearest-grid-point assignment for the WHOLE census at once. Everything
+    # from here to the CSV write is array work on positional indices into the
+    # census: the row-wise form built an (image, (i, j)) tuple pair and then a
+    # 16-key dict per image, which is ~1.4 GB per million images and is what
+    # made a census-heavy city unschedulable (issue #157).
+    i_idx, j_idx, in_grid = assign_to_grid(
+        census["lat"].to_numpy(),
+        census["lon"].to_numpy(),
+        grid.center_lat,
+        grid.center_lon,
+        grid.width_steps,
+        grid.height_steps,
+        grid.step_length,
+    )
+    ordinals = grid.ordinals(i_idx, j_idx)
+    del i_idx, j_idx
+
+    # Positions of the in-grid panos, in census order -- the order the row-wise
+    # loop visited them in, and therefore the row order of the output file.
+    pano_positions = np.flatnonzero(in_grid & is_pano)
+    pano_ordinals = ordinals[pano_positions]
+    capture_dates = capture_dates_for(census, pano_positions)
+    covered_df = build_image_rows(
+        census,
+        pano_positions,
+        grid.lats[pano_ordinals],
+        grid.lons[pano_ordinals],
+        query_timestamp,
+        status_for_capture_dates(capture_dates),
+        capture_dates,
+        dtypes=dtypes,
+        image_columns=image_columns,
+    )
+    del capture_dates
+
+    # Flat imagery (issue #116): tally every in-grid flat image for the census
+    # magnitude, and keep one representative per grid point so a flat-only
+    # point (a point with flats but no pano) can be written as a single
+    # FLAT_ONLY marker row.
+    flat_positions = np.flatnonzero(in_grid & ~is_pano)
+    num_flat_images = len(flat_positions)
+    # return_index gives the FIRST occurrence of each ordinal, matching the
+    # dict.setdefault this replaces -- the earliest flat in census order stays
+    # the representative for its point.
+    _, first_of_point = np.unique(ordinals[flat_positions], return_index=True)
+    flat_positions = flat_positions[np.sort(first_of_point)]
+    # A pano already covers that point, so it is not flat-ONLY.
+    flat_positions = flat_positions[
+        ~np.isin(ordinals[flat_positions], pano_ordinals, assume_unique=False)
+    ]
+    flat_ordinals = ordinals[flat_positions]
+    flat_only_df = build_image_rows(
+        census,
+        flat_positions,
+        grid.lats[flat_ordinals],
+        grid.lons[flat_ordinals],
+        query_timestamp,
+        FLAT_ONLY,
+        # capture_date is deliberately null for FLAT_ONLY: this row is a
+        # coverage-presence marker, and a null date keeps flat timestamps out
+        # of every date/age/histogram path (which key on status == 'OK').
+        None,
+        dtypes=dtypes,
+        image_columns=image_columns,
+    )
+    num_flat_only_points = len(flat_positions)
+    # Deliberately NOT pd.concat'd onto covered_df. covered_df is one row per
+    # in-grid pano -- 6.5M rows of mostly-object columns at Colorado Springs --
+    # and concatenating copies all of it to append a frame that is at most one
+    # row per grid point. The two are written to the gzip handle in sequence
+    # instead, which is byte-identical, for the same reason the empty fill is
+    # (see the write below).
+    del census, is_pano, in_grid
+
+    # Which grid points nothing covered, via a bitmap rather than np.setdiff1d:
+    # setdiff1d sorts and uniques BOTH operands, including the
+    # num_grid_points-long arange that is unique by construction -- O(n log n)
+    # plus several int64 temporaries over the biggest array in the function.
+    # This is O(n) and one byte per point, and needs no concatenate either.
+    covered = np.zeros(grid.num_points, dtype=bool)
+    covered[pano_ordinals] = True
+    covered[flat_ordinals] = True
+    empty_ordinals = np.flatnonzero(~covered)
+    del covered, pano_ordinals, flat_ordinals, ordinals
+
+    # The empty-grid-point fill, built COLUMN-WISE rather than as one dict per
+    # point. This is the single biggest allocation in the whole pipeline: a
+    # 16-key dict is 464 bytes, so Cairo's ~10.5M points cost ~4.9 GB of dicts
+    # plus another ~6 GB when pandas turns them into an N x 16 object matrix --
+    # on a cgroup capped at 8 GB (issue #157). As arrays the same fill is two
+    # float columns and a handful of all-null ones.
+    empty_df = build_empty_rows(
+        grid.lats[empty_ordinals],
+        grid.lons[empty_ordinals],
+        query_timestamp,
+        "ZERO_RESULTS",
+        dtypes=dtypes,
+    )
+    # An uncovered point inside an area that never downloaded is UNKNOWN, not
+    # empty. Left as ZERO_RESULTS it would be indistinguishable from genuine
+    # no-imagery and would quietly understate coverage and pollute the
+    # run-to-run diff, so it gets its own status -- the same shape as the GSV
+    # downloader writing REQUEST_FAILED rows for its sub-threshold holes
+    # (issue #168). REQUEST_FAILED counts toward neither 360 nor any-imagery
+    # coverage, and is already one of analysis.SYSTEMIC_FAILURE_STATUSES.
+    num_unmeasured_points = 0
+    if unmeasured_mask is not None:
+        in_unmeasured = unmeasured_mask(grid.lats[empty_ordinals], grid.lons[empty_ordinals])
+        empty_df.loc[in_unmeasured, "status"] = REQUEST_FAILED
+        num_unmeasured_points = int(in_unmeasured.sum())
+        logger.warning(
+            f"{num_unmeasured_points:,} grid points fall in {unmeasured_desc}; "
+            f"written as {REQUEST_FAILED} rather than empty"
+        )
+    num_empty_points = len(empty_ordinals)
+    del empty_ordinals
+
+    # Stream straight into the gzip handle, and write the three frames in
+    # sequence rather than pd.concat'ing them first. df.to_csv() with no path
+    # built the ENTIRE csv as one Python str and then a second full copy as
+    # bytes -- about 1.7 GB of pure duplication at Cairo scale, for a file we
+    # are writing out anyway -- and each concat was another full copy of the
+    # frames it joined. Appending with header=False is byte-identical to
+    # concatenating: same columns, same order, panos then flat-only then empty.
+    with gzip.open(output_csv_gz_path, "wt", encoding="utf-8", newline="") as f:
+        covered_df.to_csv(f, index=False)
+        if num_flat_only_points:
+            flat_only_df.to_csv(f, index=False, header=False)
+        if num_empty_points:
+            empty_df.to_csv(f, index=False, header=False)
+    del covered_df, flat_only_df, empty_df
+
+    # Read back through the shared loader so dtypes match GSV runs exactly.
+    df = load_city_csv_file(output_csv_gz_path, dtypes=dtypes)
+    n_pano_rows = int(df["status"].isin(("OK", "NO_DATE")).sum())
+    logger.info(
+        f"Wrote {len(df)} rows ({n_pano_rows} pano rows, "
+        f"{num_flat_only_points} flat-only points, {num_flat_images} flat images, "
+        f"{num_empty_points} empty grid points) "
+        f"to {output_csv_gz_path}"
+    )
+    return {
+        "df": df,
+        "num_pano_rows": n_pano_rows,
+        "num_flat_images": num_flat_images,
+        "num_flat_only_points": num_flat_only_points,
+        "num_empty_points": num_empty_points,
+        "num_unmeasured_points": num_unmeasured_points,
+    }
