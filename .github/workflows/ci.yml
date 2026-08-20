@@ -15,10 +15,20 @@ concurrency:
 permissions:
   contents: read
 
+# Every job below sets timeout-minutes. GitHub's default is 6 HOURS, and on
+# 2026-08-19 a PR's e2e job sat in "Install Chromium" for 5 h before it was
+# cancelled by hand — a hang that reported as "still running", not as a
+# failure, so the signal it produced was indistinguishable from a slow queue.
+# The caps are sized from measured durations (a warm-cache run on 2026-08-20:
+# lint 14 s, frontend 10 s, tests ~2m20s, e2e 1m31s) with wide headroom: they
+# exist to convert a hang into a legible failure in minutes, NOT to police
+# normal variance, so a cap that fires on a healthy run is too low by
+# definition and should be raised rather than debugged.
 jobs:
   lint:
     name: Lint (ruff)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -36,6 +46,8 @@ jobs:
   test:
     name: Tests (py${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    # Per matrix leg, not for the matrix as a whole.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -57,6 +69,7 @@ jobs:
   frontend:
     name: Frontend (ESLint + unit tests)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     defaults:
       run:
         working-directory: www
@@ -81,6 +94,15 @@ jobs:
     # block merges; it drives real Chromium over the committed fixture and is
     # advisory. The fast pytest/frontend jobs never depend on it.
     continue-on-error: true
+    # The loosest cap in this file, and deliberately so: this is the job that
+    # hung, but it is also the only one that downloads ~350 MB of browser on a
+    # cache miss. The re-run of that same hung job spent ~14 min in "Install
+    # Chromium" and then PASSED — so the obvious 15 would have killed a healthy
+    # run, and the number has to clear a cold cache, not a warm one (1m31s).
+    # 30 leaves ~2x headroom over the worst legitimate run observed while still
+    # turning a 5-hour hang into a failure inside half an hour. Because this job
+    # is continue-on-error, hitting it costs a red advisory check, not a merge.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
