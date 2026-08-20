@@ -3440,6 +3440,12 @@ def test_stop_timeout_covers_the_publish_tail_it_waits_for():
 
     Asserted against the DIRECTIVE line, not the prose around it — a comment is
     not what systemd runs.
+
+    It ALSO pins the unit's prose to `_MEASURED_TAIL_AGGREGATE_S` via
+    `_assert_unit_quotes`, which the test name does not advertise: that constant
+    has no other test, and a failure here can therefore be about the quoted
+    figure rather than about TimeoutStopSec itself. The assertion message says
+    which.
     """
     from streetscape_metadata_tracker import catalog_backup
 
@@ -3477,13 +3483,24 @@ def test_stop_timeout_covers_the_publish_tail_it_waits_for():
     )
 
 
-# Extrapolated peak RSS of the largest city we track, in GiB: the per-run JSON
-# tail measured 4.81 GiB on Ho Chi Minh City's 5.26M-row census (2026-08-18),
-# i.e. ~0.914 GiB per million rows, and Detroit is ~16.7M rows. A named constant
-# for the same reason _MEASURED_TAIL_AGGREGATE_S is one — the unit file quotes
-# this figure, and the next re-sizing has to argue from it. NOTE it is an
-# EXTRAPOLATION from one city's slope, not a measurement; replace it with a real
-# MemoryPeak the first night a big city runs to completion.
+# Extrapolated peak RSS of the largest city we track, in GiB. Both inputs are
+# traceable, which matters because this figure is a floor the caps are sized
+# against: the per-run JSON tail measured 4.81 GiB on Ho Chi Minh City's 5.26M-row
+# census (2026-08-18), i.e. ~0.914 GiB per million rows, and the largest census
+# in the catalog is Detroit's 16,569,307 rows —
+#
+#   sqlite3 data/streetscape_tracker.db \
+#     "SELECT city_id, run_date, MAX(total_points) FROM runs WHERE provider='mapillary';"
+#
+# (runs.total_points IS the CSV row count for a Mapillary census: one row per
+# pano plus the ZERO_RESULTS/FLAT_ONLY fill, and it sums the status columns
+# exactly). 16.569M x 0.914 = 15.1 GiB, rounded UP to 15.3 here — a floor should
+# err high, and the slope is one city's.
+#
+# A named constant for the same reason _MEASURED_TAIL_AGGREGATE_S is one: the
+# unit file quotes this figure and the next re-sizing has to argue from it. NOTE
+# it is an EXTRAPOLATION from one city's slope, not a measurement; replace it
+# with a real MemoryPeak the first night a big city runs to completion.
 _EXTRAPOLATED_LARGEST_CITY_PEAK_GIB = 15.3
 
 
@@ -3518,8 +3535,12 @@ def test_memory_high_is_a_throttle_below_the_hard_limit_and_clears_the_worst_cit
     )
 
     def _raw(directive):
-        m = re.search(rf"^{directive}=(\S+)\s*$", unit, re.M)
-        return m.group(1) if m else None
+        # LAST match, not the first: systemd is last-wins for a repeated
+        # directive, so a duplicated MemoryHigh= line would otherwise be
+        # validated at the copy the kernel ignores — this test passing on a
+        # value that is not in force is the one way it could mislead.
+        found = re.findall(rf"^{directive}=(\S+)\s*$", unit, re.M)
+        return found[-1] if found else None
 
     def _bytes(directive, value):
         m = re.fullmatch(r"(\d+)([KMGT]?)", value)

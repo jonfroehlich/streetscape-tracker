@@ -140,8 +140,10 @@ ReadWritePaths=/cse/web/research/makelab/public/streetscape-tracker
 #
 # 12G still did not cover the largest cities, and MemoryHigh is the cap where
 # that is expensive rather than legible. Peak scales at ~0.914 GiB per million
-# CSV rows (5.26M -> 4.81 GiB measured), so Detroit's ~16.7M rows extrapolate to
-# ~15.3 GiB: over 12G, under MemoryMax. Crossing MemoryHigh reproduces exactly
+# CSV rows (5.26M -> 4.81 GiB measured), and the largest census in the catalog
+# is Detroit's 16,569,307 rows (runs.total_points, mapillary, 2026-07-24), so it
+# extrapolates to 15.1 GiB — call it ~15.3 GiB, rounding a floor up rather than
+# down: over 12G, under MemoryMax. Crossing MemoryHigh reproduces exactly
 # the failure diagnosed above — hours of silent reclaim ending in the
 # scheduler's 180-min city timeout — while crossing MemoryMax is a fast OOM kill
 # you can read in a log. So MemoryHigh is 20G: the extrapolated worst city plus
