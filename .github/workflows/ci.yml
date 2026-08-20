@@ -19,11 +19,19 @@ permissions:
 # 2026-08-19 a PR's e2e job sat in "Install Chromium" for 5 h before it was
 # cancelled by hand — a hang that reported as "still running", not as a
 # failure, so the signal it produced was indistinguishable from a slow queue.
+#
+# What a cap buys is TIME-TO-SIGNAL, not an unblocked merge. e2e is
+# continue-on-error, so that hang never blocked anything mechanically; it
+# blocked a person, who waits on all of these before merging. The cap turns a
+# 6-hour worst case into a bounded one.
+#
 # The caps are sized from measured durations (a warm-cache run on 2026-08-20:
 # lint 14 s, frontend 10 s, tests ~2m20s, e2e 1m31s) with wide headroom: they
 # exist to convert a hang into a legible failure in minutes, NOT to police
 # normal variance, so a cap that fires on a healthy run is too low by
-# definition and should be raised rather than debugged.
+# definition and should be raised rather than debugged. Note the clock starts
+# when a job starts, not when it is queued, so these bound execution only —
+# which is the right shape here, since the incident was a hung step.
 jobs:
   lint:
     name: Lint (ruff)
@@ -101,7 +109,8 @@ jobs:
     # run, and the number has to clear a cold cache, not a warm one (1m31s).
     # 30 leaves ~2x headroom over the worst legitimate run observed while still
     # turning a 5-hour hang into a failure inside half an hour. Because this job
-    # is continue-on-error, hitting it costs a red advisory check, not a merge.
+    # is continue-on-error, hitting it costs a red advisory check, not a merge —
+    # which is what makes buying that headroom cheap here and nowhere else.
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
