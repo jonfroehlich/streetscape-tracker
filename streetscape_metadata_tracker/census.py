@@ -147,7 +147,21 @@ def dedupe_census(census: pd.DataFrame) -> pd.DataFrame:
     # already the dict's key order; the scatter below then overwrites each
     # code's slot with every later position it occurs at, leaving the LAST.
     # (NumPy specifies last-wins for repeated indices in a plain assignment.)
-    codes, uniques = pd.factorize(census["id"])
+    #
+    # use_na_sentinel=False is load-bearing, not tidiness. By default factorize
+    # gives every null id the sentinel code -1, and `last_position[-1] = ...`
+    # is a NEGATIVE index: it writes the null row's position into the slot
+    # belonging to the LAST unique id, so that image is not merely dropped, it
+    # is REPLACED by the null row's coordinates and capture date. Given
+    # [A, B, <NA>] the result was [A, <NA>] -- B silently gone, a row with no
+    # pano_id in its place, in an immutable dated snapshot that diff.py then
+    # reads as one pano removed and another added at a different grid point.
+    # With the flag, a null id is simply its own key, which is exactly what the
+    # `images_by_id[record["id"]] = record` dict this reproduces would do
+    # (None is a perfectly good dict key). Mapillary cannot reach this --
+    # decode_image_features skips a feature with no id -- but a census provider
+    # that does not filter its ids can, so the seam has to be safe on its own.
+    codes, uniques = pd.factorize(census["id"], use_na_sentinel=False)
     if len(uniques) == len(census):  # no duplicates: skip the copy entirely
         return census
     last_position = np.empty(len(uniques), dtype=np.int64)
@@ -170,6 +184,49 @@ def status_for_capture_dates(capture_dates) -> np.ndarray:
             vectorized date parser.
     """
     return np.where(np.asarray(capture_dates) != "", "OK", "NO_DATE")
+
+
+def _check_image_columns(
+    core: Mapping[str, Any], provider: Mapping[str, Any], dtypes: Mapping[str, Any]
+) -> None:
+    """
+    Refuse a provider binding that does not exactly fill its own output schema.
+
+    ``pd.DataFrame(..., columns=list(dtypes))`` selects and reorders, which is
+    what makes the output column order the schema's order -- but it is also
+    silent in all three directions a binding can be wrong, and every one of
+    them publishes rather than raising:
+
+    * a column declared in ``dtypes`` that the binding never supplies is
+      created as all-null. #225 publishes ``date_added`` as its own column
+      precisely so it can never be confused with ``shot_date``; an all-null
+      ``date_added`` in an immutable dated snapshot destroys exactly the
+      provenance that column exists to keep, and nothing raises.
+    * a key the binding supplies that is NOT in ``dtypes`` -- a typo -- is
+      dropped, so the intended column is all-null by the rule above and the
+      typo leaves no trace.
+    * a key that collides with the shared core silently WINS, because the
+      binding is splatted last. A binding returning ``pano_lat`` would quietly
+      replace the census's own coordinate.
+
+    A provider seam whose contract is unenforced is a copy waiting to happen,
+    which is the thing this module exists to prevent, so the contract is
+    checked once per call (a set comparison against a handful of names, not
+    per-row work) and stated as an error rather than discovered in a CSV.
+    """
+    collisions = sorted(set(core) & set(provider))
+    if collisions:
+        raise ValueError(
+            f"image_columns returned {collisions}, which the shared core already "
+            f"fills; a provider column cannot silently replace a core one"
+        )
+    supplied, declared = set(core) | set(provider), set(dtypes)
+    if supplied != declared:
+        missing, unexpected = sorted(declared - supplied), sorted(supplied - declared)
+        raise ValueError(
+            f"image_columns does not match the output schema: "
+            f"missing {missing or 'nothing'}, unexpected {unexpected or 'nothing'}"
+        )
 
 
 def build_image_rows(
@@ -212,20 +269,19 @@ def build_image_rows(
         A DataFrame with the ``dtypes`` columns, in order.
     """
     picked = census.take(image_positions)
-    return pd.DataFrame(
-        {
-            "query_lat": query_lat,
-            "query_lon": query_lon,
-            "query_timestamp": query_timestamp,
-            "pano_lat": picked["lat"].to_numpy(),
-            "pano_lon": picked["lon"].to_numpy(),
-            "pano_id": picked["id"].to_numpy(dtype=object),
-            "capture_date": capture_date,
-            "status": status,
-            **image_columns(picked),
-        },
-        columns=list(dtypes.keys()),
-    )
+    core = {
+        "query_lat": query_lat,
+        "query_lon": query_lon,
+        "query_timestamp": query_timestamp,
+        "pano_lat": picked["lat"].to_numpy(),
+        "pano_lon": picked["lon"].to_numpy(),
+        "pano_id": picked["id"].to_numpy(dtype=object),
+        "capture_date": capture_date,
+        "status": status,
+    }
+    provider = image_columns(picked)
+    _check_image_columns(core, provider, dtypes)
+    return pd.DataFrame({**core, **provider}, columns=list(dtypes.keys()))
 
 
 def build_empty_rows(

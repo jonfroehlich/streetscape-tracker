@@ -106,6 +106,75 @@ def test_output_columns_come_out_in_the_schemas_order():
     assert rows["pano_id"].tolist() == ["a", "b"]
 
 
+def test_a_binding_that_skips_a_declared_column_is_refused_not_published():
+    """
+    The all-null column is the failure this raises to prevent. `columns=` on
+    the DataFrame constructor selects and reorders, so a column the binding
+    forgot is created full of nulls and SHIPS -- into an immutable dated
+    snapshot, silently. #225 publishes `date_added` as its own column precisely
+    so a null capture_date keeps its provenance; an all-null one destroys it.
+    """
+    frame = census.records_to_census([_record("a", 1.0, 2.0, 7)], OTHER_CENSUS_DTYPES)
+    with pytest.raises(ValueError, match="missing.*sequence_index"):
+        census.build_image_rows(
+            frame,
+            np.array([0]),
+            [10.0],
+            [20.0],
+            "T",
+            "OK",
+            ["2020-01-01"],
+            dtypes=OTHER_OUTPUT_DTYPES,
+            # copyright_info only -- sequence_index quietly dropped.
+            image_columns=lambda picked: {"copyright_info": np.array(["© Somewhere"])},
+        )
+
+
+def test_a_mistyped_binding_key_is_refused_rather_than_dropped():
+    """A typo is the realistic form of the above: the intended column is null
+    and the misspelling leaves no trace at all."""
+    frame = census.records_to_census([_record("a", 1.0, 2.0, 7)], OTHER_CENSUS_DTYPES)
+    with pytest.raises(ValueError, match="unexpected.*sequence_indexx"):
+        census.build_image_rows(
+            frame,
+            np.array([0]),
+            [10.0],
+            [20.0],
+            "T",
+            "OK",
+            ["2020-01-01"],
+            dtypes=OTHER_OUTPUT_DTYPES,
+            image_columns=lambda picked: {
+                "copyright_info": np.array(["© Somewhere"]),
+                "sequence_indexx": np.array([7], dtype=object),
+            },
+        )
+
+
+def test_a_binding_cannot_silently_overwrite_a_core_column():
+    """
+    The provider's dict is splatted LAST, so without this check a binding
+    returning `pano_lat` would win over the census's own coordinate -- and the
+    row would look perfectly well-formed.
+    """
+    frame = census.records_to_census([_record("a", 1.0, 2.0, 7)], OTHER_CENSUS_DTYPES)
+    with pytest.raises(ValueError, match="pano_lat.*core"):
+        census.build_image_rows(
+            frame,
+            np.array([0]),
+            [10.0],
+            [20.0],
+            "T",
+            "OK",
+            ["2020-01-01"],
+            dtypes=OTHER_OUTPUT_DTYPES,
+            image_columns=lambda picked: {
+                **_other_image_columns(picked),
+                "pano_lat": np.array([999.0]),
+            },
+        )
+
+
 def test_empty_rows_null_every_column_the_provider_did_not_fill():
     out = census.build_empty_rows(
         [1.0, 2.0], [3.0, 4.0], "T", "ZERO_RESULTS", dtypes=OTHER_OUTPUT_DTYPES
@@ -150,6 +219,38 @@ def test_dedup_takes_the_last_copys_values_but_the_first_ones_position():
 
     naive = pd.concat([first, second], ignore_index=True).drop_duplicates(subset="id", keep="last")
     assert list(naive["id"]) == ["A", "B"]  # the shortcut this test rejects
+
+
+def test_a_null_id_does_not_overwrite_the_last_real_image():
+    """
+    factorize's default NA sentinel is -1, and `last_position[-1] = ...` writes
+    to the END of the array -- the slot belonging to the last unique id. So a
+    single id-less record did not merely get dropped, it REPLACED a real image:
+    [A, B, <NA>] deduped to [A, <NA>], with B's row carrying the null record's
+    coordinates. In an immutable dated snapshot diff.py reads that as one pano
+    removed and another added at a different grid point.
+
+    The dict this reproduces would have kept all three (None is a fine dict
+    key), so that is the behaviour asserted here. Mapillary's decoder skips a
+    feature with no id and can never reach this; a census provider that does
+    not filter its ids can, so the seam has to be safe on its own.
+    """
+    frame = census.records_to_census(
+        [
+            _record("A", 1.0, 1.0),
+            _record("A", 2.0, 2.0),
+            _record("B", 3.0, 3.0),
+            _record(None, 99.0, 99.0),
+        ],
+        OTHER_CENSUS_DTYPES,
+    )
+    out = census.dedupe_census(frame)
+    assert out["id"].tolist()[:2] == ["A", "B"]
+    assert pd.isna(out["id"].iloc[2])
+    # B survives with its OWN coordinates rather than the null row's.
+    assert out.loc[1, ["lat", "lon"]].tolist() == [3.0, 3.0]
+    # ...and A still takes the last copy's values at the first position.
+    assert out.loc[0, ["lat", "lon"]].tolist() == [2.0, 2.0]
 
 
 def test_dedup_of_a_clean_census_returns_it_untouched():
