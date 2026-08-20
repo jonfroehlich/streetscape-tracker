@@ -46,7 +46,7 @@ retry budget:
      the catalog, uncorrelated with density -- Seattle held r=1000 at a higher
      measured photo density than either New York or Manila, both of which
      calibrated down to r=500. So it is measured once per city
-     (:func:`calibrate_radius`, at most a dozen requests) rather than
+     (:func:`calibrate_radius`, at most 30 requests at the defaults) rather than
      rediscovered at every cell, which would pay a cascade per cell.
 
 HTTP 400 IS BACKPRESSURE, NOT A MALFORMED REQUEST. The server signals overload
@@ -213,6 +213,24 @@ class Cell:
         return int(round(self.size_m * math.sqrt(2) / 2))
 
 
+def _lon_span_deg(min_lon: float, max_lon: float) -> float:
+    """
+    East-west extent of a bbox in degrees, unwrapping an antimeridian crossing.
+
+    geopy normalizes longitudes to +/-180, so a bbox straddling the antimeridian
+    comes back with ``min_lon > max_lon`` (Suva and Taveuni in Fiji, and every
+    other city within ~half a grid of 180 deg). ``max_lon - min_lon`` is then
+    NEGATIVE, which is the shape that silently produced a near-empty sweep.
+    """
+    span = max_lon - min_lon
+    return span + 360.0 if span < 0 else span
+
+
+def _wrap_lon(lon: float) -> float:
+    """Fold a longitude produced by unwrapped arithmetic back into +/-180."""
+    return ((lon + 180.0) % 360.0) - 180.0
+
+
 def cells_for_bbox(
     min_lon: float, min_lat: float, max_lon: float, max_lat: float, cell_size_m: float
 ) -> list[Cell]:
@@ -221,10 +239,32 @@ def cells_for_bbox(
 
     Equirectangular placement about the bbox's own mid-latitude. The lattice is
     a fetch plan, not a data structure any artifact depends on, and each cell is
-    covered by a circle 1.41x its own width -- so the sub-metre error this
-    approximation carries over a 100 km bbox is many orders of magnitude inside
-    the slack. The grid the CSV is keyed to still comes from
-    ``download_common.generate_grid_points``' geodesic solve, untouched.
+    covered by a circle 1.41x its own width. The grid the CSV is keyed to still
+    comes from ``download_common.generate_grid_points``' geodesic solve,
+    untouched.
+
+    ANTIMERIDIAN. A bbox that crosses it arrives wrapped (``min_lon > max_lon``)
+    and the naive ``max_lon - min_lon`` is negative, so ``ceil`` went negative
+    and ``max(1, ...)`` collapsed the whole city to a single column of cells.
+    This is not hypothetical and it is not new: ``download_mapillary``'s
+    ``tiles_for_bbox`` carries the same fix and names Suva, Fiji as the case.
+    Measured here before the fix, Taveuni FJ on an ordinary 40x40 km grid
+    planned **29 cells where it needs 841** -- 3.4% of the city -- and, because
+    ``_bbox_area_m2`` had the mirror-image bug and reported the wrap as 1.5
+    million km2, even every one of those 29 failing computed as 0.004%
+    unmeasured, three orders of magnitude under MAX_FAILED_AREA_FRACTION. So it
+    did not fail: it returned a 97%-empty census as a clean success, which
+    publishes and diffs as "every pano in the city removed".
+
+    The residual approximation is the equirectangular ``cos(mid_lat)``: cells on
+    the equator-ward half of a tall bbox are slightly wider in metres than
+    ``cell_size_m``, so their circumscribed circle falls fractionally short at
+    the corner -- about 1.7 m at a 40 km grid and 47 deg N, growing to ~7 m at
+    100 km and 61 deg. Grids are capped at 40 km (#166), the shortfall is at the
+    four corners only, and neighbouring circles overlap heavily everywhere else,
+    so this is left as measured rather than fixed: correcting it would move
+    every city's cell count and invalidate the committed cost record for a
+    couple of metres of corner.
     """
     if cell_size_m <= 0:
         raise ValueError(f"cell_size_m must be positive, got {cell_size_m}")
@@ -232,11 +272,11 @@ def cells_for_bbox(
     deg_lat = cell_size_m / _METERS_PER_DEG_LAT
     deg_lon = cell_size_m / (_METERS_PER_DEG_LAT * math.cos(math.radians(mid_lat)))
     n_y = max(1, math.ceil((max_lat - min_lat) / deg_lat))
-    n_x = max(1, math.ceil((max_lon - min_lon) / deg_lon))
+    n_x = max(1, math.ceil(_lon_span_deg(min_lon, max_lon) / deg_lon))
     return [
         Cell(
             lat=min_lat + (j + 0.5) * deg_lat,
-            lon=min_lon + (i + 0.5) * deg_lon,
+            lon=_wrap_lon(min_lon + (i + 0.5) * deg_lon),
             size_m=cell_size_m,
         )
         for j in range(n_y)
@@ -334,6 +374,26 @@ EARLIEST_CAPTURE_DATE = EARLIEST_PLAUSIBLE_CAPTURE["kartaview"]
 _FUTURE_SLACK = timedelta(days=1)
 
 
+def _scalar_timestamp(value: str) -> pd.Timestamp:
+    """
+    One timestamp string -> naive ``pd.Timestamp``, or ``NaT`` if unusable.
+
+    The scalar counterpart of :func:`_to_naive_datetime`, and it has to strip
+    the zone for the same reason: an offset makes the Timestamp tz-aware, and
+    comparing that to the naive ``EARLIEST_CAPTURE_DATE`` raises TypeError
+    rather than returning False. ``pd.Timestamp`` raises a family of errors on
+    garbage (ValueError, TypeError, OverflowError, and dateutil's ParserError
+    which is a ValueError), so all of them mean the same thing here: unusable.
+    """
+    try:
+        parsed = pd.Timestamp(value)
+    except (ValueError, TypeError, OverflowError):
+        return pd.NaT
+    if parsed is not pd.NaT and parsed.tzinfo is not None:
+        parsed = parsed.tz_convert("UTC").tz_localize(None)
+    return parsed
+
+
 def shot_date_to_iso_date(shot_date: str | None, date_added: str | None) -> str:
     """
     KartaView's two timestamps -> 'YYYY-MM-DD' capture date, or '' when unusable.
@@ -370,17 +430,11 @@ def shot_date_to_iso_date(shot_date: str | None, date_added: str | None) -> str:
     """
     if not shot_date:
         return ""
-    try:
-        shot = pd.Timestamp(shot_date)
-    except ValueError:
-        return ""
+    shot = _scalar_timestamp(shot_date)
     if pd.isna(shot):
         return ""
     if date_added:
-        try:
-            added = pd.Timestamp(date_added)
-        except ValueError:
-            added = pd.NaT
+        added = _scalar_timestamp(date_added)
         if pd.notna(added) and shot >= added:
             return ""
     if shot < pd.Timestamp(EARLIEST_CAPTURE_DATE):
@@ -388,6 +442,29 @@ def shot_date_to_iso_date(shot_date: str | None, date_added: str | None) -> str:
     if shot > pd.Timestamp(datetime.now(UTC).replace(tzinfo=None)) + _FUTURE_SLACK:
         return ""
     return shot.date().isoformat()
+
+
+def _to_naive_datetime(values) -> pd.Series:
+    """
+    Parse a column of KartaView timestamps to naive (zone-less) datetimes.
+
+    ``format="ISO8601"`` rather than inference: KartaView mixes precisions
+    inside ONE page -- ``shot_date`` arrives as "2025-09-01 17:57:05.000" and
+    ``date_added`` as "2025-09-20 21:08:37" -- and pandas infers a single format
+    from the first non-null value, so with ``errors="coerce"`` every value at
+    the other precision silently becomes NaT. Measured: a page whose first row
+    carried milliseconds nulled the capture date of every row that did not.
+    That is issue #226's failure arriving from a second direction -- the values
+    are fine, the parse throws them away, and nothing raises.
+
+    ``utc=True`` then ``tz_localize(None)`` so the result is always naive: see
+    the caller for why an offset appearing in a future response would otherwise
+    raise past the point of no return.
+    """
+    parsed = pd.to_datetime(
+        pd.Series(values, dtype=object), format="ISO8601", errors="coerce", utc=True
+    )
+    return parsed.dt.tz_localize(None)
 
 
 def shot_dates_to_iso_dates(shot_dates, dates_added) -> pd.Series:
@@ -406,17 +483,11 @@ def shot_dates_to_iso_dates(shot_dates, dates_added) -> pd.Series:
     Returns:
         A str Series of 'YYYY-MM-DD' / '' values, aligned to the input.
     """
-    # format="ISO8601", NOT inference. KartaView mixes precisions inside one
-    # page -- `shot_date` arrives as "2025-09-01 17:57:05.000" and `date_added`
-    # as "2025-09-20 21:08:37" -- and pandas infers ONE format from the first
-    # non-null value, so with `errors="coerce"` every value at the other
-    # precision silently becomes NaT. Measured here: a page whose first row
-    # carries milliseconds nulled the capture date of every row that did not.
-    # That is issue #226's failure exactly (a strict format in the CSV loader
-    # nulling every archival run's dates), arriving from a second direction:
-    # the values are fine, the parse throws them away, and nothing raises.
-    shot = pd.to_datetime(pd.Series(shot_dates, dtype=object), format="ISO8601", errors="coerce")
-    added = pd.to_datetime(pd.Series(dates_added, dtype=object), format="ISO8601", errors="coerce")
+    # Both the ISO8601 pin (#226's mixed-precision trap) and the naive-UTC
+    # normalization (a future offset would otherwise raise past the point where
+    # the sweep has already been paid for) live in _to_naive_datetime.
+    shot = _to_naive_datetime(shot_dates)
+    added = _to_naive_datetime(dates_added)
     shot = shot.reset_index(drop=True)
     added = added.reset_index(drop=True)
     ceiling = pd.Timestamp(datetime.now(UTC).replace(tzinfo=None)) + _FUTURE_SLACK
@@ -504,10 +575,20 @@ def decode_photo_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
             # and no sample point, so it would be an unusable row rather than a
             # missing one.
             continue
+        image_id = item.get("id")
+        if image_id is None:
+            # Same rule for the id, and for a sharper reason than tidiness:
+            # `id` is what census.dedupe_census keys on and what becomes
+            # `pano_id`, which diff.py compares run to run. An id-less row can
+            # be neither deduped nor diffed, so it is dropped here exactly as
+            # download_mapillary.decode_image_features drops a feature with no
+            # id. (census.dedupe_census is independently safe against nulls
+            # now, but the census should not carry them in the first place.)
+            continue
         sequence_index = item.get("sequence_index")
         records.append(
             {
-                "id": str(item.get("id")) if item.get("id") is not None else None,
+                "id": str(image_id),
                 "lon": lon,
                 "lat": lat,
                 "shot_date": item.get("shot_date") or None,
@@ -714,6 +795,23 @@ async def _post_nearby(
             timeout=timeout,
             allow_redirects=False,
         ) as resp:
+            content_type = resp.headers.get("Content-Type", "")
+            # 401/403 is decided FIRST, before the content-type test below, and
+            # the order is the whole point (the Mapillary precedent checks it
+            # first for the same reason). kartaview.org serves a JS single-page
+            # app from the very host this API lives on, so the natural shape of
+            # a rejected or expired token is an HTML login page -- and so is a
+            # load balancer's 502/503. Reading content-type first typed both as
+            # a host refusal, which routes into #208's night-level breaker:
+            # every remaining KartaView city skipped for the night, no failure
+            # recorded, and an unconditional "host UNAVAILABLE" alert sending
+            # the operator after a ban that never happened. A credential is
+            # scoped to the CHANNEL, not the machine.
+            if resp.status in (401, 403):
+                raise ResponseError(
+                    f"KartaView rejected the credential (HTTP {resp.status}, {content_type or '?'})."
+                    " Check KARTAVIEW_ACCESS_TOKEN; this is scoped to the token, not to this host."
+                )
             if 300 <= resp.status < 400:
                 raise HostBlockedError(
                     f"KartaView redirected the request (HTTP {resp.status} -> "
@@ -721,7 +819,19 @@ async def _post_nearby(
                     f"treating this host as refused",
                     HOST_KARTAVIEW,
                 )
-            content_type = resp.headers.get("Content-Type", "")
+            # 5xx before the content-type test, and transient rather than
+            # definite. An overloaded upstream answers with its load balancer's
+            # HTML error page essentially always, so the check below would have
+            # called an ordinary 502 a host refusal and skipped every remaining
+            # KartaView city for the night. Typed as transport, it takes the
+            # retry budget _probe_cell already gives a timeout or a reset, and
+            # if it persists the cell is recorded as unmeasured -- never
+            # subdivided, because a struggling server must not be asked for
+            # four requests where it just failed to serve one (#198).
+            if resp.status >= 500:
+                raise TransportError(
+                    f"KartaView server error (HTTP {resp.status}, {content_type or '?'})"
+                )
             if "text/html" in content_type.lower():
                 raise HostBlockedError(
                     f"KartaView served an HTML page (HTTP {resp.status}, {content_type}) "
@@ -747,7 +857,19 @@ async def _post_nearby(
     except ValueError as e:
         raise ResponseError(f"non-JSON body (HTTP {status_code}, {content_type or '?'})") from e
 
+    # A body that parsed but is not an object (a bare list, string or null) is
+    # an answer we cannot use, not a crash: `.get` on it raises AttributeError,
+    # which is neither DownloadError nor a transport error, so it would escape
+    # _probe_cell and _fetch_city_images WITHOUT the api_requests the caller
+    # needs to write its ledger row.
+    if not isinstance(body, dict):
+        raise ResponseError(
+            f"body is {type(body).__name__}, not a JSON object (HTTP {status_code})"
+        )
+
     status = body.get("status") or {}
+    if not isinstance(status, dict):
+        status = {}
     try:
         api_code = int(status.get("apiCode"))
     except (TypeError, ValueError):
@@ -817,6 +939,13 @@ def calibration_points(
         (mid_lat - qy, mid_lon + qx),
         (mid_lat + qy, mid_lon - qx),
     ]
+    if n < 1:
+        # 0 is the natural spelling of "don't calibrate", and it fails OPEN:
+        # `answered == len(points)` is 0 == 0, so the first rung is accepted
+        # having asked nothing -- and that rung is r=1000, which four of the
+        # study's fourteen cities could not hold. Refuse instead; the way to
+        # skip calibration is to pass radius_m.
+        raise ValueError(f"calibration needs at least one probe, got {n}")
     return candidates[:n]
 
 
@@ -845,19 +974,39 @@ async def calibrate_radius(
 
     Discovering it per cell instead pays the cascade at EVERY cell: a root that
     will not answer costs its retries plus 1 + 4 + 16 to the floor, and pays it
-    again for each of the city's other roots. One calibration up front costs at
-    most ``len(RADIUS_LADDER_M) * probes_per_rung`` requests for the whole city
-    -- at most 12, against a median city of 12 requests and a p95 of 384.
+    again for each of the city's other roots. One calibration up front is paid
+    once for the whole city.
 
-    A rung is accepted only if EVERY probe on it answers, because one lucky
-    point would set a radius the rest of the city then rediscovers the hard way.
+    COST. A rung is accepted only if EVERY probe on it answers, so the moment
+    one probe fails the rung is already lost and the remaining probes on it are
+    pure waste -- hence the break. With that, the bound is
+    ``len(RADIUS_LADDER_M) * (probes_per_rung + retries)`` requests, because a
+    rung costs either ``probes_per_rung`` answers or one probe's full retry
+    budget: 6 * (2 + 3) = **30** at the defaults, worst case, for a city where
+    nothing answers anywhere. The docstring here, the module docstring and
+    CLAUDE.md all previously said "at most 12" -- that was
+    ``rungs * probes_per_rung``, which silently assumed every probe costs one
+    request when a refused probe costs ``retries + 1``. Measured before the
+    break: 48. The number matters because it is fixed overhead against a median
+    city of 12 requests, and a scheduler that derives a timeout from the
+    estimate does not count it at all.
 
     Returns:
         The calibrated radius, or None when no rung answered anywhere -- which
         is NOT the same as "no imagery here" and must never be recorded as an
         empty city.
+
+    Raises:
+        ResponseError: the server gave a definite, unusable answer at every
+            probe -- overwhelmingly a rejected credential. Surfaced as itself
+            rather than folded into the None above, because "no radius answers
+            in this bbox" is a property of the LOCATION and sends the operator
+            to look at the city; a 401 is a property of the token and sends
+            them to the .env. They are not the same fact and the message the
+            caller prints must not claim the wrong one.
     """
     points = calibration_points(bbox, probes_per_rung)
+    saw_only_broken = True
     for radius in RADIUS_LADDER_M:
         answered = 0
         for lat, lon in points:
@@ -871,10 +1020,21 @@ async def calibrate_radius(
                 retries=retries,
                 timeout=timeout,
             )
-            answered += outcome.startswith("ok")
+            if outcome != "broken":
+                saw_only_broken = False
+            if not outcome.startswith("ok"):
+                # The rung needs every probe, so it is already lost.
+                break
+            answered += 1
         logger.info(f"  calibrate r={radius} m: {answered}/{len(points)} answered")
         if answered == len(points):
             return radius
+    if saw_only_broken:
+        raise ResponseError(
+            "KartaView gave no usable answer at any radius or any calibration point "
+            "(every probe a definite error rather than backpressure); this is the "
+            "credential or the endpoint, not the city's geometry"
+        )
     return None
 
 
@@ -952,10 +1112,19 @@ async def _probe_cell(
 
 
 def _bbox_area_m2(bbox: tuple[float, float, float, float]) -> float:
+    """
+    Bbox area, the denominator of the unmeasured-fraction guard.
+
+    Uses the same antimeridian unwrap as :func:`cells_for_bbox`. Taking the raw
+    ``max_lon - min_lon`` here was the second half of the wrap bug: on a wrapped
+    bbox it is about -359.6 deg, and the ``abs()`` below turned that into an
+    area of ~1.5 million km2, so ANY number of failed cells divided down to
+    nothing and the failed-area guard could not fire.
+    """
     min_lon, min_lat, max_lon, max_lat = bbox
     mid_lat = (min_lat + max_lat) / 2.0
     height = (max_lat - min_lat) * _METERS_PER_DEG_LAT
-    width = (max_lon - min_lon) * _METERS_PER_DEG_LAT * math.cos(math.radians(mid_lat))
+    width = _lon_span_deg(min_lon, max_lon) * _METERS_PER_DEG_LAT * math.cos(math.radians(mid_lat))
     return abs(width * height)
 
 
@@ -1072,6 +1241,20 @@ async def _fetch_city_images(
         error.api_requests = api_requests
         return error
 
+    def over_budget() -> bool:
+        """Has the runaway guard tripped? Asked everywhere a request is issued."""
+        return max_requests is not None and api_requests >= max_requests
+
+    # Clamped ONCE, here, so the page arithmetic and the wire agree. _post_nearby
+    # sends min(ipp, IPP_MAX) because the server caps it there, but
+    # pages_for_total was priced from the caller's value -- so ipp=8000 asked
+    # for one page of a circle holding 8,000 photos, got 2,000, and recorded no
+    # failed cell and no warning. 6,000 photos silently absent from a snapshot
+    # that publishes as complete.
+    if ipp > IPP_MAX:
+        logger.warning(f"ipp={ipp} exceeds the server cap; using {IPP_MAX}")
+        ipp = IPP_MAX
+
     limiter = AsyncRateLimiter(max_requests_per_minute)
     timeout = aiohttp.ClientTimeout(total=request_timeout)
     logger.info(
@@ -1131,9 +1314,10 @@ async def _fetch_city_images(
                 # indistinguishable after a SIGKILL (issue #157).
                 logger=logger,
             )
+            budget_stop = False
             try:
                 for index, root in enumerate(roots):
-                    if max_requests is not None and api_requests >= max_requests:
+                    if over_budget():
                         # Everything not yet visited is unmeasured, not empty.
                         failed_cells.extend(roots[index:])
                         logger.warning(
@@ -1144,6 +1328,22 @@ async def _fetch_city_images(
                         break
                     stack = [root]
                     while stack:
+                        # The guard is checked HERE, and again in the page loop
+                        # below, not only at the root boundary. Checked only
+                        # there it bounded nothing: one root can cascade to the
+                        # radius floor (1 + 4 + 16 + 64 = 85 cells, each up to
+                        # retries + 1 attempts and MAX_PAGES_PER_CELL pages) and
+                        # a page count comes from a SERVER-supplied total, so a
+                        # single root could spend thousands of requests without
+                        # the loop ever asking again. Measured before this fix:
+                        # max_requests=5 issued 500 requests. The scheduler
+                        # hands sibling channels the remaining daily budget in
+                        # exactly this parameter, so the overrun would be spent
+                        # against a per-IP-metered host.
+                        if over_budget():
+                            failed_cells.extend(stack)
+                            budget_stop = True
+                            break
                         cell = stack.pop()
                         cells_visited += 1
                         items, total, outcome = await _probe_cell(
@@ -1176,16 +1376,37 @@ async def _fetch_city_images(
                         frames.append(records_to_census(decode_photo_items(items)))
 
                         pages = pages_for_total(total, ipp)
-                        if pages > MAX_PAGES_PER_CELL and can_subdivide(cell):
+                        if pages > MAX_PAGES_PER_CELL:
                             # Deep paging is untested past page 7; four
                             # shallower circles cost less risk than one long
                             # descent. Page 1 is kept rather than discarded --
                             # it is already paid for, and the children's
                             # overlap is deduped by id anyway.
-                            stack.extend(subdivide(cell))
+                            if can_subdivide(cell):
+                                stack.extend(subdivide(cell))
+                                continue
+                            # At the floor there are no shallower circles to
+                            # fall back to, and the `and can_subdivide(cell)`
+                            # this replaces made the cap a NO-OP there: control
+                            # fell through and paged to a server-supplied total
+                            # with no ceiling at all. A 100 m circle claiming a
+                            # million items paged 500 times at 16/min. A cell
+                            # we cannot exhaust is unmeasured area, which is
+                            # what failed_cells means -- "refuse a hole"
+                            # rather than silently accept a truncated circle.
+                            logger.warning(
+                                f"r={cell.radius_m} m @ {cell.lat:.4f},{cell.lon:.4f} needs "
+                                f"{pages} pages at the radius floor and cannot be split; "
+                                f"recording it as unmeasured"
+                            )
+                            failed_cells.append(cell)
                             continue
 
                         for page in range(2, pages + 1):
+                            if over_budget():
+                                failed_cells.append(cell)
+                                budget_stop = True
+                                break
                             items, _, outcome = await _probe_cell(
                                 session,
                                 limiter,
@@ -1197,19 +1418,42 @@ async def _fetch_city_images(
                                 retries=retries,
                                 timeout=timeout,
                             )
-                            if outcome in ("refused", "broken"):
-                                # A partially paged circle is not exhaustive, so
-                                # the area has to be re-covered rather than
-                                # accepted short. Subdividing re-asks it as four
-                                # smaller circles; at the floor it is recorded
-                                # as unmeasured.
+                            if outcome == "refused":
+                                # Backpressure, and ONLY backpressure, may
+                                # subdivide: a partially paged circle is not
+                                # exhaustive, so the area is re-covered as four
+                                # smaller ones rather than accepted short.
                                 if can_subdivide(cell):
                                     stack.extend(subdivide(cell))
                                 else:
                                     failed_cells.append(cell)
                                 break
+                            if outcome == "broken":
+                                # A transport fault or a definite unusable
+                                # answer is NOT backpressure, so it must not
+                                # fan out -- asking the server for four
+                                # requests where it just failed to serve one is
+                                # #198's shape, not a fix for it. This branch
+                                # used to share the `refused` path and so
+                                # cascaded all the way to the floor: measured,
+                                # a rejected credential on page 2 of one root
+                                # cost 42 requests and a single TCP reset cost
+                                # 105, while the module's own docstrings
+                                # promised "asked exactly once" and "recorded
+                                # as a failed cell".
+                                failed_cells.append(cell)
+                                break
                             raw_photo_count += len(items)
                             frames.append(records_to_census(decode_photo_items(items)))
+                    if budget_stop:
+                        failed_cells.extend(roots[index + 1 :])
+                        logger.warning(
+                            f"Stopped mid-cell after {api_requests} requests (max_requests="
+                            f"{max_requests}); {len(roots) - index - 1} of {len(roots)} root "
+                            f"cells never visited"
+                        )
+                        progress_bar.update(1)
+                        break
                     progress_bar.update(1)
             finally:
                 progress_bar.close()
@@ -1219,13 +1463,25 @@ async def _fetch_city_images(
         # first refusal already said (#205). Serial fetching makes that exact:
         # the spend is the requests issued up to and including the refusal.
         raise spent(e) from None
-    except DownloadError:
-        raise
+    except DownloadError as e:
+        # Every exit carries the spend, including one raised deeper (a rejected
+        # credential surfaced by calibrate_radius). Without it the caller writes
+        # no api_usage row for requests that were genuinely issued.
+        raise spent(e) from None
     except (TimeoutError, aiohttp.ClientError) as e:
         raise spent(DownloadError(f"KartaView sweep failed: {redact_credentials(e)}")) from e
 
     if failed_cells:
-        unmeasured = sum(c.size_m**2 for c in failed_cells) / max(_bbox_area_m2(bbox), 1.0)
+        # Clamped at 1.0 for the message only. The lattice deliberately
+        # over-covers -- ceil() in both axes, and each cell is a square the bbox
+        # edge cuts through -- so summed cell area exceeds bbox area, and a
+        # small city whose every cell failed reported "161% unmeasured". The
+        # over-count is in the safe direction (it can only refuse too eagerly,
+        # never too late), so the guard keeps the raw ratio and only the printed
+        # figure is capped.
+        unmeasured = min(
+            1.0, sum(c.size_m**2 for c in failed_cells) / max(_bbox_area_m2(bbox), 1.0)
+        )
         detail = (
             f"{len(failed_cells)} cell(s) never answered, leaving {unmeasured:.1%} of "
             f"{city_name}'s bbox unmeasured"

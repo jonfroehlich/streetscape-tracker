@@ -41,6 +41,7 @@ from streetscape_metadata_tracker.download_common import (
     HostBusyError,
     host_exit_code,
 )
+from streetscape_metadata_tracker.download_mapillary import grid_bbox
 
 # A compact bbox: (min_lon, min_lat, max_lon, max_lat), ~2 km on a side.
 BBOX = (-122.35, 47.60, -122.325, 47.618)
@@ -752,7 +753,62 @@ def test_a_city_that_answers_no_radius_is_refused_not_recorded_as_empty(monkeypa
     )
     assert not isinstance(error, HostBlockedError)
     assert "empty city" in str(error)
-    assert len(calls) == len(kv.RADIUS_LADDER_M) * 2
+    # One probe per rung, not two: a rung needs EVERY probe, so once the first
+    # fails the rung is already lost and the rest are pure waste.
+    assert len(calls) == len(kv.RADIUS_LADDER_M)
+    assert error.api_requests == len(calls)
+
+
+def test_calibration_cost_is_bounded_at_the_production_retry_budget(monkeypatch):
+    """
+    The docstrings and CLAUDE.md all said "at most 12" -- rungs x probes, which
+    assumes a probe costs one request. A REFUSED probe costs retries + 1, and
+    measured at the shipped defaults a city where nothing answers spent 48.
+    The bound is rungs * (probes + retries); this pins it at the real defaults
+    rather than at the retries=0 the other tests use, which is what hid it.
+    """
+    error, calls = _failed_sweep(
+        monkeypatch,
+        lambda call: (_ for _ in ()).throw(kv.BackpressureError("apiCode 690")),
+        radius_m=None,
+        calibration_probes=kv.DEFAULT_CALIBRATION_PROBES,
+        retries=kv.DEFAULT_BACKPRESSURE_RETRIES,
+    )
+    bound = len(kv.RADIUS_LADDER_M) * (
+        kv.DEFAULT_CALIBRATION_PROBES + kv.DEFAULT_BACKPRESSURE_RETRIES
+    )
+    assert len(calls) <= bound
+    assert error.api_requests == len(calls)
+
+
+def test_calibration_refuses_to_run_with_no_probes():
+    """
+    0 is the natural spelling of "don't calibrate" and it failed OPEN:
+    `answered == len(points)` is 0 == 0, so r=1000 was accepted having asked
+    nothing -- and four of the study's fourteen cities could not hold r=1000.
+    """
+    with pytest.raises(ValueError, match="at least one probe"):
+        kv.calibration_points(BBOX, 0)
+
+
+def test_a_credential_rejected_at_every_probe_says_so_rather_than_blaming_the_city(monkeypatch):
+    """
+    Every rung failing has two very different causes and they send the operator
+    to different places: no answerable radius is a property of the LOCATION
+    (Horace ND), a 401 is a property of the TOKEN. Folding the second into the
+    first printed "answered no radius at any calibration point ... refusing to
+    treat a refusal as an empty city" for a bad key.
+    """
+    error, calls = _failed_sweep(
+        monkeypatch,
+        lambda call: (_ for _ in ()).throw(kv.ResponseError("HTTP 401")),
+        radius_m=None,
+        calibration_probes=2,
+    )
+    assert isinstance(error, kv.ResponseError)
+    assert not isinstance(error, HostBlockedError)  # the token, not the host
+    assert "credential" in str(error)
+    assert "empty city" not in str(error)
     assert error.api_requests == len(calls)
 
 
@@ -893,3 +949,292 @@ def test_the_kartaview_exit_codes_are_distinct_from_every_other_meaning():
     assert not set(HOST_EXIT_CODES.values()) & set(HOST_BUSY_EXIT_CODES.values())
     # 0/1 are success and generic failure; 2 is argparse; 64 is EX_USAGE.
     assert not {blocked, busy} & {0, 1, 2, 64}
+
+
+# ── The antimeridian, and the guard that could not see it ──────────────────
+
+
+# Taveuni, Fiji at 179.97 E: an ordinary 40 x 40 km grid straddles 180 deg, so
+# geopy hands back min_lon 179.78 and max_lon -179.84.
+FIJI_BBOX = grid_bbox(-16.85, 179.97, 40000, 40000, 20)
+
+
+def test_a_bbox_crossing_the_antimeridian_is_tiled_in_full():
+    """
+    `max_lon - min_lon` is NEGATIVE on a wrapped bbox, so ceil went negative and
+    max(1, ...) collapsed the city to a single column. Measured before the fix:
+    29 cells where Taveuni needs 841 -- 3.4% of the city, returned as a clean
+    success. download_mapillary.tiles_for_bbox already carries this fix and
+    names Suva; cells_for_bbox reintroduced the naive form.
+    """
+    assert FIJI_BBOX[0] > FIJI_BBOX[2], "fixture must actually wrap"
+    cells = kv.cells_for_bbox(*FIJI_BBOX, 1000 * math.sqrt(2))
+    unwrapped = kv.cells_for_bbox(-0.218, -17.031, 0.158, -16.669, 1000 * math.sqrt(2))
+    # Same extent, just shifted across the seam: the counts must match.
+    assert len(cells) == len(unwrapped)
+    assert len(cells) > 800
+    assert all(-180.0 <= c.lon <= 180.0 for c in cells), "centres must stay normalized"
+
+
+def test_the_wrapped_bbox_area_is_the_city_not_the_planet():
+    """
+    The mirror-image half of the same bug, and the reason it failed SILENTLY:
+    abs() turned the -359.6 deg span into ~1.5 million km2, so every cell in
+    Taveuni could fail and still compute as 0.004% unmeasured -- three orders
+    of magnitude under MAX_FAILED_AREA_FRACTION. The sweep could not refuse.
+    """
+    area_km2 = kv._bbox_area_m2(FIJI_BBOX) / 1e6
+    assert 1_000 < area_km2 < 3_000
+    cells = kv.cells_for_bbox(*FIJI_BBOX, 1000 * math.sqrt(2))
+    every_cell_failed = sum(c.size_m**2 for c in cells) / kv._bbox_area_m2(FIJI_BBOX)
+    assert every_cell_failed > kv.MAX_FAILED_AREA_FRACTION
+
+
+def test_the_estimate_agrees_with_the_plan_across_the_seam():
+    """estimate_sweep_requests gates the channel's budget and timeout, so it
+    must not be the one place the wrap survives."""
+    assert kv.estimate_sweep_requests(-16.85, 179.97, 40000, 40000, 20) == len(
+        kv.cells_for_bbox(*FIJI_BBOX, kv.DEFAULT_START_RADIUS_M * math.sqrt(2))
+    )
+
+
+# ── What each HTTP failure means, revisited ────────────────────────────────
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_a_rejected_credential_serving_html_is_still_only_the_credential(status):
+    """
+    THE realistic shape: kartaview.org is a JS single-page app on this very
+    host, so a rejected or expired token comes back as an HTML login page. The
+    content-type test used to run first and typed that as a host refusal, which
+    trips #208's night-level breaker -- every remaining KartaView city skipped,
+    no failure recorded, and an alert sending the operator after a ban that
+    never happened. The pre-existing test passed only because its fixture
+    served JSON.
+    """
+    error = _post_error(
+        _FakeResponse(
+            status=status,
+            headers={"Content-Type": "text/html; charset=utf-8"},
+            text="<html><body>Sign in to KartaView</body></html>",
+        )
+    )
+    assert isinstance(error, kv.ResponseError)
+    assert not isinstance(error, HostBlockedError)
+    assert "KARTAVIEW_ACCESS_TOKEN" in str(error)
+
+
+@pytest.mark.parametrize("status", [500, 502, 503, 504])
+def test_a_server_error_page_is_transient_not_a_host_refusal(status):
+    """
+    An overloaded upstream answers with its load balancer's HTML error page
+    essentially always, so the content-type test called an ordinary 502 a host
+    refusal. Typed as transport it takes _probe_cell's retry budget instead,
+    and if it persists the cell is recorded unmeasured -- never subdivided,
+    since a struggling server must not be asked for four requests where it just
+    failed to serve one (#198).
+    """
+    error = _post_error(
+        _FakeResponse(
+            status=status,
+            headers={"Content-Type": "text/html"},
+            text="<html>502 Bad Gateway</html>",
+        )
+    )
+    assert isinstance(error, kv.TransportError)
+    assert not isinstance(error, HostBlockedError)
+
+
+def test_an_html_page_on_a_200_is_still_a_host_refusal():
+    """The #199 shape survives the reordering above."""
+    error = _post_error(
+        _FakeResponse(status=200, headers={"Content-Type": "text/html"}, text="<html>nope</html>")
+    )
+    assert isinstance(error, HostBlockedError)
+
+
+@pytest.mark.parametrize("body", ["[]", '"nope"', "null", "3"])
+def test_a_json_body_that_is_not_an_object_is_a_response_error(body):
+    """`body.get(...)` on a list raises AttributeError, which is neither a
+    DownloadError nor a transport error -- so it escaped the sweep WITHOUT the
+    api_requests the caller needs to write its ledger row."""
+    error = _post_error(_FakeResponse(text=body))
+    assert isinstance(error, kv.ResponseError)
+
+
+# ── Pacing, the ledger, and what actually reaches the wire ─────────────────
+
+
+class _SpyLimiter:
+    """Records acquisitions so the pacing can be observed rather than assumed."""
+
+    def __init__(self, rate):
+        self.rate = rate
+        self.acquires = 0
+
+    async def acquire(self):
+        self.acquires += 1
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        _FakeResponse(body={"currentPageItems": [], "totalFilteredItems": 0}),
+        _FakeResponse(status=400, body={"status": {"apiCode": 690, "apiMessage": "too heavy"}}),
+        _FakeResponse(status=401, body={"status": {"apiCode": 401}}),
+    ],
+    ids=["ok", "backpressure", "rejected-credential"],
+)
+def test_every_request_takes_a_token_and_a_ledger_increment_whatever_it_returns(response):
+    """
+    #198/#203's invariant: one token, one ledger increment, one HTTP request --
+    and both must happen BEFORE the status is known, or a refused request is
+    unpaced and unbilled. Deleting `limiter.acquire()` outright used to leave
+    the whole suite green, which for a host that meters per IP and publishes no
+    rate-limit headers is the one thing that must not be unobserved.
+    """
+    limiter = _SpyLimiter(16)
+    session = _FakeSession(response)
+    counted = []
+    try:
+        asyncio.run(
+            kv._post_nearby(
+                session, limiter, lambda: counted.append(1), 47.6, -122.33, 400, access_token="tok"
+            )
+        )
+    except DownloadError:
+        pass
+    assert limiter.acquires == 1
+    assert counted == [1]
+    assert len(session.calls) == 1
+
+
+def test_the_sweep_builds_its_limiter_at_the_configured_rate(monkeypatch):
+    built = []
+
+    class _Recording(_SpyLimiter):
+        def __init__(self, rate):
+            super().__init__(rate)
+            built.append(rate)
+
+    monkeypatch.setattr(kv, "AsyncRateLimiter", _Recording)
+    _install(monkeypatch, _empty)
+    asyncio.run(
+        kv.fetch_city_images_async(
+            "Testville", BBOX, "tok", radius_m=1000, retries=0, max_requests_per_minute=7
+        )
+    )
+    assert built == [7]
+
+
+def test_the_default_pace_stays_under_the_documented_hourly_ceiling():
+    """
+    KartaView returns no X-RateLimit-* or Retry-After headers at all, so a
+    client cannot observe its own budget and this is the only check there is.
+    Raising the constant to 20/min (1,200/h) broke nothing before this test.
+    """
+    assert kv.DEFAULT_SWEEP_REQUESTS_PER_MINUTE * 60 <= kv.REQUESTS_PER_HOUR_AUTH
+
+
+def test_the_request_carries_the_token_and_the_full_page_size():
+    """
+    load_config makes the token mandatory on the ground that the anonymous tier
+    "is not a slower channel, it is no channel" -- so the sweep had better
+    actually send it. And ipp is what the 2000-vs-200 finding turned on: at 200
+    the same city costs 10x the requests.
+    """
+    (_, _), session, _ = _post(
+        _FakeResponse(body={"currentPageItems": [], "totalFilteredItems": 0}),
+        access_token="secret-token",
+    )
+    assert session.calls[0]["params"] == {"access_token": "secret-token"}
+    assert session.calls[0]["data"]["ipp"] == kv.IPP_MAX == 2000
+
+
+# ── The runaway guard, which did not guard ─────────────────────────────────
+
+
+def test_the_budget_bounds_a_cascade_not_just_the_root_boundary(monkeypatch):
+    """
+    Checked only between root cells, max_requests bounded nothing: one root can
+    cascade to the radius floor (1 + 4 + 16 + 64 cells, each with retries and
+    pages) without the loop ever asking again. Measured before this fix:
+    max_requests=5 issued 500 requests.
+    """
+    error, calls = _failed_sweep(
+        monkeypatch,
+        lambda call: (_ for _ in ()).throw(kv.BackpressureError("apiCode 690")),
+        radius_m=1000,
+        max_requests=3,
+        retries=0,
+    )
+    assert len(calls) <= 4, f"budget of 3 spent {len(calls)} requests"
+    assert error.api_requests == len(calls)
+    assert "unmeasured" in str(error)
+
+
+def test_a_cell_needing_more_pages_than_the_cap_is_unmeasured_not_unbounded(monkeypatch):
+    """
+    `pages > MAX_PAGES_PER_CELL and can_subdivide(cell)` made the cap a no-op
+    at the radius floor: control fell through and paged to a SERVER-supplied
+    total with no ceiling. A 100 m circle claiming a million items paged 500
+    times at 16/min. A circle we cannot exhaust is unmeasured area.
+    """
+    error, calls = _failed_sweep(
+        monkeypatch,
+        lambda call: ([], 1_000_000),
+        radius_m=kv.RADIUS_FLOOR_M,
+        retries=0,
+    )
+    # One page-1 per root cell and nothing more: no paging past the cap, and no
+    # subdivision either, since there is nothing below the floor to split into.
+    assert all(call.page == 1 for call in calls)
+    assert len(calls) == len(kv.cells_for_bbox(*BBOX, kv.RADIUS_FLOOR_M * math.sqrt(2)))
+    assert "unmeasured" in str(error)
+
+
+def test_a_page_two_transport_fault_does_not_fan_out_into_four_circles(monkeypatch):
+    """
+    The deep-paging branch subdivided on `refused` OR `broken`, so a transport
+    fault -- and a rejected credential -- fanned one request into four and
+    cascaded to the floor. Measured: 42 requests for a 401 and 105 for a single
+    TCP reset, against docstrings promising "asked exactly once" and "recorded
+    as a failed cell". Only backpressure may subdivide.
+    """
+
+    def responder(call):
+        if call.page == 1:
+            return [], 4000  # exactly two pages
+        raise kv.TransportError("connection reset")
+
+    error, calls = _failed_sweep(monkeypatch, responder, radius_m=500, retries=0)
+    assert {call.radius_m for call in calls} == {500}, "no subdivision may have happened"
+    assert len(calls) == 2 * len(kv.cells_for_bbox(*BBOX, 500 * math.sqrt(2)))
+    assert "unmeasured" in str(error)
+
+
+def test_a_page_two_backpressure_refusal_still_subdivides(monkeypatch):
+    """The other half of the same branch: backpressure means "ask for less",
+    and a partially paged circle is not exhaustive, so its area is re-covered
+    as four smaller ones."""
+
+    def responder(call):
+        if call.page == 1:
+            return [], 4000
+        raise kv.BackpressureError("apiCode 690")
+
+    _failed_sweep(monkeypatch, responder, radius_m=500, retries=0)
+    # The point is only that children WERE asked; the sweep still refuses.
+
+
+def test_a_page_size_above_the_server_cap_does_not_silently_truncate(monkeypatch):
+    """
+    _post_nearby sent min(ipp, IPP_MAX) while pages_for_total priced the
+    caller's value, so ipp=8000 asked for one page of a circle holding 8,000
+    photos, got 2,000, and recorded no failed cell and no warning: 6,000 photos
+    absent from a snapshot that published as complete.
+    """
+    result, calls = _sweep(monkeypatch, lambda call: ([], 8000), radius_m=1000, ipp=8000)
+    pages = {call.page for call in calls}
+    assert pages == {1, 2, 3, 4}, f"expected 8000/2000 = 4 pages, saw {sorted(pages)}"
+    assert result["failed_cells"] == []
