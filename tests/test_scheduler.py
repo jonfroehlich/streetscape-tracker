@@ -3401,6 +3401,25 @@ def test_backup_check_unit_matches_the_collection_unit(tmp_path):
     assert "[Install]" in timer and "OnCalendar=" in timer
 
 
+def _assert_unit_quotes(unit, rendered, constant):
+    """Pin the two copies of a measurement to each other.
+
+    The figures the resource directives are sized from live twice by design: as
+    a constant here, which is what the test ENFORCES, and in the unit file's
+    rationale block, which is what the next person re-sizing a directive
+    actually READS. Nothing else stops those drifting, and the drift is silent
+    and bad in a specific way — the cap ends up justified by one number and
+    enforced against another, so an operator argues from a figure no test holds
+    anyone to. Cheap to assert, so assert it.
+    """
+    assert rendered in unit, (
+        f"{constant} renders as {rendered!r}, which no longer appears in "
+        f"deploy/systemd/streetscape-tracker.service. Update BOTH copies — the "
+        f"constant is what this suite enforces, the unit's prose is what the "
+        f"next operator reads before changing the directive."
+    )
+
+
 # Worst aggregate + streetwalk-manifest rebuild measured on prod: 7m15s on the
 # 19-city night of 2026-08-18 (a small night is ~1.6 s). A named constant rather
 # than a literal because it is a MEASUREMENT — the unit file quotes the same
@@ -3431,6 +3450,11 @@ def test_stop_timeout_covers_the_publish_tail_it_waits_for():
     m = re.search(r"^TimeoutStopSec=(\d+)(s|min|h)?\s*$", unit, re.M)
     assert m, "the unit must set TimeoutStopSec explicitly; systemd's default is 90 s (#206)"
     stop_s = int(m.group(1)) * {None: 1, "s": 1, "min": 60, "h": 3600}[m.group(2)]
+    _assert_unit_quotes(
+        unit,
+        f"{_MEASURED_TAIL_AGGREGATE_S // 60}m{_MEASURED_TAIL_AGGREGATE_S % 60:02d}s",
+        "_MEASURED_TAIL_AGGREGATE_S",
+    )
 
     # The floor is the SUM of the tail's two large known terms, not the larger of
     # them. Asserting only `> BACKUP_TIMEOUT_S` accepted 11min — which the very
@@ -3489,6 +3513,9 @@ def test_memory_high_is_a_throttle_below_the_hard_limit_and_clears_the_worst_cit
     """
     unit = Path(_PROJECT_ROOT, "deploy", "systemd", "streetscape-tracker.service").read_text()
     floor = _EXTRAPOLATED_LARGEST_CITY_PEAK_GIB * 2**30
+    _assert_unit_quotes(
+        unit, f"{_EXTRAPOLATED_LARGEST_CITY_PEAK_GIB} GiB", "_EXTRAPOLATED_LARGEST_CITY_PEAK_GIB"
+    )
 
     def _raw(directive):
         m = re.search(rf"^{directive}=(\S+)\s*$", unit, re.M)
