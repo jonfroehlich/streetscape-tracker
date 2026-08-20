@@ -3471,34 +3471,68 @@ def test_memory_high_is_a_throttle_below_the_hard_limit_and_clears_the_worst_cit
     nothing (measured 2026-08-18, issue #157). MemoryMax is a hard limit, whose
     breach is a fast OOM kill an operator can actually read.
 
-    So two independent properties, neither of which systemd will complain about:
-    a MemoryHigh at or above MemoryMax is INERT — the soft brake never engages
-    and every overrun becomes the hard kill — and a MemoryHigh below the largest
-    city's peak reproduces the 2026-08-18 hang on exactly the nights that matter
-    most. Asserted against the directive lines, not the prose around them.
+    So the hard limit must clear the largest city's peak no matter what, and IF
+    a soft brake is configured it has to sit in the band where it is useful:
+    strictly below MemoryMax (at or above it the brake is INERT — it never
+    engages and every overrun becomes the hard kill) and above the largest
+    city's peak (below it, the biggest nights throttle into the 180-min city
+    timeout — the 2026-08-18 failure).
+
+    "IF" is load-bearing: the unit file offers "no MemoryHigh at all" as a valid
+    answer to a big-city hang, so this must not be the test that forbids the fix
+    its own subject recommends. Absent — and systemd's `infinity` spelling of
+    the same thing — is accepted, and the MemoryMax floor below is then the only
+    thing standing between a big city and an OOM kill, which is why that
+    assertion is unconditional rather than part of the MemoryHigh branch.
+
+    Asserted against the directive lines, not the prose around them.
     """
     unit = Path(_PROJECT_ROOT, "deploy", "systemd", "streetscape-tracker.service").read_text()
+    floor = _EXTRAPOLATED_LARGEST_CITY_PEAK_GIB * 2**30
 
-    def _bytes(directive):
-        m = re.search(rf"^{directive}=(\d+)([KMGT]?)\s*$", unit, re.M)
-        assert m, f"the unit must set {directive} explicitly"
+    def _raw(directive):
+        m = re.search(rf"^{directive}=(\S+)\s*$", unit, re.M)
+        return m.group(1) if m else None
+
+    def _bytes(directive, value):
+        m = re.fullmatch(r"(\d+)([KMGT]?)", value)
+        assert m, (
+            f"{directive}={value} is not a plain byte size; this test compares "
+            f"the two caps numerically and cannot interpret that spelling"
+        )
         return int(m.group(1)) * {"": 1, "K": 2**10, "M": 2**20, "G": 2**30, "T": 2**40}[m.group(2)]
 
-    high, hard = _bytes("MemoryHigh"), _bytes("MemoryMax")
+    hard_raw = _raw("MemoryMax")
+    assert hard_raw and hard_raw != "infinity", (
+        "the unit must set MemoryMax to a real ceiling: it is the only cap whose "
+        "breach is a fast, legible OOM kill rather than silent reclaim"
+    )
+    hard = _bytes("MemoryMax", hard_raw)
+    assert hard > floor, (
+        f"MemoryMax={hard / 2**30:.1f}G is under the largest city's "
+        f"~{_EXTRAPOLATED_LARGEST_CITY_PEAK_GIB}GiB extrapolated peak, so the "
+        f"biggest nights are OOM-killed outright (issue #157)."
+    )
+
+    high_raw = _raw("MemoryHigh")
+    if high_raw is None or high_raw == "infinity":
+        return  # No soft brake by choice — see the docstring.
+    high = _bytes("MemoryHigh", high_raw)
 
     assert high < hard, (
-        f"MemoryHigh={high} is not below MemoryMax={hard}: the soft brake can "
-        f"never engage, so every overrun skips the throttle and becomes an OOM "
-        f"kill. If that is genuinely wanted, drop MemoryHigh rather than raising "
-        f"it to meet MemoryMax, so the intent is visible in the unit."
+        f"MemoryHigh={high / 2**30:.1f}G is not below MemoryMax={hard / 2**30:.1f}G: "
+        f"the soft brake can never engage, so every overrun skips the throttle and "
+        f"becomes an OOM kill. If that is genuinely wanted, DROP MemoryHigh (or set "
+        f"it to `infinity`) rather than raising it to meet MemoryMax, so the intent "
+        f"is visible in the unit."
     )
-    floor = _EXTRAPOLATED_LARGEST_CITY_PEAK_GIB * 2**30
     assert high > floor, (
         f"MemoryHigh={high / 2**30:.1f}G is under the largest city's "
         f"~{_EXTRAPOLATED_LARGEST_CITY_PEAK_GIB}GiB extrapolated peak, so the "
         f"biggest nights throttle into the 180-min city timeout instead of "
         f"finishing — the 2026-08-18 failure, which is what raising this cap "
-        f"exists to prevent (issues #157/#206)."
+        f"exists to prevent (issues #157/#206). If a real measurement lands above "
+        f"MemoryMax={hard / 2**30:.1f}G, both caps have to move, not just this one."
     )
 
 
