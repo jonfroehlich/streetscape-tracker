@@ -15,10 +15,31 @@ concurrency:
 permissions:
   contents: read
 
+# Every job below sets timeout-minutes. GitHub's default is 6 HOURS, and on
+# 2026-08-19 a PR's e2e job sat in "Install Chromium" for 5 h before it was
+# cancelled by hand — a hang that reported as "still running", not as a
+# failure, so the signal it produced was indistinguishable from a slow queue.
+#
+# What a cap buys is TIME-TO-SIGNAL, not an unblocked merge. e2e is
+# continue-on-error, so that hang never blocked anything mechanically; it
+# blocked a person, who waits on all of these before merging. The cap turns a
+# 6-hour worst case into a bounded one.
+#
+# The caps are sized from measured durations, with wide headroom. Warm-cache
+# run 32378798829 (2026-08-20): lint 14 s, frontend 12 s, tests 2m07s-2m35s
+# across the four legs, e2e 1m27s. The run id is here so the next re-sizing can
+# re-check the numbers instead of trusting them; durations drift, and a figure
+# with no run behind it is how the e2e cap below first got argued from a wrong
+# one. These exist to convert a hang into a legible failure in minutes, NOT to
+# police normal variance, so a cap that fires on a healthy run is too low by
+# definition and should be raised rather than debugged. Note the clock starts
+# when a job starts, not when it is queued, so these bound execution only —
+# which is the right shape here, since the incident was a hung step.
 jobs:
   lint:
     name: Lint (ruff)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -36,6 +57,8 @@ jobs:
   test:
     name: Tests (py${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    # Per matrix leg, not for the matrix as a whole.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -57,6 +80,7 @@ jobs:
   frontend:
     name: Frontend (ESLint + unit tests)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     defaults:
       run:
         working-directory: www
@@ -81,6 +105,32 @@ jobs:
     # block merges; it drives real Chromium over the committed fixture and is
     # advisory. The fast pytest/frontend jobs never depend on it.
     continue-on-error: true
+    # The loosest cap in this file, and deliberately so: this is the job that
+    # hung, but it is also the only one that downloads ~550 MB of browser on a
+    # cache miss. The number therefore has to clear a COLD cache, not the warm
+    # 1m27s. The re-run of that same hung job spent 11m02s in "Install Chromium"
+    # and then passed (run 32273955535 attempt 2, 2026-08-19; attempt 1 is the
+    # incident — the same step, 5h22m, cancelled by hand).
+    #
+    # Note what that one sample does NOT establish: 15 would have cleared it by
+    # four minutes. The case for 30 is that the sample bounds nothing — the
+    # download's duration is set by a CDN we don't control, and the 5-hour hang
+    # is that same step failing to make progress at all, so the spread between a
+    # slow download and a stuck one is the whole question. 30 buys ~2.7x over the
+    # worst legitimate run observed while still turning a 5-hour hang into a
+    # failure inside half an hour.
+    #
+    # Hitting it SHOULD cost only a red advisory check rather than a merge,
+    # since this job is continue-on-error — but treat that as unverified. GitHub
+    # documents continue-on-error as absorbing a job that FAILS, and
+    # timeout-minutes as CANCELLING the job, and a cancel is demonstrably not
+    # absorbed: in run 32273955535 attempt 1 the e2e job was cancelled by hand,
+    # the other six jobs went green, and the whole run concluded `cancelled`. So
+    # this cap firing may well read at run level exactly like the incident did.
+    # Nothing is gated on it either way — main carries no branch protection — so
+    # the cost of being wrong is a run-level red mark, not a blocked merge, and
+    # that is what makes buying the headroom cheap here and nowhere else.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
