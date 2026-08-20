@@ -3453,6 +3453,55 @@ def test_stop_timeout_covers_the_publish_tail_it_waits_for():
     )
 
 
+# Extrapolated peak RSS of the largest city we track, in GiB: the per-run JSON
+# tail measured 4.81 GiB on Ho Chi Minh City's 5.26M-row census (2026-08-18),
+# i.e. ~0.914 GiB per million rows, and Detroit is ~16.7M rows. A named constant
+# for the same reason _MEASURED_TAIL_AGGREGATE_S is one — the unit file quotes
+# this figure, and the next re-sizing has to argue from it. NOTE it is an
+# EXTRAPOLATION from one city's slope, not a measurement; replace it with a real
+# MemoryPeak the first night a big city runs to completion.
+_EXTRAPOLATED_LARGEST_CITY_PEAK_GIB = 15.3
+
+
+def test_memory_high_is_a_throttle_below_the_hard_limit_and_clears_the_worst_city():
+    """
+    The two memory caps do different jobs and only mean something together.
+    MemoryHigh is a THROTTLE: crossing it costs hours of silent reclaim that end
+    in the scheduler's 180-min city timeout SIGKILLing a child that printed
+    nothing (measured 2026-08-18, issue #157). MemoryMax is a hard limit, whose
+    breach is a fast OOM kill an operator can actually read.
+
+    So two independent properties, neither of which systemd will complain about:
+    a MemoryHigh at or above MemoryMax is INERT — the soft brake never engages
+    and every overrun becomes the hard kill — and a MemoryHigh below the largest
+    city's peak reproduces the 2026-08-18 hang on exactly the nights that matter
+    most. Asserted against the directive lines, not the prose around them.
+    """
+    unit = Path(_PROJECT_ROOT, "deploy", "systemd", "streetscape-tracker.service").read_text()
+
+    def _bytes(directive):
+        m = re.search(rf"^{directive}=(\d+)([KMGT]?)\s*$", unit, re.M)
+        assert m, f"the unit must set {directive} explicitly"
+        return int(m.group(1)) * {"": 1, "K": 2**10, "M": 2**20, "G": 2**30, "T": 2**40}[m.group(2)]
+
+    high, hard = _bytes("MemoryHigh"), _bytes("MemoryMax")
+
+    assert high < hard, (
+        f"MemoryHigh={high} is not below MemoryMax={hard}: the soft brake can "
+        f"never engage, so every overrun skips the throttle and becomes an OOM "
+        f"kill. If that is genuinely wanted, drop MemoryHigh rather than raising "
+        f"it to meet MemoryMax, so the intent is visible in the unit."
+    )
+    floor = _EXTRAPOLATED_LARGEST_CITY_PEAK_GIB * 2**30
+    assert high > floor, (
+        f"MemoryHigh={high / 2**30:.1f}G is under the largest city's "
+        f"~{_EXTRAPOLATED_LARGEST_CITY_PEAK_GIB}GiB extrapolated peak, so the "
+        f"biggest nights throttle into the 180-min city timeout instead of "
+        f"finishing — the 2026-08-18 failure, which is what raising this cap "
+        f"exists to prevent (issues #157/#206)."
+    )
+
+
 def test_restore_backup_subcommand_restores_and_then_refuses(conn, monkeypatch, tmp_path, capsys):
     """The incident-time handle. It must work, and it must refuse the second
     time — restoring onto a catalog that is already there would destroy the

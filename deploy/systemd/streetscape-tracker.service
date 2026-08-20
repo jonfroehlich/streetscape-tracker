@@ -135,24 +135,36 @@ ReadWritePaths=/cse/web/research/makelab/public/streetscape-tracker
 # mark, still above 4G, which is why it looked like a separate "aggregate-tail
 # hang"). That night's cgroup read MemoryPeak=4297121792 — about 2 MiB above the
 # 4G threshold, i.e. held right at it, which is what a throttled cgroup looks
-# like, not a comfortable one. 12G gives the measured tail ~2.5x headroom on top
-# of the concurrently-live census structures; 24G is the hard stop.
+# like, not a comfortable one. An interim 12G gave that measured tail ~2.5x
+# headroom on top of the concurrently-live census structures.
 #
-# KNOWN REMAINING GAP: 12G does not cover the largest cities. Peak scales at
-# ~0.914 GiB per million CSV rows (5.26M -> 4.81 GiB measured), so Detroit's
-# ~16.7M rows extrapolate to ~15.3 GiB — over MemoryHigh, under MemoryMax.
-# That matters because of WHICH cap it crosses: MemoryHigh is a throttle, not a
-# limit, so exceeding it reproduces exactly the failure diagnosed above — hours
-# of silent reclaim ending in the scheduler's 180-min city timeout — rather than
-# a fast, legible OOM kill at MemoryMax. If a big-city night hangs again with no
-# output, check MemoryPeak against 12G FIRST; the fix is a bigger MemoryHigh (or
-# no MemoryHigh at all), not a longer city timeout.
+# 12G still did not cover the largest cities, and MemoryHigh is the cap where
+# that is expensive rather than legible. Peak scales at ~0.914 GiB per million
+# CSV rows (5.26M -> 4.81 GiB measured), so Detroit's ~16.7M rows extrapolate to
+# ~15.3 GiB: over 12G, under MemoryMax. Crossing MemoryHigh reproduces exactly
+# the failure diagnosed above — hours of silent reclaim ending in the
+# scheduler's 180-min city timeout — while crossing MemoryMax is a fast OOM kill
+# you can read in a log. So MemoryHigh is 20G: the extrapolated worst city plus
+# ~30%, with a deliberately narrow 20->24 gap so a genuine runaway still reaches
+# the hard stop quickly instead of reclaiming for hours on the way there.
+#
+# Two things to keep straight about that number. It RAISES NO CEILING — the
+# limit is MemoryMax and it is unchanged; MemoryHigh only moves where we start
+# throttling ourselves, which is the one burden on this host that has actually
+# been measured (its load is ZFS; CPU sits 97-99% idle). And 15.3 GiB is an
+# EXTRAPOLATION from one city's slope, not a measurement: capture MemoryPeak on
+# a real Detroit night before treating it as settled. For scale, makelab2 has
+# 188 GiB and 48 cores (checked 2026-08-20), so 20G/24G is ~11%/~13% of the box.
+#
+# If a big-city night hangs again with no output, check MemoryPeak against
+# MemoryHigh FIRST; the fix is a bigger MemoryHigh (or no MemoryHigh at all),
+# not a longer city timeout.
 #
 # Re-validate after a live night and tune:
 #   systemctl --user show streetscape-tracker.service -p MemoryPeak -p CPUUsageNSec
 Nice=10
 MemoryAccounting=true
-MemoryHigh=12G
+MemoryHigh=20G
 MemoryMax=24G
 CPUAccounting=true
 # Hard ceiling: never use more than 4 of the host's cores.
