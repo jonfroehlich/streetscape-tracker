@@ -95,7 +95,7 @@ jobs:
     # advisory. The fast pytest/frontend jobs never depend on it.
     continue-on-error: true
     # The loosest cap in this file, and deliberately so: this is the job that
-    # hung, but it is also the only one that downloads ~350 MB of browser on a
+    # hung, but it is also the only one that downloads ~550 MB of browser on a
     # cache miss. The re-run of that same hung job spent ~14 min in "Install
     # Chromium" and then PASSED — so the obvious 15 would have killed a healthy
     # run, and the number has to clear a cold cache, not a warm one (1m31s).
