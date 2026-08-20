@@ -333,10 +333,11 @@ const STREET_FILTERS = [
     label: "Provider",
     type: "select",
     anyLabel: "All providers",
-    options: [
-      { value: "gsv", label: "Google Street View" },
-      { value: "mapillary", label: "Mapillary" },
-    ],
+    // One option per REGISTERED provider (issue #225). Rows come from the
+    // streetwalk manifest, which carries whichever providers actually walked
+    // the city, so a hardcoded pair meant a third provider's walks were
+    // listed with no filter able to isolate them.
+    options: Object.entries(PROVIDERS).map(([value, p]) => ({ value, label: p.label })),
     test: (row, value) => row.provider === value,
   },
   {

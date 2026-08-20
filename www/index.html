@@ -37,17 +37,15 @@
        target="_blank" rel="noopener">About &#8599;</a>
   </header>
 
+  <!-- The options inside this group are rendered from the PROVIDERS registry
+       by initProviderToggle() (index.js), not written here (issue #225): a
+       hardcoded pair of radios leaves the group with NOTHING checked the day a
+       third provider is registered, because ?provider= is validated against the
+       registry and would select one no radio carries. The fieldset and its
+       visually-hidden legend — the group's accessible name — stay in markup. -->
   <fieldset id="provider-toggle" class="provider-toggle"
             aria-label="Imagery provider">
     <legend class="visually-hidden">Imagery provider</legend>
-    <label>
-      <input type="radio" name="provider" value="gsv" checked>
-      <span title="Official Google Street View metadata, sampled at each grid point">Google Street View</span>
-    </label>
-    <label>
-      <input type="radio" name="provider" value="mapillary">
-      <span title="Crowdsourced Mapillary imagery: a census of every 360° panorama">Mapillary</span>
-    </label>
   </fieldset>
 
   <fieldset id="metric-toggle" class="provider-toggle metric-toggle"
@@ -63,7 +61,7 @@
     </label>
     <label>
       <input type="radio" name="metric" value="coverage_any">
-      <span title="Mapillary's full footprint including flat imagery; equals Coverage for Google Street View">Any imagery</span>
+      <span title="Each provider's full footprint, including flat/perspective imagery; equals Coverage for a provider that publishes 360° panoramas only, such as Google Street View">Any imagery</span>
     </label>
     <label>
       <input type="radio" name="metric" value="streets">

@@ -9,9 +9,13 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
+// A THIRD provider the page has never heard of: the filter options are
+// derived from this registry, so a hardcoded two-element list fails here
+// rather than the day one is really registered (issue #225).
 global.PROVIDERS = {
   gsv: { label: "Google Street View" },
   mapillary: { label: "Mapillary" },
+  thirdparty: { label: "Third Party" },
 };
 global.DEFAULT_STREET_NETWORK_TYPE = "drive";
 global.STREET_NETWORK_LABELS = { drive: "Roads", all_public: "Roads + paths" };
@@ -41,6 +45,7 @@ const {
   walkChangeCellHtml,
   walkRowHtml,
   STREET_COLUMNS,
+  STREET_FILTERS,
   DEFAULT_SORT,
 } = require("../streets.js");
 
@@ -432,4 +437,19 @@ test("sortRows: changeDelta sorts numerically with first walks (null) last", () 
     sorted.map((r) => r.cityId),
     ["c", "b", "a"]
   );
+});
+
+// --- STREET_FILTERS ---------------------------------------------------------
+
+test("STREET_FILTERS: the Provider filter offers one option per registered provider", () => {
+  // Rows come from the streetwalk manifest, which carries whichever providers
+  // actually walked a city — including one the filter list never enumerated.
+  const provider = STREET_FILTERS.find((f) => f.key === "provider");
+  assert.deepEqual(
+    provider.options,
+    Object.entries(global.PROVIDERS).map(([value, p]) => ({ value, label: p.label }))
+  );
+  assert.ok(provider.options.some((o) => o.value === "thirdparty"));
+  assert.ok(provider.test({ provider: "thirdparty" }, "thirdparty"));
+  assert.ok(!provider.test({ provider: "mapillary" }, "thirdparty"));
 });

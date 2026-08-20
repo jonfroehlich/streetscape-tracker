@@ -11,6 +11,7 @@ process.env.TZ = "America/Los_Angeles";
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const { execFileSync } = require("node:child_process");
+const { readFileSync } = require("node:fs");
 
 const {
   PROVIDERS,
@@ -224,6 +225,50 @@ test("every registered provider declares both capability flags", () => {
     assert.equal(typeof p.hasCopyrightFilter, "boolean", key);
     assert.equal(typeof p.hasFlatImagery, "boolean", key);
   }
+});
+
+/**
+ * Drop comments from JS source so a source-inspection test reads only code.
+ *
+ * Deliberately crude: block comments, and lines that are ENTIRELY a line
+ * comment. A trailing `// …` on a code line survives, which is fine here —
+ * the point is that a comment ABOUT the old branch (there is one, in city.js's
+ * providerHasCopyrightFilter docblock) must not read as the branch itself.
+ *
+ * @param {string} src - JavaScript source.
+ * @returns {string} The same source with comments blanked out.
+ */
+function stripComments(src) {
+  return src
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .split("\n")
+    .filter((line) => !/^\s*\/\//.test(line))
+    .join("\n");
+}
+
+test("city.js asks the registry for the copyright split, not for the provider's name", () => {
+  // A source check because no behavioural one can catch this: city.js has FOUR
+  // branches deciding the same thing (does this provider publish a copyright
+  // field?), and with only gsv and mapillary registered, `=== "gsv"` and
+  // hasCopyrightFilter agree on every input. The fifth site that spells it the
+  // old way would therefore ship green and only misbehave for a provider that
+  // does not exist yet.
+  //
+  // Scoped to city.js on purpose: index.js still compares against "gsv" in
+  // setProvider and at load, but those are the URL-param DEFAULT (?provider=
+  // is omitted for gsv), not a question about what the provider publishes.
+  const src = stripComments(readFileSync(require.resolve("../city.js"), "utf8"));
+  for (const forbidden of [
+    'providerGlobal === "gsv"',
+    'providerGlobal !== "gsv"',
+    'providerGlobal === "mapillary"',
+    'providerGlobal !== "mapillary"',
+  ]) {
+    assert.ok(!src.includes(forbidden), `city.js still branches on ${forbidden}`);
+  }
+  // ...and what it asks instead is a flag the registry actually declares.
+  assert.match(src, /PROVIDERS\[providerGlobal\]\?\.hasCopyrightFilter/);
+  assert.equal(typeof PROVIDERS.gsv.hasCopyrightFilter, "boolean");
 });
 
 test("the unknown-provider date floor is the loosest registered one, not a named provider", () => {

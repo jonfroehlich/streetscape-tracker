@@ -55,14 +55,40 @@ let cityIdGlobal = null; // canonical city_id from the aggregate record (for the
 // GSV imagery display mode. Every run streams BOTH official-Google and
 // contributor (UGC) panos into markers; `showAllGsv` is a pure display
 // switch: false (default) hides the contributor markers, true reveals them.
-// Never set for non-GSV providers (their rows are all provider imagery) or
-// archival GSV runs that recorded no copyright (Google vs UGC unknown).
+// Never set for a provider that publishes no copyright field (its rows are all
+// provider imagery) or for archival GSV runs that recorded no copyright at all
+// (Google vs UGC unknown).
 let showAllGsv = false;
 
-// Flat-only imagery layer (issue #116, Mapillary only). A FLAT_ONLY CSV row
-// marks a grid point covered by flat/perspective imagery but no 360° pano;
-// these render as distinct muted markers, hidden by default (showFlatOnly),
-// so the map can reveal phone-camera coverage that the pano layer omits.
+/**
+ * Does the active provider publish a copyright field — i.e. does its imagery
+ * split into an official-fleet subset and contributor uploads?
+ *
+ * The four places that consult this used to spell it `providerGlobal === "gsv"`,
+ * which is an identity question standing in for a capability one (issue #225):
+ * the copyright split is a property of what a provider publishes, so a third
+ * provider that publishes one would have had its contributor imagery silently
+ * treated as fleet imagery, and one that publishes none would have been asked
+ * for a `© Google` match it can never make. Reading the registry keeps the
+ * answer in one place, beside the flag itself.
+ *
+ * Note this is per PROVIDER. Whether a particular RUN recorded the field is a
+ * separate fact (`copyrightAvailableGlobal`, false for the #93 archival GSV
+ * imports), and both are required wherever the split is used.
+ *
+ * @returns {boolean} True iff the active provider declares hasCopyrightFilter.
+ */
+function providerHasCopyrightFilter() {
+  return PROVIDERS[providerGlobal]?.hasCopyrightFilter === true;
+}
+
+// Flat-only imagery layer (issue #116) — for any provider whose rows can carry
+// a FLAT_ONLY status, not Mapillary alone: the markers are built from the data,
+// and the legend toggle that reveals them is shown whenever there are any. A
+// FLAT_ONLY CSV row marks a grid point covered by flat/perspective imagery but
+// no 360° pano; these render as distinct muted markers, hidden by default
+// (showFlatOnly), so the map can reveal phone-camera coverage that the pano
+// layer omits.
 let flatOnlyMarkers = [];
 let showFlatOnly = false;
 const FLAT_ONLY_COLOR = "#9aa0a6"; // muted gray — visibly not a dated pano
@@ -443,12 +469,18 @@ function updateLegend(years) {
     }
   }
 
-  // ── Section 3: GSV imagery mode toggle ────────────────────
-  // Only for GSV runs that recorded copyright (so Google vs contributor is
-  // known). Both marker sets are already in memory — this flips which are
-  // drawn without any refetch. Other providers' rows are all provider
-  // imagery, so there is nothing to toggle.
-  if (providerGlobal === "gsv" && copyrightAvailableGlobal) {
+  // ── Section 3: imagery mode toggle ───────────────────────
+  // Only for a provider that publishes a copyright field, on a run that
+  // actually recorded it (so fleet vs contributor is known). Both marker sets
+  // are already in memory — this flips which are drawn without any refetch.
+  // A provider with no copyright field has rows that are all provider imagery,
+  // so there is nothing to toggle.
+  //
+  // The button WORDING below is still GSV-specific ("Google only", "All GSV"),
+  // deliberately: that is a change to what the page says rather than to what it
+  // decides, and it waits for a second copyright-filtered provider to exist so
+  // the replacement can be written against a real one rather than guessed.
+  if (providerHasCopyrightFilter() && copyrightAvailableGlobal) {
     // Counts are fixed per run (computed once at finalize), not re-derived from
     // all N markers on every legend rebuild.
     const allCount = allMarkerCount;
@@ -750,12 +782,13 @@ function toggleYear(year) {
  * (overview stats, dated-pano count, year filter, temporal plot) from the
  * matching JSON block and the in-memory markers — no network request. Any
  * active year/date filter is cleared, since its marker set is mode-specific.
- * No-op for non-GSV providers and archival GSV runs (no toggle is shown).
+ * No-op for a provider that publishes no copyright field, and for archival GSV
+ * runs that recorded none (no toggle is shown in either case).
  *
  * @param {boolean} showAll - true = All GSV, false = Google only.
  */
 function setGsvMode(showAll) {
-  if (providerGlobal !== "gsv" || !copyrightAvailableGlobal) return;
+  if (!providerHasCopyrightFilter() || !copyrightAvailableGlobal) return;
   if (showAll === showAllGsv) return;
   showAllGsv = showAll;
 
@@ -1371,8 +1404,8 @@ async function loadData() {
       rawCities = await fetchGzippedJson(STREETSCAPE_DATA_BASE_URL + "cities.json.gz");
       // ?city= queries resolve against the requested provider's view
       // (?provider=mapillary), defaulting to GSV
-      const queryProvider = isKnownProvider(urlParams.get("provider"))
-        ? urlParams.get("provider") : "gsv";
+      const requestedProvider = urlParams.get("provider");
+      const queryProvider = isKnownProvider(requestedProvider) ? requestedProvider : "gsv";
       citiesData = adaptCitiesPayload(rawCities, queryProvider);
     } catch (e) {
       // The ?file= path can still work without the aggregate
@@ -1581,9 +1614,10 @@ async function loadData() {
           : `${ageInYears.toFixed(1)} years`;
 
         // Official-Google iff the copyright matches exactly (see
-        // isGoogleCopyright). Non-GSV/archival rows have no such distinction
-        // and are treated as always-visible.
-        const isGoogle = providerGlobal !== "gsv" || !copyrightAvailableGlobal
+        // isGoogleCopyright). Rows from a provider that publishes no copyright
+        // field — and archival rows that recorded none — have no such
+        // distinction and are treated as always-visible.
+        const isGoogle = !providerHasCopyrightFilter() || !copyrightAvailableGlobal
           || isGoogleCopyright(row.copyright_info);
 
         // Map marker. captureDateStr keeps the CSV's own YYYY-MM-DD string so
@@ -1608,7 +1642,10 @@ async function loadData() {
           }
         }
 
-        const photographer = providerGlobal !== "gsv"
+        // The same capability question as `isGoogle` above: a provider with
+        // no copyright field credits the image to whatever it did publish, or
+        // to the provider itself.
+        const photographer = !providerHasCopyrightFilter()
           ? (row.copyright_info || PROVIDERS[providerGlobal].label)
           : !copyrightAvailableGlobal
             ? (row.copyright_info || "Unknown")

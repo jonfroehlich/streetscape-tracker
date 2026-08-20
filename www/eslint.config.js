@@ -208,6 +208,15 @@ module.exports = [
     rules: browserRules,
   },
   {
+    // index.js carries a Node export shim (`module`) so its pure helpers can
+    // be unit-tested (js/__tests__/index.test.js), like the page scripts
+    // above. Flat config merges this into its entry.
+    files: ["js/index.js"],
+    languageOptions: {
+      globals: { module: "readonly" },
+    },
+  },
+  {
     // Only city.html loads street-coverage.js and diff-overlay.js, so only
     // city.js may consume their globals (flat config merges this into
     // city.js's entry above). The manifest helpers moved to
