@@ -1151,10 +1151,16 @@ def test_publish_passes_local_iff_configured(monkeypatch, tmp_path, publish_loca
     """
     calls = []
 
-    class _Result:
-        returncode = 0
+    class _Proc:
+        pid = 424242
 
-    monkeypatch.setattr(_sched.subprocess, "run", lambda cmd, **kw: calls.append(cmd) or _Result())
+        def __init__(self, cmd, **kw):
+            calls.append(cmd)
+
+        def wait(self, timeout=None):
+            return 0
+
+    monkeypatch.setattr(_sched.subprocess, "Popen", _Proc)
 
     _sched._publish(_cfg(tmp_path, publish_local=publish_local), "ctx")
 

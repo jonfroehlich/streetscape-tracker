@@ -71,11 +71,20 @@ TimeoutStartSec=14h
 #     2026-08-18; ~1.6 s on a small one
 #   - driving-plan summary            — 2-20 s
 #   - catalog backup                  — hard-bounded at BACKUP_TIMEOUT_S (10 min)
-#   - publish rsync (~6,300 files)    — logged as "Published in N.N s" since #206,
-#                                       which is where to look before changing
-#                                       this number
+#   - publish rsync (7,409 published  — hard-bounded at PUBLISH_TIMEOUT_S (10 min)
+#     files, 30.75 GB, measured          since #230; healthy nights measure p50
+#     2026-08-20)                        12.1 s / max 25.5 s over 16 nights, and
+#                                        those are UPPER bounds, not readings
+#                                        (docs/experiments/publish-duration.md).
+#                                        The live figure is the "Published in
+#                                        N.N s" line
 # 30min is roughly 2x the worst tail we have measured, and a test pins
-# TimeoutStopSec > BACKUP_TIMEOUT_S and < max_batch_hours. Reaching it is still a
+# TimeoutStopSec above the SUM of the three bounded/measured terms above
+# (600 + 435 + 600 = 1635 s) and below max_batch_hours. That sum is also the
+# constraint from the other direction: PUBLISH_TIMEOUT_S cannot be raised past
+# ~765 s without this directive moving first, or the publish bound gets
+# SIGKILLed before it can report its own timeout — which is the pre-#230
+# behaviour under a different name. Reaching this timeout at all is still a
 # SIGKILL — i.e. the pre-#206 behaviour — so this can only improve on it. An
 # operator who needs the batch dead immediately should `systemctl --user kill`
 # rather than wait this out.

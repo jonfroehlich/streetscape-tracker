@@ -797,6 +797,18 @@ def _emit(message: str) -> None:
         logger.debug("stdout closed; continuing")
 
 
+# The batch email's window into the scheduler log, and it is sized against what
+# now gets PASTED into that log rather than against the log's own narrative. A
+# failed collection child contributes _CHILD_LOG_TAIL_LINES + 2 lines, and since
+# issue #218 so does a failed publish — which, being the last thing a night does,
+# is the block the tail is guaranteed to contain. At the 40-line default a night
+# that failed to publish spent 27 of those 40 on the rsync tail and evicted the
+# report of which cities failed and which host refused us: the fix eating the
+# context it exists to be read beside. Sized for the realistic bad night (a
+# failed publish plus two failed channels) plus room for the summary above them.
+_BATCH_LOG_TAIL_LINES = 120
+
+
 def _recent_log_tail(cfg: SchedulerConfig, n: int = 40) -> str:
     """
     Last n lines of the scheduler log, for pasting into an alert email.
@@ -811,6 +823,113 @@ def _recent_log_tail(cfg: SchedulerConfig, n: int = 40) -> str:
             return redact_credentials("".join(f.readlines()[-n:])) or "(log empty)"
     except OSError as e:
         return f"(could not read {log_path}: {e})"
+
+
+# The publish is the last thing a night does, and it was the only unbounded
+# subprocess.run in this file (issue #230). Every other long-running child here
+# is already bounded — the collection child by a per-city timeout, the catalog
+# backup by catalog_backup.BACKUP_TIMEOUT_S, the Overpass fetch by _deadline() —
+# and rsync has exactly the property those bounds exist for: a half-open SSH
+# connection, or a stalled NFS mount on the --local path, sits indefinitely
+# rather than erroring.
+#
+# Sized from a measured distribution, not guessed. 16 nights of prod scheduler
+# logs (2026-07-21..2026-08-20) put a healthy publish at p50 12.1 s, p95 24.3 s,
+# max 25.5 s — and every one of those is an UPPER bound, since the interval they
+# come from (`Publishing via` -> the next log line) also contains the alert's
+# SMTP send. The rsync's tree walk over the 7,409 published files (7,416 rsync
+# candidates) is 0.138-2.303 s of that, depending on NFS dentry-cache state.
+# See docs/experiments/publish-duration.md, and re-measure from the
+# `Published in N.N s` line rather than trusting these.
+#
+# 600 s is ~23x that max, and deliberately the same number as
+# BACKUP_TIMEOUT_S so the tail's two bounded terms read alike. The ceiling is
+# not free choice: during a `systemctl stop` wind-down the WHOLE tail has to fit
+# inside the unit's TimeoutStopSec (30 min), and the other two large terms are
+# BACKUP_TIMEOUT_S (600 s) plus the measured aggregate+manifest rebuild (435 s),
+# so anything above ~765 s is back to being SIGKILLed with no explanation — the
+# exact outcome this bound exists to replace, not an improvement on it.
+# test_stop_timeout_covers_the_publish_tail_it_waits_for pins that sum.
+PUBLISH_TIMEOUT_S = 600.0
+
+# How long to wait for the publish child's process GROUP to actually die after
+# SIGKILL before giving up and letting the tail continue. subprocess.run's own
+# post-kill wait() is unbounded, which is the one thing about it this file must
+# not reproduce: the whole point of PUBLISH_TIMEOUT_S is that the tail stops
+# waiting on a wedged rsync, and inheriting an unbounded reap would hand that
+# wait straight back. A child blocked in an uninterruptible NFS RPC does not die
+# on SIGKILL until the mount answers — as it would not for systemd's own SIGKILL
+# — so the grace is short and expiring it is reported, not retried.
+_PUBLISH_REAP_GRACE_S = 30.0
+
+
+def _kill_publish_group(proc: subprocess.Popen) -> None:
+    """SIGKILL the publish child's whole process group, then reap it, bounded.
+
+    The group, not the process: see ``_run_publish_child``. Falls back to killing
+    the leader alone if the group is already gone (the ordinary race — the child
+    exited between the timeout firing and this call).
+    """
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except OSError:
+        # Already reaped, or a platform that refused the group kill. Either way
+        # the leader is the only thing left we can name.
+        proc.kill()
+    try:
+        proc.wait(timeout=_PUBLISH_REAP_GRACE_S)
+    except subprocess.TimeoutExpired:
+        logger.error(
+            f"publish child (pid {proc.pid}) did not die within "
+            f"{_PUBLISH_REAP_GRACE_S:.0f} s of SIGKILL — it is stuck in the kernel, "
+            f"which on the --local path means an uninterruptible NFS RPC. Leaving it "
+            f"and continuing; the tail must not inherit that wait."
+        )
+
+
+def _run_publish_child(cmd: list[str], fh, timeout_s: float) -> subprocess.CompletedProcess:
+    """Run the publish script bounded, killing the whole process group on timeout.
+
+    ``Popen`` rather than ``subprocess.run``, and the difference is the entire
+    point of issue #230's bound. ``cmd`` is ``["bash", sync_data_to_server.sh]``
+    and that script runs rsync as an ordinary child with echoes after it — no
+    implicit ``exec`` — so ``run``'s timeout path (``Popen.kill()`` ->
+    ``os.kill(self.pid)``) reaches only the SHELL. The rsync that is actually
+    wedged on the half-open SSH connection or the stalled NFS mount would be
+    reparented and keep going: still holding the transport, still appending to
+    the per-day publish log after ``_tail_lines`` has read it, and still live
+    when the next publish starts — which is not hypothetical, since ``_publish``
+    APPENDS to a per-day log, so a manual ``regenerate-aggregate --publish``
+    after a timed-out nightly one would put a second rsync into the same docroot
+    beside the wedged one.
+
+    ``start_new_session=True`` makes the child a session and process-group
+    leader, so ``os.killpg`` reaches the shell and the rsync together. Two
+    consequences of that, both deliberate:
+
+    - The child leaves the terminal's foreground process group, so a Ctrl-C in an
+      operator shell no longer reaches it. That would trade one orphan for
+      another, so anything unwinding past the wait — ``KeyboardInterrupt``
+      included — kills the group on the way out.
+    - It does NOT leave the cgroup, which is what ``systemctl stop``'s default
+      ``KillMode=control-group`` signals, so #206's wind-down still reaches this
+      child exactly as it did before.
+    """
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(_PROJECT_ROOT),
+        stdout=fh,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    try:
+        returncode = proc.wait(timeout=timeout_s)
+    except BaseException:
+        # Both the timeout and the Ctrl-C case: nothing else is going to kill
+        # this group now, so do it before the exception leaves this frame.
+        _kill_publish_group(proc)
+        raise
+    return subprocess.CompletedProcess(cmd, returncode)
 
 
 def _publish(cfg: SchedulerConfig, context: str, alert_on_failure: bool = True) -> int:
@@ -837,7 +956,27 @@ def _publish(cfg: SchedulerConfig, context: str, alert_on_failure: bool = True) 
     ``alert_on_failure`` is off when the caller reports failures itself. The
     batch tail does, so that one email names the failed publish alongside the
     failed index or backup it usually accompanies (a full data_dir breaks both),
-    instead of sending a partial email and returning early.
+    instead of sending a partial email and returning early. Either way the
+    script's own output is copied into THIS log before the alert decision, since
+    that is the only route by which the rsync error text reaches the batch email
+    — which quotes ``_recent_log_tail`` and nothing else (issue #218).
+
+    The rsync is bounded by ``PUBLISH_TIMEOUT_S`` (issue #230). A timeout is
+    reported as an ordinary publish failure — logged, alerted, nonzero — never
+    raised, because #167's rule is that the tail reports rather than propagates.
+    The kill reaches the whole process GROUP rather than the shell alone, which
+    is not a detail — see ``_run_publish_child``, where the rsync we are actually
+    trying to stop is a grandchild.
+
+    One case the bound still does not cover, stated rather than implied: a child
+    the KERNEL will not kill. Over SSH the child is in interruptible sleep and
+    dies at once; on prod's ``--local`` path one blocked in an uninterruptible
+    NFS RPC defers SIGKILL until the mount answers, and systemd's own SIGKILL is
+    deferred identically, so no userspace bound can end that process. What this
+    file can do is refuse to WAIT on it, which is what ``_PUBLISH_REAP_GRACE_S``
+    buys, and say so: the reap logs its own expiry, and the failure line reports
+    the timeout and the ACTUAL elapsed separately, so a gap between them is
+    visible rather than silent.
     """
     cmd = ["bash", cfg.publish_script]
     if cfg.publish_local:
@@ -845,14 +984,16 @@ def _publish(cfg: SchedulerConfig, context: str, alert_on_failure: bool = True) 
     logger.info(f"Publishing via {' '.join(cmd[1:])}")
     os.makedirs(cfg.log_dir, exist_ok=True)
     log_path = Path(cfg.log_dir) / f"publish_{date.today().isoformat()}.log"
-    # Time the rsync. It is the publish tail's largest component (~6,300 files)
-    # and was its only UNMEASURED one: everything else in the tail is either
-    # bounded in code (catalog_backup.BACKUP_TIMEOUT_S) or already visible in the
-    # log's timestamps. The tail is exactly what the unit's TimeoutStopSec has to
-    # cover when `systemctl stop` winds a night down, so this line is what any
-    # future re-sizing of that number should be argued from (issue #206).
-    # Monotonic rather than wall clock: an NTP step must not be able to report a
-    # negative publish.
+    # Time the rsync. It is the publish tail's largest component (7,409 published
+    # files / 30.75 GB, measured 2026-08-20 — 7,416 is rsync's candidate count,
+    # which is a different number) and was its only UNMEASURED one:
+    # everything else in the tail is either bounded in code
+    # (catalog_backup.BACKUP_TIMEOUT_S) or already visible in the log's
+    # timestamps. The tail is exactly what the unit's TimeoutStopSec has to cover
+    # when `systemctl stop` winds a night down, so this line is what any future
+    # re-sizing of that number — or of PUBLISH_TIMEOUT_S — has to be argued from
+    # (issues #206, #230). Monotonic rather than wall clock: an NTP step must not
+    # be able to report a negative publish.
     started = time.monotonic()
     try:
         # Append, not truncate: a night can publish more than once (a manual
@@ -862,42 +1003,69 @@ def _publish(cfg: SchedulerConfig, context: str, alert_on_failure: bool = True) 
             fh.write(f"\n===== {datetime.now(UTC).isoformat()} =====\n")
             fh.write(redact_credentials(" ".join(cmd)) + "\n\n")
             fh.flush()
-            result = subprocess.run(
-                cmd,
-                cwd=str(_PROJECT_ROOT),
-                stdout=fh,
-                stderr=subprocess.STDOUT,
-            )
+            result = _run_publish_child(cmd, fh, PUBLISH_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        elapsed = time.monotonic() - started
+        # The bound and the actual elapsed are reported as two numbers, not one:
+        # subprocess.run's post-kill wait() is unbounded, so `timed out at 600 s
+        # after 742.3 s` is the signature of a SIGKILL the kernel deferred (see
+        # the docstring), and there is no other place that shows.
+        detail = f"(timed out at {PUBLISH_TIMEOUT_S:.0f} s) after {elapsed:.1f} s"
+        # The alert carries BOTH numbers too, not just the bound: it is the first
+        # thing an operator reads, and the gap between them is the whole signal
+        # (see the docstring). Leaving the elapsed to the log tail lower in the
+        # same email made the headline the one number that says least.
+        reason = f"timed out at {PUBLISH_TIMEOUT_S:.0f} s and was killed after {elapsed:.1f} s"
+        # The same 1 the OSError branch below already returns. _finish_batch has
+        # only an int to act on, so a bespoke status here would put a second
+        # meaning on a number no caller can interpret; the reason travels in the
+        # log line, which is what both alert paths quote.
+        rc = 1
     except OSError as e:
         # The log itself is unwritable (full or read-only disk) — which is also
         # a good reason for the publish to be about to fail. Report it as the
         # publish failing rather than taking down the tail.
         logger.error(f"Could not open {log_path} for the publish script: {e}")
         return 1
-
-    elapsed = time.monotonic() - started
-    if result.returncode != 0:
+    else:
+        elapsed = time.monotonic() - started
+        if result.returncode == 0:
+            logger.info(f"Published in {elapsed:.1f} s")
+            return 0
         # Elapsed on the failure line too: a publish that failed in 2 s (bad
         # path, auth) is a different incident from one that failed at 25 minutes
         # (a stalled NFS transfer), and the message alone could not tell them
         # apart.
-        logger.error(
-            f"Publish script failed (exit {result.returncode}) after {elapsed:.1f} s; "
-            f"output in {log_path}"
-        )
-        if alert_on_failure:
-            tail = _tail_lines(log_path, _CHILD_LOG_TAIL_LINES)
-            send_alert(
-                cfg.alerts,
-                f"publish script FAILED on {socket.gethostname()}",
-                f"{context}\n\nPublish step exited {result.returncode}.\n\n"
-                f"--- last {_CHILD_LOG_TAIL_LINES} lines of {log_path.name} ---\n{tail}\n\n"
-                f"Recent log:\n{_recent_log_tail(cfg)}",
-            )
-        return result.returncode
+        detail = f"(exit {result.returncode}) after {elapsed:.1f} s"
+        reason = f"exited {result.returncode} after {elapsed:.1f} s"
+        rc = result.returncode
 
-    logger.info(f"Published in {elapsed:.1f} s")
-    return result.returncode
+    # Copy the script's own output into the SCHEDULER log, exactly as
+    # _run_collection_subprocess does for a failed child — not only into the
+    # alert below. The nightly path passes alert_on_failure=False so the batch
+    # tail can send one combined email, and that email pastes _recent_log_tail
+    # and nothing else. While this tail lived only in the alert, the one path
+    # that runs every night reported "publish script FAILED (exit N); see
+    # logs/publish_*.log" and left the rsync error in a file on a host nobody
+    # was reading (issue #218).
+    tail = _tail_lines(log_path, _CHILD_LOG_TAIL_LINES)
+    message = f"Publish script failed {detail}; output in {log_path}"
+    if tail:
+        message += f"\n--- last {_CHILD_LOG_TAIL_LINES} lines of {log_path.name} ---\n{tail}"
+    logger.error(message)
+    if alert_on_failure:
+        # Still pasted explicitly here rather than left to _recent_log_tail's
+        # 40-line window: this path's whole job is to be the complete report,
+        # and the overlap is the same one a failed collection child already
+        # produces in the threshold email.
+        send_alert(
+            cfg.alerts,
+            f"publish script FAILED on {socket.gethostname()}",
+            f"{context}\n\nPublish step {reason}.\n\n"
+            f"--- last {_CHILD_LOG_TAIL_LINES} lines of {log_path.name} ---\n{tail}\n\n"
+            f"Recent log:\n{_recent_log_tail(cfg)}",
+        )
+    return rc
 
 
 def cmd_notify_failure(cfg: SchedulerConfig) -> int:
@@ -3250,7 +3418,15 @@ def _finish_batch(
     if cfg.publish_enabled and succeeded > 0:
         rc = _publish(cfg, summary, alert_on_failure=False)
         if rc != 0:
-            publish_error = f"publish script FAILED (exit {rc}); see logs/publish_*.log"
+            # Deliberately NOT "(exit {rc})": _publish returns 1 for a timeout
+            # and for an unwritable log, neither of which is a status the rsync
+            # produced, so naming it as one sends the operator looking up an
+            # rsync exit code that never existed. What actually happened is in
+            # the scheduler-log tail quoted further down this same email —
+            # which is why _publish logs the script's output there (issue #218).
+            publish_error = (
+                f"publish step FAILED (status {rc}); see logs/publish_*.log and the log tail below"
+            )
 
     # Operator email when the batch finished unhealthy (threshold-controlled so
     # an occasional single flaky city doesn't page every night). No-op unless
@@ -3335,7 +3511,11 @@ def _finish_batch(
             + (f"\n\n{blocked_note}" if blocked_note else "")
             + (f"\n\n{busy_note}" if busy_note else "")
         )
-        send_alert(cfg.alerts, subject, f"{body}\n\nRecent log:\n{_recent_log_tail(cfg)}")
+        send_alert(
+            cfg.alerts,
+            subject,
+            f"{body}\n\nRecent log:\n{_recent_log_tail(cfg, _BATCH_LOG_TAIL_LINES)}",
+        )
 
     # A backup failure, a failed index rebuild, a failed publish, a missed
     # driving-plan snapshot, a blocked host or a locally-busy one makes the

@@ -1,0 +1,383 @@
+{
+  "_about": {
+    "experiment": "publish-duration",
+    "writeup": "docs/experiments/publish-duration.md",
+    "generated_by": "scripts/publish_duration_analyze.py --logs-dir logs --time-tree-walk --docs-dir docs/experiments",
+    "note": "How long the nightly publish (sync_data_to_server.sh) takes, read out of logs/streetscape_scheduler.log*. Sizes scheduler.PUBLISH_TIMEOUT_S (issue #230). `exact` is the `Published in N.N s` line; `bound` is the pre-#229 fallback (`Publishing via` -> next log line) and is an UPPER bound that also contains the alert's SMTP send; `failed` is not a publish duration at all. The three are never pooled. The source logs stay on the collecting host."
+  },
+  "summary": {
+    "exact": {
+      "overall": {
+        "n": 0
+      }
+    },
+    "bound": {
+      "overall": {
+        "n": 16,
+        "min": 3.419,
+        "p25": 5.997,
+        "p50": 12.09,
+        "p75": 14.457,
+        "p90": 20.295,
+        "p95": 24.298,
+        "max": 25.547
+      },
+      "local": {
+        "n": 2,
+        "min": 10.323,
+        "p25": 13.713,
+        "p50": 17.102,
+        "p75": 20.492,
+        "p90": 22.526,
+        "p95": 23.204,
+        "max": 23.882
+      },
+      "ssh": {
+        "n": 14,
+        "min": 3.419,
+        "p25": 5.764,
+        "p50": 12.09,
+        "p75": 14.139,
+        "p90": 16.193,
+        "p95": 19.802,
+        "max": 25.547
+      }
+    },
+    "failed": {
+      "overall": {
+        "n": 0
+      },
+      "untimed": 3
+    },
+    "excluded": {
+      "n": 34
+    }
+  },
+  "observations": {
+    "exact": [],
+    "bound": [
+      {
+        "seconds": 11.404,
+        "mode": "ssh",
+        "at": "2026-07-21 12:04:45,589",
+        "upper_bound": true
+      },
+      {
+        "seconds": 14.278,
+        "mode": "ssh",
+        "at": "2026-07-22 09:21:24,583",
+        "upper_bound": true
+      },
+      {
+        "seconds": 13.722,
+        "mode": "ssh",
+        "at": "2026-07-23 09:02:23,251",
+        "upper_bound": true
+      },
+      {
+        "seconds": 5.647,
+        "mode": "ssh",
+        "at": "2026-07-24 12:17:04,283",
+        "upper_bound": true
+      },
+      {
+        "seconds": 25.547,
+        "mode": "ssh",
+        "at": "2026-07-28 11:43:26,176",
+        "upper_bound": true
+      },
+      {
+        "seconds": 9.727,
+        "mode": "ssh",
+        "at": "2026-07-31 12:06:02,780",
+        "upper_bound": true
+      },
+      {
+        "seconds": 6.114,
+        "mode": "ssh",
+        "at": "2026-08-01 12:09:18,402",
+        "upper_bound": true
+      },
+      {
+        "seconds": 3.419,
+        "mode": "ssh",
+        "at": "2026-08-02 12:11:38,732",
+        "upper_bound": true
+      },
+      {
+        "seconds": 4.577,
+        "mode": "ssh",
+        "at": "2026-08-03 12:19:52,457",
+        "upper_bound": true
+      },
+      {
+        "seconds": 14.992,
+        "mode": "ssh",
+        "at": "2026-08-05 12:08:31,568",
+        "upper_bound": true
+      },
+      {
+        "seconds": 16.708,
+        "mode": "ssh",
+        "at": "2026-08-06 12:10:57,528",
+        "upper_bound": true
+      },
+      {
+        "seconds": 4.022,
+        "mode": "ssh",
+        "at": "2026-08-07 12:59:08,775",
+        "upper_bound": true
+      },
+      {
+        "seconds": 12.775,
+        "mode": "ssh",
+        "at": "2026-08-08 12:44:08,220",
+        "upper_bound": true
+      },
+      {
+        "seconds": 13.332,
+        "mode": "ssh",
+        "at": "2026-08-14 06:23:56,558",
+        "upper_bound": true
+      },
+      {
+        "seconds": 23.882,
+        "mode": "local",
+        "at": "2026-08-19 12:14:31,865",
+        "upper_bound": true
+      },
+      {
+        "seconds": 10.323,
+        "mode": "local",
+        "at": "2026-08-20 15:13:42,322",
+        "upper_bound": true
+      }
+    ],
+    "failed": [
+      {
+        "seconds": null,
+        "mode": "ssh",
+        "at": "2026-07-22 16:18:49,757",
+        "why": "pre-#229 line, elapsed not recorded"
+      },
+      {
+        "seconds": null,
+        "mode": "ssh",
+        "at": "2026-08-12 11:33:51,118",
+        "why": "pre-#229 line, elapsed not recorded"
+      },
+      {
+        "seconds": null,
+        "mode": "ssh",
+        "at": "2026-08-17 11:53:51,775",
+        "why": "pre-#229 line, elapsed not recorded"
+      }
+    ],
+    "excluded": [
+      {
+        "mode": "ssh",
+        "at": "2026-07-23 16:17:01,014",
+        "why": "successor belongs to a later invocation",
+        "successor_delta_s": 4588.3
+      },
+      {
+        "mode": "ssh",
+        "at": "2026-07-23 19:08:41,462",
+        "why": "no successor line (log ends here)"
+      },
+      {
+        "mode": "ssh",
+        "at": "2026-07-24 07:30:16,259",
+        "why": "successor 6353s away, over the 300s cutoff",
+        "successor_delta_s": 6352.9
+      },
+      {
+        "mode": "ssh",
+        "at": "2026-07-24 11:14:20,260",
+        "why": "successor belongs to a later invocation",
+        "successor_delta_s": 101.8
+      },
+      {
+        "mode": "ssh",
+        "at": "2026-07-25 08:23:04,571",
+        "why": "no successor line (log ends here)"
+      },
+      {
+        "mode": "ssh",
+        "at": "2026-07-26 07:53:29,790",
+        "why": "successor 7755s away, over the 300s cutoff",
+        "successor_delta_s": 7755.2
+      },
+      {
+        "mode": "ssh",
+        "at": "2026-07-26 10:02:45,979",
+        "why": "no successor line (log ends here)"
+      },
+      {
+        "mode": "ssh",
+        "at": "2026-07-28 17:47:25,568",
+        "why": "no successor line (log ends here)"
+      },
+      {
+        "mode": "ssh",
+        "at": "2026-07-30 09:03:52,310",
+        "why": "successor 1573s away, over the 300s cutoff",
+        "successor_delta_s": 1572.7
+      },
+      {
+        "mode": "ssh",
+        "at": "2026-07-30 09:30:06,036",
+        "why": "successor belongs to a later invocation",
+        "successor_delta_s": 735.1
+      },
+      {
+        "mode": "ssh",
+        "at": "2026-07-30 09:54:57,067",
+        "why": "successor belongs to a later invocation",
+        "successor_delta_s": 3744.1
+      },
+      {
+        "mode": "ssh",
+        "at": "2026-07-30 20:21:50,120",
+        "why": "no successor line (log ends here)"
+      },
+      {
+        "mode": "ssh",
+        "at": "2026-07-31 05:53:36,177",
+        "why": "successor 5173s away, over the 300s cutoff",
+        "successor_delta_s": 5172.8
+      },
+      {
+        "mode": "ssh",
+        "at": "2026-07-31 07:27:25,118",
+        "why": "successor 10348s away, over the 300s cutoff",
+        "successor_delta_s": 10348.2
+      },
+      {
+        "mode": "ssh",
+        "at": "2026-08-04 07:42:51,625",
+        "why": "successor 10599s away, over the 300s cutoff",
+        "successor_delta_s": 10598.7
+      },
+      {
+        "mode": "ssh",
+        "at": "2026-08-04 10:39:31,318",
+        "why": "successor belongs to a later invocation",
+        "successor_delta_s": 29.3
+      },
+      {
+        "mode": "ssh",
+        "at": "2026-08-05 13:04:23,396",
+        "why": "no successor line (log ends here)"
+      },
+      {
+        "mode": "ssh",
+        "at": "2026-08-09 03:39:00,189",
+        "why": "no successor line (log ends here)"
+      },
+      {
+        "mode": "ssh",
+        "at": "2026-08-10 05:17:09,502",
+        "why": "no successor line (log ends here)"
+      },
+      {
+        "mode": "ssh",
+        "at": "2026-08-11 07:01:44,597",
+        "why": "no successor line (log ends here)"
+      },
+      {
+        "mode": "ssh",
+        "at": "2026-08-12 05:20:06,872",
+        "why": "successor 8464s away, over the 300s cutoff",
+        "successor_delta_s": 8464.4
+      },
+      {
+        "mode": "ssh",
+        "at": "2026-08-12 07:41:12,463",
+        "why": "successor 9274s away, over the 300s cutoff",
+        "successor_delta_s": 9274.1
+      },
+      {
+        "mode": "ssh",
+        "at": "2026-08-12 12:25:10,687",
+        "why": "successor belongs to a later invocation",
+        "successor_delta_s": 19056.3
+      },
+      {
+        "mode": "ssh",
+        "at": "2026-08-13 08:58:29,156",
+        "why": "no successor line (log ends here)"
+      },
+      {
+        "mode": "ssh",
+        "at": "2026-08-14 04:11:09,085",
+        "why": "successor belongs to a later invocation",
+        "successor_delta_s": 618.8
+      },
+      {
+        "mode": "ssh",
+        "at": "2026-08-15 08:29:24,371",
+        "why": "no successor line (log ends here)"
+      },
+      {
+        "mode": "ssh",
+        "at": "2026-08-16 08:18:59,343",
+        "why": "no successor line (log ends here)"
+      },
+      {
+        "mode": "ssh",
+        "at": "2026-08-17 05:02:48,971",
+        "why": "successor 10425s away, over the 300s cutoff",
+        "successor_delta_s": 10425.1
+      },
+      {
+        "mode": "ssh",
+        "at": "2026-08-17 07:56:37,229",
+        "why": "successor belongs to a later invocation",
+        "successor_delta_s": 139.0
+      },
+      {
+        "mode": "ssh",
+        "at": "2026-08-18 12:09:14,848",
+        "why": "successor 18513s away, over the 300s cutoff",
+        "successor_delta_s": 18513.3
+      },
+      {
+        "mode": "local",
+        "at": "2026-08-18 17:17:51,586",
+        "why": "successor belongs to a later invocation",
+        "successor_delta_s": 77.1
+      },
+      {
+        "mode": "local",
+        "at": "2026-08-18 18:32:13,308",
+        "why": "no successor line (log ends here)"
+      },
+      {
+        "mode": "local",
+        "at": "2026-08-19 16:22:55,807",
+        "why": "no successor line (log ends here)"
+      },
+      {
+        "mode": "local",
+        "at": "2026-08-20 10:18:16,337",
+        "why": "successor belongs to a later invocation",
+        "successor_delta_s": 11439.0
+      }
+    ]
+  },
+  "tree_walk": {
+    "measured_by": "bash sync_data_to_server.sh --local --dry-run",
+    "note": "The rsync file-list build alone, with nothing transferred \u2014 the floor the observed durations sit on top of.",
+    "as_found_seconds": 2.303,
+    "warm_seconds": [
+      0.139,
+      0.138
+    ],
+    "files_considered": 7416,
+    "published_files": 7409,
+    "published_gb": 30.75,
+    "host": "makelab2.cs.washington.edu",
+    "measured_at": "2026-08-20"
+  }
+}
