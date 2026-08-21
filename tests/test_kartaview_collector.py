@@ -1662,15 +1662,65 @@ def test_a_stop_mid_root_discards_that_roots_rows_rather_than_committing_them(
         # 3 the budget never reaches.
         return [_item(id=f"{call.lat:.5f}:{call.lon:.5f}#p{call.page}")], 6
 
+    bars = []
+    real_progress = kv.progress
+    monkeypatch.setattr(kv, "progress", lambda **kw: bars.append(real_progress(**kw)) or bars[-1])
+
     error, calls = _failed_sweep_ckpt(
         monkeypatch, paged, ckpt, ipp=2, max_requests=2, checkpoint_request_interval=1
     )
     assert isinstance(error, kv.SweepIncompleteError)
     assert {c.page for c in calls} == {1, 2}, "the stop must land inside the page loop"
+    assert bars[0].n == 0, (
+        "the bar must not count a root that was rolled back -- on the night that "
+        "got killed, over-reporting progress is what makes 'slow' and 'hung' "
+        "indistinguishable in the log (#157)"
+    )
     state = _state(ckpt)
     assert state["roots_done"] == 0, "a half-paged root is not a swept root"
     assert state["census_rows"] == 0, "its pages are rolled back, not committed"
     assert state["parts"] == 0
+    assert state["raw_photo_count"] == 0
+
+
+def test_a_crash_between_a_roots_pages_rewinds_it_too(monkeypatch, tmp_path):
+    """
+    The boundary rewind is enforced in the `finally`, not per stop-path, so it
+    covers a host block, a transport fault and a bug as well as the budget stop
+    -- and this is the case that distinguishes the two placements: a root
+    interrupted by an EXCEPTION between its pages has photos in hand, and
+    committing them against a `roots_done` that excludes the root would leave
+    the resume free to sweep it again, carrying its early pages twice.
+    """
+    ckpt = tmp_path / "sweep"
+    pages_seen = []
+
+    def paged(call):
+        pages_seen.append(call.page)
+        if call.page == 2:
+            raise RuntimeError("something entirely unexpected")
+        return [_item(id=f"{call.lat:.5f}:{call.lon:.5f}#p{call.page}")], 6
+
+    _install(monkeypatch, paged)
+    with pytest.raises(RuntimeError):
+        asyncio.run(
+            kv.fetch_city_images_async(
+                "Testville",
+                BBOX,
+                "tok",
+                radius_m=1000,
+                ipp=2,
+                retries=0,
+                max_requests_per_minute=0,
+                checkpoint_path=str(ckpt),
+                checkpoint_request_interval=1,
+            )
+        )
+    assert pages_seen == [1, 2], "the crash must land inside the page loop"
+    state = _state(ckpt)
+    assert state["roots_done"] == 0
+    assert state["census_rows"] == 0, "page 1 of an unfinished circle is not census"
+    assert state["cells_visited"] == 0
     assert state["raw_photo_count"] == 0
 
 

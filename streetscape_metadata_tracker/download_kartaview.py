@@ -1397,7 +1397,9 @@ def load_checkpoint(
         if rows != cp.census_rows:
             discard(f"its parts hold {rows} rows where the commit record says {cp.census_rows}")
             return None
-    except Exception as e:  # noqa: BLE001 -- see the NEVER RAISES note above
+    except Exception as e:
+        # Broad on purpose; see the NEVER RAISES note above. A checkpoint that
+        # cannot be read must cost a re-sweep, never a night.
         discard(f"{type(e).__name__}: {e}")
         return None
 
@@ -1960,22 +1962,9 @@ async def _fetch_city_images(
                         )
                         stop_reason = f"the {max_requests}-request budget ran out mid-cell"
                         if cp is None:
+                            # Uncheckpointed, this root is counted the way it
+                            # always was; the rewind below is what replaces it.
                             progress_bar.update(1)
-                        else:
-                            # This root is NOT done, so it is neither counted nor
-                            # kept. A commit always writes the sweep as of the
-                            # last completed root boundary -- that invariant is
-                            # what makes the finally-commit below safe from any
-                            # exception path, and what lets the DFS stack stay
-                            # un-persisted. So the partial root's contributions
-                            # are rolled back and it is re-swept tomorrow from
-                            # its own top; the alternative, committing a
-                            # half-swept root as done, silently drops whatever
-                            # its remaining stack held.
-                            del frames[mark_frames:]
-                            del failed_cells[mark_failed:]
-                            cells_visited = mark_visited
-                            raw_photo_count = mark_photos
                         break
                     progress_bar.update(1)
                     roots_done = index + 1
@@ -2003,6 +1992,23 @@ async def _fetch_city_images(
             finally:
                 progress_bar.close()
                 if cp is not None:
+                    # REWIND TO THE LAST COMPLETED ROOT BOUNDARY. A commit always
+                    # writes the sweep as of one, and this is where that
+                    # invariant is actually enforced -- for the budget stop
+                    # above, for a host block, for a transport fault, for a bug.
+                    # It is a no-op on the clean path, since the marks are taken
+                    # at each boundary. A root interrupted between its pages has
+                    # photos in hand, but a paged circle is not exhaustive until
+                    # its last page, so committing those rows against a
+                    # `roots_done` that excludes the root would leave the resume
+                    # free to sweep it again -- the census would carry its early
+                    # pages twice and every counter describing it would drift.
+                    # Enforcing it here rather than per stop-path is also what
+                    # lets the DFS stack stay un-persisted.
+                    del frames[mark_frames:]
+                    del failed_cells[mark_failed:]
+                    cells_visited = mark_visited
+                    raw_photo_count = mark_photos
                     # The bonus half, not the mechanism: this catches a host
                     # block, a raising responder and the clean end of the loop.
                     # It does NOT catch a SIGTERM or a SIGKILL -- neither runs a
