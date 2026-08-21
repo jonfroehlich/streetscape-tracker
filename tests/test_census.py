@@ -20,6 +20,7 @@ import textwrap
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
 import pytest
 
 from streetscape_metadata_tracker import census, config, fileutils, naming
@@ -743,6 +744,32 @@ def _binds_the_census(value):
     return not _is_scalar_reduction(value)
 
 
+def _census_bindings(tree) -> list[tuple[int, str]]:
+    """
+    Every ``(lineno, name)`` in ``tree`` where the census frame is given a name.
+
+    THE ONE traversal, shared by all three tests below. It used to be written
+    out twice -- once in the guard, once in the test that claims to validate the
+    guard -- so the parametrized "every spelling" cases exercised a COPY: with
+    the ``ast.For`` arm deleted from the guard alone, all twelve of those tests
+    stayed green while a `for c in [fetched["census"]]` leak walked through.
+    """
+    bindings = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, ast.AnnAssign | ast.NamedExpr):
+            targets, value = [node.target], node.value
+        elif isinstance(node, ast.For):
+            targets, value = [node.target], node.iter
+        else:
+            continue
+        if not targets or value is None or not _binds_the_census(value):
+            continue
+        bindings.append((node.lineno, getattr(targets[0], "id", "<expr>")))
+    return bindings
+
+
 def _grid_collector_modules():
     """
     Every module in the repo that calls write_census_grid_run.
@@ -789,23 +816,11 @@ def test_no_grid_collector_binds_the_census_to_a_local():
     of its spellings, including ``.get("census")`` and ``.copy()``, the latter
     being strictly worse than the bare binding it looks safer than.
     """
-    offenders = []
-    for rel, text in _grid_collector_modules():
-        tree = ast.parse(text)
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Assign):
-                targets, value = node.targets, node.value
-            elif isinstance(node, ast.AnnAssign | ast.NamedExpr):
-                targets, value = [node.target], node.value
-            elif isinstance(node, ast.For):
-                targets, value = [node.target], node.iter
-            else:
-                continue
-            if not targets or value is None or not _binds_the_census(value):
-                continue
-            name = getattr(targets[0], "id", "<expr>")
-            offenders.append(f"{rel}:{node.lineno} ({name!r})")
-
+    offenders = [
+        f"{rel}:{lineno} ({name!r})"
+        for rel, text in _grid_collector_modules()
+        for lineno, name in _census_bindings(ast.parse(text))
+    ]
     assert offenders == [], (
         "these bind the census to a local instead of reading it inline: "
         + ", ".join(offenders)
@@ -831,20 +846,11 @@ def test_the_ownership_check_catches_every_spelling_of_the_leak(source):
     The check is only worth having if it catches the forms a real author would
     actually write. `.copy()` in particular pins a second full census, so a
     guard that matched only the bare subscript would wave through the worse bug.
+
+    Drives _census_bindings -- the SAME function the guard above runs, not a
+    second copy of the traversal -- so narrowing the guard fails here too.
     """
-    tree = ast.parse(textwrap.dedent(source))
-    bound = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Assign):
-            targets, value = node.targets, node.value
-        elif isinstance(node, ast.AnnAssign | ast.NamedExpr):
-            targets, value = [node.target], node.value
-        elif isinstance(node, ast.For):
-            targets, value = [node.target], node.iter
-        else:
-            continue
-        if targets and value is not None and _binds_the_census(value):
-            bound.append(node.lineno)
+    bound = _census_bindings(ast.parse(textwrap.dedent(source)))
     assert bound, f"the leak was not caught: {source!r}"
 
 
@@ -860,10 +866,7 @@ def test_the_ownership_check_catches_every_spelling_of_the_leak(source):
 )
 def test_the_ownership_check_allows_inline_scalar_reads(source):
     """The rule bans holding the FRAME, not reading a number out of it."""
-    tree = ast.parse(source)
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Assign):
-            assert not _binds_the_census(node.value), source
+    assert _census_bindings(ast.parse(source)) == [], source
 
 
 # ── the dtypes seam: a run CSV is read with ITS OWN provider's schema ─────────
@@ -888,6 +891,50 @@ def test_dtypes_for_run_path_picks_the_schema_from_the_provider_token():
     )
     # A name the naming contract does not parse keeps the historical default.
     assert fileutils.dtypes_for_run_path("scratch.csv.gz") is config.MAPILLARY_METADATA_DTYPES
+    # ...and that is what an as-yet-unregistered provider token gets, in BOTH
+    # artifact families: parse_filename rejects an unknown token and
+    # _STREETWALK_FILENAME_RE builds its alternation from the same tuple, so
+    # having a schema is not enough to be read with it. Flips at #225 phase 3b
+    # -- see test_a_run_schema_is_reachable_from_a_filename.
+    assert "kartaview" not in naming.KNOWN_PROVIDERS, (
+        "phase 3b landed: replace the two fallback assertions below with "
+        "`is config.KARTAVIEW_METADATA_DTYPES`, and drop the xfail marker on "
+        "test_a_run_schema_is_reachable_from_a_filename"
+    )
+    for unregistered in (
+        f"{base}_kartaview_2026-07-02.csv.gz",
+        f"{base}_kartaview_streetwalk_sp15_2026-07-08.csv.gz",
+    ):
+        assert fileutils.dtypes_for_run_path(unregistered) is config.MAPILLARY_METADATA_DTYPES
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "#225 phase 3b: kartaview has a run schema but no naming.KNOWN_PROVIDERS "
+        "token yet, so its runs would read with the Mapillary schema. When 3b "
+        "lands this XPASSes and fails -- delete the marker then."
+    ),
+)
+def test_a_run_schema_is_reachable_from_a_filename():
+    """
+    The direction test_every_known_provider_has_a_run_schema cannot check.
+
+    That test asserts KNOWN_PROVIDERS is a subset of PROVIDER_RUN_DTYPES, which
+    is satisfied VACUOUSLY by a provider that has a schema and no token -- the
+    exact state kartaview is in. A schema nothing can reach is worse than a
+    missing one: config.py reads as though KartaView runs are read with the
+    KartaView schema, and every reader outside the collector (cli.py's
+    previous-run load, both json_summarizer reads, analyze.py, collect_mapillary,
+    recompute_run_stats) would silently take the Mapillary default instead. The
+    tail itself is safe -- write_census_grid_run passes dtypes= explicitly.
+    """
+    unreachable = sorted(
+        provider
+        for provider in config.PROVIDER_RUN_DTYPES
+        if provider != naming.DEFAULT_PROVIDER and provider not in naming.KNOWN_PROVIDERS
+    )
+    assert unreachable == [], f"run schemas no filename can select: {unreachable}"
 
 
 def test_every_known_provider_has_a_run_schema():
@@ -962,29 +1009,40 @@ def test_the_tail_reads_its_run_back_with_the_schema_it_wrote(tmp_path):
 # ── is_pano: the one census column the generic tail indexes by name ───────────
 
 
-@pytest.mark.parametrize("dtype", ["bool", "boolean"], ids=["numpy-bool", "nullable-boolean"])
+@pytest.mark.parametrize(
+    "dtype",
+    ["bool", "boolean", object, pd.ArrowDtype(pa.bool_())],
+    ids=["numpy-bool", "nullable-boolean", "object", "arrow-bool"],
+)
 def test_is_pano_reads_as_a_numpy_bool_array_whichever_dtype_a_provider_declares(dtype):
     """
     Both providers declare "bool" today, but "boolean" is the natural choice for
-    a third (both OUTPUT schemas use pd.BooleanDtype()) and it converts cleanly
-    only while it holds no nulls -- so the tail must not depend on which was
-    picked.
+    a third (both OUTPUT schemas use pd.BooleanDtype()), and KartaView already
+    declares pyarrow-backed dtypes elsewhere in its census schema -- so the tail
+    must not depend on which was picked.
+
+    The `object` case is the one worth having even though no schema declares it:
+    it is the SILENT failure. `~` on an object array of Python bools yields -2/-1
+    rather than raising, both truthy, so an unguarded `np.flatnonzero(~x)` selects
+    every row and marks the whole city FLAT_ONLY. The assertion below is what
+    separates that from the nullable case, which is loud.
     """
     frame = pd.DataFrame({"is_pano": pd.Series([True, False, True], dtype=dtype)})
     got = census.census_is_pano(frame)
     assert got.dtype == np.dtype(bool)
     assert got.tolist() == [True, False, True]
-    # ~is_pano is how the tail selects flat imagery; on an object array it would
-    # yield ints and quietly select the wrong rows.
+    # ~is_pano is how the tail selects flat imagery, and it is only correct on a
+    # real NumPy bool array -- hence the dtype assertion above, not just values.
     assert np.flatnonzero(~got).tolist() == [1]
 
 
 def test_a_null_is_pano_is_read_as_flat_and_reported(caplog):
     """
     A nullable column carrying an actual null degrades .to_numpy() to an object
-    array, and the tail then raises 'boolean value of NA is ambiguous' AFTER the
-    whole paced fetch is paid for. The imagery is kept (a null projection is not
-    a 360 pano, so it is flat), but the decoder bug is named rather than absorbed.
+    array holding pd.NA, and `~` on that raises 'boolean value of NA is
+    ambiguous' -- AFTER the whole paced fetch is paid for. The imagery is kept
+    (a null projection is not a 360 pano, so it is flat), but the decoder bug is
+    named rather than absorbed.
     """
     frame = pd.DataFrame({"is_pano": pd.Series([True, None, False], dtype="boolean")})
     with caplog.at_level(logging.WARNING, logger="streetscape_metadata_tracker.census"):

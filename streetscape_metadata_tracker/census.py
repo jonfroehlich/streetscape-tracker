@@ -191,12 +191,19 @@ def census_is_pano(census: pd.DataFrame) -> np.ndarray:
     name (issue #116), and it is read through here rather than inline because
     the dtype a provider declares for it decides whether the tail works at all.
     A non-nullable ``"bool"`` (what every provider declares today) converts
-    straight through. A nullable ``"boolean"`` also converts cleanly WHILE it
-    holds no nulls -- which is the trap: the first census carrying one degrades
-    ``.to_numpy()`` to an object array, and ``~is_pano`` then yields ints, so
-    the tail raises ``TypeError: boolean value of NA is ambiguous`` AFTER the
-    whole paced fetch has been paid for, naming neither the column nor the
-    provider.
+    straight through. Two other declarations fail, and they fail DIFFERENTLY --
+    both were measured, and conflating them hides the silent one:
+
+    * A nullable ``"boolean"`` converts cleanly WHILE it holds no nulls
+      (``.to_numpy()`` is still ``dtype=bool``), which is the trap. The first
+      census carrying a null degrades it to an object array holding ``pd.NA``,
+      and ``~is_pano`` then raises ``TypeError: boolean value of NA is
+      ambiguous`` right there -- LOUD, but AFTER the whole paced fetch has been
+      paid for, and naming neither the column nor the provider.
+    * A plain ``"object"`` column of Python bools never raises: ``~True`` is
+      ``-2`` and ``~False`` is ``-1``, both truthy, so ``np.flatnonzero(~x)``
+      selects EVERY row and the tail writes a FLAT_ONLY marker for every image
+      in the city. SILENT, and it publishes into an immutable dated snapshot.
 
     A null projection is not a 360 pano, so it is read as False -- the imagery
     is still recorded, as flat -- but it is a decoder bug, so it is counted and
@@ -513,7 +520,11 @@ def write_census_grid_run(
         dtypes: the provider's OUTPUT schema; its key order is the CSV's column
             order and part of the byte-identical contract.
         unmeasured_mask: ``(lats, lons) -> bool mask`` marking query points whose
-            area never downloaded, or None when the fetch was complete.
+            area never downloaded, or None when the fetch was complete. One
+            element per point, in the same order -- coerced with
+            ``np.asarray(..., dtype=bool)`` here, so returning positional
+            indices instead of a mask fails loudly rather than being read as
+            ``.loc`` labels.
         unmeasured_desc: operator-facing noun phrase for what failed (e.g.
             "3 undownloaded tile(s)"), logged with the resulting point count.
             Required whenever ``unmeasured_mask`` is given.
@@ -642,7 +653,15 @@ def write_census_grid_run(
     # coverage, and is already one of analysis.SYSTEMIC_FAILURE_STATUSES.
     num_unmeasured_points = 0
     if unmeasured_mask is not None:
-        in_unmeasured = unmeasured_mask(grid.lats[empty_ordinals], grid.lons[empty_ordinals])
+        # asarray(dtype=bool) rather than trusting the provider's return: this
+        # is a seam each new provider implements, empty_df carries a RangeIndex,
+        # and .loc reads an INTEGER array as labels rather than as a mask -- so
+        # a mask returned as indices would set roughly the right rows while
+        # num_unmeasured_points reported the SUM of those indices as a count.
+        # Wrong length still raises, which is what we want.
+        in_unmeasured = np.asarray(
+            unmeasured_mask(grid.lats[empty_ordinals], grid.lons[empty_ordinals]), dtype=bool
+        )
         empty_df.loc[in_unmeasured, "status"] = REQUEST_FAILED
         num_unmeasured_points = int(in_unmeasured.sum())
         # Only warn if points were actually degraded. A failed fetch unit can

@@ -97,6 +97,16 @@ KARTAVIEW_METADATA_DTYPES = {**METADATA_DTYPES, **KARTAVIEW_EXTRA_DTYPES}
 PROVIDER_RUN_DTYPES = {
     "gsv": METADATA_DTYPES,
     "mapillary": MAPILLARY_METADATA_DTYPES,
+    # UNREACHABLE UNTIL naming.KNOWN_PROVIDERS GAINS "kartaview" (phase 3b of
+    # issue #225). Both filename regexes gate on that tuple -- parse_filename
+    # rejects an unknown token outright and _STREETWALK_FILENAME_RE builds its
+    # provider alternation from it -- so dtypes_for_run_path cannot reach this
+    # entry today and a KartaView run would fall through to the Mapillary
+    # default: sequence_index inferred to float64, way_id inferred to a float
+    # that eats its leading zeros. Harmless only because nothing writes a
+    # KartaView run yet; test_a_run_schema_is_reachable_from_a_filename is the
+    # strict-xfail that goes red the moment the token lands, so the two cannot
+    # be brought into step in the wrong order.
     "kartaview": KARTAVIEW_METADATA_DTYPES,
 }
 
