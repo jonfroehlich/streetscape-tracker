@@ -41,6 +41,18 @@ comment at the trigger itself: measured on issue #226's affected runs, 3 of 8
 carried no impossible date at all, and rebuilding only on reason one would have
 left them publishing NULL ages.
 
+That second trigger has a size, and it is not small. It fires on ANY moved
+capture-date column, so the first pass that also applies a date-definition
+change rebuilds a large fraction of the series rather than the handful of runs
+the definition was written for. Measured over every gsv run in a 1,157-run
+catalog that had not yet taken issue #213's backfill: 405 runs, 35.0%, move a
+date column — and only 8 of those are #226's. Each is a second full read of its
+CSV on top of this loop's own, over a ~15 GB corpus. That is the cost of the
+repair rather than a defect (those published files hold pre-#213 numbers), but
+budget hours rather than minutes, and pass --provider gsv: without it the
+trigger also reaches the Mapillary census runs, whose CSVs are millions of rows
+apiece. Measurement and method: docs/experiments/capture-date-precision.md.
+
 Two published artifacts are rebuilt either way, and they are not
 interchangeable: cities.json.gz, which the overview site reads coverage from,
 and driving_plan.json.gz, which is the ONLY published artifact that reads the
@@ -58,6 +70,9 @@ Usage:
     python scripts/recompute_run_stats.py --execute              # apply
     python scripts/recompute_run_stats.py --provider gsv \\
         --regenerate-json --execute        # issue #213's and #226's repair on prod
+
+--provider gsv is not just a filter there: --regenerate-json re-reads every
+rebuilt run's CSV, and a Mapillary census run is millions of rows.
 """
 
 import argparse
@@ -116,6 +131,29 @@ DATE_COLUMNS = (
     "newest_capture_date",
     "median_pano_age_years",
 )
+# Checked rather than trusted: the trigger is
+# `any(c in changed for c in DATE_COLUMNS)` and `changed` is keyed by
+# STAT_COLUMNS, so a name here that is not one of those is not an error -- it is
+# a condition that can never be true, and the JSON rebuild silently stops
+# happening for that column forever. Same posture as census._check_image_columns:
+# the contract is enforced, not documented.
+#
+# This catches a MISSPELLED entry. The other half of the mistake -- a real stat
+# column quietly DROPPED from this tuple -- is invisible to a subset check and
+# is pinned instead by
+# tests/test_recompute_run_stats.test_each_date_column_independently_triggers_the_json_rebuild,
+# which spoils one catalog column at a time. That fixture is deliberately
+# unnatural: oldest, newest and median are a min, a max and a median of one
+# population and move together in any realistic run, which is exactly why a
+# realistic fixture cannot see a single-column regression.
+#
+# `raise`, not `assert`: python -O strips asserts, and this guard is worth more
+# than it costs.
+if not set(DATE_COLUMNS) <= set(STAT_COLUMNS):
+    raise RuntimeError(
+        f"DATE_COLUMNS must be a subset of STAT_COLUMNS; "
+        f"unknown: {sorted(set(DATE_COLUMNS) - set(STAT_COLUMNS))}"
+    )
 
 
 def _equalish(a, b) -> bool:
@@ -319,8 +357,18 @@ def main() -> int:
             # regenerate_run_json reloads the CSV itself. That is a second read
             # of a file this pass already had in memory, and deliberately so:
             # it is the one function that writes a per-run JSON exactly as the
-            # live pipeline does, and the repaired set is dozens of runs, not
-            # thousands.
+            # live pipeline does, so a rebuilt file is what the next collection
+            # would have written rather than a second implementation of it.
+            #
+            # Do NOT read a set-size bound into that justification. This comment
+            # used to end "and the repaired set is dozens of runs, not
+            # thousands", which held only while the trigger was #213's
+            # impossible-date test alone. Trigger (2) fires on any moved
+            # capture-date column, so a pass that also carries a date-definition
+            # change rebuilds a large fraction of the series -- measured at 405
+            # of 1,157 gsv runs, 35.0% (see the module docstring). The double
+            # read is worth paying at that scale too; it is the wall clock, not
+            # the correctness, that the operator needs warning about.
             if regenerate_run_json(conn, run_id, args.data_dir) is None:
                 logger.warning(f"Could not rebuild JSON for run {run_id} ({csv_filename})")
             else:

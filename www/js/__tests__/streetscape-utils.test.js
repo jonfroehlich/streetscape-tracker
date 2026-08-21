@@ -754,6 +754,30 @@ test("panoDateOrNull: widening the shapes did not start accepting non-dates", ()
   assert.ok(!Number.isNaN(ts.getTime()));
 });
 
+test("panoDateOrNull: out-of-range months and days do not roll over into plausible dates", () => {
+  // The failure this pins is specific and is the widening's own: `new Date(y,
+  // m, d)` ROLLS OVER, so an unbounded month group turns "2022-13" into Jan
+  // 2023 and "2022-00" into Dec 2021 — dates isPlausibleCaptureDate ACCEPTS.
+  // A corrupt field would then be drawn on the map and counted in a year
+  // bucket, while Python's ISO8601 parse coerces the same value to NaT. A
+  // plausible wrong date is worse than an honest null, so the two readers have
+  // to agree that these are not dates.
+  //
+  // "2022-09-32" is the same hole one field over and PREDATES the widening: it
+  // matched the old `\d{2}` day group and rolled to Oct 2.
+  //
+  // Asserted through isPlausibleCaptureDate rather than on getMonth(), because
+  // what matters is the verdict the map acts on, not which wrong date was
+  // produced.
+  for (const bad of ["2022-13", "2022-00", "2022-09-32", "2022-09-00"]) {
+    assert.equal(isPlausibleCaptureDate(panoDateOrNull(bad), "gsv"), false, bad);
+  }
+  // ...while every in-range spelling still parses on the fast path.
+  assert.equal(panoDateOrNull("2022-12").getMonth(), 11);
+  assert.equal(panoDateOrNull("2022-01-31").getDate(), 31);
+  assert.equal(panoDateOrNull("2022-10-01").getMonth(), 9);
+});
+
 // --- getColor: YlOrRd age color scale boundaries ----------------------------
 //
 // The scale's documented stops: age 0 → rgb(255, 255, 178) (light yellow),

@@ -15,6 +15,7 @@ import sys
 from datetime import date
 
 import pandas as pd
+import pytest
 
 from streetscape_metadata_tracker import db
 from streetscape_metadata_tracker.analysis import calculate_run_stats
@@ -442,3 +443,80 @@ def test_moved_capture_dates_rebuild_the_json_without_an_impossible_date(conn, d
         "2022": 1,
         "2024": 1,
     }
+
+
+@pytest.mark.parametrize(
+    "column, wrong_value, rebuilt",
+    [
+        ("oldest_capture_date", "2021-01-01T00:00:00", True),
+        ("newest_capture_date", "2025-12-01T00:00:00", True),
+        ("median_pano_age_years", 99.0, True),
+        # Control: a NON-date column moving must NOT drag the JSON along. The
+        # per-run JSON's age blocks are what trigger (2) exists to repair, and
+        # #213's narrowing moves a pano/coverage stat for nearly every gsv run
+        # — so a trigger that fired on any change at all would rebuild the
+        # whole series every pass, for runs whose published dates are fine.
+        ("unique_panos", 999, False),
+    ],
+)
+def test_each_date_column_independently_triggers_the_json_rebuild(
+    conn, data_dir, column, wrong_value, rebuilt
+):
+    """One stale column at a time — the case a realistic fixture cannot produce.
+
+    scripts/recompute_run_stats.DATE_COLUMNS names three columns and the
+    trigger is `any(c in changed for c in DATE_COLUMNS)`, so a misspelled or
+    dropped entry is not an error: it is a condition that can never be true,
+    and the rebuild silently stops happening for that column forever. Every
+    natural fixture hides that, because oldest, newest and median are a min, a
+    max and a median of ONE population and move together — so this test builds
+    the unnatural case directly, registering a catalog row that is correct in
+    every column but one.
+
+    The module also refuses to import if DATE_COLUMNS drifts out of
+    STAT_COLUMNS; the two guards catch different mistakes (a name that is not a
+    stat column at all, versus a stat column quietly dropped from the trigger).
+    """
+    run_date = date(2026, 4, 15)
+    cid = db.register_city(
+        conn,
+        city_name="Bend",
+        state_name="Oregon",
+        state_code="OR",
+        country_name="United States",
+        country_code="US",
+        center_lat=44.0,
+        center_lon=-121.0,
+        grid_width_m=1000,
+        grid_height_m=1000,
+        step_m=20,
+    )
+    # Every date plausible, so trigger (1) — "the CSV holds an impossible
+    # capture date" — stays silent and cannot mask the column under test.
+    df = make_city_df([("p1", "2020-06-15"), ("p2", "2024-01-10")], run_date=run_date, n_empty=1)
+    csv_name = "bend--oregon--united-states_width_1000_height_1000_step_20_2026-04-15.csv.gz"
+    csv_path = os.path.join(data_dir, csv_name)
+    write_city_csv_gz(df, csv_path)
+
+    # Register the run with the CORRECT stats, then spoil exactly one column.
+    truth = calculate_run_stats(load_city_csv_file(csv_path), run_date, provider="gsv")
+    stored = {**truth, column: wrong_value}
+    db.register_run(conn, city_id=cid, run_date=run_date, csv_filename=csv_name, **stored)
+
+    result = _run_script(data_dir, "--execute", "--regenerate-json")
+    assert result.returncode == 0, result.stderr
+    if rebuilt:
+        # Reported as a MOVED date, never as an impossible one: the two reasons
+        # are counted separately precisely so this cannot pass for the wrong
+        # one, and this fixture's dates are all plausible.
+        assert "0 hold an impossible capture date" in result.stdout
+        assert "1 have capture-date columns this pass moves" in result.stdout
+        assert "Rebuilt 1 of 1" in result.stdout
+        assert os.path.exists(csv_path.replace(".csv.gz", ".json.gz"))
+    else:
+        assert "Rebuilt 0 of 0" in result.stdout
+        assert not os.path.exists(csv_path.replace(".csv.gz", ".json.gz"))
+    # Either way the catalog itself is repaired — the trigger governs the
+    # PUBLISHED file, never whether the stats pass does its job.
+    row = conn.execute("SELECT * FROM runs WHERE city_id = ?", (cid,)).fetchone()
+    assert row[column] == truth[column]

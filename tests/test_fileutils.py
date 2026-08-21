@@ -115,6 +115,13 @@ def test_unreadable_dates_coerce_rather_than_raise(data_dir):
     one because a single row is malformed would take out every statistic in it
     rather than the one date that is actually unusable. Same reasoning as
     analysis._dated_unique's own coerce.
+
+    Scope, because the loader docstring now states it too: this covers every
+    shape a provider has ever written. It is NOT "to_datetime can no longer
+    raise" — a timezone-aware value beside a naive one raises through
+    errors="coerce" under format="ISO8601". No writer in the repo can emit one
+    (standardize_capture_date returns YYYY-MM-DD or None; both census decoders
+    strftime the same), so it is documented rather than guarded.
     """
     df = _load(data_dir, [("p1", "not-a-date"), ("p2", "2022-09"), ("p3", "2022-13")])
 

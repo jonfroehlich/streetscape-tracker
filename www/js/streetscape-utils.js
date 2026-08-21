@@ -939,12 +939,33 @@ function isPlausibleCaptureDate(date, provider) {
  * fileutils.load_city_csv_file's ISO8601 parse), so the map and the published
  * stats describe one population.
  *
+ * The month and day groups are RANGE-bounded rather than `\d{2}`, and that is
+ * the widening's own safety rail rather than fussiness. `new Date(y, m, d)`
+ * ROLLS OVER: an unbounded month group turned "2022-13" into Jan 2023 and
+ * "2022-00" into Dec 2021 — values `isPlausibleCaptureDate` then accepts, so a
+ * corrupt field would have been drawn and bucketed as a real capture instead of
+ * dropped, while Python's ISO8601 parse coerces both to NaT. A plausible wrong
+ * date is worse than an honest null (the same rule KartaView's
+ * `shot_date >= date_added` guard exists for). Bounded, they miss the regex and
+ * fall through to `new Date`, which rejects them too — so JS and Python agree.
+ * The day bound closes the same hole one field over, which predates the
+ * widening: "2022-09-32" matched `\d{2}` and rolled to Oct 2.
+ *
+ * What the regex CANNOT close, stated so nobody reads it as closed: a
+ * shape-valid but calendar-impossible date. "2022-02-30" is NaT in Python and
+ * Mar 2 here, and the `new Date` fallback is no better (Mar 1, via the UTC
+ * parse this function exists to avoid) — so there is no cheap answer, only a
+ * per-row round-trip check for a value no writer in this repo can emit
+ * (standardize_capture_date strptime-validates; both census decoders strftime).
+ * The range bounds are free; that check would not be, and would not be
+ * complete either.
+ *
  * @param {?string} v - ISO date string, or null/undefined.
  * @returns {?Date} A Date (local midnight for date-only), or null when falsy.
  */
 function panoDateOrNull(v) {
   if (!v) return null;
-  const m = /^(\d{4})(?:-(\d{2})(?:-(\d{2}))?)?$/.exec(String(v));
+  const m = /^(\d{4})(?:-(0[1-9]|1[0-2])(?:-(0[1-9]|[12]\d|3[01]))?)?$/.exec(String(v));
   if (m) return new Date(Number(m[1]), Number(m[2] ?? 1) - 1, Number(m[3] ?? 1));
   return new Date(v);
 }

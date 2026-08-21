@@ -19,7 +19,13 @@ METADATA_DTYPES = {
     "pano_lat": pd.Float64Dtype(),  # nullable float
     "pano_lon": pd.Float64Dtype(),  # nullable float
     "pano_id": pd.StringDtype(),  # nullable string
-    "capture_date": str,  # initially read as a str; stored in ISO 8601 format (YYYY-MM-DD)
+    # Read as a str, then parsed by fileutils.load_city_csv_file. Runs collected
+    # since 2026 are written YYYY-MM-DD (standardize_capture_date), but the
+    # legacy pre-2026 runs on disk carry MONTH precision and are never
+    # rewritten, so the on-disk contract is "any ISO 8601 date precision", not
+    # YYYY-MM-DD. Saying otherwise here is what produced issue #226: the loader
+    # parsed with a strict '%Y-%m-%d' and NaT'd every date in those files.
+    "capture_date": str,
     "copyright_info": pd.StringDtype(),  # nullable string
     "status": str,  # status is never null
 }

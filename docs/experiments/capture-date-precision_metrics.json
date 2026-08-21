@@ -1,0 +1,226 @@
+{
+  "topic": "capture-date-precision",
+  "issue": 226,
+  "writeup": "docs/experiments/capture-date-precision.md",
+  "generated_by": "python scripts/capture_date_precision_analyze.py --measure all --docs-dir docs/experiments",
+  "generated_at": "2026-08-21T04:15:11+00:00",
+  "python": "3.14.3",
+  "pandas": "3.0.1",
+  "sweep": {
+    "files_scanned": 1170,
+    "files_unreadable": [],
+    "by_provider": {
+      "gsv": {
+        "files": 1167,
+        "rows_by_shape": {
+          "absent": 559562024,
+          "day": 148455698,
+          "month": 4929989
+        },
+        "day_rows_on_first": 148455698
+      },
+      "mapillary": {
+        "files": 3,
+        "rows_by_shape": {
+          "absent": 1817717,
+          "day": 15306443
+        },
+        "day_rows_on_first": 459611
+      }
+    },
+    "rows_total": 730071871,
+    "rows_by_shape": {
+      "absent": 561379741,
+      "day": 163762141,
+      "month": 4929989
+    },
+    "files_by_shape_set": {
+      "absent-only": 12,
+      "day": 1149,
+      "month": 9
+    },
+    "files_with_reduced_precision": [
+      {
+        "file": "amsterdam_nl_width_23873_height_17012_step_20.csv.gz",
+        "rows": 1016094,
+        "shape_counts": {
+          "absent": 511169,
+          "month": 504925
+        }
+      },
+      {
+        "file": "auckland_nz_width_28538_height_35511_step_20.csv.gz",
+        "rows": 2534352,
+        "shape_counts": {
+          "absent": 1560758,
+          "month": 973594
+        }
+      },
+      {
+        "file": "la_piedad_mx_width_24430_height_21235_step_20.csv.gz",
+        "rows": 1297764,
+        "shape_counts": {
+          "absent": 1179987,
+          "month": 117777
+        }
+      },
+      {
+        "file": "lagos_nigeria_width_35397_height_35388_step_20.csv.gz",
+        "rows": 3132900,
+        "shape_counts": {
+          "absent": 2385803,
+          "month": 747097
+        }
+      },
+      {
+        "file": "nairobi_kenya_width_48987_height_31426_step_20.csv.gz",
+        "rows": 3851400,
+        "shape_counts": {
+          "absent": 2777197,
+          "month": 1074203
+        }
+      },
+      {
+        "file": "nakuru_kenya_width_16385_height_11128_step_20.csv.gz",
+        "rows": 456740,
+        "shape_counts": {
+          "absent": 280211,
+          "month": 176529
+        }
+      },
+      {
+        "file": "saskatoon_sk_width_21989_height_17952_step_20.csv.gz",
+        "rows": 987800,
+        "shape_counts": {
+          "absent": 649936,
+          "month": 337864
+        }
+      },
+      {
+        "file": "taipei_taiwan_width_21063_height_27662_step_20.csv.gz",
+        "rows": 1458736,
+        "shape_counts": {
+          "absent": 699723,
+          "month": 759013
+        }
+      },
+      {
+        "file": "zurich_switzerland_width_13399_height_12724_step_20.csv.gz",
+        "rows": 426790,
+        "shape_counts": {
+          "absent": 187803,
+          "month": 238987
+        }
+      }
+    ],
+    "files_mixing_precisions": []
+  },
+  "parse": {
+    "rows": 3000000,
+    "pandas_version": "3.0.1",
+    "seconds_best_of_3": {
+      "strict_ymd": 0.47,
+      "iso8601": 0.46,
+      "inferred": 0.459
+    },
+    "inference_loss": {
+      "day_first": {
+        "input": [
+          "2022-09-15",
+          "2022-09"
+        ],
+        "inferred": [
+          "2022-09-15",
+          null
+        ],
+        "iso8601": [
+          "2022-09-15",
+          "2022-09-01"
+        ]
+      },
+      "month_first": {
+        "input": [
+          "2022-09",
+          "2022-09-15"
+        ],
+        "inferred": [
+          "2022-09-01",
+          null
+        ],
+        "iso8601": [
+          "2022-09-01",
+          "2022-09-15"
+        ]
+      }
+    }
+  },
+  "asymmetry": {
+    "provider": "gsv",
+    "runs_in_catalog": 1157,
+    "runs_missing_csv": 0,
+    "runs_unreadable": [],
+    "by_reader": {
+      "strict_ymd": {
+        "moved": 383,
+        "unchanged": 760,
+        "value_to_null": 14
+      },
+      "iso8601": {
+        "moved": 383,
+        "null_to_value": 8,
+        "unchanged": 752,
+        "value_to_null": 14
+      }
+    },
+    "runs_restored_by_iso8601": [
+      {
+        "city_id": "amsterdam--north-holland--netherlands",
+        "run_date": "2024-12-15",
+        "oldest_capture_date": "2008-03-01T00:00:00",
+        "newest_capture_date": "2024-10-01T00:00:00"
+      },
+      {
+        "city_id": "auckland--auckland--new-zealand",
+        "run_date": "2024-12-15",
+        "oldest_capture_date": "2007-12-01T00:00:00",
+        "newest_capture_date": "2024-09-01T00:00:00"
+      },
+      {
+        "city_id": "la_piedad_mx--michoac\u00e1n--mexico",
+        "run_date": "2024-12-15",
+        "oldest_capture_date": "2008-12-01T00:00:00",
+        "newest_capture_date": "2024-10-01T00:00:00"
+      },
+      {
+        "city_id": "lagos--lagos-state--nigeria",
+        "run_date": "2024-12-15",
+        "oldest_capture_date": "2016-10-01T00:00:00",
+        "newest_capture_date": "2024-08-01T00:00:00"
+      },
+      {
+        "city_id": "nairobi--nairobi-county--kenya",
+        "run_date": "2024-12-15",
+        "oldest_capture_date": "2015-02-01T00:00:00",
+        "newest_capture_date": "2024-08-01T00:00:00"
+      },
+      {
+        "city_id": "nakuru--nakuru--kenya",
+        "run_date": "2024-12-15",
+        "oldest_capture_date": "2018-04-01T00:00:00",
+        "newest_capture_date": "2024-06-01T00:00:00"
+      },
+      {
+        "city_id": "taipei--taiwan",
+        "run_date": "2024-12-16",
+        "oldest_capture_date": "2008-12-01T00:00:00",
+        "newest_capture_date": "2024-11-01T00:00:00"
+      },
+      {
+        "city_id": "zurich--zurich--switzerland",
+        "run_date": "2024-12-14",
+        "oldest_capture_date": "2009-05-01T00:00:00",
+        "newest_capture_date": "2024-09-01T00:00:00"
+      }
+    ]
+  }
+}

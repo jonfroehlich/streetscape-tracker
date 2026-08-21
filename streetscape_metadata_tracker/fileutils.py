@@ -56,7 +56,12 @@ def load_city_csv_file(csv_path: str, dtypes: dict | None = None) -> pd.DataFram
     Read a CSV file into a DataFrame, automatically detecting if it's gzipped based on file extension.
     capture_date accepts any ISO 8601 date — day, month or year precision —
     with reduced precision pinned to the 1st, matching standardize_capture_date;
-    anything else parses to NaT (issue #226).
+    anything else parses to NaT (issue #226). One shape is an exception to
+    "anything else parses to NaT" and raises instead: a timezone-AWARE value
+    beside a naive one in the same column ("Mixed timezones detected", which
+    errors="coerce" does not suppress). Nothing can write that today —
+    standardize_capture_date returns YYYY-MM-DD or None, and both census
+    decoders strftime("%Y-%m-%d") — so it is stated rather than guarded.
 
     Args:
         csv_path: Path to the CSV file (can be either .csv or .csv.gz)
@@ -128,6 +133,17 @@ def load_city_csv_file(csv_path: str, dtypes: dict | None = None) -> pd.DataFram
         # every generation at once and pins reduced precision to the 1st, the
         # same convention standardize_capture_date applies at download time (and
         # download_kartaview pins the same way, for the same reason).
+        #
+        # errors="coerce" is what keeps ONE malformed row from taking out a whole
+        # immutable dated snapshot, and it covers every shape a provider has ever
+        # written -- but state its one hole rather than implying it has none: a
+        # timezone-aware value beside a naive one raises "Mixed timezones
+        # detected" THROUGH errors="coerce" (measured on pandas 3.0). The old
+        # "%Y-%m-%d" coerced such a value to NaT instead, so this is a real if
+        # unreachable narrowing: no writer in the repo can emit an offset here.
+        # Left unguarded deliberately -- utc=True would silently SHIFT the naive
+        # values rather than preserve them, which is a worse answer than a loud
+        # failure on a file that cannot currently exist.
         df["capture_date"] = pd.to_datetime(df["capture_date"], format="ISO8601", errors="coerce")
 
         logger.debug(f"Loaded {len(df)} rows from {csv_path}")
