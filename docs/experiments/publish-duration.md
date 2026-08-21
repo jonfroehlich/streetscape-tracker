@@ -45,12 +45,20 @@ logged — on the nights that have a successor at all, the alert's SMTP send —
 durations are somewhat *shorter* than what is quoted here. That direction is the safe one for
 sizing a timeout.
 
-`failed` is the sharpest trap, and it fires. Three of the observed failures took **0.05–0.30 s**
-(a `--local`/SSH mode mismatch, an immediate rsync exit), and pre-#229 the failure line carried
-no elapsed at all — so it is simply the next line after `Publishing via`, 0.05 s later. Left
-unrecognised, the bound fallback scores it as a *healthy publish faster than any real one*,
-becoming the new minimum of the distribution the timeout is sized from. The parser matches it
-explicitly and files it under `failed` with a null duration: counted, never timed.
+`failed` is the sharpest trap, and it fires — three times in this archive. A publish that
+refuses before transferring (a `--local`/SSH mode mismatch, an immediate rsync exit) fails
+*sub-second by construction*, and pre-#229 the failure line carried no elapsed at all, so it is
+simply the next line after `Publishing via`. Left unrecognised, the bound fallback scores it as
+a *healthy publish faster than any real one*, becoming the new minimum of the distribution the
+timeout is sized from. The parser matches it explicitly and files it under `failed` with a null
+duration: counted, never timed.
+
+How fast is recorded rather than described. Each `failed` row carries `successor_delta_s` — the
+interval from `Publishing via` to the failure line, deliberately *not* named like a duration —
+and `summary.failed.successor_delta_s` gives its distribution, so "it would be the new minimum"
+is checkable against the record instead of resting on this paragraph. That field postdates the
+committed JSON below, whose three `failed` rows read `"seconds": null` with no delta; it appears
+on the next regeneration on makelab2 (see **Open**).
 
 **And a fourth thing that is not an observation at all.** A healthy pre-#229 night logged
 *nothing* after `Publishing via` — that is
@@ -120,17 +128,26 @@ never raised, per #167's rule that the tail reports rather than propagates.
   `--local` NFS observations (10.3 s, 23.9 s) sit inside the SSH range, so there is no evident
   regime change — at n=2.
 - **A cold publish is the one case 600 s may not cover.** Into an empty docroot the transfer is
-  the full 30.75 GB, which needs ≳ 41 MB/s to finish inside the bound. That is survivable
+  the full 30.75 GiB, which needs ≳ **52 MiB/s** (55 MB/s decimal) to finish inside the bound.
+  That is survivable
   rather than fatal: rsync's progress is monotone across attempts (completed files persist;
   only the in-flight temp file is lost), so successive nights converge while each one alerts —
   and the operator's actual move for a docroot rebuild is to run the script by hand, outside
   the scheduler, where no bound applies.
-- **The bound cannot stop an uninterruptible child.** `subprocess.run` answers `TimeoutExpired`
-  with `kill()` and then an *unbounded* `wait()`, so a `--local` child blocked in an
-  uninterruptible NFS RPC outlives it — as it would outlive systemd's own SIGKILL. Nothing in
-  userspace fixes that one. The failure line prints the bound and the real elapsed as two
-  numbers (`timed out at 600 s … after 742.3 s`) precisely so that deferral is visible
-  somewhere.
+- **The kill has to reach the process *group*, and `subprocess.run` cannot.** `cmd` is
+  `["bash", sync_data_to_server.sh]` and that script runs rsync as an ordinary child with echoes
+  after it, so there is no implicit `exec`: `run`'s timeout path is `os.kill(self.pid)` and
+  reaches only the shell, leaving the wedged rsync reparented and still holding the transport —
+  still appending to the per-day publish log, and still live when the next publish appends to
+  that same file. `_run_publish_child` therefore uses `Popen(start_new_session=True)` and
+  `os.killpg`, and kills the group on `KeyboardInterrupt` too, since a child in its own session
+  no longer receives the terminal's Ctrl-C.
+- **What remains uncovered is a child the *kernel* will not kill.** A `--local` child blocked in
+  an uninterruptible NFS RPC defers SIGKILL until the mount answers, exactly as it would defer
+  systemd's. No userspace bound ends that process; what this code can do is refuse to *wait* on
+  it (`_PUBLISH_REAP_GRACE_S`, 30 s, whose expiry is logged) rather than inheriting
+  `subprocess.run`'s unbounded post-kill `wait()`. The failure line still prints the bound and
+  the real elapsed as two numbers (`timed out at 600 s … after 742.3 s`) so the gap is visible.
 
 ## Replicating
 
@@ -150,5 +167,7 @@ Sampling invariants are pinned by `tests/test_publish_duration.py`.
 
 - Re-measure once `exact` exists on prod, and re-size if the real distribution differs from
   these upper bounds by more than the margin assumes.
+- Regenerate the record on makelab2 to pick up `successor_delta_s` on the three `failed` rows.
+  The parser writes it as of this change; the committed JSON predates it.
 - The publish is timed but the *aggregate rebuild* still is not — `_MEASURED_TAIL_AGGREGATE_S`
   comes from reading log timestamps by hand. It is the last unbounded term in the sum above.

@@ -53,10 +53,10 @@ def test_exact_and_bound_observations_are_never_pooled(parsed):
 
 
 def test_a_failed_publish_never_enters_the_healthy_distribution(parsed):
-    """A failure is not a publish duration. The prod history holds three that
-    took 0.05-0.30 s (a bad --local/SSH mode, an immediate rsync exit); pooled
-    into the healthy set they drop p25 by more than half and make any bound
-    derived from the result look safer than it is."""
+    """A failure is not a publish duration. A publish that refuses before
+    transferring (a bad --local/SSH mode, an immediate rsync exit) fails
+    sub-second, so pooled into the healthy set it becomes the new minimum of the
+    distribution the timeout is sized from — see the demonstration below."""
     assert len(parsed["failed"]) == 2
     healthy = [o["seconds"] for o in parsed["exact"] + parsed["bound"]]
     assert 3.2 not in healthy and 0.05 not in healthy
@@ -64,6 +64,47 @@ def test_a_failed_publish_never_enters_the_healthy_distribution(parsed):
     summary = pda.summarize(parsed)
     assert summary["failed"]["overall"]["n"] == 1, "only the timed failure is timed"
     assert summary["failed"]["untimed"] == 1
+
+
+def test_pooling_the_failures_would_drag_the_low_percentiles_down(parsed):
+    """The claim the separation rests on, demonstrated rather than asserted in
+    prose — CLAUDE.md's rule that a quoted number comes back to committed code.
+
+    Prod's healthy set is 3.4-25.5 s and its three failures are sub-second, so
+    the direction is what matters and it is arithmetic: pooling moves the low
+    end down while leaving the max alone, which makes a timeout derived from the
+    result look safer than it is.
+    """
+    healthy = [o["seconds"] for o in parsed["bound"]] + [3.4, 6.0, 12.1, 14.5, 25.5]
+    pooled = healthy + [o["successor_delta_s"] for o in parsed["failed"]]
+
+    clean, dirty = pda.percentiles(healthy), pda.percentiles(pooled)
+    assert dirty["min"] < clean["min"], "a refused publish becomes the new minimum"
+    assert dirty["p25"] < clean["p25"], "and it drags the low percentiles with it"
+    assert dirty["max"] == clean["max"], (
+        "while leaving the max untouched — which is why the contamination is "
+        "invisible to anyone reading only the headline figure"
+    )
+
+
+def test_every_failure_records_how_fast_it_failed(parsed):
+    """`seconds` stays null on the pre-#229 line (counted, never timed), but the
+    interval to it is recorded anyway, under a deliberately non-duration name.
+
+    Without it the writeup's "a refused publish would be the new minimum" was a
+    sentence backed by nothing in the committed record — the same single-copy
+    failure the traceability rule exists to prevent, landing on the number that
+    justifies this parser's sharpest design decision.
+    """
+    assert all(o.get("successor_delta_s") is not None for o in parsed["failed"])
+    bare = next(o for o in parsed["failed"] if o["seconds"] is None)
+    assert bare["successor_delta_s"] == 0.05
+
+    stats = pda.summarize(parsed)["failed"]
+    assert stats["successor_delta_s"]["n"] == 2
+    assert "successor_delta_s" not in stats["overall"], (
+        "how fast a failure was LOGGED must never merge into the duration stats"
+    )
 
 
 def test_the_pre_229_bare_failure_line_is_not_read_as_a_fast_publish(parsed):
@@ -181,3 +222,48 @@ def test_the_committed_record_still_matches_the_writeup():
         "the writeup must quote the PUBLISH_TIMEOUT_S it argues for, and it must "
         "be the value scheduler.py holds"
     )
+
+
+def test_the_code_comments_quote_the_same_record_the_writeup_does():
+    """The writeup was pinned to the JSON and the code comments were not — so the
+    writeup is the copy that stayed right and both unpinned copies drifted:
+    scheduler.py and this script's own `_TREE_WALK_PASSES` block each quoted a
+    tree walk of "2.10 s / 0.16 s, a 13x spread" against a record that says
+    2.303 / 0.139 / 0.138. Same failure `_assert_unit_quotes` exists to prevent,
+    one file over, so pin it the same way.
+
+    The file COUNTS are pinned for a second reason: 7,416 is rsync's candidate
+    count and 7,409 is what is actually published, and the comments had merged
+    them while quoting the byte total of the 7,409.
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    record = json.loads(
+        (root / "docs" / "experiments" / "publish-duration_metrics.json").read_text()
+    )
+    walk = record["tree_walk"]
+    scheduler_src = (root / "streetscape_metadata_tracker" / "scheduler.py").read_text()
+    unit = (root / "deploy" / "systemd" / "streetscape-tracker.service").read_text()
+    analyze_src = (root / "scripts" / "publish_duration_analyze.py").read_text()
+
+    warm = min(walk["warm_seconds"])
+    for name, src in (
+        ("scheduler.py", scheduler_src),
+        ("publish_duration_analyze.py", analyze_src),
+    ):
+        assert str(walk["as_found_seconds"]) in src and str(warm) in src, (
+            f"{name} must quote the tree-walk range from "
+            f"publish-duration_metrics.json ({warm}-{walk['as_found_seconds']} s), "
+            f"not a figure recalled from the session that measured it"
+        )
+
+    # The published count is the one these comments are ABOUT; the candidate
+    # count may appear beside it, but never in its place.
+    published = f"{walk['published_files']:,}"
+    for name, src in (("scheduler.py", scheduler_src), ("the systemd unit", unit)):
+        assert published in src, (
+            f"{name} must say {published} published files — {walk['files_considered']:,} is "
+            f"rsync's candidate count, and the byte total quoted beside it is the "
+            f"published one's"
+        )

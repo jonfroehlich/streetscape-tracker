@@ -4299,6 +4299,47 @@ def test_a_failed_index_and_a_failed_publish_arrive_in_ONE_complete_alert(conn, 
     assert "No space left on device" in body, "the shared root cause must reach the body"
 
 
+def _fake_publish_popen(returncode=0, write=None, hangs=False, dies_on_kill=True, seen=None):
+    """A stand-in for the publish child, patched in at ``subprocess.Popen``.
+
+    Patched at the real API rather than at a scheduler-side seam on purpose: the
+    things these tests assert about the child — stdout redirected to a log file,
+    ``start_new_session=True``, a BOUNDED wait — are properties of the call
+    actually handed to the OS, and a helper-level fake would let any of the three
+    be dropped without a test noticing.
+
+    ``hangs`` makes the first wait time out, as a wedged rsync does;
+    ``dies_on_kill=False`` additionally makes it survive SIGKILL, which is the
+    uninterruptible-NFS case the reap grace exists for.
+    """
+
+    class _Proc:
+        pid = 424242
+
+        def __init__(self, cmd, **kwargs):
+            self.cmd, self.returncode, self.killed = cmd, None, False
+            if seen is not None:
+                seen.update(kwargs)
+                seen["cmd"] = cmd
+                seen["waits"] = []
+            if write and kwargs.get("stdout"):
+                kwargs["stdout"].write(write)
+                kwargs["stdout"].flush()
+
+        def wait(self, timeout=None):
+            if seen is not None:
+                seen["waits"].append(timeout)
+            if hangs and (not self.killed or not dies_on_kill):
+                raise subprocess.TimeoutExpired(self.cmd, timeout)
+            self.returncode = returncode
+            return returncode
+
+        def kill(self):
+            self.killed = True
+
+    return _Proc
+
+
 def test_the_publish_child_never_inherits_a_dead_pipe(monkeypatch, tmp_path):
     """
     THE fix for 2026-08-17. Python ignores SIGPIPE only for itself; subprocess
@@ -4312,12 +4353,7 @@ def test_the_publish_child_never_inherits_a_dead_pipe(monkeypatch, tmp_path):
 
     seen = {}
 
-    def fake_run(cmd, **kwargs):
-        seen.update(kwargs)
-        seen["cmd"] = cmd
-        return subprocess.CompletedProcess(cmd, 0)
-
-    monkeypatch.setattr(sched.subprocess, "run", fake_run)
+    monkeypatch.setattr(sched.subprocess, "Popen", _fake_publish_popen(seen=seen))
     cfg = _publishing_cfg(log_dir=str(tmp_path))
 
     assert sched._publish(cfg, "ctx") == 0
@@ -4332,12 +4368,11 @@ def test_a_failed_publish_alert_carries_the_scripts_own_output(monkeypatch, tmp_
     that omits it sends the operator back to the machine to find out why."""
     from streetscape_metadata_tracker import scheduler as sched
 
-    def fake_run(cmd, **kwargs):
-        kwargs["stdout"].write("rsync: connection unexpectedly closed\n")
-        kwargs["stdout"].flush()
-        return subprocess.CompletedProcess(cmd, 12)
-
-    monkeypatch.setattr(sched.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        sched.subprocess,
+        "Popen",
+        _fake_publish_popen(returncode=12, write="rsync: connection unexpectedly closed\n"),
+    )
     alerts = []
     monkeypatch.setattr(sched, "send_alert", lambda cfg, subj, body: alerts.append((subj, body)))
     monkeypatch.setattr(sched, "_recent_log_tail", lambda cfg, n=40: "")
@@ -4366,9 +4401,7 @@ def test_publish_logs_how_long_the_rsync_took(monkeypatch, tmp_path, caplog):
 
     from streetscape_metadata_tracker import scheduler as sched
 
-    monkeypatch.setattr(
-        sched.subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0)
-    )
+    monkeypatch.setattr(sched.subprocess, "Popen", _fake_publish_popen())
     monkeypatch.setattr(sched, "_recent_log_tail", lambda cfg, n=40: "")
 
     with caplog.at_level(logging.INFO):
@@ -4380,9 +4413,7 @@ def test_publish_logs_how_long_the_rsync_took(monkeypatch, tmp_path, caplog):
     # …and a failed one says how long it took to fail: 2 s (bad path, auth) and
     # 25 minutes (a stalled NFS transfer) are different incidents.
     caplog.clear()
-    monkeypatch.setattr(
-        sched.subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 12)
-    )
+    monkeypatch.setattr(sched.subprocess, "Popen", _fake_publish_popen(returncode=12))
     monkeypatch.setattr(sched, "send_alert", lambda *a, **k: None)
     with caplog.at_level(logging.INFO):
         assert sched._publish(_publishing_cfg(log_dir=str(tmp_path)), "ctx") == 12
@@ -4403,16 +4434,38 @@ def test_the_publish_is_bounded(monkeypatch, tmp_path):
 
     seen = {}
 
-    def fake_run(cmd, **kwargs):
-        seen.update(kwargs)
-        return subprocess.CompletedProcess(cmd, 0)
-
-    monkeypatch.setattr(sched.subprocess, "run", fake_run)
+    monkeypatch.setattr(sched.subprocess, "Popen", _fake_publish_popen(seen=seen))
     assert sched._publish(_publishing_cfg(log_dir=str(tmp_path)), "ctx") == 0
-    assert seen.get("timeout") == sched.PUBLISH_TIMEOUT_S, (
+    assert seen["waits"] == [sched.PUBLISH_TIMEOUT_S], (
         "the publish must be bounded; rsync sits on a half-open SSH connection "
         "or a stalled NFS mount indefinitely rather than erroring (#230)"
     )
+    assert seen.get("start_new_session") is True, (
+        "the child must lead its own process group, or the timeout's kill "
+        "reaches only the shell and orphans the rsync — see "
+        "test_a_hung_publish_kills_the_rsync_not_just_the_shell"
+    )
+
+
+# Every subprocess API that STARTS a child, not just the one the file happens to
+# use today. `run` was the only spelling here when #230 landed, so a guard that
+# named only `run` went green the moment _publish moved to `Popen` — while the
+# bound it was guarding moved with it. The blocking wrappers take `timeout=`
+# directly; `Popen` hands the caller the wait, so its bound lives on the
+# `.wait(...)`/`.communicate(...)` that follows.
+_BLOCKING_SUBPROCESS_CALLS = ("run", "call", "check_call", "check_output")
+
+
+def _enclosing_functions(tree):
+    """{node: enclosing ast.FunctionDef} for every Call in the module."""
+    import ast
+
+    owner = {}
+    for fn in ast.walk(tree):
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for node in ast.walk(fn):
+                owner.setdefault(node, fn)
+    return owner
 
 
 def test_every_subprocess_in_the_scheduler_is_bounded():
@@ -4422,27 +4475,55 @@ def test_every_subprocess_in_the_scheduler_is_bounded():
     same reasoning as the `progress()` and `host_lock` source-inspection guards.
     AST rather than a regex, so a bound spelled across wrapped lines still reads
     as one.
+
+    Checks the whole child-starting API surface, not just `subprocess.run`. That
+    is not hypothetical tidiness: #230's own fix moved the publish to `Popen`
+    (the timeout's kill has to reach the process GROUP, since the wedged rsync is
+    a grandchild of the `bash` we spawn), and a `run`-only guard would have gone
+    green across exactly that change. For `Popen` the bound is on the wait, so
+    that is what gets looked for.
     """
     import ast
 
     tree = ast.parse(
         Path(_PROJECT_ROOT, "streetscape_metadata_tracker", "scheduler.py").read_text()
     )
-    unbounded = [
-        node.lineno
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "run"
-        and isinstance(node.func.value, ast.Name)
-        and node.func.value.id == "subprocess"
-        and not any(kw.arg == "timeout" for kw in node.keywords)
-    ]
+    owner = _enclosing_functions(tree)
+
+    def _subprocess_attr(node):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+            return None
+        value = node.func.value
+        if isinstance(value, ast.Name) and value.id == "subprocess":
+            return node.func.attr
+        return None
+
+    unbounded = []
+    for node in ast.walk(tree):
+        attr = _subprocess_attr(node)
+        if attr in _BLOCKING_SUBPROCESS_CALLS:
+            if not any(kw.arg == "timeout" for kw in node.keywords):
+                unbounded.append(f"{attr} at line {node.lineno} (no timeout=)")
+        elif attr == "Popen":
+            # The bound is whatever waits on the handle, so look for a bounded
+            # wait in the same function. Loose on purpose: this guard's job is to
+            # notice an UNBOUNDED child being started, not to typecheck.
+            fn = owner.get(node)
+            waited = fn is not None and any(
+                isinstance(inner, ast.Call)
+                and isinstance(inner.func, ast.Attribute)
+                and inner.func.attr in ("wait", "communicate")
+                and any(kw.arg == "timeout" for kw in inner.keywords)
+                for inner in ast.walk(fn)
+            )
+            if not waited:
+                unbounded.append(f"Popen at line {node.lineno} (no bounded wait/communicate)")
+
     assert not unbounded, (
-        f"subprocess.run at scheduler.py:{unbounded} has no timeout=. Every "
-        f"child this file starts outlives a supervisor deadline if it hangs — "
-        f"which for the publish meant a SIGKILL with nothing in the log but "
-        f"`Publishing via …` (issues #218, #230)."
+        f"unbounded child in scheduler.py: {unbounded}. Every child this file "
+        f"starts outlives a supervisor deadline if it hangs — which for the "
+        f"publish meant a SIGKILL with nothing in the log but `Publishing via …` "
+        f"(issues #218, #230)."
     )
 
 
@@ -4461,10 +4542,9 @@ def test_a_hung_publish_fails_and_alerts_instead_of_hanging(monkeypatch, tmp_pat
 
     from streetscape_metadata_tracker import scheduler as sched
 
-    def fake_run(cmd, **kwargs):
-        raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
-
-    monkeypatch.setattr(sched.subprocess, "run", fake_run)
+    monkeypatch.setattr(sched.subprocess, "Popen", _fake_publish_popen(hangs=True))
+    monkeypatch.setattr(sched.os, "killpg", lambda pgid, sig: None)
+    monkeypatch.setattr(sched.os, "getpgid", lambda pid: pid)
     monkeypatch.setattr(sched, "_recent_log_tail", lambda cfg, n=40: "")
     alerts = []
     monkeypatch.setattr(sched, "send_alert", lambda cfg, subj, body: alerts.append((subj, body)))
@@ -4480,6 +4560,139 @@ def test_a_hung_publish_fails_and_alerts_instead_of_hanging(monkeypatch, tmp_pat
         "the alert must say WHICH failure this was; `exited 1` would send the "
         "operator looking up an rsync exit code that never happened"
     )
+
+
+def test_a_hung_publish_kills_the_rsync_not_just_the_shell(monkeypatch, tmp_path, caplog):
+    """The bound is worth nothing if it kills the wrong process.
+
+    `cmd` is ["bash", sync_data_to_server.sh], and that script runs rsync as an
+    ordinary child with echoes after it — no implicit exec — so
+    subprocess.run's timeout path (Popen.kill() -> os.kill(self.pid)) reaches
+    only the SHELL. The wedged rsync would be reparented and keep going: still
+    holding the half-open SSH connection or the stalled NFS mount, still
+    appending to the per-day publish log after _tail_lines has read it, and
+    still live when a later `regenerate-aggregate --publish` appends to that
+    same file and starts a SECOND rsync into the same docroot.
+
+    So the kill must reach the process GROUP, which is why the child is started
+    with start_new_session=True. Asserted on killpg rather than on a real
+    process tree: spawning one and racing it would make this test the flakiest
+    in the file for no extra confidence.
+    """
+    import logging
+
+    from streetscape_metadata_tracker import scheduler as sched
+
+    seen = {}
+    killed = []
+    monkeypatch.setattr(sched.subprocess, "Popen", _fake_publish_popen(hangs=True, seen=seen))
+    monkeypatch.setattr(sched.os, "getpgid", lambda pid: pid)
+    monkeypatch.setattr(sched.os, "killpg", lambda pgid, sig: killed.append((pgid, sig)))
+    monkeypatch.setattr(sched, "send_alert", lambda *a, **k: None)
+    monkeypatch.setattr(sched, "_recent_log_tail", lambda cfg, n=40: "")
+
+    with caplog.at_level(logging.INFO):
+        assert sched._publish(_publishing_cfg(log_dir=str(tmp_path)), "ctx") != 0
+
+    assert seen["start_new_session"] is True, (
+        "without its own session the child stays in our process group and "
+        "killpg would take the scheduler down with it"
+    )
+    assert killed == [(424242, signal.SIGKILL)], (
+        "the timeout must SIGKILL the child's whole process group; killing the "
+        "bash leader alone orphans the rsync that is actually wedged"
+    )
+    # And the reap that follows is bounded, unlike subprocess.run's.
+    assert seen["waits"][-1] == sched._PUBLISH_REAP_GRACE_S
+
+
+def test_the_publish_reap_is_bounded_when_the_kernel_refuses_the_kill(
+    monkeypatch, tmp_path, caplog
+):
+    """The case no userspace bound can fix, and the one thing this code can still
+    do about it: not wait.
+
+    A --local child blocked in an uninterruptible NFS RPC defers SIGKILL until
+    the mount answers — exactly as it would defer systemd's. subprocess.run's
+    post-kill wait() is unbounded, so inheriting it would hand the tail back the
+    very wait PUBLISH_TIMEOUT_S exists to end. The reap gives up after
+    _PUBLISH_REAP_GRACE_S, says so, and lets the tail finish.
+    """
+    import logging
+
+    from streetscape_metadata_tracker import scheduler as sched
+
+    monkeypatch.setattr(
+        sched.subprocess, "Popen", _fake_publish_popen(hangs=True, dies_on_kill=False)
+    )
+    monkeypatch.setattr(sched.os, "getpgid", lambda pid: pid)
+    monkeypatch.setattr(sched.os, "killpg", lambda pgid, sig: None)
+    monkeypatch.setattr(sched, "send_alert", lambda *a, **k: None)
+    monkeypatch.setattr(sched, "_recent_log_tail", lambda cfg, n=40: "")
+
+    with caplog.at_level(logging.INFO):
+        assert sched._publish(_publishing_cfg(log_dir=str(tmp_path)), "ctx") != 0
+
+    assert "did not die within" in caplog.text, (
+        "a child that survives SIGKILL must be named, not silently abandoned — "
+        "it is still holding the mount the next publish will want"
+    )
+
+
+def test_a_publish_interrupted_by_ctrl_c_still_kills_its_group(monkeypatch, tmp_path):
+    """start_new_session takes the child OUT of the terminal's foreground process
+    group, so Ctrl-C no longer reaches it — which would trade the timeout's
+    orphan for an interactive one. Anything unwinding past the wait kills the
+    group on the way out.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    class _Interrupting:
+        pid = 424242
+
+        def __init__(self, cmd, **kw):
+            pass
+
+        def wait(self, timeout=None):
+            raise KeyboardInterrupt
+
+        def kill(self):
+            pass
+
+    killed = []
+    monkeypatch.setattr(sched.subprocess, "Popen", _Interrupting)
+    monkeypatch.setattr(sched.os, "getpgid", lambda pid: pid)
+    monkeypatch.setattr(sched.os, "killpg", lambda pgid, sig: killed.append(pgid))
+
+    with pytest.raises(KeyboardInterrupt):
+        sched._publish(_publishing_cfg(log_dir=str(tmp_path)), "ctx")
+    assert killed == [424242], "Ctrl-C must not leave the rsync running detached"
+
+
+def test_the_batch_email_tail_survives_a_pasted_publish_failure(monkeypatch, tmp_path):
+    """#218 put the publish log's tail INTO the scheduler log, and the batch email
+    quotes that log's last N lines — so the fix can evict the context it exists
+    to be read beside.
+
+    A failed publish contributes _CHILD_LOG_TAIL_LINES + 2 lines and is the LAST
+    thing a night writes, so at the old 40-line default it took 27 of 40 and
+    pushed out which cities failed and which host refused us. The window is
+    sized against what gets pasted into the log, not against the log's own
+    narrative.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    assert sched._BATCH_LOG_TAIL_LINES >= 3 * (sched._CHILD_LOG_TAIL_LINES + 2) + 20, (
+        "the batch email's window must hold a failed publish plus a couple of "
+        "failed channels AND still show the night's own summary lines; sized "
+        "below that, the most recent pasted block silently evicts the rest"
+    )
+
+    log = tmp_path / "streetscape_scheduler.log"
+    log.write_text("".join(f"line {i}\n" for i in range(400)), encoding="utf-8")
+    cfg = _publishing_cfg(log_dir=str(tmp_path))
+    tail = sched._recent_log_tail(cfg, sched._BATCH_LOG_TAIL_LINES)
+    assert len(tail.splitlines()) == sched._BATCH_LOG_TAIL_LINES
 
 
 def test_a_failed_publish_reaches_the_batch_email_through_the_scheduler_log(monkeypatch, tmp_path):
@@ -4499,12 +4712,11 @@ def test_a_failed_publish_reaches_the_batch_email_through_the_scheduler_log(monk
 
     from streetscape_metadata_tracker import scheduler as sched
 
-    def fake_run(cmd, **kwargs):
-        kwargs["stdout"].write("rsync: connection unexpectedly closed\n")
-        kwargs["stdout"].flush()
-        return subprocess.CompletedProcess(cmd, 12)
-
-    monkeypatch.setattr(sched.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        sched.subprocess,
+        "Popen",
+        _fake_publish_popen(returncode=12, write="rsync: connection unexpectedly closed\n"),
+    )
     cfg = _publishing_cfg(log_dir=str(tmp_path))
 
     handler = logging.FileHandler(tmp_path / "streetscape_scheduler.log", encoding="utf-8")

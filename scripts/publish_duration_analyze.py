@@ -24,10 +24,16 @@ number that is wrong in a direction nobody would notice:
           that have a successor line is the alert's SMTP send. This is the only
           population available before #229 is deployed, which is why it exists at
           all — and precisely why it must stay labelled.
-  failed  `Publish script failed (…) after N.N s`. NOT a publish duration. Three
-          of the observed failures are 0.05-0.30 s (a bad --local/SSH mode, an
-          immediate rsync exit); pooled into the healthy set they drag p25 down
-          by a factor of two and make the bound look safer than it is.
+  failed  `Publish script failed (…) after N.N s`. NOT a publish duration. A
+          failure is sub-second BY CONSTRUCTION whenever the script refuses
+          before transferring (a bad --local/SSH mode, an immediate rsync exit),
+          so pooled into the healthy set it becomes the new minimum of the
+          distribution the timeout is sized from and drags p25 down with it.
+          Each failure therefore records `successor_delta_s` — how long after
+          `Publishing via` the failure line was logged — as a deliberately
+          NON-duration field, so that claim is checkable against the record
+          instead of resting on prose. `seconds` stays null on the pre-#229
+          line: counted, never timed.
 
 A further trap the `bound` population has all to itself: a healthy pre-#229 night
 logged NOTHING after `Publishing via`, so its successor line — if the file has
@@ -171,7 +177,7 @@ def parse_log(text: str, bound_cutoff_s: float = DEFAULT_BOUND_CUTOFF_S) -> dict
             if _PUBLISHING_RE.match(lines[j]):
                 break
         if resolved:
-            kind, secs, why, _j = resolved
+            kind, secs, why, j = resolved
             obs = {
                 "seconds": None if secs is None else round(secs, 3),
                 "mode": mode,
@@ -179,6 +185,21 @@ def parse_log(text: str, bound_cutoff_s: float = DEFAULT_BOUND_CUTOFF_S) -> dict
             }
             if why:
                 obs["why"] = why
+            if kind == "failed":
+                # How long after `Publishing via` the failure was logged. NOT a
+                # duration and deliberately not named like one — a refused
+                # publish is sub-second, and pooling that into the healthy set
+                # is this parser's sharpest hazard. Recording it is what makes
+                # "it would be the new minimum" a checkable claim rather than a
+                # sentence in a writeup, which is the same single-copy failure
+                # CLAUDE.md's traceability rule exists to prevent. The
+                # `excluded` rows below carry the identically-named field.
+                obs["successor_delta_s"] = round(
+                    (
+                        _parse_ts(_LINE_RE.match(lines[j]).group(1)) - _parse_ts(started_at)
+                    ).total_seconds(),
+                    3,
+                )
             out[kind].append(obs)
             continue
 
@@ -233,6 +254,13 @@ def summarize(observations: dict) -> dict:
         entry = {"overall": percentiles([r["seconds"] for r in timed])}
         if len(timed) != len(rows):
             entry["untimed"] = len(rows) - len(timed)
+        # Summarized for `failed` only, and never merged into `overall`: it is
+        # how fast the failure was LOGGED, not how long a publish took. It exists
+        # so the writeup's "a refused publish would be the new minimum" is a
+        # figure in the record rather than a claim in prose.
+        deltas = [r["successor_delta_s"] for r in rows if r.get("successor_delta_s") is not None]
+        if deltas:
+            entry["successor_delta_s"] = percentiles(deltas)
         for mode in ("local", "ssh"):
             in_mode = [r["seconds"] for r in timed if r["mode"] == mode]
             if in_mode:
@@ -269,10 +297,11 @@ def published_volume(data_dir: str | None = None) -> tuple[int, int]:
 
 # Repeats of the dry run, because ONE number would misrepresent it: the walk is
 # an NFS stat() sweep, so it is dominated by the client's dentry cache. Measured
-# on makelab2 2026-08-20, the as-found pass took 2.10 s and a warm repeat 0.16 s
-# — a 13x spread that a single figure would silently pick a side of. The first
-# pass is reported as `as_found` (whatever cache state the host was in) and the
-# rest as warm; the writeup quotes the range, not a point.
+# on makelab2 2026-08-20, three passes ran 2.303 / 0.139 / 0.138 s — a 17x spread
+# that a single figure would silently pick a side of. The first pass is reported
+# as `as_found` (whatever cache state the host was in) and the rest as warm; the
+# writeup quotes the range, not a point. Those are the figures in
+# publish-duration_metrics.json; do not restate them from memory here.
 _TREE_WALK_PASSES = 3
 
 
