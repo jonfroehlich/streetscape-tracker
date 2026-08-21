@@ -920,7 +920,7 @@ function isPlausibleCaptureDate(date, provider) {
  * `new Date(null)` silently rendering as the Unix epoch (12/31/1969)
  * instead of a "—"/"No data" placeholder (issue #122, #69 family).
  *
- * Date-ONLY strings ("YYYY-MM-DD") are parsed as LOCAL midnight, not UTC:
+ * Date-ONLY strings are parsed as LOCAL midnight, not UTC:
  * `new Date("2023-01-01")` is UTC midnight, and reading it back with local
  * getters (toLocaleDateString, getFullYear) west of UTC shifts every date
  * back a day — and every January/year-precision capture date back a whole
@@ -928,13 +928,24 @@ function isPlausibleCaptureDate(date, provider) {
  * US visitors saw those panos in the previous year's filter bucket and
  * color. Full timestamps (with a time component) still parse natively.
  *
+ * All THREE ISO precisions are matched — "YYYY-MM-DD", "YYYY-MM", "YYYY" —
+ * because city.js streams the run CSV itself and the legacy pre-2026 runs
+ * carry MONTH precision, are never rewritten, and reach here verbatim (issue
+ * #226). Matching only the full form sent those through `new Date("2022-09")`,
+ * which is the very UTC parse the paragraph above exists to avoid, and at a
+ * whole month's magnitude rather than a day's: west of UTC "2022-09" read back
+ * as August and "2022-01" as 2021. Reduced precision is pinned to the 1st, the
+ * same convention Python applies (standardize_capture_date, and
+ * fileutils.load_city_csv_file's ISO8601 parse), so the map and the published
+ * stats describe one population.
+ *
  * @param {?string} v - ISO date string, or null/undefined.
  * @returns {?Date} A Date (local midnight for date-only), or null when falsy.
  */
 function panoDateOrNull(v) {
   if (!v) return null;
-  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(v));
-  if (m) return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  const m = /^(\d{4})(?:-(\d{2})(?:-(\d{2}))?)?$/.exec(String(v));
+  if (m) return new Date(Number(m[1]), Number(m[2] ?? 1) - 1, Number(m[3] ?? 1));
   return new Date(v);
 }
 
