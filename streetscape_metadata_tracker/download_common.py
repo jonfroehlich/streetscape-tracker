@@ -336,6 +336,96 @@ def generate_grid_arrays(
     return lats, lons, i_idx, j_idx
 
 
+# ── Grid geometry: shared by every provider ──────────────────
+#
+# These three lived in download_mapillary.py, which made them unreachable to a
+# second census provider without a provider-to-provider import (KartaView had
+# resorted to a function-local one). They are pure geodesy over the frozen grid
+# and know nothing about tiles, so they belong beside generate_grid_arrays.
+
+
+# Meters per degree of latitude (WGS84 mean). Kept for rough offset math in
+# tests/estimates; the actual grid assignment uses the latitude-local series
+# below (the mean constant mis-assigned edge panos by whole grid rows —
+# ~0.7% error at the equator is +1 row at 2.5 km from center).
+_M_PER_DEG_LAT = 111320.0
+
+
+def _meters_per_degree(lat_deg):
+    """
+    (m_per_deg_lat, m_per_deg_lon) at a latitude, via the standard WGS84
+    series expansion. Accepts scalars or numpy arrays. Matches the geodesic
+    math that builds the grid to well under a meter over a city-sized area,
+    so nearest-grid-point assignment can't drift by rows near the edges.
+    """
+    phi = np.radians(lat_deg)
+    m_lat = (
+        111132.92 - 559.82 * np.cos(2 * phi) + 1.175 * np.cos(4 * phi) - 0.0023 * np.cos(6 * phi)
+    )
+    m_lon = 111412.84 * np.cos(phi) - 93.5 * np.cos(3 * phi) + 0.118 * np.cos(5 * phi)
+    return m_lat, m_lon
+
+
+def grid_bbox(
+    center_lat: float, center_lon: float, grid_width: float, grid_height: float, step_length: float
+) -> tuple[float, float, float, float]:
+    """
+    (min_lon, min_lat, max_lon, max_lat) covering the sampling grid plus a
+    half-step margin, computed with the same geodesic math that builds the
+    grid so the two always agree. The margin admits images that lie just
+    outside the outermost grid points but are still nearest to them.
+    """
+    origin = geopy.Point(center_lat, center_lon)
+    half_h = grid_height / 2 + step_length / 2
+    half_w = grid_width / 2 + step_length / 2
+    north = geopy.distance.distance(meters=half_h).destination(origin, 0)
+    south = geopy.distance.distance(meters=half_h).destination(origin, 180)
+    east = geopy.distance.distance(meters=half_w).destination(origin, 90)
+    west = geopy.distance.distance(meters=half_w).destination(origin, 270)
+    return west.longitude, south.latitude, east.longitude, north.latitude
+
+
+def assign_to_grid(
+    image_lats: np.ndarray,
+    image_lons: np.ndarray,
+    center_lat: float,
+    center_lon: float,
+    width_steps: int,
+    height_steps: int,
+    step_length: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Vectorized nearest-grid-point assignment.
+
+    The grid is a regular lattice of step_length meters indexed by
+    (i, j) = (north, east) offsets from the center (see
+    generate_grid_points), so the nearest point is just a rounded division
+    in a local equirectangular projection — no spatial index needed.
+
+    Returns (i, j, in_grid) arrays; in_grid is False for images farther
+    than half a step beyond the outermost grid points, which the caller
+    drops.
+    """
+    # Latitude-local scales: the grid is built geodesically, so a global
+    # mean m/° mis-assigns by whole rows near the grid edges. dy uses the
+    # series at the center↔image midpoint latitude; dx uses each image's
+    # own latitude (grid rows are constant-latitude, and their east-west
+    # spacing shrinks with cos φ at THAT row, not at the center).
+    m_lat_mid, _ = _meters_per_degree((image_lats + center_lat) / 2)
+    _, m_lon_local = _meters_per_degree(image_lats)
+    dy_m = (image_lats - center_lat) * m_lat_mid
+    dx_m = (image_lons - center_lon) * m_lon_local
+    i = np.rint(dy_m / step_length).astype(int)
+    j = np.rint(dx_m / step_length).astype(int)
+
+    # Replicate generate_grid_points' index ranges exactly (note: Python
+    # floor division makes the ranges asymmetric for odd step counts).
+    i_min, i_max = -height_steps // 2, height_steps // 2
+    j_min, j_max = -width_steps // 2, width_steps // 2
+    in_grid = (i >= i_min) & (i <= i_max) & (j >= j_min) & (j <= j_max)
+    return i, j, in_grid
+
+
 def standardize_capture_date(date_str: str | None) -> str | None:
     """Standardizes a capture date string to ISO 8601 format (YYYY-MM-DD).
 

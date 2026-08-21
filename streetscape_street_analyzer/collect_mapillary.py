@@ -41,6 +41,7 @@ import numpy as np
 import pandas as pd
 
 from streetscape_metadata_tracker.analysis import FLAT_ONLY
+from streetscape_metadata_tracker.census import census_is_pano
 from streetscape_metadata_tracker.download_mapillary import (
     DEFAULT_TILE_REQUESTS_PER_MINUTE,
     build_empty_rows,
@@ -148,7 +149,15 @@ def nearest_images_to_samples(
             matches[joined["sample_idx"].to_numpy()] = joined["image_idx"].to_numpy()
         return matches
 
-    is_pano = census["is_pano"].to_numpy()
+    # Through census_is_pano, not census["is_pano"].to_numpy(): a provider is
+    # free to declare the column nullable (KartaView's projection is decoded to
+    # a plain bool today, but both OUTPUT schemas use pd.BooleanDtype()), and a
+    # single null degrades .to_numpy() to an object array on which `~` raises --
+    # after the whole paced tile fetch is spent. Same reason the grid tail reads
+    # it there -- and this function in particular is the one a second census
+    # provider reuses verbatim (it touches only lon/lat/is_pano); its neighbour
+    # build_streetwalk_rows is Mapillary-specific and will have to be generalized.
+    is_pano = census_is_pano(census)
     return _join(np.flatnonzero(is_pano)), _join(np.flatnonzero(~is_pano))
 
 
@@ -262,7 +271,7 @@ async def collect_mapillary_street_samples_async(
     # indexing it would keep the whole census resident past the `del` below,
     # through the join, the row build and the CSV write.
     census = fetched.pop("census")
-    num_flat_images = int((~census["is_pano"].to_numpy()).sum())
+    num_flat_images = int((~census_is_pano(census)).sum())
     logger.info(
         "%s: %d Mapillary images (%d panos, %d flat) from %d tiles → scoring %d sample points",
         city.city_id,
