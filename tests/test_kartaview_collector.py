@@ -23,6 +23,7 @@ plausible-looking edit would undo:
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import math
 
@@ -1238,3 +1239,727 @@ def test_a_page_size_above_the_server_cap_does_not_silently_truncate(monkeypatch
     pages = {call.page for call in calls}
     assert pages == {1, 2, 3, 4}, f"expected 8000/2000 = 4 pages, saw {sorted(pages)}"
     assert result["failed_cells"] == []
+
+
+# ── The checkpoint (issue #239) ────────────────────────────────────────────
+#
+# A sweep is hours of paced fetching, so the thing under test is not "does it
+# write a file" but "does a resumed sweep produce EXACTLY the artifact an
+# uninterrupted one would, having re-asked nothing". Both halves are load-bearing
+# and the first is the one a plausible edit breaks silently.
+
+
+def _sweep_ckpt(monkeypatch, responder, path, **kwargs):
+    """A checkpointed :func:`_sweep`."""
+    return _sweep(monkeypatch, responder, checkpoint_path=str(path), **kwargs)
+
+
+def _failed_sweep_ckpt(monkeypatch, responder, path, **kwargs):
+    """A checkpointed :func:`_failed_sweep`."""
+    return _failed_sweep(monkeypatch, responder, checkpoint_path=str(path), **kwargs)
+
+
+def _state(path):
+    """The commit record, as a dict."""
+    return json.loads((path / kv.CHECKPOINT_STATE_FILENAME).read_text())
+
+
+def _parts(path):
+    return sorted(p.name for p in path.glob("part-*.parquet"))
+
+
+def _photos(call):
+    """
+    Two photos unique to this circle, plus one every circle re-sees.
+
+    The shared id is the point: the lattice covers each square with its
+    circumscribed circle, so the sweep re-sees ~pi/2 of everything and
+    dedupe_census keeps a repeated id at the position of its FIRST appearance
+    with its LAST values. Carrying that across a process boundary is what the
+    checkpoint's fetch-order contract exists for.
+    """
+    tag = f"{call.lat:.5f}:{call.lon:.5f}"
+    items = [_item(id=f"{tag}#{n}") for n in range(2)]
+    items.append(_item(id="seen-everywhere", lat=f"{call.lat}", lng=f"{call.lon}"))
+    return items, len(items)
+
+
+def test_a_resumed_census_is_identical_to_an_uninterrupted_one(monkeypatch, tmp_path):
+    """
+    THE test of this feature. A census resumed across a process boundary must be
+    the same frame, row for row and value for value, as one swept in a single
+    go -- because what it becomes is an immutable dated snapshot that diff.py
+    compares to its predecessor, so any reordering surfaces as phantom churn in
+    every city rather than as a visible failure.
+    """
+    whole, whole_calls = _sweep(monkeypatch, _photos)
+
+    ckpt = tmp_path / "sweep"
+    error, night_one = _failed_sweep_ckpt(monkeypatch, _photos, ckpt, max_requests=2)
+    assert isinstance(error, kv.SweepIncompleteError)
+    resumed, night_two = _sweep_ckpt(monkeypatch, _photos, ckpt)
+
+    assert night_one and night_two
+    assert len(night_one) + len(night_two) == len(whole_calls)
+    pd.testing.assert_frame_equal(resumed["census"], whole["census"])
+    assert resumed["raw_photo_count"] == whole["raw_photo_count"]
+    assert resumed["cells_visited"] == whole["cells_visited"]
+
+
+def test_a_sweep_spanning_three_nights_is_still_that_one_census(monkeypatch, tmp_path):
+    """
+    The case the feature is actually for, and structurally distinct from one
+    interruption: night two both READS a checkpoint and WRITES one, so a resume
+    that mis-seeds its own commit -- restarting the part index, dropping the
+    inherited counters, re-committing what it loaded -- shows up only here. It
+    is also the whole-catalog answer, since "a pass takes N nights" is this
+    property applied to a bigger lattice.
+    """
+    whole, whole_calls = _sweep(monkeypatch, _photos, radius_m=500)
+    assert len(whole_calls) == 9, "the fixture needs enough roots to stop twice"
+
+    ckpt = tmp_path / "sweep"
+    nights = []
+    for budget in (3, 3):
+        error, calls = _failed_sweep_ckpt(
+            monkeypatch,
+            _photos,
+            ckpt,
+            radius_m=500,
+            max_requests=budget,
+            checkpoint_request_interval=2,
+        )
+        assert isinstance(error, kv.SweepIncompleteError)
+        nights.append(calls)
+    final, last = _sweep_ckpt(monkeypatch, _photos, ckpt, radius_m=500)
+    nights.append(last)
+
+    assert [len(n) for n in nights] == [3, 3, 3]
+    assert len({c.key for n in nights for c in n}) == 9, "no circle asked twice"
+    pd.testing.assert_frame_equal(final["census"], whole["census"])
+    assert final["api_requests"] == 3
+    assert final["api_requests_total"] == len(whole_calls) == 9
+    assert final["cells_visited"] == whole["cells_visited"]
+    assert not ckpt.exists()
+
+
+def test_a_hole_punched_on_night_one_still_refuses_the_snapshot_on_night_two(monkeypatch, tmp_path):
+    """
+    Failed cells are inherited across a resume, and must be: a cell that
+    genuinely never answered is a hole in the bbox whether it was asked
+    yesterday or today, and the area guard is what stops an immutable dated
+    snapshot being published around it. Losing them on resume would turn a
+    refused sweep into a silently incomplete one.
+
+    The refusal keeps the checkpoint, because a complete one re-finalizes
+    without spending a request -- so the operator's retry is free, and the reset
+    is the deliberate act of deleting the directory.
+    """
+    ckpt = tmp_path / "sweep"
+    seen = []
+
+    def responder(call):
+        seen.append(call)
+        if len(seen) == 1:
+            raise kv.ResponseError("HTTP 500")  # this root is a hole, permanently
+        return [], 0
+
+    night_one, calls = _failed_sweep_ckpt(monkeypatch, responder, ckpt, max_requests=2, retries=0)
+    assert isinstance(night_one, kv.SweepIncompleteError)
+    assert len(_state(ckpt)["failed_cells"]) == 1
+
+    night_two, _ = _failed_sweep_ckpt(monkeypatch, responder, ckpt)
+    assert not isinstance(night_two, kv.SweepIncompleteError)
+    assert "unmeasured" in str(night_two) and "refusing to finalize" in str(night_two)
+    assert str(ckpt) in str(night_two)
+    assert _state(ckpt)["roots_done"] == 4, "kept, so the retry costs nothing"
+    assert len(calls) == 2
+
+
+def test_a_null_looking_string_survives_the_checkpoint_as_a_string(tmp_path):
+    """
+    Why the parts are parquet and not CSV, pinned as the consequence rather than
+    as the format.
+
+    Every string column here is PROVIDER-SUPPLIED, and pandas' default na_values
+    claims "NA", "null", "None" and "nan". A contributor is free to call
+    themselves NA. Through CSV that photo comes back attributed to
+    "© KartaView" rather than "© KartaView contributor NA" and loses its OSM way
+    -- so a resumed run would publish different rows than an uninterrupted one,
+    which is the one thing a checkpoint must never do.
+    """
+    ckpt = tmp_path / "sweep"
+    ckpt.mkdir()
+    cp = kv.SweepCheckpoint(path=str(ckpt), radius_m=1000)
+    frame = kv.records_to_census(
+        kv.decode_photo_items(
+            [
+                _item(id="a", username="NA", way_id="null", sequence_id="None"),
+                _item(id="b", username=None),
+            ]
+        )
+    )
+    kv._commit_checkpoint(
+        cp,
+        [frame],
+        roots_done=1,
+        failed_cells=[],
+        cells_visited=1,
+        raw_photo_count=2,
+        api_requests_total=1,
+        bbox=BBOX,
+        ipp=kv.IPP_MAX,
+        root_count=4,
+    )
+    (back,) = kv._checkpoint_frames(cp)
+    pd.testing.assert_frame_equal(back, frame)
+    assert list(back["way_id"]) == ["null", "993382884"]
+    assert list(kv._kartaview_image_columns(back)["copyright_info"]) == [
+        "© KartaView contributor NA",
+        "© KartaView",
+    ]
+
+    # And the counterexample, so the reason outlives the choice: the same frame
+    # through the obvious CSV form loses all three values to na_values.
+    csv = io.StringIO()
+    frame.to_csv(csv, index=False)
+    via_csv = pd.read_csv(io.StringIO(csv.getvalue()), dtype=dict(kv._CENSUS_DTYPES))
+    assert via_csv["username"].isna().all()
+    assert via_csv["way_id"].iloc[0] is pd.NA
+
+
+def test_the_committed_parts_are_read_in_fetch_order(tmp_path):
+    """
+    Index order IS fetch order. A directory glob would be lexical, which happens
+    to agree only while the zero-padding holds -- so the reader takes the count
+    from the commit record and never asks the filesystem what is there.
+    """
+    ckpt = tmp_path / "sweep"
+    ckpt.mkdir()
+    cp = kv.SweepCheckpoint(path=str(ckpt), radius_m=1000)
+    for n, ids in enumerate([["a", "b"], ["c"], ["d", "e"]]):
+        kv._commit_checkpoint(
+            cp,
+            [kv.records_to_census(kv.decode_photo_items([_item(id=i) for i in ids]))],
+            roots_done=n + 1,
+            failed_cells=[],
+            cells_visited=n + 1,
+            raw_photo_count=0,
+            api_requests_total=n + 1,
+            bbox=BBOX,
+            ipp=kv.IPP_MAX,
+            root_count=4,
+        )
+    assert _parts(ckpt) == ["part-00000.parquet", "part-00001.parquet", "part-00002.parquet"]
+    combined = kv.concat_census(kv._checkpoint_frames(cp))
+    assert list(combined["id"]) == ["a", "b", "c", "d", "e"]
+
+
+def test_an_interrupted_sweep_re_asks_no_cell_it_already_answered(monkeypatch, tmp_path):
+    """
+    The whole point: what a resume must NOT do is re-spend requests already paid
+    for, at 16/min against a host that has banned this project twice.
+    """
+    ckpt = tmp_path / "sweep"
+    _, night_one = _failed_sweep_ckpt(monkeypatch, _empty, ckpt, max_requests=2)
+    _, night_two = _sweep_ckpt(monkeypatch, _empty, ckpt)
+
+    first = {c.key for c in night_one}
+    second = {c.key for c in night_two}
+    assert first and second
+    assert not first & second, "a resume must not re-ask an answered circle"
+    _, whole = _sweep(monkeypatch, _empty)
+    assert first | second == {c.key for c in whole}
+
+
+def test_a_resume_pins_the_radius_and_skips_calibration(monkeypatch, tmp_path):
+    """
+    Refusals are time-varying (fact 2: Horace refused r=1000 on 0/6 attempts and
+    answered it 2/2 forty-five minutes later), so a resume that re-calibrated
+    could land on a different rung -- and `roots_done` would then index into a
+    lattice it was never recorded against. Every cell already swept would count
+    as covering area it does not cover.
+    """
+    ckpt = tmp_path / "sweep"
+    _failed_sweep_ckpt(monkeypatch, _empty, ckpt, radius_m=500, max_requests=2)
+    assert _state(ckpt)["radius_m"] == 500
+
+    # Night two asks for no particular radius, and the responder would happily
+    # answer r=1000 -- the top of the ladder calibration starts at.
+    result, night_two = _sweep_ckpt(monkeypatch, _empty, ckpt, radius_m=None)
+    assert result["radius_m"] == 500
+    assert {c.radius_m for c in night_two} == {500}, "a resume must not re-calibrate"
+
+
+def test_a_resumed_sweep_reports_only_this_processes_requests(monkeypatch, tmp_path):
+    """
+    `api_requests` feeds db.add_api_usage, which is `requests = requests + ?`
+    keyed by (date, provider). A resumed night reporting the whole sweep would
+    charge last night's requests against tonight's budget gate, and the gate is
+    what decides whether the next city runs at all.
+    """
+    ckpt = tmp_path / "sweep"
+    error, night_one = _failed_sweep_ckpt(monkeypatch, _empty, ckpt, max_requests=2)
+    assert error.api_requests == len(night_one)
+    assert error.api_requests_total == len(night_one)
+
+    result, night_two = _sweep_ckpt(monkeypatch, _empty, ckpt)
+    assert result["api_requests"] == len(night_two)
+    assert result["api_requests_total"] == len(night_one) + len(night_two)
+    assert result["api_requests"] < result["api_requests_total"]
+
+
+def test_a_clean_sweep_deletes_its_checkpoint(monkeypatch, tmp_path):
+    ckpt = tmp_path / "sweep"
+    result, _ = _sweep_ckpt(monkeypatch, _photos, ckpt)
+    assert result["checkpoint_path"] == str(ckpt)
+    assert not ckpt.exists()
+
+
+def test_a_completed_checkpoint_finalizes_without_a_single_request(monkeypatch, tmp_path):
+    """
+    The gap-closer for a crash AFTER the sweep and BEFORE the caller's artifact
+    is durable -- the shape of #157's tail OOM. A checkpoint whose roots are all
+    done re-finalizes from disk, so the ten hours are not re-spent to recover a
+    write that failed.
+    """
+    ckpt = tmp_path / "sweep"
+    # Stand in for a process that died in the tail: the sweep finished, the
+    # checkpoint was never discarded.
+    monkeypatch.setattr(kv, "_discard_checkpoint", lambda path: None)
+    first, _ = _sweep_ckpt(monkeypatch, _photos, ckpt)
+    monkeypatch.undo()
+    assert _state(ckpt)["roots_done"] == first["cells"]
+
+    again, calls = _sweep_ckpt(monkeypatch, _photos, ckpt)
+    assert calls == [], "a complete checkpoint must cost nothing to finalize"
+    pd.testing.assert_frame_equal(again["census"], first["census"])
+    assert again["api_requests"] == 0
+    assert not ckpt.exists()
+
+
+def test_the_progress_bar_resumes_at_the_committed_root_count(monkeypatch, tmp_path):
+    """
+    Paced at 16/min a sweep is the scheduler's longest-running child, and its
+    once-a-minute log line is the only thing distinguishing "slow" from "hung"
+    after a SIGKILL (#157). Restarting that line at 0% on a resumed night would
+    make an almost-finished city look untouched.
+    """
+    ckpt = tmp_path / "sweep"
+    _failed_sweep_ckpt(monkeypatch, _empty, ckpt, max_requests=2)
+    done = _state(ckpt)["roots_done"]
+    assert done == 2
+
+    seen = {}
+    real_progress = kv.progress
+
+    def spy(**kwargs):
+        seen.update(kwargs)
+        return real_progress(**kwargs)
+
+    monkeypatch.setattr(kv, "progress", spy)
+    result, _ = _sweep_ckpt(monkeypatch, _empty, ckpt)
+    assert seen["initial"] == done
+    assert seen["total"] == result["cells"]
+
+
+def test_a_budget_stop_with_a_checkpoint_continues_tomorrow_rather_than_refusing(
+    monkeypatch, tmp_path
+):
+    """
+    The behaviour change #239 is for. Without a checkpoint the same trip marks
+    the rest of the bbox unmeasured and the area guard refuses, discarding the
+    spend; with one it is simply an unfinished sweep. Nothing is finalized
+    either way -- a partial census must never publish as a dated snapshot.
+    """
+    ckpt = tmp_path / "sweep"
+    error, calls = _failed_sweep_ckpt(monkeypatch, _empty, ckpt, max_requests=2)
+    assert isinstance(error, kv.SweepIncompleteError)
+    assert "unmeasured" not in str(error)
+    assert str(ckpt) in str(error)
+    assert error.roots_done == len(calls) == 2
+    assert error.root_count == 4
+    assert ckpt.exists() and _state(ckpt)["roots_done"] == 2
+
+
+def test_an_unvisited_root_is_never_a_failed_cell(monkeypatch, tmp_path):
+    """
+    "Unmeasured" and "not yet visited" are different facts, and conflating them
+    poisons the resumed sweep: the resume would inherit failed cells nothing was
+    ever wrong with, and the area guard would refuse a snapshot that is about to
+    be completed.
+    """
+    ckpt = tmp_path / "sweep"
+    _failed_sweep_ckpt(monkeypatch, _empty, ckpt, max_requests=2)
+    assert _state(ckpt)["failed_cells"] == []
+
+
+def test_a_sweep_incomplete_error_is_not_a_host_condition(monkeypatch, tmp_path):
+    """
+    host_exit_code maps a HostUnavailableError to 81, which the scheduler turns
+    into a night-level breaker skipping every remaining KartaView city. An
+    incomplete sweep is a property of THIS city's budget; the next city is
+    unaffected and must still run.
+    """
+    from streetscape_metadata_tracker.download_common import (
+        SWEEP_INCOMPLETE_EXIT_CODE,
+        HostUnavailableError,
+    )
+
+    ckpt = tmp_path / "sweep"
+    error, _ = _failed_sweep_ckpt(monkeypatch, _empty, ckpt, max_requests=2)
+    assert isinstance(error, DownloadError)
+    assert not isinstance(error, HostUnavailableError)
+    assert SWEEP_INCOMPLETE_EXIT_CODE not in HOST_EXIT_CODES.values()
+    assert SWEEP_INCOMPLETE_EXIT_CODE not in HOST_BUSY_EXIT_CODES.values()
+    assert SWEEP_INCOMPLETE_EXIT_CODE not in (0, 1, 2, 64, 77, 78)
+
+
+def test_a_stop_mid_root_does_not_mark_that_root_done(monkeypatch, tmp_path):
+    """
+    A commit always writes the sweep as of the last completed ROOT BOUNDARY.
+    That invariant is what makes the finally-commit safe from any exception path
+    and what lets the DFS stack stay un-persisted -- so a stop landing inside a
+    cascade rolls the partial root back rather than recording it as swept, which
+    would silently drop whatever its remaining stack still held.
+    """
+    ckpt = tmp_path / "sweep"
+    seen = []
+
+    def responder(call):
+        seen.append(call)
+        if len(seen) == 1:
+            return [], 0  # root 0 answers cleanly and completes
+        if len(seen) == 2:
+            raise kv.BackpressureError("apiCode 690")  # root 1 cascades
+        raise kv.ResponseError("HTTP 500")  # ...and a child of it is broken
+
+    _failed_sweep_ckpt(monkeypatch, responder, ckpt, max_requests=3, retries=0)
+    state = _state(ckpt)
+    assert state["roots_done"] == 1, "the cascading root was not finished"
+    assert state["cells_visited"] == 1, "its subdivisions were rolled back"
+    assert state["failed_cells"] == [], (
+        "the broken child belongs to a root that will be swept again from its "
+        "top, so recording it would double-count it against the area guard"
+    )
+
+
+def test_a_stop_mid_root_discards_that_roots_rows_rather_than_committing_them(
+    monkeypatch, tmp_path
+):
+    """
+    The other half of the boundary invariant, and the expensive half. A root
+    stopped between its pages has photos in hand, but a paged circle is not
+    exhaustive until its last page -- so committing those rows against a
+    `roots_done` that does not include the root would leave the resume free to
+    re-sweep it, and the census would carry its early pages twice while the
+    counters describing it drifted permanently.
+    """
+    ckpt = tmp_path / "sweep"
+
+    def paged(call):
+        # ipp=2 with a total of 6 means three pages: page 1, page 2, and a page
+        # 3 the budget never reaches.
+        return [_item(id=f"{call.lat:.5f}:{call.lon:.5f}#p{call.page}")], 6
+
+    error, calls = _failed_sweep_ckpt(
+        monkeypatch, paged, ckpt, ipp=2, max_requests=2, checkpoint_request_interval=1
+    )
+    assert isinstance(error, kv.SweepIncompleteError)
+    assert {c.page for c in calls} == {1, 2}, "the stop must land inside the page loop"
+    state = _state(ckpt)
+    assert state["roots_done"] == 0, "a half-paged root is not a swept root"
+    assert state["census_rows"] == 0, "its pages are rolled back, not committed"
+    assert state["parts"] == 0
+    assert state["raw_photo_count"] == 0
+
+
+def test_a_checkpoint_that_cannot_be_written_does_not_fail_the_sweep(monkeypatch, tmp_path):
+    """
+    The _write_owner posture: a checkpoint that cannot be written must never be
+    what fails a sweep, since the cost is re-paying a segment rather than a
+    wrong artifact -- and swallowing it is also what stops it masking an
+    in-flight exception.
+
+    It is the one arrangement that leaves uncommitted frames in hand at
+    finalize, so it doubles as the check that they are concatenated AFTER the
+    committed parts rather than before: index order is fetch order.
+    """
+    ckpt = tmp_path / "sweep"
+    whole, _ = _sweep(monkeypatch, _photos)
+
+    real_commit = kv._commit_checkpoint
+    commits = {"n": 0}
+
+    def flaky_commit(*args, **kwargs):
+        commits["n"] += 1
+        if commits["n"] > 1:  # the periodic commit lands; the final one does not
+            raise OSError("no space left on device")
+        return real_commit(*args, **kwargs)
+
+    monkeypatch.setattr(kv, "_commit_checkpoint", flaky_commit)
+    result, _ = _sweep_ckpt(monkeypatch, _photos, ckpt, checkpoint_request_interval=3)
+    assert commits["n"] == 2, "the periodic commit ran, and then the final one failed"
+    pd.testing.assert_frame_equal(result["census"], whole["census"])
+
+
+def test_a_crash_mid_sweep_leaves_a_resumable_checkpoint(monkeypatch, tmp_path):
+    """
+    Not every interruption is one we typed. An unexpected exception must still
+    leave the answered circles on disk -- the finally-commit's job, distinct
+    from the periodic one that covers SIGTERM and SIGKILL, which run no
+    handlers at all.
+    """
+    ckpt = tmp_path / "sweep"
+    calls = []
+
+    def responder(call):
+        calls.append(call)
+        if len(calls) > 2:
+            raise RuntimeError("something entirely unexpected")
+        return _photos(call)
+
+    _install(monkeypatch, responder)
+    with pytest.raises(RuntimeError):
+        asyncio.run(
+            kv.fetch_city_images_async(
+                "Testville",
+                BBOX,
+                "tok",
+                radius_m=1000,
+                retries=0,
+                max_requests_per_minute=0,
+                checkpoint_path=str(ckpt),
+            )
+        )
+    state = _state(ckpt)
+    assert state["roots_done"] == 2
+    assert state["census_rows"] > 0
+    assert _parts(ckpt)
+
+
+def test_a_host_refusal_mid_sweep_still_checkpoints_what_it_paid_for(monkeypatch, tmp_path):
+    """
+    #205 stops at the first refusal; #239 keeps what the refusal interrupted.
+    The two compose: the exception still carries the exact spend and still exits
+    81, it just no longer takes the night's work with it.
+    """
+    ckpt = tmp_path / "sweep"
+    calls = []
+
+    def responder(call):
+        calls.append(call)
+        if len(calls) > 2:
+            raise HostBlockedError("refused", HOST_KARTAVIEW)
+        return _photos(call)
+
+    _install(monkeypatch, responder)
+    with pytest.raises(HostBlockedError) as excinfo:
+        asyncio.run(
+            kv.fetch_city_images_async(
+                "Testville",
+                BBOX,
+                "tok",
+                radius_m=1000,
+                retries=0,
+                max_requests_per_minute=0,
+                checkpoint_path=str(ckpt),
+            )
+        )
+    assert excinfo.value.api_requests == 3
+    assert host_exit_code(excinfo.value) == HOST_EXIT_CODES[HOST_KARTAVIEW]
+    assert _state(ckpt)["roots_done"] == 2
+
+
+def test_a_torn_part_beyond_the_commit_record_is_ignored_and_removed(monkeypatch, tmp_path):
+    """
+    The crash window the commit record exists to close: a part written and
+    renamed into place, and then the process dies before state.json counts it.
+    Its rows were never accounted for, so they are not census -- they are debris,
+    and leaving them would put someone else's bytes under the next part's name.
+    """
+    ckpt = tmp_path / "sweep"
+    _failed_sweep_ckpt(monkeypatch, _photos, ckpt, max_requests=2, checkpoint_request_interval=1)
+    torn_index = _state(ckpt)["parts"]
+    torn = ckpt / kv.CHECKPOINT_PART_TEMPLATE.format(index=torn_index)
+    kv.records_to_census(kv.decode_photo_items([_item(id="never-committed")])).to_parquet(
+        torn, index=False
+    )
+
+    # The load is where the debris goes: a resume that happens to commit nothing
+    # further would otherwise leave it to accumulate across nights.
+    cp = kv.load_checkpoint(str(ckpt), bbox=BBOX, ipp=kv.IPP_MAX, requested_radius_m=1000)
+    assert cp is not None and cp.parts == torn_index
+    assert not torn.exists()
+
+    result, _ = _sweep_ckpt(monkeypatch, _photos, ckpt)
+    assert "never-committed" not in set(result["census"]["id"])
+
+
+def test_a_part_missing_under_the_commit_record_discards_the_whole_checkpoint(
+    monkeypatch, tmp_path
+):
+    ckpt = tmp_path / "sweep"
+    _failed_sweep_ckpt(monkeypatch, _photos, ckpt, max_requests=2, checkpoint_request_interval=1)
+    (ckpt / kv.CHECKPOINT_PART_TEMPLATE.format(index=0)).unlink()
+
+    result, calls = _sweep_ckpt(monkeypatch, _photos, ckpt)
+    assert len(calls) == result["cells"], "a checkpoint we cannot trust means a fresh sweep"
+
+
+def test_a_row_count_that_disagrees_with_the_commit_record_is_discarded(monkeypatch, tmp_path):
+    """
+    The parts are verified from their FOOTERS at load -- a seek to the end of
+    each file, costing nothing -- rather than at finalize, where a truncated
+    part would surface only after the night had already been paid for.
+    """
+    ckpt = tmp_path / "sweep"
+    _failed_sweep_ckpt(monkeypatch, _photos, ckpt, max_requests=2, checkpoint_request_interval=1)
+    state = _state(ckpt)
+    state["census_rows"] += 1
+    (ckpt / kv.CHECKPOINT_STATE_FILENAME).write_text(json.dumps(state))
+
+    result, calls = _sweep_ckpt(monkeypatch, _photos, ckpt)
+    assert len(calls) == result["cells"]
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(lambda s: s.update(bbox=[-1.0, -1.0, 1.0, 1.0]), id="bbox"),
+        pytest.param(lambda s: s.update(format_version=s["format_version"] + 1), id="version"),
+        pytest.param(lambda s: s.update(ipp=s["ipp"] // 2), id="ipp"),
+        pytest.param(lambda s: s.update(root_count=s["root_count"] + 1), id="root_count"),
+        pytest.param(lambda s: s.update(roots_done=s["root_count"] + 99), id="counters"),
+    ],
+)
+def test_a_checkpoint_that_does_not_describe_this_sweep_is_discarded(monkeypatch, tmp_path, mutate):
+    """
+    Discarded, never refused. Both existing checkpoints in the repo degrade to
+    "start over" on anything they cannot trust, and the reason generalizes: a
+    checkpoint is not a comparison whose mismatch would corrupt an artifact, so
+    the walk-diff posture of refusing outright would cost a night to protect
+    nothing.
+    """
+    ckpt = tmp_path / "sweep"
+    _failed_sweep_ckpt(monkeypatch, _empty, ckpt, max_requests=2)
+    state = _state(ckpt)
+    mutate(state)
+    (ckpt / kv.CHECKPOINT_STATE_FILENAME).write_text(json.dumps(state))
+
+    result, calls = _sweep_ckpt(monkeypatch, _empty, ckpt)
+    assert len(calls) == result["cells"], "a mismatched checkpoint must not be resumed"
+
+
+def test_an_explicit_radius_that_contradicts_the_checkpoint_wins(monkeypatch, tmp_path):
+    """
+    A caller that names a radius is not asking to be silently overridden by a
+    stale directory. Its lattice differs, so the checkpoint describes a
+    different sweep and goes.
+    """
+    ckpt = tmp_path / "sweep"
+    _failed_sweep_ckpt(monkeypatch, _empty, ckpt, radius_m=1000, max_requests=2)
+
+    result, calls = _sweep_ckpt(monkeypatch, _empty, ckpt, radius_m=500)
+    assert result["radius_m"] == 500
+    assert {c.radius_m for c in calls} == {500}
+    assert len(calls) == result["cells"]
+
+
+def test_a_changed_lattice_is_discarded_even_at_the_same_radius(monkeypatch, tmp_path):
+    """
+    Guards a change to cells_for_bbox ITSELF. The module notes that correcting
+    the equirectangular cos(mid_lat) shortfall "would move every city's cell
+    count"; this is what makes such a change re-sweep rather than resume onto a
+    lattice whose indices no longer mean what was recorded against them.
+    """
+    ckpt = tmp_path / "sweep"
+    _failed_sweep_ckpt(monkeypatch, _empty, ckpt, max_requests=2)
+
+    real_cells_for_bbox = kv.cells_for_bbox
+    monkeypatch.setattr(kv, "cells_for_bbox", lambda *a, **k: real_cells_for_bbox(*a, **k)[:-1])
+    result, calls = _sweep_ckpt(monkeypatch, _empty, ckpt)
+    assert len(calls) == result["cells"]
+
+
+def test_an_unreadable_checkpoint_degrades_to_a_full_sweep(monkeypatch, tmp_path):
+    ckpt = tmp_path / "sweep"
+    ckpt.mkdir()
+    (ckpt / kv.CHECKPOINT_STATE_FILENAME).write_text("{not json at all")
+
+    result, calls = _sweep_ckpt(monkeypatch, _empty, ckpt)
+    assert len(calls) == result["cells"]
+    assert not ckpt.exists()
+
+
+def test_an_unusable_checkpoint_path_fails_before_the_first_request(monkeypatch, tmp_path):
+    """
+    Asked up front, deliberately: an unwritable checkpoint discovered ten hours
+    in is exactly the failure this feature exists to prevent, arriving from the
+    inside.
+    """
+    blocker = tmp_path / "not-a-directory"
+    blocker.write_text("")
+    error, calls = _failed_sweep_ckpt(monkeypatch, _empty, blocker / "sweep")
+    assert calls == []
+    assert "checkpoint" in str(error)
+    assert error.api_requests == 0
+
+
+def test_the_commit_cadence_is_measured_in_requests_not_roots(monkeypatch, tmp_path):
+    """
+    A root does not cost a fixed amount: one that answers cleanly is a single
+    request, while one that cascades to the radius floor is 1 + 4 + 16 + 64
+    cells at up to retries + 1 attempts each -- ~340 requests, ~21 minutes. So
+    flushing per root would have both a worse worst case and one part file per
+    root (~7,300 for Singapore).
+    """
+    coarse = tmp_path / "coarse"
+    _failed_sweep_ckpt(
+        monkeypatch, _photos, coarse, radius_m=500, max_requests=4, checkpoint_request_interval=3
+    )
+    fine = tmp_path / "fine"
+    _failed_sweep_ckpt(
+        monkeypatch, _photos, fine, radius_m=500, max_requests=4, checkpoint_request_interval=1
+    )
+
+    assert _state(coarse)["roots_done"] == _state(fine)["roots_done"] == 4
+    assert _state(fine)["parts"] == 4, "one commit per root at an interval of one"
+    assert _state(coarse)["parts"] == 2, "the same four roots, committed on request count"
+    assert _state(coarse)["census_rows"] == _state(fine)["census_rows"]
+
+
+def test_a_busy_host_lock_stops_a_resume_before_it_opens_the_checkpoint(monkeypatch, tmp_path):
+    """
+    The checkpoint needs no lock of its own because every read and write of it
+    happens inside the host lock this sweep already takes. A second process is
+    refused before it can read -- let alone rewrite -- a directory the first one
+    is committing into.
+    """
+    from filelock import FileLock
+
+    from streetscape_metadata_tracker import host_lock as host_lock_module
+
+    ckpt = tmp_path / "sweep"
+    _failed_sweep_ckpt(monkeypatch, _empty, ckpt, max_requests=2)
+    before = (ckpt / kv.CHECKPOINT_STATE_FILENAME).read_bytes()
+
+    calls = _install(monkeypatch, _empty)
+    competitor = FileLock(host_lock_module.lock_path(HOST_KARTAVIEW), timeout=0)
+    competitor.acquire()
+    try:
+        with pytest.raises(HostBusyError):
+            asyncio.run(
+                kv.fetch_city_images_async(
+                    "Testville",
+                    BBOX,
+                    "tok",
+                    radius_m=1000,
+                    max_requests_per_minute=0,
+                    checkpoint_path=str(ckpt),
+                )
+            )
+    finally:
+        competitor.release()
+    assert calls == []
+    assert (ckpt / kv.CHECKPOINT_STATE_FILENAME).read_bytes() == before
