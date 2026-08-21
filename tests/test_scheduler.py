@@ -3456,6 +3456,7 @@ def test_stop_timeout_covers_the_publish_tail_it_waits_for():
     which.
     """
     from streetscape_metadata_tracker import catalog_backup
+    from streetscape_metadata_tracker import scheduler as sched
 
     unit = Path(_PROJECT_ROOT, "deploy", "systemd", "streetscape-tracker.service").read_text()
     # Parse systemd's suffixes rather than hard-coding `min`: the TimeoutStartSec
@@ -3469,20 +3470,37 @@ def test_stop_timeout_covers_the_publish_tail_it_waits_for():
         f"{_MEASURED_TAIL_AGGREGATE_S // 60}m{_MEASURED_TAIL_AGGREGATE_S % 60:02d}s",
         "_MEASURED_TAIL_AGGREGATE_S",
     )
+    _assert_unit_quotes(
+        unit, f"PUBLISH_TIMEOUT_S ({sched.PUBLISH_TIMEOUT_S / 60:.0f} min)", "PUBLISH_TIMEOUT_S"
+    )
 
-    # The floor is the SUM of the tail's two large known terms, not the larger of
+    # The floor is the SUM of the tail's large known terms, not the largest of
     # them. Asserting only `> BACKUP_TIMEOUT_S` accepted 11min — which the very
     # sentence justifying that bound rules out, since the aggregate runs BEFORE
     # the backup and neither term substitutes for the other.
-    floor_s = catalog_backup.BACKUP_TIMEOUT_S + _MEASURED_TAIL_AGGREGATE_S
+    #
+    # PUBLISH_TIMEOUT_S is the third term (issue #230) and belongs in the sum for
+    # exactly that reason: the publish runs AFTER both. A bound that merely sits
+    # below TimeoutStopSec on its own — the weaker condition #230 asks for —
+    # still lets the wind-down be SIGKILLed partway through backup + aggregate +
+    # publish, which is the pre-#230 outcome reached one step later. Sizing the
+    # publish bound and sizing this directive are one decision, so they are one
+    # assertion, and it can fail from either side: see the message.
+    floor_s = catalog_backup.BACKUP_TIMEOUT_S + _MEASURED_TAIL_AGGREGATE_S + sched.PUBLISH_TIMEOUT_S
+    publish_ceiling_s = stop_s - catalog_backup.BACKUP_TIMEOUT_S - _MEASURED_TAIL_AGGREGATE_S
     assert stop_s > floor_s, (
-        f"TimeoutStopSec={stop_s:.0f}s cannot reach the publish: the tail's "
-        f"catalog backup ALONE is hard-bounded at "
-        f"{catalog_backup.BACKUP_TIMEOUT_S:.0f}s and aggregate+manifest measured "
-        f"{_MEASURED_TAIL_AGGREGATE_S:.0f}s on the 19-city night of 2026-08-18, "
-        f"so anything at or below {floor_s:.0f}s SIGKILLs the wind-down before "
-        f"the rsync it exists to reach. This is why #206's suggested 10min would "
-        f"have been wrong — and 11min would have been too."
+        f"TimeoutStopSec={stop_s:.0f}s cannot survive its own tail: the catalog "
+        f"backup is hard-bounded at {catalog_backup.BACKUP_TIMEOUT_S:.0f}s, "
+        f"aggregate+manifest measured {_MEASURED_TAIL_AGGREGATE_S:.0f}s on the "
+        f"19-city night of 2026-08-18, and the publish is bounded at "
+        f"PUBLISH_TIMEOUT_S={sched.PUBLISH_TIMEOUT_S:.0f}s, so anything at or "
+        f"below {floor_s:.0f}s SIGKILLs the wind-down partway through the very "
+        f"steps this timeout exists to reach. This is why #206's suggested 10min "
+        f"would have been wrong — and 11min would have been too. The other way "
+        f"to break it is from the publish side: at this TimeoutStopSec, "
+        f"PUBLISH_TIMEOUT_S cannot exceed ~{publish_ceiling_s:.0f}s, because a "
+        f"publish bound that is itself SIGKILLed before it can report is the "
+        f"pre-#230 behaviour under a different name."
     )
     cfg = load_scheduler_config(os.path.join(_PROJECT_ROOT, "config", "scheduler.makelab1.toml"))
     assert stop_s < cfg.max_batch_hours * 3600, (
@@ -4370,6 +4388,138 @@ def test_publish_logs_how_long_the_rsync_took(monkeypatch, tmp_path, caplog):
         assert sched._publish(_publishing_cfg(log_dir=str(tmp_path)), "ctx") == 12
     assert re.search(r"Publish script failed .* after \d+\.\d+ s", caplog.text)
     assert "Published in" not in caplog.text, "a failed publish must not report success"
+
+
+def test_the_publish_is_bounded(monkeypatch, tmp_path):
+    """The publish was the only unbounded subprocess.run in the scheduler, and
+    it sits at the very END of the tail — so a hung rsync loses the publish for
+    a night whose data is already collected (#167's shape by another route) and,
+    since #206, can hold the whole 30-minute stop window by itself (issue #230).
+
+    Asserted on the kwarg rather than on the wall clock: a test that actually
+    waited PUBLISH_TIMEOUT_S out would take ten minutes.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen.update(kwargs)
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(sched.subprocess, "run", fake_run)
+    assert sched._publish(_publishing_cfg(log_dir=str(tmp_path)), "ctx") == 0
+    assert seen.get("timeout") == sched.PUBLISH_TIMEOUT_S, (
+        "the publish must be bounded; rsync sits on a half-open SSH connection "
+        "or a stalled NFS mount indefinitely rather than erroring (#230)"
+    )
+
+
+def test_every_subprocess_in_the_scheduler_is_bounded():
+    """The rule generalises, so enforce it rather than trusting the next author.
+
+    Two call sites is a rule for humans and the third reintroduces #230 — the
+    same reasoning as the `progress()` and `host_lock` source-inspection guards.
+    AST rather than a regex, so a bound spelled across wrapped lines still reads
+    as one.
+    """
+    import ast
+
+    tree = ast.parse(
+        Path(_PROJECT_ROOT, "streetscape_metadata_tracker", "scheduler.py").read_text()
+    )
+    unbounded = [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "run"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "subprocess"
+        and not any(kw.arg == "timeout" for kw in node.keywords)
+    ]
+    assert not unbounded, (
+        f"subprocess.run at scheduler.py:{unbounded} has no timeout=. Every "
+        f"child this file starts outlives a supervisor deadline if it hangs — "
+        f"which for the publish meant a SIGKILL with nothing in the log but "
+        f"`Publishing via …` (issues #218, #230)."
+    )
+
+
+def test_a_hung_publish_fails_and_alerts_instead_of_hanging(monkeypatch, tmp_path, caplog):
+    """A TimeoutExpired is an ordinary publish failure — logged, alerted,
+    nonzero — never an exception, because #167's rule is that the tail reports
+    rather than propagates. Raising here would take down the alert that is the
+    only remaining thing in the tail.
+
+    The line carries the bound AND the real elapsed as two numbers: subprocess's
+    post-kill wait() is unbounded, so a gap between them is a SIGKILL the kernel
+    deferred (an uninterruptible NFS RPC on the --local path), which nothing
+    else in the system would show.
+    """
+    import logging
+
+    from streetscape_metadata_tracker import scheduler as sched
+
+    def fake_run(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+
+    monkeypatch.setattr(sched.subprocess, "run", fake_run)
+    monkeypatch.setattr(sched, "_recent_log_tail", lambda cfg, n=40: "")
+    alerts = []
+    monkeypatch.setattr(sched, "send_alert", lambda cfg, subj, body: alerts.append((subj, body)))
+
+    with caplog.at_level(logging.INFO):
+        rc = sched._publish(_publishing_cfg(log_dir=str(tmp_path)), "ctx")
+
+    assert rc != 0, "a timed-out publish is a failed publish"
+    assert re.search(r"Publish script failed \(timed out at \d+ s\) after \d+\.\d+ s", caplog.text)
+    assert "Published in" not in caplog.text, "a timed-out publish must not report success"
+    assert len(alerts) == 1
+    assert "timed out" in alerts[0][1], (
+        "the alert must say WHICH failure this was; `exited 1` would send the "
+        "operator looking up an rsync exit code that never happened"
+    )
+
+
+def test_a_failed_publish_reaches_the_batch_email_through_the_scheduler_log(monkeypatch, tmp_path):
+    """The gap #218 named, pinned from the side that was broken.
+
+    The nightly path calls _publish(alert_on_failure=False) so _finish_batch can
+    send ONE combined email — and that email pastes _recent_log_tail and nothing
+    else. While the script's output was copied only into _publish's own alert,
+    every night that failed to publish reported a bare status and left the rsync
+    error in a file on a host nobody reads.
+
+    Asserted through _recent_log_tail rather than caplog, because the file is
+    what the email actually quotes: a logger.error that never reached the handler
+    would satisfy caplog and still lose the night's explanation.
+    """
+    import logging
+
+    from streetscape_metadata_tracker import scheduler as sched
+
+    def fake_run(cmd, **kwargs):
+        kwargs["stdout"].write("rsync: connection unexpectedly closed\n")
+        kwargs["stdout"].flush()
+        return subprocess.CompletedProcess(cmd, 12)
+
+    monkeypatch.setattr(sched.subprocess, "run", fake_run)
+    cfg = _publishing_cfg(log_dir=str(tmp_path))
+
+    handler = logging.FileHandler(tmp_path / "streetscape_scheduler.log", encoding="utf-8")
+    sched.logger.addHandler(handler)
+    try:
+        assert sched._publish(cfg, "ctx", alert_on_failure=False) == 12
+    finally:
+        sched.logger.removeHandler(handler)
+        handler.close()
+
+    assert "rsync: connection unexpectedly closed" in sched._recent_log_tail(cfg), (
+        "the batch email quotes the scheduler log and nothing else, so the "
+        "publish script's own output has to land THERE, not only in the alert "
+        "the batch path suppresses (issue #218)"
+    )
 
 
 def test_a_loop_crash_still_names_itself_when_an_index_also_failed(conn, monkeypatch):
