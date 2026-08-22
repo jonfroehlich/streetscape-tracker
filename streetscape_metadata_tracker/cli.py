@@ -702,7 +702,15 @@ async def _collect_one_run(conn, args, city_row, run_date, provider, config, vis
         started_at=started,
         finished_at=finished,
         duration_seconds=duration,
-        api_requests=dict_results["api_requests"],
+        # The SWEEP's cost, not this process's. These are the same number for
+        # every provider that finishes in one go, and differ for a KartaView
+        # sweep resumed across nights (#239): the row describes the run, so it
+        # must say what the run cost, while db.add_api_usage above is fed the
+        # per-process figure because it is additive and keyed by (date,
+        # provider) -- charging it the cumulative total would bill last night's
+        # requests against tonight's budget gate a second time. Falls back for
+        # the providers that publish no cumulative figure.
+        api_requests=dict_results.get("api_requests_total", dict_results["api_requests"]),
         # Flat-image census (issue #116) is a Mapillary downloader artifact,
         # not derivable from the CSV — GSV runs omit it (stored NULL).
         num_flat_images=dict_results.get("num_flat_images"),

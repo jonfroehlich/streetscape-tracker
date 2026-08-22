@@ -22,10 +22,12 @@ from streetscape_metadata_tracker.download_common import (
     HOST_BUSY_EXIT_CODES,
     HOST_EXIT_CODES,
     HOST_MAPILLARY_TILES,
+    SWEEP_INCOMPLETE_EXIT_CODE,
     DownloadError,
     HostBlockedError,
     HostBusyError,
 )
+from streetscape_metadata_tracker.download_kartaview import SweepIncompleteError
 from streetscape_metadata_tracker.download_mapillary import DEFAULT_TILE_REQUESTS_PER_MINUTE
 from streetscape_metadata_tracker.fileutils import load_city_csv_file
 from streetscape_metadata_tracker.naming import generate_run_filename
@@ -438,3 +440,124 @@ def test_cap_dimensions_clamps_each_side_to_40km():
 
     # At or under the cap passes through unchanged
     assert cap_dimensions(40_000, 12_000, "Fine") == (40_000, 12_000)
+
+
+# ── The two KartaView request counts (issues #225, #239) ────────────────────
+
+
+def kartaview_configs(monkeypatch):
+    monkeypatch.setattr(cli, "load_config", lambda provider: {"access_token": "t"})
+
+
+def kartaview_stub(*, api_requests=25, api_requests_total=33):
+    async def stub(**kwargs):
+        path = kwargs["output_csv_gz_path"]
+        write_city_csv_gz(make_mapillary_city_df([("p1", "2023-05-01")]), path)
+        return {
+            "df": load_city_csv_file(path),
+            "filename_with_path": path,
+            "api_requests": api_requests,
+            "api_requests_total": api_requests_total,
+            "num_flat_images": 0,
+            "started_at": "2026-07-01T00:00:00+00:00",
+            "finished_at": "2026-07-01T00:05:00+00:00",
+        }
+
+    return stub
+
+
+def test_the_run_row_takes_the_sweeps_cost_and_the_ledger_this_processs(monkeypatch, catalog):
+    """
+    A resumed KartaView sweep reports two different numbers, and they go to two
+    different places (#239). Getting this backwards is silent in both
+    directions, and it WAS backwards until a real Krabi sweep showed it.
+
+    `runs.api_requests` describes the RUN, so it must say what the whole sweep
+    cost -- 25 tonight after 8 on an earlier night is a run that cost 33.
+    `db.add_api_usage` is additive and keyed by (date, provider), so it takes
+    only tonight's 25: feeding it the cumulative figure would charge the earlier
+    night's requests against tonight's budget gate a second time, and the gate
+    would start deferring cities that fit.
+    """
+    conn, city_id, data_dir = catalog
+    kartaview_configs(monkeypatch)
+    monkeypatch.setattr(cli, "download_kartaview_metadata_async", kartaview_stub())
+
+    assert run_cli(monkeypatch, city_id, data_dir, provider="kartaview") == 0
+    run = db.get_latest_run(conn, city_id, provider="kartaview")
+    assert run.api_requests == 33, "the run row must carry the sweep's cost"
+    assert db.get_api_usage(conn, RUN_DATE, provider="kartaview") == 25, (
+        "the additive daily ledger must carry only this process's spend"
+    )
+
+
+def test_a_provider_without_a_cumulative_count_still_records_its_spend(monkeypatch, catalog):
+    """
+    The fallback matters: gsv and mapillary publish no `api_requests_total`, so
+    a bare subscript would make every one of their runs raise KeyError.
+    """
+    conn, city_id, data_dir = catalog
+    gsv_configs(monkeypatch)
+    monkeypatch.setattr(cli, "download_gsv_metadata_async", stub_downloader([], api_requests=17))
+
+    assert run_cli(monkeypatch, city_id, data_dir, provider="gsv") == 0
+    assert db.get_latest_run(conn, city_id, provider="gsv").api_requests == 17
+
+
+def test_an_incomplete_sweep_exits_83_and_publishes_nothing(monkeypatch, catalog):
+    """
+    83 means "this made progress, run it again", which is a different
+    instruction from 1. The scheduler branch that will read it must `continue`
+    WITHOUT record_attempt(success=False): get_due_cities filters on
+    consecutive_failures and nothing but a success resets it, so a city that
+    legitimately needs three nights would quarantine itself for a whole cycle
+    for making progress.
+    """
+    conn, city_id, data_dir = catalog
+    kartaview_configs(monkeypatch)
+    error = SweepIncompleteError("budget", checkpoint_path="/cp", roots_done=2, root_count=16)
+    error.api_requests = 4
+
+    async def stub(**kwargs):
+        raise error
+
+    monkeypatch.setattr(cli, "download_kartaview_metadata_async", stub)
+    assert (
+        run_cli(monkeypatch, city_id, data_dir, provider="kartaview") == SWEEP_INCOMPLETE_EXIT_CODE
+    )
+    # Nothing published -- a partial census dated today would diff as "every
+    # pano in the rest of the city removed" -- but the spend is on the ledger,
+    # because those requests were issued and KartaView counted them.
+    assert db.get_latest_run(conn, city_id, provider="kartaview") is None
+    assert db.get_api_usage(conn, RUN_DATE, provider="kartaview") == 4
+
+
+def test_a_paused_sweep_alongside_a_real_failure_exits_1_not_83(monkeypatch, catalog):
+    """
+    The same reasoning as the mixed-host case above: 83 tells the caller to just
+    run it again, so an invocation where something ALSO genuinely broke must not
+    wear it and have the real failure read as progress.
+    """
+    conn, city_id, data_dir = catalog
+    monkeypatch.setattr(cli, "load_config", lambda provider: {"api_key": "k", "access_token": "t"})
+
+    async def paused(**kwargs):
+        raise SweepIncompleteError("budget", checkpoint_path="/cp", roots_done=2, root_count=16)
+
+    monkeypatch.setattr(cli, "download_kartaview_metadata_async", paused)
+    assert (
+        run_cli(monkeypatch, city_id, data_dir, provider="kartaview") == SWEEP_INCOMPLETE_EXIT_CODE
+    )
+
+    # Now the same pause with a genuinely broken channel beside it. 'both' is
+    # gsv+mapillary and deliberately excludes kartaview, so this drives the
+    # aggregation directly rather than through a provider list that cannot
+    # contain all three.
+    conn2, city2, data_dir2 = catalog
+    monkeypatch.setattr(
+        cli, "download_gsv_metadata_async", stub_downloader([], error=DownloadError("broken"))
+    )
+    monkeypatch.setattr(
+        cli, "download_mapillary_metadata_async", stub_downloader([], error=DownloadError("broken"))
+    )
+    assert run_cli(monkeypatch, city2, data_dir2, provider="both") == 1
