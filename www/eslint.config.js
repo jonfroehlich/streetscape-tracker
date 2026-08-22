@@ -83,6 +83,21 @@ const tableGlobals = {
   createSortableTable: "readonly",
 };
 
+// Symbols histogram-slider.js DEFINES (issue #250). Loaded between
+// table-utils.js (whose formatCellNumber it consumes) and table-controls.js,
+// which instantiates the component. Only grid.html and streets.html load it —
+// driving.html has no histogram-range filter, so table-controls.js reaches
+// these names only when one exists.
+const histogramSliderGlobals = {
+  HISTOGRAM_SLIDER_BUCKETS: "readonly",
+  sliderStepFor: "readonly",
+  normalizeSliderRange: "readonly",
+  classifyBuckets: "readonly",
+  sliderValuetext: "readonly",
+  roundSliderValue: "readonly",
+  createHistogramSlider: "readonly",
+};
+
 // Symbols table-controls.js DEFINES and the table pages CONSUME (issue
 // #188). Loaded after table-utils.js, whose formatCellNumber it consumes.
 const tableControlGlobals = {
@@ -162,6 +177,18 @@ module.exports = [
     rules: browserRules,
   },
   {
+    // The histogram-slider filter control (issue #250): consumes
+    // table-utils.js's formatCellNumber and defines the
+    // histogramSliderGlobals. Node export shim (`module`) for the unit tests.
+    files: ["js/histogram-slider.js"],
+    languageOptions: {
+      ecmaVersion: 2022,
+      sourceType: "script",
+      globals: { ...globals.browser, ...vendorGlobals, ...tableGlobals, module: "readonly" },
+    },
+    rules: browserRules,
+  },
+  {
     // The exploration chassis (issue #188): consumes table-utils.js's
     // formatCellNumber and defines the tableControlGlobals. Node export shim
     // (`module`) for the unit tests.
@@ -174,6 +201,7 @@ module.exports = [
         ...vendorGlobals,
         ...sharedGlobals,
         ...tableGlobals,
+        ...histogramSliderGlobals,
         module: "readonly",
       },
     },
@@ -193,6 +221,7 @@ module.exports = [
         ...vendorGlobals,
         ...sharedGlobals,
         ...tableGlobals,
+        ...histogramSliderGlobals,
         ...tableControlGlobals,
         module: "readonly",
       },

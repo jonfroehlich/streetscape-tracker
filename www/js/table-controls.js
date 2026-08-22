@@ -513,10 +513,13 @@ function controlsHtml({
             <select id="f-${filter.key}" data-filter="${filter.key}">${options}</select>
           </div>`;
       }
-      if (filter.type === "range") {
-        return `
-          <div class="control control-range" role="group" aria-labelledby="f-${filter.key}-legend">
-            <span class="control-legend" id="f-${filter.key}-legend">${filter.label}</span>
+      // The two numeric-window flavours share their number inputs verbatim —
+      // same `data-filter`/`data-bound` hooks, same aria-labels — because
+      // those are what syncControlsToState, handleControlChange and the e2e
+      // selectors read. `histogram-range` only ADDS the bars + brush above
+      // them (issue #250); the precision path is unchanged, which is also what
+      // keeps the control fully usable by keyboard and by AT.
+      const boundInputs = () => `
             <input type="number" data-filter="${filter.key}" data-bound="min"
                    aria-label="Minimum ${filter.label}" placeholder="min"
                    ${filter.min != null ? `min="${filter.min}"` : ""}
@@ -525,7 +528,31 @@ function controlsHtml({
             <input type="number" data-filter="${filter.key}" data-bound="max"
                    aria-label="Maximum ${filter.label}" placeholder="max"
                    ${filter.min != null ? `min="${filter.min}"` : ""}
-                   ${filter.max != null ? `max="${filter.max}"` : ""}>
+                   ${filter.max != null ? `max="${filter.max}"` : ""}>`;
+      if (filter.type === "range") {
+        return `
+          <div class="control control-range" role="group" aria-labelledby="f-${filter.key}-legend">
+            <span class="control-legend" id="f-${filter.key}-legend">${filter.label}</span>
+            ${boundInputs()}
+          </div>`;
+      }
+      if (filter.type === "histogram-range") {
+        // The bars are decorative (aria-hidden): the two range thumbs carry a
+        // live aria-valuetext and the number inputs carry the exact figures,
+        // so nothing here is announced twice or only visually.
+        return `
+          <div class="control control-histogram" data-histogram="${filter.key}"
+               role="group" aria-labelledby="f-${filter.key}-legend">
+            <span class="control-legend" id="f-${filter.key}-legend">${filter.label}</span>
+            <div class="hist-slider">
+              <div class="hist-bars" aria-hidden="true"></div>
+              <div class="hist-track" aria-hidden="true"><div class="hist-fill"></div></div>
+              <input type="range" class="hist-lo" aria-label="Minimum ${filter.label}">
+              <input type="range" class="hist-hi" aria-label="Maximum ${filter.label}">
+            </div>
+            <div class="hist-bounds">
+              ${boundInputs()}
+            </div>
           </div>`;
       }
       return `
@@ -673,6 +700,84 @@ function createTableControls({
   // right instead of five.
   const stripEl = rootEl.querySelector("#distribution-strip");
 
+  // ── Histogram-sliders (issue #250) ──
+  // One per `histogram-range` filter, each with a FIXED axis seeded once from
+  // the full row set. The domain lives here rather than inside the component
+  // because repaintHistograms has to hand the same domain to histogramBuckets;
+  // keeping one copy is what stops the bars and the handles from ever
+  // describing different scales.
+  const histograms = new Map(); // filter key -> {filter, slider, domain}
+  for (const filter of filters) {
+    if (filter.type !== "histogram-range") continue;
+    const el = rootEl.querySelector(`.control-histogram[data-histogram="${filter.key}"]`);
+    if (!el || typeof createHistogramSlider !== "function") continue;
+    const entry = { filter, domain: null, slider: null };
+    entry.slider = createHistogramSlider({
+      rootEl: el,
+      filter,
+      onInput: (range) => {
+        state.values[filter.key] = range;
+        // Keep the precision inputs showing what the handles say. They are the
+        // same two elements syncControlsToState writes, so a drag and a typed
+        // bound can never disagree about the current window.
+        const [minEl, maxEl] = rootEl.querySelectorAll(`[data-filter="${filter.key}"]`);
+        minEl.value = range.min ?? "";
+        maxEl.value = range.max ?? "";
+        // Debounced on the SAME timer as a typed bound: a drag emits on every
+        // pointer move, and on grid.html that is 1,501 rows re-filtered and
+        // re-rendered per frame.
+        clearTimeout(rangeTimer);
+        rangeTimer = setTimeout(apply, 150);
+      },
+    });
+    histograms.set(filter.key, entry);
+  }
+
+  /**
+   * Fix each histogram's axis from the FULL row set, clamped by whatever the
+   * descriptor declares. Called once, from setRows: an axis recomputed under a
+   * brush would move the handles' meaning out from under the reader's hand.
+   */
+  function seedHistogramDomains() {
+    for (const entry of histograms.values()) {
+      const { filter } = entry;
+      const values = allRows
+        .map((row) => row[filter.field])
+        .filter((v) => typeof v === "number" && Number.isFinite(v));
+      let min = values.length ? Math.min(...values) : (filter.min ?? 0);
+      let max = values.length ? Math.max(...values) : (filter.max ?? 1);
+      if (filter.min != null) min = Math.max(min, filter.min);
+      if (filter.max != null) max = Math.min(max, filter.max);
+      entry.domain = { min, max: max > min ? max : min + 1 };
+      entry.slider.setDomain(entry.domain);
+    }
+  }
+
+  /**
+   * Redraw every histogram over the rows the OTHER controls have selected.
+   *
+   * Never over `filtered`: feeding a slider its own output makes the picture
+   * collapse under the brush that drew it (and dragging back out cannot
+   * restore bars that are no longer there). Costs one extra filter pass per
+   * histogram — three passes over ~1,500 rows on the widest page.
+   */
+  function repaintHistograms() {
+    for (const [key, entry] of histograms) {
+      const rows = rowsExceptFilter(
+        allRows,
+        { filters, values: state.values, query: state.query, searchFields },
+        key
+      );
+      entry.slider.setHistogram(
+        histogramBuckets(
+          rows.map((row) => row[entry.filter.field]),
+          HISTOGRAM_SLIDER_BUCKETS,
+          entry.domain
+        )
+      );
+    }
+  }
+
   // ── state → DOM ──
   function syncControlsToState() {
     searchEl.value = state.query;
@@ -692,6 +797,10 @@ function createTableControls({
         else el.value = value ?? "";
       }
     }
+    // Adopt WITHOUT reporting: this runs when the URL, "Clear all" or a strip
+    // click is the source of the value, and echoing it back through onInput
+    // would be circular.
+    for (const [key, entry] of histograms) entry.slider.setValue(state.values[key]);
     const visibleKeys = new Set(
       resolveVisibleColumns(columns, presets, state.preset, state.cols).map((c) => c.key)
     );
@@ -735,6 +844,7 @@ function createTableControls({
     });
     table.setRows(filtered);
     repaintStrip();
+    repaintHistograms();
     updateUrl();
     onChange?.(filtered, allRows, { values: { ...state.values }, preset: state.preset });
   }
@@ -875,6 +985,7 @@ function createTableControls({
       state.preset = presets.some((p) => p.id === parsed.preset) ? parsed.preset : defaultPreset;
       state.cols = parsed.cols;
       state.values = parsed.values;
+      seedHistogramDomains();
       applyColumns();
       if (parsed.sort) table.setSortTo(parsed.sort.key, parsed.sort.dir);
       syncControlsToState();

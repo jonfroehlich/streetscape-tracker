@@ -374,6 +374,171 @@
   outline-offset: 1px;
 }
 
+/* ── Histogram-slider filter (issue #250) ─────────────────────────────────
+   A mini histogram with a dual-handle brush over it, used in place of a bare
+   min/max pair on grid.html and streets.html. Only pages whose filters declare
+   `type: "histogram-range"` emit this markup, so driving.html never matches.
+
+   The bars reuse the distribution strip's look (one flat hue, no legend, no
+   axis furniture) because they encode the same thing — row counts — and a
+   second visual language for one quantity would imply a second meaning.
+
+   The slider itself is lifted from index.css's .legend-slider family: two
+   native range inputs stacked on one custom track, the inputs ignoring pointer
+   events so only their thumbs are grabbable, and the band between the thumbs
+   draggable as a window. */
+
+.control-histogram {
+  gap: 4px;
+}
+
+.hist-slider {
+  position: relative;
+  width: 100%;
+  min-width: 180px;
+  height: 56px; /* 32px of bars + a 24px slider lane beneath them */
+  touch-action: none; /* window drags must not scroll the page on touch */
+}
+
+.hist-slider.dragging,
+.hist-slider.dragging .hist-fill.draggable {
+  cursor: grabbing;
+}
+
+.hist-bars {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 32px;
+  display: flex;
+  align-items: flex-end;
+  gap: 1px;
+}
+
+.hist-bar {
+  flex: 1;
+  min-width: 1px;
+  background: #6c8ba0; /* the strip's hue — 3.6:1 on white, above the 3:1 floor */
+  border-radius: 2px 2px 0 0;
+}
+
+/* Outside the brushed window. Dimmed rather than hidden: those rows still
+   exist, they are just not selected. */
+.hist-bar.dimmed {
+  opacity: 0.35;
+}
+
+.hist-track {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 10px;
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(0, 0, 0, 0.2);
+}
+
+.hist-fill {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  border-radius: 2px;
+  background: #1a73e8;
+}
+
+.hist-fill.draggable {
+  cursor: grab;
+}
+
+.hist-slider input[type="range"] {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  width: 100%;
+  height: 24px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  pointer-events: none;
+  appearance: none;
+  -webkit-appearance: none;
+}
+
+.hist-slider input[type="range"]::-webkit-slider-runnable-track {
+  -webkit-appearance: none;
+  height: 24px;
+  background: transparent;
+  border: none;
+}
+
+.hist-slider input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  pointer-events: auto;
+  box-sizing: border-box;
+  width: 14px;
+  height: 14px;
+  margin-top: 5px; /* (24px input − 14px thumb) / 2, centers on the track */
+  border-radius: 50%;
+  background: #fff;
+  border: 2px solid #1a73e8;
+  cursor: grab;
+}
+
+.hist-slider input[type="range"]::-moz-range-track {
+  background: transparent;
+  border: none;
+}
+
+.hist-slider input[type="range"]::-moz-range-thumb {
+  pointer-events: auto;
+  box-sizing: border-box;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #fff;
+  border: 2px solid #1a73e8;
+  cursor: grab;
+}
+
+/* Focus ring on the thumb itself: an outline on the input would draw a
+   full-width box, since the input is transparent and spans the whole track. */
+.hist-slider input[type="range"]:focus-visible {
+  outline: none;
+}
+
+.hist-slider input[type="range"]:focus-visible::-webkit-slider-thumb {
+  box-shadow: 0 0 0 3px rgba(26, 115, 232, 0.4);
+}
+
+.hist-slider input[type="range"]:focus-visible::-moz-range-thumb {
+  box-shadow: 0 0 0 3px rgba(26, 115, 232, 0.4);
+}
+
+/* The precision path: exact bounds, and the fully labeled form controls. */
+.hist-bounds {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.hist-bounds input {
+  font: inherit;
+  font-size: 13px;
+  width: 78px;
+  padding: 4px 6px;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  background: #fff;
+  color: #222;
+}
+
+.hist-bounds input:focus-visible {
+  outline: 2px solid #1a73e8;
+  outline-offset: 1px;
+}
+
 /* ── Distribution strip ────────────────────────────────────────────────────
    A histogram of the ACTIVE SORT COLUMN over the CURRENTLY FILTERED rows, so
    it describes what you have selected rather than the whole table. Single
