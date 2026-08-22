@@ -155,6 +155,8 @@ function roundSliderValue(value) {
  *            getValue: Function, destroy: Function}}
  */
 function createHistogramSlider({ rootEl, filter, onInput }) {
+  // Reassigned by setLabel; the unit/digits it also carries are what
+  // sliderValuetext reads on every paint.
   const barsEl = rootEl.querySelector(".hist-bars");
   const sliderEl = rootEl.querySelector(".hist-slider");
   const fillEl = rootEl.querySelector(".hist-fill");
@@ -324,6 +326,18 @@ function createHistogramSlider({ rootEl, filter, onInput }) {
         })
         .join("");
       paint();
+    },
+
+    /**
+     * Rename the control. The scope select decides whose numbers this slider
+     * reads (issue #250 follow-up), so the thumbs' aria-labels have to move
+     * with it — otherwise a screen reader announces "Minimum Grid coverage %"
+     * while the handle is brushing Mapillary's column.
+     */
+    setLabel(label) {
+      filter = { ...filter, label };
+      loEl.setAttribute("aria-label", `Minimum ${label}`);
+      hiEl.setAttribute("aria-label", `Maximum ${label}`);
     },
 
     /** Adopt a window WITHOUT reporting it (URL restore, Clear all, …). */

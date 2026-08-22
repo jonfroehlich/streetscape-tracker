@@ -485,20 +485,29 @@ const STREET_FILTERS = [
     anyLabel: "Any provider",
     options: Object.entries(PROVIDERS)
       .map(([value, p]) => ({ value, label: p.label }))
-      .concat([{ value: "multi", label: "2+ providers" }]),
+      .concat([{ value: SCOPE_MULTI, label: "2+ providers" }]),
     test: (row, value) =>
-      value === "multi" ? row.providers.length > 1 : row.providers.includes(value),
+      value === SCOPE_MULTI ? row.providers.length > 1 : row.providers.includes(value),
   },
+  // Follows the scope above — see GRID_FILTERS for why.
   {
     key: "cov",
-    label: "360° street-km % (best)",
+    label: "360° street-km %",
     type: "histogram-range",
     field: "pctBest",
     min: 0,
     max: 100,
     unit: "%",
     digits: 1,
+    ...scopedNumericFilter({
+      base: "pct",
+      bestField: "pctBest",
+      label: "360° street-km %",
+      anyLabel: "any provider reaches",
+    }),
   },
+  // NOT scoped: street length is a property of the OSM network, not of a
+  // provider's walk of it, so there is no per-provider column to read.
   {
     key: "km",
     label: "Street km",
@@ -513,9 +522,24 @@ const STREET_FILTERS = [
     label: "Has Δ since last walk",
     type: "boolean",
     title:
-      "Only cities walked at least twice by SOME provider, so a change could be computed " +
-      "(issue #101)",
+      "Cities walked at least twice, so a change could be computed (issue #101). Follows " +
+      "the Collected by scope: with a provider selected it asks about THAT provider's " +
+      "second walk, not anyone's.",
     test: (row) => walkProviders().some((p) => row[`changeDelta_${p}`] != null),
+    // Same scope contract as the numeric filters: "walked twice" is as
+    // incomplete a question as "coverage over 80%" until you say by whom.
+    testFor: (values) => {
+      const provider = scopedProvider(values);
+      return provider
+        ? (row) => row[`changeDelta_${provider}`] != null
+        : (row) => walkProviders().some((p) => row[`changeDelta_${p}`] != null);
+    },
+    labelFor: (values) => {
+      const provider = scopedProvider(values);
+      return provider
+        ? `Has Δ since last walk — ${providerShortLabel(provider)}`
+        : "Has Δ since last walk — any provider";
+    },
   },
 ];
 

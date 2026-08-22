@@ -450,3 +450,54 @@ test("GRID_FILTERS: every filter's field exists on a row model", () => {
     assert.ok(filter.field in row, `filter ${filter.key} reads a missing field ${filter.field}`);
   }
 });
+
+// --- the provider scope (issue #250 follow-up) ------------------------------
+
+test("GRID_FILTERS: the numeric filters follow the Collected by scope", () => {
+  const byKey = Object.fromEntries(GRID_FILTERS.map((f) => [f.key, f]));
+
+  // Unscoped: best across a city's providers, and the label names the
+  // quantifier rather than leaving "best" to be guessed at.
+  assert.equal(byKey.cov.fieldFor({}), "pctBest");
+  assert.equal(byKey.cov.labelFor({}), "Grid coverage % — any provider reaches");
+  assert.equal(byKey.age.fieldFor({}), "medianAgeBest");
+  // Unscoped "best" age is the MINIMUM, which "best" alone would not convey.
+  assert.equal(byKey.age.labelFor({}), "Median age (yrs) — freshest of any");
+
+  // Scoped: that provider's own column.
+  assert.equal(byKey.cov.fieldFor({ provider: "mapillary" }), "pct_mapillary");
+  assert.equal(byKey.cov.labelFor({ provider: "mapillary" }), "Grid coverage % — Mapillary");
+  assert.equal(byKey.age.fieldFor({ provider: "gsv" }), "medianAge_gsv");
+
+  // "2+ providers" names no single provider, so it stays best-across.
+  assert.equal(byKey.cov.fieldFor({ provider: "multi" }), "pctBest");
+  // ...as does a scope naming a provider that is not registered.
+  assert.equal(byKey.cov.fieldFor({ provider: "nope" }), "pctBest");
+});
+
+test("GRID_FILTERS: a third registered provider is scopable with no edit here", () => {
+  const cov = GRID_FILTERS.find((f) => f.key === "cov");
+  assert.equal(cov.fieldFor({ provider: "thirdparty" }), "pct_thirdparty");
+  // shortLabel is absent from that registry entry — the fallback is `label`.
+  assert.equal(cov.labelFor({ provider: "thirdparty" }), "Grid coverage % — Third Party");
+});
+
+test("GRID_FILTERS: the Δ filter is NOT scoped — it is a question about the pair", () => {
+  const dcov = GRID_FILTERS.find((f) => f.key === "dcov");
+  assert.equal(dcov.fieldFor, undefined);
+  assert.equal(dcov.field, "deltaPct");
+});
+
+test("every scoped field a filter can resolve to exists on a row model", () => {
+  // The seam the scope introduces: a fieldFor that names a key the pivot does
+  // not build would filter every row out with nothing to see.
+  const row = rowFor(payload(SEATTLE_GSV, SEATTLE_MAPILLARY), "seattle--wa");
+  const scopes = [{}, { provider: "multi" }, ...Object.keys(global.PROVIDERS).map((p) => ({ provider: p }))];
+  for (const filter of GRID_FILTERS) {
+    if (!filter.fieldFor) continue;
+    for (const values of scopes) {
+      const field = filter.fieldFor(values);
+      assert.ok(field in row, `${filter.key} under ${JSON.stringify(values)} reads missing ${field}`);
+    }
+  }
+});

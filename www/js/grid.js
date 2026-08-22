@@ -343,36 +343,54 @@ const GRID_FILTERS = [
     // populated", which is what the checkbox was really asking.
     options: Object.entries(PROVIDERS)
       .map(([value, p]) => ({ value, label: p.label }))
-      .concat([{ value: "multi", label: "2+ providers" }]),
+      .concat([{ value: SCOPE_MULTI, label: "2+ providers" }]),
     // The `?provider=gsv` links from before the pivot keep working: the value
     // vocabulary is unchanged apart from the addition.
     test: (row, value) =>
-      value === "multi" ? row.providers.length > 1 : row.providers.includes(value),
+      value === SCOPE_MULTI ? row.providers.length > 1 : row.providers.includes(value),
   },
-  // The numeric filters read the BEST value across a city's providers, since
-  // the row is a city: "cities with over 80% coverage" means some provider
-  // reaches 80%, not that a particular one does.
+  // The numeric filters follow the scope above: pick a provider and they read
+  // THAT provider's column and say so; leave it on "any" and they read the
+  // best across a city's providers, with a label that spells the quantifier
+  // out. `field`/`label` are the unscoped defaults, used before the first
+  // resolve and by anything reading the descriptors statically.
   {
     key: "cov",
-    label: "Grid coverage % (best)",
+    label: "Grid coverage %",
     type: "histogram-range",
     field: "pctBest",
     min: 0,
     max: 100,
     unit: "%",
     digits: 1,
+    ...scopedNumericFilter({
+      base: "pct",
+      bestField: "pctBest",
+      label: "Grid coverage %",
+      anyLabel: "any provider reaches",
+    }),
   },
   {
     key: "age",
-    label: "Median age (yrs, freshest)",
+    label: "Median age (yrs)",
     type: "histogram-range",
     field: "medianAgeBest",
     min: 0,
     unit: " yrs",
     digits: 1,
+    ...scopedNumericFilter({
+      base: "medianAge",
+      bestField: "medianAgeBest",
+      label: "Median age (yrs)",
+      // Unscoped, "best" is the MINIMUM — the freshest imagery any provider
+      // has — so the quantifier has to be named rather than left as "best".
+      anyLabel: "freshest of any",
+    }),
   },
   // The head-to-head brush, and the reason the pivot exists: "show me the
-  // cities where Mapillary is ahead by 20 points or more".
+  // cities where Mapillary is ahead by 20 points or more". Deliberately NOT
+  // scoped: a difference is a question about the pair, so there is no single
+  // provider whose column it could read instead.
   ...(gridDeltaPair()
     ? [
         {

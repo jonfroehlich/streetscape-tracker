@@ -252,6 +252,55 @@ function providerColumnGroup({
 }
 
 /**
+ * The "Collected by" option meaning "more than one provider", rather than a
+ * provider key. It scopes to nothing in particular, so it reads as unscoped.
+ */
+const SCOPE_MULTI = "multi";
+
+/**
+ * Which provider the "Collected by" select is currently scoped to, or null for
+ * "any provider" (including the 2+ option, which names no single one).
+ *
+ * @param {Object} values - Current filter values.
+ * @returns {?string} A PROVIDERS key.
+ */
+function scopedProvider(values) {
+  const scope = values?.provider;
+  return scope && scope !== SCOPE_MULTI && PROVIDERS[scope] ? scope : null;
+}
+
+/**
+ * The `fieldFor`/`labelFor` half of a numeric filter that follows the provider
+ * scope (issue #250 follow-up).
+ *
+ * A pivoted row holds one value per provider, so "coverage over 80%" is
+ * incomplete until you say whose coverage. The scope select answers it: pick a
+ * provider and the slider reads that provider's column and says so; leave it
+ * on "any" and it reads the best-across field with a label that spells the
+ * quantifier out. Without this the two controls did not compose at all — see
+ * resolveFilters in table-controls.js for what that cost.
+ *
+ * @param {Object} spec
+ * @param {string} spec.base - Row-key prefix, e.g. "pct" -> `pct_gsv`.
+ * @param {string} spec.bestField - The unscoped row key, e.g. "pctBest".
+ * @param {string} spec.label - The metric's name, without the scope.
+ * @param {string} spec.anyLabel - How the unscoped quantifier reads.
+ * @returns {{fieldFor: Function, labelFor: Function}}
+ */
+function scopedNumericFilter({ base, bestField, label, anyLabel }) {
+  return {
+    fieldFor: (values) => {
+      const provider = scopedProvider(values);
+      return provider ? `${base}_${provider}` : bestField;
+    },
+    labelFor: (values) => {
+      const provider = scopedProvider(values);
+      return `${label} — ${provider ? providerShortLabel(provider) : anyLabel}`;
+    },
+  };
+}
+
+/**
  * Assemble one per-provider `<td>` from its parts, wrapping the content in a
  * link when the row has that provider's series to open.
  *
@@ -510,6 +559,9 @@ if (typeof module !== "undefined" && module.exports) {
     coverageCellHtml,
     coverageCellParts,
     providerShortLabel,
+    SCOPE_MULTI,
+    scopedProvider,
+    scopedNumericFilter,
     deltaCellHtml,
     providerCellHtml,
     providerColumnGroup,

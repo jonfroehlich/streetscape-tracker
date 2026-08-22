@@ -22,6 +22,7 @@ const {
   applyFilters,
   rowsExceptFilter,
   resolveVisibleColumns,
+  resolveFilters,
   defaultFilterValues,
   parseTableState,
   serializeTableState,
@@ -694,4 +695,134 @@ test("wireSidebarDisclosure: a no-op without a sidebar, matchMedia, or a documen
   // this is called unconditionally on DOMContentLoaded, so both must be safe.
   assert.equal(wireSidebarDisclosure({ querySelector: () => null }), null);
   assert.equal(wireSidebarDisclosure(), null);
+});
+
+// --- resolveFilters: the provider scope -------------------------------------
+//
+// A pivoted row holds one value per provider, so a numeric filter is
+// incomplete until something says WHOSE number it asks about. Before this,
+// nothing did: the sliders always read a best-across field while "Collected
+// by" only narrowed which cities were listed, so the two controls did not
+// compose. Measured on the live catalog, "Collected by Mapillary" + "coverage
+// >= 80%" returned 56 cities and NONE of them had Mapillary coverage >= 80.
+
+const SCOPED_FILTERS = [
+  {
+    key: "provider",
+    label: "Collected by",
+    type: "select",
+    options: [
+      { value: "gsv", label: "GSV" },
+      { value: "mapillary", label: "Mapillary" },
+      { value: "multi", label: "2+ providers" },
+    ],
+    test: (row, value) =>
+      value === "multi" ? row.providers.length > 1 : row.providers.includes(value),
+  },
+  {
+    key: "cov",
+    label: "Coverage %",
+    type: "histogram-range",
+    field: "pctBest",
+    fieldFor: (values) =>
+      values?.provider && values.provider !== "multi" ? `pct_${values.provider}` : "pctBest",
+    labelFor: (values) =>
+      values?.provider && values.provider !== "multi"
+        ? `Coverage % — ${values.provider}`
+        : "Coverage % — any provider reaches",
+  },
+  { key: "km", label: "Street km", type: "histogram-range", field: "lengthKm" },
+];
+
+const SCOPED_ROWS = [
+  // The real shape of the bug: GSV is high, Mapillary is zero, best is GSV's.
+  { rowKey: "a", providers: ["gsv", "mapillary"], pct_gsv: 97.6, pct_mapillary: 0, pctBest: 97.6 },
+  { rowKey: "b", providers: ["mapillary"], pct_gsv: null, pct_mapillary: 44, pctBest: 44 },
+  { rowKey: "c", providers: ["gsv"], pct_gsv: 91, pct_mapillary: null, pctBest: 91 },
+];
+
+test("resolveFilters: an unscoped view reads the best-across field and says so", () => {
+  const [, cov] = resolveFilters(SCOPED_FILTERS, {});
+  assert.equal(cov.field, "pctBest");
+  assert.equal(cov.label, "Coverage % — any provider reaches");
+});
+
+test("resolveFilters: a scoped view reads THAT provider's column and says so", () => {
+  const [, cov] = resolveFilters(SCOPED_FILTERS, { provider: "mapillary" });
+  assert.equal(cov.field, "pct_mapillary");
+  assert.equal(cov.label, "Coverage % — mapillary");
+});
+
+test("resolveFilters: the 2+ option scopes to no single provider, so it stays best-across", () => {
+  const [, cov] = resolveFilters(SCOPED_FILTERS, { provider: "multi" });
+  assert.equal(cov.field, "pctBest");
+});
+
+test("resolveFilters: descriptors without a scope hook pass through by IDENTITY", () => {
+  // driving.html and the plain `range` filters must be unaware of any of this;
+  // returning fresh copies would also churn object identity on every apply.
+  const out = resolveFilters(SCOPED_FILTERS, { provider: "gsv" });
+  assert.equal(out[0], SCOPED_FILTERS[0], "the select itself is not scoped");
+  assert.equal(out[2], SCOPED_FILTERS[2], "an unscoped numeric filter is not copied");
+  assert.notEqual(out[1], SCOPED_FILTERS[1]);
+  // ...and the originals are never mutated.
+  assert.equal(SCOPED_FILTERS[1].field, "pctBest");
+  assert.equal(SCOPED_FILTERS[1].label, "Coverage %");
+});
+
+test("scope + window compose: the query that used to return 56 wrong rows", () => {
+  const values = { provider: "mapillary", cov: { min: 80, max: null } };
+  const resolved = resolveFilters(SCOPED_FILTERS, values);
+  const out = applyFilters(SCOPED_ROWS, {
+    filters: resolved,
+    values,
+    query: "",
+    searchFields: [],
+  });
+  assert.deepEqual(out.map((r) => r.rowKey), [], "no row has Mapillary coverage >= 80");
+
+  // Under the OLD semantics the same query matched row "a" on GSV's 97.6%.
+  const unscoped = applyFilters(SCOPED_ROWS, {
+    filters: SCOPED_FILTERS,
+    values,
+    query: "",
+    searchFields: [],
+  });
+  assert.deepEqual(unscoped.map((r) => r.rowKey), ["a"]);
+});
+
+test("scope + window compose: a reachable Mapillary window returns the right row", () => {
+  const values = { provider: "mapillary", cov: { min: 40, max: null } };
+  const out = applyFilters(SCOPED_ROWS, {
+    filters: resolveFilters(SCOPED_FILTERS, values),
+    values,
+    query: "",
+    searchFields: [],
+  });
+  assert.deepEqual(out.map((r) => r.rowKey), ["b"]);
+});
+
+test("resolveFilters: a scoped boolean resolves its TEST, not just its wording", () => {
+  const changed = {
+    key: "changed",
+    label: "Has Δ",
+    type: "boolean",
+    test: (row) => row.dGsv != null || row.dMap != null,
+    testFor: (values) =>
+      values?.provider === "gsv" ? (row) => row.dGsv != null : (row) => row.dGsv != null || row.dMap != null,
+  };
+  const rows = [
+    { rowKey: "x", dGsv: 1, dMap: null },
+    { rowKey: "y", dGsv: null, dMap: 2 },
+  ];
+  const anyValues = { changed: true };
+  assert.deepEqual(
+    applyFilters(rows, { filters: resolveFilters([changed], anyValues), values: anyValues, query: "", searchFields: [] }).map((r) => r.rowKey),
+    ["x", "y"]
+  );
+  const gsvValues = { provider: "gsv", changed: true };
+  assert.deepEqual(
+    applyFilters(rows, { filters: resolveFilters([changed], gsvValues), values: gsvValues, query: "", searchFields: [] }).map((r) => r.rowKey),
+    ["x"]
+  );
 });

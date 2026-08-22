@@ -147,6 +147,41 @@ function applyFilters(rows, { filters, values, query, searchFields }) {
 }
 
 /**
+ * Resolve the filters that depend on ANOTHER filter's value (issue #250
+ * follow-up: the provider scope).
+ *
+ * A pivoted row holds one value per provider, so a numeric filter has to be
+ * told WHOSE number it is asking about — and the answer is whatever the
+ * "Collected by" select currently says. Before this, the two did not compose
+ * at all: the sliders always read a best-across-providers field, so
+ * "Collected by Mapillary" + "coverage >= 80%" returned 56 cities on the live
+ * catalog and **none** of them had Mapillary coverage >= 80 — every one was
+ * matched on GSV's number, and no city anywhere reaches 80 on Mapillary, so
+ * the honest answer was zero rows.
+ *
+ * A descriptor opts in with `fieldFor(values)` / `labelFor(values)` /
+ * `testFor(values)`; everything else passes through untouched, which is what
+ * keeps driving.html and the plain `range` filters unaware of any of this. The
+ * result is a SHALLOW COPY, so the originals stay the page's static
+ * descriptors and nothing accumulates state across renders.
+ *
+ * @param {Object[]} filters - Filter descriptors.
+ * @param {Object} values - Current {filterKey: value}.
+ * @returns {Object[]} Filters with `field`/`label`/`test` resolved.
+ */
+function resolveFilters(filters, values) {
+  return filters.map((filter) => {
+    if (!filter.fieldFor && !filter.labelFor && !filter.testFor) return filter;
+    return {
+      ...filter,
+      field: filter.fieldFor ? filter.fieldFor(values) : filter.field,
+      label: filter.labelFor ? filter.labelFor(values) : filter.label,
+      test: filter.testFor ? filter.testFor(values) : filter.test,
+    };
+  });
+}
+
+/**
  * Narrow rows by everything EXCEPT one filter (issue #250).
  *
  * The crossfilter rule for a histogram-slider: the bars a slider draws must be
@@ -758,23 +793,43 @@ function createTableControls({
   // because repaintHistograms has to hand the same domain to histogramBuckets;
   // keeping one copy is what stops the bars and the handles from ever
   // describing different scales.
-  const histograms = new Map(); // filter key -> {filter, slider, domain}
+  // The filters as they read RIGHT NOW: a scoped descriptor's field, label and
+  // test all depend on another control's value, so everything that reasons
+  // about a filter reads this rather than the static `filters`. Re-derived
+  // whenever the values change (see refreshResolved).
+  let resolved = resolveFilters(filters, state.values);
+  const filterFor = (key) => resolved.find((f) => f.key === key);
+
+  /**
+   * Write a numeric window into its two precision inputs.
+   *
+   * THE single writer, because there are three paths that change a window — a
+   * typed bound, a dragged handle, and a scope change clearing it — and every
+   * one of them has to leave the inputs agreeing with `state.values`. The
+   * scope-clear path is the one that got this wrong: the filter was genuinely
+   * cleared and the table re-filtered, while the min box went on reading "80".
+   */
+  function writeRangeInputs(key, value) {
+    const [minEl, maxEl] = rootEl.querySelectorAll(`[data-filter="${key}"]`);
+    if (!minEl || !maxEl) return;
+    minEl.value = value?.min ?? "";
+    maxEl.value = value?.max ?? "";
+  }
+
+  const histograms = new Map(); // filter key -> {slider, domain, field}
   for (const filter of filters) {
     if (filter.type !== "histogram-range") continue;
     const el = rootEl.querySelector(`.control-histogram[data-histogram="${filter.key}"]`);
     if (!el || typeof createHistogramSlider !== "function") continue;
-    const entry = { filter, domain: null, slider: null };
+    const entry = { key: filter.key, domain: null, slider: null, field: null };
     entry.slider = createHistogramSlider({
       rootEl: el,
       filter,
       onInput: (range) => {
         state.values[filter.key] = range;
-        // Keep the precision inputs showing what the handles say. They are the
-        // same two elements syncControlsToState writes, so a drag and a typed
-        // bound can never disagree about the current window.
-        const [minEl, maxEl] = rootEl.querySelectorAll(`[data-filter="${filter.key}"]`);
-        minEl.value = range.min ?? "";
-        maxEl.value = range.max ?? "";
+        // Keep the precision inputs showing what the handles say, so a drag
+        // and a typed bound can never disagree about the current window.
+        writeRangeInputs(filter.key, range);
         // Debounced on the SAME timer as a typed bound: a drag emits on every
         // pointer move, and on grid.html that is 1,501 rows re-filtered and
         // re-rendered per frame.
@@ -787,12 +842,30 @@ function createTableControls({
 
   /**
    * Fix each histogram's axis from the FULL row set, clamped by whatever the
-   * descriptor declares. Called once, from setRows: an axis recomputed under a
-   * brush would move the handles' meaning out from under the reader's hand.
+   * descriptor declares.
+   *
+   * An axis recomputed under a BRUSH would move the handles' meaning out from
+   * under the reader's hand, so it is seeded once per field and then left
+   * alone. A SCOPE change is the one thing that legitimately moves it — the
+   * slider is now asking about a different population, and a Mapillary-scoped
+   * coverage axis genuinely should not span GSV's range. That is a different
+   * gesture from brushing, and it is the only case this re-seeds on.
+   *
+   * The scoped filter's window is CLEARED when its field changes, rather than
+   * carried across and clamped into the new domain. Clamping would silently
+   * rewrite the question: ">= 80%" against a 0-47.6% Mapillary axis would
+   * become ">= 47.6%" and return a row, where the truthful answer is none.
+   *
+   * @param {boolean} [clearOnChange] - Clear a filter whose field moved. False
+   *   on the initial seed, where the field has not "changed" — it arrived that
+   *   way from the URL, together with the window that belongs to it.
    */
-  function seedHistogramDomains() {
+  function syncHistogramDomains(clearOnChange = true) {
     for (const entry of histograms.values()) {
-      const { filter } = entry;
+      const filter = filterFor(entry.key);
+      if (entry.field === filter.field) continue;
+      const changed = entry.field !== null;
+      entry.field = filter.field;
       const values = allRows
         .map((row) => row[filter.field])
         .filter((v) => typeof v === "number" && Number.isFinite(v));
@@ -801,7 +874,13 @@ function createTableControls({
       if (filter.min != null) min = Math.max(min, filter.min);
       if (filter.max != null) max = Math.min(max, filter.max);
       entry.domain = { min, max: max > min ? max : min + 1 };
+      if (changed && clearOnChange) {
+        delete state.values[entry.key];
+        writeRangeInputs(entry.key, null);
+      }
       entry.slider.setDomain(entry.domain);
+      entry.slider.setValue(state.values[entry.key]);
+      entry.slider.setLabel(filter.label);
     }
   }
 
@@ -817,17 +896,50 @@ function createTableControls({
     for (const [key, entry] of histograms) {
       const rows = rowsExceptFilter(
         allRows,
-        { filters, values: state.values, query: state.query, searchFields },
+        { filters: resolved, values: state.values, query: state.query, searchFields },
         key
       );
       entry.slider.setHistogram(
         histogramBuckets(
-          rows.map((row) => row[entry.filter.field]),
+          rows.map((row) => row[entry.field]),
           HISTOGRAM_SLIDER_BUCKETS,
           entry.domain
         )
       );
     }
+  }
+
+  /**
+   * Re-derive the resolved filters and everything downstream of a scope
+   * change: each histogram's axis, its window, and the wording that says whose
+   * numbers it is asking about.
+   */
+  function refreshResolved({ clearOnScopeChange = true } = {}) {
+    resolved = resolveFilters(filters, state.values);
+    syncHistogramDomains(clearOnScopeChange);
+    for (const filter of resolved) if (filter.labelFor) relabelControl(filter);
+  }
+
+  /**
+   * Write a resolved label back onto its control.
+   *
+   * A scoped filter's wording is the ONLY thing that says whose numbers it is
+   * asking about, so it has to move with the scope — leaving it static is the
+   * invisible-semantics problem this whole change exists to fix. Two shapes to
+   * cover: a numeric window labels itself with a `.control-legend` span and two
+   * aria-labelled bounds, everything else with a plain `<label for>`.
+   */
+  function relabelControl(filter) {
+    const legend = rootEl.querySelector(`#f-${filter.key}-legend`);
+    if (legend) {
+      legend.textContent = filter.label;
+      const [minEl, maxEl] = rootEl.querySelectorAll(`[data-filter="${filter.key}"]`);
+      minEl?.setAttribute("aria-label", `Minimum ${filter.label}`);
+      maxEl?.setAttribute("aria-label", `Maximum ${filter.label}`);
+      return;
+    }
+    const label = rootEl.querySelector(`label[for="f-${filter.key}"]`);
+    if (label) label.textContent = filter.label;
   }
 
   // ── state → DOM ──
@@ -838,11 +950,9 @@ function createTableControls({
       const value = state.values[filter.key];
       if (isRangeType(filter)) {
         // Exactly the two number inputs: a histogram-range's <input type=range>
-        // handles deliberately carry no `data-filter`, so this querySelectorAll
-        // returns the same [min, max] pair for both range flavours.
-        const [minEl, maxEl] = rootEl.querySelectorAll(`[data-filter="${filter.key}"]`);
-        minEl.value = value?.min ?? "";
-        maxEl.value = value?.max ?? "";
+        // handles deliberately carry no `data-filter`, so writeRangeInputs
+        // finds the same [min, max] pair for both range flavours.
+        writeRangeInputs(filter.key, value);
       } else {
         const el = rootEl.querySelector(`[data-filter="${filter.key}"]`);
         if (filter.type === "boolean") el.checked = value === true;
@@ -853,6 +963,7 @@ function createTableControls({
     // click is the source of the value, and echoing it back through onInput
     // would be circular.
     for (const [key, entry] of histograms) entry.slider.setValue(state.values[key]);
+    for (const filter of resolved) if (filter.labelFor) relabelControl(filter);
     const visibleKeys = new Set(
       resolveVisibleColumns(columns, presets, state.preset, state.cols).map((c) => c.key)
     );
@@ -888,8 +999,11 @@ function createTableControls({
 
   /** Re-filter, repaint the table, the strip, and the URL. */
   function apply() {
+    // A scope change lands here through the same path as any other control, so
+    // this is where the resolved filters catch up before anything reads them.
+    refreshResolved();
     filtered = applyFilters(allRows, {
-      filters,
+      filters: resolved,
       values: state.values,
       query: state.query,
       searchFields,
@@ -1048,7 +1162,9 @@ function createTableControls({
       state.preset = presets.some((p) => p.id === parsed.preset) ? parsed.preset : defaultPreset;
       state.cols = parsed.cols;
       state.values = parsed.values;
-      seedHistogramDomains();
+      // Not a scope CHANGE: the field and its window arrived together from the
+      // URL, so clearing here would discard a shared link's own filter.
+      refreshResolved({ clearOnScopeChange: false });
       applyColumns();
       if (parsed.sort) table.setSortTo(parsed.sort.key, parsed.sort.dir);
       syncControlsToState();
@@ -1119,6 +1235,7 @@ if (typeof module !== "undefined" && module.exports) {
     applyFilters,
     rowsExceptFilter,
     resolveVisibleColumns,
+    resolveFilters,
     defaultFilterValues,
     parseTableState,
     serializeTableState,

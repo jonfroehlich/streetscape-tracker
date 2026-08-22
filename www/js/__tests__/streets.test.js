@@ -642,3 +642,49 @@ test("updateStreetsCaption: names the active network and counts within it", () =
 
   delete global.document;
 });
+
+// --- the provider scope (issue #250 follow-up) ------------------------------
+
+test("STREET_FILTERS: coverage follows the scope; street km cannot", () => {
+  const byKey = Object.fromEntries(STREET_FILTERS.map((f) => [f.key, f]));
+  assert.equal(byKey.cov.fieldFor({}), "pctBest");
+  assert.equal(byKey.cov.labelFor({}), "360° street-km % — any provider reaches");
+  assert.equal(byKey.cov.fieldFor({ provider: "mapillary" }), "pct_mapillary");
+  assert.equal(byKey.cov.labelFor({ provider: "gsv" }), "360° street-km % — GSV");
+
+  // Street length is a property of the OSM network, not of a provider's walk
+  // of it, so there is no per-provider column it could read.
+  assert.equal(byKey.km.fieldFor, undefined);
+  assert.equal(byKey.km.field, "lengthKm");
+});
+
+test("STREET_FILTERS: 'Has Δ' follows the scope too — 'walked twice' needs a whom", () => {
+  const changed = STREET_FILTERS.find((f) => f.key === "changed");
+  const gsvOnly = rowsFor(
+    { ...SEATTLE_GSV_WALK, change: CHANGE_BLOCK },
+    SEATTLE_MAPILLARY_WALK
+  )[0];
+
+  // Unscoped: any provider having walked twice is enough.
+  assert.ok(changed.testFor({})(gsvOnly));
+  assert.equal(changed.labelFor({}), "Has Δ since last walk — any provider");
+
+  // Scoped to the provider that DID walk twice.
+  assert.ok(changed.testFor({ provider: "gsv" })(gsvOnly));
+  assert.equal(changed.labelFor({ provider: "gsv" }), "Has Δ since last walk — GSV");
+
+  // Scoped to the one that did not: the honest answer is no.
+  assert.ok(!changed.testFor({ provider: "mapillary" })(gsvOnly));
+});
+
+test("every scoped field a filter can resolve to exists on a row model", () => {
+  const row = rowsFor(SEATTLE_GSV_WALK, SEATTLE_MAPILLARY_WALK)[0];
+  const scopes = [{}, { provider: "multi" }, ...Object.keys(global.PROVIDERS).map((p) => ({ provider: p }))];
+  for (const filter of STREET_FILTERS) {
+    if (!filter.fieldFor) continue;
+    for (const values of scopes) {
+      const field = filter.fieldFor(values);
+      assert.ok(field in row, `${filter.key} under ${JSON.stringify(values)} reads missing ${field}`);
+    }
+  }
+});
