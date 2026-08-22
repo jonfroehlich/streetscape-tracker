@@ -514,21 +514,31 @@ def test_streets_page_lists_published_road_walks(page: Page, base_url):
     assert errors == []
 
 
-def test_streets_walked_cell_links_to_that_providers_own_walk(page: Page, base_url):
+def test_streets_provider_cells_open_that_providers_own_walk(page: Page, base_url):
     """city.html derives its provider from the run filename, so a per-city row
-    needs a per-provider way in. The filename must come from the provider-keyed
-    aggregate entry, never from the bare-city_id NAME fallback — that fallback
-    exists so a city walked by a provider it has no grid run for still gets a
-    label, and following it would open a different provider's series."""
+    needs a per-provider way in, and EVERY per-provider cell is one. The
+    filename must come from the provider-keyed aggregate entry, never from the
+    bare-city_id NAME fallback — that fallback exists so a city walked by a
+    provider it has no grid run for still gets a label, and following it would
+    open a different provider's series."""
     errors = _capture_errors(page)
     page.goto(f"{base_url}/streets.html")
 
     alpha = page.locator("#streets-tbody tr", has_text="Alpha City")
-    links = alpha.locator("td a.streets-view-link")
-    expect(links).to_have_count(2)  # one per provider that walked this row
-    expect(links.nth(0)).to_have_attribute("href", f"city.html?file={ALPHA_LATEST}&network=drive")
-    expect(links.nth(1)).to_have_attribute(
-        "href", f"city.html?file={ALPHA_MAPILLARY_LATEST}&network=drive"
+    links = alpha.locator("td a.provider-cell-link")
+    expect(links).to_have_count(6)  # 3 groups x 2 providers; the Δ is not one
+    hrefs = links.evaluate_all("els => els.map(e => e.getAttribute('href'))")
+    assert set(hrefs) == {
+        f"city.html?file={ALPHA_LATEST}&network=drive",
+        f"city.html?file={ALPHA_MAPILLARY_LATEST}&network=drive",
+    }, hrefs
+    expect(alpha.locator("td.delta-cell a")).to_have_count(0)
+
+    # The broad walk's links carry ITS network, not the default.
+    page.locator('select[data-filter="network"]').select_option("all_public")
+    broad = page.locator("#streets-tbody tr", has_text="Alpha City")
+    expect(broad.locator("td a.provider-cell-link").first).to_have_attribute(
+        "href", f"city.html?file={ALPHA_LATEST}&network=all_public"
     )
 
     assert errors == []
@@ -767,20 +777,32 @@ def test_grid_page_lists_one_row_per_city(page: Page, base_url):
     assert errors == []
 
 
-def test_grid_last_collected_links_to_that_providers_own_run(page: Page, base_url):
+def test_grid_provider_cells_open_that_providers_own_run(page: Page, base_url):
     """city.html derives its provider from the run filename, so a per-city row
     needs a per-provider way in — otherwise the Mapillary series of a city that
-    also has GSV is unreachable from this page."""
+    also has GSV is unreachable from this page. EVERY per-provider cell is that
+    way in, not just the date one."""
     errors = _capture_errors(page)
     page.goto(f"{base_url}/grid.html")
 
     alpha = page.locator("#grid-tbody tr", has_text="Alpha City")
-    links = alpha.locator("td a.streets-view-link")
-    expect(links).to_have_count(2)  # one per provider that collected this city
-    expect(links.nth(0)).to_have_attribute("href", f"city.html?file={ALPHA_LATEST}")
-    expect(links.nth(1)).to_have_attribute("href", f"city.html?file={ALPHA_MAPILLARY_LATEST}")
+    # Overview shows two metric groups plus Last collected, so Alpha City's two
+    # providers contribute six linked cells; the Δ cells are not links.
+    links = alpha.locator("td a.provider-cell-link")
+    expect(links).to_have_count(6)
+    hrefs = links.evaluate_all("els => els.map(e => e.getAttribute('href'))")
+    assert set(hrefs) == {
+        f"city.html?file={ALPHA_LATEST}",
+        f"city.html?file={ALPHA_MAPILLARY_LATEST}",
+    }, hrefs
+    expect(alpha.locator("td.delta-cell a")).to_have_count(0)
 
-    links.nth(1).click()
+    # Map Ville has no GSV run: its GSV cells are plain, not links to nowhere.
+    map_ville = page.locator("#grid-tbody tr", has_text="Map Ville")
+    expect(map_ville.locator("td a.provider-cell-link")).to_have_count(3)
+
+    # Clicking a Mapillary cell lands on the Mapillary series.
+    alpha.locator("td.coverage-cell").nth(1).locator("a").click()
     page.wait_for_url(f"**/city.html?file={ALPHA_MAPILLARY_LATEST}")
     expect(page.locator("table.legend-stats")).to_be_visible()
 
@@ -1238,6 +1260,74 @@ def test_distribution_strip_survives_on_the_driving_page(page: Page, base_url):
     expect(page.locator(".table-sidebar")).to_have_count(0)
     expect(page.locator("thead th.th-group")).to_have_count(0)
     expect(page.locator("#driving-thead tr")).to_have_count(1)
+
+    assert errors == []
+
+
+@pytest.mark.parametrize("path", ["grid.html", "streets.html"])
+def test_the_table_and_its_filters_are_on_the_first_screen(page: Page, base_url, path):
+    """These two pages are instruments, not articles. A screen of preamble
+    pushed both the table and the filter sidebar below the fold, so the lead is
+    now one sentence and the rest lives in a closed disclosure. The assertion is
+    the outcome, not the word count: the table's first row and the search box
+    both have to be visible without scrolling."""
+    errors = _capture_errors(page)
+    page.set_viewport_size({"width": 1440, "height": 900})
+    page.goto(f"{base_url}/{path}")
+    expect(page.locator("tbody tr").first).to_be_visible()
+
+    top = page.evaluate(
+        """() => ({
+             table: document.querySelector('.streets-table-wrap').getBoundingClientRect().top,
+             search: document.querySelector('#table-search').getBoundingClientRect().top,
+             viewport: window.innerHeight,
+           })"""
+    )
+    assert top["table"] < top["viewport"] / 2, f"table starts at {top['table']}px"
+    assert top["search"] < top["viewport"] / 2, f"search starts at {top['search']}px"
+
+    # The long explanation is still there, just closed.
+    about = page.locator("details.page-about")
+    expect(about).to_have_count(1)
+    assert about.evaluate("el => el.open") is False
+    expect(about.locator(".page-about-body")).to_be_hidden()
+    about.locator("summary").click()
+    expect(about.locator(".page-about-body")).to_be_visible()
+
+    assert errors == []
+
+
+@pytest.mark.parametrize("path", ["grid.html", "streets.html"])
+def test_the_filter_sidebar_spans_the_full_viewport_height(page: Page, base_url, path):
+    """ "Always there" means it does not scroll away, and "full extent" means it
+    is a column rather than a short card with grey below it. Both come from the
+    sidebar itself being the sticky, full-height panel — a flex chain through
+    the <details> does not survive Chromium's ::details-content box."""
+    errors = _capture_errors(page)
+    page.set_viewport_size({"width": 1440, "height": 900})
+    page.goto(f"{base_url}/{path}")
+    expect(page.locator("tbody tr").first).to_be_visible()
+
+    box = page.evaluate(
+        """() => {
+             const a = document.querySelector('.table-sidebar');
+             const c = getComputedStyle(a);
+             return {h: a.getBoundingClientRect().height, viewport: window.innerHeight,
+                     position: c.position, background: c.backgroundColor};
+           }"""
+    )
+    assert box["position"] == "sticky"
+    assert box["h"] > box["viewport"] * 0.85, f"sidebar is only {box['h']}px of {box['viewport']}px"
+    # The container is the panel, so the height is visible rather than notional.
+    assert box["background"] not in ("rgba(0, 0, 0, 0)", "transparent"), box["background"]
+
+    # ...and it stays put when the table scrolls past it.
+    page.mouse.wheel(0, 1200)
+    page.wait_for_timeout(200)
+    assert (
+        page.evaluate("() => document.querySelector('.table-sidebar').getBoundingClientRect().top")
+        < 100
+    ), "sidebar scrolled away instead of sticking"
 
     assert errors == []
 

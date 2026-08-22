@@ -45,7 +45,6 @@ const {
   sortRows,
   num,
   walkChangeCellHtml,
-  walkDateCellHtml,
   walkRowHtml,
   streetDeltaPair,
   updateStreetsCaption,
@@ -400,23 +399,55 @@ test("walkRowHtml: the City cell links with THIS row's network type", () => {
   assert.match(walkRowHtml(broad), /&network=all_public"/);
 });
 
-test("walkDateCellHtml: each provider's Walked cell opens THAT provider's series", () => {
+test("EVERY per-provider cell opens THAT provider's walk of THIS row's network", () => {
+  // Asserted across the whole group set rather than on one column, since a
+  // group added later must not quietly opt out of being a way in.
   const row = rowsFor(SEATTLE_GSV_WALK, SEATTLE_MAPILLARY_WALK)[0];
-  assert.match(walkDateCellHtml(row, "gsv"), /file=seattle_gsv\.csv\.gz&network=drive/);
-  assert.match(walkDateCellHtml(row, "mapillary"), /file=seattle_mapillary\.csv\.gz&network=drive/);
-  assert.match(walkDateCellHtml(row, "mapillary"), /title="Mapillary walk of 2026-07-26 \(Roads\)"/);
-  // A provider that never walked this row renders an em-dash, not an empty link.
-  assert.equal(walkDateCellHtml(row, "thirdparty"), "<td>—</td>");
+  const perProvider = STREET_COLUMNS.filter((c) => c.group && !c.key.startsWith("delta"));
+  assert.ok(perProvider.length >= 15, "expected several per-provider groups");
+
+  for (const col of perProvider) {
+    const provider = col.key.slice(col.key.lastIndexOf("_") + 1);
+    const cell = col.cell(row);
+    if (provider === "thirdparty") {
+      assert.doesNotMatch(cell, /href=/, `${col.key} linked with no walk behind it`);
+      continue;
+    }
+    assert.match(
+      cell,
+      new RegExp(`file=seattle_${provider}\\.csv\\.gz&network=drive`),
+      `${col.key} does not open ${provider}'s walk of this network`
+    );
+    assert.match(cell, /class="provider-cell-link"/, `${col.key} is not the whole-cell link`);
+  }
 });
 
-test("walkDateCellHtml: a walk whose city has no run for that provider is unlinked", () => {
-  // The name fallback supplies a label, never a link (see indexCitiesByProvider).
+test("the per-provider link carries THIS row's network, not the default", () => {
+  // city.html defaults to 'drive', so a broad row whose link omits ?network=
+  // opens a different walk — or falls back to the grid-attribution artifact.
+  const broad = rowsFor(SEATTLE_BROAD_WALK)[0];
+  const cell = STREET_COLUMNS.find((c) => c.key === "pct_gsv").cell(broad);
+  assert.match(cell, /&network=all_public"/);
+  assert.match(cell, /title="Open GSV · 2026-07-26 · Roads \+ paths"/);
+});
+
+test("a Δ cell is never a link — it belongs to no one provider", () => {
+  const row = rowsFor(SEATTLE_GSV_WALK, SEATTLE_MAPILLARY_WALK)[0];
+  for (const col of STREET_COLUMNS.filter((c) => c.key.startsWith("delta"))) {
+    assert.doesNotMatch(col.cell(row), /href=/, `${col.key} should not be a link`);
+  }
+});
+
+test("a per-provider cell is unlinked when that city has no run for that provider", () => {
+  // The name fallback supplies a label, never a link (see indexCitiesByProvider):
+  // city.html derives its provider from the filename, so following it would
+  // open a different provider's series.
   const row = pivotStreetWalks(
     [{ city_id: "bend--or", provider: "mapillary", run_date: "2026-07-26" }],
     INDEX
   )[0];
   assert.equal(row.label, "Bend");
-  const cell = walkDateCellHtml(row, "mapillary");
+  const cell = STREET_COLUMNS.find((c) => c.key === "runDate_mapillary").cell(row);
   assert.match(cell, />2026-07-26</);
   assert.doesNotMatch(cell, /href=/);
 });
@@ -487,20 +518,20 @@ test("pivotStreetWalks: the manifest change block lands on the walking provider"
 
 test("walkChangeCellHtml: em dash for a first walk, signed pp figure with a churn title", () => {
   const first = rowsFor(SEATTLE_GSV_WALK)[0];
-  assert.equal(walkChangeCellHtml(first, "gsv"), "<td>—</td>");
+  assert.deepEqual(walkChangeCellHtml(first, "gsv"), { html: "—" });
 
   const changed = rowsFor({ ...SEATTLE_GSV_WALK, change: CHANGE_BLOCK })[0];
-  const html = walkChangeCellHtml(changed, "gsv");
-  assert.match(html, />\+4\.2 pp</);
-  assert.match(html, /Since 2026-04-01/);
-  assert.match(html, /12 streets gained/);
-  assert.match(html, /3 lost/);
+  const parts = walkChangeCellHtml(changed, "gsv");
+  assert.equal(parts.html, "+4.2 pp");
+  assert.match(parts.title, /Since 2026-04-01/);
+  assert.match(parts.title, /12 streets gained/);
+  assert.match(parts.title, /3 lost/);
 
   const negative = rowsFor({
     ...SEATTLE_GSV_WALK,
     change: { ...CHANGE_BLOCK, coverage_pct_by_length_delta: -0.3 },
   })[0];
-  assert.match(walkChangeCellHtml(negative, "gsv"), />-0\.3 pp</);
+  assert.equal(walkChangeCellHtml(negative, "gsv").html, "-0.3 pp");
 });
 
 test("walkChangeCellHtml: a zero delta still renders (imagery churned, net flat)", () => {
@@ -508,7 +539,17 @@ test("walkChangeCellHtml: a zero delta still renders (imagery churned, net flat)
     ...SEATTLE_GSV_WALK,
     change: { ...CHANGE_BLOCK, coverage_pct_by_length_delta: 0 },
   })[0];
-  assert.match(walkChangeCellHtml(zero, "gsv"), />\+0\.0 pp</);
+  assert.equal(walkChangeCellHtml(zero, "gsv").html, "+0.0 pp");
+});
+
+test("the change cell keeps its OWN title over the link's — it says more", () => {
+  // "Since 2026-04-01: 12 streets gained coverage, 3 lost it" is specific;
+  // "Open GSV · …" is what every other cell already says.
+  const changed = rowsFor({ ...SEATTLE_GSV_WALK, change: CHANGE_BLOCK })[0];
+  const cell = STREET_COLUMNS.find((c) => c.key === "changeDelta_gsv").cell(changed);
+  assert.match(cell, /<td title="Since 2026-04-01/);
+  assert.doesNotMatch(cell, /title="Open GSV/);
+  assert.match(cell, /href=/, "...while still being a link");
 });
 
 test("sortRows: changeDelta sorts numerically with first walks (null) last", () => {

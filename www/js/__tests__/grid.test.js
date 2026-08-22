@@ -330,24 +330,44 @@ test("gridRowHtml: one cell per column, with the city linking to city.html", () 
   assert.match(html, />\+10\.3 pp</);
 });
 
-test("gridRowHtml: each provider's Last collected cell links to THAT provider's run", () => {
-  // city.html derives its provider from the run filename, so this is the only
-  // place a reader can open a specific series — the City cell can only ever
-  // open one of them.
+test("EVERY per-provider cell opens THAT provider's series", () => {
+  // city.html derives its provider from the run filename, so these cells are
+  // the only place a reader can open a specific series — the City cell can
+  // only ever open one of them. Asserted across the whole group set rather
+  // than on one column, since a group added later must not quietly opt out.
   const row = rowFor(payload(SEATTLE_GSV, SEATTLE_MAPILLARY), "seattle--wa");
-  const collectedGsv = GRID_COLUMNS.find((c) => c.key === "collected_gsv").cell(row);
-  const collectedMap = GRID_COLUMNS.find((c) => c.key === "collected_mapillary").cell(row);
-  assert.match(collectedGsv, /href="city\.html\?file=seattle--wa_width_5000_height_5000_step_20_2026-07-05\.csv\.gz"/);
-  assert.match(collectedMap, /_mapillary_2026-07-05\.csv\.gz"/);
-  assert.match(collectedMap, /title="Mapillary run of 2026-07-05"/);
+  const perProvider = GRID_COLUMNS.filter((c) => c.group && !c.key.startsWith("delta"));
+  assert.ok(perProvider.length >= 12, "expected several per-provider groups");
 
-  // A provider that never collected this city renders a plain em-dash, not an
-  // empty link.
-  const thirdparty = GRID_COLUMNS.find((c) => c.key === "collected_thirdparty").cell(row);
-  assert.equal(thirdparty, "<td>—</td>");
+  for (const col of perProvider) {
+    const provider = col.key.slice(col.key.lastIndexOf("_") + 1);
+    const cell = col.cell(row);
+    if (provider === "thirdparty") {
+      // Never collected this city: a plain cell, not a link to nowhere.
+      assert.doesNotMatch(cell, /href=/, `${col.key} linked with no run behind it`);
+      continue;
+    }
+    const expected =
+      provider === "gsv"
+        ? "seattle--wa_width_5000_height_5000_step_20_2026-07-05.csv.gz"
+        : "seattle--wa_width_5000_height_5000_step_20_mapillary_2026-07-05.csv.gz";
+    assert.match(
+      cell,
+      new RegExp(`href="city\\.html\\?file=${expected.replace(/\./g, "\\.")}"`),
+      `${col.key} does not open ${provider}'s run`
+    );
+    assert.match(cell, /class="provider-cell-link"/, `${col.key} is not the whole-cell link`);
+  }
 });
 
-test("gridRowHtml: a provider's date renders unlinked when it has no published run", () => {
+test("a Δ cell is never a link — it belongs to no one provider", () => {
+  const row = rowFor(payload(SEATTLE_GSV, SEATTLE_MAPILLARY), "seattle--wa");
+  for (const col of GRID_COLUMNS.filter((c) => c.key.startsWith("delta"))) {
+    assert.doesNotMatch(col.cell(row), /href=/, `${col.key} should not be a link`);
+  }
+});
+
+test("a per-provider cell renders unlinked when that provider has no published run", () => {
   const row = rowFor(
     payload({ ...SEATTLE_GSV, data_file: null, latest_run_date: "2026-07-05" }),
     "seattle--wa"
@@ -355,6 +375,12 @@ test("gridRowHtml: a provider's date renders unlinked when it has no published r
   const cell = GRID_COLUMNS.find((c) => c.key === "collected_gsv").cell(row);
   assert.match(cell, />2026-07-05</);
   assert.doesNotMatch(cell, /href=/);
+});
+
+test("the per-provider link names the provider and its date, for hover and AT", () => {
+  const row = rowFor(payload(SEATTLE_GSV, SEATTLE_MAPILLARY), "seattle--wa");
+  const cell = GRID_COLUMNS.find((c) => c.key === "pct_mapillary").cell(row);
+  assert.match(cell, /title="Open Mapillary · 2026-07-05 for this city"/);
 });
 
 test("gridRowHtml: null stats render em dashes and no link", () => {

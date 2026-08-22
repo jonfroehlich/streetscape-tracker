@@ -57,6 +57,32 @@ function gridDeltaPair() {
 // ── Cells ─────────────────────────────────────────────────────
 
 /**
+ * The link factory every per-provider group on this page shares: open THAT
+ * provider's latest run on the city page.
+ *
+ * city.html derives its provider from the run filename, so these cells are the
+ * only place a reader can ask for one specific series — the City cell can open
+ * exactly one of them. Null when the provider has no published run here, so a
+ * cell of em-dashes is never a link to nowhere.
+ *
+ * @param {string} provider
+ * @returns {(row: Object) => ?{href: string, title: string}}
+ */
+function gridProviderLink(provider) {
+  return (row) => {
+    const file = row[`filename_${provider}`];
+    if (!file) return null;
+    const date = row[`collected_${provider}`];
+    return {
+      href: `city.html?file=${encodeURIComponent(file)}`,
+      title: escapeHtml(
+        `Open ${providerShortLabel(provider)}${date ? ` · ${date}` : ""} for this city`
+      ),
+    };
+  };
+}
+
+/**
  * Cell for the "City" column: the label, hyperlinked to the city page when
  * this row has a published run to link to.
  *
@@ -120,7 +146,8 @@ function buildGridColumns() {
       keyFor: (p) => `pct_${p}`,
       // Compact cells: one coverage cell PER PROVIDER plus a Δ, and at the
       // full 128px that group alone would not fit the measure.
-      cellFor: (p) => (row) => coverageCellHtml(row[`pct_${p}`], { compact: true }),
+      cellFor: (p) => (row) => coverageCellParts(row[`pct_${p}`], { compact: true }),
+      linkFor: gridProviderLink,
       initial: "desc",
       unit: "%",
       digits: 1,
@@ -136,7 +163,8 @@ function buildGridColumns() {
       groupTitle:
         "Including flat/perspective imagery (Mapillary); equals grid coverage for Google Street View",
       keyFor: (p) => `pctAny_${p}`,
-      cellFor: (p) => (row) => coverageCellHtml(row[`pctAny_${p}`], { compact: true }),
+      cellFor: (p) => (row) => coverageCellParts(row[`pctAny_${p}`], { compact: true }),
+      linkFor: gridProviderLink,
       initial: "desc",
       unit: "%",
       digits: 1,
@@ -151,8 +179,10 @@ function buildGridColumns() {
       groupLabel: "Median age (yrs)",
       groupTitle: "Median age of the city's panoramas at that provider's latest snapshot",
       keyFor: (p) => `medianAge_${p}`,
-      cellFor: (p) => (row) =>
-        `<td>${row[`medianAge_${p}`] == null ? "—" : formatCellNumber(row[`medianAge_${p}`], 1)}</td>`,
+      cellFor: (p) => (row) => ({
+        html: row[`medianAge_${p}`] == null ? "—" : formatCellNumber(row[`medianAge_${p}`], 1),
+      }),
+      linkFor: gridProviderLink,
       initial: "asc",
       unit: " yrs",
       digits: 1,
@@ -177,7 +207,8 @@ function buildGridColumns() {
         const model = PROVIDERS[p]?.panoCountingModel;
         return model ? `${providerShortLabel(p)} (${model})` : providerShortLabel(p);
       },
-      cellFor: (p) => (row) => `<td>${formatCellNumber(row[`panos_${p}`])}</td>`,
+      cellFor: (p) => (row) => ({ html: formatCellNumber(row[`panos_${p}`]) }),
+      linkFor: gridProviderLink,
       initial: "desc",
     }),
     // Frozen-grid facts, shared by every provider of a city (the geometry is a
@@ -226,7 +257,10 @@ function buildGridColumns() {
       groupLabel: "Last collected",
       groupTitle: "Date of each provider's latest collection run — how fresh that series is",
       keyFor: (p) => `collected_${p}`,
-      cellFor: (p) => (row) => collectedCellHtml(row, p),
+      cellFor: (p) => (row) => ({
+        html: row[`collected_${p}`] == null ? "—" : escapeHtml(row[`collected_${p}`]),
+      }),
+      linkFor: gridProviderLink,
       // Dates, which compare as text.
       type: "text",
       initial: "desc",
@@ -237,35 +271,11 @@ function buildGridColumns() {
       groupTitle:
         "Number of dated collection runs per provider; repeat runs enable change tracking over time",
       keyFor: (p) => `snapshots_${p}`,
-      cellFor: (p) => (row) => `<td>${formatCellNumber(row[`snapshots_${p}`])}</td>`,
+      cellFor: (p) => (row) => ({ html: formatCellNumber(row[`snapshots_${p}`]) }),
+      linkFor: gridProviderLink,
       initial: "desc",
     }),
   ];
-}
-
-/**
- * Cell for one provider's "Last collected" date — and the per-provider link
- * home.
- *
- * city.html derives its provider from the run filename, so this is the only
- * place a reader can ask for a SPECIFIC series; the City cell can only ever
- * open one of them.
- *
- * @param {Object} row
- * @param {string} provider
- * @returns {string} HTML for one <td>.
- */
-function collectedCellHtml(row, provider) {
-  const date = row[`collected_${provider}`];
-  if (date == null) return `<td>—</td>`;
-  const file = row[`filename_${provider}`];
-  const text = escapeHtml(date);
-  if (!file) return `<td>${text}</td>`;
-  const label = `${providerShortLabel(provider)} run of ${text}`;
-  return (
-    `<td><a class="streets-view-link" title="${escapeHtml(label)}" ` +
-    `href="city.html?file=${encodeURIComponent(file)}">${text}</a></td>`
-  );
 }
 
 const GRID_COLUMNS = buildGridColumns();

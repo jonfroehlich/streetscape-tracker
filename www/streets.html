@@ -38,43 +38,50 @@
   </header>
 
   <main class="streets-main streets-main--wide">
-    <h1>Street-level coverage</h1>
-
-    <div class="streets-intro">
-      <p>
-        The <a href="index.html">overview map</a> measures coverage by
-        <strong>area</strong>: what share of a regular grid of sample points
-        around a city has street-level imagery. This page measures it by
-        <strong>road network</strong> instead: what fraction of a city's
-        streets have actually been driven.
+    <div class="page-head">
+      <h1>Street-level coverage</h1>
+      <p class="page-lead">
+        What fraction of a city's streets have actually been driven — a
+        <strong>road network</strong> measure, where the
+        <a href="index.html">overview map</a> and
+        <a href="grid.html">Grid</a> measure area instead.
       </p>
-      <p>
-        Each collection walks every edge of the city's OpenStreetMap street
-        network, samples on-street points every ~15 m along the centerline,
-        and asks the imagery provider for the nearest panorama at each point.
-        A sample counts as covered when a panorama is found within the match
-        distance, so coverage is <strong>fractional per street</strong> — a
-        road that is half driven reports 50%, not "covered". The headline
-        number below weights each street by its length.
-      </p>
-      <p class="streets-caveat">
-        Each city is <strong>one row</strong>, with a sub-column per provider:
-        both walk the same sample points on the same frozen network, so their
-        numbers are directly comparable and the <strong>Δ</strong> column gives
-        the difference. The <strong>Network</strong> selector is separate for
-        the opposite reason — &quot;Roads&quot; and &quot;Roads + paths&quot;
-        divide by different street-km totals, so they are never shown side by
-        side. Street-level collection runs on the same rolling schedule as the
-        grid, so cities appear here as they are walked and are refreshed each
-        cycle. Google Street View costs one metadata request per sample point
-        (a large city runs to a few hundred thousand), while Mapillary is
-        derived from its vector-tile census — so Mapillary cities fill in
-        faster. Search, filter and re-sort to narrow the table. Each numeric filter in
-        the sidebar carries a small histogram of where the rows actually sit,
-        drawn over everything the <em>other</em> controls have selected, so
-        brushing one range never redraws its own picture. The address bar
-        always carries the view you are looking at so it can be shared.
-      </p>
+      <details class="page-about">
+        <summary>How to read this table</summary>
+        <div class="page-about-body">
+          <p>
+            Each collection walks every edge of the city's OpenStreetMap street
+            network, samples on-street points every ~15 m along the centerline,
+            and asks the provider for the nearest panorama at each. A sample
+            counts as covered when a panorama is found within the match
+            distance, so coverage is <strong>fractional per street</strong> — a
+            road half driven reports 50%, not "covered" — and the headline
+            number weights each street by its length.
+          </p>
+          <p>
+            Each city is <strong>one row</strong>, with a sub-column per
+            provider: both walk the same sample points on the same frozen
+            network, so their numbers are directly comparable and the
+            <strong>&#916;</strong> column gives the difference. Click any
+            provider's cell to open that provider's walk. The
+            <strong>Network</strong> selector is separate for the opposite
+            reason &mdash; &quot;Roads&quot; and &quot;Roads + paths&quot;
+            divide by different street-km totals, so they are never shown side
+            by side.
+          </p>
+          <p>
+            Collection runs on the same rolling schedule as the grid, so cities
+            appear here as they are walked. Google Street View costs one
+            metadata request per sample point (a large city runs to a few
+            hundred thousand), while Mapillary is derived from its vector-tile
+            census &mdash; so Mapillary cities fill in faster. Each numeric
+            filter in the sidebar carries a histogram of where the rows
+            actually sit, drawn over everything the <em>other</em> controls
+            have selected. The address bar always carries the view you are
+            looking at.
+          </p>
+        </div>
+      </details>
     </div>
 
     <div id="streets-status" class="table-status" role="status" aria-live="polite">

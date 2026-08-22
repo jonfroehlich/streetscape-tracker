@@ -116,17 +116,17 @@ function num(value, digits = 0) {
  *
  * @param {Object} row - From pivotStreetWalks.
  * @param {string} provider
- * @returns {string} HTML for one <td>.
+ * @returns {{html: string, title?: string}} Cell parts (see providerCellHtml).
  */
 function walkChangeCellHtml(row, provider) {
   const delta = row[`changeDelta_${provider}`];
-  if (delta == null) return `<td>—</td>`;
+  if (delta == null) return { html: "—" };
   const change = row[`change_${provider}`] ?? {};
   const sign = delta >= 0 ? "+" : "";
   const title =
     `Since ${change.from}: ${change.edges_gained_coverage ?? 0} streets gained ` +
     `coverage, ${change.edges_lost_coverage ?? 0} lost it`;
-  return `<td title="${escapeHtml(title)}">${sign}${delta.toFixed(1)} pp</td>`;
+  return { html: `${sign}${delta.toFixed(1)} pp`, title: escapeHtml(title) };
 }
 
 /**
@@ -179,26 +179,34 @@ function cityPageLink(filename, networkType, text, title = null) {
 }
 
 /**
- * Cell for one provider's walk date — and that provider's link home.
+ * The link factory every per-provider group on this page shares: open THAT
+ * provider's walk of THIS row's network on the city page.
  *
- * The filename comes only from the `${provider}|${city_id}` index entry, never
- * from the bare-city_id name fallback: city.html derives its provider from the
- * run filename, so a cross-provider link opens the wrong series entirely.
+ * Two things it has to get right. The filename comes only from the
+ * `${provider}|${city_id}` index entry, never from the bare-city_id name
+ * fallback — city.html derives its provider from the run filename, so a
+ * cross-provider link opens the wrong series entirely. And the `&network=` is
+ * load-bearing: city.html defaults to 'drive', so a "Roads + paths" row whose
+ * link omits it opens a different walk, or falls all the way back to the
+ * grid-attribution artifact.
  *
- * @param {Object} row
  * @param {string} provider
- * @returns {string} HTML for one <td>.
+ * @returns {(row: Object) => ?{href: string, title: string}}
  */
-function walkDateCellHtml(row, provider) {
-  const date = row[`runDate_${provider}`];
-  if (date == null) return `<td>—</td>`;
-  const file = row[`filename_${provider}`];
-  const text = escapeHtml(date);
-  if (!file) return `<td>${text}</td>`;
-  const title = escapeHtml(
-    `${providerShortLabel(provider)} walk of ${text} (${row.networkLabel})`
-  );
-  return `<td>${cityPageLink(file, row.networkType, text, title)}</td>`;
+function walkProviderLink(provider) {
+  return (row) => {
+    const file = row[`filename_${provider}`];
+    if (!file) return null;
+    const date = row[`runDate_${provider}`];
+    return {
+      href:
+        `city.html?file=${encodeURIComponent(file)}` +
+        `&network=${encodeURIComponent(row.networkType)}`,
+      title: escapeHtml(
+        `Open ${providerShortLabel(provider)}${date ? ` · ${date}` : ""} · ${row.networkLabel}`
+      ),
+    };
+  };
 }
 
 // ── Columns ───────────────────────────────────────────────────
@@ -240,7 +248,8 @@ function buildStreetColumns() {
         "Share of street-km covered by 360° imagery. Both providers walk the SAME sample " +
         "points on the same frozen network, so these are directly comparable.",
       keyFor: (p) => `pct_${p}`,
-      cellFor: (p) => (row) => coverageCellHtml(row[`pct_${p}`], { compact: true }),
+      cellFor: (p) => (row) => coverageCellParts(row[`pct_${p}`], { compact: true }),
+      linkFor: walkProviderLink,
       initial: "desc",
       unit: "%",
       digits: 1,
@@ -256,7 +265,8 @@ function buildStreetColumns() {
       groupTitle:
         "Including flat/perspective imagery; equals the 360° number for Google Street View",
       keyFor: (p) => `pctAny_${p}`,
-      cellFor: (p) => (row) => coverageCellHtml(row[`pctAny_${p}`], { compact: true }),
+      cellFor: (p) => (row) => coverageCellParts(row[`pctAny_${p}`], { compact: true }),
+      linkFor: walkProviderLink,
       initial: "desc",
       unit: "%",
       digits: 1,
@@ -271,7 +281,10 @@ function buildStreetColumns() {
       groupLabel: "Walked",
       groupTitle: "Date of each provider's latest walk of this network",
       keyFor: (p) => `runDate_${p}`,
-      cellFor: (p) => (row) => walkDateCellHtml(row, p),
+      cellFor: (p) => (row) => ({
+        html: row[`runDate_${p}`] == null ? "—" : escapeHtml(row[`runDate_${p}`]),
+      }),
+      linkFor: walkProviderLink,
       type: "text",
       initial: "desc",
     }),
@@ -282,8 +295,10 @@ function buildStreetColumns() {
         "Median age of the imagery covering this walk's streets. Stored rather than " +
         "derived — a median of the per-class medians is not the median.",
       keyFor: (p) => `medianAge_${p}`,
-      cellFor: (p) => (row) =>
-        `<td>${row[`medianAge_${p}`] == null ? "—" : `${num(row[`medianAge_${p}`], 1)} yrs`}</td>`,
+      cellFor: (p) => (row) => ({
+        html: row[`medianAge_${p}`] == null ? "—" : `${num(row[`medianAge_${p}`], 1)} yrs`,
+      }),
+      linkFor: walkProviderLink,
       initial: "asc",
       unit: " yrs",
       digits: 1,
@@ -299,6 +314,7 @@ function buildStreetColumns() {
         "percentage points. Blank for first walks. Never a cross-provider comparison.",
       keyFor: (p) => `changeDelta_${p}`,
       cellFor: (p) => (row) => walkChangeCellHtml(row, p),
+      linkFor: walkProviderLink,
       initial: "desc",
       unit: " pp",
       digits: 1,
@@ -308,10 +324,11 @@ function buildStreetColumns() {
       groupLabel: "Covered km",
       groupTitle: "Kilometres of street covered by 360° imagery",
       keyFor: (p) => `lengthKmCovered_${p}`,
-      cellFor: (p) => (row) =>
-        `<td>${
-          row[`lengthKmCovered_${p}`] == null ? "—" : `${num(row[`lengthKmCovered_${p}`], 1)} km`
-        }</td>`,
+      cellFor: (p) => (row) => ({
+        html:
+          row[`lengthKmCovered_${p}`] == null ? "—" : `${num(row[`lengthKmCovered_${p}`], 1)} km`,
+      }),
+      linkFor: walkProviderLink,
       initial: "desc",
       unit: " km",
       digits: 1,
@@ -321,12 +338,13 @@ function buildStreetColumns() {
       groupLabel: "Covered km (any)",
       groupTitle: "Kilometres of street covered by any imagery, including flat/perspective",
       keyFor: (p) => `lengthKmCoveredAny_${p}`,
-      cellFor: (p) => (row) =>
-        `<td>${
+      cellFor: (p) => (row) => ({
+        html:
           row[`lengthKmCoveredAny_${p}`] == null
             ? "—"
-            : `${num(row[`lengthKmCoveredAny_${p}`], 1)} km`
-        }</td>`,
+            : `${num(row[`lengthKmCoveredAny_${p}`], 1)} km`,
+      }),
+      linkFor: walkProviderLink,
       initial: "desc",
       unit: " km",
       digits: 1,
@@ -336,7 +354,8 @@ function buildStreetColumns() {
       groupLabel: "Fully covered",
       groupTitle: "Streets covered end to end, per provider",
       keyFor: (p) => `fullyCovered_${p}`,
-      cellFor: (p) => (row) => `<td>${num(row[`fullyCovered_${p}`])}</td>`,
+      cellFor: (p) => (row) => ({ html: num(row[`fullyCovered_${p}`]) }),
+      linkFor: walkProviderLink,
       initial: "desc",
     }),
     ...providerColumnGroup({
@@ -344,8 +363,10 @@ function buildStreetColumns() {
       groupLabel: "Sample spacing (m)",
       groupTitle: "Along-edge sample spacing each provider's walk used",
       keyFor: (p) => `spacing_${p}`,
-      cellFor: (p) => (row) =>
-        `<td>${row[`spacing_${p}`] == null ? "—" : `${num(row[`spacing_${p}`])} m`}</td>`,
+      cellFor: (p) => (row) => ({
+        html: row[`spacing_${p}`] == null ? "—" : `${num(row[`spacing_${p}`])} m`,
+      }),
+      linkFor: walkProviderLink,
       initial: "asc",
       unit: " m",
     }),
@@ -784,7 +805,7 @@ if (typeof module !== "undefined" && module.exports) {
     sortRows,
     num,
     walkChangeCellHtml,
-    walkDateCellHtml,
+    walkProviderLink,
     walkRowHtml,
     streetDeltaPair,
     renderStreetWalks,

@@ -94,16 +94,30 @@ function formatCellNumber(value, digits = 0) {
  * @param {{compact?: boolean}} [options]
  * @returns {string} HTML for one <td>.
  */
-function coverageCellHtml(pct, { compact = false } = {}) {
-  const cls = compact ? "coverage-cell coverage-cell--compact" : "coverage-cell";
-  if (pct == null) return `<td class="${cls}">—</td>`;
+function coverageCellHtml(pct, options) {
+  const { html, className } = coverageCellParts(pct, options);
+  return `<td class="${className}">${html}</td>`;
+}
+
+/**
+ * The INNER content and class of a coverage cell, without its `<td>`.
+ *
+ * Split out so `providerColumnGroup` can wrap the content in a link without
+ * doing string surgery on an assembled `<td>` (issue #250 follow-up: every
+ * per-provider cell opens that provider's series).
+ *
+ * @param {?number} pct
+ * @param {{compact?: boolean}} [options]
+ * @returns {{html: string, className: string}}
+ */
+function coverageCellParts(pct, { compact = false } = {}) {
+  const className = compact ? "coverage-cell coverage-cell--compact" : "coverage-cell";
+  if (pct == null) return { html: "—", className };
   const bar = `
     <span class="coverage-bar" aria-hidden="true"
           style="width:${Math.max(0, Math.min(100, pct))}%;
                  background:${coverageColor(pct)}"></span>`;
-  return `<td class="${cls}">${bar}<span class="coverage-value">${pct.toFixed(
-    1
-  )}%</span></td>`;
+  return { html: `${bar}<span class="coverage-value">${pct.toFixed(1)}%</span>`, className };
 }
 
 /**
@@ -164,8 +178,20 @@ function deltaCellHtml(value, { digits = 1, unit = "" } = {}) {
  * @param {string} spec.id - Group id; every member repeats it.
  * @param {string} spec.groupLabel
  * @param {string} spec.groupTitle
+ * Every per-provider LEAF cell is a link into that provider's own series when
+ * `linkFor` supplies one: a row is a city now, so its per-provider numbers are
+ * the only place a reader can ask for one specific series, and making them
+ * click through is what stops the City cell's single link from being the whole
+ * way in. The Δ leaf is deliberately never linked — it belongs to no one
+ * provider. The link inherits the cell's colour and only shows an underline on
+ * hover/focus, so a table of numbers does not turn into a table of blue text.
+ *
  * @param {(provider: string) => string} spec.keyFor - Row-model key per provider.
  * @param {(provider: string) => Function} spec.cellFor - Cell renderer factory.
+ *   The renderer returns `{html, className?, title?}` — the cell's INNER
+ *   content, not an assembled `<td>`, so the link wrapper can go inside it.
+ * @param {(provider: string) => Function} [spec.linkFor] - Link factory
+ *   returning `{href, title}` or null for "this provider has nothing here".
  * @param {(provider: string) => string} [spec.leafLabel] - Overrides the
  *   default short provider label.
  * @param {string} [spec.type="number"]
@@ -183,6 +209,7 @@ function providerColumnGroup({
   groupTitle,
   keyFor,
   cellFor,
+  linkFor,
   leafLabel,
   type = "number",
   initial,
@@ -191,18 +218,22 @@ function providerColumnGroup({
   delta,
 }) {
   const group = { id, label: groupLabel, title: groupTitle };
-  const columns = Object.keys(PROVIDERS).map((provider) => ({
-    key: keyFor(provider),
-    label: leafLabel ? leafLabel(provider) : providerShortLabel(provider),
-    pickerLabel: `${groupLabel} — ${providerShortLabel(provider)}`,
-    type,
-    initial,
-    unit,
-    digits,
-    title: groupTitle,
-    group,
-    cell: cellFor(provider),
-  }));
+  const columns = Object.keys(PROVIDERS).map((provider) => {
+    const render = cellFor(provider);
+    const link = linkFor?.(provider);
+    return {
+      key: keyFor(provider),
+      label: leafLabel ? leafLabel(provider) : providerShortLabel(provider),
+      pickerLabel: `${groupLabel} — ${providerShortLabel(provider)}`,
+      type,
+      initial,
+      unit,
+      digits,
+      title: groupTitle,
+      group,
+      cell: (row) => providerCellHtml(render(row), link?.(row)),
+    };
+  });
   if (delta) {
     columns.push({
       key: delta.key,
@@ -218,6 +249,30 @@ function providerColumnGroup({
     });
   }
   return columns;
+}
+
+/**
+ * Assemble one per-provider `<td>` from its parts, wrapping the content in a
+ * link when the row has that provider's series to open.
+ *
+ * The cell's own `title` wins over the link's when both exist — a cell that
+ * has something specific to say (the walk-to-walk churn behind a Δ) is saying
+ * more than "opens this series".
+ *
+ * @param {{html: string, className?: string, title?: string}} parts
+ * @param {?{href: string, title?: string}} link
+ * @returns {string} HTML for one <td>.
+ */
+function providerCellHtml(parts, link) {
+  const { html, className, title } = parts;
+  const attrs =
+    (className ? ` class="${className}"` : "") + (title ? ` title="${title}"` : "");
+  if (!link) return `<td${attrs}>${html}</td>`;
+  const linkTitle = !title && link.title ? ` title="${link.title}"` : "";
+  return (
+    `<td${attrs}><a class="provider-cell-link"${linkTitle} ` +
+    `href="${link.href}">${html}</a></td>`
+  );
 }
 
 /**
@@ -453,8 +508,10 @@ if (typeof module !== "undefined" && module.exports) {
     sortRowsBy,
     formatCellNumber,
     coverageCellHtml,
+    coverageCellParts,
     providerShortLabel,
     deltaCellHtml,
+    providerCellHtml,
     providerColumnGroup,
     headerCellHtml,
     theadHtml,
