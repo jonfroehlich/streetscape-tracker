@@ -537,27 +537,35 @@ def test_a_paused_sweep_alongside_a_real_failure_exits_1_not_83(monkeypatch, cat
     The same reasoning as the mixed-host case above: 83 tells the caller to just
     run it again, so an invocation where something ALSO genuinely broke must not
     wear it and have the real failure read as progress.
+
+    NOTE WHAT THIS CAN AND CANNOT REACH TODAY. `--provider` takes one of
+    {both, gsv, mapillary, kartaview} and `both` is gsv+mapillary, so kartaview
+    always runs ALONE and the mixed case is currently unreachable through argv
+    — the guard is `len(incomplete) == len(failed)`, which today is either
+    trivially true or vacuous. It exists for #247, which makes `--provider all`
+    collect every provider in one invocation and turns this into a live path.
+
+    So this drives the aggregation directly, by stubbing the per-provider entry
+    point rather than the downloaders. Testing it through a `both` run of two
+    ordinary failures would exit 1 for reasons that have nothing to do with the
+    branch under test, and would pass just as happily if the branch were
+    deleted.
     """
     conn, city_id, data_dir = catalog
-    monkeypatch.setattr(cli, "load_config", lambda provider: {"api_key": "k", "access_token": "t"})
+    gsv_configs(monkeypatch)
 
-    async def paused(**kwargs):
+    async def one_pauses_one_breaks(conn_, args, city_row, run_date, provider, config, vis_path):
+        if provider == "mapillary":
+            raise SweepIncompleteError("budget", checkpoint_path="/cp", roots_done=2, root_count=16)
+        raise DownloadError("genuinely broken")
+
+    monkeypatch.setattr(cli, "_collect_one_run", one_pauses_one_breaks)
+    assert run_cli(monkeypatch, city_id, data_dir, provider="both") == 1
+
+    # ...and with the pause as the ONLY thing that went wrong, the same code
+    # path reports it as progress.
+    async def only_pauses(conn_, args, city_row, run_date, provider, config, vis_path):
         raise SweepIncompleteError("budget", checkpoint_path="/cp", roots_done=2, root_count=16)
 
-    monkeypatch.setattr(cli, "download_kartaview_metadata_async", paused)
-    assert (
-        run_cli(monkeypatch, city_id, data_dir, provider="kartaview") == SWEEP_INCOMPLETE_EXIT_CODE
-    )
-
-    # Now the same pause with a genuinely broken channel beside it. 'both' is
-    # gsv+mapillary and deliberately excludes kartaview, so this drives the
-    # aggregation directly rather than through a provider list that cannot
-    # contain all three.
-    conn2, city2, data_dir2 = catalog
-    monkeypatch.setattr(
-        cli, "download_gsv_metadata_async", stub_downloader([], error=DownloadError("broken"))
-    )
-    monkeypatch.setattr(
-        cli, "download_mapillary_metadata_async", stub_downloader([], error=DownloadError("broken"))
-    )
-    assert run_cli(monkeypatch, city2, data_dir2, provider="both") == 1
+    monkeypatch.setattr(cli, "_collect_one_run", only_pauses)
+    assert run_cli(monkeypatch, city_id, data_dir, provider="both") == SWEEP_INCOMPLETE_EXIT_CODE
