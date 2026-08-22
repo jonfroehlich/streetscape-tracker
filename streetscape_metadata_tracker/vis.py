@@ -4,6 +4,7 @@ import json
 import logging
 from datetime import datetime
 from math import cos, pi
+from urllib.parse import quote
 
 import branca.colormap as cm
 import folium
@@ -176,18 +177,44 @@ def display_search_area(
     return m
 
 
+def _kartaview_viewer_url(pano_id, row) -> str | None:
+    """
+    KartaView viewer deep-link for one census row, or None when unlinkable.
+
+    KartaView's viewer is addressed by (sequence, index within it) rather than
+    by photo id — mirroring PROVIDERS.kartaview.viewerUrl in
+    www/js/streetscape-utils.js, including its call to render no link at all
+    when either field is missing (the decoder keeps a null sequence rather than
+    inventing one, and a link to nowhere is worse than none).
+    """
+    sequence = row.get("sequence_id")
+    index = row.get("sequence_index")
+    if pd.isna(sequence) or pd.isna(index) or sequence == "":
+        return None
+    return f"https://kartaview.org/details/{quote(str(sequence), safe='')}/{int(index)}"
+
+
 # User-facing labels and pano viewer deep-links per provider (mirrors the
-# PROVIDERS registry in www/js/gsv-utils.js)
+# PROVIDERS registry in www/js/streetscape-utils.js). viewer_url takes the whole
+# row besides the pano id because KartaView's viewer is not addressable by photo
+# id; it may return None, which the popup renders as no link at all. Every
+# naming.KNOWN_PROVIDERS member must have an entry — a run's map is generated
+# AFTER the run is registered, so a missing one fails a fully successful
+# collection at the last step (a test pins the coverage).
 PROVIDER_DISPLAY = {
     "gsv": {
         "label": "GSV",
-        "viewer_url": lambda pano_id: (
+        "viewer_url": lambda pano_id, row: (
             f"https://www.google.com/maps/@?api=1&map_action=pano&pano={pano_id}"
         ),
     },
     "mapillary": {
         "label": "Mapillary",
-        "viewer_url": lambda pano_id: f"https://www.mapillary.com/app/?pKey={pano_id}",
+        "viewer_url": lambda pano_id, row: f"https://www.mapillary.com/app/?pKey={pano_id}",
+    },
+    "kartaview": {
+        "label": "KartaView",
+        "viewer_url": _kartaview_viewer_url,
     },
 }
 
@@ -200,8 +227,9 @@ def create_visualization_map(df: pd.DataFrame, city_name: str, provider: str = "
     Args:
         df: DataFrame containing run metadata (config.METADATA_DTYPES schema)
         city_name: Name of the city being visualized
-        provider: imagery provider ('gsv' or 'mapillary'); controls labels,
-            per-pano viewer links, and the official-imagery filter
+        provider: imagery provider (any naming.KNOWN_PROVIDERS member);
+            controls labels, per-pano viewer links, and the official-imagery
+            filter
 
     Returns:
         folium.Map object with the visualization
@@ -377,13 +405,16 @@ def create_visualization_map(df: pd.DataFrame, city_name: str, provider: str = "
         age_years = (datetime.now() - capture_date).days / 365.25
         color = matplotlib.colors.to_hex(colormap(age_years))
 
+        viewer_url = display["viewer_url"](row["pano_id"], row)
+        viewer_link = (
+            f'<br><a href="{viewer_url}" target="_blank">View in {label}</a>' if viewer_url else ""
+        )
         popup = folium.Popup(
             f"""
             <div>
                 Capture Date: {date_str}
                 <br>Age: {age_years:.1f} years
-                <br>Photographer: {row["copyright_info"]}
-                <br><a href="{display["viewer_url"](row["pano_id"])}" target="_blank">View in {label}</a>
+                <br>Photographer: {row["copyright_info"]}{viewer_link}
             </div>
         """,
             max_width=300,
