@@ -1829,6 +1829,11 @@ async def download_kartaview_metadata_async(
             api_requests_total: the whole sweep's spend across resumes
             num_flat_images: census magnitude of flat (PLANE) imagery (#116)
             started_at / finished_at: UTC ISO 8601 timestamps
+            checkpoint_path: the still-live checkpoint directory (or None). The
+                CALLER discards it, and only after the runs row is committed:
+                until then a crash leaves an uncataloged CSV whose orphan-guard
+                remedy is "delete it and re-run", which must resume from the
+                checkpoint rather than re-pay the sweep.
 
     Raises:
         SweepIncompleteError: propagated unchanged. Nothing is written and the
@@ -1859,48 +1864,61 @@ async def download_kartaview_metadata_async(
     api_requests = fetched["api_requests"]
     api_requests_total = fetched["api_requests_total"]
     failed_cells = fetched.get("failed_cells") or []
-    # Counted by the fetch, not recomputed here: binding the census to a local
-    # would pin the whole thing alive through both CSV writes and defeat the
-    # tail's release, and re-reading it through the dict would cost a second
-    # full pass for a log line (issue #157).
-    num_images = fetched["num_images"]
-    num_panos = fetched["num_panos"]
-    logger.info(
-        f"Swept {fetched['raw_photo_count']} photo rows "
-        f"({num_images} unique: {num_panos} panos, {num_images - num_panos} flat) "
-        f"from {fetched['cells_visited']} cells at r={fetched['radius_m']} m"
-    )
+    checkpoint_path_used = fetched.get("checkpoint_path")
+    try:
+        # Counted by the fetch, not recomputed here: binding the census to a
+        # local would pin the whole thing alive through both CSV writes and
+        # defeat the tail's release, and re-reading it through the dict would
+        # cost a second full pass for a log line (issue #157).
+        num_images = fetched["num_images"]
+        num_panos = fetched["num_panos"]
+        logger.info(
+            f"Swept {fetched['raw_photo_count']} photo rows "
+            f"({num_images} unique: {num_panos} panos, {num_images - num_panos} flat) "
+            f"from {fetched['cells_visited']} cells at r={fetched['radius_m']} m"
+        )
 
-    written = census_core.write_census_grid_run(
-        fetched,
-        grid,
-        output_csv_gz_path,
-        query_timestamp,
-        capture_dates_for=_kartaview_capture_dates,
-        image_columns=_kartaview_image_columns,
-        dtypes=KARTAVIEW_METADATA_DTYPES,
-        # A cell nothing came back for leaves its grid points UNKNOWN rather
-        # than empty; a clean sweep passes None and pays nothing. The sweep
-        # refuses to finalize at all past MAX_FAILED_AREA_FRACTION, so this
-        # only ever describes a small remainder.
-        unmeasured_mask=(
-            (lambda lats, lons: _points_in_cells(lats, lons, failed_cells))
-            if failed_cells
-            else None
-        ),
-        unmeasured_desc=f"{len(failed_cells)} unmeasured cell(s)",
-    )
+        written = census_core.write_census_grid_run(
+            fetched,
+            grid,
+            output_csv_gz_path,
+            query_timestamp,
+            capture_dates_for=_kartaview_capture_dates,
+            image_columns=_kartaview_image_columns,
+            dtypes=KARTAVIEW_METADATA_DTYPES,
+            # A cell nothing came back for leaves its grid points UNKNOWN rather
+            # than empty; a clean sweep passes None and pays nothing. The sweep
+            # refuses to finalize at all past MAX_FAILED_AREA_FRACTION, so this
+            # only ever describes a small remainder.
+            unmeasured_mask=(
+                (lambda lats, lons: _points_in_cells(lats, lons, failed_cells))
+                if failed_cells
+                else None
+            ),
+            unmeasured_desc=f"{len(failed_cells)} unmeasured cell(s)",
+        )
+    except Exception as e:
+        # The sweep's spend is real even when this tail dies (ENOSPC on the
+        # gzip write, a read-back failure), and these failures are not
+        # DownloadErrors, so without the attributes the caller's failure-path
+        # ledger write records nothing — and because the checkpoint survives
+        # and the resume re-finalizes for ~0 new requests, the spend would
+        # never land in ANY api_usage row (PR #251 review).
+        e.api_requests = api_requests
+        e.api_requests_total = api_requests_total
+        raise
 
-    # LAST, and only now: the artifact is on disk, so the sweep it was paid for
-    # is durable and the checkpoint has nothing left to protect. Discarding it
-    # any earlier -- inside the fetch, or before this write -- is what would
-    # make a crash in this tail re-pay the whole sweep, which is one of the four
-    # interruptions #239 exists to cover. Best effort by contract: a checkpoint
-    # that cannot be removed must never fail a run that has already succeeded.
-    if fetched.get("checkpoint_path"):
-        discard_checkpoint(fetched["checkpoint_path"])
+    # The checkpoint is NOT discarded here, deliberately — not even now that
+    # the CSV is on disk. The caller still has to write the stats, the `runs`
+    # row, the JSON and the diff, and a crash between this return and
+    # `register_run` leaves an uncataloged CSV whose orphan-guard remedy is
+    # "delete it and re-run" — which must re-finalize from the checkpoint for
+    # ~0 requests, not re-pay a multi-night sweep (PR #251 review). The path is
+    # returned so the CLI can discard_checkpoint() once the runs row is
+    # committed; see that function's docstring for the contract.
 
     return {
+        "checkpoint_path": checkpoint_path_used,
         "df": written["df"],
         "filename_with_path": output_csv_gz_path,
         # This process's spend. The ledger is additive and keyed by (date,

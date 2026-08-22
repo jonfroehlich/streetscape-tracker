@@ -569,3 +569,182 @@ def test_a_paused_sweep_alongside_a_real_failure_exits_1_not_83(monkeypatch, cat
 
     monkeypatch.setattr(cli, "_collect_one_run", only_pauses)
     assert run_cli(monkeypatch, city_id, data_dir, provider="both") == SWEEP_INCOMPLETE_EXIT_CODE
+
+
+def test_a_paused_sweep_prints_paused_not_failed(monkeypatch, catalog, capsys):
+    """
+    The except clause calls a pause "progress, not breakage", so stdout must
+    not announce FAILED and then contradict itself with PAUSED — a wrapper
+    grepping stdout would escalate (or --force re-run) every legitimately
+    budget-capped night of a multi-night sweep. The message also names the
+    provider that actually paused rather than hardcoding KartaView
+    (PR #251 review).
+    """
+    conn, city_id, data_dir = catalog
+    kartaview_configs(monkeypatch)
+    error = SweepIncompleteError("budget", checkpoint_path="/cp", roots_done=2, root_count=16)
+
+    async def stub(**kwargs):
+        raise error
+
+    monkeypatch.setattr(cli, "download_kartaview_metadata_async", stub)
+    assert (
+        run_cli(monkeypatch, city_id, data_dir, provider="kartaview") == SWEEP_INCOMPLETE_EXIT_CODE
+    )
+    out = capsys.readouterr().out
+    assert "PAUSED: kartaview checkpointed at 2/16 root cells" in out
+    assert "FAILED" not in out
+
+
+def test_the_checkpoint_is_discarded_only_after_the_runs_row_commits(monkeypatch, catalog):
+    """
+    The discard moved out of the downloader (PR #251 review): the CSV landing
+    is not enough, because a crash between the CSV write and register_run
+    leaves an orphan whose remedy is "delete it and re-run" — which must
+    re-finalize from the checkpoint for ~0 requests, not re-pay the sweep. So
+    the CLI discards, and only once the runs row is already in the catalog.
+    """
+    conn, city_id, data_dir = catalog
+    kartaview_configs(monkeypatch)
+    inner = kartaview_stub()
+
+    async def with_checkpoint(**kwargs):
+        result = await inner(**kwargs)
+        result["checkpoint_path"] = "/cp"
+        return result
+
+    monkeypatch.setattr(cli, "download_kartaview_metadata_async", with_checkpoint)
+    seen = {}
+
+    def fake_discard(path):
+        seen["path"] = path
+        seen["run_cataloged"] = db.get_latest_run(conn, city_id, provider="kartaview") is not None
+
+    monkeypatch.setattr(cli, "discard_checkpoint", fake_discard)
+
+    assert run_cli(monkeypatch, city_id, data_dir, provider="kartaview") == 0
+    assert seen["path"] == "/cp"
+    assert seen["run_cataloged"] is True, "discard must come after register_run, never before"
+
+
+def test_a_register_run_failure_leaves_the_checkpoint_alive(monkeypatch, catalog):
+    """
+    The failure that motivated the move: the DB refusing the runs row (locked
+    by a concurrent process, a schema migration mid-run — the class that cost
+    the 611k-request Berlin walk its row). The CSV is on disk, nothing is
+    cataloged, and the checkpoint must survive as the only thing that makes
+    the re-run cheap.
+    """
+    conn, city_id, data_dir = catalog
+    kartaview_configs(monkeypatch)
+    inner = kartaview_stub()
+
+    async def with_checkpoint(**kwargs):
+        result = await inner(**kwargs)
+        result["checkpoint_path"] = "/cp"
+        return result
+
+    monkeypatch.setattr(cli, "download_kartaview_metadata_async", with_checkpoint)
+    discarded = []
+    monkeypatch.setattr(cli, "discard_checkpoint", lambda p: discarded.append(p))
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(cli.db, "register_run", boom)
+    assert run_cli(monkeypatch, city_id, data_dir, provider="kartaview") == 1
+    assert discarded == []
+
+
+def test_a_non_downloaderror_failure_with_a_spend_still_reaches_the_ledger(monkeypatch, catalog):
+    """
+    PR #251 review: a KartaView sweep whose post-fetch tail dies (ENOSPC on
+    the gzip write) raises OSError, not DownloadError — and because the
+    checkpoint survives and the resume re-finalizes for ~0 new requests, a
+    spend missed here would never land in ANY api_usage row.
+    """
+    conn, city_id, data_dir = catalog
+    kartaview_configs(monkeypatch)
+    error = OSError("No space left on device")
+    error.api_requests = 9
+
+    async def stub(**kwargs):
+        raise error
+
+    monkeypatch.setattr(cli, "download_kartaview_metadata_async", stub)
+    assert run_cli(monkeypatch, city_id, data_dir, provider="kartaview") == 1
+    assert db.get_api_usage(conn, RUN_DATE, provider="kartaview") == 9
+
+
+def test_kartaview_gets_its_own_timeout_default(monkeypatch, catalog):
+    """
+    DEFAULT_REQUEST_TIMEOUT_S is 60 because nearby-photos is a database query
+    whose heaviest documented shape is a 2,000-row page; passing the CLI's
+    30 s default straight through silently halved it on every real sweep
+    (PR #251 review). An explicit --timeout still wins.
+    """
+    conn, city_id, data_dir = catalog
+    kartaview_configs(monkeypatch)
+    calls = []
+    inner = kartaview_stub()
+
+    async def capture(**kwargs):
+        calls.append(kwargs)
+        return await inner(**kwargs)
+
+    monkeypatch.setattr(cli, "download_kartaview_metadata_async", capture)
+    assert run_cli(monkeypatch, city_id, data_dir, provider="kartaview") == 0
+    assert calls[0]["request_timeout"] == 60.0
+
+    assert (
+        run_cli(
+            monkeypatch,
+            city_id,
+            data_dir,
+            "--run-date",
+            "2026-07-02",
+            "--timeout",
+            "45",
+            "--force",
+            provider="kartaview",
+        )
+        == 0
+    )
+    assert calls[-1]["request_timeout"] == 45.0
+
+    gsv_calls = []
+    gsv_configs(monkeypatch)
+    monkeypatch.setattr(cli, "download_gsv_metadata_async", stub_downloader(gsv_calls))
+    assert run_cli(monkeypatch, city_id, data_dir, provider="gsv") == 0
+    assert gsv_calls[0]["request_timeout"] == 30.0, "the other providers keep their 30 s default"
+
+
+def test_kartaview_max_requests_refuses_nonpositive_values(monkeypatch, catalog):
+    """
+    `--kartaview-max-requests 0` used to spend the full calibration ladder,
+    checkpoint roots_done=0, exit 83 and print "re-run the same command to
+    resume" — an infinite loop the message actively encourages (PR #251
+    review). Refused at parse time, before any work, following #214's posture
+    for `run-due --limit`.
+    """
+    conn, city_id, data_dir = catalog
+    kartaview_configs(monkeypatch)
+    calls = []
+
+    async def never(**kwargs):
+        calls.append(kwargs)
+        raise AssertionError("no downloader call may happen on a refused value")
+
+    monkeypatch.setattr(cli, "download_kartaview_metadata_async", never)
+    for bad in ("0", "-5"):
+        with pytest.raises(SystemExit) as excinfo:
+            run_cli(
+                monkeypatch,
+                city_id,
+                data_dir,
+                "--kartaview-max-requests",
+                bad,
+                provider="kartaview",
+            )
+        assert excinfo.value.code == 2
+    assert calls == []

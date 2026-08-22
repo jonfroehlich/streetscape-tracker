@@ -12,7 +12,8 @@ without failing anything else:
   * ``failed_cells`` become REQUEST_FAILED points rather than empty ones;
   * ``api_requests`` and ``api_requests_total`` are different numbers reaching
     different sinks;
-  * the checkpoint is discarded LAST, and not at all when nothing was written.
+  * the checkpoint SURVIVES the wrapper — its path is handed back for the CLI
+    to discard only after register_run commits (PR #251 review).
 
 The sweep is stubbed out entirely -- no request reaches kartaview.org, which is
 the suite-wide rule for a project that already owns two per-IP bans.
@@ -303,38 +304,38 @@ def test_the_wrapper_never_counts_the_census_itself(monkeypatch, tmp_path):
 # ── The checkpoint lifecycle ───────────────────────────────────────────────
 
 
-def test_the_checkpoint_is_discarded_only_after_the_artifact_lands(monkeypatch, tmp_path):
+def test_the_wrapper_never_discards_the_checkpoint_itself(monkeypatch, tmp_path):
     """
-    The caller-tail half of #239, and the reason the fetch does NOT delete it.
-
-    Ordering is the assertion, not merely that it happens: discarding before the
-    CSV write is what would make a crash in this tail re-pay the whole sweep.
+    The caller-tail half of #239, moved one level up by the PR #251 review:
+    the CSV landing is NOT enough. The wrapper's caller still has to commit the
+    `runs` row, and a crash between this return and register_run leaves an
+    orphan CSV whose remedy is "delete it and re-run" — which must re-finalize
+    from the checkpoint for ~0 requests, not re-pay a multi-night sweep. So the
+    wrapper returns the live path for the CLI to discard after register_run,
+    and calls discard_checkpoint never.
     """
     cp = tmp_path / "cp"
     cp.mkdir()
     (cp / "state.json").write_text("{}")
-    output = str(tmp_path / "run.csv.gz")
-    seen = {}
-
-    def fake_discard(path):
-        # The artifact must already be on disk when this runs.
-        seen["artifact_existed"] = os.path.exists(output)
-        seen["path"] = path
-
-    monkeypatch.setattr(kv, "discard_checkpoint", fake_discard)
-    fetched = _fetched([_item()], checkpoint_path=str(cp))
-    _run(monkeypatch, fetched, tmp_path)
-
-    assert seen["path"] == str(cp)
-    assert seen["artifact_existed"] is True
-
-
-def test_no_checkpoint_means_nothing_to_discard(monkeypatch, tmp_path):
-    """`checkpoint_path=None` is the pre-#239 path and must stay a no-op."""
     calls = []
     monkeypatch.setattr(kv, "discard_checkpoint", lambda p: calls.append(p))
-    _run(monkeypatch, _fetched([_item()]), tmp_path)
+
+    fetched = _fetched([_item()], checkpoint_path=str(cp))
+    result, _, _ = _run(monkeypatch, fetched, tmp_path)
+
     assert calls == []
+    assert result["checkpoint_path"] == str(cp)
+    assert (cp / "state.json").exists()
+
+
+def test_no_checkpoint_means_no_path_to_hand_back(monkeypatch, tmp_path):
+    """`checkpoint_path=None` is the pre-#239 path: nothing survives, nothing
+    is handed to the caller to discard."""
+    calls = []
+    monkeypatch.setattr(kv, "discard_checkpoint", lambda p: calls.append(p))
+    result, _, _ = _run(monkeypatch, _fetched([_item()]), tmp_path)
+    assert calls == []
+    assert result["checkpoint_path"] is None
 
 
 def test_an_incomplete_sweep_propagates_and_publishes_nothing(monkeypatch, tmp_path):
