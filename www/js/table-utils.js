@@ -15,6 +15,13 @@
  * file and the row renderers emitted a matching, hand-maintained sequence of
  * `<td>`s — two parallel lists that a column change had to update in step.
  *
+ * A descriptor may additionally carry `group: {id, label, title}`, repeated on
+ * every member of the group, which turns the header into two rows (see
+ * theadHtml) — that is how the pivoted pages (issue #250) put one sub-column
+ * per provider under one metric heading. A grouped leaf's `label` is then just
+ * a provider name, so `pickerLabel` supplies the self-contained wording the
+ * column picker needs (read in table-controls.js).
+ *
  * Depends on globals from streetscape-utils.js (loaded first): coverageColor.
  */
 
@@ -73,14 +80,27 @@ function formatCellNumber(value, digits = 0) {
   });
 }
 
-/** A coverage cell: a proportional bar (decorative) behind the number. */
-function coverageCellHtml(pct) {
-  if (pct == null) return `<td class="coverage-cell">—</td>`;
+/**
+ * A coverage cell: a proportional bar (decorative) behind the number.
+ *
+ * `compact` narrows the cell (90px rather than 128px) for the pivoted pages,
+ * where one metric occupies one sub-column PER PROVIDER under a grouped
+ * header: at the full width a three-provider coverage group alone would push
+ * the table past its measure. The bar still reads as a proportion — it is the
+ * surrounding whitespace that goes, not the bar.
+ *
+ * @param {?number} pct
+ * @param {{compact?: boolean}} [options]
+ * @returns {string} HTML for one <td>.
+ */
+function coverageCellHtml(pct, { compact = false } = {}) {
+  const cls = compact ? "coverage-cell coverage-cell--compact" : "coverage-cell";
+  if (pct == null) return `<td class="${cls}">—</td>`;
   const bar = `
     <span class="coverage-bar" aria-hidden="true"
           style="width:${Math.max(0, Math.min(100, pct))}%;
                  background:${coverageColor(pct)}"></span>`;
-  return `<td class="coverage-cell">${bar}<span class="coverage-value">${pct.toFixed(
+  return `<td class="${cls}">${bar}<span class="coverage-value">${pct.toFixed(
     1
   )}%</span></td>`;
 }
@@ -99,23 +119,89 @@ function coverageCellHtml(pct) {
  *
  * @param {Object} column - Column descriptor.
  * @param {{key: string, dir: string}} activeSort
+ * @param {{rowspan?: number}} [options] - `rowspan` is emitted only when a
+ *   two-row grouped header is in play (see theadHtml): an UNgrouped column has
+ *   no second-row leaf, so its single cell has to span both rows or the header
+ *   would be one cell short on row 2. Omitting the option leaves the markup
+ *   byte-identical to the single-row form.
  * @returns {string} HTML for one <th>.
  */
-function headerCellHtml(column, activeSort) {
+function headerCellHtml(column, activeSort, { rowspan } = {}) {
+  const span = rowspan ? ` rowspan="${rowspan}"` : "";
   // A non-sortable column (none currently defined, but the mechanism stays
   // general) still needs a header cell so the column count matches the body
   // rows, even with nothing to sort and no visible label.
   if (column.sortable === false) {
-    return `<th scope="col"><span class="visually-hidden">${column.srLabel ?? ""}</span></th>`;
+    return `<th scope="col"${span}><span class="visually-hidden">${column.srLabel ?? ""}</span></th>`;
   }
   const isActive = column.key === activeSort.key;
   const ariaSort = isActive ? (activeSort.dir === "asc" ? "ascending" : "descending") : "none";
   const arrow = isActive ? (activeSort.dir === "asc" ? "▲" : "▼") : "";
   const title = column.title ? ` title="${column.title}"` : "";
   return `
-    <th scope="col" data-key="${column.key}" aria-sort="${ariaSort}">
+    <th scope="col"${span} data-key="${column.key}" aria-sort="${ariaSort}">
       <button type="button"${title}>${column.label} <span class="sort-arrow" aria-hidden="true">${arrow}</span></button>
     </th>`;
+}
+
+/**
+ * Build the whole <thead> content for a visible column set (issue #250).
+ *
+ * TWO shapes, and which one you get is decided by the data, not by a flag:
+ *
+ *  * No visible column carries a `group` → ONE `<tr>`, byte-identical to what
+ *    this file emitted before grouped headers existed. That is the
+ *    driving.html guarantee: that page's descriptors have no groups, so its
+ *    header markup cannot move. A test pins the identity.
+ *  * Otherwise TWO `<tr>`s. Row 1 collapses each run of columns sharing a
+ *    `group.id` into one `<th scope="colgroup" colspan=N>`; an ungrouped
+ *    column emits its normal header cell with `rowspan="2"`. Row 2 carries the
+ *    leaf cells of the grouped columns only.
+ *
+ * Runs are contiguous because `resolveVisibleColumns` already orders the
+ * visible set canonically — a group's members are adjacent in the page's
+ * column list, so they are adjacent here. A group whose members were somehow
+ * split would render as two separate group cells rather than misaligning the
+ * body, which is the safe failure.
+ *
+ * `data-key`, the sort <button> and `aria-sort` live ONLY on leaf `<th>`s, so
+ * createSortableTable's delegated `closest("th[data-key]")` click keeps
+ * working unchanged and a click on a group cell is a no-op.
+ *
+ * The first VISIBLE member of a group supplies the group's label and title —
+ * the descriptor repeats them on every member so that dropping the first one
+ * from the view (a preset, or the column picker) still leaves the group named.
+ *
+ * @param {Object[]} visible - Visible column descriptors, in canonical order.
+ * @param {{key: string, dir: string}} activeSort
+ * @returns {string} The <thead>'s inner HTML.
+ */
+function theadHtml(visible, activeSort) {
+  if (!visible.some((column) => column.group)) {
+    return `<tr>${visible.map((column) => headerCellHtml(column, activeSort)).join("")}</tr>`;
+  }
+  const groupRow = [];
+  const leafRow = [];
+  for (let i = 0; i < visible.length; ) {
+    const column = visible[i];
+    if (!column.group) {
+      groupRow.push(headerCellHtml(column, activeSort, { rowspan: 2 }));
+      i += 1;
+      continue;
+    }
+    let end = i;
+    while (end < visible.length && visible[end].group?.id === column.group.id) end += 1;
+    const members = visible.slice(i, end);
+    const { label, title } = members[0].group;
+    groupRow.push(
+      `<th scope="colgroup" class="th-group" colspan="${members.length}"${
+        title ? ` title="${title}"` : ""
+      }>${label}</th>`
+    );
+    for (const member of members) leafRow.push(headerCellHtml(member, activeSort));
+    i = end;
+  }
+  return `<tr>${groupRow.join("")}</tr><tr>${leafRow.join("")}</tr>`;
 }
 
 /**
@@ -157,9 +243,7 @@ function createSortableTable({ columns, defaultSort, theadEl, tbodyEl, tieKey = 
   const sortListeners = [];
 
   function render() {
-    theadEl.innerHTML = `<tr>${visible
-      .map((column) => headerCellHtml(column, activeSort))
-      .join("")}</tr>`;
+    theadEl.innerHTML = theadHtml(visible, activeSort);
     tbodyEl.innerHTML = sortRowsBy(visible, rows, activeSort.key, activeSort.dir, tieKey)
       .map((row) => rowHtmlFromColumns(visible, row))
       .join("");
@@ -255,6 +339,7 @@ if (typeof module !== "undefined" && module.exports) {
     formatCellNumber,
     coverageCellHtml,
     headerCellHtml,
+    theadHtml,
     rowHtmlFromColumns,
     createSortableTable,
   };

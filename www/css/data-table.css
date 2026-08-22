@@ -116,6 +116,26 @@
   outline-offset: -2px;
 }
 
+/* ── Grouped two-row headers (issue #250) ─────────────────────────────────
+   Emitted only when a page's column descriptors carry a `group` (grid.html
+   and streets.html pivot providers into sub-columns); driving.html's header
+   stays one row and never matches these rules. The group cell is a label, not
+   a control — it has no sort button and no data-key, so it is deliberately
+   centered and unclickable. */
+
+.streets-table thead th.th-group {
+  padding: 6px 12px;
+  text-align: center;
+  font-weight: bold;
+  border-bottom: 1px solid #ddd;
+  /* Separates one metric group from the next without a full grid of rules. */
+  box-shadow: inset 1px 0 0 #ddd;
+}
+
+.streets-table thead th.th-group:first-child {
+  box-shadow: none;
+}
+
 /* Reserve the arrow's width so re-sorting doesn't shift column widths. */
 .sort-arrow {
   display: inline-block;
@@ -156,6 +176,13 @@
 .coverage-cell {
   position: relative;
   min-width: 128px;
+}
+
+/* The pivoted pages (issue #250) put one coverage cell per PROVIDER under a
+   grouped header, plus a Δ column — at 128px each that group alone overflows
+   the measure. The bar still reads as a proportion; what goes is slack. */
+.coverage-cell--compact {
+  min-width: 90px;
 }
 
 /* The coverage scale runs light-at-high (see coverageColor), so the bar needs

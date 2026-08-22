@@ -16,10 +16,13 @@ global.formatCellNumber = (v, digits = 0) =>
 const {
   foldForSearch,
   matchesSearch,
+  isRangeType,
   isFilterUnset,
   rowPassesFilter,
   applyFilters,
+  rowsExceptFilter,
   resolveVisibleColumns,
+  defaultFilterValues,
   parseTableState,
   serializeTableState,
   bucketCountFor,
@@ -361,4 +364,232 @@ test("controlsHtml: the picker offers every column except the always-on ones", (
   // City and the link column are structural — they are never toggleable.
   assert.doesNotMatch(html, /data-column="label"/);
   assert.doesNotMatch(html, /data-column="actions"/);
+});
+
+// --- histogram-range parity (issue #250) ------------------------------------
+//
+// `histogram-range` renders differently and behaves identically: same value
+// shape, same URL wire format. Every place that reasons about the VALUE has to
+// treat the two as one, so each is asserted against its `range` twin rather
+// than against a hand-copied expectation.
+
+const HIST_FILTERS = [
+  { key: "cov", label: "Coverage", type: "histogram-range", field: "pct", min: 0, max: 100 },
+  { key: "age", label: "Median age", type: "histogram-range", field: "age", min: 0 },
+];
+
+test("isRangeType: both numeric-window flavours, nothing else", () => {
+  assert.ok(isRangeType({ type: "range" }));
+  assert.ok(isRangeType({ type: "histogram-range" }));
+  assert.ok(!isRangeType({ type: "select" }));
+  assert.ok(!isRangeType({ type: "boolean" }));
+});
+
+test("histogram-range is unset/pass-tested exactly like range", () => {
+  const hist = HIST_FILTERS[0];
+  const plain = FILTERS[1];
+  for (const value of [{ min: null, max: null }, { min: 10, max: null }, null, ""]) {
+    assert.equal(
+      isFilterUnset(hist, value),
+      isFilterUnset(plain, value),
+      `unset disagreed on ${JSON.stringify(value)}`
+    );
+  }
+  for (const row of [{ pct: 90 }, { pct: 10 }, { pct: null }]) {
+    assert.equal(
+      rowPassesFilter(hist, row, { min: 50, max: 100 }),
+      rowPassesFilter(plain, row, { min: 50, max: 100 }),
+      `pass disagreed on ${JSON.stringify(row)}`
+    );
+  }
+});
+
+test("histogram-range round-trips through the URL in the plain range's format", () => {
+  const state = {
+    query: "",
+    preset: "overview",
+    cols: null,
+    sort: null,
+    values: { cov: { min: 10, max: 90 } },
+  };
+  const qs = serializeTableState(state, { filters: HIST_FILTERS, defaultPreset: "overview" });
+  // Byte-for-byte what the plain `range` twin writes (URLSearchParams
+  // percent-encodes the "~", which is why this is compared rather than typed).
+  assert.equal(
+    qs,
+    serializeTableState(state, { filters: [FILTERS[1]], defaultPreset: "overview" })
+  );
+  assert.deepEqual(parseTableState(qs, { filters: HIST_FILTERS }).values.cov, { min: 10, max: 90 });
+
+  // One-sided and malformed degrade the same way a plain range does.
+  assert.deepEqual(parseTableState("cov=50~", { filters: HIST_FILTERS }).values.cov, {
+    min: 50,
+    max: null,
+  });
+  assert.deepEqual(parseTableState("cov=~50", { filters: HIST_FILTERS }).values.cov, {
+    min: null,
+    max: 50,
+  });
+  assert.deepEqual(parseTableState("cov=abc~xyz", { filters: HIST_FILTERS }).values, {});
+  assert.deepEqual(parseTableState("cov=~", { filters: HIST_FILTERS }).values, {});
+});
+
+// --- rowsExceptFilter (the crossfilter rule) --------------------------------
+
+test("rowsExceptFilter: ignores its own filter but honors every other one", () => {
+  // The bars a slider draws must not be computed over its own selection, or
+  // the histogram changes under the reader's hand. Everything else still
+  // narrows them, which is the point of computing them at all.
+  const cfg = {
+    filters: FILTERS,
+    values: { provider: "gsv", cov: { min: 80, max: 100 } },
+    query: "",
+    searchFields: [],
+  };
+  // With every filter applied only "a" survives...
+  assert.deepEqual(applyFilters(ROWS, cfg).map((r) => r.cityId), ["a"]);
+  // ...but the coverage histogram is drawn over both GSV rows, including the
+  // one its own window currently excludes.
+  assert.deepEqual(rowsExceptFilter(ROWS, cfg, "cov").map((r) => r.cityId), ["a", "c"]);
+  // Dropping the provider filter instead leaves cov doing the narrowing.
+  assert.deepEqual(rowsExceptFilter(ROWS, cfg, "provider").map((r) => r.cityId), ["a"]);
+  // An unknown self-key drops nothing.
+  assert.deepEqual(rowsExceptFilter(ROWS, cfg, "nope").map((r) => r.cityId), ["a"]);
+});
+
+test("rowsExceptFilter: the free-text query still narrows the bars", () => {
+  const rows = [
+    { cityId: "a", label: "Seattle", pct: 90 },
+    { cityId: "b", label: "Bend", pct: 10 },
+  ];
+  const out = rowsExceptFilter(
+    rows,
+    { filters: FILTERS, values: { cov: { min: 50, max: 100 } }, query: "bend", searchFields: ["label"] },
+    "cov"
+  );
+  assert.deepEqual(out.map((r) => r.cityId), ["b"]);
+});
+
+// --- histogramBuckets: fixed domain -----------------------------------------
+
+test("histogramBuckets: a domain override fixes the axis instead of tracking the values", () => {
+  // The slider's axis must not rescale under a brush — bars shrink, the axis
+  // stays. Without the override these three values would span 10–30.
+  const stats = histogramBuckets([10, 20, 30], 4, { min: 0, max: 100 });
+  assert.equal(stats.min, 0);
+  assert.equal(stats.max, 100);
+  // Four 25-wide buckets over 0-100: 10 and 20 in the first, 30 in the second.
+  assert.deepEqual(stats.buckets.map((b) => b.count), [2, 1, 0, 0]);
+  assert.equal(stats.buckets[0].from, 0);
+  assert.equal(stats.buckets[3].to, 100);
+  // Without the override the same values would span 10-30 instead.
+  assert.equal(histogramBuckets([10, 20, 30], 4).max, 30);
+});
+
+test("histogramBuckets: values outside a fixed domain clamp into the end buckets", () => {
+  // A domain is computed once from the unfiltered rows; a value beyond it can
+  // only come from a stale domain, and losing the row silently would be worse
+  // than piling it on an end bar.
+  const stats = histogramBuckets([-5, 50, 105], 2, { min: 0, max: 100 });
+  // -5 clamps up into the first bucket, 105 clamps down into the last; 50 sits
+  // on the boundary and belongs to the upper bucket, as it always has.
+  assert.deepEqual(stats.buckets.map((b) => b.count), [1, 2]);
+  assert.equal(stats.count, 3);
+});
+
+test("histogramBuckets: without a domain, nothing about the existing behaviour moves", () => {
+  const stats = histogramBuckets([0, 50, 100], 4);
+  assert.equal(stats.min, 0);
+  assert.equal(stats.max, 100);
+  assert.equal(histogramBuckets([], 4, { min: 0, max: 100 }), null);
+});
+
+// --- select defaultValue (issue #250) ---------------------------------------
+
+const NETWORK_FILTER = {
+  key: "network",
+  label: "Network",
+  type: "select",
+  defaultValue: "drive",
+  options: [
+    { value: "drive", label: "Roads" },
+    { value: "all_public", label: "Roads + paths" },
+  ],
+  test: (row, value) => row.networkType === value,
+};
+
+test("parseTableState: an absent param means the DEFAULT, not 'no filter'", () => {
+  // streets.html has no "all networks" reading: two networks are two different
+  // street-km denominators, which must never share a comparable column.
+  assert.deepEqual(parseTableState("", { filters: [NETWORK_FILTER] }).values, {
+    network: "drive",
+  });
+  assert.deepEqual(parseTableState("network=all_public", { filters: [NETWORK_FILTER] }).values, {
+    network: "all_public",
+  });
+});
+
+test("parseTableState: an unknown value falls back to the default, not to unset", () => {
+  // Dropping the filter would double every city's rows on a hand-edited URL.
+  assert.deepEqual(parseTableState("network=bogus", { filters: [NETWORK_FILTER] }).values, {
+    network: "drive",
+  });
+  assert.deepEqual(parseTableState("network=", { filters: [NETWORK_FILTER] }).values, {
+    network: "drive",
+  });
+});
+
+test("serializeTableState: the default is omitted, a deviation is written", () => {
+  const cfg = { filters: [NETWORK_FILTER], defaultPreset: "overview" };
+  const base = { query: "", preset: "overview", cols: null, sort: null };
+  assert.equal(serializeTableState({ ...base, values: { network: "drive" } }, cfg), "");
+  assert.equal(
+    serializeTableState({ ...base, values: { network: "all_public" } }, cfg),
+    "network=all_public"
+  );
+});
+
+test("defaultFilterValues: only defaulted selects contribute — this is what Clear all resets to", () => {
+  assert.deepEqual(defaultFilterValues([NETWORK_FILTER, ...FILTERS]), { network: "drive" });
+  assert.deepEqual(defaultFilterValues(FILTERS), {});
+});
+
+test("controlsHtml: a defaulted select drops the blank 'any' option", () => {
+  const html = controlsHtml({ filters: [NETWORK_FILTER], presets: PRESETS, columns: COLUMNS });
+  assert.doesNotMatch(html, /<option value="">/);
+  assert.match(html, /<option value="drive">Roads<\/option>/);
+  // ...while an ordinary select keeps it.
+  assert.match(
+    controlsHtml({ filters: FILTERS, presets: PRESETS, columns: COLUMNS }),
+    /<option value="">All<\/option>/
+  );
+});
+
+// --- strip opt-out + pickerLabel --------------------------------------------
+
+test("controlsHtml: showDistributionStrip=false omits the strip container entirely", () => {
+  // The pivoted pages replace it with per-filter histograms; leaving an empty
+  // container would still paint a card-shaped box under the controls.
+  const off = controlsHtml({
+    filters: FILTERS,
+    presets: PRESETS,
+    columns: COLUMNS,
+    showDistributionStrip: false,
+  });
+  assert.doesNotMatch(off, /distribution-strip/);
+  // driving.html passes nothing and keeps it.
+  assert.match(controlsHtml({ filters: FILTERS, presets: PRESETS, columns: COLUMNS }), /id="distribution-strip"/);
+});
+
+test("controlsHtml: the picker prefers pickerLabel over the leaf label", () => {
+  // A pivot's leaf label is a provider name repeated under every metric group
+  // ("GSV" four times); unambiguous in the header, useless in a flat list.
+  const columns = [
+    { key: "label", label: "City", always: true },
+    { key: "pct_gsv", label: "GSV", pickerLabel: "Grid coverage — GSV" },
+    { key: "km", label: "Street km" },
+  ];
+  const html = controlsHtml({ filters: [], presets: PRESETS, columns });
+  assert.match(html, /data-column="pct_gsv"> Grid coverage — GSV/);
+  assert.match(html, /data-column="km"> Street km/);
 });

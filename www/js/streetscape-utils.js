@@ -67,6 +67,18 @@ const RENDER_CAP = 40000;
 const PROVIDERS = {
   gsv: {
     label: "Google Street View",
+    // Column-header form (issue #250). The pivoted grid/streets tables put one
+    // sub-column PER PROVIDER under a grouped header, so the leaf label is
+    // repeated across every metric group and has to be short enough that three
+    // of them fit a measure. Consumers fall back to `label`, so a provider
+    // registered without one still renders.
+    shortLabel: "GSV",
+    // How a provider's raw pano COUNT is arrived at — the reason those counts
+    // are not comparable across providers even though the coverage
+    // percentages are. Rendered as the parenthetical on the pivot's
+    // "Panoramas" leaves, which is the one place the two numbers sit side by
+    // side and most invite being subtracted.
+    panoCountingModel: "sample",
     description: "Official Google Street View metadata, sampled at each grid point",
     panoNoun: "Google Panoramas",
     launchDate: new Date("2007-05-25"),
@@ -80,6 +92,8 @@ const PROVIDERS = {
   },
   mapillary: {
     label: "Mapillary",
+    shortLabel: "Mapillary",
+    panoCountingModel: "census",
     description: "Crowdsourced Mapillary imagery: a census of every 360° panorama",
     panoNoun: "Mapillary Panoramas",
     launchDate: new Date("2014-01-01"),

@@ -78,6 +78,7 @@ const tableGlobals = {
   formatCellNumber: "readonly",
   coverageCellHtml: "readonly",
   headerCellHtml: "readonly",
+  theadHtml: "readonly",
   rowHtmlFromColumns: "readonly",
   createSortableTable: "readonly",
 };
@@ -87,10 +88,13 @@ const tableGlobals = {
 const tableControlGlobals = {
   foldForSearch: "readonly",
   matchesSearch: "readonly",
+  isRangeType: "readonly",
   isFilterUnset: "readonly",
   rowPassesFilter: "readonly",
   applyFilters: "readonly",
+  rowsExceptFilter: "readonly",
   resolveVisibleColumns: "readonly",
+  defaultFilterValues: "readonly",
   parseTableState: "readonly",
   serializeTableState: "readonly",
   histogramBuckets: "readonly",
