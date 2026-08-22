@@ -526,9 +526,7 @@ def test_streets_walked_cell_links_to_that_providers_own_walk(page: Page, base_u
     alpha = page.locator("#streets-tbody tr", has_text="Alpha City")
     links = alpha.locator("td a.streets-view-link")
     expect(links).to_have_count(2)  # one per provider that walked this row
-    expect(links.nth(0)).to_have_attribute(
-        "href", f"city.html?file={ALPHA_LATEST}&network=drive"
-    )
+    expect(links.nth(0)).to_have_attribute("href", f"city.html?file={ALPHA_LATEST}&network=drive")
     expect(links.nth(1)).to_have_attribute(
         "href", f"city.html?file={ALPHA_MAPILLARY_LATEST}&network=drive"
     )
@@ -762,9 +760,7 @@ def test_grid_page_lists_one_row_per_city(page: Page, base_url):
     assert "sort=deltaPct" in page.url
 
     # And it actually lands on the city page.
-    page.locator("#grid-tbody tr", has_text="Alpha City").locator(
-        "th a.streets-view-link"
-    ).click()
+    page.locator("#grid-tbody tr", has_text="Alpha City").locator("th a.streets-view-link").click()
     page.wait_for_url(f"**/city.html?file={ALPHA_LATEST}")
     expect(page.locator("table.legend-stats")).to_be_visible()
 
@@ -1053,7 +1049,9 @@ def test_column_picker_adds_and_drops_columns(page: Page, base_url):
     # A grouped LEAF is offered under a self-contained name, not the bare
     # provider label its header shows — "GSV" appears under four different
     # metrics and would be four identical checkboxes.
-    expect(page.locator(".col-picker")).to_contain_text("Panoramas (per provider — not comparable) — GSV")
+    expect(page.locator(".col-picker")).to_contain_text(
+        "Panoramas (per provider — not comparable) — GSV"
+    )
     page.locator('input[data-column="panos_gsv"]').check()
     expect(page.locator('th[data-key="panos_gsv"]')).to_have_count(1)
     # Checking ONE leaf of a group still renders the group header over it.

@@ -163,7 +163,9 @@ def _add_mapillary_run(conn, city_id, city_name, state, country, panos, run_date
     write_city_csv_gz(
         make_mapillary_city_df(panos, run_date=run_date, grid_origin=grid_origin), csv_path
     )
-    json_path, df = _write_summary(csv_path, city_name, state, country, run_date, provider="mapillary")
+    json_path, df = _write_summary(
+        csv_path, city_name, state, country, run_date, provider="mapillary"
+    )
     return _register_run_with_stats(
         conn,
         df=df,
