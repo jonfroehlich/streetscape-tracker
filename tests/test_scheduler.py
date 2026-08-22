@@ -613,14 +613,17 @@ def test_makelab1_production_config_is_wired():
     # pace was the real protection was FALSIFIED on 2026-08-20 (issue #241:
     # blocked while obeying it exactly, at 5,013/day the day after 5,753 ran
     # clean), and only a rolling 2-3 day per-IP window fits both incidents
-    # (2-day threshold in (7,061, 10,766]). Pinned exactly, not bounded
+    # (2-day threshold in (7,061, 10,766]). Split EVENLY because both channels
+    # read the identical z14 tile census, so the budgets deplete in lockstep
+    # and a heavy slate defers the same cities on both channels rather than
+    # un-pairing them. Pinned exactly, not bounded
     # loosely: this is the sort of number that drifts upwards one "just a bit
     # more" at a time, and the whole point is that a change to it is a
     # decision someone made on purpose.
     mly = cfg.providers["mapillary"].daily_request_budget
     mly_streets = cfg.providers["mapillary_streets"].daily_request_budget
-    assert mly == 2_500
-    assert mly_streets == 1_000
+    assert mly == 1_750
+    assert mly_streets == 1_750
     assert mly + mly_streets == 3_500, (
         "the tile block is per IP, so the two channels' budgets SUM — the "
         "2026-08-22 cut keeps any 2-day total at <= 7,000, at or below the "

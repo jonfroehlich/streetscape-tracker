@@ -107,19 +107,23 @@ enabled = true
 # the experiment works, so it is deliberately not being run. Full analysis,
 # both incidents' numbers, and the staff statements: issue #241.
 #
-# THE NUMBERS BELOW (cut 2026-08-22: 15,000 -> 2,500 here, 5,000 -> 1,000 on
-# mapillary_streets): the block is per IP, so what is on the line is the SUM
-# — 2,500 + 1,000 = 3,500/day on one address, chosen so any 2-day total stays
-# <= 7,000, at or below the highest value ever observed clean (7,061). A
-# normal 20-city night (~2-3k combined) is unaffected. NO `--limit` catch-ups
+# THE NUMBERS BELOW (cut 2026-08-22: 15,000 + 5,000 -> 1,750 + 1,750): the
+# block is per IP, so what is on the line is the SUM — 3,500/day on one
+# address, chosen so any 2-day total stays <= 7,000, at or below the highest
+# value ever observed clean (7,061). Split EVENLY because both channels read
+# the identical z14 census (a road walk re-reads the grid run's tiles), so
+# the two budgets deplete in lockstep and a heavy slate defers the same
+# cities on both channels instead of un-pairing them. A normal 20-city night
+# (~1,150 tiles per channel) is unaffected. NO `--limit` catch-ups
 # until a rolling multi-day guard exists: these budgets bound any single day,
 # but three consecutive maxed days sum to 10,500 — inside the 3-day
 # uncertainty band above — so only a multi-night catch-up can reach where
 # normal nights cannot.
 #
 # RECOVERY, measured twice (#241): the block lifts within ~a day of the LAST
-# refused request — block 1 cleared after ~20.5 h of true silence (having
-# lasted ~44 h+ while refused requests kept flowing), block 2 within
+# refused request — block 1 cleared after ~20.5 h of true silence (silence
+# only began ~44 h in; a ~48 h probe was still refused; ~48-65 h total),
+# block 2 within
 # <= 24 h 32 min of silence from onset, matching staff's "the block is 24
 # hours, as I remember". On a block: disable both channels immediately,
 # ps-sweep for detached loops, then ONE single-request probe per application
@@ -127,10 +131,10 @@ enabled = true
 #
 # Sizing, measured over the 1,214 enabled cities on 2026-08-16: the largest
 # frozen grid is 870 tiles (Moscow), so no city is ever skipped as "exceeds
-# the entire daily budget"; the mean is 57.8, so 2,500 reaches ~43 cities and
-# the 70,168-tile catalog is one full pass in ~29 nights. The budget — not
+# the entire daily budget"; the mean is 57.8, so 1,750 reaches ~30 cities and
+# the 70,168-tile catalog is one full pass in ~40 nights. The budget — not
 # max_batch_hours — is now what ends a maxed Mapillary night.
-daily_request_budget = 2500
+daily_request_budget = 1750
 # Client-side pacing for the tile CDN (issue #198). 60/min is a conservative
 # guess; 370 is confirmed too high — and #241 proved 60/min is NOT sufficient
 # on its own (blocked 2026-08-20 while obeying it exactly). The limiter stays
@@ -187,12 +191,13 @@ spacing_m = 15
 # the walk is a local spatial join against the tiles. Budgeted in tile requests against the same PER-IP ceiling as the grid
 # channel above (see its comment for the documented limits and how the #214
 # bet resolved), not against the per-app cap: different tokens, one address,
-# so the number that matters is the SUM — 2,500 + 1,000 = 3,500/day as of
-# 2026-08-22 (issue #241). Kept as the smaller half because the grid census
-# is the series a catch-up would chase.
+# so the number that matters is the SUM — 1,750 + 1,750 = 3,500/day as of
+# 2026-08-22 (issue #241), split evenly: a road walk reads the identical
+# tile census as the grid run, so a paired night costs the same on each
+# channel and the budgets deplete in lockstep.
 [providers.mapillary_streets]
 enabled = true
-daily_request_budget = 1000
+daily_request_budget = 1750
 spacing_m = 15
 # See [providers.mapillary].max_requests_per_minute. The tile CDN's rate limit
 # is per IP, so this channel and the grid one draw on ONE budget no matter that

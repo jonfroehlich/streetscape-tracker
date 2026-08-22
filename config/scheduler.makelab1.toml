@@ -65,13 +65,16 @@ enabled = true
 # only a rolling 2-3 day accumulation window fits both blocks (2-day
 # threshold somewhere in (7,061, 10,766]). Budgets are cut so the combined
 # 2-day sum can never exceed 7,000, the highest value ever observed clean:
-# 2,500 here + 1,000 on mapillary_streets = 3,500/day. A normal 20-city
-# night (~2-3k combined) fits; a catch-up-scale burst is impossible by
-# construction, ON PURPOSE -- no `--limit` catch-ups until a rolling
+# 1,750 here + 1,750 on mapillary_streets = 3,500/day, split EVENLY because
+# both channels read the identical z14 census (a road walk re-reads the grid
+# run's tiles), so the two budgets deplete in lockstep and a heavy slate
+# defers the same cities on both channels instead of un-pairing them. A
+# normal 20-city night (~1,150 tiles per channel) fits; a catch-up-scale
+# burst is impossible by construction, ON PURPOSE -- no `--limit` catch-ups until a rolling
 # multi-day guard exists (#241). Recovery recipe, measured twice: full
 # silence, then one single-request probe; both blocks cleared within ~a day
 # of the last refused request.
-daily_request_budget = 2500
+daily_request_budget = 1750
 # Client-side tile pacing (issue #198). Shared per-IP with mapillary_streets
 # below and with any manual run on this host — the host lock (#208) is what
 # makes this figure the real one rather than a per-process wish.
@@ -108,12 +111,13 @@ spacing_m = 15
 # local spatial join against the tiles. Budgeted in tile
 # requests against the SAME per-IP ceiling as [providers.mapillary] above, not
 # against the per-app cap: different tokens, one address, so the number that
-# matters is the SUM -- 2,500 + 1,000 = 3,500/day as of 2026-08-22; see the
-# issue #241 note in [providers.mapillary]. Kept as the smaller half because
-# the grid census is the series a catch-up would actually chase.
+# matters is the SUM -- 1,750 + 1,750 = 3,500/day as of 2026-08-22; see the
+# issue #241 note in [providers.mapillary]. Split evenly: a road walk reads
+# the identical tile census as the grid run, so a paired night costs the
+# same on each channel and the budgets deplete in lockstep.
 [providers.mapillary_streets]
 enabled = true
-daily_request_budget = 1000
+daily_request_budget = 1750
 spacing_m = 15
 # See [providers.mapillary] — one per-IP rate budget, two channels.
 max_requests_per_minute = 60
