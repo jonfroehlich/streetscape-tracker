@@ -608,25 +608,29 @@ def test_makelab1_production_config_is_wired():
     # Paced by the streets key's own quota, not [download]'s 48k grid pacing.
     assert cfg.providers["gsv_streets"].max_requests_per_minute == 24_000
     # The Mapillary budgets are NOT derived from the documented 50,000/day
-    # per-app cap — our block matched that limit in no attribute (per IP not per
-    # app, at ~21% of it, 302 not 4xx). They encode a deliberate bet that the
-    # trigger is throughput rather than daily volume (issue #214), which puts the
-    # per-IP total ABOVE the one daily figure measured going badly. Pinned
-    # exactly, not bounded loosely: this is the sort of number that drifts
-    # upwards one "just a bit more" at a time, and the whole point is that a
-    # change to it is a decision someone made on purpose.
+    # per-app cap — both blocks matched that limit in no attribute (per IP not
+    # per app, at 21% and 10% of it, 302 not 4xx). #214's bet that the 60/min
+    # pace was the real protection was FALSIFIED on 2026-08-20 (issue #241:
+    # blocked while obeying it exactly, at 5,013/day the day after 5,753 ran
+    # clean), and only a rolling 2-3 day per-IP window fits both incidents
+    # (2-day threshold in (7,061, 10,766]). Pinned exactly, not bounded
+    # loosely: this is the sort of number that drifts upwards one "just a bit
+    # more" at a time, and the whole point is that a change to it is a
+    # decision someone made on purpose.
     mly = cfg.providers["mapillary"].daily_request_budget
     mly_streets = cfg.providers["mapillary_streets"].daily_request_budget
-    assert mly == 15_000
-    assert mly_streets == 5_000
-    assert mly + mly_streets == 20_000, (
-        "the tile block is per IP, so the two channels' budgets SUM — this total "
-        "is the number on the line, and at 20,000 it is ~1.9x the 10,659/day "
-        "that got this host blocked on 2026-08-12 (a considered bet, see CLAUDE.md)"
+    assert mly == 2_500
+    assert mly_streets == 1_000
+    assert mly + mly_streets == 3_500, (
+        "the tile block is per IP, so the two channels' budgets SUM — the "
+        "2026-08-22 cut keeps any 2-day total at <= 7,000, at or below the "
+        "highest value ever observed clean (7,061), because only a rolling "
+        "2-3 day window fits both blocks (issue #241, see CLAUDE.md)"
     )
-    # Under that bet the per-minute pace is the ACTUAL protection, so it matters
-    # more here than it did before and was previously unguarded. Both channels
-    # draw on one per-IP rate, so both must carry the conservative figure.
+    # The per-minute pace is still pinned — an unpaced burst (~370/min) is
+    # confirmed harmful, and a constant peak rate is what made the two
+    # incidents comparable — but per #241 it is NOT sufficient on its own.
+    # Both channels draw on one per-IP rate, so both carry the same figure.
     assert cfg.providers["mapillary"].max_requests_per_minute == 60
     assert cfg.providers["mapillary_streets"].max_requests_per_minute == 60
     assert cfg.publish_enabled
