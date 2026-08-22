@@ -374,6 +374,132 @@
   outline-offset: 1px;
 }
 
+/* ── Kayak-style filter sidebar (issue #250) ──────────────────────────────
+   grid.html and streets.html only: every rule below is scoped under
+   .with-sidebar or .streets-main--wide, and driving.html carries neither
+   class, so its horizontal control strip is untouched.
+
+   The sidebar is a native <details>. Above the breakpoint its <summary> is
+   hidden and the panel is simply an always-open column; below it, the summary
+   becomes the "Filters" toggle. That is keyboard and AT semantics for free,
+   and the one hole it leaves — collapsed narrow, then widened, leaving the
+   panel closed with its toggle hidden — is closed in JS by
+   wireSidebarDisclosure. */
+
+/* Wider measure than the 1200px single-column pages: a pivoted table carries
+   one sub-column per provider, and the sidebar takes 280px of the width. */
+.streets-main--wide {
+  max-width: 1500px;
+}
+
+.table-layout.with-sidebar {
+  display: grid;
+  grid-template-columns: 280px minmax(0, 1fr);
+  gap: 20px;
+  /* Without this the sidebar stretches to the table's height and cannot be
+     sticky (a stretched grid item has nothing to stick within). */
+  align-items: start;
+}
+
+.with-sidebar .table-sidebar {
+  position: sticky;
+  top: 56px; /* clears the 44px fixed .site-header, plus breathing room */
+  max-height: calc(100vh - 72px);
+  overflow-y: auto;
+}
+
+.with-sidebar .sidebar-disclosure > summary {
+  display: none; /* the panel is simply present at this width */
+}
+
+.with-sidebar .controls-region {
+  margin-bottom: 0;
+}
+
+/* One column of controls rather than a wrapping row. */
+.with-sidebar .table-controls {
+  flex-direction: column;
+  align-items: stretch;
+  flex-wrap: nowrap;
+  gap: 12px;
+}
+
+.with-sidebar .control-search input {
+  min-width: 0;
+  width: 100%;
+}
+
+.with-sidebar .control-check,
+.with-sidebar .col-picker {
+  align-self: flex-start;
+  padding-bottom: 0;
+}
+
+.with-sidebar .controls-clear {
+  align-self: flex-start;
+}
+
+/* The floating picker panel is clipped by the sidebar's own overflow, so in
+   this layout it pushes the controls below it down instead of overlaying the
+   table. Nothing is being read underneath it here — the table is elsewhere. */
+.with-sidebar .col-picker .col-panel {
+  position: static;
+  margin-top: 6px;
+  box-shadow: none;
+}
+
+.with-sidebar .col-picker .col-panel fieldset {
+  grid-template-columns: 1fr;
+}
+
+@media (max-width: 900px) {
+  .table-layout.with-sidebar {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .with-sidebar .table-sidebar {
+    position: static;
+    max-height: none;
+    overflow: visible;
+  }
+
+  /* Below the breakpoint the disclosure is real: the filters collapse behind
+     a "Filters" summary so the table is not pushed off the first screen. */
+  .with-sidebar .sidebar-disclosure > summary {
+    display: list-item;
+    cursor: pointer;
+    padding: 8px 12px;
+    margin-bottom: 8px;
+    background: #fff;
+    border-radius: 6px;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.15);
+    font-weight: bold;
+    color: #1a6b1d;
+  }
+
+  .with-sidebar .sidebar-disclosure > summary:focus-visible {
+    outline: 2px solid #1a73e8;
+    outline-offset: 1px;
+  }
+
+  /* Back to the horizontal, wrapping strip — there is a full width to use. */
+  .with-sidebar .table-controls {
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    gap: 10px 16px;
+  }
+
+  .with-sidebar .col-picker .col-panel {
+    position: absolute;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+  }
+
+  .with-sidebar .col-picker .col-panel fieldset {
+    grid-template-columns: repeat(2, minmax(140px, 1fr));
+  }
+}
+
 /* ── Histogram-slider filter (issue #250) ─────────────────────────────────
    A mini histogram with a dual-handle brush over it, used in place of a bare
    min/max pair on grid.html and streets.html. Only pages whose filters declare

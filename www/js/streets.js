@@ -351,20 +351,25 @@ const STREET_FILTERS = [
     ],
     test: (row, value) => row.networkType === value,
   },
+  // Histogram-sliders (issue #250) — see GRID_FILTERS for the rationale.
   {
     key: "cov",
     label: "360° street-km %",
-    type: "range",
+    type: "histogram-range",
     field: "pct",
     min: 0,
     max: 100,
+    unit: "%",
+    digits: 1,
   },
   {
     key: "km",
     label: "Street km",
-    type: "range",
+    type: "histogram-range",
     field: "lengthKm",
     min: 0,
+    unit: " km",
+    digits: 1,
   },
   {
     key: "changed",
@@ -509,6 +514,8 @@ function renderStreetWalks(manifest, rawCities) {
     presets: STREET_PRESETS,
     filters: STREET_FILTERS,
     searchFields: STREET_SEARCH_FIELDS,
+    layout: "sidebar",
+    showDistributionStrip: false,
     onChange: (shown, all) => updateStreetsCaption(shown, all, manifest),
   });
   streetsControls.setRows(rows);

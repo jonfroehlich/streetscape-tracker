@@ -43,7 +43,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from streetscape_metadata_tracker import db, naming  # noqa: E402
+from streetscape_metadata_tracker import analysis, db, naming  # noqa: E402
 from streetscape_metadata_tracker.diff import (  # noqa: E402
     compute_run_diff,
     generate_diff_filename,
@@ -78,9 +78,14 @@ def _run_name(city_id, run_date, provider="gsv"):
 
 
 def _write_summary(csv_path, city_name, state, country, run_date, provider="gsv"):
-    """Write the per-run JSON summary next to the csv and return its path."""
+    """Write the per-run JSON summary next to the csv; return (path, dataframe).
+
+    The frame is handed back so the caller can run the REAL
+    ``analysis.calculate_run_stats`` over it rather than hand-passing a few
+    columns — see ``_register_run_with_stats``.
+    """
     df = load_city_csv_file(csv_path)
-    return generate_city_metadata_summary_as_json(
+    path = generate_city_metadata_summary_as_json(
         csv_path,
         df,
         city_name,
@@ -93,6 +98,32 @@ def _write_summary(csv_path, city_name, state, country, run_date, provider="gsv"
         run_date=run_date,
         provider=provider,
     )
+    return path, df
+
+
+def _register_run_with_stats(conn, *, df, run_date, provider, **kwargs):
+    """Catalog a run with the stats the real pipeline would have computed.
+
+    ``analysis.calculate_run_stats`` returns exactly ``db.register_run``'s
+    stats kwargs, so passing it through is both shorter and more faithful than
+    naming a few columns by hand — which is what this used to do, and which
+    left ``coverage_rate_pct`` NULL on every fixture run. That is not a
+    cosmetic gap: it is the aggregate's ``coverage_rate_percent``, i.e. the
+    grid page's headline column, its histogram filter and (from issue #250) its
+    cross-provider delta, so the e2e was asserting against a column that was
+    em-dashes all the way down.
+
+    ``num_flat_images`` stays absent on purpose: it is a downloader artifact
+    (flat-only points collapse to one CSV row), not something a frame can be
+    asked for.
+    """
+    return db.register_run(
+        conn,
+        run_date=run_date,
+        provider=provider,
+        **kwargs,
+        **analysis.calculate_run_stats(df, run_date, provider),
+    )
 
 
 def _add_gsv_run(conn, city_id, city_name, state, country, panos, run_date, grid_origin, n_empty=1):
@@ -101,23 +132,21 @@ def _add_gsv_run(conn, city_id, city_name, state, country, panos, run_date, grid
     write_city_csv_gz(
         make_city_df(panos, run_date=run_date, grid_origin=grid_origin, n_empty=n_empty), csv_path
     )
-    json_path = _write_summary(csv_path, city_name, state, country, run_date)
-    # Capture dates come straight from the synthetic panos rather than being
-    # invented here, so the driving-plan join (issue #176) has real imagery
-    # dates to contradict Google's published windows with — that contradiction
-    # is the whole point of the Driving page, and it cannot be observed at all
+    # Capture dates, coverage rates and status counts all come out of the run's
+    # own CSV via the real stats code, so the fixture cannot drift from what
+    # the pipeline would actually catalog. The driving-plan join (issue #176)
+    # depends on the capture dates in particular: its whole point is imagery
+    # dates contradicting Google's published windows, which is unobservable
     # without a newest_capture_date on the run.
-    captures = sorted(capture for _, capture in panos if capture)
-    return db.register_run(
+    json_path, df = _write_summary(csv_path, city_name, state, country, run_date)
+    return _register_run_with_stats(
         conn,
-        city_id=city_id,
+        df=df,
         run_date=run_date,
+        provider="gsv",
+        city_id=city_id,
         csv_filename=name,
         json_filename=os.path.basename(json_path),
-        unique_panos=len(panos),
-        unique_google_panos=len(panos),
-        oldest_capture_date=captures[0] if captures else None,
-        newest_capture_date=captures[-1] if captures else None,
     )
 
 
@@ -127,15 +156,15 @@ def _add_mapillary_run(conn, city_id, city_name, state, country, panos, run_date
     write_city_csv_gz(
         make_mapillary_city_df(panos, run_date=run_date, grid_origin=grid_origin), csv_path
     )
-    json_path = _write_summary(csv_path, city_name, state, country, run_date, provider="mapillary")
-    return db.register_run(
+    json_path, df = _write_summary(csv_path, city_name, state, country, run_date, provider="mapillary")
+    return _register_run_with_stats(
         conn,
-        city_id=city_id,
+        df=df,
         run_date=run_date,
-        csv_filename=name,
         provider="mapillary",
+        city_id=city_id,
+        csv_filename=name,
         json_filename=os.path.basename(json_path),
-        unique_panos=len(panos),
     )
 
 

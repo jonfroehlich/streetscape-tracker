@@ -26,6 +26,7 @@ Assertions (seeded from the manual run):
 import functools
 import http.server
 import os
+import re
 import socketserver
 import threading
 
@@ -927,78 +928,183 @@ def test_unchecking_every_optional_column_actually_empties_the_table(page: Page,
     assert errors == []
 
 
-def test_distribution_strip_describes_the_sorted_column(page: Page, base_url):
-    """The strip is a histogram of the ACTIVE SORT COLUMN over the CURRENTLY
-    FILTERED rows. Its bars are decorative; the summary sentence beside them is
-    the accessible equivalent and must track both."""
+@pytest.mark.parametrize("path", ["grid.html", "streets.html"])
+def test_the_pivoted_pages_replaced_the_strip_with_per_filter_histograms(
+    page: Page, base_url, path
+):
+    """Issue #250. The sorted-column strip is gone from these two pages: it
+    visualized whichever column happened to be sorted, over the FILTERED rows,
+    so it silently swapped its metric on a header click and collapsed under the
+    very bar-click it invited. Each numeric filter now owns one histogram, on
+    one metric, on a fixed axis."""
     errors = _capture_errors(page)
-    page.goto(f"{base_url}/streets.html")
+    page.goto(f"{base_url}/{path}")
+    expect(page.locator("tbody tr").first).to_be_visible()
 
-    summary = page.locator("#distribution-strip .strip-summary")
-    expect(summary).to_contain_text("360° street-km across 2 rows")
-
-    # Re-sorting repoints the strip at the newly sorted column.
-    page.locator('th[data-key="medianAge"] button').click()
-    expect(summary).to_contain_text("Median age")
-
-    # Filtering repoints it at the narrowed set.
-    page.locator('select[data-filter="provider"]').select_option("gsv")
-    expect(summary).to_contain_text("across 1 rows")
+    expect(page.locator("#distribution-strip")).to_have_count(0)
+    cov = page.locator('.control-histogram[data-histogram="cov"]')
+    expect(cov).to_have_count(1)
+    expect(cov.locator(".hist-bar").first).to_be_visible()
+    # The bars are decorative; the thumbs carry the announced value and the
+    # number inputs carry the exact figures.
+    expect(cov.locator(".hist-bars")).to_have_attribute("aria-hidden", "true")
+    expect(cov.locator(".hist-lo")).to_have_attribute("aria-valuetext", re.compile(r"."))
+    expect(cov.locator('input[data-bound="min"]')).to_have_count(1)
 
     assert errors == []
 
 
-def test_distribution_strip_bars_are_clickable_when_a_matching_filter_exists(page: Page, base_url):
-    """A bucket becomes a real, focusable <button> exactly when the active sort
-    column has a matching range filter, and clicking it sets that filter to the
-    bucket's bounds — both narrowing the table and populating the min/max
-    inputs, not just one or the other."""
+def test_histogram_slider_narrows_the_table_by_keyboard(page: Page, base_url):
+    """The slider must be operable without a pointer, and one keypress has to
+    move all three of the things that carry the filter: the rendered rows, the
+    precision input beside it, and the URL."""
     errors = _capture_errors(page)
     page.goto(f"{base_url}/streets.html")
-
-    # Default sort is 360° street-km % (pct), which the "cov" range filter
-    # matches, so the strip's two buckets (Alpha City ~85%, Map Ville 0%) are
-    # clickable — spans on any other page would not be.
-    bars = page.locator("#distribution-strip .strip-bar")
-    expect(bars).to_have_count(2)
-    assert page.evaluate("() => document.querySelector('.strip-bar').tagName") == "BUTTON"
-
-    # The higher bucket covers Alpha City's ~85% (two buckets split the 0-85.1%
-    # range at its midpoint, not at wherever the values actually cluster, so
-    # the exact bound is a data-shape detail — read it off the button rather
-    # than hardcoding it). The DOM is rebuilt on click, so read data-from/-to
-    # before clicking rather than off a now-stale locator afterward.
-    last_bar = bars.last
-    expected_min = last_bar.get_attribute("data-from")
-    expected_max = last_bar.get_attribute("data-to")
-    last_bar.click()
-
     rows = page.locator("#streets-tbody tr")
+    expect(rows).to_have_count(2)
+
+    lo = page.locator('.control-histogram[data-histogram="cov"] .hist-lo')
+    # The step is derived from the data's own extent (sliderStepFor), so read
+    # it rather than hardcoding what today's fixture happens to span.
+    step = lo.get_attribute("step")
+    lo.press("ArrowRight")
+
+    # Map Ville's walk is flat-imagery-only (0.0% by 360° pano), so any
+    # non-zero floor drops it and leaves Alpha City.
     expect(rows).to_have_count(1)
     expect(rows.first).to_contain_text("Alpha City")
-    min_val = page.locator('input[data-filter="cov"][data-bound="min"]').input_value()
-    max_val = page.locator('input[data-filter="cov"][data-bound="max"]').input_value()
-    assert min_val == expected_min, (
-        f"expected the min bound to match the clicked bucket's data-from "
-        f"({expected_min!r}), got {min_val!r}"
-    )
-    assert max_val == expected_max, (
-        f"expected the max bound to match the clicked bucket's data-to "
-        f"({expected_max!r}), got {max_val!r}"
+    expect(page.locator('input[data-filter="cov"][data-bound="min"]')).to_have_value(step)
+    # URLSearchParams percent-encodes the "~" separator; the wire format itself
+    # is unchanged from the plain `range` filter's.
+    assert f"cov={step}%7E" in page.url, f"expected cov={step}~ in {page.url}"
+
+    # Full-span is not a filter: arrowing back to the floor clears it from the
+    # URL rather than writing an inert "cov=0~".
+    lo.press("ArrowLeft")
+    expect(rows).to_have_count(2)
+    assert "cov=" not in page.url
+
+    assert errors == []
+
+
+def test_histogram_bars_track_other_controls_but_not_their_own_selection(page: Page, base_url):
+    """The crossfilter rule. A histogram is computed over the rows every OTHER
+    control has selected: a search query must redraw it, while its own brush
+    must not — otherwise the picture collapses under the hand that drew it and
+    dragging back out cannot restore bars that are no longer there."""
+    errors = _capture_errors(page)
+    page.goto(f"{base_url}/streets.html")
+
+    def lit_bars():
+        """Bars with a non-zero height, i.e. buckets holding rows."""
+        return page.evaluate(
+            """() => [...document.querySelectorAll(
+                 '.control-histogram[data-histogram=cov] .hist-bar')]
+                 .filter((b) => parseFloat(b.style.height) > 0).length"""
+        )
+
+    both = lit_bars()
+    assert both == 2, f"two walks at opposite ends of the range: {both} lit bars"
+
+    # Its OWN brush leaves the bars alone — the excluded buckets are dimmed,
+    # not removed, and the axis does not rescale. (Typed through the precision
+    # input rather than the thumb, which also pins that the two halves of the
+    # control stay in step: a bound typed on the right must move the handles
+    # and the dimming on the left.)
+    page.locator('input[data-filter="cov"][data-bound="min"]').fill("50")
+    expect(page.locator("#streets-tbody tr")).to_have_count(1)
+    assert lit_bars() == both, "a slider's own selection must not redraw its bars"
+    dimmed = page.locator('.control-histogram[data-histogram="cov"] .hist-bar.dimmed')
+    expect(dimmed.first).to_be_attached()
+    # The bucket holding the surviving row is NOT dimmed, so dimming reads as
+    # "outside the window" rather than "everything but the last bar".
+    assert dimmed.count() < 24, "the whole histogram was dimmed"
+
+    # Another control DOES redraw them: the search box is not this filter, so
+    # its narrowing is part of the cross-selection the bars are computed over.
+    page.locator("#table-search").fill("alpha")
+    expect(page.locator("#streets-tbody tr")).to_have_count(1)
+    page.wait_for_function(
+        """() => [...document.querySelectorAll(
+             '.control-histogram[data-histogram=cov] .hist-bar')]
+             .filter((b) => parseFloat(b.style.height) > 0).length === 1"""
     )
 
     assert errors == []
 
 
-def test_distribution_strip_bars_are_inert_without_a_matching_filter(page: Page, base_url):
-    """Sorting by a column with no matching range filter (e.g. Median age has
-    none on streets.html) must not offer a click that goes nowhere."""
+def test_distribution_strip_survives_on_the_driving_page(page: Page, base_url):
+    """The strip was removed from the two pivoted pages, NOT from the chassis.
+    driving.html keeps it, and keeps the behaviour it always had: a histogram
+    of the ACTIVE SORT COLUMN over the CURRENTLY FILTERED rows, with the
+    summary sentence as its accessible equivalent."""
     errors = _capture_errors(page)
-    page.goto(f"{base_url}/streets.html")
+    page.goto(f"{base_url}/driving.html")
 
-    page.locator('th[data-key="medianAge"] button').click()
-    assert page.evaluate("() => document.querySelector('.strip-bar').tagName") == "SPAN"
-    expect(page.locator("#distribution-strip .strip-bars")).to_have_attribute("aria-hidden", "true")
+    summary = page.locator("#distribution-strip .strip-summary")
+    expect(summary).to_be_visible()
+
+    # Re-sorting repoints the strip at the newly sorted column (coveragePct is
+    # in driving.html's default Overview preset, so it is on screen).
+    page.locator('th[data-key="coveragePct"] button').click()
+    # Case-insensitive: the summary lowercases the column label in its
+    # "No <label> values" form, which is what a fixture with few tracked
+    # cities in view actually produces.
+    expect(summary).to_contain_text(re.compile(r"grid coverage", re.I))
+
+    # ...and driving.html renders none of the pivot's furniture.
+    expect(page.locator(".control-histogram")).to_have_count(0)
+    expect(page.locator(".table-sidebar")).to_have_count(0)
+    expect(page.locator("thead th.th-group")).to_have_count(0)
+    expect(page.locator("#driving-thead tr")).to_have_count(1)
+
+    assert errors == []
+
+
+@pytest.mark.parametrize("path", ["grid.html", "streets.html"])
+def test_filter_sidebar_sits_beside_the_table_and_collapses_on_narrow_screens(
+    page: Page, base_url, path
+):
+    """Issue #250's layout: a ~280px filter column beside the table at desktop
+    width, collapsing to a "Filters" disclosure below 900px. The one state that
+    must be unreachable is "collapsed, then widened" — the summary is hidden at
+    desktop width, so a panel left closed would strand filters that are in the
+    URL and cannot be seen or changed."""
+    errors = _capture_errors(page)
+    page.set_viewport_size({"width": 1440, "height": 900})
+    page.goto(f"{base_url}/{path}")
+    expect(page.locator("tbody tr").first).to_be_visible()
+
+    aside = page.locator(".table-sidebar")
+    table = page.locator(".streets-table-wrap")
+    expect(aside).to_be_visible()
+    # Beside, not above: the sidebar's right edge is left of the table's left.
+    boxes = page.evaluate(
+        """() => {
+             const a = document.querySelector('.table-sidebar').getBoundingClientRect();
+             const t = document.querySelector('.streets-table-wrap').getBoundingClientRect();
+             return {aRight: a.right, tLeft: t.left, aTop: a.top, tTop: t.top};
+           }"""
+    )
+    assert boxes["aRight"] <= boxes["tLeft"] + 1, "sidebar overlaps the table"
+    assert abs(boxes["aTop"] - boxes["tTop"]) < 40, "sidebar is not on the table's row"
+    # At this width the disclosure is a plain panel, with no toggle to find.
+    expect(page.locator(".sidebar-disclosure > summary")).to_be_hidden()
+    expect(table).to_be_visible()
+
+    # Narrow: the summary becomes the toggle and closing it hides the filters.
+    page.set_viewport_size({"width": 600, "height": 900})
+    summary = page.locator(".sidebar-disclosure > summary")
+    expect(summary).to_be_visible()
+    expect(summary).to_have_text("Filters")
+    expect(page.locator("#table-search")).to_be_visible()
+    summary.click()
+    expect(page.locator("#table-search")).to_be_hidden()
+
+    # Widening re-opens it, rather than leaving a hidden panel with no toggle.
+    page.set_viewport_size({"width": 1440, "height": 900})
+    expect(page.locator("#table-search")).to_be_visible()
+    expect(page.locator(".sidebar-disclosure > summary")).to_be_hidden()
 
     assert errors == []
 

@@ -268,19 +268,32 @@ function createHistogramSlider({ rootEl, filter, onInput }) {
      * Fix the axis. Called ONCE, from the rows — after that the bars shrink
      * under a brush but the scale never moves.
      *
-     * A degenerate domain (every row at one value, or one row) is widened by a
-     * unit rather than left zero-width: two range inputs with min === max are
-     * inert, and the reader would be left with a control that cannot move and
-     * no explanation.
+     * Two adjustments to the raw extent, both load-bearing:
+     *
+     *  * A degenerate domain (every row at one value, or one row) is widened
+     *    rather than left zero-width: two range inputs with min === max are
+     *    inert, and the reader gets a control that cannot move and no
+     *    explanation.
+     *  * The ends are SNAPPED OUTWARD to whole steps. A max that is not a
+     *    whole number of steps above min is unreachable — the browser snaps a
+     *    range input's value down to the last valid one — so `hi` would rest
+     *    just below the top of the data. Full span would then never read as
+     *    "no filter", and, worse, the highest-valued rows would silently drop
+     *    out of the table the moment the OTHER handle moved (a 0–85.1 axis at
+     *    step 1 pins hi to 85, quietly excluding the 85.1% row). The axis
+     *    therefore ends up at most one step past the data, which is under 1%
+     *    of the span.
      */
     setDomain(next) {
-      const min = next.min;
-      const max = next.max > next.min ? next.max : next.min + 1;
-      domain = { min, max };
-      step = sliderStepFor(min, max);
+      const rawMin = next.min;
+      const rawMax = next.max > next.min ? next.max : next.min + 1;
+      step = sliderStepFor(rawMin, rawMax);
+      const min = roundSliderValue(Math.floor(rawMin / step) * step);
+      const max = roundSliderValue(Math.ceil(rawMax / step) * step);
+      domain = { min, max: max > min ? max : min + step };
       for (const el of [loEl, hiEl]) {
-        el.min = String(min);
-        el.max = String(max);
+        el.min = String(domain.min);
+        el.max = String(domain.max);
         el.step = String(step);
       }
       value = normalizeSliderRange(value, domain);

@@ -483,8 +483,23 @@ function renderDistributionStrip(el, column, values, clickable = false) {
  * `<fieldset>` — so the whole region is keyboard-reachable and announced
  * without any ARIA of its own.
  *
+ * Two section orders, picked by `layout`:
+ *
+ *  * `"inline"` (default) — search, then every filter in descriptor order,
+ *    then the column controls, then Clear all. This is the horizontal strip
+ *    driving.html has always rendered, and it is emitted byte-identically.
+ *  * `"sidebar"` — search, selects, the column controls, numeric windows, then
+ *    booleans, then Clear all (issue #250). In a 280px column the reading
+ *    order IS the layout, so the cheap categorical narrowings come first and
+ *    the tall histogram brushes sit below the column controls rather than
+ *    pushing them off the bottom.
+ *
+ * The sidebar order partitions by filter TYPE, so it also carries an
+ * "everything else" bucket: a filter type added later must still be rendered
+ * somewhere rather than silently vanishing from one of the two layouts.
+ *
  * @param {Object} cfg - {filters, presets, columns, searchPlaceholder,
- *   showDistributionStrip}.
+ *   showDistributionStrip, layout}.
  * @returns {string} HTML.
  */
 function controlsHtml({
@@ -493,9 +508,9 @@ function controlsHtml({
   columns,
   searchPlaceholder,
   showDistributionStrip = true,
+  layout = "inline",
 }) {
-  const filterControls = filters
-    .map((filter) => {
+  const renderFilter = (filter) => {
       if (filter.type === "select") {
         // A select with a declared default has no "any" reading (issue #250:
         // streets.html's network selector — two networks means two different
@@ -519,8 +534,7 @@ function controlsHtml({
       // selectors read. `histogram-range` only ADDS the bars + brush above
       // them (issue #250); the precision path is unchanged, which is also what
       // keeps the control fully usable by keyboard and by AT.
-      const boundInputs = () => `
-            <input type="number" data-filter="${filter.key}" data-bound="min"
+      const boundInputs = () => `<input type="number" data-filter="${filter.key}" data-bound="min"
                    aria-label="Minimum ${filter.label}" placeholder="min"
                    ${filter.min != null ? `min="${filter.min}"` : ""}
                    ${filter.max != null ? `max="${filter.max}"` : ""}>
@@ -562,8 +576,7 @@ function controlsHtml({
             filter.title ? ` title="${filter.title}"` : ""
           }>${filter.label}</label>
         </div>`;
-    })
-    .join("");
+  };
 
   const presetOptions = presets
     .map((p) => `<option value="${p.id}"${p.title ? ` title="${p.title}"` : ""}>${p.label}</option>`)
@@ -583,15 +596,15 @@ function controlsHtml({
     )
     .join("");
 
-  return `
-    <div class="table-controls">
+  const searchControl = `
       <div class="control control-search">
         <label for="table-search">Search</label>
         <input type="search" id="table-search"
                placeholder="${searchPlaceholder ?? "City, provider…"}"
                autocomplete="off" spellcheck="false">
-      </div>
-      ${filterControls}
+      </div>`;
+
+  const columnControls = `
       <div class="control">
         <label for="table-preset">Columns</label>
         <select id="table-preset">${presetOptions}</select>
@@ -605,8 +618,42 @@ function controlsHtml({
           </fieldset>
           <button type="button" class="col-reset">Reset to preset</button>
         </div>
-      </details>
-      <button type="button" class="controls-clear">Clear all</button>
+      </details>`;
+
+  const clearControl = `
+      <button type="button" class="controls-clear">Clear all</button>`;
+
+  let body;
+  if (layout === "sidebar") {
+    // Partition, don't hand-list: `rest` catches any filter type not named
+    // here, so a type added later renders in the wrong PLACE rather than not
+    // at all. The order is search -> selects -> columns -> numeric windows ->
+    // booleans -> clear.
+    const selects = filters.filter((f) => f.type === "select");
+    const ranges = filters.filter(isRangeType);
+    const booleans = filters.filter((f) => f.type === "boolean");
+    const placed = new Set([...selects, ...ranges, ...booleans]);
+    const rest = filters.filter((f) => !placed.has(f));
+    const render = (list) => list.map(renderFilter).join("");
+    body =
+      searchControl +
+      render(selects) +
+      columnControls +
+      render(ranges) +
+      render(booleans) +
+      render(rest) +
+      clearControl;
+  } else {
+    // The literal indent the old `${filterControls}` interpolation sat on. It
+    // is here so this branch stays BYTE-identical to the pre-#250 markup —
+    // driving.html renders through it, and a test compares the two strings
+    // rather than trusting the eye.
+    body =
+      searchControl + "\n      " + filters.map(renderFilter).join("") + columnControls + clearControl;
+  }
+
+  return `
+    <div class="table-controls">${body}
     </div>
     ${showDistributionStrip ? `<div class="distribution-strip" id="distribution-strip"></div>` : ""}`;
 }
@@ -634,6 +681,9 @@ function controlsHtml({
  *   caption/result count. The third argument is what lets a caption name a
  *   filter's active value (streets.html's network) without reaching into the
  *   DOM for it.
+ * @param {"inline"|"sidebar"} [cfg.layout="inline"] - Control section order;
+ *   see controlsHtml. The pivoted pages pass "sidebar"; driving.js does not,
+ *   and its markup is unchanged.
  * @param {boolean} [cfg.showDistributionStrip=true] - Render the sorted-column
  *   distribution strip. The pivoted pages (issue #250) turn it off: their
  *   numeric filters are histogram-sliders, which draw a PER-FILTER histogram
@@ -671,6 +721,7 @@ function createTableControls({
   searchPlaceholder,
   onChange,
   showDistributionStrip = true,
+  layout = "inline",
 }) {
   const defaultPreset = presets[0].id;
   let allRows = [];
@@ -692,6 +743,7 @@ function createTableControls({
     columns,
     searchPlaceholder,
     showDistributionStrip,
+    layout,
   });
   const searchEl = rootEl.querySelector("#table-search");
   const presetEl = rootEl.querySelector("#table-preset");
@@ -895,6 +947,17 @@ function createTableControls({
         min: Number.isFinite(min) ? min : null,
         max: Number.isFinite(max) ? max : null,
       };
+      // A typed bound has to move the handles too, or the slider would keep
+      // showing the previous window while the table showed a different one.
+      // The component's normalized value is then read BACK as the state, so
+      // there is one answer rather than two: a bound at the domain edge is not
+      // a filter (and must not litter the URL), and a bound outside it is
+      // clamped to the edge — same rows either way, since nothing lies beyond.
+      const entry = histograms.get(key);
+      if (entry) {
+        entry.slider.setValue(state.values[key]);
+        state.values[key] = entry.slider.getValue();
+      }
     } else if (filter.type === "boolean") {
       state.values[key] = target.checked;
     } else {
@@ -995,6 +1058,55 @@ function createTableControls({
   };
 }
 
+// ── Sidebar disclosure (issue #250) ───────────────────────────────────────
+
+/**
+ * Keep a collapsible sidebar from becoming unreachable.
+ *
+ * The filter sidebar is a native `<details>`, which is what gives it keyboard
+ * and AT semantics for nothing. Below the breakpoint its `<summary>` is the
+ * "Filters" toggle; above it the summary is hidden by CSS and the panel is
+ * simply always there. That leaves one bad state: collapse it on a narrow
+ * screen, then widen (rotate a tablet, drag a window) and the panel is closed
+ * with its only toggle now display:none — filters that exist, are in the URL,
+ * and cannot be seen or changed. Widening therefore re-opens it.
+ *
+ * Deliberately one-way: narrowing does NOT collapse a panel the reader opened.
+ *
+ * @param {{open: boolean}} detailsEl - The `<details>` element.
+ * @param {boolean} isWide - Is the viewport past the breakpoint?
+ * @returns {boolean} The resulting open state.
+ */
+function syncSidebarDisclosure(detailsEl, isWide) {
+  if (isWide && !detailsEl.open) detailsEl.open = true;
+  return detailsEl.open;
+}
+
+/**
+ * Wire syncSidebarDisclosure to a media query. A no-op on a page with no
+ * sidebar (driving.html) and in Node, so it is safe to call unconditionally.
+ *
+ * @param {Document|Element} [root]
+ * @param {string} [query] - Must mirror the `max-width: 900px` breakpoint in
+ *   data-table.css; the two are one decision expressed twice.
+ * @returns {?Object} The media-query list, for tests.
+ */
+function wireSidebarDisclosure(root, query = "(min-width: 901px)") {
+  const scope = root ?? (typeof document !== "undefined" ? document : null);
+  if (!scope || typeof window === "undefined" || !window.matchMedia) return null;
+  const detailsEl = scope.querySelector(".sidebar-disclosure");
+  if (!detailsEl) return null;
+  const mq = window.matchMedia(query);
+  const apply = () => syncSidebarDisclosure(detailsEl, mq.matches);
+  apply();
+  mq.addEventListener("change", apply);
+  return mq;
+}
+
+if (typeof document !== "undefined") {
+  document.addEventListener("DOMContentLoaded", () => wireSidebarDisclosure());
+}
+
 // Node/CommonJS export shim for the unit tests. No-op in the browser, where
 // these are plain globals loaded via <script>.
 if (typeof module !== "undefined" && module.exports) {
@@ -1017,5 +1129,7 @@ if (typeof module !== "undefined" && module.exports) {
     renderDistributionStrip,
     controlsHtml,
     createTableControls,
+    syncSidebarDisclosure,
+    wireSidebarDisclosure,
   };
 }

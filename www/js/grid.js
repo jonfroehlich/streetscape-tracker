@@ -211,20 +211,28 @@ const GRID_FILTERS = [
     options: Object.entries(PROVIDERS).map(([value, p]) => ({ value, label: p.label })),
     test: (row, value) => row.provider === value,
   },
+  // Histogram-sliders (issue #250): the bars show where the rows actually
+  // sit before a window is chosen, on a fixed axis, computed over the rows the
+  // OTHER controls have selected. The min/max number inputs are still there
+  // for precision.
   {
     key: "cov",
     label: "Grid coverage %",
-    type: "range",
+    type: "histogram-range",
     field: "pct",
     min: 0,
     max: 100,
+    unit: "%",
+    digits: 1,
   },
   {
     key: "age",
     label: "Median age (yrs)",
-    type: "range",
+    type: "histogram-range",
     field: "medianAge",
     min: 0,
+    unit: " yrs",
+    digits: 1,
   },
   {
     key: "both",
@@ -363,6 +371,11 @@ function renderGridRuns(rawCities) {
     presets: GRID_PRESETS,
     filters: GRID_FILTERS,
     searchFields: GRID_SEARCH_FIELDS,
+    // The sidebar carries per-filter histograms on fixed axes; a second
+    // histogram of whichever column happens to be sorted would be a different
+    // answer to the same question, changing its metric on every header click.
+    layout: "sidebar",
+    showDistributionStrip: false,
     onChange: (shown, all) => updateGridCaption(shown, all, generatedAt),
   });
   gridControls.setRows(rows);

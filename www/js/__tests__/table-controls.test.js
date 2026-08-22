@@ -31,6 +31,8 @@ const {
   formatStripSummary,
   renderDistributionStrip,
   controlsHtml,
+  syncSidebarDisclosure,
+  wireSidebarDisclosure,
 } = require("../table-controls.js");
 
 // --- search -----------------------------------------------------------------
@@ -592,4 +594,104 @@ test("controlsHtml: the picker prefers pickerLabel over the leaf label", () => {
   const html = controlsHtml({ filters: [], presets: PRESETS, columns });
   assert.match(html, /data-column="pct_gsv"> Grid coverage — GSV/);
   assert.match(html, /data-column="km"> Street km/);
+});
+
+// --- control section order (issue #250) -------------------------------------
+
+const ORDER_FILTERS = [
+  FILTERS[1], // range "cov"
+  FILTERS[2], // boolean "changed"
+  FILTERS[0], // select "provider"
+];
+
+/** Index of each landmark in the emitted markup, for order assertions. */
+function landmarks(html) {
+  return {
+    search: html.indexOf('id="table-search"'),
+    select: html.indexOf('data-filter="provider"'),
+    range: html.indexOf('data-filter="cov"'),
+    boolean: html.indexOf('id="f-changed"'),
+    columns: html.indexOf('id="table-preset"'),
+    clear: html.indexOf("controls-clear"),
+  };
+}
+
+test("controlsHtml: the inline layout keeps descriptor order, filters before the column controls", () => {
+  // driving.html renders through this branch, and its controls have always
+  // been "search, every filter in the order the page declared them, columns,
+  // clear". Reordering them would be a visible change to a page #250 does not
+  // touch.
+  const at = landmarks(controlsHtml({ filters: ORDER_FILTERS, presets: PRESETS, columns: COLUMNS }));
+  assert.ok(at.search < at.range, "search must lead");
+  assert.ok(at.range < at.boolean, "descriptor order: range before boolean");
+  assert.ok(at.boolean < at.select, "descriptor order: boolean before select");
+  assert.ok(at.select < at.columns, "every filter precedes the column controls");
+  assert.ok(at.columns < at.clear, "Clear all is last");
+});
+
+test("controlsHtml: the sidebar layout partitions by type, columns between selects and ranges", () => {
+  // In a 280px column the reading order IS the layout: cheap categorical
+  // narrowings first, then the column controls, then the tall histogram
+  // brushes, then the checkboxes.
+  const at = landmarks(
+    controlsHtml({ filters: ORDER_FILTERS, presets: PRESETS, columns: COLUMNS, layout: "sidebar" })
+  );
+  assert.ok(at.search < at.select, "search leads");
+  assert.ok(at.select < at.columns, "selects come before the column controls");
+  assert.ok(at.columns < at.range, "column controls come before the numeric windows");
+  assert.ok(at.range < at.boolean, "numeric windows come before the checkboxes");
+  assert.ok(at.boolean < at.clear, "Clear all is last");
+});
+
+test("controlsHtml: the sidebar layout renders EVERY filter, including an unknown type", () => {
+  // The partition is by type, so a type added later must land somewhere rather
+  // than being silently dropped from one of the two layouts.
+  const odd = { key: "future", label: "Future", type: "something-new" };
+  const html = controlsHtml({
+    filters: [...ORDER_FILTERS, odd],
+    presets: PRESETS,
+    columns: COLUMNS,
+    layout: "sidebar",
+  });
+  for (const key of ["provider", "cov", "changed", "future"]) {
+    assert.match(html, new RegExp(`data-filter="${key}"`), `${key} is missing from the sidebar`);
+  }
+});
+
+test("controlsHtml: a histogram-range emits the slider AND keeps the number inputs", () => {
+  const html = controlsHtml({ filters: HIST_FILTERS, presets: PRESETS, columns: COLUMNS });
+  assert.match(html, /class="control control-histogram" data-histogram="cov"/);
+  assert.match(html, /<div class="hist-bars" aria-hidden="true"><\/div>/);
+  assert.match(html, /class="hist-lo" aria-label="Minimum Coverage"/);
+  assert.match(html, /class="hist-hi" aria-label="Maximum Coverage"/);
+  // The chassis and the e2e selectors both locate a range filter's bounds with
+  // querySelectorAll('[data-filter=KEY]') and expect exactly two elements — so
+  // the range handles must NOT carry one.
+  assert.equal((html.match(/data-filter="cov"/g) || []).length, 2);
+  assert.match(html, /<input type="number" data-filter="cov" data-bound="min"/);
+  assert.match(html, /<input type="number" data-filter="cov" data-bound="max"/);
+});
+
+// --- sidebar disclosure -----------------------------------------------------
+
+test("syncSidebarDisclosure: widening re-opens a collapsed sidebar", () => {
+  // Otherwise the panel is closed with its only toggle now display:none —
+  // filters that exist, are in the URL, and cannot be seen or changed.
+  const el = { open: false };
+  assert.equal(syncSidebarDisclosure(el, true), true);
+  assert.equal(el.open, true);
+});
+
+test("syncSidebarDisclosure: narrowing never closes what the reader opened", () => {
+  const open = { open: true };
+  assert.equal(syncSidebarDisclosure(open, false), true);
+  const closed = { open: false };
+  assert.equal(syncSidebarDisclosure(closed, false), false);
+});
+
+test("wireSidebarDisclosure: a no-op without a sidebar, matchMedia, or a document", () => {
+  // driving.html has no .sidebar-disclosure, and Node has no window at all —
+  // this is called unconditionally on DOMContentLoaded, so both must be safe.
+  assert.equal(wireSidebarDisclosure({ querySelector: () => null }), null);
+  assert.equal(wireSidebarDisclosure(), null);
 });

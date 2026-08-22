@@ -118,6 +118,8 @@ const tableControlGlobals = {
   renderDistributionStrip: "readonly",
   controlsHtml: "readonly",
   createTableControls: "readonly",
+  syncSidebarDisclosure: "readonly",
+  wireSidebarDisclosure: "readonly",
 };
 
 const browserRules = {
