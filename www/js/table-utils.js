@@ -22,7 +22,8 @@
  * a provider name, so `pickerLabel` supplies the self-contained wording the
  * column picker needs (read in table-controls.js).
  *
- * Depends on globals from streetscape-utils.js (loaded first): coverageColor.
+ * Depends on globals from streetscape-utils.js (loaded first): coverageColor,
+ * PROVIDERS.
  */
 
 /**
@@ -103,6 +104,120 @@ function coverageCellHtml(pct, { compact = false } = {}) {
   return `<td class="${cls}">${bar}<span class="coverage-value">${pct.toFixed(
     1
   )}%</span></td>`;
+}
+
+/**
+ * Short, column-header form of a provider's name, falling back to its full
+ * label and then to its key.
+ *
+ * The pivoted pages (issue #250) repeat a provider name under every metric
+ * group, so "Google Street View" three times over would cost more width than
+ * the numbers underneath. A provider registered without a `shortLabel` still
+ * renders.
+ *
+ * @param {string} provider - A PROVIDERS key.
+ * @returns {string}
+ */
+function providerShortLabel(provider) {
+  const entry = PROVIDERS[provider];
+  return entry?.shortLabel ?? entry?.label ?? provider;
+}
+
+/**
+ * A signed difference cell, for the pivoted pages' cross-provider Δ columns.
+ *
+ * Deliberately NOT colored green/red by sign. In a coverage group a positive Δ
+ * means Mapillary has more imagery; in an age group a NEGATIVE Δ means
+ * Mapillary is FRESHER — so one sign-to-color rule would have to lie in one of
+ * the two places. The sign character carries the direction and the column's
+ * `title` says what it means; `delta-pos`/`delta-neg` are emitted as styling
+ * hooks. Only an exact zero is styled, because "the two providers agree
+ * exactly" is a genuinely different fact from "they are close".
+ *
+ * @param {?number} value
+ * @param {{digits?: number, unit?: string}} [options]
+ * @returns {string} HTML for one <td>.
+ */
+function deltaCellHtml(value, { digits = 1, unit = "" } = {}) {
+  if (value == null) return `<td class="delta-cell">—</td>`;
+  const tone = value > 0 ? "delta-pos" : value < 0 ? "delta-neg" : "delta-zero";
+  const sign = value > 0 ? "+" : "";
+  return `<td class="delta-cell ${tone}">${sign}${formatCellNumber(value, digits)}${unit}</td>`;
+}
+
+/**
+ * Build one grouped metric for a pivoted page: a leaf column per registered
+ * provider, plus an optional Δ leaf for a head-to-head pair.
+ *
+ * `group` is repeated on every member — theadHtml collapses the run into one
+ * `<th scope="colgroup">` and takes the label from the first VISIBLE member,
+ * so dropping a leaf via a preset or the column picker still leaves the group
+ * named. `pickerLabel` exists because a leaf's own label is just a provider
+ * name, repeated under every metric: unambiguous in the header, useless in the
+ * picker's flat checkbox list.
+ *
+ * Shared by grid.js and streets.js rather than copied: the two pages pivot the
+ * same registry the same way, and a copy would let their headers drift apart
+ * while both looked right in isolation.
+ *
+ * @param {Object} spec
+ * @param {string} spec.id - Group id; every member repeats it.
+ * @param {string} spec.groupLabel
+ * @param {string} spec.groupTitle
+ * @param {(provider: string) => string} spec.keyFor - Row-model key per provider.
+ * @param {(provider: string) => Function} spec.cellFor - Cell renderer factory.
+ * @param {(provider: string) => string} [spec.leafLabel] - Overrides the
+ *   default short provider label.
+ * @param {string} [spec.type="number"]
+ * @param {string} spec.initial - First-click sort direction.
+ * @param {string} [spec.unit]
+ * @param {number} [spec.digits]
+ * @param {?{key: string, unit?: string, title: string}} [spec.delta] - Falsy
+ *   for a group that must never have one (per-provider pano counts are
+ *   census-vs-sample, so their difference answers nothing).
+ * @returns {Object[]} Column descriptors, in leaf order.
+ */
+function providerColumnGroup({
+  id,
+  groupLabel,
+  groupTitle,
+  keyFor,
+  cellFor,
+  leafLabel,
+  type = "number",
+  initial,
+  unit,
+  digits,
+  delta,
+}) {
+  const group = { id, label: groupLabel, title: groupTitle };
+  const columns = Object.keys(PROVIDERS).map((provider) => ({
+    key: keyFor(provider),
+    label: leafLabel ? leafLabel(provider) : providerShortLabel(provider),
+    pickerLabel: `${groupLabel} — ${providerShortLabel(provider)}`,
+    type,
+    initial,
+    unit,
+    digits,
+    title: groupTitle,
+    group,
+    cell: cellFor(provider),
+  }));
+  if (delta) {
+    columns.push({
+      key: delta.key,
+      label: "Δ",
+      pickerLabel: `${groupLabel} — Δ`,
+      type: "number",
+      initial: "desc",
+      unit: delta.unit,
+      digits: 1,
+      title: delta.title,
+      group,
+      cell: (row) => deltaCellHtml(row[delta.key], { unit: delta.unit }),
+    });
+  }
+  return columns;
 }
 
 /**
@@ -338,6 +453,9 @@ if (typeof module !== "undefined" && module.exports) {
     sortRowsBy,
     formatCellNumber,
     coverageCellHtml,
+    providerShortLabel,
+    deltaCellHtml,
+    providerColumnGroup,
     headerCellHtml,
     theadHtml,
     rowHtmlFromColumns,

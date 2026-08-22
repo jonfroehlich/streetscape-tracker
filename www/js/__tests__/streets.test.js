@@ -1,20 +1,21 @@
 // Offline unit tests for the pure helpers in streets.js — the street-level
-// coverage page (issues #99/#155). Run with `npm test` (Node's built-in test
-// runner) — no network, no jsdom.
+// coverage page (issues #99/#155), pivoted to one row per (city, network) in
+// issue #250. Run with `npm test` (Node's built-in test runner) — no network,
+// no jsdom.
 //
 // In the browser these helpers read shared globals from streetscape-utils.js;
-// here we stub the three they touch. `document` is left undefined on purpose:
+// here we stub the ones they touch. `document` is left undefined on purpose:
 // streets.js only registers its DOMContentLoaded listener when one exists.
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
-// A THIRD provider the page has never heard of: the filter options are
-// derived from this registry, so a hardcoded two-element list fails here
-// rather than the day one is really registered (issue #225).
+// A THIRD provider the page has never heard of: every per-provider column,
+// filter option and row key is generated from this registry, so a hardcoded
+// pair fails here rather than the day one is really registered (issue #225).
 global.PROVIDERS = {
-  gsv: { label: "Google Street View" },
-  mapillary: { label: "Mapillary" },
+  gsv: { label: "Google Street View", shortLabel: "GSV" },
+  mapillary: { label: "Mapillary", shortLabel: "Mapillary" },
   thirdparty: { label: "Third Party" },
 };
 global.DEFAULT_STREET_NETWORK_TYPE = "drive";
@@ -32,19 +33,24 @@ global.adaptCitiesPayload = (raw, provider) => ({
     .map((c) => ({ ...c })),
 });
 
-// streets.js now delegates to the shared table machinery, which it reads as
-// browser globals — mirror that here (must precede the streets.js require).
+// streets.js delegates to the shared table machinery, which it reads as
+// browser globals — mirror that here (must precede the streets.js require, and
+// must follow PROVIDERS, which the provider-column helpers read).
 Object.assign(global, require("../table-utils.js"));
 
 const {
   cityLabel,
   indexCitiesByProvider,
-  toRowModel,
+  pivotStreetWalks,
   sortRows,
   num,
   walkChangeCellHtml,
+  walkDateCellHtml,
   walkRowHtml,
+  streetDeltaPair,
+  updateStreetsCaption,
   STREET_COLUMNS,
+  STREET_PRESETS,
   STREET_FILTERS,
   DEFAULT_SORT,
 } = require("../streets.js");
@@ -79,9 +85,19 @@ test("cityLabel: falls back through state/country to Unknown", () => {
 
 const RAW_CITIES = {
   cities: [
-    { provider: "gsv", city_id: "seattle--wa", city: "Seattle" },
+    {
+      provider: "gsv",
+      city_id: "seattle--wa",
+      city: "Seattle",
+      data_file: { filename: "seattle_gsv.csv.gz" },
+    },
     { provider: "gsv", city_id: "bend--or", city: "Bend" },
-    { provider: "mapillary", city_id: "seattle--wa", city: "Seattle" },
+    {
+      provider: "mapillary",
+      city_id: "seattle--wa",
+      city: "Seattle",
+      data_file: { filename: "seattle_mapillary.csv.gz" },
+    },
   ],
 };
 
@@ -98,26 +114,11 @@ test("indexCitiesByProvider: keys by provider + city_id, so providers don't coll
 test("indexCitiesByProvider: only indexes the providers asked for", () => {
   const index = indexCitiesByProvider(RAW_CITIES, ["gsv"]);
   assert.equal(index.get("mapillary|seattle--wa"), undefined);
-  // 2 provider-keyed entries + 2 bare city_id entries (the name fallback)
   assert.equal(index.size, 4);
 });
 
 test("indexCitiesByProvider: also indexes by bare city_id for the name fallback", () => {
-  const index = indexCitiesByProvider(RAW_CITIES, ["gsv"]);
-  assert.equal(index.get("seattle--wa").city, "Seattle");
-});
-
-test("toRowModel: uses the label fallback but never its link", () => {
-  // A city walked by a provider it has no grid run for: name it properly,
-  // but do NOT link to another provider's run — city.html derives its
-  // provider from the filename and would open the wrong series.
-  const row = toRowModel(
-    { city_id: "adrian--or", provider: "mapillary" },
-    null,
-    { city: "Adrian", state: { name: "Oregon" }, data_file: { filename: "adrian_gsv.csv.gz" } }
-  );
-  assert.equal(row.label, "Adrian, Oregon");
-  assert.equal(row.filename, null);
+  assert.equal(indexCitiesByProvider(RAW_CITIES, ["gsv"]).get("seattle--wa").city, "Seattle");
 });
 
 test("indexCitiesByProvider: a missing aggregate yields an empty index, not a throw", () => {
@@ -125,135 +126,258 @@ test("indexCitiesByProvider: a missing aggregate yields an empty index, not a th
   assert.equal(indexCitiesByProvider(null, ["gsv"]).size, 0);
 });
 
-// --- toRowModel ------------------------------------------------------------
+// --- pivotStreetWalks ------------------------------------------------------
 
-test("toRowModel: flattens walk + joined city into the shape the sorter reads", () => {
-  const row = toRowModel(
-    {
-      city_id: "seattle--wa",
-      provider: "gsv",
-      run_date: "2026-07-26",
-      spacing_m: 15,
-      coverage_pct_by_length: 98.4,
-      edges: 100,
-      edges_fully_covered: 90,
-    },
-    { city: "Seattle", data_file: { filename: "seattle.csv.gz" } }
-  );
-  assert.equal(row.label, "Seattle");
-  assert.equal(row.providerLabel, "Google Street View");
-  assert.equal(row.pct, 98.4);
-  assert.equal(row.filename, "seattle.csv.gz");
+const SEATTLE_GSV_WALK = {
+  city_id: "seattle--wa",
+  provider: "gsv",
+  network_type: "drive",
+  run_date: "2026-07-26",
+  spacing_m: 15,
+  coverage_pct_by_length: 98.4,
+  coverage_pct_by_length_any: 98.4,
+  length_km: 873.2,
+  length_km_covered: 859.2,
+  length_km_covered_any: 859.2,
+  median_covered_age_years: 2.3,
+  edges: 33597,
+  edges_fully_covered: 32391,
+};
+
+const SEATTLE_MAPILLARY_WALK = {
+  ...SEATTLE_GSV_WALK,
+  provider: "mapillary",
+  coverage_pct_by_length: 61.2,
+  coverage_pct_by_length_any: 74.8,
+  length_km: 873.4, // each walk re-derives it from the frozen graph
+  length_km_covered: 534.5,
+  length_km_covered_any: 653.2,
+  median_covered_age_years: 1.1,
+  edges_fully_covered: 20100,
+};
+
+const SEATTLE_BROAD_WALK = {
+  ...SEATTLE_GSV_WALK,
+  network_type: "all_public",
+  coverage_pct_by_length: 71.0,
+  length_km: 1402.9,
+};
+
+const INDEX = indexCitiesByProvider(RAW_CITIES, ["gsv", "mapillary"]);
+
+function rowsFor(...walks) {
+  return pivotStreetWalks(walks, INDEX);
+}
+
+test("pivotStreetWalks: providers fold into one row; networks do NOT", () => {
+  // Two providers walk the SAME sample points on the same frozen network, so
+  // their numbers are comparable and belong side by side. Two NETWORKS divide
+  // by different street-km denominators, so they stay separate rows.
+  const rows = rowsFor(SEATTLE_GSV_WALK, SEATTLE_MAPILLARY_WALK, SEATTLE_BROAD_WALK);
+  assert.equal(rows.length, 2);
+  assert.deepEqual(rows.map((r) => r.rowKey), ["seattle--wa|drive", "seattle--wa|all_public"]);
+
+  const drive = rows[0];
+  assert.equal(drive.networkLabel, "Roads");
+  assert.deepEqual(drive.providers, ["gsv", "mapillary"]);
+  assert.equal(drive.providersLabel, "GSV, Mapillary");
+  assert.equal(drive.pct_gsv, 98.4);
+  assert.equal(drive.pct_mapillary, 61.2);
+  assert.equal(drive.pctAny_mapillary, 74.8);
+  assert.equal(drive.medianAge_mapillary, 1.1);
+  assert.equal(drive.lengthKmCovered_gsv, 859.2);
+  assert.equal(drive.lengthKmCoveredAny_mapillary, 653.2);
+  assert.equal(drive.fullyCovered_mapillary, 20100);
+  assert.equal(drive.spacing_gsv, 15);
+
+  const broad = rows[1];
+  assert.equal(broad.networkLabel, "Roads + paths");
+  assert.deepEqual(broad.providers, ["gsv"]);
+  assert.equal(broad.pct_gsv, 71.0);
+  assert.equal(broad.pct_mapillary, null);
 });
 
-test("toRowModel: falls back to city_id and nulls when the join missed", () => {
-  const row = toRowModel({ city_id: "ghost--xx", provider: "gsv" }, null);
+test("pivotStreetWalks: rowKey is what makes a city's two networks distinct rows", () => {
+  // city_id alone no longer identifies a row, which is why the table is built
+  // with tieKey: "rowKey" — ties would otherwise break arbitrarily between a
+  // city's own two networks.
+  const rows = rowsFor(SEATTLE_GSV_WALK, SEATTLE_BROAD_WALK);
+  assert.equal(new Set(rows.map((r) => r.cityId)).size, 1);
+  assert.equal(new Set(rows.map((r) => r.rowKey)).size, 2);
+});
+
+test("pivotStreetWalks: a walk with no network_type defaults to the drive series", () => {
+  // Walks published before network types existed carry no field at all, and
+  // must land on the scheduled series rather than in a row of their own.
+  const legacy = { ...SEATTLE_GSV_WALK };
+  delete legacy.network_type;
+  const rows = rowsFor(legacy, SEATTLE_MAPILLARY_WALK);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].networkType, "drive");
+  assert.equal(rows[0].networkLabel, "Roads");
+});
+
+test("pivotStreetWalks: Δ is null unless BOTH providers walked this (city, network)", () => {
+  const both = rowsFor(SEATTLE_GSV_WALK, SEATTLE_MAPILLARY_WALK)[0];
+  assert.equal(Math.round(both.deltaPct * 10) / 10, -37.2); // 61.2 − 98.4
+  assert.equal(Math.round(both.deltaPctAny * 10) / 10, -23.6); // 74.8 − 98.4
+  assert.deepEqual(streetDeltaPair(), ["mapillary", "gsv"]);
+
+  const gsvOnly = rowsFor(SEATTLE_GSV_WALK)[0];
+  assert.equal(gsvOnly.deltaPct, null);
+  assert.equal(gsvOnly.deltaPctAny, null);
+});
+
+test("pivotStreetWalks: pctBest is the max across providers", () => {
+  const row = rowsFor(SEATTLE_GSV_WALK, SEATTLE_MAPILLARY_WALK)[0];
+  assert.equal(row.pctBest, 98.4);
+  assert.equal(rowsFor({ city_id: "x", provider: "gsv" })[0].pctBest, null);
+});
+
+test("pivotStreetWalks: network properties collapse to one field, first walk wins", () => {
+  // Street km and edge count describe the OSM network, not a provider — but
+  // each walk re-derives them from the frozen graph and can differ slightly,
+  // which is why the column's title says so instead of pretending otherwise.
+  const row = rowsFor(SEATTLE_GSV_WALK, SEATTLE_MAPILLARY_WALK)[0];
+  assert.equal(row.lengthKm, 873.2);
+  assert.equal(row.edges, 33597);
+
+  // A first walk carrying no length must not shadow a later one that does
+  // (pre-v12 walks are NULL, "not measured", never zero).
+  const noLength = { ...SEATTLE_GSV_WALK, length_km: null, edges: null };
+  const salvaged = rowsFor(noLength, SEATTLE_MAPILLARY_WALK)[0];
+  assert.equal(salvaged.lengthKm, 873.4);
+});
+
+test("pivotStreetWalks: the label may come from any provider's record; the LINK may not", () => {
+  // A city can be walked by a provider it has no grid run for (a Mapillary
+  // walk costs a handful of tiles and lands before a full census does). Name
+  // it properly, but never link to another provider's run: city.html derives
+  // its provider from the filename and would open the wrong series.
+  const row = pivotStreetWalks(
+    [{ city_id: "seattle--wa", provider: "thirdparty", coverage_pct_by_length: 5 }],
+    INDEX
+  )[0];
+  assert.equal(row.label, "Seattle");
+  assert.equal(row.filename_thirdparty, null, "the bare-city_id fallback must not supply a link");
+  assert.equal(row.filename, null);
+});
+
+test("pivotStreetWalks: the City link is the first REGISTERED provider with a run", () => {
+  const both = rowsFor(SEATTLE_GSV_WALK, SEATTLE_MAPILLARY_WALK)[0];
+  assert.equal(both.filename_gsv, "seattle_gsv.csv.gz");
+  assert.equal(both.filename_mapillary, "seattle_mapillary.csv.gz");
+  assert.equal(both.filename, "seattle_gsv.csv.gz");
+
+  const mapillaryOnly = rowsFor(SEATTLE_MAPILLARY_WALK)[0];
+  assert.equal(mapillaryOnly.filename, "seattle_mapillary.csv.gz");
+});
+
+test("pivotStreetWalks: falls back to city_id and nulls when the join missed", () => {
+  const row = rowsFor({ city_id: "ghost--xx", provider: "gsv" })[0];
   assert.equal(row.label, "ghost--xx");
   assert.equal(row.filename, null);
-  assert.equal(row.pct, null);
-  assert.equal(row.pctAny, null);
+  assert.equal(row.pct_gsv, null);
+  assert.equal(row.pctAny_gsv, null);
 });
 
-test("toRowModel: any-imagery coverage is null on walks predating the field", () => {
+test("pivotStreetWalks: any-imagery coverage is null on walks predating the field", () => {
   // Pre-existing manifests carry no coverage_pct_by_length_any; the column
   // must read "no data", never silently mirror the 360° number.
-  const row = toRowModel(
-    { city_id: "x", provider: "gsv", coverage_pct_by_length: 80 },
-    null
-  );
-  assert.equal(row.pctAny, null);
+  const row = rowsFor({ city_id: "x", provider: "gsv", coverage_pct_by_length: 80 })[0];
+  assert.equal(row.pctAny_gsv, null);
 });
 
 // --- sortRows --------------------------------------------------------------
 
-const ROWS = [
-  { cityId: "c", label: "Cee", pct: 50, edges: 5, runDate: "2026-01-01" },
-  { cityId: "a", label: "Aye", pct: null, edges: 90, runDate: null },
-  { cityId: "b", label: "Bee", pct: 98.4, edges: 10, runDate: "2026-05-05" },
-  { cityId: "d", label: "Dee", pct: 50, edges: 1, runDate: "2026-03-03" },
-];
+const SORT_ROWS = rowsFor(
+  { ...SEATTLE_GSV_WALK, city_id: "c", coverage_pct_by_length: 50, run_date: "2026-01-01" },
+  { ...SEATTLE_GSV_WALK, city_id: "a", coverage_pct_by_length: null, run_date: null },
+  { ...SEATTLE_GSV_WALK, city_id: "b", coverage_pct_by_length: 98.4, run_date: "2026-05-05" },
+  { ...SEATTLE_GSV_WALK, city_id: "d", coverage_pct_by_length: 50, run_date: "2026-03-03" }
+);
 
-test("sortRows: numeric desc puts the best first, nulls last", () => {
-  assert.deepEqual(sortRows(ROWS, "pct", "desc").map((r) => r.cityId), ["b", "c", "d", "a"]);
+test("sortRows: numeric desc puts the best first, nulls last in both directions", () => {
+  assert.deepEqual(sortRows(SORT_ROWS, "pct_gsv", "desc").map((r) => r.cityId), ["b", "c", "d", "a"]);
+  const asc = sortRows(SORT_ROWS, "pct_gsv", "asc").map((r) => r.cityId);
+  assert.equal(asc[asc.length - 1], "a", "absent is not small");
+  assert.deepEqual(asc, ["c", "d", "b", "a"]);
 });
 
-test("sortRows: nulls stay last when the direction flips (absent is not small)", () => {
-  const ids = sortRows(ROWS, "pct", "asc").map((r) => r.cityId);
-  assert.equal(ids[ids.length - 1], "a");
-  assert.deepEqual(ids, ["c", "d", "b", "a"]);
-});
-
-test("sortRows: ties break on city_id, so re-sorting is stable", () => {
-  // "c" and "d" both sit at 50% — they must keep the same relative order
-  // in both directions rather than swapping on every re-sort.
-  assert.deepEqual(sortRows(ROWS, "pct", "desc").slice(1, 3).map((r) => r.cityId), ["c", "d"]);
-  assert.deepEqual(sortRows(ROWS, "pct", "asc").slice(0, 2).map((r) => r.cityId), ["c", "d"]);
+test("sortRows: ties break on rowKey, so re-sorting is stable", () => {
+  assert.deepEqual(sortRows(SORT_ROWS, "pct_gsv", "desc").slice(1, 3).map((r) => r.cityId), ["c", "d"]);
+  assert.deepEqual(sortRows(SORT_ROWS, "pct_gsv", "asc").slice(0, 2).map((r) => r.cityId), ["c", "d"]);
 });
 
 test("sortRows: text columns sort lexically in both directions", () => {
-  assert.deepEqual(sortRows(ROWS, "label", "asc").map((r) => r.cityId), ["a", "b", "c", "d"]);
-  assert.deepEqual(sortRows(ROWS, "label", "desc").map((r) => r.cityId), ["d", "c", "b", "a"]);
+  assert.deepEqual(sortRows(SORT_ROWS, "label", "asc").map((r) => r.cityId), ["a", "b", "c", "d"]);
+  assert.deepEqual(sortRows(SORT_ROWS, "label", "desc").map((r) => r.cityId), ["d", "c", "b", "a"]);
 });
 
 test("sortRows: an unknown key falls back to the first column, never throws", () => {
-  assert.equal(sortRows(ROWS, "nope", "asc").length, ROWS.length);
+  assert.equal(sortRows(SORT_ROWS, "nope", "asc").length, SORT_ROWS.length);
 });
 
 test("sortRows: does not mutate its input", () => {
-  const before = ROWS.map((r) => r.cityId);
-  sortRows(ROWS, "pct", "asc");
-  assert.deepEqual(ROWS.map((r) => r.cityId), before);
+  const before = SORT_ROWS.map((r) => r.cityId);
+  sortRows(SORT_ROWS, "pct_gsv", "asc");
+  assert.deepEqual(SORT_ROWS.map((r) => r.cityId), before);
 });
 
+// --- columns / presets / invariants ----------------------------------------
+
 test("every sortable column key exists on a row model", () => {
-  // Guards the column/model seam: a sortable column with no matching model
-  // field would silently sort every row as null.
-  const row = toRowModel(
-    { city_id: "x", provider: "gsv", run_date: "2026-01-01", spacing_m: 15 },
-    { city: "X" }
-  );
+  const row = rowsFor(SEATTLE_GSV_WALK, SEATTLE_MAPILLARY_WALK)[0];
   for (const col of STREET_COLUMNS.filter((c) => c.sortable !== false)) {
     assert.ok(col.key in row, `row model is missing ${col.key}`);
   }
   assert.ok(STREET_COLUMNS.some((c) => c.key === DEFAULT_SORT.key));
 });
 
+test("the default sort is a VISIBLE column of the default preset", () => {
+  // pctBest has no column of its own — it is a filter field — so sorting by it
+  // would order the table by something the reader cannot see, which is exactly
+  // what createSortableTable's fallback exists to prevent. The GSV leaf is the
+  // deliberate, slightly asymmetric alternative.
+  assert.equal(DEFAULT_SORT.key, "pct_gsv");
+  assert.ok(STREET_PRESETS[0].columns.includes(DEFAULT_SORT.key));
+});
+
 test("every column can render a cell, including from a fully null row model", () => {
-  // The header and the body are both generated from STREET_COLUMNS now, so a
-  // column that throws on a sparse walk takes the whole table down rather than
-  // rendering one bad cell.
-  const sparse = toRowModel({ city_id: "x", provider: "gsv" }, null);
+  const sparse = rowsFor({ city_id: "x", provider: "gsv" })[0];
   for (const col of STREET_COLUMNS) {
     assert.equal(typeof col.cell, "function", `${col.key} has no cell renderer`);
     assert.match(col.cell(sparse), /^<t[hd][\s>]/, `${col.key} did not render a cell`);
   }
 });
 
-test("a row renders one cell per column", () => {
-  // The link column is now a STREET_COLUMNS entry like any other (it renders
-  // its own cell), so the count is exact rather than "columns plus one".
-  const html = walkRowHtml(
-    toRowModel(
-      { city_id: "x", provider: "gsv", network_type: "all_public", run_date: "2026-01-01" },
-      { city: "X" }
-    )
-  );
-  const cells = (html.match(/<t[hd][\s>]/g) || []).length;
-  assert.equal(cells, STREET_COLUMNS.length);
+test("every preset names only real columns", () => {
+  const keys = new Set(STREET_COLUMNS.map((c) => c.key));
+  for (const preset of STREET_PRESETS) {
+    for (const key of preset.columns) {
+      assert.ok(keys.has(key), `preset ${preset.id} names unknown column ${key}`);
+    }
+  }
 });
 
-test("toRowModel: labels the network, defaulting a tokenless walk to roads", () => {
-  const broad = toRowModel(
-    { city_id: "x", provider: "gsv", network_type: "all_public" },
-    { city: "X" }
-  );
-  assert.equal(broad.networkType, "all_public");
-  assert.equal(broad.networkLabel, "Roads + paths");
+test("the walk-to-walk change group has one column per provider and NO cross-provider Δ", () => {
+  // "GSV improved 4 points and Mapillary improved 1" is two facts about two
+  // series; their difference is not a third.
+  const change = STREET_COLUMNS.filter((c) => c.group?.id === "change");
+  assert.deepEqual(change.map((c) => c.key), [
+    "changeDelta_gsv",
+    "changeDelta_mapillary",
+    "changeDelta_thirdparty",
+  ]);
+  assert.match(change[0].title, /Never a cross-provider comparison/);
+  // ...while the coverage group DOES get one.
+  assert.ok(STREET_COLUMNS.some((c) => c.key === "deltaPct" && c.group?.id === "cov"));
+});
 
-  // A walk published before network types existed carries no field at all.
-  const legacy = toRowModel({ city_id: "x", provider: "gsv" }, { city: "X" });
-  assert.equal(legacy.networkType, "drive");
-  assert.equal(legacy.networkLabel, "Roads");
+test("a row renders one cell per column", () => {
+  const html = walkRowHtml(rowsFor(SEATTLE_GSV_WALK, SEATTLE_MAPILLARY_WALK)[0]);
+  const cells = (html.match(/<t[hd][\s>]/g) || []).length;
+  assert.equal(cells, STREET_COLUMNS.length);
 });
 
 // --- num -------------------------------------------------------------------
@@ -264,84 +388,70 @@ test("num: renders an em dash for null/undefined rather than 'null'", () => {
   assert.equal(num(0), "0");
 });
 
-// --- walkRowHtml -----------------------------------------------------------
+// --- cells -----------------------------------------------------------------
 
-const SEATTLE_WALK = {
-  city_id: "seattle--washington--united-states",
-  provider: "gsv",
-  run_date: "2026-07-26",
-  spacing_m: 15,
-  coverage_pct_by_length: 98.4,
-  edges: 33597,
-  edges_fully_covered: 32391,
-};
-
-test("walkRowHtml: links to the city page using the aggregate's run filename", () => {
-  const html = walkRowHtml(
-    toRowModel(SEATTLE_WALK, {
-      city: "Seattle",
-      state: { name: "Washington" },
-      country: { name: "United States" },
-      data_file: { filename: "seattle--wa_width_1_height_1_step_20.csv.gz" },
-    })
-  );
-  assert.match(html, /Seattle, Washington, United States/);
-  assert.match(html, /Google Street View/);
-  assert.match(html, /98\.4%/);
-  assert.match(
-    html,
-    /href="city\.html\?file=seattle--wa_width_1_height_1_step_20\.csv\.gz&network=drive"/
-  );
+test("walkRowHtml: the City cell links with THIS row's network type", () => {
+  // city.html selects the walk to draw by network type and defaults to
+  // 'drive', so a broad row whose link omits ?network= opens a DIFFERENT walk
+  // — or, for a city walked only broadly, falls back to the grid-attribution
+  // artifact, a different metric entirely.
+  const [drive, broad] = rowsFor(SEATTLE_GSV_WALK, SEATTLE_BROAD_WALK);
+  assert.match(walkRowHtml(drive), /href="city\.html\?file=seattle_gsv\.csv\.gz&network=drive"/);
+  assert.match(walkRowHtml(broad), /&network=all_public"/);
 });
 
-test("walkRowHtml: the link carries this row's network type, not the default", () => {
-  // city.html selects the walk to draw by network type and defaults to 'drive',
-  // so a broad row whose link omits ?network= opens a DIFFERENT walk — or, for a
-  // city walked only broadly, falls back to the grid-attribution artifact.
-  const html = walkRowHtml(
-    toRowModel(
-      { ...SEATTLE_WALK, network_type: "all_public" },
-      { city: "Seattle", data_file: { filename: "seattle--wa_width_1_height_1_step_20.csv.gz" } }
-    )
-  );
-  assert.match(html, /&network=all_public"/);
+test("walkDateCellHtml: each provider's Walked cell opens THAT provider's series", () => {
+  const row = rowsFor(SEATTLE_GSV_WALK, SEATTLE_MAPILLARY_WALK)[0];
+  assert.match(walkDateCellHtml(row, "gsv"), /file=seattle_gsv\.csv\.gz&network=drive/);
+  assert.match(walkDateCellHtml(row, "mapillary"), /file=seattle_mapillary\.csv\.gz&network=drive/);
+  assert.match(walkDateCellHtml(row, "mapillary"), /title="Mapillary walk of 2026-07-26 \(Roads\)"/);
+  // A provider that never walked this row renders an em-dash, not an empty link.
+  assert.equal(walkDateCellHtml(row, "thirdparty"), "<td>—</td>");
+});
+
+test("walkDateCellHtml: a walk whose city has no run for that provider is unlinked", () => {
+  // The name fallback supplies a label, never a link (see indexCitiesByProvider).
+  const row = pivotStreetWalks(
+    [{ city_id: "bend--or", provider: "mapillary", run_date: "2026-07-26" }],
+    INDEX
+  )[0];
+  assert.equal(row.label, "Bend");
+  const cell = walkDateCellHtml(row, "mapillary");
+  assert.match(cell, />2026-07-26</);
+  assert.doesNotMatch(cell, /href=/);
 });
 
 test("walkRowHtml: a city missing from the aggregate still renders, without a link", () => {
-  // The manifest is keyed by city_id and can name a city whose runs are not
-  // published — the row must degrade, not disappear or throw.
-  const html = walkRowHtml(toRowModel(SEATTLE_WALK, null));
-  assert.match(html, /seattle--washington--united-states/);
+  const html = walkRowHtml(rowsFor({ city_id: "ghost--xx", provider: "gsv" })[0]);
+  assert.match(html, /ghost--xx/);
   assert.doesNotMatch(html, /href="city\.html/);
 });
 
 test("walkRowHtml: null stats render em dashes, and no coverage bar", () => {
   const html = walkRowHtml(
-    toRowModel(
-      { city_id: "x", provider: "gsv", coverage_pct_by_length: null, spacing_m: null },
-      null
-    )
+    rowsFor({ city_id: "x", provider: "gsv", coverage_pct_by_length: null, spacing_m: null })[0]
   );
   assert.match(html, /—/);
   assert.doesNotMatch(html, /coverage-bar/);
 });
 
-test("walkRowHtml: renders both the 360° and any-imagery coverage cells", () => {
-  const html = walkRowHtml(
-    toRowModel({ ...SEATTLE_WALK, provider: "mapillary", coverage_pct_by_length: 61.2, coverage_pct_by_length_any: 74.8 }, null)
-  );
+test("walkRowHtml: renders both providers' 360° and any-imagery cells", () => {
+  const html = walkRowHtml(rowsFor(SEATTLE_GSV_WALK, SEATTLE_MAPILLARY_WALK)[0]);
+  assert.match(html, /98\.4%/);
   assert.match(html, /61\.2%/);
   assert.match(html, /74\.8%/);
-  assert.match(html, /Mapillary/);
 });
 
 test("walkRowHtml: the coverage bar width is clamped to 0–100%", () => {
-  const html = walkRowHtml(toRowModel({ ...SEATTLE_WALK, coverage_pct_by_length: 137 }, null));
+  const html = walkRowHtml(rowsFor({ ...SEATTLE_GSV_WALK, coverage_pct_by_length: 137 })[0]);
   assert.match(html, /width:100%/);
 });
 
 test("walkRowHtml: city names are HTML-escaped (OSM data is publicly editable)", () => {
-  const html = walkRowHtml(toRowModel(SEATTLE_WALK, { city: "<script>alert(1)</script>" }));
+  const raw = { cities: [{ provider: "gsv", city_id: "x", city: "<script>alert(1)</script>" }] };
+  const html = walkRowHtml(
+    pivotStreetWalks([{ city_id: "x", provider: "gsv" }], indexCitiesByProvider(raw, ["gsv"]))[0]
+  );
   assert.doesNotMatch(html, /<script>/);
   assert.match(html, /&lt;script&gt;/);
 });
@@ -349,14 +459,8 @@ test("walkRowHtml: city names are HTML-escaped (OSM data is publicly editable)",
 test("walkRowHtml: the label cell carries its full text as a title, for ellipsis truncation", () => {
   // Worldwide-frame labels (issue #115) run 60+ chars; the CSS truncates the
   // cell with an ellipsis, so the untruncated name needs to survive on hover.
-  const html = walkRowHtml(
-    toRowModel(SEATTLE_WALK, {
-      city: "Seattle",
-      state: { name: "Washington" },
-      country: { name: "United States" },
-    })
-  );
-  assert.match(html, /<th scope="row" title="Seattle, Washington, United States">/);
+  const html = walkRowHtml(rowsFor(SEATTLE_GSV_WALK)[0]);
+  assert.match(html, /<th scope="row" title="Seattle">/);
 });
 
 // --- walkChangeCellHtml (issue #101) ---------------------------------------
@@ -372,84 +476,128 @@ const CHANGE_BLOCK = {
   diff_file: "seattle_streetwalkdiff_2026-04-01_to_2026-07-26.csv.gz",
 };
 
-test("toRowModel: maps the manifest change block onto change/changeDelta", () => {
-  const row = toRowModel({ ...SEATTLE_WALK, change: CHANGE_BLOCK }, null);
-  assert.equal(row.changeDelta, 4.2);
-  assert.equal(row.change.from, "2026-04-01");
+test("pivotStreetWalks: the manifest change block lands on the walking provider", () => {
+  const row = rowsFor({ ...SEATTLE_GSV_WALK, change: CHANGE_BLOCK }, SEATTLE_MAPILLARY_WALK)[0];
+  assert.equal(row.changeDelta_gsv, 4.2);
+  assert.equal(row.change_gsv.from, "2026-04-01");
+  // ...and NOT on the other provider, whose own walk was a first walk.
+  assert.equal(row.changeDelta_mapillary, null);
+  assert.equal(row.change_mapillary, null);
 });
 
-test("toRowModel: first walks (no change block) leave both null", () => {
-  const row = toRowModel(SEATTLE_WALK, null);
-  assert.equal(row.change, null);
-  assert.equal(row.changeDelta, null);
-});
+test("walkChangeCellHtml: em dash for a first walk, signed pp figure with a churn title", () => {
+  const first = rowsFor(SEATTLE_GSV_WALK)[0];
+  assert.equal(walkChangeCellHtml(first, "gsv"), "<td>—</td>");
 
-test("walkChangeCellHtml: em dash for a first walk", () => {
-  assert.equal(walkChangeCellHtml(toRowModel(SEATTLE_WALK, null)), "<td>—</td>");
-});
-
-test("walkChangeCellHtml: signed pp figure with a churn title", () => {
-  const html = walkChangeCellHtml(toRowModel({ ...SEATTLE_WALK, change: CHANGE_BLOCK }, null));
+  const changed = rowsFor({ ...SEATTLE_GSV_WALK, change: CHANGE_BLOCK })[0];
+  const html = walkChangeCellHtml(changed, "gsv");
   assert.match(html, />\+4\.2 pp</);
   assert.match(html, /Since 2026-04-01/);
   assert.match(html, /12 streets gained/);
   assert.match(html, /3 lost/);
 
-  const negative = walkChangeCellHtml(
-    toRowModel(
-      { ...SEATTLE_WALK, change: { ...CHANGE_BLOCK, coverage_pct_by_length_delta: -0.3 } },
-      null
-    )
-  );
-  assert.match(negative, />-0\.3 pp</);
+  const negative = rowsFor({
+    ...SEATTLE_GSV_WALK,
+    change: { ...CHANGE_BLOCK, coverage_pct_by_length_delta: -0.3 },
+  })[0];
+  assert.match(walkChangeCellHtml(negative, "gsv"), />-0\.3 pp</);
 });
 
 test("walkChangeCellHtml: a zero delta still renders (imagery churned, net flat)", () => {
-  const html = walkChangeCellHtml(
-    toRowModel(
-      { ...SEATTLE_WALK, change: { ...CHANGE_BLOCK, coverage_pct_by_length_delta: 0 } },
-      null
-    )
-  );
-  assert.match(html, />\+0\.0 pp</);
-});
-
-test("walkRowHtml: cell count matches STREET_COLUMNS, change block included", () => {
-  const html = walkRowHtml(toRowModel({ ...SEATTLE_WALK, change: CHANGE_BLOCK }, null));
-  const cells = (html.match(/<t[dh][ >]/g) || []).length;
-  assert.equal(cells, STREET_COLUMNS.length);
+  const zero = rowsFor({
+    ...SEATTLE_GSV_WALK,
+    change: { ...CHANGE_BLOCK, coverage_pct_by_length_delta: 0 },
+  })[0];
+  assert.match(walkChangeCellHtml(zero, "gsv"), />\+0\.0 pp</);
 });
 
 test("sortRows: changeDelta sorts numerically with first walks (null) last", () => {
-  const rows = [
-    toRowModel({ ...SEATTLE_WALK, city_id: "a" }, null),
-    toRowModel(
-      { ...SEATTLE_WALK, city_id: "b", change: { ...CHANGE_BLOCK, coverage_pct_by_length_delta: -0.3 } },
-      null
-    ),
-    toRowModel(
-      { ...SEATTLE_WALK, city_id: "c", change: { ...CHANGE_BLOCK, coverage_pct_by_length_delta: 4.2 } },
-      null
-    ),
-  ];
-  const sorted = sortRows(rows, "changeDelta", "desc");
-  assert.deepEqual(
-    sorted.map((r) => r.cityId),
-    ["c", "b", "a"]
+  const rows = rowsFor(
+    { ...SEATTLE_GSV_WALK, city_id: "a" },
+    {
+      ...SEATTLE_GSV_WALK,
+      city_id: "b",
+      change: { ...CHANGE_BLOCK, coverage_pct_by_length_delta: -0.3 },
+    },
+    {
+      ...SEATTLE_GSV_WALK,
+      city_id: "c",
+      change: { ...CHANGE_BLOCK, coverage_pct_by_length_delta: 4.2 },
+    }
   );
+  assert.deepEqual(sortRows(rows, "changeDelta_gsv", "desc").map((r) => r.cityId), ["c", "b", "a"]);
 });
 
 // --- STREET_FILTERS ---------------------------------------------------------
 
-test("STREET_FILTERS: the Provider filter offers one option per registered provider", () => {
-  // Rows come from the streetwalk manifest, which carries whichever providers
-  // actually walked a city — including one the filter list never enumerated.
+test("STREET_FILTERS: Network is first, defaulted, and has no 'any' reading", () => {
+  // Two networks are two different street-km denominators; an "all networks"
+  // option would stack incomparable numbers in one column.
+  assert.equal(STREET_FILTERS[0].key, "network");
+  assert.equal(STREET_FILTERS[0].defaultValue, "drive");
+  assert.equal(STREET_FILTERS[0].anyLabel, undefined);
+  const [drive, broad] = rowsFor(SEATTLE_GSV_WALK, SEATTLE_BROAD_WALK);
+  assert.ok(STREET_FILTERS[0].test(drive, "drive"));
+  assert.ok(!STREET_FILTERS[0].test(broad, "drive"));
+  assert.ok(STREET_FILTERS[0].test(broad, "all_public"));
+});
+
+test("STREET_FILTERS: 'Collected by' offers every registered provider plus the arity option", () => {
   const provider = STREET_FILTERS.find((f) => f.key === "provider");
   assert.deepEqual(
-    provider.options,
-    Object.entries(global.PROVIDERS).map(([value, p]) => ({ value, label: p.label }))
+    provider.options.map((o) => o.value),
+    ["gsv", "mapillary", "thirdparty", "multi"]
   );
-  assert.ok(provider.options.some((o) => o.value === "thirdparty"));
-  assert.ok(provider.test({ provider: "thirdparty" }, "thirdparty"));
-  assert.ok(!provider.test({ provider: "mapillary" }, "thirdparty"));
+  const both = rowsFor(SEATTLE_GSV_WALK, SEATTLE_MAPILLARY_WALK)[0];
+  const one = rowsFor(SEATTLE_GSV_WALK)[0];
+  assert.ok(provider.test(both, "multi"));
+  assert.ok(!provider.test(one, "multi"));
+  assert.ok(provider.test(one, "gsv"));
+  assert.ok(!provider.test(one, "thirdparty"));
+});
+
+test("STREET_FILTERS: 'Has Δ' asks whether ANY provider walked this row twice", () => {
+  const none = rowsFor(SEATTLE_GSV_WALK, SEATTLE_MAPILLARY_WALK)[0];
+  const some = rowsFor({ ...SEATTLE_GSV_WALK, change: CHANGE_BLOCK }, SEATTLE_MAPILLARY_WALK)[0];
+  const changed = STREET_FILTERS.find((f) => f.key === "changed");
+  assert.ok(!changed.test(none));
+  assert.ok(changed.test(some));
+});
+
+test("STREET_FILTERS: numeric filters are histogram sliders over real row fields", () => {
+  const row = rowsFor(SEATTLE_GSV_WALK, SEATTLE_MAPILLARY_WALK)[0];
+  for (const filter of STREET_FILTERS) {
+    if (!filter.field) continue;
+    assert.equal(filter.type, "histogram-range", `${filter.key} is not a histogram filter`);
+    assert.ok(filter.field in row, `filter ${filter.key} reads a missing field ${filter.field}`);
+  }
+  assert.equal(STREET_FILTERS.find((f) => f.key === "cov").field, "pctBest");
+  assert.equal(STREET_FILTERS.find((f) => f.key === "km").field, "lengthKm");
+});
+
+// --- updateStreetsCaption ---------------------------------------------------
+
+test("updateStreetsCaption: names the active network and counts within it", () => {
+  // `all` holds BOTH networks, so "1 of 3" would compare the visible roads
+  // rows against a total that includes rows the selector deliberately excluded.
+  const captions = [];
+  global.document = { getElementById: () => ({ set textContent(v) { captions.push(v); } }) };
+  const all = rowsFor(SEATTLE_GSV_WALK, SEATTLE_MAPILLARY_WALK, SEATTLE_BROAD_WALK);
+  const drive = all.filter((r) => r.networkType === "drive");
+
+  updateStreetsCaption(drive, all, null, { values: { network: "drive" } });
+  assert.equal(captions.pop(), "1 city walked on Roads");
+
+  updateStreetsCaption([], all, null, { values: { network: "drive" } });
+  assert.equal(captions.pop(), "0 of 1 city walked on Roads");
+
+  updateStreetsCaption(
+    all.filter((r) => r.networkType === "all_public"),
+    all,
+    null,
+    { values: { network: "all_public" } }
+  );
+  assert.equal(captions.pop(), "1 city walked on Roads + paths");
+
+  delete global.document;
 });

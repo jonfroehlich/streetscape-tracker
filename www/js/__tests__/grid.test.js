@@ -1,17 +1,20 @@
 // Offline unit tests for the pure helpers in grid.js — the Grid Coverage
-// table page. Run with `npm test` (Node's built-in test runner) — no network,
-// no jsdom. `document` is left undefined on purpose: grid.js only registers
-// its DOMContentLoaded listener when one exists.
+// table page, pivoted to one row per city in issue #250. Run with `npm test`
+// (Node's built-in test runner) — no network, no jsdom. `document` is left
+// undefined on purpose: grid.js only registers its DOMContentLoaded listener
+// when one exists.
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
-// A THIRD provider the page has never heard of: the filter options are
-// derived from this registry, so a hardcoded two-element list fails here
-// rather than the day one is really registered (issue #225).
+// A THIRD provider the page has never heard of: every per-provider column,
+// filter option and row key is generated from this registry, so a hardcoded
+// pair fails here rather than the day one is really registered (issue #225).
+// It deliberately carries no shortLabel/panoCountingModel, which is what the
+// caller-side fallbacks are for.
 global.PROVIDERS = {
-  gsv: { label: "Google Street View" },
-  mapillary: { label: "Mapillary" },
+  gsv: { label: "Google Street View", shortLabel: "GSV", panoCountingModel: "sample" },
+  mapillary: { label: "Mapillary", shortLabel: "Mapillary", panoCountingModel: "census" },
   thirdparty: { label: "Third Party" },
 };
 global.coverageColor = (pct) => `coverage(${pct})`;
@@ -19,18 +22,32 @@ global.escapeHtml = (s) =>
   String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
 // grid.js reads the shared table machinery as browser globals — mirror that
-// here (must precede the grid.js require).
-Object.assign(global, require("../table-utils.js"));
+// here (must precede the grid.js require). PROVIDERS above must already be
+// set: table-utils.js's provider-column helpers read it.
+const tableUtils = require("../table-utils.js");
+Object.assign(global, tableUtils);
+const { deltaCellHtml } = tableUtils;
+
+// The real adapter is exercised by streetscape-utils.test.js; here a stub
+// keeps the fixtures readable and, crucially, reproduces the ONE behaviour the
+// pivot depends on: a city with no runs for the provider being adapted is
+// simply absent from that pass.
+global.adaptCitiesPayload = (raw, provider) => ({
+  meta: { generatedAt: raw?.generated_at ?? null },
+  cities: (raw?.cities ?? []).filter((c) => c.provider === provider).map((c) => ({ ...c })),
+});
 
 const {
-  gridRowModel,
+  pivotGridRows,
   gridRowHtml,
+  gridDeltaPair,
   GRID_COLUMNS,
+  GRID_PRESETS,
   GRID_DEFAULT_SORT,
   GRID_FILTERS,
 } = require("../grid.js");
 
-const SEATTLE = {
+const SEATTLE_GSV = {
   provider: "gsv",
   city_id: "seattle--wa",
   city: "Seattle",
@@ -40,41 +57,180 @@ const SEATTLE = {
   any_imagery_coverage_rate_percent: 51.2,
   pano_age_stats: { median_pano_age_years: 3.4 },
   pano_count: 41234,
+  total_search_points: 1681,
+  search_area_km2: 25.0,
+  grid: { width_meters: 5000, height_meters: 5000, step_length_meters: 20 },
   latest_run_date: "2026-07-05",
   runs: [{ run_date: "2025-01-17" }, { run_date: "2026-07-05" }],
   data_file: { filename: "seattle--wa_width_5000_height_5000_step_20_2026-07-05.csv.gz" },
 };
 
-// --- gridRowModel -----------------------------------------------------------
+const SEATTLE_MAPILLARY = {
+  provider: "mapillary",
+  city_id: "seattle--wa",
+  city: "Seattle",
+  state: { name: "Washington" },
+  country: { name: "United States" },
+  coverage_rate_percent: 61.5,
+  any_imagery_coverage_rate_percent: 74.8,
+  pano_age_stats: { median_pano_age_years: 2.1 },
+  pano_count: 987654,
+  latest_run_date: "2026-07-05",
+  runs: [{ run_date: "2026-07-05" }],
+  data_file: {
+    filename: "seattle--wa_width_5000_height_5000_step_20_mapillary_2026-07-05.csv.gz",
+  },
+};
 
-test("gridRowModel: flattens an adapted record into the sorter's shape", () => {
-  const row = gridRowModel(SEATTLE);
-  assert.equal(row.cityId, "seattle--wa");
-  assert.equal(row.label, "Seattle, Washington, United States");
-  assert.equal(row.providerLabel, "Google Street View");
-  assert.equal(row.pct, 51.2);
-  assert.equal(row.medianAge, 3.4);
-  assert.equal(row.panos, 41234);
-  assert.equal(row.collected, "2026-07-05");
-  assert.equal(row.snapshots, 2);
-  assert.equal(row.filename, SEATTLE.data_file.filename);
+const BEND_GSV = { ...SEATTLE_GSV, city_id: "bend--or", city: "Bend", state: { name: "Oregon" } };
+
+function payload(...cities) {
+  return { generated_at: "2026-07-06T00:00:00Z", cities };
+}
+
+function rowFor(raw, cityId) {
+  return pivotGridRows(raw).rows.find((r) => r.cityId === cityId);
+}
+
+// --- pivotGridRows ----------------------------------------------------------
+
+test("pivotGridRows: one row per city, providers folded into sub-fields", () => {
+  const { rows, generatedAt } = pivotGridRows(payload(SEATTLE_GSV, SEATTLE_MAPILLARY, BEND_GSV));
+  assert.equal(rows.length, 2);
+  assert.equal(generatedAt, "2026-07-06T00:00:00Z");
+
+  const seattle = rows.find((r) => r.cityId === "seattle--wa");
+  assert.equal(seattle.label, "Seattle, Washington, United States");
+  assert.deepEqual(seattle.providers, ["gsv", "mapillary"]);
+  assert.equal(seattle.providerCount, 2);
+  assert.equal(seattle.providersLabel, "GSV, Mapillary");
+  assert.equal(seattle.pct_gsv, 51.2);
+  assert.equal(seattle.pct_mapillary, 61.5);
+  assert.equal(seattle.pctAny_mapillary, 74.8);
+  assert.equal(seattle.medianAge_gsv, 3.4);
+  assert.equal(seattle.panos_mapillary, 987654);
+  assert.equal(seattle.collected_mapillary, "2026-07-05");
+  assert.equal(seattle.snapshots_gsv, 2);
+  assert.equal(seattle.snapshots_mapillary, 1);
 });
 
-test("gridRowModel: missing stats become nulls, never NaN or 'undefined'", () => {
-  const row = gridRowModel({ provider: "mapillary", city_id: "x--y", city: "X" });
-  assert.equal(row.pct, null);
-  assert.equal(row.pctAny, null);
-  assert.equal(row.medianAge, null);
-  assert.equal(row.panos, null);
-  assert.equal(row.collected, null);
-  assert.equal(row.snapshots, null); // zero runs reads as absent, not "0"
-  assert.equal(row.filename, null);
+test("pivotGridRows: the city set is the UNION across providers, never the intersection", () => {
+  // adaptCitiesPayload drops a city that has no runs for the provider it is
+  // adapting for, so intersecting would hide every single-provider city —
+  // which is most of them.
+  const onlyMapillary = { ...SEATTLE_MAPILLARY, city_id: "lisboa--pt", city: "Lisboa" };
+  const { rows } = pivotGridRows(payload(BEND_GSV, onlyMapillary));
+  assert.deepEqual(rows.map((r) => r.cityId).sort(), ["bend--or", "lisboa--pt"]);
+
+  const lisboa = rows.find((r) => r.cityId === "lisboa--pt");
+  assert.deepEqual(lisboa.providers, ["mapillary"]);
+  assert.equal(lisboa.pct_gsv, null, "a provider that never collected must read null");
+  assert.equal(lisboa.pct_mapillary, 61.5);
+  assert.equal(lisboa.collected_gsv, null);
+  assert.equal(lisboa.filename_gsv, null);
 });
+
+test("pivotGridRows: shared frozen-grid facts collapse to one field", () => {
+  // Grid geometry is a CITY property shared by every provider — that is what
+  // makes their coverage rates comparable — so it is one column, not one per
+  // provider. The Mapillary record here carries none of it, and must not
+  // overwrite the GSV record's values with nulls.
+  const seattle = rowFor(payload(SEATTLE_GSV, SEATTLE_MAPILLARY), "seattle--wa");
+  assert.equal(seattle.searchPoints, 1681);
+  assert.equal(seattle.gridWidthM, 5000);
+  assert.equal(seattle.gridStepM, 20);
+  assert.equal(seattle.areaKm2, 25.0);
+  assert.equal(seattle.gridSpanLabel, "5.0 × 5.0 km");
+
+  // ...and in the other order too, so "first non-null wins" is not "first
+  // provider wins".
+  const flipped = rowFor(payload(SEATTLE_MAPILLARY, SEATTLE_GSV), "seattle--wa");
+  assert.equal(flipped.searchPoints, 1681);
+  assert.equal(flipped.gridSpanLabel, "5.0 × 5.0 km");
+});
+
+test("pivotGridRows: the City link prefers the first REGISTERED provider with a run", () => {
+  // The row is a city now, so it has no provider of its own; each provider's
+  // "Last collected" sub-cell carries the link to that provider's series.
+  const both = rowFor(payload(SEATTLE_GSV, SEATTLE_MAPILLARY), "seattle--wa");
+  assert.equal(both.filename, SEATTLE_GSV.data_file.filename);
+
+  const mapillaryOnly = rowFor(payload(SEATTLE_MAPILLARY), "seattle--wa");
+  assert.equal(mapillaryOnly.filename, SEATTLE_MAPILLARY.data_file.filename);
+
+  const none = rowFor(payload({ provider: "gsv", city_id: "x--y", city: "X" }), "x--y");
+  assert.equal(none.filename, null);
+});
+
+test("pivotGridRows: pctBest is the MAX and medianAgeBest is the MIN (freshest)", () => {
+  const seattle = rowFor(payload(SEATTLE_GSV, SEATTLE_MAPILLARY), "seattle--wa");
+  assert.equal(seattle.pctBest, 61.5);
+  assert.equal(seattle.medianAgeBest, 2.1, "best age is the SMALL number");
+
+  const gsvOnly = rowFor(payload(BEND_GSV), "bend--or");
+  assert.equal(gsvOnly.pctBest, 51.2);
+  assert.equal(gsvOnly.medianAgeBest, 3.4);
+
+  const nothing = rowFor(payload({ provider: "gsv", city_id: "x--y", city: "X" }), "x--y");
+  assert.equal(nothing.pctBest, null);
+  assert.equal(nothing.medianAgeBest, null);
+});
+
+test("pivotGridRows: Δ is null unless BOTH operands are present, and signed Mapillary − GSV", () => {
+  // Treating a missing operand as zero would turn "no Mapillary run here" into
+  // "Mapillary is 51 points behind" — a made-up comparison that would then
+  // sort as one.
+  const both = rowFor(payload(SEATTLE_GSV, SEATTLE_MAPILLARY), "seattle--wa");
+  assert.equal(Math.round(both.deltaPct * 10) / 10, 10.3); // 61.5 − 51.2
+  assert.equal(Math.round(both.deltaPctAny * 10) / 10, 23.6); // 74.8 − 51.2
+  assert.equal(Math.round(both.deltaMedianAge * 10) / 10, -1.3); // 2.1 − 3.4
+
+  for (const key of ["deltaPct", "deltaPctAny", "deltaMedianAge"]) {
+    assert.equal(rowFor(payload(BEND_GSV), "bend--or")[key], null, `${key} on a GSV-only city`);
+    assert.equal(
+      rowFor(payload(SEATTLE_MAPILLARY), "seattle--wa")[key],
+      null,
+      `${key} on a Mapillary-only city`
+    );
+  }
+});
+
+test("pivotGridRows: a third registered provider gets keys and is counted, but no Δ", () => {
+  const third = { ...SEATTLE_MAPILLARY, provider: "thirdparty", coverage_rate_percent: 99 };
+  const seattle = rowFor(payload(SEATTLE_GSV, SEATTLE_MAPILLARY, third), "seattle--wa");
+  assert.equal(seattle.pct_thirdparty, 99);
+  assert.equal(seattle.providerCount, 3);
+  // shortLabel is absent from this registry entry — the fallback is `label`.
+  assert.match(seattle.providersLabel, /Third Party/);
+  // pctBest spans EVERY provider, not just the Δ pair.
+  assert.equal(seattle.pctBest, 99);
+  // ...but the Δ still compares exactly the declared pair.
+  assert.deepEqual(gridDeltaPair(), ["mapillary", "gsv"]);
+  assert.equal(Math.round(seattle.deltaPct * 10) / 10, 10.3);
+  assert.equal(seattle.deltaPct_thirdparty, undefined);
+});
+
+test("pivotGridRows: missing stats become nulls, never NaN or 'undefined'", () => {
+  const row = rowFor(payload({ provider: "mapillary", city_id: "x--y", city: "X" }), "x--y");
+  assert.equal(row.pct_mapillary, null);
+  assert.equal(row.pctAny_mapillary, null);
+  assert.equal(row.medianAge_mapillary, null);
+  assert.equal(row.panos_mapillary, null);
+  assert.equal(row.collected_mapillary, null);
+  assert.equal(row.snapshots_mapillary, null); // zero runs reads as absent, not "0"
+  assert.equal(row.gridSpanLabel, null);
+});
+
+test("pivotGridRows: an empty or missing payload yields no rows rather than throwing", () => {
+  assert.deepEqual(pivotGridRows({ cities: [] }).rows, []);
+});
+
+// --- columns / presets / invariants -----------------------------------------
 
 test("every sortable column key exists on a row model", () => {
   // Guards the column/model seam: a sortable column with no matching model
   // field would silently sort every row as null.
-  const row = gridRowModel(SEATTLE);
+  const row = rowFor(payload(SEATTLE_GSV, SEATTLE_MAPILLARY), "seattle--wa");
   for (const col of GRID_COLUMNS.filter((c) => c.sortable !== false)) {
     assert.ok(col.key in row, `row model is missing ${col.key}`);
   }
@@ -85,39 +241,124 @@ test("every column can render a cell, including from a fully null row model", ()
   // The header and the body are both generated from GRID_COLUMNS now, so a
   // column that throws on a sparse record takes the whole table down rather
   // than rendering one bad cell.
-  const sparse = gridRowModel({ provider: "gsv", city_id: "x--y", city: "X" });
+  const sparse = rowFor(payload({ provider: "gsv", city_id: "x--y", city: "X" }), "x--y");
   for (const col of GRID_COLUMNS) {
     assert.equal(typeof col.cell, "function", `${col.key} has no cell renderer`);
     assert.match(col.cell(sparse), /^<t[hd][\s>]/, `${col.key} did not render a cell`);
   }
 });
 
-// --- gridRowHtml ------------------------------------------------------------
+test("every preset names only real columns", () => {
+  const keys = new Set(GRID_COLUMNS.map((c) => c.key));
+  for (const preset of GRID_PRESETS) {
+    for (const key of preset.columns) {
+      assert.ok(keys.has(key), `preset ${preset.id} names unknown column ${key}`);
+    }
+  }
+});
 
-test("gridRowHtml: one cell per column, linking to city.html", () => {
-  // The link column is now a GRID_COLUMNS entry like any other (it renders its
-  // own cell), so the count is exact rather than "columns plus one".
-  const html = gridRowHtml(gridRowModel(SEATTLE));
+test("grouped columns carry a group on EVERY member, and only leaves are sortable keys", () => {
+  // theadHtml collapses a run of same-group columns into one colgroup cell and
+  // takes the label from the first VISIBLE member, which only works if every
+  // member repeats it.
+  const groups = new Map();
+  for (const col of GRID_COLUMNS) {
+    if (!col.group) continue;
+    assert.ok(col.group.id && col.group.label, `${col.key} has an incomplete group`);
+    const seen = groups.get(col.group.id);
+    if (seen) assert.equal(seen, col.group.label, `${col.group.id} members disagree on the label`);
+    else groups.set(col.group.id, col.group.label);
+  }
+  // The registry has three providers, so each per-provider group has three
+  // leaves (plus a Δ where one is declared).
+  const cov = GRID_COLUMNS.filter((c) => c.group?.id === "cov");
+  assert.deepEqual(cov.map((c) => c.key), [
+    "pct_gsv",
+    "pct_mapillary",
+    "pct_thirdparty",
+    "deltaPct",
+  ]);
+  // Panorama counts are census-vs-sample and get NO Δ, ever.
+  const panos = GRID_COLUMNS.filter((c) => c.group?.id === "panos");
+  assert.equal(panos.length, 3);
+  assert.ok(!panos.some((c) => c.key.startsWith("delta")));
+  assert.match(panos[0].label, /GSV \(sample\)/);
+  assert.match(panos[1].label, /Mapillary \(census\)/);
+  // ...and a provider with no declared counting model just reads its name.
+  assert.equal(panos[2].label, "Third Party");
+});
+
+test("grouped leaves carry a self-contained pickerLabel", () => {
+  // A leaf's own label is a provider name repeated under every metric group —
+  // unambiguous in the header, meaningless in the picker's flat list.
+  const leaf = GRID_COLUMNS.find((c) => c.key === "pct_mapillary");
+  assert.equal(leaf.label, "Mapillary");
+  assert.equal(leaf.pickerLabel, "Grid coverage (%) — Mapillary");
+  const delta = GRID_COLUMNS.find((c) => c.key === "deltaPct");
+  assert.equal(delta.pickerLabel, "Grid coverage (%) — Δ");
+});
+
+test("the age Δ column says which sign means fresher", () => {
+  // The one place the sign is counter-intuitive: a NEGATIVE age difference is
+  // Mapillary being newer. The column title is where that is stated.
+  const delta = GRID_COLUMNS.find((c) => c.key === "deltaMedianAge");
+  assert.match(delta.title, /NEGATIVE means Mapillary is fresher/);
+});
+
+// --- cells ------------------------------------------------------------------
+
+test("deltaCellHtml: signs positives, em-dashes nulls, marks an exact tie", () => {
+  assert.match(deltaCellHtml(10.3, { unit: " pp" }), />\+10\.3 pp</);
+  assert.match(deltaCellHtml(10.3, { unit: " pp" }), /delta-pos/);
+  assert.match(deltaCellHtml(-1.3, { unit: " yrs" }), />-1\.3 yrs</);
+  assert.match(deltaCellHtml(-1.3), /delta-neg/);
+  assert.match(deltaCellHtml(0), /delta-zero/);
+  assert.match(deltaCellHtml(0), />0\.0</);
+  assert.equal(deltaCellHtml(null), `<td class="delta-cell">—</td>`);
+});
+
+test("gridRowHtml: one cell per column, with the city linking to city.html", () => {
+  const html = gridRowHtml(rowFor(payload(SEATTLE_GSV, SEATTLE_MAPILLARY), "seattle--wa"));
   const cells = (html.match(/<t[hd][\s>]/g) || []).length;
   assert.equal(cells, GRID_COLUMNS.length);
   assert.match(
     html,
-    /href="city\.html\?file=seattle--wa_width_5000_height_5000_step_20_2026-07-05\.csv\.gz"/
+    /<th scope="row" title="Seattle, Washington, United States"><a class="streets-view-link" href="city\.html\?file=seattle--wa_width_5000_height_5000_step_20_2026-07-05\.csv\.gz"/
   );
   assert.match(html, /51\.2%/);
-  assert.match(html, /3\.4 yrs/);
+  assert.match(html, /61\.5%/);
+  assert.match(html, />\+10\.3 pp</);
 });
 
-test("gridRowHtml: the label cell carries its full text as a title, for ellipsis truncation", () => {
-  // OSM/Nominatim labels are unbounded (issue #115's worldwide names run 60+
-  // chars); the CSS truncates the cell with an ellipsis, so the untruncated
-  // name needs to survive on hover via `title`.
-  const html = gridRowHtml(gridRowModel(SEATTLE));
-  assert.match(html, /<th scope="row" title="Seattle, Washington, United States">/);
+test("gridRowHtml: each provider's Last collected cell links to THAT provider's run", () => {
+  // city.html derives its provider from the run filename, so this is the only
+  // place a reader can open a specific series — the City cell can only ever
+  // open one of them.
+  const row = rowFor(payload(SEATTLE_GSV, SEATTLE_MAPILLARY), "seattle--wa");
+  const collectedGsv = GRID_COLUMNS.find((c) => c.key === "collected_gsv").cell(row);
+  const collectedMap = GRID_COLUMNS.find((c) => c.key === "collected_mapillary").cell(row);
+  assert.match(collectedGsv, /href="city\.html\?file=seattle--wa_width_5000_height_5000_step_20_2026-07-05\.csv\.gz"/);
+  assert.match(collectedMap, /_mapillary_2026-07-05\.csv\.gz"/);
+  assert.match(collectedMap, /title="Mapillary run of 2026-07-05"/);
+
+  // A provider that never collected this city renders a plain em-dash, not an
+  // empty link.
+  const thirdparty = GRID_COLUMNS.find((c) => c.key === "collected_thirdparty").cell(row);
+  assert.equal(thirdparty, "<td>—</td>");
+});
+
+test("gridRowHtml: a provider's date renders unlinked when it has no published run", () => {
+  const row = rowFor(
+    payload({ ...SEATTLE_GSV, data_file: null, latest_run_date: "2026-07-05" }),
+    "seattle--wa"
+  );
+  const cell = GRID_COLUMNS.find((c) => c.key === "collected_gsv").cell(row);
+  assert.match(cell, />2026-07-05</);
+  assert.doesNotMatch(cell, /href=/);
 });
 
 test("gridRowHtml: null stats render em dashes and no link", () => {
-  const html = gridRowHtml(gridRowModel({ provider: "gsv", city_id: "x--y", city: "X" }));
+  const html = gridRowHtml(rowFor(payload({ provider: "gsv", city_id: "x--y", city: "X" }), "x--y"));
   assert.match(html, /—/);
   assert.doesNotMatch(html, /href="city\.html/);
   assert.doesNotMatch(html, /coverage-bar/);
@@ -125,7 +366,7 @@ test("gridRowHtml: null stats render em dashes and no link", () => {
 
 test("gridRowHtml: city names are HTML-escaped (OSM data is publicly editable)", () => {
   const html = gridRowHtml(
-    gridRowModel({ provider: "gsv", city_id: "x--y", city: "<script>alert(1)</script>" })
+    rowFor(payload({ provider: "gsv", city_id: "x--y", city: "<script>alert(1)</script>" }), "x--y")
   );
   assert.doesNotMatch(html, /<script>/);
   assert.match(html, /&lt;script&gt;/);
@@ -133,24 +374,53 @@ test("gridRowHtml: city names are HTML-escaped (OSM data is publicly editable)",
 
 // --- GRID_FILTERS -----------------------------------------------------------
 
-test("GRID_FILTERS: the Provider filter offers one option per registered provider", () => {
-  // renderGridRuns builds its rows by iterating PROVIDERS, so a filter that
-  // does not would list a third provider's rows with no way to isolate them.
+test("GRID_FILTERS: 'Collected by' offers every registered provider plus the arity option", () => {
+  // The arity option replaced the old "Multiple providers" checkbox: with the
+  // pivot, "collected by 2+ providers" is exactly "this row's Δ columns are
+  // populated", which is what the checkbox was really asking.
   const provider = GRID_FILTERS.find((f) => f.key === "provider");
+  assert.equal(provider.label, "Collected by");
   assert.deepEqual(
-    provider.options,
-    Object.entries(global.PROVIDERS).map(([value, p]) => ({ value, label: p.label }))
+    provider.options.map((o) => o.value),
+    ["gsv", "mapillary", "thirdparty", "multi"]
   );
-  assert.ok(provider.options.some((o) => o.value === "thirdparty"));
-  // The option values are what `test` compares against a row's provider key.
-  assert.ok(provider.test({ provider: "thirdparty" }, "thirdparty"));
-  assert.ok(!provider.test({ provider: "gsv" }, "thirdparty"));
+
+  const both = rowFor(payload(SEATTLE_GSV, SEATTLE_MAPILLARY), "seattle--wa");
+  const one = rowFor(payload(BEND_GSV), "bend--or");
+  assert.ok(provider.test(both, "gsv"));
+  assert.ok(provider.test(both, "mapillary"));
+  assert.ok(!provider.test(one, "mapillary"));
+  assert.ok(provider.test(both, "multi"));
+  assert.ok(!provider.test(one, "multi"));
 });
 
-test("GRID_FILTERS: the multi-provider filter is labeled by arity, not by two names", () => {
-  // The test has always been `size > 1` (markBothProviders); only the label
-  // claimed there were exactly two providers.
-  const both = GRID_FILTERS.find((f) => f.key === "both");
-  assert.doesNotMatch(both.label, /both/i);
-  assert.doesNotMatch(both.title, /Mapillary/);
+test("GRID_FILTERS: the old ?provider=gsv links still select the same rows", () => {
+  // The value vocabulary is unchanged apart from the addition, so a link made
+  // before the pivot keeps working — it now selects the CITY rather than the
+  // series, which is the same set of cities.
+  const provider = GRID_FILTERS.find((f) => f.key === "provider");
+  assert.ok(provider.options.some((o) => o.value === "gsv"));
+  assert.ok(provider.test(rowFor(payload(SEATTLE_GSV, SEATTLE_MAPILLARY), "seattle--wa"), "gsv"));
+});
+
+test("GRID_FILTERS: numeric filters read best-across-providers, and are histogram sliders", () => {
+  const byKey = Object.fromEntries(GRID_FILTERS.map((f) => [f.key, f]));
+  assert.equal(byKey.cov.field, "pctBest");
+  assert.equal(byKey.age.field, "medianAgeBest");
+  assert.equal(byKey.dcov.field, "deltaPct");
+  for (const key of ["cov", "age", "dcov"]) {
+    assert.equal(byKey[key].type, "histogram-range", `${key} is not a histogram filter`);
+  }
+  // The Δ filter has no declared bounds: a difference is signed and its extent
+  // is a property of the data, not of the metric.
+  assert.equal(byKey.dcov.min, undefined);
+  assert.equal(byKey.dcov.max, undefined);
+});
+
+test("GRID_FILTERS: every filter's field exists on a row model", () => {
+  const row = rowFor(payload(SEATTLE_GSV, SEATTLE_MAPILLARY), "seattle--wa");
+  for (const filter of GRID_FILTERS) {
+    if (!filter.field) continue;
+    assert.ok(filter.field in row, `filter ${filter.key} reads a missing field ${filter.field}`);
+  }
 });

@@ -58,12 +58,18 @@
         number below weights each street by its length.
       </p>
       <p class="streets-caveat">
-        Street-level collection runs on the same rolling schedule as the grid,
-        so cities appear here as they are walked and are refreshed each cycle.
-        Google Street View costs one metadata request per sample point (a large
-        city runs to a few hundred thousand), while Mapillary is derived from
-        its vector-tile census — so Mapillary cities fill in faster.
-        Search, filter and re-sort to narrow the table. Each numeric filter in
+        Each city is <strong>one row</strong>, with a sub-column per provider:
+        both walk the same sample points on the same frozen network, so their
+        numbers are directly comparable and the <strong>Δ</strong> column gives
+        the difference. The <strong>Network</strong> selector is separate for
+        the opposite reason — &quot;Roads&quot; and &quot;Roads + paths&quot;
+        divide by different street-km totals, so they are never shown side by
+        side. Street-level collection runs on the same rolling schedule as the
+        grid, so cities appear here as they are walked and are refreshed each
+        cycle. Google Street View costs one metadata request per sample point
+        (a large city runs to a few hundred thousand), while Mapillary is
+        derived from its vector-tile census — so Mapillary cities fill in
+        faster. Search, filter and re-sort to narrow the table. Each numeric filter in
         the sidebar carries a small histogram of where the rows actually sit,
         drawn over everything the <em>other</em> controls have selected, so
         brushing one range never redraws its own picture. The address bar

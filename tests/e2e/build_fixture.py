@@ -18,9 +18,16 @@ Everything lands in ``tests/e2e/fixture/`` and is tiny enough to commit:
 The three cities cover the render paths the smoke test asserts on:
 
   * a normal multi-run **GSV** city  — snapshot ``<select>`` + change line,
-    plus a road-walk coverage artifact (fractional street overlay, #155)
+    plus a road-walk coverage artifact (fractional street overlay, #155).
+    It also carries a **Mapillary** run and a Mapillary road walk, so it is the
+    two-provider city the pivoted grid/streets tables (#250) need: without one,
+    the cross-provider Δ columns and the union-not-intersection pivot render
+    nothing an assertion can see. And a second, **all_public** walk, for the
+    streets page's network selector.
   * a **0-pano** GSV city (#69/#122) — "—" dates, no ``Infinity%``/``NaN``
-  * a **Mapillary** city             — provider toggle / ``?provider=``
+  * a **Mapillary-only** city        — provider toggle / ``?provider=``, and
+    the one tracked city with no GSV capture date, which the driving-plan join
+    needs to render an ordinary "campaign closed, nothing observed" verdict
 
 The manifest is written for every city (as in production, where it is rebuilt
 with the aggregate), so a city with no walk exercises the lookup-miss path.
@@ -207,6 +214,7 @@ def _add_streetwalk(
     spacing_m=15.0,
     match_dist_m=25.0,
     provider="gsv",
+    network_type="drive",
     flat_only=False,
 ):
     """
@@ -224,6 +232,12 @@ def _add_streetwalk(
     but no 360° pano: it lifts the any-imagery number while leaving the 360°
     number at zero (issue #116's distinction). Used to give the streets page a
     second provider whose two coverage columns actually differ.
+
+    ``network_type`` selects which OSM network the walk claims to have covered.
+    The synthetic two-edge network is the same either way — what matters to the
+    frontend is that the artifact, the filename token and the catalog row all
+    agree, since a walk of a different network has a different street-km
+    denominator and must never share a row or a column with a 'drive' one.
     """
     import geopandas as gpd
     import pandas as pd
@@ -278,7 +292,14 @@ def _add_streetwalk(
     # actually emit — the bug that let two providers collide on one filename).
     csv_name = (
         naming.generate_streetwalk_filename(
-            city_id, W, H, STEP, spacing_m, run_date, provider=provider
+            city_id,
+            W,
+            H,
+            STEP,
+            spacing_m,
+            run_date,
+            provider=provider,
+            network_type=network_type,
         )
         + ".csv.gz"
     )
@@ -295,6 +316,7 @@ def _add_streetwalk(
         spacing_m=spacing_m,
         match_dist_m=match_dist_m,
         source_csv=csv_name,
+        network_type=network_type,
     )
     with gzip.open(os.path.join(FIXTURE_DIR, coverage_name), "wt", encoding="utf-8") as fh:
         json.dump(geojson, fh)
@@ -306,6 +328,7 @@ def _add_streetwalk(
         run_date=run_date,
         csv_filename=csv_name,
         provider=provider,
+        network_type=network_type,
         coverage_filename=coverage_name,
         spacing_m=spacing_m,
         match_dist_m=match_dist_m,
@@ -373,6 +396,26 @@ def build():
         )
         _record_real_diff(conn, alpha, r1, r2, date(2026, 1, 15), date(2026, 4, 15))
 
+        # ...plus a Mapillary run of the SAME city on the SAME date. This is
+        # what makes Alpha City a two-provider city, and until issue #250 the
+        # fixture had none at all — so the grid page's cross-provider Δ columns,
+        # the union-not-intersection pivot and the shared-geometry collapse were
+        # all invisible to the e2e, which could only ever see single-provider
+        # rows. Deliberately on ALPHA rather than on Map Ville (which the issue
+        # suggested): the driving-plan fixture below needs one tracked city with
+        # NO gsv capture date, to render the ordinary "campaign closed, nothing
+        # observed" verdict, and Map Ville is it.
+        _add_mapillary_run(
+            conn,
+            alpha,
+            "Alpha City",
+            "Alphastate",
+            "Testland",
+            [("am1", "2023-05-01"), ("am2", "2025-05-01")],
+            date(2026, 4, 15),
+            grid_origin=(44.00, -121.00),
+        )
+
         # 2) 0-pano GSV city (#69/#122): a run with no panos at all.
         zero = db.register_city(
             conn,
@@ -424,13 +467,38 @@ def build():
             grid_origin=(46.00, -119.00),
         )
 
-        # 4) A road-walk coverage artifact for Alpha City only (#155): the city
-        # page must render it in place of the grid overlay, while Zero/Map Ville
-        # exercise the "manifest present, no entry for me" path.
+        # 4) Road-walk coverage artifacts (#155). The city page must render one
+        # in place of the grid overlay, while Zero City exercises the "manifest
+        # present, no entry for me" path.
+        #
+        # Alpha City is walked by BOTH providers on the same date and on the
+        # 'drive' network, which is what gives streets.html a pivoted row with
+        # two populated provider sub-columns and a non-null Δ (issue #250) — and
+        # it is also the collision the provider token exists to prevent, so the
+        # two artifacts must not overwrite each other.
         _add_streetwalk(conn, alpha, date(2026, 4, 15), grid_origin=(44.00, -121.00))
-        # A Mapillary walk on the Mapillary city, recorded as flat-only imagery
-        # so the streets page has a second provider AND a row whose 360° and
-        # any-imagery numbers differ.
+        _add_streetwalk(
+            conn,
+            alpha,
+            date(2026, 4, 15),
+            grid_origin=(44.00, -121.00),
+            provider="mapillary",
+            flat_only=True,
+        )
+        # ...and once more on the BROAD network, so the streets page's
+        # network selector has a second series to switch to. Its street-km
+        # denominator is a different one, which is exactly why it is a separate
+        # row rather than another column.
+        _add_streetwalk(
+            conn,
+            alpha,
+            date(2026, 4, 15),
+            grid_origin=(44.00, -121.00),
+            network_type="all_public",
+        )
+        # A Mapillary walk on the Mapillary-only city, recorded as flat-only
+        # imagery so the streets page has a row whose 360° and any-imagery
+        # numbers differ.
         _add_streetwalk(
             conn,
             mapv,

@@ -136,6 +136,12 @@
   box-shadow: none;
 }
 
+/* An ungrouped column spans both header rows; align its label with the leaf
+   labels beside it rather than letting it float in the middle. */
+.streets-table thead th[rowspan] {
+  vertical-align: bottom;
+}
+
 /* Reserve the arrow's width so re-sorting doesn't shift column widths. */
 .sort-arrow {
   display: inline-block;
@@ -198,6 +204,22 @@
 
 .coverage-value {
   position: relative;
+}
+
+/* ── Cross-provider Δ cells (issue #250) ──────────────────────────────────
+   Deliberately NOT green/red by sign: a positive Δ means "Mapillary has more"
+   in a coverage group and "Mapillary is OLDER" in the age group, so one
+   sign-to-colour rule would have to lie in one of the two places. The sign
+   character carries the direction and the column's title says what it means.
+   Only an exact zero is styled — "the two providers agree exactly" is a
+   genuinely different fact from "they are close". */
+
+.delta-cell {
+  font-variant-numeric: tabular-nums;
+}
+
+.delta-cell.delta-zero {
+  color: #888;
 }
 
 /* The city-name link (issue #188 follow-up: absorbed the old separate "View

@@ -53,11 +53,14 @@
         streets have actually been driven.
       </p>
       <p class="streets-caveat">
-        A city collected by both Google Street View and Mapillary appears
-        once per provider. Coverage percentages are cross-provider
-        comparable; raw panorama counts are not — GSV samples the nearest
-        pano per grid point while Mapillary is a census of every 360° pano.
-        Search, filter and re-sort to narrow the table. Each numeric filter in
+        Each city is <strong>one row</strong>, with a sub-column per provider
+        under every metric, so a city collected by both Google Street View and
+        Mapillary can be read across in one line — and the <strong>Δ</strong>
+        column gives the difference (Mapillary − GSV) directly. Coverage
+        percentages are cross-provider comparable; raw panorama counts are
+        <em>not</em> — GSV samples the nearest pano per grid point while
+        Mapillary is a census of every 360° pano, which is why that group has
+        no Δ. Search, filter and re-sort to narrow the table. Each numeric filter in
         the sidebar carries a small histogram of where the rows actually sit,
         drawn over everything the <em>other</em> controls have selected, so
         brushing one range never redraws its own picture. The address bar

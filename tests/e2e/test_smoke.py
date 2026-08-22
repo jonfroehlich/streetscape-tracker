@@ -43,6 +43,11 @@ FIXTURE_DIR = os.path.join(HERE, "fixture")
 
 # Latest-run csv.gz filenames the fixture emits (see build_fixture.py).
 ALPHA_LATEST = "alpha-city--alphastate--testland_width_100_height_100_step_20_2026-04-15.csv.gz"
+# Alpha City's Mapillary series — the fixture's one two-provider city, which
+# the pivoted grid/streets tables (#250) need in order to render a Δ at all.
+ALPHA_MAPILLARY_LATEST = (
+    "alpha-city--alphastate--testland_width_100_height_100_step_20_mapillary_2026-04-15.csv.gz"
+)
 ZERO_CITY = "zero-city--zerostate--testland_width_100_height_100_step_20_2026-04-15.csv.gz"
 # The published diff detail between Alpha City's two runs (real compute_run_diff
 # output: one pano_added row), fetched by the city page's change overlay.
@@ -218,13 +223,15 @@ def test_provider_toggle_persists_via_query_param(page: Page, base_url):
 
     page.locator('input[name="provider"][value="mapillary"]').check()
     page.wait_for_url("**provider=mapillary**")
-    # Only the single Mapillary city remains after the toggle.
-    expect(page.locator("path.leaflet-interactive")).to_have_count(1)
+    # The two Mapillary cities remain; Zero City (gsv only) drops out. The
+    # provider sets OVERLAP but are not equal, which is what makes the toggle
+    # observable at all — Alpha City is collected by both.
+    expect(page.locator("path.leaflet-interactive")).to_have_count(2)
 
     # The choice survives a reload (persisted in the URL, re-read on load).
     page.reload()
     expect(page.locator('input[name="provider"][value="mapillary"]')).to_be_checked()
-    expect(page.locator("path.leaflet-interactive")).to_have_count(1)
+    expect(page.locator("path.leaflet-interactive")).to_have_count(2)
 
 
 def test_metric_toggle_recolors_and_persists_via_query_param(page: Page, base_url):
@@ -460,37 +467,44 @@ def test_streets_page_lists_published_road_walks(page: Page, base_url):
     streets.html joins the manifest against the aggregate: the manifest has no
     display name and no run filename, so a row can only name Alpha City and
     link to its map if that join worked.
+
+    Since issue #250 a row is a (city, NETWORK) pair with each provider as a
+    sub-column — so the fixture's four walks collapse to two 'drive' rows, and
+    the 'all_public' walk is behind the network selector rather than beside
+    them (a different street-km denominator must never share a column).
     """
     errors = _capture_errors(page)
     page.goto(f"{base_url}/streets.html")
 
     rows = page.locator("#streets-tbody tr")
-    expect(rows).to_have_count(2)  # one GSV walk, one Mapillary walk
+    expect(rows).to_have_count(2)  # Alpha City and Map Ville, on Roads
 
-    # Default sort is best 360° coverage first, so Alpha City (85.1%) leads
-    # Map Ville (0.0% by pano, flat imagery only).
+    # Default sort is best GSV 360° coverage first, so Alpha City (85.1%)
+    # leads Map Ville, which has no GSV walk at all.
     alpha_row = rows.first
     expect(alpha_row).to_contain_text("Alpha City")
-    expect(alpha_row).to_contain_text("Google Street View")
     expect(alpha_row).to_contain_text("85.1%")
     expect(alpha_row).to_contain_text("2026-04-15")
-    expect(rows.nth(1)).to_contain_text("Mapillary")
+
+    # Alpha City is walked by BOTH providers: two populated 360° cells and a
+    # real Δ. Map Ville is Mapillary-only, so its GSV cell reads absent.
+    expect(alpha_row.locator("td.coverage-cell").nth(0)).to_have_text("85.1%")  # GSV
+    expect(alpha_row.locator("td.coverage-cell").nth(1)).to_have_text("0.0%")  # Mapillary
+    expect(alpha_row.locator("td.delta-cell").first).to_have_text("-85.1 pp")
+    expect(rows.nth(1).locator("td.coverage-cell").nth(0)).to_have_text("—")
 
     # The link target comes from the aggregate, not the manifest — plus this
     # row's own network type, so the city page draws the walk the row advertises
-    # rather than defaulting to 'drive' (these fixtures ARE drive walks, hence
-    # the explicit token even though it matches the default).
-    link = alpha_row.locator("a.streets-view-link")
+    # rather than defaulting to 'drive'.
+    link = alpha_row.locator("th a.streets-view-link")
     expect(link).to_have_attribute("href", f"city.html?file={ALPHA_LATEST}&network=drive")
     # The link lives on the row's own name cell now (issue #188 follow-up: the
     # separate "View on map" column was folded in) — a whole trailing column
     # existed only to carry the one link every row already has a natural home
-    # for. There is no longer a dedicated actions/link header, and every row
-    # with a published run links out through its own <th>.
+    # for. There is no longer a dedicated actions/link header.
     expect(link).to_have_text("Alpha City, Alphastate, Testland")
-    expect(page.locator("th[scope='row'] a.streets-view-link")).to_have_count(2)
     expect(page.locator("thead").get_by_text("Link to city map")).to_have_count(0)
-    expect(page.locator("#streets-caption")).to_contain_text("2 published road-walk collections")
+    expect(page.locator("#streets-caption")).to_contain_text("2 cities walked on Roads")
 
     # And it actually lands on the city page with the overlay.
     link.click()
@@ -500,18 +514,85 @@ def test_streets_page_lists_published_road_walks(page: Page, base_url):
     assert errors == []
 
 
-def test_streets_page_separates_360_and_any_imagery_coverage(page: Page, base_url):
-    """The Mapillary fixture walk is flat-imagery-only: 0% by 360° pano, 85.1%
-    counting any imagery. The two columns must show that difference rather
-    than one silently standing in for the other."""
+def test_streets_walked_cell_links_to_that_providers_own_walk(page: Page, base_url):
+    """city.html derives its provider from the run filename, so a per-city row
+    needs a per-provider way in. The filename must come from the provider-keyed
+    aggregate entry, never from the bare-city_id NAME fallback — that fallback
+    exists so a city walked by a provider it has no grid run for still gets a
+    label, and following it would open a different provider's series."""
     errors = _capture_errors(page)
     page.goto(f"{base_url}/streets.html")
 
-    mapillary_row = page.locator("#streets-tbody tr", has_text="Mapillary")
-    cells = mapillary_row.locator("td.coverage-cell")
-    expect(cells).to_have_count(2)
-    expect(cells.nth(0)).to_have_text("0.0%")  # 360° only
-    expect(cells.nth(1)).to_have_text("85.1%")  # including flat imagery
+    alpha = page.locator("#streets-tbody tr", has_text="Alpha City")
+    links = alpha.locator("td a.streets-view-link")
+    expect(links).to_have_count(2)  # one per provider that walked this row
+    expect(links.nth(0)).to_have_attribute(
+        "href", f"city.html?file={ALPHA_LATEST}&network=drive"
+    )
+    expect(links.nth(1)).to_have_attribute(
+        "href", f"city.html?file={ALPHA_MAPILLARY_LATEST}&network=drive"
+    )
+
+    assert errors == []
+
+
+def test_streets_page_separates_360_and_any_imagery_coverage(page: Page, base_url):
+    """Alpha City's Mapillary walk is flat-imagery-only: 0% by 360° pano, 85.1%
+    counting any imagery. Pivoted, that split is now one provider's two cells
+    in two different groups — and the group headers are what keep them from
+    reading as one number."""
+    errors = _capture_errors(page)
+    page.goto(f"{base_url}/streets.html?preset=kilometres")
+
+    alpha = page.locator("#streets-tbody tr", has_text="Alpha City")
+    # Kilometres shows the 360° group only, so switch to the compare preset,
+    # which carries both coverage groups.
+    page.goto(f"{base_url}/streets.html")
+    page.locator(".col-picker summary").click()
+    page.locator('input[data-column="pctAny_mapillary"]').check()
+
+    alpha = page.locator("#streets-tbody tr", has_text="Alpha City")
+    cells = alpha.locator("td.coverage-cell")
+    # GSV 360°, Mapillary 360°, then the Mapillary any-imagery cell just added.
+    expect(cells.nth(1)).to_have_text("0.0%")  # Mapillary, 360° only
+    expect(cells.last).to_have_text("85.1%")  # Mapillary, including flat imagery
+
+    assert errors == []
+
+
+def test_streets_network_selector_switches_series_and_round_trips(page: Page, base_url):
+    """Two networks are two different street-km denominators, so they are rows
+    behind a page-level selector rather than columns. There is deliberately no
+    "all networks" option — that would stack incomparable numbers — which is
+    why the parameter's ABSENCE means 'drive' rather than "no filter"."""
+    errors = _capture_errors(page)
+    page.goto(f"{base_url}/streets.html")
+
+    network = page.locator('select[data-filter="network"]')
+    expect(network).to_have_value("drive")
+    # No blank "any" option: every option is a real network.
+    expect(network.locator("option")).to_have_count(2)
+    expect(page.locator("#streets-caption")).to_contain_text("walked on Roads")
+    # The default is not written into a clean URL.
+    assert "network=" not in page.url
+
+    network.select_option("all_public")
+    rows = page.locator("#streets-tbody tr")
+    expect(rows).to_have_count(1)  # only Alpha City has a broad walk
+    expect(rows.first).to_contain_text("Alpha City")
+    expect(page.locator("#streets-caption")).to_contain_text("1 city walked on Roads + paths")
+    assert "network=all_public" in page.url
+
+    # The broad row's link carries its own network, or the city page would draw
+    # the drive walk instead — a different metric under the same name.
+    expect(rows.first.locator("th a.streets-view-link")).to_have_attribute(
+        "href", f"city.html?file={ALPHA_LATEST}&network=all_public"
+    )
+
+    # A cold reload of that URL reproduces the view rather than snapping back.
+    page.goto(f"{base_url}/streets.html?network=all_public")
+    expect(page.locator('select[data-filter="network"]')).to_have_value("all_public")
+    expect(page.locator("#streets-tbody tr")).to_have_count(1)
 
     assert errors == []
 
@@ -522,23 +603,28 @@ def test_streets_table_sorts_on_header_click(page: Page, base_url):
     rows = page.locator("#streets-tbody tr")
     expect(rows).to_have_count(2)
 
-    # Opens on best-360°-coverage-first.
-    expect(page.locator('th[data-key="pct"]')).to_have_attribute("aria-sort", "descending")
+    # Opens on best-GSV-360°-coverage-first. pctBest has no column of its own,
+    # so sorting by it would order the table by something invisible.
+    expect(page.locator('th[data-key="pct_gsv"]')).to_have_attribute("aria-sort", "descending")
     expect(rows.first).to_contain_text("Alpha City")
 
     # Sorting by city name ascending puts Alpha first, descending flips it.
     page.locator('th[data-key="label"] button').click()
     expect(page.locator('th[data-key="label"]')).to_have_attribute("aria-sort", "ascending")
-    expect(page.locator('th[data-key="pct"]')).to_have_attribute("aria-sort", "none")
+    expect(page.locator('th[data-key="pct_gsv"]')).to_have_attribute("aria-sort", "none")
     expect(rows.first).to_contain_text("Alpha City")
 
     page.locator('th[data-key="label"] button').click()
     expect(page.locator('th[data-key="label"]')).to_have_attribute("aria-sort", "descending")
     expect(rows.first).to_contain_text("Map Ville")
 
-    # Any-imagery column: both rows are 85.1%, so the city_id tiebreak keeps
-    # the order stable rather than shuffling on every click.
-    page.locator('th[data-key="pctAny"] button').click()
+    # A Δ header sorts too — the head-to-head question the pivot exists for.
+    page.locator('th[data-key="deltaPct"] button').click()
+    expect(page.locator('th[data-key="deltaPct"]')).to_have_attribute("aria-sort", "descending")
+    # Map Ville has no GSV walk, so its Δ is absent and sinks in both
+    # directions: a missing comparison is not a small one.
+    expect(rows.first).to_contain_text("Alpha City")
+    page.locator('th[data-key="deltaPct"] button').click()
     expect(rows.first).to_contain_text("Alpha City")
 
     assert errors == []
@@ -611,16 +697,18 @@ def test_city_without_a_walk_falls_back_and_stays_clean(page: Page, base_url):
     assert errors == []
 
 
-def test_grid_page_lists_city_runs(page: Page, base_url):
+def test_grid_page_lists_one_row_per_city(page: Page, base_url):
     """
-    grid.html is the tabular counterpart of the overview map: one row per
-    (city, provider) run series from the aggregate, linking into city.html.
+    grid.html is the tabular counterpart of the overview map. Since issue #250
+    a row is a CITY, with each provider as a sub-column under a grouped header
+    — the pivot that makes "does Mapillary beat GSV here?" readable off one
+    line instead of scattered across two rows a metric sort pulls apart.
     """
     errors = _capture_errors(page)
     page.goto(f"{base_url}/grid.html")
 
     rows = page.locator("#grid-tbody tr")
-    expect(rows).to_have_count(3)  # Alpha (gsv), Zero (gsv), Map Ville (mapillary)
+    expect(rows).to_have_count(3)  # three CITIES, not four (city, provider) series
 
     # Default sort is alphabetical (a browsable index).
     expect(page.locator('th[data-key="label"]')).to_have_attribute("aria-sort", "ascending")
@@ -628,24 +716,97 @@ def test_grid_page_lists_city_runs(page: Page, base_url):
     expect(rows.nth(1)).to_contain_text("Map Ville")
     expect(rows.nth(2)).to_contain_text("Zero City")
 
-    # Rows link to the city page via the latest run filename, from the row's
-    # own name cell — there is no separate "View on map" column (issue #188
-    # follow-up: folded into City, the one place every row already has).
-    expect(rows.first.locator("a.streets-view-link")).to_have_attribute(
+    # The header is two rows now: a colgroup cell per metric over its
+    # per-provider leaves. Only the leaves are sortable.
+    expect(page.locator("#grid-thead tr")).to_have_count(2)
+    group = page.locator("#grid-thead th.th-group", has_text="Grid coverage")
+    expect(group).to_have_count(1)
+    expect(group).to_have_attribute("colspan", "3")  # GSV + Mapillary + Δ
+    assert group.evaluate("el => el.hasAttribute('data-key')") is False
+
+    # Alpha City is the two-provider city: both leaves populated, and a Δ that
+    # is a real signed number rather than an em-dash.
+    alpha = rows.first
+    expect(alpha.locator("td.coverage-cell").nth(0)).to_have_text("75.0%")  # GSV
+    expect(alpha.locator("td.coverage-cell").nth(1)).to_have_text("66.7%")  # Mapillary
+    expect(alpha.locator("td.delta-cell").first).to_have_text("-8.3 pp")
+
+    # Map Ville has no GSV run at all: the union pivot keeps the row, the
+    # missing provider reads as absent, and the Δ has nothing to compare.
+    map_ville = rows.nth(1)
+    expect(map_ville.locator("td.coverage-cell").nth(0)).to_have_text("—")
+    expect(map_ville.locator("td.coverage-cell").nth(1)).to_have_text("66.7%")
+    expect(map_ville.locator("td.delta-cell").first).to_have_text("—")
+
+    # Rows link to the city page via a run filename, from the row's own name
+    # cell — there is no separate "View on map" column (issue #188 follow-up:
+    # folded into City, the one place every row already has).
+    expect(alpha.locator("th a.streets-view-link")).to_have_attribute(
         "href", f"city.html?file={ALPHA_LATEST}"
     )
     expect(page.locator("thead").get_by_text("Link to city map")).to_have_count(0)
-    expect(page.locator("#grid-caption")).to_contain_text("3 city grid-run series")
+    expect(page.locator("#grid-caption")).to_contain_text("3 cities (4 provider series)")
 
-    # A header click re-sorts (grid coverage, best first: the 0-pano city sinks).
-    page.locator('th[data-key="pct"] button').click()
-    expect(page.locator('th[data-key="pct"]')).to_have_attribute("aria-sort", "descending")
-    expect(page.locator("#grid-tbody tr").last).to_contain_text("Zero City")
+    # A grouped LEAF header sorts (GSV grid coverage, best first: the 0-pano
+    # city sinks, and Map Ville sinks below it because it has no GSV value at
+    # all — absent is not small).
+    page.locator('th[data-key="pct_gsv"] button').click()
+    expect(page.locator('th[data-key="pct_gsv"]')).to_have_attribute("aria-sort", "descending")
+    expect(page.locator("#grid-tbody tr").first).to_contain_text("Alpha City")
+    expect(page.locator("#grid-tbody tr").last).to_contain_text("Map Ville")
+
+    # ...and so does a Δ header, which is the whole point of the pivot.
+    page.locator('th[data-key="deltaPct"] button').click()
+    expect(page.locator('th[data-key="deltaPct"]')).to_have_attribute("aria-sort", "descending")
+    expect(page.locator("#grid-tbody tr").first).to_contain_text("Alpha City")
+    assert "sort=deltaPct" in page.url
 
     # And it actually lands on the city page.
-    page.locator("#grid-tbody tr", has_text="Alpha City").locator("a.streets-view-link").click()
+    page.locator("#grid-tbody tr", has_text="Alpha City").locator(
+        "th a.streets-view-link"
+    ).click()
     page.wait_for_url(f"**/city.html?file={ALPHA_LATEST}")
     expect(page.locator("table.legend-stats")).to_be_visible()
+
+    assert errors == []
+
+
+def test_grid_last_collected_links_to_that_providers_own_run(page: Page, base_url):
+    """city.html derives its provider from the run filename, so a per-city row
+    needs a per-provider way in — otherwise the Mapillary series of a city that
+    also has GSV is unreachable from this page."""
+    errors = _capture_errors(page)
+    page.goto(f"{base_url}/grid.html")
+
+    alpha = page.locator("#grid-tbody tr", has_text="Alpha City")
+    links = alpha.locator("td a.streets-view-link")
+    expect(links).to_have_count(2)  # one per provider that collected this city
+    expect(links.nth(0)).to_have_attribute("href", f"city.html?file={ALPHA_LATEST}")
+    expect(links.nth(1)).to_have_attribute("href", f"city.html?file={ALPHA_MAPILLARY_LATEST}")
+
+    links.nth(1).click()
+    page.wait_for_url(f"**/city.html?file={ALPHA_MAPILLARY_LATEST}")
+    expect(page.locator("table.legend-stats")).to_be_visible()
+
+    assert errors == []
+
+
+def test_grid_collected_by_filter_replaces_the_multi_provider_checkbox(page: Page, base_url):
+    """The old "Multiple providers" checkbox existed only to FIND comparable
+    cities, because the un-pivoted layout could not SHOW the comparison. It is
+    now an option on the same select the per-provider values live on, so an old
+    ?provider= link keeps working and "2+ providers" is one click away."""
+    errors = _capture_errors(page)
+    page.goto(f"{base_url}/grid.html?provider=mapillary")
+
+    rows = page.locator("#grid-tbody tr")
+    expect(rows).to_have_count(2)  # Alpha City and Map Ville
+    expect(page.locator('select[data-filter="provider"]')).to_have_value("mapillary")
+
+    page.locator('select[data-filter="provider"]').select_option("multi")
+    expect(rows).to_have_count(1)
+    expect(rows.first).to_contain_text("Alpha City")
+    expect(page.locator("#grid-caption")).to_contain_text("1 of 3 cities (2 provider series)")
 
     assert errors == []
 
@@ -773,15 +934,19 @@ def test_table_search_and_filters_narrow_the_rendered_rows(page: Page, base_url)
     expect(rows.first).to_contain_text("Map Ville")
     expect(page.locator("#streets-caption")).to_contain_text("1 of 2")
 
-    # Clearing restores every row and the unqualified caption.
+    # Clearing restores every row and the unqualified caption — and puts the
+    # network selector back on its DEFAULT rather than blanking it, since a
+    # blank network would stack two street-km denominators in one column.
     page.locator(".controls-clear").click()
     expect(rows).to_have_count(2)
-    expect(page.locator("#streets-caption")).to_contain_text("2 published road-walk collections")
+    expect(page.locator("#streets-caption")).to_contain_text("2 cities walked on Roads")
+    expect(page.locator('select[data-filter="network"]')).to_have_value("drive")
 
-    # A structured filter narrows the same way.
-    page.locator('select[data-filter="provider"]').select_option("mapillary")
+    # A structured filter narrows the same way. Only Alpha City was walked by
+    # Google Street View.
+    page.locator('select[data-filter="provider"]').select_option("gsv")
     expect(rows).to_have_count(1)
-    expect(rows.first).to_contain_text("Mapillary")
+    expect(rows.first).to_contain_text("Alpha City")
 
     assert errors == []
 
@@ -841,10 +1006,11 @@ def test_sorting_survives_a_column_preset_change(page: Page, base_url):
     errors = _capture_errors(page)
     page.goto(f"{base_url}/streets.html")
 
-    # Kilometres keeps the sorted column (pct), so the sort carries across the
-    # re-render rather than being reset by the drop-the-sorted-column fallback.
+    # Kilometres keeps the sorted column (pct_gsv), so the sort carries across
+    # the re-render rather than being reset by the drop-the-sorted-column
+    # fallback.
     page.locator("#table-preset").select_option("kilometres")
-    expect(page.locator('th[data-key="pct"]')).to_have_attribute("aria-sort", "descending")
+    expect(page.locator('th[data-key="pct_gsv"]')).to_have_attribute("aria-sort", "descending")
 
     page.locator('th[data-key="label"] button').click()
     expect(page.locator('th[data-key="label"]')).to_have_attribute("aria-sort", "ascending")
@@ -862,11 +1028,11 @@ def test_dropping_the_sorted_column_falls_back_to_a_visible_one(page: Page, base
     ordered by something the reader can no longer see."""
     errors = _capture_errors(page)
     page.goto(f"{base_url}/streets.html")
-    expect(page.locator('th[data-key="pct"]')).to_have_attribute("aria-sort", "descending")
+    expect(page.locator('th[data-key="pct_gsv"]')).to_have_attribute("aria-sort", "descending")
 
-    # Network drops the coverage column entirely.
+    # Network drops the whole coverage group.
     page.locator("#table-preset").select_option("network")
-    expect(page.locator('th[data-key="pct"]')).to_have_count(0)
+    expect(page.locator('th[data-key="pct_gsv"]')).to_have_count(0)
     expect(page.locator('th[data-key="label"]')).to_have_attribute("aria-sort", "ascending")
 
     assert errors == []
@@ -884,8 +1050,20 @@ def test_column_picker_adds_and_drops_columns(page: Page, base_url):
     # The fixture publishes total_search_points = 4 for Alpha City.
     expect(page.locator("#grid-tbody tr", has_text="Alpha City")).to_contain_text("4")
 
+    # A grouped LEAF is offered under a self-contained name, not the bare
+    # provider label its header shows — "GSV" appears under four different
+    # metrics and would be four identical checkboxes.
+    expect(page.locator(".col-picker")).to_contain_text("Panoramas (per provider — not comparable) — GSV")
+    page.locator('input[data-column="panos_gsv"]').check()
+    expect(page.locator('th[data-key="panos_gsv"]')).to_have_count(1)
+    # Checking ONE leaf of a group still renders the group header over it.
+    expect(page.locator("#grid-thead th.th-group", has_text="Panoramas")).to_have_attribute(
+        "colspan", "1"
+    )
+
     page.locator(".col-reset").click()
     expect(page.locator('th[data-key="searchPoints"]')).to_have_count(0)
+    expect(page.locator('th[data-key="panos_gsv"]')).to_have_count(0)
 
     assert errors == []
 
@@ -907,9 +1085,13 @@ def test_unchecking_every_optional_column_actually_empties_the_table(page: Page,
     for i in range(count):
         boxes.nth(i).uncheck()
 
-    # Only the one always-on column remains: City.
+    # Only the one always-on column remains: City. With no grouped column left
+    # visible, the header collapses back to a SINGLE row — the shape
+    # driving.html renders permanently, reached here from the other direction.
     expect(page.locator("#grid-thead th")).to_have_count(1)
-    expect(page.locator('th[data-key="providerLabel"]')).to_have_count(0)
+    expect(page.locator("#grid-thead tr")).to_have_count(1)
+    expect(page.locator("#grid-thead th.th-group")).to_have_count(0)
+    expect(page.locator('th[data-key="pct_gsv"]')).to_have_count(0)
     for i in range(count):
         expect(boxes.nth(i)).not_to_be_checked()
 
@@ -921,6 +1103,7 @@ def test_unchecking_every_optional_column_actually_empties_the_table(page: Page,
     # rather than snapping back to the preset's columns.
     page.goto(reload_url)
     expect(page.locator("#grid-thead th")).to_have_count(1)
+    expect(page.locator("#grid-thead tr")).to_have_count(1)
     page.locator(".col-picker summary").click()
     for i in range(page.locator("input[data-column]").count()):
         expect(page.locator("input[data-column]").nth(i)).not_to_be_checked()
