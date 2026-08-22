@@ -54,9 +54,14 @@ def dtypes_for_run_path(csv_path: str) -> dict:
 def load_city_csv_file(csv_path: str, dtypes: dict | None = None) -> pd.DataFrame:
     """
     Read a CSV file into a DataFrame, automatically detecting if it's gzipped based on file extension.
-    capture_date must be YYYY-MM-DD (the on-disk schema — standardize_capture_date
-    normalizes month/year-precision dates at download time); any other format
-    parses to NaT.
+    capture_date accepts any ISO 8601 date — day, month or year precision —
+    with reduced precision pinned to the 1st, matching standardize_capture_date;
+    anything else parses to NaT (issue #226). One shape is an exception to
+    "anything else parses to NaT" and raises instead: a timezone-AWARE value
+    beside a naive one in the same column ("Mixed timezones detected", which
+    errors="coerce" does not suppress). Nothing can write that today —
+    standardize_capture_date returns YYYY-MM-DD or None, and both census
+    decoders strftime("%Y-%m-%d") — so it is stated rather than guarded.
 
     Args:
         csv_path: Path to the CSV file (can be either .csv or .csv.gz)
@@ -110,8 +115,36 @@ def load_city_csv_file(csv_path: str, dtypes: dict | None = None) -> pd.DataFram
         # Convert query_timestamp (ISO 8601 with timezone)
         df["query_timestamp"] = pd.to_datetime(df["query_timestamp"], format="ISO8601")
 
-        # Convert capture_date (YYYY-MM-DD)
-        df["capture_date"] = pd.to_datetime(df["capture_date"], format="%Y-%m-%d", errors="coerce")
+        # Convert capture_date. This is the upstream gate every date-derived
+        # statistic sits behind — analysis.dated_unique_panos, the per-run JSON's
+        # age blocks and histograms, diff.py's capture-date comparison — so its
+        # parse has to be at least as permissive as what is actually on disk.
+        # A strict "%Y-%m-%d" was not: the legacy pre-2026 downloader wrote
+        # MONTH-precision dates and those run files are never rewritten, so
+        # every date in them coerced to NaT while the pano counts stayed
+        # perfect, leaving catalog rows that looked fully populated and
+        # internally consistent with NULL oldest/newest/median (issue #226).
+        #
+        # The format is PINNED rather than inferred, and that is the load-bearing
+        # part: a format-free to_datetime(errors="coerce") reads ONE format off
+        # the first non-null value and silently NaTs everything at another
+        # precision, so a file mixing 2022-09 and 2022-09-15 loses one of the two
+        # populations depending on which happens to come first. "ISO8601" accepts
+        # every generation at once and pins reduced precision to the 1st, the
+        # same convention standardize_capture_date applies at download time (and
+        # download_kartaview pins the same way, for the same reason).
+        #
+        # errors="coerce" is what keeps ONE malformed row from taking out a whole
+        # immutable dated snapshot, and it covers every shape a provider has ever
+        # written -- but state its one hole rather than implying it has none: a
+        # timezone-aware value beside a naive one raises "Mixed timezones
+        # detected" THROUGH errors="coerce" (measured on pandas 3.0). The old
+        # "%Y-%m-%d" coerced such a value to NaT instead, so this is a real if
+        # unreachable narrowing: no writer in the repo can emit an offset here.
+        # Left unguarded deliberately -- utc=True would silently SHIFT the naive
+        # values rather than preserve them, which is a worse answer than a loud
+        # failure on a file that cannot currently exist.
+        df["capture_date"] = pd.to_datetime(df["capture_date"], format="ISO8601", errors="coerce")
 
         logger.debug(f"Loaded {len(df)} rows from {csv_path}")
         logger.debug(f"The DataFrame has columns: {df.columns} with dtypes: {df.dtypes}")

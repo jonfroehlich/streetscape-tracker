@@ -704,6 +704,80 @@ test("panoDateOrNull: valid ISO date parses to a Date", () => {
   assert.equal(d.getUTCFullYear(), 2020);
 });
 
+test("panoDateOrNull: month- and year-precision dates parse at LOCAL midnight", () => {
+  // city.js streams the run CSV itself, and the legacy pre-2026 runs carry
+  // MONTH precision and are never rewritten (issue #226), so these shapes
+  // reach this function verbatim. Matching only YYYY-MM-DD sent them through
+  // `new Date("2022-09")` — a UTC parse — which west of UTC read back as
+  // August, and turned "2022-01" into 2021: the wrong color bucket, the wrong
+  // year filter and the wrong bar in the temporal histogram.
+  //
+  // Asserted on the LOCAL getters, never toISOString(): a UTC-built date and a
+  // local-built one agree on the ISO string in exactly the timezone that hides
+  // the bug, so an ISO comparison passes everywhere and protects nowhere.
+  const sept = panoDateOrNull("2022-09");
+  assert.equal(sept.getFullYear(), 2022);
+  assert.equal(sept.getMonth(), 8);   // September, not August
+  assert.equal(sept.getDate(), 1);    // pinned to the 1st, as Python pins it
+
+  const jan = panoDateOrNull("2022-01");
+  assert.equal(jan.getFullYear(), 2022); // not 2021
+  assert.equal(jan.getMonth(), 0);
+
+  const year = panoDateOrNull("2019");
+  assert.equal(year.getFullYear(), 2019);
+  assert.equal(year.getMonth(), 0);
+  assert.equal(year.getDate(), 1);
+
+  // Day precision is unchanged, and still local rather than UTC
+  const day = panoDateOrNull("2020-06-15");
+  assert.equal(day.getFullYear(), 2020);
+  assert.equal(day.getMonth(), 5);
+  assert.equal(day.getDate(), 15);
+});
+
+test("panoDateOrNull: widening the shapes did not start accepting non-dates", () => {
+  // The regex is anchored, so anything that is not one of the three ISO date
+  // shapes still falls through to `new Date` exactly as before. Unreadable
+  // values yield an Invalid Date, which isPlausibleCaptureDate rejects —
+  // widening the fast path must not turn one into a plausible-looking date.
+  //
+  // Only genuinely unparseable values are listed. V8's non-ISO fallback is
+  // very lenient ("2022-", "2022/09" and "2022-9" all parse, at LOCAL midnight),
+  // and that is untouched by this change: those shapes missed the old regex too
+  // and reached the same `new Date`. Pinning them here would test V8, not us.
+  for (const bad of ["nonsense", "not-a-date", "20226"]) {
+    assert.equal(isPlausibleCaptureDate(panoDateOrNull(bad), "gsv"), false, bad);
+  }
+  // A full timestamp keeps parsing natively (it carries its own offset).
+  const ts = panoDateOrNull("2022-09-15T12:00:00Z");
+  assert.ok(!Number.isNaN(ts.getTime()));
+});
+
+test("panoDateOrNull: out-of-range months and days do not roll over into plausible dates", () => {
+  // The failure this pins is specific and is the widening's own: `new Date(y,
+  // m, d)` ROLLS OVER, so an unbounded month group turns "2022-13" into Jan
+  // 2023 and "2022-00" into Dec 2021 — dates isPlausibleCaptureDate ACCEPTS.
+  // A corrupt field would then be drawn on the map and counted in a year
+  // bucket, while Python's ISO8601 parse coerces the same value to NaT. A
+  // plausible wrong date is worse than an honest null, so the two readers have
+  // to agree that these are not dates.
+  //
+  // "2022-09-32" is the same hole one field over and PREDATES the widening: it
+  // matched the old `\d{2}` day group and rolled to Oct 2.
+  //
+  // Asserted through isPlausibleCaptureDate rather than on getMonth(), because
+  // what matters is the verdict the map acts on, not which wrong date was
+  // produced.
+  for (const bad of ["2022-13", "2022-00", "2022-09-32", "2022-09-00"]) {
+    assert.equal(isPlausibleCaptureDate(panoDateOrNull(bad), "gsv"), false, bad);
+  }
+  // ...while every in-range spelling still parses on the fast path.
+  assert.equal(panoDateOrNull("2022-12").getMonth(), 11);
+  assert.equal(panoDateOrNull("2022-01-31").getDate(), 31);
+  assert.equal(panoDateOrNull("2022-10-01").getMonth(), 9);
+});
+
 // --- getColor: YlOrRd age color scale boundaries ----------------------------
 //
 // The scale's documented stops: age 0 → rgb(255, 255, 178) (light yellow),

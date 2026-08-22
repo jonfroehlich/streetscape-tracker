@@ -15,6 +15,7 @@ import sys
 from datetime import date
 
 import pandas as pd
+import pytest
 
 from streetscape_metadata_tracker import db
 from streetscape_metadata_tracker.analysis import calculate_run_stats
@@ -245,7 +246,12 @@ def test_regenerated_json_keeps_the_change_block(conn, data_dir):
 
     result = _run_script(data_dir, "--execute", "--regenerate-json")
     assert result.returncode == 0, result.stderr
-    assert "Rebuilt 1 of 1" in result.stdout
+    # BOTH runs are rebuilt, not only the one holding the corrupt date: their
+    # catalog rows were registered with no stats at all, so issue #226's second
+    # trigger — this pass MOVES the capture-date columns — fires for each. The
+    # property under test is the change block surviving a rebuild, which the
+    # later run still exercises.
+    assert "Rebuilt 2 of 2" in result.stdout
 
     json_path = os.path.join(data_dir, f"{stem}_2026-04-15.json.gz")
     with gzip.open(json_path, "rt", encoding="utf-8") as fh:
@@ -358,3 +364,159 @@ def test_recompute_skips_runs_with_missing_csv(conn, data_dir):
     # The stored values survive untouched
     row = conn.execute("SELECT unique_panos FROM runs WHERE city_id = ?", (cid,)).fetchone()
     assert row["unique_panos"] == 7
+
+
+def test_moved_capture_dates_rebuild_the_json_without_an_impossible_date(conn, data_dir):
+    """Issue #226's repair: a run whose date columns MOVE gets its JSON rebuilt.
+
+    The legacy pre-2026 runs carry month-precision capture dates, which the
+    loader used to coerce to NaT — so their catalog columns AND their published
+    per-run JSON were both computed with no dates at all, while every pano count
+    came out perfect.
+
+    What this pins is that the JSON rebuild does not depend on the run ALSO
+    holding an impossible date. #213's trigger fires only on that, and whether
+    an affected run happens to carry one is luck: measured across the 8 affected
+    runs in one catalog, Lagos, Nakuru and La Piedad carry none. This fixture is
+    that shape — every date plausible — and it must still be rebuilt, because
+    the site's age display reads the per-run JSON rather than `runs`
+    (json_summarizer._build_provider_summary takes all_panos_age_stats and the
+    capture-year histogram straight from it).
+    """
+    run_date = date(2026, 4, 15)
+    cid = db.register_city(
+        conn,
+        city_name="Bend",
+        state_name="Oregon",
+        state_code="OR",
+        country_name="United States",
+        country_code="US",
+        center_lat=44.0,
+        center_lon=-121.0,
+        grid_width_m=1000,
+        grid_height_m=1000,
+        step_m=20,
+    )
+    # Month precision, and every date comfortably inside the plausible window
+    df = make_city_df([("p1", "2022-09"), ("p2", "2024-03")], run_date=run_date, n_empty=1)
+    csv_name = "bend--oregon--united-states_width_1000_height_1000_step_20_2026-04-15.csv.gz"
+    csv_path = os.path.join(data_dir, csv_name)
+    write_city_csv_gz(df, csv_path)
+    # The catalog as the broken loader left it: counts right, dates absent
+    db.register_run(
+        conn,
+        city_id=cid,
+        run_date=run_date,
+        csv_filename=csv_name,
+        unique_panos=2,
+        unique_google_panos=2,
+        oldest_capture_date=None,
+        newest_capture_date=None,
+        median_pano_age_years=None,
+    )
+    json_path = csv_path.replace(".csv.gz", ".json.gz")
+
+    result = _run_script(data_dir, "--execute", "--regenerate-json")
+    assert result.returncode == 0, result.stderr
+    # Reported as a moved date, NOT as an impossible one — the two reasons are
+    # counted separately so this cannot pass for the wrong reason.
+    assert "0 hold an impossible capture date" in result.stdout
+    assert "1 have capture-date columns this pass moves" in result.stdout
+    assert "Rebuilt 1 of 1" in result.stdout
+
+    row = conn.execute(
+        "SELECT oldest_capture_date, newest_capture_date, median_pano_age_years "
+        "FROM runs WHERE city_id = ?",
+        (cid,),
+    ).fetchone()
+    assert row["oldest_capture_date"] == "2022-09-01T00:00:00"  # pinned to the 1st
+    assert row["newest_capture_date"] == "2024-03-01T00:00:00"
+    assert row["median_pano_age_years"] is not None
+
+    with gzip.open(json_path, "rt", encoding="utf-8") as fh:
+        published = json.load(fh)
+    ages = published["all_panos"]["age_stats"]
+    assert ages["oldest_pano_date"] == "2022-09-01T00:00:00"
+    assert ages["newest_pano_date"] == "2024-03-01T00:00:00"
+    assert ages["median_pano_age_years"] is not None
+    assert published["all_panos"]["histogram_of_capture_dates_by_year"]["counts"] == {
+        "2022": 1,
+        "2024": 1,
+    }
+
+
+@pytest.mark.parametrize(
+    "column, wrong_value, rebuilt",
+    [
+        ("oldest_capture_date", "2021-01-01T00:00:00", True),
+        ("newest_capture_date", "2025-12-01T00:00:00", True),
+        ("median_pano_age_years", 99.0, True),
+        # Control: a NON-date column moving must NOT drag the JSON along. The
+        # per-run JSON's age blocks are what trigger (2) exists to repair, and
+        # #213's narrowing moves a pano/coverage stat for nearly every gsv run
+        # — so a trigger that fired on any change at all would rebuild the
+        # whole series every pass, for runs whose published dates are fine.
+        ("unique_panos", 999, False),
+    ],
+)
+def test_each_date_column_independently_triggers_the_json_rebuild(
+    conn, data_dir, column, wrong_value, rebuilt
+):
+    """One stale column at a time — the case a realistic fixture cannot produce.
+
+    scripts/recompute_run_stats.DATE_COLUMNS names three columns and the
+    trigger is `any(c in changed for c in DATE_COLUMNS)`, so a misspelled or
+    dropped entry is not an error: it is a condition that can never be true,
+    and the rebuild silently stops happening for that column forever. Every
+    natural fixture hides that, because oldest, newest and median are a min, a
+    max and a median of ONE population and move together — so this test builds
+    the unnatural case directly, registering a catalog row that is correct in
+    every column but one.
+
+    The module also refuses to import if DATE_COLUMNS drifts out of
+    STAT_COLUMNS; the two guards catch different mistakes (a name that is not a
+    stat column at all, versus a stat column quietly dropped from the trigger).
+    """
+    run_date = date(2026, 4, 15)
+    cid = db.register_city(
+        conn,
+        city_name="Bend",
+        state_name="Oregon",
+        state_code="OR",
+        country_name="United States",
+        country_code="US",
+        center_lat=44.0,
+        center_lon=-121.0,
+        grid_width_m=1000,
+        grid_height_m=1000,
+        step_m=20,
+    )
+    # Every date plausible, so trigger (1) — "the CSV holds an impossible
+    # capture date" — stays silent and cannot mask the column under test.
+    df = make_city_df([("p1", "2020-06-15"), ("p2", "2024-01-10")], run_date=run_date, n_empty=1)
+    csv_name = "bend--oregon--united-states_width_1000_height_1000_step_20_2026-04-15.csv.gz"
+    csv_path = os.path.join(data_dir, csv_name)
+    write_city_csv_gz(df, csv_path)
+
+    # Register the run with the CORRECT stats, then spoil exactly one column.
+    truth = calculate_run_stats(load_city_csv_file(csv_path), run_date, provider="gsv")
+    stored = {**truth, column: wrong_value}
+    db.register_run(conn, city_id=cid, run_date=run_date, csv_filename=csv_name, **stored)
+
+    result = _run_script(data_dir, "--execute", "--regenerate-json")
+    assert result.returncode == 0, result.stderr
+    if rebuilt:
+        # Reported as a MOVED date, never as an impossible one: the two reasons
+        # are counted separately precisely so this cannot pass for the wrong
+        # one, and this fixture's dates are all plausible.
+        assert "0 hold an impossible capture date" in result.stdout
+        assert "1 have capture-date columns this pass moves" in result.stdout
+        assert "Rebuilt 1 of 1" in result.stdout
+        assert os.path.exists(csv_path.replace(".csv.gz", ".json.gz"))
+    else:
+        assert "Rebuilt 0 of 0" in result.stdout
+        assert not os.path.exists(csv_path.replace(".csv.gz", ".json.gz"))
+    # Either way the catalog itself is repaired — the trigger governs the
+    # PUBLISHED file, never whether the stats pass does its job.
+    row = conn.execute("SELECT * FROM runs WHERE city_id = ?", (cid,)).fetchone()
+    assert row[column] == truth[column]
