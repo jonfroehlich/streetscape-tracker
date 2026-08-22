@@ -55,6 +55,7 @@ from .city_registration import (
 from .download_common import (
     HOST_BY_BUSY_EXIT_CODE,
     HOST_BY_EXIT_CODE,
+    HOST_KARTAVIEW,
     HOST_LABELS,
     HOST_MAPILLARY_TILES,
     HOST_OVERPASS,
@@ -107,6 +108,39 @@ CHANNEL_HOSTS: dict[str, tuple[str, ...]] = {
     "gsv_streets": (HOST_OVERPASS,),
     "mapillary": (HOST_MAPILLARY_TILES,),
     "mapillary_streets": (HOST_OVERPASS, HOST_MAPILLARY_TILES),
+    # Declared even though no kartaview channel can be configured yet (see
+    # UNWIRED_CHANNELS): test_every_scheduled_channel_declares_its_per_ip_hosts
+    # asserts set EQUALITY against KNOWN_PROVIDERS, so the token landing without
+    # this entry is a red test rather than a channel that silently fails open.
+    "kartaview": (HOST_KARTAVIEW,),
+}
+
+# Channels that KNOWN_PROVIDERS makes configurable but that the scheduler cannot
+# yet run correctly, refused by load_scheduler_config rather than accepted.
+#
+# The failure this prevents is silent in all three of its parts. #225 phase 3b
+# put "kartaview" in naming.KNOWN_PROVIDERS so the CLI could collect a city by
+# hand, and the config loader gates on that same tuple -- so [providers.kartaview]
+# started PARSING while three arms here stayed fail-open:
+#   * city_timeout_seconds' allow-list returns the flat city_timeout_minutes
+#     floor for an unlisted channel. At the sweep's 16 req/min that SIGKILLs
+#     Singapore (~9,974 requests, ~10.4 h) at 180 minutes, and a killed child
+#     records NO api_usage, so its whole spend vanishes from the daily ledger.
+#   * estimate_requests falls through to the GSV GRID formula -- thousands of
+#     "requests" for a bbox the sweep covers in a handful of circles -- so the
+#     budget guard is wrong in both directions.
+#   * enabled_providers' rank.get(p, 99) orders it by accident, not decision.
+# None of those raises; the channel would just run wrong, nightly. Issue #238
+# is the timeout arm and the per-(city, provider) scoping issue is the other
+# half -- dueness reads cities.enabled alone, so a kartaview channel would put
+# all 1,144 enabled cities in its queue at ~186,000 requests per pass.
+UNWIRED_CHANNELS: dict[str, str] = {
+    "kartaview": (
+        "collectable by hand via `streetscape_tracker.py --provider kartaview`, "
+        "but it has no scheduler timeout arm (#238), no request estimator, and "
+        "no per-(city, provider) scoping, so a nightly channel would run on a "
+        "flat timeout against a budget computed with the GSV grid formula"
+    ),
 }
 
 
@@ -296,6 +330,18 @@ def load_scheduler_config(path: str | None = None) -> SchedulerConfig:
                     f"{', '.join(sorted(STREET_CHANNELS))})"
                 )
                 continue
+            # A channel the naming contract knows but the scheduler cannot yet
+            # run. RAISED, not warned-and-skipped like the branch above: an
+            # unknown name is a typo and dropping it is the kind thing to do,
+            # whereas this one is spelled correctly, would be accepted by every
+            # check after this point, and would then collect wrongly every
+            # night. Refusing at load time makes it impossible to switch on by
+            # accident, and the message says what is missing.
+            if name in UNWIRED_CHANNELS:
+                raise ValueError(
+                    f"[providers.{name}] in {config_path} is not a runnable scheduler "
+                    f"channel yet: {UNWIRED_CHANNELS[name]}. Remove the block."
+                )
             # An unknown network_type reaches `collect --network-type` as an
             # argparse choices violation, i.e. exit 2 on EVERY street run of
             # EVERY due city, night after night, with nothing in the scheduler's

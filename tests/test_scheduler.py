@@ -1509,6 +1509,60 @@ def test_unknown_provider_still_warned_and_dropped(tmp_path):
     assert "bogus" not in cfg.providers
 
 
+def test_a_known_but_unwired_channel_is_refused_rather_than_dropped(tmp_path):
+    """
+    RAISED, not warned-and-skipped like the unknown name above, and the
+    asymmetry is the point.
+
+    #225 phase 3b put "kartaview" in KNOWN_PROVIDERS so the CLI could collect a
+    city by hand, and this loader gates on that same tuple -- so
+    [providers.kartaview] started PARSING while city_timeout_seconds,
+    estimate_requests and enabled_providers' rank all stayed fail-open for it.
+    A misspelled channel is a typo and dropping it is kind; this one is spelled
+    correctly and would be accepted by every check after this point, then
+    collect wrongly every night on a flat timeout against a budget computed
+    with the GSV grid formula. Nothing downstream raises, so this must.
+    """
+    from streetscape_metadata_tracker.scheduler import UNWIRED_CHANNELS
+
+    assert "kartaview" in UNWIRED_CHANNELS
+    cfg_path = tmp_path / "s.toml"
+    cfg_path.write_text(
+        "[providers.gsv]\nenabled = true\n\n[providers.kartaview]\nenabled = true\n"
+    )
+    with pytest.raises(ValueError, match="kartaview"):
+        load_scheduler_config(str(cfg_path))
+
+
+def test_disabling_an_unwired_channel_does_not_make_it_acceptable(tmp_path):
+    """
+    `enabled = false` is not a way to keep the block around "for later".
+
+    The refusal is about the block EXISTING, because the next person to flip
+    that flag gets a channel the scheduler cannot run and no error saying so.
+    """
+    cfg_path = tmp_path / "s.toml"
+    cfg_path.write_text("[providers.kartaview]\nenabled = false\n")
+    with pytest.raises(ValueError, match="kartaview"):
+        load_scheduler_config(str(cfg_path))
+
+
+def test_every_unwired_channel_is_a_real_provider_token(tmp_path):
+    """
+    A guard keyed on a name nothing can configure is a guard that never fires.
+
+    If a token is removed from KNOWN_PROVIDERS (or misspelled here), the branch
+    above becomes unreachable and the config it was written to refuse starts
+    being silently dropped by the unknown-provider branch instead -- which reads
+    as working, because the channel still does not run.
+    """
+    from streetscape_metadata_tracker.naming import KNOWN_PROVIDERS
+    from streetscape_metadata_tracker.scheduler import STREET_CHANNELS, UNWIRED_CHANNELS
+
+    unreachable = sorted(set(UNWIRED_CHANNELS) - set(KNOWN_PROVIDERS) - set(STREET_CHANNELS))
+    assert unreachable == [], f"UNWIRED_CHANNELS names nothing configurable: {unreachable}"
+
+
 def test_street_estimate_prefers_a_prior_walk_and_rescales_for_spacing(conn):
     from streetscape_metadata_tracker.scheduler import estimate_street_samples
 

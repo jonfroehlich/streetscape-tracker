@@ -239,20 +239,24 @@ test("providerToggleHtml: one radio per registered provider, exactly one checked
   assert.match(html, /value="gsv" checked/);
 });
 
-test("providerToggleHtml: a third provider is checkable — the defect a hardcoded pair had", () => {
+test("providerToggleHtml: an unregistered provider is checkable — the defect a hardcoded pair had", () => {
   // With two hardcoded radios, ?provider=thirdparty (isKnownProvider says yes,
   // so currentProvider becomes it) left the group with NOTHING checked: a
   // keyboard user tabbing in lands on the first option and their first
   // arrow-press silently switches provider.
   const registry = {
     ...PROVIDERS,
-    thirdparty: { label: "Third Party", description: "A third census provider" },
+    thirdparty: { label: "Third Party", description: "A further census provider" },
   };
   const html = providerToggleHtml(registry, "thirdparty");
-  assert.equal((html.match(/<input /g) || []).length, 3);
+  // Counted off the registry, not a literal: this test is about the LAST
+  // provider being checkable, so pinning the number would just have to be
+  // bumped by hand every time a real one is registered (as it was when
+  // kartaview landed and the "third provider" here became the fourth).
+  assert.equal((html.match(/<input /g) || []).length, Object.keys(registry).length);
   assert.equal((html.match(/ checked/g) || []).length, 1);
   assert.match(html, /value="thirdparty" checked/);
-  assert.match(html, /title="A third census provider"/);
+  assert.match(html, /title="A further census provider"/);
 });
 
 test("providerToggleHtml: labels and descriptions are escaped, and an absent description emits no title", () => {

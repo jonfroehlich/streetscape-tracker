@@ -1279,22 +1279,30 @@ function updateChartColorsForDate(chart, date) {
  * @param {string} photographer - e.g. "Google" or a Mapillary contributor.
  * @returns {string} HTML string.
  */
-function buildPopupHtml(captureDate, ageFormatted, panoId, photographer) {
+function buildPopupHtml(captureDate, ageFormatted, panoId, photographer, row) {
   const provider = PROVIDERS[providerGlobal];
   // photographer is third-party content (Mapillary contributor names,
   // archival GSV credits) and pano_id comes straight from the CSV — both
   // must be escaped before entering popup HTML.
+  //
+  // The whole row goes to viewerUrl because KartaView addresses its viewer by
+  // (sequence_id, sequence_index) rather than by image id; a null back means
+  // this row is not addressable and the link is omitted (cf. the FLAT_ONLY
+  // popup, which already makes that call for a missing image id).
+  const viewerUrl = provider.viewerUrl(panoId, row);
   return `
     <div style="font-family:sans-serif">
       <strong>Capture Date:</strong> ${captureDate.toLocaleDateString()}<br>
       <strong>Age:</strong> ${ageFormatted}<br>
       <strong>Photographer:</strong> ${escapeHtml(photographer)}<br>
       <strong>Pano ID:</strong> ${escapeHtml(panoId)}<br><br>
-      <a href="${provider.viewerUrl(panoId)}"
+      ${viewerUrl
+        ? `<a href="${viewerUrl}"
          target="_blank" rel="noopener"
          style="color:#2196F3;text-decoration:none">
          ${provider.viewerLabel}
-      </a>
+      </a>`
+        : ""}
     </div>
   `;
 }
@@ -1312,26 +1320,31 @@ function buildPopupHtml(captureDate, ageFormatted, panoId, photographer) {
  * Falls back to the bare explanation when the row carries no image id (every
  * FLAT_ONLY row written to date does, but a link to nowhere is worse than none).
  *
- * @param {string} panoId - Mapillary image id, possibly empty.
- * @param {string} photographer - Mapillary contributor credit, possibly empty.
+ * @param {string} panoId - flat image id, possibly empty.
+ * @param {string} photographer - contributor credit, possibly empty.
+ * @param {Object} [row] - the CSV row, for providers whose viewer is not
+ *   addressed by image id (KartaView keys on sequence_id/sequence_index).
  * @returns {string} HTML string.
  */
-function buildFlatOnlyPopupHtml(panoId, photographer) {
+function buildFlatOnlyPopupHtml(panoId, photographer, row) {
   const provider = PROVIDERS[providerGlobal];
   const note = "Flat imagery only — no 360° panorama here";
   if (!panoId) return `<div style="font-family:sans-serif">${note}</div>`;
   // photographer and panoId are third-party content straight from the CSV —
   // both must be escaped before entering popup HTML (cf. buildPopupHtml).
+  const viewerUrl = provider.viewerUrl(panoId, row);
   return `
     <div style="font-family:sans-serif">
       ${note}<br><br>
       ${photographer ? `<strong>Photographer:</strong> ${escapeHtml(photographer)}<br>` : ""}
       <strong>Image ID:</strong> ${escapeHtml(panoId)}<br><br>
-      <a href="${provider.viewerUrl(panoId)}"
+      ${viewerUrl
+        ? `<a href="${viewerUrl}"
          target="_blank" rel="noopener"
          style="color:#2196F3;text-decoration:none">
          ${provider.viewerLabel}
-      </a>
+      </a>`
+        : ""}
     </div>
   `;
 }
@@ -1575,7 +1588,7 @@ async function loadData() {
             fillOpacity: 0.55,
           });
           flatMarker.bindPopup(
-            buildFlatOnlyPopupHtml(row.pano_id, row.copyright_info));
+            buildFlatOnlyPopupHtml(row.pano_id, row.copyright_info, row));
           flatOnlyMarkers.push(flatMarker);
           if (showFlatOnly) flatMarker.addTo(map);
           continue;
@@ -1651,7 +1664,7 @@ async function loadData() {
             ? (row.copyright_info || "Unknown")
             : isGoogle ? "Google" : (row.copyright_info || "Contributor");
         marker.bindPopup(buildPopupHtml(captureDate, ageFormatted, row.pano_id,
-                                        photographer));
+                                        photographer, row));
 
         if (!markersByYear[year]) markersByYear[year] = [];
         markersByYear[year].push(marker);

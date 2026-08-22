@@ -97,6 +97,7 @@ from streetscape_metadata_tracker.json_summarizer import (  # noqa: E402
     generate_driving_plan_summary,
     regenerate_run_json,
 )
+from streetscape_metadata_tracker.naming import KNOWN_PROVIDERS  # noqa: E402
 from streetscape_metadata_tracker.paths import get_default_data_dir  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -210,9 +211,13 @@ def main() -> int:
     )
     parser.add_argument(
         "--provider",
-        choices=("gsv", "mapillary"),
+        # From the naming contract rather than a literal: this script re-derives
+        # stats for whatever run files exist, so a provider that can WRITE one
+        # can always be asked about here, and a hardcoded pair silently omits
+        # the newest provider from every repair.
+        choices=KNOWN_PROVIDERS,
         help="Restrict to one provider's runs. Worth using for a gsv-only "
-        "repair: a Mapillary census CSV is millions of rows (issue #157), so "
+        "repair: a census CSV is millions of rows (issue #157), so "
         "loading them all costs hours and gigabytes for no change.",
     )
     parser.add_argument(

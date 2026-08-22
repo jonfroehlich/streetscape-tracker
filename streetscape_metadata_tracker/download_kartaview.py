@@ -126,6 +126,7 @@ from .download_common import (
     redact_credentials,
 )
 from .host_lock import host_lock
+from .paths import get_project_root
 from .progress import progress
 
 logger = logging.getLogger(__name__)
@@ -755,6 +756,26 @@ def _kartaview_image_columns(picked: pd.DataFrame) -> dict[str, Any]:
     }
 
 
+def _kartaview_capture_dates(census_frame: pd.DataFrame, positions: np.ndarray) -> np.ndarray:
+    """
+    Capture dates for the census rows at ``positions``, per KartaView's rules.
+
+    Handed to :func:`census_core.write_census_grid_run`. Takes positions rather
+    than a taken sub-frame so this indexes the TWO columns it needs -- a full
+    ``.take()`` here would materialize every column of a multi-million-row
+    census a second time (issue #157).
+
+    Two columns rather than Mapillary's one because the rule needs both: a
+    ``shot_date`` at or after its ``date_added`` is the upload timestamp being
+    served as a capture date, and :func:`shot_dates_to_iso_dates` rejects it.
+    They are never merged into a fallback -- see :func:`shot_date_to_iso_date`.
+    """
+    return shot_dates_to_iso_dates(
+        census_frame["shot_date"].to_numpy()[positions],
+        census_frame["date_added"].to_numpy()[positions],
+    ).to_numpy()
+
+
 def build_image_rows(
     census_frame: pd.DataFrame,
     image_positions: np.ndarray,
@@ -795,6 +816,41 @@ def build_empty_rows(query_lat, query_lon, query_timestamp: str, status) -> pd.D
     return census_core.build_empty_rows(
         query_lat, query_lon, query_timestamp, status, dtypes=KARTAVIEW_METADATA_DTYPES
     )
+
+
+# ── Grid assignment ────────────────────────────────────────────────────────
+
+
+def _points_in_cells(lats: np.ndarray, lons: np.ndarray, cells: list[Cell]) -> np.ndarray:
+    """
+    Boolean mask of which (lat, lon) points fall inside any of ``cells``.
+
+    Used to attribute unmeasured cells back to the grid points they cover, so
+    those points become REQUEST_FAILED rather than ZERO_RESULTS -- the same job
+    ``download_mapillary._points_in_tiles`` does for undownloaded tiles (#168).
+    Erring toward "unknown" is the point: recording an unswept point as empty
+    publishes an absence we never observed into an immutable dated snapshot.
+
+    Tested against each cell's own SQUARE, not its circumscribed circle. The
+    circle is what the request covered and is 1.57x the area, so masking with it
+    would mark points in neighbouring cells -- which were measured, by their own
+    request -- as unknown. The square is the cell's share of the lattice.
+
+    Deliberately a loop over cells rather than one packed lookup: subdivision
+    means cells are NOT one size (that is the whole difference from the tile
+    case), and the list is bounded by MAX_FAILED_AREA_FRACTION anyway.
+    """
+    if len(lats) == 0:
+        return np.zeros(0, dtype=bool)
+    mask = np.zeros(len(lats), dtype=bool)
+    for cell in cells:
+        half_lat = (cell.size_m / 2.0) / _METERS_PER_DEG_LAT
+        half_lon = (cell.size_m / 2.0) / (_METERS_PER_DEG_LAT * math.cos(math.radians(cell.lat)))
+        # Wrapped difference, so a cell beside the antimeridian compares against
+        # points on the other side of it rather than against a ~360 deg gap.
+        d_lon = ((lons - cell.lon + 180.0) % 360.0) - 180.0
+        mask |= (np.abs(lats - cell.lat) <= half_lat) & (np.abs(d_lon) <= half_lon)
+    return mask
 
 
 # ── The request, and what its failures mean ────────────────────────────────
@@ -1314,6 +1370,62 @@ def _bbox_area_m2(bbox: tuple[float, float, float, float]) -> float:
 # `load_checkpoint` says so at WARNING, and the tell is `api_requests == 0`.
 
 
+CHECKPOINT_DIR_ENV = "STREETSCAPE_CHECKPOINT_DIR"
+
+
+def checkpoint_dir() -> str:
+    """
+    Directory holding in-flight sweep checkpoints.
+
+    The same three constraints as ``host_lock.lock_dir``, for the same host and
+    for reasons that rhyme: **not** ``/tmp`` (the systemd unit sets
+    ``PrivateTmp=true``, so a resumed sweep would never find the night's work),
+    **not** the unresolved checkout path (``%h/streetscape-tracker`` is a
+    symlink and ``get_project_root()`` uses ``abspath``, which does not resolve
+    it, so two spellings of one directory would silently be two checkpoints --
+    i.e. exactly the restart-from-zero this exists to prevent), and **not** under
+    ``data/``, which ``sync_data_to_server.sh`` rsyncs to a public web server. A
+    partial census is the one artifact that must never reach the publisher.
+
+    The env override is realpath'd for the same reason the default is: an
+    operator exporting the ``~`` spelling of the deployed path would otherwise
+    derive a different directory and resume nothing.
+    """
+    override = os.environ.get(CHECKPOINT_DIR_ENV)
+    if override:
+        return os.path.realpath(override)
+    return os.path.join(os.path.realpath(get_project_root()), "checkpoints")
+
+
+def checkpoint_path_for(city_id: str, bbox: tuple[float, float, float, float], channel: str) -> str:
+    """
+    Checkpoint directory for one (city, grid geometry, channel).
+
+    DATE-FREE by construction, which is the contract: a sweep is meant to span
+    nights and a run is dated on the day it COMPLETES, so a date in this path
+    would make every night start from zero.
+
+    The CHANNEL is not optional. A KartaView road walk will sweep the same
+    frozen bbox at the same ipp and radius, so every validation in
+    :func:`load_checkpoint` would pass and the two channels would resume each
+    other's sweeps -- with different credentials and different ledgers.
+
+    The bbox is folded in rather than trusted to the city_id because the frozen
+    grid can be re-registered (``scripts/resize_city.py``, ``cap_oversized_grids.py``):
+    a checkpoint keyed on the slug alone would survive a resize and resume onto a
+    lattice it does not describe. ``load_checkpoint`` also compares the stored
+    bbox, so this is the cheap half of a belt-and-braces pair -- but it is the
+    half that keeps the stale directory from lingering under the live name.
+
+    Args:
+        city_id: canonical catalog slug.
+        bbox: the frozen grid's (min_lon, min_lat, max_lon, max_lat).
+        channel: 'kartaview' for a grid run; a walk uses its own channel name.
+    """
+    geometry = "_".join(f"{coord:.6f}" for coord in bbox)
+    return os.path.join(checkpoint_dir(), channel, f"{city_id}_{geometry}")
+
+
 @dataclass
 class SweepCheckpoint:
     """Handle to an on-disk checkpoint directory, loaded or freshly opened."""
@@ -1681,6 +1793,131 @@ def _remove_empty_checkpoint_dir(path: str | None) -> None:
         pass
 
 
+async def download_kartaview_metadata_async(
+    city_name: str,
+    center_lat: float,
+    center_lon: float,
+    grid_width: float,
+    grid_height: float,
+    step_length: float,
+    access_token: str,
+    output_csv_gz_path: str,
+    request_timeout: float = DEFAULT_REQUEST_TIMEOUT_S,
+    max_requests_per_minute: int = DEFAULT_SWEEP_REQUESTS_PER_MINUTE,
+    max_requests: int | None = None,
+    radius_m: int | None = None,
+    checkpoint_path: str | None = None,
+) -> dict[str, Any]:
+    """
+    Sweep a city's KartaView census and write it as a run csv.gz.
+
+    Same calling convention as ``download_gsv_metadata_async`` and
+    ``download_mapillary_metadata_async``: the caller decides the output
+    filename, because skip policy and dated naming live in the CLI/scheduler
+    layer rather than here.
+
+    The shape is the second census provider's, which is the point of #237's
+    seam -- preamble, grid, this provider's own fetch, then the shared tail.
+    Everything specific to KartaView is in the three bindings handed to
+    :func:`census_core.write_census_grid_run`.
+
+    Returns:
+        Dict with:
+            df: DataFrame containing the metadata (KARTAVIEW_METADATA_DTYPES)
+            filename_with_path: the written .csv.gz path
+            api_requests: sweep requests issued BY THIS PROCESS, for the ledger
+            api_requests_total: the whole sweep's spend across resumes
+            num_flat_images: census magnitude of flat (PLANE) imagery (#116)
+            started_at / finished_at: UTC ISO 8601 timestamps
+
+    Raises:
+        SweepIncompleteError: propagated unchanged. Nothing is written and the
+            checkpoint is NOT discarded -- that is the whole point of it.
+    """
+    started_at = datetime.now(UTC).isoformat()
+    query_timestamp = started_at
+
+    # Checked before a single request is issued, though write_census_grid_run
+    # re-checks as it takes ownership of the write: one implementation, called
+    # at the point where failing is free.
+    census_core.prepare_output_path(output_csv_gz_path)
+
+    # Built before the fetch (its bbox bounds the sweep lattice) and consumed
+    # after it, so it is derived once and threaded through.
+    grid = census_core.build_grid(center_lat, center_lon, grid_width, grid_height, step_length)
+
+    fetched = await fetch_city_images_async(
+        city_name,
+        grid.bbox,
+        access_token,
+        radius_m=radius_m,
+        request_timeout=request_timeout,
+        max_requests_per_minute=max_requests_per_minute,
+        max_requests=max_requests,
+        checkpoint_path=checkpoint_path,
+    )
+    api_requests = fetched["api_requests"]
+    api_requests_total = fetched["api_requests_total"]
+    failed_cells = fetched.get("failed_cells") or []
+    # Counted by the fetch, not recomputed here: binding the census to a local
+    # would pin the whole thing alive through both CSV writes and defeat the
+    # tail's release, and re-reading it through the dict would cost a second
+    # full pass for a log line (issue #157).
+    num_images = fetched["num_images"]
+    num_panos = fetched["num_panos"]
+    logger.info(
+        f"Swept {fetched['raw_photo_count']} photo rows "
+        f"({num_images} unique: {num_panos} panos, {num_images - num_panos} flat) "
+        f"from {fetched['cells_visited']} cells at r={fetched['radius_m']} m"
+    )
+
+    written = census_core.write_census_grid_run(
+        fetched,
+        grid,
+        output_csv_gz_path,
+        query_timestamp,
+        capture_dates_for=_kartaview_capture_dates,
+        image_columns=_kartaview_image_columns,
+        dtypes=KARTAVIEW_METADATA_DTYPES,
+        # A cell nothing came back for leaves its grid points UNKNOWN rather
+        # than empty; a clean sweep passes None and pays nothing. The sweep
+        # refuses to finalize at all past MAX_FAILED_AREA_FRACTION, so this
+        # only ever describes a small remainder.
+        unmeasured_mask=(
+            (lambda lats, lons: _points_in_cells(lats, lons, failed_cells))
+            if failed_cells
+            else None
+        ),
+        unmeasured_desc=f"{len(failed_cells)} unmeasured cell(s)",
+    )
+
+    # LAST, and only now: the artifact is on disk, so the sweep it was paid for
+    # is durable and the checkpoint has nothing left to protect. Discarding it
+    # any earlier -- inside the fetch, or before this write -- is what would
+    # make a crash in this tail re-pay the whole sweep, which is one of the four
+    # interruptions #239 exists to cover. Best effort by contract: a checkpoint
+    # that cannot be removed must never fail a run that has already succeeded.
+    if fetched.get("checkpoint_path"):
+        discard_checkpoint(fetched["checkpoint_path"])
+
+    return {
+        "df": written["df"],
+        "filename_with_path": output_csv_gz_path,
+        # This process's spend. The ledger is additive and keyed by (date,
+        # provider), so handing it the cumulative figure would charge a resumed
+        # sweep's earlier nights against today's budget gate.
+        "api_requests": api_requests,
+        "api_requests_total": api_requests_total,
+        # Census magnitude of flat imagery (issue #116): every in-grid PLANE
+        # image, including those at points that also hold a SPHERE pano. Not
+        # reconstructable from the CSV (flat-only points collapse to one
+        # FLAT_ONLY row), so it is threaded to the catalog separately.
+        "num_flat_images": written["num_flat_images"],
+        "started_at": started_at,
+        "finished_at": datetime.now(UTC).isoformat(),
+    }
+
+
 async def fetch_city_images_async(
     city_name: str,
     bbox: tuple[float, float, float, float],
@@ -1804,7 +2041,9 @@ async def _fetch_city_images(
         Dict with ``census`` (the deduped columnar census), ``api_requests``,
         ``api_requests_total``, ``cells`` (root cells), ``cells_visited`` (roots
         plus every subdivision), ``radius_m`` (what the sweep tiled at),
-        ``raw_photo_count`` (pre-dedupe), ``failed_cells`` and
+        ``raw_photo_count`` (pre-dedupe), ``num_images`` and ``num_panos``
+        (post-dedupe totals, summarized here because the caller cannot count
+        them without pinning the census -- see below), ``failed_cells`` and
         ``checkpoint_path`` (echoed back, or None). On a clean sweep that path
         still exists and is the CALLER'S to :func:`discard_checkpoint` once its
         artifact is durable; see that function for why deleting it here would
@@ -2357,6 +2596,14 @@ async def _fetch_city_images(
         "cells_visited": cells_visited,
         "radius_m": radius_m,
         "raw_photo_count": raw_photo_count,
+        # Summarized HERE, not by the caller, and that is a memory contract
+        # rather than a convenience: write_census_grid_run POPS the census so it
+        # can drop the frame before the CSV writes, so a caller counting these
+        # itself would have to bind the census to a local and would pin every
+        # row alive across both writes (issue #157). Mapillary's fetch
+        # pre-counts its equivalents for exactly this reason.
+        "num_images": len(census),
+        "num_panos": int(census_core.census_is_pano(census).sum()),
         # Cells nothing came back for. Empty on a clean sweep; the caller
         # attributes the query points inside them to REQUEST_FAILED.
         "failed_cells": failed_cells,

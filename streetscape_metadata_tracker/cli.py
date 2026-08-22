@@ -39,6 +39,7 @@ from . import (
     db,
     display_search_area,
     download_gsv_metadata_async,
+    download_kartaview_metadata_async,
     download_mapillary_metadata_async,
     get_city_location_data,
     get_search_dimensions,
@@ -54,10 +55,17 @@ from .city_registration import (
 )
 from .diff import compute_run_diff, generate_diff_filename, write_diff_detail
 from .download_common import (
+    SWEEP_INCOMPLETE_EXIT_CODE,
     DownloadError,
     HostBusyError,
     HostUnavailableError,
+    grid_bbox,
     host_exit_code,
+)
+from .download_kartaview import (
+    DEFAULT_SWEEP_REQUESTS_PER_MINUTE,
+    SweepIncompleteError,
+    checkpoint_path_for,
 )
 from .download_mapillary import DEFAULT_TILE_REQUESTS_PER_MINUTE
 from .fileutils import load_city_csv_file
@@ -100,13 +108,18 @@ def parse_args():
 
     parser.add_argument(
         "--provider",
-        choices=["both", "gsv", "mapillary"],
+        choices=["both", "gsv", "mapillary", "kartaview"],
         default="both",
-        help="Imagery provider(s) to collect. The default collects GSV then "
-        "Mapillary back-to-back with the same run date so the two "
-        "series stay in sync. Each provider keeps its own independent "
-        "run series (dated files, diffs, skip policy) on the same "
-        "frozen city grid.",
+        help="Imagery provider(s) to collect. Each provider keeps its own "
+        "independent run series (dated files, diffs, skip policy) on the "
+        "same frozen city grid. 'both' means GSV then Mapillary "
+        "back-to-back with the same run date so those two series stay in "
+        "sync — it does NOT include KartaView, which must be asked for by "
+        "name (see issue #247 on renaming this to --provider all). "
+        "KartaView is deliberately opt-in: its sweep is paced at "
+        f"{DEFAULT_SWEEP_REQUESTS_PER_MINUTE} requests/minute and serial, so "
+        "a large city is hours of wall-clock and should never be something "
+        "you get by typing nothing.",
     )
 
     parser.add_argument(
@@ -225,6 +238,37 @@ def parse_args():
              and exceeding it blocks the whole host — every Mapillary channel
              at once, including the nightly scheduler's. Default
              {DEFAULT_TILE_REQUESTS_PER_MINUTE}; 0 disables pacing.""",
+    )
+
+    concurrency_group.add_argument(
+        "--kartaview-max-requests-per-minute",
+        type=int,
+        default=DEFAULT_SWEEP_REQUESTS_PER_MINUTE,
+        help=f"""Client-side cap on KartaView sweep requests per minute
+             (kartaview provider only). A third separate flag rather than a
+             shared one because all three limits are a different KIND: the GSV
+             cap above is a project quota, Mapillary's is an undocumented
+             per-IP tile limit, and this one paces to KartaView's PUBLISHED
+             1,000/hour authenticated ceiling — which is necessary because the
+             API returns no X-RateLimit-* or Retry-After headers at all, so a
+             client cannot observe its own budget and has to assume the
+             documented number is real. Default
+             {DEFAULT_SWEEP_REQUESTS_PER_MINUTE} ({DEFAULT_SWEEP_REQUESTS_PER_MINUTE * 60}/hour,
+             under that ceiling by construction); 0 disables pacing.""",
+    )
+
+    concurrency_group.add_argument(
+        "--kartaview-max-requests",
+        type=int,
+        default=None,
+        help="""Stop a KartaView sweep after this many requests and CHECKPOINT
+             the rest (kartaview provider only, issue #239). Not a sampling
+             knob: nothing is published, because a partial census dated today
+             would diff against its predecessor as 'every pano in the rest of
+             the city removed'. What it buys is that the spend survives — the
+             run exits 83 and the next invocation resumes from the cells
+             already answered, so a metro that needs 10 hours can be taken a
+             night at a time. Default: sweep to completion.""",
     )
 
     parser.add_argument(
@@ -414,11 +458,25 @@ async def async_main():
         # exit code and the scheduler reacts to the host rather than counting a
         # per-city failure (issue #208).
         unavailable: list[HostUnavailableError] = []
+        # Sweeps that stopped with work left and CHECKPOINTED it (issue #239).
+        # Not a failure in the sense the others are: the spend is on disk and
+        # the next attempt continues from it, which is why this gets its own
+        # exit code rather than being folded into 1. See the aggregation below.
+        incomplete: list[SweepIncompleteError] = []
         for provider in providers:
             try:
                 await _collect_one_run(
                     conn, args, city_row, run_date, provider, configs[provider], vis_path
                 )
+            except SweepIncompleteError as e:
+                # Progress, not breakage — logged at INFO with the fraction
+                # done, and deliberately without a traceback.
+                logging.info(
+                    f"{provider} sweep paused at {e.roots_done}/{e.root_count} root cells; "
+                    f"re-run to resume from {e.checkpoint_path}"
+                )
+                failed.append(provider)
+                incomplete.append(e)
             except HostUnavailableError as e:
                 # A known environmental condition, not a bug: log the message
                 # (which names the host and what to do) without a traceback.
@@ -436,6 +494,27 @@ async def async_main():
 
         if failed:
             print(f"FAILED: {', '.join(failed)} (see log for details)")
+            # A paused sweep is reported as itself only when it is the ONLY
+            # thing that went wrong, on exactly the reasoning the host branch
+            # below uses: 83 tells the caller "this made progress, run it
+            # again", and a mixed run where GSV also genuinely broke must not
+            # wear that code and have the real failure read as progress.
+            #
+            # It is checked FIRST because the two conditions are not symmetric.
+            # A host refusal is a property of the machine that the next city
+            # inherits; an incomplete sweep is a property of this city's budget
+            # and says nothing about the next one. If a sweep both paused and
+            # some other channel hit a blocked host, the host verdict is the
+            # one worth acting on, so this returns 83 only when `unavailable`
+            # is empty by construction (every failure being incomplete leaves
+            # no room for one).
+            if len(incomplete) == len(failed):
+                print(
+                    f"PAUSED: KartaView checkpointed at "
+                    f"{incomplete[0].roots_done}/{incomplete[0].root_count} root cells. "
+                    f"Re-run the same command to resume; nothing was published."
+                )
+                return SWEEP_INCOMPLETE_EXIT_CODE
             # Only report a host-level exit when EVERY failure was that host:
             # a mixed night (Mapillary blocked, GSV genuinely broken) must not
             # let the breaker mask a real bug behind an environmental code.
@@ -522,6 +601,38 @@ async def _collect_one_run(conn, args, city_row, run_date, provider, config, vis
                 output_csv_gz_path=output_csv_gz_path,
                 request_timeout=args.timeout,
                 max_requests_per_minute=args.mapillary_max_requests_per_minute,
+            )
+        elif provider == "kartaview":
+            # The checkpoint path is built HERE rather than inside the
+            # downloader because it is keyed on the CHANNEL, and only the
+            # caller knows which channel it is: a KartaView road walk sweeps
+            # the same frozen bbox at the same radius, so a path derived from
+            # the geometry alone would let the two resume each other's sweeps
+            # under different credentials and different ledgers (#239).
+            checkpoint_path = checkpoint_path_for(
+                city_row.city_id,
+                grid_bbox(
+                    city_row.center_lat,
+                    city_row.center_lon,
+                    city_row.grid_width_m,
+                    city_row.grid_height_m,
+                    city_row.step_m,
+                ),
+                provider,
+            )
+            dict_results = await download_kartaview_metadata_async(
+                city_name=city_row.display_name,
+                center_lat=city_row.center_lat,
+                center_lon=city_row.center_lon,
+                grid_width=city_row.grid_width_m,
+                grid_height=city_row.grid_height_m,
+                step_length=city_row.step_m,
+                access_token=config["access_token"],
+                output_csv_gz_path=output_csv_gz_path,
+                request_timeout=args.timeout,
+                max_requests_per_minute=args.kartaview_max_requests_per_minute,
+                max_requests=args.kartaview_max_requests,
+                checkpoint_path=checkpoint_path,
             )
         else:
             logging.info(
