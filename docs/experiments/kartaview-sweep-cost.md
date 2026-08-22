@@ -241,6 +241,15 @@ costs ~9,970 requests — 10 h of paced fetching; New York, on a thinner sample,
   place to start. (The earlier "~96,000 requests ≈ 96 h" in this section was the
   floor's *floor*: `area / (2 r²)` without the lattice ceiling, without retries
   and without calibration.)
+
+  **Amended after issue #239.** "Not affordable" was really "no city may cost
+  more than one night", because until the sweep could checkpoint, an
+  interruption discarded every request already paid for and the 186 h had to be
+  read as a wall rather than a total. With resumability it is arithmetic: a
+  sweep takes whatever the night gives it and continues tomorrow, so a whole
+  pass is *N nights*, exactly the shape the Mapillary catch-up already runs on.
+  The figures above are unchanged — what changed is that they no longer have to
+  fit inside `max_batch_hours` per city.
 - **Budget by bbox area, not by imagery.** `estimate_requests` for a KartaView
   channel should be `bbox_area / (2 r²)` — the only term computable before the
   walk — defaulting r to 1000, refining it from the previous run's calibrated

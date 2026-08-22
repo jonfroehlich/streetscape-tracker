@@ -21,10 +21,17 @@ columns. 360-degree imagery is ``projection == "SPHERE"`` and flat imagery is
 WHAT THE SWEEP COSTS, MEASURED (docs/experiments/kartaview-sweep-cost.md, 14
 cities / 638 requests). The cost is one geometric term -- ``root_cells`` tracks
 ``bbox_area / (2 r^2)`` to within 10% above ~350 km2 -- so a city is budgeted by
-BBOX AREA, not by how much imagery it holds. The median catalog city is ~12
-requests, the same as Mapillary's median tile count; the p95 is 384 and Singapore
-is ~7,300. :func:`estimate_sweep_requests` is that number, and it is exact enough
-to schedule against.
+BBOX AREA, not by how much imagery it holds.
+
+QUOTE THE OBSERVED COST, NOT THE FLOOR. :func:`estimate_sweep_requests` counts
+the LATTICE -- circles, not requests -- and the study measured it 1.54x too low
+in aggregate (19,173 against 29,589), because the floor prices neither the
+backpressure retries nor the calibration ladder. The two columns, per the cost
+study: the median catalog city is 12 circles and cost 16 requests (58 s), the
+p95 is 384 circles and cost 636, and Singapore is 5,130 circles and cost ~9,974
+(~10.4 h at the pace above). Budget against the observed figure with the study's
+median 1.80x overhead applied to the cell count; use the bare lattice count only
+where the thing being described really is the lattice.
 
 THREE MEASURED FACTS DECIDE THIS DESIGN. Two of them contradict the feasibility
 study that preceded them, so read them before changing a radius, a page size or a
@@ -69,6 +76,21 @@ SERIAL -- one request in flight -- and paced by
 since the limiter is the bottleneck and the walk is adaptive (what to ask next
 depends on the last answer).
 
+CHECKPOINTING (issue #239). A sweep is HOURS at that pace -- Singapore is
+~9,974 requests, i.e. ~10.4 h -- so an interruption that discarded it would be
+the most expensive failure in the repo. ``fetch_city_images_async`` therefore
+takes a ``checkpoint_path`` and commits what it has answered as it goes, so a
+SIGKILL, a ``systemctl stop``, an OOM or a crash in the caller's tail means
+"resume tomorrow" rather than "lose the night". The last of those four is why
+the caller, not this module, calls :func:`discard_checkpoint`: the census is
+returned as a DataFrame and the artifact is written afterwards, so a checkpoint
+deleted before returning would cover every interruption except the one that
+happens after it. The immutable dated-snapshot contract is untouched: a partial
+sweep is never a run, and becomes one only when the lattice is complete, dated
+on the day it completes. See the checkpoint section below -- the file format,
+the fetch-order contract, the commit cadence and the age bound are all
+constraints rather than choices.
+
 The whole sweep also takes the machine-wide :data:`HOST_KARTAVIEW` lock, because
 the documented limit is per API key but nothing tells us the enforced one is:
 both of this project's prior per-IP bans (Mapillary tiles #198, Overpass #209)
@@ -81,13 +103,16 @@ from __future__ import annotations
 import json
 import logging
 import math
-from dataclasses import dataclass
+import os
+import shutil
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import aiohttp
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 
 from . import census as census_core
 from .analysis import EARLIEST_PLAUSIBLE_CAPTURE
@@ -178,6 +203,68 @@ DEFAULT_SWEEP_REQUESTS_PER_MINUTE = 16
 # MAX_FAILED_TILE_FRACTION and download_gsv's MAX_FAILED_POINT_FRACTION:
 # tolerate a blip, refuse a hole.
 MAX_FAILED_AREA_FRACTION = 0.02
+
+# ── Checkpointing (issue #239) ─────────────────────────────────────────────
+#
+# A sweep is HOURS of paced fetching -- Singapore is ~9,974 requests, i.e. ~10.4 h
+# at the rate above -- and until this existed, any interruption discarded every
+# request it had already paid for. A SIGKILL from the scheduler's per-city
+# timeout, a `systemctl stop`, an OOM, a crash in the caller's tail: all of them
+# started the next attempt back at cell zero.
+#
+# EVERY SINGAPORE FIGURE IN THIS SECTION IS `sweep_requests_observed`, NEVER THE
+# GEOMETRIC FLOOR. The cost study's floor column reads 7,329 for the same city and
+# is the number CLAUDE.md says not to quote, because it prices neither the
+# backpressure retries nor the calibration ladder (the study's own overhead ratio
+# is 1.54x). Singapore is 5,130 root cells / 9,974 requests / ~10.4 h; see
+# docs/experiments/kartaview-sweep-cost.md, "Finding 3".
+#
+# READ THIS BEFORE "SIMPLIFYING" THE COMMIT INTO THE `finally`. The periodic
+# in-sweep commit IS the feature. `cli.py` installs no SIGTERM handler, and
+# Python's default disposition terminates the process without unwinding, so
+# `finally` does NOT run on the most common deliberate interruption -- nor on a
+# SIGKILL from a timeout, nor on an OOM kill. The `finally`-commit is a bonus
+# that catches a host block and stray exceptions; it is not the mechanism.
+#
+# The commit cadence is measured in REQUESTS, not in root cells, because a root
+# does not cost a fixed amount: one that answers cleanly is a single request
+# (~3.75 s at 16/min), while one that cascades to the radius floor is
+# 1 + 4 + 16 + 64 = 85 cells at up to `retries + 1` attempts each -- ~340
+# requests, ~21 minutes. Flushing per root would therefore have both a WORSE
+# worst case and one part file per ROOT -- 5,130 of them for Singapore, which is
+# its root-cell count and not its request count; the two differ by ~2x and it is
+# the cells that would each get a file.
+CHECKPOINT_FORMAT_VERSION = 1
+CHECKPOINT_STATE_FILENAME = "state.json"
+CHECKPOINT_PART_TEMPLATE = "part-{index:05d}.parquet"
+
+# Requests between commits. 32 is two minutes at the shipped pace, which bounds
+# lost work at `interval + one root's worst case` (the check is only evaluated at
+# a root boundary) and keeps the part count at ~0 for the median catalog city
+# (16 requests), ~20 at the p95 (636) and ~310 for Singapore (9,974).
+#
+# Note what a SMALL value means, since it is the opposite of the natural reading:
+# the cadence test is `api_requests - requests_at_last_commit >= interval` and no
+# root costs zero requests, so anything <= 1 -- including 0 and any negative --
+# commits at every root boundary, i.e. the per-root flushing the paragraph above
+# argues against. It is not a way to disable checkpointing; that is
+# `checkpoint_path=None`.
+DEFAULT_CHECKPOINT_REQUEST_INTERVAL = 32
+
+# How old a checkpoint may be before it is discarded rather than resumed.
+#
+# NOT tidiness -- this is the one way a checkpoint could produce a WRONG artifact
+# rather than merely wasted work, which is the line the whole design is drawn
+# against. The frozen grid geometry never changes, so bbox, ipp, radius and
+# root_count all still match months later: a checkpoint left by a city that was
+# interrupted and then sat out a long gap (a channel switched off after a per-IP
+# block, `consecutive_failures` quarantining a city for a whole 90-day cycle)
+# would resume and splice rows fetched last quarter into a snapshot dated today,
+# published as one observation of one day. Seven days is comfortably longer than
+# any legitimate multi-night sweep -- Singapore, the worst city in the catalog, is
+# ~10.4 h -- and comfortably shorter than the 80-day `min_days_since_last_run`
+# cadence, so it can only ever catch the stale case.
+CHECKPOINT_MAX_AGE_S = 7 * 24 * 3600
 
 # Per-request timeout. Higher than the tile CDN's 30 s: this endpoint is a
 # database query against a service whose own tracker carries an open MySQL
@@ -741,6 +828,42 @@ class ResponseError(DownloadError):
     """
 
 
+class SweepIncompleteError(DownloadError):
+    """
+    The sweep stopped with root cells unvisited, and CHECKPOINTED them (#239).
+
+    Nothing is finalized -- a partial census must never be published as a dated
+    snapshot, because an immutable dated file holding 60% of a city diffs
+    against its predecessor as "every pano in the rest of the city removed".
+    What is different from every other failure here is that the spend survives:
+    the answered cells are on disk and the next attempt resumes from them.
+
+    Deliberately NOT a ``HostUnavailableError``, and the distinction is not
+    academic. ``host_exit_code`` maps those to 81 for KartaView, which the
+    scheduler turns into a night-level breaker skipping every remaining
+    KartaView city -- correct for a refusal, which is a property of the machine,
+    and wrong for this, which is a property of THIS city's budget. The next
+    city's sweep is unaffected and should run.
+
+    This is why ``download_gsv_history``'s ``HarvestIncompleteError``, which
+    subclasses its blocked error, is the wrong precedent to copy: that harvester
+    is a manual script the scheduler never runs, so nothing reads its type as a
+    host verdict.
+
+    Carries ``api_requests`` (this process's spend, for the ledger) and
+    ``api_requests_total`` (the whole sweep's, for the operator), attached by
+    the caller's ``spent`` helper.
+    """
+
+    def __init__(
+        self, message: str, *, checkpoint_path: str, roots_done: int, root_count: int
+    ) -> None:
+        super().__init__(message)
+        self.checkpoint_path = checkpoint_path
+        self.roots_done = roots_done
+        self.root_count = root_count
+
+
 async def _post_nearby(
     session: aiohttp.ClientSession,
     limiter: AsyncRateLimiter,
@@ -1124,6 +1247,440 @@ def _bbox_area_m2(bbox: tuple[float, float, float, float]) -> float:
     return abs(width * height)
 
 
+# ── The checkpoint on disk ─────────────────────────────────────────────────
+#
+# Layout, one directory per (city, grid geometry):
+#
+#     <checkpoint_path>/
+#       state.json            the commit record; written LAST
+#       part-00000.parquet    census rows, _CENSUS_DTYPES, in FETCH ORDER
+#       part-00001.parquet
+#
+# THE PARTS ARE PARQUET, NOT CSV, and that is load-bearing rather than a taste
+# call. Every string column here is a PROVIDER-SUPPLIED value -- a contributor's
+# chosen username, an OSM way id, a sequence id, an org code -- and pandas'
+# default `na_values` claims `NA`, `null`, `None`, `nan`, `N/A` and several more.
+# Measured on this schema: a username of "NA", a way_id of "null" and a
+# sequence_id of "None" all come back from `read_csv` as `<NA>`. So a CSV
+# checkpoint would make a RESUMED run publish DIFFERENT rows than an
+# uninterrupted one -- `_kartaview_image_columns` would attribute that photo to
+# "© KartaView" instead of "© KartaView contributor NA", and its way_id would be
+# gone -- in a repo whose census output is pinned byte-for-byte by a golden
+# fixture. (`keep_default_na=False` trades the bug for its mirror image: every
+# genuine null becomes the empty string, and the same attribution splits the
+# other way.) Parquet round-trips all thirteen columns exactly, `""`-vs-`<NA>`
+# included, and an empty frame's dtypes with them.
+#
+# THE COMMIT RECORD IS A COUNT, NOT A LIST. Committed parts are `[0, parts)`;
+# anything at or beyond that index is a torn write from a crash and is deleted on
+# load. A growing list re-serialized at every commit would be O(n^2) bytes for
+# nothing, and "is this name in the list" is a harder thing to reason about than
+# an integer. `state.json` is written last and atomically, so it is the commit
+# point: a part that exists without being counted never happened.
+#
+# THE PATH IS THE CALLER'S, AND IT MUST BE DATE-FREE. The whole point is a sweep
+# that spans nights, and a run is dated on the day it COMPLETES -- so a
+# date-bearing path (the `.downloading` and `.harvesting` convention, where a
+# collection finishes in one night) would make every night start from zero. It
+# must also be a realpath: on makelab2 the unit's WorkingDirectory is a symlink,
+# and two spellings of one directory would silently be two checkpoints, i.e.
+# exactly the restart-from-zero this exists to prevent (see host_lock.lock_dir,
+# which carries the same reasoning for the same host). Finally it belongs OUTSIDE
+# `data/` -- a partial census is the one artifact that must never reach the
+# publisher -- which is what the gitignored `checkpoints/` sibling is for.
+#
+# THE PATH KEY IS (CITY, GRID GEOMETRY, CHANNEL), AND THE CHANNEL IS NOT
+# OPTIONAL. A KartaView road walk will call this exact function with the same
+# frozen `grid_bbox` the grid run uses -- that is the Mapillary precedent
+# (`collect_mapillary` builds its bbox from the city's frozen geometry) and the
+# reason this fetch is shared at all. So a walk and a grid run of one city agree
+# on bbox, ipp, radius AND root_count: every validation in `load_checkpoint`
+# passes and the two channels would happily resume each other's sweeps. The
+# census would be the same either way, but the channels meter into SEPARATE
+# `api_usage` ledgers, so one would inherit the other's `api_requests_total`.
+#
+# THE CALLER OWNS THE DIRECTORY AND MUST `discard_checkpoint` IT once its dated
+# artifacts are durable. This function deliberately does NOT delete the
+# checkpoint on a clean sweep, and that is the whole of what makes "a crash in
+# the caller's tail" recoverable: the census is returned as a DataFrame and the
+# caller writes the CSV, the stats, the run row, the JSON and the diff after this
+# returns. Deleting here -- which is where the delete first lived -- would mean
+# the checkpoint is already gone by the time any of that can fail, so the one
+# interruption of the four named above that lands OUTSIDE this function would be
+# the one not covered. Discarding is one line at the end of a caller that just
+# finished writing its artifact, exactly as `download_gsv` unlinks `.downloading`
+# after its CSV lands. A caller that forgets is bounded rather than broken:
+# CHECKPOINT_MAX_AGE_S caps how long a complete checkpoint can be re-finalized,
+# `load_checkpoint` says so at WARNING, and the tell is `api_requests == 0`.
+
+
+@dataclass
+class SweepCheckpoint:
+    """Handle to an on-disk checkpoint directory, loaded or freshly opened."""
+
+    path: str
+    radius_m: int
+    roots_done: int = 0
+    parts: int = 0
+    census_rows: int = 0
+    cells_visited: int = 0
+    raw_photo_count: int = 0
+    api_requests_total: int = 0
+    failed_cells: list[Cell] = field(default_factory=list)
+
+
+def _cell_to_dict(cell: Cell) -> dict[str, float]:
+    return {"lat": cell.lat, "lon": cell.lon, "size_m": cell.size_m, "depth": cell.depth}
+
+
+def _cell_from_dict(record: dict[str, Any]) -> Cell:
+    return Cell(
+        lat=float(record["lat"]),
+        lon=float(record["lon"]),
+        size_m=float(record["size_m"]),
+        depth=int(record["depth"]),
+    )
+
+
+def _fsync_dir(path: str) -> None:
+    """
+    Make a rename into ``path`` durable.
+
+    ``os.replace`` is atomic but not durable: the directory entry it rewrites
+    lives in the containing directory, so without this the part-then-state
+    ordering survives a process crash and not a power loss. Best effort -- some
+    filesystems refuse ``O_RDONLY`` fsync on a directory, and a checkpoint must
+    never be what fails a sweep.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError as e:  # pragma: no cover - platform-dependent
+        logger.debug(f"Could not fsync the checkpoint directory {path}: {e}")
+
+
+def _state_path(path: str) -> str:
+    return os.path.join(path, CHECKPOINT_STATE_FILENAME)
+
+
+def _part_path(path: str, index: int) -> str:
+    return os.path.join(path, CHECKPOINT_PART_TEMPLATE.format(index=index))
+
+
+def _bbox_matches(stored: Any, bbox: tuple[float, float, float, float]) -> bool:
+    """
+    Is a stored bbox the same lattice frame as this one?
+
+    Compared numerically at 1e-9 deg (~0.1 mm) rather than exactly, for the
+    reason the golden-fixture comparison uses the same figure: the frozen bbox
+    comes from a geodesic solve over libm, whose last ULP is not portable. A
+    tolerance that tight cannot hide a real reframing.
+    """
+    if not isinstance(stored, list | tuple) or len(stored) != 4:
+        return False
+    return all(abs(float(a) - float(b)) <= 1e-9 for a, b in zip(stored, bbox, strict=True))
+
+
+def load_checkpoint(
+    path: str,
+    *,
+    bbox: tuple[float, float, float, float],
+    ipp: int,
+    requested_radius_m: int | None,
+) -> SweepCheckpoint | None:
+    """
+    Resume state for this sweep, or None if there is nothing usable here.
+
+    NEVER RAISES. Every failure degrades to "sweep from the beginning" with a
+    warning, following :func:`download_gsv.get_processed_points` and
+    :func:`download_gsv_history._load_checkpoint`. A checkpoint is not a
+    comparison whose mismatch would corrupt an artifact -- the worst case of
+    ignoring one is wasted work, so the walk-diff ``same_grid_geometry`` posture
+    of refusing outright would cost a night to protect nothing.
+
+    Args:
+        path: the checkpoint directory. Need not exist.
+        bbox: this sweep's frame. A different one means a different lattice.
+        ipp: this sweep's page size. It prices ``pages_for_total``, so a change
+            changes the walk even at an identical radius.
+        requested_radius_m: the caller's explicit radius, or None to adopt the
+            checkpoint's. An explicit value that CONTRADICTS the stored one
+            discards the checkpoint rather than being silently overridden.
+
+    Returns:
+        A :class:`SweepCheckpoint` with its uncommitted parts already swept
+        away, or None.
+    """
+
+    def discard(reason: str) -> None:
+        logger.warning(f"Ignoring the KartaView checkpoint at {path}: {reason}")
+
+    state_path = _state_path(path)
+    if not os.path.exists(state_path):
+        return None  # the ordinary first-run case; not worth a line of log
+    try:
+        with open(state_path, encoding="utf-8") as f:
+            state = json.load(f)
+        if state["format_version"] != CHECKPOINT_FORMAT_VERSION:
+            discard(
+                f"it is format v{state['format_version']}, this build writes "
+                f"v{CHECKPOINT_FORMAT_VERSION}"
+            )
+            return None
+        if not _bbox_matches(state["bbox"], bbox):
+            discard(f"it was swept over bbox {state['bbox']}, this run uses {list(bbox)}")
+            return None
+        if int(state["ipp"]) != ipp:
+            discard(f"it was swept at ipp={state['ipp']}, this run uses ipp={ipp}")
+            return None
+        radius_m = int(state["radius_m"])
+        if requested_radius_m is not None and requested_radius_m != radius_m:
+            discard(
+                f"it was swept at r={radius_m} m and this run was asked for "
+                f"r={requested_radius_m} m; an explicit radius wins"
+            )
+            return None
+        age_s = (datetime.now(UTC) - datetime.fromisoformat(state["updated_at"])).total_seconds()
+        if age_s > CHECKPOINT_MAX_AGE_S:
+            # The one guard here that protects an ARTIFACT rather than a night's
+            # work: frozen geometry never changes, so every other check below
+            # still passes months later, and resuming would splice last
+            # quarter's rows into a snapshot dated today. See
+            # CHECKPOINT_MAX_AGE_S.
+            discard(
+                f"it was last committed {age_s / 86400:.1f} days ago, past the "
+                f"{CHECKPOINT_MAX_AGE_S / 86400:.0f}-day limit; its rows would be spliced "
+                f"into a snapshot dated today"
+            )
+            return None
+        root_count = int(state["root_count"])
+        if len(cells_for_bbox(*bbox, radius_m * math.sqrt(2))) != root_count:
+            # Catches a change to cells_for_bbox itself. The module docstring
+            # notes that correcting the equirectangular cos(mid_lat) shortfall
+            # "would move every city's cell count"; this is what makes such a
+            # change re-sweep rather than silently resume onto a lattice whose
+            # indices no longer mean what the checkpoint recorded.
+            discard(f"the lattice no longer has {root_count} root cells")
+            return None
+        cp = SweepCheckpoint(
+            path=path,
+            radius_m=radius_m,
+            roots_done=int(state["roots_done"]),
+            parts=int(state["parts"]),
+            census_rows=int(state["census_rows"]),
+            cells_visited=int(state["cells_visited"]),
+            raw_photo_count=int(state["raw_photo_count"]),
+            api_requests_total=int(state["api_requests_total"]),
+            failed_cells=[_cell_from_dict(c) for c in state["failed_cells"]],
+        )
+        if not 0 <= cp.roots_done <= root_count or cp.parts < 0:
+            discard(f"its counters are out of range ({cp.roots_done}/{root_count}, {cp.parts})")
+            return None
+        # Verify the parts from their FOOTERS -- a seek to the end of each file,
+        # costing nothing -- rather than discovering a truncated one at finalize,
+        # after the night has already been paid for.
+        rows = 0
+        for index in range(cp.parts):
+            part = _part_path(path, index)
+            if not os.path.exists(part):
+                discard(f"committed part {os.path.basename(part)} is missing")
+                return None
+            rows += pq.ParquetFile(part).metadata.num_rows
+        if rows != cp.census_rows:
+            discard(f"its parts hold {rows} rows where the commit record says {cp.census_rows}")
+            return None
+    except Exception as e:
+        # Broad on purpose; see the NEVER RAISES note above. A checkpoint that
+        # cannot be read must cost a re-sweep, never a night.
+        discard(f"{type(e).__name__}: {e}")
+        return None
+
+    _purge_uncommitted_parts(cp)
+    if cp.roots_done == root_count:
+        # Louder than the partial case, because this one finalizes without
+        # issuing a request and so cannot be told from a fresh collection by its
+        # artifact alone. It is the intended recovery from a caller that died
+        # before its artifact was durable -- and it is also what a caller that
+        # simply forgot to `discard_checkpoint` looks like, so say which sweep's
+        # answers are about to be republished.
+        logger.warning(
+            f"The KartaView checkpoint at {path} is COMPLETE ({root_count} root cells, "
+            f"last committed {age_s / 3600:.1f} h ago): finalizing from disk without "
+            f"issuing a request. This is the recovery path for a caller that died before "
+            f"its artifact was durable; if that is not what happened, the previous run "
+            f"failed to call discard_checkpoint()."
+        )
+    else:
+        logger.info(
+            f"Resuming a KartaView sweep from {path}: {cp.roots_done}/{root_count} root cells "
+            f"done at r={cp.radius_m} m, {cp.census_rows} census rows on disk, "
+            f"{cp.api_requests_total} requests already spent"
+        )
+    return cp
+
+
+def _purge_uncommitted_parts(cp: SweepCheckpoint) -> None:
+    """
+    Delete part files at or beyond the commit record, and any staging leftovers.
+
+    Those are torn writes: the process died between writing a part and counting
+    it. Removing them keeps the next commit's index free, so a part is never
+    written under a name that already holds someone else's bytes.
+
+    The ``.tmp`` siblings are the other half of the same crash. A commit that
+    died between ``to_parquet`` and ``os.replace`` leaves one behind, and while
+    it is harmless -- the next commit truncates the same name -- a sweep that
+    never completes would otherwise accumulate one per interrupted commit in a
+    directory that already holds a partial census.
+    """
+    index = cp.parts
+    while os.path.exists(part := _part_path(cp.path, index)):
+        os.remove(part)
+        index += 1
+    for name in os.listdir(cp.path):
+        if name.endswith(".tmp"):
+            os.remove(os.path.join(cp.path, name))
+
+
+def _commit_checkpoint(
+    cp: SweepCheckpoint,
+    frames: list[pd.DataFrame],
+    *,
+    roots_done: int,
+    failed_cells: list[Cell],
+    cells_visited: int,
+    raw_photo_count: int,
+    api_requests_total: int,
+    bbox: tuple[float, float, float, float],
+    ipp: int,
+    root_count: int,
+) -> None:
+    """
+    Make everything swept so far durable, as of the last completed root boundary.
+
+    Ordering is the whole mechanism: the part is written, fsynced and renamed
+    into place FIRST, and only then does ``state.json`` -- itself written to a
+    sibling and ``os.replace``d -- count it. So a crash anywhere leaves either
+    the previous consistent state or this one, never a half of either.
+
+    THE DIRECTORY IS FSYNCED AFTER EACH RENAME, and the state file before its
+    own. Without that the ordering above holds only against a PROCESS crash --
+    where the page cache survives and the file fsync buys nothing anyway -- and
+    not against a power loss, where the two renames may reach the disk in either
+    order. The failure that leaves would not be a wrong artifact (a state file
+    naming a part that is not there is caught by ``load_checkpoint``'s existence
+    and footer checks) but it would discard the WHOLE checkpoint rather than the
+    last interval, which for a multi-night city is the loss this exists to
+    prevent. Four fsyncs per commit, i.e. four per 32 paced requests, is not a
+    cost worth reasoning about.
+
+    ``frames`` holds only the rows since the last commit; the caller clears it
+    afterwards, which is what keeps the sweep's memory bounded by one interval
+    rather than by the whole census.
+    """
+    frame = concat_census(frames)
+    if len(frame):
+        tmp = _part_path(cp.path, cp.parts) + ".tmp"
+        frame.to_parquet(tmp, index=False)
+        with open(tmp, "rb+") as f:
+            os.fsync(f.fileno())
+        os.replace(tmp, _part_path(cp.path, cp.parts))
+        _fsync_dir(cp.path)
+        cp.parts += 1
+        cp.census_rows += len(frame)
+    cp.roots_done = roots_done
+    cp.failed_cells = list(failed_cells)
+    cp.cells_visited = cells_visited
+    cp.raw_photo_count = raw_photo_count
+    cp.api_requests_total = api_requests_total
+    state = {
+        "format_version": CHECKPOINT_FORMAT_VERSION,
+        "bbox": list(bbox),
+        "radius_m": cp.radius_m,
+        "ipp": ipp,
+        "root_count": root_count,
+        "roots_done": cp.roots_done,
+        "parts": cp.parts,
+        "census_rows": cp.census_rows,
+        "cells_visited": cp.cells_visited,
+        "raw_photo_count": cp.raw_photo_count,
+        "api_requests_total": cp.api_requests_total,
+        "failed_cells": [_cell_to_dict(c) for c in cp.failed_cells],
+        "updated_at": datetime.now(UTC).isoformat(),
+    }
+    tmp_state = _state_path(cp.path) + ".tmp"
+    with open(tmp_state, "w", encoding="utf-8") as f:
+        json.dump(state, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_state, _state_path(cp.path))
+    _fsync_dir(cp.path)
+
+
+def _checkpoint_frames(cp: SweepCheckpoint) -> list[pd.DataFrame]:
+    """
+    The committed parts, read back in index order.
+
+    Index order is FETCH order, and that is not cosmetic:
+    :func:`census.dedupe_census` keeps a repeated image id at the position of
+    its FIRST appearance while taking its LAST values, so reading the parts in
+    any other order -- a directory glob's, say -- would reorder the published
+    CSV of essentially every real city, since the sweep re-sees ~pi/2 of
+    everything by construction.
+    """
+    return [pd.read_parquet(_part_path(cp.path, index)) for index in range(cp.parts)]
+
+
+def discard_checkpoint(path: str) -> None:
+    """
+    Remove a finished checkpoint. THE CALLER'S JOB, once its artifact is durable.
+
+    :func:`_fetch_city_images` deliberately does not call this on a clean sweep.
+    It returns the census as a DataFrame and the caller then writes the dated
+    CSV, the stats, the ``runs`` row, the JSON and the diff -- so a delete
+    issued before returning would be the one thing guaranteeing that a crash in
+    that tail costs the whole sweep again, which is one of the four
+    interruptions #239 exists to cover. Call this last, after the artifact
+    lands, the way ``download_gsv`` unlinks its ``.downloading`` sibling.
+
+    Best effort: a checkpoint that cannot be removed must never fail a run that
+    has already succeeded. The stale directory it leaves is bounded by
+    :data:`CHECKPOINT_MAX_AGE_S`.
+
+    Args:
+        path: the checkpoint directory, as echoed back in ``checkpoint_path``.
+    """
+    try:
+        shutil.rmtree(path)
+    except FileNotFoundError:
+        pass  # already gone; discarding twice is not an error
+    except OSError as e:
+        logger.warning(f"Could not remove the finished KartaView checkpoint at {path}: {e}")
+
+
+def _remove_empty_checkpoint_dir(path: str | None) -> None:
+    """
+    Drop a checkpoint directory nothing was ever written into.
+
+    The directory is created BEFORE the first request, deliberately, so that an
+    unwritable path fails in one second rather than ten hours in. But a sweep
+    can then die before the radius is settled -- a rejected credential, a host
+    block during calibration, a bbox where no rung answers anywhere (Horace) --
+    and never open a checkpoint at all, leaving an empty directory behind on
+    every attempt. ``os.rmdir`` refuses a non-empty directory, which is exactly
+    the test wanted: a real checkpoint is never touched.
+    """
+    if path is None:
+        return
+    try:
+        os.rmdir(path)
+    except OSError:
+        pass
+
+
 async def fetch_city_images_async(
     city_name: str,
     bbox: tuple[float, float, float, float],
@@ -1136,6 +1693,8 @@ async def fetch_city_images_async(
     max_requests: int | None = None,
     retries: int = DEFAULT_BACKPRESSURE_RETRIES,
     calibration_probes: int = DEFAULT_CALIBRATION_PROBES,
+    checkpoint_path: str | None = None,
+    checkpoint_request_interval: int = DEFAULT_CHECKPOINT_REQUEST_INTERVAL,
 ) -> dict[str, Any]:
     """
     Fetch a city's KartaView census, serialized against other processes.
@@ -1146,6 +1705,11 @@ async def fetch_city_images_async(
     nothing published says the ENFORCED one is; both of this project's prior
     bans were on undocumented per-IP limits, and a per-IP limit is a property of
     the machine that no per-process limiter can honour alone (#208).
+
+    That hold covers the CHECKPOINT too, and is why it needs no lock of its own:
+    every read and write of the directory happens inside this ``with``, so a
+    second process on this machine is refused before it can open the file a
+    resume is reading.
 
     See :func:`_fetch_city_images` for the arguments and return value.
 
@@ -1165,6 +1729,8 @@ async def fetch_city_images_async(
             max_requests=max_requests,
             retries=retries,
             calibration_probes=calibration_probes,
+            checkpoint_path=checkpoint_path,
+            checkpoint_request_interval=checkpoint_request_interval,
         )
 
 
@@ -1180,6 +1746,8 @@ async def _fetch_city_images(
     max_requests: int | None = None,
     retries: int = DEFAULT_BACKPRESSURE_RETRIES,
     calibration_probes: int = DEFAULT_CALIBRATION_PROBES,
+    checkpoint_path: str | None = None,
+    checkpoint_request_interval: int = DEFAULT_CHECKPOINT_REQUEST_INTERVAL,
 ) -> dict[str, Any]:
     """
     Sweep a bbox with overlapping circles and return every KartaView photo in it.
@@ -1205,20 +1773,62 @@ async def _fetch_city_images(
             run's calibrated value; leave None to measure it.
         request_timeout: per-request timeout in seconds.
         max_requests_per_minute: client-side pacing. <= 0 disables it (tests).
-        max_requests: runaway guard, not a sampling knob. A sweep that hits it
-            leaves the rest of the bbox UNMEASURED, which all but guarantees the
-            failed-area check below refuses to finalize the snapshot -- which is
-            the point: a partial census must not be published as a dated one.
+        max_requests: runaway guard, not a sampling knob. WITHOUT a checkpoint a
+            sweep that hits it leaves the rest of the bbox UNMEASURED, which all
+            but guarantees the failed-area check below refuses to finalize the
+            snapshot -- which is the point: a partial census must not be
+            published as a dated one. WITH a checkpoint the unvisited cells are
+            not unmeasured, they are tomorrow's work, so the same trip raises
+            :class:`SweepIncompleteError` instead and publishes nothing either
+            way. That is what lets the scheduler hand this the night's remaining
+            budget without the figure being a cliff that destroys the spend.
         retries: backpressure/transport retries before a cell is subdivided.
         calibration_probes: points per rung; a rung passes only if all answer.
+        checkpoint_path: directory to checkpoint into, so an interrupted sweep
+            resumes instead of starting over (#239). None disables it, and that
+            path is byte-for-byte the behaviour that shipped before this
+            existed. THE PATH MUST BE DATE-FREE and must live outside ``data/``;
+            see the checkpoint section above for why both are contracts rather
+            than preferences. One directory per (city, grid geometry, CHANNEL) --
+            the channel is not optional, because a road walk sweeps the same
+            frozen bbox at the same ipp and radius and would otherwise resume
+            the grid run's checkpoint. A mismatched bbox, ipp or radius, or a
+            checkpoint older than :data:`CHECKPOINT_MAX_AGE_S`, discards it and
+            sweeps afresh rather than resuming onto a lattice it does not
+            describe. ON A CLEAN SWEEP THE DIRECTORY SURVIVES: it is the
+            caller's to :func:`discard_checkpoint` once the dated artifact is
+            durable, which is what makes a crash in that tail recoverable.
+        checkpoint_request_interval: requests between commits. Clamped to >= 1.
 
     Returns:
-        Dict with ``census`` (the deduped columnar census), ``api_requests``
-        (every request issued, calibration included), ``cells`` (root cells),
-        ``cells_visited`` (roots plus every subdivision), ``radius_m`` (what the
-        sweep tiled at), ``raw_photo_count`` (pre-dedupe) and ``failed_cells``.
+        Dict with ``census`` (the deduped columnar census), ``api_requests``,
+        ``api_requests_total``, ``cells`` (root cells), ``cells_visited`` (roots
+        plus every subdivision), ``radius_m`` (what the sweep tiled at),
+        ``raw_photo_count`` (pre-dedupe), ``failed_cells`` and
+        ``checkpoint_path`` (echoed back, or None). On a clean sweep that path
+        still exists and is the CALLER'S to :func:`discard_checkpoint` once its
+        artifact is durable; see that function for why deleting it here would
+        forfeit the caller-tail half of #239.
+
+        THE TWO REQUEST COUNTS ARE NOT THE SAME NUMBER and the asymmetry is
+        deliberate. ``api_requests`` is what THIS PROCESS spent; it is what
+        ``cli.py`` feeds to ``db.add_api_usage``, which is additive and keyed by
+        (date, provider), so a resumed night reporting the whole sweep would
+        charge last night's requests against tonight's budget gate and
+        eventually skip cities that fit. ``api_requests_total`` is the sweep's
+        cumulative spend, for the operator and for the ``runs`` row. (Note this
+        is the opposite of ``download_gsv_history``'s checkpoint, which DOES
+        carry its count over -- correctly, because its caller writes
+        ``db.record_harvest`` and never touches the daily ledger.)
+
+        ``cells_visited``, ``raw_photo_count`` and ``failed_cells`` stay
+        CUMULATIVE across a resume, because they describe the census rather than
+        the process that fetched it.
 
     Raises:
+        SweepIncompleteError: the sweep stopped with roots unvisited and
+            checkpointed them. Nothing is finalized; re-run with the same
+            checkpoint path to continue.
         DownloadError: on a rejected credential, a city where no radius answers
             anywhere, or a sweep that left more than
             :data:`MAX_FAILED_AREA_FRACTION` of the bbox unmeasured. Carries
@@ -1227,6 +1837,7 @@ async def _fetch_city_images(
             refusal rather than after the whole bbox has been paid for (#205).
     """
     api_requests = 0
+    prior_requests = 0
 
     def count_request() -> None:
         nonlocal api_requests
@@ -1234,12 +1845,34 @@ async def _fetch_city_images(
 
     def spent(error: DownloadError) -> DownloadError:
         """Attach the spend so the caller can still write the ledger row."""
+        # api_requests is THIS process's, because that is the attribute the
+        # caller hands to the additive daily ledger. The cumulative figure rides
+        # alongside rather than replacing it; see the Returns note above.
         error.api_requests = api_requests
+        error.api_requests_total = prior_requests + api_requests
         return error
 
     def over_budget() -> bool:
         """Has the runaway guard tripped? Asked everywhere a request is issued."""
         return max_requests is not None and api_requests >= max_requests
+
+    def unvisited(cells: list[Cell]) -> None:
+        """
+        Record cells a budget stop never reached.
+
+        WITHOUT a checkpoint they are unmeasured area, and the failed-area guard
+        below must refuse to finalize: a census covering 60% of a city, written
+        as an immutable dated snapshot, diffs against its predecessor as "every
+        pano in the other 40% removed".
+
+        WITH one they are simply tomorrow's work -- on disk, unvisited, and
+        picked up by the resume. Calling them failed there would be actively
+        wrong twice over: it would poison the resumed sweep's guard with cells
+        nothing was ever wrong with, and it would make the guard refuse a
+        snapshot that is about to be completed.
+        """
+        if cp is None:
+            failed_cells.extend(cells)
 
     # Clamped ONCE, here, so the page arithmetic and the wire agree. _post_nearby
     # sends min(ipp, IPP_MAX) because the server caps it there, but
@@ -1251,6 +1884,34 @@ async def _fetch_city_images(
         logger.warning(f"ipp={ipp} exceeds the server cap; using {IPP_MAX}")
         ipp = IPP_MAX
 
+    # Normalized, NOT defended against: any value <= 1 means "commit at every
+    # root boundary", because the cadence test is
+    # `api_requests - requests_at_last_commit >= interval` and no root costs
+    # zero requests. So 0 and -5 are not a way to disable checkpointing, they
+    # are the tightest cadence there is -- and that is a legitimate thing for a
+    # caller to want (the tests sweep at 2 and 3). The clamp only keeps a
+    # nonsense value from reading as one, since `>= -5` and `>= 1` are the same
+    # predicate here. Turning checkpointing OFF is checkpoint_path=None.
+    checkpoint_request_interval = max(1, checkpoint_request_interval)
+
+    # `resumed` is what was already on disk (None on a first night or a
+    # checkpoint that does not describe this sweep); `cp` is the handle the loop
+    # commits through, and cannot be built until the radius is resolved, since
+    # the radius is part of what the checkpoint pins.
+    resumed: SweepCheckpoint | None = None
+    cp: SweepCheckpoint | None = None
+    if checkpoint_path is not None:
+        try:
+            os.makedirs(checkpoint_path, exist_ok=True)
+        except OSError as e:
+            # Asked BEFORE the first request, deliberately. An unwritable
+            # checkpoint discovered ten hours in is the exact failure this
+            # feature exists to prevent, arriving from the inside.
+            raise spent(
+                DownloadError(f"Cannot use the KartaView checkpoint at {checkpoint_path}: {e}")
+            ) from e
+        resumed = load_checkpoint(checkpoint_path, bbox=bbox, ipp=ipp, requested_radius_m=radius_m)
+
     limiter = AsyncRateLimiter(max_requests_per_minute)
     timeout = aiohttp.ClientTimeout(total=request_timeout)
     logger.info(
@@ -1259,13 +1920,32 @@ async def _fetch_city_images(
         else "KartaView pacing DISABLED (max_requests_per_minute <= 0)"
     )
 
+    # `frames` holds only the rows SINCE THE LAST COMMIT once a checkpoint is in
+    # play; everything committed lives on disk and is read back at finalize. The
+    # rest are cumulative across resumes, because they describe the census.
     frames: list[pd.DataFrame] = []
-    failed_cells: list[Cell] = []
-    raw_photo_count = cells_visited = 0
+    failed_cells: list[Cell] = list(resumed.failed_cells) if resumed else []
+    raw_photo_count = resumed.raw_photo_count if resumed else 0
+    cells_visited = resumed.cells_visited if resumed else 0
+    prior_requests = resumed.api_requests_total if resumed else 0
+    start_index = resumed.roots_done if resumed else 0
+    roots_done = start_index
+    requests_at_last_commit = 0
+    stop_reason: str | None = None
 
     try:
         async with aiohttp.ClientSession() as session:
-            if radius_m is None:
+            if resumed is not None:
+                # PINNED, not re-measured. A refusal is a transient (fact 2 --
+                # Horace refused r=1000 on 0/6 attempts and answered it 2/2
+                # forty-five minutes later), so a resume that re-calibrated
+                # could land on a different rung and re-tile the bbox mid-sweep.
+                # The lattice has to be stable across resumes or `roots_done`
+                # indexes into a different list of cells than it was recorded
+                # against. Skipping the ladder also saves up to 30 requests a
+                # night, which is a whole median city.
+                radius_m = resumed.radius_m
+            elif radius_m is None:
                 logger.info(f"Calibrating KartaView sweep radius for {city_name}")
                 radius_m = await calibrate_radius(
                     session,
@@ -1295,6 +1975,11 @@ async def _fetch_city_images(
                     )
                 )
 
+            if checkpoint_path is not None:
+                # The radius is settled, so the checkpoint can be opened against
+                # the lattice it will actually describe.
+                cp = resumed or SweepCheckpoint(path=checkpoint_path, radius_m=radius_m)
+
             roots = cells_for_bbox(*bbox, radius_m * math.sqrt(2))
             logger.info(
                 f"Sweeping KartaView for {city_name}: {len(roots)} cells at r={radius_m} m "
@@ -1302,7 +1987,15 @@ async def _fetch_city_images(
             )
             progress_bar = progress(
                 total=len(roots),
-                desc=f"Sweeping KartaView circles for {city_name}",
+                # Seeded, so a resumed night's bar and its once-a-minute log
+                # line read against the whole city rather than restarting at 0%.
+                initial=start_index,
+                desc=(
+                    f"Sweeping KartaView circles for {city_name}"
+                    if resumed is None
+                    else f"Resuming KartaView sweep for {city_name} "
+                    f"at root {start_index}/{len(roots)}"
+                ),
                 unit="cell",
                 # Paced at ~16 requests/min, so a large city is hours of
                 # deliberately slow fetching under the scheduler's redirected
@@ -1311,16 +2004,27 @@ async def _fetch_city_images(
                 logger=logger,
             )
             budget_stop = False
+            # The accumulators as of the last completed root boundary, so a stop
+            # landing mid-root can roll back to one. Everything a commit writes
+            # is taken at a mark, never mid-cell.
+            mark_frames = 0
+            mark_failed = len(failed_cells)
+            mark_visited, mark_photos = cells_visited, raw_photo_count
             try:
-                for index, root in enumerate(roots):
+                # range(), not enumerate() + continue: skipping already-swept
+                # roots through the loop body would evaluate over_budget() on
+                # each of them, so a resume with a small budget could "stop"
+                # before asking anything.
+                for index in range(start_index, len(roots)):
+                    root = roots[index]
                     if over_budget():
-                        # Everything not yet visited is unmeasured, not empty.
-                        failed_cells.extend(roots[index:])
+                        unvisited(roots[index:])
                         logger.warning(
                             f"Stopped after {api_requests} requests (max_requests="
                             f"{max_requests}); {len(roots) - index} of {len(roots)} cells "
                             f"never visited"
                         )
+                        stop_reason = f"the {max_requests}-request budget ran out"
                         break
                     stack = [root]
                     while stack:
@@ -1337,7 +2041,7 @@ async def _fetch_city_images(
                         # exactly this parameter, so the overrun would be spent
                         # against a per-IP-metered host.
                         if over_budget():
-                            failed_cells.extend(stack)
+                            unvisited(stack)
                             budget_stop = True
                             break
                         cell = stack.pop()
@@ -1400,7 +2104,7 @@ async def _fetch_city_images(
 
                         for page in range(2, pages + 1):
                             if over_budget():
-                                failed_cells.append(cell)
+                                unvisited([cell])
                                 budget_stop = True
                                 break
                             items, _, outcome = await _probe_cell(
@@ -1442,16 +2146,110 @@ async def _fetch_city_images(
                             raw_photo_count += len(items)
                             frames.append(records_to_census(decode_photo_items(items)))
                     if budget_stop:
-                        failed_cells.extend(roots[index + 1 :])
+                        unvisited(roots[index + 1 :])
                         logger.warning(
                             f"Stopped mid-cell after {api_requests} requests (max_requests="
                             f"{max_requests}); {len(roots) - index - 1} of {len(roots)} root "
                             f"cells never visited"
                         )
-                        progress_bar.update(1)
+                        stop_reason = f"the {max_requests}-request budget ran out mid-cell"
+                        if cp is None:
+                            # Uncheckpointed, this root is counted the way it
+                            # always was; the rewind below is what replaces it.
+                            progress_bar.update(1)
                         break
                     progress_bar.update(1)
+                    roots_done = index + 1
+                    mark_frames, mark_failed = len(frames), len(failed_cells)
+                    mark_visited, mark_photos = cells_visited, raw_photo_count
+                    if (
+                        cp is not None
+                        and api_requests - requests_at_last_commit >= checkpoint_request_interval
+                    ):
+                        _commit_checkpoint(
+                            cp,
+                            frames,
+                            roots_done=roots_done,
+                            failed_cells=failed_cells,
+                            cells_visited=cells_visited,
+                            raw_photo_count=raw_photo_count,
+                            api_requests_total=prior_requests + api_requests,
+                            bbox=bbox,
+                            ipp=ipp,
+                            root_count=len(roots),
+                        )
+                        frames.clear()
+                        mark_frames = 0
+                        requests_at_last_commit = api_requests
             finally:
+                # THE COMMIT GOES FIRST AND THE BAR IS CLOSED AFTER. Anything
+                # that can raise between entering this block and committing
+                # would cost the segment this block exists to save, and closing
+                # a progress bar is exactly the kind of thing that raises on a
+                # dead output stream -- the failure mode `progress()` was
+                # written for (#167). Nothing below it can throw the commit
+                # away.
+                if cp is not None:
+                    # REWIND TO THE LAST COMPLETED ROOT BOUNDARY. A commit always
+                    # writes the sweep as of one, and this is where that
+                    # invariant is actually enforced -- for the budget stop
+                    # above, for a host block, for a transport fault, for a bug.
+                    # It is a no-op on the clean path, since the marks are taken
+                    # at each boundary. A root interrupted between its pages has
+                    # photos in hand, but a paged circle is not exhaustive until
+                    # its last page, so committing those rows against a
+                    # `roots_done` that excludes the root would leave the resume
+                    # free to sweep it again -- the census would carry its early
+                    # pages twice and every counter describing it would drift.
+                    # Enforcing it here rather than per stop-path is also what
+                    # lets the DFS stack stay un-persisted.
+                    del frames[mark_frames:]
+                    del failed_cells[mark_failed:]
+                    cells_visited = mark_visited
+                    raw_photo_count = mark_photos
+                    # The bonus half, not the mechanism: this catches a host
+                    # block, a raising responder and the clean end of the loop.
+                    # It does NOT catch a SIGTERM or a SIGKILL -- neither runs a
+                    # finally -- which is why the periodic commit above exists
+                    # and must not be "simplified" into this one.
+                    try:
+                        _commit_checkpoint(
+                            cp,
+                            frames,
+                            roots_done=roots_done,
+                            failed_cells=failed_cells,
+                            cells_visited=cells_visited,
+                            raw_photo_count=raw_photo_count,
+                            api_requests_total=prior_requests + api_requests,
+                            bbox=bbox,
+                            ipp=ipp,
+                            root_count=len(roots),
+                        )
+                        frames.clear()
+                        requests_at_last_commit = api_requests
+                    except Exception as e:
+                        # Best effort, the _write_owner posture: a checkpoint
+                        # that cannot be written must never be what fails a
+                        # sweep. The cost is re-paying this segment, not a
+                        # wrong artifact -- and swallowing it here also means
+                        # it cannot mask an in-flight exception.
+                        #
+                        # BROAD ON PURPOSE, and not the OSError this used to
+                        # catch. A commit runs concat_census, to_parquet and
+                        # json.dump, and their failures are not all OSError --
+                        # pyarrow's ArrowIOError is, but ArrowInvalid is a
+                        # ValueError. This finally sits on the re-raise path of
+                        # HostBlockedError, so anything escaping it would
+                        # replace a host block with a serialization error: no
+                        # exit 81, no night-level breaker, and a scheduler that
+                        # keeps asking a host which is refusing this IP -- the
+                        # exact outcome #205/#208 exist to prevent, arriving
+                        # through the error-handling path.
+                        logger.error(
+                            f"Could not commit the KartaView checkpoint at {cp.path}: "
+                            f"{type(e).__name__}: {e}; "
+                            f"{api_requests - requests_at_last_commit} requests will be re-paid"
+                        )
                 progress_bar.close()
     except HostBlockedError as e:
         # Nothing else in the bbox can answer differently, so the sweep stops
@@ -1466,6 +2264,29 @@ async def _fetch_city_images(
         raise spent(e) from None
     except (TimeoutError, aiohttp.ClientError) as e:
         raise spent(DownloadError(f"KartaView sweep failed: {redact_credentials(e)}")) from e
+    finally:
+        # Only ever fires when `cp` was never opened -- a rejected credential, a
+        # host block during calibration, a bbox where no rung answers. `os.rmdir`
+        # refuses a non-empty directory, so a real checkpoint is untouched.
+        _remove_empty_checkpoint_dir(checkpoint_path)
+
+    if stop_reason is not None and cp is not None:
+        # Without a checkpoint the same stop falls through to the area guard
+        # below, because `unvisited` put those cells in failed_cells: unmeasured
+        # area, refuse. Nothing is finalized either way -- the difference is that
+        # here the spend survives to be continued.
+        raise spent(
+            SweepIncompleteError(
+                f"KartaView sweep for {city_name} stopped after {roots_done} of {len(roots)} "
+                f"root cells ({stop_reason}); {api_requests} requests spent this process, "
+                f"{prior_requests + api_requests} in total. Progress is checkpointed at "
+                f"{cp.path}; re-running with the same checkpoint path continues it. Nothing "
+                f"is finalized: a partial census must never be published as a dated snapshot.",
+                checkpoint_path=cp.path,
+                roots_done=roots_done,
+                root_count=len(roots),
+            )
+        )
 
     if failed_cells:
         # Clamped at 1.0 for the message only. The lattice deliberately
@@ -1483,11 +2304,22 @@ async def _fetch_city_images(
             f"{city_name}'s bbox unmeasured"
         )
         if unmeasured > MAX_FAILED_AREA_FRACTION:
+            # Named so the operator knows the retry is free and the reset is
+            # manual. A complete checkpoint re-finalizes without a request, so
+            # asking again cannot answer differently until the directory goes.
+            resume_note = (
+                ""
+                if cp is None
+                else (
+                    f" Progress is checkpointed at {cp.path}, which re-finalizes without "
+                    f"spending a request, so delete that directory to force a fresh sweep."
+                )
+            )
             raise spent(
                 DownloadError(
                     f"KartaView sweep failed: {detail} "
                     f"(> {MAX_FAILED_AREA_FRACTION:.0%} tolerated); refusing to "
-                    f"finalize an incomplete snapshot"
+                    f"finalize an incomplete snapshot.{resume_note}"
                 )
             )
         # Under the threshold the run continues, but the caller must mark the
@@ -1495,17 +2327,32 @@ async def _fetch_city_images(
         # genuine no-imagery -- the same shape as an undownloaded Mapillary tile.
         logger.warning(f"Continuing with {detail}; affected query points marked REQUEST_FAILED")
 
+    if cp is not None:
+        # Committed parts FIRST, then whatever the finally-commit could not
+        # write: index order is fetch order, which dedupe_census reads as
+        # first-appearance position. Any other order reshuffles the published
+        # CSV of every city, since the sweep re-sees ~pi/2 of everything.
+        frames = _checkpoint_frames(cp) + frames
     census = concat_census(frames)
     del frames
     census = census_core.dedupe_census(census)
+    # The checkpoint is NOT discarded here. It is the caller's, and it must
+    # survive until the dated artifact is durable -- everything that writes one
+    # happens after this returns, so a delete on this line would guarantee that
+    # a crash in that tail re-pays the whole sweep, which is one of the four
+    # interruptions #239 exists to cover. See discard_checkpoint().
 
     logger.info(
         f"Swept {cells_visited} cells ({len(roots)} roots at r={radius_m} m) for {city_name}: "
         f"{raw_photo_count} photo rows, {len(census)} unique, {api_requests} requests"
+        + (f" this process, {prior_requests + api_requests} in total" if prior_requests else "")
     )
     return {
         "census": census,
+        # THIS process's spend, for the additive daily ledger; see the Returns
+        # docstring for why the cumulative figure must not take its place.
         "api_requests": api_requests,
+        "api_requests_total": prior_requests + api_requests,
         "cells": len(roots),
         "cells_visited": cells_visited,
         "radius_m": radius_m,
@@ -1513,4 +2360,5 @@ async def _fetch_city_images(
         # Cells nothing came back for. Empty on a clean sweep; the caller
         # attributes the query points inside them to REQUEST_FAILED.
         "failed_cells": failed_cells,
+        "checkpoint_path": checkpoint_path,
     }

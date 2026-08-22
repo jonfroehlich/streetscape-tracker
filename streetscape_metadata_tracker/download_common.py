@@ -130,6 +130,30 @@ HOST_BUSY_EXIT_CODES = {
 HOST_BY_EXIT_CODE = {code: host for host, code in HOST_EXIT_CODES.items()}
 HOST_BY_BUSY_EXIT_CODE = {code: host for host, code in HOST_BUSY_EXIT_CODES.items()}
 
+# A collection stopped part-way and CHECKPOINTED what it had (issue #239). Not a
+# host condition in either sense above: the third party answered every question
+# it was asked, and nothing about this machine is refusing anything. What ran out
+# was the night — a request budget, a deadline, a supervisor's stop — and the
+# work is on disk waiting for tomorrow.
+#
+# It is a third family rather than an entry in either dict for exactly that
+# reason. A BLOCKED code trips the night-level breaker and skips that host's
+# remaining cities, which would be badly wrong here: the next city's sweep is
+# unaffected by this city's budget. A BUSY code says "another local process holds
+# the lock", which is a different fact an operator would chase differently.
+#
+# 83 continues past the busy family and past sysexits.h's end (78), so like 79-82
+# it carries no false EX_* analogy. The scheduler branch this exists for does not
+# exist yet — KartaView is deliberately unwired — but the number is allocated
+# here, beside the rationale for the numbering, rather than chosen in a later PR
+# that would have to rediscover it. What that branch must do when it lands:
+# `continue` WITHOUT `record_attempt(success=False)`, exactly like the busy
+# branch, because `get_due_cities` filters on `consecutive_failures <
+# max_consecutive_failures` (5) and nothing resets that counter but a success —
+# so a city that legitimately needs three nights would quarantine itself for a
+# whole cycle for making progress.
+SWEEP_INCOMPLETE_EXIT_CODE = 83
+
 
 def host_exit_code(error: HostUnavailableError) -> int:
     """

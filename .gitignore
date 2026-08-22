@@ -42,6 +42,12 @@ __pycache__/
 # systemd unit sets PrivateTmp=true, which would hide these from exactly the
 # detached operator processes the lock exists to serialize against.
 /locks/
+# In-flight KartaView sweep checkpoints (issue #239): a paced sweep is hours
+# long, so it commits what it has answered and resumes tomorrow. Outside data/
+# is a hard requirement rather than tidiness — the contents are a PARTIAL
+# census, and a partial census that reached the publisher would diff against the
+# previous snapshot as every pano in the rest of the city being removed.
+/checkpoints/
 # Claude Code. settings.json is shared project config and IS tracked (team
 # settings: permissions, hooks); the local override and worktree metadata are
 # per-machine. Claude Code normally protects settings.local.json by adding it
