@@ -28,6 +28,7 @@ import io
 import json
 import logging
 import math
+import os
 from datetime import UTC, datetime, timedelta
 
 import numpy as np
@@ -2277,6 +2278,30 @@ def test_a_torn_part_beyond_the_commit_record_is_ignored_and_removed(monkeypatch
 
     result, _ = _sweep_ckpt(monkeypatch, _photos, ckpt)
     assert "never-committed" not in set(result["census"]["id"])
+
+
+def test_an_unpurgeable_checkpoint_degrades_to_a_full_sweep_rather_than_raising(
+    monkeypatch, tmp_path, request
+):
+    """
+    load_checkpoint promises it NEVER RAISES, and the purge of torn parts sat
+    outside the promise: it is an os.remove, so a read-only checkpoint
+    directory raised PermissionError -- before the sweep's DownloadError arms
+    exist to catch anything, i.e. a bare traceback with no api_usage row.
+    Resuming WITHOUT the purge is not the fallback, because the debris would
+    sit under the next commit's part name.
+    """
+    ckpt = tmp_path / "sweep"
+    _failed_sweep_ckpt(monkeypatch, _photos, ckpt, max_requests=2, checkpoint_request_interval=1)
+    torn = ckpt / kv.CHECKPOINT_PART_TEMPLATE.format(index=_state(ckpt)["parts"])
+    kv.records_to_census(kv.decode_photo_items([_item(id="never-committed")])).to_parquet(
+        torn, index=False
+    )
+    os.chmod(ckpt, 0o555)
+    request.addfinalizer(lambda: os.chmod(ckpt, 0o755))
+
+    cp = kv.load_checkpoint(str(ckpt), bbox=BBOX, ipp=kv.IPP_MAX, requested_radius_m=1000)
+    assert cp is None, "an unpurgeable checkpoint is discarded, not raised"
 
 
 def test_a_part_missing_under_the_commit_record_discards_the_whole_checkpoint(

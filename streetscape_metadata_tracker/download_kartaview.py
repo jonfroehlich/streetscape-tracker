@@ -1664,7 +1664,19 @@ def load_checkpoint(
         discard(f"{type(e).__name__}: {e}")
         return None
 
-    _purge_uncommitted_parts(cp)
+    try:
+        _purge_uncommitted_parts(cp)
+    except Exception as e:
+        # The one call that sat OUTSIDE the catch-all, and it hits the
+        # filesystem too: purging a torn part is an os.remove, so a read-only
+        # checkpoint directory raised PermissionError straight through the
+        # NEVER RAISES contract -- out of load_checkpoint, out of the sweep's
+        # own DownloadError arms (it fires before the try), and into cli.py as
+        # a bare traceback with exit 2. Degrade to a fresh sweep like every
+        # other failure here; resuming WITHOUT the purge is not an option,
+        # since the debris would sit under the next commit's part name.
+        discard(f"cannot purge its uncommitted parts: {type(e).__name__}: {e}")
+        return None
     if cp.roots_done == root_count:
         # Louder than the partial case, because this one finalizes without
         # re-sweeping and so cannot be told from a fresh collection by its
