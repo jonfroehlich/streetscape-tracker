@@ -2359,6 +2359,33 @@ def test_a_checkpoint_that_does_not_describe_this_sweep_is_discarded(monkeypatch
     assert len(calls) == result["cells"], "a mismatched checkpoint must not be resumed"
 
 
+def test_a_checkpoint_from_another_channel_is_discarded(monkeypatch, tmp_path):
+    """
+    The path already keys the channel (checkpoint_path_for), but the path is
+    caller-built: a directory moved by hand, or a caller deriving it wrong,
+    passes every geometric check here -- a road walk sweeps the SAME frozen
+    bbox at the same ipp and radius -- and would resume a sweep whose spend
+    belongs to a different api_usage ledger, inheriting its
+    api_requests_total. So the commit record stores the channel it was written
+    under, and refuses another's.
+    """
+    ckpt = tmp_path / "sweep"
+    _failed_sweep_ckpt(monkeypatch, _empty, ckpt, max_requests=2, checkpoint_channel="kartaview")
+    assert _state(ckpt)["channel"] == "kartaview"
+
+    result, calls = _sweep_ckpt(monkeypatch, _empty, ckpt, checkpoint_channel="kartaview_streets")
+    assert len(calls) == result["cells"], "another channel's checkpoint must sweep afresh"
+    assert result["api_requests_total"] == len(calls), "no spend inherited across ledgers"
+    assert _state(ckpt)["channel"] == "kartaview_streets"
+
+    ckpt_two = tmp_path / "sweep2"
+    _failed_sweep_ckpt(
+        monkeypatch, _empty, ckpt_two, max_requests=2, checkpoint_channel="kartaview"
+    )
+    result, calls = _sweep_ckpt(monkeypatch, _empty, ckpt_two, checkpoint_channel="kartaview")
+    assert len(calls) == result["cells"] - 2, "the matching channel still resumes"
+
+
 def test_an_explicit_radius_that_contradicts_the_checkpoint_wins(monkeypatch, tmp_path):
     """
     A caller that names a radius is not asking to be silently overridden by a

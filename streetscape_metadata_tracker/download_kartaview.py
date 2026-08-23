@@ -1460,9 +1460,13 @@ def checkpoint_path_for(city_id: str, bbox: tuple[float, float, float, float], c
     would make every night start from zero.
 
     The CHANNEL is not optional. A KartaView road walk will sweep the same
-    frozen bbox at the same ipp and radius, so every validation in
+    frozen bbox at the same ipp and radius, so every geometric validation in
     :func:`load_checkpoint` would pass and the two channels would resume each
-    other's sweeps -- with different credentials and different ledgers.
+    other's sweeps -- with different credentials and different ledgers. The
+    commit record also stores the channel it was written under and
+    ``load_checkpoint`` compares it, so the path is the half that keeps the
+    directories apart and the state file is the half that refuses if they meet
+    anyway.
 
     The bbox is folded in rather than trusted to the city_id because the frozen
     grid can be re-registered (``scripts/resize_city.py``, ``cap_oversized_grids.py``):
@@ -1486,6 +1490,7 @@ class SweepCheckpoint:
 
     path: str
     radius_m: int
+    channel: str | None = None
     roots_done: int = 0
     parts: int = 0
     census_rows: int = 0
@@ -1556,6 +1561,7 @@ def load_checkpoint(
     bbox: tuple[float, float, float, float],
     ipp: int,
     requested_radius_m: int | None,
+    channel: str | None = None,
 ) -> SweepCheckpoint | None:
     """
     Resume state for this sweep, or None if there is nothing usable here.
@@ -1575,6 +1581,13 @@ def load_checkpoint(
         requested_radius_m: the caller's explicit radius, or None to adopt the
             checkpoint's. An explicit value that CONTRADICTS the stored one
             discards the checkpoint rather than being silently overridden.
+        channel: which api_usage channel this sweep meters into. The PATH
+            already keys the channel (checkpoint_path_for), but the path is
+            caller-built: a directory moved by hand, or a future caller
+            deriving the path wrong, would pass every geometric check here and
+            resume a sweep whose spend belongs to a different ledger. The
+            state file records what it was written as, and a mismatch --
+            including a checkpoint from before this field existed -- discards.
 
     Returns:
         A :class:`SweepCheckpoint` with its uncommitted parts already swept
@@ -1601,6 +1614,12 @@ def load_checkpoint(
             return None
         if int(state["ipp"]) != ipp:
             discard(f"it was swept at ipp={state['ipp']}, this run uses ipp={ipp}")
+            return None
+        if state.get("channel") != channel:
+            discard(
+                f"it belongs to the {state.get('channel')!r} channel and this run is "
+                f"{channel!r}; the two meter into different api_usage ledgers"
+            )
             return None
         radius_m = int(state["radius_m"])
         if requested_radius_m is not None and requested_radius_m != radius_m:
@@ -1634,6 +1653,7 @@ def load_checkpoint(
         cp = SweepCheckpoint(
             path=path,
             radius_m=radius_m,
+            channel=channel,
             roots_done=int(state["roots_done"]),
             parts=int(state["parts"]),
             census_rows=int(state["census_rows"]),
@@ -1783,6 +1803,7 @@ def _commit_checkpoint(
         "format_version": CHECKPOINT_FORMAT_VERSION,
         "bbox": list(bbox),
         "radius_m": cp.radius_m,
+        "channel": cp.channel,
         "ipp": ipp,
         "root_count": root_count,
         "roots_done": cp.roots_done,
@@ -1878,6 +1899,7 @@ async def download_kartaview_metadata_async(
     max_requests: int | None = None,
     radius_m: int | None = None,
     checkpoint_path: str | None = None,
+    checkpoint_channel: str | None = None,
 ) -> dict[str, Any]:
     """
     Sweep a city's KartaView census and write it as a run csv.gz.
@@ -1931,6 +1953,7 @@ async def download_kartaview_metadata_async(
         max_requests_per_minute=max_requests_per_minute,
         max_requests=max_requests,
         checkpoint_path=checkpoint_path,
+        checkpoint_channel=checkpoint_channel,
     )
     api_requests = fetched["api_requests"]
     api_requests_total = fetched["api_requests_total"]
@@ -2021,6 +2044,7 @@ async def fetch_city_images_async(
     calibration_probes: int = DEFAULT_CALIBRATION_PROBES,
     checkpoint_path: str | None = None,
     checkpoint_request_interval: int = DEFAULT_CHECKPOINT_REQUEST_INTERVAL,
+    checkpoint_channel: str | None = None,
 ) -> dict[str, Any]:
     """
     Fetch a city's KartaView census, serialized against other processes.
@@ -2057,6 +2081,7 @@ async def fetch_city_images_async(
             calibration_probes=calibration_probes,
             checkpoint_path=checkpoint_path,
             checkpoint_request_interval=checkpoint_request_interval,
+            checkpoint_channel=checkpoint_channel,
         )
 
 
@@ -2074,6 +2099,7 @@ async def _fetch_city_images(
     calibration_probes: int = DEFAULT_CALIBRATION_PROBES,
     checkpoint_path: str | None = None,
     checkpoint_request_interval: int = DEFAULT_CHECKPOINT_REQUEST_INTERVAL,
+    checkpoint_channel: str | None = None,
 ) -> dict[str, Any]:
     """
     Sweep a bbox with overlapping circles and return every KartaView photo in it.
@@ -2125,6 +2151,10 @@ async def _fetch_city_images(
             caller's to :func:`discard_checkpoint` once the dated artifact is
             durable, which is what makes a crash in that tail recoverable.
         checkpoint_request_interval: requests between commits. Clamped to >= 1.
+        checkpoint_channel: the api_usage channel this sweep meters into,
+            recorded in the commit record and required to match on resume. The
+            checkpoint PATH already keys the channel, but the path is
+            caller-built; this is the half the state file can enforce itself.
 
     Returns:
         Dict with ``census`` (the deduped columnar census), ``api_requests``,
@@ -2257,7 +2287,13 @@ async def _fetch_city_images(
             raise spent(
                 DownloadError(f"Cannot use the KartaView checkpoint at {checkpoint_path}: {e}")
             ) from e
-        resumed = load_checkpoint(checkpoint_path, bbox=bbox, ipp=ipp, requested_radius_m=radius_m)
+        resumed = load_checkpoint(
+            checkpoint_path,
+            bbox=bbox,
+            ipp=ipp,
+            requested_radius_m=radius_m,
+            channel=checkpoint_channel,
+        )
 
     limiter = AsyncRateLimiter(max_requests_per_minute)
     timeout = aiohttp.ClientTimeout(total=request_timeout)
@@ -2337,7 +2373,9 @@ async def _fetch_city_images(
             if checkpoint_path is not None:
                 # The radius is settled, so the checkpoint can be opened against
                 # the lattice it will actually describe.
-                cp = resumed or SweepCheckpoint(path=checkpoint_path, radius_m=radius_m)
+                cp = resumed or SweepCheckpoint(
+                    path=checkpoint_path, radius_m=radius_m, channel=checkpoint_channel
+                )
 
             roots = cells_for_bbox(*bbox, radius_m * math.sqrt(2))
             logger.info(

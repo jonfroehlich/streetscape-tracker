@@ -56,7 +56,6 @@ from .city_registration import (
 from .diff import compute_run_diff, generate_diff_filename, write_diff_detail
 from .download_common import (
     SWEEP_INCOMPLETE_EXIT_CODE,
-    DownloadError,
     HostBusyError,
     HostUnavailableError,
     grid_bbox,
@@ -674,6 +673,11 @@ async def _collect_one_run(conn, args, city_row, run_date, provider, config, vis
                 max_requests_per_minute=args.kartaview_max_requests_per_minute,
                 max_requests=args.kartaview_max_requests,
                 checkpoint_path=checkpoint_path,
+                # The channel again, this time INSIDE the commit record: the
+                # path above separates channels only as long as every caller
+                # derives it correctly, so the state file also records which
+                # ledger its spend belongs to and refuses to resume another's.
+                checkpoint_channel=provider,
             )
         else:
             logging.info(
