@@ -128,12 +128,14 @@
   text-align: center;
   font-weight: bold;
   border-bottom: 1px solid #ddd;
-  /* Separates one metric group from the next without a full grid of rules. */
+  /* Separates one metric group from the next — and the City column from the
+     first of them — without a full grid of rules. There is deliberately no
+     `:first-child` exemption: `label` is `always: true` and leads the
+     canonical column order, so a `.th-group` is never the row's first child
+     and such a rule could not match. It is also not wanted, since the cell to
+     the left is the row-header column rather than the table's edge, and
+     without the divider "City" reads as part of the first group. */
   box-shadow: inset 1px 0 0 #ddd;
-}
-
-.streets-table thead th.th-group:first-child {
-  box-shadow: none;
 }
 
 /* An ungrouped column spans both header rows; align its label with the leaf
@@ -241,13 +243,16 @@
    sign-to-colour rule would have to lie in one of the two places. The sign
    character carries the direction and the column's title says what it means.
    Only an exact zero is styled — "the two providers agree exactly" is a
-   genuinely different fact from "they are close". */
+   genuinely different fact from "they are close". The zero tone is matched on
+   ANY cell, not just `.delta-cell`, because streets.html's "Δ since last walk"
+   group renders the same fact one column over through the per-provider cell
+   path (see walkChangeCellHtml) and the two must not disagree about it. */
 
 .delta-cell {
   font-variant-numeric: tabular-nums;
 }
 
-.delta-cell.delta-zero {
+.streets-table td.delta-zero {
   color: #888;
 }
 
@@ -666,7 +671,14 @@
   width: 100%;
   min-width: 180px;
   height: 56px; /* 32px of bars + a 24px slider lane beneath them */
-  touch-action: none; /* window drags must not scroll the page on touch */
+  /* `pan-y`, not `none`. This is a 56px-tall, full-width strip — three of them
+     on grid.html — inside a sidebar that below 900px is an ordinary scrolling
+     column above the table, so `none` meant a touch STARTING anywhere on a
+     slider (the bars included, which are not draggable at all) could not
+     scroll the panel. `pan-y` keeps vertical scrolling and still claims the
+     horizontal gesture, which is all the window drag uses: `pointermove`
+     reads `clientX` only. */
+  touch-action: pan-y;
 }
 
 .hist-slider.dragging,
