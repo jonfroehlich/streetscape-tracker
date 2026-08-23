@@ -337,6 +337,17 @@ function providerCellHtml(parts, link) {
  * as "City ▲". The <button> is what carries the click and the keyboard focus —
  * a click handler on a bare <th> is unreachable by keyboard.
  *
+ * A grouped leaf's visible label is only a provider name, repeated under every
+ * metric group, so the buttons of a pivoted page expose three distinct
+ * accessible names across eight controls ("GSV", "Mapillary", "Delta", "GSV",
+ * ...) in ONE tab order and one rotor list. Reading the table is fine — AT
+ * associates the `scope="colgroup"` cell with the body cells during table
+ * navigation — but a controls list gets the button's accessible name and
+ * nothing else, and the disambiguating text was in a hover-only `title`.
+ * `aria-label` therefore carries `pickerLabel` ("Grid coverage (%) - Mapillary"),
+ * which the column picker already computes for exactly this reason. It is set
+ * only where a descriptor supplies one, so driving.html's markup is unchanged.
+ *
  * Labels and titles are code constants, not data, so they are interpolated
  * unescaped — unlike anything row-derived, which is OSM/Nominatim content and
  * is escaped at the point it enters innerHTML.
@@ -362,9 +373,10 @@ function headerCellHtml(column, activeSort, { rowspan } = {}) {
   const ariaSort = isActive ? (activeSort.dir === "asc" ? "ascending" : "descending") : "none";
   const arrow = isActive ? (activeSort.dir === "asc" ? "▲" : "▼") : "";
   const title = column.title ? ` title="${column.title}"` : "";
+  const ariaLabel = column.pickerLabel ? ` aria-label="${column.pickerLabel}"` : "";
   return `
     <th scope="col"${span} data-key="${column.key}" aria-sort="${ariaSort}">
-      <button type="button"${title}>${column.label} <span class="sort-arrow" aria-hidden="true">${arrow}</span></button>
+      <button type="button"${ariaLabel}${title}>${column.label} <span class="sort-arrow" aria-hidden="true">${arrow}</span></button>
     </th>`;
 }
 

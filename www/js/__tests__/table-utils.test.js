@@ -122,6 +122,35 @@ test("headerCellHtml: marks the active column and reserves the arrow", () => {
   assert.doesNotMatch(idle, /[▲▼]/);
 });
 
+test("headerCellHtml: a grouped leaf's sort button gets a SELF-CONTAINED accessible name", () => {
+  // A pivoted page's leaf labels are bare provider names repeated under every
+  // metric group, so its header exposes eight sort buttons carrying three
+  // distinct accessible names, in one tab order and one rotor list. Reading
+  // the table is fine (AT associates the colgroup cell during table
+  // navigation); a controls list gets the button's name and nothing else, and
+  // the disambiguating text was in a hover-only title. pickerLabel already
+  // computes exactly the right string for the column picker's flat list.
+  const leaf = {
+    key: "pct_mapillary",
+    label: "Mapillary",
+    pickerLabel: "Grid coverage (%) — Mapillary",
+    title: "Share of the city's grid sample points with a 360° panorama",
+  };
+  const html = headerCellHtml(leaf, { key: "label", dir: "asc" });
+  assert.match(html, /aria-label="Grid coverage \(%\) — Mapillary"/);
+  // The VISIBLE label stays short — three of them have to fit one measure.
+  assert.match(html, />Mapillary <span class="sort-arrow"/);
+  // The title is unchanged and still there; aria-label does not replace it.
+  assert.match(html, /title="Share of the city/);
+});
+
+test("headerCellHtml: a column with no pickerLabel emits no aria-label at all", () => {
+  // driving.html's descriptors carry none, and its header markup must not
+  // move — the same guarantee theadHtml's group-free branch makes.
+  const html = headerCellHtml(COLUMNS[1], { key: "pct", dir: "desc" });
+  assert.doesNotMatch(html, /aria-label/);
+});
+
 test("headerCellHtml: a non-sortable column gets a label-less header, no data-key", () => {
   // The trailing link column: no sort affordance, but it still needs a <th> or
   // every body row would have one more cell than the header.
