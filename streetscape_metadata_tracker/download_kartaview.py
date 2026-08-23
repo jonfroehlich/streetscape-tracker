@@ -216,7 +216,7 @@ MAX_FAILED_AREA_FRACTION = 0.02
 #
 # EVERY SINGAPORE FIGURE IN THIS SECTION IS `sweep_requests_observed`, NEVER THE
 # GEOMETRIC FLOOR. The cost study's floor column reads 7,329 for the same city and
-# is the number CLAUDE.md says not to quote, because it prices neither the
+# is the number docs/census.md says not to quote, because it prices neither the
 # backpressure retries nor the calibration ladder (the study's own overhead ratio
 # is 1.54x). Singapore is 5,130 root cells / 9,974 requests / ~10.4 h; see
 # docs/experiments/kartaview-sweep-cost.md, "Finding 3".
