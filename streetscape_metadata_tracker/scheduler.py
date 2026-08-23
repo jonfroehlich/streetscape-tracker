@@ -116,7 +116,11 @@ CHANNEL_HOSTS: dict[str, tuple[str, ...]] = {
 }
 
 # Channels that KNOWN_PROVIDERS makes configurable but that the scheduler cannot
-# yet run correctly, refused by load_scheduler_config rather than accepted.
+# yet run correctly. load_scheduler_config drops such a block from `providers`
+# and records the error in SchedulerConfig.unwired_channel_errors; the two
+# channel-running commands (run-due, assess-city) refuse with USAGE_EXIT_CODE
+# while the read-only subcommands — backup-status and restore-backup are the
+# incident-time handles — keep working with the error in the log.
 #
 # The failure this prevents is silent in all three of its parts. #225 phase 3b
 # put "kartaview" in naming.KNOWN_PROVIDERS so the CLI could collect a city by
@@ -268,6 +272,15 @@ class SchedulerConfig:
     # [providers.*] — when None (no section in the TOML), falls back to
     # gsv-only with the legacy [schedule].daily_request_budget
     providers: dict[str, ProviderConfig] | None = None
+    # [providers.*] blocks the naming contract knows but the scheduler cannot
+    # run yet (UNWIRED_CHANNELS). Such a block is DROPPED from `providers` at
+    # load so nothing downstream can price, budget or launch it, and its error
+    # message collects here instead of raising: a load-time ValueError took
+    # down EVERY subcommand — backup-status and restore-backup are the
+    # incident-time handles — over a config block that only run-due and
+    # assess-city could ever act on. Those two refuse (USAGE_EXIT_CODE) while
+    # this list is non-empty; everything else proceeds with the error logged.
+    unwired_channel_errors: list[str] = field(default_factory=list)
     # [alerts] — operator email on unhealthy runs (off by default)
     alerts: AlertConfig = field(default_factory=AlertConfig)
     # [resource_guard] — load/RAM-aware concurrency backoff on shared hosts
@@ -317,6 +330,7 @@ def load_scheduler_config(path: str | None = None) -> SchedulerConfig:
     dp = raw.get("driving_plan", {})
 
     providers = None
+    unwired_channel_errors: list[str] = []
     if "providers" in raw:
         providers = {}
         for name, p in raw["providers"].items():
@@ -331,17 +345,25 @@ def load_scheduler_config(path: str | None = None) -> SchedulerConfig:
                 )
                 continue
             # A channel the naming contract knows but the scheduler cannot yet
-            # run. RAISED, not warned-and-skipped like the branch above: an
-            # unknown name is a typo and dropping it is the kind thing to do,
-            # whereas this one is spelled correctly, would be accepted by every
-            # check after this point, and would then collect wrongly every
-            # night. Refusing at load time makes it impossible to switch on by
-            # accident, and the message says what is missing.
+            # run. RECORDED and dropped, not warned-and-forgotten like the
+            # branch above: an unknown name is a typo and dropping it silently
+            # is the kind thing to do, whereas this one is spelled correctly,
+            # would be accepted by every check after this point, and would then
+            # collect wrongly every night. Dropping it from `providers` is what
+            # makes it impossible to run by accident; recording the message is
+            # what lets run-due/assess-city REFUSE rather than quietly run a
+            # night around a channel the config asks for. Not raised, because a
+            # load-time ValueError took down every subcommand — including
+            # backup-status and restore-backup, the incident-time handles —
+            # over a block only the channel-running commands could act on.
             if name in UNWIRED_CHANNELS:
-                raise ValueError(
+                message = (
                     f"[providers.{name}] in {config_path} is not a runnable scheduler "
                     f"channel yet: {UNWIRED_CHANNELS[name]}. Remove the block."
                 )
+                logger.error(message)
+                unwired_channel_errors.append(message)
+                continue
             # An unknown network_type reaches `collect --network-type` as an
             # argparse choices violation, i.e. exit 2 on EVERY street run of
             # EVERY due city, night after night, with nothing in the scheduler's
@@ -386,6 +408,7 @@ def load_scheduler_config(path: str | None = None) -> SchedulerConfig:
         publish_local=pub.get("local", False),
         site_url=pub.get("site_url", ""),
         providers=providers,
+        unwired_channel_errors=unwired_channel_errors,
         alerts=AlertConfig(
             enabled=al.get("enabled", False),
             recipient=al.get("recipient", ""),
@@ -1919,6 +1942,13 @@ def cmd_assess_city(
     ``today`` is injectable so tests can pin a date; production callers omit it.
     """
     # Validate BEFORE opening the catalog or geocoding, so a typo costs nothing.
+    if cfg.unwired_channel_errors:
+        # Same refusal as cmd_run_due's, for the same reason: this command
+        # launches channels, so it must not run a collection around a config
+        # block the loader had to drop. The read-only subcommands proceed.
+        for message in cfg.unwired_channel_errors:
+            logger.error(message)
+        return USAGE_EXIT_CODE
     try:
         if (lat is None) != (lng is None):
             raise _UsageError("--lat and --lng must be given together")
@@ -2745,6 +2775,16 @@ def cmd_run_due(
     # Validate BEFORE opening the catalog, so an operator typo costs nothing.
     # Returning rather than propagating is deliberate: main()'s run-due branch
     # emails an alert on an exception, and a typo is not a nightly crash.
+    if cfg.unwired_channel_errors:
+        # The load already dropped the block, so nothing below could launch
+        # it — but a night that silently ran AROUND a channel the config asks
+        # for would read as a success while collecting nothing on it, the same
+        # shape as the unknown-channel refusal below. Only the channel-running
+        # commands refuse; backup-status and friends proceed with the error in
+        # the log.
+        for message in cfg.unwired_channel_errors:
+            logger.error(message)
+        return USAGE_EXIT_CODE
     try:
         providers = (
             _select_providers(cfg, requested_providers)
