@@ -2,7 +2,7 @@
 CLI: compute OSM street coverage for an existing run and write a GeoJSON artifact.
 
     python -m streetscape_street_analyzer.analyze "Seattle, WA" \
-        [--provider gsv|mapillary] [--run-date YYYY-MM-DD] \
+        [--provider gsv|mapillary|kartaview] [--run-date YYYY-MM-DD] \
         [--match-dist 25] [--refresh] [--data-dir DIR]
 
 Resolves the city and locates its run CSV via the catalog (read-only except for

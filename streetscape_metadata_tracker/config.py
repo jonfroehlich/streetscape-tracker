@@ -103,16 +103,15 @@ KARTAVIEW_METADATA_DTYPES = {**METADATA_DTYPES, **KARTAVIEW_EXTRA_DTYPES}
 PROVIDER_RUN_DTYPES = {
     "gsv": METADATA_DTYPES,
     "mapillary": MAPILLARY_METADATA_DTYPES,
-    # UNREACHABLE UNTIL naming.KNOWN_PROVIDERS GAINS "kartaview" (phase 3b of
-    # issue #225). Both filename regexes gate on that tuple -- parse_filename
-    # rejects an unknown token outright and _STREETWALK_FILENAME_RE builds its
-    # provider alternation from it -- so dtypes_for_run_path cannot reach this
-    # entry today and a KartaView run would fall through to the Mapillary
-    # default: sequence_index inferred to float64, way_id inferred to a float
-    # that eats its leading zeros. Harmless only because nothing writes a
-    # KartaView run yet; test_a_run_schema_is_reachable_from_a_filename is the
-    # strict-xfail that goes red the moment the token lands, so the two cannot
-    # be brought into step in the wrong order.
+    # Live since #225 phase 3b put "kartaview" in naming.KNOWN_PROVIDERS: both
+    # filename regexes build from that tuple, so a KartaView run's token now
+    # parses and dtypes_for_run_path resolves here instead of falling through
+    # to the Mapillary default (which inferred sequence_index to float64 and
+    # way_id to a float that eats its leading zeros).
+    # test_a_run_schema_is_reachable_from_a_filename asserts the reachability
+    # directly -- it was a strict xfail while the token was pending, so the two
+    # could not be brought into step in the wrong order -- and
+    # test_every_known_provider_has_a_run_schema holds the other direction.
     "kartaview": KARTAVIEW_METADATA_DTYPES,
 }
 
@@ -259,5 +258,6 @@ def load_config(provider: str = "gsv") -> dict[str, Any]:
         return config
 
     raise ValueError(
-        f"Unknown provider {provider!r} (known: gsv, mapillary, gsv_streets, mapillary_streets)"
+        f"Unknown provider {provider!r} "
+        f"(known: gsv, mapillary, kartaview, gsv_streets, mapillary_streets)"
     )
