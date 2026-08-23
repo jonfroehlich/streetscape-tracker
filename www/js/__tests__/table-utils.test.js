@@ -16,6 +16,7 @@ const {
   formatCellNumber,
   coverageCellHtml,
   headerCellHtml,
+  theadHtml,
   rowHtmlFromColumns,
   createSortableTable,
 } = require("../table-utils.js");
@@ -119,6 +120,35 @@ test("headerCellHtml: marks the active column and reserves the arrow", () => {
   const idle = headerCellHtml(COLUMNS[0], { key: "pct", dir: "desc" });
   assert.match(idle, /aria-sort="none"/);
   assert.doesNotMatch(idle, /[▲▼]/);
+});
+
+test("headerCellHtml: a grouped leaf's sort button gets a SELF-CONTAINED accessible name", () => {
+  // A pivoted page's leaf labels are bare provider names repeated under every
+  // metric group, so its header exposes eight sort buttons carrying three
+  // distinct accessible names, in one tab order and one rotor list. Reading
+  // the table is fine (AT associates the colgroup cell during table
+  // navigation); a controls list gets the button's name and nothing else, and
+  // the disambiguating text was in a hover-only title. pickerLabel already
+  // computes exactly the right string for the column picker's flat list.
+  const leaf = {
+    key: "pct_mapillary",
+    label: "Mapillary",
+    pickerLabel: "Grid coverage (%) — Mapillary",
+    title: "Share of the city's grid sample points with a 360° panorama",
+  };
+  const html = headerCellHtml(leaf, { key: "label", dir: "asc" });
+  assert.match(html, /aria-label="Grid coverage \(%\) — Mapillary"/);
+  // The VISIBLE label stays short — three of them have to fit one measure.
+  assert.match(html, />Mapillary <span class="sort-arrow"/);
+  // The title is unchanged and still there; aria-label does not replace it.
+  assert.match(html, /title="Share of the city/);
+});
+
+test("headerCellHtml: a column with no pickerLabel emits no aria-label at all", () => {
+  // driving.html's descriptors carry none, and its header markup must not
+  // move — the same guarantee theadHtml's group-free branch makes.
+  const html = headerCellHtml(COLUMNS[1], { key: "pct", dir: "desc" });
+  assert.doesNotMatch(html, /aria-label/);
 });
 
 test("headerCellHtml: a non-sortable column gets a label-less header, no data-key", () => {
@@ -258,4 +288,122 @@ test("createSortableTable: setSort with an unknown key is a no-op", () => {
   const before = tbodyEl.innerHTML;
   table.setSort("nope");
   assert.equal(tbodyEl.innerHTML, before);
+});
+
+// --- theadHtml (issue #250: grouped two-row headers) ------------------------
+
+const GROUPED = [
+  { key: "label", label: "City", type: "text", initial: "asc", always: true, cell: () => "" },
+  {
+    key: "pct_gsv",
+    label: "GSV",
+    type: "number",
+    initial: "desc",
+    group: { id: "cov", label: "Grid coverage (%)", title: "Share of sample points" },
+    cell: () => "",
+  },
+  {
+    key: "pct_mapillary",
+    label: "Mapillary",
+    type: "number",
+    initial: "desc",
+    group: { id: "cov", label: "Grid coverage (%)", title: "Share of sample points" },
+    cell: () => "",
+  },
+  {
+    key: "deltaPct",
+    label: "Δ",
+    type: "number",
+    initial: "desc",
+    group: { id: "cov", label: "Grid coverage (%)", title: "Share of sample points" },
+    cell: () => "",
+  },
+  { key: "areaKm2", label: "Grid area", type: "number", initial: "desc", cell: () => "" },
+];
+
+test("theadHtml: a group-free column set emits exactly today's single row", () => {
+  // The driving.html guarantee. That page's descriptors carry no `group`, so
+  // its header markup must be byte-identical to the pre-#250 output — which is
+  // precisely what this expression used to be, inlined in createSortableTable.
+  const activeSort = { key: "pct", dir: "desc" };
+  const expected = `<tr>${COLUMNS.map((c) => headerCellHtml(c, activeSort)).join("")}</tr>`;
+  assert.equal(theadHtml(COLUMNS, activeSort), expected);
+  assert.equal((theadHtml(COLUMNS, activeSort).match(/<tr>/g) || []).length, 1);
+});
+
+test("theadHtml: grouped columns collapse into a colgroup cell over their leaves", () => {
+  const html = theadHtml(GROUPED, { key: "pct_gsv", dir: "desc" });
+  assert.equal((html.match(/<tr>/g) || []).length, 2);
+  assert.match(html, /<th scope="colgroup" class="th-group" colspan="3" title="Share of sample points">Grid coverage \(%\)<\/th>/);
+  // Ungrouped columns live in row 1 and span both rows, or row 2 would be
+  // short by exactly the number of ungrouped columns.
+  assert.match(html, /<th scope="col" rowspan="2" data-key="label"/);
+  assert.match(html, /<th scope="col" rowspan="2" data-key="areaKm2"/);
+  // ...and the leaves are in row 2, WITHOUT a rowspan.
+  const [row1, row2] = html.split("</tr><tr>");
+  assert.doesNotMatch(row1, /data-key="pct_gsv"/);
+  assert.match(row2, /data-key="pct_gsv"/);
+  assert.match(row2, /data-key="pct_mapillary"/);
+  assert.match(row2, /data-key="deltaPct"/);
+  assert.doesNotMatch(row2, /rowspan/);
+});
+
+test("theadHtml: only leaves carry data-key and aria-sort, so a group cell is inert", () => {
+  // createSortableTable delegates on `closest("th[data-key]")`; a group cell
+  // that carried one would sort by a column key that does not exist.
+  const html = theadHtml(GROUPED, { key: "pct_mapillary", dir: "asc" });
+  const groupCell = html.slice(html.indexOf('<th scope="colgroup"'));
+  const groupCellOnly = groupCell.slice(0, groupCell.indexOf("</th>"));
+  assert.doesNotMatch(groupCellOnly, /data-key/);
+  assert.doesNotMatch(groupCellOnly, /aria-sort/);
+  assert.doesNotMatch(groupCellOnly, /<button/);
+  // The active leaf is still marked.
+  assert.match(html, /data-key="pct_mapillary" aria-sort="ascending"/);
+});
+
+test("theadHtml: the first VISIBLE member names the group", () => {
+  // A preset or the column picker can drop a group's first column; the group
+  // must still be named rather than rendering an empty header.
+  const withoutFirstLeaf = GROUPED.filter((c) => c.key !== "pct_gsv");
+  const html = theadHtml(withoutFirstLeaf, { key: "label", dir: "asc" });
+  assert.match(html, /colspan="2"[^>]*>Grid coverage \(%\)</);
+});
+
+test("theadHtml: two adjacent groups stay separate cells", () => {
+  const cols = [
+    GROUPED[0],
+    GROUPED[1],
+    { ...GROUPED[1], key: "age_gsv", group: { id: "age", label: "Median age (yrs)" } },
+  ];
+  const html = theadHtml(cols, { key: "label", dir: "asc" });
+  assert.equal((html.match(/scope="colgroup"/g) || []).length, 2);
+  assert.match(html, /colspan="1"[^>]*>Grid coverage \(%\)</);
+  assert.match(html, /colspan="1">Median age \(yrs\)</);
+});
+
+test("createSortableTable: a grouped header still sorts on a leaf click", () => {
+  const { theadEl, tbodyEl } = stubTable();
+  const table = createSortableTable({
+    columns: GROUPED,
+    defaultSort: { key: "label", dir: "asc" },
+    theadEl,
+    tbodyEl,
+  });
+  table.setRows([
+    { cityId: "a", label: "Aye", pct_gsv: 10, pct_mapillary: 20, deltaPct: 10, areaKm2: 1 },
+    { cityId: "b", label: "Bee", pct_gsv: 90, pct_mapillary: 5, deltaPct: -85, areaKm2: 2 },
+  ]);
+  theadEl.clickKey("pct_gsv");
+  assert.equal(table.getSort().key, "pct_gsv");
+  assert.match(theadEl.innerHTML, /data-key="pct_gsv" aria-sort="descending"/);
+});
+
+test("coverageCellHtml: the compact variant adds a class and nothing else", () => {
+  assert.match(coverageCellHtml(50, { compact: true }), /class="coverage-cell coverage-cell--compact"/);
+  assert.equal(
+    coverageCellHtml(null, { compact: true }),
+    `<td class="coverage-cell coverage-cell--compact">—</td>`
+  );
+  // The default is unchanged, so driving.html's cells do not move.
+  assert.match(coverageCellHtml(50), /class="coverage-cell"/);
 });

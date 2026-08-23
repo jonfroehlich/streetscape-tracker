@@ -67,6 +67,25 @@ function matchesSearch(row, fields, query) {
 // ── Structured filters ────────────────────────────────────────
 
 /**
+ * Is this a numeric-window filter?
+ *
+ * `range` (two number inputs) and `histogram-range` (issue #250: a mini
+ * histogram plus a dual-handle slider, WITH the same two number inputs kept
+ * for precision and keyboard/AT parity) differ only in what they render. The
+ * value shape is identical — `{min, max}`, either nullable — and so is the URL
+ * wire format, `"min~max"`. Every place that reasons about the VALUE therefore
+ * has to accept both, which is what this predicate is for: a missed site would
+ * make a histogram filter silently unserializable or un-parseable rather than
+ * failing loudly.
+ *
+ * @param {Object} filter - Filter descriptor.
+ * @returns {boolean}
+ */
+function isRangeType(filter) {
+  return filter.type === "range" || filter.type === "histogram-range";
+}
+
+/**
  * Is a filter's value "unset" (and therefore not narrowing anything)?
  *
  * @param {Object} filter - Filter descriptor.
@@ -76,7 +95,7 @@ function matchesSearch(row, fields, query) {
 function isFilterUnset(filter, value) {
   if (value == null || value === "") return true;
   if (filter.type === "boolean") return value !== true;
-  if (filter.type === "range") return value.min == null && value.max == null;
+  if (isRangeType(filter)) return value.min == null && value.max == null;
   return false;
 }
 
@@ -96,7 +115,7 @@ function isFilterUnset(filter, value) {
  */
 function rowPassesFilter(filter, row, value) {
   if (isFilterUnset(filter, value)) return true;
-  if (filter.type === "range") {
+  if (isRangeType(filter)) {
     const v = row[filter.field];
     if (v == null) return false;
     if (value.min != null && v < value.min) return false;
@@ -125,6 +144,65 @@ function applyFilters(rows, { filters, values, query, searchFields }) {
       matchesSearch(row, searchFields, query ?? "") &&
       filters.every((filter) => rowPassesFilter(filter, row, values[filter.key]))
   );
+}
+
+/**
+ * Resolve the filters that depend on ANOTHER filter's value (issue #250
+ * follow-up: the provider scope).
+ *
+ * A pivoted row holds one value per provider, so a numeric filter has to be
+ * told WHOSE number it is asking about — and the answer is whatever the
+ * "Collected by" select currently says. Before this, the two did not compose
+ * at all: the sliders always read a best-across-providers field, so
+ * "Collected by Mapillary" + "coverage >= 80%" returned 56 cities on the live
+ * catalog and **none** of them had Mapillary coverage >= 80 — every one was
+ * matched on GSV's number, and no city anywhere reaches 80 on Mapillary, so
+ * the honest answer was zero rows.
+ *
+ * A descriptor opts in with `fieldFor(values)` / `labelFor(values)` /
+ * `testFor(values)`; everything else passes through untouched, which is what
+ * keeps driving.html and the plain `range` filters unaware of any of this. The
+ * result is a SHALLOW COPY, so the originals stay the page's static
+ * descriptors and nothing accumulates state across renders.
+ *
+ * @param {Object[]} filters - Filter descriptors.
+ * @param {Object} values - Current {filterKey: value}.
+ * @returns {Object[]} Filters with `field`/`label`/`test` resolved.
+ */
+function resolveFilters(filters, values) {
+  return filters.map((filter) => {
+    if (!filter.fieldFor && !filter.labelFor && !filter.testFor) return filter;
+    return {
+      ...filter,
+      field: filter.fieldFor ? filter.fieldFor(values) : filter.field,
+      label: filter.labelFor ? filter.labelFor(values) : filter.label,
+      test: filter.testFor ? filter.testFor(values) : filter.test,
+    };
+  });
+}
+
+/**
+ * Narrow rows by everything EXCEPT one filter (issue #250).
+ *
+ * The crossfilter rule for a histogram-slider: the bars a slider draws must be
+ * computed over the rows every OTHER control has selected, never over its own
+ * selection. Feeding a filter its own output makes the histogram change under
+ * its own interaction — drag a handle in, the bars outside the window vanish,
+ * so the next drag is measured against a different picture (and dragging back
+ * out cannot restore what is no longer drawn). The other controls still count,
+ * which is the point: searching "Oregon" really should redraw the coverage
+ * bars.
+ *
+ * @param {Object[]} rows - All row models.
+ * @param {Object} cfg - Same shape applyFilters takes.
+ * @param {string} selfKey - The filter to leave out.
+ * @returns {Object[]} A new filtered array (input untouched).
+ */
+function rowsExceptFilter(rows, cfg, selfKey) {
+  return applyFilters(rows, {
+    ...cfg,
+    filters: cfg.filters.filter((filter) => filter.key !== selfKey),
+  });
 }
 
 // ── Column presets ────────────────────────────────────────────
@@ -174,6 +252,14 @@ function resolveVisibleColumns(columns, presets, presetId, explicitKeys) {
  * throwing — a URL is user-editable text, and a bad `?pct=` should not blank
  * the page.
  *
+ * A `select` filter may declare a `defaultValue` (issue #250, streets.html's
+ * network selector). That makes ABSENCE of the parameter mean the default
+ * rather than "no filter": the page has no "all networks" reading, because
+ * road-km coverage under two different network denominators must never sit in
+ * one comparable column. An unknown value falls back to the same default, for
+ * the same reason — dropping the filter entirely would double every city's
+ * rows on a hand-edited URL.
+ *
  * @param {string} search - `location.search`.
  * @param {{filters: Object[]}} cfg
  * @returns {{query: string, preset: ?string, cols: ?string[],
@@ -184,8 +270,11 @@ function parseTableState(search, { filters }) {
   const values = {};
   for (const filter of filters) {
     const raw = params.get(filter.key);
-    if (raw == null || raw === "") continue;
-    if (filter.type === "range") {
+    if (raw == null || raw === "") {
+      if (filter.defaultValue != null) values[filter.key] = filter.defaultValue;
+      continue;
+    }
+    if (isRangeType(filter)) {
       // "10~90", "10~" (min only), "~90" (max only). Bare "~" is unset.
       const [minRaw, maxRaw] = raw.split("~");
       const min = Number.parseFloat(minRaw);
@@ -199,6 +288,8 @@ function parseTableState(search, { filters }) {
       if (raw === "1") values[filter.key] = true;
     } else if (filter.options.some((o) => o.value === raw)) {
       values[filter.key] = raw;
+    } else if (filter.defaultValue != null) {
+      values[filter.key] = filter.defaultValue;
     }
   }
 
@@ -244,7 +335,11 @@ function serializeTableState(state, { filters, defaultPreset }) {
   for (const filter of filters) {
     const value = state.values[filter.key];
     if (isFilterUnset(filter, value)) continue;
-    if (filter.type === "range") {
+    // A select sitting on its declared default is the page's opening view, so
+    // it is omitted for the same reason the default preset is: only deviations
+    // belong in a shared link.
+    if (filter.defaultValue != null && value === filter.defaultValue) continue;
+    if (isRangeType(filter)) {
       params.set(filter.key, `${value.min ?? ""}~${value.max ?? ""}`);
     } else if (filter.type === "boolean") {
       params.set(filter.key, "1");
@@ -282,16 +377,23 @@ function bucketCountFor(n) {
  *
  * @param {Array<?number>} values
  * @param {number} [bucketCount] - Defaults to bucketCountFor(N).
+ * @param {?{min: number, max: number}} [domain] - Fixed axis (issue #250). By
+ *   default the extent is taken from `values`, which is right for the
+ *   distribution strip (it describes the rows in view) and WRONG for a
+ *   histogram-slider, whose axis must stay put while the reader brushes it:
+ *   a self-scaling axis would move the handles' meaning out from under them.
+ *   Values outside the domain are clamped into the end buckets rather than
+ *   dropped, so a stale domain under-draws rather than losing rows.
  * @returns {{buckets: {from: number, to: number, count: number}[],
  *            min: number, max: number, count: number}|null}
  *   Null when nothing is measurable.
  */
-function histogramBuckets(values, bucketCount) {
+function histogramBuckets(values, bucketCount, domain = null) {
   const nums = values.filter((v) => typeof v === "number" && Number.isFinite(v));
   if (nums.length === 0) return null;
   bucketCount = bucketCount ?? bucketCountFor(nums.length);
-  const min = Math.min(...nums);
-  const max = Math.max(...nums);
+  const min = domain ? domain.min : Math.min(...nums);
+  const max = domain ? domain.max : Math.max(...nums);
   if (min === max) {
     return { buckets: [{ from: min, to: max, count: nums.length }], min, max, count: nums.length };
   }
@@ -302,8 +404,10 @@ function histogramBuckets(values, bucketCount) {
     count: 0,
   }));
   for (const value of nums) {
-    // The maximum lands in the last bucket rather than one past the end.
-    const index = Math.min(bucketCount - 1, Math.floor((value - min) / width));
+    // The maximum lands in the last bucket rather than one past the end; with
+    // a fixed domain, so does anything beyond it (and anything below the floor
+    // lands in the first) — clamped at both ends, not discarded.
+    const index = Math.min(bucketCount - 1, Math.max(0, Math.floor((value - min) / width)));
     buckets[index].count += 1;
   }
   return { buckets, min, max, count: nums.length };
@@ -414,14 +518,43 @@ function renderDistributionStrip(el, column, values, clickable = false) {
  * `<fieldset>` — so the whole region is keyboard-reachable and announced
  * without any ARIA of its own.
  *
- * @param {Object} cfg - {filters, presets, columns}.
+ * Two section orders, picked by `layout`:
+ *
+ *  * `"inline"` (default) — search, then every filter in descriptor order,
+ *    then the column controls, then Clear all. This is the horizontal strip
+ *    driving.html has always rendered, and it is emitted byte-identically.
+ *  * `"sidebar"` — search, selects, the column controls, numeric windows, then
+ *    booleans, then Clear all (issue #250). In a 280px column the reading
+ *    order IS the layout, so the cheap categorical narrowings come first and
+ *    the tall histogram brushes sit below the column controls rather than
+ *    pushing them off the bottom.
+ *
+ * The sidebar order partitions by filter TYPE, so it also carries an
+ * "everything else" bucket: a filter type added later must still be rendered
+ * somewhere rather than silently vanishing from one of the two layouts.
+ *
+ * @param {Object} cfg - {filters, presets, columns, searchPlaceholder,
+ *   showDistributionStrip, layout}.
  * @returns {string} HTML.
  */
-function controlsHtml({ filters, presets, columns, searchPlaceholder }) {
-  const filterControls = filters
-    .map((filter) => {
+function controlsHtml({
+  filters,
+  presets,
+  columns,
+  searchPlaceholder,
+  showDistributionStrip = true,
+  layout = "inline",
+}) {
+  const renderFilter = (filter) => {
       if (filter.type === "select") {
-        const options = [`<option value="">${filter.anyLabel ?? "All"}</option>`]
+        // A select with a declared default has no "any" reading (issue #250:
+        // streets.html's network selector — two networks means two different
+        // street-km denominators, which must never share a column), so the
+        // blank option is omitted rather than offered and then ignored.
+        const options = (filter.defaultValue != null
+          ? []
+          : [`<option value="">${filter.anyLabel ?? "All"}</option>`]
+        )
           .concat(filter.options.map((o) => `<option value="${o.value}">${o.label}</option>`))
           .join("");
         return `
@@ -430,11 +563,13 @@ function controlsHtml({ filters, presets, columns, searchPlaceholder }) {
             <select id="f-${filter.key}" data-filter="${filter.key}">${options}</select>
           </div>`;
       }
-      if (filter.type === "range") {
-        return `
-          <div class="control control-range" role="group" aria-labelledby="f-${filter.key}-legend">
-            <span class="control-legend" id="f-${filter.key}-legend">${filter.label}</span>
-            <input type="number" data-filter="${filter.key}" data-bound="min"
+      // The two numeric-window flavours share their number inputs verbatim —
+      // same `data-filter`/`data-bound` hooks, same aria-labels — because
+      // those are what syncControlsToState, handleControlChange and the e2e
+      // selectors read. `histogram-range` only ADDS the bars + brush above
+      // them (issue #250); the precision path is unchanged, which is also what
+      // keeps the control fully usable by keyboard and by AT.
+      const boundInputs = () => `<input type="number" data-filter="${filter.key}" data-bound="min"
                    aria-label="Minimum ${filter.label}" placeholder="min"
                    ${filter.min != null ? `min="${filter.min}"` : ""}
                    ${filter.max != null ? `max="${filter.max}"` : ""}>
@@ -442,7 +577,31 @@ function controlsHtml({ filters, presets, columns, searchPlaceholder }) {
             <input type="number" data-filter="${filter.key}" data-bound="max"
                    aria-label="Maximum ${filter.label}" placeholder="max"
                    ${filter.min != null ? `min="${filter.min}"` : ""}
-                   ${filter.max != null ? `max="${filter.max}"` : ""}>
+                   ${filter.max != null ? `max="${filter.max}"` : ""}>`;
+      if (filter.type === "range") {
+        return `
+          <div class="control control-range" role="group" aria-labelledby="f-${filter.key}-legend">
+            <span class="control-legend" id="f-${filter.key}-legend">${filter.label}</span>
+            ${boundInputs()}
+          </div>`;
+      }
+      if (filter.type === "histogram-range") {
+        // The bars are decorative (aria-hidden): the two range thumbs carry a
+        // live aria-valuetext and the number inputs carry the exact figures,
+        // so nothing here is announced twice or only visually.
+        return `
+          <div class="control control-histogram" data-histogram="${filter.key}"
+               role="group" aria-labelledby="f-${filter.key}-legend">
+            <span class="control-legend" id="f-${filter.key}-legend">${filter.label}</span>
+            <div class="hist-slider">
+              <div class="hist-bars" aria-hidden="true"></div>
+              <div class="hist-track" aria-hidden="true"><div class="hist-fill"></div></div>
+              <input type="range" class="hist-lo" aria-label="Minimum ${filter.label}">
+              <input type="range" class="hist-hi" aria-label="Maximum ${filter.label}">
+            </div>
+            <div class="hist-bounds">
+              ${boundInputs()}
+            </div>
           </div>`;
       }
       return `
@@ -452,32 +611,35 @@ function controlsHtml({ filters, presets, columns, searchPlaceholder }) {
             filter.title ? ` title="${filter.title}"` : ""
           }>${filter.label}</label>
         </div>`;
-    })
-    .join("");
+  };
 
   const presetOptions = presets
     .map((p) => `<option value="${p.id}"${p.title ? ` title="${p.title}"` : ""}>${p.label}</option>`)
     .join("");
 
+  // `pickerLabel` overrides `label` here because a pivoted page's leaf labels
+  // are provider names ("GSV", "Mapillary") repeated across every metric group
+  // — unambiguous under their group header, meaningless in a flat checkbox
+  // list. Pages that don't set one are unchanged.
   const pickerBoxes = columns
     .filter((c) => c.always !== true)
     .map(
       (c) => `
         <label class="col-toggle">
-          <input type="checkbox" data-column="${c.key}"> ${c.label}
+          <input type="checkbox" data-column="${c.key}"> ${c.pickerLabel ?? c.label}
         </label>`
     )
     .join("");
 
-  return `
-    <div class="table-controls">
+  const searchControl = `
       <div class="control control-search">
         <label for="table-search">Search</label>
         <input type="search" id="table-search"
                placeholder="${searchPlaceholder ?? "City, provider…"}"
                autocomplete="off" spellcheck="false">
-      </div>
-      ${filterControls}
+      </div>`;
+
+  const columnControls = `
       <div class="control">
         <label for="table-preset">Columns</label>
         <select id="table-preset">${presetOptions}</select>
@@ -491,10 +653,44 @@ function controlsHtml({ filters, presets, columns, searchPlaceholder }) {
           </fieldset>
           <button type="button" class="col-reset">Reset to preset</button>
         </div>
-      </details>
-      <button type="button" class="controls-clear">Clear all</button>
+      </details>`;
+
+  const clearControl = `
+      <button type="button" class="controls-clear">Clear all</button>`;
+
+  let body;
+  if (layout === "sidebar") {
+    // Partition, don't hand-list: `rest` catches any filter type not named
+    // here, so a type added later renders in the wrong PLACE rather than not
+    // at all. The order is search -> selects -> columns -> numeric windows ->
+    // booleans -> clear.
+    const selects = filters.filter((f) => f.type === "select");
+    const ranges = filters.filter(isRangeType);
+    const booleans = filters.filter((f) => f.type === "boolean");
+    const placed = new Set([...selects, ...ranges, ...booleans]);
+    const rest = filters.filter((f) => !placed.has(f));
+    const render = (list) => list.map(renderFilter).join("");
+    body =
+      searchControl +
+      render(selects) +
+      columnControls +
+      render(ranges) +
+      render(booleans) +
+      render(rest) +
+      clearControl;
+  } else {
+    // The literal indent the old `${filterControls}` interpolation sat on. It
+    // is here so this branch stays BYTE-identical to the pre-#250 markup —
+    // driving.html renders through it, and a test compares the two strings
+    // rather than trusting the eye.
+    body =
+      searchControl + "\n      " + filters.map(renderFilter).join("") + columnControls + clearControl;
+  }
+
+  return `
+    <div class="table-controls">${body}
     </div>
-    <div class="distribution-strip" id="distribution-strip"></div>`;
+    ${showDistributionStrip ? `<div class="distribution-strip" id="distribution-strip"></div>` : ""}`;
 }
 
 /**
@@ -515,10 +711,41 @@ function controlsHtml({ filters, presets, columns, searchPlaceholder }) {
  * @param {Object[]} cfg.presets - Preset descriptors.
  * @param {Object[]} cfg.filters - Filter descriptors.
  * @param {string[]} cfg.searchFields - Row fields the text query searches.
- * @param {Function} [cfg.onChange] - Called with the filtered rows after every
- *   change, for the page's caption/result count.
+ * @param {Function} [cfg.onChange] - Called with the filtered rows, every row,
+ *   and a snapshot of the control state, after every change — for the page's
+ *   caption/result count. The third argument is what lets a caption name a
+ *   filter's active value (streets.html's network) without reaching into the
+ *   DOM for it.
+ * @param {"inline"|"sidebar"} [cfg.layout="inline"] - Control section order;
+ *   see controlsHtml. The pivoted pages pass "sidebar"; driving.js does not,
+ *   and its markup is unchanged.
+ * @param {boolean} [cfg.showDistributionStrip=true] - Render the sorted-column
+ *   distribution strip. The pivoted pages (issue #250) turn it off: their
+ *   numeric filters are histogram-sliders, which draw a PER-FILTER histogram
+ *   on a fixed axis, so a second histogram of whichever column happens to be
+ *   sorted — one that silently swapped its metric on every header click — is
+ *   two conflicting answers to one question. driving.html keeps it.
  * @returns {{setRows: Function, getFilteredRows: Function}}
  */
+/**
+ * The filter values an untouched page opens on.
+ *
+ * Only `defaultValue` selects contribute: everything else's "unset" is the
+ * absence of a key. This is what "Clear all" resets TO — blanking a defaulted
+ * select instead would leave streets.html showing both network types at once,
+ * i.e. two incomparable street-km denominators stacked in one column.
+ *
+ * @param {Object[]} filters - Filter descriptors.
+ * @returns {Object} {filterKey: value}.
+ */
+function defaultFilterValues(filters) {
+  const values = {};
+  for (const filter of filters) {
+    if (filter.defaultValue != null) values[filter.key] = filter.defaultValue;
+  }
+  return values;
+}
+
 function createTableControls({
   rootEl,
   table,
@@ -528,6 +755,8 @@ function createTableControls({
   searchFields,
   searchPlaceholder,
   onChange,
+  showDistributionStrip = true,
+  layout = "inline",
 }) {
   const defaultPreset = presets[0].id;
   let allRows = [];
@@ -540,13 +769,191 @@ function createTableControls({
     query: "",
     preset: defaultPreset,
     cols: null,
-    values: {},
+    values: defaultFilterValues(filters),
   };
 
-  rootEl.innerHTML = controlsHtml({ filters, presets, columns, searchPlaceholder });
+  rootEl.innerHTML = controlsHtml({
+    filters,
+    presets,
+    columns,
+    searchPlaceholder,
+    showDistributionStrip,
+    layout,
+  });
   const searchEl = rootEl.querySelector("#table-search");
   const presetEl = rootEl.querySelector("#table-preset");
+  // Null when the page opted out — every strip site below guards on the
+  // element rather than re-reading the flag, so there is one condition to get
+  // right instead of five.
   const stripEl = rootEl.querySelector("#distribution-strip");
+
+  // ── Histogram-sliders (issue #250) ──
+  // One per `histogram-range` filter, each with a FIXED axis seeded once from
+  // the full row set. `entry.domain` is whatever `setDomain` HANDED BACK, not
+  // the raw extent passed in: the component snaps the ends outward to whole
+  // steps, and the thumbs and `.hist-fill` are positioned over that snapped
+  // axis while `repaintHistograms` draws the bars across the same 100% width.
+  // Keeping the pre-snap copy here is what would let the bars and the handles
+  // describe different scales (measured 1.05% of the track at the data max on
+  // a 0-85.1 coverage axis).
+  // The filters as they read RIGHT NOW: a scoped descriptor's field, label and
+  // test all depend on another control's value, so everything that reasons
+  // about a filter reads this rather than the static `filters`. Re-derived
+  // whenever the values change (see refreshResolved).
+  let resolved = resolveFilters(filters, state.values);
+  const filterFor = (key) => resolved.find((f) => f.key === key);
+
+  /**
+   * Write a numeric window into its two precision inputs.
+   *
+   * THE single writer, because there are FOUR paths that change a window — a
+   * typed bound, that bound being NORMALIZED (swapped, nulled at an edge, or
+   * clamped past one), a dragged handle, and a scope change clearing it — and
+   * every one of them has to leave the inputs agreeing with `state.values`.
+   * The scope-clear path is the one that got this wrong first: the filter was
+   * genuinely cleared and the table re-filtered, while the min box went on
+   * reading "80". The normalization path is the same shape and was missed in
+   * the first pass — see handleControlChange.
+   */
+  function writeRangeInputs(key, value) {
+    const [minEl, maxEl] = rootEl.querySelectorAll(`[data-filter="${key}"]`);
+    if (!minEl || !maxEl) return;
+    minEl.value = value?.min ?? "";
+    maxEl.value = value?.max ?? "";
+  }
+
+  const histograms = new Map(); // filter key -> {slider, domain, field}
+  for (const filter of filters) {
+    if (filter.type !== "histogram-range") continue;
+    const el = rootEl.querySelector(`.control-histogram[data-histogram="${filter.key}"]`);
+    if (!el || typeof createHistogramSlider !== "function") continue;
+    const entry = { key: filter.key, domain: null, slider: null, field: null };
+    entry.slider = createHistogramSlider({
+      rootEl: el,
+      filter,
+      onInput: (range) => {
+        state.values[filter.key] = range;
+        // Keep the precision inputs showing what the handles say, so a drag
+        // and a typed bound can never disagree about the current window.
+        writeRangeInputs(filter.key, range);
+        // Debounced on the SAME timer as a typed bound: a drag emits on every
+        // pointer move, and on grid.html that is 1,501 rows re-filtered and
+        // re-rendered per frame.
+        clearTimeout(rangeTimer);
+        rangeTimer = setTimeout(apply, 150);
+      },
+    });
+    histograms.set(filter.key, entry);
+  }
+
+  /**
+   * Fix each histogram's axis from the FULL row set, clamped by whatever the
+   * descriptor declares.
+   *
+   * An axis recomputed under a BRUSH would move the handles' meaning out from
+   * under the reader's hand, so it is seeded once per field and then left
+   * alone. A SCOPE change is the one thing that legitimately moves it — the
+   * slider is now asking about a different population, and a Mapillary-scoped
+   * coverage axis genuinely should not span GSV's range. That is a different
+   * gesture from brushing, and it is the only case this re-seeds on.
+   *
+   * The scoped filter's window is CLEARED when its field changes, rather than
+   * carried across and clamped into the new domain. Clamping would silently
+   * rewrite the question: ">= 80%" against a 0-47.6% Mapillary axis would
+   * become ">= 47.6%" and return a row, where the truthful answer is none.
+   *
+   * @param {boolean} [clearOnChange] - Clear a filter whose field moved. False
+   *   on the initial seed, where the field has not "changed" — it arrived that
+   *   way from the URL, together with the window that belongs to it.
+   * @param {Object} [opts]
+   * @param {boolean} [opts.force] - Re-seed even where the field has not
+   *   moved. `setRows` passes this, because the ROWS are what an axis is
+   *   derived from: gating on the field alone made a second `setRows` keep the
+   *   first row set's axis, which is not what a method called "set the rows"
+   *   should do. Not reachable while both pages render once, which is exactly
+   *   why it is worth closing now.
+   */
+  function syncHistogramDomains(clearOnChange = true, { force = false } = {}) {
+    for (const entry of histograms.values()) {
+      const filter = filterFor(entry.key);
+      if (!force && entry.field === filter.field) continue;
+      const changed = entry.field !== null;
+      entry.field = filter.field;
+      const values = allRows
+        .map((row) => row[filter.field])
+        .filter((v) => typeof v === "number" && Number.isFinite(v));
+      let min = values.length ? Math.min(...values) : (filter.min ?? 0);
+      let max = values.length ? Math.max(...values) : (filter.max ?? 1);
+      if (filter.min != null) min = Math.max(min, filter.min);
+      if (filter.max != null) max = Math.min(max, filter.max);
+      if (changed && clearOnChange) {
+        delete state.values[entry.key];
+        writeRangeInputs(entry.key, null);
+      }
+      // The SNAPPED axis, which is the one histogramBuckets has to bucket over.
+      entry.domain = entry.slider.setDomain({ min, max: max > min ? max : min + 1 });
+      entry.slider.setValue(state.values[entry.key]);
+      entry.slider.setLabel(filter.label);
+    }
+  }
+
+  /**
+   * Redraw every histogram over the rows the OTHER controls have selected.
+   *
+   * Never over `filtered`: feeding a slider its own output makes the picture
+   * collapse under the brush that drew it (and dragging back out cannot
+   * restore bars that are no longer there). Costs one extra filter pass per
+   * histogram — three passes over ~1,500 rows on the widest page.
+   */
+  function repaintHistograms() {
+    for (const [key, entry] of histograms) {
+      const rows = rowsExceptFilter(
+        allRows,
+        { filters: resolved, values: state.values, query: state.query, searchFields },
+        key
+      );
+      entry.slider.setHistogram(
+        histogramBuckets(
+          rows.map((row) => row[entry.field]),
+          HISTOGRAM_SLIDER_BUCKETS,
+          entry.domain
+        )
+      );
+    }
+  }
+
+  /**
+   * Re-derive the resolved filters and everything downstream of a scope
+   * change: each histogram's axis, its window, and the wording that says whose
+   * numbers it is asking about.
+   */
+  function refreshResolved({ clearOnScopeChange = true, reseedDomains = false } = {}) {
+    resolved = resolveFilters(filters, state.values);
+    syncHistogramDomains(clearOnScopeChange, { force: reseedDomains });
+    for (const filter of resolved) if (filter.labelFor) relabelControl(filter);
+  }
+
+  /**
+   * Write a resolved label back onto its control.
+   *
+   * A scoped filter's wording is the ONLY thing that says whose numbers it is
+   * asking about, so it has to move with the scope — leaving it static is the
+   * invisible-semantics problem this whole change exists to fix. Two shapes to
+   * cover: a numeric window labels itself with a `.control-legend` span and two
+   * aria-labelled bounds, everything else with a plain `<label for>`.
+   */
+  function relabelControl(filter) {
+    const legend = rootEl.querySelector(`#f-${filter.key}-legend`);
+    if (legend) {
+      legend.textContent = filter.label;
+      const [minEl, maxEl] = rootEl.querySelectorAll(`[data-filter="${filter.key}"]`);
+      minEl?.setAttribute("aria-label", `Minimum ${filter.label}`);
+      maxEl?.setAttribute("aria-label", `Maximum ${filter.label}`);
+      return;
+    }
+    const label = rootEl.querySelector(`label[for="f-${filter.key}"]`);
+    if (label) label.textContent = filter.label;
+  }
 
   // ── state → DOM ──
   function syncControlsToState() {
@@ -554,16 +961,22 @@ function createTableControls({
     presetEl.value = state.preset;
     for (const filter of filters) {
       const value = state.values[filter.key];
-      if (filter.type === "range") {
-        const [minEl, maxEl] = rootEl.querySelectorAll(`[data-filter="${filter.key}"]`);
-        minEl.value = value?.min ?? "";
-        maxEl.value = value?.max ?? "";
+      if (isRangeType(filter)) {
+        // Exactly the two number inputs: a histogram-range's <input type=range>
+        // handles deliberately carry no `data-filter`, so writeRangeInputs
+        // finds the same [min, max] pair for both range flavours.
+        writeRangeInputs(filter.key, value);
       } else {
         const el = rootEl.querySelector(`[data-filter="${filter.key}"]`);
         if (filter.type === "boolean") el.checked = value === true;
         else el.value = value ?? "";
       }
     }
+    // Adopt WITHOUT reporting: this runs when the URL, "Clear all" or a strip
+    // click is the source of the value, and echoing it back through onInput
+    // would be circular.
+    for (const [key, entry] of histograms) entry.slider.setValue(state.values[key]);
+    for (const filter of resolved) if (filter.labelFor) relabelControl(filter);
     const visibleKeys = new Set(
       resolveVisibleColumns(columns, presets, state.preset, state.cols).map((c) => c.key)
     );
@@ -580,10 +993,11 @@ function createTableControls({
 
   /** The range filter a click on the strip's bars would set, if any. */
   function rangeFilterFor(column) {
-    return filters.find((f) => f.type === "range" && f.field === column.key);
+    return filters.find((f) => isRangeType(f) && f.field === column.key);
   }
 
   function repaintStrip() {
+    if (!stripEl) return;
     const sort = table.getSort();
     const column = columns.find((c) => c.key === sort.key);
     if (column) {
@@ -598,16 +1012,20 @@ function createTableControls({
 
   /** Re-filter, repaint the table, the strip, and the URL. */
   function apply() {
+    // A scope change lands here through the same path as any other control, so
+    // this is where the resolved filters catch up before anything reads them.
+    refreshResolved();
     filtered = applyFilters(allRows, {
-      filters,
+      filters: resolved,
       values: state.values,
       query: state.query,
       searchFields,
     });
     table.setRows(filtered);
     repaintStrip();
+    repaintHistograms();
     updateUrl();
-    onChange?.(filtered, allRows);
+    onChange?.(filtered, allRows, { values: { ...state.values }, preset: state.preset });
   }
 
   function applyColumns() {
@@ -635,7 +1053,19 @@ function createTableControls({
   });
 
   /** Fold one control's current DOM value into `state` and repaint. */
-  function handleControlChange(target) {
+  /**
+   * Apply one control's current DOM state.
+   *
+   * @param {Element} target
+   * @param {Object} [opts]
+   * @param {boolean} [opts.commit] - The reader has FINISHED with this control
+   *   (blur or Enter on a number input), so a normalized window may be written
+   *   back into the two precision boxes. Deliberately not done on every
+   *   debounced keystroke: a bound half-way to "95" reads as "9", which
+   *   normalizes to the domain edge or to null, and rewriting the box would
+   *   wipe the digit that was about to follow.
+   */
+  function handleControlChange(target, { commit = false } = {}) {
     if (target.dataset?.column) {
       state.cols = [...rootEl.querySelectorAll("[data-column]")]
         .filter((b) => b.checked)
@@ -648,7 +1078,7 @@ function createTableControls({
     const key = target.dataset?.filter;
     if (!key) return;
     const filter = filters.find((f) => f.key === key);
-    if (filter.type === "range") {
+    if (isRangeType(filter)) {
       const [minEl, maxEl] = rootEl.querySelectorAll(`[data-filter="${key}"]`);
       const min = Number.parseFloat(minEl.value);
       const max = Number.parseFloat(maxEl.value);
@@ -656,6 +1086,23 @@ function createTableControls({
         min: Number.isFinite(min) ? min : null,
         max: Number.isFinite(max) ? max : null,
       };
+      // A typed bound has to move the handles too, or the slider would keep
+      // showing the previous window while the table showed a different one.
+      // The component's normalized value is then read BACK as the state, so
+      // there is one answer rather than two: a bound at the domain edge is not
+      // a filter (and must not litter the URL), and a bound outside it is
+      // clamped to the edge — same rows either way, since nothing lies beyond.
+      const entry = histograms.get(key);
+      if (entry) {
+        entry.slider.setValue(state.values[key]);
+        state.values[key] = entry.slider.getValue();
+        // The fourth path (issue #250 review). normalizeSliderRange swaps
+        // crossed handles, nulls a bound sitting at a domain edge and clamps
+        // one beyond it — so without this the boxes can end up reading 90 and
+        // 10 while the table, the thumbs and the URL all say 10-90. Same
+        // two-halves-disagree shape the single writer was introduced for.
+        if (commit) writeRangeInputs(key, state.values[key]);
+      }
     } else if (filter.type === "boolean") {
       state.values[key] = target.checked;
     } else {
@@ -670,7 +1117,15 @@ function createTableControls({
   // and the later "change" for the same element is skipped rather than
   // re-running the same filter pass.
   rootEl.addEventListener("change", (event) => {
-    if (event.target.dataset?.bound) return;
+    if (event.target.dataset?.bound) {
+      // A number input fires "change" on blur or Enter — the moment the reader
+      // is DONE typing, and the only safe moment to write a normalized window
+      // back into the boxes. The pending debounce is dropped rather than left
+      // to re-run the same filter pass a beat later.
+      clearTimeout(rangeTimer);
+      handleControlChange(event.target, { commit: true });
+      return;
+    }
     handleControlChange(event.target);
   });
   let rangeTimer = null;
@@ -694,7 +1149,7 @@ function createTableControls({
   // innerHTML on every sort/filter change, which would silently drop a
   // per-button listener the same way an un-delegated header click would (see
   // createSortableTable's own listener for that exact regression).
-  stripEl.addEventListener("click", (event) => {
+  stripEl?.addEventListener("click", (event) => {
     const bar = event.target.closest?.(".strip-bar[data-from]");
     if (!bar) return;
     const sort = table.getSort();
@@ -719,7 +1174,7 @@ function createTableControls({
 
   rootEl.querySelector(".controls-clear").addEventListener("click", () => {
     state.query = "";
-    state.values = {};
+    state.values = defaultFilterValues(filters);
     state.preset = defaultPreset;
     state.cols = null;
     applyColumns();
@@ -735,7 +1190,13 @@ function createTableControls({
   });
 
   return {
-    /** Seed or replace the full row set (called once the data has loaded). */
+    /**
+     * Seed or replace the full row set (called once the data has loaded).
+     *
+     * Idempotent in the way the name implies: calling it again with a
+     * different row set re-derives the filter axes from those rows rather
+     * than keeping the first set's.
+     */
     setRows(rows) {
       allRows = rows;
       const parsed = parseTableState(
@@ -746,6 +1207,12 @@ function createTableControls({
       state.preset = presets.some((p) => p.id === parsed.preset) ? parsed.preset : defaultPreset;
       state.cols = parsed.cols;
       state.values = parsed.values;
+      // Not a scope CHANGE: the field and its window arrived together from the
+      // URL, so clearing here would discard a shared link's own filter. The
+      // axes DO re-seed though — these are new rows, and an axis is derived
+      // from them — while the window that came with the URL is kept and
+      // re-normalized against whatever domain the new rows produce.
+      refreshResolved({ clearOnScopeChange: false, reseedDomains: true });
       applyColumns();
       if (parsed.sort) table.setSortTo(parsed.sort.key, parsed.sort.dir);
       syncControlsToState();
@@ -755,16 +1222,69 @@ function createTableControls({
   };
 }
 
+// ── Sidebar disclosure (issue #250) ───────────────────────────────────────
+
+/**
+ * Keep a collapsible sidebar from becoming unreachable.
+ *
+ * The filter sidebar is a native `<details>`, which is what gives it keyboard
+ * and AT semantics for nothing. Below the breakpoint its `<summary>` is the
+ * "Filters" toggle; above it the summary is hidden by CSS and the panel is
+ * simply always there. That leaves one bad state: collapse it on a narrow
+ * screen, then widen (rotate a tablet, drag a window) and the panel is closed
+ * with its only toggle now display:none — filters that exist, are in the URL,
+ * and cannot be seen or changed. Widening therefore re-opens it.
+ *
+ * Deliberately one-way: narrowing does NOT collapse a panel the reader opened.
+ *
+ * @param {{open: boolean}} detailsEl - The `<details>` element.
+ * @param {boolean} isWide - Is the viewport past the breakpoint?
+ * @returns {boolean} The resulting open state.
+ */
+function syncSidebarDisclosure(detailsEl, isWide) {
+  if (isWide && !detailsEl.open) detailsEl.open = true;
+  return detailsEl.open;
+}
+
+/**
+ * Wire syncSidebarDisclosure to a media query. A no-op on a page with no
+ * sidebar (driving.html) and in Node, so it is safe to call unconditionally.
+ *
+ * @param {Document|Element} [root]
+ * @param {string} [query] - Must mirror the `max-width: 900px` breakpoint in
+ *   data-table.css; the two are one decision expressed twice.
+ * @returns {?Object} The media-query list, for tests.
+ */
+function wireSidebarDisclosure(root, query = "(min-width: 901px)") {
+  const scope = root ?? (typeof document !== "undefined" ? document : null);
+  if (!scope || typeof window === "undefined" || !window.matchMedia) return null;
+  const detailsEl = scope.querySelector(".sidebar-disclosure");
+  if (!detailsEl) return null;
+  const mq = window.matchMedia(query);
+  const apply = () => syncSidebarDisclosure(detailsEl, mq.matches);
+  apply();
+  mq.addEventListener("change", apply);
+  return mq;
+}
+
+if (typeof document !== "undefined") {
+  document.addEventListener("DOMContentLoaded", () => wireSidebarDisclosure());
+}
+
 // Node/CommonJS export shim for the unit tests. No-op in the browser, where
 // these are plain globals loaded via <script>.
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     foldForSearch,
     matchesSearch,
+    isRangeType,
     isFilterUnset,
     rowPassesFilter,
     applyFilters,
+    rowsExceptFilter,
     resolveVisibleColumns,
+    resolveFilters,
+    defaultFilterValues,
     parseTableState,
     serializeTableState,
     bucketCountFor,
@@ -774,5 +1294,7 @@ if (typeof module !== "undefined" && module.exports) {
     renderDistributionStrip,
     controlsHtml,
     createTableControls,
+    syncSidebarDisclosure,
+    wireSidebarDisclosure,
   };
 }

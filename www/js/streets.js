@@ -12,6 +12,14 @@
  * only become a link if the city also has a published run. Rows whose city is
  * missing from the aggregate still render — they just don't link out.
  *
+ * ONE ROW PER (CITY, NETWORK), providers as sub-columns (issue #250). Two
+ * things could not share a row before: a city's GSV and Mapillary walks, which
+ * measure the SAME sample points and are directly comparable — those are now
+ * columns — and a city's `drive` and `all_public` walks, which divide by
+ * DIFFERENT street-km denominators and must never sit in comparable columns.
+ * So the network is a page-level selector (one network at a time) and the
+ * providers pivot within it.
+ *
  * Deliberately not a map: with a handful of walked cities, a second Leaflet
  * view would duplicate the overview's search/legend/scatter machinery for no
  * gain. Each row links to the city page, which already prefers the road-walk
@@ -19,9 +27,11 @@
  *
  * Depends on globals from streetscape-utils.js (loaded first): PROVIDERS,
  * STREETSCAPE_DATA_BASE_URL, fetchGzippedJson, fetchStreetwalkManifest,
- * adaptCitiesPayload, escapeHtml — from table-utils.js: cityDisplayLabel,
- * sortRowsBy, formatCellNumber, coverageCellHtml, createSortableTable — and
- * from table-controls.js: createTableControls.
+ * adaptCitiesPayload, escapeHtml, DEFAULT_STREET_NETWORK_TYPE,
+ * streetNetworkLabel — from table-utils.js: cityDisplayLabel, sortRowsBy,
+ * formatCellNumber, coverageCellHtml, providerShortLabel, deltaCellHtml,
+ * providerColumnGroup, rowHtmlFromColumns, createSortableTable — and from
+ * table-controls.js: createTableControls.
  */
 
 // ── Display helpers ───────────────────────────────────────────
@@ -39,12 +49,58 @@ function cityLabel(city) {
 }
 
 /**
+ * Registry order — every provider the site KNOWS ABOUT.
+ *
+ * Not the same list as the one the table renders: a provider can be
+ * registered and have walked nothing (KartaView is registered but has no road
+ * walk at all — `build_streetwalk_rows` is Mapillary-specific in three
+ * separate ways), and a leaf column or scope option for such a provider is a
+ * column of em-dashes and a filter that selects no rows. See
+ * `walkProvidersIn`.
+ */
+function walkProviders() {
+  return Object.keys(PROVIDERS);
+}
+
+/**
+ * The registered providers these walks actually CONTAIN, in registry order.
+ *
+ * This is what the columns, the presets and the "Collected by" options fan out
+ * from — the manifest is the payload here, the way cities.json.gz is on the
+ * grid page (issue #250 review).
+ *
+ * @param {Object[]} walks - Manifest walk records.
+ * @returns {string[]}
+ */
+function walkProvidersIn(walks) {
+  const present = new Set((walks ?? []).map((w) => w.provider));
+  return walkProviders().filter((p) => present.has(p));
+}
+
+/**
+ * The head-to-head pair the Δ columns compare, as [minuend, subtrahend]. Same
+ * fixed-pair reasoning as grid.js's GRID_DELTA_PAIRS: "best − GSV" would have
+ * a sign that means something different in every row.
+ */
+const STREET_DELTA_PAIRS = [["mapillary", "gsv"]];
+
+/**
+ * The first delta pair both of whose providers are present, or null.
+ *
+ * @param {string[]} [providers] - Providers present in the manifest.
+ * @returns {?string[]}
+ */
+function streetDeltaPair(providers = walkProviders()) {
+  return STREET_DELTA_PAIRS.find(([a, b]) => providers.includes(a) && providers.includes(b)) ?? null;
+}
+
+/**
  * Index the aggregate by `city_id` for every provider that appears in the
  * walks, so each row can be joined in one lookup.
  *
  * Adapting is per-provider (a v3 record holds an independent run series per
  * provider), so this adapts once per distinct provider rather than once per
- * row — today that is a single pass for "gsv".
+ * row.
  *
  * @param {?Object} rawCities - The parsed cities.json.gz, or null.
  * @param {string[]} providers - Distinct provider keys to index.
@@ -77,31 +133,49 @@ function num(value, digits = 0) {
 }
 
 /**
- * Cell for the "since last walk" coverage delta: an em-dash for a first walk
- * (no change block in the manifest), else a signed percentage-point figure
- * whose title carries the comparison date and the edge churn behind it.
+ * Cell for one provider's "since last walk" coverage delta: an em-dash for a
+ * first walk (no change block in the manifest), else a signed
+ * percentage-point figure whose title carries the comparison date and the edge
+ * churn behind it.
  *
- * @param {Object} row - From toRowModel.
- * @returns {string} HTML for one <td>.
+ * This is a WITHIN-provider comparison over time, and it is the reason this
+ * group keeps one column per provider rather than gaining a cross-provider Δ
+ * of its own: "GSV improved 4 points and Mapillary improved 1" is two facts
+ * about two series, and their difference is not a third.
+ *
+ * An exact zero reads as "0.0 pp", unsigned — matching `deltaCellHtml` one
+ * column over, where the reasoning is spelled out: "the walk found exactly
+ * what the last one did" is a genuinely different fact from "it moved a
+ * little", and "+0.0" claims a rise that did not happen. It carries the same
+ * `delta-zero` hook, so the two cells are styled by one rule.
+ *
+ * @param {Object} row - From pivotStreetWalks.
+ * @param {string} provider
+ * @returns {{html: string, title?: string}} Cell parts (see providerCellHtml).
  */
-function walkChangeCellHtml(row) {
-  if (row.changeDelta == null) return `<td>—</td>`;
-  const sign = row.changeDelta >= 0 ? "+" : "";
+function walkChangeCellHtml(row, provider) {
+  const delta = row[`changeDelta_${provider}`];
+  if (delta == null) return { html: "—" };
+  const change = row[`change_${provider}`] ?? {};
+  const sign = delta > 0 ? "+" : "";
+  const tone = delta > 0 ? "delta-pos" : delta < 0 ? "delta-neg" : "delta-zero";
   const title =
-    `Since ${row.change.from}: ${row.change.edges_gained_coverage ?? 0} streets gained ` +
-    `coverage, ${row.change.edges_lost_coverage ?? 0} lost it`;
-  return `<td title="${escapeHtml(title)}">${sign}${row.changeDelta.toFixed(1)} pp</td>`;
+    `Since ${change.from}: ${change.edges_gained_coverage ?? 0} streets gained ` +
+    `coverage, ${change.edges_lost_coverage ?? 0} lost it`;
+  return {
+    html: `${sign}${delta.toFixed(1)} pp`,
+    className: tone,
+    title: escapeHtml(title),
+  };
 }
 
 /**
  * Cell for the "City" column: the label, hyperlinked to the city page when
- * this row has a published run to link to.
+ * this row has a walk to link to.
  *
- * Absorbs the "View on map" link — a follow-up to issue #188. A whole extra
- * trailing column existed only to carry one link per row, when every row
- * already has exactly one natural place for it: its own name. A row with
- * nothing to link to (no published run) still renders, just as plain text —
- * the same degrade-not-disappear posture the old placeholder cell had.
+ * The target is the first registered provider that walked this (city,
+ * network); each provider's own "Walked" sub-cell links to THAT provider's
+ * walk, which is where a reader after a specific series goes.
  *
  * The link carries THIS row's network type: city.html selects the walk to draw
  * by network type and defaults to 'drive', so without it a "Roads + paths" row
@@ -114,338 +188,606 @@ function walkChangeCellHtml(row) {
  * ellipsis-truncated in CSS (data-table.css) because OSM/Nominatim labels are
  * unbounded and a long one alone can push the table past its measure.
  *
- * @param {Object} row - From toRowModel.
+ * @param {Object} row - From pivotStreetWalks.
  * @returns {string} HTML for one <th scope="row">.
  */
 function walkLabelCellHtml(row) {
   const label = escapeHtml(row.label);
-  const content = row.filename
-    ? `<a class="streets-view-link"
-          href="city.html?file=${encodeURIComponent(row.filename)}&network=${encodeURIComponent(
-        row.networkType
-      )}">${label}</a>`
-    : label;
+  const content = row.filename ? cityPageLink(row.filename, row.networkType, label) : label;
   return `<th scope="row" title="${label}">${content}</th>`;
 }
 
 /**
- * The columns, in table order.
+ * An `<a>` into city.html for one run filename + network type.
+ *
+ * The `&network=` is load-bearing (see walkLabelCellHtml) and this is the one
+ * place it is assembled, so the City cell and every per-provider "Walked" cell
+ * cannot drift apart on it.
+ *
+ * @param {string} filename - A RUN csv.gz filename (not a walk artifact).
+ * @param {string} networkType
+ * @param {string} text - Already-escaped link text.
+ * @param {?string} [title] - Already-escaped title attribute.
+ * @returns {string}
+ */
+function cityPageLink(filename, networkType, text, title = null) {
+  return (
+    `<a class="streets-view-link"${title ? ` title="${title}"` : ""} ` +
+    `href="city.html?file=${encodeURIComponent(filename)}` +
+    `&network=${encodeURIComponent(networkType)}">${text}</a>`
+  );
+}
+
+/**
+ * The link factory every per-provider group on this page shares: open THAT
+ * provider's walk of THIS row's network on the city page.
+ *
+ * Two things it has to get right. The filename comes only from the
+ * `${provider}|${city_id}` index entry, never from the bare-city_id name
+ * fallback — city.html derives its provider from the run filename, so a
+ * cross-provider link opens the wrong series entirely. And the `&network=` is
+ * load-bearing: city.html defaults to 'drive', so a "Roads + paths" row whose
+ * link omits it opens a different walk, or falls all the way back to the
+ * grid-attribution artifact.
+ *
+ * @param {string} provider
+ * @returns {(row: Object) => ?{href: string, title: string}}
+ */
+function walkProviderLink(provider) {
+  return (row) => {
+    const file = row[`filename_${provider}`];
+    if (!file) return null;
+    const date = row[`runDate_${provider}`];
+    return {
+      href:
+        `city.html?file=${encodeURIComponent(file)}` +
+        `&network=${encodeURIComponent(row.networkType)}`,
+      title: escapeHtml(
+        `Open ${providerShortLabel(provider)}${date ? ` · ${date}` : ""} · ${row.networkLabel}`
+      ),
+    };
+  };
+}
+
+// ── Columns ───────────────────────────────────────────────────
+
+/**
+ * The columns, in table order — generated from the PROVIDERS registry so a
+ * third provider needs no edit here.
  *
  * `key` is the row-model field, `type` picks the comparator, `initial` is the
  * direction a first click applies (numbers read best-first, text reads A–Z),
  * and `cell(row)` renders that column's own cell — the header and the body are
  * both generated from this list so they cannot drift (see table-utils.js).
  *
- * `unit`/`digits` are read by the distribution strip; `title` becomes the
- * header tooltip (these lived in streets.html before the header became
- * JS-rendered).
- *
  * City/state/country names come from OSM/Nominatim (publicly editable
  * third-party data) — escape everything data-derived entering innerHTML.
+ *
+ * @param {string[]} [providers] - Providers to give a leaf column, in order.
+ *   The render path passes the ones the manifest contains; the default is the
+ *   whole registry, which is what a caller with no manifest wants.
+ * @returns {Object[]}
  */
-const STREET_COLUMNS = [
-  {
-    key: "label",
-    label: "City",
-    type: "text",
-    initial: "asc",
-    always: true,
-    cell: walkLabelCellHtml,
-  },
-  {
-    key: "providerLabel",
-    label: "Provider",
-    type: "text",
-    initial: "asc",
-    cell: (r) => `<td>${escapeHtml(r.providerLabel)}</td>`,
-  },
-  // Which OSM network was walked. Without this column two rows for one city
-  // would look like duplicates, when in fact their coverage percentages divide
-  // by different street-km denominators and are not comparable.
-  {
-    key: "networkLabel",
-    label: "Network",
-    type: "text",
-    initial: "asc",
-    title:
-      "Which OSM network was walked. &quot;Roads&quot; is motorized public roads only; " +
-      "&quot;Roads + paths&quot; also covers alleys, footpaths, park trails, cycleways and " +
-      "steps. Coverage percentages are only comparable within the same network.",
-    cell: (r) => `<td>${escapeHtml(r.networkLabel)}</td>`,
-  },
-  {
-    key: "runDate",
-    label: "Walked",
-    type: "text",
-    initial: "desc",
-    cell: (r) => `<td>${escapeHtml(r.runDate ?? "—")}</td>`,
-  },
-  {
-    key: "spacing",
-    label: "Sample spacing",
-    type: "number",
-    initial: "asc",
-    unit: " m",
-    cell: (r) => `<td>${r.spacing == null ? "—" : `${num(r.spacing)} m`}</td>`,
-  },
-  {
-    key: "pct",
-    label: "360° street-km",
-    type: "number",
-    initial: "desc",
-    unit: "%",
-    title: "Share of street-km covered by 360° imagery",
-    cell: (r) => coverageCellHtml(r.pct),
-  },
-  {
-    key: "pctAny",
-    label: "Any imagery",
-    type: "number",
-    initial: "desc",
-    unit: "%",
-    title:
-      "Including flat/perspective imagery; equals the 360° number for Google Street View",
-    cell: (r) => coverageCellHtml(r.pctAny),
-  },
-  // "Since last walk" coverage delta (issue #101), from the manifest's
-  // optional change block. Null for first walks — most cities, until their
-  // second walk lands — which the number comparator sorts to the end.
-  {
-    key: "changeDelta",
-    label: "Δ coverage",
-    type: "number",
-    initial: "desc",
-    unit: " pp",
-    title:
-      "Change in 360° street-km coverage since the previous walk of this city, in " +
-      "percentage points. Blank for first walks.",
-    cell: walkChangeCellHtml,
-  },
-  // Absolute street length (schema v12, issue #189). A share cannot be turned
-  // back into kilometres without its denominator — 74.5% of Corvallis is 873 km
-  // and the same 74.5% of a village is 5 km — and deployment estimates are
-  // quoted in km, not percent.
-  {
-    key: "lengthKm",
-    label: "Street km",
-    type: "number",
-    initial: "desc",
-    unit: " km",
-    digits: 1,
-    title: "Total length of the walked network, in kilometres",
-    cell: (r) => `<td>${r.lengthKm == null ? "—" : `${num(r.lengthKm, 1)} km`}</td>`,
-  },
-  {
-    key: "lengthKmCovered",
-    label: "Covered km",
-    type: "number",
-    initial: "desc",
-    unit: " km",
-    digits: 1,
-    title: "Kilometres of street covered by 360° imagery",
-    cell: (r) => `<td>${r.lengthKmCovered == null ? "—" : `${num(r.lengthKmCovered, 1)} km`}</td>`,
-  },
-  {
-    key: "lengthKmCoveredAny",
-    label: "Covered km (any)",
-    type: "number",
-    initial: "desc",
-    unit: " km",
-    digits: 1,
-    title: "Kilometres of street covered by any imagery, including flat/perspective",
-    cell: (r) =>
-      `<td>${r.lengthKmCoveredAny == null ? "—" : `${num(r.lengthKmCoveredAny, 1)} km`}</td>`,
-  },
-  {
-    key: "medianAge",
-    label: "Median age",
-    type: "number",
-    initial: "asc",
-    unit: " yrs",
-    digits: 1,
-    title:
-      "Median age of the imagery covering this walk's streets. Stored rather than " +
-      "derived — a median of the per-class medians is not the median.",
-    cell: (r) => `<td>${r.medianAge == null ? "—" : `${num(r.medianAge, 1)} yrs`}</td>`,
-  },
-  {
-    key: "edges",
-    label: "Streets",
-    type: "number",
-    initial: "desc",
-    cell: (r) => `<td>${num(r.edges)}</td>`,
-  },
-  {
-    key: "fullyCovered",
-    label: "Fully covered",
-    type: "number",
-    initial: "desc",
-    cell: (r) => `<td>${num(r.fullyCovered)}</td>`,
-  },
-];
+function buildStreetColumns(providers = walkProviders()) {
+  const pair = streetDeltaPair(providers);
+  const [ahead, behind] = pair ?? [];
+  const pairNames = pair
+    ? `${providerShortLabel(ahead)} − ${providerShortLabel(behind)}`
+    : "";
+
+  return [
+    {
+      key: "label",
+      label: "City",
+      type: "text",
+      initial: "asc",
+      always: true,
+      cell: walkLabelCellHtml,
+    },
+    ...providerColumnGroup({
+      providers,
+      id: "cov",
+      groupLabel: "360° street-km (%)",
+      groupTitle:
+        "Share of street-km covered by 360° imagery. Both providers walk the SAME sample " +
+        "points on the same frozen network, so these are directly comparable.",
+      keyFor: (p) => `pct_${p}`,
+      cellFor: (p) => (row) => coverageCellParts(row[`pct_${p}`], { compact: true }),
+      linkFor: walkProviderLink,
+      initial: "desc",
+      unit: "%",
+      digits: 1,
+      delta: pair && {
+        key: "deltaPct",
+        unit: " pp",
+        title: `${pairNames}, in percentage points. Positive means Mapillary covers more street-km.`,
+      },
+    }),
+    ...providerColumnGroup({
+      providers,
+      id: "covAny",
+      groupLabel: "Any imagery (%)",
+      groupTitle:
+        "Including flat/perspective imagery; equals the 360° number for Google Street View",
+      keyFor: (p) => `pctAny_${p}`,
+      cellFor: (p) => (row) => coverageCellParts(row[`pctAny_${p}`], { compact: true }),
+      linkFor: walkProviderLink,
+      initial: "desc",
+      unit: "%",
+      digits: 1,
+      delta: pair && {
+        key: "deltaPctAny",
+        unit: " pp",
+        title: `${pairNames}, in percentage points. Positive means Mapillary covers more street-km with imagery of any kind.`,
+      },
+    }),
+    ...providerColumnGroup({
+      providers,
+      id: "walked",
+      groupLabel: "Walked",
+      groupTitle: "Date of each provider's latest walk of this network",
+      keyFor: (p) => `runDate_${p}`,
+      cellFor: (p) => (row) => ({
+        html: row[`runDate_${p}`] == null ? "—" : escapeHtml(row[`runDate_${p}`]),
+      }),
+      linkFor: walkProviderLink,
+      type: "text",
+      initial: "desc",
+    }),
+    ...providerColumnGroup({
+      providers,
+      id: "age",
+      groupLabel: "Median age (yrs)",
+      groupTitle:
+        "Median age of the imagery covering this walk's streets. Stored rather than " +
+        "derived — a median of the per-class medians is not the median.",
+      keyFor: (p) => `medianAge_${p}`,
+      cellFor: (p) => (row) => ({
+        html: row[`medianAge_${p}`] == null ? "—" : `${num(row[`medianAge_${p}`], 1)} yrs`,
+      }),
+      linkFor: walkProviderLink,
+      initial: "asc",
+      unit: " yrs",
+      digits: 1,
+    }),
+    // Walk-to-walk change (issue #101): each provider against ITS OWN previous
+    // walk. Deliberately no Δ leaf — a difference between two providers' own
+    // improvements is not a quantity anyone asked for.
+    ...providerColumnGroup({
+      providers,
+      id: "change",
+      groupLabel: "Δ since last walk (pp)",
+      groupTitle:
+        "Change in that provider's 360° street-km coverage since ITS previous walk, in " +
+        "percentage points. Blank for first walks. Never a cross-provider comparison.",
+      keyFor: (p) => `changeDelta_${p}`,
+      cellFor: (p) => (row) => walkChangeCellHtml(row, p),
+      linkFor: walkProviderLink,
+      initial: "desc",
+      unit: " pp",
+      digits: 1,
+    }),
+    ...providerColumnGroup({
+      providers,
+      id: "coveredKm",
+      groupLabel: "Covered km",
+      groupTitle: "Kilometres of street covered by 360° imagery",
+      keyFor: (p) => `lengthKmCovered_${p}`,
+      cellFor: (p) => (row) => ({
+        html:
+          row[`lengthKmCovered_${p}`] == null ? "—" : `${num(row[`lengthKmCovered_${p}`], 1)} km`,
+      }),
+      linkFor: walkProviderLink,
+      initial: "desc",
+      unit: " km",
+      digits: 1,
+    }),
+    ...providerColumnGroup({
+      providers,
+      id: "coveredKmAny",
+      groupLabel: "Covered km (any)",
+      groupTitle: "Kilometres of street covered by any imagery, including flat/perspective",
+      keyFor: (p) => `lengthKmCoveredAny_${p}`,
+      cellFor: (p) => (row) => ({
+        html:
+          row[`lengthKmCoveredAny_${p}`] == null
+            ? "—"
+            : `${num(row[`lengthKmCoveredAny_${p}`], 1)} km`,
+      }),
+      linkFor: walkProviderLink,
+      initial: "desc",
+      unit: " km",
+      digits: 1,
+    }),
+    ...providerColumnGroup({
+      providers,
+      id: "fully",
+      groupLabel: "Fully covered",
+      groupTitle: "Streets covered end to end, per provider",
+      keyFor: (p) => `fullyCovered_${p}`,
+      cellFor: (p) => (row) => ({ html: num(row[`fullyCovered_${p}`]) }),
+      linkFor: walkProviderLink,
+      initial: "desc",
+    }),
+    ...providerColumnGroup({
+      providers,
+      id: "spacing",
+      groupLabel: "Sample spacing (m)",
+      groupTitle: "Along-edge sample spacing each provider's walk used",
+      keyFor: (p) => `spacing_${p}`,
+      cellFor: (p) => (row) => ({
+        html: row[`spacing_${p}`] == null ? "—" : `${num(row[`spacing_${p}`])} m`,
+      }),
+      linkFor: walkProviderLink,
+      initial: "asc",
+      unit: " m",
+    }),
+    // Properties of the OSM NETWORK rather than of a walk, so one column
+    // apiece rather than one per provider. See pivotStreetWalks for the caveat
+    // the title carries.
+    {
+      key: "lengthKm",
+      label: "Street km",
+      type: "number",
+      initial: "desc",
+      unit: " km",
+      digits: 1,
+      title:
+        "Total length of the walked network, in kilometres. A property of the OSM network, " +
+        "not of a provider — but each walk re-derives it from the frozen graph, so two " +
+        "providers' figures can differ slightly; the first available is shown.",
+      cell: (r) => `<td>${r.lengthKm == null ? "—" : `${num(r.lengthKm, 1)} km`}</td>`,
+    },
+    {
+      key: "edges",
+      label: "Streets",
+      type: "number",
+      initial: "desc",
+      title:
+        "Street segments in the walked network. Like Street km, a network property that each " +
+        "walk re-derives; the first available is shown.",
+      cell: (r) => `<td>${num(r.edges)}</td>`,
+    },
+  ];
+}
 
 /**
- * Column presets. The first is the default and must fit the page's 1200px
- * measure without horizontal scrolling — that is what these exist for.
+ * The full-registry build: what the page would render if every registered
+ * provider had walked something. The static vocabulary — `?sort=` keys,
+ * `?cols=` names — is taken from here, and it is the default for callers with
+ * no manifest. What actually renders is built per manifest in
+ * `renderStreetWalks`, from the providers the manifest contains.
  */
-const STREET_PRESETS = [
-  {
-    id: "overview",
-    label: "Overview",
-    title: "The headline read: who walked what, how much of it, and how fresh",
-    // pctAny stays in the default view: the 360°-vs-any-imagery split (issue
-    // #116) is the page's headline distinction for Mapillary, not a detail to
-    // be discovered behind a preset.
-    columns: [
-      "providerLabel",
-      "networkLabel",
-      "runDate",
-      "pct",
-      "pctAny",
-      "lengthKm",
-      "medianAge",
-    ],
-  },
-  {
-    id: "kilometres",
-    label: "Kilometres",
-    title: "Absolute street length rather than shares (schema v12)",
-    columns: ["providerLabel", "pct", "pctAny", "lengthKm", "lengthKmCovered", "lengthKmCoveredAny"],
-  },
-  {
-    id: "change",
-    label: "Change",
-    title: "Walk-to-walk movement (issue #101); blank until a city's second walk lands",
-    columns: ["providerLabel", "networkLabel", "runDate", "pct", "changeDelta", "lengthKm"],
-  },
-  {
-    id: "network",
-    label: "Network",
-    title: "The shape of the walked network itself",
-    columns: ["providerLabel", "networkLabel", "spacing", "edges", "fullyCovered", "lengthKm"],
-  },
-];
+const STREET_COLUMNS = buildStreetColumns();
 
-/** Filters offered above the table. */
-const STREET_FILTERS = [
-  {
-    key: "provider",
-    label: "Provider",
-    type: "select",
-    anyLabel: "All providers",
-    // One option per REGISTERED provider (issue #225). Rows come from the
-    // streetwalk manifest, which carries whichever providers actually walked
-    // the city, so a hardcoded pair meant a third provider's walks were
-    // listed with no filter able to isolate them.
-    options: Object.entries(PROVIDERS).map(([value, p]) => ({ value, label: p.label })),
-    test: (row, value) => row.provider === value,
-  },
-  {
-    key: "network",
-    label: "Network",
-    type: "select",
-    anyLabel: "All networks",
-    options: [
-      { value: "drive", label: "Roads" },
-      { value: "all_public", label: "Roads + paths" },
-    ],
-    test: (row, value) => row.networkType === value,
-  },
-  {
-    key: "cov",
-    label: "360° street-km %",
-    type: "range",
-    field: "pct",
-    min: 0,
-    max: 100,
-  },
-  {
-    key: "km",
-    label: "Street km",
-    type: "range",
-    field: "lengthKm",
-    min: 0,
-  },
-  {
-    key: "changed",
-    label: "Has Δ coverage",
-    type: "boolean",
-    title: "Only cities walked at least twice, so a change could be computed (issue #101)",
-    test: (row) => row.changeDelta != null,
-  },
-];
+/**
+ * Every leaf key of one grouped metric, in table order.
+ *
+ * @param {string} id - Group id.
+ * @param {Object[]} [columns] - The build to read; defaults to full-registry.
+ */
+function streetGroupKeys(id, columns = STREET_COLUMNS) {
+  return columns.filter((c) => c.group?.id === id).map((c) => c.key);
+}
+
+/**
+ * Column presets. The first is the default and must fit the page's content
+ * measure (1500px page − the 280px sidebar) without horizontal scrolling.
+ *
+ * Built from a column list rather than fixed, so a preset naming a grouped
+ * metric lists exactly the leaves that were built.
+ *
+ * @param {Object[]} [columns] - The build to draw leaf keys from.
+ * @returns {Object[]}
+ */
+function buildStreetPresets(columns = STREET_COLUMNS) {
+  const groupKeys = (id) => streetGroupKeys(id, columns);
+  return [
+    {
+      id: "overview",
+      label: "Overview",
+      // pctAny stays out of the default view now that it is a whole GROUP rather
+      // than one column; the Δ in the 360° group is the headline comparison and
+      // "Kilometres" is one click away.
+      title: "The headline read: who walked what, how much of it, and how fresh",
+      columns: [
+        ...groupKeys("cov"),
+        ...groupKeys("walked"),
+        ...groupKeys("age"),
+        "lengthKm",
+      ],
+    },
+    {
+      id: "kilometres",
+      label: "Kilometres",
+      title: "Absolute street length rather than shares (schema v12)",
+      columns: [
+        ...groupKeys("cov"),
+        "lengthKm",
+        ...groupKeys("coveredKm"),
+        ...groupKeys("coveredKmAny"),
+      ],
+    },
+    {
+      id: "change",
+      label: "Change",
+      title: "Walk-to-walk movement (issue #101); blank until a city's second walk lands",
+      columns: [
+        ...groupKeys("cov"),
+        ...groupKeys("walked"),
+        ...groupKeys("change"),
+      ],
+    },
+    {
+      id: "network",
+      label: "Network",
+      title: "The shape of the walked network itself, and how each provider sampled it",
+      columns: [
+        ...groupKeys("spacing"),
+        "edges",
+        ...groupKeys("fully"),
+        "lengthKm",
+      ],
+    },
+  ];
+}
+
+/**
+ * Filters offered in the sidebar.
+ *
+ * @param {string[]} [providers] - Providers to offer as scopes, in order.
+ *   The render path passes the ones the manifest contains.
+ * @returns {Object[]}
+ */
+function buildStreetFilters(providers = walkProviders()) {
+  return [
+    {
+      // FIRST in the sidebar, and a page-level selector rather than an ordinary
+      // narrowing: two network types are two different street-km denominators,
+      // so there is no "all networks" reading that would not stack incomparable
+      // numbers in one column. `defaultValue` is what makes absence of the
+      // param mean 'drive' rather than "no filter"; old ?network=all_public
+      // links keep working.
+      key: "network",
+      label: "Network",
+      type: "select",
+      defaultValue: "drive",
+      options: [
+        { value: "drive", label: "Roads" },
+        { value: "all_public", label: "Roads + paths" },
+      ],
+      test: (row, value) => row.networkType === value,
+    },
+    {
+      key: "provider",
+      label: "Collected by",
+      type: "select",
+      anyLabel: "Any provider",
+      // Collected rather than registered — see GRID_FILTERS for why an option
+      // matching zero rows is worse here than elsewhere: this select is also
+      // the SCOPE the numeric sliders read through.
+      options: providers
+        .map((value) => ({ value, label: PROVIDERS[value].label }))
+        .concat([{ value: SCOPE_MULTI, label: "2+ providers" }]),
+      test: (row, value) =>
+        value === SCOPE_MULTI ? row.providers.length > 1 : row.providers.includes(value),
+    },
+    // Follows the scope above — see GRID_FILTERS for why.
+    {
+      key: "cov",
+      label: "360° street-km %",
+      type: "histogram-range",
+      field: "pctBest",
+      min: 0,
+      max: 100,
+      unit: "%",
+      digits: 1,
+      ...scopedNumericFilter({
+        base: "pct",
+        bestField: "pctBest",
+        label: "360° street-km %",
+        anyLabel: "any provider reaches",
+      }),
+    },
+    // NOT scoped: street length is a property of the OSM network, not of a
+    // provider's walk of it, so there is no per-provider column to read.
+    {
+      key: "km",
+      label: "Street km",
+      type: "histogram-range",
+      field: "lengthKm",
+      min: 0,
+      unit: " km",
+      digits: 1,
+    },
+    {
+      key: "changed",
+      label: "Has Δ since last walk",
+      type: "boolean",
+      title:
+        "Cities walked at least twice, so a change could be computed (issue #101). Follows " +
+        "the Collected by scope: with a provider selected it asks about THAT provider's " +
+        "second walk, not anyone's.",
+      test: (row) => walkProviders().some((p) => row[`changeDelta_${p}`] != null),
+      // Same scope contract as the numeric filters: "walked twice" is as
+      // incomplete a question as "coverage over 80%" until you say by whom.
+      testFor: (values) => {
+        const provider = scopedProvider(values);
+        return provider
+          ? (row) => row[`changeDelta_${provider}`] != null
+          : (row) => walkProviders().some((p) => row[`changeDelta_${p}`] != null);
+      },
+      labelFor: (values) => {
+        const provider = scopedProvider(values);
+        return provider
+          ? `Has Δ since last walk — ${providerShortLabel(provider)}`
+          : "Has Δ since last walk — any provider";
+      },
+    },
+  ];
+}
+
+/** The full-registry builds, for the static vocabulary and for the tests. */
+const STREET_PRESETS = buildStreetPresets();
+const STREET_FILTERS = buildStreetFilters();
 
 /** Row fields the free-text search box looks at. */
-const STREET_SEARCH_FIELDS = ["label", "cityId", "providerLabel", "networkLabel"];
-
-/** Default sort: best 360° coverage first (what the page opens on). */
-const DEFAULT_SORT = { key: "pct", dir: "desc" };
+const STREET_SEARCH_FIELDS = ["label", "cityId", "providersLabel", "networkLabel"];
 
 /**
- * Flatten a manifest walk + its joined aggregate record into the one shape the
- * sorter and the row renderer both read.
+ * Default sort: best GSV 360° coverage first.
  *
- * Doing this once up front (rather than reaching into the walk record from
- * each comparator) is what lets the table sort on *derived* columns like the
- * display label, which exists only after the aggregate join.
- *
- * @param {Object} walk - A manifest walk record.
- * @param {?Object} city - The joined aggregate record for this walk's exact
- *   (provider, city_id), or null/undefined. Supplies both the label and the
- *   `city.html?file=` link target.
- * @param {?Object} [labelSource] - Fallback record matched on city_id alone,
- *   used for the display NAME only when the city has no run in this walk's
- *   provider series. Never used for the link: city.html derives its provider
- *   from the run filename, so a cross-provider link opens the wrong series.
- * @returns {Object} Row model.
+ * Deliberately the GSV leaf rather than `pctBest`: the page has always opened
+ * on coverage-descending, and `pctBest` is a filter field with no column of
+ * its own — sorting by a column the reader cannot see is exactly what
+ * createSortableTable's fallback exists to prevent. Privileging one provider
+ * in the default order is a real (small) asymmetry, taken knowingly because
+ * GSV is the series every city has.
  */
-function toRowModel(walk, city, labelSource = null) {
-  const named = city ?? labelSource;
-  return {
-    cityId: walk.city_id,
-    label: named ? cityLabel(named) : walk.city_id,
-    provider: walk.provider,
-    providerLabel: PROVIDERS[walk.provider]?.label ?? walk.provider,
-    networkType: walk.network_type ?? DEFAULT_STREET_NETWORK_TYPE,
-    networkLabel: streetNetworkLabel(walk.network_type),
-    runDate: walk.run_date ?? null,
-    spacing: walk.spacing_m ?? null,
-    pct: walk.coverage_pct_by_length ?? null,
+const DEFAULT_SORT = { key: "pct_gsv", dir: "desc" };
+
+// ── Row model ─────────────────────────────────────────────────
+
+/** a − b, or null unless BOTH operands are present (see grid.js's deltaOf). */
+function walkDeltaOf(a, b) {
+  return a == null || b == null ? null : a - b;
+}
+
+/**
+ * Pivot the manifest's walks into one row per (city, NETWORK), with
+ * per-provider sub-fields.
+ *
+ * The network stays a row key rather than becoming more columns because its
+ * two values divide by different street-km denominators: putting a 'drive'
+ * percentage beside an 'all_public' one under a shared header would invite
+ * exactly the comparison that is not valid. Providers, by contrast, walk the
+ * SAME deterministic sample points on the same frozen network, so their
+ * numbers belong side by side.
+ *
+ * @param {Object[]} walks - Manifest walk records.
+ * @param {Map<string, Object>} index - From indexCitiesByProvider.
+ * @returns {Object[]} Row models.
+ */
+function pivotStreetWalks(walks, index) {
+  const byKey = new Map();
+  // Narrowed to what this manifest CONTAINS, so a registered-but-unwalked
+  // provider gets no row keys — and therefore no leaf columns, no preset
+  // entries and no scope option. See walkProvidersIn.
+  const providers = walkProvidersIn(walks);
+
+  for (const walk of walks) {
+    const cityId = walk.city_id;
+    const networkType = walk.network_type ?? DEFAULT_STREET_NETWORK_TYPE;
+    const rowKey = `${cityId}|${networkType}`;
+    const provider = walk.provider;
+
+    let row = byKey.get(rowKey);
+    if (!row) {
+      row = {
+        rowKey,
+        cityId,
+        // The display name may come from ANY provider's aggregate record (a
+        // city's name is provider-independent) — unlike the link, which may
+        // not. See indexCitiesByProvider.
+        label: cityId,
+        networkType,
+        networkLabel: streetNetworkLabel(walk.network_type),
+        providers: [],
+        providersLabel: "",
+        providerCount: 0,
+        // Always present, so "this manifest has no Δ pair" reads as null
+        // rather than as a missing field.
+        deltaPct: null,
+        deltaPctAny: null,
+        lengthKm: null,
+        edges: null,
+        filename: null,
+      };
+      for (const p of providers) {
+        row[`pct_${p}`] = null;
+        row[`pctAny_${p}`] = null;
+        row[`runDate_${p}`] = null;
+        row[`spacing_${p}`] = null;
+        row[`medianAge_${p}`] = null;
+        row[`lengthKmCovered_${p}`] = null;
+        row[`lengthKmCoveredAny_${p}`] = null;
+        row[`change_${p}`] = null;
+        row[`changeDelta_${p}`] = null;
+        row[`fullyCovered_${p}`] = null;
+        row[`filename_${p}`] = null;
+      }
+      byKey.set(rowKey, row);
+    }
+
+    row.providers.push(provider);
+    row[`pct_${provider}`] = walk.coverage_pct_by_length ?? null;
     // Any-imagery street coverage: Mapillary only (flat/perspective imagery
     // counts as covered too). For GSV it equals the 360° number, and it is
     // null for walks collected before the field existed.
-    pctAny: walk.coverage_pct_by_length_any ?? null,
-    // "Since last walk" change block (issue #101). Absent from the manifest
-    // for first walks, so both stay null and the cell renders an em-dash.
-    change: walk.change ?? null,
-    changeDelta: walk.change?.coverage_pct_by_length_delta ?? null,
+    row[`pctAny_${provider}`] = walk.coverage_pct_by_length_any ?? null;
+    row[`runDate_${provider}`] = walk.run_date ?? null;
+    row[`spacing_${provider}`] = walk.spacing_m ?? null;
     // Absolute lengths and median covered age (schema v12). NULL on walks
     // cataloged before v12 and not yet backfilled.
-    lengthKm: walk.length_km ?? null,
-    lengthKmCovered: walk.length_km_covered ?? null,
-    lengthKmCoveredAny: walk.length_km_covered_any ?? null,
-    medianAge: walk.median_covered_age_years ?? null,
-    // Per-highway-class breakdown, absent-not-null in the manifest. Carried on
-    // the row model for the class-level filter now and the row expansion in
-    // the follow-up PR.
-    coverageByHighway: walk.coverage_by_highway ?? null,
-    edges: walk.edges ?? null,
-    fullyCovered: walk.edges_fully_covered ?? null,
-    filename: city?.data_file?.filename ?? null,
-  };
+    row[`medianAge_${provider}`] = walk.median_covered_age_years ?? null;
+    row[`lengthKmCovered_${provider}`] = walk.length_km_covered ?? null;
+    row[`lengthKmCoveredAny_${provider}`] = walk.length_km_covered_any ?? null;
+    // "Since last walk" change block (issue #101). Absent from the manifest
+    // for first walks, so both stay null and the cell renders an em-dash.
+    row[`change_${provider}`] = walk.change ?? null;
+    row[`changeDelta_${provider}`] = walk.change?.coverage_pct_by_length_delta ?? null;
+    row[`fullyCovered_${provider}`] = walk.edges_fully_covered ?? null;
+    // ONLY the provider-keyed entry, never the bare-city_id name fallback:
+    // city.html derives its provider from the run filename, so a
+    // cross-provider link opens the wrong series entirely.
+    row[`filename_${provider}`] = index.get(`${provider}|${cityId}`)?.data_file?.filename ?? null;
+
+    // Network properties: first walk to report each one wins. Each walk
+    // re-derives them from the same frozen graph, so two providers can differ
+    // slightly — the column's title says so rather than pretending otherwise.
+    row.lengthKm ??= walk.length_km ?? null;
+    row.edges ??= walk.edges ?? null;
+
+    const named = index.get(`${provider}|${cityId}`) ?? index.get(cityId);
+    if (named && row.label === cityId) row.label = cityLabel(named);
+  }
+
+  const pair = streetDeltaPair(providers);
+  const rows = [...byKey.values()];
+  for (const row of rows) {
+    row.providerCount = row.providers.length;
+    row.providersLabel = row.providers.map(providerShortLabel).join(", ");
+    if (pair) {
+      const [a, b] = pair;
+      row.deltaPct = walkDeltaOf(row[`pct_${a}`], row[`pct_${b}`]);
+      row.deltaPctAny = walkDeltaOf(row[`pctAny_${a}`], row[`pctAny_${b}`]);
+    }
+    const values = providers
+      .map((p) => row[`pct_${p}`])
+      .filter((v) => typeof v === "number" && Number.isFinite(v));
+    row.pctBest = values.length ? Math.max(...values) : null;
+    // The City cell opens the first provider that walked this (city, network)
+    // AND has a published run to address.
+    row.filename = providers.map((p) => row[`filename_${p}`]).find((f) => f) ?? null;
+  }
+  return rows;
 }
 
 /**
  * Sort row models by one column (table-utils.sortRowsBy over this page's
  * columns). Alias kept for this page's tests/callers.
  *
- * @param {Object[]} rows - Row models from toRowModel.
+ * The tie key is `rowKey`, not `cityId`: a city appears once per network type,
+ * so city_id alone no longer identifies a row and ties would break
+ * arbitrarily between a city's two networks.
+ *
+ * @param {Object[]} rows - Row models from pivotStreetWalks.
  * @param {string} key - A STREET_COLUMNS key.
  * @param {"asc"|"desc"} dir
  * @returns {Object[]} A new sorted array.
  */
 function sortRows(rows, key, dir = "desc") {
-  return sortRowsBy(STREET_COLUMNS, rows, key, dir);
+  return sortRowsBy(STREET_COLUMNS, rows, key, dir, "rowKey");
 }
 
 // ── Rendering ─────────────────────────────────────────────────
@@ -453,7 +795,7 @@ function sortRows(rows, key, dir = "desc") {
 /**
  * Build one table row from a row model.
  *
- * @param {Object} row - From toRowModel.
+ * @param {Object} row - From pivotStreetWalks.
  * @param {Object[]} [columns] - Visible columns; defaults to all of them.
  * @returns {string} HTML for one <tr>.
  */
@@ -486,30 +828,33 @@ function renderStreetWalks(manifest, rawCities) {
     return;
   }
 
-  const providers = [...new Set(walks.map((w) => w.provider))];
+  const providers = walkProvidersIn(walks);
   const index = indexCitiesByProvider(rawCities, providers);
-  const rows = walks.map((walk) =>
-    toRowModel(
-      walk,
-      index.get(`${walk.provider}|${walk.city_id}`),
-      index.get(walk.city_id)
-    )
-  );
+  const rows = pivotStreetWalks(walks, index);
 
+  // Built from the providers THIS manifest carries, not from the registry: a
+  // registered-but-unwalked provider would otherwise contribute a leaf to
+  // every metric group (nine more columns for KartaView alone), all of them
+  // em-dashes, plus a scope option that matches no rows.
+  const columns = buildStreetColumns(providers);
   streetsTable ??= createSortableTable({
-    columns: STREET_COLUMNS,
+    columns,
     defaultSort: DEFAULT_SORT,
     theadEl: document.getElementById("streets-thead"),
     tbodyEl: document.getElementById("streets-tbody"),
+    // city_id no longer identifies a row: a city appears once per network.
+    tieKey: "rowKey",
   });
   streetsControls ??= createTableControls({
     rootEl: document.getElementById("streets-controls"),
     table: streetsTable,
-    columns: STREET_COLUMNS,
-    presets: STREET_PRESETS,
-    filters: STREET_FILTERS,
+    columns,
+    presets: buildStreetPresets(columns),
+    filters: buildStreetFilters(providers),
     searchFields: STREET_SEARCH_FIELDS,
-    onChange: (shown, all) => updateStreetsCaption(shown, all, manifest),
+    layout: "sidebar",
+    showDistributionStrip: false,
+    onChange: (shown, all, state) => updateStreetsCaption(shown, all, manifest, state),
   });
   streetsControls.setRows(rows);
 
@@ -520,20 +865,27 @@ function renderStreetWalks(manifest, rawCities) {
 /**
  * Keep the caption reporting what is actually on screen.
  *
- * The count is the live result count for the current filters, so it must say
- * how many of how many — a bare "12 collections" after a filter reads as the
- * whole dataset.
+ * It names the ACTIVE NETWORK, and counts against the rows of that network
+ * only: `allRows` holds both networks, so "3 of 7" would compare the visible
+ * roads rows against a total that includes roads-and-paths rows the selector
+ * has deliberately excluded.
  *
  * @param {Object[]} shown - Filtered rows.
- * @param {Object[]} all - Every row.
+ * @param {Object[]} all - Every row, both networks.
  * @param {?Object} manifest - For the generated-at stamp.
+ * @param {{values: Object}} [state] - Control state snapshot.
  */
-function updateStreetsCaption(shown, all, manifest) {
-  const noun = `road-walk collection${all.length === 1 ? "" : "s"}`;
+function updateStreetsCaption(shown, all, manifest, state) {
+  const networkType = state?.values?.network ?? DEFAULT_STREET_NETWORK_TYPE;
+  const inNetwork = all.filter((row) => row.networkType === networkType).length;
+  const label = streetNetworkLabel(networkType);
+  const noun = `${inNetwork === 1 ? "city" : "cities"} walked on ${label}`;
+  // Through formatCellNumber, matching updateGridCaption: the two captions are
+  // twins on twin pages, and this one is the half that printed a raw 1187.
   const counts =
-    shown.length === all.length
-      ? `${all.length} published ${noun}`
-      : `${shown.length} of ${all.length} published ${noun}`;
+    shown.length === inNetwork
+      ? `${num(inNetwork)} ${noun}`
+      : `${num(shown.length)} of ${num(inNetwork)} ${noun}`;
   document.getElementById("streets-caption").textContent =
     counts +
     (manifest?.generated_at
@@ -576,17 +928,25 @@ if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     cityLabel,
     indexCitiesByProvider,
-    toRowModel,
+    pivotStreetWalks,
+    walkProviders,
+    walkProvidersIn,
+    buildStreetColumns,
+    buildStreetPresets,
+    buildStreetFilters,
     sortRows,
     num,
     walkChangeCellHtml,
+    walkProviderLink,
     walkRowHtml,
+    streetDeltaPair,
     renderStreetWalks,
     updateStreetsCaption,
     STREET_COLUMNS,
     STREET_PRESETS,
     STREET_FILTERS,
     STREET_SEARCH_FIELDS,
+    STREET_DELTA_PAIRS,
     DEFAULT_SORT,
   };
 }

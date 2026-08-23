@@ -37,59 +37,85 @@
        target="_blank" rel="noopener">About &#8599;</a>
   </header>
 
-  <main class="streets-main">
-    <h1>Street-level coverage</h1>
-
-    <div class="streets-intro">
-      <p>
-        The <a href="index.html">overview map</a> measures coverage by
-        <strong>area</strong>: what share of a regular grid of sample points
-        around a city has street-level imagery. This page measures it by
-        <strong>road network</strong> instead: what fraction of a city's
-        streets have actually been driven.
+  <main class="streets-main streets-main--wide">
+    <div class="page-head">
+      <h1>Street-level coverage</h1>
+      <p class="page-lead">
+        What fraction of a city's streets have actually been driven — a
+        <strong>road network</strong> measure, where the
+        <a href="index.html">overview map</a> and
+        <a href="grid.html">Grid</a> measure area instead.
       </p>
-      <p>
-        Each collection walks every edge of the city's OpenStreetMap street
-        network, samples on-street points every ~15 m along the centerline,
-        and asks the imagery provider for the nearest panorama at each point.
-        A sample counts as covered when a panorama is found within the match
-        distance, so coverage is <strong>fractional per street</strong> — a
-        road that is half driven reports 50%, not "covered". The headline
-        number below weights each street by its length.
-      </p>
-      <p class="streets-caveat">
-        Street-level collection runs on the same rolling schedule as the grid,
-        so cities appear here as they are walked and are refreshed each cycle.
-        Google Street View costs one metadata request per sample point (a large
-        city runs to a few hundred thousand), while Mapillary is derived from
-        its vector-tile census — so Mapillary cities fill in faster.
-        Search, filter and re-sort to narrow the table; the strip below the
-        controls shows how the sorted column is distributed across the rows
-        currently in view, and the address bar always carries the view you are
-        looking at so it can be shared.
-      </p>
+      <details class="page-about">
+        <summary>How to read this table</summary>
+        <div class="page-about-body">
+          <p>
+            Each collection walks every edge of the city's OpenStreetMap street
+            network, samples on-street points every ~15 m along the centerline,
+            and asks the provider for the nearest panorama at each. A sample
+            counts as covered when a panorama is found within the match
+            distance, so coverage is <strong>fractional per street</strong> — a
+            road half driven reports 50%, not "covered" — and the headline
+            number weights each street by its length.
+          </p>
+          <p>
+            Each city is <strong>one row</strong>, with a sub-column per
+            provider: both walk the same sample points on the same frozen
+            network, so their numbers are directly comparable and the
+            <strong>&#916;</strong> column gives the difference. Click any
+            provider's cell to open that provider's walk. The
+            <strong>Network</strong> selector is separate for the opposite
+            reason &mdash; &quot;Roads&quot; and &quot;Roads + paths&quot;
+            divide by different street-km totals, so they are never shown side
+            by side.
+          </p>
+          <p>
+            Collection runs on the same rolling schedule as the grid, so cities
+            appear here as they are walked. Google Street View costs one
+            metadata request per sample point (a large city runs to a few
+            hundred thousand), while Mapillary is derived from its vector-tile
+            census &mdash; so Mapillary cities fill in faster. Each numeric
+            filter in the sidebar carries a histogram of where the rows
+            actually sit, drawn over everything the <em>other</em> controls
+            have selected. The address bar always carries the view you are
+            looking at.
+          </p>
+        </div>
+      </details>
     </div>
 
     <div id="streets-status" class="table-status" role="status" aria-live="polite">
       Loading street-level collections…
     </div>
 
-    <!-- Search, filters, column preset/picker and the distribution strip are
-         rendered into this container by table-controls.js once the data has
-         loaded (issue #188). -->
-    <div id="streets-controls" class="controls-region"></div>
+    <!-- Sidebar + table (issue #250); see grid.html for the <details>
+         rationale — the two pages share one shape and one stylesheet. -->
+    <div class="table-layout with-sidebar">
+      <aside class="table-sidebar" aria-label="Search and filters">
+        <details class="sidebar-disclosure" open>
+          <summary>Filters</summary>
+          <!-- Search, filters and the column preset/picker are rendered into
+               this container by table-controls.js once the data has loaded
+               (issue #188). -->
+          <div id="streets-controls" class="controls-region"></div>
+        </details>
+      </aside>
 
-    <div id="streets-table-wrap" class="streets-table-wrap" hidden>
-      <table class="streets-table">
-        <caption id="streets-caption"></caption>
-        <!-- Header cells are rendered by table-utils.js from the page's column
-             descriptors (STREET_COLUMNS), not authored here: column presets
-             change the visible set at runtime, so the header and the body have
-             to come from one list or they drift. Sorting is delegated from this
-             element, which is why it survives a re-render. -->
-        <thead id="streets-thead"></thead>
-        <tbody id="streets-tbody"></tbody>
-      </table>
+      <div class="table-content">
+        <div id="streets-table-wrap" class="streets-table-wrap" hidden>
+          <table class="streets-table">
+            <caption id="streets-caption"></caption>
+            <!-- Header cells are rendered by table-utils.js from the page's
+                 column descriptors (STREET_COLUMNS), not authored here: column
+                 presets change the visible set at runtime, so the header and
+                 the body have to come from one list or they drift. Sorting is
+                 delegated from this element, which is why it survives a
+                 re-render. -->
+            <thead id="streets-thead"></thead>
+            <tbody id="streets-tbody"></tbody>
+          </table>
+        </div>
+      </div>
     </div>
   </main>
 
@@ -99,6 +125,7 @@
           crossorigin="anonymous"></script>
   <script src="js/streetscape-utils.js"></script>
   <script src="js/table-utils.js"></script>
+  <script src="js/histogram-slider.js"></script>
   <script src="js/table-controls.js"></script>
   <script src="js/streets.js"></script>
 </body>

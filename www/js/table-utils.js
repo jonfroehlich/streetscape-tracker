@@ -15,7 +15,15 @@
  * file and the row renderers emitted a matching, hand-maintained sequence of
  * `<td>`s — two parallel lists that a column change had to update in step.
  *
- * Depends on globals from streetscape-utils.js (loaded first): coverageColor.
+ * A descriptor may additionally carry `group: {id, label, title}`, repeated on
+ * every member of the group, which turns the header into two rows (see
+ * theadHtml) — that is how the pivoted pages (issue #250) put one sub-column
+ * per provider under one metric heading. A grouped leaf's `label` is then just
+ * a provider name, so `pickerLabel` supplies the self-contained wording the
+ * column picker needs (read in table-controls.js).
+ *
+ * Depends on globals from streetscape-utils.js (loaded first): coverageColor,
+ * PROVIDERS.
  */
 
 /**
@@ -73,16 +81,252 @@ function formatCellNumber(value, digits = 0) {
   });
 }
 
-/** A coverage cell: a proportional bar (decorative) behind the number. */
-function coverageCellHtml(pct) {
-  if (pct == null) return `<td class="coverage-cell">—</td>`;
+/**
+ * A coverage cell: a proportional bar (decorative) behind the number.
+ *
+ * `compact` narrows the cell (90px rather than 128px) for the pivoted pages,
+ * where one metric occupies one sub-column PER PROVIDER under a grouped
+ * header: at the full width a three-provider coverage group alone would push
+ * the table past its measure. The bar still reads as a proportion — it is the
+ * surrounding whitespace that goes, not the bar.
+ *
+ * @param {?number} pct
+ * @param {{compact?: boolean}} [options]
+ * @returns {string} HTML for one <td>.
+ */
+function coverageCellHtml(pct, options) {
+  const { html, className } = coverageCellParts(pct, options);
+  return `<td class="${className}">${html}</td>`;
+}
+
+/**
+ * The INNER content and class of a coverage cell, without its `<td>`.
+ *
+ * Split out so `providerColumnGroup` can wrap the content in a link without
+ * doing string surgery on an assembled `<td>` (issue #250 follow-up: every
+ * per-provider cell opens that provider's series).
+ *
+ * @param {?number} pct
+ * @param {{compact?: boolean}} [options]
+ * @returns {{html: string, className: string}}
+ */
+function coverageCellParts(pct, { compact = false } = {}) {
+  const className = compact ? "coverage-cell coverage-cell--compact" : "coverage-cell";
+  if (pct == null) return { html: "—", className };
   const bar = `
     <span class="coverage-bar" aria-hidden="true"
           style="width:${Math.max(0, Math.min(100, pct))}%;
                  background:${coverageColor(pct)}"></span>`;
-  return `<td class="coverage-cell">${bar}<span class="coverage-value">${pct.toFixed(
-    1
-  )}%</span></td>`;
+  return { html: `${bar}<span class="coverage-value">${pct.toFixed(1)}%</span>`, className };
+}
+
+/**
+ * Short, column-header form of a provider's name, falling back to its full
+ * label and then to its key.
+ *
+ * The pivoted pages (issue #250) repeat a provider name under every metric
+ * group, so "Google Street View" three times over would cost more width than
+ * the numbers underneath. A provider registered without a `shortLabel` still
+ * renders.
+ *
+ * @param {string} provider - A PROVIDERS key.
+ * @returns {string}
+ */
+function providerShortLabel(provider) {
+  const entry = PROVIDERS[provider];
+  return entry?.shortLabel ?? entry?.label ?? provider;
+}
+
+/**
+ * A signed difference cell, for the pivoted pages' cross-provider Δ columns.
+ *
+ * Deliberately NOT colored green/red by sign. In a coverage group a positive Δ
+ * means Mapillary has more imagery; in an age group a NEGATIVE Δ means
+ * Mapillary is FRESHER — so one sign-to-color rule would have to lie in one of
+ * the two places. The sign character carries the direction and the column's
+ * `title` says what it means; `delta-pos`/`delta-neg` are emitted as styling
+ * hooks. Only an exact zero is styled, because "the two providers agree
+ * exactly" is a genuinely different fact from "they are close".
+ *
+ * @param {?number} value
+ * @param {{digits?: number, unit?: string}} [options]
+ * @returns {string} HTML for one <td>.
+ */
+function deltaCellHtml(value, { digits = 1, unit = "" } = {}) {
+  if (value == null) return `<td class="delta-cell">—</td>`;
+  const tone = value > 0 ? "delta-pos" : value < 0 ? "delta-neg" : "delta-zero";
+  const sign = value > 0 ? "+" : "";
+  return `<td class="delta-cell ${tone}">${sign}${formatCellNumber(value, digits)}${unit}</td>`;
+}
+
+/**
+ * Build one grouped metric for a pivoted page: a leaf column per registered
+ * provider, plus an optional Δ leaf for a head-to-head pair.
+ *
+ * `group` is repeated on every member — theadHtml collapses the run into one
+ * `<th scope="colgroup">` and takes the label from the first VISIBLE member,
+ * so dropping a leaf via a preset or the column picker still leaves the group
+ * named. `pickerLabel` exists because a leaf's own label is just a provider
+ * name, repeated under every metric: unambiguous in the header, useless in the
+ * picker's flat checkbox list.
+ *
+ * Shared by grid.js and streets.js rather than copied: the two pages pivot the
+ * same registry the same way, and a copy would let their headers drift apart
+ * while both looked right in isolation.
+ *
+ * @param {Object} spec
+ * @param {string} spec.id - Group id; every member repeats it.
+ * @param {string} spec.groupLabel
+ * @param {string} spec.groupTitle
+ * @param {string[]} [spec.providers] - Which providers get a leaf, in order.
+ *   Defaults to the whole registry. Callers pass the providers actually
+ *   PRESENT IN THE PAYLOAD instead: a registered provider is not a collected
+ *   one, and a leaf for a provider with no rows is a column of em-dashes.
+ * Every per-provider LEAF cell is a link into that provider's own series when
+ * `linkFor` supplies one: a row is a city now, so its per-provider numbers are
+ * the only place a reader can ask for one specific series, and making them
+ * click through is what stops the City cell's single link from being the whole
+ * way in. The Δ leaf is deliberately never linked — it belongs to no one
+ * provider. The link inherits the cell's colour and only shows an underline on
+ * hover/focus, so a table of numbers does not turn into a table of blue text.
+ *
+ * @param {(provider: string) => string} spec.keyFor - Row-model key per provider.
+ * @param {(provider: string) => Function} spec.cellFor - Cell renderer factory.
+ *   The renderer returns `{html, className?, title?}` — the cell's INNER
+ *   content, not an assembled `<td>`, so the link wrapper can go inside it.
+ * @param {(provider: string) => Function} [spec.linkFor] - Link factory
+ *   returning `{href, title}` or null for "this provider has nothing here".
+ * @param {(provider: string) => string} [spec.leafLabel] - Overrides the
+ *   default short provider label.
+ * @param {string} [spec.type="number"]
+ * @param {string} spec.initial - First-click sort direction.
+ * @param {string} [spec.unit]
+ * @param {number} [spec.digits]
+ * @param {?{key: string, unit?: string, title: string}} [spec.delta] - Falsy
+ *   for a group that must never have one (per-provider pano counts are
+ *   census-vs-sample, so their difference answers nothing).
+ * @returns {Object[]} Column descriptors, in leaf order.
+ */
+function providerColumnGroup({
+  id,
+  groupLabel,
+  groupTitle,
+  providers = Object.keys(PROVIDERS),
+  keyFor,
+  cellFor,
+  linkFor,
+  leafLabel,
+  type = "number",
+  initial,
+  unit,
+  digits,
+  delta,
+}) {
+  const group = { id, label: groupLabel, title: groupTitle };
+  const columns = providers.map((provider) => {
+    const render = cellFor(provider);
+    const link = linkFor?.(provider);
+    return {
+      key: keyFor(provider),
+      label: leafLabel ? leafLabel(provider) : providerShortLabel(provider),
+      pickerLabel: `${groupLabel} — ${providerShortLabel(provider)}`,
+      type,
+      initial,
+      unit,
+      digits,
+      title: groupTitle,
+      group,
+      cell: (row) => providerCellHtml(render(row), link?.(row)),
+    };
+  });
+  if (delta) {
+    columns.push({
+      key: delta.key,
+      label: "Δ",
+      pickerLabel: `${groupLabel} — Δ`,
+      type: "number",
+      initial: "desc",
+      unit: delta.unit,
+      digits: 1,
+      title: delta.title,
+      group,
+      cell: (row) => deltaCellHtml(row[delta.key], { unit: delta.unit }),
+    });
+  }
+  return columns;
+}
+
+/**
+ * The "Collected by" option meaning "more than one provider", rather than a
+ * provider key. It scopes to nothing in particular, so it reads as unscoped.
+ */
+const SCOPE_MULTI = "multi";
+
+/**
+ * Which provider the "Collected by" select is currently scoped to, or null for
+ * "any provider" (including the 2+ option, which names no single one).
+ *
+ * @param {Object} values - Current filter values.
+ * @returns {?string} A PROVIDERS key.
+ */
+function scopedProvider(values) {
+  const scope = values?.provider;
+  return scope && scope !== SCOPE_MULTI && PROVIDERS[scope] ? scope : null;
+}
+
+/**
+ * The `fieldFor`/`labelFor` half of a numeric filter that follows the provider
+ * scope (issue #250 follow-up).
+ *
+ * A pivoted row holds one value per provider, so "coverage over 80%" is
+ * incomplete until you say whose coverage. The scope select answers it: pick a
+ * provider and the slider reads that provider's column and says so; leave it
+ * on "any" and it reads the best-across field with a label that spells the
+ * quantifier out. Without this the two controls did not compose at all — see
+ * resolveFilters in table-controls.js for what that cost.
+ *
+ * @param {Object} spec
+ * @param {string} spec.base - Row-key prefix, e.g. "pct" -> `pct_gsv`.
+ * @param {string} spec.bestField - The unscoped row key, e.g. "pctBest".
+ * @param {string} spec.label - The metric's name, without the scope.
+ * @param {string} spec.anyLabel - How the unscoped quantifier reads.
+ * @returns {{fieldFor: Function, labelFor: Function}}
+ */
+function scopedNumericFilter({ base, bestField, label, anyLabel }) {
+  return {
+    fieldFor: (values) => {
+      const provider = scopedProvider(values);
+      return provider ? `${base}_${provider}` : bestField;
+    },
+    labelFor: (values) => {
+      const provider = scopedProvider(values);
+      return `${label} — ${provider ? providerShortLabel(provider) : anyLabel}`;
+    },
+  };
+}
+
+/**
+ * Assemble one per-provider `<td>` from its parts, wrapping the content in a
+ * link when the row has that provider's series to open.
+ *
+ * The cell's own `title` wins over the link's when both exist — a cell that
+ * has something specific to say (the walk-to-walk churn behind a Δ) is saying
+ * more than "opens this series".
+ *
+ * @param {{html: string, className?: string, title?: string}} parts
+ * @param {?{href: string, title?: string}} link
+ * @returns {string} HTML for one <td>.
+ */
+function providerCellHtml(parts, link) {
+  const { html, className, title } = parts;
+  const attrs =
+    (className ? ` class="${className}"` : "") + (title ? ` title="${title}"` : "");
+  if (!link) return `<td${attrs}>${html}</td>`;
+  const linkTitle = !title && link.title ? ` title="${link.title}"` : "";
+  return (
+    `<td${attrs}><a class="provider-cell-link"${linkTitle} ` +
+    `href="${link.href}">${html}</a></td>`
+  );
 }
 
 /**
@@ -93,29 +337,107 @@ function coverageCellHtml(pct) {
  * as "City ▲". The <button> is what carries the click and the keyboard focus —
  * a click handler on a bare <th> is unreachable by keyboard.
  *
+ * A grouped leaf's visible label is only a provider name, repeated under every
+ * metric group, so the buttons of a pivoted page expose three distinct
+ * accessible names across eight controls ("GSV", "Mapillary", "Delta", "GSV",
+ * ...) in ONE tab order and one rotor list. Reading the table is fine — AT
+ * associates the `scope="colgroup"` cell with the body cells during table
+ * navigation — but a controls list gets the button's accessible name and
+ * nothing else, and the disambiguating text was in a hover-only `title`.
+ * `aria-label` therefore carries `pickerLabel` ("Grid coverage (%) - Mapillary"),
+ * which the column picker already computes for exactly this reason. It is set
+ * only where a descriptor supplies one, so driving.html's markup is unchanged.
+ *
  * Labels and titles are code constants, not data, so they are interpolated
  * unescaped — unlike anything row-derived, which is OSM/Nominatim content and
  * is escaped at the point it enters innerHTML.
  *
  * @param {Object} column - Column descriptor.
  * @param {{key: string, dir: string}} activeSort
+ * @param {{rowspan?: number}} [options] - `rowspan` is emitted only when a
+ *   two-row grouped header is in play (see theadHtml): an UNgrouped column has
+ *   no second-row leaf, so its single cell has to span both rows or the header
+ *   would be one cell short on row 2. Omitting the option leaves the markup
+ *   byte-identical to the single-row form.
  * @returns {string} HTML for one <th>.
  */
-function headerCellHtml(column, activeSort) {
+function headerCellHtml(column, activeSort, { rowspan } = {}) {
+  const span = rowspan ? ` rowspan="${rowspan}"` : "";
   // A non-sortable column (none currently defined, but the mechanism stays
   // general) still needs a header cell so the column count matches the body
   // rows, even with nothing to sort and no visible label.
   if (column.sortable === false) {
-    return `<th scope="col"><span class="visually-hidden">${column.srLabel ?? ""}</span></th>`;
+    return `<th scope="col"${span}><span class="visually-hidden">${column.srLabel ?? ""}</span></th>`;
   }
   const isActive = column.key === activeSort.key;
   const ariaSort = isActive ? (activeSort.dir === "asc" ? "ascending" : "descending") : "none";
   const arrow = isActive ? (activeSort.dir === "asc" ? "▲" : "▼") : "";
   const title = column.title ? ` title="${column.title}"` : "";
+  const ariaLabel = column.pickerLabel ? ` aria-label="${column.pickerLabel}"` : "";
   return `
-    <th scope="col" data-key="${column.key}" aria-sort="${ariaSort}">
-      <button type="button"${title}>${column.label} <span class="sort-arrow" aria-hidden="true">${arrow}</span></button>
+    <th scope="col"${span} data-key="${column.key}" aria-sort="${ariaSort}">
+      <button type="button"${ariaLabel}${title}>${column.label} <span class="sort-arrow" aria-hidden="true">${arrow}</span></button>
     </th>`;
+}
+
+/**
+ * Build the whole <thead> content for a visible column set (issue #250).
+ *
+ * TWO shapes, and which one you get is decided by the data, not by a flag:
+ *
+ *  * No visible column carries a `group` → ONE `<tr>`, byte-identical to what
+ *    this file emitted before grouped headers existed. That is the
+ *    driving.html guarantee: that page's descriptors have no groups, so its
+ *    header markup cannot move. A test pins the identity.
+ *  * Otherwise TWO `<tr>`s. Row 1 collapses each run of columns sharing a
+ *    `group.id` into one `<th scope="colgroup" colspan=N>`; an ungrouped
+ *    column emits its normal header cell with `rowspan="2"`. Row 2 carries the
+ *    leaf cells of the grouped columns only.
+ *
+ * Runs are contiguous because `resolveVisibleColumns` already orders the
+ * visible set canonically — a group's members are adjacent in the page's
+ * column list, so they are adjacent here. A group whose members were somehow
+ * split would render as two separate group cells rather than misaligning the
+ * body, which is the safe failure.
+ *
+ * `data-key`, the sort <button> and `aria-sort` live ONLY on leaf `<th>`s, so
+ * createSortableTable's delegated `closest("th[data-key]")` click keeps
+ * working unchanged and a click on a group cell is a no-op.
+ *
+ * The first VISIBLE member of a group supplies the group's label and title —
+ * the descriptor repeats them on every member so that dropping the first one
+ * from the view (a preset, or the column picker) still leaves the group named.
+ *
+ * @param {Object[]} visible - Visible column descriptors, in canonical order.
+ * @param {{key: string, dir: string}} activeSort
+ * @returns {string} The <thead>'s inner HTML.
+ */
+function theadHtml(visible, activeSort) {
+  if (!visible.some((column) => column.group)) {
+    return `<tr>${visible.map((column) => headerCellHtml(column, activeSort)).join("")}</tr>`;
+  }
+  const groupRow = [];
+  const leafRow = [];
+  for (let i = 0; i < visible.length; ) {
+    const column = visible[i];
+    if (!column.group) {
+      groupRow.push(headerCellHtml(column, activeSort, { rowspan: 2 }));
+      i += 1;
+      continue;
+    }
+    let end = i;
+    while (end < visible.length && visible[end].group?.id === column.group.id) end += 1;
+    const members = visible.slice(i, end);
+    const { label, title } = members[0].group;
+    groupRow.push(
+      `<th scope="colgroup" class="th-group" colspan="${members.length}"${
+        title ? ` title="${title}"` : ""
+      }>${label}</th>`
+    );
+    for (const member of members) leafRow.push(headerCellHtml(member, activeSort));
+    i = end;
+  }
+  return `<tr>${groupRow.join("")}</tr><tr>${leafRow.join("")}</tr>`;
 }
 
 /**
@@ -157,9 +479,7 @@ function createSortableTable({ columns, defaultSort, theadEl, tbodyEl, tieKey = 
   const sortListeners = [];
 
   function render() {
-    theadEl.innerHTML = `<tr>${visible
-      .map((column) => headerCellHtml(column, activeSort))
-      .join("")}</tr>`;
+    theadEl.innerHTML = theadHtml(visible, activeSort);
     tbodyEl.innerHTML = sortRowsBy(visible, rows, activeSort.key, activeSort.dir, tieKey)
       .map((row) => rowHtmlFromColumns(visible, row))
       .join("");
@@ -254,7 +574,16 @@ if (typeof module !== "undefined" && module.exports) {
     sortRowsBy,
     formatCellNumber,
     coverageCellHtml,
+    coverageCellParts,
+    providerShortLabel,
+    SCOPE_MULTI,
+    scopedProvider,
+    scopedNumericFilter,
+    deltaCellHtml,
+    providerCellHtml,
+    providerColumnGroup,
     headerCellHtml,
+    theadHtml,
     rowHtmlFromColumns,
     createSortableTable,
   };

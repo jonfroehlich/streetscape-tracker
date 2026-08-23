@@ -116,6 +116,34 @@
   outline-offset: -2px;
 }
 
+/* ── Grouped two-row headers (issue #250) ─────────────────────────────────
+   Emitted only when a page's column descriptors carry a `group` (grid.html
+   and streets.html pivot providers into sub-columns); driving.html's header
+   stays one row and never matches these rules. The group cell is a label, not
+   a control — it has no sort button and no data-key, so it is deliberately
+   centered and unclickable. */
+
+.streets-table thead th.th-group {
+  padding: 6px 12px;
+  text-align: center;
+  font-weight: bold;
+  border-bottom: 1px solid #ddd;
+  /* Separates one metric group from the next — and the City column from the
+     first of them — without a full grid of rules. There is deliberately no
+     `:first-child` exemption: `label` is `always: true` and leads the
+     canonical column order, so a `.th-group` is never the row's first child
+     and such a rule could not match. It is also not wanted, since the cell to
+     the left is the row-header column rather than the table's edge, and
+     without the divider "City" reads as part of the first group. */
+  box-shadow: inset 1px 0 0 #ddd;
+}
+
+/* An ungrouped column spans both header rows; align its label with the leaf
+   labels beside it rather than letting it float in the middle. */
+.streets-table thead th[rowspan] {
+  vertical-align: bottom;
+}
+
 /* Reserve the arrow's width so re-sorting doesn't shift column widths. */
 .sort-arrow {
   display: inline-block;
@@ -158,6 +186,13 @@
   min-width: 128px;
 }
 
+/* The pivoted pages (issue #250) put one coverage cell per PROVIDER under a
+   grouped header, plus a Δ column — at 128px each that group alone overflows
+   the measure. The bar still reads as a proportion; what goes is slack. */
+.coverage-cell--compact {
+  min-width: 90px;
+}
+
 /* The coverage scale runs light-at-high (see coverageColor), so the bar needs
    most of its opacity to stay visible on white at the top of the range. */
 .coverage-bar {
@@ -171,6 +206,54 @@
 
 .coverage-value {
   position: relative;
+}
+
+/* Per-provider cells are links into that provider's own series. They must NOT
+   look like links at rest — a pivoted row carries six to twelve of them, and a
+   table of blue underlined numbers is unreadable — so the link inherits the
+   cell's colour and fills it, and the affordance appears on hover/focus only.
+   `display: block` is what makes the whole cell the hit area rather than just
+   the glyphs. */
+
+.provider-cell-link {
+  display: block;
+  color: inherit;
+  text-decoration: none;
+}
+
+.provider-cell-link:hover,
+.provider-cell-link:focus-visible {
+  text-decoration: underline;
+}
+
+.provider-cell-link:focus-visible {
+  outline: 2px solid #1a73e8;
+  outline-offset: -2px;
+}
+
+/* The coverage cell positions its bar against the <td>; with a link inside,
+   the link is the thing that has to fill it or the bar sits behind nothing. */
+.coverage-cell .provider-cell-link {
+  position: static;
+}
+
+/* ── Cross-provider Δ cells (issue #250) ──────────────────────────────────
+   Deliberately NOT green/red by sign: a positive Δ means "Mapillary has more"
+   in a coverage group and "Mapillary is OLDER" in the age group, so one
+   sign-to-colour rule would have to lie in one of the two places. The sign
+   character carries the direction and the column's title says what it means.
+   Only an exact zero is styled — "the two providers agree exactly" is a
+   genuinely different fact from "they are close". The zero tone is matched on
+   ANY cell, not just `.delta-cell`, because streets.html's "Δ since last walk"
+   group renders the same fact one column over through the per-provider cell
+   path (see walkChangeCellHtml) and the two must not disagree about it. */
+
+.delta-cell {
+  font-variant-numeric: tabular-nums;
+}
+
+.streets-table td.delta-zero {
+  color: #888;
 }
 
 /* The city-name link (issue #188 follow-up: absorbed the old separate "View
@@ -343,6 +426,396 @@
 .controls-clear:focus-visible,
 .col-reset:focus-visible,
 .col-toggle input:focus-visible {
+  outline: 2px solid #1a73e8;
+  outline-offset: 1px;
+}
+
+/* ── Kayak-style filter sidebar (issue #250) ──────────────────────────────
+   grid.html and streets.html only: every rule below is scoped under
+   .with-sidebar or .streets-main--wide, and driving.html carries neither
+   class, so its horizontal control strip is untouched.
+
+   The sidebar is a native <details>. Above the breakpoint its <summary> is
+   hidden and the panel is simply an always-open column; below it, the summary
+   becomes the "Filters" toggle. That is keyboard and AT semantics for free,
+   and the one hole it leaves — collapsed narrow, then widened, leaving the
+   panel closed with its toggle hidden — is closed in JS by
+   wireSidebarDisclosure. */
+
+/* Wider measure than the 1200px single-column pages: a pivoted table carries
+   one sub-column per provider, and the sidebar takes 280px of the width. */
+.streets-main--wide {
+  max-width: 1500px;
+  /* Tighter than the prose pages': the point of the compact head below is to
+     put the table and its filters on the first screen. */
+  padding-top: 56px;
+  padding-bottom: 24px;
+}
+
+/* ── Compact page head ────────────────────────────────────────────────────
+   These two pages are instruments, not articles: the table and the filter
+   sidebar are what the reader came for, and a screen of preamble above them
+   pushed both below the fold. The lead is one sentence saying what the page
+   measures and how it differs from its sibling; everything else — how to read
+   the pivot, the census-vs-sample caveat, the crossfilter rule — moves into a
+   disclosure that is one click away and costs no vertical space closed.
+   driving.html keeps its full prose intro (.streets-intro), which is doing a
+   different job: that page's whole point needs explaining before its verdicts
+   mean anything. */
+
+.page-head {
+  margin-bottom: 14px;
+}
+
+.page-head h1 {
+  margin: 0 0 6px;
+  font-size: 24px;
+}
+
+.page-lead {
+  max-width: 78ch;
+  margin: 0 0 8px;
+  color: #333;
+}
+
+.page-about > summary {
+  display: inline-block;
+  cursor: pointer;
+  color: #1a6b1d;
+  font-weight: bold;
+  font-size: 13px;
+}
+
+.page-about > summary:focus-visible {
+  outline: 2px solid #1a73e8;
+  outline-offset: 2px;
+}
+
+.page-about-body {
+  max-width: 78ch;
+  margin-top: 8px;
+  color: #555;
+  font-size: 14px;
+}
+
+.page-about-body p {
+  margin: 0 0 8px;
+}
+
+.table-layout.with-sidebar {
+  display: grid;
+  grid-template-columns: 280px minmax(0, 1fr);
+  gap: 20px;
+  /* Without this the sidebar stretches to the table's height and cannot be
+     sticky (a stretched grid item has nothing to stick within). */
+  align-items: start;
+}
+
+/* Always there, and the full height of the viewport once the head scrolls
+   away: `sticky` pins it under the 44px fixed .site-header, and the explicit
+   height (rather than max-height) is what makes it a full-extent column rather
+   than a card that ends where its controls do. It scrolls independently, so a
+   long filter list never has to be reached by scrolling the table.
+   THE SIDEBAR ITSELF carries the card chrome here, and .table-controls goes
+   transparent inside it — the obvious alternative, a flex chain stretching the
+   controls to fill, does not survive contact with `<details>`: modern Chromium
+   gives it a `::details-content` box, so .controls-region is not a flex item
+   of the disclosure at all and simply does not grow. Painting the container is
+   both shorter and immune to that. */
+.with-sidebar .table-sidebar {
+  position: sticky;
+  top: 52px; /* clears the 44px fixed .site-header, plus breathing room */
+  height: calc(100vh - 64px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  background: #fff;
+  border-radius: 6px;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.15);
+}
+
+.with-sidebar .table-controls {
+  background: none;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+.with-sidebar .sidebar-disclosure > summary {
+  display: none; /* the panel is simply present at this width */
+}
+
+.with-sidebar .controls-region {
+  margin-bottom: 0;
+}
+
+/* One column of controls rather than a wrapping row. */
+.with-sidebar .table-controls {
+  flex-direction: column;
+  align-items: stretch;
+  flex-wrap: nowrap;
+  gap: 12px;
+}
+
+.with-sidebar .control-search input {
+  min-width: 0;
+  width: 100%;
+}
+
+.with-sidebar .control-check,
+.with-sidebar .col-picker {
+  align-self: flex-start;
+  padding-bottom: 0;
+}
+
+.with-sidebar .controls-clear {
+  align-self: flex-start;
+}
+
+/* The floating picker panel is clipped by the sidebar's own overflow, so in
+   this layout it pushes the controls below it down instead of overlaying the
+   table. Nothing is being read underneath it here — the table is elsewhere. */
+.with-sidebar .col-picker .col-panel {
+  position: static;
+  margin-top: 6px;
+  box-shadow: none;
+}
+
+.with-sidebar .col-picker .col-panel fieldset {
+  grid-template-columns: 1fr;
+}
+
+@media (max-width: 900px) {
+  .table-layout.with-sidebar {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .with-sidebar .table-sidebar {
+    position: static;
+    height: auto;
+    overflow: visible;
+  }
+
+  /* A full-height column makes no sense stacked above the table: the card
+     chrome goes back onto the controls, and the container back to plain. */
+  .with-sidebar .table-sidebar {
+    background: none;
+    border-radius: 0;
+    box-shadow: none;
+  }
+
+  .with-sidebar .table-controls {
+    background: #fff;
+    border-radius: 6px;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.15);
+  }
+
+  /* Below the breakpoint the disclosure is real: the filters collapse behind
+     a "Filters" summary so the table is not pushed off the first screen. */
+  .with-sidebar .sidebar-disclosure > summary {
+    display: list-item;
+    cursor: pointer;
+    padding: 8px 12px;
+    margin-bottom: 8px;
+    background: #fff;
+    border-radius: 6px;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.15);
+    font-weight: bold;
+    color: #1a6b1d;
+  }
+
+  .with-sidebar .sidebar-disclosure > summary:focus-visible {
+    outline: 2px solid #1a73e8;
+    outline-offset: 1px;
+  }
+
+  /* Back to using the full width — but as a GRID rather than a wrapping flex
+     row. A histogram-slider is a tall, wide item and a select is a short
+     narrow one, and flex-wrap interleaves them into a ragged block where a
+     slider's number inputs end up beside an unrelated control's label. */
+  .with-sidebar .table-controls {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    align-items: end;
+    gap: 12px 16px;
+  }
+
+  .with-sidebar .col-picker .col-panel {
+    position: absolute;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+  }
+
+  .with-sidebar .col-picker .col-panel fieldset {
+    grid-template-columns: repeat(2, minmax(140px, 1fr));
+  }
+}
+
+/* ── Histogram-slider filter (issue #250) ─────────────────────────────────
+   A mini histogram with a dual-handle brush over it, used in place of a bare
+   min/max pair on grid.html and streets.html. Only pages whose filters declare
+   `type: "histogram-range"` emit this markup, so driving.html never matches.
+
+   The bars reuse the distribution strip's look (one flat hue, no legend, no
+   axis furniture) because they encode the same thing — row counts — and a
+   second visual language for one quantity would imply a second meaning.
+
+   The slider itself is lifted from index.css's .legend-slider family: two
+   native range inputs stacked on one custom track, the inputs ignoring pointer
+   events so only their thumbs are grabbable, and the band between the thumbs
+   draggable as a window. */
+
+.control-histogram {
+  gap: 4px;
+}
+
+.hist-slider {
+  position: relative;
+  width: 100%;
+  min-width: 180px;
+  height: 56px; /* 32px of bars + a 24px slider lane beneath them */
+  /* `pan-y`, not `none`. This is a 56px-tall, full-width strip — three of them
+     on grid.html — inside a sidebar that below 900px is an ordinary scrolling
+     column above the table, so `none` meant a touch STARTING anywhere on a
+     slider (the bars included, which are not draggable at all) could not
+     scroll the panel. `pan-y` keeps vertical scrolling and still claims the
+     horizontal gesture, which is all the window drag uses: `pointermove`
+     reads `clientX` only. */
+  touch-action: pan-y;
+}
+
+.hist-slider.dragging,
+.hist-slider.dragging .hist-fill.draggable {
+  cursor: grabbing;
+}
+
+.hist-bars {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 32px;
+  display: flex;
+  align-items: flex-end;
+  gap: 1px;
+}
+
+.hist-bar {
+  flex: 1;
+  min-width: 1px;
+  background: #6c8ba0; /* the strip's hue — 3.6:1 on white, above the 3:1 floor */
+  border-radius: 2px 2px 0 0;
+}
+
+/* Outside the brushed window. Dimmed rather than hidden: those rows still
+   exist, they are just not selected. */
+.hist-bar.dimmed {
+  opacity: 0.35;
+}
+
+.hist-track {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 10px;
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(0, 0, 0, 0.2);
+}
+
+.hist-fill {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  border-radius: 2px;
+  background: #1a73e8;
+}
+
+.hist-fill.draggable {
+  cursor: grab;
+}
+
+.hist-slider input[type="range"] {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  width: 100%;
+  height: 24px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  pointer-events: none;
+  appearance: none;
+  -webkit-appearance: none;
+}
+
+.hist-slider input[type="range"]::-webkit-slider-runnable-track {
+  -webkit-appearance: none;
+  height: 24px;
+  background: transparent;
+  border: none;
+}
+
+.hist-slider input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  pointer-events: auto;
+  box-sizing: border-box;
+  width: 14px;
+  height: 14px;
+  margin-top: 5px; /* (24px input − 14px thumb) / 2, centers on the track */
+  border-radius: 50%;
+  background: #fff;
+  border: 2px solid #1a73e8;
+  cursor: grab;
+}
+
+.hist-slider input[type="range"]::-moz-range-track {
+  background: transparent;
+  border: none;
+}
+
+.hist-slider input[type="range"]::-moz-range-thumb {
+  pointer-events: auto;
+  box-sizing: border-box;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #fff;
+  border: 2px solid #1a73e8;
+  cursor: grab;
+}
+
+/* Focus ring on the thumb itself: an outline on the input would draw a
+   full-width box, since the input is transparent and spans the whole track. */
+.hist-slider input[type="range"]:focus-visible {
+  outline: none;
+}
+
+.hist-slider input[type="range"]:focus-visible::-webkit-slider-thumb {
+  box-shadow: 0 0 0 3px rgba(26, 115, 232, 0.4);
+}
+
+.hist-slider input[type="range"]:focus-visible::-moz-range-thumb {
+  box-shadow: 0 0 0 3px rgba(26, 115, 232, 0.4);
+}
+
+/* The precision path: exact bounds, and the fully labeled form controls. */
+.hist-bounds {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.hist-bounds input {
+  font: inherit;
+  font-size: 13px;
+  width: 78px;
+  padding: 4px 6px;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  background: #fff;
+  color: #222;
+}
+
+.hist-bounds input:focus-visible {
   outline: 2px solid #1a73e8;
   outline-offset: 1px;
 }

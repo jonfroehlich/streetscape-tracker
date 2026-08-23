@@ -37,53 +37,80 @@
        target="_blank" rel="noopener">About &#8599;</a>
   </header>
 
-  <main class="streets-main">
-    <h1>Grid coverage</h1>
-
-    <div class="streets-intro">
-      <p>
-        Every city in the tracker is sampled on a fixed geographic
-        <strong>grid</strong>: a lattice of points around the city center,
-        each asked for its nearest street-level panorama. Grid coverage is
-        the share of those sample points with imagery — an
-        <strong>area</strong> measure, comparable across providers because
-        both are queried on the same frozen grid. The
-        <a href="streets.html">Streets page</a> measures coverage by
-        <strong>road network</strong> instead: what fraction of a city's
-        streets have actually been driven.
+  <main class="streets-main streets-main--wide">
+    <div class="page-head">
+      <h1>Grid coverage</h1>
+      <p class="page-lead">
+        What share of a fixed lattice of sample points around each city has
+        street-level imagery — an <strong>area</strong> measure, comparable
+        across providers because both are queried on the same frozen grid.
+        <a href="streets.html">Streets</a> measures the <strong>road
+        network</strong> instead.
       </p>
-      <p class="streets-caveat">
-        A city collected by both Google Street View and Mapillary appears
-        once per provider. Coverage percentages are cross-provider
-        comparable; raw panorama counts are not — GSV samples the nearest
-        pano per grid point while Mapillary is a census of every 360° pano.
-        Search, filter and re-sort to narrow the table; the strip below the
-        controls shows how the sorted column is distributed across the rows
-        currently in view, and the address bar always carries the view you are
-        looking at so it can be shared.
-      </p>
+      <details class="page-about">
+        <summary>How to read this table</summary>
+        <div class="page-about-body">
+          <p>
+            Each city is <strong>one row</strong>, with a sub-column per
+            provider under every metric, so a city collected by both Google
+            Street View and Mapillary reads across in one line — and the
+            <strong>Δ</strong> column gives the difference (Mapillary − GSV)
+            directly. Click any provider's cell to open that provider's
+            snapshot for the city.
+          </p>
+          <p>
+            Coverage percentages are cross-provider comparable; raw panorama
+            counts are <em>not</em> — GSV samples the nearest pano per grid
+            point while Mapillary is a census of every 360° pano, which is why
+            that group has no Δ.
+          </p>
+          <p>
+            Each numeric filter in the sidebar carries a histogram of where the
+            rows actually sit, drawn over everything the <em>other</em>
+            controls have selected, so brushing one range never redraws its own
+            picture. The address bar always carries the view you are looking at
+            so it can be shared.
+          </p>
+        </div>
+      </details>
     </div>
 
     <div id="grid-status" class="table-status" role="status" aria-live="polite">
       Loading city collections…
     </div>
 
-    <!-- Search, filters, column preset/picker and the distribution strip are
-         rendered into this container by table-controls.js once the data has
-         loaded (issue #188). -->
-    <div id="grid-controls" class="controls-region"></div>
+    <!-- Sidebar + table (issue #250). The <details> is what makes the sidebar
+         collapsible below 900px with keyboard/AT semantics for free; above
+         that breakpoint its <summary> is hidden by CSS and the panel is simply
+         an always-open column. table-controls.js re-opens it on widening, so a
+         panel collapsed on a narrow screen can never end up hidden with its
+         only toggle gone. -->
+    <div class="table-layout with-sidebar">
+      <aside class="table-sidebar" aria-label="Search and filters">
+        <details class="sidebar-disclosure" open>
+          <summary>Filters</summary>
+          <!-- Search, filters and the column preset/picker are rendered into
+               this container by table-controls.js once the data has loaded
+               (issue #188). -->
+          <div id="grid-controls" class="controls-region"></div>
+        </details>
+      </aside>
 
-    <div id="grid-table-wrap" class="streets-table-wrap" hidden>
-      <table class="streets-table">
-        <caption id="grid-caption"></caption>
-        <!-- Header cells are rendered by table-utils.js from the page's column
-             descriptors (GRID_COLUMNS), not authored here: column presets
-             change the visible set at runtime, so the header and the body have
-             to come from one list or they drift. Sorting is delegated from this
-             element, which is why it survives a re-render. -->
-        <thead id="grid-thead"></thead>
-        <tbody id="grid-tbody"></tbody>
-      </table>
+      <div class="table-content">
+        <div id="grid-table-wrap" class="streets-table-wrap" hidden>
+          <table class="streets-table">
+            <caption id="grid-caption"></caption>
+            <!-- Header cells are rendered by table-utils.js from the page's
+                 column descriptors (GRID_COLUMNS), not authored here: column
+                 presets change the visible set at runtime, so the header and
+                 the body have to come from one list or they drift. Sorting is
+                 delegated from this element, which is why it survives a
+                 re-render. -->
+            <thead id="grid-thead"></thead>
+            <tbody id="grid-tbody"></tbody>
+          </table>
+        </div>
+      </div>
     </div>
   </main>
 
@@ -93,6 +120,7 @@
           crossorigin="anonymous"></script>
   <script src="js/streetscape-utils.js"></script>
   <script src="js/table-utils.js"></script>
+  <script src="js/histogram-slider.js"></script>
   <script src="js/table-controls.js"></script>
   <script src="js/grid.js"></script>
 </body>
