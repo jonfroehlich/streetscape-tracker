@@ -788,18 +788,27 @@ def _kartaview_capture_dates(census_frame: pd.DataFrame, positions: np.ndarray) 
     Capture dates for the census rows at ``positions``, per KartaView's rules.
 
     Handed to :func:`census_core.write_census_grid_run`. Takes positions rather
-    than a taken sub-frame so this indexes the TWO columns it needs -- a full
-    ``.take()`` here would materialize every column of a multi-million-row
-    census a second time (issue #157).
+    than a taken sub-frame so this indexes the TWO columns it needs -- a
+    whole-frame ``.take()`` here would materialize every column of a
+    multi-million-row census a second time (issue #157).
+
+    Per-column ``Series.take(positions)``, not ``.to_numpy()[positions]``: the
+    census columns are Arrow-backed strings (~a byte per character), and
+    ``.to_numpy()`` converts the ENTIRE column to a numpy object array of
+    Python strings -- tens of bytes per value, for every row in the census --
+    before the positional index throws almost all of it away. ``take`` selects
+    first, inside Arrow.
 
     Two columns rather than Mapillary's one because the rule needs both: a
     ``shot_date`` at or after its ``date_added`` is the upload timestamp being
-    served as a capture date, and :func:`shot_dates_to_iso_dates` rejects it.
-    They are never merged into a fallback -- see :func:`shot_date_to_iso_date`.
+    served as a capture date, and :func:`shot_dates_to_iso_dates` rejects it
+    (that function resets both series' indexes, so the taken positions do not
+    survive as labels). They are never merged into a fallback -- see
+    :func:`shot_date_to_iso_date`.
     """
     return shot_dates_to_iso_dates(
-        census_frame["shot_date"].to_numpy()[positions],
-        census_frame["date_added"].to_numpy()[positions],
+        census_frame["shot_date"].take(positions),
+        census_frame["date_added"].take(positions),
     ).to_numpy()
 
 
