@@ -492,7 +492,7 @@ def test_a_rejected_credential_is_not_a_host_refusal(status):
     breaker and skip another channel's cities.
     """
     error = _post_error(_FakeResponse(status=status, body={"status": {"apiCode": status}}))
-    assert isinstance(error, kv.ResponseError)
+    assert isinstance(error, kv.CredentialRejectedError), "the sweep fails fast on this type"
     assert not isinstance(error, HostBlockedError)
 
 
@@ -795,25 +795,50 @@ def test_calibration_refuses_to_run_with_no_probes():
         kv.calibration_points(BBOX, 0)
 
 
-def test_a_credential_rejected_at_every_probe_says_so_rather_than_blaming_the_city(monkeypatch):
+def test_a_broken_endpoint_at_every_probe_says_so_rather_than_blaming_the_city(monkeypatch):
     """
     Every rung failing has two very different causes and they send the operator
     to different places: no answerable radius is a property of the LOCATION
-    (Horace ND), a 401 is a property of the TOKEN. Folding the second into the
-    first printed "answered no radius at any calibration point ... refusing to
-    treat a refusal as an empty city" for a bad key.
+    (Horace ND), a definite server error at every probe is a property of the
+    ENDPOINT. Folding the second into the first printed "answered no radius at
+    any calibration point ... refusing to treat a refusal as an empty city" for
+    an API that was answering garbage.
     """
     error, calls = _failed_sweep(
         monkeypatch,
-        lambda call: (_ for _ in ()).throw(kv.ResponseError("HTTP 401")),
+        lambda call: (_ for _ in ()).throw(kv.ResponseError("no items in the body")),
         radius_m=None,
         calibration_probes=2,
     )
     assert isinstance(error, kv.ResponseError)
-    assert not isinstance(error, HostBlockedError)  # the token, not the host
-    assert "credential" in str(error)
+    assert not isinstance(error, HostBlockedError)  # the endpoint, not the host
+    assert "endpoint" in str(error)
     assert "empty city" not in str(error)
     assert error.api_requests == len(calls)
+
+
+def test_a_rejected_credential_stops_calibration_at_the_first_probe(monkeypatch):
+    """
+    A dead token answers identically at every rung, so walking the rest of the
+    ladder -- up to 30 requests at the defaults -- could only re-learn what
+    probe one already said, against a host this project paces at 16/min
+    precisely because its enforcement is unobservable. The error is the
+    propagated CredentialRejectedError, whose message names the token, not the
+    calibration message that blames the endpoint or the geometry.
+    """
+    error, calls = _failed_sweep(
+        monkeypatch,
+        lambda call: (_ for _ in ()).throw(
+            kv.CredentialRejectedError("HTTP 401; check KARTAVIEW_ACCESS_TOKEN")
+        ),
+        radius_m=None,
+        calibration_probes=2,
+    )
+    assert isinstance(error, kv.CredentialRejectedError)
+    assert not isinstance(error, HostBlockedError)  # the token, not the host
+    assert len(calls) == 1, "the ladder must not be walked with a dead token"
+    assert error.api_requests == 1
+    assert "calibration point" not in str(error), "the message blames the token, not the city"
 
 
 def test_the_cascade_stops_at_the_radius_floor(monkeypatch):
@@ -1023,7 +1048,7 @@ def test_a_rejected_credential_serving_html_is_still_only_the_credential(status)
             text="<html><body>Sign in to KartaView</body></html>",
         )
     )
-    assert isinstance(error, kv.ResponseError)
+    assert isinstance(error, kv.CredentialRejectedError)
     assert not isinstance(error, HostBlockedError)
     assert "KARTAVIEW_ACCESS_TOKEN" in str(error)
 
@@ -1461,6 +1486,36 @@ def test_a_budget_stop_mid_retry_keeps_the_unprobed_tail_failed(monkeypatch, tmp
     result, calls_three = _sweep_ckpt(monkeypatch, two_bad_roots_once, ckpt, retries=0)
     assert len(calls_three) == 1, "night three re-probes only what night two never reached"
     assert result["failed_cells"] == []
+
+
+def test_a_dead_credential_on_a_resumed_sweep_stops_at_one_request(monkeypatch, tmp_path):
+    """
+    Before CredentialRejectedError, a 401 was just another "broken" cell, so a
+    resumed sweep with a dead token marched through its entire remaining
+    lattice -- every cell, every retry -- to learn what request one already
+    said (176 requests on the review's reproduction), against a host whose
+    enforcement is unobservable. The sweep now stops at the first rejection,
+    the checkpoint keeps what previous nights paid for, and the error names
+    the token rather than the geometry.
+    """
+    ckpt = tmp_path / "sweep"
+    _failed_sweep_ckpt(monkeypatch, _photos, ckpt, max_requests=2)
+    before = _state(ckpt)
+    assert before["roots_done"] == 2
+
+    rejected = kv.CredentialRejectedError("HTTP 401; check KARTAVIEW_ACCESS_TOKEN")
+    error, calls = _failed_sweep_ckpt(
+        monkeypatch, lambda call: (_ for _ in ()).throw(rejected), ckpt
+    )
+    assert error is rejected, "propagated as itself, spend attached"
+    assert len(calls) == 1, "the rest of the lattice must not be asked with a dead token"
+    assert error.api_requests == 1
+    after = _state(ckpt)
+    assert (after["roots_done"], after["parts"], after["census_rows"]) == (
+        before["roots_done"],
+        before["parts"],
+        before["census_rows"],
+    ), "the checkpoint still holds exactly what previous nights paid for"
 
 
 def test_a_null_looking_string_survives_the_checkpoint_as_a_string(tmp_path):

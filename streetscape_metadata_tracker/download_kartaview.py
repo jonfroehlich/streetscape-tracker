@@ -884,6 +884,24 @@ class ResponseError(DownloadError):
     """
 
 
+class CredentialRejectedError(ResponseError):
+    """
+    The server rejected the token itself: HTTP 401/403.
+
+    The one ResponseError that fails the SWEEP rather than the cell. Every
+    other definite answer is a property of one query -- an unparseable body at
+    cell N says nothing about cell N+1 -- but a dead token answers identically
+    everywhere, so recording it per cell re-asks a rejected credential at
+    every remaining cell of every page (a full lattice's worth of requests to
+    learn what request one already said, which is also a good way to look like
+    an attack). ``_probe_cell`` re-raises it instead of returning ``broken``;
+    the checkpoint's finally-commit keeps the spend.
+
+    Still a ResponseError and still NOT host-typed, per the class above: the
+    token is scoped to the CHANNEL, so a sibling channel's cities keep running.
+    """
+
+
 class SweepIncompleteError(DownloadError):
     """
     The sweep stopped with root cells unvisited, and CHECKPOINTED them (#239).
@@ -983,7 +1001,7 @@ async def _post_nearby(
             # the operator after a ban that never happened. A credential is
             # scoped to the CHANNEL, not the machine.
             if resp.status in (401, 403):
-                raise ResponseError(
+                raise CredentialRejectedError(
                     f"KartaView rejected the credential (HTTP {resp.status}, {content_type or '?'})."
                     " Check KARTAVIEW_ACCESS_TOKEN; this is scoped to the token, not to this host."
                 )
@@ -1172,13 +1190,17 @@ async def calibrate_radius(
         empty city.
 
     Raises:
-        ResponseError: the server gave a definite, unusable answer at every
-            probe -- overwhelmingly a rejected credential. Surfaced as itself
-            rather than folded into the None above, because "no radius answers
-            in this bbox" is a property of the LOCATION and sends the operator
-            to look at the city; a 401 is a property of the token and sends
-            them to the .env. They are not the same fact and the message the
-            caller prints must not claim the wrong one.
+        CredentialRejectedError: the token was rejected. Propagates from the
+            FIRST probe rather than after the ladder -- a dead token answers
+            identically at every rung, so the remaining probes could only
+            re-learn it -- and its message sends the operator to the .env.
+        ResponseError: the server gave a definite, unusable non-credential
+            answer at every probe (an unparseable body, an HTTP error that is
+            neither backpressure nor transport). Surfaced as itself rather
+            than folded into the None above, because "no radius answers in
+            this bbox" is a property of the LOCATION and sends the operator to
+            look at the city; a broken endpoint is not the same fact and the
+            message the caller prints must not claim the wrong one.
     """
     points = calibration_points(bbox, probes_per_rung)
     saw_only_broken = True
@@ -1205,10 +1227,13 @@ async def calibrate_radius(
         if answered == len(points):
             return radius
     if saw_only_broken:
+        # A rejected credential never reaches this: CredentialRejectedError
+        # propagates from the first probe. What lands here is the endpoint
+        # answering definite garbage -- unparseable bodies, item-less envelopes.
         raise ResponseError(
             "KartaView gave no usable answer at any radius or any calibration point "
             "(every probe a definite error rather than backpressure); this is the "
-            "credential or the endpoint, not the city's geometry"
+            "endpoint, not the city's geometry"
         )
     return None
 
@@ -1243,9 +1268,12 @@ async def _probe_cell(
     The two non-backpressure classes are then retried differently, because they
     are different facts. A TransportError -- reset, timeout, DNS -- is transient
     by nature and gets the same retry budget. A ResponseError is the server
-    giving a definite answer we cannot use (a rejected token, an unparseable
-    body); re-asking cannot change it, and a rejected credential re-asked at
-    every cell of every city is a good way to look like an attack.
+    giving a definite answer we cannot use (an unparseable body, an HTTP error
+    that is neither backpressure nor transport); re-asking cannot change it, so
+    the cell is recorded broken and never retried. Its
+    :class:`CredentialRejectedError` subclass is the exception and PROPAGATES:
+    a dead token answers identically at every cell, so it fails the sweep
+    rather than the cell.
 
     A HostBlockedError is not caught at all: it is a property of the machine, so
     the sweep stops rather than working through its remaining cells to learn
@@ -1273,6 +1301,13 @@ async def _probe_cell(
             if attempt == retries:
                 return [], None, "broken"
             continue
+        except CredentialRejectedError:
+            # Propagated, not recorded: a dead token answers identically at
+            # every cell, so "broken" here would re-ask it at every remaining
+            # cell of every page. The sweep stops now, the checkpoint's
+            # finally-commit keeps the spend, and the message sends the
+            # operator to the .env rather than to the city.
+            raise
         except ResponseError as e:
             logger.warning(
                 f"r={cell.radius_m} m @ {cell.lat:.4f},{cell.lon:.4f}: neither backpressure "
@@ -2403,7 +2438,9 @@ async def _fetch_city_images(
                             # cost 42 requests and a single TCP reset cost
                             # 105, while the module's own docstrings
                             # promised "asked exactly once" and "recorded
-                            # as a failed cell".
+                            # as a failed cell". (The credential half now
+                            # propagates before it can get here -- see
+                            # CredentialRejectedError.)
                             failed_cells.append(cell)
                             break
                         raw_photo_count += len(items)
