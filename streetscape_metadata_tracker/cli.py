@@ -76,7 +76,7 @@ from .json_summarizer import (
     generate_driving_plan_summary,
     generate_streetwalk_manifest,
 )
-from .naming import generate_run_filename, same_grid_geometry
+from .naming import KNOWN_PROVIDERS, generate_run_filename, same_grid_geometry
 from .paths import get_default_data_dir, get_default_vis_dir
 
 logger = logging.getLogger(__name__)
@@ -126,7 +126,10 @@ def parse_args():
 
     parser.add_argument(
         "--provider",
-        choices=["both", "gsv", "mapillary", "kartaview"],
+        # Built from the naming contract rather than restated: a provider that
+        # joins KNOWN_PROVIDERS is collectable here without a second edit, and
+        # a hand-kept list is the kind that drifts one provider behind.
+        choices=["both", *KNOWN_PROVIDERS],
         default="both",
         help="Imagery provider(s) to collect. Each provider keeps its own "
         "independent run series (dated files, diffs, skip policy) on the "
@@ -753,14 +756,16 @@ async def _collect_one_run(conn, args, city_row, run_date, provider, config, vis
         started_at=started,
         finished_at=finished,
         duration_seconds=duration,
-        # The SWEEP's cost, not this process's. These are the same number for
-        # every provider that finishes in one go, and differ for a KartaView
-        # sweep resumed across nights (#239): the row describes the run, so it
-        # must say what the run cost, while db.add_api_usage above is fed the
-        # per-process figure because it is additive and keyed by (date,
-        # provider) -- charging it the cumulative total would bill last night's
-        # requests against tonight's budget gate a second time. Falls back for
-        # the providers that publish no cumulative figure.
+        # The SWEEP's cost, not this process's: the row describes the run, so
+        # it must say what the run cost, while db.add_api_usage above is fed
+        # the per-process figure because it is additive and keyed by (date,
+        # provider) -- charging it the cumulative total would bill last
+        # night's requests against tonight's budget gate a second time. Only
+        # KartaView publishes the cumulative figure (#239); the fallback is
+        # exact for Mapillary (always one process) but UNDER-counts a GSV run
+        # resumed via its .downloading sibling, whose earlier processes' spend
+        # is recorded only in api_usage -- a pre-existing limitation of that
+        # checkpoint, noted rather than fixed here.
         api_requests=dict_results.get("api_requests_total", dict_results["api_requests"]),
         # Flat-image census (issue #116) is a Mapillary downloader artifact,
         # not derivable from the CSV — GSV runs omit it (stored NULL).
