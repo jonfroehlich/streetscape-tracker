@@ -1348,37 +1348,119 @@ def test_a_sweep_spanning_three_nights_is_still_that_one_census(monkeypatch, tmp
     assert not ckpt.exists()
 
 
-def test_a_hole_punched_on_night_one_still_refuses_the_snapshot_on_night_two(monkeypatch, tmp_path):
+def test_a_hole_that_fails_again_still_refuses_the_snapshot_on_night_two(monkeypatch, tmp_path):
     """
-    Failed cells are inherited across a resume, and must be: a cell that
-    genuinely never answered is a hole in the bbox whether it was asked
-    yesterday or today, and the area guard is what stops an immutable dated
-    snapshot being published around it. Losing them on resume would turn a
+    Failed cells are inherited across a resume AND RE-PROBED: a refusal is
+    time-varying, so night two asks the hole again rather than trusting
+    yesterday's verdict. One that fails AGAIN is a hole in the bbox whether it
+    was asked yesterday or today, and the area guard is what stops an immutable
+    dated snapshot being published around it. Losing it on resume would turn a
     refused sweep into a silently incomplete one.
 
-    The refusal keeps the checkpoint, because a complete one re-finalizes
-    without spending a request -- so the operator's retry is free, and the reset
-    is the deliberate act of deleting the directory.
+    The refusal keeps the checkpoint: everything already answered stays paid
+    for, a later attempt re-probes only the hole, and the reset is the
+    deliberate act of deleting the directory.
+    """
+    ckpt = tmp_path / "sweep"
+    hole = []
+
+    def responder(call):
+        if not hole:
+            hole.append(call.key)
+        if call.key == hole[0]:
+            raise kv.ResponseError("HTTP 500")  # this circle is a hole, permanently
+        return [], 0
+
+    night_one, _ = _failed_sweep_ckpt(monkeypatch, responder, ckpt, max_requests=2, retries=0)
+    assert isinstance(night_one, kv.SweepIncompleteError)
+    assert len(_state(ckpt)["failed_cells"]) == 1
+
+    night_two, calls = _failed_sweep_ckpt(monkeypatch, responder, ckpt, retries=0)
+    assert not isinstance(night_two, kv.SweepIncompleteError)
+    assert "unmeasured" in str(night_two) and "refusing to finalize" in str(night_two)
+    assert str(ckpt) in str(night_two)
+    assert _state(ckpt)["roots_done"] == 4, "kept, so a later attempt re-probes only the hole"
+    assert len(_state(ckpt)["failed_cells"]) == 1, "it failed again, so it stays failed"
+    assert sum(1 for c in calls if c.key == hole[0]) == 1, "the hole was re-probed exactly once"
+    assert len(calls) == 3  # the re-probe plus the two roots night one never reached
+
+
+def test_a_carried_failed_cell_is_re_probed_and_can_heal(monkeypatch, tmp_path):
+    """
+    The reciprocal case, and the reason the retry pass exists: apiCode 690 is
+    FLAKY (fact 2 -- Horace refused r=1000 on 0/6 attempts and answered it 2/2
+    forty-five minutes later), so a cell that failed yesterday is not a hole
+    today until it has refused again. This checkpoint is COMPLETE with one
+    failed cell; before the retry pass, no re-run could ever answer differently
+    without the operator deleting the directory by hand, so one bad hour
+    permanently blocked a snapshot the host was willing to complete.
     """
     ckpt = tmp_path / "sweep"
     seen = []
 
-    def responder(call):
+    def flaky_then_fine(call):
         seen.append(call)
         if len(seen) == 1:
-            raise kv.ResponseError("HTTP 500")  # this root is a hole, permanently
-        return [], 0
+            raise kv.ResponseError("HTTP 500")  # one bad hour, night one only
+        return _photos(call)
 
-    night_one, calls = _failed_sweep_ckpt(monkeypatch, responder, ckpt, max_requests=2, retries=0)
-    assert isinstance(night_one, kv.SweepIncompleteError)
+    night_one, calls_one = _failed_sweep_ckpt(monkeypatch, flaky_then_fine, ckpt, retries=0)
+    assert "unmeasured" in str(night_one), "night one refuses to finalize around the hole"
+    assert _state(ckpt)["roots_done"] == 4, "complete: every root was visited"
     assert len(_state(ckpt)["failed_cells"]) == 1
 
-    night_two, _ = _failed_sweep_ckpt(monkeypatch, responder, ckpt)
-    assert not isinstance(night_two, kv.SweepIncompleteError)
-    assert "unmeasured" in str(night_two) and "refusing to finalize" in str(night_two)
-    assert str(ckpt) in str(night_two)
-    assert _state(ckpt)["roots_done"] == 4, "kept, so the retry costs nothing"
-    assert len(calls) == 2
+    result, calls_two = _sweep_ckpt(monkeypatch, flaky_then_fine, ckpt, retries=0)
+    assert len(calls_two) == 1, "only the failed cell is re-probed"
+    assert calls_two[0].key == calls_one[0].key
+    assert result["failed_cells"] == []
+    assert result["api_requests"] == 1
+    assert result["api_requests_total"] == len(calls_one) + 1
+    # The healed census holds every circle's photos. Not compared frame-for-
+    # frame with an uninterrupted sweep: fetch order differs (the healed
+    # cell's photos arrive last), and fetch order is what it is.
+    whole, _ = _sweep(monkeypatch, _photos)
+    assert sorted(result["census"]["id"]) == sorted(whole["census"]["id"])
+
+
+def test_a_budget_stop_mid_retry_keeps_the_unprobed_tail_failed(monkeypatch, tmp_path):
+    """
+    Each carried cell leaves the durable failed set only at the moment it is
+    actually re-swept. A session stopping partway through the retry pass must
+    commit the not-yet-re-probed tail as still failed -- seeding the session's
+    failed list from the carried set instead would read the same on the clean
+    path and silently lose the tail here, publishing those cells' grid points
+    as ZERO_RESULTS: absence never observed. And the stop is a
+    SweepIncompleteError, not the area guard: with a checkpoint the budget
+    means "spend this much tonight", and the pass continues tomorrow.
+    """
+    ckpt = tmp_path / "sweep"
+    seen = []
+
+    def two_bad_roots_once(call):
+        seen.append(call)
+        if len(seen) <= 2:
+            raise kv.ResponseError("HTTP 500")
+        return [], 0
+
+    night_one, _ = _failed_sweep_ckpt(monkeypatch, two_bad_roots_once, ckpt, retries=0)
+    assert "unmeasured" in str(night_one)
+    carried = _state(ckpt)["failed_cells"]
+    assert len(carried) == 2 and _state(ckpt)["roots_done"] == 4
+
+    night_two, calls = _failed_sweep_ckpt(
+        monkeypatch, two_bad_roots_once, ckpt, retries=0, max_requests=1
+    )
+    assert isinstance(night_two, kv.SweepIncompleteError)
+    assert "re-probing previously failed cells" in str(night_two)
+    assert "unmeasured" not in str(night_two)
+    assert len(calls) == 1, "the budget bounded the retry pass"
+    assert _state(ckpt)["failed_cells"] == [carried[1]], (
+        "the re-probed cell healed and left the set; the un-probed one stayed"
+    )
+
+    result, calls_three = _sweep_ckpt(monkeypatch, two_bad_roots_once, ckpt, retries=0)
+    assert len(calls_three) == 1, "night three re-probes only what night two never reached"
+    assert result["failed_cells"] == []
 
 
 def test_a_null_looking_string_survives_the_checkpoint_as_a_string(tmp_path):

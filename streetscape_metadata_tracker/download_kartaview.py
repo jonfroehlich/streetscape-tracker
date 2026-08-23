@@ -1613,15 +1613,20 @@ def load_checkpoint(
     _purge_uncommitted_parts(cp)
     if cp.roots_done == root_count:
         # Louder than the partial case, because this one finalizes without
-        # issuing a request and so cannot be told from a fresh collection by its
+        # re-sweeping and so cannot be told from a fresh collection by its
         # artifact alone. It is the intended recovery from a caller that died
         # before its artifact was durable -- and it is also what a caller that
         # simply forgot to `discard_checkpoint` looks like, so say which sweep's
         # answers are about to be republished.
+        retry_note = (
+            f" after re-probing its {len(cp.failed_cells)} failed cell(s)"
+            if cp.failed_cells
+            else " without issuing a request"
+        )
         logger.warning(
             f"The KartaView checkpoint at {path} is COMPLETE ({root_count} root cells, "
-            f"last committed {age_s / 3600:.1f} h ago): finalizing from disk without "
-            f"issuing a request. This is the recovery path for a caller that died before "
+            f"last committed {age_s / 3600:.1f} h ago): finalizing from disk{retry_note}. "
+            f"This is the recovery path for a caller that died before "
             f"its artifact was durable; if that is not what happened, the previous run "
             f"failed to call discard_checkpoint()."
         )
@@ -2078,9 +2083,13 @@ async def _fetch_city_images(
         carry its count over -- correctly, because its caller writes
         ``db.record_harvest`` and never touches the daily ledger.)
 
-        ``cells_visited``, ``raw_photo_count`` and ``failed_cells`` stay
-        CUMULATIVE across a resume, because they describe the census rather than
-        the process that fetched it.
+        ``cells_visited`` and ``raw_photo_count`` stay CUMULATIVE across a
+        resume, because they describe the census rather than the process that
+        fetched it. ``failed_cells`` is carried too, but through a RETRY PASS
+        rather than verbatim: a resume re-probes every carried cell before the
+        unvisited roots (a refusal is time-varying -- fact 2), so a cell stays
+        failed only by refusing again, and a crash mid-pass keeps the
+        not-yet-re-probed tail failed in the checkpoint.
 
     Raises:
         SweepIncompleteError: the sweep stopped with roots unvisited and
@@ -2130,6 +2139,21 @@ async def _fetch_city_images(
         """
         if cp is None:
             failed_cells.extend(cells)
+
+    def durable_failed() -> list[Cell]:
+        """
+        The failed set as it must be RECORDED, not as this session has seen it.
+
+        A cell carried failed from a prior session leaves the set only at the
+        moment it is actually re-swept (``retry_pos`` advances past it), so a
+        commit taken mid-retry-pass -- or the finally-commit after a crash
+        there -- keeps every not-yet-re-probed cell failed. Initializing
+        ``failed_cells`` from the carried set instead would read the same on
+        the clean path and silently LOSE the tail on this one: the un-retried
+        cells' grid points would publish as ZERO_RESULTS, absence never
+        observed.
+        """
+        return retry_queue[retry_pos:] + failed_cells
 
     # Clamped ONCE, here, so the page arithmetic and the wire agree. _post_nearby
     # sends min(ipp, IPP_MAX) because the server caps it there, but
@@ -2181,7 +2205,18 @@ async def _fetch_city_images(
     # play; everything committed lives on disk and is read back at finalize. The
     # rest are cumulative across resumes, because they describe the census.
     frames: list[pd.DataFrame] = []
-    failed_cells: list[Cell] = list(resumed.failed_cells) if resumed else []
+    # Cells prior sessions recorded as failed are RE-PROBED, not carried forward
+    # unasked: a refusal is time-varying (fact 2 -- Horace refused r=1000 on 0/6
+    # attempts and answered it 2/2 forty-five minutes later), so yesterday's
+    # dead cell is often today's clean answer, and carrying it blindly would let
+    # one bad hour permanently punch REQUEST_FAILED holes through every later
+    # resume -- or trip the area guard on a sweep about to complete. They live
+    # in `retry_queue` until each is actually re-swept; `failed_cells` is this
+    # SESSION's failures only, append-only so the rewind marks stay valid, and
+    # the recorded set is always durable_failed() -- the two joined.
+    retry_queue: list[Cell] = list(resumed.failed_cells) if resumed else []
+    retry_pos = 0
+    failed_cells: list[Cell] = []
     raw_photo_count = resumed.raw_photo_count if resumed else 0
     cells_visited = resumed.cells_visited if resumed else 0
     prior_requests = resumed.api_requests_total if resumed else 0
@@ -2242,6 +2277,162 @@ async def _fetch_city_images(
                 f"Sweeping KartaView for {city_name}: {len(roots)} cells at r={radius_m} m "
                 f"covering bbox {tuple(round(v, 4) for v in bbox)}"
             )
+
+            async def _sweep_subtree(subtree_root: Cell) -> bool:
+                """
+                Sweep one cell depth-first, descending wherever it refuses.
+
+                Returns False when the request budget ran out mid-subtree (the
+                caller stops the sweep; ``unvisited`` has already recorded
+                whatever the stop never reached) and True otherwise --
+                including when parts of the subtree ended as failed cells,
+                which are recorded rather than raised. One body shared by the
+                root loop and the retry pass, so the two walks cannot drift.
+                """
+                nonlocal cells_visited, raw_photo_count
+                stack = [subtree_root]
+                while stack:
+                    # The guard is checked HERE, and again in the page loop
+                    # below, not only at the root boundary. Checked only
+                    # there it bounded nothing: one root can cascade to the
+                    # radius floor (1 + 4 + 16 + 64 = 85 cells, each up to
+                    # retries + 1 attempts and MAX_PAGES_PER_CELL pages) and
+                    # a page count comes from a SERVER-supplied total, so a
+                    # single root could spend thousands of requests without
+                    # the loop ever asking again. Measured before this fix:
+                    # max_requests=5 issued 500 requests. The scheduler
+                    # hands sibling channels the remaining daily budget in
+                    # exactly this parameter, so the overrun would be spent
+                    # against a per-IP-metered host.
+                    if over_budget():
+                        unvisited(stack)
+                        return False
+                    cell = stack.pop()
+                    cells_visited += 1
+                    items, total, outcome = await _probe_cell(
+                        session,
+                        limiter,
+                        count_request,
+                        cell,
+                        ipp=ipp,
+                        access_token=access_token,
+                        retries=retries,
+                        timeout=timeout,
+                    )
+                    if outcome == "broken":
+                        failed_cells.append(cell)
+                        continue
+                    if outcome == "refused":
+                        if not can_subdivide(cell):
+                            # Below the floor a refusal is a defect rather
+                            # than backpressure: the smallest rung answered
+                            # at every target the feasibility study probed.
+                            failed_cells.append(cell)
+                            continue
+                        stack.extend(subdivide(cell))
+                        continue
+
+                    raw_photo_count += len(items)
+                    # Converted to columns HERE, per page, so one page's
+                    # dicts are freed before the next is decoded rather than
+                    # the whole city's surviving to the end (#157).
+                    frames.append(records_to_census(decode_photo_items(items)))
+
+                    pages = pages_for_total(total, ipp)
+                    if pages > MAX_PAGES_PER_CELL:
+                        # Deep paging is untested past page 7; four
+                        # shallower circles cost less risk than one long
+                        # descent. Page 1 is kept rather than discarded --
+                        # it is already paid for, and the children's
+                        # overlap is deduped by id anyway.
+                        if can_subdivide(cell):
+                            stack.extend(subdivide(cell))
+                            continue
+                        # At the floor there are no shallower circles to
+                        # fall back to, and the `and can_subdivide(cell)`
+                        # this replaces made the cap a NO-OP there: control
+                        # fell through and paged to a server-supplied total
+                        # with no ceiling at all. A 100 m circle claiming a
+                        # million items paged 500 times at 16/min. A cell
+                        # we cannot exhaust is unmeasured area, which is
+                        # what failed_cells means -- "refuse a hole"
+                        # rather than silently accept a truncated circle.
+                        logger.warning(
+                            f"r={cell.radius_m} m @ {cell.lat:.4f},{cell.lon:.4f} needs "
+                            f"{pages} pages at the radius floor and cannot be split; "
+                            f"recording it as unmeasured"
+                        )
+                        failed_cells.append(cell)
+                        continue
+
+                    for page in range(2, pages + 1):
+                        if over_budget():
+                            unvisited([cell])
+                            unvisited(stack)
+                            return False
+                        items, _, outcome = await _probe_cell(
+                            session,
+                            limiter,
+                            count_request,
+                            cell,
+                            page=page,
+                            ipp=ipp,
+                            access_token=access_token,
+                            retries=retries,
+                            timeout=timeout,
+                        )
+                        if outcome == "refused":
+                            # Backpressure, and ONLY backpressure, may
+                            # subdivide: a partially paged circle is not
+                            # exhaustive, so the area is re-covered as four
+                            # smaller ones rather than accepted short.
+                            if can_subdivide(cell):
+                                stack.extend(subdivide(cell))
+                            else:
+                                failed_cells.append(cell)
+                            break
+                        if outcome == "broken":
+                            # A transport fault or a definite unusable
+                            # answer is NOT backpressure, so it must not
+                            # fan out -- asking the server for four
+                            # requests where it just failed to serve one is
+                            # #198's shape, not a fix for it. This branch
+                            # used to share the `refused` path and so
+                            # cascaded all the way to the floor: measured,
+                            # a rejected credential on page 2 of one root
+                            # cost 42 requests and a single TCP reset cost
+                            # 105, while the module's own docstrings
+                            # promised "asked exactly once" and "recorded
+                            # as a failed cell".
+                            failed_cells.append(cell)
+                            break
+                        raw_photo_count += len(items)
+                        frames.append(records_to_census(decode_photo_items(items)))
+                return True
+
+            def maybe_commit() -> None:
+                """Commit at the cadence, at a boundary the marks were just taken at."""
+                nonlocal mark_frames, requests_at_last_commit
+                if (
+                    cp is not None
+                    and api_requests - requests_at_last_commit >= checkpoint_request_interval
+                ):
+                    _commit_checkpoint(
+                        cp,
+                        frames,
+                        roots_done=roots_done,
+                        failed_cells=durable_failed(),
+                        cells_visited=cells_visited,
+                        raw_photo_count=raw_photo_count,
+                        api_requests_total=prior_requests + api_requests,
+                        bbox=bbox,
+                        ipp=ipp,
+                        root_count=len(roots),
+                    )
+                    frames.clear()
+                    mark_frames = 0
+                    requests_at_last_commit = api_requests
+
             progress_bar = progress(
                 total=len(roots),
                 # Seeded, so a resumed night's bar and its once-a-minute log
@@ -2260,184 +2451,89 @@ async def _fetch_city_images(
                 # indistinguishable after a SIGKILL (issue #157).
                 logger=logger,
             )
-            budget_stop = False
-            # The accumulators as of the last completed root boundary, so a stop
-            # landing mid-root can roll back to one. Everything a commit writes
-            # is taken at a mark, never mid-cell.
+            retry_bar = None
+            # The accumulators as of the last completed boundary -- a root's,
+            # or a retried cell's -- so a stop landing mid-cell can roll back
+            # to one. Everything a commit writes is taken at a mark, never
+            # mid-cell.
             mark_frames = 0
             mark_failed = len(failed_cells)
             mark_visited, mark_photos = cells_visited, raw_photo_count
+            mark_retry = retry_pos
             try:
-                # range(), not enumerate() + continue: skipping already-swept
-                # roots through the loop body would evaluate over_budget() on
-                # each of them, so a resume with a small budget could "stop"
-                # before asking anything.
-                for index in range(start_index, len(roots)):
-                    root = roots[index]
-                    if over_budget():
-                        unvisited(roots[index:])
-                        logger.warning(
-                            f"Stopped after {api_requests} requests (max_requests="
-                            f"{max_requests}); {len(roots) - index} of {len(roots)} cells "
-                            f"never visited"
-                        )
-                        stop_reason = f"the {max_requests}-request budget ran out"
-                        break
-                    stack = [root]
-                    while stack:
-                        # The guard is checked HERE, and again in the page loop
-                        # below, not only at the root boundary. Checked only
-                        # there it bounded nothing: one root can cascade to the
-                        # radius floor (1 + 4 + 16 + 64 = 85 cells, each up to
-                        # retries + 1 attempts and MAX_PAGES_PER_CELL pages) and
-                        # a page count comes from a SERVER-supplied total, so a
-                        # single root could spend thousands of requests without
-                        # the loop ever asking again. Measured before this fix:
-                        # max_requests=5 issued 500 requests. The scheduler
-                        # hands sibling channels the remaining daily budget in
-                        # exactly this parameter, so the overrun would be spent
-                        # against a per-IP-metered host.
-                        if over_budget():
-                            unvisited(stack)
-                            budget_stop = True
-                            break
-                        cell = stack.pop()
-                        cells_visited += 1
-                        items, total, outcome = await _probe_cell(
-                            session,
-                            limiter,
-                            count_request,
-                            cell,
-                            ipp=ipp,
-                            access_token=access_token,
-                            retries=retries,
-                            timeout=timeout,
-                        )
-                        if outcome == "broken":
-                            failed_cells.append(cell)
-                            continue
-                        if outcome == "refused":
-                            if not can_subdivide(cell):
-                                # Below the floor a refusal is a defect rather
-                                # than backpressure: the smallest rung answered
-                                # at every target the feasibility study probed.
-                                failed_cells.append(cell)
-                                continue
-                            stack.extend(subdivide(cell))
-                            continue
-
-                        raw_photo_count += len(items)
-                        # Converted to columns HERE, per page, so one page's
-                        # dicts are freed before the next is decoded rather than
-                        # the whole city's surviving to the end (#157).
-                        frames.append(records_to_census(decode_photo_items(items)))
-
-                        pages = pages_for_total(total, ipp)
-                        if pages > MAX_PAGES_PER_CELL:
-                            # Deep paging is untested past page 7; four
-                            # shallower circles cost less risk than one long
-                            # descent. Page 1 is kept rather than discarded --
-                            # it is already paid for, and the children's
-                            # overlap is deduped by id anyway.
-                            if can_subdivide(cell):
-                                stack.extend(subdivide(cell))
-                                continue
-                            # At the floor there are no shallower circles to
-                            # fall back to, and the `and can_subdivide(cell)`
-                            # this replaces made the cap a NO-OP there: control
-                            # fell through and paged to a server-supplied total
-                            # with no ceiling at all. A 100 m circle claiming a
-                            # million items paged 500 times at 16/min. A cell
-                            # we cannot exhaust is unmeasured area, which is
-                            # what failed_cells means -- "refuse a hole"
-                            # rather than silently accept a truncated circle.
+                # ---- Retry pass: cells prior sessions recorded as failed ----
+                # Walked BEFORE the unvisited roots, deliberately: these are
+                # the cells whose age argues hardest for asking again, and a
+                # budget that runs out tonight should run out on the roots the
+                # resume will reach anyway, not on the holes it would carry
+                # forever. Each cell leaves the durable failed set only when
+                # it is actually re-swept (durable_failed), so a stop or crash
+                # mid-pass keeps the tail failed rather than losing it; one
+                # that fails AGAIN is re-recorded by the subtree body.
+                if retry_queue:
+                    retry_bar = progress(
+                        total=len(retry_queue),
+                        desc=(
+                            f"Re-probing {len(retry_queue)} previously failed "
+                            f"cell(s) for {city_name}"
+                        ),
+                        unit="cell",
+                        logger=logger,
+                    )
+                    while retry_pos < len(retry_queue):
+                        if not await _sweep_subtree(retry_queue[retry_pos]):
                             logger.warning(
-                                f"r={cell.radius_m} m @ {cell.lat:.4f},{cell.lon:.4f} needs "
-                                f"{pages} pages at the radius floor and cannot be split; "
-                                f"recording it as unmeasured"
+                                f"Stopped after {api_requests} requests (max_requests="
+                                f"{max_requests}); {len(retry_queue) - retry_pos} of "
+                                f"{len(retry_queue)} previously failed cell(s) not yet "
+                                f"re-probed -- they stay failed in the checkpoint"
                             )
-                            failed_cells.append(cell)
-                            continue
+                            stop_reason = (
+                                f"the {max_requests}-request budget ran out re-probing "
+                                f"previously failed cells"
+                            )
+                            break
+                        retry_pos += 1
+                        retry_bar.update(1)
+                        mark_frames, mark_failed = len(frames), len(failed_cells)
+                        mark_visited, mark_photos = cells_visited, raw_photo_count
+                        mark_retry = retry_pos
+                        maybe_commit()
 
-                        for page in range(2, pages + 1):
-                            if over_budget():
-                                unvisited([cell])
-                                budget_stop = True
-                                break
-                            items, _, outcome = await _probe_cell(
-                                session,
-                                limiter,
-                                count_request,
-                                cell,
-                                page=page,
-                                ipp=ipp,
-                                access_token=access_token,
-                                retries=retries,
-                                timeout=timeout,
+                if stop_reason is None:
+                    # range(), not enumerate() + continue: skipping already-swept
+                    # roots through the loop body would evaluate over_budget() on
+                    # each of them, so a resume with a small budget could "stop"
+                    # before asking anything.
+                    for index in range(start_index, len(roots)):
+                        root = roots[index]
+                        if over_budget():
+                            unvisited(roots[index:])
+                            logger.warning(
+                                f"Stopped after {api_requests} requests (max_requests="
+                                f"{max_requests}); {len(roots) - index} of {len(roots)} cells "
+                                f"never visited"
                             )
-                            if outcome == "refused":
-                                # Backpressure, and ONLY backpressure, may
-                                # subdivide: a partially paged circle is not
-                                # exhaustive, so the area is re-covered as four
-                                # smaller ones rather than accepted short.
-                                if can_subdivide(cell):
-                                    stack.extend(subdivide(cell))
-                                else:
-                                    failed_cells.append(cell)
-                                break
-                            if outcome == "broken":
-                                # A transport fault or a definite unusable
-                                # answer is NOT backpressure, so it must not
-                                # fan out -- asking the server for four
-                                # requests where it just failed to serve one is
-                                # #198's shape, not a fix for it. This branch
-                                # used to share the `refused` path and so
-                                # cascaded all the way to the floor: measured,
-                                # a rejected credential on page 2 of one root
-                                # cost 42 requests and a single TCP reset cost
-                                # 105, while the module's own docstrings
-                                # promised "asked exactly once" and "recorded
-                                # as a failed cell".
-                                failed_cells.append(cell)
-                                break
-                            raw_photo_count += len(items)
-                            frames.append(records_to_census(decode_photo_items(items)))
-                    if budget_stop:
-                        unvisited(roots[index + 1 :])
-                        logger.warning(
-                            f"Stopped mid-cell after {api_requests} requests (max_requests="
-                            f"{max_requests}); {len(roots) - index - 1} of {len(roots)} root "
-                            f"cells never visited"
-                        )
-                        stop_reason = f"the {max_requests}-request budget ran out mid-cell"
-                        if cp is None:
-                            # Uncheckpointed, this root is counted the way it
-                            # always was; the rewind below is what replaces it.
-                            progress_bar.update(1)
-                        break
-                    progress_bar.update(1)
-                    roots_done = index + 1
-                    mark_frames, mark_failed = len(frames), len(failed_cells)
-                    mark_visited, mark_photos = cells_visited, raw_photo_count
-                    if (
-                        cp is not None
-                        and api_requests - requests_at_last_commit >= checkpoint_request_interval
-                    ):
-                        _commit_checkpoint(
-                            cp,
-                            frames,
-                            roots_done=roots_done,
-                            failed_cells=failed_cells,
-                            cells_visited=cells_visited,
-                            raw_photo_count=raw_photo_count,
-                            api_requests_total=prior_requests + api_requests,
-                            bbox=bbox,
-                            ipp=ipp,
-                            root_count=len(roots),
-                        )
-                        frames.clear()
-                        mark_frames = 0
-                        requests_at_last_commit = api_requests
+                            stop_reason = f"the {max_requests}-request budget ran out"
+                            break
+                        if not await _sweep_subtree(root):
+                            unvisited(roots[index + 1 :])
+                            logger.warning(
+                                f"Stopped mid-cell after {api_requests} requests (max_requests="
+                                f"{max_requests}); {len(roots) - index - 1} of {len(roots)} root "
+                                f"cells never visited"
+                            )
+                            stop_reason = f"the {max_requests}-request budget ran out mid-cell"
+                            if cp is None:
+                                # Uncheckpointed, this root is counted the way it
+                                # always was; the rewind below is what replaces it.
+                                progress_bar.update(1)
+                            break
+                        progress_bar.update(1)
+                        roots_done = index + 1
+                        mark_frames, mark_failed = len(frames), len(failed_cells)
+                        mark_visited, mark_photos = cells_visited, raw_photo_count
+                        maybe_commit()
             finally:
                 # THE COMMIT GOES FIRST AND THE BAR IS CLOSED AFTER. Anything
                 # that can raise between entering this block and committing
@@ -2447,23 +2543,26 @@ async def _fetch_city_images(
                 # written for (#167). Nothing below it can throw the commit
                 # away.
                 if cp is not None:
-                    # REWIND TO THE LAST COMPLETED ROOT BOUNDARY. A commit always
-                    # writes the sweep as of one, and this is where that
-                    # invariant is actually enforced -- for the budget stop
-                    # above, for a host block, for a transport fault, for a bug.
-                    # It is a no-op on the clean path, since the marks are taken
-                    # at each boundary. A root interrupted between its pages has
-                    # photos in hand, but a paged circle is not exhaustive until
-                    # its last page, so committing those rows against a
-                    # `roots_done` that excludes the root would leave the resume
-                    # free to sweep it again -- the census would carry its early
-                    # pages twice and every counter describing it would drift.
-                    # Enforcing it here rather than per stop-path is also what
-                    # lets the DFS stack stay un-persisted.
+                    # REWIND TO THE LAST COMPLETED BOUNDARY -- a root's, or a
+                    # retried cell's. A commit always writes the sweep as of
+                    # one, and this is where that invariant is actually
+                    # enforced -- for the budget stop above, for a host block,
+                    # for a transport fault, for a bug. It is a no-op on the
+                    # clean path, since the marks are taken at each boundary. A
+                    # root interrupted between its pages has photos in hand,
+                    # but a paged circle is not exhaustive until its last page,
+                    # so committing those rows against a `roots_done` that
+                    # excludes the root would leave the resume free to sweep it
+                    # again -- the census would carry its early pages twice and
+                    # every counter describing it would drift. Enforcing it
+                    # here rather than per stop-path is also what lets the DFS
+                    # stack stay un-persisted. `retry_pos` rewinds with the
+                    # rest: a half-re-probed cell must commit as still failed.
                     del frames[mark_frames:]
                     del failed_cells[mark_failed:]
                     cells_visited = mark_visited
                     raw_photo_count = mark_photos
+                    retry_pos = mark_retry
                     # The bonus half, not the mechanism: this catches a host
                     # block, a raising responder and the clean end of the loop.
                     # It does NOT catch a SIGTERM or a SIGKILL -- neither runs a
@@ -2474,7 +2573,7 @@ async def _fetch_city_images(
                             cp,
                             frames,
                             roots_done=roots_done,
-                            failed_cells=failed_cells,
+                            failed_cells=durable_failed(),
                             cells_visited=cells_visited,
                             raw_photo_count=raw_photo_count,
                             api_requests_total=prior_requests + api_requests,
@@ -2508,6 +2607,8 @@ async def _fetch_city_images(
                             f"{api_requests - requests_at_last_commit} requests will be re-paid"
                         )
                 progress_bar.close()
+                if retry_bar is not None:
+                    retry_bar.close()
     except HostBlockedError as e:
         # Nothing else in the bbox can answer differently, so the sweep stops
         # here rather than paying for the rest of the city to learn what the
@@ -2545,6 +2646,11 @@ async def _fetch_city_images(
             )
         )
 
+    # From here on the recorded set IS the session set: a sweep that got this
+    # far either had no checkpoint (empty retry queue) or walked its whole
+    # retry queue, so the rebinding is exact -- and it keeps the guard, the
+    # caller's REQUEST_FAILED masking and the checkpoint reading one list.
+    failed_cells = durable_failed()
     if failed_cells:
         # Clamped at 1.0 for the message only. The lattice deliberately
         # over-covers -- ceil() in both axes, and each cell is a square the bbox
@@ -2561,15 +2667,18 @@ async def _fetch_city_images(
             f"{city_name}'s bbox unmeasured"
         )
         if unmeasured > MAX_FAILED_AREA_FRACTION:
-            # Named so the operator knows the retry is free and the reset is
-            # manual. A complete checkpoint re-finalizes without a request, so
-            # asking again cannot answer differently until the directory goes.
+            # Named so the operator knows what a retry costs and that the
+            # reset is manual. Re-running with the checkpoint re-probes ONLY
+            # the failed cells -- a refusal is time-varying, so asking again
+            # genuinely can answer differently -- and everything already
+            # answered stays paid for.
             resume_note = (
                 ""
                 if cp is None
                 else (
-                    f" Progress is checkpointed at {cp.path}, which re-finalizes without "
-                    f"spending a request, so delete that directory to force a fresh sweep."
+                    f" Progress is checkpointed at {cp.path}; re-running with it re-probes "
+                    f"just the {len(failed_cells)} failed cell(s), or delete that directory "
+                    f"to force a fresh sweep."
                 )
             )
             raise spent(
@@ -2591,7 +2700,11 @@ async def _fetch_city_images(
         # CSV of every city, since the sweep re-sees ~pi/2 of everything.
         frames = _checkpoint_frames(cp) + frames
     census = concat_census(frames)
-    del frames
+    # clear(), not `del`: the release matters the same either way (#157 -- the
+    # per-part frames must not survive into dedupe's allocations), but `frames`
+    # is now also a cell variable of _sweep_subtree/maybe_commit and deleting a
+    # closed-over name reads as undefined to the linter.
+    frames.clear()
     census = census_core.dedupe_census(census)
     # The checkpoint is NOT discarded here. It is the caller's, and it must
     # survive until the dated artifact is durable -- everything that writes one
