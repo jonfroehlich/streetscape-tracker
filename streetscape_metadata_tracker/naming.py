@@ -24,7 +24,7 @@ from datetime import date
 # Providers with a filename token. GSV files carry no token (legacy compat),
 # so 'gsv' never appears in filenames but is the parse default.
 DEFAULT_PROVIDER = "gsv"
-KNOWN_PROVIDERS = ("gsv", "mapillary")
+KNOWN_PROVIDERS = ("gsv", "mapillary", "kartaview")
 
 # Accepts int or float numeric groups, an optional provider token, and an
 # optional trailing ISO run date. The groups can't bleed into each other:

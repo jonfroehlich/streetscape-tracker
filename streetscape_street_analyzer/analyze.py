@@ -2,7 +2,7 @@
 CLI: compute OSM street coverage for an existing run and write a GeoJSON artifact.
 
     python -m streetscape_street_analyzer.analyze "Seattle, WA" \
-        [--provider gsv|mapillary] [--run-date YYYY-MM-DD] \
+        [--provider gsv|mapillary|kartaview] [--run-date YYYY-MM-DD] \
         [--match-dist 25] [--refresh] [--data-dir DIR]
 
 Resolves the city and locates its run CSV via the catalog (read-only except for
@@ -24,7 +24,11 @@ from streetscape_metadata_tracker import db
 from streetscape_metadata_tracker.db import RunRow
 from streetscape_metadata_tracker.download_common import HostUnavailableError, host_exit_code
 from streetscape_metadata_tracker.fileutils import load_city_csv_file
-from streetscape_metadata_tracker.naming import streets_filename_for_run
+from streetscape_metadata_tracker.naming import (
+    DEFAULT_PROVIDER,
+    KNOWN_PROVIDERS,
+    streets_filename_for_run,
+)
 from streetscape_metadata_tracker.paths import get_default_data_dir
 
 from .download_street_network import fetch_street_edges
@@ -162,9 +166,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("city", help="City query or catalog slug (e.g. 'Seattle, WA')")
     parser.add_argument(
         "--provider",
-        default="gsv",
-        choices=["gsv", "mapillary"],
-        help="Pano provider to score coverage against (default: gsv)",
+        default=DEFAULT_PROVIDER,
+        # From the naming contract rather than a literal: this reads an existing
+        # run file and overlays the street network on it, so any provider whose
+        # runs can be NAMED can be scored. A hardcoded pair silently omits the
+        # newest provider from street coverage.
+        choices=list(KNOWN_PROVIDERS),
+        help=f"Pano provider to score coverage against (default: {DEFAULT_PROVIDER})",
     )
     parser.add_argument(
         "--run-date",

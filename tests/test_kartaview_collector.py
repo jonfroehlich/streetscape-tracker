@@ -28,6 +28,7 @@ import io
 import json
 import logging
 import math
+import os
 from datetime import UTC, datetime, timedelta
 
 import numpy as np
@@ -81,6 +82,38 @@ def test_a_cells_children_exactly_cover_it():
     assert len(children) == 4
     assert sum(c.size_m**2 for c in children) == pytest.approx(parent.size_m**2)
     assert all(c.depth == parent.depth + 1 for c in children)
+
+
+def test_adjacent_failed_cells_leave_no_unmasked_sliver_between_them():
+    """
+    The lattice spaces cells at cos(mid_lat), but the failed-cell mask priced
+    each cell's width at cos(cell.lat) -- so on the equator-ward rows of a
+    tall bbox the masks were a couple of metres narrower than the lattice, and
+    a grid point in the gap between two adjacent failed cells published as
+    ZERO_RESULTS: absence never observed, in an immutable dated snapshot. The
+    mask must use the same latitude the lattice was laid out at.
+    """
+    # A full-height 40 km grid at 47 degN: the worst case the #166 cap allows.
+    tall_bbox = (-122.5, 47.0, -121.97, 47.36)
+    roots = kv.cells_for_bbox(*tall_bbox, 1000 * math.sqrt(2))
+    c0, c1 = roots[0], roots[1]  # horizontally adjacent, on the bottom row
+    assert c0.lat == c1.lat and c1.lon > c0.lon
+
+    # A point in the pre-fix sliver: outside both cells' masks as priced at
+    # cos(cell.lat), inside c0's share of the lattice as priced at mid_lat.
+    sliver_lon = c0.lon + 0.4995 * (c1.lon - c0.lon)
+    prefix_half_lon = (c0.size_m / 2.0) / (kv._METERS_PER_DEG_LAT * math.cos(math.radians(c0.lat)))
+    assert abs(sliver_lon - c0.lon) > prefix_half_lon, "the fixture must sit in the old gap"
+    assert abs(sliver_lon - c1.lon) > prefix_half_lon
+
+    lats, lons = np.array([c0.lat]), np.array([sliver_lon])
+    assert kv._points_in_cells(lats, lons, [c0, c1])[0], "the sliver point must be masked"
+
+    # And the same through subdivision: children inherit the lattice latitude,
+    # so a root that cascaded before failing still masks its whole share.
+    descendants = [g for child in kv.subdivide(c0) for g in kv.subdivide(child)]
+    nudged = np.array([c0.lat + 1e-7])  # off the children's shared edge
+    assert kv._points_in_cells(nudged, lons, descendants + [c1])[0]
 
 
 def test_the_floor_guard_is_asked_of_the_children_not_the_cell():
@@ -492,7 +525,7 @@ def test_a_rejected_credential_is_not_a_host_refusal(status):
     breaker and skip another channel's cities.
     """
     error = _post_error(_FakeResponse(status=status, body={"status": {"apiCode": status}}))
-    assert isinstance(error, kv.ResponseError)
+    assert isinstance(error, kv.CredentialRejectedError), "the sweep fails fast on this type"
     assert not isinstance(error, HostBlockedError)
 
 
@@ -785,6 +818,29 @@ def test_calibration_cost_is_bounded_at_the_production_retry_budget(monkeypatch)
     assert error.api_requests == len(calls)
 
 
+def test_the_budget_bounds_calibration_too(monkeypatch):
+    """
+    The runaway guard was asked everywhere a request is issued EXCEPT the
+    calibration ladder, which runs before the sweep proper -- so max_requests=3
+    could spend up to 30 requests before the first root was ever asked, in the
+    very parameter the scheduler uses to hand a channel the night's remaining
+    budget. The stop must not read as "no radius answers here" either: that
+    message blames the city for a budget the operator set.
+    """
+    error, calls = _failed_sweep(
+        monkeypatch,
+        lambda call: (_ for _ in ()).throw(kv.BackpressureError("apiCode 690")),
+        radius_m=None,
+        calibration_probes=kv.DEFAULT_CALIBRATION_PROBES,
+        max_requests=3,
+    )
+    assert len(calls) == 3, "the ladder must honour the runaway guard"
+    assert "calibration" in str(error)
+    assert "no radius" not in str(error)
+    assert not isinstance(error, kv.SweepIncompleteError), "there is nothing to resume"
+    assert error.api_requests == 3
+
+
 def test_calibration_refuses_to_run_with_no_probes():
     """
     0 is the natural spelling of "don't calibrate" and it failed OPEN:
@@ -795,25 +851,50 @@ def test_calibration_refuses_to_run_with_no_probes():
         kv.calibration_points(BBOX, 0)
 
 
-def test_a_credential_rejected_at_every_probe_says_so_rather_than_blaming_the_city(monkeypatch):
+def test_a_broken_endpoint_at_every_probe_says_so_rather_than_blaming_the_city(monkeypatch):
     """
     Every rung failing has two very different causes and they send the operator
     to different places: no answerable radius is a property of the LOCATION
-    (Horace ND), a 401 is a property of the TOKEN. Folding the second into the
-    first printed "answered no radius at any calibration point ... refusing to
-    treat a refusal as an empty city" for a bad key.
+    (Horace ND), a definite server error at every probe is a property of the
+    ENDPOINT. Folding the second into the first printed "answered no radius at
+    any calibration point ... refusing to treat a refusal as an empty city" for
+    an API that was answering garbage.
     """
     error, calls = _failed_sweep(
         monkeypatch,
-        lambda call: (_ for _ in ()).throw(kv.ResponseError("HTTP 401")),
+        lambda call: (_ for _ in ()).throw(kv.ResponseError("no items in the body")),
         radius_m=None,
         calibration_probes=2,
     )
     assert isinstance(error, kv.ResponseError)
-    assert not isinstance(error, HostBlockedError)  # the token, not the host
-    assert "credential" in str(error)
+    assert not isinstance(error, HostBlockedError)  # the endpoint, not the host
+    assert "endpoint" in str(error)
     assert "empty city" not in str(error)
     assert error.api_requests == len(calls)
+
+
+def test_a_rejected_credential_stops_calibration_at_the_first_probe(monkeypatch):
+    """
+    A dead token answers identically at every rung, so walking the rest of the
+    ladder -- up to 30 requests at the defaults -- could only re-learn what
+    probe one already said, against a host this project paces at 16/min
+    precisely because its enforcement is unobservable. The error is the
+    propagated CredentialRejectedError, whose message names the token, not the
+    calibration message that blames the endpoint or the geometry.
+    """
+    error, calls = _failed_sweep(
+        monkeypatch,
+        lambda call: (_ for _ in ()).throw(
+            kv.CredentialRejectedError("HTTP 401; check KARTAVIEW_ACCESS_TOKEN")
+        ),
+        radius_m=None,
+        calibration_probes=2,
+    )
+    assert isinstance(error, kv.CredentialRejectedError)
+    assert not isinstance(error, HostBlockedError)  # the token, not the host
+    assert len(calls) == 1, "the ladder must not be walked with a dead token"
+    assert error.api_requests == 1
+    assert "calibration point" not in str(error), "the message blames the token, not the city"
 
 
 def test_the_cascade_stops_at_the_radius_floor(monkeypatch):
@@ -1023,7 +1104,7 @@ def test_a_rejected_credential_serving_html_is_still_only_the_credential(status)
             text="<html><body>Sign in to KartaView</body></html>",
         )
     )
-    assert isinstance(error, kv.ResponseError)
+    assert isinstance(error, kv.CredentialRejectedError)
     assert not isinstance(error, HostBlockedError)
     assert "KARTAVIEW_ACCESS_TOKEN" in str(error)
 
@@ -1348,37 +1429,149 @@ def test_a_sweep_spanning_three_nights_is_still_that_one_census(monkeypatch, tmp
     assert not ckpt.exists()
 
 
-def test_a_hole_punched_on_night_one_still_refuses_the_snapshot_on_night_two(monkeypatch, tmp_path):
+def test_a_hole_that_fails_again_still_refuses_the_snapshot_on_night_two(monkeypatch, tmp_path):
     """
-    Failed cells are inherited across a resume, and must be: a cell that
-    genuinely never answered is a hole in the bbox whether it was asked
-    yesterday or today, and the area guard is what stops an immutable dated
-    snapshot being published around it. Losing them on resume would turn a
+    Failed cells are inherited across a resume AND RE-PROBED: a refusal is
+    time-varying, so night two asks the hole again rather than trusting
+    yesterday's verdict. One that fails AGAIN is a hole in the bbox whether it
+    was asked yesterday or today, and the area guard is what stops an immutable
+    dated snapshot being published around it. Losing it on resume would turn a
     refused sweep into a silently incomplete one.
 
-    The refusal keeps the checkpoint, because a complete one re-finalizes
-    without spending a request -- so the operator's retry is free, and the reset
-    is the deliberate act of deleting the directory.
+    The refusal keeps the checkpoint: everything already answered stays paid
+    for, a later attempt re-probes only the hole, and the reset is the
+    deliberate act of deleting the directory.
+    """
+    ckpt = tmp_path / "sweep"
+    hole = []
+
+    def responder(call):
+        if not hole:
+            hole.append(call.key)
+        if call.key == hole[0]:
+            raise kv.ResponseError("HTTP 500")  # this circle is a hole, permanently
+        return [], 0
+
+    night_one, _ = _failed_sweep_ckpt(monkeypatch, responder, ckpt, max_requests=2, retries=0)
+    assert isinstance(night_one, kv.SweepIncompleteError)
+    assert len(_state(ckpt)["failed_cells"]) == 1
+
+    night_two, calls = _failed_sweep_ckpt(monkeypatch, responder, ckpt, retries=0)
+    assert not isinstance(night_two, kv.SweepIncompleteError)
+    assert "unmeasured" in str(night_two) and "refusing to finalize" in str(night_two)
+    assert str(ckpt) in str(night_two)
+    assert _state(ckpt)["roots_done"] == 4, "kept, so a later attempt re-probes only the hole"
+    assert len(_state(ckpt)["failed_cells"]) == 1, "it failed again, so it stays failed"
+    assert sum(1 for c in calls if c.key == hole[0]) == 1, "the hole was re-probed exactly once"
+    assert len(calls) == 3  # the re-probe plus the two roots night one never reached
+
+
+def test_a_carried_failed_cell_is_re_probed_and_can_heal(monkeypatch, tmp_path):
+    """
+    The reciprocal case, and the reason the retry pass exists: apiCode 690 is
+    FLAKY (fact 2 -- Horace refused r=1000 on 0/6 attempts and answered it 2/2
+    forty-five minutes later), so a cell that failed yesterday is not a hole
+    today until it has refused again. This checkpoint is COMPLETE with one
+    failed cell; before the retry pass, no re-run could ever answer differently
+    without the operator deleting the directory by hand, so one bad hour
+    permanently blocked a snapshot the host was willing to complete.
     """
     ckpt = tmp_path / "sweep"
     seen = []
 
-    def responder(call):
+    def flaky_then_fine(call):
         seen.append(call)
         if len(seen) == 1:
-            raise kv.ResponseError("HTTP 500")  # this root is a hole, permanently
-        return [], 0
+            raise kv.ResponseError("HTTP 500")  # one bad hour, night one only
+        return _photos(call)
 
-    night_one, calls = _failed_sweep_ckpt(monkeypatch, responder, ckpt, max_requests=2, retries=0)
-    assert isinstance(night_one, kv.SweepIncompleteError)
+    night_one, calls_one = _failed_sweep_ckpt(monkeypatch, flaky_then_fine, ckpt, retries=0)
+    assert "unmeasured" in str(night_one), "night one refuses to finalize around the hole"
+    assert _state(ckpt)["roots_done"] == 4, "complete: every root was visited"
     assert len(_state(ckpt)["failed_cells"]) == 1
 
-    night_two, _ = _failed_sweep_ckpt(monkeypatch, responder, ckpt)
-    assert not isinstance(night_two, kv.SweepIncompleteError)
-    assert "unmeasured" in str(night_two) and "refusing to finalize" in str(night_two)
-    assert str(ckpt) in str(night_two)
-    assert _state(ckpt)["roots_done"] == 4, "kept, so the retry costs nothing"
-    assert len(calls) == 2
+    result, calls_two = _sweep_ckpt(monkeypatch, flaky_then_fine, ckpt, retries=0)
+    assert len(calls_two) == 1, "only the failed cell is re-probed"
+    assert calls_two[0].key == calls_one[0].key
+    assert result["failed_cells"] == []
+    assert result["api_requests"] == 1
+    assert result["api_requests_total"] == len(calls_one) + 1
+    # The healed census holds every circle's photos. Not compared frame-for-
+    # frame with an uninterrupted sweep: fetch order differs (the healed
+    # cell's photos arrive last), and fetch order is what it is.
+    whole, _ = _sweep(monkeypatch, _photos)
+    assert sorted(result["census"]["id"]) == sorted(whole["census"]["id"])
+
+
+def test_a_budget_stop_mid_retry_keeps_the_unprobed_tail_failed(monkeypatch, tmp_path):
+    """
+    Each carried cell leaves the durable failed set only at the moment it is
+    actually re-swept. A session stopping partway through the retry pass must
+    commit the not-yet-re-probed tail as still failed -- seeding the session's
+    failed list from the carried set instead would read the same on the clean
+    path and silently lose the tail here, publishing those cells' grid points
+    as ZERO_RESULTS: absence never observed. And the stop is a
+    SweepIncompleteError, not the area guard: with a checkpoint the budget
+    means "spend this much tonight", and the pass continues tomorrow.
+    """
+    ckpt = tmp_path / "sweep"
+    seen = []
+
+    def two_bad_roots_once(call):
+        seen.append(call)
+        if len(seen) <= 2:
+            raise kv.ResponseError("HTTP 500")
+        return [], 0
+
+    night_one, _ = _failed_sweep_ckpt(monkeypatch, two_bad_roots_once, ckpt, retries=0)
+    assert "unmeasured" in str(night_one)
+    carried = _state(ckpt)["failed_cells"]
+    assert len(carried) == 2 and _state(ckpt)["roots_done"] == 4
+
+    night_two, calls = _failed_sweep_ckpt(
+        monkeypatch, two_bad_roots_once, ckpt, retries=0, max_requests=1
+    )
+    assert isinstance(night_two, kv.SweepIncompleteError)
+    assert "re-probing previously failed cells" in str(night_two)
+    assert "unmeasured" not in str(night_two)
+    assert len(calls) == 1, "the budget bounded the retry pass"
+    assert _state(ckpt)["failed_cells"] == [carried[1]], (
+        "the re-probed cell healed and left the set; the un-probed one stayed"
+    )
+
+    result, calls_three = _sweep_ckpt(monkeypatch, two_bad_roots_once, ckpt, retries=0)
+    assert len(calls_three) == 1, "night three re-probes only what night two never reached"
+    assert result["failed_cells"] == []
+
+
+def test_a_dead_credential_on_a_resumed_sweep_stops_at_one_request(monkeypatch, tmp_path):
+    """
+    Before CredentialRejectedError, a 401 was just another "broken" cell, so a
+    resumed sweep with a dead token marched through its entire remaining
+    lattice -- every cell, every retry -- to learn what request one already
+    said (176 requests on the review's reproduction), against a host whose
+    enforcement is unobservable. The sweep now stops at the first rejection,
+    the checkpoint keeps what previous nights paid for, and the error names
+    the token rather than the geometry.
+    """
+    ckpt = tmp_path / "sweep"
+    _failed_sweep_ckpt(monkeypatch, _photos, ckpt, max_requests=2)
+    before = _state(ckpt)
+    assert before["roots_done"] == 2
+
+    rejected = kv.CredentialRejectedError("HTTP 401; check KARTAVIEW_ACCESS_TOKEN")
+    error, calls = _failed_sweep_ckpt(
+        monkeypatch, lambda call: (_ for _ in ()).throw(rejected), ckpt
+    )
+    assert error is rejected, "propagated as itself, spend attached"
+    assert len(calls) == 1, "the rest of the lattice must not be asked with a dead token"
+    assert error.api_requests == 1
+    after = _state(ckpt)
+    assert (after["roots_done"], after["parts"], after["census_rows"]) == (
+        before["roots_done"],
+        before["parts"],
+        before["census_rows"],
+    ), "the checkpoint still holds exactly what previous nights paid for"
 
 
 def test_a_null_looking_string_survives_the_checkpoint_as_a_string(tmp_path):
@@ -2119,6 +2312,30 @@ def test_a_torn_part_beyond_the_commit_record_is_ignored_and_removed(monkeypatch
     assert "never-committed" not in set(result["census"]["id"])
 
 
+def test_an_unpurgeable_checkpoint_degrades_to_a_full_sweep_rather_than_raising(
+    monkeypatch, tmp_path, request
+):
+    """
+    load_checkpoint promises it NEVER RAISES, and the purge of torn parts sat
+    outside the promise: it is an os.remove, so a read-only checkpoint
+    directory raised PermissionError -- before the sweep's DownloadError arms
+    exist to catch anything, i.e. a bare traceback with no api_usage row.
+    Resuming WITHOUT the purge is not the fallback, because the debris would
+    sit under the next commit's part name.
+    """
+    ckpt = tmp_path / "sweep"
+    _failed_sweep_ckpt(monkeypatch, _photos, ckpt, max_requests=2, checkpoint_request_interval=1)
+    torn = ckpt / kv.CHECKPOINT_PART_TEMPLATE.format(index=_state(ckpt)["parts"])
+    kv.records_to_census(kv.decode_photo_items([_item(id="never-committed")])).to_parquet(
+        torn, index=False
+    )
+    os.chmod(ckpt, 0o555)
+    request.addfinalizer(lambda: os.chmod(ckpt, 0o755))
+
+    cp = kv.load_checkpoint(str(ckpt), bbox=BBOX, ipp=kv.IPP_MAX, requested_radius_m=1000)
+    assert cp is None, "an unpurgeable checkpoint is discarded, not raised"
+
+
 def test_a_part_missing_under_the_commit_record_discards_the_whole_checkpoint(
     monkeypatch, tmp_path
 ):
@@ -2172,6 +2389,33 @@ def test_a_checkpoint_that_does_not_describe_this_sweep_is_discarded(monkeypatch
 
     result, calls = _sweep_ckpt(monkeypatch, _empty, ckpt)
     assert len(calls) == result["cells"], "a mismatched checkpoint must not be resumed"
+
+
+def test_a_checkpoint_from_another_channel_is_discarded(monkeypatch, tmp_path):
+    """
+    The path already keys the channel (checkpoint_path_for), but the path is
+    caller-built: a directory moved by hand, or a caller deriving it wrong,
+    passes every geometric check here -- a road walk sweeps the SAME frozen
+    bbox at the same ipp and radius -- and would resume a sweep whose spend
+    belongs to a different api_usage ledger, inheriting its
+    api_requests_total. So the commit record stores the channel it was written
+    under, and refuses another's.
+    """
+    ckpt = tmp_path / "sweep"
+    _failed_sweep_ckpt(monkeypatch, _empty, ckpt, max_requests=2, checkpoint_channel="kartaview")
+    assert _state(ckpt)["channel"] == "kartaview"
+
+    result, calls = _sweep_ckpt(monkeypatch, _empty, ckpt, checkpoint_channel="kartaview_streets")
+    assert len(calls) == result["cells"], "another channel's checkpoint must sweep afresh"
+    assert result["api_requests_total"] == len(calls), "no spend inherited across ledgers"
+    assert _state(ckpt)["channel"] == "kartaview_streets"
+
+    ckpt_two = tmp_path / "sweep2"
+    _failed_sweep_ckpt(
+        monkeypatch, _empty, ckpt_two, max_requests=2, checkpoint_channel="kartaview"
+    )
+    result, calls = _sweep_ckpt(monkeypatch, _empty, ckpt_two, checkpoint_channel="kartaview")
+    assert len(calls) == result["cells"] - 2, "the matching channel still resumes"
 
 
 def test_an_explicit_radius_that_contradicts_the_checkpoint_wins(monkeypatch, tmp_path):

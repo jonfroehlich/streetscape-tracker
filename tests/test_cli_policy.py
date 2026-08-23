@@ -22,10 +22,12 @@ from streetscape_metadata_tracker.download_common import (
     HOST_BUSY_EXIT_CODES,
     HOST_EXIT_CODES,
     HOST_MAPILLARY_TILES,
+    SWEEP_INCOMPLETE_EXIT_CODE,
     DownloadError,
     HostBlockedError,
     HostBusyError,
 )
+from streetscape_metadata_tracker.download_kartaview import SweepIncompleteError
 from streetscape_metadata_tracker.download_mapillary import DEFAULT_TILE_REQUESTS_PER_MINUTE
 from streetscape_metadata_tracker.fileutils import load_city_csv_file
 from streetscape_metadata_tracker.naming import generate_run_filename
@@ -438,3 +440,311 @@ def test_cap_dimensions_clamps_each_side_to_40km():
 
     # At or under the cap passes through unchanged
     assert cap_dimensions(40_000, 12_000, "Fine") == (40_000, 12_000)
+
+
+# ── The two KartaView request counts (issues #225, #239) ────────────────────
+
+
+def kartaview_configs(monkeypatch):
+    monkeypatch.setattr(cli, "load_config", lambda provider: {"access_token": "t"})
+
+
+def kartaview_stub(*, api_requests=25, api_requests_total=33):
+    async def stub(**kwargs):
+        path = kwargs["output_csv_gz_path"]
+        write_city_csv_gz(make_mapillary_city_df([("p1", "2023-05-01")]), path)
+        return {
+            "df": load_city_csv_file(path),
+            "filename_with_path": path,
+            "api_requests": api_requests,
+            "api_requests_total": api_requests_total,
+            "num_flat_images": 0,
+            "started_at": "2026-07-01T00:00:00+00:00",
+            "finished_at": "2026-07-01T00:05:00+00:00",
+        }
+
+    return stub
+
+
+def test_the_run_row_takes_the_sweeps_cost_and_the_ledger_this_processs(monkeypatch, catalog):
+    """
+    A resumed KartaView sweep reports two different numbers, and they go to two
+    different places (#239). Getting this backwards is silent in both
+    directions, and it WAS backwards until a real Krabi sweep showed it.
+
+    `runs.api_requests` describes the RUN, so it must say what the whole sweep
+    cost -- 25 tonight after 8 on an earlier night is a run that cost 33.
+    `db.add_api_usage` is additive and keyed by (date, provider), so it takes
+    only tonight's 25: feeding it the cumulative figure would charge the earlier
+    night's requests against tonight's budget gate a second time, and the gate
+    would start deferring cities that fit.
+    """
+    conn, city_id, data_dir = catalog
+    kartaview_configs(monkeypatch)
+    monkeypatch.setattr(cli, "download_kartaview_metadata_async", kartaview_stub())
+
+    assert run_cli(monkeypatch, city_id, data_dir, provider="kartaview") == 0
+    run = db.get_latest_run(conn, city_id, provider="kartaview")
+    assert run.api_requests == 33, "the run row must carry the sweep's cost"
+    assert db.get_api_usage(conn, RUN_DATE, provider="kartaview") == 25, (
+        "the additive daily ledger must carry only this process's spend"
+    )
+
+
+def test_a_provider_without_a_cumulative_count_still_records_its_spend(monkeypatch, catalog):
+    """
+    The fallback matters: gsv and mapillary publish no `api_requests_total`, so
+    a bare subscript would make every one of their runs raise KeyError.
+    """
+    conn, city_id, data_dir = catalog
+    gsv_configs(monkeypatch)
+    monkeypatch.setattr(cli, "download_gsv_metadata_async", stub_downloader([], api_requests=17))
+
+    assert run_cli(monkeypatch, city_id, data_dir, provider="gsv") == 0
+    assert db.get_latest_run(conn, city_id, provider="gsv").api_requests == 17
+
+
+def test_an_incomplete_sweep_exits_83_and_publishes_nothing(monkeypatch, catalog):
+    """
+    83 means "this made progress, run it again", which is a different
+    instruction from 1. The scheduler branch that will read it must `continue`
+    WITHOUT record_attempt(success=False): get_due_cities filters on
+    consecutive_failures and nothing but a success resets it, so a city that
+    legitimately needs three nights would quarantine itself for a whole cycle
+    for making progress.
+    """
+    conn, city_id, data_dir = catalog
+    kartaview_configs(monkeypatch)
+    error = SweepIncompleteError("budget", checkpoint_path="/cp", roots_done=2, root_count=16)
+    error.api_requests = 4
+
+    async def stub(**kwargs):
+        raise error
+
+    monkeypatch.setattr(cli, "download_kartaview_metadata_async", stub)
+    assert (
+        run_cli(monkeypatch, city_id, data_dir, provider="kartaview") == SWEEP_INCOMPLETE_EXIT_CODE
+    )
+    # Nothing published -- a partial census dated today would diff as "every
+    # pano in the rest of the city removed" -- but the spend is on the ledger,
+    # because those requests were issued and KartaView counted them.
+    assert db.get_latest_run(conn, city_id, provider="kartaview") is None
+    assert db.get_api_usage(conn, RUN_DATE, provider="kartaview") == 4
+
+
+def test_a_paused_sweep_alongside_a_real_failure_exits_1_not_83(monkeypatch, catalog):
+    """
+    The same reasoning as the mixed-host case above: 83 tells the caller to just
+    run it again, so an invocation where something ALSO genuinely broke must not
+    wear it and have the real failure read as progress.
+
+    NOTE WHAT THIS CAN AND CANNOT REACH TODAY. `--provider` takes one of
+    {both, gsv, mapillary, kartaview} and `both` is gsv+mapillary, so kartaview
+    always runs ALONE and the mixed case is currently unreachable through argv
+    — the guard is `len(incomplete) == len(failed)`, which today is either
+    trivially true or vacuous. It exists for #247, which makes `--provider all`
+    collect every provider in one invocation and turns this into a live path.
+
+    So this drives the aggregation directly, by stubbing the per-provider entry
+    point rather than the downloaders. Testing it through a `both` run of two
+    ordinary failures would exit 1 for reasons that have nothing to do with the
+    branch under test, and would pass just as happily if the branch were
+    deleted.
+    """
+    conn, city_id, data_dir = catalog
+    gsv_configs(monkeypatch)
+
+    async def one_pauses_one_breaks(conn_, args, city_row, run_date, provider, config, vis_path):
+        if provider == "mapillary":
+            raise SweepIncompleteError("budget", checkpoint_path="/cp", roots_done=2, root_count=16)
+        raise DownloadError("genuinely broken")
+
+    monkeypatch.setattr(cli, "_collect_one_run", one_pauses_one_breaks)
+    assert run_cli(monkeypatch, city_id, data_dir, provider="both") == 1
+
+    # ...and with the pause as the ONLY thing that went wrong, the same code
+    # path reports it as progress.
+    async def only_pauses(conn_, args, city_row, run_date, provider, config, vis_path):
+        raise SweepIncompleteError("budget", checkpoint_path="/cp", roots_done=2, root_count=16)
+
+    monkeypatch.setattr(cli, "_collect_one_run", only_pauses)
+    assert run_cli(monkeypatch, city_id, data_dir, provider="both") == SWEEP_INCOMPLETE_EXIT_CODE
+
+
+def test_a_paused_sweep_prints_paused_not_failed(monkeypatch, catalog, capsys):
+    """
+    The except clause calls a pause "progress, not breakage", so stdout must
+    not announce FAILED and then contradict itself with PAUSED — a wrapper
+    grepping stdout would escalate (or --force re-run) every legitimately
+    budget-capped night of a multi-night sweep. The message also names the
+    provider that actually paused rather than hardcoding KartaView
+    (PR #251 review).
+    """
+    conn, city_id, data_dir = catalog
+    kartaview_configs(monkeypatch)
+    error = SweepIncompleteError("budget", checkpoint_path="/cp", roots_done=2, root_count=16)
+
+    async def stub(**kwargs):
+        raise error
+
+    monkeypatch.setattr(cli, "download_kartaview_metadata_async", stub)
+    assert (
+        run_cli(monkeypatch, city_id, data_dir, provider="kartaview") == SWEEP_INCOMPLETE_EXIT_CODE
+    )
+    out = capsys.readouterr().out
+    assert "PAUSED: kartaview checkpointed at 2/16 root cells" in out
+    assert "FAILED" not in out
+
+
+def test_the_checkpoint_is_discarded_only_after_the_runs_row_commits(monkeypatch, catalog):
+    """
+    The discard moved out of the downloader (PR #251 review): the CSV landing
+    is not enough, because a crash between the CSV write and register_run
+    leaves an orphan whose remedy is "delete it and re-run" — which must
+    re-finalize from the checkpoint for ~0 requests, not re-pay the sweep. So
+    the CLI discards, and only once the runs row is already in the catalog.
+    """
+    conn, city_id, data_dir = catalog
+    kartaview_configs(monkeypatch)
+    inner = kartaview_stub()
+
+    async def with_checkpoint(**kwargs):
+        result = await inner(**kwargs)
+        result["checkpoint_path"] = "/cp"
+        return result
+
+    monkeypatch.setattr(cli, "download_kartaview_metadata_async", with_checkpoint)
+    seen = {}
+
+    def fake_discard(path):
+        seen["path"] = path
+        seen["run_cataloged"] = db.get_latest_run(conn, city_id, provider="kartaview") is not None
+
+    monkeypatch.setattr(cli, "discard_checkpoint", fake_discard)
+
+    assert run_cli(monkeypatch, city_id, data_dir, provider="kartaview") == 0
+    assert seen["path"] == "/cp"
+    assert seen["run_cataloged"] is True, "discard must come after register_run, never before"
+
+
+def test_a_register_run_failure_leaves_the_checkpoint_alive(monkeypatch, catalog):
+    """
+    The failure that motivated the move: the DB refusing the runs row (locked
+    by a concurrent process, a schema migration mid-run — the class that cost
+    the 611k-request Berlin walk its row). The CSV is on disk, nothing is
+    cataloged, and the checkpoint must survive as the only thing that makes
+    the re-run cheap.
+    """
+    conn, city_id, data_dir = catalog
+    kartaview_configs(monkeypatch)
+    inner = kartaview_stub()
+
+    async def with_checkpoint(**kwargs):
+        result = await inner(**kwargs)
+        result["checkpoint_path"] = "/cp"
+        return result
+
+    monkeypatch.setattr(cli, "download_kartaview_metadata_async", with_checkpoint)
+    discarded = []
+    monkeypatch.setattr(cli, "discard_checkpoint", lambda p: discarded.append(p))
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(cli.db, "register_run", boom)
+    assert run_cli(monkeypatch, city_id, data_dir, provider="kartaview") == 1
+    assert discarded == []
+
+
+def test_a_non_downloaderror_failure_with_a_spend_still_reaches_the_ledger(monkeypatch, catalog):
+    """
+    PR #251 review: a KartaView sweep whose post-fetch tail dies (ENOSPC on
+    the gzip write) raises OSError, not DownloadError — and because the
+    checkpoint survives and the resume re-finalizes for ~0 new requests, a
+    spend missed here would never land in ANY api_usage row.
+    """
+    conn, city_id, data_dir = catalog
+    kartaview_configs(monkeypatch)
+    error = OSError("No space left on device")
+    error.api_requests = 9
+
+    async def stub(**kwargs):
+        raise error
+
+    monkeypatch.setattr(cli, "download_kartaview_metadata_async", stub)
+    assert run_cli(monkeypatch, city_id, data_dir, provider="kartaview") == 1
+    assert db.get_api_usage(conn, RUN_DATE, provider="kartaview") == 9
+
+
+def test_kartaview_gets_its_own_timeout_default(monkeypatch, catalog):
+    """
+    DEFAULT_REQUEST_TIMEOUT_S is 60 because nearby-photos is a database query
+    whose heaviest documented shape is a 2,000-row page; passing the CLI's
+    30 s default straight through silently halved it on every real sweep
+    (PR #251 review). An explicit --timeout still wins.
+    """
+    conn, city_id, data_dir = catalog
+    kartaview_configs(monkeypatch)
+    calls = []
+    inner = kartaview_stub()
+
+    async def capture(**kwargs):
+        calls.append(kwargs)
+        return await inner(**kwargs)
+
+    monkeypatch.setattr(cli, "download_kartaview_metadata_async", capture)
+    assert run_cli(monkeypatch, city_id, data_dir, provider="kartaview") == 0
+    assert calls[0]["request_timeout"] == 60.0
+
+    assert (
+        run_cli(
+            monkeypatch,
+            city_id,
+            data_dir,
+            "--run-date",
+            "2026-07-02",
+            "--timeout",
+            "45",
+            "--force",
+            provider="kartaview",
+        )
+        == 0
+    )
+    assert calls[-1]["request_timeout"] == 45.0
+
+    gsv_calls = []
+    gsv_configs(monkeypatch)
+    monkeypatch.setattr(cli, "download_gsv_metadata_async", stub_downloader(gsv_calls))
+    assert run_cli(monkeypatch, city_id, data_dir, provider="gsv") == 0
+    assert gsv_calls[0]["request_timeout"] == 30.0, "the other providers keep their 30 s default"
+
+
+def test_kartaview_max_requests_refuses_nonpositive_values(monkeypatch, catalog):
+    """
+    `--kartaview-max-requests 0` used to spend the full calibration ladder,
+    checkpoint roots_done=0, exit 83 and print "re-run the same command to
+    resume" — an infinite loop the message actively encourages (PR #251
+    review). Refused at parse time, before any work, following #214's posture
+    for `run-due --limit`.
+    """
+    conn, city_id, data_dir = catalog
+    kartaview_configs(monkeypatch)
+    calls = []
+
+    async def never(**kwargs):
+        calls.append(kwargs)
+        raise AssertionError("no downloader call may happen on a refused value")
+
+    monkeypatch.setattr(cli, "download_kartaview_metadata_async", never)
+    for bad in ("0", "-5"):
+        with pytest.raises(SystemExit) as excinfo:
+            run_cli(
+                monkeypatch,
+                city_id,
+                data_dir,
+                "--kartaview-max-requests",
+                bad,
+                provider="kartaview",
+            )
+        assert excinfo.value.code == 2
+    assert calls == []

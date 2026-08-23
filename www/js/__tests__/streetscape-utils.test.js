@@ -621,12 +621,17 @@ test("isPlausibleCaptureDate: the mirrored floors match analysis.EARLIEST_PLAUSI
   const floors = [
     [PROVIDERS.gsv.earliestPlausibleCapture, 2007],
     [PROVIDERS.mapillary.earliestPlausibleCapture, 2004],
+    [PROVIDERS.kartaview.earliestPlausibleCapture, 2004],
   ];
   for (const [floor, year] of floors) {
     assert.equal(floor.getFullYear(), year);
     assert.equal(floor.getMonth(), 0);
     assert.equal(floor.getDate(), 1);
   }
+  // This table is spelled out rather than derived from PROVIDERS, so a new
+  // provider is silently EXCLUDED from the sync guarantee instead of failing
+  // it. Assert the coverage too, or the mirror rots one provider at a time.
+  assert.equal(floors.length, Object.keys(PROVIDERS).length);
 });
 
 test("isPlausibleCaptureDate: the floor is inclusive in every timezone", () => {

@@ -793,13 +793,22 @@ def _grid_collector_modules():
     return modules
 
 
-def test_the_sweep_actually_finds_the_known_collector():
+def test_the_sweep_actually_finds_the_known_collectors():
     """
     A discovery-based guard that discovers nothing passes vacuously, so pin that
-    the sweep sees the collector we know exists.
+    the sweep sees the collectors we know exist.
+
+    Both of them, not just the first: the sweep is what makes the ownership
+    contract apply to a collector nobody remembered to register, and a KartaView
+    grid run is the first time that claim was actually tested by a second
+    provider arriving (#225 phase 3b).
     """
     found = {str(rel) for rel, _ in _grid_collector_modules()}
-    assert "streetscape_metadata_tracker/download_mapillary.py" in found, found
+    for collector in (
+        "streetscape_metadata_tracker/download_mapillary.py",
+        "streetscape_metadata_tracker/download_kartaview.py",
+    ):
+        assert collector in found, found
 
 
 def test_no_grid_collector_binds_the_census_to_a_local():
@@ -891,43 +900,35 @@ def test_dtypes_for_run_path_picks_the_schema_from_the_provider_token():
     )
     # A name the naming contract does not parse keeps the historical default.
     assert fileutils.dtypes_for_run_path("scratch.csv.gz") is config.MAPILLARY_METADATA_DTYPES
-    # ...and that is what an as-yet-unregistered provider token gets, in BOTH
-    # artifact families: parse_filename rejects an unknown token and
-    # _STREETWALK_FILENAME_RE builds its alternation from the same tuple, so
-    # having a schema is not enough to be read with it. Flips at #225 phase 3b
-    # -- see test_a_run_schema_is_reachable_from_a_filename.
-    assert "kartaview" not in naming.KNOWN_PROVIDERS, (
-        "phase 3b landed: replace the two fallback assertions below with "
-        "`is config.KARTAVIEW_METADATA_DTYPES`, and drop the xfail marker on "
-        "test_a_run_schema_is_reachable_from_a_filename"
-    )
-    for unregistered in (
+    # KartaView reads with its OWN schema in BOTH artifact families as of #225
+    # phase 3b. Before the token landed both of these fell through to the
+    # Mapillary default, which is what inferred `sequence_index` to float64 and
+    # `way_id` to a float that eats its leading zeros. The streetwalk case has
+    # no collector yet, but the regex alternation is built from the same tuple,
+    # so it became reachable in the same commit and is pinned here.
+    for registered in (
         f"{base}_kartaview_2026-07-02.csv.gz",
         f"{base}_kartaview_streetwalk_sp15_2026-07-08.csv.gz",
     ):
-        assert fileutils.dtypes_for_run_path(unregistered) is config.MAPILLARY_METADATA_DTYPES
+        assert fileutils.dtypes_for_run_path(registered) is config.KARTAVIEW_METADATA_DTYPES
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "#225 phase 3b: kartaview has a run schema but no naming.KNOWN_PROVIDERS "
-        "token yet, so its runs would read with the Mapillary schema. When 3b "
-        "lands this XPASSes and fails -- delete the marker then."
-    ),
-)
 def test_a_run_schema_is_reachable_from_a_filename():
     """
     The direction test_every_known_provider_has_a_run_schema cannot check.
 
     That test asserts KNOWN_PROVIDERS is a subset of PROVIDER_RUN_DTYPES, which
     is satisfied VACUOUSLY by a provider that has a schema and no token -- the
-    exact state kartaview is in. A schema nothing can reach is worse than a
-    missing one: config.py reads as though KartaView runs are read with the
-    KartaView schema, and every reader outside the collector (cli.py's
+    state kartaview was in between #225's collector and its phase-3b wiring,
+    and the one a fourth census provider will arrive in. A schema nothing can
+    reach is worse than a missing one: config.py reads as though those runs are
+    read with their own schema, and every reader outside the collector (cli.py's
     previous-run load, both json_summarizer reads, analyze.py, collect_mapillary,
     recompute_run_stats) would silently take the Mapillary default instead. The
     tail itself is safe -- write_census_grid_run passes dtypes= explicitly.
+
+    This was a strict xfail while kartaview sat in that state, so that wiring the
+    token could not be done without also being noticed here.
     """
     unreachable = sorted(
         provider

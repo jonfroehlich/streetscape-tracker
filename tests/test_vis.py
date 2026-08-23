@@ -85,3 +85,46 @@ def test_plottable_rows_keep_duplicate_pano_references():
     would quietly redefine every existing plot."""
     same_pano_twice = [_row("p1", 47.60, -122.33), _row("p1", 47.601, -122.331)]
     assert len(vis._plottable_dated_rows(_frame(same_pano_twice))) == 2
+
+
+def test_every_known_provider_has_a_display_entry():
+    """
+    PROVIDER_DISPLAY must cover naming.KNOWN_PROVIDERS exactly. The map is
+    generated AFTER the run is registered, so a missing entry fails a fully
+    successful collection at its very last step and reports the sweep as
+    FAILED (PR #251 review) — invisible to the CLI tests, which pass
+    --no-visual. Set equality, following
+    test_every_scheduled_channel_declares_its_per_ip_hosts.
+    """
+    from streetscape_metadata_tracker.naming import KNOWN_PROVIDERS
+
+    assert set(vis.PROVIDER_DISPLAY) == set(KNOWN_PROVIDERS)
+
+
+def test_kartaview_run_builds_a_map():
+    """A kartaview run must render (the KeyError regression), link included."""
+    rows = [_row("p1", 47.60, -122.33), _row("p2", 47.62, -122.35)]
+    df = _frame(rows)
+    df["copyright_info"] = "© KartaView contributor someone"
+    df["sequence_id"] = pd.Series(["11616154", pd.NA], dtype="string")
+    df["sequence_index"] = pd.Series([1, pd.NA], dtype="Int64")
+    result = vis.create_visualization_map(df, "Krabi, Thailand", provider="kartaview")
+    assert isinstance(result, folium.Map)
+
+
+def test_kartaview_viewer_url_needs_sequence_and_index():
+    """
+    The viewer is addressed by (sequence, index), not photo id — and a row can
+    legitimately lack a sequence, which must yield NO link rather than a link
+    to nowhere (mirrors PROVIDERS.kartaview.viewerUrl in streetscape-utils.js).
+    """
+    linked = pd.Series({"sequence_id": "11616154", "sequence_index": 1})
+    assert vis.PROVIDER_DISPLAY["kartaview"]["viewer_url"]("2627370567", linked) == (
+        "https://kartaview.org/details/11616154/1"
+    )
+    for missing in (
+        pd.Series({"sequence_id": pd.NA, "sequence_index": 1}),
+        pd.Series({"sequence_id": "11616154", "sequence_index": pd.NA}),
+        pd.Series({"other": "column"}),
+    ):
+        assert vis.PROVIDER_DISPLAY["kartaview"]["viewer_url"]("2627370567", missing) is None

@@ -39,6 +39,7 @@ from . import (
     db,
     display_search_area,
     download_gsv_metadata_async,
+    download_kartaview_metadata_async,
     download_mapillary_metadata_async,
     get_city_location_data,
     get_search_dimensions,
@@ -54,10 +55,18 @@ from .city_registration import (
 )
 from .diff import compute_run_diff, generate_diff_filename, write_diff_detail
 from .download_common import (
-    DownloadError,
+    SWEEP_INCOMPLETE_EXIT_CODE,
     HostBusyError,
     HostUnavailableError,
+    grid_bbox,
     host_exit_code,
+)
+from .download_kartaview import (
+    DEFAULT_REQUEST_TIMEOUT_S,
+    DEFAULT_SWEEP_REQUESTS_PER_MINUTE,
+    SweepIncompleteError,
+    checkpoint_path_for,
+    discard_checkpoint,
 )
 from .download_mapillary import DEFAULT_TILE_REQUESTS_PER_MINUTE
 from .fileutils import load_city_csv_file
@@ -67,10 +76,27 @@ from .json_summarizer import (
     generate_driving_plan_summary,
     generate_streetwalk_manifest,
 )
-from .naming import generate_run_filename, same_grid_geometry
+from .naming import KNOWN_PROVIDERS, generate_run_filename, same_grid_geometry
 from .paths import get_default_data_dir, get_default_vis_dir
 
 logger = logging.getLogger(__name__)
+
+
+def _positive_int(value: str) -> int:
+    """
+    argparse type for flags where 0 is not "off", it is a trap.
+
+    `--kartaview-max-requests 0` used to be accepted, spend the full
+    calibration ladder (over_budget() is checked only where sweep requests are
+    issued), checkpoint roots_done=0, and exit 83 printing "re-run the same
+    command to resume" — an infinite loop the message actively encourages.
+    Refused at parse time instead, following #214's refuse-before-any-work
+    posture for `run-due --limit`.
+    """
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError(f"must be >= 1, got {number}")
+    return number
 
 
 def parse_args():
@@ -100,13 +126,21 @@ def parse_args():
 
     parser.add_argument(
         "--provider",
-        choices=["both", "gsv", "mapillary"],
+        # Built from the naming contract rather than restated: a provider that
+        # joins KNOWN_PROVIDERS is collectable here without a second edit, and
+        # a hand-kept list is the kind that drifts one provider behind.
+        choices=["both", *KNOWN_PROVIDERS],
         default="both",
-        help="Imagery provider(s) to collect. The default collects GSV then "
-        "Mapillary back-to-back with the same run date so the two "
-        "series stay in sync. Each provider keeps its own independent "
-        "run series (dated files, diffs, skip policy) on the same "
-        "frozen city grid.",
+        help="Imagery provider(s) to collect. Each provider keeps its own "
+        "independent run series (dated files, diffs, skip policy) on the "
+        "same frozen city grid. 'both' means GSV then Mapillary "
+        "back-to-back with the same run date so those two series stay in "
+        "sync — it does NOT include KartaView, which must be asked for by "
+        "name (see issue #247 on renaming this to --provider all). "
+        "KartaView is deliberately opt-in: its sweep is paced at "
+        f"{DEFAULT_SWEEP_REQUESTS_PER_MINUTE} requests/minute and serial, so "
+        "a large city is hours of wall-clock and should never be something "
+        "you get by typing nothing.",
     )
 
     parser.add_argument(
@@ -227,11 +261,46 @@ def parse_args():
              {DEFAULT_TILE_REQUESTS_PER_MINUTE}; 0 disables pacing.""",
     )
 
+    concurrency_group.add_argument(
+        "--kartaview-max-requests-per-minute",
+        type=int,
+        default=DEFAULT_SWEEP_REQUESTS_PER_MINUTE,
+        help=f"""Client-side cap on KartaView sweep requests per minute
+             (kartaview provider only). A third separate flag rather than a
+             shared one because all three limits are a different KIND: the GSV
+             cap above is a project quota, Mapillary's is an undocumented
+             per-IP tile limit, and this one paces to KartaView's PUBLISHED
+             1,000/hour authenticated ceiling — which is necessary because the
+             API returns no X-RateLimit-* or Retry-After headers at all, so a
+             client cannot observe its own budget and has to assume the
+             documented number is real. Default
+             {DEFAULT_SWEEP_REQUESTS_PER_MINUTE} ({DEFAULT_SWEEP_REQUESTS_PER_MINUTE * 60}/hour,
+             under that ceiling by construction); 0 disables pacing.""",
+    )
+
+    concurrency_group.add_argument(
+        "--kartaview-max-requests",
+        type=_positive_int,
+        default=None,
+        help="""Stop a KartaView sweep after this many requests and CHECKPOINT
+             the rest (kartaview provider only, issue #239). Not a sampling
+             knob: nothing is published, because a partial census dated today
+             would diff against its predecessor as 'every pano in the rest of
+             the city removed'. What it buys is that the spend survives — the
+             run exits 83 and the next invocation resumes from the cells
+             already answered, so a metro that needs 10 hours can be taken a
+             night at a time. Default: sweep to completion.""",
+    )
+
     parser.add_argument(
         "--timeout",
         type=float,
-        default=30.0,
-        help="Timeout in seconds for each individual API request",
+        default=None,
+        help="Timeout in seconds for each individual API request. Default: 30, "
+        "except 60 for kartaview — its nearby-photos endpoint is a database "
+        "query whose heaviest documented shape is a 2,000-row page, not a "
+        "static-content fetch, so the sweep's own engineered default applies "
+        "unless this flag overrides it explicitly.",
     )
 
     parser.add_argument(
@@ -414,11 +483,25 @@ async def async_main():
         # exit code and the scheduler reacts to the host rather than counting a
         # per-city failure (issue #208).
         unavailable: list[HostUnavailableError] = []
+        # Sweeps that stopped with work left and CHECKPOINTED it (issue #239).
+        # Not a failure in the sense the others are: the spend is on disk and
+        # the next attempt continues from it, which is why this gets its own
+        # exit code rather than being folded into 1. See the aggregation below.
+        incomplete: list[SweepIncompleteError] = []
         for provider in providers:
             try:
                 await _collect_one_run(
                     conn, args, city_row, run_date, provider, configs[provider], vis_path
                 )
+            except SweepIncompleteError as e:
+                # Progress, not breakage — logged at INFO with the fraction
+                # done, and deliberately without a traceback.
+                logging.info(
+                    f"{provider} sweep paused at {e.roots_done}/{e.root_count} root cells; "
+                    f"re-run to resume from {e.checkpoint_path}"
+                )
+                failed.append(provider)
+                incomplete.append((provider, e))
             except HostUnavailableError as e:
                 # A known environmental condition, not a bug: log the message
                 # (which names the host and what to do) without a traceback.
@@ -435,6 +518,34 @@ async def async_main():
             generate_driving_plan_summary(conn, args.download_dir)
 
         if failed:
+            # A paused sweep is reported as itself only when it is the ONLY
+            # thing that went wrong, on exactly the reasoning the host branch
+            # below uses: 83 tells the caller "this made progress, run it
+            # again", and a mixed run where GSV also genuinely broke must not
+            # wear that code and have the real failure read as progress.
+            #
+            # It is checked FIRST because the two conditions are not symmetric.
+            # A host refusal is a property of the machine that the next city
+            # inherits; an incomplete sweep is a property of this city's budget
+            # and says nothing about the next one. If a sweep both paused and
+            # some other channel hit a blocked host, the host verdict is the
+            # one worth acting on, so this returns 83 only when `unavailable`
+            # is empty by construction (every failure being incomplete leaves
+            # no room for one).
+            #
+            # And it is decided BEFORE the FAILED print: the except clause
+            # calls a pause "progress, not breakage", so announcing FAILED on
+            # stdout and then contradicting it with PAUSED would have a wrapper
+            # (or an operator grepping stdout) escalate — or --force re-run —
+            # every legitimately budget-capped night of a multi-night sweep.
+            if len(incomplete) == len(failed):
+                paused_provider, pause = incomplete[0]
+                print(
+                    f"PAUSED: {paused_provider} checkpointed at "
+                    f"{pause.roots_done}/{pause.root_count} root cells. "
+                    f"Re-run the same command to resume; nothing was published."
+                )
+                return SWEEP_INCOMPLETE_EXIT_CODE
             print(f"FAILED: {', '.join(failed)} (see log for details)")
             # Only report a host-level exit when EVERY failure was that host:
             # a mixed night (Mapillary blocked, GSV genuinely broken) must not
@@ -509,6 +620,17 @@ async def _collect_one_run(conn, args, city_row, run_date, provider, config, vis
 
     logging.info(f"Collecting {provider} run {run_date} for {city_row.city_id}")
 
+    # --timeout's default is per provider: 30 s for GSV metadata and Mapillary
+    # tiles, DEFAULT_REQUEST_TIMEOUT_S (60 s) for a KartaView sweep, whose
+    # nearby-photos endpoint is a database query rather than a static-content
+    # fetch. Passing args.timeout straight through silently halved that
+    # engineered default on every real CLI sweep, timing out exactly the heavy
+    # pages the 60 s exists for (PR #251 review). An explicit flag wins
+    # everywhere.
+    request_timeout = args.timeout
+    if request_timeout is None:
+        request_timeout = DEFAULT_REQUEST_TIMEOUT_S if provider == "kartaview" else 30.0
+
     try:
         if provider == "mapillary":
             dict_results = await download_mapillary_metadata_async(
@@ -520,8 +642,45 @@ async def _collect_one_run(conn, args, city_row, run_date, provider, config, vis
                 step_length=city_row.step_m,
                 access_token=config["access_token"],
                 output_csv_gz_path=output_csv_gz_path,
-                request_timeout=args.timeout,
+                request_timeout=request_timeout,
                 max_requests_per_minute=args.mapillary_max_requests_per_minute,
+            )
+        elif provider == "kartaview":
+            # The checkpoint path is built HERE rather than inside the
+            # downloader because it is keyed on the CHANNEL, and only the
+            # caller knows which channel it is: a KartaView road walk sweeps
+            # the same frozen bbox at the same radius, so a path derived from
+            # the geometry alone would let the two resume each other's sweeps
+            # under different credentials and different ledgers (#239).
+            checkpoint_path = checkpoint_path_for(
+                city_row.city_id,
+                grid_bbox(
+                    city_row.center_lat,
+                    city_row.center_lon,
+                    city_row.grid_width_m,
+                    city_row.grid_height_m,
+                    city_row.step_m,
+                ),
+                provider,
+            )
+            dict_results = await download_kartaview_metadata_async(
+                city_name=city_row.display_name,
+                center_lat=city_row.center_lat,
+                center_lon=city_row.center_lon,
+                grid_width=city_row.grid_width_m,
+                grid_height=city_row.grid_height_m,
+                step_length=city_row.step_m,
+                access_token=config["access_token"],
+                output_csv_gz_path=output_csv_gz_path,
+                request_timeout=request_timeout,
+                max_requests_per_minute=args.kartaview_max_requests_per_minute,
+                max_requests=args.kartaview_max_requests,
+                checkpoint_path=checkpoint_path,
+                # The channel again, this time INSIDE the commit record: the
+                # path above separates channels only as long as every caller
+                # derives it correctly, so the state file also records which
+                # ledger its spend belongs to and refuses to resume another's.
+                checkpoint_channel=provider,
             )
         else:
             logging.info(
@@ -539,12 +698,18 @@ async def _collect_one_run(conn, args, city_row, run_date, provider, config, vis
                 output_csv_gz_path=output_csv_gz_path,
                 batch_size=args.batch_size,
                 connection_limit=args.connection_limit,
-                request_timeout=args.timeout,
+                request_timeout=request_timeout,
                 max_requests_per_minute=args.max_requests_per_minute,
             )
-    except DownloadError as e:
+    except Exception as e:
         # Failed downloads still spent real (budgeted, possibly billable)
         # requests; record them so tomorrow's budget check doesn't overspend.
+        # `except Exception`, not DownloadError: a KartaView sweep whose
+        # POST-FETCH tail dies (ENOSPC on the gzip write, a read-back failure)
+        # raises OSError/ValueError with the spend attached by the downloader —
+        # and because its checkpoint survives and the resume re-finalizes for
+        # ~0 new requests, a spend missed here would never land in ANY ledger
+        # row (PR #251 review). Providers that attach nothing fall through at 0.
         spent = getattr(e, "api_requests", 0)
         if spent:
             db.add_api_usage(conn, run_date, spent, provider=provider)
@@ -591,12 +756,34 @@ async def _collect_one_run(conn, args, city_row, run_date, provider, config, vis
         started_at=started,
         finished_at=finished,
         duration_seconds=duration,
-        api_requests=dict_results["api_requests"],
+        # The SWEEP's cost, not this process's: the row describes the run, so
+        # it must say what the run cost, while db.add_api_usage above is fed
+        # the per-process figure because it is additive and keyed by (date,
+        # provider) -- charging it the cumulative total would bill last
+        # night's requests against tonight's budget gate a second time. Only
+        # KartaView publishes the cumulative figure (#239); the fallback is
+        # exact for Mapillary (always one process) but UNDER-counts a GSV run
+        # resumed via its .downloading sibling, whose earlier processes' spend
+        # is recorded only in api_usage -- a pre-existing limitation of that
+        # checkpoint, noted rather than fixed here.
+        api_requests=dict_results.get("api_requests_total", dict_results["api_requests"]),
         # Flat-image census (issue #116) is a Mapillary downloader artifact,
         # not derivable from the CSV — GSV runs omit it (stored NULL).
         num_flat_images=dict_results.get("num_flat_images"),
         **stats,
     )
+
+    # Only now is the KartaView checkpoint spent: the runs row is committed, so
+    # the sweep's cost is durable in the catalog and every recovery path is
+    # cheap (a lost diff/JSON below regenerates from the CSV; a crash BEFORE
+    # this line leaves an orphan CSV whose "delete it and re-run" remedy
+    # re-finalizes from the checkpoint for ~0 requests). Discarding it inside
+    # the downloader — before this row existed — made a register_run failure
+    # cost the whole multi-night sweep again (PR #251 review). Best effort by
+    # discard_checkpoint's own contract: an unremovable checkpoint never fails
+    # a run that succeeded.
+    if dict_results.get("checkpoint_path"):
+        discard_checkpoint(dict_results["checkpoint_path"])
 
     # Diff against the previous run of the same provider, if any — but only
     # when both runs sampled the same grid geometry. Archival baselines

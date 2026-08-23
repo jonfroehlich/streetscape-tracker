@@ -1516,6 +1516,128 @@ def test_unknown_provider_still_warned_and_dropped(tmp_path):
     assert "bogus" not in cfg.providers
 
 
+def test_a_known_but_unwired_channel_is_recorded_and_dropped(tmp_path):
+    """
+    RECORDED and dropped, not silently skipped like the unknown name above and
+    not raised either -- a three-way asymmetry, each arm load-bearing.
+
+    #225 phase 3b put "kartaview" in KNOWN_PROVIDERS so the CLI could collect a
+    city by hand, and this loader gates on that same tuple -- so
+    [providers.kartaview] started PARSING while city_timeout_seconds,
+    estimate_requests and enabled_providers' rank all stayed fail-open for it.
+    Dropping the block keeps every check after this point from pricing or
+    launching it; recording the error lets the channel-running commands refuse
+    rather than quietly run a night AROUND a channel the config asks for; and
+    NOT raising keeps backup-status and restore-backup -- the incident-time
+    handles -- working under a config only run-due could ever act on.
+    """
+    from streetscape_metadata_tracker.scheduler import UNWIRED_CHANNELS
+
+    assert "kartaview" in UNWIRED_CHANNELS
+    cfg_path = tmp_path / "s.toml"
+    cfg_path.write_text(
+        "[providers.gsv]\nenabled = true\n\n[providers.kartaview]\nenabled = true\n"
+    )
+    cfg = load_scheduler_config(str(cfg_path))
+    assert "kartaview" not in cfg.providers, "dropped, so nothing downstream can run it"
+    assert "gsv" in cfg.providers, "the runnable channel beside it is untouched"
+    assert "kartaview" not in cfg.enabled_providers()
+    assert len(cfg.unwired_channel_errors) == 1
+    assert "kartaview" in cfg.unwired_channel_errors[0]
+
+
+def test_disabling_an_unwired_channel_does_not_make_it_acceptable(tmp_path):
+    """
+    `enabled = false` is not a way to keep the block around "for later".
+
+    The refusal is about the block EXISTING, because the next person to flip
+    that flag gets a channel the scheduler cannot run and no error saying so.
+    """
+    cfg_path = tmp_path / "s.toml"
+    cfg_path.write_text("[providers.kartaview]\nenabled = false\n")
+    cfg = load_scheduler_config(str(cfg_path))
+    assert "kartaview" not in cfg.providers
+    assert cfg.unwired_channel_errors
+
+
+def test_run_due_refuses_an_unwired_channel_before_opening_the_catalog(conn, monkeypatch, tmp_path):
+    """
+    The channel-running half of the split. A night that silently ran AROUND a
+    channel the config asks for would read as a success while collecting
+    nothing on it -- the same shape as the unknown-channel refusal, one layer
+    down. Refused with USAGE_EXIT_CODE before the catalog is opened.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    cfg_path = tmp_path / "s.toml"
+    cfg_path.write_text(
+        "[providers.gsv]\nenabled = true\n\n[providers.kartaview]\nenabled = true\n"
+    )
+    cfg = load_scheduler_config(str(cfg_path))
+    connected = []
+    monkeypatch.setattr(sched.db, "connect", lambda path: connected.append(path) or conn)
+
+    assert sched.cmd_run_due(cfg, today=date(2026, 7, 2)) == sched.USAGE_EXIT_CODE
+    assert connected == []
+
+
+def test_assess_city_refuses_an_unwired_channel_before_geocoding(conn, monkeypatch, tmp_path):
+    """assess-city launches channels too, so it refuses on the same guard --
+    before the catalog is opened and before the Nominatim pre-flight spends a
+    request on a city that will not be collected."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    cfg_path = tmp_path / "s.toml"
+    cfg_path.write_text("[providers.kartaview]\nenabled = true\n")
+    cfg = load_scheduler_config(str(cfg_path))
+    connected = []
+    monkeypatch.setattr(sched.db, "connect", lambda path: connected.append(path) or conn)
+
+    assert sched.cmd_assess_city(cfg, "Bend, OR") == sched.USAGE_EXIT_CODE
+    assert connected == []
+
+
+def test_backup_status_still_works_with_a_stray_unwired_block(conn, monkeypatch, tmp_path):
+    """
+    The read-only half of the split, and the reason the loader stopped raising:
+    backup-status is an incident-time handle, and a load-time ValueError took
+    it down over a config block it could never act on -- on exactly the kind of
+    bad day it exists for.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    monkeypatch.setattr(sched.catalog_backup, "write_backup", _REAL_WRITE_BACKUP)
+    cfg_path = tmp_path / "s.toml"
+    cfg_path.write_text(
+        f'[paths]\ndata_dir = "{tmp_path / "data"}"\n'
+        f'backup_dir = "{tmp_path / "backups"}"\n\n'
+        "[providers.kartaview]\nenabled = true\n"
+    )
+    cfg = load_scheduler_config(str(cfg_path))
+    assert cfg.unwired_channel_errors, "the stray block must be what this test exercises"
+    cfg.driving_plan.archive_dir = str(tmp_path / "archive" / "gsv_driving_plan")
+    os.makedirs(cfg.driving_plan.archive_dir)
+    sched.catalog_backup.write_backup(conn, cfg.backup_dir, date(2026, 8, 7), source_db=cfg.db_path)
+
+    assert sched.cmd_backup_status(cfg) == 0, "read-only subcommands keep working"
+
+
+def test_every_unwired_channel_is_a_real_provider_token(tmp_path):
+    """
+    A guard keyed on a name nothing can configure is a guard that never fires.
+
+    If a token is removed from KNOWN_PROVIDERS (or misspelled here), the branch
+    above becomes unreachable and the config it was written to refuse starts
+    being silently dropped by the unknown-provider branch instead -- which reads
+    as working, because the channel still does not run.
+    """
+    from streetscape_metadata_tracker.naming import KNOWN_PROVIDERS
+    from streetscape_metadata_tracker.scheduler import STREET_CHANNELS, UNWIRED_CHANNELS
+
+    unreachable = sorted(set(UNWIRED_CHANNELS) - set(KNOWN_PROVIDERS) - set(STREET_CHANNELS))
+    assert unreachable == [], f"UNWIRED_CHANNELS names nothing configurable: {unreachable}"
+
+
 def test_street_estimate_prefers_a_prior_walk_and_rescales_for_spacing(conn):
     from streetscape_metadata_tracker.scheduler import estimate_street_samples
 

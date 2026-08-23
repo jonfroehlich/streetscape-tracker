@@ -56,6 +56,13 @@ const RENDER_CAP = 40000;
  * `description` is the one-line "what is this provider's data" text; index.js
  * renders it as the provider toggle's tooltip, so a newly registered provider
  * arrives in that radio group with its own explanation rather than a blank.
+ *
+ * `viewerUrl(panoId, row)` takes the whole CSV row, not just the image key,
+ * because not every provider addresses an image by its own id: KartaView's
+ * viewer is keyed on (sequence_id, sequence_index) and cannot build a link from
+ * the photo id at all. GSV and Mapillary ignore the second argument. It may
+ * return null — meaning "this row is not addressable" — and the popup builders
+ * render that as no link rather than a dead one.
  */
 const PROVIDERS = {
   gsv: {
@@ -83,6 +90,48 @@ const PROVIDERS = {
     viewerUrl: (panoId) =>
       `https://www.mapillary.com/app/?pKey=${encodeURIComponent(panoId)}`,
     hasCopyrightFilter: false,
+    hasFlatImagery: true,
+  },
+  kartaview: {
+    label: "KartaView",
+    description:
+      "Crowdsourced KartaView imagery: a census of every 360° panorama, mostly Grab fleet capture",
+    panoNoun: "KartaView Panoramas",
+    // KartaView launched as OpenStreetView in 2016. The ramp anchor only.
+    launchDate: new Date("2016-01-01"),
+    // 2004, mirroring analysis.EARLIEST_PLAUSIBLE_CAPTURE["kartaview"] and
+    // deliberately looser than the 2016 launch for the same reason Mapillary's
+    // is looser than 2013: the imagery is community dashcam footage and
+    // contributors upload genuinely old photographs. Ties Mapillary's floor, so
+    // LOOSEST_EARLIEST_PLAUSIBLE_CAPTURE is unmoved and the JS/Python
+    // divergence documented above stays dormant.
+    earliestPlausibleCapture: new Date(2004, 0, 1), // local midnight; see above
+    attribution:
+      'Image metadata © <a href="https://kartaview.org">KartaView</a>, CC BY-SA',
+    viewerLabel: "View in KartaView",
+    // The ONLY entry that needs the row, and the reason viewerUrl takes one.
+    // KartaView's viewer is addressed by (sequence, index within it) rather
+    // than by photo id -- verified against a real photo from the API
+    // (id 2627370567 lives at sequence 11616154 index 1) -- so `panoId` alone
+    // cannot build this link. Both fields are in the run schema precisely
+    // because the bulk sweep row already carries them.
+    //
+    // Returns null when either is missing, which the popup builders render as
+    // no link at all. A KartaView row can legitimately lack a sequence (the
+    // decoder keeps a null rather than inventing one), and a link to nowhere
+    // is worse than none -- the same call the FLAT_ONLY popup already makes.
+    viewerUrl: (panoId, row) => {
+      const sequence = row?.sequence_id;
+      const index = row?.sequence_index;
+      if (!sequence || index === null || index === undefined || index === "") return null;
+      return (
+        `https://kartaview.org/details/${encodeURIComponent(sequence)}` +
+        `/${encodeURIComponent(index)}`
+      );
+    },
+    hasCopyrightFilter: false,
+    // Overwhelmingly flat dashcam imagery outside the Grab fleet markets, so a
+    // coverage number has to say which of the two it counts.
     hasFlatImagery: true,
   },
 };
