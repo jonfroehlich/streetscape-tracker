@@ -328,6 +328,28 @@ def test_select_pano_points_mapillary_keeps_all_located():
     assert len(pts) == 2
 
 
+def test_select_pano_points_counts_a_no_date_pano_as_present():
+    """
+    A NO_DATE pano is imagery within reach of the street -- the grid coverage
+    rate has always said so (PRESENT_STATUSES) -- and filtering on == "OK"
+    silently dropped it here. For KartaView that population is large by
+    construction: its shot_date >= date_added rule nulls an untrustworthy
+    capture date rather than believing it, so the most honestly-dated provider
+    was the one whose street coverage read lowest. The pano covers; it just
+    carries no age.
+    """
+    df = _run_df(
+        [
+            ("OK", LAT0, LON0, "2024-01-01", "someuser"),
+            ("NO_DATE", LAT0, LON0, None, "kartacam"),  # kept: present, unaged
+            ("FLAT_ONLY", LAT0, LON0, None, "flatcam"),  # dropped: not a pano
+        ]
+    )
+    pts = select_pano_points(df, "kartaview")
+    assert len(pts) == 2
+    assert pts["capture_date"].isna().sum() == 1
+
+
 # ── GeoJSON artifact shape ───────────────────────────────────────────────────
 
 

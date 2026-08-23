@@ -22,7 +22,11 @@ from typing import Any
 import geopandas as gpd
 import pandas as pd
 
-from streetscape_metadata_tracker.analysis import FLAT_ONLY, is_google_copyright
+from streetscape_metadata_tracker.analysis import (
+    FLAT_ONLY,
+    PRESENT_STATUSES,
+    is_google_copyright,
+)
 
 from .road_sampling import quantize_coord
 
@@ -159,12 +163,19 @@ def select_pano_points(df: pd.DataFrame, provider: str) -> gpd.GeoDataFrame:
     """
     Extract located panos from a run DataFrame as a WGS84 point GeoDataFrame.
 
-    Keeps only ``status == 'OK'`` rows with non-null pano coordinates. For GSV,
-    restricts to official Google imagery (exact ``© Google`` match, mirroring the
-    stats/JSON/frontend definition); for other providers keeps every pano.
-    Retains ``capture_date`` (coerced to datetime) so coverage can be aged.
+    Keeps PRESENT rows (status OK or NO_DATE) with non-null pano coordinates --
+    the same presence vocabulary the grid coverage rate uses, because a pano
+    whose capture date is unusable is still imagery within reach of the street.
+    Filtering on ``== "OK"`` silently dropped every NO_DATE pano, which for
+    KartaView is a large population by construction (its ``shot_date >=
+    date_added`` rule nulls the date rather than trusting it) and for Mapillary
+    a small real one. For GSV, restricts to official Google imagery (exact
+    ``© Google`` match, mirroring the stats/JSON/frontend definition); for
+    other providers keeps every pano. Retains ``capture_date`` (coerced to
+    datetime) so coverage can be aged; a NO_DATE pano contributes coverage but
+    no age, exactly as it does in the grid stats.
     """
-    mask = (df["status"] == "OK") & df["pano_lat"].notna() & df["pano_lon"].notna()
+    mask = df["status"].isin(PRESENT_STATUSES) & df["pano_lat"].notna() & df["pano_lon"].notna()
     if provider == "gsv":
         # A legacy pre-copyright baseline CSV may lack the column entirely (not
         # just be all-NaN); treat that as "no official Google imagery" (empty
