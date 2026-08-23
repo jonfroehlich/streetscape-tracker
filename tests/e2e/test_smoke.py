@@ -1236,6 +1236,80 @@ def test_histogram_bars_track_other_controls_but_not_their_own_selection(page: P
     assert errors == []
 
 
+def test_collected_by_scopes_the_numeric_filters(page: Page, base_url):
+    """The "Collected by" select is a SCOPE, not merely a row filter (#250).
+
+    A pivoted row holds one number per provider, so "coverage over 10%" is not
+    a complete question until you say WHOSE coverage — and before this the two
+    controls did not compose at all: the sliders always read a best-across
+    field, so on the live catalog "Mapillary + >= 80%" returned 56 cities and
+    not one of them had Mapillary coverage over 80. Every one matched on GSV's
+    number. This pins the whole interaction in a browser: the field the slider
+    reads, the axis it re-seeds to, and the wording that says whose numbers
+    these are.
+    """
+    errors = _capture_errors(page)
+    page.goto(f"{base_url}/grid.html")
+    rows = page.locator("#grid-tbody tr")
+    legend = page.locator("#f-cov-legend")
+    cov_min = page.locator('input[data-filter="cov"][data-bound="min"]')
+    lo = page.locator('.control-histogram[data-histogram="cov"] .hist-lo')
+
+    # Unscoped it keeps the exists-semantics, with the quantifier spelled out
+    # instead of a bare "best" that never said across what.
+    expect(legend).to_have_text("Grid coverage % — any provider reaches")
+    assert float(lo.get_attribute("max")) >= 75, lo.get_attribute("max")
+
+    # Alpha City qualifies on GSV's 75.0%, Map Ville on Mapillary's 66.7%:
+    # different providers, and either one counts.
+    cov_min.fill("10")
+    expect(rows).to_have_count(2)
+
+    page.locator('select[data-filter="provider"]').select_option("mapillary")
+
+    # A scope change CLEARS the window rather than carrying it into a domain
+    # where it means something else. All three carriers of the filter have to
+    # agree it is gone — the rendered rows, the URL, and the precision input,
+    # which is the one that used to go on reading "10" after the table had
+    # already re-filtered without it.
+    expect(cov_min).to_have_value("")
+    assert "cov=" not in page.url, page.url
+    expect(rows).to_have_count(2)  # both Mapillary cities, unfiltered
+
+    # The axis re-seeds to the scoped provider's own range (a deliberate
+    # loosening of the fixed-axis rule: a scope change is a different gesture
+    # from brushing), and every label moves with it.
+    expect(legend).to_have_text("Grid coverage % — Mapillary")
+    assert float(lo.get_attribute("min")) > 60, lo.get_attribute("min")
+    expect(cov_min).to_have_attribute("aria-label", "Minimum Grid coverage % — Mapillary")
+    expect(lo).to_have_attribute("aria-label", "Minimum Grid coverage % — Mapillary")
+
+    # And the slider now reads Mapillary's column: neither city reaches 67% on
+    # Mapillary (both sit at 66.7), so the honest answer is no rows. Reading
+    # best-across here would keep Alpha City on GSV's 75 — a row whose own
+    # Mapillary number contradicts the filter that returned it.
+    cov_min.fill("67")
+    expect(rows).to_have_count(0)
+
+    assert errors == []
+
+
+def test_a_scoped_window_survives_a_url_restore(page: Page, base_url):
+    """Clearing on a scope CHANGE must not clear on a scope ARRIVAL. A shared
+    link carries the field and the window together, so the pair is coherent on
+    the way in and dropping it would discard the very thing being shared."""
+    errors = _capture_errors(page)
+    page.goto(f"{base_url}/grid.html?provider=mapillary&age=3~")
+
+    rows = page.locator("#grid-tbody tr")
+    expect(rows).to_have_count(1)
+    expect(rows.first).to_contain_text("Map Ville")  # 4.0 yrs; Alpha City 2.0
+    expect(page.locator('input[data-filter="age"][data-bound="min"]')).to_have_value("3")
+    expect(page.locator("#f-age-legend")).to_have_text("Median age (yrs) — Mapillary")
+
+    assert errors == []
+
+
 def test_distribution_strip_survives_on_the_driving_page(page: Page, base_url):
     """The strip was removed from the two pivoted pages, NOT from the chassis.
     driving.html keeps it, and keeps the behaviour it always had: a histogram
