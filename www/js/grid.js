@@ -546,10 +546,22 @@ function pivotGridRows(rawCities) {
   }
   const providers = adapted.map(([provider]) => provider);
 
+  // Folding is keyed on city_id, so a record without one cannot be folded with
+  // anything — including another record without one. Sharing a "" key merged
+  // unrelated cities into a single "Unknown" row and made the catalog look
+  // smaller than it is; each gets its own row instead. Latent today (the
+  // published v3 aggregate always carries an id) and deliberately LOUD rather
+  // than absorbed, since a record without one is a bug upstream.
+  let anonymous = 0;
+
   for (const [provider, cities] of adapted) {
     for (const city of cities) {
+      if (city.city_id == null) {
+        console.warn("grid: aggregate record with no city_id gets its own row", city);
+      }
       const cityId = city.city_id ?? "";
-      let row = byCity.get(cityId);
+      const key = city.city_id ?? `\u0000anonymous-${(anonymous += 1)}`;
+      let row = byCity.get(key);
       if (!row) {
         row = {
           cityId,
@@ -579,7 +591,7 @@ function pivotGridRows(rawCities) {
           row[`snapshots_${p}`] = null;
           row[`filename_${p}`] = null;
         }
-        byCity.set(cityId, row);
+        byCity.set(key, row);
       }
 
       row.providers.push(provider);

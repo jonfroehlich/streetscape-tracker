@@ -256,6 +256,37 @@ test("pivotGridRows: an empty or missing payload yields no rows rather than thro
   assert.deepEqual(pivotGridRows({ cities: [] }).rows, []);
 });
 
+test("pivotGridRows: records with no city_id stay DISTINCT rows rather than merging", () => {
+  // Folding is keyed on city_id, so records without one cannot be folded with
+  // each other either — sharing a "" key merged unrelated cities into a single
+  // "Unknown" row and made the catalog look smaller than it is. Latent (the
+  // published v3 aggregate always carries an id), which is why the pivot also
+  // warns rather than absorbing it silently.
+  const warnings = [];
+  const realWarn = console.warn;
+  console.warn = (...args) => warnings.push(args[0]);
+  try {
+    const { rows } = pivotGridRows(
+      payload(
+        { provider: "gsv", city: "A", coverage_rate_percent: 10 },
+        { provider: "gsv", city: "B", coverage_rate_percent: 90 },
+        SEATTLE_GSV
+      )
+    );
+    assert.equal(rows.length, 3);
+    const unknown = rows.filter((r) => r.label === "Unknown");
+    assert.equal(unknown.length, 2);
+    assert.deepEqual(
+      unknown.map((r) => r.pct_gsv).sort((a, b) => a - b),
+      [10, 90],
+      "the two id-less records collapsed into one row"
+    );
+    assert.equal(warnings.length, 2, "the pivot absorbed it silently");
+  } finally {
+    console.warn = realWarn;
+  }
+});
+
 // --- columns / presets / invariants -----------------------------------------
 
 test("every sortable column key exists on a row model", () => {

@@ -617,12 +617,28 @@ test("walkChangeCellHtml: em dash for a first walk, signed pp figure with a chur
   assert.equal(walkChangeCellHtml(negative, "gsv").html, "-0.3 pp");
 });
 
-test("walkChangeCellHtml: a zero delta still renders (imagery churned, net flat)", () => {
+test("walkChangeCellHtml: a zero delta still renders, UNSIGNED and toned like deltaCellHtml", () => {
+  // "the walk found exactly what the last one did" is a genuinely different
+  // fact from "it moved a little", and "+0.0" claims a rise that did not
+  // happen — the same reasoning deltaCellHtml applies one column over. The two
+  // renderings of an exact zero used to disagree (issue #250 review).
   const zero = rowsFor({
     ...SEATTLE_GSV_WALK,
     change: { ...CHANGE_BLOCK, coverage_pct_by_length_delta: 0 },
   })[0];
-  assert.equal(walkChangeCellHtml(zero, "gsv").html, "+0.0 pp");
+  const cell = walkChangeCellHtml(zero, "gsv");
+  assert.equal(cell.html, "0.0 pp");
+  assert.equal(cell.className, "delta-zero");
+  // ...and the sign is still carried where there IS a direction.
+  const up = rowsFor({ ...SEATTLE_GSV_WALK, change: CHANGE_BLOCK })[0];
+  assert.equal(walkChangeCellHtml(up, "gsv").html, "+4.2 pp");
+  assert.equal(walkChangeCellHtml(up, "gsv").className, "delta-pos");
+  const down = rowsFor({
+    ...SEATTLE_GSV_WALK,
+    change: { ...CHANGE_BLOCK, coverage_pct_by_length_delta: -0.3 },
+  })[0];
+  assert.equal(walkChangeCellHtml(down, "gsv").html, "-0.3 pp");
+  assert.equal(walkChangeCellHtml(down, "gsv").className, "delta-neg");
 });
 
 test("the change cell keeps its OWN title over the link's — it says more", () => {
@@ -630,7 +646,7 @@ test("the change cell keeps its OWN title over the link's — it says more", () 
   // "Open GSV · …" is what every other cell already says.
   const changed = rowsFor({ ...SEATTLE_GSV_WALK, change: CHANGE_BLOCK })[0];
   const cell = STREET_COLUMNS.find((c) => c.key === "changeDelta_gsv").cell(changed);
-  assert.match(cell, /<td title="Since 2026-04-01/);
+  assert.match(cell, /<td class="delta-pos" title="Since 2026-04-01/);
   assert.doesNotMatch(cell, /title="Open GSV/);
   assert.match(cell, /href=/, "...while still being a link");
 });
@@ -722,6 +738,13 @@ test("updateStreetsCaption: names the active network and counts within it", () =
     { values: { network: "all_public" } }
   );
   assert.equal(captions.pop(), "1 city walked on Roads + paths");
+
+  // Counts go through formatCellNumber, matching updateGridCaption — these two
+  // are twins on twin pages and this one printed a raw "1187" (issue #250
+  // review). The catalog is already past the separator.
+  const many = Array.from({ length: 1187 }, () => ({ networkType: "drive" }));
+  updateStreetsCaption(many.slice(0, 1042), many, null, { values: { network: "drive" } });
+  assert.equal(captions.pop(), "1,042 of 1,187 cities walked on Roads");
 
   delete global.document;
 });

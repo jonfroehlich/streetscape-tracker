@@ -143,6 +143,12 @@ function num(value, digits = 0) {
  * of its own: "GSV improved 4 points and Mapillary improved 1" is two facts
  * about two series, and their difference is not a third.
  *
+ * An exact zero reads as "0.0 pp", unsigned — matching `deltaCellHtml` one
+ * column over, where the reasoning is spelled out: "the walk found exactly
+ * what the last one did" is a genuinely different fact from "it moved a
+ * little", and "+0.0" claims a rise that did not happen. It carries the same
+ * `delta-zero` hook, so the two cells are styled by one rule.
+ *
  * @param {Object} row - From pivotStreetWalks.
  * @param {string} provider
  * @returns {{html: string, title?: string}} Cell parts (see providerCellHtml).
@@ -151,11 +157,16 @@ function walkChangeCellHtml(row, provider) {
   const delta = row[`changeDelta_${provider}`];
   if (delta == null) return { html: "—" };
   const change = row[`change_${provider}`] ?? {};
-  const sign = delta >= 0 ? "+" : "";
+  const sign = delta > 0 ? "+" : "";
+  const tone = delta > 0 ? "delta-pos" : delta < 0 ? "delta-neg" : "delta-zero";
   const title =
     `Since ${change.from}: ${change.edges_gained_coverage ?? 0} streets gained ` +
     `coverage, ${change.edges_lost_coverage ?? 0} lost it`;
-  return { html: `${sign}${delta.toFixed(1)} pp`, title: escapeHtml(title) };
+  return {
+    html: `${sign}${delta.toFixed(1)} pp`,
+    className: tone,
+    title: escapeHtml(title),
+  };
 }
 
 /**
@@ -869,10 +880,12 @@ function updateStreetsCaption(shown, all, manifest, state) {
   const inNetwork = all.filter((row) => row.networkType === networkType).length;
   const label = streetNetworkLabel(networkType);
   const noun = `${inNetwork === 1 ? "city" : "cities"} walked on ${label}`;
+  // Through formatCellNumber, matching updateGridCaption: the two captions are
+  // twins on twin pages, and this one is the half that printed a raw 1187.
   const counts =
     shown.length === inNetwork
-      ? `${inNetwork} ${noun}`
-      : `${shown.length} of ${inNetwork} ${noun}`;
+      ? `${num(inNetwork)} ${noun}`
+      : `${num(shown.length)} of ${num(inNetwork)} ${noun}`;
   document.getElementById("streets-caption").textContent =
     counts +
     (manifest?.generated_at
