@@ -84,6 +84,38 @@ def test_a_cells_children_exactly_cover_it():
     assert all(c.depth == parent.depth + 1 for c in children)
 
 
+def test_adjacent_failed_cells_leave_no_unmasked_sliver_between_them():
+    """
+    The lattice spaces cells at cos(mid_lat), but the failed-cell mask priced
+    each cell's width at cos(cell.lat) -- so on the equator-ward rows of a
+    tall bbox the masks were a couple of metres narrower than the lattice, and
+    a grid point in the gap between two adjacent failed cells published as
+    ZERO_RESULTS: absence never observed, in an immutable dated snapshot. The
+    mask must use the same latitude the lattice was laid out at.
+    """
+    # A full-height 40 km grid at 47 degN: the worst case the #166 cap allows.
+    tall_bbox = (-122.5, 47.0, -121.97, 47.36)
+    roots = kv.cells_for_bbox(*tall_bbox, 1000 * math.sqrt(2))
+    c0, c1 = roots[0], roots[1]  # horizontally adjacent, on the bottom row
+    assert c0.lat == c1.lat and c1.lon > c0.lon
+
+    # A point in the pre-fix sliver: outside both cells' masks as priced at
+    # cos(cell.lat), inside c0's share of the lattice as priced at mid_lat.
+    sliver_lon = c0.lon + 0.4995 * (c1.lon - c0.lon)
+    prefix_half_lon = (c0.size_m / 2.0) / (kv._METERS_PER_DEG_LAT * math.cos(math.radians(c0.lat)))
+    assert abs(sliver_lon - c0.lon) > prefix_half_lon, "the fixture must sit in the old gap"
+    assert abs(sliver_lon - c1.lon) > prefix_half_lon
+
+    lats, lons = np.array([c0.lat]), np.array([sliver_lon])
+    assert kv._points_in_cells(lats, lons, [c0, c1])[0], "the sliver point must be masked"
+
+    # And the same through subdivision: children inherit the lattice latitude,
+    # so a root that cascaded before failing still masks its whole share.
+    descendants = [g for child in kv.subdivide(c0) for g in kv.subdivide(child)]
+    nudged = np.array([c0.lat + 1e-7])  # off the children's shared edge
+    assert kv._points_in_cells(nudged, lons, descendants + [c1])[0]
+
+
 def test_the_floor_guard_is_asked_of_the_children_not_the_cell():
     """
     The natural spelling -- "is this cell above the floor?" -- halves the floor

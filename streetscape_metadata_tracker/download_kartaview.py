@@ -297,10 +297,25 @@ class Cell:
     lon: float
     size_m: float
     depth: int = 0
+    # The latitude whose cos() priced this cell's LON EXTENT in degrees. The
+    # lattice is laid out at the bbox's mid-latitude, so a cell's share of it
+    # is size_m / cos(mid_lat) degrees wide -- NOT size_m / cos(cell.lat),
+    # which on the equator-ward rows of a tall bbox is a few metres narrower
+    # and left an unmasked sliver between adjacent failed cells (a grid point
+    # there published ZERO_RESULTS, absence never observed). Roots record the
+    # lattice's mid-latitude and subdivide passes it down, so descendants tile
+    # exactly the share their root owns; None (hand-built cells, checkpoints
+    # from before this field) falls back to `lat`, the historical behaviour.
+    lon_extent_lat: float | None = None
 
     @property
     def radius_m(self) -> int:
         return int(round(self.size_m * math.sqrt(2) / 2))
+
+    @property
+    def extent_lat(self) -> float:
+        """The latitude this cell's lon extent is priced at (see above)."""
+        return self.lat if self.lon_extent_lat is None else self.lon_extent_lat
 
 
 def _lon_span_deg(min_lon: float, max_lon: float) -> float:
@@ -368,6 +383,7 @@ def cells_for_bbox(
             lat=min_lat + (j + 0.5) * deg_lat,
             lon=_wrap_lon(min_lon + (i + 0.5) * deg_lon),
             size_m=cell_size_m,
+            lon_extent_lat=mid_lat,
         )
         for j in range(n_y)
         for i in range(n_x)
@@ -375,12 +391,22 @@ def cells_for_bbox(
 
 
 def subdivide(cell: Cell) -> list[Cell]:
-    """Split one cell into the four half-size cells that exactly cover it."""
+    """
+    Split one cell into the four half-size cells that exactly cover it.
+
+    "Cover it" means the cell's share of the LATTICE, so the lon step is
+    priced at the parent's ``extent_lat`` and the children inherit it: by
+    induction every descendant tiles exactly the share its root owns, instead
+    of a share re-priced at each generation's own latitude -- which on a tall
+    bbox drifted a few metres from the lattice and out of the failed-cell
+    mask.
+    """
     half = cell.size_m / 2.0
+    extent_lat = cell.extent_lat
     d_lat = (half / 2.0) / _METERS_PER_DEG_LAT
-    d_lon = (half / 2.0) / (_METERS_PER_DEG_LAT * math.cos(math.radians(cell.lat)))
+    d_lon = (half / 2.0) / (_METERS_PER_DEG_LAT * math.cos(math.radians(extent_lat)))
     return [
-        Cell(cell.lat + sy * d_lat, cell.lon + sx * d_lon, half, cell.depth + 1)
+        Cell(cell.lat + sy * d_lat, cell.lon + sx * d_lon, half, cell.depth + 1, extent_lat)
         for sy in (-1, 1)
         for sx in (-1, 1)
     ]
@@ -846,7 +872,13 @@ def _points_in_cells(lats: np.ndarray, lons: np.ndarray, cells: list[Cell]) -> n
     mask = np.zeros(len(lats), dtype=bool)
     for cell in cells:
         half_lat = (cell.size_m / 2.0) / _METERS_PER_DEG_LAT
-        half_lon = (cell.size_m / 2.0) / (_METERS_PER_DEG_LAT * math.cos(math.radians(cell.lat)))
+        # extent_lat, not cell.lat: the cell's share of the lattice was priced
+        # at the lattice's mid-latitude, and re-pricing it here at the cell's
+        # own row left an unmasked sliver between adjacent failed cells on the
+        # equator-ward rows of a tall bbox (~2 m wide at 47 degN over 40 km).
+        half_lon = (cell.size_m / 2.0) / (
+            _METERS_PER_DEG_LAT * math.cos(math.radians(cell.extent_lat))
+        )
         # Wrapped difference, so a cell beside the antimeridian compares against
         # points on the other side of it rather than against a ~360 deg gap.
         d_lon = ((lons - cell.lon + 180.0) % 360.0) - 180.0
@@ -1500,16 +1532,26 @@ class SweepCheckpoint:
     failed_cells: list[Cell] = field(default_factory=list)
 
 
-def _cell_to_dict(cell: Cell) -> dict[str, float]:
-    return {"lat": cell.lat, "lon": cell.lon, "size_m": cell.size_m, "depth": cell.depth}
+def _cell_to_dict(cell: Cell) -> dict[str, Any]:
+    return {
+        "lat": cell.lat,
+        "lon": cell.lon,
+        "size_m": cell.size_m,
+        "depth": cell.depth,
+        "lon_extent_lat": cell.lon_extent_lat,
+    }
 
 
 def _cell_from_dict(record: dict[str, Any]) -> Cell:
+    # .get(): a checkpoint from before lon_extent_lat existed reads as None,
+    # which every consumer treats as the historical cell.lat behaviour.
+    extent = record.get("lon_extent_lat")
     return Cell(
         lat=float(record["lat"]),
         lon=float(record["lon"]),
         size_m=float(record["size_m"]),
         depth=int(record["depth"]),
+        lon_extent_lat=None if extent is None else float(extent),
     )
 
 
