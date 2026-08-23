@@ -789,10 +789,13 @@ function createTableControls({
 
   // ── Histogram-sliders (issue #250) ──
   // One per `histogram-range` filter, each with a FIXED axis seeded once from
-  // the full row set. The domain lives here rather than inside the component
-  // because repaintHistograms has to hand the same domain to histogramBuckets;
-  // keeping one copy is what stops the bars and the handles from ever
-  // describing different scales.
+  // the full row set. `entry.domain` is whatever `setDomain` HANDED BACK, not
+  // the raw extent passed in: the component snaps the ends outward to whole
+  // steps, and the thumbs and `.hist-fill` are positioned over that snapped
+  // axis while `repaintHistograms` draws the bars across the same 100% width.
+  // Keeping the pre-snap copy here is what would let the bars and the handles
+  // describe different scales (measured 1.05% of the track at the data max on
+  // a 0-85.1 coverage axis).
   // The filters as they read RIGHT NOW: a scoped descriptor's field, label and
   // test all depend on another control's value, so everything that reasons
   // about a filter reads this rather than the static `filters`. Re-derived
@@ -803,11 +806,14 @@ function createTableControls({
   /**
    * Write a numeric window into its two precision inputs.
    *
-   * THE single writer, because there are three paths that change a window — a
-   * typed bound, a dragged handle, and a scope change clearing it — and every
-   * one of them has to leave the inputs agreeing with `state.values`. The
-   * scope-clear path is the one that got this wrong: the filter was genuinely
-   * cleared and the table re-filtered, while the min box went on reading "80".
+   * THE single writer, because there are FOUR paths that change a window — a
+   * typed bound, that bound being NORMALIZED (swapped, nulled at an edge, or
+   * clamped past one), a dragged handle, and a scope change clearing it — and
+   * every one of them has to leave the inputs agreeing with `state.values`.
+   * The scope-clear path is the one that got this wrong first: the filter was
+   * genuinely cleared and the table re-filtered, while the min box went on
+   * reading "80". The normalization path is the same shape and was missed in
+   * the first pass — see handleControlChange.
    */
   function writeRangeInputs(key, value) {
     const [minEl, maxEl] = rootEl.querySelectorAll(`[data-filter="${key}"]`);
@@ -859,11 +865,18 @@ function createTableControls({
    * @param {boolean} [clearOnChange] - Clear a filter whose field moved. False
    *   on the initial seed, where the field has not "changed" — it arrived that
    *   way from the URL, together with the window that belongs to it.
+   * @param {Object} [opts]
+   * @param {boolean} [opts.force] - Re-seed even where the field has not
+   *   moved. `setRows` passes this, because the ROWS are what an axis is
+   *   derived from: gating on the field alone made a second `setRows` keep the
+   *   first row set's axis, which is not what a method called "set the rows"
+   *   should do. Not reachable while both pages render once, which is exactly
+   *   why it is worth closing now.
    */
-  function syncHistogramDomains(clearOnChange = true) {
+  function syncHistogramDomains(clearOnChange = true, { force = false } = {}) {
     for (const entry of histograms.values()) {
       const filter = filterFor(entry.key);
-      if (entry.field === filter.field) continue;
+      if (!force && entry.field === filter.field) continue;
       const changed = entry.field !== null;
       entry.field = filter.field;
       const values = allRows
@@ -873,12 +886,12 @@ function createTableControls({
       let max = values.length ? Math.max(...values) : (filter.max ?? 1);
       if (filter.min != null) min = Math.max(min, filter.min);
       if (filter.max != null) max = Math.min(max, filter.max);
-      entry.domain = { min, max: max > min ? max : min + 1 };
       if (changed && clearOnChange) {
         delete state.values[entry.key];
         writeRangeInputs(entry.key, null);
       }
-      entry.slider.setDomain(entry.domain);
+      // The SNAPPED axis, which is the one histogramBuckets has to bucket over.
+      entry.domain = entry.slider.setDomain({ min, max: max > min ? max : min + 1 });
       entry.slider.setValue(state.values[entry.key]);
       entry.slider.setLabel(filter.label);
     }
@@ -914,9 +927,9 @@ function createTableControls({
    * change: each histogram's axis, its window, and the wording that says whose
    * numbers it is asking about.
    */
-  function refreshResolved({ clearOnScopeChange = true } = {}) {
+  function refreshResolved({ clearOnScopeChange = true, reseedDomains = false } = {}) {
     resolved = resolveFilters(filters, state.values);
-    syncHistogramDomains(clearOnScopeChange);
+    syncHistogramDomains(clearOnScopeChange, { force: reseedDomains });
     for (const filter of resolved) if (filter.labelFor) relabelControl(filter);
   }
 
@@ -1040,7 +1053,19 @@ function createTableControls({
   });
 
   /** Fold one control's current DOM value into `state` and repaint. */
-  function handleControlChange(target) {
+  /**
+   * Apply one control's current DOM state.
+   *
+   * @param {Element} target
+   * @param {Object} [opts]
+   * @param {boolean} [opts.commit] - The reader has FINISHED with this control
+   *   (blur or Enter on a number input), so a normalized window may be written
+   *   back into the two precision boxes. Deliberately not done on every
+   *   debounced keystroke: a bound half-way to "95" reads as "9", which
+   *   normalizes to the domain edge or to null, and rewriting the box would
+   *   wipe the digit that was about to follow.
+   */
+  function handleControlChange(target, { commit = false } = {}) {
     if (target.dataset?.column) {
       state.cols = [...rootEl.querySelectorAll("[data-column]")]
         .filter((b) => b.checked)
@@ -1071,6 +1096,12 @@ function createTableControls({
       if (entry) {
         entry.slider.setValue(state.values[key]);
         state.values[key] = entry.slider.getValue();
+        // The fourth path (issue #250 review). normalizeSliderRange swaps
+        // crossed handles, nulls a bound sitting at a domain edge and clamps
+        // one beyond it — so without this the boxes can end up reading 90 and
+        // 10 while the table, the thumbs and the URL all say 10-90. Same
+        // two-halves-disagree shape the single writer was introduced for.
+        if (commit) writeRangeInputs(key, state.values[key]);
       }
     } else if (filter.type === "boolean") {
       state.values[key] = target.checked;
@@ -1086,7 +1117,15 @@ function createTableControls({
   // and the later "change" for the same element is skipped rather than
   // re-running the same filter pass.
   rootEl.addEventListener("change", (event) => {
-    if (event.target.dataset?.bound) return;
+    if (event.target.dataset?.bound) {
+      // A number input fires "change" on blur or Enter — the moment the reader
+      // is DONE typing, and the only safe moment to write a normalized window
+      // back into the boxes. The pending debounce is dropped rather than left
+      // to re-run the same filter pass a beat later.
+      clearTimeout(rangeTimer);
+      handleControlChange(event.target, { commit: true });
+      return;
+    }
     handleControlChange(event.target);
   });
   let rangeTimer = null;
@@ -1151,7 +1190,13 @@ function createTableControls({
   });
 
   return {
-    /** Seed or replace the full row set (called once the data has loaded). */
+    /**
+     * Seed or replace the full row set (called once the data has loaded).
+     *
+     * Idempotent in the way the name implies: calling it again with a
+     * different row set re-derives the filter axes from those rows rather
+     * than keeping the first set's.
+     */
     setRows(rows) {
       allRows = rows;
       const parsed = parseTableState(
@@ -1163,8 +1208,11 @@ function createTableControls({
       state.cols = parsed.cols;
       state.values = parsed.values;
       // Not a scope CHANGE: the field and its window arrived together from the
-      // URL, so clearing here would discard a shared link's own filter.
-      refreshResolved({ clearOnScopeChange: false });
+      // URL, so clearing here would discard a shared link's own filter. The
+      // axes DO re-seed though — these are new rows, and an axis is derived
+      // from them — while the window that came with the URL is kept and
+      // re-normalized against whatever domain the new rows produce.
+      refreshResolved({ clearOnScopeChange: false, reseedDomains: true });
       applyColumns();
       if (parsed.sort) table.setSortTo(parsed.sort.key, parsed.sort.dir);
       syncControlsToState();

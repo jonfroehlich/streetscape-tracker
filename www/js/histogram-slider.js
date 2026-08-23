@@ -151,7 +151,7 @@ function roundSliderValue(value) {
  * @param {Element} cfg.rootEl - The `.control-histogram` element.
  * @param {Object} cfg.filter - The filter descriptor (label/unit/digits).
  * @param {(range: {min: ?number, max: ?number}) => void} [cfg.onInput]
- * @returns {{setDomain: Function, setHistogram: Function, setValue: Function,
+ * @returns {{setDomain: Function, getDomain: Function, setHistogram: Function, setValue: Function,
  *            getValue: Function, destroy: Function}}
  */
 function createHistogramSlider({ rootEl, filter, onInput }) {
@@ -285,6 +285,17 @@ function createHistogramSlider({ rootEl, filter, onInput }) {
      *    step 1 pins hi to 85, quietly excluding the 85.1% row). The axis
      *    therefore ends up at most one step past the data, which is under 1%
      *    of the span.
+     *
+     * RETURNS the snapped domain, which is deliberately not the one that came
+     * in. The thumbs and `.hist-fill` are positioned over the snapped axis
+     * while the bars are drawn by the caller across the SAME 100% width, so a
+     * caller that buckets over its own pre-snap extent puts the two out of
+     * step — measured at 1.05% of the track at the data max on a 0-85.1
+     * coverage axis. Handing the snapped domain back is what keeps "one copy
+     * of the axis" true rather than merely intended.
+     *
+     * @param {{min: number, max: number}} next - Raw extent.
+     * @returns {{min: number, max: number, step: number}} The snapped axis.
      */
     setDomain(next) {
       const rawMin = next.min;
@@ -300,6 +311,16 @@ function createHistogramSlider({ rootEl, filter, onInput }) {
       }
       value = normalizeSliderRange(value, domain);
       paint();
+      return { ...domain, step };
+    },
+
+    /**
+     * The axis as SNAPPED — the one the handles actually move on.
+     *
+     * @returns {{min: number, max: number, step: number}}
+     */
+    getDomain() {
+      return { ...domain, step };
     },
 
     /**

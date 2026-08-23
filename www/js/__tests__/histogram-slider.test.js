@@ -1,11 +1,15 @@
-// Offline unit tests for the pure helpers in histogram-slider.js — the
-// numeric filter control on the pivoted data-table pages (issue #250). Run
-// with `npm test` (Node's built-in test runner) — no network, no jsdom.
+// Offline unit tests for histogram-slider.js — the numeric filter control on
+// the pivoted data-table pages (issue #250). Run with `npm test` (Node's
+// built-in test runner) — no network, no jsdom.
 //
-// The DOM half (createHistogramSlider) is covered by the browser e2e smoke
-// test instead (tests/e2e/test_smoke.py), the same split table-controls.js
-// takes. In the browser these helpers read formatCellNumber from
-// table-utils.js; here we take the real one.
+// The helpers are pinned individually below; `createHistogramSlider` is
+// exercised against a hand-stubbed root element, because the property that
+// matters is their COMPOSITION (raw extent -> step -> snapped domain -> is the
+// top of the data a reachable value?) and that is where the bug this control
+// was rebuilt around actually lived. Pointer dragging and real layout stay
+// with the browser e2e smoke test (tests/e2e/test_smoke.py). In the browser
+// these helpers read formatCellNumber from table-utils.js; here we take the
+// real one.
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -19,7 +23,40 @@ const {
   classifyBuckets,
   sliderValuetext,
   roundSliderValue,
+  createHistogramSlider,
 } = require("../histogram-slider.js");
+
+/** The smallest element the component actually touches. */
+function fakeEl() {
+  return {
+    value: "",
+    innerHTML: "",
+    children: [],
+    style: {},
+    classList: { toggle() {}, add() {}, remove() {} },
+    setAttribute(name, v) {
+      this[name] = v;
+    },
+    addEventListener() {},
+  };
+}
+
+/** A `.control-histogram` shell, as `controlsHtml` emits it. */
+function fakeRoot() {
+  const els = {
+    ".hist-bars": fakeEl(),
+    ".hist-slider": fakeEl(),
+    ".hist-fill": fakeEl(),
+    ".hist-lo": fakeEl(),
+    ".hist-hi": fakeEl(),
+  };
+  return { els, querySelector: (sel) => els[sel] };
+}
+
+function fakeSlider(filter = { label: "Grid coverage %", unit: "%", digits: 1 }) {
+  const rootEl = fakeRoot();
+  return { rootEl, slider: createHistogramSlider({ rootEl, filter }) };
+}
 
 // --- sliderStepFor ----------------------------------------------------------
 
@@ -137,4 +174,104 @@ test("roundSliderValue: kills the float noise a stepped range input accumulates"
 
 test("HISTOGRAM_SLIDER_BUCKETS is the strip's cap, so the two read at one resolution", () => {
   assert.equal(HISTOGRAM_SLIDER_BUCKETS, 24);
+});
+
+// --- createHistogramSlider: the composition ---------------------------------
+
+// The measured axes from the two pivoted pages, plus the shapes that break the
+// arithmetic: a domain spanning zero, a sub-unit one, and a degenerate one.
+const DOMAINS = [
+  [0, 85.1], // grid coverage %
+  [-85.1, 47.6], // Δ coverage, pp — spans zero
+  [3.2, 3841.7], // street km
+  [0, 0.37], // sub-unit
+  [0, 100], // already whole
+  [5, 5], // one row, or every row at the same value
+];
+
+test("createHistogramSlider: the top of the data is REACHABLE at every step the ladder picks", () => {
+  // The defect this control was rebuilt around: a range input snaps its value
+  // DOWN to the last whole step, so a domain max that is not a whole number of
+  // steps above min leaves the high thumb resting just below the top of the
+  // data. Full span then never reads as "no filter", and the highest-valued
+  // rows silently drop out the moment the OTHER handle moves. The individual
+  // helpers are each pinned above; this is their COMPOSITION, which is where
+  // that bug actually lived.
+  for (const [min, max] of DOMAINS) {
+    const { rootEl, slider } = fakeSlider();
+    const domain = slider.setDomain({ min, max });
+    const at = `${min}–${max}`;
+
+    assert.ok(Number.isFinite(domain.step) && domain.step > 0, `${at}: step ${domain.step}`);
+    // Snapped OUTWARD, so the axis contains the data...
+    assert.ok(domain.min <= min, `${at}: floor ${domain.min} is above the data`);
+    assert.ok(domain.max >= max, `${at}: ceiling ${domain.max} is below the data`);
+    // ...on a whole number of steps, which is what makes BOTH ends reachable.
+    const steps = (domain.max - domain.min) / domain.step;
+    assert.ok(Math.abs(steps - Math.round(steps)) < 1e-9, `${at}: ${steps} steps`);
+    // ...and by at most one step, so the axis never runs far past the data.
+    assert.ok(min - domain.min < domain.step, `${at}: floor overshoots`);
+    if (max > min) assert.ok(domain.max - max < domain.step, `${at}: ceiling overshoots`);
+
+    // The attributes the browser actually snaps against say the same thing.
+    assert.equal(rootEl.els[".hist-lo"].min, String(domain.min), `${at}: lo min`);
+    assert.equal(rootEl.els[".hist-hi"].max, String(domain.max), `${at}: hi max`);
+    assert.equal(rootEl.els[".hist-hi"].step, String(domain.step), `${at}: hi step`);
+
+    // Full span is not a filter, at the SNAPPED ends as well as by omission.
+    slider.setValue({ min: domain.min, max: domain.max });
+    assert.deepEqual(slider.getValue(), { min: null, max: null }, `${at}: full span filters`);
+  }
+});
+
+test("createHistogramSlider: setDomain hands back the SNAPPED axis, not its argument", () => {
+  // The caller draws the bars over this while the component positions the
+  // thumbs and the fill over it, both across the same 100% width — so an echo
+  // of the raw extent here is exactly the two-axes bug (measured 1.05% of the
+  // track at the data max on a 0–85.1 coverage axis).
+  const { slider } = fakeSlider();
+  const raw = { min: 0, max: 85.1 };
+  const domain = slider.setDomain(raw);
+  assert.deepEqual(domain, { min: 0, max: 86, step: 1 });
+  assert.notEqual(domain.max, raw.max, "setDomain echoed the raw extent");
+  assert.deepEqual(slider.getDomain(), domain, "setDomain and getDomain disagree");
+});
+
+test("createHistogramSlider: a re-seeded axis re-normalizes the window it is holding", () => {
+  // What a scope change does when the chassis does NOT clear the window (the
+  // initial seed from the URL, where the field arrived with its window rather
+  // than having changed under it): a bound that no longer sits inside the new
+  // domain comes back clamped rather than filtering everything out.
+  const { slider } = fakeSlider();
+  slider.setDomain({ min: 0, max: 100 });
+  slider.setValue({ min: 80, max: 90 });
+  assert.deepEqual(slider.getValue(), { min: 80, max: 90 });
+
+  // Mapillary's coverage tops out far below GSV's.
+  const narrowed = slider.setDomain({ min: 0, max: 47.6 });
+  assert.ok(narrowed.max >= 47.6);
+  const value = slider.getValue();
+  assert.ok(
+    value.min <= narrowed.max && value.max == null,
+    `held ${JSON.stringify(value)} against ${JSON.stringify(narrowed)}`
+  );
+});
+
+test("createHistogramSlider: destroy() detaches every listener it attached", () => {
+  // The component outlives nothing today — one per filter, for the page's
+  // lifetime — so this is the API being kept honest rather than a live path.
+  const listeners = [];
+  const rootEl = fakeRoot();
+  for (const el of Object.values(rootEl.els)) {
+    el.addEventListener = (type, fn, opts) => listeners.push({ type, opts });
+  }
+  const slider = createHistogramSlider({ rootEl, filter: { label: "x" } });
+  assert.ok(listeners.length > 0, "nothing was wired");
+  // Every one goes through the shared `on`, so one abort takes them all.
+  const signals = new Set(listeners.map((l) => l.opts?.signal));
+  assert.equal(signals.size, 1, "listeners were attached with different signals");
+  const [signal] = signals;
+  assert.equal(signal.aborted, false);
+  slider.destroy();
+  assert.equal(signal.aborted, true);
 });
