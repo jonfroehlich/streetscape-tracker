@@ -178,6 +178,10 @@ function deltaCellHtml(value, { digits = 1, unit = "" } = {}) {
  * @param {string} spec.id - Group id; every member repeats it.
  * @param {string} spec.groupLabel
  * @param {string} spec.groupTitle
+ * @param {string[]} [spec.providers] - Which providers get a leaf, in order.
+ *   Defaults to the whole registry. Callers pass the providers actually
+ *   PRESENT IN THE PAYLOAD instead: a registered provider is not a collected
+ *   one, and a leaf for a provider with no rows is a column of em-dashes.
  * Every per-provider LEAF cell is a link into that provider's own series when
  * `linkFor` supplies one: a row is a city now, so its per-provider numbers are
  * the only place a reader can ask for one specific series, and making them
@@ -207,6 +211,7 @@ function providerColumnGroup({
   id,
   groupLabel,
   groupTitle,
+  providers = Object.keys(PROVIDERS),
   keyFor,
   cellFor,
   linkFor,
@@ -218,7 +223,7 @@ function providerColumnGroup({
   delta,
 }) {
   const group = { id, label: groupLabel, title: groupTitle };
-  const columns = Object.keys(PROVIDERS).map((provider) => {
+  const columns = providers.map((provider) => {
     const render = cellFor(provider);
     const link = linkFor?.(provider);
     return {

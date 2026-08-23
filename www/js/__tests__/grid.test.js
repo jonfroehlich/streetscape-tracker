@@ -41,6 +41,9 @@ const {
   pivotGridRows,
   gridRowHtml,
   gridDeltaPair,
+  buildGridColumns,
+  buildGridPresets,
+  buildGridFilters,
   GRID_COLUMNS,
   GRID_PRESETS,
   GRID_DEFAULT_SORT,
@@ -90,6 +93,34 @@ function payload(...cities) {
 
 function rowFor(raw, cityId) {
   return pivotGridRows(raw).rows.find((r) => r.cityId === cityId);
+}
+
+/**
+ * What the page would actually render for a payload: the row, plus the
+ * columns and filters built from the providers that payload CONTAINS.
+ *
+ * The module-level GRID_COLUMNS/GRID_FILTERS are the full-registry build —
+ * every provider the site knows about, collected or not — so asserting a
+ * payload's row model against them asks for keys the pivot deliberately does
+ * not build (issue #250 review).
+ */
+function buildFor(raw, cityId) {
+  const { rows, providers } = pivotGridRows(raw);
+  return {
+    providers,
+    row: rows.find((r) => r.cityId === cityId),
+    columns: buildGridColumns(providers),
+    filters: buildGridFilters(providers),
+  };
+}
+
+/** A payload carrying a run for every registered provider. */
+function fullRegistryPayload() {
+  return payload(
+    SEATTLE_GSV,
+    SEATTLE_MAPILLARY,
+    { ...SEATTLE_MAPILLARY, provider: "thirdparty", coverage_rate_percent: 99 }
+  );
 }
 
 // --- pivotGridRows ----------------------------------------------------------
@@ -229,10 +260,14 @@ test("pivotGridRows: an empty or missing payload yields no rows rather than thro
 
 test("every sortable column key exists on a row model", () => {
   // Guards the column/model seam: a sortable column with no matching model
-  // field would silently sort every row as null.
-  const row = rowFor(payload(SEATTLE_GSV, SEATTLE_MAPILLARY), "seattle--wa");
-  for (const col of GRID_COLUMNS.filter((c) => c.sortable !== false)) {
-    assert.ok(col.key in row, `row model is missing ${col.key}`);
+  // field would silently sort every row as null. Asserted against the build
+  // for the payload's OWN providers, and again against a payload carrying
+  // every registered one, so the seam holds narrowed and wide.
+  for (const raw of [payload(SEATTLE_GSV, SEATTLE_MAPILLARY), fullRegistryPayload()]) {
+    const { row, columns } = buildFor(raw, "seattle--wa");
+    for (const col of columns.filter((c) => c.sortable !== false)) {
+      assert.ok(col.key in row, `row model is missing ${col.key}`);
+    }
   }
   assert.ok(GRID_COLUMNS.some((c) => c.key === GRID_DEFAULT_SORT.key));
 });
@@ -400,15 +435,23 @@ test("gridRowHtml: city names are HTML-escaped (OSM data is publicly editable)",
 
 // --- GRID_FILTERS -----------------------------------------------------------
 
-test("GRID_FILTERS: 'Collected by' offers every registered provider plus the arity option", () => {
+test("GRID_FILTERS: 'Collected by' offers every COLLECTED provider plus the arity option", () => {
   // The arity option replaced the old "Multiple providers" checkbox: with the
   // pivot, "collected by 2+ providers" is exactly "this row's Δ columns are
   // populated", which is what the checkbox was really asking.
   const provider = GRID_FILTERS.find((f) => f.key === "provider");
   assert.equal(provider.label, "Collected by");
+  // The full-registry build offers all three...
   assert.deepEqual(
     provider.options.map((o) => o.value),
     ["gsv", "mapillary", "thirdparty", "multi"]
+  );
+  // ...but a payload that carries no thirdparty run does not, since choosing
+  // it would match no rows AND scope every slider onto an all-null field.
+  const { filters } = buildFor(payload(SEATTLE_GSV, SEATTLE_MAPILLARY), "seattle--wa");
+  assert.deepEqual(
+    filters.find((f) => f.key === "provider").options.map((o) => o.value),
+    ["gsv", "mapillary", "multi"]
   );
 
   const both = rowFor(payload(SEATTLE_GSV, SEATTLE_MAPILLARY), "seattle--wa");
@@ -418,6 +461,74 @@ test("GRID_FILTERS: 'Collected by' offers every registered provider plus the ari
   assert.ok(!provider.test(one, "mapillary"));
   assert.ok(provider.test(both, "multi"));
   assert.ok(!provider.test(one, "multi"));
+});
+
+test("a REGISTERED but uncollected provider gets no columns, presets or scope option", () => {
+  // The registry is not the payload (issue #250 review). KartaView is
+  // registered (#225/#251) and deliberately not a scheduler channel, so the
+  // published aggregate carries no KartaView city at all — fanning the leaves
+  // out over the registry put six em-dash columns on this page, three of them
+  // in the default preset, plus a "Collected by → KartaView" option matching
+  // zero rows. That select is also the numeric SCOPE, so choosing it pointed
+  // every slider at an all-null field, whose empty domain then falls back to
+  // the descriptor's min/max — an arbitrary 0–1 axis on the age filter.
+  const { columns, filters, providers } = buildFor(
+    payload(SEATTLE_GSV, SEATTLE_MAPILLARY),
+    "seattle--wa"
+  );
+  assert.deepEqual(providers, ["gsv", "mapillary"]);
+
+  assert.deepEqual(
+    columns.filter((c) => c.key.endsWith("_thirdparty")),
+    [],
+    "uncollected provider still has leaf columns"
+  );
+  for (const preset of buildGridPresets(columns)) {
+    for (const key of preset.columns) {
+      assert.ok(!key.endsWith("_thirdparty"), `preset ${preset.id} names ${key}`);
+    }
+  }
+  assert.ok(
+    !filters.find((f) => f.key === "provider").options.some((o) => o.value === "thirdparty"),
+    "uncollected provider is still offered as a scope"
+  );
+
+  // The fan-out itself is intact — collect that provider and the columns are
+  // there, with no edit here. That is the half this narrowing must not break.
+  assert.ok(GRID_COLUMNS.some((c) => c.key === "pct_thirdparty"));
+  const wide = buildFor(fullRegistryPayload(), "seattle--wa");
+  assert.deepEqual(wide.providers, ["gsv", "mapillary", "thirdparty"]);
+  assert.ok(wide.columns.some((c) => c.key === "pct_thirdparty"));
+  assert.ok(
+    wide.filters.find((f) => f.key === "provider").options.some((o) => o.value === "thirdparty")
+  );
+});
+
+test("the default preset's width tracks the COLLECTED providers, not the registry", () => {
+  // Why the narrowing is a layout fact and not just a tidiness one: the default
+  // view has to fit the page's content measure (1500px − the 280px sidebar)
+  // without scrolling sideways, and it carries three grouped metrics, so each
+  // extra provider is three more ~90px leaves.
+  const widthFor = (providers) => buildGridPresets(buildGridColumns(providers))[0].columns.length;
+  assert.equal(widthFor(["gsv", "mapillary", "thirdparty"]) - widthFor(["gsv", "mapillary"]), 3);
+});
+
+test("the Δ columns and the Δ filter go away when only one of the pair is collected", () => {
+  // Already true for an unregistered provider; the point here is that a
+  // REGISTERED one with nothing in this payload behaves the same way, rather
+  // than producing a column of em-dashes and a slider over an empty domain.
+  const { row, columns, filters } = buildFor(payload(BEND_GSV), "bend--or");
+  assert.equal(gridDeltaPair(["gsv"]), null);
+  assert.deepEqual(
+    columns.filter((c) => c.key.startsWith("delta")),
+    []
+  );
+  assert.ok(!filters.some((f) => f.key === "dcov"));
+  // Null, not missing: "no Δ here" is the same answer whether the pair is
+  // half-collected in this city or absent from the whole payload.
+  assert.equal(row.deltaPct, null);
+  assert.equal(row.deltaPctAny, null);
+  assert.equal(row.deltaMedianAge, null);
 });
 
 test("GRID_FILTERS: the old ?provider=gsv links still select the same rows", () => {
@@ -490,14 +601,21 @@ test("GRID_FILTERS: the Δ filter is NOT scoped — it is a question about the p
 
 test("every scoped field a filter can resolve to exists on a row model", () => {
   // The seam the scope introduces: a fieldFor that names a key the pivot does
-  // not build would filter every row out with nothing to see.
-  const row = rowFor(payload(SEATTLE_GSV, SEATTLE_MAPILLARY), "seattle--wa");
-  const scopes = [{}, { provider: "multi" }, ...Object.keys(global.PROVIDERS).map((p) => ({ provider: p }))];
-  for (const filter of GRID_FILTERS) {
-    if (!filter.fieldFor) continue;
-    for (const values of scopes) {
-      const field = filter.fieldFor(values);
-      assert.ok(field in row, `${filter.key} under ${JSON.stringify(values)} reads missing ${field}`);
+  // not build would filter every row out with nothing to see. The scopes worth
+  // asserting are the ones the select can actually OFFER — narrowed to the
+  // payload's providers — plus the two that name no single provider.
+  for (const raw of [payload(SEATTLE_GSV, SEATTLE_MAPILLARY), fullRegistryPayload()]) {
+    const { row, filters, providers } = buildFor(raw, "seattle--wa");
+    const scopes = [{}, { provider: "multi" }, ...providers.map((p) => ({ provider: p }))];
+    for (const filter of filters) {
+      if (!filter.fieldFor) continue;
+      for (const values of scopes) {
+        const field = filter.fieldFor(values);
+        assert.ok(
+          field in row,
+          `${filter.key} under ${JSON.stringify(values)} reads missing ${field}`
+        );
+      }
     }
   }
 });

@@ -47,6 +47,10 @@ const {
   walkChangeCellHtml,
   walkRowHtml,
   streetDeltaPair,
+  walkProvidersIn,
+  buildStreetColumns,
+  buildStreetPresets,
+  buildStreetFilters,
   updateStreetsCaption,
   STREET_COLUMNS,
   STREET_PRESETS,
@@ -166,6 +170,34 @@ const INDEX = indexCitiesByProvider(RAW_CITIES, ["gsv", "mapillary"]);
 
 function rowsFor(...walks) {
   return pivotStreetWalks(walks, INDEX);
+}
+
+/**
+ * What the page would actually render for a manifest: the rows, plus the
+ * columns and filters built from the providers those walks CONTAIN.
+ *
+ * The module-level STREET_COLUMNS/STREET_FILTERS are the full-registry build —
+ * every provider the site knows about, walked or not — so asserting a
+ * manifest's row model against them asks for keys the pivot deliberately does
+ * not build (issue #250 review).
+ */
+function buildFor(...walks) {
+  const providers = walkProvidersIn(walks);
+  return {
+    providers,
+    rows: pivotStreetWalks(walks, INDEX),
+    columns: buildStreetColumns(providers),
+    filters: buildStreetFilters(providers),
+  };
+}
+
+/** A walk for every registered provider, so the full-registry build applies. */
+function fullRegistryWalks() {
+  return [
+    SEATTLE_GSV_WALK,
+    SEATTLE_MAPILLARY_WALK,
+    { ...SEATTLE_MAPILLARY_WALK, provider: "thirdparty" },
+  ];
 }
 
 test("pivotStreetWalks: providers fold into one row; networks do NOT", () => {
@@ -326,9 +358,14 @@ test("sortRows: does not mutate its input", () => {
 // --- columns / presets / invariants ----------------------------------------
 
 test("every sortable column key exists on a row model", () => {
-  const row = rowsFor(SEATTLE_GSV_WALK, SEATTLE_MAPILLARY_WALK)[0];
-  for (const col of STREET_COLUMNS.filter((c) => c.sortable !== false)) {
-    assert.ok(col.key in row, `row model is missing ${col.key}`);
+  // Asserted against the build for the manifest's OWN providers, and again
+  // against a manifest carrying every registered one, so the column/model
+  // seam holds narrowed and wide.
+  for (const walks of [[SEATTLE_GSV_WALK, SEATTLE_MAPILLARY_WALK], fullRegistryWalks()]) {
+    const { rows, columns } = buildFor(...walks);
+    for (const col of columns.filter((c) => c.sortable !== false)) {
+      assert.ok(col.key in rows[0], `row model is missing ${col.key}`);
+    }
   }
   assert.ok(STREET_COLUMNS.some((c) => c.key === DEFAULT_SORT.key));
 });
@@ -357,6 +394,52 @@ test("every preset names only real columns", () => {
       assert.ok(keys.has(key), `preset ${preset.id} names unknown column ${key}`);
     }
   }
+});
+
+test("a REGISTERED but unwalked provider gets no columns, presets or scope option", () => {
+  // The registry is not the manifest (issue #250 review). KartaView is
+  // registered but has no road walk at ALL — `build_streetwalk_rows` is
+  // Mapillary-specific in three separate ways — so fanning the leaves out over
+  // the registry put nine em-dash columns on this page plus a scope option
+  // matching zero rows, which then pointed the sliders at an all-null field.
+  const { columns, filters, providers } = buildFor(SEATTLE_GSV_WALK, SEATTLE_MAPILLARY_WALK);
+  assert.deepEqual(providers, ["gsv", "mapillary"]);
+
+  assert.deepEqual(
+    columns.filter((c) => c.key.endsWith("_thirdparty")),
+    [],
+    "unwalked provider still has leaf columns"
+  );
+  for (const preset of buildStreetPresets(columns)) {
+    for (const key of preset.columns) {
+      assert.ok(!key.endsWith("_thirdparty"), `preset ${preset.id} names ${key}`);
+    }
+  }
+  assert.ok(
+    !filters.find((f) => f.key === "provider").options.some((o) => o.value === "thirdparty"),
+    "unwalked provider is still offered as a scope"
+  );
+
+  // The fan-out itself is intact — walk with that provider and the columns
+  // appear, with no edit here.
+  const wide = buildFor(...fullRegistryWalks());
+  assert.deepEqual(wide.providers, ["gsv", "mapillary", "thirdparty"]);
+  assert.ok(wide.columns.some((c) => c.key === "pct_thirdparty"));
+  assert.ok(
+    wide.filters.find((f) => f.key === "provider").options.some((o) => o.value === "thirdparty")
+  );
+});
+
+test("the Δ columns go away when only one of the pair has walked", () => {
+  const { rows, columns } = buildFor(SEATTLE_GSV_WALK);
+  assert.equal(streetDeltaPair(["gsv"]), null);
+  assert.deepEqual(
+    columns.filter((c) => c.key.startsWith("delta")),
+    []
+  );
+  // Null, not missing — same contract as the grid page.
+  assert.equal(rows[0].deltaPct, null);
+  assert.equal(rows[0].deltaPctAny, null);
 });
 
 test("the walk-to-walk change group has one column per provider and NO cross-provider Δ", () => {
@@ -678,13 +761,21 @@ test("STREET_FILTERS: 'Has Δ' follows the scope too — 'walked twice' needs a 
 });
 
 test("every scoped field a filter can resolve to exists on a row model", () => {
-  const row = rowsFor(SEATTLE_GSV_WALK, SEATTLE_MAPILLARY_WALK)[0];
-  const scopes = [{}, { provider: "multi" }, ...Object.keys(global.PROVIDERS).map((p) => ({ provider: p }))];
-  for (const filter of STREET_FILTERS) {
-    if (!filter.fieldFor) continue;
-    for (const values of scopes) {
-      const field = filter.fieldFor(values);
-      assert.ok(field in row, `${filter.key} under ${JSON.stringify(values)} reads missing ${field}`);
+  // The scopes worth asserting are the ones the select can actually OFFER —
+  // narrowed to the manifest's providers — plus the two that name no single
+  // provider.
+  for (const walks of [[SEATTLE_GSV_WALK, SEATTLE_MAPILLARY_WALK], fullRegistryWalks()]) {
+    const { rows, filters, providers } = buildFor(...walks);
+    const scopes = [{}, { provider: "multi" }, ...providers.map((p) => ({ provider: p }))];
+    for (const filter of filters) {
+      if (!filter.fieldFor) continue;
+      for (const values of scopes) {
+        const field = filter.fieldFor(values);
+        assert.ok(
+          field in rows[0],
+          `${filter.key} under ${JSON.stringify(values)} reads missing ${field}`
+        );
+      }
     }
   }
 });

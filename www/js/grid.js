@@ -26,7 +26,17 @@
  * table-controls.js: createTableControls.
  */
 
-/** Registry order, used everywhere a per-provider fan-out is generated. */
+/**
+ * Registry order — every provider the site KNOWS ABOUT.
+ *
+ * Not the same list as the one the table renders. A provider can be registered
+ * and publish nothing (KartaView is registered but deliberately not a
+ * scheduler channel, so essentially no city carries a KartaView run), and a
+ * leaf column, a preset entry or a scope option for such a provider is a
+ * column of em-dashes and a filter that selects no rows. `pivotGridRows`
+ * reports which providers the payload actually CONTAINS and the render path
+ * builds from that; this is the fallback for callers with no payload in hand.
+ */
 function gridProviders() {
   return Object.keys(PROVIDERS);
 }
@@ -44,14 +54,19 @@ function gridProviders() {
  * so a second pair means widening those keys and the URL vocabulary, not
  * appending here. A third provider still gets its own sub-columns in every
  * group automatically; it just gets no Δ until someone makes that choice.
- * Filtered by registry membership so a build missing either provider simply
- * has no Δ columns rather than columns of em-dashes.
+ * Filtered by COLLECTION, so a payload missing either provider simply has no Δ
+ * columns rather than columns of em-dashes.
  */
 const GRID_DELTA_PAIRS = [["mapillary", "gsv"]];
 
-/** The first delta pair both of whose providers are registered, or null. */
-function gridDeltaPair() {
-  return GRID_DELTA_PAIRS.find(([a, b]) => PROVIDERS[a] && PROVIDERS[b]) ?? null;
+/**
+ * The first delta pair both of whose providers are present, or null.
+ *
+ * @param {string[]} [providers] - Providers present in the payload.
+ * @returns {?string[]}
+ */
+function gridDeltaPair(providers = gridProviders()) {
+  return GRID_DELTA_PAIRS.find(([a, b]) => providers.includes(a) && providers.includes(b)) ?? null;
 }
 
 // ── Cells ─────────────────────────────────────────────────────
@@ -123,10 +138,13 @@ function gridLabelCellHtml(row) {
  * City/state/country names come from OSM/Nominatim (publicly editable
  * third-party data) — escape everything data-derived entering innerHTML.
  *
+ * @param {string[]} [providers] - Providers to give a leaf column, in order.
+ *   The render path passes the ones the payload actually contains; the default
+ *   is the whole registry, which is what a caller with no payload wants.
  * @returns {Object[]}
  */
-function buildGridColumns() {
-  const pair = gridDeltaPair();
+function buildGridColumns(providers = gridProviders()) {
+  const pair = gridDeltaPair(providers);
   const [ahead, behind] = pair ?? [];
   const pairNames = pair ? `${providerShortLabel(ahead)} − ${providerShortLabel(behind)}` : "";
 
@@ -140,6 +158,7 @@ function buildGridColumns() {
       cell: gridLabelCellHtml,
     },
     ...providerColumnGroup({
+      providers,
       id: "cov",
       groupLabel: "Grid coverage (%)",
       groupTitle: "Share of the city's grid sample points with a 360° panorama",
@@ -158,6 +177,7 @@ function buildGridColumns() {
       },
     }),
     ...providerColumnGroup({
+      providers,
       id: "covAny",
       groupLabel: "Any imagery (%)",
       groupTitle:
@@ -175,6 +195,7 @@ function buildGridColumns() {
       },
     }),
     ...providerColumnGroup({
+      providers,
       id: "age",
       groupLabel: "Median age (yrs)",
       groupTitle: "Median age of the city's panoramas at that provider's latest snapshot",
@@ -196,6 +217,7 @@ function buildGridColumns() {
     // Mapillary is a census of every 360° pano, so the two counts answer
     // different questions and their difference answers none.
     ...providerColumnGroup({
+      providers,
       id: "panos",
       groupLabel: "Panoramas (per provider — not comparable)",
       groupTitle:
@@ -253,6 +275,7 @@ function buildGridColumns() {
       cell: (r) => `<td>${r.areaKm2 == null ? "—" : `${formatCellNumber(r.areaKm2, 1)} km²`}</td>`,
     },
     ...providerColumnGroup({
+      providers,
       id: "collected",
       groupLabel: "Last collected",
       groupTitle: "Date of each provider's latest collection run — how fresh that series is",
@@ -266,6 +289,7 @@ function buildGridColumns() {
       initial: "desc",
     }),
     ...providerColumnGroup({
+      providers,
       id: "snapshots",
       groupLabel: "Snapshots",
       groupTitle:
@@ -278,132 +302,176 @@ function buildGridColumns() {
   ];
 }
 
+/**
+ * The full-registry build: what the page would render if every registered
+ * provider had published something. The static vocabulary — `?sort=` keys,
+ * `?cols=` names — is taken from here, and it is the default for callers that
+ * have no payload. What actually renders is built per payload in
+ * `renderGridRuns`, from the providers the payload contains.
+ */
 const GRID_COLUMNS = buildGridColumns();
 
-/** Every leaf key of one grouped metric, in table order. */
-function gridGroupKeys(id) {
-  return GRID_COLUMNS.filter((c) => c.group?.id === id).map((c) => c.key);
+/**
+ * Every leaf key of one grouped metric, in table order.
+ *
+ * @param {string} id - Group id.
+ * @param {Object[]} [columns] - The build to read; defaults to full-registry.
+ */
+function gridGroupKeys(id, columns = GRID_COLUMNS) {
+  return columns.filter((c) => c.group?.id === id).map((c) => c.key);
 }
 
 /**
  * Column presets. The first is the default and must fit the page's content
  * measure (1500px page − the 280px sidebar) without horizontal scrolling —
  * that is what these exist for.
+ *
+ * Built from a column list rather than fixed, so a preset naming a grouped
+ * metric lists exactly the leaves that were built — three providers' worth
+ * when three are collected, one when one is.
+ *
+ * @param {Object[]} [columns] - The build to draw leaf keys from.
+ * @returns {Object[]}
  */
-const GRID_PRESETS = [
-  {
-    id: "overview",
-    label: "Overview",
-    title: "The headline read: how much imagery a city has, how fresh it is, and who has more",
-    columns: [...gridGroupKeys("cov"), ...gridGroupKeys("age"), ...gridGroupKeys("collected")],
-  },
-  {
-    id: "compare",
-    label: "Compare providers",
-    title: "Every head-to-head metric at once, each with its signed difference",
-    columns: [...gridGroupKeys("cov"), ...gridGroupKeys("covAny"), ...gridGroupKeys("age")],
-  },
-  {
-    id: "grid",
-    label: "Grid geometry",
-    title: "What the percentage is a percentage OF (aggregate schema v3, issue #189)",
-    columns: [
-      ...gridGroupKeys("cov"),
-      "searchPoints",
-      "gridWidthM",
-      "gridStepM",
-      "areaKm2",
-    ],
-  },
-  {
-    id: "provenance",
-    label: "Provenance",
-    title: "When each series was collected, how many times, and how much it holds",
-    columns: [
-      ...gridGroupKeys("collected"),
-      ...gridGroupKeys("snapshots"),
-      ...gridGroupKeys("panos"),
-    ],
-  },
-];
+function buildGridPresets(columns = GRID_COLUMNS) {
+  const groupKeys = (id) => gridGroupKeys(id, columns);
+  return [
+    {
+      id: "overview",
+      label: "Overview",
+      title: "The headline read: how much imagery a city has, how fresh it is, and who has more",
+      columns: [...groupKeys("cov"), ...groupKeys("age"), ...groupKeys("collected")],
+    },
+    {
+      id: "compare",
+      label: "Compare providers",
+      title: "Every head-to-head metric at once, each with its signed difference",
+      columns: [...groupKeys("cov"), ...groupKeys("covAny"), ...groupKeys("age")],
+    },
+    {
+      id: "grid",
+      label: "Grid geometry",
+      title: "What the percentage is a percentage OF (aggregate schema v3, issue #189)",
+      columns: [
+        ...groupKeys("cov"),
+        "searchPoints",
+        "gridWidthM",
+        "gridStepM",
+        "areaKm2",
+      ],
+    },
+    {
+      id: "provenance",
+      label: "Provenance",
+      title: "When each series was collected, how many times, and how much it holds",
+      columns: [
+        ...groupKeys("collected"),
+        ...groupKeys("snapshots"),
+        ...groupKeys("panos"),
+      ],
+    },
+  ];
+}
 
-/** Filters offered in the sidebar. */
-const GRID_FILTERS = [
-  {
-    key: "provider",
-    // Renamed from "Provider" now that a row is a city rather than a series:
-    // the question is which providers collected THIS city, not which series
-    // this row is.
-    label: "Collected by",
-    type: "select",
-    anyLabel: "Any provider",
-    // One option per REGISTERED provider (issue #225), plus the arity option
-    // that replaced the old "Multiple providers" checkbox — with the pivot,
-    // "collected by 2+ providers" is exactly "this row's Δ columns are
-    // populated", which is what the checkbox was really asking.
-    options: Object.entries(PROVIDERS)
-      .map(([value, p]) => ({ value, label: p.label }))
-      .concat([{ value: SCOPE_MULTI, label: "2+ providers" }]),
-    // The `?provider=gsv` links from before the pivot keep working: the value
-    // vocabulary is unchanged apart from the addition.
-    test: (row, value) =>
-      value === SCOPE_MULTI ? row.providers.length > 1 : row.providers.includes(value),
-  },
-  // The numeric filters follow the scope above: pick a provider and they read
-  // THAT provider's column and say so; leave it on "any" and they read the
-  // best across a city's providers, with a label that spells the quantifier
-  // out. `field`/`label` are the unscoped defaults, used before the first
-  // resolve and by anything reading the descriptors statically.
-  {
-    key: "cov",
-    label: "Grid coverage %",
-    type: "histogram-range",
-    field: "pctBest",
-    min: 0,
-    max: 100,
-    unit: "%",
-    digits: 1,
-    ...scopedNumericFilter({
-      base: "pct",
-      bestField: "pctBest",
+/**
+ * Filters offered in the sidebar.
+ *
+ * @param {string[]} [providers] - Providers to offer as scopes, in order.
+ *   The render path passes the ones the payload contains; the default is the
+ *   whole registry.
+ * @returns {Object[]}
+ */
+function buildGridFilters(providers = gridProviders()) {
+  return [
+    {
+      key: "provider",
+      // Renamed from "Provider" now that a row is a city rather than a series:
+      // the question is which providers collected THIS city, not which series
+      // this row is.
+      label: "Collected by",
+      type: "select",
+      anyLabel: "Any provider",
+      // One option per COLLECTED provider, plus the arity option that replaced
+      // the old "Multiple providers" checkbox — with the pivot, "collected by
+      // 2+ providers" is exactly "this row's Δ columns are populated", which is
+      // what the checkbox was really asking.
+      //
+      // Collected rather than registered (issue #225 registered KartaView but
+      // deliberately did not schedule it): an option matching zero rows is bad
+      // enough on its own, but this select is also a SCOPE, so choosing it
+      // would point every numeric slider at an all-null field — and an empty
+      // domain falls back to the descriptor's `min`/`max`, i.e. an arbitrary
+      // 0–1 axis on the age filter. A stale `?provider=` naming an uncollected
+      // provider is simply not in `options`, and parseTableState drops a value
+      // that no option offers, so such a link degrades to unscoped.
+      options: providers
+        .map((value) => ({ value, label: PROVIDERS[value].label }))
+        .concat([{ value: SCOPE_MULTI, label: "2+ providers" }]),
+      // The `?provider=gsv` links from before the pivot keep working: the value
+      // vocabulary is unchanged apart from the addition.
+      test: (row, value) =>
+        value === SCOPE_MULTI ? row.providers.length > 1 : row.providers.includes(value),
+    },
+    // The numeric filters follow the scope above: pick a provider and they read
+    // THAT provider's column and say so; leave it on "any" and they read the
+    // best across a city's providers, with a label that spells the quantifier
+    // out. `field`/`label` are the unscoped defaults, used before the first
+    // resolve and by anything reading the descriptors statically.
+    {
+      key: "cov",
       label: "Grid coverage %",
-      anyLabel: "any provider reaches",
-    }),
-  },
-  {
-    key: "age",
-    label: "Median age (yrs)",
-    type: "histogram-range",
-    field: "medianAgeBest",
-    min: 0,
-    unit: " yrs",
-    digits: 1,
-    ...scopedNumericFilter({
-      base: "medianAge",
-      bestField: "medianAgeBest",
+      type: "histogram-range",
+      field: "pctBest",
+      min: 0,
+      max: 100,
+      unit: "%",
+      digits: 1,
+      ...scopedNumericFilter({
+        base: "pct",
+        bestField: "pctBest",
+        label: "Grid coverage %",
+        anyLabel: "any provider reaches",
+      }),
+    },
+    {
+      key: "age",
       label: "Median age (yrs)",
-      // Unscoped, "best" is the MINIMUM — the freshest imagery any provider
-      // has — so the quantifier has to be named rather than left as "best".
-      anyLabel: "freshest of any",
-    }),
-  },
-  // The head-to-head brush, and the reason the pivot exists: "show me the
-  // cities where Mapillary is ahead by 20 points or more". Deliberately NOT
-  // scoped: a difference is a question about the pair, so there is no single
-  // provider whose column it could read instead.
-  ...(gridDeltaPair()
-    ? [
-        {
-          key: "dcov",
-          label: "Δ coverage (pp)",
-          type: "histogram-range",
-          field: "deltaPct",
-          unit: " pp",
-          digits: 1,
-        },
-      ]
-    : []),
-];
+      type: "histogram-range",
+      field: "medianAgeBest",
+      min: 0,
+      unit: " yrs",
+      digits: 1,
+      ...scopedNumericFilter({
+        base: "medianAge",
+        bestField: "medianAgeBest",
+        label: "Median age (yrs)",
+        // Unscoped, "best" is the MINIMUM — the freshest imagery any provider
+        // has — so the quantifier has to be named rather than left as "best".
+        anyLabel: "freshest of any",
+      }),
+    },
+    // The head-to-head brush, and the reason the pivot exists: "show me the
+    // cities where Mapillary is ahead by 20 points or more". Deliberately NOT
+    // scoped: a difference is a question about the pair, so there is no single
+    // provider whose column it could read instead.
+    ...(gridDeltaPair(providers)
+      ? [
+          {
+            key: "dcov",
+            label: "Δ coverage (pp)",
+            type: "histogram-range",
+            field: "deltaPct",
+            unit: " pp",
+            digits: 1,
+          },
+        ]
+      : []),
+  ];
+}
+
+/** The full-registry builds, for the static vocabulary and for the tests. */
+const GRID_PRESETS = buildGridPresets();
+const GRID_FILTERS = buildGridFilters();
 
 /** Row fields the free-text search box looks at. */
 const GRID_SEARCH_FIELDS = ["label", "cityId", "providersLabel"];
@@ -424,9 +492,16 @@ function deltaOf(a, b) {
   return a == null || b == null ? null : a - b;
 }
 
-/** The best (max, or min when `lowest`) of a row's per-provider values. */
-function bestAcrossProviders(row, keyFor, lowest = false) {
-  const values = gridProviders()
+/**
+ * The best (max, or min when `lowest`) of a row's per-provider values.
+ *
+ * @param {Object} row
+ * @param {string[]} providers - Providers present in the payload.
+ * @param {(provider: string) => string} keyFor
+ * @param {boolean} [lowest] - Take the minimum instead.
+ */
+function bestAcrossProviders(row, providers, keyFor, lowest = false) {
+  const values = providers
     .map((p) => row[keyFor(p)])
     .filter((v) => typeof v === "number" && Number.isFinite(v));
   if (values.length === 0) return null;
@@ -441,25 +516,37 @@ function bestAcrossProviders(row, keyFor, lowest = false) {
  * adapting for, so intersecting would silently hide every single-provider
  * city — which is most of them.
  *
- * Per-provider keys are generated from the registry (`pct_gsv`,
+ * Per-provider keys are generated from the COLLECTED providers (`pct_gsv`,
  * `pct_mapillary`, …) so the row model and the columns fan out from one list.
- * Frozen-grid geometry is a CITY property shared by every provider — that is
- * what makes their coverage rates comparable in the first place — so it
- * collapses to a single field, taken from the first provider that reports it.
+ * A registered provider that this payload carries no cities for is dropped
+ * from that list and gets no keys, which is what keeps the columns, the
+ * presets and the scope options free of a provider with nothing to show — see
+ * `gridProviders`. Frozen-grid geometry is a CITY property shared by every
+ * provider — that is what makes their coverage rates comparable in the first
+ * place — so it collapses to a single field, taken from the first provider
+ * that reports it.
  *
  * @param {?Object} rawCities - Parsed cities.json.gz, or null.
- * @returns {{rows: Object[], generatedAt: ?string}}
+ * @returns {{rows: Object[], generatedAt: ?string, providers: string[]}}
+ *   `providers` is registry order, narrowed to those the payload contains.
  */
 function pivotGridRows(rawCities) {
   const byCity = new Map();
   let generatedAt = null;
 
+  // One adaptation pass per provider: a v3 record holds an independent run
+  // series per provider, so each pass yields that provider's cities only.
+  // Adapt first and build rows second, so the collected set is known before
+  // any row is shaped — a provider is "collected" iff it yielded a city.
+  const adapted = [];
   for (const provider of gridProviders()) {
-    // One adaptation pass per provider: a v3 record holds an independent run
-    // series per provider, so each pass yields that provider's cities only.
     const { meta, cities } = adaptCitiesPayload(rawCities, provider);
     generatedAt ??= meta.generatedAt;
+    if (cities.length > 0) adapted.push([provider, cities]);
+  }
+  const providers = adapted.map(([provider]) => provider);
 
+  for (const [provider, cities] of adapted) {
     for (const city of cities) {
       const cityId = city.city_id ?? "";
       let row = byCity.get(cityId);
@@ -470,6 +557,12 @@ function pivotGridRows(rawCities) {
           providers: [],
           providersLabel: "",
           providerCount: 0,
+          // The Δ keys always exist, so "this payload has no Δ pair" reads as
+          // null rather than as a missing field — the same null-unless-both
+          // contract, extended to "the pair was not collected here at all".
+          deltaPct: null,
+          deltaPctAny: null,
+          deltaMedianAge: null,
           searchPoints: null,
           gridWidthM: null,
           gridStepM: null,
@@ -477,7 +570,7 @@ function pivotGridRows(rawCities) {
           areaKm2: null,
           filename: null,
         };
-        for (const p of gridProviders()) {
+        for (const p of providers) {
           row[`pct_${p}`] = null;
           row[`pctAny_${p}`] = null;
           row[`medianAge_${p}`] = null;
@@ -519,7 +612,7 @@ function pivotGridRows(rawCities) {
     }
   }
 
-  const pair = gridDeltaPair();
+  const pair = gridDeltaPair(providers);
   const rows = [...byCity.values()];
   for (const row of rows) {
     row.providerCount = row.providers.length;
@@ -530,11 +623,11 @@ function pivotGridRows(rawCities) {
       row.deltaPctAny = deltaOf(row[`pctAny_${a}`], row[`pctAny_${b}`]);
       row.deltaMedianAge = deltaOf(row[`medianAge_${a}`], row[`medianAge_${b}`]);
     }
-    row.pctBest = bestAcrossProviders(row, (p) => `pct_${p}`);
+    row.pctBest = bestAcrossProviders(row, providers, (p) => `pct_${p}`);
     // The freshest, i.e. the MINIMUM age — "best" here is the small number.
-    row.medianAgeBest = bestAcrossProviders(row, (p) => `medianAge_${p}`, true);
+    row.medianAgeBest = bestAcrossProviders(row, providers, (p) => `medianAge_${p}`, true);
   }
-  return { rows, generatedAt };
+  return { rows, generatedAt, providers };
 }
 
 /**
@@ -562,15 +655,21 @@ function renderGridRuns(rawCities) {
   const statusEl = document.getElementById("grid-status");
   const wrapEl = document.getElementById("grid-table-wrap");
 
-  const { rows, generatedAt } = pivotGridRows(rawCities);
+  const { rows, generatedAt, providers } = pivotGridRows(rawCities);
 
   if (rows.length === 0) {
     statusEl.textContent = "No city collections have been published yet.";
     return;
   }
 
+  // Built from the providers THIS payload carries, not from the registry: a
+  // registered-but-uncollected provider would otherwise contribute a leaf to
+  // every metric group (six more columns and three more default-preset ones
+  // for KartaView alone), all of them em-dashes, plus a scope option that
+  // matches no rows and points every slider at an all-null field.
+  const columns = buildGridColumns(providers);
   gridTable ??= createSortableTable({
-    columns: GRID_COLUMNS,
+    columns,
     defaultSort: GRID_DEFAULT_SORT,
     theadEl: document.getElementById("grid-thead"),
     tbodyEl: document.getElementById("grid-tbody"),
@@ -578,9 +677,9 @@ function renderGridRuns(rawCities) {
   gridControls ??= createTableControls({
     rootEl: document.getElementById("grid-controls"),
     table: gridTable,
-    columns: GRID_COLUMNS,
-    presets: GRID_PRESETS,
-    filters: GRID_FILTERS,
+    columns,
+    presets: buildGridPresets(columns),
+    filters: buildGridFilters(providers),
     searchFields: GRID_SEARCH_FIELDS,
     // The sidebar carries per-filter histograms on fixed axes; a second
     // histogram of whichever column happens to be sorted would be a different
@@ -642,7 +741,10 @@ if (typeof module !== "undefined" && module.exports) {
     pivotGridRows,
     gridRowHtml,
     gridDeltaPair,
+    gridProviders,
     buildGridColumns,
+    buildGridPresets,
+    buildGridFilters,
     renderGridRuns,
     updateGridCaption,
     GRID_COLUMNS,
