@@ -785,6 +785,29 @@ def test_calibration_cost_is_bounded_at_the_production_retry_budget(monkeypatch)
     assert error.api_requests == len(calls)
 
 
+def test_the_budget_bounds_calibration_too(monkeypatch):
+    """
+    The runaway guard was asked everywhere a request is issued EXCEPT the
+    calibration ladder, which runs before the sweep proper -- so max_requests=3
+    could spend up to 30 requests before the first root was ever asked, in the
+    very parameter the scheduler uses to hand a channel the night's remaining
+    budget. The stop must not read as "no radius answers here" either: that
+    message blames the city for a budget the operator set.
+    """
+    error, calls = _failed_sweep(
+        monkeypatch,
+        lambda call: (_ for _ in ()).throw(kv.BackpressureError("apiCode 690")),
+        radius_m=None,
+        calibration_probes=kv.DEFAULT_CALIBRATION_PROBES,
+        max_requests=3,
+    )
+    assert len(calls) == 3, "the ladder must honour the runaway guard"
+    assert "calibration" in str(error)
+    assert "no radius" not in str(error)
+    assert not isinstance(error, kv.SweepIncompleteError), "there is nothing to resume"
+    assert error.api_requests == 3
+
+
 def test_calibration_refuses_to_run_with_no_probes():
     """
     0 is the natural spelling of "don't calibrate" and it failed OPEN:

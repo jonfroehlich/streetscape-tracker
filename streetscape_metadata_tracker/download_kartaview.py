@@ -105,6 +105,7 @@ import logging
 import math
 import os
 import shutil
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -1153,6 +1154,7 @@ async def calibrate_radius(
     probes_per_rung: int,
     retries: int,
     timeout: aiohttp.ClientTimeout | None = None,
+    budget_exhausted: Callable[[], bool] | None = None,
 ) -> int | None:
     """
     Find the largest radius this city's server will actually answer.
@@ -1194,6 +1196,13 @@ async def calibrate_radius(
             FIRST probe rather than after the ladder -- a dead token answers
             identically at every rung, so the remaining probes could only
             re-learn it -- and its message sends the operator to the .env.
+        DownloadError: ``budget_exhausted`` (the sweep's ``max_requests``
+            guard, asked before every probe) returned True. Raised rather
+            than returned as None, because None means "no rung answers in
+            this bbox" and both the log line and the caller's refusal would
+            blame the city for a budget the operator set. Nothing is swept
+            and nothing is checkpointed at this point, so the message says
+            so instead of pointing at a resume.
         ResponseError: the server gave a definite, unusable non-credential
             answer at every probe (an unparseable body, an HTTP error that is
             neither backpressure nor transport). Surfaced as itself rather
@@ -1207,6 +1216,16 @@ async def calibrate_radius(
     for radius in RADIUS_LADDER_M:
         answered = 0
         for lat, lon in points:
+            if budget_exhausted is not None and budget_exhausted():
+                # The ladder is fixed overhead the runaway guard used to skip:
+                # max_requests=3 spent up to 30 requests here before the first
+                # root was ever asked, in the parameter the scheduler uses to
+                # hand a channel the night's REMAINING budget.
+                raise DownloadError(
+                    f"The request budget ran out during radius calibration "
+                    f"(while probing r={radius} m); nothing was swept and nothing is "
+                    f"checkpointed -- re-run with a larger budget"
+                )
             _, _, outcome = await _probe_cell(
                 session,
                 limiter,
@@ -2284,6 +2303,7 @@ async def _fetch_city_images(
                     probes_per_rung=calibration_probes,
                     retries=retries,
                     timeout=timeout,
+                    budget_exhausted=over_budget,
                 )
             if radius_m is None:
                 # NOT a host condition, deliberately. A host block shows up as a
