@@ -2935,7 +2935,7 @@ def cmd_run_due(
     # is a config value and `api_usage` is a daily total, so "we spent too much"
     # and "we spent too long" are indistinguishable after the fact. The summary is
     # what the [alerts] email carries, so this is where an operator can read it
-    # off. See the falsifier in CLAUDE.md's Mapillary budget section.
+    # off. See the falsifier in docs/provider-access.md's Mapillary budget section.
     elapsed_h = (time.monotonic() - batch_started) / 3600.0
     summary = (
         f"run-due {today}{filter_note}: {succeeded}/{attempted} runs succeeded across "
