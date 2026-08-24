@@ -26,10 +26,11 @@ source .venv/bin/activate          # standard venv, deps in requirements.txt
 pip install -r requirements.txt
 pytest                             # run the test suite (fast, no network)
 
-# Collect dated snapshots of a city — BOTH providers by default, same run
-# date (per-provider skip if a run <80 days old exists)
+# Collect dated snapshots of a city — gsv,mapillary by default (NOT kartaview),
+# same run date (per-provider skip if a run <80 days old exists)
 python streetscape_tracker.py "Seattle, WA"
-python streetscape_tracker.py "Seattle, WA" --provider mapillary   # restrict to one provider
+python streetscape_tracker.py "Seattle, WA" --provider mapillary        # restrict to one provider
+python streetscape_tracker.py "Seattle, WA" --provider all             # every KNOWN_PROVIDER; needs all 3 keys
 python streetscape_tracker.py "Seattle, WA" --force --run-date 2026-07-02
 python streetscape_tracker.py "Seattle, WA" --check-boundary   # preview search area only
 
@@ -120,7 +121,7 @@ python -m streetscape_street_analyzer.collect "Seattle, WA" --network-type all_p
 ./sync_data_to_server.sh --dry-run
 ```
 
-Credentials in `.env`, loaded by `streetscape_metadata_tracker/config.py` per provider: `GMAPS_API_KEY` (Street View Static API enabled) for gsv, `MAPILLARY_ACCESS_TOKEN` (free client token) for mapillary. The default `--provider both` requires both keys up-front (fail-fast so the series can't drift); a single-provider run needs only its own key. A third provider adds `KARTAVIEW_ACCESS_TOKEN` for kartaview — **required rather than optional**, because KartaView's anonymous tier is 100 requests/hour against 1,000 authenticated, and at 100/h a p95 city is hours and Singapore is days: it is not a slower channel, it is no channel. Two further channels isolate street-coverage *collection* (issue #99) — `GMAPS_STREETS_API_KEY` / `MAPILLARY_STREETS_ACCESS_TOKEN`, separate keys so street experiments can't exhaust the production collectors' quotas, metered under their own `api_usage` provider strings (`gsv_streets` / `mapillary_streets`). `GMAPS_STREETS_API_KEY`/`gsv_streets` is now live — the road-walk collector (below) reads it; `mapillary_streets` stays dormant. Scheduler config lives in `config/scheduler.toml` (stdlib `tomllib`, Python ≥3.11).
+Credentials in `.env`, loaded by `streetscape_metadata_tracker/config.py` per provider: `GMAPS_API_KEY` (Street View Static API enabled) for gsv, `MAPILLARY_ACCESS_TOKEN` (free client token) for mapillary. `--provider` is a comma-separated channel LIST defaulting to the stated `gsv,mapillary` — never a keyword whose meaning drifts with the provider count (issue #247; the retired `both` still works, with a notice) — and it requires EVERY named provider's key up-front, `--provider all` included (fail-fast so the series can't drift); a single-provider run needs only its own key. A third provider adds `KARTAVIEW_ACCESS_TOKEN` for kartaview — **required rather than optional**, because KartaView's anonymous tier is 100 requests/hour against 1,000 authenticated, and at 100/h a p95 city is hours and Singapore is days: it is not a slower channel, it is no channel. Two further channels isolate street-coverage *collection* (issue #99) — `GMAPS_STREETS_API_KEY` / `MAPILLARY_STREETS_ACCESS_TOKEN`, separate keys so street experiments can't exhaust the production collectors' quotas, metered under their own `api_usage` provider strings (`gsv_streets` / `mapillary_streets`). `GMAPS_STREETS_API_KEY`/`gsv_streets` is now live — the road-walk collector (below) reads it; `mapillary_streets` stays dormant. Scheduler config lives in `config/scheduler.toml` (stdlib `tomllib`, Python ≥3.11).
 
 ## Architecture
 
