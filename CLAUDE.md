@@ -275,6 +275,13 @@ Mapillary attribution is required by their ToS.
 — downloader tests substitute an in-memory fetch primitive rather than mocking HTTP, and autouse fixtures neutralize pacing, the host lock, the Overpass probe and the backup directory suite-wide so the suite can run during a live nightly batch.
 That file records **what each test pins and why**, which is what makes a failing test readable as a contract rather than a puzzle; add to it when you add a test — to the section your test belongs to, so two PRs adding tests to different subsystems do not collide.
 
+**Write every markdown file with semantic line breaks — one sentence, or one independent clause, per line.**
+git merges line by line, so a paragraph written as one long line conflicts every time two branches touch it, however unrelated the two edits;
+`docs/testing.md` accumulated three near-duplicate copies of one paragraph that way, because nobody could see the copy already there (issue #254).
+Markdown joins consecutive lines back into one paragraph, so this changes nothing that renders.
+`test_no_prose_line_is_long_enough_to_be_unmergeable` refuses any prose line over 700 chars in a tracked `.md` file;
+keep any list a doc enumerates **alphabetical**, so two branches adding an entry usually insert at different offsets and merge rather than collide.
+
 ## Notes
 
 - **Every measured question gets a writeup in `docs/experiments/`, however small** — including negative, inconclusive and abandoned ones, and including a one-afternoon analysis over data already on disk.

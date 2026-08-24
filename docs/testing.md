@@ -11,6 +11,19 @@ here for the evidence, the incident history and the details — keep the two in 
 
 `tests/`, pytest. No real network; the downloader tests substitute an in-memory fetch primitive rather than mocking HTTP.
 
+## The CLAUDE.md router (issues #252 and #254)
+
+`tests/test_claude_md_router.py`. The router split shipped two defects of its own, and the
+convention it preserved shipped a third, so each of these corresponds to something that has
+already gone wrong once:
+
+- `CLAUDE.md` staying under Claude Code's 150,000-char limit — it reached 182,499 by growing about a paragraph per PR, which is structural rather than a one-off, so this fails while there is still room to act rather than after the file has silently truncated
+- Every `docs/` link in the router resolving (it named `docs/experiments/README.md` for months before that file was written) and every split-out doc being named by the router, so nothing is left with no way in
+- The router and `docs/experiments/README.md` naming the same writeups **and naming them in the same alphabetical order** — they shipped out of sync on the split's first commit, and the order is not cosmetic: appending guarantees an adjacent-add conflict where alphabetical insertion usually lands two branches at different offsets
+- No doc writing a long option with an underscore, anchored so a slug like `saskatoon--sk_...` is not read as one; the split introduced an underscored spelling of `--network-type` into the file every session reads
+- No prose line over 700 chars in any tracked `.md` file, fenced code and table rows exempt (issue #254) — above the measured 595-char maximum with room, and far below the paragraph-as-one-line shape it exists to refuse. The convention is not self-enforcing otherwise: the next paragraph appended as one long line reads fine, renders fine, and quietly restores the hotspot
+- Every SHA in `.git-blame-ignore-revs` still being an ancestor of `HEAD`. A rebase or squash rewrites the commit a formatting entry names, and the stale entry then does nothing at all — `git blame` ignores an unknown rev in silence. This has already happened once, rebasing #254 onto main
+
 ## Naming, catalog, diffs and JSON
 
 - Pure-logic tests for naming, db (incl. the v1→v2 migration against embedded v1 SQL), diff, JSON v2/aggregate v3
