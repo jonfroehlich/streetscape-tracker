@@ -9,7 +9,9 @@ import os
 import re
 import signal
 import subprocess
+import threading
 import time
+from collections import Counter
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -142,6 +144,7 @@ def _stub_collection(
       whether a capped run pauses after its last city.
     """
     outcome = outcome or (lambda city, provider: True)
+    conn_ = conn
 
     def fake_run(
         cfg,
@@ -152,9 +155,15 @@ def _stub_collection(
         daily_budget=0,
         conn=None,
         remaining_s=None,
+        **_,
     ):
+        # The fixture connection from the CLOSURE, not the `conn` parameter: the
+        # scheduler hands a lane worker `conn=None` on purpose, because
+        # db.connect opens the catalog check_same_thread=True and only the main
+        # thread may touch it (issue #240). The ledger write this fake stands in
+        # for really is the child's own, and the child has its own handle.
         if record_usage:
-            db.add_api_usage(conn, run_today, sched.estimate_requests(city, provider), provider)
+            db.add_api_usage(conn_, run_today, sched.estimate_requests(city, provider), provider)
         ran.append((city.city_id, provider))
         return outcome(city, provider)
 
@@ -601,6 +610,15 @@ def test_makelab1_production_config_is_wired():
     # in step deliberately, which is what this assertion is for.
     cfg = load_scheduler_config(os.path.join(_PROJECT_ROOT, "config", "scheduler.makelab1.toml"))
     assert cfg.enabled_providers() == ["gsv", "gsv_streets", "mapillary", "mapillary_streets"]
+    # Channel concurrency is OFF in production until both of #240's deploy gates
+    # clear: resume for the Mapillary tile census (#256), because a stop now kills
+    # N children at once and a killed census re-spends tiles into a per-IP ceiling
+    # we have already been blocked by twice; and a console check that the two GSV
+    # keys live in separate Cloud projects, since neither channel holds a per-IP
+    # lock. Pinned here rather than left implicit so raising it is a deliberate
+    # edit to this test and this file together — the same reason the Mapillary
+    # budgets above are pinned exactly.
+    assert cfg.max_concurrent_channels == 1
     # The street channels must keep their ISOLATED budgets: metered under their
     # own api_usage provider strings against separate keys, so a road crawl can
     # never eat the grid collectors' quota.
@@ -1410,7 +1428,7 @@ def test_run_due_refreshes_the_manifest_only_after_a_success(conn, monkeypatch):
     monkeypatch.setattr(
         sched,
         "_run_one_city",
-        lambda cfg, city, today, provider="gsv", connection_limit=None, daily_budget=0, conn=None, remaining_s=None: (
+        lambda cfg, city, today, provider="gsv", connection_limit=None, daily_budget=0, conn=None, remaining_s=None, **_: (
             False
         ),
     )
@@ -1421,7 +1439,7 @@ def test_run_due_refreshes_the_manifest_only_after_a_success(conn, monkeypatch):
     monkeypatch.setattr(
         sched,
         "_run_one_city",
-        lambda cfg, city, today, provider="gsv", connection_limit=None, daily_budget=0, conn=None, remaining_s=None: (
+        lambda cfg, city, today, provider="gsv", connection_limit=None, daily_budget=0, conn=None, remaining_s=None, **_: (
             True
         ),
     )
@@ -1874,7 +1892,7 @@ def test_street_dispatch_passes_the_full_budget_not_the_remainder(conn, monkeypa
     monkeypatch.setattr(
         sched,
         "_run_one_city",
-        lambda cfg, city, today, provider="gsv", connection_limit=None, daily_budget=0, conn=None, remaining_s=None: (
+        lambda cfg, city, today, provider="gsv", connection_limit=None, daily_budget=0, conn=None, remaining_s=None, **_: (
             seen.setdefault(provider, daily_budget) is not None or True
         ),
     )
@@ -2250,7 +2268,7 @@ def test_run_due_salvages_a_finished_walk_instead_of_recording_failure(conn, mon
     monkeypatch.setattr(
         sched,
         "_run_one_city",
-        lambda cfg, city, today, provider="gsv", connection_limit=None, daily_budget=0, conn=None, remaining_s=None: (
+        lambda cfg, city, today, provider="gsv", connection_limit=None, daily_budget=0, conn=None, remaining_s=None, **_: (
             False
         ),
     )
@@ -2330,7 +2348,7 @@ def test_street_channel_failure_is_not_reconciled_as_an_orphan_run(conn, monkeyp
     monkeypatch.setattr(
         sched,
         "_run_one_city",
-        lambda cfg, city, today, provider="gsv", connection_limit=None, daily_budget=0, conn=None, remaining_s=None: (
+        lambda cfg, city, today, provider="gsv", connection_limit=None, daily_budget=0, conn=None, remaining_s=None, **_: (
             False
         ),
     )
@@ -2421,6 +2439,38 @@ def _stub_tail(monkeypatch, sched, conn, published):
     )
 
 
+class _WorkClock:
+    """A fake ``time.monotonic`` that advances when WORK happens, not when read.
+
+    The obvious spelling — an iterator stepping on every read — makes the
+    batch's elapsed time a function of how many times the scheduler happens to
+    call ``time.monotonic()``, which is not a contract anyone signed up to
+    keep. #240 moved those reads (the deadline is now priced once per LAUNCHED
+    channel rather than once per channel considered), and a read-counting clock
+    would have failed for that reason alone while the deadline itself behaved
+    perfectly.
+
+    Advancing inside the fake collection instead ties the clock to the thing the
+    deadline is actually about — time spent collecting — so these tests keep
+    meaning what they say the next time a read moves.
+
+    Never combine one with ``max_concurrent_channels > 1`` unless a single
+    thread owns every advance: with real lanes the workers run concurrently and
+    a hand-advanced clock stops being deterministic. The lane tests that do need
+    a clock advance it from the launch path, which is main-thread by design.
+    """
+
+    def __init__(self, per_unit_s: float = 3600.0):
+        self.t = 0.0
+        self.per_unit_s = per_unit_s
+
+    def __call__(self) -> float:
+        return self.t
+
+    def work(self, units: float = 1.0) -> None:
+        self.t += self.per_unit_s * units
+
+
 def test_batch_deadline_stops_the_loop_but_still_publishes(conn, monkeypatch):
     """The whole point of the deadline: a night that runs long stops STARTING
     cities and still regenerates + publishes. Before this, systemd's
@@ -2435,12 +2485,12 @@ def test_batch_deadline_stops_the_loop_but_still_publishes(conn, monkeypatch):
     conn.commit()
 
     ran, published = [], []
-    # Each city "takes" an hour of the batch's wall clock.
-    clock = iter(range(0, 100_000, 3600))
-    monkeypatch.setattr(sched.time, "monotonic", lambda: next(clock))
+    clock = _WorkClock()
+    monkeypatch.setattr(sched.time, "monotonic", clock)
 
     def fake_run(cfg, city, today, provider="gsv", **kwargs):
         ran.append(city.city_id)
+        clock.work()  # each city "takes" an hour of the batch's wall clock
         return True
 
     monkeypatch.setattr(sched, "_run_one_city", fake_run)
@@ -2495,11 +2545,14 @@ def test_sigterm_winds_the_batch_down_instead_of_killing_the_publish(conn, monke
 
 # ── SIGTERM reaches a city's CHANNELS, not just its boundary (issue #206) ────
 #
-# None of these stub time.monotonic, deliberately. _run_city_channels reads the
-# clock once per CHANNEL, so the hour-per-call iterator used by the deadline test
-# above would blow the batch deadline inside the first city and stop the loop for
-# the wrong reason — the test would pass while asserting nothing about SIGTERM.
-# max_batch_hours defaults to 10 h against the real clock, which is ample.
+# None of these stub time.monotonic, deliberately. The rule, restated after #240
+# moved the reads: stub the clock only with a work-advanced one (_WorkClock
+# above), never with anything that steps on a read, and never at all in a test
+# that runs more than one lane. _run_city_channels reads the clock once per
+# LAUNCHED channel, so a per-read iterator would blow the batch deadline inside
+# the first city and stop the loop for the wrong reason — the test would pass
+# while asserting nothing about SIGTERM. max_batch_hours defaults to 10 h
+# against the real clock, which is ample.
 
 
 def _sigterm_cfg(**overrides):
@@ -3958,7 +4011,7 @@ def _run_loop_with(monkeypatch, conn, cfg, run_one, today=date(2026, 7, 2)):
     monkeypatch.setattr(
         sched,
         "_run_one_city",
-        lambda cfg, city, today, provider="gsv", connection_limit=None, daily_budget=0, conn=None, remaining_s=None: (
+        lambda cfg, city, today, provider="gsv", connection_limit=None, daily_budget=0, conn=None, remaining_s=None, **_: (
             run_one(city, provider)
         ),
     )
@@ -4103,7 +4156,7 @@ def test_a_blocked_night_alerts_unconditionally_exits_nonzero_and_still_publishe
     monkeypatch.setattr(
         sched,
         "_run_one_city",
-        lambda cfg, city, today, provider="gsv", connection_limit=None, daily_budget=0, conn=None, remaining_s=None: (
+        lambda cfg, city, today, provider="gsv", connection_limit=None, daily_budget=0, conn=None, remaining_s=None, **_: (
             _blocked_outcome(HOST_MAPILLARY_TILES) if provider == "mapillary" else True
         ),
     )
@@ -4234,7 +4287,7 @@ def test_a_busy_night_alerts_and_exits_nonzero_but_says_it_was_local(conn, monke
     monkeypatch.setattr(
         sched,
         "_run_one_city",
-        lambda cfg, city, today, provider="gsv", connection_limit=None, daily_budget=0, conn=None, remaining_s=None: (
+        lambda cfg, city, today, provider="gsv", connection_limit=None, daily_budget=0, conn=None, remaining_s=None, **_: (
             _busy_outcome(HOST_MAPILLARY_TILES) if provider == "mapillary" else True
         ),
     )
@@ -5005,3 +5058,725 @@ def test_exit_reports_the_status_we_computed_even_with_a_broken_stdout(monkeypat
     with pytest.raises(SystemExit) as excinfo:
         sched._exit(0)
     assert excinfo.value.code == 0
+
+
+# ---------------------------------------------------------------------------
+# Concurrent channel lanes (issue #240)
+#
+# One city's channels may run at once, up to [schedule].max_concurrent_channels
+# — but never two that need the same per-IP third party. That is the whole
+# safety argument: what Mapillary's tile CDN, Overpass and KartaView see from
+# this machine is unchanged, and only the night's wall clock moves.
+#
+# Everything here is an ORDERING claim, which is why these tests read the
+# start/end log a fake collection writes rather than timing anything. Every wait
+# carries a timeout, so a lane scheduler that has stopped overlapping (or has
+# started overlapping things it must not) fails red instead of hanging the suite.
+# ---------------------------------------------------------------------------
+
+# Generous enough that a loaded CI box never trips it, short enough that a real
+# breakage is a failed test rather than a hung run.
+_LANE_TIMEOUT_S = 10.0
+# How long a lane test holds channels open while watching for one that must not
+# have been launched. Absence is only observable by waiting, and this window is
+# elapsed in full only when nothing went wrong — so keep it small enough to pay
+# on every run and long enough that a main thread finishing one more pricing
+# pass (a couple of catalog reads) lands well inside it.
+_AFFINITY_PROBE_S = 0.5
+
+
+class _LaneLog:
+    """Thread-safe start/end record of the fake collections a city ran.
+
+    ``events`` is ``("start" | "end", city_id, provider, seq)`` in the order the
+    lanes actually reached those points. A monotonic ``seq`` taken under the
+    lock rather than a timestamp: every question worth asking here is a
+    happens-before question ("did these two overlap?", "was that one ever
+    started at all?"), and a clock would only make the answers flaky.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.events: list[tuple[str, str, str, int]] = []
+
+    def record(self, kind: str, city_id: str, provider: str) -> None:
+        with self._lock:
+            self.events.append((kind, city_id, provider, len(self.events) + 1))
+
+    def seq(self, kind: str, provider: str) -> int:
+        """The sequence number of the one ``kind`` event for ``provider``."""
+        hits = [e[3] for e in self.events if e[0] == kind and e[2] == provider]
+        assert len(hits) == 1, f"expected exactly one {kind!r} for {provider}, got {hits}"
+        return hits[0]
+
+    def starts(self) -> list[str]:
+        return [e[2] for e in self.events if e[0] == "start"]
+
+    def cities(self) -> list[str]:
+        """City ids in the order their first event landed."""
+        seen = []
+        for _kind, city_id, _provider, _seq in self.events:
+            if city_id not in seen:
+                seen.append(city_id)
+        return seen
+
+    def peak_in_flight(self) -> int:
+        peak = live = 0
+        for kind, *_rest in self.events:
+            live += 1 if kind == "start" else -1
+            peak = max(peak, live)
+        return peak
+
+
+def _stub_lane_collection(sched, monkeypatch, *, outcome=None, gate=None):
+    """Stand in for the collection subprocess in a lane test (issue #240).
+
+    ``_stub_collection``'s fake is a single point in time; a lane test needs both
+    edges, because what the lane scheduler has to prove is which channels were
+    alive at the same moment.
+
+    It never touches ``conn``, and that is the point rather than an omission: the
+    scheduler hands a worker ``conn=None`` because ``db.connect`` opens the
+    catalog ``check_same_thread=True``, so a fake that quietly reached for the
+    fixture handle would go green over a design that could not work off-thread.
+
+    ``gate(city_id, provider)`` runs between the two edges and is where a test
+    puts a Barrier or an Event to force — or to forbid — an overlap.
+    """
+    log = _LaneLog()
+    outcome = outcome or (lambda city_id, provider: True)
+
+    def fake_run(cfg, city, today, provider="gsv", **kwargs):
+        log.record("start", city.city_id, provider)
+        try:
+            if gate is not None:
+                gate(city.city_id, provider)
+            return outcome(city.city_id, provider)
+        finally:
+            log.record("end", city.city_id, provider)
+
+    monkeypatch.setattr(sched, "_run_one_city", fake_run)
+    return log
+
+
+def _lane_city(conn, name="Bend"):
+    """A registered city plus its frozen row, ready for _run_city_channels."""
+    return db.resolve_city(conn, _register(conn, name, width=1000, height=1000, step=20))
+
+
+def _run_channels(sched, cfg, conn, city, providers, **overrides):
+    """Drive _run_city_channels directly, with the batch's arguments defaulted."""
+    kwargs = dict(
+        blocked_hosts=set(),
+        busy_hosts=Counter(),
+        batch_deadline=None,
+        stop_requested=None,
+    )
+    kwargs.update(overrides)
+    return sched._run_city_channels(cfg, conn, city, date(2026, 7, 2), providers, **kwargs)
+
+
+def _no_salvage(sched, monkeypatch):
+    """Neutralize orphan reconciliation for tests whose fakes report failure.
+
+    Both reconcilers read the catalog and the data directory; a lane test is
+    about scheduling, and letting a real salvage attempt run would make it
+    depend on what happens to be on disk.
+    """
+    monkeypatch.setattr(sched, "_reconcile_orphaned_run", lambda *a, **k: False)
+    monkeypatch.setattr(sched, "_reconcile_orphaned_walk", lambda *a, **k: False)
+
+
+def test_host_disjoint_channels_of_one_city_genuinely_overlap_at_knob_2(conn, monkeypatch):
+    """The premise of #240: two channels that share no per-IP host run at once.
+
+    The barrier is the assertion — a scheduler that still runs channels
+    back-to-back never gets a second party to it and fails on the timeout. gsv
+    (no per-IP host) and mapillary (the tile CDN) are the disjoint pair.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    city = _lane_city(conn)
+    barrier = threading.Barrier(2)
+    log = _stub_lane_collection(
+        sched, monkeypatch, gate=lambda city_id, provider: barrier.wait(_LANE_TIMEOUT_S)
+    )
+
+    attempted, succeeded, skipped = _run_channels(
+        sched, _street_cfg(max_concurrent_channels=2), conn, city, ["gsv", "mapillary"]
+    )
+
+    assert (attempted, succeeded, skipped) == (2, 2, 0)
+    assert log.peak_in_flight() == 2, "both channels must have been in flight together"
+
+
+def test_no_more_than_max_concurrent_channels_are_ever_in_flight(conn, monkeypatch):
+    """The knob is a cap, not a hint.
+
+    gsv (no host), gsv_streets (Overpass) and mapillary (tiles) are pairwise
+    host-disjoint, so affinity alone would let all three run together; at knob 2
+    exactly two ever may. The barrier proves the floor (a sequential
+    implementation cannot clear it), the peak proves the ceiling.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    city = _lane_city(conn)
+    barrier = threading.Barrier(2)
+
+    def gate(city_id, provider):
+        # Only the first two launched wait; the third must not be able to join a
+        # party of two, and would deadlock the run if it tried.
+        if provider in ("gsv", "gsv_streets"):
+            barrier.wait(_LANE_TIMEOUT_S)
+
+    log = _stub_lane_collection(sched, monkeypatch, gate=gate)
+
+    attempted, succeeded, _skipped = _run_channels(
+        sched,
+        _street_cfg(max_concurrent_channels=2),
+        conn,
+        city,
+        ["gsv", "gsv_streets", "mapillary"],
+    )
+
+    assert (attempted, succeeded) == (3, 3)
+    assert log.peak_in_flight() == 2, (
+        "three host-disjoint channels at knob 2 must still peak at two in flight"
+    )
+
+
+def test_channels_sharing_a_host_never_overlap_even_at_knob_4(conn, monkeypatch):
+    """The provider-facing invariant, and the reason #240 is safe to ship.
+
+    mapillary_streets needs BOTH Overpass (gsv_streets' host) and the tile CDN
+    (mapillary's), so however high the knob goes it must start only after both
+    of those have finished. If it ever overlapped either, the tile CDN would see
+    two talkers from this IP and the configured 60/min would silently become
+    120/min — the exact shape of the 2026-08-12 block (see docs/provider-access.md).
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    city = _lane_city(conn)
+    trio = threading.Barrier(3)
+    streets_started = threading.Event()
+    overlapped_with: list[str] = []
+
+    def gate(city_id, provider):
+        if provider == "mapillary_streets":
+            streets_started.set()
+            return
+        trio.wait(_LANE_TIMEOUT_S)
+        # The three disjoint channels are now all alive. HOLD them there and
+        # watch for the fourth, because the interesting failure does not
+        # announce itself: with affinity removed, mapillary_streets is submitted
+        # in the same pass, but it is a thread that does nothing, so it can
+        # still be scheduled after these three have returned. Timing alone would
+        # therefore let a scheduler with no affinity at all pass this test. The
+        # window only elapses in full when the answer is the right one.
+        if streets_started.wait(_AFFINITY_PROBE_S):
+            overlapped_with.append(provider)
+
+    log = _stub_lane_collection(sched, monkeypatch, gate=gate)
+
+    # Submit order is a property of the PARENT, so read it there rather than
+    # from the workers' start events: several lanes launched in one pass reach
+    # their first line in whatever order the OS feels like. city_timeout_seconds
+    # is called once per launched channel, on the launching thread, immediately
+    # before the submit.
+    submitted: list[str] = []
+
+    def spy_timeout(cfg, city, provider, conn=None, remaining_s=None):
+        submitted.append(provider)
+        return 600
+
+    monkeypatch.setattr(sched, "city_timeout_seconds", spy_timeout)
+
+    attempted, succeeded, _skipped = _run_channels(
+        sched,
+        _street_cfg(max_concurrent_channels=4),
+        conn,
+        city,
+        ["gsv", "gsv_streets", "mapillary", "mapillary_streets"],
+    )
+
+    assert (attempted, succeeded) == (4, 4)
+    assert overlapped_with == [], (
+        "mapillary_streets ran while a channel it shares a per-IP host with was "
+        "still in flight — that is two talkers to one metered host from one "
+        "process, which is the whole thing #240 must not do"
+    )
+    assert submitted == ["gsv", "gsv_streets", "mapillary", "mapillary_streets"], (
+        "channels are submitted in canonical (most-expensive-first) order"
+    )
+    assert log.peak_in_flight() == 3, (
+        "four channels at knob 4 still peak at three: the fourth shares a host "
+        "with two of them, so the effective ceiling is 3, not the knob"
+    )
+
+
+def test_a_mapillary_block_at_knob_3_still_means_mapillary_streets_is_never_submitted(
+    conn, monkeypatch, caplog
+):
+    """The breaker's read-then-act ordering has to survive a deferral.
+
+    Sequentially this was trivial: mapillary ran, recorded the block, and
+    mapillary_streets read `blocked_hosts` afterwards. With lanes the second
+    channel is deferred rather than reached in order — and it stays deferred
+    precisely BECAUSE it shares the blocked host, so it is still un-launched when
+    the block is recorded and hits the breaker at its own submit. Re-verification
+    of test_a_mapillary_block_skips_both_mapillary_channels at knob > 1.
+    """
+    import logging
+
+    from streetscape_metadata_tracker import scheduler as sched
+    from streetscape_metadata_tracker.download_common import HOST_MAPILLARY_TILES
+
+    city = _lane_city(conn)
+    log = _stub_lane_collection(
+        sched,
+        monkeypatch,
+        outcome=lambda city_id, provider: (
+            _blocked_outcome(HOST_MAPILLARY_TILES) if provider == "mapillary" else True
+        ),
+    )
+    blocked: set[str] = set()
+
+    with caplog.at_level(logging.INFO):
+        attempted, succeeded, skipped = _run_channels(
+            sched,
+            _street_cfg(max_concurrent_channels=3),
+            conn,
+            city,
+            ["gsv", "gsv_streets", "mapillary", "mapillary_streets"],
+            blocked_hosts=blocked,
+        )
+
+    assert "mapillary_streets" not in log.starts(), (
+        "a channel needing a host that refused us must never be launched"
+    )
+    assert blocked == {HOST_MAPILLARY_TILES}
+    assert (attempted, succeeded, skipped) == (2, 2, 0), (
+        "neither the blocked channel nor the one skipped behind it is an attempt"
+    )
+    assert "already refused this host" in caplog.text
+
+
+def test_a_busy_exit_at_knob_3_skips_one_channel_without_poisoning_the_lanes(conn, monkeypatch):
+    """Busy is not blocked, and the lanes must keep that distinction.
+
+    A busy exit means another process on this machine holds the host — it ends
+    when that process does — so it skips one channel and nothing else. Getting
+    this wrong in the other direction would be worse than the sequential bug it
+    mirrors: one manual run would cost the whole night's Mapillary work.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+    from streetscape_metadata_tracker.download_common import HOST_MAPILLARY_TILES
+
+    city = _lane_city(conn)
+    log = _stub_lane_collection(
+        sched,
+        monkeypatch,
+        outcome=lambda city_id, provider: (
+            _busy_outcome(HOST_MAPILLARY_TILES) if provider == "mapillary" else True
+        ),
+    )
+    blocked: set[str] = set()
+    busy: Counter[str] = Counter()
+
+    attempted, succeeded, skipped = _run_channels(
+        sched,
+        _street_cfg(max_concurrent_channels=3),
+        conn,
+        city,
+        ["gsv", "gsv_streets", "mapillary", "mapillary_streets"],
+        blocked_hosts=blocked,
+        busy_hosts=busy,
+    )
+
+    assert busy == Counter({HOST_MAPILLARY_TILES: 1})
+    assert blocked == set(), "a busy local lock is not a provider refusal"
+    assert "mapillary_streets" in log.starts(), (
+        "the sibling of a busy channel is still worth running — the lock frees "
+        "when the other local process finishes"
+    )
+    assert (attempted, succeeded, skipped) == (3, 3, 0)
+
+
+def test_budget_skips_are_final_but_host_deferrals_relaunch(conn, monkeypatch):
+    """The two ways a channel can fail to launch are not the same thing.
+
+    A budget skip is a decision — priced once, logged, and never reconsidered
+    for this city tonight. A host deferral is not a decision at all: the channel
+    stays pending, silently, and launches the moment its sibling frees the host.
+    Conflating them would either re-price skipped channels in a loop or drop
+    deferred ones on the floor.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    city = _lane_city(conn)
+    cfg = _street_cfg(max_concurrent_channels=3)
+    # Priced above its entire daily budget, so mapillary can never fit tonight.
+    cfg.providers["mapillary"] = ProviderConfig(enabled=True, daily_request_budget=0)
+
+    priced: list[str] = []
+    real_estimate = sched.estimate_requests
+    monkeypatch.setattr(
+        sched,
+        "estimate_requests",
+        lambda city, provider="gsv", **kw: (
+            priced.append(provider) or real_estimate(city, provider, **kw)
+        ),
+    )
+    barrier = threading.Barrier(2)
+
+    def gate(city_id, provider):
+        if provider in ("gsv", "gsv_streets"):
+            barrier.wait(_LANE_TIMEOUT_S)
+
+    log = _stub_lane_collection(sched, monkeypatch, gate=gate)
+
+    attempted, succeeded, skipped = _run_channels(
+        sched, cfg, conn, city, ["gsv", "gsv_streets", "mapillary", "mapillary_streets"]
+    )
+
+    assert "mapillary" not in log.starts()
+    assert skipped == 1
+    assert priced.count("mapillary") == 1, (
+        "a channel skipped on budget must be priced once and then left alone; "
+        "re-pricing it every pass is how a deferral loop turns into a spin"
+    )
+    assert (attempted, succeeded) == (3, 3)
+    assert log.seq("start", "mapillary_streets") > log.seq("end", "gsv_streets"), (
+        "the deferred channel waits for the Overpass sibling and then runs"
+    )
+
+
+def test_a_stop_lets_in_flight_lanes_drain_and_declines_the_pending_channels_by_name(
+    conn, monkeypatch, caplog
+):
+    """A stop is a SUBMIT gate, not a kill.
+
+    Work already in flight has been paid for whatever we do next, so it finishes
+    and is credited; what a wind-down actually prevents is the channels nothing
+    has been asked of yet — and with Mapillary enabled those are the ones that
+    would otherwise fire into a live per-IP tile block (#205/#206). Naming them
+    is the whole point of the message.
+    """
+    import logging
+
+    from streetscape_metadata_tracker import scheduler as sched
+
+    city = _lane_city(conn)
+    stop = threading.Event()
+    barrier = threading.Barrier(2)
+
+    def gate(city_id, provider):
+        barrier.wait(_LANE_TIMEOUT_S)  # both lanes are live before the stop lands
+        stop.set()
+
+    log = _stub_lane_collection(sched, monkeypatch, gate=gate)
+
+    with caplog.at_level(logging.INFO):
+        attempted, succeeded, skipped = _run_channels(
+            sched,
+            _street_cfg(max_concurrent_channels=2),
+            conn,
+            city,
+            ["gsv", "gsv_streets", "mapillary", "mapillary_streets"],
+            stop_requested=stop,
+        )
+
+    assert sorted(log.starts()) == ["gsv", "gsv_streets"]
+    assert (attempted, succeeded, skipped) == (2, 2, 0), (
+        "children that finished before the stop reached them are still credited"
+    )
+    assert f"{city.city_id}: stop requested — not starting mapillary, mapillary_streets" in (
+        caplog.text
+    )
+
+
+def test_children_killed_together_by_the_stop_are_not_failures_for_any_channel(
+    conn, monkeypatch, caplog
+):
+    """The unit's KillMode is control-group, so a `systemctl stop` reaches every
+    in-flight child at once — N of them now, not one.
+
+    Each dies with "exited -15", which is in neither host-exit table and reads as
+    an ordinary collection failure. Charging even one to the city burns a
+    `consecutive_failures` slot that only a success ever resets, and makes a
+    deliberate stop end the unit red (issue #206). The amnesty therefore has to
+    be applied per RESULT, not once at the exit.
+    """
+    import logging
+
+    from streetscape_metadata_tracker import scheduler as sched
+
+    city = _lane_city(conn)
+    _no_salvage(sched, monkeypatch)
+    recorded = []
+    monkeypatch.setattr(sched.db, "record_attempt", lambda *a, **k: recorded.append((a, k)) or None)
+
+    stop = threading.Event()
+    barrier = threading.Barrier(2)
+
+    def gate(city_id, provider):
+        barrier.wait(_LANE_TIMEOUT_S)
+        stop.set()
+
+    _stub_lane_collection(
+        sched,
+        monkeypatch,
+        gate=gate,
+        outcome=lambda city_id, provider: sched.CollectionOutcome(
+            False, f"exited -15 (see collect_{provider}.log)", -15
+        ),
+    )
+
+    with caplog.at_level(logging.INFO):
+        attempted, succeeded, skipped = _run_channels(
+            sched,
+            _street_cfg(max_concurrent_channels=2),
+            conn,
+            city,
+            ["gsv", "gsv_streets", "mapillary", "mapillary_streets"],
+            stop_requested=stop,
+        )
+
+    assert (attempted, succeeded, skipped) == (0, 0, 0), (
+        "a channel we killed was never really attempted"
+    )
+    assert recorded == [], "a stop must not record a failure against any channel"
+    assert caplog.text.count("child was killed by the stop signal") == 2
+    assert "not starting mapillary, mapillary_streets" in caplog.text
+
+
+def test_a_worker_error_drains_the_siblings_before_the_night_reports_unhealthy(conn, monkeypatch):
+    """An unexpected exception in one lane must not discard its siblings' work.
+
+    The siblings' collections are already paid for, so they are classified and
+    recorded first; only then does the error propagate, which is what turns the
+    night into _STOP_REASON_ERROR upstream — unhealthy, but still publishing
+    what it collected (issue #167).
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    city = _lane_city(conn)
+    recorded = []
+    monkeypatch.setattr(
+        sched.db,
+        "record_attempt",
+        lambda conn_, city_id, success, provider=None, error=None: recorded.append(
+            (provider, success)
+        ),
+    )
+    barrier = threading.Barrier(2)
+
+    def outcome(city_id, provider):
+        if provider == "gsv":
+            raise RuntimeError("something unexpected")
+        return True
+
+    _stub_lane_collection(
+        sched,
+        monkeypatch,
+        gate=lambda city_id, provider: barrier.wait(_LANE_TIMEOUT_S),
+        outcome=outcome,
+    )
+
+    with pytest.raises(RuntimeError, match="something unexpected"):
+        _run_channels(
+            sched, _street_cfg(max_concurrent_channels=2), conn, city, ["gsv", "gsv_streets"]
+        )
+
+    assert recorded == [("gsv_streets", True)], (
+        "the sibling that finished must be credited before the error escapes"
+    )
+
+
+def test_the_deadline_is_a_submit_gate_and_every_lane_child_gets_its_own_remaining_s(
+    conn, monkeypatch
+):
+    """Each child is priced against the shared deadline at ITS OWN submit.
+
+    That is the correct reading with lanes: every in-flight child genuinely does
+    have until the same deadline, so one clock read per LAUNCHED channel is not
+    an approximation. Pricing them all off one read taken before the first launch
+    would hand a late-launching channel a timeout it has no right to.
+
+    The clock here is safe to stub despite the knob (see _WorkClock): every
+    advance happens inside the recorder, which the launch pass calls on the main
+    thread.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    city = _lane_city(conn)
+    clock = _WorkClock(per_unit_s=1000.0)
+    monkeypatch.setattr(sched.time, "monotonic", clock)
+
+    priced = []
+    main_thread = threading.get_ident()
+
+    def fake_timeout(cfg, city, provider, conn=None, remaining_s=None):
+        priced.append((provider, remaining_s, threading.get_ident()))
+        clock.work()
+        return 600
+
+    monkeypatch.setattr(sched, "city_timeout_seconds", fake_timeout)
+    _stub_lane_collection(sched, monkeypatch)
+
+    _run_channels(
+        sched,
+        _street_cfg(max_concurrent_channels=3),
+        conn,
+        city,
+        ["gsv", "gsv_streets", "mapillary", "mapillary_streets"],
+        batch_deadline=10_000.0,
+    )
+
+    assert priced == [
+        ("gsv", 10_000.0, main_thread),
+        ("gsv_streets", 9_000.0, main_thread),
+        ("mapillary", 8_000.0, main_thread),
+        ("mapillary_streets", 7_000.0, main_thread),
+    ], (
+        "one clock read per launched channel, on the launching thread, each "
+        "priced against what was left of the deadline when IT started"
+    )
+
+
+def test_budget_pricing_and_ledger_reads_stay_on_the_main_thread_in_submit_order(conn, monkeypatch):
+    """A lane worker runs _run_one_city and nothing else.
+
+    ``db.connect`` opens the catalog with ``check_same_thread=True``, so every
+    read of it — the budget ledger included — has to happen on the thread that
+    owns it. This is also what keeps the read-then-write budget guard honest:
+    the reads are serialized by being on one thread, in submit order, so two
+    channels cannot both see "under budget" and both spend.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    city = _lane_city(conn)
+    main_thread = threading.get_ident()
+    calls = []
+
+    real_estimate = sched.estimate_requests
+    real_usage = sched.db.get_api_usage
+
+    def spy_estimate(city, provider="gsv", **kw):
+        calls.append(("estimate", provider, threading.get_ident()))
+        return real_estimate(city, provider, **kw)
+
+    def spy_usage(conn_, day, provider):
+        calls.append(("usage", provider, threading.get_ident()))
+        return real_usage(conn_, day, provider)
+
+    monkeypatch.setattr(sched, "estimate_requests", spy_estimate)
+    monkeypatch.setattr(sched.db, "get_api_usage", spy_usage)
+    _stub_lane_collection(sched, monkeypatch)
+
+    _run_channels(
+        sched,
+        _street_cfg(max_concurrent_channels=3),
+        conn,
+        city,
+        ["gsv", "gsv_streets", "mapillary", "mapillary_streets"],
+    )
+
+    assert {ident for _kind, _provider, ident in calls} == {main_thread}
+    assert [provider for kind, provider, _ in calls if kind == "usage"] == [
+        "gsv",
+        "gsv_streets",
+        "mapillary",
+        "mapillary_streets",
+    ], "the ledger is read once per channel, in submit order, on one thread"
+
+
+def test_a_citys_lanes_drain_before_the_next_city_is_priced(conn, monkeypatch):
+    """The city is the join point, and two properties depend on it.
+
+    Paired snapshots: every channel of a city shares one run date, which only
+    holds while the city loop stays sequential (Shape A). And budget ordering:
+    the next city is priced against a ledger the previous city has finished
+    writing to, rather than one still being written.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    for name in ("Alpha", "Beta"):
+        _register(conn, name, width=1000, height=1000, step=20)
+    db.assign_schedule(conn, 90)
+    conn.execute("UPDATE schedule_state SET last_success_at = NULL")
+    conn.commit()
+
+    log = _stub_lane_collection(sched, monkeypatch)
+    _stub_tail(monkeypatch, sched, conn, [])
+    monkeypatch.setattr(sched, "send_alert", lambda *a, **k: None)
+
+    sched.cmd_run_due(
+        _street_cfg(max_concurrent_channels=3, publish_enabled=False), today=date(2026, 7, 2)
+    )
+
+    order = log.cities()
+    assert len(order) == 2, "both cities should have been collected"
+    first, second = order
+    boundary = max(seq for _k, city_id, _p, seq in log.events if city_id == first)
+    assert all(seq > boundary for _k, city_id, _p, seq in log.events if city_id == second), (
+        "no channel of the second city may start before the first city is quiet"
+    )
+
+
+def test_knob_1_is_the_default_and_runs_the_channels_inline_and_in_order(
+    conn, monkeypatch, tmp_path
+):
+    """The default must be the pre-#240 behaviour, to the thread.
+
+    Not "a pool of size 1": inline on the calling thread. That is what makes the
+    default byte-equivalent, and it is what lets anything substituting
+    _run_one_city keep using the catalog handle — every existing test in this
+    file depends on both.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    assert SchedulerConfig().max_concurrent_channels == 1
+    cfg_path = tmp_path / "s.toml"
+    cfg_path.write_text("[schedule]\ncycle_days = 90\n")
+    assert load_scheduler_config(str(cfg_path)).max_concurrent_channels == 1
+
+    city = _lane_city(conn)
+    threads = set()
+    log = _stub_lane_collection(
+        sched, monkeypatch, gate=lambda city_id, provider: threads.add(threading.get_ident())
+    )
+
+    attempted, succeeded, _skipped = _run_channels(
+        sched, _street_cfg(), conn, city, ["gsv", "gsv_streets", "mapillary", "mapillary_streets"]
+    )
+
+    assert (attempted, succeeded) == (4, 4)
+    assert threads == {threading.get_ident()}, "at one lane the channel body runs inline"
+    assert log.peak_in_flight() == 1, "nothing overlaps at the default"
+    assert [e[0] for e in log.events] == ["start", "end"] * 4
+    assert log.starts() == ["gsv", "gsv_streets", "mapillary", "mapillary_streets"]
+
+
+@pytest.mark.parametrize("value", ["0", "-2", "1.5", '"three"', "true"])
+def test_max_concurrent_channels_rejects_a_nonsense_value_and_falls_back_to_1(
+    tmp_path, value, caplog
+):
+    """Warn and fall back, never raise: a load-time error over one key of one
+    section takes down every subcommand, including backup-status and
+    restore-backup — the handles an operator needs during an incident.
+
+    ``true`` is in the list because TOML booleans are Python ints, so a bare
+    isinstance check would accept it as one lane and read as if it had been
+    honoured.
+    """
+    import logging
+
+    cfg_path = tmp_path / "s.toml"
+    cfg_path.write_text(f"[schedule]\nmax_concurrent_channels = {value}\n")
+
+    with caplog.at_level(logging.WARNING):
+        cfg = load_scheduler_config(str(cfg_path))
+
+    assert cfg.max_concurrent_channels == 1
+    assert "max_concurrent_channels" in caplog.text

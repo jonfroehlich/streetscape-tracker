@@ -16,8 +16,8 @@ series on the same grid. Re-running a (city, provider) sooner than
 `--min-days-since-last-run` (default 80) days is skipped unless you pass
 `--force`. A scheduler (see `deploy/README.md`) staggers ~13 cities/day so
 the full corpus re-collects roughly quarterly without exceeding API limits;
-a city due for both providers runs them back-to-back with the same run date
-so cross-provider snapshots align.
+a city due for both providers runs them on the same run date — back-to-back,
+or concurrently in host-disjoint lanes — so cross-provider snapshots align.
 
 ## Imagery providers
 

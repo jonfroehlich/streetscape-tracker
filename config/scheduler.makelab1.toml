@@ -17,6 +17,19 @@ city_timeout_minutes = 180
 # tail still runs. Must stay below the unit's TimeoutStartSec (14h) — before
 # this existed, a 12h systemd kill discarded a whole night's publish (#167).
 max_batch_hours = 10
+# Channels of one city, in flight at once (issue #240). Explicit at 1 rather
+# than inherited, because this is the file prod reads and the value is the whole
+# rollout: 1 is today's sequential behaviour. Raising it is deploy-gated on two
+# things that live outside this repo:
+#   1. GMAPS_API_KEY and GMAPS_STREETS_API_KEY confirmed in SEPARATE Google
+#      Cloud projects (they hold no per-IP lock, so a shared project would put
+#      48k+24k req/min on one quota with nothing serializing them). Record the
+#      project IDs and the date of the check here when it is done.
+#   2. Issue #256 landed — resume for the Mapillary tile census. Until then a
+#      killed child re-spends tiles against the 3,500/day per-IP ceiling.
+# Go to 2 before 3: gsv is the long pole and already overlaps each short channel
+# in turn at 2, for half the blast radius. See docs/scheduler.md.
+max_concurrent_channels = 1
 daily_request_budget = 10000000   # legacy fallback; superseded by [providers.*]
 
 # Per-provider daily request budgets (own run series, ledger, failure tracking).
