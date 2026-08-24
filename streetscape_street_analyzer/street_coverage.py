@@ -403,11 +403,19 @@ def compute_streetwalk_coverage(
     Score fractional per-edge coverage from road-walk collection results.
 
     Each on-street sample point is "covered" when its collected metadata row is
-    ``status == 'OK'``, official (for GSV, exact ``© Google``; other providers
-    accept any OK pano), and the returned pano lies within ``match_dist_m`` of
-    the sample point — the distance guard rejects a pano that snapped to a
+    PRESENT (``status`` in ``PRESENT_STATUSES`` — ``OK`` or ``NO_DATE``),
+    official (for GSV, exact ``© Google``; other providers accept any present
+    pano), and the returned pano lies within ``match_dist_m`` of the sample
+    point — the distance guard rejects a pano that snapped to a
     parallel/neighbouring road. An edge's ``coverage_fraction`` is its covered
     samples over its total samples.
+
+    A ``NO_DATE`` sample counts as covered but carries a NaT ``capture_date``,
+    so it never reaches ``nearest_pano_date`` or ``median_covered_age_years``
+    — coverage without age, exactly the grid convention. That population is
+    large by construction for KartaView (``shot_date >= date_added`` nulls an
+    untrustworthy date rather than believing it), small but real for Mapillary
+    (bogus contributor timestamps), and empty in practice for GSV.
 
     Args:
         edges: WGS84 LineString GeoDataFrame with ``edge_id`` (+ optional
@@ -473,8 +481,14 @@ def compute_streetwalk_coverage(
         how="left",
     )
 
-    # Per-sample covered test: OK + official + a pano within the threshold.
-    ok = m["status"] == "OK"
+    # Per-sample covered test: a PRESENT pano + official + within the threshold.
+    # PRESENT is OK *or* NO_DATE, the grid's presence vocabulary: a pano whose
+    # capture date is unusable is still imagery within reach of the street, so
+    # it covers and simply contributes no age. This path filtered on == "OK"
+    # until #257, long after `select_pano_points` (the grid-attribution path)
+    # was corrected, so the two halves of the package disagreed and the walk
+    # under-counted by its whole NO_DATE population.
+    ok = m["status"].isin(PRESENT_STATUSES)
     if provider == "gsv":
         official = (
             is_google_copyright(m["copyright_info"])
