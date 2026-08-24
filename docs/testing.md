@@ -167,38 +167,6 @@ the union-not-intersection pivot with a provider-absent city reading null rather
 Δ null-unless-both in both directions;
 the shared-geometry collapse asserted in BOTH provider orders, so "first non-null wins" is not "first provider wins";
 a synthetic THIRD provider getting keys, a filter option and a `pctBest` contribution but no Δ;
-and the per-provider link cells never taking the bare-`city_id` name fallback's filename.
-e2e: one row per city with a populated Δ and an absent-provider em-dash beside it, a Δ header click, the network selector's round-trip including a cold `?network=all_public` reload, a keyboard-only `ArrowRight` moving the rows AND the precision input AND the URL together, the crossfilter rule (a search redraws a slider's bars, its own brush does not),
-the sidebar beside the table at 1440px and collapsing at 600px and **re-opening on widening**, the column picker's self-contained `pickerLabel`s and the header collapsing back to ONE row when every optional column is unchecked, and one test retargeted at driving.html pinning that its strip, its single-row header and its horizontal controls all survive.
-**The pivoted data tables (issue #250) are covered on both sides.**
-Node: `theadHtml`'s group-free output compared against the expression it replaced rather than a hand-copied string (the driving.html guarantee), the two-row form's colspan/rowspan and leaf-only `data-key`, and the first-VISIBLE-member group label;
-`histogram-range` asserted against its plain-`range` TWIN in unset/pass/parse/serialize rather than against typed expectations, since the point is that the two are one value shape;
-`rowsExceptFilter` ignoring self while the search box still narrows;
-`histogramBuckets`' fixed domain clamping out-of-range values into the end buckets instead of dropping them;
-the select `defaultValue`'s four cases (absent, unknown, blank, explicit) and `defaultFilterValues` as what "Clear all" resets to;
-`sliderStepFor` never returning zero on a degenerate domain and `normalizeSliderRange` turning a full span into nulls, swapping crossed handles and clamping to a domain that need not start at zero;
-`classifyBuckets` dimming by OVERLAP, so a bucket cut by a handle still counts;
-the union-not-intersection pivot with a provider-absent city reading null rather than zero;
-Δ null-unless-both in both directions;
-the shared-geometry collapse asserted in BOTH provider orders, so "first non-null wins" is not "first provider wins";
-a synthetic THIRD provider getting keys, a filter option and a `pctBest` contribution but no Δ;
-and the per-provider link cells never taking the bare-`city_id` name fallback's filename.
-e2e: one row per city with a populated Δ and an absent-provider em-dash beside it, a Δ header click, the network selector's round-trip including a cold `?network=all_public` reload, a keyboard-only `ArrowRight` moving the rows AND the precision input AND the URL together, the crossfilter rule (a search redraws a slider's bars, its own brush does not),
-the sidebar beside the table at 1440px and collapsing at 600px and **re-opening on widening**, the column picker's self-contained `pickerLabel`s and the header collapsing back to ONE row when every optional column is unchecked, one test retargeted at driving.html pinning that its strip, its single-row header and its horizontal controls all survive;
-every per-provider cell of a row opening THAT provider's series while the Δ cells open nothing and a provider with no run here stays plain;
-and the layout asks themselves as outcomes rather than word counts — the table's first row and the search box both above the fold at 1440×900, the long prose present but closed, and the sidebar sticky, painted, and taller than 85% of the viewport.
-**The pivoted data tables (issue #250) are covered on both sides.**
-Node: `theadHtml`'s group-free output compared against the expression it replaced rather than a hand-copied string (the driving.html guarantee), the two-row form's colspan/rowspan and leaf-only `data-key`, and the first-VISIBLE-member group label;
-`histogram-range` asserted against its plain-`range` TWIN in unset/pass/parse/serialize rather than against typed expectations, since the point is that the two are one value shape;
-`rowsExceptFilter` ignoring self while the search box still narrows;
-`histogramBuckets`' fixed domain clamping out-of-range values into the end buckets instead of dropping them;
-the select `defaultValue`'s four cases (absent, unknown, blank, explicit) and `defaultFilterValues` as what "Clear all" resets to;
-`sliderStepFor` never returning zero on a degenerate domain and `normalizeSliderRange` turning a full span into nulls, swapping crossed handles and clamping to a domain that need not start at zero;
-`classifyBuckets` dimming by OVERLAP, so a bucket cut by a handle still counts;
-the union-not-intersection pivot with a provider-absent city reading null rather than zero;
-Δ null-unless-both in both directions;
-the shared-geometry collapse asserted in BOTH provider orders, so "first non-null wins" is not "first provider wins";
-a synthetic THIRD provider getting keys, a filter option and a `pctBest` contribution but no Δ;
 and the per-provider link cells never taking the bare-`city_id` name fallback's filename;
 and for the scope, `resolveFilters` in all four states (unscoped reads the best-across field, scoped reads that provider's, the 2+ option scopes to no single provider so it stays best-across, and a descriptor with no scope hook comes back by IDENTITY), the composed query that used to return 56 wrong rows asserted as returning none,
 a scoped BOOLEAN resolving its `test` rather than only its wording, and
