@@ -1,8 +1,11 @@
 # Streetscape Tracker
 
-Streetscape Tracker (formerly *GSV Tracker*) is a Python tool for analyzing street-level imagery coverage and temporal patterns in cities **over time** — Google Street View (GSV) and, as of 2026, [Mapillary](https://www.mapillary.com/) 360° panoramas. It samples geographic grids around city centers, queries each provider's metadata API, and produces dated snapshots per city — computing what changed between snapshots (panoramas added/removed, capture dates updated, coverage deltas) and rendering interactive visualizations of when and where imagery was captured.
+Streetscape Tracker (formerly *GSV Tracker*) is a Python tool for analyzing street-level imagery coverage and temporal patterns in cities **over time** — Google Street View (GSV) and, as of 2026, [Mapillary](https://www.mapillary.com/) 360° panoramas.
+It samples geographic grids around city centers, queries each provider's metadata API, and produces dated snapshots per city — computing what changed between snapshots (panoramas added/removed, capture dates updated, coverage deltas) and rendering interactive visualizations of when and where imagery was captured.
 
-This research project began in 2021 by Professor Jon E. Froehlich and was also part of the [UC Berkeley Data Science Discovery Program](https://cdss.berkeley.edu/discovery/projects) in 2023 with students Joseph Chen, Wenjing Yi, and Jingfeng Yang. Here's the [original pitch sheet in Google Docs](https://docs.google.com/document/d/1hfgvS_JHRmhkVtj_LBZ2qd_TO-50L6g0crlV8nTBy9s/edit?tab=t.0). The [v1.0.0 release](https://github.com/jonfroehlich/streetscape-tracker/releases/tag/v1.0.0) of this tool supported our [GeoIndustry 2025 paper](https://doi.org/10.1145/3764919.3770883) on GSV coverage and socioeconomic indicators (see also [GSVantage](https://github.com/makeabilitylab/GSVantage)).
+This research project began in 2021 by Professor Jon E. Froehlich and was also part of the [UC Berkeley Data Science Discovery Program](https://cdss.berkeley.edu/discovery/projects) in 2023 with students Joseph Chen, Wenjing Yi, and Jingfeng Yang.
+Here's the [original pitch sheet in Google Docs](https://docs.google.com/document/d/1hfgvS_JHRmhkVtj_LBZ2qd_TO-50L6g0crlV8nTBy9s/edit?tab=t.0).
+The [v1.0.0 release](https://github.com/jonfroehlich/streetscape-tracker/releases/tag/v1.0.0) of this tool supported our [GeoIndustry 2025 paper](https://doi.org/10.1145/3764919.3770883) on GSV coverage and socioeconomic indicators (see also [GSVantage](https://github.com/makeabilitylab/GSVantage)).
 
 ## How temporal tracking works
 
@@ -91,11 +94,18 @@ The repository includes several scripts divided into core data collection tools 
 
 * **`streetscape_tracker.py`**: The primary asynchronous data collection script. Each invocation collects one dated snapshot of a city, catalogs it, and diffs it against the previous run.
 * **`run_cities.py`**: A batch-processing wrapper that runs `streetscape_tracker.py` across multiple cities sequentially by reading configurations from a text file (e.g., `cities.txt`).
-* **`python -m streetscape_metadata_tracker.scheduler`**: The staggered quarterly scheduler (`status`, `assign`, `run-due`, `regenerate-aggregate`, `assess-city` subcommands). `regenerate-aggregate [--publish]` rebuilds `cities.json.gz` from the catalog without collecting — handy after a schema change or manual run. `assess-city "City, Region"` is the same-day answer for a city we don't track yet: it registers the city, walks its streets on both providers, publishes, and prints the street-km coverage a deployment decision actually turns on (`--estimate` reports boundary fit and cost first, with no provider requests). See `deploy/README.md` for running it as a systemd timer.
+* **`python -m streetscape_metadata_tracker.scheduler`**: The staggered quarterly scheduler (`status`, `assign`, `run-due`, `regenerate-aggregate`, `assess-city` subcommands).
+  `regenerate-aggregate [--publish]` rebuilds `cities.json.gz` from the catalog without collecting — handy after a schema change or manual run.
+  `assess-city "City, Region"` is the same-day answer for a city we don't track yet: it registers the city, walks its streets on both providers, publishes, and prints the street-km coverage a deployment decision actually turns on (`--estimate` reports boundary fit and cost first, with no provider requests).
+  See `deploy/README.md` for running it as a systemd timer.
 
 ### Data Utilities & Analysis
 
-* **`python -m streetscape_street_analyzer.analyze`**: OSM street-coverage analysis for an existing run — overlays the city's frozen OpenStreetMap street network on the run's panos and writes a `{base}_streets.json.gz` GeoJSON (per-segment covered/uncovered plus a by-street-type summary) that the city page renders as an optional overlay. Example: `python -m streetscape_street_analyzer.analyze "Seattle, WA" --provider gsv`. The network is fetched once per city and frozen (`data/osm_cache/`, cataloged in `street_networks`); `--refresh` re-fetches it. Uses no imagery-provider API. (Street-coverage *collection* is planned separately and will use its own isolated credentials, `GMAPS_STREETS_API_KEY` / `MAPILLARY_STREETS_ACCESS_TOKEN` — see issue #99.)
+* **`python -m streetscape_street_analyzer.analyze`**: OSM street-coverage analysis for an existing run — overlays the city's frozen OpenStreetMap street network on the run's panos and writes a `{base}_streets.json.gz` GeoJSON (per-segment covered/uncovered plus a by-street-type summary) that the city page renders as an optional overlay.
+  Example: `python -m streetscape_street_analyzer.analyze "Seattle, WA" --provider gsv`.
+  The network is fetched once per city and frozen (`data/osm_cache/`, cataloged in `street_networks`); `--refresh` re-fetches it.
+  Uses no imagery-provider API.
+  (Street-coverage *collection* is planned separately and will use its own isolated credentials, `GMAPS_STREETS_API_KEY` / `MAPILLARY_STREETS_ACCESS_TOKEN` — see issue #99.)
 * **`streetscape_compare_data.py`**: Compares two run metadata files for the same city and reports panos added/removed, capture-date changes, and coverage transitions.
 * **`generate_json.py`**: Generates missing JSON metadata summary files for existing run data directories.
 * **`check_status_codes.py`**: Analyzes API status-code distributions across data files.
