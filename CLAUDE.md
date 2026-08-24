@@ -273,7 +273,7 @@ Mapillary attribution is required by their ToS.
 
 **Tests → [`docs/testing.md`](docs/testing.md).** `pytest`, fast, no real network
 — downloader tests substitute an in-memory fetch primitive rather than mocking HTTP, and autouse fixtures neutralize pacing, the host lock, the Overpass probe and the backup directory suite-wide so the suite can run during a live nightly batch.
-That file records **what each test pins and why**, which is what makes a failing test readable as a contract rather than a puzzle; add to it when you add a test.
+That file records **what each test pins and why**, which is what makes a failing test readable as a contract rather than a puzzle; add to it when you add a test — to the section your test belongs to, so two PRs adding tests to different subsystems do not collide.
 
 ## Notes
 
@@ -285,8 +285,16 @@ That file records **what each test pins and why**, which is what makes a failing
   — and every number in it traces to that committed JSON, which in turn must be produced by committed code named in its `generated_by`.
   A number that contradicts vendor documentation gets flagged, not quietly normalized.
   The rules, the rationale, and the failure modes that produced them: [`docs/experiments/README.md`](docs/experiments/README.md).
-  Existing writeups: `grid-density.md`, `pano-spacing.md`, `kartaview-feasibility.md`, `kartaview-sweep-cost.md`, `publish-duration.md`, `capture-date-precision.md`
-  — answer "should we sample finer / differently?" from these before re-running anything.
+  Existing writeups — keep this list alphabetical, so two branches adding one usually insert at different points and merge cleanly:
+
+  - `capture-date-precision.md`
+  - `grid-density.md`
+  - `kartaview-feasibility.md`
+  - `kartaview-sweep-cost.md`
+  - `pano-spacing.md`
+  - `publish-duration.md`
+
+  Answer "should we sample finer / differently?" from these before re-running anything.
 
 - Architecture decisions are recorded in `docs/adr/`.
   Notably **ADR 0001: stay fully static, no backend** — the public site has zero server-side runtime by design;

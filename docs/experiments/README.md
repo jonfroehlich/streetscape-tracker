@@ -14,32 +14,54 @@ here for the evidence, the incident history and the details — keep the two in 
 - **Every measured question gets a writeup in `docs/experiments/`, however small** — including negative, inconclusive and abandoned ones, and including a one-afternoon analysis over data already on disk.
   "Too small to write up" is not a category: the cost of a short writeup is minutes, and the thing it prevents is re-running a collection to re-learn an answer we already bought.
   Each writeup carries the decision it justifies, the caveats, and how to replicate it.
-  So far: `grid-density.md` (issue #106 — why production stays on the 20 m grid; below ~10 m you buy redundancy, not information, since official panos sit ~10 m apart) and `pano-spacing.md` (GSV vs Mapillary capture interval
-  — Mapillary samples 1.4–3.5× finer, and **any per-pano analysis must group by `sequence_id` first**: pooling across contributors collapses the measured interval by 2–8× because the nearest image is usually someone else's drive.
-  GSV publishes no drive identifier, so the same correction is impossible there — which makes Mapillary's number the better-founded one, the opposite of the intuition).
-  `kartaview-feasibility.md` (issue #225 — whether KartaView can be a third provider; it can, as a **census** like Mapillary rather than a GSV-style sample, since its only bulk path is a paginated radius sweep.
-  Two traps generalize beyond it: `/1.0/list/nearby-photos/` fills a page by **sequence**, so any share over a truncated page describes one drive rather than one neighbourhood
-  — and the page size is a *client* flag, `--ipp`, whose 200 default (against a 2,000 server cap) was what made the first pass conclude that most points could never be measured at all.
-  And KartaView's v2 serves **the upload timestamp as the capture date** for one 2025 Grab ingest, so `shotDate >= dateAdded` must be rejected outright: a null is honest, a plausible wrong date is not, which is #213's lesson arriving from a second vendor).
-  `publish-duration.md` (issues #218/#230 — how long the nightly publish actually takes, so `scheduler.PUBLISH_TIMEOUT_S` is sized rather than guessed; read entirely out of logs already on disk, which is the smallest an experiment gets and still worth the twenty minutes.
-  Its transferable lesson is that a log holds **three** populations that look alike
-  — the exact `Published in N.N s` line, the pre-#229 `Publishing via` → next-line *upper bound*, and failures, whose 0.05–0.30 s values are not publish durations at all and halve p25 if pooled
-  — plus a fourth thing that is not an observation: a healthy pre-#229 night logged nothing after `Publishing via`, so most nights are simply unmeasurable and are reported as an excluded count rather than dropped).
-  `capture-date-precision.md` (issue #226 — what capture-date formats are actually on disk, and what the loader's strict `'%Y-%m-%d'` cost.
-  Read entirely out of run CSVs already on disk — the same shape as `publish-duration.md` above, no network and no credentials — and the same verdict: worth the twenty minutes.
-  Three things generalize.
-  **(1) A reader's permissiveness bounds every statistic downstream of it, and a repair tool that reads through the same reader inherits the blind spot**
-  — `recompute_run_stats.py` processed all 8 affected *runs* in the whole-series #213 pass and left every one NULL.
-  **(2) The one-sided-change tell**: recompute the series under the old reader and the new one and compare DIRECTIONS, not magnitudes
-  — a pass that can only ever clear a value and never restore one is describing its own blind spot, and that is a check any definition change can run for free.
-  **(3) The sweep's denominator is the corpus; the repair's is the catalog, and they differ** — 9 files on disk carry month precision against 8 registered runs, the extra being an unregistered orphan (`saskatoon_sk_…`, superseded by the registered `saskatoon--sk_…` that carries day precision), which no catalog audit and no repair script can see.
-  Also worth knowing before trusting a format census: 77% of all `capture_date` cells in the corpus are ABSENT (ZERO_RESULTS fill), so a share taken over rows rather than over dated rows describes the grid, not the imagery).
-  `kartaview-sweep-cost.md` (issue #225, follow-on to the feasibility study — what a KartaView census of a frozen grid actually costs, which was the one number gating a scheduled channel.
-  The **median catalog city is 12 circles and 16 requests**, the same order as Mapillary's median 12 tiles rather than the "two to three orders of magnitude more" the feasibility study guessed;
-  p95 is 636 and Singapore ~9,974, so it is the tail that decides affordability, not the median.
-  Quote `sweep_requests_observed` and not `sweep_requests_estimate`: the latter is the **geometric floor**, with retries and the per-city calibration ladder unpriced, and it undercounts by 1.54×.)
-  The generating code is `scripts/{topic}_{collect,analyze,common}.py` (kept so the result can be reproduced, not because it runs routinely) and its test pins the sampling invariant.
-  Answer "should we sample finer / differently?" questions from these before re-running anything.
+
+So far, alphabetically — keep that order, so two branches adding a writeup usually insert at different points and merge cleanly:
+
+### `capture-date-precision.md`
+
+Issue #226 — what capture-date formats are actually on disk, and what the loader's strict `'%Y-%m-%d'` cost.
+Read entirely out of run CSVs already on disk — the same shape as `publish-duration.md` above, no network and no credentials — and the same verdict: worth the twenty minutes.
+Three things generalize.
+**(1) A reader's permissiveness bounds every statistic downstream of it, and a repair tool that reads through the same reader inherits the blind spot**
+— `recompute_run_stats.py` processed all 8 affected *runs* in the whole-series #213 pass and left every one NULL.
+**(2) The one-sided-change tell**: recompute the series under the old reader and the new one and compare DIRECTIONS, not magnitudes
+— a pass that can only ever clear a value and never restore one is describing its own blind spot, and that is a check any definition change can run for free.
+**(3) The sweep's denominator is the corpus; the repair's is the catalog, and they differ** — 9 files on disk carry month precision against 8 registered runs, the extra being an unregistered orphan (`saskatoon_sk_…`, superseded by the registered `saskatoon--sk_…` that carries day precision), which no catalog audit and no repair script can see.
+Also worth knowing before trusting a format census: 77% of all `capture_date` cells in the corpus are ABSENT (ZERO_RESULTS fill), so a share taken over rows rather than over dated rows describes the grid, not the imagery.
+
+### `grid-density.md`
+
+Issue #106 — why production stays on the 20 m grid; below ~10 m you buy redundancy, not information, since official panos sit ~10 m apart.
+
+### `kartaview-feasibility.md`
+
+Issue #225 — whether KartaView can be a third provider; it can, as a **census** like Mapillary rather than a GSV-style sample, since its only bulk path is a paginated radius sweep.
+Two traps generalize beyond it: `/1.0/list/nearby-photos/` fills a page by **sequence**, so any share over a truncated page describes one drive rather than one neighbourhood
+— and the page size is a *client* flag, `--ipp`, whose 200 default (against a 2,000 server cap) was what made the first pass conclude that most points could never be measured at all.
+And KartaView's v2 serves **the upload timestamp as the capture date** for one 2025 Grab ingest, so `shotDate >= dateAdded` must be rejected outright: a null is honest, a plausible wrong date is not, which is #213's lesson arriving from a second vendor.
+
+### `kartaview-sweep-cost.md`
+
+Issue #225, follow-on to the feasibility study — what a KartaView census of a frozen grid actually costs, which was the one number gating a scheduled channel.
+The **median catalog city is 12 circles and 16 requests**, the same order as Mapillary's median 12 tiles rather than the "two to three orders of magnitude more" the feasibility study guessed;
+p95 is 636 and Singapore ~9,974, so it is the tail that decides affordability, not the median.
+Quote `sweep_requests_observed` and not `sweep_requests_estimate`: the latter is the **geometric floor**, with retries and the per-city calibration ladder unpriced, and it undercounts by 1.54×.
+
+### `pano-spacing.md`
+
+GSV vs Mapillary capture interval — Mapillary samples 1.4–3.5× finer, and **any per-pano analysis must group by `sequence_id` first**: pooling across contributors collapses the measured interval by 2–8× because the nearest image is usually someone else's drive.
+GSV publishes no drive identifier, so the same correction is impossible there — which makes Mapillary's number the better-founded one, the opposite of the intuition.
+
+### `publish-duration.md`
+
+Issues #218/#230 — how long the nightly publish actually takes, so `scheduler.PUBLISH_TIMEOUT_S` is sized rather than guessed;
+read entirely out of logs already on disk, which is the smallest an experiment gets and still worth the twenty minutes.
+Its transferable lesson is that a log holds **three** populations that look alike
+— the exact `Published in N.N s` line, the pre-#229 `Publishing via` → next-line *upper bound*, and failures, whose 0.05–0.30 s values are not publish durations at all and halve p25 if pooled
+— plus a fourth thing that is not an observation: a healthy pre-#229 night logged nothing after `Publishing via`, so most nights are simply unmeasurable and are reported as an excluded count rather than dropped.
+
+The generating code is `scripts/{topic}_{collect,analyze,common}.py` (kept so the result can be reproduced, not because it runs routinely) and its test pins the sampling invariant.
+Answer "should we sample finer / differently?" questions from these before re-running anything.
 
 ## The derived numbers are committed; only the bulk raw data is gitignored
 
