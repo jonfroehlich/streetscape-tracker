@@ -476,6 +476,58 @@ def test_a_metro_sweep_outgrows_the_flat_timeout(conn):
     assert derived > paced_seconds
 
 
+def test_the_sweep_child_is_timed_with_the_catalog_handle_not_without_it(
+    conn, monkeypatch, tmp_path
+):
+    """`_run_one_city`'s grid arm has to pass `conn` down, and for KartaView
+    that is load-bearing rather than cosmetic.
+
+    The street arm has always passed it and the grid arm never did, which was
+    harmless while `conn` was read only by the `gsv_streets` estimate. The
+    KartaView tier that reads a previous sweep's observed cost changes that:
+    without the handle the estimate silently drops to default-radius geometry,
+    which under-prices an r=500 metro roughly fourfold — and the only symptom
+    would be a SIGKILL months later.
+
+    Asserted end-to-end through `_run_one_city` rather than on
+    `city_timeout_seconds` directly, because the seam that can break is the
+    argument-passing, not the derivation.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    cid = _register_at(conn, "Singapore", 1.35, 103.8, 40000, 40000)
+    city = db.resolve_city(conn, cid)
+    db.register_run(
+        conn,
+        city_id=cid,
+        run_date=date(2026, 7, 1),
+        csv_filename="s.csv.gz",
+        provider="kartaview",
+        api_requests=9_974,
+    )
+
+    seen = {}
+
+    def fake_run(cmd, timeout=None, cwd=None, **kwargs):
+        seen["timeout"] = timeout
+
+        class R:
+            returncode = 0
+
+        return R()
+
+    monkeypatch.setattr(sched.subprocess, "run", fake_run)
+    cfg = dataclasses.replace(_kv_cfg(), log_dir=str(tmp_path))
+    sched._run_one_city(cfg, city, date(2026, 7, 2), "kartaview", conn=conn)
+
+    geometry_only = sched.city_timeout_seconds(cfg, city, "kartaview")
+    assert seen["timeout"] > geometry_only, (
+        "the child was timed from default-radius geometry, so the catalog handle "
+        "never reached the derivation"
+    )
+    assert seen["timeout"] == sched.city_timeout_seconds(cfg, city, "kartaview", conn=conn)
+
+
 def test_a_median_city_sweep_keeps_the_flat_floor(conn):
     """The derivation never drops below the configured floor, so the median
     catalog city — 12 circles, under a minute of fetching — is unaffected."""
