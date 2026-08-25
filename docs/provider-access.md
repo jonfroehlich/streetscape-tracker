@@ -132,7 +132,7 @@ Pacing is untouched at 60/min, and so are both daily budgets — a resumed night
 And the pre-flight estimate still prices the whole tile count even when a resume will fetch a fraction of it, which errs high; that is the safe direction for a budget gate and is left alone.
 
 What it buys, concretely: tiles fetched before a block survive it, a crash between the CSV write and cataloging re-finalizes for ~0 requests, and a night the scheduler winds down mid-city resumes rather than restarting
-— which is also why #256 gates raising `max_concurrent_channels` above 1, since a deadline or SIGTERM under lanes kills up to N children at once instead of one.
+— and it is what clears the resume gate on raising `max_concurrent_channels` above 1, since a deadline or SIGTERM under lanes kills up to N children at once instead of one.
 
 ## The supported way to run a bulk Mapillary catch-up
 
@@ -281,5 +281,6 @@ The binding Mapillary constraint is multi-day *volume* (#241), which intra-night
 **(3) The only observable change is wall clock.**
 The one place this is not free is the pair Google meters per Cloud **project** rather than per IP: `gsv` and `gsv_streets` declare no host, so nothing serializes them, and running them concurrently presents 48k + 24k req/min.
 That is safe **only if the two keys live in separate projects**, which this repo does not record anywhere — it is a Google Cloud Console check before the knob is raised, and a shared project must be fixed by splitting the keys rather than by declaring a fake host (a fake `CHANNEL_HOSTS` entry would couple the night-level breaker to something that is not a host refusal).
-Raising the knob is also gated on **resume for every provider** (#256 — the Mapillary tile census is the open half), because a deadline or a `systemctl stop` kills N children at once instead of 1, and a killed Mapillary child re-spends its tiles into the ceiling this file exists to defend.
+Raising the knob was also gated on **resume for every provider**, because a deadline or a `systemctl stop` kills N children at once instead of 1 and a killed Mapillary child re-spent its tiles into the ceiling this file exists to defend.
+**That gate is met as of #256** (see the checkpoint section above): every channel now resumes, so the Cloud-project check is the one that remains.
 Mechanism, rollout order and the watch list: [`scheduler.md`](scheduler.md).
