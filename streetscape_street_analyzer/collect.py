@@ -70,10 +70,12 @@ from dotenv import find_dotenv, load_dotenv
 from streetscape_metadata_tracker import config as cfg
 from streetscape_metadata_tracker import db
 from streetscape_metadata_tracker.analysis import detect_systemic_failure
+from streetscape_metadata_tracker.checkpointing import checkpoint_path_for, discard_checkpoint
 from streetscape_metadata_tracker.config import load_config
 from streetscape_metadata_tracker.download_common import (
     DownloadError,
     HostUnavailableError,
+    grid_bbox,
     host_exit_code,
 )
 from streetscape_metadata_tracker.download_gsv import collect_points_async
@@ -183,6 +185,36 @@ def run_collect(args: argparse.Namespace) -> int:
             logger.error("No on-street sample points generated; nothing to collect.")
             return 1
 
+        # Keyed on the BUDGET CHANNEL, not the provider: a walk and a grid run
+        # of one city sweep the identical frozen bbox, so a path derived from
+        # geometry alone would let them resume each other's census -- with the
+        # spend landing in the wrong api_usage ledger, under the wrong
+        # credential. Built after --estimate returns, so an estimate still
+        # creates nothing and needs no token.
+        #
+        # AND ON THE NETWORK TYPE, which the channel does NOT separate: 'drive'
+        # and 'all_public' are different series over the SAME frozen bbox in the
+        # SAME street channel (which is why generate_streetwalk_filename carries
+        # the network token). Without it, a walk that dies after its census but
+        # before register_street_walk leaves a checkpoint the other network
+        # type's walk re-finalizes for zero requests, writing the first crawl's
+        # api_requests_total into the second's row. Both walks read the same
+        # tiles, so the census is identical and nothing downstream would show it.
+        checkpoint_path = None
+        if provider == "mapillary":
+            checkpoint_path = checkpoint_path_for(
+                city.city_id,
+                grid_bbox(
+                    city.center_lat,
+                    city.center_lon,
+                    city.grid_width_m,
+                    city.grid_height_m,
+                    city.step_m,
+                ),
+                budget_channel,
+                variant=args.network_type,
+            )
+
         # The provider and network-type tokens are what keep same-night walks
         # apart. Both providers walk the SAME sample points and the scheduler
         # runs them on one run_date; and one frozen bbox yields both a 'drive'
@@ -282,22 +314,40 @@ def run_collect(args: argparse.Namespace) -> int:
                         connection_limit=args.connection_limit,
                         request_timeout=args.timeout,
                         max_requests_per_minute=args.mapillary_max_requests_per_minute,
+                        checkpoint_path=checkpoint_path,
+                        checkpoint_channel=budget_channel,
+                        checkpoint_variant=args.network_type,
                     )
                 )
-        except DownloadError as e:
+        except Exception as e:
             # Failed crawls still spent real requests; record them so a later
             # budget check doesn't overspend the street channel. This runs for
             # a host-unavailable failure too (HostUnavailableError IS a
             # DownloadError) — a Mapillary walk blocked partway through the
             # tile census has spent real requests, and a busy-lock failure has
             # spent none, so the same accounting is correct for both.
+            #
+            # `except Exception`, not DownloadError, and cli.py's register_run
+            # arm says why in the same words: a Mapillary walk whose POST-FETCH
+            # tail dies (ENOSPC on the gzip write, a read-back failure) raises
+            # OSError/ValueError with the spend attached by the collector — and
+            # because its checkpoint survives and the resume re-finalizes for ~0
+            # new requests, a spend missed here would never land in ANY ledger
+            # row (PR #251 review, and #256 for this path). Narrower than that,
+            # the tail's requests were simply lost with the process and a re-run
+            # bought them again, so nothing went unrecorded.
             spent = getattr(e, "api_requests", 0)
             if spent:
                 db.add_api_usage(conn, run_date, spent, provider=budget_channel)
                 logger.warning(
                     "Recorded %d %s requests spent by the failed crawl", spent, budget_channel
                 )
-            logger.error("Collection failed: %s", e)
+            if isinstance(e, DownloadError):
+                logger.error("Collection failed: %s", e)
+            else:
+                # Not a provider condition: log the traceback, since this is the
+                # only record of it (run_collect's caller has no handler).
+                logger.exception("Collection failed after the fetch: %s", e)
             if isinstance(e, HostUnavailableError):
                 return host_exit_code(e)
             return 1
@@ -374,10 +424,23 @@ def run_collect(args: argparse.Namespace) -> int:
             length_km_covered=totals["length_km_covered"],
             length_km_covered_any=totals["length_km_covered_any"],
             median_covered_age_years=totals["median_covered_age_years"],
-            api_requests=dict_results["api_requests"],
+            # The CRAWL's cost across resumes, not this process's: the row
+            # describes the walk. add_api_usage above is fed the per-process
+            # figure because it is additive and keyed by (date, provider) --
+            # see the same split in cli.py's register_run (#239, #256).
+            api_requests=dict_results.get("api_requests_total", dict_results["api_requests"]),
             started_at=dict_results.get("started_at"),
             finished_at=dict_results.get("finished_at") or datetime.now(UTC).isoformat(),
         )
+
+        # Only now is the checkpoint spent: the street_walks row is committed,
+        # so the crawl's cost is durable and every remaining failure is cheap (a
+        # lost diff or manifest rebuilds from artifacts already on disk).
+        # Discarding before this line would make a register failure cost the
+        # whole census again -- the placement cli.py already reasons through,
+        # and the walk path had no discard at all until #256.
+        if dict_results.get("checkpoint_path"):
+            discard_checkpoint(dict_results["checkpoint_path"])
 
         # Diff against the previous walk of this series (issue #101) — before
         # the manifest refresh below so the manifest immediately advertises

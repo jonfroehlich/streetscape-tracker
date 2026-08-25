@@ -22,10 +22,13 @@ import os
 from datetime import date
 
 import geopandas as gpd
+import pytest
 from shapely.geometry import LineString
 
 from streetscape_metadata_tracker import db
 from streetscape_metadata_tracker import download_gsv as dg
+from streetscape_metadata_tracker.checkpointing import checkpoint_path_for
+from streetscape_metadata_tracker.download_common import grid_bbox
 from streetscape_metadata_tracker.download_mapillary import (
     DEFAULT_TILE_REQUESTS_PER_MINUTE,
     records_to_census,
@@ -70,7 +73,7 @@ def _image(image_id, lat, lon, *, is_pano=True, captured_at_ms=1655000000000, cr
     }
 
 
-def _setup(tmp_path, monkeypatch, images):
+def _setup(tmp_path, monkeypatch, images, *, api_requests=7, api_requests_total=None):
     """Data dir + catalog with one city; edges and the tile census served locally."""
     data_dir = str(tmp_path)
     conn = db.connect(db.get_default_db_path(data_dir))
@@ -95,9 +98,21 @@ def _setup(tmp_path, monkeypatch, images):
     async def fake_fetch_images(city_name, bbox, access_token, **kwargs):
         assert access_token == "MLY|TESTTOKEN"  # the streets token, not the grid one
         calls["n"] += 1
+        calls["checkpoint_path"] = kwargs.get("checkpoint_path")
+        calls["checkpoint_channel"] = kwargs.get("checkpoint_channel")
+        calls["checkpoint_variant"] = kwargs.get("checkpoint_variant")
         return {
             "census": records_to_census(images),
-            "api_requests": 7,
+            # Per-process spend and the crawl's cumulative spend are different
+            # numbers by design (#256): the first feeds the additive daily
+            # ledger, the second the street_walks row. Equal here because this
+            # fake never resumes; test_streetwalk_mapillary_resume drives them
+            # apart.
+            "api_requests": api_requests,
+            "api_requests_total": (
+                api_requests if api_requests_total is None else api_requests_total
+            ),
+            "checkpoint_path": kwargs.get("checkpoint_path"),
             "tiles": 7,
             "raw_feature_count": len(images),
         }
@@ -497,3 +512,112 @@ def test_nearest_images_to_samples_handles_empty_inputs():
     # An empty census leaves every sample unmatched rather than raising.
     no_images = cm.nearest_images_to_samples([(44.05, -121.3, 0, 0)], records_to_census([]), 25.0)
     assert all(list(m) == [-1] for m in no_images)
+
+
+# --- The census checkpoint (issue #256) -------------------------------------
+
+
+def test_the_walk_checkpoints_under_its_own_channel_not_the_grid_runs(tmp_path, monkeypatch):
+    """
+    A walk and a grid run of one city sweep the IDENTICAL frozen bbox, so
+    geometry alone cannot tell their checkpoints apart. The budget channel is
+    what does — and it has to be the channel, not the provider, or the walk
+    would resume the grid run's census and meter it into the wrong ledger under
+    the wrong credential.
+
+    The NETWORK TYPE is the other half, and the channel does not supply it: two
+    walks of one city agree on the ledger, the credential and every geometric
+    parameter, so without it the second would re-finalize the first's crawl for
+    zero requests and inherit its `api_requests_total`.
+    """
+    images = [_image("p1", 44.05, -121.30)]
+    data_dir, calls = _setup(tmp_path, monkeypatch, images)
+
+    assert collect.run_collect(_args(data_dir)) == 0
+
+    city = db.resolve_city(db.connect(db.get_default_db_path(data_dir)), CITY_QUERY)
+    bbox = grid_bbox(
+        city.center_lat, city.center_lon, city.grid_width_m, city.grid_height_m, city.step_m
+    )
+    assert calls["checkpoint_channel"] == "mapillary_streets"
+    assert calls["checkpoint_variant"] == "drive"
+    assert calls["checkpoint_path"] == checkpoint_path_for(
+        CITY_ID, bbox, "mapillary_streets", variant="drive"
+    )
+    assert calls["checkpoint_path"] != checkpoint_path_for(CITY_ID, bbox, "mapillary")
+    assert calls["checkpoint_path"] != checkpoint_path_for(
+        CITY_ID, bbox, "mapillary_streets", variant="all_public"
+    )
+
+
+def test_the_walk_row_takes_the_crawl_and_the_ledger_this_process(tmp_path, monkeypatch):
+    """
+    The #239/#256 split, on the walk path this time: street_walks.api_requests
+    describes the walk, api_usage is additive and keyed by (date, provider).
+    """
+    images = [_image("p1", 44.05, -121.30)]
+    data_dir, _ = _setup(tmp_path, monkeypatch, images, api_requests=4, api_requests_total=19)
+
+    assert collect.run_collect(_args(data_dir)) == 0
+
+    conn = db.connect(db.get_default_db_path(data_dir))
+    walk = db.get_latest_street_walk(conn, CITY_ID, provider="mapillary")
+    assert walk["api_requests"] == 19, "the row carries the whole crawl"
+    assert db.get_api_usage(conn, date(2026, 7, 8), provider="mapillary_streets") == 4, (
+        "the ledger carries only this process's spend"
+    )
+
+
+def test_a_walk_that_fails_to_catalog_keeps_its_checkpoint(tmp_path, monkeypatch):
+    """
+    The discard belongs AFTER register_street_walk. Before it, a catalog failure
+    would cost the whole census again — the placement cli.py already reasons
+    through, and the walk path had no discard at all until #256.
+    """
+    images = [_image("p1", 44.05, -121.30)]
+    data_dir, calls = _setup(tmp_path, monkeypatch, images)
+    discarded = []
+    monkeypatch.setattr(collect, "discard_checkpoint", discarded.append)
+
+    def explode(*a, **k):
+        raise RuntimeError("catalog write failed")
+
+    monkeypatch.setattr(db, "register_street_walk", explode)
+    with pytest.raises(RuntimeError):
+        collect.run_collect(_args(data_dir))
+    assert discarded == [], "a failed register must not spend the checkpoint"
+
+
+def test_a_cataloged_walk_discards_its_checkpoint(tmp_path, monkeypatch):
+    images = [_image("p1", 44.05, -121.30)]
+    data_dir, calls = _setup(tmp_path, monkeypatch, images)
+    discarded = []
+    monkeypatch.setattr(collect, "discard_checkpoint", discarded.append)
+
+    assert collect.run_collect(_args(data_dir)) == 0
+    assert discarded == [calls["checkpoint_path"]]
+
+
+def test_a_walk_whose_tail_dies_still_records_what_the_census_cost(tmp_path, monkeypatch):
+    """
+    The checkpoint is what makes this a permanent loss rather than a wasted
+    night. Without one, a tail failure lost the spend with the process and a
+    re-run bought the tiles again, so nothing went unrecorded. With one, the
+    checkpoint survives COMPLETE and the next invocation re-finalizes it for
+    zero requests — so a spend missed here would land in no `api_usage` row,
+    ever. Same gap PR #251 closed for KartaView in the grid pipeline.
+    """
+    images = [_image("p1", 44.05, -121.30)]
+    data_dir, _ = _setup(tmp_path, monkeypatch, images, api_requests=11)
+
+    def explode(*a, **k):
+        raise OSError("no space left on device")
+
+    # After the census, before the CSV lands — not a DownloadError.
+    monkeypatch.setattr(cm, "build_streetwalk_rows", explode)
+
+    assert collect.run_collect(_args(data_dir)) == 1
+    conn = db.connect(db.get_default_db_path(data_dir))
+    assert db.get_api_usage(conn, date(2026, 7, 8), provider="mapillary_streets") == 11, (
+        "the tiles were bought; the ledger has to know even though the walk failed"
+    )

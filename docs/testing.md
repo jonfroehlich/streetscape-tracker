@@ -151,6 +151,21 @@ and `hosts_unavailable` is anchored to the blocked-host note's own `; `-delimite
 - Columnar census (issue #157: the **golden run CSV** — `tests/fixtures/mapillary_golden_run.csv`, generated from the row-wise implementation and asserted byte-for-byte except the geodesic grid columns, since a formatting or ordering drift would fake a diff in every Mapillary city; a companion test guarding the fixture's own coverage, because a silently-narrowed fixture still passes the byte comparison while protecting nothing; a second companion guarding the *comparison*, since a grid tolerance wide enough to swallow a real regression leaves a golden test that passes no matter what ships
   — it pins acceptance of the measured cross-platform ULP noise against rejection of a float32-scale coordinate shift, reordered rows, a dropped row, a moved image coordinate, a changed status, and a differently-rendered null; and the scalar-vs-vectorized capture-date equivalence including the values pandas can represent and `datetime` cannot)
 
+- Mapillary tile-census resume (`tests/test_mapillary_resume.py`, issue #256
+  — the headline pin is BYTE IDENTITY: a census interrupted after one tile and resumed reproduces the **same golden fixture** the uninterrupted path is pinned to,
+  which is what the tile-keyed part naming and the `tiles_for_bbox` reassembly exist for, since a reordering would read as imagery churn in every Mapillary city;
+  a companion pins the border duplicate directly, serving a different payload per tile so the census records which copy won.
+  Also: only successful tiles commit and a failed one is refetched while the tolerance denominator stays the full tile set; an empty tile gets a record and no part file;
+  the parquet parts round-trip the census's extension dtypes, which is why they are not CSV (`"NA"`/`"None"` as provider-supplied strings, null `on_foot`, null `captured_at_ms`);
+  each way a checkpoint can be unusable — format, bbox, zoom, channel, tile count, age, corrupt state, a part short of its recorded row count — discards and refetches **without raising**, and a six-day-old one still resumes;
+  a failing commit warns exactly once and never fails the city, and an unwritable directory fetches unprotected; a city blocked before committing leaves no empty directory;
+  the walk and the grid run get different checkpoint directories and a cross-channel resume is refused, as do the two `--network-type` walks of one city, which the channel alone cannot separate;
+  and the two counters split, **including that a blocked night's refused requests reach the crawl total** — they are counted into `api_usage` deliberately, so without `_commit_spend` the resumed row would price the city below what it cost.
+  Four pins come from the #256 review, and each fails loudly on the code as first written: the age cap is measured from the FIRST commit, so a night that commits no tile moves `updated_at` and leaves `created_at` alone — otherwise a nightly-refused city refreshes its own clock forever and the cap protects nothing;
+  a run whose stale checkpoint was DISCARDED is still protected afterwards, since the discard deletes the directory the fresh handle is about to commit into;
+  a part is fsynced before it is renamed, checked by recording the `fsync`/`replace` order rather than by trusting the call site;
+  and a part written before any commit record is swept, which the loader returns too early to reach)
+
 ## Catalog backups (issue #145)
 
 **The restore drill** — a populated catalog plus its `-wal`/`-shm` sidecars genuinely deleted, restored, and asserted intact/complete down to frozen geometry and schema version;

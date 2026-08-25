@@ -143,10 +143,11 @@ The Mapillary **grid** never receives it (`cli.py` omits the argument, so `fetch
 Combined with affinity, the only overlapping pair that points two full-size connectors at one third party is `gsv` + `gsv_streets` — both Google — which is 100 concurrent sockets on the same endpoints gate (2) below is already about.
 Dividing makes the knob a no-op at 1 and bounded above it; the trade is that a city with a single enabled channel gets the divided share too, so **raise `connection_limit` deliberately when you raise the knob** rather than discovering the multiplication in production.
 
-**Two things gate raising it in production, both outside this repo.**
+**Two things gated raising it in production. The first is now satisfied; the second is still outside this repo.**
 (1) **Resume for every provider**, because a deadline or a `systemctl stop` now kills up to N children at once instead of 1.
-GSV grid (`.downloading` sibling), the GSV road walk (same `collect_points_async` engine) and KartaView (`checkpoints/`, #239) all resume; the **Mapillary tile census does not — issue #256**, and a killed Mapillary child re-spends its tiles against the deliberate 3,500/day per-IP ceiling, which is ban risk under #241 rather than merely lost time.
-A killed child also records no `api_usage` at all (#238), and that loss multiplies by N.
+This is **met as of #256**: GSV grid (`.downloading` sibling), the GSV road walk (same `collect_points_async` engine), KartaView (`checkpoints/`, #239) and both Mapillary channels (`checkpoints/`, #256) all resume,
+so a killed child costs the tiles it had not yet fetched rather than the ones it had — which mattered here because a re-spend lands against the deliberate 3,500/day per-IP ceiling, i.e. ban risk under #241 rather than merely lost time.
+A killed child still records no `api_usage` at all (#238), and that loss multiplies by N — unchanged by the checkpoint, since it is the parent that never sees the number.
 (2) **`gsv` and `gsv_streets` hold no per-IP lock**, because Google meters per Cloud *project* rather than per IP — so running them together is only safe while `GMAPS_API_KEY` and `GMAPS_STREETS_API_KEY` really do live in **separate projects**.
 Nothing in this repo records which project either key belongs to; it is a console check, and a shared project must be fixed by splitting the keys, never by inventing a fake `CHANNEL_HOSTS` entry (that would couple the night-level breaker to a condition that is not a host refusal).
 **Rollout:** land at 1 everywhere and diff two nights' summary lines against history to check the byte-equivalence claim in production; then the two gates above; then flip prod to **2 before 3**, since `gsv` is the long pole and already overlaps each short channel in turn at 2, for half the blast radius of the unmeasured (cgroup memory sum, log interleaving).

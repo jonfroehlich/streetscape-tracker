@@ -188,6 +188,55 @@ deleting any earlier is what would make a crash in the tail re-pay it.
 `SweepIncompleteError` propagates to `SWEEP_INCOMPLETE_EXIT_CODE` (83), and `--kartaview-max-requests` is what makes that reachable by hand — a bounded sweep that publishes nothing but keeps its spend.
 The one thing that is genuinely provider-shaped rather than shared is `_points_in_cells`, the `unmeasured_mask` over `failed_cells`: it masks each cell's **square** (the circle is what the request covered and is 1.57× the area, so masking with it would mark neighbouring cells that *were* measured as unknown) and loops rather than packing one key, because subdivision means cells are not one size.
 
+## The Mapillary tile census checkpoints too, and its reassembly order is the contract (issue #256)
+
+**Both census providers now resume, and the Mapillary half is shaped by one fact the KartaView half does not have to deal with: its tiles are fetched concurrently.**
+The plumbing they share — where checkpoints live, how a directory is named and validated, how a rename into it is made durable, how a finished one is removed — is in `checkpointing.py`,
+which exists because no provider module may import from another's and a shared home is the alternative to a copy.
+What each provider keeps *inside* its directory is its own, because that part is shaped by the crawl.
+
+**Parts are keyed by tile `(x, y)`, not by fetch order, and reassembly walks `tiles_for_bbox`.**
+KartaView visits its root cells in a deterministic order, so it can number parts `0..n` and replay them in that order.
+`_fetch_city_images` runs `asyncio.gather` behind a semaphore, so completion order is nondeterministic — a fetch-order index would make a resumed census depend on which tiles happened to land before the interruption.
+Since `tiles_for_bbox` is pure, the order is **recomputed rather than stored**: walk the tile list, take each tile's frame from this run if it was fetched now and from its part file otherwise.
+`gather` preserves argument order, so an uninterrupted run and a resumed one hand `concat_census` positionally identical input.
+That is the whole byte-identity mechanism, and it is what keeps `dedupe_census`'s first-position/last-value rule on a **border duplicate** — an image inside two tiles — from resolving differently depending on which night fetched which copy.
+The golden fixture is the test: a run interrupted after one tile and resumed must reproduce it byte for byte, which is what `tests/test_mapillary_resume.py` asserts against the very fixture `test_mapillary.py` pins the uninterrupted path with.
+Get this wrong and `diff.py` reports imagery churn in every Mapillary city, indistinguishable from a real re-drive.
+
+**Only successful tiles are committed**, so a 404 or a timeout stays refetchable and #168's tolerance keeps measuring failures against the **full** tile set rather than against whatever one process attempted.
+One tile is one paced request, so per-tile commits are at most one small write per second at 60/min — and they make #205's fail-fast salvage automatic, since everything fetched before the fatal is already durable when it re-raises.
+A **zero-row tile gets a record and no file**: most tiles over a real bbox are empty, and a part for each would mean 870 files for Moscow to say nothing.
+
+**Checkpointing here fails OPEN, which is a deliberate divergence from KartaView's fail-fast.**
+There the trade is right — ten hours of paid-for crawl is worth more than the night that loses it.
+The worst Mapillary city is ~15 minutes, so an unwritable directory or a failing commit logs one warning, latches, and lets the fetch carry on unprotected: a city must never fail over its own safety net.
+An unusable checkpoint (format, bbox, zoom, channel, variant, tile count, age, a missing or short part) is **discarded and refetched**, never raised on — and unlike KartaView's it is deleted rather than left, because tile-keyed part names are never overwritten by a crawl that does not resume them.
+
+**Because the discard DELETES, the checkpoint is loaded before its directory is created, and that order is load-bearing.**
+Creating first means the directory the fresh handle is about to commit into is the one the discard just removed: every commit fails, `degraded` latches on the first tile, and the whole city fetches unprotected.
+The case that produces is the age cap, i.e. the first attempt after a multi-day block — so the one run that most needs the safety net would be the one running without it.
+Creating afterwards still happens before the first request, which is the property that actually matters: an unwritable path must fail in a second rather than fifteen minutes in.
+
+**A part is fsynced before it is renamed, and the directory after**, the same four fsyncs per commit `download_kartaview._commit_checkpoint` spends and for the same reason.
+Without them the part-then-state ordering holds against a process crash — where the page cache survives and the fsync buys nothing — but not against a power loss, where the two renames may reach the disk in either order.
+What that leaves is not a wrong artifact, since the loader's footer check catches a part shorter than its record; it is the loss of the **whole** checkpoint rather than the last tile.
+
+**The two counters mean what they mean on the KartaView side**, and one subtlety is easy to lose: spend that happens *after* the last committed tile — the requests a block refuses, which `api_usage` counts deliberately — is written into the record by `_commit_spend` on the failure paths.
+Without that, a resumed run's catalog row prices the city below what it actually cost, because those requests die with the process while the ledger keeps them.
+It is skipped when nothing was committed, so a city blocked on request 1 still leaves no directory behind.
+
+**That write is also why the age cap is measured from `created_at` — when the FIRST tile was committed — and never from the last write.**
+`_commit_spend` rewrites the record on a night that committed no tile at all, and a host-blocked night deliberately records no `consecutive_failures`, so the same stalest city is re-attempted the next night and the next.
+Ageing from the last write would let a city refresh its own clock indefinitely and hold rows from any distance in the past under the limit — defeating the one guard in this design that protects an **artifact** rather than a night's work.
+`created_at` is stamped by the first write of a crawl and carried forward by every later one; `updated_at` still moves, for an operator reading the directory.
+
+**The path key is (city, grid geometry, channel, variant), and the variant is what separates two WALKS of one city.**
+The channel separates a walk from a grid run, but `drive` and `all_public` are different series over the same frozen bbox in the same street channel — which is why `generate_streetwalk_filename` carries the network token.
+Without the variant a walk that dies after its census but before `register_street_walk` leaves a checkpoint the other network type's walk re-finalizes for zero requests, writing the first crawl's `api_requests_total` into the second's row.
+Both walks read the same tiles, so the census is identical and nothing downstream would show it.
+A grid run has exactly one crawl per channel and passes no variant, which keeps its path byte-identical to the one #239 shipped.
+
 ## Still NOT a scheduler channel (issue #248)
 
 **Still NOT a scheduler channel, and a `[providers.kartaview]` block is refused rather than accepted — recorded and dropped at load, with `run-due`/`assess-city` exiting `USAGE_EXIT_CODE` while it exists.** The token that makes the CLI work also makes that config block *parse*,

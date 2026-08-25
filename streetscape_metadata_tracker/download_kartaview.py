@@ -104,7 +104,6 @@ import json
 import logging
 import math
 import os
-import shutil
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -117,6 +116,36 @@ import pyarrow.parquet as pq
 
 from . import census as census_core
 from .analysis import EARLIEST_PLAUSIBLE_CAPTURE
+from .checkpointing import (
+    CHECKPOINT_DIR_ENV as CHECKPOINT_DIR_ENV,
+)
+from .checkpointing import (
+    CHECKPOINT_MAX_AGE_S as CHECKPOINT_MAX_AGE_S,
+)
+from .checkpointing import (
+    CHECKPOINT_STATE_FILENAME as CHECKPOINT_STATE_FILENAME,
+)
+from .checkpointing import (
+    _bbox_matches as _bbox_matches,
+)
+from .checkpointing import (
+    _fsync_dir as _fsync_dir,
+)
+from .checkpointing import (
+    _remove_empty_checkpoint_dir as _remove_empty_checkpoint_dir,
+)
+from .checkpointing import (
+    _state_path as _state_path,
+)
+from .checkpointing import (
+    checkpoint_dir as checkpoint_dir,
+)
+from .checkpointing import (
+    checkpoint_path_for as checkpoint_path_for,
+)
+from .checkpointing import (
+    discard_checkpoint as discard_checkpoint,
+)
 from .config import KARTAVIEW_METADATA_DTYPES
 from .download_common import (
     HOST_KARTAVIEW,
@@ -127,7 +156,6 @@ from .download_common import (
     redact_credentials,
 )
 from .host_lock import host_lock
-from .paths import get_project_root
 from .progress import progress
 
 logger = logging.getLogger(__name__)
@@ -237,7 +265,6 @@ MAX_FAILED_AREA_FRACTION = 0.02
 # its root-cell count and not its request count; the two differ by ~2x and it is
 # the cells that would each get a file.
 CHECKPOINT_FORMAT_VERSION = 1
-CHECKPOINT_STATE_FILENAME = "state.json"
 CHECKPOINT_PART_TEMPLATE = "part-{index:05d}.parquet"
 
 # Requests between commits. 32 is two minutes at the shipped pace, which bounds
@@ -253,20 +280,6 @@ CHECKPOINT_PART_TEMPLATE = "part-{index:05d}.parquet"
 # `checkpoint_path=None`.
 DEFAULT_CHECKPOINT_REQUEST_INTERVAL = 32
 
-# How old a checkpoint may be before it is discarded rather than resumed.
-#
-# NOT tidiness -- this is the one way a checkpoint could produce a WRONG artifact
-# rather than merely wasted work, which is the line the whole design is drawn
-# against. The frozen grid geometry never changes, so bbox, ipp, radius and
-# root_count all still match months later: a checkpoint left by a city that was
-# interrupted and then sat out a long gap (a channel switched off after a per-IP
-# block, `consecutive_failures` quarantining a city for a whole 90-day cycle)
-# would resume and splice rows fetched last quarter into a snapshot dated today,
-# published as one observation of one day. Seven days is comfortably longer than
-# any legitimate multi-night sweep -- Singapore, the worst city in the catalog, is
-# ~10.4 h -- and comfortably shorter than the 80-day `min_days_since_last_run`
-# cadence, so it can only ever catch the stale case.
-CHECKPOINT_MAX_AGE_S = 7 * 24 * 3600
 
 # Per-request timeout. Higher than the tile CDN's 30 s: this endpoint is a
 # database query against a service whose own tracker carries an open MySQL
@@ -1429,100 +1442,12 @@ def _bbox_area_m2(bbox: tuple[float, float, float, float]) -> float:
 # an integer. `state.json` is written last and atomically, so it is the commit
 # point: a part that exists without being counted never happened.
 #
-# THE PATH IS THE CALLER'S, AND IT MUST BE DATE-FREE. The whole point is a sweep
-# that spans nights, and a run is dated on the day it COMPLETES -- so a
-# date-bearing path (the `.downloading` and `.harvesting` convention, where a
-# collection finishes in one night) would make every night start from zero. It
-# must also be a realpath: on makelab2 the unit's WorkingDirectory is a symlink,
-# and two spellings of one directory would silently be two checkpoints, i.e.
-# exactly the restart-from-zero this exists to prevent (see host_lock.lock_dir,
-# which carries the same reasoning for the same host). Finally it belongs OUTSIDE
-# `data/` -- a partial census is the one artifact that must never reach the
-# publisher -- which is what the gitignored `checkpoints/` sibling is for.
+# The rules that are NOT about what is being crawled -- where checkpoints go,
+# why the path is date-free, why the channel is part of its key, and why the
+# CALLER discards it once its artifact is durable -- moved to `checkpointing.py`
+# when Mapillary grew a checkpoint of its own (#256). Read them there; they are
+# preconditions for this file, not background.
 #
-# THE PATH KEY IS (CITY, GRID GEOMETRY, CHANNEL), AND THE CHANNEL IS NOT
-# OPTIONAL. A KartaView road walk will call this exact function with the same
-# frozen `grid_bbox` the grid run uses -- that is the Mapillary precedent
-# (`collect_mapillary` builds its bbox from the city's frozen geometry) and the
-# reason this fetch is shared at all. So a walk and a grid run of one city agree
-# on bbox, ipp, radius AND root_count: every validation in `load_checkpoint`
-# passes and the two channels would happily resume each other's sweeps. The
-# census would be the same either way, but the channels meter into SEPARATE
-# `api_usage` ledgers, so one would inherit the other's `api_requests_total`.
-#
-# THE CALLER OWNS THE DIRECTORY AND MUST `discard_checkpoint` IT once its dated
-# artifacts are durable. This function deliberately does NOT delete the
-# checkpoint on a clean sweep, and that is the whole of what makes "a crash in
-# the caller's tail" recoverable: the census is returned as a DataFrame and the
-# caller writes the CSV, the stats, the run row, the JSON and the diff after this
-# returns. Deleting here -- which is where the delete first lived -- would mean
-# the checkpoint is already gone by the time any of that can fail, so the one
-# interruption of the four named above that lands OUTSIDE this function would be
-# the one not covered. Discarding is one line at the end of a caller that just
-# finished writing its artifact, exactly as `download_gsv` unlinks `.downloading`
-# after its CSV lands. A caller that forgets is bounded rather than broken:
-# CHECKPOINT_MAX_AGE_S caps how long a complete checkpoint can be re-finalized,
-# `load_checkpoint` says so at WARNING, and the tell is `api_requests == 0`.
-
-
-CHECKPOINT_DIR_ENV = "STREETSCAPE_CHECKPOINT_DIR"
-
-
-def checkpoint_dir() -> str:
-    """
-    Directory holding in-flight sweep checkpoints.
-
-    The same three constraints as ``host_lock.lock_dir``, for the same host and
-    for reasons that rhyme: **not** ``/tmp`` (the systemd unit sets
-    ``PrivateTmp=true``, so a resumed sweep would never find the night's work),
-    **not** the unresolved checkout path (``%h/streetscape-tracker`` is a
-    symlink and ``get_project_root()`` uses ``abspath``, which does not resolve
-    it, so two spellings of one directory would silently be two checkpoints --
-    i.e. exactly the restart-from-zero this exists to prevent), and **not** under
-    ``data/``, which ``sync_data_to_server.sh`` rsyncs to a public web server. A
-    partial census is the one artifact that must never reach the publisher.
-
-    The env override is realpath'd for the same reason the default is: an
-    operator exporting the ``~`` spelling of the deployed path would otherwise
-    derive a different directory and resume nothing.
-    """
-    override = os.environ.get(CHECKPOINT_DIR_ENV)
-    if override:
-        return os.path.realpath(override)
-    return os.path.join(os.path.realpath(get_project_root()), "checkpoints")
-
-
-def checkpoint_path_for(city_id: str, bbox: tuple[float, float, float, float], channel: str) -> str:
-    """
-    Checkpoint directory for one (city, grid geometry, channel).
-
-    DATE-FREE by construction, which is the contract: a sweep is meant to span
-    nights and a run is dated on the day it COMPLETES, so a date in this path
-    would make every night start from zero.
-
-    The CHANNEL is not optional. A KartaView road walk will sweep the same
-    frozen bbox at the same ipp and radius, so every geometric validation in
-    :func:`load_checkpoint` would pass and the two channels would resume each
-    other's sweeps -- with different credentials and different ledgers. The
-    commit record also stores the channel it was written under and
-    ``load_checkpoint`` compares it, so the path is the half that keeps the
-    directories apart and the state file is the half that refuses if they meet
-    anyway.
-
-    The bbox is folded in rather than trusted to the city_id because the frozen
-    grid can be re-registered (``scripts/resize_city.py``, ``cap_oversized_grids.py``):
-    a checkpoint keyed on the slug alone would survive a resize and resume onto a
-    lattice it does not describe. ``load_checkpoint`` also compares the stored
-    bbox, so this is the cheap half of a belt-and-braces pair -- but it is the
-    half that keeps the stale directory from lingering under the live name.
-
-    Args:
-        city_id: canonical catalog slug.
-        bbox: the frozen grid's (min_lon, min_lat, max_lon, max_lat).
-        channel: 'kartaview' for a grid run; a walk uses its own channel name.
-    """
-    geometry = "_".join(f"{coord:.6f}" for coord in bbox)
-    return os.path.join(checkpoint_dir(), channel, f"{city_id}_{geometry}")
 
 
 @dataclass
@@ -1564,46 +1489,8 @@ def _cell_from_dict(record: dict[str, Any]) -> Cell:
     )
 
 
-def _fsync_dir(path: str) -> None:
-    """
-    Make a rename into ``path`` durable.
-
-    ``os.replace`` is atomic but not durable: the directory entry it rewrites
-    lives in the containing directory, so without this the part-then-state
-    ordering survives a process crash and not a power loss. Best effort -- some
-    filesystems refuse ``O_RDONLY`` fsync on a directory, and a checkpoint must
-    never be what fails a sweep.
-    """
-    try:
-        fd = os.open(path, os.O_RDONLY)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-    except OSError as e:  # pragma: no cover - platform-dependent
-        logger.debug(f"Could not fsync the checkpoint directory {path}: {e}")
-
-
-def _state_path(path: str) -> str:
-    return os.path.join(path, CHECKPOINT_STATE_FILENAME)
-
-
 def _part_path(path: str, index: int) -> str:
     return os.path.join(path, CHECKPOINT_PART_TEMPLATE.format(index=index))
-
-
-def _bbox_matches(stored: Any, bbox: tuple[float, float, float, float]) -> bool:
-    """
-    Is a stored bbox the same lattice frame as this one?
-
-    Compared numerically at 1e-9 deg (~0.1 mm) rather than exactly, for the
-    reason the golden-fixture comparison uses the same figure: the frozen bbox
-    comes from a geodesic solve over libm, whose last ULP is not portable. A
-    tolerance that tight cannot hide a real reframing.
-    """
-    if not isinstance(stored, list | tuple) or len(stored) != 4:
-        return False
-    return all(abs(float(a) - float(b)) <= 1e-9 for a, b in zip(stored, bbox, strict=True))
 
 
 def load_checkpoint(
@@ -1887,53 +1774,6 @@ def _checkpoint_frames(cp: SweepCheckpoint) -> list[pd.DataFrame]:
     everything by construction.
     """
     return [pd.read_parquet(_part_path(cp.path, index)) for index in range(cp.parts)]
-
-
-def discard_checkpoint(path: str) -> None:
-    """
-    Remove a finished checkpoint. THE CALLER'S JOB, once its artifact is durable.
-
-    :func:`_fetch_city_images` deliberately does not call this on a clean sweep.
-    It returns the census as a DataFrame and the caller then writes the dated
-    CSV, the stats, the ``runs`` row, the JSON and the diff -- so a delete
-    issued before returning would be the one thing guaranteeing that a crash in
-    that tail costs the whole sweep again, which is one of the four
-    interruptions #239 exists to cover. Call this last, after the artifact
-    lands, the way ``download_gsv`` unlinks its ``.downloading`` sibling.
-
-    Best effort: a checkpoint that cannot be removed must never fail a run that
-    has already succeeded. The stale directory it leaves is bounded by
-    :data:`CHECKPOINT_MAX_AGE_S`.
-
-    Args:
-        path: the checkpoint directory, as echoed back in ``checkpoint_path``.
-    """
-    try:
-        shutil.rmtree(path)
-    except FileNotFoundError:
-        pass  # already gone; discarding twice is not an error
-    except OSError as e:
-        logger.warning(f"Could not remove the finished KartaView checkpoint at {path}: {e}")
-
-
-def _remove_empty_checkpoint_dir(path: str | None) -> None:
-    """
-    Drop a checkpoint directory nothing was ever written into.
-
-    The directory is created BEFORE the first request, deliberately, so that an
-    unwritable path fails in one second rather than ten hours in. But a sweep
-    can then die before the radius is settled -- a rejected credential, a host
-    block during calibration, a bbox where no rung answers anywhere (Horace) --
-    and never open a checkpoint at all, leaving an empty directory behind on
-    every attempt. ``os.rmdir`` refuses a non-empty directory, which is exactly
-    the test wanted: a real checkpoint is never touched.
-    """
-    if path is None:
-        return
-    try:
-        os.rmdir(path)
-    except OSError:
-        pass
 
 
 async def download_kartaview_metadata_async(

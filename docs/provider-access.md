@@ -73,6 +73,27 @@ And our block matched the documented tile limit in **no** respect: wrong scope (
 So the mechanism that hit us is undocumented in every attribute, and no budget or rate in this repo is derived from the docs — they are bets.
 This is the corollary in `CLAUDE.md`'s READ THIS FIRST section in action: *treat any behavior you cannot find documented as unknown rather than unlimited.*
 
+## A staff reply confirms the IP layer exists, and settles nothing else (2026-08-24)
+
+**A Mapillary staff reply now says in as many words that a second blocking system runs at the IP level, underneath the documented per-app cap.**
+Asked on [50,000 requests/day rate limit scope](https://forum.mapillary.com/t/50-000-requests-day-rate-limit-scope/10644) whether the tile limit is scoped per app, per account, per IP or globally, a staff member answered on **2026-08-24**:
+
+> The mentioned 50k is by app ID.
+> At the same time, if you use the same IP address and this is a sudden spike, the system might block you earlier.
+
+Read against the section above, that changes exactly one thing.
+The per-IP mechanism is no longer only a community report plus our own two incidents: a Mapillary employee describes it, and describes it as a distinct system that can refuse an address well below the documented per-app ceiling.
+That is the first outside corroboration of what #198/#199/#241 worked out the expensive way, and it retires the "undocumented in every attribute" framing above for the *scope* attribute only — the threshold and the 302 status remain undescribed by anyone.
+
+It does **not** settle which axis trips that layer.
+"A sudden spike" is rate-flavoured language, and #241 falsified the pure-rate reading: the 2026-08-20 block arrived while the limiter was provably pinned at 60/min.
+So take the phrase as confirmation that the layer exists and is IP-scoped, not as evidence about what provokes it; the rolling-window analysis in the next section still fits the ledger better than any rival tested against it.
+**No pacing, budget or retry number in this repo moves on the strength of this reply**, and the corollary above is unchanged — a mechanism a vendor describes in one informal sentence is still one to treat as unknown rather than bounded.
+
+The thread carries one lead this repo did not have: it directs commercial or production applications that need a higher quota to `support@mapillary.com`.
+Nobody has written to them.
+That is a decision rather than a task — it identifies this project to the vendor, and the quota it would ask about is not the one that has ever stopped us.
+
 ## The daily budgets encode a rolling 2–3 day per-IP window (issue #241, superseding #214's throughput bet)
 
 **The daily budgets now encode the only constraint that fits the data: a rolling 2–3 day per-IP window (issue #241, superseding #214's throughput bet).** `[providers.mapillary].daily_request_budget` and `[providers.mapillary_streets]` are **1,750 each** (cut from 15,000 + 5,000 on 2026-08-22, and split evenly because both channels read the **identical z14 tile census** — a road walk re-reads the grid run's tiles
@@ -97,6 +118,21 @@ The guard itself is a query change, not a schema change (`api_usage` is keyed (u
 At the 57.8-tile mean each channel reaches ~30 cities/night and the 70,168-tile catalog is one full pass in **~40 nights**, not ~5; no city is ever skipped as over-budget (largest grid 870 < 1,750).
 **(3) If a block ever arrives under this cap**, that is strong evidence for the repeat-offender reading over the fixed window
 — capture the day's `api_usage` row, the elapsed hours from the `run-due` summary line (the `[alerts]` email carries it; nothing else records time-under-load), AND the trailing 3 days' ledger before changing anything.
+
+## Interruption spend now survives on the Mapillary channels (issue #256)
+
+**A Mapillary census that is interrupted no longer discards the tiles it already paid for.**
+Before #256 a #205 fatal, a block, or a SIGTERM mid-census threw away every fetched tile and the next attempt bought them again
+— against a channel budget of 1,750/day and a rolling window whose whole problem is accumulation, so the re-spend was not merely slow, it was charged twice into the constraint that produces blocks.
+The census now resumes for its **missing tiles only**, through the same `checkpoints/` mechanism KartaView uses (#239) and the same caller-discards-after-the-row-lands lifecycle; the mechanics are in [`docs/census.md`](census.md).
+
+Three things this deliberately does **not** change.
+Resume is strictly **next-invocation**: no in-process retry is added anywhere, because the forum-reported hazard that retrying during a block extends it stands untested in either direction and is not worth testing with production credentials.
+Pacing is untouched at 60/min, and so are both daily budgets — a resumed night is *cheaper*, never faster.
+And the pre-flight estimate still prices the whole tile count even when a resume will fetch a fraction of it, which errs high; that is the safe direction for a budget gate and is left alone.
+
+What it buys, concretely: tiles fetched before a block survive it, a crash between the CSV write and cataloging re-finalizes for ~0 requests, and a night the scheduler winds down mid-city resumes rather than restarting
+— and it is what clears the resume gate on raising `max_concurrent_channels` above 1, since a deadline or SIGTERM under lanes kills up to N children at once instead of one.
 
 ## The supported way to run a bulk Mapillary catch-up
 
@@ -245,5 +281,6 @@ The binding Mapillary constraint is multi-day *volume* (#241), which intra-night
 **(3) The only observable change is wall clock.**
 The one place this is not free is the pair Google meters per Cloud **project** rather than per IP: `gsv` and `gsv_streets` declare no host, so nothing serializes them, and running them concurrently presents 48k + 24k req/min.
 That is safe **only if the two keys live in separate projects**, which this repo does not record anywhere — it is a Google Cloud Console check before the knob is raised, and a shared project must be fixed by splitting the keys rather than by declaring a fake host (a fake `CHANNEL_HOSTS` entry would couple the night-level breaker to something that is not a host refusal).
-Raising the knob is also gated on **resume for every provider** (#256 — the Mapillary tile census is the open half), because a deadline or a `systemctl stop` kills N children at once instead of 1, and a killed Mapillary child re-spends its tiles into the ceiling this file exists to defend.
+Raising the knob was also gated on **resume for every provider**, because a deadline or a `systemctl stop` kills N children at once instead of 1 and a killed Mapillary child re-spent its tiles into the ceiling this file exists to defend.
+**That gate is met as of #256** (see the checkpoint section above): every channel now resumes, so the Cloud-project check is the one that remains.
 Mechanism, rollout order and the watch list: [`scheduler.md`](scheduler.md).

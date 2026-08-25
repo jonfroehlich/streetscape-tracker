@@ -448,7 +448,7 @@ def test_cap_dimensions_clamps_each_side_to_40km():
     assert cap_dimensions(40_000, 12_000, "Fine") == (40_000, 12_000)
 
 
-# ── The two KartaView request counts (issues #225, #239) ────────────────────
+# ── The two census-provider request counts (issues #225, #239, #256) ───────
 
 
 def kartaview_configs(monkeypatch):
@@ -464,6 +464,37 @@ def kartaview_stub(*, api_requests=25, api_requests_total=33):
             "filename_with_path": path,
             "api_requests": api_requests,
             "api_requests_total": api_requests_total,
+            "num_flat_images": 0,
+            "started_at": "2026-07-01T00:00:00+00:00",
+            "finished_at": "2026-07-01T00:05:00+00:00",
+        }
+
+    return stub
+
+
+def mapillary_configs(monkeypatch):
+    monkeypatch.setattr(cli, "load_config", lambda provider: {"access_token": "MLY|t"})
+
+
+def tmp_checkpoint(data_dir):
+    """A stand-in checkpoint directory; the real one is built by checkpoint_path_for."""
+    path = os.path.join(os.path.dirname(data_dir), "checkpoints", "mapillary", "fixture")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def census_stub(*, api_requests=25, api_requests_total=33, checkpoint_path=None):
+    """A Mapillary grid downloader that reports both counters, as the real one does."""
+
+    async def stub(**kwargs):
+        path = kwargs["output_csv_gz_path"]
+        write_city_csv_gz(make_mapillary_city_df([("p1", "2023-05-01")]), path)
+        return {
+            "df": load_city_csv_file(path),
+            "filename_with_path": path,
+            "api_requests": api_requests,
+            "api_requests_total": api_requests_total,
+            "checkpoint_path": checkpoint_path,
             "num_flat_images": 0,
             "started_at": "2026-07-01T00:00:00+00:00",
             "finished_at": "2026-07-01T00:05:00+00:00",
@@ -499,8 +530,11 @@ def test_the_run_row_takes_the_sweeps_cost_and_the_ledger_this_processs(monkeypa
 
 def test_a_provider_without_a_cumulative_count_still_records_its_spend(monkeypatch, catalog):
     """
-    The fallback matters: gsv and mapillary publish no `api_requests_total`, so
-    a bare subscript would make every one of their runs raise KeyError.
+    The fallback matters: gsv publishes no `api_requests_total` (it resumes
+    through a `.downloading` sibling, whose earlier processes' spend survives
+    only in api_usage), so a bare subscript would make every GSV run raise
+    KeyError. Both census providers DO publish it -- see the two tests either
+    side of this one.
     """
     conn, city_id, data_dir = catalog
     gsv_configs(monkeypatch)
@@ -508,6 +542,57 @@ def test_a_provider_without_a_cumulative_count_still_records_its_spend(monkeypat
 
     assert run_cli(monkeypatch, city_id, data_dir, provider="gsv") == 0
     assert db.get_latest_run(conn, city_id, provider="gsv").api_requests == 17
+
+
+def test_a_resumed_census_row_takes_the_crawl_and_the_ledger_this_process(monkeypatch, catalog):
+    """
+    The Mapillary twin of the KartaView test above (#256).
+
+    Worth pinning separately rather than trusting the shared code path: the
+    two providers reach `register_run` through different downloader arms, and
+    this is the split that was silently backwards for KartaView until a real
+    sweep showed it. A resumed census night is the ordinary case now, not an
+    exotic one.
+    """
+    conn, city_id, data_dir = catalog
+    mapillary_configs(monkeypatch)
+    monkeypatch.setattr(
+        cli,
+        "download_mapillary_metadata_async",
+        census_stub(api_requests=9, api_requests_total=41),
+    )
+
+    assert run_cli(monkeypatch, city_id, data_dir, provider="mapillary") == 0
+    run = db.get_latest_run(conn, city_id, provider="mapillary")
+    assert run.api_requests == 41, "the run row must carry the whole crawl's cost"
+    assert db.get_api_usage(conn, RUN_DATE, provider="mapillary") == 9, (
+        "the additive daily ledger must carry only this process's spend"
+    )
+
+
+def test_the_census_checkpoint_is_discarded_only_after_the_run_row_lands(monkeypatch, catalog):
+    """
+    Discarding inside the downloader -- where the delete first lived -- made a
+    register_run failure cost the whole crawl again (PR #251 review). The
+    checkpoint must outlive every step that can still fail cheaply.
+    """
+    conn, city_id, data_dir = catalog
+    mapillary_configs(monkeypatch)
+    checkpoint = tmp_checkpoint(data_dir)
+    monkeypatch.setattr(
+        cli,
+        "download_mapillary_metadata_async",
+        census_stub(checkpoint_path=checkpoint),
+    )
+
+    def explode(*a, **k):
+        raise RuntimeError("catalog write failed")
+
+    monkeypatch.setattr(db, "register_run", explode)
+    # main()'s catch-all turns the crash into a nonzero exit rather than letting
+    # it escape, which is what the scheduler counts as a failure.
+    assert run_cli(monkeypatch, city_id, data_dir, provider="mapillary") != 0
+    assert os.path.isdir(checkpoint), "a failed register must not spend the checkpoint"
 
 
 def test_an_incomplete_sweep_exits_83_and_publishes_nothing(monkeypatch, catalog):
