@@ -1518,8 +1518,19 @@ def test_street_channels_parse_as_real_providers(tmp_path):
 
 
 def test_enabled_providers_orders_expensive_channels_first():
-    """A city's channels run back-to-back inside one night's budgets, so the
-    series that can actually exhaust a budget must claim it first."""
+    """The canonical order is stable, which is what other things are read against.
+
+    Pinned for what the order actually decides rather than for a budget story:
+    it is the submit order, so it picks which channels are already LAUNCHED when
+    a SIGTERM wind-down declines the rest (#206), which claim a lane first when a
+    city has more channels than lanes, and — the mechanical case for expensive
+    channels leading — how much of the batch deadline each child's timeout clamp
+    is allowed to see, since `remaining_s` is read fresh at every launch.
+
+    It decides nothing about budgets, which are per-channel, and nothing about
+    what a batch deadline DROPS, which is a between-cities check. See
+    `enabled_providers` for why both of those read as established for a while.
+    """
     assert _street_cfg().enabled_providers() == [
         "gsv",
         "gsv_streets",
