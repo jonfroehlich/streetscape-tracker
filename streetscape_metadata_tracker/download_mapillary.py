@@ -855,24 +855,9 @@ def _commit_tile(
             os.replace(tmp, part)
         done = dict(cp.done)
         done[(x, y)] = len(frame)
-        state = {
-            "format_version": MAPILLARY_CHECKPOINT_FORMAT_VERSION,
-            "bbox": list(bbox),
-            "zoom": TILE_ZOOM,
-            "channel": cp.channel,
-            "tile_count": len(tiles),
-            "done_tiles": [[tx, ty, rows] for (tx, ty), rows in done.items()],
-            "census_rows": sum(done.values()),
-            "api_requests_total": api_requests_total,
-            "updated_at": datetime.now(UTC).isoformat(),
-        }
-        state_tmp = f"{_state_path(cp.path)}.tmp"
-        with open(state_tmp, "w", encoding="utf-8") as f:
-            json.dump(state, f)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(state_tmp, _state_path(cp.path))
-        _fsync_dir(cp.path)
+        _write_checkpoint_state(
+            cp, done, bbox=bbox, tiles=tiles, api_requests_total=api_requests_total
+        )
         # Only after the record is durable, so an in-memory `done` can never
         # claim a tile the next invocation would not find.
         cp.done = done
@@ -882,6 +867,67 @@ def _commit_tile(
             f"Could not checkpoint tile ({x}, {y}) at {cp.path}; continuing "
             f"unprotected for the rest of this city: {e}"
         )
+
+
+def _write_checkpoint_state(
+    cp: TileCheckpoint,
+    done: dict[tuple[int, int], int],
+    *,
+    bbox: tuple[float, float, float, float],
+    tiles: list[tuple[int, int]],
+    api_requests_total: int,
+) -> None:
+    """Write the commit record atomically. Raises; callers decide what that costs."""
+    state = {
+        "format_version": MAPILLARY_CHECKPOINT_FORMAT_VERSION,
+        "bbox": list(bbox),
+        "zoom": TILE_ZOOM,
+        "channel": cp.channel,
+        "tile_count": len(tiles),
+        "done_tiles": [[tx, ty, rows] for (tx, ty), rows in done.items()],
+        "census_rows": sum(done.values()),
+        "api_requests_total": api_requests_total,
+        "updated_at": datetime.now(UTC).isoformat(),
+    }
+    state_tmp = f"{_state_path(cp.path)}.tmp"
+    with open(state_tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(state_tmp, _state_path(cp.path))
+    _fsync_dir(cp.path)
+
+
+def _commit_spend(
+    cp: TileCheckpoint | None,
+    *,
+    bbox: tuple[float, float, float, float],
+    tiles: list[tuple[int, int]],
+    api_requests_total: int,
+) -> None:
+    """
+    Persist spend that happened AFTER the last committed tile.
+
+    Without this the crawl total on the catalog row silently under-reports a
+    night that ended badly: the requests a block refused are counted into
+    ``api_usage`` (deliberately — one token, one increment, one request) but
+    would die with the process, so a resumed run's row would price the city
+    below what it actually cost. Bounded by #205's fail-fast at
+    ``connection_limit`` requests, and therefore small — but it is exactly the
+    process-vs-crawl distinction this pair of counters exists to keep straight.
+
+    Skipped when nothing was committed: there is no crawl to resume, the
+    exception carries the spend to the ledger, and writing state here would
+    leave a directory behind that ``_remove_empty_checkpoint_dir`` should take.
+    """
+    if cp is None or cp.degraded or not cp.done:
+        return
+    try:
+        _write_checkpoint_state(
+            cp, cp.done, bbox=bbox, tiles=tiles, api_requests_total=api_requests_total
+        )
+    except Exception as e:  # pragma: no cover - same fail-open posture as _commit_tile
+        logger.warning(f"Could not record the interrupted spend at {cp.path}: {e}")
 
 
 def _census_requests_total(cp: TileCheckpoint | None, api_requests: int) -> int:
@@ -1133,11 +1179,23 @@ async def _fetch_city_images(
         # success path.
         e.api_requests = api_requests
         e.api_requests_total = _census_requests_total(checkpoint, api_requests)
+        _commit_spend(
+            checkpoint,
+            bbox=bbox,
+            tiles=tiles,
+            api_requests_total=_census_requests_total(checkpoint, api_requests),
+        )
         raise
     except (TimeoutError, aiohttp.ClientError) as e:
         error = DownloadError(f"Mapillary tile download failed: {redact_credentials(e)}")
         error.api_requests = api_requests
         error.api_requests_total = _census_requests_total(checkpoint, api_requests)
+        _commit_spend(
+            checkpoint,
+            bbox=bbox,
+            tiles=tiles,
+            api_requests_total=_census_requests_total(checkpoint, api_requests),
+        )
         raise error from e
     finally:
         progress_bar.close()
@@ -1155,6 +1213,12 @@ async def _fetch_city_images(
     if fatal is not None:
         fatal.api_requests = api_requests
         fatal.api_requests_total = _census_requests_total(checkpoint, api_requests)
+        _commit_spend(
+            checkpoint,
+            bbox=bbox,
+            tiles=tiles,
+            api_requests_total=_census_requests_total(checkpoint, api_requests),
+        )
         raise fatal
 
     fetched: dict[tuple[int, int], pd.DataFrame] = {}
@@ -1170,6 +1234,13 @@ async def _fetch_city_images(
             # partial coverage.
             if isinstance(outcome, DownloadError):
                 outcome.api_requests = api_requests
+                outcome.api_requests_total = _census_requests_total(checkpoint, api_requests)
+                _commit_spend(
+                    checkpoint,
+                    bbox=bbox,
+                    tiles=tiles,
+                    api_requests_total=_census_requests_total(checkpoint, api_requests),
+                )
                 raise outcome
             failed_tiles.append((x, y))
             first_error = first_error or outcome
@@ -1189,6 +1260,13 @@ async def _fetch_city_images(
                 f"refusing to finalize an incomplete snapshot"
             )
             error.api_requests = api_requests
+            error.api_requests_total = _census_requests_total(checkpoint, api_requests)
+            _commit_spend(
+                checkpoint,
+                bbox=bbox,
+                tiles=tiles,
+                api_requests_total=_census_requests_total(checkpoint, api_requests),
+            )
             raise error from first_error
         # Under the threshold the run continues, but the caller must mark the
         # affected grid points REQUEST_FAILED rather than let them look like
