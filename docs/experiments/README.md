@@ -63,10 +63,13 @@ Its transferable lesson is that a log holds **three** populations that look alik
 ### `undated-imagery-share.md`
 
 Issue #257 — how much imagery carries no usable capture date, per provider, which is the number three prose claims in the road-walk fix rested on.
-**Three orders of magnitude apart**: GSV 0.0101% of present panos (and exactly zero in 1,070 of 1,146 runs), Mapillary 0.0% across 15.3M, KartaView 9.56% of audited photos.
-Two things generalize.
-**(1) A pooled share over a concentrated distribution describes no run in it** — GSV's is zero through the 90th percentile and is carried entirely by 76 big-metro runs, so "small on average" and "absent almost everywhere, occasionally 0.3%" are different facts with different consequences for a published one-decimal column.
-**(2) An undated population is not automatically a random sample of the imagery**: every violating KartaView sequence is one 2025-11-19 bulk ingest, so its undated imagery is its *newest*, and excluding it from an age median biases the median **older** rather than merely widening its error bar.
+**Undated imagery arrives in batches, not as diffuse noise**, so the per-run maximum is the number a decision has to survive and the pooled share describes no run in the distribution: GSV pools to 0.0086% but its worst run is 0.34%, Mapillary pools to 0.150% but its worst run is **23.3%**, and KartaView is 9.56% of audited photos concentrated in one 2025-11-19 ingest.
+Three things generalize.
+**(1) An undated population is a property of an upload BATCH, not of a provider** — Mapillary's entire undated corpus is 99.96% four adjacent Denver-metro runs, and KartaView's is one 2025-11-19 Grab ingest, so a pooled per-provider rate systematically understates what any single city can hit.
+**(2) A batch is a single point in time by construction**, which makes the bias directional rather than merely noisy: KartaView's undated imagery is its *newest*, so excluding it from an age median drags the median **older** instead of widening its error bar.
+**(3) A per-provider question cannot be answered from a catalog that is well-populated for only one provider** — and this one nearly shipped wrong because of it.
+The first pass ran against a dev laptop holding 1,144 GSV cities but **three** Mapillary runs, and concluded Mapillary emits no undated imagery at all; production's 1,201 runs say 0.150%, about 17× GSV's rate.
+Hence `--catalog-label`, recorded in the metrics file: it is the only thing separating that result from its opposite.
 The catalog half is a census and the KartaView half is an API sample read from `kartaview-shotdate-audit_metrics.json`; the two frames are reported side by side and never pooled.
 Both are proxies for the road-walk share, which no walk recorded until #257 added `dated_covered_samples`.
 

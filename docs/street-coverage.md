@@ -161,11 +161,13 @@ A KartaView city could refresh substantially and have its published median age m
 
 ### How large the undated population actually is → [`docs/experiments/undated-imagery-share.md`](experiments/undated-imagery-share.md)
 
-The claim that this population is "large by construction for KartaView, small but real for Mapillary, empty in practice for GSV" was three prose assertions until it was measured; it is now three numbers, and one of them was wrong.
-**GSV 0.0101%** of present panos — and exactly zero in **1,070 of 1,146** runs, i.e. zero through the 90th percentile, with the pooled figure carried by 76 big-metro runs.
-**Mapillary 0.0%** across 15.3M present panos: the mechanism is in the code (a bogus `captured_at_ms` becomes `NO_DATE`) but its observed rate in our own data is zero, so "small but real" is not supported by anything we hold.
-**KartaView 9.56%** of audited photos.
+The claim that this population is "large by construction for KartaView, small but real for Mapillary, empty in practice for GSV" was three prose assertions until it was measured against the **production** catalog.
+All three hold, but the pooled rates are the wrong summary: **undated imagery arrives in batches, so the per-run MAXIMUM is what a decision has to survive.**
+GSV pools to **0.0086%** of present panos and Mapillary to **0.150%** (about 17× GSV), yet both read zero through the 95th percentile of runs — and Mapillary's worst single run is **23.3%** undated against GSV's worst **0.34%**.
+Mapillary's entire undated corpus is 99.96% four adjacent Denver-metro runs, which for a census provider whose grids overlap most likely means one contributor's upload batch counted four times.
+KartaView is **9.56%** of audited photos, all one 2025-11-19 ingest.
 Those are GRID runs standing in for walks, because no walk recorded an undated count until this change added one — an estimate of the right order, not the walk's value.
+**Measure this on makelab2, never on a dev catalog**: a laptop holding three Mapillary runs against production's 1,201 produced the opposite conclusion, that Mapillary emits no undated imagery at all.
 
 ### It changes recorded numbers for the existing GSV and Mapillary walk series, and those are not being recomputed
 
@@ -181,7 +183,8 @@ Issue #262 scopes that correctly — it recomputes affected diff rows through `w
 `{city_id}_streetwalkdiff_...csv.gz` is written **only when a diff has changes**, so a pair whose only change was the phantom delta recomputes to "no changes", writes no new file — and leaves the old, wrong one sitting in `data/` and on the public server.
 Re-diffing is therefore necessary but not sufficient: a detail file whose diff no longer has changes has to be deleted, not merely not-rewritten.
 Note also that the artifact cannot repair itself — its per-edge aggregates were already computed under the old definition, so the dropped `NO_DATE` samples are simply not in it, which rules out the cheap artifact-reading design `backfill_streetwalk_coverage.py` and `backfill_streetwalk_length.py` both use.
-Until #262 lands, the affected deltas are the FIRST walk diff of each series after 2026-08-24, and for GSV they will mostly round to 0.0 anyway (0.0015 percentage points at p95) — though not always, since the catalog's worst run would shift 0.22 points, which does render at one decimal.
+Until #262 lands, the affected deltas are the FIRST walk diff of each series after 2026-08-24.
+Most will round to 0.0 — both providers sit at zero through p95 — but the tail renders: production's worst GSV run would shift **0.33** percentage points and its worst Mapillary run **2.7**, and 2.7 points is larger than most real run-to-run coverage changes, so it will read as a substantial imagery refresh rather than as noise.
 
 ## Overpass is on the critical path of every first road walk (issue #209)
 

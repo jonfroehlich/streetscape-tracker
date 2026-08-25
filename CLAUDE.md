@@ -248,7 +248,7 @@ Dated copies go through SQLite's **online backup API**, to a per-writer staging 
 
 **Street coverage and road walks → [`docs/street-coverage.md`](docs/street-coverage.md).** A second, active collection modality beside the grid: walk each frozen OSM edge, sample every `--spacing` m, and query the provider at each sample, so association is by construction and coverage is fractional per edge.
 **A sample counts as covered when its status is PRESENT — `OK` *or* `NO_DATE` — never `OK` alone** (`analysis.PRESENT_STATUSES`, the grid's vocabulary): an undated pano is still imagery within reach, so it covers and simply ages nothing.
-Both halves of `streetscape_street_analyzer` got that wrong independently (#251 finding 9, then #257), and the undated share is provider-specific by three orders of magnitude — 9.6% of audited KartaView photos against 0.010% of GSV's, so the same bug is invisible in one provider and decisive in another.
+Both halves of `streetscape_street_analyzer` got that wrong independently (#251 finding 9, then #257), and undated imagery arrives in BATCHES rather than as diffuse noise, so the per-run MAX is the number that matters, not the pooled share — both are zero through p95, but one Mapillary run is 23.3% undated against GSV's worst 0.34% and KartaView's 9.6% of audited photos.
 **Grid coverage and street coverage are different denominators and never substitute for each other** — Seattle reads 54.3% grid against 98.4% street
 — and each `--network-type` is its own series with its own denominator, never a replacement for another.
 Both providers walk the same deterministic sample points, but Mapillary reaches them through a tile census joined locally, so its cost tracks bbox **area** rather than sample count.
