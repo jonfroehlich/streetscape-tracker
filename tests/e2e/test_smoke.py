@@ -362,10 +362,13 @@ def test_city_page_renders_the_road_walk_street_overlay(page: Page, base_url):
     expect(panel).to_be_visible()
 
     # Headline reads the streetwalk totals through the key aliasing
-    # (edges/edges_any_coverage → segments/covered): 14.9% uncovered by length,
-    # 2 of 2 edges with some coverage.
+    # (edges/edges_any_coverage → segments/covered): 85.1% of street-km covered
+    # by length, 2 of 2 edges with some coverage. Stated in the positive — the
+    # complement (uncovered_pct_by_length, 14.9) is deliberately NOT what the
+    # panel quotes.
     headline = page.locator("#street-coverage-headline")
-    expect(headline).to_contain_text("14.9%")
+    expect(headline).to_contain_text("85.1%")
+    expect(headline).to_contain_text("has Google Street View imagery")
     expect(headline).to_contain_text("2 of 2 segments covered")
 
     # A fractional artifact opens on the graduated Coverage ramp, not Age.
