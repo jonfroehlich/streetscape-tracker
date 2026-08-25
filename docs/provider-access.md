@@ -72,6 +72,27 @@ And our block matched the documented tile limit in **no** respect: wrong scope (
 So the mechanism that hit us is undocumented in every attribute, and no budget or rate in this repo is derived from the docs — they are bets.
 This is the corollary in `CLAUDE.md`'s READ THIS FIRST section in action: *treat any behavior you cannot find documented as unknown rather than unlimited.*
 
+## A staff reply confirms the IP layer exists, and settles nothing else (2026-08-24)
+
+**A Mapillary staff reply now says in as many words that a second blocking system runs at the IP level, underneath the documented per-app cap.**
+Asked on [50,000 requests/day rate limit scope](https://forum.mapillary.com/t/50-000-requests-day-rate-limit-scope/10644) whether the tile limit is scoped per app, per account, per IP or globally, a staff member answered on **2026-08-24**:
+
+> The mentioned 50k is by app ID.
+> At the same time, if you use the same IP address and this is a sudden spike, the system might block you earlier.
+
+Read against the section above, that changes exactly one thing.
+The per-IP mechanism is no longer only a community report plus our own two incidents: a Mapillary employee describes it, and describes it as a distinct system that can refuse an address well below the documented per-app ceiling.
+That is the first outside corroboration of what #198/#199/#241 worked out the expensive way, and it retires the "undocumented in every attribute" framing above for the *scope* attribute only — the threshold and the 302 status remain undescribed by anyone.
+
+It does **not** settle which axis trips that layer.
+"A sudden spike" is rate-flavoured language, and #241 falsified the pure-rate reading: the 2026-08-20 block arrived while the limiter was provably pinned at 60/min.
+So take the phrase as confirmation that the layer exists and is IP-scoped, not as evidence about what provokes it; the rolling-window analysis in the next section still fits the ledger better than any rival tested against it.
+**No pacing, budget or retry number in this repo moves on the strength of this reply**, and the corollary above is unchanged — a mechanism a vendor describes in one informal sentence is still one to treat as unknown rather than bounded.
+
+The thread carries one lead this repo did not have: it directs commercial or production applications that need a higher quota to `support@mapillary.com`.
+Nobody has written to them.
+That is a decision rather than a task — it identifies this project to the vendor, and the quota it would ask about is not the one that has ever stopped us.
+
 ## The daily budgets encode a rolling 2–3 day per-IP window (issue #241, superseding #214's throughput bet)
 
 **The daily budgets now encode the only constraint that fits the data: a rolling 2–3 day per-IP window (issue #241, superseding #214's throughput bet).** `[providers.mapillary].daily_request_budget` and `[providers.mapillary_streets]` are **1,750 each** (cut from 15,000 + 5,000 on 2026-08-22, and split evenly because both channels read the **identical z14 tile census** — a road walk re-reads the grid run's tiles
