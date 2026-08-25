@@ -253,7 +253,12 @@ test("normalizeStreetArtifact: streetwalk aliases age + totals keys and flags fr
   const fc = {
     properties: {
       metadata: {
-        totals: { edges: 41, edges_any_coverage: 40, uncovered_pct_by_length: 4.4 },
+        totals: {
+          edges: 41,
+          edges_any_coverage: 40,
+          coverage_pct_by_length: 95.6,
+          uncovered_pct_by_length: 4.4,
+        },
         coverage_by_highway: {},
       },
     },
@@ -397,7 +402,12 @@ function streetwalkArtifact() {
   return {
     properties: {
       metadata: {
-        totals: { edges: 2, edges_any_coverage: 2, uncovered_pct_by_length: 1.6 },
+        totals: {
+          edges: 2,
+          edges_any_coverage: 2,
+          coverage_pct_by_length: 98.4,
+          uncovered_pct_by_length: 1.6,
+        },
         coverage_by_highway: { residential: { length_km: 1 } },
       },
     },
@@ -419,7 +429,12 @@ function gridArtifact() {
   return {
     properties: {
       metadata: {
-        totals: { segments: 2, covered: 1, uncovered_pct_by_length: 12.0 },
+        totals: {
+          segments: 2,
+          covered: 1,
+          coverage_pct_by_length: 88.0,
+          uncovered_pct_by_length: 12.0,
+        },
         coverage_by_highway: { residential: { length_km: 1 } },
       },
     },

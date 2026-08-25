@@ -978,8 +978,12 @@ def generate_streetwalk_manifest(conn, data_dir: str) -> dict[str, Any]:
             # the streets page can show "no data" instead of implying the
             # flat footprint was measured.
             "coverage_pct_by_length_any": row["coverage_pct_by_length_any"],
-            # street_walks has no uncovered column; derive it so the frontend
-            # headline ("X% of street-km have no imagery") needs no math.
+            # The complement of `coverage_pct_by_length`, derived here because
+            # street_walks has no uncovered column. Every headline on the site
+            # now quotes coverage in the POSITIVE ("X% of street-km has
+            # imagery"), so nothing in the frontend reads this today; it stays
+            # because it is a published manifest field, and a consumer asking
+            # "how big is the gap?" should not have to do the subtraction.
             "uncovered_pct_by_length": None if pct is None else round(100 - pct, 1),
             "edges": row["edges_total"],
             "edges_fully_covered": row["edges_fully_covered"],

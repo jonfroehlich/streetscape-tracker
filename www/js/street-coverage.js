@@ -509,15 +509,20 @@ function buildStreetCoveragePanel(map, layer, meta, provider, options) {
   let selection = null; // {type, covered} spotlight, or null
   let gapsOnly = false; // "Highlight gaps" toggle
 
-  const uncoveredPct = totals.uncovered_pct_by_length;
+  // Stated in the positive — "98.9% of street-km has imagery", not "1.1% has
+  // none" — and the same orientation for every provider, so this number reads
+  // the same way as the coverage percentages everywhere else on the site (the
+  // overview popup, streets.html). `coverage_pct_by_length` is what both
+  // artifacts measure; `uncovered_pct_by_length` is only its complement.
+  const coveredPct = totals.coverage_pct_by_length;
   container.innerHTML = `
     <div id="street-coverage-header">
       <strong>Street coverage</strong>
     </div>
     <p id="street-coverage-headline">
-      <span class="street-headline-pct">${uncoveredPct}%</span>
-      <span class="street-headline-text">of street-km have
-      no ${providerLabel} imagery</span>
+      <span class="street-headline-pct">${coveredPct}%</span>
+      <span class="street-headline-text">of street-km
+      has ${providerLabel} imagery</span>
       <span class="street-headline-sub">
         (${totals.covered.toLocaleString()} of
         ${totals.segments.toLocaleString()} segments covered)
