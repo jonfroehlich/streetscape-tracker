@@ -173,13 +173,15 @@ Walk coverage is computed at collection time into `street_walks` rows and `*_cov
 So every walk collected before 2026-08-24 undercounts by its own `NO_DATE` population, and each city's **next walk diff will show a one-time phantom positive coverage delta** — walk diffs compare recorded coverage numbers, so a definition change reads as imagery churn.
 Do not read that first delta as a real improvement; it is the fix landing, not Google or Mapillary driving.
 
-**That phantom is publicly visible and it is durable, which is the part worth planning for.**
+**That phantom is publicly visible, and it outlives the walk that produced it.**
 It is not confined to the diff table: the delta reaches `street_walk_diffs`, from there the streetwalk manifest's `change` block, and from there the **"Δ coverage" column on `streets.html`** — a published number a reader has no way to distinguish from imagery churn.
-And unlike the coverage numbers themselves it does not wash out on the following walk: a `street_walk_diffs` row is an immutable record of one date pair, so **recomputing `street_walks` and the artifacts does not repair the diffs already written**, and the published `{city_id}_streetwalkdiff_...csv.gz` detail files stay as they are.
-A recompute tool that stops at coverage would leave a permanently wrong diff row behind every city it fixed — arguably worse than not running it, since the row would then disagree with both walks it sits between.
-So **issue #262 has to re-diff, not just recompute**, and its scope is: rebuild the coverage numbers from the snapshot CSV plus the frozen network, then recompute every affected `street_walk_diffs` row and rewrite its detail file.
-Note the artifact cannot repair itself — its per-edge aggregates were already computed under the old definition, so the dropped `NO_DATE` samples are simply not in it, which rules out the cheap artifact-reading design `backfill_streetwalk_coverage.py` and `backfill_streetwalk_length.py` both use.
-Until that lands, the honest handling is the dated note in this section plus this one: the affected deltas are the FIRST walk diff of each series after 2026-08-24, and for GSV they will mostly round to 0.0 anyway (0.0015 percentage points at p95), though not always — the catalog's worst run would shift 0.22 points, which does render at one decimal.
+And unlike the coverage numbers themselves it does not wash out on the following walk: a `street_walk_diffs` row is an immutable record of one date pair, so recomputing `street_walks` and the artifacts does not by itself repair a diff already written.
+Issue #262 scopes that correctly — it recomputes affected diff rows through `walk_diff.compute_and_record_walk_diff` and regenerates the manifest, rather than stopping at coverage.
+**The edge it has to handle is the published detail file.**
+`{city_id}_streetwalkdiff_...csv.gz` is written **only when a diff has changes**, so a pair whose only change was the phantom delta recomputes to "no changes", writes no new file — and leaves the old, wrong one sitting in `data/` and on the public server.
+Re-diffing is therefore necessary but not sufficient: a detail file whose diff no longer has changes has to be deleted, not merely not-rewritten.
+Note also that the artifact cannot repair itself — its per-edge aggregates were already computed under the old definition, so the dropped `NO_DATE` samples are simply not in it, which rules out the cheap artifact-reading design `backfill_streetwalk_coverage.py` and `backfill_streetwalk_length.py` both use.
+Until #262 lands, the affected deltas are the FIRST walk diff of each series after 2026-08-24, and for GSV they will mostly round to 0.0 anyway (0.0015 percentage points at p95) — though not always, since the catalog's worst run would shift 0.22 points, which does render at one decimal.
 
 ## Overpass is on the critical path of every first road walk (issue #209)
 

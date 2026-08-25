@@ -415,9 +415,9 @@ def compute_streetwalk_coverage(
     — coverage without age, exactly the grid convention.
 
     That splits the two numbers apart, so the age statistics get a recorded
-    denominator: ``dated_covered_samples`` is the subset ``median_covered_age_
-    years`` was actually taken over, and it is emitted per edge and summed into
-    ``covered_samples_dated``/``dated_pct_of_covered`` by
+    denominator: ``dated_covered_samples`` is the subset that
+    ``median_covered_age_years`` was actually taken over, emitted per edge and
+    summed into ``covered_samples_dated``/``dated_pct_of_covered`` by
     ``summarize_streetwalk_coverage``. Without it an age median over 3% of a
     KartaView edge's coverage would be indistinguishable from one over all of
     a GSV edge's. How far apart they run is provider-specific by three orders
@@ -443,8 +443,11 @@ def compute_streetwalk_coverage(
         A copy of ``edges`` (WGS84, RangeIndex) with added columns:
         ``highway_bucket``, ``length_m``, ``total_samples``, ``covered_samples``,
         ``coverage_fraction`` (0..1), ``covered`` (bool: any coverage),
-        ``nearest_pano_date`` (str|None, newest covered), and
-        ``median_covered_age_years`` (float|None).
+        ``covered_samples_any``, ``coverage_fraction_any``,
+        ``nearest_pano_date`` (str|None, newest covered),
+        ``median_covered_age_years`` (float|None), and
+        ``dated_covered_samples`` (int, that median's denominator; 0, never
+        null, when the edge has no dated covered sample).
     """
     run_ts = pd.Timestamp(run_date)
     out = edges.reset_index(drop=True).copy()
