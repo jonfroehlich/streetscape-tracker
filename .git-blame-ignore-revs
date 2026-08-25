@@ -1,0 +1,18 @@
+# Commits that changed formatting only, and would otherwise bury the real
+# author of every line they touched.
+#
+# GitHub reads this file automatically. Locally, opt in once per clone:
+#
+#     git config blame.ignoreRevsFile .git-blame-ignore-revs
+#
+# Only whitespace-only or mechanically-verified no-op commits belong here.
+
+# Semantic line breaks across CLAUDE.md and docs/, so git can merge two
+# branches that touch the same paragraph (issue #254). Whitespace only:
+# collapsing all whitespace in each file reproduces the previous text byte
+# for byte.
+950d6fa80d5c3cfb577a67160ecd2ea5ab7d067c
+
+# Semantic line breaks for README.md's four one-line paragraphs, finishing
+# the same pass (issue #254). Whitespace only, verified the same way.
+acc8081dab7df56f51a1c718bc7ce0400876be41
