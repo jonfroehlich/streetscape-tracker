@@ -893,8 +893,9 @@ _SWEEP_ACHIEVED_RATE_FRACTION = 0.5
 # _run_one_city has the full ceiling rather than the remainder (see its
 # `daily_budget` argument, and _street_collect_cmd on why that is the right
 # shape for the channels that subtract today's spend themselves), and the grid
-# CLI has no budget flag to hand it to instead. So it wants its own issue
-# alongside the est > budget arm in docs/census.md, not a line here.
+# CLI has no budget flag to hand it to instead. So it is #273, not a line here
+# -- and #274 is the policy half that depends on it (the est > budget arm skips
+# an over-budget city permanently, which is wrong for a channel that resumes).
 _SWEEP_OVERHEAD_MULTIPLIER = 1.80
 # Floor for a deadline-clamped timeout. A city is only started while the batch
 # deadline still has room, so the clamp should shorten a run — never hand a
