@@ -68,11 +68,12 @@ max_batch_hours = 10
 # tile CDN with mapillary, so it always runs after both, and the Mapillary tile
 # rate stays the single figure configured below rather than double it.
 #
-# Two things gate raising this in production, both outside this file:
-#   * Every provider must be able to RESUME a killed collection (issue #256 is
-#     the open half — the Mapillary tile census). A deadline or a `systemctl
-#     stop` kills N children at once here instead of 1, and a killed Mapillary
-#     child re-spends its tiles against a deliberate 3,500/day per-IP ceiling.
+# Two things gated raising this in production, both outside this file. The
+# first is met; the second is still a console check:
+#   * Every provider must be able to RESUME a killed collection — satisfied
+#     since issue #256 landed the Mapillary tile-census checkpoint, so a
+#     deadline or `systemctl stop` killing N children at once no longer
+#     re-spends their tiles against the deliberate 3,500/day per-IP ceiling.
 #   * gsv and gsv_streets hold no per-IP lock, because Google meters per Cloud
 #     PROJECT rather than per IP. Running them together is only safe while the
 #     two keys really do live in separate projects — a console check, since

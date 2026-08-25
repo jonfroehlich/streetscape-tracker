@@ -2,7 +2,7 @@
 Filename conventions for GSV metadata files.
 
 This module is the single source of truth for generating and parsing the
-data filenames used throughout the project. Three filename generations
+data filenames used throughout the project. Four filename generations
 exist on disk and all must parse:
 
 1. Legacy (undated):        seattle--wa_width_1000_height_1000_step_20.csv.gz

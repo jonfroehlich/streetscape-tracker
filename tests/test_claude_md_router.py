@@ -3,7 +3,8 @@
 CLAUDE.md is loaded into every session, and Claude Code truncates it past
 150,000 characters. It reached 182,499 by growing roughly a paragraph per PR --
 structural growth, not a one-off -- and was split into a router plus eleven
-topic docs to get back under the limit. Nothing about that split is
+topic docs to get back under the limit (twelve since docs/architecture.md
+absorbed the data-model/pipeline/naming sections on 2026-08-25). Nothing about that split is
 self-enforcing: the file resumes growing the day it lands, a stub can name a doc
 that was never written, and a doc can be left with no stub pointing at it.
 
@@ -45,6 +46,7 @@ _MAX_PROSE_LINE = 700
 # stub (docs/city_sampling.md is reached from README.md), but each of these was
 # carved out of the router and is unreachable if its stub goes missing.
 _SPLIT_OUT_DOCS = (
+    "docs/architecture.md",
     "docs/capture-dates.md",
     "docs/catalog-backups.md",
     "docs/census.md",
