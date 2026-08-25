@@ -3,11 +3,8 @@
 The nightly batch: dueness, the tail, wind-down, deadlines, timeouts and the dead-pipe rules.
 Read before touching `scheduler.py`, the systemd units, or anything about how a night ends.
 
-Split out of `CLAUDE.md` on 2026-08-22 so the always-loaded file stays under Claude Code's
-size limit. The prose moved here is the original, with cross-reference pointers repaired where
-they would otherwise dangle across the new file boundary; anything written since the split is
-under its own heading and says so. `CLAUDE.md` keeps the short rule for each section and points
-here for the evidence, the incident history and the details — keep the two in sync.
+Split out of `CLAUDE.md` (2026-08-22); the router keeps this topic's short rules and points here for the evidence and detail.
+An edit that changes a rule belongs in both files; anything written since the split is under its own heading and says so.
 
 ## `scheduler.py`, the nightly batch and its tail
 
@@ -209,3 +206,16 @@ Watch `MemoryPeak` after each night rather than pre-raising the unit's `MemoryHi
 `TimeoutStopSec=30min` needs no change: it prices the tail, which concurrency does not touch, and N children wind down in parallel.
 The before/after is a measured question and therefore owes a writeup: `scripts/night_length_analyze.py` lands with the code and reads the elapsed distribution (with per-channel `api_usage` and the busy/blocked counts beside it, as the volume control) straight out of `logs/streetscape_scheduler.log*`; `docs/experiments/night-length.md` follows once there are nights on both sides of the flip to compare.
 That is also why `cmd_run_due` logs `max_concurrent_channels=N` on its opening line — which setting a night ran under has to be recoverable from the night's own record, not from an operator's memory of the flip date.
+
+## The subcommand roster, and the production config (added 2026-08-25)
+
+Written 2026-08-25, when the CLAUDE.md rewrite turned its command cheatsheet into a table and two subcommands turned out to be documented nowhere.
+
+**`assign`** (re)computes the `day_of_cycle` stagger for every enabled (city, provider) over `[schedule].cycle_days`, via `db.assign_schedule` — the rebalance handle after registering or enabling cities in bulk, so the nightly slate stays level rather than front-loaded.
+
+**`notify-failure`** emails the recent scheduler-log tail and is wired as the unit's `OnFailure=` hook (`deploy/systemd/streetscape-tracker-notify@.service`), so a crash that never reaches the in-run alerting still produces an email.
+It exits 0 when it alerted (or alerting is intentionally off) and 1 only when a send was attempted and failed, so the notify unit's own status is meaningful.
+`run-due` returns nonzero on any failed city, so this hook can double-report a failure the in-run threshold alert already covered — accepted, since the alternative is a class of silent nights.
+
+**Production reads `config/scheduler.makelab1.toml`, not `config/scheduler.toml`** (passed via `--config`; the filename is historical — the service itself runs on makelab2, guarded by `ConditionHost=makelab2*`).
+The two diverge materially — budgets, absolute paths, `[publish].enabled`/`[publish].local` — so an operational change edited only into the repo default changes nothing in production, and vice versa: keep any comment-level rationale in step across both files.

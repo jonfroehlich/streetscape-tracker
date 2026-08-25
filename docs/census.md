@@ -4,11 +4,8 @@ How a census provider (every image in an area, rather than the nearest one to a 
 METADATA-schema rows, and what the shared seam guarantees. Read before adding a provider or touching
 `census.py`, `download_mapillary.py` or `download_kartaview.py`.
 
-Split out of `CLAUDE.md` on 2026-08-22 so the always-loaded file stays under Claude Code's
-size limit. The prose moved here is the original, with cross-reference pointers repaired where
-they would otherwise dangle across the new file boundary; anything written since the split is
-under its own heading and says so. `CLAUDE.md` keeps the short rule for each section and points
-here for the evidence, the incident history and the details — keep the two in sync.
+Split out of `CLAUDE.md` (2026-08-22); the router keeps this topic's short rules and points here for the evidence and detail.
+An edit that changes a rule belongs in both files; anything written since the split is under its own heading and says so.
 
 ## The census machinery is provider-agnostic and lives in `census.py`
 
