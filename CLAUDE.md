@@ -211,11 +211,11 @@ A blocked or busy night still publishes, alerts unconditionally, and exits nonze
    unknown cities geocode once via `geoutils.py` (rate-limited Nominatim) and register, with the user's query slug saved as an alias so the same query never re-geocodes.
    `--check-boundary` uses the same resolution, so preview filenames and geometry match what a real run would produce.
 2. Skip policy per (city, provider): `--min-days-since-last-run` (default 80) unless `--force`.
-3. Downloader dispatch — `download_gsv.py` (gsv; resumes via a `.downloading` sibling), `download_mapillary.py` (no resume
-   — runs take seconds) or `download_kartaview.py` (resumes via a `checkpoints/` directory, #239, because a metro sweep is hours; the caller supplies that path and discards it once the artifact is durable);
-   provider-agnostic grid/date/error helpers (`generate_grid_points`, `standardize_capture_date`, `DownloadError`) live in `download_common.py` so no provider imports from another's module.
+3. Downloader dispatch — `download_gsv.py` (gsv; resumes via a `.downloading` sibling) or the two census providers, `download_mapillary.py` (#256) and `download_kartaview.py` (#239), which **both resume via a `checkpoints/` directory**:
+   the caller supplies that path — keyed on the CHANNEL, since a road walk crawls the same frozen bbox and would otherwise resume the grid run's crawl into the wrong ledger — and discards it once the artifact is durable.
+   Provider-agnostic grid/date/error helpers (`generate_grid_points`, `standardize_capture_date`, `DownloadError`) live in `download_common.py`, and the shared checkpoint plumbing in `checkpointing.py`, so no provider imports from another's module.
    Caller supplies the output path;
-   all three return `api_requests` for the per-provider budget ledger, and KartaView adds `api_requests_total`
+   all three return `api_requests` for the per-provider budget ledger, and both census providers add `api_requests_total`
    — the sweep's cumulative spend across resumes, which is for the `runs` row and the operator and must **not** reach the additive daily ledger.
 4. Guard: a run ≥95% REQUEST_DENIED/OVER_QUERY_LIMIT (`analysis.detect_systemic_failure`) is rejected before cataloging
    — csv renamed `*.rejected` (excluded from the publish glob), nonzero exit so the scheduler counts a failure.
@@ -315,7 +315,7 @@ keep any list a doc enumerates **alphabetical**, so two branches adding an entry
 - `data/` contains thousands of files — avoid globbing/listing it wholesale.
 - Legacy pre-2026 data files are undated; they're registered as `is_baseline=1` runs by the migration script and are never renamed (published URLs stay stable).
 - The sync-vs-async duplicate download path was removed in v2 (`download.py`, `gsv_tracker_single.py`); v1.0.0 tag preserves the old architecture.
-- Runtime state that must never reach the public web server lives in siblings of `data/`, all gitignored: `logs/`, `backups/` (#145), `archive/` (#176), `locks/` (#208) and `checkpoints/` (#239).
+- Runtime state that must never reach the public web server lives in siblings of `data/`, all gitignored: `logs/`, `backups/` (#145), `archive/` (#176), `locks/` (#208) and `checkpoints/` (#239, #256).
   The publish rsync only walks `data/`, so anything here is structurally unpublishable.
 - Logs go to `logs/`, never `data/` (data/ is synced to a public web server).
   Three tiers: the scheduler's own rotating `streetscape_scheduler.log`;

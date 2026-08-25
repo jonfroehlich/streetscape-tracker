@@ -118,6 +118,21 @@ At the 57.8-tile mean each channel reaches ~30 cities/night and the 70,168-tile 
 **(3) If a block ever arrives under this cap**, that is strong evidence for the repeat-offender reading over the fixed window
 — capture the day's `api_usage` row, the elapsed hours from the `run-due` summary line (the `[alerts]` email carries it; nothing else records time-under-load), AND the trailing 3 days' ledger before changing anything.
 
+## Interruption spend now survives on the Mapillary channels (issue #256)
+
+**A Mapillary census that is interrupted no longer discards the tiles it already paid for.**
+Before #256 a #205 fatal, a block, or a SIGTERM mid-census threw away every fetched tile and the next attempt bought them again
+— against a channel budget of 1,750/day and a rolling window whose whole problem is accumulation, so the re-spend was not merely slow, it was charged twice into the constraint that produces blocks.
+The census now resumes for its **missing tiles only**, through the same `checkpoints/` mechanism KartaView uses (#239) and the same caller-discards-after-the-row-lands lifecycle; the mechanics are in [`docs/census.md`](census.md).
+
+Three things this deliberately does **not** change.
+Resume is strictly **next-invocation**: no in-process retry is added anywhere, because the forum-reported hazard that retrying during a block extends it stands untested in either direction and is not worth testing with production credentials.
+Pacing is untouched at 60/min, and so are both daily budgets — a resumed night is *cheaper*, never faster.
+And the pre-flight estimate still prices the whole tile count even when a resume will fetch a fraction of it, which errs high; that is the safe direction for a budget gate and is left alone.
+
+What it buys, concretely: tiles fetched before a block survive it, a crash between the CSV write and cataloging re-finalizes for ~0 requests, and a night the scheduler winds down mid-city resumes rather than restarting
+— which is also why #256 gates raising `max_concurrent_channels` above 1, since a deadline or SIGTERM under lanes kills up to N children at once instead of one.
+
 ## The supported way to run a bulk Mapillary catch-up
 
 **The supported way to run a bulk Mapillary catch-up is `scheduler run-due --provider mapillary --limit N`, never a script.** Routing through the scheduler is the entire point: it inherits the daily budget ledger,
