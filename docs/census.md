@@ -191,13 +191,30 @@ The one thing that is genuinely provider-shaped rather than shared is `_points_i
 ## Still NOT a scheduler channel (issue #248)
 
 **Still NOT a scheduler channel, and a `[providers.kartaview]` block is refused rather than accepted — recorded and dropped at load, with `run-due`/`assess-city` exiting `USAGE_EXIT_CODE` while it exists.** The token that makes the CLI work also makes that config block *parse*,
-while three arms in `scheduler.py` stay fail-open: `city_timeout_seconds`' allow-list returns the flat `city_timeout_minutes` floor (SIGKILLing Singapore's ~10.4 h sweep at 180 min, with a killed child recording **no** `api_usage`),
-`estimate_requests` falls through to the **GSV grid formula**, and `enabled_providers`' `rank.get(p, 99)` orders it by accident.
-None of those raises, so `UNWIRED_CHANNELS` is what refuses — a misspelled channel is a typo worth dropping silently, but this one is spelled correctly and would collect wrongly every night.
+and four arms in `scheduler.py` were fail-open behind it.
+**Three are now wired (#238)**: `city_timeout_seconds` has a `_kartaview_timeout_seconds` arm where its allow-list used to return the flat `city_timeout_minutes` floor (SIGKILLing Singapore's ~10.4 h sweep at 180 min, with a killed child recording **no** `api_usage`);
+`estimate_requests` has an `estimate_kartaview_requests` arm where it used to fall through to the **GSV grid formula**;
+`enabled_providers` ranks it explicitly last rather than by `rank.get(p, 99)`'s accident — the sweep can consume the rest of the *night*, so the channels that finish a median city in minutes should already be done when it starts;
+and `_run_one_city` now hands the child `--kartaview-max-requests-per-minute`, without which a timeout derived from the configured rate would be measured against a rate the sweep never used.
+None of those raised, so `UNWIRED_CHANNELS` is what refuses — a misspelled channel is a typo worth dropping silently, but this one is spelled correctly and would have collected wrongly every night.
 The refusal is scoped to the commands that launch channels rather than raised at load: `load_scheduler_config` drops the block from `providers` (so nothing downstream can price or launch it) and records the error in `SchedulerConfig.unwired_channel_errors`, `run-due` and `assess-city` refuse with `USAGE_EXIT_CODE` while it is non-empty, and the read-only subcommands
 — `backup-status` and `restore-backup` are the incident-time handles
 — keep working with the error in the log, which a load-time `ValueError` used to take down over a block they could never act on.
 `CHANNEL_HOSTS["kartaview"]` is declared regardless, because `test_every_scheduled_channel_declares_its_per_ip_hosts` asserts set **equality** against `KNOWN_PROVIDERS`.
-Wiring the channel needs #238 (the timeout arm, derived from `estimate_sweep_requests` × the measured **1.80×** overhead, not the geometric floor) and the per-(city, provider) scoping issue
-— `get_due_cities` reads `cities.enabled` alone, so a channel would put all 1,144 cities in its queue at ~186,000 requests per pass, which `docs/experiments/kartaview-sweep-cost.md` says outright is not affordable yet.
+**The remaining blocker is dueness** — `get_due_cities` gates on `cities.enabled` alone, so a channel would put all 1,144 cities in its queue at ~186,000 requests per pass, which `docs/experiments/kartaview-sweep-cost.md` says outright is not affordable yet.
+
+**The cost arms, and the two numbers that are easy to swap (#238).** The estimate is `estimate_sweep_requests` × **1.80×**, and the multiplier is not optional: the lattice counts one page-1 per root circle and prices neither the extra pages, the backpressure retries nor the per-city calibration ladder.
+Use **1.80×** (`summary.observed_over_root_cells.p50`) and not the **1.54×** the same study reports, because the two have different denominators — 1.54× is `observed_over_floor`, measured against a floor that counts cells *plus pages 2+*, where `estimate_sweep_requests` counts cells alone, so quoting it here would under-price the pages twice over.
+The timeout then divides that by the channel's pace × `_SWEEP_ACHIEVED_RATE_FRACTION`, which is **0.5, deliberately BELOW the tile census's 0.8** — the opposite of the intuition that a serial walk tracks its limiter more closely than a concurrent one.
+A concurrent fetch hides per-request latency behind other requests in flight, so its limiter binds; the sweep is serial by design, so its wall-clock per request is `max(pacing_interval, latency)` with nothing to overlap, and at 16/min that interval is only 3.75 s against a page carrying up to 2,000 photo records.
+The error is deliberately asymmetric — under-timing is the whole defect being fixed, while over-timing is bounded by the batch deadline clamp and, since #239, an eventual kill just resumes tomorrow.
+
+**The estimate reads the previous run's OBSERVED cost before it reaches for geometry, and that ordering is doing real work.** Radius is a 4× lever the up-front lattice cannot see: it must assume the default `r=1000`, while Singapore, New York and Manila all calibrate down to `r=500`, and nothing durable records that — the checkpoint pins it for one sweep and `cli.py` discards it once the run is cataloged.
+So tier 1 is `runs.api_requests`, which for KartaView holds `api_requests_total`, the sweep's cumulative spend — carrying the radius, the pages, the retries and the ladder in one already-measured number, and previously read by nothing.
+A paused sweep raises `SweepIncompleteError` and never reaches `register_run`, so a row there always describes a *complete* sweep rather than a partial night.
+Tier 2 (a first run) is geometry × 1.80×, and is under by ~4× on exactly those metros: Singapore estimates ~1,273 circles against 9,974 requests actually spent.
+That is survivable in one direction only — #239's checkpoint means the resulting SIGKILL resumes tomorrow instead of discarding the night — and tier 1 corrects it from the second run onward.
+Note what none of this buys: a metro's honest timeout *exceeds* `max_batch_hours` outright, so the deadline clamp is what bounds it in a real night, and that is the intended outcome rather than a defect.
+One thing #238 deliberately left alone: the `est > budget` arm skips a city that can never fit the daily budget **permanently**, which is not resumability-aware — a metro priced above any sane KartaView budget would be skipped loudly forever rather than sweeping what tonight affords and checkpointing the rest.
+That wants its own issue once dueness lands.
 A road walk is also still absent: `collect_mapillary.build_streetwalk_rows` is Mapillary-specific in three separate ways and has to be generalized first.

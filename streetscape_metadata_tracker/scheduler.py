@@ -62,6 +62,10 @@ from .download_common import (
     HOST_OVERPASS,
     redact_credentials,
 )
+from .download_kartaview import (
+    DEFAULT_SWEEP_REQUESTS_PER_MINUTE,
+    estimate_sweep_requests,
+)
 from .download_mapillary import DEFAULT_TILE_REQUESTS_PER_MINUTE, estimate_tile_count
 from .json_summarizer import (
     generate_aggregate_v2,
@@ -123,28 +127,38 @@ CHANNEL_HOSTS: dict[str, tuple[str, ...]] = {
 # while the read-only subcommands — backup-status and restore-backup are the
 # incident-time handles — keep working with the error in the log.
 #
-# The failure this prevents is silent in all three of its parts. #225 phase 3b
-# put "kartaview" in naming.KNOWN_PROVIDERS so the CLI could collect a city by
-# hand, and the config loader gates on that same tuple -- so [providers.kartaview]
-# started PARSING while three arms here stayed fail-open:
-#   * city_timeout_seconds' allow-list returns the flat city_timeout_minutes
+# #225 phase 3b put "kartaview" in naming.KNOWN_PROVIDERS so the CLI could
+# collect a city by hand, and the config loader gates on that same tuple -- so
+# [providers.kartaview] started PARSING while four arms here stayed fail-open,
+# none of which raises: the channel would simply have run wrong, nightly.
+#
+# THREE OF THE FOUR ARE NOW WIRED (issue #238). They are still listed because
+# what each one silently did is the reason its replacement looks as it does:
+#   * city_timeout_seconds' allow-list returned the flat city_timeout_minutes
 #     floor for an unlisted channel. At the sweep's 16 req/min that SIGKILLs
 #     Singapore (~9,974 requests, ~10.4 h) at 180 minutes, and a killed child
 #     records NO api_usage, so its whole spend vanishes from the daily ledger.
-#   * estimate_requests falls through to the GSV GRID formula -- thousands of
+#     Now _kartaview_timeout_seconds.
+#   * estimate_requests fell through to the GSV GRID formula -- thousands of
 #     "requests" for a bbox the sweep covers in a handful of circles -- so the
-#     budget guard is wrong in both directions.
-#   * enabled_providers' rank.get(p, 99) orders it by accident, not decision.
-# None of those raises; the channel would just run wrong, nightly. Issue #238
-# is the timeout arm and the per-(city, provider) scoping issue is the other
-# half -- dueness reads cities.enabled alone, so a kartaview channel would put
-# all 1,144 enabled cities in its queue at ~186,000 requests per pass.
+#     budget guard was wrong in both directions. Now estimate_kartaview_requests.
+#   * enabled_providers' rank.get(p, 99) ordered it by accident. Now an explicit
+#     rank of 4, argued in that docstring.
+#   * _run_one_city did not hand the child the channel's configured pace, so a
+#     timeout derived from that rate could be measured against a rate the sweep
+#     never used. Now sent as --kartaview-max-requests-per-minute.
+#
+# THE REMAINING BLOCKER IS DUENESS, which is why this refusal stays: db's
+# get_due_cities gates on cities.enabled alone, so a kartaview channel would put
+# all 1,144 enabled cities in its queue at ~186,000 requests per pass -- which
+# the sweep-cost writeup says outright is not affordable yet.
 UNWIRED_CHANNELS: dict[str, str] = {
     "kartaview": (
         "collectable by hand via `streetscape_tracker.py --provider kartaview`, "
-        "but it has no scheduler timeout arm (#238), no request estimator, and "
-        "no per-(city, provider) scoping, so a nightly channel would run on a "
-        "flat timeout against a budget computed with the GSV grid formula"
+        "and its timeout, request estimate, channel order and pacing are wired "
+        "(#238) -- but dueness has no per-(city, provider) scoping, so enabling "
+        "it would put all 1,144 enabled cities in its nightly queue at roughly "
+        "186,000 requests per pass"
     ),
 }
 
@@ -370,7 +384,13 @@ class SchedulerConfig:
         host affinity in the launch pass does that, and it would keep doing it
         under any ordering.
         """
-        rank = {"gsv": 0, "gsv_streets": 1, "mapillary": 2, "mapillary_streets": 3}
+        rank = {
+            "gsv": 0,
+            "gsv_streets": 1,
+            "mapillary": 2,
+            "mapillary_streets": 3,
+            "kartaview": 4,
+        }
         return sorted(
             (p for p, pc in self.providers.items() if pc.enabled),
             key=lambda p: (rank.get(p, 99), p),
@@ -692,6 +712,66 @@ def estimate_street_samples(
     return max(1, int(street_km * 1000.0 / spacing))
 
 
+def estimate_kartaview_requests(conn, city: db.CityRow) -> int:
+    """
+    Estimated API requests for one KartaView radius sweep of this city's bbox.
+
+    The sweep tiles the frozen grid's bbox with squares, covers each with its
+    circumscribed circle, and pages each circle to exhaustion, so cost tracks
+    bbox AREA rather than imagery or sample spacing. Precedence, most to least
+    trustworthy — the same shape as :func:`estimate_street_samples`:
+
+    1. This city's last KartaView run's ``runs.api_requests``. For KartaView
+       that column holds ``api_requests_total`` (see ``cli.py``), i.e. the
+       sweep's cumulative spend across every process that resumed it -- the
+       OBSERVED cost the cost study says to quote. It is strictly better than
+       any geometry because it carries the four terms the lattice cannot see:
+       the calibrated radius, the extra pages, the backpressure retries and the
+       per-city calibration ladder. A paused sweep raises ``SweepIncompleteError``
+       and never reaches ``register_run``, so a row here always describes a
+       COMPLETE sweep rather than a partial night. It therefore over-prices a
+       city resuming from a checkpoint, which needs only its remainder -- the
+       conservative direction: the budget guard defers such a city on a tight
+       night instead of overspending, and the timeout is merely generous.
+    2. The geometric lattice x ``_SWEEP_OVERHEAD_MULTIPLIER``.
+
+    Tier 2 has a known blind spot, and it is a factor of four rather than a
+    rounding error: ``estimate_sweep_requests`` must assume the default
+    ``r=1000`` because the working radius is a property of the LOCATION,
+    measured once per city by ``calibrate_radius`` and not predicted by
+    density. A city that calibrates down to r=500 costs ~4x this estimate --
+    Singapore, New York and Manila all do (Singapore: ~1,273 circles estimated
+    against 9,974 requests actually spent). Nothing durable records that
+    radius: the checkpoint pins it for the duration of one sweep and ``cli.py``
+    discards the checkpoint once the run is cataloged. So a FIRST sweep of such
+    a city is under-estimated by construction, which is survivable in exactly
+    one direction -- #239's checkpoint means the resulting SIGKILL resumes
+    tomorrow instead of discarding the night -- and tier 1 corrects it from the
+    second run onward.
+
+    Args:
+        conn: open catalog connection, or None to force the geometric tier.
+        city: the city row (frozen grid geometry).
+
+    Returns:
+        Estimated KartaView API requests for one full sweep of the bbox.
+    """
+    if conn is not None:
+        prior = conn.execute(
+            """SELECT api_requests FROM runs
+               WHERE city_id = ? AND provider = 'kartaview' AND api_requests > 0
+               ORDER BY run_date DESC LIMIT 1""",
+            (city.city_id,),
+        ).fetchone()
+        if prior:
+            return max(1, int(prior["api_requests"]))
+
+    lattice = estimate_sweep_requests(
+        city.center_lat, city.center_lon, city.grid_width_m, city.grid_height_m, city.step_m
+    )
+    return max(1, int(lattice * _SWEEP_OVERHEAD_MULTIPLIER))
+
+
 def estimate_requests(
     city: db.CityRow,
     provider: str = "gsv",
@@ -708,8 +788,12 @@ def estimate_requests(
     road walk reads the identical census, so its cost does not scale with
     sample spacing at all).
 
-    ``conn`` is required only for ``gsv_streets``; without it the sample
-    estimate falls back to the area proxy.
+    KartaView: the radius-sweep lattice over the frozen bbox, carrying the
+    study's measured overhead (see :func:`estimate_kartaview_requests`).
+
+    ``conn`` is read by ``gsv_streets`` and ``kartaview``; without it each falls
+    back to its geometry-only tier (the area proxy, and the default-radius
+    lattice respectively).
     """
     if provider in ("mapillary", "mapillary_streets"):
         # Both Mapillary channels read the identical z14 census.
@@ -724,6 +808,11 @@ def estimate_requests(
                 street_km *= _BROAD_NETWORK_MULTIPLIER
             return max(1, int(street_km * 1000.0 / max(1, spacing_m)))
         return estimate_street_samples(conn, city, spacing_m, network_type)
+    if provider == "kartaview":
+        # A paginated radius sweep priced by bbox area, NOT the grid formula
+        # below: the lattice covers a median catalog city in ~12 circles where
+        # the grid formula would read tens of thousands of points (#238).
+        return estimate_kartaview_requests(conn, city)
     return (city.grid_width_m // city.step_m + 1) * (city.grid_height_m // city.step_m + 1)
 
 
@@ -747,6 +836,37 @@ _ACHIEVED_RATE_FRACTION = 0.5
 # the async engine never approaches. The shortfall being budgeted for here is
 # per-request latency and the occasional retry, not structural undershoot.
 _TILE_ACHIEVED_RATE_FRACTION = 0.8
+# The KartaView equivalent, and LOWER than the Mapillary one rather than higher.
+# The intuition runs the other way from the tile fetch: that sweep is concurrent,
+# so per-request latency hides behind other requests in flight and the limiter is
+# what binds. The KartaView sweep is deliberately SERIAL (the next question
+# depends on the last answer, and fanning out into a server that answers HTTP 400
+# under load is #198's shape), so its wall-clock per request is
+# max(pacing_interval, latency) with nothing to overlap. At the shipped 16/min
+# the interval is only 3.75 s, and a `nearby-photos` page carries up to 2,000
+# photo records — a far fatter response than a z14 tile — so latency can be the
+# binding term, not the limiter. 0.5 budgets 7.5 s per request at 16/min.
+#
+# The error is deliberately asymmetric. Under-timing is the failure this whole
+# derivation exists to prevent: a SIGKILLed child records NO api_usage, so its
+# spend vanishes from the daily ledger, AND it counts a collection failure that
+# only a success ever resets (five quarantine a city for a 90-day cycle).
+# Over-timing costs nothing comparable — the batch deadline still clamps the
+# value (see city_timeout_seconds), and since #239 an eventual kill means the
+# sweep resumes from its checkpoint tomorrow rather than restarting at cell zero.
+_SWEEP_ACHIEVED_RATE_FRACTION = 0.5
+# Observed KartaView sweep cost over the bare root-cell lattice, median across
+# the 14-city study (`summary.observed_over_root_cells.p50` in
+# docs/experiments/kartaview-sweep-cost_metrics.json). estimate_sweep_requests
+# counts ONE page-1 per root cell and nothing else, so the overhead this carries
+# is the extra pages, the backpressure retries and the per-city calibration
+# ladder.
+#
+# NOT the 1.54x that the same study also reports: that is
+# `summary.observed_over_floor`, measured against a DIFFERENT denominator — the
+# study's floor counts cells *plus pages 2+*, where estimate_sweep_requests
+# counts cells alone. Quoting 1.54x here would under-price the pages twice over.
+_SWEEP_OVERHEAD_MULTIPLIER = 1.80
 # Floor for a deadline-clamped timeout. A city is only started while the batch
 # deadline still has room, so the clamp should shorten a run — never hand a
 # child a timeout too short to reach its first request.
@@ -879,6 +999,43 @@ def _channel_estimate(cfg: SchedulerConfig, city: db.CityRow, provider: str, con
     )
 
 
+def _kartaview_timeout_seconds(
+    city: db.CityRow, pc: ProviderConfig | None, floor: int, conn
+) -> int:
+    """
+    Derived timeout for a paced KartaView radius sweep (issue #238).
+
+    The sweep is SERIAL and paced, so wall-clock is simply request count over
+    the achieved rate -- but both terms are unlike the other channels'. The
+    count comes from bbox area rather than grid points or tiles, and it spans
+    four orders of magnitude across the catalog (median ~16 requests, p95 636,
+    Singapore ~9,974); and the rate is 16/min, low enough that per-request
+    latency competes with the pacing interval, which is why this uses
+    ``_SWEEP_ACHIEVED_RATE_FRACTION`` rather than the tile census's figure.
+
+    Without this arm the channel fell through ``city_timeout_seconds``'
+    allow-list to the flat ``city_timeout_minutes`` floor, which SIGKILLs a
+    metro sweep part-way through -- worse than a plain failure twice over,
+    because a killed child records no ``api_usage`` (so its spend vanishes from
+    the daily ledger) and it burns one of the five ``consecutive_failures`` that
+    only a success resets.
+
+    Note what this does NOT buy: a metro's honest timeout exceeds
+    ``max_batch_hours`` outright, so the caller's deadline clamp is what bounds
+    it in a real night. That is the correct outcome rather than a defect --
+    since #239 the sweep checkpoints, so being cut short means resuming
+    tomorrow. Never returns below the configured floor.
+    """
+    # `is None`, not falsy: 0 means "pacing disabled", not "use the default".
+    configured = pc.max_requests_per_minute if pc else None
+    rate = DEFAULT_SWEEP_REQUESTS_PER_MINUTE if configured is None else configured
+    if rate <= 0:  # pacing disabled: nothing to derive from
+        return floor
+    requests = estimate_requests(city, "kartaview", conn=conn)  # what the budget uses too
+    paced_seconds = requests / (rate * _SWEEP_ACHIEVED_RATE_FRACTION) * 60.0
+    return int(max(floor, paced_seconds * _TIMEOUT_HEADROOM + _TIMEOUT_FIXED_SLACK_S))
+
+
 def city_timeout_seconds(
     cfg: SchedulerConfig,
     city: db.CityRow,
@@ -897,9 +1054,10 @@ def city_timeout_seconds(
     ``max_requests_per_minute * _ACHIEVED_RATE_FRACTION`` because the pacing cap
     is not actually achieved (see the constant). Every channel is now paced, so
     every channel scales — the Mapillary pair off tile count and their own
-    per-IP rate (see _mapillary_timeout_seconds). The derived value never drops
-    below the configured floor, so small cities keep the flat timeout whatever
-    their provider.
+    per-IP rate (see _mapillary_timeout_seconds), and KartaView off its bbox's
+    swept circle count and its own 16/min pace (see _kartaview_timeout_seconds).
+    The derived value never drops below the configured floor, so small cities
+    keep the flat timeout whatever their provider.
 
     ``remaining_s`` clamps the result to what is left of the batch deadline
     (issue #167). Without it, a city started just inside the deadline still runs
@@ -928,11 +1086,13 @@ def city_timeout_seconds(
     # is 575. The derivation stays because a grid can be re-registered larger at
     # any time, and a SIGKILL costs the requests already spent AND counts a
     # failure — the guard must not depend on today's geometry staying capped.
-    if provider not in ("gsv", "gsv_streets", "mapillary", "mapillary_streets"):
+    if provider not in ("gsv", "gsv_streets", "mapillary", "mapillary_streets", "kartaview"):
         return clamp(floor)
     pc = (cfg.providers or {}).get(provider)
     if provider in ("mapillary", "mapillary_streets"):
         return clamp(_mapillary_timeout_seconds(city, provider, pc, floor))
+    if provider == "kartaview":
+        return clamp(_kartaview_timeout_seconds(city, pc, floor, conn))
     rate = (pc.max_requests_per_minute if pc else None) or cfg.max_requests_per_minute
     if rate <= 0:
         return clamp(floor)
@@ -2526,15 +2686,31 @@ def _run_one_city(
         rate = ((cfg.providers or {}).get(provider) or ProviderConfig()).max_requests_per_minute
         if rate is not None:
             cmd += ["--mapillary-max-requests-per-minute", str(rate)]
+    if provider == "kartaview":
+        # Same reason as Mapillary's flag above, plus one specific to this
+        # channel: the timeout is DERIVED from the configured rate (#238), so a
+        # child left on its own default would be timed against a number it never
+        # honoured. Omitting the flag when unset is still correct -- the CLI
+        # default is the same conservative 16/min this derivation assumes.
+        rate = ((cfg.providers or {}).get(provider) or ProviderConfig()).max_requests_per_minute
+        if rate is not None:
+            cmd += ["--kartaview-max-requests-per-minute", str(rate)]
     # '--' so a display name can never be parsed as a flag
     cmd += ["--", city.display_name]
+    # `conn` on both fallbacks, matching the street arm above (#238). It was
+    # omitted here while `estimate_requests` read it only for gsv_streets; the
+    # KartaView tier that prefers a previous sweep's OBSERVED cost makes it
+    # load-bearing, and without it the child is timed from default-radius
+    # geometry that under-prices an r=500 metro roughly fourfold.
     estimated = (
-        _channel_estimate(cfg, city, provider) if estimated_requests is None else estimated_requests
+        _channel_estimate(cfg, city, provider, conn)
+        if estimated_requests is None
+        else estimated_requests
     )
     logger.info(f"Collecting {city.city_id} [{provider}] (~{estimated:,} requests estimated)")
     logger.debug(f"Command: {' '.join(cmd)}")
     child_timeout_s = (
-        city_timeout_seconds(cfg, city, provider, remaining_s=remaining_s)
+        city_timeout_seconds(cfg, city, provider, conn=conn, remaining_s=remaining_s)
         if timeout_s is None
         else timeout_s
     )
