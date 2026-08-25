@@ -32,14 +32,23 @@ already gone wrong once:
 ## `--provider` is a channel list (issue #247)
 
 `tests/test_cli_policy.py` pins the grid CLI's `--provider` flag.
-The two that matter most: the default expands to `gsv,mapillary` and **does not** include KartaView, and `--provider all` reaches every provider the default leaves out.
-That asymmetry is the point — `all` derived from `naming.KNOWN_PROVIDERS` cannot silently OMIT a fourth provider, where a redefined `both` would have silently INCLUDED KartaView, adding a third mandatory credential and an hours-long serial sweep to every bare `streetscape_tracker.py "City"`.
+The default expands to `gsv,mapillary` and **does not** include KartaView, while `--provider all` reaches the provider the default leaves out.
+That asymmetry is the point: `all` derived from `naming.KNOWN_PROVIDERS` cannot silently OMIT a fourth provider, where a redefined `both` would have silently INCLUDED KartaView, adding a third mandatory credential and an hours-long serial sweep to every bare `streetscape_tracker.py "City"`.
 
-- `both` is still accepted and warns on stderr (cron entries, shell history and `run_cities.py` pass-through arguments carry it)
+- Typing nothing lands in `async_main` as the canonical parsed LIST, quietly.
+  argparse runs `type` over a *string* default and hands a non-string default through untouched, so `default=DEFAULT_PROVIDERS_ARG` is load-bearing and invisible — and nothing pinned it until PR #263's review, because `run_cli` always passed `--provider`, leaving the whole suite green over a default the CLI never once parsed
+- Every `KNOWN_PROVIDERS` member reaches **its own** downloader, asserted as set equality against a hand-kept map in the test.
+  `--provider all` is the fourth consumer of that tuple and was the only one without a reachability pin — `PROVIDER_RUN_DTYPES`, `vis.PROVIDER_DISPLAY` and `scheduler.CHANNEL_HOSTS` each have one so a token cannot fail open.
+  It mattered more here than at those three, because `all` expands from the tuple: a provider added to `KNOWN_PROVIDERS` but not wired reached the dispatch without anyone typing its name, and GSV was the `else` — a Google-keyed grid sweep published as the new provider's series, in an immutable dated snapshot.
+  The companion test drives that branch (patching both `KNOWN_PROVIDERS` bindings) and asserts the log names `_collect_one_run`, so it cannot pass on `naming`'s own guard several steps earlier
+- `both` is still accepted and warns on stderr (cron entries, shell history and `run_cities.py` pass-through arguments carry it), and resolves through the `DEFAULT_PROVIDERS` tuple rather than by re-splitting its argv spelling.
+  That last part is a fix, not a flourish: the string form is also help text, so reformatting it to the more readable `"gsv, mapillary"` is an ordinary edit, and the unstripped split it used to do then resolved `both` to `['gsv']` and exited 0
 - Duplicates collapse and the result is ordered by `KNOWN_PROVIDERS` rather than by what was typed, matching `scheduler._select_providers`
 - An unknown name, an empty selection (`--provider ""`, `--provider ,` — both reachable, since argparse hands the type function whatever string it was given) and a street channel name all exit 2 with no downloader call
 - `--provider all` fails fast on **every** named credential, collecting nothing when one is missing.
   That records a decision rather than an accident — the alternative, skipping a credential-less provider with a warning, was live and was refused, because a run that silently collected two of three while exiting 0 is the quiet-narrowing failure this codebase refuses everywhere else
+- `--check-boundary` previews with **no** credential loaded at all, `--provider all` included.
+  It contacts no provider API, only Nominatim; behind the fail-fast check it demanded three keys to draw a rectangle, on exactly the under-provisioned host an operator reaches for a preview from
 
 One deliberate absence: the alias is pinned by its own named test, and the unrelated tests that used to pass `provider="both"` incidentally were moved to the list form.
 Incidental coverage of a deprecated spelling trains readers to ignore the notice, and disappears the moment someone tidies an unrelated test.

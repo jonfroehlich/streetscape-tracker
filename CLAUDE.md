@@ -41,7 +41,7 @@ pytest                             # run the test suite (fast, no network)
 # same run date (per-provider skip if a run <80 days old exists)
 python streetscape_tracker.py "Seattle, WA"
 python streetscape_tracker.py "Seattle, WA" --provider mapillary        # restrict to one provider
-python streetscape_tracker.py "Seattle, WA" --provider all             # every KNOWN_PROVIDER; needs all 3 keys
+python streetscape_tracker.py "Seattle, WA" --provider all              # every KNOWN_PROVIDER; needs all 3 keys
 python streetscape_tracker.py "Seattle, WA" --force --run-date 2026-07-02
 python streetscape_tracker.py "Seattle, WA" --check-boundary   # preview search area only
 

@@ -24,9 +24,11 @@ so cross-provider snapshots align.
 
 ## Imagery providers
 
-**By default every collection command gathers both providers**, back-to-back
-with the same run date, so the two series stay in sync (`--provider gsv` or
-`--provider mapillary` restricts to one).
+`--provider` is a comma-separated channel LIST, defaulting to `gsv,mapillary` (issue #247).
+The named providers run back-to-back with the same run date, so their series stay in sync;
+naming one (`--provider mapillary`) restricts to it.
+`--provider all` collects every provider the naming contract knows about — never the default, because KartaView's sweep is serial and hours long for a metro.
+The retired spelling `both` still works, with a deprecation notice: it named two of two when it was written and names two of three now.
 
 | | Google Street View (`--provider gsv`) | Mapillary (`--provider mapillary`) |
 |---|---|---|
@@ -34,9 +36,8 @@ with the same run date, so the two series stay in sync (`--provider gsv` or
 | What's kept | The nearest pano per grid point | **Every** 360° pano (`is_pano`), assigned to its nearest grid point; flat phone photos are excluded |
 | Credential | `GMAPS_API_KEY` ([console.cloud.google.com](https://console.cloud.google.com/apis/credentials), Street View Static API enabled) | `MAPILLARY_ACCESS_TOKEN` (free client token from [mapillary.com/dashboard/developers](https://www.mapillary.com/dashboard/developers)) |
 
-Both go in `.env` in the project root. The default (both providers)
-requires both credentials up-front — a missing key fails before anything
-downloads, so the series can't drift out of sync.
+Both go in `.env` in the project root.
+Every provider named by `--provider` must have its credential up-front — `--provider all` included — and a missing key fails before anything downloads, so the series can't drift out of sync.
 
 **Comparing numbers across providers.** Both providers use the identical
 frozen grid, so *coverage rate* (% of grid points with a pano) is directly
@@ -115,18 +116,22 @@ The repository includes several scripts divided into core data collection tools 
 
 ### Basic Usage
 
-To analyze a city's coverage using default settings (1000m x 1000m grid, 20m steps) — this collects a GSV **and** a Mapillary snapshot with the same run date:
+To analyze a city's coverage using default settings (1000m x 1000m grid, 20m steps) — this collects a GSV **and** a Mapillary snapshot with the same run date, the `gsv,mapillary` default:
 
 ```bash
 python streetscape_tracker.py "Seattle, WA"
 ```
 
-### Collecting a Single Provider
+### Choosing Which Providers to Collect
 
 ```bash
-python streetscape_tracker.py "Seattle, WA" --provider gsv
+python streetscape_tracker.py "Seattle, WA" --provider gsv          # one channel
 python streetscape_tracker.py "Seattle, WA" --provider mapillary
+python streetscape_tracker.py "Seattle, WA" --provider gsv,kartaview  # any list
+python streetscape_tracker.py "Seattle, WA" --provider all          # every provider; needs every key
 ```
+
+A name the CLI doesn't know, and an empty selection (`--provider ""`), are both refused at parse time rather than collecting nothing and exiting 0.
 
 A Mapillary run reuses the city's frozen grid and takes seconds — a whole
 city is a few dozen tile requests rather than one request per grid point.
