@@ -9,6 +9,8 @@ that join trustworthy:
   * one row per sample location, with the #116 status vocabulary
     (OK / FLAT_ONLY / ZERO_RESULTS) and the match-distance guard applied;
   * flat imagery raising the ANY-imagery number without touching the 360° one;
+  * undated imagery (NO_DATE) covering the street while ageing nothing (#257),
+    which is the arm the GSV-only unit tests structurally cannot reach;
   * requests metered under `mapillary_streets`, never `mapillary` or
     `gsv_streets`;
   * cost independent of sample spacing (the whole point of the tile census).
@@ -236,6 +238,17 @@ def test_flat_only_rows_carry_no_capture_date(tmp_path, monkeypatch):
 
 
 def test_unusable_timestamp_becomes_no_date_not_a_bogus_year(tmp_path, monkeypatch):
+    """An unusable contributor timestamp becomes NO_DATE rather than 1970 —
+    and, since #257, that pano still COVERS the street it is standing on.
+
+    This is the end-to-end half of the PRESENT-vocabulary contract that
+    `tests/test_streetwalk_coverage.py` pins on `compute_streetwalk_coverage`
+    directly. Those unit tests drive the scorer with `provider="gsv"`, the one
+    provider whose NO_DATE population is empty in practice, so they cannot see
+    a walk that produces NO_DATE rows for real. This one can: every image here
+    is undated, so the whole artifact is the undated case, and it reads 0.0%
+    against the pre-#257 `status == "OK"` filter and 100.0% after.
+    """
     images = [_image(f"p{i}", 44.05 + i * 0.0001, -121.30, captured_at_ms=0) for i in range(26)]
     data_dir, _ = _setup(tmp_path, monkeypatch, images)
 
@@ -245,6 +258,25 @@ def test_unusable_timestamp_becomes_no_date_not_a_bogus_year(tmp_path, monkeypat
     df = load_city_csv_file(os.path.join(data_dir, _csv_name()))
     assert (df["status"] == "NO_DATE").any()
     assert not (df["capture_date"].fillna("") == "1970-01-01").any()
+
+    # Undated panos on the street cover it, in the 360° number as well as _any.
+    totals = _coverage(data_dir)["properties"]["metadata"]["totals"]
+    assert totals["coverage_pct_by_length"] == 100.0
+    assert totals["coverage_pct_by_length_any"] == 100.0
+    # ...and age nothing, with the denominator recording exactly why: every
+    # covered sample here is undated, so there is no age to take a median of.
+    assert totals["median_covered_age_years"] is None
+    assert totals["covered_samples"] > 0
+    assert totals["covered_samples_dated"] == 0
+    assert totals["dated_pct_of_covered"] == 0.0
+
+    # The catalog carries the corrected number too, not just the artifact —
+    # `streets.html` and the walk diffs both read the row, not the GeoJSON.
+    conn = db.connect(db.get_default_db_path(data_dir))
+    walk = db.get_latest_street_walk(conn, CITY_ID, provider="mapillary")
+    assert walk["coverage_pct_by_length"] == 100.0
+    assert walk["median_covered_age_years"] is None
+    conn.close()
 
 
 def test_empty_census_yields_zero_coverage_not_a_crash(tmp_path, monkeypatch):

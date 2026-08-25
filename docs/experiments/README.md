@@ -60,6 +60,16 @@ Its transferable lesson is that a log holds **three** populations that look alik
 — the exact `Published in N.N s` line, the pre-#229 `Publishing via` → next-line *upper bound*, and failures, whose 0.05–0.30 s values are not publish durations at all and halve p25 if pooled
 — plus a fourth thing that is not an observation: a healthy pre-#229 night logged nothing after `Publishing via`, so most nights are simply unmeasurable and are reported as an excluded count rather than dropped.
 
+### `undated-imagery-share.md`
+
+Issue #257 — how much imagery carries no usable capture date, per provider, which is the number three prose claims in the road-walk fix rested on.
+**Three orders of magnitude apart**: GSV 0.0101% of present panos (and exactly zero in 1,070 of 1,146 runs), Mapillary 0.0% across 15.3M, KartaView 9.56% of audited photos.
+Two things generalize.
+**(1) A pooled share over a concentrated distribution describes no run in it** — GSV's is zero through the 90th percentile and is carried entirely by 76 big-metro runs, so "small on average" and "absent almost everywhere, occasionally 0.3%" are different facts with different consequences for a published one-decimal column.
+**(2) An undated population is not automatically a random sample of the imagery**: every violating KartaView sequence is one 2025-11-19 bulk ingest, so its undated imagery is its *newest*, and excluding it from an age median biases the median **older** rather than merely widening its error bar.
+The catalog half is a census and the KartaView half is an API sample read from `kartaview-shotdate-audit_metrics.json`; the two frames are reported side by side and never pooled.
+Both are proxies for the road-walk share, which no walk recorded until #257 added `dated_covered_samples`.
+
 The generating code is `scripts/{topic}_{collect,analyze,common}.py` (kept so the result can be reproduced, not because it runs routinely) and its test pins the sampling invariant.
 Answer "should we sample finer / differently?" questions from these before re-running anything.
 

@@ -1,0 +1,122 @@
+{
+  "_about": {
+    "experiment": "undated-imagery-share",
+    "writeup": "docs/experiments/undated-imagery-share.md",
+    "generated_by": "python scripts/undated_imagery_share_analyze.py --docs-dir docs/experiments",
+    "issue": 257,
+    "generated_at": "2026-08-25T11:05:56+00:00",
+    "note": "Share of present imagery carrying no usable capture date, per provider. `catalog` is a census of our own GRID runs; `kartaview_audit` is a sample of KartaView's API, read from its own committed metrics file. The two are different sampling frames and are never pooled. Both are proxies for the ROAD-WALK undated share, which no walk recorded until #257 added dated_covered_samples. No data_dir is recorded: an absolute path would put one machine's layout into a committed file."
+  },
+  "catalog": {
+    "gsv": {
+      "runs": 1157,
+      "panos_present": 151900889,
+      "panos_no_date": 15355,
+      "points_queried": 708758062,
+      "runs_with_any_no_date": 76,
+      "pooled_pct_of_present": 0.010109,
+      "pooled_pct_of_queried": 0.002166,
+      "per_run_pct_of_present": {
+        "n": 1146,
+        "min": 0.0,
+        "p25": 0.0,
+        "p50": 0.0,
+        "p75": 0.0,
+        "p90": 0.0,
+        "p95": 0.002684,
+        "max": 0.32276
+      },
+      "per_run_pct_of_queried": {
+        "n": 1157,
+        "min": 0.0,
+        "p25": 0.0,
+        "p50": 0.0,
+        "p75": 0.0,
+        "p90": 0.0,
+        "p95": 0.001478,
+        "max": 0.219361
+      },
+      "top_no_date_runs": [
+        {
+          "city_id": "los-angeles--california--united-states",
+          "run_date": "2025-01-03",
+          "no_date": 2670
+        },
+        {
+          "city_id": "new-york--new-york--united-states",
+          "run_date": "2025-02-02",
+          "no_date": 1359
+        },
+        {
+          "city_id": "phoenix--arizona--united-states",
+          "run_date": "2025-01-11",
+          "no_date": 1282
+        },
+        {
+          "city_id": "san-jose--california--united-states",
+          "run_date": "2025-01-14",
+          "no_date": 893
+        },
+        {
+          "city_id": "chicago--illinois--united-states",
+          "run_date": "2025-01-24",
+          "no_date": 843
+        }
+      ],
+      "largest_run_by_present_panos": {
+        "city_id": "houston--texas--united-states",
+        "run_date": "2025-02-06",
+        "panos_present": 6838813
+      }
+    },
+    "mapillary": {
+      "runs": 3,
+      "panos_present": 15306443,
+      "panos_no_date": 0,
+      "points_queried": 17124160,
+      "runs_with_any_no_date": 0,
+      "pooled_pct_of_present": 0.0,
+      "pooled_pct_of_queried": 0.0,
+      "per_run_pct_of_present": {
+        "n": 2,
+        "min": 0.0,
+        "p25": 0.0,
+        "p50": 0.0,
+        "p75": 0.0,
+        "p90": 0.0,
+        "p95": 0.0,
+        "max": 0.0
+      },
+      "per_run_pct_of_queried": {
+        "n": 3,
+        "min": 0.0,
+        "p25": 0.0,
+        "p50": 0.0,
+        "p75": 0.0,
+        "p90": 0.0,
+        "p95": 0.0,
+        "max": 0.0
+      },
+      "top_no_date_runs": [],
+      "largest_run_by_present_panos": {
+        "city_id": "detroit--michigan--united-states",
+        "run_date": "2026-07-24",
+        "panos_present": 15305890
+      }
+    }
+  },
+  "kartaview_audit": {
+    "available": true,
+    "source": "kartaview-shotdate-audit_metrics.json",
+    "frame": "API sample of 48 sequences, NOT our own snapshots",
+    "sequences_audited": 48,
+    "sequences_invalid": 10,
+    "photos_audited": 59263,
+    "photos_invalid": 5665,
+    "pct_of_present": 9.559084,
+    "invalid_upload_dates": [
+      "2025-11-19"
+    ],
+    "note": "Photos whose shot_date >= date_added, which the KartaView collector nulls to NO_DATE. Every violating sequence is one 2025-11-19 bulk ingest, so this population is the provider's NEWEST imagery, not a random sample of it -- dropping it from an age median biases the median OLD. The feasibility writeup calls this sample Grab-heavy and the count a lower bound."
+  }
+}

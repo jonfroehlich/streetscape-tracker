@@ -247,6 +247,8 @@ Dated copies go through SQLite's **online backup API**, to a per-writer staging 
 `scheduler backup-status` exits nonzero when the newest copy is missing, stale (>48 h) or the last attempt failed — and it needs a caller other than the scheduler, which is what the separate daily timer is for.
 
 **Street coverage and road walks → [`docs/street-coverage.md`](docs/street-coverage.md).** A second, active collection modality beside the grid: walk each frozen OSM edge, sample every `--spacing` m, and query the provider at each sample, so association is by construction and coverage is fractional per edge.
+**A sample counts as covered when its status is PRESENT — `OK` *or* `NO_DATE` — never `OK` alone** (`analysis.PRESENT_STATUSES`, the grid's vocabulary): an undated pano is still imagery within reach, so it covers and simply ages nothing.
+Both halves of `streetscape_street_analyzer` got that wrong independently (#251 finding 9, then #257), and the undated share is provider-specific by three orders of magnitude — 9.6% of audited KartaView photos against 0.010% of GSV's, so the same bug is invisible in one provider and decisive in another.
 **Grid coverage and street coverage are different denominators and never substitute for each other** — Seattle reads 54.3% grid against 98.4% street
 — and each `--network-type` is its own series with its own denominator, never a replacement for another.
 Both providers walk the same deterministic sample points, but Mapillary reaches them through a tile census joined locally, so its cost tracks bbox **area** rather than sample count.
@@ -300,6 +302,7 @@ keep any list a doc enumerates **alphabetical**, so two branches adding an entry
   - `kartaview-sweep-cost.md`
   - `pano-spacing.md`
   - `publish-duration.md`
+  - `undated-imagery-share.md`
 
   Answer "should we sample finer / differently?" from these before re-running anything.
 

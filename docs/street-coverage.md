@@ -26,8 +26,9 @@ Roadmap: attribution quality #95/#96/#97 → pipeline `--streets` flag #100 → 
 **Road-walk collection (`streetscape_street_analyzer/collect.py`, issue #99).** A SECOND, active collection modality alongside the grid (like Mapillary was added as census-vs-sample) — not a refactor.
 Instead of attributing grid panos to streets after the fact, it **walks each frozen OSM edge**, samples on-street points every `--spacing` m (~15) along the centerline (`road_sampling.generate_samples`, deterministic from the frozen GraphML so run-to-run diffs stay comparable
 — no separate frozen-points store; stable `edge_id` = unordered OSM node pair), and queries GSV for the nearest pano at each.
-Association is **by construction** and coverage is **fractional per edge** (covered samples ÷ total, a sample covered iff its pano is OK + official `© Google` + within `--match-dist` m
-— the distance guard rejects a pano that snapped to a parallel road).
+Association is **by construction** and coverage is **fractional per edge** (covered samples ÷ total, a sample covered iff its pano is PRESENT
+— `OK` **or** `NO_DATE`, see "NO_DATE counts as road-walk coverage" below
+— plus official `© Google` and within `--match-dist` m; the distance guard rejects a pano that snapped to a parallel road).
 It **reuses the grid downloader's hardened request engine** — `download_gsv.collect_points_async` (extracted so `download_gsv_metadata_async` is now a thin grid wrapper over it): same `AsyncRateLimiter`, OVER_QUERY_LIMIT/quota-window retry, failed-point finalize guard, `.downloading` resume, `detect_systemic_failure` reject.
 Budget is **isolated**: the `GMAPS_STREETS_API_KEY` key, metered in `api_usage` under `gsv_streets`, paced by its own `[providers.gsv_streets]` block
 — a first-class scheduled channel (see "Street channels are scheduled like grid providers" below), not a manual-only CLI.
@@ -135,6 +136,52 @@ Surfaced as an **absent-not-null** `change` block per manifest entry (most walks
 Only `length_km` gates backfill candidacy: the other three are legitimately NULL on rows that have a length (a pre-#116 artifact measured no flat imagery; a walk that covered nothing has no age to take a median of), so keying on them would make those rows permanent candidates.
 The backfill cross-checks each artifact's lengths against the row's already-cataloged `coverage_pct_by_length` and refuses a row that disagrees by more than a rounding tolerance
 — a filename-keyed backfill's one real failure mode is matching the wrong artifact, and the lengths and percentages are published side by side.
+
+## NO_DATE counts as road-walk coverage (issue #257)
+
+**Written after the split.**
+A road-walk sample is covered when its collected row is PRESENT — `OK` **or** `NO_DATE` — official, and within `--match-dist` m: the same presence vocabulary the grid coverage rate has always used (`analysis.PRESENT_STATUSES`).
+Until 2026-08-24 `compute_streetwalk_coverage` filtered on `status == "OK"` alone, so a 360° pano standing on the street with a capture date the provider's guard had nulled counted as **neither** `covered` nor `covered_any`.
+The grid-attribution half of this same package (`select_pano_points`) had already been corrected in 611bd53 (PR #251, review finding 9); this is the road-walk half catching up, and the two halves now read one definition rather than two.
+Note the doc was ahead of the code here — "Road-walk: both providers, and scheduled" above has described the sample vocabulary as `OK`/`NO_DATE` since #116, which is the definition that was intended all along.
+
+A `NO_DATE` sample covers and **ages nothing**: its `capture_date` is NaT, so it never reaches `nearest_pano_date` or `median_covered_age_years`, exactly as in the grid stats.
+The GSV official-imagery gate is untouched and still applies — an undated third-party pano is still third-party, and the exact `© Google` match is the only thing standing between the two.
+
+### Coverage and age now have different denominators, so the artifact records both
+
+Splitting the two apart means `median_covered_age_years` is no longer an age over "the covered imagery" but over the **dated subset** of it, and nothing recorded how large that subset was.
+So the walk artifact now carries it: `dated_covered_samples` per edge, and `covered_samples`/`covered_samples_dated`/`dated_pct_of_covered` in every `summarize_streetwalk_coverage` block (`totals` and each highway bucket, which reach the catalog verbatim through `street_walks.coverage_by_highway`).
+An age over 100% of an edge's coverage and an age over 3% of it are different measurements and must not read alike.
+Frames predating the column summarize as **100% dated**, which is what those numbers meant when they were written: before #257 only an `OK` sample could be covered, and an `OK` sample always carries a date.
+
+**Read a low `dated_pct_of_covered` as an age biased OLD, not merely as a smaller sample.**
+For KartaView the undated population is not a random slice of the imagery — every violating sequence in the audit is one 2025-11-19 bulk ingest, so it is the provider's **newest** imagery, and excluding it can only drag the median older.
+A KartaView city could refresh substantially and have its published median age move the wrong way.
+
+### How large the undated population actually is → [`docs/experiments/undated-imagery-share.md`](experiments/undated-imagery-share.md)
+
+The claim that this population is "large by construction for KartaView, small but real for Mapillary, empty in practice for GSV" was three prose assertions until it was measured; it is now three numbers, and one of them was wrong.
+**GSV 0.0101%** of present panos — and exactly zero in **1,070 of 1,146** runs, i.e. zero through the 90th percentile, with the pooled figure carried by 76 big-metro runs.
+**Mapillary 0.0%** across 15.3M present panos: the mechanism is in the code (a bogus `captured_at_ms` becomes `NO_DATE`) but its observed rate in our own data is zero, so "small but real" is not supported by anything we hold.
+**KartaView 9.56%** of audited photos.
+Those are GRID runs standing in for walks, because no walk recorded an undated count until this change added one — an estimate of the right order, not the walk's value.
+
+### It changes recorded numbers for the existing GSV and Mapillary walk series, and those are not being recomputed
+
+Walk coverage is computed at collection time into `street_walks` rows and `*_coverage.json.gz` artifacts, and there is no walk analogue of `scripts/recompute_run_stats.py`.
+So every walk collected before 2026-08-24 undercounts by its own `NO_DATE` population, and each city's **next walk diff will show a one-time phantom positive coverage delta** — walk diffs compare recorded coverage numbers, so a definition change reads as imagery churn.
+Do not read that first delta as a real improvement; it is the fix landing, not Google or Mapillary driving.
+
+**That phantom is publicly visible, and it outlives the walk that produced it.**
+It is not confined to the diff table: the delta reaches `street_walk_diffs`, from there the streetwalk manifest's `change` block, and from there the **"Δ coverage" column on `streets.html`** — a published number a reader has no way to distinguish from imagery churn.
+And unlike the coverage numbers themselves it does not wash out on the following walk: a `street_walk_diffs` row is an immutable record of one date pair, so recomputing `street_walks` and the artifacts does not by itself repair a diff already written.
+Issue #262 scopes that correctly — it recomputes affected diff rows through `walk_diff.compute_and_record_walk_diff` and regenerates the manifest, rather than stopping at coverage.
+**The edge it has to handle is the published detail file.**
+`{city_id}_streetwalkdiff_...csv.gz` is written **only when a diff has changes**, so a pair whose only change was the phantom delta recomputes to "no changes", writes no new file — and leaves the old, wrong one sitting in `data/` and on the public server.
+Re-diffing is therefore necessary but not sufficient: a detail file whose diff no longer has changes has to be deleted, not merely not-rewritten.
+Note also that the artifact cannot repair itself — its per-edge aggregates were already computed under the old definition, so the dropped `NO_DATE` samples are simply not in it, which rules out the cheap artifact-reading design `backfill_streetwalk_coverage.py` and `backfill_streetwalk_length.py` both use.
+Until #262 lands, the affected deltas are the FIRST walk diff of each series after 2026-08-24, and for GSV they will mostly round to 0.0 anyway (0.0015 percentage points at p95) — though not always, since the catalog's worst run would shift 0.22 points, which does render at one decimal.
 
 ## Overpass is on the critical path of every first road walk (issue #209)
 
