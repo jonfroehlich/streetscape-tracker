@@ -60,6 +60,7 @@ from .download_common import (
     HOST_LABELS,
     HOST_MAPILLARY_TILES,
     HOST_OVERPASS,
+    SWEEP_INCOMPLETE_EXIT_CODE,
     redact_credentials,
 )
 from .download_kartaview import (
@@ -724,16 +725,28 @@ def estimate_kartaview_requests(conn, city: db.CityRow) -> int:
     1. This city's last KartaView run's ``runs.api_requests``. For KartaView
        that column holds ``api_requests_total`` (see ``cli.py``), i.e. the
        sweep's cumulative spend across every process that resumed it -- the
-       OBSERVED cost the cost study says to quote. It is strictly better than
-       any geometry because it carries the four terms the lattice cannot see:
-       the calibrated radius, the extra pages, the backpressure retries and the
-       per-city calibration ladder. A paused sweep raises ``SweepIncompleteError``
-       and never reaches ``register_run``, so a row here always describes a
-       COMPLETE sweep rather than a partial night. It therefore over-prices a
-       city resuming from a checkpoint, which needs only its remainder -- the
-       conservative direction: the budget guard defers such a city on a tight
-       night instead of overspending, and the timeout is merely generous.
+       OBSERVED cost the cost study says to quote. It carries the four terms
+       the lattice cannot see: the calibrated radius, the extra pages, the
+       backpressure retries and the per-city calibration ladder. A paused sweep
+       raises ``SweepIncompleteError`` and never reaches ``register_run``, so a
+       row here always describes a COMPLETE sweep rather than a partial night.
+       It therefore over-prices a city resuming from a checkpoint, which needs
+       only its remainder -- the conservative direction: the budget guard defers
+       such a city on a tight night instead of overspending, and the timeout is
+       merely generous.
     2. The geometric lattice x ``_SWEEP_OVERHEAD_MULTIPLIER``.
+
+    Tier 1 is the LARGER of the two, not the prior on its own, because the
+    prior describes the bbox as it was *then*. This is the one channel whose
+    cost tracks bbox AREA directly, and the frozen grid is mutable through two
+    documented escape hatches (``scripts/resize_city.py --force``,
+    ``cap_oversized_grids.py --include-collected``), so a grid re-registered
+    LARGER would go on being priced at the old, smaller sweep -- which is the
+    hazard ``city_timeout_seconds``' Anchorage comment names, reached from the
+    other direction. Every other arm of :func:`estimate_requests` recomputes
+    from today's geometry on every call; taking the larger is how this one
+    keeps that property while still preferring the measured number whenever the
+    bbox is unchanged or has shrunk.
 
     Tier 2 has a known blind spot, and it is a factor of four rather than a
     rounding error: ``estimate_sweep_requests`` must assume the default
@@ -756,20 +769,27 @@ def estimate_kartaview_requests(conn, city: db.CityRow) -> int:
     Returns:
         Estimated KartaView API requests for one full sweep of the bbox.
     """
-    if conn is not None:
-        prior = conn.execute(
-            """SELECT api_requests FROM runs
-               WHERE city_id = ? AND provider = 'kartaview' AND api_requests > 0
-               ORDER BY run_date DESC LIMIT 1""",
-            (city.city_id,),
-        ).fetchone()
-        if prior:
-            return max(1, int(prior["api_requests"]))
-
     lattice = estimate_sweep_requests(
         city.center_lat, city.center_lon, city.grid_width_m, city.grid_height_m, city.step_m
     )
-    return max(1, int(lattice * _SWEEP_OVERHEAD_MULTIPLIER))
+    geometry = max(1, int(lattice * _SWEEP_OVERHEAD_MULTIPLIER))
+    if conn is None:
+        return geometry
+
+    prior = conn.execute(
+        """SELECT api_requests FROM runs
+           WHERE city_id = ? AND provider = 'kartaview' AND api_requests > 0
+           ORDER BY run_date DESC LIMIT 1""",
+        (city.city_id,),
+    ).fetchone()
+    if not prior:
+        return geometry
+    # max(), never the prior alone -- see the precedence note above. The prior
+    # wins on every city whose grid has not grown (it is larger than the
+    # default-radius lattice on exactly the r=500 metros this tier exists for),
+    # and a grown grid falls back to geometry instead of pricing a bbox that no
+    # longer exists.
+    return max(geometry, max(1, int(prior["api_requests"])))
 
 
 def estimate_requests(
@@ -854,6 +874,9 @@ _TILE_ACHIEVED_RATE_FRACTION = 0.8
 # Over-timing costs nothing comparable — the batch deadline still clamps the
 # value (see city_timeout_seconds), and since #239 an eventual kill means the
 # sweep resumes from its checkpoint tomorrow rather than restarting at cell zero.
+# That last clause is about the WORK and not the schedule: a kill still counts a
+# failure, so resumption is bounded at five nights. See _kartaview_timeout_seconds
+# — it is the reason this fraction is loose rather than tight.
 _SWEEP_ACHIEVED_RATE_FRACTION = 0.5
 # Observed KartaView sweep cost over the bare root-cell lattice, median across
 # the 14-city study (`summary.observed_over_root_cells.p50` in
@@ -866,6 +889,34 @@ _SWEEP_ACHIEVED_RATE_FRACTION = 0.5
 # `summary.observed_over_floor`, measured against a DIFFERENT denominator — the
 # study's floor counts cells *plus pages 2+*, where estimate_sweep_requests
 # counts cells alone. Quoting 1.54x here would under-price the pages twice over.
+#
+# It is a MEDIAN, and the same summary puts the max at 13.66x — so half the
+# catalog costs more than this prices, and the tail is not where you would
+# guess. The 13.66x city is Horace, ND: a p65 city (55.9 km2, 35 root cells,
+# 478 requests observed), i.e. this constant is ~7.6x low on a MID-catalog city,
+# and the study is explicit that refusal cascades make SPARSE bboxes the
+# expensive ones — inverting the feasibility study's expectation that cost per
+# km2 is worst where imagery is richest.
+#
+# That tail reaches the two consumers differently, and only one of them absorbs
+# it. The TIMEOUT does: it under-times only where the true overhead exceeds 5.4x
+# the cells this estimator counts AND the honest wall-clock already exceeds the
+# 180-minute floor, and no study city does both (Horace is 30 minutes of
+# fetching; Singapore's 1.94x is nowhere near 5.4x). The radius blind spot in
+# estimate_kartaview_requests is the one case that clears both bars, and it is
+# documented there. The daily BUDGET guard does not absorb it: the guard is a
+# pre-flight check, and kartaview is the only channel whose estimate is not
+# exact (grid points and tile counts both are), so it is also the only one where
+# a city can overspend what the ledger said it could afford.
+#
+# The stop for that already exists and is deliberately NOT wired here: #239's
+# `--kartaview-max-requests` pauses at a request cap and checkpoints the rest.
+# Handing it `budget - used` would turn an overrun into a resumable pause, but
+# _run_one_city has the full ceiling rather than the remainder (see its
+# `daily_budget` argument, and _street_collect_cmd on why that is the right
+# shape for the channels that subtract today's spend themselves), and the grid
+# CLI has no budget flag to hand it to instead. So it wants its own issue
+# alongside the est > budget arm in docs/census.md, not a line here.
 _SWEEP_OVERHEAD_MULTIPLIER = 1.80
 # Floor for a deadline-clamped timeout. A city is only started while the batch
 # deadline still has room, so the clamp should shorten a run — never hand a
@@ -1022,16 +1073,34 @@ def _kartaview_timeout_seconds(
 
     Note what this does NOT buy: a metro's honest timeout exceeds
     ``max_batch_hours`` outright, so the caller's deadline clamp is what bounds
-    it in a real night. That is the correct outcome rather than a defect --
-    since #239 the sweep checkpoints, so being cut short means resuming
-    tomorrow. Never returns below the configured floor.
+    it in a real night. Never returns below the configured floor.
+
+    "Being cut short just means resuming tomorrow" is TRUE OF THE WORK AND NOT
+    OF THE SCHEDULE, and the difference decides how generous this has to be.
+    #239's checkpoint means a killed sweep re-pays for nothing, but a SIGKILLed
+    child has no exit code, so ``_run_city_channels`` cannot tell it from a
+    child that made no progress and records a ``consecutive_failure`` --  and
+    ``get_due_cities`` filters on that with only a success resetting it, so five
+    such nights quarantine the city for a 90-day cycle. A *deliberate* pause
+    (exit ``SWEEP_INCOMPLETE_EXIT_CODE``) is amnestied there and can repeat
+    indefinitely; a KILL cannot. That asymmetry is why this derivation is
+    deliberately loose -- ``_SWEEP_ACHIEVED_RATE_FRACTION`` (0.5) and
+    ``_TIMEOUT_HEADROOM`` (1.5) compound to ~3x the honest paced wall-clock --
+    and why a metro whose clamped timeout is genuinely too short to finish in
+    five nights needs the dueness work in #248 rather than a bigger constant
+    here.
     """
     # `is None`, not falsy: 0 means "pacing disabled", not "use the default".
     configured = pc.max_requests_per_minute if pc else None
     rate = DEFAULT_SWEEP_REQUESTS_PER_MINUTE if configured is None else configured
     if rate <= 0:  # pacing disabled: nothing to derive from
         return floor
-    requests = estimate_requests(city, "kartaview", conn=conn)  # what the budget uses too
+    # Not via _channel_estimate: that helper exists to unify callers who need
+    # spacing_m/network_type out of config, and this channel reads neither --
+    # same shape as _mapillary_timeout_seconds. The two agree on the NUMBER
+    # because both land in estimate_requests' kartaview arm, which ignores those
+    # two arguments; they are not sharing a call site.
+    requests = estimate_requests(city, "kartaview", conn=conn)
     paced_seconds = requests / (rate * _SWEEP_ACHIEVED_RATE_FRACTION) * 60.0
     return int(max(floor, paced_seconds * _TIMEOUT_HEADROOM + _TIMEOUT_FIXED_SLACK_S))
 
@@ -3733,6 +3802,38 @@ def _run_city_channels(
                             f"{city.city_id} [{provider}]: {HOST_LABELS[blocked_host]} is "
                             f"unavailable to this host — skipping its remaining channels. "
                             f"Not counted as a failure for this city. ({reason})"
+                        )
+                        continue
+
+                    if exit_code == SWEEP_INCOMPLETE_EXIT_CODE:
+                        # A sweep that stopped with roots unvisited and CHECKPOINTED
+                        # them (issue #239). Progress, not breakage — the cli calls it
+                        # exactly that, and gives it its own exit code so a wrapper
+                        # cannot escalate a legitimately capped night of a multi-night
+                        # sweep. So it takes the same amnesty as the two host branches
+                        # above, for the same reason: get_due_cities filters on
+                        # `consecutive_failures < max_consecutive_failures` and NOTHING
+                        # but a success resets it, so charging a pause would quarantine
+                        # a city for a whole 90-day cycle after five of them — and a
+                        # metro sweep needs more nights than that by construction
+                        # (Singapore is ~10.4 h of pacing against a 10 h
+                        # max_batch_hours). The city stays due and leads tomorrow's
+                        # stalest-first queue, which is what resuming requires.
+                        #
+                        # The spend is NOT lost with it: the child ledgers its own
+                        # per-process requests before exiting 83, so unlike a SIGKILL
+                        # this path costs the budget ledger nothing.
+                        #
+                        # NOTE what this does not cover: a sweep SIGKILLed by the
+                        # timeout has no exit code at all and still counts a failure,
+                        # because nothing here can tell a kill that checkpointed
+                        # progress from one that made none. That is the standing limit
+                        # on "a kill just resumes tomorrow" — see
+                        # _kartaview_timeout_seconds.
+                        logger.info(
+                            f"{city.city_id} [{provider}]: sweep paused with its progress "
+                            f"checkpointed — not counted as a failure for this city; it "
+                            f"stays due and resumes on the next run. ({reason})"
                         )
                         continue
 

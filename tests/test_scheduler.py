@@ -384,7 +384,11 @@ def test_the_sweep_estimate_is_the_lattice_not_the_grid_formula(conn):
     from streetscape_metadata_tracker.download_kartaview import estimate_sweep_requests
     from streetscape_metadata_tracker.scheduler import _SWEEP_OVERHEAD_MULTIPLIER
 
-    # Ithaca MI, the catalog's median city: 19.7 km2, 12 root circles.
+    # Ithaca MI, the catalog's median city, sized to the study's 19.7 km2. The
+    # study's own bbox is not square, so it lattices to 12 root circles where
+    # this square one gives 16 — quote the fixture's number here, not the
+    # study's, and note 16 is ALSO the study's observed cost for Ithaca, which
+    # is a coincidence of this fixture and not agreement.
     city = db.resolve_city(conn, _register_at(conn, "Ithaca", 43.3, -84.6, 4440, 4440))
 
     lattice = estimate_sweep_requests(
@@ -403,6 +407,7 @@ def test_the_sweep_estimate_carries_the_measured_overhead(conn):
     calibration ladder. The study measured the real cost at a median 1.80x it
     (observed_over_root_cells.p50), and the guard has to carry that or it is
     systematically under on exactly the cities it exists to protect."""
+    from streetscape_metadata_tracker.download_kartaview import estimate_sweep_requests
     from streetscape_metadata_tracker.scheduler import _SWEEP_OVERHEAD_MULTIPLIER
 
     # NOT observed_over_floor (1.54x): that is measured against a different
@@ -410,9 +415,15 @@ def test_the_sweep_estimate_carries_the_measured_overhead(conn):
     # estimate_sweep_requests counts cells alone.
     assert _SWEEP_OVERHEAD_MULTIPLIER == pytest.approx(1.80)
 
-    # Milwaukee, the study's p95 city: 384 root circles, 636 requests observed.
+    # Milwaukee, the study's p95 city, sized to its 737.6 km2 — 400 root
+    # circles as a square bbox, against 384 for the study's own shape. What is
+    # being pinned is that 636 OBSERVED requests are covered; the bare lattice
+    # (400) would not cover them and the multiplier is the whole difference.
     city = db.resolve_city(conn, _register_at(conn, "Milwaukee", 43.0, -87.9, 27160, 27160))
     assert estimate_requests(city, "kartaview") >= 636
+    assert estimate_sweep_requests(
+        city.center_lat, city.center_lon, city.grid_width_m, city.grid_height_m, city.step_m
+    ) < 636, "the bare lattice must be the thing that falls short, or this pins nothing"
 
 
 def test_a_prior_sweeps_observed_cost_beats_the_geometry(conn):
@@ -422,12 +433,20 @@ def test_a_prior_sweeps_observed_cost_beats_the_geometry(conn):
     the checkpoint pins it for one sweep and cli.py discards it once the run is
     cataloged — but runs.api_requests already holds the sweep's OBSERVED total,
     which carries the radius, the pages, the retries and the ladder at once."""
-    # Singapore-shaped: ~2,547 km2, which the lattice prices at r=1000.
-    cid = _register_at(conn, "Singapore", 1.35, 103.8, 40000, 40000)
+    # Sized to the study's Singapore: 50.47 km square == 2,547 km2, which the
+    # lattice covers in 1,296 circles at the default r=1000. The dimensions
+    # matter — the ~4x this test is named for is only visible if the fixture
+    # really is the city the study measured.
+    cid = _register_at(conn, "Singapore", 1.35, 103.8, 50470, 50470)
     city = db.resolve_city(conn, cid)
 
     geometric = estimate_requests(city, "kartaview", conn=conn)
-    assert geometric < 5_000, "r=1000 geometry under-prices an r=500 city by ~4x"
+    # The ratio, not a round ceiling: 9,974 spent against ~2,332 estimated is
+    # the r=1000-vs-r=500 lever itself, so pin it as such and let the test fail
+    # if the geometry tier moves under it.
+    assert 3.5 < 9_974 / geometric < 5.0, (
+        f"r=1000 geometry should under-price this r=500 city ~4x; got {9_974 / geometric:.2f}x"
+    )
 
     db.register_run(
         conn,
@@ -440,6 +459,59 @@ def test_a_prior_sweeps_observed_cost_beats_the_geometry(conn):
     assert estimate_requests(city, "kartaview", conn=conn) == 9_974
     # Without a connection there is no prior run to read, so it falls back.
     assert estimate_requests(city, "kartaview") == geometric
+
+
+def test_a_prior_sweeps_cost_never_outranks_a_grid_that_grew_under_it(conn):
+    """The prior describes the bbox as it was THEN, and this is the one channel
+    whose cost tracks bbox AREA directly.
+
+    Frozen geometry is mutable through two documented escape hatches
+    (`resize_city.py --force`, `cap_oversized_grids.py --include-collected`),
+    and every other arm of estimate_requests recomputes from today's geometry on
+    every call — so a prior-run tier that ignored a resize would go on pricing a
+    bbox that no longer exists. Under-pricing is the direction that costs: it
+    hands the child a timeout derived from the smaller sweep, which is the
+    SIGKILL-with-no-ledger-row that #238 exists to prevent, reached from inside
+    the fix rather than by the old fall-through.
+
+    Pinned as the max() rather than as either tier, because the prior still has
+    to WIN wherever the grid did not grow — that is the whole point of tier 1.
+    """
+    from streetscape_metadata_tracker.scheduler import city_timeout_seconds
+
+    cid = _register_at(conn, "Smallville", 40.0, -80.0, 4440, 4440)
+    small = db.resolve_city(conn, cid)
+    db.register_run(
+        conn,
+        city_id=cid,
+        run_date=date(2026, 7, 1),
+        csv_filename="s.csv.gz",
+        provider="kartaview",
+        # Above this bbox's geometric tier, so tier 1 is genuinely in force.
+        api_requests=60,
+    )
+    assert estimate_requests(small, "kartaview") < 60, "the premise: geometry is the lower one"
+    assert estimate_requests(small, "kartaview", conn=conn) == 60
+
+    # Same city, grid re-registered 100x larger in area.
+    db.update_city_geometry(
+        conn,
+        city_id=cid,
+        center_lat=40.0,
+        center_lon=-80.0,
+        grid_width_m=44_400,
+        grid_height_m=44_400,
+    )
+    grown = db.resolve_city(conn, cid)
+
+    geometry = estimate_requests(grown, "kartaview")
+    assert geometry > 1_000, "a 100x bbox is worth three figures of circles"
+    assert estimate_requests(grown, "kartaview", conn=conn) == geometry, (
+        "the stale prior priced the OLD bbox and won, so the sweep is timed for a "
+        "city 100x smaller than the one it will actually walk"
+    )
+    # And the consequence the estimate exists to prevent, end to end.
+    assert city_timeout_seconds(_kv_cfg(), grown, "kartaview", conn=conn) > 180 * 60
 
 
 def test_a_metro_sweep_outgrows_the_flat_timeout(conn):
@@ -455,7 +527,7 @@ def test_a_metro_sweep_outgrows_the_flat_timeout(conn):
     )
     from streetscape_metadata_tracker.scheduler import city_timeout_seconds
 
-    cid = _register_at(conn, "Singapore", 1.35, 103.8, 40000, 40000)
+    cid = _register_at(conn, "Singapore", 1.35, 103.8, 50470, 50470)
     city = db.resolve_city(conn, cid)
     db.register_run(
         conn,
@@ -495,7 +567,7 @@ def test_the_sweep_child_is_timed_with_the_catalog_handle_not_without_it(
     """
     from streetscape_metadata_tracker import scheduler as sched
 
-    cid = _register_at(conn, "Singapore", 1.35, 103.8, 40000, 40000)
+    cid = _register_at(conn, "Singapore", 1.35, 103.8, 50470, 50470)
     city = db.resolve_city(conn, cid)
     db.register_run(
         conn,
@@ -4539,6 +4611,108 @@ def test_repeated_busy_nights_never_quarantine_a_city(conn, monkeypatch):
         provider="mapillary",
     )
     assert cid in {c.city_id for c in due}
+
+
+def _paused_sweep_outcome():
+    from streetscape_metadata_tracker.download_common import SWEEP_INCOMPLETE_EXIT_CODE
+    from streetscape_metadata_tracker.scheduler import CollectionOutcome
+
+    return CollectionOutcome(
+        False,
+        f"exited {SWEEP_INCOMPLETE_EXIT_CODE} (paused)",
+        exit_code=SWEEP_INCOMPLETE_EXIT_CODE,
+    )
+
+
+def _sweep_cfg(**overrides):
+    """_street_cfg plus a kartaview channel, bypassing UNWIRED_CHANNELS' refusal
+    the same way the timeout cases above do."""
+    cfg = _street_cfg(**overrides)
+    cfg.providers["kartaview"] = ProviderConfig(enabled=True, daily_request_budget=20_000)
+    return cfg
+
+
+def test_a_checkpointed_pause_is_not_recorded_as_a_city_failure(conn, monkeypatch):
+    """A sweep that stopped with roots unvisited and CHECKPOINTED them (#239) is
+    progress, not breakage — the CLI says exactly that and gives it its own exit
+    code so a wrapper cannot escalate a legitimately capped night.
+
+    It has to take the host branches' amnesty for the host branches' reason:
+    get_due_cities filters on `consecutive_failures < max_consecutive_failures`
+    and NOTHING but a success resets it, so charging a pause would retire the
+    city after five of them. Which is not a hypothetical for this channel — a
+    metro sweep needs more nights than that by construction (Singapore is
+    ~10.4 h of pacing against a 10 h max_batch_hours), so the failure counter
+    would fire before the sweep it is meant to protect could ever finish."""
+    cid = _register(conn, "Bend", width=1000, height=1000, step=20)
+
+    def run_one(city, provider):
+        return _paused_sweep_outcome() if provider == "kartaview" else True
+
+    _run_loop_with(monkeypatch, conn, _sweep_cfg(publish_enabled=False), run_one)
+
+    row = conn.execute(
+        "SELECT consecutive_failures FROM schedule_state WHERE city_id = ? AND provider = ?",
+        (cid, "kartaview"),
+    ).fetchone()
+    assert row is None or row["consecutive_failures"] == 0
+
+
+def test_a_multi_night_sweep_is_never_quarantined_before_it_can_finish(conn, monkeypatch):
+    """The operational corollary, and the whole reason the amnesty exists: a
+    sweep that legitimately takes more nights than max_consecutive_failures must
+    still be due on the night it would have completed."""
+    cid = _register(conn, "Bend", width=1000, height=1000, step=20)
+    cfg = _sweep_cfg(publish_enabled=False)
+
+    for day in range(8):  # comfortably past max_consecutive_failures (5)
+        _run_loop_with(
+            monkeypatch,
+            conn,
+            cfg,
+            lambda city, provider: (
+                _paused_sweep_outcome() if provider == "kartaview" else True
+            ),
+            today=date(2026, 7, 2) + timedelta(days=day),
+        )
+
+    due = db.get_due_cities(
+        conn,
+        today=date(2026, 7, 20),
+        cycle_days=1,
+        grace_days=0,
+        max_consecutive_failures=5,
+        provider="kartaview",
+    )
+    assert cid in {c.city_id for c in due}
+
+
+def test_a_sweep_killed_by_its_timeout_still_counts_a_failure(conn, monkeypatch):
+    """The boundary of the amnesty, pinned so it is not read as wider than it is.
+
+    A SIGKILLed child has NO exit code, so nothing here can tell a kill that
+    checkpointed real progress from one that made none — and treating every
+    timeout as progress would mean a genuinely stuck channel never trips the
+    failure counter at all. So "a kill just resumes tomorrow" is true of the
+    WORK and bounded at five nights by the SCHEDULE; the fix for a city whose
+    clamped timeout cannot finish in five is #248's dueness work, not a wider
+    amnesty here. See _kartaview_timeout_seconds."""
+    from streetscape_metadata_tracker.scheduler import CollectionOutcome
+
+    cid = _register(conn, "Bend", width=1000, height=1000, step=20)
+
+    def run_one(city, provider):
+        if provider != "kartaview":
+            return True
+        return CollectionOutcome(False, "timed out after 180 minutes", exit_code=None)
+
+    _run_loop_with(monkeypatch, conn, _sweep_cfg(publish_enabled=False), run_one)
+
+    row = conn.execute(
+        "SELECT consecutive_failures FROM schedule_state WHERE city_id = ? AND provider = ?",
+        (cid, "kartaview"),
+    ).fetchone()
+    assert row["consecutive_failures"] == 1
 
 
 def test_a_busy_night_alerts_and_exits_nonzero_but_says_it_was_local(conn, monkeypatch):
