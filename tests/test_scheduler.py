@@ -421,9 +421,12 @@ def test_the_sweep_estimate_carries_the_measured_overhead(conn):
     # (400) would not cover them and the multiplier is the whole difference.
     city = db.resolve_city(conn, _register_at(conn, "Milwaukee", 43.0, -87.9, 27160, 27160))
     assert estimate_requests(city, "kartaview") >= 636
-    assert estimate_sweep_requests(
-        city.center_lat, city.center_lon, city.grid_width_m, city.grid_height_m, city.step_m
-    ) < 636, "the bare lattice must be the thing that falls short, or this pins nothing"
+    assert (
+        estimate_sweep_requests(
+            city.center_lat, city.center_lon, city.grid_width_m, city.grid_height_m, city.step_m
+        )
+        < 636
+    ), "the bare lattice must be the thing that falls short, or this pins nothing"
 
 
 def test_a_prior_sweeps_observed_cost_beats_the_geometry(conn):
@@ -648,9 +651,15 @@ def test_the_sweep_budgets_a_lower_achieved_rate_than_the_tile_census(conn):
 
 def test_the_sweep_channel_is_ordered_by_decision_not_by_the_rank_fallback():
     """`rank.get(p, 99)` used to place kartaview last by accident. It still
-    sorts last, but now because the table says so: the sweep can consume the
-    rest of the NIGHT, so the channels that finish a median city in minutes
-    should already be done when it starts."""
+    sorts last, but now because the table says so.
+
+    Deliberately pinned as the POSITION and not as a rationale for it: four
+    rationales for this ordering have been wrong, and docs/scheduler.md holds
+    them and what each got wrong. The durable rule is "most expensive first,
+    except where truncation is cheapest to absorb" — a multi-hour sweep would
+    otherwise consume the deadline and leave its cheap siblings clamped to
+    `_MIN_CLAMPED_TIMEOUT_S`, and it is the one channel #239 checkpoints, so it
+    is the one that can absorb being cut short."""
     cfg = SchedulerConfig(
         providers={
             "kartaview": ProviderConfig(enabled=True),
@@ -1826,15 +1835,20 @@ def test_enabled_providers_orders_expensive_channels_first():
     """The canonical order is stable, which is what other things are read against.
 
     Pinned for what the order actually decides rather than for a budget story:
-    it is the submit order, so it picks which channels are already LAUNCHED when
-    a SIGTERM wind-down declines the rest (#206), which claim a lane first when a
-    city has more channels than lanes, and — the mechanical case for expensive
-    channels leading — how much of the batch deadline each child's timeout clamp
-    is allowed to see, since `remaining_s` is read fresh at every launch.
+    it is the submit order, so it picks which channels have FINISHED when a
+    SIGTERM wind-down stops the city (#206 — a submit gate, but `KillMode`
+    defaults to control-group, so a real `systemctl stop` takes the in-flight
+    children with it), which claim a lane first when a city has more channels
+    than lanes, and — the mechanical case for expensive channels leading — how
+    much of the batch deadline each child's timeout clamp is allowed to see,
+    since `remaining_s` is read fresh at every launch. That last one is pinned
+    in its own right by
+    test_the_deadline_is_a_submit_gate_and_every_lane_child_gets_its_own_remaining_s.
 
     It decides nothing about budgets, which are per-channel, and nothing about
-    what a batch deadline DROPS, which is a between-cities check. See
-    `enabled_providers` for why both of those read as established for a while.
+    what a batch deadline DROPS, which is a between-cities check. docs/scheduler.md
+    records why both of those read as established for a while, along with the two
+    later rationales that were also wrong.
     """
     assert _street_cfg().enabled_providers() == [
         "gsv",
@@ -4670,9 +4684,7 @@ def test_a_multi_night_sweep_is_never_quarantined_before_it_can_finish(conn, mon
             monkeypatch,
             conn,
             cfg,
-            lambda city, provider: (
-                _paused_sweep_outcome() if provider == "kartaview" else True
-            ),
+            lambda city, provider: _paused_sweep_outcome() if provider == "kartaview" else True,
             today=date(2026, 7, 2) + timedelta(days=day),
         )
 

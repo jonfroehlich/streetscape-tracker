@@ -327,63 +327,41 @@ class SchedulerConfig:
     def enabled_providers(self) -> list[str]:
         """Enabled channel names in a stable canonical order, most expensive first.
 
-        There IS a mechanism behind most-expensive-first, but it is not the one
-        this docstring gave for most of its life. Two rationales it used to give
-        are wrong, and both are recorded here because each read as established
-        long enough to be quoted elsewhere:
+        The rule is **most expensive first, EXCEPT where truncation is cheapest
+        to absorb** — kartaview is the exception and ranks last (#238).
 
-        It is **not** a budget mechanism. ``daily_request_budget`` is per
-        ``ProviderConfig`` and ``db.get_api_usage`` is keyed by (date, provider),
-        so a city's channels never draw on a shared pot and no ordering can let
-        one claim it ahead of another. The pre-#240 wording ("run back-to-back
-        within one night's budget") was a claim about TIMING that was true
-        sequentially; rewording it to "share one night's budget" turned it into a
-        claim about a shared RESOURCE that was never true.
+        The mechanism is the deadline CLAMP. ``remaining_s`` is read fresh at
+        every launch (one ``time.monotonic()`` per LAUNCHED channel) and
+        ``city_timeout_seconds`` clamps the derived timeout down to it, floored
+        at ``_MIN_CLAMPED_TIMEOUT_S`` — so a channel launched later sees less of
+        the batch deadline, and an expensive one launched late can be truncated
+        to the floor and SIGKILLed part-way. Expensive channels therefore start
+        while the most of it remains. That holds only while no single channel is
+        long enough to consume the deadline by itself; one that IS starves
+        everything behind it, and for that channel the question stops being which
+        is most expensive and becomes which can best absorb being truncated. A
+        multi-hour KartaView sweep is that channel, and it absorbs truncation
+        most cheaply because #239 checkpoints it — cheaply, not freely: no
+        channel keeps its ledger row through a SIGKILL, since every
+        ``api_usage`` write happens in the child after the download returns.
 
-        It does **not** decide what a batch deadline drops, either. That check
-        lives in ``_run_city_loop`` and fires BETWEEN cities, so once a city
-        starts, every one of its channels is attempted whatever the order — the
-        deadline only clamps each child's timeout, floored at
-        ``_MIN_CLAMPED_TIMEOUT_S``. Ranking a channel last therefore does not
-        protect a night from it.
+        Order also decides which channels have FINISHED when a wind-down stops
+        the city (a SIGTERM is a submit gate, #206, but ``KillMode`` defaults to
+        control-group, so a ``systemctl stop`` takes the in-flight children with
+        it — see ``_log_stop_declined``), and which claim a lane first when a
+        city has more channels than lanes. Above one lane it is the ATTEMPT
+        order rather than the launch order: host affinity can defer a
+        higher-ranked channel and let a lower-ranked one take the free slot. It
+        does not keep a per-IP host to one talker — affinity does that, under
+        any ordering.
 
-        What the order genuinely decides is which channels are already LAUNCHED
-        when something stops the city mid-flight. A SIGTERM wind-down is a submit
-        gate (#206): whatever has not been launched is declined and named by
-        ``_log_stop_declined``, so order picks the survivors. Above
-        ``max_concurrent_channels = 1`` this is also the submit order into the
-        lanes, so when a city has more channels than lanes it decides which claim
-        a slot first — and at one lane it is simply the execution order.
+        ``test_the_deadline_is_a_submit_gate_and_every_lane_child_gets_its_own_remaining_s``
+        pins the clamp mechanism, as a decreasing sequence in submit order.
 
-        And it decides how much of the deadline each child is allowed to use,
-        which is the mechanical case for putting the expensive channels first.
-        ``remaining_s`` is read fresh at every launch — one ``time.monotonic()``
-        per LAUNCHED channel — and ``city_timeout_seconds`` clamps the derived
-        timeout down to it, floored at ``_MIN_CLAMPED_TIMEOUT_S``. A channel
-        launched later sees less of the deadline, so a long one ranked late can
-        have its timeout truncated to the floor and be SIGKILLed part-way; a
-        killed child records no ``api_usage`` at all, so its already-spent
-        requests vanish from the ledger (#238). The channel that needs the most
-        wall-clock should therefore start while the most of it remains. This is
-        stark at one lane, where each channel launches only once the previous has
-        finished, and it applies above one lane too whenever a channel waits for
-        a slot instead of getting one in the first pass.
-
-        That is a rule and not a law, and its limit is worth stating because the
-        rule inverts past it: it holds only while no single channel is long
-        enough to consume the deadline by itself. One that IS starves everything
-        behind it — put it first and its siblings launch against what is left,
-        down to the floor — so for such a channel the question stops being which
-        is most expensive and becomes which can best absorb being truncated.
-        Note what does NOT change under that reading: a resumable channel loses
-        less WORK to a SIGKILL, but no channel keeps its ledger row, because
-        every ``api_usage`` write happens in the child after the download
-        returns. Ranking picks who absorbs the truncation; it never makes it
-        free.
-
-        What it does NOT do above one lane is keep a per-IP host to one talker —
-        host affinity in the launch pass does that, and it would keep doing it
-        under any ordering.
+        FOUR superseded rationales for this ordering, and what each got wrong,
+        are recorded in docs/scheduler.md. Read them before writing a fifth:
+        every one was reasoned from prose adjacent to this docstring instead of
+        from the code it describes, which was ~200 lines away the whole time.
         """
         rank = {
             "gsv": 0,
