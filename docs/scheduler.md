@@ -13,7 +13,9 @@ here for the evidence, the incident history and the details — keep the two in 
 
 **Scheduler** (`streetscape_metadata_tracker/scheduler.py`): designed as a systemd user timer on makelab1 (units + install docs in `deploy/`).
 `run-due` collects cities whose last success is ≥ cycle_days − grace_days old (stalest first);
-a due city runs all enabled providers back-to-back with the same run date (paired snapshots), each as a `streetscape_tracker.py --provider X` subprocess within its own daily budget (`[providers.gsv]`/`[providers.mapillary]` in scheduler.toml; a legacy toml without `[providers]` runs gsv-only).
+a due city runs all enabled providers on the same run date (paired snapshots)
+— back-to-back by default, or concurrently in host-disjoint lanes when `[schedule].max_concurrent_channels` > 1 (issue #240; see the lanes section below) —
+each as a `streetscape_tracker.py --provider X` subprocess within its own daily budget (`[providers.gsv]`/`[providers.mapillary]` in scheduler.toml; a legacy toml without `[providers]` runs gsv-only).
 Then regenerates the aggregate once and publishes.
 Stagger = `sha256(city_id) % cycle_days`, identical for all providers of a city.
 `run-due --provider CHANNEL [--limit N]` narrows one invocation to a subset of the enabled channels (issue #214)
@@ -75,6 +77,7 @@ It was checked only in `_run_city_loop`'s outer `for city in due`, so a stop sti
 It is now threaded into `_run_city_channels` as a **required, no-default** `stop_requested: threading.Event | None` (the `batch_deadline` precedent: a caller that silently inherited "nothing can stop this" would look correct until someone typed `stop`), checked as the first statement of the per-channel loop, and `break`s rather than `continue`s
 — every other guard there is a property of one *channel*, so a later one can answer differently;
 a stop is a property of the *process*, so none can.
+(Since #240 that same check is the lane scheduler's **submit gate**, with the identical argument: nothing further is launched, while a child already in flight is left to finish and credited, because it has been paid for either way.)
 `assess-city` passes `stop_requested=None` for the same reason it passes `batch_deadline=None`.
 The loop also re-checks after `_run_city_channels` returns, which matters twice: the 60 s inter-city sleep would otherwise burn a full minute of the stop window (PEP 475 *resumes* `time.sleep` after the handler runs rather than returning early),
 and on the **last** due city there is no next iteration at all, so the night would have summarized as complete while that city's remaining channels went uncollected.
@@ -90,7 +93,8 @@ A stopped night is therefore benign: it publishes, exits 0, and the declined cha
 — and that sharing is the point, because the exit that *reads* like the main path is the one an operator almost never hits: the cgroup SIGTERM kills the in-flight child first, so the loop leaves through (3) and never returns to (2)'s check.
 While the message lived only at (2), the complete operator-visible record of a stopped four-channel city was one `child was killed by the stop signal` line, with the three Mapillary/streets channels it declined named nowhere
 — losing exactly the information the operator typed `stop` to obtain.
-(3) passes `providers[i + 1:]`, since its own channel *was* started and is reported on its own line, and the helper is silent on an empty list so a stop landing on a city's last channel can't claim it skipped work that never existed.
+(3) passed `providers[i + 1:]`, since its own channel *was* started and is reported on its own line; since #240 both exits converge on the set of channels still un-launched when the city drains, so there is one call site and no wording to keep in step.
+The helper is silent on an empty list either way, so a stop landing on a city's last channel can't claim it skipped work that never existed.
 Note also what a stop does **not** suppress: the three unconditional alerts (host refused, backup failed, driving-plan fetch failed) still fire and still exit nonzero, so a `host(s) UNAVAILABLE` email after a deliberate stop is the wind-down working.
 **The installed unit on makelab2 is a copy, not a symlink**, so all of this stays inert until someone re-copies it and runs `daemon-reload`
 — verify with `systemctl --user show streetscape-tracker.service -p TimeoutStopUSec`, which must read `30min` rather than `1min 30s`.
@@ -99,3 +103,55 @@ This deadline must stay **below the unit's `TimeoutStartSec` (14 h)** — a test
 — because reaching the systemd limit means a SIGKILL mid-loop, which is exactly how 2026-07-29 collected most of a night and published none of it (#167).
 A child that exits with a `HOST_EXIT_CODES` status trips the per-IP **host breaker** (see the host-lock section): that host's channels are skipped for the rest of the night, no city is marked failed, and the night alerts unconditionally and exits nonzero while still publishing.
 Because makelab1 is shared, a `[resource_guard]` pre-flight (pure `plan_connection_limit`, Linux `/proc` read) lowers each run's `--connection-limit` when host load/free-RAM are tight — on top of the systemd unit's static CPU/RAM caps.
+
+## Concurrent channel lanes (issue #240)
+
+**A city's channels may run at once — but never two that need the same per-IP host, and the city loop itself stays sequential.**
+`[schedule].max_concurrent_channels` (default **1**) is how many of one city's channels `_run_city_channels` will keep in flight.
+This is the issue's **Shape A**: the loop over cities is unchanged, so a night's wall clock becomes the sum over cities of `max(channel)` instead of `sum(channel)`, and **paired snapshots survive** — every channel of a city still shares one run date, which is the property that makes its providers comparable at all.
+**Shape B — a per-provider queue per lane — stays rejected**: lanes advance at different speeds, so the per-night city sets diverge and paired snapshots break structurally, every night, for every city.
+That is the cost `docs/provider-access.md` records for `--provider` filtering, made permanent and universal; the expensive-city problem it would have solved is #239's, which does not require the trade.
+**What lanes buy is lanes, not throughput.**
+Each channel keeps its own limiter and its own daily budget, so no provider is asked for anything faster or larger than before; what stops is independent work queueing behind unrelated work.
+**The safety argument is host affinity.**
+The launch pass computes the set of per-IP hosts the in-flight siblings hold (from `CHANNEL_HOSTS`, never a hardcoded list) and *defers* — leaves pending, silently, reconsidered when a sibling completes — any channel that intersects it.
+So each of Overpass, the Mapillary tile CDN and KartaView sees at most one talker from this process, exactly as before, and the configured `max_requests_per_minute` stays the real figure rather than doubling.
+With today's four channels the effective ceiling is therefore **3**, whatever the knob says: `mapillary_streets` shares Overpass with `gsv_streets` and the tile CDN with `mapillary`, so it always runs after both — which is also the desirable order, since the second street channel of a city then hits the warm GraphML cache instead of racing for the same Overpass fetch.
+The child-side per-host lock (#208) is unchanged and still covers the manual runs the parent cannot see.
+**Everything except the child itself runs on the main thread.**
+A lane worker calls `_run_one_city` and nothing else; pricing, both budget gates, the ledger read, the resource guard, the breaker and *all* classification (busy/blocked/salvage/killed-by-stop/`record_attempt`) stay on the thread that owns the catalog, because `db.connect` opens it `check_same_thread=True`.
+The two values `_run_one_city` would otherwise derive from `conn` or the clock are precomputed at the launch site and passed in (`timeout_s`, `estimated_requests`); the scheduler hands the worker `conn=None` deliberately.
+That also keeps the read-then-write budget guard honest — the reads are serialized by being on one thread, in submit order, so two channels cannot both see "under budget" and both spend.
+**At the default of 1 the channel body runs INLINE on the calling thread**, not on a size-1 pool: that is what makes the default byte-equivalent to the pre-#240 loop and what keeps every existing test's `_run_one_city` substitute able to touch the fixture connection.
+**Deferral and a final skip are different things and must stay different.**
+A budget skip, a breaker skip and a stop are decisions: the channel leaves the pending list and is never reconsidered tonight.
+A host deferral is not a decision at all — nothing was priced, nothing was logged, and the channel launches the moment its sibling frees the host.
+Conflating them either re-prices skipped channels in a loop or drops deferred ones on the floor.
+The no-livelock invariant that makes the loop terminate: an empty in-flight set at the top of a launch pass means an empty host set, so nothing can defer — every such pass launches, skips everything, or is stopped.
+**Classification drains before the next launch pass, and that is a correctness invariant rather than a convenience.**
+`streetwalks.json.gz` has three writers through `json_summarizer._write_json_gz_atomic`'s fixed `path + ".tmp"`: the street child's own end-of-walk rebuild, the parent-side `_reconcile_orphaned_walk` salvage, and the batch tail.
+Host affinity keeps at most one street child alive; draining classification (salvage included) before launching again keeps a salvage rebuild from overlapping the next street child's tail write.
+The GraphML torn-cache hazard is covered by the same gate on child **exit** — `ox.save_graphml` runs after the Overpass lock releases but before the process exits, and a channel's hosts are held until its future completes, so two Overpass processes never overlap at all.
+**Semantics that shift above 1, documented rather than fixed:** one city's per-channel log lines interleave, and classification lands in completion order (the per-attempt child logs are untouched — unique per (city, channel, date), append mode).
+The summary's `elapsed_h` becomes concurrent wall clock; its role as a proxy for Mapillary time-under-load survives, because the two Mapillary channels still never overlap.
+Counters mean what they meant.
+Ledger races are impossible (four channels are four `api_usage` keys, and the city-level drain keeps cross-city reads ordered), and a busy-skip caused by *our own* lanes is structurally impossible rather than merely unlikely — which is why any 79/80 on a night with no manual run means a hole in the affinity gating and should drop the knob to 1 the same day.
+**`[download].connection_limit` is divided across lanes, not handed to each child whole.**
+The resource guard reads host-wide pressure and only ever *lowers* its answer, but it is consulted once per child from a sample taken before that child's siblings have ramped — so at N lanes each child reads a quiet box and each takes the full limit, and the guard structurally cannot see the load it is about to permit.
+Only three channels carry the number at all: the `gsv` grid, the `gsv` road walk, and the Mapillary road walk.
+The Mapillary **grid** never receives it (`cli.py` omits the argument, so `fetch_city_images_async`'s own default of 5 applies), so the arithmetic is 50 + 50 + 5 at knob 3 rather than 150.
+Combined with affinity, the only overlapping pair that points two full-size connectors at one third party is `gsv` + `gsv_streets` — both Google — which is 100 concurrent sockets on the same endpoints gate (2) below is already about.
+Dividing makes the knob a no-op at 1 and bounded above it; the trade is that a city with a single enabled channel gets the divided share too, so **raise `connection_limit` deliberately when you raise the knob** rather than discovering the multiplication in production.
+
+**Two things gate raising it in production, both outside this repo.**
+(1) **Resume for every provider**, because a deadline or a `systemctl stop` now kills up to N children at once instead of 1.
+GSV grid (`.downloading` sibling), the GSV road walk (same `collect_points_async` engine) and KartaView (`checkpoints/`, #239) all resume; the **Mapillary tile census does not — issue #256**, and a killed Mapillary child re-spends its tiles against the deliberate 3,500/day per-IP ceiling, which is ban risk under #241 rather than merely lost time.
+A killed child also records no `api_usage` at all (#238), and that loss multiplies by N.
+(2) **`gsv` and `gsv_streets` hold no per-IP lock**, because Google meters per Cloud *project* rather than per IP — so running them together is only safe while `GMAPS_API_KEY` and `GMAPS_STREETS_API_KEY` really do live in **separate projects**.
+Nothing in this repo records which project either key belongs to; it is a console check, and a shared project must be fixed by splitting the keys, never by inventing a fake `CHANNEL_HOSTS` entry (that would couple the night-level breaker to a condition that is not a host refusal).
+**Rollout:** land at 1 everywhere and diff two nights' summary lines against history to check the byte-equivalence claim in production; then the two gates above; then flip prod to **2 before 3**, since `gsv` is the long pole and already overlaps each short channel in turn at 2, for half the blast radius of the unmeasured (cgroup memory sum, log interleaving).
+Above 3 buys nothing with four channels.
+Watch `MemoryPeak` after each night rather than pre-raising the unit's `MemoryHigh=20G`/`MemoryMax=24G` (sized for one worst-case child plus 30%; crossing `MemoryHigh` throttles *all* lanes into the documented reclaim stall), and if they must move, move High and Max together, keep the unit's quoted prose figures in step, and re-copy + `daemon-reload`.
+`TimeoutStopSec=30min` needs no change: it prices the tail, which concurrency does not touch, and N children wind down in parallel.
+The before/after is a measured question and therefore owes a writeup: `scripts/night_length_analyze.py` lands with the code and reads the elapsed distribution (with per-channel `api_usage` and the busy/blocked counts beside it, as the volume control) straight out of `logs/streetscape_scheduler.log*`; `docs/experiments/night-length.md` follows once there are nights on both sides of the flip to compare.
+That is also why `cmd_run_due` logs `max_concurrent_channels=N` on its opening line — which setting a night ran under has to be recoverable from the night's own record, not from an operator's memory of the flip date.

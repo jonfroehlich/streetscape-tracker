@@ -10,8 +10,9 @@
 cycle_days = 90
 grace_days = 7
 
-# max_cities_per_day counts cities, not runs — a city due for both
-# providers runs both back-to-back with the same run date. This is the NIGHTLY
+# max_cities_per_day counts cities, not runs — a city due for both providers
+# runs both on the same run date (back-to-back, or concurrently in host-disjoint
+# lanes; see max_concurrent_channels below). This is the NIGHTLY
 # cap; `run-due --limit N` (N >= 1) overrides it for one invocation, which is how
 # an on-demand single-channel catch-up gets past it (issue #214). At 20 a full
 # pass over the 1,214 enabled cities is ~61 nights; the Mapillary daily budget
@@ -40,6 +41,35 @@ city_timeout_minutes = 180
 # regenerate-aggregate by hand (issue #167). Keep it comfortably under the
 # unit's TimeoutStartSec so this deadline, not systemd, ends a long night.
 max_batch_hours = 10
+
+# How many of ONE city's channels may be in flight at once (issue #240). The
+# city loop itself stays sequential either way, so a city's snapshots still all
+# carry one run date and stay comparable.
+#
+# 1 is the historical behaviour — channels back-to-back — and is the default so
+# this key is a config-only rollback lever: dropping back is an edit here and a
+# restart, not a deploy. Above 1 the city's channels run in host-disjoint lanes.
+#
+# What this buys is WALL CLOCK and nothing else. Every channel keeps its own
+# limiter and its own daily budget, so no provider sees a higher rate or a
+# larger volume; a night simply stops queueing independent work behind unrelated
+# work. What each per-IP third party sees is INVARIANT, because a channel is
+# never launched while an in-flight sibling is already talking to a host it
+# needs — the scheduler defers it. With today's four channels that makes 3 the
+# effective ceiling: mapillary_streets shares Overpass with gsv_streets and the
+# tile CDN with mapillary, so it always runs after both, and the Mapillary tile
+# rate stays the single figure configured below rather than double it.
+#
+# Two things gate raising this in production, both outside this file:
+#   * Every provider must be able to RESUME a killed collection (issue #256 is
+#     the open half — the Mapillary tile census). A deadline or a `systemctl
+#     stop` kills N children at once here instead of 1, and a killed Mapillary
+#     child re-spends its tiles against a deliberate 3,500/day per-IP ceiling.
+#   * gsv and gsv_streets hold no per-IP lock, because Google meters per Cloud
+#     PROJECT rather than per IP. Running them together is only safe while the
+#     two keys really do live in separate projects — a console check, since
+#     nothing in this repo records which project either key belongs to.
+max_concurrent_channels = 1
 
 # Legacy fallback: when no [providers.*] sections exist below, this is the
 # GSV daily budget and only GSV is collected.
@@ -201,8 +231,11 @@ daily_request_budget = 1750
 spacing_m = 15
 # See [providers.mapillary].max_requests_per_minute. The tile CDN's rate limit
 # is per IP, so this channel and the grid one draw on ONE budget no matter that
-# they hold separate tokens — the scheduler runs them sequentially, which is
-# what keeps the combined rate at this figure rather than double it.
+# they hold separate tokens. What keeps the combined rate at this figure rather
+# than double it is that the two never run at the same time: they share a host,
+# so the scheduler defers one behind the other whatever max_concurrent_channels
+# says (issue #240), and the child-side per-host lock (#208) covers the manual
+# runs the scheduler cannot see.
 max_requests_per_minute = 60
 # See [providers.gsv_streets].network_type. A broader network costs Mapillary
 # nothing extra (the tile census is the same regardless of how many sample

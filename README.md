@@ -9,18 +9,11 @@ The [v1.0.0 release](https://github.com/jonfroehlich/streetscape-tracker/release
 
 ## How temporal tracking works
 
-Every collection run of a city produces an immutable dated snapshot
-(`{city}_width_W_height_H_step_S_YYYY-MM-DD.csv.gz`; Mapillary runs add a
-provider token: `..._step_S_mapillary_YYYY-MM-DD.csv.gz`). A SQLite catalog
-(`data/streetscape_tracker.db`) records each city's identity and **frozen grid
-geometry** (so future runs sample the exact same points), every run's
-stats, and run-to-run diffs — each provider keeps its own independent run
-series on the same grid. Re-running a (city, provider) sooner than
-`--min-days-since-last-run` (default 80) days is skipped unless you pass
-`--force`. A scheduler (see `deploy/README.md`) staggers ~13 cities/day so
-the full corpus re-collects roughly quarterly without exceeding API limits;
-a city due for both providers runs them back-to-back with the same run date
-so cross-provider snapshots align.
+Every collection run of a city produces an immutable dated snapshot (`{city}_width_W_height_H_step_S_YYYY-MM-DD.csv.gz`; Mapillary runs add a provider token: `..._step_S_mapillary_YYYY-MM-DD.csv.gz`).
+A SQLite catalog (`data/streetscape_tracker.db`) records each city's identity and **frozen grid geometry** (so future runs sample the exact same points), every run's stats, and run-to-run diffs — each provider keeps its own independent run series on the same grid.
+Re-running a (city, provider) sooner than `--min-days-since-last-run` (default 80) days is skipped unless you pass `--force`.
+A scheduler (see `deploy/README.md`) staggers ~13 cities/day so the full corpus re-collects roughly quarterly without exceeding API limits;
+a city due for both providers runs them on the same run date — back-to-back, or concurrently in host-disjoint lanes — so cross-provider snapshots align.
 
 ## Imagery providers
 
