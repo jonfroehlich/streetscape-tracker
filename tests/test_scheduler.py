@@ -363,6 +363,320 @@ def test_an_unpaced_mapillary_channel_keeps_the_flat_floor(conn):
     assert city_timeout_seconds(cfg, city, "mapillary") == 180 * 60
 
 
+# ── KartaView: the sweep's own cost arms (issue #238) ──────────────────────
+#
+# The channel is still refused by UNWIRED_CHANNELS, so none of these run in a
+# real night. They drive SchedulerConfig directly, which is what the config
+# loader's refusal cannot reach and exactly how the Mapillary cases above work.
+
+
+def _kv_cfg(rate=None, **overrides):
+    """A config carrying a kartaview channel, bypassing the loader's refusal."""
+    pc = ProviderConfig(enabled=True, daily_request_budget=20_000, max_requests_per_minute=rate)
+    return SchedulerConfig(providers={"kartaview": pc}, **overrides)
+
+
+def test_the_sweep_estimate_is_the_lattice_not_the_grid_formula(conn):
+    """The fail-open arm this replaces: estimate_requests fell through to the
+    GSV grid formula, pricing a bbox the sweep covers in a handful of circles
+    as one request per 20 m grid point — wrong by three orders of magnitude,
+    and wrong in BOTH directions since it also ignores the sweep's overhead."""
+    from streetscape_metadata_tracker.download_kartaview import estimate_sweep_requests
+    from streetscape_metadata_tracker.scheduler import _SWEEP_OVERHEAD_MULTIPLIER
+
+    # Ithaca MI, the catalog's median city, sized to the study's 19.7 km2. The
+    # study's own bbox is not square, so it lattices to 12 root circles where
+    # this square one gives 16 — quote the fixture's number here, not the
+    # study's, and note 16 is ALSO the study's observed cost for Ithaca, which
+    # is a coincidence of this fixture and not agreement.
+    city = db.resolve_city(conn, _register_at(conn, "Ithaca", 43.3, -84.6, 4440, 4440))
+
+    lattice = estimate_sweep_requests(
+        city.center_lat, city.center_lon, city.grid_width_m, city.grid_height_m, city.step_m
+    )
+    assert estimate_requests(city, "kartaview") == int(lattice * _SWEEP_OVERHEAD_MULTIPLIER)
+
+    grid_points = estimate_requests(city, "gsv")
+    assert grid_points > 40_000, "the geometry this used to be priced at"
+    assert estimate_requests(city, "kartaview") < grid_points / 100
+
+
+def test_the_sweep_estimate_carries_the_measured_overhead(conn):
+    """The lattice is a FLOOR: it counts one page-1 per root circle and prices
+    neither the extra pages, the backpressure retries nor the per-city
+    calibration ladder. The study measured the real cost at a median 1.80x it
+    (observed_over_root_cells.p50), and the guard has to carry that or it is
+    systematically under on exactly the cities it exists to protect."""
+    from streetscape_metadata_tracker.download_kartaview import estimate_sweep_requests
+    from streetscape_metadata_tracker.scheduler import _SWEEP_OVERHEAD_MULTIPLIER
+
+    # NOT observed_over_floor (1.54x): that is measured against a different
+    # denominator — the study's floor counts cells PLUS pages 2+, where
+    # estimate_sweep_requests counts cells alone.
+    assert _SWEEP_OVERHEAD_MULTIPLIER == pytest.approx(1.80)
+
+    # Milwaukee, the study's p95 city, sized to its 737.6 km2 — 400 root
+    # circles as a square bbox, against 384 for the study's own shape. What is
+    # being pinned is that 636 OBSERVED requests are covered; the bare lattice
+    # (400) would not cover them and the multiplier is the whole difference.
+    city = db.resolve_city(conn, _register_at(conn, "Milwaukee", 43.0, -87.9, 27160, 27160))
+    assert estimate_requests(city, "kartaview") >= 636
+    assert (
+        estimate_sweep_requests(
+            city.center_lat, city.center_lon, city.grid_width_m, city.grid_height_m, city.step_m
+        )
+        < 636
+    ), "the bare lattice must be the thing that falls short, or this pins nothing"
+
+
+def test_a_prior_sweeps_observed_cost_beats_the_geometry(conn):
+    """Radius is a 4x lever on the whole cost and the up-front lattice cannot
+    see it: it must assume the default r=1000, while Singapore, New York and
+    Manila all calibrate down to r=500. Nothing durable stores that radius —
+    the checkpoint pins it for one sweep and cli.py discards it once the run is
+    cataloged — but runs.api_requests already holds the sweep's OBSERVED total,
+    which carries the radius, the pages, the retries and the ladder at once."""
+    # Sized to the study's Singapore: 50.47 km square == 2,547 km2, which the
+    # lattice covers in 1,296 circles at the default r=1000. The dimensions
+    # matter — the ~4x this test is named for is only visible if the fixture
+    # really is the city the study measured.
+    cid = _register_at(conn, "Singapore", 1.35, 103.8, 50470, 50470)
+    city = db.resolve_city(conn, cid)
+
+    geometric = estimate_requests(city, "kartaview", conn=conn)
+    # The ratio, not a round ceiling: 9,974 spent against ~2,332 estimated is
+    # the r=1000-vs-r=500 lever itself, so pin it as such and let the test fail
+    # if the geometry tier moves under it.
+    assert 3.5 < 9_974 / geometric < 5.0, (
+        f"r=1000 geometry should under-price this r=500 city ~4x; got {9_974 / geometric:.2f}x"
+    )
+
+    db.register_run(
+        conn,
+        city_id=cid,
+        run_date=date(2026, 7, 1),
+        csv_filename="s.csv.gz",
+        provider="kartaview",
+        api_requests=9_974,  # the study's measured Singapore sweep
+    )
+    assert estimate_requests(city, "kartaview", conn=conn) == 9_974
+    # Without a connection there is no prior run to read, so it falls back.
+    assert estimate_requests(city, "kartaview") == geometric
+
+
+def test_a_prior_sweeps_cost_never_outranks_a_grid_that_grew_under_it(conn):
+    """The prior describes the bbox as it was THEN, and this is the one channel
+    whose cost tracks bbox AREA directly.
+
+    Frozen geometry is mutable through two documented escape hatches
+    (`resize_city.py --force`, `cap_oversized_grids.py --include-collected`),
+    and every other arm of estimate_requests recomputes from today's geometry on
+    every call — so a prior-run tier that ignored a resize would go on pricing a
+    bbox that no longer exists. Under-pricing is the direction that costs: it
+    hands the child a timeout derived from the smaller sweep, which is the
+    SIGKILL-with-no-ledger-row that #238 exists to prevent, reached from inside
+    the fix rather than by the old fall-through.
+
+    Pinned as the max() rather than as either tier, because the prior still has
+    to WIN wherever the grid did not grow — that is the whole point of tier 1.
+    """
+    from streetscape_metadata_tracker.scheduler import city_timeout_seconds
+
+    cid = _register_at(conn, "Smallville", 40.0, -80.0, 4440, 4440)
+    small = db.resolve_city(conn, cid)
+    db.register_run(
+        conn,
+        city_id=cid,
+        run_date=date(2026, 7, 1),
+        csv_filename="s.csv.gz",
+        provider="kartaview",
+        # Above this bbox's geometric tier, so tier 1 is genuinely in force.
+        api_requests=60,
+    )
+    assert estimate_requests(small, "kartaview") < 60, "the premise: geometry is the lower one"
+    assert estimate_requests(small, "kartaview", conn=conn) == 60
+
+    # Same city, grid re-registered 100x larger in area.
+    db.update_city_geometry(
+        conn,
+        city_id=cid,
+        center_lat=40.0,
+        center_lon=-80.0,
+        grid_width_m=44_400,
+        grid_height_m=44_400,
+    )
+    grown = db.resolve_city(conn, cid)
+
+    geometry = estimate_requests(grown, "kartaview")
+    assert geometry > 1_000, "a 100x bbox is worth three figures of circles"
+    assert estimate_requests(grown, "kartaview", conn=conn) == geometry, (
+        "the stale prior priced the OLD bbox and won, so the sweep is timed for a "
+        "city 100x smaller than the one it will actually walk"
+    )
+    # And the consequence the estimate exists to prevent, end to end.
+    assert city_timeout_seconds(_kv_cfg(), grown, "kartaview", conn=conn) > 180 * 60
+
+
+def test_a_metro_sweep_outgrows_the_flat_timeout(conn):
+    """The defect in #238: a sweep is paced at 16 req/min and SERIAL, so a
+    metro is hours of deliberate waiting — Singapore's ~9,974 requests are
+    ~10.4 h — and the flat 180-minute floor SIGKILLed it part-way through.
+    That is worse than a plain failure twice over: a killed child records NO
+    api_usage, so every request it already spent vanishes from the daily
+    ledger, and it burns one of the five consecutive_failures that nothing but
+    a success resets."""
+    from streetscape_metadata_tracker.download_kartaview import (
+        DEFAULT_SWEEP_REQUESTS_PER_MINUTE,
+    )
+    from streetscape_metadata_tracker.scheduler import city_timeout_seconds
+
+    cid = _register_at(conn, "Singapore", 1.35, 103.8, 50470, 50470)
+    city = db.resolve_city(conn, cid)
+    db.register_run(
+        conn,
+        city_id=cid,
+        run_date=date(2026, 7, 1),
+        csv_filename="s.csv.gz",
+        provider="kartaview",
+        api_requests=9_974,
+    )
+    floor = 180 * 60
+    derived = city_timeout_seconds(_kv_cfg(), city, "kartaview", conn=conn)
+
+    assert derived > floor, "a ~10 h sweep must not be squeezed into the flat floor"
+    # Pin both walls rather than the number: it must cover the sweep's own
+    # paced wall-clock, and the premise must be re-measured if the pace moves.
+    paced_seconds = 9_974 / DEFAULT_SWEEP_REQUESTS_PER_MINUTE * 60
+    assert paced_seconds / 3600 < 11, "re-measure this test's premise, not just the constant"
+    assert derived > paced_seconds
+
+
+def test_the_sweep_child_is_timed_with_the_catalog_handle_not_without_it(
+    conn, monkeypatch, tmp_path
+):
+    """`_run_one_city`'s grid arm has to pass `conn` down, and for KartaView
+    that is load-bearing rather than cosmetic.
+
+    The street arm has always passed it and the grid arm never did, which was
+    harmless while `conn` was read only by the `gsv_streets` estimate. The
+    KartaView tier that reads a previous sweep's observed cost changes that:
+    without the handle the estimate silently drops to default-radius geometry,
+    which under-prices an r=500 metro roughly fourfold — and the only symptom
+    would be a SIGKILL months later.
+
+    Asserted end-to-end through `_run_one_city` rather than on
+    `city_timeout_seconds` directly, because the seam that can break is the
+    argument-passing, not the derivation.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    cid = _register_at(conn, "Singapore", 1.35, 103.8, 50470, 50470)
+    city = db.resolve_city(conn, cid)
+    db.register_run(
+        conn,
+        city_id=cid,
+        run_date=date(2026, 7, 1),
+        csv_filename="s.csv.gz",
+        provider="kartaview",
+        api_requests=9_974,
+    )
+
+    seen = {}
+
+    def fake_run(cmd, timeout=None, cwd=None, **kwargs):
+        seen["timeout"] = timeout
+
+        class R:
+            returncode = 0
+
+        return R()
+
+    monkeypatch.setattr(sched.subprocess, "run", fake_run)
+    cfg = dataclasses.replace(_kv_cfg(), log_dir=str(tmp_path))
+    sched._run_one_city(cfg, city, date(2026, 7, 2), "kartaview", conn=conn)
+
+    geometry_only = sched.city_timeout_seconds(cfg, city, "kartaview")
+    assert seen["timeout"] > geometry_only, (
+        "the child was timed from default-radius geometry, so the catalog handle "
+        "never reached the derivation"
+    )
+    assert seen["timeout"] == sched.city_timeout_seconds(cfg, city, "kartaview", conn=conn)
+
+
+def test_a_median_city_sweep_keeps_the_flat_floor(conn):
+    """The derivation never drops below the configured floor, so the median
+    catalog city — 12 circles, under a minute of fetching — is unaffected."""
+    from streetscape_metadata_tracker.scheduler import city_timeout_seconds
+
+    city = db.resolve_city(conn, _register_at(conn, "Ithaca", 43.3, -84.6, 4440, 4440))
+    assert city_timeout_seconds(_kv_cfg(), city, "kartaview", conn=conn) == 180 * 60
+
+
+def test_a_sweep_timeout_uses_the_channels_own_rate(conn):
+    """Halving the configured pace doubles the waiting, so the timeout has to
+    follow the channel's own figure rather than a constant."""
+    from streetscape_metadata_tracker.scheduler import city_timeout_seconds
+
+    city = db.resolve_city(conn, _register_at(conn, "Vegas", 36.2, -115.1, 49130, 49130))
+    fast = city_timeout_seconds(_kv_cfg(rate=32), city, "kartaview", conn=conn)
+    slow = city_timeout_seconds(_kv_cfg(rate=8), city, "kartaview", conn=conn)
+    assert slow > fast
+
+
+def test_an_unpaced_sweep_channel_keeps_the_flat_floor(conn):
+    """0 disables pacing, which leaves nothing to derive a duration from —
+    `is None`, not falsy, exactly as the Mapillary arm reads it."""
+    from streetscape_metadata_tracker.scheduler import city_timeout_seconds
+
+    city = db.resolve_city(conn, _register_at(conn, "Vegas", 36.2, -115.1, 49130, 49130))
+    assert city_timeout_seconds(_kv_cfg(rate=0), city, "kartaview", conn=conn) == 180 * 60
+
+
+def test_the_sweep_budgets_a_lower_achieved_rate_than_the_tile_census(conn):
+    """Deliberately BELOW the Mapillary fraction, which is the opposite of the
+    intuition that a serial walk tracks its limiter more closely.
+
+    The tile census is concurrent, so per-request latency hides behind other
+    requests in flight and the limiter binds. The sweep is serial by design, so
+    its wall-clock per request is max(pacing_interval, latency) with nothing to
+    overlap — and at 16/min the interval is only 3.75 s against a page carrying
+    up to 2,000 photo records, so latency can be the binding term instead."""
+    from streetscape_metadata_tracker.scheduler import (
+        _SWEEP_ACHIEVED_RATE_FRACTION,
+        _TILE_ACHIEVED_RATE_FRACTION,
+    )
+
+    assert _SWEEP_ACHIEVED_RATE_FRACTION < _TILE_ACHIEVED_RATE_FRACTION
+
+
+def test_the_sweep_channel_is_ordered_by_decision_not_by_the_rank_fallback():
+    """`rank.get(p, 99)` used to place kartaview last by accident. It still
+    sorts last, but now because the table says so.
+
+    Deliberately pinned as the POSITION and not as a rationale for it: four
+    rationales for this ordering have been wrong, and docs/scheduler.md holds
+    them and what each got wrong. The durable rule is "most expensive first,
+    except where truncation is cheapest to absorb" — a multi-hour sweep would
+    otherwise consume the deadline and leave its cheap siblings clamped to
+    `_MIN_CLAMPED_TIMEOUT_S`, and it is the one channel #239 checkpoints, so it
+    is the one that can absorb being cut short."""
+    cfg = SchedulerConfig(
+        providers={
+            "kartaview": ProviderConfig(enabled=True),
+            "gsv": ProviderConfig(enabled=True),
+            "mapillary": ProviderConfig(enabled=True),
+        }
+    )
+    assert cfg.enabled_providers() == ["gsv", "mapillary", "kartaview"]
+
+    # And it is the TABLE saying so, not the fallback: a name the table really
+    # does not know still sorts after kartaview. Under the old rank.get(p, 99)
+    # the two would have tied at 99 and fallen back to alphabetical order,
+    # putting "aardvark" first.
+    cfg.providers["aardvark"] = ProviderConfig(enabled=True)
+    assert cfg.enabled_providers()[-1] == "aardvark"
+
+
 def _orphan_run(conn, data_dir, *, run_date=date(2026, 4, 15), write_csv=True):
     """A cataloged run with json_filename=NULL, mimicking a subprocess killed in
     the pipeline tail after register_run committed. When write_csv is False the
@@ -1521,15 +1835,20 @@ def test_enabled_providers_orders_expensive_channels_first():
     """The canonical order is stable, which is what other things are read against.
 
     Pinned for what the order actually decides rather than for a budget story:
-    it is the submit order, so it picks which channels are already LAUNCHED when
-    a SIGTERM wind-down declines the rest (#206), which claim a lane first when a
-    city has more channels than lanes, and — the mechanical case for expensive
-    channels leading — how much of the batch deadline each child's timeout clamp
-    is allowed to see, since `remaining_s` is read fresh at every launch.
+    it is the submit order, so it picks which channels have FINISHED when a
+    SIGTERM wind-down stops the city (#206 — a submit gate, but `KillMode`
+    defaults to control-group, so a real `systemctl stop` takes the in-flight
+    children with it), which claim a lane first when a city has more channels
+    than lanes, and — the mechanical case for expensive channels leading — how
+    much of the batch deadline each child's timeout clamp is allowed to see,
+    since `remaining_s` is read fresh at every launch. That last one is pinned
+    in its own right by
+    test_the_deadline_is_a_submit_gate_and_every_lane_child_gets_its_own_remaining_s.
 
     It decides nothing about budgets, which are per-channel, and nothing about
-    what a batch deadline DROPS, which is a between-cities check. See
-    `enabled_providers` for why both of those read as established for a while.
+    what a batch deadline DROPS, which is a between-cities check. docs/scheduler.md
+    records why both of those read as established for a while, along with the two
+    later rationales that were also wrong.
     """
     assert _street_cfg().enabled_providers() == [
         "gsv",
@@ -3947,6 +4266,32 @@ def test_a_gsv_grid_child_never_gets_the_mapillary_flag(conn, monkeypatch, tmp_p
     assert "--mapillary-max-requests-per-minute" not in cmd
 
 
+def test_a_sweep_child_gets_the_configured_pace_the_timeout_was_derived_from(
+    conn, monkeypatch, tmp_path
+):
+    """Same reason as the Mapillary flag above, plus one specific to this
+    channel: the KartaView timeout is DERIVED from the configured rate (#238),
+    so a child left on its own default would be timed against a rate it never
+    honoured — and the disagreement would only show up as a SIGKILL."""
+    cfg = SchedulerConfig(providers={"kartaview": ProviderConfig(max_requests_per_minute=8)})
+    cmd, _ = _grid_cmd(monkeypatch, tmp_path, conn, "kartaview", cfg)
+    assert cmd[cmd.index("--kartaview-max-requests-per-minute") + 1] == "8"
+
+
+def test_an_unset_sweep_pace_leaves_the_cli_default_in_force(conn, monkeypatch, tmp_path):
+    """Omitting the flag is correct here too: the CLI's default is the same
+    conservative 16/min the timeout derivation assumes, so the two agree."""
+    cfg = SchedulerConfig(providers={"kartaview": ProviderConfig()})
+    cmd, _ = _grid_cmd(monkeypatch, tmp_path, conn, "kartaview", cfg)
+    assert "--kartaview-max-requests-per-minute" not in cmd
+
+
+def test_a_gsv_grid_child_never_gets_the_sweep_flag(conn, monkeypatch, tmp_path):
+    cfg = SchedulerConfig(providers={"kartaview": ProviderConfig(max_requests_per_minute=8)})
+    cmd, _ = _grid_cmd(monkeypatch, tmp_path, conn, "gsv", cfg)
+    assert "--kartaview-max-requests-per-minute" not in cmd
+
+
 def test_an_explicit_zero_disables_gsv_street_pacing_instead_of_reverting(conn):
     """0 is documented as 'disables pacing'. A falsy `or` fallback silently
     promoted it to [download].max_requests_per_minute — a 24k/48k project
@@ -4280,6 +4625,106 @@ def test_repeated_busy_nights_never_quarantine_a_city(conn, monkeypatch):
         provider="mapillary",
     )
     assert cid in {c.city_id for c in due}
+
+
+def _paused_sweep_outcome():
+    from streetscape_metadata_tracker.download_common import SWEEP_INCOMPLETE_EXIT_CODE
+    from streetscape_metadata_tracker.scheduler import CollectionOutcome
+
+    return CollectionOutcome(
+        False,
+        f"exited {SWEEP_INCOMPLETE_EXIT_CODE} (paused)",
+        exit_code=SWEEP_INCOMPLETE_EXIT_CODE,
+    )
+
+
+def _sweep_cfg(**overrides):
+    """_street_cfg plus a kartaview channel, bypassing UNWIRED_CHANNELS' refusal
+    the same way the timeout cases above do."""
+    cfg = _street_cfg(**overrides)
+    cfg.providers["kartaview"] = ProviderConfig(enabled=True, daily_request_budget=20_000)
+    return cfg
+
+
+def test_a_checkpointed_pause_is_not_recorded_as_a_city_failure(conn, monkeypatch):
+    """A sweep that stopped with roots unvisited and CHECKPOINTED them (#239) is
+    progress, not breakage — the CLI says exactly that and gives it its own exit
+    code so a wrapper cannot escalate a legitimately capped night.
+
+    It has to take the host branches' amnesty for the host branches' reason:
+    get_due_cities filters on `consecutive_failures < max_consecutive_failures`
+    and NOTHING but a success resets it, so charging a pause would retire the
+    city after five of them. Which is not a hypothetical for this channel — a
+    metro sweep needs more nights than that by construction (Singapore is
+    ~10.4 h of pacing against a 10 h max_batch_hours), so the failure counter
+    would fire before the sweep it is meant to protect could ever finish."""
+    cid = _register(conn, "Bend", width=1000, height=1000, step=20)
+
+    def run_one(city, provider):
+        return _paused_sweep_outcome() if provider == "kartaview" else True
+
+    _run_loop_with(monkeypatch, conn, _sweep_cfg(publish_enabled=False), run_one)
+
+    row = conn.execute(
+        "SELECT consecutive_failures FROM schedule_state WHERE city_id = ? AND provider = ?",
+        (cid, "kartaview"),
+    ).fetchone()
+    assert row is None or row["consecutive_failures"] == 0
+
+
+def test_a_multi_night_sweep_is_never_quarantined_before_it_can_finish(conn, monkeypatch):
+    """The operational corollary, and the whole reason the amnesty exists: a
+    sweep that legitimately takes more nights than max_consecutive_failures must
+    still be due on the night it would have completed."""
+    cid = _register(conn, "Bend", width=1000, height=1000, step=20)
+    cfg = _sweep_cfg(publish_enabled=False)
+
+    for day in range(8):  # comfortably past max_consecutive_failures (5)
+        _run_loop_with(
+            monkeypatch,
+            conn,
+            cfg,
+            lambda city, provider: _paused_sweep_outcome() if provider == "kartaview" else True,
+            today=date(2026, 7, 2) + timedelta(days=day),
+        )
+
+    due = db.get_due_cities(
+        conn,
+        today=date(2026, 7, 20),
+        cycle_days=1,
+        grace_days=0,
+        max_consecutive_failures=5,
+        provider="kartaview",
+    )
+    assert cid in {c.city_id for c in due}
+
+
+def test_a_sweep_killed_by_its_timeout_still_counts_a_failure(conn, monkeypatch):
+    """The boundary of the amnesty, pinned so it is not read as wider than it is.
+
+    A SIGKILLed child has NO exit code, so nothing here can tell a kill that
+    checkpointed real progress from one that made none — and treating every
+    timeout as progress would mean a genuinely stuck channel never trips the
+    failure counter at all. So "a kill just resumes tomorrow" is true of the
+    WORK and bounded at five nights by the SCHEDULE; the fix for a city whose
+    clamped timeout cannot finish in five is #248's dueness work, not a wider
+    amnesty here. See _kartaview_timeout_seconds."""
+    from streetscape_metadata_tracker.scheduler import CollectionOutcome
+
+    cid = _register(conn, "Bend", width=1000, height=1000, step=20)
+
+    def run_one(city, provider):
+        if provider != "kartaview":
+            return True
+        return CollectionOutcome(False, "timed out after 180 minutes", exit_code=None)
+
+    _run_loop_with(monkeypatch, conn, _sweep_cfg(publish_enabled=False), run_one)
+
+    row = conn.execute(
+        "SELECT consecutive_failures FROM schedule_state WHERE city_id = ? AND provider = ?",
+        (cid, "kartaview"),
+    ).fetchone()
+    assert row["consecutive_failures"] == 1
 
 
 def test_a_busy_night_alerts_and_exits_nonzero_but_says_it_was_local(conn, monkeypatch):

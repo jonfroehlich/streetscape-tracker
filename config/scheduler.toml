@@ -22,10 +22,18 @@ max_cities_per_day = 20
 # A (city, provider) pair is skipped after this many consecutive failures
 # until re-enabled.
 max_consecutive_failures = 5
-# Floor for the per-city subprocess timeout. For GSV the effective timeout is
-# derived from the grid's estimated request count and max_requests_per_minute
-# (with headroom), so large cities are not SIGKILLed mid-run; this floor still
-# applies to small cities and to the fast Mapillary provider.
+# FLOOR for the per-city subprocess timeout, not the timeout itself. Every
+# channel is paced, so every channel's effective timeout is derived from its own
+# estimated request count and its own rate (with headroom) — GSV and gsv_streets
+# off grid points and on-street samples, the two Mapillary channels off the
+# shared z14 tile count, KartaView off its bbox's swept circle count at 16/min.
+# This floor is what small cities keep, whatever their provider.
+#
+# The derivation exists because a SIGKILLed child records NO api_usage (the
+# ledger write lives in the child, after the download returns), so a timeout
+# that fires mid-run loses the whole spend AND burns one of the five
+# consecutive_failures that only a success resets. Derived values are then
+# clamped to what is left of max_batch_hours below.
 city_timeout_minutes = 180
 
 # Wall-clock ceiling on the city loop. Once this much of the night has elapsed,

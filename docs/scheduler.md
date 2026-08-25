@@ -22,6 +22,16 @@ Stagger = `sha256(city_id) % cycle_days`, identical for all providers of a city.
 — the filter is applied in `_collect_due`, whose `providers` argument is **required** (a None-means-everything default put a fail-open path one refactor away from `_select_providers`'s error return, which is now a raised `_UsageError`),
 so a channel absent from `providers_for_city` is never priced, budgeted or launched, and everything else about the night (backup, driving-plan hook, breaker, tail) is unchanged.
 It is not free of consequences, though — see the paired-snapshot note in the Mapillary budget section of `docs/provider-access.md`.
+
+**Every channel is paced, so every channel's per-city timeout is DERIVED rather than flat, and `city_timeout_minutes` (180) is only the floor.**
+The shape is the same for all of them — `estimated_requests / (rate × achieved_rate_fraction) × _TIMEOUT_HEADROOM + _TIMEOUT_FIXED_SLACK_S`, never below the floor — and what differs is where the request count and the rate come from: gsv and `gsv_streets` off grid points and on-street samples against `[download].max_requests_per_minute`, the two Mapillary channels off the shared z14 tile count, and kartaview off its bbox's swept circle count at 16/min (#238).
+The reason it is derived at all is that **a SIGKILLed child records no `api_usage`** — every `db.add_api_usage` call lives in the child, after the download returns — so a timeout that fires mid-run loses the whole spend from the daily ledger *and* burns one of the five `consecutive_failures` that nothing but a success resets.
+The `achieved_rate_fraction` differs per channel because what falls short of the configured rate differs: gsv uses **0.5** for the async engine's structural undershoot against a project quota it never approaches, Mapillary **0.8** because its limiter is a hard ceiling the concurrent fetch tracks closely, and KartaView **0.5** because its walk is *serial*, so per-request latency cannot hide behind other requests in flight and at 16/min the 3.75 s interval is genuinely comparable to the latency of a 2,000-record page.
+Derived values are then clamped to what is left of the batch deadline (never below `_MIN_CLAMPED_TIMEOUT_S`, 300 s), which is what bounds a metro KartaView sweep whose honest timeout exceeds `max_batch_hours` outright — acceptable only because #239's checkpoint turns that kill into a resume rather than a discarded night.
+**But a kill is a resume of the WORK and not of the SCHEDULE, and that is where the acceptance runs out.**
+A *deliberate* pause exits `SWEEP_INCOMPLETE_EXIT_CODE` (83) and is amnestied in `_run_city_channels` beside the blocked- and busy-host conditions, so it can repeat indefinitely; a SIGKILL has no exit code, nothing can tell one that checkpointed progress from one that made none, and it counts a `consecutive_failure` that only a success resets — so five clamped nights quarantine the city for a 90-day cycle.
+A metro sweep that cannot finish inside five nights therefore needs #248's per-(city, provider) dueness, not a larger timeout constant.
+
 **The tail — aggregate, streetwalk manifest, catalog backup, publish — is what makes a night visible, and it only runs if the city loop returns**, so every way of ending the loop goes through `_run_city_loop`,
 which always returns counters instead of propagating: a `[schedule].max_batch_hours` deadline (10 h) stops *starting* cities and clamps the in-flight child's timeout to what's left,
 a SIGTERM handler turns systemd's stop into a wind-down request checked between cities *and between a city's channels*, and an unexpected exception is logged, published anyway, and then reported as an unhealthy night (nonzero exit + alert, so publishing can't hide a bug).
@@ -103,6 +113,49 @@ This deadline must stay **below the unit's `TimeoutStartSec` (14 h)** — a test
 — because reaching the systemd limit means a SIGKILL mid-loop, which is exactly how 2026-07-29 collected most of a night and published none of it (#167).
 A child that exits with a `HOST_EXIT_CODES` status trips the per-IP **host breaker** (see the host-lock section): that host's channels are skipped for the rest of the night, no city is marked failed, and the night alerts unconditionally and exits nonzero while still publishing.
 Because makelab1 is shared, a `[resource_guard]` pre-flight (pure `plan_connection_limit`, Linux `/proc` read) lowers each run's `--connection-limit` when host load/free-RAM are tight — on top of the systemd unit's static CPU/RAM caps.
+
+## Channel order, and the four rationales it did not have (issues #240, #238)
+
+**The rule is "most expensive first, EXCEPT where truncation is cheapest to absorb."**
+`SchedulerConfig.enabled_providers` returns a fixed rank — gsv, `gsv_streets`, mapillary, `mapillary_streets`, kartaview — and the docstring there states the rule; this section holds the mechanism and the history, because the docstring was the wrong size for it and because being the collision point for every branch that touched the ordering is how the wrong versions kept getting copied.
+
+**The mechanism is the deadline clamp, and it is the only wall-clock lever ordering has.**
+`remaining_s` is read fresh at every launch — one `time.monotonic()` per *launched* channel, in the launch pass — and `city_timeout_seconds` clamps the derived timeout down to it, floored at `_MIN_CLAMPED_TIMEOUT_S` (300 s).
+A channel launched later therefore sees less of the batch deadline, and an expensive one launched late can have its timeout truncated to the floor and be SIGKILLed part-way, which costs its whole spend from the daily ledger (`db.add_api_usage` runs in the child, after the download returns).
+So the channel needing the most wall-clock should start while the most of it remains.
+`test_the_deadline_is_a_submit_gate_and_every_lane_child_gets_its_own_remaining_s` pins this, as a decreasing sequence in submit order.
+
+**The rule inverts past one point, which is why kartaview ranks last rather than first.**
+"Expensive first" holds only while no single channel is long enough to consume the deadline by itself.
+One that *is* starves everything behind it — put it first and its siblings launch against what is left, down to the floor — so for that channel the question stops being which is most expensive and becomes which can best absorb being truncated.
+A multi-hour KartaView sweep is that channel: last, exactly one channel eats the clamp, and it is the one #239 checkpoints, so a killed sweep resumes instead of re-paying for the cells it already fetched.
+Nothing else here has that (Mapillary's checkpoint is #256, and a truncated tile census re-spends against a 3,500/day per-IP ceiling).
+**Cheapest is not free, in two ways that both matter.**
+No channel keeps its ledger row through a SIGKILL, whatever its provider.
+And a SIGKILL still counts a `consecutive_failure` — only a *deliberate* pause (exit `SWEEP_INCOMPLETE_EXIT_CODE`) is amnestied — so the resumption that justifies this ranking is itself bounded at five nights.
+Ranking picks who absorbs the truncation; it never makes it free.
+
+**What order also decides**, both verified in the launch pass: which channels have **finished** when a wind-down stops the city, and which claim a lane first when a city has more channels than lanes.
+Note *finished* and not *launched*: a SIGTERM is a submit gate (#206), but the unit's `KillMode` defaults to control-group, so a real `systemctl stop` takes the in-flight children with it — `_log_stop_declined` says so, and the amnesty branch exists because those children show up as `exited -15`.
+Above one lane it is the **attempt** order rather than the launch order, because host affinity can defer a higher-ranked channel and let a lower-ranked one take the free slot.
+
+**Four superseded rationales, and what each got wrong. Read these before writing a fifth.**
+Every one was reasoned from prose adjacent to the docstring instead of from the code that prose describes — the launch pass, ~200 lines away the whole time — and each read as established long enough to be quoted elsewhere before anyone checked it.
+
+- **"A city's channels share one night's budget, so the series that can exhaust a budget should claim it first."**
+  There is no shared pot: `daily_request_budget` is per-`ProviderConfig` and `db.get_api_usage` is keyed by `(date, provider)`, so no ordering can let one channel claim anything ahead of another.
+  Traced: the pre-#240 wording was "run back-to-back **within** one night's budget" — a claim about *timing*, true sequentially — and `9d20afe` reworded it to "**share**" because back-to-back had stopped being true under lanes, silently converting a timing claim into a shared-resource one while carrying the conclusion along unchanged.
+- **"Lane occupancy": a long pole first would make the others queue behind it.**
+  Above one lane it takes **one** lane while the others take the rest, so the queueing harm cannot occur — and as a wall-clock argument it points at rank **0**, since submitting last makes the city finish later.
+- **"Deadline priority": rank a channel last and it is the first thing a truncated night drops.**
+  The batch deadline is checked in `_run_city_loop`, **between cities**; the launch pass has no deadline gate at all — only the lane cap, the SIGTERM submit gate, host affinity and the budget guards.
+  Once a city starts, every one of its channels is attempted whatever the order, so truncation does not operate at channel granularity.
+- **"It can afford to absorb the clamp, because #239 checkpoints it."**
+  True of the work and false of the schedule, until #238's review: `SWEEP_INCOMPLETE_EXIT_CODE` appeared nowhere in `scheduler.py`, so a checkpointed pause reached `record_attempt(success=False)` exactly like a crash, and `get_due_cities` filters on `consecutive_failures` with only a success resetting it.
+  Absorbing truncation was not cheap, it was cheap*er*.
+  Fixed by amnestying exit 83; the rank-4 *decision* survives, since one channel eating the clamp beats several.
+
+The pattern is the finding, not any one of the four: reading the launch pass settled all of them in a single pass — no deadline gate, no shared ledger, a fresh clock read per launch — and that check was available from the start.
 
 ## Concurrent channel lanes (issue #240)
 
