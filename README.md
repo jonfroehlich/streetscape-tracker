@@ -29,8 +29,6 @@ The full data model, pipeline, and filename contract live in [`docs/architecture
 Raw *pano counts* are not: a GSV sample undercounts dense imagery, while a census counts everything.
 The two censuses also report a second, wider *any-imagery* coverage rate that counts the flat-only points; it is never conflated with the 360° rate.
 
-**Attribution.** Mapillary metadata is used under their [terms](https://www.mapillary.com/terms) (CC BY-SA); anything derived from it must visibly credit Mapillary, which the bundled web frontend does automatically.
-
 ## Install
 
 ```bash
