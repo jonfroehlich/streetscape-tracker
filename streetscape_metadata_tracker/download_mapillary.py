@@ -29,14 +29,29 @@ The output CSV uses the exact same 9-column schema as the GSV downloader
 (config.METADATA_DTYPES), so analysis, diffing, and the frontend consume
 both providers' files identically.
 
-No resume logic: a full city is seconds of tile fetches (vs hours of
-per-point requests for GSV), so an interrupted run just restarts.
+The tile census CHECKPOINTS (issue #256). It did not always, and the reason
+it does now is not that cities got slower: at 60 tiles/min (issue #198) the
+catalog's worst city is ~15 minutes, but each channel's daily budget is 1,750
+tile requests against a per-IP limit that has blocked this host twice, so a
+re-spent census is not merely slow -- it is charged against the same rolling
+window the block is drawn from. An interrupted city now resumes for its
+MISSING tiles only, and tiles fetched before a block survive to the next
+night. Resume is strictly next-invocation: no in-process retry is added
+anywhere, because retrying during a block is reported to extend it
+(docs/provider-access.md).
+
+The caller supplies the checkpoint path and discards it once its artifact is
+durable -- see checkpointing.py, and the tile-keyed reassembly contract in
+the checkpoint section below.
 """
 
 import asyncio
+import json
 import logging
 import math
+import os
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
@@ -45,6 +60,7 @@ import backoff
 import mapbox_vector_tile
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 
 # Aliased, because `census` is also the name of the local DataFrame this
 # module passes around (see fetch_city_images_async). Importing the module
@@ -63,6 +79,14 @@ from . import census as census_core
 from .analysis import FLAT_ONLY as FLAT_ONLY
 from .census import dedupe_census
 from .census import status_for_capture_dates as status_for_capture_dates
+from .checkpointing import (
+    CHECKPOINT_MAX_AGE_S,
+    _bbox_matches,
+    _fsync_dir,
+    _remove_empty_checkpoint_dir,
+    _state_path,
+    discard_checkpoint,
+)
 from .config import MAPILLARY_METADATA_DTYPES
 from .download_common import _M_PER_DEG_LAT as _M_PER_DEG_LAT
 from .download_common import (
@@ -546,6 +570,332 @@ async def _fetch_tile(
         return await response.read()
 
 
+# ── The tile checkpoint on disk (issue #256) ───────────────────────────────
+#
+# Layout, one directory per (city, grid geometry, channel) — the naming rules
+# and the caller-discards contract live in `checkpointing.py` and are
+# preconditions for this section, not background:
+#
+#     <checkpoint_path>/
+#       state.json                the commit record; written LAST
+#       tile-2621-6335.parquet    one committed tile's census rows
+#
+# PARTS ARE KEYED BY TILE (x, y), NOT BY FETCH ORDER. That is the one real
+# divergence from KartaView's checkpoint, and it is forced: KartaView visits its
+# cells in a deterministic order, so it can number parts 0..n and replay them in
+# that order, while this module fetches tiles CONCURRENTLY (`asyncio.gather`
+# behind a semaphore) and completion order is nondeterministic. A fetch-order
+# index here would make a resumed census depend on which tiles happened to land
+# first before the interruption.
+#
+# What replaces it stores nothing: `tiles_for_bbox` is pure, so the reassembly
+# order is RECOMPUTED — walk the tile list and take each tile's frame from this
+# run if it was fetched now, else from its part file. `gather` already preserves
+# argument order, so an uninterrupted run and a resumed one hand `concat_census`
+# positionally identical input. That is what keeps `dedupe_census`'s
+# first-position/last-value rule on a border duplicate from depending on which
+# night fetched which copy — and with it the byte-for-byte golden fixture, and
+# `diff.py`'s freedom from phantom imagery churn in every Mapillary city.
+#
+# ONLY SUCCESSFUL TILES ARE COMMITTED. A tile that 404s or times out is left out
+# of the record and re-requested next invocation, so #168's tolerance keeps
+# measuring failures against the FULL tile set rather than against whatever this
+# process happened to attempt. One tile is one paced request, so committing per
+# tile is at most one small write per second at the shipped 60/min — and it is
+# what makes #205's fail-fast salvage automatic, since everything fetched before
+# the fatal is already durable by the time it re-raises.
+#
+# A ZERO-ROW TILE GETS A RECORD AND NO FILE. Most tiles over a real bbox are
+# empty, and writing a part for each would mean 870 files for Moscow to say
+# nothing. The record's row count is what tells "empty tile, already fetched"
+# from "not fetched yet".
+#
+# CHECKPOINTING FAILS OPEN, which is a deliberate divergence from KartaView's
+# fail-fast. There it is right: ten hours of paid-for crawl is worth more than
+# the night that loses it. Here the worst city in the catalog is ~15 minutes, so
+# the same trade goes the other way — an unwritable directory or a failing
+# commit logs one warning and the fetch carries on unprotected, because a city
+# must never fail over its own safety net.
+
+MAPILLARY_CHECKPOINT_FORMAT_VERSION = 1
+CHECKPOINT_PART_TEMPLATE = "tile-{x}-{y}.parquet"
+
+
+@dataclass
+class TileCheckpoint:
+    """Handle to an on-disk tile checkpoint, loaded or freshly opened."""
+
+    path: str
+    channel: str | None = None
+    # (x, y) -> committed row count. Membership means "this tile is done"; the
+    # count is what distinguishes a committed empty tile from a missing part.
+    done: dict[tuple[int, int], int] = field(default_factory=dict)
+    # Spend of the PREVIOUS invocations only. This process adds its own on top,
+    # and the sum is what reaches the catalog row (never the daily ledger).
+    api_requests_before: int = 0
+    # Latched by the first failed commit, so the warning is logged once per run
+    # and the rest of the fetch runs uncheckpointed rather than retrying a
+    # directory that has already proved unwritable.
+    degraded: bool = False
+
+
+def _tile_part_path(path: str, x: int, y: int) -> str:
+    return os.path.join(path, CHECKPOINT_PART_TEMPLATE.format(x=x, y=y))
+
+
+def load_tile_checkpoint(
+    path: str,
+    *,
+    bbox: tuple[float, float, float, float],
+    tiles: list[tuple[int, int]],
+    channel: str | None = None,
+) -> TileCheckpoint | None:
+    """
+    Resume state for this census, or None if there is nothing usable here.
+
+    NEVER RAISES, following :func:`download_kartaview.load_checkpoint` and
+    :func:`download_gsv.get_processed_points`: every failure degrades to
+    "fetch every tile" with a warning. A checkpoint is not a comparison whose
+    mismatch corrupts an artifact — the worst case of ignoring one is a
+    re-spend, so refusing outright would cost a night to protect nothing.
+
+    Unlike KartaView's, an unusable checkpoint here is DELETED rather than left
+    in place. Its parts are named for the tiles they hold, so a stale directory
+    that is never resumed is also never overwritten, and would otherwise sit
+    there until the age cap swept it.
+
+    Args:
+        path: the checkpoint directory. Need not exist.
+        bbox: this run's frame. A different one means a different lattice.
+        tiles: this run's tile list, from :func:`tiles_for_bbox`.
+        channel: which api_usage channel this census meters into. The PATH
+            already keys the channel, but the path is caller-built: a directory
+            moved by hand, or a future caller deriving it wrong, would pass
+            every geometric check here and resume a census whose spend belongs
+            to another ledger — under another credential, for this provider.
+    """
+
+    def discard(reason: str) -> None:
+        logger.warning(f"Ignoring the Mapillary tile checkpoint at {path}: {reason}")
+        discard_checkpoint(path)
+
+    state_path = _state_path(path)
+    if not os.path.exists(state_path):
+        return None  # the ordinary first-run case; not worth a line of log
+    try:
+        with open(state_path, encoding="utf-8") as f:
+            state = json.load(f)
+        if state["format_version"] != MAPILLARY_CHECKPOINT_FORMAT_VERSION:
+            discard(
+                f"it is format v{state['format_version']}, this build writes "
+                f"v{MAPILLARY_CHECKPOINT_FORMAT_VERSION}"
+            )
+            return None
+        if not _bbox_matches(state["bbox"], bbox):
+            discard(f"it covers bbox {state['bbox']}, this run uses {list(bbox)}")
+            return None
+        if int(state["zoom"]) != TILE_ZOOM:
+            # Only z14 carries per-image metadata today, so this cannot fire on
+            # current builds. It is here because the tile INDICES in every part
+            # name mean nothing without the zoom that produced them.
+            discard(f"it was fetched at z{state['zoom']}, this run uses z{TILE_ZOOM}")
+            return None
+        if state.get("channel") != channel:
+            discard(
+                f"it belongs to the {state.get('channel')!r} channel and this run is "
+                f"{channel!r}; the two meter into different api_usage ledgers"
+            )
+            return None
+        if int(state["tile_count"]) != len(tiles):
+            # Catches a change to tiles_for_bbox itself, which would leave the
+            # stored tile indices describing a lattice this run does not have.
+            discard(f"it covers {state['tile_count']} tiles, this run has {len(tiles)}")
+            return None
+        age_s = (datetime.now(UTC) - datetime.fromisoformat(state["updated_at"])).total_seconds()
+        if age_s > CHECKPOINT_MAX_AGE_S:
+            # The one guard here that protects an ARTIFACT rather than a night's
+            # work: frozen geometry never changes, so every other check still
+            # passes months later and resuming would splice last quarter's rows
+            # into a snapshot dated today. See checkpointing.CHECKPOINT_MAX_AGE_S.
+            discard(
+                f"it was last committed {age_s / 86400:.1f} days ago, past the "
+                f"{CHECKPOINT_MAX_AGE_S / 86400:.0f}-day limit; its rows would be spliced "
+                f"into a snapshot dated today"
+            )
+            return None
+        done = {(int(x), int(y)): int(rows) for x, y, rows in state["done_tiles"]}
+        if not done.keys() <= set(tiles):
+            discard("it holds tiles this run's lattice does not contain")
+            return None
+        # Verify the parts from their FOOTERS — a seek to the end of each file,
+        # costing nothing — rather than discovering a truncated one at
+        # reassembly, after the fetch has already been paid for.
+        rows_on_disk = 0
+        for (x, y), rows in done.items():
+            if rows == 0:
+                continue  # committed empty tile; no part by design
+            part = _tile_part_path(path, x, y)
+            if not os.path.exists(part):
+                discard(f"committed part {os.path.basename(part)} is missing")
+                return None
+            found = pq.ParquetFile(part).metadata.num_rows
+            if found != rows:
+                discard(
+                    f"part {os.path.basename(part)} holds {found} rows where the "
+                    f"commit record says {rows}"
+                )
+                return None
+            rows_on_disk += found
+        if rows_on_disk != int(state["census_rows"]):
+            discard(
+                f"its parts hold {rows_on_disk} rows where the commit record says "
+                f"{state['census_rows']}"
+            )
+            return None
+        cp = TileCheckpoint(
+            path=path,
+            channel=channel,
+            done=done,
+            api_requests_before=int(state["api_requests_total"]),
+        )
+    except Exception as e:
+        # Broad on purpose; see the NEVER RAISES note above. A checkpoint that
+        # cannot be read must cost a re-fetch, never a city.
+        discard(f"{type(e).__name__}: {e}")
+        return None
+
+    _purge_checkpoint_debris(cp)
+    return cp
+
+
+def _purge_checkpoint_debris(cp: TileCheckpoint) -> None:
+    """
+    Delete part files nothing committed, and any staging leftovers.
+
+    A part written for a tile that never reached the commit record is a torn
+    write: the process died between ``to_parquet`` and ``state.json``. Under
+    KartaView's fetch-order indices those names are reused and MUST be cleared;
+    here they would simply be overwritten by the tile's next attempt, so this is
+    housekeeping rather than correctness — a census that never completes would
+    otherwise accumulate them in a directory that already holds a partial one.
+    Best effort by the same argument as the rest of this file's checkpointing.
+    """
+    try:
+        for name in os.listdir(cp.path):
+            if name.endswith(".tmp"):
+                os.remove(os.path.join(cp.path, name))
+                continue
+            if not name.startswith("tile-") or not name.endswith(".parquet"):
+                continue
+            try:
+                _, x, y = name[: -len(".parquet")].split("-")
+                committed = (int(x), int(y)) in cp.done
+            except ValueError:
+                committed = False
+            if not committed:
+                os.remove(os.path.join(cp.path, name))
+    except OSError as e:
+        logger.warning(f"Could not tidy the Mapillary tile checkpoint at {cp.path}: {e}")
+
+
+def _open_tile_checkpoint(
+    path: str | None,
+    *,
+    bbox: tuple[float, float, float, float],
+    tiles: list[tuple[int, int]],
+    channel: str | None,
+) -> TileCheckpoint | None:
+    """
+    Prepare the checkpoint directory and load any resumable state.
+
+    Returns None when the caller passed no path (checkpointing off, the
+    byte-for-byte historical behaviour) or when the directory cannot be created
+    — see the FAILS OPEN paragraph above.
+    """
+    if path is None:
+        return None
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError as e:
+        logger.warning(f"Could not open a tile checkpoint at {path}; fetching unprotected: {e}")
+        return None
+    return load_tile_checkpoint(path, bbox=bbox, tiles=tiles, channel=channel) or TileCheckpoint(
+        path=path, channel=channel
+    )
+
+
+def _commit_tile(
+    cp: TileCheckpoint,
+    x: int,
+    y: int,
+    frame: pd.DataFrame,
+    *,
+    bbox: tuple[float, float, float, float],
+    tiles: list[tuple[int, int]],
+    api_requests_total: int,
+) -> None:
+    """
+    Make one fetched tile durable: its part first, then the commit record.
+
+    The ordering is the commit point. ``state.json`` is written last and
+    atomically, so a part that exists without being counted never happened —
+    :func:`_purge_checkpoint_debris` sweeps it and the tile is simply refetched.
+
+    Best effort, and it LATCHES: the first failure warns once and turns
+    checkpointing off for the rest of the run. A Mapillary census is short
+    enough that losing the safety net costs less than failing a city over it.
+    """
+    if cp.degraded:
+        return
+    try:
+        if len(frame):
+            part = _tile_part_path(cp.path, x, y)
+            tmp = f"{part}.tmp"
+            frame.to_parquet(tmp, index=False)
+            os.replace(tmp, part)
+        done = dict(cp.done)
+        done[(x, y)] = len(frame)
+        state = {
+            "format_version": MAPILLARY_CHECKPOINT_FORMAT_VERSION,
+            "bbox": list(bbox),
+            "zoom": TILE_ZOOM,
+            "channel": cp.channel,
+            "tile_count": len(tiles),
+            "done_tiles": [[tx, ty, rows] for (tx, ty), rows in done.items()],
+            "census_rows": sum(done.values()),
+            "api_requests_total": api_requests_total,
+            "updated_at": datetime.now(UTC).isoformat(),
+        }
+        state_tmp = f"{_state_path(cp.path)}.tmp"
+        with open(state_tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(state_tmp, _state_path(cp.path))
+        _fsync_dir(cp.path)
+        # Only after the record is durable, so an in-memory `done` can never
+        # claim a tile the next invocation would not find.
+        cp.done = done
+    except Exception as e:
+        cp.degraded = True
+        logger.warning(
+            f"Could not checkpoint tile ({x}, {y}) at {cp.path}; continuing "
+            f"unprotected for the rest of this city: {e}"
+        )
+
+
+def _census_requests_total(cp: TileCheckpoint | None, api_requests: int) -> int:
+    """This census's spend across every invocation, checkpointed or not."""
+    return (cp.api_requests_before if cp else 0) + api_requests
+
+
+def _checkpoint_frame_for_tile(cp: TileCheckpoint, x: int, y: int) -> pd.DataFrame:
+    """Read one committed tile back. An empty tile has a record but no file."""
+    if cp.done[(x, y)] == 0:
+        return records_to_census([])
+    return pd.read_parquet(_tile_part_path(cp.path, x, y))
+
+
 async def fetch_city_images_async(
     city_name: str,
     bbox: tuple[float, float, float, float],
@@ -553,6 +903,8 @@ async def fetch_city_images_async(
     connection_limit: int = 5,
     request_timeout: float = 30,
     max_requests_per_minute: int = DEFAULT_TILE_REQUESTS_PER_MINUTE,
+    checkpoint_path: str | None = None,
+    checkpoint_channel: str | None = None,
 ) -> dict[str, Any]:
     """
     Fetch a city's Mapillary tile census, serialized against other processes.
@@ -570,15 +922,29 @@ async def fetch_city_images_async(
         HostBusyError: another process on this machine is already fetching
             tiles. Raised before any request is issued.
     """
+    # The lock hold covers the CHECKPOINT as well as the requests, which is why
+    # the checkpoint needs no lock of its own: only one process on this machine
+    # is inside this block, so its commits cannot race another's (issue #239
+    # makes the same argument for the same host).
     with host_lock(HOST_MAPILLARY_TILES):
-        return await _fetch_city_images(
-            city_name,
-            bbox,
-            access_token,
-            connection_limit=connection_limit,
-            request_timeout=request_timeout,
-            max_requests_per_minute=max_requests_per_minute,
-        )
+        try:
+            return await _fetch_city_images(
+                city_name,
+                bbox,
+                access_token,
+                connection_limit=connection_limit,
+                request_timeout=request_timeout,
+                max_requests_per_minute=max_requests_per_minute,
+                checkpoint_path=checkpoint_path,
+                checkpoint_channel=checkpoint_channel,
+            )
+        except BaseException:
+            # A city that failed before committing anything -- a rejected token,
+            # a block on request 1 -- would otherwise leave an empty directory
+            # behind on every attempt. os.rmdir refuses a non-empty one, so a
+            # real checkpoint is never touched.
+            _remove_empty_checkpoint_dir(checkpoint_path)
+            raise
 
 
 async def _fetch_city_images(
@@ -588,6 +954,8 @@ async def _fetch_city_images(
     connection_limit: int = 5,
     request_timeout: float = 30,
     max_requests_per_minute: int = DEFAULT_TILE_REQUESTS_PER_MINUTE,
+    checkpoint_path: str | None = None,
+    checkpoint_channel: str | None = None,
 ) -> dict[str, Any]:
     """
     Fetch and dedupe every Mapillary image in a bbox from the z14 vector tiles.
@@ -607,11 +975,21 @@ async def _fetch_city_images(
         request_timeout: per-request timeout in seconds.
         max_requests_per_minute: client-side pacing cap for the tile CDN,
             which rate-limits per IP (issue #198). <= 0 disables pacing.
+        checkpoint_path: directory to resume from and commit into, or None
+            for the historical fetch-everything behaviour. Built by the
+            caller, because only the caller knows the channel — see
+            :func:`checkpointing.checkpoint_path_for`.
+        checkpoint_channel: the api_usage channel this census meters into,
+            recorded in the commit record so a checkpoint cannot be resumed
+            under a different one.
 
     Returns:
         Dict with ``census`` (the deduped columnar census — see
-        :func:`records_to_census`), ``api_requests`` (tiles fetched), ``tiles``
-        (tile count) and ``raw_feature_count`` (pre-dedupe).
+        :func:`records_to_census`), ``api_requests`` (tiles fetched BY THIS
+        CALL, which is what the additive daily ledger wants), ``tiles``
+        (tile count), ``raw_feature_count`` (pre-dedupe),
+        ``api_requests_total`` (the whole census's spend across resumes,
+        which is what the catalog row wants) and ``checkpoint_path``.
 
     Raises:
         DownloadError: on a rejected token or tile transport failure, carrying
@@ -622,6 +1000,29 @@ async def _fetch_city_images(
         f"Fetching Mapillary metadata for {city_name}: {len(tiles)} z{TILE_ZOOM} "
         f"tiles covering bbox {tuple(round(v, 4) for v in bbox)}"
     )
+
+    checkpoint = _open_tile_checkpoint(
+        checkpoint_path, bbox=bbox, tiles=tiles, channel=checkpoint_channel
+    )
+    done = checkpoint.done if checkpoint else {}
+    todo = [tile for tile in tiles if tile not in done]
+    if done and todo:
+        logger.warning(
+            f"Resuming {city_name} from the checkpoint at {checkpoint.path}: "
+            f"{len(done)}/{len(tiles)} tiles already fetched for "
+            f"{checkpoint.api_requests_before:,} requests; {len(todo)} to go"
+        )
+    elif done and not todo:
+        # Recovers the crash-after-fetch-before-catalog case for ~0 requests.
+        # Loud, because the other way to arrive here is a checkpoint the caller
+        # forgot to discard, and then a zero-request 'collection' would look
+        # like a real one.
+        logger.warning(
+            f"The checkpoint at {checkpoint.path} is COMPLETE: all {len(tiles)} tiles "
+            f"were fetched by an earlier invocation, so this one issues ZERO requests "
+            f"and re-finalizes from disk. If that is not what you meant, remove the "
+            f"directory and re-run."
+        )
 
     api_requests = 0
     timeout = aiohttp.ClientTimeout(total=request_timeout)
@@ -636,7 +1037,7 @@ async def _fetch_city_images(
         else "Tile pacing DISABLED (max_requests_per_minute <= 0)"
     )
     progress_bar = progress(
-        total=len(tiles),
+        total=len(todo),
         desc=f"Downloading Mapillary tiles for {city_name}",
         unit="tile",
         # Paced at 60 tiles/min (issue #198), so a large city is tens of minutes
@@ -695,7 +1096,22 @@ async def _fetch_city_images(
         # every tile's result until the last one lands, so returning dicts kept
         # the entire city's per-image dicts alive at once — gigabytes on a big
         # census (issue #157). Converting per tile bounds that to one tile.
-        return records_to_census(decode_image_features(tile_bytes, x, y))
+        frame = records_to_census(decode_image_features(tile_bytes, x, y))
+        if checkpoint is not None:
+            # Synchronous, inside the coroutine: the loop is single-threaded, so
+            # this is atomic with respect to every other tile's commit, and the
+            # host lock rules out another process. Only a SUCCESSFUL tile gets
+            # here — a failure raised above, and stays refetchable.
+            _commit_tile(
+                checkpoint,
+                x,
+                y,
+                frame,
+                bbox=bbox,
+                tiles=tiles,
+                api_requests_total=checkpoint.api_requests_before + api_requests,
+            )
+        return frame
 
     try:
         # Token rides in each tile URL as ?access_token= — see TILE_URL_TEMPLATE
@@ -706,16 +1122,22 @@ async def _fetch_city_images(
         # transient 404 is worth one tile, not a city.
         async with aiohttp.ClientSession() as session:
             settled = await asyncio.gather(
-                *(fetch_one(x, y) for x, y in tiles), return_exceptions=True
+                *(fetch_one(x, y) for x, y in todo), return_exceptions=True
             )
     except DownloadError as e:
         # e.g. the rejected-token error from _fetch_tile; attach the spent
-        # request count so the caller can still record it in the ledger.
+        # request count so the caller can still record it in the ledger. The
+        # ledger wants THIS call's spend (it is additive and keyed by date), so
+        # api_requests is the one that must never become the cumulative figure;
+        # the total rides along for the operator and for parity with the
+        # success path.
         e.api_requests = api_requests
+        e.api_requests_total = _census_requests_total(checkpoint, api_requests)
         raise
     except (TimeoutError, aiohttp.ClientError) as e:
         error = DownloadError(f"Mapillary tile download failed: {redact_credentials(e)}")
         error.api_requests = api_requests
+        error.api_requests_total = _census_requests_total(checkpoint, api_requests)
         raise error from e
     finally:
         progress_bar.close()
@@ -732,12 +1154,16 @@ async def _fetch_city_images(
     # than whichever DownloadError happens to sit earliest in tile order.
     if fatal is not None:
         fatal.api_requests = api_requests
+        fatal.api_requests_total = _census_requests_total(checkpoint, api_requests)
         raise fatal
 
-    results = []
+    fetched: dict[tuple[int, int], pd.DataFrame] = {}
     failed_tiles: list[tuple[int, int]] = []
     first_error: BaseException | None = None
-    for (x, y), outcome in zip(tiles, settled, strict=True):
+    # `todo`, not `tiles`: a resumed run only attempted the missing ones, and a
+    # tile already in the checkpoint is a success that happened on an earlier
+    # night. `strict=True` is what keeps that from drifting.
+    for (x, y), outcome in zip(todo, settled, strict=True):
         if isinstance(outcome, BaseException):
             # A bad token is a whole-city condition, not a per-tile one: every
             # remaining tile would fail the same way, so don't dress it up as
@@ -748,9 +1174,12 @@ async def _fetch_city_images(
             failed_tiles.append((x, y))
             first_error = first_error or outcome
         else:
-            results.append(outcome)
+            fetched[(x, y)] = outcome
 
     if failed_tiles:
+        # Denominator is the FULL tile set, not this invocation's share: the
+        # tolerance asks what fraction of the city is unmeasured, and a tile a
+        # previous night already fetched is measured.
         failed_fraction = len(failed_tiles) / len(tiles)
         detail = f"{len(failed_tiles)}/{len(tiles)} tiles failed: {redact_credentials(first_error)}"
         if failed_fraction > MAX_FAILED_TILE_FRACTION:
@@ -766,17 +1195,43 @@ async def _fetch_city_images(
         # genuine no-imagery — see download_mapillary_metadata_async.
         logger.warning(f"Continuing with {detail}; affected grid points marked REQUEST_FAILED")
 
+    # REASSEMBLE IN TILE ORDER, taking each tile from this run if it was fetched
+    # now and from its part file otherwise. This is the whole byte-identity
+    # mechanism: `gather` preserves argument order, so an uninterrupted run
+    # produces exactly this sequence, and concat + dedupe therefore see
+    # positionally identical input however the work was split across nights.
+    # See the tile-checkpoint section above.
+    results = []
+    for tile in tiles:
+        if tile in fetched:
+            # pop, so the only surviving reference is the one in `results` --
+            # otherwise this loop would double the resident census (issue #157).
+            results.append(fetched.pop(tile))
+        elif tile in done:
+            results.append(_checkpoint_frame_for_tile(checkpoint, *tile))
+        # else: it failed this run and no earlier one committed it. Already in
+        # failed_tiles, and the caller marks its points REQUEST_FAILED.
+
     raw_feature_count = sum(len(r) for r in results)
     census = concat_census(results)
-    # BOTH names have to go before the dedup copy: `settled` and `results` hold
-    # references to the same per-tile frames, so dropping either one alone frees
-    # nothing and leaves a third full census resident through dedupe_census.
-    del results, settled
+    # ALL THREE names have to go before the dedup copy: `settled`, `fetched` and
+    # `results` hold references to the same per-tile frames, so dropping fewer
+    # frees nothing and leaves a third full census resident through
+    # dedupe_census.
+    del results, settled, fetched
     census = dedupe_census(census)
 
     return {
         "census": census,
+        # THIS CALL's spend, for the additive (date, provider) ledger. A
+        # resumed night that reported the whole census here would charge the
+        # earlier night's tiles against today's budget gate (issue #239 got
+        # this backwards once).
         "api_requests": api_requests,
+        # The whole census's spend across every invocation, for the catalog
+        # row, which describes the collection rather than the process.
+        "api_requests_total": _census_requests_total(checkpoint, api_requests),
+        "checkpoint_path": checkpoint.path if checkpoint else None,
         "tiles": len(tiles),
         "raw_feature_count": raw_feature_count,
         # Summarized HERE, where the census is already in hand: the caller may
@@ -803,6 +1258,8 @@ async def download_mapillary_metadata_async(
     connection_limit: int = 5,
     request_timeout: float = 30,
     max_requests_per_minute: int = DEFAULT_TILE_REQUESTS_PER_MINUTE,
+    checkpoint_path: str | None = None,
+    checkpoint_channel: str | None = None,
 ) -> dict[str, Any]:
     """
     Fetch Mapillary pano metadata for a city and write it as a run csv.gz.
@@ -811,11 +1268,19 @@ async def download_mapillary_metadata_async(
     decides the output filename (skip policy and dated naming live in the
     CLI/scheduler layer, not here).
 
+    The checkpoint is the caller's to DISCARD, once the run row is committed.
+    Nothing here removes it: this function returns after writing the CSV, and
+    the caller still has stats, the runs row, the JSON and the diff to do — a
+    delete issued here would guarantee that a crash in that tail costs the
+    whole census again, which is one of the interruptions #256 exists to cover.
+
     Returns:
         Dict with:
             df: DataFrame containing the metadata (METADATA_DTYPES schema)
             filename_with_path: the written .csv.gz path
             api_requests: number of tile requests issued this call
+            api_requests_total: the census's spend across every invocation
+            checkpoint_path: the checkpoint to discard, or None
             started_at / finished_at: UTC ISO 8601 timestamps
     """
     started_at = datetime.now(UTC).isoformat()
@@ -837,8 +1302,11 @@ async def download_mapillary_metadata_async(
         connection_limit=connection_limit,
         request_timeout=request_timeout,
         max_requests_per_minute=max_requests_per_minute,
+        checkpoint_path=checkpoint_path,
+        checkpoint_channel=checkpoint_channel,
     )
     api_requests = fetched["api_requests"]
+    api_requests_total = fetched["api_requests_total"]
     failed_tiles = fetched.get("failed_tiles") or []
     # Counted by the fetch, not recomputed here: binding the census to a local
     # would pin the whole thing (19M rows at Detroit) alive through both CSV
@@ -852,28 +1320,41 @@ async def download_mapillary_metadata_async(
         f"from {fetched['tiles']} tiles"
     )
 
-    written = census_core.write_census_grid_run(
-        fetched,
-        grid,
-        output_csv_gz_path,
-        query_timestamp,
-        capture_dates_for=_mapillary_capture_dates,
-        image_columns=_mapillary_image_columns,
-        dtypes=MAPILLARY_METADATA_DTYPES,
-        # A tile that never downloaded leaves its grid points UNKNOWN rather
-        # than empty (issue #168); a clean fetch passes None and pays nothing.
-        unmeasured_mask=(
-            (lambda lats, lons: _points_in_tiles(lats, lons, failed_tiles))
-            if failed_tiles
-            else None
-        ),
-        unmeasured_desc=f"{len(failed_tiles)} undownloaded tile(s)",
-    )
+    # The tail is wrapped because the checkpoint changes what a crash HERE
+    # costs. Without one, a failure after the fetch loses the spend with the
+    # process and the caller records what the exception carries. With one, the
+    # next invocation re-finalizes from disk for ~0 requests — so a tail failure
+    # that carried no spend would land this census's tiles in no ledger, ever
+    # (the same gap PR #251 closed for KartaView).
+    try:
+        written = census_core.write_census_grid_run(
+            fetched,
+            grid,
+            output_csv_gz_path,
+            query_timestamp,
+            capture_dates_for=_mapillary_capture_dates,
+            image_columns=_mapillary_image_columns,
+            dtypes=MAPILLARY_METADATA_DTYPES,
+            # A tile that never downloaded leaves its grid points UNKNOWN rather
+            # than empty (issue #168); a clean fetch passes None and pays nothing.
+            unmeasured_mask=(
+                (lambda lats, lons: _points_in_tiles(lats, lons, failed_tiles))
+                if failed_tiles
+                else None
+            ),
+            unmeasured_desc=f"{len(failed_tiles)} undownloaded tile(s)",
+        )
+    except BaseException as e:
+        e.api_requests = api_requests
+        e.api_requests_total = api_requests_total
+        raise
 
     return {
         "df": written["df"],
         "filename_with_path": output_csv_gz_path,
         "api_requests": api_requests,
+        "api_requests_total": api_requests_total,
+        "checkpoint_path": fetched.get("checkpoint_path"),
         # Census magnitude of flat imagery (issue #116): every in-grid flat
         # image, including those at points that also hold a pano. Not
         # reconstructable from the CSV (flat-only points collapse to one

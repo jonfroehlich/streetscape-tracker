@@ -95,9 +95,18 @@ def _setup(tmp_path, monkeypatch, images):
     async def fake_fetch_images(city_name, bbox, access_token, **kwargs):
         assert access_token == "MLY|TESTTOKEN"  # the streets token, not the grid one
         calls["n"] += 1
+        calls["checkpoint_path"] = kwargs.get("checkpoint_path")
+        calls["checkpoint_channel"] = kwargs.get("checkpoint_channel")
         return {
             "census": records_to_census(images),
+            # Per-process spend and the crawl's cumulative spend are different
+            # numbers by design (#256): the first feeds the additive daily
+            # ledger, the second the street_walks row. Equal here because this
+            # fake never resumes; test_streetwalk_mapillary_resume drives them
+            # apart.
             "api_requests": 7,
+            "api_requests_total": 7,
+            "checkpoint_path": kwargs.get("checkpoint_path"),
             "tiles": 7,
             "raw_feature_count": len(images),
         }

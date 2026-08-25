@@ -49,6 +49,7 @@ from . import (
     open_in_browser,
 )
 from .analysis import calculate_run_stats, detect_systemic_failure, print_df_summary
+from .checkpointing import checkpoint_path_for, discard_checkpoint
 from .city_registration import (
     CityResolutionError,
     cap_dimensions,
@@ -67,8 +68,6 @@ from .download_kartaview import (
     DEFAULT_REQUEST_TIMEOUT_S,
     DEFAULT_SWEEP_REQUESTS_PER_MINUTE,
     SweepIncompleteError,
-    checkpoint_path_for,
-    discard_checkpoint,
 )
 from .download_mapillary import DEFAULT_TILE_REQUESTS_PER_MINUTE
 from .fileutils import load_city_csv_file
@@ -747,6 +746,27 @@ async def _collect_one_run(conn, args, city_row, run_date, provider, config, vis
     if request_timeout is None:
         request_timeout = DEFAULT_REQUEST_TIMEOUT_S if provider == "kartaview" else 30.0
 
+    # Built HERE rather than inside a downloader because it is keyed on the
+    # CHANNEL, and only the caller knows which channel it is: a road walk
+    # sweeps the same frozen bbox with the same geometry, so a path derived
+    # from the geometry alone would let a grid run and a walk resume each
+    # other's crawl -- under different ledgers, and for Mapillary under
+    # different credentials (#239, #256). GSV resumes through a `.downloading`
+    # sibling of its output instead and needs nothing here.
+    checkpoint_path = None
+    if provider in ("mapillary", "kartaview"):
+        checkpoint_path = checkpoint_path_for(
+            city_row.city_id,
+            grid_bbox(
+                city_row.center_lat,
+                city_row.center_lon,
+                city_row.grid_width_m,
+                city_row.grid_height_m,
+                city_row.step_m,
+            ),
+            provider,
+        )
+
     try:
         if provider == "mapillary":
             dict_results = await download_mapillary_metadata_async(
@@ -760,25 +780,14 @@ async def _collect_one_run(conn, args, city_row, run_date, provider, config, vis
                 output_csv_gz_path=output_csv_gz_path,
                 request_timeout=request_timeout,
                 max_requests_per_minute=args.mapillary_max_requests_per_minute,
+                checkpoint_path=checkpoint_path,
+                # The channel again, this time INSIDE the commit record: the
+                # path separates channels only as long as every caller derives
+                # it correctly, so the state file also records which ledger its
+                # spend belongs to and refuses to resume another's.
+                checkpoint_channel=provider,
             )
         elif provider == "kartaview":
-            # The checkpoint path is built HERE rather than inside the
-            # downloader because it is keyed on the CHANNEL, and only the
-            # caller knows which channel it is: a KartaView road walk sweeps
-            # the same frozen bbox at the same radius, so a path derived from
-            # the geometry alone would let the two resume each other's sweeps
-            # under different credentials and different ledgers (#239).
-            checkpoint_path = checkpoint_path_for(
-                city_row.city_id,
-                grid_bbox(
-                    city_row.center_lat,
-                    city_row.center_lon,
-                    city_row.grid_width_m,
-                    city_row.grid_height_m,
-                    city_row.step_m,
-                ),
-                provider,
-            )
             dict_results = await download_kartaview_metadata_async(
                 city_name=city_row.display_name,
                 center_lat=city_row.center_lat,
@@ -888,16 +897,16 @@ async def _collect_one_run(conn, args, city_row, run_date, provider, config, vis
         started_at=started,
         finished_at=finished,
         duration_seconds=duration,
-        # The SWEEP's cost, not this process's: the row describes the run, so
-        # it must say what the run cost, while db.add_api_usage above is fed
+        # The COLLECTION's cost, not this process's: the row describes the run,
+        # so it must say what the run cost, while db.add_api_usage above is fed
         # the per-process figure because it is additive and keyed by (date,
         # provider) -- charging it the cumulative total would bill last
-        # night's requests against tonight's budget gate a second time. Only
-        # KartaView publishes the cumulative figure (#239); the fallback is
-        # exact for Mapillary (always one process) but UNDER-counts a GSV run
-        # resumed via its .downloading sibling, whose earlier processes' spend
-        # is recorded only in api_usage -- a pre-existing limitation of that
-        # checkpoint, noted rather than fixed here.
+        # night's requests against tonight's budget gate a second time. Both
+        # census providers publish the cumulative figure (#239, #256); the
+        # fallback UNDER-counts a GSV run resumed via its .downloading sibling,
+        # whose earlier processes' spend is recorded only in api_usage -- a
+        # pre-existing limitation of that checkpoint, noted rather than fixed
+        # here.
         api_requests=dict_results.get("api_requests_total", dict_results["api_requests"]),
         # Flat-image census (issue #116) is a Mapillary downloader artifact,
         # not derivable from the CSV — GSV runs omit it (stored NULL).
@@ -905,13 +914,13 @@ async def _collect_one_run(conn, args, city_row, run_date, provider, config, vis
         **stats,
     )
 
-    # Only now is the KartaView checkpoint spent: the runs row is committed, so
-    # the sweep's cost is durable in the catalog and every recovery path is
+    # Only now is the checkpoint spent: the runs row is committed, so the
+    # collection's cost is durable in the catalog and every recovery path is
     # cheap (a lost diff/JSON below regenerates from the CSV; a crash BEFORE
     # this line leaves an orphan CSV whose "delete it and re-run" remedy
     # re-finalizes from the checkpoint for ~0 requests). Discarding it inside
     # the downloader — before this row existed — made a register_run failure
-    # cost the whole multi-night sweep again (PR #251 review). Best effort by
+    # cost the whole multi-night crawl again (PR #251 review). Best effort by
     # discard_checkpoint's own contract: an unremovable checkpoint never fails
     # a run that succeeded.
     if dict_results.get("checkpoint_path"):

@@ -220,14 +220,17 @@ def _isolate_host_locks(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _isolate_kartaview_checkpoints(tmp_path, monkeypatch):
+def _isolate_checkpoints(tmp_path, monkeypatch):
     """
-    Point KartaView sweep checkpoints (issue #239) at a per-test directory.
+    Point crawl checkpoints at a per-test directory.
+
+    Both census providers checkpoint — KartaView's radius sweep (#239) and
+    Mapillary's tile census (#256) — through one ``STREETSCAPE_CHECKPOINT_DIR``.
 
     ``checkpoint_dir()`` defaults to a ``checkpoints/`` sibling of the project
-    root, so without this any test that drives the CLI's kartaview path would
-    write fixture-sized checkpoint directories into the working tree — the same
-    mistake the catalog backup made with ``logs/`` before #145 grew its own
+    root, so without this any test that drives a census provider's CLI path
+    would write fixture-sized checkpoint directories into the working tree — the
+    same mistake the catalog backup made with ``logs/`` before #145 grew its own
     autouse stub.
 
     Worse than untidy, it would also make tests share state: the path key is
@@ -235,9 +238,9 @@ def _isolate_kartaview_checkpoints(tmp_path, monkeypatch):
     tests using one fixture city would resume each other's half-swept lattice.
     ``tmp_path`` is per-test, which is what rules that out.
     """
-    from streetscape_metadata_tracker import download_kartaview as dk
+    from streetscape_metadata_tracker import checkpointing
 
-    monkeypatch.setenv(dk.CHECKPOINT_DIR_ENV, str(tmp_path / "checkpoints"))
+    monkeypatch.setenv(checkpointing.CHECKPOINT_DIR_ENV, str(tmp_path / "checkpoints"))
 
 
 @pytest.fixture(autouse=True)

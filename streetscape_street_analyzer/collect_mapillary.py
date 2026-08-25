@@ -238,6 +238,8 @@ async def collect_mapillary_street_samples_async(
     connection_limit: int = 5,
     request_timeout: float = 30,
     max_requests_per_minute: int = DEFAULT_TILE_REQUESTS_PER_MINUTE,
+    checkpoint_path: str | None = None,
+    checkpoint_channel: str | None = None,
 ) -> dict[str, Any]:
     """
     Collect Mapillary street samples for a city and write the snapshot csv.gz.
@@ -245,7 +247,10 @@ async def collect_mapillary_street_samples_async(
     Returns the same contract as ``download_gsv.collect_points_async`` (``df``,
     ``filename_with_path``, ``api_requests``, ``started_at``, ``finished_at``)
     plus ``num_flat_images``, so ``collect.py`` treats both providers
-    identically after the download step.
+    identically after the download step — and, when checkpointing is on,
+    ``api_requests_total`` (the census's spend across resumes, for the
+    ``street_walks`` row) and ``checkpoint_path`` (the caller's to discard
+    once that row is committed).
 
     The census is fetched over the city's **frozen grid bbox** — the same
     footprint the Mapillary grid run uses — so a street walk can never reach
@@ -266,6 +271,8 @@ async def collect_mapillary_street_samples_async(
         connection_limit=connection_limit,
         request_timeout=request_timeout,
         max_requests_per_minute=max_requests_per_minute,
+        checkpoint_path=checkpoint_path,
+        checkpoint_channel=checkpoint_channel,
     )
     # pop, not [] — `fetched` is a live local until this function returns, so
     # indexing it would keep the whole census resident past the `del` below,
@@ -295,7 +302,11 @@ async def collect_mapillary_street_samples_async(
     return {
         "df": df,
         "filename_with_path": output_csv_gz_path,
+        # This process's spend, for the additive daily ledger; the cumulative
+        # figure below is for the street_walks row (#239's rule, #256's census).
         "api_requests": fetched["api_requests"],
+        "api_requests_total": fetched["api_requests_total"],
+        "checkpoint_path": fetched.get("checkpoint_path"),
         "num_flat_images": num_flat_images,
         "started_at": started_at,
         "finished_at": datetime.now(UTC).isoformat(),
