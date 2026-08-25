@@ -177,8 +177,11 @@ This is what turns the whole-catalog pass the cost study calls "not affordable y
 — and is a ~60-line twin of Mapillary's, with the three provider bindings (`_kartaview_capture_dates`, `_kartaview_image_columns`, `KARTAVIEW_METADATA_DTYPES`) being the whole of what differs.
 `naming.KNOWN_PROVIDERS` carries the token, so `PROVIDER_RUN_DTYPES["kartaview"]` is finally reachable and a run reads with its own schema instead of inferring `sequence_index` to float64 and `way_id` to a float;
 `streetscape_tracker.py --provider kartaview` collects a city.
-**`--provider both` still means gsv+mapillary and does NOT include KartaView**
-— a 16 req/min serial sweep is hours for a metro and must never be something you get by typing nothing (issue #247 renames it `--provider all`).
+**KartaView is never in the default channel set**
+— a 16 req/min serial sweep is hours for a metro and must never be something you get by typing nothing.
+`--provider` is a comma-separated LIST whose default is the stated `gsv,mapillary` (issue #247), so KartaView is reached only by naming it or by `--provider all`, which expands from `naming.KNOWN_PROVIDERS` and fails fast if any named provider's credential is absent.
+The retired `both` still works, with a deprecation notice: it named two of two when it was written and names two of three now, which is precisely why redefining it in place was refused
+— every bare `streetscape_tracker.py "City"` would have silently acquired both a third mandatory credential and the sweep.
 `cli.py` owns the checkpoint lifecycle end to end: it builds the date-free, channel-scoped path (`checkpoint_path_for`, under the gitignored `checkpoints/` sibling, realpath'd for the same reason `host_lock.lock_dir` is), and it calls `discard_checkpoint` **last, after `register_run` commits the runs row**
 — the wrapper only echoes the path back, because a discard inside the downloader ran before that row existed, so a `register_run` failure cost the whole multi-night sweep (PR #251 review finding 2);
 deleting any earlier is what would make a crash in the tail re-pay it.

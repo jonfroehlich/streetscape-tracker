@@ -2,12 +2,14 @@
 Command-line interface for the GSV Metadata Tracker tool.
 
 Each invocation collects one dated snapshot ("run") of a city per imagery
-provider — by default BOTH GSV and Mapillary, back-to-back with the same
-run date, so the two series stay in sync (--provider gsv|mapillary
-restricts to one). Runs are cataloged in a SQLite database (see db.py); a
-city's grid geometry is frozen in the catalog at first registration so
-that all future runs sample the exact same grid and run-to-run diffs are
-meaningful.
+provider named by --provider, a comma-separated channel LIST defaulting to
+`gsv,mapillary` (issue #247). The named providers run back-to-back with the
+same run date, so their series stay in sync; `--provider all` collects every
+naming.KNOWN_PROVIDERS member and is never the default, because a KartaView
+sweep is hours of serial wall-clock for a metro. Runs are cataloged in a
+SQLite database (see db.py); a city's grid geometry is frozen in the catalog
+at first registration so that all future runs sample the exact same grid and
+run-to-run diffs are meaningful.
 
 Skip policy (per provider): if the provider's latest run is newer than
 --min-days-since-last-run days, that provider is skipped without
@@ -99,6 +101,90 @@ def _positive_int(value: str) -> int:
     return number
 
 
+# The default channel set. Stating it beats a keyword whose meaning drifts with
+# the provider count: `both` named two of two when it was written and names two
+# of THREE today (issue #247), so redefining it in place would have added
+# KartaView's mandatory credential and its hours-long serial sweep to every bare
+# `streetscape_tracker.py "City"`.
+#
+# The tuple is the source of truth and the argv spelling is DERIVED from it. The
+# reverse — one string, split back apart wherever a list is needed — was a
+# measured trap, not a hypothetical one: this constant is also help text, so
+# reformatting it to the more readable "gsv, mapillary" is an ordinary edit, and
+# the one consumer that split it without stripping resolved `--provider both` to
+# ['gsv'] and exited 0 under exactly that edit (PR #263 review).
+DEFAULT_PROVIDERS: tuple[str, ...] = ("gsv", "mapillary")
+DEFAULT_PROVIDERS_ARG = ",".join(DEFAULT_PROVIDERS)
+
+# Retired spelling of DEFAULT_PROVIDERS, still accepted. Cron entries, shell
+# history and `run_cities.py` pass-through arguments must not break over a
+# rename; it warns and expands to exactly what it always meant.
+_LEGACY_PROVIDER_ALIAS = "both"
+
+
+def _parse_provider_list(value: str) -> list[str]:
+    """
+    argparse type for `--provider`: a comma-separated channel list (issue #247).
+
+    Accepts any mix of provider names, the keyword `all` (every member of
+    ``naming.KNOWN_PROVIDERS``) and the deprecated `both`. Returns the selection
+    ordered by KNOWN_PROVIDERS rather than by what was typed, and with
+    duplicates collapsed, so `--provider mapillary,gsv` and `--provider gsv`
+    twice both behave — mirroring ``scheduler._select_providers``, which filters
+    out of ``enabled_providers()`` for the same reason.
+
+    `all` is derived from the naming contract, never restated, so a fourth
+    provider joining KNOWN_PROVIDERS cannot be silently OMITTED from `all` the
+    way KartaView would have been silently INCLUDED in a redefined `both`. That
+    cuts both ways, which is the cost of deriving it: `all` also NAMES a token
+    the rest of the CLI may not yet be able to collect, without anyone typing
+    it. Selecting a provider is not the same as supporting one — that still
+    takes a ``config.load_config`` arm and a ``_collect_one_run`` dispatch arm —
+    so the dispatch refuses an unknown token rather than falling through to GSV,
+    and ``test_every_known_provider_reaches_its_own_downloader`` asserts set
+    equality against KNOWN_PROVIDERS so the gap cannot open quietly.
+
+    `all` is deliberately never the default — a KartaView sweep is paced at 16
+    requests/minute and serial, so a metro is hours of wall-clock, and nobody
+    should get that by typing nothing.
+
+    An empty selection is refused rather than returned. `--provider ""` and
+    `--provider ,` are both reachable (argparse hands the type function whatever
+    string it was given), and falling through with an empty list would collect
+    nothing while exiting 0 — the zero-channel no-op ``_select_providers``
+    refuses for the scheduler.
+    """
+    names = [n.strip() for n in value.split(",") if n.strip()]
+    if not names:
+        raise argparse.ArgumentTypeError(
+            f"no channel named (got {value!r}); expected one or more of "
+            f"{', '.join(KNOWN_PROVIDERS)}, or 'all'"
+        )
+    selected: set[str] = set()
+    for name in names:
+        if name == "all":
+            selected.update(KNOWN_PROVIDERS)
+        elif name == _LEGACY_PROVIDER_ALIAS:
+            # Parse time is before logging is configured (see main()), so this
+            # goes straight to stderr rather than through the logger.
+            print(
+                f"warning: --provider {_LEGACY_PROVIDER_ALIAS} is deprecated and now "
+                f"names two of {len(KNOWN_PROVIDERS)} providers; it still means "
+                f"'{DEFAULT_PROVIDERS_ARG}'. Use --provider {DEFAULT_PROVIDERS_ARG} "
+                f"(the default), or --provider all for every provider.",
+                file=sys.stderr,
+            )
+            selected.update(DEFAULT_PROVIDERS)
+        elif name in KNOWN_PROVIDERS:
+            selected.add(name)
+        else:
+            raise argparse.ArgumentTypeError(
+                f"unknown provider {name!r}; expected one or more of "
+                f"{', '.join(KNOWN_PROVIDERS)}, or 'all'"
+            )
+    return [p for p in KNOWN_PROVIDERS if p in selected]
+
+
 def parse_args():
     """
     Parse and validate command line arguments.
@@ -126,21 +212,39 @@ def parse_args():
 
     parser.add_argument(
         "--provider",
-        # Built from the naming contract rather than restated: a provider that
-        # joins KNOWN_PROVIDERS is collectable here without a second edit, and
-        # a hand-kept list is the kind that drifts one provider behind.
-        choices=["both", *KNOWN_PROVIDERS],
-        default="both",
-        help="Imagery provider(s) to collect. Each provider keeps its own "
-        "independent run series (dated files, diffs, skip policy) on the "
-        "same frozen city grid. 'both' means GSV then Mapillary "
-        "back-to-back with the same run date so those two series stay in "
-        "sync — it does NOT include KartaView, which must be asked for by "
-        "name (see issue #247 on renaming this to --provider all). "
-        "KartaView is deliberately opt-in: its sweep is paced at "
+        # Selectable from the naming contract rather than from a hand-kept list,
+        # which is the kind that drifts one provider behind. Selectable is all it
+        # is, though: a provider that joins KNOWN_PROVIDERS is nameable here at
+        # once, and still needs a `load_config` arm and a `_collect_one_run`
+        # dispatch arm before it can COLLECT. `all` makes that gap reachable
+        # without anyone typing the new token, so
+        # test_every_known_provider_reaches_its_own_downloader pins it shut.
+        #
+        # The default is the STRING spelling, not the tuple, on purpose:
+        # argparse runs `type` only over a string default and passes anything
+        # else straight through, so this is what makes args.provider a parsed
+        # channel list when nobody types the flag — while
+        # ArgumentDefaultsHelpFormatter still renders the default as the list an
+        # operator would type. Load-bearing and invisible, so
+        # test_omitting_provider_runs_the_type_function_over_the_default pins it.
+        # (Comma-separated only, not also repeatable like `scheduler run-due
+        # --provider`: argparse's append action cannot carry a displayable
+        # default without the shared-mutable-default trap, and the comma form
+        # covers every use.)
+        type=_parse_provider_list,
+        default=DEFAULT_PROVIDERS_ARG,
+        metavar="LIST",
+        help="Comma-separated imagery provider(s) to collect: "
+        f"{', '.join(KNOWN_PROVIDERS)}, or 'all' for every one of them. Each "
+        "provider keeps its own independent run series (dated files, diffs, "
+        "skip policy) on the same frozen city grid, and the providers named "
+        "here run back-to-back with the same run date so their series stay in "
+        "sync. The default does NOT include KartaView, which must be asked for "
+        "by name or via 'all': its sweep is paced at "
         f"{DEFAULT_SWEEP_REQUESTS_PER_MINUTE} requests/minute and serial, so "
         "a large city is hours of wall-clock and should never be something "
-        "you get by typing nothing.",
+        "you get by typing nothing. The retired spelling 'both' is still "
+        "accepted, with a warning.",
     )
 
     parser.add_argument(
@@ -451,20 +555,32 @@ async def async_main():
     run_date = args.run_date or datetime.now(UTC).date()
     db_path = args.db_path or db.get_default_db_path(args.download_dir)
 
-    providers = ["gsv", "mapillary"] if args.provider == "both" else [args.provider]
+    # Already a validated, canonically ordered, non-empty channel list — the
+    # expansion of `all`, `both` and the comma form all happened in
+    # _parse_provider_list, at parse time, before anything was spent.
+    providers = args.provider
 
     try:
-        # Fail fast: require every requested provider's credential before
-        # any downloading, so a missing key can't leave the series unpaired
-        configs = {provider: load_config(provider) for provider in providers}
         conn = db.connect(db_path)
 
         vis_path = get_default_vis_dir()
         os.makedirs(vis_path, exist_ok=True)
 
-        # Boundary preview: geocode + visualize, but don't register or download
+        # Boundary preview: geocode + visualize, but don't register or download.
+        # It returns BEFORE the credential check below, because it contacts no
+        # provider API at all — only Nominatim. Behind that check, previewing a
+        # search area needed every named provider's key, so `--provider all
+        # --check-boundary` demanded three credentials to draw a rectangle
+        # (PR #263 review) — a barrier with nothing on the other side of it.
         if args.check_boundary:
             return _check_boundary(conn, args, vis_path)
+
+        # Fail fast: require every requested provider's credential before any
+        # downloading, so a missing key can't leave the series unpaired. This
+        # applies to `--provider all` too, deliberately: `all` means all, and a
+        # host missing one provider's key should be told so rather than quietly
+        # collecting a subset — the escape hatch is naming the list instead.
+        configs = {provider: load_config(provider) for provider in providers}
 
         city_row, newly_registered = _resolve_geometry(conn, args)
 
@@ -682,7 +798,7 @@ async def _collect_one_run(conn, args, city_row, run_date, provider, config, vis
                 # ledger its spend belongs to and refuses to resume another's.
                 checkpoint_channel=provider,
             )
-        else:
+        elif provider == "gsv":
             logging.info(
                 f"Using batch_size={args.batch_size}, connection_limit={args.connection_limit}, "
                 f"max_requests_per_minute={args.max_requests_per_minute}"
@@ -700,6 +816,22 @@ async def _collect_one_run(conn, args, city_row, run_date, provider, config, vis
                 connection_limit=args.connection_limit,
                 request_timeout=request_timeout,
                 max_requests_per_minute=args.max_requests_per_minute,
+            )
+        else:
+            # GSV used to be the `else`, which made this dispatch fail OPEN: a
+            # provider added to naming.KNOWN_PROVIDERS but not wired here would
+            # collect as GSV — a Google-keyed grid sweep written into a file
+            # named for the new provider, cataloged, diffed and published as
+            # that provider's series, in an immutable dated snapshot. Nobody had
+            # to type the new token to reach it either, since `--provider all`
+            # expands from KNOWN_PROVIDERS (PR #263 review). Refused instead, and
+            # test_every_known_provider_reaches_its_own_downloader asserts set
+            # equality so the branch stays unreachable in practice.
+            raise ValueError(
+                f"No downloader is wired for provider {provider!r}. It is in "
+                f"naming.KNOWN_PROVIDERS (so --provider names it, and "
+                f"--provider all selects it) but _collect_one_run has no arm "
+                f"for it."
             )
     except Exception as e:
         # Failed downloads still spent real (budgeted, possibly billable)
