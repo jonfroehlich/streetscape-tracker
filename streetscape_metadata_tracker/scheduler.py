@@ -810,6 +810,27 @@ def _mapillary_timeout_seconds(
     return int(max(floor, paced_seconds * _TIMEOUT_HEADROOM + _TIMEOUT_FIXED_SLACK_S))
 
 
+def _channel_estimate(cfg: SchedulerConfig, city: db.CityRow, provider: str, conn=None) -> int:
+    """Price one channel's request count — the ONE derivation, for every caller.
+
+    ``estimate_requests`` needs a channel's ``spacing_m``/``network_type`` out of
+    config, and how you reach for them is where two copies drift. They already
+    had: the lane launch site indexed ``cfg.providers[provider]`` directly while
+    ``_run_one_city``'s fallback tolerated a missing entry via
+    ``ProviderConfig()``, so a channel enabled without its own ``[providers.*]``
+    block priced fine on one path and raised ``KeyError`` on the other. Only the
+    launch site runs in production, which is exactly why no test noticed.
+
+    The tolerant lookup is the one kept, because ``city_timeout_seconds`` already
+    makes it — the timeout and the estimate must not disagree about what a
+    missing provider block means.
+    """
+    pc = (cfg.providers or {}).get(provider) or ProviderConfig()
+    return estimate_requests(
+        city, provider, conn=conn, spacing_m=pc.spacing_m, network_type=pc.network_type
+    )
+
+
 def city_timeout_seconds(
     cfg: SchedulerConfig,
     city: db.CityRow,
@@ -2400,11 +2421,8 @@ def _run_one_city(
 
     if is_street_channel(provider):
         cmd = _street_collect_cmd(cfg, city, today, provider, conn_limit, daily_budget)
-        pc = (cfg.providers or {}).get(provider) or ProviderConfig()
         estimated = (
-            estimate_requests(
-                city, provider, conn=conn, spacing_m=pc.spacing_m, network_type=pc.network_type
-            )
+            _channel_estimate(cfg, city, provider, conn)
             if estimated_requests is None
             else estimated_requests
         )
@@ -2463,7 +2481,7 @@ def _run_one_city(
     # '--' so a display name can never be parsed as a flag
     cmd += ["--", city.display_name]
     estimated = (
-        estimate_requests(city, provider) if estimated_requests is None else estimated_requests
+        _channel_estimate(cfg, city, provider) if estimated_requests is None else estimated_requests
     )
     logger.info(f"Collecting {city.city_id} [{provider}] (~{estimated:,} requests estimated)")
     logger.debug(f"Command: {' '.join(cmd)}")
@@ -3037,6 +3055,29 @@ def cmd_run_due(
     )
 
 
+def _log_channel_error(city_id: str, provider: str, exc: BaseException) -> None:
+    """Write one channel's unhandled exception to the log, come what may.
+
+    EVERY exception gets a line, not only the first one ``_run_city_channels``
+    keeps to re-raise. At more than one lane two channels can fail for unrelated
+    reasons in the same completion pass, and only one of them can be the
+    exception that propagates; the ``[alerts]`` email carries just this log's
+    tail, so a cause not written here is unrecoverable — the same
+    "``collection failed`` with no cause" hole the per-attempt child logs were
+    added to close.
+
+    Suppressed rather than allowed to raise because this sits ON the path that
+    salvages the other channels' outcomes, and a dead output pipe raises
+    ``BrokenPipeError`` out of logging itself — which is one of the ways
+    classification fails on this thread in the first place. Losing a log line is
+    bad; losing a paid-for channel's ``record_attempt`` because the log line
+    failed is worse. ``logger.exception`` reads the live exception state, so the
+    traceback is the caller's even though the call is here.
+    """
+    with contextlib.suppress(Exception):
+        logger.exception(f"{city_id} [{provider}]: channel raised {exc!r}")
+
+
 def _log_stop_declined(city_id: str, declined: list[str]) -> None:
     """Name the channels a wind-down is choosing not to start (issue #206).
 
@@ -3151,6 +3192,32 @@ def _run_city_channels(
     """
     attempted = succeeded = skipped_budget = 0
     lanes = max(1, cfg.max_concurrent_channels)
+    # `connection_limit` is a HOST budget, so it is divided across lanes rather
+    # than handed to each child whole. The resource guard reads host-wide
+    # pressure (MemAvailable, load5) and only ever LOWERS its answer — but it is
+    # consulted once per child, from a sample taken before that child's siblings
+    # have ramped, so at N lanes each of them reads a quiet box and each takes
+    # the full limit. The guard structurally cannot see the load it is about to
+    # permit.
+    #
+    # What that costs is not uniform, because only three channels carry this
+    # number at all: the gsv grid (download_gsv's TCPConnector), the gsv road
+    # walk (the same engine) and the Mapillary road walk. The Mapillary GRID
+    # never receives it — cli.py's branch omits the argument, so
+    # fetch_city_images_async's own default of 5 applies. Combined with affinity
+    # (mapillary/mapillary_streets share the tile CDN, gsv_streets/
+    # mapillary_streets share Overpass), the only overlapping pair that points
+    # two full-size connectors at ONE third party is gsv + gsv_streets, both of
+    # which are Google: prod's 50 becomes 100 sockets on the endpoints whose
+    # per-project metering is already the second gate on raising this knob.
+    #
+    # Exactly `cfg.connection_limit` at one lane, so the shipped default path is
+    # unchanged. This is the CONSERVATIVE direction and not the free one: a city
+    # with a single enabled channel gets the divided share too, though it has no
+    # sibling to share with. Raising `[download].connection_limit` alongside the
+    # knob is a deliberate decision with a measurement behind it; multiplying it
+    # silently is not.
+    lane_connection_limit = max(1, cfg.connection_limit // lanes)
     # Channels not yet launched, in canonical (most-expensive-first) order. A
     # channel LEAVES this list the moment it is launched or finally skipped, so
     # whatever remains at the end is exactly the set nothing was ever asked of —
@@ -3166,6 +3233,17 @@ def _run_city_channels(
     # anything that substitutes _run_one_city (the catalog handle is
     # check_same_thread=True, so a pool would break test fakes and any future
     # caller that reaches for it).
+    #
+    # Per CITY rather than hoisted to the batch, deliberately. A 20-city night
+    # therefore builds and joins 20 pools, which is microseconds against
+    # subprocess-bound work — and what it buys is that `shutdown(wait=True)`
+    # below makes "no child outlives its city" structural rather than a property
+    # of the loop being written correctly. Everything this function hands back or
+    # mutates is reasoned per city: `blocked_hosts` and `busy_hosts` are read by
+    # the NEXT city's submit gates, and the streetwalks.json.gz writer ordering
+    # assumes at most one street child alive at a time. A pool shared across
+    # cities would let a straggler from city A be alive during city B, and
+    # nothing in either contract would notice.
     pool = (
         concurrent.futures.ThreadPoolExecutor(max_workers=lanes, thread_name_prefix="channel")
         if lanes > 1
@@ -3237,88 +3315,96 @@ def _run_city_channels(
 
                     pending.remove(provider)
 
-                    # A host this channel needs already refused us during this
-                    # run. A final skip (not a deferral): the other channels of
-                    # this and later cities are still worth running. Deliberately
-                    # BEFORE the budget checks — there is no point pricing work
-                    # we already know we will not do.
-                    unavailable = blocked_hosts.intersection(CHANNEL_HOSTS.get(provider, ()))
-                    if unavailable:
-                        logger.info(
-                            f"{city.city_id} [{provider}]: skipping — "
-                            f"{_host_names(unavailable)} "
-                            f"already refused this host."
-                        )
-                        continue
+                    # Same contract as the completion pass: pricing a channel
+                    # touches the catalog (estimate_requests, get_api_usage,
+                    # city_timeout_seconds) and the log, so it can raise on this
+                    # thread while siblings are in flight. Stash, stop
+                    # launching, and let the drain below credit what was already
+                    # paid for, rather than propagating past a `finally` that
+                    # would only wait for those children and then discard them.
+                    try:
+                        # A host this channel needs already refused us during this
+                        # run. A final skip (not a deferral): the other channels of
+                        # this and later cities are still worth running. Deliberately
+                        # BEFORE the budget checks — there is no point pricing work
+                        # we already know we will not do.
+                        unavailable = blocked_hosts.intersection(CHANNEL_HOSTS.get(provider, ()))
+                        if unavailable:
+                            logger.info(
+                                f"{city.city_id} [{provider}]: skipping — "
+                                f"{_host_names(unavailable)} "
+                                f"already refused this host."
+                            )
+                            continue
 
-                    budget = cfg.providers[provider].daily_request_budget
-                    est = estimate_requests(
-                        city,
-                        provider,
-                        conn=conn,
-                        spacing_m=cfg.providers[provider].spacing_m,
-                        network_type=cfg.providers[provider].network_type,
-                    )
-                    if est > budget:
-                        # This city can NEVER fit the daily budget — skipping (not
-                        # ending the city) so it can't starve every smaller city
-                        # behind it in the stalest-first queue. Needs a manual run
-                        # or a config change; surfaced loudly so it doesn't rot
-                        # silently.
-                        logger.warning(
-                            f"{city.city_id} [{provider}]: ~{est:,} estimated requests "
-                            f"exceeds the entire daily budget ({budget:,}). "
-                            f"Skipping — run manually with streetscape_tracker.py --force, "
-                            f"raise daily_request_budget, or set enabled=0."
-                        )
-                        skipped_budget += 1
-                        continue
+                        budget = cfg.providers[provider].daily_request_budget
+                        est = _channel_estimate(cfg, city, provider, conn)
+                        if est > budget:
+                            # This city can NEVER fit the daily budget — skipping (not
+                            # ending the city) so it can't starve every smaller city
+                            # behind it in the stalest-first queue. Needs a manual run
+                            # or a config change; surfaced loudly so it doesn't rot
+                            # silently.
+                            logger.warning(
+                                f"{city.city_id} [{provider}]: ~{est:,} estimated requests "
+                                f"exceeds the entire daily budget ({budget:,}). "
+                                f"Skipping — run manually with streetscape_tracker.py --force, "
+                                f"raise daily_request_budget, or set enabled=0."
+                            )
+                            skipped_budget += 1
+                            continue
 
-                    used = db.get_api_usage(conn, today, provider)
-                    if used + est > budget:
-                        # Doesn't fit in what's LEFT today — try the next (smaller)
-                        # city rather than ending the day; this one rolls to tomorrow
-                        # when the budget is fresh.
-                        logger.info(
-                            f"{city.city_id} [{provider}] (~{est:,} req) doesn't fit "
-                            f"remaining budget ({budget - used:,} left); skipping."
-                        )
-                        skipped_budget += 1
-                        continue
+                        used = db.get_api_usage(conn, today, provider)
+                        if used + est > budget:
+                            # Doesn't fit in what's LEFT today — try the next (smaller)
+                            # city rather than ending the day; this one rolls to tomorrow
+                            # when the budget is fresh.
+                            logger.info(
+                                f"{city.city_id} [{provider}] (~{est:,} req) doesn't fit "
+                                f"remaining budget ({budget - used:,} left); skipping."
+                            )
+                            skipped_budget += 1
+                            continue
 
-                    conn_limit, throttle_reason = plan_connection_limit(
-                        cfg.connection_limit, read_system_pressure(), cfg.resource_guard
-                    )
-                    if throttle_reason:
-                        logger.info(
-                            f"Resource guard: {throttle_reason}; connection limit "
-                            f"{cfg.connection_limit} → {conn_limit} for {city.city_id} [{provider}]"
+                        conn_limit, throttle_reason = plan_connection_limit(
+                            lane_connection_limit, read_system_pressure(), cfg.resource_guard
                         )
-                    # Exactly one clock read per LAUNCHED channel, here, so the
-                    # deadline is priced by the thread that knows what the whole
-                    # batch is doing. Never let a child run past it; the point of
-                    # the deadline is to reserve time for the publish tail.
-                    remaining_s = (
-                        None if batch_deadline is None else batch_deadline - time.monotonic()
-                    )
-                    future = _start(
-                        provider,
-                        connection_limit=conn_limit,
-                        # The channel's FULL ceiling, not `budget - used`: the
-                        # street collector subtracts today's spend from this
-                        # itself, so passing the remainder would count it twice.
-                        daily_budget=budget,
-                        timeout_s=city_timeout_seconds(
-                            cfg, city, provider, conn=conn, remaining_s=remaining_s
-                        ),
-                        # The gate above already priced this channel; handing the
-                        # number down deletes the duplicate computation (and with
-                        # it the only other reason the child body would want the
-                        # catalog handle).
-                        estimated_requests=est,
-                    )
-                    in_flight[future] = provider
-                    hosts_in_flight.update(CHANNEL_HOSTS.get(provider, ()))
+                        if throttle_reason:
+                            logger.info(
+                                f"Resource guard: {throttle_reason}; connection limit "
+                                f"{lane_connection_limit} → {conn_limit} for "
+                                f"{city.city_id} [{provider}]"
+                            )
+                        # Exactly one clock read per LAUNCHED channel, here, so the
+                        # deadline is priced by the thread that knows what the whole
+                        # batch is doing. Never let a child run past it; the point of
+                        # the deadline is to reserve time for the publish tail.
+                        remaining_s = (
+                            None if batch_deadline is None else batch_deadline - time.monotonic()
+                        )
+                        future = _start(
+                            provider,
+                            connection_limit=conn_limit,
+                            # The channel's FULL ceiling, not `budget - used`: the
+                            # street collector subtracts today's spend from this
+                            # itself, so passing the remainder would count it twice.
+                            daily_budget=budget,
+                            timeout_s=city_timeout_seconds(
+                                cfg, city, provider, conn=conn, remaining_s=remaining_s
+                            ),
+                            # The gate above already priced this channel; handing the
+                            # number down deletes the duplicate computation (and with
+                            # it the only other reason the child body would want the
+                            # catalog handle).
+                            estimated_requests=est,
+                        )
+                        in_flight[future] = provider
+                        hosts_in_flight.update(CHANNEL_HOSTS.get(provider, ()))
+                    except BaseException as exc:
+                        _log_channel_error(city.city_id, provider, exc)
+                        if worker_error is None:
+                            worker_error = exc
+                        break
 
             # No-livelock invariant: an empty `in_flight` here means the pass
             # above ran with an empty `hosts_in_flight`, so nothing could have
@@ -3347,129 +3433,152 @@ def _run_city_channels(
             for future in sorted(done, key=lambda f: providers.index(in_flight[f])):
                 provider = in_flight.pop(future)
 
-                exc = future.exception()
-                if exc is not None:
-                    # Stash and keep draining: the siblings' work is already paid
-                    # for, so it still gets salvaged and recorded. Re-raised once
-                    # the city is quiet, which is what turns it into
-                    # _STOP_REASON_ERROR upstream — an unhealthy night that still
-                    # publishes what it collected (issue #167).
+                # One channel's outcome, classified in full or not at all.
+                # The `try` covers BOTH the worker's own exception and
+                # everything this thread then does with the result, because the
+                # two lose the same thing: a channel that already spent its
+                # crawl, whose outcome would otherwise never reach
+                # `record_attempt` or `blocked_hosts`. Before #240 that loss was
+                # impossible — one channel was in flight and it was classified
+                # before the next started — so with lanes the main thread needs
+                # the same drain-and-credit the worker path already had.
+                #
+                # Stash and keep draining: the siblings' work is already paid
+                # for, so it still gets salvaged and recorded. The launch pass
+                # is gated on `worker_error`, so nothing new starts and the
+                # `while` empties `in_flight` classifying what is left.
+                # Re-raised once the city is quiet, which is what turns it into
+                # _STOP_REASON_ERROR upstream — an unhealthy night that still
+                # publishes what it collected (issue #167).
+                try:
+                    exc = future.exception()
+                    if exc is not None:
+                        # Re-raised rather than handled here so a worker's
+                        # failure and this thread's own take the identical
+                        # logging and stashing path below.
+                        raise exc
+                    ok = future.result()
+
+                    # getattr, not attribute access: tests (and any future caller)
+                    # may hand back a plain bool, which CollectionOutcome is
+                    # deliberately compatible with.
+                    reason = getattr(ok, "reason", None)
+                    exit_code = getattr(ok, "exit_code", None)
+
+                    busy_host = HOST_BY_BUSY_EXIT_CODE.get(exit_code)
+                    if busy_host is not None:
+                        # Another process on this machine holds that host's lock.
+                        # Transient — it ends when that process does — so this skips
+                        # ONE channel of ONE city and does not trip the breaker.
+                        # Like a blocked skip it records no `record_attempt`: the
+                        # city didn't fail, we simply never asked it. _finish_batch
+                        # still alerts, so it cannot pass as a clean night.
+                        busy_hosts[busy_host] += 1
+                        logger.warning(
+                            f"{city.city_id} [{provider}]: {HOST_LABELS[busy_host]} is busy with "
+                            f"another process on this machine — skipping this channel. Not counted "
+                            f"as a failure for this city, and not a run-wide skip: the lock frees "
+                            f"when that process finishes. ({reason})"
+                        )
+                        continue
+
+                    blocked_host = HOST_BY_EXIT_CODE.get(exit_code)
+                    if blocked_host is not None:
+                        # A whole-host condition, so this is NOT the city's failure
+                        # and must not be recorded as one: get_due_cities filters on
+                        # `consecutive_failures < max_consecutive_failures` and
+                        # nothing in the codebase resets that counter except a
+                        # success, so a few blocked nights would quietly quarantine
+                        # a city for an entire cycle. It stays due and leads
+                        # tomorrow's stalest-first queue instead. _finish_batch
+                        # alerts on blocked_hosts, so this is loud, not silent.
+                        #
+                        # A sibling that needs the same host cannot already be in
+                        # flight — affinity forbids it — so it is still in `pending`
+                        # and hits the breaker at its own submit, exactly as it would
+                        # have with the channels run back-to-back.
+                        #
+                        # Skipping `_reconcile_orphaned_run`/`_reconcile_orphaned_walk`
+                        # is safe rather than incidental: every host-unavailable exit
+                        # happens before the child writes anything. Overpass is a road
+                        # walk's first step, and the tile census is a Mapillary run's
+                        # first step, so there is never a paid-for artifact to salvage
+                        # here. Keep that true if either fetch ever moves later.
+                        blocked_hosts.add(blocked_host)
+                        logger.error(
+                            f"{city.city_id} [{provider}]: {HOST_LABELS[blocked_host]} is "
+                            f"unavailable to this host — skipping its remaining channels. "
+                            f"Not counted as a failure for this city. ({reason})"
+                        )
+                        continue
+
+                    ok = bool(ok)
+                    # A subprocess can report failure yet still have done the expensive,
+                    # budgeted part of its job; salvage that rather than re-spending the
+                    # whole crawl next cycle. The two channel kinds fail differently: a
+                    # grid run commits its `runs` row before the diff/JSON tail, while a
+                    # road walk catalogs nothing until the very end and so is salvaged
+                    # from the artifacts it left on disk.
+                    if not ok:
+                        if is_street_channel(provider):
+                            ok = _reconcile_orphaned_walk(conn, cfg, city, provider, today)
+                        else:
+                            ok = _reconcile_orphaned_run(conn, cfg, city, provider, today)
+
+                    # This child died of the SIGTERM that is stopping US. The unit's
+                    # default KillMode is control-group, so a `systemctl stop` reaches
+                    # the whole cgroup — the 2026-08-13 log shows the in-flight child as
+                    # "exited -15", which is in neither HOST_BY_EXIT_CODE nor
+                    # HOST_BY_BUSY_EXIT_CODE and therefore reads as an ordinary
+                    # collection failure. Charging it to the city would be wrong twice
+                    # over, and both are the argument the blocked- and busy-host
+                    # branches above already make: it burns one of five
+                    # `consecutive_failures` that ONLY a success ever resets, and it
+                    # makes attempted > succeeded, so every deliberate stop would email
+                    # a failure alert and end the unit red (issue #206). With lanes the
+                    # cgroup kills every in-flight child at once, so this branch is now
+                    # reached once per lane rather than once per stop — the amnesty is
+                    # applied per result, which is why it lives here and not at the exit.
+                    #
+                    # Deliberately AFTER salvage, so anything the child actually finished
+                    # and left on disk is still cataloged — and BEFORE `attempted += 1`, so
+                    # a channel we killed is not counted as attempted at all, matching how
+                    # the two host branches `continue` before that same line.
+                    #
+                    # A child that failed for its own reasons AND was still running when the
+                    # stop arrived is credited to the stop. That is the safe direction and
+                    # the same call the busy-lock branch makes.
+                    if not ok and stop_requested is not None and stop_requested.is_set():
+                        logger.warning(
+                            f"{city.city_id} [{provider}]: child was killed by the stop "
+                            f"signal ({reason}) — not counted as a failure for this city."
+                        )
+                        # No `stopped = True` here: this branch is reachable only
+                        # when the event is already set, and nothing ever clears
+                        # it, so the submit gate sets the flag itself on the very
+                        # next pass. One writer, so a later edit cannot change the
+                        # gate's meaning in one place and not the other.
+                        continue
+
+                    attempted += 1
+                    if ok:
+                        succeeded += 1
+                        db.record_attempt(conn, city.city_id, success=True, provider=provider)
+                    else:
+                        if record_failures:
+                            db.record_attempt(
+                                conn,
+                                city.city_id,
+                                success=False,
+                                error=reason or f"subprocess failed on {today}",
+                                provider=provider,
+                            )
+                        logger.error(f"{city.city_id} [{provider}]: collection failed")
+                except BaseException as exc:
+                    _log_channel_error(city.city_id, provider, exc)
                     if worker_error is None:
                         worker_error = exc
                     continue
-                ok = future.result()
-
-                # getattr, not attribute access: tests (and any future caller)
-                # may hand back a plain bool, which CollectionOutcome is
-                # deliberately compatible with.
-                reason = getattr(ok, "reason", None)
-                exit_code = getattr(ok, "exit_code", None)
-
-                busy_host = HOST_BY_BUSY_EXIT_CODE.get(exit_code)
-                if busy_host is not None:
-                    # Another process on this machine holds that host's lock.
-                    # Transient — it ends when that process does — so this skips
-                    # ONE channel of ONE city and does not trip the breaker.
-                    # Like a blocked skip it records no `record_attempt`: the
-                    # city didn't fail, we simply never asked it. _finish_batch
-                    # still alerts, so it cannot pass as a clean night.
-                    busy_hosts[busy_host] += 1
-                    logger.warning(
-                        f"{city.city_id} [{provider}]: {HOST_LABELS[busy_host]} is busy with "
-                        f"another process on this machine — skipping this channel. Not counted "
-                        f"as a failure for this city, and not a run-wide skip: the lock frees "
-                        f"when that process finishes. ({reason})"
-                    )
-                    continue
-
-                blocked_host = HOST_BY_EXIT_CODE.get(exit_code)
-                if blocked_host is not None:
-                    # A whole-host condition, so this is NOT the city's failure
-                    # and must not be recorded as one: get_due_cities filters on
-                    # `consecutive_failures < max_consecutive_failures` and
-                    # nothing in the codebase resets that counter except a
-                    # success, so a few blocked nights would quietly quarantine
-                    # a city for an entire cycle. It stays due and leads
-                    # tomorrow's stalest-first queue instead. _finish_batch
-                    # alerts on blocked_hosts, so this is loud, not silent.
-                    #
-                    # A sibling that needs the same host cannot already be in
-                    # flight — affinity forbids it — so it is still in `pending`
-                    # and hits the breaker at its own submit, exactly as it would
-                    # have with the channels run back-to-back.
-                    #
-                    # Skipping `_reconcile_orphaned_run`/`_reconcile_orphaned_walk`
-                    # is safe rather than incidental: every host-unavailable exit
-                    # happens before the child writes anything. Overpass is a road
-                    # walk's first step, and the tile census is a Mapillary run's
-                    # first step, so there is never a paid-for artifact to salvage
-                    # here. Keep that true if either fetch ever moves later.
-                    blocked_hosts.add(blocked_host)
-                    logger.error(
-                        f"{city.city_id} [{provider}]: {HOST_LABELS[blocked_host]} is "
-                        f"unavailable to this host — skipping its remaining channels. "
-                        f"Not counted as a failure for this city. ({reason})"
-                    )
-                    continue
-
-                ok = bool(ok)
-                # A subprocess can report failure yet still have done the expensive,
-                # budgeted part of its job; salvage that rather than re-spending the
-                # whole crawl next cycle. The two channel kinds fail differently: a
-                # grid run commits its `runs` row before the diff/JSON tail, while a
-                # road walk catalogs nothing until the very end and so is salvaged
-                # from the artifacts it left on disk.
-                if not ok:
-                    if is_street_channel(provider):
-                        ok = _reconcile_orphaned_walk(conn, cfg, city, provider, today)
-                    else:
-                        ok = _reconcile_orphaned_run(conn, cfg, city, provider, today)
-
-                # This child died of the SIGTERM that is stopping US. The unit's
-                # default KillMode is control-group, so a `systemctl stop` reaches
-                # the whole cgroup — the 2026-08-13 log shows the in-flight child as
-                # "exited -15", which is in neither HOST_BY_EXIT_CODE nor
-                # HOST_BY_BUSY_EXIT_CODE and therefore reads as an ordinary
-                # collection failure. Charging it to the city would be wrong twice
-                # over, and both are the argument the blocked- and busy-host
-                # branches above already make: it burns one of five
-                # `consecutive_failures` that ONLY a success ever resets, and it
-                # makes attempted > succeeded, so every deliberate stop would email
-                # a failure alert and end the unit red (issue #206). With lanes the
-                # cgroup kills every in-flight child at once, so this branch is now
-                # reached once per lane rather than once per stop — the amnesty is
-                # applied per result, which is why it lives here and not at the exit.
-                #
-                # Deliberately AFTER salvage, so anything the child actually finished
-                # and left on disk is still cataloged — and BEFORE `attempted += 1`, so
-                # a channel we killed is not counted as attempted at all, matching how
-                # the two host branches `continue` before that same line.
-                #
-                # A child that failed for its own reasons AND was still running when the
-                # stop arrived is credited to the stop. That is the safe direction and
-                # the same call the busy-lock branch makes.
-                if not ok and stop_requested is not None and stop_requested.is_set():
-                    logger.warning(
-                        f"{city.city_id} [{provider}]: child was killed by the stop "
-                        f"signal ({reason}) — not counted as a failure for this city."
-                    )
-                    stopped = True
-                    continue
-
-                attempted += 1
-                if ok:
-                    succeeded += 1
-                    db.record_attempt(conn, city.city_id, success=True, provider=provider)
-                else:
-                    if record_failures:
-                        db.record_attempt(
-                            conn,
-                            city.city_id,
-                            success=False,
-                            error=reason or f"subprocess failed on {today}",
-                            provider=provider,
-                        )
-                    logger.error(f"{city.city_id} [{provider}]: collection failed")
     finally:
         if pool is not None:
             pool.shutdown(wait=True)

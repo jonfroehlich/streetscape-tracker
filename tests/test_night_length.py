@@ -130,10 +130,10 @@ def test_the_volume_control_and_the_busy_counter_survive_into_the_summary():
     summary = nla.summarize(nla.parse_log(_LOG), usage=usage)
     knob1 = summary["by_knob"]["1"]["requests_by_channel"]
     assert knob1 == {
-        "nights_with_usage": 2,
+        "dates_with_usage": 2,
         "total_requests": {"gsv": 980_000, "mapillary": 2_150},
     }
-    assert summary["by_knob"]["2"]["requests_by_channel"]["nights_with_usage"] == 1
+    assert summary["by_knob"]["2"]["requests_by_channel"]["dates_with_usage"] == 1
     assert summary["by_knob"]["1"]["busy_channel_skips"] == 0
     assert summary["by_knob"]["2"]["busy_channel_skips"] == 2
 
@@ -146,3 +146,71 @@ def test_a_percentile_is_never_reported_without_its_n():
     assert described["n"] == 3
     assert described["min"] == 1.0 and described["max"] == 3.0
     assert described["p50"] == 2.0
+
+
+def test_two_run_dues_on_one_date_are_two_nights_but_one_days_request_volume():
+    """The volume control must not double-count a date that ran twice.
+
+    An incident night is exactly this shape — a nightly, a crash, a re-run — and
+    `api_usage` is keyed by (date, provider) and already holds the whole day's
+    total. Adding it once per night inflates the lane side of the one comparison
+    the script exists to make, and docs/provider-access.md calls a lane night
+    that spent MORE than a sequential one stop-the-line. Elapsed hours still
+    count both, because two nights really are two observations of wall clock.
+    """
+    log = """\
+2026-09-01 01:00:00,000 - streetscape_scheduler - INFO - 900 cities due on 2026-09-01; \
+processing up to 20 within daily budgets of 10,000,000 gsv requests; max_concurrent_channels=3
+2026-09-01 03:00:00,000 - streetscape_scheduler - INFO - Done: run-due 2026-09-01: 40/40 runs \
+succeeded across 10 cities in 2.00 h
+2026-09-01 04:00:00,000 - streetscape_scheduler - INFO - 900 cities due on 2026-09-01; \
+processing up to 20 within daily budgets of 10,000,000 gsv requests; max_concurrent_channels=3
+2026-09-01 07:00:00,000 - streetscape_scheduler - INFO - Done: run-due 2026-09-01: 40/40 runs \
+succeeded across 10 cities in 3.00 h
+"""
+    usage = {"2026-09-01": {"gsv": 100_000, "mapillary": 1_500}}
+    summary = nla.summarize(nla.parse_log(log), usage=usage)
+    knob3 = summary["by_knob"]["3"]
+
+    assert knob3["elapsed_hours"]["n"] == 2, "two nights are two elapsed observations"
+    assert knob3["requests_by_channel"] == {
+        "dates_with_usage": 1,
+        "total_requests": {"gsv": 100_000, "mapillary": 1_500},
+    }, "one date's api_usage row is one day's volume, however many run-dues touched it"
+
+
+def test_a_driving_plan_error_saying_unavailable_is_not_a_per_ip_refusal():
+    """`nights_with_a_host_refusal` is the signal that drops the knob to 1.
+
+    The summary tail carries the blocked-host note, the stop reason AND the
+    driving-plan error, so a bare substring search for "unavailable" reports a
+    per-IP refusal on any night whose plan fetch got a 503. That is a false
+    positive on a stop-the-line indicator; the real note is its own `; ` segment
+    ending in " unavailable".
+    """
+    log = """\
+2026-09-02 01:00:00,000 - streetscape_scheduler - INFO - 900 cities due on 2026-09-02; \
+processing up to 20 within daily budgets of 10,000,000 gsv requests; max_concurrent_channels=2
+2026-09-02 05:00:00,000 - streetscape_scheduler - INFO - Done: run-due 2026-09-02: 80/80 runs \
+succeeded across 20 cities in 4.00 h; driving-plan fetch failed: HTTP 503 Service Unavailable
+2026-09-03 01:00:00,000 - streetscape_scheduler - INFO - 900 cities due on 2026-09-03; \
+processing up to 20 within daily budgets of 10,000,000 gsv requests; max_concurrent_channels=2
+2026-09-03 05:00:00,000 - streetscape_scheduler - INFO - Done: run-due 2026-09-03: 60/80 runs \
+succeeded across 20 cities in 4.00 h; the Overpass API (overpass-api.de) unavailable
+"""
+    nights = {n["date"]: n["hosts_unavailable"] for n in nla.parse_log(log)}
+    assert nights == {"2026-09-02": False, "2026-09-03": True}
+    assert (
+        nla.summarize(nla.parse_log(log), usage={})["by_knob"]["2"]["nights_with_a_host_refusal"]
+        == 1
+    )
+
+
+def test_two_blocked_hosts_still_read_as_one_refusal_note():
+    """The note joins its labels with `; ` too, so only its LAST segment ends in
+    " unavailable" — the parser must not require the first one to."""
+    rest = (
+        "; Mapillary's tile CDN (tiles.mapillary.com); "
+        "the Overpass API (overpass-api.de) unavailable; stopped early (SIGTERM)"
+    )
+    assert nla._hosts_unavailable(rest)

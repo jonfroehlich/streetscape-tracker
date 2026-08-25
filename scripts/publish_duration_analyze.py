@@ -53,7 +53,6 @@ from __future__ import annotations
 import argparse
 import glob
 import json
-import math
 import os
 import re
 import socket
@@ -61,6 +60,10 @@ import subprocess
 import sys
 import time
 from datetime import datetime
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from experiment_stats import describe as _describe  # noqa: E402
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -116,30 +119,11 @@ def percentiles(values: list[float]) -> dict:
     """n plus min/p25/p50/p75/p90/p95/max — never a bare median.
 
     CLAUDE.md: the shape is usually the finding, and a single headline number
-    hides it. Linear interpolation between order statistics, matching
-    numpy.percentile's default so a later re-analysis agrees with this one.
+    hides it. The formula is shared (see scripts/experiment_stats.py) so two
+    writeups cannot quote p90s computed by two implementations; 3 decimals is
+    this study's own resolution — seconds of publish wall-clock.
     """
-    if not values:
-        return {"n": 0}
-    ordered = sorted(values)
-
-    def at(p: float) -> float:
-        k = (len(ordered) - 1) * p / 100.0
-        lo, hi = math.floor(k), math.ceil(k)
-        if lo == hi:
-            return ordered[lo]
-        return ordered[lo] + (ordered[hi] - ordered[lo]) * (k - lo)
-
-    return {
-        "n": len(ordered),
-        "min": round(ordered[0], 3),
-        "p25": round(at(25), 3),
-        "p50": round(at(50), 3),
-        "p75": round(at(75), 3),
-        "p90": round(at(90), 3),
-        "p95": round(at(95), 3),
-        "max": round(ordered[-1], 3),
-    }
+    return _describe(values, digits=3)
 
 
 def parse_log(text: str, bound_cutoff_s: float = DEFAULT_BOUND_CUTOFF_S) -> dict:

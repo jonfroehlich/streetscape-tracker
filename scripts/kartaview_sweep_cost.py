@@ -89,6 +89,7 @@ from dotenv import find_dotenv, load_dotenv
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from experiment_stats import percentile_fraction as _percentile_fraction  # noqa: E402
 from kartaview_probe import (  # noqa: E402
     IPP_MAX,
     RADIUS_LADDER_M,
@@ -992,24 +993,21 @@ _CATALOG_DECILES = (0.05, 0.20, 0.35, 0.50, 0.65, 0.80, 0.90, 0.95, 0.99)
 
 def percentile(sorted_values: list[float], q: float) -> float:
     """
-    Linearly interpolated percentile -- i.e. the one that gives a real median.
+    Linearly interpolated percentile, taking a FRACTION (0.0-1.0) not a percent.
 
-    The obvious spelling, ``values[int(q * (n - 1))]``, is a lower-index pick
-    and is NOT a median on an even-sized sample: over this study's 14 cities it
-    returned the 7th value, 210, where the median is 297. A study that exists to
-    publish a distribution cannot mislabel its own middle, so this is numpy's
-    default linear interpolation, written out rather than adding a dependency to
-    a stdlib-only script. n is small (14), so the record reports it beside every
-    percentile -- a p90 over 14 points sits between the 12th and 13th value and
-    is a shape, not a precise quantile.
+    A thin adapter over the shared implementation (scripts/experiment_stats.py),
+    kept because every call site in this study is written in deciles — 0.05,
+    0.20, ... — and rewriting them as 5, 20, ... to delete four lines would be a
+    worse trade than the adapter.
+
+    Why interpolated at all: the obvious spelling, ``values[int(q * (n - 1))]``,
+    is a lower-index pick and is NOT a median on an even-sized sample. Over this
+    study's 14 cities it returned the 7th value, 210, where the median is 297. n
+    is small, so the record reports it beside every percentile -- a p90 over 14
+    points sits between the 12th and 13th value and is a shape, not a precise
+    quantile.
     """
-    if not sorted_values:
-        raise ValueError("percentile of an empty sample")
-    pos = q * (len(sorted_values) - 1)
-    lo, hi = math.floor(pos), math.ceil(pos)
-    if lo == hi:
-        return float(sorted_values[lo])
-    return sorted_values[lo] + (sorted_values[hi] - sorted_values[lo]) * (pos - lo)
+    return _percentile_fraction(sorted_values, q)
 
 
 def _distribution(values: list[int]) -> dict:

@@ -62,7 +62,14 @@ import os
 import re
 import sqlite3
 import sys
+from contextlib import closing
 from datetime import datetime
+
+# The script's own directory: `experiment_stats` is a sibling MODULE, not a
+# package, and tests load this file by path and treat it as a library.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from experiment_stats import describe as _describe  # noqa: E402
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -92,35 +99,38 @@ _DONE_RE = re.compile(
 _DEFERRED_RE = re.compile(r"(\d+) deferred for budget")
 _BUSY_RE = re.compile(r"(\d+) channel\(s\) skipped")
 
-_PERCENTILES = (25, 50, 75, 90, 95)
+
+def _hosts_unavailable(rest: str) -> bool:
+    """Did a per-IP host refuse this machine during the night?
+
+    Anchored to the blocked-host NOTE rather than searched for anywhere in the
+    tail. `cmd_run_due` builds that tail by joining `; `-separated segments, and
+    the blocked note — `"; ".join(labels) + " unavailable"` — is one of them;
+    after it come the stop reason and the driving-plan error, both of which carry
+    arbitrary exception text. A bare `"unavailable" in rest` therefore fires on a
+    plan fetch that failed with `503 Service Unavailable`, and
+    `nights_with_a_host_refusal` then reports a per-IP refusal that never
+    happened — a false positive on the one signal docs/scheduler.md's rollout
+    watch list says should drop the knob to 1 the same day.
+
+    Structural rather than a list of host labels, deliberately: this reads
+    HISTORICAL logs, and a label reworded since a night was written must not turn
+    that night's refusal invisible.
+    """
+    return any(segment.strip().endswith(" unavailable") for segment in rest.split(";"))
 
 
 def _parse_ts(text: str) -> datetime:
     return datetime.strptime(text, "%Y-%m-%d %H:%M:%S,%f")
 
 
-def _percentile(values: list[float], pct: float) -> float:
-    """Linear-interpolation percentile on a sorted copy (no numpy dependency)."""
-    if not values:
-        raise ValueError("percentile of an empty sample")
-    ordered = sorted(values)
-    if len(ordered) == 1:
-        return ordered[0]
-    rank = (len(ordered) - 1) * pct / 100.0
-    low = int(rank)
-    high = min(low + 1, len(ordered) - 1)
-    return ordered[low] + (ordered[high] - ordered[low]) * (rank - low)
-
-
 def describe(values: list[float]) -> dict:
-    """n plus the shape, because a headline number alone is not a finding."""
-    if not values:
-        return {"n": 0}
-    out = {"n": len(values), "min": round(min(values), 4)}
-    for pct in _PERCENTILES:
-        out[f"p{pct}"] = round(_percentile(values, pct), 4)
-    out["max"] = round(max(values), 4)
-    return out
+    """n plus the shape, because a headline number alone is not a finding.
+
+    Hours, so 4 decimals — about a third of a second, well under the resolution
+    of a log line's own timestamps.
+    """
+    return _describe(values, digits=4)
 
 
 def log_paths(logs_dir: str) -> list[str]:
@@ -187,7 +197,7 @@ def parse_log(text: str, source: str = "") -> list[dict]:
                 "attempted": int(done.group("attempted")),
                 "deferred_budget": int(deferred.group(1)) if deferred else 0,
                 "busy_channels": int(busy.group(1)) if busy else 0,
-                "hosts_unavailable": "unavailable" in rest,
+                "hosts_unavailable": _hosts_unavailable(rest),
                 "stopped_early": stopped,
                 "started_at": started_at,
                 "finished_at": done.group(1),
@@ -222,7 +232,12 @@ def api_usage_by_date(db_path: str, dates: list[str]) -> dict:
     if not db_path or not os.path.exists(db_path):
         return {}
     usage: dict[str, dict[str, int]] = {}
-    with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+    # `closing`, not a bare `with`: sqlite3's own context manager is a
+    # TRANSACTION manager — it commits or rolls back on exit and leaves the
+    # connection, its file handle and its WAL reader mark open until GC. This is
+    # a read-only single-shot, so the practical cost is small, but the catalog is
+    # the operational source of truth and this file is a pattern others copy.
+    with closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as conn:
         for date_str in sorted(set(dates)):
             rows = conn.execute(
                 "SELECT provider, requests FROM api_usage WHERE date = ?", (date_str,)
@@ -274,19 +289,32 @@ def summarize(nights: list[dict], usage: dict) -> dict:
 def _requests_for(dates: list[str], usage: dict) -> dict:
     """Per-channel request totals across a knob's nights, with the n they cover.
 
-    ``nights_with_usage`` is carried because a channel total over 5 nights and
-    the same total over 9 are different claims, and the catalog is optional here.
+    ``dates_with_usage`` is carried because a channel total over 5 days and the
+    same total over 9 are different claims, and the catalog is optional here.
+
+    DEDUPED, and the name says dates rather than nights for the same reason: a
+    knob's ``dates`` list holds one entry per NIGHT, but ``api_usage`` is keyed
+    by (date, provider) and is already a whole day's total. Two unfiltered
+    run-due invocations on one date — a nightly plus a re-run after a crash,
+    which is exactly what an incident night looks like — would otherwise add
+    that day's row twice. The inflation lands on the lane side, and the claim
+    being tested is "a lane night must not spend MORE than a sequential one", so
+    a duplicate would read as the stop-the-line condition in
+    docs/provider-access.md rather than as the double-count it is.
+
+    Two nights on one date are still two observations of elapsed hours, so
+    `describe` is right to count both; only the volume control has to dedupe.
     """
     totals: dict[str, int] = {}
     covered = 0
-    for date_str in dates:
+    for date_str in sorted(set(dates)):
         day = usage.get(date_str)
         if not day:
             continue
         covered += 1
         for provider, requests in day.items():
             totals[provider] = totals.get(provider, 0) + requests
-    return {"nights_with_usage": covered, "total_requests": dict(sorted(totals.items()))}
+    return {"dates_with_usage": covered, "total_requests": dict(sorted(totals.items()))}
 
 
 def write_docs_record(path: str, nights: list[dict], summary: dict, usage: dict) -> None:
@@ -361,7 +389,7 @@ def main(argv=None) -> int:
             f"h/city p50 {per_city.get('p50')}  "
             f"busy skips {data['busy_channel_skips']}"
         )
-        if data["requests_by_channel"]["nights_with_usage"]:
+        if data["requests_by_channel"]["dates_with_usage"]:
             print(f"      requests: {data['requests_by_channel']['total_requests']}")
 
     if args.docs_dir:

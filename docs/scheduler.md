@@ -136,6 +136,13 @@ The GraphML torn-cache hazard is covered by the same gate on child **exit** — 
 The summary's `elapsed_h` becomes concurrent wall clock; its role as a proxy for Mapillary time-under-load survives, because the two Mapillary channels still never overlap.
 Counters mean what they meant.
 Ledger races are impossible (four channels are four `api_usage` keys, and the city-level drain keeps cross-city reads ordered), and a busy-skip caused by *our own* lanes is structurally impossible rather than merely unlikely — which is why any 79/80 on a night with no manual run means a hole in the affinity gating and should drop the knob to 1 the same day.
+**`[download].connection_limit` is divided across lanes, not handed to each child whole.**
+The resource guard reads host-wide pressure and only ever *lowers* its answer, but it is consulted once per child from a sample taken before that child's siblings have ramped — so at N lanes each child reads a quiet box and each takes the full limit, and the guard structurally cannot see the load it is about to permit.
+Only three channels carry the number at all: the `gsv` grid, the `gsv` road walk, and the Mapillary road walk.
+The Mapillary **grid** never receives it (`cli.py` omits the argument, so `fetch_city_images_async`'s own default of 5 applies), so the arithmetic is 50 + 50 + 5 at knob 3 rather than 150.
+Combined with affinity, the only overlapping pair that points two full-size connectors at one third party is `gsv` + `gsv_streets` — both Google — which is 100 concurrent sockets on the same endpoints gate (2) below is already about.
+Dividing makes the knob a no-op at 1 and bounded above it; the trade is that a city with a single enabled channel gets the divided share too, so **raise `connection_limit` deliberately when you raise the knob** rather than discovering the multiplication in production.
+
 **Two things gate raising it in production, both outside this repo.**
 (1) **Resume for every provider**, because a deadline or a `systemctl stop` now kills up to N children at once instead of 1.
 GSV grid (`.downloading` sibling), the GSV road walk (same `collect_points_async` engine) and KartaView (`checkpoints/`, #239) all resume; the **Mapillary tile census does not — issue #256**, and a killed Mapillary child re-spends its tiles against the deliberate 3,500/day per-IP ceiling, which is ban risk under #241 rather than merely lost time.

@@ -8,6 +8,7 @@ import json
 import os
 import re
 import signal
+import sqlite3
 import subprocess
 import threading
 import time
@@ -5260,6 +5261,21 @@ def test_channels_sharing_a_host_never_overlap_even_at_knob_4(conn, monkeypatch)
     trio = threading.Barrier(3)
     streets_started = threading.Event()
     overlapped_with: list[str] = []
+    # Only the channels that actually SHARE a per-IP host with mapillary_streets
+    # can be violated by it. gsv declares no host at all, so gsv running
+    # alongside mapillary_streets is not the bug — it is the feature #240 exists
+    # to deliver. Recording it as an overlap made this test fail on roughly one
+    # run in eight: all three probe windows open together, so whenever gsv was
+    # the last of the trio off the barrier, the other two could finish, be
+    # classified, and let mapillary_streets start while gsv was still watching.
+    shares_a_host_with_streets = {
+        p
+        for p in ("gsv", "gsv_streets", "mapillary")
+        if set(sched.CHANNEL_HOSTS[p]) & set(sched.CHANNEL_HOSTS["mapillary_streets"])
+    }
+    assert shares_a_host_with_streets == {"gsv_streets", "mapillary"}, (
+        "the host map changed; this test's premise (gsv is the disjoint one) needs re-deriving"
+    )
 
     def gate(city_id, provider):
         if provider == "mapillary_streets":
@@ -5273,7 +5289,7 @@ def test_channels_sharing_a_host_never_overlap_even_at_knob_4(conn, monkeypatch)
         # still be scheduled after these three have returned. Timing alone would
         # therefore let a scheduler with no affinity at all pass this test. The
         # window only elapses in full when the answer is the right one.
-        if streets_started.wait(_AFFINITY_PROBE_S):
+        if streets_started.wait(_AFFINITY_PROBE_S) and provider in shares_a_host_with_streets:
             overlapped_with.append(provider)
 
     log = _stub_lane_collection(sched, monkeypatch, gate=gate)
@@ -5325,6 +5341,22 @@ def test_a_mapillary_block_at_knob_3_still_means_mapillary_streets_is_never_subm
     precisely BECAUSE it shares the blocked host, so it is still un-launched when
     the block is recorded and hits the breaker at its own submit. Re-verification
     of test_a_mapillary_block_skips_both_mapillary_channels at knob > 1.
+
+    The staging is the test, and it is deliberate rather than incidental. At knob
+    3 the first launch pass fills every lane, so mapillary_streets is held back
+    by the LANE CAP, which an affinity bug would also respect — left there, this
+    test passes with or without the gate. The window that actually distinguishes
+    them is the launch pass triggered when a lane frees while mapillary is still
+    in flight and still unclassified, so the test builds exactly that: gsv is let
+    go first, the other two are held until gsv has been fully classified
+    (``record_attempt`` is the seam, since that is the last thing classification
+    does), and mapillary_streets is watched for during a probe window that only
+    elapses in full when it was never submitted.
+
+    Without this staging the outcome turned on which future ``wait`` happened to
+    return first: measured at 4 failures in 6 runs with the affinity gate deleted,
+    i.e. a mutation detector that missed a third of the time. It now fails every
+    run — see docs/testing.md.
     """
     import logging
 
@@ -5332,9 +5364,41 @@ def test_a_mapillary_block_at_knob_3_still_means_mapillary_streets_is_never_subm
     from streetscape_metadata_tracker.download_common import HOST_MAPILLARY_TILES
 
     city = _lane_city(conn)
+    gsv_classified = threading.Event()
+    held_pair = threading.Barrier(2)
+    streets_started = threading.Event()
+    overlapped_with: list[str] = []
+
+    real_record_attempt = sched.db.record_attempt
+
+    def spy_record_attempt(conn_, city_id, *args, provider=None, **kwargs):
+        result = real_record_attempt(conn_, city_id, *args, provider=provider, **kwargs)
+        if provider == "gsv":
+            # Classification of gsv is COMPLETE. Whatever the lane scheduler does
+            # with the freed lane, it does from here on, while the other two
+            # channels are demonstrably still in flight.
+            gsv_classified.set()
+        return result
+
+    monkeypatch.setattr(sched.db, "record_attempt", spy_record_attempt)
+
+    def gate(city_id, provider):
+        if provider == "gsv":
+            return  # frees a lane immediately
+        if provider == "mapillary_streets":
+            streets_started.set()
+            return
+        # gsv_streets and mapillary: stay alive across the launch pass that the
+        # freed lane triggers, then watch for the channel that must not appear.
+        assert gsv_classified.wait(_LANE_TIMEOUT_S), "gsv was never classified"
+        held_pair.wait(_LANE_TIMEOUT_S)
+        if streets_started.wait(_AFFINITY_PROBE_S):
+            overlapped_with.append(provider)
+
     log = _stub_lane_collection(
         sched,
         monkeypatch,
+        gate=gate,
         outcome=lambda city_id, provider: (
             _blocked_outcome(HOST_MAPILLARY_TILES) if provider == "mapillary" else True
         ),
@@ -5351,6 +5415,11 @@ def test_a_mapillary_block_at_knob_3_still_means_mapillary_streets_is_never_subm
             blocked_hosts=blocked,
         )
 
+    assert overlapped_with == [], (
+        "mapillary_streets was submitted into the window where a lane had freed "
+        "but mapillary's block was not yet recorded — the breaker cannot save a "
+        "channel that is already running, which is why affinity has to hold it"
+    )
     assert "mapillary_streets" not in log.starts(), (
         "a channel needing a host that refused us must never be launched"
     )
@@ -5590,6 +5659,110 @@ def test_a_worker_error_drains_the_siblings_before_the_night_reports_unhealthy(c
 
     assert recorded == [("gsv_streets", True)], (
         "the sibling that finished must be credited before the error escapes"
+    )
+
+
+def test_a_MAIN_thread_error_also_drains_the_siblings_and_still_trips_the_breaker(
+    conn, monkeypatch
+):
+    """The mirror of the worker-error case, and the one lanes actually created.
+
+    Classification runs on the main thread and touches the catalog and the log,
+    so it can raise (a sqlite error out of `record_attempt`, a salvage that
+    throws, a `BrokenPipeError` out of `logger.error` — this file treats a dead
+    output pipe as a live condition in four other places). Before #240 that could
+    not lose anything: one channel was in flight and it was classified before the
+    next started. With lanes, a raise there used to skip the rest of the drain,
+    block in `pool.shutdown(wait=True)` for the siblings' FULL remaining runtime,
+    and then discard their already-paid-for outcomes.
+
+    The expensive half of that is invisible in a test; the cheap half is not.
+    `blocked_hosts` is the assertion because it is the one that outlives the
+    city: a host refusal dropped here means the night-level breaker never trips
+    and every later city keeps firing at a host that already refused this IP.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+    from streetscape_metadata_tracker.download_common import HOST_OVERPASS
+
+    city = _lane_city(conn)
+    # gsv is let go first and gsv_streets is held until gsv's classification has
+    # actually raised, so the failure is guaranteed to land with a sibling still
+    # in flight. Without that staging the two finish together, `wait` may hand
+    # back gsv_streets first, and the test passes whether or not the drain works.
+    gsv_classification_failed = threading.Event()
+
+    def exploding_record_attempt(conn_, city_id, success, provider=None, error=None):
+        if provider == "gsv":
+            gsv_classification_failed.set()
+            raise sqlite3.OperationalError("database is locked")
+
+    def gate(city_id, provider):
+        if provider == "gsv":
+            return
+        assert gsv_classification_failed.wait(_LANE_TIMEOUT_S), "gsv was never classified"
+
+    monkeypatch.setattr(sched.db, "record_attempt", exploding_record_attempt)
+    _stub_lane_collection(
+        sched,
+        monkeypatch,
+        gate=gate,
+        outcome=lambda city_id, provider: (
+            True if provider == "gsv" else _blocked_outcome(HOST_OVERPASS)
+        ),
+    )
+    blocked: set[str] = set()
+
+    with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+        _run_channels(
+            sched,
+            _street_cfg(max_concurrent_channels=2),
+            conn,
+            city,
+            ["gsv", "gsv_streets"],
+            blocked_hosts=blocked,
+        )
+
+    assert blocked == {HOST_OVERPASS}, (
+        "the sibling's host refusal was already paid for and must survive the "
+        "main thread's own failure — otherwise the night-level breaker never "
+        "trips and later cities keep hitting a host that refused this IP"
+    )
+
+
+def test_every_lane_exception_is_logged_even_though_only_one_is_re_raised(
+    conn, monkeypatch, caplog
+):
+    """Two lanes can fail for unrelated reasons in one completion pass.
+
+    Only one exception can propagate, so the other's cause exists nowhere but the
+    log — and the [alerts] email carries only this log's tail. Stashing the first
+    and silently dropping the rest recreates the "collection failed with no
+    cause" hole the per-attempt child logs were added to close.
+    """
+    import logging
+
+    from streetscape_metadata_tracker import scheduler as sched
+
+    city = _lane_city(conn)
+    barrier = threading.Barrier(2)
+
+    def outcome(city_id, provider):
+        raise RuntimeError(f"{provider} blew up")
+
+    _stub_lane_collection(
+        sched,
+        monkeypatch,
+        gate=lambda city_id, provider: barrier.wait(_LANE_TIMEOUT_S),
+        outcome=outcome,
+    )
+
+    with caplog.at_level(logging.ERROR), pytest.raises(RuntimeError, match="blew up"):
+        _run_channels(
+            sched, _street_cfg(max_concurrent_channels=2), conn, city, ["gsv", "gsv_streets"]
+        )
+
+    assert "gsv blew up" in caplog.text and "gsv_streets blew up" in caplog.text, (
+        "both causes must reach the log; only one of them can be re-raised"
     )
 
 
