@@ -240,6 +240,7 @@ async def collect_mapillary_street_samples_async(
     max_requests_per_minute: int = DEFAULT_TILE_REQUESTS_PER_MINUTE,
     checkpoint_path: str | None = None,
     checkpoint_channel: str | None = None,
+    checkpoint_variant: str | None = None,
 ) -> dict[str, Any]:
     """
     Collect Mapillary street samples for a city and write the snapshot csv.gz.
@@ -273,32 +274,46 @@ async def collect_mapillary_street_samples_async(
         max_requests_per_minute=max_requests_per_minute,
         checkpoint_path=checkpoint_path,
         checkpoint_channel=checkpoint_channel,
+        checkpoint_variant=checkpoint_variant,
     )
-    # pop, not [] — `fetched` is a live local until this function returns, so
-    # indexing it would keep the whole census resident past the `del` below,
-    # through the join, the row build and the CSV write.
-    census = fetched.pop("census")
-    num_flat_images = int((~census_is_pano(census)).sum())
-    logger.info(
-        "%s: %d Mapillary images (%d panos, %d flat) from %d tiles → scoring %d sample points",
-        city.city_id,
-        len(census),
-        len(census) - num_flat_images,
-        num_flat_images,
-        fetched["tiles"],
-        len(query_points),
-    )
+    # THE TAIL IS WRAPPED BECAUSE THE CHECKPOINT CHANGES WHAT A CRASH HERE COSTS
+    # (#256). Without one, a failure below lost the spend with the process and
+    # the caller recorded whatever the exception carried. With one, the
+    # checkpoint survives complete and the NEXT invocation re-finalizes it for
+    # ZERO requests — so a tail failure that carried no spend would land this
+    # census's tiles in no api_usage row, EVER. That is the gap PR #251 closed
+    # for KartaView and download_mapillary_metadata_async closes for the grid
+    # run; the walk needs it for the same reason and did not have it.
+    try:
+        # pop, not [] — `fetched` is a live local until this function returns, so
+        # indexing it would keep the whole census resident past the `del` below,
+        # through the join, the row build and the CSV write.
+        census = fetched.pop("census")
+        num_flat_images = int((~census_is_pano(census)).sum())
+        logger.info(
+            "%s: %d Mapillary images (%d panos, %d flat) from %d tiles → scoring %d sample points",
+            city.city_id,
+            len(census),
+            len(census) - num_flat_images,
+            num_flat_images,
+            fetched["tiles"],
+            len(query_points),
+        )
 
-    df = build_streetwalk_rows(query_points, census, match_dist_m, started_at)
-    del census
-    # Straight into the gzip handle: to_csv() with no path builds the whole CSV
-    # as a str and then a second copy as bytes, which at a big city's sample
-    # count is pure duplication of a file being written out anyway (issue #157).
-    with gzip.open(output_csv_gz_path, "wt", encoding="utf-8", newline="") as f:
-        df.to_csv(f, index=False)
+        df = build_streetwalk_rows(query_points, census, match_dist_m, started_at)
+        del census
+        # Straight into the gzip handle: to_csv() with no path builds the whole CSV
+        # as a str and then a second copy as bytes, which at a big city's sample
+        # count is pure duplication of a file being written out anyway (issue #157).
+        with gzip.open(output_csv_gz_path, "wt", encoding="utf-8", newline="") as f:
+            df.to_csv(f, index=False)
 
-    # Read back through the shared loader so dtypes match the GSV path exactly.
-    df = load_city_csv_file(output_csv_gz_path)
+        # Read back through the shared loader so dtypes match the GSV path exactly.
+        df = load_city_csv_file(output_csv_gz_path)
+    except BaseException as e:
+        e.api_requests = fetched["api_requests"]
+        e.api_requests_total = fetched["api_requests_total"]
+        raise
     return {
         "df": df,
         "filename_with_path": output_csv_gz_path,

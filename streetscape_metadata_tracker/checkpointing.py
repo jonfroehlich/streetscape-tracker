@@ -47,42 +47,6 @@ CHECKPOINT_STATE_FILENAME = "state.json"
 CHECKPOINT_MAX_AGE_S = 7 * 24 * 3600
 
 
-# THE PATH IS THE CALLER'S, AND IT MUST BE DATE-FREE. The whole point is a sweep
-# that spans nights, and a run is dated on the day it COMPLETES -- so a
-# date-bearing path (the `.downloading` and `.harvesting` convention, where a
-# collection finishes in one night) would make every night start from zero. It
-# must also be a realpath: on makelab2 the unit's WorkingDirectory is a symlink,
-# and two spellings of one directory would silently be two checkpoints, i.e.
-# exactly the restart-from-zero this exists to prevent (see host_lock.lock_dir,
-# which carries the same reasoning for the same host). Finally it belongs OUTSIDE
-# `data/` -- a partial census is the one artifact that must never reach the
-# publisher -- which is what the gitignored `checkpoints/` sibling is for.
-#
-# THE PATH KEY IS (CITY, GRID GEOMETRY, CHANNEL), AND THE CHANNEL IS NOT
-# OPTIONAL. Both census providers have a grid channel and a street channel, and
-# a road walk sweeps THE SAME frozen `grid_bbox` the grid run does -- that is
-# why the fetch is shared at all. So a walk and a grid run of one city agree on
-# every geometric parameter a checkpoint records: each provider's validation
-# would pass and the two channels would happily resume each other's crawls. The
-# census would be the same either way, but the channels meter into SEPARATE
-# `api_usage` ledgers, so one would inherit the other's `api_requests_total`,
-# and for Mapillary they hold different credentials besides.
-#
-# THE CALLER OWNS THE DIRECTORY AND MUST `discard_checkpoint` IT once its dated
-# artifacts are durable. The fetch functions deliberately do NOT delete the
-# checkpoint on a clean crawl, and that is the whole of what makes "a crash in
-# the caller's tail" recoverable: the census is returned as a DataFrame and the
-# caller writes the CSV, the stats, the run row, the JSON and the diff after this
-# returns. Deleting here -- which is where the delete first lived -- would mean
-# the checkpoint is already gone by the time any of that can fail, so the one
-# interruption of the four named above that lands OUTSIDE this function would be
-# the one not covered. Discarding is one line at the end of a caller that just
-# finished writing its artifact, exactly as `download_gsv` unlinks `.downloading`
-# after its CSV lands. A caller that forgets is bounded rather than broken:
-# CHECKPOINT_MAX_AGE_S caps how long a complete checkpoint can be re-finalized,
-# each provider's loader says so at WARNING, and the tell is `api_requests == 0`.
-
-
 CHECKPOINT_DIR_ENV = "STREETSCAPE_CHECKPOINT_DIR"
 
 
@@ -110,7 +74,12 @@ def checkpoint_dir() -> str:
     return os.path.join(os.path.realpath(get_project_root()), "checkpoints")
 
 
-def checkpoint_path_for(city_id: str, bbox: tuple[float, float, float, float], channel: str) -> str:
+def checkpoint_path_for(
+    city_id: str,
+    bbox: tuple[float, float, float, float],
+    channel: str,
+    variant: str | None = None,
+) -> str:
     """
     Checkpoint directory for one (city, grid geometry, channel).
 
@@ -135,14 +104,32 @@ def checkpoint_path_for(city_id: str, bbox: tuple[float, float, float, float], c
     bbox, so this is the cheap half of a belt-and-braces pair -- but it is the
     half that keeps the stale directory from lingering under the live name.
 
+    THE VARIANT IS THE SAME ARGUMENT ONE LEVEL DOWN, and a walk needs it. The
+    channel separates a walk from a grid run, but it does NOT separate two walks
+    of one city from each other: ``--network-type drive`` and
+    ``--network-type all_public`` are separate series with separate artifacts
+    (``generate_streetwalk_filename`` carries the network token for exactly this
+    reason), and they meter into the SAME street channel over the SAME frozen
+    bbox. So every check a loader makes would pass and the second walk would
+    re-finalize the first's crawl for zero requests, writing the first's
+    ``api_requests_total`` into the second's ``street_walks`` row. The census
+    would be identical -- both walks read the same tiles -- which is what makes
+    it silent. Each provider's commit record stores the variant too, so a future
+    caller that derives the path without one is refused rather than mispriced.
+
     Args:
         city_id: canonical catalog slug.
         bbox: the frozen grid's (min_lon, min_lat, max_lon, max_lat).
         channel: the collecting channel's name -- 'mapillary' or 'kartaview' for
             a grid run, 'mapillary_streets' or 'kartaview_streets' for a walk.
+        variant: what distinguishes two crawls of one city within one channel,
+            or None when the channel is the whole key. Today that is a walk's
+            ``--network-type``; a grid run has exactly one crawl per channel and
+            passes nothing, which keeps its path byte-identical to #239's.
     """
     geometry = "_".join(f"{coord:.6f}" for coord in bbox)
-    return os.path.join(checkpoint_dir(), channel, f"{city_id}_{geometry}")
+    leaf = f"{city_id}_{geometry}" if variant is None else f"{city_id}_{geometry}_{variant}"
+    return os.path.join(checkpoint_dir(), channel, leaf)
 
 
 def _fsync_dir(path: str) -> None:
@@ -187,13 +174,18 @@ def discard_checkpoint(path: str) -> None:
     """
     Remove a finished checkpoint. THE CALLER'S JOB, once its artifact is durable.
 
-        A provider's fetch deliberately does not call this on a clean crawl. It
+    A provider's fetch deliberately does not call this on a clean crawl. It
     returns the census as a DataFrame and the caller then writes the dated
     CSV, the stats, the ``runs`` row, the JSON and the diff -- so a delete
     issued before returning would be the one thing guaranteeing that a crash in
     that tail costs the whole sweep again, which is one of the four
     interruptions #239 exists to cover. Call this last, after the artifact
     lands, the way ``download_gsv`` unlinks its ``.downloading`` sibling.
+
+    A caller that forgets is bounded rather than broken: the age cap limits how
+    long a complete checkpoint can be re-finalized, each provider's loader says
+    so at WARNING, and the tell is ``api_requests == 0`` on a run that collected
+    a whole city.
 
     Best effort: a checkpoint that cannot be removed must never fail a run that
     has already succeeded. The stale directory it leaves is bounded by

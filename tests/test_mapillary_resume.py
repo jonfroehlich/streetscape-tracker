@@ -435,9 +435,10 @@ def test_a_complete_checkpoint_refinalizes_for_zero_requests(
         ({"tile_count": 99}, "covers 99 tiles"),
         ({"census_rows": 10_000}, "commit record says 10000"),
         (
-            {"updated_at": (datetime.now(UTC) - timedelta(days=8)).isoformat()},
+            {"created_at": (datetime.now(UTC) - timedelta(days=8)).isoformat()},
             "spliced\ninto a snapshot dated today".replace("\n", " "),
         ),
+        ({"variant": "all_public"}, "price this crawl with another one's requests"),
     ],
 )
 def test_an_unusable_checkpoint_is_discarded_and_the_city_is_refetched(
@@ -650,3 +651,178 @@ def test_the_checkpoint_is_a_seven_day_horizon(monkeypatch, tmp_path, straddling
     served = _serve(monkeypatch, tiles_by_xy)
     _download(tmp_path, lat, lon, checkpoint, name="second")
     assert len(served) == len(tiles) - 1, "six days is still resumable"
+
+
+# ── The age cap has to be un-resettable, or it protects nothing ────────────
+
+
+def test_the_age_is_measured_from_the_first_commit_not_the_last_write(
+    monkeypatch, tmp_path, straddling_city, caplog
+):
+    """
+    `updated_at` moves on writes that commit NO tile (see `_commit_spend`), and a
+    host-blocked night records no `consecutive_failures` — so the same stalest
+    city is re-attempted nightly. Ageing from the last write would let it
+    refresh its own clock forever and splice rows of any age into a snapshot
+    dated today, which is the one thing this cap exists to stop.
+    """
+    lat, lon = straddling_city
+    tiles, tiles_by_xy = _golden_tiles(lat, lon)
+    checkpoint = str(tmp_path / "cp")
+
+    _serve(monkeypatch, tiles_by_xy, block_after=1)
+    with pytest.raises(HostBlockedError):
+        _download(tmp_path, lat, lon, checkpoint, name="first")
+
+    # A crawl whose oldest row is 8 days old, last written a moment ago.
+    _write_state(
+        checkpoint,
+        created_at=(datetime.now(UTC) - timedelta(days=8)).isoformat(),
+        updated_at=datetime.now(UTC).isoformat(),
+    )
+
+    served = _serve(monkeypatch, tiles_by_xy)
+    with caplog.at_level("WARNING"):
+        _download(tmp_path, lat, lon, checkpoint, name="second")
+    assert "past the 7-day limit" in caplog.text
+    assert len(served) == len(tiles), "a stale crawl is refetched, not resumed"
+
+
+def test_a_night_that_commits_no_tile_does_not_restamp_the_origin(
+    monkeypatch, tmp_path, straddling_city
+):
+    """The write `_commit_spend` makes must move `updated_at` and nothing else."""
+    lat, lon = straddling_city
+    _, tiles_by_xy = _golden_tiles(lat, lon)
+    checkpoint = str(tmp_path / "cp")
+
+    _serve(monkeypatch, tiles_by_xy, block_after=1)
+    with pytest.raises(HostBlockedError):
+        _download(tmp_path, lat, lon, checkpoint, name="first")
+
+    aged = (datetime.now(UTC) - timedelta(days=6, hours=23)).isoformat()
+    _write_state(checkpoint, created_at=aged)
+    before = _state(checkpoint)
+
+    # Refused at request 1: nothing new commits, but the spend is still recorded.
+    _serve(monkeypatch, tiles_by_xy, block_after=0)
+    with pytest.raises(HostBlockedError):
+        _download(tmp_path, lat, lon, checkpoint, name="second")
+
+    after = _state(checkpoint)
+    assert after["created_at"] == aged, "a spend-only write must not reset the age clock"
+    assert after["updated_at"] != before["updated_at"], "but it is still a write"
+    assert after["done_tiles"] == before["done_tiles"], "and it commits no tile"
+
+
+# ── A discarded checkpoint must not cost the run its protection ────────────
+
+
+def test_a_discarded_checkpoint_leaves_the_rerun_still_protected(
+    monkeypatch, tmp_path, straddling_city
+):
+    """
+    An unusable checkpoint here is DELETED, so the directory the run is about to
+    commit into is the one the discard removed. Opening it before the load left
+    every commit failing, `degraded` latched on the first tile, and the whole
+    city fetched unprotected — in exactly the case the age cap produces, i.e.
+    the first attempt after a multi-day block.
+    """
+    lat, lon = straddling_city
+    _, tiles_by_xy = _golden_tiles(lat, lon)
+    checkpoint = str(tmp_path / "cp")
+
+    _serve(monkeypatch, tiles_by_xy, block_after=1)
+    with pytest.raises(HostBlockedError):
+        _download(tmp_path, lat, lon, checkpoint, name="first")
+    _write_state(checkpoint, created_at=(datetime.now(UTC) - timedelta(days=8)).isoformat())
+
+    # Night 2 discards the stale crawl and is itself interrupted after one tile.
+    _serve(monkeypatch, tiles_by_xy, block_after=1)
+    with pytest.raises(HostBlockedError):
+        _download(tmp_path, lat, lon, checkpoint, name="second")
+
+    assert os.path.exists(_state_file(checkpoint)), "night 2 saved nothing"
+    assert len(_state(checkpoint)["done_tiles"]) == 1, "night 2's tile is not durable"
+
+
+def test_a_part_written_before_any_commit_record_is_swept(monkeypatch, tmp_path, straddling_city):
+    """
+    The process died between its first `to_parquet` and its first `state.json`,
+    so `load_tile_checkpoint` returns at the missing record before it can look —
+    which used to mean nothing ever swept what it left.
+    """
+    lat, lon = straddling_city
+    tiles, tiles_by_xy = _golden_tiles(lat, lon)
+    checkpoint = str(tmp_path / "cp")
+    os.makedirs(checkpoint)
+    orphan = dm._tile_part_path(checkpoint, 999, 999)
+    pd.DataFrame({"image_id": ["x"]}).to_parquet(orphan, index=False)
+    stray = os.path.join(checkpoint, "tile-1-2.parquet.tmp")
+    open(stray, "w").close()
+
+    served = _serve(monkeypatch, tiles_by_xy)
+    _download(tmp_path, lat, lon, checkpoint, name="run")
+
+    assert len(served) == len(tiles), "no commit record means fetch everything"
+    assert not os.path.exists(orphan)
+    assert not os.path.exists(stray)
+
+
+def test_a_committed_part_is_fsynced_before_it_is_renamed(monkeypatch, tmp_path, straddling_city):
+    """
+    Without it the part-then-state ordering holds against a process crash but
+    not a power loss, and what a torn part costs is the WHOLE checkpoint —
+    `load_tile_checkpoint` discards on a short one. `download_kartaview`'s
+    `_commit_checkpoint` spends the same fsyncs for the same reason.
+    """
+    lat, lon = straddling_city
+    _, tiles_by_xy = _golden_tiles(lat, lon)
+    checkpoint = str(tmp_path / "cp")
+
+    events = []
+    real_fsync, real_replace = os.fsync, os.replace
+    monkeypatch.setattr(os, "fsync", lambda fd: (events.append("fsync"), real_fsync(fd))[1])
+    monkeypatch.setattr(
+        os,
+        "replace",
+        lambda a, b: (events.append(("replace", os.path.basename(a))), real_replace(a, b))[1],
+    )
+
+    _serve(monkeypatch, tiles_by_xy)
+    _download(tmp_path, lat, lon, checkpoint, name="run")
+
+    first_part_rename = next(
+        i
+        for i, e in enumerate(events)
+        if isinstance(e, tuple) and e[1].startswith("tile-") and e[1].endswith(".parquet.tmp")
+    )
+    assert "fsync" in events[:first_part_rename], (
+        "the part reached the directory entry before it reached the disk"
+    )
+
+
+# ── The variant: what separates two walks of one city (issue #256 review) ──
+
+
+def test_the_two_network_types_get_different_checkpoint_directories():
+    """
+    Both walks meter into `mapillary_streets` and read the SAME frozen bbox, so
+    the channel cannot tell them apart and every geometric check would pass.
+    """
+    bbox = (-122.0, 47.0, -121.9, 47.1)
+    drive = checkpoint_path_for("seattle--washington", bbox, "mapillary_streets", variant="drive")
+    broad = checkpoint_path_for(
+        "seattle--washington", bbox, "mapillary_streets", variant="all_public"
+    )
+    grid = checkpoint_path_for("seattle--washington", bbox, "mapillary")
+
+    assert drive != broad
+    assert os.path.dirname(drive) == os.path.dirname(broad)
+    # A grid run has exactly one crawl per channel, so it passes no variant and
+    # its path stays byte-identical to the one #239 shipped.
+    assert os.path.basename(grid) == os.path.basename(drive).removesuffix("_drive")
+
+
+def _state_file(path):
+    return os.path.join(path, CHECKPOINT_STATE_FILENAME)

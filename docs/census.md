@@ -211,11 +211,31 @@ A **zero-row tile gets a record and no file**: most tiles over a real bbox are e
 **Checkpointing here fails OPEN, which is a deliberate divergence from KartaView's fail-fast.**
 There the trade is right — ten hours of paid-for crawl is worth more than the night that loses it.
 The worst Mapillary city is ~15 minutes, so an unwritable directory or a failing commit logs one warning, latches, and lets the fetch carry on unprotected: a city must never fail over its own safety net.
-An unusable checkpoint (format, bbox, zoom, channel, tile count, age, a missing or short part) is **discarded and refetched**, never raised on — and unlike KartaView's it is deleted rather than left, because tile-keyed part names are never overwritten by a crawl that does not resume them.
+An unusable checkpoint (format, bbox, zoom, channel, variant, tile count, age, a missing or short part) is **discarded and refetched**, never raised on — and unlike KartaView's it is deleted rather than left, because tile-keyed part names are never overwritten by a crawl that does not resume them.
+
+**Because the discard DELETES, the checkpoint is loaded before its directory is created, and that order is load-bearing.**
+Creating first means the directory the fresh handle is about to commit into is the one the discard just removed: every commit fails, `degraded` latches on the first tile, and the whole city fetches unprotected.
+The case that produces is the age cap, i.e. the first attempt after a multi-day block — so the one run that most needs the safety net would be the one running without it.
+Creating afterwards still happens before the first request, which is the property that actually matters: an unwritable path must fail in a second rather than fifteen minutes in.
+
+**A part is fsynced before it is renamed, and the directory after**, the same four fsyncs per commit `download_kartaview._commit_checkpoint` spends and for the same reason.
+Without them the part-then-state ordering holds against a process crash — where the page cache survives and the fsync buys nothing — but not against a power loss, where the two renames may reach the disk in either order.
+What that leaves is not a wrong artifact, since the loader's footer check catches a part shorter than its record; it is the loss of the **whole** checkpoint rather than the last tile.
 
 **The two counters mean what they mean on the KartaView side**, and one subtlety is easy to lose: spend that happens *after* the last committed tile — the requests a block refuses, which `api_usage` counts deliberately — is written into the record by `_commit_spend` on the failure paths.
 Without that, a resumed run's catalog row prices the city below what it actually cost, because those requests die with the process while the ledger keeps them.
 It is skipped when nothing was committed, so a city blocked on request 1 still leaves no directory behind.
+
+**That write is also why the age cap is measured from `created_at` — when the FIRST tile was committed — and never from the last write.**
+`_commit_spend` rewrites the record on a night that committed no tile at all, and a host-blocked night deliberately records no `consecutive_failures`, so the same stalest city is re-attempted the next night and the next.
+Ageing from the last write would let a city refresh its own clock indefinitely and hold rows from any distance in the past under the limit — defeating the one guard in this design that protects an **artifact** rather than a night's work.
+`created_at` is stamped by the first write of a crawl and carried forward by every later one; `updated_at` still moves, for an operator reading the directory.
+
+**The path key is (city, grid geometry, channel, variant), and the variant is what separates two WALKS of one city.**
+The channel separates a walk from a grid run, but `drive` and `all_public` are different series over the same frozen bbox in the same street channel — which is why `generate_streetwalk_filename` carries the network token.
+Without the variant a walk that dies after its census but before `register_street_walk` leaves a checkpoint the other network type's walk re-finalizes for zero requests, writing the first crawl's `api_requests_total` into the second's row.
+Both walks read the same tiles, so the census is identical and nothing downstream would show it.
+A grid run has exactly one crawl per channel and passes no variant, which keeps its path byte-identical to the one #239 shipped.
 
 ## Still NOT a scheduler channel (issue #248)
 

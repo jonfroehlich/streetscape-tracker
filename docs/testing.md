@@ -159,8 +159,12 @@ and `hosts_unavailable` is anchored to the blocked-host note's own `; `-delimite
   the parquet parts round-trip the census's extension dtypes, which is why they are not CSV (`"NA"`/`"None"` as provider-supplied strings, null `on_foot`, null `captured_at_ms`);
   each way a checkpoint can be unusable — format, bbox, zoom, channel, tile count, age, corrupt state, a part short of its recorded row count — discards and refetches **without raising**, and a six-day-old one still resumes;
   a failing commit warns exactly once and never fails the city, and an unwritable directory fetches unprotected; a city blocked before committing leaves no empty directory;
-  the walk and the grid run get different checkpoint directories and a cross-channel resume is refused;
-  and the two counters split, **including that a blocked night's refused requests reach the crawl total** — they are counted into `api_usage` deliberately, so without `_commit_spend` the resumed row would price the city below what it cost)
+  the walk and the grid run get different checkpoint directories and a cross-channel resume is refused, as do the two `--network-type` walks of one city, which the channel alone cannot separate;
+  and the two counters split, **including that a blocked night's refused requests reach the crawl total** — they are counted into `api_usage` deliberately, so without `_commit_spend` the resumed row would price the city below what it cost.
+  Four pins come from the #256 review, and each fails loudly on the code as first written: the age cap is measured from the FIRST commit, so a night that commits no tile moves `updated_at` and leaves `created_at` alone — otherwise a nightly-refused city refreshes its own clock forever and the cap protects nothing;
+  a run whose stale checkpoint was DISCARDED is still protected afterwards, since the discard deletes the directory the fresh handle is about to commit into;
+  a part is fsynced before it is renamed, checked by recording the `fsync`/`replace` order rather than by trusting the call site;
+  and a part written before any commit record is swept, which the loader returns too early to reach)
 
 ## Catalog backups (issue #145)
 

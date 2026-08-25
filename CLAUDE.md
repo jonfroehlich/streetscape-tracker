@@ -212,7 +212,7 @@ A blocked or busy night still publishes, alerts unconditionally, and exits nonze
    `--check-boundary` uses the same resolution, so preview filenames and geometry match what a real run would produce.
 2. Skip policy per (city, provider): `--min-days-since-last-run` (default 80) unless `--force`.
 3. Downloader dispatch — `download_gsv.py` (gsv; resumes via a `.downloading` sibling) or the two census providers, `download_mapillary.py` (#256) and `download_kartaview.py` (#239), which **both resume via a `checkpoints/` directory**:
-   the caller supplies that path — keyed on the CHANNEL, since a road walk crawls the same frozen bbox and would otherwise resume the grid run's crawl into the wrong ledger — and discards it once the artifact is durable.
+   the caller supplies that path — keyed on the CHANNEL, and for a walk on its `--network-type` too, since a road walk crawls the same frozen bbox and would otherwise resume the grid run's crawl into the wrong ledger (or the other walk's, into the wrong row) — and discards it once the artifact is durable.
    Provider-agnostic grid/date/error helpers (`generate_grid_points`, `standardize_capture_date`, `DownloadError`) live in `download_common.py`, and the shared checkpoint plumbing in `checkpointing.py`, so no provider imports from another's module.
    Caller supplies the output path;
    all three return `api_requests` for the per-provider budget ledger, and both census providers add `api_requests_total`
