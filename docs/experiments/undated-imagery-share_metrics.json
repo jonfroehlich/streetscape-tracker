@@ -2,39 +2,40 @@
   "_about": {
     "experiment": "undated-imagery-share",
     "writeup": "docs/experiments/undated-imagery-share.md",
-    "generated_by": "python scripts/undated_imagery_share_analyze.py --docs-dir docs/experiments",
+    "generated_by": "python scripts/undated_imagery_share_analyze.py --docs-dir docs/experiments --catalog-label makelab2-prod",
     "issue": 257,
-    "generated_at": "2026-08-25T11:05:56+00:00",
-    "note": "Share of present imagery carrying no usable capture date, per provider. `catalog` is a census of our own GRID runs; `kartaview_audit` is a sample of KartaView's API, read from its own committed metrics file. The two are different sampling frames and are never pooled. Both are proxies for the ROAD-WALK undated share, which no walk recorded until #257 added dated_covered_samples. No data_dir is recorded: an absolute path would put one machine's layout into a committed file."
+    "catalog_label": "makelab2-prod",
+    "generated_at": "2026-08-25T12:15:38+00:00",
+    "note": "Share of present imagery carrying no usable capture date, per provider. `catalog` is a census of our own GRID runs; `kartaview_audit` is a sample of KartaView's API, read from its own committed metrics file. The two are different sampling frames and are never pooled. Both are proxies for the ROAD-WALK undated share, which no walk recorded until #257 added dated_covered_samples. No data_dir is recorded: an absolute path would put one machine's layout into a committed file -- `catalog_label` names which catalog was read instead, since a dev catalog and production give materially different answers for the same provider."
   },
   "catalog": {
     "gsv": {
-      "runs": 1157,
-      "panos_present": 151900889,
-      "panos_no_date": 15355,
-      "points_queried": 708758062,
-      "runs_with_any_no_date": 76,
-      "pooled_pct_of_present": 0.010109,
-      "pooled_pct_of_queried": 0.002166,
+      "runs": 1766,
+      "panos_present": 242499345,
+      "panos_no_date": 20968,
+      "points_queried": 996053847,
+      "runs_with_any_no_date": 119,
+      "pooled_pct_of_present": 0.008647,
+      "pooled_pct_of_queried": 0.002105,
       "per_run_pct_of_present": {
-        "n": 1146,
+        "n": 1749,
         "min": 0.0,
         "p25": 0.0,
         "p50": 0.0,
         "p75": 0.0,
         "p90": 0.0,
-        "p95": 0.002684,
-        "max": 0.32276
+        "p95": 0.00455,
+        "max": 0.335802
       },
       "per_run_pct_of_queried": {
-        "n": 1157,
+        "n": 1766,
         "min": 0.0,
         "p25": 0.0,
         "p50": 0.0,
         "p75": 0.0,
         "p90": 0.0,
-        "p95": 0.001478,
-        "max": 0.219361
+        "p95": 0.002849,
+        "max": 0.329362
       },
       "top_no_date_runs": [
         {
@@ -59,8 +60,8 @@
         },
         {
           "city_id": "chicago--illinois--united-states",
-          "run_date": "2025-01-24",
-          "no_date": 843
+          "run_date": "2026-07-30",
+          "no_date": 864
         }
       ],
       "largest_run_by_present_panos": {
@@ -70,38 +71,64 @@
       }
     },
     "mapillary": {
-      "runs": 3,
-      "panos_present": 15306443,
-      "panos_no_date": 0,
-      "points_queried": 17124160,
-      "runs_with_any_no_date": 0,
-      "pooled_pct_of_present": 0.0,
-      "pooled_pct_of_queried": 0.0,
+      "runs": 1201,
+      "panos_present": 68280653,
+      "panos_no_date": 102733,
+      "points_queried": 359372123,
+      "runs_with_any_no_date": 11,
+      "pooled_pct_of_present": 0.150457,
+      "pooled_pct_of_queried": 0.028587,
       "per_run_pct_of_present": {
-        "n": 2,
+        "n": 453,
         "min": 0.0,
         "p25": 0.0,
         "p50": 0.0,
         "p75": 0.0,
         "p90": 0.0,
         "p95": 0.0,
-        "max": 0.0
+        "max": 23.272308
       },
       "per_run_pct_of_queried": {
-        "n": 3,
+        "n": 1201,
         "min": 0.0,
         "p25": 0.0,
         "p50": 0.0,
         "p75": 0.0,
         "p90": 0.0,
         "p95": 0.0,
-        "max": 0.0
+        "max": 2.729452
       },
-      "top_no_date_runs": [],
+      "top_no_date_runs": [
+        {
+          "city_id": "denver--colorado--united-states",
+          "run_date": "2026-08-08",
+          "no_date": 66441
+        },
+        {
+          "city_id": "commerce-city--colorado--united-states",
+          "run_date": "2026-07-31",
+          "no_date": 32059
+        },
+        {
+          "city_id": "lakewood--colorado--united-states",
+          "run_date": "2026-08-24",
+          "no_date": 2378
+        },
+        {
+          "city_id": "englewood--colorado--united-states",
+          "run_date": "2026-08-11",
+          "no_date": 1810
+        },
+        {
+          "city_id": "ho-chi-minh-city--vietnam",
+          "run_date": "2026-07-23",
+          "no_date": 17
+        }
+      ],
       "largest_run_by_present_panos": {
         "city_id": "detroit--michigan--united-states",
-        "run_date": "2026-07-24",
-        "panos_present": 15305890
+        "run_date": "2026-08-17",
+        "panos_present": 15433401
       }
     }
   },

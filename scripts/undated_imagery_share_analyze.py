@@ -78,16 +78,27 @@ DOCS_DIR_DEFAULT = "docs/experiments"
 KARTAVIEW_AUDIT = "kartaview-shotdate-audit_metrics.json"
 
 
-def docs_generated_by(docs_dir: str) -> str:
+def docs_generated_by(docs_dir: str, label: str) -> str:
     """The exact command that reproduces the committed metrics file.
 
     A constant rather than a literal in the JSON, so a test can assert the
     stamp names a run the repo can actually make (the grid-density precedent).
+
+    `--catalog-label` is part of it because WHICH catalog was read is the
+    single biggest determinant of these numbers and cannot be recovered from
+    them afterwards: a dev laptop holds a handful of Mapillary runs against
+    production's 1,200, which is the difference between "Mapillary never emits
+    NO_DATE" and "Mapillary emits 17x GSV's rate". A label rather than a path,
+    so no machine's directory layout lands in a committed file.
     """
-    return f"python scripts/undated_imagery_share_analyze.py --docs-dir {docs_dir}"
+    return (
+        "python scripts/undated_imagery_share_analyze.py "
+        f"--docs-dir {docs_dir} --catalog-label {label}"
+    )
 
 
-DOCS_GENERATED_BY = docs_generated_by(DOCS_DIR_DEFAULT)
+DEFAULT_LABEL = "unspecified"
+DOCS_GENERATED_BY = docs_generated_by(DOCS_DIR_DEFAULT, DEFAULT_LABEL)
 
 
 def percentiles(values: list[float]) -> dict:
@@ -219,6 +230,11 @@ def main() -> int:
         default=None,
         help=f"write {TOPIC}_metrics.json here (default: print only)",
     )
+    parser.add_argument(
+        "--catalog-label",
+        default=DEFAULT_LABEL,
+        help="which catalog this read, e.g. 'makelab2-prod' (recorded, not a path)",
+    )
     args = parser.parse_args()
 
     data_dir = args.data_dir or get_default_data_dir()
@@ -233,8 +249,11 @@ def main() -> int:
         "_about": {
             "experiment": TOPIC,
             "writeup": f"docs/experiments/{TOPIC}.md",
-            "generated_by": docs_generated_by(args.docs_dir or DOCS_DIR_DEFAULT),
+            "generated_by": docs_generated_by(
+                args.docs_dir or DOCS_DIR_DEFAULT, args.catalog_label
+            ),
             "issue": 257,
+            "catalog_label": args.catalog_label,
             "generated_at": datetime.now(UTC).isoformat(timespec="seconds"),
             "note": (
                 "Share of present imagery carrying no usable capture date, per provider. "
@@ -243,7 +262,9 @@ def main() -> int:
                 "different sampling frames and are never pooled. Both are proxies for the "
                 "ROAD-WALK undated share, which no walk recorded until #257 added "
                 "dated_covered_samples. No data_dir is recorded: an absolute path would "
-                "put one machine's layout into a committed file."
+                "put one machine's layout into a committed file -- `catalog_label` names "
+                "which catalog was read instead, since a dev catalog and production give "
+                "materially different answers for the same provider."
             ),
         },
         "catalog": catalog,

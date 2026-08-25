@@ -420,12 +420,15 @@ def compute_streetwalk_coverage(
     summed into ``covered_samples_dated``/``dated_pct_of_covered`` by
     ``summarize_streetwalk_coverage``. Without it an age median over 3% of a
     KartaView edge's coverage would be indistinguishable from one over all of
-    a GSV edge's. How far apart they run is provider-specific by three orders
-    of magnitude — 9.6% of audited KartaView photos are undated by its
-    ``shot_date >= date_added`` rule against 0.010% of GSV's grid panos (see
-    ``docs/experiments/undated-imagery-share.md``) — and for KartaView the
-    undated population is not a random sample of the imagery but its NEWEST,
-    one 2025-11-19 bulk ingest, so dropping it biases the age median OLD.
+    a GSV edge's. How far apart they run is provider-specific, and undated
+    imagery arrives in BATCHES rather than as diffuse noise: GSV and Mapillary
+    both read zero through the 95th percentile of runs, yet one Mapillary run
+    is 23.3% undated against GSV's worst 0.34%, and 9.6% of audited KartaView
+    photos are undated by its ``shot_date >= date_added`` rule (see
+    ``docs/experiments/undated-imagery-share.md``). So the per-run MAXIMUM is
+    what to design against, never the pooled share. A batch is also a single
+    point in time by construction — KartaView's is one 2025-11-19 bulk ingest,
+    i.e. its NEWEST imagery, so dropping it biases that age median OLD.
 
     Args:
         edges: WGS84 LineString GeoDataFrame with ``edge_id`` (+ optional
