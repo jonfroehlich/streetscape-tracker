@@ -66,6 +66,11 @@ jobs:
         python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v4
+        with:
+          # test_every_ignored_rev_is_still_a_commit_on_this_branch walks
+          # history to check .git-blame-ignore-revs; the default depth-1
+          # checkout does not contain the commits it names.
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}

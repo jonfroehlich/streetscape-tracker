@@ -44,11 +44,18 @@ def _collected(
     `no_date_pred(row)` takes precedence and gives the sample a NO_DATE row —
     a located pano with an unusable capture date, which is imagery within reach
     of the street but carries no age.
+
+    `date` may be a callable taking the sample row, so a fixture can give each
+    covered sample its own capture date. A test that needs the age median to
+    MOVE cannot use one shared date: with every dated sample at the same age
+    the median is that age no matter what else is mixed into it, which is how
+    an undated-samples-age-zero bug hides.
     """
     rows = []
     for r in samples.itertuples():
         undated = bool(no_date_pred(r)) if no_date_pred else False
         cov = undated or covered_pred(r)
+        row_date = date(r) if callable(date) else date
         rows.append(
             {
                 "query_lat": r.lat,
@@ -56,7 +63,7 @@ def _collected(
                 "pano_lat": (r.lat + pano_offset) if cov else None,
                 "pano_lon": r.lon if cov else None,
                 "pano_id": ("p" if cov else None),
-                "capture_date": (None if undated else (date if cov else None)),
+                "capture_date": (None if undated else (row_date if cov else None)),
                 "copyright_info": (copyright_ if cov else None),
                 "status": ("NO_DATE" if undated else ("OK" if cov else "ZERO_RESULTS")),
                 "query_timestamp": "2026-07-08T00:00:00Z",
@@ -159,44 +166,96 @@ def test_no_date_sample_counts_toward_coverage():
     assert a_tot["coverage_pct_by_length_any"] > b_tot["coverage_pct_by_length_any"]
 
 
+# The age half needs its OWN population shape, not the one above. With most of
+# the coverage dated and every dated sample sharing a date, the median cannot
+# move whatever the undated samples do, so a test built that way passes even if
+# undated samples are folded in at age 0. These invert it: the undated samples
+# are the MAJORITY and the dated ones carry spread-out dates, which is also the
+# real shape — for KartaView the undated population is 9.6% of audited photos
+# and is its newest imagery, so it is exactly what an age median must not see.
+_AGE_DATES = ["2018-06-01", "2019-06-01", "2020-06-01", "2021-06-01", "2022-06-01"]
+
+
+def _few_dated(r):
+    """5 of the long edge's 15 samples get a dated OK pano, each a year apart."""
+    return r.edge_id == "1_2" and r.sample_idx < len(_AGE_DATES)
+
+
+def _mostly_undated(r):
+    """The other 10 are covered but undated — the majority, as on a real walk."""
+    return r.edge_id == "1_2" and r.sample_idx >= len(_AGE_DATES)
+
+
+def _age_date(r):
+    return _AGE_DATES[r.sample_idx] if r.sample_idx < len(_AGE_DATES) else _AGE_DATES[-1]
+
+
+def _age_years(date_str):
+    delta = pd.Timestamp(RUN_DATE) - pd.Timestamp(date_str)
+    return delta.total_seconds() / (365.25 * 24 * 3600)
+
+
 def test_no_date_sample_contributes_coverage_but_no_age():
     """
     NO_DATE rows carry a null capture_date, so they must never reach a dated
-    statistic: adding them moves coverage while leaving `nearest_pano_date` and
-    `median_covered_age_years` exactly where they were. That is the grid
-    convention — PRESENT_STATUSES cover, only the dated subset ages — and it is
-    what lets the fix land without disturbing the age series.
+    statistic: the age median is taken over the DATED covered samples alone,
+    and stays exactly where it was when undated coverage is piled on top. That
+    is the grid convention — PRESENT_STATUSES cover, only the dated subset ages
+    — and it is what lets the fix land without disturbing the age series.
+
+    The assertion is against an independently computed expected median rather
+    than only against a `before` frame: `before` alone would still pass if
+    undated samples were folded in at age 0, because with the dated samples in
+    the majority the median could not move far enough to notice.
     """
     edges = _edges()
     samples = rs.generate_samples(edges, spacing_m=15.0)
 
     before = sc.compute_streetwalk_coverage(
-        edges, samples, _collected(samples, _dated), RUN_DATE, "gsv", 25.0
+        edges, samples, _collected(samples, _few_dated, date=_age_date), RUN_DATE, "gsv", 25.0
     ).set_index("edge_id")
     after = sc.compute_streetwalk_coverage(
         edges,
         samples,
-        _collected(samples, _dated, no_date_pred=_undated),
+        _collected(samples, _few_dated, date=_age_date, no_date_pred=_mostly_undated),
         RUN_DATE,
         "gsv",
         25.0,
     ).set_index("edge_id")
 
-    assert after.loc["1_2", "covered_samples"] > before.loc["1_2", "covered_samples"]
-    assert after.loc["1_2", "nearest_pano_date"] == before.loc["1_2", "nearest_pano_date"]
-    assert (
-        after.loc["1_2", "median_covered_age_years"]
-        == before.loc["1_2", "median_covered_age_years"]
-    )
-    assert (
-        before.loc["1_2", "median_covered_age_years"] is not None
-    )  # a real value, not None == None
+    # Coverage tripled: 5 dated samples, then 5 dated + 10 undated.
+    assert before.loc["1_2", "covered_samples"] == 5
+    assert after.loc["1_2", "covered_samples"] == 15
 
-    # Same at the summary level: coverage_by_highway's age is the covered-edge
-    # median, and the undated samples must not have entered it.
+    # ...while the age median is the median of the five DATED ages, in both
+    # frames. The middle date is 2020-06-01; folding the 10 undated samples in
+    # at age 0 would drag it to 0, and dropping them (correct) cannot move it.
+    expected = round(_age_years("2020-06-01"), 3)
+    assert before.loc["1_2", "median_covered_age_years"] == expected
+    assert after.loc["1_2", "median_covered_age_years"] == expected
+
+    # The newest DATED pano, likewise unmoved — an undated pano has no date to
+    # be newer than, and must not read as one.
+    assert before.loc["1_2", "nearest_pano_date"] == "2022-06-01"
+    assert after.loc["1_2", "nearest_pano_date"] == "2022-06-01"
+
+    # And that median's denominator is recorded, not left to be inferred: after
+    # the fix `covered` and `dated` are different populations, so an age over 5
+    # of 15 covered samples must be distinguishable from one over all 15.
+    assert before.loc["1_2", "dated_covered_samples"] == 5
+    assert after.loc["1_2", "dated_covered_samples"] == 5
+
+    # Same at the summary level, where the age is the covered-edge median.
     b_res = sc.summarize_streetwalk_coverage(before.reset_index())["totals"]
     a_res = sc.summarize_streetwalk_coverage(after.reset_index())["totals"]
-    assert a_res["median_covered_age_years"] == b_res["median_covered_age_years"]
+    assert (
+        a_res["median_covered_age_years"] == b_res["median_covered_age_years"] == round(expected, 2)
+    )
+    assert a_res["covered_samples"] == 15
+    assert a_res["covered_samples_dated"] == 5
+    assert a_res["dated_pct_of_covered"] == 33.3
+    # Before the fix every covered sample was dated, and the summary says so.
+    assert b_res["dated_pct_of_covered"] == 100.0
 
 
 def test_gsv_no_date_still_gated_by_official_copyright():

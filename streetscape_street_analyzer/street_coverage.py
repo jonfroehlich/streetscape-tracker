@@ -412,10 +412,20 @@ def compute_streetwalk_coverage(
 
     A ``NO_DATE`` sample counts as covered but carries a NaT ``capture_date``,
     so it never reaches ``nearest_pano_date`` or ``median_covered_age_years``
-    — coverage without age, exactly the grid convention. That population is
-    large by construction for KartaView (``shot_date >= date_added`` nulls an
-    untrustworthy date rather than believing it), small but real for Mapillary
-    (bogus contributor timestamps), and empty in practice for GSV.
+    — coverage without age, exactly the grid convention.
+
+    That splits the two numbers apart, so the age statistics get a recorded
+    denominator: ``dated_covered_samples`` is the subset ``median_covered_age_
+    years`` was actually taken over, and it is emitted per edge and summed into
+    ``covered_samples_dated``/``dated_pct_of_covered`` by
+    ``summarize_streetwalk_coverage``. Without it an age median over 3% of a
+    KartaView edge's coverage would be indistinguishable from one over all of
+    a GSV edge's. How far apart they run is provider-specific by three orders
+    of magnitude — 9.6% of audited KartaView photos are undated by its
+    ``shot_date >= date_added`` rule against 0.010% of GSV's grid panos (see
+    ``docs/experiments/undated-imagery-share.md``) — and for KartaView the
+    undated population is not a random sample of the imagery but its NEWEST,
+    one 2025-11-19 bulk ingest, so dropping it biases the age median OLD.
 
     Args:
         edges: WGS84 LineString GeoDataFrame with ``edge_id`` (+ optional
@@ -453,6 +463,7 @@ def compute_streetwalk_coverage(
             ("covered", bool),
             ("covered_samples_any", int),
             ("coverage_fraction_any", float),
+            ("dated_covered_samples", int),
             ("nearest_pano_date", object),
             ("median_covered_age_years", object),
         ):
@@ -540,6 +551,10 @@ def compute_streetwalk_coverage(
             {
                 "nearest_pano_date": dates.max().date().isoformat() if len(dates) else None,
                 "median_covered_age_years": round(float(ages.median()), 3) if len(ages) else None,
+                # The age median's denominator, recorded rather than inferred:
+                # since #257 `covered` and "dated" are different populations,
+                # and nothing else on the edge says how far apart they ran.
+                "dated_covered_samples": int(len(ages)),
             }
         )
 
@@ -569,6 +584,18 @@ def compute_streetwalk_coverage(
         if "median_covered_age_years" in extra
         else pd.Series(dtype=object)
     )
+    # Unlike the two above, this one is a count and NEVER null: an edge with no
+    # dated covered samples has zero of them, which is a fact, not a gap.
+    out["dated_covered_samples"] = (
+        out["edge_id"]
+        .map(
+            extra["dated_covered_samples"]
+            if "dated_covered_samples" in extra
+            else pd.Series(dtype=object)
+        )
+        .fillna(0)
+        .astype(int)
+    )
     return out
 
 
@@ -586,6 +613,13 @@ def summarize_streetwalk_coverage(covered_edges: gpd.GeoDataFrame) -> dict[str, 
         covered_edges = covered_edges.assign(
             coverage_fraction_any=covered_edges["coverage_fraction"]
         )
+    # Frames predating #257 recorded no dated denominator. Treating every
+    # covered sample as dated reproduces what those numbers meant when they
+    # were written — before #257 only an OK sample could be covered, and an OK
+    # sample always carries a date — so an old frame summarizes to 100% dated
+    # rather than to a hole.
+    if "dated_covered_samples" not in covered_edges.columns:
+        covered_edges = covered_edges.assign(dated_covered_samples=covered_edges["covered_samples"])
 
     def _block(group: pd.DataFrame) -> dict[str, Any]:
         edges = int(len(group))
@@ -597,6 +631,8 @@ def summarize_streetwalk_coverage(covered_edges: gpd.GeoDataFrame) -> dict[str, 
         )
         sampled = group[group["total_samples"] > 0]
         ages = pd.to_numeric(group["median_covered_age_years"], errors="coerce").dropna()
+        covered_samples = int(group["covered_samples"].sum())
+        dated_samples = int(group["dated_covered_samples"].sum())
         return {
             "edges": edges,
             "edges_sampled": int(len(sampled)),
@@ -617,6 +653,18 @@ def summarize_streetwalk_coverage(covered_edges: gpd.GeoDataFrame) -> dict[str, 
             if length_km
             else 0.0,
             "median_covered_age_years": round(float(ages.median()), 2) if len(ages) else None,
+            # The denominator behind that median, recorded rather than left to
+            # be inferred. `covered_samples_dated` is the subset carrying a
+            # usable capture date; the remainder are covered NO_DATE samples,
+            # which is imagery the age number cannot see. For KartaView that
+            # shortfall is its NEWEST imagery (one bulk ingest its
+            # `shot_date >= date_added` rule nulls), so a low
+            # `dated_pct_of_covered` means the age median reads OLD.
+            "covered_samples": covered_samples,
+            "covered_samples_dated": dated_samples,
+            "dated_pct_of_covered": round(100.0 * dated_samples / covered_samples, 1)
+            if covered_samples
+            else None,
         }
 
     by_type = {bucket: _block(group) for bucket, group in covered_edges.groupby("highway_bucket")}
@@ -685,6 +733,11 @@ def build_streetwalk_geojson(
                     "median_covered_age_years": float(median_age)
                     if median_age is not None
                     else None,
+                    # covered_samples minus this is the edge's covered-but-
+                    # undated population — the coverage its age cannot see.
+                    "dated_covered_samples": int(
+                        getattr(row, "dated_covered_samples", row.covered_samples)
+                    ),
                 },
             }
         )
