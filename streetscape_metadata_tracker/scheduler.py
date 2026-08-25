@@ -354,6 +354,18 @@ class SchedulerConfig:
         finished, and it applies above one lane too whenever a channel waits for
         a slot instead of getting one in the first pass.
 
+        That is a rule and not a law, and its limit is worth stating because the
+        rule inverts past it: it holds only while no single channel is long
+        enough to consume the deadline by itself. One that IS starves everything
+        behind it — put it first and its siblings launch against what is left,
+        down to the floor — so for such a channel the question stops being which
+        is most expensive and becomes which can best absorb being truncated.
+        Note what does NOT change under that reading: a resumable channel loses
+        less WORK to a SIGKILL, but no channel keeps its ledger row, because
+        every ``api_usage`` write happens in the child after the download
+        returns. Ranking picks who absorbs the truncation; it never makes it
+        free.
+
         What it does NOT do above one lane is keep a per-IP host to one talker —
         host affinity in the launch pass does that, and it would keep doing it
         under any ordering.
