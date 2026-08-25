@@ -74,6 +74,9 @@ The catalog half is a census and the KartaView half is an API sample read from `
 Both are proxies for the road-walk share, which no walk recorded until #257 added `dated_covered_samples`.
 
 The generating code is `scripts/{topic}_{collect,analyze,common}.py` (kept so the result can be reproduced, not because it runs routinely) and its test pins the sampling invariant.
+What is genuinely identical across studies lives in one place instead: `scripts/experiment_style.py` for the figure palette, `scripts/experiment_stats.py` for the percentile/`describe` summary every writeup quotes.
+That second one exists because the same linear-interpolation percentile had been written three times, and two writeups quoting p90s computed by two implementations are comparing numbers nobody checked agree.
+Note the trap it left behind: `pos = q * (n - 1)` is grouped the way it is on purpose, because the algebraically equal `(n - 1) * q` differs by an ULP on some samples and the study records are pinned byte-for-byte.
 Answer "should we sample finer / differently?" questions from these before re-running anything.
 
 ## The derived numbers are committed; only the bulk raw data is gitignored

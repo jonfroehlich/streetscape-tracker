@@ -233,6 +233,7 @@ A per-(city, provider) artifact that omits the token silently collides the momen
 
 **Scheduler → [`docs/scheduler.md`](docs/scheduler.md).** `run-due` collects the stalest-due cities, runs each enabled channel as its own subprocess under a per-channel daily budget, then runs a tail
 — aggregate, streetwalk manifest, driving-plan summary, catalog backup, publish.
+Channels run back-to-back, or concurrently in host-disjoint lanes when `[schedule].max_concurrent_channels` > 1 (default 1 = sequential); channels sharing a per-IP host never overlap, so the effective ceiling is 3 not 4, and raising it in prod is gated on #256 plus a check that the two GSV keys live in separate Cloud projects.
 **The tail is what makes a night visible, and it only runs if the city loop returns**, so every way of ending the loop (deadline, SIGTERM wind-down, unexpected exception) returns counters instead of propagating, and each tail artifact reports a crash rather than raising.
 Publishing happens **only at the end**, so a stale public site usually means the batch died or overran rather than that the publisher broke.
 A dead output pipe is treated as an ordinary condition in four separate places — but still drive manual batches into a file (`>> logs/x.log 2>&1`), never a pipe.

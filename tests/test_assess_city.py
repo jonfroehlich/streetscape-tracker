@@ -63,6 +63,22 @@ def _cfg(tmp_path, **overrides):
     return SchedulerConfig(**base)
 
 
+# The frozen geometry a registered Newport carries, for the tests that need a
+# CityRow without going through the command.
+_CITY_ROW = dict(
+    city_name="Newport",
+    state_name="Kentucky",
+    state_code="KY",
+    country_name="United States",
+    country_code="US",
+    center_lat=39.0889,
+    center_lon=-84.4919,
+    grid_width_m=4000,
+    grid_height_m=4000,
+    step_m=20,
+)
+
+
 class _Loc:
     """The subset of a geoutils location object registration reads."""
 
@@ -141,6 +157,7 @@ def _stub_collection(monkeypatch, conn, *, outcome=None):
         daily_budget=0,
         conn=None,
         remaining_s=None,
+        **_,
     ):
         ran.append((city.city_id, provider))
         return outcome(city, provider)
@@ -1201,3 +1218,58 @@ def test_assess_channels_never_includes_the_gsv_grid_run():
     assert set(ASSESS_CHANNELS) == {"gsv_streets", "mapillary", "mapillary_streets"}
     # And every assess channel must be a channel the scheduler knows how to run.
     assert all(c in _sched.CHANNEL_HOSTS for c in ASSESS_CHANNELS)
+
+
+def test_assess_city_inherits_the_lane_scheduler_from_the_config_knob(conn, monkeypatch, tmp_path):
+    """The operator path runs the same lane scheduler, gates included (issue #240).
+
+    assess-city calls _run_city_channels, so it fans out the moment prod raises
+    the knob — intended, and safe for the same reason the nightly batch is: the
+    affinity rule is in the scheduler, not in the caller. Pinned here because
+    ASSESS_CHANNELS is exactly the shape that would hide a missing rule by luck
+    — gsv_streets and mapillary_streets share Overpass, mapillary and
+    mapillary_streets share the tile CDN, and a canonical-order sequential run
+    happens to get that right for the wrong reason.
+    """
+    import threading
+    from collections import Counter
+    from datetime import date
+
+    lock = threading.Lock()
+    events = []
+    pair = threading.Barrier(2)
+
+    def fake_run(cfg, city, today, provider="gsv", **kwargs):
+        with lock:
+            events.append(("start", provider, len(events) + 1))
+        try:
+            # The two host-disjoint channels must be able to meet here; the
+            # third shares a host with each of them and must not.
+            if provider != "mapillary_streets":
+                pair.wait(10.0)
+            return True
+        finally:
+            with lock:
+                events.append(("end", provider, len(events) + 1))
+
+    monkeypatch.setattr(_sched, "_run_one_city", fake_run)
+    cfg = _cfg(tmp_path, max_concurrent_channels=4)
+    city = db.resolve_city(conn, db.register_city(conn, **_CITY_ROW))
+
+    attempted, succeeded, skipped = _sched._run_city_channels(
+        cfg,
+        conn,
+        city,
+        date(2026, 8, 17),
+        list(ASSESS_CHANNELS),
+        blocked_hosts=set(),
+        busy_hosts=Counter(),
+        batch_deadline=None,
+        stop_requested=None,
+        record_failures=False,
+    )
+
+    assert (attempted, succeeded, skipped) == (3, 3, 0)
+    seq = {(kind, provider): n for kind, provider, n in events}
+    assert seq[("start", "mapillary_streets")] > seq[("end", "gsv_streets")]
+    assert seq[("start", "mapillary_streets")] > seq[("end", "mapillary")]

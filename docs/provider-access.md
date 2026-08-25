@@ -39,7 +39,8 @@ It is kept because a grid can be re-registered larger at any time, so the guard 
 Pacing and request counting live **inside** `_fetch_tile`'s retried body, so a tile that retries re-paces and is re-counted — one token, one ledger increment, one HTTP request;
 taking the token in the caller let a retrying tile present up to `_TILE_MAX_TRIES`× the configured rate during exactly a 429/5xx storm, and under-report the same factor to `api_usage`.
 **The limiter is per-process**, so N concurrent Mapillary collections would still present N× the rate
-— which is why the host lock below, not the scheduler's sequential channel ordering, is what makes the configured figure the real one.
+— which is why the host lock below, and not any ordering property of the scheduler, is what makes the configured figure the real one.
+(That reasoning is what #240 relies on: a city's channels may now run concurrently, but the parent defers any channel whose per-IP host an in-flight sibling already holds, so the two Mapillary channels still never overlap and the tile CDN still sees one talker from this process — see the lanes section below.)
 (Until #208 that guarantee rested on a rule for humans, and on 2026-08-14 a detached script that could not read it doubled the rate and got the host banned again.)
 A block manifests as HTTP 302 → login whose *followed* page returns 200 `text/html`, so before #199 it reached the protobuf decoder and read as a corrupt tile; `_fetch_tile` now sets `allow_redirects=False` and names it.
 **A blocked host also stops after the first refusal rather than paying for the whole city (issue #205).** `gather(return_exceptions=True)` (from #168, so one bad tile can't discard a city) must settle *every* tile before the settle loop can re-raise,
@@ -230,3 +231,19 @@ The backup-side rule from "Two `run-due` processes can overlap" — that
 `catalog_backup._staging_path` names host + pid and sweeps by age — is restated where someone
 changing `catalog_backup.py` will actually be reading, in
 [`catalog-backups.md`](catalog-backups.md). Keep the two in sync.
+
+## Concurrent channel lanes leave per-host presentation invariant (issue #240)
+
+**Added after the split.**
+`[schedule].max_concurrent_channels` lets one city's channels run at once (default 1 = the historical back-to-back behaviour).
+**Nothing about what a provider sees changes**, and that claim rests on three things rather than on good intentions.
+**(1) Host affinity is enforced in the parent.**
+The launch pass derives the per-IP hosts its in-flight children hold from `CHANNEL_HOSTS` and defers any channel that intersects them, so Overpass, the Mapillary tile CDN and KartaView each see **at most one talker from this process at a time** — the same as before.
+The child-side cross-process lock (#208) is untouched and still covers the manual runs the parent cannot see.
+**(2) Pacing and budgets are per channel and unchanged**: each child keeps its own limiter, and the combined Mapillary per-IP ceiling stays 3,500/day.
+The binding Mapillary constraint is multi-day *volume* (#241), which intra-night packing does not move — a night collects the same cities and spends the same tiles, sooner.
+**(3) The only observable change is wall clock.**
+The one place this is not free is the pair Google meters per Cloud **project** rather than per IP: `gsv` and `gsv_streets` declare no host, so nothing serializes them, and running them concurrently presents 48k + 24k req/min.
+That is safe **only if the two keys live in separate projects**, which this repo does not record anywhere — it is a Google Cloud Console check before the knob is raised, and a shared project must be fixed by splitting the keys rather than by declaring a fake host (a fake `CHANNEL_HOSTS` entry would couple the night-level breaker to something that is not a host refusal).
+Raising the knob is also gated on **resume for every provider** (#256 — the Mapillary tile census is the open half), because a deadline or a `systemctl stop` kills N children at once instead of 1, and a killed Mapillary child re-spends its tiles into the ceiling this file exists to defend.
+Mechanism, rollout order and the watch list: [`scheduler.md`](scheduler.md).
