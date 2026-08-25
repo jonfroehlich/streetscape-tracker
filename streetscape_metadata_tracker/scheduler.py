@@ -312,10 +312,10 @@ class SchedulerConfig:
     def enabled_providers(self) -> list[str]:
         """Enabled channel names in a stable canonical order, most expensive first.
 
-        Deterministic and stable is most of what this buys, and the rest is
-        narrower than it looks. Two rationales this docstring used to give are
-        wrong, and both are recorded here because each one read as established
-        for long enough to be quoted elsewhere:
+        There IS a mechanism behind most-expensive-first, but it is not the one
+        this docstring gave for most of its life. Two rationales it used to give
+        are wrong, and both are recorded here because each read as established
+        long enough to be quoted elsewhere:
 
         It is **not** a budget mechanism. ``daily_request_budget`` is per
         ``ProviderConfig`` and ``db.get_api_usage`` is keyed by (date, provider),
@@ -339,6 +339,20 @@ class SchedulerConfig:
         ``max_concurrent_channels = 1`` this is also the submit order into the
         lanes, so when a city has more channels than lanes it decides which claim
         a slot first — and at one lane it is simply the execution order.
+
+        And it decides how much of the deadline each child is allowed to use,
+        which is the mechanical case for putting the expensive channels first.
+        ``remaining_s`` is read fresh at every launch — one ``time.monotonic()``
+        per LAUNCHED channel — and ``city_timeout_seconds`` clamps the derived
+        timeout down to it, floored at ``_MIN_CLAMPED_TIMEOUT_S``. A channel
+        launched later sees less of the deadline, so a long one ranked late can
+        have its timeout truncated to the floor and be SIGKILLed part-way; a
+        killed child records no ``api_usage`` at all, so its already-spent
+        requests vanish from the ledger (#238). The channel that needs the most
+        wall-clock should therefore start while the most of it remains. This is
+        stark at one lane, where each channel launches only once the previous has
+        finished, and it applies above one lane too whenever a channel waits for
+        a slot instead of getting one in the first pass.
 
         What it does NOT do above one lane is keep a per-IP host to one talker —
         host affinity in the launch pass does that, and it would keep doing it
