@@ -18,14 +18,16 @@ The full data model, pipeline, and filename contract live in [`docs/architecture
 | | GSV (`gsv`) | Mapillary (`mapillary`) | KartaView (`kartaview`) |
 |---|---|---|---|
 | API model | One metadata request per grid point | Bulk z14 vector tiles (~10–100 requests/city) | Paginated radius sweep |
-| What's kept | The nearest pano per grid point (a *sample*) | Every 360° pano, nearest-grid-point assigned (a *census*) | Every photo (a *census*) |
+| What's kept | The nearest pano per grid point (a *sample*) | Every 360° pano, assigned to its nearest grid point, plus one `FLAT_ONLY` marker where only flat imagery covers a point (a *census*) | The same census as Mapillary — 360° panos plus `FLAT_ONLY` markers, never a row per flat photo |
 | Credential (`.env`) | `GMAPS_API_KEY` | `MAPILLARY_ACCESS_TOKEN` | `KARTAVIEW_ACCESS_TOKEN` (required — the anonymous tier is unusably slow) |
 | Nightly scheduler | Yes | Yes | No — CLI collection only |
 
-`--provider` is a comma-separated channel list defaulting to `gsv,mapillary`; `--provider all` collects everything, and every named provider's key must be present up-front so the series can't drift.
+`--provider` is a comma-separated channel list defaulting to `gsv,mapillary`, and every named provider's key must be present up-front so the series can't drift.
+`--provider all` collects every provider the naming contract knows about — never the default, because KartaView's radius sweep is serial and runs for hours on a metro (see [`docs/experiments/kartaview-sweep-cost.md`](docs/experiments/kartaview-sweep-cost.md)).
 
-**Comparing providers.** All providers share the identical frozen grid, so *coverage rate* (% of grid points with a pano) is directly comparable.
+**Comparing providers.** All providers share the identical frozen grid, so *coverage rate* (% of grid points with a 360° pano) is directly comparable.
 Raw *pano counts* are not: a GSV sample undercounts dense imagery, while a census counts everything.
+The two censuses also report a second, wider *any-imagery* coverage rate that counts the flat-only points; it is never conflated with the 360° rate.
 
 **Attribution.** Mapillary metadata is used under their [terms](https://www.mapillary.com/terms) (CC BY-SA); anything derived from it must visibly credit Mapillary, which the bundled web frontend does automatically.
 
@@ -51,7 +53,7 @@ python streetscape_tracker.py "Seattle, WA"
 # Choose providers
 python streetscape_tracker.py "Seattle, WA" --provider gsv
 python streetscape_tracker.py "Seattle, WA" --provider gsv,kartaview
-python streetscape_tracker.py "Seattle, WA" --provider all
+python streetscape_tracker.py "Seattle, WA" --provider all   # includes the hours-long KartaView sweep
 
 # Preview the search boundary on a map before spending any requests
 python streetscape_tracker.py "Seattle, WA" --check-boundary
@@ -62,6 +64,16 @@ python run_cities.py cities.txt --continue-on-error
 
 Re-running a (city, provider) sooner than `--min-days-since-last-run` (default 80 days) is skipped unless you pass `--force`.
 Street-level coverage analysis and collection (road walks along the OSM street network) live in `streetscape_street_analyzer` — see [`docs/street-coverage.md`](docs/street-coverage.md).
+
+Three standalone tools sit beside the tracker at the repo root, all offline (no API keys, no network):
+
+```bash
+python streetscape_compare_data.py old.csv.gz new.csv.gz     # diff two runs of one provider
+python generate_json.py                                      # rebuild missing per-run JSON summaries
+python check_status_codes.py data/some_run.csv.gz            # status-code breakdown of a run CSV
+```
+
+
 For the nightly scheduler, its systemd units, and operator commands like the same-day `assess-city` report, see [`deploy/README.md`](deploy/README.md) and [`docs/operations.md`](docs/operations.md).
 
 ## Output files
@@ -72,6 +84,7 @@ Everything lands in `./data` (override with `--download-dir`), where `{base}` is
 - **`{base}.json.gz`** — coverage/age statistics, temporal histograms, and the change-vs-previous-run block.
 - **`{city_id}_diff_{FROM}_to_{TO}.csv.gz`** — per-pano change detail between two runs of the same provider.
 - **`{base}_streets.json.gz`** — optional OSM street-coverage overlay, written by `streetscape_street_analyzer.analyze`.
+- **`{base}_failed_points.csv`** — written only when grid points still failed after every retry: `lat,lon,i,j,status`, one row each. Above 1% of points the run is refused outright and no snapshot is finalized, so this sidecar accompanies kept runs, whose residual failures also appear as rows in the snapshot itself.
 - **`cities.json.gz`** — the aggregate the website consumes: per city, per provider, latest stats + run history + change summary.
 - **`streetscape_tracker.db`** — the SQLite catalog. Local only, never published.
 - **`vis/{base}.html`** — an interactive map of the run.

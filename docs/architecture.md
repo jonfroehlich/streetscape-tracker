@@ -45,8 +45,9 @@ For all of these, NULL means "not measured", never zero and never a copy of a si
 Each provider is an independent run series on the same frozen grid.
 
 GSV issues one metadata request per grid point (nearest pano — a grid *sample*).
-Mapillary (`download_mapillary.py`) reads z14 vector tiles (~10–100 requests/city, `mapbox-vector-tile` dep) and keeps **every** `is_pano` image assigned to its nearest grid point (a *census*), one CSV row per pano plus ZERO_RESULTS fill; bogus contributor timestamps become NO_DATE.
-KartaView (`download_kartaview.py`) is the second census provider, a paginated radius sweep (#225/#239).
+Mapillary (`download_mapillary.py`) reads z14 vector tiles (~10–100 requests/city, `mapbox-vector-tile` dep) and keeps **every** `is_pano` image assigned to its nearest grid point (a *census*), one CSV row per pano; bogus contributor timestamps become NO_DATE.
+KartaView (`download_kartaview.py`) is the second census provider, a paginated radius sweep (#225/#239), and keeps exactly the same thing — `is_pano` is `projection == "SPHERE"`, and a flat photo never gets a row of its own.
+Neither census writes a row per flat image: a grid point covered *only* by flat imagery gets one `FLAT_ONLY` marker instead of ZERO_RESULTS (#116), which is what makes the second, wider **any-imagery** coverage number reportable beside the GSV-comparable 360° one — the two are never conflated, and GSV emits no `FLAT_ONLY` rows at all.
 The census pipeline itself — record → rows → grid assignment → written CSV — lives once in `census.py`; see [`census.md`](census.md) for its contracts, and [`capture-dates.md`](capture-dates.md) for the date seam every statistic reads through.
 
 Every provider writes the identical 9-column **core** (`config.METADATA_DTYPES`) and appends its own extras — Mapillary 16 columns in total, KartaView 18, all built by the one `census.build_image_rows`.
@@ -105,4 +106,7 @@ Every published JSON artifact carries a `schema_version`; the frontend's `adaptC
 | Streetwalk manifest | `streetwalks.json.gz` | 1 |
 | Driving-plan summary | `driving_plan.json.gz` | 1 |
 
-The streetwalk manifest's version deliberately stayed 1 across the v12 catalog additions — additive keys are absent, not null, on entries that predate them.
+The streetwalk manifest's version deliberately stayed 1 across the v12 catalog additions: every one of them is additive, and no existing key changed shape or meaning.
+The four scalar v12 keys (`length_km`, `length_km_covered`, `length_km_covered_any`, `median_covered_age_years`) are written unconditionally, so on a walk cataloged before v12 they are **present carrying `null`**, not absent; only the optional `coverage_by_highway` and `change` blocks are omitted when they have nothing to say.
+So key presence is never a version probe, and a null length means "this walk has no length cataloged" — never "this manifest predates lengths".
+One v1 manifest legitimately holds both, since a pre-v12 walk reads NULL until `scripts/backfill_streetwalk_length.py` runs.
