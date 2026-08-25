@@ -310,17 +310,39 @@ class SchedulerConfig:
             self.providers = {"gsv": ProviderConfig(daily_request_budget=self.daily_request_budget)}
 
     def enabled_providers(self) -> list[str]:
-        """Enabled channel names, most expensive first.
+        """Enabled channel names in a stable canonical order, most expensive first.
 
-        Order matters: a city's channels share one night's budget, so the series
-        that can actually exhaust a budget should claim it before the cheap ones.
-        gsv (grid) leads, then gsv_streets (the other per-request channel), then
-        the two tile-census Mapillary channels.
+        Deterministic and stable is most of what this buys, and the rest is
+        narrower than it looks. Two rationales this docstring used to give are
+        wrong, and both are recorded here because each one read as established
+        for long enough to be quoted elsewhere:
 
-        Above ``max_concurrent_channels = 1`` this is the SUBMIT order into the
-        lanes, and it still governs pricing for exactly the reason above. What it
-        does NOT do there is keep a per-IP host to one talker — host affinity in
-        the launch pass does that, and it would keep doing it under any ordering.
+        It is **not** a budget mechanism. ``daily_request_budget`` is per
+        ``ProviderConfig`` and ``db.get_api_usage`` is keyed by (date, provider),
+        so a city's channels never draw on a shared pot and no ordering can let
+        one claim it ahead of another. The pre-#240 wording ("run back-to-back
+        within one night's budget") was a claim about TIMING that was true
+        sequentially; rewording it to "share one night's budget" turned it into a
+        claim about a shared RESOURCE that was never true.
+
+        It does **not** decide what a batch deadline drops, either. That check
+        lives in ``_run_city_loop`` and fires BETWEEN cities, so once a city
+        starts, every one of its channels is attempted whatever the order — the
+        deadline only clamps each child's timeout, floored at
+        ``_MIN_CLAMPED_TIMEOUT_S``. Ranking a channel last therefore does not
+        protect a night from it.
+
+        What the order genuinely decides is which channels are already LAUNCHED
+        when something stops the city mid-flight. A SIGTERM wind-down is a submit
+        gate (#206): whatever has not been launched is declined and named by
+        ``_log_stop_declined``, so order picks the survivors. Above
+        ``max_concurrent_channels = 1`` this is also the submit order into the
+        lanes, so when a city has more channels than lanes it decides which claim
+        a slot first — and at one lane it is simply the execution order.
+
+        What it does NOT do above one lane is keep a per-IP host to one talker —
+        host affinity in the launch pass does that, and it would keep doing it
+        under any ordering.
         """
         rank = {"gsv": 0, "gsv_streets": 1, "mapillary": 2, "mapillary_streets": 3}
         return sorted(
