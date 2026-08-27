@@ -795,20 +795,38 @@ def estimate_kartaview_requests(conn, city: db.CityRow) -> int:
     if conn is None:
         return geometry
 
-    prior = conn.execute(
-        """SELECT api_requests FROM runs
-           WHERE city_id = ? AND provider = 'kartaview' AND api_requests > 0
-           ORDER BY run_date DESC LIMIT 1""",
-        (city.city_id,),
-    ).fetchone()
-    if not prior:
+    prior = _prior_kartaview_spend(conn, city.city_id)
+    if prior is None:
         return geometry
     # max(), never the prior alone -- see the precedence note above. The prior
     # wins on every city whose grid has not grown (it is larger than the
     # default-radius lattice on exactly the r=500 metros this tier exists for),
     # and a grown grid falls back to geometry instead of pricing a bbox that no
     # longer exists.
-    return max(geometry, max(1, int(prior["api_requests"])))
+    return max(geometry, max(1, prior))
+
+
+def _prior_kartaview_spend(conn, city_id: str) -> int | None:
+    """This city's last COMPLETE sweep's observed cost, or None if it has none.
+
+    One query behind two readers: :func:`estimate_kartaview_requests`' tier 1,
+    and ``_enrolment_cost_note``, which has to say WHICH tier the number it is
+    about to print came from — a tier-2 figure is the default-radius geometry
+    and can be ~4x low on an r=500 metro. Sharing the query rather than
+    repeating it keeps "does a prior exist" from drifting away from "what does
+    the estimator do with it", which is the pair a reader has to trust
+    together.
+
+    ``api_requests > 0`` rather than NOT NULL, matching the estimator: a
+    cataloged run that recorded no spend prices nothing.
+    """
+    row = conn.execute(
+        """SELECT api_requests FROM runs
+           WHERE city_id = ? AND provider = 'kartaview' AND api_requests > 0
+           ORDER BY run_date DESC LIMIT 1""",
+        (city_id,),
+    ).fetchone()
+    return None if row is None else int(row["api_requests"])
 
 
 def estimate_requests(
@@ -1709,6 +1727,19 @@ def _enrolment_cost_note(conn, cfg: SchedulerConfig, city: db.CityRow, channel: 
     keeping the enrolled set to cities whose estimate is well under one — a
     decision the operator can only make if the number is in front of them.
 
+    A second line names the estimator's own error bar when this city has no
+    prior sweep to read, and that caveat is the reason the number is worth
+    printing rather than a hedge on it. ``estimate_kartaview_requests``' tier 2
+    must assume the default ``r=1000``, because the working radius is a
+    property of the LOCATION and is measured once per city by
+    ``calibrate_radius``; a city that calibrates down to ``r=500`` costs ~4x
+    this figure (Singapore, New York and Manila all do). No city has a
+    cataloged KartaView run today, so tier 2 is what EVERY enrolment prints —
+    and nothing downstream absorbs that miss, because the daily budget guard is
+    a pre-flight check against this same estimate and the child is handed no
+    request cap at all (issue #273). The operator reading this line is
+    currently the last gate.
+
     Empty for a channel with no sweep estimator; ``kartaview`` is the only
     opt-in channel today.
     """
@@ -1726,7 +1757,16 @@ def _enrolment_cost_note(conn, cfg: SchedulerConfig, city: db.CityRow, channel: 
         minutes = requests / rate
         paced = f"{minutes:.0f} min" if minutes < 90 else f"{minutes / 60:.1f} h"
         line += f" (~{paced} paced at {rate}/min)"
-    return [line]
+    lines = [line]
+    # `is None` rather than falsy: a previous sweep is the observed tier
+    # whatever it cost, and 0 requests is not a thing a cataloged run records.
+    if _prior_kartaview_spend(conn, city.city_id) is None:
+        lines.append(
+            "  NOTE  no prior sweep for this city, so that is the GEOMETRY estimate at the "
+            "default r=1000. A city that calibrates to r=500 costs ~4x it, and nothing "
+            "caps the child's spend (#273) — treat it as a floor."
+        )
+    return lines
 
 
 def cmd_enroll_city(
@@ -1768,6 +1808,14 @@ def cmd_enroll_city(
     This deliberately does NOT refuse on ``cfg.unwired_channel_errors``:
     enrolment has to work BEFORE the config block exists or the rollout order
     is impossible. It notes the situation instead.
+
+    ``--list`` is read-only and therefore scoped differently from the rest:
+    it accepts any known channel, including a default-membership one, because
+    "who is in this channel's queue" is a true and answerable question there
+    ("every enabled city") with no hazard behind refusing it. It refuses to
+    run beside ``--remove``/``--clear``, which argparse's mutually exclusive
+    group does not cover — those flags would otherwise be accepted, ignored,
+    and exit 0, which is the silent no-op this whole command exists to stop.
     """
     try:
         # Channel validation first, before the catalog is even opened, so an
@@ -1777,7 +1825,19 @@ def cmd_enroll_city(
                 f"--channel {channel}: unknown channel. Known: "
                 f"{', '.join(sorted(CHANNEL_DEFAULT_MEMBERSHIP))}"
             )
-        if not is_opt_in_channel(channel):
+        if list_only and (remove or clear):
+            # argparse's mutually exclusive group covers --remove/--clear but
+            # not --list, and `list_only` short-circuits the whole write path
+            # below — so without this, `--list --remove` lists and exits 0
+            # having changed nothing. A silent no-op is the exact failure this
+            # command exists to prevent; it cannot ship one of its own.
+            raise _UsageError("--list cannot be combined with --remove or --clear")
+        # The opt-in guard is scoped to the WRITE path. Listing a channel's
+        # members is read-only and answers correctly for any channel — under a
+        # default-membership channel it is "every enabled city", which is a
+        # true and occasionally useful answer, and refusing it would be a
+        # refusal with no hazard behind it.
+        if not list_only and not is_opt_in_channel(channel):
             # Per-city exclusion for a default-membership channel already has a
             # handle: cities.enabled. Shipping a second, less visible way to
             # disable a city on gsv is how two operators end up disagreeing
@@ -3293,10 +3353,8 @@ def _collect_due(conn, cfg: SchedulerConfig, today: date, providers: list[str]):
     #
     # For a city due on both gsv and an opt-in channel that is already right:
     # it sits in gsv's stalest-first list and both channels run the same night.
-    # It breaks in exactly one case, and it is the case #239's checkpoint
-    # exists for. A deliberately paused sweep exits SWEEP_INCOMPLETE_EXIT_CODE
-    # and is amnestied, so the city stays due on that channel — but its gsv run
-    # SUCCEEDED, so gsv's clock advanced and gsv will not surface it again for
+    # It breaks for a city whose sweep did not finish, because its gsv run
+    # SUCCEEDED — so gsv's clock advanced and gsv will not surface it again for
     # ~83 days. The city falls to the tail of the union and is truncated by the
     # city cap, which is what makes docs/scheduler.md's "leads tomorrow's
     # stalest-first queue" true of the channel's own list and false of the
@@ -3304,6 +3362,23 @@ def _collect_due(conn, cfg: SchedulerConfig, today: date, providers: list[str]):
     # "five nights" from a figure of speech into a mechanism: the five
     # consecutive_failures a SIGKILL can burn are survivable only while the
     # five nights are CONSECUTIVE, so #239's checkpointed progress accumulates.
+    #
+    # WHICH unfinished sweep, precisely, because the two arms behave differently
+    # and only one of them is live today:
+    #
+    #   * A SIGKILL at the per-city timeout. This is the arm a nightly batch
+    #     actually takes. The checkpoint on disk survives, so tomorrow resumes —
+    #     but the kill has no exit code, so it counts a consecutive_failure, and
+    #     `attempted` was incremented, so it DID consume a city-cap slot. The
+    #     hoist is what makes tomorrow's retry the FIRST slot rather than one
+    #     truncated away.
+    #   * A deliberate pause (SWEEP_INCOMPLETE_EXIT_CODE, amnestied in
+    #     _run_city_channels, consuming no slot). NOT REACHABLE FROM run-due
+    #     TODAY: download_kartaview sets its `stop_reason` only from the
+    #     `max_requests` guard, and _run_one_city deliberately does not pass
+    #     `--kartaview-max-requests` (see _SWEEP_OVERHEAD_MULTIPLIER above).
+    #     That is issue #273; when it lands this becomes the common arm and the
+    #     five-night bound stops binding. The hoist is written for both.
     #
     # `all`, not `any`, and the choice is the blast radius. A city due on gsv
     # too needs no hoist (see above), and there is no pairing argument either:
@@ -3325,7 +3400,12 @@ def _collect_due(conn, cfg: SchedulerConfig, today: date, providers: list[str]):
         keys = [
             0 if all(p in opt_in for p in providers_for_city[c.city_id]) else 1 for c in ordered
         ]
-        hoisted = keys.count(0)
+        # Counted only when there is something for them to be ahead OF. An
+        # all-0 slate is the identity permutation just as an all-1 one is, and
+        # it is not a corner case: `run-due --provider kartaview` makes every
+        # due city opt-in-only, so an unguarded count would report the whole
+        # slate as reordered on every catch-up.
+        hoisted = keys.count(0) if 0 in keys and 1 in keys else 0
         # Stable sort on a boolean key: with no opt-in channel configured every
         # key is 1 and this is the identity permutation, which is what makes
         # PR A's inertness provable by construction rather than argued. (The
@@ -3534,6 +3614,20 @@ def cmd_run_due(
         # byte-identical to today's.
         + (f"; hoisted={hoisted} opt-in-only cities" if hoisted else "")
     )
+    if hoisted and hoisted >= max_cities:
+        # The hoist is deliberately UNBOUNDED (docs/scheduler.md records the
+        # trade and names the eventual fix as reserved slots per opt-in
+        # channel, issue #282). Unbounded plus a city cap has one arithmetic
+        # consequence worth saying out loud on the night it happens: once the
+        # opt-in-only cities alone fill the cap, every default-membership
+        # channel collects NOTHING, and the only trace would otherwise be an
+        # INFO count an operator has to do the subtraction on.
+        logger.warning(
+            f"{hoisted} opt-in-only cities fill the city cap ({max_cities}), so "
+            f"{', '.join(p for p in providers if not is_opt_in_channel(p))} will collect "
+            f"nothing tonight. Narrow the enrolled set (`enroll-city --remove`) or raise "
+            f"[schedule].max_cities_per_day."
+        )
     if requested_providers is not None and set(providers) != set(cfg.enabled_providers()):
         # Say out loud what a filtered run costs, because nothing downstream
         # will. `get_due_cities` derives dueness from `schedule_state
@@ -4656,7 +4750,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--list",
         dest="list_only",
         action="store_true",
-        help="List the channel's current members and exit; CITY is then optional.",
+        help="List the channel's current members and exit; CITY is then optional. "
+        "Read-only, so it accepts a default-membership channel too (the answer "
+        "there is every enabled city). Cannot be combined with --remove/--clear.",
     )
     p_regen = sub.add_parser(
         "regenerate-aggregate",

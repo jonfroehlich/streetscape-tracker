@@ -199,3 +199,69 @@ def test_purge_removes_downloading_siblings(catalog):
     purge_run(conn, data_dir, item["run"], item["reason"], execute=True)
     for s in siblings:
         assert not os.path.exists(s)
+
+
+def test_the_re_arm_says_so_when_the_pair_is_a_channel_member(catalog, caplog):
+    """The default-membership case: the re-arm really does re-arm, so the log
+    states it plainly and nothing warns.
+
+    Membership gates BEFORE staleness in get_due_cities (#248), so this branch
+    is what makes "clearing last_success_at makes the city due again" a true
+    sentence rather than an assumed one — and gsv defaults to member, which is
+    why the four scheduled channels see no change here at all.
+    """
+    import logging
+
+    conn, data_dir, city_id, clean_run, tainted_run = catalog
+    [item] = find_runs_to_purge(conn, data_dir, "2026-07-16", "gsv")
+    with caplog.at_level(logging.INFO, logger="purge_tainted_runs"):
+        purge_run(conn, data_dir, item["run"], item["reason"], execute=True)
+
+    assert "clear schedule_state.last_success_at for gsv" in caplog.text
+    assert "re-arms nothing" not in caplog.text
+
+
+def test_the_re_arm_warns_when_the_pair_is_not_a_channel_member(catalog, caplog):
+    """The opt-in case, and the reason this branch exists: on a non-member pair
+    the UPDATE below succeeds and re-arms NOTHING.
+
+    `get_due_cities` COALESCEs membership before it ever looks at staleness, so
+    a NULLed last_success_at on a city nobody enrolled leaves it exactly as
+    undue as it was. Logging a re-arm that did not happen is the same failure
+    the re-arm itself exists to prevent — a missed re-collect hiding as a green
+    skip — so it warns and names the handle instead.
+    """
+    import logging
+
+    conn, data_dir, city_id, clean_run, tainted_run = catalog
+    # Retarget the tainted run onto the one opt-in channel, nobody enrolled.
+    conn.execute("UPDATE runs SET provider = 'kartaview' WHERE run_id = ?", (tainted_run,))
+    conn.commit()
+
+    [item] = find_runs_to_purge(conn, data_dir, "2026-07-16", "kartaview")
+    with caplog.at_level(logging.INFO, logger="purge_tainted_runs"):
+        purge_run(conn, data_dir, item["run"], item["reason"], execute=True)
+
+    assert "is not a member of kartaview" in caplog.text
+    assert "enroll-city" in caplog.text, "the warning has to name the handle that fixes it"
+    assert "clear schedule_state.last_success_at" not in caplog.text
+
+
+def test_an_enrolled_pair_on_an_opt_in_channel_re_arms_normally(catalog, caplog):
+    """Enrolment flips the branch above, which is what keeps the warning a
+    statement about THIS pair rather than about the channel."""
+    import logging
+
+    from streetscape_metadata_tracker import db as sdb
+
+    conn, data_dir, city_id, clean_run, tainted_run = catalog
+    conn.execute("UPDATE runs SET provider = 'kartaview' WHERE run_id = ?", (tainted_run,))
+    conn.commit()
+    sdb.set_channel_membership(conn, city_id, "kartaview", True, cycle_days=90)
+
+    [item] = find_runs_to_purge(conn, data_dir, "2026-07-16", "kartaview")
+    with caplog.at_level(logging.INFO, logger="purge_tainted_runs"):
+        purge_run(conn, data_dir, item["run"], item["reason"], execute=True)
+
+    assert "clear schedule_state.last_success_at for kartaview" in caplog.text
+    assert "re-arms nothing" not in caplog.text

@@ -29,6 +29,9 @@ Derived values are then clamped to what is left of the batch deadline (never bel
 A *deliberate* pause exits `SWEEP_INCOMPLETE_EXIT_CODE` (83) and is amnestied in `_run_city_channels` beside the blocked- and busy-host conditions, so it can repeat indefinitely; a SIGKILL has no exit code, nothing can tell one that checkpointed progress from one that made none, and it counts a `consecutive_failure` that only a success resets — so five clamped nights quarantine the city for a 90-day cycle.
 A metro sweep that cannot finish inside five nights therefore needs #248's per-(city, provider) dueness, not a larger timeout constant.
 That budget of five is survivable only if the five nights are **consecutive**, so the checkpointed progress accumulates — and consecutive is what `_collect_due`'s hoist buys.
+Note which of the two unfinished-sweep arms a nightly batch actually takes today: the SIGKILL one.
+The deliberate pause is **not reachable from `run-due`** — `download_kartaview` sets its `stop_reason` only from the `max_requests` guard, and `_run_one_city` deliberately passes no `--kartaview-max-requests` (#273) — so exit 83, its amnesty and its "consumes no city-cap slot" property are all dormant until #273 lands.
+A kill does count a `consecutive_failure` and does consume a slot, which is exactly why the five-night bound binds and why the hoist has to put tomorrow's retry in the *first* slot rather than merely in the list.
 The union of the per-channel due lists is ordered by first appearance, so `gsv` (rank 0) dictates city order; a city whose `gsv` run succeeded but whose sweep paused sits at the tail of ~949 cities and is truncated by `max_cities_per_day`, returning months later rather than tomorrow.
 The hoist moves a city to the head of the slate when **every** channel it is due on is opt-in — `all`, not `any`, so a city due on `gsv` too keeps its exact union position and `gsv`'s stalest-first ordering is strictly untouched.
 It reorders the **city list only**, never the union loop, because `providers_for_city` is passed straight to `_run_city_channels` where `pending = list(providers)` *is* the launch order.
@@ -168,7 +171,8 @@ This is the issue's **Shape A**: the loop over cities is unchanged, so a night's
 The opt-in hoist (#248) is the one deliberate exception to Shape A's "the loop over cities is unchanged", and it carries a cost worth stating: a city that pauses is due tomorrow, hoists to index 0, runs first, and `city_timeout_seconds` clamps it to what is left of `max_batch_hours` — so it can take essentially the whole night, every night, for as long as it keeps pausing.
 Today's `gsv`-first ordering is *accidentally* protecting the nightly slate from that, and the hoist removes the protection at the same moment it enables the channel that needs it.
 The seed set is safe because Krabi and Yogyakarta are small, which is a property of the curated set rather than of the design; `enroll-city` prints each city's lattice estimate so keeping the set under one night is a decision rather than a discovery.
-If the set ever widens, the fix is reserved slots per opt-in channel, not an unbounded hoist.
+If the set ever widens, the fix is reserved slots per opt-in channel, not an unbounded hoist — filed as #282, because the mechanism's success case and its starvation case are the same case at different N.
+Until it lands the only guard is an alert: `cmd_run_due` logs a `WARNING` when the hoisted count reaches `max_cities_per_day`, naming the channels that will therefore collect nothing, since the arithmetic that produces a night of zero `gsv` is otherwise recoverable only by subtracting two numbers on an INFO line.
 That is the cost `docs/provider-access.md` records for `--provider` filtering, made permanent and universal; the expensive-city problem it would have solved is #239's, which does not require the trade.
 **What lanes buy is lanes, not throughput.**
 Each channel keeps its own limiter and its own daily budget, so no provider is asked for anything faster or larger than before; what stops is independent work queueing behind unrelated work.
@@ -229,6 +233,7 @@ Assignment is **not** enrolment: on an opt-in channel it creates a row per enabl
 It refuses (`USAGE_EXIT_CODE`, changing no row) an unknown channel, a **default-membership** channel (per-city exclusion for `gsv` is `cities.enabled`, and a second less visible way to disable a city is how two operators disagree about why it stopped), an unresolvable city, and a city with `cities.enabled = 0`.
 It deliberately does **not** refuse while the channel is still unwired or unconfigured — enrolment must precede the config block or the rollout order is impossible — and prints a `NOTE` saying nothing collects it yet.
 `--remove` writes an explicit `0` and `--clear` restores NULL; the two are indistinguishable to dueness today and kept apart because only the explicit `0` survives a future flip of the channel default.
+`--list` is scoped differently from the rest because it is read-only: it accepts a **default-membership** channel too (the answer there is every enabled city), and it refuses to run beside `--remove`/`--clear`, which argparse's mutually exclusive group does not cover and which would otherwise be accepted, ignored and exit 0.
 A known, deliberate foreclosure: a **kartaview-only city is inexpressible**, since registering one makes it `enabled = 1` and therefore a member of all four default channels.
 Revisit that only if widening wants Grab-market cities we would not otherwise collect.
 

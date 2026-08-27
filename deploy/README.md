@@ -710,8 +710,28 @@ python -m streetscape_metadata_tracker.scheduler --config <cfg> \
     enroll-city --channel kartaview --list
 ```
 
-It only accepts an **opt-in** channel — one whose default membership is off (`kartaview` today).
+It only accepts an **opt-in** channel — one whose default membership is off (`kartaview` today) — for the WRITE path.
+`--list` is read-only and accepts any channel; on a default-membership one the answer is every enabled city.
 Per-city exclusion on `gsv`, `mapillary` and the two street channels stays `cities.enabled`, deliberately: a second, less visible way to disable a city is how two operators end up disagreeing about why it stopped collecting.
+
+### Turning the KartaView channel on in production (#248)
+
+The repo default `config/scheduler.toml` declares `[providers.kartaview]`; **production reads `config/scheduler.makelab1.toml`, which deliberately does not**, so deploying the code changes nothing.
+Flipping it is four steps, in this order, and the order matters — enrolment must precede the config block, or the first night after the flip runs the channel over an empty queue and tells you nothing:
+
+1. **The token first.** `KARTAVIEW_ACCESS_TOKEN` into the production `.env`. It is required, not optional: anonymous is 100 req/h against 1,000 authenticated, at which a p95 city is hours and Singapore is days — see [`../docs/provider-access.md`](../docs/provider-access.md). Verify with a single hand-run `streetscape_tracker.py --provider kartaview` on one small city before anything is scheduled.
+2. **Enrol the seed cities**, with the channel still absent from the production config. `enroll-city` prints each city's estimate and says `NOTE ... not enabled in this config, so nothing collects it yet`, which is the expected output at this point.
+3. **Add the `[providers.kartaview]` block** to `config/scheduler.makelab1.toml`, copying the repo default's budget and rate. Read that block's comments first: `daily_request_budget` is a pre-flight gate against an *estimate*, not a ceiling on what the child spends (#273), and a city whose estimate exceeds it is skipped permanently rather than deferred (#274).
+4. **Watch one night.** `hoisted=N opt-in-only cities` on the opening line says the reorder took; a `WARNING` that the hoisted count filled the city cap says the enrolled set is already too wide (#282). Check `kartaview budget today` in `status` against what the sweep actually spent — the gap between them is #273 measured.
+
+**The revert is one line**: delete the `[providers.kartaview]` block from `config/scheduler.makelab1.toml` and redeploy.
+Enrolment rows survive that and cost nothing while the channel is unconfigured, so there is no need to un-enrol as part of a rollback.
+
+**Never deploy mid-batch.** The scheduler launches a fresh `streetscape_tracker.py` per city out of the deployed tree, so an rsync while `run-due` is in flight changes the code the *next* city runs — and a schema migration would be applied by a child while the parent is still executing the previously-loaded module. Check for a live batch first:
+
+```bash
+pgrep -af 'scheduler .*run-due'
+```
 
 A city that fails `max_consecutive_failures` nights in a row is skipped
 automatically until you reset it:
