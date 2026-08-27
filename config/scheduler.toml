@@ -272,13 +272,27 @@ max_requests_per_minute = 60
 # max_concurrent_channels ceiling moves from 3-of-4 to 4-of-5.
 [providers.kartaview]
 enabled = true
-# Must clear the largest ENROLLED city's estimate or the budget guard skips it
-# *permanently* — `_run_city_channels` treats est > budget as a skip, and
-# `estimate_kartaview_requests` prices the whole sweep rather than a resuming
-# city's remainder, so no amount of checkpointing gets such a city collected.
-# That is issue #274. 10,000 clears the largest city the cost study measured
+# READ BOTH HALVES BEFORE ENROLLING A METRO. This number is a FLOOR that must
+# be cleared, and it is NOT a ceiling on what a night spends.
+#
+# The floor (#274): must clear the largest ENROLLED city's estimate or the
+# budget guard skips it *permanently* — `_run_city_channels` treats est >
+# budget as a skip, and `estimate_kartaview_requests` prices the whole sweep
+# rather than a resuming city's remainder, so no amount of checkpointing gets
+# such a city collected. 10,000 clears the largest city the cost study measured
 # (Singapore, ~9,974). Note the arithmetic honestly: 16/min x 10 h is ~9,600,
 # so a night can physically spend slightly less than this ceiling.
+#
+# Not a ceiling (#273): the guard is a PRE-FLIGHT check against an ESTIMATE,
+# and the child is handed no request cap at all — `_run_one_city` passes
+# `--kartaview-max-requests` to nothing. The estimate it checks is the geometry
+# tier for every enrolled city today, because no city has ever had a cataloged
+# KartaView run for the observed tier to read, and that tier must assume the
+# default r=1000: a city calibrating to r=500 costs ~4x it (Singapore, New York
+# and Manila all do — see docs/experiments/kartaview-sweep-cost.md). So a first
+# sweep of such a city can overspend this figure with nothing but the per-city
+# wall-clock timeout to stop it. Fine at the seed set, which is small and
+# hand-checked; the number to widen is this one only after #273.
 daily_request_budget = 10000
 # DEFAULT_SWEEP_REQUESTS_PER_MINUTE — 960/h, under the documented 1,000/h
 # authenticated ceiling. Load-bearing beyond pacing: _kartaview_timeout_seconds
