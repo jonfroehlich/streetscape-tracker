@@ -114,10 +114,11 @@ CHANNEL_HOSTS: dict[str, tuple[str, ...]] = {
     "gsv_streets": (HOST_OVERPASS,),
     "mapillary": (HOST_MAPILLARY_TILES,),
     "mapillary_streets": (HOST_OVERPASS, HOST_MAPILLARY_TILES),
-    # Declared even though no kartaview channel can be configured yet (see
-    # UNWIRED_CHANNELS): test_every_scheduled_channel_declares_its_per_ip_hosts
-    # asserts set EQUALITY against KNOWN_PROVIDERS, so the token landing without
-    # this entry is a red test rather than a channel that silently fails open.
+    # kartaview shares its host with nothing, which is why it is the channel
+    # that moves the effective concurrency ceiling from 3-of-4 to 4-of-5.
+    # test_every_scheduled_channel_declares_its_per_ip_hosts asserts set
+    # EQUALITY against KNOWN_PROVIDERS, so a token landing without an entry
+    # here is a red test rather than a channel that silently fails open.
     "kartaview": (HOST_KARTAVIEW,),
 }
 
@@ -185,24 +186,14 @@ def is_opt_in_channel(name: str) -> bool:
 #     timeout derived from that rate could be measured against a rate the sweep
 #     never used. Now sent as --kartaview-max-requests-per-minute.
 #
-# DUENESS IS NOW WIRED TOO (#248): CHANNEL_DEFAULT_MEMBERSHIP makes this an
-# opt-in channel, so its nightly queue is the cities an operator enrolled with
-# `enroll-city` and not all 1,144 -- and _collect_due hoists an opt-in-only city
-# so the queue is actually reached. The refusal stays for the LAST step, which
-# is a deliberate second change rather than an oversight: landing
-# [providers.kartaview] anywhere makes this a FIFTH channel, and a cluster of
-# tests and prose asserting the concurrency ceiling is "3 of 4" (kartaview
-# declares HOST_KARTAVIEW, shared with nothing, so it becomes 4 of 5) turns over
-# with it. Removing this entry belongs in that change.
-UNWIRED_CHANNELS: dict[str, str] = {
-    "kartaview": (
-        "collectable by hand via `streetscape_tracker.py --provider kartaview`, "
-        "and its timeout, request estimate, channel order, pacing (#238) and "
-        "per-(city, channel) dueness (#248) are all wired -- but no config has "
-        "declared it as a channel yet, and doing so makes it the fifth, which "
-        "moves the concurrency ceiling from 3-of-4 to 4-of-5"
-    ),
-}
+# DUENESS WAS THE LAST BLOCKER AND IS NOW WIRED (#248): CHANNEL_DEFAULT_MEMBERSHIP
+# makes kartaview an opt-in channel, so its nightly queue is the cities an
+# operator enrolled with `enroll-city` rather than all 1,144, and _collect_due
+# hoists an opt-in-only city so that queue is actually reached. The entry is
+# gone; the dict stays, because the record/drop/don't-raise asymmetry above is
+# the mechanism the NEXT unwired channel needs, and rebuilding it from scratch
+# under time pressure is how a fail-open arm gets missed again.
+UNWIRED_CHANNELS: dict[str, str] = {}
 
 
 logger = logging.getLogger("streetscape_scheduler")
@@ -298,9 +289,10 @@ class SchedulerConfig:
     # host-disjoint lanes, which compresses a night's WALL CLOCK only; no
     # channel goes faster, because each keeps its own limiter and its own daily
     # budget. Channels that share a per-IP third party never overlap whatever
-    # this says (the launch pass defers them), so with today's four channels the
-    # effective ceiling is 3: mapillary_streets shares Overpass with gsv_streets
-    # and the tile CDN with mapillary, so it always runs after both.
+    # this says (the launch pass defers them), so with today's five channels the
+    # effective ceiling is 4: mapillary_streets shares Overpass with gsv_streets
+    # and the tile CDN with mapillary, so it always runs after both, while
+    # kartaview shares its host with nothing and can always take a lane.
     max_concurrent_channels: int = 1
     # [download]
     batch_size: int = 100

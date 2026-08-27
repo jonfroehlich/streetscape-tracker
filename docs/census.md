@@ -234,23 +234,24 @@ Without the variant a walk that dies after its census but before `register_stree
 Both walks read the same tiles, so the census is identical and nothing downstream would show it.
 A grid run has exactly one crawl per channel and passes no variant, which keeps its path byte-identical to the one #239 shipped.
 
-## Still NOT a scheduler channel (issue #248)
+## An opt-in scheduler channel (issue #248)
 
-**Still NOT a scheduler channel, and a `[providers.kartaview]` block is refused rather than accepted — recorded and dropped at load, with `run-due`/`assess-city` exiting `USAGE_EXIT_CODE` while it exists.** The token that makes the CLI work also makes that config block *parse*,
-and four arms in `scheduler.py` were fail-open behind it.
+**KartaView is a scheduler channel, and the only one whose membership is opt-in: `[providers.kartaview]` in `config/scheduler.toml` declares it, and its nightly queue is exactly the cities an operator enrolled with `scheduler enroll-city`.** Getting here took four fail-open arms plus dueness, and the reason each one looks as it does is that the token making the CLI work also made that config block *parse*.
 **Three are now wired (#238)**: `city_timeout_seconds` has a `_kartaview_timeout_seconds` arm where its allow-list used to return the flat `city_timeout_minutes` floor (SIGKILLing Singapore's ~10.4 h sweep at 180 min, with a killed child recording **no** `api_usage`);
 `estimate_requests` has an `estimate_kartaview_requests` arm where it used to fall through to the **GSV grid formula**;
 `enabled_providers` ranks it explicitly last rather than by `rank.get(p, 99)`'s accident — the rule being "most expensive first, EXCEPT where truncation is cheapest to absorb", with this channel as the exception that proves the second half (the mechanism, and the four rationales that were wrong before it, are in [`docs/scheduler.md`](scheduler.md));
 and `_run_one_city` now hands the child `--kartaview-max-requests-per-minute`, without which a timeout derived from the configured rate would be measured against a rate the sweep never used.
-None of those raised, so `UNWIRED_CHANNELS` is what refuses — a misspelled channel is a typo worth dropping silently, but this one is spelled correctly and would have collected wrongly every night.
-The refusal is scoped to the commands that launch channels rather than raised at load: `load_scheduler_config` drops the block from `providers` (so nothing downstream can price or launch it) and records the error in `SchedulerConfig.unwired_channel_errors`, `run-due` and `assess-city` refuse with `USAGE_EXIT_CODE` while it is non-empty, and the read-only subcommands
+None of those raised, so `UNWIRED_CHANNELS` is what refused a `[providers.kartaview]` block until all five were wired — a misspelled channel is a typo worth dropping silently, but this one was spelled correctly and would have collected wrongly every night.
+That mechanism is still there and now holds nothing: `load_scheduler_config` drops an unwired block from `providers` and records the error in `SchedulerConfig.unwired_channel_errors`, `run-due` and `assess-city` refuse with `USAGE_EXIT_CODE` while it is non-empty, and the read-only subcommands
 — `backup-status` and `restore-backup` are the incident-time handles
 — keep working with the error in the log, which a load-time `ValueError` used to take down over a block they could never act on.
-`CHANNEL_HOSTS["kartaview"]` is declared regardless, because `test_every_scheduled_channel_declares_its_per_ip_hosts` asserts set **equality** against `KNOWN_PROVIDERS`.
+Keeping the empty dict and its tests (driven by a monkeypatched synthetic entry) is deliberate: that record/drop/don't-raise asymmetry is what the next unwired channel inherits, and rebuilding it under time pressure is how a fail-open arm gets missed again.
+`CHANNEL_HOSTS["kartaview"]` is declared because `test_every_scheduled_channel_declares_its_per_ip_hosts` asserts set **equality** against `KNOWN_PROVIDERS` — and because that host is shared with nothing, which is what moves the effective `max_concurrent_channels` ceiling from 3-of-4 to 4-of-5.
 **Dueness is now wired too (#248).** `get_due_cities` no longer gates on `cities.enabled` alone: `schedule_state.member` is per (city, channel), and `scheduler.CHANNEL_DEFAULT_MEMBERSHIP` says what a NULL means per channel — `True` for the four scheduled channels, so their dueness is byte-identical, and `False` for `kartaview`, so its nightly queue is the cities an operator enrolled with `scheduler enroll-city` rather than all 1,144 at ~186,000 requests per pass.
 `_collect_due` then hoists a city due *only* on an opt-in channel to the head of the slate, because the union is ordered by first appearance and `max_cities_per_day` truncates from the tail — without that the channel is scoped but never reached.
-What still refuses the config block is that landing `[providers.kartaview]` makes this a **fifth** channel, which moves the concurrency ceiling from 3-of-4 to 4-of-5 (`HOST_KARTAVIEW` is shared with nothing) and turns over the tests and prose asserting the old figure.
-That is a deliberate second change, not an oversight.
+The seed set is deliberately a handful of hand-verified cities rather than the cost study's ~40-city Grab-fleet set: prove a night end to end, widen after.
+No city has ever had a cataloged KartaView run, so every enrolled city prices from `estimate_kartaview_requests`' geometry tier, which `docs/experiments/kartaview-sweep-cost.md` records as ~4× under on the metros that calibrate to r=500.
+One consequence to state rather than discover at widening time: a **kartaview-only city is inexpressible**, since registering one makes it `enabled = 1` and therefore a member of all four default channels.
 
 **The cost arms, and the two numbers that are easy to swap (#238).** The estimate is `estimate_sweep_requests` × **1.80×**, and the multiplier is not optional: the lattice counts one page-1 per root circle and prices neither the extra pages, the backpressure retries nor the per-city calibration ladder.
 Use **1.80×** (`summary.observed_over_root_cells.p50`) and not the **1.54×** the same study reports, because the two have different denominators — 1.54× is `observed_over_floor`, measured against a floor that counts cells *plus pages 2+*, where `estimate_sweep_requests` counts cells alone, so quoting it here would under-price the pages twice over.

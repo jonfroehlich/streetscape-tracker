@@ -916,6 +916,58 @@ def test_regenerate_aggregate_reports_a_failed_driving_plan_rebuild(conn, monkey
     assert "driving_plan.json.gz NOT regenerated" in capsys.readouterr().out
 
 
+def test_the_repo_default_config_declares_kartaview_as_an_opt_in_channel():
+    """The flip, pinned in the file it actually lands in (issue #248).
+
+    Two halves, and the second is the one that makes the first safe: the
+    channel is declared, AND it is opt-in, so declaring it enrols nobody. A
+    default-membership kartaview would put all 1,144 enabled cities in its
+    nightly queue at ~186,000 requests a pass — the thing this whole issue
+    exists to prevent — and nothing else in the config would say so.
+
+    The budget is pinned exactly because it is not a round number: it clears
+    the largest city the cost study measured (Singapore, ~9,974), and a city
+    whose estimate exceeds the daily budget is skipped PERMANENTLY rather than
+    deferred (issue #274).
+    """
+    from streetscape_metadata_tracker.scheduler import (
+        DEFAULT_SWEEP_REQUESTS_PER_MINUTE,
+        is_opt_in_channel,
+    )
+
+    cfg = load_scheduler_config(os.path.join(_PROJECT_ROOT, "config", "scheduler.toml"))
+    assert "kartaview" in cfg.enabled_providers()
+    assert is_opt_in_channel("kartaview"), "declaring it must not enrol the catalog"
+    assert cfg.providers["kartaview"].daily_request_budget == 10_000
+    # _kartaview_timeout_seconds derives the per-city timeout from this rate,
+    # so it is not only a pacing figure.
+    assert cfg.providers["kartaview"].max_requests_per_minute == DEFAULT_SWEEP_REQUESTS_PER_MINUTE
+
+
+def test_a_declared_kartaview_channel_still_collects_nothing_until_a_city_is_enrolled(
+    conn, monkeypatch
+):
+    """The flip's whole safety property, end to end through a night.
+
+    The config is enabled, the channel is priced, ranked and paced — and the
+    nightly queue is empty, because membership defaults to off. This is what
+    lets the repo default carry the block at all.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    _register(conn, "Bend", width=1000, height=1000, step=20)
+    ran = []
+    _run_loop_with(
+        monkeypatch,
+        conn,
+        _sweep_cfg(publish_enabled=False),
+        lambda city, provider: ran.append(provider) or True,
+        today=date(2026, 7, 2),
+    )
+    assert "kartaview" not in ran
+    assert sched.db.count_channel_members(conn, "kartaview", False) == 0
+
+
 def test_makelab1_production_config_is_wired():
     # Guard the checked-in production config the systemd unit points at.
     #
@@ -925,6 +977,10 @@ def test_makelab1_production_config_is_wired():
     # in step deliberately, which is what this assertion is for.
     cfg = load_scheduler_config(os.path.join(_PROJECT_ROOT, "config", "scheduler.makelab1.toml"))
     assert cfg.enabled_providers() == ["gsv", "gsv_streets", "mapillary", "mapillary_streets"]
+    # kartaview is deliberately NOT here. The repo default declares it (#248),
+    # and turning it on in production is a separate deploy decision — the same
+    # posture as max_concurrent_channels below.
+    assert "kartaview" not in cfg.providers
     # Channel concurrency is OFF in production until both of #240's deploy gates
     # clear: resume for the Mapillary tile census (#256), because a stop now kills
     # N children at once and a killed census re-spends tiles into a per-IP ceiling
@@ -1881,7 +1937,24 @@ def test_unknown_provider_still_warned_and_dropped(tmp_path):
     assert "bogus" not in cfg.providers
 
 
-def test_a_known_but_unwired_channel_is_recorded_and_dropped(tmp_path):
+# The refusal mechanism outlived the channel it was written for: kartaview is a
+# real channel since #248, so these drive a SYNTHETIC entry via monkeypatch
+# rather than being deleted. Keeping them is the point — the record/drop/
+# don't-raise asymmetry is what the NEXT unwired channel inherits, and the four
+# fail-open arms #225 phase 3b left behind are what it exists to catch.
+_UNWIRED_FIXTURE = "gsv_streets"
+
+
+@pytest.fixture
+def unwired(monkeypatch):
+    """Make a real, otherwise-runnable channel temporarily unwired."""
+    from streetscape_metadata_tracker.scheduler import UNWIRED_CHANNELS
+
+    monkeypatch.setitem(UNWIRED_CHANNELS, _UNWIRED_FIXTURE, "a synthetic test reason")
+    return _UNWIRED_FIXTURE
+
+
+def test_a_known_but_unwired_channel_is_recorded_and_dropped(tmp_path, unwired):
     """
     RECORDED and dropped, not silently skipped like the unknown name above and
     not raised either -- a three-way asymmetry, each arm load-bearing.
@@ -1896,22 +1969,19 @@ def test_a_known_but_unwired_channel_is_recorded_and_dropped(tmp_path):
     NOT raising keeps backup-status and restore-backup -- the incident-time
     handles -- working under a config only run-due could ever act on.
     """
-    from streetscape_metadata_tracker.scheduler import UNWIRED_CHANNELS
-
-    assert "kartaview" in UNWIRED_CHANNELS
     cfg_path = tmp_path / "s.toml"
     cfg_path.write_text(
-        "[providers.gsv]\nenabled = true\n\n[providers.kartaview]\nenabled = true\n"
+        f"[providers.gsv]\nenabled = true\n\n[providers.{unwired}]\nenabled = true\n"
     )
     cfg = load_scheduler_config(str(cfg_path))
-    assert "kartaview" not in cfg.providers, "dropped, so nothing downstream can run it"
+    assert unwired not in cfg.providers, "dropped, so nothing downstream can run it"
     assert "gsv" in cfg.providers, "the runnable channel beside it is untouched"
-    assert "kartaview" not in cfg.enabled_providers()
+    assert unwired not in cfg.enabled_providers()
     assert len(cfg.unwired_channel_errors) == 1
-    assert "kartaview" in cfg.unwired_channel_errors[0]
+    assert unwired in cfg.unwired_channel_errors[0]
 
 
-def test_disabling_an_unwired_channel_does_not_make_it_acceptable(tmp_path):
+def test_disabling_an_unwired_channel_does_not_make_it_acceptable(tmp_path, unwired):
     """
     `enabled = false` is not a way to keep the block around "for later".
 
@@ -1919,13 +1989,15 @@ def test_disabling_an_unwired_channel_does_not_make_it_acceptable(tmp_path):
     that flag gets a channel the scheduler cannot run and no error saying so.
     """
     cfg_path = tmp_path / "s.toml"
-    cfg_path.write_text("[providers.kartaview]\nenabled = false\n")
+    cfg_path.write_text(f"[providers.{unwired}]\nenabled = false\n")
     cfg = load_scheduler_config(str(cfg_path))
-    assert "kartaview" not in cfg.providers
+    assert unwired not in cfg.providers
     assert cfg.unwired_channel_errors
 
 
-def test_run_due_refuses_an_unwired_channel_before_opening_the_catalog(conn, monkeypatch, tmp_path):
+def test_run_due_refuses_an_unwired_channel_before_opening_the_catalog(
+    conn, monkeypatch, tmp_path, unwired
+):
     """
     The channel-running half of the split. A night that silently ran AROUND a
     channel the config asks for would read as a success while collecting
@@ -1936,7 +2008,7 @@ def test_run_due_refuses_an_unwired_channel_before_opening_the_catalog(conn, mon
 
     cfg_path = tmp_path / "s.toml"
     cfg_path.write_text(
-        "[providers.gsv]\nenabled = true\n\n[providers.kartaview]\nenabled = true\n"
+        f"[providers.gsv]\nenabled = true\n\n[providers.{unwired}]\nenabled = true\n"
     )
     cfg = load_scheduler_config(str(cfg_path))
     connected = []
@@ -1946,14 +2018,21 @@ def test_run_due_refuses_an_unwired_channel_before_opening_the_catalog(conn, mon
     assert connected == []
 
 
-def test_assess_city_refuses_an_unwired_channel_before_geocoding(conn, monkeypatch, tmp_path):
+def test_assess_city_refuses_an_unwired_channel_before_geocoding(
+    conn, monkeypatch, tmp_path, unwired
+):
     """assess-city launches channels too, so it refuses on the same guard --
     before the catalog is opened and before the Nominatim pre-flight spends a
-    request on a city that will not be collected."""
+    request on a city that will not be collected.
+
+    The fixture channel is in ASSESS_CHANNELS on purpose: otherwise this would
+    pass on the "not an assess channel" refusal instead and stop testing the
+    guard it names.
+    """
     from streetscape_metadata_tracker import scheduler as sched
 
     cfg_path = tmp_path / "s.toml"
-    cfg_path.write_text("[providers.kartaview]\nenabled = true\n")
+    cfg_path.write_text(f"[providers.{unwired}]\nenabled = true\n")
     cfg = load_scheduler_config(str(cfg_path))
     connected = []
     monkeypatch.setattr(sched.db, "connect", lambda path: connected.append(path) or conn)
@@ -1962,7 +2041,7 @@ def test_assess_city_refuses_an_unwired_channel_before_geocoding(conn, monkeypat
     assert connected == []
 
 
-def test_backup_status_still_works_with_a_stray_unwired_block(conn, monkeypatch, tmp_path):
+def test_backup_status_still_works_with_a_stray_unwired_block(conn, monkeypatch, tmp_path, unwired):
     """
     The read-only half of the split, and the reason the loader stopped raising:
     backup-status is an incident-time handle, and a load-time ValueError took
@@ -1976,7 +2055,7 @@ def test_backup_status_still_works_with_a_stray_unwired_block(conn, monkeypatch,
     cfg_path.write_text(
         f'[paths]\ndata_dir = "{tmp_path / "data"}"\n'
         f'backup_dir = "{tmp_path / "backups"}"\n\n'
-        "[providers.kartaview]\nenabled = true\n"
+        f"[providers.{unwired}]\nenabled = true\n"
     )
     cfg = load_scheduler_config(str(cfg_path))
     assert cfg.unwired_channel_errors, "the stray block must be what this test exercises"
@@ -1998,6 +2077,13 @@ def test_every_unwired_channel_is_a_real_provider_token(tmp_path):
     """
     from streetscape_metadata_tracker.naming import KNOWN_PROVIDERS
     from streetscape_metadata_tracker.scheduler import STREET_CHANNELS, UNWIRED_CHANNELS
+
+    if not UNWIRED_CHANNELS:
+        # `set() - ... == []` is vacuously true, and a guard that passes by
+        # being empty is the one outcome worth refusing outright: it reads as
+        # "checked" in a green run. Skipping says so out loud instead. Every
+        # channel is wired since #248; this fires again for the next one.
+        pytest.skip("UNWIRED_CHANNELS is empty — every known channel is wired")
 
     unreachable = sorted(set(UNWIRED_CHANNELS) - set(KNOWN_PROVIDERS) - set(STREET_CHANNELS))
     assert unreachable == [], f"UNWIRED_CHANNELS names nothing configurable: {unreachable}"
@@ -6398,8 +6484,11 @@ def test_channels_sharing_a_host_never_overlap_even_at_knob_4(conn, monkeypatch)
         "channels are submitted in canonical (most-expensive-first) order"
     )
     assert log.peak_in_flight() == 3, (
-        "four channels at knob 4 still peak at three: the fourth shares a host "
-        "with two of them, so the effective ceiling is 3, not the knob"
+        "THESE four channels at knob 4 still peak at three: mapillary_streets "
+        "shares a host with two of them, so the ceiling is host affinity and "
+        "not the knob. The figure is a property of the channel SET, not a "
+        "constant — kartaview shares its host with nothing (#248), so the five "
+        "configured channels peak at four"
     )
 
 
