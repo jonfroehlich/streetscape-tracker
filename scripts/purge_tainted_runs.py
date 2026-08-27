@@ -59,6 +59,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from streetscape_metadata_tracker import db  # noqa: E402
 from streetscape_metadata_tracker.analysis import RETRYABLE_STATUSES  # noqa: E402
 from streetscape_metadata_tracker.paths import get_default_data_dir  # noqa: E402
+from streetscape_metadata_tracker.scheduler import CHANNEL_DEFAULT_MEMBERSHIP  # noqa: E402
 
 logger = logging.getLogger("purge_tainted_runs")
 
@@ -145,7 +146,22 @@ def purge_run(conn, data_dir: str, run, reason: str, execute: bool) -> None:
     for d in diffs:
         logger.info(f"  {verb} run_diffs row diff_id={d['diff_id']}")
     logger.info(f"  {verb} runs row run_id={run_id}")
-    logger.info(f"  {verb} clear schedule_state.last_success_at for {run['provider']}")
+    # Membership gates BEFORE staleness in get_due_cities (issue #248), so on a
+    # non-member pair the re-arm below re-arms nothing. Say so rather than
+    # logging a re-arm that did not happen — the whole point of the re-arm is
+    # that a missed re-collect must not hide as a green skip.
+    member = db.get_channel_membership(conn, run["city_id"], run["provider"])
+    # Indexed, never .get(..., True): a provider token with no membership
+    # decision must be a KeyError here rather than a silent "member".
+    is_member = CHANNEL_DEFAULT_MEMBERSHIP[run["provider"]] if member is None else bool(member)
+    if is_member:
+        logger.info(f"  {verb} clear schedule_state.last_success_at for {run['provider']}")
+    else:
+        logger.warning(
+            f"  {run['city_id']} is not a member of {run['provider']}, so clearing "
+            f"last_success_at re-arms nothing: it will not become due until it is "
+            f"enrolled (`scheduler enroll-city ... --channel {run['provider']}`)."
+        )
     if execute:
         conn.execute(
             "DELETE FROM run_diffs WHERE from_run_id = ? OR to_run_id = ?", (run_id, run_id)

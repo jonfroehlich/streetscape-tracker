@@ -1120,7 +1120,12 @@ def test_due_cities_stalest_first(conn):
     conn.commit()
 
     due = db.get_due_cities(
-        conn, today=date(2026, 7, 2), cycle_days=90, grace_days=7, max_consecutive_failures=5
+        conn,
+        today=date(2026, 7, 2),
+        cycle_days=90,
+        grace_days=7,
+        max_consecutive_failures=5,
+        default_membership=True,
     )
     ids = [x.city_id for x in due]
     assert ids[0] == a  # never-run first (NULL last_success)
@@ -1134,7 +1139,12 @@ def test_disabled_city_never_due(conn):
     conn.execute("UPDATE cities SET enabled = 0 WHERE city_id = ?", (cid,))
     conn.commit()
     due = db.get_due_cities(
-        conn, today=date(2026, 7, 2), cycle_days=90, grace_days=7, max_consecutive_failures=5
+        conn,
+        today=date(2026, 7, 2),
+        cycle_days=90,
+        grace_days=7,
+        max_consecutive_failures=5,
+        default_membership=True,
     )
     assert due == []
 
@@ -1145,7 +1155,12 @@ def test_failure_cap_excludes_city(conn):
     for _ in range(5):
         db.record_attempt(conn, cid, success=False, error="x")
     due = db.get_due_cities(
-        conn, today=date(2026, 7, 2), cycle_days=90, grace_days=7, max_consecutive_failures=5
+        conn,
+        today=date(2026, 7, 2),
+        cycle_days=90,
+        grace_days=7,
+        max_consecutive_failures=5,
+        default_membership=True,
     )
     assert due == []
 
@@ -1673,6 +1688,7 @@ def test_a_filtered_run_desyncs_that_citys_paired_snapshots(conn, monkeypatch):
                 cycle_days=90,
                 grace_days=7,
                 max_consecutive_failures=5,
+                default_membership=True,
                 provider=p,
             )
         ]
@@ -1985,6 +2001,588 @@ def test_every_unwired_channel_is_a_real_provider_token(tmp_path):
 
     unreachable = sorted(set(UNWIRED_CHANNELS) - set(KNOWN_PROVIDERS) - set(STREET_CHANNELS))
     assert unreachable == [], f"UNWIRED_CHANNELS names nothing configurable: {unreachable}"
+
+
+# ---------------------------------------------------------------------------
+# Per-(city, channel) membership and the opt-in hoist (issue #248).
+#
+# Membership scopes a channel to an explicit set of cities; the hoist is what
+# makes that set actually REACHED, because _collect_due's union is ordered by
+# first appearance and _run_city_loop truncates at max_cities_per_day. The two
+# halves are tested separately because either one alone is a channel that is
+# configured and collects nothing.
+# ---------------------------------------------------------------------------
+
+
+def test_every_scheduled_channel_declares_its_default_membership():
+    """Set EQUALITY, so a provider token cannot land without a membership decision.
+
+    A `.get(p, True)`, or a set of opt-in names tested with `in`, would classify
+    a NEWLY ADDED provider as "every enabled city, immediately" — which is
+    exactly how #225 phase 3b created this bug: adding a token to
+    KNOWN_PROVIDERS made a channel configurable and four fail-open arms then did
+    the wrong thing silently. A missing entry must be a KeyError here.
+    """
+    from streetscape_metadata_tracker.naming import KNOWN_PROVIDERS
+    from streetscape_metadata_tracker.scheduler import (
+        CHANNEL_DEFAULT_MEMBERSHIP,
+        STREET_CHANNELS,
+    )
+
+    assert set(CHANNEL_DEFAULT_MEMBERSHIP) == set(KNOWN_PROVIDERS) | set(STREET_CHANNELS)
+    with pytest.raises(KeyError):
+        CHANNEL_DEFAULT_MEMBERSHIP["a_channel_nobody_decided_about"]
+
+
+def test_get_due_cities_has_no_default_membership_default():
+    """The fail-open direction here costs a 186-hour nightly queue.
+
+    Same guard as _collect_due's `providers` and _run_city_loop's `max_cities`:
+    a `= True` would make "the caller forgot" and "every enabled city" the same
+    value, and the symptom is only visible as a night that never ends.
+    """
+    import inspect
+
+    from streetscape_metadata_tracker import db as sdb
+
+    param = inspect.signature(sdb.get_due_cities).parameters["default_membership"]
+    assert param.default is inspect.Parameter.empty, (
+        "get_due_cities must require an explicit default_membership; a True "
+        "default fails open into the whole catalog"
+    )
+    assert param.kind is inspect.Parameter.KEYWORD_ONLY
+
+
+def test_kartaview_is_the_only_opt_in_channel_today():
+    """Pins the actual policy, not just its shape — the four scheduled channels
+    are cheap enough per city that catalog-wide membership is right for them,
+    and flipping one of them to opt-in would silently empty its nightly queue.
+    """
+    from streetscape_metadata_tracker.scheduler import CHANNEL_DEFAULT_MEMBERSHIP
+
+    opt_in = sorted(c for c, default in CHANNEL_DEFAULT_MEMBERSHIP.items() if not default)
+    assert opt_in == ["kartaview"]
+
+
+def test_the_hoist_is_the_identity_permutation_without_an_opt_in_channel(conn):
+    """PR A's inertness, asserted as element-wise list identity rather than
+    "looks the same".
+
+    With every CHANNEL_DEFAULT_MEMBERSHIP value True, `opt_in` is empty, every
+    sort key is 1, and a stable sort on a constant key changes nothing. This
+    pins that against the pre-change union order for a multi-city, multi-channel
+    slate — the shape where a reorder would actually show.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    ids = [
+        _register(conn, n, width=1000, height=1000, step=20)
+        for n in ("Bend", "Corvallis", "Eugene")
+    ]
+    db.assign_schedule(conn, 90, providers=("gsv", "mapillary"))
+    # Stagger the clocks so the order is a real stalest-first ordering rather
+    # than the city_id tiebreak.
+    for i, cid in enumerate(ids):
+        conn.execute(
+            "UPDATE schedule_state SET last_success_at = ? WHERE city_id = ? AND provider = 'gsv'",
+            (f"2026-0{i + 1}-01T00:00:00+00:00", cid),
+        )
+    conn.commit()
+
+    cfg = _mly_cfg()
+    ordered, providers_for_city, hoisted = sched._collect_due(
+        conn, cfg, date(2026, 7, 2), ["gsv", "mapillary"]
+    )
+    expected = [
+        c.city_id
+        for c in db.get_due_cities(
+            conn,
+            today=date(2026, 7, 2),
+            cycle_days=cfg.cycle_days,
+            grace_days=cfg.grace_days,
+            max_consecutive_failures=cfg.max_consecutive_failures,
+            default_membership=True,
+            provider="gsv",
+        )
+    ]
+    assert [c.city_id for c in ordered] == expected
+    assert hoisted == 0
+    assert all(providers_for_city[c] == ["gsv", "mapillary"] for c in expected)
+
+
+def test_a_city_due_only_on_an_opt_in_channel_is_hoisted_ahead_of_the_gsv_block(conn):
+    """Without this the channel is scoped but never REACHED.
+
+    The union is ordered by first appearance, so gsv (rank 0) dictates city
+    order and an opt-in channel only ever appends. A city whose gsv run
+    succeeded — so gsv will not surface it for ~83 days — but whose sweep
+    checkpointed sits at the tail of ~949 cities and is truncated by the
+    20-city cap, every night. That is what makes docs/scheduler.md's "leads
+    tomorrow's stalest-first queue" true of the channel's own list and false of
+    the union, and what would spend #239's five-night budget over a whole cycle.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    for name in ("Bend", "Corvallis", "Eugene"):
+        _register(conn, name, width=1000, height=1000, step=20)
+    krabi = _register(conn, "Krabi", width=1000, height=1000, step=20)
+    db.assign_schedule(conn, 90, providers=("gsv", "kartaview"))
+    db.set_channel_membership(conn, krabi, "kartaview", True, cycle_days=90)
+    # Krabi's gsv clock is fresh, so gsv does not surface it; its sweep is due.
+    db.record_attempt(conn, krabi, success=True, provider="gsv")
+
+    cfg = _sweep_cfg(publish_enabled=False)
+    ordered, providers_for_city, hoisted = sched._collect_due(
+        conn, cfg, date(2026, 7, 2), ["gsv", "kartaview"]
+    )
+
+    assert [c.city_id for c in ordered][0] == krabi
+    assert providers_for_city[krabi] == ["kartaview"]
+    assert hoisted == 1
+
+
+def test_a_city_due_on_gsv_too_keeps_its_exact_union_position(conn):
+    """`all`, not `any` — and the choice is the blast radius.
+
+    A city due on gsv as well needs no hoist: the union already places it in
+    gsv's stalest-first list and both channels run the same night, and below the
+    city cap it is truncated on both channels TOGETHER, which pairs fine. An
+    `any` key would hoist it anyway, displacing the stalest gsv-only city from a
+    capped night every time a member city comes due — negligible at two seed
+    cities, a queue-jump per member city per cycle once the set widens.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    ids = [_register(conn, n, width=1000, height=1000, step=20) for n in ("Bend", "Corvallis")]
+    krabi = _register(conn, "Krabi", width=1000, height=1000, step=20)
+    db.assign_schedule(conn, 90, providers=("gsv", "kartaview"))
+    db.set_channel_membership(conn, krabi, "kartaview", True, cycle_days=90)
+    # Every city is due on gsv, and Krabi is LAST in gsv's stalest-first order.
+    for i, cid in enumerate([*ids, krabi]):
+        conn.execute(
+            "UPDATE schedule_state SET last_success_at = ? WHERE city_id = ? AND provider = 'gsv'",
+            (f"2026-0{i + 1}-01T00:00:00+00:00", cid),
+        )
+    conn.commit()
+
+    cfg = _sweep_cfg(publish_enabled=False)
+    ordered, providers_for_city, hoisted = sched._collect_due(
+        conn, cfg, date(2026, 7, 2), ["gsv", "kartaview"]
+    )
+
+    assert [c.city_id for c in ordered][-1] == krabi, "not hoisted: it is due on gsv too"
+    assert providers_for_city[krabi] == ["gsv", "kartaview"]
+    assert hoisted == 0
+
+
+def test_a_paused_sweep_leads_the_next_nights_slate_within_the_city_cap(conn, monkeypatch):
+    """The claim docs/scheduler.md makes, end to end through the loop.
+
+    Not just "still returned by get_due_cities" — the amnesty already gives that
+    (test_a_multi_night_sweep_is_never_quarantined_before_it_can_finish) — but
+    that it REACHES _run_city_loop inside max_cities_per_day. Without the hoist
+    a paused city sits behind every gsv-due city and the cap decides, so a
+    checkpointed sweep would resume months later rather than tomorrow, and #239's
+    five-night budget would be spent over a whole cycle having finished nothing.
+    """
+
+    for name in ("Bend", "Corvallis", "Eugene"):
+        _register(conn, name, width=1000, height=1000, step=20)
+    krabi = _register(conn, "Krabi", width=1000, height=1000, step=20)
+    db.assign_schedule(conn, 90, providers=tuple(_street_cfg().enabled_providers()))
+    db.set_channel_membership(conn, krabi, "kartaview", True, cycle_days=90)
+    # Krabi is fresh on every default-membership channel — the stranded shape:
+    # due ONLY on the opt-in channel, so `all(...)` holds and it hoists.
+    for channel in _street_cfg().enabled_providers():
+        db.record_attempt(conn, krabi, success=True, provider=channel)
+
+    ran = []
+
+    def run_one(city, provider):
+        ran.append((city.city_id, provider))
+        return _paused_sweep_outcome() if provider == "kartaview" else True
+
+    # A cap of ONE city: whichever city heads the slate is the one the night
+    # reaches, so this asserts ORDERING rather than mere presence.
+    cfg = _sweep_cfg(publish_enabled=False, max_cities_per_day=1)
+    _run_loop_with(monkeypatch, conn, cfg, run_one, today=date(2026, 7, 2))
+
+    assert ran[0] == (krabi, "kartaview"), "the paused sweep leads the slate"
+    # And the pause did not consume the cap: the amnesty `continue`s BEFORE
+    # `attempted` is counted, so `processed` never incremented and the night
+    # went on to the next city. Pinned here because that placement is what
+    # keeps a checkpointed sweep from costing a capped night its whole slate —
+    # move the amnesty below the counter and this line goes red.
+    assert any(cid != krabi for cid, _ in ran)
+
+
+def test_a_sweep_killed_by_its_timeout_leads_the_next_slate_but_costs_the_night_a_slot(
+    conn, monkeypatch
+):
+    """The arm a nightly batch actually takes today, which the pause case above
+    does NOT cover.
+
+    `_run_one_city` passes no `--kartaview-max-requests` (#273), and
+    `download_kartaview` sets its `stop_reason` only from that guard — so exit
+    83, its amnesty, and its "consumes no slot" property are all unreachable
+    from run-due for now. What actually ends an unfinished sweep is a timeout
+    SIGKILL, and it differs in both halves: it counts a consecutive_failure,
+    and it DOES consume a city-cap slot, because the failure path increments
+    `attempted`.
+
+    The half the hoist is for survives either way: nothing stamps
+    last_success_at, so the city is still due ONLY on the opt-in channel and
+    still leads tomorrow's slate instead of falling to the tail of the union.
+    Pinned so that if #273 lands and flips which arm is common, this stays the
+    record of what the other one does.
+    """
+    for name in ("Bend", "Corvallis", "Eugene"):
+        _register(conn, name, width=1000, height=1000, step=20)
+    krabi = _register(conn, "Krabi", width=1000, height=1000, step=20)
+    db.assign_schedule(conn, 90, providers=tuple(_street_cfg().enabled_providers()))
+    db.set_channel_membership(conn, krabi, "kartaview", True, cycle_days=90)
+    for channel in _street_cfg().enabled_providers():
+        db.record_attempt(conn, krabi, success=True, provider=channel)
+
+    ran = []
+
+    def run_one(city, provider):
+        ran.append((city.city_id, provider))
+        # A SIGKILL surfaces as a plain failure carrying no exit code at all:
+        # nothing here can tell it from a sweep that made no progress, which is
+        # the whole reason it is charged a failure.
+        return False if provider == "kartaview" else True
+
+    cfg = _sweep_cfg(publish_enabled=False, max_cities_per_day=1)
+    _run_loop_with(monkeypatch, conn, cfg, run_one, today=date(2026, 7, 2))
+
+    assert ran[0] == (krabi, "kartaview"), "the killed sweep still leads the slate"
+    # And unlike the amnestied pause, it COST the night its only slot.
+    assert [cid for cid, _ in ran] == [krabi]
+
+    row = conn.execute(
+        "SELECT consecutive_failures, last_success_at FROM schedule_state "
+        "WHERE city_id = ? AND provider = 'kartaview'",
+        (krabi,),
+    ).fetchone()
+    assert row["consecutive_failures"] == 1
+    assert row["last_success_at"] is None
+
+    ordered, providers_for_city, hoisted = _sched._collect_due(
+        conn, cfg, date(2026, 7, 3), list(cfg.enabled_providers())
+    )
+    assert ordered[0].city_id == krabi, "still hoisted tomorrow, which is what bounds it at five"
+    assert providers_for_city[krabi] == ["kartaview"]
+    assert hoisted == 1
+
+
+def test_a_single_opt_in_channel_run_reports_no_hoist(conn):
+    """`--provider kartaview` makes EVERY due city opt-in-only, so every sort
+    key is 0 and the reorder is the identity permutation — the same trivial
+    case as no opt-in channel configured, reached from the other end.
+
+    Counting it would put `hoisted=<the whole slate>` on the opening line of
+    every catch-up, which reads as "N cities were moved ahead of something"
+    when nothing was moved and there is nothing to be ahead of.
+    """
+    krabi = _register(conn, "Krabi", width=1000, height=1000, step=20)
+    bend = _register(conn, "Bend", width=1000, height=1000, step=20)
+    db.assign_schedule(conn, 90, providers=("gsv", "kartaview"))
+    for cid in (krabi, bend):
+        db.set_channel_membership(conn, cid, "kartaview", True, cycle_days=90)
+
+    cfg = _sweep_cfg(publish_enabled=False)
+    ordered, providers_for_city, hoisted = _sched._collect_due(
+        conn, cfg, date(2026, 7, 2), ["kartaview"]
+    )
+    assert {c.city_id for c in ordered} == {krabi, bend}, "both are still collected"
+    assert all(providers_for_city[c.city_id] == ["kartaview"] for c in ordered)
+    assert hoisted == 0
+
+
+def test_the_night_warns_when_the_opt_in_cities_fill_the_city_cap(conn, monkeypatch, caplog):
+    """The hoist is deliberately unbounded (#282), so this alert is the only
+    guard until reserved slots land.
+
+    Once the opt-in-only cities alone fill `max_cities_per_day`, every
+    default-membership channel collects NOTHING that night — and the arithmetic
+    that produces a night of zero gsv would otherwise be recoverable only by
+    subtracting two numbers on an INFO line. The warning names the starved
+    channels, so the night's record says what it did and not only what it
+    reordered.
+    """
+    import logging
+
+    enrolled = [_register(conn, n, width=1000, height=1000, step=20) for n in ("Krabi", "Hue")]
+    bend = _register(conn, "Bend", width=1000, height=1000, step=20)
+    channels = _street_cfg().enabled_providers()
+    db.assign_schedule(conn, 90, providers=tuple(channels))
+    # Enrolled AND fresh on every default-membership channel: the stranded
+    # shape, so both hoist and the cap is exactly their count.
+    for cid in enrolled:
+        db.set_channel_membership(conn, cid, "kartaview", True, cycle_days=90)
+        for channel in channels:
+            db.record_attempt(conn, cid, success=True, provider=channel)
+
+    ran = []
+    cfg = _sweep_cfg(publish_enabled=False, max_cities_per_day=len(enrolled))
+    with caplog.at_level(logging.WARNING, logger="streetscape_scheduler"):
+        _run_loop_with(
+            monkeypatch,
+            conn,
+            cfg,
+            lambda c, p: ran.append((c.city_id, p)) or True,
+            today=date(2026, 7, 2),
+        )
+
+    assert f"fill the city cap ({len(enrolled)})" in caplog.text
+    assert "gsv" in caplog.text and "nothing tonight" in caplog.text
+    # The warning is not merely pessimistic: Bend really did not collect.
+    assert {cid for cid, _ in ran} == set(enrolled)
+    assert bend not in {cid for cid, _ in ran}
+
+
+def test_the_hoist_count_is_on_the_nights_own_record(conn, monkeypatch, caplog):
+    """Same reason as max_concurrent_channels: which cities a capped night
+    reached must be recoverable from the night's own log, not from an
+    operator's memory of when a city was enrolled. Absent entirely when nothing
+    was hoisted, so nightly lines stay byte-identical to today's.
+    """
+    import logging
+
+    krabi = _register(conn, "Krabi", width=1000, height=1000, step=20)
+    # A second city, due on gsv, so the hoist has something to be AHEAD of: the
+    # count means "moved past N cities", and an all-opt-in slate is the identity
+    # permutation with nothing to report (see
+    # test_a_single_opt_in_channel_run_reports_no_hoist).
+    _register(conn, "Bend", width=1000, height=1000, step=20)
+    db.assign_schedule(conn, 90, providers=tuple(_street_cfg().enabled_providers()))
+    db.set_channel_membership(conn, krabi, "kartaview", True, cycle_days=90)
+    for channel in _street_cfg().enabled_providers():
+        db.record_attempt(conn, krabi, success=True, provider=channel)
+
+    with caplog.at_level(logging.INFO, logger="streetscape_scheduler"):
+        _run_loop_with(
+            monkeypatch,
+            conn,
+            _sweep_cfg(publish_enabled=False),
+            lambda c, p: True,
+            today=date(2026, 7, 2),
+        )
+    assert "hoisted=1 opt-in-only cities" in caplog.text
+
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="streetscape_scheduler"):
+        _run_loop_with(monkeypatch, conn, _mly_cfg(), lambda c, p: True, today=date(2026, 7, 2))
+    assert "hoisted=" not in caplog.text
+
+
+# ── enroll-city (issue #248) ────────────────────────────────────────────────
+
+
+def _enroll_cfg(tmp_path, conn, monkeypatch, **overrides):
+    from streetscape_metadata_tracker import scheduler as sched
+
+    cfg = _sweep_cfg(publish_enabled=False, **overrides)
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+    return cfg
+
+
+def test_enroll_city_enrolls_and_reports_the_cost_before_it_is_spent(
+    conn, monkeypatch, tmp_path, capsys
+):
+    """ "I typed a slug" has to become "I saw the number".
+
+    Risk 1 of this design is that a hoisted opt-in city can consume essentially
+    a whole night, and the mitigation is keeping the enrolled set to cities
+    whose estimate is well under one — a decision only possible if the estimate
+    is printed at enrolment time.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    cid = _register(conn, "Krabi", width=10000, height=10000, step=20)
+    cfg = _enroll_cfg(tmp_path, conn, monkeypatch)
+
+    assert sched.cmd_enroll_city(cfg, cid, channel="kartaview") == 0
+    out = capsys.readouterr().out
+    assert "-> MEMBER" in out
+    assert "requests" in out and "km" in out
+    assert "1 of 1 enabled cities opted in" in out
+    assert db.get_channel_membership(conn, cid, "kartaview") == 1
+
+
+def test_enroll_city_refuses_a_default_membership_channel(conn, monkeypatch, tmp_path):
+    """Per-city exclusion on gsv already has a handle: cities.enabled. A second,
+    less visible way to disable a city is how two operators end up disagreeing
+    about why it stopped collecting."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    cid = _register(conn, "Bend", width=1000, height=1000, step=20)
+    cfg = _enroll_cfg(tmp_path, conn, monkeypatch)
+
+    assert sched.cmd_enroll_city(cfg, cid, channel="gsv") == sched.USAGE_EXIT_CODE
+    assert sched.cmd_enroll_city(cfg, cid, channel="nope") == sched.USAGE_EXIT_CODE
+    assert conn.execute("SELECT COUNT(*) FROM schedule_state").fetchone()[0] == 0
+
+
+def test_enroll_city_refuses_an_unresolvable_or_disabled_city(conn, monkeypatch, tmp_path):
+    """Both are the silent zero-row success this command exists to prevent: a
+    typo'd slug matches nothing, and a disabled city can never be due on ANY
+    channel because get_due_cities still requires cities.enabled = 1."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    cid = _register(conn, "Bend", width=1000, height=1000, step=20)
+    cfg = _enroll_cfg(tmp_path, conn, monkeypatch)
+
+    assert sched.cmd_enroll_city(cfg, "krabi", channel="kartaview") == sched.USAGE_EXIT_CODE
+
+    conn.execute("UPDATE cities SET enabled = 0 WHERE city_id = ?", (cid,))
+    conn.commit()
+    assert sched.cmd_enroll_city(cfg, cid, channel="kartaview") == sched.USAGE_EXIT_CODE
+    assert db.get_channel_membership(conn, cid, "kartaview") is None
+
+
+def test_enroll_city_remove_and_clear_are_kept_apart(conn, monkeypatch, tmp_path):
+    """Indistinguishable to dueness today, deliberately kept apart anyway: an
+    explicit 0 persists as an exclusion if this channel's default membership
+    ever flips to True (the plausible end-state of "widen after"), while NULL
+    flips with it. Collapsing them would put that out of reach of everything but
+    hand-SQL."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    cid = _register(conn, "Krabi", width=1000, height=1000, step=20)
+    cfg = _enroll_cfg(tmp_path, conn, monkeypatch)
+
+    sched.cmd_enroll_city(cfg, cid, channel="kartaview")
+    assert sched.cmd_enroll_city(cfg, cid, channel="kartaview", remove=True) == 0
+    assert db.get_channel_membership(conn, cid, "kartaview") == 0
+    assert sched.cmd_enroll_city(cfg, cid, channel="kartaview", clear=True) == 0
+    assert db.get_channel_membership(conn, cid, "kartaview") is None
+
+
+def test_enroll_city_works_before_the_config_block_exists_and_says_so(
+    conn, monkeypatch, tmp_path, capsys
+):
+    """It deliberately does NOT refuse on unwired_channel_errors: enrolment has
+    to work BEFORE the channel is runnable or the rollout order is impossible.
+    "Nothing collected overnight" is the EXPECTED outcome at that point, so it
+    is stated rather than discovered."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    cid = _register(conn, "Krabi", width=1000, height=1000, step=20)
+    cfg = _mly_cfg(publish_enabled=False)  # no kartaview channel configured at all
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+
+    assert sched.cmd_enroll_city(cfg, cid, channel="kartaview") == 0
+    assert "NOTE" in capsys.readouterr().out
+    assert db.get_channel_membership(conn, cid, "kartaview") == 1
+
+
+def test_enroll_city_list_reports_the_channels_members(conn, monkeypatch, tmp_path, capsys):
+    from streetscape_metadata_tracker import scheduler as sched
+
+    cid = _register(conn, "Krabi", width=1000, height=1000, step=20)
+    _register(conn, "Bend", width=1000, height=1000, step=20)
+    cfg = _enroll_cfg(tmp_path, conn, monkeypatch)
+    sched.cmd_enroll_city(cfg, cid, channel="kartaview")
+    capsys.readouterr()
+
+    assert sched.cmd_enroll_city(cfg, None, channel="kartaview", list_only=True) == 0
+    out = capsys.readouterr().out
+    assert cid in out
+    assert "1 of 2 enabled cities opted in" in out
+
+
+def test_enroll_city_list_refuses_a_write_flag_and_accepts_any_channel(
+    conn, monkeypatch, tmp_path, capsys
+):
+    """`--list` is read-only, so it is scoped the OPPOSITE way from the write
+    path on one axis and stricter on the other.
+
+    Stricter: argparse's mutually exclusive group covers --remove/--clear but
+    not --list, and `list_only` short-circuits the write path — so `--list
+    --remove` would otherwise be accepted, ignored and exit 0. That is the
+    silent no-op this whole command exists to prevent, shipped by the command
+    itself.
+
+    Looser: refusing to LIST a default-membership channel would be a refusal
+    with no hazard behind it. The answer there is "every enabled city", which
+    is true and occasionally the thing being checked. Only WRITING to one is
+    refused, because per-city exclusion there is cities.enabled.
+    """
+    cid = _register(conn, "Krabi", width=1000, height=1000, step=20)
+    cfg = _enroll_cfg(tmp_path, conn, monkeypatch)
+
+    for flag in ("remove", "clear"):
+        assert (
+            _sched.cmd_enroll_city(cfg, None, channel="kartaview", list_only=True, **{flag: True})
+            == _sched.USAGE_EXIT_CODE
+        )
+
+    capsys.readouterr()
+    assert _sched.cmd_enroll_city(cfg, None, channel="gsv", list_only=True) == 0
+    out = capsys.readouterr().out
+    assert cid in out, "every enabled city is a member of a default-membership channel"
+    assert "1 of 1 enabled cities opted in" in out
+
+    # Writing to one is still refused, and an unknown channel on either path.
+    assert _sched.cmd_enroll_city(cfg, cid, channel="gsv") == _sched.USAGE_EXIT_CODE
+    assert (
+        _sched.cmd_enroll_city(cfg, None, channel="nope", list_only=True) == _sched.USAGE_EXIT_CODE
+    )
+
+
+def test_the_enrolment_cost_note_says_when_it_is_the_geometry_tier(
+    conn, monkeypatch, tmp_path, capsys
+):
+    """The estimate an operator enrols against is a FLOOR, and nothing
+    downstream absorbs the miss.
+
+    estimate_kartaview_requests' tier 2 must assume the default r=1000 because
+    the working radius is a property of the location; an r=500 metro costs ~4x
+    it. No city has a cataloged KartaView run, so tier 2 is what every
+    enrolment prints today — and the daily budget guard is a pre-flight check
+    against this same number while the child is handed no request cap at all
+    (#273), which makes the operator reading this line the last gate.
+    """
+    cid = _register(conn, "Krabi", width=10000, height=10000, step=20)
+    cfg = _enroll_cfg(tmp_path, conn, monkeypatch)
+
+    assert _sched.cmd_enroll_city(cfg, cid, channel="kartaview") == 0
+    assert "GEOMETRY estimate" in capsys.readouterr().out
+
+    # A prior sweep is the observed tier, and the caveat goes away with it.
+    db.register_run(
+        conn,
+        city_id=cid,
+        run_date=date(2026, 6, 1),
+        csv_filename="x.csv.gz",
+        total_points=1,
+        provider="kartaview",
+        api_requests=5_000,
+    )
+    assert _sched.cmd_enroll_city(cfg, cid, channel="kartaview") == 0
+    out = capsys.readouterr().out
+    assert "GEOMETRY estimate" not in out
+    assert "~5,000 requests" in out, "and the observed number is what it prices"
+
+
+def test_status_marks_a_non_member_rather_than_printing_enabled_yes(
+    conn, monkeypatch, tmp_path, capsys
+):
+    """`c.enabled` alone would print `yes` for a non-member whose DUE column
+    stays permanently blank, which reads as "the scheduler is broken" rather
+    than "this city is not enrolled in this channel" (issue #248, risk 3)."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    _register(conn, "Bend", width=1000, height=1000, step=20)
+    cfg = _enroll_cfg(tmp_path, conn, monkeypatch)
+    db.assign_schedule(conn, 90, providers=tuple(cfg.enabled_providers()))
+
+    assert sched.cmd_status(cfg) == 0
+    out = capsys.readouterr().out
+    assert "not enrolled" in out
+    assert "kartaview: 0 of 1 enabled cities opted in" in out
 
 
 def test_street_estimate_prefers_a_prior_walk_and_rescales_for_spacing(conn):
@@ -4464,6 +5062,7 @@ def test_repeated_blocked_nights_never_quarantine_a_city(conn, monkeypatch):
         cycle_days=1,
         grace_days=0,
         max_consecutive_failures=5,
+        default_membership=True,
         provider="mapillary",
     )
     assert cid in [c.city_id for c in due]
@@ -4622,6 +5221,7 @@ def test_repeated_busy_nights_never_quarantine_a_city(conn, monkeypatch):
         cycle_days=1,
         grace_days=0,
         max_consecutive_failures=5,
+        default_membership=True,
         provider="mapillary",
     )
     assert cid in {c.city_id for c in due}
@@ -4646,6 +5246,17 @@ def _sweep_cfg(**overrides):
     return cfg
 
 
+def _enroll_kartaview(conn, cid):
+    """Opt a city into the kartaview channel (issue #248).
+
+    Required for every sweep case below, and not boilerplate: kartaview's
+    default membership is False, so without this the channel is configured,
+    priced and ranked but its nightly queue is EMPTY — which is the mechanism
+    under test in the dueness tests and a silent no-op in the amnesty ones.
+    """
+    db.set_channel_membership(conn, cid, "kartaview", True, cycle_days=90)
+
+
 def test_a_checkpointed_pause_is_not_recorded_as_a_city_failure(conn, monkeypatch):
     """A sweep that stopped with roots unvisited and CHECKPOINTED them (#239) is
     progress, not breakage — the CLI says exactly that and gives it its own exit
@@ -4659,6 +5270,7 @@ def test_a_checkpointed_pause_is_not_recorded_as_a_city_failure(conn, monkeypatc
     ~10.4 h of pacing against a 10 h max_batch_hours), so the failure counter
     would fire before the sweep it is meant to protect could ever finish."""
     cid = _register(conn, "Bend", width=1000, height=1000, step=20)
+    _enroll_kartaview(conn, cid)
 
     def run_one(city, provider):
         return _paused_sweep_outcome() if provider == "kartaview" else True
@@ -4677,6 +5289,7 @@ def test_a_multi_night_sweep_is_never_quarantined_before_it_can_finish(conn, mon
     sweep that legitimately takes more nights than max_consecutive_failures must
     still be due on the night it would have completed."""
     cid = _register(conn, "Bend", width=1000, height=1000, step=20)
+    _enroll_kartaview(conn, cid)
     cfg = _sweep_cfg(publish_enabled=False)
 
     for day in range(8):  # comfortably past max_consecutive_failures (5)
@@ -4694,6 +5307,9 @@ def test_a_multi_night_sweep_is_never_quarantined_before_it_can_finish(conn, mon
         cycle_days=1,
         grace_days=0,
         max_consecutive_failures=5,
+        # The channel's real default, not True: this asserts the city survives
+        # the amnesty AND its enrolment, which is what a real night reads.
+        default_membership=_sched.CHANNEL_DEFAULT_MEMBERSHIP["kartaview"],
         provider="kartaview",
     )
     assert cid in {c.city_id for c in due}
@@ -4712,6 +5328,7 @@ def test_a_sweep_killed_by_its_timeout_still_counts_a_failure(conn, monkeypatch)
     from streetscape_metadata_tracker.scheduler import CollectionOutcome
 
     cid = _register(conn, "Bend", width=1000, height=1000, step=20)
+    _enroll_kartaview(conn, cid)
 
     def run_one(city, provider):
         if provider != "kartaview":

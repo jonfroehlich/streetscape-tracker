@@ -60,7 +60,8 @@ python scripts/register_frame.py   # dry-run preview; --execute stays disabled u
 | Subcommand | Purpose |
 |---|---|
 | `status` | Per-city schedule and budget status |
-| `assign` | (Re)compute stagger assignments |
+| `assign` | (Re)compute stagger assignments (writes `day_of_cycle` only, so it never un-enrolls a member) |
+| `enroll-city CITY --channel C` | Opt one city into an **opt-in** channel's queue (#248); `--remove`/`--clear`/`--list` |
 | `run-due [--dry-run]` | The nightly batch: collect stalest-due cities per channel, then the tail (aggregate, manifests, backup, publish) |
 | `run-due --provider mapillary --limit 40` | On-demand single-channel catch-up (#214) — the ONLY supported bulk path; **Mapillary catch-ups are PAUSED** (see provider access below) |
 | `assess-city "Newport, Kentucky" --estimate` | Same-day answer for a partner inquiry about an untracked city (#215); `--estimate` stops after the boundary and cost report, `--yes` runs it |
@@ -73,6 +74,7 @@ python scripts/register_frame.py   # dry-run preview; --execute stays disabled u
 
 `run-due` notes: `--limit` (≥1) overrides `[schedule].max_cities_per_day`; an unknown/disabled channel or a bad `--limit` exits 64, not 2; a filtered run advances only the named channels' clocks, **un-pairing those cities' snapshots**.
 `assess-city` notes: a bad `--provider` or an unpaired `--width`/`--height` exits 64; answer from **street coverage, never grid coverage** (see operations below).
+`enroll-city` notes: it only accepts a channel whose default membership is OFF — per-city exclusion on the other four is `cities.enabled`; an unknown channel, a default-membership channel, an unresolvable city or a disabled city exits 64 writing no row; enrolling BEFORE the channel is configured is supported on purpose (it prints a note), or the rollout order is impossible.
 
 ### One-time and repair scripts (`scripts/`)
 
@@ -122,7 +124,8 @@ Each area below states its rules here and keeps its evidence in a `docs/` file.
 
 **Data model, pipeline and naming → [`docs/architecture.md`](docs/architecture.md).**
 Every run is an immutable dated snapshot on the city's **frozen grid geometry** (never re-geocoded, shared by all providers, so diffs are meaningful); **no filename provider token means gsv**, so all pre-provider names and published URLs are unchanged.
-The SQLite catalog `data/streetscape_tracker.db` (schema v12, auto-migrated on connect) is the operational source of truth and is **local-only, never rsynced**.
+The SQLite catalog `data/streetscape_tracker.db` (schema v13, auto-migrated on connect) is the operational source of truth and is **local-only, never rsynced**.
+`schedule_state.member` (v13, #248) is the one column where **NULL does not mean "not measured"** — it means "use `scheduler.CHANNEL_DEFAULT_MEMBERSHIP[channel]`", which is code-side so a new provider token cannot silently enrol the catalog (a missing entry is a `KeyError`, never a permissive default).
 Each provider is an independent run series on the same grid: GSV is a *sample* (nearest pano per grid point), Mapillary and KartaView are *censuses* — so coverage rates are cross-provider comparable and raw pano counts are not.
 Official-Google classification is an exact `© Google` match (`analysis.is_google_copyright`, mirrored in `city.js`), never a substring, since photographer names can contain "Google".
 `streetscape_metadata_tracker/naming.py` is the single source of truth for filenames; `sanitize_city_query_str` must never change (canonical `city_id`s and legacy slugs depend on it).
@@ -141,7 +144,8 @@ It is columnar (a memory contract, #157), pinned byte-identical by a golden fixt
 `is_pano` is read through `census.census_is_pano`, never as a raw array; imagery-type stratification (#116) yields **two** coverage numbers — 360° and any-imagery — which are never conflated.
 Four KartaView rules that must survive without a read:
 
-- **`--provider kartaview` collects (#251) but is still NOT a scheduler channel** — a `[providers.kartaview]` block is refused (`run-due`/`assess-city` exit `USAGE_EXIT_CODE` while one exists), because dueness gates on `cities.enabled` alone and would queue all 1,144 cities (#248).
+- **`--provider kartaview` collects (#251) but is still NOT a scheduler channel** — a `[providers.kartaview]` block is refused (`run-due`/`assess-city` exit `USAGE_EXIT_CODE` while one exists), now only because declaring it makes a FIFTH channel and moves the concurrency ceiling from 3-of-4 to 4-of-5.
+  Dueness is no longer the blocker: it is per (city, channel) since #248, `kartaview` defaults to non-member, and `_collect_due` hoists a city due *only* on an opt-in channel to the head of the slate (`all`, not `any`) — without which the channel would be scoped but never reached.
   Its cost arms ARE wired (#238): the estimate is the swept-circle lattice × the measured **1.80×**, never the GSV grid formula, and the previous run's observed `runs.api_requests` outranks that geometry as the **larger** of the two, never on its own.
 - **`api_requests` is this process's spend and `api_requests_total` is the sweep's** — `db.add_api_usage` is additive and keyed by (date, provider), so a resumed night reporting the whole sweep would charge last night against tonight's budget gate.
 - **HTTP 400 is backpressure here, not a malformed request** — typed permanent it would never be retried or subdivided, and every dense city would collect nothing.
