@@ -24,6 +24,8 @@ already gone wrong once:
 ## Naming, catalog, diffs and JSON
 
 - Pure-logic tests for naming, db (incl. the v1→v2 migration against embedded v1 SQL), diff, JSON v2/aggregate v3
+- The v12→v13 migration (`schedule_state.member`, issue #248): the column arrives NULL on an existing row and the row's other columns survive; re-connecting is idempotent; and — the claim that actually matters — a v12 catalog's due set is **element-for-element identical** afterwards, order included, since the city cap truncates from the tail and a test that only counted due cities could stay green while the gate changed which cities lead.
+  The v8-to-current ladder test gains a v13 assertion for the reason it exists: a rung that never fires is silent.
 - An end-to-end migration test with synthetic fixtures
 
 ## `--provider` is a channel list (issue #247)
@@ -78,6 +80,10 @@ Incidental coverage of a deprecated spelling trains readers to ignore the notice
   and that the child is handed the configured pace, without which the derived timeout would be measured against a rate the sweep never used
 - A checkpointed sweep pause (exit `SWEEP_INCOMPLETE_EXIT_CODE`) taking the same amnesty as a busy or blocked host, and — the case that gives the amnesty its point — a city still being **due** after eight consecutive paused nights, well past `max_consecutive_failures`.
   A multi-night sweep is normal operation for this channel rather than an edge case (Singapore is ~10.4 h of pacing against a 10 h `max_batch_hours`), so charging a pause would fire the failure counter before the sweep it protects could ever finish.
+- Per-(city, channel) membership and the opt-in hoist (issue #248), which are tested as two separate halves because either one alone is a channel that is configured and collects nothing.
+  Membership: that `CHANNEL_DEFAULT_MEMBERSHIP` covers every scheduled channel by **set equality** (a `.get(p, True)` would classify a newly added provider as "every enabled city, immediately", which is how #225 phase 3b created this bug); that `get_due_cities`' `default_membership` has **no default value**, since the fail-open direction here costs a 186-hour nightly queue; that membership and the `consecutive_failures` quarantine are independent gates, so a non-member never reads as a failing city; and that `assign_schedule` — which `run-due` calls before every night — cannot un-enrol a member.
+  The hoist: that it is the **identity permutation** with no opt-in channel configured, asserted element-wise against the pre-change union order rather than eyeballed; that a city due *only* on an opt-in channel leads the slate; that a city due on `gsv` too keeps its **exact** union position (the `all` key, not `any`); and that a paused sweep therefore leads the next night's slate, which is the claim `docs/scheduler.md` makes and the mechanism the "five consecutive nights" budget depends on.
+  `enroll-city`'s refusals are pinned as `USAGE_EXIT_CODE` with **no row written** — an unknown channel, a default-membership channel, an unresolvable city, a disabled city — alongside the two it deliberately does not refuse: an unwired or unconfigured channel, since enrolment has to precede the config block or the rollout order is impossible.
   Paired with the boundary case, which pins the amnesty as narrow: a sweep SIGKILLED by its timeout **does** still count a failure, because a kill has no exit code and nothing can distinguish one that checkpointed real progress from one that made none
 - Scheduler passing each street channel its FULL daily budget (the collector subtracts today's spend itself, so passing the remainder double-counts it and fails cities that fit)
 - `regenerate-aggregate` exiting nonzero when the driving-plan rebuild failed while still publishing the two artifacts that succeeded (the guard exists so #167's posture holds, but rebuilding the published JSON *is* that command's job, so a partial rebuild must not read as success to a wrapper)

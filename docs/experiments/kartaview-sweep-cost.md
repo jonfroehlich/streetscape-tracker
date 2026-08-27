@@ -250,6 +250,21 @@ costs ~9,970 requests — 10 h of paced fetching; New York, on a thinner sample,
   pass is *N nights*, exactly the shape the Mapillary catch-up already runs on.
   The figures above are unchanged — what changed is that they no longer have to
   fit inside `max_batch_hours` per city.
+
+  **Amended after issue #248.** Two corrections to the amendment above.
+  First, "a whole pass is *N nights*" is **false while the budget guard prices
+  the total**: `_run_city_channels` skips a city *permanently* when its estimate
+  exceeds the daily budget, and `estimate_kartaview_requests` prices the whole
+  sweep rather than a resuming city's remainder — so a city over the budget is
+  skipped with a warning every night forever, no matter how often it
+  checkpoints. That is issue #274, and the amendment above only becomes true
+  when it lands.
+  Second, the 1,144-city figure stays correct as a whole-catalog *projection*
+  and is no longer the *scheduled* cost: membership is now per (city, channel),
+  so the channel collects only the cities an operator enrolled with
+  `scheduler enroll-city`. The seed set is Krabi (~90 requests) and Yogyakarta
+  (~202) — both tier-2 geometry estimates, since no city has ever had a
+  cataloged KartaView run for the observed tier to read.
 - **Budget by bbox area, not by imagery.** `estimate_requests` for a KartaView
   channel should be `bbox_area / (2 r²)` — the only term computable before the
   walk — defaulting r to 1000, refining it from the previous run's calibrated

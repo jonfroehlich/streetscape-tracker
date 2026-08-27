@@ -28,6 +28,10 @@ Derived values are then clamped to what is left of the batch deadline (never bel
 **But a kill is a resume of the WORK and not of the SCHEDULE, and that is where the acceptance runs out.**
 A *deliberate* pause exits `SWEEP_INCOMPLETE_EXIT_CODE` (83) and is amnestied in `_run_city_channels` beside the blocked- and busy-host conditions, so it can repeat indefinitely; a SIGKILL has no exit code, nothing can tell one that checkpointed progress from one that made none, and it counts a `consecutive_failure` that only a success resets — so five clamped nights quarantine the city for a 90-day cycle.
 A metro sweep that cannot finish inside five nights therefore needs #248's per-(city, provider) dueness, not a larger timeout constant.
+That budget of five is survivable only if the five nights are **consecutive**, so the checkpointed progress accumulates — and consecutive is what `_collect_due`'s hoist buys.
+The union of the per-channel due lists is ordered by first appearance, so `gsv` (rank 0) dictates city order; a city whose `gsv` run succeeded but whose sweep paused sits at the tail of ~949 cities and is truncated by `max_cities_per_day`, returning months later rather than tomorrow.
+The hoist moves a city to the head of the slate when **every** channel it is due on is opt-in — `all`, not `any`, so a city due on `gsv` too keeps its exact union position and `gsv`'s stalest-first ordering is strictly untouched.
+It reorders the **city list only**, never the union loop, because `providers_for_city` is passed straight to `_run_city_channels` where `pending = list(providers)` *is* the launch order.
 
 **The tail — aggregate, streetwalk manifest, catalog backup, publish — is what makes a night visible, and it only runs if the city loop returns**, so every way of ending the loop goes through `_run_city_loop`,
 which always returns counters instead of propagating: a `[schedule].max_batch_hours` deadline (10 h) stops *starting* cities and clamps the in-flight child's timeout to what's left,
@@ -160,6 +164,11 @@ The pattern is the finding, not any one of the four: reading the launch pass set
 `[schedule].max_concurrent_channels` (default **1**) is how many of one city's channels `_run_city_channels` will keep in flight.
 This is the issue's **Shape A**: the loop over cities is unchanged, so a night's wall clock becomes the sum over cities of `max(channel)` instead of `sum(channel)`, and **paired snapshots survive** — every channel of a city still shares one run date, which is the property that makes its providers comparable at all.
 **Shape B — a per-provider queue per lane — stays rejected**: lanes advance at different speeds, so the per-night city sets diverge and paired snapshots break structurally, every night, for every city.
+
+The opt-in hoist (#248) is the one deliberate exception to Shape A's "the loop over cities is unchanged", and it carries a cost worth stating: a city that pauses is due tomorrow, hoists to index 0, runs first, and `city_timeout_seconds` clamps it to what is left of `max_batch_hours` — so it can take essentially the whole night, every night, for as long as it keeps pausing.
+Today's `gsv`-first ordering is *accidentally* protecting the nightly slate from that, and the hoist removes the protection at the same moment it enables the channel that needs it.
+The seed set is safe because Krabi and Yogyakarta are small, which is a property of the curated set rather than of the design; `enroll-city` prints each city's lattice estimate so keeping the set under one night is a decision rather than a discovery.
+If the set ever widens, the fix is reserved slots per opt-in channel, not an unbounded hoist.
 That is the cost `docs/provider-access.md` records for `--provider` filtering, made permanent and universal; the expensive-city problem it would have solved is #239's, which does not require the trade.
 **What lanes buy is lanes, not throughput.**
 Each channel keeps its own limiter and its own daily budget, so no provider is asked for anything faster or larger than before; what stops is independent work queueing behind unrelated work.
@@ -212,6 +221,16 @@ That is also why `cmd_run_due` logs `max_concurrent_channels=N` on its opening l
 Written 2026-08-25, when the CLAUDE.md rewrite turned its command cheatsheet into a table and two subcommands turned out to be documented nowhere.
 
 **`assign`** (re)computes the `day_of_cycle` stagger for every enabled (city, provider) over `[schedule].cycle_days`, via `db.assign_schedule` — the rebalance handle after registering or enabling cities in bulk, so the nightly slate stays level rather than front-loaded.
+It writes `day_of_cycle` and nothing else, which is what keeps the nightly `assign` (`run-due` calls it before every night) from un-enrolling every opted-in pair; a pinning test says so.
+Assignment is **not** enrolment: on an opt-in channel it creates a row per enabled city and leaves `member` NULL, so the channel gains ~1,144 rows that collect nothing.
+`status` and `assign` therefore print a per-channel enrolled count for each opt-in channel — without it, a table of blank `DUE` cells reads as "the flip did not take".
+
+**`enroll-city CITY --channel CHANNEL [--remove | --clear] [--list]`** is the operator handle for `schedule_state.member` (#248), and it exists because hand-SQL has four ways to be a silent no-op here: `day_of_cycle` is `NOT NULL` with no default so a bare `INSERT` fails; an `UPDATE` matches zero rows and exits 0 whenever `assign` has not yet run with the channel enabled; a typo'd slug is the same zero-row success; and NULL/0/1 is three-valued with its meaning in a code-side table.
+It refuses (`USAGE_EXIT_CODE`, changing no row) an unknown channel, a **default-membership** channel (per-city exclusion for `gsv` is `cities.enabled`, and a second less visible way to disable a city is how two operators disagree about why it stopped), an unresolvable city, and a city with `cities.enabled = 0`.
+It deliberately does **not** refuse while the channel is still unwired or unconfigured — enrolment must precede the config block or the rollout order is impossible — and prints a `NOTE` saying nothing collects it yet.
+`--remove` writes an explicit `0` and `--clear` restores NULL; the two are indistinguishable to dueness today and kept apart because only the explicit `0` survives a future flip of the channel default.
+A known, deliberate foreclosure: a **kartaview-only city is inexpressible**, since registering one makes it `enabled = 1` and therefore a member of all four default channels.
+Revisit that only if widening wants Grab-market cities we would not otherwise collect.
 
 **`notify-failure`** emails the recent scheduler-log tail and is wired as the unit's `OnFailure=` hook (`deploy/systemd/streetscape-tracker-notify@.service`), so a crash that never reaches the in-run alerting still produces an email.
 It exits 0 when it alerted (or alerting is intentionally off) and 1 only when a send was attempted and failed, so the notify unit's own status is meaningful.

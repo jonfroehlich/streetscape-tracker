@@ -680,6 +680,7 @@ def test_the_closing_note_says_which_channels_are_actually_due(conn, monkeypatch
                 cycle_days=90,
                 grace_days=10,
                 max_consecutive_failures=5,
+                default_membership=_sched.CHANNEL_DEFAULT_MEMBERSHIP[p],
                 provider=p,
             )
         ]
@@ -739,7 +740,7 @@ def test_repeated_failures_leave_the_city_collectable_by_the_nightly_batch(
     for _ in range(6):
         _assess(tmp_path)
 
-    due, _providers = _sched._collect_due(conn, _cfg(tmp_path), TODAY, ["gsv"])
+    due, _providers, _hoisted = _sched._collect_due(conn, _cfg(tmp_path), TODAY, ["gsv"])
     assert [c.city_id for c in due] == [CITY_ID]
 
 

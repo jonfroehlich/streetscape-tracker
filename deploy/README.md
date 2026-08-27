@@ -700,6 +700,19 @@ drop back to the steady ~quarterly cadence (`max_cities_per_day = 20` keeps
 sqlite3 data/streetscape_tracker.db "UPDATE cities SET enabled = 0 WHERE city_id = '...'"
 ```
 
+`cities.enabled` is catalog-wide: it takes the city out of *every* channel.
+Membership is a second dimension (issue #248) — `schedule_state.member`, per (city, channel) — and it has its own handle rather than raw SQL, because hand-SQL here has four ways to be a silent no-op (`day_of_cycle` is `NOT NULL` with no default; an `UPDATE` matches zero rows and exits 0 before `assign` has run with the channel enabled; a typo'd slug does the same; NULL/0/1 is three-valued with its meaning in a code-side table):
+
+```bash
+python -m streetscape_metadata_tracker.scheduler --config <cfg> \
+    enroll-city "Krabi, Thailand" --channel kartaview
+python -m streetscape_metadata_tracker.scheduler --config <cfg> \
+    enroll-city --channel kartaview --list
+```
+
+It only accepts an **opt-in** channel — one whose default membership is off (`kartaview` today).
+Per-city exclusion on `gsv`, `mapillary` and the two street channels stays `cities.enabled`, deliberately: a second, less visible way to disable a city is how two operators end up disagreeing about why it stopped collecting.
+
 A city that fails `max_consecutive_failures` nights in a row is skipped
 automatically until you reset it:
 

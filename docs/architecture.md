@@ -17,7 +17,7 @@ Legacy pre-2026 undated files are registered as `is_baseline=1` runs by `scripts
 
 ## The catalog
 
-The SQLite catalog `data/streetscape_tracker.db` (`streetscape_metadata_tracker/db.py`, stdlib sqlite3/WAL, no ORM; schema v12, auto-migrated on connect) is the operational source of truth.
+The SQLite catalog `data/streetscape_tracker.db` (`streetscape_metadata_tracker/db.py`, stdlib sqlite3/WAL, no ORM; schema v13, auto-migrated on connect) is the operational source of truth.
 It is **local-only and never rsynced** — it lives in exactly one place, which is why the dated backups in [`catalog-backups.md`](catalog-backups.md) exist.
 
 | Table | Key / uniqueness | Holds |
@@ -27,7 +27,7 @@ It is **local-only and never rsynced** — it lives in exactly one place, which 
 | `runs` | UNIQUE(city_id, provider, run_date) | Per-run stats incl. the #213 capture-date columns; `unique_google_panos` is NULL for non-gsv runs |
 | `run_diffs` | UNIQUE(from_run_id, to_run_id) | Run-to-run change counters + detail filename |
 | `api_usage` | PK(usage_date, provider) | Daily request-budget ledger; **additive** (`add_api_usage`); streets channels metered under their own strings (#99) |
-| `schedule_state` | PK(city_id, provider) | Stagger day, last attempt/success, `consecutive_failures` (reset only by a success) |
+| `schedule_state` | PK(city_id, provider) | Stagger day, last attempt/success, `consecutive_failures` (reset only by a success), `member` (per-channel membership, #248) |
 | `history_harvests` | UNIQUE(city_id, provider, harvest_date) | Out-of-band GSV capture-history harvests (#2) |
 | `street_networks` | UNIQUE(city_id, network_type) | Frozen OSM networks (#103); GraphML lives unpublished under `data/osm_cache/` |
 | `street_walks` | UNIQUE(city_id, provider, network_type, run_date) | Road-walk collection runs (#99) — a second modality with its own unit of observation |
@@ -38,7 +38,12 @@ It is **local-only and never rsynced** — it lives in exactly one place, which 
 Schema-version history that still matters when reading old rows:
 v11 added `street_walks.coverage_by_highway` (#101, backfilled by `scripts/backfill_streetwalk_coverage.py`);
 v12 added the `street_walks` absolute-length columns (`length_km`, `length_km_covered`, `length_km_covered_any`) **and `median_covered_age_years`** — an age, not a length, stored because a median cannot be recovered from per-bucket medians (backfilled by `scripts/backfill_streetwalk_length.py`).
-For all of these, NULL means "not measured", never zero and never a copy of a sibling column.
+For all of those, NULL means "not measured", never zero and never a copy of a sibling column.
+
+v13 added `schedule_state.member` (#248), and it is the **one deliberate exception** to the rule above: here NULL means "fall back to this channel's default membership", not "not measured".
+The table of defaults is `scheduler.CHANNEL_DEFAULT_MEMBERSHIP`, deliberately code-side rather than config, so adding a provider token cannot silently enrol the whole catalog — a missing entry is a `KeyError`, not a permissive default.
+Every channel scheduled today defaults to member, so the `ALTER TABLE`'s all-NULL fill leaves dueness byte-identical; `kartaview` defaults to non-member, which is what makes it a legal but inert channel until an operator runs `scheduler enroll-city`.
+The column is **not** named `enabled` for a mechanical reason: `cities.enabled` already exists, and `get_due_cities` reads `SELECT c.*` through `sqlite3.Row`, where two columns of one name collapse to one key holding the wrong value.
 
 ## Provider model
 

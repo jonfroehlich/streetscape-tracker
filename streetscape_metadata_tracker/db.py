@@ -27,7 +27,7 @@ from .naming import sanitize_city_query_str
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS cities (
@@ -122,6 +122,15 @@ CREATE TABLE IF NOT EXISTS api_usage (
     PRIMARY KEY (usage_date, provider)
 );
 
+-- `member` (v13, issue #248) is per-(city, channel) membership: whether this
+-- city is in this channel's nightly queue at all. NULL is the normal state and
+-- means "fall back to this channel's default membership" — the table of
+-- defaults is scheduler.CHANNEL_DEFAULT_MEMBERSHIP, deliberately code-side, so
+-- adding a provider token cannot silently enrol 1,144 cities. Unlike every
+-- other nullable column in this schema, NULL here is NOT "not measured": see
+-- docs/architecture.md. It is NOT named `enabled` — cities.enabled already is,
+-- and a duplicate column name is silently resolved the wrong way by the
+-- `SELECT c.*` + sqlite3.Row read in get_due_cities.
 CREATE TABLE IF NOT EXISTS schedule_state (
     city_id              TEXT NOT NULL REFERENCES cities(city_id),
     provider             TEXT NOT NULL DEFAULT 'gsv',
@@ -130,6 +139,7 @@ CREATE TABLE IF NOT EXISTS schedule_state (
     last_success_at      TEXT,
     consecutive_failures INTEGER NOT NULL DEFAULT 0,
     last_error           TEXT,
+    member               INTEGER,
     PRIMARY KEY (city_id, provider)
 );
 
@@ -631,6 +641,12 @@ def init_schema(conn: sqlite3.Connection) -> None:
     if user_version == 11:
         _migrate_v11_to_v12(conn)
         user_version = 12
+    # v12 -> v13 (issue #248): schedule_state gains the per-channel `member`
+    # column. Additive and nullable, so every existing pair keeps today's
+    # behaviour via the channel default.
+    if user_version == 12:
+        _migrate_v12_to_v13(conn)
+        user_version = 13
     conn.executescript(_SCHEMA)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
@@ -810,6 +826,41 @@ def _migrate_v11_to_v12(conn: sqlite3.Connection) -> None:
     logger.info(f"Migrating catalog schema v11 -> v12 (street_walks: {', '.join(missing)})")
     for column in missing:
         conn.execute(f"ALTER TABLE street_walks ADD COLUMN {column} REAL")
+    conn.commit()
+
+
+# The v13 schedule_state columns, in DDL order. Named once so the migration and
+# its idempotency guard cannot drift apart (same shape as _V12_STREET_WALK_COLUMNS).
+_V13_SCHEDULE_STATE_COLUMNS = ("member",)
+
+
+def _migrate_v12_to_v13(conn: sqlite3.Connection) -> None:
+    """Add schedule_state.member — per-(city, channel) membership (v13, issue #248).
+
+    Additive; no table rebuild, exactly like _migrate_v11_to_v12, and idempotent
+    for the same reason: the ADD COLUMN is skipped when the column already
+    exists, and an absent table means the CREATE TABLE in _SCHEMA below builds
+    it current. A v1 catalog reaches here having been rebuilt to the v2 shape by
+    _MIGRATE_V1_TO_V2 (whose frozen SQL must NOT gain this column), so the ADD
+    COLUMN applies to it too.
+
+    Deliberately declared with **no DEFAULT**: SQLite's ADD COLUMN without one
+    is O(1) and fills every existing row NULL, which is exactly the semantics
+    wanted — NULL means "use this channel's default membership"
+    (scheduler.CHANNEL_DEFAULT_MEMBERSHIP). Every pair in an existing catalog
+    therefore keeps its current dueness, because all four scheduled channels
+    default to member.
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(schedule_state)").fetchall()}
+    if not cols:
+        # Absent table → the CREATE TABLE in _SCHEMA below builds it current.
+        return
+    missing = [c for c in _V13_SCHEDULE_STATE_COLUMNS if c not in cols]
+    if not missing:
+        return
+    logger.info(f"Migrating catalog schema v12 -> v13 (schedule_state: {', '.join(missing)})")
+    for column in missing:
+        conn.execute(f"ALTER TABLE schedule_state ADD COLUMN {column} INTEGER")
     conn.commit()
 
 
@@ -1630,6 +1681,12 @@ def assign_schedule(conn: sqlite3.Connection, cycle_days: int, providers: tuple 
     a city land on the same day (paired same-day snapshots). Recomputed each
     call (stable hash, so assignments only change if cycle_days changed).
 
+    The upsert writes ``day_of_cycle`` and nothing else, so an existing row's
+    ``member`` (issue #248), clocks and failure count all survive. That is
+    load-bearing rather than incidental: ``cmd_run_due`` calls this on every
+    night before collecting, so a broader ``DO UPDATE`` would un-enrol every
+    opted-in (city, channel) pair nightly. Pinned by a test, not a comment.
+
     Returns the number of cities assigned.
     """
     cities = get_all_cities(conn, enabled_only=True)
@@ -1654,28 +1711,53 @@ def get_due_cities(
     cycle_days: int,
     grace_days: int,
     max_consecutive_failures: int,
+    default_membership: bool,
     provider: str = "gsv",
 ) -> list[CityRow]:
     """
     Cities due for collection today for the given provider, ordered
     stalest-first so backlog self-heals after outages.
 
-    A city is due when it is enabled, hasn't exceeded the failure cap, and
-    either has never succeeded or its last success is at least
-    (cycle_days - grace_days) old.
+    A city is due when it is enabled, is a MEMBER of this channel, hasn't
+    exceeded the failure cap, and either has never succeeded or its last
+    success is at least (cycle_days - grace_days) old.
+
+    ``default_membership`` is what a NULL ``schedule_state.member`` means for
+    this channel — the caller reads it from
+    ``scheduler.CHANNEL_DEFAULT_MEMBERSHIP[provider]``. It is **required and
+    keyword-only, with no default value**, deliberately: a ``= True`` here fails
+    open in the one direction that costs a 186-hour nightly queue (issue #248),
+    and it is the same shape ``_collect_due``'s ``providers`` and
+    ``_run_city_loop``'s ``max_cities`` already refuse for the same reason. A
+    signature test pins the absence of a default.
+
+    Membership and the ``consecutive_failures`` quarantine are independent
+    gates: a non-member never appears here however healthy it is, and a member
+    over the failure cap is still quarantined.
     """
     threshold = cycle_days - grace_days
+    # `s.member` is deliberately NOT in the SELECT list. Nothing downstream
+    # needs it, and `SELECT c.*` under sqlite3.Row is exactly where a
+    # duplicate column name would be resolved silently and wrongly — the
+    # reason the column is not called `enabled` (see _SCHEMA).
     rows = conn.execute(
         """SELECT c.*, s.last_success_at, s.consecutive_failures
            FROM cities c
            LEFT JOIN schedule_state s
              ON s.city_id = c.city_id AND s.provider = ?
            WHERE c.enabled = 1
+             AND COALESCE(s.member, ?) = 1
              AND COALESCE(s.consecutive_failures, 0) < ?
              AND (s.last_success_at IS NULL
                   OR julianday(?) - julianday(s.last_success_at) >= ?)
            ORDER BY s.last_success_at ASC NULLS FIRST, c.city_id ASC""",
-        (provider, max_consecutive_failures, today.isoformat(), threshold),
+        (
+            provider,
+            1 if default_membership else 0,
+            max_consecutive_failures,
+            today.isoformat(),
+            threshold,
+        ),
     ).fetchall()
     out = []
     for row in rows:
@@ -1719,6 +1801,68 @@ def record_attempt(
             (city_id, provider, now, error, now, error),
         )
     conn.commit()
+
+
+def get_channel_membership(conn: sqlite3.Connection, city_id: str, provider: str) -> int | None:
+    """This pair's explicit ``schedule_state.member``, or None.
+
+    None covers both "no schedule_state row yet" and "row exists, member unset";
+    they are the same thing to dueness, which COALESCEs either onto the
+    channel default. Callers that need to tell them apart should query the row.
+    """
+    row = conn.execute(
+        "SELECT member FROM schedule_state WHERE city_id = ? AND provider = ?",
+        (city_id, provider),
+    ).fetchone()
+    return None if row is None else row["member"]
+
+
+def set_channel_membership(
+    conn: sqlite3.Connection,
+    city_id: str,
+    provider: str,
+    member: bool | None,
+    *,
+    cycle_days: int,
+) -> None:
+    """Set this pair's membership (issue #248). ``None`` clears it to the channel default.
+
+    Inserts the ``schedule_state`` row if it does not exist yet — which is the
+    normal case for an opt-in channel, since ``assign_schedule`` only creates
+    rows for channels the config already enables. The inserted
+    ``day_of_cycle`` comes from :func:`compute_day_of_cycle`, matching
+    ``assign_schedule``, rather than ``record_attempt``'s literal 0. Nothing
+    gates on the column — dueness is pure staleness — so the 0 is a display
+    wart in ``cmd_status`` rather than a scheduling bug; the reason to write
+    the real value here is that a third writer inventing a third convention is
+    how a display wart grows into a trusted-looking lie.
+    """
+    value = None if member is None else (1 if member else 0)
+    conn.execute(
+        """INSERT INTO schedule_state (city_id, provider, day_of_cycle, member)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(city_id, provider) DO UPDATE SET member = ?""",
+        (city_id, provider, compute_day_of_cycle(city_id, cycle_days), value, value),
+    )
+    conn.commit()
+
+
+def count_channel_members(conn: sqlite3.Connection, provider: str, default_membership: bool) -> int:
+    """How many ENABLED cities are members of this channel, under its default.
+
+    The denominator half of ``cmd_status``' per-channel footer. Mirrors
+    :func:`get_due_cities`' membership clause exactly (``COALESCE(s.member, ?)
+    = 1`` over ``cities.enabled = 1``) and deliberately nothing else: this
+    counts membership, not dueness, so a quarantined or freshly-collected
+    member still counts.
+    """
+    return conn.execute(
+        """SELECT COUNT(*) FROM cities c
+           LEFT JOIN schedule_state s
+             ON s.city_id = c.city_id AND s.provider = ?
+           WHERE c.enabled = 1 AND COALESCE(s.member, ?) = 1""",
+        (provider, 1 if default_membership else 0),
+    ).fetchone()[0]
 
 
 # ── GSV driving-plan feed (issue #176) ─────────────────────────────────────

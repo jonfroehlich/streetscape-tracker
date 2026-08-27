@@ -239,7 +239,13 @@ def test_api_usage_ledger(conn):
 
 
 def test_due_selection_lifecycle(conn, city):
-    kw = dict(today=date(2026, 7, 2), cycle_days=90, grace_days=7, max_consecutive_failures=5)
+    kw = dict(
+        today=date(2026, 7, 2),
+        cycle_days=90,
+        grace_days=7,
+        max_consecutive_failures=5,
+        default_membership=True,
+    )
     db.assign_schedule(conn, 90)
     assert [c.city_id for c in db.get_due_cities(conn, **kw)] == [city]  # never run
 
@@ -310,7 +316,13 @@ def test_api_usage_ledger_per_provider(conn):
 
 
 def test_schedule_state_per_provider(conn, city):
-    kw = dict(today=date(2026, 7, 2), cycle_days=90, grace_days=7, max_consecutive_failures=5)
+    kw = dict(
+        today=date(2026, 7, 2),
+        cycle_days=90,
+        grace_days=7,
+        max_consecutive_failures=5,
+        default_membership=True,
+    )
     db.assign_schedule(conn, 90, providers=("gsv", "mapillary"))
     # Both providers land on the same cycle day (paired snapshots)
     days = conn.execute(
@@ -957,6 +969,279 @@ def test_migrate_v11_to_v12_resumes_after_a_partial_migration(tmp_path):
     conn.close()
 
 
+def test_migrate_v12_to_v13(tmp_path):
+    """A v12 catalog gains schedule_state.member on connect, NULL everywhere.
+
+    Built from db._SCHEMA minus the delta (so the fixture tracks the code),
+    with a pre-v13 schedule_state row seeded to prove it survives and reads
+    NULL — which for this column means "fall back to the channel default", NOT
+    "not measured" (issue #248). That is what makes the migration inert for the
+    four channels running today.
+    """
+    db_path = str(tmp_path / "v12.db")
+    raw = sqlite3.connect(db_path)
+    raw.executescript(db._SCHEMA)
+    for column in db._V13_SCHEDULE_STATE_COLUMNS:
+        raw.execute(f"ALTER TABLE schedule_state DROP COLUMN {column}")
+    raw.execute(
+        """INSERT INTO cities (city_id, display_name, city_name, center_lat,
+           center_lon, grid_width_m, grid_height_m, step_m, created_at)
+           VALUES ('bend--or', 'Bend, OR', 'Bend', 44.05, -121.31,
+                   5000, 5000, 20, '2026-01-01T00:00:00+00:00')"""
+    )
+    raw.execute(
+        """INSERT INTO schedule_state (city_id, provider, day_of_cycle, last_success_at,
+           consecutive_failures)
+           VALUES ('bend--or', 'gsv', 47, '2026-05-01T00:00:00+00:00', 2)"""
+    )
+    raw.execute("PRAGMA user_version = 12")
+    raw.commit()
+    raw.close()
+
+    conn = db.connect(db_path)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(schedule_state)").fetchall()}
+    assert set(db._V13_SCHEDULE_STATE_COLUMNS) <= cols
+
+    row = conn.execute("SELECT * FROM schedule_state WHERE city_id = 'bend--or'").fetchone()
+    assert row["member"] is None
+    assert row["day_of_cycle"] == 47  # the pre-v13 row survived intact
+    assert row["consecutive_failures"] == 2
+
+    # Idempotent: reopening must not error or re-migrate.
+    conn.close()
+    conn2 = db.connect(db_path)
+    assert conn2.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
+    conn2.close()
+
+
+def test_migrating_to_v13_returns_an_identical_due_set(tmp_path):
+    """The byte-equivalence claim, asserted as a list rather than eyeballed.
+
+    Every scheduled channel today defaults to member, so a v12 catalog's due
+    set must be element-for-element what it was before the column existed —
+    including its stalest-first ORDER, since the city cap truncates from the
+    tail. Most rows are not due at all, so a test that only counted them could
+    stay green while the gate silently changed which cities lead.
+    """
+    db_path = str(tmp_path / "v12.db")
+    raw = sqlite3.connect(db_path)
+    raw.executescript(db._SCHEMA)
+    for column in db._V13_SCHEDULE_STATE_COLUMNS:
+        raw.execute(f"ALTER TABLE schedule_state DROP COLUMN {column}")
+    for i, (cid, last) in enumerate(
+        [
+            ("alpha", None),  # never run -> leads (NULLS FIRST)
+            ("bravo", "2026-01-01T00:00:00+00:00"),  # stalest dated
+            ("charlie", "2026-03-01T00:00:00+00:00"),
+            ("delta", "2026-07-01T00:00:00+00:00"),  # fresh -> not due
+        ]
+    ):
+        raw.execute(
+            """INSERT INTO cities (city_id, display_name, city_name, center_lat,
+               center_lon, grid_width_m, grid_height_m, step_m, created_at)
+               VALUES (?, ?, ?, 44.05, -121.31, 5000, 5000, 20, '2026-01-01T00:00:00+00:00')""",
+            (cid, cid.title(), cid.title()),
+        )
+        raw.execute(
+            "INSERT INTO schedule_state (city_id, provider, day_of_cycle, last_success_at) "
+            "VALUES (?, 'gsv', ?, ?)",
+            (cid, i, last),
+        )
+    raw.execute("PRAGMA user_version = 12")
+    raw.commit()
+    raw.close()
+
+    conn = db.connect(db_path)
+    due = db.get_due_cities(
+        conn,
+        today=date(2026, 7, 2),
+        cycle_days=90,
+        grace_days=7,
+        max_consecutive_failures=5,
+        default_membership=True,
+    )
+    assert [c.city_id for c in due] == ["alpha", "bravo", "charlie"]
+    assert all(
+        r["member"] is None for r in conn.execute("SELECT member FROM schedule_state").fetchall()
+    )
+    conn.close()
+
+
+def test_membership_is_per_channel_and_independent_of_the_failure_quarantine(tmp_path):
+    """`member` scopes ONE channel, and it is a separate gate from the failure cap.
+
+    Both halves matter (issue #248): a per-city flag that took a city out of
+    every channel would just be cities.enabled again, and folding membership
+    into the quarantine would make a non-member look like a failing city — the
+    one state an operator must never confuse for the other, since a failing
+    city needs investigating and a non-member is working as configured.
+    """
+    conn = db.connect(str(tmp_path / "c.db"))
+    db.register_city(
+        conn,
+        city_name="Bend",
+        state_name="Oregon",
+        state_code="OR",
+        country_name="United States",
+        country_code="US",
+        center_lat=44.05,
+        center_lon=-121.31,
+        grid_width_m=5000,
+        grid_height_m=5000,
+        step_m=20,
+    )
+    cid = db.derive_city_id("Bend", "Oregon", "United States")
+    db.assign_schedule(conn, 90, providers=("gsv", "mapillary"))
+    kw = dict(today=date(2026, 7, 2), cycle_days=90, grace_days=7, max_consecutive_failures=5)
+
+    db.set_channel_membership(conn, cid, "gsv", False, cycle_days=90)
+    assert db.get_due_cities(conn, default_membership=True, provider="gsv", **kw) == []
+    assert [
+        c.city_id
+        for c in db.get_due_cities(conn, default_membership=True, provider="mapillary", **kw)
+    ] == [cid]
+
+    # Independent gates: healthy but not a member above; a member over the cap
+    # is still quarantined below.
+    db.set_channel_membership(conn, cid, "gsv", True, cycle_days=90)
+    for _ in range(5):
+        db.record_attempt(conn, cid, success=False, error="boom")
+    assert db.get_due_cities(conn, default_membership=True, provider="gsv", **kw) == []
+    conn.close()
+
+
+def test_an_opt_in_channel_collects_nothing_until_a_city_is_enrolled(tmp_path):
+    """default_membership=False is the whole point: a configured channel whose
+    cities were never enrolled has an EMPTY queue, not the 1,144-city one that
+    prices at ~186,000 requests a pass (issue #248).
+
+    And an explicit 1 overrides the default in that direction, which is what
+    `enroll-city` writes.
+    """
+    conn = db.connect(str(tmp_path / "c.db"))
+    db.register_city(
+        conn,
+        city_name="Krabi",
+        state_name=None,
+        state_code=None,
+        country_name="Thailand",
+        country_code="TH",
+        center_lat=8.06,
+        center_lon=98.92,
+        grid_width_m=10000,
+        grid_height_m=10000,
+        step_m=20,
+    )
+    cid = db.derive_city_id("Krabi", None, "Thailand")
+    db.assign_schedule(conn, 90, providers=("kartaview",))
+    kw = dict(
+        today=date(2026, 7, 2),
+        cycle_days=90,
+        grace_days=7,
+        max_consecutive_failures=5,
+        provider="kartaview",
+    )
+
+    assert db.get_due_cities(conn, default_membership=False, **kw) == []
+    assert db.count_channel_members(conn, "kartaview", False) == 0
+
+    db.set_channel_membership(conn, cid, "kartaview", True, cycle_days=90)
+    assert [c.city_id for c in db.get_due_cities(conn, default_membership=False, **kw)] == [cid]
+    assert db.count_channel_members(conn, "kartaview", False) == 1
+
+    # --clear restores the default; --remove writes an explicit 0. The two are
+    # indistinguishable to dueness TODAY and deliberately kept apart anyway:
+    # only the explicit 0 survives a future flip of the channel default.
+    db.set_channel_membership(conn, cid, "kartaview", None, cycle_days=90)
+    assert db.get_channel_membership(conn, cid, "kartaview") is None
+    db.set_channel_membership(conn, cid, "kartaview", False, cycle_days=90)
+    assert db.get_channel_membership(conn, cid, "kartaview") == 0
+    assert db.get_due_cities(conn, default_membership=False, **kw) == []
+    assert db.get_due_cities(conn, default_membership=True, **kw) == []
+    conn.close()
+
+
+def test_enrolling_a_city_with_no_schedule_row_uses_the_assign_stagger(tmp_path):
+    """set_channel_membership INSERTs when no row exists — the normal case for an
+    opt-in channel, since assign_schedule only creates rows for CONFIGURED ones.
+
+    The inserted day_of_cycle must be compute_day_of_cycle's, matching
+    assign_schedule, not record_attempt's literal 0. Nothing gates on the
+    column, so the 0 is a cmd_status display wart rather than a scheduling bug
+    — but a third writer inventing a third convention is how a display wart
+    grows into a trusted-looking lie.
+    """
+    conn = db.connect(str(tmp_path / "c.db"))
+    db.register_city(
+        conn,
+        city_name="Krabi",
+        state_name=None,
+        state_code=None,
+        country_name="Thailand",
+        country_code="TH",
+        center_lat=8.06,
+        center_lon=98.92,
+        grid_width_m=10000,
+        grid_height_m=10000,
+        step_m=20,
+    )
+    cid = db.derive_city_id("Krabi", None, "Thailand")
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM schedule_state WHERE city_id = ? AND provider = 'kartaview'",
+            (cid,),
+        ).fetchone()[0]
+        == 0
+    )
+
+    db.set_channel_membership(conn, cid, "kartaview", True, cycle_days=90)
+    row = conn.execute(
+        "SELECT day_of_cycle, member FROM schedule_state WHERE city_id = ? AND provider = ?",
+        (cid, "kartaview"),
+    ).fetchone()
+    assert row["member"] == 1
+    assert row["day_of_cycle"] == db.compute_day_of_cycle(cid, 90)
+    conn.close()
+
+
+def test_assign_schedule_never_un_enrolls_a_member(tmp_path):
+    """cmd_run_due calls assign_schedule on EVERY night before collecting, so an
+    upsert that touched more than day_of_cycle would silently un-enrol every
+    opted-in pair nightly (issue #248). Pinned here rather than left to the
+    `DO UPDATE SET day_of_cycle = ?` being read correctly by the next editor.
+    """
+    conn = db.connect(str(tmp_path / "c.db"))
+    db.register_city(
+        conn,
+        city_name="Krabi",
+        state_name=None,
+        state_code=None,
+        country_name="Thailand",
+        country_code="TH",
+        center_lat=8.06,
+        center_lon=98.92,
+        grid_width_m=10000,
+        grid_height_m=10000,
+        step_m=20,
+    )
+    cid = db.derive_city_id("Krabi", None, "Thailand")
+    db.set_channel_membership(conn, cid, "kartaview", True, cycle_days=90)
+    db.record_attempt(conn, cid, success=True, provider="kartaview")
+
+    db.assign_schedule(conn, 90, providers=("gsv", "kartaview"))
+
+    row = conn.execute(
+        "SELECT member, last_success_at, consecutive_failures FROM schedule_state "
+        "WHERE city_id = ? AND provider = 'kartaview'",
+        (cid,),
+    ).fetchone()
+    assert row["member"] == 1
+    assert row["last_success_at"] is not None
+    assert row["consecutive_failures"] == 0
+    conn.close()
+
+
 def test_register_street_walk_round_trips_the_v12_lengths(tmp_path):
     """The lengths reach the row, and re-collecting the same day replaces them
     rather than keeping the first walk's figures (the upsert covers v12 too)."""
@@ -1024,6 +1309,9 @@ def test_migrate_v8_catalog_reaches_current_schema_in_one_connect(tmp_path):
     assert conn.execute("SELECT COUNT(*) FROM street_walk_diffs").fetchone()[0] == 0
     # v12: the absolute-length columns.
     assert set(db._V12_STREET_WALK_COLUMNS) <= cols
+    # v13: the per-channel membership column.
+    sched_cols = {r[1] for r in conn.execute("PRAGMA table_info(schedule_state)").fetchall()}
+    assert set(db._V13_SCHEDULE_STATE_COLUMNS) <= sched_cols
     # And the seeded v8 walk survived the whole ladder.
     walk = db.get_latest_street_walk(conn, "bend--or")
     assert walk["csv_filename"] == "old_streetwalk.csv.gz"
