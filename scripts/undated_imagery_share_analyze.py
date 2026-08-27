@@ -21,7 +21,8 @@ them would be meaningless:
   catalog   Our own dated grid snapshots, per (provider, run), from the
             ``runs`` table's ``status_ok``/``status_no_date`` counters. This is
             a census of what WE collected — 1,000+ GSV runs — but we hold no
-            KartaView runs, because ``kartaview`` is not a scheduler channel.
+            KartaView runs: ``kartaview`` became a scheduler channel in #248,
+            but an opt-in one, so it collects only enrolled cities.
   audit     ``kartaview-shotdate-audit_metrics.json``, already committed beside
             ``kartaview-feasibility.md``: 48 sequences sampled from KartaView's
             API and tested against the ``shot_date >= date_added`` invariant.

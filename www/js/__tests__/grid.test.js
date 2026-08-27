@@ -496,8 +496,9 @@ test("GRID_FILTERS: 'Collected by' offers every COLLECTED provider plus the arit
 
 test("a REGISTERED but uncollected provider gets no columns, presets or scope option", () => {
   // The registry is not the payload (issue #250 review). KartaView is
-  // registered (#225/#251) and deliberately not a scheduler channel, so the
-  // published aggregate carries no KartaView city at all — fanning the leaves
+  // registered (#225/#251) and, since #248, an OPT-IN scheduler channel, so the
+  // published aggregate carries no KartaView city until one is enrolled —
+  // "registered" and "collected" stay different sets either way. Fanning the leaves
   // out over the registry put six em-dash columns on this page, three of them
   // in the default preset, plus a "Collected by → KartaView" option matching
   // zero rows. That select is also the numeric SCOPE, so choosing it pointed

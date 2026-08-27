@@ -20,7 +20,7 @@ The full data model, pipeline, and filename contract live in [`docs/architecture
 | API model | One metadata request per grid point | Bulk z14 vector tiles (~10–100 requests/city) | Paginated radius sweep |
 | What's kept | The nearest pano per grid point (a *sample*) | Every 360° pano, assigned to its nearest grid point, plus one `FLAT_ONLY` marker where only flat imagery covers a point (a *census*) | The same census as Mapillary — 360° panos plus `FLAT_ONLY` markers, never a row per flat photo |
 | Credential (`.env`) | `GMAPS_API_KEY` | `MAPILLARY_ACCESS_TOKEN` | `KARTAVIEW_ACCESS_TOKEN` (required — the anonymous tier is unusably slow) |
-| Nightly scheduler | Yes | Yes | No — CLI collection only |
+| Nightly scheduler | Yes — every enabled city | Yes — every enabled city | Yes, but **opt-in**: only cities enrolled with `scheduler enroll-city` (#248) |
 
 `--provider` is a comma-separated channel list defaulting to `gsv,mapillary`, and every named provider's key must be present up-front so the series can't drift.
 `--provider all` collects every provider the naming contract knows about — never the default, because KartaView's radius sweep is serial and runs for hours on a metro (see [`docs/experiments/kartaview-sweep-cost.md`](docs/experiments/kartaview-sweep-cost.md)).

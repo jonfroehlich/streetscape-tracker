@@ -37,7 +37,7 @@ A per-provider question cannot be answered from a catalog that is only well-popu
 
 The first two are a census of what we collected; the third is a sample of what the provider serves, lifted from [`kartaview-shotdate-audit_metrics.json`](kartaview-shotdate-audit_metrics.json) rather than re-probed, since that number already has a writeup and caveats of its own ([`kartaview-feasibility.md`](kartaview-feasibility.md)).
 They are not a controlled comparison.
-We hold no KartaView runs at all (it is not a scheduler channel), and the audit's own writeup calls its sample Grab-heavy and its count a lower bound.
+We hold no KartaView runs at all — it became a scheduler channel in #248 but an opt-in one, so it collects only enrolled cities — and the audit's own writeup calls its sample Grab-heavy and its count a lower bound.
 
 **And all three are proxies for the quantity actually at issue, which is the ROAD-WALK undated share.**
 No walk has ever recorded one: `street_walks` and the coverage artifact counted covered samples and nothing else, which is the gap #257 closed by adding `dated_covered_samples` per edge and `covered_samples_dated`/`dated_pct_of_covered` to the artifact's summary blocks.

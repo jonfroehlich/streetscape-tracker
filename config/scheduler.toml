@@ -63,10 +63,11 @@ max_batch_hours = 10
 # larger volume; a night simply stops queueing independent work behind unrelated
 # work. What each per-IP third party sees is INVARIANT, because a channel is
 # never launched while an in-flight sibling is already talking to a host it
-# needs — the scheduler defers it. With today's four channels that makes 3 the
+# needs — the scheduler defers it. With today's five channels that makes 4 the
 # effective ceiling: mapillary_streets shares Overpass with gsv_streets and the
 # tile CDN with mapillary, so it always runs after both, and the Mapillary tile
 # rate stays the single figure configured below rather than double it.
+# kartaview shares its host with nothing, so it can always take a lane.
 #
 # Two things gated raising this in production, both outside this file. The
 # first is met; the second is still a console check:
@@ -250,6 +251,40 @@ max_requests_per_minute = 60
 # nothing extra (the tile census is the same regardless of how many sample
 # points are scored against it) — only the local join gets bigger.
 #network_type = "drive"
+
+# KartaView (issue #248). An OPT-IN channel: unlike every block above, enabling
+# it here does NOT put the catalog in its queue. Membership is per (city,
+# channel) in the catalog — `schedule_state.member`, defaulting to non-member
+# for this channel — so the nightly queue is exactly the cities an operator
+# enrolled:
+#
+#   scheduler enroll-city "Krabi, Thailand" --channel kartaview
+#   scheduler enroll-city --channel kartaview --list
+#
+# That is the whole reason this block can exist at all. Tiling all 1,144
+# enabled cities' frozen bboxes prices one pass at ~186,000 requests ~ 186 h
+# (docs/experiments/kartaview-sweep-cost.md), and stalest-first ordering knows
+# nothing about cost, so which nights drew Singapore (~9,974) or New York
+# (~12,355) would be a coin flip.
+#
+# Enabling it here is also what makes this the FIFTH channel: kartaview
+# declares HOST_KARTAVIEW, shared with nothing, so the effective
+# max_concurrent_channels ceiling moves from 3-of-4 to 4-of-5.
+[providers.kartaview]
+enabled = true
+# Must clear the largest ENROLLED city's estimate or the budget guard skips it
+# *permanently* — `_run_city_channels` treats est > budget as a skip, and
+# `estimate_kartaview_requests` prices the whole sweep rather than a resuming
+# city's remainder, so no amount of checkpointing gets such a city collected.
+# That is issue #274. 10,000 clears the largest city the cost study measured
+# (Singapore, ~9,974). Note the arithmetic honestly: 16/min x 10 h is ~9,600,
+# so a night can physically spend slightly less than this ceiling.
+daily_request_budget = 10000
+# DEFAULT_SWEEP_REQUESTS_PER_MINUTE — 960/h, under the documented 1,000/h
+# authenticated ceiling. Load-bearing beyond pacing: _kartaview_timeout_seconds
+# derives the per-city timeout from this rate, so lowering it here without
+# re-reading that function silently shortens every sweep's timeout too.
+max_requests_per_minute = 16
 
 [download]
 # Conservative defaults; see cli.py docstring for tuning guidance.

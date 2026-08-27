@@ -7,7 +7,8 @@ It is a **router**: each section carries the short, mistake-preventing rules and
 ## What this project is
 
 Streetscape Tracker analyzes street-level imagery coverage and temporal patterns in cities **over time**.
-Three providers are collectable — Google Street View (GSV, the default), Mapillary (360° panos only), and KartaView — though only GSV and Mapillary run on the nightly scheduler; KartaView is CLI-only (see the census section below).
+Three providers are collectable — Google Street View (GSV, the default), Mapillary (360° panos only), and KartaView.
+GSV and Mapillary run nightly over **every enabled city**; KartaView is a scheduler channel too but **opt-in**, collecting only the cities an operator enrolled with `scheduler enroll-city` (#248), because one whole-catalog pass prices at ~186,000 requests ≈ 186 h.
 The tool samples a geographic grid around a city center, queries each provider's metadata API, and produces immutable dated snapshots per (city, provider), run-to-run change summaries (panos added/removed, capture-date changes, coverage deltas), and interactive map visualizations.
 
 ## READ THIS FIRST: provider API access is the single point of failure
@@ -100,7 +101,7 @@ Credentials live in `.env`, loaded per channel by `streetscape_metadata_tracker/
 |---|---|---|
 | `gsv` | `GMAPS_API_KEY` | Street View Static API enabled |
 | `mapillary` | `MAPILLARY_ACCESS_TOKEN` | Free client token |
-| `kartaview` | `KARTAVIEW_ACCESS_TOKEN` | **Required, not optional**: anonymous is 100 req/h vs 1,000 authenticated — at 100/h a p95 city is hours and Singapore is days, so it is not a slower channel, it is no channel |
+| `kartaview` | `KARTAVIEW_ACCESS_TOKEN` | **Required, not optional**: anonymous is 100 req/h vs 1,000 authenticated — at 100/h a p95 city is hours and Singapore is days, so it is not a slower channel, it is no channel. Scheduled but **opt-in** (#248) |
 | `gsv_streets` | `GMAPS_STREETS_API_KEY` | Isolated street-collection key (#99) with its own `api_usage` string, so street experiments can't exhaust production quotas; **live** |
 | `mapillary_streets` | `MAPILLARY_STREETS_ACCESS_TOKEN` | Same isolation; **dormant** |
 
@@ -111,7 +112,7 @@ Three `--provider` flags exist with **different vocabularies** — never conflat
 | Surface | Accepts | Shape |
 |---|---|---|
 | `streetscape_tracker.py --provider` | `gsv`, `mapillary`, `kartaview`, `all`; the retired `both` still works, with a notice (#247) | Comma-separated list; default `gsv,mapillary` |
-| `scheduler run-due --provider` | The four scheduled channels: `gsv`, `gsv_streets`, `mapillary`, `mapillary_streets` | Repeatable or comma-separated; no `all`, `both`, or `kartaview` |
+| `scheduler run-due --provider` | The five scheduled channels: `gsv`, `gsv_streets`, `kartaview`, `mapillary`, `mapillary_streets` | Repeatable or comma-separated; no `all` or `both` |
 | `scheduler assess-city --provider` | `gsv_streets`, `mapillary`, `mapillary_streets` — the GSV grid run is never part of it | Repeatable or comma-separated |
 
 `--provider` is always a channel LIST, never a keyword whose meaning drifts with the provider count (#247).
@@ -144,8 +145,9 @@ It is columnar (a memory contract, #157), pinned byte-identical by a golden fixt
 `is_pano` is read through `census.census_is_pano`, never as a raw array; imagery-type stratification (#116) yields **two** coverage numbers — 360° and any-imagery — which are never conflated.
 Four KartaView rules that must survive without a read:
 
-- **`--provider kartaview` collects (#251) but is still NOT a scheduler channel** — a `[providers.kartaview]` block is refused (`run-due`/`assess-city` exit `USAGE_EXIT_CODE` while one exists), now only because declaring it makes a FIFTH channel and moves the concurrency ceiling from 3-of-4 to 4-of-5.
-  Dueness is no longer the blocker: it is per (city, channel) since #248, `kartaview` defaults to non-member, and `_collect_due` hoists a city due *only* on an opt-in channel to the head of the slate (`all`, not `any`) — without which the channel would be scoped but never reached.
+- **`kartaview` IS a scheduler channel now (#248), and the only OPT-IN one** — declaring `[providers.kartaview]` enrolls nobody; its nightly queue is exactly the cities an operator ran `enroll-city` on, because a whole-catalog pass is ~186,000 requests ≈ 186 h.
+  `_collect_due` hoists a city due *only* on an opt-in channel to the head of the slate (`all`, not `any`) — without which the channel would be scoped but never reached, since the union is gsv-ordered and the city cap truncates from the tail.
+  It is also the fifth channel, so the effective `max_concurrent_channels` ceiling is **4 of 5** (`HOST_KARTAVIEW` is shared with nothing) — that figure is a property of the channel set's host graph, never a constant.
   Its cost arms ARE wired (#238): the estimate is the swept-circle lattice × the measured **1.80×**, never the GSV grid formula, and the previous run's observed `runs.api_requests` outranks that geometry as the **larger** of the two, never on its own.
 - **`api_requests` is this process's spend and `api_requests_total` is the sweep's** — `db.add_api_usage` is additive and keyed by (date, provider), so a resumed night reporting the whole sweep would charge last night against tonight's budget gate.
 - **HTTP 400 is backpressure here, not a malformed request** — typed permanent it would never be retried or subdivided, and every dense city would collect nothing.
@@ -170,7 +172,7 @@ This is what READ THIS FIRST points at; read it before changing any pacing, retr
 
 **Scheduler → [`docs/scheduler.md`](docs/scheduler.md).**
 `run-due` collects the stalest-due cities per enabled channel under per-channel daily budgets, then runs a tail — aggregate, streetwalk manifest, driving-plan summary, catalog backup, publish.
-Channels run back-to-back, or concurrently in host-disjoint lanes when `[schedule].max_concurrent_channels` > 1 (default 1; channels sharing a per-IP host never overlap, so the effective ceiling is 3 of 4, and raising it in prod is gated only on verifying the two GSV keys live in separate Cloud projects).
+Channels run back-to-back, or concurrently in host-disjoint lanes when `[schedule].max_concurrent_channels` > 1 (default 1; channels sharing a per-IP host never overlap, so the effective ceiling is 4 of 5, and raising it in prod is gated only on verifying the two GSV keys live in separate Cloud projects).
 **The tail is what makes a night visible, and it only runs if the city loop returns** — every way of ending the loop (deadline, SIGTERM wind-down, unexpected exception) returns counters instead of propagating, and each tail artifact reports a crash rather than raising.
 **Publishing happens only at the end**, so a stale public site usually means the batch died or overran, not that the publisher broke.
 Drive manual batches into a file (`>> logs/x.log 2>&1`), never a pipe.

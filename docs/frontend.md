@@ -50,7 +50,7 @@ On streets those filenames come **only** from the `${provider}|${city_id}` aggre
 The provider asymmetry is deliberate and commented.
 **(6) Old links degrade rather than break**: `?provider=gsv` still selects the same cities (the value vocabulary only *gained* a `multi` option, which absorbed the old checkbox), `?both=1` is silently ignored by the unknown-key parser, and a pre-pivot `?sort=pct` falls through `setSortTo`'s unknown-key guard to the page default.
 **(7) The REGISTRY is not the payload: every leaf fans out over the providers actually COLLECTED, not over `Object.keys(PROVIDERS)`.**
-The registry is what the site knows how to render and it is a strictly larger set than what has been published — KartaView is registered (#225/#251) and deliberately not a scheduler channel, so the 2026-08-22 aggregate carries 1,187 GSV cities, 1,067 Mapillary and **zero** KartaView.
+The registry is what the site knows how to render and it is a strictly larger set than what has been published — KartaView is registered (#225/#251) and, since #248, a scheduler channel whose membership is **opt-in**, so it publishes only for the cities an operator enrolled and the 2026-08-22 aggregate carries 1,187 GSV cities, 1,067 Mapillary and **zero** KartaView.
 Fanning out over the registry took `grid.html` from 20 columns to 26 and its default preset from 9 visible to 12 (streets 23 → 32, 9 → 12), every KartaView leaf an em-dash
 — and worse, offered “Collected by → KartaView”, which matches no rows AND, because that select is also the numeric **scope** (below), redirects every slider onto an all-null field whose empty domain then falls back to the descriptor's `min`/`max`, i.e.
 an arbitrary 0–1 axis on the age filter.

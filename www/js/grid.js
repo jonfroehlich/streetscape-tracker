@@ -30,8 +30,9 @@
  * Registry order — every provider the site KNOWS ABOUT.
  *
  * Not the same list as the one the table renders. A provider can be registered
- * and publish nothing (KartaView is registered but deliberately not a
- * scheduler channel, so essentially no city carries a KartaView run), and a
+ * and publish nothing (KartaView is registered and, since #248, a scheduler
+ * channel whose membership is opt-in, so essentially no city carries a
+ * KartaView run until an operator enrolls one), and a
  * leaf column, a preset entry or a scope option for such a provider is a
  * column of em-dashes and a filter that selects no rows. `pivotGridRows`
  * reports which providers the payload actually CONTAINS and the render path
