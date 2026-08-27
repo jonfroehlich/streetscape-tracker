@@ -416,6 +416,25 @@ test("every plan-status filter value is one the row models can actually produce"
   }
 });
 
+test("DRIVING_FILTERS: numeric filters are histogram sliders over real row fields", () => {
+  // The same contract grid.js and streets.js carry. A `range` descriptor still
+  // renders (two number inputs, no picture), so a filter that silently stayed
+  // plain would look deliberate rather than broken — and on THIS page the bars
+  // are load-bearing: most rows are plan areas we do not track, whose observed
+  // fields are all null, so the histogram is what says how few of the ~3,800
+  // rows a coverage window can match at all.
+  const row = drivingRowModel(ADDIS, TODAY);
+  const area = planAreaRowModel(CHUBUT, TODAY);
+  for (const filter of DRIVING_FILTERS) {
+    if (!filter.field) continue;
+    assert.equal(filter.type, "histogram-range", `${filter.key} is not a histogram filter`);
+    assert.ok(filter.field in row, `filter ${filter.key} reads a missing field ${filter.field}`);
+    // Both row KINDS have to carry the field, or a domain seeded from the full
+    // row set would read `undefined` off every untracked area.
+    assert.ok(filter.field in area, `filter ${filter.key} is absent from a plan-area row`);
+  }
+});
+
 test("planAreaRowModel: names the row by the districts it covers", () => {
   // Google's feed carries TEN separate Accra records — different districts,
   // different windows. Labelling them all "Accra, Ghana" made ten distinct

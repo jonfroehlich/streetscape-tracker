@@ -38,91 +38,120 @@
        target="_blank" rel="noopener">About &#8599;</a>
   </header>
 
-  <main class="streets-main">
-    <h1>Driving plan vs. observed imagery</h1>
-
-    <div class="streets-intro">
-      <p>
-        Google publishes where it plans to drive next, at a single URL it
-        <strong>overwrites in place</strong> — so every revision is lost unless
-        someone keeps a dated copy. This tracker does. This page reads that
-        archived plan together with the imagery we have actually measured, and
-        reports where the two agree and where they do not.
+  <main class="streets-main streets-main--wide">
+    <div class="page-head">
+      <h1>Driving plan vs. observed imagery</h1>
+      <p class="page-lead">
+        Google publishes where it plans to drive next at a single URL it
+        <strong>overwrites in place</strong> — this page reads our dated archive
+        of that plan against the imagery we have actually measured, and reports
+        where the two agree and where they do not.
       </p>
-      <p>
-        Every row is a <strong>place</strong>: either a city this project
-        collects, or a region named in Google's plan that it does not — so the
-        <em>Tracked</em> column tells you both whether imagery is coming and
-        whether anyone here is watching for it. The
-        <em>Capture history</em> column shows the years a place's official
-        Google imagery was actually taken, which is where repeat drives show up
-        that a single median age hides.
-      </p>
-      <p class="streets-caveat">
-        <strong>A closed or absent plan entry is not evidence that an area was
-        not driven.</strong> Google's Israeli entries all read
-        <em>publish&nbsp;=&nbsp;No</em> with 2018–19 windows, while our own runs
-        record captures in September and October 2023 — Google drove Israel four
-        years after the feed said the campaign had closed, and never revised it.
-        Rows like that are labelled <em>Driven, unplanned</em>, and they are the
-        clearest measure of how much the plan under-reports. Treat the plan as
-        advisory, never as a contract.
-      </p>
+      <details class="page-about">
+        <summary>How to read this table</summary>
+        <div class="page-about-body">
+          <p>
+            Every row is a <strong>place</strong>: either a city this project
+            collects, or a region named in Google's plan that it does not — so
+            the <em>Tracked</em> column tells you both whether imagery is coming
+            and whether anyone here is watching for it. The
+            <em>Capture history</em> column shows the years a place's official
+            Google imagery was actually taken, which is where repeat drives show
+            up that a single median age hides.
+          </p>
+          <p>
+            <strong>A closed or absent plan entry is not evidence that an area
+            was not driven.</strong> Google's Israeli entries all read
+            <em>publish&nbsp;=&nbsp;No</em> with 2018–19 windows, while our own
+            runs record captures in September and October 2023 — Google drove
+            Israel four years after the feed said the campaign had closed, and
+            never revised it. Rows like that are labelled <em>Driven,
+            unplanned</em>, and they are the clearest measure of how much the
+            plan under-reports. Treat the plan as advisory, never as a contract.
+          </p>
+          <p>
+            Each numeric filter in the sidebar carries a histogram of where the
+            rows actually sit, drawn over everything the <em>other</em> controls
+            have selected, so brushing one range never redraws its own picture.
+            The address bar always carries the view you are looking at so it can
+            be shared.
+          </p>
+        </div>
+      </details>
     </div>
 
     <!-- Archive provenance + Google's own disclaimer, rendered by driving.js
          from the artifact's `plan` block. This is the page's principal caveat
-         (the archive is young), so it sits above the table, not below it. -->
+         (the archive is young), so it sits above the table, not below it — and
+         above the .table-layout rather than inside its table column, so the
+         sidebar and the table still start on the same row. -->
     <div id="driving-provenance" class="driving-provenance" hidden></div>
 
     <div id="driving-status" class="table-status" role="status" aria-live="polite">
       Loading the driving plan…
     </div>
 
-    <!-- Search, filters, column preset/picker and the distribution strip are
-         rendered into this container by table-controls.js once the data has
-         loaded. -->
-    <div id="driving-controls" class="controls-region"></div>
+    <!-- Sidebar + table, the shape grid.html and streets.html use; see that
+         file for the <details> rationale. This page is NOT pivoted — one row
+         per place, no provider sub-columns — but it filters through the same
+         chassis, so it gets the same filter column. -->
+    <div class="table-layout with-sidebar">
+      <aside class="table-sidebar" aria-label="Search and filters">
+        <details class="sidebar-disclosure" open>
+          <summary>Filters</summary>
+          <!-- Search, filters and the column preset/picker are rendered into
+               this container by table-controls.js once the data has loaded. -->
+          <div id="driving-controls" class="controls-region"></div>
+        </details>
+      </aside>
 
-    <div id="driving-table-wrap" class="streets-table-wrap" hidden>
-      <table class="streets-table">
-        <caption id="driving-caption"></caption>
-        <!-- Header cells are rendered by table-utils.js from the page's column
-             descriptors (DRIVING_COLUMNS), not authored here: column presets
-             change the visible set at runtime, so the header and the body have
-             to come from one list or they drift. -->
-        <thead id="driving-thead"></thead>
-        <tbody id="driving-tbody"></tbody>
-      </table>
+      <div class="table-content">
+        <div id="driving-table-wrap" class="streets-table-wrap" hidden>
+          <table class="streets-table">
+            <caption id="driving-caption"></caption>
+            <!-- Header cells are rendered by table-utils.js from the page's
+                 column descriptors (DRIVING_COLUMNS), not authored here: column
+                 presets change the visible set at runtime, so the header and
+                 the body have to come from one list or they drift. -->
+            <thead id="driving-thead"></thead>
+            <tbody id="driving-tbody"></tbody>
+          </table>
+        </div>
+
+        <!-- Both trailing sections live INSIDE the table column rather than
+             below the layout, so the sticky sidebar stays beside them and the
+             filters remain reachable while the revision history is being read.
+
+             What Google actually changed between archived snapshots, rendered
+             by driving.js from the artifact's `revisions`. This is the
+             archive's own reason to exist: the feed is overwritten in place, so
+             these edits are observable only because they were captured at the
+             time. -->
+        <section id="driving-revisions" class="driving-revisions" hidden></section>
+
+        <!-- The limits of "the past". Deliberately placed HERE rather than in
+             the page head: it is a caveat about historical depth, so it belongs
+             beside the history, and stacking a third caveat above the table
+             pushed the data itself below the fold. -->
+        <section class="driving-limits">
+          <h2>What this page cannot tell you</h2>
+          <p class="streets-caveat">
+            The capture history is built from dates attached to imagery that is
+            <em>currently</em> published, so a drive whose panoramas have since
+            been replaced leaves no trace in it. Recovering the full per-panorama
+            capture history — every past drive-through and its month — is
+            possible through an unpublished Google endpoint, but that harvester
+            has not been run for any city yet.
+          </p>
+          <p class="streets-caveat">
+            The plan archive itself only begins in July 2026. For any drive
+            before that, this page can report that the plan is silent or stale,
+            never that the drive was genuinely unplanned — the record simply
+            does not go back far enough.
+          </p>
+        </section>
+      </div>
     </div>
-
-    <!-- What Google actually changed between archived snapshots. Rendered by
-         driving.js from the artifact's `revisions`. This is the archive's own
-         reason to exist: the feed is overwritten in place, so these edits are
-         observable only because they were captured at the time. -->
-    <section id="driving-revisions" class="driving-revisions" hidden></section>
-
-    <!-- The limits of "the past". Deliberately placed HERE rather than in the
-         intro: it is a caveat about historical depth, so it belongs beside the
-         history, and stacking a third caveat above the table pushed the data
-         itself below the fold. -->
-    <section class="driving-limits">
-      <h2>What this page cannot tell you</h2>
-      <p class="streets-caveat">
-        The capture history is built from dates attached to imagery that is
-        <em>currently</em> published, so a drive whose panoramas have since
-        been replaced leaves no trace in it. Recovering the full per-panorama
-        capture history — every past drive-through and its month — is possible
-        through an unpublished Google endpoint, but that harvester has not been
-        run for any city yet.
-      </p>
-      <p class="streets-caveat">
-        The plan archive itself only begins in July 2026. For any drive before
-        that, this page can report that the plan is silent or stale, never that
-        the drive was genuinely unplanned — the record simply does not go back
-        far enough.
-      </p>
-    </section>
   </main>
 
   <!-- Scripts (order matters: libs → shared utils → page logic) -->
@@ -131,6 +160,7 @@
           crossorigin="anonymous"></script>
   <script src="js/streetscape-utils.js"></script>
   <script src="js/table-utils.js"></script>
+  <script src="js/histogram-slider.js"></script>
   <script src="js/table-controls.js"></script>
   <script src="js/driving.js"></script>
 </body>

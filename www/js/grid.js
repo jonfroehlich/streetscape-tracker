@@ -693,11 +693,6 @@ function renderGridRuns(rawCities) {
     presets: buildGridPresets(columns),
     filters: buildGridFilters(providers),
     searchFields: GRID_SEARCH_FIELDS,
-    // The sidebar carries per-filter histograms on fixed axes; a second
-    // histogram of whichever column happens to be sorted would be a different
-    // answer to the same question, changing its metric on every header click.
-    layout: "sidebar",
-    showDistributionStrip: false,
     onChange: (shown, all) => updateGridCaption(shown, all, generatedAt),
   });
   gridControls.setRows(rows);

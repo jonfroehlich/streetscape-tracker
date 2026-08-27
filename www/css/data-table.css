@@ -1,12 +1,13 @@
 /**
  * data-table.css
  * Shared styles for the sortable data-table pages: grid.html (per-city
- * grid-run stats) and streets.html (published road walks).
+ * grid-run stats), streets.html (published road walks) and driving.html
+ * (Google's plan joined against observed imagery).
  *
  * Moved wholesale from streets.css when the Grid page was added; the
  * `streets-*` class names predate the move and are kept verbatim because
  * the row templates in table-utils.js/streets.js and the e2e selectors
- * emit them — both pages simply share them.
+ * emit them — all three pages simply share them.
  *
  * Unlike index.html / city.html these pages are normal scrolling documents,
  * not a full-bleed map with floating panels — so they clear the fixed
@@ -19,8 +20,8 @@
   line-height: 1.5;
 }
 
-/* Wide enough that the table's nowrap columns fit without scrolling at
-   desktop widths; the intro keeps its own reading measure below. */
+/* The base measure. Every table page overrides it with .streets-main--wide
+   below; this is what a table page WITHOUT the filter sidebar would get. */
 .streets-main {
   max-width: 1200px;
   margin: 0 auto;
@@ -30,15 +31,6 @@
 .streets-main h1 {
   margin: 0 0 12px;
   font-size: 24px;
-}
-
-.streets-intro {
-  max-width: 68ch;
-  margin-bottom: 24px;
-}
-
-.streets-intro p {
-  margin: 0 0 10px;
 }
 
 .streets-caveat {
@@ -274,9 +266,8 @@
 }
 
 /* ── Exploration controls (issue #188) ─────────────────────────────────────
-   Search, filters, the column preset/picker and the distribution strip. The
-   whole region is rendered by table-controls.js; nothing here is authored in
-   the HTML. */
+   Search, filters and the column preset/picker. The whole region is rendered
+   by table-controls.js; nothing here is authored in the HTML. */
 
 .controls-region {
   margin-bottom: 16px;
@@ -431,9 +422,10 @@
 }
 
 /* ── Kayak-style filter sidebar (issue #250) ──────────────────────────────
-   grid.html and streets.html only: every rule below is scoped under
-   .with-sidebar or .streets-main--wide, and driving.html carries neither
-   class, so its horizontal control strip is untouched.
+   Every rule below is scoped under .with-sidebar or .streets-main--wide. That
+   scoping was originally what kept driving.html on its old horizontal control
+   strip; driving.html now carries both classes too, so all three table pages
+   share this column.
 
    The sidebar is a native <details>. Above the breakpoint its <summary> is
    hidden and the panel is simply an always-open column; below it, the summary
@@ -442,8 +434,10 @@
    panel closed with its toggle hidden — is closed in JS by
    wireSidebarDisclosure. */
 
-/* Wider measure than the 1200px single-column pages: a pivoted table carries
-   one sub-column per provider, and the sidebar takes 280px of the width. */
+/* Wider measure than the 1200px base: the sidebar takes 280px of the width,
+   and a pivoted table carries one sub-column per provider on top of that. The
+   arithmetic is deliberate — 1500 − 280 − 20 leaves the table the same 1200px
+   the pages had before the sidebar, so no preset had to be re-sized. */
 .streets-main--wide {
   max-width: 1500px;
   /* Tighter than the prose pages': the point of the compact head below is to
@@ -453,15 +447,15 @@
 }
 
 /* ── Compact page head ────────────────────────────────────────────────────
-   These two pages are instruments, not articles: the table and the filter
-   sidebar are what the reader came for, and a screen of preamble above them
-   pushed both below the fold. The lead is one sentence saying what the page
-   measures and how it differs from its sibling; everything else — how to read
-   the pivot, the census-vs-sample caveat, the crossfilter rule — moves into a
-   disclosure that is one click away and costs no vertical space closed.
-   driving.html keeps its full prose intro (.streets-intro), which is doing a
-   different job: that page's whole point needs explaining before its verdicts
-   mean anything. */
+   These pages are instruments, not articles: the table and the filter sidebar
+   are what the reader came for, and a screen of preamble above them pushed
+   both below the fold. The lead is one sentence saying what the page measures;
+   everything else — how to read the pivot, the census-vs-sample caveat, the
+   crossfilter rule, driving.html's "a closed plan row is not evidence" — moves
+   into a disclosure that is one click away and costs no vertical space closed.
+   driving.html held out longest on a three-paragraph intro, on the grounds
+   that its verdicts need explaining; the explanation is one click away here
+   rather than gone. */
 
 .page-head {
   margin-bottom: 14px;
@@ -650,12 +644,12 @@
 
 /* ── Histogram-slider filter (issue #250) ─────────────────────────────────
    A mini histogram with a dual-handle brush over it, used in place of a bare
-   min/max pair on grid.html and streets.html. Only pages whose filters declare
-   `type: "histogram-range"` emit this markup, so driving.html never matches.
+   min/max pair. Only filters declaring `type: "histogram-range"` emit this
+   markup; a plain `range` still renders as two number inputs.
 
-   The bars reuse the distribution strip's look (one flat hue, no legend, no
-   axis furniture) because they encode the same thing — row counts — and a
-   second visual language for one quantity would imply a second meaning.
+   One flat hue, no legend, no axis furniture: a single series encoding row
+   counts. Deliberately NOT painted with coverageColor, which would imply the
+   bar height meant coverage.
 
    The slider itself is lifted from index.css's .legend-slider family: two
    native range inputs stacked on one custom track, the inputs ignoring pointer
@@ -700,7 +694,7 @@
 .hist-bar {
   flex: 1;
   min-width: 1px;
-  background: #6c8ba0; /* the strip's hue — 3.6:1 on white, above the 3:1 floor */
+  background: #6c8ba0; /* 3.6:1 on the white surface — above the 3:1 floor */
   border-radius: 2px 2px 0 0;
 }
 
@@ -818,69 +812,4 @@
 .hist-bounds input:focus-visible {
   outline: 2px solid #1a73e8;
   outline-offset: 1px;
-}
-
-/* ── Distribution strip ────────────────────────────────────────────────────
-   A histogram of the ACTIVE SORT COLUMN over the CURRENTLY FILTERED rows, so
-   it describes what you have selected rather than the whole table. Single
-   series, so: one flat hue, no legend, no axis furniture. Deliberately not
-   painted with coverageColor — these bars encode row counts, and reusing the
-   coverage ramp would imply the height meant coverage. */
-
-.distribution-strip {
-  margin-top: 10px;
-  padding: 10px 14px;
-  background: #fff;
-  border-radius: 6px;
-  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.15);
-}
-
-.strip-bars {
-  display: flex;
-  align-items: flex-end;
-  gap: 2px; /* the surface gap that keeps adjacent bars readable as separate */
-  height: 40px;
-}
-
-.strip-bar {
-  flex: 1;
-  min-width: 2px;
-  background: #6c8ba0; /* 3.6:1 on the white surface — above the 3:1 floor */
-  border-radius: 2px 2px 0 0; /* rounded data-end, anchored to the baseline */
-  /* Reset browser <button> chrome (border/padding/font/background) — a bar is
-     a <button> exactly when its bucket is clickable (renderDistributionStrip
-     emits a plain, non-interactive <span> otherwise), and these are no-ops on
-     a <span>, so one rule covers both without a tag selector. */
-  display: block;
-  border: 0;
-  padding: 0;
-  font: inherit;
-  appearance: none;
-}
-
-/* Only a <button> (a clickable bucket) gets pointer affordance and
-   interaction states; the plain <span> case has nothing to hover into. */
-button.strip-bar {
-  cursor: pointer;
-}
-
-button.strip-bar:hover {
-  background: #557089;
-}
-
-button.strip-bar:focus-visible {
-  outline: 2px solid #1a73e8;
-  outline-offset: 1px;
-}
-
-.strip-summary {
-  margin: 6px 0 0;
-  color: #555;
-  font-size: 12px;
-}
-
-@media (prefers-reduced-motion: no-preference) {
-  .strip-bar {
-    transition: height 120ms ease-out;
-  }
 }

@@ -27,7 +27,15 @@
  * STREETSCAPE_DATA_BASE_URL, fetchGzippedJson, escapeHtml — from
  * table-utils.js: sortRowsBy, formatCellNumber, coverageCellHtml,
  * rowHtmlFromColumns, createSortableTable — and from table-controls.js:
- * createTableControls.
+ * createTableControls. histogram-slider.js is loaded for the numeric filters,
+ * but only table-controls.js talks to it.
+ *
+ * The page renders through the same chassis as grid.html and streets.html and
+ * now shares their layout too: a sticky filter sidebar, a one-sentence lead
+ * with the explanation in a disclosure, and histogram-slider filters. What it
+ * does NOT share is the pivot — those two carry one row per city with a
+ * sub-column per provider, this one carries one row per place and a flat
+ * single-row header, so no column here declares a `group`.
  */
 
 /**
@@ -542,10 +550,15 @@ const DRIVING_FILTERS = [
     ],
     test: (row, value) => (row.planStatus ?? "None") === value,
   },
+  // The three numeric windows are histogram-sliders, like grid.html's and
+  // streets.html's. On this page the picture is doing more work than there:
+  // most rows are plan areas we do not track, whose observed fields are all
+  // null, so the bars are the only thing that says how few of the ~3,800 rows
+  // a coverage window can possibly match before you brush one.
   {
     key: "cov",
     label: "Grid coverage %",
-    type: "range",
+    type: "histogram-range",
     field: "coveragePct",
     min: 0,
     max: 100,
@@ -553,7 +566,7 @@ const DRIVING_FILTERS = [
   {
     key: "street",
     label: "Street coverage %",
-    type: "range",
+    type: "histogram-range",
     field: "streetPct",
     min: 0,
     max: 100,
@@ -561,8 +574,10 @@ const DRIVING_FILTERS = [
   {
     key: "since",
     label: "Years since capture",
-    type: "range",
+    type: "histogram-range",
     field: "yearsSinceCapture",
+    // No declared max: how stale the stalest place is, is a property of the
+    // data rather than of the metric, so the axis takes it from the rows.
     min: 0,
   },
   {

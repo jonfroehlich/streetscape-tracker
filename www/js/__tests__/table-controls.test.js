@@ -26,11 +26,7 @@ const {
   defaultFilterValues,
   parseTableState,
   serializeTableState,
-  bucketCountFor,
   histogramBuckets,
-  medianOf,
-  formatStripSummary,
-  renderDistributionStrip,
   controlsHtml,
   syncSidebarDisclosure,
   wireSidebarDisclosure,
@@ -253,24 +249,15 @@ test("parseTableState: an empty query string yields defaults, not undefined", ()
   assert.deepEqual(parsed, { query: "", preset: null, cols: null, sort: null, values: {} });
 });
 
-// --- distribution strip -----------------------------------------------------
-
-test("bucketCountFor: scales with N and clamps at both ends", () => {
-  // A heavily filtered view must not render two lone bars across 24 empty
-  // buckets, and a full table must not render bars thinner than their gaps.
-  assert.equal(bucketCountFor(1), 1);
-  assert.equal(bucketCountFor(2), 2);
-  assert.equal(bucketCountFor(283), 17); // production's walk count
-  assert.equal(bucketCountFor(1501), 24); // production's grid-series count, capped
-});
-
-test("histogramBuckets: bucket count adapts to N when not given one", () => {
-  assert.equal(histogramBuckets([1, 2]).buckets.length, 2);
-  assert.equal(histogramBuckets(Array.from({ length: 100 }, (_, i) => i)).buckets.length, 10);
-});
+// --- histogramBuckets --------------------------------------------------------
+//
+// The axis is always the CALLER's. This helper fed two consumers until the
+// sorted-column distribution strip was retired: the strip scaled itself to the
+// rows in view, the histogram-slider must not, and the self-scaling default
+// went with the strip rather than being left as an option nothing picks.
 
 test("histogramBuckets: drops nulls and puts the maximum in the last bucket", () => {
-  const stats = histogramBuckets([0, 50, 100, null, undefined], 4);
+  const stats = histogramBuckets([0, 50, 100, null, undefined], 4, { min: 0, max: 100 });
   assert.equal(stats.count, 3);
   assert.equal(stats.min, 0);
   assert.equal(stats.max, 100);
@@ -280,68 +267,18 @@ test("histogramBuckets: drops nulls and puts the maximum in the last bucket", ()
   assert.equal(stats.buckets.reduce((n, b) => n + b.count, 0), 3);
 });
 
-test("histogramBuckets: a single distinct value yields one bucket, not a zero-width range", () => {
-  const stats = histogramBuckets([7, 7, 7], 10);
+test("histogramBuckets: a single-point domain yields one bucket, not a zero-width range", () => {
+  const stats = histogramBuckets([7, 7, 7], 10, { min: 7, max: 7 });
   assert.equal(stats.buckets.length, 1);
   assert.deepEqual(stats.buckets[0], { from: 7, to: 7, count: 3 });
 });
 
 test("histogramBuckets: nothing measurable yields null, not an empty chart", () => {
-  assert.equal(histogramBuckets([]), null);
-  assert.equal(histogramBuckets([null, undefined]), null);
+  const domain = { min: 0, max: 100 };
+  assert.equal(histogramBuckets([], 4, domain), null);
+  assert.equal(histogramBuckets([null, undefined], 4, domain), null);
   // NaN/Infinity are not measurements either.
-  assert.equal(histogramBuckets([NaN, Infinity]), null);
-});
-
-test("medianOf: averages the middle pair on an even count, ignores nulls", () => {
-  assert.equal(medianOf([1, 2, 3]), 2);
-  assert.equal(medianOf([1, 2, 3, 4]), 2.5);
-  assert.equal(medianOf([3, null, 1]), 2);
-  assert.equal(medianOf([]), null);
-});
-
-test("formatStripSummary: carries min/median/max as text for screen readers", () => {
-  const column = { key: "pct", label: "Grid coverage", type: "number", unit: "%", digits: 1 };
-  const summary = formatStripSummary(column, [10, 20, 90]);
-  assert.match(summary, /Grid coverage across 3 rows/);
-  assert.match(summary, /min 10\.0%/);
-  assert.match(summary, /median 20\.0%/);
-  assert.match(summary, /max 90\.0%/);
-});
-
-test("formatStripSummary: says so plainly when the filtered view has no values", () => {
-  const column = { key: "pct", label: "Grid coverage", type: "number" };
-  assert.match(formatStripSummary(column, [null, null]), /No grid coverage values/);
-});
-
-// --- renderDistributionStrip (clickable bars) --------------------------------
-
-const STRIP_EL = () => ({ innerHTML: "" });
-const STRIP_COLUMN = { key: "pct", label: "Coverage", type: "number", unit: "%", digits: 1 };
-
-test("renderDistributionStrip: plain, non-interactive spans when the caller passes no filter", () => {
-  const el = STRIP_EL();
-  renderDistributionStrip(el, STRIP_COLUMN, [10, 50, 90]);
-  assert.match(el.innerHTML, /<div class="strip-bars" aria-hidden="true">/);
-  assert.match(el.innerHTML, /<span class="strip-bar"/);
-  assert.doesNotMatch(el.innerHTML, /<button/);
-});
-
-test("renderDistributionStrip: clickable buttons carrying rounded bounds when a matching filter exists", () => {
-  const el = STRIP_EL();
-  renderDistributionStrip(el, STRIP_COLUMN, [10, 50, 90], true);
-  // No aria-hidden on the container once its bars are real, focusable buttons.
-  assert.doesNotMatch(el.innerHTML, /aria-hidden="true"/);
-  assert.match(el.innerHTML, /<button type="button" class="strip-bar" data-from="[\d.]+" data-to="[\d.]+"/);
-  assert.match(el.innerHTML, /click to filter to this range/);
-});
-
-test("renderDistributionStrip: a non-numeric or empty column never renders buttons, even if asked", () => {
-  // clickable=true from a stale sort state must not produce a strip with
-  // nothing behind it to filter.
-  const el = STRIP_EL();
-  renderDistributionStrip(el, { key: "label", label: "City", type: "text" }, [], true);
-  assert.doesNotMatch(el.innerHTML, /<button/);
+  assert.equal(histogramBuckets([NaN, Infinity], 4, domain), null);
 });
 
 // --- controls markup --------------------------------------------------------
@@ -475,9 +412,10 @@ test("rowsExceptFilter: the free-text query still narrows the bars", () => {
 
 // --- histogramBuckets: fixed domain -----------------------------------------
 
-test("histogramBuckets: a domain override fixes the axis instead of tracking the values", () => {
+test("histogramBuckets: the axis is the caller's, never the values' own extent", () => {
   // The slider's axis must not rescale under a brush — bars shrink, the axis
-  // stays. Without the override these three values would span 10–30.
+  // stays. Left to themselves these three values would span 10–30, which would
+  // move the handles' meaning out from under the reader's hand.
   const stats = histogramBuckets([10, 20, 30], 4, { min: 0, max: 100 });
   assert.equal(stats.min, 0);
   assert.equal(stats.max, 100);
@@ -485,8 +423,6 @@ test("histogramBuckets: a domain override fixes the axis instead of tracking the
   assert.deepEqual(stats.buckets.map((b) => b.count), [2, 1, 0, 0]);
   assert.equal(stats.buckets[0].from, 0);
   assert.equal(stats.buckets[3].to, 100);
-  // Without the override the same values would span 10-30 instead.
-  assert.equal(histogramBuckets([10, 20, 30], 4).max, 30);
 });
 
 test("histogramBuckets: values outside a fixed domain clamp into the end buckets", () => {
@@ -498,13 +434,6 @@ test("histogramBuckets: values outside a fixed domain clamp into the end buckets
   // on the boundary and belongs to the upper bucket, as it always has.
   assert.deepEqual(stats.buckets.map((b) => b.count), [1, 2]);
   assert.equal(stats.count, 3);
-});
-
-test("histogramBuckets: without a domain, nothing about the existing behaviour moves", () => {
-  const stats = histogramBuckets([0, 50, 100], 4);
-  assert.equal(stats.min, 0);
-  assert.equal(stats.max, 100);
-  assert.equal(histogramBuckets([], 4, { min: 0, max: 100 }), null);
 });
 
 // --- select defaultValue (issue #250) ---------------------------------------
@@ -570,18 +499,15 @@ test("controlsHtml: a defaulted select drops the blank 'any' option", () => {
 
 // --- strip opt-out + pickerLabel --------------------------------------------
 
-test("controlsHtml: showDistributionStrip=false omits the strip container entirely", () => {
-  // The pivoted pages replace it with per-filter histograms; leaving an empty
-  // container would still paint a card-shaped box under the controls.
-  const off = controlsHtml({
-    filters: FILTERS,
-    presets: PRESETS,
-    columns: COLUMNS,
-    showDistributionStrip: false,
-  });
-  assert.doesNotMatch(off, /distribution-strip/);
-  // driving.html passes nothing and keeps it.
-  assert.match(controlsHtml({ filters: FILTERS, presets: PRESETS, columns: COLUMNS }), /id="distribution-strip"/);
+test("controlsHtml: renders no sorted-column distribution strip", () => {
+  // Every numeric filter now owns a histogram on a FIXED axis. A second
+  // histogram of whichever column happened to be sorted was a different answer
+  // to the same question — it swapped its metric on a header click and
+  // collapsed under the very bar-click it invited — so it is gone from the
+  // chassis, not merely switched off per page.
+  const html = controlsHtml({ filters: FILTERS, presets: PRESETS, columns: COLUMNS });
+  assert.doesNotMatch(html, /distribution-strip/);
+  assert.doesNotMatch(html, /strip-bar/);
 });
 
 test("controlsHtml: the picker prefers pickerLabel over the leaf label", () => {
@@ -617,25 +543,14 @@ function landmarks(html) {
   };
 }
 
-test("controlsHtml: the inline layout keeps descriptor order, filters before the column controls", () => {
-  // driving.html renders through this branch, and its controls have always
-  // been "search, every filter in the order the page declared them, columns,
-  // clear". Reordering them would be a visible change to a page #250 does not
-  // touch.
-  const at = landmarks(controlsHtml({ filters: ORDER_FILTERS, presets: PRESETS, columns: COLUMNS }));
-  assert.ok(at.search < at.range, "search must lead");
-  assert.ok(at.range < at.boolean, "descriptor order: range before boolean");
-  assert.ok(at.boolean < at.select, "descriptor order: boolean before select");
-  assert.ok(at.select < at.columns, "every filter precedes the column controls");
-  assert.ok(at.columns < at.clear, "Clear all is last");
-});
-
-test("controlsHtml: the sidebar layout partitions by type, columns between selects and ranges", () => {
+test("controlsHtml: sections partition by type, columns between selects and ranges", () => {
   // In a 280px column the reading order IS the layout: cheap categorical
   // narrowings first, then the column controls, then the tall histogram
-  // brushes, then the checkboxes.
+  // brushes, then the checkboxes. Note the descriptors arrive in a DIFFERENT
+  // order (range, boolean, select) — the page's declaration order is not the
+  // rendering order, which is the whole point of partitioning.
   const at = landmarks(
-    controlsHtml({ filters: ORDER_FILTERS, presets: PRESETS, columns: COLUMNS, layout: "sidebar" })
+    controlsHtml({ filters: ORDER_FILTERS, presets: PRESETS, columns: COLUMNS })
   );
   assert.ok(at.search < at.select, "search leads");
   assert.ok(at.select < at.columns, "selects come before the column controls");
@@ -644,15 +559,14 @@ test("controlsHtml: the sidebar layout partitions by type, columns between selec
   assert.ok(at.boolean < at.clear, "Clear all is last");
 });
 
-test("controlsHtml: the sidebar layout renders EVERY filter, including an unknown type", () => {
-  // The partition is by type, so a type added later must land somewhere rather
-  // than being silently dropped from one of the two layouts.
+test("controlsHtml: EVERY filter renders, including an unknown type", () => {
+  // The partition is by type, so a type added later must land somewhere — in
+  // the wrong PLACE rather than not at all.
   const odd = { key: "future", label: "Future", type: "something-new" };
   const html = controlsHtml({
     filters: [...ORDER_FILTERS, odd],
     presets: PRESETS,
     columns: COLUMNS,
-    layout: "sidebar",
   });
   for (const key of ["provider", "cov", "changed", "future"]) {
     assert.match(html, new RegExp(`data-filter="${key}"`), `${key} is missing from the sidebar`);
@@ -691,8 +605,9 @@ test("syncSidebarDisclosure: narrowing never closes what the reader opened", () 
 });
 
 test("wireSidebarDisclosure: a no-op without a sidebar, matchMedia, or a document", () => {
-  // driving.html has no .sidebar-disclosure, and Node has no window at all —
-  // this is called unconditionally on DOMContentLoaded, so both must be safe.
+  // Node has no window at all, and any page loading table-controls.js without
+  // a sidebar has no .sidebar-disclosure — this is called unconditionally on
+  // DOMContentLoaded, so both must be safe.
   assert.equal(wireSidebarDisclosure({ querySelector: () => null }), null);
   assert.equal(wireSidebarDisclosure(), null);
 });

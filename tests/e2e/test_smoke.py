@@ -1134,15 +1134,14 @@ def test_unchecking_every_optional_column_actually_empties_the_table(page: Page,
     assert errors == []
 
 
-@pytest.mark.parametrize("path", ["grid.html", "streets.html"])
-def test_the_pivoted_pages_replaced_the_strip_with_per_filter_histograms(
-    page: Page, base_url, path
-):
-    """Issue #250. The sorted-column strip is gone from these two pages: it
-    visualized whichever column happened to be sorted, over the FILTERED rows,
-    so it silently swapped its metric on a header click and collapsed under the
-    very bar-click it invited. Each numeric filter now owns one histogram, on
-    one metric, on a fixed axis."""
+@pytest.mark.parametrize("path", ["grid.html", "streets.html", "driving.html"])
+def test_the_table_pages_replaced_the_strip_with_per_filter_histograms(page: Page, base_url, path):
+    """Issue #250, extended to driving.html. The sorted-column strip is gone
+    from the site: it visualized whichever column happened to be sorted, over
+    the FILTERED rows, so it silently swapped its metric on a header click and
+    collapsed under the very bar-click it invited. Each numeric filter now owns
+    one histogram, on one metric, on a fixed axis — and every table page keys
+    its coverage filter `cov`, which is why one body covers all three."""
     errors = _capture_errors(page)
     page.goto(f"{base_url}/{path}")
     expect(page.locator("tbody tr").first).to_be_visible()
@@ -1313,41 +1312,44 @@ def test_a_scoped_window_survives_a_url_restore(page: Page, base_url):
     assert errors == []
 
 
-def test_distribution_strip_survives_on_the_driving_page(page: Page, base_url):
-    """The strip was removed from the two pivoted pages, NOT from the chassis.
-    driving.html keeps it, and keeps the behaviour it always had: a histogram
-    of the ACTIVE SORT COLUMN over the CURRENTLY FILTERED rows, with the
-    summary sentence as its accessible equivalent."""
+def test_driving_takes_the_sidebar_without_taking_the_pivot(page: Page, base_url):
+    """driving.html shares the chassis, the filter sidebar and the histogram
+    filters with grid/streets — but NOT the pivot. Its rows are places, not
+    cities-with-a-column-per-provider, so no column declares a `group` and the
+    header stays a single <tr>. That makes this the only page exercising
+    theadHtml's flat branch in a real browser, which is why the assertion lives
+    here rather than being folded into the shared parametrized tests above."""
     errors = _capture_errors(page)
     page.goto(f"{base_url}/driving.html")
+    expect(page.locator("#driving-table-wrap")).to_be_visible()
 
-    summary = page.locator("#distribution-strip .strip-summary")
-    expect(summary).to_be_visible()
+    # Shared: the sidebar and a real histogram on the coverage filter.
+    expect(page.locator(".table-sidebar")).to_have_count(1)
+    expect(page.locator('.control-histogram[data-histogram="cov"]')).to_have_count(1)
 
-    # Re-sorting repoints the strip at the newly sorted column (coveragePct is
-    # in driving.html's default Overview preset, so it is on screen).
-    page.locator('th[data-key="coveragePct"] button').click()
-    # Case-insensitive: the summary lowercases the column label in its
-    # "No <label> values" form, which is what a fixture with few tracked
-    # cities in view actually produces.
-    expect(summary).to_contain_text(re.compile(r"grid coverage", re.I))
-
-    # ...and driving.html renders none of the pivot's furniture.
-    expect(page.locator(".control-histogram")).to_have_count(0)
-    expect(page.locator(".table-sidebar")).to_have_count(0)
+    # Not shared: the pivot's grouped header, and no Δ cells to go with it —
+    # a difference between providers is only a question a pivoted row can ask.
     expect(page.locator("thead th.th-group")).to_have_count(0)
     expect(page.locator("#driving-thead tr")).to_have_count(1)
+    expect(page.locator("#driving-tbody td.delta-cell")).to_have_count(0)
+
+    # Re-sorting is still just a sort: the strip that used to repoint itself at
+    # the newly sorted column is gone from the whole site.
+    page.locator('th[data-key="coveragePct"] button').click()
+    expect(page.locator("#distribution-strip")).to_have_count(0)
+    expect(page.locator(".strip-bar")).to_have_count(0)
 
     assert errors == []
 
 
-@pytest.mark.parametrize("path", ["grid.html", "streets.html"])
+@pytest.mark.parametrize("path", ["grid.html", "streets.html", "driving.html"])
 def test_the_table_and_its_filters_are_on_the_first_screen(page: Page, base_url, path):
-    """These two pages are instruments, not articles. A screen of preamble
-    pushed both the table and the filter sidebar below the fold, so the lead is
-    now one sentence and the rest lives in a closed disclosure. The assertion is
-    the outcome, not the word count: the table's first row and the search box
-    both have to be visible without scrolling."""
+    """These pages are instruments, not articles. A screen of preamble pushed
+    both the table and the filter sidebar below the fold, so the lead is now one
+    sentence and the rest lives in a closed disclosure. The assertion is the
+    outcome, not the word count: the table's first row and the search box both
+    have to be visible without scrolling. driving.html is the tightest case —
+    it also renders the archive-provenance callout above the layout."""
     errors = _capture_errors(page)
     page.set_viewport_size({"width": 1440, "height": 900})
     page.goto(f"{base_url}/{path}")
@@ -1374,7 +1376,7 @@ def test_the_table_and_its_filters_are_on_the_first_screen(page: Page, base_url,
     assert errors == []
 
 
-@pytest.mark.parametrize("path", ["grid.html", "streets.html"])
+@pytest.mark.parametrize("path", ["grid.html", "streets.html", "driving.html"])
 def test_the_filter_sidebar_spans_the_full_viewport_height(page: Page, base_url, path):
     """ "Always there" means it does not scroll away, and "full extent" means it
     is a column rather than a short card with grey below it. Both come from the
@@ -1409,7 +1411,7 @@ def test_the_filter_sidebar_spans_the_full_viewport_height(page: Page, base_url,
     assert errors == []
 
 
-@pytest.mark.parametrize("path", ["grid.html", "streets.html"])
+@pytest.mark.parametrize("path", ["grid.html", "streets.html", "driving.html"])
 def test_filter_sidebar_sits_beside_the_table_and_collapses_on_narrow_screens(
     page: Page, base_url, path
 ):
