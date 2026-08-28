@@ -979,13 +979,18 @@ def test_makelab1_production_config_is_wired():
     # Order is canonical, not alphabetical: most expensive first, EXCEPT kartaview,
     # which ranks LAST because a multi-hour sweep absorbs deadline truncation most
     # cheaply (#238). Asserting the list therefore pins the launch order too.
-    assert cfg.enabled_providers() == [
-        "gsv",
-        "gsv_streets",
-        "mapillary",
-        "mapillary_streets",
-        "kartaview",
-    ]
+    #
+    # Both Mapillary channels are PAUSED as of 2026-08-28 (third per-IP block), so
+    # they are configured-but-disabled and drop out of this list. Pinned as an
+    # absence rather than deleted: resuming them must be a deliberate edit here.
+    assert cfg.enabled_providers() == ["gsv", "gsv_streets", "kartaview"]
+    for paused in ("mapillary", "mapillary_streets"):
+        assert paused in cfg.providers, f"{paused} block must survive the pause"
+        assert not cfg.providers[paused].enabled
+    # The pause is about the mechanism, not the sizing — the budgets stay at the
+    # values #241/#267 argued for so that resuming is one flag, not a re-derivation.
+    assert cfg.providers["mapillary"].daily_request_budget == 1_750
+    assert cfg.providers["mapillary_streets"].daily_request_budget == 1_750
     # kartaview was turned on in production on 2026-08-28, the separate deploy
     # decision this assertion previously withheld (#248). Enabling the CHANNEL
     # enrols nobody: it is the one opt-in channel, so the nightly queue is exactly

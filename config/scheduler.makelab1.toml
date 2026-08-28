@@ -39,8 +39,16 @@ enabled = true
 # 10M/day covers cycling ~1,144 cities on the 90-day schedule with headroom.
 daily_request_budget = 10000000
 
+# PAUSED 2026-08-28 after the THIRD per-IP block (see the new-issue link in
+# docs/provider-access.md). Not a volume decision: the ledger rules out a fixed
+# threshold over every window from 1 to 8 days — 08-28 was refused at 1,938/day
+# while 08-14 spent 26,363 clean — so cutting the budget a third time has no
+# mechanism to work through. The budgets below are LEFT AS-IS deliberately: they
+# are the sizing #241/#267 argued for, and re-enabling should be a decision about
+# the mechanism, not a re-derivation of numbers that were never the binding
+# constraint. Flip `enabled` back to true to resume; nothing else needs changing.
 [providers.mapillary]
-enabled = true
+enabled = false
 # Counted in z14 vector-tile requests. Mapillary documents this endpoint as
 # "50,000 per day (not per minute)" per app — i.e. NO documented throughput
 # limit at all — and 4xx on exceeding it. Our block matched none of that: on
@@ -128,8 +136,11 @@ spacing_m = 15
 # issue #241 note in [providers.mapillary]. Split evenly: a road walk reads
 # the identical tile census as the grid run, so a paired night costs the
 # same on each channel and the budgets deplete in lockstep.
+# PAUSED 2026-08-28 with [providers.mapillary] — same IP, same tile CDN, so
+# pausing one and not the other would keep the host under exactly the load the
+# pause exists to stop. Re-enable the pair together.
 [providers.mapillary_streets]
-enabled = true
+enabled = false
 daily_request_budget = 1750
 spacing_m = 15
 # See [providers.mapillary] — one per-IP rate budget, two channels.
