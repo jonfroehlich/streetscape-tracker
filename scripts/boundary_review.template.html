@@ -298,8 +298,14 @@
 
     // ---- map + base layers ----
     const map = L.map("map", { zoomControl: true }).setView([20, 0], 2);
+    // The key is substituted by build_boundary_review.py out of
+    // www/js/streetscape-utils.js, so this page shares the site's one copy
+    // rather than carrying a second that could drift. Without a valid key
+    // CARTO returns HTTP 200 with "API KEY REQUIRED" printed across every
+    // tile, which on a tool for judging boundaries by eye is not cosmetic.
     const voyager = L.tileLayer(
-      "https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png",
+      "https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png"
+        + "?key=__CARTO_KEY__",
       { maxZoom: 19, attribution: "© OpenStreetMap contributors © CARTO" }).addTo(map);
     const satellite = L.tileLayer(
       "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",

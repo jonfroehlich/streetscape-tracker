@@ -154,3 +154,31 @@ All four keys are **indexed, not `.get()`-guarded**, matching the `search_area_k
 Guarding would also publish `{width: null, height: null, step: null}` — a *truthy* all-null block that no `if (rec.grid)` consumer can reject, the exact failure the absent-not-null convention exists to prevent.
 It is the **latest run's** grid, not the city's current frozen geometry: the two diverge for cities resized catalog-only by `scripts/cap_oversized_grids.py` (#166) until their next collection, and pairing the run's denominator with the run's geometry is the correct half — label it as the run's grid in any UI.
 `adaptCityRecord` surfaces both normalized (null on v1/v2 records, which will never carry them).
+## The basemap needs a CARTO key, and a bad key looks like a styling bug
+
+*Written after the split.*
+
+**The basemap needs a CARTO key, and every way of getting that key wrong is invisible.**
+CARTO began requiring an API key on `basemaps.cartocdn.com` on 2026-08-28, and the enforcement is not an error response:
+a keyless request returns HTTP 200 and `image/png`, with `API KEY REQUIRED / carto.com/basemaps/apikey` printed diagonally across the tile itself.
+Measured the same day, on our own URL form: keyless, a well-formed but wrong key, and the right key under the wrong parameter name (`api_key=` rather than `key=`) all returned the **byte-identical** watermarked tile, and only `?key=<our key>` returned a different one.
+So there is no fetch handling, no `errorTileUrl`, and no console warning that could ever have caught it — it reaches a reader as a map that looks oddly branded, and it reached ours for an unknown period before anyone said so.
+**If the maps ever look wrong again, check this first**, and check it with bytes rather than with a status code.
+
+`addBasemapLayer(map)` in `streetscape-utils.js` is the only place the tile URL is built; `index.js` and `city.js` call it and `www/js/__tests__/streetscape-utils.test.js` pins that neither of them contains an `L.tileLayer(` of its own.
+That pin is the point rather than tidiness: the two call sites were byte-identical duplicates, and a reintroduced duplicate renders perfectly well — watermarked.
+The generated boundary-review viewer (`scripts/boundary_review.template.html`) is a third CARTO map that cannot load the module, so `build_boundary_review.py` reads `CARTO_BASEMAP_KEY` out of the JS and substitutes it, raising if the const or the placeholder has gone.
+A watermark there is not cosmetic either — that tool exists to judge a city boundary by eye.
+
+**The key is public by construction and bearer-style, which are two different facts.**
+Public by construction: the browser sends it to CARTO on every tile request, so it is readable off the deployed page wherever the repo keeps it, and there is no build step to inject it at ([ADR 0001](adr/0001-no-backend.md)).
+Bearer-style: CARTO asks for a domain when issuing the key but does **not** enforce it — a tile request with a mismatched `Referer` and one with no `Referer` at all returned byte-identical keyed tiles — so unlike a conventionally domain-locked Mapbox or Google JS key, a copy scraped out of this public repo works anywhere.
+That is the part worth acting on: exposure is unavoidable, abuse is not, and the ask is for CARTO to enforce the domain they already collected.
+The free ceiling is 5M tile requests per calendar month across the raster **and** vector services, conditioned on crediting CARTO and OpenStreetMap — which is why `addBasemapLayer` sets the attribution, and why exhausting the ceiling degrades to the same silent watermark.
+Rotation is a reply to the issuing email plus editing the one const.
+
+**The detection path is `tests/e2e/test_basemap_key.py`**, marked `e2e` so it stays out of the fast no-network suite.
+It fetches one tile with the key and the same tile without, and requires the bytes to differ.
+Differential rather than a pinned watermark hash, so it survives CARTO restyling the notice, and it goes red for a revoked key, an exhausted quota, and a dropped or misspelled parameter alike.
+It also goes red if CARTO ever stops watermarking keyless requests, which is a false alarm worth having: the constraint this mechanism exists for would have changed.
+Whether to leave raster for vector is a separate, larger question — vector needs the same key, and Leaflet cannot draw MVT at all — and is worked through in [`experiments/carto-basemap-key.md`](experiments/carto-basemap-key.md).

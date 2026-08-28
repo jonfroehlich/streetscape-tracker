@@ -205,6 +205,8 @@ The raw feed archive lives outside `data/` (mirroring a vendor's file is not our
 **Web frontend → [`docs/frontend.md`](docs/frontend.md).**
 Static vanilla JS + Leaflet + Chart.js 4 in `www/`, no build step, fetching the published `data/`.
 `www/js/streetscape-utils.js` holds the provider registry and `adaptCityRecord`, which flattens v1/v2/v3 aggregate records into one normalized shape.
+It also holds `addBasemapLayer` and the CARTO key, which is **the one place a tile URL is built** — because CARTO enforces its key by watermarking the tile rather than by refusing the request: a keyless request, a wrong key and the right key under the wrong parameter name all return HTTP 200 and a byte-identical PNG stamped "API KEY REQUIRED", so no error handling anywhere can see it and a duplicated call site renders perfectly, watermarked.
+The key is bearer-style (the issuing domain is measurably not enforced), so exposure is unavoidable but abuse is not; the detection path is `tests/e2e/test_basemap_key.py`, which compares a keyed tile against a keyless one by bytes.
 `grid.html`/`streets.html`/`driving.html` are configuration over one shared table chassis with **no pagination or virtualization** (a new page's row count is a design constraint), and `createTableControls` (`www/js/table-controls.js`) **owns the whole query string** — two instances on one page fight over it, which is why `driving.html` renders unmatched plan areas as a summary rather than a second filtered table.
 `grid.html` and `streets.html` are pivoted to **one row per city**, providers as sub-columns (#250), so "Collected by" is a **scope, not just a row filter** — it redirects what the numeric filters read, or "coverage over 80%" silently means "some provider's".
 Anything fanning out over the provider registry must gate on presence in the payload — a registered provider is not a collected one.
@@ -228,6 +230,7 @@ Keep any list a doc enumerates **alphabetical**, so two branches adding an entry
   Existing writeups — keep this list alphabetical, and answer "should we sample finer or differently?" from them before re-running anything:
 
   - `capture-date-precision.md`
+  - `carto-basemap-key.md`
   - `grid-density.md`
   - `kartaview-feasibility.md`
   - `kartaview-sweep-cost.md`

@@ -79,10 +79,7 @@ function baseFillOpacity(city) {
   return value == null && currentMetric === "streets" ? 0.2 : 0.6;
 }
 
-L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
-  attribution: "© OpenStreetMap contributors © CARTO",
-  maxZoom: 19,
-}).addTo(map);
+addBasemapLayer(map);
 
 // ── Popup histogram ───────────────────────────────────────────
 

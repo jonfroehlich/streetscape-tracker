@@ -29,6 +29,7 @@ const vendorGlobals = {
 // streetscape-utils.js's own definitions aren't flagged as `no-redeclare`.
 const sharedGlobals = {
   STREETSCAPE_DATA_BASE_URL: "readonly",
+  addBasemapLayer: "readonly",
   RENDER_CAP: "readonly",
   PROVIDERS: "readonly",
   METRICS: "readonly",

@@ -31,10 +31,7 @@
 const map = L.map("map", { zoomControl: false, preferCanvas: true }).setView([0, 0], 13);
 L.control.zoom({ position: "bottomleft" }).addTo(map);
 
-L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
-  attribution: "© OpenStreetMap contributors © CARTO",
-  maxZoom: 19,
-}).addTo(map);
+addBasemapLayer(map);
 
 // ── Module-level state ─────────────────────────────────────────
 let markersByYear = {};

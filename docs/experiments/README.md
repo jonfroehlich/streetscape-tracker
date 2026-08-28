@@ -26,6 +26,15 @@ Three things generalize.
 **(3) The sweep's denominator is the corpus; the repair's is the catalog, and they differ** — 9 files on disk carry month precision against 8 registered runs, the extra being an unregistered orphan (`saskatoon_sk_…`, superseded by the registered `saskatoon--sk_…` that carries day precision), which no catalog audit and no repair script can see.
 Also worth knowing before trusting a format census: 77% of all `capture_date` cells in the corpus are ABSENT (ZERO_RESULTS fill), so a share taken over rows rather than over dated rows describes the grid, not the imagery.
 
+### `carto-basemap-key.md`
+
+Issue #284 — how CARTO enforces its basemap key, and what leaving raster for vector would cost.
+Both answers are counter-intuitive enough to be worth the minutes.
+**CARTO enforces by watermarking the tile, not by refusing the request**: a keyless request, a well-formed wrong key, and the right key under the wrong parameter name all return HTTP 200 with a byte-identical PNG stamped "API KEY REQUIRED", so no client-side error handling can detect it and the break presents as a styling bug.
+That is why the detection path is differential (keyed bytes vs keyless bytes) rather than a pinned hash, and why the key had to be verified against our own URL form rather than the one CARTO documents.
+**The domain CARTO collects at issue time is not enforced** — issued origin, foreign origin and no `Referer` return identical bytes — so the key is bearer-style, which separates unavoidable *exposure* from mitigable *abuse* and makes "same as any Mapbox client key" the wrong analogy.
+**Vector is not a way off the key** (same key, same 5M/month ceiling), so it is purely a rendering-stack decision: maplibre-gl is 6.19x Leaflet's gzipped weight, plus a WebGL flake class and no basemap at all where WebGL is unavailable. Decision: stay on raster.
+
 ### `grid-density.md`
 
 Issue #106 — why production stays on the 20 m grid; below ~10 m you buy redundancy, not information, since official panos sit ~10 m apart.

@@ -43,6 +43,8 @@ const {
   computeVisibilityDelta,
   markerDateStyle,
   STREETSCAPE_DATA_BASE_URL,
+  CARTO_BASEMAP_KEY,
+  addBasemapLayer,
   streetwalkManifestUrl,
   fetchStreetwalkManifest,
   lookupStreetwalk,
@@ -1412,4 +1414,78 @@ test("run and diff filename contracts stay disjoint", () => {
   assert.equal(isValidDiffFilename(runName), false);
   assert.ok(isValidDiffFilename(diffName));
   assert.equal(isValidRunFilename(diffName), false);
+});
+
+// --- CARTO basemap key ----------------------------------------------------
+//
+// These pin the fix for the 2026-08-28 outage, which no ordinary assertion
+// could have caught: CARTO began requiring a key, and serves a KEYLESS request
+// HTTP 200 with "API KEY REQUIRED" burned into the tile PNG. A wrong param
+// name, a mangled key and a revoked key all return that same byte-identical
+// watermarked tile, so the browser sees a perfectly good image and every
+// behavioural check stays green while every map on the site is broken.
+//
+// What is pinnable offline is the SHAPE of the request we make. Whether the
+// key is still accepted is a live question, and lives in
+// tests/e2e/test_basemap_key.py, which diffs a keyed tile against a keyless
+// one over the network.
+
+test("addBasemapLayer sends the key under the param CARTO validates", () => {
+  const calls = [];
+  const previousL = global.L;
+  global.L = {
+    tileLayer(url, options) {
+      calls.push({ url, options });
+      return { addTo: (m) => ({ addedTo: m }) };
+    },
+  };
+  try {
+    const map = { id: "map" };
+    const layer = addBasemapLayer(map);
+
+    assert.equal(calls.length, 1);
+    assert.deepEqual(layer, { addedTo: map }, "the layer must be added to the map it was given");
+
+    const [base, query] = calls[0].url.split("?");
+    assert.equal(
+      base,
+      "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",
+      "the {s}/{r} placeholders are Leaflet's, and CARTO serves this shorthand style path"
+    );
+
+    // Read through URLSearchParams rather than matching the raw string: it
+    // undoes the encodeURIComponent, so this asserts the key CARTO actually
+    // RECEIVES, and keeps passing if a rotated key needs escaping. The param
+    // name is the load-bearing half — `api_key` is the plausible typo, and it
+    // returns the watermarked tile rather than an error.
+    const params = new URLSearchParams(query);
+    assert.equal(params.get("key"), CARTO_BASEMAP_KEY);
+    assert.ok(CARTO_BASEMAP_KEY.length > 0, "an empty key is a keyless request");
+
+    // The free tier is conditioned on the credit, so the attribution is part
+    // of the contract rather than decoration.
+    assert.match(calls[0].options.attribution, /CARTO/);
+    assert.match(calls[0].options.attribution, /OpenStreetMap/);
+  } finally {
+    global.L = previousL;
+  }
+});
+
+test("index.js and city.js take their basemap only from addBasemapLayer", () => {
+  // A source check because no behavioural one can catch this: a page script
+  // that rebuilt the URL inline would still render, and would render
+  // WATERMARKED, which is the exact bug the helper exists to make
+  // unrepeatable. The two call sites were byte-identical duplicates before
+  // they were collapsed, so the duplicate is the natural thing for the next
+  // edit to reintroduce.
+  for (const name of ["../index.js", "../city.js"]) {
+    const src = stripComments(readFileSync(require.resolve(name), "utf8"));
+    assert.equal(
+      /L\.tileLayer\s*\(/.test(src),
+      false,
+      name + " builds its own tile layer; call addBasemapLayer(map) instead, so the " +
+        "key and the attribution keep exactly one home"
+    );
+    assert.ok(/addBasemapLayer\s*\(/.test(src), name + " never adds a basemap at all");
+  }
 });
