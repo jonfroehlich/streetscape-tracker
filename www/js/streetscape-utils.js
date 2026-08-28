@@ -36,11 +36,24 @@ const STREETSCAPE_DATA_BASE_URL =
  * raster AND vector services, conditioned on crediting CARTO and
  * OpenStreetMap — which is why addBasemapLayer sets the attribution.
  *
- * Raster PNG is on CARTO's stated retirement path, but vector will require
- * this same key eventually (CARTO: coming, not live yet, as of 2026-08-28).
- * So switching to vector is a rendering-stack decision — Leaflet cannot draw
- * MVT, and maplibre-gl is ~273 KB gzipped against Leaflet's ~42 KB — and not
- * a way off the key.
+ * Exposure is unavoidable; ABUSE is a separate question, and that one IS
+ * mitigable. The key is readable off the deployed page and out of this public
+ * repo both, and CARTO does not enforce the domain it collected — so a
+ * scraped copy spends our shared 5M ceiling, and exhaustion degrades to the
+ * same silent watermark as no key at all. Hence a detection path rather than
+ * a promise: tests/e2e/test_basemap_key.py asserts a keyed tile differs
+ * byte-wise from a keyless one, the one check that fails on a revoked,
+ * mistyped, mangled or exhausted key. Ask CARTO to enforce the domain if they
+ * ever offer it.
+ *
+ * CARTO says it is CONSIDERING stopping raster data updates and has announced
+ * no end date (FAQ, read 2026-08-28) — weaker than a retirement date, and
+ * the difference matters to anyone budgeting a migration against it. Vector
+ * will require this same key eventually (CARTO: coming, not live yet), so
+ * leaving raster is a rendering-stack decision and not a way off the key:
+ * Leaflet cannot draw MVT, and maplibre-gl is ~273 KB gzipped against
+ * Leaflet's ~42 KB. Measured, with the caveats:
+ * docs/experiments/carto-basemap-key.md.
  *
  * @see https://docs.carto.com/faqs/carto-basemaps
  */
@@ -54,15 +67,22 @@ const CARTO_BASEMAP_KEY = "cb1_2g44_1_b50596cc0f87c5ea43d9b94b";
  * the required attribution have exactly one place to be updated — two copies
  * of a key that must match is how one map silently keeps the watermark.
  *
+ * The key is encodeURIComponent'd rather than pasted in raw. Today's value is
+ * URL-safe, but a rotated one carrying `+`, `/`, `=` or `&` would be mangled
+ * in the query string — and a mangled key returns HTTP 200 with the
+ * watermark, indistinguishable from sending no key. The rotation the docblock
+ * above calls a one-line change has to actually stay one line.
+ *
  * @param {L.Map} map - Map to add the basemap to.
- * @returns {Object} The tile layer, already added to the map.
+ * @returns {L.TileLayer} The tile layer, already added to the map.
  */
 function addBasemapLayer(map) {
   return L.tileLayer(
-    `https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png?key=${CARTO_BASEMAP_KEY}`,
+    "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png" +
+      `?key=${encodeURIComponent(CARTO_BASEMAP_KEY)}`,
     {
       attribution: "© OpenStreetMap contributors © CARTO",
-      maxZoom: 19
+      maxZoom: 19,
     }
   ).addTo(map);
 }

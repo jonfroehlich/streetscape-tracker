@@ -9,6 +9,8 @@ delegated to boundary_audit.frozen_rect_bounds, so we assert the two agree.
 import importlib.util
 import os
 
+import pytest
+
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _spec = importlib.util.spec_from_file_location(
     "build_boundary_review", os.path.join(PROJECT_ROOT, "scripts", "build_boundary_review.py")
@@ -370,3 +372,66 @@ def test_render_html_neutralizes_close_tag():
     ]
     html = bbr.render_html(payloads)
     assert "danger <\\/script> tag" in html
+
+
+# ── CARTO basemap key ───────────────────────────────────────────────────────
+#
+# The viewer is generated, standalone HTML: it cannot load
+# www/js/streetscape-utils.js, so its basemap key is substituted in here. That
+# is worth pinning because the failure is invisible -- CARTO answers a
+# missing, stale or placeholder key with HTTP 200 and "API KEY REQUIRED"
+# printed across the tile, and on a tool whose whole job is judging a city
+# boundary by eye, a watermark over every tile is a working-looking page that
+# is harder to review.
+
+
+def test_render_html_substitutes_the_frontend_carto_key():
+    payloads = [
+        bbr.build_city_payload(
+            "boston",
+            group="manual",
+            current=CURRENT,
+            report=report_row(),
+            rec_source=manual_row(),
+            cache=None,
+        )
+    ]
+    html = bbr.render_html(payloads)
+    assert bbr.CARTO_KEY_PLACEHOLDER not in html
+    assert f"?key={bbr.carto_basemap_key()}" in html
+
+
+def test_carto_key_comes_from_the_frontend_module_not_a_second_copy():
+    """One key, one home. A second literal is how the two drift apart."""
+    js = os.path.join(PROJECT_ROOT, "www", "js", "streetscape-utils.js")
+    with open(js, encoding="utf-8") as f:
+        js_source = f.read()
+    assert f'CARTO_BASEMAP_KEY = "{bbr.carto_basemap_key()}"' in js_source
+
+    # The template must carry the placeholder, never the key itself.
+    with open(bbr.TEMPLATE_PATH, encoding="utf-8") as f:
+        template = f.read()
+    assert bbr.CARTO_KEY_PLACEHOLDER in template
+    assert bbr.carto_basemap_key() not in template
+
+
+def test_carto_key_read_raises_rather_than_degrading(tmp_path):
+    """A renamed const must fail the build, not ship a placeholder as the key.
+
+    Returning "" or the placeholder would render a page that looks fine until
+    a reviewer notices the watermark, which is exactly the failure mode this
+    whole change exists to remove.
+    """
+    empty = tmp_path / "no-key.js"
+    empty.write_text("const SOMETHING_ELSE = 1;\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="CARTO_BASEMAP_KEY"):
+        bbr.carto_basemap_key(str(empty))
+
+
+def test_render_html_raises_when_the_template_loses_the_key_placeholder(tmp_path):
+    with open(bbr.TEMPLATE_PATH, encoding="utf-8") as f:
+        template = f.read()
+    stripped = tmp_path / "template.html"
+    stripped.write_text(template.replace("?key=" + bbr.CARTO_KEY_PLACEHOLDER, ""), encoding="utf-8")
+    with pytest.raises(ValueError, match=bbr.CARTO_KEY_PLACEHOLDER):
+        bbr.render_html([], template_path=str(stripped))

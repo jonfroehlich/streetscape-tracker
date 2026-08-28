@@ -1,0 +1,122 @@
+{
+  "_about": {
+    "experiment": "carto-basemap-key",
+    "writeup": "docs/experiments/carto-basemap-key.md",
+    "generated_by": "scripts/measure_carto_basemap.py --out-dir docs/experiments",
+    "note": "CARTO began requiring an API key on basemaps.cartocdn.com (2026-08-28) and enforces it by watermarking the tile, not by returning an error, so every way of getting the key wrong is HTTP 200. `key_enforcement` compares each wrong variant against the keyed request BY DIGEST because a status code cannot tell them apart. `referer_enforcement` tests whether the domain CARTO collects when issuing a key is enforced. `renderer_bundles` is gzipped transfer size off cdnjs, sizing the raster-vs-vector decision -- vector needs the same key, so the only thing switching buys or costs is the rendering stack. The key itself is not recorded here; it lives in www/js/streetscape-utils.js."
+  },
+  "tile": "https://a.basemaps.cartocdn.com/dark_all/12/655/1583.png",
+  "key_enforcement": {
+    "keyed": {
+      "status": 200,
+      "bytes": 16945,
+      "sha256": "d36c88d307ff56ad0fb2a05137adebe5176be6f8e1d83c5037cf12ddd92ece99",
+      "content_type": "image/png",
+      "content_encoding": null,
+      "differs_from_keyed": false
+    },
+    "keyless": {
+      "status": 200,
+      "bytes": 15516,
+      "sha256": "cb4906d807d177ca6a4d40eebef42e8404498ad55c4b2b76cd7b9fd72c6569c4",
+      "content_type": "image/png",
+      "content_encoding": null,
+      "differs_from_keyed": true
+    },
+    "wrong_key_value": {
+      "status": 200,
+      "bytes": 15516,
+      "sha256": "cb4906d807d177ca6a4d40eebef42e8404498ad55c4b2b76cd7b9fd72c6569c4",
+      "content_type": "image/png",
+      "content_encoding": null,
+      "differs_from_keyed": true
+    },
+    "wrong_param_name": {
+      "status": 200,
+      "bytes": 15516,
+      "sha256": "cb4906d807d177ca6a4d40eebef42e8404498ad55c4b2b76cd7b9fd72c6569c4",
+      "content_type": "image/png",
+      "content_encoding": null,
+      "differs_from_keyed": true
+    }
+  },
+  "referer_enforcement": {
+    "issued_origin": {
+      "status": 200,
+      "bytes": 16945,
+      "sha256": "d36c88d307ff56ad0fb2a05137adebe5176be6f8e1d83c5037cf12ddd92ece99",
+      "content_type": "image/png",
+      "content_encoding": null,
+      "matches_issued_origin": true
+    },
+    "foreign_origin": {
+      "status": 200,
+      "bytes": 16945,
+      "sha256": "d36c88d307ff56ad0fb2a05137adebe5176be6f8e1d83c5037cf12ddd92ece99",
+      "content_type": "image/png",
+      "content_encoding": null,
+      "matches_issued_origin": true
+    },
+    "no_referer": {
+      "status": 200,
+      "bytes": 16945,
+      "sha256": "d36c88d307ff56ad0fb2a05137adebe5176be6f8e1d83c5037cf12ddd92ece99",
+      "content_type": "image/png",
+      "content_encoding": null,
+      "matches_issued_origin": true
+    }
+  },
+  "renderer_bundles": {
+    "leaflet": {
+      "assets": {
+        "leaflet.js": {
+          "status": 200,
+          "bytes": 42605,
+          "sha256": "4f9145e426ef2d94a3dea38346b010c13c2b54f3f0d09b5a12da5d3d39787069",
+          "content_type": "application/javascript; charset=utf-8",
+          "content_encoding": "gzip",
+          "url": "https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"
+        },
+        "leaflet.css": {
+          "status": 200,
+          "bytes": 3526,
+          "sha256": "2a27dd90533ce37f43c8e9f6adbba93605a930801044c079309f5f468a69d31d",
+          "content_type": "text/css; charset=utf-8",
+          "content_encoding": "gzip",
+          "url": "https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css"
+        }
+      },
+      "total_gzipped_bytes": 46131
+    },
+    "maplibre-gl": {
+      "assets": {
+        "maplibre-gl.js": {
+          "status": 200,
+          "bytes": 275453,
+          "sha256": "ad5c44986f2210461e5942ff8d20baae41fe43330d68702c0d8852d327ea2d5e",
+          "content_type": "application/javascript; charset=utf-8",
+          "content_encoding": "gzip",
+          "url": "https://cdnjs.cloudflare.com/ajax/libs/maplibre-gl/5.24.0/maplibre-gl.js"
+        },
+        "maplibre-gl.css": {
+          "status": 200,
+          "bytes": 10090,
+          "sha256": "007683310140a1cc4a90ffefd661142f06618a502ea1c8cd919061ab53c0d613",
+          "content_type": "text/css; charset=utf-8",
+          "content_encoding": "gzip",
+          "url": "https://cdnjs.cloudflare.com/ajax/libs/maplibre-gl/5.24.0/maplibre-gl.css"
+        }
+      },
+      "total_gzipped_bytes": 285543
+    }
+  },
+  "summary": {
+    "wrong_is_indistinguishable_from_absent": true,
+    "keyed_differs_from_keyless": true,
+    "every_failure_mode_returns_200": true,
+    "referer_enforced": false,
+    "leaflet_gzipped_bytes": 46131,
+    "maplibre_gl_gzipped_bytes": 285543,
+    "maplibre_over_leaflet_ratio": 6.19
+  }
+}

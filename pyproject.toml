@@ -46,5 +46,5 @@ testpaths = ["tests"]
 # + a Chromium install and are intentionally kept out of the pure-logic suite.
 addopts = "-q -m 'not e2e'"
 markers = [
-  "e2e: browser end-to-end smoke tests (require pytest-playwright + chromium)",
+  "e2e: end-to-end tests that need the network - the browser smoke suite (pytest-playwright + chromium) and live third-party checks",
 ]
