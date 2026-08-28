@@ -2,10 +2,11 @@
  * streetscape-utils.js
  * Shared utilities for the Streetscape City Explorer.
  *
- * Provides the data-host base URL, the provider registry (GSV/Mapillary),
- * the YlOrRd color scale, filename→provider detection, gzip JSON fetching,
- * and the aggregate-record adapter — used by both the overview map
- * (index.js) and the per-city detail view (city.js).
+ * Provides the data-host base URL, the shared dark basemap layer, the
+ * provider registry (GSV/Mapillary), the YlOrRd color scale,
+ * filename→provider detection, gzip JSON fetching, and the aggregate-record
+ * adapter — used by both the overview map (index.js) and the per-city
+ * detail view (city.js).
  *
  * @module streetscape-utils
  */
@@ -13,6 +14,58 @@
 /** Base URL for all Streetscape Tracker data files. */
 const STREETSCAPE_DATA_BASE_URL =
   "https://makeabilitylab.cs.washington.edu/public/streetscape-tracker/data/";
+
+/**
+ * CARTO basemap API key — public on purpose, not a secret.
+ *
+ * CARTO now requires a key on basemaps.cartocdn.com (observed 2026-08-28).
+ * A keyless request still returns HTTP 200: the tile PNG itself comes back
+ * stamped "API KEY REQUIRED", so the break renders as a styling bug rather
+ * than an outage, and no amount of error handling on our side can see it.
+ *
+ * The token ships in static JS because it has to: the browser sends it to
+ * CARTO on every tile request, so it is readable off the deployed page no
+ * matter where the repo keeps it, and the site has no build step to hide it
+ * behind (ADR 0001). CARTO asks for a domain when issuing the key but does
+ * NOT enforce it — a tile request with a mismatched Referer and one with no
+ * Referer at all both returned the same keyed bytes (checked 2026-08-28) —
+ * so treat this as bearer-style. Rotate by replying to the issuing email; the
+ * key lives in this one const so that stays a one-line change.
+ *
+ * The free ceiling is 5M tile requests per calendar month, counted across the
+ * raster AND vector services, conditioned on crediting CARTO and
+ * OpenStreetMap — which is why addBasemapLayer sets the attribution.
+ *
+ * Raster PNG is on CARTO's stated retirement path, but vector will require
+ * this same key eventually (CARTO: coming, not live yet, as of 2026-08-28).
+ * So switching to vector is a rendering-stack decision — Leaflet cannot draw
+ * MVT, and maplibre-gl is ~273 KB gzipped against Leaflet's ~42 KB — and not
+ * a way off the key.
+ *
+ * @see https://docs.carto.com/faqs/carto-basemaps
+ */
+const CARTO_BASEMAP_KEY = "cb1_2g44_1_b50596cc0f87c5ea43d9b94b";
+
+/**
+ * Add the shared dark basemap to a Leaflet map.
+ *
+ * The overview map (index.js) and the per-city detail map (city.js) draw the
+ * same tiles. They call this instead of each repeating the URL so the key and
+ * the required attribution have exactly one place to be updated — two copies
+ * of a key that must match is how one map silently keeps the watermark.
+ *
+ * @param {L.Map} map - Map to add the basemap to.
+ * @returns {Object} The tile layer, already added to the map.
+ */
+function addBasemapLayer(map) {
+  return L.tileLayer(
+    `https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png?key=${CARTO_BASEMAP_KEY}`,
+    {
+      attribution: "© OpenStreetMap contributors © CARTO",
+      maxZoom: 19
+    }
+  ).addTo(map);
+}
 
 /**
  * Max pano dots the city map draws at once (issues #77/#58). Dense cities hold
@@ -1200,6 +1253,8 @@ function markerDateStyle(captureDateStr, selectedDateStr) {
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     STREETSCAPE_DATA_BASE_URL,
+    CARTO_BASEMAP_KEY,
+    addBasemapLayer,
     RENDER_CAP,
     PROVIDERS,
     LOOSEST_EARLIEST_PLAUSIBLE_CAPTURE,
