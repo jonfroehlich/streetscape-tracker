@@ -976,11 +976,29 @@ def test_makelab1_production_config_is_wired():
     # scheduler.toml alone changes nothing in production — the two must be kept
     # in step deliberately, which is what this assertion is for.
     cfg = load_scheduler_config(os.path.join(_PROJECT_ROOT, "config", "scheduler.makelab1.toml"))
-    assert cfg.enabled_providers() == ["gsv", "gsv_streets", "mapillary", "mapillary_streets"]
-    # kartaview is deliberately NOT here. The repo default declares it (#248),
-    # and turning it on in production is a separate deploy decision — the same
-    # posture as max_concurrent_channels below.
-    assert "kartaview" not in cfg.providers
+    # Order is canonical, not alphabetical: most expensive first, EXCEPT kartaview,
+    # which ranks LAST because a multi-hour sweep absorbs deadline truncation most
+    # cheaply (#238). Asserting the list therefore pins the launch order too.
+    assert cfg.enabled_providers() == [
+        "gsv",
+        "gsv_streets",
+        "mapillary",
+        "mapillary_streets",
+        "kartaview",
+    ]
+    # kartaview was turned on in production on 2026-08-28, the separate deploy
+    # decision this assertion previously withheld (#248). Enabling the CHANNEL
+    # enrols nobody: it is the one opt-in channel, so the nightly queue is exactly
+    # the cities `scheduler enroll-city` names, and the seed set is deliberately
+    # two (Krabi, Yogyakarta) because a whole-catalog pass is ~186,000 requests.
+    # The budget is a FLOOR to clear rather than a ceiling on the night's spend
+    # (#273/#274) — a city whose estimate exceeds it is skipped permanently — so
+    # this figure is pinned exactly, like the Mapillary ones below, and re-checked
+    # before any metro is enrolled.
+    assert cfg.providers["kartaview"].daily_request_budget == 10_000
+    # Load-bearing beyond pacing: _kartaview_timeout_seconds derives every sweep's
+    # per-city timeout from this rate, so lowering it shortens those timeouts too.
+    assert cfg.providers["kartaview"].max_requests_per_minute == 16
     # Channel concurrency is OFF in production until both of #240's deploy gates
     # clear: resume for the Mapillary tile census (#256), because a stop now kills
     # N children at once and a killed census re-spends tiles into a per-IP ceiling

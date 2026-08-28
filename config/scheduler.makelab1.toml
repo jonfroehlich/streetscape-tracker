@@ -135,6 +135,34 @@ spacing_m = 15
 # See [providers.mapillary] — one per-IP rate budget, two channels.
 max_requests_per_minute = 60
 
+# KartaView (issue #248) — the one OPT-IN channel. Declaring this block enrolls
+# NOBODY: the nightly queue is exactly the cities an operator ran
+# `scheduler enroll-city CITY --channel kartaview` on, because a whole-catalog
+# pass prices at ~186,000 requests ~= 186 h. Seed set on this host is Krabi and
+# Yogyakarta. To see who is enrolled: `scheduler enroll-city --list`.
+#
+# daily_request_budget is a FLOOR to clear, NOT a ceiling on the night's spend
+# (#273/#274): the guard is a pre-flight check against an ESTIMATE, and the child
+# is handed no request cap, so a city that calibrates to r=500 can overspend this
+# figure with only the per-city wall-clock timeout to stop it. 10,000 clears the
+# largest city the cost study measured (Singapore, ~9,974); both seed cities are
+# far under it. Widen only after #273 — and re-check this floor before enrolling
+# any metro, since a city whose estimate exceeds it is skipped *permanently*.
+#
+# max_requests_per_minute is load-bearing beyond pacing: _kartaview_timeout_seconds
+# derives every sweep's per-city timeout from this rate, so lowering it here
+# silently shortens those timeouts too. 16/min = 960/h, under the 1,000/h
+# authenticated ceiling. Requires KARTAVIEW_ACCESS_TOKEN in .env — anonymous is
+# 100 req/h, which is not a slower channel, it is no channel.
+#
+# This is the FIFTH channel, so the effective max_concurrent_channels ceiling is
+# 4 of 5 (kartaview.org is a per-IP host shared with nothing). Moot at the knob's
+# current value of 1. See config/scheduler.toml for the full field docs.
+[providers.kartaview]
+enabled = true
+daily_request_budget = 10000
+max_requests_per_minute = 16
+
 [download]
 batch_size = 100
 connection_limit = 50
