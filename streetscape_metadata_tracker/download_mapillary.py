@@ -503,6 +503,14 @@ _TILE_MAX_TIME_S = 120
 # this rate to the CDN. Do not run Mapillary collections in parallel.
 DEFAULT_TILE_REQUESTS_PER_MINUTE = 60
 
+# Jitter fraction for the tile pacer (issue #292): request gaps vary uniformly
+# by ±this around 60/DEFAULT_TILE_REQUESTS_PER_MINUTE. Non-zero BY DEFAULT: a
+# saturated token bucket emits tiles at an exact 1.000 s cadence over
+# sequential z14 tiles from a datacenter IP, and after three per-IP blocks that
+# regularity is the one property of our traffic never changed between restarts
+# (rate and daily volume were both falsified, #286). 0 restores the metronome.
+DEFAULT_TILE_JITTER = 0.6
+
 # Content types that are an error page rather than a tile (issue #199). A
 # DENY-list, not an allow-list of protobuf types: if Mapillary ever relabels
 # real tiles (say `application/vnd.mapbox-vector-tile`), an allow-list would
@@ -1202,6 +1210,7 @@ async def fetch_city_images_async(
     connection_limit: int = 5,
     request_timeout: float = 30,
     max_requests_per_minute: int = DEFAULT_TILE_REQUESTS_PER_MINUTE,
+    jitter: float = DEFAULT_TILE_JITTER,
     checkpoint_path: str | None = None,
     checkpoint_channel: str | None = None,
     checkpoint_variant: str | None = None,
@@ -1236,6 +1245,7 @@ async def fetch_city_images_async(
                 connection_limit=connection_limit,
                 request_timeout=request_timeout,
                 max_requests_per_minute=max_requests_per_minute,
+                jitter=jitter,
                 checkpoint_path=checkpoint_path,
                 checkpoint_channel=checkpoint_channel,
                 checkpoint_variant=checkpoint_variant,
@@ -1257,6 +1267,7 @@ async def _fetch_city_images(
     connection_limit: int = 5,
     request_timeout: float = 30,
     max_requests_per_minute: int = DEFAULT_TILE_REQUESTS_PER_MINUTE,
+    jitter: float = DEFAULT_TILE_JITTER,
     checkpoint_path: str | None = None,
     checkpoint_channel: str | None = None,
     checkpoint_variant: str | None = None,
@@ -1397,12 +1408,18 @@ async def _fetch_city_images(
     # Bounds the aggregate rate regardless of connection_limit — the semaphore
     # caps concurrency, which on a fast link still meant ~5 tiles/s (~300/min)
     # from a single city before this (issue #198).
-    rate_limiter = AsyncRateLimiter(max_requests_per_minute)
-    logger.info(
-        f"Pacing tile requests at {max_requests_per_minute}/min"
-        if max_requests_per_minute > 0
-        else "Tile pacing DISABLED (max_requests_per_minute <= 0)"
-    )
+    rate_limiter = AsyncRateLimiter(max_requests_per_minute, jitter=jitter)
+    if max_requests_per_minute <= 0:
+        logger.info("Tile pacing DISABLED (max_requests_per_minute <= 0)")
+    elif jitter > 0:
+        mean_gap_s = 60.0 / max_requests_per_minute
+        logger.info(
+            f"Pacing tile requests at a mean {max_requests_per_minute}/min, jittered "
+            f"\u00b1{jitter:.0%} (gaps {mean_gap_s * (1 - jitter):.2f}\u2013"
+            f"{mean_gap_s * (1 + jitter):.2f} s, issue #292)"
+        )
+    else:
+        logger.info(f"Pacing tile requests at {max_requests_per_minute}/min")
     progress_bar = progress(
         total=len(todo),
         desc=f"Downloading Mapillary tiles for {city_name}",
@@ -1699,6 +1716,7 @@ async def download_mapillary_metadata_async(
     connection_limit: int = 5,
     request_timeout: float = 30,
     max_requests_per_minute: int = DEFAULT_TILE_REQUESTS_PER_MINUTE,
+    jitter: float = DEFAULT_TILE_JITTER,
     checkpoint_path: str | None = None,
     checkpoint_channel: str | None = None,
     census_cache: CensusCache | None = None,
@@ -1746,6 +1764,7 @@ async def download_mapillary_metadata_async(
         connection_limit=connection_limit,
         request_timeout=request_timeout,
         max_requests_per_minute=max_requests_per_minute,
+        jitter=jitter,
         checkpoint_path=checkpoint_path,
         checkpoint_channel=checkpoint_channel,
         census_cache=census_cache,

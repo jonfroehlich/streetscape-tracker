@@ -22,7 +22,7 @@ See also issue #205 and the Mapillary rate-limit sections below.
 and that is not what actually stops us: on 2026-08-12 a bulk catch-up sustaining **~370 tile requests/min** got makelab2's **whole IP** redirected to a login page for every tile request, at a total spend of 10,659 — ~21% of that daily cap.
 It is scoped to the **host**, not the credential: both Mapillary applications (`MAPILLARY_ACCESS_TOKEN` and `MAPILLARY_STREETS_ACCESS_TOKEN`) were refused simultaneously while the same token served tiles fine from another IP and `graph.mapillary.com` kept working
 — so the `mapillary`/`mapillary_streets` channel split isolates *ledgers*, never this, and a second token or even a second Mapillary application would buy nothing.
-`download_mapillary.py` therefore paces every tile request through `AsyncRateLimiter` at `DEFAULT_TILE_REQUESTS_PER_MINUTE` (60), overridable per channel via `[providers.*].max_requests_per_minute` and the `--mapillary-max-requests-per-minute` flag on both CLIs
+`download_mapillary.py` therefore paces every tile request through `AsyncRateLimiter` at `DEFAULT_TILE_REQUESTS_PER_MINUTE` (60), overridable per channel via `[providers.*].max_requests_per_minute` and the `--mapillary-max-requests-per-minute` flag on both CLIs — and, since #292, **jittered** rather than metronomic (see the request-jitter section below)
 — a **separate** flag from the GSV `--max-requests-per-minute`, whose value is a project-quota figure three orders of magnitude larger.
 60 is a deliberately conservative guess (370 is confirmed too high) and slowness is cheap here
 — but #241 proved 60/min alone is **not sufficient**: the 2026-08-20 block arrived while obeying it exactly, so the limiter is kept as a necessary bound (an unpaced burst is confirmed harmful, and a constant peak rate is what made the two incidents comparable) while the operative constraint is the multi-day accumulation window in the budget section below.
@@ -194,6 +194,29 @@ Both figures are upper bounds, and the measured/reported/guessed tiers below mus
   An automated version (`probe_mapillary_block.sh` plus a self-disarming systemd user timer, untracked, emails the verdict either way) lives on makelab2 from the second incident.
   Re-enabling the channels stays a human decision — make it **promptly** on a clean probe, since both incidents' channels sat dark longer than their bans.
   And n=2 with upper bounds only: do not infer a shorter wait works, and do not probe more than once a day.
+
+- **Measured (block 3, cleared 2026-08-29).** Cleared within **≤26.3 h** of true silence (blocked 10:40 on 08-28, single probe 12:56 on 08-29 returned 200/protobuf for both applications), with the host verified quiet first.
+  Three blocks in, the duration does **not** escalate with repeat offenses.
+
+## Request jitter: the one axis no restart changed (issue #292)
+
+**After three blocks, both levers we control are falsified as the trigger, and the fourth hypothesis is the *shape* of the traffic rather than its amount.**
+Rate: block 2 arrived with the 60/min limiter provably pinned.
+Daily volume: block 3 arrived at **1,938** combined requests/day, while 08-14 had spent **26,363** in one day clean, and no accumulation window from 1 to 8 days separates blocked days from clean ones (issue #286, which retires #241's bands).
+What every restart left untouched is that `AsyncRateLimiter`'s token bucket, once saturated, emits tile requests at an **exact `60 / max_per_minute` cadence** — the sleep is computed to the token — over sequential z14 tiles in raster order, from a datacenter IP, with the same UA every time.
+Staff describe the per-IP layer only as a separate system that "can block you at different levels"; if it scores behaviour rather than counting, that regularity is the most machine-like feature we present.
+
+The change (issue #292) is a `jitter` fraction on the limiter: above 0 it becomes a **spaced pacer** whose gap is `60 / max_per_minute × uniform(1 − jitter, 1 + jitter)`.
+The mean rate is still `max_per_minute` — so the daily budgets and the rate-derived scheduler timeout keep their meaning — there is no burst capacity, and because the pacer is FIFO under one lock, `connection_limit` concurrency cannot smooth the jitter back out.
+`jitter = 0` is byte-for-byte the old bucket, so GSV and KartaView pacing (which never opt in) are unchanged.
+Mapillary tile fetches jitter **by default** (`DEFAULT_TILE_JITTER = 0.6`, `--mapillary-jitter` on both CLIs, `[providers.mapillary*].jitter` in the scheduler config, passed to the children exactly as `max_requests_per_minute` is), and prod runs **40/min ± 60%** — gaps uniform on 0.6–2.4 s — with the budgets left at 1,750 because a fourth cut has no mechanism to work through.
+
+**This is a pre-registered test, not a fix**, and the prediction is recorded in #286 before the restart.
+Each prior block came after exactly **6 active collection days** (8 calendar days apart: 08-12, 08-20, 08-28).
+A fourth block around **2026-09-06/07** under jitter and #290's halved paired-night spend means rate, volume *and* request pattern are all dead, the trigger is cadence (consecutive active days, or a trust score), and the next move is scheduling rest days for the Mapillary channels — not more pacing.
+Clean through ~2026-09-10 means keep the setting.
+Bundling #290 with the jitter means a clean result cannot say which one worked; that is accepted, since a block would falsify both at once.
+Deliberately **not** changed in the same round: tile order (raster → shuffled), because a second pattern change would confound the same test.
 
 **Separately, a project decision rather than an empirical claim: makelab1 is NOT an escape hatch, even though it demonstrably still works** (verified 2026-08-13: same token, same /24, 200 + 12.4 MB while makelab2 got 302).
 **Project Sidewalk serves Mapillary data off the makelab servers**, so pointing this workload at makelab1 risks earning the same per-IP block on a host that a *production research deployment* depends on.

@@ -7,7 +7,9 @@ live here so provider-specific downloaders (`download_gsv.py`,
 provider importing from another's module.
 """
 
+import argparse
 import asyncio
+import random
 import re
 from collections.abc import Callable, Iterator
 from datetime import datetime
@@ -182,18 +184,48 @@ class AsyncRateLimiter:
     aggregate rate holds no matter how many tasks call ``acquire()``
     concurrently.
 
+    With ``jitter > 0`` the bucket is replaced by a **spaced pacer**
+    (issue #292): each acquisition waits out the previous one's gap, and the
+    gap is ``60 / max_per_minute`` scaled by a uniform draw from
+    ``[1 - jitter, 1 + jitter]``. The mean rate is still ``max_per_minute``,
+    there is no burst, and consecutive requests are no longer a metronome —
+    a saturated token bucket emits at an exact ``60 / max_per_minute`` cadence,
+    which is the one property of our Mapillary traffic that three per-IP blocks
+    left untested (rate and daily volume were both falsified, #286). Because
+    the pacer is FIFO under one lock, ``connection_limit`` concurrency cannot
+    smooth the jitter back out. ``jitter = 0`` is exactly the token bucket, so
+    callers that never opt in (GSV, KartaView) are unchanged.
+
     Usage:
         limiter = AsyncRateLimiter(24_000)  # 80% of the 30k/min quota
         await limiter.acquire()             # before each request
+
+        limiter = AsyncRateLimiter(40, jitter=0.6)  # gaps uniform on 0.6–2.4 s
     """
 
-    def __init__(self, max_per_minute: int, time_func: Callable[[], float] | None = None):
+    def __init__(
+        self,
+        max_per_minute: int,
+        time_func: Callable[[], float] | None = None,
+        *,
+        jitter: float = 0.0,
+        random_func: Callable[[float, float], float] | None = None,
+    ):
         """
         Args:
             max_per_minute: Maximum acquisitions per minute; <= 0 disables.
             time_func: Monotonic clock returning seconds (defaults to the
                 running event loop's clock). Injectable for tests.
+            jitter: Fraction in ``[0, 1)``. 0 keeps the token bucket; anything
+                above switches to the spaced pacer whose gaps vary by
+                ``±jitter`` around the mean. 1 or more would admit a zero gap,
+                i.e. an unpaced burst, so it is refused.
+            random_func: ``(low, high) -> float`` uniform sampler used for the
+                jitter (defaults to :func:`random.uniform`). Injectable for
+                deterministic tests.
         """
+        if not 0.0 <= jitter < 1.0:
+            raise ValueError(f"jitter must be in [0, 1), got {jitter!r}")
         self._enabled = max_per_minute > 0
         self._rate = max_per_minute / 60.0  # tokens per second
         self._capacity = max(self._rate, 1.0)  # ~1 second of burst
@@ -201,6 +233,11 @@ class AsyncRateLimiter:
         self._time_func = time_func
         self._last_refill: float | None = None
         self._lock = asyncio.Lock()
+        self.jitter = jitter
+        self._random = random_func or random.uniform
+        # Spaced-pacer state: the clock time the next request may go out. None
+        # until the first acquisition, which never waits.
+        self._next_at: float | None = None
 
     def _now(self) -> float:
         if self._time_func is not None:
@@ -210,6 +247,9 @@ class AsyncRateLimiter:
     async def acquire(self) -> None:
         """Block until a request token is available (no-op when disabled)."""
         if not self._enabled:
+            return
+        if self.jitter > 0:
+            await self._acquire_spaced()
             return
         async with self._lock:
             now = self._now()
@@ -228,6 +268,40 @@ class AsyncRateLimiter:
             await asyncio.sleep(wait)
             self._last_refill = self._now()
             self._tokens = 0.0
+
+    async def _acquire_spaced(self) -> None:
+        # Sleep while holding the lock, for the same reason as the bucket: the
+        # waiters behind this one must queue behind its gap anyway, and the
+        # gap is drawn AFTER the sleep so every request's delay is fresh
+        # randomness rather than one draw replayed by a burst of waiters.
+        async with self._lock:
+            now = self._now()
+            if self._next_at is not None and self._next_at > now:
+                await asyncio.sleep(self._next_at - now)
+                now = self._now()
+            gap = (1.0 / self._rate) * self._random(1.0 - self.jitter, 1.0 + self.jitter)
+            self._next_at = now + gap
+
+
+def jitter_fraction(value: str) -> float:
+    """
+    argparse type for a pacing jitter: a float in ``[0, 1)`` (issue #292).
+
+    Shared by both CLIs' ``--mapillary-jitter`` so the two cannot drift on what
+    the bound is. 1 or more would admit a zero gap — an unpaced burst against
+    the per-IP tile CDN — so it is refused at parse time rather than at the
+    first request.
+
+    Usage:
+        parser.add_argument("--mapillary-jitter", type=jitter_fraction, default=0.6)
+    """
+    try:
+        number = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"must be a number, got {value!r}") from None
+    if not 0.0 <= number < 1.0:
+        raise argparse.ArgumentTypeError(f"must be in [0, 1), got {number}")
+    return number
 
 
 # Credential-bearing query parameters (GSV's key=, Mapillary's

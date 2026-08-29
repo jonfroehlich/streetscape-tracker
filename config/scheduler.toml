@@ -190,7 +190,17 @@ daily_request_budget = 1750
 # host — the cross-process host lock (issue #208) is what makes this figure the
 # real one rather than a per-process wish. A ban is not cheap: it takes out
 # every Mapillary channel on the host until it lifts.
-max_requests_per_minute = 60
+#
+# 40, not 60, and JITTERED (issue #292): the third block (2026-08-28) arrived at
+# 1,938 requests/day under a pinned 60/min limiter, while 26,363 in one day had
+# run clean — so neither rate nor daily volume is the trigger. What no restart
+# had changed is the SHAPE of the traffic: a saturated token bucket emits tiles
+# at an exact 1.000 s cadence, in raster order, from a datacenter IP. `jitter`
+# replaces that metronome with gaps drawn uniformly from ±60% of the mean
+# (0.6–2.4 s at 40/min); the mean rate is still max_requests_per_minute, so the
+# budget and timeout arithmetic are unchanged. 0 restores the exact cadence.
+max_requests_per_minute = 40
+jitter = 0.6
 
 # Road-walk street-coverage collection (issue #99). These are SCHEDULED
 # channels like the two above — same cycle_days, same stagger day (a city's
@@ -251,8 +261,11 @@ spacing_m = 15
 # than double it is that the two never run at the same time: they share a host,
 # so the scheduler defers one behind the other whatever max_concurrent_channels
 # says (issue #240), and the child-side per-host lock (#208) covers the manual
-# runs the scheduler cannot see.
-max_requests_per_minute = 60
+# runs the scheduler cannot see. Same jitter as the grid channel (#292): the
+# walk pays for the census on an un-paired night, and one metronomic channel
+# would leave the pattern under test half-changed.
+max_requests_per_minute = 40
+jitter = 0.6
 # See [providers.gsv_streets].network_type. A broader network costs Mapillary
 # nothing extra (the tile census is the same regardless of how many sample
 # points are scored against it) — only the local join gets bigger.

@@ -46,9 +46,18 @@ daily_request_budget = 10000000
 # mechanism to work through. The budgets below are LEFT AS-IS deliberately: they
 # are the sizing #241/#267 argued for, and re-enabling should be a decision about
 # the mechanism, not a re-derivation of numbers that were never the binding
-# constraint. Flip `enabled` back to true to resume; nothing else needs changing.
+# constraint.
+#
+# RESUMED 2026-08-31 under issue #292: slower mean rate AND jittered request
+# gaps (see max_requests_per_minute / jitter below), with #291's shared census
+# halving a paired night's tile spend. Pre-registered prediction, recorded in
+# #286: each prior block came after exactly 6 active collection days, so a
+# fourth block around 2026-09-06/07 means rate, volume and request pattern are
+# ALL dead and the trigger is cadence (next move: rest days, not more pacing);
+# clean through ~2026-09-10 means keep this. If it blocks: disable both channels
+# again, sweep for detached processes, probe once after ~24 h.
 [providers.mapillary]
-enabled = false
+enabled = true
 # Counted in z14 vector-tile requests. Mapillary documents this endpoint as
 # "50,000 per day (not per minute)" per app — i.e. NO documented throughput
 # limit at all — and 4xx on exceeding it. Our block matched none of that: on
@@ -103,7 +112,16 @@ daily_request_budget = 1750
 # Client-side tile pacing (issue #198). Shared per-IP with mapillary_streets
 # below and with any manual run on this host — the host lock (#208) is what
 # makes this figure the real one rather than a per-process wish.
-max_requests_per_minute = 60
+#
+# 40 and JITTERED, not a metronomic 60 (issue #292, the fourth hypothesis):
+# block 2 came with this limiter pinned at 60 and block 3 at 1,938/day while
+# 26,363 had run clean in a day, so rate and volume are both falsified. The
+# one thing every restart left unchanged was the exact 1.000 s cadence of a
+# saturated token bucket; `jitter` draws each gap from ±60% of the mean
+# (0.6–2.4 s). Mean rate is unchanged in meaning, so budgets and the derived
+# timeout need no re-sizing. 0 restores the exact cadence.
+max_requests_per_minute = 40
+jitter = 0.6
 
 # Road-walk street-coverage collection (issue #99). SCHEDULED channels like the
 # two above — same cycle, same stagger day (a city's grid and street snapshots
@@ -143,13 +161,16 @@ spacing_m = 15
 # and this budget is drawn on only when the pair is split apart.
 # PAUSED 2026-08-28 with [providers.mapillary] — same IP, same tile CDN, so
 # pausing one and not the other would keep the host under exactly the load the
-# pause exists to stop. Re-enable the pair together.
+# pause exists to stop — and RESUMED with it 2026-08-31 under #292: the pair
+# moves together in both directions.
 [providers.mapillary_streets]
-enabled = false
+enabled = true
 daily_request_budget = 1750
 spacing_m = 15
-# See [providers.mapillary] — one per-IP rate budget, two channels.
-max_requests_per_minute = 60
+# See [providers.mapillary] — one per-IP rate budget, two channels, and the
+# same jitter, or the pattern under test would be half-changed (#292).
+max_requests_per_minute = 40
+jitter = 0.6
 
 # KartaView (issue #248) — the one OPT-IN channel. Declaring this block enrolls
 # NOBODY: the nightly queue is exactly the cities an operator ran

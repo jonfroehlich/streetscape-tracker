@@ -5,6 +5,8 @@ downloaders and the GSV history harvester, so they're tested on their own here
 rather than only transitively through a provider.
 """
 
+import argparse
+
 import geopy.distance
 import pytest
 
@@ -14,6 +16,7 @@ from streetscape_metadata_tracker.download_common import (
     generate_grid_arrays,
     generate_grid_points,
     grid_index_ranges,
+    jitter_fraction,
     standardize_capture_date,
 )
 
@@ -211,6 +214,138 @@ def test_rate_limiter_zero_or_negative_disables(monkeypatch):
 
     _run(scenario())
     assert sleeps == []
+
+
+# ── AsyncRateLimiter jitter (issue #292) ─────────────────────────────────────
+#
+# The spaced pacer is the fourth per-IP hypothesis under test, and the property
+# it exists to change is the metronome: a saturated token bucket sleeps exactly
+# 60/max_per_minute between requests. These pin that (a) the gaps really follow
+# the injected draw, (b) the mean rate is still the configured one, (c) there
+# is no burst, and (d) jitter=0 is byte-for-byte the old bucket.
+
+
+def _draws(values):
+    """A deterministic stand-in for random.uniform that replays `values`."""
+    it = iter(values)
+
+    def uniform(low, high):
+        assert (low, high) == (pytest.approx(0.4), pytest.approx(1.6))
+        return next(it)
+
+    return uniform
+
+
+def test_jittered_limiter_spaces_requests_by_the_drawn_gap(monkeypatch):
+    clock, now = _make_clock()
+    sleeps = []
+    _patch_sleep(monkeypatch, clock, sleeps)
+    # mean gap 1.5 s (40/min); draws are the multiplier on it
+    # Every acquisition draws the gap the NEXT one will wait, so four requests
+    # draw four times and the last draw is never slept on.
+    limiter = AsyncRateLimiter(
+        40, time_func=now, jitter=0.6, random_func=_draws([0.4, 1.6, 1.0, 1.0])
+    )
+
+    async def scenario():
+        for _ in range(4):
+            await limiter.acquire()
+
+    _run(scenario())
+    # The first request never waits; each later one waits out the PREVIOUS
+    # request's drawn gap, so the sleeps are the draws in order.
+    assert sleeps == [pytest.approx(0.6), pytest.approx(2.4), pytest.approx(1.5)]
+
+
+def test_jittered_limiter_keeps_the_configured_mean_rate(monkeypatch):
+    """Jitter reshapes the gaps; it must not quietly slow or speed the channel
+    — the daily budget and the scheduler's timeout are both derived from
+    max_requests_per_minute as a mean."""
+    import random
+
+    clock, now = _make_clock()
+    sleeps = []
+    _patch_sleep(monkeypatch, clock, sleeps)
+    limiter = AsyncRateLimiter(
+        60, time_func=now, jitter=0.6, random_func=random.Random(292).uniform
+    )
+
+    async def scenario():
+        for _ in range(2000):
+            await limiter.acquire()
+
+    _run(scenario())
+    assert len(sleeps) == 1999
+    assert sum(sleeps) / len(sleeps) == pytest.approx(1.0, rel=0.03)
+    assert min(sleeps) >= 0.4 and max(sleeps) <= 1.6
+
+
+def test_jittered_limiter_has_no_burst_capacity(monkeypatch):
+    """The bucket lets ~1 s of requests through unpaced after an idle period;
+    the pacer must not, since a burst is exactly the shape a per-IP scorer
+    would notice first."""
+    clock, now = _make_clock()
+    sleeps = []
+    _patch_sleep(monkeypatch, clock, sleeps)
+    limiter = AsyncRateLimiter(600, time_func=now, jitter=0.6, random_func=_draws([1.0] * 20))
+
+    async def scenario():
+        await limiter.acquire()
+        clock["t"] += 3600.0  # a long idle earns no credit
+        for _ in range(3):
+            await limiter.acquire()
+
+    _run(scenario())
+    # After the idle the first acquisition goes straight out (its slot is long
+    # past), and every one after it waits the full gap — never zero.
+    assert sleeps == [pytest.approx(0.1), pytest.approx(0.1)]
+
+
+def test_zero_jitter_is_exactly_the_token_bucket(monkeypatch):
+    clock, now = _make_clock()
+    sleeps = []
+    _patch_sleep(monkeypatch, clock, sleeps)
+
+    def never(low, high):  # pragma: no cover - the assertion is that it is unused
+        raise AssertionError("jitter=0 must not draw randomness")
+
+    limiter = AsyncRateLimiter(60, time_func=now, jitter=0.0, random_func=never)
+
+    async def scenario():
+        for _ in range(3):
+            await limiter.acquire()
+
+    _run(scenario())
+    assert sleeps == [pytest.approx(1.0), pytest.approx(1.0)]
+
+
+def test_disabled_pacing_ignores_jitter(monkeypatch):
+    clock, now = _make_clock()
+    sleeps = []
+    _patch_sleep(monkeypatch, clock, sleeps)
+    limiter = AsyncRateLimiter(0, time_func=now, jitter=0.6)
+
+    async def scenario():
+        for _ in range(50):
+            await limiter.acquire()
+
+    _run(scenario())
+    assert sleeps == []
+
+
+@pytest.mark.parametrize("bad", [-0.1, 1.0, 1.5])
+def test_jitter_outside_the_unit_interval_is_refused(bad):
+    """>= 1 admits a zero gap, i.e. an unpaced burst against the tile CDN."""
+    with pytest.raises(ValueError, match="jitter"):
+        AsyncRateLimiter(60, jitter=bad)
+
+
+def test_jitter_fraction_argparse_type():
+    assert jitter_fraction("0") == 0.0
+    assert jitter_fraction("0.6") == pytest.approx(0.6)
+    for bad in ("1", "1.2", "-0.5", "lots"):
+        with pytest.raises(argparse.ArgumentTypeError):
+            jitter_fraction(bad)
 
 
 # ── generate_grid_arrays (issue #157) ───────────────────────────────────────

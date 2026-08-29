@@ -252,6 +252,11 @@ and the **per-writer staging name** — that two pids derive different paths, th
   a blocked night alerting below the failure threshold while still publishing, the same for a busy night but with a subject that does **not** claim the provider refused us,
   a busy exit leaving the *next* city's same channel still attempted, and `CHANNEL_HOSTS` covering every scheduled channel since it is read with a fail-open `.get`)
 
+- Request jitter (issue #292: the spaced pacer sleeps exactly the injected draw scaled by the mean gap, keeps the configured **mean** rate over 2,000 draws, has no burst credit after an idle, `jitter = 0` never draws randomness and sleeps exactly as the bucket did, disabled pacing ignores it, and `[1, ∞)` or a negative is refused by both the class and the shared `jitter_fraction` argparse type;
+  the census builds its limiter with the jitter it was given and the module default is non-zero; the flag reaches the downloader from `cli.py` and the census from `collect.py`, both defaulting on rather than to the metronome, and a jitter of 1 exits 2 at parse time;
+  the scheduler parses `[providers.*].jitter` as None-when-absent — never 0, which means "restore the exact cadence" — and hands it to both Mapillary children, a 0 included, while an unset one and a GSV child get no flag;
+  and the prod config pin asserts both Mapillary channels resumed at the same jittered rate)
+
 ## The same-day partner path (issue #215)
 
 `tests/test_assess_city.py`: the channel set collected in `enabled_providers()` order and **never** including the GSV grid run;

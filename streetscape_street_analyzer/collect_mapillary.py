@@ -44,6 +44,7 @@ from streetscape_metadata_tracker.analysis import FLAT_ONLY
 from streetscape_metadata_tracker.census import census_is_pano
 from streetscape_metadata_tracker.checkpointing import CensusCache, observation_timestamp
 from streetscape_metadata_tracker.download_mapillary import (
+    DEFAULT_TILE_JITTER,
     DEFAULT_TILE_REQUESTS_PER_MINUTE,
     build_empty_rows,
     build_image_rows,
@@ -239,6 +240,7 @@ async def collect_mapillary_street_samples_async(
     connection_limit: int = 5,
     request_timeout: float = 30,
     max_requests_per_minute: int = DEFAULT_TILE_REQUESTS_PER_MINUTE,
+    jitter: float = DEFAULT_TILE_JITTER,
     checkpoint_path: str | None = None,
     checkpoint_channel: str | None = None,
     checkpoint_variant: str | None = None,
@@ -283,6 +285,7 @@ async def collect_mapillary_street_samples_async(
         connection_limit=connection_limit,
         request_timeout=request_timeout,
         max_requests_per_minute=max_requests_per_minute,
+        jitter=jitter,
         checkpoint_path=checkpoint_path,
         checkpoint_channel=checkpoint_channel,
         checkpoint_variant=checkpoint_variant,

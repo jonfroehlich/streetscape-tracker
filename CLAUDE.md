@@ -165,6 +165,7 @@ The lifecycle (loader, marker, reuse accounting, `crawl_store_for`) lives once i
 This is what READ THIS FIRST points at; read it before changing any pacing, retry, concurrency, volume or host decision.
 
 - **Mapillary `--limit` catch-ups are PAUSED** until #241's rolling multi-day guard lands: the second block (2026-08-20) arrived while the 60/min limiter was provably pinned, so the limiter is necessary but not sufficient and the operative constraint is a rolling 2–3 day per-IP accumulation window.
+- **Mapillary tile pacing is jittered, never metronomic** (`jitter` in `[providers.mapillary*]`, `--mapillary-jitter`, #292): the third block (2026-08-28) at 1,938/day — after 26,363 ran clean in a day — falsified rate AND daily volume as the trigger (#286), so request regularity is the axis under test; a fourth block ~6 active days after a restart means cadence, not pacing.
 - When they resume, the only supported path is `scheduler run-due --provider mapillary --limit N`, **never a detached script** — the bespoke one with none of the scheduler's guards got makelab2 banned by Mapillary and Overpass in one night.
 - Three third parties meter by **IP, not credential** — Mapillary's tile CDN, `overpass-api.de`, `kartaview.org` — so a per-process limiter cannot honour them alone; `host_lock.py` serializes them across processes.
 - Exit-code families, **none of which records a scheduler failure** (`get_due_cities` filters on `consecutive_failures`, and nothing but a success resets it):

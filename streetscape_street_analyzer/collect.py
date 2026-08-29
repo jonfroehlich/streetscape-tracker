@@ -82,9 +82,11 @@ from streetscape_metadata_tracker.download_common import (
     DownloadError,
     HostUnavailableError,
     host_exit_code,
+    jitter_fraction,
 )
 from streetscape_metadata_tracker.download_gsv import collect_points_async
 from streetscape_metadata_tracker.download_mapillary import (
+    DEFAULT_TILE_JITTER,
     DEFAULT_TILE_REQUESTS_PER_MINUTE,
     estimate_tile_count,
 )
@@ -372,6 +374,7 @@ def run_collect(args: argparse.Namespace) -> int:
                         connection_limit=args.connection_limit,
                         request_timeout=args.timeout,
                         max_requests_per_minute=args.mapillary_max_requests_per_minute,
+                        jitter=args.mapillary_jitter,
                         checkpoint_path=checkpoint_path,
                         checkpoint_channel=budget_channel,
                         checkpoint_variant=args.network_type,
@@ -673,6 +676,18 @@ def build_parser() -> argparse.ArgumentParser:
             "pacing. Separate from the gsv_streets cap because Mapillary's "
             "tile CDN rate-limits per IP, so exceeding it blocks every "
             "Mapillary channel on this host at once (issue #198)"
+        ),
+    )
+    parser.add_argument(
+        "--mapillary-jitter",
+        type=jitter_fraction,
+        default=DEFAULT_TILE_JITTER,
+        help=(
+            "Randomize the gap between Mapillary tile requests by +/- this "
+            f"fraction of the mean (default: {DEFAULT_TILE_JITTER}; 0 restores "
+            "an exact cadence). Rate and daily volume were both falsified as "
+            "the per-IP block trigger, so the metronomic request pattern is "
+            "the axis under test (issue #292)"
         ),
     )
     parser.add_argument(

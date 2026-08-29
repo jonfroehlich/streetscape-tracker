@@ -783,6 +783,24 @@ daily_request_budget = 1
     assert cfg.providers["gsv"].daily_request_budget == 99_000
     assert cfg.providers["mapillary"].daily_request_budget == 5000
     assert "bogus" not in cfg.providers  # unknown providers are ignored
+    # jitter (issue #292) is None when absent — "use the collector's default" —
+    # never 0, which would mean "restore the metronome".
+    assert cfg.providers["mapillary"].jitter is None
+
+
+def test_config_parses_mapillary_jitter(tmp_path):
+    p = tmp_path / "s.toml"
+    p.write_text("""
+[providers.mapillary]
+max_requests_per_minute = 40
+jitter = 0.6
+[providers.mapillary_streets]
+jitter = 0
+""")
+    cfg = load_scheduler_config(str(p))
+    assert cfg.providers["mapillary"].jitter == pytest.approx(0.6)
+    assert cfg.providers["mapillary"].max_requests_per_minute == 40
+    assert cfg.providers["mapillary_streets"].jitter == 0
 
 
 def test_config_rejects_an_unknown_network_type(tmp_path):
@@ -980,15 +998,25 @@ def test_makelab1_production_config_is_wired():
     # which ranks LAST because a multi-hour sweep absorbs deadline truncation most
     # cheaply (#238). Asserting the list therefore pins the launch order too.
     #
-    # Both Mapillary channels are PAUSED as of 2026-08-28 (third per-IP block), so
-    # they are configured-but-disabled and drop out of this list. Pinned as an
-    # absence rather than deleted: resuming them must be a deliberate edit here.
-    assert cfg.enabled_providers() == ["gsv", "gsv_streets", "kartaview"]
-    for paused in ("mapillary", "mapillary_streets"):
-        assert paused in cfg.providers, f"{paused} block must survive the pause"
-        assert not cfg.providers[paused].enabled
-    # The pause is about the mechanism, not the sizing — the budgets stay at the
-    # values #241/#267 argued for so that resuming is one flag, not a re-derivation.
+    # Both Mapillary channels were PAUSED 2026-08-28 (third per-IP block) and
+    # RESUMED with #292's pacing: a slower mean rate and, the actual change
+    # under test, jittered request gaps — rate and daily volume were both
+    # falsified as the trigger, request regularity never was. Pinned so the
+    # restart cannot silently ship at the old metronomic 60/min.
+    assert cfg.enabled_providers() == [
+        "gsv",
+        "gsv_streets",
+        "mapillary",
+        "mapillary_streets",
+        "kartaview",
+    ]
+    for channel in ("mapillary", "mapillary_streets"):
+        pc = cfg.providers[channel]
+        assert pc.enabled, f"{channel} resumed under #292"
+        assert pc.max_requests_per_minute == 40
+        assert pc.jitter == pytest.approx(0.6)
+    # The restart is about the mechanism, not the sizing — the budgets stay at the
+    # values #241/#267 argued for; a fourth cut has no mechanism to work through.
     assert cfg.providers["mapillary"].daily_request_budget == 1_750
     assert cfg.providers["mapillary_streets"].daily_request_budget == 1_750
     # kartaview was turned on in production on 2026-08-28, the separate deploy
@@ -1043,11 +1071,15 @@ def test_makelab1_production_config_is_wired():
         "2-3 day window fits both blocks (issue #241, see CLAUDE.md)"
     )
     # The per-minute pace is still pinned — an unpaced burst (~370/min) is
-    # confirmed harmful, and a constant peak rate is what made the two
-    # incidents comparable — but per #241 it is NOT sufficient on its own.
-    # Both channels draw on one per-IP rate, so both carry the same figure.
-    assert cfg.providers["mapillary"].max_requests_per_minute == 60
-    assert cfg.providers["mapillary_streets"].max_requests_per_minute == 60
+    # confirmed harmful — but per #241 it is NOT sufficient on its own, and per
+    # #292 it is a MEAN under jittered gaps rather than an exact cadence. Both
+    # channels draw on one per-IP rate, so both carry the same figures (the
+    # values themselves are pinned in test_makelab1_production_config_is_wired).
+    assert (
+        cfg.providers["mapillary"].max_requests_per_minute
+        == cfg.providers["mapillary_streets"].max_requests_per_minute
+    )
+    assert cfg.providers["mapillary"].jitter == cfg.providers["mapillary_streets"].jitter
     assert cfg.publish_enabled
     assert cfg.publish_script.endswith("sync_data_to_server.sh")
     # smtp transport (not "mail"): the local mailer is blocked by the systemd
@@ -5038,6 +5070,50 @@ def test_mapillary_street_child_gets_the_tile_pace(conn):
     # gsv_streets' own pacing flag must not leak onto a Mapillary walk: its
     # value is a GSV-scale number the collector would apply to tile requests.
     assert "--max-requests-per-minute" not in cmd
+
+
+def test_mapillary_children_get_the_configured_jitter(conn, monkeypatch, tmp_path):
+    """Both Mapillary children pace the same per-IP CDN, so a jitter configured
+    on a channel must reach that channel's collector (issue #292) — and a 0 must
+    reach it too, since 0 means "restore the exact cadence", not "unset"."""
+    from streetscape_metadata_tracker.scheduler import _street_collect_cmd
+
+    cfg = SchedulerConfig(
+        providers={
+            "mapillary": ProviderConfig(jitter=0.6),
+            "mapillary_streets": ProviderConfig(jitter=0),
+        }
+    )
+    cmd, _ = _grid_cmd(monkeypatch, tmp_path, conn, "mapillary", cfg)
+    assert cmd[cmd.index("--mapillary-jitter") + 1] == "0.6"
+    # Jitter without a rate: the rate flag stays absent (collector default).
+    assert "--mapillary-max-requests-per-minute" not in cmd
+
+    cid = _register(conn, "Bend", width=5000, height=5000, step=20)
+    city = db.resolve_city(conn, cid)
+    cmd = _street_collect_cmd(cfg, city, date(2026, 7, 8), "mapillary_streets", 10, 100)
+    assert cmd[cmd.index("--mapillary-jitter") + 1] == "0"
+
+
+def test_an_unset_jitter_leaves_the_collector_default_in_force(conn, monkeypatch, tmp_path):
+    from streetscape_metadata_tracker.scheduler import _street_collect_cmd
+
+    cfg = SchedulerConfig(
+        providers={
+            "mapillary": ProviderConfig(max_requests_per_minute=60),
+            "mapillary_streets": ProviderConfig(max_requests_per_minute=60),
+            "gsv": ProviderConfig(),
+        }
+    )
+    cmd, _ = _grid_cmd(monkeypatch, tmp_path, conn, "mapillary", cfg)
+    assert "--mapillary-jitter" not in cmd
+    cid = _register(conn, "Bend", width=5000, height=5000, step=20)
+    city = db.resolve_city(conn, cid)
+    cmd = _street_collect_cmd(cfg, city, date(2026, 7, 8), "mapillary_streets", 10, 100)
+    assert "--mapillary-jitter" not in cmd
+    # And a GSV child never sees a Mapillary flag at all.
+    cmd, _ = _grid_cmd(monkeypatch, tmp_path, conn, "gsv", cfg)
+    assert "--mapillary-jitter" not in cmd
 
 
 # ---------------------------------------------------------------------------

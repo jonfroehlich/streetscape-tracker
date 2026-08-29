@@ -1468,7 +1468,7 @@ def test_every_tile_request_passes_through_the_rate_limiter(monkeypatch, straddl
     acquires = []
 
     class _SpyLimiter:
-        def __init__(self, max_per_minute):
+        def __init__(self, max_per_minute, *args, **kwargs):
             self.max_per_minute = max_per_minute
 
         async def acquire(self):
@@ -1487,6 +1487,26 @@ def test_the_default_pace_is_well_under_the_rate_that_got_us_banned():
     it must stay a conservative one — this is the guard on someone 'tuning' it
     up without new evidence about where the real ceiling is."""
     assert 0 < dm.DEFAULT_TILE_REQUESTS_PER_MINUTE <= 120
+
+
+def test_the_tile_limiter_is_built_jittered(monkeypatch, straddling_city):
+    """Issue #292: the census builds its limiter with the jitter it was given,
+    and the module default is non-zero — a saturated token bucket's exact
+    cadence is the one property of our traffic three blocks never changed."""
+    lat, lon = straddling_city
+    built = []
+
+    class _Recording:
+        def __init__(self, max_per_minute, *args, **kwargs):
+            built.append((max_per_minute, kwargs.get("jitter")))
+
+        async def acquire(self):
+            return None
+
+    monkeypatch.setattr(dm, "AsyncRateLimiter", _Recording)
+    _fetch_city(monkeypatch, _failing_fetch(set()), lat, lon)
+    assert built == [(dm.DEFAULT_TILE_REQUESTS_PER_MINUTE, dm.DEFAULT_TILE_JITTER)]
+    assert 0 < dm.DEFAULT_TILE_JITTER < 1
 
 
 class _SequencedTileSession:

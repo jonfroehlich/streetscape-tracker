@@ -219,6 +219,10 @@ class ProviderConfig:
     # (0/None → fall back to [download].max_requests_per_minute) and the
     # on-street sample spacing the road walk collects at.
     max_requests_per_minute: int | None = None
+    # Mapillary channels only: randomize tile request gaps by ±this fraction
+    # of the mean (issue #292). None leaves the collector's own default in
+    # force; 0 restores an exact cadence.
+    jitter: float | None = None
     spacing_m: int = 15
     # Which OSM network the road walk covers. 'drive' (motorized public roads)
     # is the scheduled default; 'all_public' additionally walks alleys,
@@ -511,6 +515,7 @@ def load_scheduler_config(path: str | None = None) -> SchedulerConfig:
                 enabled=p.get("enabled", True),
                 daily_request_budget=p.get("daily_request_budget", 250_000),
                 max_requests_per_minute=p.get("max_requests_per_minute"),
+                jitter=p.get("jitter"),
                 spacing_m=p.get("spacing_m", 15),
                 network_type=network_type,
             )
@@ -2906,15 +2911,20 @@ def _street_collect_cmd(
             "--max-requests-per-minute",
             str(cfg.max_requests_per_minute if rate is None else rate),
         ]
-    elif channel == "mapillary_streets" and pc.max_requests_per_minute is not None:
+    elif channel == "mapillary_streets":
         # Paces the tile CDN, which limits per IP rather than per token — so
         # this channel and the grid one can ban each other (issue #198). Unset
         # leaves the collector's own conservative default in force; the GSV
         # fallback above would be nonsensically large here.
-        cmd += [
-            "--mapillary-max-requests-per-minute",
-            str(pc.max_requests_per_minute),
-        ]
+        if pc.max_requests_per_minute is not None:
+            cmd += [
+                "--mapillary-max-requests-per-minute",
+                str(pc.max_requests_per_minute),
+            ]
+        # Same contract for the jitter (issue #292): unset means the collector's
+        # own default, which is itself jittered.
+        if pc.jitter is not None:
+            cmd += ["--mapillary-jitter", str(pc.jitter)]
     # '--' so a display name can never be parsed as a flag
     cmd += ["--", city.display_name]
     return cmd
@@ -3127,9 +3137,12 @@ def _run_one_city(
         # its own, far smaller cap against a per-IP limit on the tile CDN
         # (issue #198); omitting the flag would leave the CLI's own
         # conservative default in force, which is also correct.
-        rate = ((cfg.providers or {}).get(provider) or ProviderConfig()).max_requests_per_minute
-        if rate is not None:
-            cmd += ["--mapillary-max-requests-per-minute", str(rate)]
+        pc = (cfg.providers or {}).get(provider) or ProviderConfig()
+        if pc.max_requests_per_minute is not None:
+            cmd += ["--mapillary-max-requests-per-minute", str(pc.max_requests_per_minute)]
+        # And its jitter (issue #292), under the same unset-means-default rule.
+        if pc.jitter is not None:
+            cmd += ["--mapillary-jitter", str(pc.jitter)]
     if provider == "kartaview":
         # Same reason as Mapillary's flag above, plus one specific to this
         # channel: the timeout is DERIVED from the configured rate (#238), so a

@@ -383,6 +383,28 @@ def test_the_road_walk_forwards_the_tile_pace_to_the_census(tmp_path, monkeypatc
     assert seen["max_requests_per_minute"] == 42
 
 
+def test_the_road_walk_jitter_reaches_the_census(tmp_path, monkeypatch):
+    """Same seam as the rate above (issue #292): the walk pays for the census on
+    an un-paired night, so its tile requests must carry the same jitter the grid
+    run's do — otherwise the metronome survives on one of the two channels."""
+    from streetscape_metadata_tracker.download_mapillary import DEFAULT_TILE_JITTER
+
+    data_dir, _ = _setup(tmp_path, monkeypatch, [_image("i-1", 44.0500, -121.3000)])
+    census = cm.fetch_city_images_async
+    seen = []
+
+    async def capture(city_name, bbox, access_token, **kwargs):
+        seen.append(kwargs)
+        return await census(city_name, bbox, access_token, **kwargs)
+
+    monkeypatch.setattr(cm, "fetch_city_images_async", capture)
+
+    assert collect.run_collect(_args(data_dir, **{"mapillary-jitter": 0.3})) == 0
+    assert seen[-1]["jitter"] == pytest.approx(0.3)
+    assert collect.run_collect(_args(data_dir, force=True)) == 0
+    assert seen[-1]["jitter"] == DEFAULT_TILE_JITTER
+
+
 def test_an_unset_road_walk_pace_still_paces(tmp_path, monkeypatch):
     """Unset must mean the collector's own conservative default, never unpaced
     and never the gsv_streets figure."""
