@@ -22,10 +22,11 @@ See also issue #205 and the Mapillary rate-limit sections below.
 and that is not what actually stops us: on 2026-08-12 a bulk catch-up sustaining **~370 tile requests/min** got makelab2's **whole IP** redirected to a login page for every tile request, at a total spend of 10,659 — ~21% of that daily cap.
 It is scoped to the **host**, not the credential: both Mapillary applications (`MAPILLARY_ACCESS_TOKEN` and `MAPILLARY_STREETS_ACCESS_TOKEN`) were refused simultaneously while the same token served tiles fine from another IP and `graph.mapillary.com` kept working
 — so the `mapillary`/`mapillary_streets` channel split isolates *ledgers*, never this, and a second token or even a second Mapillary application would buy nothing.
-`download_mapillary.py` therefore paces every tile request through `AsyncRateLimiter` at `DEFAULT_TILE_REQUESTS_PER_MINUTE` (60), overridable per channel via `[providers.*].max_requests_per_minute` and the `--mapillary-max-requests-per-minute` flag on both CLIs
+`download_mapillary.py` therefore paces every tile request through `AsyncRateLimiter` at `DEFAULT_TILE_REQUESTS_PER_MINUTE` (60), overridable per channel via `[providers.*].max_requests_per_minute` and the `--mapillary-max-requests-per-minute` flag on both CLIs — and, since #292, **jittered** rather than metronomic (see the request-jitter section below)
 — a **separate** flag from the GSV `--max-requests-per-minute`, whose value is a project-quota figure three orders of magnitude larger.
 60 is a deliberately conservative guess (370 is confirmed too high) and slowness is cheap here
-— but #241 proved 60/min alone is **not sufficient**: the 2026-08-20 block arrived while obeying it exactly, so the limiter is kept as a necessary bound (an unpaced burst is confirmed harmful, and a constant peak rate is what made the two incidents comparable) while the operative constraint is the multi-day accumulation window in the budget section below.
+— but #241 proved 60/min alone is **not sufficient**: the 2026-08-20 block arrived while obeying it exactly, so the limiter is kept as a necessary bound (an unpaced burst is confirmed harmful, and a constant peak rate is what made the two incidents comparable).
+#241 then read the residue as a multi-day accumulation window; **block 3 retired that** (see the budget section below, which is kept but marked superseded), and the live hypothesis is the request-jitter section at the end of this file.
 **The tile-count numbers, measured over all 1,214 enabled cities' frozen geometry on 2026-08-16** (`estimate_tile_count`; re-measure rather than trusting these, since grid re-registration moves them): median **12**, mean **57.8**, p90 **180**, p95 **306**, p99 **480**, max **870** (Moscow), and the **whole catalog is one 70,168-tile pass**.
 So a 20-city night is ~1,160 tiles on the grid channel (~20 min) against the 10 h batch deadline, and a complete catch-up over every city is ~20 h of paced wall clock
 — small as wall-clock, though the post-#241 budgets floor it at ~40 nights and catch-ups are paused besides (see the budget section below).
@@ -91,9 +92,15 @@ The thread carries one lead this repo did not have: it directs commercial or pro
 Nobody has written to them.
 That is a decision rather than a task — it identifies this project to the vendor, and the quota it would ask about is not the one that has ever stopped us.
 
-## The daily budgets encode a rolling 2–3 day per-IP window (issue #241, superseding #214's throughput bet)
+## SUPERSEDED — the daily budgets encoded a rolling 2–3 day per-IP window (issue #241, superseded by #286)
 
-**The daily budgets now encode the only constraint that fits the data: a rolling 2–3 day per-IP window (issue #241, superseding #214's throughput bet).** `[providers.mapillary].daily_request_budget` and `[providers.mapillary_streets]` are **1,750 each** (cut from 15,000 + 5,000 on 2026-08-22, and split evenly because both channels read the **identical z14 tile census** — a road walk re-reads the grid run's tiles
+> **SUPERSEDED by block 3 (2026-08-28); kept in full, not deleted, because the ledger analysis and the staff record below are still the evidence base and because #267 was sized on these bands.**
+> Block 3 arrived at **1,938** combined requests/day while 08-14 had spent **26,363** in one day clean, and **no accumulation window from 1 to 8 days** admits a threshold separating blocked days from clean ones (#286).
+> So the bands quoted below — 2-day (7,061, 10,766], 3-day (10,284, 12,074] — are **dead**, and the ~10,000-per-48 h reading with them.
+> What survives: the budgets themselves stay at 1,750 each, now as a *conservative floor on our exposure* rather than as a threshold anyone believes in; the no-`--limit`-catch-ups rule stays, on the general ground that a multi-night burst is the one shape we know preceded a block; and the **repeat-offender** rival named below is likewise dead, since block 3 did not escalate (≤26.3 h, same as block 2).
+> The live hypothesis is request *shape*, not request *volume* — see the request-jitter section at the end of this file.
+
+**The daily budgets encoded what #241 read as the only constraint fitting the data at n=2: a rolling 2–3 day per-IP window (issue #241, superseding #214's throughput bet).** `[providers.mapillary].daily_request_budget` and `[providers.mapillary_streets]` are **1,750 each** (cut from 15,000 + 5,000 on 2026-08-22, and split evenly because both channels read the **identical z14 tile census** — a road walk re-reads the grid run's tiles
 — so the two budgets deplete in lockstep and a heavy slate defers the same cities on both channels rather than un-pairing them).
 **Since #290 the walk no longer re-reads those tiles: on a paired night it reuses the grid run's census for zero requests**, so `mapillary_streets`' budget is spent only on nights the two channels are *not* paired — which is what a budget deferral or a filtered run produces.
 The budget *values* are unchanged; sizing them for the new load is #286's question, and this issue's goal is strictly less load, never more.
@@ -156,7 +163,7 @@ That code is deliberately **not** 2: argparse already exits 2 on a parse error a
 `--limit` is validated the same way and for the same reason (`< 1` would collect nothing and exit 0).
 An explicit `--limit N` **overrides `[schedule].max_cities_per_day`** for that invocation, because otherwise the config's 20 silently wins where the budget would allow ~30 cities;
 the nightly systemd unit passes no `--limit` and is unaffected.
-(Catch-ups are **paused** until #241's rolling guard lands — see the budget section above; the mechanism here is unchanged and stays the only supported path when they resume.)
+(Catch-ups stay **paused** — #241's rolling guard was the original condition and block 3 retired the window it would have guarded, so the pause now rests on the general ground that a multi-night burst is the one shape known to precede a block; see the superseded budget section above. The mechanism here is unchanged and stays the only supported path when they resume.)
 `--limit N` does **not** truncate the candidate list to N — a candidate can be skipped without being processed (budget guard, host breaker, busy lock), so pre-slicing let the loop run out of list below N and report a clean night, which is this flag's own bug one layer down.
 
 ## A filtered run is not a narrower nightly run: it un-pairs the cities it touches
@@ -194,6 +201,50 @@ Both figures are upper bounds, and the measured/reported/guessed tiers below mus
   An automated version (`probe_mapillary_block.sh` plus a self-disarming systemd user timer, untracked, emails the verdict either way) lives on makelab2 from the second incident.
   Re-enabling the channels stays a human decision — make it **promptly** on a clean probe, since both incidents' channels sat dark longer than their bans.
   And n=2 with upper bounds only: do not infer a shorter wait works, and do not probe more than once a day.
+
+- **Measured (block 3, cleared 2026-08-29).** Cleared within **≤26.3 h** of true silence (blocked 10:40 on 08-28, single probe 12:56 on 08-29 returned 200/protobuf for both applications), with the host verified quiet first.
+  Three blocks in, the duration does **not** escalate with repeat offenses.
+
+## Request jitter: the one axis no restart changed (issue #292)
+
+**After three blocks, both levers we control are falsified as the trigger, and the fourth hypothesis is the *shape* of the traffic rather than its amount.**
+Rate: block 2 arrived with the 60/min limiter provably pinned.
+Daily volume: block 3 arrived at **1,938** combined requests/day, while 08-14 had spent **26,363** in one day clean, and no accumulation window from 1 to 8 days separates blocked days from clean ones (issue #286, which retires #241's bands).
+What every restart left untouched is that `AsyncRateLimiter`'s token bucket, once saturated, emits tile requests at an **exact `60 / max_per_minute` cadence** — the sleep is computed to the token — over sequential z14 tiles in raster order, from a datacenter IP, with the same UA every time.
+Staff describe the per-IP layer only as a separate system that "can block you at different levels"; if it scores behaviour rather than counting, that regularity is the most machine-like feature we present.
+
+The change (issue #292) is a `jitter` fraction on the limiter: above 0 it becomes a **spaced pacer** whose gap is drawn from a **shifted exponential** around the mean gap `m = 60 / max_per_minute`:
+
+```
+gap = m × ((1 − jitter) + jitter × Exponential(1))
+```
+
+— a fixed floor of `(1 − jitter) × m` plus an exponential tail scaled to `jitter × m`.
+
+**Why a shifted exponential and not the uniform draw this started as.**
+The target is not "gaps that differ" but *gaps whose statistics look like a client rather than a program*, and the one-number summary of that is the **coefficient of variation**: an organic client's arrivals are Poisson, whose gaps are exponential with **CV = 1.0**.
+A uniform draw on `[1 − j, 1 + j]` reaches only `j / √3` — **0.35** at `j = 0.6` — and, worse, keeps a **hard ceiling**: under it no pause ever exceeds `(1 + j) × m`, so across a 44-minute run there is never a gap over 2.4 s, and a scorer reading gap *statistics* rather than gap *equality* sees very nearly what the metronome showed it.
+The shifted exponential is memoryless above the floor, unbounded above, and has **`CV = jitter` exactly** — 0.6 at the configured setting, against the metronome's 0.
+The parameter did not have to change meaning, because every invariant the uniform version had is preserved:
+
+- **The mean gap is exactly `m`** (`E[Exponential(1)] = 1`), so the mean rate is still `max_per_minute` and the daily budgets and the rate-derived scheduler timeout keep their arithmetic.
+  The tail widens the *variance* of a night's wall clock, not its expectation: over a 1,750-request night the standard deviation of the total is `√N × jitter × m` — under a minute against ~44, far inside `_TIMEOUT_HEADROOM`.
+  The gap is deliberately **not** capped, since a cap is a ceiling and the ceiling is the artifact being removed.
+- **The minimum gap is exactly `(1 − jitter) × m`**, so `jitter` still reads as "how far below the mean a gap may fall", there is still no burst capacity, and the `jitter < 1` bound is now literally what keeps the gap above zero.
+- **`jitter = 0` collapses the draw to a constant `m`**, so the pacer is continuous with the token bucket — and is short-circuited to it byte-for-byte anyway, so GSV and KartaView pacing (which never opt in) are unchanged.
+
+Because the pacer is FIFO under one lock, `connection_limit` concurrency cannot smooth the jitter back out.
+Mapillary tile fetches jitter **by default** (`DEFAULT_TILE_JITTER = 0.6`, `--mapillary-jitter` on both CLIs, `[providers.mapillary*].jitter` in the scheduler config — validated at load by `coerce_jitter`, and passed to the children exactly as `max_requests_per_minute` is), and prod runs **40/min at CV 0.6**: gaps floored at **0.60 s**, mean **1.50 s**, p99 **~4.7 s**, no ceiling.
+The budgets are left at 1,750 because a fourth cut has no mechanism to work through.
+
+**This is a pre-registered test, not a fix**, and the prediction is recorded in #286 before the restart.
+Each prior block came after exactly **6 active collection days** (8 calendar days apart: 08-12, 08-20, 08-28).
+A fourth block around **2026-09-06/07** under jitter and the shared census's halved paired-night spend (issue #290, PR #291) means rate, volume *and* request pattern are all dead, the trigger is cadence (consecutive active days, or a trust score), and the next move is scheduling rest days for the Mapillary channels — not more pacing.
+That inference is only as strong as the treatment, which is why the distribution was moved from uniform to exponential before the restart rather than after: at CV 0.35 a fourth block would have been ambiguous between "the trigger is cadence" and "the jitter was too mild to move the score", and at CV 0.6 against Poisson's 1.0 that second reading is much harder to sustain.
+It is not *impossible* to sustain — the remaining gap to 1.0, and the unchanged duty cycle (~44 minutes of unbroken traffic, no gap over ~10 s), are the honest limits on the conclusion.
+Clean through ~2026-09-10 means keep the setting.
+Bundling the shared census (#290) with the jitter means a clean result cannot say which one worked; that is accepted, since a block would falsify both at once.
+Deliberately **not** changed in the same round: tile order (raster → shuffled), because a second pattern change would confound the same test.
 
 **Separately, a project decision rather than an empirical claim: makelab1 is NOT an escape hatch, even though it demonstrably still works** (verified 2026-08-13: same token, same /24, 200 + 12.4 MB while makelab2 got 302).
 **Project Sidewalk serves Mapillary data off the makelab servers**, so pointing this workload at makelab1 risks earning the same per-IP block on a host that a *production research deployment* depends on.
@@ -288,7 +339,7 @@ changing `catalog_backup.py` will actually be reading, in
 The launch pass derives the per-IP hosts its in-flight children hold from `CHANNEL_HOSTS` and defers any channel that intersects them, so Overpass, the Mapillary tile CDN and KartaView each see **at most one talker from this process at a time** — the same as before.
 The child-side cross-process lock (#208) is untouched and still covers the manual runs the parent cannot see.
 **(2) Pacing and budgets are per channel and unchanged**: each child keeps its own limiter, and the combined Mapillary per-IP ceiling stays 3,500/day.
-The binding Mapillary constraint is multi-day *volume* (#241), which intra-night packing does not move — a night collects the same cities and spends the same tiles, sooner.
+Whatever the binding Mapillary constraint turns out to be, intra-night packing does not move it — a night collects the same cities and spends the same tiles, sooner. (This read "multi-day *volume* (#241)" until block 3 retired that; the argument never depended on which hypothesis was live.)
 **(3) The only observable change is wall clock.**
 The one place this is not free is the pair Google meters per Cloud **project** rather than per IP: `gsv` and `gsv_streets` declare no host, so nothing serializes them, and running them concurrently presents 48k + 24k req/min.
 That is safe **only if the two keys live in separate projects**, which this repo does not record anywhere — it is a Google Cloud Console check before the knob is raised, and a shared project must be fixed by splitting the keys rather than by declaring a fake host (a fake `CHANNEL_HOSTS` entry would couple the night-level breaker to something that is not a host refusal).

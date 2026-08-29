@@ -62,13 +62,14 @@ from .download_common import (
     HostBusyError,
     HostUnavailableError,
     host_exit_code,
+    jitter_fraction,
 )
 from .download_kartaview import (
     DEFAULT_REQUEST_TIMEOUT_S,
     DEFAULT_SWEEP_REQUESTS_PER_MINUTE,
     SweepIncompleteError,
 )
-from .download_mapillary import DEFAULT_TILE_REQUESTS_PER_MINUTE
+from .download_mapillary import DEFAULT_TILE_JITTER, DEFAULT_TILE_REQUESTS_PER_MINUTE
 from .fileutils import load_city_csv_file
 from .json_summarizer import (
     generate_aggregate_v2,
@@ -374,6 +375,22 @@ def parse_args():
              and exceeding it blocks the whole host — every Mapillary channel
              at once, including the nightly scheduler's. Default
              {DEFAULT_TILE_REQUESTS_PER_MINUTE}; 0 disables pacing.""",
+    )
+
+    concurrency_group.add_argument(
+        "--mapillary-jitter",
+        type=jitter_fraction,
+        default=DEFAULT_TILE_JITTER,
+        help=f"""Randomize the gap between Mapillary tile requests (mapillary
+             provider only): each gap is a floor of (1 - this) x the mean plus
+             an exponential tail scaled to this, so the mean rate is unchanged
+             and this number is the gaps' coefficient of variation (1.0 is an
+             organic client's Poisson arrivals). A saturated token bucket emits
+             tiles at an exact cadence, and after three per-IP blocks that
+             regularity is the one property of our traffic never changed between
+             restarts — rate and daily volume were both falsified as the trigger
+             (issue #292). Default {DEFAULT_TILE_JITTER}; 0 restores the exact
+             cadence.""",
     )
 
     concurrency_group.add_argument(
@@ -799,6 +816,7 @@ async def _collect_one_run(conn, args, city_row, run_date, provider, config, vis
                 output_csv_gz_path=output_csv_gz_path,
                 request_timeout=request_timeout,
                 max_requests_per_minute=args.mapillary_max_requests_per_minute,
+                jitter=args.mapillary_jitter,
                 checkpoint_path=checkpoint_path,
                 # The channel again, this time INSIDE the commit record: the
                 # path separates channels only as long as every caller derives

@@ -224,6 +224,46 @@ def test_mapillary_tile_pace_defaults_to_the_conservative_tile_rate(monkeypatch,
     assert calls[0]["max_requests_per_minute"] == DEFAULT_TILE_REQUESTS_PER_MINUTE
 
 
+def test_mapillary_jitter_threads_to_the_downloader(monkeypatch, catalog):
+    """The jitter is the axis under test after three per-IP blocks (issue #292):
+    the flag must reach the downloader."""
+    conn, city_id, data_dir = catalog
+    calls = []
+    gsv_configs(monkeypatch)
+    monkeypatch.setattr(cli, "download_mapillary_metadata_async", _mapillary_stub(calls))
+
+    exit_code = run_cli(
+        monkeypatch, city_id, data_dir, "--mapillary-jitter", "0.25", provider="mapillary"
+    )
+    assert exit_code == 0
+    assert calls[0]["jitter"] == pytest.approx(0.25)
+
+
+def test_mapillary_jitter_defaults_on(monkeypatch, catalog):
+    """Leaving the flag unset must mean the jittered default, never the
+    metronome — the exact cadence is the pattern under test."""
+    from streetscape_metadata_tracker.download_mapillary import DEFAULT_TILE_JITTER
+
+    conn, city_id, data_dir = catalog
+    calls = []
+    gsv_configs(monkeypatch)
+    monkeypatch.setattr(cli, "download_mapillary_metadata_async", _mapillary_stub(calls))
+
+    assert run_cli(monkeypatch, city_id, data_dir, provider="mapillary") == 0
+    assert calls[0]["jitter"] == DEFAULT_TILE_JITTER
+    assert DEFAULT_TILE_JITTER > 0
+
+
+def test_a_jitter_of_one_or_more_is_refused_at_parse_time(monkeypatch, catalog):
+    """1 admits a zero gap — an unpaced burst against the tile CDN — so argparse
+    exits 2 before any request, rather than the limiter raising mid-city."""
+    conn, city_id, data_dir = catalog
+    gsv_configs(monkeypatch)
+    with pytest.raises(SystemExit) as exc:
+        run_cli(monkeypatch, city_id, data_dir, "--mapillary-jitter", "1", provider="mapillary")
+    assert exc.value.code == 2
+
+
 def test_same_run_date_is_noop(monkeypatch, catalog):
     conn, city_id, data_dir = catalog
     db.register_run(conn, city_id=city_id, run_date=RUN_DATE, csv_filename=run_filename(city_id))

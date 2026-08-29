@@ -7,7 +7,9 @@ live here so provider-specific downloaders (`download_gsv.py`,
 provider importing from another's module.
 """
 
+import argparse
 import asyncio
+import random
 import re
 from collections.abc import Callable, Iterator
 from datetime import datetime
@@ -168,6 +170,16 @@ def host_exit_code(error: HostUnavailableError) -> int:
     return HOST_EXIT_CODES[error.host]
 
 
+def _unit_exponential() -> float:
+    """A draw from the unit exponential distribution (mean 1, CV 1).
+
+    The default jitter sampler for :class:`AsyncRateLimiter` (issue #292).
+    ``lambd`` is passed explicitly because it only became optional in Python
+    3.12 and this project still runs on 3.11.
+    """
+    return random.expovariate(1.0)
+
+
 class AsyncRateLimiter:
     """
     Token-bucket rate limiter for provider APIs with a per-minute quota
@@ -182,18 +194,83 @@ class AsyncRateLimiter:
     aggregate rate holds no matter how many tasks call ``acquire()``
     concurrently.
 
+    With ``jitter > 0`` the bucket is replaced by a **spaced pacer**
+    (issue #292): each acquisition waits out the previous one's gap, and the
+    gap is drawn from a *shifted exponential* around the mean gap
+    ``m = 60 / max_per_minute``::
+
+        gap = m * ((1 - jitter) + jitter * Exponential(1))
+
+    i.e. a fixed floor of ``(1 - jitter) * m`` plus an exponential tail scaled
+    to ``jitter * m``. A saturated token bucket emits at an exact ``m`` cadence,
+    which is the one property of our Mapillary traffic that three per-IP blocks
+    left untested (rate and daily volume were both falsified, #286).
+
+    Why *this* distribution rather than the uniform draw #292 first shipped:
+    an organic client's request arrivals are Poisson, whose inter-arrival gaps
+    are exponential with a **coefficient of variation of 1.0**. A uniform draw
+    on ``[1 - j, 1 + j]`` reaches only ``j / sqrt(3)`` (0.35 at j = 0.6) and,
+    worse, keeps a hard ceiling — under it no pause ever exceeds ``(1 + j) * m``,
+    so a scorer reading gap *statistics* rather than gap *equality* sees nearly
+    what the metronome showed it. The shifted exponential is memoryless above
+    the floor, is unbounded above, and has ``CV = jitter`` exactly.
+
+    Every invariant the uniform version had is preserved, which is why the
+    parameter did not have to change meaning:
+
+    * **Mean gap is exactly** ``m`` (``E[Exponential(1)] = 1``), so the mean rate
+      is still ``max_per_minute`` and the daily budgets and the rate-derived
+      scheduler timeout keep their arithmetic. The tail widens the *variance* of
+      a run's wall clock, not its expectation: over a 1,750-request night the
+      standard deviation of the total is ``sqrt(N) * jitter * m`` — under a
+      minute against ~44, far inside ``_TIMEOUT_HEADROOM``. The gap is
+      deliberately **not** capped: a cap is a ceiling, and the ceiling is the
+      artifact being removed.
+    * **Minimum gap is exactly** ``(1 - jitter) * m``, so ``jitter`` still reads
+      as "how far below the mean a gap may fall" and the ``jitter < 1`` bound is
+      literally what keeps the gap above zero — at ``jitter = 1`` the floor
+      vanishes and the draw admits an unpaced burst.
+    * ``jitter = 0`` collapses the draw to a constant ``m``, so the pacer is
+      continuous with the token bucket it replaces (and is short-circuited to it
+      anyway, byte for byte, so GSV and KartaView are untouched).
+
+    Because the pacer is FIFO under one lock, ``connection_limit`` concurrency
+    cannot smooth the jitter back out.
+
     Usage:
         limiter = AsyncRateLimiter(24_000)  # 80% of the 30k/min quota
         await limiter.acquire()             # before each request
+
+        # 40/min: gaps floored at 0.6 s, mean 1.5 s, p99 ~4.7 s, no ceiling
+        limiter = AsyncRateLimiter(40, jitter=0.6)
     """
 
-    def __init__(self, max_per_minute: int, time_func: Callable[[], float] | None = None):
+    def __init__(
+        self,
+        max_per_minute: int,
+        time_func: Callable[[], float] | None = None,
+        *,
+        jitter: float = 0.0,
+        draw_func: Callable[[], float] | None = None,
+    ):
         """
         Args:
             max_per_minute: Maximum acquisitions per minute; <= 0 disables.
             time_func: Monotonic clock returning seconds (defaults to the
                 running event loop's clock). Injectable for tests.
+            jitter: Fraction in ``[0, 1)``. 0 keeps the token bucket; anything
+                above switches to the spaced pacer, and is both the exponential
+                tail's share of the mean gap and the resulting coefficient of
+                variation. 1 or more would erase the floor and admit a zero gap,
+                i.e. an unpaced burst, so it is refused.
+            draw_func: ``() -> float`` sampler from the **unit exponential**
+                distribution (mean 1), used for the jitter. Defaults to
+                :func:`random.expovariate`. Injectable for deterministic tests;
+                a caller that substitutes a differently-scaled distribution
+                breaks the mean-rate guarantee above.
         """
+        if not 0.0 <= jitter < 1.0:
+            raise ValueError(f"jitter must be in [0, 1), got {jitter!r}")
         self._enabled = max_per_minute > 0
         self._rate = max_per_minute / 60.0  # tokens per second
         self._capacity = max(self._rate, 1.0)  # ~1 second of burst
@@ -201,6 +278,11 @@ class AsyncRateLimiter:
         self._time_func = time_func
         self._last_refill: float | None = None
         self._lock = asyncio.Lock()
+        self.jitter = jitter
+        self._draw = draw_func or _unit_exponential
+        # Spaced-pacer state: the clock time the next request may go out. None
+        # until the first acquisition, which never waits.
+        self._next_at: float | None = None
 
     def _now(self) -> float:
         if self._time_func is not None:
@@ -210,6 +292,9 @@ class AsyncRateLimiter:
     async def acquire(self) -> None:
         """Block until a request token is available (no-op when disabled)."""
         if not self._enabled:
+            return
+        if self.jitter > 0:
+            await self._acquire_spaced()
             return
         async with self._lock:
             now = self._now()
@@ -228,6 +313,77 @@ class AsyncRateLimiter:
             await asyncio.sleep(wait)
             self._last_refill = self._now()
             self._tokens = 0.0
+
+    async def _acquire_spaced(self) -> None:
+        # Sleep while holding the lock, for the same reason as the bucket: the
+        # waiters behind this one must queue behind its gap anyway, and the
+        # gap is drawn AFTER the sleep so every request's delay is fresh
+        # randomness rather than one draw replayed by a burst of waiters.
+        async with self._lock:
+            now = self._now()
+            if self._next_at is not None and self._next_at > now:
+                await asyncio.sleep(self._next_at - now)
+                now = self._now()
+            # Shifted exponential: a fixed (1 - jitter) floor plus an
+            # exponential tail scaled to jitter. Mean is exactly the mean gap
+            # because E[Exponential(1)] = 1; see the class docstring.
+            mean_gap = 1.0 / self._rate
+            gap = mean_gap * ((1.0 - self.jitter) + self.jitter * self._draw())
+            self._next_at = now + gap
+
+
+def jitter_fraction(value: str) -> float:
+    """
+    argparse type for a pacing jitter: a float in ``[0, 1)`` (issue #292).
+
+    Shared by both CLIs' ``--mapillary-jitter`` so the two cannot drift on what
+    the bound is, and by ``scheduler.load_scheduler_config`` through
+    :func:`coerce_jitter` so a config file cannot smuggle past it either. 1 or
+    more erases :class:`AsyncRateLimiter`'s gap floor and admits a zero gap — an
+    unpaced burst against the per-IP tile CDN — so it is refused at parse time
+    rather than at the first request.
+
+    Usage:
+        parser.add_argument("--mapillary-jitter", type=jitter_fraction, default=0.6)
+    """
+    try:
+        number = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"must be a number, got {value!r}") from None
+    if not 0.0 <= number < 1.0:
+        raise argparse.ArgumentTypeError(f"must be in [0, 1), got {number}")
+    return number
+
+
+def coerce_jitter(value: object) -> float | None:
+    """
+    The scheduler-config half of :func:`jitter_fraction`: coerce a TOML value to
+    a valid jitter, or ``None`` if it is not one (issue #292).
+
+    Lives here, beside the argparse type and the limiter's own guard, so the
+    three cannot disagree about what a valid jitter is. Returns ``None`` rather
+    than raising because the caller's fallback for a bad field is "use the
+    collector's own default", which is what ``None`` means downstream — and
+    never ``0``, which means "restore the exact cadence".
+
+    Usage:
+        jitter = coerce_jitter(p.get("jitter"))  # None on absent or invalid
+    """
+    if value is None:
+        return None
+    # bool BEFORE float(): a bool is an int, so `jitter = false` would coerce to
+    # a perfectly valid 0.0 and silently mean "restore the metronome" — a
+    # reading of that TOML nobody writing it intends, and the one wrong answer
+    # here that runs a whole night without complaining.
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if not 0.0 <= number < 1.0:
+        return None
+    return number
 
 
 # Credential-bearing query parameters (GSV's key=, Mapillary's

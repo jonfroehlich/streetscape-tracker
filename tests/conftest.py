@@ -189,7 +189,7 @@ def _no_mapillary_tile_pacing(monkeypatch):
     from streetscape_metadata_tracker import download_mapillary as dm
 
     class _NoPacing:
-        def __init__(self, max_per_minute):
+        def __init__(self, max_per_minute, *args, **kwargs):
             pass
 
         async def acquire(self):

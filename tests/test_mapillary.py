@@ -1187,12 +1187,17 @@ def _failing_fetch(fail_xy, tiles_by_xy=None, status=404):
     return fake_fetch
 
 
-def _fetch_city(monkeypatch, fetch, lat, lon, width=30000, height=30000, step=2000):
-    """Run a whole-city fetch with ``fetch`` standing in for one tile request."""
+def _fetch_city(monkeypatch, fetch, lat, lon, width=30000, height=30000, step=2000, **kwargs):
+    """Run a whole-city fetch with ``fetch`` standing in for one tile request.
+
+    ``kwargs`` reach ``fetch_city_images_async`` verbatim, so a test can pin a
+    non-default pacing argument all the way to the limiter rather than only
+    pinning the module default.
+    """
     _stub_fetch_tile(monkeypatch, fetch)
     return asyncio.run(
         dm.fetch_city_images_async(
-            "Test City", dm.grid_bbox(lat, lon, width, height, step), "MLY|test|token"
+            "Test City", dm.grid_bbox(lat, lon, width, height, step), "MLY|test|token", **kwargs
         )
     )
 
@@ -1468,7 +1473,7 @@ def test_every_tile_request_passes_through_the_rate_limiter(monkeypatch, straddl
     acquires = []
 
     class _SpyLimiter:
-        def __init__(self, max_per_minute):
+        def __init__(self, max_per_minute, *args, **kwargs):
             self.max_per_minute = max_per_minute
 
         async def acquire(self):
@@ -1487,6 +1492,41 @@ def test_the_default_pace_is_well_under_the_rate_that_got_us_banned():
     it must stay a conservative one — this is the guard on someone 'tuning' it
     up without new evidence about where the real ceiling is."""
     assert 0 < dm.DEFAULT_TILE_REQUESTS_PER_MINUTE <= 120
+
+
+def test_the_tile_limiter_is_built_jittered(monkeypatch, straddling_city):
+    """Issue #292: the census builds its limiter with the jitter it was given,
+    and the module default is non-zero — a saturated token bucket's exact
+    cadence is the one property of our traffic three blocks never changed.
+
+    Both halves matter, and the second is the one a green suite missed before:
+    pinning only the default lets the construction site hardcode
+    ``DEFAULT_TILE_JITTER`` and ignore its argument, which would silently
+    disable ``--mapillary-jitter 0`` — this experiment's CONTROL arm — and every
+    per-channel config override with it. The rate is pinned the same way for the
+    same reason.
+    """
+    lat, lon = straddling_city
+    built = []
+
+    class _Recording:
+        def __init__(self, max_per_minute, *args, **kwargs):
+            built.append((max_per_minute, kwargs.get("jitter")))
+
+        async def acquire(self):
+            return None
+
+    monkeypatch.setattr(dm, "AsyncRateLimiter", _Recording)
+
+    _fetch_city(monkeypatch, _failing_fetch(set()), lat, lon)
+    assert built == [(dm.DEFAULT_TILE_REQUESTS_PER_MINUTE, dm.DEFAULT_TILE_JITTER)]
+    assert 0 < dm.DEFAULT_TILE_JITTER < 1
+
+    # ...and a caller's own values, including the metronome the control arm asks
+    # for, must survive the trip instead of being replaced by those defaults.
+    built.clear()
+    _fetch_city(monkeypatch, _failing_fetch(set()), lat, lon, jitter=0.0, max_requests_per_minute=7)
+    assert built == [(7, 0.0)]
 
 
 class _SequencedTileSession:
