@@ -49,7 +49,7 @@ from . import (
     open_in_browser,
 )
 from .analysis import calculate_run_stats, detect_systemic_failure, print_df_summary
-from .checkpointing import checkpoint_path_for, discard_checkpoint
+from .checkpointing import census_cache_path_for, checkpoint_path_for, discard_checkpoint
 from .city_registration import (
     CityResolutionError,
     cap_dimensions,
@@ -297,6 +297,19 @@ def parse_args():
     )
     run_group.add_argument(
         "--force", action="store_true", help="Collect even if a recent run exists"
+    )
+    run_group.add_argument(
+        "--refetch-census",
+        action="store_true",
+        help="""Ask the provider again instead of reusing a census another
+             channel already fetched for this city and bbox (mapillary and
+             kartaview only, issue #290). DELIBERATELY SEPARATE FROM --force:
+             --force is about this run DATE's artifacts, and a collection whose
+             tail crashed after writing its CSV is re-run with --force and must
+             re-finalize for zero requests rather than re-pay a census it
+             already bought. This flag is about the OBSERVATION, for an operator
+             who wants it taken now. A refetch still promotes its result, so the
+             consumers behind it get the fresher census.""",
     )
     run_group.add_argument(
         "--min-days-since-last-run",
@@ -754,18 +767,23 @@ async def _collect_one_run(conn, args, city_row, run_date, provider, config, vis
     # different credentials (#239, #256). GSV resumes through a `.downloading`
     # sibling of its output instead and needs nothing here.
     checkpoint_path = None
+    # The SHARED census cache (issue #290), built beside the checkpoint path and
+    # keyed deliberately unlike it: no channel, no variant, no date, because the
+    # census content depends on (provider, frozen bbox, when fetched) and nothing
+    # else. That is what lets the paired road walk -- which sweeps this exact
+    # bbox minutes later -- read this run's census for zero requests instead of
+    # buying a second copy against the same per-IP limit.
+    cache_path = None
     if provider in ("mapillary", "kartaview"):
-        checkpoint_path = checkpoint_path_for(
-            city_row.city_id,
-            grid_bbox(
-                city_row.center_lat,
-                city_row.center_lon,
-                city_row.grid_width_m,
-                city_row.grid_height_m,
-                city_row.step_m,
-            ),
-            provider,
+        bbox = grid_bbox(
+            city_row.center_lat,
+            city_row.center_lon,
+            city_row.grid_width_m,
+            city_row.grid_height_m,
+            city_row.step_m,
         )
+        checkpoint_path = checkpoint_path_for(city_row.city_id, bbox, provider)
+        cache_path = census_cache_path_for(provider, city_row.city_id, bbox)
 
     try:
         if provider == "mapillary":
@@ -786,6 +804,8 @@ async def _collect_one_run(conn, args, city_row, run_date, provider, config, vis
                 # it correctly, so the state file also records which ledger its
                 # spend belongs to and refuses to resume another's.
                 checkpoint_channel=provider,
+                cache_path=cache_path,
+                reuse_census=not args.refetch_census,
             )
         elif provider == "kartaview":
             dict_results = await download_kartaview_metadata_async(
@@ -806,6 +826,8 @@ async def _collect_one_run(conn, args, city_row, run_date, provider, config, vis
                 # derives it correctly, so the state file also records which
                 # ledger its spend belongs to and refuses to resume another's.
                 checkpoint_channel=provider,
+                cache_path=cache_path,
+                reuse_census=not args.refetch_census,
             )
         elif provider == "gsv":
             logging.info(
@@ -877,6 +899,14 @@ async def _collect_one_run(conn, args, city_row, run_date, provider, config, vis
 
     print(f"\nDownload Summary for {city_row.display_name} [{provider}]")
     print("=" * 50)
+    # Said out loud, because a reused census is otherwise invisible in the
+    # artifact: the run collected a whole city and issued no request (#290).
+    if dict_results.get("census_reused"):
+        print(
+            f"Census REUSED from the shared cache: fetched by "
+            f"{dict_results.get('census_fetched_by')}, crawl started "
+            f"{dict_results.get('census_fetched_at')}. 0 requests issued."
+        )
     print_df_summary(df, provider=provider)
 
     # Catalog the run
@@ -911,6 +941,12 @@ async def _collect_one_run(conn, args, city_row, run_date, provider, config, vis
         # Flat-image census (issue #116) is a Mapillary downloader artifact,
         # not derivable from the CSV — GSV runs omit it (stored NULL).
         num_flat_images=dict_results.get("num_flat_images"),
+        # Which channel actually paid for this census and when it observed the
+        # provider (issue #290). On a cross-channel reuse api_requests above is
+        # 0, and these two are the only thing that makes a fully collected city
+        # with a zero-cost run legible. NULL for gsv, which has no census.
+        census_fetched_by=dict_results.get("census_fetched_by"),
+        census_fetched_at=dict_results.get("census_fetched_at"),
         **stats,
     )
 

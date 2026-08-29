@@ -87,9 +87,13 @@ enabled = false
 # threshold somewhere in (7,061, 10,766]). Budgets are cut so the combined
 # 2-day sum can never exceed 7,000, the highest value ever observed clean:
 # 1,750 here + 1,750 on mapillary_streets = 3,500/day, split EVENLY because
-# both channels read the identical z14 census (a road walk re-reads the grid
-# run's tiles), so the two budgets deplete in lockstep and a heavy slate
-# defers the same cities on both channels instead of un-pairing them. A
+# both channels read the identical z14 census. SINCE #290 THE WALK NO LONGER
+# RE-READS THOSE TILES: it reuses the grid run's census for 0 requests on a
+# paired night, so mapillary_streets' budget is spent only on nights the two
+# are NOT paired. The values are unchanged — re-sizing them for the lighter
+# load is #286's question. The even split still matters for the un-paired
+# case, where the two budgets deplete in lockstep and a heavy slate defers the
+# same cities on both channels instead of un-pairing them further. A
 # normal 20-city night (~1,150 tiles per channel) fits; a catch-up-scale
 # burst is impossible by construction, ON PURPOSE -- no `--limit` catch-ups until a rolling
 # multi-day guard exists (#241). Recovery recipe, measured twice: full
@@ -134,8 +138,9 @@ spacing_m = 15
 # against the per-app cap: different tokens, one address, so the number that
 # matters is the SUM -- 1,750 + 1,750 = 3,500/day as of 2026-08-22; see the
 # issue #241 note in [providers.mapillary]. Split evenly: a road walk reads
-# the identical tile census as the grid run, so a paired night costs the
-# same on each channel and the budgets deplete in lockstep.
+# the identical tile census as the grid run. Since #290 it REUSES that census
+# rather than re-reading it, so on a paired night this channel spends nothing
+# and this budget is drawn on only when the pair is split apart.
 # PAUSED 2026-08-28 with [providers.mapillary] — same IP, same tile CDN, so
 # pausing one and not the other would keep the host under exactly the load the
 # pause exists to stop. Re-enable the pair together.

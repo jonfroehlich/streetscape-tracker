@@ -314,6 +314,16 @@ Two rules for manual work:
 2. **A leftover `locks/*.lock` file is not a held lock.** `flock` is released by
    the kernel when the process dies, SIGKILL included. Do not delete lock files
    to "unstick" anything — check `locks/*.lock.owner` for the pid instead.
+3. **`census_cache/` is a fourth runtime-state sibling and needs no unit change**
+   (issue #290). A completed Mapillary or KartaView census is promoted out of
+   `checkpoints/` into it so the paired road walk reads it for zero requests, and
+   like `checkpoints/` and `locks/` it lives under the project root, which
+   `ReadWritePaths` already covers; `STREETSCAPE_CENSUS_CACHE_DIR` is not set in
+   the unit, deliberately, so both the scheduler and a manual run derive the same
+   default. Do not move it under `data/` — that directory is rsynced to the
+   public web server. The nightly tail prunes entries past the 7-day reuse
+   window; if you ever need to clear it by hand, deleting the whole directory
+   costs nothing but a re-fetch.
 
 Exit codes a collection child uses to report a host-level condition. The
 blocked/busy split matters: the two have opposite lifetimes, and `run-due`

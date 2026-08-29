@@ -19,7 +19,7 @@ that join trustworthy:
 import gzip
 import json
 import os
-from datetime import date
+from datetime import UTC, date, datetime
 
 import geopandas as gpd
 import pytest
@@ -27,7 +27,12 @@ from shapely.geometry import LineString
 
 from streetscape_metadata_tracker import db
 from streetscape_metadata_tracker import download_gsv as dg
-from streetscape_metadata_tracker.checkpointing import checkpoint_path_for
+from streetscape_metadata_tracker.checkpointing import (
+    CENSUS_CACHE_FORMAT_VERSION,
+    CENSUS_CACHE_MARKER,
+    census_cache_path_for,
+    checkpoint_path_for,
+)
 from streetscape_metadata_tracker.download_common import grid_bbox
 from streetscape_metadata_tracker.download_mapillary import (
     DEFAULT_TILE_REQUESTS_PER_MINUTE,
@@ -73,7 +78,17 @@ def _image(image_id, lat, lon, *, is_pano=True, captured_at_ms=1655000000000, cr
     }
 
 
-def _setup(tmp_path, monkeypatch, images, *, api_requests=7, api_requests_total=None):
+def _setup(
+    tmp_path,
+    monkeypatch,
+    images,
+    *,
+    api_requests=7,
+    api_requests_total=None,
+    census_fetched_by=None,
+    census_fetched_at=None,
+    census_reused=None,
+):
     """Data dir + catalog with one city; edges and the tile census served locally."""
     data_dir = str(tmp_path)
     conn = db.connect(db.get_default_db_path(data_dir))
@@ -101,6 +116,8 @@ def _setup(tmp_path, monkeypatch, images, *, api_requests=7, api_requests_total=
         calls["checkpoint_path"] = kwargs.get("checkpoint_path")
         calls["checkpoint_channel"] = kwargs.get("checkpoint_channel")
         calls["checkpoint_variant"] = kwargs.get("checkpoint_variant")
+        calls["cache_path"] = kwargs.get("cache_path")
+        calls["reuse_census"] = kwargs.get("reuse_census")
         return {
             "census": records_to_census(images),
             # Per-process spend and the crawl's cumulative spend are different
@@ -115,6 +132,15 @@ def _setup(tmp_path, monkeypatch, images, *, api_requests=7, api_requests_total=
             "checkpoint_path": kwargs.get("checkpoint_path"),
             "tiles": 7,
             "raw_feature_count": len(images),
+            # Census provenance (#290). Defaults mimic an ordinary fresh fetch:
+            # this channel paid, and nothing was reused.
+            "census_fetched_by": census_fetched_by or kwargs.get("checkpoint_channel"),
+            "census_fetched_at": census_fetched_at,
+            "census_reused": (
+                bool(census_fetched_by and census_fetched_by != kwargs.get("checkpoint_channel"))
+                if census_reused is None
+                else census_reused
+            ),
         }
 
     monkeypatch.setattr(cm, "fetch_city_images_async", fake_fetch_images)
@@ -621,3 +647,216 @@ def test_a_walk_whose_tail_dies_still_records_what_the_census_cost(tmp_path, mon
     assert db.get_api_usage(conn, date(2026, 7, 8), provider="mapillary_streets") == 11, (
         "the tiles were bought; the ledger has to know even though the walk failed"
     )
+
+
+# --- The shared census cache (issue #290) -----------------------------------
+#
+# A Mapillary walk and its city's grid run read the IDENTICAL z14 census over
+# the IDENTICAL frozen bbox — that identity is stated a few tests up, as the
+# reason the two need separate CHECKPOINTS. Here it is the point rather than the
+# hazard: on a paired night the grid run pays and the walk reads its census for
+# zero requests, and `--network-type all_public` becomes free rather than a
+# third copy.
+
+
+def test_the_walk_reaches_the_provider_keyed_cache_the_grid_run_writes(tmp_path, monkeypatch):
+    """
+    The two path builders, side by side, because both mistakes are silent. The
+    CHECKPOINT path keys the channel and the network type (a shared one would
+    let two crawls resume each other's spend into the wrong ledger); the CACHE
+    path keys NEITHER (a channel-keyed one would never reuse anything, and every
+    census would still be bought twice with nothing failing).
+    """
+    images = [_image("p1", 44.05, -121.30)]
+    data_dir, calls = _setup(tmp_path, monkeypatch, images)
+
+    assert collect.run_collect(_args(data_dir)) == 0
+
+    bbox = grid_bbox(44.05, -121.30, 200, 200, 20)
+    assert calls["cache_path"] == census_cache_path_for("mapillary", CITY_ID, bbox)
+    assert calls["cache_path"] == census_cache_path_for("mapillary", CITY_ID, bbox), (
+        "and the grid run resolves to the very same entry"
+    )
+    assert calls["cache_path"] != calls["checkpoint_path"]
+    assert calls["reuse_census"] is True
+
+
+def test_a_reused_census_costs_the_street_ledger_nothing_and_says_who_paid(tmp_path, monkeypatch):
+    """
+    The zero has to be legible. `street_walks.api_requests = 0` on a fully
+    walked city reads as a bug unless the row also records that the `mapillary`
+    channel bought the census — which is what the v14 provenance columns are.
+    """
+    images = [_image("p1", 44.05, -121.30)]
+    data_dir, _ = _setup(
+        tmp_path,
+        monkeypatch,
+        images,
+        api_requests=0,
+        api_requests_total=0,
+        census_fetched_by="mapillary",
+        census_fetched_at="2026-07-08T01:02:03+00:00",
+    )
+
+    assert collect.run_collect(_args(data_dir)) == 0
+
+    conn = db.connect(db.get_default_db_path(data_dir))
+    walk = db.get_latest_street_walk(conn, CITY_ID, provider="mapillary")
+    assert walk["api_requests"] == 0
+    assert walk["census_fetched_by"] == "mapillary"
+    assert walk["census_fetched_at"] == "2026-07-08T01:02:03+00:00"
+    assert db.get_api_usage(conn, date(2026, 7, 8), provider="mapillary_streets") == 0
+    assert db.get_api_usage(conn, date(2026, 7, 8), provider="mapillary") == 0, (
+        "and the walk must never charge the channel that actually paid"
+    )
+
+
+def test_a_reused_census_stamps_its_rows_with_when_mapillary_was_observed(tmp_path, monkeypatch):
+    """
+    Every row of a reused census was fetched by another collection, possibly on
+    an earlier night, so stamping `query_timestamp` with this process's clock
+    would record an observation that never happened — and json_summarizer reports
+    the run's start/end from exactly that column.
+    """
+    images = [_image("p1", 44.05, -121.30)]
+    observed = "2026-07-07T22:15:00+00:00"
+    data_dir, _ = _setup(
+        tmp_path, monkeypatch, images, census_fetched_by="mapillary", census_fetched_at=observed
+    )
+
+    assert collect.run_collect(_args(data_dir)) == 0
+    with gzip.open(os.path.join(data_dir, _csv_name()), "rt") as fh:
+        rows = fh.read()
+    assert observed in rows
+
+
+def test_a_freshly_fetched_census_keeps_this_processs_clock(tmp_path, monkeypatch):
+    """
+    The other side, and the reason the restamp is gated on REUSE rather than on
+    the provenance being present at all: a fresh crawl's rows were observed now,
+    and #256's byte-identity contract between an interrupted census and an
+    uninterrupted one is written against `started_at`.
+    """
+    images = [_image("p1", 44.05, -121.30)]
+    crawl_start = "2026-07-01T00:00:00+00:00"
+    data_dir, _ = _setup(
+        tmp_path,
+        monkeypatch,
+        images,
+        census_fetched_by="mapillary_streets",
+        census_fetched_at=crawl_start,
+        census_reused=False,
+    )
+
+    assert collect.run_collect(_args(data_dir)) == 0
+    with gzip.open(os.path.join(data_dir, _csv_name()), "rt") as fh:
+        rows = fh.read()
+    assert crawl_start not in rows
+
+
+def test_refetch_census_tells_the_collector_not_to_reuse(tmp_path, monkeypatch):
+    """
+    Deliberately separate from --force, which is about this run date's
+    artifacts: a walk whose tail died after writing its CSV is re-run with
+    --force and must re-finalize for zero requests rather than re-pay a census
+    it already bought.
+    """
+    images = [_image("p1", 44.05, -121.30)]
+    data_dir, calls = _setup(tmp_path, monkeypatch, images)
+
+    assert collect.run_collect(_args(data_dir, **{"refetch-census": True})) == 0
+    assert calls["reuse_census"] is False
+
+
+def test_force_leaves_the_cache_alone(tmp_path, monkeypatch):
+    images = [_image("p1", 44.05, -121.30)]
+    data_dir, calls = _setup(tmp_path, monkeypatch, images)
+
+    assert collect.run_collect(_args(data_dir)) == 0
+    assert collect.run_collect(_args(data_dir, **{"force": True})) == 0
+    assert calls["reuse_census"] is True, "--force is about artifacts, not observations"
+
+
+def test_gsv_never_probes_the_cache(tmp_path, monkeypatch):
+    """
+    GSV queries per point; there is no census to share, so the probe must answer
+    None rather than pricing a gsv_streets walk at zero off a Mapillary entry
+    that happens to exist for the same city.
+    """
+    images = [_image("p1", 44.05, -121.30)]
+    data_dir, _ = _setup(tmp_path, monkeypatch, images)
+    conn = db.connect(db.get_default_db_path(data_dir))
+    city = db.resolve_city(conn, CITY_QUERY)
+    bbox = grid_bbox(
+        city.center_lat, city.center_lon, city.grid_width_m, city.grid_height_m, city.step_m
+    )
+    _stamp_cache_entry(census_cache_path_for("mapillary", CITY_ID, bbox))
+
+    assert collect._cached_census_marker(city, "gsv", _args(data_dir)) is None
+    assert collect._cached_census_marker(city, "mapillary", _args(data_dir)) is not None
+    # --refetch-census prices the fetch it is about to force, not the entry it
+    # is about to ignore.
+    forced = _args(data_dir, **{"refetch-census": True})
+    assert collect._cached_census_marker(city, "mapillary", forced) is None
+
+
+def test_estimate_prices_a_cached_census_at_zero(tmp_path, monkeypatch, capsys):
+    """
+    `--estimate` is how an operator decides whether to spend, so it has to know
+    the walk is free. It reads the marker only — a planning pass must not become
+    a disk sweep — which makes a hit a strong hint rather than a promise.
+    """
+    images = [_image("p1", 44.05, -121.30)]
+    data_dir, _ = _setup(tmp_path, monkeypatch, images)
+    conn = db.connect(db.get_default_db_path(data_dir))
+    city = db.resolve_city(conn, CITY_QUERY)
+    bbox = grid_bbox(
+        city.center_lat, city.center_lon, city.grid_width_m, city.grid_height_m, city.step_m
+    )
+    _stamp_cache_entry(census_cache_path_for("mapillary", CITY_ID, bbox))
+
+    assert collect.run_collect(_args(data_dir, estimate=True)) == 0
+    out = capsys.readouterr().out
+    assert "0 Mapillary tile requests" in out
+    assert "cached census fetched by mapillary" in out
+
+
+def test_the_budget_preflight_does_not_abort_a_free_walk(tmp_path, monkeypatch):
+    """
+    Without this the cheapest possible walk — one whose census the grid run
+    already paid for — is exactly the one a nearly-spent street budget refuses,
+    so the pairing the cache exists to exploit never happens on the nights it
+    helps most.
+    """
+    images = [_image("p1", 44.05, -121.30)]
+    data_dir, _ = _setup(tmp_path, monkeypatch, images, api_requests=0, api_requests_total=0)
+    conn = db.connect(db.get_default_db_path(data_dir))
+    city = db.resolve_city(conn, CITY_QUERY)
+    bbox = grid_bbox(
+        city.center_lat, city.center_lon, city.grid_width_m, city.grid_height_m, city.step_m
+    )
+    # A zero budget refuses any census at all, so an uncached walk aborts.
+    uncached = collect.run_collect(_args(data_dir, **{"daily-budget": 0}))
+    assert uncached == 1, "the guard still works when there is nothing to reuse"
+
+    _stamp_cache_entry(census_cache_path_for("mapillary", CITY_ID, bbox))
+    assert collect.run_collect(_args(data_dir, **{"daily-budget": 0})) == 0
+
+
+def _stamp_cache_entry(cache_path, *, fetched_by="mapillary"):
+    """A marker-only cache entry — what `census_cache_probe` reads."""
+    os.makedirs(cache_path, exist_ok=True)
+    with open(os.path.join(cache_path, CENSUS_CACHE_MARKER), "w", encoding="utf-8") as fh:
+        json.dump(
+            {
+                "format_version": CENSUS_CACHE_FORMAT_VERSION,
+                "provider": "mapillary",
+                "fetched_by": fetched_by,
+                "fetched_variant": None,
+                "crawl_started_at": datetime.now(UTC).isoformat(),
+                "completed_at": datetime.now(UTC).isoformat(),
+                "api_requests_total": 7,
+                "failed": [],
+            },
+            fh,
+        )

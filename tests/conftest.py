@@ -244,6 +244,30 @@ def _isolate_checkpoints(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_census_cache(tmp_path, monkeypatch):
+    """
+    Point the shared census cache (issue #290) at a per-test directory.
+
+    The sibling of ``_isolate_checkpoints``, and needed more urgently than it.
+    A checkpoint is deleted by its caller once the artifact lands; a COMPLETED
+    census is now promoted into ``census_cache/`` and deliberately left there
+    for the next consumer — so without this, every test that drives a census
+    provider to completion would deposit a fixture-sized entry in the working
+    tree and leave it.
+
+    Worse than untidy, it would make tests share state in the one way the
+    checkpoint isolation was written to prevent, and MORE easily: the cache key
+    is (provider, city, bbox) with no channel, no variant and no date, so any
+    two tests using one fixture city would hand each other a census — and the
+    reader is silent about it beyond a log line, because reuse is the feature.
+    A test asserting "N tile requests" would pass alone and see 0 in a suite run.
+    """
+    from streetscape_metadata_tracker import checkpointing
+
+    monkeypatch.setenv(checkpointing.CENSUS_CACHE_DIR_ENV, str(tmp_path / "census_cache"))
+
+
+@pytest.fixture(autouse=True)
 def _no_overpass_status_probe(monkeypatch):
     """
     Stub the Overpass /status pre-flight (issue #209) for the whole suite.

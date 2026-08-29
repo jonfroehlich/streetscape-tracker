@@ -18,6 +18,7 @@ import pandas as pd
 import pytest
 
 from streetscape_metadata_tracker import cli, db, naming
+from streetscape_metadata_tracker.checkpointing import census_cache_path_for
 from streetscape_metadata_tracker.city_registration import cap_dimensions
 from streetscape_metadata_tracker.download_common import (
     HOST_BUSY_EXIT_CODES,
@@ -27,6 +28,7 @@ from streetscape_metadata_tracker.download_common import (
     DownloadError,
     HostBlockedError,
     HostBusyError,
+    grid_bbox,
 )
 from streetscape_metadata_tracker.download_kartaview import SweepIncompleteError
 from streetscape_metadata_tracker.download_mapillary import DEFAULT_TILE_REQUESTS_PER_MINUTE
@@ -1124,3 +1126,175 @@ def test_check_boundary_previews_without_any_credential(monkeypatch, catalog):
 
     assert run_cli(monkeypatch, city_id, data_dir, "--check-boundary", provider="all") == 0
     assert len(saved) == 1
+
+
+# ── The shared census cache, at the CLI seam (issue #290) ──────────────────
+
+
+def _mapillary_downloader(calls, **result_overrides):
+    """A Mapillary downloader double that also echoes the #290 provenance."""
+
+    async def stub(**kwargs):
+        calls.append(kwargs)
+        path = kwargs["output_csv_gz_path"]
+        write_city_csv_gz(make_mapillary_city_df([("m1", "2024-01-01")]), path)
+        result = {
+            "df": load_city_csv_file(path),
+            "filename_with_path": path,
+            "api_requests": 12,
+            "api_requests_total": 12,
+            "checkpoint_path": None,
+            "census_fetched_by": "mapillary",
+            "census_fetched_at": "2026-06-30T22:00:00+00:00",
+            "census_reused": False,
+            "num_flat_images": 0,
+            "started_at": "2026-07-01T00:00:00+00:00",
+            "finished_at": "2026-07-01T00:05:00+00:00",
+        }
+        result.update(result_overrides)
+        return result
+
+    return stub
+
+
+def test_the_grid_run_hands_the_downloader_a_provider_keyed_cache_path(monkeypatch, catalog):
+    """
+    Built by the CALLER beside the checkpoint path, and keyed deliberately
+    unlike it: no channel, no variant, no date. That is what lets the road walk,
+    which sweeps this exact bbox minutes later, read this run's census instead of
+    buying a second copy against the same per-IP limit.
+    """
+    conn, city_id, data_dir = catalog
+    calls = []
+    gsv_configs(monkeypatch)
+    monkeypatch.setattr(cli, "download_mapillary_metadata_async", _mapillary_downloader(calls))
+
+    assert run_cli(monkeypatch, city_id, data_dir, provider="mapillary") == 0
+
+    city = db.resolve_city(conn, city_id)
+    bbox = grid_bbox(
+        city.center_lat, city.center_lon, city.grid_width_m, city.grid_height_m, city.step_m
+    )
+    assert calls[0]["cache_path"] == census_cache_path_for("mapillary", city_id, bbox)
+    assert calls[0]["cache_path"] != calls[0]["checkpoint_path"]
+    assert calls[0]["reuse_census"] is True
+
+
+def test_kartaview_gets_its_own_cache_path(monkeypatch, catalog):
+    """Two providers share a bbox and nothing else — not even a part schema."""
+    conn, city_id, data_dir = catalog
+    calls = []
+    gsv_configs(monkeypatch)
+    monkeypatch.setattr(cli, "download_kartaview_metadata_async", _mapillary_downloader(calls))
+
+    assert run_cli(monkeypatch, city_id, data_dir, provider="kartaview") == 0
+
+    city = db.resolve_city(conn, city_id)
+    bbox = grid_bbox(
+        city.center_lat, city.center_lon, city.grid_width_m, city.grid_height_m, city.step_m
+    )
+    assert calls[0]["cache_path"] == census_cache_path_for("kartaview", city_id, bbox)
+    assert calls[0]["cache_path"] != census_cache_path_for("mapillary", city_id, bbox)
+
+
+def test_gsv_gets_no_cache_path(monkeypatch, catalog):
+    """GSV queries per point; there is no census to share."""
+    conn, city_id, data_dir = catalog
+    calls = []
+    gsv_configs(monkeypatch)
+    monkeypatch.setattr(cli, "download_gsv_metadata_async", stub_downloader(calls))
+
+    assert run_cli(monkeypatch, city_id, data_dir, provider="gsv") == 0
+    assert "cache_path" not in calls[0]
+
+
+def test_refetch_census_threads_through_to_the_downloader(monkeypatch, catalog):
+    """
+    Deliberately separate from --force, which clears this run date's artifacts:
+    a collection whose tail crashed after writing its CSV is re-run with --force
+    and must re-finalize for zero requests rather than re-pay a census it
+    already bought.
+    """
+    conn, city_id, data_dir = catalog
+    calls = []
+    gsv_configs(monkeypatch)
+    monkeypatch.setattr(cli, "download_mapillary_metadata_async", _mapillary_downloader(calls))
+
+    assert run_cli(monkeypatch, city_id, data_dir, "--refetch-census", provider="mapillary") == 0
+    assert calls[0]["reuse_census"] is False
+
+
+def test_force_is_cache_transparent(monkeypatch, catalog):
+    conn, city_id, data_dir = catalog
+    calls = []
+    gsv_configs(monkeypatch)
+    monkeypatch.setattr(cli, "download_mapillary_metadata_async", _mapillary_downloader(calls))
+
+    assert run_cli(monkeypatch, city_id, data_dir, "--force", provider="mapillary") == 0
+    assert calls[0]["reuse_census"] is True
+
+
+def test_the_runs_row_records_who_paid_for_the_census(monkeypatch, catalog):
+    """
+    A cross-channel reuse writes api_requests = 0 on a fully collected city.
+    These two columns are the only thing that makes that legible rather than
+    alarming — and the reason they are stored rather than derived is that the
+    payer is a different channel and the observation is a different day.
+    """
+    conn, city_id, data_dir = catalog
+    calls = []
+    gsv_configs(monkeypatch)
+    monkeypatch.setattr(
+        cli,
+        "download_mapillary_metadata_async",
+        _mapillary_downloader(
+            calls,
+            api_requests=0,
+            api_requests_total=0,
+            census_fetched_by="mapillary_streets",
+            census_fetched_at="2026-06-29T09:00:00+00:00",
+            census_reused=True,
+        ),
+    )
+
+    assert run_cli(monkeypatch, city_id, data_dir, provider="mapillary") == 0
+
+    run = db.get_latest_run(conn, city_id, provider="mapillary")
+    assert run.api_requests == 0
+    assert run.census_fetched_by == "mapillary_streets"
+    assert run.census_fetched_at == "2026-06-29T09:00:00+00:00"
+    assert db.get_api_usage(conn, RUN_DATE, provider="mapillary") == 0
+
+
+def test_a_gsv_run_leaves_the_provenance_columns_null(monkeypatch, catalog):
+    """NULL is the honest 'not measured', not a stand-in for 'itself'."""
+    conn, city_id, data_dir = catalog
+    calls = []
+    gsv_configs(monkeypatch)
+    monkeypatch.setattr(cli, "download_gsv_metadata_async", stub_downloader(calls))
+
+    assert run_cli(monkeypatch, city_id, data_dir, provider="gsv") == 0
+    run = db.get_latest_run(conn, city_id, provider="gsv")
+    assert run.census_fetched_by is None
+    assert run.census_fetched_at is None
+
+
+def test_a_reused_census_says_so_in_the_summary(monkeypatch, catalog, capsys):
+    """
+    A run that collected a whole city and issued no request is invisible in its
+    artifact. The operator reading logs/collect_{city}_{channel}_{date}.log has
+    to be told which collection's answers are being republished.
+    """
+    conn, city_id, data_dir = catalog
+    calls = []
+    gsv_configs(monkeypatch)
+    monkeypatch.setattr(
+        cli,
+        "download_mapillary_metadata_async",
+        _mapillary_downloader(calls, api_requests=0, census_reused=True),
+    )
+
+    assert run_cli(monkeypatch, city_id, data_dir, provider="mapillary") == 0
+    out = capsys.readouterr().out
+    assert "Census REUSED" in out
+    assert "fetched by mapillary" in out

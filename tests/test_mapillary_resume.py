@@ -31,9 +31,11 @@ import pytest
 import yarl
 from multidict import CIMultiDict, CIMultiDictProxy
 
+from streetscape_metadata_tracker import checkpointing as dm_checkpointing
 from streetscape_metadata_tracker import download_mapillary as dm
 from streetscape_metadata_tracker.checkpointing import (
     CHECKPOINT_STATE_FILENAME,
+    census_cache_path_for,
     checkpoint_path_for,
 )
 from streetscape_metadata_tracker.download_common import HOST_MAPILLARY_TILES, HostBlockedError
@@ -826,3 +828,476 @@ def test_the_two_network_types_get_different_checkpoint_directories():
 
 def _state_file(path):
     return os.path.join(path, CHECKPOINT_STATE_FILENAME)
+
+
+# ── The shared census cache (issue #290) ───────────────────────────────────
+#
+# A checkpoint protects ONE crawl; the cache lets every other consumer of that
+# (provider, city, bbox) observation reuse the finished result. For Mapillary
+# that is the grid run, the road walk, and a second walk at another
+# --network-type — three identical tile censuses, each previously paid for
+# against the same per-IP limit that has blocked this host three times.
+#
+# What is under test here is not "does it read the file back". It is that a
+# REUSED census is the SAME CENSUS — pinned against the same golden fixture the
+# uninterrupted and the resumed paths are pinned to — and that the two request
+# counters split the way the ledger needs, which is the half a plausible edit
+# gets backwards silently.
+
+
+def _fetch(tmp_path, lat, lon, *, channel, variant=None, cache_path, reuse=True, checkpoint=None):
+    """One census fetch through the real entry point, cache wired up."""
+    return asyncio.run(
+        dm.fetch_city_images_async(
+            "Test City",
+            dm.grid_bbox(lat, lon, 200, 200, 20),
+            "MLY|test|token",
+            connection_limit=1,
+            checkpoint_path=checkpoint or str(tmp_path / f"cp-{channel}-{variant}"),
+            checkpoint_channel=channel,
+            checkpoint_variant=variant,
+            cache_path=cache_path,
+            reuse_census=reuse,
+        )
+    )
+
+
+@pytest.fixture
+def cache_path(tmp_path, straddling_city):
+    """The entry the grid run and both walks all resolve to — no channel in it."""
+    lat, lon = straddling_city
+    return census_cache_path_for("mapillary", "test--city", dm.grid_bbox(lat, lon, 200, 200, 20))
+
+
+def test_the_second_channel_reads_the_first_channels_census_for_zero_requests(
+    monkeypatch, tmp_path, straddling_city, cache_path, caplog
+):
+    """
+    THE test of this feature, and the reason it exists: on a paired night the
+    grid run and the road walk fetch the IDENTICAL z14 census over the identical
+    frozen bbox — the ledger showed byte-identical daily totals for the two
+    channels (#287). One fetch now serves both.
+    """
+    lat, lon = straddling_city
+    tiles, tiles_by_xy = _golden_tiles(lat, lon)
+
+    served = _serve(monkeypatch, tiles_by_xy)
+    grid = _fetch(tmp_path, lat, lon, channel="mapillary", cache_path=cache_path)
+    assert len(served) == len(tiles)
+
+    served = _serve(monkeypatch, tiles_by_xy)
+    with caplog.at_level("WARNING"):
+        walk = _fetch(
+            tmp_path,
+            lat,
+            lon,
+            channel="mapillary_streets",
+            variant="drive",
+            cache_path=cache_path,
+        )
+
+    assert served == [], "the walk must not touch the tile CDN"
+    assert walk["api_requests"] == 0
+    pd.testing.assert_frame_equal(walk["census"], grid["census"])
+    assert "REUSING the Mapillary census fetched by mapillary" in caplog.text
+
+
+def test_a_reused_census_writes_the_same_csv_as_a_fetched_one(
+    monkeypatch, tmp_path, straddling_city, cache_path
+):
+    """
+    Byte identity against the SAME golden fixture the uninterrupted and resumed
+    paths are pinned to (test_mapillary.py, and the resume test at the top of
+    this file). A reused census that assembled its tiles in a different order
+    would resolve the border duplicate the other way — dedupe_census keeps the
+    FIRST position — and every diff of that city would show imagery churn that
+    did not happen, against an immutable dated snapshot.
+    """
+    lat, lon = straddling_city
+    _tiles, tiles_by_xy = _golden_tiles(lat, lon)
+
+    _serve(monkeypatch, tiles_by_xy)
+    first = asyncio.run(
+        dm.download_mapillary_metadata_async(
+            "Test City",
+            lat,
+            lon,
+            200,
+            200,
+            20,
+            "MLY|t",
+            str(tmp_path / "grid.csv.gz"),
+            connection_limit=1,
+            checkpoint_path=str(tmp_path / "cp-grid"),
+            checkpoint_channel="mapillary",
+            cache_path=cache_path,
+        )
+    )
+    served = _serve(monkeypatch, tiles_by_xy)
+    second = asyncio.run(
+        dm.download_mapillary_metadata_async(
+            "Test City",
+            lat,
+            lon,
+            200,
+            200,
+            20,
+            "MLY|t",
+            str(tmp_path / "walk.csv.gz"),
+            connection_limit=1,
+            checkpoint_path=str(tmp_path / "cp-walk"),
+            checkpoint_channel="mapillary_streets",
+            cache_path=cache_path,
+        )
+    )
+    assert served == []
+
+    with gzip.open(second["filename_with_path"], "rt", encoding="utf-8") as f:
+        written = f.read()
+    # The reused run stamps its rows with WHEN MAPILLARY WAS OBSERVED, not when
+    # this process started: the rows were fetched by the grid run.
+    assert second["census_fetched_at"] == first["census_fetched_at"]
+    assert second["started_at"] not in written
+    written = written.replace(second["census_fetched_at"], GOLDEN_TIMESTAMP_PLACEHOLDER)
+    _assert_csv_matches_golden(written, GOLDEN_PATH.read_text(encoding="utf-8"))
+
+
+def test_a_cross_channel_reuse_records_zero_and_a_same_channel_refinalize_records_the_crawl(
+    monkeypatch, tmp_path, straddling_city, cache_path
+):
+    """
+    The one rule here that is easy to get backwards. `api_requests` is always 0
+    (this process issued nothing, and the daily ledger is additive by (date,
+    provider)) — but `api_requests_total` is NOT.
+
+    A same-(channel, variant) reader is not reusing anything: it is #239/#256's
+    re-finalize, a caller that died before its artifact was durable coming back
+    to write the row for a crawl IT paid for. That row must still price the
+    collection. A different channel's collection genuinely cost nothing.
+    """
+    lat, lon = straddling_city
+    tiles, tiles_by_xy = _golden_tiles(lat, lon)
+
+    _serve(monkeypatch, tiles_by_xy)
+    grid = _fetch(tmp_path, lat, lon, channel="mapillary", cache_path=cache_path)
+    assert grid["api_requests_total"] == len(tiles)
+
+    _serve(monkeypatch, tiles_by_xy)
+    refinalize = _fetch(tmp_path, lat, lon, channel="mapillary", cache_path=cache_path)
+    assert refinalize["api_requests"] == 0
+    assert refinalize["api_requests_total"] == len(tiles), "the row still prices the collection"
+    assert refinalize["census_fetched_by"] == "mapillary"
+
+    _serve(monkeypatch, tiles_by_xy)
+    walk = _fetch(
+        tmp_path, lat, lon, channel="mapillary_streets", variant="drive", cache_path=cache_path
+    )
+    assert walk["api_requests"] == 0
+    assert walk["api_requests_total"] == 0, "this collection cost nothing"
+    assert walk["census_fetched_by"] == "mapillary", "and the row says who did pay"
+
+
+def test_the_two_network_types_share_one_census(monkeypatch, tmp_path, straddling_city, cache_path):
+    """
+    `--network-type all_public` is a THIRD identical census (N+1, #287). The
+    variant is what keeps the two walks' CHECKPOINTS apart — they agree on the
+    ledger, the credential and every geometric parameter — and it is deliberately
+    absent from the cache key, because the census they read is the same one.
+    """
+    lat, lon = straddling_city
+    _tiles, tiles_by_xy = _golden_tiles(lat, lon)
+
+    _serve(monkeypatch, tiles_by_xy)
+    drive = _fetch(
+        tmp_path, lat, lon, channel="mapillary_streets", variant="drive", cache_path=cache_path
+    )
+    served = _serve(monkeypatch, tiles_by_xy)
+    broad = _fetch(
+        tmp_path, lat, lon, channel="mapillary_streets", variant="all_public", cache_path=cache_path
+    )
+
+    assert served == []
+    pd.testing.assert_frame_equal(broad["census"], drive["census"])
+    assert broad["census_fetched_by"] == "mapillary_streets"
+    # Same channel, DIFFERENT variant: still a reuse, not a re-finalize, so the
+    # second walk must not inherit the first's crawl cost into its own row.
+    assert broad["api_requests_total"] == 0
+
+
+def test_the_promoted_checkpoint_is_not_left_behind_for_the_caller_to_discard(
+    monkeypatch, tmp_path, straddling_city, cache_path
+):
+    """
+    The directory MOVED. Returning its old path would have the caller's
+    `discard_checkpoint` chase a path that is gone — harmless today, but a
+    future caller reading it as "still mine" would delete the shared entry.
+    """
+    lat, lon = straddling_city
+    _tiles, tiles_by_xy = _golden_tiles(lat, lon)
+    checkpoint = str(tmp_path / "cp")
+
+    _serve(monkeypatch, tiles_by_xy)
+    result = _fetch(
+        tmp_path, lat, lon, channel="mapillary", cache_path=cache_path, checkpoint=checkpoint
+    )
+    assert result["checkpoint_path"] is None
+    assert not os.path.exists(checkpoint)
+    assert os.path.isdir(cache_path)
+
+
+def test_a_reuse_inherits_the_failed_tiles_rather_than_re_probing_them(
+    monkeypatch, tmp_path, straddling_city, cache_path
+):
+    """
+    The reuser is publishing the SAME observation, so the same grid points must
+    read REQUEST_FAILED in both artifacts. Re-probing the holes would mix two
+    moments into one dated snapshot for no gain — and would not be free.
+    """
+    lat, lon = straddling_city
+    tiles, tiles_by_xy = _golden_tiles(lat, lon)
+    hole = tiles[-1]
+    # The golden city is 4 tiles, so one hole is 25% and the real 2% tolerance
+    # would refuse to finalize. Widened here because what is under test is what
+    # a REUSER inherits, not where the tolerance sits (which
+    # test_mapillary.py's own tolerance tests pin).
+    monkeypatch.setattr(dm, "MAX_FAILED_TILE_FRACTION", 0.5)
+
+    _serve(monkeypatch, tiles_by_xy, failing={hole})
+    grid = _fetch(tmp_path, lat, lon, channel="mapillary", cache_path=cache_path)
+    assert grid["failed_tiles"] == [hole]
+
+    served = _serve(monkeypatch, tiles_by_xy)
+    walk = _fetch(
+        tmp_path, lat, lon, channel="mapillary_streets", variant="drive", cache_path=cache_path
+    )
+    assert served == [], "the hole is inherited, not re-asked"
+    assert walk["failed_tiles"] == [hole]
+
+
+def test_an_interrupted_census_is_never_promoted(
+    monkeypatch, tmp_path, straddling_city, cache_path
+):
+    """
+    A partial entry reused as a census would publish the missing tiles' grid
+    points as genuine no-imagery — absence never observed — in an immutable
+    dated snapshot. That is the one way this feature could produce a WRONG
+    artifact rather than wasted work, so promotion happens only on the success
+    path and only after every `raise` above it.
+    """
+    lat, lon = straddling_city
+    _tiles, tiles_by_xy = _golden_tiles(lat, lon)
+
+    _serve(monkeypatch, tiles_by_xy, block_after=1)
+    with pytest.raises(HostBlockedError):
+        _fetch(tmp_path, lat, lon, channel="mapillary", cache_path=cache_path)
+
+    assert not os.path.exists(cache_path)
+    assert dm.load_census_cache_marker(cache_path) is None
+
+
+def test_a_degraded_checkpoint_is_never_promoted(
+    monkeypatch, tmp_path, straddling_city, cache_path
+):
+    """
+    A checkpoint whose commits latched off is missing tiles it never recorded,
+    so `done` no longer describes what is on disk. The fetch still succeeds —
+    checkpointing fails OPEN here, deliberately — but what it holds is not a
+    complete census and must not become one.
+    """
+    lat, lon = straddling_city
+    tiles, tiles_by_xy = _golden_tiles(lat, lon)
+
+    def refuse_every_commit(*a, **k):
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(dm, "_write_checkpoint_state", refuse_every_commit)
+    _serve(monkeypatch, tiles_by_xy)
+    result = _fetch(tmp_path, lat, lon, channel="mapillary", cache_path=cache_path)
+
+    assert result["api_requests"] == len(tiles), "the city still collected"
+    assert not os.path.exists(cache_path), "but nothing incomplete reached the cache"
+
+
+def test_an_incomplete_cache_entry_is_refused_and_deleted(
+    monkeypatch, tmp_path, straddling_city, cache_path
+):
+    """
+    Completeness is the one check a cache entry makes that a resume does NOT: a
+    partial checkpoint is legitimate progress, a partial census is a hole. Here
+    the entry is hand-shortened to look complete by its own counters while
+    covering fewer tiles than the lattice.
+    """
+    lat, lon = straddling_city
+    tiles, tiles_by_xy = _golden_tiles(lat, lon)
+
+    _serve(monkeypatch, tiles_by_xy)
+    _fetch(tmp_path, lat, lon, channel="mapillary", cache_path=cache_path)
+
+    state = _state(cache_path)
+    dropped = state["done_tiles"].pop()
+    state["census_rows"] -= dropped[2]
+    _write_state(cache_path, **state)
+    os.remove(dm._tile_part_path(cache_path, dropped[0], dropped[1]))
+
+    served = _serve(monkeypatch, tiles_by_xy)
+    result = _fetch(
+        tmp_path, lat, lon, channel="mapillary_streets", variant="drive", cache_path=cache_path
+    )
+    assert len(served) == len(tiles), "an incomplete entry costs a full fetch, not a hole"
+    assert result["api_requests"] == len(tiles)
+
+
+@pytest.mark.parametrize(
+    "overrides, expected",
+    [
+        ({"bbox": [0.0, 0.0, 1.0, 1.0]}, "covers bbox"),
+        ({"tile_count": 99}, "covers 99 tiles"),
+        ({"zoom": 13}, "fetched at z13"),
+    ],
+)
+def test_an_entry_that_does_not_describe_this_lattice_is_refused_and_deleted(
+    monkeypatch, tmp_path, straddling_city, cache_path, caplog, overrides, expected
+):
+    """
+    A promoted entry IS a moved checkpoint, so the same geometric cascade a
+    resume makes has to run over it — a re-registered grid (resize_city.py,
+    cap_oversized_grids.py) must not be reused onto a lattice it does not
+    describe. Deleted rather than left, because a shared entry that will never
+    validate would otherwise be re-read by every consumer in turn.
+    """
+    lat, lon = straddling_city
+    tiles, tiles_by_xy = _golden_tiles(lat, lon)
+
+    _serve(monkeypatch, tiles_by_xy)
+    _fetch(tmp_path, lat, lon, channel="mapillary", cache_path=cache_path)
+    _write_state(cache_path, **overrides)
+
+    served = _serve(monkeypatch, tiles_by_xy)
+    with caplog.at_level("WARNING"):
+        _fetch(
+            tmp_path, lat, lon, channel="mapillary_streets", variant="drive", cache_path=cache_path
+        )
+    assert expected in caplog.text
+    assert len(served) == len(tiles), "the refusal costs a full fetch, never a hole"
+    # The entry standing at that path is now the REFETCH's, not the one that was
+    # refused: the loader deleted the bad one and the walk promoted its own over
+    # the space. (The deletion itself is pinned in test_census_cache.py, where
+    # nothing writes a replacement.)
+    assert dm.load_census_cache_marker(cache_path)["fetched_by"] == "mapillary_streets"
+
+
+def test_a_stale_entry_is_refetched_rather_than_spliced_into_todays_snapshot(
+    monkeypatch, tmp_path, straddling_city, cache_path
+):
+    """
+    Frozen geometry never changes, so every other check still passes a fortnight
+    later. The window is what keeps a census fetched last month out of a
+    snapshot dated today, published as one observation of one day.
+    """
+    lat, lon = straddling_city
+    tiles, tiles_by_xy = _golden_tiles(lat, lon)
+
+    _serve(monkeypatch, tiles_by_xy)
+    _fetch(tmp_path, lat, lon, channel="mapillary", cache_path=cache_path)
+
+    marker_path = os.path.join(cache_path, dm_checkpointing.CENSUS_CACHE_MARKER)
+    with open(marker_path, encoding="utf-8") as f:
+        marker = json.load(f)
+    marker["crawl_started_at"] = (datetime.now(UTC) - timedelta(days=8)).isoformat()
+    with open(marker_path, "w", encoding="utf-8") as f:
+        json.dump(marker, f)
+
+    served = _serve(monkeypatch, tiles_by_xy)
+    _fetch(tmp_path, lat, lon, channel="mapillary_streets", variant="drive", cache_path=cache_path)
+    assert len(served) == len(tiles)
+
+
+def test_refetch_census_ignores_the_entry_and_replaces_it(
+    monkeypatch, tmp_path, straddling_city, cache_path
+):
+    """
+    `--refetch-census` is about the OBSERVATION — take it now — and is
+    deliberately separate from `--force`, which is about this run date's
+    artifacts. A refetch still PROMOTES, so the consumers behind it get the
+    fresher census rather than a re-fetch each.
+    """
+    lat, lon = straddling_city
+    tiles, tiles_by_xy = _golden_tiles(lat, lon)
+
+    _serve(monkeypatch, tiles_by_xy)
+    first = _fetch(tmp_path, lat, lon, channel="mapillary", cache_path=cache_path)
+
+    served = _serve(monkeypatch, tiles_by_xy)
+    refetched = _fetch(
+        tmp_path,
+        lat,
+        lon,
+        channel="mapillary_streets",
+        variant="drive",
+        cache_path=cache_path,
+        reuse=False,
+    )
+    assert len(served) == len(tiles), "the flag means ask again"
+    assert refetched["census_fetched_by"] == "mapillary_streets"
+    assert dm.load_census_cache_marker(cache_path)["fetched_by"] == "mapillary_streets", (
+        "and the entry it leaves is the fresher one"
+    )
+    assert first["census_fetched_at"] != refetched["census_fetched_at"]
+
+
+def test_no_cache_path_is_the_historical_behaviour(monkeypatch, tmp_path, straddling_city):
+    """The pre-#290 path, byte for byte: nothing is promoted, nothing is read,
+    and the caller still owns its checkpoint."""
+    lat, lon = straddling_city
+    tiles, tiles_by_xy = _golden_tiles(lat, lon)
+    checkpoint = str(tmp_path / "cp")
+
+    _serve(monkeypatch, tiles_by_xy)
+    result = _fetch(tmp_path, lat, lon, channel="mapillary", cache_path=None, checkpoint=checkpoint)
+    assert result["checkpoint_path"] == checkpoint
+    assert os.path.isdir(checkpoint)
+    assert not os.path.exists(dm_checkpointing.census_cache_dir()) or not os.listdir(
+        dm_checkpointing.census_cache_dir()
+    )
+    assert result["api_requests"] == len(tiles)
+
+
+def test_an_unwritable_cache_never_fails_a_city(monkeypatch, tmp_path, straddling_city):
+    """
+    A city must never fail over its own optimization. When promotion cannot
+    happen the caller keeps its checkpoint and discards it exactly as it did
+    before this existed — the only cost is that the next consumer refetches.
+    """
+    lat, lon = straddling_city
+    tiles, tiles_by_xy = _golden_tiles(lat, lon)
+    checkpoint = str(tmp_path / "cp")
+    unwritable = tmp_path / "readonly"
+    unwritable.mkdir(mode=0o500)
+
+    _serve(monkeypatch, tiles_by_xy)
+    result = _fetch(
+        tmp_path,
+        lat,
+        lon,
+        channel="mapillary",
+        cache_path=str(unwritable / "sub" / "entry"),
+        checkpoint=checkpoint,
+    )
+    assert result["api_requests"] == len(tiles), "the collection succeeded"
+    assert result["checkpoint_path"] == checkpoint, "and its checkpoint is still the caller's"
+
+
+def test_the_walk_and_the_grid_run_share_the_cache_while_splitting_the_checkpoint():
+    """
+    The two path builders, side by side, because getting them the same way round
+    is the whole design and both mistakes are silent: a cache keyed by channel
+    never reuses anything, and a checkpoint NOT keyed by channel lets two crawls
+    resume each other's spend into the wrong ledger.
+    """
+    bbox = (-122.0, 47.0, -121.9, 47.1)
+    assert checkpoint_path_for("seattle--washington", bbox, "mapillary") != checkpoint_path_for(
+        "seattle--washington", bbox, "mapillary_streets"
+    )
+    assert census_cache_path_for("mapillary", "seattle--washington", bbox) == census_cache_path_for(
+        "mapillary", "seattle--washington", bbox
+    )

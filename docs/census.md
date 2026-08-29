@@ -148,6 +148,11 @@ Its cadence is measured in **requests** (`DEFAULT_CHECKPOINT_REQUEST_INTERVAL` =
 — measured on this schema, a username of "NA" and a way_id of "null" both return as `<NA>`
 — so a resumed run would publish *different* rows than an uninterrupted one, in a repo whose census output is pinned byte-for-byte by a golden fixture (`keep_default_na=False` only mirrors the bug: every genuine null becomes `""`).
 Parts are also read strictly in **index order**, never by a directory glob, because index order is fetch order and `dedupe_census` keeps a repeated id at its **first** position — and the sweep re-sees ~π/2 of everything by construction.
+**The age cap is measured from `created_at` — when the FIRST commit landed — not from `updated_at` (issue #272), and the commit record is format v2 because of it.**
+The `finally` commit rewrites the record on nights that swept nothing: a host block, a rejected credential, a budget stop at request 1.
+A host-blocked night deliberately records no `consecutive_failures`, so the same stalest city is re-attempted the next night and the next — and ageing from the last write would let such a city refresh its own clock forever and hold rows from any distance in the past under the limit.
+That is the same fix Mapillary's checkpoint already carried; a v1 record has no first-commit stamp at all, and adopting `updated_at` in its place would be exactly the bug, so it is discarded by the ordinary format-mismatch arm and its sweep restarts once.
+
 **(3) The radius is pinned in the checkpoint**, since a refusal is time-varying (Horace again) and a re-calibrating resume could land on a different rung, re-tiling the bbox so that `roots_done` indexes a lattice it was never recorded against.
 **(4) A commit always writes the sweep as of the last completed boundary — a root's, or a re-probed failed cell's**
 — that invariant is what makes the `finally` commit safe from any exception path and lets the DFS stack stay un-persisted, at the cost of rolling a partial cell's rows, failed cells and counters back so it is re-swept from its own top.
@@ -233,6 +238,63 @@ The channel separates a walk from a grid run, but `drive` and `all_public` are d
 Without the variant a walk that dies after its census but before `register_street_walk` leaves a checkpoint the other network type's walk re-finalizes for zero requests, writing the first crawl's `api_requests_total` into the second's row.
 Both walks read the same tiles, so the census is identical and nothing downstream would show it.
 A grid run has exactly one crawl per channel and passes no variant, which keeps its path byte-identical to the one #239 shipped.
+That paragraph closes with "both walks read the same tiles, so the census is identical and nothing downstream would show it" — **still true of checkpoints, where the identity is a hazard.
+The census cache below is where the same identity is exploited instead.**
+
+## The census cache — fetch once per (provider, bbox), reuse across channels (issue #290)
+
+**A completed checkpoint is PROMOTED into `census_cache/<provider>/<city_id>_<bbox>` rather than deleted, and every later consumer of that (provider, city, bbox) observation reads it for zero requests.**
+The observation being paid for repeatedly was measured, not suspected: the ledger showed byte-identical daily totals for `mapillary` and `mapillary_streets` (#287), because a road walk fetches the identical z14 census over the identical frozen bbox and then joins it onto sample points locally.
+It is worse than 2× — a second walk at `--network-type all_public` is a third copy, and #258's KartaView walk would repeat the pattern against a sweep that is ~10.4 h for Singapore.
+A paired Mapillary night now costs one census instead of two, `all_public` walks are free, and `assess-city`'s grid+walk pair halves.
+
+**THE KEY IS GEOMETRY AND THE MARKER IS THE RECORD, and that is the whole difference from a checkpoint path.**
+`checkpoint_path_for` keys the channel and the variant because two crawls must never resume each other's spend.
+`census_cache_path_for` keys **neither** — the census content depends on (provider, frozen bbox, when it was fetched) and on nothing else — and who paid, under which channel and variant, is written INTO the entry as `census_cache.json`.
+Both mistakes are silent: a cache keyed by channel would reuse nothing and every census would still be bought twice with nothing failing, and a checkpoint *not* keyed by channel would let two crawls resume each other into the wrong ledger under the wrong credential.
+The bbox is folded in at 6 dp for the reason a checkpoint's is: a frozen grid can be re-registered (`scripts/resize_city.py`, `cap_oversized_grids.py`), and an entry keyed on the slug alone would survive a resize.
+
+**The marker is written AFTER the rename, and that ordering is the commit point.**
+A crash between the two leaves a marker-less directory, which every loader deletes on sight, so the failure mode is a re-fetch.
+Written the other way round it would leave a marker describing a directory that does not hold what it claims — a wrong artifact rather than wasted work.
+Promotion is best effort throughout: any `OSError` warns and returns False, and the caller then keeps its checkpoint and discards it exactly as before, because a city must never fail over its own optimization.
+It is the **last statement before the success return**, after `dedupe_census` and therefore after every `raise`, so a moved directory and a propagating exception cannot coexist; and it runs inside the host lock, so no other process can read an entry mid-replace.
+
+**An in-flight checkpoint is never a cache entry, and completeness is the check that separates them.**
+A resume is allowed to be partial by definition; a cache entry that is missing tiles or root cells would publish those points as genuine no-imagery — absence never observed — in an immutable dated snapshot.
+So a promoted entry is validated by the same geometric/footer cascade a resume is (`_validate_tile_store`, `_validate_sweep_store`, factored out for exactly this reason) **plus** completeness: for Mapillary `done ∪ marker.failed == tiles`, for KartaView `roots_done == root_count`.
+Promotion is refused for anything short of that — a `degraded` Mapillary checkpoint whose commits latched off, an interrupted crawl, a `SweepIncompleteError` pause.
+KartaView needs one clause more, because its `finally` commit is deliberately best-effort: its failure is swallowed, which can leave the on-disk store lagging the in-memory census while the counters still read complete, so promotion additionally requires that last commit to have landed (`final_commit_ok`), nothing left uncommitted, and the recorded failed set to equal the session's.
+
+**The reuse window is `CENSUS_REUSE_MAX_AGE_S`, which IS `CHECKPOINT_MAX_AGE_S` (7 days) rather than a second constant that happens to agree**, because both answer the same question: how far apart may two halves of one dated observation be?
+It is aged from `crawl_started_at` — the crawl's first commit, when the provider was actually observed — falling back to `completed_at` only for a crawl that never checkpointed.
+A multi-night crawl's last commit says nothing about how old its oldest rows are.
+
+**Failed tiles and cells are INHERITED by a reuser rather than re-probed.**
+The reuser is republishing the same observation, so the same points read `REQUEST_FAILED` in both artifacts.
+This differs deliberately from a same-channel KartaView *resume*, which re-probes carried failures because a refusal is time-varying (fact 2) — a resume continues one crawl, a reuse republishes a finished one, and mixing a fresher probe into a dated snapshot buys nothing.
+
+**A reused census restamps `query_timestamp` with when the provider was observed; a fresh one keeps this process's clock.**
+Every row of a reused census was fetched by another collection, possibly on an earlier night, and `json_summarizer` reports a run's start/end from that column.
+Gating the restamp on reuse rather than on the provenance being present is what keeps #256's byte-identity contract between an interrupted census and an uninterrupted one, which is written against `started_at`.
+`calculate_run_stats` still ages imagery against `run_date`, so a reused census can skew a pano age by at most the window — 7 days against an 80-day cadence.
+
+**`api_requests` is 0 for every reuser; `api_requests_total` is not, and the asymmetry is easy to get backwards.**
+The daily ledger is additive and keyed by (date, provider), so charging a reuser anything would bill one channel's spend against another's budget gate — the per-IP figure #241/#267/#286 reason about.
+But a reader whose (channel, variant) matches the marker's is not reusing anything: it is #239/#256's re-finalize, a caller that died before its artifact was durable coming back to write the row for a crawl **it** paid for, and that row must still price the collection.
+A different channel records 0, and schema v14's `census_fetched_by`/`census_fetched_at` on `runs` and `street_walks` are what make that 0 explicable rather than alarming.
+
+**`--refetch-census` is the opt-out, and it is deliberately not `--force`.**
+`--force` is about this run date's artifacts: a collection whose tail crashed after writing its CSV is re-run with `--force` and must re-finalize for zero requests rather than re-pay a census it already bought.
+`--refetch-census` is about the *observation* — take it now — and it still promotes, so the consumers behind it get the fresher census rather than a re-fetch each.
+
+**Scheduler-side, `_channel_estimate` returns 0 on a cache probe hit while `estimate_requests` stays cache-blind.**
+The gates fed by the first are `est > budget` and `used + est > budget`, so without it the cheapest channel of the night — a walk whose census the grid run bought minutes earlier — is exactly the one a nearly-spent budget defers, and the pairing never happens on the nights it helps most.
+The second also feeds `_mapillary_timeout_seconds`/`_kartaview_timeout_seconds`, where a 0 would collapse a child's timeout onto the flat floor.
+The probe reads the **marker only** — no part files — because it prices every channel of every due city on every night; a hit is therefore a strong hint rather than a promise, and the consumer's own loader still validates and refetches, which is the safe direction.
+It also **deletes nothing**, unlike the consumer-side loader: a planning caller holds no host lock and runs concurrently with the children promoting into these entries, and since promotion is a rename followed by a separate marker write, a probe that removed what it refused could delete a census a child had just renamed and not yet stamped.
+Deleting a refused entry is the job of the consumer that holds the lock, and of the tail prune, which runs after the city loop has returned.
+The scheduler tail prunes expired entries (`prune_census_cache`), and that is the only thing bounding the cache's size: an entry is written for every census a night fetches and is not overwritten until that city comes round again, ~80 days later.
 
 ## An opt-in scheduler channel (issue #248)
 

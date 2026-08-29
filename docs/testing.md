@@ -68,6 +68,9 @@ Incidental coverage of a deprecated spelling trains readers to ignore the notice
 ## Scheduler
 
 - Scheduler due/budget/provider-pairing/timeout-derivation logic
+- The census cache at the scheduler seam (issue #290): `_channel_estimate` returns 0 on a probe hit and its full estimate otherwise, only the census channels read it (gsv and `gsv_streets` query per point and must not be priced off a Mapillary entry), each channel reads its own PROVIDER's entry,
+  an expired entry prices at full cost, and — the one that keeps the two estimators honestly separate — **a cache hit must not collapse a child's timeout**, since `estimate_requests` also feeds `_mapillary_timeout_seconds`.
+  Plus the dry run naming a cached census at ~0 requests, the tail pruning expired entries and counting them, and a tail that survives a cache directory it cannot read.
 - Per-city timeout derivation, one case per channel, all of them pure-function calls against a `SchedulerConfig` built inline (no mocking): that a huge GSV grid derives points ÷ achieved rate rather than the flat floor and a small city keeps the floor, that an Austin-sized grid clears the ~170-minute download that used to eat the whole 180-minute floor, that a paced tile census outgrows the floor at Anchorage's ~6,500 tiles and follows the *channel's own* rate, and that `0` means "pacing disabled" rather than "use the default" (so the floor stands).
   The point of every one of them is the same failure: a SIGKILLed child records **no** `api_usage`, so a timeout that fires mid-run loses the whole spend from the daily ledger and burns one of the five `consecutive_failures` that nothing but a success resets
 - The KartaView cost arms (issue #238), which were written while **no runtime path reached them** — `UNWIRED_CHANNELS` refused the config block, so they drive `SchedulerConfig` directly. `config/scheduler.toml` declares the channel since #248 and the arms are live; the direct-construction style is kept because it makes each one a pure-function assertion rather than a night to run.
@@ -150,6 +153,9 @@ and `hosts_unavailable` is anchored to the blocked-host note's own `; `-delimite
   `test_no_date_sample_counts_toward_coverage` (undated samples raise `covered_samples`, `coverage_fraction`, both `_any` variants and, through `summarize_streetwalk_coverage`, `length_km_covered` and both `coverage_pct_by_length[_any]`, while `total_samples` stays put — the change is numerator-only);
   `test_no_date_sample_contributes_coverage_but_no_age` (coverage triples while `nearest_pano_date` and `median_covered_age_years` do not move, and `dated_covered_samples`/`dated_pct_of_covered` record the denominator that makes the two legible apart);
   and `test_gsv_no_date_still_gated_by_official_copyright` (the same all-`NO_DATE` run under `© Someone Else` vs `© Google`, two halves so the exact-copyright gate is pinned as the *only* difference — a one-sided version would still pass if the fix had widened GSV to third-party imagery).
+- **A walk on a paired night costs nothing** (issue #290, extending `tests/test_streetwalk_mapillary.py`): the walk reaches the provider-keyed cache entry the grid run writes while keeping its own channel- and network-keyed checkpoint (both mistakes are silent, so the two path builders are asserted side by side);
+  a reused census writes `street_walks.api_requests = 0` with `census_fetched_by = "mapillary"` and charges neither ledger; its rows carry the cache's `crawl_started_at` as `query_timestamp` while a fresh census keeps this process's clock;
+  `--estimate` and the `--daily-budget` pre-flight both price a probe hit at 0, which is what keeps a nearly-spent budget from refusing the cheapest walk of the night; and `--force` reuses while `--refetch-census` does not.
   Their companion on the grid-attribution side is `test_select_pano_points_counts_a_no_date_pano_as_present` in `tests/test_street_coverage.py` (611bd53); the two files pin one definition on the two halves of `streetscape_street_analyzer`, so a change to either belongs in both.
   Two things about the age test are deliberate and easy to undo by accident.
   **Its undated samples are the MAJORITY (10 of 15) and its dated ones carry dates a year apart**, because the obvious fixture — a few undated samples among many dated ones sharing one date — cannot detect the bug it exists to catch: fold the undated samples in at age 0 and the median does not budge, since the dated majority outvotes them.
@@ -191,6 +197,22 @@ and `hosts_unavailable` is anchored to the blocked-host note's own `; `-delimite
   a run whose stale checkpoint was DISCARDED is still protected afterwards, since the discard deletes the directory the fresh handle is about to commit into;
   a part is fsynced before it is renamed, checked by recording the `fsync`/`replace` order rather than by trusting the call site;
   and a part written before any commit record is swept, which the loader returns too early to reach)
+
+- The shared census cache (`tests/test_census_cache.py`, issue #290 — the plumbing both providers stand on).
+  The two headline pins are the ones a plausible edit breaks silently: the path keys the PROVIDER, city and bbox and carries no channel, variant or date (a channel-keyed entry would reuse nothing, with nothing failing),
+  and the marker is written AFTER the rename, checked by exploding the marker write and asserting the moved-but-unstamped directory that leaves is deleted rather than read.
+  Also: a failed promotion leaves the checkpoint where the caller expects it; EXDEV falls back to copy-then-remove, since either directory can be pointed at another filesystem by its env override;
+  a stale entry is replaced wholesale rather than merged; the window is aged from `crawl_started_at` (a fresh promotion of a ten-day-old crawl is refused, which ageing from `completed_at` would allow) with `completed_at` as the fallback, and last night's entry still reuses;
+  the probe opens no parquet footer, since it prices every channel of every due city on every night; and the prune removes expired and marker-less entries while leaving fresh ones, stray files and the whole of `checkpoints/` alone.
+- Mapillary census reuse (extending `tests/test_mapillary_resume.py`): a second channel reads the first's census for **0** tile requests and the reused census writes the **same golden fixture** the uninterrupted and resumed paths are pinned to;
+  the counters split — `api_requests` always 0, `api_requests_total` the crawl total for a same-(channel, variant) re-finalize and 0 for a cross-channel reuse;
+  the two `--network-type` walks share one census while keeping separate checkpoints; a reuse inherits the failed tiles rather than re-probing them;
+  an interrupted or `degraded` crawl is never promoted, an incomplete or geometrically-wrong entry is refused (and the refetch that follows replaces it), a stale one is refetched;
+  `--refetch-census` ignores the entry and leaves the fresher one behind; no `cache_path` is byte-for-byte the pre-#290 behaviour; and an unwritable cache never fails a city.
+- KartaView sweep reuse and the first-commit stamp (extending `tests/test_kartaview_collector.py`, issues #290 and #272):
+  the same reuse set as Mapillary's, plus that a hit restores `cells`/`cells_visited`/`raw_photo_count`/`radius_m` from the record (they describe the census, not the process) and inherits the failed cells rather than re-probing them, which is deliberately unlike a resume;
+  that a `SweepIncompleteError` pause never promotes; and **that a failed `finally` commit never promotes** — the KartaView-specific trap, set up so the last periodic commit HAS landed, which isolates the `final_commit_ok` clause from the other three.
+  For #272: `created_at` is stamped once and carried forward while `updated_at` moves, a night that sweeps nothing cannot restamp it, and a v1 record is discarded rather than read forward.
 
 ## Catalog backups (issue #145)
 
