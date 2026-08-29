@@ -48,6 +48,13 @@ from tabulate import tabulate
 
 from . import catalog_backup, db, driving_plan
 from .alerting import AlertConfig, send_alert, should_alert
+from .checkpointing import (
+    CENSUS_PROVIDERS,
+    CENSUS_REUSE_MAX_AGE_S,
+    census_cache_probe,
+    frozen_bbox,
+    prune_census_cache,
+)
 from .city_registration import (
     MAX_GRID_DIM_M,
     CityResolutionError,
@@ -1059,7 +1066,47 @@ def _mapillary_timeout_seconds(
     return int(max(floor, paced_seconds * _TIMEOUT_HEADROOM + _TIMEOUT_FIXED_SLACK_S))
 
 
-def _channel_estimate(cfg: SchedulerConfig, city: db.CityRow, provider: str, conn=None) -> int:
+def _census_reuse_window_s(cfg: SchedulerConfig) -> float:
+    """
+    The reuse window a SCHEDULER probe prices against: the consumer's window
+    less the length of the batch (issue #290).
+
+    The probe runs at slate time and the child loads the entry up to
+    ``max_batch_hours`` later, so an entry that would expire in between must
+    not be priced as free: the child's loader would refuse it and fetch at full
+    cost with the budget gate already passed and no in-child request cap.
+    """
+    return max(0.0, CENSUS_REUSE_MAX_AGE_S - cfg.max_batch_hours * 3600.0)
+
+
+def channel_census_cache_marker(
+    city: db.CityRow, channel: str, *, max_age_s: float = CENSUS_REUSE_MAX_AGE_S
+) -> dict | None:
+    """
+    Is a reusable census on hand for this (channel, city)? Marker only (#290).
+
+    A channel reads its PROVIDER's entry -- 'mapillary' and 'mapillary_streets'
+    are different ledgers reading one observation -- and the provider is derived
+    the one way the scheduler already knows (``STREET_CHANNELS``), gated on
+    ``CENSUS_PROVIDERS``, rather than by a second table that would have to be
+    edited beside the first when a channel is added. Answers None for every
+    channel whose cost is not a shared census: gsv and gsv_streets query per
+    point, so there is nothing to share.
+    """
+    provider = STREET_CHANNELS.get(channel, channel)
+    if provider not in CENSUS_PROVIDERS:
+        return None
+    return census_cache_probe(provider, city.city_id, frozen_bbox(city), max_age_s=max_age_s)
+
+
+def _channel_estimate(
+    cfg: SchedulerConfig,
+    city: db.CityRow,
+    provider: str,
+    conn=None,
+    *,
+    cached: bool | None = None,
+) -> int:
     """Price one channel's request count — the ONE derivation, for every caller.
 
     ``estimate_requests`` needs a channel's ``spacing_m``/``network_type`` out of
@@ -1073,7 +1120,28 @@ def _channel_estimate(cfg: SchedulerConfig, city: db.CityRow, provider: str, con
     The tolerant lookup is the one kept, because ``city_timeout_seconds`` already
     makes it — the timeout and the estimate must not disagree about what a
     missing provider block means.
+
+    A CENSUS ALREADY IN THE SHARED CACHE COSTS 0 (issue #290), and this is the
+    seam that has to know it rather than ``estimate_requests``. The two gates
+    this feeds are ``est > budget`` and ``used + est > budget``, so without it
+    the cheapest channel of the night — a road walk whose census the grid run
+    bought minutes earlier — is exactly the one a nearly-spent budget defers,
+    and the pairing the cache exists to exploit never happens on the nights it
+    matters. ``estimate_requests`` stays cache-blind on purpose: it is also the
+    input to ``_mapillary_timeout_seconds``/``_kartaview_timeout_seconds``, and
+    a 0 there would collapse a child's timeout onto the fixed floor.
+
+    ``cached`` lets a caller that has already probed the marker (the dry run,
+    which also names who paid) pass its answer rather than read it again; None
+    probes here, against the batch-narrowed window.
     """
+    if cached is None:
+        cached = (
+            channel_census_cache_marker(city, provider, max_age_s=_census_reuse_window_s(cfg))
+            is not None
+        )
+    if cached:
+        return 0
     pc = (cfg.providers or {}).get(provider) or ProviderConfig()
     return estimate_requests(
         city, provider, conn=conn, spacing_m=pc.spacing_m, network_type=pc.network_type
@@ -3648,14 +3716,19 @@ def cmd_run_due(
         print(f"DRY RUN — would process (budget remaining {left_str}):")
         for city in due[:day_cap]:
             for provider in providers_for_city[city.city_id]:
-                est = estimate_requests(
-                    city,
-                    provider,
-                    conn=conn,
-                    spacing_m=cfg.providers[provider].spacing_m,
-                    network_type=cfg.providers[provider].network_type,
+                # Via _channel_estimate, not estimate_requests: the dry run has
+                # to price what the night will ACTUALLY spend, and a census
+                # already in the shared cache is free (issue #290). Reading the
+                # raw estimate here would show an over-budget deferral for a
+                # channel the real run launches for nothing.
+                marker = channel_census_cache_marker(
+                    city, provider, max_age_s=_census_reuse_window_s(cfg)
                 )
+                est = _channel_estimate(cfg, city, provider, conn, cached=marker is not None)
                 fits = "ok" if est <= budget_left[provider] else "OVER BUDGET (deferred)"
+                if marker is not None:
+                    payer = marker.get("fetched_by") or "an earlier collection"
+                    fits = f"ok (cached census from {payer})"
                 print(f"  {city.city_id:60s} {provider:16s} ~{est:>9,} req  {fits}")
                 budget_left[provider] -= est if est <= budget_left[provider] else 0
         if cfg.driving_plan.enabled:
@@ -4554,6 +4627,18 @@ def _finish_batch(
     # night still reporting a clean success.
     logger.info("Regenerating driving_plan.json.gz")
     rebuild("driving-plan summary", generate_driving_plan_summary)
+
+    # Sweep expired shared censuses (issue #290). Bounded by nothing else: an
+    # entry is written for every census the night fetched and is not overwritten
+    # until that city comes round again, ~80 days later, so a cache nobody
+    # pruned would grow without limit on a host whose disk is shared with
+    # Project Sidewalk. In the tail with the other best-effort steps, and
+    # never allowed to cost the publish -- prune_census_cache swallows its own
+    # filesystem errors for exactly that reason.
+    pruned = prune_census_cache()
+    if pruned:
+        logger.info(f"Pruned {pruned} expired cached census(es)")
+        summary += f"; pruned {pruned} cached census(es)"
 
     # Back up again now that the night's runs, diffs and walks are registered:
     # the pre-flight copy (see _backup_catalog_nightly) guarantees a copy

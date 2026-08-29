@@ -17,14 +17,14 @@ Legacy pre-2026 undated files are registered as `is_baseline=1` runs by `scripts
 
 ## The catalog
 
-The SQLite catalog `data/streetscape_tracker.db` (`streetscape_metadata_tracker/db.py`, stdlib sqlite3/WAL, no ORM; schema v13, auto-migrated on connect) is the operational source of truth.
+The SQLite catalog `data/streetscape_tracker.db` (`streetscape_metadata_tracker/db.py`, stdlib sqlite3/WAL, no ORM; schema v14, auto-migrated on connect) is the operational source of truth.
 It is **local-only and never rsynced** — it lives in exactly one place, which is why the dated backups in [`catalog-backups.md`](catalog-backups.md) exist.
 
 | Table | Key / uniqueness | Holds |
 |---|---|---|
 | `cities` | `city_id` PK | Canonical identity + **frozen grid geometry** (center, width, height, step), `enabled` flag |
 | `city_aliases` | `alias_slug` PK | Legacy slugs (e.g. `albany--ny`) → `city_id`, so the same query never re-geocodes |
-| `runs` | UNIQUE(city_id, provider, run_date) | Per-run stats incl. the #213 capture-date columns; `unique_google_panos` is NULL for non-gsv runs |
+| `runs` | UNIQUE(city_id, provider, run_date) | Per-run stats incl. the #213 capture-date columns and the v14 census provenance; `unique_google_panos` is NULL for non-gsv runs |
 | `run_diffs` | UNIQUE(from_run_id, to_run_id) | Run-to-run change counters + detail filename |
 | `api_usage` | PK(usage_date, provider) | Daily request-budget ledger; **additive** (`add_api_usage`); streets channels metered under their own strings (#99) |
 | `schedule_state` | PK(city_id, provider) | Stagger day, last attempt/success, `consecutive_failures` (reset only by a success), `member` (per-channel membership, #248) |
@@ -44,6 +44,11 @@ v13 added `schedule_state.member` (#248), and it is the **one deliberate excepti
 The table of defaults is `scheduler.CHANNEL_DEFAULT_MEMBERSHIP`, deliberately code-side rather than config, so adding a provider token cannot silently enrol the whole catalog — a missing entry is a `KeyError`, not a permissive default.
 Every channel scheduled today defaults to member, so the `ALTER TABLE`'s all-NULL fill leaves dueness byte-identical; `kartaview` defaults to non-member, which is what makes it a legal but inert channel until an operator runs `scheduler enroll-city`.
 The column is **not** named `enabled` for a mechanical reason: `cities.enabled` already exists, and `get_due_cities` reads `SELECT c.*` through `sqlite3.Row`, where two columns of one name collapse to one key holding the wrong value.
+
+v14 added `census_fetched_by` / `census_fetched_at` to **both** `runs` and `street_walks` (#290), and they are back under the ordinary rule: NULL means "not measured".
+They record which channel's credential and ledger actually paid for a shared census and when the provider was observed, which is what makes an `api_requests` of **0** on a fully collected city explicable rather than alarming — see the census-cache section of [`census.md`](census.md).
+Every gsv run and walk, every legacy import, and every row salvaged by `_reconcile_orphaned_run`/`_reconcile_orphaned_walk` (which read artifacts off disk and cannot know) keep NULL.
+`RunRow` gains the two fields as well, and that is not optional: `_row_to_run` builds `RunRow(**dict(row))` from a `SELECT *`, so a column without a matching field is a `TypeError` on every `get_latest_run` against a migrated catalog rather than a missing feature.
 
 ## Provider model
 
@@ -71,6 +76,7 @@ The steps below are per (city, provider, run_date):
 2. Skip policy per (city, provider): `--min-days-since-last-run` (default 80) unless `--force`.
 3. Downloader dispatch — `download_gsv.py` (gsv; resumes via a `.downloading` sibling) or the two census providers, `download_mapillary.py` (#256) and `download_kartaview.py` (#239), which **both resume via a `checkpoints/` directory**:
    the caller supplies that path — keyed on the CHANNEL, and for a walk on its `--network-type` too, since a road walk crawls the same frozen bbox and would otherwise resume the grid run's crawl into the wrong ledger (or the other walk's, into the wrong row) — and discards it once the artifact is durable.
+   The caller also supplies a `census_cache/` path (#290), keyed the opposite way — on the PROVIDER, city and bbox, with no channel, variant or date — into which a COMPLETED crawl is promoted so the next consumer of that observation reads it for zero requests.
    Provider-agnostic grid/date/error helpers (`generate_grid_points`, `standardize_capture_date`, `DownloadError`) live in `download_common.py`, and the shared checkpoint plumbing in `checkpointing.py`, so no provider imports from another's module.
    Caller supplies the output path;
    all three return `api_requests` for the per-provider budget ledger, and both census providers add `api_requests_total`

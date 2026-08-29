@@ -7138,3 +7138,209 @@ def test_max_concurrent_channels_rejects_a_nonsense_value_and_falls_back_to_1(
 
     assert cfg.max_concurrent_channels == 1
     assert "max_concurrent_channels" in caplog.text
+
+
+# ── The shared census cache, at the scheduler seam (issue #290) ────────────
+
+
+def _stamp_census_cache(city, provider, *, fetched_by, age_days=0):
+    """Write the marker `census_cache_probe` reads. No parts: the probe is
+    deliberately marker-only, so this is exactly what production hands it."""
+    from streetscape_metadata_tracker.checkpointing import census_cache_path_for, frozen_bbox
+    from tests.conftest import stamp_census_cache
+
+    return stamp_census_cache(
+        census_cache_path_for(provider, city.city_id, frozen_bbox(city)),
+        provider,
+        fetched_by=fetched_by,
+        age_days=age_days,
+        api_requests_total=41,
+    )
+
+
+def test_a_cached_census_prices_a_channel_at_zero(conn):
+    """
+    The gates this feeds are `est > budget` and `used + est > budget`. Without
+    this the CHEAPEST channel of the night — a road walk whose census the grid
+    run bought minutes earlier — is exactly the one a nearly-spent budget
+    defers, and the pairing the cache exists to exploit never happens on the
+    nights it helps most.
+    """
+    from streetscape_metadata_tracker.scheduler import _channel_estimate
+
+    cid = _register(conn, "Bend", width=5000, height=5000, step=20)
+    city = db.resolve_city(conn, cid)
+    cfg = SchedulerConfig(providers={"mapillary_streets": ProviderConfig()})
+
+    assert _channel_estimate(cfg, city, "mapillary_streets", conn) > 0
+    _stamp_census_cache(city, "mapillary", fetched_by="mapillary")
+    assert _channel_estimate(cfg, city, "mapillary_streets", conn) == 0
+
+
+def test_only_the_census_channels_read_the_cache(conn):
+    """
+    gsv and gsv_streets query per point; there is no census to share, so an
+    entry for the same city must not silently price them at zero.
+    """
+    from streetscape_metadata_tracker.scheduler import _channel_estimate
+
+    cid = _register(conn, "Bend", width=5000, height=5000, step=20)
+    city = db.resolve_city(conn, cid)
+    cfg = SchedulerConfig(providers={p: ProviderConfig() for p in ("gsv", "gsv_streets")})
+    _stamp_census_cache(city, "mapillary", fetched_by="mapillary")
+
+    assert _channel_estimate(cfg, city, "gsv", conn) > 0
+    assert _channel_estimate(cfg, city, "gsv_streets", conn) > 0
+
+
+def test_both_mapillary_channels_and_kartaview_read_their_providers_entry(conn):
+    """
+    The channel -> provider mapping is the whole point: 'mapillary' and
+    'mapillary_streets' are different ledgers reading ONE observation, and
+    KartaView's grid run and the #258 walk will be the same.
+    """
+    from streetscape_metadata_tracker.scheduler import _channel_estimate
+
+    cid = _register(conn, "Bend", width=5000, height=5000, step=20)
+    city = db.resolve_city(conn, cid)
+    cfg = SchedulerConfig(
+        providers={p: ProviderConfig() for p in ("mapillary", "mapillary_streets", "kartaview")}
+    )
+
+    _stamp_census_cache(city, "mapillary", fetched_by="mapillary_streets")
+    assert _channel_estimate(cfg, city, "mapillary", conn) == 0
+    assert _channel_estimate(cfg, city, "mapillary_streets", conn) == 0
+    assert _channel_estimate(cfg, city, "kartaview", conn) > 0, "different provider, own entry"
+
+    _stamp_census_cache(city, "kartaview", fetched_by="kartaview")
+    assert _channel_estimate(cfg, city, "kartaview", conn) == 0
+
+
+def test_an_expired_entry_prices_the_channel_at_full_cost(conn):
+    """The window is what keeps a fortnight-old census out of a snapshot dated
+    today, so it has to be priced as the fetch it will actually become."""
+    from streetscape_metadata_tracker.scheduler import _channel_estimate
+
+    cid = _register(conn, "Bend", width=5000, height=5000, step=20)
+    city = db.resolve_city(conn, cid)
+    cfg = SchedulerConfig(providers={"mapillary_streets": ProviderConfig()})
+
+    _stamp_census_cache(city, "mapillary", fetched_by="mapillary", age_days=9)
+    assert _channel_estimate(cfg, city, "mapillary_streets", conn) > 0
+
+
+def test_an_entry_that_would_expire_during_the_batch_is_priced_as_a_fetch(conn):
+    """
+    The probe runs at slate time and the child loads the entry up to
+    max_batch_hours later. An entry the loader would refuse by then must not be
+    priced at zero: the child would fetch at full cost with the budget gate
+    already passed and no in-child request cap.
+    """
+    from streetscape_metadata_tracker.scheduler import _channel_estimate
+
+    cid = _register(conn, "Bend", width=5000, height=5000, step=20)
+    city = db.resolve_city(conn, cid)
+    # 6.8 days old: inside the 7-day consumer window, but not by a 10-hour batch.
+    _stamp_census_cache(city, "mapillary", fetched_by="mapillary", age_days=6.8)
+
+    loose = SchedulerConfig(providers={"mapillary_streets": ProviderConfig()}, max_batch_hours=1)
+    assert _channel_estimate(loose, city, "mapillary_streets", conn) == 0
+    tight = SchedulerConfig(providers={"mapillary_streets": ProviderConfig()}, max_batch_hours=10)
+    assert _channel_estimate(tight, city, "mapillary_streets", conn) > 0
+
+
+def test_a_cached_census_does_not_collapse_the_child_timeout(conn):
+    """
+    `estimate_requests` stays cache-BLIND on purpose, and this is why: it is
+    also the input to the timeout derivations, and a 0 there would time a child
+    against the flat floor. A reuse is fast, but a cache entry the collector
+    then rejects means the child fetches for real — and a SIGKILL costs the
+    requests already spent AND a consecutive_failure.
+    """
+    from streetscape_metadata_tracker.scheduler import city_timeout_seconds
+
+    cid = _register(conn, "Metropolis", width=40000, height=40000, step=20)
+    city = db.resolve_city(conn, cid)
+    cfg = SchedulerConfig(
+        city_timeout_minutes=1, providers={"mapillary": ProviderConfig(max_requests_per_minute=60)}
+    )
+    before = city_timeout_seconds(cfg, city, "mapillary", conn=conn)
+    _stamp_census_cache(city, "mapillary", fetched_by="mapillary_streets")
+
+    assert city_timeout_seconds(cfg, city, "mapillary", conn=conn) == before
+    assert before > cfg.city_timeout_minutes * 60, "the derivation, not the floor"
+
+
+def test_the_dry_run_names_a_cached_census(conn, monkeypatch, tmp_path, capsys):
+    """
+    A dry run has to price what the night will ACTUALLY spend. Reading the raw
+    estimate would show an over-budget deferral for a channel the real run
+    launches for nothing.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+    cid = _register(conn, "Bend", width=5000, height=5000, step=20)
+    city = db.resolve_city(conn, cid)
+    _stamp_census_cache(city, "mapillary", fetched_by="mapillary")
+    cfg = SchedulerConfig(
+        data_dir=str(tmp_path),
+        db_path=str(tmp_path / "x.db"),
+        backup_dir=str(tmp_path / "backups"),
+        publish_enabled=False,
+        providers={
+            "mapillary": ProviderConfig(enabled=True),
+            "mapillary_streets": ProviderConfig(enabled=True),
+        },
+    )
+
+    assert sched.cmd_run_due(cfg, dry_run=True, today=date(2026, 7, 2)) == 0
+    out = capsys.readouterr().out
+    assert "cached census from mapillary" in out
+    assert re.search(r"mapillary_streets\s+~\s*0 req", out), out
+
+
+def test_the_tail_prunes_the_cache_and_says_how_many(conn, monkeypatch, tmp_path, caplog):
+    """
+    The cache is bounded by this and by nothing else: an entry is written for
+    every census the night fetched and is not overwritten until that city comes
+    round again, ~80 days later. In the tail beside the backup and the publish,
+    where #167's rule is that no housekeeping step may cost the night's
+    visibility.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    cid = _register(conn, "Bend", width=5000, height=5000, step=20)
+    city = db.resolve_city(conn, cid)
+    fresh = _stamp_census_cache(city, "mapillary", fetched_by="mapillary")
+    stale = _stamp_census_cache(city, "kartaview", fetched_by="kartaview", age_days=9)
+    cfg = SchedulerConfig(
+        data_dir=str(tmp_path), backup_dir=str(tmp_path / "backups"), publish_enabled=False
+    )
+
+    with caplog.at_level("INFO"):
+        sched._finish_batch(cfg, conn, "summary", succeeded=1, attempted=1, today=date(2026, 7, 2))
+
+    assert os.path.isdir(fresh)
+    assert not os.path.exists(stale)
+    assert "Pruned 1 expired cached census" in caplog.text
+
+
+def test_the_tail_survives_a_broken_cache_directory(conn, monkeypatch, tmp_path):
+    """
+    #167's posture: the prune is housekeeping, and the publish and the alert
+    come after it. A filesystem it cannot read must cost a log line, never the
+    night's visibility.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    def refuse(*a, **k):
+        raise PermissionError("nope")
+
+    monkeypatch.setattr(sched.os, "listdir", refuse)
+    cfg = SchedulerConfig(
+        data_dir=str(tmp_path), backup_dir=str(tmp_path / "backups"), publish_enabled=False
+    )
+    assert sched._finish_batch(
+        cfg, conn, "summary", succeeded=1, attempted=1, today=date(2026, 7, 2)
+    ) in (0, 1)

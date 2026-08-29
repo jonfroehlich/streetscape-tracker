@@ -151,9 +151,14 @@ enabled = true
 # block is per IP, so what is on the line is the SUM — 3,500/day on one
 # address, chosen so any 2-day total stays <= 7,000, at or below the highest
 # value ever observed clean (7,061). Split EVENLY because both channels read
-# the identical z14 census (a road walk re-reads the grid run's tiles), so
-# the two budgets deplete in lockstep and a heavy slate defers the same
-# cities on both channels instead of un-pairing them. A normal 20-city night
+# the identical z14 census. SINCE #290 THE WALK NO LONGER RE-READS THOSE
+# TILES: it reuses the grid run's census for 0 requests on a paired night, so
+# mapillary_streets' budget is spent only on nights the two are NOT paired
+# (a budget deferral, a filtered run). The values are unchanged — re-sizing
+# them for the lighter load is #286's question, and #290's goal is strictly
+# less load. The even split still matters for the un-paired case, where the
+# two budgets deplete in lockstep and a heavy slate defers the same cities on
+# both channels instead of un-pairing them further. A normal 20-city night
 # (~1,150 tiles per channel) is unaffected. NO `--limit` catch-ups
 # until a rolling multi-day guard exists: these budgets bound any single day,
 # but three consecutive maxed days sum to 10,500 — inside the 3-day
@@ -233,8 +238,9 @@ spacing_m = 15
 # bet resolved), not against the per-app cap: different tokens, one address,
 # so the number that matters is the SUM — 1,750 + 1,750 = 3,500/day as of
 # 2026-08-22 (issue #241), split evenly: a road walk reads the identical
-# tile census as the grid run, so a paired night costs the same on each
-# channel and the budgets deplete in lockstep.
+# tile census as the grid run. Since #290 it REUSES that census rather than
+# re-reading it, so on a paired night this channel spends nothing and this
+# budget is drawn on only when the pair is split apart.
 [providers.mapillary_streets]
 enabled = true
 daily_request_budget = 1750

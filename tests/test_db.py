@@ -1644,3 +1644,162 @@ def test_street_network_types_coexist(conn, city):
 def test_street_network_unknown_city_rejected(conn):
     with pytest.raises(sqlite3.IntegrityError):
         db.register_street_network(conn, city_id="nowhere--xx", graphml_filename="nowhere.graphml")
+
+
+def test_migrate_v13_to_v14(tmp_path):
+    """A v13 catalog gains the census-provenance pair on runs and street_walks.
+
+    Built from db._SCHEMA minus those four columns (so the fixture tracks the
+    code rather than a hand-copy that drifts), with a pre-v14 run and walk
+    seeded to prove both survive and read NULL — the honest "not measured", since
+    a census fetched before the shared cache existed recorded no payer.
+    """
+    db_path = str(tmp_path / "v13.db")
+    raw = sqlite3.connect(db_path)
+    raw.executescript(db._SCHEMA)
+    for table in ("runs", "street_walks"):
+        for col in db._V14_CENSUS_PROVENANCE_COLUMNS:
+            raw.execute(f"ALTER TABLE {table} DROP COLUMN {col}")
+    raw.execute(
+        """INSERT INTO cities (city_id, display_name, city_name, center_lat,
+           center_lon, grid_width_m, grid_height_m, step_m, created_at)
+           VALUES ('bend--or', 'Bend, OR', 'Bend', 44.05, -121.31,
+                   5000, 5000, 20, '2026-01-01T00:00:00+00:00')"""
+    )
+    raw.execute(
+        """INSERT INTO runs (city_id, provider, run_date, csv_filename, api_requests)
+           VALUES ('bend--or', 'mapillary', '2026-05-01', 'old.csv.gz', 31)"""
+    )
+    raw.execute(
+        """INSERT INTO street_walks (city_id, provider, run_date, csv_filename, api_requests)
+           VALUES ('bend--or', 'mapillary', '2026-05-01', 'old-walk.csv.gz', 31)"""
+    )
+    raw.execute("PRAGMA user_version = 13")
+    raw.commit()
+    raw.close()
+
+    conn = db.connect(db_path)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
+    for table in ("runs", "street_walks"):
+        cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        assert set(db._V14_CENSUS_PROVENANCE_COLUMNS) <= cols, table
+
+    # The pre-v14 rows keep their data; the new columns are NULL.
+    run = db.get_latest_run(conn, "bend--or", provider="mapillary")
+    assert run.api_requests == 31
+    assert run.census_fetched_by is None
+    assert run.census_fetched_at is None
+    walk = db.get_latest_street_walk(conn, "bend--or", provider="mapillary")
+    assert walk["census_fetched_by"] is None
+
+    # Idempotent: reopening must not error or re-migrate.
+    conn.close()
+    conn2 = db.connect(db_path)
+    assert conn2.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
+    conn2.close()
+
+
+def test_run_row_carries_every_runs_column(conn):
+    """
+    `_row_to_run` builds RunRow(**dict(row)) from `SELECT *`, so a column added
+    to the table without a matching field is not a missing feature — it is a
+    TypeError on every `get_latest_run` against a migrated catalog. Asserted
+    against the table itself so a future column cannot land half-wired.
+    """
+    from dataclasses import fields
+
+    db.register_city(
+        conn,
+        city_name="Bend",
+        state_name="Oregon",
+        state_code="OR",
+        country_name="United States",
+        country_code="US",
+        center_lat=44.05,
+        center_lon=-121.31,
+        grid_width_m=200,
+        grid_height_m=200,
+        step_m=20,
+    )
+    columns = {r[1] for r in conn.execute("PRAGMA table_info(runs)").fetchall()}
+    assert columns == {f.name for f in fields(db.RunRow)}
+
+
+def test_register_run_round_trips_the_census_provenance(conn):
+    """
+    A cross-channel reuse writes api_requests = 0 on a fully collected city;
+    these two columns are what make that legible. Stored rather than derived
+    because the payer is a DIFFERENT channel and the observation is often an
+    earlier day than run_date.
+    """
+    city_id = db.register_city(
+        conn,
+        city_name="Bend",
+        state_name="Oregon",
+        state_code="OR",
+        country_name="United States",
+        country_code="US",
+        center_lat=44.05,
+        center_lon=-121.31,
+        grid_width_m=200,
+        grid_height_m=200,
+        step_m=20,
+    )
+    db.register_run(
+        conn,
+        city_id=city_id,
+        run_date=date(2026, 7, 8),
+        csv_filename="reused.csv.gz",
+        provider="mapillary",
+        api_requests=0,
+        census_fetched_by="mapillary_streets",
+        census_fetched_at="2026-07-07T22:00:00+00:00",
+    )
+    db.register_street_walk(
+        conn,
+        city_id=city_id,
+        run_date=date(2026, 7, 8),
+        csv_filename="reused-walk.csv.gz",
+        provider="mapillary",
+        api_requests=0,
+        census_fetched_by="mapillary",
+        census_fetched_at="2026-07-08T01:00:00+00:00",
+    )
+
+    run = db.get_latest_run(conn, city_id, provider="mapillary")
+    assert (run.api_requests, run.census_fetched_by) == (0, "mapillary_streets")
+    assert run.census_fetched_at == "2026-07-07T22:00:00+00:00"
+    walk = db.get_latest_street_walk(conn, city_id, provider="mapillary")
+    assert (walk["api_requests"], walk["census_fetched_by"]) == (0, "mapillary")
+
+
+def test_the_provenance_defaults_to_null_not_to_the_collecting_channel(conn):
+    """
+    NULL means "not measured" — a gsv run, a legacy import, a row salvaged from
+    a CSV on disk by _reconcile_orphaned_run. Defaulting to the row's own
+    provider would claim provenance nothing recorded, and would make an
+    unexplained 0 look explained.
+    """
+    city_id = db.register_city(
+        conn,
+        city_name="Bend",
+        state_name="Oregon",
+        state_code="OR",
+        country_name="United States",
+        country_code="US",
+        center_lat=44.05,
+        center_lon=-121.31,
+        grid_width_m=200,
+        grid_height_m=200,
+        step_m=20,
+    )
+    db.register_run(
+        conn,
+        city_id=city_id,
+        run_date=date(2026, 7, 8),
+        csv_filename="salvaged.csv.gz",
+        provider="gsv",
+        api_requests=100,
+    )
+    run = db.get_latest_run(conn, city_id, provider="gsv")
+    assert run.census_fetched_by is None and run.census_fetched_at is None

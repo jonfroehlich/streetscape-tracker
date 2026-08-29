@@ -70,12 +70,17 @@ from dotenv import find_dotenv, load_dotenv
 from streetscape_metadata_tracker import config as cfg
 from streetscape_metadata_tracker import db
 from streetscape_metadata_tracker.analysis import detect_systemic_failure
-from streetscape_metadata_tracker.checkpointing import checkpoint_path_for, discard_checkpoint
+from streetscape_metadata_tracker.checkpointing import (
+    CENSUS_PROVIDERS,
+    census_cache_probe,
+    crawl_store_for,
+    discard_checkpoint,
+    frozen_bbox,
+)
 from streetscape_metadata_tracker.config import load_config
 from streetscape_metadata_tracker.download_common import (
     DownloadError,
     HostUnavailableError,
-    grid_bbox,
     host_exit_code,
 )
 from streetscape_metadata_tracker.download_gsv import collect_points_async
@@ -124,6 +129,30 @@ DEFAULT_SPACING_M = 15
 DEFAULT_MAX_REQUESTS_PER_MINUTE = 24_000
 
 
+def _cached_census_marker(city, provider: str, args) -> dict | None:
+    """
+    Is a reusable census already on hand for this city? Marker only (issue #290).
+
+    Two callers, and they must agree: ``--estimate`` (which prints the cost) and
+    the ``--daily-budget`` pre-flight (which refuses to start when the cost does
+    not fit). A walk whose census is free has to read as free in both, or the
+    guard aborts exactly the collections the cache was built to make cheap.
+
+    Deliberately conservative in three ways. It answers None for gsv, which has
+    no census to share; None under ``--refetch-census``, so the flag prices the
+    fetch it is about to force; and it reads the MARKER without validating the
+    parts, because a planning pass must not become a disk sweep. That last makes
+    a hit a strong hint rather than a promise -- the collector's own loader may
+    still reject the entry and refetch, spending requests this pass priced at
+    zero. That is the safe direction: the ledger records what is actually spent,
+    and the alternative (pricing a free walk at full cost) is the failure this
+    exists to prevent.
+    """
+    if provider not in CENSUS_PROVIDERS or args.refetch_census:
+        return None
+    return census_cache_probe(provider, city.city_id, frozen_bbox(city))
+
+
 def run_collect(args: argparse.Namespace) -> int:
     data_dir = args.data_dir
     provider = args.provider
@@ -169,11 +198,19 @@ def run_collect(args: argparse.Namespace) -> int:
             # Dry run: no key, no API calls — just report the work + cost.
             # Only GSV bills per sample location; Mapillary reads a tile census
             # whose size is set by the city's area, not by the sample count.
-            cost = (
-                f"{len(query_points)} unique GSV queries"
-                if provider == "gsv"
-                else f"~{estimate_tile_count(city.center_lat, city.center_lon, city.grid_width_m, city.grid_height_m, city.step_m)} Mapillary tile requests (independent of spacing)"
-            )
+            cached = _cached_census_marker(city, provider, args)
+            if cached is not None:
+                cost = (
+                    f"0 Mapillary tile requests (cached census fetched by "
+                    f"{cached.get('fetched_by')}, crawl started "
+                    f"{cached.get('crawl_started_at')})"
+                )
+            else:
+                cost = (
+                    f"{len(query_points)} unique GSV queries"
+                    if provider == "gsv"
+                    else f"~{estimate_tile_count(city.center_lat, city.center_lon, city.grid_width_m, city.grid_height_m, city.step_m)} Mapillary tile requests (independent of spacing)"
+                )
             print(
                 f"{city.city_id} [{args.network_type}]: {len(edges)} edges, "
                 f"{len(samples)} samples, {cost} "
@@ -200,20 +237,30 @@ def run_collect(args: argparse.Namespace) -> int:
         # type's walk re-finalizes for zero requests, writing the first crawl's
         # api_requests_total into the second's row. Both walks read the same
         # tiles, so the census is identical and nothing downstream would show it.
-        checkpoint_path = None
-        if provider == "mapillary":
-            checkpoint_path = checkpoint_path_for(
-                city.city_id,
-                grid_bbox(
-                    city.center_lat,
-                    city.center_lon,
-                    city.grid_width_m,
-                    city.grid_height_m,
-                    city.step_m,
-                ),
-                budget_channel,
-                variant=args.network_type,
-            )
+        #
+        # THE CACHE PATH IS THE MIRROR IMAGE (issue #290) and is built from the
+        # PROVIDER, with neither the channel nor the network type in it. The
+        # paragraph above ends "both walks read the same tiles, so the census is
+        # identical and nothing downstream would show it" -- that identity is a
+        # HAZARD for a checkpoint, whose spend belongs to exactly one crawl, and
+        # the whole POINT for a cache, which holds a finished observation any
+        # consumer may republish. The grid run writes the entry minutes earlier
+        # on a paired night; this walk and the other --network-type both read it
+        # for zero requests.
+        #
+        # Both, and the "is this a census provider" test, come from ONE
+        # derivation (crawl_store_for), the same one the grid run uses, so the
+        # writer and this reader key the identical lattice. (None, None) for gsv.
+        checkpoint_path, census_cache = crawl_store_for(
+            provider,
+            city,
+            budget_channel,
+            variant=args.network_type,
+            reuse=not args.refetch_census,
+            # The snapshot date being written: an entry observed after it is
+            # refused rather than published into a snapshot from its past.
+            run_date=run_date,
+        )
 
         # The provider and network-type tokens are what keep same-night walks
         # apart. Both providers walk the SAME sample points and the scheduler
@@ -257,9 +304,20 @@ def run_collect(args: argparse.Namespace) -> int:
 
         # Pre-flight budget guard against the isolated street ledger. Only GSV
         # spends per sample location; a Mapillary walk costs its tile census.
+        #
+        # A cached census costs nothing, so the guard must not abort on it
+        # (#290). Without this, the cheapest possible walk -- one whose census
+        # the grid run already paid for -- is exactly the one a nearly-exhausted
+        # street budget refuses, and the reuse never happens on the nights it
+        # helps most. The probe reads the marker only, so it is honest about
+        # "cost" and deliberately not about "will validate"; an entry the
+        # collector then rejects costs a re-fetch that was not budgeted, which
+        # is the safe direction (the ledger still records what was spent).
         estimated_requests = (
             len(query_points)
             if provider == "gsv"
+            else 0
+            if _cached_census_marker(city, provider, args) is not None
             else estimate_tile_count(
                 city.center_lat,
                 city.center_lon,
@@ -317,6 +375,7 @@ def run_collect(args: argparse.Namespace) -> int:
                         checkpoint_path=checkpoint_path,
                         checkpoint_channel=budget_channel,
                         checkpoint_variant=args.network_type,
+                        census_cache=census_cache,
                     )
                 )
         except Exception as e:
@@ -429,6 +488,12 @@ def run_collect(args: argparse.Namespace) -> int:
             # figure because it is additive and keyed by (date, provider) --
             # see the same split in cli.py's register_run (#239, #256).
             api_requests=dict_results.get("api_requests_total", dict_results["api_requests"]),
+            # Which channel actually paid for this census and when it observed
+            # the provider (issue #290). A walk on a paired night costs 0, and
+            # these are what make that 0 legible rather than alarming; NULL for
+            # gsv, which has no census to share.
+            census_fetched_by=dict_results.get("census_fetched_by"),
+            census_fetched_at=dict_results.get("census_fetched_at"),
             started_at=dict_results.get("started_at"),
             finished_at=dict_results.get("finished_at") or datetime.now(UTC).isoformat(),
         )
@@ -574,6 +639,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--estimate",
         action="store_true",
         help="Report edge/sample/query counts and exit — no API key or requests needed",
+    )
+    parser.add_argument(
+        "--refetch-census",
+        action="store_true",
+        help="""Ask Mapillary again instead of reusing the census the grid run
+             (or the other --network-type) already fetched for this city and
+             bbox (issue #290). DELIBERATELY SEPARATE FROM --force: --force
+             clears this run date's artifacts, and a walk whose tail died after
+             writing its CSV is re-run with --force and must re-finalize for
+             zero requests rather than re-pay a census it already bought.""",
     )
     parser.add_argument("--batch-size", type=int, default=100)
     parser.add_argument("--connection-limit", type=int, default=50)

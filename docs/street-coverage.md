@@ -73,6 +73,18 @@ The Mapillary arm emits #116's status vocabulary at sample level
 — which `compute_streetwalk_coverage` turns into **two numbers per edge**: `coverage_fraction` (360°) and `coverage_fraction_any`, summarized as `coverage_pct_by_length[_any]`.
 GSV emits no FLAT_ONLY, so its any-value equals its 360° value by construction; `street_walks.coverage_pct_by_length_any` (**schema v8**) is NULL on pre-v8 walks — "not measured", never a copy.
 
+## A Mapillary walk on a paired night costs zero requests (issue #290)
+
+**A Mapillary road walk reads the same z14 census over the same frozen bbox its city's grid run reads, so on a paired night it reuses that census for zero requests instead of buying a second copy.**
+That identity was always true and was previously only a hazard: it is why the two channels need separate CHECKPOINTS (a shared one would let them resume each other's spend into the wrong ledger under the wrong credential), and the ledger showed byte-identical daily totals for `mapillary` and `mapillary_streets` as a result (#287).
+`--network-type all_public`, previously a THIRD identical census, is free for the same reason — the cache key carries neither the channel nor the network type, only the provider, the city and the bbox.
+
+Consequences for reading a walk's row: `street_walks.api_requests` is legitimately **0** on a fully walked city, and schema v14's `census_fetched_by`/`census_fetched_at` are what make that legible — which channel's credential and ledger paid, and when Mapillary was actually observed (the crawl's first commit, which on a paired night is minutes earlier and on a budget-deferred one can be the previous night).
+Every row's `query_timestamp` carries that observation instant rather than this process's clock, for the same reason.
+`--estimate` and the `--daily-budget` pre-flight both report a cached census as 0 requests; without that the cheapest possible walk is exactly the one a nearly-spent street budget refuses.
+`--force` is cache-transparent — it is about this run date's artifacts — and `--refetch-census` is the opt-out that takes the observation afresh.
+Mechanism: [`docs/census.md`](census.md).
+
 ## Street channels are scheduled like grid providers
 
 **Street channels are scheduled like grid providers.** `gsv_streets`/`mapillary_streets` are no longer skipped by the scheduler's config loader — they are first-class channels in `[providers.*]`, both `enabled = true`.

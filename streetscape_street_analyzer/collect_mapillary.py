@@ -42,6 +42,7 @@ import pandas as pd
 
 from streetscape_metadata_tracker.analysis import FLAT_ONLY
 from streetscape_metadata_tracker.census import census_is_pano
+from streetscape_metadata_tracker.checkpointing import CensusCache, observation_timestamp
 from streetscape_metadata_tracker.download_mapillary import (
     DEFAULT_TILE_REQUESTS_PER_MINUTE,
     build_empty_rows,
@@ -241,6 +242,7 @@ async def collect_mapillary_street_samples_async(
     checkpoint_path: str | None = None,
     checkpoint_channel: str | None = None,
     checkpoint_variant: str | None = None,
+    census_cache: CensusCache | None = None,
 ) -> dict[str, Any]:
     """
     Collect Mapillary street samples for a city and write the snapshot csv.gz.
@@ -256,6 +258,15 @@ async def collect_mapillary_street_samples_async(
     The census is fetched over the city's **frozen grid bbox** — the same
     footprint the Mapillary grid run uses — so a street walk can never reach
     imagery outside the area the city is defined to cover.
+
+    THAT IDENTITY IS WHAT ``cache_path`` EXPLOITS (issue #290). The grid run and
+    this walk read the same tiles over the same bbox, so on a paired night the
+    grid run pays and this walk reads its census from the shared cache for zero
+    requests — and a second walk at another ``--network-type`` is free as well.
+    ``census_cache.reuse=False`` (``--refetch-census``) opts out. When the census IS
+    reused, every row's ``query_timestamp`` records when the provider was
+    observed rather than when this process started, and the return carries
+    ``census_fetched_by``/``census_fetched_at`` for the ``street_walks`` row.
     """
     started_at = datetime.now(UTC).isoformat()
     if not output_csv_gz_path.endswith(".csv.gz"):
@@ -275,7 +286,11 @@ async def collect_mapillary_street_samples_async(
         checkpoint_path=checkpoint_path,
         checkpoint_channel=checkpoint_channel,
         checkpoint_variant=checkpoint_variant,
+        census_cache=census_cache,
     )
+    # A reused census is stamped with when the provider was observed, a fresh
+    # one with this process's clock; see checkpointing.observation_timestamp.
+    query_timestamp = observation_timestamp(fetched, started_at)
     # THE TAIL IS WRAPPED BECAUSE THE CHECKPOINT CHANGES WHAT A CRASH HERE COSTS
     # (#256). Without one, a failure below lost the spend with the process and
     # the caller recorded whatever the exception carried. With one, the
@@ -300,7 +315,7 @@ async def collect_mapillary_street_samples_async(
             len(query_points),
         )
 
-        df = build_streetwalk_rows(query_points, census, match_dist_m, started_at)
+        df = build_streetwalk_rows(query_points, census, match_dist_m, query_timestamp)
         del census
         # Straight into the gzip handle: to_csv() with no path builds the whole CSV
         # as a str and then a second copy as bytes, which at a big city's sample
@@ -322,6 +337,9 @@ async def collect_mapillary_street_samples_async(
         "api_requests": fetched["api_requests"],
         "api_requests_total": fetched["api_requests_total"],
         "checkpoint_path": fetched.get("checkpoint_path"),
+        "census_fetched_by": fetched.get("census_fetched_by"),
+        "census_fetched_at": fetched.get("census_fetched_at"),
+        "census_reused": bool(fetched.get("census_reused")),
         "num_flat_images": num_flat_images,
         "started_at": started_at,
         "finished_at": datetime.now(UTC).isoformat(),

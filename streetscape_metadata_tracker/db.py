@@ -27,7 +27,7 @@ from .naming import sanitize_city_query_str
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS cities (
@@ -87,6 +87,19 @@ CREATE TABLE IF NOT EXISTS runs (
     newest_capture_date TEXT,
     median_pano_age_years REAL,
     api_requests        INTEGER,
+    -- Census provenance (v14, issue #290). A Mapillary or KartaView census is
+    -- fetched once per (provider, city, frozen bbox) and REUSED by every other
+    -- consumer of that observation -- the paired road walk, a second
+    -- --network-type, the other channel of the pair -- so a fully collected
+    -- city can legitimately show api_requests = 0. These two are what make that
+    -- zero explicable rather than alarming: which channel's credential and
+    -- ledger actually paid, and when the provider was observed (the crawl's
+    -- first commit, which on a resumed crawl is an earlier night than
+    -- run_date). NULL is the honest "not measured": every gsv run, every
+    -- legacy/archival row, and every run salvaged by _reconcile_orphaned_run,
+    -- which reads a CSV off disk and cannot know.
+    census_fetched_by   TEXT,
+    census_fetched_at   TEXT,
     UNIQUE (city_id, provider, run_date)
 );
 CREATE INDEX IF NOT EXISTS idx_runs_city_date
@@ -242,6 +255,14 @@ CREATE TABLE IF NOT EXISTS street_walks (
     -- carried a capture date.
     median_covered_age_years REAL,
     api_requests           INTEGER,
+    -- Census provenance (v14, issue #290); see the identical pair on `runs`.
+    -- A Mapillary walk on a night its city's grid run already collected costs
+    -- ZERO requests, so this is where "the mapillary channel paid for it" is
+    -- recorded -- otherwise api_requests = 0 on a fully walked city reads as a
+    -- bug. NULL for every gsv walk, every pre-v14 row, and every walk salvaged
+    -- by _reconcile_orphaned_walk, which reads artifacts off disk.
+    census_fetched_by      TEXT,
+    census_fetched_at      TEXT,
     started_at             TEXT,
     finished_at            TEXT,
     -- network_type is part of the key (v9): one frozen bbox yields a small
@@ -543,6 +564,12 @@ class RunRow:
     newest_capture_date: str | None
     median_pano_age_years: float | None
     api_requests: int | None
+    # v14 (issue #290). NOT optional on the dataclass even though the columns
+    # are nullable: _row_to_run builds RunRow(**dict(row)) from SELECT *, so a
+    # column without a field here is an unexpected keyword argument and
+    # get_latest_run raises on every catalog at v14.
+    census_fetched_by: str | None = None
+    census_fetched_at: str | None = None
 
 
 def utc_now_iso() -> str:
@@ -647,6 +674,13 @@ def init_schema(conn: sqlite3.Connection) -> None:
     if user_version == 12:
         _migrate_v12_to_v13(conn)
         user_version = 13
+    # v13 -> v14 (issue #290): runs and street_walks gain the census-provenance
+    # pair. Additive and nullable, so every existing row keeps the honest "not
+    # measured" -- a census fetched before the cache existed has no recorded
+    # payer.
+    if user_version == 13:
+        _migrate_v13_to_v14(conn)
+        user_version = 14
     conn.executescript(_SCHEMA)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
@@ -864,6 +898,44 @@ def _migrate_v12_to_v13(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+# The v14 provenance columns, in DDL order, per table. Named once so the
+# migration and its idempotency guard cannot drift apart (the shape
+# _V12_STREET_WALK_COLUMNS and _V13_SCHEDULE_STATE_COLUMNS already use).
+_V14_CENSUS_PROVENANCE_COLUMNS = ("census_fetched_by", "census_fetched_at")
+
+
+def _migrate_v13_to_v14(conn: sqlite3.Connection) -> None:
+    """Add census provenance to runs and street_walks (v14, issue #290).
+
+    Additive; no table rebuild, exactly like _migrate_v12_to_v13, and idempotent
+    for the same reason: each ADD COLUMN is skipped when the column already
+    exists, so a catalog interrupted midway completes on the next connect. An
+    absent table means the CREATE TABLE in _SCHEMA below builds it current.
+
+    Deliberately declared with **no DEFAULT**: SQLite's ADD COLUMN without one
+    is O(1) and fills every existing row NULL, which is exactly the semantics
+    wanted. NULL here means "not measured" -- these runs and walks were
+    collected before the shared census cache existed, so nothing recorded which
+    channel paid, and inventing a value would claim provenance we do not have.
+
+    Applies to a rebuilt v1 catalog too (whose frozen _MIGRATE_V1_TO_V2 SQL must
+    NOT gain these columns), because that rebuild lands on the v2 shape and then
+    walks forward through every migration including this one.
+    """
+    for table in ("runs", "street_walks"):
+        cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if not cols:
+            # Absent table -> the CREATE TABLE in _SCHEMA below builds it current.
+            continue
+        missing = [c for c in _V14_CENSUS_PROVENANCE_COLUMNS if c not in cols]
+        if not missing:
+            continue
+        logger.info(f"Migrating catalog schema v13 -> v14 ({table}: {', '.join(missing)})")
+        for column in missing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT")
+    conn.commit()
+
+
 def derive_city_id(city_name: str, state_name: str | None, country_name: str | None) -> str:
     """
     Canonical city id: the sanitized slug of the full (never abbreviated)
@@ -1032,6 +1104,8 @@ def register_run(
     newest_capture_date: str | None = None,
     median_pano_age_years: float | None = None,
     api_requests: int | None = None,
+    census_fetched_by: str | None = None,
+    census_fetched_at: str | None = None,
 ) -> int:
     """
     Register a completed collection run. Raises sqlite3.IntegrityError if a
@@ -1048,8 +1122,9 @@ def register_run(
             status_flat_only, status_other, unique_panos, unique_google_panos,
             coverage_rate_pct, any_imagery_coverage_rate_pct, num_flat_images,
             oldest_capture_date, newest_capture_date, median_pano_age_years,
-            api_requests)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            api_requests, census_fetched_by, census_fetched_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                   ?, ?)""",
         (
             city_id,
             provider,
@@ -1075,6 +1150,8 @@ def register_run(
             newest_capture_date,
             median_pano_age_years,
             api_requests,
+            census_fetched_by,
+            census_fetched_at,
         ),
     )
     conn.commit()
@@ -1400,6 +1477,8 @@ def register_street_walk(
     length_km_covered_any: float | None = None,
     median_covered_age_years: float | None = None,
     api_requests: int | None = None,
+    census_fetched_by: str | None = None,
+    census_fetched_at: str | None = None,
     started_at: str | None = None,
     finished_at: str | None = None,
 ) -> int:
@@ -1421,8 +1500,9 @@ def register_street_walk(
             edges_fully_covered, mean_edge_coverage, coverage_pct_by_length,
             coverage_pct_by_length_any, coverage_by_highway, length_km,
             length_km_covered, length_km_covered_any, median_covered_age_years,
-            api_requests, started_at, finished_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            api_requests, census_fetched_by, census_fetched_at,
+            started_at, finished_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(city_id, provider, network_type, run_date) DO UPDATE SET
              csv_filename = excluded.csv_filename,
              coverage_filename = excluded.coverage_filename,
@@ -1440,6 +1520,8 @@ def register_street_walk(
              length_km_covered_any = excluded.length_km_covered_any,
              median_covered_age_years = excluded.median_covered_age_years,
              api_requests = excluded.api_requests,
+             census_fetched_by = excluded.census_fetched_by,
+             census_fetched_at = excluded.census_fetched_at,
              started_at = excluded.started_at,
              finished_at = excluded.finished_at""",
         (
@@ -1463,6 +1545,8 @@ def register_street_walk(
             length_km_covered_any,
             median_covered_age_years,
             api_requests,
+            census_fetched_by,
+            census_fetched_at,
             started_at,
             finished_at,
         ),

@@ -30,13 +30,15 @@ import logging
 import math
 import os
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pytest
 
-from streetscape_metadata_tracker import analysis
+from streetscape_metadata_tracker import analysis, checkpointing
 from streetscape_metadata_tracker import download_kartaview as kv
+from streetscape_metadata_tracker.checkpointing import CensusCache, load_census_cache_marker
 from streetscape_metadata_tracker.download_common import (
     HOST_BUSY_EXIT_CODES,
     HOST_EXIT_CODES,
@@ -1785,7 +1787,9 @@ def test_a_stale_checkpoint_is_discarded_rather_than_spliced_into_todays_snapsho
 
     state = _state(ckpt)
     aged = datetime.now(UTC) - timedelta(seconds=kv.CHECKPOINT_MAX_AGE_S + 60)
-    state["updated_at"] = aged.isoformat()
+    # created_at, not updated_at: the cap is measured from the FIRST commit
+    # (issue #272), so ageing the last write alone must NOT be what expires it.
+    state["created_at"] = aged.isoformat()
     (ckpt / kv.CHECKPOINT_STATE_FILENAME).write_text(json.dumps(state))
 
     whole, whole_calls = _sweep(monkeypatch, _photos)
@@ -1809,7 +1813,7 @@ def test_a_checkpoint_from_last_night_still_resumes(monkeypatch, tmp_path):
     _failed_sweep_ckpt(monkeypatch, _photos, ckpt, max_requests=2)
 
     state = _state(ckpt)
-    state["updated_at"] = (datetime.now(UTC) - timedelta(hours=18)).isoformat()
+    state["created_at"] = (datetime.now(UTC) - timedelta(hours=18)).isoformat()
     (ckpt / kv.CHECKPOINT_STATE_FILENAME).write_text(json.dumps(state))
 
     whole, whole_calls = _sweep(monkeypatch, _photos)
@@ -2132,12 +2136,22 @@ def test_every_commit_rename_is_followed_by_a_directory_fsync():
     """
     lines = inspect.getsource(kv._commit_checkpoint).splitlines()
     renames = [i for i, line in enumerate(lines) if "os.replace(" in line]
-    assert len(renames) == 2, f"expected the part and state renames, saw {len(renames)}"
+    assert len(renames) == 1, f"expected the part rename, saw {len(renames)}"
     for i in renames:
         following = next(line for line in lines[i + 1 :] if line.strip())
         assert "_fsync_dir(" in following, (
             f"the rename on line {i + 1} of _commit_checkpoint is not made durable: {following!r}"
         )
+    # The state record goes through the ONE durable-JSON writer both providers
+    # and the cache marker share, so the rename-then-fsync sequence is pinned
+    # there rather than re-audited in each copy.
+    assert "_write_json_durable(_state_path(cp.path), state)" in inspect.getsource(
+        kv._commit_checkpoint
+    )
+    shared = inspect.getsource(checkpointing._write_json_durable).splitlines()
+    (rename,) = [i for i, line in enumerate(shared) if "os.replace(" in line]
+    following = next(line for line in shared[rename + 1 :] if line.strip())
+    assert "_fsync_dir(" in following
 
 
 def test_a_commit_failure_that_is_not_an_oserror_cannot_swallow_a_host_block(monkeypatch, tmp_path):
@@ -2531,3 +2545,440 @@ def test_a_busy_host_lock_stops_a_resume_before_it_opens_the_checkpoint(monkeypa
         competitor.release()
     assert calls == []
     assert (ckpt / kv.CHECKPOINT_STATE_FILENAME).read_bytes() == before
+
+
+# ── The first-commit stamp (issue #272) ────────────────────────────────────
+#
+# The age cap used to be measured from `updated_at`, and `updated_at` moves on
+# nights that sweep NOTHING: the finally-commit runs on a host block, a rejected
+# credential and a budget stop at request 1. A host-blocked night deliberately
+# records no `consecutive_failures`, so the same stalest city is re-attempted
+# every night — which means such a city could refresh its own clock forever and
+# hold rows from any distance in the past under the limit. Mapillary's
+# checkpoint already aged from its first commit; this is the same fix here.
+
+
+def test_the_first_commit_stamp_is_written_once_and_carried_forward(monkeypatch, tmp_path):
+    ckpt = tmp_path / "sweep"
+    _failed_sweep_ckpt(monkeypatch, _photos, ckpt, max_requests=2)
+    first = _state(ckpt)
+    assert first["created_at"], "the first commit stamps the origin"
+
+    _failed_sweep_ckpt(monkeypatch, _photos, ckpt, max_requests=1)
+    second = _state(ckpt)
+    assert second["created_at"] == first["created_at"], "carried forward, never re-stamped"
+    assert second["updated_at"] > first["updated_at"], "while updated_at still moves"
+
+
+def test_a_night_that_sweeps_nothing_cannot_refresh_the_origin(monkeypatch, tmp_path):
+    """
+    THE case the stamp exists for. This night is refused at request 1 — the
+    shape of a host block, which records no consecutive_failure and so is
+    re-attempted the next night and the next. Ageing from a timestamp such a
+    night moves would let the city hold last quarter's rows under the cap
+    indefinitely.
+    """
+    ckpt = tmp_path / "sweep"
+    _failed_sweep_ckpt(monkeypatch, _photos, ckpt, max_requests=2)
+    origin = _state(ckpt)["created_at"]
+
+    # Backdate the whole record, then run a night whose budget stops it before
+    # it can sweep anything. The finally-commit still rewrites state.json.
+    state = _state(ckpt)
+    aged = (datetime.now(UTC) - timedelta(days=6)).isoformat()
+    state["created_at"] = aged
+    (ckpt / kv.CHECKPOINT_STATE_FILENAME).write_text(json.dumps(state))
+
+    _failed_sweep_ckpt(monkeypatch, _photos, ckpt, max_requests=0)
+    assert _state(ckpt)["created_at"] == aged, "a no-progress night must not restamp it"
+    assert _state(ckpt)["created_at"] != origin
+
+
+def test_a_v1_checkpoint_is_discarded_rather_than_read_forward(monkeypatch, tmp_path, caplog):
+    """
+    A v1 record has no first-commit stamp at all, and adopting `updated_at` in
+    its place is exactly the bug the bump exists to fix. So it goes through the
+    ordinary format-mismatch arm: one in-flight city re-sweeps, once, on the
+    build that ships this.
+    """
+    ckpt = tmp_path / "sweep"
+    _failed_sweep_ckpt(monkeypatch, _photos, ckpt, max_requests=2)
+    state = _state(ckpt)
+    state["format_version"] = 1
+    del state["created_at"]
+    (ckpt / kv.CHECKPOINT_STATE_FILENAME).write_text(json.dumps(state))
+
+    whole, whole_calls = _sweep(monkeypatch, _photos)
+    with caplog.at_level(logging.WARNING, logger=kv.logger.name):
+        result, calls = _sweep_ckpt(monkeypatch, _photos, ckpt)
+    assert "format v1" in caplog.text
+    assert len(calls) == len(whole_calls)
+    pd.testing.assert_frame_equal(result["census"], whole["census"])
+
+
+# ── The shared census cache (issue #290) ───────────────────────────────────
+#
+# This matters more here than for Mapillary. A KartaView sweep is HOURS at the
+# paced 16/min (Singapore ~10.4 h), so a grid run and the #258 road walk of one
+# city sweeping the identical frozen bbox is not a doubled cost in the abstract —
+# it is a second overnight against a host that meters by IP.
+#
+# The extra hazard on this side is the finally-commit, which is deliberately
+# best-effort (a checkpoint must never fail a sweep that succeeded). Its failure
+# leaves an on-disk store that LAGS the in-memory census while still reading
+# complete by its own counters — the one state a reuser cannot detect, and what
+# the four-part promotion predicate exists to exclude.
+
+
+def _cache(tmp_path, name="entry"):
+    return str(tmp_path / "cache" / name)
+
+
+def _sweep_cached(monkeypatch, responder, cache, *, channel, path, reuse=True, **kwargs):
+    """A sweep wired to the shared cache, with its own private checkpoint."""
+    return _sweep(
+        monkeypatch,
+        responder,
+        checkpoint_path=str(path),
+        checkpoint_channel=channel,
+        census_cache=CensusCache(cache, reuse=reuse),
+        **kwargs,
+    )
+
+
+def test_the_walk_reads_the_grid_runs_sweep_for_zero_requests(monkeypatch, tmp_path, caplog):
+    """
+    One sweep, two consumers. The census must be the SAME frame row for row —
+    fetch order is what dedupe_census reads as first-appearance position, and the
+    sweep re-sees ~pi/2 of everything by construction, so any reordering would
+    reshuffle the published CSV of essentially every real city.
+    """
+    cache = _cache(tmp_path)
+    grid, grid_calls = _sweep_cached(
+        monkeypatch, _photos, cache, channel="kartaview", path=tmp_path / "cp-grid"
+    )
+    assert grid_calls, "the grid run paid for it"
+
+    with caplog.at_level(logging.WARNING, logger=kv.logger.name):
+        walk, walk_calls = _sweep_cached(
+            monkeypatch, _photos, cache, channel="kartaview_streets", path=tmp_path / "cp-walk"
+        )
+    assert walk_calls == [], "the walk must not touch KartaView"
+    pd.testing.assert_frame_equal(walk["census"], grid["census"])
+    assert "REUSING the KartaView census fetched by kartaview" in caplog.text
+    assert walk["api_requests"] == 0
+
+
+def test_a_reuse_restores_the_census_counters_from_the_record(monkeypatch, tmp_path):
+    """
+    `cells_visited`, `raw_photo_count` and `radius_m` describe the CENSUS rather
+    than the process that fetched it — the same rule a resume follows — so a
+    reuser must report the sweep's figures, not zeros. `radius_m` in particular
+    is what a later run's estimate and timeout are derived from.
+    """
+    cache = _cache(tmp_path)
+    grid, _ = _sweep_cached(
+        monkeypatch, _photos, cache, channel="kartaview", path=tmp_path / "cp-grid"
+    )
+    walk, _ = _sweep_cached(
+        monkeypatch, _photos, cache, channel="kartaview_streets", path=tmp_path / "cp-walk"
+    )
+
+    for key in ("cells", "cells_visited", "raw_photo_count", "radius_m", "num_images", "num_panos"):
+        assert walk[key] == grid[key], key
+
+
+def test_a_reuse_costs_zero_and_a_same_channel_refinalize_carries_the_sweep(monkeypatch, tmp_path):
+    """
+    The counter split, KartaView side. `api_requests` is always 0 — this process
+    issued none, and the daily ledger is additive by (date, provider). But a
+    SAME-channel reader is #239's re-finalize, not a reuse: a caller that died
+    before its artifact was durable, coming back to write the row for a sweep it
+    paid for. That row still has to price the collection.
+    """
+    cache = _cache(tmp_path)
+    grid, grid_calls = _sweep_cached(
+        monkeypatch, _photos, cache, channel="kartaview", path=tmp_path / "cp-grid"
+    )
+
+    refinalize, _ = _sweep_cached(
+        monkeypatch, _photos, cache, channel="kartaview", path=tmp_path / "cp-grid-again"
+    )
+    assert refinalize["api_requests"] == 0
+    assert refinalize["api_requests_total"] == len(grid_calls)
+
+    walk, _ = _sweep_cached(
+        monkeypatch, _photos, cache, channel="kartaview_streets", path=tmp_path / "cp-walk"
+    )
+    assert walk["api_requests"] == 0
+    assert walk["api_requests_total"] == 0, "this collection cost nothing"
+    assert walk["census_fetched_by"] == "kartaview", "and the row says who did pay"
+
+
+def test_a_reuse_inherits_the_failed_cells_rather_than_re_probing_them(monkeypatch, tmp_path):
+    """
+    Deliberately UNLIKE a same-channel resume, which re-probes carried failures
+    because a refusal is time-varying (fact 2). A resume is continuing one crawl;
+    this is republishing a finished one, so the same query points must read
+    REQUEST_FAILED in both artifacts — the same observation, not a fresher one
+    mixed into a dated snapshot.
+    """
+    seen = []
+
+    def one_bad_cell(call):
+        seen.append(call)
+        if len(seen) == 1:
+            raise kv.ResponseError("HTTP 500")
+        return _photos(call)
+
+    # One failed cell of four is 53% of this fixture bbox, and the real 2%
+    # guard would refuse to finalize. Widened because what is under test is
+    # what a REUSER inherits, not where the guard sits (which
+    # test_a_sweep_that_leaves_too_much_unmeasured_refuses pins).
+    monkeypatch.setattr(kv, "MAX_FAILED_AREA_FRACTION", 0.9)
+
+    cache = _cache(tmp_path)
+    grid, _ = _sweep_cached(
+        monkeypatch,
+        one_bad_cell,
+        cache,
+        channel="kartaview",
+        path=tmp_path / "cp-grid",
+        retries=0,
+    )
+    assert len(grid["failed_cells"]) == 1
+
+    walk, walk_calls = _sweep_cached(
+        monkeypatch, _photos, cache, channel="kartaview_streets", path=tmp_path / "cp-walk"
+    )
+    assert walk_calls == [], "the hole is inherited, not re-asked"
+    assert walk["failed_cells"] == grid["failed_cells"], (
+        "the same cells, so the same query points read REQUEST_FAILED in both artifacts"
+    )
+
+
+def test_the_sweeps_own_channel_re_probes_its_failed_cells_rather_than_inheriting_them(
+    monkeypatch, tmp_path, caplog
+):
+    """
+    The same channel coming back is #239's re-finalize — a tail that died
+    between promotion and the catalog row — and load_checkpoint's COMPLETE path
+    re-probes carried failures because a refusal is time-varying. Promotion
+    must not silently drop that: the entry is handed back to the checkpoint,
+    the resume re-probes the cell, and what it re-promotes has no hole.
+    """
+    seen = []
+
+    def one_bad_cell(call):
+        seen.append(call)
+        if len(seen) == 1:
+            raise kv.ResponseError("HTTP 500")
+        return _photos(call)
+
+    monkeypatch.setattr(kv, "MAX_FAILED_AREA_FRACTION", 0.9)
+    cache = _cache(tmp_path)
+    grid, _ = _sweep_cached(
+        monkeypatch, one_bad_cell, cache, channel="kartaview", path=tmp_path / "cp-grid", retries=0
+    )
+    assert len(grid["failed_cells"]) == 1
+
+    with caplog.at_level(logging.WARNING):
+        again, calls = _sweep_cached(
+            monkeypatch, _photos, cache, channel="kartaview", path=tmp_path / "cp-grid"
+        )
+    assert calls, "the failed cell was re-asked"
+    assert "re-probes them" in caplog.text
+    assert again["failed_cells"] == []
+    assert again["checkpoint_path"] is None, "re-promoted"
+    assert load_census_cache_marker(cache)["failed"] == []
+    assert not (tmp_path / "cp-grid").exists()
+
+
+def test_the_promoted_checkpoint_is_not_left_behind_for_the_caller_to_discard(
+    monkeypatch, tmp_path
+):
+    ckpt = tmp_path / "cp-grid"
+    cache = _cache(tmp_path)
+    result, _ = _sweep_cached(monkeypatch, _photos, cache, channel="kartaview", path=ckpt)
+
+    assert result["checkpoint_path"] is None, "the directory MOVED"
+    assert not ckpt.exists()
+    assert os.path.isdir(cache)
+
+
+def test_an_incomplete_sweep_is_never_promoted(monkeypatch, tmp_path):
+    """
+    SweepIncompleteError is the deliberate multi-night pause: its checkpoint is
+    legitimate progress the next night resumes, and it must stay where the caller
+    can find it. Reused as a census it would publish the unvisited cells' query
+    points as genuine no-imagery.
+    """
+    ckpt = tmp_path / "cp"
+    cache = _cache(tmp_path)
+    error, _ = _failed_sweep(
+        monkeypatch,
+        _photos,
+        checkpoint_path=str(ckpt),
+        checkpoint_channel="kartaview",
+        census_cache=CensusCache(cache),
+        max_requests=2,
+    )
+    assert isinstance(error, kv.SweepIncompleteError)
+    assert ckpt.exists(), "the caller resumes from it tomorrow"
+    assert not os.path.exists(cache)
+
+
+def test_a_sweep_whose_final_commit_failed_is_never_promoted(monkeypatch, tmp_path, caplog):
+    """
+    THE KartaView-specific trap, and why the promotion predicate has a
+    `final_commit_ok` clause rather than trusting the stored counters.
+
+    The finally-commit is best-effort by design — a checkpoint that cannot be
+    written must never be what fails a sweep — so its failure is logged and
+    swallowed and the sweep still returns a census. In general that leaves an
+    on-disk store LAGGING the in-memory census by everything since the last
+    periodic commit, while `state.json` still passes every geometric check a
+    reuser makes. A reuser cannot detect that, so the predicate refuses on the
+    commit having failed rather than trying to tell the benign case from the
+    lossy one.
+
+    Here the last periodic commit HAS landed, so the store happens to be
+    complete — the strictly harder case for the predicate, and the one that
+    isolates this clause from the other three.
+    """
+    ckpt = tmp_path / "cp"
+    cache = _cache(tmp_path)
+    real_commit = kv._commit_checkpoint
+    at_the_end = {"n": 0}
+
+    def fail_the_finally_commit(cp, frames, **kwargs):
+        # Two commits arrive with every root done: the periodic one at the last
+        # root boundary, and then the one in the sweep's `finally`. Only the
+        # second is the one this test is about; failing the first would
+        # propagate out of the loop instead of being swallowed.
+        if kwargs["roots_done"] == kwargs["root_count"]:
+            at_the_end["n"] += 1
+            if at_the_end["n"] > 1:
+                raise OSError("no space left on device")
+        return real_commit(cp, frames, **kwargs)
+
+    monkeypatch.setattr(kv, "_commit_checkpoint", fail_the_finally_commit)
+    with caplog.at_level(logging.ERROR, logger=kv.logger.name):
+        result, calls = _sweep(
+            monkeypatch,
+            _photos,
+            checkpoint_path=str(ckpt),
+            checkpoint_channel="kartaview",
+            census_cache=CensusCache(cache),
+            checkpoint_request_interval=1,
+        )
+    assert calls, "the sweep itself succeeded"
+    assert at_the_end["n"] == 2, "the finally-commit is the one that failed"
+    assert "Could not commit the KartaView checkpoint" in caplog.text
+    assert not os.path.exists(cache), "a possibly-lagging store must not become a cache entry"
+    assert result["checkpoint_path"] == str(ckpt), "and the caller still owns its checkpoint"
+    assert ckpt.exists()
+
+
+def test_an_incomplete_cache_entry_is_refused_and_deleted(monkeypatch, tmp_path, caplog):
+    """
+    Completeness is the one check a cache entry makes that a resume does NOT: a
+    partial sweep is legitimate progress, a partial census is a hole.
+    """
+    cache = _cache(tmp_path)
+    _sweep_cached(monkeypatch, _photos, cache, channel="kartaview", path=tmp_path / "cp-grid")
+
+    state = _state(Path(cache))
+    state["roots_done"] -= 1
+    (Path(cache) / kv.CHECKPOINT_STATE_FILENAME).write_text(json.dumps(state))
+
+    whole, whole_calls = _sweep(monkeypatch, _photos)
+    with caplog.at_level(logging.WARNING, logger=kv.logger.name):
+        _result, calls = _sweep_cached(
+            monkeypatch, _photos, cache, channel="kartaview_streets", path=tmp_path / "cp-walk"
+        )
+    assert "only a COMPLETE sweep is reusable" in caplog.text
+    assert len(calls) == len(whole_calls), "an incomplete entry costs a full sweep, not a hole"
+
+
+def test_an_entry_swept_at_another_radius_is_refused_but_not_deleted(monkeypatch, tmp_path, caplog):
+    """
+    A promoted entry IS a moved checkpoint, so the same cascade runs over it,
+    and an explicit radius that contradicts the stored one wins — the lattice
+    indices in every part name mean nothing without the radius that produced
+    them. But the radius (like ``ipp``) is THIS CALLER's parameter, not a
+    property of the entry: a `--ipp 200` harness or an explicit-radius walk must
+    not cost every other consumer the grid run's ten-hour sweep. Refused for
+    this caller, left for the rest.
+    """
+    cache = _cache(tmp_path)
+    _sweep_cached(monkeypatch, _photos, cache, channel="kartaview", path=tmp_path / "cp-grid")
+
+    with caplog.at_level(logging.INFO):
+        _result, calls = _sweep_cached(
+            monkeypatch,
+            _photos,
+            cache,
+            channel="kartaview_streets",
+            path=tmp_path / "cp-walk",
+            radius_m=500,
+        )
+    assert "an explicit radius wins" in caplog.text
+    assert calls, "it re-swept rather than reusing a lattice it does not describe"
+    # The explicit-radius sweep promoted its own entry over the space -- so
+    # check the non-deletion the other way round: an ipp mismatch against the
+    # entry that now stands leaves it for the consumer that fits it.
+    _result, calls = _sweep_cached(
+        monkeypatch, _photos, cache, channel="kartaview", path=tmp_path / "cp-odd", ipp=7
+    )
+    assert calls, "refused for this caller"
+    assert load_census_cache_marker(cache) is not None, "and kept for the others"
+
+
+def test_refetch_census_re_sweeps_and_replaces_the_entry(monkeypatch, tmp_path):
+    cache = _cache(tmp_path)
+    _sweep_cached(monkeypatch, _photos, cache, channel="kartaview", path=tmp_path / "cp-grid")
+
+    result, calls = _sweep_cached(
+        monkeypatch,
+        _photos,
+        cache,
+        channel="kartaview_streets",
+        path=tmp_path / "cp-walk",
+        reuse=False,
+    )
+    assert calls, "the flag means ask again"
+    assert result["census_fetched_by"] == "kartaview_streets"
+    assert load_census_cache_marker(cache)["fetched_by"] == "kartaview_streets", (
+        "and the entry it leaves is the fresher one"
+    )
+
+
+def test_no_cache_path_is_the_historical_behaviour(monkeypatch, tmp_path):
+    """The pre-#290 path, byte for byte: the caller still owns its checkpoint."""
+    ckpt = tmp_path / "cp"
+    result, calls = _sweep_ckpt(monkeypatch, _photos, ckpt, checkpoint_channel="kartaview")
+    assert result["checkpoint_path"] == str(ckpt)
+    assert ckpt.exists()
+    assert calls
+
+
+def test_an_unwritable_cache_never_fails_a_sweep(monkeypatch, tmp_path):
+    """
+    Ten hours of paid-for sweeping must never be lost to its own optimization.
+    When promotion cannot happen the caller keeps its checkpoint and discards it
+    exactly as before; the only cost is that the next consumer re-sweeps.
+    """
+    ckpt = tmp_path / "cp"
+    unwritable = tmp_path / "readonly"
+    unwritable.mkdir(mode=0o500)
+
+    result, calls = _sweep(
+        monkeypatch,
+        _photos,
+        checkpoint_path=str(ckpt),
+        checkpoint_channel="kartaview",
+        census_cache=CensusCache(str(unwritable / "sub" / "entry")),
+    )
+    assert calls, "the sweep succeeded"
+    assert result["checkpoint_path"] == str(ckpt), "and its checkpoint is still the caller's"

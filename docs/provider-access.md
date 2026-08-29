@@ -95,6 +95,8 @@ That is a decision rather than a task — it identifies this project to the vend
 
 **The daily budgets now encode the only constraint that fits the data: a rolling 2–3 day per-IP window (issue #241, superseding #214's throughput bet).** `[providers.mapillary].daily_request_budget` and `[providers.mapillary_streets]` are **1,750 each** (cut from 15,000 + 5,000 on 2026-08-22, and split evenly because both channels read the **identical z14 tile census** — a road walk re-reads the grid run's tiles
 — so the two budgets deplete in lockstep and a heavy slate defers the same cities on both channels rather than un-pairing them).
+**Since #290 the walk no longer re-reads those tiles: on a paired night it reuses the grid run's census for zero requests**, so `mapillary_streets`' budget is spent only on nights the two channels are *not* paired — which is what a budget deferral or a filtered run produces.
+The budget *values* are unchanged; sizing them for the new load is #286's question, and this issue's goal is strictly less load, never more.
 The block is per **IP**, so the number that matters is the **sum** across the two channels
 — different tokens, one address: **3,500/day**, chosen so any 2-day total stays ≤ 7,000, at or below the **highest value ever observed clean** (7,061).
 
@@ -130,6 +132,18 @@ And the pre-flight estimate still prices the whole tile count even when a resume
 
 What it buys, concretely: tiles fetched before a block survive it, a crash between the CSV write and cataloging re-finalizes for ~0 requests, and a night the scheduler winds down mid-city resumes rather than restarting
 — and it is what clears the resume gate on raising `max_concurrent_channels` above 1, since a deadline or SIGTERM under lanes kills up to N children at once instead of one.
+
+## A paired night now costs one census, not two (issue #290)
+
+**Reuse is the one pacing lever that costs nothing scientifically.**
+Every other way to reduce per-IP load trades something away: a lower rate lengthens the night, a smaller budget lengthens the catalog pass, a smaller grid shrinks the city.
+Fetching the *same* observation once instead of twice changes no number anyone reports — the two channels' artifacts were already built from byte-identical censuses, which is exactly why the ledger totals matched (#287).
+
+`mapillary` (rank 2) launches before `mapillary_streets` (rank 3) in a city, host affinity and the host lock serialize them, and both channels' dueness runs in lockstep — so on an ordinary night the grid run fetches and the walk reuses, and a walk deferred for budget still reuses within the 7-day window.
+An `all_public` walk, previously a third identical census, is free.
+The saving is ~50% of Mapillary tile requests for the same slate, drawn directly out of the rolling window the blocks come from.
+It lands **inert**: both Mapillary channels are paused in production (#285/#286), so it pays off the day they are re-enabled.
+Mechanism, the completeness and promotion rules, and why an in-flight checkpoint is never a cache entry: [`docs/census.md`](census.md).
 
 ## The supported way to run a bulk Mapillary catch-up
 

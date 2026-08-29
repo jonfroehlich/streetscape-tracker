@@ -244,6 +244,77 @@ def _isolate_checkpoints(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_census_cache(tmp_path, monkeypatch):
+    """
+    Point the shared census cache (issue #290) at a per-test directory.
+
+    The sibling of ``_isolate_checkpoints``, and needed more urgently than it.
+    A checkpoint is deleted by its caller once the artifact lands; a COMPLETED
+    census is now promoted into ``census_cache/`` and deliberately left there
+    for the next consumer — so without this, every test that drives a census
+    provider to completion would deposit a fixture-sized entry in the working
+    tree and leave it.
+
+    Worse than untidy, it would make tests share state in the one way the
+    checkpoint isolation was written to prevent, and MORE easily: the cache key
+    is (provider, city, bbox) with no channel, no variant and no date, so any
+    two tests using one fixture city would hand each other a census — and the
+    reader is silent about it beyond a log line, because reuse is the feature.
+    A test asserting "N tile requests" would pass alone and see 0 in a suite run.
+    """
+    from streetscape_metadata_tracker import checkpointing
+
+    monkeypatch.setenv(checkpointing.CENSUS_CACHE_DIR_ENV, str(tmp_path / "census_cache"))
+
+
+def stamp_census_cache(
+    cache_path,
+    provider="mapillary",
+    *,
+    fetched_by=None,
+    fetched_variant=None,
+    age_days=0,
+    api_requests_total=7,
+    failed=(),
+    **overrides,
+):
+    """
+    A marker-only cache entry -- what ``census_cache_probe`` reads (issue #290).
+
+    Goes through the production builder (``checkpointing.census_cache_marker``)
+    rather than spelling the dict out, so the marker's shape has ONE spelling
+    across the suite: a field the builder gains reaches every test that stamps
+    an entry, and a test cannot hand a reader an entry no writer would produce.
+    ``age_days`` backdates both the crawl's start and its completion; keyword
+    ``overrides`` land on the finished marker for the tests that need a
+    malformed one.
+    """
+    import json
+    from datetime import timedelta
+
+    from streetscape_metadata_tracker.checkpointing import (
+        CENSUS_CACHE_MARKER,
+        census_cache_marker,
+    )
+
+    os.makedirs(cache_path, exist_ok=True)
+    stamp = (datetime.now(UTC) - timedelta(days=age_days)).isoformat()
+    marker = census_cache_marker(
+        provider,
+        fetched_by=fetched_by or provider,
+        fetched_variant=fetched_variant,
+        crawl_started_at=stamp,
+        api_requests_total=api_requests_total,
+        failed=list(failed),
+    )
+    marker["completed_at"] = stamp
+    marker.update(overrides)
+    with open(os.path.join(cache_path, CENSUS_CACHE_MARKER), "w", encoding="utf-8") as fh:
+        json.dump(marker, fh)
+    return cache_path
+
+
+@pytest.fixture(autouse=True)
 def _no_overpass_status_probe(monkeypatch):
     """
     Stub the Overpass /status pre-flight (issue #209) for the whole suite.

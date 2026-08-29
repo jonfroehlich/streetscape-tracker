@@ -67,3 +67,12 @@ __pycache__/
 .venv/
 .venv-*/
 .tooling/
+
+# Completed censuses promoted out of checkpoints/ and shared across the channels
+# that read the same (provider, city, bbox) observation (issue #290). Same two
+# reasons as checkpoints/ above -- provider bulk data, and never publishable --
+# plus one of its own: this one is deliberately reachable by every consumer, so
+# a committed entry would be a census the next collection silently republishes.
+# The scheduler's tail prunes it; nothing here is ever needed to rebuild an
+# artifact.
+/census_cache/
