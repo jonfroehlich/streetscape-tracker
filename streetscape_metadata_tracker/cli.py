@@ -49,7 +49,7 @@ from . import (
     open_in_browser,
 )
 from .analysis import calculate_run_stats, detect_systemic_failure, print_df_summary
-from .checkpointing import census_cache_path_for, checkpoint_path_for, discard_checkpoint
+from .checkpointing import crawl_store_for, discard_checkpoint
 from .city_registration import (
     CityResolutionError,
     cap_dimensions,
@@ -61,7 +61,6 @@ from .download_common import (
     SWEEP_INCOMPLETE_EXIT_CODE,
     HostBusyError,
     HostUnavailableError,
-    grid_bbox,
     host_exit_code,
 )
 from .download_kartaview import (
@@ -766,24 +765,26 @@ async def _collect_one_run(conn, args, city_row, run_date, provider, config, vis
     # other's crawl -- under different ledgers, and for Mapillary under
     # different credentials (#239, #256). GSV resumes through a `.downloading`
     # sibling of its output instead and needs nothing here.
-    checkpoint_path = None
-    # The SHARED census cache (issue #290), built beside the checkpoint path and
-    # keyed deliberately unlike it: no channel, no variant, no date, because the
+    #
+    # The SHARED census cache (issue #290) is built beside it and keyed
+    # deliberately unlike it: no channel, no variant, no date, because the
     # census content depends on (provider, frozen bbox, when fetched) and nothing
     # else. That is what lets the paired road walk -- which sweeps this exact
     # bbox minutes later -- read this run's census for zero requests instead of
-    # buying a second copy against the same per-IP limit.
-    cache_path = None
-    if provider in ("mapillary", "kartaview"):
-        bbox = grid_bbox(
-            city_row.center_lat,
-            city_row.center_lon,
-            city_row.grid_width_m,
-            city_row.grid_height_m,
-            city_row.step_m,
-        )
-        checkpoint_path = checkpoint_path_for(city_row.city_id, bbox, provider)
-        cache_path = census_cache_path_for(provider, city_row.city_id, bbox)
+    # buying a second copy against the same per-IP limit. Both paths, and the
+    # "is this a census provider" test, come from ONE derivation
+    # (crawl_store_for), so the grid run and every reader key the same lattice
+    # and a provider cannot be cached on one surface and priced at full cost on
+    # another. (None, None) for gsv.
+    checkpoint_path, census_cache = crawl_store_for(
+        provider,
+        city_row,
+        provider,
+        reuse=not args.refetch_census,
+        # The snapshot date being written: an entry observed after it is refused
+        # (a backdated --force --run-date must not publish rows from its future).
+        run_date=run_date,
+    )
 
     try:
         if provider == "mapillary":
@@ -804,8 +805,7 @@ async def _collect_one_run(conn, args, city_row, run_date, provider, config, vis
                 # it correctly, so the state file also records which ledger its
                 # spend belongs to and refuses to resume another's.
                 checkpoint_channel=provider,
-                cache_path=cache_path,
-                reuse_census=not args.refetch_census,
+                census_cache=census_cache,
             )
         elif provider == "kartaview":
             dict_results = await download_kartaview_metadata_async(
@@ -826,8 +826,7 @@ async def _collect_one_run(conn, args, city_row, run_date, provider, config, vis
                 # derives it correctly, so the state file also records which
                 # ledger its spend belongs to and refuses to resume another's.
                 checkpoint_channel=provider,
-                cache_path=cache_path,
-                reuse_census=not args.refetch_census,
+                census_cache=census_cache,
             )
         elif provider == "gsv":
             logging.info(

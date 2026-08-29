@@ -35,8 +35,10 @@ from streetscape_metadata_tracker import checkpointing as dm_checkpointing
 from streetscape_metadata_tracker import download_mapillary as dm
 from streetscape_metadata_tracker.checkpointing import (
     CHECKPOINT_STATE_FILENAME,
+    CensusCache,
     census_cache_path_for,
     checkpoint_path_for,
+    load_census_cache_marker,
 )
 from streetscape_metadata_tracker.download_common import HOST_MAPILLARY_TILES, HostBlockedError
 from tests.test_mapillary import (
@@ -845,7 +847,18 @@ def _state_file(path):
 # gets backwards silently.
 
 
-def _fetch(tmp_path, lat, lon, *, channel, variant=None, cache_path, reuse=True, checkpoint=None):
+def _fetch(
+    tmp_path,
+    lat,
+    lon,
+    *,
+    channel,
+    variant=None,
+    cache_path,
+    reuse=True,
+    checkpoint=None,
+    run_date=None,
+):
     """One census fetch through the real entry point, cache wired up."""
     return asyncio.run(
         dm.fetch_city_images_async(
@@ -856,8 +869,7 @@ def _fetch(tmp_path, lat, lon, *, channel, variant=None, cache_path, reuse=True,
             checkpoint_path=checkpoint or str(tmp_path / f"cp-{channel}-{variant}"),
             checkpoint_channel=channel,
             checkpoint_variant=variant,
-            cache_path=cache_path,
-            reuse_census=reuse,
+            census_cache=CensusCache(cache_path, reuse, run_date) if cache_path else None,
         )
     )
 
@@ -930,7 +942,7 @@ def test_a_reused_census_writes_the_same_csv_as_a_fetched_one(
             connection_limit=1,
             checkpoint_path=str(tmp_path / "cp-grid"),
             checkpoint_channel="mapillary",
-            cache_path=cache_path,
+            census_cache=CensusCache(cache_path),
         )
     )
     served = _serve(monkeypatch, tiles_by_xy)
@@ -947,7 +959,7 @@ def test_a_reused_census_writes_the_same_csv_as_a_fetched_one(
             connection_limit=1,
             checkpoint_path=str(tmp_path / "cp-walk"),
             checkpoint_channel="mapillary_streets",
-            cache_path=cache_path,
+            census_cache=CensusCache(cache_path),
         )
     )
     assert served == []
@@ -1049,9 +1061,10 @@ def test_a_reuse_inherits_the_failed_tiles_rather_than_re_probing_them(
     monkeypatch, tmp_path, straddling_city, cache_path
 ):
     """
-    The reuser is publishing the SAME observation, so the same grid points must
-    read REQUEST_FAILED in both artifacts. Re-probing the holes would mix two
-    moments into one dated snapshot for no gain — and would not be free.
+    A CROSS-CHANNEL reuser is publishing the SAME observation, so the same grid
+    points must read REQUEST_FAILED in both artifacts. Re-probing the holes
+    would mix two moments into one dated snapshot for no gain — and would not
+    be free. (The crawl's own channel is the exception; see the next test.)
     """
     lat, lon = straddling_city
     tiles, tiles_by_xy = _golden_tiles(lat, lon)
@@ -1074,6 +1087,153 @@ def test_a_reuse_inherits_the_failed_tiles_rather_than_re_probing_them(
     assert walk["failed_tiles"] == [hole]
 
 
+def test_the_crawls_own_channel_re_probes_its_failed_tiles_rather_than_inheriting_them(
+    monkeypatch, tmp_path, straddling_city, cache_path
+):
+    """
+    The same (channel, variant) coming back is #239/#256's re-finalize — a tail
+    that died between promotion and the catalog row — and on main that path
+    resumed a COMPLETE checkpoint, which re-fetches the tiles that failed
+    because a refusal is time-varying. Promotion must not silently drop that:
+    the entry is handed back to the checkpoint, the resume re-probes the hole
+    for exactly one request, and the entry it re-promotes has no hole.
+    """
+    lat, lon = straddling_city
+    tiles, tiles_by_xy = _golden_tiles(lat, lon)
+    hole = tiles[-1]
+    monkeypatch.setattr(dm, "MAX_FAILED_TILE_FRACTION", 0.5)
+
+    _serve(monkeypatch, tiles_by_xy, failing={hole})
+    grid = _fetch(tmp_path, lat, lon, channel="mapillary", cache_path=cache_path)
+    assert grid["failed_tiles"] == [hole]
+
+    served = _serve(monkeypatch, tiles_by_xy)
+    again = _fetch(tmp_path, lat, lon, channel="mapillary", cache_path=cache_path)
+    assert served == [hole], "the hole was re-asked, and only the hole"
+    assert again["failed_tiles"] == []
+    assert again["api_requests"] == 1
+    # The row still prices the whole collection: the crawl's stored spend plus
+    # this re-probe (the resume rule the counter tests above pin).
+    assert again["api_requests_total"] >= len(tiles)
+    assert again["checkpoint_path"] is None, "re-promoted"
+    assert load_census_cache_marker(cache_path)["failed"] == []
+    # The entry was handed back and re-promoted, so nothing lingers under the
+    # checkpoint name.
+    assert not os.path.exists(str(tmp_path / "cp-mapillary-None"))
+
+
+def test_a_hit_discards_this_channels_older_partial_checkpoint(
+    monkeypatch, tmp_path, straddling_city, cache_path
+):
+    """
+    Last night's walk was host-blocked after one tile and left its checkpoint;
+    the grid run then completed and promoted. The walk's hit supersedes the
+    partial, which nothing else would ever touch — a hit returns before the
+    checkpoint is opened, and no pruner walks checkpoints/.
+    """
+    lat, lon = straddling_city
+    _tiles, tiles_by_xy = _golden_tiles(lat, lon)
+    walk_checkpoint = str(tmp_path / "cp-mapillary_streets-drive")
+
+    _serve(monkeypatch, tiles_by_xy, block_after=1)
+    with pytest.raises(HostBlockedError):
+        _fetch(
+            tmp_path, lat, lon, channel="mapillary_streets", variant="drive", cache_path=cache_path
+        )
+    assert os.path.exists(os.path.join(walk_checkpoint, CHECKPOINT_STATE_FILENAME))
+
+    _serve(monkeypatch, tiles_by_xy)
+    _fetch(tmp_path, lat, lon, channel="mapillary", cache_path=cache_path)
+
+    served = _serve(monkeypatch, tiles_by_xy)
+    walk = _fetch(
+        tmp_path, lat, lon, channel="mapillary_streets", variant="drive", cache_path=cache_path
+    )
+    assert served == [], "reused"
+    assert walk["census_fetched_by"] == "mapillary"
+    assert not os.path.exists(walk_checkpoint), "the superseded partial is gone"
+
+
+def test_an_interrupted_refetch_is_resumed_rather_than_abandoned_for_the_stale_entry(
+    monkeypatch, tmp_path, straddling_city, cache_path
+):
+    """
+    An operator's `--refetch-census` that was host-blocked mid-crawl is the
+    NEWER observation and the one they asked for. The next run without the flag
+    must resume it — not hit the entry it was started to replace and republish
+    that.
+    """
+    lat, lon = straddling_city
+    tiles, tiles_by_xy = _golden_tiles(lat, lon)
+
+    _serve(monkeypatch, tiles_by_xy)
+    _fetch(tmp_path, lat, lon, channel="mapillary", cache_path=cache_path)
+
+    _serve(monkeypatch, tiles_by_xy, block_after=1)
+    with pytest.raises(HostBlockedError):
+        _fetch(
+            tmp_path,
+            lat,
+            lon,
+            channel="mapillary_streets",
+            variant="drive",
+            cache_path=cache_path,
+            reuse=False,
+        )
+
+    served = _serve(monkeypatch, tiles_by_xy)
+    resumed = _fetch(
+        tmp_path, lat, lon, channel="mapillary_streets", variant="drive", cache_path=cache_path
+    )
+    assert 0 < len(served) < len(tiles), "resumed the newer crawl: the rest of it, not a reuse"
+    assert resumed["census_fetched_by"] == "mapillary_streets"
+    assert load_census_cache_marker(cache_path)["fetched_by"] == "mapillary_streets", (
+        "and the refetch replaced the entry it was started to replace"
+    )
+
+
+def test_a_backdated_run_date_refuses_an_entry_observed_after_it(
+    monkeypatch, tmp_path, straddling_city, cache_path
+):
+    """
+    `--force --run-date <earlier>` after a real collection must not publish
+    rows Mapillary served after the snapshot's own date. The window cannot see
+    this (the entry is minutes old), so the consumer's run_date is the guard;
+    the refetch then promotes over it, since a refetch is the fresher census.
+    """
+    lat, lon = straddling_city
+    tiles, tiles_by_xy = _golden_tiles(lat, lon)
+
+    _serve(monkeypatch, tiles_by_xy)
+    _fetch(tmp_path, lat, lon, channel="mapillary", cache_path=cache_path)
+
+    served = _serve(monkeypatch, tiles_by_xy)
+    yesterday = datetime.now(UTC).date() - timedelta(days=1)
+    backdated = _fetch(
+        tmp_path,
+        lat,
+        lon,
+        channel="mapillary_streets",
+        variant="drive",
+        cache_path=cache_path,
+        run_date=yesterday,
+    )
+    assert len(served) == len(tiles), "refetched rather than published from its own future"
+    assert backdated["census_reused"] is False
+
+    served = _serve(monkeypatch, tiles_by_xy)
+    _fetch(
+        tmp_path,
+        lat,
+        lon,
+        channel="mapillary_streets",
+        variant="all_public",
+        cache_path=cache_path,
+        run_date=datetime.now(UTC).date(),
+    )
+    assert served == [], "a consumer dated today reuses it"
+
+
 def test_an_interrupted_census_is_never_promoted(
     monkeypatch, tmp_path, straddling_city, cache_path
 ):
@@ -1092,7 +1252,7 @@ def test_an_interrupted_census_is_never_promoted(
         _fetch(tmp_path, lat, lon, channel="mapillary", cache_path=cache_path)
 
     assert not os.path.exists(cache_path)
-    assert dm.load_census_cache_marker(cache_path) is None
+    assert load_census_cache_marker(cache_path) is None
 
 
 def test_a_degraded_checkpoint_is_never_promoted(
@@ -1183,7 +1343,7 @@ def test_an_entry_that_does_not_describe_this_lattice_is_refused_and_deleted(
     # refused: the loader deleted the bad one and the walk promoted its own over
     # the space. (The deletion itself is pinned in test_census_cache.py, where
     # nothing writes a replacement.)
-    assert dm.load_census_cache_marker(cache_path)["fetched_by"] == "mapillary_streets"
+    assert load_census_cache_marker(cache_path)["fetched_by"] == "mapillary_streets"
 
 
 def test_a_stale_entry_is_refetched_rather_than_spliced_into_todays_snapshot(
@@ -1239,7 +1399,7 @@ def test_refetch_census_ignores_the_entry_and_replaces_it(
     )
     assert len(served) == len(tiles), "the flag means ask again"
     assert refetched["census_fetched_by"] == "mapillary_streets"
-    assert dm.load_census_cache_marker(cache_path)["fetched_by"] == "mapillary_streets", (
+    assert load_census_cache_marker(cache_path)["fetched_by"] == "mapillary_streets", (
         "and the entry it leaves is the fresher one"
     )
     assert first["census_fetched_at"] != refetched["census_fetched_at"]

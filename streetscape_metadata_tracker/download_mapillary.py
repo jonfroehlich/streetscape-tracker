@@ -52,7 +52,7 @@ import math
 import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any
 
 import aiohttp
@@ -80,16 +80,21 @@ from .analysis import FLAT_ONLY as FLAT_ONLY
 from .census import dedupe_census
 from .census import status_for_capture_dates as status_for_capture_dates
 from .checkpointing import (
-    CENSUS_CACHE_FORMAT_VERSION,
-    CENSUS_REUSE_MAX_AGE_S,
     CHECKPOINT_MAX_AGE_S,
+    MAPILLARY_CHECKPOINT_FORMAT_VERSION,
+    CensusCache,
     _bbox_matches,
     _fsync_dir,
     _remove_empty_checkpoint_dir,
     _state_path,
+    _write_json_durable,
+    census_cache_marker,
     discard_checkpoint,
-    load_census_cache_marker,
+    load_cached_store,
+    observation_timestamp,
     promote_checkpoint_to_cache,
+    reconcile_cache_hit,
+    reused_census_provenance,
 )
 from .config import MAPILLARY_METADATA_DTYPES
 from .download_common import _M_PER_DEG_LAT as _M_PER_DEG_LAT
@@ -625,7 +630,9 @@ async def _fetch_tile(
 # commit logs one warning and the fetch carries on unprotected, because a city
 # must never fail over its own safety net.
 
-MAPILLARY_CHECKPOINT_FORMAT_VERSION = 1
+# MAPILLARY_CHECKPOINT_FORMAT_VERSION is declared in checkpointing.py (imported
+# above) beside KartaView's, so the census cache probe can tell whether an
+# entry's commit record is one this loader reads without importing this module.
 CHECKPOINT_PART_TEMPLATE = "tile-{x}-{y}.parquet"
 
 
@@ -840,65 +847,49 @@ def load_cached_census(
     *,
     bbox: tuple[float, float, float, float],
     tiles: list[tuple[int, int]],
+    run_date: date | None = None,
 ) -> tuple[TileCheckpoint, dict] | None:
     """
     A COMPLETE census another consumer already paid for, or None (issue #290).
 
-    Never raises and, like :func:`load_tile_checkpoint`, DELETES an entry it
-    refuses: an entry that does not describe this lattice will never describe it,
-    and leaving it under the live name would make every later consumer pay the
-    same read to reach the same verdict.
-
-    Three things are checked, in this order:
-
-    1. the marker's own reuse window (``checkpointing.load_census_cache_marker``),
-       which is what keeps a week-old census out of a snapshot dated today;
-    2. the same geometric/footer cascade a resume makes
-       (:func:`_validate_tile_store`) -- a cache entry is a moved checkpoint, so
-       a re-registered grid or a truncated part must be caught identically;
-    3. COMPLETENESS, which a resume deliberately does NOT check and which is the
-       whole difference between the two. ``done`` plus the tiles the fetcher
-       recorded as FAILED must be the entire lattice. A partial entry reused as
-       a census would publish the missing tiles' grid points as genuine
-       no-imagery -- absence never observed -- in an immutable dated snapshot.
+    :func:`checkpointing.load_cached_store` -- which owns the marker window, the
+    ``run_date`` rule, the never-raise posture and the delete-what-is-refused
+    contract -- with this provider's two checks plugged in: the same
+    geometric/footer cascade a resume makes (:func:`_validate_tile_store`), and
+    COMPLETENESS, which a resume deliberately does NOT check and which is the
+    whole difference between the two. ``done`` plus the tiles the fetcher
+    recorded as FAILED must be the entire lattice; a partial entry reused as a
+    census would publish the missing tiles' grid points as genuine no-imagery,
+    absence never observed, in an immutable dated snapshot.
 
     Returns ``(store, marker)``: a :class:`TileCheckpoint` handle whose ``done``
     is what the entry holds (so :func:`_checkpoint_frame_for_tile` reads it back
     unchanged), and the provenance record naming who paid and when.
     """
 
-    def discard(reason: str) -> None:
-        logger.warning(f"Ignoring the cached Mapillary census at {cache_path}: {reason}")
-        discard_checkpoint(cache_path)
+    def validate(state: dict) -> tuple[dict[tuple[int, int], int] | None, str | None]:
+        return _validate_tile_store(cache_path, state, bbox=bbox, tiles=tiles)
 
-    marker = load_census_cache_marker(cache_path, max_age_s=CENSUS_REUSE_MAX_AGE_S)
-    if marker is None:
-        return None  # no entry, or one the marker check already removed
-    state_path = _state_path(cache_path)
-    if not os.path.exists(state_path):
-        discard("it has a marker but no commit record")
-        return None
-    try:
-        with open(state_path, encoding="utf-8") as f:
-            state = json.load(f)
-        done, reason = _validate_tile_store(cache_path, state, bbox=bbox, tiles=tiles)
-        if reason is not None:
-            discard(reason)
-            return None
+    def is_complete(done: dict[tuple[int, int], int], state: dict, marker: dict) -> str | None:
         failed = {(int(x), int(y)) for x, y in marker.get("failed") or []}
-        if done.keys() | failed != set(tiles):
-            missing = len(set(tiles) - done.keys() - failed)
-            discard(
-                f"it covers {len(done)} fetched + {len(failed)} failed of {len(tiles)} "
-                f"tiles, leaving {missing} never observed; only a COMPLETE census is "
-                f"reusable"
-            )
+        if done.keys() | failed == set(tiles):
             return None
-    except Exception as e:
-        # Broad on purpose, exactly as above: an unreadable cache entry must
-        # cost a re-fetch, never a city.
-        discard(f"{type(e).__name__}: {e}")
+        missing = len(set(tiles) - done.keys() - failed)
+        return (
+            f"it covers {len(done)} fetched + {len(failed)} failed of {len(tiles)} tiles, "
+            f"leaving {missing} never observed; only a COMPLETE census is reusable"
+        )
+
+    loaded = load_cached_store(
+        cache_path,
+        label="Mapillary census",
+        run_date=run_date,
+        validate=validate,
+        is_complete=is_complete,
+    )
+    if loaded is None:
         return None
+    done, marker = loaded
     return TileCheckpoint(path=cache_path, done=done), marker
 
 
@@ -1080,13 +1071,7 @@ def _write_checkpoint_state(
         "created_at": created_at,
         "updated_at": datetime.now(UTC).isoformat(),
     }
-    state_tmp = f"{_state_path(cp.path)}.tmp"
-    with open(state_tmp, "w", encoding="utf-8") as f:
-        json.dump(state, f)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(state_tmp, _state_path(cp.path))
-    _fsync_dir(cp.path)
+    _write_json_durable(_state_path(cp.path), state)
     # Only after the record naming it is durable, so a crash cannot leave the
     # in-memory stamp claiming an origin no file records.
     cp.created_at = created_at
@@ -1163,30 +1148,24 @@ def _reuse_cached_census(
     differently and the reused census would differ from the fetched one in every
     city that straddles a tile edge.
 
-    THE TWO REQUEST COUNTERS SPLIT DIFFERENTLY HERE, and it is the one rule in
-    this feature that is easy to get backwards:
-
-    * ``api_requests`` is 0 unconditionally. This process issued none, and the
-      daily ledger is additive and keyed by (date, provider) -- charging it
-      anything would bill another channel's spend against this one's budget
-      gate, which is exactly the per-IP figure #241/#267/#286 reason about.
-    * ``api_requests_total`` is the crawl's cost ONLY when the reuser is the
-      same (channel, variant) that paid it. That case is not a cross-channel
-      reuse at all: it is #239/#256's re-finalize, a caller that died before its
-      artifact was durable coming back to write the row for a crawl it paid for,
-      and the row must still say what the collection cost. A DIFFERENT channel
-      records 0, because its collection genuinely cost nothing and the
-      provenance columns are what explain the zero.
+    The request counters and the provenance come from
+    :func:`checkpointing.reused_census_provenance`, the one rule for both
+    providers: ``api_requests`` is 0 unconditionally, and ``api_requests_total``
+    is the crawl's cost only for the (channel, variant) that paid it.
 
     Failed tiles are inherited from the marker rather than re-probed. The reuser
     is publishing the SAME observation, so the same grid points read
     REQUEST_FAILED in both artifacts -- which is the honest answer, and the
     alternative (a handful of fresh requests for those tiles) would mix two
-    moments into one dated snapshot for no gain.
+    moments into one dated snapshot for no gain. The one reader for whom that is
+    wrong -- the crawl's OWN channel re-finalizing after a tail crash, which a
+    resume would re-probe -- never reaches here:
+    :func:`checkpointing.reconcile_cache_hit` hands such an entry back to its
+    checkpoint first.
     """
     store, marker = cached
     fetched_by = marker.get("fetched_by")
-    crawl_started_at = marker.get("crawl_started_at") or marker.get("completed_at")
+    crawl_started_at = marker.get("crawl_started_at")
     # WARNING, not INFO: a collection that issues no request is otherwise
     # indistinguishable from a real one in its artifact, and this line is what
     # an operator reading logs/collect_{city}_{channel}_{date}.log has to tell
@@ -1203,24 +1182,16 @@ def _reuse_cached_census(
     # resident twice through dedupe_census (issue #157).
     del results
     census = dedupe_census(census)
-    same_crawl = (fetched_by, marker.get("fetched_variant")) == (
-        checkpoint_channel,
-        checkpoint_variant,
-    )
     return {
         "census": census,
-        "api_requests": 0,
-        "api_requests_total": int(marker.get("api_requests_total") or 0) if same_crawl else 0,
-        # The entry is shared, so it is nobody's to discard.
-        "checkpoint_path": None,
         "tiles": len(tiles),
         "raw_feature_count": raw_feature_count,
         "num_images": len(census),
         "num_panos": int(census_core.census_is_pano(census).sum()),
         "failed_tiles": [(int(x), int(y)) for x, y in marker.get("failed") or []],
-        "census_fetched_by": fetched_by,
-        "census_fetched_at": crawl_started_at,
-        "census_reused": True,
+        # api_requests, api_requests_total, checkpoint_path and the provenance
+        # columns: the accounting both providers must agree on, from one place.
+        **reused_census_provenance(marker, channel=checkpoint_channel, variant=checkpoint_variant),
     }
 
 
@@ -1234,8 +1205,7 @@ async def fetch_city_images_async(
     checkpoint_path: str | None = None,
     checkpoint_channel: str | None = None,
     checkpoint_variant: str | None = None,
-    cache_path: str | None = None,
-    reuse_census: bool = True,
+    census_cache: CensusCache | None = None,
 ) -> dict[str, Any]:
     """
     Fetch a city's Mapillary tile census, serialized against other processes.
@@ -1269,8 +1239,7 @@ async def fetch_city_images_async(
                 checkpoint_path=checkpoint_path,
                 checkpoint_channel=checkpoint_channel,
                 checkpoint_variant=checkpoint_variant,
-                cache_path=cache_path,
-                reuse_census=reuse_census,
+                census_cache=census_cache,
             )
         except BaseException:
             # A city that failed before committing anything -- a rejected token,
@@ -1291,8 +1260,7 @@ async def _fetch_city_images(
     checkpoint_path: str | None = None,
     checkpoint_channel: str | None = None,
     checkpoint_variant: str | None = None,
-    cache_path: str | None = None,
-    reuse_census: bool = True,
+    census_cache: CensusCache | None = None,
 ) -> dict[str, Any]:
     """
     Fetch and dedupe every Mapillary image in a bbox from the z14 vector tiles.
@@ -1322,17 +1290,14 @@ async def _fetch_city_images(
         checkpoint_variant: what separates two crawls of one city within that
             channel — a walk's ``--network-type``, None for a grid run. Also
             recorded, for the same reason.
-        cache_path: the shared per-(provider, city, bbox) cache entry (issue
-            #290), also caller-built — see
-            :func:`checkpointing.census_cache_path_for`. Given one, a COMPLETE
-            census another consumer already paid for is reused here for zero
-            requests, and a census this call completes is PROMOTED into it on
-            the way out. None keeps the historical behaviour exactly.
-        reuse_census: False refetches even when the cache holds a usable entry,
-            and replaces it. The ``--refetch-census`` escape hatch, for an
-            operator who wants this observation taken now rather than reused.
-            It does NOT disable promotion: a refetch still leaves the fresher
-            census for the consumers behind it.
+        census_cache: the shared per-(provider, city, bbox) cache entry and how
+            this caller may use it (issue #290), also caller-built — see
+            :func:`checkpointing.crawl_store_for`. Given one, a COMPLETE census
+            another consumer already paid for is reused here for zero requests
+            (unless its ``reuse`` is False — the ``--refetch-census`` escape
+            hatch — or the entry postdates its ``run_date``), and a census this
+            call completes is PROMOTED into it on the way out, refetch included.
+            None keeps the historical behaviour exactly.
 
     Returns:
         Dict with ``census`` (the deduped columnar census — see
@@ -1363,21 +1328,34 @@ async def _fetch_city_images(
         f"tiles covering bbox {tuple(round(v, 4) for v in bbox)}"
     )
 
-    # THE CACHE IS CONSULTED BEFORE THE CHECKPOINT, and a hit never touches the
-    # checkpoint directory at all (issue #290). The two answer different
-    # questions and the order follows from that: a checkpoint is THIS crawl's
-    # unfinished work, a cache entry is a COMPLETE observation somebody else
-    # already paid for over the identical lattice. If a usable entry exists
-    # there is nothing left to fetch, so opening a checkpoint first would create
-    # a directory, resume a partial crawl and re-request tiles the answer for is
-    # already on disk.
+    # THE CACHE IS CONSULTED BEFORE THE CHECKPOINT IS OPENED (issue #290). The
+    # two answer different questions and the order follows from that: a
+    # checkpoint is THIS crawl's unfinished work, a cache entry is a COMPLETE
+    # observation somebody already paid for over the identical lattice. If a
+    # usable entry exists there is nothing left to fetch, so opening a
+    # checkpoint first would create a directory, resume a partial crawl and
+    # re-request tiles the answer for is already on disk.
+    #
+    # A hit is then RECONCILED with whatever sits at checkpoint_path
+    # (reconcile_cache_hit): a checkpoint newer than the entry is resumed
+    # instead, an older one is discarded as superseded, and an entry this very
+    # crawl paid for that still has failed tiles is handed back to the
+    # checkpoint so the resume below re-probes them.
     #
     # This whole block runs inside the host lock (fetch_city_images_async), so no
-    # second process on this machine can be mid-promotion into the entry being
-    # read here.
-    if reuse_census and cache_path:
-        cached = load_cached_census(cache_path, bbox=bbox, tiles=tiles)
-        if cached is not None:
+    # second process on this machine can be promoting into, or reading, the
+    # entry being read here.
+    if census_cache is not None and census_cache.reuse:
+        cached = load_cached_census(
+            census_cache.path, bbox=bbox, tiles=tiles, run_date=census_cache.run_date
+        )
+        if cached is not None and reconcile_cache_hit(
+            cached[1],
+            cache_path=census_cache.path,
+            checkpoint_path=checkpoint_path,
+            channel=checkpoint_channel,
+            variant=checkpoint_variant,
+        ):
             return _reuse_cached_census(
                 cached,
                 city_name=city_name,
@@ -1651,28 +1629,26 @@ async def _fetch_city_images(
     promoted = False
     total = _census_requests_total(checkpoint, api_requests)
     if (
-        cache_path
+        census_cache is not None
         and checkpoint is not None
         and not checkpoint.degraded
         and checkpoint.created_at is not None
     ):
         promoted = promote_checkpoint_to_cache(
             checkpoint.path,
-            cache_path,
-            {
-                "format_version": CENSUS_CACHE_FORMAT_VERSION,
-                "provider": "mapillary",
+            census_cache.path,
+            census_cache_marker(
+                "mapillary",
                 # RECORDED, never keyed: the entry is reusable by any channel,
                 # and this is what lets the catalog say who actually paid.
-                "fetched_by": checkpoint.channel,
-                "fetched_variant": checkpoint.variant,
-                "crawl_started_at": checkpoint.created_at,
-                "completed_at": datetime.now(UTC).isoformat(),
-                "api_requests_total": total,
-                # Inherited verbatim by every reuser rather than re-probed; see
-                # _reuse_cached_census.
-                "failed": [[int(x), int(y)] for x, y in failed_tiles],
-            },
+                fetched_by=checkpoint.channel,
+                fetched_variant=checkpoint.variant,
+                crawl_started_at=checkpoint.created_at,
+                api_requests_total=total,
+                # Inherited verbatim by a cross-channel reuser; the crawl's own
+                # channel re-probes them instead (reconcile_cache_hit).
+                failed=[[int(x), int(y)] for x, y in failed_tiles],
+            ),
         )
 
     return {
@@ -1725,8 +1701,7 @@ async def download_mapillary_metadata_async(
     max_requests_per_minute: int = DEFAULT_TILE_REQUESTS_PER_MINUTE,
     checkpoint_path: str | None = None,
     checkpoint_channel: str | None = None,
-    cache_path: str | None = None,
-    reuse_census: bool = True,
+    census_cache: CensusCache | None = None,
 ) -> dict[str, Any]:
     """
     Fetch Mapillary pano metadata for a city and write it as a run csv.gz.
@@ -1773,26 +1748,11 @@ async def download_mapillary_metadata_async(
         max_requests_per_minute=max_requests_per_minute,
         checkpoint_path=checkpoint_path,
         checkpoint_channel=checkpoint_channel,
-        cache_path=cache_path,
-        reuse_census=reuse_census,
+        census_cache=census_cache,
     )
-    # WHEN THE PROVIDER WAS OBSERVED, not when this process started, and only
-    # when the census was REUSED (issue #290). Every row of a reused census was
-    # fetched by an earlier collection, possibly on an earlier night, so
-    # stamping it with this process's clock would record an observation that
-    # never happened -- and json_summarizer reports the run's start/end from
-    # exactly this column. A freshly fetched census keeps `started_at`, which
-    # holds #256's byte-identity contract between an interrupted census and an
-    # uninterrupted one.
-    #
-    # `calculate_run_stats` still ages imagery against `run_date` rather than
-    # this, so a reused census can skew a pano age by at most the reuse window
-    # (7 days against an 80-day cadence).
-    query_timestamp = (
-        fetched.get("census_fetched_at") or started_at
-        if fetched.get("census_reused")
-        else started_at
-    )
+    # A reused census is stamped with when the provider was observed, a fresh
+    # one with this process's clock; see checkpointing.observation_timestamp.
+    query_timestamp = observation_timestamp(fetched, started_at)
     api_requests = fetched["api_requests"]
     api_requests_total = fetched["api_requests_total"]
     failed_tiles = fetched.get("failed_tiles") or []

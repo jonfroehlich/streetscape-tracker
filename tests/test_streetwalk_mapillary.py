@@ -19,7 +19,7 @@ that join trustworthy:
 import gzip
 import json
 import os
-from datetime import UTC, date, datetime
+from datetime import date
 
 import geopandas as gpd
 import pytest
@@ -28,8 +28,6 @@ from shapely.geometry import LineString
 from streetscape_metadata_tracker import db
 from streetscape_metadata_tracker import download_gsv as dg
 from streetscape_metadata_tracker.checkpointing import (
-    CENSUS_CACHE_FORMAT_VERSION,
-    CENSUS_CACHE_MARKER,
     census_cache_path_for,
     checkpoint_path_for,
 )
@@ -44,6 +42,7 @@ from streetscape_metadata_tracker.naming import (
 )
 from streetscape_street_analyzer import collect
 from streetscape_street_analyzer import collect_mapillary as cm
+from tests.conftest import stamp_census_cache
 
 # ~222 m north-south edge, plus a short spur — same geometry as the GSV test.
 LONG_EDGE = LineString([(-121.30, 44.05), (-121.30, 44.052)])
@@ -116,8 +115,10 @@ def _setup(
         calls["checkpoint_path"] = kwargs.get("checkpoint_path")
         calls["checkpoint_channel"] = kwargs.get("checkpoint_channel")
         calls["checkpoint_variant"] = kwargs.get("checkpoint_variant")
-        calls["cache_path"] = kwargs.get("cache_path")
-        calls["reuse_census"] = kwargs.get("reuse_census")
+        policy = kwargs.get("census_cache")
+        calls["cache_path"] = policy.path if policy else None
+        calls["reuse_census"] = policy.reuse if policy else None
+        calls["run_date"] = policy.run_date if policy else None
         return {
             "census": records_to_census(images),
             # Per-process spend and the crawl's cumulative spend are different
@@ -679,6 +680,9 @@ def test_the_walk_reaches_the_provider_keyed_cache_the_grid_run_writes(tmp_path,
     )
     assert calls["cache_path"] != calls["checkpoint_path"]
     assert calls["reuse_census"] is True
+    # The snapshot date travels with the policy, so an entry observed after a
+    # backdated --run-date is refused at the loader rather than published.
+    assert calls["run_date"] == date.fromisoformat(RUN_DATE)
 
 
 def test_a_reused_census_costs_the_street_ledger_nothing_and_says_who_paid(tmp_path, monkeypatch):
@@ -845,18 +849,4 @@ def test_the_budget_preflight_does_not_abort_a_free_walk(tmp_path, monkeypatch):
 
 def _stamp_cache_entry(cache_path, *, fetched_by="mapillary"):
     """A marker-only cache entry — what `census_cache_probe` reads."""
-    os.makedirs(cache_path, exist_ok=True)
-    with open(os.path.join(cache_path, CENSUS_CACHE_MARKER), "w", encoding="utf-8") as fh:
-        json.dump(
-            {
-                "format_version": CENSUS_CACHE_FORMAT_VERSION,
-                "provider": "mapillary",
-                "fetched_by": fetched_by,
-                "fetched_variant": None,
-                "crawl_started_at": datetime.now(UTC).isoformat(),
-                "completed_at": datetime.now(UTC).isoformat(),
-                "api_requests_total": 7,
-                "failed": [],
-            },
-            fh,
-        )
+    return stamp_census_cache(cache_path, "mapillary", fetched_by=fetched_by)

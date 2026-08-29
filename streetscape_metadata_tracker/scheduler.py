@@ -48,7 +48,13 @@ from tabulate import tabulate
 
 from . import catalog_backup, db, driving_plan
 from .alerting import AlertConfig, send_alert, should_alert
-from .checkpointing import census_cache_probe, prune_census_cache
+from .checkpointing import (
+    CENSUS_PROVIDERS,
+    CENSUS_REUSE_MAX_AGE_S,
+    census_cache_probe,
+    frozen_bbox,
+    prune_census_cache,
+)
 from .city_registration import (
     MAX_GRID_DIM_M,
     CityResolutionError,
@@ -62,7 +68,6 @@ from .download_common import (
     HOST_MAPILLARY_TILES,
     HOST_OVERPASS,
     SWEEP_INCOMPLETE_EXIT_CODE,
-    grid_bbox,
     redact_credentials,
 )
 from .download_kartaview import (
@@ -1061,43 +1066,47 @@ def _mapillary_timeout_seconds(
     return int(max(floor, paced_seconds * _TIMEOUT_HEADROOM + _TIMEOUT_FIXED_SLACK_S))
 
 
-# Channels whose cost is a shared census: one fetch per (provider, city, frozen
-# bbox) serves every one of them (issue #290). Maps channel -> the PROVIDER the
-# cache is keyed on, which is the whole point -- 'mapillary' and
-# 'mapillary_streets' are different ledgers reading one observation.
-CENSUS_CACHE_CHANNEL_PROVIDERS = {
-    "mapillary": "mapillary",
-    "mapillary_streets": "mapillary",
-    "kartaview": "kartaview",
-}
+def _census_reuse_window_s(cfg: SchedulerConfig) -> float:
+    """
+    The reuse window a SCHEDULER probe prices against: the consumer's window
+    less the length of the batch (issue #290).
+
+    The probe runs at slate time and the child loads the entry up to
+    ``max_batch_hours`` later, so an entry that would expire in between must
+    not be priced as free: the child's loader would refuse it and fetch at full
+    cost with the budget gate already passed and no in-child request cap.
+    """
+    return max(0.0, CENSUS_REUSE_MAX_AGE_S - cfg.max_batch_hours * 3600.0)
 
 
-def channel_census_cache_marker(city: db.CityRow, provider: str) -> dict | None:
+def channel_census_cache_marker(
+    city: db.CityRow, channel: str, *, max_age_s: float = CENSUS_REUSE_MAX_AGE_S
+) -> dict | None:
     """
     Is a reusable census on hand for this (channel, city)? Marker only (#290).
 
-    Answers None for every channel whose cost is not a shared census -- gsv and
-    gsv_streets query per point, so there is nothing to share.
+    A channel reads its PROVIDER's entry -- 'mapillary' and 'mapillary_streets'
+    are different ledgers reading one observation -- and the provider is derived
+    the one way the scheduler already knows (``STREET_CHANNELS``), gated on
+    ``CENSUS_PROVIDERS``, rather than by a second table that would have to be
+    edited beside the first when a channel is added. Answers None for every
+    channel whose cost is not a shared census: gsv and gsv_streets query per
+    point, so there is nothing to share.
     """
-    cache_provider = CENSUS_CACHE_CHANNEL_PROVIDERS.get(provider)
-    if cache_provider is None:
+    provider = STREET_CHANNELS.get(channel, channel)
+    if provider not in CENSUS_PROVIDERS:
         return None
-    return census_cache_probe(
-        cache_provider,
-        city.city_id,
-        grid_bbox(
-            city.center_lat, city.center_lon, city.grid_width_m, city.grid_height_m, city.step_m
-        ),
-    )
+    return census_cache_probe(provider, city.city_id, frozen_bbox(city), max_age_s=max_age_s)
 
 
-def _marker_payer(city: db.CityRow, provider: str) -> str:
-    """Which channel paid for the cached census this channel would reuse."""
-    marker = channel_census_cache_marker(city, provider) or {}
-    return str(marker.get("fetched_by") or "an earlier collection")
-
-
-def _channel_estimate(cfg: SchedulerConfig, city: db.CityRow, provider: str, conn=None) -> int:
+def _channel_estimate(
+    cfg: SchedulerConfig,
+    city: db.CityRow,
+    provider: str,
+    conn=None,
+    *,
+    cached: bool | None = None,
+) -> int:
     """Price one channel's request count — the ONE derivation, for every caller.
 
     ``estimate_requests`` needs a channel's ``spacing_m``/``network_type`` out of
@@ -1121,8 +1130,17 @@ def _channel_estimate(cfg: SchedulerConfig, city: db.CityRow, provider: str, con
     matters. ``estimate_requests`` stays cache-blind on purpose: it is also the
     input to ``_mapillary_timeout_seconds``/``_kartaview_timeout_seconds``, and
     a 0 there would collapse a child's timeout onto the fixed floor.
+
+    ``cached`` lets a caller that has already probed the marker (the dry run,
+    which also names who paid) pass its answer rather than read it again; None
+    probes here, against the batch-narrowed window.
     """
-    if channel_census_cache_marker(city, provider) is not None:
+    if cached is None:
+        cached = (
+            channel_census_cache_marker(city, provider, max_age_s=_census_reuse_window_s(cfg))
+            is not None
+        )
+    if cached:
         return 0
     pc = (cfg.providers or {}).get(provider) or ProviderConfig()
     return estimate_requests(
@@ -3703,11 +3721,14 @@ def cmd_run_due(
                 # already in the shared cache is free (issue #290). Reading the
                 # raw estimate here would show an over-budget deferral for a
                 # channel the real run launches for nothing.
-                cached = channel_census_cache_marker(city, provider) is not None
-                est = _channel_estimate(cfg, city, provider, conn)
+                marker = channel_census_cache_marker(
+                    city, provider, max_age_s=_census_reuse_window_s(cfg)
+                )
+                est = _channel_estimate(cfg, city, provider, conn, cached=marker is not None)
                 fits = "ok" if est <= budget_left[provider] else "OVER BUDGET (deferred)"
-                if cached:
-                    fits = f"ok (cached census from {_marker_payer(city, provider)})"
+                if marker is not None:
+                    payer = marker.get("fetched_by") or "an earlier collection"
+                    fits = f"ok (cached census from {payer})"
                 print(f"  {city.city_id:60s} {provider:16s} ~{est:>9,} req  {fits}")
                 budget_left[provider] -= est if est <= budget_left[provider] else 0
         if cfg.driving_plan.enabled:

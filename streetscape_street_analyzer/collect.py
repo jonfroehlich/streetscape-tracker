@@ -71,16 +71,16 @@ from streetscape_metadata_tracker import config as cfg
 from streetscape_metadata_tracker import db
 from streetscape_metadata_tracker.analysis import detect_systemic_failure
 from streetscape_metadata_tracker.checkpointing import (
-    census_cache_path_for,
+    CENSUS_PROVIDERS,
     census_cache_probe,
-    checkpoint_path_for,
+    crawl_store_for,
     discard_checkpoint,
+    frozen_bbox,
 )
 from streetscape_metadata_tracker.config import load_config
 from streetscape_metadata_tracker.download_common import (
     DownloadError,
     HostUnavailableError,
-    grid_bbox,
     host_exit_code,
 )
 from streetscape_metadata_tracker.download_gsv import collect_points_async
@@ -148,19 +148,9 @@ def _cached_census_marker(city, provider: str, args) -> dict | None:
     and the alternative (pricing a free walk at full cost) is the failure this
     exists to prevent.
     """
-    if provider != "mapillary" or args.refetch_census:
+    if provider not in CENSUS_PROVIDERS or args.refetch_census:
         return None
-    return census_cache_probe(
-        provider,
-        city.city_id,
-        grid_bbox(
-            city.center_lat,
-            city.center_lon,
-            city.grid_width_m,
-            city.grid_height_m,
-            city.step_m,
-        ),
-    )
+    return census_cache_probe(provider, city.city_id, frozen_bbox(city))
 
 
 def run_collect(args: argparse.Namespace) -> int:
@@ -257,23 +247,20 @@ def run_collect(args: argparse.Namespace) -> int:
         # consumer may republish. The grid run writes the entry minutes earlier
         # on a paired night; this walk and the other --network-type both read it
         # for zero requests.
-        checkpoint_path = None
-        cache_path = None
-        if provider == "mapillary":
-            bbox = grid_bbox(
-                city.center_lat,
-                city.center_lon,
-                city.grid_width_m,
-                city.grid_height_m,
-                city.step_m,
-            )
-            checkpoint_path = checkpoint_path_for(
-                city.city_id,
-                bbox,
-                budget_channel,
-                variant=args.network_type,
-            )
-            cache_path = census_cache_path_for(provider, city.city_id, bbox)
+        #
+        # Both, and the "is this a census provider" test, come from ONE
+        # derivation (crawl_store_for), the same one the grid run uses, so the
+        # writer and this reader key the identical lattice. (None, None) for gsv.
+        checkpoint_path, census_cache = crawl_store_for(
+            provider,
+            city,
+            budget_channel,
+            variant=args.network_type,
+            reuse=not args.refetch_census,
+            # The snapshot date being written: an entry observed after it is
+            # refused rather than published into a snapshot from its past.
+            run_date=run_date,
+        )
 
         # The provider and network-type tokens are what keep same-night walks
         # apart. Both providers walk the SAME sample points and the scheduler
@@ -388,8 +375,7 @@ def run_collect(args: argparse.Namespace) -> int:
                         checkpoint_path=checkpoint_path,
                         checkpoint_channel=budget_channel,
                         checkpoint_variant=args.network_type,
-                        cache_path=cache_path,
-                        reuse_census=not args.refetch_census,
+                        census_cache=census_cache,
                     )
                 )
         except Exception as e:

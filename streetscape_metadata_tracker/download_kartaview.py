@@ -106,7 +106,7 @@ import math
 import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import aiohttp
@@ -117,12 +117,6 @@ import pyarrow.parquet as pq
 from . import census as census_core
 from .analysis import EARLIEST_PLAUSIBLE_CAPTURE
 from .checkpointing import (
-    CENSUS_CACHE_FORMAT_VERSION,
-    CENSUS_REUSE_MAX_AGE_S,
-    load_census_cache_marker,
-    promote_checkpoint_to_cache,
-)
-from .checkpointing import (
     CHECKPOINT_DIR_ENV as CHECKPOINT_DIR_ENV,
 )
 from .checkpointing import (
@@ -130,6 +124,18 @@ from .checkpointing import (
 )
 from .checkpointing import (
     CHECKPOINT_STATE_FILENAME as CHECKPOINT_STATE_FILENAME,
+)
+from .checkpointing import (
+    KARTAVIEW_CHECKPOINT_FORMAT_VERSION,
+    CacheEntryUnusableHere,
+    CensusCache,
+    _write_json_durable,
+    census_cache_marker,
+    load_cached_store,
+    observation_timestamp,
+    promote_checkpoint_to_cache,
+    reconcile_cache_hit,
+    reused_census_provenance,
 )
 from .checkpointing import (
     _bbox_matches as _bbox_matches,
@@ -270,13 +276,11 @@ MAX_FAILED_AREA_FRACTION = 0.02
 # worst case and one part file per ROOT -- 5,130 of them for Singapore, which is
 # its root-cell count and not its request count; the two differ by ~2x and it is
 # the cells that would each get a file.
-# v2 (issue #272): the commit record gained `created_at`, and the age cap moved
-# from `updated_at` onto it. A v1 record cannot be read forward -- it has no
-# first-commit stamp at all, and adopting `updated_at` in its place would be
-# exactly the bug the bump exists to fix -- so an old checkpoint is discarded by
-# the existing format-mismatch arm and its sweep restarts. That costs at most one
-# in-flight city, once, on the build that ships this.
-CHECKPOINT_FORMAT_VERSION = 2
+# The version itself is declared in checkpointing.py beside Mapillary's (see the
+# note there on v2, issue #272), so the census cache probe can read a store's
+# format without importing this module; this is the name the commit record and
+# the loader use.
+CHECKPOINT_FORMAT_VERSION = KARTAVIEW_CHECKPOINT_FORMAT_VERSION
 CHECKPOINT_PART_TEMPLATE = "part-{index:05d}.parquet"
 
 # Requests between commits. 32 is two minutes at the shipped pace, which bounds
@@ -1516,13 +1520,35 @@ def _part_path(path: str, index: int) -> str:
     return os.path.join(path, CHECKPOINT_PART_TEMPLATE.format(index=index))
 
 
+def _sweep_matches_caller(state: dict, *, ipp: int, requested_radius_m: int | None) -> str | None:
+    """
+    Does a stored sweep answer the question THIS caller is asking? A reason when
+    not, None when it does.
+
+    Deliberately separate from :func:`_validate_sweep_store`, which asks whether
+    the store is intact. Page size and an explicit radius are the CALLER's
+    parameters, not properties of the entry: a mismatch here says nothing about
+    the store being bad for anyone else, so a resume merely ignores it, and a
+    cache consumer must refuse WITHOUT deleting an entry every other consumer
+    can still read (a ``--ipp 200`` harness must not cost the grid run's
+    ten-hour Singapore sweep).
+    """
+    if int(state["ipp"]) != ipp:
+        return f"it was swept at ipp={state['ipp']}, this run uses ipp={ipp}"
+    radius_m = int(state["radius_m"])
+    if requested_radius_m is not None and requested_radius_m != radius_m:
+        return (
+            f"it was swept at r={radius_m} m and this run was asked for "
+            f"r={requested_radius_m} m; an explicit radius wins"
+        )
+    return None
+
+
 def _validate_sweep_store(
     path: str,
     state: dict,
     *,
     bbox: tuple[float, float, float, float],
-    ipp: int,
-    requested_radius_m: int | None,
 ) -> tuple[SweepCheckpoint | None, str | None]:
     """
     The geometric/footer cascade every reader of a sweep store makes.
@@ -1535,7 +1561,8 @@ def _validate_sweep_store(
     Factored out because a promoted cache entry (issue #290) IS a checkpoint
     directory that was moved, so it must be validated exactly as a resume is.
     What each caller adds on top is what differs: :func:`load_checkpoint` adds
-    the channel and the age of the sweep and then purges torn parts;
+    the channel, the caller's own parameters (:func:`_sweep_matches_caller`)
+    and the age of the sweep and then purges torn parts;
     :func:`load_cached_sweep` adds the marker's own window and the one check a
     resume must NOT make, completeness.
 
@@ -1550,14 +1577,7 @@ def _validate_sweep_store(
         )
     if not _bbox_matches(state["bbox"], bbox):
         return None, f"it was swept over bbox {state['bbox']}, this run uses {list(bbox)}"
-    if int(state["ipp"]) != ipp:
-        return None, f"it was swept at ipp={state['ipp']}, this run uses ipp={ipp}"
     radius_m = int(state["radius_m"])
-    if requested_radius_m is not None and requested_radius_m != radius_m:
-        return None, (
-            f"it was swept at r={radius_m} m and this run was asked for "
-            f"r={requested_radius_m} m; an explicit radius wins"
-        )
     root_count = int(state["root_count"])
     if len(cells_for_bbox(*bbox, radius_m * math.sqrt(2))) != root_count:
         # Catches a change to cells_for_bbox itself. The module docstring
@@ -1647,9 +1667,9 @@ def load_checkpoint(
                 f"{channel!r}; the two meter into different api_usage ledgers"
             )
             return None
-        cp, reason = _validate_sweep_store(
-            path, state, bbox=bbox, ipp=ipp, requested_radius_m=requested_radius_m
-        )
+        reason = _sweep_matches_caller(state, ipp=ipp, requested_radius_m=requested_radius_m)
+        if reason is None:
+            cp, reason = _validate_sweep_store(path, state, bbox=bbox)
         if reason is not None:
             discard(reason)
             return None
@@ -1728,6 +1748,7 @@ def load_cached_sweep(
     bbox: tuple[float, float, float, float],
     ipp: int,
     requested_radius_m: int | None,
+    run_date: date | None = None,
 ) -> tuple[SweepCheckpoint, dict] | None:
     """
     A COMPLETE sweep another consumer already paid for, or None (issue #290).
@@ -1738,61 +1759,50 @@ def load_cached_sweep(
     cost in the abstract -- it is a second overnight against a host that meters
     by IP.
 
-    Never raises and DELETES an entry it refuses, like Mapillary's loader and
-    unlike :func:`load_checkpoint` (which leaves an unusable checkpoint in place
-    because its parts are indexed by fetch order and would be overwritten
-    anyway). A cache entry is reachable by every consumer, so one that will never
-    validate has to go rather than be re-read by each of them in turn.
-
-    Three things are checked, in order: the marker's reuse window, the same
-    geometric/footer cascade a resume makes (:func:`_validate_sweep_store`), and
-    COMPLETENESS -- ``roots_done == root_count``. That last is the difference
-    between a checkpoint and a cache entry: a partial sweep is legitimate
-    progress, but reused as a census it would publish the unvisited cells' query
-    points as genuine no-imagery, which is absence never observed.
+    :func:`checkpointing.load_cached_store` -- which owns the marker window, the
+    ``run_date`` rule, the never-raise posture and the delete-what-is-refused
+    contract -- with this provider's checks plugged in: the caller's own
+    parameters (:func:`_sweep_matches_caller`, whose mismatch is raised as
+    :class:`CacheEntryUnusableHere` so the entry is left for the consumers it
+    does fit), the same geometric/footer cascade a resume makes
+    (:func:`_validate_sweep_store`), and COMPLETENESS -- ``roots_done ==
+    root_count``. That last is the difference between a checkpoint and a cache
+    entry: a partial sweep is legitimate progress, but reused as a census it
+    would publish the unvisited cells' query points as genuine no-imagery, which
+    is absence never observed.
 
     ``failed_cells`` in a complete entry are allowed (the fetcher's own
     ``MAX_FAILED_AREA_FRACTION`` guard already passed on them) and are INHERITED
-    RATHER THAN RE-PROBED. The reuser is publishing the same observation, so the
-    same query points read REQUEST_FAILED in both artifacts. That differs
-    deliberately from a same-channel resume, which re-probes them because a
-    refusal is time-varying -- a resume is continuing one crawl, while this is
-    republishing a finished one.
+    RATHER THAN RE-PROBED by a cross-channel reuser: it is publishing the same
+    observation, so the same query points read REQUEST_FAILED in both
+    artifacts. The crawl's OWN channel coming back to re-finalize is a resume,
+    and a resume re-probes them because a refusal is time-varying --
+    :func:`checkpointing.reconcile_cache_hit` hands such an entry back to its
+    checkpoint so :func:`load_checkpoint`'s COMPLETE path does exactly that.
     """
 
-    def discard(reason: str) -> None:
-        logger.warning(f"Ignoring the cached KartaView sweep at {cache_path}: {reason}")
-        discard_checkpoint(cache_path)
-
-    marker = load_census_cache_marker(cache_path, max_age_s=CENSUS_REUSE_MAX_AGE_S)
-    if marker is None:
-        return None  # no entry, or one the marker check already removed
-    state_path = _state_path(cache_path)
-    if not os.path.exists(state_path):
-        discard("it has a marker but no commit record")
-        return None
-    try:
-        with open(state_path, encoding="utf-8") as f:
-            state = json.load(f)
-        cp, reason = _validate_sweep_store(
-            cache_path, state, bbox=bbox, ipp=ipp, requested_radius_m=requested_radius_m
-        )
+    def validate(state: dict) -> tuple[SweepCheckpoint | None, str | None]:
+        reason = _sweep_matches_caller(state, ipp=ipp, requested_radius_m=requested_radius_m)
         if reason is not None:
-            discard(reason)
-            return None
-        cp.created_at = state.get("created_at")
+            raise CacheEntryUnusableHere(reason)
+        return _validate_sweep_store(cache_path, state, bbox=bbox)
+
+    def is_complete(cp: SweepCheckpoint, state: dict, marker: dict) -> str | None:
         root_count = int(state["root_count"])
-        if cp.roots_done != root_count:
-            discard(
-                f"it stopped at {cp.roots_done} of {root_count} root cells; only a "
-                f"COMPLETE sweep is reusable"
-            )
+        if cp.roots_done == root_count:
             return None
-    except Exception as e:
-        # Broad on purpose, exactly as above.
-        discard(f"{type(e).__name__}: {e}")
-        return None
-    return cp, marker
+        return (
+            f"it stopped at {cp.roots_done} of {root_count} root cells; only a "
+            f"COMPLETE sweep is reusable"
+        )
+
+    return load_cached_store(
+        cache_path,
+        label="KartaView sweep",
+        run_date=run_date,
+        validate=validate,
+        is_complete=is_complete,
+    )
 
 
 def _purge_uncommitted_parts(cp: SweepCheckpoint) -> None:
@@ -1892,13 +1902,7 @@ def _commit_checkpoint(
         "created_at": created_at,
         "updated_at": datetime.now(UTC).isoformat(),
     }
-    tmp_state = _state_path(cp.path) + ".tmp"
-    with open(tmp_state, "w", encoding="utf-8") as f:
-        json.dump(state, f)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp_state, _state_path(cp.path))
-    _fsync_dir(cp.path)
+    _write_json_durable(_state_path(cp.path), state)
     # Only after the record naming it is durable, so a crash cannot leave the
     # in-memory stamp claiming an origin no file records.
     cp.created_at = created_at
@@ -1933,8 +1937,7 @@ async def download_kartaview_metadata_async(
     radius_m: int | None = None,
     checkpoint_path: str | None = None,
     checkpoint_channel: str | None = None,
-    cache_path: str | None = None,
-    reuse_census: bool = True,
+    census_cache: CensusCache | None = None,
 ) -> dict[str, Any]:
     """
     Sweep a city's KartaView census and write it as a run csv.gz.
@@ -1992,17 +1995,11 @@ async def download_kartaview_metadata_async(
         max_requests=max_requests,
         checkpoint_path=checkpoint_path,
         checkpoint_channel=checkpoint_channel,
-        cache_path=cache_path,
-        reuse_census=reuse_census,
+        census_cache=census_cache,
     )
-    # WHEN THE PROVIDER WAS OBSERVED, not when this process started, and only
-    # when the census was REUSED (issue #290) -- see the identical rule in
-    # download_mapillary_metadata_async for why a fresh sweep keeps started_at.
-    query_timestamp = (
-        fetched.get("census_fetched_at") or started_at
-        if fetched.get("census_reused")
-        else started_at
-    )
+    # A reused census is stamped with when the provider was observed, a fresh
+    # one with this process's clock; see checkpointing.observation_timestamp.
+    query_timestamp = observation_timestamp(fetched, started_at)
     api_requests = fetched["api_requests"]
     api_requests_total = fetched["api_requests_total"]
     failed_cells = fetched.get("failed_cells") or []
@@ -2086,6 +2083,7 @@ def _reuse_cached_sweep(
     *,
     city_name: str,
     checkpoint_channel: str | None,
+    checkpoint_variant: str | None = None,
 ) -> dict[str, Any]:
     """
     Assemble a census from the shared cache. Zero requests (issue #290).
@@ -2097,16 +2095,12 @@ def _reuse_cached_sweep(
     argument :func:`_checkpoint_frames` documents for a resume, and the reason
     this reuses that function rather than globbing the directory.
 
-    THE TWO REQUEST COUNTERS SPLIT DIFFERENTLY HERE:
-
-    * ``api_requests`` is 0 unconditionally -- this process issued none, and the
-      daily ledger is additive and keyed by (date, provider), so anything else
-      would charge one channel's spend against another's budget gate.
-    * ``api_requests_total`` is the sweep's cost ONLY when the reuser is the same
-      channel that paid it, which is #239's re-finalize rather than a reuse: a
-      caller that died before its artifact was durable, coming back to write the
-      row for a sweep it did pay for. A DIFFERENT channel records 0, and the
-      provenance columns are what make that 0 explicable.
+    The request counters and the provenance come from
+    :func:`checkpointing.reused_census_provenance`, the one rule for both
+    providers: ``api_requests`` is 0 unconditionally, and ``api_requests_total``
+    is the sweep's cost only for the (channel, variant) that paid it -- the
+    VARIANT included, which is what a #258 walk with a ``--network-type`` needs
+    and what a channel-only comparison here once got wrong.
 
     ``cells_visited``, ``raw_photo_count`` and ``radius_m`` come off the stored
     record, because they describe the CENSUS rather than the process that
@@ -2115,7 +2109,7 @@ def _reuse_cached_sweep(
     """
     cp, marker = cached
     fetched_by = marker.get("fetched_by")
-    crawl_started_at = marker.get("crawl_started_at") or marker.get("completed_at")
+    crawl_started_at = marker.get("crawl_started_at")
     # WARNING, not INFO, for the reason the COMPLETE-checkpoint notice is: a
     # collection that issues no request is indistinguishable from a real one by
     # its artifact alone, so the log has to say which sweep's answers are being
@@ -2130,11 +2124,8 @@ def _reuse_cached_sweep(
     # allocations.
     frames.clear()
     census = census_core.dedupe_census(census)
-    same_crawl = fetched_by == checkpoint_channel
     return {
         "census": census,
-        "api_requests": 0,
-        "api_requests_total": int(marker.get("api_requests_total") or 0) if same_crawl else 0,
         "cells": cp.roots_done,
         "cells_visited": cp.cells_visited,
         "radius_m": cp.radius_m,
@@ -2142,11 +2133,9 @@ def _reuse_cached_sweep(
         "num_images": len(census),
         "num_panos": int(census_core.census_is_pano(census).sum()),
         "failed_cells": [_cell_from_dict(c) for c in marker.get("failed") or []],
-        # The entry is shared, so it is nobody's to discard.
-        "checkpoint_path": None,
-        "census_fetched_by": fetched_by,
-        "census_fetched_at": crawl_started_at,
-        "census_reused": True,
+        # api_requests, api_requests_total, checkpoint_path and the provenance
+        # columns: the accounting both providers must agree on, from one place.
+        **reused_census_provenance(marker, channel=checkpoint_channel, variant=checkpoint_variant),
     }
 
 
@@ -2165,8 +2154,7 @@ async def fetch_city_images_async(
     checkpoint_path: str | None = None,
     checkpoint_request_interval: int = DEFAULT_CHECKPOINT_REQUEST_INTERVAL,
     checkpoint_channel: str | None = None,
-    cache_path: str | None = None,
-    reuse_census: bool = True,
+    census_cache: CensusCache | None = None,
 ) -> dict[str, Any]:
     """
     Fetch a city's KartaView census, serialized against other processes.
@@ -2204,8 +2192,7 @@ async def fetch_city_images_async(
             checkpoint_path=checkpoint_path,
             checkpoint_request_interval=checkpoint_request_interval,
             checkpoint_channel=checkpoint_channel,
-            cache_path=cache_path,
-            reuse_census=reuse_census,
+            census_cache=census_cache,
         )
 
 
@@ -2224,8 +2211,7 @@ async def _fetch_city_images(
     checkpoint_path: str | None = None,
     checkpoint_request_interval: int = DEFAULT_CHECKPOINT_REQUEST_INTERVAL,
     checkpoint_channel: str | None = None,
-    cache_path: str | None = None,
-    reuse_census: bool = True,
+    census_cache: CensusCache | None = None,
 ) -> dict[str, Any]:
     """
     Sweep a bbox with overlapping circles and return every KartaView photo in it.
@@ -2281,17 +2267,17 @@ async def _fetch_city_images(
             recorded in the commit record and required to match on resume. The
             checkpoint PATH already keys the channel, but the path is
             caller-built; this is the half the state file can enforce itself.
-        cache_path: the shared per-(provider, city, bbox) cache entry (issue
-            #290), also caller-built -- see
-            :func:`checkpointing.census_cache_path_for`. Given one, a COMPLETE
-            sweep another consumer already paid for is reused here for zero
-            requests, and a sweep this call completes is PROMOTED into it on the
-            way out. None keeps the historical behaviour exactly. It matters
-            more here than for Mapillary: a sweep is hours, so the grid run and
-            the #258 walk of one city would otherwise be two overnights against
-            a host that meters by IP.
-        reuse_census: False re-sweeps even when the cache holds a usable entry,
-            and replaces it. The ``--refetch-census`` escape hatch.
+        census_cache: the shared per-(provider, city, bbox) cache entry and how
+            this caller may use it (issue #290), also caller-built -- see
+            :func:`checkpointing.crawl_store_for`. Given one, a COMPLETE sweep
+            another consumer already paid for is reused here for zero requests
+            (unless its ``reuse`` is False -- the ``--refetch-census`` escape
+            hatch -- or the entry postdates its ``run_date``), and a sweep this
+            call completes is PROMOTED into it on the way out. None keeps the
+            historical behaviour exactly. It matters more here than for
+            Mapillary: a sweep is hours, so the grid run and the #258 walk of
+            one city would otherwise be two overnights against a host that
+            meters by IP.
 
     Returns:
         Dict with ``census`` (the deduped columnar census), ``api_requests``,
@@ -2415,11 +2401,27 @@ async def _fetch_city_images(
     # THE CACHE IS CONSULTED BEFORE ANYTHING ELSE -- before the checkpoint
     # directory is created and, crucially, before calibration (issue #290).
     # Calibration alone is up to 30 requests, so a hit checked any later would
-    # not actually be free. Inside the host lock (fetch_city_images_async), so
-    # no second process can be mid-promotion into the entry read here.
-    if reuse_census and cache_path is not None:
-        cached = load_cached_sweep(cache_path, bbox=bbox, ipp=ipp, requested_radius_m=radius_m)
-        if cached is not None:
+    # not actually be free. A hit is then reconciled with whatever sits at
+    # checkpoint_path (reconcile_cache_hit): a newer checkpoint is resumed
+    # instead, an older one discarded as superseded, and this crawl's own entry
+    # with failed cells is handed back so load_checkpoint's COMPLETE path below
+    # re-probes them. Inside the host lock (fetch_city_images_async), so no
+    # second process can be promoting into, or reading, the entry read here.
+    if census_cache is not None and census_cache.reuse:
+        cached = load_cached_sweep(
+            census_cache.path,
+            bbox=bbox,
+            ipp=ipp,
+            requested_radius_m=radius_m,
+            run_date=census_cache.run_date,
+        )
+        if cached is not None and reconcile_cache_hit(
+            cached[1],
+            cache_path=census_cache.path,
+            checkpoint_path=checkpoint_path,
+            channel=checkpoint_channel,
+            variant=None,
+        ):
             return _reuse_cached_sweep(
                 cached,
                 city_name=city_name,
@@ -3001,27 +3003,26 @@ async def _fetch_city_images(
     # costing a future consumer a re-sweep and costing this run nothing.
     promoted = False
     if (
-        cache_path
+        census_cache is not None
         and cp is not None
         and final_commit_ok
         and uncommitted_frames == 0
         and cp.roots_done == len(roots)
         and cp.failed_cells == failed_cells
+        and cp.created_at is not None
     ):
         promoted = promote_checkpoint_to_cache(
             cp.path,
-            cache_path,
-            {
-                "format_version": CENSUS_CACHE_FORMAT_VERSION,
-                "provider": "kartaview",
+            census_cache.path,
+            census_cache_marker(
+                "kartaview",
                 # RECORDED, never keyed -- the entry is reusable by any channel.
-                "fetched_by": cp.channel,
-                "fetched_variant": None,
-                "crawl_started_at": cp.created_at,
-                "completed_at": datetime.now(UTC).isoformat(),
-                "api_requests_total": prior_requests + api_requests,
-                "failed": [_cell_to_dict(c) for c in failed_cells],
-            },
+                fetched_by=cp.channel,
+                fetched_variant=None,
+                crawl_started_at=cp.created_at,
+                api_requests_total=prior_requests + api_requests,
+                failed=[_cell_to_dict(c) for c in failed_cells],
+            ),
         )
 
     # The checkpoint is NOT discarded here. It is the caller's, and it must

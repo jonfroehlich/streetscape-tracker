@@ -36,8 +36,9 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from streetscape_metadata_tracker import analysis
+from streetscape_metadata_tracker import analysis, checkpointing
 from streetscape_metadata_tracker import download_kartaview as kv
+from streetscape_metadata_tracker.checkpointing import CensusCache, load_census_cache_marker
 from streetscape_metadata_tracker.download_common import (
     HOST_BUSY_EXIT_CODES,
     HOST_EXIT_CODES,
@@ -2135,12 +2136,22 @@ def test_every_commit_rename_is_followed_by_a_directory_fsync():
     """
     lines = inspect.getsource(kv._commit_checkpoint).splitlines()
     renames = [i for i, line in enumerate(lines) if "os.replace(" in line]
-    assert len(renames) == 2, f"expected the part and state renames, saw {len(renames)}"
+    assert len(renames) == 1, f"expected the part rename, saw {len(renames)}"
     for i in renames:
         following = next(line for line in lines[i + 1 :] if line.strip())
         assert "_fsync_dir(" in following, (
             f"the rename on line {i + 1} of _commit_checkpoint is not made durable: {following!r}"
         )
+    # The state record goes through the ONE durable-JSON writer both providers
+    # and the cache marker share, so the rename-then-fsync sequence is pinned
+    # there rather than re-audited in each copy.
+    assert "_write_json_durable(_state_path(cp.path), state)" in inspect.getsource(
+        kv._commit_checkpoint
+    )
+    shared = inspect.getsource(checkpointing._write_json_durable).splitlines()
+    (rename,) = [i for i, line in enumerate(shared) if "os.replace(" in line]
+    following = next(line for line in shared[rename + 1 :] if line.strip())
+    assert "_fsync_dir(" in following
 
 
 def test_a_commit_failure_that_is_not_an_oserror_cannot_swallow_a_host_block(monkeypatch, tmp_path):
@@ -2623,14 +2634,14 @@ def _cache(tmp_path, name="entry"):
     return str(tmp_path / "cache" / name)
 
 
-def _sweep_cached(monkeypatch, responder, cache, *, channel, path, **kwargs):
+def _sweep_cached(monkeypatch, responder, cache, *, channel, path, reuse=True, **kwargs):
     """A sweep wired to the shared cache, with its own private checkpoint."""
     return _sweep(
         monkeypatch,
         responder,
         checkpoint_path=str(path),
         checkpoint_channel=channel,
-        cache_path=cache,
+        census_cache=CensusCache(cache, reuse=reuse),
         **kwargs,
     )
 
@@ -2746,6 +2757,43 @@ def test_a_reuse_inherits_the_failed_cells_rather_than_re_probing_them(monkeypat
     )
 
 
+def test_the_sweeps_own_channel_re_probes_its_failed_cells_rather_than_inheriting_them(
+    monkeypatch, tmp_path, caplog
+):
+    """
+    The same channel coming back is #239's re-finalize — a tail that died
+    between promotion and the catalog row — and load_checkpoint's COMPLETE path
+    re-probes carried failures because a refusal is time-varying. Promotion
+    must not silently drop that: the entry is handed back to the checkpoint,
+    the resume re-probes the cell, and what it re-promotes has no hole.
+    """
+    seen = []
+
+    def one_bad_cell(call):
+        seen.append(call)
+        if len(seen) == 1:
+            raise kv.ResponseError("HTTP 500")
+        return _photos(call)
+
+    monkeypatch.setattr(kv, "MAX_FAILED_AREA_FRACTION", 0.9)
+    cache = _cache(tmp_path)
+    grid, _ = _sweep_cached(
+        monkeypatch, one_bad_cell, cache, channel="kartaview", path=tmp_path / "cp-grid", retries=0
+    )
+    assert len(grid["failed_cells"]) == 1
+
+    with caplog.at_level(logging.WARNING):
+        again, calls = _sweep_cached(
+            monkeypatch, _photos, cache, channel="kartaview", path=tmp_path / "cp-grid"
+        )
+    assert calls, "the failed cell was re-asked"
+    assert "re-probes them" in caplog.text
+    assert again["failed_cells"] == []
+    assert again["checkpoint_path"] is None, "re-promoted"
+    assert load_census_cache_marker(cache)["failed"] == []
+    assert not (tmp_path / "cp-grid").exists()
+
+
 def test_the_promoted_checkpoint_is_not_left_behind_for_the_caller_to_discard(
     monkeypatch, tmp_path
 ):
@@ -2772,7 +2820,7 @@ def test_an_incomplete_sweep_is_never_promoted(monkeypatch, tmp_path):
         _photos,
         checkpoint_path=str(ckpt),
         checkpoint_channel="kartaview",
-        cache_path=cache,
+        census_cache=CensusCache(cache),
         max_requests=2,
     )
     assert isinstance(error, kv.SweepIncompleteError)
@@ -2821,7 +2869,7 @@ def test_a_sweep_whose_final_commit_failed_is_never_promoted(monkeypatch, tmp_pa
             _photos,
             checkpoint_path=str(ckpt),
             checkpoint_channel="kartaview",
-            cache_path=cache,
+            census_cache=CensusCache(cache),
             checkpoint_request_interval=1,
         )
     assert calls, "the sweep itself succeeded"
@@ -2853,17 +2901,20 @@ def test_an_incomplete_cache_entry_is_refused_and_deleted(monkeypatch, tmp_path,
     assert len(calls) == len(whole_calls), "an incomplete entry costs a full sweep, not a hole"
 
 
-def test_an_entry_swept_at_another_radius_is_refused(monkeypatch, tmp_path, caplog):
+def test_an_entry_swept_at_another_radius_is_refused_but_not_deleted(monkeypatch, tmp_path, caplog):
     """
-    A promoted entry IS a moved checkpoint, so the same geometric cascade runs
-    over it. An explicit radius that contradicts the stored one wins — the
-    lattice indices in every part name mean nothing without the radius that
-    produced them.
+    A promoted entry IS a moved checkpoint, so the same cascade runs over it,
+    and an explicit radius that contradicts the stored one wins — the lattice
+    indices in every part name mean nothing without the radius that produced
+    them. But the radius (like ``ipp``) is THIS CALLER's parameter, not a
+    property of the entry: a `--ipp 200` harness or an explicit-radius walk must
+    not cost every other consumer the grid run's ten-hour sweep. Refused for
+    this caller, left for the rest.
     """
     cache = _cache(tmp_path)
     _sweep_cached(monkeypatch, _photos, cache, channel="kartaview", path=tmp_path / "cp-grid")
 
-    with caplog.at_level(logging.WARNING, logger=kv.logger.name):
+    with caplog.at_level(logging.INFO):
         _result, calls = _sweep_cached(
             monkeypatch,
             _photos,
@@ -2874,6 +2925,14 @@ def test_an_entry_swept_at_another_radius_is_refused(monkeypatch, tmp_path, capl
         )
     assert "an explicit radius wins" in caplog.text
     assert calls, "it re-swept rather than reusing a lattice it does not describe"
+    # The explicit-radius sweep promoted its own entry over the space -- so
+    # check the non-deletion the other way round: an ipp mismatch against the
+    # entry that now stands leaves it for the consumer that fits it.
+    _result, calls = _sweep_cached(
+        monkeypatch, _photos, cache, channel="kartaview", path=tmp_path / "cp-odd", ipp=7
+    )
+    assert calls, "refused for this caller"
+    assert load_census_cache_marker(cache) is not None, "and kept for the others"
 
 
 def test_refetch_census_re_sweeps_and_replaces_the_entry(monkeypatch, tmp_path):
@@ -2886,11 +2945,11 @@ def test_refetch_census_re_sweeps_and_replaces_the_entry(monkeypatch, tmp_path):
         cache,
         channel="kartaview_streets",
         path=tmp_path / "cp-walk",
-        reuse_census=False,
+        reuse=False,
     )
     assert calls, "the flag means ask again"
     assert result["census_fetched_by"] == "kartaview_streets"
-    assert kv.load_census_cache_marker(cache)["fetched_by"] == "kartaview_streets", (
+    assert load_census_cache_marker(cache)["fetched_by"] == "kartaview_streets", (
         "and the entry it leaves is the fresher one"
     )
 
@@ -2919,7 +2978,7 @@ def test_an_unwritable_cache_never_fails_a_sweep(monkeypatch, tmp_path):
         _photos,
         checkpoint_path=str(ckpt),
         checkpoint_channel="kartaview",
-        cache_path=str(unwritable / "sub" / "entry"),
+        census_cache=CensusCache(str(unwritable / "sub" / "entry")),
     )
     assert calls, "the sweep succeeded"
     assert result["checkpoint_path"] == str(ckpt), "and its checkpoint is still the caller's"

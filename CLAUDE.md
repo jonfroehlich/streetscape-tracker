@@ -155,9 +155,11 @@ Four KartaView rules that must survive without a read:
 - The capture-date rule is **`shot_date >= date_added` → NULL — `>=`, not `>`**.
 
 A COMPLETED crawl is promoted out of `checkpoints/` into `census_cache/<provider>/<city>_<bbox>`, and every later consumer of that (provider, city, bbox) observation reuses it for **0 requests** (#290) — the paired road walk, a second `--network-type`, KartaView's #258 walk.
-**The cache keys on GEOMETRY and *records* who paid, never keys it** (a channel-keyed entry would reuse nothing, silently); the marker is written AFTER the rename, so the crash state is a marker-less directory every loader deletes.
+**The cache keys on GEOMETRY and *records* who paid, never keys it** (a channel-keyed entry would reuse nothing, silently); the marker travels INSIDE the directory and the single rename is the commit, so no entry ever exists unstamped — which is what makes the lock-free tail prune safe.
 An in-flight checkpoint is never a cache entry: completeness is the extra check, and promotion is refused for a degraded, interrupted or lagging store.
-`--refetch-census` opts out; **`--force` stays cache-transparent** (a walk whose tail died must re-finalize for 0, not re-pay the census).
+A hit is reconciled with the consumer's own checkpoint (`reconcile_cache_hit`): a newer checkpoint is resumed, an older one discarded, and **the crawl's own entry with failed work is handed back so the resume re-probes it** — a channel never inherits its own holes.
+The lifecycle (loader, marker, reuse accounting, `crawl_store_for`) lives once in `checkpointing.py`; never copy it per provider — the first copies disagreed about what "the same crawl" meant.
+`--refetch-census` opts out; **`--force` stays cache-transparent** (a walk whose tail died must re-finalize for 0, not re-pay the census); a backdated `--run-date` refuses an entry observed after it.
 
 **Provider access, per-IP limits and blocks → [`docs/provider-access.md`](docs/provider-access.md).**
 This is what READ THIS FIRST points at; read it before changing any pacing, retry, concurrency, volume or host decision.
@@ -245,7 +247,7 @@ Keep any list a doc enumerates **alphabetical**, so two branches adding an entry
 - Published JSON artifacts and their schema versions are inventoried in [`docs/architecture.md`](docs/architecture.md): per-run summary v2, aggregate `cities.json.gz` v3, streetwalk manifest v1, driving-plan summary v1.
 - `data/` contains thousands of files — avoid globbing or listing it wholesale.
 - Legacy pre-2026 data files are undated; they are registered as `is_baseline=1` runs by the migration script and never renamed (published URLs stay stable).
-- Runtime state that must never reach the public web server lives in gitignored siblings of `data/` — `logs/`, `backups/` (#145), `archive/` (#176), `census_cache/` (#290), `checkpoints/` (#239, #256), `locks/` (#208) — and the publish rsync only walks `data/`, so anything there is structurally unpublishable.
+- Runtime state that must never reach the public web server lives in gitignored siblings of `data/` — `archive/` (#176), `backups/` (#145), `census_cache/` (#290), `checkpoints/` (#239, #256), `locks/` (#208), `logs/` — and the publish rsync only walks `data/`, so anything there is structurally unpublishable.
 - Logs go to `logs/`, never `data/`, in three tiers: the scheduler's own rotating `streetscape_scheduler.log`; a per-attempt `collect_{city_id}_{channel}_{date}.log` holding one collection subprocess's full output (a failed child's last 25 lines are also copied into the scheduler log, whose tail is what the `[alerts]` email sends); and `streetscape_service_console.log`, the unit's `StandardOutput=append:` safety net for anything else.
 - The **worldwide frame** ([`docs/worldwide_sampling.md`](docs/worldwide_sampling.md)) is a stratified curated set (~56 cities: continent × size-band × GSV-coverage-regime) built deterministically from vendored GeoNames data (CC BY 4.0) in `data_sources/` (not rsynced, not git-ignored, unlike `data/`); GeoNames population is used only for binning, never as a reported variable.
 - The sync-vs-async duplicate download path was removed in v2; the v1.0.0 tag preserves the old architecture.

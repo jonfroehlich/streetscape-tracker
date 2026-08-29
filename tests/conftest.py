@@ -267,6 +267,53 @@ def _isolate_census_cache(tmp_path, monkeypatch):
     monkeypatch.setenv(checkpointing.CENSUS_CACHE_DIR_ENV, str(tmp_path / "census_cache"))
 
 
+def stamp_census_cache(
+    cache_path,
+    provider="mapillary",
+    *,
+    fetched_by=None,
+    fetched_variant=None,
+    age_days=0,
+    api_requests_total=7,
+    failed=(),
+    **overrides,
+):
+    """
+    A marker-only cache entry -- what ``census_cache_probe`` reads (issue #290).
+
+    Goes through the production builder (``checkpointing.census_cache_marker``)
+    rather than spelling the dict out, so the marker's shape has ONE spelling
+    across the suite: a field the builder gains reaches every test that stamps
+    an entry, and a test cannot hand a reader an entry no writer would produce.
+    ``age_days`` backdates both the crawl's start and its completion; keyword
+    ``overrides`` land on the finished marker for the tests that need a
+    malformed one.
+    """
+    import json
+    from datetime import timedelta
+
+    from streetscape_metadata_tracker.checkpointing import (
+        CENSUS_CACHE_MARKER,
+        census_cache_marker,
+    )
+
+    os.makedirs(cache_path, exist_ok=True)
+    stamp = (datetime.now(UTC) - timedelta(days=age_days)).isoformat()
+    marker = census_cache_marker(
+        provider,
+        fetched_by=fetched_by or provider,
+        fetched_variant=fetched_variant,
+        crawl_started_at=stamp,
+        api_requests_total=api_requests_total,
+        failed=list(failed),
+    )
+    marker["completed_at"] = stamp
+    marker.update(overrides)
+    with open(os.path.join(cache_path, CENSUS_CACHE_MARKER), "w", encoding="utf-8") as fh:
+        json.dump(marker, fh)
+    return cache_path
+
+
 @pytest.fixture(autouse=True)
 def _no_overpass_status_probe(monkeypatch):
     """

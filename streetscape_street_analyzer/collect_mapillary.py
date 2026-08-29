@@ -42,6 +42,7 @@ import pandas as pd
 
 from streetscape_metadata_tracker.analysis import FLAT_ONLY
 from streetscape_metadata_tracker.census import census_is_pano
+from streetscape_metadata_tracker.checkpointing import CensusCache, observation_timestamp
 from streetscape_metadata_tracker.download_mapillary import (
     DEFAULT_TILE_REQUESTS_PER_MINUTE,
     build_empty_rows,
@@ -241,8 +242,7 @@ async def collect_mapillary_street_samples_async(
     checkpoint_path: str | None = None,
     checkpoint_channel: str | None = None,
     checkpoint_variant: str | None = None,
-    cache_path: str | None = None,
-    reuse_census: bool = True,
+    census_cache: CensusCache | None = None,
 ) -> dict[str, Any]:
     """
     Collect Mapillary street samples for a city and write the snapshot csv.gz.
@@ -263,7 +263,7 @@ async def collect_mapillary_street_samples_async(
     this walk read the same tiles over the same bbox, so on a paired night the
     grid run pays and this walk reads its census from the shared cache for zero
     requests — and a second walk at another ``--network-type`` is free as well.
-    ``reuse_census=False`` (``--refetch-census``) opts out. When the census IS
+    ``census_cache.reuse=False`` (``--refetch-census``) opts out. When the census IS
     reused, every row's ``query_timestamp`` records when the provider was
     observed rather than when this process started, and the return carries
     ``census_fetched_by``/``census_fetched_at`` for the ``street_walks`` row.
@@ -286,18 +286,11 @@ async def collect_mapillary_street_samples_async(
         checkpoint_path=checkpoint_path,
         checkpoint_channel=checkpoint_channel,
         checkpoint_variant=checkpoint_variant,
-        cache_path=cache_path,
-        reuse_census=reuse_census,
+        census_cache=census_cache,
     )
-    # See download_mapillary_metadata_async for why only a REUSED census
-    # restamps this: the rows were fetched by another collection, possibly on an
-    # earlier night, so this process's clock would record an observation that
-    # never happened.
-    query_timestamp = (
-        fetched.get("census_fetched_at") or started_at
-        if fetched.get("census_reused")
-        else started_at
-    )
+    # A reused census is stamped with when the provider was observed, a fresh
+    # one with this process's clock; see checkpointing.observation_timestamp.
+    query_timestamp = observation_timestamp(fetched, started_at)
     # THE TAIL IS WRAPPED BECAUSE THE CHECKPOINT CHANGES WHAT A CRASH HERE COSTS
     # (#256). Without one, a failure below lost the spend with the process and
     # the caller recorded whatever the exception carried. With one, the

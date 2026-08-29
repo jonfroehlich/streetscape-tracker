@@ -49,14 +49,6 @@ __pycache__/
 # reached the publisher would diff against the previous snapshot as every pano
 # in the rest of the city being removed.
 /checkpoints/
-# Completed censuses promoted out of checkpoints/ and shared across the channels
-# that read the same (provider, city, bbox) observation (issue #290). Same two
-# reasons as checkpoints/ above -- provider bulk data, and never publishable --
-# plus one of its own: this one is deliberately reachable by every consumer, so
-# a committed entry would be a census the next collection silently republishes.
-# The scheduler's tail prunes it; nothing here is ever needed to rebuild an
-# artifact.
-/census_cache/
 # Claude Code. settings.json is shared project config and IS tracked (team
 # settings: permissions, hooks); the local override and worktree metadata are
 # per-machine. Claude Code normally protects settings.local.json by adding it
@@ -75,3 +67,12 @@ __pycache__/
 .venv/
 .venv-*/
 .tooling/
+
+# Completed censuses promoted out of checkpoints/ and shared across the channels
+# that read the same (provider, city, bbox) observation (issue #290). Same two
+# reasons as checkpoints/ above -- provider bulk data, and never publishable --
+# plus one of its own: this one is deliberately reachable by every consumer, so
+# a committed entry would be a census the next collection silently republishes.
+# The scheduler's tail prunes it; nothing here is ever needed to rebuild an
+# artifact.
+/census_cache/

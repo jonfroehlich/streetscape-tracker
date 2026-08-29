@@ -13,7 +13,7 @@ import subprocess
 import threading
 import time
 from collections import Counter
-from datetime import UTC, date, datetime, timedelta
+from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
@@ -7146,37 +7146,16 @@ def test_max_concurrent_channels_rejects_a_nonsense_value_and_falls_back_to_1(
 def _stamp_census_cache(city, provider, *, fetched_by, age_days=0):
     """Write the marker `census_cache_probe` reads. No parts: the probe is
     deliberately marker-only, so this is exactly what production hands it."""
-    from streetscape_metadata_tracker.checkpointing import (
-        CENSUS_CACHE_FORMAT_VERSION,
-        CENSUS_CACHE_MARKER,
-        census_cache_path_for,
-    )
-    from streetscape_metadata_tracker.download_common import grid_bbox
+    from streetscape_metadata_tracker.checkpointing import census_cache_path_for, frozen_bbox
+    from tests.conftest import stamp_census_cache
 
-    path = census_cache_path_for(
+    return stamp_census_cache(
+        census_cache_path_for(provider, city.city_id, frozen_bbox(city)),
         provider,
-        city.city_id,
-        grid_bbox(
-            city.center_lat, city.center_lon, city.grid_width_m, city.grid_height_m, city.step_m
-        ),
+        fetched_by=fetched_by,
+        age_days=age_days,
+        api_requests_total=41,
     )
-    os.makedirs(path, exist_ok=True)
-    stamp = datetime.now(UTC) - timedelta(days=age_days)
-    Path(path, CENSUS_CACHE_MARKER).write_text(
-        json.dumps(
-            {
-                "format_version": CENSUS_CACHE_FORMAT_VERSION,
-                "provider": provider,
-                "fetched_by": fetched_by,
-                "fetched_variant": None,
-                "crawl_started_at": stamp.isoformat(),
-                "completed_at": stamp.isoformat(),
-                "api_requests_total": 41,
-                "failed": [],
-            }
-        )
-    )
-    return path
 
 
 def test_a_cached_census_prices_a_channel_at_zero(conn):
@@ -7248,6 +7227,26 @@ def test_an_expired_entry_prices_the_channel_at_full_cost(conn):
 
     _stamp_census_cache(city, "mapillary", fetched_by="mapillary", age_days=9)
     assert _channel_estimate(cfg, city, "mapillary_streets", conn) > 0
+
+
+def test_an_entry_that_would_expire_during_the_batch_is_priced_as_a_fetch(conn):
+    """
+    The probe runs at slate time and the child loads the entry up to
+    max_batch_hours later. An entry the loader would refuse by then must not be
+    priced at zero: the child would fetch at full cost with the budget gate
+    already passed and no in-child request cap.
+    """
+    from streetscape_metadata_tracker.scheduler import _channel_estimate
+
+    cid = _register(conn, "Bend", width=5000, height=5000, step=20)
+    city = db.resolve_city(conn, cid)
+    # 6.8 days old: inside the 7-day consumer window, but not by a 10-hour batch.
+    _stamp_census_cache(city, "mapillary", fetched_by="mapillary", age_days=6.8)
+
+    loose = SchedulerConfig(providers={"mapillary_streets": ProviderConfig()}, max_batch_hours=1)
+    assert _channel_estimate(loose, city, "mapillary_streets", conn) == 0
+    tight = SchedulerConfig(providers={"mapillary_streets": ProviderConfig()}, max_batch_hours=10)
+    assert _channel_estimate(tight, city, "mapillary_streets", conn) > 0
 
 
 def test_a_cached_census_does_not_collapse_the_child_timeout(conn):

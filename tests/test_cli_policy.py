@@ -1175,9 +1175,13 @@ def test_the_grid_run_hands_the_downloader_a_provider_keyed_cache_path(monkeypat
     bbox = grid_bbox(
         city.center_lat, city.center_lon, city.grid_width_m, city.grid_height_m, city.step_m
     )
-    assert calls[0]["cache_path"] == census_cache_path_for("mapillary", city_id, bbox)
-    assert calls[0]["cache_path"] != calls[0]["checkpoint_path"]
-    assert calls[0]["reuse_census"] is True
+    policy = calls[0]["census_cache"]
+    assert policy.path == census_cache_path_for("mapillary", city_id, bbox)
+    assert policy.path != calls[0]["checkpoint_path"]
+    assert policy.reuse is True
+    # The snapshot date travels with the policy, so an entry observed after a
+    # backdated --run-date is refused at the loader rather than published.
+    assert policy.run_date == RUN_DATE
 
 
 def test_kartaview_gets_its_own_cache_path(monkeypatch, catalog):
@@ -1193,8 +1197,8 @@ def test_kartaview_gets_its_own_cache_path(monkeypatch, catalog):
     bbox = grid_bbox(
         city.center_lat, city.center_lon, city.grid_width_m, city.grid_height_m, city.step_m
     )
-    assert calls[0]["cache_path"] == census_cache_path_for("kartaview", city_id, bbox)
-    assert calls[0]["cache_path"] != census_cache_path_for("mapillary", city_id, bbox)
+    assert calls[0]["census_cache"].path == census_cache_path_for("kartaview", city_id, bbox)
+    assert calls[0]["census_cache"].path != census_cache_path_for("mapillary", city_id, bbox)
 
 
 def test_gsv_gets_no_cache_path(monkeypatch, catalog):
@@ -1205,7 +1209,7 @@ def test_gsv_gets_no_cache_path(monkeypatch, catalog):
     monkeypatch.setattr(cli, "download_gsv_metadata_async", stub_downloader(calls))
 
     assert run_cli(monkeypatch, city_id, data_dir, provider="gsv") == 0
-    assert "cache_path" not in calls[0]
+    assert "census_cache" not in calls[0]
 
 
 def test_refetch_census_threads_through_to_the_downloader(monkeypatch, catalog):
@@ -1221,7 +1225,7 @@ def test_refetch_census_threads_through_to_the_downloader(monkeypatch, catalog):
     monkeypatch.setattr(cli, "download_mapillary_metadata_async", _mapillary_downloader(calls))
 
     assert run_cli(monkeypatch, city_id, data_dir, "--refetch-census", provider="mapillary") == 0
-    assert calls[0]["reuse_census"] is False
+    assert calls[0]["census_cache"].reuse is False
 
 
 def test_force_is_cache_transparent(monkeypatch, catalog):
@@ -1231,7 +1235,7 @@ def test_force_is_cache_transparent(monkeypatch, catalog):
     monkeypatch.setattr(cli, "download_mapillary_metadata_async", _mapillary_downloader(calls))
 
     assert run_cli(monkeypatch, city_id, data_dir, "--force", provider="mapillary") == 0
-    assert calls[0]["reuse_census"] is True
+    assert calls[0]["census_cache"].reuse is True
 
 
 def test_the_runs_row_records_who_paid_for_the_census(monkeypatch, catalog):
