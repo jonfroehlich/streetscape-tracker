@@ -503,12 +503,20 @@ _TILE_MAX_TIME_S = 120
 # this rate to the CDN. Do not run Mapillary collections in parallel.
 DEFAULT_TILE_REQUESTS_PER_MINUTE = 60
 
-# Jitter fraction for the tile pacer (issue #292): request gaps vary uniformly
-# by ±this around 60/DEFAULT_TILE_REQUESTS_PER_MINUTE. Non-zero BY DEFAULT: a
-# saturated token bucket emits tiles at an exact 1.000 s cadence over
-# sequential z14 tiles from a datacenter IP, and after three per-IP blocks that
-# regularity is the one property of our traffic never changed between restarts
-# (rate and daily volume were both falsified, #286). 0 restores the metronome.
+# Jitter fraction for the tile pacer (issue #292). Each request gap is a
+# shifted exponential around the mean 60/DEFAULT_TILE_REQUESTS_PER_MINUTE: a
+# floor of (1 - this) x the mean plus an exponential tail scaled to this, so the
+# mean gap is unchanged and the coefficient of variation IS this number.
+#
+# Non-zero BY DEFAULT: a saturated token bucket emits tiles at an exact 1.000 s
+# cadence over sequential z14 tiles from a datacenter IP, and after three per-IP
+# blocks that regularity is the one property of our traffic never changed
+# between restarts (rate and daily volume were both falsified, #286).
+#
+# 0.6 rather than something smaller because the point is to approach the CV of
+# an organic client's Poisson arrivals (1.0), not merely to break gap EQUALITY:
+# a scorer reading gap statistics is unmoved by a narrow, hard-bounded wobble.
+# 0 restores the metronome.
 DEFAULT_TILE_JITTER = 0.6
 
 # Content types that are an error page rather than a tile (issue #199). A
@@ -1412,11 +1420,16 @@ async def _fetch_city_images(
     if max_requests_per_minute <= 0:
         logger.info("Tile pacing DISABLED (max_requests_per_minute <= 0)")
     elif jitter > 0:
+        # Logged as the gap DISTRIBUTION, not as a rate: "40/min" is what the
+        # metronome also said, and the shape is the whole change under test. The
+        # p99 is the shifted exponential's, m * ((1 - j) + j * ln(100)).
         mean_gap_s = 60.0 / max_requests_per_minute
+        floor_s = mean_gap_s * (1 - jitter)
+        p99_s = mean_gap_s * ((1 - jitter) + jitter * math.log(100.0))
         logger.info(
-            f"Pacing tile requests at a mean {max_requests_per_minute}/min, jittered "
-            f"\u00b1{jitter:.0%} (gaps {mean_gap_s * (1 - jitter):.2f}\u2013"
-            f"{mean_gap_s * (1 + jitter):.2f} s, issue #292)"
+            f"Pacing tile requests at a mean {max_requests_per_minute}/min, "
+            f"exponentially jittered (CV {jitter:.2f}; gaps floor {floor_s:.2f} s, "
+            f"mean {mean_gap_s:.2f} s, p99 {p99_s:.2f} s, no ceiling — issue #292)"
         )
     else:
         logger.info(f"Pacing tile requests at {max_requests_per_minute}/min")

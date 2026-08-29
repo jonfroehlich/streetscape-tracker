@@ -117,9 +117,16 @@ daily_request_budget = 1750
 # block 2 came with this limiter pinned at 60 and block 3 at 1,938/day while
 # 26,363 had run clean in a day, so rate and volume are both falsified. The
 # one thing every restart left unchanged was the exact 1.000 s cadence of a
-# saturated token bucket; `jitter` draws each gap from ±60% of the mean
-# (0.6–2.4 s). Mean rate is unchanged in meaning, so budgets and the derived
-# timeout need no re-sizing. 0 restores the exact cadence.
+# saturated token bucket.
+#
+# `jitter` draws each gap from a SHIFTED EXPONENTIAL: a floor of (1 - jitter)
+# x the mean plus an exponential tail scaled to jitter. Here: 0.60 s floor,
+# 1.50 s mean, ~4.7 s p99, no ceiling. It is also the gaps' coefficient of
+# variation — an organic client's Poisson arrivals sit at 1.0, and the uniform
+# draw this started as reached only 0.35 with a hard 2.4 s ceiling, which a
+# scorer reading gap STATISTICS rather than gap EQUALITY would barely notice.
+# Mean rate is unchanged in meaning, so budgets and the derived timeout need no
+# re-sizing. 0 restores the exact cadence.
 max_requests_per_minute = 40
 jitter = 0.6
 

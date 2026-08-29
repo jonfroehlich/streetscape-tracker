@@ -5,6 +5,7 @@ import dataclasses
 import gzip
 import io
 import json
+import logging
 import os
 import re
 import signal
@@ -801,6 +802,37 @@ jitter = 0
     assert cfg.providers["mapillary"].jitter == pytest.approx(0.6)
     assert cfg.providers["mapillary"].max_requests_per_minute == 40
     assert cfg.providers["mapillary_streets"].jitter == 0
+
+
+@pytest.mark.parametrize("bad", ["1.5", "-0.2", '"banana"', "true"])
+def test_config_refuses_an_out_of_range_jitter_instead_of_shipping_it(tmp_path, caplog, bad):
+    """Same guard, and the same cost, as network_type's (issue #292).
+
+    Out of [0, 1) or non-numeric, the value reaches `--mapillary-jitter` as an
+    argparse type error, i.e. exit 2 on EVERY Mapillary run of EVERY due city.
+    Exit 2 is not one of the amnestied families, so five such nights spend the
+    city's whole `consecutive_failures` budget and drop it out of
+    `get_due_cities` — where only a success can put it back, and no success is
+    reachable while the config still says this. Falling back to None (the
+    collector's own jittered default) and NOT to 0, which would silently
+    restore the metronome the channel exists to avoid.
+    """
+    p = tmp_path / "s.toml"
+    p.write_text(f"[providers.mapillary]\njitter = {bad}\n")
+    with caplog.at_level(logging.WARNING):
+        cfg = load_scheduler_config(str(p))
+    assert cfg.providers["mapillary"].jitter is None
+    assert "jitter" in caplog.text and "providers.mapillary" in caplog.text
+
+
+def test_a_refused_jitter_leaves_no_flag_on_the_child(conn, monkeypatch, tmp_path):
+    """The end of the same path: a rejected field must reach the child as an
+    ABSENT flag, so the collector applies its own default and the night runs."""
+    cfgfile = tmp_path / "s.toml"
+    cfgfile.write_text("[providers.mapillary]\njitter = 9\n")
+    cfg = load_scheduler_config(str(cfgfile))
+    cmd, _ = _grid_cmd(monkeypatch, tmp_path, conn, "mapillary", cfg)
+    assert "--mapillary-jitter" not in cmd
 
 
 def test_config_rejects_an_unknown_network_type(tmp_path):

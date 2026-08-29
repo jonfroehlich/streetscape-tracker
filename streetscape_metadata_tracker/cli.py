@@ -381,13 +381,16 @@ def parse_args():
         "--mapillary-jitter",
         type=jitter_fraction,
         default=DEFAULT_TILE_JITTER,
-        help=f"""Randomize the gap between Mapillary tile requests by +/- this
-             fraction of the mean gap (mapillary provider only). A saturated
-             token bucket emits tiles at an exact cadence, and after three
-             per-IP blocks that regularity is the one property of our traffic
-             never changed between restarts — rate and daily volume were both
-             falsified as the trigger (issue #292). Default
-             {DEFAULT_TILE_JITTER}; 0 restores the exact cadence.""",
+        help=f"""Randomize the gap between Mapillary tile requests (mapillary
+             provider only): each gap is a floor of (1 - this) x the mean plus
+             an exponential tail scaled to this, so the mean rate is unchanged
+             and this number is the gaps' coefficient of variation (1.0 is an
+             organic client's Poisson arrivals). A saturated token bucket emits
+             tiles at an exact cadence, and after three per-IP blocks that
+             regularity is the one property of our traffic never changed between
+             restarts — rate and daily volume were both falsified as the trigger
+             (issue #292). Default {DEFAULT_TILE_JITTER}; 0 restores the exact
+             cadence.""",
     )
 
     concurrency_group.add_argument(
