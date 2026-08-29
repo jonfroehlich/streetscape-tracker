@@ -48,14 +48,19 @@ daily_request_budget = 10000000
 # the mechanism, not a re-derivation of numbers that were never the binding
 # constraint.
 #
-# RESUMED 2026-08-31 under issue #292: slower mean rate AND jittered request
+# RESUMED 2026-08-30 under issue #292: slower mean rate AND jittered request
 # gaps (see max_requests_per_minute / jitter below), with #291's shared census
-# halving a paired night's tile spend. Pre-registered prediction, recorded in
-# #286: each prior block came after exactly 6 active collection days, so a
-# fourth block around 2026-09-06/07 means rate, volume and request pattern are
-# ALL dead and the trigger is cadence (next move: rest days, not more pacing);
-# clean through ~2026-09-10 means keep this. If it blocks: disable both channels
-# again, sweep for detached processes, probe once after ~24 h.
+# halving a paired night's tile spend. Deployed 2026-08-29 afternoon, so the
+# first jittered night is the 08-30 02:13 timer fire -- ONE NIGHT EARLIER than
+# the 08-31 this said when it was written, and the prediction below is shifted
+# to match rather than left pointing at the pre-deploy plan.
+#
+# Pre-registered prediction, recorded in #286: each prior block came after
+# exactly 6 active collection days, so a fourth block around 2026-09-05/06
+# means rate, volume and request pattern are ALL dead and the trigger is
+# cadence (next move: rest days, not more pacing); clean through ~2026-09-09
+# means keep this. If it blocks: disable both channels again, sweep for
+# detached processes, probe once after ~24 h.
 [providers.mapillary]
 enabled = true
 # Counted in z14 vector-tile requests. Mapillary documents this endpoint as
@@ -168,7 +173,7 @@ spacing_m = 15
 # and this budget is drawn on only when the pair is split apart.
 # PAUSED 2026-08-28 with [providers.mapillary] — same IP, same tile CDN, so
 # pausing one and not the other would keep the host under exactly the load the
-# pause exists to stop — and RESUMED with it 2026-08-31 under #292: the pair
+# pause exists to stop — and RESUMED with it 2026-08-30 under #292: the pair
 # moves together in both directions.
 [providers.mapillary_streets]
 enabled = true

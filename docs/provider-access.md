@@ -239,10 +239,11 @@ The budgets are left at 1,750 because a fourth cut has no mechanism to work thro
 
 **This is a pre-registered test, not a fix**, and the prediction is recorded in #286 before the restart.
 Each prior block came after exactly **6 active collection days** (8 calendar days apart: 08-12, 08-20, 08-28).
-A fourth block around **2026-09-06/07** under jitter and the shared census's halved paired-night spend (issue #290, PR #291) means rate, volume *and* request pattern are all dead, the trigger is cadence (consecutive active days, or a trust score), and the next move is scheduling rest days for the Mapillary channels — not more pacing.
+The restart was planned for Mon 2026-08-31 but the deploy landed on Sat 2026-08-29 afternoon, so the first jittered night is the **08-30 02:13 PDT** timer fire and every date below is one day earlier than #286's original table — shifted here rather than silently left pointing at the pre-deploy plan, because moving a pre-registered date *after* the outcome is known is the thing this whole section exists to avoid.
+A fourth block around **2026-09-05/06** under jitter and the shared census's halved paired-night spend (issue #290, PR #291) means rate, volume *and* request pattern are all dead, the trigger is cadence (consecutive active days, or a trust score), and the next move is scheduling rest days for the Mapillary channels — not more pacing.
 That inference is only as strong as the treatment, which is why the distribution was moved from uniform to exponential before the restart rather than after: at CV 0.35 a fourth block would have been ambiguous between "the trigger is cadence" and "the jitter was too mild to move the score", and at CV 0.6 against Poisson's 1.0 that second reading is much harder to sustain.
 It is not *impossible* to sustain — the remaining gap to 1.0, and the unchanged duty cycle (~44 minutes of unbroken traffic, no gap over ~10 s), are the honest limits on the conclusion.
-Clean through ~2026-09-10 means keep the setting.
+Clean through ~2026-09-09 means keep the setting.
 Bundling the shared census (#290) with the jitter means a clean result cannot say which one worked; that is accepted, since a block would falsify both at once.
 Deliberately **not** changed in the same round: tile order (raster → shuffled), because a second pattern change would confound the same test.
 
