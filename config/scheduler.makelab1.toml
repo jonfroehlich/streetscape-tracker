@@ -55,12 +55,15 @@ daily_request_budget = 10000000
 # the 08-31 this said when it was written, and the prediction below is shifted
 # to match rather than left pointing at the pre-deploy plan.
 #
-# Pre-registered prediction, recorded in #286: each prior block came after
-# exactly 6 active collection days, so a fourth block around 2026-09-05/06
-# means rate, volume and request pattern are ALL dead and the trigger is
-# cadence (next move: rest days, not more pacing); clean through ~2026-09-09
-# means keep this. If it blocks: disable both channels again, sweep for
-# detached processes, probe once after ~24 h.
+# Pre-registered prediction, recorded in #286: each prior block landed ON the
+# 6th active collection night (08-13..08-20, 08-23..08-28), so with 08-30 as
+# night 1 a fourth block around 2026-09-04/05 means rate, volume and request
+# pattern are ALL dead and the trigger is cadence (next move: rest days, not
+# more pacing); clean through ~2026-09-09 means keep this. The prior blocks
+# were ALSO 8 calendar days apart, but only because each run contained two
+# paused days; this restart has none, so count active nights, not calendar
+# days. If it blocks: disable both channels again, sweep for detached
+# processes, probe once after ~24 h.
 [providers.mapillary]
 enabled = true
 # Counted in z14 vector-tile requests. Mapillary documents this endpoint as
