@@ -87,6 +87,10 @@ from streetscape_metadata_tracker.download_common import (
     jitter_fraction,
 )
 from streetscape_metadata_tracker.download_gsv import collect_points_async
+from streetscape_metadata_tracker.download_kartaview import (
+    DEFAULT_SWEEP_REQUESTS_PER_MINUTE,
+    estimate_sweep_requests,
+)
 from streetscape_metadata_tracker.download_mapillary import (
     DEFAULT_TILE_JITTER,
     DEFAULT_TILE_REQUESTS_PER_MINUTE,
@@ -102,6 +106,7 @@ from streetscape_metadata_tracker.naming import (
 from streetscape_metadata_tracker.paths import get_default_data_dir
 from streetscape_metadata_tracker.walk_diff import compute_and_record_walk_diff
 
+from .collect_kartaview import collect_kartaview_street_samples_async
 from .collect_mapillary import collect_mapillary_street_samples_async
 from .download_street_network import fetch_street_edges
 from .road_sampling import dedupe_query_points, generate_samples
@@ -120,6 +125,7 @@ logger = logging.getLogger(__name__)
 # quota (issue #141).
 STREET_BUDGET_CHANNELS = {
     "gsv": "gsv_streets",
+    "kartaview": "kartaview_streets",
     "mapillary": "mapillary_streets",
 }
 
@@ -165,6 +171,13 @@ class StreetCostModel:
 # walk wearing another provider's name.
 STREET_COST_MODELS: dict[str, StreetCostModel] = {
     "gsv": StreetCostModel(unit="GSV queries", estimate=None),
+    # estimate_sweep_requests is a FLOOR, not a budget: it counts one page-1 per
+    # root cell and nothing else, and the cost study measured real sweeps at
+    # 1.80x it (Yogyakarta ran 3.0x). The pre-flight is deliberately still built
+    # on the floor -- it is the number a collector can compute up front, and the
+    # safe direction is to under-refuse a walk whose census may well be free
+    # from the cache anyway. See docs/experiments/kartaview-sweep-cost.md.
+    "kartaview": StreetCostModel(unit="KartaView sweep requests", estimate=estimate_sweep_requests),
     "mapillary": StreetCostModel(unit="Mapillary tile requests", estimate=estimate_tile_count),
 }
 
@@ -446,6 +459,22 @@ def run_collect(args: argparse.Namespace) -> int:
                         request_timeout=args.timeout,
                         max_requests_per_minute=args.mapillary_max_requests_per_minute,
                         jitter=args.mapillary_jitter,
+                        checkpoint_path=checkpoint_path,
+                        checkpoint_channel=budget_channel,
+                        checkpoint_variant=args.network_type,
+                        census_cache=census_cache,
+                    )
+                )
+            elif provider == "kartaview":
+                dict_results = asyncio.run(
+                    collect_kartaview_street_samples_async(
+                        query_points,
+                        city,
+                        config["access_token"],
+                        out_csv,
+                        match_dist_m=args.match_dist,
+                        request_timeout=args.timeout,
+                        max_requests_per_minute=args.kartaview_max_requests_per_minute,
                         checkpoint_path=checkpoint_path,
                         checkpoint_channel=budget_channel,
                         checkpoint_variant=args.network_type,
@@ -775,6 +804,19 @@ def build_parser() -> argparse.ArgumentParser:
             "cadence). Rate and daily volume were both falsified as the per-IP "
             "block trigger, so the metronomic request pattern is the axis under "
             "test (issue #292)"
+        ),
+    )
+    parser.add_argument(
+        "--kartaview-max-requests-per-minute",
+        type=int,
+        default=DEFAULT_SWEEP_REQUESTS_PER_MINUTE,
+        help=(
+            "Client-side pacing cap for KartaView sweep requests "
+            f"(default: {DEFAULT_SWEEP_REQUESTS_PER_MINUTE}); <= 0 disables "
+            "pacing. Its own flag rather than the Mapillary one because "
+            "kartaview.org is a separate per-IP-metered host, shared with no "
+            "other channel -- and because the authenticated ceiling is "
+            "1,000/h, which this default sits under (issue #258)"
         ),
     )
     parser.add_argument(

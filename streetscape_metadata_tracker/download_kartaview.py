@@ -2154,6 +2154,7 @@ async def fetch_city_images_async(
     checkpoint_path: str | None = None,
     checkpoint_request_interval: int = DEFAULT_CHECKPOINT_REQUEST_INTERVAL,
     checkpoint_channel: str | None = None,
+    checkpoint_variant: str | None = None,
     census_cache: CensusCache | None = None,
 ) -> dict[str, Any]:
     """
@@ -2192,6 +2193,7 @@ async def fetch_city_images_async(
             checkpoint_path=checkpoint_path,
             checkpoint_request_interval=checkpoint_request_interval,
             checkpoint_channel=checkpoint_channel,
+            checkpoint_variant=checkpoint_variant,
             census_cache=census_cache,
         )
 
@@ -2211,6 +2213,7 @@ async def _fetch_city_images(
     checkpoint_path: str | None = None,
     checkpoint_request_interval: int = DEFAULT_CHECKPOINT_REQUEST_INTERVAL,
     checkpoint_channel: str | None = None,
+    checkpoint_variant: str | None = None,
     census_cache: CensusCache | None = None,
 ) -> dict[str, Any]:
     """
@@ -2420,12 +2423,19 @@ async def _fetch_city_images(
             cache_path=census_cache.path,
             checkpoint_path=checkpoint_path,
             channel=checkpoint_channel,
-            variant=None,
+            # The VARIANT, not None. A road walk's --network-type is what
+            # separates two crawls of one city inside one channel, so a
+            # hardcoded None here would have the 'drive' walk reconcile against
+            # the 'all_public' walk's checkpoint and inherit its holes. None is
+            # still correct for the grid run, which has no variant -- it now
+            # arrives as one rather than being assumed (#258).
+            variant=checkpoint_variant,
         ):
             return _reuse_cached_sweep(
                 cached,
                 city_name=city_name,
                 checkpoint_channel=checkpoint_channel,
+                checkpoint_variant=checkpoint_variant,
             )
 
     resumed: SweepCheckpoint | None = None

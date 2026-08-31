@@ -40,8 +40,7 @@ from streetscape_metadata_tracker.naming import (
     generate_streetwalk_filename,
     streetwalk_coverage_filename,
 )
-from streetscape_street_analyzer import collect
-from streetscape_street_analyzer import census_walk
+from streetscape_street_analyzer import census_walk, collect
 from streetscape_street_analyzer import collect_mapillary as cm
 from tests.conftest import stamp_census_cache
 

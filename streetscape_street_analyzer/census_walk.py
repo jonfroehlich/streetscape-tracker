@@ -39,7 +39,7 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 
-from streetscape_metadata_tracker.analysis import FLAT_ONLY
+from streetscape_metadata_tracker.analysis import FLAT_ONLY, REQUEST_FAILED
 from streetscape_metadata_tracker.census import census_is_pano, status_for_capture_dates
 
 WGS84 = "EPSG:4326"
@@ -182,6 +182,7 @@ def build_streetwalk_rows(
     match_dist_m: float,
     query_timestamp: str,
     spec: CensusWalkSpec,
+    unmeasured_mask: Callable[[np.ndarray, np.ndarray], np.ndarray] | None = None,
 ) -> pd.DataFrame:
     """
     Score every sample location against the census into METADATA rows.
@@ -197,6 +198,9 @@ def build_streetwalk_rows(
         presence marker with a **null capture_date**, so flat timestamps never
         enter a dated statistic; counts only toward any-imagery coverage.
       * ``ZERO_RESULTS`` — no imagery of any kind in range.
+      * ``REQUEST_FAILED`` — nothing in range, but this sample sits under part
+        of the bbox the fetch never measured, so "no imagery" was never
+        observed here (see ``unmeasured_mask``).
 
     Args:
         query_points: the deterministic on-street sample points.
@@ -204,6 +208,19 @@ def build_streetwalk_rows(
         match_dist_m: max sample-to-image distance in metres.
         query_timestamp: the observation timestamp stamped on every row.
         spec: the provider's :class:`CensusWalkSpec`.
+        unmeasured_mask: ``(lats, lons) -> bool array`` marking sample points
+            under a tile or cell the fetch never got back — KartaView's
+            ``_points_in_cells`` over ``failed_cells``, and the same seam
+            Mapillary's ``failed_tiles`` needs for #259. None for a clean
+            sweep, which pays nothing.
+
+            Recording an unswept sample as ZERO_RESULTS publishes an absence we
+            never observed into an immutable dated snapshot, and street
+            coverage is a share of samples — so an unmeasured hole would read
+            as measured emptiness and understate the city forever. Applied only
+            to samples that matched nothing: one that found imagery within
+            ``match_dist_m`` was measured by construction, whatever cell it
+            sits in.
     """
     pano_positions, flat_positions = nearest_images_to_samples(query_points, census, match_dist_m)
     sample_lats = np.array([p[0] for p in query_points], dtype=np.float64)
@@ -244,11 +261,18 @@ def build_streetwalk_rows(
     empty_idx = np.flatnonzero(~matched)
     if not len(empty_idx):
         return image_rows
+    empty_lats = sample_lats[empty_idx]
+    empty_lons = sample_lons[empty_idx]
+    if unmeasured_mask is None:
+        empty_status = "ZERO_RESULTS"
+    else:
+        unknown = np.asarray(unmeasured_mask(empty_lats, empty_lons), dtype=bool)
+        empty_status = np.where(unknown, REQUEST_FAILED, "ZERO_RESULTS")
     empty_rows = spec.build_empty_rows(
-        sample_lats[empty_idx],
-        sample_lons[empty_idx],
+        empty_lats,
+        empty_lons,
         query_timestamp,
-        "ZERO_RESULTS",
+        empty_status,
     )
     # Restore sample order: the two frames were built by kind, not by position.
     combined = pd.concat([image_rows, empty_rows], ignore_index=True)

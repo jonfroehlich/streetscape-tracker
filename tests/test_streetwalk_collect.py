@@ -16,7 +16,7 @@ import geopandas as gpd
 import pytest
 from shapely.geometry import LineString
 
-from streetscape_metadata_tracker import db
+from streetscape_metadata_tracker import db, naming
 from streetscape_metadata_tracker import download_gsv as dg
 from streetscape_street_analyzer import collect
 
@@ -685,22 +685,31 @@ def test_street_cost_model_refuses_an_unmodelled_provider():
     """
     Raises rather than defaulting: every default here is some OTHER provider's
     cost model, which misprices a walk instead of stopping it.
+
+    A synthetic name, not a real provider. This test's whole subject is the
+    provider the table does NOT know about, so naming a real one dates it to
+    whichever provider happened to be unwired that week -- it was written with
+    'kartaview' and went green the moment #258 wired it, which is the failure
+    mode being avoided here.
     """
-    with pytest.raises(ValueError, match="No street cost model for provider 'kartaview'"):
-        collect.street_cost_model("kartaview")
+    with pytest.raises(ValueError, match="No street cost model for provider 'newprovider'"):
+        collect.street_cost_model("newprovider")
 
 
 def test_dispatch_refuses_a_provider_with_no_collector(tmp_path, monkeypatch, caplog):
     """
     The arm that matters most, driven through the REAL flow.
 
-    Before #268 this was `else: <mapillary>`, so a KartaView walk would have
-    fetched from tiles.mapillary.com carrying a KartaView token and been
-    published under a kartaview filename -- a plausible success, not a crash.
+    Before #268 this was `else: <mapillary>`, so a new provider's walk would
+    have fetched from tiles.mapillary.com carrying that provider's token and been
+    published under that provider's own filename -- a plausible success, not a
+    crash.
 
-    Reproduces the half-wired state #258 necessarily passes through: a budget
-    channel and a cost model exist (so argparse accepts --provider kartaview and
-    the pre-flight prices it) but no dispatch arm does. Mutating the
+    Reproduces the half-wired state a new provider necessarily passes through: a
+    budget channel and a cost model exist (so argparse accepts the flag and the
+    pre-flight prices it) but no dispatch arm does. Uses a SYNTHETIC provider
+    rather than a real one -- written against 'kartaview', it went green the
+    moment #258 wired that arm, testing nothing. Mutating the
     construction site rather than reading the shipped table, because a test over
     today's two providers would pass while `else` still meant Mapillary.
 
@@ -711,11 +720,17 @@ def test_dispatch_refuses_a_provider_with_no_collector(tmp_path, monkeypatch, ca
     artifact assertions below pin.
     """
     data_dir = _setup(tmp_path, monkeypatch)
-    monkeypatch.setitem(collect.STREET_BUDGET_CHANNELS, "kartaview", "kartaview_streets")
+    monkeypatch.setitem(collect.STREET_BUDGET_CHANNELS, "newprovider", "newprovider_streets")
+    # naming.KNOWN_PROVIDERS is a SECOND guard on this path and it fires first
+    # in the real flow -- generate_streetwalk_filename refuses a provider it has
+    # no token for, before the dispatch is reached. That layering is deliberate
+    # and worth stating, but it is not what this test is about, so widen it here
+    # to let the run get as far as the dispatch arm under test.
+    monkeypatch.setattr(naming, "KNOWN_PROVIDERS", (*naming.KNOWN_PROVIDERS, "newprovider"))
     monkeypatch.setitem(
         collect.STREET_COST_MODELS,
-        "kartaview",
-        collect.StreetCostModel(unit="KartaView sweep requests", estimate=lambda *a: 7),
+        "newprovider",
+        collect.StreetCostModel(unit="NewProvider requests", estimate=lambda *a: 7),
     )
     # The kartaview_streets channel has no config arm until #258; patch it so the
     # test fails at the DISPATCH rather than earlier, on credential loading.
@@ -723,14 +738,14 @@ def test_dispatch_refuses_a_provider_with_no_collector(tmp_path, monkeypatch, ca
 
     # Any call into the Mapillary collector is the defect itself, not a side effect.
     def boom(*a, **k):  # pragma: no cover - must never run
-        raise AssertionError("KartaView walk reached the MAPILLARY collector")
+        raise AssertionError("an unwired provider's walk reached the MAPILLARY collector")
 
     monkeypatch.setattr(collect, "collect_mapillary_street_samples_async", boom)
 
-    rc = collect.run_collect(_args(data_dir, provider="kartaview"))
+    rc = collect.run_collect(_args(data_dir, provider="newprovider"))
 
     assert rc == 1
-    assert "No street collector for provider 'kartaview'" in caplog.text
+    assert "No street collector for provider 'newprovider'" in caplog.text
     # Nothing was published under the kartaview name -- the failure this prevents
     # is an immutable dated snapshot carrying another provider's data.
-    assert not [f for f in os.listdir(data_dir) if "kartaview" in f]
+    assert not [f for f in os.listdir(data_dir) if "newprovider" in f]
