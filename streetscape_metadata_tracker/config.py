@@ -147,6 +147,34 @@ def warn_if_credentials_world_readable(env_path: str) -> bool:
     return False
 
 
+# Credential channel -> the env var(s) load_config reads for it, most specific
+# first. The FIRST entry is the channel's own variable and the one CLAUDE.md's
+# credentials table documents; a second is a documented fallback.
+#
+# Declared rather than left implicit in load_config's if-chain because that
+# chain is not enumerable, and #258 shipped `kartaview_streets` with no row in
+# the router's credentials table -- while being the one street channel whose
+# credential behaviour differs from its siblings. Two tests close the loop:
+# test_load_config_reads_no_env_var_outside_the_declared_table asserts this
+# covers every variable the chain actually reads, and
+# test_every_credential_channel_appears_in_the_routers_credentials_table
+# asserts CLAUDE.md covers every channel here. Adding a channel fails both
+# until it is declared and documented.
+CHANNEL_ENV_VARS: dict[str, tuple[str, ...]] = {
+    "gsv": ("GMAPS_API_KEY",),
+    "gsv_streets": ("GMAPS_STREETS_API_KEY",),
+    "kartaview": ("KARTAVIEW_ACCESS_TOKEN",),
+    # The one channel with a fallback: a walk and a grid run of KartaView are
+    # serialized by one machine-wide host_lock(HOST_KARTAVIEW), so there is no
+    # parallel quota burn to isolate the way gsv_streets and mapillary_streets
+    # must. Its own token still overrides, for an operator who wants the walk
+    # metered separately upstream.
+    "kartaview_streets": ("KARTAVIEW_STREETS_ACCESS_TOKEN", "KARTAVIEW_ACCESS_TOKEN"),
+    "mapillary": ("MAPILLARY_ACCESS_TOKEN",),
+    "mapillary_streets": ("MAPILLARY_STREETS_ACCESS_TOKEN",),
+}
+
+
 def load_config(provider: str = "gsv") -> dict[str, Any]:
     """
     Load the API credential for the given provider from the environment.

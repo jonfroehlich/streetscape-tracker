@@ -81,6 +81,7 @@ from streetscape_metadata_tracker.checkpointing import (
 )
 from streetscape_metadata_tracker.config import load_config
 from streetscape_metadata_tracker.download_common import (
+    SWEEP_INCOMPLETE_EXIT_CODE,
     DownloadError,
     HostUnavailableError,
     host_exit_code,
@@ -89,6 +90,7 @@ from streetscape_metadata_tracker.download_common import (
 from streetscape_metadata_tracker.download_gsv import collect_points_async
 from streetscape_metadata_tracker.download_kartaview import (
     DEFAULT_SWEEP_REQUESTS_PER_MINUTE,
+    SweepIncompleteError,
     estimate_sweep_requests,
 )
 from streetscape_metadata_tracker.download_mapillary import (
@@ -475,6 +477,7 @@ def run_collect(args: argparse.Namespace) -> int:
                         match_dist_m=args.match_dist,
                         request_timeout=args.timeout,
                         max_requests_per_minute=args.kartaview_max_requests_per_minute,
+                        max_requests=args.kartaview_max_requests,
                         checkpoint_path=checkpoint_path,
                         checkpoint_channel=budget_channel,
                         checkpoint_variant=args.network_type,
@@ -518,6 +521,21 @@ def run_collect(args: argparse.Namespace) -> int:
                 logger.warning(
                     "Recorded %d %s requests spent by the failed crawl", spent, budget_channel
                 )
+            if isinstance(e, SweepIncompleteError):
+                # PROGRESS, not breakage: the sweep stopped at its request cap
+                # or deadline and CHECKPOINTED what it paid for, so the next
+                # run resumes instead of re-paying. Logged at INFO without a
+                # traceback and given its own exit code, exactly as the grid
+                # CLI does (cli.py) -- the scheduler amnesties 83 rather than
+                # counting a consecutive_failure, and folding this into 1 would
+                # quarantine a city that is making progress every night.
+                logger.info(
+                    "KartaView sweep paused at %s/%s root cells; re-run to resume from %s",
+                    e.roots_done,
+                    e.root_count,
+                    e.checkpoint_path,
+                )
+                return SWEEP_INCOMPLETE_EXIT_CODE
             if isinstance(e, DownloadError):
                 logger.error("Collection failed: %s", e)
             else:
@@ -817,6 +835,21 @@ def build_parser() -> argparse.ArgumentParser:
             "kartaview.org is a separate per-IP-metered host, shared with no "
             "other channel -- and because the authenticated ceiling is "
             "1,000/h, which this default sits under (issue #258)"
+        ),
+    )
+    parser.add_argument(
+        "--kartaview-max-requests",
+        type=int,
+        default=None,
+        help=(
+            "Hard ceiling on the requests this KartaView walk may issue. The "
+            "--daily-budget gate is priced from estimate_sweep_requests, which "
+            "is a geometric FLOOR (measured overhead 1.80x, and Yogyakarta ran "
+            "3.0x), so a gate that passes does not bound what the sweep then "
+            "spends against a host that meters by IP. Stopping at the cap "
+            "checkpoints the work and exits "
+            f"{SWEEP_INCOMPLETE_EXIT_CODE}, so the next run resumes rather "
+            "than re-paying (issues #238, #273)"
         ),
     )
     parser.add_argument(

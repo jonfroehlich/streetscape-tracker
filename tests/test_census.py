@@ -345,6 +345,51 @@ def test_the_mapillary_names_are_bindings_of_the_generic_ones():
     assert dm.status_for_capture_dates is census.status_for_capture_dates
 
 
+@pytest.mark.parametrize("missing", ["", None, np.nan, pd.NaT])
+def test_every_spelling_of_a_missing_date_is_no_date(missing):
+    """
+    '' is the in-repo convention and every current parser emits it, but this is
+    the guard a NEW census provider binds against through
+    CensusWalkSpec.capture_dates_for -- and `None != ""` is True, so a guard
+    testing only the empty string scores a null date as OK.
+
+    That is not a cosmetic difference: the row counts as covered, its NO_DATE
+    is lost, and the pair goes into an immutable dated snapshot. Undated
+    imagery arrives in batches, so a provider whose dates silently vanished
+    would publish full coverage that ages nothing and read as a property of the
+    data rather than as a bug.
+    """
+    assert list(census.status_for_capture_dates([missing])) == ["NO_DATE"]
+
+
+def test_a_real_date_beside_every_missing_spelling_still_reads_ok():
+    """
+    The positive half: a guard that answered NO_DATE unconditionally would pass
+    the test above and lose every date in the catalog.
+    """
+    dates = ["2024-01-01", "", None, "2019-06-30", np.nan]
+    assert list(census.status_for_capture_dates(dates)) == [
+        "OK",
+        "NO_DATE",
+        "NO_DATE",
+        "OK",
+        "NO_DATE",
+    ]
+
+
+def test_the_string_fast_path_is_not_dragged_through_the_null_check():
+    """
+    A parser's output is a fixed-width string array, which cannot hold None at
+    all -- so the null check is skipped for it. Pinned because this runs once
+    per census row (#157's memory contract) and the object-dtype conversion
+    that would make it total unconditionally is the kind of cost that gets
+    added quietly.
+    """
+    dates = np.asarray(["2024-01-01", ""])
+    assert dates.dtype != object, "a parser hands in a string array, not object"
+    assert list(census.status_for_capture_dates(dates)) == ["OK", "NO_DATE"]
+
+
 # ── the grid run: a census becomes a run CSV ───────────────────────────────
 #
 # write_census_grid_run is the ~150-line back half every census provider needs:

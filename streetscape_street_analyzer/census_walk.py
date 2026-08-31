@@ -64,11 +64,16 @@ class CensusWalkSpec:
 
     Attributes:
         capture_dates_for: ``(census, positions) -> array`` of ISO date strings
-            (or None) for those census rows. The one genuinely divergent piece:
-            Mapillary reads ``captured_at_ms``, KartaView reads ``shot_date``
-            against ``date_added``. A date the provider's own guard rejects
-            comes back None, which becomes NO_DATE below — never a dropped
-            sample, because an undated pano still covers (issue #257).
+            for those census rows. The one genuinely divergent piece: Mapillary
+            reads ``captured_at_ms``, KartaView reads ``shot_date`` against
+            ``date_added``. A date the provider's own guard rejects must come
+            back as **the empty string**, which becomes NO_DATE below — never a
+            dropped sample, because an undated pano still covers (issue #257).
+            Both current bindings emit ``""`` (`.fillna("")`);
+            ``status_for_capture_dates`` also treats None/NaN/NaT as missing,
+            so a binding that returns None is scored correctly rather than
+            silently publishing OK with a null date, but ``""`` is the
+            convention to write against.
         build_image_rows: the provider's binding of ``census.build_image_rows``.
         build_empty_rows: the provider's binding of ``census.build_empty_rows``.
     """
@@ -243,10 +248,11 @@ def build_streetwalk_rows(
         spec.capture_dates_for(census, chosen[matched_idx][pano_of_matched])
     )
     # status_for_capture_dates is evaluated over every matched row, including
-    # the flat ones whose capture_date is None — those transiently read "OK"
-    # (None != "") and are then overridden by the outer where. Kept whole-array
-    # rather than masked so the OK/NO_DATE rule has exactly one statement,
-    # shared with the grid downloader; a flat row's status never escapes it.
+    # the flat ones whose capture_date is None — those transiently read
+    # "NO_DATE" (the guard treats None as missing) and are then overridden by
+    # the outer where. Kept whole-array rather than masked so the OK/NO_DATE
+    # rule has exactly one statement, shared with the grid downloader; a flat
+    # row's status never escapes it.
     status = np.where(~pano_of_matched, FLAT_ONLY, status_for_capture_dates(capture_dates))
     image_rows = spec.build_image_rows(
         census,

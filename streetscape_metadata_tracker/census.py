@@ -238,11 +238,35 @@ def status_for_capture_dates(capture_dates) -> np.ndarray:
     grid downloader and road-walk collector so one provider's status vocabulary
     can't drift from another's.
 
+    MISSING IS ANY OF ``""``, None, NaN or NaT, not just the empty string. The
+    empty string is the in-repo convention and every current parser emits it
+    (`.fillna("")`), but this is the function a NEW census provider binds
+    against through `CensusWalkSpec.capture_dates_for`, and `None != ""` is
+    True: a guard testing only the empty string reads a null date as **OK with
+    no date**. That row would be counted as covered, its NO_DATE silently lost,
+    and written into an immutable dated snapshot -- and because undated imagery
+    arrives in batches it would read as a property of the provider's data
+    rather than as a bug. Cheap to make total, so it is total.
+
     Args:
-        capture_dates: array-like of 'YYYY-MM-DD'/'' from the provider's
-            vectorized date parser.
+        capture_dates: array-like of 'YYYY-MM-DD' / '' from the provider's
+            vectorized date parser. None/NaN/NaT are accepted and treated as
+            missing, but '' is what a parser should emit.
     """
-    return np.where(np.asarray(capture_dates) != "", "OK", "NO_DATE")
+    dates = np.asarray(capture_dates)
+    if dates.dtype.kind in "US":
+        # The fast path, and the only one a current parser takes: a fixed-width
+        # string array cannot hold None or NaN, so there is nothing to check
+        # for. Keyed on the STRING kinds rather than on `== object` because an
+        # all-null column arrives as float64 NaN, which is neither.
+        # This runs once per census row (#157's memory contract).
+        missing = dates == ""
+    else:
+        # Comparing a float array against "" yields a scalar False rather than
+        # an elementwise mask, so the null check comes first and the empty
+        # string is asked of an object view.
+        missing = pd.isna(dates) | (dates.astype(object) == "")
+    return np.where(missing, "NO_DATE", "OK")
 
 
 def _check_image_columns(

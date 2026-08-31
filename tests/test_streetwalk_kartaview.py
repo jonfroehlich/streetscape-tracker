@@ -28,8 +28,12 @@ from shapely.geometry import LineString
 
 from streetscape_metadata_tracker import db
 from streetscape_metadata_tracker.checkpointing import census_cache_path_for
-from streetscape_metadata_tracker.download_common import grid_bbox
-from streetscape_metadata_tracker.download_kartaview import Cell, records_to_census
+from streetscape_metadata_tracker.download_common import SWEEP_INCOMPLETE_EXIT_CODE, grid_bbox
+from streetscape_metadata_tracker.download_kartaview import (
+    Cell,
+    SweepIncompleteError,
+    records_to_census,
+)
 from streetscape_metadata_tracker.naming import (
     generate_streetwalk_filename,
     streetwalk_coverage_filename,
@@ -78,7 +82,9 @@ def _image(image_id, lat, lon, *, is_pano=True, shot_date="2024-05-01", date_add
     }
 
 
-def _setup(tmp_path, monkeypatch, images, *, api_requests=9, failed_cells=None, token=None):
+def _setup(
+    tmp_path, monkeypatch, images, *, api_requests=9, failed_cells=None, token=None, raises=None
+):
     """Data dir + catalog with one city; edges and the sweep served locally."""
     data_dir = str(tmp_path)
     conn = db.connect(db.get_default_db_path(data_dir))
@@ -107,6 +113,9 @@ def _setup(tmp_path, monkeypatch, images, *, api_requests=9, failed_cells=None, 
         calls["checkpoint_channel"] = kwargs.get("checkpoint_channel")
         calls["checkpoint_variant"] = kwargs.get("checkpoint_variant")
         calls["max_requests_per_minute"] = kwargs.get("max_requests_per_minute")
+        calls["max_requests"] = kwargs.get("max_requests")
+        if raises is not None:
+            raise raises
         policy = kwargs.get("census_cache")
         calls["cache_path"] = policy.path if policy else None
         calls["reuse_census"] = policy.reuse if policy else None
@@ -142,6 +151,25 @@ def _args(data_dir, **overrides):
     for k, v in overrides.items():
         argv += [f"--{k}", str(v)] if v is not True else [f"--{k}"]
     return collect.build_parser().parse_args(argv)
+
+
+def _paused_sweep(*, spent):
+    """A sweep that stopped with roots unvisited, as the request cap leaves it.
+
+    `api_requests` is attached by the collector's `spent` helper rather than
+    passed to __init__, so the fixture builds it the same way the real sweep
+    does -- otherwise the ledger assertion would pin a shape the collector
+    never produces.
+    """
+    error = SweepIncompleteError(
+        "stopped at the request cap",
+        checkpoint_path="/checkpoints/kv",
+        roots_done=3,
+        root_count=8,
+    )
+    error.api_requests = spent
+    error.api_requests_total = spent
+    return error
 
 
 def _walk_csv(data_dir, network_type="drive"):
@@ -328,6 +356,59 @@ def test_the_walk_reads_the_grid_runs_cache_entry(tmp_path, monkeypatch):
     assert calls["checkpoint_channel"] == "kartaview_streets"
     assert calls["checkpoint_variant"] == "drive"
     assert "kartaview_streets" in calls["checkpoint_path"]
+
+
+def test_the_request_cap_reaches_the_sweep_rather_than_only_the_budget_gate(tmp_path, monkeypatch):
+    """
+    --daily-budget only GATES: it is priced from estimate_sweep_requests, which
+    the estimator's own docstring calls a geometric FLOOR (measured overhead
+    1.80x; Yogyakarta ran 3.0x). So a gate that passes at 1,800 does not stop
+    the sweep spending 5,400 against a host that meters by IP and sends no
+    Retry-After. The cap is the enforceable half, and it has to reach the
+    sweep -- a flag parsed and dropped bounds nothing.
+
+    Asserted against a value that is not the default, so a call site that
+    hardcoded the default (or dropped the argument) still fails.
+    """
+    data_dir, calls = _setup(tmp_path, monkeypatch, [_image("kv1", 44.05, -121.30)])
+    assert collect.run_collect(_args(data_dir, **{"kartaview-max-requests": 500})) == 0
+    assert calls["max_requests"] == 500
+
+    # ...and unset stays unset, rather than a cap nobody asked for silently
+    # truncating a city's sweep into a permanent hole.
+    data_dir2, calls2 = _setup(tmp_path / "b", monkeypatch, [_image("kv1", 44.05, -121.30)])
+    assert collect.run_collect(_args(data_dir2)) == 0
+    assert calls2["max_requests"] is None
+
+
+def test_a_sweep_that_stops_at_its_cap_exits_83_rather_than_failing(tmp_path, monkeypatch):
+    """
+    Hitting the cap is PROGRESS: the work is checkpointed and the next run
+    resumes from it. Exit 83 is what says so.
+
+    Folding it into 1 would be worse than cosmetic. The scheduler amnesties 83
+    but counts a 1 as a consecutive_failure, and nothing but a success resets
+    that -- so a city too large to sweep in one night, which is exactly the
+    city the checkpoint exists for, would quarantine itself after five nights
+    of making steady progress.
+    """
+    data_dir, _ = _setup(
+        tmp_path,
+        monkeypatch,
+        [_image("kv1", 44.05, -121.30)],
+        raises=_paused_sweep(spent=500),
+    )
+    assert collect.run_collect(_args(data_dir, **{"kartaview-max-requests": 500})) == (
+        SWEEP_INCOMPLETE_EXIT_CODE
+    )
+    assert not os.path.exists(_walk_csv(data_dir)), "a paused sweep publishes nothing"
+
+    # The spend still reaches the ledger, or tomorrow's gate overspends by
+    # whatever a paused night cost.
+    conn = db.connect(db.get_default_db_path(data_dir))
+    spent = db.get_api_usage(conn, date.fromisoformat(RUN_DATE), provider="kartaview_streets")
+    conn.close()
+    assert spent == 500
 
 
 def test_the_walks_variant_reaches_the_fetch(tmp_path, monkeypatch):

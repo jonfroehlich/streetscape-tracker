@@ -1473,6 +1473,15 @@ class SweepCheckpoint:
     path: str
     radius_m: int
     channel: str | None = None
+    # WHICH crawl of that channel. A road walk's --network-type is what
+    # separates two crawls of one city inside one channel, so the channel alone
+    # does not identify a sweep once #258's walk exists: `drive` and
+    # `all_public` meter into the SAME ledger and are not the same crawl.
+    # Mirrors download_mapillary's tile checkpoint, whose commit record has
+    # carried the variant since #256 -- checkpointing.checkpoint_path_for's
+    # docstring asserts that every provider's record stores it, and until #258
+    # KartaView's did not, leaving the path token as the only separation.
+    variant: str | None = None
     # When the FIRST commit of this sweep landed, carried forward by every later
     # one. The age cap is measured from here rather than from `updated_at`
     # (issue #272), for the reason Mapillary's checkpoint already records: a
@@ -1620,6 +1629,7 @@ def load_checkpoint(
     ipp: int,
     requested_radius_m: int | None,
     channel: str | None = None,
+    variant: str | None = None,
 ) -> SweepCheckpoint | None:
     """
     Resume state for this sweep, or None if there is nothing usable here.
@@ -1646,6 +1656,14 @@ def load_checkpoint(
             resume a sweep whose spend belongs to a different ledger. The
             state file records what it was written as, and a mismatch --
             including a checkpoint from before this field existed -- discards.
+        variant: WHICH crawl of that channel -- a road walk's --network-type,
+            or None for the grid run. The channel alone stopped identifying a
+            sweep when #258 gave one channel two walks of a city: `drive` and
+            `all_public` meter into the SAME ledger, so this is the only thing
+            separating them. A mismatch discards for the reason the channel one
+            does -- resuming would price this crawl with another one's requests
+            -- and a record written before this field existed reads None, which
+            is exactly right for the grid run that wrote it.
 
     Returns:
         A :class:`SweepCheckpoint` with its uncommitted parts already swept
@@ -1667,6 +1685,13 @@ def load_checkpoint(
                 f"{channel!r}; the two meter into different api_usage ledgers"
             )
             return None
+        if state.get("variant") != variant:
+            discard(
+                f"it belongs to the {state.get('variant')!r} crawl of this channel and "
+                f"this run is {variant!r}; resuming it would price this crawl with "
+                f"another one's requests"
+            )
+            return None
         reason = _sweep_matches_caller(state, ipp=ipp, requested_radius_m=requested_radius_m)
         if reason is None:
             cp, reason = _validate_sweep_store(path, state, bbox=bbox)
@@ -1674,6 +1699,7 @@ def load_checkpoint(
             discard(reason)
             return None
         cp.channel = channel
+        cp.variant = variant
         cp.created_at = state["created_at"]
         # MEASURED FROM created_at -- WHEN THE FIRST COMMIT LANDED -- NOT FROM
         # updated_at (issue #272). The one guard here that protects an ARTIFACT
@@ -1890,6 +1916,7 @@ def _commit_checkpoint(
         "bbox": list(bbox),
         "radius_m": cp.radius_m,
         "channel": cp.channel,
+        "variant": cp.variant,
         "ipp": ipp,
         "root_count": root_count,
         "roots_done": cp.roots_done,
@@ -2456,6 +2483,7 @@ async def _fetch_city_images(
             ipp=ipp,
             requested_radius_m=radius_m,
             channel=checkpoint_channel,
+            variant=checkpoint_variant,
         )
 
     limiter = AsyncRateLimiter(max_requests_per_minute)
@@ -2546,7 +2574,10 @@ async def _fetch_city_images(
                 # The radius is settled, so the checkpoint can be opened against
                 # the lattice it will actually describe.
                 cp = resumed or SweepCheckpoint(
-                    path=checkpoint_path, radius_m=radius_m, channel=checkpoint_channel
+                    path=checkpoint_path,
+                    radius_m=radius_m,
+                    channel=checkpoint_channel,
+                    variant=checkpoint_variant,
                 )
 
             roots = cells_for_bbox(*bbox, radius_m * math.sqrt(2))
@@ -3027,8 +3058,15 @@ async def _fetch_city_images(
             census_cache_marker(
                 "kartaview",
                 # RECORDED, never keyed -- the entry is reusable by any channel.
+                # But recorded as the PAIR: same_crawl compares (channel,
+                # variant), so a walk that hardcoded None here would fail to
+                # recognise its OWN entry on a re-finalize -- reporting
+                # api_requests_total=0 for a sweep it paid for, while
+                # census_fetched_by names itself as the payer -- and would take
+                # reconcile_cache_hit's cross-channel path, inheriting its own
+                # failed cells instead of re-probing them.
                 fetched_by=cp.channel,
-                fetched_variant=None,
+                fetched_variant=cp.variant,
                 crawl_started_at=cp.created_at,
                 api_requests_total=prior_requests + api_requests,
                 failed=[_cell_to_dict(c) for c in failed_cells],

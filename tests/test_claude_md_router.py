@@ -197,6 +197,34 @@ def test_the_router_and_the_experiments_readme_name_the_same_writeups():
         )
 
 
+def test_every_credential_channel_appears_in_the_routers_credentials_table():
+    """
+    The credentials table is rule-bearing: it is where a session learns which
+    env var a channel reads, and #258's `kartaview_streets` shipped without a
+    row -- while being the one street channel whose credential behaviour
+    DIFFERS from its siblings (it falls back to KARTAVIEW_ACCESS_TOKEN rather
+    than requiring its own key). A missing row is worse than no table, because
+    the four rows that are there read as complete.
+
+    Set equality against the code, following
+    test_every_scheduled_channel_declares_its_per_ip_hosts: adding a channel
+    without documenting it fails here, and so does documenting one that no
+    longer exists.
+    """
+    from streetscape_metadata_tracker.config import CHANNEL_ENV_VARS
+
+    text = _ROUTER.read_text(encoding="utf-8")
+    documented = dict(re.findall(r"^\| `([a-z_]+)` \| `([A-Z_]+)`", text, re.MULTILINE))
+    assert set(documented) == set(CHANNEL_ENV_VARS), (
+        "every credential channel needs a row in CLAUDE.md's credentials table"
+    )
+    for channel, env_var in documented.items():
+        assert env_var == CHANNEL_ENV_VARS[channel][0], (
+            f"the table says {channel} reads {env_var}, the code reads "
+            f"{CHANNEL_ENV_VARS[channel][0]} first"
+        )
+
+
 def test_no_doc_writes_a_long_flag_with_an_underscore():
     """Every argparse long option in this repo is hyphenated, so an underscore
     flag in the prose is always a typo -- and one copied out of CLAUDE.md fails
