@@ -36,11 +36,9 @@ import os
 from datetime import UTC, datetime
 from typing import Any
 
-import geopandas as gpd
 import numpy as np
 import pandas as pd
 
-from streetscape_metadata_tracker.analysis import FLAT_ONLY
 from streetscape_metadata_tracker.census import census_is_pano
 from streetscape_metadata_tracker.checkpointing import CensusCache, observation_timestamp
 from streetscape_metadata_tracker.download_mapillary import (
@@ -51,116 +49,34 @@ from streetscape_metadata_tracker.download_mapillary import (
     captured_at_to_iso_dates,
     fetch_city_images_async,
     grid_bbox,
-    status_for_capture_dates,
 )
 from streetscape_metadata_tracker.fileutils import load_city_csv_file
+from streetscape_street_analyzer.census_walk import CensusWalkSpec
+from streetscape_street_analyzer.census_walk import (
+    build_streetwalk_rows as census_walk_rows,
+)
 
 logger = logging.getLogger(__name__)
 
 WGS84 = "EPSG:4326"
 
-# Sample points per sjoin_nearest call. The join's peak memory is driven by the
-# match set it materializes, so a big city (hundreds of thousands of samples
-# against a multi-million-image census) is chunked rather than joined in one go.
-# Purely a memory knob — the result is identical at any block size, since each
-# sample's nearest image is decided independently.
-_JOIN_CHUNK_SIZE = 50_000
+
+# Mapillary's binding of the shared census→walk scorer (issue #258).
+#
+# The join, the pano-beats-flat rule and the OK/NO_DATE/FLAT_ONLY/ZERO_RESULTS
+# vocabulary all live in census_walk now; what is left here is the one piece
+# that genuinely differs -- Mapillary stores capture time as epoch milliseconds
+# -- plus this module's own output-schema bindings.
+def _mapillary_capture_dates(census: pd.DataFrame, positions: np.ndarray):
+    """ISO capture dates for those census rows, from Mapillary's epoch ms."""
+    return captured_at_to_iso_dates(census["captured_at_ms"].to_numpy()[positions]).to_numpy()
 
 
-def nearest_images_to_samples(
-    query_points: list[tuple[float, float, int, int]],
-    census: pd.DataFrame,
-    match_dist_m: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    """
-    For each sample location, the nearest 360° pano and the nearest flat image
-    within ``match_dist_m``.
-
-    Uses ``gpd.sjoin_nearest`` on the local UTM CRS — the same idiom the
-    grid-attribution path uses to match panos to edges (street_coverage.py), so
-    distances are true metres rather than degree approximations. Panos and
-    flats are joined separately because they answer different questions: 360°
-    coverage and any-imagery coverage (issue #116's distinction, applied to
-    streets).
-
-    The samples run through the join in ``_JOIN_CHUNK_SIZE`` blocks rather than
-    one call. Now that ``mapillary_streets`` is scheduled across the whole
-    catalog, a dense city pairs a multi-million-image census with a few hundred
-    thousand sample points, and a single join materializes the whole match set
-    at once. Chunking bounds peak memory at the census plus one block's matches;
-    it cannot change the result, because a sample never spans two blocks and the
-    nearest-image choice is per sample.
-
-    Args:
-        query_points: ``(lat, lon, seq, _)`` tuples from
-            ``road_sampling.dedupe_query_points``.
-        census: the columnar Mapillary census (``fetch_city_images_async``).
-        match_dist_m: max sample-to-image distance in metres.
-
-    Returns:
-        ``(pano_positions, flat_positions)`` — two int arrays as long as
-        ``query_points``, holding the census position of the nearest qualifying
-        image per sample and ``-1`` where nothing is in range. Positions rather
-        than image records: Colorado Springs pairs 360k samples with a 6.5M
-        image census, and a dict of per-sample image dicts is a copy of the
-        census the arrays do not need (issue #157).
-    """
-    n_samples = len(query_points)
-    none_matched = np.full(n_samples, -1, dtype=np.int64)
-    if not n_samples or not len(census):
-        return none_matched, none_matched.copy()
-
-    samples_gdf = gpd.GeoDataFrame(
-        {"sample_idx": range(n_samples)},
-        geometry=gpd.points_from_xy([p[1] for p in query_points], [p[0] for p in query_points]),
-        crs=WGS84,
-    )
-    # A city's sample points span a single UTM zone in every realistic case;
-    # estimate_utm_crs picks it from the sample extent.
-    metric_crs = samples_gdf.estimate_utm_crs()
-    samples_m = samples_gdf.to_crs(metric_crs)
-
-    def _join(positions: np.ndarray) -> np.ndarray:
-        matches = np.full(n_samples, -1, dtype=np.int64)
-        if not len(positions):
-            return matches
-        # image_idx carries the position in the FULL census, not in this
-        # subset, so the caller can index the census directly.
-        # Built once, outside the chunk loop: the census is the same for every
-        # block, and reprojecting it per block would dominate the runtime.
-        images_gdf = gpd.GeoDataFrame(
-            {"image_idx": positions},
-            geometry=gpd.points_from_xy(
-                census["lon"].to_numpy()[positions], census["lat"].to_numpy()[positions]
-            ),
-            crs=WGS84,
-        ).to_crs(metric_crs)
-
-        for start in range(0, len(samples_m), _JOIN_CHUNK_SIZE):
-            block = samples_m.iloc[start : start + _JOIN_CHUNK_SIZE]
-            joined = gpd.sjoin_nearest(
-                block,
-                images_gdf,
-                how="inner",
-                max_distance=match_dist_m,
-                distance_col="dist_m",
-            )
-            # sjoin_nearest emits every tied nearest neighbour; keep the closest
-            # single image per sample so each sample yields exactly one row.
-            joined = joined.sort_values("dist_m").drop_duplicates("sample_idx", keep="first")
-            matches[joined["sample_idx"].to_numpy()] = joined["image_idx"].to_numpy()
-        return matches
-
-    # Through census_is_pano, not census["is_pano"].to_numpy(): a provider is
-    # free to declare the column nullable (KartaView's projection is decoded to
-    # a plain bool today, but both OUTPUT schemas use pd.BooleanDtype()), and a
-    # single null degrades .to_numpy() to an object array on which `~` raises --
-    # after the whole paced tile fetch is spent. Same reason the grid tail reads
-    # it there -- and this function in particular is the one a second census
-    # provider reuses verbatim (it touches only lon/lat/is_pano); its neighbour
-    # build_streetwalk_rows is Mapillary-specific and will have to be generalized.
-    is_pano = census_is_pano(census)
-    return _join(np.flatnonzero(is_pano)), _join(np.flatnonzero(~is_pano))
+MAPILLARY_WALK = CensusWalkSpec(
+    capture_dates_for=_mapillary_capture_dates,
+    build_image_rows=build_image_rows,
+    build_empty_rows=build_empty_rows,
+)
 
 
 def build_streetwalk_rows(
@@ -170,65 +86,15 @@ def build_streetwalk_rows(
     query_timestamp: str,
 ) -> pd.DataFrame:
     """
-    Score every sample location against the census into METADATA rows.
+    Score Mapillary census images against the walk's sample points.
 
-    Exactly one row per sample, in ``query_points`` order. Status vocabulary
-    matches the grid downloader exactly (issue #116):
-
-      * ``OK`` / ``NO_DATE`` — a 360° pano is in range (NO_DATE when its
-        contributor timestamp is unusable), which is what 360° street coverage
-        counts.
-      * ``FLAT_ONLY`` — no pano in range but flat/perspective imagery is. A
-        presence marker with a **null capture_date**, so flat timestamps never
-        enter a dated statistic; counts only toward any-imagery coverage.
-      * ``ZERO_RESULTS`` — no imagery of any kind in range.
+    A thin binding of :func:`census_walk.build_streetwalk_rows`; the contract
+    and the status vocabulary are documented there. Kept as a named function on
+    this module rather than a bare partial so the collector below still resolves
+    it as a module global -- which is what lets a test substitute it to simulate
+    a tail failure after the census is already paid for.
     """
-    pano_positions, flat_positions = nearest_images_to_samples(query_points, census, match_dist_m)
-    sample_lats = np.array([p[0] for p in query_points], dtype=np.float64)
-    sample_lons = np.array([p[1] for p in query_points], dtype=np.float64)
-
-    has_pano = pano_positions >= 0
-    # A pano wins wherever there is one; a flat only speaks for samples no pano
-    # reached, which is exactly what makes the row FLAT_ONLY rather than OK.
-    matched = has_pano | (flat_positions >= 0)
-    chosen = np.where(has_pano, pano_positions, flat_positions)
-
-    matched_idx = np.flatnonzero(matched)
-    capture_dates = np.full(len(matched_idx), None, dtype=object)
-    pano_of_matched = has_pano[matched_idx]
-    capture_dates[pano_of_matched] = captured_at_to_iso_dates(
-        census["captured_at_ms"].to_numpy()[chosen[matched_idx][pano_of_matched]]
-    ).to_numpy()
-    # status_for_capture_dates is evaluated over every matched row, including
-    # the flat ones whose capture_date is None — those transiently read "OK"
-    # (None != "") and are then overridden by the outer where. Kept whole-array
-    # rather than masked so the OK/NO_DATE rule has exactly one statement,
-    # shared with the grid downloader; a flat row's status never escapes it.
-    status = np.where(~pano_of_matched, FLAT_ONLY, status_for_capture_dates(capture_dates))
-    image_rows = build_image_rows(
-        census,
-        chosen[matched_idx],
-        sample_lats[matched_idx],
-        sample_lons[matched_idx],
-        query_timestamp,
-        status,
-        capture_dates,
-    )
-
-    empty_idx = np.flatnonzero(~matched)
-    if not len(empty_idx):
-        return image_rows
-    empty_rows = build_empty_rows(
-        sample_lats[empty_idx],
-        sample_lons[empty_idx],
-        query_timestamp,
-        "ZERO_RESULTS",
-    )
-    # Restore sample order: the two frames were built by kind, not by position.
-    combined = pd.concat([image_rows, empty_rows], ignore_index=True)
-    return combined.iloc[
-        np.argsort(np.concatenate([matched_idx, empty_idx]), kind="stable")
-    ].reset_index(drop=True)
+    return census_walk_rows(query_points, census, match_dist_m, query_timestamp, MAPILLARY_WALK)
 
 
 async def collect_mapillary_street_samples_async(

@@ -47,6 +47,7 @@ python -m streetscape_street_analyzer.analyze "Seattle, WA" --provider gsv
 python -m streetscape_street_analyzer.collect "Seattle, WA" --estimate      # cost preview, no key used
 python -m streetscape_street_analyzer.collect "Seattle, WA" --spacing 15
 python -m streetscape_street_analyzer.collect "Seattle, WA" --provider mapillary
+python -m streetscape_street_analyzer.collect "Seattle, WA" --provider kartaview   # free on a paired night (#290 cache)
 python -m streetscape_street_analyzer.collect "Seattle, WA" --network-type all_public   # a SEPARATE walk series, not a replacement
 
 # Worldwide sampling frame (docs/worldwide_sampling.md)
@@ -104,6 +105,7 @@ Credentials live in `.env`, loaded per channel by `streetscape_metadata_tracker/
 | `mapillary` | `MAPILLARY_ACCESS_TOKEN` | Free client token |
 | `kartaview` | `KARTAVIEW_ACCESS_TOKEN` | **Required, not optional**: anonymous is 100 req/h vs 1,000 authenticated — at 100/h a p95 city is hours and Singapore is days, so it is not a slower channel, it is no channel. Scheduled but **opt-in** (#248) |
 | `gsv_streets` | `GMAPS_STREETS_API_KEY` | Isolated street-collection key (#99) with its own `api_usage` string, so street experiments can't exhaust production quotas; **live** |
+| `kartaview_streets` | `KARTAVIEW_STREETS_ACCESS_TOKEN` | The one street channel that **falls back to `KARTAVIEW_ACCESS_TOKEN`** rather than requiring its own: one machine-wide `host_lock(HOST_KARTAVIEW)` serializes every KartaView request, so there is no parallel burn to isolate. CLI-only, **not yet scheduled** (#258) |
 | `mapillary_streets` | `MAPILLARY_STREETS_ACCESS_TOKEN` | Same isolation; **dormant** |
 
 A run requires EVERY named provider's key up-front, `--provider all` included (fail-fast so the series can't drift); a single-provider run needs only its own key.

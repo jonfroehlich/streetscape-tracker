@@ -147,6 +147,34 @@ def warn_if_credentials_world_readable(env_path: str) -> bool:
     return False
 
 
+# Credential channel -> the env var(s) load_config reads for it, most specific
+# first. The FIRST entry is the channel's own variable and the one CLAUDE.md's
+# credentials table documents; a second is a documented fallback.
+#
+# Declared rather than left implicit in load_config's if-chain because that
+# chain is not enumerable, and #258 shipped `kartaview_streets` with no row in
+# the router's credentials table -- while being the one street channel whose
+# credential behaviour differs from its siblings. Two tests close the loop:
+# test_load_config_reads_no_env_var_outside_the_declared_table asserts this
+# covers every variable the chain actually reads, and
+# test_every_credential_channel_appears_in_the_routers_credentials_table
+# asserts CLAUDE.md covers every channel here. Adding a channel fails both
+# until it is declared and documented.
+CHANNEL_ENV_VARS: dict[str, tuple[str, ...]] = {
+    "gsv": ("GMAPS_API_KEY",),
+    "gsv_streets": ("GMAPS_STREETS_API_KEY",),
+    "kartaview": ("KARTAVIEW_ACCESS_TOKEN",),
+    # The one channel with a fallback: a walk and a grid run of KartaView are
+    # serialized by one machine-wide host_lock(HOST_KARTAVIEW), so there is no
+    # parallel quota burn to isolate the way gsv_streets and mapillary_streets
+    # must. Its own token still overrides, for an operator who wants the walk
+    # metered separately upstream.
+    "kartaview_streets": ("KARTAVIEW_STREETS_ACCESS_TOKEN", "KARTAVIEW_ACCESS_TOKEN"),
+    "mapillary": ("MAPILLARY_ACCESS_TOKEN",),
+    "mapillary_streets": ("MAPILLARY_STREETS_ACCESS_TOKEN",),
+}
+
+
 def load_config(provider: str = "gsv") -> dict[str, Any]:
     """
     Load the API credential for the given provider from the environment.
@@ -257,7 +285,46 @@ def load_config(provider: str = "gsv") -> dict[str, Any]:
             )
         return config
 
+    if provider == "kartaview_streets":
+        # FALLS BACK to the grid channel's token, unlike its two sibling street
+        # channels which require their own (issue #258).
+        #
+        # Those two exist for QUOTA isolation: two Google keys can burn one
+        # project's per-minute quota in parallel, and two Mapillary tokens can
+        # spend one IP's tile budget in parallel. Neither is reachable here.
+        # Every KartaView request in the repo goes through one machine-wide
+        # host_lock(HOST_KARTAVIEW), so the grid run and the walk CANNOT be in
+        # flight at once -- and since #290 a paired night's walk reuses the grid
+        # run's census for zero requests, so the usual case spends nothing at
+        # all. A second token would buy no isolation the lock does not already
+        # give, while making the channel un-runnable until someone creates one.
+        #
+        # An override is still honoured, so isolating later is a .env line
+        # rather than a code change.
+        config = {
+            "access_token": (
+                os.environ.get("KARTAVIEW_STREETS_ACCESS_TOKEN")
+                or os.environ.get("KARTAVIEW_ACCESS_TOKEN")
+            ),
+        }
+        if not config["access_token"]:
+            raise ValueError(
+                "Neither KARTAVIEW_STREETS_ACCESS_TOKEN nor KARTAVIEW_ACCESS_TOKEN "
+                "found in environment variables.\n\n"
+                "The KartaView road walk reads the same census as the grid run and "
+                "is serialized against it by the machine-wide host lock, so it "
+                "shares the grid channel's token by default (issue #258). Set "
+                "KARTAVIEW_STREETS_ACCESS_TOKEN only if you want the walk metered "
+                "under a separate credential.\n\n"
+                "Add it to the .env file in your project root:\n"
+                "  KARTAVIEW_ACCESS_TOKEN=YOUR_TOKEN\n\n"
+                "Sign in at https://kartaview.org with Google or Facebook and read "
+                "the token from the session."
+            )
+        return config
+
     raise ValueError(
         f"Unknown provider {provider!r} "
-        f"(known: gsv, mapillary, kartaview, gsv_streets, mapillary_streets)"
+        f"(known: gsv, mapillary, kartaview, gsv_streets, mapillary_streets, "
+        f"kartaview_streets)"
     )

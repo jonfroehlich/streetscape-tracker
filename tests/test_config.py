@@ -1,7 +1,13 @@
 """load_config tests — the function cli.py's both-provider fail-fast relies on."""
 
+import inspect
+import os
+import re
+from unittest import mock
+
 import pytest
 
+from streetscape_metadata_tracker import config
 from streetscape_metadata_tracker.config import load_config, warn_if_credentials_world_readable
 
 
@@ -57,6 +63,54 @@ def test_load_config_empty_credential_raises(monkeypatch, provider, env_var):
     monkeypatch.setenv(env_var, "")
     with pytest.raises(ValueError, match=env_var):
         load_config(provider)
+
+
+def test_load_config_reads_no_env_var_outside_the_declared_table():
+    """
+    CHANNEL_ENV_VARS is only worth having if it cannot drift from the if-chain
+    it describes -- and that chain is a sequence of `if provider == ...` blocks
+    with no enumerable form, which is how #258 added a channel that no table
+    mentioned.
+
+    So: read the source and assert every credential variable load_config
+    actually reaches for is declared. Adding a channel then fails HERE (and in
+    the router's credentials-table test) until it is written down.
+    """
+    source = inspect.getsource(config.load_config)
+    read = set(re.findall(r'os\.environ\.get\("([A-Z_]+)"\)', source))
+    declared = {var for variables in config.CHANNEL_ENV_VARS.values() for var in variables}
+    assert read == declared
+
+
+@pytest.mark.parametrize("channel", sorted(config.CHANNEL_ENV_VARS))
+def test_every_declared_channel_loads_from_its_own_variable(channel):
+    """
+    The other direction: a declared channel must be one load_config accepts,
+    reading the variable the table names first. Pinned per channel so a typo in
+    the table is a named failure rather than a KeyError somewhere downstream.
+    """
+    primary = config.CHANNEL_ENV_VARS[channel][0]
+    with mock.patch.dict(os.environ, {primary: "SENTINEL"}, clear=True):
+        loaded = config.load_config(channel)
+    assert "SENTINEL" in loaded.values()
+
+
+def test_the_kartaview_walk_falls_back_but_prefers_its_own_token():
+    """
+    The one declared fallback, in both directions. It exists because a KartaView
+    walk and grid run are serialized by one machine-wide host lock, so there is
+    no parallel quota burn to isolate -- but an operator who DOES set a separate
+    token must get it, or the isolation they asked for silently does nothing.
+    """
+    with mock.patch.dict(os.environ, {"KARTAVIEW_ACCESS_TOKEN": "SHARED"}, clear=True):
+        assert config.load_config("kartaview_streets")["access_token"] == "SHARED"
+
+    with mock.patch.dict(
+        os.environ,
+        {"KARTAVIEW_ACCESS_TOKEN": "SHARED", "KARTAVIEW_STREETS_ACCESS_TOKEN": "OWN"},
+        clear=True,
+    ):
+        assert config.load_config("kartaview_streets")["access_token"] == "OWN"
 
 
 def test_load_config_unknown_provider_raises():

@@ -63,6 +63,8 @@ import json
 import logging
 import os
 import sys
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 
 from dotenv import find_dotenv, load_dotenv
@@ -79,12 +81,18 @@ from streetscape_metadata_tracker.checkpointing import (
 )
 from streetscape_metadata_tracker.config import load_config
 from streetscape_metadata_tracker.download_common import (
+    SWEEP_INCOMPLETE_EXIT_CODE,
     DownloadError,
     HostUnavailableError,
     host_exit_code,
     jitter_fraction,
 )
 from streetscape_metadata_tracker.download_gsv import collect_points_async
+from streetscape_metadata_tracker.download_kartaview import (
+    DEFAULT_SWEEP_REQUESTS_PER_MINUTE,
+    SweepIncompleteError,
+    estimate_sweep_requests,
+)
 from streetscape_metadata_tracker.download_mapillary import (
     DEFAULT_TILE_JITTER,
     DEFAULT_TILE_REQUESTS_PER_MINUTE,
@@ -100,6 +108,7 @@ from streetscape_metadata_tracker.naming import (
 from streetscape_metadata_tracker.paths import get_default_data_dir
 from streetscape_metadata_tracker.walk_diff import compute_and_record_walk_diff
 
+from .collect_kartaview import collect_kartaview_street_samples_async
 from .collect_mapillary import collect_mapillary_street_samples_async
 from .download_street_network import fetch_street_edges
 from .road_sampling import dedupe_query_points, generate_samples
@@ -118,8 +127,80 @@ logger = logging.getLogger(__name__)
 # quota (issue #141).
 STREET_BUDGET_CHANNELS = {
     "gsv": "gsv_streets",
+    "kartaview": "kartaview_streets",
     "mapillary": "mapillary_streets",
 }
+
+
+@dataclass(frozen=True)
+class StreetCostModel:
+    """
+    How one provider's road walk is PRICED and what one request is called.
+
+    ``unit`` is the noun printed by ``--estimate`` and by the run summary;
+    ``estimate`` is the bbox-driven cost floor, or None for a provider billed
+    one request per on-street sample point.
+
+    None is the meaningful distinction, not a missing value: a per-point
+    provider's cost scales with ``--spacing`` and a census provider's does not
+    (it sweeps the frozen bbox and joins locally), so the two are different
+    cost SHAPES rather than two numbers.
+    """
+
+    unit: str
+    estimate: Callable[[float, float, float, float, float], int] | None
+
+
+# Provider -> cost model, keyed by the SAME tokens as STREET_BUDGET_CHANNELS.
+#
+# A TABLE, not a chain of `if provider == "gsv" ... else <mapillary>` (issue
+# #268). Four of those arms existed, and every one of them made `else` mean
+# Mapillary: the --estimate text, the --daily-budget pre-flight, the collector
+# dispatch and the summary's unit label. All four are unreachable today because
+# argparse gates --provider on STREET_BUDGET_CHANNELS -- and all four would go
+# live, silently and simultaneously, the moment a third key is added there
+# (#258 has to add "kartaview" for --provider kartaview to be accepted at all).
+#
+# The failure was not a crash but a plausible success: a KartaView walk fetched
+# from tiles.mapillary.com under a KartaView token, priced with the tile cost
+# model, and published under a kartaview filename -- an immutable dated snapshot
+# carrying another provider's data, the exact class CLAUDE.md's filename
+# contract exists to prevent. Same shape as the `_collect_one_run` chain PR #263
+# closed on the grid side.
+#
+# test_street_cost_models_cover_every_budget_channel asserts set EQUALITY, so
+# adding a channel without a cost model is a red test rather than a Mapillary
+# walk wearing another provider's name.
+STREET_COST_MODELS: dict[str, StreetCostModel] = {
+    "gsv": StreetCostModel(unit="GSV queries", estimate=None),
+    # estimate_sweep_requests is a FLOOR, not a budget: it counts one page-1 per
+    # root cell and nothing else, and the cost study measured real sweeps at
+    # 1.80x it (Yogyakarta ran 3.0x). The pre-flight is deliberately still built
+    # on the floor -- it is the number a collector can compute up front, and the
+    # safe direction is to under-refuse a walk whose census may well be free
+    # from the cache anyway. See docs/experiments/kartaview-sweep-cost.md.
+    "kartaview": StreetCostModel(unit="KartaView sweep requests", estimate=estimate_sweep_requests),
+    "mapillary": StreetCostModel(unit="Mapillary tile requests", estimate=estimate_tile_count),
+}
+
+
+def street_cost_model(provider: str) -> StreetCostModel:
+    """
+    This provider's cost model, or a loud failure.
+
+    Raises rather than defaulting, for the reason the table above exists: every
+    default here is some other provider's cost model, and applying one silently
+    misprices a walk instead of stopping it.
+    """
+    try:
+        return STREET_COST_MODELS[provider]
+    except KeyError:
+        raise ValueError(
+            f"No street cost model for provider {provider!r}. Add one to "
+            f"STREET_COST_MODELS beside its STREET_BUDGET_CHANNELS entry."
+        ) from None
+
+
 DEFAULT_PROVIDER = "gsv"
 DEFAULT_SPACING_M = 15
 
@@ -198,20 +279,25 @@ def run_collect(args: argparse.Namespace) -> int:
 
         if args.estimate:
             # Dry run: no key, no API calls — just report the work + cost.
-            # Only GSV bills per sample location; Mapillary reads a tile census
-            # whose size is set by the city's area, not by the sample count.
+            # Which of the two cost SHAPES applies comes from the provider's
+            # StreetCostModel, not from naming a provider here: a per-point
+            # provider bills per sample location, a census provider reads a
+            # sweep of the frozen bbox whose size is set by the city's area and
+            # not by the sample count (so --spacing does not move it).
+            model = street_cost_model(provider)
             cached = _cached_census_marker(city, provider, args)
             if cached is not None:
                 cost = (
-                    f"0 Mapillary tile requests (cached census fetched by "
+                    f"0 {model.unit} (cached census fetched by "
                     f"{cached.get('fetched_by')}, crawl started "
                     f"{cached.get('crawl_started_at')})"
                 )
+            elif model.estimate is None:
+                cost = f"{len(query_points)} unique {model.unit}"
             else:
                 cost = (
-                    f"{len(query_points)} unique GSV queries"
-                    if provider == "gsv"
-                    else f"~{estimate_tile_count(city.center_lat, city.center_lon, city.grid_width_m, city.grid_height_m, city.step_m)} Mapillary tile requests (independent of spacing)"
+                    f"~{model.estimate(city.center_lat, city.center_lon, city.grid_width_m, city.grid_height_m, city.step_m)}"
+                    f" {model.unit} (independent of spacing)"
                 )
             print(
                 f"{city.city_id} [{args.network_type}]: {len(edges)} edges, "
@@ -315,19 +401,19 @@ def run_collect(args: argparse.Namespace) -> int:
         # "cost" and deliberately not about "will validate"; an entry the
         # collector then rejects costs a re-fetch that was not budgeted, which
         # is the safe direction (the ledger still records what was spent).
-        estimated_requests = (
-            len(query_points)
-            if provider == "gsv"
-            else 0
-            if _cached_census_marker(city, provider, args) is not None
-            else estimate_tile_count(
+        model = street_cost_model(provider)
+        if model.estimate is None:
+            estimated_requests = len(query_points)
+        elif _cached_census_marker(city, provider, args) is not None:
+            estimated_requests = 0
+        else:
+            estimated_requests = model.estimate(
                 city.center_lat,
                 city.center_lon,
                 city.grid_width_m,
                 city.grid_height_m,
                 city.step_m,
             )
-        )
         if args.daily_budget is not None:
             already = db.get_api_usage(conn, run_date, provider=budget_channel)
             if already + estimated_requests > args.daily_budget:
@@ -363,7 +449,7 @@ def run_collect(args: argparse.Namespace) -> int:
                         max_requests_per_minute=args.max_requests_per_minute,
                     )
                 )
-            else:
+            elif provider == "mapillary":
                 dict_results = asyncio.run(
                     collect_mapillary_street_samples_async(
                         query_points,
@@ -380,6 +466,37 @@ def run_collect(args: argparse.Namespace) -> int:
                         checkpoint_variant=args.network_type,
                         census_cache=census_cache,
                     )
+                )
+            elif provider == "kartaview":
+                dict_results = asyncio.run(
+                    collect_kartaview_street_samples_async(
+                        query_points,
+                        city,
+                        config["access_token"],
+                        out_csv,
+                        match_dist_m=args.match_dist,
+                        request_timeout=args.timeout,
+                        max_requests_per_minute=args.kartaview_max_requests_per_minute,
+                        max_requests=args.kartaview_max_requests,
+                        checkpoint_path=checkpoint_path,
+                        checkpoint_channel=budget_channel,
+                        checkpoint_variant=args.network_type,
+                        census_cache=census_cache,
+                    )
+                )
+            else:
+                # Unreachable while argparse gates --provider on
+                # STREET_BUDGET_CHANNELS, and that is the point: this arm is
+                # what makes ADDING a key safe. Before #268 it read `else:
+                # <mapillary>`, so a new provider's first walk would have gone
+                # to tiles.mapillary.com carrying that provider's token and
+                # been published under that provider's filename -- a plausible
+                # success, not a crash. Raise instead, so wiring a channel
+                # without a collector stops the walk rather than mislabelling
+                # one. street_cost_model() guards the same seam for pricing.
+                raise ValueError(
+                    f"No street collector for provider {provider!r}. Add a dispatch "
+                    f"arm here beside its STREET_BUDGET_CHANNELS entry."
                 )
         except Exception as e:
             # Failed crawls still spent real requests; record them so a later
@@ -404,6 +521,21 @@ def run_collect(args: argparse.Namespace) -> int:
                 logger.warning(
                     "Recorded %d %s requests spent by the failed crawl", spent, budget_channel
                 )
+            if isinstance(e, SweepIncompleteError):
+                # PROGRESS, not breakage: the sweep stopped at its request cap
+                # or deadline and CHECKPOINTED what it paid for, so the next
+                # run resumes instead of re-paying. Logged at INFO without a
+                # traceback and given its own exit code, exactly as the grid
+                # CLI does (cli.py) -- the scheduler amnesties 83 rather than
+                # counting a consecutive_failure, and folding this into 1 would
+                # quarantine a city that is making progress every night.
+                logger.info(
+                    "KartaView sweep paused at %s/%s root cells; re-run to resume from %s",
+                    e.roots_done,
+                    e.root_count,
+                    e.checkpoint_path,
+                )
+                return SWEEP_INCOMPLETE_EXIT_CODE
             if isinstance(e, DownloadError):
                 logger.error("Collection failed: %s", e)
             else:
@@ -553,7 +685,7 @@ def run_collect(args: argparse.Namespace) -> int:
             if totals["coverage_pct_by_length_any"] == totals["coverage_pct_by_length"]
             else f", {totals['coverage_pct_by_length_any']}% including flat imagery"
         )
-        unit = "GSV queries" if provider == "gsv" else "Mapillary tile requests"
+        unit = street_cost_model(provider).unit
         print(
             f"{city.city_id} [streetwalk {provider}/{args.network_type} {run_date}]: "
             f"{len(samples)} samples over {totals['edges']} edges "
@@ -690,6 +822,34 @@ def build_parser() -> argparse.ArgumentParser:
             "cadence). Rate and daily volume were both falsified as the per-IP "
             "block trigger, so the metronomic request pattern is the axis under "
             "test (issue #292)"
+        ),
+    )
+    parser.add_argument(
+        "--kartaview-max-requests-per-minute",
+        type=int,
+        default=DEFAULT_SWEEP_REQUESTS_PER_MINUTE,
+        help=(
+            "Client-side pacing cap for KartaView sweep requests "
+            f"(default: {DEFAULT_SWEEP_REQUESTS_PER_MINUTE}); <= 0 disables "
+            "pacing. Its own flag rather than the Mapillary one because "
+            "kartaview.org is a separate per-IP-metered host, shared with no "
+            "other channel -- and because the authenticated ceiling is "
+            "1,000/h, which this default sits under (issue #258)"
+        ),
+    )
+    parser.add_argument(
+        "--kartaview-max-requests",
+        type=int,
+        default=None,
+        help=(
+            "Hard ceiling on the requests this KartaView walk may issue. The "
+            "--daily-budget gate is priced from estimate_sweep_requests, which "
+            "is a geometric FLOOR (measured overhead 1.80x, and Yogyakarta ran "
+            "3.0x), so a gate that passes does not bound what the sweep then "
+            "spends against a host that meters by IP. Stopping at the cap "
+            "checkpoints the work and exits "
+            f"{SWEEP_INCOMPLETE_EXIT_CODE}, so the next run resumes rather "
+            "than re-paying (issues #238, #273)"
         ),
     )
     parser.add_argument(

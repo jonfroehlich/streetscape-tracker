@@ -2794,6 +2794,227 @@ def test_the_sweeps_own_channel_re_probes_its_failed_cells_rather_than_inheritin
     assert not (tmp_path / "cp-grid").exists()
 
 
+def test_a_walks_own_refinalize_carries_the_sweep_it_paid_for(monkeypatch, tmp_path):
+    """
+    The variant counterpart of the re-finalize test above, and the one the grid
+    run cannot cover: the grid run's variant is None, so a promotion that
+    hardcoded ``fetched_variant=None`` was correct for it and wrong for every
+    walk.
+
+    same_crawl compares the PAIR, so a walk stamping None writes
+    ("kartaview_streets", None) and later asks ("kartaview_streets", "drive")
+    -- its own entry, unrecognised. The row then prices a sweep it paid for at
+    0 while census_fetched_by names itself as the payer, a row that contradicts
+    itself, and it under-reports spend against the one host that meters by IP.
+    """
+    cache = _cache(tmp_path)
+    walk, walk_calls = _sweep_cached(
+        monkeypatch,
+        _photos,
+        cache,
+        channel="kartaview_streets",
+        checkpoint_variant="drive",
+        path=tmp_path / "cp-walk",
+    )
+    assert walk_calls, "the walk paid for it"
+    assert load_census_cache_marker(cache)["fetched_variant"] == "drive", (
+        "the marker must record WHICH crawl paid, not just which channel"
+    )
+
+    refinalize, calls = _sweep_cached(
+        monkeypatch,
+        _photos,
+        cache,
+        channel="kartaview_streets",
+        checkpoint_variant="drive",
+        path=tmp_path / "cp-walk-again",
+    )
+    assert calls == [], "the entry is its own; nothing is re-asked"
+    assert refinalize["api_requests"] == 0, "this process issued none"
+    assert refinalize["api_requests_total"] == len(walk_calls), (
+        "a walk coming back to write its row must still price the collection"
+    )
+    assert refinalize["census_fetched_by"] == "kartaview_streets"
+
+
+def test_the_other_variant_of_one_channel_is_a_reuse_not_a_refinalize(monkeypatch, tmp_path):
+    """
+    The discrimination the pair exists for, and the thing a fix that compared
+    only the CHANNEL would break: `drive` and `all_public` are two walks of one
+    city in one channel, so channel equality would price the second walk's
+    collection at the first's cost -- double-counting one sweep across two
+    catalog rows.
+    """
+    cache = _cache(tmp_path)
+    drive, drive_calls = _sweep_cached(
+        monkeypatch,
+        _photos,
+        cache,
+        channel="kartaview_streets",
+        checkpoint_variant="drive",
+        path=tmp_path / "cp-drive",
+    )
+    assert drive_calls
+
+    broad, calls = _sweep_cached(
+        monkeypatch,
+        _photos,
+        cache,
+        channel="kartaview_streets",
+        checkpoint_variant="all_public",
+        path=tmp_path / "cp-all-public",
+    )
+    assert calls == [], "the census is the same observation; it is free"
+    assert broad["api_requests"] == 0
+    assert broad["api_requests_total"] == 0, "this walk did not pay for that sweep"
+    assert broad["census_fetched_by"] == "kartaview_streets"
+
+
+def test_the_walks_own_variant_re_probes_its_failed_cells_rather_than_inheriting_them(
+    monkeypatch, tmp_path, caplog
+):
+    """
+    The variant counterpart of the own-channel re-probe. reconcile_cache_hit's
+    "hand the crawl's own entry back so the resume re-probes it" branch is
+    gated on same_crawl, so a walk whose marker said None never took it: its
+    own refusals would be inherited verbatim for the whole 7-day window and --
+    with #258's unmeasured_mask -- republished as REQUEST_FAILED holes in every
+    walk snapshot across it. A refusal is time-varying; a channel never
+    inherits its own holes.
+    """
+    seen = []
+
+    def one_bad_cell(call):
+        seen.append(call)
+        if len(seen) == 1:
+            raise kv.ResponseError("HTTP 500")
+        return _photos(call)
+
+    monkeypatch.setattr(kv, "MAX_FAILED_AREA_FRACTION", 0.9)
+    cache = _cache(tmp_path)
+    walk, _ = _sweep_cached(
+        monkeypatch,
+        one_bad_cell,
+        cache,
+        channel="kartaview_streets",
+        checkpoint_variant="drive",
+        path=tmp_path / "cp-walk",
+        retries=0,
+    )
+    assert len(walk["failed_cells"]) == 1
+
+    with caplog.at_level(logging.WARNING):
+        again, calls = _sweep_cached(
+            monkeypatch,
+            _photos,
+            cache,
+            channel="kartaview_streets",
+            checkpoint_variant="drive",
+            path=tmp_path / "cp-walk",
+        )
+    assert calls, "the failed cell was re-asked"
+    assert "re-probes them" in caplog.text
+    assert again["failed_cells"] == []
+    assert load_census_cache_marker(cache)["failed"] == []
+
+    # ...while the OTHER variant, which is a genuine reuse, still inherits it.
+    cache_two = _cache(tmp_path / "cache-two")
+    walk_two, _ = _sweep_cached(
+        monkeypatch,
+        one_bad_cell,
+        cache_two,
+        channel="kartaview_streets",
+        checkpoint_variant="drive",
+        path=tmp_path / "cp-drive-two",
+        retries=0,
+    )
+    seen.clear()
+    broad, broad_calls = _sweep_cached(
+        monkeypatch,
+        _photos,
+        cache_two,
+        channel="kartaview_streets",
+        checkpoint_variant="all_public",
+        path=tmp_path / "cp-all-public-two",
+    )
+    assert broad_calls == [], "a different crawl republishes the observation as it stands"
+    assert broad["failed_cells"] == walk_two["failed_cells"]
+
+
+def test_a_checkpoint_from_another_variant_of_this_channel_is_discarded(monkeypatch, tmp_path):
+    """
+    The channel guard's blind spot once one channel has two walks of a city.
+    `drive` and `all_public` meter into the SAME ledger, so the channel check
+    passes and every geometric check passes too -- they sweep the identical
+    frozen bbox at the same ipp and radius. Only the variant separates them,
+    and resuming across it would price this crawl with the other one's
+    requests. Mirrors download_mapillary.load_tile_checkpoint, whose record has
+    carried the variant since #256.
+    """
+    ckpt = tmp_path / "sweep"
+    _failed_sweep_ckpt(
+        monkeypatch,
+        _empty,
+        ckpt,
+        max_requests=2,
+        checkpoint_channel="kartaview_streets",
+        checkpoint_variant="drive",
+    )
+    assert _state(ckpt)["variant"] == "drive", "the commit record stores which crawl wrote it"
+
+    result, calls = _sweep_ckpt(
+        monkeypatch,
+        _empty,
+        ckpt,
+        checkpoint_channel="kartaview_streets",
+        checkpoint_variant="all_public",
+    )
+    assert len(calls) == result["cells"], "another variant's checkpoint must sweep afresh"
+    assert result["api_requests_total"] == len(calls), "no spend inherited across crawls"
+    assert _state(ckpt)["variant"] == "all_public"
+
+    ckpt_two = tmp_path / "sweep2"
+    _failed_sweep_ckpt(
+        monkeypatch,
+        _empty,
+        ckpt_two,
+        max_requests=2,
+        checkpoint_channel="kartaview_streets",
+        checkpoint_variant="drive",
+    )
+    result, calls = _sweep_ckpt(
+        monkeypatch,
+        _empty,
+        ckpt_two,
+        checkpoint_channel="kartaview_streets",
+        checkpoint_variant="drive",
+    )
+    assert len(calls) == result["cells"] - 2, "the matching variant still resumes"
+
+
+def test_a_checkpoint_written_before_variants_existed_still_resumes_the_grid_run(
+    monkeypatch, tmp_path
+):
+    """
+    Every KartaView checkpoint on prod today was written by the grid run, whose
+    variant is None, and none of them carry the key. `state.get("variant")`
+    reads None for exactly those, which is what the grid run asks for -- so the
+    field arrives without discarding a single in-flight sweep. A guard that
+    compared a MISSING key against None wrongly would re-sweep every enrolled
+    city mid-crawl.
+    """
+    ckpt = tmp_path / "sweep"
+    _failed_sweep_ckpt(monkeypatch, _empty, ckpt, max_requests=2, checkpoint_channel="kartaview")
+
+    state_path = ckpt / kv.CHECKPOINT_STATE_FILENAME
+    state = json.loads(state_path.read_text())
+    del state["variant"]
+    state_path.write_text(json.dumps(state))
+
+    result, calls = _sweep_ckpt(monkeypatch, _empty, ckpt, checkpoint_channel="kartaview")
+    assert len(calls) == result["cells"] - 2, "a pre-variant record still resumes"
+
+
 def test_the_promoted_checkpoint_is_not_left_behind_for_the_caller_to_discard(
     monkeypatch, tmp_path
 ):

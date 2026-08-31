@@ -16,7 +16,7 @@ import geopandas as gpd
 import pytest
 from shapely.geometry import LineString
 
-from streetscape_metadata_tracker import db
+from streetscape_metadata_tracker import db, naming
 from streetscape_metadata_tracker import download_gsv as dg
 from streetscape_street_analyzer import collect
 
@@ -640,3 +640,112 @@ def test_an_ordinary_network_failure_still_exits_1(tmp_path, monkeypatch):
 
     with pytest.raises(DownloadError):
         collect.run_collect(_args(data_dir))
+
+
+# ── Provider dispatch is explicit, never gsv-or-else (issue #268) ────────────
+#
+# Four arms in collect.py used to read `if provider == "gsv" ... else <mapillary>`:
+# the --estimate text, the --daily-budget pre-flight, the collector dispatch and
+# the summary's unit label. All four are unreachable while argparse gates
+# --provider on STREET_BUDGET_CHANNELS -- and all four go live the instant a
+# third key is added there, which #258 has to do for `--provider kartaview` to
+# be accepted at all. These tests are what turn that addition into a red test
+# rather than a Mapillary walk published under another provider's name.
+
+
+def test_street_cost_models_cover_every_budget_channel():
+    """
+    Set EQUALITY, so a channel cannot be wired without a cost model.
+
+    Equality rather than a subset in either direction: a channel with no model
+    would be priced by whichever `else` arm caught it, and a model with no
+    channel is a cost model nothing can reach -- both are the drift this pins.
+    """
+    assert set(collect.STREET_COST_MODELS) == set(collect.STREET_BUDGET_CHANNELS)
+
+
+def test_every_street_provider_has_a_unit_and_a_declared_cost_shape():
+    """
+    A provider is billed per SAMPLE POINT or per BBOX SWEEP, and which one it is
+    has to be stated rather than defaulted.
+
+    `estimate is None` is meaningful (per-point, scales with --spacing), so the
+    test asserts the field is present and correctly shaped rather than truthy --
+    a `None` check alone would pass for a provider that simply forgot it.
+    """
+    for provider, model in collect.STREET_COST_MODELS.items():
+        assert isinstance(model.unit, str) and model.unit, provider
+        assert model.estimate is None or callable(model.estimate), provider
+    # The two shapes that exist today, pinned by name so a silent flip is caught.
+    assert collect.STREET_COST_MODELS["gsv"].estimate is None
+    assert callable(collect.STREET_COST_MODELS["mapillary"].estimate)
+
+
+def test_street_cost_model_refuses_an_unmodelled_provider():
+    """
+    Raises rather than defaulting: every default here is some OTHER provider's
+    cost model, which misprices a walk instead of stopping it.
+
+    A synthetic name, not a real provider. This test's whole subject is the
+    provider the table does NOT know about, so naming a real one dates it to
+    whichever provider happened to be unwired that week -- it was written with
+    'kartaview' and went green the moment #258 wired it, which is the failure
+    mode being avoided here.
+    """
+    with pytest.raises(ValueError, match="No street cost model for provider 'newprovider'"):
+        collect.street_cost_model("newprovider")
+
+
+def test_dispatch_refuses_a_provider_with_no_collector(tmp_path, monkeypatch, caplog):
+    """
+    The arm that matters most, driven through the REAL flow.
+
+    Before #268 this was `else: <mapillary>`, so a new provider's walk would
+    have fetched from tiles.mapillary.com carrying that provider's token and been
+    published under that provider's own filename -- a plausible success, not a
+    crash.
+
+    Reproduces the half-wired state a new provider necessarily passes through: a
+    budget channel and a cost model exist (so argparse accepts the flag and the
+    pre-flight prices it) but no dispatch arm does. Uses a SYNTHETIC provider
+    rather than a real one -- written against 'kartaview', it went green the
+    moment #258 wired that arm, testing nothing. Mutating the
+    construction site rather than reading the shipped table, because a test over
+    today's two providers would pass while `else` still meant Mapillary.
+
+    Asserts rc == 1 rather than pytest.raises: the dispatch sits inside
+    run_collect's broad `except Exception`, so the guard surfaces as a refused
+    run with a logged traceback. That still delivers what the ordering needs --
+    no Mapillary traffic and no mislabelled artifact -- which is what the
+    artifact assertions below pin.
+    """
+    data_dir = _setup(tmp_path, monkeypatch)
+    monkeypatch.setitem(collect.STREET_BUDGET_CHANNELS, "newprovider", "newprovider_streets")
+    # naming.KNOWN_PROVIDERS is a SECOND guard on this path and it fires first
+    # in the real flow -- generate_streetwalk_filename refuses a provider it has
+    # no token for, before the dispatch is reached. That layering is deliberate
+    # and worth stating, but it is not what this test is about, so widen it here
+    # to let the run get as far as the dispatch arm under test.
+    monkeypatch.setattr(naming, "KNOWN_PROVIDERS", (*naming.KNOWN_PROVIDERS, "newprovider"))
+    monkeypatch.setitem(
+        collect.STREET_COST_MODELS,
+        "newprovider",
+        collect.StreetCostModel(unit="NewProvider requests", estimate=lambda *a: 7),
+    )
+    # The kartaview_streets channel has no config arm until #258; patch it so the
+    # test fails at the DISPATCH rather than earlier, on credential loading.
+    monkeypatch.setattr(collect, "load_config", lambda ch: {"access_token": "KV-TOKEN"})
+
+    # Any call into the Mapillary collector is the defect itself, not a side effect.
+    def boom(*a, **k):  # pragma: no cover - must never run
+        raise AssertionError("an unwired provider's walk reached the MAPILLARY collector")
+
+    monkeypatch.setattr(collect, "collect_mapillary_street_samples_async", boom)
+
+    rc = collect.run_collect(_args(data_dir, provider="newprovider"))
+
+    assert rc == 1
+    assert "No street collector for provider 'newprovider'" in caplog.text
+    # Nothing was published under the kartaview name -- the failure this prevents
+    # is an immutable dated snapshot carrying another provider's data.
+    assert not [f for f in os.listdir(data_dir) if "newprovider" in f]

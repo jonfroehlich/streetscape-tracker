@@ -67,7 +67,9 @@ GSV issues one metadata request per sample location (Seattle: 247k).
 Consequence: a Mapillary walk's cost is the tile census — *independent of sample spacing* (Corvallis: 25,555 sample points scored for 42 requests, and a test pins equal `api_requests` across spacing 15 vs 30) but **not independent of city size**, since tile count scales with bbox area: median 12, mean 57.8, max 870 over the catalog (the distribution measured in `docs/provider-access.md`).
 Only the spacing half of that is a real invariant — an earlier version of this documentation claimed both, which would price Moscow like a village.
 Either way it is orders of magnitude below GSV's one-request-per-sample-point, which is why it can run everywhere GSV can't; `collect --estimate` prints the actual figure for a city before spending.
-Each provider meters against its own isolated key + `api_usage` channel (`gsv_streets` / `mapillary_streets`).
+Each provider meters against its own `api_usage` channel (`gsv_streets` / `kartaview_streets` / `mapillary_streets`), so a road walk can never exhaust a grid collector's quota.
+Two of the three also isolate the **credential**: `gsv_streets` and `mapillary_streets` require their own key, because a walk and a grid run of those providers can be in flight at once and would otherwise burn one quota in parallel.
+`kartaview_streets` deliberately does not — it falls back to `KARTAVIEW_ACCESS_TOKEN` when `KARTAVIEW_STREETS_ACCESS_TOKEN` is unset, because one machine-wide `host_lock(HOST_KARTAVIEW)` serializes every KartaView request in the repo, so there is no parallel burn to isolate; on a paired night the walk reuses the grid run's census and spends nothing at all.
 The Mapillary arm emits #116's status vocabulary at sample level
 — `OK`/`NO_DATE` for a 360° pano in range, `FLAT_ONLY` (null capture_date) when only flat imagery is, `ZERO_RESULTS` otherwise
 — which `compute_streetwalk_coverage` turns into **two numbers per edge**: `coverage_fraction` (360°) and `coverage_fraction_any`, summarized as `coverage_pct_by_length[_any]`.
