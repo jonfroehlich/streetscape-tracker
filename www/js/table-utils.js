@@ -198,6 +198,14 @@ function deltaCellHtml(value, { digits = 1, unit = "" } = {}) {
  *   returning `{href, title}` or null for "this provider has nothing here".
  * @param {(provider: string) => string} [spec.leafLabel] - Overrides the
  *   default short provider label.
+ * @param {(provider: string) => string} [spec.leafTitle] - Per-provider
+ *   tooltip for the LEAF column, defaulting to `groupTitle`. Exists because a
+ *   group title that enumerates providers ("flat imagery (Mapillary)") is
+ *   attached verbatim to every leaf, so it misattributes the moment a third
+ *   provider joins the group -- KartaView's flat-imagery column read
+ *   "(Mapillary)" while carrying the largest flat count in the payload
+ *   (#295). The group HEADER keeps `groupTitle`, which is why that string
+ *   should say what the group measures rather than who is in it.
  * @param {string} [spec.type="number"]
  * @param {string} spec.initial - First-click sort direction.
  * @param {string} [spec.unit]
@@ -216,6 +224,7 @@ function providerColumnGroup({
   cellFor,
   linkFor,
   leafLabel,
+  leafTitle,
   type = "number",
   initial,
   unit,
@@ -234,7 +243,7 @@ function providerColumnGroup({
       initial,
       unit,
       digits,
-      title: groupTitle,
+      title: leafTitle?.(provider) ?? groupTitle,
       group,
       cell: (row) => providerCellHtml(render(row), link?.(row)),
     };

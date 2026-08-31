@@ -229,6 +229,36 @@ test("every registered provider declares both capability flags", () => {
   }
 });
 
+test("every registered provider declares the two fields the pivoted tables render", () => {
+  // Both fall back rather than throw, which is exactly why an omission
+  // survives review: `shortLabel ?? label` still renders a leaf, and a missing
+  // panoCountingModel just drops the "(census)"/"(sample)" parenthetical --
+  // the one label telling a reader NOT to subtract a census count from a
+  // sampled one. KartaView shipped without both for three releases (#295)
+  // because it was registered (#225) before the pivot (#250) added them.
+  for (const [key, p] of Object.entries(PROVIDERS)) {
+    assert.equal(typeof p.shortLabel, "string", key);
+    assert.ok(p.shortLabel.length > 0, key);
+    assert.ok(
+      p.panoCountingModel === "sample" || p.panoCountingModel === "census",
+      `${key}: panoCountingModel must be "sample" or "census", got ${p.panoCountingModel}`
+    );
+  }
+});
+
+test("a census provider's pano count is read unfiltered, and KartaView is one", () => {
+  // The counting model and the copyright filter have to agree: a census
+  // provider publishes no copyright-filtered subset, so pano_count must come
+  // from unique_panos. Pins the pair rather than either alone -- KartaView
+  // declared hasCopyrightFilter correctly while declaring no model at all.
+  for (const [key, p] of Object.entries(PROVIDERS)) {
+    if (p.panoCountingModel === "census") {
+      assert.equal(p.hasCopyrightFilter, false, key);
+    }
+  }
+  assert.equal(PROVIDERS.kartaview.panoCountingModel, "census");
+});
+
 /**
  * Drop comments from JS source so a source-inspection test reads only code.
  *

@@ -19,6 +19,7 @@ const {
   theadHtml,
   rowHtmlFromColumns,
   createSortableTable,
+  providerColumnGroup,
 } = require("../table-utils.js");
 
 // --- cityDisplayLabel (canonical copy; streets.js's cityLabel aliases it) ---
@@ -406,4 +407,56 @@ test("coverageCellHtml: the compact variant adds a class and nothing else", () =
   );
   // The default is unchanged, so driving.html's cells do not move.
   assert.match(coverageCellHtml(50), /class="coverage-cell"/);
+});
+
+// --- providerColumnGroup: leaf tooltips (#295) ---
+
+// PROVIDERS is read by providerShortLabel; two entries are enough, and the
+// second deliberately carries no shortLabel so the `?? label` fallback shows.
+global.PROVIDERS = {
+  gsv: { label: "Google Street View", shortLabel: "GSV" },
+  other: { label: "Other Provider" },
+};
+
+/** Build the group and return its leaves (the Δ, if any, is not one). */
+function leavesOf(extra = {}) {
+  return providerColumnGroup({
+    id: "cov",
+    groupLabel: "Coverage",
+    groupTitle: "The group's own tooltip",
+    providers: ["gsv", "other"],
+    keyFor: (p) => `pct_${p}`,
+    cellFor: () => () => ({ html: "x" }),
+    initial: "desc",
+    ...extra,
+  });
+}
+
+test("providerColumnGroup: leaves default to the group title", () => {
+  for (const col of leavesOf()) {
+    assert.equal(col.title, "The group's own tooltip");
+  }
+});
+
+test("providerColumnGroup: leafTitle overrides per leaf, and the GROUP keeps its own", () => {
+  // The pass-through, not just the default: `title: groupTitle` on every leaf
+  // is what attached "flat imagery (Mapillary)" to KartaView's column (#295),
+  // so the test mutates the hook rather than asserting the shipped string.
+  const leaves = leavesOf({ leafTitle: (p) => `tooltip for ${p}` });
+  assert.deepEqual(
+    leaves.map((c) => c.title),
+    ["tooltip for gsv", "tooltip for other"]
+  );
+  // Every leaf still points at ONE shared group object, whose title is
+  // untouched — the group header and the leaf headers say different things.
+  const groups = new Set(leaves.map((c) => c.group));
+  assert.equal(groups.size, 1);
+  assert.equal(leaves[0].group.title, "The group's own tooltip");
+});
+
+test("providerColumnGroup: a leafTitle returning nothing falls back to the group title", () => {
+  // A hook that only knows some providers must not blank the others' tooltip.
+  const leaves = leavesOf({ leafTitle: (p) => (p === "gsv" ? "only gsv" : undefined) });
+  assert.equal(leaves[0].title, "only gsv");
+  assert.equal(leaves[1].title, "The group's own tooltip");
 });

@@ -181,6 +181,15 @@ const PROVIDERS = {
   },
   kartaview: {
     label: "KartaView",
+    shortLabel: "KartaView",
+    // A census, like Mapillary: the sweep enumerates every image in the
+    // circle rather than picking a nearest one per grid point. Absent until
+    // #295 because the provider was registered (#225) before the pivot (#250)
+    // introduced this field, and grid.js's leaf label is a ternary on it --
+    // no model means no "(census)" parenthetical, silently, which is the one
+    // label stopping a reader from subtracting KartaView's 52,224 panos at
+    // Krabi from GSV's sampled 18,784.
+    panoCountingModel: "census",
     description:
       "Crowdsourced KartaView imagery: a census of every 360° panorama, mostly Grab fleet capture",
     panoNoun: "KartaView Panoramas",
