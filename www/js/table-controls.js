@@ -1,14 +1,15 @@
 /**
  * table-controls.js — the exploration chassis for the data-table pages
- * (grid.html and streets.html), issue #188.
+ * (grid.html, streets.html and driving.html), issue #188.
  *
- * The tables outgrew "sortable list": grid.html renders 1,501 rows and
- * streets.html 283, and the questions being asked of them are comparative
- * ("where does Mapillary beat GSV?", "which cities have imagery where people
- * actually walk?") rather than lookup-by-name. This module adds the machinery
- * that makes a large table explorable — text search, structured filters,
- * column presets, and a distribution strip for the sorted column — and keeps
- * the whole view in the URL so a finding can be linked to.
+ * The tables outgrew "sortable list": driving.html renders ~3,800 rows,
+ * grid.html ~1,190 and streets.html 283, and the questions being asked of them
+ * are comparative ("where does Mapillary beat GSV?", "which cities have
+ * imagery where people actually walk?") rather than lookup-by-name. This
+ * module adds the machinery that makes a large table explorable — text search,
+ * structured filters, column presets and per-filter histograms, rendered into
+ * a sidebar beside the table — and keeps the whole view in the URL so a
+ * finding can be linked to.
  *
  * Deliberately NOT an export tool. `cities.json.gz` and `streetwalks.json.gz`
  * are already published as public gzipped JSON at fixed URLs, so a CSV of the
@@ -16,11 +17,12 @@
  * analysis pulls from the catalog instead.
  *
  * Page-agnostic: everything specific to a page arrives as descriptors
- * (`columns`, `presets`, `filters`) from grid.js / streets.js. The pure
- * functions here are exported for the offline unit tests; only
+ * (`columns`, `presets`, `filters`) from grid.js / streets.js / driving.js.
+ * The pure functions here are exported for the offline unit tests; only
  * `createTableControls` touches the DOM.
  *
- * Depends on globals from table-utils.js (loaded first): formatCellNumber.
+ * Depends on globals from histogram-slider.js (loaded first):
+ * createHistogramSlider, HISTOGRAM_SLIDER_BUCKETS.
  */
 
 // ── Text search ───────────────────────────────────────────────
@@ -46,6 +48,51 @@ function foldForSearch(value) {
 }
 
 /**
+ * Fold a raw query into its search terms: whitespace-separated, blanks
+ * dropped, each folded by foldForSearch.
+ *
+ * Split out so applyFilters can fold the query ONCE per pass instead of once
+ * per row. It matters because of how many passes there are: every `apply()`
+ * runs applyFilters for the table plus one `rowsExceptFilter` per histogram
+ * (three on driving.html, four on grid.html), so driving.html's ~3,800 rows
+ * meant ~19,000 NFD folds of the same three-character query per keystroke.
+ *
+ * @param {string} query - Raw query text.
+ * @returns {string[]} Folded terms; empty for a blank query.
+ */
+function foldSearchTerms(query) {
+  return foldForSearch(query).split(/\s+/).filter(Boolean);
+}
+
+/**
+ * Each row's searched fields, folded and joined — computed once per row.
+ *
+ * Keyed on the row OBJECT, so the cache lives exactly as long as the row
+ * models do and a reload drops it with them. It assumes the SEARCHED fields
+ * are immutable once a row model is built, which is true of all three pages
+ * (driving.js's mergeStreetCoverage does mutate rows, but it writes observed
+ * coverage, not any of DRIVING_SEARCH_FIELDS, and it runs before the rows
+ * reach the chassis at all).
+ *
+ * @type {WeakMap<Object, {fields: string, text: string}>}
+ */
+const searchHaystacks = new WeakMap();
+
+/**
+ * @param {Object} row - A row model.
+ * @param {string[]} fields - Row fields to search.
+ * @returns {string} The folded, joined haystack for that row.
+ */
+function searchHaystackFor(row, fields) {
+  const fieldKey = fields.join(",");
+  const cached = searchHaystacks.get(row);
+  if (cached !== undefined && cached.fields === fieldKey) return cached.text;
+  const text = fields.map((f) => foldForSearch(row[f])).join(" ");
+  searchHaystacks.set(row, { fields: fieldKey, text });
+  return text;
+}
+
+/**
  * Does a row match a free-text query?
  *
  * Every whitespace-separated term must appear in at least one of the row's
@@ -58,31 +105,54 @@ function foldForSearch(value) {
  * @returns {boolean}
  */
 function matchesSearch(row, fields, query) {
-  const terms = foldForSearch(query).split(/\s+/).filter(Boolean);
+  return matchesSearchTerms(row, fields, foldSearchTerms(query));
+}
+
+/**
+ * matchesSearch with the query already folded — the hot path.
+ *
+ * @param {Object} row - A row model.
+ * @param {string[]} fields - Row fields to search.
+ * @param {string[]} terms - Folded terms from foldSearchTerms; empty matches
+ *   everything.
+ * @returns {boolean}
+ */
+function matchesSearchTerms(row, fields, terms) {
   if (terms.length === 0) return true;
-  const haystack = fields.map((f) => foldForSearch(row[f])).join(" ");
+  const haystack = searchHaystackFor(row, fields);
   return terms.every((term) => haystack.includes(term));
 }
 
 // ── Structured filters ────────────────────────────────────────
 
 /**
- * Is this a numeric-window filter?
+ * Is this a numeric-window filter — a `{min, max}` value, either nullable,
+ * serialized as `"min~max"`?
  *
- * `range` (two number inputs) and `histogram-range` (issue #250: a mini
- * histogram plus a dual-handle slider, WITH the same two number inputs kept
- * for precision and keyboard/AT parity) differ only in what they render. The
- * value shape is identical — `{min, max}`, either nullable — and so is the URL
- * wire format, `"min~max"`. Every place that reasons about the VALUE therefore
- * has to accept both, which is what this predicate is for: a missed site would
- * make a histogram filter silently unserializable or un-parseable rather than
- * failing loudly.
+ * There were TWO flavours once (issue #188 follow-up): a bar-less `range` (the two
+ * number inputs) and `histogram-range` (issue #250: a mini histogram plus a
+ * dual-handle slider, keeping those same inputs for precision and keyboard/AT
+ * parity). They differed only in what they RENDERED, so this predicate existed
+ * to keep every value-shaped call site accepting both.
+ *
+ * `range` is gone, along with its render branch, its `.control-range` CSS and
+ * the twinned tests. driving.html was its last caller and moved to
+ * `histogram-range` here; keeping a second flavour warm for a hypothetical
+ * caller would have kept warm a code path nothing renders, and the "parity"
+ * tests that appeared to protect it proved nothing — every one of them
+ * dispatched through THIS predicate first, so `f(range) === f(histogram)` was
+ * comparing a branch against itself.
+ *
+ * The predicate itself stays, rather than inlining `type === "histogram-range"`
+ * at nine call sites: it names WHY those sites are grouped (they reason about
+ * the value, not the widget), and it is where the next numeric widget would be
+ * admitted.
  *
  * @param {Object} filter - Filter descriptor.
  * @returns {boolean}
  */
 function isRangeType(filter) {
-  return filter.type === "range" || filter.type === "histogram-range";
+  return filter.type === "histogram-range";
 }
 
 /**
@@ -130,6 +200,12 @@ function rowPassesFilter(filter, row, value) {
 /**
  * Narrow rows by the free-text query and every set filter.
  *
+ * The query is folded ONCE here, not once per row, and each row's haystack is
+ * folded once for the life of the row model (searchHaystackFor) — worth doing
+ * because this function runs 4-5 times per keystroke on the largest table (the
+ * table itself plus one `rowsExceptFilter` per histogram) behind a 150 ms
+ * debounce.
+ *
  * @param {Object[]} rows - All row models.
  * @param {Object} cfg
  * @param {Object[]} cfg.filters - Filter descriptors.
@@ -139,9 +215,10 @@ function rowPassesFilter(filter, row, value) {
  * @returns {Object[]} A new filtered array (input untouched).
  */
 function applyFilters(rows, { filters, values, query, searchFields }) {
+  const terms = foldSearchTerms(query ?? "");
   return rows.filter(
     (row) =>
-      matchesSearch(row, searchFields, query ?? "") &&
+      matchesSearchTerms(row, searchFields, terms) &&
       filters.every((filter) => rowPassesFilter(filter, row, values[filter.key]))
   );
 }
@@ -161,9 +238,10 @@ function applyFilters(rows, { filters, values, query, searchFields }) {
  *
  * A descriptor opts in with `fieldFor(values)` / `labelFor(values)` /
  * `testFor(values)`; everything else passes through untouched, which is what
- * keeps driving.html and the plain `range` filters unaware of any of this. The
- * result is a SHALLOW COPY, so the originals stay the page's static
- * descriptors and nothing accumulates state across renders.
+ * keeps the unpivoted page (driving.html, whose rows are places rather than
+ * cities-with-a-column-per-provider) unaware of any of this. The result is a
+ * SHALLOW COPY, so the originals stay the page's static descriptors and
+ * nothing accumulates state across renders.
  *
  * @param {Object[]} filters - Filter descriptors.
  * @param {Object} values - Current {filterKey: value}.
@@ -350,50 +428,38 @@ function serializeTableState(state, { filters, defaultPreset }) {
   return params.toString();
 }
 
-// ── Distribution strip ────────────────────────────────────────
+// ── Histogram bucketing ───────────────────────────────────────
 
 /**
- * How many buckets to cut a set of N values into.
- *
- * The square-root rule, clamped. A fixed bucket count is wrong at both ends of
- * this table's range: at N=2 (a heavily filtered view) 24 buckets strand two
- * lone bars at opposite edges of an otherwise empty strip, and past ~600 the
- * bars are thinner than the gaps between them. Production sits at 283 walks
- * and 1,501 grid series, both of which land on the 24 cap.
- *
- * @param {number} n - Count of measurable values.
- * @returns {number}
- */
-function bucketCountFor(n) {
-  return Math.min(24, Math.max(1, Math.ceil(Math.sqrt(n))));
-}
-
-/**
- * Bucket numeric values into a histogram.
+ * Bucket numeric values into a histogram, over an axis the CALLER fixes.
  *
  * Nulls are dropped rather than bucketed as zero (see rowPassesFilter). A
  * single distinct value yields one full-width bucket instead of a degenerate
  * zero-width range.
  *
+ * The axis is never taken from the values themselves. A histogram-slider's
+ * axis has to stay put while the reader brushes it, or the handles' meaning
+ * moves out from under their hand — and the bars have to be bucketed over the
+ * SNAPPED domain the component hands back, not the raw extent, or the two are
+ * painted across the same 100% width on two different scales (measured at
+ * 1.05% of the track on a 0–85.1 coverage axis). The sorted-column
+ * distribution strip did scale itself to the rows in view, which is why this
+ * carried a self-scaling default until that strip was retired; it does not,
+ * now, because nothing left on the site wants one.
+ *
  * @param {Array<?number>} values
- * @param {number} [bucketCount] - Defaults to bucketCountFor(N).
- * @param {?{min: number, max: number}} [domain] - Fixed axis (issue #250). By
- *   default the extent is taken from `values`, which is right for the
- *   distribution strip (it describes the rows in view) and WRONG for a
- *   histogram-slider, whose axis must stay put while the reader brushes it:
- *   a self-scaling axis would move the handles' meaning out from under them.
- *   Values outside the domain are clamped into the end buckets rather than
- *   dropped, so a stale domain under-draws rather than losing rows.
+ * @param {number} bucketCount
+ * @param {{min: number, max: number}} domain - The fixed axis. Values outside
+ *   it are clamped into the end buckets rather than dropped, so a stale domain
+ *   under-draws rather than losing rows.
  * @returns {{buckets: {from: number, to: number, count: number}[],
  *            min: number, max: number, count: number}|null}
  *   Null when nothing is measurable.
  */
-function histogramBuckets(values, bucketCount, domain = null) {
+function histogramBuckets(values, bucketCount, domain) {
   const nums = values.filter((v) => typeof v === "number" && Number.isFinite(v));
   if (nums.length === 0) return null;
-  bucketCount = bucketCount ?? bucketCountFor(nums.length);
-  const min = domain ? domain.min : Math.min(...nums);
-  const max = domain ? domain.max : Math.max(...nums);
+  const { min, max } = domain;
   if (min === max) {
     return { buckets: [{ from: min, to: max, count: nums.length }], min, max, count: nums.length };
   }
@@ -413,101 +479,7 @@ function histogramBuckets(values, bucketCount, domain = null) {
   return { buckets, min, max, count: nums.length };
 }
 
-/** Median of a numeric array (the strip's text summary). */
-function medianOf(values) {
-  const nums = values
-    .filter((v) => typeof v === "number" && Number.isFinite(v))
-    .sort((a, b) => a - b);
-  if (nums.length === 0) return null;
-  const mid = Math.floor(nums.length / 2);
-  return nums.length % 2 ? nums[mid] : (nums[mid - 1] + nums[mid]) / 2;
-}
-
-/**
- * Text equivalent of the distribution strip.
- *
- * The bars are decorative (`aria-hidden`); this sentence carries the same
- * information for a screen reader and doubles as the visible caption.
- *
- * @param {Object} column - The active sort column descriptor.
- * @param {Array<?number>} values
- * @returns {string}
- */
-function formatStripSummary(column, values) {
-  const stats = histogramBuckets(values);
-  if (!stats) return `No ${column.label.toLowerCase()} values in the current view.`;
-  const unit = column.unit ?? "";
-  const fmt = (v) => `${formatCellNumber(v, column.digits ?? 1)}${unit}`;
-  return (
-    `${column.label} across ${formatCellNumber(stats.count)} rows: ` +
-    `min ${fmt(stats.min)}, median ${fmt(medianOf(values))}, max ${fmt(stats.max)}.`
-  );
-}
-
 // ── DOM wiring ────────────────────────────────────────────────
-
-/**
- * Render the distribution strip into a container.
- *
- * A single-series magnitude chart, so: one flat hue for every bar (bar colour
- * carries no second meaning), no legend, no axis furniture. The bars are
- * deliberately NOT painted with `coverageColor` — these encode row counts, and
- * reusing the coverage ramp here would imply the height meant coverage.
- *
- * When the active sort column has a matching range filter, each bucket
- * becomes a real `<button>` carrying its bounds in `data-from`/`data-to` —
- * `createTableControls` delegates a click listener to the container (bars are
- * rebuilt on every repaint, so a per-bar listener would need re-binding every
- * time; delegation on the container survives the innerHTML replacement, the
- * same reason the header's sort click is delegated to the `<thead>`). Without
- * a matching filter the bars stay plain, `aria-hidden` `<span>`s exactly as
- * before — there is nothing a click on them could narrow.
- *
- * @param {Element} el - Container.
- * @param {Object} column - Active sort column descriptor.
- * @param {Array<?number>} values
- * @param {boolean} [clickable] - Whether the active sort column has a range
- *   filter a bar click can set.
- */
-function renderDistributionStrip(el, column, values, clickable = false) {
-  const stats = histogramBuckets(values);
-  const summary = formatStripSummary(column, values);
-  if (!stats || column.type !== "number") {
-    el.innerHTML = `<p class="strip-summary">${
-      column.type === "number" ? summary : "Sort by a numeric column to see its distribution."
-    }</p>`;
-    return;
-  }
-  const tallest = Math.max(...stats.buckets.map((b) => b.count));
-  const unit = column.unit ?? "";
-  const digits = column.digits ?? 1;
-  // Bucket bounds are rounded to the column's own display precision before
-  // being used anywhere — as the label text AND as the value a click writes
-  // into the filter — so a bar's tooltip and the range it actually selects
-  // always agree (rather than a label reading "58.7%" while the click quietly
-  // filters to the unrounded 58.6987…%).
-  const roundToDigits = (v) => Math.round(v * 10 ** digits) / 10 ** digits;
-  const bars = stats.buckets
-    .map((bucket) => {
-      const height = tallest === 0 ? 0 : Math.round((bucket.count / tallest) * 100);
-      const from = roundToDigits(bucket.from);
-      const to = roundToDigits(bucket.to);
-      const label =
-        `${formatCellNumber(from, digits)}${unit}–${formatCellNumber(to, digits)}${unit}: ` +
-        `${formatCellNumber(bucket.count)} row${bucket.count === 1 ? "" : "s"}` +
-        (clickable ? " — click to filter to this range" : "");
-      // min-height keeps a non-empty bucket visible instead of rounding it away.
-      const heightPct = bucket.count > 0 ? Math.max(height, 2) : 0;
-      return clickable
-        ? `<button type="button" class="strip-bar" data-from="${from}" data-to="${to}"
-                   title="${label}" aria-label="${label}" style="height:${heightPct}%"></button>`
-        : `<span class="strip-bar" title="${label}" style="height:${heightPct}%"></span>`;
-    })
-    .join("");
-  el.innerHTML =
-    `<div class="strip-bars"${clickable ? "" : ' aria-hidden="true"'}>${bars}</div>` +
-    `<p class="strip-summary">${summary}</p>`;
-}
 
 /**
  * Build the controls markup for a page.
@@ -518,33 +490,25 @@ function renderDistributionStrip(el, column, values, clickable = false) {
  * `<fieldset>` — so the whole region is keyboard-reachable and announced
  * without any ARIA of its own.
  *
- * Two section orders, picked by `layout`:
+ * One section order, for the one place these controls are rendered: a ~280px
+ * sidebar beside the table. Search, selects, the column controls, numeric
+ * windows, booleans, Clear all (issue #250). In a column that narrow the
+ * reading order IS the layout, so the cheap categorical narrowings come first
+ * and the tall histogram brushes sit below the column controls rather than
+ * pushing them off the bottom.
  *
- *  * `"inline"` (default) — search, then every filter in descriptor order,
- *    then the column controls, then Clear all. This is the horizontal strip
- *    driving.html has always rendered, and it is emitted byte-identically.
- *  * `"sidebar"` — search, selects, the column controls, numeric windows, then
- *    booleans, then Clear all (issue #250). In a 280px column the reading
- *    order IS the layout, so the cheap categorical narrowings come first and
- *    the tall histogram brushes sit below the column controls rather than
- *    pushing them off the bottom.
+ * There was a second, horizontal order for driving.html until that page moved
+ * to the sidebar too; it is gone rather than kept warm, since an alternative
+ * layout nothing renders is one nothing tests either.
  *
- * The sidebar order partitions by filter TYPE, so it also carries an
- * "everything else" bucket: a filter type added later must still be rendered
- * somewhere rather than silently vanishing from one of the two layouts.
+ * The order partitions by filter TYPE, so it also carries an "everything else"
+ * bucket: a filter type added later must still be rendered somewhere rather
+ * than silently vanishing.
  *
- * @param {Object} cfg - {filters, presets, columns, searchPlaceholder,
- *   showDistributionStrip, layout}.
+ * @param {Object} cfg - {filters, presets, columns, searchPlaceholder}.
  * @returns {string} HTML.
  */
-function controlsHtml({
-  filters,
-  presets,
-  columns,
-  searchPlaceholder,
-  showDistributionStrip = true,
-  layout = "inline",
-}) {
+function controlsHtml({ filters, presets, columns, searchPlaceholder }) {
   const renderFilter = (filter) => {
       if (filter.type === "select") {
         // A select with a declared default has no "any" reading (issue #250:
@@ -563,12 +527,11 @@ function controlsHtml({
             <select id="f-${filter.key}" data-filter="${filter.key}">${options}</select>
           </div>`;
       }
-      // The two numeric-window flavours share their number inputs verbatim —
-      // same `data-filter`/`data-bound` hooks, same aria-labels — because
-      // those are what syncControlsToState, handleControlChange and the e2e
-      // selectors read. `histogram-range` only ADDS the bars + brush above
-      // them (issue #250); the precision path is unchanged, which is also what
-      // keeps the control fully usable by keyboard and by AT.
+      // The number inputs are the PRECISION path under the brush, and they are
+      // what syncControlsToState, handleControlChange and the e2e selectors
+      // read (`data-filter`/`data-bound`). They were shared verbatim with a
+      // second, bar-less `range` flavour until that flavour lost its last
+      // caller; see isRangeType for why it is gone rather than kept warm.
       const boundInputs = () => `<input type="number" data-filter="${filter.key}" data-bound="min"
                    aria-label="Minimum ${filter.label}" placeholder="min"
                    ${filter.min != null ? `min="${filter.min}"` : ""}
@@ -578,13 +541,6 @@ function controlsHtml({
                    aria-label="Maximum ${filter.label}" placeholder="max"
                    ${filter.min != null ? `min="${filter.min}"` : ""}
                    ${filter.max != null ? `max="${filter.max}"` : ""}>`;
-      if (filter.type === "range") {
-        return `
-          <div class="control control-range" role="group" aria-labelledby="f-${filter.key}-legend">
-            <span class="control-legend" id="f-${filter.key}-legend">${filter.label}</span>
-            ${boundInputs()}
-          </div>`;
-      }
       if (filter.type === "histogram-range") {
         // The bars are decorative (aria-hidden): the two range thumbs carry a
         // live aria-valuetext and the number inputs carry the exact figures,
@@ -658,47 +614,36 @@ function controlsHtml({
   const clearControl = `
       <button type="button" class="controls-clear">Clear all</button>`;
 
-  let body;
-  if (layout === "sidebar") {
-    // Partition, don't hand-list: `rest` catches any filter type not named
-    // here, so a type added later renders in the wrong PLACE rather than not
-    // at all. The order is search -> selects -> columns -> numeric windows ->
-    // booleans -> clear.
-    const selects = filters.filter((f) => f.type === "select");
-    const ranges = filters.filter(isRangeType);
-    const booleans = filters.filter((f) => f.type === "boolean");
-    const placed = new Set([...selects, ...ranges, ...booleans]);
-    const rest = filters.filter((f) => !placed.has(f));
-    const render = (list) => list.map(renderFilter).join("");
-    body =
-      searchControl +
-      render(selects) +
-      columnControls +
-      render(ranges) +
-      render(booleans) +
-      render(rest) +
-      clearControl;
-  } else {
-    // The literal indent the old `${filterControls}` interpolation sat on. It
-    // is here so this branch stays BYTE-identical to the pre-#250 markup —
-    // driving.html renders through it, and a test compares the two strings
-    // rather than trusting the eye.
-    body =
-      searchControl + "\n      " + filters.map(renderFilter).join("") + columnControls + clearControl;
-  }
+  // Partition, don't hand-list: `rest` catches any filter type not named here,
+  // so a type added later renders in the wrong PLACE rather than not at all.
+  // The order is search -> selects -> columns -> numeric windows -> booleans
+  // -> clear.
+  const selects = filters.filter((f) => f.type === "select");
+  const ranges = filters.filter(isRangeType);
+  const booleans = filters.filter((f) => f.type === "boolean");
+  const placed = new Set([...selects, ...ranges, ...booleans]);
+  const rest = filters.filter((f) => !placed.has(f));
+  const render = (list) => list.map(renderFilter).join("");
+  const body =
+    searchControl +
+    render(selects) +
+    columnControls +
+    render(ranges) +
+    render(booleans) +
+    render(rest) +
+    clearControl;
 
   return `
     <div class="table-controls">${body}
-    </div>
-    ${showDistributionStrip ? `<div class="distribution-strip" id="distribution-strip"></div>` : ""}`;
+    </div>`;
 }
 
 /**
  * Wire the controls region to a sortable table.
  *
  * Owns the filter/search/preset state, pushes the narrowed rows into the
- * table, keeps the URL in step, and repaints the distribution strip whenever
- * the active sort column or the filtered set changes.
+ * table, keeps the URL in step, and redraws each filter's histogram whenever
+ * the filtered set changes.
  *
  * The URL is written with `replaceState`, not `pushState`: exploring a table is
  * a continuous adjustment, and one history entry per keystroke would make the
@@ -716,15 +661,6 @@ function controlsHtml({
  *   caption/result count. The third argument is what lets a caption name a
  *   filter's active value (streets.html's network) without reaching into the
  *   DOM for it.
- * @param {"inline"|"sidebar"} [cfg.layout="inline"] - Control section order;
- *   see controlsHtml. The pivoted pages pass "sidebar"; driving.js does not,
- *   and its markup is unchanged.
- * @param {boolean} [cfg.showDistributionStrip=true] - Render the sorted-column
- *   distribution strip. The pivoted pages (issue #250) turn it off: their
- *   numeric filters are histogram-sliders, which draw a PER-FILTER histogram
- *   on a fixed axis, so a second histogram of whichever column happens to be
- *   sorted — one that silently swapped its metric on every header click — is
- *   two conflicting answers to one question. driving.html keeps it.
  * @returns {{setRows: Function, getFilteredRows: Function}}
  */
 /**
@@ -746,6 +682,55 @@ function defaultFilterValues(filters) {
   return values;
 }
 
+/**
+ * Wrap the controls container in the sidebar chrome, and reveal the layout.
+ *
+ * The `<aside>` landmark, the collapsible `<details>` and its "Filters"
+ * summary used to be hand-copied into all three page HTMLs. That made a
+ * wrapper change — the summary text, the `aria-label`, the `open` default — a
+ * three-file edit whose failure mode was silent: miss one page and
+ * `wireSidebarDisclosure` simply returns null there, so its filters stay
+ * collapsed after a widen with no toggle to reopen them.
+ *
+ * Revealing the layout is the same argument from the other side. The pages
+ * author `.table-layout` as `hidden`, and every empty-state and error path
+ * returns BEFORE createTableControls — so a deployment with nothing published
+ * (driving.html before its first `fetch-driving-plan`, streets.html before the
+ * first road walk) used to render a viewport-tall empty white sidebar beside
+ * its status line, and an empty landmark to assistive tech. Clearing the
+ * attribute here rather than per page means the reveal cannot be forgotten by
+ * whichever page is added next.
+ *
+ * @param {Element} rootEl - The `#<page>-controls` container authored in HTML.
+ * @returns {?Element} The layout element, if there was one.
+ */
+function mountSidebar(rootEl) {
+  if (typeof document === "undefined") return null;
+  const layoutEl = rootEl.closest(".table-layout");
+  if (rootEl.closest(".table-sidebar")) {
+    // Already wrapped — a page that calls createTableControls twice.
+    layoutEl?.removeAttribute("hidden");
+    return layoutEl;
+  }
+  const asideEl = document.createElement("aside");
+  asideEl.className = "table-sidebar";
+  asideEl.setAttribute("aria-label", "Search and filters");
+  const detailsEl = document.createElement("details");
+  detailsEl.className = "sidebar-disclosure";
+  detailsEl.open = true;
+  const summaryEl = document.createElement("summary");
+  summaryEl.textContent = "Filters";
+  detailsEl.append(summaryEl);
+  asideEl.append(detailsEl);
+  // Put the aside exactly where the container was, then adopt the container
+  // into it: `rootEl` keeps its identity, so everything downstream that reads
+  // or listens on it is unaffected.
+  rootEl.replaceWith(asideEl);
+  detailsEl.append(rootEl);
+  layoutEl?.removeAttribute("hidden");
+  return layoutEl;
+}
+
 function createTableControls({
   rootEl,
   table,
@@ -755,16 +740,14 @@ function createTableControls({
   searchFields,
   searchPlaceholder,
   onChange,
-  showDistributionStrip = true,
-  layout = "inline",
 }) {
   const defaultPreset = presets[0].id;
   let allRows = [];
   let filtered = [];
   // No `sort` field here: the sort is owned entirely by `table` (the
   // createSortableTable controller), read via `table.getSort()` wherever it's
-  // needed (updateUrl, repaintStrip). Duplicating it into this state object
-  // would just be a second, driftable copy of the same fact.
+  // needed (updateUrl). Duplicating it into this state object would just be a
+  // second, driftable copy of the same fact.
   const state = {
     query: "",
     preset: defaultPreset,
@@ -772,20 +755,13 @@ function createTableControls({
     values: defaultFilterValues(filters),
   };
 
-  rootEl.innerHTML = controlsHtml({
-    filters,
-    presets,
-    columns,
-    searchPlaceholder,
-    showDistributionStrip,
-    layout,
-  });
+  const layoutEl = mountSidebar(rootEl);
+  rootEl.innerHTML = controlsHtml({ filters, presets, columns, searchPlaceholder });
+  // Wired here rather than on DOMContentLoaded: the disclosure it needs does
+  // not exist until mountSidebar has run.
+  wireSidebarDisclosure(layoutEl ?? undefined);
   const searchEl = rootEl.querySelector("#table-search");
   const presetEl = rootEl.querySelector("#table-preset");
-  // Null when the page opted out — every strip site below guards on the
-  // element rather than re-reading the flag, so there is one condition to get
-  // right instead of five.
-  const stripEl = rootEl.querySelector("#distribution-strip");
 
   // ── Histogram-sliders (issue #250) ──
   // One per `histogram-range` filter, each with a FIXED axis seeded once from
@@ -837,7 +813,7 @@ function createTableControls({
         // and a typed bound can never disagree about the current window.
         writeRangeInputs(filter.key, range);
         // Debounced on the SAME timer as a typed bound: a drag emits on every
-        // pointer move, and on grid.html that is 1,501 rows re-filtered and
+        // pointer move, and on driving.html that is ~3,800 rows re-filtered and
         // re-rendered per frame.
         clearTimeout(rangeTimer);
         rangeTimer = setTimeout(apply, 150);
@@ -903,7 +879,8 @@ function createTableControls({
    * Never over `filtered`: feeding a slider its own output makes the picture
    * collapse under the brush that drew it (and dragging back out cannot
    * restore bars that are no longer there). Costs one extra filter pass per
-   * histogram — three passes over ~1,500 rows on the widest page.
+   * histogram: four extra passes over grid.html's ~1,190 rows, three over
+   * driving.html's ~3,800.
    */
   function repaintHistograms() {
     for (const [key, entry] of histograms) {
@@ -972,9 +949,9 @@ function createTableControls({
         else el.value = value ?? "";
       }
     }
-    // Adopt WITHOUT reporting: this runs when the URL, "Clear all" or a strip
-    // click is the source of the value, and echoing it back through onInput
-    // would be circular.
+    // Adopt WITHOUT reporting: this runs when the URL or "Clear all" is the
+    // source of the value, and echoing it back through onInput would be
+    // circular.
     for (const [key, entry] of histograms) entry.slider.setValue(state.values[key]);
     for (const filter of resolved) if (filter.labelFor) relabelControl(filter);
     const visibleKeys = new Set(
@@ -991,26 +968,7 @@ function createTableControls({
     history.replaceState(null, "", qs ? `?${qs}` : location.pathname);
   }
 
-  /** The range filter a click on the strip's bars would set, if any. */
-  function rangeFilterFor(column) {
-    return filters.find((f) => isRangeType(f) && f.field === column.key);
-  }
-
-  function repaintStrip() {
-    if (!stripEl) return;
-    const sort = table.getSort();
-    const column = columns.find((c) => c.key === sort.key);
-    if (column) {
-      renderDistributionStrip(
-        stripEl,
-        column,
-        filtered.map((r) => r[column.key]),
-        Boolean(rangeFilterFor(column))
-      );
-    }
-  }
-
-  /** Re-filter, repaint the table, the strip, and the URL. */
+  /** Re-filter, repaint the table, the histograms, and the URL. */
   function apply() {
     // A scope change lands here through the same path as any other control, so
     // this is where the resolved filters catch up before anything reads them.
@@ -1022,7 +980,6 @@ function createTableControls({
       searchFields,
     });
     table.setRows(filtered);
-    repaintStrip();
     repaintHistograms();
     updateUrl();
     onChange?.(filtered, allRows, { values: { ...state.values }, preset: state.preset });
@@ -1035,7 +992,7 @@ function createTableControls({
   // ── DOM → state ──
   let searchTimer = null;
   searchEl.addEventListener("input", () => {
-    // Debounced: 1,501 rows re-filter and re-render on every keystroke.
+    // Debounced: ~3,800 rows re-filter and re-render on every keystroke.
     clearTimeout(searchTimer);
     searchTimer = setTimeout(() => {
       state.query = searchEl.value;
@@ -1048,7 +1005,6 @@ function createTableControls({
     state.cols = null; // an explicit preset choice discards a picker deviation
     applyColumns();
     syncControlsToState();
-    repaintStrip();
     updateUrl();
   });
 
@@ -1071,7 +1027,6 @@ function createTableControls({
         .filter((b) => b.checked)
         .map((b) => b.dataset.column);
       applyColumns();
-      repaintStrip();
       updateUrl();
       return;
     }
@@ -1132,7 +1087,7 @@ function createTableControls({
   rootEl.addEventListener("input", (event) => {
     if (!event.target.dataset?.bound) return;
     // Debounced for the same reason the search box is: a range bound applies
-    // on every keystroke (see above), and on grid.html that is up to 1,501
+    // on every keystroke (see above), and on driving.html that is up to ~3,800
     // rows re-filtered and re-rendered per digit typed. handleControlChange
     // re-reads the input's live value when the timer fires, so only the
     // settled figure is ever applied.
@@ -1140,35 +1095,10 @@ function createTableControls({
     rangeTimer = setTimeout(() => handleControlChange(event.target), 150);
   });
 
-  // Distribution strip: a bar click sets the range filter matching the
-  // ACTIVE SORT COLUMN to that bucket's bounds (renderDistributionStrip only
-  // emits <button>s, rather than the plain aria-hidden <span>s, when such a
-  // filter exists — so a stray click elsewhere in the strip's whitespace is
-  // simply not on a `.strip-bar[data-from]` and no-ops here). Delegated on
-  // the container rather than bound per-bar: repaintStrip replaces the strip's
-  // innerHTML on every sort/filter change, which would silently drop a
-  // per-button listener the same way an un-delegated header click would (see
-  // createSortableTable's own listener for that exact regression).
-  stripEl?.addEventListener("click", (event) => {
-    const bar = event.target.closest?.(".strip-bar[data-from]");
-    if (!bar) return;
-    const sort = table.getSort();
-    const column = columns.find((c) => c.key === sort.key);
-    const filter = column && rangeFilterFor(column);
-    if (!filter) return;
-    state.values[filter.key] = {
-      min: Number.parseFloat(bar.dataset.from),
-      max: Number.parseFloat(bar.dataset.to),
-    };
-    syncControlsToState();
-    apply();
-  });
-
   rootEl.querySelector(".col-reset").addEventListener("click", () => {
     state.cols = null;
     applyColumns();
     syncControlsToState();
-    repaintStrip();
     updateUrl();
   });
 
@@ -1183,9 +1113,11 @@ function createTableControls({
   });
 
   // A header click re-sorts inside the table controller, which knows nothing
-  // about the URL or the strip — so listen on the same thead and follow up.
+  // about the URL — so listen on the same thead and follow up. The histograms
+  // are deliberately NOT redrawn here: which column is sorted does not change
+  // which rows are selected, and a picture that repainted on a sort would be
+  // claiming otherwise.
   table.onSortChange?.(() => {
-    repaintStrip();
     updateUrl();
   });
 
@@ -1247,8 +1179,11 @@ function syncSidebarDisclosure(detailsEl, isWide) {
 }
 
 /**
- * Wire syncSidebarDisclosure to a media query. A no-op on a page with no
- * sidebar (driving.html) and in Node, so it is safe to call unconditionally.
+ * Wire syncSidebarDisclosure to a media query. A no-op before the sidebar is
+ * mounted, on a page that has none, and in Node — so it is safe to call
+ * unconditionally. createTableControls calls it once mountSidebar has built
+ * the disclosure; there is no DOMContentLoaded hook, because at that point the
+ * data has not loaded and the sidebar does not exist yet.
  *
  * @param {Document|Element} [root]
  * @param {string} [query] - Must mirror the `max-width: 900px` breakpoint in
@@ -1267,16 +1202,14 @@ function wireSidebarDisclosure(root, query = "(min-width: 901px)") {
   return mq;
 }
 
-if (typeof document !== "undefined") {
-  document.addEventListener("DOMContentLoaded", () => wireSidebarDisclosure());
-}
-
 // Node/CommonJS export shim for the unit tests. No-op in the browser, where
 // these are plain globals loaded via <script>.
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     foldForSearch,
+    foldSearchTerms,
     matchesSearch,
+    matchesSearchTerms,
     isRangeType,
     isFilterUnset,
     rowPassesFilter,
@@ -1287,11 +1220,7 @@ if (typeof module !== "undefined" && module.exports) {
     defaultFilterValues,
     parseTableState,
     serializeTableState,
-    bucketCountFor,
     histogramBuckets,
-    medianOf,
-    formatStripSummary,
-    renderDistributionStrip,
     controlsHtml,
     createTableControls,
     syncSidebarDisclosure,

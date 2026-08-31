@@ -15,10 +15,11 @@ An edit that changes a rule belongs in both files; anything written since the sp
 `city.js` streams the run's csv.gz (provider derived from the filename token; GSV rows filtered to official `© Google`, Mapillary rows all kept) and has a snapshot `<select>` filtered to the active provider's runs.
 Data is fetched from `https://makeabilitylab.cs.washington.edu/public/streetscape-tracker/data/`, populated by `sync_data_to_server.sh` (which publishes only `*.csv.gz`/`*.json.gz` — logs, the DB, and bare CSVs are excluded).
 Mapillary attribution is required by their ToS and rendered in the Leaflet attribution control.
-`grid.html`/`streets.html`/`driving.html` are **configuration over a shared chassis**, not bespoke pages: `table-utils.js` + `table-controls.js` (plus `histogram-slider.js`, loaded only by the two pivoted pages) provide sorting (nulls sink in both directions),
-diacritic-folded search, select/range/histogram-range/boolean filters, grouped two-row headers, column presets + picker, full URL round-trip and a clickable distribution strip, so a page is a column-descriptor array, a row model and a fetch.
+`grid.html`/`streets.html`/`driving.html` are **configuration over a shared chassis**, not bespoke pages: `table-utils.js` + `table-controls.js` + `histogram-slider.js` provide sorting (nulls sink in both directions),
+diacritic-folded search, select/range/histogram-range/boolean filters, grouped two-row headers, column presets + picker, a filter sidebar and full URL round-trip, so a page is a column-descriptor array, a row model and a fetch.
+All three load all three scripts and pass the same options; the chassis has no per-page layout switches left.
 Two constraints that shape what a new page may do: there is **no pagination or virtualization**
-— every keystroke re-renders all matching rows via `innerHTML`, and the largest page is `driving.html` at ~3,900 rows (`grid.html` fell from 1,501 to ~1,190 when it pivoted to one row per city)
+— every keystroke re-renders all matching rows via `innerHTML`, and the largest page is `driving.html` at ~3,800 rows (`grid.html` fell from 1,501 to ~1,190 when it pivoted to one row per city)
 — and `createTableControls` **owns the whole query string**, so two instances on one page would fight over it (which is why `driving.html` renders unmatched plan areas as a summary section rather than a second table).
 
 ## The two data-table pages are pivoted: one row per city (issue #250)
@@ -62,7 +63,7 @@ And this is a layout fact rather than a tidiness one: the default view carries t
 The visible leaf label is a bare provider name repeated under every metric group, so grid's default preset exposes eight sort buttons under **three** distinct accessible names, in one tab order and one rotor list.
 Reading the *table* is fine — AT associates the `scope="colgroup"` cell with the body cells during table navigation — but a controls list gets the button's accessible name and nothing else, and the disambiguating text lived only in a hover-only `title`.
 The column picker's flat checkbox list hit the identical problem one layer over, and `pickerLabel` is the string it already computes for it.
-Emitted only where a descriptor supplies one, so driving.html's header markup does not move.
+Emitted only where a descriptor supplies one, so driving.html — whose columns are ungrouped and carry no `pickerLabel` — emits no `aria-label` at all, and its header markup is unchanged.
 **(9) A `groupTitle` is also every LEAF's default tooltip, so it must state what the group measures and never enumerate who is in it (#295/#296).**
 `providerColumnGroup` hung one shared string on each leaf, so "Including flat/perspective imagery (Mapillary)" was attached verbatim to KartaView's any-imagery column — the provider whose flat imagery is the *larger half* of its data (Yogyakarta: 1,071,155 flat images against 16,913 panos, 16.3% any-imagery coverage against 2.1% 360°) — and the same sentence sat on GSV's, which publishes no flat imagery at all.
 The fix is an optional `leafTitle(provider)` hook falling back to `groupTitle`, plus the rule that a per-provider tooltip is **derived from a registry capability, never from a provider name**: `anyImageryLeafTitle` lives in `table-utils.js` because grid.js and streets.js both need the identical `hasFlatImagery` branch and copying it is how the defect reached two pages.
@@ -74,8 +75,9 @@ The regression guard is a sweep — no per-provider leaf tooltip may name a *dif
 
 *Written after the split.*
 
-**Those two pages replaced the sorted-column distribution strip with per-filter histogram-sliders; driving.html keeps the strip, byte-identically.**
-The strip visualizes the ACTIVE SORT COLUMN over the CURRENTLY FILTERED rows, which made it change its own meaning twice over: re-sorting silently swapped its metric, and clicking a bar filtered the rows the strip was drawn from, so the picture collapsed under the very interaction it invited.
+**Per-filter histogram-sliders replaced the sorted-column distribution strip.**
+The strip visualized the ACTIVE SORT COLUMN over the CURRENTLY FILTERED rows, which made it change its own meaning twice over: re-sorting silently swapped its metric, and clicking a bar filtered the rows the strip was drawn from, so the picture collapsed under the very interaction it invited.
+#250 took it off the two pivoted pages and left it on driving.html; driving.html has since moved to the sidebar too, and the strip is now **deleted from the chassis** rather than switched off per page — see the section below.
 `histogram-slider.js` gives each numeric filter one histogram, on one metric, with a dual-handle brush
 — the interaction mechanics (two native range inputs on one track, thumbs clamped against each other, the band between them draggable as a window, the z-index hack that keeps the low thumb grabbable when both are pinned at the top) lifted from index.js's legend slider and generalized from integer bucket indices to continuous values.
 Three of its properties are the reason it is not just prettier.
@@ -87,9 +89,10 @@ Steps come from `sliderStepFor` (~100 arrow presses across the domain, on a 1/2/
 The min/max **number inputs stay** as the precision path and keep their `data-filter`/`data-bound` hooks verbatim — `syncControlsToState`, `handleControlChange` and the e2e selectors all read them, and the range handles deliberately carry no `data-filter` so `querySelectorAll('[data-filter=KEY]')` still returns exactly two elements.
 A bound typed on the right moves the handles on the left and the component's normalized value is read BACK as the state, so the two halves of one control cannot show different windows.
 Cost, measured in-browser against the real published aggregate (1,187 cities, 2,254 series): one filter pass **1.4 ms**, all three crossfilter histogram passes **3.6 ms**, sort + `innerHTML` of 311 matched rows **12.3 ms** — so the extra passes are ~4 ms of a ~17 ms keystroke, comfortably inside a frame.
-**What protects driving.html is enforcement, not care**: `theadHtml` emits exactly the pre-#250 single `<tr>` when no visible column carries a `group` (a test compares the two strings), and `controlsHtml`'s default `layout: "inline"` was verified byte-identical against `origin/main` over driving.js's real descriptors
-— which is why that branch carries a literal `"\n      "` where the old `${filterControls}` interpolation sat.
-Every new CSS rule is scoped under `.with-sidebar` / `.streets-main--wide` / `.th-group` / `.hist-*` / `.delta-*`, none of which driving.html emits.
+**What protected driving.html through #250 was enforcement, not care**, and the surviving half of that is still load-bearing: `theadHtml` emits exactly the pre-#250 single `<tr>` when no visible column carries a `group`, and a test compares the two strings rather than trusting the eye.
+driving.html is still the page that renders through it — its rows are places, not a pivot — so that branch has a real caller and a real browser test.
+The other half is gone with the page's old layout: `controlsHtml` carried a second `layout: "inline"` branch, verified byte-identical against `origin/main` over driving.js's real descriptors, with a literal `"\n      "` standing in for the old `${filterControls}` interpolation.
+The CSS scoping under `.with-sidebar` / `.streets-main--wide`, which is what kept driving.html's old strip untouched, is likewise gone — every table page got it, so it became the base rule.
 Two things the first cut of this got wrong, both caught in review.
 **The snapped axis is the ONLY axis, and the chassis has to be handed it back.**
 `setDomain` snapped internally while `syncHistogramDomains` kept the RAW extent and passed that to `histogramBuckets`, so the bars were bucketed over `[dataMin, dataMax]` while the thumbs and `.hist-fill` were positioned over `[snappedMin, snappedMax]` — both painted across the same 100% width, i.e.
@@ -113,7 +116,7 @@ A pivoted row holds one number per provider, so "coverage over 80%" is not a com
 Measured on the live catalog, "Mapillary + ≥ 80%" returned **56 cities and not one of them had Mapillary coverage over 80** — every one matched on GSV's number, and since nothing anywhere reaches 80% on Mapillary (catalog max 47.6) the truthful answer was zero rows; the bars had the same defect, drawing GSV's spread under a Mapillary selection.
 Picking a provider now points each numeric filter at that provider's column, redraws the bars over its distribution, re-seeds the axis to its range and rewrites the wording that says whose numbers these are (the legend AND both thumbs' `aria-label`, or a screen reader announces "Minimum Grid coverage %" while the handle brushes Mapillary's column);
 "Any provider" keeps the exists-semantics with the quantifier spelled out ("any provider reaches", "freshest of any") rather than a bare "best" that never said across what.
-The mechanism is a descriptor opt-in — `fieldFor`/`labelFor`/`testFor(values)`, resolved by `resolveFilters` into the live view that `applyFilters`, `rowsExceptFilter` and the histograms all read — and **a descriptor declaring none of them passes through by IDENTITY**, which is what keeps driving.html and the plain `range` filters unaware of any of it.
+The mechanism is a descriptor opt-in — `fieldFor`/`labelFor`/`testFor(values)`, resolved by `resolveFilters` into the live view that `applyFilters`, `rowsExceptFilter` and the histograms all read — and **a descriptor declaring none of them passes through by IDENTITY**, which is what keeps driving.html's filters unaware of any of it: a driving row is a place with one GSV number, so there is nothing there to scope.
 Three decisions inside it.
 **(1) A scope change re-seeds the axis**, the single exception to the fixed-axis rule above: it is a different gesture from brushing, and a Mapillary-scoped coverage axis genuinely should not span GSV's range.
 **(2) A scope change CLEARS that filter's window** rather than carrying it across, because clamping silently rewrites the question — "≥ 80%" against a 0–47.6% axis becomes "≥ 47.6%" and returns a row where the honest answer is none.
@@ -128,15 +131,40 @@ One bug the clear path exposed is worth keeping named: three paths change a wind
 *Written after the split.*
 
 **The filter sidebar is a native `<details>`, and the one hole that leaves is closed in JS.**
-grid.html and streets.html put search/selects/columns/sliders/checkboxes in a ~280px column beside the table (page measure 1200 → 1500px) that collapses to a "Filters" disclosure at ≤900px; native semantics give keyboard and AT support for nothing.
+The table pages put search/selects/columns/sliders/checkboxes in a ~280px column beside the table (page measure 1200 → 1500px) that collapses to a "Filters" disclosure at ≤900px; native semantics give keyboard and AT support for nothing.
 Above the breakpoint the `<summary>` is `display: none` and the panel is simply a column — which means a panel collapsed on a narrow screen and then widened would be closed with its only toggle gone, stranding filters that are in the URL and cannot be seen or changed.
 `wireSidebarDisclosure` re-opens it on widening, one-way (narrowing never closes what the reader opened).
-`controlsHtml`'s `layout: "sidebar"` orders the sections search → selects → columns → numeric windows → booleans → clear, partitioning by filter TYPE with an "everything else" bucket so a type added later renders in the wrong place rather than not at all;
+`controlsHtml` orders the sections search → selects → columns → numeric windows → booleans → clear, partitioning by filter TYPE with an "everything else" bucket so a type added later renders in the wrong place rather than not at all
+— it took a `layout` option to pick between this order and driving.html's old horizontal one until that page moved here too;
 below the breakpoint the same controls become a `repeat(auto-fit, minmax(220px, 1fr))` GRID rather than a wrapping flex row, since a tall wide histogram-slider and a short narrow select interleave into a ragged block under `flex-wrap`.
 **`.table-sidebar` itself carries the card chrome and the sticky full-viewport height**, with `.table-controls` transparent inside it
 — the obvious alternative, a flex chain stretching the controls to fill, does not survive contact with `<details>`: modern Chromium gives it a `::details-content` box, so `.controls-region` is not a flex item of the disclosure at all and simply does not grow (measured: sidebar 886px, controls 637px).
-**And the pages lead with one sentence, not a screen of prose** (`.page-head` / `.page-lead` / a closed `.page-about` disclosure): these two are instruments rather than articles, and the preamble was pushing both the table and its filters below the fold.
-driving.html keeps its full `.streets-intro`, which is doing a different job — that page's verdicts do not mean anything until the plan-vs-observed contradiction has been explained.
+**And the pages lead with one sentence, not a screen of prose** (`.page-head` / `.page-lead` / a closed `.page-about` disclosure): these are instruments rather than articles, and the preamble was pushing both the table and its filters below the fold.
+driving.html held out on a full three-paragraph `.streets-intro` on the grounds that its verdicts do not mean anything until the plan-vs-observed contradiction has been explained; it now leads with one sentence like the others, with that explanation one click away rather than gone.
+`.streets-intro` had no other user and went with it.
+
+## All three table pages share one layout, and the alternatives are deleted
+
+*Written after the split.*
+
+**driving.html now renders the same sidebar, page head and histogram filters as grid.html and streets.html, and the two shapes it used to be the only caller of are gone.**
+#250 rebuilt the pivoted pages and deliberately left driving.html alone; the result was one page plus two rather than three pages over one chassis, which is the opposite of what "configuration over a shared chassis" is supposed to buy.
+What moved: the wide measure and the `.table-layout` markup, the compact `.page-head` with its closed `.page-about` disclosure, and `histogram-range` on all three numeric filters.
+Once all three pages carried them, the `.streets-main--wide` and `.with-sidebar` modifiers were folded into their base rules and the sidebar chrome moved into `createTableControls` — a class every caller sets is a base value wearing a class name, and its failure mode was silent (a fourth page forgetting one lands on a strip layout nothing has rendered since, with `wireSidebarDisclosure` returning null and no error anywhere).
+What did NOT move is the pivot — a driving row is a **place** (a tracked city, or a plan area covering none), so no column declares a `group`, `theadHtml` still emits its flat single `<tr>`, and there are no Δ cells and no provider scope.
+The sidebar and the pivot were separable, and only one of them was ever about providers.
+
+**Two chassis features had no remaining caller afterwards, and were deleted rather than kept warm.**
+The sorted-column distribution strip (`renderDistributionStrip`, `formatStripSummary`, `medianOf`, `bucketCountFor`, `showDistributionStrip`, the bar-click handler and the `.strip-*` CSS) went, along with `controlsHtml`'s `layout: "inline"` branch and the `layout` option itself.
+An alternative layout nothing renders is one nothing tests either, and the strip in particular carried a live footgun: `histogramBuckets` took a `domain = null` default that scaled the axis to the values, which is exactly right for a strip describing the rows in view and exactly wrong for a slider whose handles must not move under the reader's hand — the two-axes bug above was one call site away the whole time.
+`domain` is now required, and there is one axis rule instead of two.
+
+**A third had none either, and the argument for keeping it did not survive review: `type: "range"`.**
+The case for keeping the bar-less flavour warm was that the tests making `histogram-range` trustworthy asserted it against a plain `range` TWIN in unset/pass/parse/serialize, so deleting `range` would delete the comparison pinning them as one value shape.
+That was wrong in a way worth recording: every one of those parity assertions dispatches through `isRangeType` FIRST, so `f(hist) === f(plain)` compared a branch against itself and could not fail.
+The twins are replaced by typed expectations (the `min~max` wire format written out, not compared), the shared test fixture now declares `histogram-range` like the real pages do, and the render branch, `.control-range` CSS and second `isRangeType` arm are deleted.
+What survives is the three per-page assertions that each numeric filter IS a `histogram-range` — more load-bearing now than before, since a descriptor left saying `range` no longer renders two number inputs, it falls off the end of `controlsHtml`'s type partition and renders as a **checkbox** for a `{min, max}` value.
+`isRangeType` itself stays as a one-arm predicate: it names why nine call sites are grouped (they reason about the value, not the widget).
 
 ## Site navigation + street-coverage discoverability
 

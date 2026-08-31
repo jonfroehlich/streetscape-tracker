@@ -37,7 +37,7 @@
        target="_blank" rel="noopener">About &#8599;</a>
   </header>
 
-  <main class="streets-main streets-main--wide">
+  <main class="streets-main">
     <div class="page-head">
       <h1>Grid coverage</h1>
       <p class="page-lead">
@@ -83,22 +83,26 @@
       Loading city collections…
     </div>
 
-    <!-- Sidebar + table (issue #250). The <details> is what makes the sidebar
-         collapsible below 900px with keyboard/AT semantics for free; above
-         that breakpoint its <summary> is hidden by CSS and the panel is simply
-         an always-open column. table-controls.js re-opens it on widening, so a
-         panel collapsed on a narrow screen can never end up hidden with its
-         only toggle gone. -->
-    <div class="table-layout with-sidebar">
-      <aside class="table-sidebar" aria-label="Search and filters">
-        <details class="sidebar-disclosure" open>
-          <summary>Filters</summary>
-          <!-- Search, filters and the column preset/picker are rendered into
-               this container by table-controls.js once the data has loaded
-               (issue #188). -->
-          <div id="grid-controls" class="controls-region"></div>
-        </details>
-      </aside>
+    <!-- Sidebar + table (issue #250).
+
+         `hidden` until the first successful render: createTableControls clears
+         it, and every empty/error path returns before that, so a deployment
+         with nothing published shows the status line alone rather than a
+         viewport-tall empty sidebar card (and an empty landmark to AT).
+
+         The sidebar CHROME — the <aside> landmark, the collapsible <details>
+         and its "Filters" summary — is emitted by table-controls.js around
+         this container, not authored here, so the three pages cannot drift
+         apart on it. The <details> is what makes the sidebar collapsible
+         below 900px with keyboard/AT semantics for free; above that breakpoint
+         its <summary> is hidden by CSS and the panel is simply an always-open
+         column, and table-controls.js re-opens it on widening so a panel
+         collapsed on a narrow screen can never end up hidden with its only
+         toggle gone. -->
+    <div class="table-layout" hidden>
+      <!-- Search, filters and the column preset/picker are rendered into this
+           container by table-controls.js once the data has loaded (#188). -->
+      <div id="grid-controls" class="controls-region"></div>
 
       <div class="table-content">
         <div id="grid-table-wrap" class="streets-table-wrap" hidden>

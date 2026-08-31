@@ -683,11 +683,13 @@ def build_parser() -> argparse.ArgumentParser:
         type=jitter_fraction,
         default=DEFAULT_TILE_JITTER,
         help=(
-            "Randomize the gap between Mapillary tile requests by +/- this "
-            f"fraction of the mean (default: {DEFAULT_TILE_JITTER}; 0 restores "
-            "an exact cadence). Rate and daily volume were both falsified as "
-            "the per-IP block trigger, so the metronomic request pattern is "
-            "the axis under test (issue #292)"
+            "Randomize the gap between Mapillary tile requests: a floor of "
+            "(1 - this) x the mean gap plus an exponential tail scaled to this, "
+            "so the mean rate is unchanged and this is the gaps' coefficient of "
+            f"variation (default: {DEFAULT_TILE_JITTER}; 0 restores an exact "
+            "cadence). Rate and daily volume were both falsified as the per-IP "
+            "block trigger, so the metronomic request pattern is the axis under "
+            "test (issue #292)"
         ),
     )
     parser.add_argument(

@@ -1,12 +1,13 @@
 /**
  * data-table.css
  * Shared styles for the sortable data-table pages: grid.html (per-city
- * grid-run stats) and streets.html (published road walks).
+ * grid-run stats), streets.html (published road walks) and driving.html
+ * (Google's plan joined against observed imagery).
  *
  * Moved wholesale from streets.css when the Grid page was added; the
  * `streets-*` class names predate the move and are kept verbatim because
  * the row templates in table-utils.js/streets.js and the e2e selectors
- * emit them — both pages simply share them.
+ * emit them — all three pages simply share them.
  *
  * Unlike index.html / city.html these pages are normal scrolling documents,
  * not a full-bleed map with floating panels — so they clear the fixed
@@ -19,26 +20,26 @@
   line-height: 1.5;
 }
 
-/* Wide enough that the table's nowrap columns fit without scrolling at
-   desktop widths; the intro keeps its own reading measure below. */
+/* The measure for every page loading this stylesheet — grid, streets and
+   driving, all three of which carry the sidebar. There is no narrower variant:
+   a `--wide` modifier lived here while driving.html was still on a horizontal
+   control strip, and once all three shared the sidebar it was a modifier every
+   caller set, which is a base value wearing a class name.
+
+   The width is deliberate arithmetic: the sidebar takes 280px, and 1500 − 280
+   − 20 leaves the table the same 1200px the pages had before the sidebar, so
+   no column preset had to be re-sized. The padding is tighter than the prose
+   pages' because the point of the compact page head is to put the table and
+   its filters on the first screen. */
 .streets-main {
-  max-width: 1200px;
+  max-width: 1500px;
   margin: 0 auto;
-  padding: 64px 20px 60px; /* 44px header + breathing room */
+  padding: 56px 20px 24px; /* 44px header + breathing room */
 }
 
 .streets-main h1 {
   margin: 0 0 12px;
   font-size: 24px;
-}
-
-.streets-intro {
-  max-width: 68ch;
-  margin-bottom: 24px;
-}
-
-.streets-intro p {
-  margin: 0 0 10px;
 }
 
 .streets-caveat {
@@ -274,23 +275,25 @@
 }
 
 /* ── Exploration controls (issue #188) ─────────────────────────────────────
-   Search, filters, the column preset/picker and the distribution strip. The
-   whole region is rendered by table-controls.js; nothing here is authored in
-   the HTML. */
+   Search, filters and the column preset/picker. The whole region is rendered
+   by table-controls.js; nothing here is authored in the HTML. */
 
 .controls-region {
-  margin-bottom: 16px;
+  margin-bottom: 0;
 }
 
+/* ONE column of controls, and transparent: the sidebar that holds it paints
+   the card (see .table-sidebar for why the chrome lives there rather than
+   here). Both go the other way below the breakpoint, where the controls stack
+   above the table instead — that is the only place the horizontal card still
+   exists. */
 .table-controls {
   display: flex;
-  flex-wrap: wrap;
-  align-items: flex-end;
-  gap: 10px 16px;
+  flex-direction: column;
+  align-items: stretch;
+  flex-wrap: nowrap;
+  gap: 12px;
   padding: 12px 14px;
-  background: #fff;
-  border-radius: 6px;
-  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.15);
 }
 
 .control {
@@ -317,26 +320,16 @@
   color: #222;
 }
 
+/* Fills the sidebar column rather than carrying a fixed measure of its own. */
 .control-search input {
-  min-width: 220px;
+  min-width: 0;
+  width: 100%;
 }
 
-/* Two bounds on one line; each input stays wide enough for a 4-digit figure
-   plus the spinner the browser adds to number inputs. */
-.control-range {
-  flex-direction: row;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 4px;
-}
-
-.control-range .control-legend {
-  flex-basis: 100%;
-}
-
-.control-range input {
-  width: 78px;
-}
+/* There was a `.control-range` block here — the bar-less numeric filter's two
+   number inputs on one line — referenced by nothing but that filter's render
+   branch. It went with the branch; every numeric window is a histogram-slider
+   now, and .hist-bounds below lays the same two inputs out. */
 
 .control-dash {
   color: #999;
@@ -347,8 +340,7 @@
   flex-direction: row;
   align-items: center;
   gap: 6px;
-  align-self: flex-end;
-  padding-bottom: 5px;
+  align-self: flex-start;
 }
 
 .control-check label {
@@ -359,8 +351,7 @@
 .col-picker {
   position: relative; /* the open panel positions against this, not the page */
   font-size: 13px;
-  align-self: flex-end;
-  padding-bottom: 4px;
+  align-self: flex-start;
 }
 
 .col-picker summary {
@@ -369,23 +360,24 @@
   font-weight: bold;
 }
 
-/* Floated over the table rather than pushing it down, so opening the picker
-   does not reflow the rows you are reading. */
+/* In the sidebar the panel PUSHES the controls below it down rather than
+   floating over anything: it is clipped by the sidebar's own overflow, and
+   nothing is being read underneath it there — the table is in the next column.
+   Below the breakpoint the controls sit directly above the table and it floats
+   instead, which is where the shadow and the stacking context come back. */
 .col-picker .col-panel {
-  position: absolute;
-  z-index: 5;
-  left: 0;
+  position: static;
   margin-top: 6px;
   padding: 10px 12px;
   border: 1px solid #ddd;
   border-radius: 6px;
   background: #fff;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
 }
 
+/* One column of checkboxes: a 280px sidebar has no room for two. */
 .col-picker .col-panel fieldset {
   display: grid;
-  grid-template-columns: repeat(2, minmax(140px, 1fr));
+  grid-template-columns: 1fr;
   gap: 2px 14px;
   margin: 0 0 8px;
   padding: 0;
@@ -412,7 +404,7 @@
 }
 
 .controls-clear {
-  align-self: flex-end;
+  align-self: flex-start;
 }
 
 .controls-clear:hover,
@@ -431,37 +423,31 @@
 }
 
 /* ── Kayak-style filter sidebar (issue #250) ──────────────────────────────
-   grid.html and streets.html only: every rule below is scoped under
-   .with-sidebar or .streets-main--wide, and driving.html carries neither
-   class, so its horizontal control strip is untouched.
+   The rules below were scoped under a .with-sidebar modifier while
+   driving.html was still on its old horizontal control strip and grid/streets
+   were not. All three pages share this column now, and .with-sidebar was on
+   every one of them, so the modifier is gone: a class every caller sets is a
+   base rule with an extra way to get it wrong, and the way it went wrong was
+   silent — a fourth table page forgetting it would land on a strip layout
+   nothing has rendered since, with no error anywhere.
 
-   The sidebar is a native <details>. Above the breakpoint its <summary> is
-   hidden and the panel is simply an always-open column; below it, the summary
-   becomes the "Filters" toggle. That is keyboard and AT semantics for free,
-   and the one hole it leaves — collapsed narrow, then widened, leaving the
-   panel closed with its toggle hidden — is closed in JS by
-   wireSidebarDisclosure. */
-
-/* Wider measure than the 1200px single-column pages: a pivoted table carries
-   one sub-column per provider, and the sidebar takes 280px of the width. */
-.streets-main--wide {
-  max-width: 1500px;
-  /* Tighter than the prose pages': the point of the compact head below is to
-     put the table and its filters on the first screen. */
-  padding-top: 56px;
-  padding-bottom: 24px;
-}
+   The sidebar is a native <details>, built by table-controls.js rather than
+   authored per page. Above the breakpoint its <summary> is hidden and the
+   panel is simply an always-open column; below it, the summary becomes the
+   "Filters" toggle. That is keyboard and AT semantics for free, and the one
+   hole it leaves — collapsed narrow, then widened, leaving the panel closed
+   with its toggle hidden — is closed in JS by wireSidebarDisclosure. */
 
 /* ── Compact page head ────────────────────────────────────────────────────
-   These two pages are instruments, not articles: the table and the filter
-   sidebar are what the reader came for, and a screen of preamble above them
-   pushed both below the fold. The lead is one sentence saying what the page
-   measures and how it differs from its sibling; everything else — how to read
-   the pivot, the census-vs-sample caveat, the crossfilter rule — moves into a
-   disclosure that is one click away and costs no vertical space closed.
-   driving.html keeps its full prose intro (.streets-intro), which is doing a
-   different job: that page's whole point needs explaining before its verdicts
-   mean anything. */
+   These pages are instruments, not articles: the table and the filter sidebar
+   are what the reader came for, and a screen of preamble above them pushed
+   both below the fold. The lead is one sentence saying what the page measures;
+   everything else — how to read the pivot, the census-vs-sample caveat, the
+   crossfilter rule, driving.html's "a closed plan row is not evidence" — moves
+   into a disclosure that is one click away and costs no vertical space closed.
+   driving.html held out longest on a three-paragraph intro, on the grounds
+   that its verdicts need explaining; the explanation is one click away here
+   rather than gone. */
 
 .page-head {
   margin-bottom: 14px;
@@ -502,13 +488,22 @@
   margin: 0 0 8px;
 }
 
-.table-layout.with-sidebar {
+.table-layout {
   display: grid;
   grid-template-columns: 280px minmax(0, 1fr);
   gap: 20px;
   /* Without this the sidebar stretches to the table's height and cannot be
      sticky (a stretched grid item has nothing to stick within). */
   align-items: start;
+}
+
+/* The pages author this element `hidden` and table-controls.js clears the
+   attribute on the first successful render, so an empty or failed load shows
+   the status line alone rather than a viewport-tall empty sidebar card. This
+   rule is what makes that work: `display: grid` above is an author declaration
+   and would otherwise beat the UA stylesheet's `[hidden] { display: none }`. */
+.table-layout[hidden] {
+  display: none;
 }
 
 /* Always there, and the full height of the viewport once the head scrolls
@@ -522,7 +517,7 @@
    gives it a `::details-content` box, so .controls-region is not a flex item
    of the disclosure at all and simply does not grow. Painting the container is
    both shorter and immune to that. */
-.with-sidebar .table-sidebar {
+.table-sidebar {
   position: sticky;
   top: 52px; /* clears the 44px fixed .site-header, plus breathing room */
   height: calc(100vh - 64px);
@@ -533,76 +528,36 @@
   box-shadow: 0 1px 4px rgba(0, 0, 0, 0.15);
 }
 
-.with-sidebar .table-controls {
-  background: none;
-  border-radius: 0;
-  box-shadow: none;
-}
-
-.with-sidebar .sidebar-disclosure > summary {
+.sidebar-disclosure > summary {
   display: none; /* the panel is simply present at this width */
 }
 
-.with-sidebar .controls-region {
-  margin-bottom: 0;
-}
-
-/* One column of controls rather than a wrapping row. */
-.with-sidebar .table-controls {
-  flex-direction: column;
-  align-items: stretch;
-  flex-wrap: nowrap;
-  gap: 12px;
-}
-
-.with-sidebar .control-search input {
-  min-width: 0;
-  width: 100%;
-}
-
-.with-sidebar .control-check,
-.with-sidebar .col-picker {
-  align-self: flex-start;
-  padding-bottom: 0;
-}
-
-.with-sidebar .controls-clear {
-  align-self: flex-start;
-}
-
-/* The floating picker panel is clipped by the sidebar's own overflow, so in
-   this layout it pushes the controls below it down instead of overlaying the
-   table. Nothing is being read underneath it here — the table is elsewhere. */
-.with-sidebar .col-picker .col-panel {
-  position: static;
-  margin-top: 6px;
-  box-shadow: none;
-}
-
-.with-sidebar .col-picker .col-panel fieldset {
-  grid-template-columns: 1fr;
-}
-
 @media (max-width: 900px) {
-  .table-layout.with-sidebar {
+  .table-layout {
     grid-template-columns: minmax(0, 1fr);
   }
 
-  .with-sidebar .table-sidebar {
+  /* A full-height sticky column makes no sense stacked above the table, and
+     the card chrome goes back onto the controls with it: the sidebar becomes
+     a plain block, and .table-controls the card again. */
+  .table-sidebar {
     position: static;
     height: auto;
     overflow: visible;
-  }
-
-  /* A full-height column makes no sense stacked above the table: the card
-     chrome goes back onto the controls, and the container back to plain. */
-  .with-sidebar .table-sidebar {
     background: none;
     border-radius: 0;
     box-shadow: none;
   }
 
-  .with-sidebar .table-controls {
+  /* Back to using the full width — but as a GRID rather than a wrapping flex
+     row. A histogram-slider is a tall, wide item and a select is a short
+     narrow one, and flex-wrap interleaves them into a ragged block where a
+     slider's number inputs end up beside an unrelated control's label. */
+  .table-controls {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    align-items: end;
+    gap: 12px 16px;
     background: #fff;
     border-radius: 6px;
     box-shadow: 0 1px 4px rgba(0, 0, 0, 0.15);
@@ -610,7 +565,7 @@
 
   /* Below the breakpoint the disclosure is real: the filters collapse behind
      a "Filters" summary so the table is not pushed off the first screen. */
-  .with-sidebar .sidebar-disclosure > summary {
+  .sidebar-disclosure > summary {
     display: list-item;
     cursor: pointer;
     padding: 8px 12px;
@@ -622,40 +577,33 @@
     color: #1a6b1d;
   }
 
-  .with-sidebar .sidebar-disclosure > summary:focus-visible {
+  .sidebar-disclosure > summary:focus-visible {
     outline: 2px solid #1a73e8;
     outline-offset: 1px;
   }
 
-  /* Back to using the full width — but as a GRID rather than a wrapping flex
-     row. A histogram-slider is a tall, wide item and a select is a short
-     narrow one, and flex-wrap interleaves them into a ragged block where a
-     slider's number inputs end up beside an unrelated control's label. */
-  .with-sidebar .table-controls {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-    align-items: end;
-    gap: 12px 16px;
-  }
-
-  .with-sidebar .col-picker .col-panel {
+  /* Floating again: here the controls sit directly above the table, so a panel
+     that pushed them down would shove the rows off the screen. */
+  .col-picker .col-panel {
     position: absolute;
+    z-index: 5;
+    left: 0;
     box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
   }
 
-  .with-sidebar .col-picker .col-panel fieldset {
+  .col-picker .col-panel fieldset {
     grid-template-columns: repeat(2, minmax(140px, 1fr));
   }
 }
 
 /* ── Histogram-slider filter (issue #250) ─────────────────────────────────
    A mini histogram with a dual-handle brush over it, used in place of a bare
-   min/max pair on grid.html and streets.html. Only pages whose filters declare
-   `type: "histogram-range"` emit this markup, so driving.html never matches.
+   min/max pair. Only filters declaring `type: "histogram-range"` emit this
+   markup; a plain `range` still renders as two number inputs.
 
-   The bars reuse the distribution strip's look (one flat hue, no legend, no
-   axis furniture) because they encode the same thing — row counts — and a
-   second visual language for one quantity would imply a second meaning.
+   One flat hue, no legend, no axis furniture: a single series encoding row
+   counts. Deliberately NOT painted with coverageColor, which would imply the
+   bar height meant coverage.
 
    The slider itself is lifted from index.css's .legend-slider family: two
    native range inputs stacked on one custom track, the inputs ignoring pointer
@@ -700,7 +648,7 @@
 .hist-bar {
   flex: 1;
   min-width: 1px;
-  background: #6c8ba0; /* the strip's hue — 3.6:1 on white, above the 3:1 floor */
+  background: #6c8ba0; /* 3.6:1 on the white surface — above the 3:1 floor */
   border-radius: 2px 2px 0 0;
 }
 
@@ -818,69 +766,4 @@
 .hist-bounds input:focus-visible {
   outline: 2px solid #1a73e8;
   outline-offset: 1px;
-}
-
-/* ── Distribution strip ────────────────────────────────────────────────────
-   A histogram of the ACTIVE SORT COLUMN over the CURRENTLY FILTERED rows, so
-   it describes what you have selected rather than the whole table. Single
-   series, so: one flat hue, no legend, no axis furniture. Deliberately not
-   painted with coverageColor — these bars encode row counts, and reusing the
-   coverage ramp would imply the height meant coverage. */
-
-.distribution-strip {
-  margin-top: 10px;
-  padding: 10px 14px;
-  background: #fff;
-  border-radius: 6px;
-  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.15);
-}
-
-.strip-bars {
-  display: flex;
-  align-items: flex-end;
-  gap: 2px; /* the surface gap that keeps adjacent bars readable as separate */
-  height: 40px;
-}
-
-.strip-bar {
-  flex: 1;
-  min-width: 2px;
-  background: #6c8ba0; /* 3.6:1 on the white surface — above the 3:1 floor */
-  border-radius: 2px 2px 0 0; /* rounded data-end, anchored to the baseline */
-  /* Reset browser <button> chrome (border/padding/font/background) — a bar is
-     a <button> exactly when its bucket is clickable (renderDistributionStrip
-     emits a plain, non-interactive <span> otherwise), and these are no-ops on
-     a <span>, so one rule covers both without a tag selector. */
-  display: block;
-  border: 0;
-  padding: 0;
-  font: inherit;
-  appearance: none;
-}
-
-/* Only a <button> (a clickable bucket) gets pointer affordance and
-   interaction states; the plain <span> case has nothing to hover into. */
-button.strip-bar {
-  cursor: pointer;
-}
-
-button.strip-bar:hover {
-  background: #557089;
-}
-
-button.strip-bar:focus-visible {
-  outline: 2px solid #1a73e8;
-  outline-offset: 1px;
-}
-
-.strip-summary {
-  margin: 6px 0 0;
-  color: #555;
-  font-size: 12px;
-}
-
-@media (prefers-reduced-motion: no-preference) {
-  .strip-bar {
-    transition: height 120ms ease-out;
-  }
 }

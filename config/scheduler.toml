@@ -195,10 +195,19 @@ daily_request_budget = 1750
 # 1,938 requests/day under a pinned 60/min limiter, while 26,363 in one day had
 # run clean — so neither rate nor daily volume is the trigger. What no restart
 # had changed is the SHAPE of the traffic: a saturated token bucket emits tiles
-# at an exact 1.000 s cadence, in raster order, from a datacenter IP. `jitter`
-# replaces that metronome with gaps drawn uniformly from ±60% of the mean
-# (0.6–2.4 s at 40/min); the mean rate is still max_requests_per_minute, so the
-# budget and timeout arithmetic are unchanged. 0 restores the exact cadence.
+# at an exact 1.000 s cadence, in raster order, from a datacenter IP.
+#
+# `jitter` replaces that metronome with a SHIFTED EXPONENTIAL gap: a floor of
+# (1 - jitter) x the mean plus an exponential tail scaled to jitter. At 40/min
+# and 0.6 that is a 0.60 s floor, a 1.50 s mean, a ~4.7 s p99 and NO ceiling.
+# The number is also the gaps' coefficient of variation, which is the point:
+# an organic client's arrivals are Poisson (CV 1.0), and the uniform draw this
+# started as reached only 0.35 while keeping a hard ceiling — invisible to a
+# scorer reading gap statistics rather than gap equality.
+#
+# The mean rate is still max_requests_per_minute, so the budget and timeout
+# arithmetic are unchanged; the tail widens the variance of a night's wall
+# clock by well under a minute against ~44. 0 restores the exact cadence.
 max_requests_per_minute = 40
 jitter = 0.6
 
@@ -261,9 +270,10 @@ spacing_m = 15
 # than double it is that the two never run at the same time: they share a host,
 # so the scheduler defers one behind the other whatever max_concurrent_channels
 # says (issue #240), and the child-side per-host lock (#208) covers the manual
-# runs the scheduler cannot see. Same jitter as the grid channel (#292): the
-# walk pays for the census on an un-paired night, and one metronomic channel
-# would leave the pattern under test half-changed.
+# runs the scheduler cannot see. Same jitter as the grid channel (#292) — see
+# its block for what the number means: the walk pays for the census on an
+# un-paired night, and one metronomic channel would leave the pattern under
+# test half-changed.
 max_requests_per_minute = 40
 jitter = 0.6
 # See [providers.gsv_streets].network_type. A broader network costs Mapillary

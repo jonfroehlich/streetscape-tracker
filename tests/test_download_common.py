@@ -13,6 +13,8 @@ import pytest
 from streetscape_metadata_tracker.download_common import (
     AsyncRateLimiter,
     DownloadError,
+    _unit_exponential,
+    coerce_jitter,
     generate_grid_arrays,
     generate_grid_points,
     grid_index_ranges,
@@ -220,31 +222,28 @@ def test_rate_limiter_zero_or_negative_disables(monkeypatch):
 #
 # The spaced pacer is the fourth per-IP hypothesis under test, and the property
 # it exists to change is the metronome: a saturated token bucket sleeps exactly
-# 60/max_per_minute between requests. These pin that (a) the gaps really follow
-# the injected draw, (b) the mean rate is still the configured one, (c) there
-# is no burst, and (d) jitter=0 is byte-for-byte the old bucket.
+# 60/max_per_minute between requests. The gap is a SHIFTED EXPONENTIAL —
+# mean * ((1 - j) + j * Exponential(1)) — so these pin (a) that the gaps really
+# are that shifted draw, (b) that the mean rate is unchanged and the CV is
+# `jitter`, (c) that there is no burst and no ceiling, and (d) that jitter=0 is
+# byte-for-byte the old bucket.
 
 
 def _draws(values):
-    """A deterministic stand-in for random.uniform that replays `values`."""
+    """A deterministic stand-in for the unit-exponential sampler."""
     it = iter(values)
-
-    def uniform(low, high):
-        assert (low, high) == (pytest.approx(0.4), pytest.approx(1.6))
-        return next(it)
-
-    return uniform
+    return lambda: next(it)
 
 
-def test_jittered_limiter_spaces_requests_by_the_drawn_gap(monkeypatch):
+def test_jittered_limiter_spaces_requests_by_the_shifted_draw(monkeypatch):
     clock, now = _make_clock()
     sleeps = []
     _patch_sleep(monkeypatch, clock, sleeps)
-    # mean gap 1.5 s (40/min); draws are the multiplier on it
+    # mean gap 1.5 s (40/min), jitter 0.6: gap = 1.5 * (0.4 + 0.6 * draw).
     # Every acquisition draws the gap the NEXT one will wait, so four requests
     # draw four times and the last draw is never slept on.
     limiter = AsyncRateLimiter(
-        40, time_func=now, jitter=0.6, random_func=_draws([0.4, 1.6, 1.0, 1.0])
+        40, time_func=now, jitter=0.6, draw_func=_draws([0.0, 3.0, 1.0, 1.0])
     )
 
     async def scenario():
@@ -253,31 +252,62 @@ def test_jittered_limiter_spaces_requests_by_the_drawn_gap(monkeypatch):
 
     _run(scenario())
     # The first request never waits; each later one waits out the PREVIOUS
-    # request's drawn gap, so the sleeps are the draws in order.
-    assert sleeps == [pytest.approx(0.6), pytest.approx(2.4), pytest.approx(1.5)]
+    # request's drawn gap. draw=0 lands exactly on the floor, and draw=3 is a
+    # gap the old uniform draw could not have produced at all (its ceiling was
+    # 1.6 * mean = 2.4 s) — which is the point of the change.
+    assert sleeps == [pytest.approx(0.6), pytest.approx(3.3), pytest.approx(1.5)]
 
 
-def test_jittered_limiter_keeps_the_configured_mean_rate(monkeypatch):
-    """Jitter reshapes the gaps; it must not quietly slow or speed the channel
-    — the daily budget and the scheduler's timeout are both derived from
-    max_requests_per_minute as a mean."""
-    import random
+def test_the_floor_is_exactly_one_minus_jitter_and_a_gap_is_never_zero(monkeypatch):
+    """`jitter < 1` is enforced precisely because it is what keeps the floor
+    above zero — at 1 the draw admits an unpaced burst against the tile CDN."""
+    clock, now = _make_clock()
+    sleeps = []
+    _patch_sleep(monkeypatch, clock, sleeps)
+    limiter = AsyncRateLimiter(60, time_func=now, jitter=0.99, draw_func=_draws([0.0] * 5))
+
+    async def scenario():
+        for _ in range(3):
+            await limiter.acquire()
+
+    _run(scenario())
+    # Even the smallest possible draw leaves (1 - jitter) * mean of spacing.
+    assert sleeps == [pytest.approx(0.01), pytest.approx(0.01)]
+    assert all(gap > 0 for gap in sleeps)
+
+
+def test_jittered_limiter_keeps_the_mean_rate_and_reaches_the_target_cv(monkeypatch):
+    """Two properties in one draw sample, because they trade off against each
+    other: jitter reshapes the gaps but must not quietly slow or speed the
+    channel (the daily budget and the scheduler's timeout are both derived from
+    max_requests_per_minute as a MEAN), and the reshaping has to be large
+    enough to matter — an organic client's Poisson arrivals sit at CV 1.0, and
+    the uniform draw this replaced reached only jitter/sqrt(3) = 0.35."""
+    import random as _random
+    import statistics
 
     clock, now = _make_clock()
     sleeps = []
     _patch_sleep(monkeypatch, clock, sleeps)
+    rng = _random.Random(292)
     limiter = AsyncRateLimiter(
-        60, time_func=now, jitter=0.6, random_func=random.Random(292).uniform
+        60, time_func=now, jitter=0.6, draw_func=lambda: rng.expovariate(1.0)
     )
 
     async def scenario():
-        for _ in range(2000):
+        for _ in range(20_000):
             await limiter.acquire()
 
     _run(scenario())
-    assert len(sleeps) == 1999
-    assert sum(sleeps) / len(sleeps) == pytest.approx(1.0, rel=0.03)
-    assert min(sleeps) >= 0.4 and max(sleeps) <= 1.6
+    assert len(sleeps) == 19_999
+    mean = statistics.fmean(sleeps)
+    assert mean == pytest.approx(1.0, rel=0.02), "the mean rate must survive the reshaping"
+    assert statistics.pstdev(sleeps) / mean == pytest.approx(0.6, rel=0.05), "CV == jitter"
+    assert min(sleeps) >= 0.4, "the (1 - jitter) floor holds"
+    # No ceiling: the old uniform draw could never exceed (1 + jitter) * mean,
+    # and that hard bound is exactly what a scorer reading gap statistics would
+    # still have seen. This is the assertion that the distribution changed.
+    assert max(sleeps) > 1.6
 
 
 def test_jittered_limiter_has_no_burst_capacity(monkeypatch):
@@ -287,7 +317,7 @@ def test_jittered_limiter_has_no_burst_capacity(monkeypatch):
     clock, now = _make_clock()
     sleeps = []
     _patch_sleep(monkeypatch, clock, sleeps)
-    limiter = AsyncRateLimiter(600, time_func=now, jitter=0.6, random_func=_draws([1.0] * 20))
+    limiter = AsyncRateLimiter(600, time_func=now, jitter=0.6, draw_func=_draws([1.0] * 20))
 
     async def scenario():
         await limiter.acquire()
@@ -306,10 +336,10 @@ def test_zero_jitter_is_exactly_the_token_bucket(monkeypatch):
     sleeps = []
     _patch_sleep(monkeypatch, clock, sleeps)
 
-    def never(low, high):  # pragma: no cover - the assertion is that it is unused
+    def never():  # pragma: no cover - the assertion is that it is unused
         raise AssertionError("jitter=0 must not draw randomness")
 
-    limiter = AsyncRateLimiter(60, time_func=now, jitter=0.0, random_func=never)
+    limiter = AsyncRateLimiter(60, time_func=now, jitter=0.0, draw_func=never)
 
     async def scenario():
         for _ in range(3):
@@ -333,9 +363,20 @@ def test_disabled_pacing_ignores_jitter(monkeypatch):
     assert sleeps == []
 
 
+def test_the_default_sampler_is_the_unit_exponential():
+    """The mean-rate guarantee is `E[draw] == 1`; a differently-scaled default
+    would silently re-rate every Mapillary channel."""
+    import statistics
+
+    draws = [_unit_exponential() for _ in range(50_000)]
+    assert statistics.fmean(draws) == pytest.approx(1.0, rel=0.02)
+    assert statistics.pstdev(draws) == pytest.approx(1.0, rel=0.02)  # CV 1.0
+    assert min(draws) >= 0.0
+
+
 @pytest.mark.parametrize("bad", [-0.1, 1.0, 1.5])
 def test_jitter_outside_the_unit_interval_is_refused(bad):
-    """>= 1 admits a zero gap, i.e. an unpaced burst against the tile CDN."""
+    """>= 1 erases the gap floor, i.e. an unpaced burst against the tile CDN."""
     with pytest.raises(ValueError, match="jitter"):
         AsyncRateLimiter(60, jitter=bad)
 
@@ -343,9 +384,23 @@ def test_jitter_outside_the_unit_interval_is_refused(bad):
 def test_jitter_fraction_argparse_type():
     assert jitter_fraction("0") == 0.0
     assert jitter_fraction("0.6") == pytest.approx(0.6)
-    for bad in ("1", "1.2", "-0.5", "lots"):
+    for bad in ("1", "1.2", "-0.5", "lots", "inf", "nan"):
         with pytest.raises(argparse.ArgumentTypeError):
             jitter_fraction(bad)
+
+
+def test_coerce_jitter_agrees_with_the_argparse_type():
+    """The config loader's half of the same guard (issue #292). It must accept
+    exactly what `jitter_fraction` accepts, and answer None — "use the
+    collector's default" — rather than 0, which means "restore the metronome"."""
+    assert coerce_jitter(None) is None
+    assert coerce_jitter(0.6) == pytest.approx(0.6)
+    assert coerce_jitter(0) == 0.0
+    assert coerce_jitter("0.25") == pytest.approx(0.25)
+    # `False` is the one that has to be named: it is an int, so it would coerce
+    # to a valid 0.0 and silently mean "restore the metronome".
+    for bad in (1, 1.5, -0.1, "banana", True, False, [], float("nan"), float("inf")):
+        assert coerce_jitter(bad) is None, bad
 
 
 # ── generate_grid_arrays (issue #157) ───────────────────────────────────────

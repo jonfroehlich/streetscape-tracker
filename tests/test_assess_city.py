@@ -449,14 +449,26 @@ def test_differently_paced_mapillary_channels_are_both_reported(
 ):
     """The two channels hold independent [providers.*] blocks and run
     back-to-back, so one rate beside a summed total would misreport a config
-    that paces them apart."""
+    that paces them apart.
+
+    The rate is reported as a MEAN with its jitter beside it (issue #292): since
+    the pacer stopped being a metronome, a bare "60/min" reads exactly like the
+    cadence it replaced, and the shape is the whole change an operator is here
+    to see. An explicit 0 must read as the exact cadence it is.
+    """
     _stub_collection(monkeypatch, conn)
     cfg = _cfg(tmp_path)
     cfg.providers["mapillary_streets"].max_requests_per_minute = 30
 
     _sched.cmd_assess_city(cfg, QUERY, today=TODAY, assume_yes=True, estimate_only=True)
 
-    assert "paced at 30/min and 60/min" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    # Unset jitter means the child's own default, which is jittered.
+    assert "paced at 30/min (mean, gaps at CV 0.60) and 60/min (mean, gaps at CV 0.60)" in out
+
+    cfg.providers["mapillary_streets"].jitter = 0
+    _sched.cmd_assess_city(cfg, QUERY, today=TODAY, assume_yes=True, estimate_only=True)
+    assert "30/min (exact cadence)" in capsys.readouterr().out
 
 
 # --------------------------------------------------------------------------
