@@ -229,6 +229,42 @@ test("every registered provider declares both capability flags", () => {
   }
 });
 
+test("every registered provider declares the two fields the pivoted tables render", () => {
+  // Both fall back rather than throw, which is exactly why an omission
+  // survives review: `shortLabel ?? label` still renders a leaf, and a missing
+  // panoCountingModel just drops the "(census)"/"(sample)" parenthetical --
+  // the one label telling a reader NOT to subtract a census count from a
+  // sampled one. KartaView shipped without both for three releases (#295)
+  // because it was registered (#225) before the pivot (#250) added them.
+  for (const [key, p] of Object.entries(PROVIDERS)) {
+    assert.equal(typeof p.shortLabel, "string", key);
+    assert.ok(p.shortLabel.length > 0, key);
+    assert.ok(
+      p.panoCountingModel === "sample" || p.panoCountingModel === "census",
+      `${key}: panoCountingModel must be "sample" or "census", got ${p.panoCountingModel}`
+    );
+  }
+});
+
+test("KartaView is declared a census, the way it is actually collected", () => {
+  // The specific value, not just "one of the two": the sweep enumerates every
+  // image in the circle rather than picking a nearest one per grid point, so
+  // its counts are unbounded by the grid and must not be subtracted from GSV's
+  // sampled ones. Krabi reads 52,224 KartaView panos against 18,784 sampled
+  // GSV ones, which is exactly the subtraction the "(census)" parenthetical
+  // exists to stop.
+  //
+  // What is deliberately NOT asserted here (#296 review): that a census
+  // provider never declares hasCopyrightFilter. The two fields are orthogonal
+  // capabilities -- how panos are COUNTED, and whether the provider publishes
+  // a copyright field -- and today's three entries only happen to correlate
+  // them. Pinning that would force the first census provider with a copyright
+  // field to either fail CI or mis-declare itself, and the failure would read
+  // as "your registry entry is wrong". The real coupling, that pano_count
+  // follows hasCopyrightFilter, is pinned behaviourally above.
+  assert.equal(PROVIDERS.kartaview.panoCountingModel, "census");
+});
+
 /**
  * Drop comments from JS source so a source-inspection test reads only code.
  *

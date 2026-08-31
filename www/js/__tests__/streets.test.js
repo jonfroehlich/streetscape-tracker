@@ -13,9 +13,14 @@ const assert = require("node:assert/strict");
 // A THIRD provider the page has never heard of: every per-provider column,
 // filter option and row key is generated from this registry, so a hardcoded
 // pair fails here rather than the day one is really registered (issue #225).
+//
+// `hasFlatImagery` is carried on purpose rather than left off: the any-imagery
+// leaf tooltips branch on it, so a stub without it evaluates only the
+// 360°-only half and the cross-provider sweep below would pass against a
+// hardcoded provider name (#296 review).
 global.PROVIDERS = {
-  gsv: { label: "Google Street View", shortLabel: "GSV" },
-  mapillary: { label: "Mapillary", shortLabel: "Mapillary" },
+  gsv: { label: "Google Street View", shortLabel: "GSV", hasFlatImagery: false },
+  mapillary: { label: "Mapillary", shortLabel: "Mapillary", hasFlatImagery: true },
   thirdparty: { label: "Third Party" },
 };
 global.DEFAULT_STREET_NETWORK_TYPE = "drive";
@@ -454,6 +459,86 @@ test("the walk-to-walk change group has one column per provider and NO cross-pro
   assert.match(change[0].title, /Never a cross-provider comparison/);
   // ...while the coverage group DOES get one.
   assert.ok(STREET_COLUMNS.some((c) => c.key === "deltaPct" && c.group?.id === "cov"));
+});
+
+test("no per-provider leaf tooltip names a DIFFERENT provider", () => {
+  // The same sweep grid.test.js runs, because this page had the same defect
+  // and CI could not see it: `title: groupTitle` hangs ONE string on every
+  // leaf, so "equals the 360° number for Google Street View" was attached to
+  // every provider's any-imagery column. Not hypothetical — the KartaView
+  // road-walk collector (#258) publishes into this page, and KartaView's flat
+  // imagery is the larger half of its data (#296 review).
+  //
+  // Forces `hasFlatImagery` both ways, for the reason grid.test.js's twin
+  // spells out: reading the registry's own value evaluates ONE branch per
+  // provider, and the provider that reaches the flat-imagery branch today is
+  // the one it would be hardcoded to name.
+  const providers = ["gsv", "mapillary", "thirdparty"];
+  const names = { gsv: /GSV|Google Street View/, mapillary: /Mapillary/, thirdparty: /Third Party/ };
+  const saved = providers.map((p) => ({ ...global.PROVIDERS[p] }));
+  try {
+    for (const hasFlatImagery of [false, true]) {
+      for (const p of providers) global.PROVIDERS[p].hasFlatImagery = hasFlatImagery;
+      for (const col of buildStreetColumns(providers)) {
+        const owner = providers.find((q) => col.key.endsWith(`_${q}`));
+        if (!owner) continue; // Δ and the network-property columns own no provider.
+        for (const [other, pattern] of Object.entries(names)) {
+          if (other === owner) continue;
+          assert.doesNotMatch(
+            col.title ?? "",
+            pattern,
+            `[hasFlatImagery=${hasFlatImagery}] ${col.key} names ${other}: ${col.title}`
+          );
+        }
+      }
+    }
+  } finally {
+    providers.forEach((p, i) => {
+      global.PROVIDERS[p] = saved[i];
+    });
+  }
+});
+
+test("the any-imagery leaf tooltips are derived from hasFlatImagery", () => {
+  // Both branches, on the page's own columns: a provider that publishes flat
+  // imagery says so in its own name, and a 360°-only one explains why its two
+  // columns hold identical numbers. Percent and kilometres both, since they
+  // are two call sites of the same helper.
+  const byKey = Object.fromEntries(
+    buildStreetColumns(["gsv", "mapillary"]).map((c) => [c.key, c])
+  );
+  assert.match(byKey.pctAny_mapillary.title, /Mapillary's flat\/perspective imagery/);
+  assert.match(byKey.pctAny_gsv.title, /Equals the 360° street-km number/);
+  assert.match(byKey.pctAny_gsv.title, /Google Street View publishes 360° panoramas only/);
+  assert.match(byKey.lengthKmCoveredAny_mapillary.title, /flat\/perspective/);
+  assert.match(byKey.lengthKmCoveredAny_gsv.title, /Equals the 360° covered km/);
+
+  // Pinned to the FLAG, not to today's registry: flip it and the sentence
+  // follows. A test reading only the shipped values lets the call site
+  // hardcode the provider it happens to be describing.
+  const restore = global.PROVIDERS.gsv.hasFlatImagery;
+  try {
+    global.PROVIDERS.gsv.hasFlatImagery = true;
+    const flipped = buildStreetColumns(["gsv"]).find((c) => c.key === "pctAny_gsv").title;
+    assert.match(flipped, /Google Street View's flat\/perspective imagery/);
+  } finally {
+    global.PROVIDERS.gsv.hasFlatImagery = restore;
+  }
+});
+
+test("the coverage group titles state the rule rather than counting the providers", () => {
+  // "Both providers walk the SAME sample points" was true of a two-provider
+  // page and is one collected provider away from false. The group title is
+  // also every leaf's DEFAULT tooltip, so a title that enumerates is a title
+  // that misattributes (#296 review).
+  const groupTitle = (id) => STREET_COLUMNS.find((c) => c.group?.id === id).group.title;
+  for (const id of ["cov", "covAny"]) {
+    assert.doesNotMatch(groupTitle(id), /\bBoth\b/, `${id} title says "Both"`);
+    for (const name of ["GSV", "Mapillary", "Google", "KartaView"]) {
+      assert.doesNotMatch(groupTitle(id), new RegExp(name), `${id} title names ${name}`);
+    }
+  }
+  assert.match(groupTitle("cov"), /directly comparable/);
 });
 
 test("a row renders one cell per column", () => {

@@ -181,9 +181,20 @@ function buildGridColumns(providers = gridProviders()) {
       providers,
       id: "covAny",
       groupLabel: "Any imagery (%)",
+      // Says what the group MEASURES, not who is in it: the leaves below carry
+      // the per-provider half, because this string is also each leaf's default
+      // tooltip and naming one provider in it mislabels the others (#295).
       groupTitle:
-        "Including flat/perspective imagery (Mapillary); equals grid coverage for Google Street View",
+        "Share of grid sample points with imagery of ANY kind — 360° panoramas plus flat/" +
+        "perspective images, for a provider that publishes both",
       keyFor: (p) => `pctAny_${p}`,
+      // Read off `hasFlatImagery` rather than naming a provider, through the
+      // helper streets.js also calls so the two pages cannot drift. KartaView
+      // is the case that made this matter: its flat imagery is the DOMINANT
+      // half of its data (Yogyakarta, 1,071,155 flat images against 16,913
+      // panos — 2.1% 360° coverage against 16.3% any-imagery), and it
+      // inherited a tooltip crediting the flat column to Mapillary.
+      leafTitle: (p) => anyImageryLeafTitle(p, "Equals grid coverage"),
       cellFor: (p) => (row) => coverageCellParts(row[`pctAny_${p}`], { compact: true }),
       linkFor: gridProviderLink,
       initial: "desc",
@@ -221,14 +232,47 @@ function buildGridColumns(providers = gridProviders()) {
       providers,
       id: "panos",
       groupLabel: "Panoramas (per provider — not comparable)",
+      // Was an enumeration ("...for GSV, ...for Mapillary") that simply went
+      // stale when a third provider was collected. States the rule instead, so
+      // it stays true however many providers the payload carries (#295).
       groupTitle:
-        "Unique panoramas in the latest snapshot: official © Google panos for GSV, all 360° " +
-        "panos for Mapillary. NOT comparable across providers (sample vs census), which is why " +
-        "this group has no Δ column.",
+        "Unique panoramas in each provider's latest snapshot, counted that provider's own way. " +
+        "NOT comparable across providers (a sample and a census answer different questions), " +
+        "which is why this group has no Δ column.",
       keyFor: (p) => `panos_${p}`,
       leafLabel: (p) => {
         const model = PROVIDERS[p]?.panoCountingModel;
         return model ? `${providerShortLabel(p)} (${model})` : providerShortLabel(p);
+      },
+      leafTitle: (p) => {
+        const model = PROVIDERS[p]?.panoCountingModel;
+        const label = PROVIDERS[p]?.label ?? p;
+        let title;
+        if (model === "sample") {
+          title = `${label}: the nearest panorama at each grid point, so the count is bounded ` +
+            "by the grid rather than by the imagery";
+        } else if (model === "census") {
+          title = `${label}: every 360° panorama found in the search area, so the count is ` +
+            "unbounded by the grid — do not compare it against a sampled count";
+        } else {
+          title = `Unique panoramas in ${label}'s latest snapshot`;
+        }
+        // The copyright half, which the counting model does NOT imply and
+        // which nothing else on the row discloses: for a copyright-filtered
+        // provider, adaptCityRecord resolves `pano_count` to the
+        // official-fleet subset (`unique_google_panos`) while the coverage
+        // columns beside it count every PRESENT point regardless of
+        // copyright. Two numbers with different denominators sat side by side
+        // in one row, and the group title that used to say so ("official
+        // © Google panos for GSV") was the enumeration removed above (#296
+        // review). An archival run that never captured a copyright field
+        // falls back to all panos, which this simplifies over exactly as the
+        // title it replaces did.
+        return PROVIDERS[p]?.hasCopyrightFilter
+          ? `${title}. Counts official-fleet panoramas only — contributor imagery is ` +
+            "excluded here but still counted in the coverage columns, so the two have " +
+            "different denominators."
+          : title;
       },
       cellFor: (p) => (row) => ({ html: formatCellNumber(row[`panos_${p}`]) }),
       linkFor: gridProviderLink,

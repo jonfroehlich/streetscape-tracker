@@ -52,17 +52,21 @@
         <div class="page-about-body">
           <p>
             Each city is <strong>one row</strong>, with a sub-column per
-            provider under every metric, so a city collected by both Google
-            Street View and Mapillary reads across in one line — and the
-            <strong>Δ</strong> column gives the difference (Mapillary − GSV)
-            directly. Click any provider's cell to open that provider's
-            snapshot for the city.
+            provider under every metric, so every provider that collected a
+            city reads across in one line. The <strong>Δ</strong> column gives
+            one fixed difference (Mapillary − GSV) rather than a moving
+            "best − rest", so its sign means the same thing in every row; a
+            further provider gets its own sub-columns but no Δ. Click any
+            provider's cell to open that provider's snapshot for the city.
           </p>
           <p>
-            Coverage percentages are cross-provider comparable; raw panorama
-            counts are <em>not</em> — GSV samples the nearest pano per grid
-            point while Mapillary is a census of every 360° pano, which is why
-            that group has no Δ.
+            Coverage percentages are cross-provider comparable, because every
+            provider is measured against the same frozen grid. Raw panorama
+            counts are <em>not</em>: a <em>sample</em> provider records only
+            the nearest pano at each grid point, so its count is bounded by the
+            grid, while a <em>census</em> provider records every 360° pano in
+            the search area. Each panorama column is labelled with which of the
+            two it is, which is also why that group has no Δ.
           </p>
           <p>
             Each numeric filter in the sidebar carries a histogram of where the
