@@ -1,21 +1,20 @@
 // Offline unit tests for the exploration chassis in table-controls.js
-// (issue #188): search, structured filters, column presets, URL round-trip,
-// and the distribution strip's bucketing.
+// (issue #188): search, structured filters, column presets and URL round-trip.
 //
 // Run with `npm test` (Node's built-in test runner) — no network, no jsdom.
-// In the browser this module reads formatCellNumber from table-utils.js; here
-// we stub it. The DOM wiring in createTableControls is covered by the browser
-// e2e smoke test instead (tests/e2e/test_smoke.py).
+// The DOM wiring in createTableControls is covered by the browser e2e smoke
+// test instead (tests/e2e/test_smoke.py). No global stubs are needed: the
+// module's only cross-file dependency is histogram-slider.js, reached solely
+// through createTableControls' DOM path, which nothing here exercises.
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
-global.formatCellNumber = (v, digits = 0) =>
-  v == null ? "—" : v.toFixed(digits);
-
 const {
   foldForSearch,
+  foldSearchTerms,
   matchesSearch,
+  matchesSearchTerms,
   isRangeType,
   isFilterUnset,
   rowPassesFilter,
@@ -57,6 +56,35 @@ test("matchesSearch: a blank or whitespace query matches everything", () => {
   assert.ok(matchesSearch(row, SEARCH_FIELDS, "   "));
 });
 
+test("foldSearchTerms: the query is folded to terms once, for the whole pass", () => {
+  // applyFilters calls this once and hands the terms to matchesSearchTerms per
+  // row, rather than re-folding the query ~19,000 times per keystroke on
+  // driving.html. The two spellings must agree, or the split would be a
+  // behaviour change dressed as an optimization.
+  assert.deepEqual(foldSearchTerms("  SÃO   paulo "), ["sao", "paulo"]);
+  assert.deepEqual(foldSearchTerms("   "), []);
+  const row = { label: "São Paulo, Brazil", providerLabel: "Mapillary" };
+  for (const query of ["sao paulo", "SÃO", "  ", "sao google"]) {
+    assert.equal(
+      matchesSearchTerms(row, SEARCH_FIELDS, foldSearchTerms(query)),
+      matchesSearch(row, SEARCH_FIELDS, query),
+      `disagreed on ${JSON.stringify(query)}`
+    );
+  }
+});
+
+test("the per-row haystack cache is keyed by the FIELD LIST, not just the row", () => {
+  // The cache lives on the row object for the life of the row model. Two
+  // callers on one page always search the same fields, but a cache that
+  // ignored the field list would serve streets.html's haystack to a caller
+  // asking about a different column set — a silent wrong ANSWER, not a slow
+  // one, so the key is asserted rather than assumed.
+  const row = { label: "Seattle", providerLabel: "Mapillary" };
+  assert.ok(matchesSearch(row, ["label", "providerLabel"], "mapillary"));
+  assert.ok(!matchesSearch(row, ["label"], "mapillary"));
+  assert.ok(matchesSearch(row, ["label", "providerLabel"], "mapillary"));
+});
+
 // --- filters ----------------------------------------------------------------
 
 const FILTERS = [
@@ -70,7 +98,11 @@ const FILTERS = [
     ],
     test: (row, value) => row.provider === value,
   },
-  { key: "cov", label: "Coverage", type: "range", field: "pct", min: 0, max: 100 },
+  // `histogram-range` is the ONLY numeric-window type — there was a bar-less
+  // `range` twin, and this fixture was it. Every value-shaped assertion below
+  // (unset, pass, URL round-trip, section order) now runs against the type the
+  // pages actually declare.
+  { key: "cov", label: "Coverage", type: "histogram-range", field: "pct", min: 0, max: 100 },
   { key: "changed", label: "Has Δ", type: "boolean", test: (row) => row.delta != null },
 ];
 
@@ -308,43 +340,28 @@ test("controlsHtml: the picker offers every column except the always-on ones", (
 
 // --- histogram-range parity (issue #250) ------------------------------------
 //
-// `histogram-range` renders differently and behaves identically: same value
-// shape, same URL wire format. Every place that reasons about the VALUE has to
-// treat the two as one, so each is asserted against its `range` twin rather
-// than against a hand-copied expectation.
-
+// A second numeric window, for the cases that need two on one page.
 const HIST_FILTERS = [
-  { key: "cov", label: "Coverage", type: "histogram-range", field: "pct", min: 0, max: 100 },
+  FILTERS[1],
   { key: "age", label: "Median age", type: "histogram-range", field: "age", min: 0 },
 ];
 
-test("isRangeType: both numeric-window flavours, nothing else", () => {
-  assert.ok(isRangeType({ type: "range" }));
+test("isRangeType: histogram-range and nothing else", () => {
+  // ONE numeric-window type. There was a bar-less `range` twin, and there were
+  // "parity" tests asserting f(range) === f(histogram) at every value-shaped
+  // call site — which proved nothing, because every one of those sites
+  // dispatches through THIS predicate first, so the two arguments took the
+  // same branch. The typed assertions the twins wrapped are the real content
+  // and live on above, against the histogram-range fixture.
   assert.ok(isRangeType({ type: "histogram-range" }));
+  assert.ok(!isRangeType({ type: "range" }));
   assert.ok(!isRangeType({ type: "select" }));
   assert.ok(!isRangeType({ type: "boolean" }));
 });
 
-test("histogram-range is unset/pass-tested exactly like range", () => {
-  const hist = HIST_FILTERS[0];
-  const plain = FILTERS[1];
-  for (const value of [{ min: null, max: null }, { min: 10, max: null }, null, ""]) {
-    assert.equal(
-      isFilterUnset(hist, value),
-      isFilterUnset(plain, value),
-      `unset disagreed on ${JSON.stringify(value)}`
-    );
-  }
-  for (const row of [{ pct: 90 }, { pct: 10 }, { pct: null }]) {
-    assert.equal(
-      rowPassesFilter(hist, row, { min: 50, max: 100 }),
-      rowPassesFilter(plain, row, { min: 50, max: 100 }),
-      `pass disagreed on ${JSON.stringify(row)}`
-    );
-  }
-});
-
-test("histogram-range round-trips through the URL in the plain range's format", () => {
+test("a numeric window's URL format is `min~max`, exactly", () => {
+  // Typed rather than compared against a twin: this IS the wire format, and a
+  // shared link written by an older deployment has to keep parsing.
   const state = {
     query: "",
     preset: "overview",
@@ -352,16 +369,20 @@ test("histogram-range round-trips through the URL in the plain range's format", 
     sort: null,
     values: { cov: { min: 10, max: 90 } },
   };
-  const qs = serializeTableState(state, { filters: HIST_FILTERS, defaultPreset: "overview" });
-  // Byte-for-byte what the plain `range` twin writes (URLSearchParams
-  // percent-encodes the "~", which is why this is compared rather than typed).
+  // URLSearchParams percent-encodes the "~", which is why the expectation
+  // reads `%7E` rather than the character the parser splits on.
   assert.equal(
-    qs,
-    serializeTableState(state, { filters: [FILTERS[1]], defaultPreset: "overview" })
+    serializeTableState(state, { filters: HIST_FILTERS, defaultPreset: "overview" }),
+    "cov=10%7E90"
   );
-  assert.deepEqual(parseTableState(qs, { filters: HIST_FILTERS }).values.cov, { min: 10, max: 90 });
+  assert.deepEqual(parseTableState("cov=10~90", { filters: HIST_FILTERS }).values.cov, {
+    min: 10,
+    max: 90,
+  });
+  // A window on one filter says nothing about the other.
+  assert.equal(parseTableState("cov=10~90", { filters: HIST_FILTERS }).values.age, undefined);
 
-  // One-sided and malformed degrade the same way a plain range does.
+  // One-sided keeps the bound it was given; unparseable is simply not set.
   assert.deepEqual(parseTableState("cov=50~", { filters: HIST_FILTERS }).values.cov, {
     min: 50,
     max: null,
@@ -497,18 +518,16 @@ test("controlsHtml: a defaulted select drops the blank 'any' option", () => {
   );
 });
 
-// --- strip opt-out + pickerLabel --------------------------------------------
+// --- pickerLabel ------------------------------------------------------------
 
-test("controlsHtml: renders no sorted-column distribution strip", () => {
-  // Every numeric filter now owns a histogram on a FIXED axis. A second
-  // histogram of whichever column happened to be sorted was a different answer
-  // to the same question — it swapped its metric on a header click and
-  // collapsed under the very bar-click it invited — so it is gone from the
-  // chassis, not merely switched off per page.
-  const html = controlsHtml({ filters: FILTERS, presets: PRESETS, columns: COLUMNS });
-  assert.doesNotMatch(html, /distribution-strip/);
-  assert.doesNotMatch(html, /strip-bar/);
-});
+// There WAS a `controlsHtml: renders no sorted-column distribution strip` test
+// here, asserting the output matched neither /distribution-strip/ nor
+// /strip-bar/. It went with the strip: once those strings appear nowhere in
+// table-controls.js, a test for their absence from its output cannot fail, and
+// a vacuous test reads like coverage. The strip's real replacement — one
+// fixed-axis histogram per numeric filter — is pinned by the histogram-range
+// cases above and, in a browser, by
+// test_the_table_pages_replaced_the_strip_with_per_filter_histograms.
 
 test("controlsHtml: the picker prefers pickerLabel over the leaf label", () => {
   // A pivot's leaf label is a provider name repeated under every metric group

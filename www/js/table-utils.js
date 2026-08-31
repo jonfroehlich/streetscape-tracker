@@ -539,9 +539,8 @@ function createSortableTable({ columns, defaultSort, theadEl, tbodyEl, tieKey = 
   /**
    * Subscribe to sort changes made through the header.
    *
-   * The table controller deliberately knows nothing about the URL or the
-   * distribution strip; table-controls.js registers here to keep both in step
-   * with a header click.
+   * The table controller deliberately knows nothing about the URL;
+   * table-controls.js registers here to keep it in step with a header click.
    *
    * @param {(sort: {key: string, dir: string}) => void} fn
    */

@@ -48,6 +48,51 @@ function foldForSearch(value) {
 }
 
 /**
+ * Fold a raw query into its search terms: whitespace-separated, blanks
+ * dropped, each folded by foldForSearch.
+ *
+ * Split out so applyFilters can fold the query ONCE per pass instead of once
+ * per row. It matters because of how many passes there are: every `apply()`
+ * runs applyFilters for the table plus one `rowsExceptFilter` per histogram
+ * (three on driving.html, four on grid.html), so driving.html's ~3,800 rows
+ * meant ~19,000 NFD folds of the same three-character query per keystroke.
+ *
+ * @param {string} query - Raw query text.
+ * @returns {string[]} Folded terms; empty for a blank query.
+ */
+function foldSearchTerms(query) {
+  return foldForSearch(query).split(/\s+/).filter(Boolean);
+}
+
+/**
+ * Each row's searched fields, folded and joined — computed once per row.
+ *
+ * Keyed on the row OBJECT, so the cache lives exactly as long as the row
+ * models do and a reload drops it with them. It assumes the SEARCHED fields
+ * are immutable once a row model is built, which is true of all three pages
+ * (driving.js's mergeStreetCoverage does mutate rows, but it writes observed
+ * coverage, not any of DRIVING_SEARCH_FIELDS, and it runs before the rows
+ * reach the chassis at all).
+ *
+ * @type {WeakMap<Object, {fields: string, text: string}>}
+ */
+const searchHaystacks = new WeakMap();
+
+/**
+ * @param {Object} row - A row model.
+ * @param {string[]} fields - Row fields to search.
+ * @returns {string} The folded, joined haystack for that row.
+ */
+function searchHaystackFor(row, fields) {
+  const fieldKey = fields.join(",");
+  const cached = searchHaystacks.get(row);
+  if (cached !== undefined && cached.fields === fieldKey) return cached.text;
+  const text = fields.map((f) => foldForSearch(row[f])).join(" ");
+  searchHaystacks.set(row, { fields: fieldKey, text });
+  return text;
+}
+
+/**
  * Does a row match a free-text query?
  *
  * Every whitespace-separated term must appear in at least one of the row's
@@ -60,31 +105,54 @@ function foldForSearch(value) {
  * @returns {boolean}
  */
 function matchesSearch(row, fields, query) {
-  const terms = foldForSearch(query).split(/\s+/).filter(Boolean);
+  return matchesSearchTerms(row, fields, foldSearchTerms(query));
+}
+
+/**
+ * matchesSearch with the query already folded — the hot path.
+ *
+ * @param {Object} row - A row model.
+ * @param {string[]} fields - Row fields to search.
+ * @param {string[]} terms - Folded terms from foldSearchTerms; empty matches
+ *   everything.
+ * @returns {boolean}
+ */
+function matchesSearchTerms(row, fields, terms) {
   if (terms.length === 0) return true;
-  const haystack = fields.map((f) => foldForSearch(row[f])).join(" ");
+  const haystack = searchHaystackFor(row, fields);
   return terms.every((term) => haystack.includes(term));
 }
 
 // ── Structured filters ────────────────────────────────────────
 
 /**
- * Is this a numeric-window filter?
+ * Is this a numeric-window filter — a `{min, max}` value, either nullable,
+ * serialized as `"min~max"`?
  *
- * `range` (two number inputs) and `histogram-range` (issue #250: a mini
- * histogram plus a dual-handle slider, WITH the same two number inputs kept
- * for precision and keyboard/AT parity) differ only in what they render. The
- * value shape is identical — `{min, max}`, either nullable — and so is the URL
- * wire format, `"min~max"`. Every place that reasons about the VALUE therefore
- * has to accept both, which is what this predicate is for: a missed site would
- * make a histogram filter silently unserializable or un-parseable rather than
- * failing loudly.
+ * There were TWO flavours once (issue #188 follow-up): a bar-less `range` (the two
+ * number inputs) and `histogram-range` (issue #250: a mini histogram plus a
+ * dual-handle slider, keeping those same inputs for precision and keyboard/AT
+ * parity). They differed only in what they RENDERED, so this predicate existed
+ * to keep every value-shaped call site accepting both.
+ *
+ * `range` is gone, along with its render branch, its `.control-range` CSS and
+ * the twinned tests. driving.html was its last caller and moved to
+ * `histogram-range` here; keeping a second flavour warm for a hypothetical
+ * caller would have kept warm a code path nothing renders, and the "parity"
+ * tests that appeared to protect it proved nothing — every one of them
+ * dispatched through THIS predicate first, so `f(range) === f(histogram)` was
+ * comparing a branch against itself.
+ *
+ * The predicate itself stays, rather than inlining `type === "histogram-range"`
+ * at nine call sites: it names WHY those sites are grouped (they reason about
+ * the value, not the widget), and it is where the next numeric widget would be
+ * admitted.
  *
  * @param {Object} filter - Filter descriptor.
  * @returns {boolean}
  */
 function isRangeType(filter) {
-  return filter.type === "range" || filter.type === "histogram-range";
+  return filter.type === "histogram-range";
 }
 
 /**
@@ -132,6 +200,12 @@ function rowPassesFilter(filter, row, value) {
 /**
  * Narrow rows by the free-text query and every set filter.
  *
+ * The query is folded ONCE here, not once per row, and each row's haystack is
+ * folded once for the life of the row model (searchHaystackFor) — worth doing
+ * because this function runs 4-5 times per keystroke on the largest table (the
+ * table itself plus one `rowsExceptFilter` per histogram) behind a 150 ms
+ * debounce.
+ *
  * @param {Object[]} rows - All row models.
  * @param {Object} cfg
  * @param {Object[]} cfg.filters - Filter descriptors.
@@ -141,9 +215,10 @@ function rowPassesFilter(filter, row, value) {
  * @returns {Object[]} A new filtered array (input untouched).
  */
 function applyFilters(rows, { filters, values, query, searchFields }) {
+  const terms = foldSearchTerms(query ?? "");
   return rows.filter(
     (row) =>
-      matchesSearch(row, searchFields, query ?? "") &&
+      matchesSearchTerms(row, searchFields, terms) &&
       filters.every((filter) => rowPassesFilter(filter, row, values[filter.key]))
   );
 }
@@ -163,9 +238,10 @@ function applyFilters(rows, { filters, values, query, searchFields }) {
  *
  * A descriptor opts in with `fieldFor(values)` / `labelFor(values)` /
  * `testFor(values)`; everything else passes through untouched, which is what
- * keeps driving.html and the plain `range` filters unaware of any of this. The
- * result is a SHALLOW COPY, so the originals stay the page's static
- * descriptors and nothing accumulates state across renders.
+ * keeps the unpivoted page (driving.html, whose rows are places rather than
+ * cities-with-a-column-per-provider) unaware of any of this. The result is a
+ * SHALLOW COPY, so the originals stay the page's static descriptors and
+ * nothing accumulates state across renders.
  *
  * @param {Object[]} filters - Filter descriptors.
  * @param {Object} values - Current {filterKey: value}.
@@ -451,12 +527,11 @@ function controlsHtml({ filters, presets, columns, searchPlaceholder }) {
             <select id="f-${filter.key}" data-filter="${filter.key}">${options}</select>
           </div>`;
       }
-      // The two numeric-window flavours share their number inputs verbatim —
-      // same `data-filter`/`data-bound` hooks, same aria-labels — because
-      // those are what syncControlsToState, handleControlChange and the e2e
-      // selectors read. `histogram-range` only ADDS the bars + brush above
-      // them (issue #250); the precision path is unchanged, which is also what
-      // keeps the control fully usable by keyboard and by AT.
+      // The number inputs are the PRECISION path under the brush, and they are
+      // what syncControlsToState, handleControlChange and the e2e selectors
+      // read (`data-filter`/`data-bound`). They were shared verbatim with a
+      // second, bar-less `range` flavour until that flavour lost its last
+      // caller; see isRangeType for why it is gone rather than kept warm.
       const boundInputs = () => `<input type="number" data-filter="${filter.key}" data-bound="min"
                    aria-label="Minimum ${filter.label}" placeholder="min"
                    ${filter.min != null ? `min="${filter.min}"` : ""}
@@ -466,13 +541,6 @@ function controlsHtml({ filters, presets, columns, searchPlaceholder }) {
                    aria-label="Maximum ${filter.label}" placeholder="max"
                    ${filter.min != null ? `min="${filter.min}"` : ""}
                    ${filter.max != null ? `max="${filter.max}"` : ""}>`;
-      if (filter.type === "range") {
-        return `
-          <div class="control control-range" role="group" aria-labelledby="f-${filter.key}-legend">
-            <span class="control-legend" id="f-${filter.key}-legend">${filter.label}</span>
-            ${boundInputs()}
-          </div>`;
-      }
       if (filter.type === "histogram-range") {
         // The bars are decorative (aria-hidden): the two range thumbs carry a
         // live aria-valuetext and the number inputs carry the exact figures,
@@ -614,6 +682,55 @@ function defaultFilterValues(filters) {
   return values;
 }
 
+/**
+ * Wrap the controls container in the sidebar chrome, and reveal the layout.
+ *
+ * The `<aside>` landmark, the collapsible `<details>` and its "Filters"
+ * summary used to be hand-copied into all three page HTMLs. That made a
+ * wrapper change — the summary text, the `aria-label`, the `open` default — a
+ * three-file edit whose failure mode was silent: miss one page and
+ * `wireSidebarDisclosure` simply returns null there, so its filters stay
+ * collapsed after a widen with no toggle to reopen them.
+ *
+ * Revealing the layout is the same argument from the other side. The pages
+ * author `.table-layout` as `hidden`, and every empty-state and error path
+ * returns BEFORE createTableControls — so a deployment with nothing published
+ * (driving.html before its first `fetch-driving-plan`, streets.html before the
+ * first road walk) used to render a viewport-tall empty white sidebar beside
+ * its status line, and an empty landmark to assistive tech. Clearing the
+ * attribute here rather than per page means the reveal cannot be forgotten by
+ * whichever page is added next.
+ *
+ * @param {Element} rootEl - The `#<page>-controls` container authored in HTML.
+ * @returns {?Element} The layout element, if there was one.
+ */
+function mountSidebar(rootEl) {
+  if (typeof document === "undefined") return null;
+  const layoutEl = rootEl.closest(".table-layout");
+  if (rootEl.closest(".table-sidebar")) {
+    // Already wrapped — a page that calls createTableControls twice.
+    layoutEl?.removeAttribute("hidden");
+    return layoutEl;
+  }
+  const asideEl = document.createElement("aside");
+  asideEl.className = "table-sidebar";
+  asideEl.setAttribute("aria-label", "Search and filters");
+  const detailsEl = document.createElement("details");
+  detailsEl.className = "sidebar-disclosure";
+  detailsEl.open = true;
+  const summaryEl = document.createElement("summary");
+  summaryEl.textContent = "Filters";
+  detailsEl.append(summaryEl);
+  asideEl.append(detailsEl);
+  // Put the aside exactly where the container was, then adopt the container
+  // into it: `rootEl` keeps its identity, so everything downstream that reads
+  // or listens on it is unaffected.
+  rootEl.replaceWith(asideEl);
+  detailsEl.append(rootEl);
+  layoutEl?.removeAttribute("hidden");
+  return layoutEl;
+}
+
 function createTableControls({
   rootEl,
   table,
@@ -638,7 +755,11 @@ function createTableControls({
     values: defaultFilterValues(filters),
   };
 
+  const layoutEl = mountSidebar(rootEl);
   rootEl.innerHTML = controlsHtml({ filters, presets, columns, searchPlaceholder });
+  // Wired here rather than on DOMContentLoaded: the disclosure it needs does
+  // not exist until mountSidebar has run.
+  wireSidebarDisclosure(layoutEl ?? undefined);
   const searchEl = rootEl.querySelector("#table-search");
   const presetEl = rootEl.querySelector("#table-preset");
 
@@ -692,7 +813,7 @@ function createTableControls({
         // and a typed bound can never disagree about the current window.
         writeRangeInputs(filter.key, range);
         // Debounced on the SAME timer as a typed bound: a drag emits on every
-        // pointer move, and on grid.html that is 1,501 rows re-filtered and
+        // pointer move, and on driving.html that is ~3,800 rows re-filtered and
         // re-rendered per frame.
         clearTimeout(rangeTimer);
         rangeTimer = setTimeout(apply, 150);
@@ -758,7 +879,8 @@ function createTableControls({
    * Never over `filtered`: feeding a slider its own output makes the picture
    * collapse under the brush that drew it (and dragging back out cannot
    * restore bars that are no longer there). Costs one extra filter pass per
-   * histogram — three passes over ~1,500 rows on the widest page.
+   * histogram: four extra passes over grid.html's ~1,190 rows, three over
+   * driving.html's ~3,800.
    */
   function repaintHistograms() {
     for (const [key, entry] of histograms) {
@@ -870,7 +992,7 @@ function createTableControls({
   // ── DOM → state ──
   let searchTimer = null;
   searchEl.addEventListener("input", () => {
-    // Debounced: 1,501 rows re-filter and re-render on every keystroke.
+    // Debounced: ~3,800 rows re-filter and re-render on every keystroke.
     clearTimeout(searchTimer);
     searchTimer = setTimeout(() => {
       state.query = searchEl.value;
@@ -965,7 +1087,7 @@ function createTableControls({
   rootEl.addEventListener("input", (event) => {
     if (!event.target.dataset?.bound) return;
     // Debounced for the same reason the search box is: a range bound applies
-    // on every keystroke (see above), and on grid.html that is up to 1,501
+    // on every keystroke (see above), and on driving.html that is up to ~3,800
     // rows re-filtered and re-rendered per digit typed. handleControlChange
     // re-reads the input's live value when the timer fires, so only the
     // settled figure is ever applied.
@@ -1057,8 +1179,11 @@ function syncSidebarDisclosure(detailsEl, isWide) {
 }
 
 /**
- * Wire syncSidebarDisclosure to a media query. A no-op on a page with no
- * sidebar (driving.html) and in Node, so it is safe to call unconditionally.
+ * Wire syncSidebarDisclosure to a media query. A no-op before the sidebar is
+ * mounted, on a page that has none, and in Node — so it is safe to call
+ * unconditionally. createTableControls calls it once mountSidebar has built
+ * the disclosure; there is no DOMContentLoaded hook, because at that point the
+ * data has not loaded and the sidebar does not exist yet.
  *
  * @param {Document|Element} [root]
  * @param {string} [query] - Must mirror the `max-width: 900px` breakpoint in
@@ -1077,16 +1202,14 @@ function wireSidebarDisclosure(root, query = "(min-width: 901px)") {
   return mq;
 }
 
-if (typeof document !== "undefined") {
-  document.addEventListener("DOMContentLoaded", () => wireSidebarDisclosure());
-}
-
 // Node/CommonJS export shim for the unit tests. No-op in the browser, where
 // these are plain globals loaded via <script>.
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     foldForSearch,
+    foldSearchTerms,
     matchesSearch,
+    matchesSearchTerms,
     isRangeType,
     isFilterUnset,
     rowPassesFilter,

@@ -202,7 +202,7 @@ Static vanilla JS + Leaflet + Chart.js 4 in `www/`, no build step, fetching the 
 `grid.html`/`streets.html`/`driving.html` are configuration over one shared table chassis with **no pagination or virtualization** (a new page's row count is a design constraint), and `createTableControls` (`www/js/table-controls.js`) **owns the whole query string** — two instances on one page fight over it, which is why `driving.html` renders unmatched plan areas as a summary rather than a second filtered table.
 All three share **one layout** — a sticky filter sidebar, a one-sentence lead with the rest in a closed disclosure, and per-filter histogram-sliders — and the alternatives are **deleted, not switched off**: no `layout` option, no sorted-column distribution strip, and `histogramBuckets` takes a required domain, since a self-scaling axis is right for a strip and wrong for a slider.
 But only `grid.html` and `streets.html` are pivoted to **one row per city**, providers as sub-columns (#250), so "Collected by" is a **scope, not just a row filter** — it redirects what the numeric filters read, or "coverage over 80%" silently means "some provider's".
-A `driving.html` row is a **place**, so it keeps a flat single-row header and is the only caller of that `theadHtml` branch.
+A `driving.html` row is a **place**, so it keeps a flat single-row header — the only page that renders that `theadHtml` branch **by default**, never its only caller (grid/streets reach it whenever every grouped column is unchecked, so deleting it breaks them).
 Anything fanning out over the provider registry must gate on presence in the payload — a registered provider is not a collected one.
 Mapillary attribution is required by their ToS.
 

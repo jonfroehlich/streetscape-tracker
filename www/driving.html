@@ -38,7 +38,7 @@
        target="_blank" rel="noopener">About &#8599;</a>
   </header>
 
-  <main class="streets-main streets-main--wide">
+  <main class="streets-main">
     <div class="page-head">
       <h1>Driving plan vs. observed imagery</h1>
       <p class="page-lead">
@@ -92,18 +92,17 @@
     </div>
 
     <!-- Sidebar + table, the shape grid.html and streets.html use; see that
-         file for the <details> rationale. This page is NOT pivoted — one row
-         per place, no provider sub-columns — but it filters through the same
-         chassis, so it gets the same filter column. -->
-    <div class="table-layout with-sidebar">
-      <aside class="table-sidebar" aria-label="Search and filters">
-        <details class="sidebar-disclosure" open>
-          <summary>Filters</summary>
-          <!-- Search, filters and the column preset/picker are rendered into
-               this container by table-controls.js once the data has loaded. -->
-          <div id="driving-controls" class="controls-region"></div>
-        </details>
-      </aside>
+         file for the `hidden` and <details> rationale. This page is NOT
+         pivoted — one row per place, no provider sub-columns — but it filters
+         through the same chassis, so it gets the same filter column.
+
+         The `hidden` matters most here: a deployment that has never run
+         `scheduler fetch-driving-plan`, or a transient 404 of
+         driving_plan.json.gz, is the ordinary way this page renders no rows. -->
+    <div class="table-layout" hidden>
+      <!-- Search, filters and the column preset/picker are rendered into this
+           container by table-controls.js once the data has loaded. -->
+      <div id="driving-controls" class="controls-region"></div>
 
       <div class="table-content">
         <div id="driving-table-wrap" class="streets-table-wrap" hidden>

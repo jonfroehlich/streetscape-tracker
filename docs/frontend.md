@@ -19,7 +19,7 @@ Mapillary attribution is required by their ToS and rendered in the Leaflet attri
 diacritic-folded search, select/range/histogram-range/boolean filters, grouped two-row headers, column presets + picker, a filter sidebar and full URL round-trip, so a page is a column-descriptor array, a row model and a fetch.
 All three load all three scripts and pass the same options; the chassis has no per-page layout switches left.
 Two constraints that shape what a new page may do: there is **no pagination or virtualization**
-— every keystroke re-renders all matching rows via `innerHTML`, and the largest page is `driving.html` at ~3,900 rows (`grid.html` fell from 1,501 to ~1,190 when it pivoted to one row per city)
+— every keystroke re-renders all matching rows via `innerHTML`, and the largest page is `driving.html` at ~3,800 rows (`grid.html` fell from 1,501 to ~1,190 when it pivoted to one row per city)
 — and `createTableControls` **owns the whole query string**, so two instances on one page would fight over it (which is why `driving.html` renders unmatched plan areas as a summary section rather than a second table).
 
 ## The two data-table pages are pivoted: one row per city (issue #250)
@@ -86,7 +86,7 @@ Cost, measured in-browser against the real published aggregate (1,187 cities, 2,
 **What protected driving.html through #250 was enforcement, not care**, and the surviving half of that is still load-bearing: `theadHtml` emits exactly the pre-#250 single `<tr>` when no visible column carries a `group`, and a test compares the two strings rather than trusting the eye.
 driving.html is still the page that renders through it — its rows are places, not a pivot — so that branch has a real caller and a real browser test.
 The other half is gone with the page's old layout: `controlsHtml` carried a second `layout: "inline"` branch, verified byte-identical against `origin/main` over driving.js's real descriptors, with a literal `"\n      "` standing in for the old `${filterControls}` interpolation.
-The CSS scoping under `.with-sidebar` / `.streets-main--wide` / `.hist-*`, which is what kept driving.html's old strip untouched, is likewise now scoping that every table page opts into.
+The CSS scoping under `.with-sidebar` / `.streets-main--wide`, which is what kept driving.html's old strip untouched, is likewise gone — every table page got it, so it became the base rule.
 Two things the first cut of this got wrong, both caught in review.
 **The snapped axis is the ONLY axis, and the chassis has to be handed it back.**
 `setDomain` snapped internally while `syncHistogramDomains` kept the RAW extent and passed that to `histogramBuckets`, so the bars were bucketed over `[dataMin, dataMax]` while the thumbs and `.hist-fill` were positioned over `[snappedMin, snappedMax]` — both painted across the same 100% width, i.e.
@@ -143,7 +143,8 @@ driving.html held out on a full three-paragraph `.streets-intro` on the grounds 
 
 **driving.html now renders the same sidebar, page head and histogram filters as grid.html and streets.html, and the two shapes it used to be the only caller of are gone.**
 #250 rebuilt the pivoted pages and deliberately left driving.html alone; the result was one page plus two rather than three pages over one chassis, which is the opposite of what "configuration over a shared chassis" is supposed to buy.
-What moved: `.streets-main--wide` and the `.table-layout.with-sidebar` markup, the compact `.page-head` with its closed `.page-about` disclosure, and `histogram-range` on all three numeric filters.
+What moved: the wide measure and the `.table-layout` markup, the compact `.page-head` with its closed `.page-about` disclosure, and `histogram-range` on all three numeric filters.
+Once all three pages carried them, the `.streets-main--wide` and `.with-sidebar` modifiers were folded into their base rules and the sidebar chrome moved into `createTableControls` — a class every caller sets is a base value wearing a class name, and its failure mode was silent (a fourth page forgetting one lands on a strip layout nothing has rendered since, with `wireSidebarDisclosure` returning null and no error anywhere).
 What did NOT move is the pivot — a driving row is a **place** (a tracked city, or a plan area covering none), so no column declares a `group`, `theadHtml` still emits its flat single `<tr>`, and there are no Δ cells and no provider scope.
 The sidebar and the pivot were separable, and only one of them was ever about providers.
 
@@ -152,10 +153,12 @@ The sorted-column distribution strip (`renderDistributionStrip`, `formatStripSum
 An alternative layout nothing renders is one nothing tests either, and the strip in particular carried a live footgun: `histogramBuckets` took a `domain = null` default that scaled the axis to the values, which is exactly right for a strip describing the rows in view and exactly wrong for a slider whose handles must not move under the reader's hand — the two-axes bug above was one call site away the whole time.
 `domain` is now required, and there is one axis rule instead of two.
 
-**What was NOT deleted, and why: `type: "range"`.**
-No page declares one today, but `histogram-range`'s markup embeds `range`'s two number inputs verbatim, and the unit tests that make `histogram-range` trustworthy assert it against a plain `range` TWIN in unset/pass/parse/serialize rather than against typed expectations.
-Removing `range` would mean removing the comparison that pins them as one value shape.
-`isRangeType` has to accept both regardless.
+**A third had none either, and the argument for keeping it did not survive review: `type: "range"`.**
+The case for keeping the bar-less flavour warm was that the tests making `histogram-range` trustworthy asserted it against a plain `range` TWIN in unset/pass/parse/serialize, so deleting `range` would delete the comparison pinning them as one value shape.
+That was wrong in a way worth recording: every one of those parity assertions dispatches through `isRangeType` FIRST, so `f(hist) === f(plain)` compared a branch against itself and could not fail.
+The twins are replaced by typed expectations (the `min~max` wire format written out, not compared), the shared test fixture now declares `histogram-range` like the real pages do, and the render branch, `.control-range` CSS and second `isRangeType` arm are deleted.
+What survives is the three per-page assertions that each numeric filter IS a `histogram-range` — more load-bearing now than before, since a descriptor left saying `range` no longer renders two number inputs, it falls off the end of `controlsHtml`'s type partition and renders as a **checkbox** for a `{min, max}` value.
+`isRangeType` itself stays as a one-arm predicate: it names why nine call sites are grouped (they reason about the value, not the widget).
 
 ## Site navigation + street-coverage discoverability
 

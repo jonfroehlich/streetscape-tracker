@@ -1,7 +1,7 @@
 /* driving.css — styles unique to the Driving page (driving.html).
  *
- * The page reuses data-table.css for the table, controls and distribution
- * strip; only the verdict pills, the archive-provenance block and the
+ * The page reuses data-table.css for the table, the filter sidebar and the
+ * controls in it; only the verdict pills, the archive-provenance block and the
  * unwatched-areas summary are page-specific.
  *
  * Colour note: the four tones below are the same family the rest of the site

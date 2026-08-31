@@ -1316,16 +1316,21 @@ def test_driving_takes_the_sidebar_without_taking_the_pivot(page: Page, base_url
     """driving.html shares the chassis, the filter sidebar and the histogram
     filters with grid/streets — but NOT the pivot. Its rows are places, not
     cities-with-a-column-per-provider, so no column declares a `group` and the
-    header stays a single <tr>. That makes this the only page exercising
-    theadHtml's flat branch in a real browser, which is why the assertion lives
-    here rather than being folded into the shared parametrized tests above."""
+    header stays a single <tr>. That makes this the only page whose DEFAULT
+    render exercises theadHtml's flat branch, which is why the assertion lives
+    here rather than being folded into the shared parametrized tests above.
+
+    Not the branch's only caller, though: it keys off the visible columns, so
+    grid.html reaches it too once every grouped column is unchecked (see
+    test_unchecking_every_optional_column_actually_empties_the_table). Deleting
+    the branch with a future pivoted driving.html would break those pages."""
     errors = _capture_errors(page)
     page.goto(f"{base_url}/driving.html")
     expect(page.locator("#driving-table-wrap")).to_be_visible()
 
-    # Shared: the sidebar and a real histogram on the coverage filter.
+    # Shared: the sidebar. (The coverage histogram itself is covered for all
+    # three pages by test_the_table_pages_replaced_the_strip_with_per_filter_histograms.)
     expect(page.locator(".table-sidebar")).to_have_count(1)
-    expect(page.locator('.control-histogram[data-histogram="cov"]')).to_have_count(1)
 
     # Not shared: the pivot's grouped header, and no Δ cells to go with it —
     # a difference between providers is only a question a pivoted row can ask.
@@ -1333,11 +1338,29 @@ def test_driving_takes_the_sidebar_without_taking_the_pivot(page: Page, base_url
     expect(page.locator("#driving-thead tr")).to_have_count(1)
     expect(page.locator("#driving-tbody td.delta-cell")).to_have_count(0)
 
-    # Re-sorting is still just a sort: the strip that used to repoint itself at
-    # the newly sorted column is gone from the whole site.
+    # Re-sorting is still just a sort — and the assertions have to be POSITIVE
+    # ones. The strip this replaced was what made a driving.html header click
+    # observable (it retargeted itself at the newly sorted column); with the
+    # strip gone site-wide, asserting its absence after a click says nothing
+    # about the click, and inert header buttons would pass.
+    rows = page.locator("#driving-tbody tr")
+    expect(page.locator('th[data-key="label"]')).to_have_attribute("aria-sort", "ascending")
     page.locator('th[data-key="coveragePct"] button').click()
-    expect(page.locator("#distribution-strip")).to_have_count(0)
-    expect(page.locator(".strip-bar")).to_have_count(0)
+    expect(page.locator('th[data-key="coveragePct"]')).to_have_attribute("aria-sort", "descending")
+    expect(page.locator('th[data-key="label"]')).to_have_attribute("aria-sort", "none")
+    assert "sort=coveragePct" in page.url and "dir=desc" in page.url
+
+    # ...and the ROWS moved, not just the header glyph: the leading row's own
+    # coverage figure has to reverse with the direction. Read off the cell
+    # rather than matching city names, so the assertion survives a fixture that
+    # gains a city.
+    def leading_coverage():
+        return float(rows.first.locator(".coverage-value").first.inner_text().rstrip("%"))
+
+    most_covered = leading_coverage()
+    page.locator('th[data-key="coveragePct"] button').click()
+    expect(page.locator('th[data-key="coveragePct"]')).to_have_attribute("aria-sort", "ascending")
+    assert leading_coverage() < most_covered
 
     assert errors == []
 
@@ -1457,6 +1480,67 @@ def test_filter_sidebar_sits_beside_the_table_and_collapses_on_narrow_screens(
     expect(page.locator(".sidebar-disclosure > summary")).to_be_hidden()
 
     assert errors == []
+
+
+@pytest.mark.parametrize(
+    "path,artifact",
+    [
+        ("grid.html", "cities.json.gz"),
+        ("streets.html", "streetwalks.json.gz"),
+        ("driving.html", "driving_plan.json.gz"),
+    ],
+)
+def test_a_page_with_nothing_published_shows_no_empty_sidebar(page: Page, base_url, path, artifact):
+    """Fail the page's own artifact and it must render the status line ALONE.
+
+    Not a defensive branch: every one of these is a real state of a real
+    deployment — driving.html before its first `scheduler fetch-driving-plan`,
+    streets.html before the first road walk, plus a transient 404 on any of
+    them. The sidebar is a `position: sticky` full-viewport-height white card,
+    so an unconditional one meant a viewport-tall empty panel beside a
+    one-line "nothing published yet" message, and an empty `aria-label`led
+    landmark for anyone navigating by landmark.
+
+    The fix is in the chassis rather than in the three pages: `.table-layout`
+    is authored `hidden` and only `createTableControls` clears it, and every
+    empty/error path returns before reaching it."""
+    errors = _capture_errors(page)
+
+    def fail_artifact(route):
+        route.fulfill(status=404, body=b"nothing published")
+
+    page.route(f"**/streetscape-tracker/data/{artifact}", fail_artifact)
+    page.set_viewport_size({"width": 1440, "height": 900})
+    page.goto(f"{base_url}/{path}")
+
+    status = page.locator(".table-status")
+    expect(status).to_be_visible()
+    expect(status).not_to_have_text("")
+    # No sidebar, no landmark, no filters.
+    expect(page.locator(".table-sidebar")).to_have_count(0)
+    expect(page.locator('aside[aria-label="Search and filters"]')).to_have_count(0)
+    expect(page.locator("#table-search")).to_have_count(0)
+    expect(page.locator("tbody tr")).to_have_count(0)
+
+    # The page head is still there: this is an empty state, not a broken page.
+    expect(page.locator(".page-head h1")).to_be_visible()
+
+    # The `hidden` attribute specifically, asserted on the attribute rather
+    # than through to_be_hidden(): an unrendered layout has no content, so it
+    # collapses to zero height and Playwright calls it hidden either way. What
+    # must hold is that it is DECLARED hidden and stays that way — otherwise a
+    # later page that authors trailing content inside .table-content (as
+    # driving.html does, with its revision history and limits sections) gets a
+    # 20px-gap grid column and a sticky sidebar slot around it.
+    assert page.locator(".table-layout").get_attribute("hidden") is not None
+    assert (
+        page.evaluate("() => getComputedStyle(document.querySelector('.table-layout')).display")
+        == "none"
+    ), "the [hidden] attribute lost to the layout's own display: grid"
+
+    # A 404 on driving_plan.json.gz is logged by driving.js on purpose, and
+    # streets.html's cities.json.gz path warns; neither is a page error.
+    assert [e for e in errors if "404" not in e and "Error loading" not in e] == []
 
 
 def test_driving_page_joins_the_plan_against_observed_imagery(page: Page, base_url):

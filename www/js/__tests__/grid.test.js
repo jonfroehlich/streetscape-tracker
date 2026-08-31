@@ -576,6 +576,10 @@ test("GRID_FILTERS: numeric filters read best-across-providers, and are histogra
   assert.equal(byKey.cov.field, "pctBest");
   assert.equal(byKey.age.field, "medianAgeBest");
   assert.equal(byKey.dcov.field, "deltaPct");
+  // `histogram-range` is the only numeric-window type now that the bar-less
+  // `range` is deleted, so this is not a style check: a descriptor left saying
+  // `range` falls off the end of controlsHtml's partition and renders as a
+  // CHECKBOX for a `{min, max}` value.
   for (const key of ["cov", "age", "dcov"]) {
     assert.equal(byKey[key].type, "histogram-range", `${key} is not a histogram filter`);
   }

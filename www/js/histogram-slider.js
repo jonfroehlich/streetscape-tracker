@@ -1,6 +1,9 @@
 /**
  * histogram-slider.js — a mini histogram with a dual-handle range brush, used
- * as the numeric filter control on the pivoted data-table pages (issue #250).
+ * as THE numeric filter control on every data-table page (issue #250). Not
+ * only the pivoted ones: driving.html is deliberately unpivoted (its rows are
+ * places, not cities-with-a-column-per-provider) and loads three of these, and
+ * the bar-less alternative it used to render is deleted.
  *
  * WHY this replaces the min/max number inputs as the primary control, and why
  * it replaces the distribution strip rather than joining it:
@@ -36,7 +39,13 @@
  * Depends on globals from table-utils.js (loaded first): formatCellNumber.
  */
 
-/** How many bars a histogram-slider draws. Matches the strip's cap. */
+/**
+ * How many bars a histogram-slider draws.
+ *
+ * Inherited from the sorted-column distribution strip this replaced, which
+ * capped itself here; the strip is gone, and the figure survives on its own
+ * merits — 24 bars is about as fine as a 280px sidebar column resolves.
+ */
 const HISTOGRAM_SLIDER_BUCKETS = 24;
 
 /**

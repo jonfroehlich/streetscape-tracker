@@ -417,12 +417,16 @@ test("every plan-status filter value is one the row models can actually produce"
 });
 
 test("DRIVING_FILTERS: numeric filters are histogram sliders over real row fields", () => {
-  // The same contract grid.js and streets.js carry. A `range` descriptor still
-  // renders (two number inputs, no picture), so a filter that silently stayed
-  // plain would look deliberate rather than broken — and on THIS page the bars
-  // are load-bearing: most rows are plan areas we do not track, whose observed
-  // fields are all null, so the histogram is what says how few of the ~3,800
-  // rows a coverage window can match at all.
+  // The same contract grid.js and streets.js carry, and it got MORE
+  // load-bearing when the bar-less `range` type was deleted: `histogram-range`
+  // is now the only numeric window, so a descriptor left saying `range` no
+  // longer renders two number inputs — it falls off the end of controlsHtml's
+  // partition and renders as a CHECKBOX, silently, on a filter whose value
+  // shape is `{min, max}`.
+  //
+  // On THIS page the bars are load-bearing besides: most rows are plan areas we
+  // do not track, whose observed fields are all null, so the histogram is what
+  // says how few of the ~3,800 rows a coverage window can match at all.
   const row = drivingRowModel(ADDIS, TODAY);
   const area = planAreaRowModel(CHUBUT, TODAY);
   for (const filter of DRIVING_FILTERS) {
@@ -432,7 +436,26 @@ test("DRIVING_FILTERS: numeric filters are histogram sliders over real row field
     // Both row KINDS have to carry the field, or a domain seeded from the full
     // row set would read `undefined` off every untracked area.
     assert.ok(filter.field in area, `filter ${filter.key} is absent from a plan-area row`);
+    // `unit`/`digits` are not cosmetic here: histogram-slider.js is the ONLY
+    // reader of them, and it is the control that speaks to assistive tech.
+    // The `aria-valuetext` it builds is `formatCellNumber(v, digits ?? 0) +
+    // (unit ?? "")`, so an undeclared pair makes a thumb on the 0-12 yrs axis
+    // (0.2 steps) announce "0", "0", "1" while the column renders "0.2 yrs",
+    // and makes every bucket tooltip read "0-0: 12 rows". The plain `range`
+    // renderer these three came from never read either field, so nothing
+    // caught the omission when they were switched over.
+    assert.equal(typeof filter.digits, "number", `filter ${filter.key} declares no digits`);
+    assert.equal(typeof filter.unit, "string", `filter ${filter.key} declares no unit`);
   }
+});
+
+test("DRIVING_FILTERS: each numeric axis is announced in its own units", () => {
+  const units = new Map(
+    DRIVING_FILTERS.filter((f) => f.field).map((f) => [f.key, [f.unit, f.digits]])
+  );
+  assert.deepEqual(units.get("cov"), ["%", 1]);
+  assert.deepEqual(units.get("street"), ["%", 1]);
+  assert.deepEqual(units.get("since"), [" yrs", 1]);
 });
 
 test("planAreaRowModel: names the row by the districts it covers", () => {

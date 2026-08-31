@@ -120,7 +120,9 @@ const tableControlGlobals = {
   defaultFilterValues: "readonly",
   parseTableState: "readonly",
   serializeTableState: "readonly",
-  histogramBuckets: "readonly",
+  // No `histogramBuckets`: it is table-controls.js's own, used only inside the
+  // file and `require`d by the unit tests. Declaring it here said a page
+  // script reads it, and none does.
   controlsHtml: "readonly",
   createTableControls: "readonly",
   syncSidebarDisclosure: "readonly",
@@ -199,6 +201,13 @@ module.exports = [
     // The exploration chassis (issue #188): consumes histogram-slider.js's
     // component and defines the tableControlGlobals. Node export shim
     // (`module`) for the unit tests.
+    //
+    // Deliberately NOT given tableGlobals: this file's last table-utils.js
+    // dependency (formatCellNumber) went to histogram-slider.js, and `no-undef`
+    // is the only thing enforcing the load order the docblock claims. Left
+    // spread here, a new table-utils use would slip in silently — and
+    // table-controls.js is loaded before table-utils.js on no page today, but
+    // nothing but this list would notice if one changed.
     files: ["js/table-controls.js"],
     languageOptions: {
       ecmaVersion: 2022,
@@ -207,7 +216,6 @@ module.exports = [
         ...globals.browser,
         ...vendorGlobals,
         ...sharedGlobals,
-        ...tableGlobals,
         ...histogramSliderGlobals,
         module: "readonly",
       },

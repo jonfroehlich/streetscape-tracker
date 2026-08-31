@@ -562,6 +562,8 @@ const DRIVING_FILTERS = [
     field: "coveragePct",
     min: 0,
     max: 100,
+    unit: "%",
+    digits: 1,
   },
   {
     key: "street",
@@ -570,6 +572,8 @@ const DRIVING_FILTERS = [
     field: "streetPct",
     min: 0,
     max: 100,
+    unit: "%",
+    digits: 1,
   },
   {
     key: "since",
@@ -579,6 +583,8 @@ const DRIVING_FILTERS = [
     // No declared max: how stale the stalest place is, is a property of the
     // data rather than of the metric, so the axis takes it from the rows.
     min: 0,
+    unit: " yrs",
+    digits: 1,
   },
   {
     key: "enabled",
