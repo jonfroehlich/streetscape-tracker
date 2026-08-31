@@ -41,6 +41,7 @@ from streetscape_metadata_tracker.naming import (
     streetwalk_coverage_filename,
 )
 from streetscape_street_analyzer import collect
+from streetscape_street_analyzer import census_walk
 from streetscape_street_analyzer import collect_mapillary as cm
 from tests.conftest import stamp_census_cache
 
@@ -502,6 +503,13 @@ def test_both_providers_can_walk_the_same_city_on_the_same_night(tmp_path, monke
 
 
 # --- The pure join helper ---------------------------------------------------
+#
+# The join moved to census_walk with #258 (it touches only lon/lat/is_pano, so
+# it was already provider-agnostic) and is addressed there now. The tests stay
+# here, driven by a real MAPILLARY census: the behaviours below -- closest of
+# each kind, chunk-invariance, empty inputs -- are properties of the join, and
+# exercising them against an actual provider census is what makes them evidence
+# rather than a restatement of the implementation.
 
 
 def _ids(census, positions):
@@ -516,7 +524,7 @@ def test_nearest_images_to_samples_picks_the_closest_of_each_kind():
     far_pano = _image("p_far", 44.05015, -121.3000)  # ~17 m away
     near_flat = _image("f_near", 44.050005, -121.3000, is_pano=False)
     census = records_to_census([far_pano, near_pano, near_flat])
-    panos, flats = cm.nearest_images_to_samples(samples, census, 25.0)
+    panos, flats = census_walk.nearest_images_to_samples(samples, census, 25.0)
     assert _ids(census, panos) == ["p_near"]
     assert _ids(census, flats) == ["f_near"]
 
@@ -540,11 +548,13 @@ def test_chunked_join_matches_a_single_shot_join(monkeypatch):
     match_dist = 5.0
     census = records_to_census(images)
 
-    monkeypatch.setattr(cm, "_JOIN_CHUNK_SIZE", 10_000)  # one block
-    whole_panos, whole_flats = cm.nearest_images_to_samples(samples, census, match_dist)
+    monkeypatch.setattr(census_walk, "_JOIN_CHUNK_SIZE", 10_000)  # one block
+    whole_panos, whole_flats = census_walk.nearest_images_to_samples(samples, census, match_dist)
 
-    monkeypatch.setattr(cm, "_JOIN_CHUNK_SIZE", 7)  # boundaries at 7, 14, 21
-    chunked_panos, chunked_flats = cm.nearest_images_to_samples(samples, census, match_dist)
+    monkeypatch.setattr(census_walk, "_JOIN_CHUNK_SIZE", 7)  # boundaries at 7, 14, 21
+    chunked_panos, chunked_flats = census_walk.nearest_images_to_samples(
+        samples, census, match_dist
+    )
 
     assert _ids(census, chunked_panos) == _ids(census, whole_panos)
     assert _ids(census, chunked_flats) == _ids(census, whole_flats)
@@ -556,10 +566,12 @@ def test_chunked_join_matches_a_single_shot_join(monkeypatch):
 
 def test_nearest_images_to_samples_handles_empty_inputs():
     one_image = records_to_census([_image("p", 44.05, -121.3)])
-    no_samples = cm.nearest_images_to_samples([], one_image, 25.0)
+    no_samples = census_walk.nearest_images_to_samples([], one_image, 25.0)
     assert all(len(m) == 0 for m in no_samples)
     # An empty census leaves every sample unmatched rather than raising.
-    no_images = cm.nearest_images_to_samples([(44.05, -121.3, 0, 0)], records_to_census([]), 25.0)
+    no_images = census_walk.nearest_images_to_samples(
+        [(44.05, -121.3, 0, 0)], records_to_census([]), 25.0
+    )
     assert all(list(m) == [-1] for m in no_images)
 
 
