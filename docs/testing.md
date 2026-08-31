@@ -329,9 +329,10 @@ a scoped BOOLEAN resolving its `test` rather than only its wording, and
 — the one that catches a typo'd `base`
 — **every field a scoped filter can resolve to asserted to exist on a real row model**, for every provider in the registry, since a field that resolves to nothing filters nothing and looks like a working control.
 e2e: one row per city with a populated Δ and an absent-provider em-dash beside it, a Δ header click, the network selector's round-trip including a cold `?network=all_public` reload, a keyboard-only `ArrowRight` moving the rows AND the precision input AND the URL together, the crossfilter rule (a search redraws a slider's bars, its own brush does not),
-the sidebar beside the table at 1440px and collapsing at 600px and **re-opening on widening**, the column picker's self-contained `pickerLabel`s and the header collapsing back to ONE row when every optional column is unchecked, one test retargeted at driving.html pinning that its strip, its single-row header and its horizontal controls all survive;
+the sidebar beside the table at 1440px and collapsing at 600px and **re-opening on widening**, the column picker's self-contained `pickerLabel`s and the header collapsing back to ONE row when every optional column is unchecked;
 every per-provider cell of a row opening THAT provider's series while the Δ cells open nothing and a provider with no run here stays plain;
-and the layout asks themselves as outcomes rather than word counts — the table's first row and the search box both above the fold at 1440×900, the long prose present but closed, and the sidebar sticky, painted, and taller than 85% of the viewport;
+and the layout asks themselves as outcomes rather than word counts — the table's first row and the search box both above the fold at 1440×900, the long prose present but closed, and the sidebar sticky, painted, and taller than 85% of the viewport
+— all four of those layout tests parametrized over **all three** table pages once driving.html joined the sidebar (see below), so a page cannot quietly opt out of the shape;
 and the scope end to end in a browser
 — the unscoped legend naming its quantifier, a scope change clearing the window from all three of its carriers at once (rows, URL, precision input), the axis re-seeding to the scoped provider's range, both labels following it, a scoped window returning no rows where best-across would have returned a city whose own Mapillary number contradicts the filter,
 and a `?provider=&age=` link surviving a cold load rather than being cleared on arrival.
@@ -345,7 +346,43 @@ The two column/model seam tests (`every sortable column key exists on a row mode
 Six domains, including the three measured ones, a domain spanning zero, a sub-unit one and a degenerate one, each asserted to contain the data, to land on a whole number of steps (which is what makes both ends reachable at all), to overshoot by less than one step, and to agree with the `min`/`max`/`step` attributes the browser actually snaps against
 — the property, rather than one fixture's incidental span.
 Beside it: that `setDomain` hands back the SNAPPED axis rather than echoing its argument (an echo is exactly the two-axes bug), that a re-seeded axis re-normalizes the window it is holding, and that `destroy()` really aborts the one signal every listener was attached with — which is also what stops that method being untested API surface.
-Three smaller pins: a grouped leaf's header button carrying `pickerLabel` as `aria-label` **while a descriptor without one emits no `aria-label` at all** (driving.html's markup must not move);
+Three smaller pins: a grouped leaf's header button carrying `pickerLabel` as `aria-label` **while a descriptor without one emits no `aria-label` at all** (driving.html declares none, and its header markup must not move);
 `walkChangeCellHtml` rendering an exact zero unsigned and grey, matching `deltaCellHtml` one column over, while still signing a real direction;
 and `updateStreetsCaption` formatting its counts at a scale where the separator shows, since the fixture's own counts are single digits and would pass either way.
 And that aggregate records with no `city_id` stay DISTINCT rows with a warning rather than collapsing into one shared "Unknown" — latent, since the published v3 aggregate always carries one, which is exactly why it needed a test rather than a reader's trust.
+
+### driving.html joined the sidebar (issue #188 follow-up)
+
+**The four shared layout e2e tests are parametrized over all three table pages** — that parametrization is described with the rest of the #250 e2e list above, and this is the entry that says WHY driving.html is in it: the pages are one shape, and a page that drifts off it now fails a test another page wrote.
+driving.html is the tightest case on the first-screen budget, since it renders the archive-provenance callout above the layout as well as the page head, which is exactly why it is worth having in the list rather than exempted from it.
+
+**One test stayed page-specific, and its subject changed:** `test_driving_takes_the_sidebar_without_taking_the_pivot`.
+driving.html shares the chassis, the sidebar and the histograms but NOT the pivot — its rows are places, so no column declares a `group` — which makes it the only page rendering `theadHtml`'s flat single-`<tr>` branch **by default** in a real browser, and the only place a Δ-cell count of zero means anything.
+That branch is a data-shape rule (`!visible.some((column) => column.group)`), not a driving.html feature, so it is emphatically not driving.html's to own: `test_unchecking_every_optional_column_actually_empties_the_table` already watches grid.html collapse to the same single `<tr>` with zero `th.th-group` once every grouped column is unchecked.
+Saying "only caller" here would invite a later PR to delete the branch along with a pivoted driving.html, and break grid/streets in a state only the advisory e2e job covers.
+It replaced `test_distribution_strip_survives_on_the_driving_page`, whose premise (the strip was removed from two pages, not from the chassis) stopped being true — and the replacement's **header-click assertions had to be rewritten to be positive ones**.
+The strip was what made a driving.html header click observable, because it retargeted itself at the newly sorted column; with the strip gone site-wide, asserting its absence after a click says nothing about the click, and inert header buttons passed.
+It now asserts `aria-sort` moving to the clicked column and off the old one, the `?sort=`/`?dir=` pair in the URL, and the first row actually changing between the two directions.
+
+**Tests were deleted only where their subject was**, and it is worth being explicit about which:
+`bucketCountFor`, `medianOf`, `formatStripSummary` and the three `renderDistributionStrip` cases went with the strip itself.
+The `histogramBuckets` cases were rewritten rather than dropped — the helper survives, but its axis is now the caller's in every case, so the self-scaling assertions became fixed-domain ones and the "without a domain, nothing moves" test had nothing left to say.
+`controlsHtml`'s inline-order test went with the `layout` option; the sidebar-order test lost its `layout: "sidebar"` argument and kept every assertion, and it is still worth reading for the reason its fixture declares filters in a DIFFERENT order than they render in.
+`controlsHtml: renders no sorted-column distribution strip` went too, for the opposite reason to the rest: its subject was already gone, and a `doesNotMatch(/distribution-strip/)` against a file that no longer contains the string cannot fail.
+So did the two `histogram-range` PARITY tests, which asserted `f(hist) === f(plainRange)` at every value-shaped call site — every one of those sites dispatches through `isRangeType` first, so both arguments took the same branch and the comparison was vacuous.
+Their content survives as typed expectations (the `min~max` wire format written out rather than compared), and the shared fixture in `table-controls.test.js` now declares `histogram-range`, the only numeric-window type left.
+
+**Added:** `DRIVING_FILTERS: numeric filters are histogram sliders over real row fields`, the contract grid.js and streets.js already carried.
+It asserts the field exists on **both** driving row kinds — a tracked city and a plan area — because the axis is seeded from the full row set, and a field present only on cities would read `undefined` off every untracked area without failing anything.
+It also pins each filter's `unit` and `digits`, which `histogram-slider.js` is the only reader of and which the plain `range` renderer these three came from never read: without them a thumb on the 0–12 yrs axis announces "0", "0", "1" for 0.2/0.4/0.6 while the column renders `0.2 yrs`, and every bucket tooltip reads "0–0: 12 rows".
+The type half of that assertion got MORE load-bearing when `type: "range"` was deleted: a descriptor left saying `range` no longer renders two working number inputs, it falls off the end of `controlsHtml`'s type partition and renders as a **checkbox** for a `{min, max}` value.
+
+**Added:** `test_a_page_with_nothing_published_shows_no_empty_sidebar`, parametrized over each page and the artifact that page cannot render without.
+The empty state is a real state of a real deployment — driving.html before its first `fetch-driving-plan`, streets.html before the first road walk, plus a transient 404 on any of the three — and the sidebar being an unconditional `position: sticky` full-viewport-height white card meant a viewport-tall empty panel beside a one-line "nothing published yet", with an `aria-label`led landmark holding nothing.
+It asserts the **attribute**, `hidden`, and the computed `display: none` separately, and both halves were confirmed to fail on their own: an unrendered layout has no content, so it collapses to zero height and Playwright's `to_be_hidden()` passes either way, and `display: grid` is an author declaration that beats the UA stylesheet's `[hidden]` rule unless `.table-layout[hidden]` says otherwise.
+The reveal lives in `createTableControls` rather than in the three pages, because every empty/error path returns before reaching it — so the page that is added next cannot forget it.
+
+Two more chassis-level pins came with the same work.
+`foldSearchTerms` is asserted to agree with `matchesSearch` on the same queries, because folding the query once per pass instead of once per row is only an optimization if the two spellings cannot diverge.
+And the per-row search haystack cache is asserted to be keyed by the **field list**, not just the row object — a cache ignoring the field list would serve one caller's haystack to a caller asking about different columns, which is a wrong answer rather than a slow one.
+

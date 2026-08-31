@@ -94,9 +94,8 @@ const tableGlobals = {
 
 // Symbols histogram-slider.js DEFINES (issue #250). Loaded between
 // table-utils.js (whose formatCellNumber it consumes) and table-controls.js,
-// which instantiates the component. Only grid.html and streets.html load it —
-// driving.html has no histogram-range filter, so table-controls.js reaches
-// these names only when one exists.
+// which instantiates the component. All three table pages load it — every
+// numeric filter on the site is a histogram-range.
 const histogramSliderGlobals = {
   HISTOGRAM_SLIDER_BUCKETS: "readonly",
   sliderStepFor: "readonly",
@@ -108,7 +107,7 @@ const histogramSliderGlobals = {
 };
 
 // Symbols table-controls.js DEFINES and the table pages CONSUME (issue
-// #188). Loaded after table-utils.js, whose formatCellNumber it consumes.
+// #188). Loaded after histogram-slider.js, which it instantiates.
 const tableControlGlobals = {
   foldForSearch: "readonly",
   matchesSearch: "readonly",
@@ -122,10 +121,9 @@ const tableControlGlobals = {
   defaultFilterValues: "readonly",
   parseTableState: "readonly",
   serializeTableState: "readonly",
-  histogramBuckets: "readonly",
-  medianOf: "readonly",
-  formatStripSummary: "readonly",
-  renderDistributionStrip: "readonly",
+  // No `histogramBuckets`: it is table-controls.js's own, used only inside the
+  // file and `require`d by the unit tests. Declaring it here said a page
+  // script reads it, and none does.
   controlsHtml: "readonly",
   createTableControls: "readonly",
   syncSidebarDisclosure: "readonly",
@@ -201,9 +199,16 @@ module.exports = [
     rules: browserRules,
   },
   {
-    // The exploration chassis (issue #188): consumes table-utils.js's
-    // formatCellNumber and defines the tableControlGlobals. Node export shim
+    // The exploration chassis (issue #188): consumes histogram-slider.js's
+    // component and defines the tableControlGlobals. Node export shim
     // (`module`) for the unit tests.
+    //
+    // Deliberately NOT given tableGlobals: this file's last table-utils.js
+    // dependency (formatCellNumber) went to histogram-slider.js, and `no-undef`
+    // is the only thing enforcing the load order the docblock claims. Left
+    // spread here, a new table-utils use would slip in silently — and
+    // table-controls.js is loaded before table-utils.js on no page today, but
+    // nothing but this list would notice if one changed.
     files: ["js/table-controls.js"],
     languageOptions: {
       ecmaVersion: 2022,
@@ -212,7 +217,6 @@ module.exports = [
         ...globals.browser,
         ...vendorGlobals,
         ...sharedGlobals,
-        ...tableGlobals,
         ...histogramSliderGlobals,
         module: "readonly",
       },
@@ -220,10 +224,10 @@ module.exports = [
     rules: browserRules,
   },
   {
-    // The two table pages (issues #99/#155 and the grid table): consume the
-    // streetscape-utils.js, table-utils.js and table-controls.js globals and,
-    // like the files above, carry a Node export shim (`module`) so their pure
-    // helpers can be unit-tested.
+    // The three table pages (issues #99/#155, the grid table and the driving
+    // join): consume the streetscape-utils.js, table-utils.js and
+    // table-controls.js globals and, like the files above, carry a Node export
+    // shim (`module`) so their pure helpers can be unit-tested.
     files: ["js/streets.js", "js/grid.js", "js/driving.js"],
     languageOptions: {
       ecmaVersion: 2022,

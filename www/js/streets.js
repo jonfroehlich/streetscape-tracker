@@ -852,8 +852,6 @@ function renderStreetWalks(manifest, rawCities) {
     presets: buildStreetPresets(columns),
     filters: buildStreetFilters(providers),
     searchFields: STREET_SEARCH_FIELDS,
-    layout: "sidebar",
-    showDistributionStrip: false,
     onChange: (shown, all, state) => updateStreetsCaption(shown, all, manifest, state),
   });
   streetsControls.setRows(rows);

@@ -705,6 +705,10 @@ test("STREET_FILTERS: 'Has Δ' asks whether ANY provider walked this row twice",
 });
 
 test("STREET_FILTERS: numeric filters are histogram sliders over real row fields", () => {
+  // `histogram-range` is the only numeric-window type now that the bar-less
+  // `range` is deleted, so this is not a style check: a descriptor left saying
+  // `range` falls off the end of controlsHtml's partition and renders as a
+  // CHECKBOX for a `{min, max}` value.
   const row = rowsFor(SEATTLE_GSV_WALK, SEATTLE_MAPILLARY_WALK)[0];
   for (const filter of STREET_FILTERS) {
     if (!filter.field) continue;

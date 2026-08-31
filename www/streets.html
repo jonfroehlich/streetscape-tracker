@@ -37,7 +37,7 @@
        target="_blank" rel="noopener">About &#8599;</a>
   </header>
 
-  <main class="streets-main streets-main--wide">
+  <main class="streets-main">
     <div class="page-head">
       <h1>Street-level coverage</h1>
       <p class="page-lead">
@@ -88,18 +88,13 @@
       Loading street-level collections…
     </div>
 
-    <!-- Sidebar + table (issue #250); see grid.html for the <details>
-         rationale — the two pages share one shape and one stylesheet. -->
-    <div class="table-layout with-sidebar">
-      <aside class="table-sidebar" aria-label="Search and filters">
-        <details class="sidebar-disclosure" open>
-          <summary>Filters</summary>
-          <!-- Search, filters and the column preset/picker are rendered into
-               this container by table-controls.js once the data has loaded
-               (issue #188). -->
-          <div id="streets-controls" class="controls-region"></div>
-        </details>
-      </aside>
+    <!-- Sidebar + table (issue #250); see grid.html for the `hidden` and
+         <details> rationale — all three table pages share one shape, one
+         stylesheet and one chassis-emitted sidebar. -->
+    <div class="table-layout" hidden>
+      <!-- Search, filters and the column preset/picker are rendered into this
+           container by table-controls.js once the data has loaded (#188). -->
+      <div id="streets-controls" class="controls-region"></div>
 
       <div class="table-content">
         <div id="streets-table-wrap" class="streets-table-wrap" hidden>
