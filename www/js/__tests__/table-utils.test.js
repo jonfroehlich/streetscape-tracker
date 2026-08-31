@@ -20,6 +20,7 @@ const {
   rowHtmlFromColumns,
   createSortableTable,
   providerColumnGroup,
+  anyImageryLeafTitle,
 } = require("../table-utils.js");
 
 // --- cityDisplayLabel (canonical copy; streets.js's cityLabel aliases it) ---
@@ -459,4 +460,36 @@ test("providerColumnGroup: a leafTitle returning nothing falls back to the group
   const leaves = leavesOf({ leafTitle: (p) => (p === "gsv" ? "only gsv" : undefined) });
   assert.equal(leaves[0].title, "only gsv");
   assert.equal(leaves[1].title, "The group's own tooltip");
+});
+
+test("anyImageryLeafTitle: the branch is the registry flag, the clause is the caller's", () => {
+  // Lives here rather than in either page because BOTH call it: grid.js's
+  // any-imagery column and streets.js's two. Copying the branch is how the
+  // misattribution spread in the first place (#295/#296 review), so the test
+  // for it is shared too.
+  const restore = global.PROVIDERS.gsv.hasFlatImagery;
+  try {
+    global.PROVIDERS.gsv.hasFlatImagery = true;
+    assert.equal(
+      anyImageryLeafTitle("gsv", "Equals grid coverage"),
+      "Includes Google Street View's flat/perspective imagery as well as its 360° panoramas"
+    );
+    global.PROVIDERS.gsv.hasFlatImagery = false;
+    assert.equal(
+      anyImageryLeafTitle("gsv", "Equals grid coverage"),
+      "Equals grid coverage: Google Street View publishes 360° panoramas only"
+    );
+    // The equivalence clause is the caller's half — the two pages divide by
+    // different denominators (grid points vs street-km), which is why it is a
+    // parameter rather than a constant inside the helper.
+    assert.match(
+      anyImageryLeafTitle("gsv", "Equals the 360° street-km number"),
+      /^Equals the 360° street-km number: /
+    );
+  } finally {
+    global.PROVIDERS.gsv.hasFlatImagery = restore;
+  }
+  // An unregistered provider names itself by key rather than rendering
+  // "undefined publishes 360° panoramas only".
+  assert.match(anyImageryLeafTitle("nosuch", "Equals grid coverage"), /: nosuch publishes/);
 });

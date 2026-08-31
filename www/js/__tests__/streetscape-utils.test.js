@@ -246,16 +246,22 @@ test("every registered provider declares the two fields the pivoted tables rende
   }
 });
 
-test("a census provider's pano count is read unfiltered, and KartaView is one", () => {
-  // The counting model and the copyright filter have to agree: a census
-  // provider publishes no copyright-filtered subset, so pano_count must come
-  // from unique_panos. Pins the pair rather than either alone -- KartaView
-  // declared hasCopyrightFilter correctly while declaring no model at all.
-  for (const [key, p] of Object.entries(PROVIDERS)) {
-    if (p.panoCountingModel === "census") {
-      assert.equal(p.hasCopyrightFilter, false, key);
-    }
-  }
+test("KartaView is declared a census, the way it is actually collected", () => {
+  // The specific value, not just "one of the two": the sweep enumerates every
+  // image in the circle rather than picking a nearest one per grid point, so
+  // its counts are unbounded by the grid and must not be subtracted from GSV's
+  // sampled ones. Krabi reads 52,224 KartaView panos against 18,784 sampled
+  // GSV ones, which is exactly the subtraction the "(census)" parenthetical
+  // exists to stop.
+  //
+  // What is deliberately NOT asserted here (#296 review): that a census
+  // provider never declares hasCopyrightFilter. The two fields are orthogonal
+  // capabilities -- how panos are COUNTED, and whether the provider publishes
+  // a copyright field -- and today's three entries only happen to correlate
+  // them. Pinning that would force the first census provider with a copyright
+  // field to either fail CI or mis-declare itself, and the failure would read
+  // as "your registry entry is wrong". The real coupling, that pano_count
+  // follows hasCopyrightFilter, is pinned behaviourally above.
   assert.equal(PROVIDERS.kartaview.panoCountingModel, "census");
 });
 

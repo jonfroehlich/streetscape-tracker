@@ -80,6 +80,7 @@ const tableGlobals = {
   coverageCellHtml: "readonly",
   coverageCellParts: "readonly",
   providerShortLabel: "readonly",
+  anyImageryLeafTitle: "readonly",
   SCOPE_MULTI: "readonly",
   scopedProvider: "readonly",
   scopedNumericFilter: "readonly",

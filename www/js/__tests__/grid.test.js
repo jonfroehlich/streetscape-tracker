@@ -12,9 +12,28 @@ const assert = require("node:assert/strict");
 // pair fails here rather than the day one is really registered (issue #225).
 // It deliberately carries no shortLabel/panoCountingModel, which is what the
 // caller-side fallbacks are for.
+//
+// The capability flags are NOT optional decoration here. Both tooltip
+// branches are guarded by one (`hasFlatImagery`, `hasCopyrightFilter`), so a
+// stub that omits them leaves the true branch unevaluated and the
+// cross-provider sweep below green against a hardcoded provider name —
+// mutation-verified, and the gap the #296 review found in the first version
+// of that sweep.
 global.PROVIDERS = {
-  gsv: { label: "Google Street View", shortLabel: "GSV", panoCountingModel: "sample" },
-  mapillary: { label: "Mapillary", shortLabel: "Mapillary", panoCountingModel: "census" },
+  gsv: {
+    label: "Google Street View",
+    shortLabel: "GSV",
+    panoCountingModel: "sample",
+    hasCopyrightFilter: true,
+    hasFlatImagery: false,
+  },
+  mapillary: {
+    label: "Mapillary",
+    shortLabel: "Mapillary",
+    panoCountingModel: "census",
+    hasCopyrightFilter: false,
+    hasFlatImagery: true,
+  },
   thirdparty: { label: "Third Party" },
 };
 global.coverageColor = (pct) => `coverage(${pct})`;
@@ -560,25 +579,82 @@ test("the Panoramas leaf says HOW each provider counts, and the group title name
   assert.match(groupTitle, /NOT comparable/);
 });
 
-test("no per-provider leaf tooltip names a DIFFERENT provider", () => {
+test("the Panoramas leaf discloses the copyright filter, driven by the flag", () => {
+  // The two numbers in a GSV row have DIFFERENT copyright denominators:
+  // `panos_gsv` is adaptCityRecord's `unique_google_panos` (the official-fleet
+  // subset), while `pct_gsv` counts every PRESENT grid point regardless of who
+  // shot it. The group title used to disclose that ("official © Google panos
+  // for GSV") and lost it when the enumeration was rewritten into a rule
+  // (#296 review), leaving the page silent about a filter it applies.
+  //
+  // Sets the flag rather than reading whatever the registry declares, so the
+  // clause is pinned to the CONDITION and not to gsv happening to be the only
+  // filtered provider today.
+  const titleFor = (hasCopyrightFilter) => {
+    const restore = global.PROVIDERS.mapillary.hasCopyrightFilter;
+    try {
+      global.PROVIDERS.mapillary.hasCopyrightFilter = hasCopyrightFilter;
+      return buildGridColumns(["mapillary"]).find((c) => c.key === "panos_mapillary").title;
+    } finally {
+      global.PROVIDERS.mapillary.hasCopyrightFilter = restore;
+    }
+  };
+  assert.match(titleFor(true), /official-fleet/i);
+  assert.match(titleFor(true), /different denominators/i);
+  assert.doesNotMatch(titleFor(false), /official-fleet/i);
+  // The counting-model half survives the clause rather than being replaced by it.
+  assert.match(titleFor(true), /every 360° panorama found in the search area/);
+
+  // And it is live on the shipped registry, where gsv is the filtered one.
+  assert.match(
+    buildGridColumns(["gsv"]).find((c) => c.key === "panos_gsv").title,
+    /official-fleet/i
+  );
+});
+
+test("no per-provider leaf tooltip names a DIFFERENT provider, on ANY capability branch", () => {
   // The defect this pins (#295): `title: groupTitle` gave every leaf one
   // shared string, so "flat/perspective imagery (Mapillary)" was attached to
   // KartaView's any-imagery column — whose flat imagery is in fact the larger
   // half of its data. Checked across the whole registry so adding a provider
   // cannot reintroduce it.
+  //
+  // Swept over the CAPABILITY FLAGS as well as the providers, which is what
+  // makes it a guard rather than a spot check (#296 review). Every tooltip
+  // that could name a provider is behind one of these two flags, so a sweep
+  // reading the registry's own values evaluates one branch per provider and
+  // leaves the other free to hardcode a name — mutation-verified: with the
+  // real flags, planting "(Mapillary)" in the flat-imagery branch survives,
+  // because the only provider reaching that branch IS Mapillary. Forcing the
+  // flags means every provider is tested through every branch.
   const providers = ["gsv", "mapillary", "thirdparty"];
   const names = { gsv: /GSV|Google Street View/, mapillary: /Mapillary/, thirdparty: /Third Party/ };
-  for (const col of buildGridColumns(providers)) {
-    const owner = providers.find((p) => col.key.endsWith(`_${p}`));
-    if (!owner) continue; // Δ and the shared grid-geometry columns own no provider.
-    for (const [other, pattern] of Object.entries(names)) {
-      if (other === owner) continue;
-      assert.doesNotMatch(
-        col.title ?? "",
-        pattern,
-        `${col.key} tooltip names ${other}: ${col.title}`
-      );
+  const saved = providers.map((p) => ({ ...global.PROVIDERS[p] }));
+  try {
+    for (const hasFlatImagery of [false, true]) {
+      for (const hasCopyrightFilter of [false, true]) {
+        for (const p of providers) {
+          Object.assign(global.PROVIDERS[p], { hasFlatImagery, hasCopyrightFilter });
+        }
+        const where = `hasFlatImagery=${hasFlatImagery} hasCopyrightFilter=${hasCopyrightFilter}`;
+        for (const col of buildGridColumns(providers)) {
+          const owner = providers.find((q) => col.key.endsWith(`_${q}`));
+          if (!owner) continue; // Δ and the shared grid-geometry columns own no provider.
+          for (const [other, pattern] of Object.entries(names)) {
+            if (other === owner) continue;
+            assert.doesNotMatch(
+              col.title ?? "",
+              pattern,
+              `[${where}] ${col.key} tooltip names ${other}: ${col.title}`
+            );
+          }
+        }
+      }
     }
+  } finally {
+    providers.forEach((p, i) => {
+      global.PROVIDERS[p] = saved[i];
+    });
   }
 });
 

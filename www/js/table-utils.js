@@ -138,6 +138,40 @@ function providerShortLabel(provider) {
 }
 
 /**
+ * Leaf tooltip for an "any imagery" column, derived from the registry rather
+ * than from a provider name.
+ *
+ * Shared by grid.js and streets.js because the branch is the same on both
+ * pages and only the equivalence clause differs — one place to fix, rather
+ * than a fix that lands on one page and leaves the other reading the old
+ * sentence, which is exactly the state the #296 review found.
+ *
+ * The defect it replaces (#295): a group title naming ONE provider
+ * ("Including flat/perspective imagery (Mapillary)") is hung verbatim on
+ * every leaf, so KartaView's column — whose flat imagery is the LARGER half
+ * of its data (Yogyakarta: 1,071,155 flat images against 16,913 panos) — was
+ * credited to Mapillary, and GSV's, which publishes no flat imagery at all,
+ * carried the same sentence.
+ *
+ * @param {string} provider - A PROVIDERS key.
+ * @param {string} sameAs - What the number equals for a 360°-only provider,
+ *   as a sentence opener: the two pages have different denominators
+ *   ("Equals grid coverage" vs "Equals the 360° street-km number"), so the
+ *   caller owns that half and this owns the branch.
+ * @returns {string}
+ *
+ * @example
+ *   anyImageryLeafTitle("gsv", "Equals grid coverage");
+ *   // "Equals grid coverage: Google Street View publishes 360° panoramas only"
+ */
+function anyImageryLeafTitle(provider, sameAs) {
+  const label = PROVIDERS[provider]?.label ?? provider;
+  return PROVIDERS[provider]?.hasFlatImagery
+    ? `Includes ${label}'s flat/perspective imagery as well as its 360° panoramas`
+    : `${sameAs}: ${label} publishes 360° panoramas only`;
+}
+
+/**
  * A signed difference cell, for the pivoted pages' cross-provider Δ columns.
  *
  * Deliberately NOT colored green/red by sign. In a coverage group a positive Δ
@@ -585,6 +619,7 @@ if (typeof module !== "undefined" && module.exports) {
     coverageCellHtml,
     coverageCellParts,
     providerShortLabel,
+    anyImageryLeafTitle,
     SCOPE_MULTI,
     scopedProvider,
     scopedNumericFilter,

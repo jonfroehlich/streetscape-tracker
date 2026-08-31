@@ -288,8 +288,11 @@ function buildStreetColumns(providers = walkProviders()) {
       providers,
       id: "cov",
       groupLabel: "360° street-km (%)",
+      // States the rule rather than counting who is in the group: this string
+      // is also every leaf's default tooltip, so "Both providers" was already
+      // one collected provider away from being false (#296 review).
       groupTitle:
-        "Share of street-km covered by 360° imagery. Both providers walk the SAME sample " +
+        "Share of street-km covered by 360° imagery. Every provider walks the SAME sample " +
         "points on the same frozen network, so these are directly comparable.",
       keyFor: (p) => `pct_${p}`,
       cellFor: (p) => (row) => coverageCellParts(row[`pct_${p}`], { compact: true }),
@@ -307,9 +310,16 @@ function buildStreetColumns(providers = walkProviders()) {
       providers,
       id: "covAny",
       groupLabel: "Any imagery (%)",
+      // Same misattribution grid.js carried until #295: one shared string
+      // naming ONE provider was hung verbatim on every leaf. Left unfixed
+      // here it would have re-landed the moment the KartaView road-walk
+      // collector (#258) published its first walk, on the provider whose flat
+      // imagery is the larger half of its data (#296 review).
       groupTitle:
-        "Including flat/perspective imagery; equals the 360° number for Google Street View",
+        "Share of street-km covered by imagery of ANY kind — 360° panoramas plus flat/" +
+        "perspective images, for a provider that publishes both",
       keyFor: (p) => `pctAny_${p}`,
+      leafTitle: (p) => anyImageryLeafTitle(p, "Equals the 360° street-km number"),
       cellFor: (p) => (row) => coverageCellParts(row[`pctAny_${p}`], { compact: true }),
       linkFor: walkProviderLink,
       initial: "desc",
@@ -388,6 +398,11 @@ function buildStreetColumns(providers = walkProviders()) {
       groupLabel: "Covered km (any)",
       groupTitle: "Kilometres of street covered by any imagery, including flat/perspective",
       keyFor: (p) => `lengthKmCoveredAny_${p}`,
+      // The same any-imagery branch as covAny above, one column further right
+      // and in kilometres rather than percent: a 360°-only provider's two
+      // covered-km columns are identical numbers, and the tooltip is the only
+      // thing saying why.
+      leafTitle: (p) => anyImageryLeafTitle(p, "Equals the 360° covered km"),
       cellFor: (p) => (row) => ({
         html:
           row[`lengthKmCoveredAny_${p}`] == null
