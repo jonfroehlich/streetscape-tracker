@@ -59,8 +59,8 @@ Deferred: `leisure=park` polygon attribution (the honest way to ask "park covera
 
 ## Road-walk: both providers, and scheduled
 
-**Road-walk: both providers, and scheduled.** `collect.py` takes `--provider {gsv,mapillary}`;
-both walk the SAME deterministic sample points from the same frozen network, so their coverage percentages are directly comparable — but they reach imagery very differently.
+**Road-walk: three providers, all scheduled.** `collect.py` takes `--provider {gsv,kartaview,mapillary}`;
+all three walk the SAME deterministic sample points from the same frozen network, so their coverage percentages are directly comparable — but they reach imagery very differently.
 GSV issues one metadata request per sample location (Seattle: 247k).
 **Mapillary has no per-point endpoint at all**: `collect_mapillary.py` reads the z14 tile census once (`download_mapillary.fetch_city_images_async`, extracted so both the grid run and the road walk share the identical fetch/decode) and joins it onto the sample points locally via `gpd.sjoin_nearest` on `estimate_utm_crs()`
 — the same idiom the grid-attribution path uses, so **no new dependency** (there is no scipy).
@@ -70,6 +70,9 @@ Either way it is orders of magnitude below GSV's one-request-per-sample-point, w
 Each provider meters against its own `api_usage` channel (`gsv_streets` / `kartaview_streets` / `mapillary_streets`), so a road walk can never exhaust a grid collector's quota.
 Two of the three also isolate the **credential**: `gsv_streets` and `mapillary_streets` require their own key, because a walk and a grid run of those providers can be in flight at once and would otherwise burn one quota in parallel.
 `kartaview_streets` deliberately does not — it falls back to `KARTAVIEW_ACCESS_TOKEN` when `KARTAVIEW_STREETS_ACCESS_TOKEN` is unset, because one machine-wide `host_lock(HOST_KARTAVIEW)` serializes every KartaView request in the repo, so there is no parallel burn to isolate; on a paired night the walk reuses the grid run's census and spends nothing at all.
+It is a **scheduled, opt-in** channel as of #258, enrolled separately from `kartaview` (`enroll-city CITY --channel kartaview_streets`) and ranked immediately after it so the grid sweep is the one that pays.
+**KartaView's walk is priced like Mapillary's, not GSV's**: a radius sweep of the frozen bbox, independent of spacing.
+The first one measured it — Krabi, 2026-08-31, 18,851 samples over 2,144 edges scored from **87 sweep requests**, against 18,851 for the same walk on `gsv_streets`, for slightly HIGHER coverage (85.4% of street-km vs GSV's 82.9%).
 The Mapillary arm emits #116's status vocabulary at sample level
 — `OK`/`NO_DATE` for a 360° pano in range, `FLAT_ONLY` (null capture_date) when only flat imagery is, `ZERO_RESULTS` otherwise
 — which `compute_streetwalk_coverage` turns into **two numbers per edge**: `coverage_fraction` (360°) and `coverage_fraction_any`, summarized as `coverage_pct_by_length[_any]`.
