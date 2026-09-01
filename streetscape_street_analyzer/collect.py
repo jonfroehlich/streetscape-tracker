@@ -722,10 +722,11 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Imagery provider to walk (default: gsv). Each is metered against "
             "its own isolated street budget channel (gsv_streets / "
-            "mapillary_streets); gsv costs one request per sample point, "
-            "mapillary reads a tile census whose cost depends on the city's "
-            "bbox area (catalog median 12 tiles, max 870) but not on spacing. "
-            "Use --estimate to price a city before spending."
+            "kartaview_streets / mapillary_streets); gsv costs one request per "
+            "sample point, while mapillary reads a tile census and kartaview a "
+            "radius sweep — both priced by the city's bbox area, not by "
+            "spacing, and both free when the paired grid run already cached "
+            "that census. Use --estimate to price a city before spending."
         ),
     )
     parser.add_argument(
@@ -863,9 +864,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Today's FULL ceiling for this provider's street budget channel "
-            "(gsv_streets / mapillary_streets). Abort when the ledger's spend "
-            "so far plus this collection's estimated requests would exceed it — "
-            "pass the whole daily budget, not what is left of it"
+            "(gsv_streets / kartaview_streets / mapillary_streets). Abort when "
+            "the ledger's spend so far plus this collection's estimated "
+            "requests would exceed it — pass the whole daily budget, not what "
+            "is left of it"
         ),
     )
     parser.add_argument("--data-dir", default=get_default_data_dir(), help="Data directory")

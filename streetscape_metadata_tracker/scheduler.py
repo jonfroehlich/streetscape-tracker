@@ -107,8 +107,16 @@ from .walk_diff import compute_and_record_walk_diff
 # a different subprocess (the road-walk collector) against a different
 # credential. The map is channel -> imagery provider, which is what lands in
 # street_walks and the published artifacts.
+#
+# This one entry is what most of the wiring below reads: `_street_collect_cmd`
+# takes the child's `--provider` from it, `channel_census_cache_marker` derives
+# which census a channel would reuse from it, and `is_street_channel` is it. A
+# channel added here without the decisions in CHANNEL_HOSTS and
+# CHANNEL_DEFAULT_MEMBERSHIP is a red test, not a channel that runs half-wired
+# (both are asserted as set EQUALITY against KNOWN_PROVIDERS | STREET_CHANNELS).
 STREET_CHANNELS = {
     "gsv_streets": "gsv",
+    "kartaview_streets": "kartaview",
     "mapillary_streets": "mapillary",
 }
 
@@ -132,12 +140,24 @@ CHANNEL_HOSTS: dict[str, tuple[str, ...]] = {
     "gsv_streets": (HOST_OVERPASS,),
     "mapillary": (HOST_MAPILLARY_TILES,),
     "mapillary_streets": (HOST_OVERPASS, HOST_MAPILLARY_TILES),
-    # kartaview shares its host with nothing, which is why it is the channel
-    # that moves the effective concurrency ceiling from 3-of-4 to 4-of-5.
+    # kartaview shares its host with nothing, which is why it was the channel
+    # that moved the effective concurrency ceiling from 3-of-4 to 4-of-5.
     # test_every_scheduled_channel_declares_its_per_ip_hosts asserts set
     # EQUALITY against KNOWN_PROVIDERS, so a token landing without an entry
     # here is a red test rather than a channel that silently fails open.
     "kartaview": (HOST_KARTAVIEW,),
+    # The walk needs BOTH: it starts at the city's OSM street network and then
+    # sweeps kartaview.org for the census it joins against. Overpass is not
+    # hypothetical here even though a re-walk reads a cached GraphML — a FIRST
+    # walk of a city always goes to the network, the same reason gsv_streets
+    # declares it.
+    #
+    # Adding it does NOT lower the effective concurrency ceiling, and the
+    # arithmetic is worth stating because the figure is a property of this
+    # graph rather than a constant: the largest host-disjoint set is gsv (no
+    # host) + ONE of the three Overpass channels + mapillary (tiles) +
+    # kartaview (KV) = 4. So 4 of 6 now, where it was 4 of 5.
+    "kartaview_streets": (HOST_OVERPASS, HOST_KARTAVIEW),
 }
 
 # What a NULL `schedule_state.member` means for each channel (issue #248), i.e.
@@ -162,12 +182,21 @@ CHANNEL_HOSTS: dict[str, tuple[str, ...]] = {
 # kartaview is False because one pass over all 1,144 enabled cities prices at
 # ~186,000 requests ≈ 186 h (docs/experiments/kartaview-sweep-cost.md), and
 # stalest-first ordering knows nothing about cost.
+#
+# kartaview_streets is False for the same arithmetic and then some: a road walk
+# reads the SAME sweep the grid run reads, so a whole-catalog pass prices at
+# another ~186,000 requests — and it buys nothing the grid run has not already
+# paid for whenever the two are paired. Opting a city in is therefore a
+# statement that its STREET coverage is wanted, which is a different question
+# from whether its grid coverage is, and is why this is a second enrollment
+# rather than a mirror of [providers.kartaview]'s.
 CHANNEL_DEFAULT_MEMBERSHIP: dict[str, bool] = {
     "gsv": True,
     "gsv_streets": True,
     "mapillary": True,
     "mapillary_streets": True,
     "kartaview": False,
+    "kartaview_streets": False,
 }
 
 
@@ -454,12 +483,25 @@ class SchedulerConfig:
         every one was reasoned from prose adjacent to this docstring instead of
         from the code it describes, which was ~200 lines away the whole time.
         """
+        # kartaview_streets ranks immediately AFTER kartaview, and that adjacency
+        # is a COST decision rather than tidiness. The two read one observation:
+        # whichever runs first pays the sweep and promotes it into the shared
+        # census cache (#290), and the second then prices at 0 through
+        # `_channel_estimate`. Ordering the walk before the grid run would work
+        # equally well arithmetically — the saving is symmetric — but it would
+        # put the multi-hour sweep behind a channel that can be deferred by host
+        # affinity, so the grid run keeps the earlier slot and the walk inherits
+        # a paid-for census. Separating them (anything ranked between) is the
+        # only ordering that is actually wrong here, because the truncation
+        # argument above applies to BOTH and a night that reaches one but not
+        # the other pays full price on the next.
         rank = {
             "gsv": 0,
             "gsv_streets": 1,
             "mapillary": 2,
             "mapillary_streets": 3,
             "kartaview": 4,
+            "kartaview_streets": 5,
         }
         return sorted(
             (p for p, pc in self.providers.items() if pc.enabled),
@@ -934,10 +976,17 @@ def estimate_requests(
                 street_km *= _BROAD_NETWORK_MULTIPLIER
             return max(1, int(street_km * 1000.0 / max(1, spacing_m)))
         return estimate_street_samples(conn, city, spacing_m, network_type)
-    if provider == "kartaview":
+    if provider in ("kartaview", "kartaview_streets"):
         # A paginated radius sweep priced by bbox area, NOT the grid formula
         # below: the lattice covers a median catalog city in ~12 circles where
         # the grid formula would read tens of thousands of points (#238).
+        #
+        # Both KartaView channels read the IDENTICAL sweep, the way both
+        # Mapillary channels read the identical tile census — the walk has no
+        # per-sample endpoint, it joins the census locally. So the walk's cost
+        # tracks bbox area and is independent of `--spacing`, and pricing it off
+        # the sample count would have read 18,851 requests for a Krabi walk the
+        # sweep covers in 64 circles.
         return estimate_kartaview_requests(conn, city)
     return (city.grid_width_m // city.step_m + 1) * (city.grid_height_m // city.step_m + 1)
 
@@ -1357,12 +1406,25 @@ def city_timeout_seconds(
     # is 575. The derivation stays because a grid can be re-registered larger at
     # any time, and a SIGKILL costs the requests already spent AND counts a
     # failure — the guard must not depend on today's geometry staying capped.
-    if provider not in ("gsv", "gsv_streets", "mapillary", "mapillary_streets", "kartaview"):
+    if provider not in (
+        "gsv",
+        "gsv_streets",
+        "mapillary",
+        "mapillary_streets",
+        "kartaview",
+        "kartaview_streets",
+    ):
         return clamp(floor)
     pc = (cfg.providers or {}).get(provider)
     if provider in ("mapillary", "mapillary_streets"):
         return clamp(_mapillary_timeout_seconds(city, provider, pc, floor))
-    if provider == "kartaview":
+    if provider in ("kartaview", "kartaview_streets"):
+        # Same sweep, same derivation. Deliberately NOT discounted for a cache
+        # hit: `estimate_requests` stays cache-blind precisely so this timeout
+        # does, because a walk that finds no reusable census must still be
+        # given time to fetch one, and a 0 here would collapse it onto the
+        # fixed floor — the exact failure #238's arm exists to prevent, arrived
+        # at from the other direction.
         return clamp(_kartaview_timeout_seconds(city, pc, floor, conn))
     rate = (pc.max_requests_per_minute if pc else None) or cfg.max_requests_per_minute
     if rate <= 0:
@@ -3032,6 +3094,19 @@ def _street_collect_cmd(
         # own default, which is itself jittered.
         if pc.jitter is not None:
             cmd += ["--mapillary-jitter", str(pc.jitter)]
+    elif channel == "kartaview_streets":
+        # The child MUST be told the pace this channel's timeout was derived
+        # from. _kartaview_timeout_seconds divides the sweep estimate by the
+        # configured rate, so a child left on the collector's own default would
+        # be measured against a rate it never used — one of the four fail-open
+        # arms #238 closed for the grid channel, and it would land here intact
+        # if this arm were left out. Unset means the collector's default, and
+        # then the timeout derivation reads the same default.
+        if pc.max_requests_per_minute is not None:
+            cmd += [
+                "--kartaview-max-requests-per-minute",
+                str(pc.max_requests_per_minute),
+            ]
     # '--' so a display name can never be parsed as a flag
     cmd += ["--", city.display_name]
     return cmd

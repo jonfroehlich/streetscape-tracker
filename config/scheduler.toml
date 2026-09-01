@@ -337,6 +337,48 @@ daily_request_budget = 10000
 # re-reading that function silently shortens every sweep's timeout too.
 max_requests_per_minute = 16
 
+# KartaView road walk (issue #258) — the SECOND opt-in channel, and the same
+# arithmetic as the block above: declaring it enrols nobody, because a
+# whole-catalog pass is another ~186,000 requests. Opt a city in with
+#   scheduler enroll-city CITY --channel kartaview_streets
+#
+# It is enrolled SEPARATELY from [providers.kartaview] rather than following it,
+# because "we want this city's street coverage" is a different question from
+# "we want its grid coverage" — and because schedule_state.member has exactly
+# one meaning for NULL (use CHANNEL_DEFAULT_MEMBERSHIP), which a channel that
+# read another channel's enrollment would quietly make three.
+#
+# WHAT IT COSTS: on a night where [providers.kartaview] already ran this city,
+# nothing. Both channels read one sweep of one bbox, the grid run promotes it
+# into the shared census cache (#290), and `_channel_estimate` prices the walk
+# at 0 — which is also why kartaview_streets is ranked immediately after
+# kartaview in enabled_providers(). Un-paired, it pays a full sweep, which is
+# what this budget has to cover.
+#
+# The credential is the one street channel that FALLS BACK: it reads
+# KARTAVIEW_STREETS_ACCESS_TOKEN if set and KARTAVIEW_ACCESS_TOKEN otherwise.
+# The other two street channels isolate a quota two processes could burn in
+# parallel; here one machine-wide host lock serializes every KartaView request
+# in the repo, so there is no parallel burn to isolate.
+[providers.kartaview_streets]
+enabled = true
+# Mirrors [providers.kartaview] — the SAME sweep priced the same way, and the
+# same #273/#274 caveat applies with full force: this is a FLOOR TO CLEAR, not
+# a ceiling on the night's spend, so a city whose estimate exceeds it is
+# skipped permanently rather than deferred. Re-check it before enrolling a
+# metro, and read the tier caveat above the grid channel's figure first.
+daily_request_budget = 10000
+# Must match the pace the timeout is derived from: _kartaview_timeout_seconds
+# divides the sweep estimate by this rate, and _street_collect_cmd passes it to
+# the child as --kartaview-max-requests-per-minute so the two cannot disagree.
+# Not additive with [providers.kartaview]'s: one host lock, so the two channels
+# never talk to kartaview.org at the same moment.
+max_requests_per_minute = 16
+# Match the other two street channels so all three walk the same sample points
+# and land on one comparable streets.html row.
+spacing_m = 15
+network_type = "drive"
+
 [download]
 # Conservative defaults; see cli.py docstring for tuning guidance.
 batch_size = 100
