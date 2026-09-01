@@ -31,6 +31,15 @@ already gone wrong once:
   The load-bearing pin is `test_run_row_carries_every_runs_column`: `_row_to_run` builds `RunRow(**dict(row))` from a `SELECT *`, so a column without a matching dataclass field is a `TypeError` on every `get_latest_run` against a migrated catalog, not a missing feature.
 - An end-to-end migration test with synthetic fixtures
 
+## City registration manifests (issue #110, and the purposive additions)
+
+`tests/test_register_frame.py` pins the bulk-registration safety rails — overlap reuse, `enabled = 0` until vetted, the GeoNames center guard against a province-centroid geocode, dry-run-by-default writing nothing, idempotent re-runs — with the geocoding seam monkeypatched, so no network.
+It pins `--notes-label` by MUTATING it rather than by asserting the default: a case that only read `cities.notes` after a default run would stay green while the flag was dropped on the floor, and that label is how the vetting and enable steps select one batch out of the catalog.
+
+`tests/test_mapillary_360_cities_manifest.py` IS the provenance of `mapillary_360_cities.csv`.
+The city list is curated, but its values are a GeoNames join keyed by `geonameid` and there is no generator script to name in a `generated_by`, so the test re-runs that join in reverse: city, admin, country, continent, population and coordinates must match the vendored records, and `query_string` must equal what `build_worldwide_frame.query_string` writes, so a query here behaves exactly like a frame query at the geocoder.
+The `city_id`s are pinned as **literals** deliberately — registration freezes them into filenames and published URLs, so a change in `db.derive_city_id` or `naming.sanitize_city_query_str` must break a test instead of quietly renaming a city — and the single deliberate departure from GeoNames' ASCII names (`Malmoe` -> `Malmo`) is a named constant rather than an unexplained mismatch.
+
 ## `--provider` is a channel list (issue #247)
 
 `tests/test_cli_policy.py` pins the grid CLI's `--provider` flag, and (issue #290) the CLI seam of the census cache: the downloader is handed one `CensusCache` policy built by `crawl_store_for` — its path keyed on the PROVIDER (KartaView gets its own, gsv gets none), `reuse` False only under `--refetch-census` and untouched by `--force`, and the run's `run_date` riding along so a backdated snapshot refuses an entry observed after it; the `runs` row records who paid and when, a gsv run leaves both NULL, and a reused census says so in the printed summary.

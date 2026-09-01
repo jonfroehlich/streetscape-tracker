@@ -171,6 +171,46 @@ def test_execute_registers_new_city_disabled(tmp_path, catalog, fake_geocode):
     conn.close()
 
 
+def test_notes_label_identifies_the_manifest_batch(tmp_path, catalog, fake_geocode):
+    """
+    cities.notes carries the batch label, so a later reader (and the enable
+    step) can tell which manifest a registered city came from. Asserting the
+    default alone would pass even if the flag were dropped on the floor, so
+    both the default and an override are exercised.
+    """
+    manifest = tmp_path / "frame.csv"
+    write_manifest(manifest, [frame_row()])
+    assert rf.main(["--manifest", str(manifest), "--db-path", catalog, "--execute"]) == 0
+
+    other = tmp_path / "other.csv"
+    write_manifest(
+        other,
+        [frame_row(query_string="Newville, Testland", city="Newville", lat="50.0", lon="60.0")],
+    )
+    fake_geocode["center_by_query"] = {"Newville, Testland": (50.0, 60.0)}
+    assert (
+        rf.main(
+            [
+                "--manifest",
+                str(other),
+                "--db-path",
+                catalog,
+                "--execute",
+                "--notes-label",
+                "mapillary 360 leaders",
+            ]
+        )
+        == 0
+    )
+
+    conn = db.connect(catalog)
+    assert db.resolve_city(conn, "Testville, Testland").notes.startswith("worldwide frame (")
+    assert db.resolve_city(conn, "Newville, Testland").notes.startswith(
+        "mapillary 360 leaders (geonameid 42)"
+    )
+    conn.close()
+
+
 def test_center_guard_rejects_far_geocode(tmp_path, catalog, fake_geocode, capsys):
     fake_geocode["center"] = (11.0, 20.0)  # ~111 km from the GeoNames coords
     manifest = tmp_path / "frame.csv"

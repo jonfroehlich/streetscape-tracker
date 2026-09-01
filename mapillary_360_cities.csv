@@ -1,0 +1,15 @@
+query_string,city,admin,iso2,country,continent,size_band,population,coverage_regime,geonameid,lat,lon
+"Ottawa, Ontario, Canada",Ottawa,Ontario,CA,Canada,NA,,1017449,,6094817,45.41117,-75.69812
+"Melbourne, Victoria, Australia",Melbourne,Victoria,AU,Australia,OC,,5435590,,2158177,-37.814,144.96332
+"Vilnius, Lithuania",Vilnius,Vilnius,LT,Lithuania,EU,,542366,,593116,54.68916,25.2798
+"Prague, Czechia",Prague,Prague,CZ,Czechia,EU,,1165581,,3067696,50.08804,14.42076
+"Copenhagen, Capital Region, Denmark",Copenhagen,Capital Region,DK,Denmark,EU,,1153615,,2618425,55.67594,12.56553
+"Munich, Bavaria, Germany",Munich,Bavaria,DE,Germany,EU,,1505005,,2867714,48.13743,11.57549
+"Milan, Lombardy, Italy",Milan,Lombardy,IT,Italy,EU,,1371498,,3173435,45.46427,9.18951
+"Barcelona, Catalonia, Spain",Barcelona,Catalonia,ES,Spain,EU,,1686208,,3128760,41.38879,2.15899
+"Bruxelles-Capitale, Belgium",Brussels,Brussels Capital,BE,Belgium,EU,,1019022,,2800866,50.85045,4.34878
+"Malmo, Skane, Sweden",Malmo,Skane,SE,Sweden,EU,,362133,,2692969,55.60587,13.00073
+"Dar es Salaam, Tanzania",Dar es Salaam,Dar es Salaam Region,TZ,Tanzania,AF,,5383728,,160263,-6.82349,39.26951
+"Clovis, New Mexico, United States",Clovis,New Mexico,US,United States,NA,,39480,,5462393,34.4048,-103.20523
+"Johns Creek, Georgia, United States",Johns Creek,Georgia,US,United States,NA,,83335,,6331909,34.02893,-84.19858
+"Sandusky, Erie County, Ohio, United States",Sandusky,Ohio,US,United States,NA,,25212,,5170691,41.44894,-82.70796
