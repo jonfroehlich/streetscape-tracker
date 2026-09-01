@@ -324,12 +324,19 @@ enabled = true
 # r=500 costs ~4x it (Singapore, New York and Manila all do — see
 # docs/experiments/kartaview-sweep-cost.md).
 #
-# `_run_city_channels` now hands the child `budget - used` as
-# `--kartaview-max-requests`, so a sweep that would overrun stops at the
-# remainder, checkpoints, and exits 83 — amnestied, resumed tomorrow. Raising
-# this number therefore widens what a night may spend rather than only what it
-# may attempt, which is the direction to be careful in against a host that
-# meters by IP.
+# `_run_city_channels` now hands the child a `--kartaview-max-requests` cap, so
+# a sweep that would overrun stops there, checkpoints, and exits 83 —
+# amnestied, resumed tomorrow. Raising this number therefore widens what a
+# night may spend rather than only what it may attempt, which is the direction
+# to be careful in against a host that meters by IP.
+#
+# The cap is `min(budget - used, what the child's own timeout can pace)`, and
+# the second term is why this ceiling is rarely the binding one: at 16/min a
+# 10 h batch paces ~9,600 requests, and a per-city timeout is a fraction of
+# that, so the WALL CLOCK usually stops a big sweep first. That is deliberate —
+# a cap the child cannot reach inside its timeout would leave the SIGKILL as
+# the live arm, and a kill records no api_usage at all, so the night's spend
+# vanishes from this ledger and the city burns a consecutive_failure.
 daily_request_budget = 10000
 # DEFAULT_SWEEP_REQUESTS_PER_MINUTE — 960/h, under the documented 1,000/h
 # authenticated ceiling. Load-bearing beyond pacing: _kartaview_timeout_seconds
@@ -362,11 +369,13 @@ max_requests_per_minute = 16
 # in the repo, so there is no parallel burn to isolate.
 [providers.kartaview_streets]
 enabled = true
-# Mirrors [providers.kartaview] — the SAME sweep priced the same way, and the
-# same #273/#274 caveat applies with full force: this is a FLOOR TO CLEAR, not
-# a ceiling on the night's spend, so a city whose estimate exceeds it is
-# skipped permanently rather than deferred. Re-check it before enrolling a
-# metro, and read the tier caveat above the grid channel's figure first.
+# Mirrors [providers.kartaview] — the SAME sweep priced the same way, so read
+# that block's two halves as written about this one: no longer a floor a city
+# must clear (#274 launches an over-priced sweep capped rather than skipping it
+# forever), and a per-night ceiling only in the sense the cap makes it one
+# (#273), with the child's own timeout usually the tighter of the two limits.
+# Re-check it before enrolling a metro, and read the tier caveat above the grid
+# channel's figure first.
 daily_request_budget = 10000
 # Must match the pace the timeout is derived from: _kartaview_timeout_seconds
 # divides the sweep estimate by this rate, and _street_collect_cmd passes it to

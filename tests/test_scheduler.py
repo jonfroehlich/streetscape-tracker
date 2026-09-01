@@ -5901,6 +5901,138 @@ def test_a_non_resumable_channel_keeps_the_permanent_skip(conn, monkeypatch):
     assert [c for c in calls if c[1] == "kartaview"], "the sweep still launches"
 
 
+def _paced_seconds_for(requests: int, rate: int) -> float:
+    """Wall clock a paced sweep needs for `requests`, at the rate the timeout
+    assumes it will achieve. Written from the constants rather than from the
+    scheduler's own helper, so this is an independent statement of the relation
+    and not a restatement of the code under test."""
+    from streetscape_metadata_tracker.scheduler import _SWEEP_ACHIEVED_RATE_FRACTION
+
+    return requests / (rate * _SWEEP_ACHIEVED_RATE_FRACTION) * 60.0
+
+
+@pytest.mark.parametrize("channel", ["kartaview", "kartaview_streets"])
+def test_a_sweeps_cap_is_sized_to_what_its_own_timeout_can_pace(conn, monkeypatch, channel):
+    """The cap and the timeout are one decision, or the arm taken is still the kill.
+
+    #273 hands the child `budget - used` so an overrun becomes a deliberate
+    pause — exit 83, amnestied, no consecutive_failure, and the spend still
+    ledgered. A cap the child cannot physically REACH inside its own timeout
+    buys none of that. On prod (16/min, a 10 h batch, a 10,000 budget) a whole
+    night paces ~9,600 requests, so a fresh night's remainder is unreachable by
+    arithmetic and a city costing more than its timeout affords is SIGKILLed
+    first: no exit code, a consecutive_failure, a city-cap slot spent, and no
+    ledger write at all, since the child's add_api_usage calls both need it to
+    return.
+
+    Both terms are captured from the launch itself, so this asserts a RELATION
+    between the two numbers the child receives rather than re-deriving one of
+    them: the cap, paced at the rate the timeout was priced from, fits inside
+    that timeout with the fixed slack still to spare. `cap == remaining` — the
+    shape before this fix — fails it on the first assertion.
+
+    Both KartaView channels, because both are resumable and both derive their
+    timeout through the same `_kartaview_timeout_seconds` arm; a fix applied to
+    the grid channel alone would leave the walk on the kill.
+    """
+    from streetscape_metadata_tracker.scheduler import _TIMEOUT_FIXED_SLACK_S
+
+    budget, rate = 10_000, 16
+    cid = _register(conn, "Metro", width=20_000, height=20_000, step=20)
+    db.set_channel_membership(conn, cid, channel, True, cycle_days=90)
+    cfg = _sweep_cfg(publish_enabled=False)
+    cfg.providers[channel] = ProviderConfig(
+        enabled=True, daily_request_budget=budget, max_requests_per_minute=rate
+    )
+
+    calls = []
+    _run_loop_capturing_kwargs(monkeypatch, conn, cfg, calls)
+
+    sweeps = [c for c in calls if c[1] == channel]
+    assert sweeps, "the sweep must still launch — this bounds the cap, it does not skip"
+    cap, timeout_s = sweeps[0][2]["request_cap"], sweeps[0][2]["timeout_s"]
+    # Nothing has spent today, so the budget remainder IS the budget: a cap
+    # sized on the remainder alone would be 10,000 here.
+    assert cap < budget, "a cap the timeout cannot reach leaves the SIGKILL as the live arm"
+    assert _paced_seconds_for(cap, rate) + _TIMEOUT_FIXED_SLACK_S <= timeout_s, (
+        "the child must be able to pace its whole cap, and still write the "
+        "checkpoint, inside the timeout it was handed"
+    )
+
+
+def test_a_timeout_with_room_to_spare_leaves_the_cap_at_the_budget_remainder(conn, monkeypatch):
+    """The complement, and the reason the cap is a `min` rather than a swap.
+
+    The wall clock is a SECOND ceiling, not a replacement for the budget one: a
+    night whose timeout can pace far more than the budget has left must still
+    stop at the budget, or the ledger stops meaning anything and #274's floor
+    gate is measured against the wrong number. A cap sized on the clock alone
+    would read 4,000-odd here instead of 400.
+    """
+    from streetscape_metadata_tracker.scheduler import _TIMEOUT_FIXED_SLACK_S
+
+    budget, rate = 400, 16
+    cid = _register(conn, "Metro", width=20_000, height=20_000, step=20)
+    _enroll_kartaview(conn, cid)
+    # A 10-hour per-city timeout: the batch deadline clamps it, and either way
+    # it paces thousands of requests against a 400-request remainder.
+    cfg = _sweep_cfg(publish_enabled=False, city_timeout_minutes=600)
+    cfg.providers["kartaview"] = ProviderConfig(
+        enabled=True, daily_request_budget=budget, max_requests_per_minute=rate
+    )
+
+    calls = []
+    _run_loop_capturing_kwargs(monkeypatch, conn, cfg, calls)
+
+    sweeps = [c for c in calls if c[1] == "kartaview"]
+    assert sweeps, "an over-budget sweep still launches capped (#274)"
+    cap, timeout_s = sweeps[0][2]["request_cap"], sweeps[0][2]["timeout_s"]
+    assert cap == budget, "the budget remainder still binds when the clock does not"
+    # ...and it is genuinely the smaller of the two, not a coincidence: this
+    # timeout affords strictly more than the cap it was compared against.
+    assert _paced_seconds_for(cap, rate) + _TIMEOUT_FIXED_SLACK_S < timeout_s
+
+
+def test_a_cap_the_clock_puts_under_the_calibration_floor_skips_like_an_empty_budget(
+    conn, monkeypatch
+):
+    """The floor applies to the CAP, not to the budget remainder.
+
+    A sweep that cannot clear radius calibration raises a plain DownloadError —
+    nothing swept, nothing checkpointed — so it takes none of the exit-83
+    amnesty and burns a real consecutive_failure. That is just as true when the
+    wall clock is what runs out (a city started near the batch deadline, or a
+    pace this slow) as when the budget is, and the budget here is 25x the floor:
+    only a floor read against the final cap can refuse this launch.
+    """
+    from streetscape_metadata_tracker.scheduler import _MIN_SWEEP_LAUNCH_REQUESTS
+
+    cid = _register(conn, "Bend", width=1_000, height=1_000, step=20)
+    _enroll_kartaview(conn, cid)
+    # 1/min against a 60-minute timeout: ~25 requests of wall clock, under the
+    # ~34 the calibration ladder alone can cost. Stands in for the deadline
+    # clamp, which reaches the same place by shortening the timeout instead.
+    cfg = _sweep_cfg(publish_enabled=False, city_timeout_minutes=60)
+    cfg.providers["kartaview"] = ProviderConfig(
+        enabled=True,
+        daily_request_budget=_MIN_SWEEP_LAUNCH_REQUESTS * 25,
+        max_requests_per_minute=1,
+    )
+
+    calls = []
+    _run_loop_capturing_kwargs(monkeypatch, conn, cfg, calls)
+
+    assert not [c for c in calls if c[1] == "kartaview"], (
+        "launching under the floor burns a consecutive_failure to accomplish nothing"
+    )
+    # A budget decision, not a failure: the city stays due and unpunished.
+    row = conn.execute(
+        "SELECT consecutive_failures FROM schedule_state WHERE city_id = ? AND provider = ?",
+        (cid, "kartaview"),
+    ).fetchone()
+    assert row is None or row["consecutive_failures"] == 0
+
+
 def test_the_pause_log_names_how_far_the_sweep_actually_got(conn, tmp_path, monkeypatch):
     """A pause is amnestied and consumes no city-cap slot, so without this a
     multi-night sweep is invisible: the log says "resumes on the next run" every

@@ -84,9 +84,24 @@ def _image(image_id, lat, lon, *, is_pano=True, shot_date="2024-05-01", date_add
 
 
 def _setup(
-    tmp_path, monkeypatch, images, *, api_requests=9, failed_cells=None, token=None, raises=None
+    tmp_path,
+    monkeypatch,
+    images,
+    *,
+    api_requests=9,
+    failed_cells=None,
+    token=None,
+    raises=None,
+    grid_m=200,
 ):
-    """Data dir + catalog with one city; edges and the sweep served locally."""
+    """Data dir + catalog with one city; edges and the sweep served locally.
+
+    ``grid_m`` widens the FROZEN GRID without touching the street network: the
+    edges are served from memory either way, so a wider grid moves exactly one
+    number — the sweep cost estimate, which is priced from the grid's bbox. The
+    budget-gate cases below need an estimate large enough to sit above a
+    plausible budget, and the 200 m default prices at a single request.
+    """
     data_dir = str(tmp_path)
     conn = db.connect(db.get_default_db_path(data_dir))
     db.register_city(
@@ -98,8 +113,8 @@ def _setup(
         country_code="US",
         center_lat=44.05,
         center_lon=-121.30,
-        grid_width_m=200,
-        grid_height_m=200,
+        grid_width_m=grid_m,
+        grid_height_m=grid_m,
         step_m=20,
     )
     conn.close()
@@ -425,6 +440,63 @@ def test_a_sweep_that_stops_at_its_cap_exits_83_rather_than_failing(tmp_path, mo
     spent = db.get_api_usage(conn, date.fromisoformat(RUN_DATE), provider="kartaview_streets")
     conn.close()
     assert spent == 500
+
+
+def test_a_capped_walk_is_gated_on_the_cap_rather_than_the_whole_sweeps_geometry(
+    tmp_path, monkeypatch
+):
+    """The child's own --daily-budget gate has to know about the cap, or it
+    refuses exactly the launches the scheduler now makes (#273/#274).
+
+    _street_collect_cmd sends BOTH flags: the channel's full ceiling as
+    --daily-budget (this collector subtracts today's spend itself) and the
+    night's remainder as --kartaview-max-requests. The scheduler deliberately
+    stopped applying its own `est > budget` gate to a resumable channel, so a
+    metro priced above the budget is launched capped instead of skipped
+    forever. If this gate keeps pricing the WHOLE sweep from geometry, those
+    launches come back as exit 1 — a real consecutive_failure, five of which
+    quarantine the walk for a 90-day cycle, and the pause that #273 exists to
+    produce never happens.
+
+    The cap is what bounds the spend: the sweep stops there, checkpoints the
+    unvisited roots and exits 83. So `min(estimate, cap)` is the honest
+    pre-flight number, and it is asserted through the RUNNING gate rather than
+    through the command builder — the builder cannot see this failure.
+    """
+    # A 10 km grid prices at 64 sweep requests, well above the 20-request
+    # budget below; the sweep itself is still served from memory.
+    data_dir, calls = _setup(tmp_path, monkeypatch, [_image("kv1", 44.05, -121.30)], grid_m=10_000)
+
+    assert (
+        collect.run_collect(_args(data_dir, **{"daily-budget": 20, "kartaview-max-requests": 10}))
+        == 0
+    ), "a sweep capped under the budget must run, whatever the whole city would cost"
+    assert calls["n"] == 1, "the gate must not refuse before the sweep is ever reached"
+
+
+def test_an_uncapped_over_budget_walk_is_still_refused(tmp_path, monkeypatch):
+    """The complement: the cap RELAXES the gate by exactly what it bounds, and
+    nothing more.
+
+    Two ways to get this wrong, and both are silent. Dropping the gate whenever
+    a cap is present lets an uncapped-in-effect sweep (a cap larger than the
+    whole estimate) spend past the ceiling against a host that meters by IP;
+    dropping it for every provider would relax a gate the cap never reaches,
+    since --kartaview-max-requests is forwarded only to the KartaView sweep.
+    """
+    data_dir, calls = _setup(tmp_path, monkeypatch, [_image("kv1", 44.05, -121.30)], grid_m=10_000)
+    assert collect.run_collect(_args(data_dir, **{"daily-budget": 20})) == 1
+    assert calls["n"] == 0, "a refused walk must not reach the sweep"
+
+    # And a cap ABOVE the estimate bounds nothing, so the gate still binds.
+    data_dir2, calls2 = _setup(
+        tmp_path / "b", monkeypatch, [_image("kv1", 44.05, -121.30)], grid_m=10_000
+    )
+    assert (
+        collect.run_collect(_args(data_dir2, **{"daily-budget": 20, "kartaview-max-requests": 500}))
+        == 1
+    )
+    assert calls2["n"] == 0
 
 
 def test_the_walks_variant_reaches_the_fetch(tmp_path, monkeypatch):
