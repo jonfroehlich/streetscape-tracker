@@ -40,6 +40,20 @@ DATA_SOURCES = REPO_ROOT / "data_sources"
 # display name and a URL, and the slug is permanent.
 ASCII_SPELLING_OVERRIDES = {"2692969": "Malmo"}
 
+# Two cities whose GeoNames-derived query matches the WRONG OSM feature, caught
+# before registration by comparing each geocoded center against the GeoNames
+# coordinates (the 50 km --max-center-km guard sees neither):
+#   Sandusky -> "Sandusky County, Ohio", a different county ~36 km west of the
+#     city, which is in Erie County.
+#   Brussels -> the City of Brussels commune (8.7x13.1 km), about a fifth of the
+#     19-commune Brussels-Capital Region the coverage number is meant to describe.
+# An override changes only the GEOCODE query. Identity — and so the frozen
+# city_id — still comes from the GeoNames city/admin/country columns.
+QUERY_OVERRIDES = {
+    "5170691": "Sandusky, Erie County, Ohio, United States",
+    "2800866": "Bruxelles-Capitale, Belgium",
+}
+
 # Permanent slugs, frozen at registration. Order matches the manifest.
 EXPECTED_CITY_IDS = {
     "6094817": "ottawa--ontario--canada",
@@ -114,16 +128,25 @@ def test_query_strings_are_what_the_frame_generator_would_write(manifest_rows, g
     """
     Same "City, Admin, Country" construction as the worldwide frame, including
     effective_admin dropping an admin that just repeats the city name — so a
-    Nominatim query here behaves exactly like a frame query.
+    Nominatim query here behaves exactly like a frame query, except for the
+    declared QUERY_OVERRIDES.
     """
     for row in manifest_rows:
-        city = geonames.cities[row["geonameid"]]
+        gid = row["geonameid"]
+        city = geonames.cities[gid]
         record = SimpleNamespace(
             city=city._replace(name=row["city"]),
             iso2=city.iso2,
             country=row["country"],
         )
-        assert row["query_string"] == query_string(record, geonames.admin), row["geonameid"]
+        generated = query_string(record, geonames.admin)
+        if gid not in QUERY_OVERRIDES:
+            assert row["query_string"] == generated, gid
+            continue
+        assert row["query_string"] == QUERY_OVERRIDES[gid], gid
+        # An override that matches what the generator would write anyway is a
+        # lie about why it exists — and would silently stop being tested.
+        assert QUERY_OVERRIDES[gid] != generated, gid
 
 
 def test_city_ids_are_the_pinned_permanent_slugs(manifest_rows):

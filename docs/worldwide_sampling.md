@@ -194,6 +194,21 @@ Two things differ from a frame registration:
 The values in a purposive manifest are still a GeoNames join keyed by `geonameid`, not hand-typed coordinates; `tests/test_mapillary_360_cities_manifest.py` re-runs that join and is the file's provenance, since there is no generator script to name.
 It also pins the permanent `city_id`s as literals and records the one deliberate departure from GeoNames' ASCII names (`Malmoe` -> `Malmo`, because the slug outlives the spelling in filenames and published URLs).
 
+**Vet before registering, not after.** For a batch this size the cheapest vetting is to compute the geometry registration *would* freeze — `get_city_location_data` -> `resolve_center` -> `get_search_dimensions` -> `cap_dimensions`, the same four calls `register_frame_city` makes — and read two numbers per city: the grid dimensions, and the distance from the geocoded center to the manifest's GeoNames coordinates.
+That offset is the tell, and on the 2026-08-31 batch it found four cities the `--max-center-km` guard would have waved through at its default of 50 km:
+
+| City | What Nominatim matched | Offset | Fix |
+|---|---|---|---|
+| Sandusky OH | `Sandusky County, Ohio` — a *different* county, ~36 km west of the city (which is in Erie County) | 36.1 km | query override |
+| Melbourne | Greater Melbourne (153x122 km) | 34.7 km | `--center-from-geonames` |
+| Dar es Salaam | Dar es Salaam Region (102x69 km), midpoint offshore-ward | 22.6 km | `--center-from-geonames` |
+| Ottawa | the amalgamated, mostly rural City of Ottawa (87x64 km) | 19.7 km | `--center-from-geonames` |
+
+The nine cities that were fine all sat within 5.5 km, so `--max-center-km 10 --center-from-geonames` separates the two groups exactly: it recenters an over-large administrative match onto the GeoNames downtown point (the grid is clamped to 40 km/side anyway) and leaves every good geocode alone.
+That does NOT fix a *wrong-feature* match, whose dimensions come from the wrong polygon — for those, override the geocode query in the manifest (`Sandusky, Erie County, Ohio, United States`) and keep identity on the GeoNames columns, so the frozen `city_id` is unchanged.
+The same override handles the opposite failure, a match that is too SMALL: "Brussels" resolves to the City of Brussels commune (8.7x13.1 km), about a fifth of the 19-commune Brussels-Capital Region, and `Bruxelles-Capitale, Belgium` resolves to the region (16.8x16.7 km).
+`get_city_location_data` restricts structured search to settlement types, so an override phrased as a region name may match a museum instead — always re-run the four calls on the override before committing it.
+
 Vetting is the same requirement as for the frame, but the full audit chain is disproportionate for a handful of cities: read the registered rectangles back out of `cities`, and for anything that looks wrong render it with `streetscape_tracker.py "<query>" --check-boundary` and correct it with `scripts/resize_city.py` (safe only while the city has no runs).
 The trap for these cities is the opposite of the province centroid the `--max-center-km` guard catches: several have a *tiny* core municipality as their OSM boundary — the City of Brussels and the City of Melbourne LGA are both a few km across inside metros many times larger.
 

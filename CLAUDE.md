@@ -53,7 +53,7 @@ python -m streetscape_street_analyzer.collect "Seattle, WA" --network-type all_p
 # Worldwide sampling frame (docs/worldwide_sampling.md)
 python scripts/build_worldwide_frame.py
 python scripts/register_frame.py   # dry-run preview; --execute stays disabled until boundary-vetted
-python scripts/register_frame.py --manifest mapillary_360_cities.csv --overlap-km 5 --notes-label "mapillary 360 leaders"
+python scripts/register_frame.py --manifest mapillary_360_cities.csv --overlap-km 5 --max-center-km 10 --center-from-geonames --notes-label "mapillary 360 leaders"
 
 # Publish data/ to the UW Makeability Lab web server (rsync over SSH)
 ./sync_data_to_server.sh --dry-run
@@ -262,4 +262,5 @@ Keep any list a doc enumerates **alphabetical**, so two branches adding an entry
 - The **worldwide frame** ([`docs/worldwide_sampling.md`](docs/worldwide_sampling.md)) is a stratified curated set (~56 cities: continent × size-band × GSV-coverage-regime) built deterministically from vendored GeoNames data (CC BY 4.0) in `data_sources/` (not rsynced, not git-ignored, unlike `data/`); GeoNames population is used only for binning, never as a reported variable.
   Cities added for a specific reason (`mapillary_360_cities.csv`) get their OWN manifest in the same format, registered by the same script — never appended to `worldwide_frame.csv`, which must keep tracing to its generator, and never counted as frame cities.
   Such a batch needs `--notes-label` (or every city claims to be a frame city in `cities.notes`) and `--overlap-km 5`, because the default 25 km reuse radius silently ALIASES a genuine neighbour away instead of registering it.
+  **Compute each grid BEFORE registering and read the offset from the GeoNames point** — geometry is frozen, and the default 50 km center guard caught none of the four bad matches in that batch (a wrong county 36 km away, and three administrative regions whose bbox midpoint sits 20–35 km off downtown).
 - The sync-vs-async duplicate download path was removed in v2; the v1.0.0 tag preserves the old architecture.
