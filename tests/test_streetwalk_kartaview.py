@@ -24,6 +24,7 @@ import os
 from datetime import date
 
 import geopandas as gpd
+import pytest
 from shapely.geometry import LineString
 
 from streetscape_metadata_tracker import db
@@ -379,6 +380,21 @@ def test_the_request_cap_reaches_the_sweep_rather_than_only_the_budget_gate(tmp_
     data_dir2, calls2 = _setup(tmp_path / "b", monkeypatch, [_image("kv1", 44.05, -121.30)])
     assert collect.run_collect(_args(data_dir2)) == 0
     assert calls2["max_requests"] is None
+
+
+def test_the_walks_request_cap_refuses_nonpositive_values_like_the_grid_flag(tmp_path):
+    """
+    The grid CLI refuses `--kartaview-max-requests 0` at parse time, because 0
+    spends the whole calibration ladder, checkpoints roots_done=0 and exits 83
+    printing "re-run the same command to resume" -- a loop the message
+    encourages. This copy of the flag carried plain `type=int`, so the guard was
+    real on one path and absent on the other: the shape a copied argument always
+    takes (#273). Both now share download_common.positive_int.
+    """
+    for bad in ("0", "-5"):
+        with pytest.raises(SystemExit) as excinfo:
+            _args(str(tmp_path), **{"kartaview-max-requests": bad})
+        assert excinfo.value.code == 2
 
 
 def test_a_sweep_that_stops_at_its_cap_exits_83_rather_than_failing(tmp_path, monkeypatch):

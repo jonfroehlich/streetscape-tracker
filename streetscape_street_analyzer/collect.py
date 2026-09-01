@@ -86,6 +86,7 @@ from streetscape_metadata_tracker.download_common import (
     HostUnavailableError,
     host_exit_code,
     jitter_fraction,
+    positive_int,
 )
 from streetscape_metadata_tracker.download_gsv import collect_points_async
 from streetscape_metadata_tracker.download_kartaview import (
@@ -839,7 +840,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--kartaview-max-requests",
-        type=int,
+        # Not `int`: 0 here is the same trap the grid CLI refuses at parse time
+        # -- it spends the whole calibration ladder, checkpoints roots_done=0,
+        # and exits 83 telling the operator to re-run, which loops. The guard
+        # was on the grid flag and absent on this copy of it (#273).
+        type=positive_int,
         default=None,
         help=(
             "Hard ceiling on the requests this KartaView walk may issue. The "

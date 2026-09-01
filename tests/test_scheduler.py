@@ -4983,8 +4983,13 @@ def test_restore_backup_subcommand_is_wired():
 # ── Mapillary tile pacing reaches the children (issue #198) ────────────────
 
 
-def _grid_cmd(monkeypatch, tmp_path, conn, provider, cfg):
-    """Capture the argv the scheduler hands a grid subprocess."""
+def _grid_cmd(monkeypatch, tmp_path, conn, provider, cfg, **kwargs):
+    """Capture the argv the scheduler hands a grid subprocess.
+
+    ``**kwargs`` reach ``_run_one_city`` unchanged, which is how a test pins a
+    caller-supplied value like ``request_cap`` rather than only its default —
+    a flag asserted at its default lets the call site hard-code anything.
+    """
     from streetscape_metadata_tracker import scheduler as sched
 
     cid = _register(conn, "Bend", width=5000, height=5000, step=20)
@@ -5001,7 +5006,7 @@ def _grid_cmd(monkeypatch, tmp_path, conn, provider, cfg):
 
     monkeypatch.setattr(sched.subprocess, "run", fake_run)
     cfg = dataclasses.replace(cfg, log_dir=str(tmp_path))
-    assert sched._run_one_city(cfg, city, date(2026, 7, 1), provider)
+    assert sched._run_one_city(cfg, city, date(2026, 7, 1), provider, **kwargs)
     return captured["cmd"], city
 
 
@@ -5061,6 +5066,70 @@ def test_a_gsv_grid_child_never_gets_the_sweep_flag(conn, monkeypatch, tmp_path)
     cfg = SchedulerConfig(providers={"kartaview": ProviderConfig(max_requests_per_minute=8)})
     cmd, _ = _grid_cmd(monkeypatch, tmp_path, conn, "gsv", cfg)
     assert "--kartaview-max-requests-per-minute" not in cmd
+
+
+def test_a_sweep_child_gets_the_nights_remaining_budget_as_a_hard_stop(conn, monkeypatch, tmp_path):
+    """Issue #273. The budget guard is a PRE-FLIGHT check against an estimate,
+    and kartaview is the only channel whose estimate is not exact — 1.80x is a
+    median whose study max is 13.66x, on a p65 city — so before this the child
+    could spend ~7.6x what the ledger said it could afford, against a host that
+    meters by IP. The value is asserted, not just its presence: a flag pinned
+    only at its default lets the call site hard-code the wrong number."""
+    cfg = SchedulerConfig(providers={"kartaview": ProviderConfig()})
+    cmd, _ = _grid_cmd(monkeypatch, tmp_path, conn, "kartaview", cfg, request_cap=7314)
+    assert cmd[cmd.index("--kartaview-max-requests") + 1] == "7314"
+
+
+def test_an_unset_request_cap_sweeps_to_completion(conn, monkeypatch, tmp_path):
+    """Omitting the flag is the CLI's documented 'sweep to completion', which is
+    what every direct caller and manual run still wants. It must not degrade to
+    a 0 — the CLI's _positive_int refuses that at parse time, and a cap of 0
+    would spend the whole calibration ladder and checkpoint nothing."""
+    cfg = SchedulerConfig(providers={"kartaview": ProviderConfig()})
+    cmd, _ = _grid_cmd(monkeypatch, tmp_path, conn, "kartaview", cfg)
+    assert "--kartaview-max-requests" not in cmd
+
+
+def test_a_gsv_grid_child_never_gets_the_request_cap(conn, monkeypatch, tmp_path):
+    """gsv is not CHANNEL_RESUMABLE: it has no checkpoint, so a cap would turn a
+    bounded overrun into a half-collected grid that fails outright."""
+    cfg = SchedulerConfig(providers={"kartaview": ProviderConfig()})
+    cmd, _ = _grid_cmd(monkeypatch, tmp_path, conn, "gsv", cfg, request_cap=500)
+    assert "--kartaview-max-requests" not in cmd
+
+
+def test_every_scheduled_channel_declares_whether_it_is_resumable():
+    """Set EQUALITY against KNOWN_PROVIDERS, the same shape as the hosts and
+    default-membership tables, so a new channel token cannot land without
+    someone deciding this. Neither default is safe: False silently keeps a
+    resumable channel on the permanent-skip arm (#274), and True hands a cap to
+    a child that ignores it while the budget gate believes it is bounded."""
+    from streetscape_metadata_tracker.naming import KNOWN_PROVIDERS
+    from streetscape_metadata_tracker.scheduler import CHANNEL_RESUMABLE, STREET_CHANNELS
+
+    assert set(CHANNEL_RESUMABLE) == set(KNOWN_PROVIDERS) | set(STREET_CHANNELS)
+
+
+def test_only_kartaview_is_resumable_today():
+    """Mapillary checkpoints its tile census (#256) and is still False here: the
+    property is 'accepts a REQUEST CAP that pauses', and download_mapillary
+    takes only max_requests_per_minute — a pacing knob, with no stop_reason and
+    no SweepIncompleteError. Conflating the two would hand a Mapillary child a
+    budget it has no way to honour."""
+    from streetscape_metadata_tracker.scheduler import CHANNEL_RESUMABLE, is_resumable_channel
+
+    assert [c for c, v in CHANNEL_RESUMABLE.items() if v] == ["kartaview"]
+    assert is_resumable_channel("kartaview")
+    assert not is_resumable_channel("mapillary")
+
+
+def test_an_unknown_channel_is_a_keyerror_not_a_default():
+    """Read as CHANNEL_RESUMABLE[p], never .get(p, ...) — the same rule
+    CHANNEL_DEFAULT_MEMBERSHIP states, for the same reason."""
+    from streetscape_metadata_tracker.scheduler import is_resumable_channel
+
+    with pytest.raises(KeyError):
+        is_resumable_channel("nonesuch")
 
 
 def test_an_explicit_zero_disables_gsv_street_pacing_instead_of_reverting(conn):
