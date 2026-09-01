@@ -86,6 +86,7 @@ from streetscape_metadata_tracker.download_common import (
     HostUnavailableError,
     host_exit_code,
     jitter_fraction,
+    positive_int,
 )
 from streetscape_metadata_tracker.download_gsv import collect_points_async
 from streetscape_metadata_tracker.download_kartaview import (
@@ -416,14 +417,44 @@ def run_collect(args: argparse.Namespace) -> int:
             )
         if args.daily_budget is not None:
             already = db.get_api_usage(conn, run_date, provider=budget_channel)
-            if already + estimated_requests > args.daily_budget:
+            # A CAPPED sweep is gated on the cap, not on the estimate, because
+            # the cap is what it can actually spend: `--kartaview-max-requests`
+            # stops the sweep at that many requests, checkpoints the unvisited
+            # roots and exits SWEEP_INCOMPLETE_EXIT_CODE (#239/#273), so
+            # `min(estimate, cap)` is an upper bound on tonight's spend where
+            # the bare estimate is not.
+            #
+            # Without this the two halves of #273 contradict each other. The
+            # scheduler hands a resumable sweep BOTH flags -- the full ceiling
+            # as --daily-budget and the night's remainder as the cap -- and
+            # deliberately stopped applying its own `est > budget` gate to that
+            # channel, precisely so a metro priced above the budget is launched
+            # capped instead of skipped forever. Gating here on the whole
+            # sweep's geometry would refuse exactly those launches with exit 1:
+            # a real consecutive_failure, five of which quarantine the walk for
+            # a 90-day cycle. Latent on a paired night (a cached census prices
+            # at 0) and live for a walk-only enrolment, an aged cache, or the
+            # night the paired grid sweep itself pauses -- a checkpoint is not a
+            # cache entry, so the walk prices at full.
+            #
+            # Scoped to the provider the cap reaches: it is forwarded only to
+            # the KartaView sweep (see the dispatch below), so honouring it for
+            # any other provider would relax a gate nothing enforces.
+            cap = getattr(args, "kartaview_max_requests", None)
+            gated_requests = (
+                min(estimated_requests, cap)
+                if cap is not None and provider == "kartaview"
+                else estimated_requests
+            )
+            if already + gated_requests > args.daily_budget:
                 logger.error(
                     "%s daily budget %d would be exceeded: %d already spent "
-                    "+ %d estimated requests. Aborting.",
+                    "+ %d estimated requests%s. Aborting.",
                     budget_channel,
                     args.daily_budget,
                     already,
                     estimated_requests,
+                    "" if gated_requests == estimated_requests else f" (capped at {cap})",
                 )
                 return 1
 
@@ -840,7 +871,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--kartaview-max-requests",
-        type=int,
+        # Not `int`: 0 here is the same trap the grid CLI refuses at parse time
+        # -- it spends the whole calibration ladder, checkpoints roots_done=0,
+        # and exits 83 telling the operator to re-run, which loops. The guard
+        # was on the grid flag and absent on this copy of it (#273).
+        type=positive_int,
         default=None,
         help=(
             "Hard ceiling on the requests this KartaView walk may issue. The "

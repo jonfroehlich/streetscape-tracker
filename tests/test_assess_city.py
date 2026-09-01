@@ -1277,6 +1277,7 @@ def test_assess_city_inherits_the_lane_scheduler_from_the_config_knob(conn, monk
         list(ASSESS_CHANNELS),
         blocked_hosts=set(),
         busy_hosts=Counter(),
+        deferred_channels=Counter(),
         batch_deadline=None,
         stop_requested=None,
         record_failures=False,

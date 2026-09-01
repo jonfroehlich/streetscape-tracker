@@ -39,10 +39,11 @@ import time
 import tomllib
 import traceback
 from collections import Counter
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from tabulate import tabulate
 
@@ -51,9 +52,12 @@ from .alerting import AlertConfig, send_alert, should_alert
 from .checkpointing import (
     CENSUS_PROVIDERS,
     CENSUS_REUSE_MAX_AGE_S,
+    CHECKPOINT_MAX_AGE_S,
     census_cache_probe,
+    checkpoint_path_for,
     frozen_bbox,
     prune_census_cache,
+    sweep_progress,
 )
 from .city_registration import (
     MAX_GRID_DIM_M,
@@ -72,7 +76,10 @@ from .download_common import (
     redact_credentials,
 )
 from .download_kartaview import (
+    DEFAULT_BACKPRESSURE_RETRIES,
+    DEFAULT_CALIBRATION_PROBES,
     DEFAULT_SWEEP_REQUESTS_PER_MINUTE,
+    RADIUS_LADDER_M,
     estimate_sweep_requests,
 )
 from .download_mapillary import (
@@ -197,6 +204,51 @@ CHANNEL_DEFAULT_MEMBERSHIP: dict[str, bool] = {
 def is_opt_in_channel(name: str) -> bool:
     """True when this channel collects only cities explicitly enrolled in it."""
     return not CHANNEL_DEFAULT_MEMBERSHIP[name]
+
+
+# Whether a channel accepts a REQUEST CAP that pauses and checkpoints instead of
+# failing (issues #273, #274). Not "does it checkpoint at all": the two are
+# different properties and only this one makes a capped launch safe.
+#
+# mapillary and mapillary_streets checkpoint their tile census (#256), and are
+# still False here, because download_mapillary takes only
+# max_requests_per_minute -- a PACING knob. It has no request cap, no
+# stop_reason and no SweepIncompleteError, so a Mapillary census resumes after
+# an interruption it did not choose and has no way to stop itself at a number.
+# Handing one a cap would do nothing; handing it a budget it cannot honour is
+# the overrun this table exists to bound.
+#
+# Read it as CHANNEL_RESUMABLE[provider], NEVER `.get(p, ...)`, for exactly the
+# reason CHANNEL_DEFAULT_MEMBERSHIP spells out above: either default is a wrong
+# answer for a channel nobody has thought about. False would silently keep a
+# resumable channel on the permanent-skip arm; True would hand a cap to a child
+# that ignores it and let the budget gate believe it is bounded. A missing
+# entry must be a KeyError, and
+# test_every_scheduled_channel_declares_whether_it_is_resumable asserts set
+# EQUALITY so a new token cannot land without a decision. That test earned its
+# keep immediately: #299 added kartaview_streets while this was in review, and
+# the set check is what turned an unconsidered channel into a red build instead
+# of a sixth channel quietly inheriting whichever default was written here.
+#
+# BOTH KartaView channels are True, because the walk reads the same census by
+# the same radius sweep and so inherits the same defect exactly -- its
+# --daily-budget is a GATE priced from a geometric floor, not a ceiling on what
+# the sweep then spends. Marking the walk True is only honest because
+# _street_collect_cmd actually forwards the cap; a True here with nothing
+# reading it downstream is the fail-open this table was written against.
+CHANNEL_RESUMABLE: dict[str, bool] = {
+    "gsv": False,
+    "gsv_streets": False,
+    "kartaview": True,
+    "kartaview_streets": True,
+    "mapillary": False,
+    "mapillary_streets": False,
+}
+
+
+def is_resumable_channel(name: str) -> bool:
+    """True when a request cap pauses this channel's work rather than failing it."""
+    return CHANNEL_RESUMABLE[name]
 
 
 # Channels that KNOWN_PROVIDERS makes configurable but that the scheduler cannot
@@ -411,7 +463,9 @@ class SchedulerConfig:
         to absorb** — kartaview is the exception and ranks last (#238).
 
         The mechanism is the deadline CLAMP. ``remaining_s`` is read fresh at
-        every launch (one ``time.monotonic()`` per LAUNCHED channel) and
+        every launch (one ``time.monotonic()`` per LAUNCHED channel, plus one
+        per resumable channel that is priced and then skipped, since its request
+        cap is sized against the clamped timeout — see #273) and
         ``city_timeout_seconds`` clamps the derived timeout down to it, floored
         at ``_MIN_CLAMPED_TIMEOUT_S`` — so a channel launched later sees less of
         the batch deadline, and an expensive one launched late can be truncated
@@ -1024,16 +1078,50 @@ _SWEEP_ACHIEVED_RATE_FRACTION = 0.5
 # exact (grid points and tile counts both are), so it is also the only one where
 # a city can overspend what the ledger said it could afford.
 #
-# The stop for that already exists and is deliberately NOT wired here: #239's
-# `--kartaview-max-requests` pauses at a request cap and checkpoints the rest.
-# Handing it `budget - used` would turn an overrun into a resumable pause, but
-# _run_one_city has the full ceiling rather than the remainder (see its
-# `daily_budget` argument, and _street_collect_cmd on why that is the right
-# shape for the channels that subtract today's spend themselves), and the grid
-# CLI has no budget flag to hand it to instead. So it is #273, not a line here
-# -- and #274 is the policy half that depends on it (the est > budget arm skips
-# an over-budget city permanently, which is wrong for a channel that resumes).
+# THE STOP FOR THAT IS NOW WIRED (#273), so this multiplier no longer has to be
+# right for the spend to be bounded. _run_city_channels hands the child #239's
+# `--kartaview-max-requests`, and exhausting it checkpoints the rest and exits
+# 83 rather than overspending -- so the overrun this paragraph used to describe
+# is a resumable pause. The cap is the SMALLER of `budget - used` and what the
+# child's own timeout can pace (_sweep_requests_within_timeout), because the
+# ledger term alone is often unreachable: a night's paced wall clock is finite,
+# and on prod 16/min over a 10 h batch affords ~9,600 requests against a 10,000
+# budget. The number travels as `request_cap`, spelled differently from
+# `daily_budget` on purpose: the street channels' ceiling is the FULL budget
+# because that collector subtracts today's spend itself (see
+# _street_collect_cmd), and the grid CLI reads no ledger, so its number has to
+# arrive already subtracted.
+#
+# The multiplier still matters in the other direction. It is what the two
+# budget gates and the timeout are priced from, so a median used as a ceiling
+# still UNDER-prices a mid-catalog city -- it just costs that city an extra
+# night now instead of an unbounded overrun. #274 is what stops it costing the
+# city everything: a sweep priced above the whole daily budget is launched with
+# a cap rather than skipped forever.
 _SWEEP_OVERHEAD_MULTIPLIER = 1.80
+
+# Smallest remaining daily budget worth launching a resumable sweep with (#274).
+#
+# DERIVED, not chosen, because the binding reason is a specific failure rather
+# than a taste for round numbers. calibrate_radius is asked the runaway guard
+# before every probe, and a budget that runs out THERE raises a plain
+# DownloadError -- "nothing was swept and nothing is checkpointed" -- not
+# SweepIncompleteError. So it takes none of the exit-83 amnesty and counts a
+# real consecutive_failure, five of which quarantine the city for a 90-day
+# cycle. A cap below the ladder's worst case therefore buys nothing and costs a
+# failure, on precisely the metros this whole change exists to collect.
+#
+# The ladder's bound is its own documented one: a rung costs either
+# probes_per_rung answers or one probe's full retry budget (the rung is lost the
+# moment a probe fails, hence the break), so 6 * (2 + 3) = 30 at the defaults.
+# Read from the constants rather than pinned at 30, so retuning the ladder
+# carries this with it. The extra retries + 1 is one root cell's full attempt on
+# top: clearing calibration with nothing left to sweep is a legal pause, but it
+# spends a night and a checkpoint-age day to record zero progress.
+_MIN_SWEEP_LAUNCH_REQUESTS = len(RADIUS_LADDER_M) * (
+    DEFAULT_CALIBRATION_PROBES + DEFAULT_BACKPRESSURE_RETRIES
+) + (DEFAULT_BACKPRESSURE_RETRIES + 1)
+
 # Floor for a deadline-clamped timeout. A city is only started while the batch
 # deadline still has room, so the clamp should shorten a run — never hand a
 # child a timeout too short to reach its first request.
@@ -1286,6 +1374,55 @@ def _kartaview_timeout_seconds(
     return int(max(floor, paced_seconds * _TIMEOUT_HEADROOM + _TIMEOUT_FIXED_SLACK_S))
 
 
+def _sweep_requests_within_timeout(timeout_s: int, pc: ProviderConfig | None) -> int | None:
+    """
+    Requests a paced sweep can issue inside ``timeout_s``, or None when the
+    channel's pace makes that unknowable.
+
+    The INVERSE of :func:`_kartaview_timeout_seconds`, and it lives beside it
+    because the two must be read from the same constants or they drift: that
+    function turns a request count into a wall clock, this one turns a wall
+    clock back into a request count. Both use the channel's configured rate
+    (default ``DEFAULT_SWEEP_REQUESTS_PER_MINUTE``) discounted by
+    ``_SWEEP_ACHIEVED_RATE_FRACTION``, and both hold ``_TIMEOUT_FIXED_SLACK_S``
+    back for process startup, the checkpoint write and the tail.
+
+    WHY THE CALLER NEEDS IT (#273/#274). ``_run_city_channels`` hands a
+    resumable sweep ``budget - used`` as its request cap so an overrun becomes a
+    deliberate pause (exit ``SWEEP_INCOMPLETE_EXIT_CODE``, amnestied, no
+    ``consecutive_failure``) rather than a SIGKILL at the per-city timeout,
+    which counts one. A cap the child cannot physically REACH inside its own
+    timeout buys none of that: on prod (16/min, a 10 h batch, a 10,000-request
+    budget) a whole night paces ~9,600 requests, so a fresh night's cap is
+    unreachable by arithmetic and the arm actually taken stays the kill. Sizing
+    the cap to what the clock affords is what makes the pause the arm a healthy
+    child takes.
+
+    ``_TIMEOUT_HEADROOM`` is deliberately NOT divided out here, and that is the
+    one asymmetry between the two directions. It covers the request COUNT being
+    under-estimated (extra pages, backpressure retries, the calibration ladder)
+    — and a cap bounds requests actually issued, retries included, so applying
+    it again would halve the cap for a hazard the cap already removes. What is
+    left over is the margin: a child that achieves the assumed
+    ``rate x _SWEEP_ACHIEVED_RATE_FRACTION`` hits the cap with the headroom
+    still unspent. A child that runs SLOWER than that is still killed, and that
+    is the arm this cannot remove — only a wall-clock stop inside the child can
+    (the option this deliberately did not take, because the child has no clock
+    budget flag).
+
+    Returns None for a channel with pacing disabled (``rate <= 0``): with no
+    pace there is no wall-clock arithmetic to do, and the honest answer is "do
+    not bound the cap by the clock" rather than 0, which would skip every city.
+    """
+    # `is None`, not falsy: 0 means "pacing disabled", exactly as above.
+    configured = pc.max_requests_per_minute if pc else None
+    rate = DEFAULT_SWEEP_REQUESTS_PER_MINUTE if configured is None else configured
+    if rate <= 0:
+        return None
+    paceable_s = max(0.0, timeout_s - _TIMEOUT_FIXED_SLACK_S)
+    return int(paceable_s / 60.0 * rate * _SWEEP_ACHIEVED_RATE_FRACTION)
+
+
 def city_timeout_seconds(
     cfg: SchedulerConfig,
     city: db.CityRow,
@@ -1367,6 +1504,247 @@ def city_timeout_seconds(
     )
     paced_seconds = estimated / effective_rate * 60.0
     return clamp(int(max(floor, paced_seconds * _TIMEOUT_HEADROOM + _TIMEOUT_FIXED_SLACK_S)))
+
+
+# ── The resumable-sweep launch decision, made ONCE for both callers ──────────
+#
+# The live launch site (_run_city_channels) and `run-due --dry-run` each had
+# their own copy of the budget arithmetic, and they disagreed the moment #274
+# landed: the dry run printed "OVER BUDGET (deferred)" whenever
+# `est > budget_left`, so an operator's pre-flight said a metro was deferred
+# while the live path launched it capped and resumable. The preview is the one
+# place an operator checks BEFORE a night, so a preview that is wrong about the
+# expensive channel is worse than none.
+#
+# The decision is therefore derived here and both callers read it — the same
+# argument `_channel_estimate` was extracted for, one level up: this helper
+# decides, the callers do the I/O (launch and account, or print). Adding a
+# fourth skip means editing one function, and no caller can be left behind.
+#
+# The skip tokens double as the dry run's short label, so a skip cannot be
+# rendered under a name the live path does not use.
+_SWEEP_SKIP_SIBLING = "sibling sweep in flight"
+_SWEEP_SKIP_AGE_WALL = "checkpoint at the age wall"
+_SWEEP_SKIP_FLOOR = "under the calibration floor"
+
+# How close to CHECKPOINT_MAX_AGE_S a checkpoint may get before the scheduler
+# refuses to add another night to it: ONE night. The wall is measured from the
+# checkpoint's first commit, so a sweep still short of the lattice when it is
+# within a night of the wall is one resume away from having the whole crawl
+# discarded (download_kartaview.load_checkpoint) and re-swept from root 0 -- and
+# the re-sweep commits a FRESH created_at, so the cycle repeats weekly, forever.
+# One night rather than zero because the check runs BEFORE the launch: at zero
+# margin the refusal would arrive on the night the child has already thrown the
+# spend away.
+_CHECKPOINT_AGE_WALL_MARGIN_S = 86400
+
+
+class SweepLaunchPlan(NamedTuple):
+    """What tonight can do with one resumable channel of one city.
+
+    ``skip`` is None for a launch and otherwise one of the ``_SWEEP_SKIP_*``
+    tokens; ``message`` is a full clause for the log (the caller prefixes
+    ``city [channel]:``) and ``label`` its short form for the dry run's table.
+    ``request_cap`` and ``timeout_s`` are the two numbers the child receives,
+    and they are decided together deliberately -- see
+    :func:`_sweep_requests_within_timeout`.
+    """
+
+    timeout_s: int
+    request_cap: int
+    affordable: int | None
+    skip: str | None
+    message: str
+    label: str
+
+
+def _sweep_checkpoint_progress(cfg: SchedulerConfig, city: db.CityRow, channel: str) -> dict | None:
+    """
+    How far the sweep checkpointed for one (city, channel) has got, or None.
+
+    THE one reader, because the variant is not optional decoration: a WALK's
+    store is keyed by (channel, network type) and a grid run's by the channel
+    alone, so omitting it reads a grid run's checkpoint and reports its progress
+    against the walk's. Two call sites spelling that out independently is how
+    the pause log and the launch gate would come to disagree about which crawl
+    they are talking about.
+
+    None for a channel that cannot pause at all, so a caller asking about a
+    channel's sibling (see :func:`_sweep_launch_plan`) never has to test
+    resumability first.
+
+    Best-effort and total: every failure is None. One caller reports on a night
+    that already succeeded in its own terms and the other is a launch gate, and
+    neither may be the thing that breaks over a half-written state file.
+    """
+    if not is_resumable_channel(channel):
+        return None
+    try:
+        variant = (
+            ((cfg.providers or {}).get(channel) or ProviderConfig()).network_type
+            if is_street_channel(channel)
+            else None
+        )
+        return sweep_progress(
+            checkpoint_path_for(city.city_id, frozen_bbox(city), channel, variant)
+        )
+    except Exception:
+        return None
+
+
+def _sweep_launch_plan(
+    cfg: SchedulerConfig,
+    city: db.CityRow,
+    channel: str,
+    conn=None,
+    *,
+    est: int,
+    remaining: int,
+    remaining_s: float | None,
+    city_channels: Sequence[str],
+) -> SweepLaunchPlan:
+    """
+    Launch, or skip and why, for one resumable channel of one city tonight.
+
+    ``remaining`` is the channel's budget MINUS today's spend, ``remaining_s``
+    what is left of the batch deadline (None for a preview or an operator run),
+    and ``city_channels`` every channel this city is scheduled on tonight --
+    needed for the sibling arm below, which must not defer behind a sweep
+    nothing is going to run.
+
+    THE CAP IS THE SMALLER OF TWO CEILINGS. The budget remainder alone is not
+    reachable: a night's paced wall clock is finite, and on prod (16/min, a 10 h
+    batch, a 10,000-request budget affording ~9,600) a fresh night's remainder
+    is unreachable by arithmetic, so the arm a big city actually took was the
+    SIGKILL at the timeout -- no exit code, a consecutive_failure, a city-cap
+    slot spent and NO ledger write, because the child's add_api_usage calls both
+    need it to return. Sizing the cap to what the clock affords makes the
+    deliberate pause the arm a healthy child takes (#273).
+
+    THE THREE SKIPS, in the order they are asked, which is the order of how much
+    each one costs to get wrong:
+
+    * ``_SWEEP_SKIP_SIBLING`` -- this is a road walk whose GRID sibling has an
+      in-flight checkpoint over the same frozen bbox. ``kartaview_streets``
+      ranks immediately after ``kartaview`` for the same city, and a PAUSED grid
+      sweep leaves a checkpoint, not a cache entry -- so the walk prices at full
+      and would launch a second, independently checkpointed sweep of one
+      lattice, against the same per-IP host, for an observation the grid will
+      put in the census cache the moment it completes (#290).
+      ``reconcile_cache_hit`` then discards the walk's older checkpoint and
+      everything it spent.
+      Deferring costs a night and buys the pairing back: once the grid finishes,
+      the walk prices at 0.
+    * ``_SWEEP_SKIP_AGE_WALL`` -- the checkpoint is within a night of
+      ``CHECKPOINT_MAX_AGE_S`` and tonight cannot finish it. See
+      ``_CHECKPOINT_AGE_WALL_MARGIN_S``: resuming buys one more night of spend
+      that the child then throws away. The caller records this as a FAILURE, on
+      purpose and unlike every other skip here, because it is the only one that
+      is not self-correcting -- a pause records nothing, so without a failure
+      the five-night backstop, the nightly alert and the operator all stay
+      unaware while ~60k requests a cycle are discarded.
+    * ``_SWEEP_SKIP_FLOOR`` -- the cap cannot even clear radius calibration. A
+      budget exhausted there raises a plain DownloadError, not
+      SweepIncompleteError, so it takes no amnesty and burns a real
+      consecutive_failure to accomplish nothing.
+
+    ``est == 0`` means a census already in the shared cache, and it exempts a
+    channel from the sibling and floor arms both. Nothing is being crawled: the
+    ladder is never walked, so its cost is not a reason to skip (#274 review),
+    and there is no second sweep of the lattice to avoid because there is no
+    sweep at all.
+    """
+    timeout_s = city_timeout_seconds(cfg, city, channel, conn=conn, remaining_s=remaining_s)
+    # `.get`, matching _channel_estimate and city_timeout_seconds: a channel
+    # enabled without its own [providers.*] block must price, time and cap the
+    # same way on every path, and this one also runs under the dry run, which
+    # must never raise over a config shape the live path tolerates.
+    affordable = _sweep_requests_within_timeout(timeout_s, (cfg.providers or {}).get(channel))
+    request_cap = remaining if affordable is None else min(remaining, affordable)
+    clock_note = (
+        f"{remaining:,} left in the budget, "
+        f"{'unpaced' if affordable is None else f'{affordable:,}'} "
+        f"inside a {timeout_s // 60:,}-minute timeout"
+    )
+
+    def plan(skip: str | None, message: str, label: str) -> SweepLaunchPlan:
+        return SweepLaunchPlan(timeout_s, request_cap, affordable, skip, message, label)
+
+    if est > 0 and is_street_channel(channel):
+        # The pairing is read from STREET_CHANNELS, the table that already maps
+        # every walk to the provider whose census it reads -- deliberately NOT a
+        # second table beside CHANNEL_RESUMABLE. channel_census_cache_marker
+        # makes the same call for the same reason: a second copy would have to
+        # be edited beside the first when a channel is added, and the one that
+        # was forgotten fails open. Direct indexing, never `.get`, so an
+        # unmapped street channel is a KeyError rather than a silent "no
+        # sibling" (test_a_resumable_walk_names_its_grid_sibling pins the set).
+        sibling = STREET_CHANNELS[channel]
+        # Only when the sibling is actually on tonight's slate for this city.
+        # A checkpoint left by a channel nothing is going to run tonight will
+        # not complete tonight either, so deferring behind it would be a wait
+        # with no end -- which is the very shape of failure the age wall arm
+        # below exists to stop.
+        if sibling in city_channels and _sweep_checkpoint_progress(cfg, city, sibling) is not None:
+            return plan(
+                _SWEEP_SKIP_SIBLING,
+                f"deferring — {sibling} has an in-flight checkpoint over the same frozen "
+                f"bbox, and sweeping it twice would spend ~{est:,} requests against the "
+                f"same host for a census the cache will hand this walk for free once that "
+                f"sweep completes (#290). Not a failure; it stays due.",
+                f"deferred ({sibling} sweep in flight)",
+            )
+
+    progress = _sweep_checkpoint_progress(cfg, city, channel)
+    age_s = None if progress is None else progress["age_s"]
+    if age_s is not None and age_s >= CHECKPOINT_MAX_AGE_S - _CHECKPOINT_AGE_WALL_MARGIN_S:
+        roots_done, root_count = progress["roots_done"], progress["root_count"]
+        # What is LEFT, priced by the share of the lattice still unvisited.
+        # Root cells are not uniform, and `est` is a floor rather than a budget
+        # (a Yogyakarta sweep ran 3.0x its geometry estimate), so this is a
+        # lower bound on the remaining cost -- which is the safe direction for
+        # the question being asked: "could tonight plausibly finish it?" A
+        # nonsense root_count cannot be projected from at all, so it prices the
+        # whole sweep, and a checkpoint that has answered every root is already
+        # finished and only needs its finalize.
+        projected = (
+            est if root_count <= 0 else int(est * max(0, root_count - roots_done) / root_count)
+        )
+        if projected > request_cap:
+            return plan(
+                _SWEEP_SKIP_AGE_WALL,
+                f"refusing to resume — its checkpoint is {age_s / 86400:.1f} days old "
+                f"(discarded past {CHECKPOINT_MAX_AGE_S / 86400:.0f}) at "
+                f"{roots_done}/{root_count} root cells, and the ~{projected:,} requests "
+                f"left will not fit tonight's {request_cap:,} ({clock_note}). Another night "
+                f"would be thrown away with the checkpoint. RECORDED AS A FAILURE so this "
+                f"is alerted rather than re-swept from zero every week: raise "
+                f"[providers.{channel}].daily_request_budget, shrink the city's grid, or "
+                f"delete the checkpoint to start the sweep over deliberately.",
+                f"REFUSED (checkpoint {age_s / 86400:.1f} d old, {roots_done}/{root_count})",
+            )
+
+    if est > 0 and request_cap < _MIN_SWEEP_LAUNCH_REQUESTS:
+        binding = (
+            "requests left in today's budget"
+            if request_cap == remaining
+            else f"requests its {timeout_s // 60:,}-minute timeout affords"
+        )
+        return plan(
+            _SWEEP_SKIP_FLOOR,
+            f"{request_cap:,} {binding} is under the {_MIN_SWEEP_LAUNCH_REQUESTS} needed to "
+            f"clear radius calibration; skipping (resumes tomorrow).",
+            f"deferred ({request_cap:,} req under the calibration floor)",
+        )
+
+    if est > request_cap:
+        return plan(
+            None,
+            f"~{est:,} estimated requests exceeds the {request_cap:,} this night affords "
+            f"({clock_note}); launching capped — it will checkpoint and resume.",
+            f"launch capped at {request_cap:,}; resumes",
+        )
+    return plan(None, "", "ok")
 
 
 def setup_logging(cfg: SchedulerConfig, verbose: bool = False) -> None:
@@ -2827,6 +3205,13 @@ def cmd_assess_city(
 
     blocked_hosts: set[str] = set()
     busy_hosts: Counter[str] = Counter()
+    # Unreachable for this command as it stands — assess-city's channel
+    # vocabulary has no KartaView in it, and the sibling deferral is a property
+    # of a resumable street channel — but owned and scored here anyway, for the
+    # reason the docstring below gives about a skip an operator cannot see: a
+    # channel silently not collected is exactly what makes an inquiry answer
+    # wrong, and #274's counter must not be the one the shared path drops.
+    deferred_channels: Counter[str] = Counter()
     attempted, succeeded, skipped_budget = _run_city_channels(
         cfg,
         conn,
@@ -2835,6 +3220,7 @@ def cmd_assess_city(
         channels,
         blocked_hosts=blocked_hosts,
         busy_hosts=busy_hosts,
+        deferred_channels=deferred_channels,
         # No batch deadline: an operator run has nothing queued behind it, and
         # each child still carries its own derived per-city timeout.
         batch_deadline=None,
@@ -2898,6 +3284,11 @@ def cmd_assess_city(
     summary = (
         f"{succeeded}/{attempted} channel(s) collected"
         + (f", {skipped_budget} skipped on budget" if skipped_budget else "")
+        + (
+            f", {sum(deferred_channels.values())} deferred behind a sibling sweep"
+            if deferred_channels
+            else ""
+        )
         + blocked_note
         + busy_note
         + ("; published" if published else "")
@@ -2935,14 +3326,15 @@ def cmd_assess_city(
     #
     #   - `attempted == 0` is a failure, not a no-op. Every channel was skipped,
     #     so the operator has nothing to reply to the partner with.
-    #   - a budget skip counts against it. On a nightly run a skip is a normal
+    #   - a budget skip counts against it, and so does a walk deferred behind a
+    #     sibling sweep (issue #274). On a nightly run either is a normal
     #     deferral — the city rolls to tomorrow inside a 90-day cycle, and
     #     _finish_batch scores only `attempted - succeeded`. Here the skipped
     #     channel IS the job, and today is the deadline.
     #   - a refused or busy host is never clean, which _finish_batch does agree
     #     with (it alerts unconditionally on either).
     collected_everything = attempted > 0 and succeeded == attempted
-    nothing_deferred = skipped_budget == 0
+    nothing_deferred = skipped_budget == 0 and not deferred_channels
     hosts_were_fine = not blocked_hosts and not busy_hosts
     complete = collected_everything and nothing_deferred and hosts_were_fine
     if complete and (published or not publish_wanted):
@@ -2957,6 +3349,7 @@ def _street_collect_cmd(
     channel: str,
     conn_limit: int,
     daily_budget: int,
+    request_cap: int | None = None,
 ) -> list[str]:
     """Argv for a road-walk collection of one (city, street channel).
 
@@ -3037,6 +3430,20 @@ def _street_collect_cmd(
                 "--kartaview-max-requests-per-minute",
                 str(pc.max_requests_per_minute),
             ]
+        # And the night's REMAINING budget as a hard stop (#273). --daily-budget
+        # above only GATES: the collector prices it from estimate_sweep_requests,
+        # a geometric FLOOR (measured overhead 1.80x; Yogyakarta ran 3.0x), so a
+        # gate that passes does not bound what the sweep then spends against a
+        # host that meters by IP. This is the enforceable half, and it is the
+        # same defect the grid channel had -- the walk reads the same census by
+        # the same sweep, so it inherits it exactly.
+        #
+        # Both flags, not one: they are a gate and a stop, with opposite
+        # subtraction conventions. --daily-budget is the FULL ceiling because
+        # this collector subtracts today's spend itself; the cap arrives already
+        # subtracted, because nothing in the child can compute it.
+        if request_cap is not None:
+            cmd += ["--kartaview-max-requests", str(request_cap)]
     # '--' so a display name can never be parsed as a flag
     cmd += ["--", city.display_name]
     return cmd
@@ -3167,6 +3574,7 @@ def _run_one_city(
     *,
     timeout_s: int | None = None,
     estimated_requests: int | None = None,
+    request_cap: int | None = None,
 ) -> CollectionOutcome:
     """Collect one (city, channel) in a subprocess.
 
@@ -3181,6 +3589,18 @@ def _run_one_city(
     ``remaining_s`` is what is left of the batch deadline, which caps this
     child's timeout (issue #167).
 
+    ``request_cap`` is the OPPOSITE convention to ``daily_budget`` and the two
+    must never be conflated (issue #273). ``daily_budget`` is a ceiling the
+    child subtracts today's spend from ITSELF, because the street collector
+    reads the same ``api_usage`` ledger; passing it a remainder would charge
+    that spend twice. The grid CLI reads no ledger, so ``request_cap`` is the
+    remainder ALREADY SUBTRACTED — ``budget - used`` — and only the caller can
+    compute it, because a lane worker is handed ``conn=None`` by design (see
+    above) and has no catalog to query. It is passed only for channels
+    ``CHANNEL_RESUMABLE`` marks, where exhausting it checkpoints and exits
+    ``SWEEP_INCOMPLETE_EXIT_CODE`` instead of failing. ``None`` — the default —
+    omits the flag entirely and sweeps to completion.
+
     ``timeout_s`` and ``estimated_requests`` let the CALLER precompute the two
     values this function would otherwise derive here, and exist so this body can
     run off the main thread (issue #240). Both derivations need either the
@@ -3194,7 +3614,7 @@ def _run_one_city(
     conn_limit = cfg.connection_limit if connection_limit is None else connection_limit
 
     if is_street_channel(provider):
-        cmd = _street_collect_cmd(cfg, city, today, provider, conn_limit, daily_budget)
+        cmd = _street_collect_cmd(cfg, city, today, provider, conn_limit, daily_budget, request_cap)
         estimated = (
             _channel_estimate(cfg, city, provider, conn)
             if estimated_requests is None
@@ -3264,6 +3684,21 @@ def _run_one_city(
         rate = ((cfg.providers or {}).get(provider) or ProviderConfig()).max_requests_per_minute
         if rate is not None:
             cmd += ["--kartaview-max-requests-per-minute", str(rate)]
+        # The night's REMAINING budget as a hard stop (issue #273). Until this
+        # landed the guard was a pre-flight check against an estimate and
+        # nothing bounded the child, on the one channel whose estimate is not
+        # exact: _SWEEP_OVERHEAD_MULTIPLIER is a MEDIAN (1.80x) whose study max
+        # is 13.66x, on a p65 city, so a mid-catalog sweep could spend ~7.6x
+        # what the ledger said it could afford against a host that meters us by
+        # IP. Exhausting this checkpoints the rest and exits 83 instead, which
+        # _run_city_channels amnesties -- so the overrun became a pause.
+        #
+        # Same unset-means-omit rule as the rate above, and the value is never
+        # < 1: the CLI's _positive_int refuses 0 at parse time (it used to be
+        # accepted, spend the whole calibration ladder and checkpoint nothing),
+        # and the caller's floor is what keeps this side of that.
+        if request_cap is not None:
+            cmd += ["--kartaview-max-requests", str(request_cap)]
     # '--' so a display name can never be parsed as a flag
     cmd += ["--", city.display_name]
     # `conn` on both fallbacks, matching the street arm above (#238). It was
@@ -3548,22 +3983,32 @@ def _collect_due(conn, cfg: SchedulerConfig, today: date, providers: list[str]):
     # consecutive_failures a SIGKILL can burn are survivable only while the
     # five nights are CONSECUTIVE, so #239's checkpointed progress accumulates.
     #
-    # WHICH unfinished sweep, precisely, because the two arms behave differently
-    # and only one of them is live today:
+    # WHICH unfinished sweep, precisely, because the two arms behave very
+    # differently and BOTH are live since #273:
     #
-    #   * A SIGKILL at the per-city timeout. This is the arm a nightly batch
-    #     actually takes. The checkpoint on disk survives, so tomorrow resumes —
-    #     but the kill has no exit code, so it counts a consecutive_failure, and
-    #     `attempted` was incremented, so it DID consume a city-cap slot. The
-    #     hoist is what makes tomorrow's retry the FIRST slot rather than one
-    #     truncated away.
     #   * A deliberate pause (SWEEP_INCOMPLETE_EXIT_CODE, amnestied in
-    #     _run_city_channels, consuming no slot). NOT REACHABLE FROM run-due
-    #     TODAY: download_kartaview sets its `stop_reason` only from the
-    #     `max_requests` guard, and _run_one_city deliberately does not pass
-    #     `--kartaview-max-requests` (see _SWEEP_OVERHEAD_MULTIPLIER above).
-    #     That is issue #273; when it lands this becomes the common arm and the
-    #     five-night bound stops binding. The hoist is written for both.
+    #     _run_city_channels, consuming no slot). This is the arm a HEALTHY
+    #     sweep takes: _run_city_channels caps every sweep at the smaller of the
+    #     night's remaining budget and what the child's own timeout can pace
+    #     (_sweep_requests_within_timeout), so a sweep that would overrun stops
+    #     itself deliberately instead of being killed. Both terms are needed --
+    #     on prod 16/min over a 10 h batch paces ~9,600 requests against a
+    #     10,000 budget, so a cap set to a fresh night's remainder is
+    #     unreachable by arithmetic and the kill below stays the arm actually
+    #     taken. A pause records no consecutive_failure, so the five-night bound
+    #     below does not bind it at all -- what bounds it instead is
+    #     CHECKPOINT_MAX_AGE_S, seven days from the checkpoint's FIRST commit,
+    #     after which its rows would be spliced into a snapshot dated today and
+    #     it is discarded.
+    #   * A SIGKILL at the per-city timeout. Still reachable, and what it now
+    #     catches is a child running SLOWER than the assumed rate x
+    #     _SWEEP_ACHIEVED_RATE_FRACTION -- the one overrun a request cap cannot
+    #     bound, since only a clock inside the child could. The checkpoint on
+    #     disk survives, so tomorrow resumes — but the kill has no exit code, so
+    #     it counts a consecutive_failure, and `attempted` was incremented, so
+    #     it DID consume a city-cap slot. The hoist is what makes tomorrow's
+    #     retry the FIRST slot rather than one truncated away, and the
+    #     five-night bound is this arm's, not the pause's.
     #
     # `all`, not `any`, and the choice is the blast radius. A city due on gsv
     # too needs no hoist (see above), and there is no pairing argument either:
@@ -3850,12 +4295,49 @@ def cmd_run_due(
                     city, provider, max_age_s=_census_reuse_window_s(cfg)
                 )
                 est = _channel_estimate(cfg, city, provider, conn, cached=marker is not None)
-                fits = "ok" if est <= budget_left[provider] else "OVER BUDGET (deferred)"
+                if is_resumable_channel(provider):
+                    # THE SAME DECISION THE LIVE PATH MAKES, from the same
+                    # helper (issue #274). `est > budget_left` is the wrong
+                    # question for a channel that pauses and resumes: it printed
+                    # "OVER BUDGET (deferred)" for precisely the metros
+                    # _run_city_channels launches capped, and a preview that is
+                    # wrong about the expensive channel is worse than no preview.
+                    #
+                    # `remaining_s=None` is the ONE thing this cannot share: the
+                    # batch deadline is a clock reading inside a running night,
+                    # and a preview has no night. So the cap shown here is the
+                    # UNCLAMPED one — an upper bound, matched by a night whose
+                    # deadline is still far off and larger than what a city
+                    # launched late actually gets.
+                    plan = _sweep_launch_plan(
+                        cfg,
+                        city,
+                        provider,
+                        conn,
+                        est=est,
+                        remaining=budget_left[provider],
+                        remaining_s=None,
+                        city_channels=providers_for_city[city.city_id],
+                    )
+                    fits = plan.label
+                    # What the night would actually spend on it: a capped launch
+                    # stops at the cap, and a skip spends nothing at all.
+                    spend = 0 if plan.skip else min(est, plan.request_cap)
+                else:
+                    fits = "ok" if est <= budget_left[provider] else "OVER BUDGET (deferred)"
+                    spend = est if est <= budget_left[provider] else 0
                 if marker is not None:
                     payer = marker.get("fetched_by") or "an earlier collection"
-                    fits = f"ok (cached census from {payer})"
+                    # Still worth saying when a cached channel is nonetheless
+                    # being stood down (a walk waiting on its grid sibling), so
+                    # this reads as an addition to the verdict, not a replacement.
+                    fits = (
+                        f"ok (cached census from {payer})"
+                        if fits == "ok"
+                        else f"{fits} (cached census from {payer})"
+                    )
                 print(f"  {city.city_id:60s} {provider:16s} ~{est:>9,} req  {fits}")
-                budget_left[provider] -= est if est <= budget_left[provider] else 0
+                budget_left[provider] -= spend
         if cfg.driving_plan.enabled:
             print("Would also snapshot the GSV driving-plan feed (issue #176).")
         print(f"Would also back up the catalog to {cfg.backup_dir} (issue #145).")
@@ -3886,6 +4368,7 @@ def cmd_run_due(
             stop_reason,
             blocked_hosts,
             busy_hosts,
+            deferred_channels,
         ) = _run_city_loop(
             cfg,
             conn,
@@ -3923,6 +4406,16 @@ def cmd_run_due(
         f"run-due {today}{filter_note}: {succeeded}/{attempted} runs succeeded across "
         f"{processed} cities in {elapsed_h:.2f} h"
         + (f"; {skipped_budget} deferred for budget" if skipped_budget else "")
+        # Named apart from the budget deferral because the operator's next move
+        # differs: nothing is over budget and nothing failed -- the walk is
+        # waiting for its grid sibling's sweep to land in the census cache, and
+        # collects for 0 requests once it does (issues #274, #290).
+        + (
+            f"; {sum(deferred_channels.values())} walk(s) deferred behind a paused sibling "
+            f"sweep ({', '.join(sorted(deferred_channels))})"
+            if deferred_channels
+            else ""
+        )
         + (f"; {blocked_note}" if blocked_note else "")
         + (f"; {busy_note}" if busy_note else "")
         + (f"; stopped early ({stop_reason})" if stop_reason else "")
@@ -3967,6 +4460,60 @@ def _log_channel_error(city_id: str, provider: str, exc: BaseException) -> None:
         logger.exception(f"{city_id} [{provider}]: channel raised {exc!r}")
 
 
+def _sweep_progress_note(progress: dict | None) -> str:
+    """
+    " 3/8 root cells." for a paused sweep; empty when nothing readable is on
+    disk. Takes the dict :func:`_sweep_checkpoint_progress` returns, because the
+    caller needs it for the age-wall warning too and reading the state file
+    twice is how two reports of one pause come to disagree.
+
+    A pause is amnestied and consumes no city-cap slot, so without this a
+    multi-night sweep is invisible: the log says "resumes on the next run" every
+    night whether or not any root cell was answered, and the two failure modes
+    it hides look identical from outside.
+
+    Deliberately NO age-wall warning in here any more. It used to be appended as
+    the substring "WARNING:" inside a record logged at INFO — invisible to every
+    level filter, every handler that splits by severity and every operator
+    grepping for warnings, on the one line that says a sweep is about to have
+    its whole spend thrown away. It is its own ``logger.warning`` record now;
+    see :func:`_warn_if_checkpoint_near_the_age_wall`.
+    """
+    if progress is None:
+        return ""
+    return f" {progress['roots_done']}/{progress['root_count']} root cells."
+
+
+def _warn_if_checkpoint_near_the_age_wall(
+    city_id: str, provider: str, progress: dict | None
+) -> None:
+    """
+    A WARNING record — its own, not a substring of one — when a paused sweep's
+    checkpoint is within a night of ``CHECKPOINT_MAX_AGE_S``.
+
+    ``CHECKPOINT_MAX_AGE_S`` is measured from the checkpoint's FIRST commit, so
+    a city that cannot finish inside it has its checkpoint discarded mid-crawl
+    and re-sweeps from root 0 -- weekly and forever, because the re-sweep
+    commits a fresh ``created_at`` and every individual night then reads as
+    ordinary progress.
+
+    This fires the night BEFORE the discard, from the pause branch. It is the
+    early notice, not the guard: ``_sweep_launch_plan`` refuses the next night's
+    launch outright and records a failure, which is what reaches the alert path
+    (issue #274). Both exist because they answer different questions — this one
+    says a sweep is falling behind while there is still a night to act in.
+    """
+    age_s = None if progress is None else progress["age_s"]
+    if age_s is None or age_s < CHECKPOINT_MAX_AGE_S - _CHECKPOINT_AGE_WALL_MARGIN_S:
+        return
+    logger.warning(
+        f"{city_id} [{provider}]: this checkpoint is {age_s / 86400:.1f} days old and is "
+        f"discarded past {CHECKPOINT_MAX_AGE_S / 86400:.0f}, which throws the whole sweep "
+        f"away — it is not finishing at this nightly budget, and the next run will refuse "
+        f"to resume it (and record a failure) rather than spend another night on it."
+    )
+
+
 def _log_stop_declined(city_id: str, declined: list[str]) -> None:
     """Name the channels a wind-down is choosing not to start (issue #206).
 
@@ -4005,6 +4552,7 @@ def _run_city_channels(
     *,
     blocked_hosts: set[str],
     busy_hosts: Counter[str],
+    deferred_channels: Counter[str],
     batch_deadline: float | None,
     stop_requested: threading.Event | None,
     record_failures: bool = True,
@@ -4045,6 +4593,14 @@ def _run_city_channels(
     that refused us cannot answer differently for the next city, so its channels
     stay skipped once seen. A *busy* host is only counted — that condition ends
     when the other local process does.
+
+    ``deferred_channels`` counts, per channel, the walks this city stood down
+    because their GRID sibling's sweep of the same lattice is still in flight
+    (issue #274; see ``_sweep_launch_plan``). Same ownership and the same reason
+    as ``busy_hosts``: it is neither a failure nor a budget skip — nothing is
+    wrong and nothing was spent — but a night that quietly collected no road
+    walk has to say so somewhere, and the two existing counters would each be a
+    lie about why.
 
     ``batch_deadline`` (a ``time.monotonic()`` value) clamps each child's
     timeout so no collection outlives the window reserved for the publish tail;
@@ -4228,7 +4784,125 @@ def _run_city_channels(
 
                         budget = cfg.providers[provider].daily_request_budget
                         est = _channel_estimate(cfg, city, provider, conn)
-                        if est > budget:
+                        # Read BEFORE the est > budget arm, not between the two arms
+                        # as it used to be, because the resumable branch below needs
+                        # the remainder to decide anything at all. It is a read on
+                        # the one thread that owns the catalog either way.
+                        used = db.get_api_usage(conn, today, provider)
+                        remaining = budget - used
+
+                        # Derived here, ahead of the gates, for the resumable channels
+                        # ONLY -- their request cap is sized against the timeout their
+                        # child will actually be given, deadline clamp included, so the
+                        # two numbers have to be decided together (#273). Everything
+                        # else keeps deriving it at the launch site below, where a
+                        # channel the gates skip pays for nothing it will not use.
+                        # Whichever site runs, it runs exactly once per channel and on
+                        # this thread: `city_timeout_seconds` needs the catalog handle,
+                        # and the deadline has to be read by the thread that knows what
+                        # the whole batch is doing.
+                        timeout_s: int | None = None
+                        request_cap: int | None = None
+
+                        if is_resumable_channel(provider):
+                            # NEITHER gate below applies to a channel that can stop
+                            # itself and continue tomorrow (#274). Both of them exist
+                            # because every other channel is all-or-nothing: a partial
+                            # GSV grid, a partial tile census and a partial road walk
+                            # are not runs, so there is no way to spend half a budget
+                            # usefully and refusing to start is honest.
+                            #
+                            # A sweep is not all-or-nothing. Since #239 it spends what
+                            # tonight affords, checkpoints the unvisited roots and
+                            # exits 83; nothing is finalized or published until the
+                            # lattice is complete, so the immutable dated-snapshot
+                            # contract is untouched -- the run is simply dated the day
+                            # it completes. The cities `est > budget` skipped forever
+                            # are therefore precisely the ones the checkpoint was
+                            # built for: Singapore ~9,974 requests, New York ~12,355,
+                            # both permanently skipped against any sane budget while
+                            # being loudly logged every single night.
+                            #
+                            # `est` is deliberately not consulted here. It prices the
+                            # WHOLE sweep even for a city resuming from a checkpoint
+                            # -- estimate_kartaview_requests says so itself, because
+                            # its observed tier reads a `runs` row and a paused sweep
+                            # never reaches register_run -- so gating on it is exactly
+                            # the over-pricing this branch exists to stop.
+                            #
+                            # THE CAP, THE TIMEOUT AND THE THREE SKIPS ARE ONE
+                            # DECISION, and it is made in _sweep_launch_plan rather
+                            # than here -- shared with `run-due --dry-run`, which used
+                            # to print "OVER BUDGET (deferred)" for exactly the metros
+                            # this path launches capped. The preview is the one thing
+                            # an operator reads before a night, so the two must not be
+                            # able to disagree. Why the cap is the smaller of the
+                            # budget remainder and what the clock affords, and why
+                            # each skip answers as it does, is stated once, there.
+                            #
+                            # What stays HERE is the accounting, because only this
+                            # path has any: a skip is a counter or a recorded failure,
+                            # and the dry run neither collects nor records.
+                            plan = _sweep_launch_plan(
+                                cfg,
+                                city,
+                                provider,
+                                conn,
+                                est=est,
+                                remaining=remaining,
+                                remaining_s=(
+                                    None
+                                    if batch_deadline is None
+                                    else batch_deadline - time.monotonic()
+                                ),
+                                city_channels=providers,
+                            )
+                            timeout_s, request_cap = plan.timeout_s, plan.request_cap
+                            if plan.skip == _SWEEP_SKIP_AGE_WALL:
+                                # THE ONE SKIP HERE THAT IS RECORDED AS A FAILURE, and
+                                # it has to be. Everything else on this path is
+                                # self-correcting: a budget skip retries tomorrow, a
+                                # pause is amnestied and resumes. A checkpoint at the
+                                # age wall corrects nothing -- the child would discard
+                                # it, re-commit a FRESH created_at on the same path and
+                                # start from root 0, weekly and forever, with no
+                                # failure counted, no `unhealthy` component set and no
+                                # email. `attempted` is what feeds
+                                # `failures = attempted - succeeded` in _finish_batch,
+                                # so incrementing it here is what buys both the nightly
+                                # alert and the five-night backstop that eventually
+                                # quarantines the city instead of burning ~60k requests
+                                # a cycle on a sweep that cannot finish.
+                                logger.warning(f"{city.city_id} [{provider}]: {plan.message}")
+                                attempted += 1
+                                if record_failures:
+                                    db.record_attempt(
+                                        conn,
+                                        city.city_id,
+                                        success=False,
+                                        error=(
+                                            f"checkpoint at the {CHECKPOINT_MAX_AGE_S / 86400:.0f}"
+                                            f"-day age wall and unfinishable at tonight's cap"
+                                        ),
+                                        provider=provider,
+                                    )
+                                continue
+                            if plan.skip == _SWEEP_SKIP_SIBLING:
+                                # Neither a failure nor a budget deferral: nothing is
+                                # wrong and the budget is not the reason. Counted apart
+                                # so a night that quietly collected no walk says so.
+                                logger.info(f"{city.city_id} [{provider}]: {plan.message}")
+                                deferred_channels[provider] += 1
+                                continue
+                            if plan.skip is not None:
+                                # The calibration floor. A budget decision, so it takes
+                                # the budget counter and no failure -- see the plan.
+                                logger.info(f"{city.city_id} [{provider}]: {plan.message}")
+                                skipped_budget += 1
+                                continue
+                            if plan.message:
+                                logger.info(f"{city.city_id} [{provider}]: {plan.message}")
+                        elif est > budget:
                             # This city can NEVER fit the daily budget — skipping (not
                             # ending the city) so it can't starve every smaller city
                             # behind it in the stalest-first queue. Needs a manual run
@@ -4242,15 +4916,13 @@ def _run_city_channels(
                             )
                             skipped_budget += 1
                             continue
-
-                        used = db.get_api_usage(conn, today, provider)
-                        if used + est > budget:
+                        elif used + est > budget:
                             # Doesn't fit in what's LEFT today — try the next (smaller)
                             # city rather than ending the day; this one rolls to tomorrow
                             # when the budget is fresh.
                             logger.info(
                                 f"{city.city_id} [{provider}] (~{est:,} req) doesn't fit "
-                                f"remaining budget ({budget - used:,} left); skipping."
+                                f"remaining budget ({remaining:,} left); skipping."
                             )
                             skipped_budget += 1
                             continue
@@ -4264,13 +4936,21 @@ def _run_city_channels(
                                 f"{lane_connection_limit} → {conn_limit} for "
                                 f"{city.city_id} [{provider}]"
                             )
-                        # Exactly one clock read per LAUNCHED channel, here, so the
-                        # deadline is priced by the thread that knows what the whole
-                        # batch is doing. Never let a child run past it; the point of
-                        # the deadline is to reserve time for the publish tail.
-                        remaining_s = (
-                            None if batch_deadline is None else batch_deadline - time.monotonic()
-                        )
+                        if timeout_s is None:
+                            # Exactly one clock read per LAUNCHED channel, here, so the
+                            # deadline is priced by the thread that knows what the whole
+                            # batch is doing. Never let a child run past it; the point of
+                            # the deadline is to reserve time for the publish tail. A
+                            # resumable channel already took this branch above, where its
+                            # cap needed the answer.
+                            remaining_s = (
+                                None
+                                if batch_deadline is None
+                                else batch_deadline - time.monotonic()
+                            )
+                            timeout_s = city_timeout_seconds(
+                                cfg, city, provider, conn=conn, remaining_s=remaining_s
+                            )
                         future = _start(
                             provider,
                             connection_limit=conn_limit,
@@ -4278,14 +4958,25 @@ def _run_city_channels(
                             # street collector subtracts today's spend from this
                             # itself, so passing the remainder would count it twice.
                             daily_budget=budget,
-                            timeout_s=city_timeout_seconds(
-                                cfg, city, provider, conn=conn, remaining_s=remaining_s
-                            ),
+                            # Derived above for a resumable channel, beside the cap
+                            # that is sized against it, and handed down rather than
+                            # re-derived: the cap is only meaningful against the
+                            # timeout the child actually gets, deadline clamp and all.
+                            timeout_s=timeout_s,
                             # The gate above already priced this channel; handing the
                             # number down deletes the duplicate computation (and with
                             # it the only other reason the child body would want the
                             # catalog handle).
                             estimated_requests=est,
+                            # The budget remainder ALREADY SUBTRACTED, floored at what
+                            # the timeout above can pace -- the opposite convention to
+                            # daily_budget, deliberately spelled differently so the two
+                            # cannot drift into each other (#273). None for every
+                            # non-resumable channel. Computed on this thread because it
+                            # has to be: a lane worker gets conn=None, so `used` is
+                            # only knowable here, which is also the thread whose
+                            # serialized read-then-write keeps the guard honest.
+                            request_cap=request_cap,
                         )
                         in_flight[future] = provider
                         hosts_in_flight.update(CHANNEL_HOSTS.get(provider, ()))
@@ -4426,10 +5117,21 @@ def _run_city_channels(
                         # progress from one that made none. That is the standing limit
                         # on "a kill just resumes tomorrow" — see
                         # _kartaview_timeout_seconds.
+                        #
+                        # One read of the state file, two records out of it: the
+                        # progress line at INFO, and — only when the checkpoint is
+                        # running out of days — a WARNING of its own. The warning used
+                        # to be a substring inside this INFO line, which is invisible
+                        # to every severity filter there is.
+                        paused_progress = _sweep_checkpoint_progress(cfg, city, provider)
                         logger.info(
                             f"{city.city_id} [{provider}]: sweep paused with its progress "
                             f"checkpointed — not counted as a failure for this city; it "
-                            f"stays due and resumes on the next run. ({reason})"
+                            f"stays due and resumes on the next run."
+                            f"{_sweep_progress_note(paused_progress)} ({reason})"
+                        )
+                        _warn_if_checkpoint_near_the_age_wall(
+                            city.city_id, provider, paused_progress
                         )
                         continue
 
@@ -4524,7 +5226,7 @@ def _run_city_loop(
     batch_deadline: float,
     sigterm_seen: threading.Event,
     max_cities: int,
-) -> tuple[int, int, int, int, str | None, set[str], Counter[str]]:
+) -> tuple[int, int, int, int, str | None, set[str], Counter[str], Counter[str]]:
     """Collect due cities until the city cap, the batch deadline, or SIGTERM.
 
     ``sigterm_seen`` is both checked here (between cities) and forwarded to
@@ -4538,7 +5240,7 @@ def _run_city_loop(
     dead code that also reads as a second opinion on what the cap is.
 
     Returns ``(processed, succeeded, attempted, skipped_budget, stop_reason,
-    blocked_hosts, busy_hosts)``; ``stop_reason`` is None when the whole due
+    blocked_hosts, busy_hosts, deferred_channels)``; ``stop_reason`` is None when the whole due
     list was worked through. Split out of ``cmd_run_due`` so every way of ending
     the night still reaches the publish tail — an unexpected exception here is
     logged and converted into a stop reason rather than discarding a night's
@@ -4555,11 +5257,17 @@ def _run_city_loop(
     the batch every Mapillary city of the night. It is still reported, because a
     city that quietly did not collect is exactly the shape of failure #145
     exists to make impossible.
+
+    ``deferred_channels`` counts road walks stood down behind their grid
+    sibling's in-flight sweep (issue #274). Reported for exactly the reason
+    ``busy_hosts`` is, and counted apart from both a failure and a budget skip
+    because it is neither.
     """
     processed = succeeded = attempted = skipped_budget = 0
     stop_reason: str | None = None
     blocked_hosts: set[str] = set()
     busy_hosts: Counter[str] = Counter()
+    deferred_channels: Counter[str] = Counter()
     try:
         for city in due:
             if processed >= max_cities:
@@ -4587,6 +5295,7 @@ def _run_city_loop(
                 providers_for_city[city.city_id],
                 blocked_hosts=blocked_hosts,
                 busy_hosts=busy_hosts,
+                deferred_channels=deferred_channels,
                 batch_deadline=batch_deadline,
                 stop_requested=sigterm_seen,
             )
@@ -4626,7 +5335,16 @@ def _run_city_loop(
         logger.exception("City loop aborted by an unexpected error")
         stop_reason = _STOP_REASON_ERROR
 
-    return processed, succeeded, attempted, skipped_budget, stop_reason, blocked_hosts, busy_hosts
+    return (
+        processed,
+        succeeded,
+        attempted,
+        skipped_budget,
+        stop_reason,
+        blocked_hosts,
+        busy_hosts,
+        deferred_channels,
+    )
 
 
 def _tail_artifact(label: str, fn, conn, data_dir: str) -> tuple[Any, str | None]:

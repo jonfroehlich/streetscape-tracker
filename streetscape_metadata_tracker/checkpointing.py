@@ -668,6 +668,44 @@ def _checkpoint_started_at(checkpoint_path: str | None) -> str | None:
         return None
 
 
+def sweep_progress(checkpoint_path: str | None) -> dict | None:
+    """
+    How far the sweep checkpointed at ``checkpoint_path`` has got, or None when
+    nothing readable is there.
+
+    Returns ``{"roots_done", "root_count", "age_s"}``. Lives here rather than in
+    the scheduler because it is the state record's layout, and the module that
+    writes a format is the one that should be asked to read it -- the same rule
+    the census seam follows.
+
+    ``age_s`` is measured from ``created_at``, the FIRST commit, because that is
+    what ``CHECKPOINT_MAX_AGE_S`` is enforced against (issue #272): a sweep that
+    resumes nightly keeps moving ``updated_at`` and would otherwise look
+    perpetually fresh while ageing towards the discard that throws its whole
+    spend away.
+
+    Best-effort and total: every failure is None, because a caller reporting on
+    a night that already succeeded in its own terms must never be the thing that
+    breaks it.
+    """
+    if checkpoint_path is None:
+        return None
+    try:
+        with open(_state_path(checkpoint_path), encoding="utf-8") as f:
+            state = json.load(f)
+        root_count = int(state["root_count"])
+        roots_done = int(state["roots_done"])
+        started = state.get("created_at")
+        age_s = (
+            None
+            if not started
+            else (datetime.now(UTC) - datetime.fromisoformat(started)).total_seconds()
+        )
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return {"roots_done": roots_done, "root_count": root_count, "age_s": age_s}
+
+
 def same_crawl(marker: dict, channel: str | None, variant: str | None) -> bool:
     """
     Is the consumer identified by (channel, variant) the crawl that paid for

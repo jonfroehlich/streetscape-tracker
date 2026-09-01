@@ -193,13 +193,17 @@ jitter = 0.6
 # pass prices at ~186,000 requests ~= 186 h. Seed set on this host is Krabi and
 # Yogyakarta. To see who is enrolled: `scheduler enroll-city --list`.
 #
-# daily_request_budget is a FLOOR to clear, NOT a ceiling on the night's spend
-# (#273/#274): the guard is a pre-flight check against an ESTIMATE, and the child
-# is handed no request cap, so a city that calibrates to r=500 can overspend this
-# figure with only the per-city wall-clock timeout to stop it. 10,000 clears the
-# largest city the cost study measured (Singapore, ~9,974); both seed cities are
-# far under it. Widen only after #273 — and re-check this floor before enrolling
-# any metro, since a city whose estimate exceeds it is skipped *permanently*.
+# daily_request_budget is a real CEILING on the night's spend since #273/#274:
+# the child is handed min(budget - used, what its own timeout can pace) as
+# `--kartaview-max-requests`, and exhausting it checkpoints the unvisited roots
+# and exits 83 rather than overspending. A city priced over this figure is no
+# longer skipped permanently either — it launches capped and sweeps across
+# nights — so what this number now buys is how FAST a metro finishes, not
+# whether it is attempted. 10,000 clears the largest city the cost study
+# measured (Singapore, ~9,974) in a single night; both seed cities are far under
+# it. Set it too low for an enrolled metro and the sweep cannot finish inside
+# CHECKPOINT_MAX_AGE_S, at which point the scheduler refuses to resume it and
+# records a failure rather than re-sweeping from zero every week (#274).
 #
 # max_requests_per_minute is load-bearing beyond pacing: _kartaview_timeout_seconds
 # derives every sweep's per-city timeout from this rate, so lowering it here
@@ -222,9 +226,13 @@ max_requests_per_minute = 16
 # bbox; whichever runs first promotes it into the shared census cache (#290) and
 # the second prices at 0 — which is why kartaview_streets ranks immediately
 # after kartaview in the launch order. Un-paired it pays a full sweep, and that
-# is what this budget covers. Same FLOOR-not-ceiling caveat as above (#273/#274),
-# same load-bearing rate (the per-city timeout is derived from it, and
-# _street_collect_cmd passes it to the child so the two cannot disagree).
+# is what this budget covers. Same real ceiling as above (#273/#274) — the walk
+# takes the same request cap and the same exit-83 pause — and the same
+# load-bearing rate (the per-city timeout is derived from it, and
+# _street_collect_cmd passes it to the child so the two cannot disagree). One
+# behaviour is this channel's alone: while the grid sibling's sweep of the same
+# bbox is still checkpointed mid-crawl, the walk DEFERS rather than sweeping the
+# lattice a second time, and collects for 0 once that sweep lands in the cache.
 #
 # Credential: KARTAVIEW_STREETS_ACCESS_TOKEN if set, else KARTAVIEW_ACCESS_TOKEN.
 # The only street channel that falls back, because one machine-wide host lock

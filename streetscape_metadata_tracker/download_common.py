@@ -157,6 +157,30 @@ HOST_BY_BUSY_EXIT_CODE = {code: host for host, code in HOST_BUSY_EXIT_CODES.item
 SWEEP_INCOMPLETE_EXIT_CODE = 83
 
 
+def positive_int(value: str) -> int:
+    """
+    argparse type for flags where 0 is not "off", it is a trap.
+
+    ``--kartaview-max-requests 0`` used to be accepted, spend the full
+    calibration ladder (``over_budget()`` is checked only where sweep requests
+    are issued), checkpoint ``roots_done=0``, and exit 83 printing "re-run the
+    same command to resume" — an infinite loop the message actively encourages.
+    Refused at parse time instead, following #214's refuse-before-any-work
+    posture for ``run-due --limit``.
+
+    Lives HERE rather than privately in ``cli.py`` because the trap is a
+    property of the flag, not of one entry point: the road-walk collector
+    declares its own ``--kartaview-max-requests`` against the same sweep, and
+    carried ``type=int`` for it — so the guard was real on the grid path and
+    absent on the walk path, which is the shape a copied argument always takes
+    (issue #273).
+    """
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError(f"must be >= 1, got {number}")
+    return number
+
+
 def host_exit_code(error: HostUnavailableError) -> int:
     """
     The exit code a collection child should return for ``error``.

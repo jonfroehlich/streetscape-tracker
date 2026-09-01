@@ -63,6 +63,7 @@ from .download_common import (
     HostUnavailableError,
     host_exit_code,
     jitter_fraction,
+    positive_int,
 )
 from .download_kartaview import (
     DEFAULT_REQUEST_TIMEOUT_S,
@@ -83,21 +84,10 @@ from .paths import get_default_data_dir, get_default_vis_dir
 logger = logging.getLogger(__name__)
 
 
-def _positive_int(value: str) -> int:
-    """
-    argparse type for flags where 0 is not "off", it is a trap.
-
-    `--kartaview-max-requests 0` used to be accepted, spend the full
-    calibration ladder (over_budget() is checked only where sweep requests are
-    issued), checkpoint roots_done=0, and exit 83 printing "re-run the same
-    command to resume" — an infinite loop the message actively encourages.
-    Refused at parse time instead, following #214's refuse-before-any-work
-    posture for `run-due --limit`.
-    """
-    number = int(value)
-    if number < 1:
-        raise argparse.ArgumentTypeError(f"must be >= 1, got {number}")
-    return number
+# Promoted to download_common so the road-walk collector's copy of the same
+# flag gets the same guard (issue #273); kept as an alias so nothing that
+# already reads `_positive_int` in this module has to move with it.
+_positive_int = positive_int
 
 
 # The default channel set. Stating it beats a keyword whose meaning drifts with
