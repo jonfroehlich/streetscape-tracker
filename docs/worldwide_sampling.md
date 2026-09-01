@@ -95,8 +95,8 @@ Running `python scripts/build_worldwide_frame.py` writes (repo root):
 - `cities_worldwide.txt` — `run_cities.py`/`streetscape_tracker.py`-compatible query
   lines (double-quoted so names with apostrophes survive shlex parsing).
 - `worldwide_frame.csv` — the selected frame, one row per city, with
-  `query_string, city, iso2, country, continent, size_band, population,
-  coverage_regime, geonameid, lat, lon`. This is the manifest for the paper and
+  `query_string, city, admin, iso2, country, continent, size_band,
+  population, coverage_regime, geonameid, lat, lon`. This is the manifest for the paper and
   the input to `scripts/register_frame.py`.
 - `worldwide_candidates.csv` — the full ranked eligible-country pool, so a city
   that fails boundary vetting can be swapped for an alternate without
@@ -178,6 +178,24 @@ scheduler host (makelab2), after the merged code is deployed there.
 3. **Enable in the scheduler.** Set the vetted cities `enabled = 1`. Provider
    enablement stays global (both GSV and Mapillary); the scheduler staggers the
    cities over its cycle.
+
+## Purposive additions (non-frame manifests)
+
+The frame is a *stratified sample*, so it deliberately does not contain every city we might want.
+Cities added for a specific reason live in their own manifest in the same format, registered by the same script — never appended to `worldwide_frame.csv`, which is the deterministic output of `build_worldwide_frame.py` and must keep tracing to it.
+
+- `mapillary_360_cities.csv` (2026-08-31, 14 cities) — cities with a documented city-scale Mapillary 360° capture program that the catalog did not already track: BikeOttawa, Kaart in Melbourne, the Lithuanian Road Administration (Vilnius), Ramani Huria (Dar es Salaam), Mapillary's own showcase municipalities (Clovis NM, Johns Creek GA, and Sandusky as the seat of Erie County OH), Mapillary's home city (Malmo), and the CompleteTheMap Europe target cities Prague, Copenhagen, Munich, Milan, Barcelona and Brussels.
+
+Two things differ from a frame registration:
+
+- **Label the batch**: `--notes-label "mapillary 360 leaders"` writes that into `cities.notes`, so the vetting and enable steps can select exactly this batch and a later reader can tell where a city came from. Without it every registered city claims to be a frame city.
+- **Shrink the overlap radius**: `--overlap-km 5`, not the default 25. The default exists to catch one physical city registered twice under different slugs, and at 25 km it also swallows genuine neighbours — Johns Creek sits 16 km from the already-registered Sugar Hill GA, and Sandusky 17 km from Kelleys Island OH, so both would have been *aliased away* instead of registered. Always read the dry run's `reused-existing` count before `--execute`.
+
+The values in a purposive manifest are still a GeoNames join keyed by `geonameid`, not hand-typed coordinates; `tests/test_mapillary_360_cities_manifest.py` re-runs that join and is the file's provenance, since there is no generator script to name.
+It also pins the permanent `city_id`s as literals and records the one deliberate departure from GeoNames' ASCII names (`Malmoe` -> `Malmo`, because the slug outlives the spelling in filenames and published URLs).
+
+Vetting is the same requirement as for the frame, but the full audit chain is disproportionate for a handful of cities: read the registered rectangles back out of `cities`, and for anything that looks wrong render it with `streetscape_tracker.py "<query>" --check-boundary` and correct it with `scripts/resize_city.py` (safe only while the city has no runs).
+The trap for these cities is the opposite of the province centroid the `--max-center-km` guard catches: several have a *tiny* core municipality as their OSM boundary — the City of Brussels and the City of Melbourne LGA are both a few km across inside metros many times larger.
 
 ## Refreshing the frame
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Register the worldwide sampling-frame cities in the catalog, freezing each
-city's grid geometry — WITHOUT downloading any imagery.
+Register the cities in a frame manifest, freezing each city's grid geometry
+— WITHOUT downloading any imagery.
 
 This lets the boundary-audit workflow (scripts/audit_city_boundaries.py ->
 build_boundary_review.py -> apply_decisions.py) vet the grids BEFORE the first
@@ -17,7 +17,10 @@ district--colombia". Geometry (center + dimensions) still comes from geocoding;
 this mirrors cli._resolve_geometry's new-city branch (helpers imported below)
 but supplies the identity ourselves.
 
-Reads the manifest produced by scripts/build_worldwide_frame.py. Idempotent —
+Reads a manifest in the format scripts/build_worldwide_frame.py writes: the
+worldwide sampling frame by default, or a purposive list such as
+mapillary_360_cities.csv via --manifest (docs/worldwide_sampling.md).
+Identify the batch in the catalog with --notes-label. Idempotent —
 already-registered cities are skipped, so it is safe to re-run and resumable
 via ``--limit``. Makes ZERO provider API calls (geocoding is rate-limited
 Nominatim, no keys needed). Dry-run by default; pass --execute to write.
@@ -76,6 +79,7 @@ DEFAULT_MANIFEST = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "worldwide_frame.csv"
 )
 
+DEFAULT_NOTES_LABEL = "worldwide frame"
 DEFAULT_OVERLAP_KM = 25.0
 DEFAULT_MAX_CENTER_KM = 50.0
 
@@ -132,9 +136,9 @@ def geocode_queries(row):
     return [query] if fallback == query else [query, fallback]
 
 
-def register_frame_city(conn, row, step, use_geonames_center, max_center_km):
+def register_frame_city(conn, row, step, use_geonames_center, max_center_km, notes_label):
     """
-    Register one frame city with GeoNames ASCII identity + geocoded geometry.
+    Register one manifest city with GeoNames ASCII identity + geocoded geometry.
 
     Mirrors cli._resolve_geometry's new-city branch (center from the OSM bbox,
     dimensions from the boundary, clamped to MAX_GRID_DIM_M) but pins the
@@ -201,7 +205,7 @@ def register_frame_city(conn, row, step, use_geonames_center, max_center_km):
         grid_height_m=grid_height,
         step_m=step,
         enabled=False,
-        notes=f"worldwide frame (geonameid {row['geonameid']}); pending boundary vetting",
+        notes=f"{notes_label} (geonameid {row['geonameid']}); pending boundary vetting",
     )
     # Alias the query slug to the canonical id so `streetscape_tracker.py
     # "<query>"` resolves without geocoding (usually identical, since
@@ -255,6 +259,12 @@ def parse_args(argv=None):
         action="store_true",
         help="when the geocoded center fails the --max-center-km guard, fall "
         "back to the GeoNames coordinates instead of skipping the city",
+    )
+    p.add_argument(
+        "--notes-label",
+        default=DEFAULT_NOTES_LABEL,
+        help="batch label written into cities.notes, so a later reader can tell "
+        "which manifest a city came from (default: %(default)s)",
     )
     p.add_argument(
         "--db-path", default=None, help="catalog path (default: the standard data-dir DB)"
@@ -319,7 +329,12 @@ def main(argv=None):
                 continue
             try:
                 city_row = register_frame_city(
-                    conn, row, args.step, args.center_from_geonames, args.max_center_km
+                    conn,
+                    row,
+                    args.step,
+                    args.center_from_geonames,
+                    args.max_center_km,
+                    args.notes_label,
                 )
                 print(
                     f"{prefix} -> registered {city_row.city_id} "
