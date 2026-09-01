@@ -5293,17 +5293,67 @@ def test_every_scheduled_channel_declares_whether_it_is_resumable():
     assert set(CHANNEL_RESUMABLE) == set(KNOWN_PROVIDERS) | set(STREET_CHANNELS)
 
 
-def test_only_kartaview_is_resumable_today():
+def test_the_two_kartaview_channels_are_the_resumable_ones():
     """Mapillary checkpoints its tile census (#256) and is still False here: the
     property is 'accepts a REQUEST CAP that pauses', and download_mapillary
     takes only max_requests_per_minute — a pacing knob, with no stop_reason and
     no SweepIncompleteError. Conflating the two would hand a Mapillary child a
-    budget it has no way to honour."""
+    budget it has no way to honour.
+
+    The walk is True with the grid run because it reads the same census by the
+    same radius sweep, so it inherits the same defect: its --daily-budget is a
+    gate priced from a geometric floor, not a ceiling on what the sweep spends.
+    """
     from streetscape_metadata_tracker.scheduler import CHANNEL_RESUMABLE, is_resumable_channel
 
-    assert [c for c, v in CHANNEL_RESUMABLE.items() if v] == ["kartaview"]
+    assert sorted(c for c, v in CHANNEL_RESUMABLE.items() if v) == [
+        "kartaview",
+        "kartaview_streets",
+    ]
     assert is_resumable_channel("kartaview")
     assert not is_resumable_channel("mapillary")
+    assert not is_resumable_channel("mapillary_streets")
+
+
+def test_the_walk_gets_the_request_cap_too_not_only_the_budget_gate(conn):
+    """A True in CHANNEL_RESUMABLE that nothing reads downstream is the
+    fail-open the table was written against: the launch site would compute a cap
+    for this channel and _street_collect_cmd would drop it, while the budget
+    gate believed the night was bounded.
+
+    Both flags are passed, not one. They are a gate and a stop with opposite
+    subtraction conventions — --daily-budget is the FULL ceiling because this
+    collector subtracts today's spend itself, and the cap arrives already
+    subtracted because nothing in the child can compute it.
+    """
+    from streetscape_metadata_tracker.scheduler import _street_collect_cmd
+
+    cid = _register(conn, "Krabi", width=1000, height=1000, step=20)
+    city = db.resolve_city(conn, cid)
+    cfg = _sweep_cfg()
+    cmd = _street_collect_cmd(cfg, city, date(2026, 7, 1), "kartaview_streets", 8, 9_000, 1_234)
+
+    assert cmd[cmd.index("--kartaview-max-requests") + 1] == "1234"
+    assert cmd[cmd.index("--daily-budget") + 1] == "9000"
+
+    # Unset still means sweep-to-completion, for every direct caller and manual
+    # run — and must never degrade to a 0 the CLI refuses.
+    plain = _street_collect_cmd(cfg, city, date(2026, 7, 1), "kartaview_streets", 8, 9_000)
+    assert "--kartaview-max-requests" not in plain
+
+
+def test_a_mapillary_walk_never_gets_a_request_cap(conn):
+    """The cap is scoped to the channels that can honour it. mapillary_streets
+    reads a tile census with no request cap at all, so a flag here would be
+    parsed and dropped while the gate believed it bounded the night."""
+    from streetscape_metadata_tracker.scheduler import _street_collect_cmd
+
+    cid = _register(conn, "Bend", width=1000, height=1000, step=20)
+    city = db.resolve_city(conn, cid)
+    cmd = _street_collect_cmd(
+        _sweep_cfg(), city, date(2026, 7, 1), "mapillary_streets", 8, 9_000, 1_234
+    )
+    assert "--kartaview-max-requests" not in cmd
 
 
 def test_an_unknown_channel_is_a_keyerror_not_a_default():
@@ -5873,7 +5923,7 @@ def test_the_pause_log_names_how_far_the_sweep_actually_got(conn, tmp_path, monk
             f,
         )
 
-    assert "3/8 root cells" in sched._sweep_progress_note(city, "kartaview")
+    assert "3/8 root cells" in sched._sweep_progress_note(_sweep_cfg(), city, "kartaview")
 
 
 def test_a_checkpoint_running_out_of_days_is_warned_about_before_it_is_discarded(
@@ -5905,7 +5955,7 @@ def test_a_checkpoint_running_out_of_days_is_warned_about_before_it_is_discarded
             f,
         )
 
-    note = sched._sweep_progress_note(city, "kartaview")
+    note = sched._sweep_progress_note(_sweep_cfg(), city, "kartaview")
     assert "WARNING" in note
     assert "not finishing at this nightly budget" in note
 
@@ -5925,9 +5975,9 @@ def test_an_unreadable_checkpoint_never_breaks_the_amnesty(conn, tmp_path, monke
     with open(os.path.join(path, "state.json"), "w", encoding="utf-8") as f:
         f.write("{not json")
 
-    assert sched._sweep_progress_note(city, "kartaview") == ""
+    assert sched._sweep_progress_note(_sweep_cfg(), city, "kartaview") == ""
     # And a channel that cannot pause at all is silent rather than guessing.
-    assert sched._sweep_progress_note(city, "gsv") == ""
+    assert sched._sweep_progress_note(_sweep_cfg(), city, "gsv") == ""
 
 
 def test_a_checkpointed_pause_is_not_recorded_as_a_city_failure(conn, monkeypatch):

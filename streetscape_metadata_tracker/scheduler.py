@@ -224,13 +224,24 @@ def is_opt_in_channel(name: str) -> bool:
 # that ignores it and let the budget gate believe it is bounded. A missing
 # entry must be a KeyError, and
 # test_every_scheduled_channel_declares_whether_it_is_resumable asserts set
-# EQUALITY so a new token cannot land without a decision.
+# EQUALITY so a new token cannot land without a decision. That test earned its
+# keep immediately: #299 added kartaview_streets while this was in review, and
+# the set check is what turned an unconsidered channel into a red build instead
+# of a sixth channel quietly inheriting whichever default was written here.
+#
+# BOTH KartaView channels are True, because the walk reads the same census by
+# the same radius sweep and so inherits the same defect exactly -- its
+# --daily-budget is a GATE priced from a geometric floor, not a ceiling on what
+# the sweep then spends. Marking the walk True is only honest because
+# _street_collect_cmd actually forwards the cap; a True here with nothing
+# reading it downstream is the fail-open this table was written against.
 CHANNEL_RESUMABLE: dict[str, bool] = {
     "gsv": False,
     "gsv_streets": False,
+    "kartaview": True,
+    "kartaview_streets": True,
     "mapillary": False,
     "mapillary_streets": False,
-    "kartaview": True,
 }
 
 
@@ -3027,6 +3038,7 @@ def _street_collect_cmd(
     channel: str,
     conn_limit: int,
     daily_budget: int,
+    request_cap: int | None = None,
 ) -> list[str]:
     """Argv for a road-walk collection of one (city, street channel).
 
@@ -3107,6 +3119,20 @@ def _street_collect_cmd(
                 "--kartaview-max-requests-per-minute",
                 str(pc.max_requests_per_minute),
             ]
+        # And the night's REMAINING budget as a hard stop (#273). --daily-budget
+        # above only GATES: the collector prices it from estimate_sweep_requests,
+        # a geometric FLOOR (measured overhead 1.80x; Yogyakarta ran 3.0x), so a
+        # gate that passes does not bound what the sweep then spends against a
+        # host that meters by IP. This is the enforceable half, and it is the
+        # same defect the grid channel had -- the walk reads the same census by
+        # the same sweep, so it inherits it exactly.
+        #
+        # Both flags, not one: they are a gate and a stop, with opposite
+        # subtraction conventions. --daily-budget is the FULL ceiling because
+        # this collector subtracts today's spend itself; the cap arrives already
+        # subtracted, because nothing in the child can compute it.
+        if request_cap is not None:
+            cmd += ["--kartaview-max-requests", str(request_cap)]
     # '--' so a display name can never be parsed as a flag
     cmd += ["--", city.display_name]
     return cmd
@@ -3277,7 +3303,7 @@ def _run_one_city(
     conn_limit = cfg.connection_limit if connection_limit is None else connection_limit
 
     if is_street_channel(provider):
-        cmd = _street_collect_cmd(cfg, city, today, provider, conn_limit, daily_budget)
+        cmd = _street_collect_cmd(cfg, city, today, provider, conn_limit, daily_budget, request_cap)
         estimated = (
             _channel_estimate(cfg, city, provider, conn)
             if estimated_requests is None
@@ -4068,7 +4094,7 @@ def _log_channel_error(city_id: str, provider: str, exc: BaseException) -> None:
         logger.exception(f"{city_id} [{provider}]: channel raised {exc!r}")
 
 
-def _sweep_progress_note(city: db.CityRow, provider: str) -> str:
+def _sweep_progress_note(cfg: SchedulerConfig, city: db.CityRow, provider: str) -> str:
     """
     " 3/8 root cells." for a paused sweep, plus a warning when its checkpoint is
     running out of days. Empty string when nothing readable is on disk.
@@ -4087,11 +4113,23 @@ def _sweep_progress_note(city: db.CityRow, provider: str) -> str:
 
     Best-effort by construction: this runs inside a branch that has already
     decided the night was fine, so it reports nothing rather than raising.
+
+    A WALK's store is keyed by (channel, network type) and a grid run's by the
+    channel alone, so the variant is not optional decoration -- omitting it here
+    would read a grid run's checkpoint and report its progress against the
+    walk's pause.
     """
     if not is_resumable_channel(provider):
         return ""
     try:
-        progress = sweep_progress(checkpoint_path_for(city.city_id, frozen_bbox(city), provider))
+        variant = (
+            ((cfg.providers or {}).get(provider) or ProviderConfig()).network_type
+            if is_street_channel(provider)
+            else None
+        )
+        progress = sweep_progress(
+            checkpoint_path_for(city.city_id, frozen_bbox(city), provider, variant)
+        )
     except Exception:
         return ""
     if progress is None:
@@ -4632,7 +4670,7 @@ def _run_city_channels(
                             f"{city.city_id} [{provider}]: sweep paused with its progress "
                             f"checkpointed — not counted as a failure for this city; it "
                             f"stays due and resumes on the next run."
-                            f"{_sweep_progress_note(city, provider)} ({reason})"
+                            f"{_sweep_progress_note(cfg, city, provider)} ({reason})"
                         )
                         continue
 

@@ -357,7 +357,7 @@ The hazard is the one `city_timeout_seconds`' Anchorage comment already names, r
 Tier 2 (a first run) is geometry × 1.80×, and is under by ~4× on exactly those metros: Singapore's ~1,273 circles price at ~2,332 requests against the 9,974 actually spent.
 That is survivable in one direction only — #239's checkpoint means the resulting SIGKILL resumes tomorrow instead of discarding the night, bounded at five nights as above — and tier 1 corrects it from the second run onward.
 Note what none of this buys: a metro's honest timeout *exceeds* `max_batch_hours` outright, so the deadline clamp is what bounds it in a real night, and that is the intended outcome rather than a defect.
-**Both budget arms are now resumability-aware (#274), and neither applies to this channel.**
+**Both budget arms are now resumability-aware (#274), and neither applies to either KartaView channel.**
 They exist because every other channel is all-or-nothing — a partial GSV grid, a partial tile census and a partial road walk are not runs, so refusing to start is the honest answer.
 A sweep is not all-or-nothing: it spends what tonight affords, checkpoints the unvisited roots and exits 83, and nothing is finalized or published until the lattice is complete, so the run is simply dated the day it completes.
 `_run_city_channels` therefore launches an enrolled sweep with `budget - used` as its cap whatever the estimate says, instead of skipping it — the cities the old `est > budget` arm skipped forever (Singapore ~9,974 requests, New York ~12,355) being precisely the ones #239's checkpoint was built for.
@@ -367,4 +367,5 @@ The one floor that remains is `_MIN_SWEEP_LAUNCH_REQUESTS`, and it is derived ra
 A budget exhausted during radius **calibration** raises a plain `DownloadError` — "nothing was swept and nothing is checkpointed" — not `SweepIncompleteError`, so it takes none of the exit-83 amnesty and counts a real `consecutive_failure`.
 The floor is the ladder's own documented bound (`len(RADIUS_LADDER_M) * (probes + retries)`, 30 at the defaults) plus one root cell's full attempt, read from those constants so retuning the ladder carries it along.
 
-The road walk is no longer absent: #258 generalized `collect_mapillary.build_streetwalk_rows` into the shared `census_walk.py` scorer and added `collect_kartaview.py`, so `--provider kartaview` walks a city under the `kartaview_streets` budget channel — CLI-only, deliberately not a scheduler channel.
+The road walk is no longer absent: #258 generalized `collect_mapillary.build_streetwalk_rows` into the shared `census_walk.py` scorer and added `collect_kartaview.py`, and #299 made `kartaview_streets` the sixth scheduler channel — opt-in, like the grid channel it pairs with.
+It reads the same census by the same radius sweep, so it inherits the grid channel's cost arms wholesale: the same 1.80x overhead, the same geometric-floor estimate, and the same request cap, which is why both KartaView channels are `CHANNEL_RESUMABLE`.
