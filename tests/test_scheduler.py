@@ -1041,6 +1041,7 @@ def test_makelab1_production_config_is_wired():
         "mapillary",
         "mapillary_streets",
         "kartaview",
+        "kartaview_streets",
     ]
     for channel in ("mapillary", "mapillary_streets"):
         pc = cfg.providers[channel]
@@ -1064,6 +1065,20 @@ def test_makelab1_production_config_is_wired():
     # Load-bearing beyond pacing: _kartaview_timeout_seconds derives every sweep's
     # per-city timeout from this rate, so lowering it shortens those timeouts too.
     assert cfg.providers["kartaview"].max_requests_per_minute == 16
+    # The KartaView ROAD WALK (#258), turned on 2026-08-31 as the sixth channel
+    # and the second opt-in one. Same figures as the grid channel above and for
+    # the same reason: one sweep of one bbox priced one way, so a walk that
+    # misses its pairing pays exactly what the grid run would have. The rate
+    # matches too — one host lock means the two never overlap, so these are not
+    # additive — and _street_collect_cmd hands this value to the child, which is
+    # what stops the derived timeout being measured against a rate the sweep
+    # never used.
+    assert cfg.providers["kartaview_streets"].daily_request_budget == 10_000
+    assert cfg.providers["kartaview_streets"].max_requests_per_minute == 16
+    # Walks the same sample points on the same network as the other two street
+    # channels, or the three providers would not share a streets.html row.
+    assert cfg.providers["kartaview_streets"].spacing_m == 15
+    assert cfg.providers["kartaview_streets"].network_type == "drive"
     # Channel concurrency is OFF in production until both of #240's deploy gates
     # clear: resume for the Mapillary tile census (#256), because a stop now kills
     # N children at once and a killed census re-spends tiles into a per-IP ceiling
@@ -2226,15 +2241,23 @@ def test_get_due_cities_has_no_default_membership_default():
     assert param.kind is inspect.Parameter.KEYWORD_ONLY
 
 
-def test_kartaview_is_the_only_opt_in_channel_today():
-    """Pins the actual policy, not just its shape — the four scheduled channels
-    are cheap enough per city that catalog-wide membership is right for them,
-    and flipping one of them to opt-in would silently empty its nightly queue.
+def test_the_two_kartaview_channels_are_the_opt_in_ones_today():
+    """Pins the actual policy, not just its shape — the four non-KartaView
+    channels are cheap enough per city that catalog-wide membership is right for
+    them, and flipping one of them to opt-in would silently empty its nightly
+    queue.
+
+    Both KartaView channels are opt-in for one reason counted twice: they read
+    the SAME radius sweep, and one whole-catalog pass of it is ~186,000 requests
+    (docs/experiments/kartaview-sweep-cost.md). The walk gets its own entry
+    rather than inheriting the grid channel's, so enrolling a city in street
+    coverage stays a separate decision from enrolling it in grid coverage and
+    schedule_state.member keeps exactly one meaning for NULL (#258).
     """
     from streetscape_metadata_tracker.scheduler import CHANNEL_DEFAULT_MEMBERSHIP
 
     opt_in = sorted(c for c, default in CHANNEL_DEFAULT_MEMBERSHIP.items() if not default)
-    assert opt_in == ["kartaview"]
+    assert opt_in == ["kartaview", "kartaview_streets"]
 
 
 def test_the_hoist_is_the_identity_permutation_without_an_opt_in_channel(conn):
@@ -2871,6 +2894,88 @@ def test_street_channel_passes_its_network_type_to_the_collector(conn):
     assert default_cmd[default_cmd.index("--network-type") + 1] == "drive"
 
 
+def test_the_kartaview_walk_child_is_told_the_pace_its_timeout_assumes(conn):
+    """#238's fourth fail-open arm, arriving at the walk channel (#258).
+
+    `_kartaview_timeout_seconds` divides the sweep estimate by the CONFIGURED
+    rate. A child left on the collector's own default would then be measured
+    against a rate the sweep never used — and the failure is a SIGKILL
+    mid-sweep, which records no `api_usage` (the spend vanishes from the daily
+    ledger) and burns one of the five `consecutive_failures` that only a
+    success resets.
+
+    Pinned as a PASS-THROUGH, not a default: the configured value is mutated,
+    because asserting the shipped 16 would pass just as well against a call
+    site that hardcoded it.
+    """
+    from streetscape_metadata_tracker.scheduler import ProviderConfig, _street_collect_cmd
+
+    cid = _register(conn, "Bend", width=5000, height=5000, step=20)
+    city = db.resolve_city(conn, cid)
+
+    def rate_in_cmd(pc):
+        cmd = _street_collect_cmd(
+            SchedulerConfig(providers={"kartaview_streets": pc}),
+            city,
+            date(2026, 7, 8),
+            "kartaview_streets",
+            10,
+            100,
+        )
+        if "--kartaview-max-requests-per-minute" not in cmd:
+            return None
+        return cmd[cmd.index("--kartaview-max-requests-per-minute") + 1]
+
+    assert rate_in_cmd(ProviderConfig(max_requests_per_minute=16)) == "16"
+    assert rate_in_cmd(ProviderConfig(max_requests_per_minute=7)) == "7"
+    # Unset means the collector's own default, and the timeout derivation then
+    # reads that same default — so the flag is omitted rather than guessed at.
+    assert rate_in_cmd(ProviderConfig()) is None
+    # Never the Mapillary flag: they pace different hosts at different rates.
+    cmd = _street_collect_cmd(
+        SchedulerConfig(
+            providers={"kartaview_streets": ProviderConfig(max_requests_per_minute=16)}
+        ),
+        city,
+        date(2026, 7, 8),
+        "kartaview_streets",
+        10,
+        100,
+    )
+    assert "--mapillary-max-requests-per-minute" not in cmd
+    # And the child walks the KartaView imagery series, from STREET_CHANNELS.
+    assert cmd[cmd.index("--provider") + 1] == "kartaview"
+
+
+def test_the_kartaview_walk_ranks_immediately_after_the_grid_sweep():
+    """Adjacency is a COST decision (#258/#290), not tidiness.
+
+    Both channels read one sweep of one bbox. Whichever launches first pays and
+    promotes it into the shared census cache; the second then prices at 0
+    through `_channel_estimate`. Anything ranked BETWEEN them is the ordering
+    that is actually wrong — a night that reaches one but not the other pays
+    full price on the next.
+    """
+    cfg = SchedulerConfig(
+        providers={
+            p: ProviderConfig()
+            for p in (
+                "gsv",
+                "gsv_streets",
+                "mapillary",
+                "mapillary_streets",
+                "kartaview",
+                "kartaview_streets",
+            )
+        }
+    )
+    order = cfg.enabled_providers()
+    assert order.index("kartaview_streets") == order.index("kartaview") + 1
+    # The sweep pair stays LAST as a pair: #238's argument is that a multi-hour
+    # sweep absorbs deadline truncation most cheaply, and it applies to both.
+    assert order[-2:] == ["kartaview", "kartaview_streets"]
+
+
 def test_mapillary_street_estimate_is_tiles_not_samples(conn):
     cid = _register(conn, "Bend", width=5000, height=5000, step=20)
     city = db.resolve_city(conn, cid)
@@ -2883,6 +2988,84 @@ def test_mapillary_street_estimate_is_tiles_not_samples(conn):
     assert estimate_requests(city, "gsv_streets", conn=conn) > estimate_requests(
         city, "mapillary_streets", conn=conn
     )
+
+
+def test_kartaview_street_estimate_is_the_sweep_not_the_grid_formula(conn):
+    """The #238 fail-open shape, arriving at the walk channel (#258).
+
+    An unlisted channel falls through `estimate_requests` to the GSV GRID
+    formula — `(w/step + 1) * (h/step + 1)`, tens of thousands of "requests"
+    for a bbox the sweep covers in a handful of circles — and that number
+    feeds BOTH budget gates. Wrong in both directions: it defers a city that
+    fits, and under #274 a city whose estimate exceeds the budget is skipped
+    *permanently* rather than deferred.
+
+    Asserted against the grid formula explicitly rather than as "small",
+    because "smaller than GSV" is also true of the tile count and would not
+    distinguish a walk that had silently inherited the wrong census.
+    """
+    cid = _register(conn, "Bend", width=5000, height=5000, step=20)
+    city = db.resolve_city(conn, cid)
+
+    # Same sweep as the grid channel, priced the same way: one observation,
+    # two ledgers.
+    assert estimate_requests(city, "kartaview_streets", conn=conn) == estimate_requests(
+        city, "kartaview", conn=conn
+    )
+    grid_formula = (city.grid_width_m // city.step_m + 1) * (city.grid_height_m // city.step_m + 1)
+    assert estimate_requests(city, "kartaview_streets", conn=conn) < grid_formula
+
+    # And independent of spacing, which is what makes it schedulable at all:
+    # there is no per-sample endpoint, the walk joins the census locally.
+    assert estimate_requests(
+        city, "kartaview_streets", conn=conn, spacing_m=15
+    ) == estimate_requests(city, "kartaview_streets", conn=conn, spacing_m=30)
+    assert estimate_requests(city, "gsv_streets", conn=conn) > estimate_requests(
+        city, "kartaview_streets", conn=conn
+    )
+
+
+def test_the_kartaview_walk_is_timed_by_the_SWEEP_rate_fraction(conn, monkeypatch):
+    """Without its arm in `city_timeout_seconds` the channel reaches the
+    GENERIC per-point derivation instead of `_kartaview_timeout_seconds` (#238).
+
+    Asserting "> the flat floor" or "== the grid channel's timeout" does NOT
+    catch that, and both were tried: `_ACHIEVED_RATE_FRACTION` and
+    `_SWEEP_ACHIEVED_RATE_FRACTION` are BOTH 0.5 today, and the estimate arm
+    already routes this channel to the sweep count, so the two paths currently
+    compute the identical number. Pinning that equality would pin a
+    coincidence — the same trap as pinning `census => not hasCopyrightFilter`
+    on the registry — and it would go on passing while the channel quietly took
+    the wrong path.
+
+    So pin the DERIVATION instead: move the sweep's own rate fraction and the
+    walk's timeout must move with it. The two constants are documented as
+    separate quantities (the sweep's is deliberately loose because per-request
+    latency competes with a 16/min pacing interval), so they are free to part
+    company, and on the day they do this channel must follow the sweep.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    floor_min = 180
+    cfg = SchedulerConfig(
+        city_timeout_minutes=floor_min,
+        providers={
+            "kartaview": ProviderConfig(max_requests_per_minute=16),
+            "kartaview_streets": ProviderConfig(max_requests_per_minute=16),
+        },
+    )
+    cid = _register(conn, "Metropolis", width=40000, height=40000, step=20)
+    city = db.resolve_city(conn, cid)
+
+    baseline = sched.city_timeout_seconds(cfg, city, "kartaview_streets", conn=conn)
+    assert baseline > floor_min * 60, "fell through to the flat floor"
+
+    # Halving the ACHIEVED fraction doubles the paced time, for both KartaView
+    # channels and only for them.
+    monkeypatch.setattr(sched, "_SWEEP_ACHIEVED_RATE_FRACTION", 0.25)
+    slower = sched.city_timeout_seconds(cfg, city, "kartaview_streets", conn=conn)
+    assert slower > baseline, "walk is not timed off the sweep's rate fraction"
+    assert slower == sched.city_timeout_seconds(cfg, city, "kartaview", conn=conn)
 
 
 def test_street_timeout_scales_like_gsv_not_the_flat_floor(conn):
@@ -7301,27 +7484,43 @@ def test_only_the_census_channels_read_the_cache(conn):
     assert _channel_estimate(cfg, city, "gsv_streets", conn) > 0
 
 
-def test_both_mapillary_channels_and_kartaview_read_their_providers_entry(conn):
+def test_both_census_channel_pairs_read_their_providers_entry(conn):
     """
     The channel -> provider mapping is the whole point: 'mapillary' and
     'mapillary_streets' are different ledgers reading ONE observation, and
-    KartaView's grid run and the #258 walk will be the same.
+    since #258 'kartaview' and 'kartaview_streets' are the same pair over the
+    radius sweep.
+
+    Directionality is asserted BOTH ways for KartaView, because production has
+    now done it both ways round: the first KartaView walk (Krabi, 2026-08-31)
+    paid the sweep itself and stamped `fetched_by: kartaview_streets`, which is
+    the entry the next grid run reads for free. The cache keys on the PROVIDER
+    and merely records who paid — a channel-keyed entry would reuse nothing,
+    silently, which is the failure this pins.
     """
     from streetscape_metadata_tracker.scheduler import _channel_estimate
 
     cid = _register(conn, "Bend", width=5000, height=5000, step=20)
     city = db.resolve_city(conn, cid)
-    cfg = SchedulerConfig(
-        providers={p: ProviderConfig() for p in ("mapillary", "mapillary_streets", "kartaview")}
-    )
+    channels = ("mapillary", "mapillary_streets", "kartaview", "kartaview_streets")
+    cfg = SchedulerConfig(providers={p: ProviderConfig() for p in channels})
 
     _stamp_census_cache(city, "mapillary", fetched_by="mapillary_streets")
     assert _channel_estimate(cfg, city, "mapillary", conn) == 0
     assert _channel_estimate(cfg, city, "mapillary_streets", conn) == 0
     assert _channel_estimate(cfg, city, "kartaview", conn) > 0, "different provider, own entry"
+    assert _channel_estimate(cfg, city, "kartaview_streets", conn) > 0
 
+    # The paired night, in the order the scheduler actually launches them: the
+    # grid run pays, and the walk ranked immediately after it prices at 0.
     _stamp_census_cache(city, "kartaview", fetched_by="kartaview")
     assert _channel_estimate(cfg, city, "kartaview", conn) == 0
+    assert _channel_estimate(cfg, city, "kartaview_streets", conn) == 0
+
+    # And the reverse, which is how the seed city was actually collected.
+    _stamp_census_cache(city, "kartaview", fetched_by="kartaview_streets")
+    assert _channel_estimate(cfg, city, "kartaview", conn) == 0
+    assert _channel_estimate(cfg, city, "kartaview_streets", conn) == 0
 
 
 def test_an_expired_entry_prices_the_channel_at_full_cost(conn):

@@ -207,13 +207,39 @@ jitter = 0.6
 # authenticated ceiling. Requires KARTAVIEW_ACCESS_TOKEN in .env — anonymous is
 # 100 req/h, which is not a slower channel, it is no channel.
 #
-# This is the FIFTH channel, so the effective max_concurrent_channels ceiling is
-# 4 of 5 (kartaview.org is a per-IP host shared with nothing). Moot at the knob's
-# current value of 1. See config/scheduler.toml for the full field docs.
+# See config/scheduler.toml for the full field docs.
 [providers.kartaview]
 enabled = true
 daily_request_budget = 10000
 max_requests_per_minute = 16
+
+# KartaView road walk (issue #258) — the SECOND opt-in channel, enrolled
+# SEPARATELY from the grid one above: `scheduler enroll-city CITY --channel
+# kartaview_streets`. Declaring this block enrolls nobody. Seed set on this host
+# is the same two cities, so the pairing below actually happens.
+#
+# It is nearly free WHEN PAIRED. Both KartaView channels read one sweep of one
+# bbox; whichever runs first promotes it into the shared census cache (#290) and
+# the second prices at 0 — which is why kartaview_streets ranks immediately
+# after kartaview in the launch order. Un-paired it pays a full sweep, and that
+# is what this budget covers. Same FLOOR-not-ceiling caveat as above (#273/#274),
+# same load-bearing rate (the per-city timeout is derived from it, and
+# _street_collect_cmd passes it to the child so the two cannot disagree).
+#
+# Credential: KARTAVIEW_STREETS_ACCESS_TOKEN if set, else KARTAVIEW_ACCESS_TOKEN.
+# The only street channel that falls back, because one machine-wide host lock
+# serializes every KartaView request — there is no parallel burn to isolate.
+#
+# These are now the FIFTH and SIXTH channels. The effective
+# max_concurrent_channels ceiling stays 4, now 4 of 6: the largest host-disjoint
+# set is gsv (no per-IP host) + ONE of the three Overpass channels + mapillary
+# (tile CDN) + kartaview (kartaview.org). Moot at the knob's current value of 1.
+[providers.kartaview_streets]
+enabled = true
+daily_request_budget = 10000
+max_requests_per_minute = 16
+spacing_m = 15
+network_type = "drive"
 
 [download]
 batch_size = 100
