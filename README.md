@@ -114,11 +114,13 @@ The full provenance and sampling methodology — the record to cite in publicati
 | Street coverage and road walks | [`docs/street-coverage.md`](docs/street-coverage.md) |
 | Nightly scheduler | [`docs/scheduler.md`](docs/scheduler.md) |
 | Measured experiments | [`docs/experiments/README.md`](docs/experiments/README.md) |
+| Related tools and literature | [`docs/related-work.md`](docs/related-work.md) |
 
 ## Related tools
 
-[sv-map](https://sv-map.netlify.app/) archives Google's blue Street View coverage lines daily as images and diffs them pixel-wise; [Virtual Streets](https://virtualstreets.org/) blogs about new Street View coverage.
-Both track *where* coverage exists; Streetscape Tracker tracks the underlying metadata — counts, capture dates, and change — across providers.
+[sv-map](https://sv-map.netlify.app/) archives Google's blue Street View coverage lines daily as images and diffs them pixel-wise; [Virtual Streets](https://virtualstreets.org/) blogs about new Street View coverage; [ZenSVI](https://github.com/koito19960406/ZenSVI) is the most complete open-source street view imagery pipeline, covering Mapillary and KartaView but not Google.
+They track *where* coverage exists, or analyze one collection of it; Streetscape Tracker tracks the underlying metadata — counts, capture dates, and change — across providers and over time.
+The full landscape scan, the differentiation, and the literature to cite are in [`docs/related-work.md`](docs/related-work.md).
 
 ## License
 
