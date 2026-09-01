@@ -5776,6 +5776,64 @@ def _enroll_kartaview(conn, cid):
     db.set_channel_membership(conn, cid, "kartaview", True, cycle_days=90)
 
 
+def _write_sweep_checkpoint(city, channel, *, roots_done, root_count, days_old, variant=None):
+    """Put a sweep checkpoint on disk for (city, channel), aged `days_old` days.
+
+    The age is written into `created_at`, the FIRST commit, because that is what
+    CHECKPOINT_MAX_AGE_S is enforced against (#272) — a resume moves
+    `updated_at` and would otherwise look perpetually fresh. The caller must
+    already have pointed STREETSCAPE_CHECKPOINT_DIR at a tmp_path.
+
+    Goes through checkpoint_path_for rather than building the directory name,
+    for the reason every per-(city, provider) artifact does: the channel and the
+    variant are what keep a walk's store from being read as the grid run's.
+    """
+    from streetscape_metadata_tracker.checkpointing import checkpoint_path_for, frozen_bbox
+
+    path = checkpoint_path_for(city.city_id, frozen_bbox(city), channel, variant)
+    os.makedirs(path, exist_ok=True)
+    started = datetime.now(UTC) - timedelta(days=days_old)
+    with open(os.path.join(path, "state.json"), "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "roots_done": roots_done,
+                "root_count": root_count,
+                "created_at": started.isoformat(),
+            },
+            f,
+        )
+    return path
+
+
+def _checkpointed_city(
+    conn,
+    tmp_path,
+    monkeypatch,
+    *,
+    roots_done,
+    root_count,
+    days_old,
+    channel="kartaview",
+    variant=None,
+    name="Bend",
+    width=1000,
+    height=1000,
+):
+    """A registered city with one sweep checkpoint already on disk."""
+    cid = _register(conn, name, width=width, height=height, step=20)
+    city = db.resolve_city(conn, cid)
+    monkeypatch.setenv("STREETSCAPE_CHECKPOINT_DIR", str(tmp_path))
+    _write_sweep_checkpoint(
+        city,
+        channel,
+        roots_done=roots_done,
+        root_count=root_count,
+        days_old=days_old,
+        variant=variant,
+    )
+    return city
+
+
 def _run_loop_capturing_kwargs(monkeypatch, conn, cfg, calls, today=date(2026, 7, 2)):
     """Like _run_loop_with, but keeps the kwargs the launch site handed down.
 
@@ -6055,11 +6113,12 @@ def test_the_pause_log_names_how_far_the_sweep_actually_got(conn, tmp_path, monk
             f,
         )
 
-    assert "3/8 root cells" in sched._sweep_progress_note(_sweep_cfg(), city, "kartaview")
+    progress = sched._sweep_checkpoint_progress(_sweep_cfg(), city, "kartaview")
+    assert "3/8 root cells" in sched._sweep_progress_note(progress)
 
 
-def test_a_checkpoint_running_out_of_days_is_warned_about_before_it_is_discarded(
-    conn, tmp_path, monkeypatch
+def test_a_checkpoint_running_out_of_days_is_warned_about_at_warning_LEVEL(
+    conn, tmp_path, monkeypatch, caplog
 ):
     """The pathology the age wall creates, which no individual night looks like.
 
@@ -6067,29 +6126,40 @@ def test_a_checkpoint_running_out_of_days_is_warned_about_before_it_is_discarded
     cannot finish inside it has its checkpoint discarded mid-crawl and
     re-sweeps from scratch — forever, and silently, because every night in
     between reads as ordinary progress.
+
+    The notice used to be the substring "WARNING:" inside a record logged at
+    INFO, which is invisible to every severity filter, every handler that splits
+    by level, and every operator grepping for warnings — on the one line saying
+    a sweep is about to have its whole spend thrown away. So this asserts the
+    RECORD's level, not its text: the old shape emitted no warning record at all
+    and put the word inside the progress note, which is what the second
+    assertion refuses.
     """
     from streetscape_metadata_tracker import scheduler as sched
-    from streetscape_metadata_tracker.checkpointing import (
-        CHECKPOINT_MAX_AGE_S,
-        checkpoint_path_for,
-        frozen_bbox,
-    )
 
-    cid = _register(conn, "Bend", width=1000, height=1000, step=20)
-    city = db.resolve_city(conn, cid)
-    monkeypatch.setenv("STREETSCAPE_CHECKPOINT_DIR", str(tmp_path))
-    path = checkpoint_path_for(city.city_id, frozen_bbox(city), "kartaview")
-    os.makedirs(path, exist_ok=True)
-    started = datetime.now(UTC) - timedelta(seconds=CHECKPOINT_MAX_AGE_S - 3600)
-    with open(os.path.join(path, "state.json"), "w", encoding="utf-8") as f:
-        json.dump(
-            {"roots_done": 3, "root_count": 800, "created_at": started.isoformat()},
-            f,
-        )
+    city = _checkpointed_city(conn, tmp_path, monkeypatch, roots_done=3, root_count=800, days_old=6)
 
-    note = sched._sweep_progress_note(_sweep_cfg(), city, "kartaview")
-    assert "WARNING" in note
-    assert "not finishing at this nightly budget" in note
+    progress = sched._sweep_checkpoint_progress(_sweep_cfg(), city, "kartaview")
+    with caplog.at_level(logging.INFO, logger="streetscape_scheduler"):
+        sched._warn_if_checkpoint_near_the_age_wall(city.city_id, "kartaview", progress)
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1, "the age wall has to reach a severity filter, not just the text"
+    assert "not finishing at this nightly budget" in warnings[0].getMessage()
+    assert "WARNING" not in sched._sweep_progress_note(progress)
+
+
+def test_a_fresh_checkpoint_is_not_warned_about(conn, tmp_path, monkeypatch, caplog):
+    """The complement: a warning every night is a warning nobody reads. Sits
+    beside the case above so a margin widened to "always" fails something."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    city = _checkpointed_city(conn, tmp_path, monkeypatch, roots_done=3, root_count=800, days_old=1)
+
+    progress = sched._sweep_checkpoint_progress(_sweep_cfg(), city, "kartaview")
+    with caplog.at_level(logging.INFO, logger="streetscape_scheduler"):
+        sched._warn_if_checkpoint_near_the_age_wall(city.city_id, "kartaview", progress)
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
 
 def test_an_unreadable_checkpoint_never_breaks_the_amnesty(conn, tmp_path, monkeypatch):
@@ -6107,9 +6177,376 @@ def test_an_unreadable_checkpoint_never_breaks_the_amnesty(conn, tmp_path, monke
     with open(os.path.join(path, "state.json"), "w", encoding="utf-8") as f:
         f.write("{not json")
 
-    assert sched._sweep_progress_note(_sweep_cfg(), city, "kartaview") == ""
+    assert sched._sweep_checkpoint_progress(_sweep_cfg(), city, "kartaview") is None
+    assert sched._sweep_progress_note(None) == ""
     # And a channel that cannot pause at all is silent rather than guessing.
-    assert sched._sweep_progress_note(_sweep_cfg(), city, "gsv") == ""
+    assert sched._sweep_checkpoint_progress(_sweep_cfg(), city, "gsv") is None
+
+
+# ── The age wall, ACTED on rather than annotated (issues #273, #274) ─────────
+#
+# A checkpoint older than CHECKPOINT_MAX_AGE_S is discarded by the CHILD, which
+# then re-commits on the same path with a fresh created_at -- so an
+# under-budgeted city re-sweeps from root 0 every seven days, forever, and every
+# individual night reads as ordinary progress. Nothing in the scheduler saw it:
+# a pause records no consecutive_failure, contributes to no `unhealthy`
+# component and sends no email, and the child's discard warning sits at the top
+# of a log whose last 25 lines are the only part ever copied out.
+
+
+def _wall_cfg(budget=100):
+    """A KartaView channel whose nightly remainder cannot finish a Metro sweep.
+
+    100 requests against a ~405-request estimate: over the calibration floor
+    (34), so the FLOOR arm cannot be what refuses these launches, and under the
+    estimate, so the night genuinely cannot finish the lattice. That gap is what
+    makes the age-wall arm the only thing these cases can be exercising.
+    """
+    cfg = _sweep_cfg(publish_enabled=False)
+    cfg.providers["kartaview"] = ProviderConfig(enabled=True, daily_request_budget=budget)
+    return cfg
+
+
+@pytest.mark.parametrize("days_old", [6.1, 7.5])
+def test_a_checkpoint_at_the_age_wall_is_refused_and_recorded_as_a_failure(
+    conn, tmp_path, monkeypatch, caplog, days_old
+):
+    """Both nights of the pathology, and the second one is the discard itself.
+
+    At 6.1 days the next resume spends a whole night on a checkpoint that will
+    be thrown away before it can be used; at 7.5 the child has ALREADY passed
+    the wall, so resuming discards the crawl and starts over at root 0 —
+    stamping a fresh created_at, which is what makes the cycle weekly and
+    endless rather than self-limiting.
+
+    The refusal is recorded as a real failure on purpose, and that is the half
+    that reaches an operator: `failures = attempted - succeeded` is what
+    _finish_batch alerts on, and `consecutive_failures` is what quarantines the
+    city after five nights instead of burning ~60k requests a cycle on a sweep
+    that cannot finish. A pause records neither, which is exactly how this ran
+    silently.
+    """
+    city = _checkpointed_city(
+        conn,
+        tmp_path,
+        monkeypatch,
+        roots_done=3,
+        root_count=800,
+        days_old=days_old,
+        name="Metro",
+        width=20_000,
+        height=20_000,
+    )
+    _enroll_kartaview(conn, city.city_id)
+
+    calls = []
+    with caplog.at_level(logging.WARNING, logger="streetscape_scheduler"):
+        rc = _run_loop_capturing_kwargs(monkeypatch, conn, _wall_cfg(), calls)
+
+    assert not [c for c in calls if c[1] == "kartaview"], (
+        "resuming buys one more night that the child then throws away with the checkpoint"
+    )
+    refusals = [r for r in caplog.records if "refusing to resume" in r.getMessage()]
+    assert len(refusals) == 1
+    assert refusals[0].levelno == logging.WARNING
+    message = refusals[0].getMessage()
+    assert city.city_id in message and "3/800" in message and "days old" in message
+    # The alert path, both halves of it.
+    row = conn.execute(
+        "SELECT consecutive_failures FROM schedule_state WHERE city_id = ? AND provider = ?",
+        (city.city_id, "kartaview"),
+    ).fetchone()
+    assert row["consecutive_failures"] == 1, "a skip nothing counts is how this stayed invisible"
+    assert rc != 0, "the night has to end unhealthy, or no email is sent"
+
+
+def test_a_checkpoint_near_the_wall_that_tonight_CAN_finish_is_still_resumed(
+    conn, tmp_path, monkeypatch
+):
+    """The refusal is "it cannot finish", not "it is old".
+
+    A sweep 799 root cells into 800 needs a fraction of its estimate to land,
+    and refusing it on its last night would throw away the whole crawl the wall
+    is there to protect — the opposite of the point. Same city, same budget and
+    a checkpoint the same age as the case above: only `roots_done` differs, so
+    a guard that reads the age alone fails this.
+    """
+    city = _checkpointed_city(
+        conn,
+        tmp_path,
+        monkeypatch,
+        roots_done=799,
+        root_count=800,
+        days_old=6.1,
+        name="Metro",
+        width=20_000,
+        height=20_000,
+    )
+    _enroll_kartaview(conn, city.city_id)
+
+    calls = []
+    _run_loop_capturing_kwargs(monkeypatch, conn, _wall_cfg(), calls)
+
+    assert [c for c in calls if c[1] == "kartaview"], "its last night is the one that finishes it"
+
+
+@pytest.mark.parametrize("checkpointed", [True, False])
+def test_a_sweep_with_days_to_spare_launches_exactly_as_before(
+    conn, tmp_path, monkeypatch, checkpointed
+):
+    """The two shapes a healthy night has — a young checkpoint, and none at all.
+
+    Both launch capped and resume; neither records a failure. Without this the
+    age-wall arm could be refusing every resumable channel and the tests above
+    would still pass.
+    """
+    if checkpointed:
+        city = _checkpointed_city(
+            conn,
+            tmp_path,
+            monkeypatch,
+            roots_done=3,
+            root_count=800,
+            days_old=1,
+            name="Metro",
+            width=20_000,
+            height=20_000,
+        )
+    else:
+        cid = _register(conn, "Metro", width=20_000, height=20_000, step=20)
+        city = db.resolve_city(conn, cid)
+    _enroll_kartaview(conn, city.city_id)
+
+    calls = []
+    _run_loop_capturing_kwargs(monkeypatch, conn, _wall_cfg(), calls)
+
+    sweeps = [c for c in calls if c[1] == "kartaview"]
+    assert sweeps, "a sweep with room to run is launched capped, exactly as #274 says"
+    assert sweeps[0][2]["request_cap"] == 100
+    row = conn.execute(
+        "SELECT consecutive_failures FROM schedule_state WHERE city_id = ? AND provider = ?",
+        (city.city_id, "kartaview"),
+    ).fetchone()
+    assert row is None or row["consecutive_failures"] == 0
+
+
+# ── A paused grid sweep and its paired walk (issues #274, #290) ──────────────
+
+
+def _kartaview_pair_cfg(**overrides):
+    """Both KartaView channels and nothing else, so the slate is the pair."""
+    providers = {
+        "kartaview": ProviderConfig(enabled=True, daily_request_budget=20_000),
+        "kartaview_streets": ProviderConfig(enabled=True, daily_request_budget=20_000),
+    }
+    return SchedulerConfig(providers=providers, publish_enabled=False, **overrides)
+
+
+def _enroll_pair(conn, cid, channels=("kartaview", "kartaview_streets")):
+    """Opt one city into each named opt-in channel (issues #248, #258)."""
+    for channel in channels:
+        db.set_channel_membership(conn, cid, channel, True, cycle_days=90)
+
+
+def test_a_resumable_walk_names_its_grid_sibling(conn):
+    """The pairing is DATA, not a "kartaview" spelled into the launch site.
+
+    STREET_CHANNELS already maps every walk to the provider whose census it
+    reads, and it is the table channel_census_cache_marker asks for the same
+    reason: a second copy beside CHANNEL_RESUMABLE would have to be edited
+    alongside it when a channel lands, and the one that was forgotten fails
+    open. Read by direct indexing, so an unmapped walk is a KeyError.
+
+    Asserted as set EQUALITY the way CHANNEL_RESUMABLE is, so a new resumable
+    street channel cannot arrive without a decision about what it defers behind.
+    """
+    from streetscape_metadata_tracker.scheduler import (
+        CHANNEL_RESUMABLE,
+        STREET_CHANNELS,
+        is_street_channel,
+    )
+
+    walks = {c for c, resumable in CHANNEL_RESUMABLE.items() if resumable and is_street_channel(c)}
+    assert walks == {"kartaview_streets"}
+    for walk in walks:
+        sibling = STREET_CHANNELS[walk]
+        assert sibling in CHANNEL_RESUMABLE, "the sibling has to be a scheduled channel"
+        assert CHANNEL_RESUMABLE[sibling], (
+            "a walk can only wait on a sibling that pauses and checkpoints; waiting on a "
+            "channel that cannot would be a wait with no end"
+        )
+
+
+def test_a_walk_defers_while_its_grid_siblings_sweep_is_in_flight(
+    conn, tmp_path, monkeypatch, caplog
+):
+    """Two sweeps of one lattice, which is what a paused grid run used to buy.
+
+    kartaview_streets ranks immediately after kartaview for the same city. A
+    PAUSED grid sweep leaves a checkpoint, not a cache entry, so the walk prices
+    at full and — with both budget gates gone for resumable channels (#274) —
+    launches a second, independently checkpointed sweep of the same bbox against
+    the same per-IP host. When the grid finally completes, its census lands in
+    the shared cache, reconcile_cache_hit discards the walk's older checkpoint,
+    and everything the walk spent is thrown away.
+
+    Deferring is neither a failure nor a budget skip: nothing is wrong, nothing
+    was spent, and once the grid completes the walk collects for 0 requests
+    (#290). It gets its own counter for exactly that reason, and the night's
+    summary names it — a channel that quietly did not collect is the shape of
+    failure #145 exists to make impossible.
+    """
+    city = _checkpointed_city(
+        conn, tmp_path, monkeypatch, roots_done=3, root_count=8, days_old=0, channel="kartaview"
+    )
+    _enroll_pair(conn, city.city_id)
+
+    calls = []
+    with caplog.at_level(logging.INFO, logger="streetscape_scheduler"):
+        _run_loop_capturing_kwargs(monkeypatch, conn, _kartaview_pair_cfg(), calls)
+
+    assert not [c for c in calls if c[1] == "kartaview_streets"], (
+        "the walk would sweep the same lattice a second time and have it discarded"
+    )
+    assert "deferred behind a paused sibling sweep" in caplog.text
+    row = conn.execute(
+        "SELECT consecutive_failures FROM schedule_state WHERE city_id = ? AND provider = ?",
+        (city.city_id, "kartaview_streets"),
+    ).fetchone()
+    assert row is None or row["consecutive_failures"] == 0, "a deferral is not a failure"
+
+
+def test_a_walk_launches_when_no_grid_sweep_is_in_flight(conn, monkeypatch):
+    """The complement, and the reason the gate reads the checkpoint rather than
+    the channel: with the grid run complete (or never started) there is nothing
+    to wait for, and the walk is the collection."""
+    cid = _register(conn, "Bend", width=1000, height=1000, step=20)
+    _enroll_pair(conn, cid)
+
+    calls = []
+    _run_loop_capturing_kwargs(monkeypatch, conn, _kartaview_pair_cfg(), calls)
+
+    assert [c for c in calls if c[1] == "kartaview_streets"], "nothing is in flight to wait on"
+
+
+def test_a_walk_resuming_its_OWN_checkpoint_is_not_mistaken_for_its_siblings(
+    conn, tmp_path, monkeypatch
+):
+    """A walk's store is keyed by (channel, network type) and a grid run's by
+    the channel alone. A gate that read the checkpoint directory without the
+    channel would see the walk's own in-flight crawl, defer it behind itself,
+    and stall the channel forever."""
+    city = _checkpointed_city(
+        conn,
+        tmp_path,
+        monkeypatch,
+        roots_done=3,
+        root_count=8,
+        days_old=0,
+        channel="kartaview_streets",
+        variant="drive",
+    )
+    _enroll_pair(conn, city.city_id)
+
+    calls = []
+    _run_loop_capturing_kwargs(monkeypatch, conn, _kartaview_pair_cfg(), calls)
+
+    assert [c for c in calls if c[1] == "kartaview_streets"], "a walk resumes its own crawl"
+
+
+def test_a_walk_never_defers_behind_a_sweep_tonight_will_not_run(conn, tmp_path, monkeypatch):
+    """Deferral has to be bounded by something, or it is the age wall again.
+
+    A checkpoint left by a channel that is not on tonight's slate for this city
+    will not advance tonight either, so waiting on it is a wait with no end —
+    the walk would silently never collect. The gate therefore asks whether the
+    sibling is actually scheduled, not merely whether a directory exists.
+    """
+    city = _checkpointed_city(
+        conn, tmp_path, monkeypatch, roots_done=3, root_count=8, days_old=0, channel="kartaview"
+    )
+    # The WALK alone: the grid channel is opt-in and this city is not in it.
+    _enroll_pair(conn, city.city_id, channels=("kartaview_streets",))
+
+    calls = []
+    _run_loop_capturing_kwargs(monkeypatch, conn, _kartaview_pair_cfg(), calls)
+
+    assert [c for c in calls if c[1] == "kartaview_streets"]
+    assert not [c for c in calls if c[1] == "kartaview"], "the grid channel is not enrolled"
+
+
+# ── The calibration floor and a free walk (issue #274 review) ────────────────
+
+
+@pytest.mark.parametrize("cached,should_launch", [(True, True), (False, False)])
+def test_the_calibration_floor_does_not_gate_a_walk_that_costs_nothing(
+    conn, monkeypatch, cached, should_launch
+):
+    """The floor prices the radius-calibration ladder, which a cached census
+    never walks.
+
+    A walk whose grid run already put the census in the shared cache (#290)
+    costs 0 requests: it reads the entry, joins it against the road network and
+    finalizes. The ladder is not on that path, so the ladder's cost is not a
+    reason to defer it — and the nights a nearly-spent budget leaves under the
+    floor are exactly the nights the pairing is worth most. The uncached half is
+    the same city, same budget, and IS refused, which is what keeps this from
+    passing by making the floor unreachable.
+    """
+    cid = _register(conn, "Bend", width=1000, height=1000, step=20)
+    city = db.resolve_city(conn, cid)
+    _enroll_pair(conn, cid, channels=("kartaview_streets",))
+    if cached:
+        _stamp_census_cache(city, "kartaview", fetched_by="kartaview")
+    cfg = _kartaview_pair_cfg()
+    # Under _MIN_SWEEP_LAUNCH_REQUESTS (34): a remainder that cannot pay for
+    # calibration, and does not have to when there is nothing to calibrate.
+    cfg.providers["kartaview_streets"] = ProviderConfig(enabled=True, daily_request_budget=10)
+
+    calls = []
+    _run_loop_capturing_kwargs(monkeypatch, conn, cfg, calls)
+
+    walks = [c for c in calls if c[1] == "kartaview_streets"]
+    assert bool(walks) is should_launch
+    if should_launch:
+        assert walks[0][2]["request_cap"] == 10
+        assert walks[0][2]["estimated_requests"] == 0
+
+
+# ── The dry run and the live path, one decision (issue #274 review) ──────────
+
+
+def test_the_dry_run_and_the_live_path_agree_on_a_metro(conn, monkeypatch, capsys):
+    """The preview is the one thing an operator reads BEFORE a night.
+
+    It priced every channel with `est > budget_left`, which is the right
+    question for an all-or-nothing channel and the wrong one for a sweep that
+    pauses and resumes: it printed "OVER BUDGET (deferred)" for exactly the
+    metros _run_city_channels launches capped. Both now read one helper, so the
+    number in the preview is the number the child is handed.
+
+    The one thing the preview cannot share is the deadline clamp — a preview has
+    no night in progress — so this city's derived timeout is deliberately well
+    inside the batch window, where the clamp does not bind and the two agree
+    exactly.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    cid = _register(conn, "Metro", width=20_000, height=20_000, step=20)
+    _enroll_kartaview(conn, cid)
+    cfg = _wall_cfg()
+
+    _stub_tail(monkeypatch, sched, conn, [])
+    monkeypatch.setattr(sched, "send_alert", lambda *a, **k: None)
+    sched.cmd_run_due(cfg, today=date(2026, 7, 2), dry_run=True)
+    preview = capsys.readouterr().out
+
+    calls = []
+    _run_loop_capturing_kwargs(monkeypatch, conn, cfg, calls)
+    cap = [c for c in calls if c[1] == "kartaview"][0][2]["request_cap"]
+
+    assert "OVER BUDGET" not in preview, "the live path launches this city, capped"
+    assert f"launch capped at {cap:,}; resumes" in preview
 
 
 def test_a_checkpointed_pause_is_not_recorded_as_a_city_failure(conn, monkeypatch):
@@ -7098,6 +7535,7 @@ def _run_channels(sched, cfg, conn, city, providers, **overrides):
     kwargs = dict(
         blocked_hosts=set(),
         busy_hosts=Counter(),
+        deferred_channels=Counter(),
         batch_deadline=None,
         stop_requested=None,
     )

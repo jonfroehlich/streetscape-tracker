@@ -337,6 +337,15 @@ enabled = true
 # a cap the child cannot reach inside its timeout would leave the SIGKILL as
 # the live arm, and a kill records no api_usage at all, so the night's spend
 # vanishes from this ledger and the city burns a consecutive_failure.
+#
+# WHAT SETTING IT TOO LOW NOW COSTS (#274 review). A sweep that cannot finish
+# inside CHECKPOINT_MAX_AGE_S — seven days from its FIRST commit — has its
+# checkpoint discarded mid-crawl by the child, which then restarts at root 0
+# with a fresh stamp, weekly and forever. The scheduler refuses that: within a
+# night of the wall, and with more lattice left than the night can cover, it
+# logs at WARNING, declines to launch and records a real failure, so the run
+# alerts and the five-night backstop applies. An enrolled metro therefore needs
+# a budget that finishes it inside a week, not merely one that starts it.
 daily_request_budget = 10000
 # DEFAULT_SWEEP_REQUESTS_PER_MINUTE — 960/h, under the documented 1,000/h
 # authenticated ceiling. Load-bearing beyond pacing: _kartaview_timeout_seconds
@@ -376,6 +385,12 @@ enabled = true
 # (#273), with the child's own timeout usually the tighter of the two limits.
 # Re-check it before enrolling a metro, and read the tier caveat above the grid
 # channel's figure first.
+#
+# One behaviour is this channel's alone: while [providers.kartaview]'s sweep of
+# the same bbox is still checkpointed mid-crawl, this walk DEFERS instead of
+# sweeping the lattice a second time against the same per-IP host — nothing is
+# failed and nothing is spent, and once that sweep completes the walk reads its
+# census from the cache for 0 (#274, #290).
 daily_request_budget = 10000
 # Must match the pace the timeout is derived from: _kartaview_timeout_seconds
 # divides the sweep estimate by this rate, and _street_collect_cmd passes it to
