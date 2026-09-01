@@ -301,16 +301,19 @@ jitter = 0.6
 # max_concurrent_channels ceiling moves from 3-of-4 to 4-of-5.
 [providers.kartaview]
 enabled = true
-# READ BOTH HALVES BEFORE ENROLLING A METRO. This number is a FLOOR that must
-# be cleared, and it is NOT a ceiling on what a night spends.
+# This is a per-NIGHT ceiling. It used to also be a floor a city had to clear
+# to be collectable at all, and that is no longer true (#274) -- but read the
+# second half before raising it, because what it bounds has changed.
 #
-# The floor (#274): must clear the largest ENROLLED city's estimate or the
-# budget guard skips it *permanently* — `_run_city_channels` treats est >
-# budget as a skip, and `estimate_kartaview_requests` prices the whole sweep
-# rather than a resuming city's remainder, so no amount of checkpointing gets
-# such a city collected. 10,000 clears the largest city the cost study measured
-# (Singapore, ~9,974). Note the arithmetic honestly: 16/min x 10 h is ~9,600,
-# so a night can physically spend slightly less than this ceiling.
+# NO LONGER A FLOOR (#274): a city priced above this used to be skipped
+# *permanently*, since `_run_city_channels` treated est > budget as a dead end
+# and `estimate_kartaview_requests` prices the whole sweep rather than a
+# resuming city's remainder. An enrolled sweep is now launched capped at what
+# is left of the night whatever its estimate says, and checkpoints the rest, so
+# a metro is collected across nights instead of never. 10,000 still clears the
+# largest city the cost study measured in one night (Singapore, ~9,974); the
+# arithmetic to note is that 16/min x 10 h is ~9,600, so a night can physically
+# spend slightly less than this ceiling anyway.
 #
 # NOW ALSO A CEILING (#273). It used to be neither: the guard was a PRE-FLIGHT
 # check against an ESTIMATE and the child was handed no request cap at all, so

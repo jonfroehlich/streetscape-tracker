@@ -14,7 +14,7 @@ import subprocess
 import threading
 import time
 from collections import Counter
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -5541,6 +5541,210 @@ def _enroll_kartaview(conn, cid):
     under test in the dueness tests and a silent no-op in the amnesty ones.
     """
     db.set_channel_membership(conn, cid, "kartaview", True, cycle_days=90)
+
+
+def _run_loop_capturing_kwargs(monkeypatch, conn, cfg, calls, today=date(2026, 7, 2)):
+    """Like _run_loop_with, but keeps the kwargs the launch site handed down.
+
+    _run_loop_with swallows them in **_, which is fine where the question is
+    which channels ran — and useless where the question is what the budget gate
+    decided to hand the child.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    def fake(cfg_, city, today_, provider="gsv", **kwargs):
+        calls.append((city.city_id, provider, kwargs))
+        return True
+
+    monkeypatch.setattr(sched, "_run_one_city", fake)
+    _stub_tail(monkeypatch, sched, conn, [])
+    monkeypatch.setattr(sched, "send_alert", lambda *a, **k: None)
+    return sched.cmd_run_due(cfg, today=today)
+
+
+def test_a_sweep_priced_over_the_whole_budget_is_capped_rather_than_skipped_forever(
+    conn, monkeypatch
+):
+    """Issue #274, and the inversion is the point.
+
+    `est > budget` is a PERMANENT skip: tomorrow's budget is the same size, so
+    the city never runs. That is honest for every all-or-nothing channel, and
+    exactly wrong for the one that checkpoints — the cities it skips forever
+    (Singapore ~9,974 requests, New York ~12,355) are precisely the ones #239's
+    checkpoint was built for. They were loudly logged every night and never
+    collected.
+    """
+    cid = _register(conn, "Metro", width=20_000, height=20_000, step=20)
+    _enroll_kartaview(conn, cid)
+    # A budget far under this city's sweep estimate: the old arm's dead end.
+    cfg = _sweep_cfg(publish_enabled=False)
+    cfg.providers["kartaview"] = ProviderConfig(enabled=True, daily_request_budget=400)
+
+    calls = []
+    _run_loop_capturing_kwargs(monkeypatch, conn, cfg, calls)
+
+    sweeps = [c for c in calls if c[1] == "kartaview"]
+    assert sweeps, "an over-budget sweep must launch, not be skipped permanently"
+    # Capped at the whole budget, since nothing else has spent today.
+    assert sweeps[0][2]["request_cap"] == 400
+
+
+@pytest.mark.parametrize("delta,should_launch", [(-1, False), (1, True)])
+def test_a_remainder_under_the_calibration_floor_is_still_skipped(
+    conn, monkeypatch, delta, should_launch
+):
+    """The one hazard the #274 branch introduces, and why the floor is not
+    optional.
+
+    A budget exhausted during radius calibration raises a plain DownloadError,
+    NOT SweepIncompleteError — "nothing was swept and nothing is checkpointed" —
+    so it takes none of the exit-83 amnesty and counts a real
+    consecutive_failure. Launching under the floor would burn a failure to
+    accomplish nothing, on the very metros this change exists to collect.
+    """
+    from streetscape_metadata_tracker.scheduler import _MIN_SWEEP_LAUNCH_REQUESTS
+
+    budget = _MIN_SWEEP_LAUNCH_REQUESTS + delta
+    cid = _register(conn, "Metro", width=20_000, height=20_000, step=20)
+    _enroll_kartaview(conn, cid)
+    cfg = _sweep_cfg(publish_enabled=False)
+    cfg.providers["kartaview"] = ProviderConfig(enabled=True, daily_request_budget=budget)
+
+    calls = []
+    _run_loop_capturing_kwargs(monkeypatch, conn, cfg, calls)
+    sweeps = [c for c in calls if c[1] == "kartaview"]
+
+    # Both budgets are far under this city's estimate, so the over-budget arm
+    # would refuse BOTH: the floor straddled by one request is the only thing
+    # that can distinguish them, which is what stops this passing vacuously.
+    assert bool(sweeps) is should_launch
+    if should_launch:
+        assert sweeps[0][2]["request_cap"] == budget
+    # Either way it is a budget decision, not a failure: the city stays due.
+    row = conn.execute(
+        "SELECT consecutive_failures FROM schedule_state WHERE city_id = ? AND provider = ?",
+        (cid, "kartaview"),
+    ).fetchone()
+    assert row is None or row["consecutive_failures"] == 0
+
+
+def test_the_launch_floor_clears_the_radius_calibration_ladder():
+    """Derived from the ladder's own documented bound rather than chosen, so
+    retuning the ladder carries the floor with it. A rung costs either
+    probes_per_rung answers or one probe's full retry budget (the rung is lost
+    the moment a probe fails, hence the break), and the floor adds one root
+    cell's full attempt on top — clearing calibration with nothing left to sweep
+    is a legal pause, but it spends a night and a checkpoint-age day to record
+    zero progress."""
+    from streetscape_metadata_tracker.download_kartaview import (
+        DEFAULT_BACKPRESSURE_RETRIES,
+        DEFAULT_CALIBRATION_PROBES,
+        RADIUS_LADDER_M,
+    )
+    from streetscape_metadata_tracker.scheduler import _MIN_SWEEP_LAUNCH_REQUESTS
+
+    ladder = len(RADIUS_LADDER_M) * (DEFAULT_CALIBRATION_PROBES + DEFAULT_BACKPRESSURE_RETRIES)
+    assert _MIN_SWEEP_LAUNCH_REQUESTS > ladder
+
+
+def test_a_non_resumable_channel_keeps_the_permanent_skip(conn, monkeypatch):
+    """The branch is scoped by CHANNEL_RESUMABLE, not applied to everything. A
+    partial GSV grid is not a run — there is no way to spend half a budget
+    usefully — so for gsv the dead end is still the honest answer."""
+    cid = _register(conn, "Metro", width=20_000, height=20_000, step=20)
+    _enroll_kartaview(conn, cid)
+    cfg = _sweep_cfg(publish_enabled=False)
+    # Per-provider, not the global [download] ceiling: the gate reads
+    # cfg.providers[provider].daily_request_budget.
+    cfg.providers["gsv"] = ProviderConfig(enabled=True, daily_request_budget=400)
+    cfg.providers["kartaview"] = ProviderConfig(enabled=True, daily_request_budget=400)
+
+    calls = []
+    _run_loop_capturing_kwargs(monkeypatch, conn, cfg, calls)
+
+    # Same city, same budget, same night: the sweep launches capped and the grid
+    # run does not, which is the whole distinction CHANNEL_RESUMABLE draws.
+    assert not [c for c in calls if c[1] == "gsv"], "gsv over budget is still skipped"
+    assert [c for c in calls if c[1] == "kartaview"], "the sweep still launches"
+
+
+def test_the_pause_log_names_how_far_the_sweep_actually_got(conn, tmp_path, monkeypatch):
+    """A pause is amnestied and consumes no city-cap slot, so without this a
+    multi-night sweep is invisible: the log says "resumes on the next run" every
+    night whether or not a single root cell was answered."""
+    from streetscape_metadata_tracker import scheduler as sched
+    from streetscape_metadata_tracker.checkpointing import checkpoint_path_for, frozen_bbox
+
+    cid = _register(conn, "Bend", width=1000, height=1000, step=20)
+    city = db.resolve_city(conn, cid)
+    monkeypatch.setenv("STREETSCAPE_CHECKPOINT_DIR", str(tmp_path))
+    path = checkpoint_path_for(city.city_id, frozen_bbox(city), "kartaview")
+    os.makedirs(path, exist_ok=True)
+    with open(os.path.join(path, "state.json"), "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "roots_done": 3,
+                "root_count": 8,
+                "created_at": datetime.now(UTC).isoformat(),
+            },
+            f,
+        )
+
+    assert "3/8 root cells" in sched._sweep_progress_note(city, "kartaview")
+
+
+def test_a_checkpoint_running_out_of_days_is_warned_about_before_it_is_discarded(
+    conn, tmp_path, monkeypatch
+):
+    """The pathology the age wall creates, which no individual night looks like.
+
+    CHECKPOINT_MAX_AGE_S is measured from the FIRST commit, so a city that
+    cannot finish inside it has its checkpoint discarded mid-crawl and
+    re-sweeps from scratch — forever, and silently, because every night in
+    between reads as ordinary progress.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+    from streetscape_metadata_tracker.checkpointing import (
+        CHECKPOINT_MAX_AGE_S,
+        checkpoint_path_for,
+        frozen_bbox,
+    )
+
+    cid = _register(conn, "Bend", width=1000, height=1000, step=20)
+    city = db.resolve_city(conn, cid)
+    monkeypatch.setenv("STREETSCAPE_CHECKPOINT_DIR", str(tmp_path))
+    path = checkpoint_path_for(city.city_id, frozen_bbox(city), "kartaview")
+    os.makedirs(path, exist_ok=True)
+    started = datetime.now(UTC) - timedelta(seconds=CHECKPOINT_MAX_AGE_S - 3600)
+    with open(os.path.join(path, "state.json"), "w", encoding="utf-8") as f:
+        json.dump(
+            {"roots_done": 3, "root_count": 800, "created_at": started.isoformat()},
+            f,
+        )
+
+    note = sched._sweep_progress_note(city, "kartaview")
+    assert "WARNING" in note
+    assert "not finishing at this nightly budget" in note
+
+
+def test_an_unreadable_checkpoint_never_breaks_the_amnesty(conn, tmp_path, monkeypatch):
+    """This runs inside a branch that has already decided the night was fine, so
+    it must report nothing rather than raise. A garbage state file is the
+    realistic shape — a commit interrupted mid-write."""
+    from streetscape_metadata_tracker import scheduler as sched
+    from streetscape_metadata_tracker.checkpointing import checkpoint_path_for, frozen_bbox
+
+    cid = _register(conn, "Bend", width=1000, height=1000, step=20)
+    city = db.resolve_city(conn, cid)
+    monkeypatch.setenv("STREETSCAPE_CHECKPOINT_DIR", str(tmp_path))
+    path = checkpoint_path_for(city.city_id, frozen_bbox(city), "kartaview")
+    os.makedirs(path, exist_ok=True)
+    with open(os.path.join(path, "state.json"), "w", encoding="utf-8") as f:
+        f.write("{not json")
+
+    assert sched._sweep_progress_note(city, "kartaview") == ""
+    # And a channel that cannot pause at all is silent rather than guessing.
+    assert sched._sweep_progress_note(city, "gsv") == ""
 
 
 def test_a_checkpointed_pause_is_not_recorded_as_a_city_failure(conn, monkeypatch):

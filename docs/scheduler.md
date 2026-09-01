@@ -198,6 +198,12 @@ A lane worker calls `_run_one_city` and nothing else; pricing, both budget gates
 The two values `_run_one_city` would otherwise derive from `conn` or the clock are precomputed at the launch site and passed in (`timeout_s`, `estimated_requests`); the scheduler hands the worker `conn=None` deliberately.
 That also keeps the read-then-write budget guard honest — the reads are serialized by being on one thread, in submit order, so two channels cannot both see "under budget" and both spend.
 **At the default of 1 the channel body runs INLINE on the calling thread**, not on a size-1 pool: that is what makes the default byte-equivalent to the pre-#240 loop and what keeps every existing test's `_run_one_city` substitute able to touch the fixture connection.
+**Neither budget gate applies to a channel `CHANNEL_RESUMABLE` marks (#274), which today is `kartaview` alone.**
+Both gates exist because every other channel is all-or-nothing — a partial grid, tile census or road walk is not a run — so refusing to start is honest and `est > budget` is a real dead end.
+A sweep checkpoints, so it is launched with `budget - used` as its cap whatever the estimate says, and its estimate is deliberately not consulted: `estimate_kartaview_requests` prices the whole sweep even for a resuming city, because its observed tier reads a `runs` row and a paused sweep never reaches `register_run`.
+The single floor left is `_MIN_SWEEP_LAUNCH_REQUESTS` — a budget that runs out during radius *calibration* raises a plain `DownloadError` rather than `SweepIncompleteError`, so it takes no amnesty and counts a real failure, and the floor is derived from the calibration ladder's own bound so retuning the ladder carries it.
+The property is declared as data, not as `provider == "kartaview"`: `CHANNEL_RESUMABLE` means "accepts a request cap that pauses and checkpoints rather than failing", which is why both Mapillary channels are `False` despite checkpointing their tile census (#256) — `download_mapillary` has a pacing knob and no request cap at all.
+
 **Deferral and a final skip are different things and must stay different.**
 A budget skip, a breaker skip and a stop are decisions: the channel leaves the pending list and is never reconsidered tonight.
 A host deferral is not a decision at all — nothing was priced, nothing was logged, and the channel launches the moment its sibling frees the host.

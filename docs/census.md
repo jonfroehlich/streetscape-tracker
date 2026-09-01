@@ -357,6 +357,14 @@ The hazard is the one `city_timeout_seconds`' Anchorage comment already names, r
 Tier 2 (a first run) is geometry × 1.80×, and is under by ~4× on exactly those metros: Singapore's ~1,273 circles price at ~2,332 requests against the 9,974 actually spent.
 That is survivable in one direction only — #239's checkpoint means the resulting SIGKILL resumes tomorrow instead of discarding the night, bounded at five nights as above — and tier 1 corrects it from the second run onward.
 Note what none of this buys: a metro's honest timeout *exceeds* `max_batch_hours` outright, so the deadline clamp is what bounds it in a real night, and that is the intended outcome rather than a defect.
-One thing #238 deliberately left alone: the `est > budget` arm skips a city that can never fit the daily budget **permanently**, which is not resumability-aware — a metro priced above any sane KartaView budget would be skipped loudly forever rather than sweeping what tonight affords and checkpointing the rest.
-That is **#274**, which depends on #273 for the plumbing and on #248 for there being a channel at all — the cities it skips forever (Singapore ~9,974 requests, New York ~12,355) are precisely the ones #239's checkpoint was built for.
-A road walk is also still absent: `collect_mapillary.build_streetwalk_rows` is Mapillary-specific in three separate ways and has to be generalized first.
+**Both budget arms are now resumability-aware (#274), and neither applies to this channel.**
+They exist because every other channel is all-or-nothing — a partial GSV grid, a partial tile census and a partial road walk are not runs, so refusing to start is the honest answer.
+A sweep is not all-or-nothing: it spends what tonight affords, checkpoints the unvisited roots and exits 83, and nothing is finalized or published until the lattice is complete, so the run is simply dated the day it completes.
+`_run_city_channels` therefore launches an enrolled sweep with `budget - used` as its cap whatever the estimate says, instead of skipping it — the cities the old `est > budget` arm skipped forever (Singapore ~9,974 requests, New York ~12,355) being precisely the ones #239's checkpoint was built for.
+`est` is deliberately not consulted on this branch, because `estimate_kartaview_requests` prices the WHOLE sweep even for a city resuming from a checkpoint (its observed tier reads a `runs` row, and a paused sweep never reaches `register_run`), so gating on it is the over-pricing the branch exists to stop.
+
+The one floor that remains is `_MIN_SWEEP_LAUNCH_REQUESTS`, and it is derived rather than chosen.
+A budget exhausted during radius **calibration** raises a plain `DownloadError` — "nothing was swept and nothing is checkpointed" — not `SweepIncompleteError`, so it takes none of the exit-83 amnesty and counts a real `consecutive_failure`.
+The floor is the ladder's own documented bound (`len(RADIUS_LADDER_M) * (probes + retries)`, 30 at the defaults) plus one root cell's full attempt, read from those constants so retuning the ladder carries it along.
+
+The road walk is no longer absent: #258 generalized `collect_mapillary.build_streetwalk_rows` into the shared `census_walk.py` scorer and added `collect_kartaview.py`, so `--provider kartaview` walks a city under the `kartaview_streets` budget channel — CLI-only, deliberately not a scheduler channel.
