@@ -662,7 +662,12 @@ def load_scheduler_config(path: str | None = None) -> SchedulerConfig:
         batch_size=dl.get("batch_size", 100),
         connection_limit=dl.get("connection_limit", 50),
         request_timeout_s=dl.get("request_timeout_s", 30.0),
-        sleep_between_cities_s=dl.get("sleep_between_cities_s", 5),
+        # Clamped at 0 rather than trusted: a negative here reaches time.sleep()
+        # inside the city loop, where ValueError is caught by the loop's broad
+        # `except Exception` and ends the whole night at _STOP_REASON_ERROR after
+        # one city -- a batch lost to a typo, reported as "City loop aborted by
+        # an unexpected error", i.e. pointing at the loop instead of the config.
+        sleep_between_cities_s=max(0, dl.get("sleep_between_cities_s", 5)),
         max_requests_per_minute=dl.get("max_requests_per_minute", 24_000),
         data_dir=paths.get("data_dir", str(_PROJECT_ROOT / "data")),
         db_path=paths.get("db_path", ""),

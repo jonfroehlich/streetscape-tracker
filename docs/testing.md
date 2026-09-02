@@ -141,9 +141,11 @@ Incidental coverage of a deprecated spelling trains readers to ignore the notice
 - The inter-city pause (issue #306), pinned in three places because a knob whose only symptom is a slower night has nothing else watching it.
   The **pass-through**, asserted against a value that is neither the new default nor the old 60 s, so a call site hard-coding either fails
   — and asserted on the COUNT as well as the value, one pause per city gap rather than per channel, since moving it inside `_run_city_channels` turns a 5 s settle time into a 20 s one on a four-channel night.
+  That count assertion runs **two channels over two cities on purpose**: one channel cannot separate the two placements by more than the trailing-sleep suppression, so a single-channel run would assert the number without testing the claim.
   The **default**, in both places one can come from — `SchedulerConfig()`'s field and `load_scheduler_config`'s literal for a config file that omits the key — because those two drifting apart is how "the default" comes to mean two different nights.
   And the **production** value in `test_makelab1_production_config_is_wired`, beside the budgets and the concurrency knob.
-  All three are pinned as a RANGE (1–15 s) rather than a number: `0` removes the settle time the cut deliberately keeps (one city's writeback, and any lag between a child exiting and its host lock reading as free, which is a fail-fast busy-skip rather than a wait), and creeping back upward is exactly the failure a single fixed value invites arguing with
+  All three are pinned as a RANGE (1–15 s) rather than a number: `0` removes the settle time the cut deliberately keeps (one city's writeback, and any lag between a child exiting and its host lock reading as free, which is a fail-fast busy-skip rather than a wait), and creeping back upward is exactly the failure a single fixed value invites arguing with.
+  A fourth test pins the **clamp**: a negative in the TOML is floored at 0 by `load_scheduler_config` rather than carried into `time.sleep`, where `ValueError` is swallowed by the city loop's broad `except Exception` and ends the night at `_STOP_REASON_ERROR` after one city — a batch lost to a typo, reported as a loop bug.
 
 ## Concurrent channel lanes (issue #240)
 

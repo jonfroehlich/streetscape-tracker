@@ -1799,10 +1799,12 @@ def test_the_inter_city_pause_is_the_configured_one_and_not_a_constant(conn, mon
     failure shape as every other pass-through in this file: a knob pinned only
     at its default lets the code ignore the knob.
 
-    The count matters as much as the value — one pause per gap, not per channel:
-    the four channels of a two-city night are three sleeps if this ever moves
-    inside `_run_city_channels`, which is how a 5 s settle time quietly becomes
-    a 20 s one.
+    The count matters as much as the value — one pause per gap, not per channel
+    — so this runs TWO channels over two cities. One channel could not tell the
+    two placements apart by more than the trailing-sleep suppression; with two,
+    a sleep moved inside `_run_city_channels` is four rather than one, which is
+    the multiplication that quietly turns a 5 s settle time into a 20 s one on a
+    four-channel night.
     """
     from streetscape_metadata_tracker import scheduler as sched
 
@@ -1814,10 +1816,10 @@ def test_the_inter_city_pause_is_the_configured_one_and_not_a_constant(conn, mon
     sched.cmd_run_due(
         _mly_cfg(sleep_between_cities_s=7),
         today=date(2026, 7, 2),
-        requested_providers=["mapillary"],
+        requested_providers=["gsv", "mapillary"],
     )
 
-    assert len(ran) == 2
+    assert len(ran) == 4, "two cities x two channels, so a per-channel sleep has room to show"
     assert slept == [7], "one configured pause per city GAP, and the config's value"
 
 
@@ -1838,6 +1840,23 @@ def test_the_inter_city_pause_defaults_to_a_settle_time_not_a_rate_limiter(tmp_p
 
     for cfg in (SchedulerConfig(), load_scheduler_config(str(cfg_path))):
         assert 1 <= cfg.sleep_between_cities_s <= 15
+
+
+def test_a_negative_inter_city_pause_is_clamped_rather_than_carried_into_the_loop(tmp_path):
+    """
+    The knob is small enough now to be edited casually, and a negative reaches
+    `time.sleep()` inside the city loop -- where `ValueError` is swallowed by the
+    loop's broad `except Exception` and converted into `_STOP_REASON_ERROR`.
+
+    That costs the whole night after one city and reports it as "City loop
+    aborted by an unexpected error", which sends the operator reading the loop
+    rather than the two characters they typed. Clamped at load, where the value
+    came from.
+    """
+    cfg_path = tmp_path / "scheduler.toml"
+    cfg_path.write_text("[download]\nsleep_between_cities_s = -5\n")
+
+    assert load_scheduler_config(str(cfg_path)).sleep_between_cities_s == 0
 
 
 def test_the_summary_reports_elapsed_time_and_the_active_filter(conn, monkeypatch):

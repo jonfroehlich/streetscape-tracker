@@ -430,8 +430,15 @@ max_requests_per_minute = 24000
 #     100" for a regular app) that a night of ~20-40 queries does not approach —
 #     the 2026-08-14 ban came from concurrency, which is now the host lock's job.
 # Meanwhile the cost was real: on 2026-09-01 `morland--kansas` did 21 s of work
-# across four channels and then idled for 62 s, and a 20-city night spends ~20
-# minutes this way against a 10 h deadline that has left 917 cities unattempted.
+# across four channels and then idled for 62 s. Be precise about the size of the
+# win, though, because it is bounded by a different knob: the pause fires only
+# between cities that were actually attempted, and [schedule].max_cities_per_day
+# caps that at 20, so the ceiling is 19 gaps x 55 s ~= 17 min of a 600 min night
+# (~3%). It CANNOT collect more cities than that cap allows, and it cannot move
+# any provider's daily request count -- what it buys is 17 min of deadline back
+# on nights that run out of clock, which the 2026-08-27 batch did with 917 of
+# 937 due cities unattempted (i.e. having attempted at most 19). The big term in
+# a night is the GSV grid channel at 66-76%, not this; this is the cheap one.
 #
 # Kept non-zero on purpose. Two things it may still be doing incidentally, both
 # silent if wrong: absorbing one city's ZFS writeback before the next city's

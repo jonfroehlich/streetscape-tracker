@@ -104,8 +104,9 @@ It is now threaded into `_run_city_channels` as a **required, no-default** `stop
 a stop is a property of the *process*, so none can.
 (Since #240 that same check is the lane scheduler's **submit gate**, with the identical argument: nothing further is launched, while a child already in flight is left to finish and credited, because it has been paid for either way.)
 `assess-city` passes `stop_requested=None` for the same reason it passes `batch_deadline=None`.
-The loop also re-checks after `_run_city_channels` returns, which matters twice: the inter-city sleep would otherwise burn its whole interval out of the stop window (a full minute of it until #306 cut `sleep_between_cities_s` from 60 s to 5 s — the check is not sized to that constant and must survive it moving back) (PEP 475 *resumes* `time.sleep` after the handler runs rather than returning early),
+The loop also re-checks after `_run_city_channels` returns, which matters twice: the inter-city sleep would otherwise burn its whole interval out of the stop window (PEP 475 *resumes* `time.sleep` after the handler runs rather than returning early, so the flag is set and ignored for the whole interval),
 and on the **last** due city there is no next iteration at all, so the night would have summarized as complete while that city's remaining channels went uncollected.
+That was a full minute of the stop window until #306 cut `sleep_between_cities_s` from 60 s to 5 s; the check is not sized to the constant and must survive it moving back.
 **(3)** The child killed by our own stop is **not** recorded as the city's failure.
 `KillMode` defaults to control-group, so the SIGTERM reaches the whole cgroup and the in-flight child returns `-15`
 — a code in neither `HOST_BY_EXIT_CODE` nor `HOST_BY_BUSY_EXIT_CODE`, so it read as an ordinary collection failure.
