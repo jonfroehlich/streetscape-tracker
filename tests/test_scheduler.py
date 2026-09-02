@@ -2809,6 +2809,131 @@ def test_enroll_city_list_refuses_a_write_flag_and_accepts_any_channel(
     )
 
 
+def test_enroll_all_is_a_dry_run_until_execute(conn, monkeypatch, tmp_path, capsys):
+    """`--all` reports and writes NOTHING without `--execute` (issue #282).
+
+    The single-city path has always written immediately and still does; the
+    confirmation step is scoped to `--all`, whose blast radius is the whole
+    catalog and which is one keystroke from `--all --remove`. This follows the
+    `scripts/` convention rather than the rest of this command, deliberately.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    for name in ("Krabi", "Bend", "Hue"):
+        _register(conn, name, width=1000, height=1000, step=20)
+    cfg = _enroll_cfg(tmp_path, conn, monkeypatch)
+
+    assert sched.cmd_enroll_city(cfg, None, channel="kartaview", all_cities=True) == 0
+    out = capsys.readouterr().out
+    assert "WOULD ENROL 3 cities" in out
+    assert "DRY RUN" in out
+    assert sched.db.count_channel_members(conn, "kartaview", False) == 0, "nothing written"
+
+
+def test_enroll_all_execute_takes_the_cheapest_limit_and_skips_existing_members(
+    conn, monkeypatch, tmp_path, capsys
+):
+    """A tranche is `--limit N` cheapest-first, counted in cities CHANGED.
+
+    Two properties in one case because they are the same claim from both ends.
+    Cheapest-first is what keeps a tranche inside one night: a city that
+    completes its sweep in a night never writes a checkpoint, so it never meets
+    CHECKPOINT_MAX_AGE_S. And already-correct cities are excluded rather than
+    re-written, so `--limit 2` means two NEW members — otherwise a tranche could
+    silently be a no-op an operator cannot see.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    big = _register(conn, "Bigtown", width=8000, height=8000, step=20)
+    small = _register(conn, "Smalltown", width=1000, height=1000, step=20)
+    mid = _register(conn, "Midtown", width=3000, height=3000, step=20)
+    cfg = _enroll_cfg(tmp_path, conn, monkeypatch)
+    # Already a member: it must not consume one of the two slots.
+    sched.cmd_enroll_city(cfg, small, channel="kartaview")
+    capsys.readouterr()
+
+    assert (
+        sched.cmd_enroll_city(
+            cfg, None, channel="kartaview", all_cities=True, limit=2, execute=True
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+
+    members = {
+        r["city_id"]
+        for r in conn.execute(
+            "SELECT city_id FROM schedule_state WHERE provider = 'kartaview' AND member = 1"
+        )
+    }
+    assert members == {small, mid, big}, "the two remaining cities, not two rows re-touched"
+    assert out.index(mid) < out.index(big), "cheapest first"
+    assert "FLOOR" in out, "the printed total must never read as a budget"
+
+
+def test_enroll_all_reports_how_many_nights_the_reservation_needs(
+    conn, monkeypatch, tmp_path, capsys
+):
+    """Enrolling N cities does not mean N collect tomorrow (issues #248/#282).
+
+    The reservation paces the widening, so the enrolled count alone gives an
+    operator the wrong model of the night. `--all --execute` says how many
+    nights the set it just wrote will actually take.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    for i in range(12):
+        _register(conn, f"City{i}", width=1000, height=1000, step=20)
+    cfg = _enroll_cfg(tmp_path, conn, monkeypatch)
+    assert _reserve(cfg) == 5
+
+    sched.cmd_enroll_city(cfg, None, channel="kartaview", all_cities=True, execute=True)
+    out = capsys.readouterr().out
+    assert "opt_in_cities_per_day=5" in out
+    assert "~3 nights" in out, "12 cities at 5 a night rounds UP, never down"
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"all_cities": True, "list_only": True},
+        {"all_cities": True, "limit": 0},
+        {"limit": 5},
+        {"execute": True},
+    ],
+    ids=["all-with-list", "limit-below-one", "limit-without-all", "execute-without-all"],
+)
+def test_enroll_all_refuses_incoherent_flag_combinations(conn, monkeypatch, tmp_path, kwargs):
+    """Every one of these would otherwise be accepted, ignored, and exit 0.
+
+    That silent no-op is the exact failure this command exists to prevent, so
+    it must not ship one of its own. `--execute` without `--all` is refused
+    rather than treated as a harmless nudge, because accepting it would imply
+    the single-city path had ever needed confirming.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    cid = _register(conn, "Krabi", width=1000, height=1000, step=20)
+    cfg = _enroll_cfg(tmp_path, conn, monkeypatch)
+    city = None if kwargs.get("all_cities") else cid
+    assert sched.cmd_enroll_city(cfg, city, channel="kartaview", **kwargs) == sched.USAGE_EXIT_CODE
+    assert sched.db.count_channel_members(conn, "kartaview", False) == 0, "no row written"
+
+
+def test_enroll_all_refuses_a_city_argument(conn, monkeypatch, tmp_path):
+    """`--all` plus CITY is ambiguous by the whole catalog, so it is refused
+    rather than resolved by precedence."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    cid = _register(conn, "Krabi", width=1000, height=1000, step=20)
+    cfg = _enroll_cfg(tmp_path, conn, monkeypatch)
+    assert (
+        sched.cmd_enroll_city(cfg, cid, channel="kartaview", all_cities=True)
+        == sched.USAGE_EXIT_CODE
+    )
+    assert sched.db.count_channel_members(conn, "kartaview", False) == 0
+
+
 def test_the_enrolment_cost_note_says_when_it_is_the_geometry_tier(
     conn, monkeypatch, tmp_path, capsys
 ):

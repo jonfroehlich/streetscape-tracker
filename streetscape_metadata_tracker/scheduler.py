@@ -2333,6 +2333,90 @@ def _enrolment_cost_note(conn, cfg: SchedulerConfig, city: db.CityRow, channel: 
     return lines
 
 
+def _bulk_candidates(conn, cfg: SchedulerConfig, channel: str, target: bool | None) -> list:
+    """The enabled cities a bulk enrolment would actually CHANGE, priced.
+
+    Returns ``[(estimate, CityRow), ...]``, cheapest first. Two properties are
+    deliberate:
+
+    * **Already-correct cities are excluded, not re-written.** The selection is
+      what changes, so `--limit 200` means 200 new members rather than 200 rows
+      touched of which some number were already members — which is the
+      difference between a tranche and a no-op an operator cannot see.
+    * **The price is the geometry FLOOR** (`estimate_requests`), so the printed
+      total is a lower bound and is labelled as one. For KartaView it is the
+      swept-circle lattice times a MEDIAN overhead whose study max was 13.66x,
+      and it under-prices any city that calibrates to r=500 by ~4x. A tranche
+      is sized on it; a budget is not.
+    """
+    rows = []
+    for city in db.get_all_cities(conn, enabled_only=True):
+        if db.get_channel_membership(conn, city.city_id, channel) == target:
+            continue
+        rows.append((estimate_requests(city, channel, conn=conn), city))
+    # city_id breaks ties, so a tranche is reproducible: the same command twice
+    # against an unchanged catalog selects the same cities in the same order.
+    rows.sort(key=lambda ec: (ec[0], ec[1].city_id))
+    return rows
+
+
+def _cmd_enroll_bulk(
+    conn,
+    cfg: SchedulerConfig,
+    *,
+    channel: str,
+    target: bool | None,
+    limit: int | None,
+    execute: bool,
+    n_enabled: int,
+) -> int:
+    """`enroll-city --all`: enrol (or un-enrol) many cities in one reproducible step.
+
+    Dry-run by DEFAULT, following the `scripts/` convention rather than the
+    rest of this command, because the blast radius is the whole catalog and
+    `--all` is one keystroke from `--all --remove`. `--execute` writes.
+    """
+    candidates = _bulk_candidates(conn, cfg, channel, target)
+    if not candidates:
+        print(f"{channel}: nothing to change — every enabled city already matches.")
+        return 0
+
+    selected = candidates if limit is None else candidates[:limit]
+    total = sum(e for e, _ in selected)
+    verb = "enrol" if target else ("un-enrol" if target is False else "clear")
+
+    print(f"{'WOULD ' if not execute else ''}{verb.upper()} {len(selected):,} cities on {channel}")
+    for est, city in selected[:10]:
+        print(f"  {est:>9,} req  {city.city_id}")
+    if len(selected) > 10:
+        print(f"  ... and {len(selected) - 10:,} more")
+    # Floor, and said so every time it is printed: the whole point of the
+    # tranche is that this number is the one being tested against reality.
+    print(f"  estimated {total:,} requests for the tranche (a FLOOR, not a budget)")
+    if limit is not None and len(candidates) > len(selected):
+        print(f"  {len(candidates) - len(selected):,} further cities would still be unchanged")
+
+    if not execute:
+        print("  DRY RUN — nothing written. Re-run with --execute to apply.")
+        return 0
+
+    for _est, city in selected:
+        db.set_channel_membership(conn, city.city_id, channel, target, cycle_days=cfg.cycle_days)
+    n_member = db.count_channel_members(conn, channel, CHANNEL_DEFAULT_MEMBERSHIP[channel])
+    print(f"  {channel}: {n_member:,} of {n_enabled:,} enabled cities opted in.")
+    # The reservation, not the enrolled count, is what paces the widening — an
+    # operator who reads "800 enrolled" and expects 800 collected tomorrow has
+    # the wrong model of the night (issue #282).
+    reserved = _opt_in_reservation(cfg, cfg.max_cities_per_day)
+    if target and reserved:
+        print(
+            f"  NOTE  at [schedule].opt_in_cities_per_day={reserved} this set takes "
+            f"~{-(-n_member // reserved):,} nights to work through."
+        )
+    _print_unwired_note(cfg, channel)
+    return 0
+
+
 def cmd_enroll_city(
     cfg: SchedulerConfig,
     city_query: str | None,
@@ -2341,6 +2425,9 @@ def cmd_enroll_city(
     remove: bool = False,
     clear: bool = False,
     list_only: bool = False,
+    all_cities: bool = False,
+    limit: int | None = None,
+    execute: bool = False,
 ) -> int:
     """Opt one city into (or out of) an opt-in channel's nightly queue (issue #248).
 
@@ -2414,8 +2501,23 @@ def cmd_enroll_city(
             )
         if remove and clear:
             raise _UsageError("--remove and --clear are mutually exclusive")
-        if not list_only and not city_query:
-            raise _UsageError("CITY is required unless --list is given")
+        if all_cities and list_only:
+            raise _UsageError("--all cannot be combined with --list")
+        if all_cities and city_query:
+            # Accepting both would make it ambiguous which one won, and the two
+            # readings differ by the whole catalog.
+            raise _UsageError("--all takes no CITY argument")
+        if limit is not None and not all_cities:
+            raise _UsageError("--limit only applies to --all")
+        if limit is not None and limit < 1:
+            raise _UsageError(f"--limit {limit}: must be >= 1")
+        if execute and not all_cities:
+            # Single-city enrolment has always written immediately; adding a
+            # confirmation step only to --all keeps that true rather than
+            # silently changing what an existing command does.
+            raise _UsageError("--execute only applies to --all (a single city writes immediately)")
+        if not list_only and not all_cities and not city_query:
+            raise _UsageError("CITY is required unless --list or --all is given")
     except _UsageError as e:
         logger.error(str(e))
         return USAGE_EXIT_CODE
@@ -2440,6 +2542,17 @@ def cmd_enroll_city(
         print(f"{channel}: {len(rows):,} of {n_enabled:,} enabled cities opted in.")
         _print_unwired_note(cfg, channel)
         return 0
+
+    if all_cities:
+        return _cmd_enroll_bulk(
+            conn,
+            cfg,
+            channel=channel,
+            target=None if clear else (False if remove else True),
+            limit=limit,
+            execute=execute,
+            n_enabled=n_enabled,
+        )
 
     city = db.resolve_city(conn, city_query)
     if city is None:
@@ -5758,6 +5871,27 @@ def build_parser() -> argparse.ArgumentParser:
         "Read-only, so it accepts a default-membership channel too (the answer "
         "there is every enabled city). Cannot be combined with --remove/--clear.",
     )
+    p_enroll.add_argument(
+        "--all",
+        dest="all_cities",
+        action="store_true",
+        help="Apply to every enabled city the setting would CHANGE, cheapest first "
+        "(issue #282). Takes no CITY. DRY RUN unless --execute is given.",
+    )
+    p_enroll.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        metavar="N",
+        help="With --all, take only the N cheapest candidates — one tranche of a "
+        "staged widening. Reproducible: ties break on city_id.",
+    )
+    p_enroll.add_argument(
+        "--execute",
+        action="store_true",
+        help="With --all, actually write. Without it --all only reports, because "
+        "its blast radius is the whole catalog.",
+    )
     p_regen = sub.add_parser(
         "regenerate-aggregate",
         help="Rebuild cities.json.gz from the catalog (no collection)",
@@ -5911,6 +6045,9 @@ def main() -> int:
             remove=args.remove,
             clear=args.clear,
             list_only=args.list_only,
+            all_cities=args.all_cities,
+            limit=args.limit,
+            execute=args.execute,
         )
     if args.command == "regenerate-aggregate":
         return cmd_regenerate(cfg, publish=args.publish)

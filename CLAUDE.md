@@ -8,7 +8,7 @@ It is a **router**: each section carries the short, mistake-preventing rules and
 
 Streetscape Tracker analyzes street-level imagery coverage and temporal patterns in cities **over time**.
 Three providers are collectable — Google Street View (GSV, the default), Mapillary (360° panos only), and KartaView.
-GSV and Mapillary run nightly over **every enabled city**; KartaView is a scheduler channel too but **opt-in**, collecting only the cities an operator enrolled with `scheduler enroll-city` (#248), because one whole-catalog pass prices at ~186,000 requests ≈ 186 h.
+GSV and Mapillary run nightly over **every enabled city**; KartaView is a scheduler channel too but **opt-in**, collecting only the cities an operator enrolled with `scheduler enroll-city` (#248), because one whole-catalog pass prices at ~205,000 requests ≈ 215 h at the configured 16/min.
 The tool samples a geographic grid around a city center, queries each provider's metadata API, and produces immutable dated snapshots per (city, provider), run-to-run change summaries (panos added/removed, capture-date changes, coverage deltas), and interactive map visualizations.
 
 ## READ THIS FIRST: provider API access is the single point of failure
@@ -66,7 +66,7 @@ python scripts/register_frame.py --manifest mapillary_360_cities.csv --overlap-k
 |---|---|
 | `status` | Per-city schedule and budget status |
 | `assign` | (Re)compute stagger assignments (writes `day_of_cycle` only, so it never un-enrolls a member) |
-| `enroll-city CITY --channel C` | Opt one city into an **opt-in** channel's queue (#248); `--remove`/`--clear`/`--list` |
+| `enroll-city CITY --channel C` | Opt one city into an **opt-in** channel's queue (#248); `--remove`/`--clear`/`--list`; `--all [--limit N] --execute` bulk-enrols cheapest-first (#282) |
 | `run-due [--dry-run]` | The nightly batch: collect stalest-due cities per channel, then the tail (aggregate, manifests, backup, publish) |
 | `run-due --provider mapillary --limit 40` | On-demand single-channel catch-up (#214) — the ONLY supported bulk path; **Mapillary catch-ups are PAUSED** (see provider access below) |
 | `assess-city "Newport, Kentucky" --estimate` | Same-day answer for a partner inquiry about an untracked city (#215); `--estimate` stops after the boundary and cost report, `--yes` runs it |
@@ -80,6 +80,7 @@ python scripts/register_frame.py --manifest mapillary_360_cities.csv --overlap-k
 `run-due` notes: `--limit` (≥1) overrides `[schedule].max_cities_per_day`; an unknown/disabled channel or a bad `--limit` exits 64, not 2; a filtered run advances only the named channels' clocks, **un-pairing those cities' snapshots**.
 `assess-city` notes: a bad `--provider` or an unpaired `--width`/`--height` exits 64; answer from **street coverage, never grid coverage** (see operations below).
 `enroll-city` notes: it only accepts a channel whose default membership is OFF — per-city exclusion on the other four is `cities.enabled`; an unknown channel, a default-membership channel, an unresolvable city or a disabled city exits 64 writing no row; enrolling BEFORE the channel is configured is supported on purpose (it prints a note), or the rollout order is impossible.
+**`--all` is DRY-RUN until `--execute`** (its blast radius is the whole catalog, and it is one keystroke from `--all --remove`), selects only cities the setting would CHANGE (so `--limit N` means N *new* members, never N rows re-touched), orders cheapest-first because a city that finishes its sweep in one night never writes a checkpoint and so never meets the 7-day `CHECKPOINT_MAX_AGE_S`, and prints its total as a **floor**; `--limit`/`--execute` without `--all`, `--all` with `--list`, and `--all` with a CITY all exit 64.
 
 ### One-time and repair scripts (`scripts/`)
 
@@ -150,7 +151,7 @@ It is columnar (a memory contract, #157), pinned byte-identical by a golden fixt
 `is_pano` is read through `census.census_is_pano`, never as a raw array; imagery-type stratification (#116) yields **two** coverage numbers — 360° and any-imagery — which are never conflated.
 Four KartaView rules that must survive without a read:
 
-- **BOTH KartaView channels are scheduler channels (#248, #258), and they are the OPT-IN ones** — declaring `[providers.kartaview]` or `[providers.kartaview_streets]` enrolls nobody; each nightly queue is exactly the cities an operator ran `enroll-city` on for THAT channel, because a whole-catalog pass is ~186,000 requests ≈ 186 h.
+- **BOTH KartaView channels are scheduler channels (#248, #258), and they are the OPT-IN ones** — declaring `[providers.kartaview]` or `[providers.kartaview_streets]` enrolls nobody; each nightly queue is exactly the cities an operator ran `enroll-city` on for THAT channel, because a whole-catalog pass is ~205,000 requests ≈ 215 h at 16/min (and both channels share ONE host lock, so that rate is their combined ceiling, never each).
   The walk is enrolled **separately** rather than following the grid channel: street coverage is a different question from grid coverage, and a channel reading another channel's membership would give `schedule_state.member`'s NULL a third meaning.
   Enrol both for a city and the pair is nearly free — `kartaview_streets` ranks immediately after `kartaview`, so the grid sweep lands in the census cache and the walk prices at 0 (#290); enrol only the walk and it pays a full sweep.
   `_collect_due` hoists a city due *only* on an opt-in channel to the head of the slate (`all`, not `any`) — without which the channel would be scoped but never reached, since the union is gsv-ordered and the city cap truncates from the tail.
