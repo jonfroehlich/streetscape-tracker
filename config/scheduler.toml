@@ -14,14 +14,47 @@ grace_days = 7
 # runs both on the same run date (back-to-back, or concurrently in host-disjoint
 # lanes; see max_concurrent_channels below). This is the NIGHTLY
 # cap; `run-due --limit N` (N >= 1) overrides it for one invocation, which is how
-# an on-demand single-channel catch-up gets past it (issue #214). At 20 a full
-# pass over the 1,214 enabled cities is ~61 nights; the Mapillary daily budget
+# an on-demand single-channel catch-up gets past it (issue #214). At 40 a full
+# pass over the 1,214 enabled cities is ~31 nights; the Mapillary daily budget
 # would allow ~5, which is the gap --limit exists to close.
-max_cities_per_day = 20
+#
+# Raised from 20 on 2026-09-02 (#304/#308). 20 was unmeasured and it bound only
+# on LIGHT nights, where it threw away wall clock max_batch_hours had already
+# granted — 2026-08-30 stopped at 20 cities after 6.77 h of a 10 h window,
+# while 2026-08-27 hit the deadline at 14 cities and never reached the cap.
+# max_batch_hours is the real governor (it stops starting cities, clamps the
+# in-flight child, and still runs the tail); this is now high enough to let it
+# be the only one. More cities SEQUENTIALLY does not raise peak memory, since
+# max_concurrent_channels = 1 means one collection child at a time.
+max_cities_per_day = 40
+
+# How many of a capped night's city slots are reserved for cities that will
+# gain a SECOND dated interval — one whose last success is at least
+# cycle_days - grace_days old, i.e. a real refresh (issue #308).
+#
+# Why this key exists at all: db.get_due_cities orders `last_success_at ASC
+# NULLS FIRST`, so every never-collected city sits ahead of every refresh and
+# the all-NULL block drains alphabetically. With 497 of 1,216 cities never
+# collected on gsv, that block takes weeks — and until it drains NO city gains
+# a second dated interval, so the run-to-run change summaries this project
+# exists to produce have nothing to compare. Breadth-first is a defensible
+# policy; being an unstated side effect of a tiebreak is not.
+#
+# Unset derives max_cities_per_day // 4 (10 at the cap above), so the split
+# follows the cap from one place. An explicit integer overrides; 0 restores
+# pure breadth-first exactly (the identity permutation).
+#
+# It CANNOT refresh a city early. Every city it can promote came out of
+# get_due_cities, which returns nothing under the cycle_days - grace_days wall,
+# so a promoted "refresh" is at the same 83-day staleness as everything it
+# displaced. The opt-in hoist (issue #248) is applied after the reserve and so
+# takes precedence over it — but it is BOUNDED by opt_in_cities_per_day below
+# (issue #282), so what it can displace is that reservation, never the night.
+# refresh_slots = 10
 
 # Slots reserved out of max_cities_per_day for cities due ONLY on an opt-in
 # channel (issue #282). Unset means "a quarter of the cap, floored at 1" —
-# 5 at the cap above — and the resolution lives in one place,
+# 10 at the cap above — and the resolution lives in one place,
 # scheduler._opt_in_reservation, so a config that sets this and one that does
 # not cannot disagree about what it means.
 #
@@ -38,7 +71,13 @@ max_cities_per_day = 20
 # the enrolled set divided by this figure is how many nights a full pass takes.
 # Setting it equal to max_cities_per_day re-creates the unbounded hoist by hand
 # (the night then warns); 0 switches the promotion off without un-enrolling.
-# opt_in_cities_per_day = 5
+#
+# This and refresh_slots above are the night's TWO reservations, both derived
+# as a quarter of the same cap. At the derived pair (10 + 10 of 40) half the
+# night is reserved and half stays pure stalest-first, so raise either one and
+# check the other: it is the SUM that bounds how much of a night the plain
+# stalest-first queue still governs.
+# opt_in_cities_per_day = 10
 
 # A (city, provider) pair is skipped after this many consecutive failures
 # until re-enabled.
@@ -69,7 +108,17 @@ city_timeout_minutes = 180
 # the catalog, correct but unpublished, until an operator noticed and ran
 # regenerate-aggregate by hand (issue #167). Keep it comfortably under the
 # unit's TimeoutStartSec so this deadline, not systemd, ends a long night.
-max_batch_hours = 10
+#
+# Raised from 10 to 12 on 2026-09-02. 10 was chosen as "comfortably below
+# TimeoutStartSec" with nothing measured behind it. The real bracket is
+# TimeoutStopSec (30 min) < max_batch_hours < TimeoutStartSec (14 h) less the
+# bounded tail (PUBLISH_TIMEOUT_S + _MEASURED_TAIL_AGGREGATE_S +
+# BACKUP_TIMEOUT_S = 1,635 s ~ 0.45 h). 12 clears both with 1.55 h spare and
+# needs no change to the systemd unit. Past ~13.5 h TimeoutStartSec has to move
+# first, and two costs come with it: the publish lands later in the working
+# day, and a longer nightly window means more sustained hours against the
+# per-IP metered hosts (docs/provider-access.md).
+max_batch_hours = 12
 
 # How many of ONE city's channels may be in flight at once (issue #240). The
 # city loop itself stays sequential either way, so a city's snapshots still all

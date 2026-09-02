@@ -45,7 +45,7 @@ from tests.conftest import make_city_df, write_city_csv_gz
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def _reserve(cfg):
+def _reserve(cfg, max_cities=None):
     """The opt-in slot reservation a nightly run would resolve for ``cfg`` (#282).
 
     Tests call ``_collect_due`` directly, so they have to supply the reservation
@@ -53,8 +53,15 @@ def _reserve(cfg):
     hardcoded, so a test cannot keep asserting the old unbounded behaviour by
     quietly passing its own number — the pass-through is the thing under test in
     ``test_the_opt_in_reservation_bounds_the_hoist``.
+
+    ``max_cities`` mirrors ``cmd_run_due``'s ``--limit``: a test that drives
+    ``_collect_due`` at a cap other than the config's has to resolve the
+    reservation against the SAME window, or it reserves slots in a window the
+    call under test never uses.
     """
-    return _sched._opt_in_reservation(cfg, cfg.max_cities_per_day)
+    return _sched._opt_in_reservation(
+        cfg, cfg.max_cities_per_day if max_cities is None else max_cities
+    )
 
 
 # The real nightly hooks, saved before the autouse stubs below replace them so
@@ -1101,13 +1108,27 @@ def test_makelab1_production_config_is_wired():
     # edit to this test and this file together — the same reason the Mapillary
     # budgets above are pinned exactly.
     assert cfg.max_concurrent_channels == 1
-    # Production leaves the #282 reservation UNSET, so the derived share is what
-    # actually runs. Pinning the resolved number and not just the None is the
-    # point: `is None` alone would still pass if the resolver's share changed
-    # under it, and 5 of 20 is the figure the KartaView widening is paced by —
-    # the enrolled set divided by it is how many nights a full pass takes.
+    # Production leaves BOTH of the night's reservations UNSET, so the derived
+    # shares are what actually run. Pinning the resolved numbers and not just
+    # the Nones is the point: `is None` alone would still pass if a resolver's
+    # share changed under it — and both derive a quarter of max_cities_per_day,
+    # so the #304/#308 cap raise from 20 to 40 moved the opt-in reservation from
+    # 5 to 10 without a line of #282's code changing. That figure is what paces
+    # the KartaView widening: the enrolled set divided by it is how many nights
+    # a full pass takes.
     assert cfg.opt_in_cities_per_day is None
-    assert _sched._opt_in_reservation(cfg, cfg.max_cities_per_day) == 5
+    assert _sched._opt_in_reservation(cfg, cfg.max_cities_per_day) == 10
+    assert cfg.refresh_slots is None
+    assert cfg.effective_refresh_slots(cfg.max_cities_per_day) == 10
+    # The SUM is the number to read, and it is pinned here rather than left to
+    # be re-derived: 20 of 40 slots are reserved, so half a production night is
+    # still the plain stalest-first queue. Raising either share without this
+    # assertion failing would be raising it against the other one blind.
+    assert (
+        _sched._opt_in_reservation(cfg, cfg.max_cities_per_day)
+        + cfg.effective_refresh_slots(cfg.max_cities_per_day)
+        == cfg.max_cities_per_day // 2
+    )
     # The inter-city pause (issue #306). Pinned in production, not just at the
     # dataclass default, because this is a knob whose only symptom when wrong is
     # a night that is slower than it needs to be — nothing fails, nothing alerts,
@@ -2387,7 +2408,7 @@ def test_the_hoist_is_the_identity_permutation_without_an_opt_in_channel(conn):
     conn.commit()
 
     cfg = _mly_cfg()
-    ordered, providers_for_city, hoisted = sched._collect_due(
+    slate = sched._collect_due(
         conn,
         cfg,
         date(2026, 7, 2),
@@ -2395,6 +2416,7 @@ def test_the_hoist_is_the_identity_permutation_without_an_opt_in_channel(conn):
         max_opt_in=_reserve(cfg),
         max_cities=cfg.max_cities_per_day,
     )
+    ordered, providers_for_city, hoisted = slate.cities, slate.providers_for_city, slate.hoisted
     expected = [
         c.city_id
         for c in db.get_due_cities(
@@ -2434,7 +2456,7 @@ def test_a_city_due_only_on_an_opt_in_channel_is_hoisted_ahead_of_the_gsv_block(
     db.record_attempt(conn, krabi, success=True, provider="gsv")
 
     cfg = _sweep_cfg(publish_enabled=False)
-    ordered, providers_for_city, hoisted = sched._collect_due(
+    slate = sched._collect_due(
         conn,
         cfg,
         date(2026, 7, 2),
@@ -2442,6 +2464,7 @@ def test_a_city_due_only_on_an_opt_in_channel_is_hoisted_ahead_of_the_gsv_block(
         max_opt_in=_reserve(cfg),
         max_cities=cfg.max_cities_per_day,
     )
+    ordered, providers_for_city, hoisted = slate.cities, slate.providers_for_city, slate.hoisted
 
     assert [c.city_id for c in ordered][0] == krabi
     assert providers_for_city[krabi] == ["kartaview"]
@@ -2473,7 +2496,7 @@ def test_a_city_due_on_gsv_too_keeps_its_exact_union_position(conn):
     conn.commit()
 
     cfg = _sweep_cfg(publish_enabled=False)
-    ordered, providers_for_city, hoisted = sched._collect_due(
+    slate = sched._collect_due(
         conn,
         cfg,
         date(2026, 7, 2),
@@ -2481,6 +2504,7 @@ def test_a_city_due_on_gsv_too_keeps_its_exact_union_position(conn):
         max_opt_in=_reserve(cfg),
         max_cities=cfg.max_cities_per_day,
     )
+    ordered, providers_for_city, hoisted = slate.cities, slate.providers_for_city, slate.hoisted
 
     assert [c.city_id for c in ordered][-1] == krabi, "not hoisted: it is due on gsv too"
     assert providers_for_city[krabi] == ["gsv", "kartaview"]
@@ -2580,7 +2604,7 @@ def test_a_sweep_killed_by_its_timeout_leads_the_next_slate_but_costs_the_night_
     assert row["consecutive_failures"] == 1
     assert row["last_success_at"] is None
 
-    ordered, providers_for_city, hoisted = _sched._collect_due(
+    slate = _sched._collect_due(
         conn,
         cfg,
         date(2026, 7, 3),
@@ -2588,6 +2612,7 @@ def test_a_sweep_killed_by_its_timeout_leads_the_next_slate_but_costs_the_night_
         max_opt_in=_reserve(cfg),
         max_cities=cfg.max_cities_per_day,
     )
+    ordered, providers_for_city, hoisted = slate.cities, slate.providers_for_city, slate.hoisted
     assert ordered[0].city_id == krabi, "still hoisted tomorrow, which is what bounds it at five"
     assert providers_for_city[krabi] == ["kartaview"]
     assert hoisted == 1
@@ -2609,7 +2634,7 @@ def test_a_single_opt_in_channel_run_reports_no_hoist(conn):
         db.set_channel_membership(conn, cid, "kartaview", True, cycle_days=90)
 
     cfg = _sweep_cfg(publish_enabled=False)
-    ordered, providers_for_city, hoisted = _sched._collect_due(
+    slate = _sched._collect_due(
         conn,
         cfg,
         date(2026, 7, 2),
@@ -2617,6 +2642,7 @@ def test_a_single_opt_in_channel_run_reports_no_hoist(conn):
         max_opt_in=_reserve(cfg),
         max_cities=cfg.max_cities_per_day,
     )
+    ordered, providers_for_city, hoisted = slate.cities, slate.providers_for_city, slate.hoisted
     assert {c.city_id for c in ordered} == {krabi, bend}, "both are still collected"
     assert all(providers_for_city[c.city_id] == ["kartaview"] for c in ordered)
     assert hoisted == 0
@@ -2641,9 +2667,10 @@ def test_a_bounded_all_opt_in_slate_still_reports_no_hoist(conn):
         db.set_channel_membership(conn, cid, "kartaview", True, cycle_days=90)
 
     cfg = _sweep_cfg(publish_enabled=False, opt_in_cities_per_day=2)
-    ordered, _providers_for_city, hoisted = _sched._collect_due(
+    slate = _sched._collect_due(
         conn, cfg, date(2026, 7, 2), ["kartaview"], max_opt_in=2, max_cities=6
     )
+    ordered, hoisted = slate.cities, slate.hoisted
     assert [c.city_id for c in ordered] == ids, "identity permutation: nothing moved"
     assert hoisted == 0, "2 were promoted, but promotion is not movement"
 
@@ -2678,9 +2705,9 @@ def test_a_live_checkpoint_takes_a_reserved_slot_first(conn, monkeypatch):
         lambda cfg, city, channel: {"age_s": 1.0} if city.city_id == zlast else None,
     )
     cfg = _sweep_cfg(publish_enabled=False, opt_in_cities_per_day=1)
-    ordered, _pfc, _hoisted = _sched._collect_due(
+    ordered = _sched._collect_due(
         conn, cfg, date(2026, 7, 2), ["kartaview"], max_opt_in=1, max_cities=3
-    )
+    ).cities
     assert ordered[0].city_id == zlast, (
         "the resumable city leads, not the alphabetically-first never-swept one"
     )
@@ -2947,6 +2974,307 @@ def test_the_hoist_count_is_on_the_nights_own_record(conn, monkeypatch, caplog):
     with caplog.at_level(logging.INFO, logger="streetscape_scheduler"):
         _run_loop_with(monkeypatch, conn, _mly_cfg(), lambda c, p: True, today=date(2026, 7, 2))
     assert "hoisted=" not in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# The refresh reserve: what a CAPPED night spends its slots on (issue #308)
+#
+# `db.get_due_cities` orders `last_success_at ASC NULLS FIRST`, so every
+# never-collected city precedes every refresh and the all-NULL block drains
+# alphabetically. These pin the reserve that makes that policy stated and
+# movable rather than an unstated consequence of a tiebreak — and, first among
+# them, that it can never refresh a city EARLY.
+# ---------------------------------------------------------------------------
+
+
+def _slate_conn(conn, *, never: int, refreshes: list[str], provider: str = "gsv"):
+    """A slate of never-collected cities plus dated refreshes, stalest-first.
+
+    ``refreshes`` are ISO dates for `last_success_at`, oldest first. Names are
+    chosen so the never-collected block sorts BEFORE the refreshes by city_id
+    too, which is what makes a promotion visible rather than indistinguishable
+    from the alphabetical tiebreak.
+    """
+    never_ids = [
+        _register(conn, f"Anever{i:02d}", width=1000, height=1000, step=20) for i in range(never)
+    ]
+    refresh_ids = [
+        _register(conn, f"Zold{i:02d}", width=1000, height=1000, step=20)
+        for i in range(len(refreshes))
+    ]
+    db.assign_schedule(conn, 90, providers=(provider,))
+    for cid, when in zip(refresh_ids, refreshes, strict=True):
+        conn.execute(
+            "UPDATE schedule_state SET last_success_at = ? WHERE city_id = ? AND provider = ?",
+            (when, cid, provider),
+        )
+    conn.commit()
+    return never_ids, refresh_ids
+
+
+def test_refresh_slots_zero_is_the_identity_permutation(conn):
+    """Inertness asserted as element-wise list identity, not "looks the same".
+
+    `refresh_slots = 0` must reproduce the pure breadth-first order
+    `get_due_cities`' NULLS FIRST tiebreak produces on its own — the same
+    property `max_concurrent_channels = 1` keeps for #240, and the thing that
+    makes rolling this policy back a TOML edit rather than a revert.
+    """
+    never_ids, refresh_ids = _slate_conn(conn, never=4, refreshes=["2026-01-01T00:00:00+00:00"])
+
+    cfg = SchedulerConfig(publish_enabled=False, refresh_slots=0, max_cities_per_day=2)
+    slate = _sched._collect_due(
+        conn, cfg, date(2026, 7, 2), ["gsv"], max_opt_in=_reserve(cfg, 2), max_cities=2
+    )
+
+    assert [c.city_id for c in slate.cities] == never_ids + refresh_ids
+    assert slate.promoted == 0
+
+
+def test_the_reserve_promotes_the_stalest_refreshes_into_the_window(conn):
+    """Two of a four-city window go to refreshes, stalest-first.
+
+    The refreshes sit LAST in the union (NULLS FIRST puts four never-collected
+    cities ahead of them) and are beyond a window of 4 until promoted, so this
+    is the exact shape that leaves a project with 497 uncollected cities unable
+    to gain a second dated interval for weeks.
+    """
+    never_ids, refresh_ids = _slate_conn(
+        conn,
+        never=4,
+        refreshes=[
+            "2026-01-01T00:00:00+00:00",  # stalest
+            "2026-02-01T00:00:00+00:00",
+            "2026-03-01T00:00:00+00:00",
+        ],
+    )
+
+    cfg = SchedulerConfig(publish_enabled=False, refresh_slots=2, max_cities_per_day=4)
+    slate = _sched._collect_due(
+        conn, cfg, date(2026, 7, 2), ["gsv"], max_opt_in=_reserve(cfg, 4), max_cities=4
+    )
+
+    ids = [c.city_id for c in slate.cities]
+    assert slate.promoted == 2
+    # The two stalest refreshes are IN the window, at its end so the head stays
+    # breadth-first; the third stays out.
+    assert ids[:4] == never_ids[:2] + refresh_ids[:2]
+    # The displaced never-collected cities keep their relative order immediately
+    # after the window, so they lead TOMORROW rather than falling to the tail.
+    assert ids[4:6] == never_ids[2:4]
+    assert ids[6:] == refresh_ids[2:]
+
+
+def test_a_promoted_city_is_never_refreshed_early(conn):
+    """The reserve cannot pull a city forward past its cadence, and the reason
+    is that it never sees one: `ordered` comes from `get_due_cities`, which
+    returns nothing whose last success is under `cycle_days - grace_days`.
+
+    Asserted THROUGH the real query rather than by construction, because "the
+    reserve only reorders what dueness already returned" is exactly the kind of
+    invariant that survives a refactor in prose and not in code.
+    """
+    fresh = _register(conn, "Zfresh", width=1000, height=1000, step=20)
+    _slate_conn(conn, never=3, refreshes=["2026-01-01T00:00:00+00:00"])
+    db.assign_schedule(conn, 90, providers=("gsv",))
+    # 30 days old: collected, but nowhere near the 83-day wall.
+    conn.execute(
+        "UPDATE schedule_state SET last_success_at = ? WHERE city_id = ? AND provider = 'gsv'",
+        ("2026-06-02T00:00:00+00:00", fresh),
+    )
+    conn.commit()
+
+    cfg = SchedulerConfig(publish_enabled=False, refresh_slots=3, max_cities_per_day=2)
+    slate = _sched._collect_due(
+        conn, cfg, date(2026, 7, 2), ["gsv"], max_opt_in=_reserve(cfg, 2), max_cities=2
+    )
+
+    assert fresh not in {c.city_id for c in slate.cities}, (
+        "a city 30 days past its last success is not due at all, so no reserve can promote it"
+    )
+
+
+def test_a_refresh_is_any_due_channel_with_a_prior_success(conn):
+    """`any`, not `all`, and the difference is what the reserve buys.
+
+    A city due on gsv (one prior run) and mapillary (never) yields one second
+    gsv interval — exactly the outcome being accumulated — so requiring EVERY
+    due channel to have a prior would exclude it for having a newly enabled
+    sibling, which is the common case right after a channel is turned on.
+    """
+    never_ids, _ = _slate_conn(conn, never=4, refreshes=[], provider="gsv")
+    mixed = _register(conn, "Zmixed", width=1000, height=1000, step=20)
+    db.assign_schedule(conn, 90, providers=("gsv", "mapillary"))
+    conn.execute(
+        "UPDATE schedule_state SET last_success_at = ? WHERE city_id = ? AND provider = 'gsv'",
+        ("2026-01-01T00:00:00+00:00", mixed),
+    )
+    conn.commit()
+
+    cfg = _mly_cfg(refresh_slots=1, max_cities_per_day=2)
+    slate = _sched._collect_due(
+        conn, cfg, date(2026, 7, 2), ["gsv", "mapillary"], max_opt_in=_reserve(cfg, 2), max_cities=2
+    )
+
+    assert slate.promoted == 1
+    assert [c.city_id for c in slate.cities][:2] == [never_ids[0], mixed]
+    assert slate.providers_for_city[mixed] == ["gsv", "mapillary"]
+
+
+def test_the_hoist_leads_the_slate_without_evicting_the_reserve(conn):
+    """The two reservations compose: the hoist owns the head, the reserve owns
+    what is left, and BOTH land inside the cap.
+
+    This is the pairing #308 shipped the other way round. Applied
+    reserve-then-hoist, `_reserve_refresh_slots` promoted its refreshes to the
+    END of the window and the hoist then displaced the window's LAST cities —
+    the same cities — so on prod's derived pair (10 opt-in + 10 refresh of 40)
+    the refresh reserve cancelled itself on exactly the nights a KartaView
+    widening made the hoist do anything, while still reporting `promoted=10`.
+
+    Bounding the hoist (#282) is what makes this order available: its head is a
+    known prefix now, so the reserve can be handed the remainder instead of
+    being run first and evicted out of it.
+    """
+    never_ids, refresh_ids = _slate_conn(conn, never=2, refreshes=["2026-01-01T00:00:00+00:00"])
+    krabi = _register(conn, "Krabi", width=1000, height=1000, step=20)
+    db.assign_schedule(conn, 90, providers=("gsv", "kartaview"))
+    db.set_channel_membership(conn, krabi, "kartaview", True, cycle_days=90)
+    # Krabi's gsv clock is fresh, so it is due ONLY on the opt-in channel.
+    db.record_attempt(conn, krabi, success=True, provider="gsv")
+
+    # A two-city night, one slot to each reservation.
+    cfg = _sweep_cfg(publish_enabled=False, refresh_slots=1, max_cities_per_day=2)
+    slate = _sched._collect_due(
+        conn,
+        cfg,
+        date(2026, 7, 2),
+        ["gsv", "kartaview"],
+        max_opt_in=_reserve(cfg, 2),
+        max_cities=2,
+    )
+
+    ids = [c.city_id for c in slate.cities]
+    assert ids[0] == krabi, "the hoist still owns index 0"
+    assert slate.hoisted == 1
+    # The refresh is INSIDE the cap, not merely counted. Under reserve-then-hoist
+    # this assertion is the one that failed while `promoted` still said 1.
+    assert ids[1] == refresh_ids[0]
+    assert slate.promoted == 1
+    # And what the pair displaced is a never-collected city, which keeps its
+    # relative order at the head of the remainder and so leads tomorrow.
+    assert ids[2] == never_ids[0]
+
+
+def test_the_reserve_cannot_promote_into_a_window_the_hoist_filled(conn):
+    """The degenerate end of the same composition, stated so it is not read as
+    a lost promotion.
+
+    At a one-city cap the hoist takes the only slot, so the refresh reserve has
+    a window of zero and reports `promoted=0` — the honest count. The old
+    ordering reported 1 here for a refresh the night would never reach.
+    """
+    _never_ids, refresh_ids = _slate_conn(conn, never=2, refreshes=["2026-01-01T00:00:00+00:00"])
+    krabi = _register(conn, "Krabi", width=1000, height=1000, step=20)
+    db.assign_schedule(conn, 90, providers=("gsv", "kartaview"))
+    db.set_channel_membership(conn, krabi, "kartaview", True, cycle_days=90)
+    db.record_attempt(conn, krabi, success=True, provider="gsv")
+
+    cfg = _sweep_cfg(publish_enabled=False, refresh_slots=1, max_cities_per_day=1)
+    slate = _sched._collect_due(
+        conn,
+        cfg,
+        date(2026, 7, 2),
+        ["gsv", "kartaview"],
+        max_opt_in=_reserve(cfg, 1),
+        max_cities=1,
+    )
+
+    ids = [c.city_id for c in slate.cities]
+    assert ids[0] == krabi, "the hoist is bounded, but one slot is within its bound"
+    assert slate.hoisted == 1
+    assert slate.promoted == 0, "no window left to promote into, and it says so"
+    assert refresh_ids[0] in ids[1:], "the refresh is still due, just not tonight"
+
+
+def test_refresh_slots_derives_from_the_city_cap_and_clamps_to_the_window():
+    """Unset derives `max_cities_per_day // 4` so the split follows the cap
+    from ONE place; an explicit value overrides, 0 included; and the result is
+    clamped to the run's actual window so `--limit` cannot be over-reserved.
+
+    No floor on the derivation, deliberately: at a cap of 3 it derives 0,
+    because a reserve of 1 out of 3 is not a share, it is a third of the night.
+    """
+    assert SchedulerConfig(max_cities_per_day=20).effective_refresh_slots(20) == 5
+    assert SchedulerConfig(max_cities_per_day=40).effective_refresh_slots(40) == 10
+    assert SchedulerConfig(max_cities_per_day=3).effective_refresh_slots(3) == 0
+    assert SchedulerConfig(max_cities_per_day=20, refresh_slots=0).effective_refresh_slots(20) == 0
+    assert SchedulerConfig(max_cities_per_day=20, refresh_slots=99).effective_refresh_slots(4) == 4
+    # Derived from the CONFIG cap, not the window, so a one-off --limit does
+    # not silently redefine the standing policy.
+    assert SchedulerConfig(max_cities_per_day=40).effective_refresh_slots(100) == 10
+
+
+def test_a_bad_refresh_slots_key_derives_rather_than_disabling(tmp_path, caplog):
+    """Warn-and-fall-back like `_lane_count`, but NOT to 0.
+
+    0 is a meaningful value here (pure breadth-first), so falling back to it
+    would make a typo indistinguishable from a deliberate policy choice — on
+    the one knob whose whole point is that the policy be stated. TOML booleans
+    are Python ints, so `false` is excluded explicitly; it is also exactly what
+    someone means by 0, which is why it must not silently land there.
+    """
+    import logging
+
+    for value in ("false", '"five"', "-1"):
+        path = tmp_path / f"cfg_{abs(hash(value))}.toml"
+        path.write_text(f"[schedule]\nmax_cities_per_day = 20\nrefresh_slots = {value}\n")
+        with caplog.at_level(logging.WARNING, logger="streetscape_scheduler"):
+            cfg = load_scheduler_config(str(path))
+        assert cfg.refresh_slots is None, value
+        assert cfg.effective_refresh_slots(20) == 5, value
+        assert "refresh_slots" in caplog.text
+
+    path = tmp_path / "good.toml"
+    path.write_text("[schedule]\nmax_cities_per_day = 20\nrefresh_slots = 0\n")
+    assert load_scheduler_config(str(path)).refresh_slots == 0
+
+
+def test_collect_due_has_no_max_cities_default():
+    """The same refusal `providers` and `_run_city_loop`'s `max_cities` carry.
+
+    The reserve decides which cities fall INSIDE the cap, so a caller that
+    inherited a default here would be reserving slots against a window the loop
+    never uses — and the symptom is a slate that looks right and collects the
+    wrong cities.
+    """
+    import inspect
+
+    param = inspect.signature(_sched._collect_due).parameters["max_cities"]
+    assert param.default is inspect.Parameter.empty
+    assert param.kind is inspect.Parameter.KEYWORD_ONLY
+
+
+def test_the_reserve_is_on_the_nights_own_record(conn, monkeypatch, caplog):
+    """Logged UNCONDITIONALLY, unlike the hoist clause.
+
+    The reserve is live by default and its derived value follows
+    `max_cities_per_day`, so which policy a night ran under is not recoverable
+    from the config file alone once either knob has moved.
+    """
+    import logging
+
+    _slate_conn(conn, never=2, refreshes=["2026-01-01T00:00:00+00:00"])
+
+    with caplog.at_level(logging.INFO, logger="streetscape_scheduler"):
+        _run_loop_with(
+            monkeypatch,
+            conn,
+            _mly_cfg(refresh_slots=1, max_cities_per_day=2),
+            lambda c, p: True,
+            today=date(2026, 7, 2),
+        )
+    assert "refresh_slots=1 (1 promoted)" in caplog.text
 
 
 # ── enroll-city (issue #248) ────────────────────────────────────────────────
@@ -6619,12 +6947,15 @@ def test_a_sweeps_cap_is_sized_to_what_its_own_timeout_can_pace(conn, monkeypatc
     #273 hands the child `budget - used` so an overrun becomes a deliberate
     pause — exit 83, amnestied, no consecutive_failure, and the spend still
     ledgered. A cap the child cannot physically REACH inside its own timeout
-    buys none of that. On prod (16/min, a 10 h batch, a 10,000 budget) a whole
-    night paces ~9,600 requests, so a fresh night's remainder is unreachable by
-    arithmetic and a city costing more than its timeout affords is SIGKILLed
-    first: no exit code, a consecutive_failure, a city-cap slot spent, and no
-    ledger write at all, since the child's add_api_usage calls both need it to
-    return.
+    buys none of that, and WHICH of the two ceilings binds moves with the
+    config — which is why the cap is a `min` rather than the term that was
+    smaller when #273 was written. At the 10 h batch it was written against,
+    prod's 16/min paced ~9,600 against a 10,000 budget, so a fresh night's
+    remainder was unreachable by arithmetic outright; at 12 h the same rate
+    paces ~11,520 and the budget is the smaller term. Either way a city costing
+    more than its timeout affords is SIGKILLed first: no exit code, a
+    consecutive_failure, a city-cap slot spent, and no ledger write at all,
+    since the child's add_api_usage calls both need it to return.
 
     Both terms are captured from the launch itself, so this asserts a RELATION
     between the two numbers the child receives rather than re-deriving one of
@@ -7201,9 +7532,10 @@ def test_a_checkpointed_pause_is_not_recorded_as_a_city_failure(conn, monkeypatc
     get_due_cities filters on `consecutive_failures < max_consecutive_failures`
     and NOTHING but a success resets it, so charging a pause would retire the
     city after five of them. Which is not a hypothetical for this channel — a
-    metro sweep needs more nights than that by construction (Singapore is
-    ~10.4 h of pacing against a 10 h max_batch_hours), so the failure counter
-    would fire before the sweep it is meant to protect could ever finish."""
+    metro sweep needs more nights than that by construction: New York is
+    ~12,355 requests, ~12.9 h of pacing against a 12 h max_batch_hours, and the
+    r=500 metros cost ~4x their geometry estimate. So the failure counter would
+    fire before the sweep it is meant to protect could ever finish."""
     cid = _register(conn, "Bend", width=1000, height=1000, step=20)
     _enroll_kartaview(conn, cid)
 

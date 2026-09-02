@@ -95,6 +95,7 @@ All are catalog/disk-only (no API calls), dry-run by default, and take `--execut
 | `backfill_streetwalk_coverage.py` | Backfill `street_walks.coverage_by_highway` (schema v11, #101) from artifacts on disk |
 | `backfill_streetwalk_length.py` | Backfill the schema v12 `street_walks` columns; exits nonzero if an artifact's lengths contradict the row's cataloged coverage (wrong artifact matched) |
 | `recompute_run_stats.py --provider gsv --regenerate-json` | Re-derive every run's stored stats from its CSV under the current analysis definitions — the repair handle whenever a stats definition moves (#213); a definition change is applied to the WHOLE series in one pass |
+| `enroll_kartaview_tail.py [--max-requests N] [--limit N]` | Rank every enabled city by estimated KartaView sweep cost and enrol the cheap tail on BOTH KartaView channels (#307); no threshold prints only the distribution, and `--execute` refuses one over a quarter of the channel budget (the estimate is a floor) or a batch past `max_cities_per_day` (#282) |
 
 The boundary-audit workflow (does a frozen grid actually fit its city?) is a four-script chain, each with a pinning test: `audit_city_boundaries.py` → `build_boundary_review.py` → `apply_decisions.py` → `reregister_boundaries.py`.
 
@@ -191,6 +192,10 @@ This is what READ THIS FIRST points at; read it before changing any pacing, retr
 
 **Scheduler → [`docs/scheduler.md`](docs/scheduler.md).**
 `run-due` collects the stalest-due cities per enabled channel under per-channel daily budgets, then runs a tail — aggregate, streetwalk manifest, driving-plan summary, catalog backup, publish.
+**`get_due_cities`' `NULLS FIRST` put every never-collected city ahead of every refresh, so `[schedule].refresh_slots` reserves a share of the night's cap for cities that gain a SECOND dated interval (#308)** — unset it derives `max_cities_per_day // 4`, `0` is the identity permutation, and it can never refresh early because everything it promotes already cleared the `cycle_days - grace_days` (83 day) wall.
+The BOUNDED opt-in hoist (#248, #282) is applied first and the reserve second, into what the hoist did not take: reserve-first put its promotions at the end of the window and the hoist displaced the window's last cities, so the two reservations cancelled rather than composed.
+A night's cap is therefore split three ways — `opt_in_cities_per_day`, then `refresh_slots` of the remainder, then stalest-first — and it is the SUM of the two that bounds how much of a night the plain queue still governs (20 of 40 on prod).
+`max_cities_per_day` is 40 and `max_batch_hours` 12 (raised 2026-09-02, #304): the deadline is the intended governor, and the bracket on it is `TimeoutStopSec` < `max_batch_hours` < `TimeoutStartSec` (14 h) less the ~0.45 h bounded tail — past ~13.5 h the unit has to move first.
 Channels run back-to-back, or concurrently in host-disjoint lanes when `[schedule].max_concurrent_channels` > 1 (default 1; channels sharing a per-IP host never overlap, so the effective ceiling is 4 of 6, and raising it in prod is gated only on verifying the two GSV keys live in separate Cloud projects).
 **The tail is what makes a night visible, and it only runs if the city loop returns** — every way of ending the loop (deadline, SIGTERM wind-down, unexpected exception) returns counters instead of propagating, and each tail artifact reports a crash rather than raising.
 **Publishing happens only at the end**, so a stale public site usually means the batch died or overran, not that the publisher broke.

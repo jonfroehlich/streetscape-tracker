@@ -399,6 +399,20 @@ class SchedulerConfig:
     # and the tile CDN with mapillary, so it always runs after both, while
     # kartaview shares its host with nothing and can always take a lane.
     max_concurrent_channels: int = 1
+    # How many of a capped night's city slots are reserved for cities that will
+    # gain a SECOND dated interval (issue #308). None means "derive it", and
+    # the derivation is `max_cities_per_day // 4` — read through
+    # `effective_refresh_slots`, never off this field, so the two cannot be
+    # configured apart. An explicit integer overrides, `0` included, and 0 is
+    # the identity permutation: pure breadth-first, exactly the ordering
+    # `db.get_due_cities`' `NULLS FIRST` tiebreak produced on its own.
+    #
+    # The reserve cannot refresh anything early, and that property is not this
+    # code's to keep: every city it can promote came out of `get_due_cities`,
+    # which returns nothing whose last success is under `cycle_days -
+    # grace_days` (83 days on prod). A "refresh" here is a city at the same
+    # staleness wall as every other due city, competing for the same slot.
+    refresh_slots: int | None = None
     # [download]
     batch_size: int = 100
     connection_limit: int = 50
@@ -470,6 +484,28 @@ class SchedulerConfig:
             self.site_url += "/"
         if self.providers is None:
             self.providers = {"gsv": ProviderConfig(daily_request_budget=self.daily_request_budget)}
+
+    def effective_refresh_slots(self, window: int) -> int:
+        """How many of ``window`` slots tonight are reserved for refreshes (#308).
+
+        ``window`` is the run's ACTUAL city cap — ``max_cities_per_day``, or an
+        explicit ``run-due --limit`` — not the config key, so a catch-up that
+        raises the cap raises the reserve with it and one that lowers it cannot
+        end up reserving more slots than the night has.
+
+        The derived default is ``max_cities_per_day // 4`` and deliberately has
+        no floor: at a cap of 3 it derives 0, because a reserve of 1 out of 3
+        is not a share, it is a third of the night. It derives from the CONFIG
+        cap rather than ``window`` so a one-off ``--limit`` does not silently
+        redefine the standing policy.
+
+        Clamped to ``window`` at the end, which is the only clamp that matters:
+        `_reserve_refresh_slots` promotes at most what it is given, so an
+        unclamped 30-of-20 would simply mean "every slot", written in a way
+        that reads like a bug at the call site.
+        """
+        slots = self.max_cities_per_day // 4 if self.refresh_slots is None else self.refresh_slots
+        return max(0, min(slots, max(0, window)))
 
     def enabled_providers(self) -> list[str]:
         """Enabled channel names in a stable canonical order, most expensive first.
@@ -619,6 +655,38 @@ def _lane_count(sched: dict, config_path) -> int:
     return value
 
 
+def _refresh_slots(sched: dict, config_path) -> int | None:
+    """Read ``[schedule].refresh_slots``, or None to derive it (issue #308).
+
+    Same warn-and-fall-back posture as :func:`_lane_count`, for the same
+    reason: this is one key of one section, and raising over it would take down
+    every subcommand including ``backup-status`` and ``restore-backup``, the
+    incident-time handles.
+
+    The fall-back is None — "derive ``max_cities_per_day // 4``" — rather than
+    0. 0 is a MEANINGFUL value here (pure breadth-first), so falling back to it
+    would make a typo'd key indistinguishable from a deliberate policy choice,
+    silently, on the one knob whose whole point is that the policy be stated
+    rather than implied.
+
+    ``isinstance(v, bool)`` is excluded explicitly because TOML booleans are
+    Python ints, so ``refresh_slots = false`` would otherwise load as 0 and
+    read as if it had been honoured — which here is not even the safe
+    direction, since 0 is exactly the value someone writing ``false`` means.
+    """
+    if "refresh_slots" not in sched:
+        return None
+    value = sched["refresh_slots"]
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        logger.warning(
+            f"[schedule] refresh_slots={value!r} in {config_path} is not a non-negative "
+            f"integer; deriving it from max_cities_per_day instead (set 0 to turn the "
+            f"refresh reserve off deliberately)"
+        )
+        return None
+    return value
+
+
 def load_scheduler_config(path: str | None = None) -> SchedulerConfig:
     """Load scheduler config from TOML; missing file yields defaults."""
     config_path = Path(path) if path else DEFAULT_CONFIG_PATH
@@ -723,6 +791,7 @@ def load_scheduler_config(path: str | None = None) -> SchedulerConfig:
         city_timeout_minutes=sched.get("city_timeout_minutes", 180),
         max_batch_hours=sched.get("max_batch_hours", 10.0),
         max_concurrent_channels=_lane_count(sched, config_path),
+        refresh_slots=_refresh_slots(sched, config_path),
         batch_size=dl.get("batch_size", 100),
         connection_limit=dl.get("connection_limit", 50),
         request_timeout_s=dl.get("request_timeout_s", 30.0),
@@ -1162,9 +1231,12 @@ _SWEEP_ACHIEVED_RATE_FRACTION = 0.5
 # 83 rather than overspending -- so the overrun this paragraph used to describe
 # is a resumable pause. The cap is the SMALLER of `budget - used` and what the
 # child's own timeout can pace (_sweep_requests_within_timeout), because the
-# ledger term alone is often unreachable: a night's paced wall clock is finite,
-# and on prod 16/min over a 10 h batch affords ~9,600 requests against a 10,000
-# budget. The number travels as `request_cap`, spelled differently from
+# neither term dominates: a night's paced wall clock is finite (on prod 16/min
+# over the 12 h batch affords ~11,520 requests) and the budget is 10,000, so
+# which ceiling binds flips with config that moves -- at the 10 h batch this
+# argument was first written against, the clock was the smaller term and the
+# ledger remainder was unreachable outright.
+# The number travels as `request_cap`, spelled differently from
 # `daily_budget` on purpose: the street channels' ceiling is the FULL budget
 # because that collector subtracts today's spend itself (see
 # _street_collect_cmd), and the grid CLI reads no ledger, so its number has to
@@ -1470,11 +1542,13 @@ def _sweep_requests_within_timeout(timeout_s: int, pc: ProviderConfig | None) ->
     deliberate pause (exit ``SWEEP_INCOMPLETE_EXIT_CODE``, amnestied, no
     ``consecutive_failure``) rather than a SIGKILL at the per-city timeout,
     which counts one. A cap the child cannot physically REACH inside its own
-    timeout buys none of that: on prod (16/min, a 10 h batch, a 10,000-request
-    budget) a whole night paces ~9,600 requests, so a fresh night's cap is
-    unreachable by arithmetic and the arm actually taken stays the kill. Sizing
-    the cap to what the clock affords is what makes the pause the arm a healthy
-    child takes.
+    timeout buys none of that. On prod at the 10 h batch this was written
+    against, 16/min paced ~9,600 requests under a 10,000-request budget, so a
+    fresh night's cap was unreachable by arithmetic outright and the arm
+    actually taken stayed the kill. At 12 h the same rate paces ~11,520 and the
+    budget is the smaller term instead -- which is why the cap is a ``min`` of
+    the two rather than whichever one is currently smaller. Sizing it to what
+    the clock affords is what makes the pause the arm a healthy child takes.
 
     ``_TIMEOUT_HEADROOM`` is deliberately NOT divided out here, and that is the
     one asymmetry between the two directions. It covers the request COUNT being
@@ -1690,13 +1764,17 @@ def _sweep_launch_plan(
     needed for the sibling arm below, which must not defer behind a sweep
     nothing is going to run.
 
-    THE CAP IS THE SMALLER OF TWO CEILINGS. The budget remainder alone is not
-    reachable: a night's paced wall clock is finite, and on prod (16/min, a 10 h
-    batch, a 10,000-request budget affording ~9,600) a fresh night's remainder
-    is unreachable by arithmetic, so the arm a big city actually took was the
-    SIGKILL at the timeout -- no exit code, a consecutive_failure, a city-cap
-    slot spent and NO ledger write, because the child's add_api_usage calls both
-    need it to return. Sizing the cap to what the clock affords makes the
+    THE CAP IS THE SMALLER OF TWO CEILINGS, and WHICH one binds is not a
+    constant -- it moves with the config, which is exactly why this is a
+    ``min`` rather than the term that happened to be smaller when it was
+    written. A night's paced wall clock is finite: at the 10 h batch #273 was
+    written against, prod's 16/min afforded ~9,600 against a 10,000-request
+    budget, so the budget remainder was unreachable by arithmetic and the arm a
+    big city actually took was the SIGKILL at the timeout -- no exit code, a
+    consecutive_failure, a city-cap slot spent and NO ledger write, because the
+    child's add_api_usage calls both need it to return. At the 12 h batch the
+    same rate paces ~11,520, so the budget is now the smaller term and the
+    clock the looser one. Sizing the cap to what BOTH afford makes the
     deliberate pause the arm a healthy child takes (#273).
 
     THE THREE SKIPS, in the order they are asked, which is the order of how much
@@ -4142,6 +4220,99 @@ def _reconcile_orphaned_walk(
     return True
 
 
+class DueSlate(NamedTuple):
+    """Tonight's slate: the ordered city list and how it came to be ordered.
+
+    ``cities`` is the union of the per-channel due lists and
+    ``providers_for_city`` says which channels each is due on.
+    ``hoisted`` and ``promoted`` are the two reorderings applied to that union
+    — the opt-in hoist (#248, bounded by #282) and the refresh reserve (#308) —
+    reported rather than merely applied, because which cities a CAPPED night
+    reached has to be recoverable from the night's own log (the argument
+    ``max_concurrent_channels=`` on the same line already makes). They are also
+    the two RESERVATIONS against one cap, so a night's log has to carry both to
+    say why a plain stalest-first city was not reached.
+
+    A NamedTuple rather than a bare tuple for the reason ``SweepLaunchPlan`` is
+    one: this return value has grown twice, and each growth silently changed
+    the arity every call site unpacks.
+    """
+
+    cities: list[db.CityRow]
+    providers_for_city: dict[str, list[str]]
+    hoisted: int
+    promoted: int
+
+
+def _reserve_refresh_slots(
+    ordered: list[db.CityRow], refresh_ids: set[str], window: int, reserved: int
+) -> tuple[list[db.CityRow], int]:
+    """
+    Give ``reserved`` of the first ``window`` slots to refreshes (issue #308).
+
+    ``db.get_due_cities`` orders ``last_success_at ASC NULLS FIRST``, so every
+    city that has never succeeded on a channel sits ahead of every city that
+    has, and the all-NULL block is drained alphabetically by ``city_id``. With
+    497 of 1,216 cities never collected on gsv and a 20-city cap, that block
+    takes ~25 more nights — and until it drains, **no city gains a second dated
+    interval**, so the run-to-run change summaries this project exists to
+    produce have nothing to compare and ``run_diffs`` / #101's walk diffs never
+    exercise.
+
+    Breadth-first is a defensible policy; being an unstated consequence of a
+    tiebreak is not. This makes it a stated one with a lever
+    (``[schedule].refresh_slots``), and ``reserved = 0`` restores the pure
+    breadth-first order exactly — the identity permutation, provable by
+    construction rather than argued, the same property
+    ``max_concurrent_channels = 1`` keeps for #240.
+
+    THE PROMOTION IS ORDER-PRESERVING IN BOTH DIRECTIONS, which is what stops
+    it becoming a churn machine. Promoted refreshes keep their stalest-first
+    relative order and land at the END of the window (so tonight's slate is
+    still breadth-first at its head); the non-refresh cities they displace are
+    the window's LAST ones, kept in their relative order immediately after it,
+    so they lead tomorrow's slate rather than being shuffled back into the
+    ~900-city tail.
+
+    What this CANNOT do is refresh a city early, and that is not this
+    function's doing: ``ordered`` is built from ``db.get_due_cities``, which
+    never returns a city whose last success is under ``cycle_days -
+    grace_days``. A promoted city is at the same 83-day staleness wall as every
+    city it displaced.
+
+    Args:
+        ordered: the union slate, stalest-first (mutated: no; a new list).
+        refresh_ids: city_ids with a prior success on at least one channel they
+            are due on tonight.
+        window: how many cities the night can actually process.
+        reserved: how many of those slots refreshes may take.
+
+    Returns:
+        ``(reordered, promoted)`` — ``promoted`` counts cities moved INTO the
+        window, so 0 means the slate is unchanged.
+    """
+    if reserved <= 0 or window <= 0 or len(ordered) <= window:
+        # Nothing beyond the window to promote FROM, so there is nothing to
+        # trade. Returning early rather than falling through the arithmetic
+        # keeps the no-op case a literal identity rather than one that happens
+        # to compute the same list.
+        return ordered, 0
+    have = sum(1 for c in ordered[:window] if c.city_id in refresh_ids)
+    candidates = [c for c in ordered[window:] if c.city_id in refresh_ids]
+    # `window - have` is the third term and it is not redundant with the
+    # caller's clamp: it is what keeps `window - need` non-negative HERE, so a
+    # future caller passing an unclamped `reserved` gets "every slot" rather
+    # than a negative slice, which Python would honour silently by counting
+    # from the end.
+    need = min(reserved - have, len(candidates), window - have)
+    if need <= 0:
+        return ordered, 0
+    promoted = candidates[:need]
+    promoted_ids = {c.city_id for c in promoted}
+    rest = [c for c in ordered if c.city_id not in promoted_ids]
+    return rest[: window - need] + promoted + rest[window - need :], need
+
+
 def _collect_due(
     conn,
     cfg: SchedulerConfig,
@@ -4150,13 +4321,20 @@ def _collect_due(
     *,
     max_opt_in: int,
     max_cities: int,
-):
+) -> DueSlate:
     """
     Due work for today: an ordered city list (stalest-first, gsv's order
     leading since it's the expensive series) and, per city, which of
     ``providers`` are due. Providers pair on the same cycle day by design, so
     most cities are due for all providers at once; they only diverge after
     per-provider failures or when a provider was enabled later.
+
+    ``max_cities`` is the night's actual city cap and is **required and
+    keyword-only, with no default value**, for the same reason ``providers``
+    below is and ``_run_city_loop``'s own ``max_cities`` is: the reserve is a
+    decision about which cities fall inside the cap, so a caller that inherited
+    a default here would be silently reserving slots against a window that is
+    not the one the loop will use.
 
     ``providers`` is **required** — the caller states the channel set, which for
     a nightly run is ``cfg.enabled_providers()`` and for ``run-due --provider``
@@ -4168,18 +4346,39 @@ def _collect_due(
     ``providers_for_city``, so a channel absent from this mapping is never
     priced, never budgeted and never launched.
 
-    Returns ``(ordered, providers_for_city, hoisted)``; ``hoisted`` is the
-    number of cities the opt-in reorder below moved, logged by ``cmd_run_due``.
-
     ``max_opt_in`` is the reservation from issue #282 — how many opt-in-only
     cities may be promoted to the head of the slate. It is **keyword-only with
     no default**, for the same reason ``providers`` is required and
     ``_run_city_loop``'s ``max_cities`` is: a permissive default here is an
     unbounded hoist one refactor away, and unbounded is the exact failure #282
     exists to remove. Callers resolve it through ``_opt_in_reservation``.
+
+    Returns a :class:`DueSlate`. TWO RESERVATIONS ARE APPLIED TO THE UNION,
+    against one cap, and the order of the two is load-bearing: **the bounded
+    opt-in hoist (#248, #282) first, then the refresh reserve (#308) into the
+    slots the hoist did not take**. The hoist still wins — its cities lead the
+    slate, which is what keeps a paused sweep's five nights CONSECUTIVE and so
+    what makes #239's checkpoint accumulate — but it wins a BOUNDED prefix now,
+    so the reserve can be given the remainder instead of being applied first
+    and then evicted out of it.
+
+    That eviction is not hypothetical, and it is why this order is the reverse
+    of the one #308 shipped with. ``_reserve_refresh_slots`` lands its promoted
+    refreshes at the END of the window, and an unbounded hoist displaced the
+    window's LAST cities — so refresh-then-hoist evicted precisely what the
+    reserve had just promoted. At the derived pair on prod's cap (10 + 10 of
+    40) that nullified ``refresh_slots`` outright on exactly the nights a
+    KartaView widening makes the hoist matter. Bounding the hoist (#282) is
+    what makes a stable composition available at all; taking it is this
+    function's only substantive change to either mechanism.
+
+    So the night's arithmetic is ``max_cities`` split three ways: at most
+    ``max_opt_in`` opt-in-only cities, then at most ``refresh_slots`` refreshes
+    in what remains, and the rest pure stalest-first. It is the SUM of the two
+    reservations that bounds how much of a night the plain queue still governs.
     """
     due_by_provider = {
-        provider: db.get_due_cities(
+        provider: db.get_due_cities_with_last_success(
             conn,
             today=today,
             cycle_days=cfg.cycle_days,
@@ -4192,12 +4391,22 @@ def _collect_due(
     }
     ordered, seen = [], set()
     providers_for_city = {}
+    # City_ids that will gain a SECOND dated interval tonight: at least one of
+    # the channels they are due on has succeeded before. `any`, not `all`, and
+    # the difference is the thing being bought — a city due on gsv (one prior
+    # run) and mapillary (never) yields one second gsv interval, which is
+    # exactly the outcome the reserve exists to start accumulating, so
+    # requiring every channel to have a prior would exclude it for having a
+    # newly enabled sibling.
+    refresh_ids: set[str] = set()
     for provider, due in due_by_provider.items():
-        for city in due:
+        for city, last_success_at in due:
             if city.city_id not in seen:
                 seen.add(city.city_id)
                 ordered.append(city)
             providers_for_city.setdefault(city.city_id, []).append(provider)
+            if last_success_at is not None:
+                refresh_ids.add(city.city_id)
 
     # Membership scopes a channel; without this it is still never REACHED
     # (issue #248). The union above is ordered by first appearance, so the
@@ -4225,11 +4434,12 @@ def _collect_due(
     #     sweep takes: _run_city_channels caps every sweep at the smaller of the
     #     night's remaining budget and what the child's own timeout can pace
     #     (_sweep_requests_within_timeout), so a sweep that would overrun stops
-    #     itself deliberately instead of being killed. Both terms are needed --
-    #     on prod 16/min over a 10 h batch paces ~9,600 requests against a
-    #     10,000 budget, so a cap set to a fresh night's remainder is
-    #     unreachable by arithmetic and the kill below stays the arm actually
-    #     taken. A pause records no consecutive_failure, so the five-night bound
+    #     itself deliberately instead of being killed. Both terms are needed,
+    #     and which one binds moves with the config: at the 10 h batch this was
+    #     written against, prod's 16/min paced ~9,600 against a 10,000 budget so
+    #     the ledger remainder was unreachable outright; at 12 h the same rate
+    #     paces ~11,520 and the budget is the smaller term instead.
+    #     A pause records no consecutive_failure, so the five-night bound
     #     below does not bind it at all -- what bounds it instead is
     #     CHECKPOINT_MAX_AGE_S, seven days from the checkpoint's FIRST commit,
     #     after which its rows would be spliced into a snapshot dated today and
@@ -4265,6 +4475,7 @@ def _collect_due(
     # docs/scheduler.md exist to protect.
     opt_in = {p for p in providers if is_opt_in_channel(p)}
     hoisted = 0
+    promoted_opt_in = 0
     if opt_in:
         # BOUNDED since #282. The promotion is now a RESERVATION -- at most
         # `max_opt_in` cities move -- and the bound is what makes the mechanism
@@ -4335,7 +4546,9 @@ def _collect_due(
                 ]
             )
         keys = [0 if i in chosen else 1 for i in range(len(ordered))]
-        promoted = len(chosen)
+        # Not `promoted`: that name belongs to the refresh reserve below, and
+        # the two counts mean different things in the same scope.
+        promoted_opt_in = len(chosen)
         # Cities that actually MOVED, which is what the word means and what
         # scripts/night_length_analyze.py reads off the opening line.
         #
@@ -4358,6 +4571,35 @@ def _collect_due(
         # PR A's inertness provable by construction rather than argued. (The
         # `if opt_in` guard is belt-and-braces on the same claim.)
         ordered = [c for _, c in sorted(zip(keys, ordered, strict=True), key=lambda kc: kc[0])]
+
+    # The refresh reserve (#308) runs HERE, on what the hoist did not take,
+    # rather than before it. After the stable sort above the first
+    # `promoted_opt_in` entries ARE the chosen cities by construction, so the
+    # hoist's head is a known prefix and the remainder is exactly the window
+    # this reserve is entitled to. Applied the other way round it promoted
+    # refreshes to the END of the window and the hoist then displaced the
+    # window's last cities -- which are the same cities -- so the reserve
+    # cancelled itself on precisely the nights the hoist is doing anything.
+    #
+    # `effective_refresh_slots` is still asked for the run's OWN cap, not this
+    # narrowed window: the standing policy is a share of the night, and a night
+    # that spends part of itself on an opt-in widening should not also redefine
+    # what a refresh slot means. _reserve_refresh_slots clamps to the window it
+    # is given, so the narrowing binds without the derivation moving.
+    #
+    # A hoisted city that is itself a refresh is not counted in the reserve's
+    # `have`, so the night can end up with more refreshes than `refresh_slots`.
+    # That is the right direction: the key is a floor on second intervals, not
+    # a ration of them.
+    tail, promoted = _reserve_refresh_slots(
+        ordered[promoted_opt_in:],
+        refresh_ids,
+        max_cities - promoted_opt_in,
+        cfg.effective_refresh_slots(max_cities),
+    )
+    ordered = ordered[:promoted_opt_in] + tail
+
+    if opt_in:
         # The backlog is the number an operator widening a channel actually
         # needs, and it is invisible from `hoisted` alone -- a reservation that
         # is working looks identical whether 3 cities are waiting or 800.
@@ -4371,6 +4613,11 @@ def _collect_due(
         # the reservation this logged "10 ... take tonight's reserved slots; 30
         # wait for a later night" and then collected all 40, which is the one
         # number the operator is reading.
+        #
+        # Counted AFTER the refresh reserve, not before it: the reserve can push
+        # an opt-in-only city that was not hoisted out of the window, so a count
+        # taken before it would report a city as reached that the night will not
+        # reach.
         opt_in_only = [
             i
             for i, c in enumerate(ordered)
@@ -4382,9 +4629,9 @@ def _collect_due(
             logger.info(
                 f"{reached} of {len(opt_in_only)} opt-in-only cities are inside tonight's "
                 f"{max_cities}-city cap ([schedule].opt_in_cities_per_day={max_opt_in} "
-                f"reserved, {promoted} promoted); {waiting} wait for a later night"
+                f"reserved, {promoted_opt_in} promoted); {waiting} wait for a later night"
             )
-    return ordered, providers_for_city, hoisted
+    return DueSlate(ordered, providers_for_city, hoisted, promoted)
 
 
 def _backup_catalog_nightly(cfg: SchedulerConfig, conn, today: date) -> str | None:
@@ -4557,22 +4804,30 @@ def cmd_run_due(
     # would leave a Mapillary catch-up at the nightly cap's ~61 nights per pass
     # rather than the ~5 the daily budget allows.
     #
-    # There is deliberately NO `due = due[:limit]` here, and that omission is the
-    # whole fix rather than a tidy-up. The loop's cap counts cities it actually
-    # *processed*, and a candidate can be skipped without processing (budget
-    # guard, host breaker, busy lock), so pre-truncating the candidate list to N
-    # lets the loop run out of list below N — `--limit 40` silently doing 30 and
-    # reporting a clean night, which is this flag's own bug one layer down.
+    # There is deliberately NO `due = due[:limit]` below, and that omission is
+    # the whole fix rather than a tidy-up. The loop's cap counts cities it
+    # actually *processed*, and a candidate can be skipped without processing
+    # (budget guard, host breaker, busy lock), so pre-truncating the candidate
+    # list to N lets the loop run out of list below N — `--limit 40` silently
+    # doing 30 and reporting a clean night, which is this flag's own bug one
+    # layer down.
+    #
+    # Read BEFORE _collect_due rather than after it, because the refresh
+    # reserve (#308) is a decision about which cities fall inside THIS run's
+    # cap: computing the slate against max_cities_per_day and then capping it
+    # at an explicit --limit would reserve slots in a window the loop never
+    # reaches.
     max_cities = limit if limit is not None else cfg.max_cities_per_day
     # Resolved BEFORE the slate is built, because the reservation is an input to
     # the ordering rather than a filter applied after it — and against
     # `max_cities`, not `cfg.max_cities_per_day`, so `--limit` scales the split
     # with the cap it overrides instead of leaving a 20-city reservation on a
-    # 5-city night.
+    # 5-city night. Both of the night's reservations are therefore resolved
+    # against the same window the loop will actually use.
     max_opt_in = _opt_in_reservation(cfg, max_cities)
-    due, providers_for_city, hoisted = _collect_due(
-        conn, cfg, today, providers, max_opt_in=max_opt_in, max_cities=max_cities
-    )
+    slate = _collect_due(conn, cfg, today, providers, max_opt_in=max_opt_in, max_cities=max_cities)
+    due, providers_for_city = slate.cities, slate.providers_for_city
+    hoisted = slate.hoisted
     day_cap = min(len(due), max_cities)
 
     budget_str = ", ".join(f"{cfg.providers[p].daily_request_budget:,} {p}" for p in providers)
@@ -4588,6 +4843,13 @@ def cmd_run_due(
         # like the config key so a log line and a TOML line are greppable
         # together — scripts/night_length_analyze.py reads this.
         f"; max_concurrent_channels={cfg.max_concurrent_channels}"
+        # Same reason again, and unconditional unlike the hoist clause below:
+        # the refresh reserve is LIVE by default (issue #308), so which policy
+        # a night ran under is not recoverable from the config file alone once
+        # the knob has been moved — the derived default follows
+        # max_cities_per_day, so it changes whenever the cap does.
+        f"; refresh_slots={cfg.effective_refresh_slots(max_cities)}"
+        f" ({slate.promoted} promoted)"
         # Same reason as the lane count: an opt-in channel's hoist reorders the
         # night's slate (issue #248), and which cities a capped night reached
         # has to be recoverable from the night's own record. Omitted entirely
@@ -5463,7 +5725,7 @@ def _run_city_channels(
                         # but a success resets it, so charging a pause would quarantine
                         # a city for a whole 90-day cycle after five of them — and a
                         # metro sweep needs more nights than that by construction
-                        # (Singapore is ~10.4 h of pacing against a 10 h
+                        # (New York is ~12.9 h of pacing against a 12 h
                         # max_batch_hours). The city stays due and leads tomorrow's
                         # stalest-first queue, which is what resuming requires.
                         #
