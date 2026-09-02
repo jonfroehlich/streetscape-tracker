@@ -8,6 +8,7 @@ publish.
 """
 
 import os
+from pathlib import Path
 
 import pytest
 
@@ -18,13 +19,18 @@ def _tree(tmp_path, *, relative="/user.slice/streetscape-tracker.service", **fil
     """Build a fake `/sys/fs/cgroup` + `/proc/self/cgroup` pair.
 
     `files` maps cgroup file name -> contents; omit one to simulate a kernel or
-    hierarchy that does not provide it.
+    hierarchy that does not provide it. `bytes` contents are written raw, for the
+    cases that are about a value the reader cannot decode at all.
     """
     root = tmp_path / "cgroup"
     node = root / relative.lstrip("/")
     node.mkdir(parents=True)
     for name, contents in files.items():
-        (node / name.replace("_", ".", 1)).write_text(contents + "\n")
+        target = node / name.replace("_", ".", 1)
+        if isinstance(contents, bytes):
+            target.write_bytes(contents)
+        else:
+            target.write_text(contents + "\n")
     proc = tmp_path / "proc_self_cgroup"
     proc.write_text(f"0::{relative}\n")
     return str(root), str(proc)
@@ -60,11 +66,12 @@ def test_the_line_quotes_the_percentage_against_memory_high(tmp_path):
         memory_peak="20267974656",
         memory_high=str(20 * 2**30),
         memory_max=str(24 * 2**30),
+        memory_events="low 0\nhigh 0\nmax 0\noom 0\noom_kill 0",
     )
 
     line = cgroup_memory.describe_cgroup_memory(root, proc)
 
-    assert line == "cgroup peak 18.88 GiB of 20 GiB MemoryHigh (94%)"
+    assert line == "cgroup peak 18.88 GiB of 20 GiB MemoryHigh (94%), throttled 0 times"
 
 
 def test_memory_max_is_the_fallback_denominator_when_the_soft_brake_is_off(tmp_path):
@@ -94,6 +101,115 @@ def test_an_uncapped_cgroup_reports_the_peak_without_inventing_a_percentage(tmp_
     assert cgroup_memory.describe_cgroup_memory(root, proc) == (
         "cgroup peak 3.00 GiB (no cgroup memory cap)"
     )
+
+
+def test_the_throttle_count_is_reported_because_the_percentage_is_only_a_proxy(tmp_path):
+    """`memory.peak` is the high-water mark of `memory.current`, which charges
+    page cache and kernel memory as well as anon — so a high percentage is
+    evidence that a raise MIGHT be due, not that the brake ever engaged.
+
+    `memory.events`'s `high` counter is the direct answer, and the two can
+    disagree in both directions: this cgroup sat at 47% of MemoryHigh and was
+    still throttled three times. Reading the percentage alone would have called
+    that night comfortable.
+    """
+    root, proc = _tree(
+        tmp_path,
+        memory_peak="20267974656",
+        memory_high=str(40 * 2**30),
+        memory_max=str(48 * 2**30),
+        memory_events="low 0\nhigh 3\nmax 0\noom 0\noom_kill 0",
+    )
+
+    assert cgroup_memory.describe_cgroup_memory(root, proc) == (
+        "cgroup peak 18.88 GiB of 40 GiB MemoryHigh (47%), throttled 3 times"
+    )
+
+
+def test_an_absent_or_unparseable_events_file_drops_the_count_and_keeps_the_line(tmp_path):
+    """The counter is an addition to the line, never a precondition for it: a
+    kernel or hierarchy that does not provide `memory.events` must still get the
+    peak and the percentage, which are the reading #305 actually asked for.
+
+    None and 0 stay distinct all the way to the output — "throttled 0 times" is
+    a measurement, and saying it when nothing was measured is the same class of
+    lie as reporting a peak of 0.00 GiB.
+    """
+    without = _tree(tmp_path / "a", memory_peak="20267974656", memory_high=str(40 * 2**30))
+    garbage = _tree(
+        tmp_path / "b",
+        memory_peak="20267974656",
+        memory_high=str(40 * 2**30),
+        memory_events="high not-a-number",
+    )
+
+    for root, proc in (without, garbage):
+        assert cgroup_memory.read_cgroup_memory(root, proc).high_events is None
+        assert cgroup_memory.describe_cgroup_memory(root, proc) == (
+            "cgroup peak 18.88 GiB of 40 GiB MemoryHigh (47%)"
+        )
+
+
+def test_the_count_is_omitted_when_there_is_no_soft_brake_to_be_throttled_by(tmp_path):
+    """`memory.events`'s `high` counter increments on the HIGH boundary, so with
+    MemoryHigh unset it is structurally 0. Printing it there would dress a
+    tautology up as a measurement, next to a percentage taken against a
+    different cap."""
+    root, proc = _tree(
+        tmp_path,
+        memory_peak=str(12 * 2**30),
+        memory_high="max",
+        memory_max=str(48 * 2**30),
+        memory_events="low 0\nhigh 0\nmax 0",
+    )
+
+    assert cgroup_memory.describe_cgroup_memory(root, proc) == (
+        "cgroup peak 12.00 GiB of 48 GiB MemoryMax (25%)"
+    )
+
+
+@pytest.mark.parametrize("zeroed", ["memory_high", "memory_max"])
+def test_a_cap_of_zero_does_not_divide_by_zero(tmp_path, zeroed):
+    """`0` is a legal cgroup v2 value for both cap files, and it is what
+    `systemctl --user set-property ... MemoryHigh=0` writes — the same surface
+    deploy/README.md documents for live emergencies, so this is reachable by an
+    operator rather than only by a kernel.
+
+    Testing the caps for truthiness rather than for `is not None` is the whole
+    fix: `_finish_batch` is NOT wrapped at its call site, so a ZeroDivisionError
+    here skips the tail catalog backup, the publish AND the alert — issue #167's
+    failure, produced by the accounting nicety that exists to prevent it.
+    """
+    caps = {"memory_high": "max", "memory_max": "max", zeroed: "0"}
+    root, proc = _tree(tmp_path, memory_peak=str(3 * 2**30), **caps)
+
+    assert cgroup_memory.describe_cgroup_memory(root, proc) == (
+        "cgroup peak 3.00 GiB (no cgroup memory cap)"
+    )
+
+
+@pytest.mark.parametrize(
+    "path_file",
+    ["memory_peak", "proc_self_cgroup"],
+    ids=["in-a-cgroup-file", "in-proc-self-cgroup"],
+)
+def test_undecodable_bytes_are_not_measured_rather_than_an_exception(tmp_path, path_file):
+    """The reads decode as ASCII and UTF-8, and a `UnicodeDecodeError` is a
+    `ValueError`, not an `OSError` — so catching only `OSError` left the
+    never-raises contract with a hole on both files it opens.
+
+    Not expected from a kernel, which is exactly why it needs a test: the
+    contract is what the tail depends on, and a contract only holds where it was
+    checked.
+    """
+    root, proc = _tree(tmp_path, memory_peak="20267974656", memory_high=str(40 * 2**30))
+    if path_file == "proc_self_cgroup":
+        Path(proc).write_bytes(b"0::/user.slice/\xff.service\n")
+    else:
+        next(Path(root).rglob("memory.peak")).write_bytes(b"\xff\xfe20267974656\n")
+
+    assert cgroup_memory.read_cgroup_memory(root, proc) is None
+    assert cgroup_memory.describe_cgroup_memory(root, proc) is None
 
 
 def test_a_missing_memory_peak_is_none_not_zero(tmp_path):

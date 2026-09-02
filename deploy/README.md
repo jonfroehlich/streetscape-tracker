@@ -146,11 +146,14 @@ The service ships with resource caps (`MemoryHigh=40G`, `MemoryMax=48G`,
 `CPUQuota=400%`, `Nice=10`, `CPUWeight=50`) so nightly collection can't starve
 the other lab services that share the box and the storage array. The memory
 numbers are measured, not guessed, and the unit file carries the measurement
-and the date beside them — read that before changing either. They were raised
-from 20G/24G on 2026-09-02 (issue #305) after an ordinary night peaked at 18.88
-GiB, i.e. 94% of the soft brake; the nightly summary now records the peak, so
-`grep 'cgroup peak' logs/streetscape_scheduler.log` is the running measurement. If `enable-linger`
-is disallowed by policy, ask CSE IT to enable lingering for your account.
+and the date beside them — read that before changing either.
+They were raised from 20G/24G on 2026-09-02 (issue #305) after an ordinary night
+peaked at 18.88 GiB, i.e. 94% of the soft brake.
+The nightly summary now records the peak, so
+`grep 'cgroup peak' logs/streetscape_scheduler.log` is the running measurement.
+
+If `enable-linger` is disallowed by policy, ask CSE IT to enable lingering for
+your account.
 
 **`systemctl --user set-property` overrides this unit file, permanently and
 invisibly.** It writes a drop-in under
@@ -648,8 +651,20 @@ retrospective:
 
 ```bash
 grep 'cgroup peak' logs/streetscape_scheduler.log | tail -14
-#   cgroup peak 18.88 GiB of 40 GiB MemoryHigh (47%)
+#   cgroup peak 18.88 GiB of 40 GiB MemoryHigh (47%), throttled 0 times
 ```
+
+Read the throttle count, not only the percentage.
+`memory.peak` is the high-water mark of `memory.current`, which charges page
+cache and kernel memory as well as anonymous memory, so a high percentage says a
+raise *might* be due.
+`memory.events`'s `high` counter is the direct evidence: it counts the times
+this cgroup was actually pushed into direct reclaim at the soft brake.
+`throttled 0 times` at 94% means the brake never engaged; a non-zero count at
+47% means it did, and no percentage would have shown it.
+The clause is absent when the kernel does not provide `memory.events`, and
+absent when no `MemoryHigh` is configured (the counter only increments on that
+boundary).
 
 The number covers the whole unit — the scheduler plus every collection child,
 since `subprocess` children share its cgroup — which is the right denominator,

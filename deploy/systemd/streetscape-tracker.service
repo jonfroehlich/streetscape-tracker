@@ -175,14 +175,16 @@ ReadWritePaths=/cse/web/research/makelab/public/streetscape-tracker
 # to read "worst city plus ~30%" as covering every night. Measure a diff night
 # (the next Detroit collection is one) before sizing against it.
 #
-# Two things to keep straight about that number. It RAISES NO CEILING — the
-# limit is MemoryMax and it is unchanged; MemoryHigh only moves where we start
-# throttling ourselves, which is the one burden on this host that has actually
-# been measured (its load is ZFS; CPU sits 97-99% idle). And ~15.3 GiB is an
-# EXTRAPOLATION from one city's slope, not a measurement: capture MemoryPeak on
-# a real Detroit night before treating it as settled. For scale, makelab2 has
-# 188 GiB and 48 cores (checked 2026-08-20), so the caps below are ~21%/~26% of
-# the box.
+# Two things to keep straight about that number. As written in 2026-08 it RAISED
+# NO CEILING — the limit was MemoryMax and that raise left it alone; MemoryHigh
+# only moves where we start throttling ourselves, which is the one burden on this
+# host that has actually been measured (its load is ZFS; CPU sits 97-99% idle).
+# THAT NO LONGER HOLDS: the 2026-09-02 raise below moves MemoryMax as well
+# (24G -> 48G), so it does raise the ceiling and the sentence is kept only as the
+# record of what the earlier decision was. And ~15.3 GiB is an EXTRAPOLATION from
+# one city's slope, not a measurement: capture MemoryPeak on a real Detroit night
+# before treating it as settled. For scale, makelab2 has 188 GiB and 48 cores
+# (checked 2026-08-20), so the caps below are ~21%/~26% of the box.
 #
 # 2026-09-02 (issue #305): 20G was NOT the comfortable number the paragraphs
 # above assumed. The 2026-09-01 batch read MemoryPeak=20,267,974,656 = 18.88
@@ -193,14 +195,23 @@ ReadWritePaths=/cse/web/research/makelab/public/streetscape-tracker
 # things and no more:
 #   - one child at the measured 18.88 GiB with ~2x headroom rather than 6%;
 #   - TWO children at once, which is what [schedule].max_concurrent_channels > 1
-#     makes possible (issue #240) -- ~38 GiB, still under the soft brake. Today's
-#     peak is ONE child, so the concurrency raise has no headroom at 20G; this is
-#     its precondition, not a workaround for it;
-#   - the GSV connection_limit experiment (issue #304), which raises in-flight
-#     response buffers in proportion to the limit it tests.
-# It is NOT sized for the 4-of-6 host-disjoint lane ceiling (~76 GiB), and it is
-# still NOT sized for a Detroit DIFF night (the unmeasured two-frame case two
-# paragraphs up). Measure before assuming either.
+#     makes possible (issue #240). Today's peak is ONE child, so the concurrency
+#     raise has no headroom at 20G; this is its precondition, not a workaround
+#     for it. BE CAREFUL WITH THE ARITHMETIC HERE: 2 x 18.88 = 37.76 GiB is 94%
+#     of 40G, i.e. the same margin this paragraph just called unacceptable at one
+#     child. It is an UPPER BOUND, not the expected figure -- 18.88 is the whole
+#     unit (scheduler baseline B plus one child C), so two children are B + 2C,
+#     which is strictly less than 2(B + C). The doubling is quoted because it is
+#     the conservative read; the real headroom is better than 6% and nobody has
+#     measured how much better. A two-lane night is the first thing to read a
+#     `cgroup peak` line off, and it is a reason to read one, not to skip it.
+# It is explicitly NOT sized for the GSV connection_limit experiment (issue
+# #304): that raises in-flight response buffers in proportion to the limit it
+# tests, on top of a two-child case already quoted at 94% of the brake, and no
+# one has put a number on it. Run that experiment at max_concurrent_channels = 1
+# until there is one. It is NOT sized for the 4-of-6 host-disjoint lane ceiling
+# (~76 GiB), and it is still NOT sized for a Detroit DIFF night (the unmeasured
+# two-frame case two paragraphs up). Measure before assuming any of the three.
 #
 # The ceiling argument is the BOX's, not the cgroup's, and free RAM is the wrong
 # reading of it: makelab2 has 188 GiB, but it is also the lab fileserver and most
@@ -213,7 +224,17 @@ ReadWritePaths=/cse/web/research/makelab/public/streetscape-tracker
 # MemoryPeak is now recorded per night in the run-due summary line (issue #305),
 # so `grep 'cgroup peak' logs/streetscape_scheduler.log` answers "is there
 # headroom?" without an operator being logged in at the right moment -- and
-# without the reading being lost when the next start creates a new cgroup. Read a
+# without the reading being lost when the next start creates a new cgroup.
+#
+# Two things that line is honest about rather than silent on. It carries the
+# memory.events `high` counter beside the percentage, because memory.peak is the
+# high-water mark of memory.current -- page cache and kernel memory included --
+# and so is a proxy for throttling rather than evidence of it; the counter is the
+# evidence, and 0 at 94% means the brake never engaged. And it is read BEFORE the
+# tail catalog backup and the publish rsync, because the summary has to be
+# complete before it is handed to the publish, so neither of those two steps can
+# ever appear in the number. Both are small on a pool where ZFS ARC (not the
+# cgroup) absorbs the file IO, but neither has been measured. Read a
 # week of those, INCLUDING a night with a 4M-point city (Moscow, Mexico City, Los
 # Angeles, London and Las Vegas all sit at the 4,004,xxx grid cap), before
 # treating this headroom as real or raising max_concurrent_channels.

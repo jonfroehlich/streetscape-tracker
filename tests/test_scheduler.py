@@ -5013,6 +5013,22 @@ def test_stop_timeout_covers_the_publish_tail_it_waits_for():
 # with a real MemoryPeak the first night a big city runs to completion.
 _EXTRAPOLATED_LARGEST_CITY_PEAK_GIB = 15.3
 
+# The instruction above ("replace it with a real MemoryPeak the first night a big
+# city runs to completion") is what this constant is. 2026-09-01, read off the
+# unit's own cgroup: MemoryPeak=20,267,974,656 = 18.88 GiB, whole unit, ORDINARY
+# night -- one collection child at a time, nothing Detroit-scale in the slate.
+#
+# It is ABOVE the extrapolated worst-city figure, which is the finding and not a
+# rounding difference: the ~0.914 GiB-per-million-rows slope underestimates
+# because the baseline term dominates what it attributed to row count. So this,
+# not 15.3, is the binding floor for both caps -- and the unit file's "not sized
+# for a Detroit DIFF night" caveat is understated by more than it says.
+#
+# The two are kept side by side rather than one replacing the other: 15.3 is
+# still the only figure anyone has for how peak scales WITH a city, and 18.88 is
+# the only one measured. Neither answers the other's question.
+_MEASURED_ORDINARY_NIGHT_PEAK_GIB = 18.88
+
 
 def test_memory_high_is_a_throttle_below_the_hard_limit_and_clears_the_worst_city():
     """
@@ -5039,9 +5055,18 @@ def test_memory_high_is_a_throttle_below_the_hard_limit_and_clears_the_worst_cit
     Asserted against the directive lines, not the prose around them.
     """
     unit = Path(_PROJECT_ROOT, "deploy", "systemd", "streetscape-tracker.service").read_text()
-    floor = _EXTRAPOLATED_LARGEST_CITY_PEAK_GIB * 2**30
+    # The HIGHER of the two, because they are floors for the same caps and only
+    # the binding one is a guard. Since 2026-09-01 that is the measurement, not
+    # the extrapolation -- an ordinary night read above the extrapolated worst
+    # city. Left as a max() rather than hard-coded to the measurement so a later,
+    # larger extrapolation (a Detroit diff night is the named candidate) becomes
+    # the floor by being written down, without anyone having to notice this line.
+    floor = max(_EXTRAPOLATED_LARGEST_CITY_PEAK_GIB, _MEASURED_ORDINARY_NIGHT_PEAK_GIB) * 2**30
     _assert_unit_quotes(
         unit, f"{_EXTRAPOLATED_LARGEST_CITY_PEAK_GIB} GiB", "_EXTRAPOLATED_LARGEST_CITY_PEAK_GIB"
+    )
+    _assert_unit_quotes(
+        unit, f"{_MEASURED_ORDINARY_NIGHT_PEAK_GIB} GiB", "_MEASURED_ORDINARY_NIGHT_PEAK_GIB"
     )
 
     def _raw(directive):
@@ -8564,6 +8589,44 @@ def test_the_tail_records_the_cgroup_memory_peak(conn, monkeypatch, tmp_path, ca
 
     assert "cgroup peak 18.88 GiB of 40 GiB MemoryHigh (47%)" in caplog.text
     assert published["context"] == "summary; cgroup peak 18.88 GiB of 40 GiB MemoryHigh (47%)"
+
+
+def test_the_cgroup_peak_is_read_after_the_aggregate_rebuild(conn, monkeypatch, tmp_path):
+    """
+    Ordering, which is the reason the call sits in `_finish_batch` at all.
+
+    On a big-census night the tail and not the city loop sets the peak (#157):
+    `generate_aggregate_v2` is the heaviest step either side of it, and a reading
+    taken before it would quote the city loop's number and miss the actual high
+    water mark by whatever the rebuild adds.
+
+    Untested, that argument is a comment. Both other tail tests here patch the
+    reader and assert on the summary, which passes identically with the call
+    moved to the top of the function -- so this pins the sequence rather than the
+    output.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    order = []
+    monkeypatch.setattr(
+        sched, "generate_aggregate_v2", lambda c, d: order.append("aggregate") or {}
+    )
+    monkeypatch.setattr(
+        sched.cgroup_memory,
+        "describe_cgroup_memory",
+        lambda: (order.append("cgroup peak"), "cgroup peak 1.00 GiB (no cgroup memory cap)")[1],
+    )
+    monkeypatch.setattr(sched, "_publish", lambda cfg, context, **_kw: 0)
+    cfg = SchedulerConfig(
+        data_dir=str(tmp_path), backup_dir=str(tmp_path / "backups"), publish_enabled=True
+    )
+
+    sched._finish_batch(cfg, conn, "summary", succeeded=1, attempted=1, today=date(2026, 7, 2))
+
+    assert order == ["aggregate", "cgroup peak"], (
+        "the peak must be read AFTER the aggregate rebuild, which is what makes "
+        "it the whole night's high-water mark rather than the city loop's"
+    )
 
 
 def test_the_tail_says_nothing_when_the_cgroup_cannot_be_read(conn, monkeypatch, tmp_path):

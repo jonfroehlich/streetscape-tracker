@@ -11,13 +11,30 @@ streetscape-tracker.service -p MemoryPeak``), but only for an operator logged in
 at the right moment, and the value resets when the next start creates a new
 cgroup. A night's peak was therefore unobservable by morning.
 
+**Two numbers, not one, because the percentage is only a proxy.**
+``memory.peak`` is the high-water mark of ``memory.current``, which charges page
+cache, kernel memory and socket buffers alongside anonymous memory — so it is
+not the same quantity as the ~15.3 GiB working-set figure the unit file
+extrapolates from a per-city slope, and a high percentage does not by itself
+mean the night was throttled. ``memory.events``'s ``high`` counter is the direct
+evidence: it counts the times processes in this cgroup were pushed into direct
+reclaim *because* the high boundary was exceeded. Zero throttle events at 94% of
+``MemoryHigh`` says the brake never engaged; a non-zero count at 47% says it did,
+and no percentage would have shown it. Both are read here, and the counter shares
+the peak's lifetime semantics, so the two are always about the same window.
+
 Three things this deliberately does NOT do:
 
 * **It never raises.** A missing file, a cgroup v1 host, a kernel without
-  ``memory.peak`` (added in 5.19) or a container that hides ``/sys/fs/cgroup``
-  all return ``None``. This runs in the tail, beside the catalog backup and the
-  publish, and an accounting nicety must never be what costs a night its
-  publish (issue #167).
+  ``memory.peak`` (added in 5.19), a container that hides ``/sys/fs/cgroup``,
+  an unparseable or non-ASCII value, or a cap of ``0`` (a legal cgroup v2
+  setting, and what ``systemctl set-property MemoryHigh=0`` writes) all return
+  ``None`` or drop the percentage. This runs in the tail, beside the catalog
+  backup and the publish, and ``_finish_batch`` is NOT wrapped at its call site
+  — an exception here skips the backup, the publish and the alert, which is
+  exactly issue #167's failure. So every read catches ``ValueError`` as well as
+  ``OSError`` (``UnicodeDecodeError`` is a ``ValueError``), and every division
+  checks its denominator is truthy rather than merely non-``None``.
 * **It reads the cgroup, not systemd.** ``systemctl show`` would need the
   service name, would only work under the unit, and would spawn a child inside
   the very cgroup being measured. ``/proc/self/cgroup`` needs none of that and
@@ -56,19 +73,32 @@ class CgroupMemory:
     unset — cgroup v2 spells that ``max``, and "no cap" and "a cap we could not
     read" are deliberately the same value here, because the only thing either
     can support is declining to quote a percentage.
+
+    ``high_events`` is ``memory.events``'s ``high`` counter — how many times
+    this cgroup was actually throttled at the soft brake — or ``None`` when the
+    file is absent or unparseable. ``None`` and ``0`` are very different
+    answers here and callers must keep them apart: ``0`` is the reassuring
+    measurement the percentage cannot give, while ``None`` is no measurement.
     """
 
     peak_bytes: int
     high_bytes: int | None
     max_bytes: int | None
+    high_events: int | None = None
 
 
 def _read_limit(path: str) -> int | None:
-    """One cgroup byte-valued file, or None for ``max`` / unreadable."""
+    """One cgroup byte-valued file, or None for ``max`` / unreadable.
+
+    ``ValueError`` is caught alongside ``OSError`` because the decode happens
+    inside the read: a non-ASCII byte raises ``UnicodeDecodeError``, which is a
+    ``ValueError`` and would otherwise escape the whole module's never-raises
+    contract on the way out of ``fh.read()``.
+    """
     try:
         with open(path, encoding="ascii") as fh:
             raw = fh.read().strip()
-    except OSError:
+    except (OSError, ValueError):
         return None
     if raw == "max":
         return None
@@ -76,6 +106,25 @@ def _read_limit(path: str) -> int | None:
         return int(raw)
     except ValueError:
         return None
+
+
+def _read_high_events(path: str) -> int | None:
+    """``memory.events``'s ``high`` counter, or None.
+
+    The file is ``key value`` lines (``low``/``high``/``max``/``oom``/
+    ``oom_kill``), so it needs its own parse rather than ``_read_limit``. Only
+    ``high`` is read: it is the one counter that answers "did the soft brake
+    engage?", which is the question the peak percentage can only approximate.
+    """
+    try:
+        with open(path, encoding="ascii") as fh:
+            for line in fh:
+                key, _, value = line.strip().partition(" ")
+                if key == "high":
+                    return int(value)
+    except (OSError, ValueError):
+        return None
+    return None
 
 
 def _own_cgroup_path(cgroup_root: str, proc_self_cgroup: str) -> str | None:
@@ -94,7 +143,7 @@ def _own_cgroup_path(cgroup_root: str, proc_self_cgroup: str) -> str | None:
                     relative = line.strip().split("::", 1)[1]
                     # An empty path is the root cgroup, which is legal.
                     return os.path.join(cgroup_root, relative.lstrip("/"))
-    except OSError:
+    except (OSError, ValueError):
         return None
     return None
 
@@ -103,7 +152,7 @@ def read_cgroup_memory(
     cgroup_root: str = CGROUP_ROOT,
     proc_self_cgroup: str = PROC_SELF_CGROUP,
 ) -> CgroupMemory | None:
-    """This process's cgroup memory peak and caps, or None if unavailable.
+    """This process's cgroup memory peak, caps and throttle count, or None.
 
     ``None`` means "not measured", never "zero" — every caller has to keep those
     apart, since a summary line quoting a peak of 0 GiB on a host without
@@ -119,26 +168,47 @@ def read_cgroup_memory(
         peak_bytes=peak,
         high_bytes=_read_limit(os.path.join(base, "memory.high")),
         max_bytes=_read_limit(os.path.join(base, "memory.max")),
+        high_events=_read_high_events(os.path.join(base, "memory.events")),
     )
 
 
 def format_cgroup_memory(reading: CgroupMemory) -> str:
-    """One human line, e.g. ``cgroup peak 18.88 GiB of 40 GiB MemoryHigh (47%)``.
+    """One human line, e.g.::
+
+        cgroup peak 18.88 GiB of 40 GiB MemoryHigh (47%), throttled 0 times
 
     Quoted against ``MemoryHigh`` in preference to ``MemoryMax`` because that is
     the cap whose breach is invisible: reaching ``MemoryMax`` produces an OOM
     kill an operator can read in a log, while reaching ``MemoryHigh`` produces a
-    night that is merely slow. The percentage is the whole point of the line —
-    the absolute GiB alone cannot say whether a raise is due.
+    night that is merely slow. The percentage is why the line is worth reading —
+    the absolute GiB alone cannot say whether a raise is due — and the throttle
+    count is why the percentage is not the last word.
+
+    The count is appended only in the ``MemoryHigh`` branch: ``memory.events``'s
+    ``high`` counter increments on the *high* boundary, so with no soft brake
+    configured it is structurally 0 and reporting it would be noise dressed as a
+    measurement.
+
+    Both caps are tested for truthiness, not just for ``None``. ``0`` is a legal
+    value for ``memory.high`` and ``memory.max`` — it is what
+    ``systemctl --user set-property ... MemoryHigh=0`` writes, on the same
+    surface ``deploy/README.md`` documents for live emergencies — and dividing
+    by it is how this becomes the exception that costs the night its publish.
     """
     peak = f"cgroup peak {reading.peak_bytes / _GIB:.2f} GiB"
-    if reading.high_bytes is not None:
+    if reading.high_bytes:
         cap, label = reading.high_bytes, "MemoryHigh"
-    elif reading.max_bytes is not None:
-        cap, label = reading.max_bytes, "MemoryMax"
+        throttled = (
+            f", throttled {reading.high_events} time{'' if reading.high_events == 1 else 's'}"
+            if reading.high_events is not None
+            else ""
+        )
+    elif reading.max_bytes:
+        cap, label, throttled = reading.max_bytes, "MemoryMax", ""
     else:
         return f"{peak} (no cgroup memory cap)"
-    return f"{peak} of {cap / _GIB:.0f} GiB {label} ({100.0 * reading.peak_bytes / cap:.0f}%)"
+    pct = 100.0 * reading.peak_bytes / cap
+    return f"{peak} of {cap / _GIB:.0f} GiB {label} ({pct:.0f}%){throttled}"
 
 
 def describe_cgroup_memory(
