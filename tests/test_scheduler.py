@@ -44,6 +44,19 @@ from tests.conftest import make_city_df, write_city_csv_gz
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+
+def _reserve(cfg):
+    """The opt-in slot reservation a nightly run would resolve for ``cfg`` (#282).
+
+    Tests call ``_collect_due`` directly, so they have to supply the reservation
+    ``cmd_run_due`` computes. Routed through the production resolver rather than
+    hardcoded, so a test cannot keep asserting the old unbounded behaviour by
+    quietly passing its own number — the pass-through is the thing under test in
+    ``test_the_opt_in_reservation_bounds_the_hoist``.
+    """
+    return _sched._opt_in_reservation(cfg, cfg.max_cities_per_day)
+
+
 # The real nightly hooks, saved before the autouse stubs below replace them so
 # the dedicated driving-plan / backup tests can exercise them.
 _REAL_DRIVING_PLAN_HOOK = _sched._fetch_driving_plan_nightly
@@ -1088,6 +1101,13 @@ def test_makelab1_production_config_is_wired():
     # edit to this test and this file together — the same reason the Mapillary
     # budgets above are pinned exactly.
     assert cfg.max_concurrent_channels == 1
+    # Production leaves the #282 reservation UNSET, so the derived share is what
+    # actually runs. Pinning the resolved number and not just the None is the
+    # point: `is None` alone would still pass if the resolver's share changed
+    # under it, and 5 of 20 is the figure the KartaView widening is paced by —
+    # the enrolled set divided by it is how many nights a full pass takes.
+    assert cfg.opt_in_cities_per_day is None
+    assert _sched._opt_in_reservation(cfg, cfg.max_cities_per_day) == 5
     # The street channels must keep their ISOLATED budgets: metered under their
     # own api_usage provider strings against separate keys, so a road crawl can
     # never eat the grid collectors' quota.
@@ -2287,7 +2307,7 @@ def test_the_hoist_is_the_identity_permutation_without_an_opt_in_channel(conn):
 
     cfg = _mly_cfg()
     ordered, providers_for_city, hoisted = sched._collect_due(
-        conn, cfg, date(2026, 7, 2), ["gsv", "mapillary"]
+        conn, cfg, date(2026, 7, 2), ["gsv", "mapillary"], max_opt_in=_reserve(cfg)
     )
     expected = [
         c.city_id
@@ -2329,7 +2349,7 @@ def test_a_city_due_only_on_an_opt_in_channel_is_hoisted_ahead_of_the_gsv_block(
 
     cfg = _sweep_cfg(publish_enabled=False)
     ordered, providers_for_city, hoisted = sched._collect_due(
-        conn, cfg, date(2026, 7, 2), ["gsv", "kartaview"]
+        conn, cfg, date(2026, 7, 2), ["gsv", "kartaview"], max_opt_in=_reserve(cfg)
     )
 
     assert [c.city_id for c in ordered][0] == krabi
@@ -2363,7 +2383,7 @@ def test_a_city_due_on_gsv_too_keeps_its_exact_union_position(conn):
 
     cfg = _sweep_cfg(publish_enabled=False)
     ordered, providers_for_city, hoisted = sched._collect_due(
-        conn, cfg, date(2026, 7, 2), ["gsv", "kartaview"]
+        conn, cfg, date(2026, 7, 2), ["gsv", "kartaview"], max_opt_in=_reserve(cfg)
     )
 
     assert [c.city_id for c in ordered][-1] == krabi, "not hoisted: it is due on gsv too"
@@ -2465,7 +2485,7 @@ def test_a_sweep_killed_by_its_timeout_leads_the_next_slate_but_costs_the_night_
     assert row["last_success_at"] is None
 
     ordered, providers_for_city, hoisted = _sched._collect_due(
-        conn, cfg, date(2026, 7, 3), list(cfg.enabled_providers())
+        conn, cfg, date(2026, 7, 3), list(cfg.enabled_providers()), max_opt_in=_reserve(cfg)
     )
     assert ordered[0].city_id == krabi, "still hoisted tomorrow, which is what bounds it at five"
     assert providers_for_city[krabi] == ["kartaview"]
@@ -2489,39 +2509,81 @@ def test_a_single_opt_in_channel_run_reports_no_hoist(conn):
 
     cfg = _sweep_cfg(publish_enabled=False)
     ordered, providers_for_city, hoisted = _sched._collect_due(
-        conn, cfg, date(2026, 7, 2), ["kartaview"]
+        conn, cfg, date(2026, 7, 2), ["kartaview"], max_opt_in=_reserve(cfg)
     )
     assert {c.city_id for c in ordered} == {krabi, bend}, "both are still collected"
     assert all(providers_for_city[c.city_id] == ["kartaview"] for c in ordered)
     assert hoisted == 0
 
 
-def test_the_night_warns_when_the_opt_in_cities_fill_the_city_cap(conn, monkeypatch, caplog):
-    """The hoist is deliberately unbounded (#282), so this alert is the only
-    guard until reserved slots land.
+def _starvation_slate(conn):
+    """Two opt-in-only cities and one gsv-only city — the shape #282 is about.
 
-    Once the opt-in-only cities alone fill `max_cities_per_day`, every
-    default-membership channel collects NOTHING that night — and the arithmetic
-    that produces a night of zero gsv would otherwise be recoverable only by
-    subtracting two numbers on an INFO line. The warning names the starved
-    channels, so the night's record says what it did and not only what it
-    reordered.
+    Both enrolled cities are fresh on every default-membership channel, so they
+    are due ONLY on kartaview: the stranded shape the hoist exists to rescue,
+    and, at enough of them, the shape that starves everything else.
     """
-    import logging
-
     enrolled = [_register(conn, n, width=1000, height=1000, step=20) for n in ("Krabi", "Hue")]
     bend = _register(conn, "Bend", width=1000, height=1000, step=20)
     channels = _street_cfg().enabled_providers()
     db.assign_schedule(conn, 90, providers=tuple(channels))
-    # Enrolled AND fresh on every default-membership channel: the stranded
-    # shape, so both hoist and the cap is exactly their count.
     for cid in enrolled:
         db.set_channel_membership(conn, cid, "kartaview", True, cycle_days=90)
         for channel in channels:
             db.record_attempt(conn, cid, success=True, provider=channel)
+    return enrolled, bend
+
+
+def test_the_opt_in_reservation_leaves_slots_for_the_default_channels(conn, monkeypatch):
+    """Issue #282: the hoist is BOUNDED, so a wide enrolled set cannot starve gsv.
+
+    This is the case that used to warn and now simply does not happen. Two
+    opt-in-only cities against a two-city cap: unbounded, both hoist and Bend —
+    the stalest gsv city — collects nothing. With the derived reservation
+    (max(1, 2 // 4) = 1) exactly one is promoted and Bend keeps the other slot.
+
+    The assertion that matters is `bend in ran`: the reservation is not about
+    how many opt-in cities run, it is about the ones that DON'T get displaced.
+    """
+    enrolled, bend = _starvation_slate(conn)
 
     ran = []
     cfg = _sweep_cfg(publish_enabled=False, max_cities_per_day=len(enrolled))
+    assert _reserve(cfg) == 1, "derived reservation is a quarter of the cap, floored at 1"
+    _run_loop_with(
+        monkeypatch,
+        conn,
+        cfg,
+        lambda c, p: ran.append((c.city_id, p)) or True,
+        today=date(2026, 7, 2),
+    )
+
+    collected = {cid for cid, _ in ran}
+    assert bend in collected, "the reserved share must not take the whole cap"
+    assert len(collected & set(enrolled)) == 1, "exactly the reservation, not both"
+
+
+def test_the_night_still_warns_if_the_reservation_is_set_to_the_whole_cap(
+    conn, monkeypatch, caplog
+):
+    """The starvation warning is kept as a backstop, not deleted by #282.
+
+    The derived reservation cannot reach the cap, so the only way back into a
+    starved night is an operator setting `opt_in_cities_per_day` equal to
+    `max_cities_per_day` — re-creating the unbounded hoist by hand. That is a
+    legal configuration, so the warning still has to fire and still has to name
+    the starved channels.
+    """
+    import logging
+
+    enrolled, bend = _starvation_slate(conn)
+
+    ran = []
+    cfg = _sweep_cfg(
+        publish_enabled=False,
+        max_cities_per_day=len(enrolled),
+        opt_in_cities_per_day=len(enrolled),
+    )
     with caplog.at_level(logging.WARNING, logger="streetscape_scheduler"):
         _run_loop_with(
             monkeypatch,
@@ -2533,9 +2595,28 @@ def test_the_night_warns_when_the_opt_in_cities_fill_the_city_cap(conn, monkeypa
 
     assert f"fill the city cap ({len(enrolled)})" in caplog.text
     assert "gsv" in caplog.text and "nothing tonight" in caplog.text
+    assert "opt_in_cities_per_day" in caplog.text, "the warning must name the knob that did it"
     # The warning is not merely pessimistic: Bend really did not collect.
     assert {cid for cid, _ in ran} == set(enrolled)
     assert bend not in {cid for cid, _ in ran}
+
+
+def test_the_opt_in_reservation_is_resolved_in_one_place(conn):
+    """`_opt_in_reservation` is the only place `None` becomes a number (#282).
+
+    Pins the three behaviours a call site must not re-derive for itself: the
+    derived share, an explicit override, and the clamp that stops an override
+    larger than the cap from being the unbounded hoist spelled differently.
+    A test asserting only the DEFAULT would let a call site hardcode its own
+    figure, so the override and the clamp are pinned here too.
+    """
+    assert _sched._opt_in_reservation(_sweep_cfg(), 20) == 5
+    assert _sched._opt_in_reservation(_sweep_cfg(), 2) == 1, "floored at 1, never 0 by rounding"
+    assert _sched._opt_in_reservation(_sweep_cfg(opt_in_cities_per_day=7), 20) == 7
+    assert _sched._opt_in_reservation(_sweep_cfg(opt_in_cities_per_day=99), 20) == 20, "clamped"
+    assert _sched._opt_in_reservation(_sweep_cfg(opt_in_cities_per_day=0), 20) == 0, (
+        "0 switches the promotion off without un-enrolling anybody"
+    )
 
 
 def test_the_hoist_count_is_on_the_nights_own_record(conn, monkeypatch, caplog):

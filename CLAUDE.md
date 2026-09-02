@@ -20,6 +20,7 @@ The tool samples a geographic grid around a city center, queries each provider's
 | Provider | Official docs | Community |
 |---|---|---|
 | GSV | [Street View Static API usage & billing](https://developers.google.com/maps/documentation/streetview/usage-and-billing) + the API's own docs | Google Maps Platform issue tracker; Stack Overflow `google-street-view` tag |
+| KartaView | No developer portal: the single documented figure (100/h anonymous, 1,000/h authenticated) sits in a JS-SPA FAQ, restated by [Bellingcat's toolkit](https://bellingcat.gitbook.io/toolkit/more/all-tools/kartaview) | **None exists** — the `kartaview/openstreetcam.org` tracker is unstaffed, so for this provider there is no early warning at all; pace on the documented number and stage volume changes |
 | Mapillary | [API documentation](https://www.mapillary.com/developer/api-documentation), incl. its rate-limits section | [forum.mapillary.com](https://forum.mapillary.com) — **not optional**: Mapillary's real operational limits are undocumented and described only there |
 
 **The documented limit is not necessarily the binding one, and the forum is where you learn that.**
@@ -153,6 +154,7 @@ Four KartaView rules that must survive without a read:
   The walk is enrolled **separately** rather than following the grid channel: street coverage is a different question from grid coverage, and a channel reading another channel's membership would give `schedule_state.member`'s NULL a third meaning.
   Enrol both for a city and the pair is nearly free — `kartaview_streets` ranks immediately after `kartaview`, so the grid sweep lands in the census cache and the walk prices at 0 (#290); enrol only the walk and it pays a full sweep.
   `_collect_due` hoists a city due *only* on an opt-in channel to the head of the slate (`all`, not `any`) — without which the channel would be scoped but never reached, since the union is gsv-ordered and the city cap truncates from the tail.
+  The hoist is **bounded** by `[schedule].opt_in_cities_per_day` (#282; unset = a quarter of the city cap, floored at 1, resolved only in `_opt_in_reservation`), because unbounded it starves every default-membership channel once the enrolled set is wide — so that key is the RATE any widening proceeds at, not a safety margin.
   With `kartaview_streets` (#258) they are the fifth and sixth channels, and the effective `max_concurrent_channels` ceiling is **4 of 6**: the largest host-disjoint set is gsv (no per-IP host) + ONE of the three Overpass channels + mapillary + kartaview.
   That figure is a property of the channel set's host graph, never a constant — re-derive it when a channel is added rather than quoting the last number written down.
   Its cost arms ARE wired (#238): the estimate is the swept-circle lattice × the measured **1.80×**, never the GSV grid formula, and the previous run's observed `runs.api_requests` outranks that geometry as the **larger** of the two, never on its own.

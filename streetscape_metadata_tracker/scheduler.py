@@ -368,6 +368,12 @@ class SchedulerConfig:
     grace_days: int = 7
     daily_request_budget: int = 10_000_000  # legacy gsv budget ([providers] overrides)
     max_cities_per_day: int = 20
+    # Slots reserved out of max_cities_per_day for cities due ONLY on an opt-in
+    # channel (issue #282). None means "derive from the cap" — see
+    # _opt_in_reservation, which is the single place that resolution happens.
+    # It belongs beside max_cities_per_day because a night's cap and its split
+    # are only meaningful read together.
+    opt_in_cities_per_day: int | None = None
     max_consecutive_failures: int = 5
     city_timeout_minutes: int = 180
     # Wall-clock ceiling on the CITY LOOP, leaving the tail (aggregate,
@@ -523,6 +529,33 @@ class SchedulerConfig:
         )
 
 
+# The share of a night's city cap reserved for opt-in-only cities when
+# [schedule].opt_in_cities_per_day is unset. A quarter, so the derived value at
+# prod's cap of 20 is 5 — comfortably above the two-city seed set (so this
+# changes no night that runs today) and comfortably below the cap (so a widened
+# enrolled set cannot starve the default-membership channels). It is a divisor
+# rather than a constant because the thing being split is the cap, and a
+# constant would silently become the whole cap if someone lowered it.
+_OPT_IN_SLOT_SHARE = 4
+
+
+def _opt_in_reservation(cfg: SchedulerConfig, max_cities: int) -> int:
+    """
+    How many opt-in-only cities may lead tonight's slate (issue #282).
+
+    The single place ``[schedule].opt_in_cities_per_day``'s None is resolved, so
+    a config that sets it and a config that does not cannot disagree about what
+    the reservation means. An explicit value is clamped to ``max_cities``: a
+    reservation larger than the cap is the unbounded hoist again, spelled
+    differently, and 0 is a legitimate way to switch the promotion off entirely
+    without un-enrolling anybody.
+    """
+    configured = cfg.opt_in_cities_per_day
+    if configured is not None:
+        return max(0, min(configured, max_cities))
+    return max(1, max_cities // _OPT_IN_SLOT_SHARE)
+
+
 def _lane_count(sched: dict, config_path) -> int:
     """Read ``[schedule].max_concurrent_channels``, falling back to 1 (issue #240).
 
@@ -646,6 +679,7 @@ def load_scheduler_config(path: str | None = None) -> SchedulerConfig:
         grace_days=sched.get("grace_days", 7),
         daily_request_budget=sched.get("daily_request_budget", 10_000_000),
         max_cities_per_day=sched.get("max_cities_per_day", 20),
+        opt_in_cities_per_day=sched.get("opt_in_cities_per_day"),
         max_consecutive_failures=sched.get("max_consecutive_failures", 5),
         city_timeout_minutes=sched.get("city_timeout_minutes", 180),
         max_batch_hours=sched.get("max_batch_hours", 10.0),
@@ -3923,7 +3957,7 @@ def _reconcile_orphaned_walk(
     return True
 
 
-def _collect_due(conn, cfg: SchedulerConfig, today: date, providers: list[str]):
+def _collect_due(conn, cfg: SchedulerConfig, today: date, providers: list[str], *, max_opt_in: int):
     """
     Due work for today: an ordered city list (stalest-first, gsv's order
     leading since it's the expensive series) and, per city, which of
@@ -3943,6 +3977,13 @@ def _collect_due(conn, cfg: SchedulerConfig, today: date, providers: list[str]):
 
     Returns ``(ordered, providers_for_city, hoisted)``; ``hoisted`` is the
     number of cities the opt-in reorder below moved, logged by ``cmd_run_due``.
+
+    ``max_opt_in`` is the reservation from issue #282 — how many opt-in-only
+    cities may be promoted to the head of the slate. It is **keyword-only with
+    no default**, for the same reason ``providers`` is required and
+    ``_run_city_loop``'s ``max_cities`` is: a permissive default here is an
+    unbounded hoist one refactor away, and unbounded is the exact failure #282
+    exists to remove. Callers resolve it through ``_opt_in_reservation``.
     """
     due_by_provider = {
         provider: db.get_due_cities(
@@ -4027,9 +4068,28 @@ def _collect_due(conn, cfg: SchedulerConfig, today: date, providers: list[str]):
     opt_in = {p for p in providers if is_opt_in_channel(p)}
     hoisted = 0
     if opt_in:
-        keys = [
-            0 if all(p in opt_in for p in providers_for_city[c.city_id]) else 1 for c in ordered
-        ]
+        # BOUNDED since #282. The promotion is now a RESERVATION -- at most
+        # `max_opt_in` cities move -- and the bound is what makes the mechanism
+        # survive a wide enrolled set. Unbounded, the hoist's success case and
+        # its starvation case are the same case at different N: "due only on
+        # the opt-in channel" is the NORMAL steady state for an enrolled city,
+        # because gsv succeeds nightly and advances its clock while the opt-in
+        # channel's stays put. So at a seed set of two it rescues a stranded
+        # city, and at a few hundred it takes the whole city cap and every
+        # default-membership channel collects nothing.
+        #
+        # The cities beyond the bound keep their union position rather than
+        # being dropped: they are still due, still counted in `due`, and simply
+        # wait for a later night's reservation. That is the intended shape of a
+        # widening -- N cities per night, indefinitely -- not a truncation.
+        promoted = 0
+        keys = []
+        for c in ordered:
+            if all(p in opt_in for p in providers_for_city[c.city_id]) and promoted < max_opt_in:
+                keys.append(0)
+                promoted += 1
+            else:
+                keys.append(1)
         # Counted only when there is something for them to be ahead OF. An
         # all-0 slate is the identity permutation just as an all-1 one is, and
         # it is not a corner case: `run-due --provider kartaview` makes every
@@ -4041,6 +4101,21 @@ def _collect_due(conn, cfg: SchedulerConfig, today: date, providers: list[str]):
         # PR A's inertness provable by construction rather than argued. (The
         # `if opt_in` guard is belt-and-braces on the same claim.)
         ordered = [c for _, c in sorted(zip(keys, ordered, strict=True), key=lambda kc: kc[0])]
+        # The backlog is the number an operator widening a channel actually
+        # needs, and it is invisible from `hoisted` alone -- a reservation that
+        # is working looks identical whether 3 cities are waiting or 800. It is
+        # logged here rather than on cmd_run_due's opening line because it is a
+        # property of the enrolled set, not of the night's configuration.
+        waiting = (
+            sum(1 for c in ordered if all(p in opt_in for p in providers_for_city[c.city_id]))
+            - promoted
+        )
+        if waiting:
+            logger.info(
+                f"{promoted} of {promoted + waiting} opt-in-only cities take tonight's "
+                f"reserved slots ([schedule].opt_in_cities_per_day={max_opt_in}); "
+                f"{waiting} wait for a later night"
+            )
     return ordered, providers_for_city, hoisted
 
 
@@ -4209,7 +4284,6 @@ def cmd_run_due(
     # channels it isn't running tonight.
     db.assign_schedule(conn, cfg.cycle_days, providers=tuple(cfg.enabled_providers()))
 
-    due, providers_for_city, hoisted = _collect_due(conn, cfg, today, providers)
     # An explicit --limit IS the cap for this run. Without this the config's
     # max_cities_per_day silently wins, and `--limit 40` quietly does 20 — which
     # would leave a Mapillary catch-up at the nightly cap's ~61 nights per pass
@@ -4222,6 +4296,15 @@ def cmd_run_due(
     # lets the loop run out of list below N — `--limit 40` silently doing 30 and
     # reporting a clean night, which is this flag's own bug one layer down.
     max_cities = limit if limit is not None else cfg.max_cities_per_day
+    # Resolved BEFORE the slate is built, because the reservation is an input to
+    # the ordering rather than a filter applied after it — and against
+    # `max_cities`, not `cfg.max_cities_per_day`, so `--limit` scales the split
+    # with the cap it overrides instead of leaving a 20-city reservation on a
+    # 5-city night.
+    max_opt_in = _opt_in_reservation(cfg, max_cities)
+    due, providers_for_city, hoisted = _collect_due(
+        conn, cfg, today, providers, max_opt_in=max_opt_in
+    )
     day_cap = min(len(due), max_cities)
 
     budget_str = ", ".join(f"{cfg.providers[p].daily_request_budget:,} {p}" for p in providers)
@@ -4245,17 +4328,18 @@ def cmd_run_due(
         + (f"; hoisted={hoisted} opt-in-only cities" if hoisted else "")
     )
     if hoisted and hoisted >= max_cities:
-        # The hoist is deliberately UNBOUNDED (docs/scheduler.md records the
-        # trade and names the eventual fix as reserved slots per opt-in
-        # channel, issue #282). Unbounded plus a city cap has one arithmetic
-        # consequence worth saying out loud on the night it happens: once the
-        # opt-in-only cities alone fill the cap, every default-membership
-        # channel collects NOTHING, and the only trace would otherwise be an
-        # INFO count an operator has to do the subtraction on.
+        # KEPT as a backstop after #282 bounded the hoist, not left behind by
+        # it. The reservation makes this unreachable by arithmetic on a derived
+        # value (a quarter of the cap cannot fill the cap), so if it ever fires
+        # it means an operator set [schedule].opt_in_cities_per_day equal to
+        # max_cities_per_day and re-created the unbounded hoist by hand. That
+        # is a legal configuration and a bad one, and the night it starves
+        # every default-membership channel is the night to say so.
         logger.warning(
             f"{hoisted} opt-in-only cities fill the city cap ({max_cities}), so "
             f"{', '.join(p for p in providers if not is_opt_in_channel(p))} will collect "
-            f"nothing tonight. Narrow the enrolled set (`enroll-city --remove`) or raise "
+            f"nothing tonight. Lower [schedule].opt_in_cities_per_day (the reserved "
+            f"share), narrow the enrolled set (`enroll-city --remove`), or raise "
             f"[schedule].max_cities_per_day."
         )
     if requested_providers is not None and set(providers) != set(cfg.enabled_providers()):
