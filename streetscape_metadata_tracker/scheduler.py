@@ -397,7 +397,16 @@ class SchedulerConfig:
     batch_size: int = 100
     connection_limit: int = 50
     request_timeout_s: float = 30.0
-    sleep_between_cities_s: int = 60
+    # Pause between cities. 5 s, not the historical 60 s (issue #306): every
+    # mechanism the original "spread load" rationale named now exists properly
+    # — a per-channel `max_requests_per_minute` limiter inside each child, the
+    # cross-process lock that serializes the three per-IP metered hosts (#208),
+    # jittered Mapillary tile gaps (#292), and osmnx's server-advertised
+    # Overpass slot wait — while the sleep itself was 62 s of a small city's
+    # 83 s slot. Kept non-zero rather than deleted: it is the only thing
+    # standing between one city's writeback and the next city's first write,
+    # and a settle time is cheap where a race is not.
+    sleep_between_cities_s: int = 5
     # Client-side gsv pacing; 80% of the API's default 30k/min quota. Scale
     # with the project's granted quota. 0 disables.
     max_requests_per_minute: int = 24_000
@@ -653,7 +662,7 @@ def load_scheduler_config(path: str | None = None) -> SchedulerConfig:
         batch_size=dl.get("batch_size", 100),
         connection_limit=dl.get("connection_limit", 50),
         request_timeout_s=dl.get("request_timeout_s", 30.0),
-        sleep_between_cities_s=dl.get("sleep_between_cities_s", 60),
+        sleep_between_cities_s=dl.get("sleep_between_cities_s", 5),
         max_requests_per_minute=dl.get("max_requests_per_minute", 24_000),
         data_dir=paths.get("data_dir", str(_PROJECT_ROOT / "data")),
         db_path=paths.get("db_path", ""),
@@ -5308,8 +5317,11 @@ def _run_city_loop(
 
             # Re-check HERE, not only at the top of the next iteration. Two
             # things sit in between, and a stop has to survive both (issue #206):
-            # the inter-city sleep below, which would spend a full minute of a
-            # stop window whose entire purpose is the publish tail — and worse,
+            # the inter-city sleep below, which would spend its whole interval
+            # out of a stop window whose entire purpose is the publish tail
+            # (a full minute of it before #306 cut the sleep to 5 s, but the
+            # check is not sized to the constant and must survive it moving
+            # back) — and worse,
             # PEP 475 makes time.sleep RESUME after the handler runs rather than
             # returning early, so the flag is set and ignored for the whole
             # interval; and, on the LAST due city, nothing at all, so the `for`

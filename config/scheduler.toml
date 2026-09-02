@@ -413,8 +413,34 @@ request_timeout_s = 30.0
 # quota 30,000 -> 24000 here); server-side throttling (OVER_QUERY_LIMIT)
 # burns retries and can abort a run. 0 disables pacing.
 max_requests_per_minute = 24000
-# Pause between cities to spread load.
-sleep_between_cities_s = 60
+# Pause between cities. NOT a rate limiter, and it never was a good one — this
+# is a settle time, and 5 s is chosen as the smallest value that still is one.
+#
+# It was 60 s from the start, with the comment "pause between cities to spread
+# load". That rationale is dead (issue #306): it was written when there was one
+# provider, one process and no pacing anywhere, and every part of the job it was
+# a weak proxy for is now done properly and per-request —
+#   * each channel paces inside its own child (`max_requests_per_minute`);
+#   * `host_lock.py` serializes the three per-IP metered hosts ACROSS processes
+#     (issue #208), which is the thing an inter-city gap could only approximate;
+#   * Mapillary tile gaps are jittered (issue #292), so the traffic shape between
+#     cities is deliberately not what a fixed sleep should be shaping;
+#   * Overpass waits the slot the SERVER advertises (`overpass_rate_limit`), and
+#     its fair-use guidance is a daily volume (~10k queries/day, and "divide by
+#     100" for a regular app) that a night of ~20-40 queries does not approach —
+#     the 2026-08-14 ban came from concurrency, which is now the host lock's job.
+# Meanwhile the cost was real: on 2026-09-01 `morland--kansas` did 21 s of work
+# across four channels and then idled for 62 s, and a 20-city night spends ~20
+# minutes this way against a 10 h deadline that has left 917 cities unattempted.
+#
+# Kept non-zero on purpose. Two things it may still be doing incidentally, both
+# silent if wrong: absorbing one city's ZFS writeback before the next city's
+# first write, and covering any lag between a child exiting and its host lock
+# being observable as free (the lock is `timeout=0` fail-fast, so a race there
+# is an exit-79/80 busy-skip rather than a wait). Neither is measured; 5 s
+# preserves both roles at 8% of the old cost, and the check after deploying is
+# that per-city `duration_seconds` and the busy-skip exit codes are unchanged.
+sleep_between_cities_s = 5
 
 [paths]
 # Absolute paths recommended for the systemd deployment. Defaults (when

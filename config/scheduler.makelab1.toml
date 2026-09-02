@@ -85,7 +85,10 @@ enabled = true
 # NOT A RAISE: 40,000 -> 15,000 lowers the combined per-IP ceiling from 45,000 to
 # 20,000, and 40,000 was never reachable. At 60/min with max_batch_hours = 10 and
 # sleep_between_cities_s = 60, a night tops out near ~300 cities / ~17,000 tiles,
-# so 15,000 is roughly as much as a night can actually spend. Full pass over the
+# so 15,000 is roughly as much as a night can actually spend. (That arithmetic is
+# preserved as written in 2026-08; sleep_between_cities_s became 5 in #306, which
+# raises the ceiling it derives. The budget below is 1,750 for unrelated reasons
+# — three per-IP blocks — so nothing here depends on the old figure.) Full pass over the
 # 70,168-tile catalog: ~5 nights (vs ~61 at the 20-city nightly cap, which is
 # what `--limit N` exists to override).
 #
@@ -253,7 +256,12 @@ network_type = "drive"
 batch_size = 100
 connection_limit = 50
 request_timeout_s = 30.0
-sleep_between_cities_s = 60
+# 60 -> 5 on 2026-09-02 (issue #306). It was never a rate limiter and every
+# mechanism its "spread load" rationale named is now per-request and per-host;
+# it was, measurably, 62 s of idle after 21 s of work on a small city. Kept
+# non-zero as a settle time — see config/scheduler.toml for the full argument
+# and for the two post-deploy checks (per-city duration, busy-skip exit codes).
+sleep_between_cities_s = 5
 # Client-side GSV metadata rate cap. Google approved 60,000 req/min for this
 # project (2026-07-16); we pace at 80% to stay clear of the quota alert and
 # never write OVER_QUERY_LIMIT rows. Repo default is a conservative 24,000.
