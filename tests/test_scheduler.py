@@ -8526,6 +8526,74 @@ def test_the_tail_prunes_the_cache_and_says_how_many(conn, monkeypatch, tmp_path
     assert "Pruned 1 expired cached census" in caplog.text
 
 
+def test_the_tail_records_the_cgroup_memory_peak(conn, monkeypatch, tmp_path, caplog):
+    """
+    How close the night came to `MemoryHigh` (issue #305).
+
+    Both destinations are asserted because they answer different questions and
+    only one of them is retrospective. The [alerts] email carries the SUMMARY,
+    so the append is what an operator reads on the night it mattered; the LOG
+    line is what `grep 'cgroup peak'` finds a week later, and it is not
+    redundant with the append — cmd_run_due emits its "Done: ..." line before
+    _finish_batch runs, so a summary-only append never reaches the scheduler log
+    on a healthy night.
+
+    Read after the aggregate rebuild rather than beside the elapsed-time figure:
+    on a big-census night the tail, not the city loop, sets the peak (#157).
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    monkeypatch.setattr(
+        sched.cgroup_memory,
+        "describe_cgroup_memory",
+        lambda: "cgroup peak 18.88 GiB of 40 GiB MemoryHigh (47%)",
+    )
+    published = {}
+
+    def fake_publish(cfg, context, **_kw):
+        published["context"] = context
+        return 0
+
+    monkeypatch.setattr(sched, "_publish", fake_publish)
+    cfg = SchedulerConfig(
+        data_dir=str(tmp_path), backup_dir=str(tmp_path / "backups"), publish_enabled=True
+    )
+
+    with caplog.at_level("INFO"):
+        sched._finish_batch(cfg, conn, "summary", succeeded=1, attempted=1, today=date(2026, 7, 2))
+
+    assert "cgroup peak 18.88 GiB of 40 GiB MemoryHigh (47%)" in caplog.text
+    assert published["context"] == "summary; cgroup peak 18.88 GiB of 40 GiB MemoryHigh (47%)"
+
+
+def test_the_tail_says_nothing_when_the_cgroup_cannot_be_read(conn, monkeypatch, tmp_path):
+    """
+    A host without cgroup v2 (or a kernel before 5.19, which has no
+    `memory.peak`) must add nothing at all rather than a placeholder. The
+    summary is already dense and is what the alert email carries, so a line
+    saying the number is unknown costs an operator a read and tells them
+    nothing — and a zero would read as a night with enormous headroom, which is
+    the conclusion #305 exists to stop anyone drawing without evidence.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    monkeypatch.setattr(sched.cgroup_memory, "describe_cgroup_memory", lambda: None)
+    published = {}
+
+    def fake_publish(cfg, context, **_kw):
+        published["context"] = context
+        return 0
+
+    monkeypatch.setattr(sched, "_publish", fake_publish)
+    cfg = SchedulerConfig(
+        data_dir=str(tmp_path), backup_dir=str(tmp_path / "backups"), publish_enabled=True
+    )
+
+    sched._finish_batch(cfg, conn, "summary", succeeded=1, attempted=1, today=date(2026, 7, 2))
+
+    assert published["context"] == "summary"
+
+
 def test_the_tail_survives_a_broken_cache_directory(conn, monkeypatch, tmp_path):
     """
     #167's posture: the prune is housekeeping, and the publish and the alert

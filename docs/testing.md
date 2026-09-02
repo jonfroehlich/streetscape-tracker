@@ -138,6 +138,15 @@ Incidental coverage of a deprecated spelling trains readers to ignore the notice
   — the regression from pre-slicing the candidate list, which collected 1 of 3 when two over-budget cities led the queue; that a widened run is still stopped by the daily budget ledger,
   which needs the stub to write `api_usage` as the real pipeline does; that a capped run does not sleep after its last city; that a filtered run **desyncs that city's paired snapshots**,
   asserted as the intended cost rather than left to be discovered; and that the summary carries both the active filter and the night's elapsed hours, since that line is the `[alerts]` email's content and the only place time-under-load is recorded)
+- The nightly cgroup memory peak (issue #305), in `test_cgroup_memory.py` plus two tail tests here.
+  The reader is pinned mostly against being **wrong quietly**: a missing `memory.peak` (kernel < 5.19), a cgroup v1 hierarchy, an unparseable value and a wholly absent `/sys/fs/cgroup` all return `None` and never `0`
+  — a summary quoting 0.00 GiB reads as a night with enormous headroom, which is the conclusion #305 exists to stop anyone drawing without evidence
+  — and nothing raises, because this runs in the tail beside the backup and the publish where #167's rule applies.
+  The percentage is asserted against **`MemoryHigh`**, not `MemoryMax`: the same 2026-09-01 reading is 94% of the soft brake and 79% of the hard one, and only the first says the night was throttled.
+  `MemoryMax` is the fallback denominator (the unit file offers "no `MemoryHigh` at all" as a valid answer), and an uncapped cgroup reports the peak with no percentage rather than dividing by a cap that does not exist.
+  The tail tests pin **both** destinations, which answer different questions: the summary append is what the `[alerts]` email carries on the night, and the log line is what `grep 'cgroup peak'` finds a week later
+  — not redundant, since `cmd_run_due` emits its `Done: ...` line *before* `_finish_batch` runs, so a summary-only append never reaches the scheduler log on a healthy night.
+  Their complement pins silence: an unavailable reading adds nothing to the summary at all
 
 ## Concurrent channel lanes (issue #240)
 

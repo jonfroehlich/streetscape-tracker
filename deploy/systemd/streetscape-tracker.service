@@ -155,9 +155,11 @@ ReadWritePaths=/cse/web/research/makelab/public/streetscape-tracker
 # down: over 12G, under MemoryMax. Crossing MemoryHigh reproduces exactly
 # the failure diagnosed above — hours of silent reclaim ending in the
 # scheduler's 180-min city timeout — while crossing MemoryMax is a fast OOM kill
-# you can read in a log. So MemoryHigh is 20G: the extrapolated worst city plus
-# ~30%, with a deliberately narrow 20->24 gap so a genuine runaway still reaches
-# the hard stop quickly instead of reclaiming for hours on the way there.
+# you can read in a log. So MemoryHigh became 20G on 2026-08-20: the extrapolated
+# worst city plus ~30%, with a deliberately narrow 20->24 gap so a genuine
+# runaway still reaches the hard stop quickly instead of reclaiming for hours on
+# the way there. The 2026-09-02 raise below keeps that SHAPE and moves only the
+# numbers.
 #
 # THE FLOOR PRICES A FIRST RUN, and Detroit's next run is not one. 15.3 GiB is
 # one census frame plus the per-run JSON tail — the shape of 2026-07-24, which
@@ -179,7 +181,42 @@ ReadWritePaths=/cse/web/research/makelab/public/streetscape-tracker
 # been measured (its load is ZFS; CPU sits 97-99% idle). And ~15.3 GiB is an
 # EXTRAPOLATION from one city's slope, not a measurement: capture MemoryPeak on
 # a real Detroit night before treating it as settled. For scale, makelab2 has
-# 188 GiB and 48 cores (checked 2026-08-20), so 20G/24G is ~11%/~13% of the box.
+# 188 GiB and 48 cores (checked 2026-08-20), so the caps below are ~21%/~26% of
+# the box.
+#
+# 2026-09-02 (issue #305): 20G was NOT the comfortable number the paragraphs
+# above assumed. The 2026-09-01 batch read MemoryPeak=20,267,974,656 = 18.88
+# GiB, i.e. 94% of MemoryHigh -- on an ORDINARY night: one collection child at a
+# time, no Detroit-scale city in the slate, nothing anyone had flagged as heavy.
+# 6% headroom is the throttled shape described above waiting to happen, not a
+# margin. Raised to MemoryHigh=40G / MemoryMax=48G, sized for exactly three
+# things and no more:
+#   - one child at the measured 18.88 GiB with ~2x headroom rather than 6%;
+#   - TWO children at once, which is what [schedule].max_concurrent_channels > 1
+#     makes possible (issue #240) -- ~38 GiB, still under the soft brake. Today's
+#     peak is ONE child, so the concurrency raise has no headroom at 20G; this is
+#     its precondition, not a workaround for it;
+#   - the GSV connection_limit experiment (issue #304), which raises in-flight
+#     response buffers in proportion to the limit it tests.
+# It is NOT sized for the 4-of-6 host-disjoint lane ceiling (~76 GiB), and it is
+# still NOT sized for a Detroit DIFF night (the unmeasured two-frame case two
+# paragraphs up). Measure before assuming either.
+#
+# The ceiling argument is the BOX's, not the cgroup's, and free RAM is the wrong
+# reading of it: makelab2 has 188 GiB, but it is also the lab fileserver and most
+# of its "used" memory is ZFS ARC serving NFS to other hosts. ARC is reclaimable,
+# so a bigger cap here does not fail -- it quietly costs the co-tenants cache.
+# That is why this is 40G/48G rather than the 64G/80G a 4-lane night would want:
+# the number is argued from a measured peak plus one doubling, not from how much
+# RAM looked free on one evening.
+#
+# MemoryPeak is now recorded per night in the run-due summary line (issue #305),
+# so `grep 'cgroup peak' logs/streetscape_scheduler.log` answers "is there
+# headroom?" without an operator being logged in at the right moment -- and
+# without the reading being lost when the next start creates a new cgroup. Read a
+# week of those, INCLUDING a night with a 4M-point city (Moscow, Mexico City, Los
+# Angeles, London and Las Vegas all sit at the 4,004,xxx grid cap), before
+# treating this headroom as real or raising max_concurrent_channels.
 #
 # If a big-city night hangs again with no output, check MemoryPeak against
 # MemoryHigh FIRST; the fix is a bigger MemoryHigh (or no MemoryHigh at all),
@@ -189,8 +226,8 @@ ReadWritePaths=/cse/web/research/makelab/public/streetscape-tracker
 #   systemctl --user show streetscape-tracker.service -p MemoryPeak -p CPUUsageNSec
 Nice=10
 MemoryAccounting=true
-MemoryHigh=20G
-MemoryMax=24G
+MemoryHigh=40G
+MemoryMax=48G
 CPUAccounting=true
 # Hard ceiling: never use more than 4 of the host's cores.
 CPUQuota=400%
