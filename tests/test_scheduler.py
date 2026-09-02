@@ -1088,6 +1088,17 @@ def test_makelab1_production_config_is_wired():
     # edit to this test and this file together — the same reason the Mapillary
     # budgets above are pinned exactly.
     assert cfg.max_concurrent_channels == 1
+    # The inter-city pause (issue #306). Pinned in production, not just at the
+    # dataclass default, because this is a knob whose only symptom when wrong is
+    # a night that is slower than it needs to be — nothing fails, nothing alerts,
+    # and 60 s survived for months on a rationale ("spread load") that the
+    # per-channel limiters and the host lock have since taken over properly.
+    # Pinned as a RANGE rather than a value: 0 would remove the settle time this
+    # deliberately keeps (one city's writeback, and any lag between a child
+    # exiting and its host lock reading as free — a fail-fast busy-skip rather
+    # than a wait), and anything above ~15 s is the old cost returning a nudge at
+    # a time on nights that are already deadline-bound.
+    assert 1 <= cfg.sleep_between_cities_s <= 15
     # The street channels must keep their ISOLATED budgets: metered under their
     # own api_usage provider strings against separate keys, so a road crawl can
     # never eat the grid collectors' quota.
@@ -1776,6 +1787,76 @@ def test_limit_below_the_cap_still_narrows(conn, monkeypatch):
 
     assert len(ran) == 1
     assert slept == [], "a capped run must not sleep after the last city it will run"
+
+
+def test_the_inter_city_pause_is_the_configured_one_and_not_a_constant(conn, monkeypatch):
+    """
+    Issue #306 cut `sleep_between_cities_s` from 60 s to 5 s, and the only way
+    that lands is if the loop reads the config rather than a literal.
+
+    Asserted against a value that is neither the new default nor the old one, so
+    a call site that hard-codes either passes nothing here. This is the same
+    failure shape as every other pass-through in this file: a knob pinned only
+    at its default lets the code ignore the knob.
+
+    The count matters as much as the value — one pause per gap, not per channel
+    — so this runs TWO channels over two cities. One channel could not tell the
+    two placements apart by more than the trailing-sleep suppression; with two,
+    a sleep moved inside `_run_city_channels` is four rather than one, which is
+    the multiplication that quietly turns a 5 s settle time into a 20 s one on a
+    four-channel night.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    _register(conn, "Bend", width=1000, height=1000, step=20)
+    _register(conn, "Cody", width=1000, height=1000, step=20)
+    ran, slept = [], []
+    _stub_collection(sched, monkeypatch, conn, ran, slept=slept)
+
+    sched.cmd_run_due(
+        _mly_cfg(sleep_between_cities_s=7),
+        today=date(2026, 7, 2),
+        requested_providers=["gsv", "mapillary"],
+    )
+
+    assert len(ran) == 4, "two cities x two channels, so a per-channel sleep has room to show"
+    assert slept == [7], "one configured pause per city GAP, and the config's value"
+
+
+def test_the_inter_city_pause_defaults_to_a_settle_time_not_a_rate_limiter(tmp_path):
+    """
+    5 s in both places a default can come from, and both are asserted because
+    they disagree silently: a config file that omits the key takes
+    `load_scheduler_config`'s literal, while `SchedulerConfig()` takes the
+    dataclass field, and the two drifted apart is how a "default" ends up
+    meaning two different nights.
+
+    The value is bounded rather than spelled twice, for the reason the
+    production pin gives: 0 removes the settle time this deliberately keeps, and
+    creeping back up is the failure mode a fixed assertion invites arguing with.
+    """
+    cfg_path = tmp_path / "scheduler.toml"
+    cfg_path.write_text("[download]\nbatch_size = 100\n")
+
+    for cfg in (SchedulerConfig(), load_scheduler_config(str(cfg_path))):
+        assert 1 <= cfg.sleep_between_cities_s <= 15
+
+
+def test_a_negative_inter_city_pause_is_clamped_rather_than_carried_into_the_loop(tmp_path):
+    """
+    The knob is small enough now to be edited casually, and a negative reaches
+    `time.sleep()` inside the city loop -- where `ValueError` is swallowed by the
+    loop's broad `except Exception` and converted into `_STOP_REASON_ERROR`.
+
+    That costs the whole night after one city and reports it as "City loop
+    aborted by an unexpected error", which sends the operator reading the loop
+    rather than the two characters they typed. Clamped at load, where the value
+    came from.
+    """
+    cfg_path = tmp_path / "scheduler.toml"
+    cfg_path.write_text("[download]\nsleep_between_cities_s = -5\n")
+
+    assert load_scheduler_config(str(cfg_path)).sleep_between_cities_s == 0
 
 
 def test_the_summary_reports_elapsed_time_and_the_active_filter(conn, monkeypatch):
