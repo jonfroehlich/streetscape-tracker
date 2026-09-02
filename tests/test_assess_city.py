@@ -759,6 +759,7 @@ def test_repeated_failures_leave_the_city_collectable_by_the_nightly_batch(
         TODAY,
         ["gsv"],
         max_opt_in=_sched._opt_in_reservation(_due_cfg, _due_cfg.max_cities_per_day),
+        max_cities=_due_cfg.max_cities_per_day,
     )
     assert [c.city_id for c in due] == [CITY_ID]
 

@@ -20,6 +20,7 @@ import hashlib
 import logging
 import os
 import sqlite3
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 
@@ -1921,14 +1922,47 @@ def set_channel_membership(
     the real value here is that a third writer inventing a third convention is
     how a display wart grows into a trusted-looking lie.
     """
+    set_channel_membership_bulk(conn, [city_id], provider, member, cycle_days=cycle_days)
+
+
+# The one membership upsert. Both writers below go through it, so the
+# day_of_cycle convention this docstring defends cannot be reinvented by the
+# bulk path -- which is exactly how "a third writer inventing a third
+# convention" starts.
+_MEMBERSHIP_UPSERT = """INSERT INTO schedule_state (city_id, provider, day_of_cycle, member)
+   VALUES (?, ?, ?, ?)
+   ON CONFLICT(city_id, provider) DO UPDATE SET member = ?"""
+
+
+def set_channel_membership_bulk(
+    conn: sqlite3.Connection,
+    city_ids: Iterable[str],
+    provider: str,
+    member: bool | None,
+    *,
+    cycle_days: int,
+) -> int:
+    """Set membership for many cities in ONE transaction. Returns how many rows.
+
+    The bulk half of :func:`set_channel_membership`, which delegates here so
+    there is a single upsert and a single ``day_of_cycle`` convention.
+
+    One commit, not one per city, and that is the point rather than a
+    micro-optimisation: a tranche interrupted part-way through a per-city loop
+    leaves an enrolment nobody can size from the catalog afterwards, while the
+    command that wrote it has already printed a count and a
+    nights-to-work-through estimate for a set that was never committed.
+    Re-running is idempotent either way, so this buys legibility, not
+    recoverability.
+    """
     value = None if member is None else (1 if member else 0)
-    conn.execute(
-        """INSERT INTO schedule_state (city_id, provider, day_of_cycle, member)
-           VALUES (?, ?, ?, ?)
-           ON CONFLICT(city_id, provider) DO UPDATE SET member = ?""",
-        (city_id, provider, compute_day_of_cycle(city_id, cycle_days), value, value),
-    )
+    rows = [
+        (city_id, provider, compute_day_of_cycle(city_id, cycle_days), value, value)
+        for city_id in city_ids
+    ]
+    conn.executemany(_MEMBERSHIP_UPSERT, rows)
     conn.commit()
+    return len(rows)
 
 
 def count_channel_members(conn: sqlite3.Connection, provider: str, default_membership: bool) -> int:

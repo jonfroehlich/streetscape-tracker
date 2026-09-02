@@ -2307,7 +2307,12 @@ def test_the_hoist_is_the_identity_permutation_without_an_opt_in_channel(conn):
 
     cfg = _mly_cfg()
     ordered, providers_for_city, hoisted = sched._collect_due(
-        conn, cfg, date(2026, 7, 2), ["gsv", "mapillary"], max_opt_in=_reserve(cfg)
+        conn,
+        cfg,
+        date(2026, 7, 2),
+        ["gsv", "mapillary"],
+        max_opt_in=_reserve(cfg),
+        max_cities=cfg.max_cities_per_day,
     )
     expected = [
         c.city_id
@@ -2349,7 +2354,12 @@ def test_a_city_due_only_on_an_opt_in_channel_is_hoisted_ahead_of_the_gsv_block(
 
     cfg = _sweep_cfg(publish_enabled=False)
     ordered, providers_for_city, hoisted = sched._collect_due(
-        conn, cfg, date(2026, 7, 2), ["gsv", "kartaview"], max_opt_in=_reserve(cfg)
+        conn,
+        cfg,
+        date(2026, 7, 2),
+        ["gsv", "kartaview"],
+        max_opt_in=_reserve(cfg),
+        max_cities=cfg.max_cities_per_day,
     )
 
     assert [c.city_id for c in ordered][0] == krabi
@@ -2383,7 +2393,12 @@ def test_a_city_due_on_gsv_too_keeps_its_exact_union_position(conn):
 
     cfg = _sweep_cfg(publish_enabled=False)
     ordered, providers_for_city, hoisted = sched._collect_due(
-        conn, cfg, date(2026, 7, 2), ["gsv", "kartaview"], max_opt_in=_reserve(cfg)
+        conn,
+        cfg,
+        date(2026, 7, 2),
+        ["gsv", "kartaview"],
+        max_opt_in=_reserve(cfg),
+        max_cities=cfg.max_cities_per_day,
     )
 
     assert [c.city_id for c in ordered][-1] == krabi, "not hoisted: it is due on gsv too"
@@ -2485,7 +2500,12 @@ def test_a_sweep_killed_by_its_timeout_leads_the_next_slate_but_costs_the_night_
     assert row["last_success_at"] is None
 
     ordered, providers_for_city, hoisted = _sched._collect_due(
-        conn, cfg, date(2026, 7, 3), list(cfg.enabled_providers()), max_opt_in=_reserve(cfg)
+        conn,
+        cfg,
+        date(2026, 7, 3),
+        list(cfg.enabled_providers()),
+        max_opt_in=_reserve(cfg),
+        max_cities=cfg.max_cities_per_day,
     )
     assert ordered[0].city_id == krabi, "still hoisted tomorrow, which is what bounds it at five"
     assert providers_for_city[krabi] == ["kartaview"]
@@ -2509,11 +2529,108 @@ def test_a_single_opt_in_channel_run_reports_no_hoist(conn):
 
     cfg = _sweep_cfg(publish_enabled=False)
     ordered, providers_for_city, hoisted = _sched._collect_due(
-        conn, cfg, date(2026, 7, 2), ["kartaview"], max_opt_in=_reserve(cfg)
+        conn,
+        cfg,
+        date(2026, 7, 2),
+        ["kartaview"],
+        max_opt_in=_reserve(cfg),
+        max_cities=cfg.max_cities_per_day,
     )
     assert {c.city_id for c in ordered} == {krabi, bend}, "both are still collected"
     assert all(providers_for_city[c.city_id] == ["kartaview"] for c in ordered)
     assert hoisted == 0
+
+
+def test_a_bounded_all_opt_in_slate_still_reports_no_hoist(conn):
+    """The case the bound broke, and the reason `hoisted` counts MOVEMENT.
+
+    The test above passes only because its two cities sit under the default
+    reservation. Once an all-opt-in slate is LARGER than the reservation the
+    keys split into promoted (0) and unpromoted (1) — so the old
+    `0 in keys and 1 in keys` guard passes, and the night reported
+    `hoisted=<reservation>` having reordered nothing at all, because the keys
+    were already sorted and the stable sort is the identity permutation.
+
+    `run-due --provider kartaview --limit N` is exactly that slate, and
+    `scripts/night_length_analyze.py` reads the number off the opening line.
+    """
+    ids = [_register(conn, f"City{i:02d}", width=1000, height=1000, step=20) for i in range(6)]
+    db.assign_schedule(conn, 90, providers=("gsv", "kartaview"))
+    for cid in ids:
+        db.set_channel_membership(conn, cid, "kartaview", True, cycle_days=90)
+
+    cfg = _sweep_cfg(publish_enabled=False, opt_in_cities_per_day=2)
+    ordered, _providers_for_city, hoisted = _sched._collect_due(
+        conn, cfg, date(2026, 7, 2), ["kartaview"], max_opt_in=2, max_cities=6
+    )
+    assert [c.city_id for c in ordered] == ids, "identity permutation: nothing moved"
+    assert hoisted == 0, "2 were promoted, but promotion is not movement"
+
+
+def test_a_live_checkpoint_takes_a_reserved_slot_first(conn, monkeypatch):
+    """The invariant the bound would otherwise have retired silently.
+
+    `get_due_cities` orders `last_success_at ASC NULLS FIRST, city_id ASC`, and
+    a city SIGKILLed mid-sweep still has NULL there — it never succeeded — so
+    filling the reservation in union order sorts it ALPHABETICALLY among every
+    never-run enrolled city, which during a widening is the whole enrolled set.
+    At a reservation of 1 and a late-sorting name it is not reached for as many
+    nights as there are cities ahead of it, far past CHECKPOINT_MAX_AGE_S — its
+    checkpoint is discarded, `_SWEEP_SKIP_AGE_WALL` records a real
+    consecutive_failure, and the partial sweep is re-paid every cycle.
+
+    That is the "five nights must be CONSECUTIVE" property docs/scheduler.md
+    rests the whole amnesty design on, so the reservation prefers a live
+    checkpoint over a city never swept. `zlast` is deliberately last
+    alphabetically: without the preference it is the LAST city promoted, not
+    the first.
+    """
+    ids = [_register(conn, n, width=1000, height=1000, step=20) for n in ("Aone", "Btwo", "Zlast")]
+    db.assign_schedule(conn, 90, providers=("gsv", "kartaview"))
+    for cid in ids:
+        db.set_channel_membership(conn, cid, "kartaview", True, cycle_days=90)
+    zlast = ids[-1]
+
+    monkeypatch.setattr(
+        _sched,
+        "_sweep_checkpoint_progress",
+        lambda cfg, city, channel: {"age_s": 1.0} if city.city_id == zlast else None,
+    )
+    cfg = _sweep_cfg(publish_enabled=False, opt_in_cities_per_day=1)
+    ordered, _pfc, _hoisted = _sched._collect_due(
+        conn, cfg, date(2026, 7, 2), ["kartaview"], max_opt_in=1, max_cities=3
+    )
+    assert ordered[0].city_id == zlast, (
+        "the resumable city leads, not the alphabetically-first never-swept one"
+    )
+    # The other two keep their stalest-first order behind it, so the preference
+    # is a promotion rather than a reshuffle.
+    assert [c.city_id for c in ordered[1:]] == ids[:2]
+
+
+def test_the_checkpoint_probe_is_skipped_when_the_reservation_does_not_choose(conn, monkeypatch):
+    """No filesystem reads at today's enrolled set.
+
+    The probe exists for the widening, and its cost should arrive with the
+    problem rather than before it: when every opt-in-only city fits inside the
+    reservation there is nothing to choose between, so nothing is probed.
+    """
+    calls = []
+    krabi = _register(conn, "Krabi", width=1000, height=1000, step=20)
+    db.assign_schedule(conn, 90, providers=("gsv", "kartaview"))
+    db.set_channel_membership(conn, krabi, "kartaview", True, cycle_days=90)
+    db.record_attempt(conn, krabi, success=True, provider="gsv")
+    monkeypatch.setattr(
+        _sched,
+        "_sweep_checkpoint_progress",
+        lambda cfg, city, channel: calls.append(city.city_id),
+    )
+
+    cfg = _sweep_cfg(publish_enabled=False)
+    _sched._collect_due(
+        conn, cfg, date(2026, 7, 2), ["gsv", "kartaview"], max_opt_in=5, max_cities=20
+    )
+    assert calls == []
 
 
 def _starvation_slate(conn):
@@ -2601,6 +2718,77 @@ def test_the_night_still_warns_if_the_reservation_is_set_to_the_whole_cap(
     assert bend not in {cid for cid, _ in ran}
 
 
+def test_the_starvation_warning_is_silent_when_every_channel_is_opt_in(conn, monkeypatch, caplog):
+    """Nothing to starve on `run-due --provider kartaview`, so nothing is said.
+
+    The message names the channels that will collect nothing by filtering
+    `providers` down to the non-opt-in ones, which is EMPTY when every
+    requested channel is itself opt-in — rendering "so  will collect nothing
+    tonight" about no channel at all. The reservation made that reachable by
+    splitting an all-opt-in slate into promoted and unpromoted keys, which the
+    old promotion-based `hoisted` then reported as a hoist.
+
+    Counting MOVEMENT instead closes it at the source: `starved` is empty only
+    when every requested provider is opt-in, which makes every due city
+    opt-in-only, which makes every key 0, which is the identity permutation and
+    `hoisted == 0`. The `starved` guard in `cmd_run_due` is therefore
+    belt-and-braces on the same claim rather than the fix — kept because it
+    states the intent locally, where the next edit to either half will be read.
+
+    What this pins is the operator-visible property both halves exist for: a
+    single-opt-in-channel catch-up never emits a starvation warning, whatever
+    the reservation is set to.
+    """
+    import logging
+
+    enrolled, _bend = _starvation_slate(conn)
+    cfg = _sweep_cfg(
+        publish_enabled=False,
+        max_cities_per_day=len(enrolled),
+        opt_in_cities_per_day=len(enrolled),
+    )
+    with caplog.at_level(logging.WARNING, logger="streetscape_scheduler"):
+        _run_loop_with(
+            monkeypatch,
+            conn,
+            cfg,
+            lambda c, p: True,
+            today=date(2026, 7, 2),
+            providers=["kartaview"],
+        )
+    assert "fill the city cap" not in caplog.text
+    assert "will collect" not in caplog.text
+
+
+def test_waiting_is_measured_against_the_city_cap_not_the_reservation(conn, monkeypatch, caplog):
+    """ "N wait for a later night" has to be true of the night it is logged on.
+
+    An unpromoted opt-in-only city keeps its union position rather than being
+    dropped, so it is deferred only if it falls outside `max_cities`. Counted
+    off the reservation instead, `run-due --provider kartaview --limit 6` with
+    6 due cities logged "2 ... take tonight's reserved slots; 4 wait for a
+    later night" and then collected all 6 — the one number an operator widening
+    the channel is reading.
+    """
+    import logging
+
+    ids = [_register(conn, f"City{i:02d}", width=1000, height=1000, step=20) for i in range(6)]
+    db.assign_schedule(conn, 90, providers=("gsv", "kartaview"))
+    for cid in ids:
+        db.set_channel_membership(conn, cid, "kartaview", True, cycle_days=90)
+
+    cfg = _sweep_cfg(publish_enabled=False, opt_in_cities_per_day=2)
+    with caplog.at_level(logging.INFO, logger="streetscape_scheduler"):
+        _sched._collect_due(conn, cfg, date(2026, 7, 2), ["kartaview"], max_opt_in=2, max_cities=6)
+    assert "wait for a later night" not in caplog.text, "all six are inside the cap"
+
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="streetscape_scheduler"):
+        _sched._collect_due(conn, cfg, date(2026, 7, 2), ["kartaview"], max_opt_in=2, max_cities=4)
+    assert "4 of 6 opt-in-only cities are inside tonight's 4-city cap" in caplog.text
+    assert "2 wait for a later night" in caplog.text
+
+
 def test_the_opt_in_reservation_is_resolved_in_one_place(conn):
     """`_opt_in_reservation` is the only place `None` becomes a number (#282).
 
@@ -2617,6 +2805,32 @@ def test_the_opt_in_reservation_is_resolved_in_one_place(conn):
     assert _sched._opt_in_reservation(_sweep_cfg(opt_in_cities_per_day=0), 20) == 0, (
         "0 switches the promotion off without un-enrolling anybody"
     )
+
+
+def test_an_explicit_reservation_scales_with_limit_instead_of_saturating_it():
+    """A narrowed run must not hand its WHOLE night to the opt-in channel.
+
+    `max_cities` is the `--limit` override, so a bare `min(configured,
+    max_cities)` saturates: at the `opt_in_cities_per_day = 5` the shipped
+    config comments show an operator uncommenting, `run-due --limit 4` clamped
+    the reservation to 4 and gsv/gsv_streets/mapillary/mapillary_streets
+    collected nothing — this key's own starvation case, reached through the
+    flag meant to NARROW a run.
+
+    An explicit value is therefore scaled by the ratio the cap moved, exactly
+    as the derived path already scaled. Asserted at the identity too, since a
+    scaling that also moved the nightly number would be a different bug.
+    """
+    cfg = _sweep_cfg(max_cities_per_day=20, opt_in_cities_per_day=5)
+    assert _sched._opt_in_reservation(cfg, 20) == 5, "a nightly run is unchanged"
+    assert _sched._opt_in_reservation(cfg, 4) == 1, "a quarter of a quarter, not the whole night"
+    assert _sched._opt_in_reservation(cfg, 8) == 2
+    # Rounds DOWN, so narrowing a run never buys the opt-in channel a LARGER
+    # share of it than the standing config asks for.
+    assert _sched._opt_in_reservation(cfg, 6) == 1
+    # A --limit above the standing cap is not scaled up: the configured number
+    # is a reservation, not a ratio the operator asked to preserve.
+    assert _sched._opt_in_reservation(cfg, 40) == 5
 
 
 def test_the_hoist_count_is_on_the_nights_own_record(conn, monkeypatch, caplog):
@@ -2891,6 +3105,119 @@ def test_enroll_all_reports_how_many_nights_the_reservation_needs(
     out = capsys.readouterr().out
     assert "opt_in_cities_per_day=5" in out
     assert "~3 nights" in out, "12 cities at 5 a night rounds UP, never down"
+
+
+def test_enroll_all_remove_selects_the_members_not_the_whole_catalog(
+    conn, monkeypatch, tmp_path, capsys
+):
+    """`--all --remove` un-enrols the MEMBERS, and nothing else.
+
+    The selection asks whether a city already matches the target, and on an
+    opt-in channel that has to mean the EFFECTIVE membership: `assign_schedule`
+    leaves almost every row NULL, NULL means "not a member", and `None ==
+    False` is False — so comparing the raw column selected all ~1,214 enabled
+    cities for a channel with two members, printed `UN-ENROL 1,214 cities`, and
+    stamped an explicit 0 across the catalog.
+
+    Not merely a large no-op. It permanently destroys the NULL-vs-explicit-0
+    distinction `cmd_enroll_city` keeps on purpose — an explicit 0 survives a
+    future flip of the channel default while a NULL flips with it — and
+    `--all --remove` is the natural way to undo a tranche.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    member = _register(conn, "Krabi", width=1000, height=1000, step=20)
+    for name in ("Bend", "Corvallis", "Eugene"):
+        _register(conn, name, width=1000, height=1000, step=20)
+    cfg = _enroll_cfg(tmp_path, conn, monkeypatch)
+    sched.cmd_enroll_city(cfg, member, channel="kartaview")
+    capsys.readouterr()
+
+    assert (
+        sched.cmd_enroll_city(
+            cfg, None, channel="kartaview", all_cities=True, remove=True, execute=True
+        )
+        == 0
+    )
+    assert "UN-ENROL 1 cities" in capsys.readouterr().out
+
+    rows = dict(
+        conn.execute("SELECT city_id, member FROM schedule_state WHERE provider = 'kartaview'")
+    )
+    assert rows[member] == 0, "the one member is now an explicit exclusion"
+    assert all(v is None for k, v in rows.items() if k != member), (
+        "every non-member keeps its NULL, which is what flips with the channel default"
+    )
+
+
+def test_enroll_all_clear_still_asks_about_the_stored_column(conn, monkeypatch, tmp_path, capsys):
+    """`--clear` is the one direction that really is about the raw value.
+
+    It restores NULL, so a row already NULL is unchanged whatever the channel
+    default says, while an explicit 0 or 1 is not. Pinned beside the fix above
+    because the fix routes `--all`/`--remove` through the EFFECTIVE membership,
+    and applying that to `--clear` too would make clearing an explicit 0 on an
+    opt-in channel look like a no-op.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    excluded = _register(conn, "Krabi", width=1000, height=1000, step=20)
+    _register(conn, "Bend", width=1000, height=1000, step=20)
+    cfg = _enroll_cfg(tmp_path, conn, monkeypatch)
+    sched.cmd_enroll_city(cfg, excluded, channel="kartaview", remove=True)
+    capsys.readouterr()
+
+    assert (
+        sched.cmd_enroll_city(
+            cfg, None, channel="kartaview", all_cities=True, clear=True, execute=True
+        )
+        == 0
+    )
+    assert "CLEAR 1 cities" in capsys.readouterr().out
+    assert db.get_channel_membership(conn, excluded, "kartaview") is None
+
+
+def test_a_bulk_tranche_is_one_transaction(conn, monkeypatch, tmp_path, capsys):
+    """One commit for the tranche, not one per city.
+
+    An interrupted per-city loop leaves an enrolment nobody can size from the
+    catalog afterwards, while the command has already printed a count and a
+    nights-to-work-through estimate for a set that was never fully written.
+    Asserted by counting commits, since the end state is identical either way.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    for i in range(5):
+        _register(conn, f"City{i}", width=1000, height=1000, step=20)
+    cfg = _enroll_cfg(tmp_path, conn, monkeypatch)
+
+    class _CountingConn:
+        """Delegates everything, counts commits. `sqlite3.Connection.commit` is
+        read-only, so it cannot be patched in place."""
+
+        def __init__(self, inner):
+            self._inner = inner
+            self.commits = 0
+
+        def commit(self):
+            self.commits += 1
+            return self._inner.commit()
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    counting = _CountingConn(conn)
+    monkeypatch.setattr(sched.db, "connect", lambda path: counting)
+
+    sched.cmd_enroll_city(cfg, None, channel="kartaview", all_cities=True, execute=True)
+    capsys.readouterr()
+    assert counting.commits == 1, f"one commit for 5 cities, got {counting.commits}"
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM schedule_state WHERE provider = 'kartaview' AND member = 1"
+        ).fetchone()[0]
+        == 5
+    )
 
 
 @pytest.mark.parametrize(
@@ -5684,8 +6011,12 @@ def _busy_outcome(host):
     )
 
 
-def _run_loop_with(monkeypatch, conn, cfg, run_one, today=date(2026, 7, 2)):
-    """Drive cmd_run_due with a fake _run_one_city, tail stubbed out."""
+def _run_loop_with(monkeypatch, conn, cfg, run_one, today=date(2026, 7, 2), providers=None):
+    """Drive cmd_run_due with a fake _run_one_city, tail stubbed out.
+
+    ``providers`` passes through to `--provider`, so a caller can drive the
+    FILTERED path (an all-opt-in night, say) rather than only the nightly one.
+    """
     from streetscape_metadata_tracker import scheduler as sched
 
     monkeypatch.setattr(
@@ -5697,7 +6028,7 @@ def _run_loop_with(monkeypatch, conn, cfg, run_one, today=date(2026, 7, 2)):
     )
     _stub_tail(monkeypatch, sched, conn, [])
     monkeypatch.setattr(sched, "send_alert", lambda *a, **k: None)
-    return sched.cmd_run_due(cfg, today=today)
+    return sched.cmd_run_due(cfg, today=today, requested_providers=providers)
 
 
 def test_a_blocked_host_skips_its_channels_for_the_rest_of_the_night(conn, monkeypatch):

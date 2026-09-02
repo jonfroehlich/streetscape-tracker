@@ -545,15 +545,45 @@ def _opt_in_reservation(cfg: SchedulerConfig, max_cities: int) -> int:
 
     The single place ``[schedule].opt_in_cities_per_day``'s None is resolved, so
     a config that sets it and a config that does not cannot disagree about what
-    the reservation means. An explicit value is clamped to ``max_cities``: a
-    reservation larger than the cap is the unbounded hoist again, spelled
-    differently, and 0 is a legitimate way to switch the promotion off entirely
-    without un-enrolling anybody.
+    the reservation means. 0 is a legitimate value: it switches the promotion
+    off entirely without un-enrolling anybody.
+
+    BOTH PATHS SCALE WITH THE RUN'S CAP, and the explicit one has to because
+    ``max_cities`` is the ``--limit`` override rather than the standing
+    ``max_cities_per_day``. A bare ``min(configured, max_cities)`` saturates:
+    with the ``opt_in_cities_per_day = 5`` the shipped config comments show an
+    operator uncommenting, ``run-due --limit 4`` would clamp the reservation to
+    4 and hand the WHOLE night to opt-in-only cities -- gsv, gsv_streets,
+    mapillary and mapillary_streets collecting nothing, which is the starvation
+    this key exists to prevent, reached through the flag meant to narrow a run.
+    So an explicit value is scaled by the same ratio the cap moved, and only
+    then clamped. At ``--limit == max_cities_per_day`` the scaling is the
+    identity, so a nightly run is unaffected.
+
+    The final clamp to ``max_cities`` stays, and stays at the cap rather than
+    below it: a reservation EQUAL to the cap is the unbounded hoist spelled
+    differently, but it is a thing an operator can mean, and the starvation
+    WARNING in ``cmd_run_due`` is kept precisely as the backstop that names it.
+    Foreclosing it here would turn that warning into dead code and take away a
+    deliberate choice; `run-due --provider kartaview` is the better way to ask
+    for the same night anyway.
+
+    One reachable case the WARNING's comment used to deny: a DERIVED value can
+    equal the cap at ``max_cities == 1``, where ``max(1, 1 // 4)`` is 1. That is
+    `run-due --limit 1`, a degenerate one-city run, and the warning firing there
+    is correct rather than a false alarm — but "unreachable by arithmetic on a
+    derived value" was wrong, so it no longer says that.
     """
     configured = cfg.opt_in_cities_per_day
-    if configured is not None:
-        return max(0, min(configured, max_cities))
-    return max(1, max_cities // _OPT_IN_SLOT_SHARE)
+    if configured is None:
+        reservation = max(1, max_cities // _OPT_IN_SLOT_SHARE)
+    elif max_cities >= cfg.max_cities_per_day or cfg.max_cities_per_day <= 0:
+        reservation = max(0, configured)
+    else:
+        # Round down, so narrowing a run never rounds the reservation UP into a
+        # larger share of it than the standing config asks for.
+        reservation = max(0, configured * max_cities // cfg.max_cities_per_day)
+    return max(0, min(reservation, max_cities))
 
 
 def _lane_count(sched: dict, config_path) -> int:
@@ -2333,25 +2363,46 @@ def _enrolment_cost_note(conn, cfg: SchedulerConfig, city: db.CityRow, channel: 
     return lines
 
 
-def _bulk_candidates(conn, cfg: SchedulerConfig, channel: str, target: bool | None) -> list:
+def _bulk_candidates(conn, channel: str, target: bool | None) -> list:
     """The enabled cities a bulk enrolment would actually CHANGE, priced.
 
-    Returns ``[(estimate, CityRow), ...]``, cheapest first. Two properties are
+    Returns ``[(estimate, CityRow), ...]``, cheapest first. Three properties are
     deliberate:
 
     * **Already-correct cities are excluded, not re-written.** The selection is
       what changes, so `--limit 200` means 200 new members rather than 200 rows
       touched of which some number were already members — which is the
       difference between a tranche and a no-op an operator cannot see.
+    * **"Already correct" is the EFFECTIVE membership, not the stored column**,
+      and that distinction is the whole of the `--remove` direction. On an
+      opt-in channel almost every row is NULL (`assign_schedule` creates them
+      unset) and NULL means "not a member" — so comparing the raw column would
+      make `None == False` false, select all ~1,214 enabled cities for
+      `--all --remove`, and stamp an explicit `0` across a catalog of which two
+      cities were ever members. That is not merely a large no-op: it
+      permanently destroys the NULL-vs-explicit-0 distinction `cmd_enroll_city`
+      keeps on purpose (an explicit 0 survives a future flip of the channel
+      default; a NULL flips with it), and `--all --remove` is the natural way
+      to undo a tranche. `--all` and `--clear` were correct against the raw
+      column only by coincidence — `--remove` is the one case where the stored
+      value and the effective one disagree.
     * **The price is the geometry FLOOR** (`estimate_requests`), so the printed
       total is a lower bound and is labelled as one. For KartaView it is the
       swept-circle lattice times a MEDIAN overhead whose study max was 13.66x,
       and it under-prices any city that calibrates to r=500 by ~4x. A tranche
       is sized on it; a budget is not.
     """
+    default_member = CHANNEL_DEFAULT_MEMBERSHIP[channel]
     rows = []
     for city in db.get_all_cities(conn, enabled_only=True):
-        if db.get_channel_membership(conn, city.city_id, channel) == target:
+        stored = db.get_channel_membership(conn, city.city_id, channel)
+        # `--clear` (target None) is the one direction that really does ask
+        # about the stored column: it restores NULL, so a row already NULL is
+        # unchanged while an explicit 0 or 1 is not, whatever they mean.
+        effective = (
+            stored if target is None else (default_member if stored is None else bool(stored))
+        )
+        if effective == target:
             continue
         rows.append((estimate_requests(city, channel, conn=conn), city))
     # city_id breaks ties, so a tranche is reproducible: the same command twice
@@ -2376,7 +2427,7 @@ def _cmd_enroll_bulk(
     rest of this command, because the blast radius is the whole catalog and
     `--all` is one keystroke from `--all --remove`. `--execute` writes.
     """
-    candidates = _bulk_candidates(conn, cfg, channel, target)
+    candidates = _bulk_candidates(conn, channel, target)
     if not candidates:
         print(f"{channel}: nothing to change — every enabled city already matches.")
         return 0
@@ -2400,8 +2451,15 @@ def _cmd_enroll_bulk(
         print("  DRY RUN — nothing written. Re-run with --execute to apply.")
         return 0
 
-    for _est, city in selected:
-        db.set_channel_membership(conn, city.city_id, channel, target, cycle_days=cfg.cycle_days)
+    # ONE transaction for the tranche, which is what "one reproducible step" in
+    # the docstring above has to mean to be worth saying. A loop over the
+    # single-city writer commits per city, so an interrupted `--execute` leaves
+    # an enrolment nobody can size from the catalog afterwards -- while this
+    # command has already printed a count and a nights-to-work-through estimate
+    # for a set that was never fully written.
+    db.set_channel_membership_bulk(
+        conn, [c.city_id for _est, c in selected], channel, target, cycle_days=cfg.cycle_days
+    )
     n_member = db.count_channel_members(conn, channel, CHANNEL_DEFAULT_MEMBERSHIP[channel])
     print(f"  {channel}: {n_member:,} of {n_enabled:,} enabled cities opted in.")
     # The reservation, not the enrolled count, is what paces the widening — an
@@ -4070,7 +4128,15 @@ def _reconcile_orphaned_walk(
     return True
 
 
-def _collect_due(conn, cfg: SchedulerConfig, today: date, providers: list[str], *, max_opt_in: int):
+def _collect_due(
+    conn,
+    cfg: SchedulerConfig,
+    today: date,
+    providers: list[str],
+    *,
+    max_opt_in: int,
+    max_cities: int,
+):
     """
     Due work for today: an ordered city list (stalest-first, gsv's order
     leading since it's the expensive series) and, per city, which of
@@ -4163,6 +4229,11 @@ def _collect_due(conn, cfg: SchedulerConfig, today: date, providers: list[str], 
     #     it DID consume a city-cap slot. The hoist is what makes tomorrow's
     #     retry the FIRST slot rather than one truncated away, and the
     #     five-night bound is this arm's, not the pause's.
+    #     Since #282 bounded the hoist, "the first slot" is no longer automatic
+    #     and is bought deliberately instead: a live checkpoint takes a reserved
+    #     slot ahead of a city that has never been swept. See the reservation
+    #     below -- without that preference a killed city sorts alphabetically
+    #     among the never-run block and the five nights stop being consecutive.
     #
     # `all`, not `any`, and the choice is the blast radius. A city due on gsv
     # too needs no hoist (see above), and there is no pairing argument either:
@@ -4195,20 +4266,79 @@ def _collect_due(conn, cfg: SchedulerConfig, today: date, providers: list[str], 
         # being dropped: they are still due, still counted in `due`, and simply
         # wait for a later night's reservation. That is the intended shape of a
         # widening -- N cities per night, indefinitely -- not a truncation.
-        promoted = 0
-        keys = []
-        for c in ordered:
-            if all(p in opt_in for p in providers_for_city[c.city_id]) and promoted < max_opt_in:
-                keys.append(0)
-                promoted += 1
-            else:
-                keys.append(1)
-        # Counted only when there is something for them to be ahead OF. An
-        # all-0 slate is the identity permutation just as an all-1 one is, and
-        # it is not a corner case: `run-due --provider kartaview` makes every
-        # due city opt-in-only, so an unguarded count would report the whole
-        # slate as reordered on every catch-up.
-        hoisted = keys.count(0) if 0 in keys and 1 in keys else 0
+        # WHICH cities the reservation spends its slots on, which a bound makes
+        # a real question for the first time. Unbounded, every opt-in-only city
+        # led the slate and the order among them did not matter.
+        #
+        # Bounded and filled in union order it does, and it breaks the one
+        # invariant the hoist exists to provide. `get_due_cities` orders
+        # `last_success_at ASC NULLS FIRST, city_id ASC`, and a city SIGKILLed
+        # mid-sweep still has NULL there -- it never succeeded -- so it sorts
+        # ALPHABETICALLY among every never-run enrolled city, which during a
+        # widening is the whole enrolled set. Enrol 200 at a reservation of 5
+        # and a killed city sorting late is not reached for ~40 nights, far past
+        # CHECKPOINT_MAX_AGE_S (7 days): its checkpoint is discarded,
+        # _SWEEP_SKIP_AGE_WALL records a real consecutive_failure, and the
+        # partial sweep is re-paid every cycle forever. The five failures stop
+        # being CONSECUTIVE, which is the property the whole amnesty design
+        # rests on and the reason docs/scheduler.md says the hoist buys it.
+        #
+        # So a live checkpoint takes a reserved slot first. That is the exact
+        # population the invariant is about -- both unfinished-sweep arms leave
+        # one, the deliberate pause and the SIGKILL -- and it is the only signal
+        # that distinguishes "this city has already been paid for and the
+        # payment expires" from "this city has never been touched".
+        # `consecutive_failures` would catch only the SIGKILL arm, and a
+        # healthy multi-night pause records none.
+        #
+        # Probed only when the reservation actually has to choose. At today's
+        # enrolled set the whole slate fits and this costs no filesystem reads
+        # at all; the cost arrives with the widening, alongside the problem.
+        opt_in_only = [
+            i
+            for i, c in enumerate(ordered)
+            if all(p in opt_in for p in providers_for_city[c.city_id])
+        ]
+        if len(opt_in_only) <= max_opt_in:
+            chosen = set(opt_in_only)
+        else:
+
+            def _has_live_checkpoint(city) -> bool:
+                # Through _sweep_checkpoint_progress, THE reader, because a
+                # walk's store is keyed by (channel, network type) and a grid
+                # run's by the channel alone -- a second spelling here would
+                # ask about a different crawl than the launch gate does.
+                return any(
+                    _sweep_checkpoint_progress(cfg, city, p) is not None
+                    for p in providers_for_city[city.city_id]
+                )
+
+            # Stable, so within each group the union's stalest-first order is
+            # untouched and the choice is only ever "resumers before starters".
+            chosen = set(
+                sorted(opt_in_only, key=lambda i: 0 if _has_live_checkpoint(ordered[i]) else 1)[
+                    :max_opt_in
+                ]
+            )
+        keys = [0 if i in chosen else 1 for i in range(len(ordered))]
+        promoted = len(chosen)
+        # Cities that actually MOVED, which is what the word means and what
+        # scripts/night_length_analyze.py reads off the opening line.
+        #
+        # The old test -- both key values present -- was written when a slate
+        # was all-0 or all-1, and the reservation broke it: `run-due --provider
+        # kartaview` makes every due city opt-in-only, so with a bound the
+        # first `max_opt_in` take key 0 and the rest key 1, the keys are
+        # ALREADY sorted, the stable sort moves nothing, and the night would
+        # report `hoisted=10` having reordered nothing at all.
+        #
+        # A stable sort on a boolean key moves a city exactly when some key-1
+        # city precedes it, so the count is the key-0 cities after the first
+        # key-1 one. That is the identity permutation for an all-0 slate, an
+        # all-1 slate AND a bounded all-opt-in slate, without special-casing
+        # any of the three.
+        first_kept = next((i for i, k in enumerate(keys) if k == 1), len(keys))
+        hoisted = sum(1 for k in keys[first_kept:] if k == 0)
         # Stable sort on a boolean key: with no opt-in channel configured every
         # key is 1 and this is the identity permutation, which is what makes
         # PR A's inertness provable by construction rather than argued. (The
@@ -4216,18 +4346,29 @@ def _collect_due(conn, cfg: SchedulerConfig, today: date, providers: list[str], 
         ordered = [c for _, c in sorted(zip(keys, ordered, strict=True), key=lambda kc: kc[0])]
         # The backlog is the number an operator widening a channel actually
         # needs, and it is invisible from `hoisted` alone -- a reservation that
-        # is working looks identical whether 3 cities are waiting or 800. It is
-        # logged here rather than on cmd_run_due's opening line because it is a
-        # property of the enrolled set, not of the night's configuration.
-        waiting = (
-            sum(1 for c in ordered if all(p in opt_in for p in providers_for_city[c.city_id]))
-            - promoted
-        )
+        # is working looks identical whether 3 cities are waiting or 800.
+        #
+        # "Waiting" is measured against the CITY CAP, not against the
+        # reservation, and the difference is not cosmetic. An unpromoted city
+        # keeps its union position rather than being dropped, so it is deferred
+        # only if it falls outside `max_cities` -- and on the catch-up a
+        # widening actually uses (`run-due --provider kartaview --limit 40`
+        # with 40 due cities) every one of them collects tonight. Counted off
+        # the reservation this logged "10 ... take tonight's reserved slots; 30
+        # wait for a later night" and then collected all 40, which is the one
+        # number the operator is reading.
+        opt_in_only = [
+            i
+            for i, c in enumerate(ordered)
+            if all(p in opt_in for p in providers_for_city[c.city_id])
+        ]
+        reached = sum(1 for i in opt_in_only if i < max_cities)
+        waiting = len(opt_in_only) - reached
         if waiting:
             logger.info(
-                f"{promoted} of {promoted + waiting} opt-in-only cities take tonight's "
-                f"reserved slots ([schedule].opt_in_cities_per_day={max_opt_in}); "
-                f"{waiting} wait for a later night"
+                f"{reached} of {len(opt_in_only)} opt-in-only cities are inside tonight's "
+                f"{max_cities}-city cap ([schedule].opt_in_cities_per_day={max_opt_in} "
+                f"reserved, {promoted} promoted); {waiting} wait for a later night"
             )
     return ordered, providers_for_city, hoisted
 
@@ -4416,7 +4557,7 @@ def cmd_run_due(
     # 5-city night.
     max_opt_in = _opt_in_reservation(cfg, max_cities)
     due, providers_for_city, hoisted = _collect_due(
-        conn, cfg, today, providers, max_opt_in=max_opt_in
+        conn, cfg, today, providers, max_opt_in=max_opt_in, max_cities=max_cities
     )
     day_cap = min(len(due), max_cities)
 
@@ -4440,17 +4581,25 @@ def cmd_run_due(
         # byte-identical to today's.
         + (f"; hoisted={hoisted} opt-in-only cities" if hoisted else "")
     )
-    if hoisted and hoisted >= max_cities:
+    starved = [p for p in providers if not is_opt_in_channel(p)]
+    if starved and hoisted and hoisted >= max_cities:
         # KEPT as a backstop after #282 bounded the hoist, not left behind by
-        # it. The reservation makes this unreachable by arithmetic on a derived
-        # value (a quarter of the cap cannot fill the cap), so if it ever fires
-        # it means an operator set [schedule].opt_in_cities_per_day equal to
-        # max_cities_per_day and re-created the unbounded hoist by hand. That
-        # is a legal configuration and a bad one, and the night it starves
-        # every default-membership channel is the night to say so.
+        # it. Two ways to reach it, and neither is the wide enrolled set the
+        # pre-#282 version fired on: an operator set
+        # [schedule].opt_in_cities_per_day equal to max_cities_per_day and
+        # re-created the unbounded hoist by hand, or `--limit 1` made a derived
+        # `max(1, 1 // 4)` equal the cap. Both are legal, the first is a bad
+        # configuration and the second is a degenerate one-city run; the night
+        # it starves every default-membership channel is the night to say so.
+        #
+        # `starved` gates the whole warning, because on `run-due --provider
+        # kartaview` every requested channel is opt-in and the list is EMPTY --
+        # which used to render "so  will collect nothing tonight" about no
+        # channel at all. There is nothing to starve on such a run: the
+        # operator asked for exactly the channels that are running.
         logger.warning(
             f"{hoisted} opt-in-only cities fill the city cap ({max_cities}), so "
-            f"{', '.join(p for p in providers if not is_opt_in_channel(p))} will collect "
+            f"{', '.join(starved)} will collect "
             f"nothing tonight. Lower [schedule].opt_in_cities_per_day (the reserved "
             f"share), narrow the enrolled set (`enroll-city --remove`), or raise "
             f"[schedule].max_cities_per_day."
