@@ -95,7 +95,6 @@ All are catalog/disk-only (no API calls), dry-run by default, and take `--execut
 | `backfill_streetwalk_coverage.py` | Backfill `street_walks.coverage_by_highway` (schema v11, #101) from artifacts on disk |
 | `backfill_streetwalk_length.py` | Backfill the schema v12 `street_walks` columns; exits nonzero if an artifact's lengths contradict the row's cataloged coverage (wrong artifact matched) |
 | `recompute_run_stats.py --provider gsv --regenerate-json` | Re-derive every run's stored stats from its CSV under the current analysis definitions — the repair handle whenever a stats definition moves (#213); a definition change is applied to the WHOLE series in one pass |
-| `enroll_kartaview_tail.py [--max-requests N] [--limit N]` | Rank every enabled city by estimated KartaView sweep cost and enrol the cheap tail on BOTH KartaView channels (#307); no threshold prints only the distribution, and `--execute` refuses one over a quarter of the channel budget (the estimate is a floor) or a batch past `max_cities_per_day` (#282) |
 
 The boundary-audit workflow (does a frozen grid actually fit its city?) is a four-script chain, each with a pinning test: `audit_city_boundaries.py` → `build_boundary_review.py` → `apply_decisions.py` → `reregister_boundaries.py`.
 

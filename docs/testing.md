@@ -170,16 +170,6 @@ Incidental coverage of a deprecated spelling trains readers to ignore the notice
   A third pins the **ordering** — read after `generate_aggregate_v2`, because on a big-census night the tail and not the city loop sets the peak (#157) — since the other two pass identically with the call moved to the top of the function.
   Their complement pins silence: an unavailable reading adds nothing to the summary at all.
 
-## Enrolling KartaView's cheap tail (issue #307)
-
-**Added after the split.**
-`tests/test_enroll_kartaview_tail.py` covers `scripts/enroll_kartaview_tail.py`, and every pin is a **refusal**, because the hazard of a batch enrolment tool is doing more than the operator meant, never doing too little.
-No `--max-requests` prints the distribution and selects nothing (the default invocation is a question, not an action — a defaulted threshold would make "I ran it to see the numbers" and "I enrolled the whole catalog" the same command);
-`--execute` without a threshold and a non-opt-in or unknown `--channel` exit argparse's 2, while the two refusals that needed the catalog or the config to decide — a threshold over a quarter of the channel's `daily_request_budget`, and a batch taking the enrolled total past `max_cities_per_day` — return `USAGE_EXIT_CODE` and write nothing.
-The budget refusal exists because the estimate is a **floor**: Yogyakarta ran 3.0× its geometry estimate and tier 2 is ~4× low by construction on a city that calibrates to r=500.
-The cap refusal is #282's arithmetic checked against the enrolled **total** rather than this batch's size, with `--force` as the deliberate override.
-The seeded fixture names cities so the alphabetical and cost orders **disagree**, which is what makes "selected the cheap tail" distinguishable from "selected the first N rows"; the tier-1/tier-2 label is pinned against a real cataloged `runs.api_requests` row, since it is read through the same `_prior_kartaview_spend` the estimator's own tier 1 uses; and the dry run, the idempotent second `--execute`, the disabled-city skip and the never-clobbered registration note are each their own case.
-
 ## Concurrent channel lanes (issue #240)
 
 **Added after the split.**
