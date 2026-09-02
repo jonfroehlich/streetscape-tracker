@@ -146,6 +146,17 @@ Incidental coverage of a deprecated spelling trains readers to ignore the notice
   And the **production** value in `test_makelab1_production_config_is_wired`, beside the budgets and the concurrency knob.
   All three are pinned as a RANGE (1–15 s) rather than a number: `0` removes the settle time the cut deliberately keeps (one city's writeback, and any lag between a child exiting and its host lock reading as free, which is a fail-fast busy-skip rather than a wait), and creeping back upward is exactly the failure a single fixed value invites arguing with.
   A fourth test pins the **clamp**: a negative in the TOML is floored at 0 by `load_scheduler_config` rather than carried into `time.sleep`, where `ValueError` is swallowed by the city loop's broad `except Exception` and ends the night at `_STOP_REASON_ERROR` after one city — a batch lost to a typo, reported as a loop bug.
+- The nightly cgroup memory peak (issue #305), in `test_cgroup_memory.py` plus three tail tests here.
+  The reader is pinned mostly against being **wrong quietly**: a missing `memory.peak` (kernel < 5.19), a cgroup v1 hierarchy, an unparseable value and a wholly absent `/sys/fs/cgroup` all return `None` and never `0`
+  — a summary quoting 0.00 GiB reads as a night with enormous headroom, which is the conclusion #305 exists to stop anyone drawing without evidence.
+  Nothing raises, and two cases pin that where catching `OSError` alone did not: **undecodable bytes** in either file it opens (a `UnicodeDecodeError` is a `ValueError`), and a **cap of `0`**, which is legal in cgroup v2 and is what `systemctl set-property MemoryHigh=0` writes — a `ZeroDivisionError` there would skip the tail backup, the publish and the alert, since `_finish_batch` is not wrapped at its call site (#167).
+  The percentage is asserted against **`MemoryHigh`**, not `MemoryMax`: the same 2026-09-01 reading is 94% of the soft brake and 79% of the hard one, and only the first says the night was throttled.
+  `MemoryMax` is the fallback denominator (the unit file offers "no `MemoryHigh` at all" as a valid answer), and an uncapped cgroup reports the peak with no percentage rather than dividing by a cap that does not exist.
+  The **throttle count** from `memory.events` is pinned alongside it, and pinned as being able to disagree with the percentage in both directions — a peak percentage is a proxy (`memory.current` charges page cache and kernel memory too) while the counter is the measurement; `None` and `0` stay distinct all the way to the output, for the same reason the peak's do.
+  The tail tests pin **both** destinations, which answer different questions: the summary append is what the `[alerts]` email carries on the night, and the log line is what `grep 'cgroup peak'` finds a week later
+  — not redundant, since `cmd_run_due` emits its `Done: ...` line *before* `_finish_batch` runs, so a summary-only append never reaches the scheduler log on a healthy night.
+  A third pins the **ordering** — read after `generate_aggregate_v2`, because on a big-census night the tail and not the city loop sets the peak (#157) — since the other two pass identically with the call moved to the top of the function.
+  Their complement pins silence: an unavailable reading adds nothing to the summary at all.
 
 ## Concurrent channel lanes (issue #240)
 

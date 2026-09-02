@@ -47,7 +47,7 @@ from typing import Any, NamedTuple
 
 from tabulate import tabulate
 
-from . import catalog_backup, db, driving_plan
+from . import catalog_backup, cgroup_memory, db, driving_plan
 from .alerting import AlertConfig, send_alert, should_alert
 from .checkpointing import (
     CENSUS_PROVIDERS,
@@ -5499,6 +5499,32 @@ def _finish_batch(
     if pruned:
         logger.info(f"Pruned {pruned} expired cached census(es)")
         summary += f"; pruned {pruned} cached census(es)"
+
+    # How close the night came to the systemd unit's memory cap (issue #305).
+    #
+    # Read HERE, not beside the elapsed-time figure in the summary above, because
+    # the aggregate rebuild a few lines up is the tail's heaviest step and on a
+    # big-census night it, not the city loop, sets the peak (issue #157). That
+    # ordering is pinned by a test, because it is the whole reason the call sits
+    # in this function rather than next to the figure it is quoted with.
+    #
+    # KNOWN BLIND SPOT, named rather than argued away: memory.peak is monotonic
+    # and this runs BEFORE the tail catalog backup and the publish rsync, so
+    # neither can ever appear in the number. That is structural -- `summary` has
+    # to be complete before _publish receives it -- and both are believed small
+    # on a pool where ZFS ARC rather than the cgroup absorbs the file IO. Neither
+    # has been measured, and a PR about not assuming things about this cgroup
+    # should not assume that one.
+    #
+    # Logged as well as appended, and that is not redundancy: the "Done: ..."
+    # line is emitted by cmd_run_due BEFORE this function runs, so an append to
+    # `summary` reaches the [alerts] email and the publish log but never the
+    # scheduler log on a healthy night. `grep 'cgroup peak'` over a week of logs
+    # is the measurement #305 asks for before max_concurrent_channels is raised.
+    memory_note = cgroup_memory.describe_cgroup_memory()
+    if memory_note:
+        logger.info(memory_note)
+        summary += f"; {memory_note}"
 
     # Back up again now that the night's runs, diffs and walks are registered:
     # the pre-flight copy (see _backup_catalog_nightly) guarantees a copy
