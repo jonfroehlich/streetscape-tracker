@@ -1282,24 +1282,17 @@ function buildPopupHtml(captureDate, ageFormatted, panoId, photographer, row) {
   // archival GSV credits) and pano_id comes straight from the CSV — both
   // must be escaped before entering popup HTML.
   //
-  // The whole row goes to viewerUrl because KartaView addresses its viewer by
-  // (sequence_id, sequence_index) rather than by image id; a null back means
-  // this row is not addressable and the link is omitted (cf. the FLAT_ONLY
-  // popup, which already makes that call for a missing image id).
-  const viewerUrl = provider.viewerUrl(panoId, row);
+  // The whole row goes to the link builder because KartaView addresses its
+  // viewer by (sequence_id, sequence_index) rather than by image id, and its
+  // map fallback by (pano_lat, pano_lon); a null back from either means that
+  // link is not addressable and it is omitted rather than pointed at nothing.
   return `
     <div style="font-family:sans-serif">
       <strong>Capture Date:</strong> ${captureDate.toLocaleDateString()}<br>
       <strong>Age:</strong> ${ageFormatted}<br>
       <strong>Photographer:</strong> ${escapeHtml(photographer)}<br>
       <strong>Pano ID:</strong> ${escapeHtml(panoId)}<br><br>
-      ${viewerUrl
-        ? `<a href="${viewerUrl}"
-         target="_blank" rel="noopener"
-         style="color:#2196F3;text-decoration:none">
-         ${provider.viewerLabel}
-      </a>`
-        : ""}
+      ${viewerLinksHtml(provider, panoId, row)}
     </div>
   `;
 }
@@ -1329,19 +1322,12 @@ function buildFlatOnlyPopupHtml(panoId, photographer, row) {
   if (!panoId) return `<div style="font-family:sans-serif">${note}</div>`;
   // photographer and panoId are third-party content straight from the CSV —
   // both must be escaped before entering popup HTML (cf. buildPopupHtml).
-  const viewerUrl = provider.viewerUrl(panoId, row);
   return `
     <div style="font-family:sans-serif">
       ${note}<br><br>
       ${photographer ? `<strong>Photographer:</strong> ${escapeHtml(photographer)}<br>` : ""}
       <strong>Image ID:</strong> ${escapeHtml(panoId)}<br><br>
-      ${viewerUrl
-        ? `<a href="${viewerUrl}"
-         target="_blank" rel="noopener"
-         style="color:#2196F3;text-decoration:none">
-         ${provider.viewerLabel}
-      </a>`
-        : ""}
+      ${viewerLinksHtml(provider, panoId, row)}
     </div>
   `;
 }

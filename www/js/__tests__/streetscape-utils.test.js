@@ -19,6 +19,7 @@ const {
   METRICS,
   adaptCityRecord,
   escapeHtml,
+  viewerLinksHtml,
   getColor,
   coverageColor,
   getProviderFromFilename,
@@ -263,6 +264,85 @@ test("KartaView is declared a census, the way it is actually collected", () => {
   // as "your registry entry is wrong". The real coupling, that pano_count
   // follows hasCopyrightFilter, is pinned behaviourally above.
   assert.equal(PROVIDERS.kartaview.panoCountingModel, "census");
+});
+
+test("every registered provider declares whether it has a viewer fallback", () => {
+  // Declared on all three, null where there is none, for the same reason the
+  // capability flags are: an omitted key is falsy, which reads as "no
+  // fallback" whether that was decided or forgotten. viewerLinksHtml would
+  // still render, one link short, and silently.
+  for (const [key, p] of Object.entries(PROVIDERS)) {
+    const url = p.fallbackViewerUrl;
+    assert.ok(url === null || typeof url === "function", `${key}: fallbackViewerUrl`);
+    const label = p.fallbackViewerLabel;
+    assert.ok(label === null || typeof label === "string", `${key}: fallbackViewerLabel`);
+    assert.equal(url === null, label === null, `${key}: a fallback needs both a URL and a label`);
+  }
+});
+
+test("only KartaView carries a fallback, and it is the provider whose viewer is broken", () => {
+  // Issue #312. A second entry here would mean either that a working viewer
+  // was given a fallback it does not need, or that this one was copied rather
+  // than read -- and the caveat wording only makes sense on the provider it
+  // was measured about.
+  const withFallback = Object.entries(PROVIDERS)
+    .filter(([, p]) => p.fallbackViewerUrl)
+    .map(([key]) => key);
+  assert.deepEqual(withFallback, ["kartaview"]);
+  assert.match(PROVIDERS.kartaview.viewerLabel, /broken/);
+});
+
+test("KartaView's fallback needs only a position, so it covers rows the photo link cannot", () => {
+  // The point of keying on geometry: a KartaView row can legitimately carry no
+  // sequence (the decoder keeps a null rather than inventing one), which makes
+  // the photo link unbuildable. Before #312 such a row got no link at all.
+  const noSequence = { pano_lat: 8.061405, pano_lon: 98.917865 };
+  assert.equal(PROVIDERS.kartaview.viewerUrl("1855176953", noSequence), null);
+  assert.equal(
+    PROVIDERS.kartaview.fallbackViewerUrl(noSequence),
+    "https://kartaview.org/map/@8.061405,98.917865,19z"
+  );
+
+  // ...and a row with no position is not addressable by either.
+  for (const row of [
+    { pano_lat: null, pano_lon: 98.917865 },
+    { pano_lat: 8.061405, pano_lon: undefined },
+    { pano_lat: "", pano_lon: "" },
+    {},
+    undefined,
+  ]) {
+    assert.equal(PROVIDERS.kartaview.fallbackViewerUrl(row), null);
+  }
+});
+
+test("a popup puts the link that works first", () => {
+  // Order is the whole change: both URL builders were already correct before
+  // #312, and the popup still offered only the one that opens an error page.
+  const row = { sequence_id: "8313353", sequence_index: 936, pano_lat: 8.061405, pano_lon: 98.917865 };
+  const html = viewerLinksHtml(PROVIDERS.kartaview, "1855176953", row);
+  assert.ok(html.indexOf("kartaview.org/map/@") < html.indexOf("kartaview.org/details/"));
+  assert.match(html, /rel="noopener"/);
+
+  // A provider with no fallback renders exactly one link, as before.
+  const gsv = viewerLinksHtml(PROVIDERS.gsv, "abc123", {});
+  assert.equal(gsv.match(/<a /g).length, 1);
+  assert.match(gsv, /map_action=pano/);
+
+  // Neither link addressable -> no markup at all, rather than an empty <a>.
+  assert.equal(viewerLinksHtml(PROVIDERS.kartaview, "1855176953", {}), "");
+});
+
+test("city.js renders provider links only through viewerLinksHtml", () => {
+  // A source check for the same reason as the basemap one below: a popup that
+  // interpolated provider.viewerUrl(...) directly would render perfectly, with
+  // the broken KartaView link back on top and nothing to notice it.
+  const src = stripComments(readFileSync(require.resolve("../city.js"), "utf8"));
+  assert.equal(
+    /viewerUrl\s*\(/.test(src),
+    false,
+    "city.js builds a viewer link itself; call viewerLinksHtml(provider, panoId, row) instead"
+  );
+  assert.equal((src.match(/viewerLinksHtml\s*\(/g) || []).length, 2, "both popup builders");
 });
 
 /**

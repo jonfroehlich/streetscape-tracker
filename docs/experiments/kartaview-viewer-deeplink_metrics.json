@@ -1,0 +1,439 @@
+{
+  "_about": {
+    "experiment": "kartaview-viewer-deeplink",
+    "writeup": "docs/experiments/kartaview-viewer-deeplink.md",
+    "generated_by": "scripts/kartaview_details_probe.py --csv https://makeabilitylab.cs.washington.edu/public/streetscape-tracker/data/krabi-town-municipality--mueang-krabi-district--thailand_width_10000_height_10000_step_20_kartaview_2026-08-28.csv.gz --docs-dir docs/experiments",
+    "issue": 312,
+    "probed_at_utc": "2026-09-03T03:41:06.881319+00:00",
+    "authenticated_pacing": true,
+    "rate_limit_used_per_hour": 1000,
+    "endpoint": "https://api.kartaview.org/details",
+    "verdict_definition": "loads = the response carries osv.photos, which is what the viewer dereferences; anything else renders 'Sequence cannot be loaded...'",
+    "note": "The run sequences and the control sequence go through the IDENTICAL call, so a control that fails rules out our data as the cause. The v2 rows are one-shot health checks of the same host, and are also the stack behind the map-view fallback."
+  },
+  "summary": {
+    "sequences_probed": 39,
+    "sequences_loading": 0,
+    "by_outcome": {
+      "api_code 400": 39
+    },
+    "api_messages": [
+      "not found"
+    ],
+    "token_sample_size": 4,
+    "token_changes_verdict_for": [],
+    "v2_endpoints_ok": 3,
+    "v2_endpoints_probed": 3
+  },
+  "sequences": [
+    {
+      "sequence_id": "8313753",
+      "http_status": 200,
+      "api_code": "400",
+      "api_message": "not found",
+      "loads": false,
+      "photos": 0,
+      "source": "run"
+    },
+    {
+      "sequence_id": "8314809",
+      "http_status": 200,
+      "api_code": "400",
+      "api_message": "not found",
+      "loads": false,
+      "photos": 0,
+      "source": "run"
+    },
+    {
+      "sequence_id": "8313737",
+      "http_status": 200,
+      "api_code": "400",
+      "api_message": "not found",
+      "loads": false,
+      "photos": 0,
+      "source": "run"
+    },
+    {
+      "sequence_id": "8313849",
+      "http_status": 200,
+      "api_code": "400",
+      "api_message": "not found",
+      "loads": false,
+      "photos": 0,
+      "source": "run"
+    },
+    {
+      "sequence_id": "8311017",
+      "http_status": 200,
+      "api_code": "400",
+      "api_message": "not found",
+      "loads": false,
+      "photos": 0,
+      "source": "run"
+    },
+    {
+      "sequence_id": "8308889",
+      "http_status": 200,
+      "api_code": "400",
+      "api_message": "not found",
+      "loads": false,
+      "photos": 0,
+      "source": "run"
+    },
+    {
+      "sequence_id": "8310313",
+      "http_status": 200,
+      "api_code": "400",
+      "api_message": "not found",
+      "loads": false,
+      "photos": 0,
+      "source": "run"
+    },
+    {
+      "sequence_id": "8310505",
+      "http_status": 200,
+      "api_code": "400",
+      "api_message": "not found",
+      "loads": false,
+      "photos": 0,
+      "source": "run"
+    },
+    {
+      "sequence_id": "8311033",
+      "http_status": 200,
+      "api_code": "400",
+      "api_message": "not found",
+      "loads": false,
+      "photos": 0,
+      "source": "run"
+    },
+    {
+      "sequence_id": "8312969",
+      "http_status": 200,
+      "api_code": "400",
+      "api_message": "not found",
+      "loads": false,
+      "photos": 0,
+      "source": "run"
+    },
+    {
+      "sequence_id": "8311833",
+      "http_status": 200,
+      "api_code": "400",
+      "api_message": "not found",
+      "loads": false,
+      "photos": 0,
+      "source": "run"
+    },
+    {
+      "sequence_id": "8313353",
+      "http_status": 200,
+      "api_code": "400",
+      "api_message": "not found",
+      "loads": false,
+      "photos": 0,
+      "source": "run"
+    },
+    {
+      "sequence_id": "8309161",
+      "http_status": 200,
+      "api_code": "400",
+      "api_message": "not found",
+      "loads": false,
+      "photos": 0,
+      "source": "run"
+    },
+    {
+      "sequence_id": "8311913",
+      "http_status": 200,
+      "api_code": "400",
+      "api_message": "not found",
+      "loads": false,
+      "photos": 0,
+      "source": "run"
+    },
+    {
+      "sequence_id": "8312521",
+      "http_status": 200,
+      "api_code": "400",
+      "api_message": "not found",
+      "loads": false,
+      "photos": 0,
+      "source": "run"
+    },
+    {
+      "sequence_id": "8311849",
+      "http_status": 200,
+      "api_code": "400",
+      "api_message": "not found",
+      "loads": false,
+      "photos": 0,
+      "source": "run"
+    },
+    {
+      "sequence_id": "8308873",
+      "http_status": 200,
+      "api_code": "400",
+      "api_message": "not found",
+      "loads": false,
+      "photos": 0,
+      "source": "run"
+    },
+    {
+      "sequence_id": "11616147",
+      "http_status": 200,
+      "api_code": "400",
+      "api_message": "not found",
+      "loads": false,
+      "photos": 0,
+      "source": "run"
+    },
+    {
+      "sequence_id": "11616143",
+      "http_status": 200,
+      "api_code": "400",
+      "api_message": "not found",
+      "loads": false,
+      "photos": 0,
+      "source": "run"
+    },
+    {
+      "sequence_id": "8308937",
+      "http_status": 200,
+      "api_code": "400",
+      "api_message": "not found",
+      "loads": false,
+      "photos": 0,
+      "source": "run"
+    },
+    {
+      "sequence_id": "11616155",
+      "http_status": 200,
+      "api_code": "400",
+      "api_message": "not found",
+      "loads": false,
+      "photos": 0,
+      "source": "run"
+    },
+    {
+      "sequence_id": "11616151",
+      "http_status": 200,
+      "api_code": "400",
+      "api_message": "not found",
+      "loads": false,
+      "photos": 0,
+      "source": "run"
+    },
+    {
+      "sequence_id": "11616152",
+      "http_status": 200,
+      "api_code": "400",
+      "api_message": "not found",
+      "loads": false,
+      "photos": 0,
+      "source": "run"
+    },
+    {
+      "sequence_id": "11616154",
+      "http_status": 200,
+      "api_code": "400",
+      "api_message": "not found",
+      "loads": false,
+      "photos": 0,
+      "source": "run"
+    },
+    {
+      "sequence_id": "11616153",
+      "http_status": 200,
+      "api_code": "400",
+      "api_message": "not found",
+      "loads": false,
+      "photos": 0,
+      "source": "run"
+    },
+    {
+      "sequence_id": "11616142",
+      "http_status": 200,
+      "api_code": "400",
+      "api_message": "not found",
+      "loads": false,
+      "photos": 0,
+      "source": "run"
+    },
+    {
+      "sequence_id": "11616144",
+      "http_status": 200,
+      "api_code": "400",
+      "api_message": "not found",
+      "loads": false,
+      "photos": 0,
+      "source": "run"
+    },
+    {
+      "sequence_id": "11616156",
+      "http_status": 200,
+      "api_code": "400",
+      "api_message": "not found",
+      "loads": false,
+      "photos": 0,
+      "source": "run"
+    },
+    {
+      "sequence_id": "3682125",
+      "http_status": 200,
+      "api_code": "400",
+      "api_message": "not found",
+      "loads": false,
+      "photos": 0,
+      "source": "run"
+    },
+    {
+      "sequence_id": "3682121",
+      "http_status": 200,
+      "api_code": "400",
+      "api_message": "not found",
+      "loads": false,
+      "photos": 0,
+      "source": "run"
+    },
+    {
+      "sequence_id": "3682129",
+      "http_status": 200,
+      "api_code": "400",
+      "api_message": "not found",
+      "loads": false,
+      "photos": 0,
+      "source": "run"
+    },
+    {
+      "sequence_id": "11616730",
+      "http_status": 200,
+      "api_code": "400",
+      "api_message": "not found",
+      "loads": false,
+      "photos": 0,
+      "source": "run"
+    },
+    {
+      "sequence_id": "11616729",
+      "http_status": 200,
+      "api_code": "400",
+      "api_message": "not found",
+      "loads": false,
+      "photos": 0,
+      "source": "run"
+    },
+    {
+      "sequence_id": "11616728",
+      "http_status": 200,
+      "api_code": "400",
+      "api_message": "not found",
+      "loads": false,
+      "photos": 0,
+      "source": "run"
+    },
+    {
+      "sequence_id": "11615626",
+      "http_status": 200,
+      "api_code": "400",
+      "api_message": "not found",
+      "loads": false,
+      "photos": 0,
+      "source": "run"
+    },
+    {
+      "sequence_id": "11615625",
+      "http_status": 200,
+      "api_code": "400",
+      "api_message": "not found",
+      "loads": false,
+      "photos": 0,
+      "source": "run"
+    },
+    {
+      "sequence_id": "11614074",
+      "http_status": 200,
+      "api_code": "400",
+      "api_message": "not found",
+      "loads": false,
+      "photos": 0,
+      "source": "run"
+    },
+    {
+      "sequence_id": "11614073",
+      "http_status": 200,
+      "api_code": "400",
+      "api_message": "not found",
+      "loads": false,
+      "photos": 0,
+      "source": "run"
+    },
+    {
+      "sequence_id": "6187609",
+      "http_status": 200,
+      "api_code": "400",
+      "api_message": "not found",
+      "loads": false,
+      "photos": 0,
+      "source": "kartaview_documented_example"
+    }
+  ],
+  "authenticated_sample": [
+    {
+      "sequence_id": "8313753",
+      "http_status": 200,
+      "api_code": "400",
+      "api_message": "not found",
+      "loads": false,
+      "photos": 0,
+      "source": "run (authenticated)"
+    },
+    {
+      "sequence_id": "8314809",
+      "http_status": 200,
+      "api_code": "400",
+      "api_message": "not found",
+      "loads": false,
+      "photos": 0,
+      "source": "run (authenticated)"
+    },
+    {
+      "sequence_id": "8313737",
+      "http_status": 200,
+      "api_code": "400",
+      "api_message": "not found",
+      "loads": false,
+      "photos": 0,
+      "source": "run (authenticated)"
+    },
+    {
+      "sequence_id": "8313849",
+      "http_status": 200,
+      "api_code": "400",
+      "api_message": "not found",
+      "loads": false,
+      "photos": 0,
+      "source": "run (authenticated)"
+    }
+  ],
+  "v2_controls": [
+    {
+      "url": "https://api.kartaview.org/2.0/sequence/8313753",
+      "http_status": 200,
+      "api_code": "600",
+      "ok": true
+    },
+    {
+      "url": "https://api.kartaview.org/2.0/sequence/8313753/photos",
+      "http_status": 200,
+      "api_code": "600",
+      "ok": true
+    },
+    {
+      "url": "https://api.kartaview.org/2.0/photo/?sequenceId=8313753&sequenceIndex=0",
+      "http_status": 200,
+      "api_code": "600",
+      "ok": true
+    }
+  ]
+}
