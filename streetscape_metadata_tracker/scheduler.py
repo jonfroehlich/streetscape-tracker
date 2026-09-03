@@ -47,7 +47,7 @@ from typing import Any, NamedTuple
 
 from tabulate import tabulate
 
-from . import catalog_backup, db, driving_plan
+from . import catalog_backup, cgroup_memory, db, driving_plan
 from .alerting import AlertConfig, send_alert, should_alert
 from .checkpointing import (
     CENSUS_PROVIDERS,
@@ -403,7 +403,16 @@ class SchedulerConfig:
     batch_size: int = 100
     connection_limit: int = 50
     request_timeout_s: float = 30.0
-    sleep_between_cities_s: int = 60
+    # Pause between cities. 5 s, not the historical 60 s (issue #306): every
+    # mechanism the original "spread load" rationale named now exists properly
+    # — a per-channel `max_requests_per_minute` limiter inside each child, the
+    # cross-process lock that serializes the three per-IP metered hosts (#208),
+    # jittered Mapillary tile gaps (#292), and osmnx's server-advertised
+    # Overpass slot wait — while the sleep itself was 62 s of a small city's
+    # 83 s slot. Kept non-zero rather than deleted: it is the only thing
+    # standing between one city's writeback and the next city's first write,
+    # and a settle time is cheap where a race is not.
+    sleep_between_cities_s: int = 5
     # Client-side gsv pacing; 80% of the API's default 30k/min quota. Scale
     # with the project's granted quota. 0 disables.
     max_requests_per_minute: int = 24_000
@@ -717,7 +726,12 @@ def load_scheduler_config(path: str | None = None) -> SchedulerConfig:
         batch_size=dl.get("batch_size", 100),
         connection_limit=dl.get("connection_limit", 50),
         request_timeout_s=dl.get("request_timeout_s", 30.0),
-        sleep_between_cities_s=dl.get("sleep_between_cities_s", 60),
+        # Clamped at 0 rather than trusted: a negative here reaches time.sleep()
+        # inside the city loop, where ValueError is caught by the loop's broad
+        # `except Exception` and ends the whole night at _STOP_REASON_ERROR after
+        # one city -- a batch lost to a typo, reported as "City loop aborted by
+        # an unexpected error", i.e. pointing at the loop instead of the config.
+        sleep_between_cities_s=max(0, dl.get("sleep_between_cities_s", 5)),
         max_requests_per_minute=dl.get("max_requests_per_minute", 24_000),
         data_dir=paths.get("data_dir", str(_PROJECT_ROOT / "data")),
         db_path=paths.get("db_path", ""),
@@ -5654,8 +5668,11 @@ def _run_city_loop(
 
             # Re-check HERE, not only at the top of the next iteration. Two
             # things sit in between, and a stop has to survive both (issue #206):
-            # the inter-city sleep below, which would spend a full minute of a
-            # stop window whose entire purpose is the publish tail — and worse,
+            # the inter-city sleep below, which would spend its whole interval
+            # out of a stop window whose entire purpose is the publish tail
+            # (a full minute of it before #306 cut the sleep to 5 s, but the
+            # check is not sized to the constant and must survive it moving
+            # back) — and worse,
             # PEP 475 makes time.sleep RESUME after the handler runs rather than
             # returning early, so the flag is set and ignored for the whole
             # interval; and, on the LAST due city, nothing at all, so the `for`
@@ -5828,6 +5845,32 @@ def _finish_batch(
     if pruned:
         logger.info(f"Pruned {pruned} expired cached census(es)")
         summary += f"; pruned {pruned} cached census(es)"
+
+    # How close the night came to the systemd unit's memory cap (issue #305).
+    #
+    # Read HERE, not beside the elapsed-time figure in the summary above, because
+    # the aggregate rebuild a few lines up is the tail's heaviest step and on a
+    # big-census night it, not the city loop, sets the peak (issue #157). That
+    # ordering is pinned by a test, because it is the whole reason the call sits
+    # in this function rather than next to the figure it is quoted with.
+    #
+    # KNOWN BLIND SPOT, named rather than argued away: memory.peak is monotonic
+    # and this runs BEFORE the tail catalog backup and the publish rsync, so
+    # neither can ever appear in the number. That is structural -- `summary` has
+    # to be complete before _publish receives it -- and both are believed small
+    # on a pool where ZFS ARC rather than the cgroup absorbs the file IO. Neither
+    # has been measured, and a PR about not assuming things about this cgroup
+    # should not assume that one.
+    #
+    # Logged as well as appended, and that is not redundancy: the "Done: ..."
+    # line is emitted by cmd_run_due BEFORE this function runs, so an append to
+    # `summary` reaches the [alerts] email and the publish log but never the
+    # scheduler log on a healthy night. `grep 'cgroup peak'` over a week of logs
+    # is the measurement #305 asks for before max_concurrent_channels is raised.
+    memory_note = cgroup_memory.describe_cgroup_memory()
+    if memory_note:
+        logger.info(memory_note)
+        summary += f"; {memory_note}"
 
     # Back up again now that the night's runs, diffs and walks are registered:
     # the pre-flight copy (see _backup_catalog_nightly) guarantees a copy

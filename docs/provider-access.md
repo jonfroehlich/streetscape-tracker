@@ -354,7 +354,11 @@ Also: we now identify ourselves per the usage policy (`http_user_agent`/`http_re
 `OVERPASS_URL` overrides the endpoint for an incident-time mirror and is read at **call** time (`_apply_overpass_url`, re-run per `fetch_graph`) so the 03:00 escape hatch is settable without a restart and testable at all;
 and the legacy `gsv_street_analyzer/` copy is **deleted** rather than patched
 — it was referenced nowhere but had an argparse CLI and a `__main__` guard, i.e. a runnable Overpass client with no host lock, no UA and no deadline, which is exactly the "process that cannot read the rule" this stack exists for.
-**Deliberately no new client-side pacer** — Overpass's own guideline is "fewer than 10,000 queries/day", we issue roughly 20 a night with `sleep_between_cities_s` already between cities, and the ban came from concurrency (#208) and plausibly from (5), not from our steady-state rate.
+**Deliberately no new client-side pacer** — Overpass's own guideline is a daily volume ("fewer than 10,000 queries/day", and its docs add "divide by 100" for an app that queries regularly, i.e. under ~100/day), we issue roughly 20–40 a night, and the ban came from concurrency (#208) and plausibly from (5), not from our steady-state rate.
+The spacing between those queries is the **server's** call, not ours: `ox.settings.overpass_rate_limit = True` makes osmnx read `/status` and sleep off the wait Overpass itself advertises before every fetch.
+That is what made `sleep_between_cities_s` safe to cut from 60 s to 5 s (#306) without adding a pacer here — the inter-city gap was never what kept us inside Overpass's limits, and the two things that are (a daily count three orders of magnitude under the guideline, and the host lock enforcing "no parallel running of multiple scripts") are both untouched by it.
+What the cut does **not** move is the daily count: a night is capped at `[schedule].max_cities_per_day` (20 in production) however fast it runs, and the sleep only ever fired between cities that were actually attempted — so the ceiling on Overpass queries is set by that cap and by the road-walk channels enabled per city, never by the gap.
+The knobs to re-check against the ~100/day reading are therefore `max_cities_per_day` and `max_concurrent_channels`, not the nightly slate, which is already ~940 due cities and has never been what bounds the count.
 Tests stub the probe suite-wide via an autouse `conftest.py` fixture, or every street test would hit a volunteer-run service from every dev machine and CI job.
 
 ## Pointers added after the split

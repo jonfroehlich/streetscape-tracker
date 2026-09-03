@@ -1108,6 +1108,17 @@ def test_makelab1_production_config_is_wired():
     # the enrolled set divided by it is how many nights a full pass takes.
     assert cfg.opt_in_cities_per_day is None
     assert _sched._opt_in_reservation(cfg, cfg.max_cities_per_day) == 5
+    # The inter-city pause (issue #306). Pinned in production, not just at the
+    # dataclass default, because this is a knob whose only symptom when wrong is
+    # a night that is slower than it needs to be — nothing fails, nothing alerts,
+    # and 60 s survived for months on a rationale ("spread load") that the
+    # per-channel limiters and the host lock have since taken over properly.
+    # Pinned as a RANGE rather than a value: 0 would remove the settle time this
+    # deliberately keeps (one city's writeback, and any lag between a child
+    # exiting and its host lock reading as free — a fail-fast busy-skip rather
+    # than a wait), and anything above ~15 s is the old cost returning a nudge at
+    # a time on nights that are already deadline-bound.
+    assert 1 <= cfg.sleep_between_cities_s <= 15
     # The street channels must keep their ISOLATED budgets: metered under their
     # own api_usage provider strings against separate keys, so a road crawl can
     # never eat the grid collectors' quota.
@@ -1796,6 +1807,76 @@ def test_limit_below_the_cap_still_narrows(conn, monkeypatch):
 
     assert len(ran) == 1
     assert slept == [], "a capped run must not sleep after the last city it will run"
+
+
+def test_the_inter_city_pause_is_the_configured_one_and_not_a_constant(conn, monkeypatch):
+    """
+    Issue #306 cut `sleep_between_cities_s` from 60 s to 5 s, and the only way
+    that lands is if the loop reads the config rather than a literal.
+
+    Asserted against a value that is neither the new default nor the old one, so
+    a call site that hard-codes either passes nothing here. This is the same
+    failure shape as every other pass-through in this file: a knob pinned only
+    at its default lets the code ignore the knob.
+
+    The count matters as much as the value — one pause per gap, not per channel
+    — so this runs TWO channels over two cities. One channel could not tell the
+    two placements apart by more than the trailing-sleep suppression; with two,
+    a sleep moved inside `_run_city_channels` is four rather than one, which is
+    the multiplication that quietly turns a 5 s settle time into a 20 s one on a
+    four-channel night.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    _register(conn, "Bend", width=1000, height=1000, step=20)
+    _register(conn, "Cody", width=1000, height=1000, step=20)
+    ran, slept = [], []
+    _stub_collection(sched, monkeypatch, conn, ran, slept=slept)
+
+    sched.cmd_run_due(
+        _mly_cfg(sleep_between_cities_s=7),
+        today=date(2026, 7, 2),
+        requested_providers=["gsv", "mapillary"],
+    )
+
+    assert len(ran) == 4, "two cities x two channels, so a per-channel sleep has room to show"
+    assert slept == [7], "one configured pause per city GAP, and the config's value"
+
+
+def test_the_inter_city_pause_defaults_to_a_settle_time_not_a_rate_limiter(tmp_path):
+    """
+    5 s in both places a default can come from, and both are asserted because
+    they disagree silently: a config file that omits the key takes
+    `load_scheduler_config`'s literal, while `SchedulerConfig()` takes the
+    dataclass field, and the two drifted apart is how a "default" ends up
+    meaning two different nights.
+
+    The value is bounded rather than spelled twice, for the reason the
+    production pin gives: 0 removes the settle time this deliberately keeps, and
+    creeping back up is the failure mode a fixed assertion invites arguing with.
+    """
+    cfg_path = tmp_path / "scheduler.toml"
+    cfg_path.write_text("[download]\nbatch_size = 100\n")
+
+    for cfg in (SchedulerConfig(), load_scheduler_config(str(cfg_path))):
+        assert 1 <= cfg.sleep_between_cities_s <= 15
+
+
+def test_a_negative_inter_city_pause_is_clamped_rather_than_carried_into_the_loop(tmp_path):
+    """
+    The knob is small enough now to be edited casually, and a negative reaches
+    `time.sleep()` inside the city loop -- where `ValueError` is swallowed by the
+    loop's broad `except Exception` and converted into `_STOP_REASON_ERROR`.
+
+    That costs the whole night after one city and reports it as "City loop
+    aborted by an unexpected error", which sends the operator reading the loop
+    rather than the two characters they typed. Clamped at load, where the value
+    came from.
+    """
+    cfg_path = tmp_path / "scheduler.toml"
+    cfg_path.write_text("[download]\nsleep_between_cities_s = -5\n")
+
+    assert load_scheduler_config(str(cfg_path)).sleep_between_cities_s == 0
 
 
 def test_the_summary_reports_elapsed_time_and_the_active_filter(conn, monkeypatch):
@@ -5546,6 +5627,22 @@ def test_stop_timeout_covers_the_publish_tail_it_waits_for():
 # with a real MemoryPeak the first night a big city runs to completion.
 _EXTRAPOLATED_LARGEST_CITY_PEAK_GIB = 15.3
 
+# The instruction above ("replace it with a real MemoryPeak the first night a big
+# city runs to completion") is what this constant is. 2026-09-01, read off the
+# unit's own cgroup: MemoryPeak=20,267,974,656 = 18.88 GiB, whole unit, ORDINARY
+# night -- one collection child at a time, nothing Detroit-scale in the slate.
+#
+# It is ABOVE the extrapolated worst-city figure, which is the finding and not a
+# rounding difference: the ~0.914 GiB-per-million-rows slope underestimates
+# because the baseline term dominates what it attributed to row count. So this,
+# not 15.3, is the binding floor for both caps -- and the unit file's "not sized
+# for a Detroit DIFF night" caveat is understated by more than it says.
+#
+# The two are kept side by side rather than one replacing the other: 15.3 is
+# still the only figure anyone has for how peak scales WITH a city, and 18.88 is
+# the only one measured. Neither answers the other's question.
+_MEASURED_ORDINARY_NIGHT_PEAK_GIB = 18.88
+
 
 def test_memory_high_is_a_throttle_below_the_hard_limit_and_clears_the_worst_city():
     """
@@ -5572,9 +5669,18 @@ def test_memory_high_is_a_throttle_below_the_hard_limit_and_clears_the_worst_cit
     Asserted against the directive lines, not the prose around them.
     """
     unit = Path(_PROJECT_ROOT, "deploy", "systemd", "streetscape-tracker.service").read_text()
-    floor = _EXTRAPOLATED_LARGEST_CITY_PEAK_GIB * 2**30
+    # The HIGHER of the two, because they are floors for the same caps and only
+    # the binding one is a guard. Since 2026-09-01 that is the measurement, not
+    # the extrapolation -- an ordinary night read above the extrapolated worst
+    # city. Left as a max() rather than hard-coded to the measurement so a later,
+    # larger extrapolation (a Detroit diff night is the named candidate) becomes
+    # the floor by being written down, without anyone having to notice this line.
+    floor = max(_EXTRAPOLATED_LARGEST_CITY_PEAK_GIB, _MEASURED_ORDINARY_NIGHT_PEAK_GIB) * 2**30
     _assert_unit_quotes(
         unit, f"{_EXTRAPOLATED_LARGEST_CITY_PEAK_GIB} GiB", "_EXTRAPOLATED_LARGEST_CITY_PEAK_GIB"
+    )
+    _assert_unit_quotes(
+        unit, f"{_MEASURED_ORDINARY_NIGHT_PEAK_GIB} GiB", "_MEASURED_ORDINARY_NIGHT_PEAK_GIB"
     )
 
     def _raw(directive):
@@ -9061,6 +9167,112 @@ def test_the_tail_prunes_the_cache_and_says_how_many(conn, monkeypatch, tmp_path
     assert os.path.isdir(fresh)
     assert not os.path.exists(stale)
     assert "Pruned 1 expired cached census" in caplog.text
+
+
+def test_the_tail_records_the_cgroup_memory_peak(conn, monkeypatch, tmp_path, caplog):
+    """
+    How close the night came to `MemoryHigh` (issue #305).
+
+    Both destinations are asserted because they answer different questions and
+    only one of them is retrospective. The [alerts] email carries the SUMMARY,
+    so the append is what an operator reads on the night it mattered; the LOG
+    line is what `grep 'cgroup peak'` finds a week later, and it is not
+    redundant with the append — cmd_run_due emits its "Done: ..." line before
+    _finish_batch runs, so a summary-only append never reaches the scheduler log
+    on a healthy night.
+
+    Read after the aggregate rebuild rather than beside the elapsed-time figure:
+    on a big-census night the tail, not the city loop, sets the peak (#157).
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    monkeypatch.setattr(
+        sched.cgroup_memory,
+        "describe_cgroup_memory",
+        lambda: "cgroup peak 18.88 GiB of 40 GiB MemoryHigh (47%)",
+    )
+    published = {}
+
+    def fake_publish(cfg, context, **_kw):
+        published["context"] = context
+        return 0
+
+    monkeypatch.setattr(sched, "_publish", fake_publish)
+    cfg = SchedulerConfig(
+        data_dir=str(tmp_path), backup_dir=str(tmp_path / "backups"), publish_enabled=True
+    )
+
+    with caplog.at_level("INFO"):
+        sched._finish_batch(cfg, conn, "summary", succeeded=1, attempted=1, today=date(2026, 7, 2))
+
+    assert "cgroup peak 18.88 GiB of 40 GiB MemoryHigh (47%)" in caplog.text
+    assert published["context"] == "summary; cgroup peak 18.88 GiB of 40 GiB MemoryHigh (47%)"
+
+
+def test_the_cgroup_peak_is_read_after_the_aggregate_rebuild(conn, monkeypatch, tmp_path):
+    """
+    Ordering, which is the reason the call sits in `_finish_batch` at all.
+
+    On a big-census night the tail and not the city loop sets the peak (#157):
+    `generate_aggregate_v2` is the heaviest step either side of it, and a reading
+    taken before it would quote the city loop's number and miss the actual high
+    water mark by whatever the rebuild adds.
+
+    Untested, that argument is a comment. Both other tail tests here patch the
+    reader and assert on the summary, which passes identically with the call
+    moved to the top of the function -- so this pins the sequence rather than the
+    output.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    order = []
+    monkeypatch.setattr(
+        sched, "generate_aggregate_v2", lambda c, d: order.append("aggregate") or {}
+    )
+    monkeypatch.setattr(
+        sched.cgroup_memory,
+        "describe_cgroup_memory",
+        lambda: (order.append("cgroup peak"), "cgroup peak 1.00 GiB (no cgroup memory cap)")[1],
+    )
+    monkeypatch.setattr(sched, "_publish", lambda cfg, context, **_kw: 0)
+    cfg = SchedulerConfig(
+        data_dir=str(tmp_path), backup_dir=str(tmp_path / "backups"), publish_enabled=True
+    )
+
+    sched._finish_batch(cfg, conn, "summary", succeeded=1, attempted=1, today=date(2026, 7, 2))
+
+    assert order == ["aggregate", "cgroup peak"], (
+        "the peak must be read AFTER the aggregate rebuild, which is what makes "
+        "it the whole night's high-water mark rather than the city loop's"
+    )
+
+
+def test_the_tail_says_nothing_when_the_cgroup_cannot_be_read(conn, monkeypatch, tmp_path):
+    """
+    A host without cgroup v2 (or a kernel before 5.19, which has no
+    `memory.peak`) must add nothing at all rather than a placeholder. The
+    summary is already dense and is what the alert email carries, so a line
+    saying the number is unknown costs an operator a read and tells them
+    nothing — and a zero would read as a night with enormous headroom, which is
+    the conclusion #305 exists to stop anyone drawing without evidence.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    monkeypatch.setattr(sched.cgroup_memory, "describe_cgroup_memory", lambda: None)
+    published = {}
+
+    def fake_publish(cfg, context, **_kw):
+        published["context"] = context
+        return 0
+
+    monkeypatch.setattr(sched, "_publish", fake_publish)
+    cfg = SchedulerConfig(
+        data_dir=str(tmp_path), backup_dir=str(tmp_path / "backups"), publish_enabled=True
+    )
+
+    sched._finish_batch(cfg, conn, "summary", succeeded=1, attempted=1, today=date(2026, 7, 2))
+
+    assert published["context"] == "summary"
 
 
 def test_the_tail_survives_a_broken_cache_directory(conn, monkeypatch, tmp_path):
