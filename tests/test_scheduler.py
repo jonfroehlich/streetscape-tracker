@@ -5565,6 +5565,63 @@ def test_a_failed_aggregate_still_backs_up_and_publishes(conn, monkeypatch):
     assert "BrokenPipeError" in alerts[0][1], "the alert must carry the cause, not just the label"
 
 
+def test_main_run_due_broken_pipe_does_not_alert(monkeypatch):
+    """A BrokenPipeError that escapes `cmd_run_due` entirely (not caught by
+    the tail's own per-component isolation above) means the reader on our
+    stdout went away -- e.g. a manual `run-due --dry-run | head` whose pipe
+    closed, or a dropped SSH session -- not a collection failure. 2026-09-02
+    21:10 PDT: exactly this fired a "run-due CRASHED" alert email for a bare
+    BrokenPipeError out of the dry-run preview's own `print()`, with nothing
+    collected and nothing lost. `main()`'s run-due dispatch must special-case
+    it: no alert, but still a nonzero exit so a script piping run-due sees
+    failure.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    monkeypatch.setattr(sched.sys, "argv", ["scheduler", "run-due", "--dry-run"])
+    monkeypatch.setattr(sched, "load_scheduler_config", lambda path: _publishing_cfg())
+    monkeypatch.setattr(sched, "setup_logging", lambda cfg, verbose=False: None)
+
+    def boom(cfg, dry_run=False, limit=None, requested_providers=None):
+        raise BrokenPipeError(32, "Broken pipe")
+
+    monkeypatch.setattr(sched, "cmd_run_due", boom)
+
+    alerts = []
+    monkeypatch.setattr(sched, "send_alert", lambda cfg, subj, body: alerts.append((subj, body)))
+
+    rc = sched.main()
+
+    assert rc == 1, "still nonzero so a wrapper piping run-due sees failure"
+    assert alerts == [], "a dead stdout reader is not a scheduler crash"
+
+
+def test_main_run_due_other_exception_still_alerts_and_raises(monkeypatch):
+    """The BrokenPipeError carve-out above must stay narrow: any other
+    exception escaping `cmd_run_due` is still a genuine crash and must keep
+    emailing the traceback and propagating, exactly as before."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    monkeypatch.setattr(sched.sys, "argv", ["scheduler", "run-due"])
+    monkeypatch.setattr(sched, "load_scheduler_config", lambda path: _publishing_cfg())
+    monkeypatch.setattr(sched, "setup_logging", lambda cfg, verbose=False: None)
+
+    def boom(cfg, dry_run=False, limit=None, requested_providers=None):
+        raise RuntimeError("something actually broke")
+
+    monkeypatch.setattr(sched, "cmd_run_due", boom)
+
+    alerts = []
+    monkeypatch.setattr(sched, "send_alert", lambda cfg, subj, body: alerts.append((subj, body)))
+
+    with pytest.raises(RuntimeError, match="something actually broke"):
+        sched.main()
+
+    assert len(alerts) == 1
+    assert "run-due CRASHED" in alerts[0][0]
+    assert "something actually broke" in alerts[0][1]
+
+
 def test_backup_failure_alerts_even_below_the_failure_threshold(conn, monkeypatch):
     """The collection-failure threshold exists so one flaky city doesn't page
     every night. Backups get no such grace: there is no such thing as an

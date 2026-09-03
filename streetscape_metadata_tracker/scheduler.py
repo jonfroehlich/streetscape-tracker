@@ -6541,6 +6541,23 @@ def main() -> int:
                 limit=args.limit,
                 requested_providers=args.providers,
             )
+        except BrokenPipeError:
+            # The reader on our stdout went away mid-`print` -- e.g. a
+            # `--dry-run` preview piped into `head`, or an SSH session that
+            # dropped. That is an artifact of how this invocation's output
+            # was consumed, not a collection failure: the automated nightly
+            # run never hits this (its stdout is a file, per
+            # StandardOutput=append:, which has no reader to disappear), so
+            # this can only be a manual/interactive invocation. Not worth an
+            # alert email -- logger.warning is safe here even though stdout
+            # is broken, because setup_logging's handler swallows its own
+            # flush errors via handleError (see _exit's docstring). Still
+            # exit nonzero so a script piping run-due sees failure.
+            logger.warning(
+                "run-due: stdout reader went away (broken pipe) -- not a "
+                "collection failure, no alert sent."
+            )
+            return 1
         except Exception:
             # A crash (not just a failed city) — email the traceback before the
             # process dies, so a silent nightly failure can't go unnoticed.
