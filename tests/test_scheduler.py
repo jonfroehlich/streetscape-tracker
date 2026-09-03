@@ -5656,7 +5656,12 @@ def test_neutralize_broken_streams_makes_a_dead_stdout_writable(monkeypatch):
     os.close(read_fd)
     dead = os.fdopen(write_fd, "w")
     try:
-        dead.write("x" * 100_000)  # buffered; the flush is what discovers EPIPE
+        # Deliberately small and newline-free, so it stays in the TextIOWrapper's
+        # buffer and the flush below is what discovers EPIPE. A write large
+        # enough to overflow that buffer (or the ~64 KiB pipe) raises inside
+        # `write` on Linux and not on macOS, which is a platform difference the
+        # test has no business depending on.
+        dead.write("still buffered, never written")
         monkeypatch.setattr(sched.sys, "stdout", dead)
 
         with pytest.raises(BrokenPipeError):
