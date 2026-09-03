@@ -11,6 +11,27 @@ grace_days = 7
 # Nightly cap; `run-due --limit N` (N >= 1) overrides it for one invocation
 # (issue #214). At 20, a full pass over the enabled cities is ~61 nights.
 max_cities_per_day = 20    # cities/day (a city runs all enabled providers)
+
+# Slots reserved out of max_cities_per_day for cities due ONLY on an opt-in
+# channel (issue #282). Unset means "a quarter of the cap, floored at 1" —
+# 5 at the cap above — and the resolution lives in one place,
+# scheduler._opt_in_reservation, so a config that sets this and one that does
+# not cannot disagree about what it means.
+#
+# The bound is what lets an opt-in channel's enrolled set widen at all. Without
+# it the hoist is unbounded, and "due only on the opt-in channel" is the NORMAL
+# steady state for an enrolled city — gsv succeeds nightly and advances its
+# clock while the opt-in channel's stays put — so the hoist's success case at a
+# seed set of two and its starvation case at a few hundred are the same case at
+# different N. Once the opt-in-only cities alone fill the cap, gsv, gsv_streets,
+# mapillary and mapillary_streets collect NOTHING that night.
+#
+# Cities beyond the reservation are not dropped: they keep their union position
+# and wait for a later night. So this is the RATE a widening proceeds at, and
+# the enrolled set divided by this figure is how many nights a full pass takes.
+# Setting it equal to max_cities_per_day re-creates the unbounded hoist by hand
+# (the night then warns); 0 switches the promotion off without un-enrolling.
+# opt_in_cities_per_day = 5
 max_consecutive_failures = 5
 city_timeout_minutes = 180
 # Stop STARTING cities after this many hours so the aggregate/manifest/publish

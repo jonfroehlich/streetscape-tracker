@@ -288,6 +288,36 @@ Because nothing is counted as a failure, `_finish_batch` is what makes such a ni
 Tests neutralize the lock suite-wide via an autouse `conftest.py` fixture pointing `STREETSCAPE_LOCK_DIR` at a per-test `tmp_path`, so pytest can run during a real nightly batch;
 `tests/test_host_lock.py` then opts back in by taking a second `FileLock` on the same path, which behaves exactly like a competing process inside one pytest process.
 
+## KartaView documents one number, enforces nothing observable, and has no forum (surveyed 2026-09-02)
+
+**KartaView is the one locked host for which the top-of-file rule cannot be followed as written**, because the second half of it — read the developer/community forum — has no object.
+This section is that finding, recorded before widening the channel beyond its two-city seed set rather than after a block.
+
+**What is documented.** One figure, in one place: **100 requests/hour anonymous, 1,000/hour authenticated**.
+It is not on a developer portal — kartaview.org is a JS SPA whose FAQ is reachable only by scraping `kartaview.org/main.*.js` — and the only durable third-party restatement is [Bellingcat's toolkit entry](https://bellingcat.gitbook.io/toolkit/more/all-tools/kartaview), which quotes exactly that sentence and nothing further.
+A 2026-09-02 re-survey found no newer or more specific statement, and no published guidance of any kind on bulk access, sustained load, concurrency or crawl etiquette.
+Trek View's practitioner walkthrough of the API covers authentication and resource shapes and is **silent on limits entirely**.
+
+**What is enforced is not observable.** The API returns **no `X-RateLimit-*` and no `Retry-After` header of any kind**, so a client cannot read its own remaining budget, and it did not enforce either documented figure when measured (130 consecutive requests, zero 429s — `docs/experiments/kartaview-feasibility.md`).
+A limit that is neither announced in headers nor enforced at the documented value tells us nothing about where the real one is.
+This is the same epistemic position the Mapillary blocks were discovered from, and it resolves the same way: **the documented number bounds what we allow ourselves, not what they permit.**
+
+**There is no forum, and the tracker is unstaffed.** The only public channel is the `kartaview/openstreetcam.org` GitHub tracker.
+It is effectively unattended: `#392` has sat open and uncommented since 2023-10-31, and this project's own `#404` (OSM login) and `#405` (capture dates lost in the 2025-11-19 ingest) are likewise uncommented.
+Of the twelve most recently updated issues on 2026-09-02, ten carry zero comments.
+So there is no venue where an undocumented operational limit would surface the way `forum.mapillary.com` surfaced Mapillary's per-IP throttle — and therefore **no early warning is available for this provider at all**.
+Do not read the absence of complaints as evidence of headroom; it is evidence of an empty room.
+
+**Volume is the axis nothing has tested.** The largest KartaView night to date is a few hundred requests (Krabi + Yogyakarta, 745 on 2026-08-28).
+`docs/experiments/kartaview-sweep-cost.md` says so in its own words — *"Nothing here measures sustained load"* — and its whole 14-city study spent 29,589 requests across one session on one IP.
+A whole-catalog pass over the 1,216 enabled cities is **114,411 root circles ≈ 205,940 requests at the measured 1.80× overhead**, which at the configured 16/min (960/h) is **~215 h of continuous fetching**, or ~290× the total volume ever put through this host.
+That multiplier is a MEDIAN over 14 cities whose max was 13.66×, and the geometry tier under-prices any city that calibrates to r=500 by ~4×, so treat the figure as an order of magnitude and never as a budget.
+
+**What follows for pacing.** `DEFAULT_SWEEP_REQUESTS_PER_MINUTE` is 16 — 960/h, under the only documented ceiling by construction, since the limiter's burst is a single token.
+Both KartaView channels share one machine-wide `host_lock(HOST_KARTAVIEW)`, so that 960/h is the **combined** ceiling for the grid sweep and the road walk, never 960 each.
+A redirect, an HTML body or a 429 is a `HostBlockedError` at the **first** request (exit 81); 401/403 stays a plain `DownloadError` scoped to the credential.
+Widening the enrolled set is a volume change under the top-of-file rule and is therefore staged in tranches with a stop condition, not switched on catalog-wide (issue #282 and the rollout it gates).
+
 ## Overpass is a per-IP volunteer service, and the fetch is hardened accordingly (issue #209)
 
 **Overpass is a per-IP volunteer service, and the fetch is hardened accordingly (issue #209).** It is on the critical path for essentially every road walk
