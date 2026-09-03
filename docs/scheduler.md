@@ -36,7 +36,8 @@ That budget of five is survivable only if the five nights are **consecutive**, s
 Note which of the two unfinished-sweep arms a nightly batch takes, because since #273 a HEALTHY sweep takes the **pause**, not the SIGKILL.
 `_run_city_channels` hands **both** KartaView channels a request cap as `--kartaview-max-requests`, and the cap is sized against the wall clock as well as the ledger: `min(budget − used, what the child's own timeout can pace)`.
 The second term is `_sweep_requests_within_timeout`, the inverse of `_kartaview_timeout_seconds` and read from the same rate, `_SWEEP_ACHIEVED_RATE_FRACTION` and `_TIMEOUT_FIXED_SLACK_S`, so the two cannot drift apart.
-The remainder alone was not enough, and the arithmetic says why: on prod 16/min over a 10 h batch paces ~9,600 requests against a 10,000 budget, so a fresh night's remainder is **unreachable**, and a city costing more than its timeout affords was still killed before the cap could bind.
+The remainder alone was not enough, and the arithmetic says why — with the caveat that **which of the two ceilings binds moves with the config**, which is why the cap is a `min` rather than the term that was smaller when #273 was written.
+At the 10 h batch it was written against, prod's 16/min paced ~9,600 requests against a 10,000 budget, so a fresh night's remainder was **unreachable** outright and a city costing more than its timeout affords was still killed before the cap could bind; at the 12 h batch (raised 2026-09-02) the same rate paces ~11,520 and the budget is the smaller term instead.
 A sweep that reaches its cap stops itself deliberately: exit 83, amnestied, no `consecutive_failure`, no city-cap slot, and the spend still reaches the ledger because the child returns.
 What bounds a paused city is therefore not the five failures but `CHECKPOINT_MAX_AGE_S` — seven days from the checkpoint's **first** commit, after which its rows would be spliced into a snapshot dated today and it is discarded.
 The SIGKILL arm remains, and what it catches now is a child running **slower** than the assumed `rate × _SWEEP_ACHIEVED_RATE_FRACTION` — the one overrun a request cap cannot bound, since only a clock inside the child could.
@@ -46,7 +47,7 @@ The hoist moves a city to the head of the slate when **every** channel it is due
 It reorders the **city list only**, never the union loop, because `providers_for_city` is passed straight to `_run_city_channels` where `pending = list(providers)` *is* the launch order.
 
 **The tail — aggregate, streetwalk manifest, catalog backup, publish — is what makes a night visible, and it only runs if the city loop returns**, so every way of ending the loop goes through `_run_city_loop`,
-which always returns counters instead of propagating: a `[schedule].max_batch_hours` deadline (10 h) stops *starting* cities and clamps the in-flight child's timeout to what's left,
+which always returns counters instead of propagating: a `[schedule].max_batch_hours` deadline (12 h) stops *starting* cities and clamps the in-flight child's timeout to what's left,
 a SIGTERM handler turns systemd's stop into a wind-down request checked between cities *and between a city's channels*, and an unexpected exception is logged, published anyway, and then reported as an unhealthy night (nonzero exit + alert, so publishing can't hide a bug).
 **The tail also prunes the shared census cache** (`prune_census_cache`, #290), beside the backup and the publish and with the same best-effort posture — it swallows its own filesystem errors, because the prune is housekeeping and the publish and the alert come after it.
 That prune is the only thing bounding the cache's size: an entry is written for every census a night fetches and is not overwritten until that city comes round again, ~80 days later.
@@ -280,6 +281,44 @@ Watch `MemoryPeak` after each night rather than pre-raising the unit's `MemoryHi
 `TimeoutStopSec=30min` needs no change: it prices the tail, which concurrency does not touch, and N children wind down in parallel.
 The before/after is a measured question and therefore owes a writeup: `scripts/night_length_analyze.py` lands with the code and reads the elapsed distribution (with per-channel `api_usage` and the busy/blocked counts beside it, as the volume control) straight out of `logs/streetscape_scheduler.log*`; `docs/experiments/night-length.md` follows once there are nights on both sides of the flip to compare.
 That is also why `cmd_run_due` logs `max_concurrent_channels=N` on its opening line — which setting a night ran under has to be recoverable from the night's own record, not from an operator's memory of the flip date.
+
+## What a capped night spends its slots on (issue #308, added 2026-09-02)
+
+**Breadth-first was never a decision; it was the shape of a tiebreak, and this section is that tiebreak given a name and a lever.**
+`db.get_due_cities` orders `last_success_at ASC NULLS FIRST, city_id ASC`, so every city that has never succeeded on a channel sits ahead of *every* refresh, and the all-NULL block drains alphabetically.
+Measured on prod 2026-09-01: 497 of 1,216 enabled cities had never had a successful scheduled `gsv` run and 506 had only their legacy migrated baseline, so at the then-cap of 20 the never-collected block had ~25 nights left to run — and **until it drains no city gains a second dated interval**, which means `run_diffs`, #101's walk diffs and the run-to-run change summaries this project exists to produce have nothing to compare and never exercise.
+The run history shows it plainly: the batch marched the alphabet, `la*`/`lo*` the week of 2026-08-25 and `ma*`–`mo*` the week of 2026-08-30.
+
+**`[schedule].refresh_slots` reserves a share of the night's city cap for cities that will gain a second interval.**
+Unset it derives `max_cities_per_day // 4` (10 of 40 on prod), so the split follows the cap from one place rather than being a second number to keep in step; an explicit integer overrides, and **`0` restores the pure breadth-first order exactly** — the identity permutation, provable by construction rather than argued, the same property `max_concurrent_channels = 1` keeps for #240.
+A bad value warns and falls back to *deriving*, never to 0, because 0 is meaningful here and a typo must not be indistinguishable from a deliberate policy choice; TOML booleans are Python ints, so `false` is excluded explicitly.
+The promotion is order-preserving in both directions: promoted refreshes keep their stalest-first order and land at the **end** of the window so the night's head stays breadth-first, and the non-refresh cities they displace are the window's **last** ones, kept in relative order immediately after it so they lead tomorrow rather than falling back into the ~900-city tail.
+
+**It cannot refresh a city early, and that property is not the reserve's to keep.**
+Everything it can promote came out of `get_due_cities`, which returns nothing whose last success is under `cycle_days − grace_days` (83 days on prod), so a promoted "refresh" sits at the same staleness wall as every city it displaced — it is competing for a slot, not jumping a cadence.
+A city is counted as a refresh when **any** channel it is due on tonight has a prior success, `any` rather than `all`: a city due on `gsv` (one prior run) and `mapillary` (never) yields one second `gsv` interval, which is exactly the outcome being accumulated, so requiring every channel to have a prior would exclude it for having a newly enabled sibling.
+
+**The bounded opt-in hoist is applied first and the reserve second, into the slots the hoist did not take.**
+The hoist still wins — its cities lead the slate, which is what keeps a paused sweep's five nights *consecutive* and so the only thing that makes #239's checkpointed progress accumulate — but it wins a **bounded prefix** now (#282), which is what makes this order available at all.
+This is the reverse of the order #308 shipped with, and the reversal is a fix rather than a preference.
+`_reserve_refresh_slots` lands its promotions at the **end** of the window and the hoist displaces the window's **last** cities, so reserve-then-hoist evicted precisely what the reserve had just promoted: on the derived pair at prod's cap (10 opt-in + 10 refresh of 40) `refresh_slots` cancelled itself on exactly the nights a KartaView widening made the hoist do anything, while still logging `10 promoted`.
+Hoist-then-reserve gives each reservation its own slots, and at a cap too small to hold both the reserve reports `0 promoted` rather than a promotion the night will not reach.
+
+**So a night's cap is split three ways: at most `opt_in_cities_per_day` opt-in-only cities, then at most `refresh_slots` refreshes in what remains, then pure stalest-first.**
+It is the **sum** of the two reservations that bounds how much of a night the plain queue still governs — 20 of 40 on prod today — so raising either one is a decision about the other, and `test_makelab1_production_config_is_wired` pins the sum for that reason.
+A hoisted city that is itself a refresh is not counted against `refresh_slots`, so a night can exceed it: the key is a floor on second intervals, not a ration of them.
+`cmd_run_due` logs `refresh_slots=N (M promoted)` on its opening line **unconditionally**, unlike the `hoisted=` clause, because the reserve is live by default and its derived value follows `max_cities_per_day`, so which policy a night ran under is not recoverable from the config file alone once either knob has moved.
+
+**The alphabetical tiebreak is also a geographic bias, and that is worth recording even though the ordering did not change.**
+`city_id` embeds country and state, so the all-NULL block is not drained in a random order: a given week's collection is correlated by name, and any interim analysis of "what we have collected so far" inherits that correlation.
+Describe partial coverage accordingly.
+
+**Two knobs moved with it, and neither was measured before (2026-09-02).**
+`max_cities_per_day` 20 → 40: 20 bound only on *light* nights and threw away wall clock the deadline had already granted — 2026-08-30 stopped at 20 cities after **6.77 h** of a 10 h window, while 2026-08-27 hit the deadline at 14 cities and never reached the cap at all (#304).
+`max_batch_hours` is the real governor — it stops starting cities, clamps the in-flight child and still runs the tail — so the cap is now high enough to let it be the only one, and more cities *sequentially* does not raise peak memory (one collection child at a time at `max_concurrent_channels = 1`), leaving #305's `MemoryHigh` headroom untouched.
+`max_batch_hours` 10 → 12: 10 was a "comfortably below `TimeoutStartSec`" figure with nothing behind it, and the real bracket is `TimeoutStopSec` (30 min) < `max_batch_hours` < `TimeoutStartSec` (14 h) less the bounded tail (`PUBLISH_TIMEOUT_S` + `_MEASURED_TAIL_AGGREGATE_S` + `BACKUP_TIMEOUT_S` = 1,635 s ≈ 0.45 h).
+12 clears both with 1.55 h spare and needs **no** change to the systemd unit; past ~13.5 h `TimeoutStartSec` has to move first, and two costs come with it — the publish lands later in the working day, and a longer nightly window is more sustained hours against the per-IP metered hosts, the axis Mapillary's blocks are currently suspected on (`docs/provider-access.md`).
+Note the second-order effect the 12 h batch has on #273's cap arithmetic, recorded above: at 10 h the clock was the smaller of the two ceilings and the budget remainder was unreachable, and at 12 h that has swapped.
 
 ## The subcommand roster, and the production config (added 2026-08-25)
 

@@ -9,12 +9,22 @@
 cycle_days = 90            # re-collect each city ~quarterly
 grace_days = 7
 # Nightly cap; `run-due --limit N` (N >= 1) overrides it for one invocation
-# (issue #214). At 20, a full pass over the enabled cities is ~61 nights.
-max_cities_per_day = 20    # cities/day (a city runs all enabled providers)
+# (issue #214). At 40, a full pass over the enabled cities is ~31 nights.
+#
+# Raised from 20 on 2026-09-02 (#304/#308). 20 was never measured, and it was
+# binding on LIGHT nights only, where it wasted the wall clock the deadline
+# below had already granted: 2026-08-30 stopped at 20 cities after 6.77 h of a
+# 10 h window, while 2026-08-27 hit the deadline at 14 cities and never reached
+# the cap at all. max_batch_hours is the real governor — it stops starting
+# cities, clamps the in-flight child and still runs the tail — so this is now
+# high enough to let it be the only one. More cities SEQUENTIALLY does not
+# raise peak memory (max_concurrent_channels = 1 means one child at a time), so
+# #305's MemoryHigh headroom is untouched by this.
+max_cities_per_day = 40    # cities/day (a city runs all enabled providers)
 
 # Slots reserved out of max_cities_per_day for cities due ONLY on an opt-in
 # channel (issue #282). Unset means "a quarter of the cap, floored at 1" —
-# 5 at the cap above — and the resolution lives in one place,
+# 10 at the cap above — and the resolution lives in one place,
 # scheduler._opt_in_reservation, so a config that sets this and one that does
 # not cannot disagree about what it means.
 #
@@ -31,13 +41,37 @@ max_cities_per_day = 20    # cities/day (a city runs all enabled providers)
 # the enrolled set divided by this figure is how many nights a full pass takes.
 # Setting it equal to max_cities_per_day re-creates the unbounded hoist by hand
 # (the night then warns); 0 switches the promotion off without un-enrolling.
-# opt_in_cities_per_day = 5
+#
+# This and refresh_slots below are the night's TWO reservations, both derived
+# as a quarter of the same cap, and they are applied in that order: the refresh
+# reserve promotes first and the bounded hoist promotes ahead of it. At the
+# derived pair (10 + 10 of 40) half the night is reserved and half stays pure
+# stalest-first — raise either one and check the other, since it is the SUM
+# that bounds how much of a night the plain queue still governs.
+# opt_in_cities_per_day = 10
 max_consecutive_failures = 5
 city_timeout_minutes = 180
 # Stop STARTING cities after this many hours so the aggregate/manifest/publish
 # tail still runs. Must stay below the unit's TimeoutStartSec (14h) — before
 # this existed, a 12h systemd kill discarded a whole night's publish (#167).
-max_batch_hours = 10
+#
+# Raised from 10 to 12 on 2026-09-02. 10 was a "comfortably below 14h" figure
+# with nothing measured behind it; the real bracket is TimeoutStopSec (30 min)
+# < max_batch_hours < TimeoutStartSec (14 h) less the bounded tail (600 + 435 +
+# 600 s = 0.45 h). 12 clears both with 1.55 h spare and needs NO change to the
+# unit. Going past ~13.5 h would require raising TimeoutStartSec first, and
+# costs two things worth naming: the publish lands later in the working day,
+# and a longer nightly window is more sustained hours against the per-IP
+# metered hosts — the axis Mapillary's blocks are currently suspected on
+# (docs/provider-access.md).
+max_batch_hours = 12
+# How many of a capped night's city slots go to cities that will gain a SECOND
+# dated interval (issue #308). Left unset on purpose: it derives
+# max_cities_per_day // 4 (10 of 40 here), so the split follows the cap from
+# one place rather than being a second number to keep in step. Set 0 to go back
+# to pure breadth-first. The reserve cannot refresh a city early — every city
+# it can promote already cleared the cycle_days - grace_days (83 day) wall.
+# refresh_slots = 10
 # Channels of one city, in flight at once (issue #240). Explicit at 1 rather
 # than inherited, because this is the file prod reads and the value is the whole
 # rollout: 1 is today's sequential behaviour. Raising it is deploy-gated on two

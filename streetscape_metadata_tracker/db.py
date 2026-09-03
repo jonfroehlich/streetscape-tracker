@@ -1042,6 +1042,42 @@ def update_city_geometry(
     conn.commit()
 
 
+def append_city_note(conn: sqlite3.Connection, city_id: str, note: str) -> bool:
+    """Append one audit line to ``cities.notes``. Returns True if it was written.
+
+    The same newline-separated convention :func:`update_city_geometry` already
+    uses, extracted because a second writer inventing a second convention is
+    how an audit trail stops being greppable. ``notes`` is where
+    ``scripts/register_frame.py`` records WHY a city is in the catalog, so a
+    batch operation that changes what a city is enrolled in belongs there too
+    (issue #307).
+
+    APPENDS, never overwrites: the prior text is a registration's provenance
+    and losing it is not recoverable from anything else in the row.
+
+    Idempotent on an exact line match, so re-running a batch does not
+    accumulate identical clauses. Exact rather than fuzzy deliberately -- a
+    second enrolment at a DIFFERENT threshold is a different fact and has to
+    show up as a second line, or the row would claim a threshold that no
+    longer describes it.
+
+    Raises KeyError for an unknown city, matching update_city_geometry: a
+    silent zero-row success on an audit write is worse than no audit write.
+    """
+    row = conn.execute("SELECT notes FROM cities WHERE city_id = ?", (city_id,)).fetchone()
+    if row is None:
+        raise KeyError(f"Cannot append a note: unknown city_id '{city_id}'")
+    prior = row["notes"] or ""
+    if note in prior.split("\n"):
+        return False
+    conn.execute(
+        "UPDATE cities SET notes = ? WHERE city_id = ?",
+        (f"{prior}\n{note}" if prior else note, city_id),
+    )
+    conn.commit()
+    return True
+
+
 def add_alias(conn: sqlite3.Connection, alias_slug: str, city_id: str) -> None:
     """Map a legacy filename slug (e.g. 'albany--ny') to a canonical city."""
     conn.execute(
@@ -1789,6 +1825,75 @@ def assign_schedule(conn: sqlite3.Connection, cycle_days: int, providers: tuple 
     return len(cities)
 
 
+def get_due_cities_with_last_success(
+    conn: sqlite3.Connection,
+    *,
+    today: date,
+    cycle_days: int,
+    grace_days: int,
+    max_consecutive_failures: int,
+    default_membership: bool,
+    provider: str = "gsv",
+) -> list[tuple[CityRow, str | None]]:
+    """
+    :func:`get_due_cities`, each row paired with its ``last_success_at``.
+
+    THE query lives here and :func:`get_due_cities` delegates, rather than the
+    other way round or a second SELECT beside it. The dueness clause is four
+    gates that have to agree — ``cities.enabled``, ``COALESCE(s.member, ?)``,
+    the failure quarantine and the staleness threshold — and
+    :func:`count_channel_members`' docstring already records why a second copy
+    of the membership half is the wrong shape: the copy that was forgotten
+    fails open.
+
+    ``last_success_at`` is what separates a city's FIRST collection on this
+    channel from a refresh, which is the distinction
+    ``scheduler._collect_due`` needs to reserve a share of a capped night's
+    slots for cities that will actually gain a second dated interval (issue
+    #308). None means the channel has never succeeded here. Note what the
+    non-None case already guarantees, because the reserve rests on it entirely:
+    every row returned has cleared the staleness gate below, so a "refresh" is
+    never a city collected recently — it is one at least
+    ``cycle_days - grace_days`` days stale, the same wall every other due city
+    cleared.
+
+    The pairing is a tuple rather than a field on ``CityRow`` deliberately:
+    ``CityRow`` mirrors the ``cities`` table and is constructed from ``SELECT
+    c.*`` in several places, so a schedule-state column on it would be a field
+    that is sometimes populated and sometimes not.
+    """
+    threshold = cycle_days - grace_days
+    # `s.member` is deliberately NOT in the SELECT list. Nothing downstream
+    # needs it, and `SELECT c.*` under sqlite3.Row is exactly where a
+    # duplicate column name would be resolved silently and wrongly — the
+    # reason the column is not called `enabled` (see _SCHEMA).
+    rows = conn.execute(
+        """SELECT c.*, s.last_success_at, s.consecutive_failures
+           FROM cities c
+           LEFT JOIN schedule_state s
+             ON s.city_id = c.city_id AND s.provider = ?
+           WHERE c.enabled = 1
+             AND COALESCE(s.member, ?) = 1
+             AND COALESCE(s.consecutive_failures, 0) < ?
+             AND (s.last_success_at IS NULL
+                  OR julianday(?) - julianday(s.last_success_at) >= ?)
+           ORDER BY s.last_success_at ASC NULLS FIRST, c.city_id ASC""",
+        (
+            provider,
+            1 if default_membership else 0,
+            max_consecutive_failures,
+            today.isoformat(),
+            threshold,
+        ),
+    ).fetchall()
+    out = []
+    for row in rows:
+        d = {k: row[k] for k in row.keys() if k not in ("last_success_at", "consecutive_failures")}
+        d["enabled"] = bool(d["enabled"])
+        out.append((CityRow(**d), row["last_success_at"]))
+    return out
+
+
 def get_due_cities(
     conn: sqlite3.Connection,
     *,
@@ -1819,37 +1924,23 @@ def get_due_cities(
     Membership and the ``consecutive_failures`` quarantine are independent
     gates: a non-member never appears here however healthy it is, and a member
     over the failure cap is still quarantined.
+
+    A thin projection of :func:`get_due_cities_with_last_success`, which holds
+    the query. Every caller that does not need to tell a first collection from
+    a refresh keeps this signature and this return type.
     """
-    threshold = cycle_days - grace_days
-    # `s.member` is deliberately NOT in the SELECT list. Nothing downstream
-    # needs it, and `SELECT c.*` under sqlite3.Row is exactly where a
-    # duplicate column name would be resolved silently and wrongly — the
-    # reason the column is not called `enabled` (see _SCHEMA).
-    rows = conn.execute(
-        """SELECT c.*, s.last_success_at, s.consecutive_failures
-           FROM cities c
-           LEFT JOIN schedule_state s
-             ON s.city_id = c.city_id AND s.provider = ?
-           WHERE c.enabled = 1
-             AND COALESCE(s.member, ?) = 1
-             AND COALESCE(s.consecutive_failures, 0) < ?
-             AND (s.last_success_at IS NULL
-                  OR julianday(?) - julianday(s.last_success_at) >= ?)
-           ORDER BY s.last_success_at ASC NULLS FIRST, c.city_id ASC""",
-        (
-            provider,
-            1 if default_membership else 0,
-            max_consecutive_failures,
-            today.isoformat(),
-            threshold,
-        ),
-    ).fetchall()
-    out = []
-    for row in rows:
-        d = {k: row[k] for k in row.keys() if k not in ("last_success_at", "consecutive_failures")}
-        d["enabled"] = bool(d["enabled"])
-        out.append(CityRow(**d))
-    return out
+    return [
+        city
+        for city, _last_success_at in get_due_cities_with_last_success(
+            conn,
+            today=today,
+            cycle_days=cycle_days,
+            grace_days=grace_days,
+            max_consecutive_failures=max_consecutive_failures,
+            default_membership=default_membership,
+            provider=provider,
+        )
+    ]
 
 
 def record_attempt(
