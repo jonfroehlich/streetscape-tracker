@@ -5565,6 +5565,137 @@ def test_a_failed_aggregate_still_backs_up_and_publishes(conn, monkeypatch):
     assert "BrokenPipeError" in alerts[0][1], "the alert must carry the cause, not just the label"
 
 
+def _run_main_run_due_raising(monkeypatch, exc, argv):
+    """Drive `main()`'s run-due dispatch with `cmd_run_due` raising `exc`.
+
+    Returns the alerts `main()` sent, so each caller asserts on the one thing
+    it is about rather than re-stating the four patches that get there.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    monkeypatch.setattr(sched.sys, "argv", argv)
+    monkeypatch.setattr(sched, "load_scheduler_config", lambda path: _publishing_cfg())
+    monkeypatch.setattr(sched, "setup_logging", lambda cfg, verbose=False: None)
+
+    def boom(cfg, dry_run=False, limit=None, requested_providers=None):
+        raise exc
+
+    monkeypatch.setattr(sched, "cmd_run_due", boom)
+
+    alerts = []
+    monkeypatch.setattr(sched, "send_alert", lambda cfg, subj, body: alerts.append((subj, body)))
+    return sched, alerts
+
+
+def test_main_run_due_dry_run_broken_pipe_does_not_alert(monkeypatch):
+    """A BrokenPipeError that escapes a `--dry-run` `cmd_run_due` means the
+    reader on our stdout went away -- a preview piped into `head`, or a dropped
+    SSH session -- and a preview collects nothing, so nothing was lost.
+    2026-09-02 21:10 PDT: exactly this fired a "run-due CRASHED" alert email for
+    a bare BrokenPipeError out of the dry-run preview's own `print()`.
+    `main()`'s run-due dispatch must special-case it: no alert, but still a
+    nonzero exit so a script piping run-due sees failure.
+    """
+    sched, alerts = _run_main_run_due_raising(
+        monkeypatch, BrokenPipeError(32, "Broken pipe"), ["scheduler", "run-due", "--dry-run"]
+    )
+
+    # The ORDER is the point, not just that both happen: neutralizing after the
+    # warning leaves handleError's "--- Logging error ---" traceback on the
+    # operator's stderr, which is the noise this branch exists to replace. See
+    # test_neutralize_broken_streams_makes_a_dead_stdout_writable.
+    order = []
+    monkeypatch.setattr(sched, "_neutralize_broken_streams", lambda: order.append("neutralize"))
+    monkeypatch.setattr(sched.logger, "warning", lambda *a, **kw: order.append("warn"))
+
+    rc = sched.main()
+
+    assert rc == 1, "still nonzero so a wrapper piping run-due sees failure"
+    assert alerts == [], "a dead stdout reader on a preview is not a scheduler crash"
+    assert order == ["neutralize", "warn"], "the dead stream must be silenced BEFORE we log"
+
+
+def test_main_run_due_broken_pipe_on_a_real_night_still_alerts(monkeypatch):
+    """The carve-out is scoped to --dry-run, and this is the half that says why.
+
+    On a real night the exceptions reaching this handler are the ones the tail's
+    per-component isolation did NOT already convert into a scoped alert -- the
+    pre-flight backup, the driving-plan fetch, the tail backup, _finish_batch's
+    own body. A BrokenPipeError there is a night that collected and did not
+    publish (the 2026-08-17 incident), and the email is the only way an operator
+    learns of it. The supported manual catch-up
+    (`run-due --provider mapillary --limit 40`) runs over SSH, so the
+    dropped-session trigger is not dry-run-only.
+    """
+    sched, alerts = _run_main_run_due_raising(
+        monkeypatch, BrokenPipeError(32, "Broken pipe"), ["scheduler", "run-due", "--limit", "5"]
+    )
+
+    with pytest.raises(BrokenPipeError):
+        sched.main()
+
+    assert len(alerts) == 1, "a real night's broken pipe must still page the operator"
+    assert "run-due CRASHED" in alerts[0][0]
+    assert "BrokenPipeError" in alerts[0][1], "the alert must carry the cause, not just the label"
+
+
+def test_neutralize_broken_streams_makes_a_dead_stdout_writable(monkeypatch):
+    """`main()`'s broken-pipe branch logs a warning, and logging to a broken
+    stdout does not raise -- StreamHandler routes the failure to handleError --
+    but handleError then writes "--- Logging error ---" and the whole traceback
+    to stderr, which under `run-due --dry-run | head` is still the operator's
+    live terminal. So the warning would arrive with the traceback it exists to
+    replace stapled to it unless the dead stream is neutralized FIRST.
+
+    Pinned with a real pipe whose reader is closed, not a fake stream: the whole
+    mechanism is the dup2 onto a real fd, which a stand-in object cannot have.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    read_fd, write_fd = os.pipe()
+    os.close(read_fd)
+    dead = os.fdopen(write_fd, "w")
+    try:
+        # Deliberately small and newline-free, so it stays in the TextIOWrapper's
+        # buffer and the flush below is what discovers EPIPE. A write large
+        # enough to overflow that buffer (or the ~64 KiB pipe) raises inside
+        # `write` on Linux and not on macOS, which is a platform difference the
+        # test has no business depending on.
+        dead.write("still buffered, never written")
+        monkeypatch.setattr(sched.sys, "stdout", dead)
+
+        with pytest.raises(BrokenPipeError):
+            dead.flush()
+
+        sched._neutralize_broken_streams()
+
+        dead.write("this must reach /dev/null without raising")
+        dead.flush()
+    finally:
+        with contextlib.suppress(Exception):
+            dead.close()
+
+
+def test_main_run_due_other_exception_still_alerts_and_raises(monkeypatch):
+    """The BrokenPipeError carve-out above must stay narrow in the other axis
+    too: any other exception escaping `cmd_run_due` is still a genuine crash
+    and must keep emailing the traceback and propagating, --dry-run included --
+    hence the flag here, so the type test and the dry-run test are both load
+    bearing."""
+    sched, alerts = _run_main_run_due_raising(
+        monkeypatch,
+        RuntimeError("something actually broke"),
+        ["scheduler", "run-due", "--dry-run"],
+    )
+
+    with pytest.raises(RuntimeError, match="something actually broke"):
+        sched.main()
+
+    assert len(alerts) == 1
+    assert "run-due CRASHED" in alerts[0][0]
+    assert "something actually broke" in alerts[0][1]
+
+
 def test_backup_failure_alerts_even_below_the_failure_threshold(conn, monkeypatch):
     """The collection-failure threshold exists so one flaky city doesn't page
     every night. Backups get no such grace: there is no such thing as an

@@ -6541,7 +6541,47 @@ def main() -> int:
                 limit=args.limit,
                 requested_providers=args.providers,
             )
-        except Exception:
+        except Exception as exc:
+            # A DRY RUN whose stdout reader went away is the one crash here
+            # that is not a crash — the reader vanished mid-`print` (a preview
+            # piped into `head`, or a dropped SSH session), and a preview
+            # collects nothing, so nothing was lost. The nightly can't reach
+            # this at all: its stdout is a file (StandardOutput=append: in
+            # deploy/systemd/streetscape-tracker.service), which has no reader
+            # to disappear, so a broken pipe is by construction a manual
+            # invocation. 2026-09-02 21:10 PDT it emailed a "run-due CRASHED"
+            # alert for a bare BrokenPipeError out of the preview's own print.
+            #
+            # Scoped to --dry-run deliberately, and not widened to every
+            # BrokenPipeError out of run-due: on a REAL night the exceptions
+            # that reach this handler are the ones the tail's per-component
+            # isolation did NOT already convert into a scoped alert (see
+            # _tail_artifact) — the pre-flight backup, the driving-plan fetch,
+            # the tail backup, _finish_batch's own body. A broken pipe there is
+            # a night that collected and did not publish, which is the
+            # 2026-08-17 incident exactly, and the email is the only way an
+            # operator learns of it. The supported manual catch-up runs over
+            # SSH too, so the dropped-session trigger is not dry-run-only.
+            #
+            # One handler dispatching on the type rather than two `except`
+            # clauses: a `raise` from inside `except BrokenPipeError` is not
+            # caught by a sibling `except Exception`, so the narrow spelling
+            # would drop the alert in precisely the case it exists to keep.
+            if args.dry_run and isinstance(exc, BrokenPipeError):
+                # Point the dead stream at /dev/null BEFORE logging. Logging
+                # to a broken stdout does not raise — StreamHandler routes the
+                # failure to handleError — but handleError is not quiet: it
+                # writes "--- Logging error ---" and the whole traceback to
+                # stderr, which under `| head` is still the operator's
+                # terminal. Neutralizing first is what makes this one clean
+                # line instead of the traceback it replaces.
+                _neutralize_broken_streams()
+                logger.warning(
+                    "run-due --dry-run: stdout reader went away (broken pipe) — "
+                    "no collection was attempted, so no alert sent."
+                )
+                # Nonzero anyway, so a script piping run-due sees failure.
+                return 1
             # A crash (not just a failed city) — email the traceback before the
             # process dies, so a silent nightly failure can't go unnoticed.
             send_alert(
@@ -6555,6 +6595,46 @@ def main() -> int:
     # 2 has a malformed command line, while 64 means the command line parsed and
     # run-due rejected an argument's value.
     return 2
+
+
+def _neutralize_broken_streams() -> None:
+    """Flush the std streams, pointing any whose reader has gone away at /dev/null.
+
+    Two callers want the same thing for different reasons, which is why this is
+    a helper rather than four lines inside ``_exit``:
+
+    * ``_exit``, so CPython's finalization flush finds nothing to write and
+      cannot replace our exit status with 120 — see there for the full story.
+    * ``main``'s ``run-due`` broken-pipe branch, so the warning it logs next
+      does not come out as a ``--- Logging error ---`` traceback on stderr.
+      Logging to a broken stdout does not raise (``StreamHandler.emit`` sends
+      the failure to ``handleError``), but ``handleError`` writes the traceback
+      and the call stack to stderr, which under ``run-due | head`` is still a
+      live terminal — so without this the clean one-line warning arrives with
+      the traceback it was meant to replace stapled to it.
+
+    Idempotent: a stream already pointing at /dev/null flushes fine and is left
+    alone, so the second call from ``_exit`` costs nothing.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        if stream is None:
+            continue  # a detached interpreter has no stream to flush
+        try:
+            stream.flush()
+        except (BrokenPipeError, ValueError, OSError):
+            # ValueError covers an already-closed stream; OSError catches the
+            # rest of the EPIPE/EBADF family. A stream we cannot even take a
+            # fileno() from (pytest capture, an embedded interpreter) has no
+            # fd to redirect and no finalization flush to break.
+            with contextlib.suppress(Exception):
+                fd = os.open(os.devnull, os.O_WRONLY)
+                try:
+                    os.dup2(fd, stream.fileno())
+                finally:
+                    # Closed rather than leaked: harmless when the very next
+                    # statement is sys.exit, not when main() calls this and
+                    # then goes on to run a whole tail.
+                    os.close(fd)
 
 
 def _exit(rc: int) -> None:
@@ -6575,18 +6655,7 @@ def _exit(rc: int) -> None:
 
     Both streams, not just stdout: finalization flushes both.
     """
-    for stream in (sys.stdout, sys.stderr):
-        if stream is None:
-            continue  # a detached interpreter has no stream to flush
-        try:
-            stream.flush()
-        except (BrokenPipeError, ValueError, OSError):
-            # ValueError covers an already-closed stream; OSError catches the
-            # rest of the EPIPE/EBADF family. A stream we cannot even take a
-            # fileno() from (pytest capture, an embedded interpreter) has no
-            # fd to redirect and no finalization flush to break.
-            with contextlib.suppress(Exception):
-                os.dup2(os.open(os.devnull, os.O_WRONLY), stream.fileno())
+    _neutralize_broken_streams()
     sys.exit(rc)
 
 
