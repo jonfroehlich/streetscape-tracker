@@ -318,6 +318,28 @@ Both KartaView channels share one machine-wide `host_lock(HOST_KARTAVIEW)`, so t
 A redirect, an HTML body or a 429 is a `HostBlockedError` at the **first** request (exit 81); 401/403 stays a plain `DownloadError` scoped to the credential.
 Widening the enrolled set is a volume change under the top-of-file rule and is therefore staged in tranches with a stop condition, not switched on catalog-wide (issue #282 and the rollout it gates).
 
+## Panoramax documents no limit at all, but is the one locked host with a staffed community (surveyed 2026-09-04, issue #316)
+
+Panoramax is not a collection channel and may never become one — this section exists because the top-of-file rule is about *before*, and phase 1 of [#316](https://github.com/jonfroehlich/streetscape-tracker/issues/316) put read-only traffic on the host.
+It records what was found before that traffic, and what paced it.
+
+**Nothing is documented.** No rate limit appears in the API documentation, in the OpenAPI spec at `https://api.panoramax.xyz/openapi.json`, or in any third-party restatement found.
+A read-only probe returned **no `X-RateLimit-*` header, no `Retry-After`, and no `Retry-After`-adjacent hint of any kind**, so a client cannot read its own remaining budget any more than it can on KartaView.
+Per the standing rule that is **unknown, not unlimited**.
+
+**Unlike KartaView, the second half of the rule has an object.** [forum.geocommuns.fr](https://forum.geocommuns.fr) and the [OSM community forum](https://community.openstreetmap.org/) both carry Panoramax traffic answered by core developers within days.
+That is a materially better access position than KartaView's empty room, and it means **the pacing question can be asked rather than inferred** — which is the intended first step of phase 2 and has not been taken yet.
+Two questions belong in that post: what sustained rate the meta-catalog is comfortable with, and whether a picture's identity survives a sequence being migrated between instances.
+The second one is not a courtesy question: there is active work on inter-instance migration, and if an id can change under a move then "removed" in a run-to-run diff can mean "moved", which would corrupt the one statistic this project exists to produce.
+
+**What the phase-1 study paced at, and why.** 30 requests/minute with jittered gaps at CV 0.6 — the same shifted-exponential shape [#292](https://github.com/jonfroehlich/streetscape-tracker/issues/292) put on the Mapillary channels, imported from `download_common.spaced_gap_seconds` rather than re-derived, so the two cannot drift into different distributions.
+That is roughly half the Mapillary channels' configured rate against a host with strictly less published guidance, which is the intended direction of the asymmetry.
+The probe calls `refuse_on_collection_host()`, so it can only run from a laptop: a per-IP limit found from makelab2 takes out the nightly batch, and both prior bans landed exactly that way.
+It treats **403 and 429 as stop, never as retry** — a refusal ends the run with what it has measured, since finding this host's limit is emphatically not the study's question.
+
+**One host, not twenty-five.** `api.panoramax.xyz` is a meta-catalog that harvests metadata from every registered instance (23 on 2026-09-04), so a collector would query one host regardless of how many instances join — one `host_lock.py` entry, no per-instance fan-out, and no per-instance rate question.
+The corollary is that all of our load lands on one volunteer-run endpoint rather than being spread across the federation, which argues for the conservative end of any pacing range rather than against it.
+
 ## Overpass is a per-IP volunteer service, and the fetch is hardened accordingly (issue #209)
 
 **Overpass is a per-IP volunteer service, and the fetch is hardened accordingly (issue #209).** It is on the critical path for essentially every road walk
