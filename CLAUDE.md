@@ -260,6 +260,7 @@ Keep any list a doc enumerates **alphabetical**, so two branches adding an entry
   - `kartaview-feasibility.md`
   - `kartaview-sweep-cost.md`
   - `pano-spacing.md`
+  - `panoramax-feasibility.md`
   - `publish-duration.md`
   - `undated-imagery-share.md`
 

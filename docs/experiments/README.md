@@ -58,6 +58,15 @@ Quote `sweep_requests_observed` and not `sweep_requests_estimate`: the latter is
 GSV vs Mapillary capture interval — Mapillary samples 1.4–3.5× finer, and **any per-pano analysis must group by `sequence_id` first**: pooling across contributors collapses the measured interval by 2–8× because the nearest image is usually someone else's drive.
 GSV publishes no drive identifier, so the same correction is impossible there — which makes Mapillary's number the better-founded one, the opposite of the intuition.
 
+### `panoramax-feasibility.md`
+
+Issue #316 phase 1 — is there Panoramax imagery in the cities we track, which is the one question that decides whether a fourth provider is worth a channel.
+Three things generalize beyond Panoramax.
+**(1) Probe the instrument before you design around it.** The issue specified the federated `/api/search`; it does not paginate and reports no match count, so a bbox with more pictures than `limit` is indistinguishable from one holding exactly `limit` — the one distinction a coverage study is made of. The map tiles answer the same question exactly, and cheaper.
+**(2) A cheap instrument that can only PROVE ABSENCE is worth more than an expensive one that measures everything**, because it changes the population you can speak about: 113 z6 requests screen all 1,144 enabled cities, so the gate is answered over the whole catalog rather than over the stratified sample the issue asked for. The asymmetry is the product — a 0.1° cell is ~80 km² against a 19.5 km² median city, so a positive bound means "look closer" and only a zero is conclusive — and it is only sound if the zeros are checked, which is what the control group is for.
+**(3) A safety margin has to be applied at every stage that can drop data, not only the obvious one.** The screen's one-cell margin was applied where cells are filtered and not where tiles are chosen, so it silently vanished at z6 tile seams for 108 of 1,144 cities — 49 of them screened zero, i.e. precisely where the study's central claim would then have rested on cells nobody fetched.
+Also worth knowing before reading a 360-vs-flat share off any Panoramax endpoint: the tile layers' `type` field has no absent state, while the search response's EXIF `field_of_view` is missing for a large minority of pictures, so "field absent" is a property of the instrument rather than a third kind of imagery.
+
 ### `publish-duration.md`
 
 Issues #218/#230 — how long the nightly publish actually takes, so `scheduler.PUBLISH_TIMEOUT_S` is sized rather than guessed;

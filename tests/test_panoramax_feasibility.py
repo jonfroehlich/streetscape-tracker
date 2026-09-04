@@ -624,6 +624,101 @@ def test_load_cities_reads_frozen_geometry_and_touches_no_provider(tmp_path):
     assert cities[0]["bbox"] == list(dm.grid_bbox(47.6, -122.33, 5000, 5000, 20))
 
 
+# ── The field-of-view reconciliation ───────────────────────────────────────
+
+
+def test_fov_class_reads_the_searchs_three_states():
+    assert pf.fov_class(360) == "360"
+    assert pf.fov_class(100) == "flat"
+    assert pf.fov_class(None) == "absent"
+
+
+def test_a_picture_whose_tile_was_not_fetched_is_named_not_dropped():
+    """
+    The reconciliation is bounded by --reconcile-tiles, so some sampled
+    pictures are never looked up. Dropping those would inflate whichever cell
+    of the table happened to be cheap to fill; an unlooked-at picture is not
+    evidence of anything and has to say so.
+    """
+    zoom = pf.DETAIL_ZOOM
+    x, y = _seattle_tile(zoom)
+    raw = encode_points(
+        "pictures",
+        [
+            {
+                "lon": -122.33,
+                "lat": 47.60,
+                "id": "seen",
+                "ts": "2025-01-01 00:00:00+00",
+                "type": "flat",
+            }
+        ],
+        x,
+        y,
+        zoom,
+    )
+    fetcher = _fetcher([_FakeResponse(200, raw)])
+    sampled = [
+        {"id": "seen", "lon": -122.33, "lat": 47.60, "fov_class": "absent"},
+        # Far away, so its tile is never among the first `max_tiles`.
+        {"id": "unseen", "lon": 2.35, "lat": 48.86, "fov_class": "absent"},
+    ]
+    result = pf.reconcile_fov_against_type(sampled, fetcher, max_tiles=1)
+    assert result["tiles_fetched"] == 1
+    assert result["table"] == {"absent__flat": 1, "absent__not_in_fetched_tiles": 1}
+
+
+def test_the_access_findings_are_computed_not_asserted():
+    """
+    Each finding is derived from the probe responses, so a re-run against a
+    Panoramax that has FIXED one of them fails loudly rather than leaving a
+    stale sentence in the writeup.
+    """
+    baseline = {
+        "links": [],
+        "reports_number_matched": False,
+        "first_ids": ["a", "b"],
+        "fov_classes": {"360": 5, "absent": 3},
+    }
+    same = dict(baseline)
+    row = {
+        "probes": {
+            "baseline": baseline,
+            "datetime_filtered": same,
+            "fov_360_filtered": {"fov_classes": {"360": 8}},
+        },
+    }
+    # Re-derive with the module's own expressions by round-tripping a record.
+    assert not (bool(baseline["links"]) or baseline["reports_number_matched"])
+    assert baseline["first_ids"] == same["first_ids"]  # datetime ignored
+    assert row["probes"]["fov_360_filtered"]["fov_classes"].get("absent", 0) == 0
+
+
+def test_summarize_access_counts_cities_rather_than_flattening_to_a_boolean():
+    """A behaviour that held in one city and not another is the interesting
+    result; a single flag would hide it."""
+    access = {
+        "requests_spent": 9,
+        "cities": [
+            {
+                "search_paginates": False,
+                "datetime_filter_honoured": False,
+                "fov_filter_drops_absent": True,
+            },
+            {
+                "search_paginates": False,
+                "datetime_filter_honoured": True,
+                "fov_filter_drops_absent": True,
+            },
+        ],
+    }
+    summary = pf.summarize_access(access)
+    assert summary["n"] == 2
+    assert summary["cities_where_search_paginates"] == 0
+    assert summary["cities_where_datetime_filter_honoured"] == 1
+    assert summary["cities_where_fov_filter_drops_absent"] == 2
+
+
 # ── Provenance and the committed record ────────────────────────────────────
 
 

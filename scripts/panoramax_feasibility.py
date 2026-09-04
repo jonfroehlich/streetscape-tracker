@@ -103,6 +103,7 @@ from streetscape_metadata_tracker.download_common import (  # noqa: E402
     spaced_gap_seconds,
 )
 from streetscape_metadata_tracker.download_mapillary import (  # noqa: E402
+    lonlat_to_tile_frac,
     tile_frac_to_lonlat,
     tiles_for_bbox,
 )
@@ -121,6 +122,7 @@ MAP_V1_URL = API_BASE + "/map/{z}/{x}/{y}.mvt"
 MAP_V2_URL = API_BASE + "/map/2/{z}/{x}/{y}.mvt"
 SEARCH_URL = API_BASE + "/search"
 INSTANCES_URL = API_BASE + "/instances"
+STATS_URL = API_BASE + "/stats"
 
 # The three instruments, pinned as constants because each zoom is the ONLY one
 # that serves its layer -- these are not tunables. z6 is the finest zoom with a
@@ -159,6 +161,16 @@ DEFAULT_CONTROLS = 20
 DEFAULT_DETAIL_CITIES = 12
 DEFAULT_MAX_TILES_PER_CITY = 200
 DEFAULT_SEARCH_LIMIT = 500
+# z15 tiles fetched per city to type the search sample's pictures. Four is
+# enough to cover a contributor-concentrated sample and keeps the whole
+# reconciliation under one city's measure cost.
+DEFAULT_RECONCILE_TILES = 4
+
+# The access probe's own constants. The datetime window is deliberately in the
+# FUTURE relative to the imagery it is aimed at, so "honoured" and "ignored"
+# give visibly different answers rather than merely different counts.
+ACCESS_PROBE_LIMIT = 300
+ACCESS_PROBE_DATETIME = "2026-01-01T00:00:00Z/.."
 DEFAULT_TIMEOUT_S = 60
 
 DOCS_RECORD_NOTE = (
@@ -841,17 +853,146 @@ def detail_city(
     }
 
 
-def instances_city(city: dict[str, Any], fetcher: Fetcher, search_limit: int) -> dict[str, Any]:
+def stage_access(city: dict[str, Any], fetcher: Fetcher) -> dict[str, Any]:
     """
-    A bounded /api/search sample of one city, for instance attribution.
+    Pin the three /api/search behaviours that phase 2 would design around.
+
+    Each is a claim this study makes in prose, and prose is not evidence -- so
+    each gets a recorded response rather than a sentence. All three are the
+    silent kind of failure, which is the only reason they are worth four
+    requests:
+
+      * PAGINATION. If `links` is empty at every limit and no match count is
+        reported, a bbox with more pictures than `limit` is indistinguishable
+        from one holding exactly `limit`. A collector built on search would
+        report a ceiling as a measurement.
+      * THE `datetime` PARAMETER IS IGNORED. Not rejected, not empty -- the
+        SAME rows come back. An incremental "everything since last run" fetch
+        would silently re-read the whole history and report it as new.
+      * `filter=field_of_view=360` DROPS THE EXIF-LESS PICTURES rather than
+        treating them as unknown, so a 360-only search filter discards imagery
+        the tile layer classifies perfectly well.
+    """
+    min_lon, min_lat, max_lon, max_lat = city["bbox"]
+    bbox = f"{min_lon},{min_lat},{max_lon},{max_lat}"
+    probes = {}
+
+    def search(label, params):
+        response = fetcher.get(SEARCH_URL, params={"bbox": bbox, **params})
+        payload = response.json()
+        features = payload.get("features", [])
+        classes = Counter(
+            fov_class(
+                (f.get("properties", {}).get("pers:interior_orientation") or {}).get(
+                    "field_of_view"
+                )
+            )
+            for f in features
+        )
+        stamps = sorted(
+            f.get("properties", {}).get("datetime")
+            for f in features
+            if f.get("properties", {}).get("datetime")
+        )
+        probes[label] = {
+            "params": params,
+            "status": response.status_code,
+            "response_bytes": len(response.content),
+            "features": len(features),
+            "links": payload.get("links"),
+            "reports_number_matched": "numberMatched" in payload,
+            "fov_classes": dict(sorted(classes.items())),
+            "datetime_span": [stamps[0], stamps[-1]] if stamps else None,
+            "first_ids": [f.get("id") for f in features[:5]],
+        }
+
+    search("baseline", {"limit": ACCESS_PROBE_LIMIT})
+    search("datetime_filtered", {"limit": ACCESS_PROBE_LIMIT, "datetime": ACCESS_PROBE_DATETIME})
+    search("fov_360_filtered", {"limit": ACCESS_PROBE_LIMIT, "filter": "field_of_view=360"})
+
+    baseline, filtered = probes["baseline"], probes["datetime_filtered"]
+    return {
+        "city_id": city["city_id"],
+        "display_name": city["display_name"],
+        "probes": probes,
+        # The findings, computed rather than asserted, so a future re-run that
+        # finds Panoramax has FIXED any of these fails loudly instead of
+        # leaving three stale sentences in the writeup.
+        "search_paginates": bool(baseline["links"]) or baseline["reports_number_matched"],
+        "datetime_filter_honoured": baseline["first_ids"] != filtered["first_ids"],
+        "fov_filter_drops_absent": probes["fov_360_filtered"]["fov_classes"].get("absent", 0) == 0
+        and baseline["fov_classes"].get("absent", 0) > 0,
+    }
+
+
+def reconcile_fov_against_type(
+    sampled: list[dict[str, Any]], fetcher: Fetcher, max_tiles: int
+) -> dict[str, Any]:
+    """
+    Cross-tabulate each sampled picture's SEARCH field of view against the same
+    picture's TILE type, by looking it up in the z15 pictures layer.
+
+    This is the measurement that decides what #116 stratification means for
+    Panoramax, and it has to be per picture rather than per total. The tile
+    layer's federation-wide counts already show it never leaves a picture
+    unclassified, but "the totals add up" cannot tell you WHICH class an
+    EXIF-less picture lands in -- and #316 assumed the answer was "a third one".
+
+    Tiles are chosen by picture position, capped at `max_tiles`, and a picture
+    whose tile was not fetched is reported as `not_in_fetched_tiles` rather
+    than dropped: an unlooked-at picture is not evidence of anything, and
+    silently omitting it would inflate whichever cell of the table happened to
+    be cheap to fill.
+    """
+    wanted: dict[tuple[int, int], None] = {}
+    for picture in sampled:
+        x, y = _tile_xy(picture["lon"], picture["lat"], DETAIL_ZOOM)
+        if len(wanted) < max_tiles or (x, y) in wanted:
+            wanted[(x, y)] = None
+    types: dict[str, Any] = {}
+    for x, y in wanted:
+        raw = fetcher.get_tile(MAP_V1_URL, DETAIL_ZOOM, x, y)
+        for picture in pictures_from_tile(raw, x, y, DETAIL_ZOOM):
+            types[picture["id"]] = picture["type"]
+
+    table = Counter()
+    for picture in sampled:
+        tile_type = types.get(picture["id"], "not_in_fetched_tiles")
+        table[f"{picture['fov_class']}__{tile_type}"] += 1
+    return {
+        "tiles_fetched": len(wanted),
+        "sampled": len(sampled),
+        "table": dict(sorted(table.items())),
+    }
+
+
+def _tile_xy(lon: float, lat: float, zoom: int) -> tuple[int, int]:
+    """The (x, y) tile a point falls in. Thin wrapper over the shared math."""
+    fx, fy = lonlat_to_tile_frac(lon, lat, zoom)
+    return int(fx), int(fy)
+
+
+def fov_class(field_of_view: Any) -> str:
+    """`360`, `flat` or `absent` -- the SEARCH response's three-state reading."""
+    if field_of_view is None:
+        return "absent"
+    return "360" if field_of_view >= 360 else "flat"
+
+
+def instances_city(
+    city: dict[str, Any], fetcher: Fetcher, search_limit: int, reconcile_tiles: int
+) -> dict[str, Any]:
+    """
+    A bounded /api/search sample of one city, for instance attribution and for
+    the field-of-view reconciliation.
 
     This is a SAMPLE and can never be anything else: /api/search does not
     paginate and reports no match count, so `sampled` is capped at
     `search_limit` by construction and a city at the cap has an unknown
     remainder. It buys two things the tiles cannot: the `via` link naming the
     source instance, and `pers:interior_orientation.field_of_view`, whose
-    absent rate here is what shows that "field of view absent" is a property of
-    this endpoint's EXIF passthrough rather than of the imagery.
+    absent rate here is what shows "absent" is a property of this endpoint's
+    EXIF passthrough rather than of the imagery.
     """
     min_lon, min_lat, max_lon, max_lat = city["bbox"]
     response = fetcher.get(
@@ -861,7 +1002,8 @@ def instances_city(city: dict[str, Any], fetcher: Fetcher, search_limit: int) ->
     features = response.json().get("features", [])
     instances = Counter()
     producers = Counter()
-    fov_absent = fov_360 = fov_flat = 0
+    fov_counts = Counter()
+    sampled = []
     for feature in features:
         for link in feature.get("links", []):
             if link.get("rel") == "via":
@@ -870,13 +1012,19 @@ def instances_city(city: dict[str, Any], fetcher: Fetcher, search_limit: int) ->
         properties = feature.get("properties", {})
         producers[properties.get("geovisio:producer")] += 1
         orientation = properties.get("pers:interior_orientation") or {}
-        field_of_view = orientation.get("field_of_view")
-        if field_of_view is None:
-            fov_absent += 1
-        elif field_of_view >= 360:
-            fov_360 += 1
-        else:
-            fov_flat += 1
+        klass = fov_class(orientation.get("field_of_view"))
+        fov_counts[klass] += 1
+        coordinates = (feature.get("geometry") or {}).get("coordinates")
+        if feature.get("id") and coordinates:
+            sampled.append(
+                {
+                    "id": str(feature["id"]),
+                    "lon": coordinates[0],
+                    "lat": coordinates[1],
+                    "fov_class": klass,
+                }
+            )
+
     return {
         "city_id": city["city_id"],
         "display_name": city["display_name"],
@@ -884,28 +1032,44 @@ def instances_city(city: dict[str, Any], fetcher: Fetcher, search_limit: int) ->
         "at_search_limit": len(features) >= search_limit,
         "instances": dict(instances.most_common()),
         "producers": dict(producers.most_common(5)),
-        "fov_360": fov_360,
-        "fov_flat": fov_flat,
-        "fov_absent": fov_absent,
+        "fov_360": fov_counts["360"],
+        "fov_flat": fov_counts["flat"],
+        "fov_absent": fov_counts["absent"],
+        "reconciliation": reconcile_fov_against_type(sampled, fetcher, reconcile_tiles),
         "response_bytes": len(response.content),
     }
 
 
 def federation_snapshot(fetcher: Fetcher) -> dict[str, Any]:
-    """One request: the registered instances and when each was last harvested."""
+    """
+    Two requests: the registered instances, and the federation's own totals.
+
+    ``/api/stats`` is not advertised in the API root's link list -- it was found
+    by a parallel study, not by enumerating the catalog -- and it is strictly
+    better than deriving totals from a z0 tile: one small response instead of a
+    1.9 MB one, and it carries per-instance contributor counts and captured
+    kilometres that no tile layer exposes.
+    """
     instances = fetcher.get(INSTANCES_URL).json().get("instances", [])
+    stats = fetcher.get(STATS_URL).json()
+    by_instance = stats.get("stats_by_instance", {})
     return {
         "registered_instances": len(instances),
+        "generic_stats": stats.get("generic_stats"),
         "instances": sorted(
             (
                 {
                     "name": instance.get("name"),
                     "url": instance.get("url"),
                     "last_successful_harvest": instance.get("last_succesful_harvest"),
+                    "nb_pictures": (by_instance.get(instance.get("name")) or {}).get("nb_pictures"),
+                    "nb_contributors": (by_instance.get(instance.get("name")) or {}).get(
+                        "nb_contributors"
+                    ),
                 }
                 for instance in instances
             ),
-            key=lambda i: i["name"] or "",
+            key=lambda i: (-(i["nb_pictures"] or 0), i["name"] or ""),
         ),
     }
 
@@ -982,8 +1146,11 @@ def measured_by(args: argparse.Namespace, stage: str) -> str:
         parts += ["--max-tiles-per-city", str(args.max_tiles_per_city)]
     if stage == "detail" and args.detail_cities != DEFAULT_DETAIL_CITIES:
         parts += ["--detail-cities", str(args.detail_cities)]
-    if stage == "instances" and args.search_limit != DEFAULT_SEARCH_LIMIT:
-        parts += ["--search-limit", str(args.search_limit)]
+    if stage == "instances":
+        if args.search_limit != DEFAULT_SEARCH_LIMIT:
+            parts += ["--search-limit", str(args.search_limit)]
+        if args.reconcile_tiles != DEFAULT_RECONCILE_TILES:
+            parts += ["--reconcile-tiles", str(args.reconcile_tiles)]
     return " ".join(parts)
 
 
@@ -1136,6 +1303,28 @@ def cross_check(measure: dict[str, Any] | None, detail: dict[str, Any] | None):
     }
 
 
+def summarize_access(access: dict[str, Any]) -> dict[str, Any]:
+    """
+    The three search behaviours, as an agreement count across cities.
+
+    Reported as "N of M cities" rather than a bare boolean because a behaviour
+    that held in one city and not another would be the interesting result, and
+    a single flag would hide it.
+    """
+    rows = access["cities"]
+    return {
+        "n": len(rows),
+        "cities_where_search_paginates": sum(1 for r in rows if r["search_paginates"]),
+        "cities_where_datetime_filter_honoured": sum(
+            1 for r in rows if r["datetime_filter_honoured"]
+        ),
+        "cities_where_fov_filter_drops_absent": sum(
+            1 for r in rows if r["fov_filter_drops_absent"]
+        ),
+        "requests_spent": access["requests_spent"],
+    }
+
+
 def build_record(args: argparse.Namespace) -> dict[str, Any]:
     """
     Merge whatever stages have been run into the committed metrics record.
@@ -1148,6 +1337,7 @@ def build_record(args: argparse.Namespace) -> dict[str, Any]:
     measure = read_raw(args.raw_dir, "measure")
     detail = read_raw(args.raw_dir, "detail")
     instances = read_raw(args.raw_dir, "instances")
+    access = read_raw(args.raw_dir, "access")
 
     about = {
         "experiment": TOPIC,
@@ -1168,6 +1358,7 @@ def build_record(args: argparse.Namespace) -> dict[str, Any]:
                 ("measure", measure),
                 ("detail", detail),
                 ("instances", instances),
+                ("access", access),
             )
             if raw is not None
         },
@@ -1186,6 +1377,7 @@ def build_record(args: argparse.Namespace) -> dict[str, Any]:
         "measure": block(measure, summarize_measure, "measure"),
         "detail": block(detail, summarize_detail, "detail"),
         "instances": block(instances, summarize_instances, "instances"),
+        "access": block(access, summarize_access, "access"),
         "cross_check": cross_check(measure, detail),
     }
 
@@ -1210,7 +1402,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--stage",
-        choices=("screen", "measure", "detail", "instances"),
+        choices=("screen", "measure", "detail", "instances", "access"),
         help="which measurement to run; omit with --analyze to work offline",
     )
     parser.add_argument("--analyze", action="store_true", help="rebuild the committed record")
@@ -1232,6 +1424,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--detail-cities", type=int, default=DEFAULT_DETAIL_CITIES)
     parser.add_argument("--max-tiles-per-city", type=int, default=DEFAULT_MAX_TILES_PER_CITY)
     parser.add_argument("--search-limit", type=int, default=DEFAULT_SEARCH_LIMIT)
+    parser.add_argument("--reconcile-tiles", type=int, default=DEFAULT_RECONCILE_TILES)
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_S)
     parser.add_argument(
         "--city", action="append", help="override the stage's city set (repeatable)"
@@ -1379,12 +1572,15 @@ def _run_stage(args, cities, by_id, fetcher) -> dict[str, Any]:
     if args.stage == "instances":
         targets = args.city or _detail_targets(args, by_id)
         if args.dry_run:
-            return {"cities": targets, "planned_requests": len(targets) + 1}
+            return {
+                "cities": targets,
+                "planned_requests": 2 + len(targets) * (1 + args.reconcile_tiles),
+            }
         spent_before = fetcher.requests_spent
         federation = federation_snapshot(fetcher)
         rows = []
         for index, city_id in enumerate(targets, start=1):
-            row = instances_city(by_id[city_id], fetcher, args.search_limit)
+            row = instances_city(by_id[city_id], fetcher, args.search_limit, args.reconcile_tiles)
             rows.append(row)
             logger.info(
                 f"instances {index}/{len(targets)} {city_id}: {row['sampled']} sampled, "
@@ -1396,12 +1592,26 @@ def _run_stage(args, cities, by_id, fetcher) -> dict[str, Any]:
             "requests_spent": fetcher.requests_spent - spent_before,
         }
 
+    if args.stage == "access":
+        targets = args.city or _detail_targets(args, by_id)
+        if args.dry_run:
+            return {"cities": targets, "planned_requests": 3 * len(targets)}
+        spent_before = fetcher.requests_spent
+        rows = [stage_access(by_id[city_id], fetcher) for city_id in targets]
+        for row in rows:
+            logger.info(
+                f"access {row['city_id']}: paginates={row['search_paginates']} "
+                f"datetime_honoured={row['datetime_filter_honoured']} "
+                f"fov_filter_drops_absent={row['fov_filter_drops_absent']}"
+            )
+        return {"cities": rows, "requests_spent": fetcher.requests_spent - spent_before}
+
     raise AssertionError(f"unhandled stage {args.stage!r}")
 
 
 def _print_summary(record: dict[str, Any]) -> None:
     """A short human read of the record; the file on disk is the artifact."""
-    for key in ("screen", "measure", "detail", "instances"):
+    for key in ("screen", "measure", "detail", "instances", "access"):
         block = record[key]
         if not block.get("available"):
             print(f"{key:10s} not measured ({block['source']})")
