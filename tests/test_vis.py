@@ -6,6 +6,8 @@ call create_visualization_map, asserting it produces a folium.Map without
 raising. The focus is the degenerate-geometry guard from issue #69.
 """
 
+import pathlib
+
 import folium
 import pandas as pd
 
@@ -128,3 +130,85 @@ def test_kartaview_viewer_url_needs_sequence_and_index():
         pd.Series({"other": "column"}),
     ):
         assert vis.PROVIDER_DISPLAY["kartaview"]["viewer_url"]("2627370567", missing) is None
+
+
+def test_kartaview_map_url_needs_only_a_position():
+    """
+    Issue #312: the map fallback exists because KartaView's own /details backend
+    answers `osv: null` — for every sequence measured, their own documented
+    example included — so the exact-photo link lands on an error page. It is
+    keyed on the PANO's position and on nothing else: a row with no sequence at
+    all, which can build no viewer link, must still build this one.
+    """
+    map_url = vis.PROVIDER_DISPLAY["kartaview"]["map_url"]
+
+    unlinkable = pd.Series({"pano_lat": 8.061405, "pano_lon": 98.917865, "sequence_id": pd.NA})
+    assert vis.PROVIDER_DISPLAY["kartaview"]["viewer_url"]("2627370567", unlinkable) is None
+    assert map_url(unlinkable) == "https://kartaview.org/map/@8.061405,98.917865,19z"
+
+    for missing in (
+        pd.Series({"pano_lat": pd.NA, "pano_lon": 98.917865}),
+        pd.Series({"pano_lat": 8.061405, "pano_lon": pd.NA}),
+        pd.Series({"pano_lat": "", "pano_lon": ""}),
+        pd.Series({"other": "column"}),
+    ):
+        assert map_url(missing) is None
+
+
+def test_only_kartaview_declares_a_map_fallback():
+    """
+    Every provider declares the keys — a fan-out over the registry must not have
+    to know which providers have one — but only the provider whose viewer was
+    measured broken carries a URL builder. A second entry appearing here means
+    either a working viewer was given a fallback it does not need, or this one
+    was copied rather than read.
+    """
+    with_fallback = {p for p, d in vis.PROVIDER_DISPLAY.items() if d["map_url"]}
+    assert with_fallback == {"kartaview"}
+    assert all("map_label" in d and "viewer_label" in d for d in vis.PROVIDER_DISPLAY.values())
+
+
+def test_kartaview_popup_puts_the_working_link_first():
+    """
+    Order is the whole point of the fallback: the link that works has to be the
+    one a reader reaches first, or the popup still sends them to KartaView's
+    error page. Pins the rendered popup rather than the two URL builders — both
+    builders were correct before this change too, and the popup still offered
+    only the broken one.
+    """
+    df = _frame([_row("p1", 47.60, -122.33)])
+    df["copyright_info"] = "© KartaView contributor someone"
+    df["sequence_id"] = pd.Series(["11616154"], dtype="string")
+    df["sequence_index"] = pd.Series([1], dtype="Int64")
+
+    m = vis.create_visualization_map(df, "Krabi, Thailand", provider="kartaview")
+    html = m.get_root().render()
+    assert "kartaview.org/map/@47.6,-122.33,19z" in html
+    assert "kartaview.org/details/11616154/1" in html
+    assert html.index("kartaview.org/map/@") < html.index("kartaview.org/details/")
+
+
+def test_gsv_popup_still_renders_exactly_one_link():
+    """A provider with no fallback is unchanged by #312 — one link, as before."""
+    m = vis.create_visualization_map(_frame([_row("p1", 47.60, -122.33)]), "Seattle, WA")
+    html = m.get_root().render()
+    assert html.count("map_action=pano") == 1
+    assert "kartaview.org/map/@" not in html
+
+
+def test_the_js_registry_builds_the_same_kartaview_urls():
+    """
+    www/js/streetscape-utils.js and PROVIDER_DISPLAY are two hand-maintained
+    copies of the same two deep-links, and only the JS one is what a visitor
+    clicks. Read the JS the way tests/test_build_boundary_review.py already does
+    and pin the parts that must agree: the map form, its z-level, and the two
+    columns it reads. Divergence is otherwise invisible to the fast suite — the
+    Python copy is exercised by tests and the JS copy by nobody.
+    """
+    js_path = pathlib.Path(__file__).resolve().parent.parent / "www" / "js" / "streetscape-utils.js"
+    js = js_path.read_text(encoding="utf-8")
+    assert "https://kartaview.org/map/@" in js
+    assert ",19z" in js
+    for column in ("pano_lat", "pano_lon"):
+        assert f"row?.{column}" in js
+    assert "https://kartaview.org/details/" in js

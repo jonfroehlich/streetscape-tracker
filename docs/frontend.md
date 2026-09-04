@@ -216,3 +216,28 @@ It fetches one tile with the key and the same tile without, and requires the byt
 Differential rather than a pinned watermark hash, so it survives CARTO restyling the notice, and it goes red for a revoked key, an exhausted quota, and a dropped or misspelled parameter alike.
 It also goes red if CARTO ever stops watermarking keyless requests, which is a false alarm worth having: the constraint this mechanism exists for would have changed.
 Whether to leave raster for vector is a separate, larger question — vector needs the same key, and Leaflet cannot draw MVT at all — and is worked through in [`experiments/carto-basemap-key.md`](experiments/carto-basemap-key.md).
+
+## The KartaView pano link opens an error page, and the URL is correct (issue #312)
+
+*Written after the split.*
+
+**Clicking a KartaView pano dot sends a reader to "Ups! Sequence cannot be loaded…", and the link is right.**
+`PROVIDERS.kartaview.viewerUrl` builds `kartaview.org/details/{sequence_id}/{sequence_index}`, which is the form KartaView's own single-page app writes into the address bar as a viewer session moves between photos (`updatePageUrl` in their `main.*.js`).
+The pano behind a failing link is real and fully processed, and `/2.0/photo/?sequenceId=…&sequenceIndex=…` returns it with live CDN URLs.
+What fails is the single v1 call that page depends on — `POST api.kartaview.org/details`, which answers `osv: null`, and the console error (`Cannot read properties of null (reading 'photos')`) is that null being dereferenced.
+Measured 2026-09-02 over all 38 sequences a Krabi run links to **plus KartaView's own documented example sequence**: 0 of 39 load, our credential changes nothing, and the v2 endpoints on the same host are healthy ([`experiments/kartaview-viewer-deeplink.md`](experiments/kartaview-viewer-deeplink.md)).
+
+**Their own example failing is why this is written down here rather than fixed in the registry.**
+A broken third-party page and a malformed URL present identically, so the natural next move — rewriting `viewerUrl` — edits code that is already correct, and no test can catch that because the "fix" would be just as unverifiable against a backend that refuses everything.
+Before touching a deep-link builder for any provider, run **their** canonical example through the identical call.
+
+**The popup therefore carries two links, and the order is the fix.**
+`viewerLinksHtml(provider, panoId, row)` in `streetscape-utils.js` renders `fallbackViewerUrl` first and `viewerUrl` second, dropping either when its builder returns null; both popup builders in `city.js` call it and build no link of their own (pinned by a source check in `www/js/__tests__/streetscape-utils.test.js`, the same shape as the `addBasemapLayer` pin above).
+It lives in the registry module rather than in `city.js` because which viewer can be trusted is a property of the registry — and because `city.js` builds a Leaflet map at load, so nothing in it can be unit-tested.
+For KartaView the fallback is `kartaview.org/map/@{pano_lat},{pano_lon},19z`: their map view is served by the v2 stack that does answer, and their coverage tiles were measured serving content to z20, so z19 frames the pano's own track rather than a neighbourhood.
+GSV and Mapillary declare `fallbackViewerUrl: null` and render one link exactly as before.
+
+**The fallback is keyed on geometry, which makes it cover strictly more rows than the link it backs up.**
+Every linkable row carries `pano_lat`/`pano_lon` — `OK`, `NO_DATE` and `FLAT_ONLY` all populate them, and only `ZERO_RESULTS` is blank, which never gets a link — so a row with a null `sequence_id`, which could never build a photo link at all, now gets one link instead of none.
+`vis.PROVIDER_DISPLAY` carries the same two links in the same order for the folium run map; the two registries are hand-maintained copies, and only the JS one is what a visitor clicks.
+If KartaView repairs `/details`, the change is re-ordering two entries and dropping the caveat from `viewerLabel` — re-run `scripts/kartaview_details_probe.py` first, and confirm in a browser, since the probe measures the call and not the page.

@@ -235,6 +235,7 @@ All three share **one layout** — a sticky filter sidebar, a one-sentence lead 
 But only `grid.html` and `streets.html` are pivoted to **one row per city**, providers as sub-columns (#250), so "Collected by" is a **scope, not just a row filter** — it redirects what the numeric filters read, or "coverage over 80%" silently means "some provider's".
 A `driving.html` row is a **place**, so it keeps a flat single-row header — the only page that renders that `theadHtml` branch **by default**, never its only caller (grid/streets reach it whenever every grouped column is unchecked, so deleting it breaks them).
 Anything fanning out over the provider registry must gate on presence in the payload — a registered provider is not a collected one.
+**The KartaView pano link opens an error page and the URL is still correct** (#312): `details/{sequence_id}/{sequence_index}` is the form KartaView's own SPA writes, and their `POST /details` backend answers `osv: null` for every sequence probed **including their own documented example** — so the popup offers the map-view fallback FIRST and nobody should "fix" `viewerUrl`.
 Mapillary attribution is required by their ToS.
 
 **Tests → [`docs/testing.md`](docs/testing.md).**
@@ -259,6 +260,7 @@ Keep any list a doc enumerates **alphabetical**, so two branches adding an entry
   - `grid-density.md`
   - `kartaview-feasibility.md`
   - `kartaview-sweep-cost.md`
+  - `kartaview-viewer-deeplink.md`
   - `pano-spacing.md`
   - `publish-duration.md`
   - `undated-imagery-share.md`

@@ -194,6 +194,27 @@ def _kartaview_viewer_url(pano_id, row) -> str | None:
     return f"https://kartaview.org/details/{quote(str(sequence), safe='')}/{int(index)}"
 
 
+def _kartaview_map_url(row) -> str | None:
+    """
+    KartaView map-view deep-link for one census row, or None without a position.
+
+    The link that works when ``_kartaview_viewer_url``'s does not (issue #312):
+    KartaView's own ``/details`` backend answers ``osv: null`` for every sequence
+    measured — including their documented example — so the page that names the
+    exact photo renders an error, while the map view, served by the v2 stack
+    that does answer, opens the pano's neighbourhood with its track drawn on it.
+
+    Keyed on the PANO's position rather than the grid point's: the imagery is
+    what the reader is being sent to. Mirrors PROVIDERS.kartaview.
+    fallbackViewerUrl in www/js/streetscape-utils.js, z19 included.
+    """
+    lat = row.get("pano_lat")
+    lng = row.get("pano_lon")
+    if pd.isna(lat) or pd.isna(lng) or lat == "" or lng == "":
+        return None
+    return f"https://kartaview.org/map/@{lat},{lng},19z"
+
+
 # User-facing labels and pano viewer deep-links per provider (mirrors the
 # PROVIDERS registry in www/js/streetscape-utils.js). viewer_url takes the whole
 # row besides the pano id because KartaView's viewer is not addressable by photo
@@ -201,20 +222,35 @@ def _kartaview_viewer_url(pano_id, row) -> str | None:
 # naming.KNOWN_PROVIDERS member must have an entry — a run's map is generated
 # AFTER the run is registered, so a missing one fails a fully successful
 # collection at the last step (a test pins the coverage).
+#
+# map_url is the SECOND link, rendered FIRST, for a provider whose own viewer
+# cannot be relied on (issue #312); None on the two whose viewers work, which
+# renders one link exactly as before. viewer_label says out loud when a link is
+# expected to fail — mirroring the JS registry's viewerLabel, and for the same
+# reason: an honest label costs a few words, a silent error page costs trust.
 PROVIDER_DISPLAY = {
     "gsv": {
         "label": "GSV",
+        "viewer_label": "View in GSV",
         "viewer_url": lambda pano_id, row: (
             f"https://www.google.com/maps/@?api=1&map_action=pano&pano={pano_id}"
         ),
+        "map_label": None,
+        "map_url": None,
     },
     "mapillary": {
         "label": "Mapillary",
+        "viewer_label": "View in Mapillary",
         "viewer_url": lambda pano_id, row: f"https://www.mapillary.com/app/?pKey={pano_id}",
+        "map_label": None,
+        "map_url": None,
     },
     "kartaview": {
         "label": "KartaView",
+        "viewer_label": "Exact photo (KartaView's viewer is often broken)",
         "viewer_url": _kartaview_viewer_url,
+        "map_label": "View location on KartaView map",
+        "map_url": _kartaview_map_url,
     },
 }
 
@@ -405,9 +441,15 @@ def create_visualization_map(df: pd.DataFrame, city_name: str, provider: str = "
         age_years = (datetime.now() - capture_date).days / 365.25
         color = matplotlib.colors.to_hex(colormap(age_years))
 
+        # The fallback comes FIRST where one exists, because it is the link that
+        # works; see PROVIDER_DISPLAY above and issue #312.
+        map_url = display["map_url"](row) if display["map_url"] else None
         viewer_url = display["viewer_url"](row["pano_id"], row)
-        viewer_link = (
-            f'<br><a href="{viewer_url}" target="_blank">View in {label}</a>' if viewer_url else ""
+        links = [(map_url, display["map_label"]), (viewer_url, display["viewer_label"])]
+        viewer_link = "".join(
+            f'<br><a href="{url}" target="_blank">{link_label}</a>'
+            for url, link_label in links
+            if url
         )
         popup = folium.Popup(
             f"""
