@@ -172,6 +172,33 @@ def test_a_zero_screen_survives_the_generosity():
     assert pf.screen_cells_overlapping(far_away, bbox) == []
 
 
+def test_the_margin_is_applied_where_tiles_are_chosen_not_only_where_cells_are_filtered():
+    """
+    The bug this pins: a city whose bbox sits within one cell of a z6 tile seam
+    would have had its margin cells filtered for -- but never fetched, because
+    they live in the adjacent tile. 108 of 1,144 catalog cities sit there, 49
+    of them screened zero, and for those the "a zero is conclusive" claim would
+    have rested on cells nobody requested.
+    """
+    # A bbox hugging the western edge of a z6 tile column.
+    edge_lon = -123.75  # a z6 column boundary at zoom 6 (360/64 = 5.625 deg)
+    bbox = (edge_lon + 0.01, 47.0, edge_lon + 0.02, 47.01)
+    bare = set(dm.tiles_for_bbox(*bbox, pf.SCREEN_ZOOM))
+    grown = set(dm.tiles_for_bbox(*pf.grow_bbox(bbox), pf.SCREEN_ZOOM))
+    assert grown > bare, "the grown bbox must reach into the neighbouring tile"
+
+
+def test_grow_bbox_clamps_latitude_but_not_longitude():
+    """
+    Latitude has no wrap, so growing past a pole is meaningless and clamped.
+    Longitude does wrap, and `tiles_for_bbox` already handles the
+    antimeridian -- clamping it here would put the seam gap straight back.
+    """
+    assert pf.grow_bbox((0.0, 89.95, 1.0, 89.99))[3] == 90.0
+    assert pf.grow_bbox((0.0, -89.99, 1.0, -89.95))[1] == -90.0
+    assert pf.grow_bbox((179.95, 0.0, 179.99, 1.0))[2] == pytest.approx(180.09)
+
+
 # ── 3. Hex counters once, hex geometry unioned ─────────────────────────────
 
 
@@ -651,6 +678,34 @@ def test_an_unrun_stage_is_an_explicit_null_not_a_missing_key(tmp_path):
     for stage in ("screen", "measure", "detail", "instances"):
         assert record[stage]["available"] is False
         assert record[stage]["source"].endswith(f"{stage}.json")
+
+
+def test_cross_check_compares_only_cities_complete_in_both_stages():
+    """
+    A truncated city sampled 200 of its 800 z14 tiles and 200 of its 3,200 z15
+    tiles has measured two different subsets, so a disagreement between them
+    says nothing about whether the instruments agree. Comparing them anyway is
+    how a study manufactures a discrepancy and then explains it.
+    """
+    measure = {
+        "leaders": [{"city_id": "whole", "pictures": 100, "complete": True}],
+        "typical": [{"city_id": "cut", "pictures": 40, "complete": False}],
+        "controls": [],
+    }
+    detail = {
+        "cities": [
+            {"city_id": "whole", "pictures": 98, "complete": True},
+            {"city_id": "cut", "pictures": 5, "complete": True},
+        ]
+    }
+    result = pf.cross_check(measure, detail)
+    assert [row["city_id"] for row in result["cities"]] == ["whole"]
+    assert result["cities"][0]["ratio"] == pytest.approx(0.98)
+
+
+def test_cross_check_is_none_rather_than_empty_when_a_stage_is_missing():
+    assert pf.cross_check(None, {"cities": []}) is None
+    assert pf.cross_check({"leaders": [], "typical": [], "controls": []}, None) is None
 
 
 # The committed record, validated rather than regenerated: these recompute the

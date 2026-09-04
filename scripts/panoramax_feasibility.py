@@ -240,6 +240,33 @@ def screen_cells_from_tile(
     return cells
 
 
+def grow_bbox(
+    bbox: tuple[float, float, float, float], margin_deg: float = SCREEN_CELL_DEG
+) -> tuple[float, float, float, float]:
+    """
+    A bbox grown by the screen's safety margin, for enumerating z6 tiles.
+
+    :func:`screen_cells_overlapping` accepts an anchor up to one cell outside
+    the bbox, and a cell one bbox-width outside can live in the NEXT z6 tile --
+    which, if tiles were enumerated from the bare bbox, would never be fetched.
+    The margin would then silently disappear exactly at the tile seams: 108 of
+    1,144 catalog cities sit within one cell of one, 49 of them screened zero,
+    and for those the screen's "a zero is conclusive" claim would rest on cells
+    nobody looked at. So the growth happens where the tiles are chosen, not
+    only where the cells are filtered.
+
+    Deliberately unclamped in longitude: `tiles_for_bbox` already handles the
+    antimeridian wrap, and clamping here would reintroduce the gap at 180.
+    """
+    min_lon, min_lat, max_lon, max_lat = bbox
+    return (
+        min_lon - margin_deg,
+        max(-90.0, min_lat - margin_deg),
+        max_lon + margin_deg,
+        min(90.0, max_lat + margin_deg),
+    )
+
+
 def screen_cells_overlapping(
     cells: list[dict[str, Any]],
     bbox: tuple[float, float, float, float],
@@ -619,7 +646,10 @@ def stage_screen(cities: list[dict[str, Any]], fetcher: Fetcher | None) -> dict[
     wanted: set[tuple[int, int]] = set()
     per_city_tiles: dict[str, list[tuple[int, int]]] = {}
     for city in cities:
-        tiles = tiles_for_bbox(*city["bbox"], SCREEN_ZOOM)
+        # Grown, not bare: see grow_bbox. The cells a city may count and the
+        # tiles fetched for it must be chosen from the SAME rectangle, or the
+        # margin is real in one place and imaginary in the other.
+        tiles = tiles_for_bbox(*grow_bbox(tuple(city["bbox"])), SCREEN_ZOOM)
         per_city_tiles[city["city_id"]] = tiles
         wanted.update(tiles)
     tile_list = sorted(wanted)
@@ -1063,6 +1093,49 @@ def summarize_instances(instances: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def cross_check(measure: dict[str, Any] | None, detail: dict[str, Any] | None):
+    """
+    Do the two instruments agree on the cities they both measured completely?
+
+    The z14 H3 grid reports counters the server aggregated; the z15 pictures
+    layer is a row per picture that this script counts itself. They are
+    independent paths to the same number, and nothing else in this study checks
+    the aggregate layer at all -- if the hex counters meant something other
+    than "pictures in this hexagon", every count here would be wrong in a way
+    no internal consistency check could see.
+
+    Only cities COMPLETE in both are compared: a truncated city's counts are a
+    sample of a different subset in each stage, so a disagreement there would
+    say nothing. Returns None when there is no such city.
+    """
+    if not measure or not detail:
+        return None
+    grid_counts = {
+        row["city_id"]: row for group in MEASURE_GROUPS for row in measure[group] if row["complete"]
+    }
+    pairs = []
+    for row in detail["cities"]:
+        if not row["complete"] or row["city_id"] not in grid_counts:
+            continue
+        grid = grid_counts[row["city_id"]]["pictures"]
+        pairs.append(
+            {
+                "city_id": row["city_id"],
+                "z14_grid_pictures": grid,
+                "z15_pictures_layer": row["pictures"],
+                "ratio": round(row["pictures"] / grid, 4) if grid else None,
+            }
+        )
+    if not pairs:
+        return None
+    ratios = [p["ratio"] for p in pairs if p["ratio"] is not None]
+    return {
+        "n": len(pairs),
+        "ratio_distribution": describe(ratios) if ratios else None,
+        "cities": sorted(pairs, key=lambda p: p["city_id"]),
+    }
+
+
 def build_record(args: argparse.Namespace) -> dict[str, Any]:
     """
     Merge whatever stages have been run into the committed metrics record.
@@ -1113,6 +1186,7 @@ def build_record(args: argparse.Namespace) -> dict[str, Any]:
         "measure": block(measure, summarize_measure, "measure"),
         "detail": block(detail, summarize_detail, "detail"),
         "instances": block(instances, summarize_instances, "instances"),
+        "cross_check": cross_check(measure, detail),
     }
 
 
