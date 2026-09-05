@@ -933,29 +933,43 @@ def measure_city(
 def detail_city(
     city: dict[str, Any], fetcher: Fetcher, max_tiles: int, seed: int
 ) -> dict[str, Any]:
-    """Per-picture detail for one city off the v1 z15 pictures layer."""
+    """
+    Per-picture detail for one city off the v1 z15 pictures layer.
+
+    Accumulates counters and a set of seen ids rather than the pictures
+    themselves: a city like Paris is 600,000+ rows over 200 tiles, and holding
+    a dict per row cost hundreds of megabytes for numbers that are all
+    Counters in the end. The id set is what dedupes a picture a tile buffer
+    carries twice, and it is the only per-picture state kept.
+    """
     bbox = tuple(city["bbox"])
     tiles = tiles_for_bbox(*bbox, DETAIL_ZOOM)
     order = shuffled_tiles(tiles, seed)[:max_tiles]
-    pictures: dict[str, dict[str, Any]] = {}
+    seen: set[str] = set()
+    types: Counter = Counter()
+    months: Counter = Counter()
+    contributors: Counter = Counter()
+    sequences: set[Any] = set()
+    undated = 0
     for x, y in order:
         raw = fetcher.get_tile(MAP_V1_URL, DETAIL_ZOOM, x, y)
         for picture in pictures_from_tile(raw, x, y, DETAIL_ZOOM):
-            if bbox_contains(picture["lon"], picture["lat"], bbox):
-                pictures[picture["id"]] = picture
+            if picture["id"] in seen or not bbox_contains(picture["lon"], picture["lat"], bbox):
+                continue
+            seen.add(picture["id"])
+            kind = picture["type"]
+            types["360" if kind == TYPE_360 else "absent" if kind is None else "flat"] += 1
+            month = capture_month(picture["ts"])
+            if month is None:
+                undated += 1
+            else:
+                months[month] += 1
+            contributors[picture["account_id"]] += 1
+            if picture["sequence_id"]:
+                sequences.add(picture["sequence_id"])
 
-    months = Counter()
-    undated = 0
-    for picture in pictures.values():
-        month = capture_month(picture["ts"])
-        if month is None:
-            undated += 1
-        else:
-            months[month] += 1
-    contributors = Counter(p["account_id"] for p in pictures.values())
-    top_share = (
-        contributors.most_common(1)[0][1] / len(pictures) if pictures and contributors else None
-    )
+    total = len(seen)
+    top_share = contributors.most_common(1)[0][1] / total if total and contributors else None
     return {
         "city_id": city["city_id"],
         "display_name": city["display_name"],
@@ -963,20 +977,16 @@ def detail_city(
         "tiles_total": len(tiles),
         "tiles_probed": len(order),
         "complete": len(order) == len(tiles),
-        "pictures": len(pictures),
-        "pictures_360": sum(1 for p in pictures.values() if p["type"] == TYPE_360),
-        "pictures_flat": sum(
-            1 for p in pictures.values() if p["type"] is not None and p["type"] != TYPE_360
-        ),
-        "pictures_type_absent": sum(1 for p in pictures.values() if p["type"] is None),
+        "pictures": total,
+        "pictures_360": types["360"],
+        "pictures_flat": types["flat"],
+        "pictures_type_absent": types["absent"],
         "undated_pictures": undated,
         "distinct_capture_months": len(months),
         "capture_months": dict(sorted(months.items())),
         "distinct_contributors": len(contributors),
         "top_contributor_share": round(top_share, 4) if top_share is not None else None,
-        "distinct_sequences": len(
-            {p["sequence_id"] for p in pictures.values() if p["sequence_id"]}
-        ),
+        "distinct_sequences": len(sequences),
     }
 
 
