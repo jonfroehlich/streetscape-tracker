@@ -279,6 +279,106 @@ def test_a_hex_is_assigned_by_its_centre():
     assert [h["id"] for h in inside] == ["in"]
 
 
+# ── The two z6 grids disagree, and reuse is guarded ────────────────────────
+
+
+def test_the_screen_selects_hexes_by_OVERLAP_not_by_centre():
+    """
+    The screen and the measure stage select hexes differently on purpose. A
+    res-11 hexagon is 25 m across so its centre is as good as its extent; a
+    res-6 SCREEN hexagon is ~36 km2 and a city bbox is often smaller than one,
+    so centre-based selection would miss the very hex the city sits inside --
+    turning a covered city into a screened zero, which is the one failure the
+    design cannot tolerate.
+    """
+    # A hex far larger than the bbox, whose centre lies outside it.
+    accumulated = {
+        "big": {
+            "min_lon": -123.0,
+            "max_lon": -122.0,
+            "min_lat": 47.0,
+            "max_lat": 48.0,
+            "nb_pictures": 9,
+            "nb_360_pictures": 9,
+            "nb_flat_pictures": 0,
+            "date": None,
+        }
+    }
+    tiny = (-122.05, 47.90, -122.02, 47.93)
+    assert pf.hexes_in_bbox(accumulated, tiny) == []  # centre: misses it
+    assert len(pf.hexes_overlapping_bbox(accumulated, tiny)) == 1  # overlap: catches it
+
+
+def test_the_default_screen_variant_is_the_one_that_is_not_lossy():
+    """
+    The v1 lattice is what the API root's `xyz` link points at, and it drops
+    populated cells: it reported 2.5%, 7.9% and 23.9% fewer pictures than the
+    v2 H3 grid over three identical z6 extents, and a control city it called
+    empty held imagery. A lossy screen is not a slightly worse screen here --
+    the whole design rests on a zero being conclusive.
+    """
+    assert pf.DEFAULT_SCREEN_VARIANT == "v2_h3"
+    assert set(pf.SCREEN_VARIANTS) == {"v1_lattice", "v2_h3"}
+
+
+def _prior(city_id="c", tiles_total=49, tiles_probed=49):
+    return {
+        "_measured_by": "python scripts/panoramax_feasibility.py --stage measure",
+        "leaders": [
+            {
+                "city_id": city_id,
+                "tiles_total": tiles_total,
+                "tiles_probed": tiles_probed,
+                "pictures": 7,
+            }
+        ],
+        "typical": [],
+        "controls": [],
+    }
+
+
+def _city(city_id="c"):
+    return {
+        "city_id": city_id,
+        "display_name": "C",
+        "country_name": "US",
+        "bbox": list(dm.grid_bbox(47.6, -122.33, 5000, 5000, 20)),
+    }
+
+
+def test_a_prior_row_is_reused_only_when_the_tile_plan_matches():
+    city = _city()
+    n = len(dm.tiles_for_bbox(*city["bbox"], pf.MEASURE_ZOOM))
+    good = pf.reusable_measure_row(_prior(tiles_total=n, tiles_probed=n), city, 200, 316)
+    assert good is not None and good["pictures"] == 7
+    assert good["reused_from"].startswith("python scripts/panoramax_feasibility.py")
+
+
+def test_a_prior_row_measured_under_different_settings_is_refetched():
+    """
+    The guard, not the determinism, is what makes reuse safe: a row truncated
+    at a different --max-tiles-per-city sampled a different subset of the same
+    bbox, and comparing it beside fresh rows would be comparing two things.
+    """
+    city = _city()
+    n = len(dm.tiles_for_bbox(*city["bbox"], pf.MEASURE_ZOOM))
+    assert (
+        pf.reusable_measure_row(_prior(tiles_total=n, tiles_probed=n // 2), city, 200, 316) is None
+    )
+    assert (
+        pf.reusable_measure_row(_prior(tiles_total=n + 1, tiles_probed=n + 1), city, 200, 316)
+        is None
+    )
+    assert pf.reusable_measure_row(None, city, 200, 316) is None
+    assert pf.reusable_measure_row(_prior(city_id="other"), city, 200, 316) is None
+
+
+def test_reuse_is_stamped_into_the_provenance():
+    args = _args(stage="measure", reuse_measured=True)
+    assert "--reuse-measured" in pf.measured_by(args, "measure")
+    assert "--reuse-measured" not in pf.measured_by(_args(stage="measure"), "measure")
+
+
 # ── 4. Truncation is scaled, not compared raw ──────────────────────────────
 
 

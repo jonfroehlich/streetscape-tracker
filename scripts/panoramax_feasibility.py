@@ -133,6 +133,9 @@ MEASURE_ZOOM = 14
 DETAIL_ZOOM = 15
 
 SCREEN_LAYER = "grid"
+# Two endpoints serve a z6 grid and they DISAGREE; see stage_screen.
+SCREEN_VARIANTS = {"v1_lattice": MAP_V1_URL, "v2_h3": MAP_V2_URL}
+DEFAULT_SCREEN_VARIANT = "v2_h3"
 MEASURE_LAYER = "grid"
 DETAIL_LAYER = "pictures"
 
@@ -185,8 +188,12 @@ DOCS_RECORD_NOTE = (
     "sequences; where `tiles_probed` is below `tiles_total` the city was truncated by "
     "--max-tiles-per-city and its counts are a seeded-shuffle sample of the bbox, NOT a total. "
     "`instances` is a bounded /api/search sample, capped by --search-limit and therefore never a "
-    "count of anything; it exists to attribute pictures to source instances and to measure the "
-    "EXIF field-of-view absent rate against the tile `type` field, which has no absent state. "
+    "count of anything; it exists to attribute pictures to source instances and to cross-tabulate "
+    "the EXIF field of view against the same pictures' tile `type`, which has no absent state. "
+    "`access` is not a measurement of coverage at all: it probes three silent /api/search "
+    "behaviours (no pagination, `datetime` ignored, `filter=field_of_view=360` dropping EXIF-less "
+    "pictures) and DERIVES each finding from the responses, so a re-run against a fixed Panoramax "
+    "fails rather than leaving stale prose. "
     "Quote `measure` for counts, `detail` for dates and contributors, and neither for the other."
 )
 
@@ -411,6 +418,33 @@ def hexes_in_bbox(
         if min_lon <= lon <= max_lon and min_lat <= lat <= max_lat:
             inside.append({"id": hex_id, "lon": lon, "lat": lat, **hexagon})
     return inside
+
+
+def hexes_overlapping_bbox(
+    accumulated: dict[str, dict[str, Any]], bbox: tuple[float, float, float, float]
+) -> list[dict[str, Any]]:
+    """
+    Hexes whose extent INTERSECTS the bbox, in sorted-id order.
+
+    The screen and the measure stage select hexes differently on purpose.
+    :func:`hexes_in_bbox` assigns a res-11 hexagon by its centre because at 25 m
+    across the difference is noise. A screen hexagon is res 6 -- about 36 km2 --
+    and a city bbox is often smaller than one, so centre-based selection would
+    miss the very hex the city sits inside. Overlap is the only selection that
+    keeps the screen an upper bound.
+    """
+    min_lon, min_lat, max_lon, max_lat = bbox
+    out = []
+    for hex_id in sorted(accumulated):
+        hexagon = accumulated[hex_id]
+        if (
+            hexagon["min_lon"] <= max_lon
+            and hexagon["max_lon"] >= min_lon
+            and hexagon["min_lat"] <= max_lat
+            and hexagon["max_lat"] >= min_lat
+        ):
+            out.append({"id": hex_id, **hexagon})
+    return out
 
 
 def pictures_from_tile(
@@ -647,13 +681,28 @@ def load_cities(db_path: str) -> list[dict[str, Any]]:
 # ── Stages ─────────────────────────────────────────────────────────────────
 
 
-def stage_screen(cities: list[dict[str, Any]], fetcher: Fetcher | None) -> dict[str, Any]:
+def stage_screen(
+    cities: list[dict[str, Any]], fetcher: Fetcher | None, variant: str = DEFAULT_SCREEN_VARIANT
+) -> dict[str, Any]:
     """
-    Whole-catalog screen off the v1 z6 grid layer.
+    Whole-catalog screen at z6. One request per distinct z6 tile the catalog
+    touches -- 113 for the current 1,144 cities -- because neighbouring cities
+    share tiles.
 
-    One request per distinct z6 tile the catalog touches -- 104 for the current
-    1,144 cities -- because neighbouring cities share tiles. Every city then
-    gets an upper bound summed from the cells its bbox could overlap.
+    THE VARIANT MATTERS AND THE DEFAULT CHANGED. The obvious instrument is v1's
+    `grid`, a 0.1-degree lattice, and it is what the API root's `xyz` link
+    points at. It is **lossy**: over three z6 tiles it reported 2.5%, 7.9% and
+    23.9% fewer pictures than v2's H3 grid over the identical extent, and it
+    omits whole populated cells rather than under-counting populated ones (it
+    happily reports cells holding a single picture, so this is not a low-count
+    threshold). The control group is how that was found: a screened-ZERO city
+    turned out to hold imagery, and the v1 lattice had returned no cell for it
+    at all while v2 did.
+
+    A lossy screen is not a slightly worse screen here, it is a broken one --
+    the entire design rests on a zero being conclusive, and a lattice that can
+    drop a populated cell cannot support that. So the default is `v2_h3`, and
+    `v1_lattice` is kept only so the comparison stays reproducible.
     """
     wanted: set[tuple[int, int]] = set()
     per_city_tiles: dict[str, list[tuple[int, int]]] = {}
@@ -667,38 +716,58 @@ def stage_screen(cities: list[dict[str, Any]], fetcher: Fetcher | None) -> dict[
     tile_list = sorted(wanted)
 
     if fetcher is None:  # --dry-run
-        return {"planned_requests": len(tile_list), "tiles": len(tile_list), "cities": []}
+        return {
+            "variant": variant,
+            "planned_requests": len(tile_list),
+            "tiles": len(tile_list),
+            "cities": [],
+        }
 
-    cells_by_tile: dict[tuple[int, int], list[dict[str, Any]]] = {}
+    url = SCREEN_VARIANTS[variant]
+    by_tile: dict[tuple[int, int], Any] = {}
     for index, (x, y) in enumerate(tile_list, start=1):
-        raw = fetcher.get_tile(MAP_V1_URL, SCREEN_ZOOM, x, y)
-        cells_by_tile[(x, y)] = screen_cells_from_tile(raw, x, y, SCREEN_ZOOM)
+        raw = fetcher.get_tile(url, SCREEN_ZOOM, x, y)
+        by_tile[(x, y)] = (
+            screen_cells_from_tile(raw, x, y, SCREEN_ZOOM)
+            if variant == "v1_lattice"
+            else hexes_from_tile(raw, x, y, SCREEN_ZOOM)
+        )
         logger.info(f"screen {index}/{len(tile_list)} z{SCREEN_ZOOM}/{x}/{y}: {len(raw)} bytes")
 
     rows = []
     for city in cities:
-        # Deduped by lattice anchor: a city bbox can straddle a tile seam, and
-        # the same cell then arrives once per tile.
-        seen: dict[tuple[float, float], dict[str, Any]] = {}
-        for tile in per_city_tiles[city["city_id"]]:
-            for cell in screen_cells_overlapping(cells_by_tile[tile], city["bbox"]):
-                seen[(round(cell["lon"], 4), round(cell["lat"], 4))] = cell
+        bbox = tuple(city["bbox"])
+        tiles = per_city_tiles[city["city_id"]]
+        if variant == "v1_lattice":
+            # Deduped by lattice anchor: a bbox can straddle a tile seam, and
+            # the same cell then arrives once per tile.
+            seen: dict[Any, dict[str, Any]] = {}
+            for tile in tiles:
+                for cell in screen_cells_overlapping(by_tile[tile], bbox):
+                    seen[(round(cell["lon"], 4), round(cell["lat"], 4))] = cell
+            selected = list(seen.values())
+        else:
+            accumulated: dict[str, dict[str, Any]] = {}
+            for tile in tiles:
+                merge_hexes(accumulated, by_tile[tile])
+            selected = hexes_overlapping_bbox(accumulated, grow_bbox(bbox, 0.0))
         rows.append(
             {
                 "city_id": city["city_id"],
                 "display_name": city["display_name"],
                 "country_name": city["country_name"],
                 "bbox": city["bbox"],
-                "z6_tiles": len(per_city_tiles[city["city_id"]]),
-                "cells": len(seen),
-                "screen_pictures_upper_bound": sum(c["nb_pictures"] for c in seen.values()),
-                "screen_360_upper_bound": sum(c["nb_360_pictures"] for c in seen.values()),
-                "screen_flat_upper_bound": sum(c["nb_flat_pictures"] for c in seen.values()),
+                "z6_tiles": len(tiles),
+                "cells": len(selected),
+                "screen_pictures_upper_bound": sum(c["nb_pictures"] for c in selected),
+                "screen_360_upper_bound": sum(c["nb_360_pictures"] for c in selected),
+                "screen_flat_upper_bound": sum(c["nb_flat_pictures"] for c in selected),
             }
         )
     return {
+        "variant": variant,
         "zoom": SCREEN_ZOOM,
-        "cell_deg": SCREEN_CELL_DEG,
+        "cell_deg": SCREEN_CELL_DEG if variant == "v1_lattice" else None,
         "tiles": len(tile_list),
         "requests_spent": len(tile_list),
         "cities": rows,
@@ -772,6 +841,42 @@ def scale_to_bbox(counted: int, tiles_probed: int, tiles_total: int) -> int:
     if tiles_probed <= 0 or tiles_probed >= tiles_total:
         return counted
     return int(round(counted * tiles_total / tiles_probed))
+
+
+def reusable_measure_row(
+    prior: dict[str, Any] | None, city: dict[str, Any], max_tiles: int, seed: int
+) -> dict[str, Any] | None:
+    """
+    A prior row for this city that the current settings would reproduce exactly.
+
+    `measure_city` is deterministic in (bbox, seed, max_tiles): the same tiles
+    in the same seeded order, the same hexes, the same sum. So re-fetching a
+    city already measured under identical settings spends requests against a
+    host with no documented limit to re-learn a number we hold, which is the
+    opposite of the pacing posture this study argues for everywhere else.
+
+    What makes reuse safe is the GUARD, not the determinism. A row is reused
+    only when the tile plan the current settings produce matches the plan the
+    row recorded; change --seed, --max-tiles-per-city, or a city's frozen
+    geometry and it is refetched rather than silently compared against a
+    different subset of a different bbox. Reuse is never silent either: the row
+    is stamped with the run that measured it and the payload counts how many
+    rows came from where.
+
+    Returns None when there is nothing safely reusable.
+    """
+    if prior is None:
+        return None
+    for group in MEASURE_GROUPS:
+        for row in prior.get(group, []):
+            if row["city_id"] != city["city_id"]:
+                continue
+            tiles = tiles_for_bbox(*tuple(city["bbox"]), MEASURE_ZOOM)
+            probed = min(max_tiles, len(tiles))
+            if row["tiles_total"] == len(tiles) and row["tiles_probed"] == probed:
+                return {**row, "reused_from": prior.get("_measured_by", "an earlier run")}
+            return None
+    return None
 
 
 def measure_city(
@@ -1135,6 +1240,8 @@ def measured_by(args: argparse.Namespace, stage: str) -> str:
         parts += ["--jitter", str(args.jitter)]
     if args.seed != DEFAULT_SEED:
         parts += ["--seed", str(args.seed)]
+    if stage == "screen" and args.screen_variant != DEFAULT_SCREEN_VARIANT:
+        parts += ["--screen-variant", args.screen_variant]
     if stage == "measure":
         if args.leaders != DEFAULT_LEADERS:
             parts += ["--leaders", str(args.leaders)]
@@ -1142,6 +1249,8 @@ def measured_by(args: argparse.Namespace, stage: str) -> str:
             parts += ["--typical", str(args.typical)]
         if args.controls != DEFAULT_CONTROLS:
             parts += ["--controls", str(args.controls)]
+        if args.reuse_measured:
+            parts += ["--reuse-measured"]
     if stage in ("measure", "detail") and args.max_tiles_per_city != DEFAULT_MAX_TILES_PER_CITY:
         parts += ["--max-tiles-per-city", str(args.max_tiles_per_city)]
     if stage == "detail" and args.detail_cities != DEFAULT_DETAIL_CITIES:
@@ -1188,6 +1297,7 @@ def summarize_measure(measure: dict[str, Any]) -> dict[str, Any]:
         "requests_spent": measure["requests_spent"],
         "empty_tiles": measure.get("empty_tiles", 0),
         "cities_failed": measure.get("failed", []),
+        "reused_rows": measure.get("reused_rows", 0),
     }
     for group in MEASURE_GROUPS:
         rows = measure[group]
@@ -1415,6 +1525,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--docs-dir", default=DOCS_DIR_DEFAULT)
     parser.add_argument("--raw-dir", default=RAW_DIR_DEFAULT)
+    parser.add_argument(
+        "--screen-variant", choices=tuple(SCREEN_VARIANTS), default=DEFAULT_SCREEN_VARIANT
+    )
     parser.add_argument("--rate", type=int, default=DEFAULT_RATE_PER_MINUTE)
     parser.add_argument("--jitter", type=float, default=DEFAULT_JITTER)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
@@ -1428,6 +1541,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_S)
     parser.add_argument(
         "--city", action="append", help="override the stage's city set (repeatable)"
+    )
+    parser.add_argument(
+        "--reuse-measured",
+        action="store_true",
+        help="reuse rows from an existing measure.json whose tile plan the current settings "
+        "reproduce exactly, instead of re-fetching them",
     )
     parser.add_argument("--dry-run", action="store_true", help="plan and price it, spend nothing")
     parser.add_argument("--verbose", action="store_true")
@@ -1508,10 +1627,11 @@ def main(argv: list[str] | None = None) -> int:
 def _run_stage(args, cities, by_id, fetcher) -> dict[str, Any]:
     """Dispatch one stage; every branch returns the stage's raw payload."""
     if args.stage == "screen":
-        return stage_screen(cities, fetcher)
+        return stage_screen(cities, fetcher, args.screen_variant)
 
     if args.stage == "measure":
         groups = _measure_targets(args, cities, by_id)
+        prior = read_raw(args.raw_dir, "measure") if args.reuse_measured else None
         if args.dry_run:
             planned = {
                 group: sum(
@@ -1527,12 +1647,20 @@ def _run_stage(args, cities, by_id, fetcher) -> dict[str, Any]:
         spent_before = fetcher.requests_spent
         out: dict[str, Any] = {group: [] for group in MEASURE_GROUPS}
         out["failed"] = []
+        out["reused_rows"] = 0
         for group in MEASURE_GROUPS:
             ids = groups[group]
             for index, city_id in enumerate(ids, start=1):
                 # A city that fails is RECORDED and skipped, never dropped: an
                 # omitted city silently shrinks a denominator, and the group
                 # sizes are what every estimate here rests on.
+                reused = reusable_measure_row(
+                    prior, by_id[city_id], args.max_tiles_per_city, args.seed
+                )
+                if reused is not None:
+                    out[group].append(reused)
+                    out["reused_rows"] += 1
+                    continue
                 try:
                     row = measure_city(by_id[city_id], fetcher, args.max_tiles_per_city, args.seed)
                 except BlockedError:
