@@ -92,18 +92,48 @@ The thread carries one lead this repo did not have: it directs commercial or pro
 Nobody has written to them.
 That is a decision rather than a task — it identifies this project to the vendor, and the quota it would ask about is not the one that has ever stopped us.
 
+## The daily budgets, re-sized for the 40-city night (issue #286)
+
+**`[providers.mapillary].daily_request_budget` is 3,500 as of 2026-09-05; `[providers.mapillary_streets]` stays 1,750.**
+The grid channel's figure doubled for a reason that has nothing to do with the block model, and it is worth separating from one: 1,750 was sized on 2026-08-22 (#241) for a **20-city** night, and `max_cities_per_day` went 20 → 40 on 2026-09-02 (#304) without the budget following.
+The ledger shows that seam precisely — the first two 40-city nights pinned the cap, after four 20-city nights that never came close:
+
+| Night | grid | walk | combined | `max_cities_per_day` |
+|---|---|---|---|---|
+| 2026-08-30 | 755 | 0 | 755 | 20 |
+| 2026-08-31 | 950 | 0 | 950 | 20 |
+| 2026-09-01 | 1,241 | 0 | 1,241 | 20 |
+| 2026-09-02 | 1,037 | 0 | 1,037 | 20 |
+| 2026-09-03 | **1,736** | 524 | 2,260 | **40** |
+| 2026-09-04 | **1,723** | 0 | 1,723 | **40** |
+
+Per-city grid cost over 1,398 runs is median **9**, p90 **81**, p99 **440**, max **870**, mean **39**, so a 40-city night wants ~1,560 on the mean and the cap binds on any night that happens to carry two or three metros.
+It bound twice in those six nights, both times on an end-of-night sliver rather than on a city that was ever unaffordable: New York needed 484 with 426 left, and Normal, Illinois needed 40 with 38 left.
+That shape is the argument for the capped-and-resume work in #318 as well as for this raise — the raise fixes the average night, a resumable census fixes the tail.
+
+**What this actually spends.** Since #290 the walk reuses the grid run's census for zero requests on a paired night, and the table above shows `mapillary_streets` spending 0 on five of the six nights.
+The *combined* per-IP load has therefore been running at ~1,750/day against the 3,500 that #241 sanctioned — half of it — so on a paired night 3,500 + 0 restores that sanctioned combined ceiling rather than exceeding it.
+**Be honest about the un-paired case**: nothing enforces the pairing, and a split pair can reach **5,250**, which is 1.5x the #241 ceiling and the most this host has been configured for since block 2.
+That is accepted rather than overlooked, on the ground that block 3 (1,938/day, against 26,363 spent clean on 08-14) falsified daily volume and every accumulation window from 1 to 8 days (#286).
+It is **not** accepted on the ground that volume is safe — nothing about this host's behaviour is known safe, and the even split #241 chose still matters on exactly the nights that reach 5,250.
+The structurally correct fix is a single per-IP pool both channels draw from, which is a scheduler change rather than a config edit and is deliberately not attempted here; until it exists, the sum above is the number to quote, never the grid channel's 3,500 alone.
+
+**Deliberately timed after the jitter window closed.** The #292 restart is a pre-registered test whose read-out condition is "clean through ~2026-09-09", and raising volume inside that window would have handed a fourth block two candidate causes where the design went to real trouble to leave exactly one.
+The cost of waiting was the two skipped cities above.
+The same reasoning applies to the next person who wants to move this number: check what test is in flight before changing an axis it is measuring.
+
 ## SUPERSEDED — the daily budgets encoded a rolling 2–3 day per-IP window (issue #241, superseded by #286)
 
 > **SUPERSEDED by block 3 (2026-08-28); kept in full, not deleted, because the ledger analysis and the staff record below are still the evidence base and because #267 was sized on these bands.**
 > Block 3 arrived at **1,938** combined requests/day while 08-14 had spent **26,363** in one day clean, and **no accumulation window from 1 to 8 days** admits a threshold separating blocked days from clean ones (#286).
 > So the bands quoted below — 2-day (7,061, 10,766], 3-day (10,284, 12,074] — are **dead**, and the ~10,000-per-48 h reading with them.
-> What survives: the budgets themselves stay at 1,750 each, now as a *conservative floor on our exposure* rather than as a threshold anyone believes in; the no-`--limit`-catch-ups rule stays, on the general ground that a multi-night burst is the one shape we know preceded a block; and the **repeat-offender** rival named below is likewise dead, since block 3 did not escalate (≤26.3 h, same as block 2).
+> What survives: the budgets stayed at 1,750 each, no longer as a threshold anyone believes in but as a *conservative floor on our exposure* — and on 2026-09-05 the grid channel's half was re-sized to 3,500 for the 40-city night, which is the section above, not this one; the no-`--limit`-catch-ups rule stays, on the general ground that a multi-night burst is the one shape we know preceded a block; and the **repeat-offender** rival named below is likewise dead, since block 3 did not escalate (≤26.3 h, same as block 2).
 > The live hypothesis is request *shape*, not request *volume* — see the request-jitter section at the end of this file.
 
 **The daily budgets encoded what #241 read as the only constraint fitting the data at n=2: a rolling 2–3 day per-IP window (issue #241, superseding #214's throughput bet).** `[providers.mapillary].daily_request_budget` and `[providers.mapillary_streets]` are **1,750 each** (cut from 15,000 + 5,000 on 2026-08-22, and split evenly because both channels read the **identical z14 tile census** — a road walk re-reads the grid run's tiles
 — so the two budgets deplete in lockstep and a heavy slate defers the same cities on both channels rather than un-pairing them).
 **Since #290 the walk no longer re-reads those tiles: on a paired night it reuses the grid run's census for zero requests**, so `mapillary_streets`' budget is spent only on nights the two channels are *not* paired — which is what a budget deferral or a filtered run produces.
-The budget *values* are unchanged; sizing them for the new load is #286's question, and this issue's goal is strictly less load, never more.
+The budget *values* were unchanged here; sizing them for the new load was #286's question, answered on 2026-09-05 in the section above (grid 1,750 → 3,500). This issue's own goal was strictly less load, never more.
 The block is per **IP**, so the number that matters is the **sum** across the two channels
 — different tokens, one address: **3,500/day**, chosen so any 2-day total stays ≤ 7,000, at or below the **highest value ever observed clean** (7,061).
 
@@ -235,7 +265,7 @@ The parameter did not have to change meaning, because every invariant the unifor
 
 Because the pacer is FIFO under one lock, `connection_limit` concurrency cannot smooth the jitter back out.
 Mapillary tile fetches jitter **by default** (`DEFAULT_TILE_JITTER = 0.6`, `--mapillary-jitter` on both CLIs, `[providers.mapillary*].jitter` in the scheduler config — validated at load by `coerce_jitter`, and passed to the children exactly as `max_requests_per_minute` is), and prod runs **40/min at CV 0.6**: gaps floored at **0.60 s**, mean **1.50 s**, p99 **~4.7 s**, no ceiling.
-The budgets are left at 1,750 because a fourth cut has no mechanism to work through.
+The budgets were left at 1,750 for the restart because a fourth cut has no mechanism to work through — and were deliberately not raised either until the window below closed, since volume is an axis this test is holding still (the grid channel went to 3,500 on 2026-09-05; see the daily-budget section above).
 
 **This is a pre-registered test, not a fix**, and the prediction is recorded in #286 before the restart.
 Each prior block landed **on the 6th active collection night**: 08-13…08-20 and 08-23…08-28 are each a run of six collecting nights ending in the block.
@@ -376,7 +406,7 @@ changing `catalog_backup.py` will actually be reading, in
 **(1) Host affinity is enforced in the parent.**
 The launch pass derives the per-IP hosts its in-flight children hold from `CHANNEL_HOSTS` and defers any channel that intersects them, so Overpass, the Mapillary tile CDN and KartaView each see **at most one talker from this process at a time** — the same as before.
 The child-side cross-process lock (#208) is untouched and still covers the manual runs the parent cannot see.
-**(2) Pacing and budgets are per channel and unchanged**: each child keeps its own limiter, and the combined Mapillary per-IP ceiling stays 3,500/day.
+**(2) Pacing and budgets are per channel and unchanged**: each child keeps its own limiter, and this changes neither. (The combined Mapillary per-IP ceiling read 3,500/day when this was written; since 2026-09-05 it is 3,500 on a paired night and 5,250 if the pair splits — see the daily-budget section above. The argument here never depended on the value.)
 Whatever the binding Mapillary constraint turns out to be, intra-night packing does not move it — a night collects the same cities and spends the same tiles, sooner. (This read "multi-day *volume* (#241)" until block 3 retired that; the argument never depended on which hypothesis was live.)
 **(3) The only observable change is wall clock.**
 The one place this is not free is the pair Google meters per Cloud **project** rather than per IP: `gsv` and `gsv_streets` declare no host, so nothing serializes them, and running them concurrently presents 48k + 24k req/min.
