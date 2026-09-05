@@ -1,7 +1,7 @@
 """
 Issue #316, phase 1: is there Panoramax imagery in the cities we actually track?
 
-    python scripts/panoramax_feasibility.py --stage screen                  # 104 requests, whole catalog
+    python scripts/panoramax_feasibility.py --stage screen                  # 113 requests, whole catalog
     python scripts/panoramax_feasibility.py --stage measure --max-cities 60
     python scripts/panoramax_feasibility.py --stage detail --detail-cities 12
     python scripts/panoramax_feasibility.py --stage instances
@@ -42,14 +42,17 @@ standing rule) showed that cannot work, and the alternative is strictly better:
      offline from `grid_bbox`, no network):
 
          instrument            zoom   distinct tiles   per city p50/p90/p95/max
-         v1 grid (screen)      z6              104          1 /   1 /   1 /    2
+         v2 H3 grid (screen)   z6              113          1 /   1 /   1 /    2
          v2 H3 grid (measure)  z14          64,650         12 / 121 / 240 / 6,480
          v1 pictures (detail)  z15         236,808         35 / 462 / 900 / 25,418
 
-     104 requests screen every city we track. That is the whole design: an
+     113 requests screen every city we track. That is the whole design: an
      almost-free stage that can PROVE ABSENCE, then exact measurement spent
      only where absence was not proven. z14's median of 12 is the Mapillary
-     census median, as it must be -- same zoom.
+     census median, as it must be -- same zoom. The screen was FIRST built on
+     v1's z6 lattice, which the API root's `xyz` link points at, and the
+     control group showed that lattice drops populated cells; see
+     `stage_screen` for the evidence and why the default moved to v2.
 
   4. THE TILE `type` FIELD HAS NO ABSENT STATE; THE SEARCH `field_of_view` DOES.
      Summed over the federation at v1 z0: 119,362,642 pictures = 52,128,373
@@ -58,9 +61,9 @@ standing rule) showed that cannot work, and the alternative is strictly better:
      out of EXIF in the SEARCH response, not of the imagery. Stage `instances`
      measures both against the same bbox so the writeup can say which.
 
-WHY A ZERO SCREEN IS CONCLUSIVE AND A NON-ZERO ONE IS NOT. A 0.1 degree cell is
-roughly 80 km2 and the median catalog city is 19.5 km2, so the screen sums cells
-far larger than the city inside them: it is an UPPER BOUND. That asymmetry is
+WHY A ZERO SCREEN IS CONCLUSIVE AND A NON-ZERO ONE IS NOT. A res-6 H3 hexagon
+is roughly 36 km2 and the median catalog city is 19.5 km2, so the screen sums
+hexes far larger than the city inside them: it is an UPPER BOUND. That asymmetry is
 the point. An upper bound of zero means the city has no imagery, full stop; a
 positive one means only "look closer", which is what stage `measure` is for.
 Stage `measure` therefore also walks a seeded random CONTROL sample of
@@ -162,6 +165,9 @@ DEFAULT_LEADERS = 20
 DEFAULT_TYPICAL = 40
 DEFAULT_CONTROLS = 20
 DEFAULT_DETAIL_CITIES = 12
+# Cities stage `detail` adds for the cross-check: the richest that are complete
+# at z15 under --max-tiles-per-city. See _detail_targets.
+DEFAULT_CROSS_CHECK_CITIES = 8
 DEFAULT_MAX_TILES_PER_CITY = 200
 DEFAULT_SEARCH_LIMIT = 500
 # z15 tiles fetched per city to type the search sample's pictures. Four is
@@ -178,9 +184,11 @@ DEFAULT_TIMEOUT_S = 60
 
 DOCS_RECORD_NOTE = (
     "Phase 1 of #316: read-only, no credential, no collector. Three instruments, and they are "
-    "not interchangeable. `screen` sums the v1 z6 grid layer's 0.1-degree cells overlapping a "
-    "city's frozen grid bbox, so every `screen_pictures_upper_bound` is an UPPER BOUND over an "
-    "area much larger than the city -- a zero is conclusive, a positive number is not. `measure` "
+    "not interchangeable. `screen` sums the v2 z6 H3 grid layer's res-6 hexagons (~36 km2 each) "
+    "overlapping a city's frozen grid bbox, so every `screen_pictures_upper_bound` is an UPPER "
+    "BOUND over an area much larger than the city -- a zero is conclusive, a positive number is "
+    "not; the v1 z6 lattice the API root advertises DROPS populated cells and is kept only as "
+    "`--screen-variant v1_lattice` for the comparison. `measure` "
     "sums the v2 z14 H3 grid layer's res-11 hexagons whose centre falls inside the bbox, which is "
     "the exact in-bbox count; hexes are deduped by H3 id across tiles and their centres are "
     "reconstructed from the union of the clipped pieces. `detail` reads the v1 z15 pictures layer "
@@ -194,6 +202,10 @@ DOCS_RECORD_NOTE = (
     "behaviours (no pagination, `datetime` ignored, `filter=field_of_view=360` dropping EXIF-less "
     "pictures) and DERIVES each finding from the responses, so a re-run against a fixed Panoramax "
     "fails rather than leaving stale prose. "
+    "`cross_check` compares the z14 grid's server-aggregated counters against a per-picture "
+    "count off the z15 layer, only over cities complete in BOTH stages -- which is why `detail` "
+    "also visits the richest cities that fit under --max-tiles-per-city at z15, since none of "
+    "the richest cities overall does. "
     "Quote `measure` for counts, `detail` for dates and contributors, and neither for the other."
 )
 
@@ -381,16 +393,26 @@ def merge_hexes(
     """
     Fold one tile's hexes into the running set, unioning clipped geometry.
 
-    Counters are taken once per id (they are whole-hex figures, so the second
-    sighting adds nothing); the vertex box is unioned, so a hex split across
-    two tiles ends up with the extent of the complete hexagon and therefore its
-    true centre. Mutates and returns `accumulated`.
+    Counters are taken once per id -- as the MAX across sightings, never the
+    sum. Under the measured contract (whole-hex figures repeated verbatim in
+    every tile the hex touches) max and first-seen are the same number and
+    the sum double-counts every seam hex. Max is chosen over first-seen
+    because of what each does if the contract is ever wrong: were a tile to
+    carry only its own piece's count, first-seen could record a ZERO for a hex
+    whose pictures all sit in the other tile, and the screen would then call a
+    covered city empty -- the one failure the design cannot tolerate -- while
+    max degrades to a lower bound that is zero only when every piece is zero.
+    The vertex box is unioned, so a hex split across two tiles ends up with
+    the extent of the complete hexagon and therefore its true centre. Mutates
+    and returns `accumulated`.
     """
     for hex_id, hexagon in new.items():
         seen = accumulated.get(hex_id)
         if seen is None:
             accumulated[hex_id] = dict(hexagon)
             continue
+        for counter in ("nb_pictures", "nb_360_pictures", "nb_flat_pictures"):
+            seen[counter] = max(seen[counter], hexagon[counter])
         seen["min_lon"] = min(seen["min_lon"], hexagon["min_lon"])
         seen["max_lon"] = max(seen["max_lon"], hexagon["max_lon"])
         seen["min_lat"] = min(seen["min_lat"], hexagon["min_lat"])
@@ -750,7 +772,7 @@ def stage_screen(
             accumulated: dict[str, dict[str, Any]] = {}
             for tile in tiles:
                 merge_hexes(accumulated, by_tile[tile])
-            selected = hexes_overlapping_bbox(accumulated, grow_bbox(bbox, 0.0))
+            selected = hexes_overlapping_bbox(accumulated, bbox)
         rows.append(
             {
                 "city_id": city["city_id"],
@@ -1251,15 +1273,24 @@ def measured_by(args: argparse.Namespace, stage: str) -> str:
             parts += ["--controls", str(args.controls)]
         if args.reuse_measured:
             parts += ["--reuse-measured"]
-    if stage in ("measure", "detail") and args.max_tiles_per_city != DEFAULT_MAX_TILES_PER_CITY:
+    # `detail`, `instances` and `access` all walk _detail_targets, whose set
+    # depends on the three flags below -- so all three stages stamp them.
+    if stage != "screen" and args.max_tiles_per_city != DEFAULT_MAX_TILES_PER_CITY:
         parts += ["--max-tiles-per-city", str(args.max_tiles_per_city)]
-    if stage == "detail" and args.detail_cities != DEFAULT_DETAIL_CITIES:
-        parts += ["--detail-cities", str(args.detail_cities)]
+    if stage in ("detail", "instances", "access"):
+        if args.detail_cities != DEFAULT_DETAIL_CITIES:
+            parts += ["--detail-cities", str(args.detail_cities)]
+        if args.cross_check_cities != DEFAULT_CROSS_CHECK_CITIES:
+            parts += ["--cross-check-cities", str(args.cross_check_cities)]
     if stage == "instances":
         if args.search_limit != DEFAULT_SEARCH_LIMIT:
             parts += ["--search-limit", str(args.search_limit)]
         if args.reconcile_tiles != DEFAULT_RECONCILE_TILES:
             parts += ["--reconcile-tiles", str(args.reconcile_tiles)]
+    # A --city override replaces a stage's whole selection, so a run that used
+    # one must say so or the record claims the default draw nobody made.
+    for city_id in args.city or []:
+        parts += ["--city", city_id]
     return " ".join(parts)
 
 
@@ -1355,8 +1386,15 @@ def summarize_instances(instances: dict[str, Any]) -> dict[str, Any]:
     sampled = sum(row["sampled"] for row in rows)
     absent = sum(row["fov_absent"] for row in rows)
     by_instance = Counter()
+    table = Counter()
     for row in rows:
         by_instance.update(row["instances"])
+        table.update(row["reconciliation"]["table"])
+    # The cross-tabulation summed over cities, keyed `<search fov>__<tile type>`.
+    # The cells that decide #316's question are `absent__*`: an EXIF-less
+    # search picture lands in SOME tile class, and this says which.
+    looked_up = {key: n for key, n in table.items() if not key.endswith("__not_in_fetched_tiles")}
+    absent_looked_up = sum(n for key, n in looked_up.items() if key.startswith("absent__"))
     return {
         "n": len(rows),
         "pictures_sampled": sampled,
@@ -1365,8 +1403,64 @@ def summarize_instances(instances: dict[str, Any]) -> dict[str, Any]:
         "fov_flat": sum(row["fov_flat"] for row in rows),
         "fov_absent": absent,
         "fov_absent_share": round(absent / sampled, 4) if sampled else None,
+        "reconciliation_table": dict(sorted(table.items())),
+        "absent_pictures_looked_up_in_tiles": absent_looked_up,
+        "absent_pictures_typed_flat_in_tiles": looked_up.get("absent__flat", 0),
         "instances_seen": dict(by_instance.most_common()),
         "requests_spent": instances["requests_spent"],
+    }
+
+
+COMPOSITION_THRESHOLDS = (1, 100, 1_000, 10_000)
+
+
+def compose_catalog(screen: dict[str, Any] | None, measure: dict[str, Any] | None):
+    """
+    The gate, stated over the WHOLE catalog, from the two strata that are known
+    differently.
+
+    The screened-zero stratum is known exactly (a zero screen is conclusive,
+    and the controls check that). The leaders are known exactly too -- every
+    one was measured. The rest of the screened-positive stratum is known only
+    through `typical`, a uniform draw from it, so its share at each threshold
+    is scaled up to the stratum's size. The sum is an ESTIMATE of how many
+    catalog cities hold at least N pictures, and it is the only number here
+    that answers "#316's median tracked city" without pooling groups that must
+    not be pooled. Thresholds use `pictures_scaled_to_bbox`, so a truncated
+    city is placed by its bbox estimate rather than its sampled count.
+
+    Returns None when either stage is missing.
+    """
+    if not screen or not measure:
+        return None
+    rows = screen["cities"]
+    zero = sum(1 for row in rows if row["screen_pictures_upper_bound"] == 0)
+    positive = len(rows) - zero
+    leaders = measure["leaders"]
+    typical = measure["typical"]
+    stratum = max(positive - len(leaders), 0)
+    thresholds = {}
+    for threshold in COMPOSITION_THRESHOLDS:
+        leaders_at = sum(1 for row in leaders if row["pictures_scaled_to_bbox"] >= threshold)
+        typical_at = sum(1 for row in typical if row["pictures_scaled_to_bbox"] >= threshold)
+        typical_share = typical_at / len(typical) if typical else None
+        estimate = leaders_at + (round(typical_share * stratum) if typical_share is not None else 0)
+        thresholds[str(threshold)] = {
+            "leaders_at_or_above": leaders_at,
+            "typical_at_or_above": typical_at,
+            "typical_share": round(typical_share, 4) if typical_share is not None else None,
+            "estimated_catalog_cities": estimate,
+            "estimated_catalog_share": round(estimate / len(rows), 4) if rows else None,
+        }
+    return {
+        "cities": len(rows),
+        "screened_zero_exact": zero,
+        "screened_positive": positive,
+        "leaders_measured": len(leaders),
+        "typical_stratum_size": stratum,
+        "typical_sampled": len(typical),
+        "median_city_pictures": 0 if zero * 2 > len(rows) else None,
+        "at_or_above": thresholds,
     }
 
 
@@ -1419,17 +1513,24 @@ def summarize_access(access: dict[str, Any]) -> dict[str, Any]:
 
     Reported as "N of M cities" rather than a bare boolean because a behaviour
     that held in one city and not another would be the interesting result, and
-    a single flag would hide it.
+    a single flag would hide it. The field-of-view finding carries its own
+    denominator: a city whose baseline sample held no EXIF-less picture cannot
+    show the filter dropping one, so it is no evidence either way rather than
+    a city where the filter behaved.
     """
     rows = access["cities"]
+    can_answer_fov = [
+        r for r in rows if r["probes"]["baseline"]["fov_classes"].get("absent", 0) > 0
+    ]
     return {
         "n": len(rows),
         "cities_where_search_paginates": sum(1 for r in rows if r["search_paginates"]),
         "cities_where_datetime_filter_honoured": sum(
             1 for r in rows if r["datetime_filter_honoured"]
         ),
+        "cities_with_an_absent_picture_in_baseline": len(can_answer_fov),
         "cities_where_fov_filter_drops_absent": sum(
-            1 for r in rows if r["fov_filter_drops_absent"]
+            1 for r in can_answer_fov if r["fov_filter_drops_absent"]
         ),
         "requests_spent": access["requests_spent"],
     }
@@ -1489,6 +1590,7 @@ def build_record(args: argparse.Namespace) -> dict[str, Any]:
         "instances": block(instances, summarize_instances, "instances"),
         "access": block(access, summarize_access, "access"),
         "cross_check": cross_check(measure, detail),
+        "catalog_composition": compose_catalog(screen, measure),
     }
 
 
@@ -1535,6 +1637,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--typical", type=int, default=DEFAULT_TYPICAL)
     parser.add_argument("--controls", type=int, default=DEFAULT_CONTROLS)
     parser.add_argument("--detail-cities", type=int, default=DEFAULT_DETAIL_CITIES)
+    parser.add_argument(
+        "--cross-check-cities",
+        type=int,
+        default=DEFAULT_CROSS_CHECK_CITIES,
+        help="richest measured cities that are complete at z15 under --max-tiles-per-city, "
+        "added to the detail set so cross_check has cities complete in both stages",
+    )
     parser.add_argument("--max-tiles-per-city", type=int, default=DEFAULT_MAX_TILES_PER_CITY)
     parser.add_argument("--search-limit", type=int, default=DEFAULT_SEARCH_LIMIT)
     parser.add_argument("--reconcile-tiles", type=int, default=DEFAULT_RECONCILE_TILES)
@@ -1565,13 +1674,27 @@ def _measure_targets(args, cities, by_id) -> dict[str, list[str]]:
     if screen is None:
         raise SystemExit(
             f"--stage measure needs {raw_path(args.raw_dir, 'screen')}; run --stage screen first "
-            f"(104 requests) or name cities with --city."
+            f"(113 requests) or name cities with --city."
         )
     return select_measure_set(screen, args.leaders, args.typical, args.controls, args.seed)
 
 
 def _detail_targets(args, by_id) -> list[str]:
-    """The ids stage `detail` will walk: the richest measured cities."""
+    """
+    The ids stage `detail` (and `instances` and `access`) will walk: the
+    richest measured cities, then the richest that are COMPLETE at z15.
+
+    The second set exists for :func:`cross_check`, which compares the z14
+    grid's server-aggregated counters against a per-picture count off the z15
+    layer and can only do so where both stages saw the whole bbox. Every city
+    rich enough to make the first set is far too large to fit -- the twelve
+    richest all exceed 200 z15 tiles -- so without the second set the
+    cross-check would compare nothing and the aggregate layer every count in
+    this study rests on would go unverified. A city qualifies when its measure
+    row is complete (an exact grid count) AND its whole z15 tile set fits under
+    --max-tiles-per-city; the two sets share one richest-first ranking and are
+    deduped, so a small rich city counts once.
+    """
     if args.city:
         return [c for c in args.city if c in by_id]
     measure = read_raw(args.raw_dir, "measure")
@@ -1580,9 +1703,25 @@ def _detail_targets(args, by_id) -> list[str]:
             f"--stage detail needs {raw_path(args.raw_dir, 'measure')}; run --stage measure first "
             f"or name cities with --city."
         )
-    measured = [row for group in MEASURE_GROUPS for row in measure[group]]
+    measured = [
+        row
+        for group in MEASURE_GROUPS
+        for row in measure[group]
+        if row["pictures"] > 0 and row["city_id"] in by_id
+    ]
     ranked = sorted(measured, key=lambda row: (-row["pictures"], row["city_id"]))
-    return [row["city_id"] for row in ranked if row["pictures"] > 0][: args.detail_cities]
+    targets = [row["city_id"] for row in ranked[: args.detail_cities]]
+    added = 0
+    for row in ranked:
+        if added >= args.cross_check_cities:
+            break
+        if row["city_id"] in targets or not row["complete"]:
+            continue
+        z15_tiles = len(tiles_for_bbox(*by_id[row["city_id"]]["bbox"], DETAIL_ZOOM))
+        if z15_tiles <= args.max_tiles_per_city:
+            targets.append(row["city_id"])
+            added += 1
+    return targets
 
 
 def main(argv: list[str] | None = None) -> int:

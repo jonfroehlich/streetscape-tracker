@@ -229,6 +229,28 @@ def test_hex_counters_are_taken_once_not_summed_across_tiles():
     assert accumulated["8b28d55522b5fff"]["nb_pictures"] == 40
 
 
+def test_seam_hex_counters_take_the_max_across_sightings_never_the_sum_or_the_first():
+    """
+    Under the measured contract every sighting carries the same whole-hex
+    figure, so max is exact. If a tile ever carried only its own piece's
+    count, first-seen could record a ZERO for a hex whose pictures all sit in
+    the other tile -- and the screen would call a covered city empty. Max
+    cannot: it is zero only when every piece is zero.
+    """
+    zoom = pf.MEASURE_ZOOM
+    x, y = _seattle_tile(zoom)
+    empty_piece = {"id": "h", "nb_pictures": 0, "nb_360_pictures": 0, "nb_flat_pictures": 0}
+    full_piece = {"id": "h", "nb_pictures": 40, "nb_360_pictures": 30, "nb_flat_pictures": 10}
+    accumulated = {}
+    for tile_x, piece in ((x, empty_piece), (x + 1, full_piece)):
+        raw = encode_polygons(
+            "grid", [{**piece, "ring": _hex_ring(-122.33, 47.60)}], tile_x, y, zoom
+        )
+        pf.merge_hexes(accumulated, pf.hexes_from_tile(raw, tile_x, y, zoom))
+    assert accumulated["h"]["nb_pictures"] == 40  # not 0 (first), not 40 + 0 either way
+    assert (accumulated["h"]["nb_360_pictures"], accumulated["h"]["nb_flat_pictures"]) == (30, 10)
+
+
 def test_a_clipped_hex_recovers_its_centre_from_the_union_of_its_pieces():
     """
     Each tile carries only the part of the hex inside it, so either piece's
@@ -768,55 +790,621 @@ def test_a_picture_whose_tile_was_not_fetched_is_named_not_dropped():
     assert result["table"] == {"absent__flat": 1, "absent__not_in_fetched_tiles": 1}
 
 
-def test_the_access_findings_are_computed_not_asserted():
-    """
-    Each finding is derived from the probe responses, so a re-run against a
-    Panoramax that has FIXED one of them fails loudly rather than leaving a
-    stale sentence in the writeup.
-    """
-    baseline = {
-        "links": [],
-        "reports_number_matched": False,
-        "first_ids": ["a", "b"],
-        "fov_classes": {"360": 5, "absent": 3},
-    }
-    same = dict(baseline)
-    row = {
-        "probes": {
-            "baseline": baseline,
-            "datetime_filtered": same,
-            "fov_360_filtered": {"fov_classes": {"360": 8}},
+def _search_feature(picture_id, fov, stamp="2025-06-01T00:00:00Z", lon=-122.33, lat=47.60):
+    return {
+        "id": picture_id,
+        "geometry": {"type": "Point", "coordinates": [lon, lat]},
+        "properties": {
+            "datetime": stamp,
+            "pers:interior_orientation": {"field_of_view": fov} if fov is not None else {},
         },
+        "links": [{"rel": "via", "instance_name": "IGN", "href": "https://ign.invalid"}],
     }
-    # Re-derive with the module's own expressions by round-tripping a record.
-    assert not (bool(baseline["links"]) or baseline["reports_number_matched"])
-    assert baseline["first_ids"] == same["first_ids"]  # datetime ignored
-    assert row["probes"]["fov_360_filtered"]["fov_classes"].get("absent", 0) == 0
 
 
-def test_summarize_access_counts_cities_rather_than_flattening_to_a_boolean():
-    """A behaviour that held in one city and not another is the interesting
-    result; a single flag would hide it."""
-    access = {
-        "requests_spent": 9,
-        "cities": [
+def _search_response(features, links=(), number_matched=None):
+    payload = {"features": features, "links": list(links)}
+    if number_matched is not None:
+        payload["numberMatched"] = number_matched
+    return _FakeResponse(200, json.dumps(payload).encode(), payload)
+
+
+A360, B_ABSENT = _search_feature("a", 360), _search_feature("b", None)
+
+
+@pytest.mark.parametrize(
+    "responses, expected",
+    [
+        (
+            # What Panoramax did on 2026-09-04: no links, the same rows back
+            # under a datetime filter, and the EXIF-less picture gone under
+            # the field-of-view filter.
+            [
+                _search_response([A360, B_ABSENT]),
+                _search_response([A360, B_ABSENT]),
+                _search_response([A360]),
+            ],
             {
                 "search_paginates": False,
                 "datetime_filter_honoured": False,
                 "fov_filter_drops_absent": True,
             },
+        ),
+        (
+            # A Panoramax that fixed all three: every finding must flip, or
+            # the writeup's three sentences would outlive the behaviour.
+            [
+                _search_response([A360, B_ABSENT], links=[{"rel": "next", "href": "..."}]),
+                _search_response([B_ABSENT]),
+                _search_response([A360, B_ABSENT]),
+            ],
             {
-                "search_paginates": False,
+                "search_paginates": True,
                 "datetime_filter_honoured": True,
+                "fov_filter_drops_absent": False,
+            },
+        ),
+        (
+            # A match count is pagination enough, even with no links.
+            [
+                _search_response([A360, B_ABSENT], number_matched=2),
+                _search_response([A360, B_ABSENT]),
+                _search_response([A360]),
+            ],
+            {
+                "search_paginates": True,
+                "datetime_filter_honoured": False,
                 "fov_filter_drops_absent": True,
             },
+        ),
+    ],
+)
+def test_the_access_findings_are_derived_from_the_responses(responses, expected):
+    """
+    Each finding is computed from the probe responses by `stage_access`, so a
+    re-run against a Panoramax that has FIXED one of them fails loudly rather
+    than leaving a stale sentence in the writeup. (An earlier version of this
+    test re-asserted the expressions on dict literals and never called the
+    stage at all, which pinned nothing.)
+    """
+    fetcher = _fetcher(responses)
+    row = pf.stage_access(_city(), fetcher)
+    assert {key: row[key] for key in expected} == expected
+    assert [params["limit"] for _, params in fetcher.session.calls] == [pf.ACCESS_PROBE_LIMIT] * 3
+    assert fetcher.session.calls[1][1]["datetime"] == pf.ACCESS_PROBE_DATETIME
+    assert fetcher.session.calls[2][1]["filter"] == "field_of_view=360"
+    assert row["probes"]["baseline"]["fov_classes"] == {"360": 1, "absent": 1}
+
+
+def test_fov_filter_drops_absent_needs_an_absent_picture_to_drop():
+    """No EXIF-less picture in the baseline is no evidence either way."""
+    fetcher = _fetcher(
+        [_search_response([A360]), _search_response([A360]), _search_response([A360])]
+    )
+    assert pf.stage_access(_city(), fetcher)["fov_filter_drops_absent"] is False
+
+
+def test_summarize_access_counts_cities_rather_than_flattening_to_a_boolean():
+    """A behaviour that held in one city and not another is the interesting
+    result; a single flag would hide it."""
+
+    def city(paginates, honoured, drops, absent_in_baseline):
+        return {
+            "search_paginates": paginates,
+            "datetime_filter_honoured": honoured,
+            "fov_filter_drops_absent": drops,
+            "probes": {"baseline": {"fov_classes": {"absent": absent_in_baseline, "360": 1}}},
+        }
+
+    access = {
+        "requests_spent": 9,
+        "cities": [
+            city(False, False, True, 3),
+            city(False, True, True, 1),
+            # No EXIF-less picture in the baseline: cannot answer the field-of-
+            # view question, so it is neither a yes nor a no.
+            city(False, False, False, 0),
         ],
     }
     summary = pf.summarize_access(access)
-    assert summary["n"] == 2
+    assert summary["n"] == 3
     assert summary["cities_where_search_paginates"] == 0
     assert summary["cities_where_datetime_filter_honoured"] == 1
+    assert summary["cities_with_an_absent_picture_in_baseline"] == 2
     assert summary["cities_where_fov_filter_drops_absent"] == 2
+
+
+# ── The stages end to end, over synthetic tiles ────────────────────────────
+
+
+class _TileFetcher:
+    """A `Fetcher` stand-in serving tiles from a dict keyed (zoom, x, y)."""
+
+    def __init__(self, tiles, raise_for=None):
+        self.tiles = tiles
+        self.raise_for = raise_for or {}
+        self.requests_spent = 0
+        self.empty_tiles = 0
+        self.served = []
+
+    def get_tile(self, template, zoom, x, y):
+        self.requests_spent += 1
+        self.served.append((zoom, x, y))
+        if (zoom, x, y) in self.raise_for:
+            raise self.raise_for[(zoom, x, y)]
+        raw = self.tiles.get((zoom, x, y), b"")
+        if not raw:
+            self.empty_tiles += 1
+        return raw
+
+
+def _hex_feature(hex_id, lon, lat, radius, **counters):
+    return {"id": hex_id, "ring": _hex_ring(lon, lat, radius), **counters}
+
+
+def test_stage_screen_v2_counts_a_hex_that_overlaps_the_city_but_is_centred_outside_it():
+    """
+    The corrected screen, end to end: tile enumeration over the grown bbox,
+    the merge across tiles, overlap selection and the sum. The one hex here is
+    far larger than the city and centred outside it -- a screen hex is often
+    bigger than a city bbox -- and a far-away hex in the same tile is not
+    counted. The row must say 1 cell and the hex's counters.
+    """
+    city = _city()
+    zoom = pf.SCREEN_ZOOM
+    x, y = _seattle_tile(zoom)
+    hexes = [
+        _hex_feature(
+            "86a", -122.30, 47.65, 0.05, nb_pictures=9, nb_360_pictures=7, nb_flat_pictures=2
+        ),
+        _hex_feature(
+            "86b", -121.50, 47.65, 0.05, nb_pictures=500, nb_360_pictures=0, nb_flat_pictures=500
+        ),
+    ]
+    fetcher = _TileFetcher({(zoom, x, y): encode_polygons("grid", hexes, x, y, zoom)})
+    out = pf.stage_screen([city], fetcher, "v2_h3")
+    (row,) = out["cities"]
+    assert row["cells"] == 1
+    assert row["screen_pictures_upper_bound"] == 9
+    assert row["screen_360_upper_bound"] == 7
+    assert row["screen_flat_upper_bound"] == 2
+    assert out["variant"] == "v2_h3" and out["cell_deg"] is None
+    assert out["requests_spent"] == out["tiles"] == len(set(fetcher.served))
+    # The hex's centre is outside the city bbox, so centre selection would have
+    # screened this city ZERO -- the failure the design cannot tolerate.
+    assert not pf.bbox_contains(-122.30, 47.65, tuple(city["bbox"]))
+
+
+def test_stage_screen_v1_sums_the_lattice_cells_within_one_cell_of_the_city():
+    city = _city()
+    zoom = pf.SCREEN_ZOOM
+    x, y = _seattle_tile(zoom)
+    cells = [
+        {"lon": -122.3, "lat": 47.6, "nb_pictures": 4, "nb_360_pictures": 4, "nb_flat_pictures": 0},
+        {"lon": -122.4, "lat": 47.5, "nb_pictures": 1, "nb_360_pictures": 0, "nb_flat_pictures": 1},
+        {
+            "lon": -121.0,
+            "lat": 47.6,
+            "nb_pictures": 800,
+            "nb_360_pictures": 0,
+            "nb_flat_pictures": 800,
+        },
+    ]
+    fetcher = _TileFetcher({(zoom, x, y): encode_points("grid", cells, x, y, zoom)})
+    (row,) = pf.stage_screen([city], fetcher, "v1_lattice")["cities"]
+    assert row["cells"] == 2
+    assert row["screen_pictures_upper_bound"] == 5
+
+
+def test_stage_screen_shares_tiles_between_neighbouring_cities_and_prices_a_dry_run():
+    """One request per DISTINCT z6 tile: two cities on one tile cost one."""
+    neighbours = [
+        _city("a"),
+        {**_city("b"), "bbox": list(dm.grid_bbox(47.7, -122.30, 5000, 5000, 20))},
+    ]
+    planned = pf.stage_screen(neighbours, None)
+    assert planned["planned_requests"] == planned["tiles"] == 1
+    assert planned["cities"] == []
+    fetcher = _TileFetcher({})
+    out = pf.stage_screen(neighbours, fetcher)
+    assert fetcher.requests_spent == 1
+    assert [row["screen_pictures_upper_bound"] for row in out["cities"]] == [0, 0]
+
+
+def _tile_centre(x, y, zoom):
+    return dm.tile_frac_to_lonlat(x + 0.5, y + 0.5, zoom)
+
+
+def test_measure_city_takes_a_seam_hex_once_and_scales_a_truncated_city():
+    """
+    Every z14 tile of the city carries a clipped piece of ONE hex, all under
+    the same id with the same whole-hex counter. The count must be that
+    counter once -- not once per tile -- the unioned centre must land inside
+    the bbox, and a run cut short at 5 tiles must scale by tiles_total/5.
+    """
+    city = _city()
+    zoom = pf.MEASURE_ZOOM
+    tiles = dm.tiles_for_bbox(*city["bbox"], zoom)
+    assert len(tiles) > 5
+    served = {}
+    for x, y in tiles:
+        lon, lat = _tile_centre(x, y, zoom)
+        piece = _hex_feature(
+            "8b1",
+            lon,
+            lat,
+            0.0004,
+            nb_pictures=40,
+            nb_360_pictures=30,
+            nb_flat_pictures=10,
+            date="2026-02-01",
+        )
+        served[(zoom, x, y)] = encode_polygons("grid", [piece], x, y, zoom)
+
+    complete = pf.measure_city(city, _TileFetcher(served), max_tiles=len(tiles), seed=316)
+    assert complete["complete"] is True
+    assert complete["tiles_probed"] == complete["tiles_total"] == len(tiles)
+    assert (complete["hexes"], complete["pictures"]) == (1, 40)
+    assert (complete["pictures_360"], complete["pictures_flat"]) == (30, 10)
+    assert complete["pictures_scaled_to_bbox"] == 40
+    assert complete["newest_hex_date"] == "2026-02-01"
+
+    fetcher = _TileFetcher(served)
+    truncated = pf.measure_city(city, fetcher, max_tiles=5, seed=316)
+    assert truncated["complete"] is False
+    assert truncated["tiles_probed"] == fetcher.requests_spent == 5
+    assert truncated["pictures"] == 40
+    assert truncated["pictures_scaled_to_bbox"] == round(40 * len(tiles) / 5)
+    # The same seed visits the same five tiles: a truncated city is reproducible.
+    again = _TileFetcher(served)
+    pf.measure_city(city, again, max_tiles=5, seed=316)
+    assert again.served == fetcher.served
+
+
+def _picture(picture_id, lon, lat, **props):
+    return {"id": picture_id, "lon": lon, "lat": lat, **props}
+
+
+def _serve_pictures(pictures_by_tile, zoom):
+    return {
+        (zoom, x, y): encode_points("pictures", points, x, y, zoom)
+        for (x, y), points in pictures_by_tile.items()
+    }
+
+
+def test_detail_city_keeps_in_bbox_pictures_once_and_reports_types_months_and_contributors():
+    city = _city()
+    bbox = tuple(city["bbox"])
+    zoom = pf.DETAIL_ZOOM
+    tiles = dm.tiles_for_bbox(*bbox, zoom)
+    # Tile A is the westernmost tile of the centre row: it straddles the
+    # bbox's west edge, so it holds both in-bbox points and a point west of
+    # the bbox -- the ordinary shape of an out-of-bbox row, since tile
+    # columns overhang the rectangle. Tile B is its eastern neighbour.
+    centre_lat = (bbox[1] + bbox[3]) / 2
+    _, yc = pf._tile_xy((bbox[0] + bbox[2]) / 2, centre_lat, zoom)
+    tile_a = (min(x for x, _ in tiles), yc)
+    tile_b = (tile_a[0] + 1, yc)
+    assert tile_a in tiles and tile_b in tiles
+    outside = (bbox[0] - 1e-4, centre_lat)
+    in_a = (bbox[0] + 1e-4, centre_lat)
+    assert pf._tile_xy(*outside, zoom) == tile_a and pf._tile_xy(*in_a, zoom) == tile_a
+    in_b = _tile_centre(*tile_b, zoom)
+    assert pf.bbox_contains(*in_b, bbox)
+    by_tile = {
+        tile_a: [
+            _picture(
+                "a",
+                *in_a,
+                ts="2025-11-02 00:24:37+00",
+                type="equirectangular",
+                account_id="u1",
+                first_sequence="s1",
+            ),
+            _picture(
+                "b",
+                in_a[0] + 1e-5,
+                in_a[1],
+                ts="2024-01-05 09:00:00+00",
+                type="flat",
+                account_id="u1",
+                first_sequence="s1",
+            ),
+            _picture(
+                "c",
+                in_a[0] + 2e-5,
+                in_a[1],
+                ts=None,
+                type=None,
+                account_id="u2",
+                first_sequence=None,
+            ),
+            _picture(
+                "dup",
+                in_a[0] + 3e-5,
+                in_a[1],
+                ts="2024-01-09 09:00:00+00",
+                type="flat",
+                account_id="u2",
+                first_sequence="s2",
+            ),
+            _picture(
+                "z",
+                *outside,
+                ts="2020-01-01 00:00:00+00",
+                type="flat",
+                account_id="u3",
+                first_sequence="s3",
+            ),
+        ],
+        # The seam copy of `dup`, as a tile buffer would carry it.
+        tile_b: [
+            _picture(
+                "dup",
+                *in_b,
+                ts="2024-01-09 09:00:00+00",
+                type="flat",
+                account_id="u2",
+                first_sequence="s2",
+            ),
+        ],
+    }
+    row = pf.detail_city(city, _TileFetcher(_serve_pictures(by_tile, zoom)), len(tiles), 316)
+    assert row["complete"] is True
+    assert row["pictures"] == 4  # a, b, c, dup -- z is outside, dup once
+    assert (row["pictures_360"], row["pictures_flat"], row["pictures_type_absent"]) == (1, 2, 1)
+    assert row["undated_pictures"] == 1
+    assert row["capture_months"] == {"2024-01": 2, "2025-11": 1}
+    assert row["distinct_capture_months"] == 2
+    assert row["distinct_contributors"] == 2
+    assert row["top_contributor_share"] == pytest.approx(0.5)
+    assert row["distinct_sequences"] == 2
+
+
+def _measure_args(tmp_path, *extra):
+    return pf.parse_args(["--stage", "measure", "--raw-dir", str(tmp_path), *extra])
+
+
+def test_the_measure_loop_reuses_a_matching_row_and_records_a_failed_city():
+    """
+    The loop's two non-happy paths, which the per-function tests cannot see:
+    a reusable prior row is placed in the CURRENT group and counted, and a
+    city whose fetch fails is recorded under `failed` rather than dropped
+    (an omitted city silently shrinks a group's denominator).
+    """
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cities = [_city("kept"), _city("broken")]
+        by_id = pf._cities_by_id(cities)
+        n = len(dm.tiles_for_bbox(*cities[0]["bbox"], pf.MEASURE_ZOOM))
+        pf.write_raw(tmp, "measure", _prior("kept", tiles_total=n, tiles_probed=n))
+        args = _measure_args(tmp, "--city", "kept", "--city", "broken", "--reuse-measured")
+        zoom = pf.MEASURE_ZOOM
+        first_tile = pf.shuffled_tiles(dm.tiles_for_bbox(*cities[1]["bbox"], zoom), 316)[0]
+        fetcher = _TileFetcher({}, raise_for={(zoom, *first_tile): RuntimeError("boom")})
+
+        out = pf._run_stage(args, cities, by_id, fetcher)
+
+    assert [row["city_id"] for row in out["leaders"]] == ["kept"]
+    assert out["leaders"][0]["reused_from"].startswith("python scripts/panoramax_feasibility.py")
+    assert out["reused_rows"] == 1
+    assert out["failed"] == [{"group": "leaders", "city_id": "broken", "error": "boom"}]
+    assert out["typical"] == out["controls"] == []
+    # The reused city cost nothing; the broken one cost exactly its first tile.
+    assert out["requests_spent"] == fetcher.requests_spent == 1
+
+
+def test_a_refusal_inside_the_measure_loop_stops_the_run_rather_than_being_recorded(tmp_path):
+    cities = [_city("a"), _city("b")]
+    args = _measure_args(tmp_path, "--city", "a", "--city", "b")
+    zoom = pf.MEASURE_ZOOM
+    first_tile = pf.shuffled_tiles(dm.tiles_for_bbox(*cities[0]["bbox"], zoom), 316)[0]
+    fetcher = _TileFetcher({}, raise_for={(zoom, *first_tile): pf.BlockedError("429")})
+    with pytest.raises(pf.BlockedError):
+        pf._run_stage(args, cities, pf._cities_by_id(cities), fetcher)
+    assert fetcher.requests_spent == 1  # city b was never started
+
+
+def test_the_measure_dry_run_prices_each_group_under_the_tile_cap(tmp_path):
+    cities = [_city("a")]
+    n = len(dm.tiles_for_bbox(*cities[0]["bbox"], pf.MEASURE_ZOOM))
+    args = _measure_args(tmp_path, "--city", "a", "--dry-run", "--max-tiles-per-city", "3")
+    out = pf._run_stage(args, cities, pf._cities_by_id(cities), None)
+    assert n > 3
+    assert out["planned_requests"] == {"leaders": 3, "typical": 0, "controls": 0}
+    assert out["planned_total"] == 3
+
+
+def test_the_detail_targets_add_the_richest_cities_that_fit_at_z15(tmp_path):
+    """
+    None of the richest cities fits under --max-tiles-per-city at z15, so the
+    cross-check needs a second set: the richest cities whose measure row is
+    complete AND whose whole z15 tile set fits. A rich-but-truncated row and a
+    city no longer in the catalog are both skipped.
+    """
+    big = {**_city("big"), "bbox": list(dm.grid_bbox(47.6, -122.33, 20000, 20000, 20))}
+    small_a = {**_city("small-a"), "bbox": list(dm.grid_bbox(47.9, -122.33, 1500, 1500, 20))}
+    small_b = {**_city("small-b"), "bbox": list(dm.grid_bbox(48.1, -122.33, 1500, 1500, 20))}
+    cut = {**_city("cut"), "bbox": list(dm.grid_bbox(48.3, -122.33, 1500, 1500, 20))}
+    by_id = pf._cities_by_id([big, small_a, small_b, cut])
+    assert len(dm.tiles_for_bbox(*big["bbox"], pf.DETAIL_ZOOM)) > 50
+    assert len(dm.tiles_for_bbox(*small_a["bbox"], pf.DETAIL_ZOOM)) <= 50
+
+    def row(city_id, pictures, complete=True):
+        return {"city_id": city_id, "pictures": pictures, "complete": complete}
+
+    pf.write_raw(
+        str(tmp_path),
+        "measure",
+        {
+            "leaders": [row("big", 10_000), row("cut", 900, complete=False), row("gone", 800)],
+            "typical": [row("small-a", 500), row("small-b", 20), row("empty", 0)],
+            "controls": [],
+        },
+    )
+    args = pf.parse_args(
+        [
+            "--stage",
+            "detail",
+            "--raw-dir",
+            str(tmp_path),
+            "--detail-cities",
+            "1",
+            "--cross-check-cities",
+            "1",
+            "--max-tiles-per-city",
+            "50",
+        ]
+    )
+    assert pf._detail_targets(args, by_id) == ["big", "small-a"]
+    args.cross_check_cities = 5
+    assert pf._detail_targets(args, by_id) == ["big", "small-a", "small-b"]
+    args.cross_check_cities = 0
+    assert pf._detail_targets(args, by_id) == ["big"]
+
+
+def test_instances_city_attributes_pictures_to_instances_and_flags_the_search_cap():
+    zoom = pf.DETAIL_ZOOM
+    x, y = _seattle_tile(zoom)
+    tile = encode_points(
+        "pictures",
+        [{"lon": -122.33, "lat": 47.60, "id": "a", "ts": "2025-06-01 00:00:00+00", "type": "flat"}],
+        x,
+        y,
+        zoom,
+    )
+    far = _search_feature("far", None, lon=2.35, lat=48.86)
+    far["links"] = [{"rel": "via", "instance_name": "OSM-FR", "href": "https://osm.invalid"}]
+    fetcher = _fetcher([_search_response([A360, far]), _FakeResponse(200, tile)])
+    row = pf.instances_city(_city(), fetcher, search_limit=2, reconcile_tiles=1)
+    assert row["sampled"] == 2
+    assert row["at_search_limit"] is True
+    assert row["instances"] == {"IGN": 1, "OSM-FR": 1}
+    assert (row["fov_360"], row["fov_flat"], row["fov_absent"]) == (1, 0, 1)
+    # `a` says 360 in search but `flat` in the tile: the table keeps both
+    # readings side by side, and the unfetched picture says so.
+    assert row["reconciliation"]["table"] == {"360__flat": 1, "absent__not_in_fetched_tiles": 1}
+    assert row["reconciliation"]["tiles_fetched"] == 1
+    assert fetcher.session.calls[0][1]["limit"] == 2
+
+
+def test_federation_snapshot_reads_the_providers_misspelled_harvest_key():
+    """
+    The instances endpoint spells it `last_succesful_harvest`. Reading the
+    correctly spelled key would silently record every instance as never
+    harvested, which is the kind of null that looks like a finding.
+    """
+    instances = {
+        "instances": [
+            {"name": "small", "url": "https://s.invalid", "last_succesful_harvest": "2026-09-01"},
+            {"name": "IGN", "url": "https://ign.invalid", "last_succesful_harvest": "2026-09-04"},
+        ]
+    }
+    stats = {
+        "generic_stats": {"nb_pictures": 105},
+        "stats_by_instance": {"IGN": {"nb_pictures": 100, "nb_contributors": 9}},
+    }
+    fetcher = _fetcher([_FakeResponse(200, b"{}", instances), _FakeResponse(200, b"{}", stats)])
+    snapshot = pf.federation_snapshot(fetcher)
+    assert snapshot["registered_instances"] == 2
+    assert snapshot["generic_stats"] == {"nb_pictures": 105}
+    assert [i["name"] for i in snapshot["instances"]] == ["IGN", "small"]  # richest first
+    assert snapshot["instances"][0]["last_successful_harvest"] == "2026-09-04"
+    assert snapshot["instances"][0]["nb_contributors"] == 9
+    assert snapshot["instances"][1]["nb_pictures"] is None  # unreported, never 0
+
+
+def test_summarize_instances_sums_the_reconciliation_and_names_the_absent_cells():
+    def city(table, absent):
+        return {
+            "sampled": sum(table.values()),
+            "at_search_limit": False,
+            "instances": {"osm-fr": sum(table.values())},
+            "fov_360": table.get("360__equirectangular", 0),
+            "fov_flat": table.get("flat__flat", 0),
+            "fov_absent": absent,
+            "reconciliation": {"table": table},
+        }
+
+    instances = {
+        "requests_spent": 4,
+        "cities": [
+            city({"360__equirectangular": 3, "absent__flat": 2}, absent=2),
+            city({"absent__flat": 1, "absent__not_in_fetched_tiles": 4}, absent=5),
+        ],
+    }
+    summary = pf.summarize_instances(instances)
+    assert summary["reconciliation_table"] == {
+        "360__equirectangular": 3,
+        "absent__flat": 3,
+        "absent__not_in_fetched_tiles": 4,
+    }
+    # Unlooked-up pictures are not evidence of a type, so they stay out of both.
+    assert summary["absent_pictures_looked_up_in_tiles"] == 3
+    assert summary["absent_pictures_typed_flat_in_tiles"] == 3
+    assert summary["fov_absent_share"] == pytest.approx(7 / 10)
+
+
+def test_compose_catalog_scales_the_typical_draw_and_counts_the_leaders_exactly():
+    """
+    The gate over the whole catalog: zeros exact, leaders exact, and the rest
+    of the positive stratum through the uniform `typical` draw. 100 cities:
+    60 screened zero, 40 positive, 5 leaders measured, so the typical stratum
+    is 35; a 4-city typical draw with 2 at >= 100 puts half the stratum there.
+    """
+    screen = {
+        "cities": [{"screen_pictures_upper_bound": 0}] * 60
+        + [{"screen_pictures_upper_bound": 9}] * 40
+    }
+    measure = {
+        "leaders": [{"pictures_scaled_to_bbox": n} for n in (50_000, 20_000, 5_000, 500, 150)],
+        "typical": [{"pictures_scaled_to_bbox": n} for n in (0, 3, 120, 4_000)],
+        "controls": [],
+    }
+    out = pf.compose_catalog(screen, measure)
+    assert (out["screened_zero_exact"], out["typical_stratum_size"]) == (60, 35)
+    assert out["median_city_pictures"] == 0
+    at = out["at_or_above"]
+    assert at["1"]["estimated_catalog_cities"] == 5 + round(0.75 * 35)
+    assert at["100"]["estimated_catalog_cities"] == 5 + round(0.5 * 35)
+    assert at["1000"]["estimated_catalog_cities"] == 3 + round(0.25 * 35)
+    assert at["10000"]["estimated_catalog_cities"] == 2 + 0
+    assert at["10000"]["estimated_catalog_share"] == pytest.approx(0.02)
+    assert pf.compose_catalog(None, measure) is None
+    assert pf.compose_catalog(screen, None) is None
+    # Fewer than half screened zero: the median is not known to be zero.
+    half = {"cities": screen["cities"][:40] + screen["cities"][60:]}
+    assert pf.compose_catalog(half, measure)["median_city_pictures"] is None
+
+
+def test_summarize_measure_keeps_the_three_groups_apart():
+    def row(city_id, pictures, complete=True):
+        return {
+            "city_id": city_id,
+            "pictures": pictures,
+            "pictures_360": pictures,
+            "pictures_flat": 0,
+            "pictures_scaled_to_bbox": pictures * (1 if complete else 2),
+            "complete": complete,
+        }
+
+    measure = {
+        "requests_spent": 5,
+        "empty_tiles": 1,
+        "failed": [],
+        "reused_rows": 2,
+        "leaders": [row("l1", 1000, complete=False), row("l2", 900)],
+        "typical": [row("t1", 3), row("t2", 0)],
+        "controls": [row("c1", 0)],
+    }
+    summary = pf.summarize_measure(measure)
+    assert summary["reused_rows"] == 2
+    assert summary["leaders"]["n"] == 2 and summary["leaders"]["cities_truncated"] == 1
+    assert summary["leaders"]["picture_count_scaled_distribution"]["max"] == 2000
+    assert summary["typical"]["cities_with_any_pictures"] == 1
+    assert summary["typical"]["picture_count_distribution"]["p50"] == pytest.approx(1.5)
+    assert summary["controls"]["pictures_total"] == 0
 
 
 # ── Provenance and the committed record ────────────────────────────────────
@@ -858,6 +1446,27 @@ def test_measured_by_carries_every_argument_that_moves_a_number():
     )
 
 
+@pytest.mark.parametrize("stage", ["detail", "instances", "access"])
+def test_every_stage_that_walks_the_detail_targets_stamps_what_selects_them(stage):
+    """
+    `instances` and `access` reuse `_detail_targets`, so their city set moves
+    with --detail-cities, --cross-check-cities and --max-tiles-per-city just
+    as `detail`'s does; a stamp that named those only for `detail` would let
+    an instances record claim a default draw nobody made.
+    """
+    stamp = pf.measured_by(
+        _args(stage=stage, detail_cities=3, cross_check_cities=2, max_tiles_per_city=50), stage
+    )
+    for fragment in ("--detail-cities 3", "--cross-check-cities 2", "--max-tiles-per-city 50"):
+        assert fragment in stamp, stamp
+
+
+def test_a_city_override_is_stamped_because_it_replaces_the_whole_selection():
+    stamp = pf.measured_by(_args(stage="access", city=["x--y", "z--w"]), "access")
+    assert "--city x--y --city z--w" in stamp
+    assert "--city" not in pf.measured_by(_args(stage="access"), "access")
+
+
 def test_the_catalog_is_labelled_not_pathed():
     """
     A committed record must not carry a machine's directory layout, and a
@@ -870,7 +1479,7 @@ def test_the_catalog_is_labelled_not_pathed():
 
 def test_an_unrun_stage_is_an_explicit_null_not_a_missing_key(tmp_path):
     record = pf.build_record(_args(raw_dir=str(tmp_path), docs_dir=str(tmp_path)))
-    for stage in ("screen", "measure", "detail", "instances"):
+    for stage in ("screen", "measure", "detail", "instances", "access"):
         assert record[stage]["available"] is False
         assert record[stage]["source"].endswith(f"{stage}.json")
 
@@ -942,6 +1551,7 @@ def test_every_available_summary_recomputes_from_its_own_raw_block(record):
         "measure": pf.summarize_measure,
         "detail": pf.summarize_detail,
         "instances": pf.summarize_instances,
+        "access": pf.summarize_access,
     }
     available = [
         key for key, block in record.items() if isinstance(block, dict) and block.get("available")
