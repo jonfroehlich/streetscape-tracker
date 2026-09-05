@@ -337,6 +337,13 @@ That is roughly half the Mapillary channels' configured rate against a host with
 The probe calls `refuse_on_collection_host()`, so it can only run from a laptop: a per-IP limit found from makelab2 takes out the nightly batch, and both prior bans landed exactly that way.
 It treats **403 and 429 as stop, never as retry** — a refusal ends the run with what it has measured, since finding this host's limit is emphatically not the study's question.
 
+**Three silent failure modes in `/api/search`, and phase 2 has to design around all of them.**
+Each is measured per city by the probe's `access` stage rather than asserted, so a re-run against a fixed Panoramax fails loudly instead of leaving stale prose here; the 2026-09-05 run over 20 cities is in the writeup's record.
+It **does not paginate** and reports no `numberMatched` (20 of 20 cities), so a bbox holding more pictures than `limit` is indistinguishable from one holding exactly `limit`.
+The **`datetime` parameter is silently ignored** (20 of 20) — asking for `2026-01-01T00:00:00Z/..` returns the identical first rows, some dated 2016, that an unfiltered request returns — so an incremental "everything since the last run" fetch would re-read the whole history and report it as new.
+And **`filter=field_of_view=360` returns none of the EXIF-less pictures** (17 of the 17 cities whose sample held one); those pictures are `flat` in the tile layer without exception, so the filter loses nothing a 360° collector wants, but a collector counting "absent" as possibly-360 would overstate coverage in every such city.
+The tile layers are the answer to all three: they carry a `type` field with no absent state, and they are the instrument [`experiments/panoramax-feasibility.md`](experiments/panoramax-feasibility.md) actually uses.
+
 **One host, not twenty-five.** `api.panoramax.xyz` is a meta-catalog that harvests metadata from every registered instance (23 on 2026-09-04), so a collector would query one host regardless of how many instances join — one `host_lock.py` entry, no per-instance fan-out, and no per-instance rate question.
 The corollary is that all of our load lands on one volunteer-run endpoint rather than being spread across the federation, which argues for the conservative end of any pacing range rather than against it.
 

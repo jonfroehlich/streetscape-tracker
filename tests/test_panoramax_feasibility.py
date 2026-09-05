@@ -1588,3 +1588,28 @@ def test_the_controls_confirm_a_zero_screen_is_conclusive(record):
     controls = record["measure"]["detail"]["controls"]
     assert controls, "the measure stage ran without controls"
     assert all(row["pictures"] == 0 for row in controls)
+
+
+def test_the_two_tile_instruments_agree_on_every_city_complete_in_both(record):
+    """
+    The z14 grid's counters are server-aggregated; the z15 pictures layer is
+    counted here per picture. Nothing else checks the aggregate layer every
+    count rests on. Measured 2026-09-05 over 8 complete cities: 5 exact, the
+    rest within 3 pictures (ratios 0.9989-1.0357), so a 5% band is a
+    regression pin, not a tolerance the study needed.
+    """
+    check = record["cross_check"]
+    if not check:
+        pytest.skip("needs cities complete in both the measure and detail stages")
+    assert check["n"] >= 5, "the cross-check set is what --cross-check-cities exists for"
+    for row in check["cities"]:
+        assert 0.95 <= row["ratio"] <= 1.05, row
+
+
+def test_the_tile_type_field_had_no_absent_state_over_every_picture_seen(record):
+    """#316's third state, refuted per picture rather than per total."""
+    if not record["detail"]["available"]:
+        pytest.skip("needs the detail stage")
+    summary = record["detail"]["summary"]
+    assert summary["pictures_seen"] > 0
+    assert summary["pictures_type_absent"] == 0

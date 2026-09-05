@@ -175,7 +175,7 @@ We track three Indian cities, and our existing providers are thin to absent ther
 | New Delhi | 49.9% | 0.38% | 472 | 0 |
 
 Mapillary is effectively empty in India — two-tenths of a percent is not a coverage rate, it is a rounding artifact.
-Panoramax is worse in absolute terms and, decisively, carries **zero** 360° pictures across both metros: everything returned was flat or had no `field_of_view` at all, contributed almost entirely by the MapComplete and OSM-FR instances.
+Panoramax is worse in absolute terms and, decisively, carries **zero** 360° pictures across both metros: everything returned was flat — including the rows with no `field_of_view`, which the phase-1 study showed the tiles type `flat` without exception — contributed almost entirely by the MapComplete and OSM-FR instances.
 
 Chandigarh is included because it hosts a Project Sidewalk deployment and is not yet in the catalog; its 17 Panoramax pictures all came from one instance in one year, none of them spherical.
 So for India, GSV is not merely the best provider, it is close to the only one, and its own coverage runs 14–50%.
@@ -191,7 +191,8 @@ That is the largest provider gap anywhere in the catalog, and it has no open sol
 
 ### Panoramax
 
-**Status: open, and the recommended next integration — tracked in [#316](https://github.com/jonfroehlich/streetscape-tracker/issues/316).**
+**Status: phase 1 measured — tracked in [#316](https://github.com/jonfroehlich/streetscape-tracker/issues/316), writeup in [`experiments/panoramax-feasibility.md`](experiments/panoramax-feasibility.md).**
+The median tracked city holds nothing (730 of 1,144 screen to a conclusive zero), but ~20 cities hold 16k–1.1M pictures and Des Moines has more 360° pictures on Panoramax than in Mapillary's census of the same bbox — so the recommendation is an **opt-in** channel on the KartaView pattern, never a default-membership one.
 
 A federated open imagery commons founded by IGN and OpenStreetMap France, licensed per picture, with **25 registered instances** and ~100 M pictures.
 Two instances hold ~99% of them — IGN at 58.0 M and OSM-FR at 54.0 M — with OSM-HR (4.2 M), Taiwan (1.2 M) and Belgium (0.65 M) next and a long tail of hobbyist servers down to a few thousand pictures.
@@ -216,13 +217,14 @@ Per-picture metadata is **richer than either census provider we have**: `datetim
 
 Zagreb is the instructive one: the OSM-HR instance's 4.2 M pictures appear to be entirely flat dashcam capture, so a 360-only filter would discard the whole instance.
 Each city is also dominated by one or two contributors — Seattle is 91% a single GoPro Max user — so the mix is a property of who happened to map there, not of the platform.
-The consequence for a collector is that Panoramax must report **both** coverage numbers under #116, and that "field absent" is a third state to carry, not a synonym for flat.
+The consequence for a collector is that Panoramax must report **both** coverage numbers under #116.
+"Field absent" is **not** a third state: the phase-1 study looked 2,136 EXIF-less search pictures up in the tile `pictures` layer, whose `type` has no absent state, and every one is `flat` — the absence is the search endpoint's EXIF passthrough, and a tile-based collector never sees it.
 
 **Rate limits are not documented** anywhere found, including the OpenAPI spec, and a single read-only probe returned no rate-limit headers.
 Unlike KartaView, though, **a staffed community exists** — [forum.geocommuns.fr](https://forum.geocommuns.fr) and the [OSM community forum](https://community.openstreetmap.org/), with core developers answering within days — so the standing rule's "read the forum first" has an object here, and the pacing question can simply be *asked* before any collector is written.
 
-**Two open risks.** Coverage against our largely-US catalog is unmeasured and is the thing that decides whether this is worth a channel.
-And there is active work on migrating sequences between instances, so picture identity across instance moves needs an answer before we build diffs — if an image can change instance and identity, "removed" in a run-to-run diff could mean "migrated", which would corrupt the one statistic this project exists to produce.
+**One open risk.** Coverage against the catalog is now measured (above).
+But there is active work on migrating sequences between instances, so picture identity across instance moves needs an answer before we build diffs — if an image can change instance and identity, "removed" in a run-to-run diff could mean "migrated", which would corrupt the one statistic this project exists to produce.
 
 ### Tencent Street View
 
