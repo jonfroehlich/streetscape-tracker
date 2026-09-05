@@ -178,7 +178,35 @@ enabled = true
 # multi-day guard exists (#241). Recovery recipe, measured twice: full
 # silence, then one single-request probe; both blocks cleared within ~a day
 # of the last refused request.
-daily_request_budget = 1750
+#
+# 2026-09-05: 1,750 -> 3,500, and this is NOT a softening of the block
+# posture -- it is the sizing #241 left open, finally matched to the night it
+# has to cover. 1,750 was sized for a 20-city night on 2026-08-22;
+# max_cities_per_day went 20 -> 40 in #304 on 09-02 and this figure did not
+# follow, so the cap started binding immediately: 1,736 and 1,723 spent on the
+# first two 40-city nights against four 20-city nights that peaked at 1,241.
+# Per-city cost over 1,398 runs is median 9, p90 81, p99 440, max 870, mean 39.
+# It bound twice in six nights, both on an end-of-night sliver rather than an
+# unaffordable city (New York wanted 484 with 426 left) -- that tail is #318's
+# capped-and-resume, not this raise.
+#
+# THE NUMBER TO QUOTE IS THE PER-IP SUM WITH mapillary_streets, not this line.
+# That channel stays at 1,750 and, since #290, spends 0 on a paired night by
+# reusing the grid census -- 5 of the 6 nights 08-30..09-04 spent exactly 0.
+# So a paired night is 3,500 + 0, the same combined ceiling #241 sanctioned.
+# An un-paired night can reach 5,250: 1.5x that ceiling, the most this host
+# has been configured for since block 2, and the honest cost of this change.
+# Accepted because block 3 (1,938/day, against 26,363 clean on 08-14)
+# falsified daily volume and every accumulation window from 1 to 8 days
+# (#286) -- NOT because volume is known safe here. Nothing about this host is.
+# The structurally right fix is one per-IP pool both channels draw from, which
+# is a scheduler change and is not attempted here.
+#
+# Deliberately deployed AFTER #292's pre-registered jitter window closed
+# (~2026-09-09). Volume is an axis that test holds still, so raising it inside
+# the window would have handed a fourth block two candidate causes where the
+# design went to real trouble to leave one. Cost of waiting: the two skips.
+daily_request_budget = 3500
 # Client-side tile pacing (issue #198). Shared per-IP with mapillary_streets
 # below and with any manual run on this host — the host lock (#208) is what
 # makes this figure the real one rather than a per-process wish.

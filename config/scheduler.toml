@@ -249,7 +249,30 @@ enabled = true
 # the entire daily budget"; the mean is 57.8, so 1,750 reaches ~30 cities and
 # the 70,168-tile catalog is one full pass in ~40 nights. The budget — not
 # max_batch_hours — is now what ends a maxed Mapillary night.
-daily_request_budget = 1750
+#
+# 1,750 -> 3,500 on 2026-09-05, and read the reason before reading it as a
+# relaxation of the block posture: 1,750 was sized for a 20-city night, and
+# max_cities_per_day went 20 -> 40 in #304 without it following. The first two
+# 40-city nights spent 1,736 and 1,723 against the 1,750 cap while the four
+# 20-city nights before them never passed 1,241. Per-city cost is median 9,
+# p90 81, p99 440, max 870 over 1,398 runs, so a 40-city night wants ~1,560 on
+# the mean and the cap binds whenever two or three metros land together.
+#
+# The number that matters is still the per-IP SUM with mapillary_streets
+# below, which is left at 1,750. Since #290 the walk reuses the grid run's
+# census for 0 requests on a paired night, so a paired night is 3,500 + 0 --
+# exactly the combined ceiling #241 already sanctioned, not an increase. An
+# UN-PAIRED night can reach 5,250, which is 1.5x that ceiling and the most
+# this host has been configured for since block 2; that is accepted because
+# block 3 falsified daily volume and every 1-8 day window (#286), NOT because
+# volume is known safe. The right fix is one per-IP pool both channels draw
+# from -- a scheduler change, not a config edit. Quote the sum, never this
+# line alone.
+#
+# Timed deliberately after #292's pre-registered jitter window closed
+# (~2026-09-09): raising volume inside it would have given a fourth block two
+# candidate causes where the test was built to leave one.
+daily_request_budget = 3500
 # Client-side pacing for the tile CDN (issue #198). 60/min is a conservative
 # guess; 370 is confirmed too high — and #241 proved 60/min is NOT sufficient
 # on its own (blocked 2026-08-20 while obeying it exactly). The limiter stays
