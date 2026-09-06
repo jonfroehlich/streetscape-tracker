@@ -1,0 +1,306 @@
+{
+  "_about": {
+    "experiment": "mapillary-image-quality",
+    "writeup": "docs/experiments/mapillary-image-quality.md",
+    "generated_by": "python scripts/mapillary_image_quality_analyze.py --cities-csv experiments/mapillary-image-quality/city_quality.csv --docs-dir docs/experiments --catalog-label makelab2-prod",
+    "collected_by": "python scripts/mapillary_image_quality_collect.py --out-dir experiments/mapillary-image-quality --catalog-label makelab2-prod",
+    "catalog_label": "makelab2-prod",
+    "generated_at": "2026-09-06T17:38:41+00:00",
+    "note": "Mapillary's per-image quality_score -- 'predicted visual quality of the image in the range [0.0, 1.0]' -- read over each city's LATEST Mapillary census, 360-degree panos only (status OK or NO_DATE). One run per city, so the distribution is not weighted by how often the scheduler happened to collect a city. Runs written before the 2026-07-24 enriched schema carry no quality_score column and are excluded rather than counted as zero; the collector's manifest records how many. No data_dir is recorded -- catalog_label names which catalog was read instead."
+  },
+  "corpus": {
+    "cities": 388,
+    "panos": 48387083,
+    "panos_scored": 48387083,
+    "sequences": 271434,
+    "panos_per_city": {
+      "n": 388,
+      "min": 1.0,
+      "p25": 799.5,
+      "p50": 4067.5,
+      "p75": 33043.0,
+      "p90": 167995.2,
+      "p95": 315810.7,
+      "max": 15433401.0
+    },
+    "run_date_range": [
+      "2026-07-23",
+      "2026-09-06"
+    ]
+  },
+  "discrimination": {
+    "image_weighted_median": {
+      "n": 388,
+      "min": 0.039,
+      "p25": 0.808,
+      "p50": 0.8365,
+      "p75": 0.8632,
+      "p90": 0.885,
+      "p95": 0.8936,
+      "max": 0.918,
+      "iqr": 0.0552,
+      "narrow_band": [
+        0.8,
+        0.87
+      ],
+      "cities_in_narrow_band": 228,
+      "pct_cities_in_narrow_band": 58.76
+    },
+    "pct_images_ge_good": {
+      "n": 388,
+      "min": 0.0,
+      "p25": 0.0,
+      "p50": 2.8296,
+      "p75": 11.548,
+      "p90": 26.792,
+      "p95": 41.8306,
+      "max": 99.0476,
+      "iqr": 11.548
+    },
+    "pct_images_lt_poor": {
+      "n": 388,
+      "min": 0.0,
+      "p25": 0.0,
+      "p50": 0.0609,
+      "p75": 1.0146,
+      "p90": 5.5297,
+      "p95": 13.196,
+      "max": 100.0,
+      "iqr": 1.0146
+    },
+    "within_narrow_band": {
+      "cities": 228,
+      "pct_images_ge_good": {
+        "n": 228,
+        "min": 0.0,
+        "p25": 0.2808,
+        "p50": 2.9318,
+        "p75": 7.5246,
+        "p90": 12.8985,
+        "p95": 16.8371,
+        "max": 25.9628
+      },
+      "median_spread": 0.069
+    },
+    "note": "The median is what mapillary_meta already stores and the only one of the three published anywhere. Compare its IQR against the range the tail shares occupy before reading a city ranking off it, and read `within_narrow_band` before concluding the cities it bunches together are genuinely alike."
+  },
+  "weighting": {
+    "cities": 388,
+    "sequences_per_city": {
+      "n": 388,
+      "min": 1.0,
+      "p25": 4.0,
+      "p50": 18.0,
+      "p75": 157.0,
+      "p90": 1010.1,
+      "p95": 2314.1,
+      "max": 54023.0
+    },
+    "panos_per_sequence": {
+      "n": 388,
+      "min": 1.0,
+      "p25": 114.41,
+      "p50": 228.18,
+      "p75": 409.54,
+      "p90": 739.04,
+      "p95": 902.84,
+      "max": 2222.0
+    },
+    "sequence_weighted_median": {
+      "n": 388,
+      "min": 0.039,
+      "p25": 0.8084,
+      "p50": 0.8353,
+      "p75": 0.8646,
+      "p90": 0.8839,
+      "p95": 0.8933,
+      "max": 0.917
+    },
+    "image_minus_sequence": {
+      "n": 388,
+      "min": -0.2005,
+      "p25": -0.005,
+      "p50": 0.0,
+      "p75": 0.002,
+      "p90": 0.013,
+      "p95": 0.0246,
+      "max": 0.197
+    },
+    "spearman_image_vs_sequence": 0.8898,
+    "sequences_with_mixed_on_foot": 0,
+    "sequences_with_mixed_organization": 0,
+    "rank_displacement": {
+      "n": 388,
+      "min": 0.0,
+      "p25": 3.0,
+      "p50": 9.0,
+      "p75": 25.0,
+      "p90": 62.3,
+      "p95": 114.0,
+      "max": 363.0
+    },
+    "largest_rank_displacements": [
+      {
+        "city_id": "glendora--california--united-states",
+        "n_panos": 6142,
+        "n_sequences": 9,
+        "q_p50": 0.916,
+        "seq_q_p50": 0.719,
+        "rank_displacement": 363.0
+      },
+      {
+        "city_id": "longview--washington--united-states",
+        "n_panos": 3318,
+        "n_sequences": 4,
+        "q_p50": 0.871,
+        "seq_q_p50": 0.677,
+        "rank_displacement": 298.0
+      },
+      {
+        "city_id": "malden--massachusetts--united-states",
+        "n_panos": 1422,
+        "n_sequences": 51,
+        "q_p50": 0.8035,
+        "seq_q_p50": 0.8925,
+        "rank_displacement": 278.5
+      },
+      {
+        "city_id": "westbrook--maine--united-states",
+        "n_panos": 53348,
+        "n_sequences": 203,
+        "q_p50": 0.777,
+        "seq_q_p50": 0.862,
+        "rank_displacement": 226.0
+      },
+      {
+        "city_id": "quincy--massachusetts--united-states",
+        "n_panos": 11944,
+        "n_sequences": 22,
+        "q_p50": 0.823,
+        "seq_q_p50": 0.8925,
+        "rank_displacement": 222.0
+      }
+    ],
+    "note": "A sequence is one contributor's drive, so its images are one observation sampled every few metres, not thousands of independent ones (pano-spacing.md). The sequence-weighted median takes one value per drive."
+  },
+  "on_foot": {
+    "pct_on_foot_across_cities": {
+      "n": 388,
+      "min": 0.0,
+      "p25": 0.0,
+      "p50": 0.0,
+      "p75": 0.04,
+      "p90": 9.19,
+      "p95": 43.54,
+      "max": 100.0
+    },
+    "cities_with_any_on_foot": 121,
+    "spearman_pct_on_foot_vs_median_quality": -0.1063,
+    "paired_cities": 58,
+    "min_side_panos": 100,
+    "min_side_sequences": 3,
+    "sequences_per_side": {
+      "on_foot": {
+        "n": 58,
+        "min": 3.0,
+        "p25": 9.2,
+        "p50": 15.0,
+        "p75": 107.0,
+        "p90": 641.1,
+        "p95": 1109.7,
+        "max": 1654.0
+      },
+      "vehicle": {
+        "n": 58,
+        "min": 3.0,
+        "p25": 49.2,
+        "p50": 187.0,
+        "p75": 1664.2,
+        "p90": 4632.7,
+        "p95": 9143.5,
+        "max": 31021.0
+      }
+    },
+    "image_weighted": {
+      "delta": {
+        "n": 58,
+        "min": -0.777,
+        "p25": -0.0925,
+        "p50": -0.0415,
+        "p75": -0.0095,
+        "p90": 0.0096,
+        "p95": 0.0194,
+        "max": 0.111
+      },
+      "cities_lower": 48,
+      "pct_cities_lower": 82.76
+    },
+    "sequence_weighted": {
+      "delta": {
+        "n": 58,
+        "min": -0.5355,
+        "p25": -0.1014,
+        "p50": -0.043,
+        "p75": -0.0135,
+        "p90": 0.0061,
+        "p95": 0.0166,
+        "max": 0.126
+      },
+      "cities_lower": 49,
+      "pct_cities_lower": 84.48
+    },
+    "note": "A within-city paired comparison, so it is not confounded by which cities happen to have pedestrian capture. A city counts only when BOTH sides carry >= 100 scored panos across >= 3 distinct drives. Both weightings are reported: the image-weighted delta is what a labeller meets, the sequence-weighted one is what survives if a single long walk is not allowed to be the whole finding."
+  },
+  "organization": {
+    "pct_with_org_across_cities": {
+      "n": 388,
+      "min": 0.0,
+      "p25": 0.0,
+      "p50": 0.0,
+      "p75": 31.06,
+      "p90": 99.73,
+      "p95": 100.0,
+      "max": 100.0
+    },
+    "distinct_orgs_across_cities": {
+      "n": 388,
+      "min": 0.0,
+      "p25": 0.0,
+      "p50": 0.0,
+      "p75": 1.0,
+      "p90": 2.0,
+      "p95": 3.0,
+      "max": 7.0
+    },
+    "spearman_pct_with_org_vs_median_quality": 0.1986,
+    "paired_cities": 98,
+    "image_weighted": {
+      "delta": {
+        "n": 98,
+        "min": -0.147,
+        "p25": -0.0245,
+        "p50": 0.0033,
+        "p75": 0.03,
+        "p90": 0.0576,
+        "p95": 0.0992,
+        "max": 0.254
+      },
+      "cities_higher": 52,
+      "pct_cities_higher": 53.06
+    },
+    "sequence_weighted": {
+      "delta": {
+        "n": 98,
+        "min": -0.3582,
+        "p25": -0.026,
+        "p50": 0.0,
+        "p75": 0.0333,
+        "p90": 0.0746,
+        "p95": 0.1051,
+        "max": 0.2755
+      },
+      "cities_higher": 49,
+      "pct_cities_higher": 50.0
+    }
+  }
+}
