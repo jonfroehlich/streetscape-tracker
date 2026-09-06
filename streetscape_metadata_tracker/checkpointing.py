@@ -92,10 +92,17 @@ MAPILLARY_CHECKPOINT_FORMAT_VERSION = 1
 # by the ordinary format-mismatch arm and its sweep restarts. That costs at most
 # one in-flight city, once, on the build that ships this.
 KARTAVIEW_CHECKPOINT_FORMAT_VERSION = 2
+# Panoramax v1 (issue #316): the same tile-store record Mapillary v1 writes --
+# `done_tiles` as [x, y, rows] triples plus `created_at` -- since the two are the
+# same crawl shape. It is a SEPARATE constant rather than an alias of Mapillary's
+# because the two providers' formats are free to diverge and a shared name would
+# make one bump silently discard the other's checkpoints.
+PANORAMAX_CHECKPOINT_FORMAT_VERSION = 1
 
 STORE_FORMAT_VERSIONS: dict[str, int] = {
     "kartaview": KARTAVIEW_CHECKPOINT_FORMAT_VERSION,
     "mapillary": MAPILLARY_CHECKPOINT_FORMAT_VERSION,
+    "panoramax": PANORAMAX_CHECKPOINT_FORMAT_VERSION,
 }
 
 # The providers whose collection is a CENSUS -- one crawl of the whole frozen

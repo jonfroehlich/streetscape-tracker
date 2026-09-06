@@ -2363,7 +2363,7 @@ def test_get_due_cities_has_no_default_membership_default():
     assert param.kind is inspect.Parameter.KEYWORD_ONLY
 
 
-def test_the_two_kartaview_channels_are_the_opt_in_ones_today():
+def test_the_opt_in_channels_today_are_the_two_kartaview_ones_and_panoramax():
     """Pins the actual policy, not just its shape — the four non-KartaView
     channels are cheap enough per city that catalog-wide membership is right for
     them, and flipping one of them to opt-in would silently empty its nightly
@@ -2375,11 +2375,19 @@ def test_the_two_kartaview_channels_are_the_opt_in_ones_today():
     rather than inheriting the grid channel's, so enrolling a city in street
     coverage stays a separate decision from enrolling it in grid coverage and
     schedule_state.member keeps exactly one meaning for NULL (#258).
+
+    panoramax is opt-in on a different argument, and the difference is worth
+    keeping visible: the KartaView pair is opt-in because a whole-catalog pass
+    is unaffordable, while panoramax is opt-in because 730 of 1,144 enabled
+    cities were MEASURED to hold no Panoramax imagery at all and a screened zero
+    is conclusive (issue #316 phase 1). Cost and emptiness are different
+    reasons, and a later provider that is cheap AND widely covered would belong
+    on the other side of this line.
     """
     from streetscape_metadata_tracker.scheduler import CHANNEL_DEFAULT_MEMBERSHIP
 
     opt_in = sorted(c for c, default in CHANNEL_DEFAULT_MEMBERSHIP.items() if not default)
-    assert opt_in == ["kartaview", "kartaview_streets"]
+    assert opt_in == ["kartaview", "kartaview_streets", "panoramax"]
 
 
 def test_the_hoist_is_the_identity_permutation_without_an_opt_in_channel(conn):

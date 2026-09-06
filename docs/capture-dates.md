@@ -12,9 +12,11 @@ An edit that changes a rule belongs in both files; anything written since the sp
 **The capture-date columns describe official Google imagery, and only dates that can be true (issue #213).** `analysis.dated_unique_panos` is the single seam every date-derived statistic reads
 — age stats, the capture-year histogram, the daily histogram, in both the catalog and the per-run JSON — and it drops two populations.
 **(1) Impossible dates.** Contributor photospheres arrive with corrupt EXIF, and because `oldest/newest_capture_date` are a min and a max, *one* pano owns them: 22 production runs read 2611–2612 and 75 predated Street View, off 1–22 bad panos in cities of 175k–334k.
-`EARLIEST_PLAUSIBLE_CAPTURE` is per provider (gsv 2007, mapillary **2004**
-— deliberately looser than its 2013 founding, matching the identical rule `download_mapillary.captured_at_to_iso_date` already applies at decode, because contributors upload genuinely old photographs) and the ceiling is the observation date itself, inclusive
+`EARLIEST_PLAUSIBLE_CAPTURE` is per provider (gsv 2007, mapillary **2004**, kartaview **2004**, panoramax **2004**
+— each of the three community providers deliberately looser than its own founding, matching the identical rule each decoder applies at decode, because contributors upload genuinely old photographs) and the ceiling is the observation date itself, inclusive
 — nothing is captured after the query that saw it, and GSV's month-precision dates are pinned to the 1st so they can only round toward the past.
+Each provider's floor also catches a SENTINEL that provider actually serves, which is what makes the number worth measuring rather than choosing: Mapillary's is an epoch-zero device clock, and Panoramax's is a literal `1970-01-01` timestamp — two Paris pictures, found in issue #316's phase-1 survey.
+A sentinel is not a null and no null check catches it; what it hands you is a well-formed, entirely plausible-looking timestamp, and the floor is the only thing between it and every date statistic the city has.
 **(2) For gsv, third-party imagery.** Not merely defensive: the site has always *displayed* the Google-filtered figures (`adaptCityRecord` reads the per-run JSON's `google_panos` block), so an all-panos catalog column published under the same name as the map's "median age" was two different numbers wearing one label
 — the driving page showed one and the overview map the other.
 Empirically the copyright filter alone repaired every affected run on a 1,171-JSON catalog (zero `© Google` panos carried a bad date), and the date bound is what fixes the published **`all_panos`** block, which by definition the copyright filter cannot.

@@ -369,6 +369,28 @@ and `_publish` passing `--local` iff `[publish].local`, read from the TOML and a
   The JS mirror is pinned the same way: the three precisions parsing at LOCAL midnight (in a test file that pins `TZ=America/Los_Angeles` before requiring the module, or every assertion passes on a UTC CI runner without the fix), and out-of-range months and days **not rolling over into plausible dates**
   — `new Date(y, 12, 1)` is Jan of the next year, which `isPlausibleCaptureDate` accepts while pandas coerces the same value to `NaT`)
 
+## The Panoramax collector (issue #316, phase 2)
+
+Three files, split the way the other census providers' are, because each pins something the other two structurally cannot see.
+
+- `tests/test_panoramax.py` — the decoder, the date rules and the transport, all offline over tiles encoded in memory with the same coordinate math the decoder inverts.
+  What it pins is mostly the ways this provider is NOT Mapillary, since those are what a reader coming from that module assumes away: the default zoom is **15** and is asserted against the shared `tiles_for_bbox` at both providers' defaults (with the z15 lattice asserted to be strictly finer, or the two defaults would be interchangeable and the test would pin nothing);
+  `type` is kept verbatim as `image_type` beside the `is_pano` it produces, and an ABSENT type decodes to flat with a non-nullable `bool` column rather than to a null;
+  a picture the layer does not name is **dropped rather than given the MVT feature id** — that fallback was copied over with the decoder's shape, and since `mapbox_vector_tile` supplies a feature id even when the properties carry none, it would have minted id `0` in every tile of the city into a `dedupe_census` that factorizes on it.
+  The date rules are pinned scalar-against-vectorized element-wise (the same contract Mapillary's pair carries), plus the measured 1970 sentinel, a future date, and **mixed precision in one column** — the last with a companion assertion that an inferred format really does NaT one of the values, so the `format="ISO8601"` pin is not protecting against a hazard that does not exist.
+  Transport: 403/429 raise `HostBlockedError` after exactly ONE call, a redirect is seen rather than followed, an HTML body under a 200 is a block, a 404 is an empty tile that is counted and not retried, and a 5xx is retried with every attempt paced AND counted (the #198 contract).
+- `tests/test_panoramax_grid_run.py` — the join between the fetch and the shared tail, which neither of the other two files can see: that the bindings actually reached are Panoramax's, so the CSV carries its schema in **its own column order**.
+  Also the three #116 statuses over one city (a pano is OK, a flat-only point is FLAT_ONLY with a NULL capture date, an empty point is ZERO_RESULTS), the 1970 sentinel landing as **NO_DATE rather than as a dropped row** — it is in `PRESENT_STATUSES`, so the imagery still covers while ageing nothing — an undownloaded tile marking REQUEST_FAILED at this provider's zoom, the spend surviving a crash in the tail, and both halves of the 404 rule: an all-404 lattice is refused, while a city that genuinely holds nothing and answers 200 publishes as ZERO_RESULTS.
+  That pair is the point — 730 of 1,144 catalog cities really are empty, so a guard keyed on emptiness rather than on the 404 would fail two thirds of the catalog.
+- `tests/test_panoramax_collector.py` — resume and the shared cache.
+  The headline is **byte identity asserted three ways against each other** — one uninterrupted pass, a run interrupted after one tile and resumed, and a different channel reading the promoted census for zero requests — rather than against a committed golden fixture.
+  Three-way because the two grid columns come from a geodesic solve whose last ULP differs between macOS and glibc, so a second committed fixture would have to carry the same numeric tolerance the Mapillary one does, while comparing runs produced on one machine pins the ORDERING exactly, which is the property at risk.
+  The city straddles a z15 tile boundary and a border picture is served by both tiles, so the comparison can actually see a reordering.
+  Also: only successful tiles commit, an empty tile gets a record and no file, the two counters split across a resume (asserted as the SUM of the two nights, not as the tile count — the first night attempted every tile and committed one, so the crawl legitimately cost more requests than the lattice has tiles), a blocked night's refused requests still reach the crawl total, seven separate ways a checkpoint can be unusable each discard and refetch **without raising**, a city refused before committing leaves no empty directory, and the cache accounting in both directions (`api_requests` 0 for every reuser, `api_requests_total` the crawl cost only for the channel that paid).
+
+Suite-wide, the autouse pacing fixture is `_no_tile_census_pacing` and now covers **both** tile censuses.
+It was renamed from `_no_mapillary_tile_pacing` rather than duplicated, and the reason is measured: the Panoramax grid-run file ran in 46 s against a live limiter and 0.3 s behind the fixture, because this provider is both slower per request (30/min) and at a zoom with ~4x the tiles.
+
 ## The Panoramax feasibility probe (issue #316)
 
 `tests/test_panoramax_feasibility.py` pins the phase-1 instrument in `scripts/panoramax_feasibility.py`, offline, over synthetic MVT tiles encoded with the same coordinate math the decoder inverts.

@@ -71,6 +71,7 @@ from .download_common import (
     HOST_LABELS,
     HOST_MAPILLARY_TILES,
     HOST_OVERPASS,
+    HOST_PANORAMAX,
     SWEEP_INCOMPLETE_EXIT_CODE,
     coerce_jitter,
     redact_credentials,
@@ -159,6 +160,14 @@ CHANNEL_HOSTS: dict[str, tuple[str, ...]] = {
     # host) + ONE of the three Overpass channels + mapillary (tiles) +
     # kartaview (KV) = 4. So 4 of 6 now, where it was 4 of 5.
     "kartaview_streets": (HOST_OVERPASS, HOST_KARTAVIEW),
+    # api.panoramax.xyz, shared with nothing (issue #316). Re-derive the ceiling
+    # rather than quoting the line above, which is what that line asks for: the
+    # largest host-disjoint set becomes gsv (no host) + ONE of the three Overpass
+    # channels + mapillary (tiles) + kartaview (KV) + panoramax = 5, so 5 of 7.
+    # The denominator moved and so did the numerator this time; neither is a
+    # constant, and the next channel gets the same re-derivation rather than
+    # this number.
+    "panoramax": (HOST_PANORAMAX,),
 }
 
 # What a NULL `schedule_state.member` means for each channel (issue #248), i.e.
@@ -198,6 +207,16 @@ CHANNEL_DEFAULT_MEMBERSHIP: dict[str, bool] = {
     "mapillary_streets": True,
     "kartaview": False,
     "kartaview_streets": False,
+    # panoramax is False on a MEASUREMENT rather than on a cost argument, which
+    # makes it the clearest case in this table (issue #316 phase 1). A screen of
+    # all 1,144 enabled cities found 730 of them — 63.8% — holding no Panoramax
+    # imagery AT ALL, and a screened zero is conclusive: every one of the 20
+    # screened-zero control cities measured exactly zero. So a default-membership
+    # channel would spend most of its nightly slots confirming absence, each one
+    # taken from a city with a second dated interval to gain (#308). The imagery
+    # is concentrated instead — roughly 20 cities hold 3.16 M pictures between
+    # them — which is exactly the shape enroll-city exists for.
+    "panoramax": False,
 }
 
 
@@ -243,6 +262,16 @@ CHANNEL_RESUMABLE: dict[str, bool] = {
     "kartaview_streets": True,
     "mapillary": False,
     "mapillary_streets": False,
+    # panoramax is False for the SAME reason the two Mapillary channels are, and
+    # for once that is a comfortable answer rather than a deferred one: it is a
+    # tile census that checkpoints (#316) but takes only a pacing knob, so there
+    # is nothing for a cap to stop. The largest city that would be enrolled is
+    # ~3,132 z15 tiles ≈ 104 minutes at 30/min, under the 180-minute floor, so
+    # no capped launch is needed to keep it inside a night. Revisit this the
+    # moment a bigger city is enrolled OR the downloader grows a request cap —
+    # marking it True with nothing reading the cap downstream is the fail-open
+    # this table was written against.
+    "panoramax": False,
 }
 
 
@@ -286,7 +315,24 @@ def is_resumable_channel(name: str) -> bool:
 # gone; the dict stays, because the record/drop/don't-raise asymmetry above is
 # the mechanism the NEXT unwired channel needs, and rebuilding it from scratch
 # under time pressure is how a fail-open arm gets missed again.
-UNWIRED_CHANNELS: dict[str, str] = {}
+#
+# AND THE NEXT ONE IS HERE. "panoramax" joined naming.KNOWN_PROVIDERS with its
+# collector (issue #316), so `streetscape_tracker.py --provider panoramax`
+# collects a city by hand and [providers.panoramax] would start PARSING — which
+# is the exact state kartaview sat in, and the state this dict exists to refuse.
+# Three of the four arms above are still unwritten for it: estimate_requests has
+# no panoramax term and falls through to the GSV grid formula, city_timeout_seconds
+# would hand a ~104-minute city the flat 180-minute floor, and enabled_providers'
+# rank.get(p, 99) would order it by accident. Removing this entry is the LAST
+# step of wiring the channel, not the first.
+UNWIRED_CHANNELS: dict[str, str] = {
+    "panoramax": (
+        "the panoramax collector has landed but its scheduler arms have not "
+        "(estimate_requests, city_timeout_seconds, the enabled_providers rank "
+        "and the _run_one_city pacing flag). Collect it by hand with "
+        "`streetscape_tracker.py --provider panoramax` until then."
+    ),
+}
 
 
 logger = logging.getLogger("streetscape_scheduler")

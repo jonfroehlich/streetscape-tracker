@@ -107,6 +107,10 @@ from .download_common import (
 )
 from .download_common import assign_to_grid as assign_to_grid
 from .download_common import grid_bbox as grid_bbox
+from .download_common import lonlat_to_tile_frac as lonlat_to_tile_frac
+from .download_common import points_in_tiles as common_points_in_tiles
+from .download_common import tile_frac_to_lonlat as tile_frac_to_lonlat
+from .download_common import tiles_for_bbox as common_tiles_for_bbox
 from .host_lock import host_lock
 from .progress import progress
 
@@ -127,44 +131,20 @@ IMAGE_LAYER = "image"
 # ── Slippy-map tile math (stdlib only) ─────────────────────────────────────
 
 
-def lonlat_to_tile_frac(lon: float, lat: float, zoom: int) -> tuple[float, float]:
-    """Fractional Web-Mercator tile coordinates (x, y; y from the top)."""
-    n = 2**zoom
-    fx = (lon + 180.0) / 360.0 * n
-    lat_rad = math.radians(lat)
-    fy = (1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * n
-    return fx, fy
-
-
-def tile_frac_to_lonlat(fx: float, fy: float, zoom: int) -> tuple[float, float]:
-    """Inverse of lonlat_to_tile_frac."""
-    n = 2**zoom
-    lon = fx / n * 360.0 - 180.0
-    lat = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * fy / n))))
-    return lon, lat
-
-
 def tiles_for_bbox(
     min_lon: float, min_lat: float, max_lon: float, max_lat: float, zoom: int = TILE_ZOOM
 ) -> list[tuple[int, int]]:
     """
-    All (x, y) tile indices at the given zoom intersecting the bbox.
+    All (x, y) z14 tile indices intersecting the bbox — Mapillary's default zoom
+    over the shared :func:`download_common.tiles_for_bbox`.
 
-    A bbox that crosses the antimeridian (min_lon > max_lon after geopy
-    normalizes longitudes to ±180 — e.g. Suva, Fiji) wraps: it covers the
-    x columns from min_lon to the right edge plus those from the left edge
-    to max_lon. The naive single range was empty there, silently yielding
-    a 0-tile (0-pano) run.
+    A one-line wrapper rather than a re-export, because the shared function
+    takes the zoom as a REQUIRED argument (a lattice helper serving two
+    providers at two zooms has no default to be right about) while ~20 call
+    sites here — the collector, the road walk, the tests, the golden fixture —
+    call this one with four arguments and mean z14.
     """
-    fx_min, fy_max = lonlat_to_tile_frac(min_lon, min_lat, zoom)  # y grows southward
-    fx_max, fy_min = lonlat_to_tile_frac(max_lon, max_lat, zoom)
-    n = 2**zoom
-    if fx_min > fx_max:  # bbox crosses the antimeridian
-        x_indices = [*range(max(0, int(fx_min)), n), *range(0, min(n - 1, int(fx_max)) + 1)]
-    else:
-        x_indices = list(range(max(0, int(fx_min)), min(n - 1, int(fx_max)) + 1))
-    y_range = range(max(0, int(fy_min)), min(n - 1, int(fy_max)) + 1)
-    return [(x, y) for x in x_indices for y in y_range]
+    return common_tiles_for_bbox(min_lon, min_lat, max_lon, max_lat, zoom)
 
 
 def estimate_tile_count(
@@ -429,24 +409,12 @@ def _points_in_tiles(
     lats: np.ndarray, lons: np.ndarray, tiles: list[tuple[int, int]], zoom: int = TILE_ZOOM
 ) -> np.ndarray:
     """
-    Boolean mask of which (lat, lon) points fall inside any of ``tiles``.
-
-    Vectorized form of ``lonlat_to_tile_frac``; used to attribute undownloaded
-    tiles back to the grid points they cover (issue #168). Deliberately ignores
-    the tiles' render buffer: a point just outside a failed tile may in fact
-    have been covered by a neighbour, and calling it "unknown" errs toward
-    admitting we don't know rather than claiming empty.
+    Mapillary's ``unmeasured_mask``: which grid points sit under a tile that
+    never downloaded (issue #168). The shared
+    :func:`download_common.points_in_tiles` at this provider's default zoom, for
+    the same reason :func:`tiles_for_bbox` above is a wrapper.
     """
-    if len(lats) == 0:
-        return np.zeros(0, dtype=bool)
-    n = 2**zoom
-    fx = (lons + 180.0) / 360.0 * n
-    fy = (1.0 - np.arcsinh(np.tan(np.radians(lats))) / np.pi) / 2.0 * n
-    # One packed int per tile so membership is a single sorted-array lookup
-    # instead of a Python loop over the (usually tiny) failed-tile list.
-    keys = fx.astype(np.int64) * n + fy.astype(np.int64)
-    failed_keys = np.array(sorted(x * n + y for x, y in tiles), dtype=np.int64)
-    return np.isin(keys, failed_keys)
+    return common_points_in_tiles(lats, lons, tiles, zoom)
 
 
 # ── Download ───────────────────────────────────────────────────────────────
