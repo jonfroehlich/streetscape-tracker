@@ -343,17 +343,18 @@ def test_the_default_screen_variant_is_the_one_that_is_not_lossy():
     assert set(pf.SCREEN_VARIANTS) == {"v1_lattice", "v2_h3"}
 
 
-def _prior(city_id="c", tiles_total=49, tiles_probed=49):
+def _prior(city_id="c", tiles_total=49, tiles_probed=49, seed=316, record_seed=True):
+    row = {
+        "city_id": city_id,
+        "tiles_total": tiles_total,
+        "tiles_probed": tiles_probed,
+        "pictures": 7,
+    }
+    if record_seed:
+        row["seed"] = seed
     return {
         "_measured_by": "python scripts/panoramax_feasibility.py --stage measure",
-        "leaders": [
-            {
-                "city_id": city_id,
-                "tiles_total": tiles_total,
-                "tiles_probed": tiles_probed,
-                "pictures": 7,
-            }
-        ],
+        "leaders": [row],
         "typical": [],
         "controls": [],
     }
@@ -393,6 +394,86 @@ def test_a_prior_row_measured_under_different_settings_is_refetched():
     )
     assert pf.reusable_measure_row(None, city, 200, 316) is None
     assert pf.reusable_measure_row(_prior(city_id="other"), city, 200, 316) is None
+
+
+def test_a_complete_row_is_reused_across_seeds_because_its_plan_is_seed_independent():
+    """
+    The seed only selects WHICH tiles when the plan is truncated. A complete
+    city visits every tile and `hexes_in_bbox` sorts by hex id, so its row is
+    the same number under any seed and refetching it would spend requests
+    against a host with no documented limit to re-learn a number we hold.
+    """
+    city = _city()
+    n = len(dm.tiles_for_bbox(*city["bbox"], pf.MEASURE_ZOOM))
+    prior = _prior(tiles_total=n, tiles_probed=n, seed=316)
+    assert pf.reusable_measure_row(prior, city, 200, 316) is not None
+    assert pf.reusable_measure_row(prior, city, 200, 999) is not None
+
+
+def test_a_truncated_row_is_refetched_when_the_seed_changes():
+    """
+    For a truncated city the seed IS the sample: `shuffled_tiles(tiles, seed)`
+    picks a different subset, so `pictures` and `pictures_scaled_to_bbox` both
+    move while `tiles_total` and `tiles_probed` stay identical. Comparing only
+    those two counts let a changed --seed through silently, and the run then
+    stamped the NEW seed into `_measured_by` over rows drawn under the OLD one
+    -- a false provenance claim in a committed record.
+    """
+    city = _city()
+    n = len(dm.tiles_for_bbox(*city["bbox"], pf.MEASURE_ZOOM))
+    assert n > 5, "the fixture city has to be big enough to truncate"
+    prior = _prior(tiles_total=n, tiles_probed=5, seed=316)
+    assert pf.reusable_measure_row(prior, city, 5, 316) is not None
+    assert pf.reusable_measure_row(prior, city, 5, 317) is None
+    # And the seeds really do choose different tiles, or the guard above would
+    # be pinning a distinction that does not exist.
+    tiles = dm.tiles_for_bbox(*city["bbox"], pf.MEASURE_ZOOM)
+    assert pf.shuffled_tiles(tiles, 316)[:5] != pf.shuffled_tiles(tiles, 317)[:5]
+
+
+def test_a_truncated_row_that_records_no_seed_is_refetched():
+    """Unknown provenance is not matching provenance. Rows written before the
+    field existed cannot be shown to match, so they are not assumed to."""
+    city = _city()
+    n = len(dm.tiles_for_bbox(*city["bbox"], pf.MEASURE_ZOOM))
+    legacy_truncated = _prior(tiles_total=n, tiles_probed=5, record_seed=False)
+    legacy_complete = _prior(tiles_total=n, tiles_probed=n, record_seed=False)
+    assert pf.reusable_measure_row(legacy_truncated, city, 5, 316) is None
+    # A complete legacy row is still exact, so it is still reusable.
+    assert pf.reusable_measure_row(legacy_complete, city, 200, 316) is not None
+
+
+def test_measure_city_records_the_seed_that_selected_its_tiles():
+    """`reusable_measure_row` cannot honour its contract without this field."""
+    city = _city()
+    row = pf.measure_city(city, _TileFetcher({}), max_tiles=3, seed=4242)
+    assert row["seed"] == 4242
+    assert row["tiles_probed"] == 3 and row["complete"] is False
+
+
+def test_the_measure_loop_refetches_a_truncated_row_when_the_seed_moves(tmp_path):
+    """
+    The guard through the loop rather than through the function, because that
+    is where --reuse-measured is actually applied: same seed reuses and spends
+    nothing, a moved seed refetches and spends the cap.
+    """
+    cities = [_city("a")]
+    by_id = pf._cities_by_id(cities)
+    n = len(dm.tiles_for_bbox(*cities[0]["bbox"], pf.MEASURE_ZOOM))
+    pf.write_raw(str(tmp_path), "measure", _prior("a", tiles_total=n, tiles_probed=2, seed=316))
+
+    same = _measure_args(tmp_path, "--city", "a", "--reuse-measured", "--max-tiles-per-city", "2")
+    kept = pf._run_stage(same, cities, by_id, _TileFetcher({}))
+    assert kept["reused_rows"] == 1 and kept["requests_spent"] == 0
+
+    moved = _measure_args(
+        tmp_path, "--city", "a", "--reuse-measured", "--max-tiles-per-city", "2", "--seed", "317"
+    )
+    fetcher = _TileFetcher({})
+    fresh = pf._run_stage(moved, cities, by_id, fetcher)
+    assert fresh["reused_rows"] == 0
+    assert fresh["requests_spent"] == fetcher.requests_spent == 2
+    assert fresh["leaders"][0]["seed"] == 317
 
 
 def test_reuse_is_stamped_into_the_provenance():
@@ -809,7 +890,65 @@ def _search_response(features, links=(), number_matched=None):
     return _FakeResponse(200, json.dumps(payload).encode(), payload)
 
 
-A360, B_ABSENT = _search_feature("a", 360), _search_feature("b", None)
+# Two pictures that differ on BOTH axes the access probe reads: the newest
+# capture (which is what the datetime window is derived from) and the EXIF
+# field of view. One picture older than the other is what gives the datetime
+# question something to drop.
+NEWEST = "2026-08-01T00:00:00Z"
+OLDER = "2025-06-01T00:00:00Z"
+A360 = _search_feature("a", 360, stamp=NEWEST)
+B_ABSENT = _search_feature("b", None, stamp=OLDER)
+DERIVED_WINDOW = "2026-08-01T00:00:00Z/.."
+
+
+def test_the_datetime_window_is_derived_from_the_citys_own_newest_capture():
+    """
+    The window is a per-city derivation, not a constant. It was a constant --
+    `2026-01-01T00:00:00Z/..`, justified as "deliberately in the FUTURE
+    relative to the imagery it is aimed at" -- and it silently stopped being
+    in the future eight months before the study ran.
+    """
+    window, cutoff, droppable = pf.access_window([A360, B_ABSENT])
+    assert window == DERIVED_WINDOW
+    assert cutoff == pf.parse_stamp(NEWEST)
+    assert droppable == 1  # exactly the one picture older than the cutoff
+
+
+def test_the_window_is_derived_chronologically_not_lexicographically():
+    """
+    The endpoint mixes `Z` with `+00:00` and seconds with microseconds, and
+    string order across those forms is not time order: `'2026-08-01T00:00:00Z'`
+    sorts AFTER `'2026-09-01T00:00:00.5+00:00'` on no axis that matters, but a
+    naive max over the raw strings gets pairs like these wrong.
+    """
+    early = _search_feature("early", 360, stamp="2026-08-01T00:00:00Z")
+    late = _search_feature("late", 360, stamp="2026-09-01T00:00:00.500000+00:00")
+    window, cutoff, droppable = pf.access_window([early, late])
+    assert cutoff == pf.parse_stamp("2026-09-01T00:00:00.5+00:00")
+    assert window.endswith("/..") and window.startswith("2026-09-01T00:00:00.500000Z")
+    assert droppable == 1
+
+
+def test_an_empty_baseline_falls_back_rather_than_inventing_a_window():
+    """Nothing to derive from, and nothing the probe could distinguish."""
+    window, cutoff, droppable = pf.access_window([])
+    assert window == pf.ACCESS_PROBE_FALLBACK_DATETIME
+    assert cutoff is None and droppable == 0
+
+
+def test_an_unparseable_or_missing_capture_time_is_outside_every_window():
+    """
+    A picture the filter should have excluded but whose date cannot be read is
+    evidence the filter did not exclude it -- the conservative direction, since
+    the finding under test is that the filter does nothing.
+    """
+    cutoff = pf.parse_stamp(NEWEST)
+    undated = {"id": "u", "properties": {}}
+    unparseable = {"id": "x", "properties": {"datetime": "last tuesday"}}
+    assert pf.features_before([undated, unparseable], cutoff) == 2
+    assert pf.features_before([A360], cutoff) == 0
+    assert pf.features_before([A360, B_ABSENT], cutoff) == 1
+    assert pf.features_before([B_ABSENT], None) == 0  # no window, no claim
 
 
 @pytest.mark.parametrize(
@@ -826,7 +965,9 @@ A360, B_ABSENT = _search_feature("a", 360), _search_feature("b", None)
             ],
             {
                 "search_paginates": False,
+                "datetime_can_answer": True,
                 "datetime_filter_honoured": False,
+                "fov_can_answer": True,
                 "fov_filter_drops_absent": True,
             },
         ),
@@ -835,12 +976,14 @@ A360, B_ABSENT = _search_feature("a", 360), _search_feature("b", None)
             # the writeup's three sentences would outlive the behaviour.
             [
                 _search_response([A360, B_ABSENT], links=[{"rel": "next", "href": "..."}]),
-                _search_response([B_ABSENT]),
+                _search_response([A360]),
                 _search_response([A360, B_ABSENT]),
             ],
             {
                 "search_paginates": True,
+                "datetime_can_answer": True,
                 "datetime_filter_honoured": True,
+                "fov_can_answer": True,
                 "fov_filter_drops_absent": False,
             },
         ),
@@ -853,7 +996,26 @@ A360, B_ABSENT = _search_feature("a", 360), _search_feature("b", None)
             ],
             {
                 "search_paginates": True,
+                "datetime_can_answer": True,
                 "datetime_filter_honoured": False,
+                "fov_can_answer": True,
+                "fov_filter_drops_absent": True,
+            },
+        ),
+        (
+            # A filter that drops SOME of what it should but not all is not
+            # honoured. Reading the first five ids instead of the window would
+            # have called this one honoured, since the first id moved.
+            [
+                _search_response([A360, B_ABSENT]),
+                _search_response([B_ABSENT]),
+                _search_response([A360]),
+            ],
+            {
+                "search_paginates": False,
+                "datetime_can_answer": True,
+                "datetime_filter_honoured": False,
+                "fov_can_answer": True,
                 "fov_filter_drops_absent": True,
             },
         ),
@@ -871,9 +1033,72 @@ def test_the_access_findings_are_derived_from_the_responses(responses, expected)
     row = pf.stage_access(_city(), fetcher)
     assert {key: row[key] for key in expected} == expected
     assert [params["limit"] for _, params in fetcher.session.calls] == [pf.ACCESS_PROBE_LIMIT] * 3
-    assert fetcher.session.calls[1][1]["datetime"] == pf.ACCESS_PROBE_DATETIME
+    assert fetcher.session.calls[1][1]["datetime"] == DERIVED_WINDOW == row["datetime_window"]
     assert fetcher.session.calls[2][1]["filter"] == "field_of_view=360"
     assert row["probes"]["baseline"]["fov_classes"] == {"360": 1, "absent": 1}
+
+
+def test_a_city_whose_imagery_all_postdates_a_fixed_cutoff_can_still_answer():
+    """
+    The Boise regression, and the reason the window stopped being a constant.
+
+    Boise's whole Panoramax deployment is three months old: its 300 baseline
+    rows span 27 hours in 2026-08, every one of them AFTER the old fixed
+    `2026-01-01T00:00:00Z` cutoff. An honoured filter over that window returns
+    exactly the rows an ignored one returns, so the old probe read "ignored"
+    whichever was true -- and Boise was counted among the twenty cities said
+    to show the filter ignored, while being no evidence at all.
+
+    Derived from the city's own newest capture the same city is decisive, and
+    decisive in BOTH directions.
+    """
+    early = _search_feature("early", 360, stamp="2026-08-26T19:46:52Z")
+    late = _search_feature("late", 360, stamp="2026-08-27T21:27:43Z")
+    assert pf.parse_stamp("2026-08-26T19:46:52Z") > pf.parse_stamp(
+        pf.ACCESS_PROBE_FALLBACK_DATETIME.split("/")[0]
+    ), "the fixture must postdate the retired constant, or it pins nothing"
+
+    ignored = pf.stage_access(
+        _city(),
+        _fetcher(
+            [
+                _search_response([early, late]),
+                _search_response([early, late]),
+                _search_response([early, late]),
+            ]
+        ),
+    )
+    assert ignored["datetime_can_answer"] is True
+    assert ignored["datetime_filter_honoured"] is False
+
+    honoured = pf.stage_access(
+        _city(),
+        _fetcher(
+            [
+                _search_response([early, late]),
+                _search_response([late]),
+                _search_response([early, late]),
+            ]
+        ),
+    )
+    assert honoured["datetime_can_answer"] is True
+    assert honoured["datetime_filter_honoured"] is True
+
+
+def test_a_city_with_one_capture_instant_cannot_answer_the_datetime_question():
+    """
+    Every picture at the cutoff means an honoured filter drops nothing, so
+    `outside == 0` says nothing. That must be no evidence, never a
+    confirmation -- the same rule the field-of-view probe already follows.
+    """
+    same = [_search_feature("a", 360, stamp=NEWEST), _search_feature("b", 360, stamp=NEWEST)]
+    row = pf.stage_access(
+        _city(),
+        _fetcher([_search_response(same), _search_response(same), _search_response(same)]),
+    )
+    assert row["datetime_baseline_droppable"] == 0
+    assert row["datetime_can_answer"] is False
+    assert row["datetime_filter_honoured"] is False  # not a yes despite outside == 0
 
 
 def test_fov_filter_drops_absent_needs_an_absent_picture_to_drop():
@@ -881,34 +1106,45 @@ def test_fov_filter_drops_absent_needs_an_absent_picture_to_drop():
     fetcher = _fetcher(
         [_search_response([A360]), _search_response([A360]), _search_response([A360])]
     )
-    assert pf.stage_access(_city(), fetcher)["fov_filter_drops_absent"] is False
+    row = pf.stage_access(_city(), fetcher)
+    assert row["fov_can_answer"] is False
+    assert row["fov_filter_drops_absent"] is False
 
 
-def test_summarize_access_counts_cities_rather_than_flattening_to_a_boolean():
-    """A behaviour that held in one city and not another is the interesting
-    result; a single flag would hide it."""
+def test_summarize_access_counts_only_the_cities_that_can_answer():
+    """
+    A behaviour that held in one city and not another is the interesting
+    result, so this counts cities rather than flattening to a boolean -- and
+    it counts them out of the cities that CAN answer. Pooling the
+    unanswerable ones in reports agreement that was never measured, which is
+    how "20 of 20" got written for a question one of the twenty could not be
+    asked.
+    """
 
-    def city(paginates, honoured, drops, absent_in_baseline):
+    def city(paginates, honoured, drops, *, can_answer_dt, can_answer_fov):
         return {
             "search_paginates": paginates,
+            "datetime_can_answer": can_answer_dt,
             "datetime_filter_honoured": honoured,
+            "fov_can_answer": can_answer_fov,
             "fov_filter_drops_absent": drops,
-            "probes": {"baseline": {"fov_classes": {"absent": absent_in_baseline, "360": 1}}},
         }
 
     access = {
-        "requests_spent": 9,
+        "requests_spent": 12,
         "cities": [
-            city(False, False, True, 3),
-            city(False, True, True, 1),
-            # No EXIF-less picture in the baseline: cannot answer the field-of-
-            # view question, so it is neither a yes nor a no.
-            city(False, False, False, 0),
+            city(False, False, True, can_answer_dt=True, can_answer_fov=True),
+            city(False, True, True, can_answer_dt=True, can_answer_fov=True),
+            # No EXIF-less picture in the baseline, and nothing older than the
+            # window: neither question can be asked here, so it is neither a
+            # yes nor a no for either.
+            city(False, False, False, can_answer_dt=False, can_answer_fov=False),
         ],
     }
     summary = pf.summarize_access(access)
     assert summary["n"] == 3
     assert summary["cities_where_search_paginates"] == 0
+    assert summary["cities_that_can_answer_the_datetime_question"] == 2
     assert summary["cities_where_datetime_filter_honoured"] == 1
     assert summary["cities_with_an_absent_picture_in_baseline"] == 2
     assert summary["cities_where_fov_filter_drops_absent"] == 2
@@ -1407,6 +1643,387 @@ def test_summarize_measure_keeps_the_three_groups_apart():
     assert summary["controls"]["pictures_total"] == 0
 
 
+# ── One --city resolver, and no stage that writes an empty run ─────────────
+
+CITY_STAGES = ("measure", "detail", "instances", "access")
+
+
+def _stage_args(tmp_path, stage, *extra):
+    return pf.parse_args(["--stage", stage, "--raw-dir", str(tmp_path), *extra])
+
+
+@pytest.mark.parametrize("stage", CITY_STAGES)
+def test_an_unknown_city_id_stops_every_stage_before_it_fetches_or_writes(stage, tmp_path):
+    """
+    `--city` used to be resolved in three places that disagreed, and BOTH
+    answers were wrong. `_measure_targets` and `_detail_targets` filtered
+    unknown ids out, so a typo produced an empty stage that spent nothing,
+    logged success and overwrote a real run's artifact; `instances` and
+    `access` skipped the filter and died on a KeyError. One resolver now, one
+    answer, and it is the loud one.
+    """
+    cities = [_city("real--city")]
+    args = _stage_args(tmp_path, stage, "--city", "reall--city")
+    fetcher = _TileFetcher({})
+    with pytest.raises(SystemExit) as exit_info:
+        pf._run_stage(args, cities, pf._cities_by_id(cities), fetcher)
+    assert exit_info.value.code == pf.USAGE_EXIT == 64
+    assert fetcher.requests_spent == 0
+    assert not os.listdir(tmp_path)
+
+
+@pytest.mark.parametrize("stage", CITY_STAGES)
+def test_a_known_city_id_still_reaches_every_stage(stage, tmp_path):
+    """The resolver must not have broken the case it exists to serve."""
+    cities = [_city("real--city")]
+    args = _stage_args(tmp_path, stage, "--city", "real--city", "--dry-run")
+    out = pf._run_stage(args, cities, pf._cities_by_id(cities), None)
+    named = out.get("cities") if "cities" in out else out["leaders"]
+    assert named == ["real--city"]
+
+
+def test_the_unknown_id_message_names_the_typo_and_not_the_whole_catalog(tmp_path, caplog):
+    cities = [_city("a--b"), _city("c--d")]
+    with caplog.at_level("ERROR"), pytest.raises(SystemExit):
+        pf.resolve_city_override(["a--b", "zzz--qq"], pf._cities_by_id(cities))
+    assert "zzz--qq" in caplog.text
+    assert "a--b" not in caplog.text
+
+
+def test_a_measure_run_that_resolves_to_no_cities_refuses_to_overwrite_its_artifact(tmp_path):
+    """
+    Every stage writes its artifact unconditionally when it finishes, so a
+    zero-city run is not a harmless no-op -- it is a successful-looking
+    overwrite of whatever that stage measured last time.
+    """
+    screen = {"cities": [], "requests_spent": 0}
+    pf.write_raw(str(tmp_path), "screen", screen)
+    real = pf.write_raw(str(tmp_path), "measure", _prior("kept"))
+    before = open(real, encoding="utf-8").read()
+
+    args = _stage_args(tmp_path, "measure")
+    with pytest.raises(SystemExit) as exit_info:
+        pf._run_stage(args, [], {}, _TileFetcher({}))
+    assert exit_info.value.code == 64
+    assert open(real, encoding="utf-8").read() == before
+
+
+def test_a_detail_run_with_no_positive_measure_rows_refuses_rather_than_emptying_it(tmp_path):
+    pf.write_raw(
+        str(tmp_path),
+        "measure",
+        {
+            "leaders": [{"city_id": "a", "pictures": 0, "complete": True}],
+            "typical": [],
+            "controls": [],
+        },
+    )
+    real = pf.write_raw(str(tmp_path), "detail", {"cities": [{"city_id": "a"}]})
+    before = open(real, encoding="utf-8").read()
+    args = _stage_args(tmp_path, "detail")
+    with pytest.raises(SystemExit) as exit_info:
+        pf._run_stage(args, [_city("a")], pf._cities_by_id([_city("a")]), _TileFetcher({}))
+    assert exit_info.value.code == 64
+    assert open(real, encoding="utf-8").read() == before
+
+
+def test_a_missing_upstream_stage_is_a_usage_error_not_a_bare_exit(tmp_path):
+    """Exit 64 like every other bad invocation here, never 1."""
+    for stage in ("measure", "detail"):
+        with pytest.raises(SystemExit) as exit_info:
+            pf._run_stage(_stage_args(tmp_path, stage), [], {}, _TileFetcher({}))
+        assert exit_info.value.code == 64
+
+
+# ── A killed stage costs one city, not the run ─────────────────────────────
+
+
+def test_write_raw_replaces_atomically_and_leaves_no_staging_file(tmp_path):
+    """
+    A process killed midway through a write must not be able to leave a
+    half-written file where a complete one was -- the posture
+    `catalog-backups.md` argues for the catalog, for the same reason.
+    """
+    path = pf.write_raw(str(tmp_path), "screen", {"cities": [1, 2, 3]})
+    pf.write_raw(str(tmp_path), "screen", {"cities": [4]})
+    assert json.load(open(path, encoding="utf-8")) == {"cities": [4]}
+    assert sorted(os.listdir(tmp_path)) == ["screen.json"]
+
+
+def _spread_cities(*ids):
+    """
+    Cities on DISTINCT bboxes, one z15 tile apart.
+
+    `_city()` gives every id the same rectangle, which is fine for the pure
+    functions and wrong for anything walking a city loop: a tile rigged to
+    fail for the third city fails on the first one too, and the test then
+    passes or fails for a reason that has nothing to do with the code.
+    """
+    return [
+        {**_city(city_id), "bbox": list(dm.grid_bbox(47.60 + 0.05 * n, -122.33, 300, 300, 20))}
+        for n, city_id in enumerate(ids)
+    ]
+
+
+def test_a_stage_killed_midway_leaves_its_finished_cities_in_a_partial_file(tmp_path):
+    """
+    THE `finally` THAT WOULD NOT HAVE HELPED. The first `detail` run of this
+    study was killed by a low-memory sweep two cities in and lost ~400 paced
+    requests. A SIGKILL runs no handler and unwinds no stack, so the only
+    thing that survives it is bytes already on disk: every stage that walks
+    cities saves after each one, and this pins that the saved bytes are the
+    finished cities and nothing else.
+    """
+    cities = _spread_cities("a", "b", "c")
+    by_id = pf._cities_by_id(cities)
+    zoom = pf.DETAIL_ZOOM
+    doomed = pf.shuffled_tiles(dm.tiles_for_bbox(*cities[2]["bbox"], zoom), 316)[0]
+    survivors = {tile for city in cities[:2] for tile in dm.tiles_for_bbox(*city["bbox"], zoom)}
+    assert doomed not in survivors, "the rigged tile must belong only to the third city"
+    fetcher = _TileFetcher({}, raise_for={(zoom, *doomed): RuntimeError("OOM-killed")})
+    args = _stage_args(
+        tmp_path,
+        "detail",
+        "--city",
+        "a",
+        "--city",
+        "b",
+        "--city",
+        "c",
+        "--max-tiles-per-city",
+        "1",
+    )
+    progress = pf.StageProgress(str(tmp_path), "detail", "python ... --stage detail")
+
+    with pytest.raises(RuntimeError, match="OOM-killed"):
+        pf._run_stage(args, cities, by_id, fetcher, progress)
+
+    saved = json.load(open(pf.partial_path(str(tmp_path), "detail"), encoding="utf-8"))
+    assert [row["city_id"] for row in saved["cities"]] == ["a", "b"]
+    assert saved["_partial"] is True
+    assert saved["_measured_by"] == "python ... --stage detail"
+    # And the canonical artifact is untouched, because it never existed.
+    assert not os.path.exists(pf.raw_path(str(tmp_path), "detail"))
+
+
+def test_a_partial_never_clobbers_the_finished_run_it_is_re_running(tmp_path):
+    """
+    Checkpointing INTO the artifact would have traded one data-loss mode for
+    another: re-running `detail` and losing it after one city would replace a
+    complete run with a one-city one. The partial lives beside it instead.
+    """
+    finished = pf.write_raw(
+        str(tmp_path), "detail", {"cities": [{"city_id": f"old-{n}"} for n in range(20)]}
+    )
+    before = open(finished, encoding="utf-8").read()
+    cities = _spread_cities("a", "b")
+    zoom = pf.DETAIL_ZOOM
+    doomed = pf.shuffled_tiles(dm.tiles_for_bbox(*cities[1]["bbox"], zoom), 316)[0]
+    fetcher = _TileFetcher({}, raise_for={(zoom, *doomed): RuntimeError("boom")})
+    args = _stage_args(
+        tmp_path, "detail", "--city", "a", "--city", "b", "--max-tiles-per-city", "1"
+    )
+    progress = pf.StageProgress(str(tmp_path), "detail", "stamp")
+
+    with pytest.raises(RuntimeError):
+        pf._run_stage(args, cities, pf._cities_by_id(cities), fetcher, progress)
+
+    assert open(finished, encoding="utf-8").read() == before
+    partial = json.load(open(pf.partial_path(str(tmp_path), "detail"), encoding="utf-8"))
+    assert [row["city_id"] for row in partial["cities"]] == ["a"]
+
+
+def test_a_finished_stage_commits_and_drops_the_partial(tmp_path):
+    """A leftover *.partial.json therefore always means an unfinished run."""
+    progress = pf.StageProgress(str(tmp_path), "detail", "stamp")
+    progress.save({"cities": [{"city_id": "a"}]})
+    assert progress.saved_path and os.path.exists(progress.saved_path)
+
+    committed = progress.commit(
+        {"cities": [{"city_id": "a"}, {"city_id": "b"}], "_measured_by": "s"}
+    )
+    assert committed == pf.raw_path(str(tmp_path), "detail")
+    assert not os.path.exists(pf.partial_path(str(tmp_path), "detail"))
+    assert progress.saved_path is None
+    assert len(json.load(open(committed, encoding="utf-8"))["cities"]) == 2
+
+
+@pytest.mark.parametrize("stage", ["measure", "instances", "access"])
+def test_every_city_walking_stage_checkpoints_and_not_only_detail(stage, tmp_path):
+    """
+    `detail` is the stage that actually lost a run, but `measure` is 3,321
+    requests and `instances` and `access` are paced against the same host, so
+    the checkpoint belongs to the shape and not to the one incident.
+
+    Counted at CALL time, never from the captured payloads: the stages hand
+    `save` the live list they are still appending to, so a test holding
+    references would read every checkpoint as the final one and pass even if
+    the stage saved only once, at the end.
+    """
+    sizes = []
+    progress = pf.StageProgress(str(tmp_path), stage, "stamp")
+    key = "leaders" if stage == "measure" else "cities"
+    progress.save = lambda payload: sizes.append(len(payload[key]))  # noqa: E731
+    cities = _spread_cities("a", "b")
+    by_id = pf._cities_by_id(cities)
+    args = _stage_args(tmp_path, stage, "--city", "a", "--city", "b")
+    if stage == "measure":
+        pf._run_stage(args, cities, by_id, _TileFetcher({}), progress)
+    else:
+        empty = _search_response([])
+        stats = _FakeResponse(200, b"{}", {})
+        responses = [stats, stats] + [empty] * 2 if stage == "instances" else [empty] * 6
+        pf._run_stage(args, cities, by_id, _fetcher(responses), progress)
+    assert sizes == [1, 2]
+
+
+def test_a_dry_run_and_a_bare_progress_write_nothing(tmp_path):
+    """--dry-run spends nothing and must leave nothing behind either."""
+    disabled = pf.StageProgress()
+    assert disabled.save({"cities": []}) is None
+    assert disabled.commit({"cities": []}) is None
+    assert not os.listdir(tmp_path)
+
+
+def _catalog(tmp_path, *city_ids):
+    """A minimal frozen-grid catalog on disk, for the `main` entry point."""
+    db = tmp_path / "catalog.db"
+    connection = sqlite3.connect(db)
+    connection.execute(
+        "CREATE TABLE cities (city_id TEXT PRIMARY KEY, display_name TEXT, country_name TEXT, "
+        "center_lat REAL, center_lon REAL, grid_width_m INTEGER, grid_height_m INTEGER, "
+        "step_m INTEGER, enabled INTEGER)"
+    )
+    connection.executemany(
+        "INSERT INTO cities VALUES (?,?,?,?,?,?,?,?,?)",
+        [
+            (city_id, city_id.upper(), "United States", 47.60 + 0.05 * n, -122.33, 300, 300, 20, 1)
+            for n, city_id in enumerate(city_ids)
+        ],
+    )
+    connection.commit()
+    connection.close()
+    return db
+
+
+def _main_argv(tmp_path, *extra):
+    return [
+        "--stage",
+        "detail",
+        "--db",
+        str(_catalog(tmp_path, "a", "b")),
+        "--raw-dir",
+        str(tmp_path),
+        "--city",
+        "a",
+        "--city",
+        "b",
+        "--max-tiles-per-city",
+        "1",
+        "--rate",
+        "0",
+        *extra,
+    ]
+
+
+def test_main_returns_the_blocked_exit_code_and_keeps_what_it_measured(tmp_path, monkeypatch):
+    """
+    The wiring `_run_stage` tests cannot see: a refusal is exit 75 (the repo's
+    blocked family), the cities that finished are on disk, and the artifact of
+    the run being re-run is left exactly as it was.
+    """
+    finished = pf.write_raw(str(tmp_path), "detail", {"cities": [{"city_id": "old"}]})
+    before = open(finished, encoding="utf-8").read()
+
+    calls = {"n": 0}
+
+    class _BlockingFetcher(_TileFetcher):
+        def __init__(self, *args, **kwargs):
+            super().__init__({})
+
+        def get_tile(self, template, zoom, x, y):
+            calls["n"] += 1
+            if calls["n"] > 1:
+                raise pf.BlockedError("HTTP 429")
+            return super().get_tile(template, zoom, x, y)
+
+    monkeypatch.setattr(pf, "Fetcher", _BlockingFetcher)
+    assert pf.main(_main_argv(tmp_path)) == 75
+
+    assert open(finished, encoding="utf-8").read() == before
+    partial = json.load(open(pf.partial_path(str(tmp_path), "detail"), encoding="utf-8"))
+    assert [row["city_id"] for row in partial["cities"]] == ["a"]
+    assert partial["_measured_by"].startswith("python scripts/panoramax_feasibility.py")
+
+
+def test_main_commits_a_finished_stage_and_leaves_no_partial(tmp_path, monkeypatch):
+    monkeypatch.setattr(pf, "Fetcher", lambda *a, **k: _TileFetcher({}))
+    assert pf.main(_main_argv(tmp_path)) == 0
+    written = json.load(open(pf.raw_path(str(tmp_path), "detail"), encoding="utf-8"))
+    assert [row["city_id"] for row in written["cities"]] == ["a", "b"]
+    assert not os.path.exists(pf.partial_path(str(tmp_path), "detail"))
+
+
+def test_main_exits_64_on_an_unknown_city_without_sending_or_writing_anything(
+    tmp_path, monkeypatch
+):
+    """
+    Exit 64 through the real entry point, and the two properties that matter
+    with it: not one request went out, and the raw directory holds only the
+    catalog it was handed. (A `requests.Session` IS constructed first, which
+    opens no socket -- the guard is on traffic and on bytes written, not on
+    object construction.)
+    """
+    fetcher = _TileFetcher({})
+    monkeypatch.setattr(pf, "Fetcher", lambda *a, **k: fetcher)
+    argv = [
+        "--stage",
+        "detail",
+        "--db",
+        str(_catalog(tmp_path, "a")),
+        "--raw-dir",
+        str(tmp_path),
+        "--city",
+        "nope",
+    ]
+    with pytest.raises(SystemExit) as exit_info:
+        pf.main(argv)
+    assert exit_info.value.code == 64
+    assert fetcher.requests_spent == 0
+    assert os.listdir(tmp_path) == ["catalog.db"]
+
+
+# ── The screen reports measured traffic, not planned tiles ─────────────────
+
+
+def test_the_screen_reports_the_traffic_it_SENT_not_the_tiles_it_planned():
+    """
+    `Fetcher.get` counts every ATTEMPT, so a retried 5xx sends more traffic
+    than the plan priced. This is the one stage whose cost the writeup quotes
+    forward as a standing recommendation -- "113 requests re-screen the whole
+    catalog" -- and against a host with no documented limit the number that
+    travels has to be measured rather than planned.
+    """
+
+    class _RetryingTileFetcher(_TileFetcher):
+        def get_tile(self, template, zoom, x, y):
+            self.requests_spent += 1  # the 503 that preceded the success
+            return super().get_tile(template, zoom, x, y)
+
+    city = _city()
+    zoom = pf.SCREEN_ZOOM
+    x, y = _seattle_tile(zoom)
+    hexes = [
+        _hex_feature(
+            "86a", -122.30, 47.65, 0.05, nb_pictures=9, nb_360_pictures=7, nb_flat_pictures=2
+        )
+    ]
+    fetcher = _RetryingTileFetcher({(zoom, x, y): encode_polygons("grid", hexes, x, y, zoom)})
+    out = pf.stage_screen([city], fetcher, "v2_h3")
+    assert out["tiles"] == 1
+    assert out["requests_spent"] == fetcher.requests_spent == 2 > out["tiles"]
+
+
 # ── Provenance and the committed record ────────────────────────────────────
 
 
@@ -1590,20 +2207,53 @@ def test_the_controls_confirm_a_zero_screen_is_conclusive(record):
     assert all(row["pictures"] == 0 for row in controls)
 
 
+# A ratio band alone is finer than the instruments' own resolution on a small
+# city. The writeup's explanation for every non-exact ratio is "a picture on a
+# hexagon edge assigned differently by the two geometries" -- a plus-or-minus
+# ONE effect -- and on Aberdeen's 3 pictures one picture is 33%, six times a 5%
+# band. So the pin is the larger of the two: 5% for cities big enough for a
+# percentage to mean something, and 2 pictures for the ones where it does not.
+CROSS_CHECK_RATIO_BAND = 0.05
+CROSS_CHECK_ABSOLUTE_BAND = 2
+
+
 def test_the_two_tile_instruments_agree_on_every_city_complete_in_both(record):
     """
     The z14 grid's counters are server-aggregated; the z15 pictures layer is
     counted here per picture. Nothing else checks the aggregate layer every
     count rests on. Measured 2026-09-05 over 8 complete cities: 5 exact, the
-    rest within 3 pictures (ratios 0.9989-1.0357), so a 5% band is a
-    regression pin, not a tolerance the study needed.
+    rest within 3 pictures (ratios 0.9989-1.0357).
     """
     check = record["cross_check"]
     if not check:
         pytest.skip("needs cities complete in both the measure and detail stages")
     assert check["n"] >= 5, "the cross-check set is what --cross-check-cities exists for"
     for row in check["cities"]:
-        assert 0.95 <= row["ratio"] <= 1.05, row
+        grid, layer = row["z14_grid_pictures"], row["z15_pictures_layer"]
+        difference = abs(layer - grid)
+        assert (
+            difference <= CROSS_CHECK_ABSOLUTE_BAND or difference <= CROSS_CHECK_RATIO_BAND * grid
+        ), row
+
+
+def test_the_cross_check_band_is_not_finer_than_one_picture_on_a_small_city(record):
+    """
+    The guard on the guard. A band expressed only as a ratio silently asserts
+    EXACT agreement on any city small enough that one picture exceeds it, and
+    three of the eight cross-check cities are that small (Aberdeen 3, Pierre 7,
+    Ridgeley 28). That is a stronger claim than the study makes and one a
+    re-run has no reason to keep satisfying.
+    """
+    check = record["cross_check"]
+    if not check:
+        pytest.skip("needs cities complete in both the measure and detail stages")
+    small = [
+        row for row in check["cities"] if row["z14_grid_pictures"] * CROSS_CHECK_RATIO_BAND < 1
+    ]
+    assert small, "no small city left to protect -- re-derive this band before deleting it"
+    for row in small:
+        # One boundary picture moving must stay inside the band for these.
+        assert CROSS_CHECK_ABSOLUTE_BAND >= 1, row
 
 
 def test_the_tile_type_field_had_no_absent_state_over_every_picture_seen(record):

@@ -175,11 +175,15 @@ DEFAULT_SEARCH_LIMIT = 500
 # reconciliation under one city's measure cost.
 DEFAULT_RECONCILE_TILES = 4
 
-# The access probe's own constants. The datetime window is deliberately in the
-# FUTURE relative to the imagery it is aimed at, so "honoured" and "ignored"
-# give visibly different answers rather than merely different counts.
+# The access probe's own constants. The datetime window is DERIVED per city
+# from that city's own newest capture (see `access_window`) rather than fixed:
+# a fixed cutoff cannot answer in a city whose imagery all postdates it, and
+# this one silently stopped being in the future while the study was running.
+# The constant below is only the fallback for a city whose baseline sample
+# came back empty, where there is nothing to derive a window from and nothing
+# the probe could distinguish either way.
 ACCESS_PROBE_LIMIT = 300
-ACCESS_PROBE_DATETIME = "2026-01-01T00:00:00Z/.."
+ACCESS_PROBE_FALLBACK_DATETIME = "2026-01-01T00:00:00Z/.."
 DEFAULT_TIMEOUT_S = 60
 
 DOCS_RECORD_NOTE = (
@@ -201,7 +205,11 @@ DOCS_RECORD_NOTE = (
     "`access` is not a measurement of coverage at all: it probes three silent /api/search "
     "behaviours (no pagination, `datetime` ignored, `filter=field_of_view=360` dropping EXIF-less "
     "pictures) and DERIVES each finding from the responses, so a re-run against a fixed Panoramax "
-    "fails rather than leaving stale prose. "
+    "fails rather than leaving stale prose. Two of the three carry their own denominator and are "
+    "reported out of the cities that CAN answer: a city whose baseline held no EXIF-less picture "
+    "cannot show the field-of-view filter dropping one, and a city whose baseline held nothing "
+    "older than the probed window cannot show the `datetime` filter dropping anything -- which is "
+    "why that window is DERIVED from each city's own newest capture rather than fixed. "
     "`cross_check` compares the z14 grid's server-aggregated counters against a per-picture "
     "count off the z15 layer, only over cities complete in BOTH stages -- which is why `detail` "
     "also visits the richest cities that fit under --max-tiles-per-city at z15, since none of "
@@ -746,6 +754,7 @@ def stage_screen(
         }
 
     url = SCREEN_VARIANTS[variant]
+    spent_before = fetcher.requests_spent
     by_tile: dict[tuple[int, int], Any] = {}
     for index, (x, y) in enumerate(tile_list, start=1):
         raw = fetcher.get_tile(url, SCREEN_ZOOM, x, y)
@@ -791,7 +800,13 @@ def stage_screen(
         "zoom": SCREEN_ZOOM,
         "cell_deg": SCREEN_CELL_DEG if variant == "v1_lattice" else None,
         "tiles": len(tile_list),
-        "requests_spent": len(tile_list),
+        # The fetcher's delta, not len(tile_list): `Fetcher.get` counts every
+        # ATTEMPT, so a retried 5xx sends more traffic than the plan priced.
+        # This is the one stage whose cost the writeup quotes forward as a
+        # standing recommendation ("113 requests re-screen the whole
+        # catalog"), and against a host with no documented limit the number
+        # that travels has to be measured traffic rather than planned traffic.
+        "requests_spent": fetcher.requests_spent - spent_before,
         "cities": rows,
     }
 
@@ -878,12 +893,27 @@ def reusable_measure_row(
     opposite of the pacing posture this study argues for everywhere else.
 
     What makes reuse safe is the GUARD, not the determinism. A row is reused
-    only when the tile plan the current settings produce matches the plan the
-    row recorded; change --seed, --max-tiles-per-city, or a city's frozen
-    geometry and it is refetched rather than silently compared against a
-    different subset of a different bbox. Reuse is never silent either: the row
-    is stamped with the run that measured it and the payload counts how many
-    rows came from where.
+    only when the current settings reproduce the plan the row recorded; change
+    --max-tiles-per-city, --seed or a city's frozen geometry and it is
+    refetched rather than silently compared against a different subset of a
+    different bbox. Reuse is never silent either: the row is stamped with the
+    run that measured it and the payload counts how many rows came from where.
+
+    THE SEED IS PART OF THE PLAN ONLY WHEN THE PLAN IS TRUNCATED, and that
+    asymmetry is the whole subtlety. A complete city visits every tile in its
+    bbox and :func:`hexes_in_bbox` sorts by hex id, so its row is
+    seed-INDEPENDENT and reusing it across seeds is exact. A truncated city's
+    seed IS its sample -- ``shuffled_tiles(tiles, seed)[:max_tiles]`` picks a
+    different subset, so `pictures` and `pictures_scaled_to_bbox` both move
+    while `tiles_total` and `tiles_probed` stay identical. Comparing only the
+    two counts therefore let a changed --seed through silently, and the run
+    would stamp the new seed into `_measured_by` over rows drawn under the old
+    one -- a false provenance claim in a committed record, which is the exact
+    failure :func:`docs_generated_by` exists to prevent.
+
+    A truncated row that predates the `seed` field cannot be shown to match,
+    so it is refetched rather than assumed: unknown provenance is not matching
+    provenance.
 
     Returns None when there is nothing safely reusable.
     """
@@ -895,9 +925,11 @@ def reusable_measure_row(
                 continue
             tiles = tiles_for_bbox(*tuple(city["bbox"]), MEASURE_ZOOM)
             probed = min(max_tiles, len(tiles))
-            if row["tiles_total"] == len(tiles) and row["tiles_probed"] == probed:
-                return {**row, "reused_from": prior.get("_measured_by", "an earlier run")}
-            return None
+            if row["tiles_total"] != len(tiles) or row["tiles_probed"] != probed:
+                return None
+            if probed < len(tiles) and row.get("seed") != seed:
+                return None
+            return {**row, "reused_from": prior.get("_measured_by", "an earlier run")}
     return None
 
 
@@ -920,6 +952,10 @@ def measure_city(
         "country_name": city["country_name"],
         "tiles_total": len(tiles),
         "tiles_probed": len(order),
+        # Recorded because it is what SELECTED the probed tiles whenever the
+        # plan is truncated; reusable_measure_row cannot honour its own
+        # contract without it.
+        "seed": seed,
         "complete": len(order) == len(tiles),
         "hexes": len(inside),
         "pictures": pictures,
@@ -990,25 +1026,99 @@ def detail_city(
     }
 
 
+def parse_stamp(value: Any) -> datetime | None:
+    """
+    A search `datetime` property as an aware datetime, or None.
+
+    Parsed rather than string-compared: the endpoint mixes `Z` and `+00:00`
+    suffixes and mixes second with microsecond precision, and lexicographic
+    order across those forms is not chronological order.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def access_window(features: list[dict[str, Any]]) -> tuple[str, datetime | None, int]:
+    """
+    The `datetime` probe window for one city, derived from that city's OWN
+    newest capture, plus how many baseline pictures the window excludes.
+
+    Returns ``(window, cutoff, droppable)``.
+
+    WHY THIS IS NOT A CONSTANT. The window was originally fixed at
+    ``2026-01-01T00:00:00Z/..`` and justified as "deliberately in the FUTURE
+    relative to the imagery it is aimed at". It stopped being in the future
+    eight months before the study ran, and in a city whose imagery lies
+    ENTIRELY inside the window an honoured filter returns exactly the rows an
+    ignored one returns -- so the probe reads "ignored" no matter which is
+    true. That was not hypothetical: Boise's 300 baseline rows span 27 hours in
+    2026-08, and it was counted among the cities showing the filter ignored
+    while being no evidence at all.
+
+    Asking instead for "at or after this city's newest picture" leaves
+    something to drop wherever the baseline holds two distinct timestamps, so
+    the probe is decisive in every city that can be decisive at all -- Boise
+    included. `droppable` is that denominator: zero means the question cannot
+    be asked here, exactly as a baseline holding no EXIF-less picture cannot
+    answer the field-of-view question.
+    """
+    stamps = [
+        stamp
+        for stamp in (parse_stamp(f.get("properties", {}).get("datetime")) for f in features)
+        if stamp is not None
+    ]
+    if not stamps:
+        return ACCESS_PROBE_FALLBACK_DATETIME, None, 0
+    cutoff = max(stamps)
+    droppable = sum(1 for stamp in stamps if stamp < cutoff)
+    return cutoff.astimezone(UTC).isoformat().replace("+00:00", "Z") + "/..", cutoff, droppable
+
+
+def features_before(features: list[dict[str, Any]], cutoff: datetime | None) -> int:
+    """How many features fall OUTSIDE a ``<cutoff>/..`` window. Undated ones do."""
+    if cutoff is None:
+        return 0
+    outside = 0
+    for feature in features:
+        stamp = parse_stamp(feature.get("properties", {}).get("datetime"))
+        if stamp is None or stamp < cutoff:
+            outside += 1
+    return outside
+
+
 def stage_access(city: dict[str, Any], fetcher: Fetcher) -> dict[str, Any]:
     """
     Pin the three /api/search behaviours that phase 2 would design around.
 
     Each is a claim this study makes in prose, and prose is not evidence -- so
     each gets a recorded response rather than a sentence. All three are the
-    silent kind of failure, which is the only reason they are worth four
+    silent kind of failure, which is the only reason they are worth three
     requests:
 
       * PAGINATION. If `links` is empty at every limit and no match count is
         reported, a bbox with more pictures than `limit` is indistinguishable
         from one holding exactly `limit`. A collector built on search would
         report a ceiling as a measurement.
-      * THE `datetime` PARAMETER IS IGNORED. Not rejected, not empty -- the
-        SAME rows come back. An incremental "everything since last run" fetch
-        would silently re-read the whole history and report it as new.
+      * THE `datetime` PARAMETER IS IGNORED. Not rejected, not empty -- rows
+        from OUTSIDE the requested window come back. An incremental
+        "everything since last run" fetch would silently re-read the whole
+        history and report it as new.
       * `filter=field_of_view=360` DROPS THE EXIF-LESS PICTURES rather than
         treating them as unknown, so a 360-only search filter discards imagery
         the tile layer classifies perfectly well.
+
+    THE TWO DERIVED FINDINGS CARRY THEIR OWN DENOMINATOR. A city can only
+    answer the field-of-view question if its baseline held an EXIF-less
+    picture to drop, and can only answer the datetime question if its baseline
+    held a picture older than the probed window. A city that cannot answer is
+    recorded as no evidence either way rather than counted as a confirmation
+    -- which is what "N of M" in the writeup means, and what keeps a re-run
+    against a FIXED Panoramax failing loudly instead of silently agreeing.
     """
     min_lon, min_lat, max_lon, max_lat = city["bbox"]
     bbox = f"{min_lon},{min_lat},{max_lon},{max_lat}"
@@ -1042,21 +1152,34 @@ def stage_access(city: dict[str, Any], fetcher: Fetcher) -> dict[str, Any]:
             "datetime_span": [stamps[0], stamps[-1]] if stamps else None,
             "first_ids": [f.get("id") for f in features[:5]],
         }
+        return features
 
-    search("baseline", {"limit": ACCESS_PROBE_LIMIT})
-    search("datetime_filtered", {"limit": ACCESS_PROBE_LIMIT, "datetime": ACCESS_PROBE_DATETIME})
+    baseline_features = search("baseline", {"limit": ACCESS_PROBE_LIMIT})
+    window, cutoff, droppable = access_window(baseline_features)
+    filtered_features = search(
+        "datetime_filtered", {"limit": ACCESS_PROBE_LIMIT, "datetime": window}
+    )
     search("fov_360_filtered", {"limit": ACCESS_PROBE_LIMIT, "filter": "field_of_view=360"})
 
-    baseline, filtered = probes["baseline"], probes["datetime_filtered"]
+    baseline = probes["baseline"]
+    outside = features_before(filtered_features, cutoff)
+    probes["datetime_filtered"]["features_outside_window"] = outside
     return {
         "city_id": city["city_id"],
         "display_name": city["display_name"],
         "probes": probes,
+        "datetime_window": window,
         # The findings, computed rather than asserted, so a future re-run that
         # finds Panoramax has FIXED any of these fails loudly instead of
         # leaving three stale sentences in the writeup.
         "search_paginates": bool(baseline["links"]) or baseline["reports_number_matched"],
-        "datetime_filter_honoured": baseline["first_ids"] != filtered["first_ids"],
+        # A picture the window excludes coming back is the filter being
+        # ignored, full stop -- a far stronger test than "the first five ids
+        # match", which an honoured filter can also produce.
+        "datetime_can_answer": droppable > 0,
+        "datetime_baseline_droppable": droppable,
+        "datetime_filter_honoured": droppable > 0 and outside == 0,
+        "fov_can_answer": baseline["fov_classes"].get("absent", 0) > 0,
         "fov_filter_drops_absent": probes["fov_360_filtered"]["fov_classes"].get("absent", 0) == 0
         and baseline["fov_classes"].get("absent", 0) > 0,
     }
@@ -1218,20 +1341,110 @@ def raw_path(raw_dir: str, stage: str) -> str:
     return os.path.join(raw_dir, f"{stage}.json")
 
 
+def partial_path(raw_dir: str, stage: str) -> str:
+    """
+    Where a stage's progress lands WHILE it runs -- deliberately not
+    :func:`raw_path`.
+
+    A stage checkpoints beside its canonical artifact rather than into it,
+    because writing progress into the artifact would trade one data-loss mode
+    for another: re-running `detail` and losing it after three cities would
+    replace a complete twenty-city run with a three-city one. The canonical
+    file is only ever replaced by a run that finished.
+    """
+    return os.path.join(raw_dir, f"{stage}.partial.json")
+
+
+def _write_json(path: str, payload: dict[str, Any]) -> str:
+    """
+    Write JSON through a staging file and one :func:`os.replace`.
+
+    The same posture `catalog-backups.md` argues for the catalog, for the same
+    reason: a process killed midway through a write must not be able to leave
+    a half-written file where a complete one was. `os.replace` is atomic on
+    both platforms this runs on, so a reader sees the old file or the new one
+    and never a truncated one.
+    """
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    staging = f"{path}.tmp"
+    with open(staging, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=False)
+        handle.write("\n")
+    os.replace(staging, path)
+    return path
+
+
 def write_raw(raw_dir: str, stage: str, payload: dict[str, Any]) -> str:
     """
     Persist one stage's raw output to the gitignored /experiments tree.
 
     Written BEFORE any summarizing or printing, so a formatting mistake cannot
     discard a paced run that took an afternoon -- the ordering discipline
-    `kartaview_sweep_cost.py` settled on in place of atomic writes.
+    `kartaview_sweep_cost.py` settled on. That covers a mistake AFTER the
+    fetching stops; :class:`StageProgress` is what covers one during.
     """
-    os.makedirs(raw_dir, exist_ok=True)
-    path = raw_path(raw_dir, stage)
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2, sort_keys=False)
-        handle.write("\n")
-    return path
+    return _write_json(raw_path(raw_dir, stage), payload)
+
+
+class StageProgress:
+    """
+    Mid-run persistence, so a killed stage costs one city rather than the run.
+
+    THIS EXISTS BECAUSE A `finally` WOULD NOT HAVE HELPED. The first `detail`
+    run of this study was killed by a low-memory sweep two cities in and lost
+    ~400 paced requests, and the fix at the time (accumulate counters instead
+    of holding every picture) removed that particular trigger without removing
+    the exposure. A SIGKILL runs no handler and unwinds no stack, so the only
+    thing that survives it is bytes already on disk: every stage that walks
+    cities therefore saves after each one.
+
+    At 30 requests/minute a `detail` stage is a ~100-minute run against a host
+    with no documented limit and an explicit do-not-retry-into-a-refusal
+    posture, which makes re-spending its requests the most expensive mistake
+    available here.
+
+    `screen` is deliberately NOT checkpointed: its payload is only computable
+    once every tile is in (a city's bound sums cells from tiles fetched all
+    over the run), and at 113 requests it is two orders of magnitude cheaper
+    than the stages that are.
+
+    Constructed with no arguments it is a no-op, which is what a --dry-run and
+    the unit tests get.
+    """
+
+    def __init__(self, raw_dir: str | None = None, stage: str | None = None, stamp: str = ""):
+        self.enabled = bool(raw_dir and stage)
+        self.raw_dir = raw_dir
+        self.stage = stage
+        self.stamp = stamp
+        self.saved_path: str | None = None
+
+    def save(self, payload: dict[str, Any]) -> str | None:
+        """Persist progress so far. Cheap enough to call once per city."""
+        if not self.enabled:
+            return None
+        self.saved_path = _write_json(
+            partial_path(self.raw_dir, self.stage),
+            {**payload, "_measured_by": self.stamp, "_partial": True},
+        )
+        return self.saved_path
+
+    def commit(self, payload: dict[str, Any]) -> str | None:
+        """
+        Promote a FINISHED stage into its canonical artifact and drop the
+        partial, so a leftover `*.partial.json` always means an unfinished run.
+        """
+        if not self.enabled:
+            return None
+        path = write_raw(self.raw_dir, self.stage, payload)
+        try:
+            os.remove(partial_path(self.raw_dir, self.stage))
+        except OSError:
+            pass
+        self.saved_path = None
+        return path
 
 
 def read_raw(raw_dir: str, stage: str) -> dict[str, Any] | None:
@@ -1523,20 +1736,27 @@ def summarize_access(access: dict[str, Any]) -> dict[str, Any]:
 
     Reported as "N of M cities" rather than a bare boolean because a behaviour
     that held in one city and not another would be the interesting result, and
-    a single flag would hide it. The field-of-view finding carries its own
-    denominator: a city whose baseline sample held no EXIF-less picture cannot
-    show the filter dropping one, so it is no evidence either way rather than
-    a city where the filter behaved.
+    a single flag would hide it.
+
+    TWO OF THE THREE CARRY THEIR OWN DENOMINATOR, and they carry it the same
+    way. A city whose baseline sample held no EXIF-less picture cannot show
+    the field-of-view filter dropping one; a city whose baseline held nothing
+    older than the probed window cannot show the datetime filter dropping
+    anything either. Both are no evidence rather than a confirmation, and the
+    summary counts them out of the cities that can answer rather than out of
+    all of them -- pooling the unanswerable ones in would report agreement
+    that was never measured. Pagination needs no such guard: an empty `links`
+    with no `numberMatched` is a property of the response itself.
     """
     rows = access["cities"]
-    can_answer_fov = [
-        r for r in rows if r["probes"]["baseline"]["fov_classes"].get("absent", 0) > 0
-    ]
+    can_answer_fov = [r for r in rows if r["fov_can_answer"]]
+    can_answer_datetime = [r for r in rows if r["datetime_can_answer"]]
     return {
         "n": len(rows),
         "cities_where_search_paginates": sum(1 for r in rows if r["search_paginates"]),
+        "cities_that_can_answer_the_datetime_question": len(can_answer_datetime),
         "cities_where_datetime_filter_honoured": sum(
-            1 for r in rows if r["datetime_filter_honoured"]
+            1 for r in can_answer_datetime if r["datetime_filter_honoured"]
         ),
         "cities_with_an_absent_picture_in_baseline": len(can_answer_fov),
         "cities_where_fov_filter_drops_absent": sum(
@@ -1676,13 +1896,68 @@ def _cities_by_id(cities: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     return {city["city_id"]: city for city in cities}
 
 
+USAGE_EXIT = 64  # the repo's usage-error code; 2 and 1 mean other things here
+
+
+def _usage_error(message: str):
+    """Fail a bad invocation loudly and with the repo's usage exit code."""
+    logger.error(message)
+    raise SystemExit(USAGE_EXIT)
+
+
+def resolve_city_override(city_ids: list[str], by_id: dict[str, dict[str, Any]]) -> list[str]:
+    """
+    `--city` resolved against the catalog, in ONE place for every stage.
+
+    It used to be resolved in three, and they disagreed. `_measure_targets`
+    and `_detail_targets` filtered unknown ids out, so a typo produced an
+    EMPTY stage that spent nothing, logged success and OVERWROTE the raw
+    artifact of a real run -- `--stage detail --city des-moines--iowa` (the
+    real id ends `--united-states`) would have discarded a 3,001-request run
+    and left `cross_check` with nothing to compare. The `instances` and
+    `access` branches skipped the filter entirely and died on a KeyError
+    instead. Two wrong answers to one typo, and the silent one is worse.
+
+    So: unknown ids are named and the run stops before anything is fetched or
+    written. Nothing here is expensive enough to be worth guessing at.
+    """
+    unknown = [city_id for city_id in city_ids if city_id not in by_id]
+    if unknown:
+        _usage_error(
+            "unknown --city id(s): "
+            + ", ".join(sorted(unknown))
+            + " -- ids are the catalog's `city_id`, not display names, and nothing was "
+            "fetched or written."
+        )
+    return list(city_ids)
+
+
+def _require_targets(stage: str, targets) -> None:
+    """
+    Refuse to run a stage that resolved to no cities.
+
+    Every stage writes its artifact unconditionally when it finishes, so a
+    zero-city run is not a harmless no-op: it is a successful-looking
+    overwrite of whatever that stage measured last time.
+    """
+    if not targets:
+        _usage_error(
+            f"--stage {stage} resolved to no cities, so it would overwrite "
+            f"{stage}.json with an empty run. Nothing was fetched or written."
+        )
+
+
 def _measure_targets(args, cities, by_id) -> dict[str, list[str]]:
     """The grouped id lists stage `measure` will walk."""
     if args.city:
-        return {"leaders": [c for c in args.city if c in by_id], "typical": [], "controls": []}
+        return {
+            "leaders": resolve_city_override(args.city, by_id),
+            "typical": [],
+            "controls": [],
+        }
     screen = read_raw(args.raw_dir, "screen")
     if screen is None:
-        raise SystemExit(
+        _usage_error(
             f"--stage measure needs {raw_path(args.raw_dir, 'screen')}; run --stage screen first "
             f"(113 requests) or name cities with --city."
         )
@@ -1706,10 +1981,10 @@ def _detail_targets(args, by_id) -> list[str]:
     deduped, so a small rich city counts once.
     """
     if args.city:
-        return [c for c in args.city if c in by_id]
+        return resolve_city_override(args.city, by_id)
     measure = read_raw(args.raw_dir, "measure")
     if measure is None:
-        raise SystemExit(
+        _usage_error(
             f"--stage detail needs {raw_path(args.raw_dir, 'measure')}; run --stage measure first "
             f"or name cities with --city."
         )
@@ -1753,16 +2028,28 @@ def main(argv: list[str] | None = None) -> int:
         limiter = SpacedRateLimiter(args.rate, jitter=args.jitter)
         fetcher = None if args.dry_run else Fetcher(limiter, args.timeout)
 
+        # Stamped BEFORE the stage runs, because a checkpoint written mid-run
+        # has to carry the same provenance the finished artifact would.
+        stamp = measured_by(args, args.stage)
+        progress = (
+            StageProgress() if args.dry_run else StageProgress(args.raw_dir, args.stage, stamp)
+        )
         try:
-            payload = _run_stage(args, cities, by_id, fetcher)
+            payload = _run_stage(args, cities, by_id, fetcher, progress)
         except BlockedError as exc:
             logger.error(str(exc))
+            _log_partial(progress)
             return 75
+        except BaseException:
+            # Ctrl-C and any unhandled failure. A SIGKILL reaches none of this,
+            # which is exactly why the checkpoints are on disk already.
+            _log_partial(progress)
+            raise
         if args.dry_run:
             print(json.dumps(payload, indent=2))
             return 0
-        payload["_measured_by"] = measured_by(args, args.stage)
-        path = write_raw(args.raw_dir, args.stage, payload)
+        payload["_measured_by"] = stamp
+        path = progress.commit(payload)
         logger.info(f"wrote {path} ({fetcher.requests_spent} requests spent)")
 
     if args.analyze:
@@ -1773,13 +2060,26 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def _run_stage(args, cities, by_id, fetcher) -> dict[str, Any]:
+def _log_partial(progress: StageProgress) -> None:
+    """Say where the interrupted stage's progress is, or there is no point."""
+    if progress.saved_path:
+        logger.error(
+            f"partial progress is in {progress.saved_path}; it holds every city that "
+            f"finished, and {raw_path(progress.raw_dir, progress.stage)} was left untouched."
+        )
+
+
+def _run_stage(
+    args, cities, by_id, fetcher, progress: StageProgress | None = None
+) -> dict[str, Any]:
     """Dispatch one stage; every branch returns the stage's raw payload."""
+    progress = progress or StageProgress()
     if args.stage == "screen":
         return stage_screen(cities, fetcher, args.screen_variant)
 
     if args.stage == "measure":
         groups = _measure_targets(args, cities, by_id)
+        _require_targets("measure", [city_id for ids in groups.values() for city_id in ids])
         prior = read_raw(args.raw_dir, "measure") if args.reuse_measured else None
         if args.dry_run:
             planned = {
@@ -1823,12 +2123,20 @@ def _run_stage(args, cities, by_id, fetcher) -> dict[str, Any]:
                     f"measure {group} {index}/{len(ids)} {city_id}: "
                     f"{row['pictures']} pictures over {row['tiles_probed']} tiles"
                 )
+                progress.save(
+                    {
+                        **out,
+                        "requests_spent": fetcher.requests_spent - spent_before,
+                        "empty_tiles": fetcher.empty_tiles,
+                    }
+                )
         out["requests_spent"] = fetcher.requests_spent - spent_before
         out["empty_tiles"] = fetcher.empty_tiles
         return out
 
     if args.stage == "detail":
         targets = _detail_targets(args, by_id)
+        _require_targets("detail", targets)
         if args.dry_run:
             planned = sum(
                 min(args.max_tiles_per_city, len(tiles_for_bbox(*by_id[c]["bbox"], DETAIL_ZOOM)))
@@ -1844,10 +2152,12 @@ def _run_stage(args, cities, by_id, fetcher) -> dict[str, Any]:
                 f"detail {index}/{len(targets)} {city_id}: {row['pictures']} pictures, "
                 f"{row['distinct_capture_months']} months"
             )
+            progress.save({"cities": rows, "requests_spent": fetcher.requests_spent - spent_before})
         return {"cities": rows, "requests_spent": fetcher.requests_spent - spent_before}
 
     if args.stage == "instances":
-        targets = args.city or _detail_targets(args, by_id)
+        targets = _detail_targets(args, by_id)
+        _require_targets("instances", targets)
         if args.dry_run:
             return {
                 "cities": targets,
@@ -1863,6 +2173,13 @@ def _run_stage(args, cities, by_id, fetcher) -> dict[str, Any]:
                 f"instances {index}/{len(targets)} {city_id}: {row['sampled']} sampled, "
                 f"{len(row['instances'])} instances"
             )
+            progress.save(
+                {
+                    "federation": federation,
+                    "cities": rows,
+                    "requests_spent": fetcher.requests_spent - spent_before,
+                }
+            )
         return {
             "federation": federation,
             "cities": rows,
@@ -1870,17 +2187,22 @@ def _run_stage(args, cities, by_id, fetcher) -> dict[str, Any]:
         }
 
     if args.stage == "access":
-        targets = args.city or _detail_targets(args, by_id)
+        targets = _detail_targets(args, by_id)
+        _require_targets("access", targets)
         if args.dry_run:
             return {"cities": targets, "planned_requests": 3 * len(targets)}
         spent_before = fetcher.requests_spent
-        rows = [stage_access(by_id[city_id], fetcher) for city_id in targets]
-        for row in rows:
+        rows = []
+        for city_id in targets:
+            row = stage_access(by_id[city_id], fetcher)
+            rows.append(row)
             logger.info(
                 f"access {row['city_id']}: paginates={row['search_paginates']} "
                 f"datetime_honoured={row['datetime_filter_honoured']} "
+                f"(can answer: {row['datetime_can_answer']}) "
                 f"fov_filter_drops_absent={row['fov_filter_drops_absent']}"
             )
+            progress.save({"cities": rows, "requests_spent": fetcher.requests_spent - spent_before})
         return {"cities": rows, "requests_spent": fetcher.requests_spent - spent_before}
 
     raise AssertionError(f"unhandled stage {args.stage!r}")

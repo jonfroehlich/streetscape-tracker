@@ -4,7 +4,7 @@
     "writeup": "docs/experiments/panoramax-feasibility.md",
     "issue": "https://github.com/jonfroehlich/streetscape-tracker/issues/316",
     "generated_by": "python scripts/panoramax_feasibility.py --analyze",
-    "generated_at": "2026-09-05T15:01:59+00:00",
+    "generated_at": "2026-09-06T13:23:17+00:00",
     "catalog_label": "laptop",
     "api_base": "https://api.panoramax.xyz/api",
     "credential": null,
@@ -18,7 +18,7 @@
       "instances": "python scripts/panoramax_feasibility.py --stage instances",
       "access": "python scripts/panoramax_feasibility.py --stage access"
     },
-    "note": "Phase 1 of #316: read-only, no credential, no collector. Three instruments, and they are not interchangeable. `screen` sums the v2 z6 H3 grid layer's res-6 hexagons (~36 km2 each) overlapping a city's frozen grid bbox, so every `screen_pictures_upper_bound` is an UPPER BOUND over an area much larger than the city -- a zero is conclusive, a positive number is not; the v1 z6 lattice the API root advertises DROPS populated cells and is kept only as `--screen-variant v1_lattice` for the comparison. `measure` sums the v2 z14 H3 grid layer's res-11 hexagons whose centre falls inside the bbox, which is the exact in-bbox count; hexes are deduped by H3 id across tiles and their centres are reconstructed from the union of the clipped pieces. `detail` reads the v1 z15 pictures layer per picture, and is the only stage that can report capture months, contributors and sequences; where `tiles_probed` is below `tiles_total` the city was truncated by --max-tiles-per-city and its counts are a seeded-shuffle sample of the bbox, NOT a total. `instances` is a bounded /api/search sample, capped by --search-limit and therefore never a count of anything; it exists to attribute pictures to source instances and to cross-tabulate the EXIF field of view against the same pictures' tile `type`, which has no absent state. `access` is not a measurement of coverage at all: it probes three silent /api/search behaviours (no pagination, `datetime` ignored, `filter=field_of_view=360` dropping EXIF-less pictures) and DERIVES each finding from the responses, so a re-run against a fixed Panoramax fails rather than leaving stale prose. `cross_check` compares the z14 grid's server-aggregated counters against a per-picture count off the z15 layer, only over cities complete in BOTH stages -- which is why `detail` also visits the richest cities that fit under --max-tiles-per-city at z15, since none of the richest cities overall does. Quote `measure` for counts, `detail` for dates and contributors, and neither for the other."
+    "note": "Phase 1 of #316: read-only, no credential, no collector. Three instruments, and they are not interchangeable. `screen` sums the v2 z6 H3 grid layer's res-6 hexagons (~36 km2 each) overlapping a city's frozen grid bbox, so every `screen_pictures_upper_bound` is an UPPER BOUND over an area much larger than the city -- a zero is conclusive, a positive number is not; the v1 z6 lattice the API root advertises DROPS populated cells and is kept only as `--screen-variant v1_lattice` for the comparison. `measure` sums the v2 z14 H3 grid layer's res-11 hexagons whose centre falls inside the bbox, which is the exact in-bbox count; hexes are deduped by H3 id across tiles and their centres are reconstructed from the union of the clipped pieces. `detail` reads the v1 z15 pictures layer per picture, and is the only stage that can report capture months, contributors and sequences; where `tiles_probed` is below `tiles_total` the city was truncated by --max-tiles-per-city and its counts are a seeded-shuffle sample of the bbox, NOT a total. `instances` is a bounded /api/search sample, capped by --search-limit and therefore never a count of anything; it exists to attribute pictures to source instances and to cross-tabulate the EXIF field of view against the same pictures' tile `type`, which has no absent state. `access` is not a measurement of coverage at all: it probes three silent /api/search behaviours (no pagination, `datetime` ignored, `filter=field_of_view=360` dropping EXIF-less pictures) and DERIVES each finding from the responses, so a re-run against a fixed Panoramax fails rather than leaving stale prose. Two of the three carry their own denominator and are reported out of the cities that CAN answer: a city whose baseline held no EXIF-less picture cannot show the field-of-view filter dropping one, and a city whose baseline held nothing older than the probed window cannot show the `datetime` filter dropping anything -- which is why that window is DERIVED from each city's own newest capture rather than fixed. `cross_check` compares the z14 grid's server-aggregated counters against a per-picture count off the z15 layer, only over cities complete in BOTH stages -- which is why `detail` also visits the richest cities that fit under --max-tiles-per-city at z15, since none of the richest cities overall does. Quote `measure` for counts, `detail` for dates and contributors, and neither for the other."
   },
   "federation": {
     "registered_instances": 23,
@@ -21381,6 +21381,7 @@
     "summary": {
       "n": 20,
       "cities_where_search_paginates": 0,
+      "cities_that_can_answer_the_datetime_question": 20,
       "cities_where_datetime_filter_honoured": 0,
       "cities_with_an_absent_picture_in_baseline": 17,
       "cities_where_fov_filter_drops_absent": 17,
@@ -21414,14 +21415,14 @@
                 "31c51fb4-0fab-4312-afea-455bceda2122",
                 "8a3f41c8-0eba-4b46-b919-988454931c97",
                 "832a2dd2-4b72-48b8-8240-e85210623875",
-                "f98c720b-f200-4062-b673-22df82f0610a",
-                "39dc77b4-08ee-474f-84a4-68e8d3f3af46"
+                "7e4a7e2c-aae1-4673-8cac-b45556be8b10",
+                "f98c720b-f200-4062-b673-22df82f0610a"
               ]
             },
             "datetime_filtered": {
               "params": {
                 "limit": 300,
-                "datetime": "2026-01-01T00:00:00Z/.."
+                "datetime": "2026-04-29T06:19:01.033676Z/.."
               },
               "status": 200,
               "response_bytes": 2051376,
@@ -21441,9 +21442,10 @@
                 "31c51fb4-0fab-4312-afea-455bceda2122",
                 "8a3f41c8-0eba-4b46-b919-988454931c97",
                 "832a2dd2-4b72-48b8-8240-e85210623875",
-                "f98c720b-f200-4062-b673-22df82f0610a",
-                "39dc77b4-08ee-474f-84a4-68e8d3f3af46"
-              ]
+                "7e4a7e2c-aae1-4673-8cac-b45556be8b10",
+                "f98c720b-f200-4062-b673-22df82f0610a"
+              ],
+              "features_outside_window": 299
             },
             "fov_360_filtered": {
               "params": {
@@ -21471,8 +21473,12 @@
               ]
             }
           },
+          "datetime_window": "2026-04-29T06:19:01.033676Z/..",
           "search_paginates": false,
+          "datetime_can_answer": true,
+          "datetime_baseline_droppable": 299,
           "datetime_filter_honoured": false,
+          "fov_can_answer": true,
           "fov_filter_drops_absent": true
         },
         {
@@ -21506,7 +21512,7 @@
             "datetime_filtered": {
               "params": {
                 "limit": 300,
-                "datetime": "2026-01-01T00:00:00Z/.."
+                "datetime": "2026-02-14T18:06:43.618259Z/.."
               },
               "status": 200,
               "response_bytes": 1717754,
@@ -21526,7 +21532,8 @@
                 "06f84b4d-65ae-4dbd-8970-2462b992cf1b",
                 "52cf6c69-2757-4eb9-9c4d-de65cff8c969",
                 "b03b23de-cb44-4fef-8f69-243a02d89b9d"
-              ]
+              ],
+              "features_outside_window": 299
             },
             "fov_360_filtered": {
               "params": {
@@ -21554,8 +21561,12 @@
               ]
             }
           },
+          "datetime_window": "2026-02-14T18:06:43.618259Z/..",
           "search_paginates": false,
+          "datetime_can_answer": true,
+          "datetime_baseline_droppable": 299,
           "datetime_filter_honoured": false,
+          "fov_can_answer": false,
           "fov_filter_drops_absent": false
         },
         {
@@ -21590,7 +21601,7 @@
             "datetime_filtered": {
               "params": {
                 "limit": 300,
-                "datetime": "2026-01-01T00:00:00Z/.."
+                "datetime": "2025-07-14T06:55:26Z/.."
               },
               "status": 200,
               "response_bytes": 1605372,
@@ -21611,7 +21622,8 @@
                 "2a89dc51-bfd0-48b5-9f8c-21dd957eb541",
                 "874bb1d9-d36c-472e-9b00-f95e015b0bd0",
                 "a916821c-e5c9-4b54-a2fa-1eb1fe1702db"
-              ]
+              ],
+              "features_outside_window": 299
             },
             "fov_360_filtered": {
               "params": {
@@ -21639,8 +21651,12 @@
               ]
             }
           },
+          "datetime_window": "2025-07-14T06:55:26Z/..",
           "search_paginates": false,
+          "datetime_can_answer": true,
+          "datetime_baseline_droppable": 299,
           "datetime_filter_honoured": false,
+          "fov_can_answer": true,
           "fov_filter_drops_absent": true
         },
         {
@@ -21675,7 +21691,7 @@
             "datetime_filtered": {
               "params": {
                 "limit": 300,
-                "datetime": "2026-01-01T00:00:00Z/.."
+                "datetime": "2025-11-23T07:29:05Z/.."
               },
               "status": 200,
               "response_bytes": 2261373,
@@ -21696,7 +21712,8 @@
                 "cade27e3-165b-4af3-b834-6238d7410e88",
                 "b65c0485-9b97-459e-abaa-65be59be4ab7",
                 "9a591e93-f29b-4732-8e8f-7debd5c8a950"
-              ]
+              ],
+              "features_outside_window": 299
             },
             "fov_360_filtered": {
               "params": {
@@ -21724,8 +21741,12 @@
               ]
             }
           },
+          "datetime_window": "2025-11-23T07:29:05Z/..",
           "search_paginates": false,
+          "datetime_can_answer": true,
+          "datetime_baseline_droppable": 299,
           "datetime_filter_honoured": false,
+          "fov_can_answer": true,
           "fov_filter_drops_absent": true
         },
         {
@@ -21760,7 +21781,7 @@
             "datetime_filtered": {
               "params": {
                 "limit": 300,
-                "datetime": "2026-01-01T00:00:00Z/.."
+                "datetime": "2026-03-28T22:34:16.257000Z/.."
               },
               "status": 200,
               "response_bytes": 2093164,
@@ -21781,7 +21802,8 @@
                 "a971d3e2-f7ea-4394-9b6a-3199c0262af4",
                 "17d0b632-8776-4fa0-8fd2-008cd893110e",
                 "5560c780-e666-454b-b3ab-81b9eb27f130"
-              ]
+              ],
+              "features_outside_window": 299
             },
             "fov_360_filtered": {
               "params": {
@@ -21809,8 +21831,12 @@
               ]
             }
           },
+          "datetime_window": "2026-03-28T22:34:16.257000Z/..",
           "search_paginates": false,
+          "datetime_can_answer": true,
+          "datetime_baseline_droppable": 299,
           "datetime_filter_honoured": false,
+          "fov_can_answer": true,
           "fov_filter_drops_absent": true
         },
         {
@@ -21845,7 +21871,7 @@
             "datetime_filtered": {
               "params": {
                 "limit": 300,
-                "datetime": "2026-01-01T00:00:00Z/.."
+                "datetime": "2025-05-12T08:04:00.094000Z/.."
               },
               "status": 200,
               "response_bytes": 1903729,
@@ -21866,7 +21892,8 @@
                 "8e9f48ff-e111-4edf-9c23-ff25d44484dc",
                 "99dada6f-903f-4b22-a9c2-75d9a9f9fc21",
                 "f51e686f-d48d-4349-9245-f3249023641c"
-              ]
+              ],
+              "features_outside_window": 299
             },
             "fov_360_filtered": {
               "params": {
@@ -21894,8 +21921,12 @@
               ]
             }
           },
+          "datetime_window": "2025-05-12T08:04:00.094000Z/..",
           "search_paginates": false,
+          "datetime_can_answer": true,
+          "datetime_baseline_droppable": 299,
           "datetime_filter_honoured": false,
+          "fov_can_answer": true,
           "fov_filter_drops_absent": true
         },
         {
@@ -21929,7 +21960,7 @@
             "datetime_filtered": {
               "params": {
                 "limit": 300,
-                "datetime": "2026-01-01T00:00:00Z/.."
+                "datetime": "2026-08-15T15:10:15.006900Z/.."
               },
               "status": 200,
               "response_bytes": 1965162,
@@ -21949,7 +21980,8 @@
                 "4b4f88b1-bb08-4a65-acef-47c121d9b7c6",
                 "9fbb6f15-4359-44fc-bef0-5d24cf829d01",
                 "7db3ed67-daa3-4dd5-994d-e6b5ff090580"
-              ]
+              ],
+              "features_outside_window": 299
             },
             "fov_360_filtered": {
               "params": {
@@ -21966,8 +21998,12 @@
               "first_ids": []
             }
           },
+          "datetime_window": "2026-08-15T15:10:15.006900Z/..",
           "search_paginates": false,
+          "datetime_can_answer": true,
+          "datetime_baseline_droppable": 299,
           "datetime_filter_honoured": false,
+          "fov_can_answer": false,
           "fov_filter_drops_absent": false
         },
         {
@@ -22002,7 +22038,7 @@
             "datetime_filtered": {
               "params": {
                 "limit": 300,
-                "datetime": "2026-01-01T00:00:00Z/.."
+                "datetime": "2026-03-27T23:08:10.358000Z/.."
               },
               "status": 200,
               "response_bytes": 2495165,
@@ -22023,7 +22059,8 @@
                 "d4114874-6b0d-4f09-bd38-c403dd820a4d",
                 "a401321c-a285-432f-9e9b-c45448f3f1ce",
                 "a9add9ca-d4f8-4a91-a60d-310e9d4968c5"
-              ]
+              ],
+              "features_outside_window": 299
             },
             "fov_360_filtered": {
               "params": {
@@ -22051,8 +22088,12 @@
               ]
             }
           },
+          "datetime_window": "2026-03-27T23:08:10.358000Z/..",
           "search_paginates": false,
+          "datetime_can_answer": true,
+          "datetime_baseline_droppable": 299,
           "datetime_filter_honoured": false,
+          "fov_can_answer": true,
           "fov_filter_drops_absent": true
         },
         {
@@ -22087,7 +22128,7 @@
             "datetime_filtered": {
               "params": {
                 "limit": 300,
-                "datetime": "2026-01-01T00:00:00Z/.."
+                "datetime": "2025-06-29T19:05:21.085045Z/.."
               },
               "status": 200,
               "response_bytes": 1616694,
@@ -22108,7 +22149,8 @@
                 "3719b5f0-93b4-4df8-97de-cabd63a08c08",
                 "5d665393-3dab-4c91-b028-dd8659341586",
                 "6f1b999d-4038-4185-9a47-cb43ac754e07"
-              ]
+              ],
+              "features_outside_window": 299
             },
             "fov_360_filtered": {
               "params": {
@@ -22136,8 +22178,12 @@
               ]
             }
           },
+          "datetime_window": "2025-06-29T19:05:21.085045Z/..",
           "search_paginates": false,
+          "datetime_can_answer": true,
+          "datetime_baseline_droppable": 299,
           "datetime_filter_honoured": false,
+          "fov_can_answer": true,
           "fov_filter_drops_absent": true
         },
         {
@@ -22172,7 +22218,7 @@
             "datetime_filtered": {
               "params": {
                 "limit": 300,
-                "datetime": "2026-01-01T00:00:00Z/.."
+                "datetime": "2026-04-19T20:00:56Z/.."
               },
               "status": 200,
               "response_bytes": 2505108,
@@ -22193,7 +22239,8 @@
                 "4ba56078-a94a-473a-bdd0-e0b661a79ff2",
                 "139cdb4b-e328-4819-a3ff-19d740559942",
                 "ea37717e-5336-4ba7-b793-caad4c528420"
-              ]
+              ],
+              "features_outside_window": 299
             },
             "fov_360_filtered": {
               "params": {
@@ -22221,8 +22268,12 @@
               ]
             }
           },
+          "datetime_window": "2026-04-19T20:00:56Z/..",
           "search_paginates": false,
+          "datetime_can_answer": true,
+          "datetime_baseline_droppable": 299,
           "datetime_filter_honoured": false,
+          "fov_can_answer": true,
           "fov_filter_drops_absent": true
         },
         {
@@ -22256,7 +22307,7 @@
             "datetime_filtered": {
               "params": {
                 "limit": 300,
-                "datetime": "2026-01-01T00:00:00Z/.."
+                "datetime": "2026-08-27T21:27:43.375549Z/.."
               },
               "status": 200,
               "response_bytes": 1284891,
@@ -22276,7 +22327,8 @@
                 "aa3a241d-910f-4d4c-92f1-5a1dae390ff3",
                 "54af2687-8e24-4d5a-8748-f5cb0fbe88f2",
                 "e36e001e-a2c7-40aa-9ef9-79bdc697abea"
-              ]
+              ],
+              "features_outside_window": 299
             },
             "fov_360_filtered": {
               "params": {
@@ -22293,8 +22345,12 @@
               "first_ids": []
             }
           },
+          "datetime_window": "2026-08-27T21:27:43.375549Z/..",
           "search_paginates": false,
+          "datetime_can_answer": true,
+          "datetime_baseline_droppable": 299,
           "datetime_filter_honoured": false,
+          "fov_can_answer": true,
           "fov_filter_drops_absent": true
         },
         {
@@ -22329,7 +22385,7 @@
             "datetime_filtered": {
               "params": {
                 "limit": 300,
-                "datetime": "2026-01-01T00:00:00Z/.."
+                "datetime": "2026-07-25T21:17:17Z/.."
               },
               "status": 200,
               "response_bytes": 2512983,
@@ -22350,7 +22406,8 @@
                 "5e2a8e2e-2c23-408f-8af7-fd995248c703",
                 "b387c38d-b1c2-4660-bdce-70c96eac19eb",
                 "4aaead96-0887-4cd3-a347-352af7dda92b"
-              ]
+              ],
+              "features_outside_window": 299
             },
             "fov_360_filtered": {
               "params": {
@@ -22378,8 +22435,12 @@
               ]
             }
           },
+          "datetime_window": "2026-07-25T21:17:17Z/..",
           "search_paginates": false,
+          "datetime_can_answer": true,
+          "datetime_baseline_droppable": 299,
           "datetime_filter_honoured": false,
+          "fov_can_answer": true,
           "fov_filter_drops_absent": true
         },
         {
@@ -22413,7 +22474,7 @@
             "datetime_filtered": {
               "params": {
                 "limit": 300,
-                "datetime": "2026-01-01T00:00:00Z/.."
+                "datetime": "2025-06-09T01:22:38Z/.."
               },
               "status": 200,
               "response_bytes": 2524558,
@@ -22433,7 +22494,8 @@
                 "8f46bfc8-d98d-4403-95b8-09a14a6ad618",
                 "564754ee-6124-4bdb-8aa0-7ff492b9baa7",
                 "cb9fd3e0-2d19-419a-ad2d-befb5833e7de"
-              ]
+              ],
+              "features_outside_window": 299
             },
             "fov_360_filtered": {
               "params": {
@@ -22461,8 +22523,12 @@
               ]
             }
           },
+          "datetime_window": "2025-06-09T01:22:38Z/..",
           "search_paginates": false,
+          "datetime_can_answer": true,
+          "datetime_baseline_droppable": 299,
           "datetime_filter_honoured": false,
+          "fov_can_answer": false,
           "fov_filter_drops_absent": false
         },
         {
@@ -22496,7 +22562,7 @@
             "datetime_filtered": {
               "params": {
                 "limit": 300,
-                "datetime": "2026-01-01T00:00:00Z/.."
+                "datetime": "2025-10-21T20:16:40.591116Z/.."
               },
               "status": 200,
               "response_bytes": 1711591,
@@ -22516,7 +22582,8 @@
                 "8ed3391e-b1aa-47ca-bd34-f04b525c797a",
                 "bea53756-64c2-437c-8db1-6cb7654e84ff",
                 "3c947aa7-510c-4677-8249-8788f906199c"
-              ]
+              ],
+              "features_outside_window": 299
             },
             "fov_360_filtered": {
               "params": {
@@ -22533,8 +22600,12 @@
               "first_ids": []
             }
           },
+          "datetime_window": "2025-10-21T20:16:40.591116Z/..",
           "search_paginates": false,
+          "datetime_can_answer": true,
+          "datetime_baseline_droppable": 299,
           "datetime_filter_honoured": false,
+          "fov_can_answer": true,
           "fov_filter_drops_absent": true
         },
         {
@@ -22568,7 +22639,7 @@
             "datetime_filtered": {
               "params": {
                 "limit": 300,
-                "datetime": "2026-01-01T00:00:00Z/.."
+                "datetime": "2025-10-20T20:08:06.635230Z/.."
               },
               "status": 200,
               "response_bytes": 1724825,
@@ -22588,7 +22659,8 @@
                 "066d14af-4491-4930-9f02-351412b43df6",
                 "0fe7460f-b754-493b-bb62-edd5acae586a",
                 "0967803b-13dd-46c6-b28e-7df006b39123"
-              ]
+              ],
+              "features_outside_window": 299
             },
             "fov_360_filtered": {
               "params": {
@@ -22605,8 +22677,12 @@
               "first_ids": []
             }
           },
+          "datetime_window": "2025-10-20T20:08:06.635230Z/..",
           "search_paginates": false,
+          "datetime_can_answer": true,
+          "datetime_baseline_droppable": 299,
           "datetime_filter_honoured": false,
+          "fov_can_answer": true,
           "fov_filter_drops_absent": true
         },
         {
@@ -22641,7 +22717,7 @@
             "datetime_filtered": {
               "params": {
                 "limit": 300,
-                "datetime": "2026-01-01T00:00:00Z/.."
+                "datetime": "2025-11-04T19:03:02.171000Z/.."
               },
               "status": 200,
               "response_bytes": 2262857,
@@ -22662,7 +22738,8 @@
                 "48f739d1-4344-4e84-8386-4302d9fc51c3",
                 "b1a2f65a-b56d-49de-be6d-23175fe26714",
                 "811c3e68-6819-457d-bc97-80da442ccc58"
-              ]
+              ],
+              "features_outside_window": 279
             },
             "fov_360_filtered": {
               "params": {
@@ -22690,8 +22767,12 @@
               ]
             }
           },
+          "datetime_window": "2025-11-04T19:03:02.171000Z/..",
           "search_paginates": false,
+          "datetime_can_answer": true,
+          "datetime_baseline_droppable": 279,
           "datetime_filter_honoured": false,
+          "fov_can_answer": true,
           "fov_filter_drops_absent": true
         },
         {
@@ -22725,7 +22806,7 @@
             "datetime_filtered": {
               "params": {
                 "limit": 300,
-                "datetime": "2026-01-01T00:00:00Z/.."
+                "datetime": "2025-09-23T23:07:11.268000Z/.."
               },
               "status": 200,
               "response_bytes": 2360817,
@@ -22745,7 +22826,8 @@
                 "e091c6cf-1e0d-4ec3-98a0-3dcd7489eebd",
                 "60850e04-1722-438a-a4d3-ac8e11e3e3a7",
                 "1b1b70ab-1e71-4101-85d9-571d7e979346"
-              ]
+              ],
+              "features_outside_window": 248
             },
             "fov_360_filtered": {
               "params": {
@@ -22762,8 +22844,12 @@
               "first_ids": []
             }
           },
+          "datetime_window": "2025-09-23T23:07:11.268000Z/..",
           "search_paginates": false,
+          "datetime_can_answer": true,
+          "datetime_baseline_droppable": 248,
           "datetime_filter_honoured": false,
+          "fov_can_answer": true,
           "fov_filter_drops_absent": true
         },
         {
@@ -22797,7 +22883,7 @@
             "datetime_filtered": {
               "params": {
                 "limit": 300,
-                "datetime": "2026-01-01T00:00:00Z/.."
+                "datetime": "2025-10-17T20:35:44.574187Z/.."
               },
               "status": 200,
               "response_bytes": 165666,
@@ -22817,7 +22903,8 @@
                 "f048c0be-5ab1-4654-b6f7-a216ab0f7fb1",
                 "da3f3c58-3e21-42e4-9061-d72d49ee20b9",
                 "32bae547-ee79-4e31-aa91-0c6ecf8b6764"
-              ]
+              ],
+              "features_outside_window": 28
             },
             "fov_360_filtered": {
               "params": {
@@ -22834,8 +22921,12 @@
               "first_ids": []
             }
           },
+          "datetime_window": "2025-10-17T20:35:44.574187Z/..",
           "search_paginates": false,
+          "datetime_can_answer": true,
+          "datetime_baseline_droppable": 28,
           "datetime_filter_honoured": false,
+          "fov_can_answer": true,
           "fov_filter_drops_absent": true
         },
         {
@@ -22869,7 +22960,7 @@
             "datetime_filtered": {
               "params": {
                 "limit": 300,
-                "datetime": "2026-01-01T00:00:00Z/.."
+                "datetime": "2024-07-28T17:00:00Z/.."
               },
               "status": 200,
               "response_bytes": 25763,
@@ -22889,7 +22980,8 @@
                 "fea5a19b-91d7-4318-a8fc-9963a65ce7a8",
                 "b2be65db-834a-45c7-b58e-07dc818975aa",
                 "b0ea3dc1-e4cb-46a3-816c-7fe19fd59ffe"
-              ]
+              ],
+              "features_outside_window": 3
             },
             "fov_360_filtered": {
               "params": {
@@ -22906,8 +22998,12 @@
               "first_ids": []
             }
           },
+          "datetime_window": "2024-07-28T17:00:00Z/..",
           "search_paginates": false,
+          "datetime_can_answer": true,
+          "datetime_baseline_droppable": 3,
           "datetime_filter_honoured": false,
+          "fov_can_answer": true,
           "fov_filter_drops_absent": true
         },
         {
@@ -22939,7 +23035,7 @@
             "datetime_filtered": {
               "params": {
                 "limit": 300,
-                "datetime": "2026-01-01T00:00:00Z/.."
+                "datetime": "2024-08-30T19:00:00Z/.."
               },
               "status": 200,
               "response_bytes": 10405,
@@ -22957,7 +23053,8 @@
                 "487a992a-72ec-4b45-9a15-d3d947bc6688",
                 "dd21ebfc-913c-4d1b-94ec-7d2bb047932f",
                 "985e17d9-3345-4240-909d-96e9c6e6bcb9"
-              ]
+              ],
+              "features_outside_window": 2
             },
             "fov_360_filtered": {
               "params": {
@@ -22974,8 +23071,12 @@
               "first_ids": []
             }
           },
+          "datetime_window": "2024-08-30T19:00:00Z/..",
           "search_paginates": false,
+          "datetime_can_answer": true,
+          "datetime_baseline_droppable": 2,
           "datetime_filter_honoured": false,
+          "fov_can_answer": true,
           "fov_filter_drops_absent": true
         }
       ],
