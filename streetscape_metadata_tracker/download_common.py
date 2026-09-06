@@ -204,6 +204,26 @@ def _unit_exponential() -> float:
     return random.expovariate(1.0)
 
 
+def spaced_gap_seconds(mean_gap: float, jitter: float, draw: Callable[[], float]) -> float:
+    """
+    One shifted-exponential inter-request gap: the #292 pacing formula.
+
+    A fixed ``(1 - jitter)`` floor plus an exponential tail scaled to
+    ``jitter``. Because ``E[Exponential(1)] == 1`` the mean is exactly
+    ``mean_gap``, so every budget and timeout derived from the mean rate is
+    unchanged; the floor is ``(1 - jitter) * mean_gap`` and there is
+    deliberately no ceiling, since the ceiling is the artifact being removed.
+    ``jitter`` is therefore the coefficient of variation, not a +/- range.
+
+    Extracted so the async pacer below and the synchronous one in
+    ``scripts/panoramax_feasibility.py`` cannot drift apart: two implementations
+    of one pacing formula is the same failure ``experiment_stats.py`` exists to
+    prevent for percentiles, and here it would silently change the shape of the
+    thing we are deliberately measuring.
+    """
+    return mean_gap * ((1.0 - jitter) + jitter * draw())
+
+
 class AsyncRateLimiter:
     """
     Token-bucket rate limiter for provider APIs with a per-minute quota
@@ -348,11 +368,7 @@ class AsyncRateLimiter:
             if self._next_at is not None and self._next_at > now:
                 await asyncio.sleep(self._next_at - now)
                 now = self._now()
-            # Shifted exponential: a fixed (1 - jitter) floor plus an
-            # exponential tail scaled to jitter. Mean is exactly the mean gap
-            # because E[Exponential(1)] = 1; see the class docstring.
-            mean_gap = 1.0 / self._rate
-            gap = mean_gap * ((1.0 - self.jitter) + self.jitter * self._draw())
+            gap = spaced_gap_seconds(1.0 / self._rate, self.jitter, self._draw)
             self._next_at = now + gap
 
 

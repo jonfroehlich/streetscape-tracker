@@ -58,6 +58,16 @@ Quote `sweep_requests_observed` and not `sweep_requests_estimate`: the latter is
 GSV vs Mapillary capture interval — Mapillary samples 1.4–3.5× finer, and **any per-pano analysis must group by `sequence_id` first**: pooling across contributors collapses the measured interval by 2–8× because the nearest image is usually someone else's drive.
 GSV publishes no drive identifier, so the same correction is impossible there — which makes Mapillary's number the better-founded one, the opposite of the intuition.
 
+### `panoramax-feasibility.md`
+
+Issue #316 phase 1 — is there Panoramax imagery in the cities we track, which is the one question that decides whether a fourth provider is worth a channel.
+The answer is split: the median tracked city holds nothing (730 of 1,144 screen to a conclusive zero), but ~20 cities hold 16k–1.1M pictures and Des Moines has more 360° pictures on Panoramax than in Mapillary's census — so an opt-in channel, never a default one.
+Four things generalize beyond Panoramax.
+**(1) Probe the instrument before you design around it.** The issue specified the federated `/api/search`; it does not paginate, reports no match count and silently ignores `datetime`, so a bbox with more pictures than `limit` is indistinguishable from one holding exactly `limit` — the one distinction a coverage study is made of. The map tiles answer the same question exactly, and cheaper.
+**(2) A cheap instrument that can only PROVE ABSENCE is worth more than an expensive one that measures everything**, because it changes the population you can speak about: 113 z6 requests screen all 1,144 enabled cities, so the gate is answered over the whole catalog rather than over the stratified sample the issue asked for. The asymmetry is the product — a res-6 hex is ~36 km² against a 19.5 km² median city, so a positive bound means "look closer" and only a zero is conclusive — and it is only sound if the zeros are checked.
+**(3) The control group is not garnish.** One screened-zero city measured 2 pictures, and that single row falsified the screen: the v1 z6 lattice the API root advertises silently OMITS populated cells (2.5–23.9% fewer pictures than v2's H3 grid over identical extents). Without controls the whole study would have rested on an instrument known to be lossy only in retrospect. The same pass also found a margin applied where cells are filtered and not where tiles are chosen, which vanished at tile seams for 108 cities.
+**(4) A "third state" can be an instrument artifact.** The search response's EXIF `field_of_view` is missing for 36% of pictures, while the tile `type` has no absent state; looking the same 2,136 pictures up in the tiles typed every one `flat`. Reconcile per picture before adding a bucket to a data model.
+
 ### `publish-duration.md`
 
 Issues #218/#230 — how long the nightly publish actually takes, so `scheduler.PUBLISH_TIMEOUT_S` is sized rather than guessed;
