@@ -31,6 +31,7 @@ shared and stated exactly once.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -41,6 +42,8 @@ import pandas as pd
 
 from streetscape_metadata_tracker.analysis import FLAT_ONLY, REQUEST_FAILED
 from streetscape_metadata_tracker.census import census_is_pano, status_for_capture_dates
+
+logger = logging.getLogger(__name__)
 
 WGS84 = "EPSG:4326"
 
@@ -188,6 +191,7 @@ def build_streetwalk_rows(
     query_timestamp: str,
     spec: CensusWalkSpec,
     unmeasured_mask: Callable[[np.ndarray, np.ndarray], np.ndarray] | None = None,
+    unmeasured_desc: str | None = None,
 ) -> pd.DataFrame:
     """
     Score every sample location against the census into METADATA rows.
@@ -221,14 +225,23 @@ def build_streetwalk_rows(
             about the same unswept ground. None for a clean sweep, which pays
             nothing.
 
-            Recording an unswept sample as ZERO_RESULTS publishes an absence we
-            never observed into an immutable dated snapshot, and street
-            coverage is a share of samples — so an unmeasured hole would read
-            as measured emptiness and understate the city forever. Applied only
+            Recording an unswept sample as ZERO_RESULTS publishes an absence
+            we never observed into an immutable dated snapshot, and nothing
+            downstream can tell it from a measured one afterwards. Applied only
             to samples that matched nothing: one that found imagery within
             ``match_dist_m`` was measured by construction, whatever cell it
             sits in.
+        unmeasured_desc: operator-facing noun phrase for what failed (e.g.
+            ``"3 undownloaded tile(s)"``), required whenever ``unmeasured_mask``
+            is given and used only in the warning below. Same contract as
+            ``census.write_census_grid_run``'s, and for the same reason: a
+            degraded artifact that says so nowhere in the per-attempt log is
+            one nobody knows to re-collect, and the REUSE path (#290) is
+            silent otherwise — it inherits the crawl's holes without re-fetching
+            anything, so no fetch-side warning fires at all.
     """
+    if unmeasured_mask is not None and not unmeasured_desc:
+        raise ValueError("unmeasured_desc is required whenever unmeasured_mask is given")
     pano_positions, flat_positions = nearest_images_to_samples(query_points, census, match_dist_m)
     sample_lats = np.array([p[0] for p in query_points], dtype=np.float64)
     sample_lons = np.array([p[1] for p in query_points], dtype=np.float64)
@@ -276,6 +289,18 @@ def build_streetwalk_rows(
     else:
         unknown = np.asarray(unmeasured_mask(empty_lats, empty_lons), dtype=bool)
         empty_status = np.where(unknown, REQUEST_FAILED, "ZERO_RESULTS")
+        # Only warn once points were actually degraded. A failed fetch unit can
+        # legitimately cover no SAMPLE at all (a tile over water, or one whose
+        # on-street points a neighbour already matched), and a WARNING claiming
+        # degradation that did not happen goes straight into the log tail the
+        # [alerts] email ships, which is where a real one has to stand out.
+        # Same rule, same wording as the grid tail's.
+        num_unmeasured = int(unknown.sum())
+        if num_unmeasured:
+            logger.warning(
+                f"{num_unmeasured:,} walk samples fall in {unmeasured_desc}; "
+                f"written as {REQUEST_FAILED} rather than empty"
+            )
     empty_rows = spec.build_empty_rows(
         empty_lats,
         empty_lons,

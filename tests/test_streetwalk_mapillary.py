@@ -21,6 +21,7 @@ that join trustworthy:
 
 import gzip
 import json
+import logging
 import os
 from datetime import date
 
@@ -381,12 +382,14 @@ def test_a_failed_tile_publishes_request_failed_not_zero_results(tmp_path, monke
     """
     A tile the fetch never got back leaves its samples UNKNOWN.
 
-    Street coverage is a share of samples, so recording an unswept sample as
-    ZERO_RESULTS publishes an absence we never observed -- into an immutable
-    dated snapshot that understates the city permanently, and that a later walk
-    diff reads as imagery churn when the tile comes back. The Mapillary GRID
-    run has masked its holes this way since #168 and the KartaView walk since
-    #258; this walk was the one that did not, which is #259.
+    Recording an unswept sample as ZERO_RESULTS publishes an absence we never
+    observed into an immutable dated snapshot, and no later reader can tell it
+    from a measured one. What that buys is a legible ROW and nothing more --
+    REQUEST_FAILED sits in the same coverage denominator ZERO_RESULTS did, so
+    no published percentage and no walk-diff counter moves either way, which is
+    the same choice the grid path makes. The Mapillary GRID run has masked its
+    holes this way since #168 and the KartaView walk since #258; this walk was
+    the one that did not, which is #259.
     """
     data_dir, _ = _setup(tmp_path, monkeypatch, [], failed_tiles=[NORTH_TILE], edges=_seam_edges())
 
@@ -451,6 +454,62 @@ def test_a_clean_fetch_still_publishes_zero_results(tmp_path, monkeypatch):
 
     assert collect.run_collect(_args(data_dir)) == 0
     assert {s for s, _ in _statuses(data_dir)} == {"ZERO_RESULTS"}
+
+
+def test_a_degraded_walk_says_so_in_its_own_log(tmp_path, monkeypatch, caplog):
+    """
+    A walk that publishes holes must SAY so in the per-attempt log.
+
+    That log is the tier the `[alerts]` mail tails, and it is the only place an
+    operator learns an artifact is partly unmeasured -- nothing in the catalog
+    row or the coverage GeoJSON records it. The reuse path (#290) makes this
+    sharper than it looks: a walk that reads its census from the cache inherits
+    the crawl's failed tiles for zero requests, so no fetch-side "N/M tiles
+    failed" warning fires at all and this is the ONLY evidence there is.
+    """
+    data_dir, _ = _setup(tmp_path, monkeypatch, [], failed_tiles=[NORTH_TILE], edges=_seam_edges())
+
+    with caplog.at_level(logging.WARNING):
+        assert collect.run_collect(_args(data_dir)) == 0
+    degraded = sum(1 for s, _ in _statuses(data_dir) if s == "REQUEST_FAILED")
+    warnings = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any(
+        f"{degraded:,} walk samples" in m and "1 undownloaded tile(s)" in m for m in warnings
+    ), f"the degraded sample count and what failed must both be in the log, got {warnings}"
+
+
+def test_a_failed_tile_covering_no_sample_claims_no_degradation(tmp_path, monkeypatch, caplog):
+    """
+    The other side of that warning: it fires on DEGRADATION, not on a failure.
+
+    A failed tile can legitimately cover no sample at all -- one over water, or
+    a margin tile whose on-street points a neighbour already answered -- and a
+    WARNING asserting damage that did not happen goes straight into the tail
+    the alert mail ships, which is where a real one has to stand out.
+    """
+    far_away = (NORTH_TILE[0] + 40, NORTH_TILE[1] + 40)
+    data_dir, _ = _setup(tmp_path, monkeypatch, [], failed_tiles=[far_away], edges=_seam_edges())
+
+    with caplog.at_level(logging.WARNING):
+        assert collect.run_collect(_args(data_dir)) == 0
+    assert {s for s, _ in _statuses(data_dir)} == {"ZERO_RESULTS"}
+    assert not [r for r in caplog.records if "walk samples fall in" in r.message]
+
+
+def test_a_mask_without_a_description_is_refused(tmp_path, monkeypatch):
+    """
+    The desc is what makes the warning above actionable, so the seam refuses a
+    mask without one rather than logging an unattributed count -- the same
+    contract `census.write_census_grid_run` enforces for the grid tail.
+    """
+    with pytest.raises(ValueError, match="unmeasured_desc"):
+        cm.build_streetwalk_rows(
+            [(44.05, -121.30, 0, 0)],
+            records_to_census([]),
+            25.0,
+            "2026-07-08T00:00:00+00:00",
+            unmeasured_mask=lambda lats, lons: np.zeros(len(lats), dtype=bool),
+        )
 
 
 def test_a_wholly_unmeasured_walk_is_rejected_rather_than_cataloged(tmp_path, monkeypatch):
