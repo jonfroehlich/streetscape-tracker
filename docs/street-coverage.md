@@ -74,9 +74,24 @@ It is a **scheduled, opt-in** channel as of #258, enrolled separately from `kart
 **KartaView's walk is priced like Mapillary's, not GSV's**: a radius sweep of the frozen bbox, independent of spacing.
 The first one measured it — Krabi, 2026-08-31, 18,851 samples over 2,144 edges scored from **87 sweep requests**, against 18,851 for the same walk on `gsv_streets`, for slightly HIGHER coverage (85.4% of street-km vs GSV's 82.9%).
 The Mapillary arm emits #116's status vocabulary at sample level
-— `OK`/`NO_DATE` for a 360° pano in range, `FLAT_ONLY` (null capture_date) when only flat imagery is, `ZERO_RESULTS` otherwise
+— `OK`/`NO_DATE` for a 360° pano in range, `FLAT_ONLY` (null capture_date) when only flat imagery is, `ZERO_RESULTS` when the sample was measured and nothing is in range, and `REQUEST_FAILED` when it was never measured at all (below)
 — which `compute_streetwalk_coverage` turns into **two numbers per edge**: `coverage_fraction` (360°) and `coverage_fraction_any`, summarized as `coverage_pct_by_length[_any]`.
 GSV emits no FLAT_ONLY, so its any-value equals its 360° value by construction; `street_walks.coverage_pct_by_length_any` (**schema v8**) is NULL on pre-v8 walks — "not measured", never a copy.
+
+### An unswept sample is not an empty one
+
+**A census walk's samples under a tile or cell the fetch never got back publish `REQUEST_FAILED`, not `ZERO_RESULTS`.**
+Street coverage is a share of samples, so an unmeasured hole recorded as measured emptiness understates the city permanently in an immutable dated snapshot, and a later walk diff reads the tile's recovery as imagery churn rather than as the measurement catching up.
+The seam is `census_walk.build_streetwalk_rows`' `unmeasured_mask` hook, and each provider passes the SAME helper its own grid run masks with — KartaView's `_points_in_cells` over `failed_cells` (#258), Mapillary's `_points_in_tiles` over `failed_tiles` (#259) — so a city's walk and its grid run cannot disagree about the same unswept ground.
+The mask applies only to samples that matched **nothing**: one that found imagery within `--match-dist` was measured by construction, whatever cell it sits in, so a matched sample inside a failed tile stays matched.
+GSV needs no hook at all, because it queries each sample directly and a failed sample already carries its own `REQUEST_FAILED`.
+
+Two consequences are worth stating, because neither is visible in the row itself.
+`REQUEST_FAILED` is **not** in `analysis.PRESENT_STATUSES`, so it lands in exactly the denominator `ZERO_RESULTS` does: this changes what a snapshot SAYS, not any coverage percentage and not any walk-diff count.
+Making the unmeasured samples vanish from the denominator instead would be a much larger change that the grid path does not make either, and doing it on one side alone would have grid and street coverage disagree about the same hole.
+`REQUEST_FAILED` **is** in `analysis.SYSTEMIC_FAILURE_STATUSES`, so the change can only push a run's denied fraction up — it can newly trip `detect_systemic_failure`'s ≥95% guard, never newly clear it.
+Tripping is the intended outcome rather than a regression: a walk that measured almost nothing carries no information about the city and must not become its series' diff baseline, and failing loudly beats publishing the same night as a confident "no imagery anywhere".
+It stays rare in practice, because each fetch refuses to finalize past its own unmeasured-area tolerance (`MAX_FAILED_AREA_FRACTION` for KartaView, `MAX_FAILED_TILE_FRACTION` for Mapillary, both 2%) long before a run approaches 95% — a whole-city failure is a broken credential, which is what the guard is for.
 
 ## A Mapillary walk on a paired night costs zero requests (issue #290)
 

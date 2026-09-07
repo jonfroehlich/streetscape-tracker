@@ -215,9 +215,11 @@ def build_streetwalk_rows(
         spec: the provider's :class:`CensusWalkSpec`.
         unmeasured_mask: ``(lats, lons) -> bool array`` marking sample points
             under a tile or cell the fetch never got back — KartaView's
-            ``_points_in_cells`` over ``failed_cells``, and the same seam
-            Mapillary's ``failed_tiles`` needs for #259. None for a clean
-            sweep, which pays nothing.
+            ``_points_in_cells`` over ``failed_cells`` (#258) and Mapillary's
+            ``_points_in_tiles`` over ``failed_tiles`` (#259), each the same
+            helper its own GRID run masks with, so the two artifacts agree
+            about the same unswept ground. None for a clean sweep, which pays
+            nothing.
 
             Recording an unswept sample as ZERO_RESULTS publishes an absence we
             never observed into an immutable dated snapshot, and street

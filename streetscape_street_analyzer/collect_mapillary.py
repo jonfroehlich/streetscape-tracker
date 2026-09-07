@@ -44,6 +44,7 @@ from streetscape_metadata_tracker.checkpointing import CensusCache, observation_
 from streetscape_metadata_tracker.download_mapillary import (
     DEFAULT_TILE_JITTER,
     DEFAULT_TILE_REQUESTS_PER_MINUTE,
+    _points_in_tiles,
     build_empty_rows,
     build_image_rows,
     captured_at_to_iso_dates,
@@ -84,6 +85,7 @@ def build_streetwalk_rows(
     census: pd.DataFrame,
     match_dist_m: float,
     query_timestamp: str,
+    unmeasured_mask=None,
 ) -> pd.DataFrame:
     """
     Score Mapillary census images against the walk's sample points.
@@ -94,7 +96,14 @@ def build_streetwalk_rows(
     it as a module global -- which is what lets a test substitute it to simulate
     a tail failure after the census is already paid for.
     """
-    return census_walk_rows(query_points, census, match_dist_m, query_timestamp, MAPILLARY_WALK)
+    return census_walk_rows(
+        query_points,
+        census,
+        match_dist_m,
+        query_timestamp,
+        MAPILLARY_WALK,
+        unmeasured_mask=unmeasured_mask,
+    )
 
 
 async def collect_mapillary_street_samples_async(
@@ -160,6 +169,7 @@ async def collect_mapillary_street_samples_async(
     # A reused census is stamped with when the provider was observed, a fresh
     # one with this process's clock; see checkpointing.observation_timestamp.
     query_timestamp = observation_timestamp(fetched, started_at)
+    failed_tiles = fetched.get("failed_tiles") or []
     # THE TAIL IS WRAPPED BECAUSE THE CHECKPOINT CHANGES WHAT A CRASH HERE COSTS
     # (#256). Without one, a failure below lost the spend with the process and
     # the caller recorded whatever the exception carried. With one, the
@@ -184,7 +194,27 @@ async def collect_mapillary_street_samples_async(
             len(query_points),
         )
 
-        df = build_streetwalk_rows(query_points, census, match_dist_m, query_timestamp)
+        df = build_streetwalk_rows(
+            query_points,
+            census,
+            match_dist_m,
+            query_timestamp,
+            # A tile nothing came back for leaves its samples UNKNOWN rather
+            # than empty (#259), exactly as this provider's GRID run has since
+            # #168 and the KartaView walk since #258; a clean fetch passes None
+            # and pays nothing. Street coverage is a share of SAMPLES, so
+            # publishing an unswept sample as ZERO_RESULTS would read as
+            # measured emptiness and understate the city in an immutable dated
+            # snapshot -- and a later walk diff would read the tile's recovery
+            # as imagery churn. The fetch refuses to finalize past
+            # MAX_FAILED_TILE_FRACTION, so this only ever describes a small
+            # remainder.
+            unmeasured_mask=(
+                (lambda lats, lons: _points_in_tiles(lats, lons, failed_tiles))
+                if failed_tiles
+                else None
+            ),
+        )
         del census
         # Straight into the gzip handle: to_csv() with no path builds the whole CSV
         # as a str and then a second copy as bytes, which at a big city's sample
