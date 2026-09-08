@@ -259,6 +259,7 @@ Keep any list a doc enumerates **alphabetical**, so two branches adding an entry
   - `grid-density.md`
   - `kartaview-feasibility.md`
   - `kartaview-sweep-cost.md`
+  - `mapillary-image-quality.md`
   - `pano-spacing.md`
   - `panoramax-feasibility.md`
   - `publish-duration.md`
