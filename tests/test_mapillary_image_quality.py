@@ -191,6 +191,77 @@ def test_a_drives_class_is_counted_not_assumed(tmp_path):
     assert row["n_seq_vehicle"] == 1
 
 
+def test_a_mixed_organization_drive_is_detected_by_id_not_by_presence(tmp_path):
+    """The org half of the same detector, which the on_foot test above does not
+    reach — and that gap is how it shipped broken: the groupby counted distinct
+    values of `has_org`, a BOOLEAN, so a drive carrying two different
+    organizations read as one class and `n_seq_mixed_org` could not exceed
+    "does this drive mix organizational with individual imagery". The writeup's
+    stronger claim needs distinct IDS, so both shapes are pinned here.
+
+    `s_ids` is the case the boolean could never see; `s_mixed` is the one it
+    could, kept so a fix cannot trade one blind spot for the other."""
+    p = tmp_path / "census.csv.gz"
+    _write_census(
+        p,
+        [
+            _row("OK", 0.80, "false", "orgA", "s_ids"),
+            _row("OK", 0.82, "false", "orgB", "s_ids"),
+            _row("OK", 0.84, "false", "orgA", "s_mixed"),
+            _row("OK", 0.86, "false", "", "s_mixed"),
+            _row("OK", 0.88, "false", "orgA", "s_clean"),
+            _row("OK", 0.90, "false", "", "s_none"),
+        ],
+    )
+    row = mqc.measure_run(str(p), "orgville", "2026-09-01", "census.csv.gz")
+    assert row["n_distinct_orgs"] == 2
+    assert row["n_seq_mixed_org"] == 2, "two different ids is mixed, and so is org + individual"
+    assert row["n_seq_org"] == 3, "presence still takes the MAX, so s_mixed counts as org"
+    assert row["n_seq_no_org"] == 1
+
+
+def test_a_numeric_organization_id_is_not_collapsed_by_float_inference(tmp_path):
+    """`organization_id` is read as a nullable string, not left to inference.
+
+    A column of all-numeric ids containing any null infers float64, and two ids
+    differing beyond float64's 15-16 significant digits then become the same
+    number — silently undercounting `n_distinct_orgs`, a published column, and
+    merging two organizations into one drive class. Two 19-digit ids one apart,
+    plus the null that forces the float inference."""
+    p = tmp_path / "census.csv.gz"
+    _write_census(
+        p,
+        [
+            _row("OK", 0.80, "false", "1234567890123456789", "s1"),
+            _row("OK", 0.82, "false", "1234567890123456788", "s2"),
+            _row("OK", 0.84, "false", "", "s3"),
+        ],
+    )
+    row = mqc.measure_run(str(p), "bigids", "2026-09-01", "census.csv.gz")
+    assert row["n_distinct_orgs"] == 2, "float64 would read both ids as 1.2345678901234568e+18"
+
+
+def test_a_sequence_id_null_is_not_the_string_NA(tmp_path):
+    """Reading the id columns as StringDtype makes their null `pd.NA`, whose
+    `str()` is the literal "<NA>". A null test that only catches float nan would
+    take that as a real sequence id, collecting every unattributed image in the
+    file into one phantom drive — which would then carry a median into the
+    drive-weighted distribution. Two sequence-less images must stay
+    sequence-less rather than becoming a shared drive."""
+    p = tmp_path / "census.csv.gz"
+    _write_census(
+        p,
+        [
+            _row("OK", 0.10, "false", "", ""),
+            _row("OK", 0.20, "false", "", ""),
+            _row("OK", 0.90, "false", "", "s1"),
+        ],
+    )
+    row = mqc.measure_run(str(p), "nullseq", "2026-09-01", "census.csv.gz")
+    assert row["n_sequences"] == 1, "the two null rows are not a drive called '<NA>'"
+    assert row["seq_q_p50"] == pytest.approx(0.90)
+
+
 def test_a_one_sided_city_is_excluded_from_the_paired_on_foot_comparison():
     """The on-foot finding is a WITHIN-city paired comparison, so it cannot be
     explained by which cities happen to have pedestrian capture. That only holds
@@ -255,7 +326,9 @@ def test_every_collected_column_reaches_the_committed_record():
     quotes. Without this, a column added to the collector would be measured on
     production, land in a gitignored directory, and never reach the repo — which
     is #106's failure mode reappearing one file later."""
-    assert set(mqa.SUMMARY_FIELDS) == (set(mqc.FIELDNAMES) - {"csv_filename"}) | {"pct_with_org"}
+    assert mqa.SUMMARY_FIELDS == (
+        tuple(f for f in mqc.FIELDNAMES if f != "csv_filename") + ("pct_with_org",)
+    ), "ORDER too, not just membership: FIELDNAMES exists to pin the committed CSV's columns"
 
 
 def test_the_committed_metrics_file_matches_its_own_summary_csv():

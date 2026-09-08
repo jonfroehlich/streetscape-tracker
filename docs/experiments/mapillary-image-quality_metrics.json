@@ -5,7 +5,7 @@
     "generated_by": "python scripts/mapillary_image_quality_analyze.py --cities-csv experiments/mapillary-image-quality/city_quality.csv --docs-dir docs/experiments --catalog-label makelab2-prod",
     "collected_by": "python scripts/mapillary_image_quality_collect.py --out-dir experiments/mapillary-image-quality --catalog-label makelab2-prod",
     "catalog_label": "makelab2-prod",
-    "generated_at": "2026-09-06T17:38:41+00:00",
+    "generated_at": "2026-09-08T20:53:49+00:00",
     "note": "Mapillary's per-image quality_score -- 'predicted visual quality of the image in the range [0.0, 1.0]' -- read over each city's LATEST Mapillary census, 360-degree panos only (status OK or NO_DATE). One run per city, so the distribution is not weighted by how often the scheduler happened to collect a city. Runs written before the 2026-07-24 enriched schema carry no quality_score column and are excluded rather than counted as zero; the collector's manifest records how many. No data_dir is recorded -- catalog_label names which catalog was read instead."
   },
   "corpus": {
@@ -249,7 +249,7 @@
       "cities_lower": 49,
       "pct_cities_lower": 84.48
     },
-    "note": "A within-city paired comparison, so it is not confounded by which cities happen to have pedestrian capture. A city counts only when BOTH sides carry >= 100 scored panos across >= 3 distinct drives. Both weightings are reported: the image-weighted delta is what a labeller meets, the sequence-weighted one is what survives if a single long walk is not allowed to be the whole finding."
+    "note": "A within-city paired comparison, so it is not confounded by which cities happen to have pedestrian capture. A city counts only when BOTH sides carry >= 100 panos across >= 3 distinct drives. Both weightings are reported: the image-weighted delta is what a labeller meets, the sequence-weighted one is what survives if a single long walk is not allowed to be the whole finding."
   },
   "organization": {
     "pct_with_org_across_cities": {

@@ -39,6 +39,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import os
 import sys
 from datetime import UTC, datetime
@@ -345,6 +346,13 @@ def paired_cities(cities: list[dict], a: str, b: str, n_a: str, n_b: str, seq_a:
     observation, however many images it holds, which is `pano-spacing.md`'s rule
     applied to a subgroup. The first pass of this study filtered on images only
     and the on-foot headline was built partly on single-walk cities.
+
+    The image counts are over every pano row and the drive counts over scored
+    rows only, because that is what the collector writes. The two denominators
+    coincide across this corpus -- `n_quality == n_panos` for all 388 cities, so
+    every pano carries a score -- but they are not the same question, and a
+    provider that ever ships an unscored pano would make the image bar the
+    looser of the two. Stated rather than silently assumed equal.
     """
     out = []
     for c in cities:
@@ -407,7 +415,7 @@ def measure_on_foot(cities: list[dict]) -> dict:
         "note": (
             "A within-city paired comparison, so it is not confounded by which "
             "cities happen to have pedestrian capture. A city counts only when "
-            f"BOTH sides carry >= {MIN_SIDE_PANOS} scored panos across "
+            f"BOTH sides carry >= {MIN_SIDE_PANOS} panos across "
             f">= {MIN_SIDE_SEQUENCES} distinct drives. Both weightings are "
             "reported: the image-weighted delta is what a labeller meets, the "
             "sequence-weighted one is what survives if a single long walk is "
@@ -496,8 +504,13 @@ def make_figures(cities: list[dict], fig_dir: str) -> list[str]:
         fontsize=9,
     )
 
-    ax2.hist(band_good, bins=27, range=(0.0, 27.0), color=CATEGORICAL[1])
-    ax2.set_xlim(0, 27)
+    # Bounded by the data, never by a constant fitted to it. A hardcoded upper
+    # limit drops every city above it from the bars WITHOUT dropping it from the
+    # annotation below, so the panel would quietly disagree with its own caption
+    # the first time this is regenerated on a catalog with a higher tail.
+    upper = max(1.0, math.ceil(max(band_good))) if band_good else 1.0
+    ax2.hist(band_good, bins=int(upper), range=(0.0, upper), color=CATEGORICAL[1])
+    ax2.set_xlim(0, upper)
     ax2.set_xlabel("% of a city's panos scoring ≥ 0.9", color=INK_2, fontsize=10)
     ax2.set_title(
         f"Those same {len(band)} cities, counted at the tail",
@@ -676,7 +689,7 @@ def main() -> int:
 
     disc = metrics["discrimination"]
     print(
-        f"{len(cities)} cities, {metrics['corpus']['panos']:,} scored panos "
+        f"{len(cities)} cities, {metrics['corpus']['panos_scored']:,} scored panos "
         f"({metrics['corpus']['sequences']:,} sequences)"
     )
     print(

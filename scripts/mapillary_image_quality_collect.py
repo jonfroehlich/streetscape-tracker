@@ -100,6 +100,15 @@ PANO_STATUSES = ("OK", "NO_DATE")
 # five here is most of the difference between a 20-minute pass and an hour's.
 NEEDED_COLUMNS = ("status", "quality_score", "on_foot", "organization_id", "sequence_id")
 
+# The two id columns are pinned to pandas' nullable string dtype rather than
+# left to inference. `config.MAPILLARY_METADATA_DTYPES` already declares both as
+# StringDtype and bypassing that is not a style question: an all-numeric
+# organization_id column containing any null infers float64, and two ids
+# differing beyond float64's 15-16 significant digits then collapse into one --
+# silently undercounting `n_distinct_orgs` and hiding a mixed-organization
+# drive. Measured: two distinct 19-digit ids read back as a single id.
+ID_COLUMN_DTYPES = {"organization_id": "string", "sequence_id": "string"}
+
 # Rows per chunk. Bounded memory is the point: the largest census in the catalog
 # is ~2.7M pano rows and this script runs beside the nightly batch.
 CHUNK_ROWS = 500_000
@@ -167,11 +176,14 @@ def latest_mapillary_runs(conn) -> list[tuple[str, str, str]]:
                     GROUP BY city_id) latest
                ON latest.city_id = r.city_id AND latest.run_date = r.run_date
             WHERE r.provider = 'mapillary'
-            ORDER BY r.city_id"""
+            ORDER BY r.city_id, r.csv_filename"""
     ).fetchall()
     # MAX(run_date) can tie when a city was collected twice on one date under
-    # different geometry; take the first deterministically rather than emitting
-    # the city twice.
+    # different geometry; take the first rather than emitting the city twice.
+    # csv_filename is in the ORDER BY because city_id alone does not make that
+    # choice deterministic -- with only city_id ordered, SQLite may return two
+    # tied rows in either order and the row this study measures would then
+    # depend on the query plan.
     seen: set[str] = set()
     out = []
     for city_id, run_date, csv_filename in rows:
@@ -216,9 +228,9 @@ def _median_or_none(values: np.ndarray) -> float | None:
 class CityAccumulator:
     """Streams one city's pano rows into the statistics its row needs.
 
-    Holds per-image quality and a factorized sequence code, so the largest city
-    in the catalog costs tens of MB rather than the hundreds a string-keyed
-    frame would. Everything else is a running count.
+    Holds per-image quality plus factorized sequence and organization codes, so
+    the largest city in the catalog costs tens of MB rather than the hundreds a
+    string-keyed frame would. Everything else is a running count.
     """
 
     def __init__(self) -> None:
@@ -226,9 +238,40 @@ class CityAccumulator:
         self._seq_codes: list[np.ndarray] = []
         self._foot: list[np.ndarray] = []  # 1 on foot, 0 vehicle, -1 unknown
         self._has_org: list[np.ndarray] = []
+        self._org_codes: list[np.ndarray] = []  # organization code, -1 individual
         self._seq_ids: dict[str, int] = {}
-        self._org_ids: set[str] = set()
+        self._org_ids: dict[str, int] = {}
         self.n_panos = 0
+
+    @staticmethod
+    def _codes(values, table: dict[str, int], dtype: str = "int64") -> np.ndarray:
+        """Factorize a nullable id column against a running table, null -> -1.
+
+        Shared by sequence_id and organization_id so the two cannot drift: the
+        mixed-class counters below are only meaningful if a code identifies
+        exactly one id, and a second hand-rolled loop is where that stops being
+        true. `pd.isna` rather than an isnan check because these columns are
+        read as StringDtype, whose null is `pd.NA` -- `str(pd.NA)` is the
+        string "<NA>", which a float-only null test would silently accept as a
+        real id shared by every unattributed row.
+
+        `dtype` exists so the organization codes can be int32: they index a
+        table that holds a handful of entries per city (7 at the observed
+        maximum) and this is a third full-length array over a census that
+        reaches 15.4M rows, where each byte per row is 15 MB of resident set.
+        """
+        codes = np.empty(len(values), dtype=dtype)
+        for i, value in enumerate(values.astype("object")):
+            if pd.isna(value):
+                codes[i] = -1
+                continue
+            key = str(value)
+            code = table.get(key)
+            if code is None:
+                code = len(table)
+                table[key] = code
+            codes[i] = code
+        return codes
 
     def add(self, chunk: pd.DataFrame) -> None:
         panos = chunk[chunk["status"].isin(PANO_STATUSES)]
@@ -238,18 +281,7 @@ class CityAccumulator:
 
         quality = pd.to_numeric(panos["quality_score"], errors="coerce").to_numpy(dtype="float64")
 
-        seq = panos["sequence_id"].astype("object")
-        codes = np.empty(len(panos), dtype="int64")
-        for i, value in enumerate(seq):
-            if value is None or (isinstance(value, float) and np.isnan(value)):
-                codes[i] = -1
-                continue
-            key = str(value)
-            code = self._seq_ids.get(key)
-            if code is None:
-                code = len(self._seq_ids)
-                self._seq_ids[key] = code
-            codes[i] = code
+        codes = self._codes(panos["sequence_id"], self._seq_ids)
 
         # on_foot arrives as a nullable bool from the Mapillary dtypes, but a
         # CSV read without them gives object/str, so normalize through pandas
@@ -262,12 +294,13 @@ class CityAccumulator:
 
         org = panos["organization_id"].astype("string")
         has_org = org.notna().to_numpy()
-        self._org_ids.update(org.dropna().unique().tolist())
+        org_codes = self._codes(org, self._org_ids, dtype="int32")
 
         self._quality.append(quality)
         self._seq_codes.append(codes)
         self._foot.append(foot)
         self._has_org.append(has_org)
+        self._org_codes.append(org_codes)
 
     def finish(self, city_id: str, run_date: str, csv_filename: str) -> dict:
         quality = np.concatenate(self._quality) if self._quality else np.empty(0, dtype="float64")
@@ -276,6 +309,9 @@ class CityAccumulator:
         )
         foot = np.concatenate(self._foot) if self._foot else np.empty(0, dtype="int8")
         has_org = np.concatenate(self._has_org) if self._has_org else np.empty(0, dtype="bool")
+        org_codes = (
+            np.concatenate(self._org_codes) if self._org_codes else np.empty(0, dtype="int32")
+        )
 
         scored = np.isfinite(quality)
         q = quality[scored]
@@ -300,6 +336,15 @@ class CityAccumulator:
         # so a mixed drive counts as on-foot/organizational rather than being
         # dropped -- the conservative direction for a study asking whether
         # pedestrian capture scores worse.
+        #
+        # `n_seq_mixed_org` counts distinct organization CODES and not distinct
+        # values of `has_org`. Counting the boolean cannot exceed two classes
+        # and so can never see a drive carrying two different organization ids
+        # -- it answers only "does this drive mix organizational with individual
+        # imagery", which is a weaker claim than the one the study wants to
+        # make. A null organization_id means individual (config.py), so -1 is a
+        # real class here rather than an unknown, and the boolean's question
+        # stays answered as a special case of this one.
         seq_medians = np.empty(0, dtype="float64")
         seq_foot = np.empty(0, dtype="int8")
         seq_org = np.empty(0, dtype="bool")
@@ -316,6 +361,7 @@ class CityAccumulator:
                     "q": quality[usable],
                     "foot": foot_known,
                     "org": has_org[usable],
+                    "org_code": org_codes[usable],
                 }
             )
             grouped = frame.groupby("seq", sort=False).agg(
@@ -323,7 +369,7 @@ class CityAccumulator:
                 foot=("foot", "max"),
                 org=("org", "max"),
                 foot_classes=("foot", "nunique"),
-                org_classes=("org", "nunique"),
+                org_classes=("org_code", "nunique"),
             )
             seq_medians = grouped["q"].to_numpy(dtype="float64")
             # A drive with no labelled row at all has a NaN max; -1 is this
@@ -384,6 +430,7 @@ def measure_run(path: str, city_id: str, run_date: str, csv_filename: str) -> di
     reader = pd.read_csv(
         path,
         usecols=lambda c: c in NEEDED_COLUMNS,
+        dtype=ID_COLUMN_DTYPES,
         chunksize=CHUNK_ROWS,
         low_memory=False,
     )

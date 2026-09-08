@@ -69,8 +69,13 @@ Glendora reads as one of the best cities in the catalog on the image-weighted me
 So the two weightings agree about the typical city and disagree about precisely the cities a shortlist would surface.
 **Publish the drive count beside any quality statistic**; a city's quality "distribution" is often four observations wearing thousands of hats.
 
-A prerequisite of every per-class number below, measured rather than assumed: across all **271,434 sequences, zero** carry more than one value of `on_foot`, and **zero** carry more than one `organization_id`.
-Both are drive-level properties in Mapillary's data, so assigning a class to a drive is exact here rather than a majority vote.
+A prerequisite of every per-class number below, measured rather than assumed: across all **271,434 sequences, zero** carry more than one value of `on_foot`, and **zero** mix organizational with individual imagery.
+So `on_foot` is a drive-level property in Mapillary's data, and the organizational split below is exact rather than a majority vote.
+
+The organizational half of that is the weaker of the two claims, and deliberately stated as the weaker one.
+The committed `n_seq_mixed_org` column counted distinct values of *has an organization* — a boolean — so it could never have seen a drive carrying two **different** organization ids; what it establishes is that no drive mixes organizational with individual imagery.
+The collector now counts distinct ids (a null id means individual, so it is a class of its own), and the stricter answer arrives with the next collection.
+Nothing here turns on it: every organizational number below splits on presence, which is exactly the question the committed column did answer.
 
 ## Finding 3 — the score runs against pedestrian capture
 
@@ -87,8 +92,9 @@ Within a city, comparing the two populations over the same census — a paired d
 | drive-weighted | −0.043 | −0.101 | −0.536 | 49 / 58 (**84.5%**) |
 
 Both weightings agree, which is what makes this robust rather than an artifact of one long walk.
-The extremes are drastic: Yogyakarta's on-foot median is **0.061** against 0.838 for its vehicle imagery (9 drives vs 152), Lima's is 0.154 against 0.863, Carefree AZ's 0.603 against 0.829.
-Only three cities run the other way, none by more than +0.111 (Nanaimo).
+The extremes are drastic, image-weighted: Yogyakarta's on-foot median is **0.061** against 0.838 for its vehicle imagery (9 drives vs 152), Lima's is 0.154 against 0.863, Carefree AZ's 0.603 against 0.829.
+Drive-weighted the same three are −0.057, −0.536 and −0.219, which is why the table above carries both columns and no sentence here mixes them.
+Nine cities run the other way under either weighting, none of them by much: the largest is Nanaimo at +0.111 image-weighted and +0.126 drive-weighted, then New Britain, CT at +0.051 and +0.044.
 
 ![Within a city, Mapillary scores on-foot capture below vehicle capture](figures/mapillary-image-quality-on_foot_penalty.png)
 
@@ -132,7 +138,7 @@ Organizational capture is still worth surfacing — it says something about *sys
 The collection half runs where the run CSVs are (production) and reduces each census to one row; the analysis half never touches a census.
 
 ```bash
-# on the host holding the catalog and run CSVs (~1 h, bounded ~450 MB, safe beside the nightly batch)
+# on the host holding the catalog and run CSVs (~1 h, bounded, safe beside the nightly batch)
 python scripts/mapillary_image_quality_collect.py \
     --out-dir experiments/mapillary-image-quality --catalog-label makelab2-prod
 
@@ -141,6 +147,8 @@ python scripts/mapillary_image_quality_analyze.py \
     --cities-csv experiments/mapillary-image-quality/city_quality.csv \
     --docs-dir docs/experiments --catalog-label makelab2-prod
 ```
+
+Peak memory was measured at ~450 MB before the per-image organization code was added; that column costs a further 4 bytes per pano row, so budget ~510 MB at the catalog's 15.4M-row maximum — derived from the measurement, not re-measured.
 
 `--catalog-label` is recorded in the metrics file and is not optional in spirit: which catalog was read is not recoverable from the numbers afterwards, and a dev laptop holds three Mapillary runs against production's 1,118 — the same trap [`undated-imagery-share.md`](undated-imagery-share.md) nearly shipped a reversed conclusion on.
 

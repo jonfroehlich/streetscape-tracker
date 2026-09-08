@@ -61,13 +61,14 @@ Three things generalize.
 **(1) A bounded score's median is the summary least able to rank**: 228 of 388 cities sit inside one 0.07-wide band of medians, and counting the SAME images at the tail spreads those same 228 cities from 0.0% to 26.0% scoring ≥ 0.9.
 That is the median discarding an ordering, not reporting that none exists — and it is why `mapillary_meta`'s one stored number was useless for the workflow it was captured for.
 **(2) A paired within-unit comparison and a cross-unit scatter can disagree completely, and the scatter is the one that is wrong.**
-Mapillary scores on-foot capture below vehicle capture in 84.5% of the cities holding both, median delta −0.043 and as far as −0.777 (Yogyakarta) — while the cross-city Spearman between on-foot share and median quality is only −0.106.
+Mapillary scores on-foot capture below vehicle capture in 84.5% of the cities holding both, drive-weighted median delta −0.043 and as far as −0.536 (Lima) — while the cross-city Spearman between on-foot share and median quality is only −0.106.
+Quote one weighting per sentence: the image-weighted figures for the same comparison are 82.8%, −0.042 and −0.777 (Yogyakarta), and pairing a drive-weighted headline with an image-weighted extreme reintroduces exactly the single-bad-walk artifact the filter below removes.
 Everything else that differs between cities swamps the effect in aggregate; the within-city pairing is immune to it.
 The operational consequence is an inversion worth carrying: pedestrian imagery is what a sidewalk deployment wants and is what the predictor marks down hardest, so a quality ranking ranks *against* the imagery it is meant to find.
 **(3) The `pano-spacing.md` sequence rule applies to subgroups too, not just to the headline.**
 The first pass filtered the paired comparison on image counts alone and admitted cities whose entire on-foot side was one walk; requiring ≥ 3 distinct drives per side is what makes 84.5% a finding rather than an anecdote with a percentage sign.
 Relatedly, the median catalog city is **18 drives** (p25 4), so a city's quality "distribution" is usually a handful of observations — and Glendora moves 363 rank places of 388 between image- and drive-weighting.
-The study also settles, over all 271,434 sequences rather than a spot check, that `on_foot` and `organization_id` are strictly drive-level (zero mixed sequences), and returns a clean null for organizational capture: drive-weighted, orgs score higher in exactly 50.0% of cities.
+The study also settles, over all 271,434 sequences rather than a spot check, that `on_foot` is strictly drive-level and that no drive mixes organizational with individual imagery (zero mixed sequences on both counts), and returns a clean null for organizational capture: drive-weighted, orgs score higher in exactly 50.0% of cities.
 
 ### `pano-spacing.md`
 
