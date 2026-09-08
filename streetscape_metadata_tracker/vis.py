@@ -195,7 +195,12 @@ def _kartaview_viewer_url(pano_id, row) -> str | None:
 
 
 # User-facing labels and pano viewer deep-links per provider (mirrors the
-# PROVIDERS registry in www/js/streetscape-utils.js). viewer_url takes the whole
+# PROVIDERS registry in www/js/streetscape-utils.js — EXCEPT for panoramax,
+# which is deliberately here and not there until #316 phase 2's frontend PR: a
+# hand-collected panoramax run does reach cities.json.gz, but grid.js and
+# streets.js enumerate that registry, so its rows render nowhere and city.js
+# rewrites an unknown ?provider= to gsv. Per-run maps and popups, which is all
+# this table feeds, work now.) viewer_url takes the whole
 # row besides the pano id because KartaView's viewer is not addressable by photo
 # id; it may return None, which the popup renders as no link at all. Every
 # naming.KNOWN_PROVIDERS member must have an entry — a run's map is generated

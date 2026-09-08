@@ -88,6 +88,7 @@ from .download_mapillary import (
     DEFAULT_TILE_REQUESTS_PER_MINUTE,
     estimate_tile_count,
 )
+from .download_panoramax import estimate_tile_count as estimate_panoramax_tile_count
 from .json_summarizer import (
     generate_aggregate_v2,
     generate_driving_plan_summary,
@@ -1166,6 +1167,9 @@ def estimate_requests(
     KartaView: the radius-sweep lattice over the frozen bbox, carrying the
     study's measured overhead (see :func:`estimate_kartaview_requests`).
 
+    Panoramax: the same shape as Mapillary's, at the z15 the picture layer
+    starts at — so roughly four times the tiles over the identical bbox.
+
     ``conn`` is read by ``gsv_streets`` and ``kartaview``; without it each falls
     back to its geometry-only tier (the area proxy, and the default-radius
     lattice respectively).
@@ -1195,6 +1199,17 @@ def estimate_requests(
         # the sample count would have read 18,851 requests for a Krabi walk the
         # sweep covers in 64 circles.
         return estimate_kartaview_requests(conn, city)
+    if provider == "panoramax":
+        # A z15 lattice, so ~4x Mapillary's tiles over the same bbox — and NOT
+        # the grid formula below, which would read tens of thousands of points
+        # for a city the lattice covers in a few hundred tiles. This arm is
+        # reachable before the channel is wired (#316 phase 2): `panoramax` is
+        # opt-in, so `enroll-city --all` already prices the whole catalog with
+        # it, and cheapest-first tranche ordering computed on the grid formula
+        # would order cities by area rather than by what the channel spends.
+        return estimate_panoramax_tile_count(
+            city.center_lat, city.center_lon, city.grid_width_m, city.grid_height_m, city.step_m
+        )
     return (city.grid_width_m // city.step_m + 1) * (city.grid_height_m // city.step_m + 1)
 
 

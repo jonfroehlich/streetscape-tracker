@@ -17,7 +17,8 @@ The 20 richest screened cities hold between 15,907 and 1,118,155 pictures each �
 Des Moines holds 548,451 360° pictures on Panoramax against 352,570 in Mapillary's census of the identical frozen bbox; Ames holds 135,501 against 83,424.
 
 So the recommendation is the KartaView shape, not the Mapillary shape: **an opt-in channel** ([#248](https://github.com/jonfroehlich/streetscape-tracker/issues/248)) enrolled city by city where the screen says there is something to collect, never a default-membership channel that would spend a nightly slot on the 63.8% of cities known to hold nothing.
-The census cost is Mapillary's — the same z14 tiles, a median of 12 per city — with no credential and no per-app quota, so the cost of building it is the collector, not the running.
+The screen is Mapillary-cheap — the same z14 tiles, a median of 12 per city — but the per-picture census is the z15 `pictures` layer, a median of 35 tiles over the same frozen grids (§3 below), so a bbox costs roughly four times Mapillary's.
+Either way there is no credential and no per-app quota, so the cost of building this is the collector, not the running.
 Whether that collector is worth writing for roughly 20–60 cities is a judgement, not a measurement, and this study stops at the measurement.
 
 ## The question
@@ -282,6 +283,11 @@ Panoramax gained instances and pictures throughout 2026 — the newest hex date 
 A re-run is 113 requests for the screen; that is the number to re-check before treating any verdict here as still current.
 
 ## Replicating
+
+**The per-picture decoder moved after this record was produced.**
+Phase 2's collector ([#316](https://github.com/jonfroehlich/streetscape-tracker/issues/316)) owns `pictures_from_tile` now and this script imports it, rather than keeping the copy that produced the numbers below.
+The one behavioural difference is deliberate: the copy here fell back to the MVT feature id when the `pictures` layer did not name a picture, and the collector does not, because those ids are numbered per tile and would collide across a city.
+Finding 4 measured zero pictures without a named id over 1,345,143 rows, so a re-run should reproduce this record exactly — but that is this study's own claim being trusted, not a re-run that has been done.
 
 ```bash
 python scripts/panoramax_feasibility.py --stage screen        # 113 requests, whole catalog

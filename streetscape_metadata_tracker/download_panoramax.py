@@ -1273,6 +1273,15 @@ async def _fetch_city_images(
     async def fetch_one(x: int, y: int) -> pd.DataFrame:
         nonlocal fatal
         url = TILE_URL_TEMPLATE.format(z=TILE_ZOOM, x=x, y=y)
+        # Per-tile, alongside the whole-city counter: the commit below needs to
+        # know whether THIS tile 404ed, not how many did.
+        answered_404 = False
+
+        def note_empty() -> None:
+            nonlocal answered_404
+            answered_404 = True
+            count_empty()
+
         async with semaphore:
             # The abort check belongs HERE, inside the semaphore: gather starts
             # every task at once and each runs to its first suspension point, so
@@ -1287,7 +1296,7 @@ async def _fetch_city_images(
             try:
                 # Pacing/counting happen inside _fetch_tile, per retried attempt.
                 tile_bytes = await _fetch_tile(
-                    session, url, timeout, rate_limiter, count_request, count_empty
+                    session, url, timeout, rate_limiter, count_request, note_empty
                 )
             except DownloadError as e:
                 # ONLY DownloadError trips the abort. Per-tile failures (a 5xx
@@ -1301,11 +1310,27 @@ async def _fetch_city_images(
         # every tile's result until the last one lands, so returning dicts would
         # keep the entire city's per-picture dicts alive at once (issue #157).
         frame = records_to_census(pictures_from_tile(tile_bytes, x, y))
-        if checkpoint is not None:
+        if checkpoint is not None and not answered_404:
             # Synchronous, inside the coroutine: the loop is single-threaded, so
             # this is atomic with respect to every other tile's commit, and the
             # host lock rules out another process. Only a SUCCESSFUL tile gets
             # here — a failure raised above, and stays refetchable.
+            #
+            # A 404 is deliberately NOT committed, even though this run reads it
+            # as an empty tile. The moved-endpoint guard below is evidence that
+            # only exists per invocation — it asks whether everything REQUESTED
+            # answered 404 — so committing one spends that evidence: the run
+            # that correctly refuses would leave a checkpoint in which every
+            # tile is recorded fetched-and-empty, and the next invocation would
+            # find nothing to do, skip the guard, and re-finalize the city from
+            # disk as a genuine ZERO_RESULTS snapshot for 0 requests (then
+            # promote that into the shared #290 cache). Leaving it uncommitted
+            # re-asks the question every night, which is the only honest thing
+            # to do with a tile whose meaning a single response cannot settle.
+            # The cost is paid by the case measured at zero in 3,321 phase-1
+            # requests: a city with a scattered 404 never completes its
+            # checkpoint, so it re-fetches that tile on a resume and its cache
+            # entry is refused (and deleted) on the next read.
             _commit_tile(
                 checkpoint,
                 x,

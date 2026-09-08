@@ -195,8 +195,8 @@ This is what READ THIS FIRST points at; read it before changing any pacing, retr
 
 | Family | Codes | Meaning |
 |---|---|---|
-| Blocked | 75 / 76 / 81 | The third party refused this IP — trips the night-level breaker |
-| Busy | 79 / 80 / 82 | Another local process holds the host lock |
+| Blocked | 75 / 76 / 81 / 84 | The third party refused this IP — trips the night-level breaker |
+| Busy | 79 / 80 / 82 / 85 | Another local process holds the host lock |
 | Sweep incomplete | 83 | A checkpointed partial sweep (#239) — the budget or deadline ran out, not a host condition; amnestied beside the host conditions (#238), while a SIGKILL has no exit code and still counts a failure, so kill-and-resume is bounded at five nights |
 
 - A blocked or busy night still publishes, alerts unconditionally, and exits nonzero.

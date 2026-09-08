@@ -261,6 +261,54 @@ def test_a_lattice_that_answers_404_EVERYWHERE_is_refused_rather_than_published(
         _run(monkeypatch, tmp_path, {}, lat, lon, empty=set(tiles))
 
 
+def test_a_404_LATTICE_is_still_refused_on_the_NIGHT_AFTER_it_checkpointed(
+    monkeypatch, tmp_path, straddling_city
+):
+    """
+    THE GUARD ABOVE HAS TO SURVIVE THE CHECKPOINT, and the evidence it reads is
+    per-invocation: it asks whether everything REQUESTED answered 404. So a 404
+    must not be committed. If it were, the run that correctly refuses would
+    leave every tile recorded fetched-and-empty, and the NEXT invocation would
+    find `todo` empty, never evaluate the guard, and re-finalize the city from
+    disk as a genuine ZERO_RESULTS snapshot for zero requests -- publishing
+    "every pano in the city removed" through the very path the guard exists to
+    close, and promoting that empty census into the shared #290 cache.
+
+    The sibling test above passes without a checkpoint, which is exactly the
+    blind spot: the CLI always passes one (`crawl_store_for` returns a store for
+    every CENSUS_PROVIDERS member), so the unchecked path is the only one that
+    ever runs in production.
+    """
+    lat, lon = straddling_city
+    tiles = dp.tiles_for_bbox(*dp.grid_bbox(lat, lon, 100, 100, 20))
+    assert len(tiles) >= 2, "the guard is bounded by len(todo) >= 2"
+    checkpoint_path = str(tmp_path / "crawl")
+
+    for night in (1, 2):
+        with pytest.raises(DownloadError, match="has moved or been renamed"):
+            _run(
+                monkeypatch,
+                tmp_path,
+                {},
+                lat,
+                lon,
+                empty=set(tiles),
+                checkpoint_path=checkpoint_path,
+                checkpoint_channel="panoramax",
+            )
+        done = dp._open_tile_checkpoint(
+            checkpoint_path,
+            bbox=dp.grid_bbox(lat, lon, 100, 100, 20),
+            tiles=tiles,
+            channel="panoramax",
+            variant=None,
+        )
+        assert done.done == {}, (
+            f"night {night} committed a 404 tile; the next invocation would find "
+            f"nothing to do and publish the city as empty"
+        )
+
+
 def test_one_404_among_answered_tiles_is_a_hole_not_a_moved_endpoint(
     monkeypatch, tmp_path, straddling_city
 ):
