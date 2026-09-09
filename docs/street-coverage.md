@@ -74,9 +74,39 @@ It is a **scheduled, opt-in** channel as of #258, enrolled separately from `kart
 **KartaView's walk is priced like Mapillary's, not GSV's**: a radius sweep of the frozen bbox, independent of spacing.
 The first one measured it — Krabi, 2026-08-31, 18,851 samples over 2,144 edges scored from **87 sweep requests**, against 18,851 for the same walk on `gsv_streets`, for slightly HIGHER coverage (85.4% of street-km vs GSV's 82.9%).
 The Mapillary arm emits #116's status vocabulary at sample level
-— `OK`/`NO_DATE` for a 360° pano in range, `FLAT_ONLY` (null capture_date) when only flat imagery is, `ZERO_RESULTS` otherwise
+— `OK`/`NO_DATE` for a 360° pano in range, `FLAT_ONLY` (null capture_date) when only flat imagery is, `ZERO_RESULTS` when the sample was measured and nothing is in range, and `REQUEST_FAILED` when it was never measured at all (below)
 — which `compute_streetwalk_coverage` turns into **two numbers per edge**: `coverage_fraction` (360°) and `coverage_fraction_any`, summarized as `coverage_pct_by_length[_any]`.
 GSV emits no FLAT_ONLY, so its any-value equals its 360° value by construction; `street_walks.coverage_pct_by_length_any` (**schema v8**) is NULL on pre-v8 walks — "not measured", never a copy.
+
+### An unswept sample is not an empty one
+
+**A census walk's samples under a tile or cell the fetch never got back publish `REQUEST_FAILED`, not `ZERO_RESULTS`.**
+Publishing an unswept sample as `ZERO_RESULTS` records an absence nobody observed into an immutable dated snapshot, and no later reader can tell it from a measured one.
+What this buys is a **legible row**, and deliberately nothing more — see the two consequences below before reading it as a coverage fix.
+The seam is `census_walk.build_streetwalk_rows`' `unmeasured_mask` hook, and each provider passes the SAME helper its own grid run masks with — KartaView's `_points_in_cells` over `failed_cells` (#258), Mapillary's `_points_in_tiles` over `failed_tiles` (#259) — so a city's walk and its grid run cannot disagree about the same unswept ground.
+The mask applies only to samples that matched **nothing**: one that found imagery within `--match-dist` was measured by construction, whatever cell it sits in, so a matched sample inside a failed tile stays matched.
+GSV needs no hook at all, because it queries each sample directly and a failed sample already carries its own `REQUEST_FAILED`.
+
+A degraded walk **says so in its per-attempt log** — `N walk samples in <desc> matched no imagery; written as REQUEST_FAILED rather than empty`, the grid tail's wording and its rule that the warning fires on damage rather than on a failure (a failed tile over water covers no sample and must not claim one).
+`N` is the count actually **relabelled** — the samples that matched nothing — not every sample under the failed tiles, since one that matched a neighbour's imagery was measured and keeps its row.
+That log is the only record there is: neither `street_walks` nor the coverage GeoJSON carries a hole count, and on a #290 reuse night the walk inherits the crawl's failed tiles for zero requests, so the fetch-side "N/M tiles failed" warning never fires for it at all.
+`unmeasured_desc` is therefore required whenever `unmeasured_mask` is given, exactly as in `census.write_census_grid_run`.
+
+**That per-attempt log is also where the line stops, and an operator has to go looking for it.**
+A tolerated hole is a SUCCESSFUL collection — the fetch stayed under `MAX_FAILED_TILE_FRACTION`, so the child exits 0 — and `_run_collection` copies a child's log tail into the scheduler log only for a child that FAILED, while the `[alerts]` mail quotes `_recent_log_tail`, i.e. the scheduler log and nothing else.
+So a degraded walk sends no mail and raises no counter; the evidence is `logs/collect_{city_id}_{channel}_{date}.log` on the collecting host.
+That is the argument for warning on damage rather than on failure, too: a spurious line pages nobody, it just buries the real one in the one place anybody reads it.
+
+Two consequences are worth stating, because neither is visible in the row itself.
+`REQUEST_FAILED` is **not** in `analysis.PRESENT_STATUSES`, so it lands in exactly the denominator `ZERO_RESULTS` did: this changes what a snapshot SAYS, not any coverage percentage and not any walk-diff count.
+`coverage_pct_by_length` still counts every unmeasured sample as uncovered, so the published understatement is unchanged, and a recovered tile still reads as `gained_coverage` in the next walk diff rather than as the measurement catching up.
+Making the unmeasured samples vanish from the denominator instead would be a much larger change that the grid path does not make either (`diff.py` filters on `PRESENT_STATUSES` the same way), and doing it on one side alone would have grid and street coverage disagree about the same hole.
+`REQUEST_FAILED` **is** in `analysis.SYSTEMIC_FAILURE_STATUSES`, so the change can only push a run's denied fraction up — it can newly trip `detect_systemic_failure`'s ≥95% guard, never newly clear it.
+Tripping is the intended outcome rather than a regression: a walk that measured almost nothing carries no information about the city and must not become its series' diff baseline, and failing loudly beats publishing the same night as a confident "no imagery anywhere".
+It stays rare in practice, but **not** because of the 2% unmeasured tolerances: `MAX_FAILED_TILE_FRACTION` is a share of the bbox LATTICE and `MAX_FAILED_AREA_FRACTION` a share of bbox AREA, while the guard is a share of STREET SAMPLES — three different denominators, and neither tolerance bounds the third (the repo's own rule about not reasoning across denominators).
+The argument that does hold for Mapillary is tile arithmetic: at 2%, a city needs **≥50 tiles before even one failed tile is tolerated at all** (below that the fetch refuses to finalize, so there is no partial artifact for the guard to see), the catalog median is 12 tiles, and a ≥50-tile bbox is roughly 13 × 13 km — so tripping the guard would take a road network confined to a single ~1.8 km tile inside a metro-sized frozen grid, which is not a shape the catalog holds.
+KartaView's area tolerance carries no equivalent implication, so there the guard is the only backstop.
+Either way, a walk that does trip it is a broken credential or a dead host, which is what the guard is for.
 
 ## A Mapillary walk on a paired night costs zero requests (issue #290)
 

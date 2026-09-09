@@ -81,6 +81,7 @@ def build_streetwalk_rows(
     match_dist_m: float,
     query_timestamp: str,
     unmeasured_mask=None,
+    unmeasured_desc=None,
 ) -> pd.DataFrame:
     """
     Score KartaView census images against the walk's sample points.
@@ -98,6 +99,7 @@ def build_streetwalk_rows(
         query_timestamp,
         KARTAVIEW_WALK,
         unmeasured_mask=unmeasured_mask,
+        unmeasured_desc=unmeasured_desc,
     )
 
 
@@ -200,6 +202,7 @@ async def collect_kartaview_street_samples_async(
                 if failed_cells
                 else None
             ),
+            unmeasured_desc=f"{len(failed_cells)} unmeasured cell(s)",
         )
         del census
         # Straight into the gzip handle: to_csv() with no path builds the whole CSV

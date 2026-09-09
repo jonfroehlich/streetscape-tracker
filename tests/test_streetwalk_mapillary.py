@@ -11,30 +11,46 @@ that join trustworthy:
   * flat imagery raising the ANY-imagery number without touching the 360° one;
   * undated imagery (NO_DATE) covering the street while ageing nothing (#257),
     which is the arm the GSV-only unit tests structurally cannot reach;
+  * a tile the fetch never got back publishing REQUEST_FAILED rather than
+    ZERO_RESULTS, so an unmeasured hole is not republished as measured
+    emptiness (#259) -- and only for the samples nothing matched;
   * requests metered under `mapillary_streets`, never `mapillary` or
     `gsv_streets`;
   * cost independent of sample spacing (the whole point of the tile census).
 """
 
+import asyncio
 import gzip
 import json
+import logging
 import os
+import re
 from datetime import date
 
+import aiohttp
 import geopandas as gpd
+import numpy as np
 import pytest
+import yarl
+from multidict import CIMultiDict, CIMultiDictProxy
 from shapely.geometry import LineString
 
 from streetscape_metadata_tracker import db
 from streetscape_metadata_tracker import download_gsv as dg
+from streetscape_metadata_tracker import download_mapillary as dm
 from streetscape_metadata_tracker.checkpointing import (
+    CensusCache,
     census_cache_path_for,
     checkpoint_path_for,
 )
 from streetscape_metadata_tracker.download_common import grid_bbox
 from streetscape_metadata_tracker.download_mapillary import (
     DEFAULT_TILE_REQUESTS_PER_MINUTE,
+    TILE_ZOOM,
+    _points_in_tiles,
+    lonlat_to_tile_frac,
     records_to_census,
+    tile_frac_to_lonlat,
 )
 from streetscape_metadata_tracker.naming import (
     generate_streetwalk_filename,
@@ -43,6 +59,7 @@ from streetscape_metadata_tracker.naming import (
 from streetscape_street_analyzer import census_walk, collect
 from streetscape_street_analyzer import collect_mapillary as cm
 from tests.conftest import stamp_census_cache
+from tests.test_mapillary import _stub_fetch_tile, encode_tile
 
 # ~222 m north-south edge, plus a short spur — same geometry as the GSV test.
 LONG_EDGE = LineString([(-121.30, 44.05), (-121.30, 44.052)])
@@ -87,8 +104,19 @@ def _setup(
     census_fetched_by=None,
     census_fetched_at=None,
     census_reused=None,
+    failed_tiles=None,
+    edges=None,
+    grid_m=200,
+    stub_fetch=True,
 ):
-    """Data dir + catalog with one city; edges and the tile census served locally."""
+    """Data dir + catalog with one city; edges and the tile census served locally.
+
+    ``grid_m`` sizes the frozen grid, and only the reuse test moves it: at the
+    default 200 m the bbox is a SINGLE z14 tile, which is fine while the census
+    fetch is stubbed but leaves no second tile for a real crawl to succeed at.
+    ``stub_fetch=False`` leaves the real ``fetch_city_images_async`` in place
+    for the tests that have to drive the cache itself.
+    """
     data_dir = str(tmp_path)
     conn = db.connect(db.get_default_db_path(data_dir))
     db.register_city(
@@ -100,12 +128,13 @@ def _setup(
         country_code="US",
         center_lat=44.05,
         center_lon=-121.30,
-        grid_width_m=200,
-        grid_height_m=200,
+        grid_width_m=grid_m,
+        grid_height_m=grid_m,
         step_m=20,
     )
     conn.close()
-    monkeypatch.setattr(collect, "fetch_street_edges", lambda *a, **k: _edges())
+    walked = _edges() if edges is None else edges
+    monkeypatch.setattr(collect, "fetch_street_edges", lambda *a, **k: walked)
 
     calls = {"n": 0}
 
@@ -131,6 +160,10 @@ def _setup(
                 api_requests if api_requests_total is None else api_requests_total
             ),
             "checkpoint_path": kwargs.get("checkpoint_path"),
+            # Tiles the fetch never got back. The real fetch refuses to
+            # finalize past MAX_FAILED_TILE_FRACTION, so a live list is always
+            # a small remainder; these tests hand it one on purpose (#259).
+            "failed_tiles": list(failed_tiles or []),
             "tiles": 7,
             "raw_feature_count": len(images),
             # Census provenance (#290). Defaults mimic an ordinary fresh fetch:
@@ -144,7 +177,8 @@ def _setup(
             ),
         }
 
-    monkeypatch.setattr(cm, "fetch_city_images_async", fake_fetch_images)
+    if stub_fetch:
+        monkeypatch.setattr(cm, "fetch_city_images_async", fake_fetch_images)
     monkeypatch.setenv("MAPILLARY_STREETS_ACCESS_TOKEN", "MLY|TESTTOKEN")
     return data_dir, calls
 
@@ -166,13 +200,13 @@ def _args(data_dir, provider="mapillary", **overrides):
     return collect.build_parser().parse_args(argv)
 
 
-def _csv_name(spacing=15, provider="mapillary", run_date=RUN_DATE):
+def _csv_name(spacing=15, provider="mapillary", run_date=RUN_DATE, grid_m=200):
     """Snapshot filename, via the real generator so the tests can't drift from
     the naming contract (the provider token is what keeps the two channels'
     artifacts from colliding)."""
     return (
         generate_streetwalk_filename(
-            CITY_ID, 200, 200, 20, spacing, date.fromisoformat(run_date), provider=provider
+            CITY_ID, grid_m, grid_m, 20, spacing, date.fromisoformat(run_date), provider=provider
         )
         + ".csv.gz"
     )
@@ -328,6 +362,311 @@ def test_empty_census_yields_zero_coverage_not_a_crash(tmp_path, monkeypatch):
     totals = _coverage(data_dir)["properties"]["metadata"]["totals"]
     assert totals["coverage_pct_by_length"] == 0.0
     assert totals["edges"] == 2
+
+
+# --- An unswept sample is not an empty one (issue #259) ---------------------
+
+# The city's own edges sit wholly inside ONE z14 tile, so failing that tile
+# would mask every sample or none and could not tell the two apart. These tests
+# walk an edge laid ACROSS a real z14 seam instead -- the northern boundary of
+# the tile the city sits in -- and fail only the tile on one side, so a single
+# run carries both kinds at once. The seam is derived from the shipped tiling
+# rather than hardcoded, so a zoom change moves the geometry with it instead of
+# quietly making these tests vacuous.
+CITY_TILE = tuple(int(v) for v in lonlat_to_tile_frac(-121.30, 44.05, TILE_ZOOM))
+NORTH_TILE = (CITY_TILE[0], CITY_TILE[1] - 1)
+# y grows southward, so a tile's own y index names its NORTHERN edge.
+SEAM_LAT = tile_frac_to_lonlat(CITY_TILE[0] + 0.5, CITY_TILE[1], TILE_ZOOM)[1]
+
+
+def _seam_edges():
+    """One ~440 m north-south edge straddling the seam: half in each tile."""
+    return gpd.GeoDataFrame(
+        {"edge_id": ["s1"], "highway": ["residential"], "length": [440.0]},
+        geometry=[LineString([(-121.30, SEAM_LAT - 0.002), (-121.30, SEAM_LAT + 0.002)])],
+        crs="EPSG:4326",
+    )
+
+
+def _statuses(data_dir, spacing=15, **name):
+    """(status, query_lat) for every published row of the walk snapshot."""
+    with gzip.open(os.path.join(data_dir, _csv_name(spacing, **name)), "rt") as fh:
+        header = fh.readline().rstrip("\n").split(",")
+        si, li = header.index("status"), header.index("query_lat")
+        return [(r.split(",")[si], float(r.split(",")[li])) for r in fh.read().splitlines() if r]
+
+
+def test_a_failed_tile_publishes_request_failed_not_zero_results(tmp_path, monkeypatch):
+    """
+    A tile the fetch never got back leaves its samples UNKNOWN.
+
+    Recording an unswept sample as ZERO_RESULTS publishes an absence we never
+    observed into an immutable dated snapshot, and no later reader can tell it
+    from a measured one. What that buys is a legible ROW and nothing more --
+    REQUEST_FAILED sits in the same coverage denominator ZERO_RESULTS did, so
+    no published percentage and no walk-diff counter moves either way, which is
+    the same choice the grid path makes. The Mapillary GRID run has masked its
+    holes this way since #168 and the KartaView walk since #258; this walk was
+    the one that did not, which is #259.
+    """
+    data_dir, _ = _setup(tmp_path, monkeypatch, [], failed_tiles=[NORTH_TILE], edges=_seam_edges())
+
+    assert collect.run_collect(_args(data_dir)) == 0
+    rows = _statuses(data_dir)
+    kinds = {s for s, _ in rows}
+    assert kinds == {"REQUEST_FAILED", "ZERO_RESULTS"}, (
+        f"the failed tile's half must read REQUEST_FAILED and the swept half "
+        f"ZERO_RESULTS, got {kinds}"
+    )
+    # ...and the split follows the tile boundary rather than some other
+    # accident: the unknown rows are exactly the ones north of the seam.
+    assert all((s == "REQUEST_FAILED") == (lat > SEAM_LAT) for s, lat in rows)
+
+
+def test_a_sample_matched_inside_a_failed_tile_stays_matched(tmp_path, monkeypatch):
+    """
+    The mask speaks only for samples that matched NOTHING.
+
+    A sample that found imagery within the match distance was measured by
+    construction, so overwriting it with REQUEST_FAILED would erase real
+    coverage. The imagery here sits inside the failed tile's own bounds, which
+    is exactly the case a mask applied before the join would get wrong.
+    """
+    # A pano every ~11 m up the northern (failed) half, dense enough that every
+    # 15 m sample there is within the 25 m match distance of one.
+    images = [_image(f"p{i}", SEAM_LAT + 0.0001 * i, -121.30) for i in range(1, 21)]
+    data_dir, _ = _setup(
+        tmp_path, monkeypatch, images, failed_tiles=[NORTH_TILE], edges=_seam_edges()
+    )
+
+    assert collect.run_collect(_args(data_dir)) == 0
+    rows = _statuses(data_dir)
+    kinds = {s for s, _ in rows}
+    north = np.array([lat for _, lat in rows if lat > SEAM_LAT])
+    # Stated rather than assumed, because it is the whole premise: these
+    # samples really do lie inside the tile that failed, so a mask applied
+    # before the join -- or to every sample rather than the unmatched ones --
+    # would turn each of them into a hole.
+    assert _points_in_tiles(north, np.full(north.shape, -121.30), [NORTH_TILE]).all()
+    assert {s for s, lat in rows if lat > SEAM_LAT} == {"OK"}, (
+        "a matched sample must stay matched even inside a failed tile's bounds"
+    )
+    # So this run publishes no unknown row at all, despite a failed tile being
+    # in play: every sample inside it matched, and the mask speaks only for the
+    # ones that did not. The southern half was swept and is mostly empty, so it
+    # still reads as measured emptiness rather than as a hole.
+    assert "REQUEST_FAILED" not in kinds
+    assert "ZERO_RESULTS" in kinds
+
+
+def test_a_clean_fetch_still_publishes_zero_results(tmp_path, monkeypatch):
+    """
+    The other half of the pair: with no failed tiles, an empty census is a
+    MEASURED absence and must read ZERO_RESULTS.
+
+    Without this, masking everything would satisfy the test above while
+    destroying the ordinary case -- the coverage denominator depends on telling
+    observed emptiness from unobserved ground.
+    """
+    data_dir, _ = _setup(tmp_path, monkeypatch, [], failed_tiles=[], edges=_seam_edges())
+
+    assert collect.run_collect(_args(data_dir)) == 0
+    assert {s for s, _ in _statuses(data_dir)} == {"ZERO_RESULTS"}
+
+
+def test_a_degraded_walk_says_so_in_its_own_log(tmp_path, monkeypatch, caplog):
+    """
+    A walk that publishes holes must SAY so in the per-attempt log.
+
+    That log is the only place an operator learns an artifact is partly
+    unmeasured -- nothing in the catalog row or the coverage GeoJSON records
+    it -- and it is also where the line STOPS. A tolerated hole is a SUCCESSFUL
+    collection (the fetch stayed under MAX_FAILED_TILE_FRACTION, so the child
+    exits 0), and `scheduler._run_collection` copies a child's tail into the
+    scheduler log -- the one the [alerts] mail quotes -- only for a child that
+    FAILED. So nothing mails anyone about this; somebody has to open
+    logs/collect_{city}_{channel}_{date}.log.
+
+    The reuse path (#290) makes that sharper: a walk reading its census from
+    the cache inherits the crawl's failed tiles for zero requests, so no
+    fetch-side "N/M tiles failed" warning fires either.
+
+    The COUNT asserted is the relabelled subset, which is what the message
+    claims -- see the wording note in `census_walk.build_streetwalk_rows`.
+    """
+    data_dir, _ = _setup(tmp_path, monkeypatch, [], failed_tiles=[NORTH_TILE], edges=_seam_edges())
+
+    with caplog.at_level(logging.WARNING):
+        assert collect.run_collect(_args(data_dir)) == 0
+    degraded = sum(1 for s, _ in _statuses(data_dir) if s == "REQUEST_FAILED")
+    warnings = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any(
+        f"{degraded:,} walk samples" in m and "1 undownloaded tile(s)" in m for m in warnings
+    ), f"the degraded sample count and what failed must both be in the log, got {warnings}"
+
+
+def test_a_failed_tile_covering_no_sample_claims_no_degradation(tmp_path, monkeypatch, caplog):
+    """
+    The other side of that warning: it fires on DEGRADATION, not on a failure.
+
+    A failed tile can legitimately cover no sample at all -- one over water, or
+    a margin tile whose on-street points a neighbour already answered -- and a
+    WARNING asserting damage that did not happen buries a real one in the ONE
+    place either is ever read, since a tolerated hole mails nobody (see the
+    test above).
+    """
+    far_away = (NORTH_TILE[0] + 40, NORTH_TILE[1] + 40)
+    data_dir, _ = _setup(tmp_path, monkeypatch, [], failed_tiles=[far_away], edges=_seam_edges())
+
+    with caplog.at_level(logging.WARNING):
+        assert collect.run_collect(_args(data_dir)) == 0
+    assert {s for s, _ in _statuses(data_dir)} == {"ZERO_RESULTS"}
+    assert not [r for r in caplog.records if "matched no imagery" in r.message]
+
+
+def test_a_mask_without_a_description_is_refused(tmp_path, monkeypatch):
+    """
+    The desc is what makes the warning above actionable, so the seam refuses a
+    mask without one rather than logging an unattributed count -- the same
+    contract `census.write_census_grid_run` enforces for the grid tail.
+    """
+    with pytest.raises(ValueError, match="unmeasured_desc"):
+        cm.build_streetwalk_rows(
+            [(44.05, -121.30, 0, 0)],
+            records_to_census([]),
+            25.0,
+            "2026-07-08T00:00:00+00:00",
+            unmeasured_mask=lambda lats, lons: np.zeros(len(lats), dtype=bool),
+        )
+
+
+def test_a_reused_census_carries_its_holes_into_the_walks_own_rows(tmp_path, monkeypatch):
+    """
+    The #290 reuse path, driven end to end rather than assumed.
+
+    This is the case every other test here stubs past, and the one the rest of
+    the rationale leans on: the walk spends ZERO requests, so no fetch-side
+    "N/M tiles failed" warning ever fires for it, and the crawl's holes reach
+    the artifact only if `marker["failed"]` survives all the way through
+    `_reuse_cached_census` -> `fetched["failed_tiles"]` -> the mask. Each hop
+    is pinned on its own (`test_mapillary_resume`'s
+    `test_a_reuse_inherits_the_failed_tiles_rather_than_re_probing_them` for
+    the first, the tests above for the last), which is exactly why the JOIN is
+    worth a test: a rename on either side passes both halves and silently
+    restores the silence #259 closed.
+
+    So: a real grid crawl loses a tile and promotes; the walk then reuses that
+    entry for nothing and must publish the same hole in its own rows.
+    """
+    # A 1,400 m grid, the smallest here whose bbox spans TWO z14 tiles -- one
+    # to fail and one to succeed. At the usual 200 m the bbox is a single tile,
+    # so a real crawl could only fail everything or nothing.
+    grid_m = 1400
+    bbox = grid_bbox(44.05, -121.30, grid_m, grid_m, 20)
+    tiles = dm.tiles_for_bbox(*bbox)
+    assert sorted(tiles) == sorted([CITY_TILE, NORTH_TILE]), (
+        "the fixture geometry moved; this test needs exactly the seam's two tiles"
+    )
+    # One of two tiles is 50%, which the real 2% tolerance would refuse to
+    # finalize. Widened because what is under test is what a REUSER inherits,
+    # not where the tolerance sits -- the same move, for the same reason, as
+    # test_mapillary_resume's inheritance tests.
+    monkeypatch.setattr(dm, "MAX_FAILED_TILE_FRACTION", 0.6)
+
+    # The cache entry is stamped with the crawl's own clock, and a backdated
+    # --run-date refuses an entry observed after it, so this walk runs today.
+    run_date = date.today().isoformat()
+    data_dir, _ = _setup(
+        tmp_path,
+        monkeypatch,
+        [],
+        edges=_seam_edges(),
+        grid_m=grid_m,
+        stub_fetch=False,
+    )
+    cache_path = census_cache_path_for("mapillary", CITY_ID, bbox)
+
+    served = []
+
+    async def fake_fetch(session, url, timeout):
+        m = re.search(r"/2/14/(\d+)/(\d+)\?access_token=", url)
+        assert m, f"unexpected tile URL: {url}"
+        xy = (int(m.group(1)), int(m.group(2)))
+        served.append(xy)
+        if xy == NORTH_TILE:
+            raise aiohttp.ClientResponseError(
+                request_info=aiohttp.RequestInfo(
+                    url=yarl.URL(url),
+                    method="GET",
+                    headers=CIMultiDictProxy(CIMultiDict()),
+                    real_url=yarl.URL(url),
+                ),
+                history=(),
+                status=404,
+                message="Not Found",
+            )
+        return encode_tile([], *xy)
+
+    _stub_fetch_tile(monkeypatch, fake_fetch)
+    crawl = asyncio.run(
+        dm.fetch_city_images_async(
+            "Bend",
+            bbox,
+            "MLY|grid|token",
+            connection_limit=1,
+            checkpoint_path=str(tmp_path / "cp-grid"),
+            checkpoint_channel="mapillary",
+            census_cache=CensusCache(cache_path, True, run_date),
+        )
+    )
+    assert crawl["failed_tiles"] == [NORTH_TILE]
+    assert os.path.isdir(cache_path), "the crawl must have promoted, or there is nothing to reuse"
+
+    # Anything the walk asks the network for is a bug: the whole point is that
+    # it inherits, so a served tile here means it re-probed rather than reused.
+    served.clear()
+    assert collect.run_collect(_args(data_dir, **{"run-date": run_date})) == 0
+    assert served == [], f"the walk must spend nothing, it asked for {served}"
+
+    conn = db.connect(db.get_default_db_path(data_dir))
+    row = db.get_latest_street_walk(conn, CITY_ID, provider="mapillary")
+    conn.close()
+    assert row["api_requests"] == 0
+    assert row["census_fetched_by"] == "mapillary", "the row still says who paid"
+
+    rows = _statuses(data_dir, run_date=run_date, grid_m=grid_m)
+    assert {s for s, _ in rows} == {"REQUEST_FAILED", "ZERO_RESULTS"}, (
+        "a hole the walk never paid to discover still has to reach its rows"
+    )
+    assert all((s == "REQUEST_FAILED") == (lat > SEAM_LAT) for s, lat in rows)
+
+
+def test_a_wholly_unmeasured_walk_is_rejected_rather_than_cataloged(tmp_path, monkeypatch):
+    """
+    #259's interaction with the systemic-failure guard, pinned deliberately.
+
+    REQUEST_FAILED is in SYSTEMIC_FAILURE_STATUSES and ZERO_RESULTS is not, so
+    this change can only ever push a run's denied fraction UP -- it can newly
+    trip the >=95% guard, never newly clear it. Tripping is the right outcome:
+    a run that measured almost nothing carries no information about the city
+    and must not become the diff baseline for its series. The alternative is
+    what #259 describes -- publishing that same night as a confident "no
+    imagery anywhere", which is silently worse than failing loudly.
+    """
+    data_dir, _ = _setup(
+        tmp_path,
+        monkeypatch,
+        [],
+        failed_tiles=[CITY_TILE, NORTH_TILE],
+        edges=_seam_edges(),
+    )
+
+    assert collect.run_collect(_args(data_dir)) == 1
+    assert not os.path.exists(os.path.join(data_dir, _csv_name()))
+    assert os.path.exists(os.path.join(data_dir, _csv_name() + ".rejected"))
+    conn = db.connect(db.get_default_db_path(data_dir))
+    assert db.get_latest_street_walk(conn, CITY_ID, provider="mapillary") is None
+    conn.close()
 
 
 # --- Cost model -------------------------------------------------------------

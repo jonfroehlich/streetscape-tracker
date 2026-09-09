@@ -525,7 +525,7 @@ def test_a_failed_cell_publishes_request_failed_not_zero_results(tmp_path, monke
     ZERO_RESULTS publishes an absence we never observed -- into an immutable
     dated snapshot that understates the city permanently. The grid run has
     always done this; the walk must too, or the two disagree about the same
-    unswept ground. (Mapillary's walk still has this gap: #259.)
+    unswept ground. Mapillary's walk closed the same gap in #259.
     """
     # A SMALL cell over the north end of the long edge, so the run carries both
     # kinds at once. A whole-city failed cell would be 100% REQUEST_FAILED,
