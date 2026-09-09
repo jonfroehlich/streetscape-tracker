@@ -239,5 +239,7 @@ GSV and Mapillary declare `fallbackViewerUrl: null` and render one link exactly 
 
 **The fallback is keyed on geometry, which makes it cover strictly more rows than the link it backs up.**
 Every linkable row carries `pano_lat`/`pano_lon` — `OK`, `NO_DATE` and `FLAT_ONLY` all populate them, and only `ZERO_RESULTS` is blank, which never gets a link — so a row with a null `sequence_id`, which could never build a photo link at all, now gets one link instead of none.
+That is why `buildFlatOnlyPopupHtml` asks for its links **before** its missing-image-id early return rather than after: an id-less flat row still has a position, and gating the call on the id is the one row shape where the invariant would silently stop holding (pinned by a source-order check).
 `vis.PROVIDER_DISPLAY` carries the same two links in the same order for the folium run map; the two registries are hand-maintained copies, and only the JS one is what a visitor clicks.
+**Every `PROVIDER_DISPLAY` entry spells its own `viewer_label`, with no `View in {label}` default to inherit** — #312 and #316 reached that rule from opposite directions within a week, KartaView's link opening an error page and Panoramax's opening a JPEG rather than a viewer, and a default would have described both as "View in \<provider\>".
 If KartaView repairs `/details`, the change is re-ordering two entries and dropping the caveat from `viewerLabel` — re-run `scripts/kartaview_details_probe.py` first, and confirm in a browser, since the probe measures the call and not the page.

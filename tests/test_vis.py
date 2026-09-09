@@ -201,14 +201,67 @@ def test_the_js_registry_builds_the_same_kartaview_urls():
     www/js/streetscape-utils.js and PROVIDER_DISPLAY are two hand-maintained
     copies of the same two deep-links, and only the JS one is what a visitor
     clicks. Read the JS the way tests/test_build_boundary_review.py already does
-    and pin the parts that must agree: the map form, its z-level, and the two
-    columns it reads. Divergence is otherwise invisible to the fast suite — the
-    Python copy is exercised by tests and the JS copy by nobody.
+    and pin what must agree. Divergence is otherwise invisible to the fast suite
+    — the Python copy is exercised by tests and the JS copy by nobody.
+
+    Compares the URLs the PYTHON builders actually produce against the JS
+    source, rather than grepping the JS for strings it obviously contains: an
+    earlier version of this test asserted only ``",19z" in js`` and would have
+    stayed green through a Python-side z-level change, which is the exact
+    divergence it exists to catch.
     """
     js_path = pathlib.Path(__file__).resolve().parent.parent / "www" / "js" / "streetscape-utils.js"
     js = js_path.read_text(encoding="utf-8")
-    assert "https://kartaview.org/map/@" in js
-    assert ",19z" in js
-    for column in ("pano_lat", "pano_lon"):
+
+    row = pd.Series(
+        {
+            "pano_lat": 8.061405,
+            "pano_lon": 98.917865,
+            "sequence_id": "8313353",
+            "sequence_index": 936,
+        }
+    )
+    map_url = vis.PROVIDER_DISPLAY["kartaview"]["map_url"](row)
+    viewer_url = vis.PROVIDER_DISPLAY["kartaview"]["viewer_url"]("1855176953", row)
+
+    # Every literal the Python builders emit around their row values has to
+    # appear in the JS, z-level included, and the JS has to read the same two
+    # columns for the map link and the same two for the photo link.
+    for literal in ("https://kartaview.org/map/@", ",19z"):
+        assert literal in js, f"JS registry does not build {map_url!r}"
+    for literal in ("https://kartaview.org/details/",):
+        assert literal in js, f"JS registry does not build {viewer_url!r}"
+    assert map_url.startswith("https://kartaview.org/map/@") and map_url.endswith(",19z")
+    assert viewer_url.startswith("https://kartaview.org/details/")
+    for column in ("pano_lat", "pano_lon", "sequence_id", "sequence_index"):
         assert f"row?.{column}" in js
-    assert "https://kartaview.org/details/" in js
+
+    # Both copies reject the same unlinkable rows. The guards drifted once
+    # already: the JS rejected an empty-string sequence_index and the Python
+    # copy fell through to int("") and raised, aborting a whole run's map over
+    # one row that should just have lost a link.
+    for missing in (
+        pd.Series({"sequence_id": "8313353", "sequence_index": ""}),
+        pd.Series({"sequence_id": "", "sequence_index": 936}),
+    ):
+        assert vis.PROVIDER_DISPLAY["kartaview"]["viewer_url"]("1855176953", missing) is None
+    assert 'index === ""' in js
+    assert 'lat === ""' in js and 'lng === ""' in js
+
+
+def test_kartaview_urls_percent_encode_their_row_values():
+    """
+    Both builders percent-encode everything they take from a row, so a value
+    carrying a URL delimiter cannot reshape the link — the same contract
+    ``viewerLinksHtml`` states in JS, where the href is interpolated into
+    popup markup with no further escaping. `sequence_id` is a nullable STRING
+    column, so a hostile or corrupt value is a decode away, not a schema
+    violation.
+    """
+    hostile = pd.Series(
+        {"sequence_id": '1/../x?a=b&c=d"', "sequence_index": 1, "pano_lat": 8.0, "pano_lon": 98.0}
+    )
+    viewer_url = vis.PROVIDER_DISPLAY["kartaview"]["viewer_url"]("p", hostile)
+    assert viewer_url == "https://kartaview.org/details/1%2F..%2Fx%3Fa%3Db%26c%3Dd%22/1"
+    for bad in ("/../", "?", "&", '"'):
+        assert bad not in viewer_url.removeprefix("https://kartaview.org/details/")

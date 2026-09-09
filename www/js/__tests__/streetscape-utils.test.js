@@ -330,6 +330,35 @@ test("a popup puts the link that works first", () => {
 
   // Neither link addressable -> no markup at all, rather than an empty <a>.
   assert.equal(viewerLinksHtml(PROVIDERS.kartaview, "1855176953", {}), "");
+
+  // An image id is not a precondition for the fallback: a row with a position
+  // and no id at all still gets the map link. This is the shape a FLAT_ONLY
+  // popup can be handed, and gating the whole call on the id is what would
+  // quietly make "covers strictly more rows" false.
+  const idless = viewerLinksHtml(PROVIDERS.kartaview, "", {
+    pano_lat: 8.061405,
+    pano_lon: 98.917865,
+  });
+  assert.equal(idless.match(/<a /g).length, 1);
+  assert.match(idless, /kartaview\.org\/map\/@/);
+});
+
+test("a row value cannot break out of the href it is interpolated into", () => {
+  // viewerLinksHtml states, as a contract on the registry, that every builder
+  // percent-encodes what it takes from a row -- because the URL goes into
+  // popup markup with no further escaping. sequence_id is a nullable STRING
+  // column, so a corrupt or hostile value is a decode away, not a schema
+  // violation, and a raw quote would end the attribute and start a new one.
+  const hostile = {
+    sequence_id: '1" onmouseover="alert(1)',
+    sequence_index: 1,
+    pano_lat: 8.0,
+    pano_lon: 98.0,
+  };
+  const html = viewerLinksHtml(PROVIDERS.kartaview, "p", hostile);
+  assert.equal(html.match(/<a /g).length, 2);
+  assert.equal(html.includes('onmouseover="'), false);
+  assert.match(html, /details\/1%22%20onmouseover%3D%22alert\(1\)\/1/);
 });
 
 test("city.js renders provider links only through viewerLinksHtml", () => {
@@ -343,6 +372,17 @@ test("city.js renders provider links only through viewerLinksHtml", () => {
     "city.js builds a viewer link itself; call viewerLinksHtml(provider, panoId, row) instead"
   );
   assert.equal((src.match(/viewerLinksHtml\s*\(/g) || []).length, 2, "both popup builders");
+
+  // The flat-only builder must ask for its links BEFORE the missing-id early
+  // return, not after it. KartaView's fallback keys on position, so a row with
+  // coordinates and no image id is exactly the row the fallback was added for
+  // -- and gating the call on the id put that row back to no link at all,
+  // silently, while every test above still passed.
+  const flatBuilder = src.slice(src.indexOf("function buildFlatOnlyPopupHtml"));
+  assert.ok(
+    flatBuilder.indexOf("viewerLinksHtml(") < flatBuilder.indexOf("if (!panoId)"),
+    "buildFlatOnlyPopupHtml returns before building its links; hoist the call"
+  );
 });
 
 /**

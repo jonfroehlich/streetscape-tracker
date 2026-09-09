@@ -5,6 +5,7 @@
     "generated_by": "scripts/kartaview_details_probe.py --csv https://makeabilitylab.cs.washington.edu/public/streetscape-tracker/data/krabi-town-municipality--mueang-krabi-district--thailand_width_10000_height_10000_step_20_kartaview_2026-08-28.csv.gz --docs-dir docs/experiments",
     "issue": 312,
     "probed_at_utc": "2026-09-03T03:41:06.881319+00:00",
+    "complete": true,
     "authenticated_pacing": true,
     "rate_limit_used_per_hour": 1000,
     "endpoint": "https://api.kartaview.org/details",

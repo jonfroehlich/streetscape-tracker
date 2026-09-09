@@ -5,7 +5,7 @@ Measured 2026-09-02, after a click on a pano dot in `city.html` opened `kartavie
 
 Numbers come from [`kartaview-viewer-deeplink_metrics.json`](kartaview-viewer-deeplink_metrics.json), produced by
 `scripts/kartaview_details_probe.py --csv <the Krabi 2026-08-28 KartaView run> --docs-dir docs/experiments`.
-39 requests to `api.kartaview.org/details` plus a 4-sequence authenticated re-ask and 3 v2 health checks, paced to the documented 1,000/hr authenticated limit; laptop only (`refuse_on_collection_host`).
+46 requests in total — 39 to `api.kartaview.org/details` (the run's 38 sequences plus the control), a 4-sequence authenticated re-ask, and 3 v2 health checks — paced to the documented 1,000/hr authenticated limit; laptop only (`refuse_on_collection_host`).
 There is no distribution to quote — the outcome is the same for every sequence — so what follows is a response matrix and two controls.
 
 ## The link format is right, and that is the part worth writing down
@@ -19,9 +19,11 @@ updatePageUrl = function () { …
                           t.currentPhotoCache.sequenceIndex + "/" + t.sidebarTab)
 ```
 
-So `details/{sequence_id}/{sequence_index}` is their canonical form, not our guess at one, and the pano behind the failing link is real and fully processed:
-`GET /2.0/photo/?sequenceId=8313353&sequenceIndex=936` returns photo `1855176953`, `autoImgProcessingStatus: FINISHED`, with live `cdn.kartaview.org` URLs.
-`POST /1.0/sequence/photo-list/` returns all 1,440 photos of that sequence with index 936 present.
+So `details/{sequence_id}/{sequence_index}` is their canonical form, not our guess at one, and the pano behind the failing link is real and fully processed.
+
+**Read by hand, not by the probe** — the bundle excerpt above and the two calls below were one-off observations while diagnosing, and the committed script reproduces none of them: its v2 controls are hardcoded to the run's most-linked sequence at `sequenceIndex=0`, and it never calls `photo-list` at all.
+`GET /2.0/photo/?sequenceId=8313353&sequenceIndex=936` returned photo `1855176953`, `autoImgProcessingStatus: FINISHED`, with live `cdn.kartaview.org` URLs, and `POST /1.0/sequence/photo-list/` returned all 1,440 photos of that sequence with index 936 present.
+They are the reason the diagnosis went where it did, but the argument does not rest on them: the control sequence below is what rules our data out, and that one IS in the committed metrics.
 
 **The failing link and a wrong link look identical from the outside, which is the trap.**
 Anyone who meets this error and reaches for `viewerUrl` in `www/js/streetscape-utils.js` will be editing code that is already correct.
@@ -53,7 +55,7 @@ Treat a single green sequence as noise; the verdict worth acting on is the contr
 
 ## Decision: a map-view fallback, offered first
 
-The popup now carries two links (`buildViewerLinksHtml` in `www/js/city.js`, mirrored in `vis.PROVIDER_DISPLAY`):
+The popup now carries two links (`viewerLinksHtml` in `www/js/streetscape-utils.js`, called by both popup builders in `city.js` and mirrored in `vis.PROVIDER_DISPLAY`):
 
 1. **`View location on KartaView map`** → `https://kartaview.org/map/@{pano_lat},{pano_lon},19z`
 2. **`Exact photo (KartaView's viewer is often broken)`** → the unchanged `details/{seq}/{idx}` URL
@@ -76,7 +78,8 @@ python scripts/kartaview_details_probe.py \
   --docs-dir docs/experiments
 ```
 
-~40 requests, ~2.5 minutes authenticated (~24 anonymous), no catalog and no collection host.
+`sequences + 8` requests: one per sequence, one for the control sequence, four authenticated re-asks and three v2 checks.
+The committed run was 46, ~2.8 minutes authenticated (~28 anonymous at 100/hr); no catalog and no collection host.
 It measures **the call the page depends on, not the page**: a sequence whose `/details` answers could still fail to render for some other reason, so a clean run is necessary and not sufficient — confirm in a browser before concluding the viewer recovered.
 
 And there is nobody to report this to.

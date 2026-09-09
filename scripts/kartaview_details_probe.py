@@ -38,11 +38,13 @@ WHAT IT CANNOT SEE. The page, only the call it depends on. A sequence whose
 clean run here is necessary and not sufficient -- confirm in a browser before
 concluding the viewer recovered.
 
-COST. One request per sequence, plus one per token-sample re-ask, plus three
-control requests. Paced by kartaview_probe's documented-limit pacer (1,000/hr
-with a token, 100/hr without), so ~40 sequences is ~2.5 minutes authenticated
-and ~24 minutes anonymous. Refuses to run on a makelab* host: this is a probe,
-and both per-IP bans this project has taken landed on a collection host.
+COST. ``sequences + 8``: one request per sequence, one more for the control
+SEQUENCE (it goes through the same /details call, which is the point of it),
+four token-sample re-asks and three v2 checks. Paced by kartaview_probe's
+documented-limit pacer (1,000/hr with a token, 100/hr without), so a 38-sequence
+run is 46 requests -- ~2.8 minutes authenticated, ~28 minutes anonymous.
+Refuses to run on a makelab* host: this is a probe, and both per-IP bans this
+project has taken landed on a collection host.
 """
 
 from __future__ import annotations
@@ -152,8 +154,19 @@ def ask_details(
         row["failure"] = f"non-JSON body ({resp.headers.get('Content-Type', '?')})"
         return row
 
-    status = body.get("status") or {}
+    # Valid JSON that is not an object -- a gateway serving a bare array or
+    # string -- is a fifth way for the viewer to break, and .get() on it would
+    # raise. Raising here would end the run and discard every sequence probed so
+    # far, which is the one outcome this function promises not to produce.
+    if not isinstance(body, dict):
+        row["loads"] = False
+        row["failure"] = f"JSON body is {type(body).__name__}, not an object"
+        return row
+
+    status = body.get("status")
+    status = status if isinstance(status, dict) else {}
     osv = body.get("osv")
+    osv = osv if isinstance(osv, dict) else None
     row["api_code"] = str(status.get("apiCode")) if status.get("apiCode") is not None else None
     row["api_message"] = (status.get("apiMessage") or "").strip() or None
     # Some failures answer outside the v1 envelope entirely (a gateway 500 with
@@ -162,7 +175,8 @@ def ask_details(
     if row["api_message"] is None and body.get("message"):
         row["api_message"] = str(body["message"]).strip()
     row["loads"] = bool(osv and osv.get("photos"))
-    row["photos"] = len((osv or {}).get("photos") or [])
+    photos = (osv or {}).get("photos")
+    row["photos"] = len(photos) if isinstance(photos, (list, dict)) else 0
     return row
 
 
@@ -280,28 +294,45 @@ def main(argv: list[str] | None = None) -> int:
         sequences = sequences[: args.limit]
     logger.info(f"{len(sequences)} distinct sequence(s) from {args.csv}")
 
-    rows = []
-    for i, sequence in enumerate(sequences, start=1):
-        row = ask_details(session, limiter, sequence)
-        row["source"] = "run"
-        rows.append(row)
-        logger.info(f"[{i}/{len(sequences)}] {sequence}: {'loads' if row['loads'] else 'FAILS'}")
+    # Anonymous, this loop is ~28 minutes of paced requests. An interrupt or an
+    # unforeseen exception two thirds of the way in used to discard every row,
+    # which is a whole run of live third-party requests spent for nothing -- so
+    # whatever was collected is written either way, under a name that cannot
+    # overwrite the committed record.
+    rows: list[dict[str, Any]] = []
+    token_rows: list[dict[str, Any]] = []
+    v2: list[dict[str, Any]] = []
+    complete = False
+    try:
+        for i, sequence in enumerate(sequences, start=1):
+            row = ask_details(session, limiter, sequence)
+            row["source"] = "run"
+            rows.append(row)
+            logger.info(
+                f"[{i}/{len(sequences)}] {sequence}: {'loads' if row['loads'] else 'FAILS'}"
+            )
 
-    control = ask_details(session, limiter, args.control_sequence)
-    control["source"] = "kartaview_documented_example"
-    rows.append(control)
-    logger.info(
-        f"control sequence {args.control_sequence}: {'loads' if control['loads'] else 'FAILS'}"
-    )
+        control = ask_details(session, limiter, args.control_sequence)
+        control["source"] = "kartaview_documented_example"
+        rows.append(control)
+        logger.info(
+            f"control sequence {args.control_sequence}: {'loads' if control['loads'] else 'FAILS'}"
+        )
 
-    token_rows = []
-    if token and args.token_sample:
-        for sequence in sequences[: args.token_sample]:
-            t = ask_details(session, limiter, sequence, access_token=token)
-            t["source"] = "run (authenticated)"
-            token_rows.append(t)
+        if token and args.token_sample:
+            for sequence in sequences[: args.token_sample]:
+                t = ask_details(session, limiter, sequence, access_token=token)
+                t["source"] = "run (authenticated)"
+                token_rows.append(t)
 
-    v2 = probe_v2_controls(session, limiter, sequences[0]) if sequences else []
+        v2 = probe_v2_controls(session, limiter, sequences[0]) if sequences else []
+        complete = True
+    except (KeyboardInterrupt, Exception) as e:
+        logger.error(
+            f"probe interrupted after {len(rows)} sequence(s): {type(e).__name__}: {e}; "
+            "writing what was collected"
+        )
+
     summary = summarize(rows, token_rows)
     summary["v2_endpoints_ok"] = sum(1 for c in v2 if c["ok"])
     summary["v2_endpoints_probed"] = len(v2)
@@ -313,7 +344,13 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.docs_dir:
         os.makedirs(args.docs_dir, exist_ok=True)
-        path = os.path.join(args.docs_dir, DOCS_METRICS_NAME)
+        # A partial run never lands on the committed filename: the writeup cites
+        # that file, and a truncated record under the same name would read as a
+        # completed measurement of a smaller sample.
+        name = (
+            DOCS_METRICS_NAME if complete else DOCS_METRICS_NAME.replace(".json", ".partial.json")
+        )
+        path = os.path.join(args.docs_dir, name)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(
                 {
@@ -327,6 +364,7 @@ def main(argv: list[str] | None = None) -> int:
                         ),
                         "issue": 312,
                         "probed_at_utc": datetime.now(UTC).isoformat(),
+                        "complete": complete,
                         "authenticated_pacing": token is not None,
                         "rate_limit_used_per_hour": (
                             REQUESTS_PER_HOUR_AUTH if token else REQUESTS_PER_HOUR_ANON
@@ -353,7 +391,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         logger.info(f"wrote {path}")
 
-    return 0
+    return 0 if complete else 1
 
 
 if __name__ == "__main__":

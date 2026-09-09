@@ -189,7 +189,12 @@ def _kartaview_viewer_url(pano_id, row) -> str | None:
     """
     sequence = row.get("sequence_id")
     index = row.get("sequence_index")
-    if pd.isna(sequence) or pd.isna(index) or sequence == "":
+    # The empty string is rejected on BOTH fields, matching the JS guard. It is
+    # unreachable through config.METADATA_DTYPES (sequence_index is Int64), but
+    # an unguarded index reaches int("") and raises ValueError, which would
+    # abort the whole run's map over one unlinkable row -- the opposite of what
+    # returning None here is for.
+    if pd.isna(sequence) or pd.isna(index) or sequence == "" or index == "":
         return None
     return f"https://kartaview.org/details/{quote(str(sequence), safe='')}/{int(index)}"
 
@@ -212,7 +217,10 @@ def _kartaview_map_url(row) -> str | None:
     lng = row.get("pano_lon")
     if pd.isna(lat) or pd.isna(lng) or lat == "" or lng == "":
         return None
-    return f"https://kartaview.org/map/@{lat},{lng},19z"
+    # Percent-encoded like the JS copy's encodeURIComponent, not because a
+    # Float64 column can carry a delimiter but because the two builders being
+    # spelled differently is how they start meaning different things.
+    return f"https://kartaview.org/map/@{quote(str(lat), safe='')},{quote(str(lng), safe='')},19z"
 
 
 # User-facing labels and pano viewer deep-links per provider (mirrors the
