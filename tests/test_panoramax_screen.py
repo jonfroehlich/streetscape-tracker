@@ -29,6 +29,7 @@ import asyncio
 import gzip
 import json
 import os
+import re
 from datetime import date
 
 import aiohttp
@@ -44,6 +45,7 @@ from streetscape_metadata_tracker.download_common import (
     DownloadError,
     HostBlockedError,
     HostBusyError,
+    grid_bbox,
     lonlat_to_tile_frac,
     tiles_for_bbox,
 )
@@ -731,17 +733,47 @@ def test_a_busy_host_lock_reports_85_and_writes_nothing(data_dir, conn, monkeypa
     assert db.get_latest_provider_screen(conn, "panoramax") == []
 
 
-def test_the_screen_paces_at_the_channels_configured_rate_once_that_block_exists(data_dir):
+def test_the_screen_falls_back_to_the_collectors_pace_while_the_channel_is_unwired(tmp_path):
     """
-    One host, one IP: lowering the collection channel's pace during a block must
-    lower the screen's too, or the config change leaves the hole it was closing.
-    Until `[providers.panoramax]` is wired (PR 3 of #316), the collector's own
-    defaults stand — which is the same 30/min.
+    Driven through the REAL loader, and that is the whole point of the test.
+
+    An earlier version built `SchedulerConfig(providers={"panoramax": ...})` by
+    hand and asserted the block won — green against a state
+    `load_scheduler_config` cannot produce, because `panoramax` is in
+    UNWIRED_CHANNELS and such a block is DROPPED at load so nothing can price,
+    budget or launch a channel the scheduler cannot run. So the documented "one
+    host, one pace" coupling did not exist, and the test could not see that.
+    Same shape as the #323 lesson this PR's own docs quote.
+
+    What is pinned here is therefore today's real behaviour: a TOML asking for
+    5/min does NOT slow the screen. When #316 PR 3 wires the channel this goes
+    red — which is the intended prompt to update it, `_screen_pacing`'s
+    docstring and docs/provider-access.md together, rather than letting the
+    prose drift back out of step with the code.
     """
-    assert scheduler._screen_pacing(_cfg(data_dir), "panoramax") == (
+    toml = tmp_path / "scheduler.toml"
+    toml.write_text(
+        "[schedule]\nmax_cities_per_day = 40\n"
+        "[providers.gsv]\ndaily_request_budget = 100\n"
+        "[providers.panoramax]\nmax_requests_per_minute = 5\njitter = 0.1\n"
+    )
+    cfg = scheduler.load_scheduler_config(str(toml))
+    assert "panoramax" not in (cfg.providers or {}), "the loader drops an unwired block"
+    assert cfg.unwired_channel_errors, "and records why, for run-due to refuse on"
+    assert scheduler._screen_pacing(cfg, "panoramax") == (
         ps.DEFAULT_TILE_REQUESTS_PER_MINUTE,
         ps.DEFAULT_TILE_JITTER,
     )
+
+
+def test_a_WIRED_channels_block_would_pace_the_screen(data_dir):
+    """The other half: `_screen_pacing` itself honours a block that reaches it.
+
+    Kept beside the loader test rather than folded into it, because the two pin
+    different things — that the function reads the block, and that the loader
+    does not currently hand it one. Merging them is how the gap above went
+    unnoticed in the first place.
+    """
     configured = _cfg(
         data_dir,
         providers={"panoramax": scheduler.ProviderConfig(max_requests_per_minute=12, jitter=0.3)},
@@ -874,3 +906,232 @@ def test_an_all_404_pass_charges_the_whole_lattice_it_paid_for(monkeypatch):
     with pytest.raises(DownloadError) as excinfo:
         asyncio.run(ps.screen_targets_async([ps.ScreenTarget("c", "C", "US", (0, 0, 1, 1))]))
     assert excinfo.value.api_requests == 2
+
+
+# ── 8. Review fixes: the antimeridian, and refusing rather than recording ───
+#
+# Everything below came out of the three-reviewer pass on PR #325. Each pins a
+# case where the instrument's failure was to record a CONFIDENT WRONG NUMBER
+# rather than to raise — which is the only failure mode a published time series
+# cannot absorb.
+
+
+def test_a_city_crossing_the_ANTIMERIDIAN_still_selects_its_hexagons():
+    """
+    `grid_bbox` normalises a bbox spanning 180° to `min_lon > max_lon`. Compared
+    naively the overlap test becomes `hex.min_lon <= -179.8 and hex.max_lon >=
+    179.8` — satisfiable only by a hexagon spanning the globe — so nothing is
+    selected and the city is published as conclusively empty while sitting under
+    half a million pictures.
+    """
+    bbox = grid_bbox(-16.5, 179.99, 40_000, 40_000, 20)
+    assert bbox[0] > bbox[2], "this fixture is only meaningful for a crossing bbox"
+    hexagon = {
+        "h": {
+            "min_lon": 179.5,
+            "max_lon": -179.5,
+            "min_lat": -16.8,
+            "max_lat": -16.2,
+            "nb_pictures": 5_000,
+            "nb_360_pictures": 5_000,
+            "nb_flat_pictures": 0,
+        }
+    }
+    tiles = ps.screen_tiles_for_city(bbox)
+    target = ps.ScreenTarget("fj", "Suva", "Fiji", bbox)
+    row = ps.screen_row(target, {tiles[0]: hexagon}, tiles)
+    assert row["cells"] == 1
+    assert row["pictures_upper_bound"] == 5_000
+
+
+def test_the_margin_wraps_across_the_seam_instead_of_clamping_to_the_edge_tile():
+    """
+    `tiles_for_bbox` handles an already-normalised crossing bbox but CLAMPS an
+    out-of-range longitude to the edge column — and growing a city within the
+    margin of 180° produces exactly that (180.09). Clamped, the tile holding the
+    other half of every seam-straddling hexagon is never fetched, which is the
+    one thing the margin exists to prevent.
+    """
+    east = ps.screen_tiles_for_city((179.95, -16.55, 179.99, -16.50))
+    assert any(x == 0 for x, _ in east), "the tile west of the seam must be fetched"
+    assert any(x == 63 for x, _ in east)
+    west = ps.screen_tiles_for_city((-179.99, -16.55, -179.95, -16.50))
+    assert any(x == 63 for x, _ in west), "and the mirror case must fetch the eastern tile"
+
+
+def test_a_hexagon_reassembled_ACROSS_the_seam_keeps_a_real_extent_and_centre():
+    """
+    The two clipped halves of a seam hexagon arrive as [174.4, 180] and
+    [-180, -174.4]. A plain min/max union of those is [-180, 180] — an extent no
+    hexagon has, which would then overlap every city on Earth and report its
+    centre at longitude 0, a quarter of the planet away.
+    """
+    east = {"h": _box(174.4, 180.0, 10.0, 10.5, 100)}
+    west = {"h": _box(-180.0, -174.4, 10.0, 10.5, 100)}
+    merged = ps.merge_hexes(dict(east), west)
+    assert merged["h"]["max_lon"] - merged["h"]["min_lon"] == pytest.approx(11.2), (
+        "the union must stay the width of one hexagon, not the width of the world"
+    )
+    centre = ps.hexes_in_bbox(merged, (179.0, 9.0, -179.0, 11.0))
+    assert [c["id"] for c in centre] == ["h"]
+    # On the seam itself, whichever way it is spelled: ±180 is one meridian, and
+    # both spellings are inside the crossing bbox's two ranges.
+    assert abs(centre[0]["lon"]) == pytest.approx(180.0, abs=1e-6)
+    # ...and it must NOT be selected by a city on the far side of the planet.
+    assert ps.hexes_overlapping_bbox(merged, (-1.0, 9.0, 1.0, 11.0)) == []
+
+
+def _box(min_lon, max_lon, min_lat, max_lat, n):
+    return {
+        "min_lon": min_lon,
+        "max_lon": max_lon,
+        "min_lat": min_lat,
+        "max_lat": max_lat,
+        "nb_pictures": n,
+        "nb_360_pictures": n,
+        "nb_flat_pictures": 0,
+    }
+
+
+def test_a_city_that_maps_to_NO_tiles_is_refused_rather_than_recorded_as_empty():
+    """
+    Beyond Web Mercator's ~85.05° limit `tiles_for_bbox` yields an empty
+    y-range, and `screen_row` would happily return cells 0 / pictures 0 — stored
+    indistinguishably from a measured zero and published as conclusive. Refused
+    for the whole pass, because a screen is a whole-catalog observation.
+    """
+    polar = ps.ScreenTarget("np", "Nord", "Greenland", (10.0, 89.95, 10.1, 89.99))
+    assert ps.screen_tiles_for_city(polar.bbox) == []
+    with pytest.raises(DownloadError, match="ZERO screen tiles"):
+        ps.plan_screen([polar])
+    with pytest.raises(DownloadError, match="Nord"):
+        ps.plan_screen(
+            [ps.ScreenTarget("dm", "Des Moines", "US", (-93.7, 41.5, -93.5, 41.7)), polar]
+        )
+
+
+def test_a_corrupt_tile_body_is_a_DownloadError_carrying_its_spend(monkeypatch):
+    """
+    The protobuf decoder raises `google.protobuf.message.DecodeError`, which is a
+    subclass of neither DownloadError nor aiohttp.ClientError. Uncaught it
+    escapes the caller's two arms as well, so the operator gets a raw protobuf
+    traceback AND every request already sent to a per-IP-metered volunteer host
+    vanishes from the day's ledger.
+    """
+
+    async def corrupt(session, url, timeout, limiter, on_request, on_empty):
+        on_request()
+        return b"\x00\x01\x02garbage"
+
+    monkeypatch.setattr(ps, "_fetch_tile", corrupt)
+    monkeypatch.setattr(ps, "plan_screen", lambda targets: ([(1, 1), (1, 2)], {"c": [(1, 1)]}))
+    with pytest.raises(DownloadError, match="could not be decoded") as excinfo:
+        asyncio.run(ps.screen_targets_async([ps.ScreenTarget("c", "C", "US", (0, 0, 1, 1))]))
+    assert excinfo.value.api_requests == 1, "the request that fetched the bad body was sent"
+
+
+def test_tiles_that_ANSWER_but_decode_to_nothing_are_refused_with_no_history(monkeypatch):
+    """
+    A renamed layer (`grid` -> `grid_v2`) answers 200 with a body, so no tile
+    404s and the moved-endpoint guard is blind to it, while every tile decodes to
+    {}. The catalog-collapse check in the scheduler cannot see it either on a
+    first run, because it needs a city to have screened positive before — and an
+    empty `provider_screen` is every first run, including production's. Without
+    this guard that pass writes 1,144 conclusive zeros and publishes them.
+    """
+    renamed = mapbox_vector_tile.encode(
+        [
+            {
+                "name": "grid_v2",
+                "features": [
+                    {
+                        "geometry": {
+                            "type": "Polygon",
+                            "coordinates": [[(0, 0), (10, 0), (10, 10), (0, 10), (0, 0)]],
+                        },
+                        "properties": {"id": "h1", "nb_pictures": 500_000},
+                    }
+                ],
+            }
+        ]
+    )
+
+    async def answers_with_the_wrong_layer(session, url, timeout, limiter, on_request, on_empty):
+        on_request()
+        return renamed
+
+    monkeypatch.setattr(ps, "_fetch_tile", answers_with_the_wrong_layer)
+    monkeypatch.setattr(ps, "plan_screen", lambda targets: ([(1, 1), (1, 2)], {"c": [(1, 1)]}))
+    target = [ps.ScreenTarget("c", "C", "US", (0, 0, 1, 1))]
+    with pytest.raises(DownloadError, match="NOT ONE") as excinfo:
+        asyncio.run(ps.screen_targets_async(target))
+    assert excinfo.value.api_requests == 2
+
+    # ...and an operator who has checked the endpoint can still record it.
+    out = asyncio.run(ps.screen_targets_async(target, allow_collapse=True))
+    assert out["hexagons"] == 0
+    assert out["rows"][0]["pictures_upper_bound"] == 0
+
+
+def test_one_answering_tile_that_decodes_to_nothing_is_NOT_a_renamed_layer():
+    """The guard is bounded at two answering tiles for the reason the 404 one is:
+    a single genuinely featureless tile proves nothing."""
+    ps._refuse_if_layer_missing([(1, 1)], empty_tiles=0, hexagons=0)
+    # An honestly empty area that 404s is the 404 guard's business, not this one.
+    ps._refuse_if_layer_missing([(1, 1), (1, 2)], empty_tiles=2, hexagons=0)
+    # And tiles that answered WITH hexagons are simply fine.
+    ps._refuse_if_layer_missing([(1, 1), (1, 2)], empty_tiles=0, hexagons=1)
+
+
+def test_the_published_instrument_block_quotes_the_MODULES_endpoint_not_a_literal(conn, data_dir):
+    """
+    The artifact every visitor downloads must not carry a second copy of the
+    endpoint. A literal keeps advertising the OLD url on the day the endpoint
+    moves — i.e. during exactly the incident the two refusal guards exist for.
+    """
+    register(conn, "Des Moines", lat=DES_MOINES[0], lon=DES_MOINES[1])
+    city_id = db.get_all_cities(conn)[0].city_id
+    db.record_provider_screen(
+        conn,
+        provider="panoramax",
+        screen_date=date(2026, 9, 9),
+        rows=[
+            {
+                "city_id": city_id,
+                "cells": 1,
+                "pictures_upper_bound": 1,
+                "pictures_360_upper_bound": 1,
+                "pictures_flat_upper_bound": 0,
+            }
+        ],
+    )
+    instrument = generate_provider_screen_summary(conn, data_dir)["providers"]["panoramax"][
+        "instrument"
+    ]
+    assert instrument["endpoint"] is ps.SCREEN_URL_TEMPLATE
+    assert instrument["layer"] is ps.SCREEN_LAYER
+    assert instrument["zoom"] == ps.SCREEN_ZOOM
+
+
+def test_the_screen_unit_can_be_stopped_without_SIGKILLing_a_publish():
+    """
+    This unit publishes, and systemd's default stop timeout is 90 s — under the
+    publish rsync's own 10-minute bound, so `systemctl stop` mid-publish would
+    leave the docroot half-synced. The collection unit carries the same
+    directive for the same reason.
+    """
+    from pathlib import Path
+
+    from streetscape_metadata_tracker.scheduler import PUBLISH_TIMEOUT_S
+
+    root = Path(__file__).resolve().parent.parent
+    unit = (root / "deploy" / "systemd" / "streetscape-screen-provider.service").read_text()
+    match = re.search(r"^TimeoutStopSec=(\d+)min$", unit, re.MULTILINE)
+    assert match, "the screen unit must set TimeoutStopSec explicitly"
+    stop_s = int(match.group(1)) * 60
+    assert stop_s > PUBLISH_TIMEOUT_S, (
+        f"TimeoutStopSec ({stop_s} s) must exceed PUBLISH_TIMEOUT_S "
+        f"({PUBLISH_TIMEOUT_S} s), or a stop kills the rsync it is waiting for"
+    )
+    start = re.search(r"^TimeoutStartSec=(\d+)m$", unit, re.MULTILINE)
+    assert start and stop_s < int(start.group(1)) * 60, "and stay under TimeoutStartSec"

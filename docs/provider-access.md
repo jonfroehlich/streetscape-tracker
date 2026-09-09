@@ -346,7 +346,9 @@ Two things, both on the same IP and serialized against each other by one machine
 - **Hand-run collections** — a city's z15 tile census, p50 414 tiles for a leader city, max 3,132.
 - **The weekly screen** ([#316](https://github.com/jonfroehlich/streetscape-tracker/issues/316) phase 2) — **113 requests, once a week**, answering all 1,144 enabled cities off the v2 `grid` layer at z6.
   That is the entire standing load, and it is small enough that the interesting number is not its volume but its regularity: it fires on a fixed weekday at a fixed hour, so it is the one traffic shape here that a scorer could learn.
-  It is paced and jittered identically to a collection, from the same constants, and if a `[providers.panoramax]` block ever lowers the channel's rate the screen follows it down — one host cannot have two paces.
+  It is paced and jittered identically to a collection, from the same constants.
+  **What it does NOT yet do is follow a config change**: `panoramax` is still an unwired channel, so `load_scheduler_config` drops a `[providers.panoramax]` block before `_screen_pacing` could read it, and lowering the rate in the TOML leaves next Monday's screen at 30/min.
+  During a block the lever that works is stopping the timer (`systemctl --user stop streetscape-screen-provider.timer`); wiring the channel (#316 PR 3) makes the coupling real, and a test goes red at that moment so this paragraph is updated with it.
 
 Its requests land in the same `(date, provider)` ledger row a collection writes, so a budget gate reading `api_usage` sees the real total rather than the collection's share of it.
 

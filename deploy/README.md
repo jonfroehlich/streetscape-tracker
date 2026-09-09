@@ -771,7 +771,8 @@ systemctl --user start streetscape-screen-provider.service   # run once now
 - Price a pass without spending anything: `scheduler screen-provider panoramax --dry-run`.
 - A city crossing zero → non-zero is an **enrolment candidate**, answerable any afternoon: `scheduler screen-provider panoramax --measure --limit 5` measures the richest screened cities exactly, prints, and writes nothing.
 - It publishes `data/provider_screen.json.gz` itself. The nightly batch deliberately does **not** rebuild that file — nothing else changes its inputs — so a stale one means this timer stopped, not that the batch did.
-- **Two refusals are by design, and both exit nonzero without writing.** Every tile answering 404 is a moved endpoint (an empty area answers 200 with no layer). And a pass finding imagery in *no* city, in a catalog where cities have screened positive before, is a renamed layer rather than a platform that deleted its imagery; `--allow-collapse` records it anyway, once you have checked the endpoint by hand.
+- **Three refusals are by design, and each exits nonzero without writing.** Every tile answering 404 is a moved endpoint (an empty area answers 200 with no layer). Tiles answering *with a body* that yields no hexagons at all is a renamed layer — the check that protects the very first run, when there is no history to compare against. A pass where every city reads zero although hexagons decoded is a renamed counter, and that one does need history. `--allow-collapse` records a collapse anyway, once you have checked the endpoint by hand.
+- **Lowering `max_requests_per_minute` in the TOML does not slow this screen** while `panoramax` is an unwired channel — the loader drops that block. If Panoramax refuses us, stop the timer: `systemctl --user stop streetscape-screen-provider.timer`.
 
 ### Turning the KartaView channel on in production (#248)
 

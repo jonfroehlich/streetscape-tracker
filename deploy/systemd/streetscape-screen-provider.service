@@ -48,6 +48,13 @@ ExecStart=%h/streetscape-tracker/.venv-makelab2/bin/python -m streetscape_metada
 # still bounded, so a screen that hangs on a stalled socket cannot sit until the
 # night's batch wants the same host lock.
 TimeoutStartSec=45m
+# `systemctl stop` during the publish must not be a SIGKILL. systemd's default
+# is 90 seconds, which cannot cover the rsync — bounded at PUBLISH_TIMEOUT_S
+# (10 min) — so stopping this unit mid-publish would leave the docroot
+# half-synced. The collection unit carries the same directive for the same
+# reason, sized to its much larger tail; here the only thing to wait for is one
+# rsync, so 15 min is comfortably above it and still well under TimeoutStartSec.
+TimeoutStopSec=15min
 
 # Same rationale as the collection unit: this account cannot read the journal.
 StandardOutput=append:/projects/makeabilitylab/streetscape-tracker/logs/streetscape_service_console.log

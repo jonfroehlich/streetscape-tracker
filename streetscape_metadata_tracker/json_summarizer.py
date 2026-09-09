@@ -11,7 +11,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from . import db, driving_plan, plan_match
+from . import db, driving_plan, panoramax_screen, plan_match
 from .analysis import (
     PRESENT_STATUSES,
     calculate_coverage_stats,
@@ -46,7 +46,9 @@ def _write_json_gz_atomic(path: str, payload: Any, *, create_parent: bool = Fals
     concurrent reader (including the publish rsync, whose glob skips the
     ``.tmp`` name) never sees a truncated file.
 
-    ``create_parent`` is opt-in, and only the driving-plan summary passes it.
+    ``create_parent`` is opt-in, and two callers pass it: the driving-plan
+    summary and the provider screen, both of which can legitimately run on a
+    host where no collection has happened yet.
     Every other caller runs after a collection has already populated
     ``data_dir``, so a missing directory there means a misconfigured path — a
     mistyped ``--download-dir``, an unmounted volume — and raising
@@ -1499,9 +1501,13 @@ def generate_driving_plan_summary(conn, data_dir: str) -> dict[str, Any]:
 # page's prose — the page is one consumer of this file, not the only one.
 _SCREEN_INSTRUMENTS: dict[str, dict[str, Any]] = {
     "panoramax": {
-        "endpoint": "https://api.panoramax.xyz/api/map/2/{z}/{x}/{y}.mvt",
-        "layer": "grid",
-        "zoom": 6,
+        # Read from the screen module, never spelled again here. A literal would
+        # keep advertising the OLD endpoint on the day the endpoint moves —
+        # i.e. during precisely the incident the screen's two refusal guards
+        # exist to catch — and this file is what every visitor downloads.
+        "endpoint": panoramax_screen.SCREEN_URL_TEMPLATE,
+        "layer": panoramax_screen.SCREEN_LAYER,
+        "zoom": panoramax_screen.SCREEN_ZOOM,
         "cell": "H3 resolution 6 (~36 km²)",
         "selection": "hexagons overlapping the city's frozen grid bbox",
         "attribution": "© Panoramax contributors",

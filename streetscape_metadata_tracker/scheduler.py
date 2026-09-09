@@ -3010,12 +3010,25 @@ def _screen_pacing(cfg: SchedulerConfig, provider: str) -> tuple[int, float]:
     """The rate and jitter a screen pass runs at, as (per_minute, jitter).
 
     Read from the provider's own ``[providers.NAME]`` block when it has one, so
-    that lowering the collection channel's pace during a block lowers the
-    screen's too — they are one host and one IP, and a screen still metronoming
-    at the old rate would be the exact hole the config change was closing. Until
-    that block exists (the channel is still in UNWIRED_CHANNELS, and such a
-    block is dropped at load), this falls back to the collector's own defaults,
-    which is the same 30/min with the same #292 jitter.
+    that lowering the collection channel's pace lowers the screen's too — they
+    are one host and one IP.
+
+    **WHILE THE CHANNEL IS UNWIRED THAT COUPLING DOES NOT EXIST, AND THAT IS
+    WORTH KNOWING BEFORE YOU NEED IT.** ``panoramax`` is in UNWIRED_CHANNELS, and
+    ``load_scheduler_config`` DROPS such a block from ``cfg.providers`` on
+    purpose — so nothing can price, budget or launch a channel the scheduler
+    cannot run. The block therefore never reaches this function, and the screen
+    paces at the collector's constants (the same 30/min, the same #292 jitter)
+    whatever the TOML says. Verified against the real loader by
+    ``test_the_screen_falls_back_to_the_collectors_pace_while_the_channel_is_unwired``.
+
+    The operational consequence, stated because it is the wrong thing to
+    discover during an incident: **lowering the rate in the TOML does not slow
+    next Monday's screen while the channel is unwired.** The lever that works is
+    stopping the timer — ``systemctl --user stop streetscape-screen-provider.timer``.
+    Wiring the channel (#316 PR 3) makes the block visible here and the coupling
+    real; the test above goes red at that moment, which is the intended prompt
+    to update it and this paragraph together.
     """
     rate = panoramax_screen.DEFAULT_TILE_REQUESTS_PER_MINUTE
     jitter = panoramax_screen.DEFAULT_TILE_JITTER
@@ -3112,7 +3125,10 @@ def cmd_screen_provider(
     today = date.today()
     try:
         result = panoramax_screen.screen_targets(
-            targets, max_requests_per_minute=rate, jitter=jitter
+            targets,
+            max_requests_per_minute=rate,
+            jitter=jitter,
+            allow_collapse=allow_collapse,
         )
     except HostUnavailableError as e:
         # 84/85, the same codes a collection reports, so the weekly unit's
@@ -3134,13 +3150,17 @@ def cmd_screen_provider(
     rows = result["rows"]
     positive = [row for row in rows if row["pictures_upper_bound"] > 0]
     if not positive and not allow_collapse:
-        # A catalog that has previously screened positive and now screens empty
-        # everywhere is far more likely to be a changed endpoint or a layer
-        # renamed under us than a platform that deleted its imagery. The all-404
-        # case is already refused inside the screen; this catches the quieter
-        # one, a 200 whose `grid` layer is absent or renamed, where every tile
-        # decodes to nothing and every city would be written a zero it was never
-        # measured at. Refused BEFORE the write, because the damage is the write.
+        # THE THIRD AND LAST COLLAPSE CHECK, and the only one that can see a
+        # renamed COUNTER. Two structural guards already ran inside the screen
+        # and neither needs any history: every tile answering 404 is a moved
+        # endpoint, and tiles answering with a body from which not one hexagon
+        # decodes is a renamed LAYER. What neither can see is a schema change
+        # that keeps the layer and the features while renaming or re-typing the
+        # counts (`nb_pictures` -> `count`): the hexagons decode, so the layer
+        # guard passes, and every counter reads 0. That is what this catches —
+        # and it is the one check that requires history, which is exactly why it
+        # cannot be the only one (an empty `provider_screen` is every first run).
+        # Refused BEFORE the write, because the damage is the write.
         known = db.provider_screen_positive_count(conn, provider)
         if known:
             logger.error(

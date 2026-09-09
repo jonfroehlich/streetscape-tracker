@@ -180,6 +180,48 @@ def _tile_point_to_lonlat(px: float, py: float, tile_x: int, tile_y: int, zoom: 
     return tile_frac_to_lonlat(fx, fy, zoom)
 
 
+def _wrap_lon(lon: float) -> float:
+    """A longitude folded back into [-180, 180]."""
+    return ((lon + 180.0) % 360.0) - 180.0
+
+
+def lon_ranges(min_lon: float, max_lon: float) -> list[tuple[float, float]]:
+    """
+    A longitude interval as one or two ranges that both lie inside [-180, 180].
+
+    THE ANTIMERIDIAN IS THE ONE PLACE THIS INSTRUMENT CAN PRODUCE A CONFIDENT
+    WRONG ANSWER, so every longitude comparison in this module goes through
+    here. Two shapes arrive and both are ordinary:
+
+    * an already-normalised CROSSING bbox, which `grid_bbox` produces for a city
+      near 180 (``min_lon`` 179.80, ``max_lon`` -179.82). Compared naively, the
+      test ``hex.min_lon <= max_lon and hex.max_lon >= min_lon`` becomes
+      ``<= -179.82 and >= 179.80``, satisfiable only by a hexagon spanning the
+      globe -- so NOTHING is ever selected and the city records a zero that the
+      published series calls conclusive.
+    * an OUT-OF-RANGE interval, which :func:`grow_bbox` produces by construction
+      whenever it adds its margin to a city within 0.1 degrees of the seam, and
+      which the shared `tiles_for_bbox` CLAMPS to the edge column rather than
+      wrapping -- so the tile on the other side of the seam is never fetched and
+      the margin is imaginary at exactly the seam it exists for.
+
+    Both become the same thing here: one range, or two that meet at the seam.
+    """
+    if max_lon - min_lon >= 360.0:
+        return [(-180.0, 180.0)]
+    lo, hi = _wrap_lon(min_lon), _wrap_lon(max_lon)
+    # A hexagon merged across the seam is stored in the continuous frame
+    # `merge_hexes` keeps it in (e.g. 174.4 -> 185.6), so `hi` wraps below `lo`
+    # and the interval is genuinely two pieces. An exact 180 wraps to -180,
+    # which would turn a range ENDING at the seam into a crossing one, so it is
+    # put back.
+    if hi == -180.0 and lo > 0:
+        hi = 180.0
+    if lo <= hi:
+        return [(lo, hi)]
+    return [(lo, 180.0), (-180.0, hi)]
+
+
 def _rings(geometry: dict[str, Any]) -> list[list[tuple[float, float]]]:
     """Coordinate rings of a Polygon or MultiPolygon, ignoring anything else."""
     kind = geometry.get("type")
@@ -275,8 +317,22 @@ def merge_hexes(
             continue
         for counter in ("nb_pictures", "nb_360_pictures", "nb_flat_pictures"):
             seen[counter] = max(seen[counter], hexagon[counter])
-        seen["min_lon"] = min(seen["min_lon"], hexagon["min_lon"])
-        seen["max_lon"] = max(seen["max_lon"], hexagon["max_lon"])
+        # A hexagon split by the ANTIMERIDIAN arrives as two pieces on opposite
+        # sides of the number line -- [174.4, 180] from tile x=63 and
+        # [-180, -174.4] from tile x=0 -- and a plain min/max union of those is
+        # [-180, 180], an extent no real hexagon has and one that then overlaps
+        # every city on Earth while reporting its centre at longitude 0. So the
+        # incoming piece is shifted into the accumulated piece's frame first,
+        # giving the honest [174.4, 185.6]; `lon_ranges` folds that back for
+        # every comparison. A gap over 180 degrees is the test because no
+        # hexagon at any zoom this module reads is remotely that wide.
+        piece_min, piece_max = hexagon["min_lon"], hexagon["max_lon"]
+        if piece_min - seen["max_lon"] > 180.0:
+            piece_min, piece_max = piece_min - 360.0, piece_max - 360.0
+        elif seen["min_lon"] - piece_max > 180.0:
+            piece_min, piece_max = piece_min + 360.0, piece_max + 360.0
+        seen["min_lon"] = min(seen["min_lon"], piece_min)
+        seen["max_lon"] = max(seen["max_lon"], piece_max)
         seen["min_lat"] = min(seen["min_lat"], hexagon["min_lat"])
         seen["max_lat"] = max(seen["max_lat"], hexagon["max_lat"])
     return accumulated
@@ -294,12 +350,15 @@ def hexes_in_bbox(
     not worth removing. Sorted so the raw artifact is stable across runs.
     """
     min_lon, min_lat, max_lon, max_lat = bbox
+    ranges = lon_ranges(min_lon, max_lon)
     inside = []
     for hex_id in sorted(accumulated):
         hexagon = accumulated[hex_id]
-        lon = (hexagon["min_lon"] + hexagon["max_lon"]) / 2.0
+        # Wrapped, because `merge_hexes` keeps a seam hexagon in a continuous
+        # frame where the midpoint of [174.4, 185.6] is 180.0, not 0.
+        lon = _wrap_lon((hexagon["min_lon"] + hexagon["max_lon"]) / 2.0)
         lat = (hexagon["min_lat"] + hexagon["max_lat"]) / 2.0
-        if min_lon <= lon <= max_lon and min_lat <= lat <= max_lat:
+        if min_lat <= lat <= max_lat and any(lo <= lon <= hi for lo, hi in ranges):
             inside.append({"id": hex_id, "lon": lon, "lat": lat, **hexagon})
     return inside
 
@@ -318,14 +377,19 @@ def hexes_overlapping_bbox(
     keeps the screen an upper bound.
     """
     min_lon, min_lat, max_lon, max_lat = bbox
+    city_ranges = lon_ranges(min_lon, max_lon)
     out = []
     for hex_id in sorted(accumulated):
         hexagon = accumulated[hex_id]
-        if (
-            hexagon["min_lon"] <= max_lon
-            and hexagon["max_lon"] >= min_lon
-            and hexagon["min_lat"] <= max_lat
-            and hexagon["max_lat"] >= min_lat
+        if not (hexagon["min_lat"] <= max_lat and hexagon["max_lat"] >= min_lat):
+            continue
+        # Both sides are folded into [-180, 180] first: either can cross the
+        # seam -- the city because `grid_bbox` normalises a crossing bbox to
+        # min_lon > max_lon, the hexagon because `merge_hexes` reassembled it
+        # from two tiles. Compared unfolded, a crossing city selects NOTHING.
+        hex_ranges = lon_ranges(hexagon["min_lon"], hexagon["max_lon"])
+        if any(
+            h_lo <= c_hi and h_hi >= c_lo for h_lo, h_hi in hex_ranges for c_lo, c_hi in city_ranges
         ):
             out.append({"id": hex_id, **hexagon})
     return out
@@ -337,9 +401,15 @@ def grow_bbox(
     """
     A bbox grown by the screen's safety margin, for enumerating z6 tiles.
 
-    The cells a city may count and the tiles fetched for it must be chosen from
-    the SAME rectangle, or the margin is real in one place and imaginary in the
-    other -- see :data:`SCREEN_MARGIN_DEG` for what the margin buys.
+    THE MARGIN WIDENS WHAT IS FETCHED, NEVER WHAT IS COUNTED. That distinction
+    is the whole of it, and the v1 lattice this was inherited from worked the
+    other way (there the margin was also a selection tolerance, because a
+    lattice anchor's convention was unmeasured). Here, tiles come from the grown
+    rectangle so a hexagon straddling a seam can be reassembled from both of its
+    clipped halves, while :func:`hexes_overlapping_bbox` then selects against
+    the city's OWN bbox by geometric overlap. Widening the selection too would
+    count imagery from up to 0.1 degrees outside the city -- see
+    :data:`SCREEN_MARGIN_DEG` for what the margin actually buys.
 
     Deliberately unclamped in longitude: `tiles_for_bbox` already handles the
     antimeridian wrap, and clamping here would reintroduce the gap at 180.
@@ -354,8 +424,22 @@ def grow_bbox(
 
 
 def screen_tiles_for_city(bbox: tuple[float, float, float, float]) -> list[tuple[int, int]]:
-    """The z6 tiles one city's screen reads, from its GROWN bbox."""
-    return common_tiles_for_bbox(*grow_bbox(tuple(bbox)), SCREEN_ZOOM)
+    """
+    The z6 tiles one city's screen reads, from its GROWN bbox.
+
+    The grown bbox is split on the antimeridian before it reaches
+    `tiles_for_bbox`, which handles an already-normalised crossing bbox but
+    CLAMPS an out-of-range longitude to the edge column. Growing a city that
+    sits within the margin of the seam produces exactly such a longitude
+    (180.09), so without the split the tile on the far side is never fetched --
+    and that tile is where the other half of every seam-straddling hexagon
+    lives, which is the whole reason the margin exists.
+    """
+    min_lon, min_lat, max_lon, max_lat = grow_bbox(tuple(bbox))
+    tiles: set[tuple[int, int]] = set()
+    for lo, hi in lon_ranges(min_lon, max_lon):
+        tiles.update(common_tiles_for_bbox(lo, min_lat, hi, max_lat, SCREEN_ZOOM))
+    return sorted(tiles)
 
 
 def plan_screen(
@@ -370,10 +454,31 @@ def plan_screen(
     """
     wanted: set[tuple[int, int]] = set()
     per_city: dict[str, list[tuple[int, int]]] = {}
+    unmappable = []
     for target in targets:
         tiles = screen_tiles_for_city(target.bbox)
+        if not tiles:
+            unmappable.append(target)
+            continue
         per_city[target.city_id] = tiles
         wanted.update(tiles)
+    if unmappable:
+        # A city whose bbox maps to NO tile cannot be screened, and the failure
+        # is silent rather than loud: `screen_row` would return cells 0 and
+        # pictures 0, which `record_provider_screen` stores indistinguishably
+        # from a measured zero and the series then calls conclusive. The real
+        # case is a city beyond Web Mercator's ~85.05 degree limit, where
+        # `tiles_for_bbox` yields an empty y-range. Refused for the whole pass,
+        # not skipped per city, because a screen is a whole-catalog observation
+        # and a silently missing city is the shape of bug this instrument
+        # cannot afford.
+        names = ", ".join(f"{t.display_name} ({t.city_id})" for t in unmappable[:5])
+        raise DownloadError(
+            f"{len(unmappable)} city(ies) resolve to ZERO screen tiles and cannot be "
+            f"screened: {names}{' ...' if len(unmappable) > 5 else ''}. A bbox beyond "
+            f"Web Mercator's ~85.05 degree limit maps to no tile, and recording that as "
+            f"a zero would publish an unmeasured city as conclusively empty."
+        )
     return sorted(wanted), per_city
 
 
@@ -479,7 +584,24 @@ async def _fetch_screen_tiles(
                     )
                     error.api_requests = requests_spent
                     raise error from exc
-                by_tile[(x, y)] = hexes_from_tile(tile_bytes, x, y, zoom)
+                try:
+                    by_tile[(x, y)] = hexes_from_tile(tile_bytes, x, y, zoom)
+                except Exception as exc:
+                    # A 200 carrying a truncated or corrupt body: the protobuf
+                    # decoder raises `google.protobuf.message.DecodeError`, which
+                    # is a subclass of NEITHER DownloadError nor
+                    # aiohttp.ClientError. Left to escape, it bypasses the
+                    # stamping arm above AND both arms in the caller, so the
+                    # operator gets a raw protobuf traceback and -- the part that
+                    # matters -- every request already sent to a per-IP-metered
+                    # volunteer host vanishes from the day's ledger.
+                    error = DownloadError(
+                        f"Panoramax screen tile z{zoom}/{x}/{y} answered but could not be "
+                        f"decoded: {redact_credentials(exc)}. Refusing to write a screen "
+                        f"with an unreadable tile."
+                    )
+                    error.api_requests = requests_spent
+                    raise error from exc
                 progress_bar.update(1)
     finally:
         progress_bar.close()
@@ -514,12 +636,54 @@ def _refuse_if_endpoint_moved(
         raise error
 
 
+def _refuse_if_layer_missing(
+    tiles: list[tuple[int, int]], empty_tiles: int, hexagons: int, *, api_requests: int = 0
+) -> None:
+    """Refuse a pass in which tiles ANSWERED but not one hexagon decoded.
+
+    The quiet twin of the moved-endpoint guard, and the one that protects a
+    catalog with no history. If the layer is renamed (`grid` -> `grid_v2`) or
+    served under a changed schema, every tile comes back 200 with a body, so no
+    404 is seen -- and `hexes_from_tile` returns {} for all of them. Every city
+    then screens zero, the pass exits 0, and 1,144 rows are recorded as
+    conclusively empty and published; those zeros become the baseline, so
+    `first_positive_date` for every city would date from whenever somebody
+    noticed, permanently mis-dating the arrival signal this instrument exists to
+    produce.
+
+    "Tiles answered and NOTHING decoded" is a structural signal that needs no
+    history, which is what makes it the right guard for a first run -- unlike
+    the catalog-collapse check in the scheduler, which can only fire once a city
+    has screened positive at least once. The two are complementary and both are
+    needed: a renamed LAYER produces zero hexagons and is caught here; a renamed
+    COUNTER property produces hexagons whose counts are all zero, decodes fine,
+    and is caught there.
+
+    Bounded at two answering tiles for the same reason the 404 guard is: over
+    the real catalog 113 tiles decode ~thousands of hexagons, and a single
+    genuinely empty tile proves nothing.
+    """
+    answered = len(tiles) - empty_tiles
+    if answered >= 2 and hexagons == 0:
+        error = DownloadError(
+            f"{answered} Panoramax screen tiles answered with a body and NOT ONE "
+            f"hexagon decoded from any of them. That is what a renamed or restructured "
+            f"'{SCREEN_LAYER}' layer looks like, not what an empty catalog looks like "
+            f"(an empty area still answers 200 and simply carries no features) — "
+            f"refusing to record every city as conclusively empty. Check the layer "
+            f"served by {SCREEN_URL_TEMPLATE} before re-running."
+        )
+        error.api_requests = api_requests
+        raise error
+
+
 async def screen_targets_async(
     targets: list[ScreenTarget],
     *,
     max_requests_per_minute: int = DEFAULT_TILE_REQUESTS_PER_MINUTE,
     jitter: float = DEFAULT_TILE_JITTER,
     request_timeout: float = SCREEN_REQUEST_TIMEOUT_S,
+    allow_collapse: bool = False,
 ) -> dict[str, Any]:
     """
     One whole-catalog screen pass, serialized against every other Panoramax
@@ -527,12 +691,19 @@ async def screen_targets_async(
 
     Returns a dict with ``rows`` (one per target, in the order given),
     ``tiles``, ``api_requests`` (ATTEMPTS, not planned tiles — a retried 5xx
-    sends traffic the plan did not price) and ``empty_tiles``.
+    sends traffic the plan did not price), ``empty_tiles`` and ``hexagons``
+    (how many distinct hexagons decoded in total, the structural evidence the
+    layer is still the layer we think it is).
+
+    ``allow_collapse`` skips only :func:`_refuse_if_layer_missing`, for an
+    operator who has checked the endpoint by hand and means to record a real
+    collapse. It does not skip the 404 guard, which has no honest reading.
 
     Raises:
         HostBlockedError: the host refused this IP, or the endpoint moved.
-        DownloadError: a tile could not be read after retries, or every tile
-            answered 404.
+        DownloadError: a tile could not be read or decoded, every tile answered
+            404, no hexagon decoded from any answering tile, or some city
+            resolves to zero tiles.
         HostBusyError: another local process holds the Panoramax lock.
     """
     tiles, per_city = plan_screen(targets)
@@ -550,12 +721,16 @@ async def screen_targets_async(
             label=f"Screening Panoramax z{SCREEN_ZOOM} tiles",
         )
     _refuse_if_endpoint_moved(tiles, empty_tiles, api_requests=api_requests)
+    hexagons = sum(len(h) for h in by_tile.values())
+    if not allow_collapse:
+        _refuse_if_layer_missing(tiles, empty_tiles, hexagons, api_requests=api_requests)
     rows = [screen_row(target, by_tile, per_city[target.city_id]) for target in targets]
     return {
         "rows": rows,
         "tiles": len(tiles),
         "api_requests": api_requests,
         "empty_tiles": empty_tiles,
+        "hexagons": hexagons,
     }
 
 
@@ -599,6 +774,9 @@ async def measure_targets_async(
             label=f"Measuring Panoramax z{MEASURE_ZOOM} tiles",
         )
     _refuse_if_endpoint_moved(tile_list, empty_tiles, api_requests=api_requests)
+    _refuse_if_layer_missing(
+        tile_list, empty_tiles, sum(len(h) for h in by_tile.values()), api_requests=api_requests
+    )
 
     rows = []
     for target in targets:
