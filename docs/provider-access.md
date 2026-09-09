@@ -340,6 +340,18 @@ What sustained rate the meta-catalog is comfortable with; and whether a picture'
 There is active work on inter-instance migration, and if an id can change under a move then "removed" in a run-to-run diff can mean "moved" — which would corrupt the one statistic this project exists to produce.
 Until that is answered it is a **known caveat on every Panoramax diff**, not a settled question, and it is recorded here rather than assumed away.
 
+**What we actually send this host, as of the growth screen (2026-09-09).**
+Two things, both on the same IP and serialized against each other by one machine-wide `host_lock(HOST_PANORAMAX)`:
+
+- **Hand-run collections** — a city's z15 tile census, p50 414 tiles for a leader city, max 3,132.
+- **The weekly screen** ([#316](https://github.com/jonfroehlich/streetscape-tracker/issues/316) phase 2) — **113 requests, once a week**, answering all 1,144 enabled cities off the v2 `grid` layer at z6.
+  That is the entire standing load, and it is small enough that the interesting number is not its volume but its regularity: it fires on a fixed weekday at a fixed hour, so it is the one traffic shape here that a scorer could learn.
+  It is paced and jittered identically to a collection, from the same constants.
+  **What it does NOT yet do is follow a config change**: `panoramax` is still an unwired channel, so `load_scheduler_config` drops a `[providers.panoramax]` block before `_screen_pacing` could read it, and lowering the rate in the TOML leaves next Monday's screen at 30/min.
+  During a block the lever that works is stopping the timer (`systemctl --user stop streetscape-screen-provider.timer`); wiring the channel (#316 PR 3) makes the coupling real, and a test goes red at that moment so this paragraph is updated with it.
+
+Its requests land in the same `(date, provider)` ledger row a collection writes, so a budget gate reading `api_usage` sees the real total rather than the collection's share of it.
+
 **What the phase-1 study paced at, and why.** 30 requests/minute with jittered gaps at CV 0.6 — the same shifted-exponential shape [#292](https://github.com/jonfroehlich/streetscape-tracker/issues/292) put on the Mapillary channels, imported from `download_common.spaced_gap_seconds` rather than re-derived, so the two cannot drift into different distributions.
 That is roughly half the Mapillary channels' configured rate against a host with strictly less published guidance, which is the intended direction of the asymmetry.
 The probe calls `refuse_on_collection_host()`, so it can only run from a laptop: a per-IP limit found from makelab2 takes out the nightly batch, and both prior bans landed exactly that way.

@@ -138,7 +138,7 @@ def test_the_same_cell_from_two_tiles_is_one_cell():
 def test_an_empty_tile_is_an_answer_not_an_error():
     """No imagery anywhere in 5.6 degrees of longitude decodes to no layer."""
     assert pf.screen_cells_from_tile(mapbox_vector_tile.encode([]), 0, 0) == []
-    assert pf.hexes_from_tile(mapbox_vector_tile.encode([]), 0, 0) == {}
+    assert pf.hexes_from_tile(mapbox_vector_tile.encode([]), 0, 0, pf.MEASURE_ZOOM) == {}
     assert pf.pictures_from_tile(mapbox_vector_tile.encode([]), 0, 0) == []
 
 
@@ -696,7 +696,7 @@ def test_a_404_is_an_empty_tile_and_is_counted_rather_than_raised():
 
 def test_empty_bytes_decode_to_nothing_here_rather_than_crashing():
     assert pf.screen_cells_from_tile(b"", 0, 0) == []
-    assert pf.hexes_from_tile(b"", 0, 0) == {}
+    assert pf.hexes_from_tile(b"", 0, 0, pf.MEASURE_ZOOM) == {}
     assert pf.pictures_from_tile(b"", 0, 0) == []
 
 

@@ -105,7 +105,6 @@ from streetscape_metadata_tracker.download_common import (  # noqa: E402
     grid_bbox,
     lonlat_to_tile_frac,
     spaced_gap_seconds,
-    tile_frac_to_lonlat,
     tiles_for_bbox,
 )
 
@@ -114,11 +113,31 @@ from streetscape_metadata_tracker.download_common import (  # noqa: E402
 # this script import `spaced_gap_seconds` rather than rewriting the gap formula:
 # a decoder rewritten beside its caller is how the study and the collector come
 # to disagree about what a picture is, and this study's whole job is to describe
-# what the collector will see. The hex/lattice decoders below stay here, since
-# the collector does not read the `grid` layer at all.
+# what the collector will see. The v1 LATTICE decoders below stay here: they
+# exist only to keep this study's v1-vs-v2 comparison reproducible, and nothing
+# in production reads that layer.
 from streetscape_metadata_tracker.download_panoramax import (  # noqa: E402
     TYPE_360,
     pictures_from_tile,
+)
+
+# The v2 `grid` decoders this study invented now live in the STANDING SCREEN
+# (issue #316 phase 2), which reads the same layer at the same zoom every week,
+# and are imported back here for the same reason: one decoder, two callers. They
+# stay re-exported under this module's names, so `pf.hexes_from_tile` and
+# `pf.grow_bbox` keep meaning what the study's tests say they mean.
+from streetscape_metadata_tracker.panoramax_screen import (  # noqa: E402
+    MEASURE_ZOOM,
+    SCREEN_ZOOM,
+    _tile_point_to_lonlat,
+    grow_bbox,
+    hexes_from_tile,
+    hexes_in_bbox,
+    hexes_overlapping_bbox,
+    merge_hexes,
+)
+from streetscape_metadata_tracker.panoramax_screen import (  # noqa: E402
+    SCREEN_URL_TEMPLATE as MAP_V2_URL,
 )
 
 logger = logging.getLogger("panoramax_feasibility")
@@ -132,7 +151,6 @@ ISSUE = "https://github.com/jonfroehlich/streetscape-tracker/issues/316"
 
 API_BASE = "https://api.panoramax.xyz/api"
 MAP_V1_URL = API_BASE + "/map/{z}/{x}/{y}.mvt"
-MAP_V2_URL = API_BASE + "/map/2/{z}/{x}/{y}.mvt"
 SEARCH_URL = API_BASE + "/search"
 INSTANCES_URL = API_BASE + "/instances"
 STATS_URL = API_BASE + "/stats"
@@ -140,16 +158,18 @@ STATS_URL = API_BASE + "/stats"
 # The three instruments, pinned as constants because each zoom is the ONLY one
 # that serves its layer -- these are not tunables. z6 is the finest zoom with a
 # v1 `grid`; z14 is the finest with a v2 H3 `grid` (and the zoom the Mapillary
-# census already walks); z15 is the coarsest with a `pictures` layer.
-SCREEN_ZOOM = 6
-MEASURE_ZOOM = 14
+# census already walks); z15 is the coarsest with a `pictures` layer. The first
+# two, and the v2 URL, are imported from the standing screen rather than spelled
+# again: a study whose zoom drifted from the instrument it justified would be
+# describing a different measurement than the one running weekly.
 DETAIL_ZOOM = 15
 
+# The v1 lattice's layer name. The v2 hexagon grid happens to use the same name
+# and declares it in `panoramax_screen`, beside the decoder that reads it.
 SCREEN_LAYER = "grid"
 # Two endpoints serve a z6 grid and they DISAGREE; see stage_screen.
 SCREEN_VARIANTS = {"v1_lattice": MAP_V1_URL, "v2_h3": MAP_V2_URL}
 DEFAULT_SCREEN_VARIANT = "v2_h3"
-MEASURE_LAYER = "grid"
 # The detail layer's NAME lives in download_panoramax now, beside the decoder
 # that reads it (PICTURE_LAYER); this study names the zoom it reads it at.
 
@@ -232,13 +252,6 @@ DOCS_RECORD_NOTE = (
 # ── Pure decoding and geometry: no network, no catalog ──────────────────────
 
 
-def _tile_point_to_lonlat(px: float, py: float, tile_x: int, tile_y: int, zoom: int, extent: int):
-    """One MVT point, in tile-local y-up coordinates, as (lon, lat)."""
-    fx = tile_x + px / extent
-    fy = tile_y + (1.0 - py / extent)
-    return tile_frac_to_lonlat(fx, fy, zoom)
-
-
 def snap_to_lattice(value: float, step: float = SCREEN_CELL_DEG) -> float:
     """
     Snap a decoded coordinate back onto the v1 grid's 0.1-degree graticule.
@@ -290,33 +303,6 @@ def screen_cells_from_tile(
     return cells
 
 
-def grow_bbox(
-    bbox: tuple[float, float, float, float], margin_deg: float = SCREEN_CELL_DEG
-) -> tuple[float, float, float, float]:
-    """
-    A bbox grown by the screen's safety margin, for enumerating z6 tiles.
-
-    :func:`screen_cells_overlapping` accepts an anchor up to one cell outside
-    the bbox, and a cell one bbox-width outside can live in the NEXT z6 tile --
-    which, if tiles were enumerated from the bare bbox, would never be fetched.
-    The margin would then silently disappear exactly at the tile seams: 108 of
-    1,144 catalog cities sit within one cell of one, 49 of them screened zero,
-    and for those the screen's "a zero is conclusive" claim would rest on cells
-    nobody looked at. So the growth happens where the tiles are chosen, not
-    only where the cells are filtered.
-
-    Deliberately unclamped in longitude: `tiles_for_bbox` already handles the
-    antimeridian wrap, and clamping here would reintroduce the gap at 180.
-    """
-    min_lon, min_lat, max_lon, max_lat = bbox
-    return (
-        min_lon - margin_deg,
-        max(-90.0, min_lat - margin_deg),
-        max_lon + margin_deg,
-        min(90.0, max_lat + margin_deg),
-    )
-
-
 def screen_cells_overlapping(
     cells: list[dict[str, Any]],
     bbox: tuple[float, float, float, float],
@@ -341,151 +327,6 @@ def screen_cells_overlapping(
         if (min_lon - cell_deg) <= c["lon"] <= (max_lon + cell_deg)
         and (min_lat - cell_deg) <= c["lat"] <= (max_lat + cell_deg)
     ]
-
-
-def hexes_from_tile(
-    tile_bytes: bytes, tile_x: int, tile_y: int, zoom: int = MEASURE_ZOOM
-) -> dict[str, dict[str, Any]]:
-    """
-    The v2 `grid` layer of one tile, keyed by H3 cell id.
-
-    Each hexagon carries the three counters for the WHOLE hexagon, not for the
-    part of it inside this tile: verified across four adjacent z14 tiles, a hex
-    appearing in more than one carries an identical `nb_pictures` in each. So
-    the counters must be deduped by id -- 582 features over those four tiles
-    were 483 distinct hexes -- and summing them per tile would over-count every
-    hex on a tile seam.
-
-    The geometry, on the other hand, IS clipped to the tile, so this returns
-    the vertex bounding box rather than a centre. :func:`merge_hexes` unions
-    those boxes across tiles, which reconstructs the full hexagon's extent from
-    its pieces.
-    """
-    if not tile_bytes:
-        return {}
-    decoded = mapbox_vector_tile.decode(tile_bytes)
-    layer = decoded.get(MEASURE_LAYER)
-    if not layer:
-        return {}
-    extent = layer.get("extent", 4096)
-    out: dict[str, dict[str, Any]] = {}
-    for feature in layer["features"]:
-        props = feature.get("properties", {})
-        hex_id = props.get("id")
-        if hex_id is None:
-            continue
-        lons, lats = [], []
-        for ring in _rings(feature.get("geometry", {})):
-            for px, py in ring:
-                lon, lat = _tile_point_to_lonlat(px, py, tile_x, tile_y, zoom, extent)
-                lons.append(lon)
-                lats.append(lat)
-        if not lons:
-            continue
-        out[str(hex_id)] = {
-            "min_lon": min(lons),
-            "max_lon": max(lons),
-            "min_lat": min(lats),
-            "max_lat": max(lats),
-            "nb_pictures": int(props.get("nb_pictures") or 0),
-            "nb_360_pictures": int(props.get("nb_360_pictures") or 0),
-            "nb_flat_pictures": int(props.get("nb_flat_pictures") or 0),
-            "date": props.get("date"),
-        }
-    return out
-
-
-def _rings(geometry: dict[str, Any]) -> list[list[tuple[float, float]]]:
-    """Coordinate rings of a Polygon or MultiPolygon, ignoring anything else."""
-    kind = geometry.get("type")
-    coords = geometry.get("coordinates") or []
-    if kind == "Polygon":
-        return [list(ring) for ring in coords]
-    if kind == "MultiPolygon":
-        return [list(ring) for polygon in coords for ring in polygon]
-    return []
-
-
-def merge_hexes(
-    accumulated: dict[str, dict[str, Any]], new: dict[str, dict[str, Any]]
-) -> dict[str, dict[str, Any]]:
-    """
-    Fold one tile's hexes into the running set, unioning clipped geometry.
-
-    Counters are taken once per id -- as the MAX across sightings, never the
-    sum. Under the measured contract (whole-hex figures repeated verbatim in
-    every tile the hex touches) max and first-seen are the same number and
-    the sum double-counts every seam hex. Max is chosen over first-seen
-    because of what each does if the contract is ever wrong: were a tile to
-    carry only its own piece's count, first-seen could record a ZERO for a hex
-    whose pictures all sit in the other tile, and the screen would then call a
-    covered city empty -- the one failure the design cannot tolerate -- while
-    max degrades to a lower bound that is zero only when every piece is zero.
-    The vertex box is unioned, so a hex split across two tiles ends up with
-    the extent of the complete hexagon and therefore its true centre. Mutates
-    and returns `accumulated`.
-    """
-    for hex_id, hexagon in new.items():
-        seen = accumulated.get(hex_id)
-        if seen is None:
-            accumulated[hex_id] = dict(hexagon)
-            continue
-        for counter in ("nb_pictures", "nb_360_pictures", "nb_flat_pictures"):
-            seen[counter] = max(seen[counter], hexagon[counter])
-        seen["min_lon"] = min(seen["min_lon"], hexagon["min_lon"])
-        seen["max_lon"] = max(seen["max_lon"], hexagon["max_lon"])
-        seen["min_lat"] = min(seen["min_lat"], hexagon["min_lat"])
-        seen["max_lat"] = max(seen["max_lat"], hexagon["max_lat"])
-    return accumulated
-
-
-def hexes_in_bbox(
-    accumulated: dict[str, dict[str, Any]], bbox: tuple[float, float, float, float]
-) -> list[dict[str, Any]]:
-    """
-    The hexes whose centre falls inside `bbox`, in sorted-id order.
-
-    A res-11 hexagon is about 2,150 m2 -- roughly 25 m across -- against city
-    bboxes measured in kilometres, so assigning a whole hex by its centre
-    rather than clipping it to the bbox is an approximation worth naming and
-    not worth removing. Sorted so the raw artifact is stable across runs.
-    """
-    min_lon, min_lat, max_lon, max_lat = bbox
-    inside = []
-    for hex_id in sorted(accumulated):
-        hexagon = accumulated[hex_id]
-        lon = (hexagon["min_lon"] + hexagon["max_lon"]) / 2.0
-        lat = (hexagon["min_lat"] + hexagon["max_lat"]) / 2.0
-        if min_lon <= lon <= max_lon and min_lat <= lat <= max_lat:
-            inside.append({"id": hex_id, "lon": lon, "lat": lat, **hexagon})
-    return inside
-
-
-def hexes_overlapping_bbox(
-    accumulated: dict[str, dict[str, Any]], bbox: tuple[float, float, float, float]
-) -> list[dict[str, Any]]:
-    """
-    Hexes whose extent INTERSECTS the bbox, in sorted-id order.
-
-    The screen and the measure stage select hexes differently on purpose.
-    :func:`hexes_in_bbox` assigns a res-11 hexagon by its centre because at 25 m
-    across the difference is noise. A screen hexagon is res 6 -- about 36 km2 --
-    and a city bbox is often smaller than one, so centre-based selection would
-    miss the very hex the city sits inside. Overlap is the only selection that
-    keeps the screen an upper bound.
-    """
-    min_lon, min_lat, max_lon, max_lat = bbox
-    out = []
-    for hex_id in sorted(accumulated):
-        hexagon = accumulated[hex_id]
-        if (
-            hexagon["min_lon"] <= max_lon
-            and hexagon["max_lon"] >= min_lon
-            and hexagon["min_lat"] <= max_lat
-            and hexagon["max_lat"] >= min_lat
-        ):
-            out.append({"id": hex_id, **hexagon})
-    return out
 
 
 def capture_month(ts: Any) -> str | None:

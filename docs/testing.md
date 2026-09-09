@@ -391,6 +391,40 @@ Three files, split the way the other census providers' are, because each pins so
 Suite-wide, the autouse pacing fixture is `_no_tile_census_pacing` and now covers **both** tile censuses.
 It was renamed from `_no_mapillary_tile_pacing` rather than duplicated, and the reason is measured: the Panoramax grid-run file ran in 46 s against a live limiter and 0.3 s behind the fixture, because this provider is both slower per request (30/min) and at a zoom with ~4x the tiles.
 
+## The Panoramax growth screen (issue #316, phase 2 PR 2)
+
+`tests/test_panoramax_screen.py` covers the standing weekly screen end to end — the decoders, the command, the catalog table and the published artifact — in one file rather than spread across four, because the screen is one instrument and the properties below only mean anything together.
+
+- **The decoders**, moved out of the phase-1 study and now shared with it.
+  A counter is the WHOLE hexagon's, repeated verbatim in every tile the hexagon touches, so a hexagon seen twice keeps ONE count and both halves of its extent; a sum would double every hexagon on a seam.
+  The merge takes the MAX rather than the first sighting, and there is a test for the case that choice exists for: were the provider ever to serve per-piece counts, first-seen could record a conclusive ZERO for a city whose imagery all sits in the other piece.
+  `hexes_from_tile` takes zoom as a REQUIRED argument, and the test file is the reason — a wrong zoom is pure arithmetic that yields plausible coordinates on the far side of the planet rather than an error, which is exactly what it did while being written.
+- **Selection is by overlap, not by centre**, pinned with the normal case rather than an edge case: a city sitting wholly inside one screen hexagon is found by overlap and missed by centre, and centre selection would therefore call most of the catalog empty, conclusively and wrongly.
+- **The economy**: neighbouring cities collapse to one shared z6 tile, and the tiles are enumerated from the GROWN bbox — asserted at an exact z6 seam, where the bare bbox is one tile and the grown one is two.
+  Without the margin the union never reconstructs a hexagon clipped across that seam, and a city beside it is screened against a hexagon nobody fetched.
+- **Both refusals, and what they must not refuse.** An all-404 pass is a moved endpoint; a single 404 is a hole. A catalog-wide zero is refused when cities have screened positive before, and the test asserts the previous screen is still standing afterwards, because the damage is the write.
+  Its companion is the one that keeps the guard honest: a FIRST screen finding nothing anywhere is recorded, since 730 of 1,144 cities screening zero is the measured normal case.
+  And a tile that cannot be read ends the pass — a screen tile is every city under ~5.6° of longitude, so a census's 2% tolerance would write conclusive zeroes for cities nobody measured.
+- **The catalog contract**: a second screen on one day replaces rather than duplicates, `first_positive_date` is the earliest NON-ZERO screen (not the earliest screen), and a city that has never screened positive carries no such key at all — absent, not null, the driving-plan artifact's convention.
+  A city already positive at the first screen publishes the archive's own start date beside it, or every such city reads as an arrival the week the instrument shipped.
+- **The command's exit vocabulary**: 64 for an unknown provider, for `--limit` without `--measure` (a partial screen would put two observations on one date axis) and for `--measure` without `--limit`; 84/85 for the host conditions, with the refused pass's requests still charged to the day's ledger and no rows written.
+  A successful screen charges its requests to the SAME `(date, provider)` row a collection writes — same host, same IP, same day.
+  That a REFUSED one still charges what it sent is pinned twice on purpose: once at the command, where the fetch is stubbed and the attribute is handed over, and once through the real fetch loop, where the block lands on the third tile and the error must carry three (the refused request went out; `_fetch_tile` counts an attempt before reading its status).
+  The pair is the [#323](https://github.com/jonfroehlich/streetscape-tracker/pull/323) lesson written down — a test that supplies the value production computes exercises the one path production never takes.
+  And the measure mode prints without touching `provider_screen`, so one column never means two instruments.
+
+The suite-wide autouse pacing fixture had to grow a THIRD module for this: the screen imports `AsyncRateLimiter` into its own namespace, so patching the two collectors left it pacing for real — nearly four minutes of sleeping in the cheapest caller in the repo.
+
+A second block of tests came out of the three-reviewer pass on [PR #325](https://github.com/jonfroehlich/streetscape-tracker/pull/325), and every one of them pins the same class of failure: the instrument recording a CONFIDENT WRONG NUMBER rather than raising.
+
+- **The antimeridian, three ways.** A crossing bbox (`min_lon > max_lon`, which `grid_bbox` produces for a city near 180°) selecting its hexagons instead of nothing; the margin WRAPPING across the seam rather than being clamped to the edge column, so the tile holding the other half of a seam hexagon is actually fetched; and a hexagon reassembled from its two clipped halves keeping the width of a hexagon rather than the width of the world — with its centre on the seam, not a quarter of the planet away at longitude 0.
+  All three failed silently before the fix, and all three are latent rather than live: the catalog tops out at 175.6°E, and nothing prevents registering a city past it.
+- **Two refusals that need no history.** A city whose bbox maps to zero tiles is refused by name rather than stored as a measured zero; and tiles that ANSWER while decoding to no hexagons at all are refused as a renamed layer. The second is the one that protects production's first run, where `provider_screen` is empty and the catalog-collapse check cannot fire — so its companion test asserts the bound (one answering tile, or tiles that merely 404, are not evidence) as well as the trigger.
+- **A corrupt tile body is a `DownloadError` carrying its spend.** `google.protobuf.message.DecodeError` subclasses neither `DownloadError` nor `aiohttp.ClientError`, so before the fix it escaped the fetch loop's two arms and both of the command's, losing the day's ledger charge on the way out.
+- **The pacing test now runs through `load_scheduler_config`.** The version this replaced built `SchedulerConfig(providers={"panoramax": ...})` by hand and asserted the block won — green against a state the loader cannot produce, since an unwired channel's block is dropped at load. It is the #323 lesson recurring in the same PR that wrote it down, which is worth stating plainly: the trap is not knowing about the trap, it is that a hand-built fixture always looks like the real thing. The replacement pins today's behaviour (the block does NOT move the screen) and goes red when #316 PR 3 wires the channel, which is the intended prompt to update the test and the prose together.
+- **The published instrument block is asserted to BE the module's constants** (`is`, not `==`), so a second copy of the endpoint cannot creep back into the file every visitor downloads.
+- **The unit's `TimeoutStopSec` is pinned above `PUBLISH_TIMEOUT_S` and below its own `TimeoutStartSec`**, the same bracket the collection unit carries, because this unit publishes too.
+
 ## The Panoramax feasibility probe (issue #316)
 
 `tests/test_panoramax_feasibility.py` pins the phase-1 instrument in `scripts/panoramax_feasibility.py`, offline, over synthetic MVT tiles encoded with the same coordinate math the decoder inverts.

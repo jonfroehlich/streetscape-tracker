@@ -1,0 +1,81 @@
+# Weekly Panoramax growth screen (user unit, issue #316).
+# Install: see deploy/README.md
+#
+# WHY A SEPARATE UNIT AND NOT A run-due TAIL STEP. The screen asks a different
+# question on a different cadence from the nightly batch: not "collect the cities
+# due tonight" but "has this provider's imagery reached any of the 1,144 cities
+# we track yet". Panoramax's US corpora are months old, not decades, so there is
+# nothing to backfill — a city's growth is observable only if we were already
+# watching when the imagery landed. Folding it into the nightly would put a
+# weekly question on a nightly clock and lengthen the batch, whose wall clock is
+# already the binding constraint (issue #304).
+#
+# It is cheap: 113 requests answer every enabled city, because a z6 tile spans
+# ~5.6 degrees and neighbouring cities share tiles.
+[Unit]
+Description=Streetscape Tracker: weekly Panoramax growth screen (issue #316)
+Wants=network-online.target
+After=network-online.target
+# Same shared-NFS-home model as streetscape-tracker.service: $HOME is shared
+# across makelab1 and makelab2, so enablement is identical on both and the
+# active host is pinned by ConditionHost + linger. This must run where the
+# CATALOG is written — a screen recorded on the wrong box writes rows nothing
+# else ever reads. Cutover = flip this alongside the collection unit's.
+ConditionHost=makelab2*
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/streetscape-tracker
+# Optional (leading '-'): Panoramax is the one channel with NO credential
+# (CHANNEL_ENV_VARS["panoramax"] is an empty tuple), so a missing .env must not
+# fail this unit. It is still read, because the campus SMTP settings for
+# [alerts] live there.
+EnvironmentFile=-%h/streetscape-tracker/.env
+# Publish straight to the NFS-mounted docroot (no SSH) — see sync_data_to_server.sh
+Environment=STREETSCAPE_PUBLISH_LOCAL=1
+# THE SAME real path the collection unit sets, and load-bearing for exactly the
+# reason it is there: PrivateTmp gives this unit its own /tmp, and
+# WorkingDirectory is the %h symlink which abspath does not resolve — so a
+# different value here would make the Panoramax host lock a no-op BETWEEN the
+# two units, which is the one thing it exists to prevent. Two processes pacing
+# themselves independently into one volunteer-run meta-catalog is how the
+# Mapillary blocks happened.
+Environment=STREETSCAPE_LOCK_DIR=/projects/makeabilitylab/streetscape-tracker/locks
+# NB: --config is a global arg and MUST precede the subcommand (argparse).
+ExecStart=%h/streetscape-tracker/.venv-makelab2/bin/python -m streetscape_metadata_tracker.scheduler --config %h/streetscape-tracker/config/scheduler.makelab1.toml screen-provider panoramax
+# 113 requests at 30/min is under four minutes; the publish rsync that follows is
+# hard-bounded at PUBLISH_TIMEOUT_S (10 min). 45 min is generous against both and
+# still bounded, so a screen that hangs on a stalled socket cannot sit until the
+# night's batch wants the same host lock.
+TimeoutStartSec=45m
+# `systemctl stop` during the publish must not be a SIGKILL. systemd's default
+# is 90 seconds, which cannot cover the rsync — bounded at PUBLISH_TIMEOUT_S
+# (10 min) — so stopping this unit mid-publish would leave the docroot
+# half-synced. The collection unit carries the same directive for the same
+# reason, sized to its much larger tail; here the only thing to wait for is one
+# rsync, so 15 min is comfortably above it and still well under TimeoutStartSec.
+TimeoutStopSec=15min
+
+# Same rationale as the collection unit: this account cannot read the journal.
+StandardOutput=append:/projects/makeabilitylab/streetscape-tracker/logs/streetscape_service_console.log
+StandardError=inherit
+
+# ── Sandboxing (same rationale as streetscape-tracker.service) ─────────
+# Wider than the backup-check unit, because this one PUBLISHES: it needs the
+# docroot, and RestrictSUIDSGID must stay OFF for the same reason it is off next
+# door — the publish rsync sets setgid dirs (--chmod=D2755) and would exit 23.
+PrivateUsers=true
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+# Real paths, not the %h symlink — mount namespacing resolves symlinks.
+ReadWritePaths=/projects/makeabilitylab/streetscape-tracker
+ReadWritePaths=/cse/web/research/makelab/public/streetscape-tracker
+
+# The work is 113 small HTTP requests, a few hundred catalog rows and one small
+# JSON file — nothing like a census. Capped low deliberately: this unit runs
+# while the box is doing its normal daytime work, and its cost should be
+# invisible next to the nightly's 40G.
+Nice=15
+MemoryAccounting=true
+MemoryMax=2G

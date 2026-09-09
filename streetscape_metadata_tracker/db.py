@@ -23,12 +23,13 @@ import sqlite3
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
+from typing import Any
 
 from .naming import sanitize_city_query_str
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS cities (
@@ -352,6 +353,44 @@ CREATE TABLE IF NOT EXISTS street_walk_diffs (
 -- The manifest looks diffs up by their 'to' walk; the UNIQUE index above
 -- leads with from_walk_id and can't serve that.
 CREATE INDEX IF NOT EXISTS idx_swd_to_walk ON street_walk_diffs(to_walk_id);
+
+-- One dated whole-catalog SCREEN of a provider (v15, issue #316): is there any
+-- imagery in this city yet? Not a run and never a substitute for one -- every
+-- count here is an UPPER BOUND read off hexagons larger than the city they
+-- contain, which is what makes a whole-catalog pass cost 113 requests. A zero
+-- is conclusive ("this city holds nothing"); a positive number means only
+-- "look closer", and only a real collection settles how much.
+--
+-- Keyed by `provider` because the instrument is not Panoramax-specific: any
+-- provider serving a coarse count layer screens into these same columns. The
+-- rows are what makes the series answerable -- "when did this city first go
+-- non-zero" is a MIN over screen_date, which no single latest-value column
+-- could answer.
+--
+-- Purely additive (the v2 -> v3 pattern): no migration function, the CREATE
+-- TABLE IF NOT EXISTS below builds it on any older catalog.
+CREATE TABLE IF NOT EXISTS provider_screen (
+    provider                  TEXT NOT NULL,
+    city_id                   TEXT NOT NULL REFERENCES cities(city_id),
+    screen_date               TEXT NOT NULL,
+    -- Upper bounds, summed over the hexagons OVERLAPPING the city's frozen
+    -- bbox. NOT NULL: a screen that could not read a tile is refused whole
+    -- rather than written with holes, so an absent row means "not screened"
+    -- and a zero always means "screened, and empty".
+    pictures_upper_bound      INTEGER NOT NULL,
+    pictures_360_upper_bound  INTEGER NOT NULL,
+    pictures_flat_upper_bound INTEGER NOT NULL,
+    -- How many hexagons the sum ran over. Zero cells and zero pictures are
+    -- different answers: no cell at all means the provider knows nothing about
+    -- this area, while a cell counting zero is an area it has looked at.
+    cells                     INTEGER NOT NULL,
+    screened_at               TEXT NOT NULL,
+    PRIMARY KEY (provider, city_id, screen_date)
+);
+-- The published series groups by date across all cities; the primary key leads
+-- with city_id and cannot serve that.
+CREATE INDEX IF NOT EXISTS idx_provider_screen_date
+    ON provider_screen(provider, screen_date);
 """
 
 # v1 → v2: add the provider dimension. Three tables need constraint changes
@@ -682,6 +721,12 @@ def init_schema(conn: sqlite3.Connection) -> None:
     if user_version == 13:
         _migrate_v13_to_v14(conn)
         user_version = 14
+    # v14 -> v15 (issue #316): the provider_screen table. Purely additive, so
+    # like v2 -> v3 it needs no migration function -- the CREATE TABLE IF NOT
+    # EXISTS in _SCHEMA creates it on any older catalog, and the version stamp
+    # below records the upgrade.
+    if user_version == 14:
+        user_version = 15
     conn.executescript(_SCHEMA)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
@@ -2248,3 +2293,150 @@ def get_driving_plan_history(conn: sqlite3.Connection) -> sqlite3.Row | None:
                   MAX(CASE WHEN changed = 1 THEN fetch_date END) AS latest_change
            FROM driving_plan_snapshots"""
     ).fetchone()
+
+
+def record_provider_screen(
+    conn: sqlite3.Connection,
+    *,
+    provider: str,
+    screen_date: date,
+    rows: list[dict[str, Any]],
+) -> int:
+    """
+    Write one dated whole-catalog screen (issue #316).
+
+    Idempotent on (provider, city_id, screen_date): a re-run on the same day
+    REPLACES that day's rows rather than erroring, because a screen is a full
+    re-read of every city and not an incremental append — the same contract
+    ``register_driving_plan_snapshot`` has for the same reason.
+
+    Each row needs ``city_id``, ``cells``, ``pictures_upper_bound``,
+    ``pictures_360_upper_bound`` and ``pictures_flat_upper_bound``.
+
+    Written in ONE transaction. A screen is only interpretable whole: half a
+    catalog's cities carrying today's date and half carrying last week's would
+    make the published series' "cities positive on this date" a count over two
+    different observations.
+
+    Returns the number of rows written.
+    """
+    stamp = utc_now_iso()
+    conn.executemany(
+        """INSERT INTO provider_screen
+           (provider, city_id, screen_date, pictures_upper_bound,
+            pictures_360_upper_bound, pictures_flat_upper_bound, cells, screened_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(provider, city_id, screen_date) DO UPDATE SET
+             pictures_upper_bound = excluded.pictures_upper_bound,
+             pictures_360_upper_bound = excluded.pictures_360_upper_bound,
+             pictures_flat_upper_bound = excluded.pictures_flat_upper_bound,
+             cells = excluded.cells,
+             screened_at = excluded.screened_at""",
+        [
+            (
+                provider,
+                row["city_id"],
+                screen_date.isoformat(),
+                int(row["pictures_upper_bound"]),
+                int(row["pictures_360_upper_bound"]),
+                int(row["pictures_flat_upper_bound"]),
+                int(row["cells"]),
+                stamp,
+            )
+            for row in rows
+        ],
+    )
+    conn.commit()
+    return len(rows)
+
+
+def get_latest_provider_screen(conn: sqlite3.Connection, provider: str) -> list[sqlite3.Row]:
+    """
+    The most recent screen row for each city, newest-per-city, ordered by city_id.
+
+    Per city rather than "every row of the newest screen date": a city
+    registered since the last screen has no row at that date, and taking the
+    date first would silently drop cities that DO have an older answer.
+    """
+    return conn.execute(
+        """SELECT ps.* FROM provider_screen ps
+           JOIN (SELECT city_id, MAX(screen_date) AS latest
+                   FROM provider_screen WHERE provider = ?
+                  GROUP BY city_id) m
+             ON ps.city_id = m.city_id AND ps.screen_date = m.latest
+           WHERE ps.provider = ?
+           ORDER BY ps.city_id""",
+        (provider, provider),
+    ).fetchall()
+
+
+def get_provider_screen_firsts(conn: sqlite3.Connection, provider: str) -> dict[str, str]:
+    """
+    Per city, the earliest screen date at which it was NOT empty.
+
+    This is the growth signal the whole instrument exists for, and it carries
+    one caveat that must travel with it: a city already positive at our FIRST
+    screen has a first-positive date equal to that first screen, which says when
+    WE started looking, not when the imagery arrived. Readers get the archive's
+    own start date beside this (see :func:`get_provider_screen_series`) so the
+    two cases stay distinguishable.
+    """
+    rows = conn.execute(
+        """SELECT city_id, MIN(screen_date) AS first_positive
+             FROM provider_screen
+            WHERE provider = ? AND pictures_upper_bound > 0
+            GROUP BY city_id""",
+        (provider,),
+    ).fetchall()
+    return {row["city_id"]: row["first_positive"] for row in rows}
+
+
+def get_provider_screen_series(conn: sqlite3.Connection, provider: str) -> list[sqlite3.Row]:
+    """
+    One catalog-level row per screen date, oldest first: how many cities were
+    screened, how many held anything, and the summed upper bounds.
+
+    The summed upper bound is deliberately reported as such. It double-counts
+    imagery in a hexagon overlapping two cities and counts imagery outside every
+    city's bbox, so it is a trend line and never an inventory of the platform.
+    """
+    return conn.execute(
+        """SELECT screen_date,
+                  COUNT(*) AS cities_screened,
+                  SUM(CASE WHEN pictures_upper_bound > 0 THEN 1 ELSE 0 END) AS cities_positive,
+                  SUM(pictures_upper_bound) AS pictures_upper_bound,
+                  SUM(pictures_360_upper_bound) AS pictures_360_upper_bound,
+                  SUM(pictures_flat_upper_bound) AS pictures_flat_upper_bound
+             FROM provider_screen
+            WHERE provider = ?
+            GROUP BY screen_date
+            ORDER BY screen_date""",
+        (provider,),
+    ).fetchall()
+
+
+def provider_screen_positive_count(conn: sqlite3.Connection, provider: str) -> int:
+    """
+    How many cities have EVER screened non-zero for this provider.
+
+    Read by the screen command's collapse guard: a pass that finds nothing
+    anywhere, in a catalog that has previously found something, is far more
+    likely to be a changed endpoint or a silently empty layer than a platform
+    that deleted its imagery.
+    """
+    row = conn.execute(
+        """SELECT COUNT(DISTINCT city_id) AS n FROM provider_screen
+            WHERE provider = ? AND pictures_upper_bound > 0""",
+        (provider,),
+    ).fetchone()
+    return int(row["n"] or 0)
+
+
+def get_screened_providers(conn: sqlite3.Connection) -> list[str]:
+    """Providers with at least one screen row, alphabetically."""
+    return [
+        row["provider"]
+        for row in conn.execute(
+            "SELECT DISTINCT provider FROM provider_screen ORDER BY provider"
+        ).fetchall()
+    ]
