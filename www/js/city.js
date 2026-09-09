@@ -1282,24 +1282,17 @@ function buildPopupHtml(captureDate, ageFormatted, panoId, photographer, row) {
   // archival GSV credits) and pano_id comes straight from the CSV — both
   // must be escaped before entering popup HTML.
   //
-  // The whole row goes to viewerUrl because KartaView addresses its viewer by
-  // (sequence_id, sequence_index) rather than by image id; a null back means
-  // this row is not addressable and the link is omitted (cf. the FLAT_ONLY
-  // popup, which already makes that call for a missing image id).
-  const viewerUrl = provider.viewerUrl(panoId, row);
+  // The whole row goes to the link builder because KartaView addresses its
+  // viewer by (sequence_id, sequence_index) rather than by image id, and its
+  // map fallback by (pano_lat, pano_lon); a null back from either means that
+  // link is not addressable and it is omitted rather than pointed at nothing.
   return `
     <div style="font-family:sans-serif">
       <strong>Capture Date:</strong> ${captureDate.toLocaleDateString()}<br>
       <strong>Age:</strong> ${ageFormatted}<br>
       <strong>Photographer:</strong> ${escapeHtml(photographer)}<br>
       <strong>Pano ID:</strong> ${escapeHtml(panoId)}<br><br>
-      ${viewerUrl
-        ? `<a href="${viewerUrl}"
-         target="_blank" rel="noopener"
-         style="color:#2196F3;text-decoration:none">
-         ${provider.viewerLabel}
-      </a>`
-        : ""}
+      ${viewerLinksHtml(provider, panoId, row)}
     </div>
   `;
 }
@@ -1314,8 +1307,13 @@ function buildPopupHtml(captureDate, ageFormatted, panoId, photographer, row) {
  * The image itself is still viewable, and `viewerUrl` takes any image key,
  * pano or flat, so the deep-link works unchanged.
  *
- * Falls back to the bare explanation when the row carries no image id (every
- * FLAT_ONLY row written to date does, but a link to nowhere is worse than none).
+ * Drops the id and photographer lines when the row carries no image id (every
+ * FLAT_ONLY row written to date has one, but a link to nowhere is worse than
+ * none) — and still asks for the links, because a provider's fallback may key
+ * on geometry rather than on the image id. KartaView's does, so an id-less row
+ * with coordinates gets the map link rather than nothing; letting the missing
+ * id short-circuit that would be the one row shape where "the fallback covers
+ * strictly more rows than the link it backs up" quietly stopped being true.
  *
  * @param {string} panoId - flat image id, possibly empty.
  * @param {string} photographer - contributor credit, possibly empty.
@@ -1326,22 +1324,18 @@ function buildPopupHtml(captureDate, ageFormatted, panoId, photographer, row) {
 function buildFlatOnlyPopupHtml(panoId, photographer, row) {
   const provider = PROVIDERS[providerGlobal];
   const note = "Flat imagery only — no 360° panorama here";
-  if (!panoId) return `<div style="font-family:sans-serif">${note}</div>`;
+  const links = viewerLinksHtml(provider, panoId, row);
+  if (!panoId) {
+    return `<div style="font-family:sans-serif">${note}${links ? `<br><br>${links}` : ""}</div>`;
+  }
   // photographer and panoId are third-party content straight from the CSV —
   // both must be escaped before entering popup HTML (cf. buildPopupHtml).
-  const viewerUrl = provider.viewerUrl(panoId, row);
   return `
     <div style="font-family:sans-serif">
       ${note}<br><br>
       ${photographer ? `<strong>Photographer:</strong> ${escapeHtml(photographer)}<br>` : ""}
       <strong>Image ID:</strong> ${escapeHtml(panoId)}<br><br>
-      ${viewerUrl
-        ? `<a href="${viewerUrl}"
-         target="_blank" rel="noopener"
-         style="color:#2196F3;text-decoration:none">
-         ${provider.viewerLabel}
-      </a>`
-        : ""}
+      ${links}
     </div>
   `;
 }

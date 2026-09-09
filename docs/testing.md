@@ -433,6 +433,18 @@ Every property is a way the study could publish a confident wrong number:
 Frontend node tests cover the streetwalk render seam (manifest lookup + fetch-failure fallback, artifact-URL selection, key normalization, the fractional ramp, and initial view mode) by stubbing Leaflet and the panel's DOM, and `panoDateOrNull`'s reduced-precision shapes (issue #226), asserted on the LOCAL getters rather than `toISOString()`
 — a UTC-built date and a local-built one agree on the ISO string in exactly the timezone that hides the bug, so an ISO comparison passes everywhere and protects nowhere.
 
+### Provider viewer links and the KartaView fallback (issue #312)
+
+Node pins the ORDER, not just the two URL builders: both builders were already correct when every KartaView link was opening an error page, so a test over `viewerUrl` alone would have stayed green through the whole bug.
+`viewerLinksHtml` must put `fallbackViewerUrl` ahead of `viewerUrl`, must render one link for a provider that declares no fallback, and must render no markup at all — rather than an empty `<a>` — when neither is addressable.
+Beside those: every provider declares both fallback fields (a missing key is falsy, so an omission silently reads as "no fallback"), a URL and a label must be declared together, and **only KartaView carries one** — a second entry means either a working viewer was given a fallback it does not need or that this one was copied rather than read.
+The geometry case is the one worth keeping: a row with a null `sequence_id` builds no photo link but must still build a map link, which is the whole reason the fallback keys on `pano_lat`/`pano_lon`.
+A source check requires `city.js` to render provider links only through `viewerLinksHtml` (no `viewerUrl(` of its own), the same shape as the `addBasemapLayer` pin — a popup that interpolated the viewer URL directly would render perfectly, with the broken link back on top.
+The same check pins the flat-only builder's ORDER — `viewerLinksHtml` before the missing-id early return — because a fallback keyed on position must survive a row with no image id, and gating the call on the id put exactly that row back to no link at all while every other assertion here still passed.
+An id-less row with coordinates is asserted to render one link, and a `sequence_id` carrying a quote is asserted not to escape the href it lands in: `viewerLinksHtml` states percent-encoding as a contract on the registry, and `sequence_id` is a nullable string column, so a corrupt value is a decode away rather than a schema violation.
+Python mirrors it over `vis.PROVIDER_DISPLAY` (the rendered folium popup, map link before photo link; `map_url` present and null on the three providers that need none) and reads `streetscape-utils.js` to pin that the JS copy builds the same URLs — the two registries are hand-maintained copies and only the JS one is what a visitor clicks.
+That parity test compares the URLs the **Python** builders produce against the JS source and pins that both copies reject the same unlinkable rows; an earlier version only grepped the JS for strings it obviously contained, which would have stayed green through a Python-side z-level change and through the guard divergence it was written to catch (the JS rejected an empty `sequence_index` and the Python copy fell through to `int("")`).
+
 ## The pivoted data tables (issue #250)
 
 **The pivoted data tables (issue #250) are covered on both sides.**

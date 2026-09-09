@@ -53,6 +53,12 @@ The **median catalog city is 12 circles and 16 requests**, the same order as Map
 p95 is 636 and Singapore ~9,974, so it is the tail that decides affordability, not the median.
 Quote `sweep_requests_observed` and not `sweep_requests_estimate`: the latter is the **geometric floor**, with retries and the per-city calibration ladder unpriced, and it undercounts by 1.54×.
 
+### `kartaview-viewer-deeplink.md`
+
+Issue #312 — why every KartaView pano link on the site opens an error page, and why the fix was a second link rather than a corrected URL.
+The deep-link format is **theirs, not our guess**: their own SPA writes `details/{sequence_id}/{sequence_index}` into the address bar.
+What fails is the one v1 call that page depends on (`POST /details` → `osv: null`), for **every sequence probed including KartaView's own documented example** — which is the control that makes this a statement about their service rather than about our data, and the reason nobody should "fix" the URL builder.
+Generalizes past this provider: when a third-party page breaks on a link we build, probe **their** canonical example through the identical call before touching our code, and prefer a fallback keyed on geometry — the map link covers rows the photo link never could, since it needs only a position.
 ### `mapillary-image-quality.md`
 
 Whether Mapillary's per-image `quality_score` — the only visual-quality prediction any provider we collect publishes — can rank Sidewalk candidate cities.

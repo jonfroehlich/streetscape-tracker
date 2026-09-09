@@ -136,6 +136,11 @@ const RENDER_CAP = 40000;
  * the photo id at all. GSV and Mapillary ignore the second argument. It may
  * return null — meaning "this row is not addressable" — and the popup builders
  * render that as no link rather than a dead one.
+ *
+ * `fallbackViewerUrl(row)` / `fallbackViewerLabel` are the SECOND link a popup
+ * may carry, for a provider whose own viewer cannot be relied on (issue #312).
+ * Null on every provider whose viewer works, so a popup renders one link as
+ * before; see the KartaView entry for the measurement that earned it one.
  */
 const PROVIDERS = {
   gsv: {
@@ -160,6 +165,8 @@ const PROVIDERS = {
     viewerLabel: "View in Google Street View",
     viewerUrl: (panoId) =>
       `https://www.google.com/maps/@?api=1&map_action=pano&pano=${encodeURIComponent(panoId)}`,
+    fallbackViewerLabel: null,
+    fallbackViewerUrl: null,
     hasCopyrightFilter: true,
     hasFlatImagery: false,
   },
@@ -176,6 +183,8 @@ const PROVIDERS = {
     viewerLabel: "View in Mapillary",
     viewerUrl: (panoId) =>
       `https://www.mapillary.com/app/?pKey=${encodeURIComponent(panoId)}`,
+    fallbackViewerLabel: null,
+    fallbackViewerUrl: null,
     hasCopyrightFilter: false,
     hasFlatImagery: true,
   },
@@ -204,7 +213,14 @@ const PROVIDERS = {
     earliestPlausibleCapture: new Date(2004, 0, 1), // local midnight; see above
     attribution:
       'Image metadata © <a href="https://kartaview.org">KartaView</a>, CC BY-SA',
-    viewerLabel: "View in KartaView",
+    // Says out loud that this link often fails, because it often does: as of
+    // 2026-09-02 KartaView's own /details backend answers `osv: null` for every
+    // sequence probed, INCLUDING their own documented example sequence, so the
+    // page it opens renders "Ups! Sequence cannot be loaded..." (issue #312,
+    // docs/experiments/kartaview-viewer-deeplink.md). The link stays because it
+    // is the only URL that names the exact pano we sampled, and the format is
+    // right — their own SPA writes it — but it is no longer offered first.
+    viewerLabel: "Exact photo (KartaView's viewer is often broken)",
     // The ONLY entry that needs the row, and the reason viewerUrl takes one.
     // KartaView's viewer is addressed by (sequence, index within it) rather
     // than by photo id -- verified against a real photo from the API
@@ -223,6 +239,32 @@ const PROVIDERS = {
       return (
         `https://kartaview.org/details/${encodeURIComponent(sequence)}` +
         `/${encodeURIComponent(index)}`
+      );
+    },
+    fallbackViewerLabel: "View location on KartaView map",
+    // The link that actually works (issue #312). KartaView's map view is served
+    // by their v2 stack — /2.0/sequence/tiles, /2.0/photo — which answers 200
+    // for the very sequences whose /details call returns null, so a coordinate
+    // deep-link survives the outage that kills the photo link above. It names a
+    // place rather than a photo, hence the honest label.
+    //
+    // Keyed on the PANO's own position, not the grid point's: the imagery is
+    // what the reader is being sent to. Every linkable row carries those two
+    // columns (OK, NO_DATE and FLAT_ONLY all populate them; only ZERO_RESULTS
+    // is blank, and it never gets a popup link), so this renders even for the
+    // rows with a null sequence_id, which have no photo link at all.
+    //
+    // z19 rather than the 13z-15z of KartaView's own marketing links: their
+    // coverage tiles were measured serving real content to z20, so this frames
+    // the pano's own track instead of a neighbourhood-sized blur.
+    fallbackViewerUrl: (row) => {
+      const lat = row?.pano_lat;
+      const lng = row?.pano_lon;
+      if (lat === null || lat === undefined || lat === "") return null;
+      if (lng === null || lng === undefined || lng === "") return null;
+      return (
+        `https://kartaview.org/map/@${encodeURIComponent(lat)},` +
+        `${encodeURIComponent(lng)},19z`
       );
     },
     hasCopyrightFilter: false,
@@ -562,6 +604,41 @@ function isKnownProvider(key) {
 function getProviderFromFilename(filename) {
   const m = /_step_\d+(?:\.\d+)?_([a-z]+)_\d{4}-\d{2}-\d{2}/.exec(filename || "");
   return m && isKnownProvider(m[1]) ? m[1] : "gsv";
+}
+
+/**
+ * Render a marker popup's provider links: the fallback first, the provider's
+ * own viewer second, each omitted when its builder returns null.
+ *
+ * Lives here rather than in city.js because the order is a property of the
+ * REGISTRY — which provider's viewer can be trusted — and because city.js
+ * builds a Leaflet map at load and so cannot be unit-tested.
+ *
+ * The order is the whole point of the fallback (issue #312): KartaView's own
+ * `/details` backend answers `osv: null` for every sequence measured, their
+ * documented example included, so the link naming the exact pano lands on an
+ * error page while the map-view link beside it works. A provider whose viewer
+ * works declares `fallbackViewerUrl: null` and renders one link, as before.
+ *
+ * Both URLs are built by the registry, which percent-encodes every value it
+ * takes from a row, so no unescaped CSV content reaches the href.
+ *
+ * @param {Object} provider - a PROVIDERS registry entry.
+ * @param {string} panoId - image key, possibly empty.
+ * @param {Object} [row] - the CSV row, for providers not addressed by image id.
+ * @returns {string} HTML string; empty when neither link is addressable.
+ */
+function viewerLinksHtml(provider, panoId, row) {
+  const style = 'style="color:#2196F3;text-decoration:none"';
+  const fallbackUrl = provider.fallbackViewerUrl ? provider.fallbackViewerUrl(row) : null;
+  const links = [
+    [fallbackUrl, provider.fallbackViewerLabel],
+    [provider.viewerUrl(panoId, row), provider.viewerLabel],
+  ];
+  return links
+    .filter(([url]) => url)
+    .map(([url, label]) => `<a href="${url}" target="_blank" rel="noopener" ${style}>${label}</a>`)
+    .join("<br>");
 }
 
 /**
@@ -1296,6 +1373,7 @@ if (typeof module !== "undefined" && module.exports) {
     recencyColor,
     FRESHNESS_BUCKETS,
     escapeHtml,
+    viewerLinksHtml,
     isValidRunFilename,
     diffFilenameFor,
     isValidDiffFilename,

@@ -41,6 +41,7 @@ const sharedGlobals = {
   recencyColor: "readonly",
   FRESHNESS_BUCKETS: "readonly",
   escapeHtml: "readonly",
+  viewerLinksHtml: "readonly",
   isValidRunFilename: "readonly",
   diffFilenameFor: "readonly",
   isValidDiffFilename: "readonly",

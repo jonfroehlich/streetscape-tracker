@@ -189,9 +189,38 @@ def _kartaview_viewer_url(pano_id, row) -> str | None:
     """
     sequence = row.get("sequence_id")
     index = row.get("sequence_index")
-    if pd.isna(sequence) or pd.isna(index) or sequence == "":
+    # The empty string is rejected on BOTH fields, matching the JS guard. It is
+    # unreachable through config.METADATA_DTYPES (sequence_index is Int64), but
+    # an unguarded index reaches int("") and raises ValueError, which would
+    # abort the whole run's map over one unlinkable row -- the opposite of what
+    # returning None here is for.
+    if pd.isna(sequence) or pd.isna(index) or sequence == "" or index == "":
         return None
     return f"https://kartaview.org/details/{quote(str(sequence), safe='')}/{int(index)}"
+
+
+def _kartaview_map_url(row) -> str | None:
+    """
+    KartaView map-view deep-link for one census row, or None without a position.
+
+    The link that works when ``_kartaview_viewer_url``'s does not (issue #312):
+    KartaView's own ``/details`` backend answers ``osv: null`` for every sequence
+    measured — including their documented example — so the page that names the
+    exact photo renders an error, while the map view, served by the v2 stack
+    that does answer, opens the pano's neighbourhood with its track drawn on it.
+
+    Keyed on the PANO's position rather than the grid point's: the imagery is
+    what the reader is being sent to. Mirrors PROVIDERS.kartaview.
+    fallbackViewerUrl in www/js/streetscape-utils.js, z19 included.
+    """
+    lat = row.get("pano_lat")
+    lng = row.get("pano_lon")
+    if pd.isna(lat) or pd.isna(lng) or lat == "" or lng == "":
+        return None
+    # Percent-encoded like the JS copy's encodeURIComponent, not because a
+    # Float64 column can carry a delimiter but because the two builders being
+    # spelled differently is how they start meaning different things.
+    return f"https://kartaview.org/map/@{quote(str(lat), safe='')},{quote(str(lng), safe='')},19z"
 
 
 # User-facing labels and pano viewer deep-links per provider (mirrors the
@@ -206,20 +235,42 @@ def _kartaview_viewer_url(pano_id, row) -> str | None:
 # naming.KNOWN_PROVIDERS member must have an entry — a run's map is generated
 # AFTER the run is registered, so a missing one fails a fully successful
 # collection at the last step (a test pins the coverage).
+#
+# map_url is the SECOND link, rendered FIRST, for a provider whose own viewer
+# cannot be relied on (issue #312); None on the three whose links need no
+# backup, which renders one link exactly as before.
+#
+# EVERY entry spells its own viewer_label, and there is deliberately no
+# "View in {label}" default to fall back on. #312 and #316 reached that rule
+# from opposite directions within a week: KartaView's link opens an error page
+# and Panoramax's opens a JPEG rather than a viewer, and a default label would
+# have described both as "View in <provider>". An honest label costs a few
+# words; a label that promises the wrong thing costs a reader's trust in every
+# other link on the page. A missing one is a KeyError at map generation — loud,
+# and at the same moment the missing-entry check above fires.
 PROVIDER_DISPLAY = {
     "gsv": {
         "label": "GSV",
+        "viewer_label": "View in GSV",
         "viewer_url": lambda pano_id, row: (
             f"https://www.google.com/maps/@?api=1&map_action=pano&pano={pano_id}"
         ),
+        "map_label": None,
+        "map_url": None,
     },
     "mapillary": {
         "label": "Mapillary",
+        "viewer_label": "View in Mapillary",
         "viewer_url": lambda pano_id, row: f"https://www.mapillary.com/app/?pKey={pano_id}",
+        "map_label": None,
+        "map_url": None,
     },
     "kartaview": {
         "label": "KartaView",
+        "viewer_label": "Exact photo (KartaView's viewer is often broken)",
         "viewer_url": _kartaview_viewer_url,
+        "map_label": "View location on KartaView map",
+        "map_url": _kartaview_map_url,
     },
     # THE PICTURE ITSELF, NOT A 360 VIEWER, and that is measured rather than a
     # shortcut (probed 2026-09-06, issue #316). Panoramax's interactive viewer
@@ -239,12 +290,16 @@ PROVIDER_DISPLAY = {
     # that. A working link to the picture beats a broken link to a viewer.
     "panoramax": {
         "label": "Panoramax",
-        # The only entry that overrides the link text, because the default
-        # "View in <label>" would promise a viewer this link is not.
-        "viewer_link_text": "Open this Panoramax picture",
+        # Says what the link opens rather than "View in Panoramax", which would
+        # promise a viewer this link is not. Spelled as every other entry's
+        # label is, because #316 and #312 arrived at the same rule from
+        # opposite directions -- see the note above the table.
+        "viewer_label": "Open this Panoramax picture",
         "viewer_url": lambda pano_id, row: (
             f"https://api.panoramax.xyz/api/pictures/{quote(str(pano_id), safe='')}/sd.jpg"
         ),
+        "map_label": None,
+        "map_url": None,
     },
 }
 
@@ -435,12 +490,15 @@ def create_visualization_map(df: pd.DataFrame, city_name: str, provider: str = "
         age_years = (datetime.now() - capture_date).days / 365.25
         color = matplotlib.colors.to_hex(colormap(age_years))
 
+        # The fallback comes FIRST where one exists, because it is the link that
+        # works; see PROVIDER_DISPLAY above and issue #312.
+        map_url = display["map_url"](row) if display["map_url"] else None
         viewer_url = display["viewer_url"](row["pano_id"], row)
-        # Most providers get "View in <label>"; a provider whose link does not
-        # open its own viewer says so instead (see PROVIDER_DISPLAY).
-        link_text = display.get("viewer_link_text", f"View in {label}")
-        viewer_link = (
-            f'<br><a href="{viewer_url}" target="_blank">{link_text}</a>' if viewer_url else ""
+        links = [(map_url, display["map_label"]), (viewer_url, display["viewer_label"])]
+        viewer_link = "".join(
+            f'<br><a href="{url}" target="_blank">{link_label}</a>'
+            for url, link_label in links
+            if url
         )
         popup = folium.Popup(
             f"""
