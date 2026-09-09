@@ -691,11 +691,20 @@ def write_census_grid_run(
         # Only warn if points were actually degraded. A failed fetch unit can
         # legitimately cover no grid point (margin tiles; a cell whose points a
         # neighbour already covered), and a WARNING asserting degradation that
-        # did not happen goes straight into the log tail the [alerts] email
-        # ships -- which is where a real one has to stand out.
+        # did not happen is noise in the ONE place this line is ever read:
+        # `logs/collect_{city}_{channel}_{date}.log` on the collecting host. A
+        # sub-threshold hole exits 0, and the scheduler copies a child's log
+        # tail into its own log -- and thence into the [alerts] mail -- only
+        # for a child that FAILED. So a spurious line pages nobody; it just
+        # buries the real one where an operator does look.
         if num_unmeasured_points:
+            # "in {desc} found no imagery", not "fall in {desc}": this counts
+            # the points actually RELABELLED, which is the empty subset -- a
+            # point inside a failed unit that a neighbour covered was measured
+            # and is not in it. The looser phrasing invited the count to be
+            # read as the failed units' whole point population.
             logger.warning(
-                f"{num_unmeasured_points:,} grid points fall in {unmeasured_desc}; "
+                f"{num_unmeasured_points:,} grid points in {unmeasured_desc} found no imagery; "
                 f"written as {REQUEST_FAILED} rather than empty"
             )
     num_empty_points = len(empty_ordinals)

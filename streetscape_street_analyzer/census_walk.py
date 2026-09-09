@@ -238,7 +238,10 @@ def build_streetwalk_rows(
             degraded artifact that says so nowhere in the per-attempt log is
             one nobody knows to re-collect, and the REUSE path (#290) is
             silent otherwise — it inherits the crawl's holes without re-fetching
-            anything, so no fetch-side warning fires at all.
+            anything, so no fetch-side warning fires at all. That per-attempt
+            log is where the line STOPS, though: a tolerated hole exits 0, and
+            only a FAILED child's tail reaches the scheduler log the [alerts]
+            mail quotes.
     """
     if unmeasured_mask is not None and not unmeasured_desc:
         raise ValueError("unmeasured_desc is required whenever unmeasured_mask is given")
@@ -292,13 +295,22 @@ def build_streetwalk_rows(
         # Only warn once points were actually degraded. A failed fetch unit can
         # legitimately cover no SAMPLE at all (a tile over water, or one whose
         # on-street points a neighbour already matched), and a WARNING claiming
-        # degradation that did not happen goes straight into the log tail the
-        # [alerts] email ships, which is where a real one has to stand out.
+        # degradation that did not happen is noise in the ONE place this line
+        # is ever read: `logs/collect_{city}_{channel}_{date}.log` on the
+        # collecting host. A tolerated hole exits 0, and the scheduler copies a
+        # child's log tail into its own log -- and thence into the [alerts]
+        # mail -- only for a child that FAILED, so nothing here pages anyone; a
+        # spurious line just buries the real one where an operator does look.
         # Same rule, same wording as the grid tail's.
         num_unmeasured = int(unknown.sum())
         if num_unmeasured:
+            # "in {desc} matched no imagery", not "fall in {desc}": this counts
+            # the samples actually RELABELLED, which is the unmatched subset --
+            # a sample inside a failed tile that matched a neighbour's imagery
+            # was measured and is not in it. The looser phrasing invited the
+            # count to be read as the tiles' whole sample population.
             logger.warning(
-                f"{num_unmeasured:,} walk samples fall in {unmeasured_desc}; "
+                f"{num_unmeasured:,} walk samples in {unmeasured_desc} matched no imagery; "
                 f"written as {REQUEST_FAILED} rather than empty"
             )
     empty_rows = spec.build_empty_rows(

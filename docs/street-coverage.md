@@ -87,9 +87,15 @@ The seam is `census_walk.build_streetwalk_rows`' `unmeasured_mask` hook, and eac
 The mask applies only to samples that matched **nothing**: one that found imagery within `--match-dist` was measured by construction, whatever cell it sits in, so a matched sample inside a failed tile stays matched.
 GSV needs no hook at all, because it queries each sample directly and a failed sample already carries its own `REQUEST_FAILED`.
 
-A degraded walk **says so in its per-attempt log** — `N walk samples fall in <desc>; written as REQUEST_FAILED rather than empty`, the grid tail's wording and its rule that the warning fires on damage rather than on a failure (a failed tile over water covers no sample and must not claim one).
+A degraded walk **says so in its per-attempt log** — `N walk samples in <desc> matched no imagery; written as REQUEST_FAILED rather than empty`, the grid tail's wording and its rule that the warning fires on damage rather than on a failure (a failed tile over water covers no sample and must not claim one).
+`N` is the count actually **relabelled** — the samples that matched nothing — not every sample under the failed tiles, since one that matched a neighbour's imagery was measured and keeps its row.
 That log is the only record there is: neither `street_walks` nor the coverage GeoJSON carries a hole count, and on a #290 reuse night the walk inherits the crawl's failed tiles for zero requests, so the fetch-side "N/M tiles failed" warning never fires for it at all.
 `unmeasured_desc` is therefore required whenever `unmeasured_mask` is given, exactly as in `census.write_census_grid_run`.
+
+**That per-attempt log is also where the line stops, and an operator has to go looking for it.**
+A tolerated hole is a SUCCESSFUL collection — the fetch stayed under `MAX_FAILED_TILE_FRACTION`, so the child exits 0 — and `_run_collection` copies a child's log tail into the scheduler log only for a child that FAILED, while the `[alerts]` mail quotes `_recent_log_tail`, i.e. the scheduler log and nothing else.
+So a degraded walk sends no mail and raises no counter; the evidence is `logs/collect_{city_id}_{channel}_{date}.log` on the collecting host.
+That is the argument for warning on damage rather than on failure, too: a spurious line pages nobody, it just buries the real one in the one place anybody reads it.
 
 Two consequences are worth stating, because neither is visible in the row itself.
 `REQUEST_FAILED` is **not** in `analysis.PRESENT_STATUSES`, so it lands in exactly the denominator `ZERO_RESULTS` did: this changes what a snapshot SAYS, not any coverage percentage and not any walk-diff count.

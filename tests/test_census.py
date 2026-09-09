@@ -580,6 +580,39 @@ def test_a_clean_fetch_pays_nothing_for_the_unmeasured_check(tmp_path):
     assert calls != []
 
 
+def test_a_mask_that_degrades_points_says_how_many_and_what_failed(tmp_path, caplog):
+    """
+    The positive half, which nothing pinned before: a silenced warning left the
+    whole `unmeasured_desc` contract asserting only that it is REQUIRED, never
+    that it is USED.
+
+    The count is the RELABELLED subset -- the empty points inside the failed
+    unit -- not every point under it, since one a neighbour covered was
+    measured and keeps its row. The message says so; an earlier "N grid points
+    fall in <desc>" invited the count to be read as the unit's whole
+    population. The only reader is
+    `logs/collect_{city}_{channel}_{date}.log` on the collecting host: a
+    sub-threshold hole exits 0, and the scheduler forwards a child's tail into
+    the log the [alerts] mail quotes only for a child that FAILED.
+    """
+    grid = _tiny_grid()
+    # The first three of nine points, so the count is a subset and a mask that
+    # degraded everything would read differently.
+    degraded = np.zeros(len(grid.lats), dtype=bool)
+    degraded[:3] = True
+    with caplog.at_level(logging.WARNING, logger="streetscape_metadata_tracker.census"):
+        _, _, written = _run_grid(
+            tmp_path,
+            [],
+            grid=grid,
+            unmeasured_mask=lambda lats, lons: degraded,
+            unmeasured_desc="2 undownloaded tile(s)",
+        )
+    assert written["num_unmeasured_points"] == 3
+    assert "3 grid points in 2 undownloaded tile(s) found no imagery" in caplog.text
+    assert "REQUEST_FAILED" in caplog.text
+
+
 def test_a_mask_that_degrades_nothing_does_not_warn(tmp_path, caplog):
     """
     A failed fetch unit can legitimately cover no grid point (margin tiles, or a
