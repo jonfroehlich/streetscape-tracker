@@ -211,17 +211,41 @@ def test_every_credential_channel_appears_in_the_routers_credentials_table():
     without documenting it fails here, and so does documenting one that no
     longer exists.
     """
-    from streetscape_metadata_tracker.config import CHANNEL_ENV_VARS
+    from streetscape_metadata_tracker.config import CHANNEL_ENV_VARS, CREDENTIAL_FREE_CHANNELS
 
     text = _ROUTER.read_text(encoding="utf-8")
-    documented = dict(re.findall(r"^\| `([a-z_]+)` \| `([A-Z_]+)`", text, re.MULTILINE))
+    # SCOPED TO THE CREDENTIALS SECTION, which the previous version got for free
+    # and this one has to ask for. The variable cell is now read as free text
+    # rather than as a backticked SHOUTING_NAME, because a channel can
+    # legitimately have no variable to name (issue #316: Panoramax reads are
+    # unauthenticated) -- and requiring the name shape would have forced the
+    # choice between inventing a variable nothing reads and dropping the one
+    # provider whose credential story is unusual out of the table entirely,
+    # which is exactly the "the rows that are there read as complete" failure
+    # above, one provider further on. But a free-text second cell also matches
+    # the SUBCOMMAND table two sections up (`| `status` | Per-city ... |`), so
+    # the section slice is what keeps this reading the table it names.
+    section = re.search(
+        r"^### Credentials and config$(.*?)^#{2,3} ", text, re.MULTILINE | re.DOTALL
+    )
+    assert section, "CLAUDE.md no longer has a '### Credentials and config' section"
+    documented = dict(re.findall(r"^\| `([a-z_]+)` \| ([^|]+?) \|", section.group(1), re.MULTILINE))
     assert set(documented) == set(CHANNEL_ENV_VARS), (
         "every credential channel needs a row in CLAUDE.md's credentials table"
     )
-    for channel, env_var in documented.items():
-        assert env_var == CHANNEL_ENV_VARS[channel][0], (
-            f"the table says {channel} reads {env_var}, the code reads "
-            f"{CHANNEL_ENV_VARS[channel][0]} first"
+    for channel, cell in documented.items():
+        if channel in CREDENTIAL_FREE_CHANNELS:
+            # Say so in words. "none" is the assertion that the blank is
+            # deliberate; an empty cell would read as an unfinished row.
+            assert "none" in cell.lower(), (
+                f"{channel} needs no credential, so its table cell must SAY so "
+                f"rather than being blank or naming a variable; got {cell!r}"
+            )
+            assert "`" not in cell, f"{channel} reads no env var, but the table names one: {cell!r}"
+            continue
+        assert cell == f"`{CHANNEL_ENV_VARS[channel][0]}`", (
+            f"the table says {channel} reads {cell}, the code reads "
+            f"`{CHANNEL_ENV_VARS[channel][0]}` first"
         )
 
 

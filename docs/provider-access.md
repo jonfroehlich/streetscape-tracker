@@ -328,9 +328,17 @@ A read-only probe returned **no `X-RateLimit-*` header, no `Retry-After`, and no
 Per the standing rule that is **unknown, not unlimited**.
 
 **Unlike KartaView, the second half of the rule has an object.** [forum.geocommuns.fr](https://forum.geocommuns.fr) and the [OSM community forum](https://community.openstreetmap.org/) both carry Panoramax traffic answered by core developers within days.
-That is a materially better access position than KartaView's empty room, and it means **the pacing question can be asked rather than inferred** — which is the intended first step of phase 2 and has not been taken yet.
-Two questions belong in that post: what sustained rate the meta-catalog is comfortable with, and whether a picture's identity survives a sequence being migrated between instances.
-The second one is not a courtesy question: there is active work on inter-instance migration, and if an id can change under a move then "removed" in a run-to-run diff can mean "moved", which would corrupt the one statistic this project exists to produce.
+That is a materially better access position than KartaView's empty room, and it means **the pacing question can be asked rather than inferred**.
+
+**It has NOT been asked, and that is a decision rather than an oversight (2026-09-06).**
+Phase 2's collector shipped without a forum post, on the reading that CLAUDE.md's standing rule is to READ a provider's docs and community before changing how we call it — which phase 1's survey did, and which this section is the record of — while *posting* a question was #316's own addition rather than the rule's.
+What that leaves is a pace chosen from nothing the provider said, which is exactly why it is conservative: 30/min, half the Mapillary channels', against the one host here that publishes no number at all.
+Re-read both forums before any change that raises volume, rate or concurrency, and treat a reply there as outranking the number in `config/scheduler.toml`.
+
+**Two questions still belong in a post, and the second is not a courtesy question.**
+What sustained rate the meta-catalog is comfortable with; and whether a picture's identity survives a sequence being migrated between instances.
+There is active work on inter-instance migration, and if an id can change under a move then "removed" in a run-to-run diff can mean "moved" — which would corrupt the one statistic this project exists to produce.
+Until that is answered it is a **known caveat on every Panoramax diff**, not a settled question, and it is recorded here rather than assumed away.
 
 **What the phase-1 study paced at, and why.** 30 requests/minute with jittered gaps at CV 0.6 — the same shifted-exponential shape [#292](https://github.com/jonfroehlich/streetscape-tracker/issues/292) put on the Mapillary channels, imported from `download_common.spaced_gap_seconds` rather than re-derived, so the two cannot drift into different distributions.
 That is roughly half the Mapillary channels' configured rate against a host with strictly less published guidance, which is the intended direction of the asymmetry.
@@ -346,6 +354,13 @@ So an incremental "everything since the last run" fetch would re-read the whole 
 The window is derived per city rather than fixed for a reason worth carrying to the next provider probe: a fixed cutoff cannot distinguish an honoured filter from an ignored one in a city whose imagery lies entirely inside it, and the original fixed `2026-01-01T00:00:00Z` had quietly stopped being in the future, so Boise was being counted as evidence while being none.
 And **`filter=field_of_view=360` returns none of the EXIF-less pictures** (17 of the 17 cities whose sample held one); those pictures are `flat` in the tile layer without exception, so the filter loses nothing a 360° collector wants, but a collector counting "absent" as possibly-360 would overstate coverage in every such city.
 The tile layers are the answer to all three: they carry a `type` field with no absent state, and they are the instrument [`experiments/panoramax-feasibility.md`](experiments/panoramax-feasibility.md) actually uses.
+
+**What the COLLECTOR does, as shipped (#316 phase 2).**
+Same 30/min and the same CV-0.6 jitter as the probe, from `download_common.spaced_gap_seconds` rather than re-derived, and behind `host_lock(HOST_PANORAMAX)` — the fourth locked host, exit codes **84 blocked / 85 busy**.
+**403 and 429 are `HostBlockedError` at the first request**, which is a stronger reading than the other two providers get and follows from there being no credential: on Mapillary and KartaView a 403 is a rejected token and is deliberately scoped to the key, while here it can only be the IP.
+**A 404 is an empty tile rather than a failure** — measured, not assumed: 0 empty tiles across 3,321 phase-1 requests including 20 cities holding nothing, because an empty area answers 200 with no layer.
+The guard that reading needs is that **a lattice where EVERY tile 404s is refused**, since that is what a moved endpoint looks like and the alternative is publishing a city as having lost all its imagery.
+Unlike the probe there is no `refuse_on_collection_host()`: a collector's whole purpose is to run on the collection host, so what protects the nightly batch is the pace, the host lock and the fact that the channel is not scheduled yet.
 
 **One host, not twenty-five.** `api.panoramax.xyz` is a meta-catalog that harvests metadata from every registered instance (23 on 2026-09-04), so a collector would query one host regardless of how many instances join — one `host_lock.py` entry, no per-instance fan-out, and no per-instance rate question.
 The corollary is that all of our load lands on one volunteer-run endpoint rather than being spread across the federation, which argues for the conservative end of any pacing range rather than against it.

@@ -103,12 +103,22 @@ from kartaview_probe import refuse_on_collection_host  # noqa: E402
 from streetscape_metadata_tracker.download_common import (  # noqa: E402
     _unit_exponential,
     grid_bbox,
-    spaced_gap_seconds,
-)
-from streetscape_metadata_tracker.download_mapillary import (  # noqa: E402
     lonlat_to_tile_frac,
+    spaced_gap_seconds,
     tile_frac_to_lonlat,
     tiles_for_bbox,
+)
+
+# The per-picture decoder and the two imagery-type constants come from the
+# COLLECTOR (issue #316 phase 2), not from a copy kept here. Same rule that made
+# this script import `spaced_gap_seconds` rather than rewriting the gap formula:
+# a decoder rewritten beside its caller is how the study and the collector come
+# to disagree about what a picture is, and this study's whole job is to describe
+# what the collector will see. The hex/lattice decoders below stay here, since
+# the collector does not read the `grid` layer at all.
+from streetscape_metadata_tracker.download_panoramax import (  # noqa: E402
+    TYPE_360,
+    pictures_from_tile,
 )
 
 logger = logging.getLogger("panoramax_feasibility")
@@ -140,16 +150,17 @@ SCREEN_LAYER = "grid"
 SCREEN_VARIANTS = {"v1_lattice": MAP_V1_URL, "v2_h3": MAP_V2_URL}
 DEFAULT_SCREEN_VARIANT = "v2_h3"
 MEASURE_LAYER = "grid"
-DETAIL_LAYER = "pictures"
+# The detail layer's NAME lives in download_panoramax now, beside the decoder
+# that reads it (PICTURE_LAYER); this study names the zoom it reads it at.
 
 # The v1 z6 lattice's spacing, measured off the decoded tiles: anchors sit on a
 # 0.1 degree graticule in BOTH axes (a geographic lattice, not a Mercator one).
 SCREEN_CELL_DEG = 0.1
 
-# Panoramax's own vocabulary for the two imagery types, from the tile layers.
-# `equirectangular` is 360; anything else is flat. Never absent (see the module
-# docstring, finding 4), which is why this is read as a two-state field.
-TYPE_360 = "equirectangular"
+# Panoramax's own vocabulary for the two imagery types is imported above, from
+# the collector, rather than spelled again here: `equirectangular` is 360 and
+# anything else is flat, never absent (module docstring, finding 4), which is
+# why it is read as a two-state field.
 
 # Conservative by construction: no published limit means no evidence, and this
 # study is small enough that a slow pace costs an afternoon rather than a
@@ -475,49 +486,6 @@ def hexes_overlapping_bbox(
         ):
             out.append({"id": hex_id, **hexagon})
     return out
-
-
-def pictures_from_tile(
-    tile_bytes: bytes, tile_x: int, tile_y: int, zoom: int = DETAIL_ZOOM
-) -> list[dict[str, Any]]:
-    """
-    The v1 `pictures` layer of one z15 tile, one dict per picture.
-
-    This is the only layer with per-picture rows, and therefore the only way to
-    get capture DATES rather than counts. Keeps id, lon/lat, the capture
-    timestamp `ts`, the imagery `type`, the contributor `account_id` and the
-    owning sequence.
-    """
-    if not tile_bytes:
-        return []
-    decoded = mapbox_vector_tile.decode(tile_bytes)
-    layer = decoded.get(DETAIL_LAYER)
-    if not layer:
-        return []
-    extent = layer.get("extent", 4096)
-    pictures = []
-    for feature in layer["features"]:
-        geometry = feature.get("geometry", {})
-        if geometry.get("type") != "Point":
-            continue
-        props = feature.get("properties", {})
-        picture_id = props.get("id", feature.get("id"))
-        if picture_id is None:
-            continue
-        px, py = geometry["coordinates"]
-        lon, lat = _tile_point_to_lonlat(px, py, tile_x, tile_y, zoom, extent)
-        pictures.append(
-            {
-                "id": str(picture_id),
-                "lon": lon,
-                "lat": lat,
-                "ts": props.get("ts"),
-                "type": props.get("type"),
-                "account_id": props.get("account_id"),
-                "sequence_id": props.get("first_sequence"),
-            }
-        )
-    return pictures
 
 
 def capture_month(ts: Any) -> str | None:

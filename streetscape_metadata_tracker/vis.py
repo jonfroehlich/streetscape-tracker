@@ -195,7 +195,12 @@ def _kartaview_viewer_url(pano_id, row) -> str | None:
 
 
 # User-facing labels and pano viewer deep-links per provider (mirrors the
-# PROVIDERS registry in www/js/streetscape-utils.js). viewer_url takes the whole
+# PROVIDERS registry in www/js/streetscape-utils.js — EXCEPT for panoramax,
+# which is deliberately here and not there until #316 phase 2's frontend PR: a
+# hand-collected panoramax run does reach cities.json.gz, but grid.js and
+# streets.js enumerate that registry, so its rows render nowhere and city.js
+# rewrites an unknown ?provider= to gsv. Per-run maps and popups, which is all
+# this table feeds, work now.) viewer_url takes the whole
 # row besides the pano id because KartaView's viewer is not addressable by photo
 # id; it may return None, which the popup renders as no link at all. Every
 # naming.KNOWN_PROVIDERS member must have an entry — a run's map is generated
@@ -215,6 +220,31 @@ PROVIDER_DISPLAY = {
     "kartaview": {
         "label": "KartaView",
         "viewer_url": _kartaview_viewer_url,
+    },
+    # THE PICTURE ITSELF, NOT A 360 VIEWER, and that is measured rather than a
+    # shortcut (probed 2026-09-06, issue #316). Panoramax's interactive viewer
+    # is served by each INSTANCE at its own root, and the federated meta-catalog
+    # we collect from hosts no viewer at all -- its root is a marketing page.
+    # The z15 `pictures` layer carries no instance either (only `via` in the
+    # /api/search response does, and search cannot be the census), so a run row
+    # has no way to name which of the 23 instances owns a picture.
+    #
+    # What DOES resolve federation-wide from the id alone is the asset route:
+    # /api/pictures/{id}/sd.jpg answers 308 to the owning instance's copy, so
+    # this link always opens the actual imagery. `sd` rather than `hd` because
+    # an equirectangular original is tens of megabytes.
+    #
+    # The alternative was no link at all, which is what the #312 rule prescribes
+    # when the only candidate is a guess -- and a guessed instance is exactly
+    # that. A working link to the picture beats a broken link to a viewer.
+    "panoramax": {
+        "label": "Panoramax",
+        # The only entry that overrides the link text, because the default
+        # "View in <label>" would promise a viewer this link is not.
+        "viewer_link_text": "Open this Panoramax picture",
+        "viewer_url": lambda pano_id, row: (
+            f"https://api.panoramax.xyz/api/pictures/{quote(str(pano_id), safe='')}/sd.jpg"
+        ),
     },
 }
 
@@ -406,8 +436,11 @@ def create_visualization_map(df: pd.DataFrame, city_name: str, provider: str = "
         color = matplotlib.colors.to_hex(colormap(age_years))
 
         viewer_url = display["viewer_url"](row["pano_id"], row)
+        # Most providers get "View in <label>"; a provider whose link does not
+        # open its own viewer says so instead (see PROVIDER_DISPLAY).
+        link_text = display.get("viewer_link_text", f"View in {label}")
         viewer_link = (
-            f'<br><a href="{viewer_url}" target="_blank">View in {label}</a>' if viewer_url else ""
+            f'<br><a href="{viewer_url}" target="_blank">{link_text}</a>' if viewer_url else ""
         )
         popup = folium.Popup(
             f"""

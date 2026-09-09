@@ -49,7 +49,7 @@ Kept **alphabetical**, so two branches adding a provider usually insert at diffe
 | Mappls RealView | Yes | **Viewer only** | OAuth2, paid | India | Ruled out — no metadata API |
 | Mapy.cz Panorama | Yes | Unofficial (`streetlevel`) | None | Czechia, Slovakia | Ruled out — scope |
 | Naver Street View | Yes | Unofficial (`streetlevel`) | None | South Korea | Ruled out — scope |
-| Panoramax | Mixed | Official (STAC) | **None** | FR-heavy, growing | **Open — [#316](https://github.com/jonfroehlich/streetscape-tracker/issues/316)** |
+| Panoramax | Mixed | Official (STAC) | **None** | FR-heavy, growing | **Integrated** (collector only; not yet scheduled — [#316](https://github.com/jonfroehlich/streetscape-tracker/issues/316)) |
 | Tencent Street View | Yes | Official (CN) | Key, CN entity | China | Ruled out — scope |
 | Yandex Panorama | Yes | Unofficial (`streetlevel`) | None | RU, TR, CIS | Ruled out — scope |
 
@@ -191,7 +191,9 @@ That is the largest provider gap anywhere in the catalog, and it has no open sol
 
 ### Panoramax
 
-**Status: phase 1 measured — tracked in [#316](https://github.com/jonfroehlich/streetscape-tracker/issues/316), writeup in [`experiments/panoramax-feasibility.md`](experiments/panoramax-feasibility.md).**
+**Status: COLLECTOR SHIPPED, channel not yet — tracked in [#316](https://github.com/jonfroehlich/streetscape-tracker/issues/316), phase-1 writeup in [`experiments/panoramax-feasibility.md`](experiments/panoramax-feasibility.md).**
+`streetscape_tracker.py --provider panoramax` collects a city today; `scheduler.UNWIRED_CHANNELS` still refuses a `[providers.panoramax]` block until the cost, timeout, rank and pacing arms land.
+The mechanism and the three ways it differs from the Mapillary census it is modelled on are in [`census.md`](census.md).
 The median tracked city holds nothing (730 of 1,144 screen to a conclusive zero), but ~20 cities hold 16k–1.1M pictures and Des Moines has more 360° pictures on Panoramax than in Mapillary's census of the same bbox — so the recommendation is an **opt-in** channel on the KartaView pattern, never a default-membership one.
 
 A federated open imagery commons founded by IGN and OpenStreetMap France, licensed per picture, with **25 registered instances** and ~100 M pictures.
@@ -200,8 +202,10 @@ Two instances hold ~99% of them — IGN at 58.0 M and OSM-FR at 54.0 M — with 
 **The federation is not our problem.** [`api.panoramax.xyz/api`](https://api.panoramax.xyz/api) is a meta-catalog that harvests metadata from every registered instance, so we query **one host** no matter how many instances join.
 That means one entry in `host_lock.py`, not 25.
 
-**It is a STAC API**, unauthenticated for read.
-`/api/search?bbox=…&limit=…` works with no credential, and a vector-tile endpoint `/api/map/{z}/{x}/{y}.mvt` exists — structurally the same shape as Mapillary's tile census, so `census.py`, `checkpointing.py` and the [#290](https://github.com/jonfroehlich/streetscape-tracker/issues/290) cache would parameterize onto it rather than needing a new pipeline.
+**It is a STAC API**, unauthenticated for read — the only provider here with no credential at all, which is why `config.CHANNEL_ENV_VARS["panoramax"]` is an empty tuple rather than a missing row.
+The vector-tile endpoint `/api/map/{z}/{x}/{y}.mvt` is the census and `census.py`, `checkpointing.py` and the [#290](https://github.com/jonfroehlich/streetscape-tracker/issues/290) cache parameterized onto it as expected.
+`/api/search` did **not**: it cannot count (no pagination, no `numberMatched`) and silently ignores its own `datetime` filter, both measured in phase 1.
+The one surprise in the cost was the zoom — the per-picture layer starts at **z15**, not Mapillary's z14, so the same bbox is ~4x the tiles.
 
 Per-picture metadata is **richer than either census provider we have**: `datetime` (capture), `created`/`updated` (ingest — so KartaView's `shot_date >= date_added` guard comes from real fields rather than inference), `license`, `geovisio:producer`, `quality:horizontal_accuracy`, `pers:interior_orientation.field_of_view`, and a `via` link naming the source instance.
 
@@ -221,10 +225,15 @@ The consequence for a collector is that Panoramax must report **both** coverage 
 "Field absent" is **not** a third state: the phase-1 study looked 2,136 EXIF-less search pictures up in the tile `pictures` layer, whose `type` has no absent state, and every one is `flat` — the absence is the search endpoint's EXIF passthrough, and a tile-based collector never sees it.
 
 **Rate limits are not documented** anywhere found, including the OpenAPI spec, and a single read-only probe returned no rate-limit headers.
-Unlike KartaView, though, **a staffed community exists** — [forum.geocommuns.fr](https://forum.geocommuns.fr) and the [OSM community forum](https://community.openstreetmap.org/), with core developers answering within days — so the standing rule's "read the forum first" has an object here, and the pacing question can simply be *asked* before any collector is written.
+Unlike KartaView, though, **a staffed community exists** — [forum.geocommuns.fr](https://forum.geocommuns.fr) and the [OSM community forum](https://community.openstreetmap.org/), with core developers answering within days — so the standing rule's "read the forum first" has an object here.
+It was read and not asked: the collector paces at 30/min, half the Mapillary channels', chosen rather than measured. [`provider-access.md`](provider-access.md) carries that decision and the two questions still worth posting.
 
-**One open risk.** Coverage against the catalog is now measured (above).
-But there is active work on migrating sequences between instances, so picture identity across instance moves needs an answer before we build diffs — if an image can change instance and identity, "removed" in a run-to-run diff could mean "migrated", which would corrupt the one statistic this project exists to produce.
+**One open risk, still open.** Coverage against the catalog is now measured (above) and the collector is written.
+But there is active work on migrating sequences between instances, so picture identity across instance moves is unanswered — if an image can change instance and identity, "removed" in a run-to-run diff could mean "migrated", which would corrupt the one statistic this project exists to produce.
+It is recorded as a standing caveat on every Panoramax diff rather than resolved.
+
+**A second, smaller one found while wiring the frontend:** the meta-catalog hosts no picture viewer (its root is a marketing page), and the tile layer carries no instance, so a run row cannot name which of the 23 instances owns a picture.
+What resolves federation-wide from the id alone is the asset route — `/api/pictures/{id}/sd.jpg` answers 308 to the owning instance — so `vis.PROVIDER_DISPLAY` links the PICTURE rather than a viewer, deliberately, rather than guessing an instance.
 
 ### Tencent Street View
 

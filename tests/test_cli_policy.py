@@ -1068,6 +1068,7 @@ EXPECTED_DOWNLOADER = {
     "gsv": "download_gsv_metadata_async",
     "mapillary": "download_mapillary_metadata_async",
     "kartaview": "download_kartaview_metadata_async",
+    "panoramax": "download_panoramax_metadata_async",
 }
 
 

@@ -93,6 +93,33 @@ KARTAVIEW_EXTRA_DTYPES = {
 # The full KartaView run schema: shared core + KartaView extras.
 KARTAVIEW_METADATA_DTYPES = {**METADATA_DTYPES, **KARTAVIEW_EXTRA_DTYPES}
 
+# Panoramax-only columns (issue #316). DELIBERATELY THIN, and the reason is
+# worth stating so nobody "fixes" it by adding a licence column: Panoramax
+# publishes far richer per-picture metadata than this -- `license`,
+# `geovisio:producer`, `quality:horizontal_accuracy`, the `via` link naming the
+# source instance -- but ALL of it only through `/api/search`, which cannot be
+# the census (it does not paginate; see download_panoramax's module docstring).
+# What the z15 `pictures` layer carries is what is here, and buying the rest
+# would mean a second, unbounded request per picture.
+#   - account_id: the contributor, also embedded in copyright_info for parity
+#     with the other two census providers. Panoramax accounts are UUIDs, hence
+#     a string rather than KartaView's numeric id.
+#   - sequence_id: the tile's `first_sequence`, i.e. the owning capture run.
+#   - is_pano: type == "equirectangular"; anything else is flat imagery (#116).
+#   - image_type: the raw `type` string, kept BESIDE the boolean it produces.
+#     Two-state today across 119M federation pictures, but a run file records
+#     what the provider said -- so a third value Panoramax has never yet served
+#     appears in the data as itself instead of being silently counted as flat.
+PANORAMAX_EXTRA_DTYPES = {
+    "account_id": pd.StringDtype(),  # nullable string
+    "sequence_id": pd.StringDtype(),  # nullable string
+    "is_pano": pd.BooleanDtype(),  # nullable bool (null on ZERO_RESULTS rows)
+    "image_type": pd.StringDtype(),  # nullable string; the provider's own word
+}
+
+# The full Panoramax run schema: shared core + Panoramax extras.
+PANORAMAX_METADATA_DTYPES = {**METADATA_DTYPES, **PANORAMAX_EXTRA_DTYPES}
+
 # Provider token (as it appears in a run filename) -> that provider's run
 # schema. The read side of the naming contract: a run CSV is only self-
 # describing through its filename, and pandas INFERS any column a dtype
@@ -113,6 +140,7 @@ PROVIDER_RUN_DTYPES = {
     # could not be brought into step in the wrong order -- and
     # test_every_known_provider_has_a_run_schema holds the other direction.
     "kartaview": KARTAVIEW_METADATA_DTYPES,
+    "panoramax": PANORAMAX_METADATA_DTYPES,
 }
 
 
@@ -172,7 +200,22 @@ CHANNEL_ENV_VARS: dict[str, tuple[str, ...]] = {
     "kartaview_streets": ("KARTAVIEW_STREETS_ACCESS_TOKEN", "KARTAVIEW_ACCESS_TOKEN"),
     "mapillary": ("MAPILLARY_ACCESS_TOKEN",),
     "mapillary_streets": ("MAPILLARY_STREETS_ACCESS_TOKEN",),
+    # THE EMPTY TUPLE IS THE POINT, not an omission (issue #316). Panoramax
+    # reads are unauthenticated, so there is no variable to name -- and the
+    # honest way to say that is a declared channel with no variable, rather than
+    # leaving the channel out of this table entirely. Out of the table it would
+    # also drop out of the router's credentials-table check, so the one provider
+    # whose credential story is unusual would be the one provider CLAUDE.md
+    # never mentions. Keep the row; document it as "none".
+    "panoramax": (),
 }
+
+# Channels that need no credential at all, derived from the table above rather
+# than listed a second time. Read by load_config and by the tests that would
+# otherwise index CHANNEL_ENV_VARS[channel][0] and IndexError here.
+CREDENTIAL_FREE_CHANNELS = frozenset(
+    channel for channel, variables in CHANNEL_ENV_VARS.items() if not variables
+)
 
 
 def load_config(provider: str = "gsv") -> dict[str, Any]:
@@ -182,6 +225,10 @@ def load_config(provider: str = "gsv") -> dict[str, Any]:
     gsv requires GMAPS_API_KEY; mapillary requires MAPILLARY_ACCESS_TOKEN.
     Only the requested provider's credential is required, so a machine can
     run one provider without the other's key.
+
+    'panoramax' requires NOTHING and succeeds on any machine: its reads are
+    unauthenticated (issue #316). It is still a declared channel here rather
+    than an exception in the caller — see CREDENTIAL_FREE_CHANNELS.
 
     'gsv_streets' and 'mapillary_streets' are ISOLATED credential channels for
     street-coverage collection (issue #99): separate keys so street-sampling
@@ -323,8 +370,19 @@ def load_config(provider: str = "gsv") -> dict[str, Any]:
             )
         return config
 
+    if provider in CREDENTIAL_FREE_CHANNELS:
+        # THE ONE ARM THAT CANNOT RAISE, and it has to be that way rather than
+        # merely happening to be. `cli.py` loads EVERY requested provider's
+        # config up front — `--provider all` included — precisely so a host
+        # missing one key is told before anything collects; a channel that
+        # raised for a credential it does not have would take down every other
+        # provider in the same invocation.
+        #
+        # Returns the same `access_token` key its siblings do, set to None, so a
+        # caller can keep one shape. The Panoramax downloader takes no token
+        # parameter at all and never reads it.
+        return {"access_token": None}
+
     raise ValueError(
-        f"Unknown provider {provider!r} "
-        f"(known: gsv, mapillary, kartaview, gsv_streets, mapillary_streets, "
-        f"kartaview_streets)"
+        f"Unknown provider {provider!r} (known: {', '.join(sorted(CHANNEL_ENV_VARS))})"
     )

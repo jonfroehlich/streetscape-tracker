@@ -203,14 +203,19 @@ def test_every_census_provider_declares_its_store_format_in_one_place():
     module reads its format FROM here, so the probe compares against the same
     number the loader does.
     """
-    from streetscape_metadata_tracker import download_kartaview, download_mapillary
+    from streetscape_metadata_tracker import (
+        download_kartaview,
+        download_mapillary,
+        download_panoramax,
+    )
 
-    assert cp.CENSUS_PROVIDERS == {"kartaview", "mapillary"}
+    assert cp.CENSUS_PROVIDERS == {"kartaview", "mapillary", "panoramax"}
     assert (
         download_mapillary.MAPILLARY_CHECKPOINT_FORMAT_VERSION
         is cp.STORE_FORMAT_VERSIONS["mapillary"]
     )
     assert download_kartaview.CHECKPOINT_FORMAT_VERSION is cp.STORE_FORMAT_VERSIONS["kartaview"]
+    assert download_panoramax.CHECKPOINT_FORMAT_VERSION is cp.STORE_FORMAT_VERSIONS["panoramax"]
 
 
 def test_crawl_store_for_derives_both_paths_from_one_city_row():

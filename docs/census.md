@@ -395,3 +395,59 @@ The one input it cannot share is the deadline clamp — a preview has no night i
 
 The road walk is no longer absent: #258 generalized `collect_mapillary.build_streetwalk_rows` into the shared `census_walk.py` scorer and added `collect_kartaview.py`, and #299 made `kartaview_streets` the sixth scheduler channel — opt-in, like the grid channel it pairs with.
 It reads the same census by the same radius sweep, so it inherits the grid channel's cost arms wholesale: the same 1.80x overhead, the same geometric-floor estimate, and the same request cap, which is why both KartaView channels are `CHANNEL_RESUMABLE`.
+
+## Panoramax is the third census provider, and its primitive is Mapillary's with three differences (issue #316)
+
+**`download_panoramax.py` is shaped on `download_mapillary.py`, not on `download_kartaview.py`**, because the primitive is the same: a lattice of vector tiles fetched concurrently behind a semaphore, rather than a serial radius sweep whose next question depends on the last answer.
+Everything that follows from that shape is inherited rather than re-decided — `(x, y)`-keyed checkpoint parts, reassembly recomputed from `tiles_for_bbox` rather than stored, only-successful-tiles-commit, a zero-row tile getting a record and no file, checkpointing that fails OPEN, and promotion into the #290 cache as the last statement before the success return.
+Read the Mapillary sections above for all of it; this section is only what differs, and each difference is something a reader coming from that module will otherwise assume away.
+
+**The tile math moved down to `download_common.py` rather than being imported across providers.**
+`lonlat_to_tile_frac`, `tile_frac_to_lonlat`, `tiles_for_bbox` and `points_in_tiles` lived in `download_mapillary` until a second tile census needed them, and they moved for exactly the reason `grid_bbox` and `assign_to_grid` did one refactor earlier: pure geometry that merely happened to sit in the first provider that wanted it, with the alternative being one provider module importing another's.
+The shared `tiles_for_bbox` takes the zoom as a **required** argument — a lattice helper serving two providers at two zooms has no default to be right about — and each provider re-exposes it as a one-line wrapper carrying its own default, so no call site moved and `download_mapillary.tiles_for_bbox(*bbox)` still means z14.
+
+### 1. The census is the z15 `pictures` layer, and `/api/search` can never be it
+
+`/api/search` is the obvious instrument and it cannot count.
+It **does not paginate** — `links` comes back empty at `limit=1`, `limit=1000` and `limit=10000` alike, there is no `next`, and the response carries no `numberMatched` — so a bbox holding more pictures than `limit` is indistinguishable from one holding exactly `limit`, which is the one distinction a coverage census is made of.
+It **silently ignores its own `datetime` filter**: across 20 cities the requested windows should have excluded 5,045 baseline pictures and all 5,045 came back, so an incremental "everything since the last run" fetch would re-read the whole history and report every row as new.
+And it is enormous, because every feature embeds a ~90-key EXIF blob: 1,000 features is 7.7 MB and 10,000 is 75 MB.
+
+So the census is the v1 map endpoint's `pictures` layer, which starts at **z15** — the coarsest zoom that serves it at all, and therefore the cheapest.
+That is not a tunable and getting it wrong is silent rather than loud: below z15 the layer is absent entirely, so every tile would decode to nothing and the run would publish a city holding no imagery rather than failing.
+The cost that follows is a real difference from Mapillary and not a rounding one: the same bbox is ~4x the tiles, a catalog p50 of 35 against Mapillary's 12, and over the cities actually worth enrolling a p50 of 414 tiles, p90 2,400 and max 3,132 (~104 minutes at the shipped pace).
+`estimate_tile_count` counts that lattice exactly, offline and free, so unlike KartaView's sweep there is no observed-versus-geometric correction to carry.
+
+The v2 endpoint's H3 `grid` layer — aggregated counters rather than rows — is the *screen* instrument phase 1 used to price the whole catalog for 113 requests, and it is not read by the collector at all.
+
+### 2. A 403 or 429 is a per-IP refusal, and a 404 is an empty tile
+
+**There is no credential**, which changes what a 4xx can mean.
+On Mapillary and KartaView a 403 is a rejected token and is deliberately typed as a plain `DownloadError` scoped to the credential; here it cannot be, so **403 and 429 are both `HostBlockedError` at the first request** — stop, never retry, and let the scheduler's night-level breaker see it.
+`HOST_PANORAMAX` is the fourth locked host, with exit codes **84 blocked / 85 busy**, continuing past 83 rather than filling the 77/78 gap that stays open because those are `EX_NOPERM`/`EX_CONFIG`.
+
+**A 404 is an ANSWER, not a failure** — the opposite of Mapillary's reading, and measured rather than assumed: phase 1 saw 0 empty tiles across 3,321 requests *including 20 cities that hold no imagery at all*, because an empty area answers 200 with no picture layer.
+That reading needs a guard, and it is the one piece of this module with no Mapillary counterpart: **a lattice where every tile 404s is refused**.
+An empty city answers 200, so a whole lattice of 404s is what a moved or renamed endpoint looks like — and without the guard the run would finalize 0 panos and `diff.py` would report every pano in the city removed, into an immutable dated snapshot.
+
+### 3. `type` is two-state, and the raw value is published anyway
+
+Issue #316 read the 10–34% of `/api/search` results carrying no `pers:interior_orientation.field_of_view` as a third imagery state.
+It is not: every one of the 2,136 EXIF-less search pictures that could be looked up is `flat` in the tile layer, whose `type` has no absent state at all (federation-wide, 119,362,642 pictures = 52,128,373 `equirectangular` + 67,234,269 `flat` + 0 unclassified), and not one of the 1,345,143 pictures phase 1 read off this layer carried an absent type.
+That is what lets the census schema declare `is_pano` a **non-nullable `"bool"`** — the honest declaration, and the one `census.census_is_pano` documents at length the alternatives to.
+
+The raw string is published as `image_type` regardless, beside the boolean it produces.
+A run file records what the provider said, so a third `type` value Panoramax has never yet served appears in the data as itself rather than being counted as flat by the decoder and never seen again.
+The rest of the run schema is deliberately thin — `account_id`, `sequence_id`, `is_pano`, `image_type` — because that is what a tile carries: `license`, `geovisio:producer` and `quality:horizontal_accuracy` exist only in `/api/search`, so `copyright_info` names the contributor (the parity convention Mapillary's `creator_id` and KartaView's `username` already follow) rather than the licence.
+
+**The decoder reads `id` from the layer's properties ONLY, with no fall back to the MVT feature id** — which `download_mapillary`'s does have, and which would be a defect here.
+An MVT feature id is numbered per tile, so the fallback mints id `0` in every tile of the city, and `dedupe_census` factorizes on `id`: those collisions would silently collapse distinct pictures into one across the whole city.
+A picture the layer does not name is dropped instead.
+
+**Pacing is 30/min with jitter 0.6**, half the Mapillary channels' configured rate against a host with strictly less published guidance — nothing documents a limit anywhere found, and no `X-RateLimit-*` or `Retry-After` header comes back.
+The jitter is adopted before any incident rather than after three; see [`provider-access.md`](provider-access.md) for the full access survey and for what has and has not been asked.
+
+**Collectable by hand, not scheduled.**
+`streetscape_tracker.py --provider panoramax` collects a city, and `naming.KNOWN_PROVIDERS` carries the token so the run reads back under its own schema.
+But `scheduler.UNWIRED_CHANNELS` still holds `panoramax`, so a `[providers.panoramax]` block is dropped with an error rather than run: `estimate_requests`, `city_timeout_seconds`, the `enabled_providers` rank and the `_run_one_city` pacing flag have no arm for it yet, and each of those fails OPEN in the way #238 records.
+`CHANNEL_DEFAULT_MEMBERSHIP["panoramax"]` is already `False`, on a measurement rather than a cost argument: 730 of 1,144 enabled cities screen to a conclusive zero, so a default-membership channel would spend most of its slots confirming absence.

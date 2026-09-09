@@ -43,6 +43,7 @@ from . import (
     download_gsv_metadata_async,
     download_kartaview_metadata_async,
     download_mapillary_metadata_async,
+    download_panoramax_metadata_async,
     get_city_location_data,
     get_search_dimensions,
     load_config,
@@ -71,6 +72,10 @@ from .download_kartaview import (
     SweepIncompleteError,
 )
 from .download_mapillary import DEFAULT_TILE_JITTER, DEFAULT_TILE_REQUESTS_PER_MINUTE
+from .download_panoramax import DEFAULT_TILE_JITTER as DEFAULT_PANORAMAX_JITTER
+from .download_panoramax import (
+    DEFAULT_TILE_REQUESTS_PER_MINUTE as DEFAULT_PANORAMAX_REQUESTS_PER_MINUTE,
+)
 from .fileutils import load_city_csv_file
 from .json_summarizer import (
     generate_aggregate_v2,
@@ -412,6 +417,35 @@ def parse_args():
              run exits 83 and the next invocation resumes from the cells
              already answered, so a metro that needs 10 hours can be taken a
              night at a time. Default: sweep to completion.""",
+    )
+
+    concurrency_group.add_argument(
+        "--panoramax-max-requests-per-minute",
+        type=int,
+        default=DEFAULT_PANORAMAX_REQUESTS_PER_MINUTE,
+        help=f"""Client-side cap on Panoramax vector-tile requests per minute
+             (panoramax provider only). A FOURTH separate flag because this
+             limit is a fourth kind again: Panoramax documents no limit at all
+             — not in its API docs, not in its OpenAPI spec, and no
+             X-RateLimit-*/Retry-After header comes back — so there is no
+             published number to pace to and this one is chosen, not measured.
+             It is deliberately half the Mapillary cap against a host with
+             strictly less published guidance, and one that is a single
+             volunteer-run meta-catalog taking all of our load. Default
+             {DEFAULT_PANORAMAX_REQUESTS_PER_MINUTE}; 0 disables pacing.""",
+    )
+
+    concurrency_group.add_argument(
+        "--panoramax-jitter",
+        type=jitter_fraction,
+        default=DEFAULT_PANORAMAX_JITTER,
+        help=f"""Randomize the gap between Panoramax tile requests (panoramax
+             provider only), with the same shifted-exponential shape and the
+             same meaning as --mapillary-jitter: this number is the gaps'
+             coefficient of variation, not a plus-or-minus range, and the mean
+             rate is unchanged. Adopted here BEFORE any incident rather than
+             after three (issue #292). Default {DEFAULT_PANORAMAX_JITTER}; 0
+             restores the exact cadence.""",
     )
 
     parser.add_argument(
@@ -833,6 +867,30 @@ async def _collect_one_run(conn, args, city_row, run_date, provider, config, vis
                 # path above separates channels only as long as every caller
                 # derives it correctly, so the state file also records which
                 # ledger its spend belongs to and refuses to resume another's.
+                checkpoint_channel=provider,
+                census_cache=census_cache,
+            )
+        elif provider == "panoramax":
+            # NO access_token, and that is not an omission: Panoramax reads are
+            # unauthenticated, so `config` here is the credential-free arm's
+            # {"access_token": None} and the downloader takes no such parameter
+            # (issue #316).
+            dict_results = await download_panoramax_metadata_async(
+                city_name=city_row.display_name,
+                center_lat=city_row.center_lat,
+                center_lon=city_row.center_lon,
+                grid_width=city_row.grid_width_m,
+                grid_height=city_row.grid_height_m,
+                step_length=city_row.step_m,
+                output_csv_gz_path=output_csv_gz_path,
+                request_timeout=request_timeout,
+                max_requests_per_minute=args.panoramax_max_requests_per_minute,
+                jitter=args.panoramax_jitter,
+                checkpoint_path=checkpoint_path,
+                # The channel again, this time INSIDE the commit record: the
+                # path separates channels only as long as every caller derives
+                # it correctly, so the state file also records which ledger its
+                # spend belongs to and refuses to resume another's.
                 checkpoint_channel=provider,
                 census_cache=census_cache,
             )
