@@ -265,3 +265,96 @@ def test_kartaview_urls_percent_encode_their_row_values():
     assert viewer_url == "https://kartaview.org/details/1%2F..%2Fx%3Fa%3Db%26c%3Dd%22/1"
     for bad in ("/../", "?", "&", '"'):
         assert bad not in viewer_url.removeprefix("https://kartaview.org/details/")
+
+
+def test_no_display_entry_builds_a_link_it_has_no_address_for():
+    """
+    The Python half of the JS registry sweep (#312, PR #326), and the reason it
+    is a sweep: the browser-side guard shipped naming gsv and mapillary, and
+    the three PROVIDER_DISPLAY entries that mirror it kept building
+    ``...?pKey=``, ``...&pano=`` and ``.../pictures//sd.jpg`` from an empty id
+    — truthy strings, so the popup rendered a link to nowhere rather than no
+    link.
+
+    Reachability here is narrow (``create_visualization_map`` plots only
+    ``status == "OK"`` rows, so FLAT_ONLY never arrives), which is exactly why
+    it needs a test rather than a reader: nothing about the rendered map would
+    have shown the drift, and the entry that will next be copied into the JS
+    registry is one of the three that was wrong.
+
+    KartaView passes on its own guard, not on the shared one — it is addressed
+    by (sequence_id, sequence_index) — which is the rule being pinned: no link
+    without something to address it with, not no link without an id.
+    """
+    empty_row = pd.Series({"sequence_id": None, "sequence_index": None})
+    for provider, display in vis.PROVIDER_DISPLAY.items():
+        for missing in ("", None, pd.NA):
+            assert display["viewer_url"](missing, empty_row) is None, (
+                f"{provider} built a link from {missing!r}"
+            )
+
+
+def test_id_addressed_display_entries_percent_encode_the_id():
+    """
+    The contract ``test_kartaview_urls_percent_encode_their_row_values`` states
+    for the row-addressed builder, held for the id-addressed ones too. It did
+    not hold before PR #326: gsv and mapillary interpolated ``pano_id`` raw
+    while kartaview and panoramax encoded it, and ``pano_id`` is a nullable
+    STRING column, so a hostile or corrupt value is a decode away rather than a
+    schema violation.
+
+    The failure this closes is concrete — an id of ``a" onmouseover=...``
+    terminated the href in the folium popup and turned the remainder into a
+    live attribute, inside the very anchor whose ``rel="noopener"`` was being
+    added at the time.
+    """
+    hostile = 'a" onmouseover=alert(1) x='
+    row = pd.Series({"sequence_id": "8313353", "sequence_index": 936})
+    for provider in ("gsv", "mapillary", "panoramax"):
+        url = vis.PROVIDER_DISPLAY[provider]["viewer_url"](hostile, row)
+        for bad in ('"', " ", "<", ">"):
+            assert bad not in url, f"{provider} left {bad!r} unencoded in {url!r}"
+
+
+def test_a_photographer_credit_cannot_inject_markup_into_a_popup():
+    """
+    ``copyright_info`` is arbitrary third-party content — contributor names
+    from Mapillary and KartaView, archival GSV credits — and reached the popup
+    template unescaped while city.js escaped the same field with a comment
+    saying why. The run map is a local artifact an operator opens, never
+    published (the publish rsync walks ``data/`` only), so the blast radius is
+    one browser; it is still the operator's.
+
+    Rendered as MAPILLARY, not gsv: a gsv map keeps only ``is_google_copyright``
+    rows, so a hostile credit is filtered out before it can reach a popup and
+    the test would pass on an empty map. The providers whose credits are
+    arbitrary are precisely the ones with no copyright filter.
+    """
+    df = _frame([_row("p1", 47.60, -122.33)])
+    df["copyright_info"] = "<img src=x onerror=alert(1)>"
+    rendered = (
+        vis.create_visualization_map(df, "Seattle, WA", provider="mapillary").get_root().render()
+    )
+    assert "<img src=x onerror=alert(1)>" not in rendered
+    assert "&lt;img src=x onerror=alert(1)&gt;" in rendered
+
+
+def test_the_js_registry_guards_its_id_addressed_viewers_too():
+    """
+    Read the JS the way ``test_the_js_registry_builds_the_same_kartaview_urls``
+    does, and pin the guard rather than the URL. Both copies rejecting the same
+    unlinkable rows is the whole value of maintaining two, and this pair
+    drifted the moment one side was fixed: PR #326 guarded the JS entries and
+    left all three Python ones building the dead link.
+    """
+    js_path = pathlib.Path(__file__).resolve().parent.parent / "www" / "js" / "streetscape-utils.js"
+    js = js_path.read_text(encoding="utf-8")
+
+    # The JS sweep asserts this for every registered provider; assert here that
+    # the sweep exists, so deleting it on that side is a failure on this one.
+    assert "no registered provider builds a link it has no address for" in (
+        (js_path.parent / "__tests__" / "streetscape-utils.test.js").read_text(encoding="utf-8")
+    )
+    # And that the two id-addressed entries actually carry a conditional.
+    assert "panoId\n        ? `https://www.google.com/maps/@" in js
+    assert "panoId ? `https://www.mapillary.com/app/?pKey=" in js

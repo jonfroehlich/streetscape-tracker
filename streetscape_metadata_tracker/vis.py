@@ -1,5 +1,6 @@
 # streetscape_metadata_tracker/vis.py
 
+import html
 import json
 import logging
 from datetime import datetime
@@ -177,6 +178,41 @@ def display_search_area(
     return m
 
 
+def _id_addressed_viewer_url(template: str):
+    """
+    Build the viewer-URL builder for a provider addressed BY its image id.
+
+    Mirrors the ``panoId ? ... : null`` guard the gsv and mapillary entries of
+    the PROVIDERS registry in www/js/streetscape-utils.js carry (issue #312):
+    an empty id interpolated into the template yields a TRUTHY string —
+    ``...?pKey=``, ``.../pictures//sd.jpg`` — which every consumer renders as a
+    link to nowhere rather than as no link. None is what they already treat as
+    "this row is not addressable".
+
+    Only narrowly reachable on this side: ``create_visualization_map`` plots
+    ``status == "OK"`` rows, so the FLAT_ONLY shape that made this a live bug
+    in the browser never reaches the marker loop, and it takes an id of ``""``
+    surviving a census decoder's ``is None`` guard to get here at all. The
+    guard is spelled anyway, because what these two registries are FOR is
+    saying the same thing, and a divergence is invisible from either side alone
+    — which is why tests/test_vis.py reads the JS source rather than trusting
+    that someone updated both.
+
+    The id is percent-encoded for the reason ``_kartaview_map_url`` encodes a
+    float: not because the column is expected to carry a delimiter, but because
+    two builders spelled differently are how they start meaning different
+    things. Unencoded, a ``"`` in the id closes the href in the folium popup
+    and everything after it becomes live markup.
+    """
+
+    def build(pano_id, row) -> str | None:
+        if pd.isna(pano_id) or pano_id == "":
+            return None
+        return template.format(id=quote(str(pano_id), safe=""))
+
+    return build
+
+
 def _kartaview_viewer_url(pano_id, row) -> str | None:
     """
     KartaView viewer deep-link for one census row, or None when unlinkable.
@@ -252,8 +288,8 @@ PROVIDER_DISPLAY = {
     "gsv": {
         "label": "GSV",
         "viewer_label": "View in GSV",
-        "viewer_url": lambda pano_id, row: (
-            f"https://www.google.com/maps/@?api=1&map_action=pano&pano={pano_id}"
+        "viewer_url": _id_addressed_viewer_url(
+            "https://www.google.com/maps/@?api=1&map_action=pano&pano={id}"
         ),
         "map_label": None,
         "map_url": None,
@@ -261,7 +297,7 @@ PROVIDER_DISPLAY = {
     "mapillary": {
         "label": "Mapillary",
         "viewer_label": "View in Mapillary",
-        "viewer_url": lambda pano_id, row: f"https://www.mapillary.com/app/?pKey={pano_id}",
+        "viewer_url": _id_addressed_viewer_url("https://www.mapillary.com/app/?pKey={id}"),
         "map_label": None,
         "map_url": None,
     },
@@ -295,8 +331,8 @@ PROVIDER_DISPLAY = {
         # label is, because #316 and #312 arrived at the same rule from
         # opposite directions -- see the note above the table.
         "viewer_label": "Open this Panoramax picture",
-        "viewer_url": lambda pano_id, row: (
-            f"https://api.panoramax.xyz/api/pictures/{quote(str(pano_id), safe='')}/sd.jpg"
+        "viewer_url": _id_addressed_viewer_url(
+            "https://api.panoramax.xyz/api/pictures/{id}/sd.jpg"
         ),
         "map_label": None,
         "map_url": None,
@@ -500,12 +536,19 @@ def create_visualization_map(df: pd.DataFrame, city_name: str, provider: str = "
             for url, link_label in links
             if url
         )
+        # copyright_info is arbitrary third-party content -- Mapillary and
+        # KartaView contributor names, archival GSV photographer credits -- so
+        # it is escaped before entering popup markup, exactly as city.js's
+        # escapeHtml treats the same field. Unescaped, a `<img src=x onerror=>`
+        # in a contributor name executes in the operator's browser when the run
+        # map is opened. The rest of this template is derived numbers and dates.
+        photographer = html.escape(str(row["copyright_info"]))
         popup = folium.Popup(
             f"""
             <div>
                 Capture Date: {date_str}
                 <br>Age: {age_years:.1f} years
-                <br>Photographer: {row["copyright_info"]}{viewer_link}
+                <br>Photographer: {photographer}{viewer_link}
             </div>
         """,
             max_width=300,

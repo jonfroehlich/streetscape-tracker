@@ -164,10 +164,19 @@ const PROVIDERS = {
     attribution: "Panorama metadata © Google",
     viewerLabel: "View in Google Street View",
     // Null without an id, because this viewer is addressed BY the id: an empty
-    // one builds `...&pano=`, which is a link to nowhere rather than no link.
-    // The FLAT_ONLY popup can hand this an empty id (its own id line is
-    // dropped in that case) and a fallback keyed on geometry may still render,
-    // so "no id" and "no popup" stopped being the same thing.
+    // one builds `...&pano=`, a truthy string that every consumer renders as a
+    // link to nowhere rather than as no link.
+    //
+    // The guard sits on each id-addressed entry rather than on
+    // viewerLinksHtml, because "needs the image id" is a property of the
+    // provider's VIEWER and not of the popup: KartaView's is addressed by
+    // (sequence_id, sequence_index) and must keep its link for a row that has
+    // no id at all. Centralising the check would have taken that away.
+    //
+    // On gsv this is defence in depth and nothing more, so read no reachability
+    // into it: gsv declares hasFlatImagery false and no fallback, so the
+    // FLAT_ONLY popup -- the one caller that can pass an empty id -- never runs
+    // with gsv selected. The mapillary entry below is where it is reachable.
     viewerUrl: (panoId) =>
       panoId
         ? `https://www.google.com/maps/@?api=1&map_action=pano&pano=${encodeURIComponent(panoId)}`
@@ -188,9 +197,13 @@ const PROVIDERS = {
     attribution:
       'Image metadata © <a href="https://www.mapillary.com">Mapillary</a>, CC BY-SA',
     viewerLabel: "View in Mapillary",
-    // Null without an id, for the reason spelled out on the gsv entry above.
-    // Mapillary is the provider this actually reaches: FLAT_ONLY rows exist
-    // only where hasFlatImagery is true, which gsv is not.
+    // Null without an id, for the reason spelled out on the gsv entry above --
+    // and this is the entry that reason is REAL for, so it is the one to read
+    // if the rule ever looks like ceremony. A FLAT_ONLY row can carry no image
+    // id, and mapillary is the only ID-ADDRESSED provider publishing flat
+    // imagery: kartaview publishes it too but is addressed by sequence, so no
+    // id-less kartaview row ever depended on this. The dead `?pKey=` link the
+    // guard prevents is one #314 actually shipped.
     viewerUrl: (panoId) =>
       panoId ? `https://www.mapillary.com/app/?pKey=${encodeURIComponent(panoId)}` : null,
     fallbackViewerLabel: null,

@@ -344,12 +344,18 @@ test("a popup puts the link that works first", () => {
 });
 
 test("an id-addressed viewer builds no link without an id", () => {
-  // Regression from #312's own fix: buildFlatOnlyPopupHtml now asks for its
-  // links BEFORE the missing-id early return, so a provider whose viewerUrl
-  // interpolates the id unconditionally started rendering `...pKey=` -- a link
-  // to nowhere, which is the thing that early return existed to prevent.
-  // Mapillary is the one this reaches: FLAT_ONLY rows only exist where
-  // hasFlatImagery is true, which gsv is not.
+  // Regression from #312's own fix: #314 hoisted viewerLinksHtml ABOVE
+  // buildFlatOnlyPopupHtml's missing-id early return, so a provider whose
+  // viewerUrl interpolates the id unconditionally started rendering `...pKey=`
+  // -- a link to nowhere, which is the thing that early return existed to
+  // prevent. Mapillary is the one this reaches: FLAT_ONLY rows only exist
+  // where hasFlatImagery is true, which gsv is not.
+  //
+  // Asserted against the registry and viewerLinksHtml rather than against the
+  // popup builder, because city.js builds a Leaflet map at load and cannot be
+  // imported here. These assertions do fail on the pre-fix registry, so they
+  // pin the defect; what pins the popup's call ORDER is the source check
+  // further down this file, not this test.
   assert.equal(PROVIDERS.gsv.viewerUrl(""), null);
   assert.equal(PROVIDERS.mapillary.viewerUrl(""), null);
   assert.equal(viewerLinksHtml(PROVIDERS.mapillary, "", {}), "");
@@ -358,6 +364,26 @@ test("an id-addressed viewer builds no link without an id", () => {
   // photo link -- the guard belongs to each builder, not to viewerLinksHtml.
   const row = { sequence_id: "8313353", sequence_index: 936 };
   assert.match(PROVIDERS.kartaview.viewerUrl("", row), /details\/8313353\/936/);
+});
+
+test("no registered provider builds a link it has no address for", () => {
+  // The sweep the test above is not. That one names gsv and mapillary, so a
+  // provider registered later inherits none of the rule -- and the next one
+  // due here is already written in the unguarded form: vis.PROVIDER_DISPLAY's
+  // panoramax entry (#316 phase 2) interpolates the id unconditionally, and
+  // `https://api.panoramax.xyz/api/pictures//sd.jpg` is a truthy string, so
+  // viewerLinksHtml would render "Open this Panoramax picture" pointing at a
+  // 404 with this whole suite green. Panoramax publishes flat imagery, so a
+  // FLAT_ONLY row with no id is the same reachable shape as Mapillary's.
+  //
+  // KartaView passes vacuously -- it is addressed by (sequence_id,
+  // sequence_index), and its own guard rejects a row carrying neither -- which
+  // is the point of sweeping viewerUrl rather than the id: the rule is "no
+  // link without something to address it with", not "no link without an id".
+  for (const [key, p] of Object.entries(PROVIDERS)) {
+    assert.equal(p.viewerUrl("", {}), null, `${key}: empty id`);
+    assert.equal(p.viewerUrl(undefined, undefined), null, `${key}: no id and no row`);
+  }
 });
 
 test("a row value cannot break out of the href it is interpolated into", () => {
