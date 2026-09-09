@@ -1068,9 +1068,12 @@ def test_makelab1_production_config_is_wired():
         assert pc.enabled, f"{channel} resumed under #292"
         assert pc.max_requests_per_minute == 40
         assert pc.jitter == pytest.approx(0.6)
-    # The restart is about the mechanism, not the sizing — the budgets stay at the
-    # values #241/#267 argued for; a fourth cut has no mechanism to work through.
-    assert cfg.providers["mapillary"].daily_request_budget == 1_750
+    # The #292 restart was about the mechanism, not the sizing, and shipped at the
+    # 1,750 both channels had carried since #241. The grid channel moved to 3,500 on
+    # 2026-09-05, once the pre-registered jitter window closed — a 20-city budget
+    # meeting the 40-city night #304 created, not a relaxation of the block posture.
+    # The walk channel is unchanged: since #290 it spends 0 on a paired night.
+    assert cfg.providers["mapillary"].daily_request_budget == 3_500
     assert cfg.providers["mapillary_streets"].daily_request_budget == 1_750
     # kartaview was turned on in production on 2026-08-28, the separate deploy
     # decision this assertion previously withheld (#248). Enabling the CHANNEL
@@ -1151,23 +1154,43 @@ def test_makelab1_production_config_is_wired():
     # per app, at 21% and 10% of it, 302 not 4xx). #214's bet that the 60/min
     # pace was the real protection was FALSIFIED on 2026-08-20 (issue #241:
     # blocked while obeying it exactly, at 5,013/day the day after 5,753 ran
-    # clean), and only a rolling 2-3 day per-IP window fits both incidents
-    # (2-day threshold in (7,061, 10,766]). Split EVENLY because both channels
+    # clean), and #241 read that as a rolling 2-3 day per-IP window fitting
+    # both incidents (2-day threshold in (7,061, 10,766]). SUPERSEDED: block 3
+    # retired that window and every other 1-8 day accumulation band (#286, and
+    # see the note below) -- it is kept here as the derivation the numbers came
+    # from, not as a live hypothesis. The EVEN split it chose (both channels
     # read the identical z14 tile census, so the budgets deplete in lockstep
     # and a heavy slate defers the same cities on both channels rather than
-    # un-pairing them. Pinned exactly, not bounded
+    # un-pairing them) is likewise history: #290 made the walk price at 0 on a
+    # paired night, and 2026-09-05 made the split 2:1. Pinned exactly, not bounded
     # loosely: this is the sort of number that drifts upwards one "just a bit
     # more" at a time, and the whole point is that a change to it is a
     # decision someone made on purpose.
     mly = cfg.providers["mapillary"].daily_request_budget
     mly_streets = cfg.providers["mapillary_streets"].daily_request_budget
-    assert mly == 1_750
+    assert mly == 3_500
     assert mly_streets == 1_750
-    assert mly + mly_streets == 3_500, (
-        "the tile block is per IP, so the two channels' budgets SUM — the "
-        "2026-08-22 cut keeps any 2-day total at <= 7,000, at or below the "
-        "highest value ever observed clean (7,061), because only a rolling "
-        "2-3 day window fits both blocks (issue #241, see CLAUDE.md)"
+    # The sum is still the figure that matters, because the block is per IP and
+    # these are two tokens at one address. What changed on 2026-09-05 is the
+    # BASIS for it, not the fact that it binds. #241 sized 1,750 + 1,750 so any
+    # 2-day total stayed under 7,000; block 3 retired that window entirely
+    # (#286), and #304 then doubled max_cities_per_day without the budget
+    # following, so the grid channel pinned its cap on the first two 40-city
+    # nights. Both ends are named in the MESSAGE rather than in a second
+    # assertion: the un-paired sum is the only one of the two that this line
+    # can actually constrain, because the paired figure IS the grid channel's
+    # own budget (mly_streets prices at 0 under #290's census reuse) and is
+    # already pinned at mly == 3_500 above. A second `assert mly == 3_500`
+    # here would restate that line while touching nothing about mly_streets,
+    # so it is deliberately not written.
+    assert mly + mly_streets == 5_250, (
+        "an UN-PAIRED night is the worst case and it is 1.5x the ceiling #241 "
+        "sanctioned — the honest cost of the 2026-09-05 raise, accepted only "
+        "because block 3 falsified daily volume and every 1-8 day window "
+        "(#286), never because volume is known safe. The PAIRED night is "
+        "3,500 + 0, the ceiling #241 already sanctioned; moving EITHER "
+        "channel's budget has to argue with both numbers (issue #286, "
+        "docs/provider-access.md)"
     )
     # The per-minute pace is still pinned — an unpaced burst (~370/min) is
     # confirmed harmful — but per #241 it is NOT sufficient on its own, and per

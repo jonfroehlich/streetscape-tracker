@@ -163,7 +163,7 @@ A multi-hour KartaView sweep is that channel: last, exactly one channel eats the
 `mapillary` (rank 2) launches before `mapillary_streets` (rank 3), so within a city the grid run pays for the shared z14 census and the walk reads it for zero requests; `kartaview` (4) and `kartaview_streets` (5) are the same pair over the radius sweep, wired in #258.
 Measured on the first KartaView walk (Krabi, 2026-08-31): 87 sweep requests un-paired, against the 18,851 that same walk costs on `gsv_streets` at one request per on-street sample — and 0 on any night the grid run got there first.
 That is a consequence of the existing ranking rather than a new constraint on it — reversing the pair would simply move which channel's ledger carries the spend, and `census_fetched_by` would record that faithfully either way — but it is why the two are ranked adjacently and why nothing should separate them.
-Nothing else here has that (Mapillary's checkpoint is #256, and a truncated tile census re-spends against a 3,500/day per-IP ceiling).
+Nothing else here has that (Mapillary's checkpoint is #256, and a truncated tile census re-spends against the per-IP ceiling — 3,500/day on a paired night, 5,250 un-paired since the 2026-09-05 re-size, see docs/provider-access.md).
 **Cheapest is not free, in two ways that both matter.**
 No channel keeps its ledger row through a SIGKILL, whatever its provider.
 And a SIGKILL still counts a `consecutive_failure` — only a *deliberate* pause (exit `SWEEP_INCOMPLETE_EXIT_CODE`) is amnestied — so the resumption that justifies this ranking is itself bounded at five nights.
@@ -277,7 +277,7 @@ Dividing makes the knob a no-op at 1 and bounded above it; the trade is that a c
 **Two things gated raising it in production. The first is now satisfied; the second is still outside this repo.**
 (1) **Resume for every provider**, because a deadline or a `systemctl stop` now kills up to N children at once instead of 1.
 This is **met as of #256**: GSV grid (`.downloading` sibling), the GSV road walk (same `collect_points_async` engine), KartaView (`checkpoints/`, #239) and both Mapillary channels (`checkpoints/`, #256) all resume,
-so a killed child costs the tiles it had not yet fetched rather than the ones it had — which mattered here because a re-spend lands against the deliberate 3,500/day per-IP ceiling, i.e. ban risk under #241 rather than merely lost time.
+so a killed child costs the tiles it had not yet fetched rather than the ones it had — which mattered here because a re-spend lands against the deliberate per-IP ceiling — 3,500/day paired and 5,250 un-paired since 2026-09-05 (#286) — i.e. ban risk rather than merely lost time.
 A killed child still records no `api_usage` at all (#238), and that loss multiplies by N — unchanged by the checkpoint, since it is the parent that never sees the number.
 (2) **`gsv` and `gsv_streets` hold no per-IP lock**, because Google meters per Cloud *project* rather than per IP — so running them together is only safe while `GMAPS_API_KEY` and `GMAPS_STREETS_API_KEY` really do live in **separate projects**.
 Nothing in this repo records which project either key belongs to; it is a console check, and a shared project must be fixed by splitting the keys, never by inventing a fake `CHANNEL_HOSTS` entry (that would couple the night-level breaker to a condition that is not a host refusal).

@@ -81,7 +81,7 @@ max_batch_hours = 12
 #      48k+24k req/min on one quota with nothing serializing them). Record the
 #      project IDs and the date of the check here when it is done.
 #   2. Issue #256 landed — resume for the Mapillary tile census. Until then a
-#      killed child re-spends tiles against the 3,500/day per-IP ceiling.
+#      killed child re-spends tiles against the per-IP ceiling (3,500/day paired, 5,250 un-paired since 2026-09-05).
 # Go to 2 before 3: gsv is the long pole and already overlaps each short channel
 # in turn at 2, for half the blast radius. See docs/scheduler.md.
 max_concurrent_channels = 1
@@ -146,9 +146,10 @@ enabled = true
 #
 # That arithmetic is preserved as written in 2026-08. sleep_between_cities_s
 # became 5 in #306, which raises the ceiling it derives -- but not by much and
-# not in a way anything here depends on: max_cities_per_day = 20 caps a nightly
-# run long before the tile figure binds, and the budget below is 1,750 for
-# unrelated reasons (three per-IP blocks). Left as a dated record of a bet that
+# not in a way anything here depends on: max_cities_per_day (20 when this was
+# written, 40 since #304) caps a nightly run long before the tile figure binds,
+# and the budget below was 1,750 for unrelated reasons (three per-IP blocks) --
+# 3,500 since the 2026-09-05 re-size. Left as a dated record of a bet that
 # later lost, not as a live derivation.
 #
 # BE HONEST ABOUT WHAT THIS IS: 15,000 + mapillary_streets' 5,000 = 20,000/day
@@ -169,16 +170,56 @@ enabled = true
 # both channels read the identical z14 census. SINCE #290 THE WALK NO LONGER
 # RE-READS THOSE TILES: it reuses the grid run's census for 0 requests on a
 # paired night, so mapillary_streets' budget is spent only on nights the two
-# are NOT paired. The values are unchanged — re-sizing them for the lighter
-# load is #286's question. The even split still matters for the un-paired
-# case, where the two budgets deplete in lockstep and a heavy slate defers the
-# same cities on both channels instead of un-pairing them further. A
+# are NOT paired. NOTE (2026-09-05, #286): the values above are the 08-22
+# ones and the even split is HISTORY, not the current state — this channel is
+# now 3,500 and mapillary_streets is still 1,750, so the split is 2:1 and the
+# sum is 3,500 paired / 5,250 un-paired. The lockstep argument went with it:
+# since #290 the walk's estimate is 0 on a paired night, so the two budgets
+# do not deplete together at all. A
 # normal 20-city night (~1,150 tiles per channel) fits; a catch-up-scale
 # burst is impossible by construction, ON PURPOSE -- no `--limit` catch-ups until a rolling
 # multi-day guard exists (#241). Recovery recipe, measured twice: full
 # silence, then one single-request probe; both blocks cleared within ~a day
 # of the last refused request.
-daily_request_budget = 1750
+#
+# Decided 2026-09-05, deployed only after the 09-09 window (see the timing
+# note at the end of this comment): 1,750 -> 3,500, and NOT a softening of the block
+# posture -- it is the sizing #241 left open, finally matched to the night it
+# has to cover. 1,750 was sized for a 20-city night on 2026-08-22;
+# max_cities_per_day went 20 -> 40 in #304 on 09-02 and this figure did not
+# follow, so the cap started binding immediately: 1,736 and 1,723 spent on the
+# first two 40-city nights against four 20-city nights that peaked at 1,241.
+# Per-city cost over the 1,398 runs collected is median 9, p90 81, max 870,
+# mean 39 -- but SIZE ON THE UNBIASED NUMBER, not that one: the gate skips
+# exactly the expensive cities, so the 85 enabled cities with no Mapillary run
+# average a 728.6 km2 grid against 131.6 km2 for the 1,132 that have one. The
+# geometry mean over all enabled cities is 57.8 and the per-city mean over
+# latest runs is 45.2, so a 40-city night demands ~1,800-2,400, not ~1,560 --
+# as 09-03 showed by demanding 2,260 (1,736 spent + 484 + 40 skipped). 3,500
+# is ~1.5x headroom over a normal night, not 2.2x.
+# It bound twice in six nights, both on an end-of-night sliver rather than an
+# unaffordable city (New York wanted 484 with 426 left) -- that tail is #318's
+# capped-and-resume, not this raise.
+#
+# THE NUMBER TO QUOTE IS THE PER-IP SUM WITH mapillary_streets, not this line.
+# That channel stays at 1,750 and, since #290, spends 0 on a paired night by
+# reusing the grid census -- 5 of the 6 nights 08-30..09-04 spent exactly 0.
+# So a paired night is 3,500 + 0, the same combined ceiling #241 sanctioned.
+# An un-paired night can reach 5,250: 1.5x that ceiling, the most this host
+# has been configured for since the 2026-08-22 cut (for ~2 days after block 2
+# it still sat at 15,000 + 5,000), and the honest cost of this change.
+# Accepted because block 3 (1,938/day, against 26,363 clean on 08-14)
+# falsified daily volume and every accumulation window from 1 to 8 days
+# (#286) -- NOT because volume is known safe here. Nothing about this host is.
+# The structurally right fix is one per-IP pool both channels draw from, which
+# is a scheduler change and is not attempted here.
+#
+# Deliberately held until AFTER #292's pre-registered jitter window closed
+# (~2026-09-09); production ran at 1,750 for every night up to that point.
+# Volume is an axis that test holds still, so raising it inside
+# the window would have handed a fourth block two candidate causes where the
+# design went to real trouble to leave one. Cost of waiting: the two skips.
+daily_request_budget = 3500
 # Client-side tile pacing (issue #198). Shared per-IP with mapillary_streets
 # below and with any manual run on this host — the host lock (#208) is what
 # makes this figure the real one rather than a per-process wish.
@@ -231,9 +272,13 @@ spacing_m = 15
 # local spatial join against the tiles. Budgeted in tile
 # requests against the SAME per-IP ceiling as [providers.mapillary] above, not
 # against the per-app cap: different tokens, one address, so the number that
-# matters is the SUM -- 1,750 + 1,750 = 3,500/day as of 2026-08-22; see the
-# issue #241 note in [providers.mapillary]. Split evenly: a road walk reads
-# the identical tile census as the grid run. Since #290 it REUSES that census
+# matters is the SUM -- 3,500/day on a PAIRED night and 5,250 if the pair
+# splits, as of the 2026-09-05 re-size (#286): [providers.mapillary] is 3,500
+# and this channel is 1,750. It was 1,750 + 1,750 = 3,500, split evenly, from
+# 2026-08-22 until then; see the issue #241 and #286 notes in
+# [providers.mapillary]. The even split bought lockstep depletion, which #290
+# had already ended: a road walk reads the identical tile census as the grid
+# run, but now reuses it rather than re-reading it. Since #290 it REUSES that census
 # rather than re-reading it, so on a paired night this channel spends nothing
 # and this budget is drawn on only when the pair is split apart.
 # PAUSED 2026-08-28 with [providers.mapillary] — same IP, same tile CDN, so
