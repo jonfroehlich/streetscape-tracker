@@ -195,7 +195,16 @@ def probe_v2_controls(
                 if resp.headers.get("Content-Type", "").startswith("application/json")
                 else {}
             )
-            code = (body.get("status") or {}).get("apiCode")
+            # The same three shapes ask_details guards, for the same reason: a
+            # Content-Type that promises JSON is a claim, not a guarantee, so
+            # resp.json() can raise ValueError -- which is NOT a
+            # RequestException, so the handler below never saw it -- and a body
+            # that parses to an array makes .get() raise AttributeError. Either
+            # one killed the run at the very check that tells a host-wide
+            # outage apart from one broken endpoint, which is the control this
+            # whole probe is built around.
+            status = body.get("status") if isinstance(body, dict) else None
+            code = status.get("apiCode") if isinstance(status, dict) else None
             out.append(
                 {
                     "url": url,
@@ -204,7 +213,7 @@ def probe_v2_controls(
                     "ok": resp.status_code == 200 and str(code) == "600",
                 }
             )
-        except requests.RequestException as e:
+        except (requests.RequestException, ValueError) as e:
             out.append(
                 {
                     "url": url,
