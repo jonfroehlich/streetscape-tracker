@@ -96,6 +96,8 @@ That is a decision rather than a task — it identifies this project to the vend
 
 **`[providers.mapillary].daily_request_budget` goes to 3,500; `[providers.mapillary_streets]` stays 1,750.**
 Decided and written 2026-09-05, and deliberately **not deployed** until #292's jitter window closed — production ran at 1,750 every night through 2026-09-09, so read any date before the deploy as the authoring date, not the live configuration.
+It reached production at **~11:00 on 2026-09-09**, hours after that morning's 1,750-budget night had already finished, so the first run this figure governs is **09-10**.
+Read the live number off the nightly log's own `within daily budgets of …` line rather than off this file or the config comment; for five days they disagreed by design.
 The grid channel's figure doubled for a reason that has nothing to do with the block model, and it is worth separating from one: 1,750 was sized on 2026-08-22 (#241) for a **20-city** night, and `max_cities_per_day` went 20 → 40 on 2026-09-02 (#304) without the budget following.
 The ledger shows that seam precisely — the first two 40-city nights pinned the cap, after four 20-city nights that never came close:
 
@@ -199,7 +201,10 @@ That code is deliberately **not** 2: argparse already exits 2 on a parse error a
 `--limit` is validated the same way and for the same reason (`< 1` would collect nothing and exit 0).
 An explicit `--limit N` **overrides `[schedule].max_cities_per_day`** for that invocation, because otherwise the config's 20 silently wins where the budget would allow ~30 cities;
 the nightly systemd unit passes no `--limit` and is unaffected.
-(Catch-ups stay **paused** — #241's rolling guard was the original condition and block 3 retired the window it would have guarded, so the pause now rests on the general ground that a multi-night burst is the one shape known to precede a block; see the superseded budget section above. The mechanism here is unchanged and stays the only supported path when they resume.)
+**Catch-ups are un-paused as of 2026-09-09**, on the read-out section below.
+#241's rolling guard was the original condition; block 3 retired the window it would have guarded, and the only ground left for the pause — that a multi-night burst is the one shape known to precede a block — is exactly what eleven clean nights at a steady cadence now speak to.
+They resume **staged, never at the ceiling**: the jitter window never spent more than 1,736 requests in a night, so a catch-up that fills the 3,500 budget on night one is a volume step no measurement covers.
+Raise the nightly spend in increments above the previous week's observed maximum, read the ledger each morning, and prefer cities that have **never** been collected on Mapillary — those cannot un-pair a snapshot that does not exist (see the next section).
 `--limit N` does **not** truncate the candidate list to N — a candidate can be skipped without being processed (budget guard, host breaker, busy lock), so pre-slicing let the loop run out of list below N and report a clean night, which is this flag's own bug one layer down.
 
 ## A filtered run is not a narrower nightly run: it un-pairs the cities it touches
@@ -282,9 +287,23 @@ The restart was planned for Mon 2026-08-31 but the deploy landed on Sat 2026-08-
 A fourth block around **2026-09-04/05** — the 6th active night is 09-04 — under jitter and the shared census's halved paired-night spend (issue #290, PR #291) means rate, volume *and* request pattern are all dead, the trigger is cadence (consecutive active days, or a trust score), and the next move is scheduling rest days for the Mapillary channels — not more pacing.
 That inference is only as strong as the treatment, which is why the distribution was moved from uniform to exponential before the restart rather than after: at CV 0.35 a fourth block would have been ambiguous between "the trigger is cadence" and "the jitter was too mild to move the score", and at CV 0.6 against Poisson's 1.0 that second reading is much harder to sustain.
 It is not *impossible* to sustain — the remaining gap to 1.0, and the unchanged duty cycle (~44 minutes of unbroken traffic, no gap over ~10 s), are the honest limits on the conclusion.
-Clean through ~2026-09-09 means keep the setting.
+Clean through ~2026-09-09 means keep the setting — and it was clean; the read-out is the next section.
 Bundling the shared census (#290) with the jitter means a clean result cannot say which one worked; that is accepted, since a block would falsify both at once.
 Deliberately **not** changed in the same round: tile order (raster → shuffled), because a second pattern change would confound the same test.
+
+## The read-out: eleven clean nights, so the jitter stays (issue #292, 2026-09-09)
+
+**The pre-registered test passed.**
+Nights 1–11 — 2026-08-30 through 2026-09-09, with no paused days, so the active-night and calendar readings coincide — all ran clean: no 302 to a login page, no blocked-family exit, and every September `consecutive_failures` row at zero.
+Night 6 (09-04) is the night both prior blocks landed on and the night #286 named in advance; it passed, and so did the five after it.
+Eleven active nights is **1.8× the six-active-night interval that produced all three blocks**, so the interval that generated the prediction has been cleared with room to spare.
+Combined Mapillary spend across the window, per night: 755 / 950 / 1,241 / 1,037 / 1,736 / 1,723 / 862 / 1,343 / 1,593 / 543 / 1,162 requests.
+Every one of those nights ran against the **old 1,750** budget — #319's raise reached production at ~11:00 on 09-09, minutes after the last window night finished, so it first binds on the 09-10 run.
+
+**The decision this records: keep 40/min at `jitter = 0.6` on both Mapillary channels, and do not tune the rate back up.**
+A clean window is evidence that this setting is survivable, not that a faster or more regular one would be — the test moved one axis and can only speak about that axis.
+Two limits on the conclusion were accepted going in and still hold: #290's shared census was bundled into the same restart, so a clean result cannot say which of the two worked, and CV 0.6 is still short of Poisson's 1.0 against an unchanged duty cycle (~44 minutes of unbroken traffic, no gap over ~10 s).
+What the window does **not** license is treating the raised budget as tested: no night in it spent more than 1,736 requests, so the 3,500 ceiling has never been approached, let alone survived.
 
 **Separately, a project decision rather than an empirical claim: makelab1 is NOT an escape hatch, even though it demonstrably still works** (verified 2026-08-13: same token, same /24, 200 + 12.4 MB while makelab2 got 302).
 **Project Sidewalk serves Mapillary data off the makelab servers**, so pointing this workload at makelab1 risks earning the same per-IP block on a host that a *production research deployment* depends on.
