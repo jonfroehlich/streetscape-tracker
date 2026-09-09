@@ -85,10 +85,19 @@ DOCS_GENERATED_BY = (
 _TS = r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3})"
 # The opening line of a run-due. `max_concurrent_channels=N` is optional because
 # nights collected before #240 do not carry it, and those must read as unknown.
+#
+# It ends `.*$`, NOT `\s*$`, and the difference is a night silently vanishing
+# from every figure this script produces. `cmd_run_due` appends further clauses
+# after the lane count — `; hoisted=N opt-in-only cities` (#248) and
+# `; refresh_slots=N (M promoted)` (#308) — and under `\s*$` the optional lane
+# group cannot be followed by them, so the whole alternative fails and the LINE
+# DOES NOT MATCH AT ALL. Not "knob unknown": no start line, so the night is
+# dropped. Verified against a real prod line before this was widened; a night
+# where the hoist fired is exactly a night worth measuring.
 _START_RE = re.compile(
     rf"^{_TS} - .* - INFO - (?P<due>\d+) cities due on (?P<date>\d{{4}}-\d{{2}}-\d{{2}})"
     r"(?P<filter>\s\[--provider [^\]]*\])?;"
-    r"(?:.*?max_concurrent_channels=(?P<knob>\d+))?\s*$"
+    r"(?:.*?max_concurrent_channels=(?P<knob>\d+))?.*$"
 )
 _DONE_RE = re.compile(
     rf"^{_TS} - .* - INFO - Done: run-due (?P<date>\d{{4}}-\d{{2}}-\d{{2}})"

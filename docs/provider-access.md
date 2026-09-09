@@ -288,6 +288,83 @@ Because nothing is counted as a failure, `_finish_batch` is what makes such a ni
 Tests neutralize the lock suite-wide via an autouse `conftest.py` fixture pointing `STREETSCAPE_LOCK_DIR` at a per-test `tmp_path`, so pytest can run during a real nightly batch;
 `tests/test_host_lock.py` then opts back in by taking a second `FileLock` on the same path, which behaves exactly like a competing process inside one pytest process.
 
+## KartaView documents one number, enforces nothing observable, and has no forum (surveyed 2026-09-02)
+
+**KartaView is the one locked host for which the top-of-file rule cannot be followed as written**, because the second half of it — read the developer/community forum — has no object.
+This section is that finding, recorded before widening the channel beyond its two-city seed set rather than after a block.
+
+**What is documented.** One figure, in one place: **100 requests/hour anonymous, 1,000/hour authenticated**.
+It is not on a developer portal — kartaview.org is a JS SPA whose FAQ is reachable only by scraping `kartaview.org/main.*.js` — and the only durable third-party restatement is [Bellingcat's toolkit entry](https://bellingcat.gitbook.io/toolkit/more/all-tools/kartaview), which quotes exactly that sentence and nothing further.
+A 2026-09-02 re-survey found no newer or more specific statement, and no published guidance of any kind on bulk access, sustained load, concurrency or crawl etiquette.
+Trek View's practitioner walkthrough of the API covers authentication and resource shapes and is **silent on limits entirely**.
+
+**What is enforced is not observable.** The API returns **no `X-RateLimit-*` and no `Retry-After` header of any kind**, so a client cannot read its own remaining budget, and it did not enforce either documented figure when measured (130 consecutive requests, zero 429s — `docs/experiments/kartaview-feasibility.md`).
+A limit that is neither announced in headers nor enforced at the documented value tells us nothing about where the real one is.
+This is the same epistemic position the Mapillary blocks were discovered from, and it resolves the same way: **the documented number bounds what we allow ourselves, not what they permit.**
+
+**There is no forum, and the tracker is unstaffed.** The only public channel is the `kartaview/openstreetcam.org` GitHub tracker.
+It is effectively unattended: `#392` has sat open and uncommented since 2023-10-31, and this project's own `#404` (OSM login) and `#405` (capture dates lost in the 2025-11-19 ingest) are likewise uncommented.
+Of the twelve most recently updated issues on 2026-09-02, ten carry zero comments.
+So there is no venue where an undocumented operational limit would surface the way `forum.mapillary.com` surfaced Mapillary's per-IP throttle — and therefore **no early warning is available for this provider at all**.
+Do not read the absence of complaints as evidence of headroom; it is evidence of an empty room.
+
+**Volume is the axis nothing has tested.** The largest KartaView night to date is a few hundred requests (Krabi + Yogyakarta, 745 on 2026-08-28).
+`docs/experiments/kartaview-sweep-cost.md` says so in its own words — *"Nothing here measures sustained load"* — and its whole 14-city study spent 29,589 requests across one session on one IP.
+A whole-catalog pass over the 1,216 enabled cities is **114,411 root circles ≈ 205,940 requests at the measured 1.80× overhead**, which at the configured 16/min (960/h) is **~215 h of continuous fetching**, or ~290× the total volume ever put through this host.
+That multiplier is a MEDIAN over 14 cities whose max was 13.66×, and the geometry tier under-prices any city that calibrates to r=500 by ~4×, so treat the figure as an order of magnitude and never as a budget.
+
+**What follows for pacing.** `DEFAULT_SWEEP_REQUESTS_PER_MINUTE` is 16 — 960/h, under the only documented ceiling by construction, since the limiter's burst is a single token.
+Both KartaView channels share one machine-wide `host_lock(HOST_KARTAVIEW)`, so that 960/h is the **combined** ceiling for the grid sweep and the road walk, never 960 each.
+A redirect, an HTML body or a 429 is a `HostBlockedError` at the **first** request (exit 81); 401/403 stays a plain `DownloadError` scoped to the credential.
+Widening the enrolled set is a volume change under the top-of-file rule and is therefore staged in tranches with a stop condition, not switched on catalog-wide (issue #282 and the rollout it gates).
+
+## Panoramax documents no limit at all, but is the one locked host with a staffed community (surveyed 2026-09-04, issue #316)
+
+Panoramax is not a collection channel and may never become one — this section exists because the top-of-file rule is about *before*, and phase 1 of [#316](https://github.com/jonfroehlich/streetscape-tracker/issues/316) put read-only traffic on the host.
+It records what was found before that traffic, and what paced it.
+
+**Nothing is documented.** No rate limit appears in the API documentation, in the OpenAPI spec at `https://api.panoramax.xyz/openapi.json`, or in any third-party restatement found.
+A read-only probe returned **no `X-RateLimit-*` header, no `Retry-After`, and no `Retry-After`-adjacent hint of any kind**, so a client cannot read its own remaining budget any more than it can on KartaView.
+Per the standing rule that is **unknown, not unlimited**.
+
+**Unlike KartaView, the second half of the rule has an object.** [forum.geocommuns.fr](https://forum.geocommuns.fr) and the [OSM community forum](https://community.openstreetmap.org/) both carry Panoramax traffic answered by core developers within days.
+That is a materially better access position than KartaView's empty room, and it means **the pacing question can be asked rather than inferred**.
+
+**It has NOT been asked, and that is a decision rather than an oversight (2026-09-06).**
+Phase 2's collector shipped without a forum post, on the reading that CLAUDE.md's standing rule is to READ a provider's docs and community before changing how we call it — which phase 1's survey did, and which this section is the record of — while *posting* a question was #316's own addition rather than the rule's.
+What that leaves is a pace chosen from nothing the provider said, which is exactly why it is conservative: 30/min, half the Mapillary channels', against the one host here that publishes no number at all.
+Re-read both forums before any change that raises volume, rate or concurrency, and treat a reply there as outranking the number in `config/scheduler.toml`.
+
+**Two questions still belong in a post, and the second is not a courtesy question.**
+What sustained rate the meta-catalog is comfortable with; and whether a picture's identity survives a sequence being migrated between instances.
+There is active work on inter-instance migration, and if an id can change under a move then "removed" in a run-to-run diff can mean "moved" — which would corrupt the one statistic this project exists to produce.
+Until that is answered it is a **known caveat on every Panoramax diff**, not a settled question, and it is recorded here rather than assumed away.
+
+**What the phase-1 study paced at, and why.** 30 requests/minute with jittered gaps at CV 0.6 — the same shifted-exponential shape [#292](https://github.com/jonfroehlich/streetscape-tracker/issues/292) put on the Mapillary channels, imported from `download_common.spaced_gap_seconds` rather than re-derived, so the two cannot drift into different distributions.
+That is roughly half the Mapillary channels' configured rate against a host with strictly less published guidance, which is the intended direction of the asymmetry.
+The probe calls `refuse_on_collection_host()`, so it can only run from a laptop: a per-IP limit found from makelab2 takes out the nightly batch, and both prior bans landed exactly that way.
+It treats **403 and 429 as stop, never as retry** — a refusal ends the run with what it has measured, since finding this host's limit is emphatically not the study's question.
+
+**Three silent failure modes in `/api/search`, and phase 2 has to design around all of them.**
+Each is measured per city by the probe's `access` stage rather than asserted, so a re-run against a fixed Panoramax fails loudly instead of leaving stale prose here; the 2026-09-06 run over 20 cities is in the writeup's record.
+Two of the three carry their own denominator and are reported out of the cities that CAN answer, because a city that cannot show a filter dropping anything is no evidence rather than a confirmation.
+It **does not paginate** and reports no `numberMatched` (20 of 20 cities), so a bbox holding more pictures than `limit` is indistinguishable from one holding exactly `limit`.
+The **`datetime` parameter is silently ignored** (20 of 20 cities, all of which can answer): each city is asked for a window starting at its OWN newest capture, and across the twenty those windows should have excluded 5,045 baseline pictures while all 5,045 came back — Amsterdam returned all 300 of its rows under `2025-07-14T06:55:26Z/..`, 299 of them older than the window's own start.
+So an incremental "everything since the last run" fetch would re-read the whole history and report it as new.
+The window is derived per city rather than fixed for a reason worth carrying to the next provider probe: a fixed cutoff cannot distinguish an honoured filter from an ignored one in a city whose imagery lies entirely inside it, and the original fixed `2026-01-01T00:00:00Z` had quietly stopped being in the future, so Boise was being counted as evidence while being none.
+And **`filter=field_of_view=360` returns none of the EXIF-less pictures** (17 of the 17 cities whose sample held one); those pictures are `flat` in the tile layer without exception, so the filter loses nothing a 360° collector wants, but a collector counting "absent" as possibly-360 would overstate coverage in every such city.
+The tile layers are the answer to all three: they carry a `type` field with no absent state, and they are the instrument [`experiments/panoramax-feasibility.md`](experiments/panoramax-feasibility.md) actually uses.
+
+**What the COLLECTOR does, as shipped (#316 phase 2).**
+Same 30/min and the same CV-0.6 jitter as the probe, from `download_common.spaced_gap_seconds` rather than re-derived, and behind `host_lock(HOST_PANORAMAX)` — the fourth locked host, exit codes **84 blocked / 85 busy**.
+**403 and 429 are `HostBlockedError` at the first request**, which is a stronger reading than the other two providers get and follows from there being no credential: on Mapillary and KartaView a 403 is a rejected token and is deliberately scoped to the key, while here it can only be the IP.
+**A 404 is an empty tile rather than a failure** — measured, not assumed: 0 empty tiles across 3,321 phase-1 requests including 20 cities holding nothing, because an empty area answers 200 with no layer.
+The guard that reading needs is that **a lattice where EVERY tile 404s is refused**, since that is what a moved endpoint looks like and the alternative is publishing a city as having lost all its imagery.
+Unlike the probe there is no `refuse_on_collection_host()`: a collector's whole purpose is to run on the collection host, so what protects the nightly batch is the pace, the host lock and the fact that the channel is not scheduled yet.
+
+**One host, not twenty-five.** `api.panoramax.xyz` is a meta-catalog that harvests metadata from every registered instance (23 on 2026-09-04), so a collector would query one host regardless of how many instances join — one `host_lock.py` entry, no per-instance fan-out, and no per-instance rate question.
+The corollary is that all of our load lands on one volunteer-run endpoint rather than being spread across the federation, which argues for the conservative end of any pacing range rather than against it.
+
 ## Overpass is a per-IP volunteer service, and the fetch is hardened accordingly (issue #209)
 
 **Overpass is a per-IP volunteer service, and the fetch is hardened accordingly (issue #209).** It is on the critical path for essentially every road walk

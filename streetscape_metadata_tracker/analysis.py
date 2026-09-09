@@ -35,10 +35,12 @@ PRESENT_STATUSES = ("OK", "NO_DATE")
 
 # Statuses that mean "some imagery is present, of any fidelity" — the broader
 # any-imagery footprint (issue #116). FLAT_ONLY marks a grid point covered only
-# by flat/perspective imagery (no 360-degree pano); it is Mapillary-specific
-# (GSV's metadata API only returns panoramas, so GSV never emits it). It is
-# deliberately kept OUT of PRESENT_STATUSES so the 360-degree coverage_rate
-# stays GSV-comparable; any_imagery_coverage_rate is the metric that counts it.
+# by flat/perspective imagery (no 360-degree pano). Every CENSUS provider emits
+# it -- Mapillary, KartaView and Panoramax -- and GSV never does, because its
+# metadata API only returns panoramas. (This comment said "Mapillary-specific"
+# through two more providers; the property is the collection model, not the
+# vendor.) It is deliberately kept OUT of PRESENT_STATUSES so the 360-degree
+# coverage_rate stays GSV-comparable; any_imagery_coverage_rate counts it.
 FLAT_ONLY = "FLAT_ONLY"
 ANY_IMAGERY_STATUSES = ("OK", "NO_DATE", FLAT_ONLY)
 
@@ -86,6 +88,17 @@ EARLIEST_PLAUSIBLE_CAPTURE = {
     # the same reason Mapillary's floor is 2004 rather than its 2013 founding.
     # download_kartaview applies this at decode, as Mapillary's parser does.
     "kartaview": date(2004, 1, 1),
+    # Same reasoning again, and a third rationale of its own. Panoramax's own
+    # instances date from 2022, but the corpus is volunteer uploads -- often of
+    # footage recorded years earlier -- and it also HARVESTS from federated
+    # instances, so a picture's presence here says nothing about when it was
+    # taken. Ties the other two census floors deliberately, which keeps the JS
+    # side's LOOSEST_EARLIEST_PLAUSIBLE_CAPTURE (a Math.min over the registry)
+    # where it already was. What this floor actually catches is measured, not
+    # hypothetical: phase 1 found two Paris pictures stamped 1970-01-01, i.e.
+    # the Unix epoch (docs/experiments/panoramax-feasibility.md).
+    # download_panoramax applies it at decode, as both other census parsers do.
+    "panoramax": date(2004, 1, 1),
 }
 # Floor for a provider not listed above. GSV's is the stricter of the two, but
 # an unknown provider is more likely to resemble a contributor-fed archive than

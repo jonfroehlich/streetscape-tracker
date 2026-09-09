@@ -59,11 +59,37 @@ Issue #312 — why every KartaView pano link on the site opens an error page, an
 The deep-link format is **theirs, not our guess**: their own SPA writes `details/{sequence_id}/{sequence_index}` into the address bar.
 What fails is the one v1 call that page depends on (`POST /details` → `osv: null`), for **every sequence probed including KartaView's own documented example** — which is the control that makes this a statement about their service rather than about our data, and the reason nobody should "fix" the URL builder.
 Generalizes past this provider: when a third-party page breaks on a link we build, probe **their** canonical example through the identical call before touching our code, and prefer a fallback keyed on geometry — the map link covers rows the photo link never could, since it needs only a position.
+### `mapillary-image-quality.md`
+
+Whether Mapillary's per-image `quality_score` — the only visual-quality prediction any provider we collect publishes — can rank Sidewalk candidate cities.
+It can, but not as the statistic we already store, and not on its own.
+Three things generalize.
+**(1) A bounded score's median is the summary least able to rank**: 228 of 388 cities sit inside one 0.07-wide band of medians, and counting the SAME images at the tail spreads those same 228 cities from 0.0% to 26.0% scoring ≥ 0.9.
+That is the median discarding an ordering, not reporting that none exists — and it is why `mapillary_meta`'s one stored number was useless for the workflow it was captured for.
+**(2) A paired within-unit comparison and a cross-unit scatter can disagree completely, and the scatter is the one that is wrong.**
+Mapillary scores on-foot capture below vehicle capture in 84.5% of the cities holding both, drive-weighted median delta −0.043 and as far as −0.536 (Lima) — while the cross-city Spearman between on-foot share and median quality is only −0.106.
+Quote one weighting per sentence: the image-weighted figures for the same comparison are 82.8%, −0.042 and −0.777 (Yogyakarta), and pairing a drive-weighted headline with an image-weighted extreme reintroduces exactly the single-bad-walk artifact the filter below removes.
+Everything else that differs between cities swamps the effect in aggregate; the within-city pairing is immune to it.
+The operational consequence is an inversion worth carrying: pedestrian imagery is what a sidewalk deployment wants and is what the predictor marks down hardest, so a quality ranking ranks *against* the imagery it is meant to find.
+**(3) The `pano-spacing.md` sequence rule applies to subgroups too, not just to the headline.**
+The first pass filtered the paired comparison on image counts alone and admitted cities whose entire on-foot side was one walk; requiring ≥ 3 distinct drives per side is what makes 84.5% a finding rather than an anecdote with a percentage sign.
+Relatedly, the median catalog city is **18 drives** (p25 4), so a city's quality "distribution" is usually a handful of observations — and Glendora moves 363 rank places of 388 between image- and drive-weighting.
+The study also settles, over all 271,434 sequences rather than a spot check, that `on_foot` is strictly drive-level and that no drive mixes organizational with individual imagery (zero mixed sequences on both counts), and returns a clean null for organizational capture: drive-weighted, orgs score higher in exactly 50.0% of cities.
 
 ### `pano-spacing.md`
 
 GSV vs Mapillary capture interval — Mapillary samples 1.4–3.5× finer, and **any per-pano analysis must group by `sequence_id` first**: pooling across contributors collapses the measured interval by 2–8× because the nearest image is usually someone else's drive.
 GSV publishes no drive identifier, so the same correction is impossible there — which makes Mapillary's number the better-founded one, the opposite of the intuition.
+
+### `panoramax-feasibility.md`
+
+Issue #316 phase 1 — is there Panoramax imagery in the cities we track, which is the one question that decides whether a fourth provider is worth a channel.
+The answer is split: the median tracked city holds nothing (730 of 1,144 screen to a conclusive zero), but ~20 cities hold 16k–1.1M pictures and Des Moines has more 360° pictures on Panoramax than in Mapillary's census — so an opt-in channel, never a default one.
+Four things generalize beyond Panoramax.
+**(1) Probe the instrument before you design around it.** The issue specified the federated `/api/search`; it does not paginate, reports no match count and silently ignores `datetime`, so a bbox with more pictures than `limit` is indistinguishable from one holding exactly `limit` — the one distinction a coverage study is made of. The map tiles answer the same question exactly, and cheaper.
+**(2) A cheap instrument that can only PROVE ABSENCE is worth more than an expensive one that measures everything**, because it changes the population you can speak about: 113 z6 requests screen all 1,144 enabled cities, so the gate is answered over the whole catalog rather than over the stratified sample the issue asked for. The asymmetry is the product — a res-6 hex is ~36 km² against a 19.5 km² median city, so a positive bound means "look closer" and only a zero is conclusive — and it is only sound if the zeros are checked.
+**(3) The control group is not garnish.** One screened-zero city measured 2 pictures, and that single row falsified the screen: the v1 z6 lattice the API root advertises silently OMITS populated cells (2.5–23.9% fewer pictures than v2's H3 grid over identical extents). Without controls the whole study would have rested on an instrument known to be lossy only in retrospect. The same pass also found a margin applied where cells are filtered and not where tiles are chosen, which vanished at tile seams for 108 cities.
+**(4) A "third state" can be an instrument artifact.** The search response's EXIF `field_of_view` is missing for 36% of pictures, while the tile `type` has no absent state; looking the same 2,136 pictures up in the tiles typed every one `flat`. Reconcile per picture before adding a bucket to a data model.
 
 ### `publish-duration.md`
 

@@ -7,8 +7,9 @@ It is a **router**: each section carries the short, mistake-preventing rules and
 ## What this project is
 
 Streetscape Tracker analyzes street-level imagery coverage and temporal patterns in cities **over time**.
-Three providers are collectable — Google Street View (GSV, the default), Mapillary (360° panos only), and KartaView.
-GSV and Mapillary run nightly over **every enabled city**; KartaView is a scheduler channel too but **opt-in**, collecting only the cities an operator enrolled with `scheduler enroll-city` (#248), because one whole-catalog pass prices at ~186,000 requests ≈ 186 h.
+Four providers are collectable — Google Street View (GSV, the default), Mapillary (360° panos only), KartaView, and Panoramax.
+Panoramax is the newest and the only credential-free one; it is collectable by hand but **not yet a scheduler channel** (#316 phase 2, `UNWIRED_CHANNELS`).
+GSV and Mapillary run nightly over **every enabled city**; KartaView is a scheduler channel too but **opt-in**, collecting only the cities an operator enrolled with `scheduler enroll-city` (#248), because one whole-catalog pass prices at ~205,000 requests ≈ 215 h at the configured 16/min.
 The tool samples a geographic grid around a city center, queries each provider's metadata API, and produces immutable dated snapshots per (city, provider), run-to-run change summaries (panos added/removed, capture-date changes, coverage deltas), and interactive map visualizations.
 
 ## READ THIS FIRST: provider API access is the single point of failure
@@ -20,7 +21,9 @@ The tool samples a geographic grid around a city center, queries each provider's
 | Provider | Official docs | Community |
 |---|---|---|
 | GSV | [Street View Static API usage & billing](https://developers.google.com/maps/documentation/streetview/usage-and-billing) + the API's own docs | Google Maps Platform issue tracker; Stack Overflow `google-street-view` tag |
+| KartaView | No developer portal: the single documented figure (100/h anonymous, 1,000/h authenticated) sits in a JS-SPA FAQ, restated by [Bellingcat's toolkit](https://bellingcat.gitbook.io/toolkit/more/all-tools/kartaview) | **None exists** — the `kartaview/openstreetcam.org` tracker is unstaffed, so for this provider there is no early warning at all; pace on the documented number and stage volume changes |
 | Mapillary | [API documentation](https://www.mapillary.com/developer/api-documentation), incl. its rate-limits section | [forum.mapillary.com](https://forum.mapillary.com) — **not optional**: Mapillary's real operational limits are undocumented and described only there |
+| Panoramax | [API docs](https://panoramax.fr) and the OpenAPI spec at `api.panoramax.xyz/openapi.json` — **neither documents any rate limit**, and no `X-RateLimit-*`/`Retry-After` header comes back | [forum.geocommuns.fr](https://forum.geocommuns.fr) and the [OSM community forum](https://community.openstreetmap.org/), both staffed by core developers — so unlike KartaView the pacing question CAN be asked; it has not been (#316), which is why the pace is deliberately half Mapillary's |
 
 **The documented limit is not necessarily the binding one, and the forum is where you learn that.**
 The 2026-08-12 case study: an undocumented per-IP throttle (302 → login) blocked both our Mapillary apps at ~21% of the documented per-app daily cap, and a forum thread had already described that exact failure, its per-IP scope, and its retry hazard before we sustained 370 req/min into it.
@@ -39,6 +42,7 @@ python streetscape_tracker.py "Seattle, WA"
 python streetscape_tracker.py "Seattle, WA" --provider mapillary
 python streetscape_tracker.py "Seattle, WA" --force --run-date 2026-07-02
 python streetscape_tracker.py "Seattle, WA" --provider mapillary --refetch-census  # ignore the shared census cache (#290)
+python streetscape_tracker.py "Des Moines, Iowa" --provider panoramax   # no credential; z15 tile census (#316)
 python streetscape_tracker.py "Seattle, WA" --check-boundary        # preview search area only
 python run_cities.py cities.txt --continue-on-error                 # batch
 
@@ -65,7 +69,7 @@ python scripts/register_frame.py --manifest mapillary_360_cities.csv --overlap-k
 |---|---|
 | `status` | Per-city schedule and budget status |
 | `assign` | (Re)compute stagger assignments (writes `day_of_cycle` only, so it never un-enrolls a member) |
-| `enroll-city CITY --channel C` | Opt one city into an **opt-in** channel's queue (#248); `--remove`/`--clear`/`--list` |
+| `enroll-city CITY --channel C` | Opt one city into an **opt-in** channel's queue (#248); `--remove`/`--clear`/`--list`; `--all [--limit N] --execute` bulk-enrols cheapest-first (#282) |
 | `run-due [--dry-run]` | The nightly batch: collect stalest-due cities per channel, then the tail (aggregate, manifests, backup, publish) |
 | `run-due --provider mapillary --limit 40` | On-demand single-channel catch-up (#214) — the ONLY supported bulk path; **Mapillary catch-ups are PAUSED** (see provider access below) |
 | `assess-city "Newport, Kentucky" --estimate` | Same-day answer for a partner inquiry about an untracked city (#215); `--estimate` stops after the boundary and cost report, `--yes` runs it |
@@ -79,6 +83,7 @@ python scripts/register_frame.py --manifest mapillary_360_cities.csv --overlap-k
 `run-due` notes: `--limit` (≥1) overrides `[schedule].max_cities_per_day`; an unknown/disabled channel or a bad `--limit` exits 64, not 2; a filtered run advances only the named channels' clocks, **un-pairing those cities' snapshots**.
 `assess-city` notes: a bad `--provider` or an unpaired `--width`/`--height` exits 64; answer from **street coverage, never grid coverage** (see operations below).
 `enroll-city` notes: it only accepts a channel whose default membership is OFF — per-city exclusion on the other four is `cities.enabled`; an unknown channel, a default-membership channel, an unresolvable city or a disabled city exits 64 writing no row; enrolling BEFORE the channel is configured is supported on purpose (it prints a note), or the rollout order is impossible.
+**`--all` is DRY-RUN until `--execute`** (its blast radius is the whole catalog, and it is one keystroke from `--all --remove`), selects only cities the setting would CHANGE (so `--limit N` means N *new* members, never N rows re-touched), orders cheapest-first because a city that finishes its sweep in one night never writes a checkpoint and so never meets the 7-day `CHECKPOINT_MAX_AGE_S`, and prints its total as a **floor**; `--limit`/`--execute` without `--all`, `--all` with `--list`, and `--all` with a CITY all exit 64.
 
 ### One-time and repair scripts (`scripts/`)
 
@@ -108,14 +113,16 @@ Credentials live in `.env`, loaded per channel by `streetscape_metadata_tracker/
 | `gsv_streets` | `GMAPS_STREETS_API_KEY` | Isolated street-collection key (#99) with its own `api_usage` string, so street experiments can't exhaust production quotas; **live** |
 | `kartaview_streets` | `KARTAVIEW_STREETS_ACCESS_TOKEN` | The one street channel that **falls back to `KARTAVIEW_ACCESS_TOKEN`** rather than requiring its own: one machine-wide `host_lock(HOST_KARTAVIEW)` serializes every KartaView request, so there is no parallel burn to isolate. Scheduled and **opt-in**, enrolled SEPARATELY from `kartaview` (#258) |
 | `mapillary_streets` | `MAPILLARY_STREETS_ACCESS_TOKEN` | Same isolation; **dormant** |
+| `panoramax` | none — unauthenticated read | The only credential-free channel (#316): `CHANNEL_ENV_VARS["panoramax"]` is an **empty tuple**, not a missing row, and `load_config` returns `{"access_token": None}` rather than raising — a channel that raised for a key it does not have would take down every other provider in the same `--provider all` invocation |
 
 A run requires EVERY named provider's key up-front, `--provider all` included (fail-fast so the series can't drift); a single-provider run needs only its own key.
+A credential-free channel is the one exception and is declared rather than special-cased (`config.CREDENTIAL_FREE_CHANNELS`, derived from the table above).
 
 Three `--provider` flags exist with **different vocabularies** — never conflate them:
 
 | Surface | Accepts | Shape |
 |---|---|---|
-| `streetscape_tracker.py --provider` | `gsv`, `mapillary`, `kartaview`, `all`; the retired `both` still works, with a notice (#247) | Comma-separated list; default `gsv,mapillary` |
+| `streetscape_tracker.py --provider` | `gsv`, `mapillary`, `kartaview`, `panoramax`, `all`; the retired `both` still works, with a notice (#247) | Comma-separated list; default `gsv,mapillary` |
 | `scheduler run-due --provider` | The six scheduled channels: `gsv`, `gsv_streets`, `kartaview`, `kartaview_streets`, `mapillary`, `mapillary_streets` | Repeatable or comma-separated; no `all` or `both` |
 | `scheduler assess-city --provider` | `gsv_streets`, `mapillary`, `mapillary_streets` — the GSV grid run is never part of it | Repeatable or comma-separated |
 
@@ -147,12 +154,21 @@ The out-of-band GSV capture-history harvester (#2) is documented there too.
 The census pipeline — record → rows → grid assignment → written CSV — lives **once** in `census.py`, parameterized per provider; never copy it into a provider module, because the contracts it enforces are invisible in a review of the second copy.
 It is columnar (a memory contract, #157), pinned byte-identical by a golden fixture (a formatting drift reads as phantom imagery churn in every diff), and the `image_columns` contract is enforced rather than documented.
 `is_pano` is read through `census.census_is_pano`, never as a raw array; imagery-type stratification (#116) yields **two** coverage numbers — 360° and any-imagery — which are never conflated.
+Three Panoramax rules that must survive without a read (#316):
+
+- **The census is the v1 `pictures` layer at z15, never `/api/search`** — search does not paginate, reports no `numberMatched` and SILENTLY IGNORES its own `datetime` filter (measured: 5,045 pictures that the requested windows should have excluded all came back), so an incremental fetch built on it would re-read the whole history and report it as new.
+  z15 is the coarsest zoom that serves the layer at all, so a bbox costs ~4x Mapillary's tiles; the shared `tiles_for_bbox` therefore takes zoom as a REQUIRED argument and each provider re-exposes it with its own default.
+- **A 403 or 429 is a per-IP refusal, and a 404 is an EMPTY TILE** — there is no credential, so 403 cannot mean a rejected token; and an empty area answers 200 with no layer, so a 404 means the tile holds nothing.
+  A lattice where EVERY tile 404s is therefore a moved endpoint, and is refused rather than published as a city that lost all its imagery.
+- **`type` is two-state and `is_pano` is non-nullable** — the search response's absent field-of-view is an EXIF artifact, not a third imagery state; the raw `type` is published as `image_type` anyway, so a value Panoramax has never served would appear in the data rather than being folded into flat.
+
 Four KartaView rules that must survive without a read:
 
-- **BOTH KartaView channels are scheduler channels (#248, #258), and they are the OPT-IN ones** — declaring `[providers.kartaview]` or `[providers.kartaview_streets]` enrolls nobody; each nightly queue is exactly the cities an operator ran `enroll-city` on for THAT channel, because a whole-catalog pass is ~186,000 requests ≈ 186 h.
+- **BOTH KartaView channels are scheduler channels (#248, #258), and they are the OPT-IN ones** — declaring `[providers.kartaview]` or `[providers.kartaview_streets]` enrolls nobody; each nightly queue is exactly the cities an operator ran `enroll-city` on for THAT channel, because a whole-catalog pass is ~205,000 requests ≈ 215 h at 16/min (and both channels share ONE host lock, so that rate is their combined ceiling, never each).
   The walk is enrolled **separately** rather than following the grid channel: street coverage is a different question from grid coverage, and a channel reading another channel's membership would give `schedule_state.member`'s NULL a third meaning.
   Enrol both for a city and the pair is nearly free — `kartaview_streets` ranks immediately after `kartaview`, so the grid sweep lands in the census cache and the walk prices at 0 (#290); enrol only the walk and it pays a full sweep.
   `_collect_due` hoists a city due *only* on an opt-in channel to the head of the slate (`all`, not `any`) — without which the channel would be scoped but never reached, since the union is gsv-ordered and the city cap truncates from the tail.
+  The hoist is **bounded** by `[schedule].opt_in_cities_per_day` (#282; unset = a quarter of the city cap, floored at 1, resolved only in `_opt_in_reservation`), because unbounded it starves every default-membership channel once the enrolled set is wide — so that key is the RATE any widening proceeds at, not a safety margin.
   With `kartaview_streets` (#258) they are the fifth and sixth channels, and the effective `max_concurrent_channels` ceiling is **4 of 6**: the largest host-disjoint set is gsv (no per-IP host) + ONE of the three Overpass channels + mapillary + kartaview.
   That figure is a property of the channel set's host graph, never a constant — re-derive it when a channel is added rather than quoting the last number written down.
   Its cost arms ARE wired (#238): the estimate is the swept-circle lattice × the measured **1.80×**, never the GSV grid formula, and the previous run's observed `runs.api_requests` outranks that geometry as the **larger** of the two, never on its own.
@@ -179,8 +195,8 @@ This is what READ THIS FIRST points at; read it before changing any pacing, retr
 
 | Family | Codes | Meaning |
 |---|---|---|
-| Blocked | 75 / 76 / 81 | The third party refused this IP — trips the night-level breaker |
-| Busy | 79 / 80 / 82 | Another local process holds the host lock |
+| Blocked | 75 / 76 / 81 / 84 | The third party refused this IP — trips the night-level breaker |
+| Busy | 79 / 80 / 82 / 85 | Another local process holds the host lock |
 | Sweep incomplete | 83 | A checkpointed partial sweep (#239) — the budget or deadline ran out, not a host condition; amnestied beside the host conditions (#238), while a SIGKILL has no exit code and still counts a failure, so kill-and-resume is bounded at five nights |
 
 - A blocked or busy night still publishes, alerts unconditionally, and exits nonzero.
@@ -188,6 +204,10 @@ This is what READ THIS FIRST points at; read it before changing any pacing, retr
 
 **Scheduler → [`docs/scheduler.md`](docs/scheduler.md).**
 `run-due` collects the stalest-due cities per enabled channel under per-channel daily budgets, then runs a tail — aggregate, streetwalk manifest, driving-plan summary, catalog backup, publish.
+**`get_due_cities`' `NULLS FIRST` put every never-collected city ahead of every refresh, so `[schedule].refresh_slots` reserves a share of the night's cap for cities that gain a SECOND dated interval (#308)** — unset it derives `max_cities_per_day // 4`, `0` is the identity permutation, and it can never refresh early because everything it promotes already cleared the `cycle_days - grace_days` (83 day) wall.
+The BOUNDED opt-in hoist (#248, #282) is applied first and the reserve second, into what the hoist did not take: reserve-first put its promotions at the end of the window and the hoist displaced the window's last cities, so the two reservations cancelled rather than composed.
+A night's cap is therefore split three ways — `opt_in_cities_per_day`, then `refresh_slots` of the remainder, then stalest-first — and it is the SUM of the two that bounds how much of a night the plain queue still governs (20 of 40 on prod).
+`max_cities_per_day` is 40 and `max_batch_hours` 12 (raised 2026-09-02, #304): the deadline is the intended governor, and the bracket on it is `TimeoutStopSec` < `max_batch_hours` < `TimeoutStartSec` (14 h) less the ~0.45 h bounded tail — past ~13.5 h the unit has to move first.
 Channels run back-to-back, or concurrently in host-disjoint lanes when `[schedule].max_concurrent_channels` > 1 (default 1; channels sharing a per-IP host never overlap, so the effective ceiling is 4 of 6, and raising it in prod is gated only on verifying the two GSV keys live in separate Cloud projects).
 **The tail is what makes a night visible, and it only runs if the city loop returns** — every way of ending the loop (deadline, SIGTERM wind-down, unexpected exception) returns counters instead of propagating, and each tail artifact reports a crash rather than raising.
 **Publishing happens only at the end**, so a stale public site usually means the batch died or overran, not that the publisher broke.
@@ -254,7 +274,9 @@ Keep any list a doc enumerates **alphabetical**, so two branches adding an entry
   - `kartaview-feasibility.md`
   - `kartaview-sweep-cost.md`
   - `kartaview-viewer-deeplink.md`
+  - `mapillary-image-quality.md`
   - `pano-spacing.md`
+  - `panoramax-feasibility.md`
   - `publish-duration.md`
   - `undated-imagery-share.md`
 

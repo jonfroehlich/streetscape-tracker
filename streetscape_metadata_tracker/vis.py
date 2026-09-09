@@ -216,7 +216,12 @@ def _kartaview_map_url(row) -> str | None:
 
 
 # User-facing labels and pano viewer deep-links per provider (mirrors the
-# PROVIDERS registry in www/js/streetscape-utils.js). viewer_url takes the whole
+# PROVIDERS registry in www/js/streetscape-utils.js — EXCEPT for panoramax,
+# which is deliberately here and not there until #316 phase 2's frontend PR: a
+# hand-collected panoramax run does reach cities.json.gz, but grid.js and
+# streets.js enumerate that registry, so its rows render nowhere and city.js
+# rewrites an unknown ?provider= to gsv. Per-run maps and popups, which is all
+# this table feeds, work now.) viewer_url takes the whole
 # row besides the pano id because KartaView's viewer is not addressable by photo
 # id; it may return None, which the popup renders as no link at all. Every
 # naming.KNOWN_PROVIDERS member must have an entry — a run's map is generated
@@ -224,10 +229,17 @@ def _kartaview_map_url(row) -> str | None:
 # collection at the last step (a test pins the coverage).
 #
 # map_url is the SECOND link, rendered FIRST, for a provider whose own viewer
-# cannot be relied on (issue #312); None on the two whose viewers work, which
-# renders one link exactly as before. viewer_label says out loud when a link is
-# expected to fail — mirroring the JS registry's viewerLabel, and for the same
-# reason: an honest label costs a few words, a silent error page costs trust.
+# cannot be relied on (issue #312); None on the three whose links need no
+# backup, which renders one link exactly as before.
+#
+# EVERY entry spells its own viewer_label, and there is deliberately no
+# "View in {label}" default to fall back on. #312 and #316 reached that rule
+# from opposite directions within a week: KartaView's link opens an error page
+# and Panoramax's opens a JPEG rather than a viewer, and a default label would
+# have described both as "View in <provider>". An honest label costs a few
+# words; a label that promises the wrong thing costs a reader's trust in every
+# other link on the page. A missing one is a KeyError at map generation — loud,
+# and at the same moment the missing-entry check above fires.
 PROVIDER_DISPLAY = {
     "gsv": {
         "label": "GSV",
@@ -251,6 +263,35 @@ PROVIDER_DISPLAY = {
         "viewer_url": _kartaview_viewer_url,
         "map_label": "View location on KartaView map",
         "map_url": _kartaview_map_url,
+    },
+    # THE PICTURE ITSELF, NOT A 360 VIEWER, and that is measured rather than a
+    # shortcut (probed 2026-09-06, issue #316). Panoramax's interactive viewer
+    # is served by each INSTANCE at its own root, and the federated meta-catalog
+    # we collect from hosts no viewer at all -- its root is a marketing page.
+    # The z15 `pictures` layer carries no instance either (only `via` in the
+    # /api/search response does, and search cannot be the census), so a run row
+    # has no way to name which of the 23 instances owns a picture.
+    #
+    # What DOES resolve federation-wide from the id alone is the asset route:
+    # /api/pictures/{id}/sd.jpg answers 308 to the owning instance's copy, so
+    # this link always opens the actual imagery. `sd` rather than `hd` because
+    # an equirectangular original is tens of megabytes.
+    #
+    # The alternative was no link at all, which is what the #312 rule prescribes
+    # when the only candidate is a guess -- and a guessed instance is exactly
+    # that. A working link to the picture beats a broken link to a viewer.
+    "panoramax": {
+        "label": "Panoramax",
+        # Says what the link opens rather than "View in Panoramax", which would
+        # promise a viewer this link is not. Spelled as every other entry's
+        # label is, because #316 and #312 arrived at the same rule from
+        # opposite directions -- see the note above the table.
+        "viewer_label": "Open this Panoramax picture",
+        "viewer_url": lambda pano_id, row: (
+            f"https://api.panoramax.xyz/api/pictures/{quote(str(pano_id), safe='')}/sd.jpg"
+        ),
+        "map_label": None,
+        "map_url": None,
     },
 }
 

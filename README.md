@@ -114,6 +114,7 @@ The full provenance and sampling methodology — the record to cite in publicati
 | Street coverage and road walks | [`docs/street-coverage.md`](docs/street-coverage.md) |
 | Nightly scheduler | [`docs/scheduler.md`](docs/scheduler.md) |
 | Measured experiments | [`docs/experiments/README.md`](docs/experiments/README.md) |
+| Candidate imagery providers | [`docs/imagery-providers.md`](docs/imagery-providers.md) |
 | Related tools and literature | [`docs/related-work.md`](docs/related-work.md) |
 
 ## Related tools

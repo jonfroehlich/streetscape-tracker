@@ -82,17 +82,64 @@ def test_load_config_reads_no_env_var_outside_the_declared_table():
     assert read == declared
 
 
-@pytest.mark.parametrize("channel", sorted(config.CHANNEL_ENV_VARS))
+@pytest.mark.parametrize(
+    "channel", sorted(set(config.CHANNEL_ENV_VARS) - config.CREDENTIAL_FREE_CHANNELS)
+)
 def test_every_declared_channel_loads_from_its_own_variable(channel):
     """
     The other direction: a declared channel must be one load_config accepts,
     reading the variable the table names first. Pinned per channel so a typo in
     the table is a named failure rather than a KeyError somewhere downstream.
+
+    Credential-FREE channels are excluded by the derived set rather than by a
+    name, and get their own test below: they declare an empty tuple, so this
+    one's `[0]` would IndexError on them and say nothing about the table.
     """
     primary = config.CHANNEL_ENV_VARS[channel][0]
     with mock.patch.dict(os.environ, {primary: "SENTINEL"}, clear=True):
         loaded = config.load_config(channel)
     assert "SENTINEL" in loaded.values()
+
+
+@pytest.mark.parametrize("channel", sorted(config.CREDENTIAL_FREE_CHANNELS))
+def test_a_credential_free_channel_loads_with_a_BARE_environment(channel):
+    """
+    A channel declaring no variable must SUCCEED with nothing set at all, and
+    that is a real contract rather than a formality (issue #316).
+
+    `cli.py` loads every requested provider's config before any of them
+    collects — `--provider all` included, deliberately, so a host missing one
+    key is told before work starts. A credential-free channel that raised for
+    the credential it does not have would therefore take down every OTHER
+    provider in the same invocation, on a machine that is perfectly able to
+    collect them.
+
+    `clear=True` is the whole test: it asserts the success survives an
+    environment holding nothing, not merely one that happens to lack this
+    channel's variable.
+    """
+    assert config.CHANNEL_ENV_VARS[channel] == ()
+    with mock.patch.dict(os.environ, {}, clear=True):
+        loaded = config.load_config(channel)
+    # Same shape as its siblings so a caller can keep one code path, with the
+    # value that says "there is nothing to carry".
+    assert loaded == {"access_token": None}
+
+
+def test_the_credential_free_set_is_derived_from_the_table_not_listed_twice():
+    """
+    Pins the derivation, not the membership — a second hand-maintained list of
+    which channels need no key is exactly the drift CHANNEL_ENV_VARS exists to
+    stop, and it would fail open: a channel dropped from the second list starts
+    raising for a variable that does not exist.
+
+    The membership assertion beside it is deliberately weak (non-empty), so this
+    test does not have to be edited by the next credential-free provider.
+    """
+    assert config.CREDENTIAL_FREE_CHANNELS == frozenset(
+        channel for channel, variables in config.CHANNEL_ENV_VARS.items() if not variables
+    )
+    assert config.CREDENTIAL_FREE_CHANNELS, "at least panoramax should be credential-free"
 
 
 def test_the_kartaview_walk_falls_back_but_prefers_its_own_token():

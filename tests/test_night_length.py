@@ -214,3 +214,32 @@ def test_two_blocked_hosts_still_read_as_one_refusal_note():
         "the Overpass API (overpass-api.de) unavailable; stopped early (SIGTERM)"
     )
     assert nla._hosts_unavailable(rest)
+
+
+def test_a_start_line_with_trailing_clauses_still_parses():
+    """The regression that made a night VANISH rather than read as unknown.
+
+    `_START_RE` used to end `\\s*$`, so the optional `max_concurrent_channels`
+    group could not be followed by anything. `cmd_run_due` already appends
+    `; hoisted=N opt-in-only cities` (issue #248) and now `; refresh_slots=N
+    (M promoted)` (issue #308) after it, and under `\\s*$` the whole
+    alternative failed: no start line matched, so the night was dropped from
+    every figure this script produces — not "knob unknown", absent.
+
+    A night where the hoist fired is exactly a night worth measuring, and the
+    clauses only appear on nights something reordered the slate, which is how
+    this stayed invisible.
+    """
+    log = (
+        "2026-09-01 01:00:00,000 - streetscape_scheduler - INFO - 871 cities due on "
+        "2026-09-01; processing up to 40 within daily budgets of 10,000,000 gsv "
+        "requests; max_concurrent_channels=2; refresh_slots=10 (3 promoted); "
+        "hoisted=2 opt-in-only cities\n"
+        "2026-09-01 09:00:00,000 - streetscape_scheduler - INFO - Done: run-due "
+        "2026-09-01: 80/80 runs succeeded across 40 cities in 8.00 h\n"
+    )
+    nights = nla.parse_log(log)
+    assert len(nights) == 1
+    assert nights[0]["knob"] == 2, "the lane count is still read past the new clauses"
+    assert nights[0]["due"] == 871
+    assert nights[0]["hours"] == 8.0

@@ -3,6 +3,7 @@ from .config import load_config
 from .download_gsv import download_gsv_metadata_async
 from .download_kartaview import download_kartaview_metadata_async
 from .download_mapillary import download_mapillary_metadata_async
+from .download_panoramax import download_panoramax_metadata_async
 from .fileutils import load_city_csv_file, open_in_browser
 from .geoutils import get_city_location_data, get_search_dimensions
 from .naming import (
@@ -23,6 +24,7 @@ __all__ = [
     "download_gsv_metadata_async",
     "download_kartaview_metadata_async",
     "download_mapillary_metadata_async",
+    "download_panoramax_metadata_async",
     "generate_base_filename",
     "generate_run_filename",
     "get_city_location_data",

@@ -9,6 +9,7 @@ provider importing from another's module.
 
 import argparse
 import asyncio
+import math
 import random
 import re
 from collections.abc import Callable, Iterator
@@ -58,11 +59,20 @@ HOST_OVERPASS = "overpass"
 # project's prior bans were on limits no document described, which is why this
 # is locked on the documented-per-key reading rather than exempted by it.
 HOST_KARTAVIEW = "kartaview"
+# Panoramax publishes NO rate limit anywhere found -- not in the API docs, not
+# in the OpenAPI spec, and no X-RateLimit-*/Retry-After header comes back -- so
+# per this repo's standing rule that is unknown rather than unlimited (issue
+# #316, docs/provider-access.md). Locked for a second reason the other three do
+# not have: api.panoramax.xyz is a META-CATALOG harvesting 23 instances, so all
+# of our load lands on ONE volunteer-run endpoint however wide the federation
+# grows, rather than being spread across it.
+HOST_PANORAMAX = "panoramax"
 
 HOST_LABELS = {
     HOST_MAPILLARY_TILES: "Mapillary's tile CDN (tiles.mapillary.com)",
     HOST_OVERPASS: "the Overpass API (overpass-api.de)",
     HOST_KARTAVIEW: "the KartaView API (kartaview.org)",
+    HOST_PANORAMAX: "the Panoramax meta-catalog (api.panoramax.xyz)",
 }
 
 
@@ -119,15 +129,20 @@ class HostBlockedError(HostUnavailableError):
 # denied" — a plausible-sounding wrong answer, which is worse than an
 # unallocated number. The families are defined by these dicts rather than by
 # being contiguous, so the numbering has a gap and each entry is justified.
+#
+# 84/85 continue the same numbering for Panoramax (issue #316), taken after 83
+# rather than filling the 77/78 gap, which stays open for the reason above.
 HOST_EXIT_CODES = {
     HOST_MAPILLARY_TILES: 75,
     HOST_OVERPASS: 76,
     HOST_KARTAVIEW: 81,
+    HOST_PANORAMAX: 84,
 }
 HOST_BUSY_EXIT_CODES = {
     HOST_MAPILLARY_TILES: 79,
     HOST_OVERPASS: 80,
     HOST_KARTAVIEW: 82,
+    HOST_PANORAMAX: 85,
 }
 HOST_BY_EXIT_CODE = {code: host for host, code in HOST_EXIT_CODES.items()}
 HOST_BY_BUSY_EXIT_CODE = {code: host for host, code in HOST_BUSY_EXIT_CODES.items()}
@@ -202,6 +217,26 @@ def _unit_exponential() -> float:
     3.12 and this project still runs on 3.11.
     """
     return random.expovariate(1.0)
+
+
+def spaced_gap_seconds(mean_gap: float, jitter: float, draw: Callable[[], float]) -> float:
+    """
+    One shifted-exponential inter-request gap: the #292 pacing formula.
+
+    A fixed ``(1 - jitter)`` floor plus an exponential tail scaled to
+    ``jitter``. Because ``E[Exponential(1)] == 1`` the mean is exactly
+    ``mean_gap``, so every budget and timeout derived from the mean rate is
+    unchanged; the floor is ``(1 - jitter) * mean_gap`` and there is
+    deliberately no ceiling, since the ceiling is the artifact being removed.
+    ``jitter`` is therefore the coefficient of variation, not a +/- range.
+
+    Extracted so the async pacer below and the synchronous one in
+    ``scripts/panoramax_feasibility.py`` cannot drift apart: two implementations
+    of one pacing formula is the same failure ``experiment_stats.py`` exists to
+    prevent for percentiles, and here it would silently change the shape of the
+    thing we are deliberately measuring.
+    """
+    return mean_gap * ((1.0 - jitter) + jitter * draw())
 
 
 class AsyncRateLimiter:
@@ -348,11 +383,7 @@ class AsyncRateLimiter:
             if self._next_at is not None and self._next_at > now:
                 await asyncio.sleep(self._next_at - now)
                 now = self._now()
-            # Shifted exponential: a fixed (1 - jitter) floor plus an
-            # exponential tail scaled to jitter. Mean is exactly the mean gap
-            # because E[Exponential(1)] = 1; see the class docstring.
-            mean_gap = 1.0 / self._rate
-            gap = mean_gap * ((1.0 - self.jitter) + self.jitter * self._draw())
+            gap = spaced_gap_seconds(1.0 / self._rate, self.jitter, self._draw)
             self._next_at = now + gap
 
 
@@ -628,6 +659,90 @@ def assign_to_grid(
     j_min, j_max = -width_steps // 2, width_steps // 2
     in_grid = (i >= i_min) & (i <= i_max) & (j >= j_min) & (j <= j_max)
     return i, j, in_grid
+
+
+# ── Slippy-map tile math: shared by every TILE census provider ──────────────
+#
+# Stdlib-only Web-Mercator lattice arithmetic. It lived in `download_mapillary`
+# until Panoramax became the second tile census (issue #316), and it moved here
+# for exactly the reason `grid_bbox` and `assign_to_grid` did: it is pure
+# geometry that merely happened to sit in the first provider that needed it, and
+# a second provider was otherwise going to reach it by importing another
+# provider's module. The zoom is a REQUIRED argument here — a shared lattice
+# function has no default zoom to be right about — and each provider re-exposes
+# it with its own (`download_mapillary` z14, `download_panoramax` z15), so no
+# existing call site moved.
+
+
+def lonlat_to_tile_frac(lon: float, lat: float, zoom: int) -> tuple[float, float]:
+    """Fractional Web-Mercator tile coordinates (x, y; y from the top)."""
+    n = 2**zoom
+    fx = (lon + 180.0) / 360.0 * n
+    lat_rad = math.radians(lat)
+    fy = (1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * n
+    return fx, fy
+
+
+def tile_frac_to_lonlat(fx: float, fy: float, zoom: int) -> tuple[float, float]:
+    """Inverse of :func:`lonlat_to_tile_frac`."""
+    n = 2**zoom
+    lon = fx / n * 360.0 - 180.0
+    lat = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * fy / n))))
+    return lon, lat
+
+
+def tiles_for_bbox(
+    min_lon: float, min_lat: float, max_lon: float, max_lat: float, zoom: int
+) -> list[tuple[int, int]]:
+    """
+    All (x, y) tile indices at the given zoom intersecting the bbox.
+
+    A bbox that crosses the antimeridian (min_lon > max_lon after geopy
+    normalizes longitudes to ±180 — e.g. Suva, Fiji) wraps: it covers the
+    x columns from min_lon to the right edge plus those from the left edge
+    to max_lon. The naive single range was empty there, silently yielding
+    a 0-tile (0-pano) run.
+
+    PURE, and every tile census depends on that: the reassembly order of a
+    resumed census is RECOMPUTED from this function rather than stored, so a
+    change to it invalidates checkpoints rather than merely re-tiling
+    (`docs/census.md`, issue #256). Both providers' checkpoint validators
+    compare a stored tile COUNT for that reason.
+    """
+    fx_min, fy_max = lonlat_to_tile_frac(min_lon, min_lat, zoom)  # y grows southward
+    fx_max, fy_min = lonlat_to_tile_frac(max_lon, max_lat, zoom)
+    n = 2**zoom
+    if fx_min > fx_max:  # bbox crosses the antimeridian
+        x_indices = [*range(max(0, int(fx_min)), n), *range(0, min(n - 1, int(fx_max)) + 1)]
+    else:
+        x_indices = list(range(max(0, int(fx_min)), min(n - 1, int(fx_max)) + 1))
+    y_range = range(max(0, int(fy_min)), min(n - 1, int(fy_max)) + 1)
+    return [(x, y) for x in x_indices for y in y_range]
+
+
+def points_in_tiles(
+    lats: np.ndarray, lons: np.ndarray, tiles: list[tuple[int, int]], zoom: int
+) -> np.ndarray:
+    """
+    Boolean mask of which (lat, lon) points fall inside any of ``tiles``.
+
+    Vectorized form of :func:`lonlat_to_tile_frac`; used to attribute
+    undownloaded tiles back to the query points they cover (issue #168), i.e.
+    every tile provider's ``unmeasured_mask``. Deliberately ignores the tiles'
+    render buffer: a point just outside a failed tile may in fact have been
+    covered by a neighbour, and calling it "unknown" errs toward admitting we
+    don't know rather than claiming empty.
+    """
+    if len(lats) == 0:
+        return np.zeros(0, dtype=bool)
+    n = 2**zoom
+    fx = (lons + 180.0) / 360.0 * n
+    fy = (1.0 - np.arcsinh(np.tan(np.radians(lats))) / np.pi) / 2.0 * n
+    # One packed int per tile so membership is a single sorted-array lookup
+    # instead of a Python loop over the (usually tiny) failed-tile list.
+    keys = fx.astype(np.int64) * n + fy.astype(np.int64)
+    failed_keys = np.array(sorted(x * n + y for x, y in tiles), dtype=np.int64)
+    return np.isin(keys, failed_keys)
 
 
 def standardize_capture_date(date_str: str | None) -> str | None:

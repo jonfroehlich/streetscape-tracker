@@ -175,18 +175,23 @@ def city_df_factory():
 
 
 @pytest.fixture(autouse=True)
-def _no_mapillary_tile_pacing(monkeypatch):
+def _no_tile_census_pacing(monkeypatch):
     """
-    Disable the Mapillary tile rate limiter (issue #198) for the whole suite.
+    Disable BOTH tile censuses' rate limiters for the whole suite.
 
-    The production default is deliberately slow — 60 tile requests/minute
-    against a per-IP limit on Mapillary's CDN — so a fixture city of a couple
-    hundred tiles would otherwise pace a single test out to several minutes of
-    real sleeping. Tests that care about pacing (rather than about what the
-    fetch returns) monkeypatch ``AsyncRateLimiter`` themselves, which runs after
-    this fixture and so wins.
+    Every production default here is deliberately slow — 60 tile requests/minute
+    for Mapillary against a per-IP limit on its CDN (issue #198), 30/min for
+    Panoramax against a host that documents no limit at all (issue #316) — so a
+    fixture city of a couple of hundred tiles would otherwise pace a single test
+    out to minutes of real sleeping. Panoramax is the worse of the two, being
+    both slower per request and at a zoom with ~4x the tiles.
+
+    Tests that care about pacing (rather than about what the fetch returns)
+    monkeypatch ``AsyncRateLimiter`` themselves, which runs after this fixture
+    and so wins.
     """
     from streetscape_metadata_tracker import download_mapillary as dm
+    from streetscape_metadata_tracker import download_panoramax as dp
 
     class _NoPacing:
         def __init__(self, max_per_minute, *args, **kwargs):
@@ -196,6 +201,7 @@ def _no_mapillary_tile_pacing(monkeypatch):
             return None
 
     monkeypatch.setattr(dm, "AsyncRateLimiter", _NoPacing)
+    monkeypatch.setattr(dp, "AsyncRateLimiter", _NoPacing)
 
 
 @pytest.fixture(autouse=True)

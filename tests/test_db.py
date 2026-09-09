@@ -261,6 +261,67 @@ def test_due_selection_lifecycle(conn, city):
     assert row["consecutive_failures"] == 5 and row["last_error"] == "boom"
 
 
+def test_get_due_cities_with_last_success_is_the_same_rows_plus_the_clock(conn, city):
+    """The projection and the query it delegates to must not drift.
+
+    `get_due_cities` is now a one-line filter over
+    `get_due_cities_with_last_success`, and the reason the dueness clause lives
+    in exactly one of them is the one `count_channel_members`' docstring
+    already records: the copy that gets forgotten fails open.
+    """
+    kw = dict(
+        today=date(2026, 7, 2),
+        cycle_days=90,
+        grace_days=7,
+        max_consecutive_failures=5,
+        default_membership=True,
+    )
+    db.assign_schedule(conn, 90)
+
+    paired = db.get_due_cities_with_last_success(conn, **kw)
+    assert [c.city_id for c, _ in paired] == [c.city_id for c in db.get_due_cities(conn, **kw)]
+    assert paired[0][1] is None, "never collected on this channel"
+
+    # A city collected long enough ago to still be due carries its clock, which
+    # is what separates a first collection from a refresh.
+    conn.execute(
+        "UPDATE schedule_state SET last_success_at = ? WHERE city_id = ? AND provider = 'gsv'",
+        ("2026-01-01T00:00:00+00:00", city),
+    )
+    conn.commit()
+    assert db.get_due_cities_with_last_success(conn, **kw)[0][1] == "2026-01-01T00:00:00+00:00"
+
+    # And a city inside the cadence is absent from BOTH, which is the property
+    # scheduler's refresh reserve (#308) rests on entirely: it can only reorder
+    # cities dueness already returned, so it can never refresh one early.
+    db.record_attempt(conn, city, success=True)
+    assert db.get_due_cities_with_last_success(conn, **kw) == []
+
+
+def test_append_city_note_appends_and_is_idempotent(conn, city):
+    """Appends, never overwrites, and does not accumulate duplicates.
+
+    The prior text is a registration's provenance and losing it is not
+    recoverable from anything else in the row; a re-run of a batch must not
+    stack identical clauses. A DIFFERENT note is a different fact and does get
+    its own line.
+    """
+    assert db.append_city_note(conn, city, "enrolled on kartaview") is True
+    assert db.resolve_city(conn, city).notes.endswith("enrolled on kartaview")
+
+    assert db.append_city_note(conn, city, "enrolled on kartaview") is False
+    assert db.resolve_city(conn, city).notes.count("enrolled on kartaview") == 1
+
+    db.append_city_note(conn, city, "enrolled on kartaview_streets")
+    assert db.resolve_city(conn, city).notes.split("\n")[-2:] == [
+        "enrolled on kartaview",
+        "enrolled on kartaview_streets",
+    ]
+
+    with pytest.raises(KeyError):
+        db.append_city_note(conn, "nope", "x")
+
+
 def test_stagger_is_stable_and_spread():
     days = [db.compute_day_of_cycle(f"city-{i}", 90) for i in range(900)]
     assert days == [db.compute_day_of_cycle(f"city-{i}", 90) for i in range(900)]
