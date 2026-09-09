@@ -343,6 +343,23 @@ test("a popup puts the link that works first", () => {
   assert.match(idless, /kartaview\.org\/map\/@/);
 });
 
+test("an id-addressed viewer builds no link without an id", () => {
+  // Regression from #312's own fix: buildFlatOnlyPopupHtml now asks for its
+  // links BEFORE the missing-id early return, so a provider whose viewerUrl
+  // interpolates the id unconditionally started rendering `...pKey=` -- a link
+  // to nowhere, which is the thing that early return existed to prevent.
+  // Mapillary is the one this reaches: FLAT_ONLY rows only exist where
+  // hasFlatImagery is true, which gsv is not.
+  assert.equal(PROVIDERS.gsv.viewerUrl(""), null);
+  assert.equal(PROVIDERS.mapillary.viewerUrl(""), null);
+  assert.equal(viewerLinksHtml(PROVIDERS.mapillary, "", {}), "");
+
+  // KartaView is NOT id-addressed, so an id-less row with a sequence keeps its
+  // photo link -- the guard belongs to each builder, not to viewerLinksHtml.
+  const row = { sequence_id: "8313353", sequence_index: 936 };
+  assert.match(PROVIDERS.kartaview.viewerUrl("", row), /details\/8313353\/936/);
+});
+
 test("a row value cannot break out of the href it is interpolated into", () => {
   // viewerLinksHtml states, as a contract on the registry, that every builder
   // percent-encodes what it takes from a row -- because the URL goes into

@@ -496,7 +496,7 @@ def create_visualization_map(df: pd.DataFrame, city_name: str, provider: str = "
         viewer_url = display["viewer_url"](row["pano_id"], row)
         links = [(map_url, display["map_label"]), (viewer_url, display["viewer_label"])]
         viewer_link = "".join(
-            f'<br><a href="{url}" target="_blank">{link_label}</a>'
+            f'<br><a href="{url}" target="_blank" rel="noopener">{link_label}</a>'
             for url, link_label in links
             if url
         )

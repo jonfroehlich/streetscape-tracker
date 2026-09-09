@@ -163,8 +163,15 @@ const PROVIDERS = {
     earliestPlausibleCapture: new Date(2007, 0, 1), // local midnight; see above
     attribution: "Panorama metadata © Google",
     viewerLabel: "View in Google Street View",
+    // Null without an id, because this viewer is addressed BY the id: an empty
+    // one builds `...&pano=`, which is a link to nowhere rather than no link.
+    // The FLAT_ONLY popup can hand this an empty id (its own id line is
+    // dropped in that case) and a fallback keyed on geometry may still render,
+    // so "no id" and "no popup" stopped being the same thing.
     viewerUrl: (panoId) =>
-      `https://www.google.com/maps/@?api=1&map_action=pano&pano=${encodeURIComponent(panoId)}`,
+      panoId
+        ? `https://www.google.com/maps/@?api=1&map_action=pano&pano=${encodeURIComponent(panoId)}`
+        : null,
     fallbackViewerLabel: null,
     fallbackViewerUrl: null,
     hasCopyrightFilter: true,
@@ -181,8 +188,11 @@ const PROVIDERS = {
     attribution:
       'Image metadata © <a href="https://www.mapillary.com">Mapillary</a>, CC BY-SA',
     viewerLabel: "View in Mapillary",
+    // Null without an id, for the reason spelled out on the gsv entry above.
+    // Mapillary is the provider this actually reaches: FLAT_ONLY rows exist
+    // only where hasFlatImagery is true, which gsv is not.
     viewerUrl: (panoId) =>
-      `https://www.mapillary.com/app/?pKey=${encodeURIComponent(panoId)}`,
+      panoId ? `https://www.mapillary.com/app/?pKey=${encodeURIComponent(panoId)}` : null,
     fallbackViewerLabel: null,
     fallbackViewerUrl: null,
     hasCopyrightFilter: false,
