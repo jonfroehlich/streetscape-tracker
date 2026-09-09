@@ -1154,11 +1154,15 @@ def test_makelab1_production_config_is_wired():
     # per app, at 21% and 10% of it, 302 not 4xx). #214's bet that the 60/min
     # pace was the real protection was FALSIFIED on 2026-08-20 (issue #241:
     # blocked while obeying it exactly, at 5,013/day the day after 5,753 ran
-    # clean), and only a rolling 2-3 day per-IP window fits both incidents
-    # (2-day threshold in (7,061, 10,766]). Split EVENLY because both channels
+    # clean), and #241 read that as a rolling 2-3 day per-IP window fitting
+    # both incidents (2-day threshold in (7,061, 10,766]). SUPERSEDED: block 3
+    # retired that window and every other 1-8 day accumulation band (#286, and
+    # see the note below) -- it is kept here as the derivation the numbers came
+    # from, not as a live hypothesis. The EVEN split it chose (both channels
     # read the identical z14 tile census, so the budgets deplete in lockstep
     # and a heavy slate defers the same cities on both channels rather than
-    # un-pairing them. Pinned exactly, not bounded
+    # un-pairing them) is likewise history: #290 made the walk price at 0 on a
+    # paired night, and 2026-09-05 made the split 2:1. Pinned exactly, not bounded
     # loosely: this is the sort of number that drifts upwards one "just a bit
     # more" at a time, and the whole point is that a change to it is a
     # decision someone made on purpose.
@@ -1172,23 +1176,21 @@ def test_makelab1_production_config_is_wired():
     # 2-day total stayed under 7,000; block 3 retired that window entirely
     # (#286), and #304 then doubled max_cities_per_day without the budget
     # following, so the grid channel pinned its cap on the first two 40-city
-    # nights. Asserted as a RANGE with both ends named, because the two ends are
-    # different facts and a single number would hide the second:
+    # nights. Both ends are named in the MESSAGE rather than in a second
+    # assertion: the un-paired sum is the only one of the two that this line
+    # can actually constrain, because the paired figure IS the grid channel's
+    # own budget (mly_streets prices at 0 under #290's census reuse) and is
+    # already pinned at mly == 3_500 above. A second `assert mly == 3_500`
+    # here would restate that line while touching nothing about mly_streets,
+    # so it is deliberately not written.
     assert mly + mly_streets == 5_250, (
         "an UN-PAIRED night is the worst case and it is 1.5x the ceiling #241 "
         "sanctioned — the honest cost of the 2026-09-05 raise, accepted only "
         "because block 3 falsified daily volume and every 1-8 day window "
-        "(#286), never because volume is known safe (issue #286, "
+        "(#286), never because volume is known safe. The PAIRED night is "
+        "3,500 + 0, the ceiling #241 already sanctioned; moving EITHER "
+        "channel's budget has to argue with both numbers (issue #286, "
         "docs/provider-access.md)"
-    )
-    # ...but the night the scheduler actually produces is the PAIRED one, where
-    # #290's census reuse means the walk spends 0 and the combined load is just
-    # the grid channel's 3,500 — exactly the ceiling #241 already sanctioned.
-    # Pinned so that a future change to mapillary_streets' budget has to argue
-    # with the paired case rather than silently doubling the un-paired one.
-    assert mly == 3_500, (
-        "on a paired night (#290 census reuse) this IS the combined per-IP "
-        "spend, and it is the 3,500 #241 sanctioned"
     )
     # The per-minute pace is still pinned — an unpaced burst (~370/min) is
     # confirmed harmful — but per #241 it is NOT sufficient on its own, and per

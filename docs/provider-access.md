@@ -94,7 +94,8 @@ That is a decision rather than a task — it identifies this project to the vend
 
 ## The daily budgets, re-sized for the 40-city night (issue #286)
 
-**`[providers.mapillary].daily_request_budget` is 3,500 as of 2026-09-05; `[providers.mapillary_streets]` stays 1,750.**
+**`[providers.mapillary].daily_request_budget` goes to 3,500; `[providers.mapillary_streets]` stays 1,750.**
+Decided and written 2026-09-05, and deliberately **not deployed** until #292's jitter window closed — production ran at 1,750 every night through 2026-09-09, so read any date before the deploy as the authoring date, not the live configuration.
 The grid channel's figure doubled for a reason that has nothing to do with the block model, and it is worth separating from one: 1,750 was sized on 2026-08-22 (#241) for a **20-city** night, and `max_cities_per_day` went 20 → 40 on 2026-09-02 (#304) without the budget following.
 The ledger shows that seam precisely — the first two 40-city nights pinned the cap, after four 20-city nights that never came close:
 
@@ -107,13 +108,17 @@ The ledger shows that seam precisely — the first two 40-city nights pinned the
 | 2026-09-03 | **1,736** | 524 | 2,260 | **40** |
 | 2026-09-04 | **1,723** | 0 | 1,723 | **40** |
 
-Per-city grid cost over 1,398 runs is median **9**, p90 **81**, p99 **440**, max **870**, mean **39**, so a 40-city night wants ~1,560 on the mean and the cap binds on any night that happens to carry two or three metros.
+Sizing it needs the *unbiased* per-city cost, and there are two distributions in this file that must not be confused.
+Over the 1,398 **runs** actually collected, cost is median **9**, p90 **81**, max **870**, mean **39** (percentiles nearest-rank; the p99 is 440 that way and 420 interpolated, which is why only p90 and max are quoted here) — but that population is biased low by construction, because the budget gate skips exactly the expensive cities: the 85 enabled cities with no Mapillary run at all average a **728.6 km²** frozen grid against **131.6 km²** for the 1,132 that have one, and tile count scales with area.
+The unbiased figures are the **geometry** ones at the top of this file (median 12, mean **57.8**, p90 180, p99 480 over all 1,214 enabled cities), and the per-**city** mean over latest runs is **45.2**.
+So a 40-city night demands roughly **1,800–2,400**, not the ~1,560 the run-weighted mean alone would suggest — and the table above confirms it from observation rather than model: 09-03 demanded 1,736 spent **plus** the 484 and 40 it skipped = **2,260** (56.5/city), and 09-04 spent 1,723 across 29 Mapillary cities (59.4/city).
+3,500 is therefore about **1.5x** headroom over a normal 40-city night, not the 2.2x the run mean implies, and the cap still binds on any night carrying two or three metros.
 It bound twice in those six nights, both times on an end-of-night sliver rather than on a city that was ever unaffordable: New York needed 484 with 426 left, and Normal, Illinois needed 40 with 38 left.
 That shape is the argument for the capped-and-resume work in #318 as well as for this raise — the raise fixes the average night, a resumable census fixes the tail.
 
 **What this actually spends.** Since #290 the walk reuses the grid run's census for zero requests on a paired night, and the table above shows `mapillary_streets` spending 0 on five of the six nights.
-The *combined* per-IP load has therefore been running at ~1,750/day against the 3,500 that #241 sanctioned — half of it — so on a paired night 3,500 + 0 restores that sanctioned combined ceiling rather than exceeding it.
-**Be honest about the un-paired case**: nothing enforces the pairing, and a split pair can reach **5,250**, which is 1.5x the #241 ceiling and the most this host has been configured for since block 2.
+The *combined* per-IP load has therefore been running at 755–2,260/day (six-night mean ~1,330) against the 3,500 that #241 sanctioned — about 38% of it on the mean and 65% at the 09-03 peak — so on a paired night 3,500 + 0 restores that sanctioned combined ceiling rather than exceeding it.
+**Be honest about the un-paired case**: nothing enforces the pairing, and a split pair can reach **5,250**, which is 1.5x the #241 ceiling and the most this host has been configured for since the 2026-08-22 cut (for ~2 days *after* block 2 it still sat at the old 15,000 + 5,000 = 20,000).
 That is accepted rather than overlooked, on the ground that block 3 (1,938/day, against 26,363 spent clean on 08-14) falsified daily volume and every accumulation window from 1 to 8 days (#286).
 It is **not** accepted on the ground that volume is safe — nothing about this host's behaviour is known safe, and the even split #241 chose still matters on exactly the nights that reach 5,250.
 The structurally correct fix is a single per-IP pool both channels draw from, which is a scheduler change rather than a config edit and is deliberately not attempted here; until it exists, the sum above is the number to quote, never the grid channel's 3,500 alone.
@@ -147,11 +152,12 @@ An equally good rival at n=2, and keep them distinct: a **repeat-offender penalt
 Separating them costs a block if the experiment works, so it is deliberately not being run (Jon, 2026-08-22).
 Full analysis, both incidents' numbers, and the staff statements: issue #241.
 
-Consequences, in force until a rolling guard lands: **(1) no `--limit` catch-ups.** The daily budgets bound any single day, but three consecutive maxed days sum to 10,500 — inside the 3-day uncertainty band
+Consequences, in force until a rolling guard lands: **(1) no `--limit` catch-ups.** The daily budgets bound any single day, but three consecutive maxed days sum to 10,500 (that figure is 1,750 + 1,750; since the 2026-09-05 re-size it is 10,500 paired and **15,750** un-paired, so the raise widens what a catch-up could spend if the ban is ever lifted) — inside the 3-day uncertainty band
 — so a multi-night catch-up can reach where normal ~2–3k nights cannot.
 The guard itself is a query change, not a schema change (`api_usage` is keyed (usage_date, provider) and already holds the history) — #241 item 3.
-**(2) The budget, not `max_batch_hours`, now ends a maxed Mapillary night**: 3,500 is ~1 h of paced fetching against the ~17,000-tile deadline ceiling.
-At the 57.8-tile mean each channel reaches ~30 cities/night and the 70,168-tile catalog is one full pass in **~40 nights**, not ~5; no city is ever skipped as over-budget (largest grid 870 < 1,750).
+**(2) The budget, not `max_batch_hours`, ended a maxed Mapillary night** while both channels sat at 1,750: that was ~1 h of paced fetching against the ~17,000-tile deadline ceiling, ~30 cities/night at the 57.8-tile mean, and one 70,168-tile catalog pass in **~40 nights**, not ~5.
+Since the 2026-09-05 re-size the grid channel's 3,500 reaches ~60 cities and ~20 nights, and it is the **40-city cap** that ends the night — every night 09-03..09-08 stopped on it in 6.8–10.6 h against `max_batch_hours = 12`.
+No city has ever been skipped as over-budget in either regime (largest grid 870).
 **(3) If a block ever arrives under this cap**, that is strong evidence for the repeat-offender reading over the fixed window
 — capture the day's `api_usage` row, the elapsed hours from the `run-due` summary line (the `[alerts]` email carries it; nothing else records time-under-load), AND the trailing 3 days' ledger before changing anything.
 

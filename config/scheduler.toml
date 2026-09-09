@@ -144,7 +144,8 @@ max_batch_hours = 12
 #   * Every provider must be able to RESUME a killed collection — satisfied
 #     since issue #256 landed the Mapillary tile-census checkpoint, so a
 #     deadline or `systemctl stop` killing N children at once no longer
-#     re-spends their tiles against the deliberate 3,500/day per-IP ceiling.
+#     re-spends their tiles against the deliberate per-IP ceiling
+#     (3,500/day paired, 5,250 un-paired since 2026-09-05).
 #   * gsv and gsv_streets hold no per-IP lock, because Google meters per Cloud
 #     PROJECT rather than per IP. Running them together is only safe while the
 #     two keys really do live in separate projects — a console check, since
@@ -217,14 +218,21 @@ enabled = true
 # the experiment works, so it is deliberately not being run. Full analysis,
 # both incidents' numbers, and the staff statements: issue #241.
 #
-# THE NUMBERS BELOW (cut 2026-08-22: 15,000 + 5,000 -> 1,750 + 1,750): the
-# block is per IP, so what is on the line is the SUM — 3,500/day on one
-# address, chosen so any 2-day total stays <= 7,000, at or below the highest
-# value ever observed clean (7,061). Split EVENLY because both channels read
+# THE NUMBERS BELOW (cut 2026-08-22: 15,000 + 5,000 -> 1,750 + 1,750; the
+# grid half re-sized to 3,500 on 2026-09-05, see below): the block is per IP,
+# so what is on the line is the SUM — 3,500/day on one address as this was
+# written, and since 2026-09-05 that is 3,500 on a paired night and 5,250 if
+# the pair splits. The 1,750 + 1,750 was chosen so any 2-day total stayed
+# <= 7,000, at or below the highest value ever observed clean (7,061), and
+# split EVENLY because both channels read
 # the identical z14 census. SINCE #290 THE WALK NO LONGER RE-READS THOSE
 # TILES: it reuses the grid run's census for 0 requests on a paired night, so
 # mapillary_streets' budget is spent only on nights the two are NOT paired
-# (a budget deferral, a filtered run). The values are unchanged — re-sizing
+# (a budget deferral, a filtered run). THE EVEN SPLIT IS HISTORY as of
+# 2026-09-05 (#286): the grid half is 3,500 and the walk half still 1,750, so
+# the split is 2:1 and the lockstep it bought is gone — since #290 the walk
+# prices at 0 on a paired night, so the budgets never deplete together.
+# The values were unchanged here — re-sizing
 # them for the lighter load is #286's question, and #290's goal is strictly
 # less load. The even split still matters for the un-paired case, where the
 # two budgets deplete in lockstep and a heavy slate defers the same cities on
@@ -233,7 +241,9 @@ enabled = true
 # until a rolling multi-day guard exists: these budgets bound any single day,
 # but three consecutive maxed days sum to 10,500 — inside the 3-day
 # uncertainty band above — so only a multi-night catch-up can reach where
-# normal nights cannot.
+# normal nights cannot. (That 10,500 was 1,750 + 1,750; since the 2026-09-05
+# re-size three maxed days are 10,500 paired and 15,750 un-paired, so the
+# raise widens the blast radius of a catch-up if the ban is ever lifted.)
 #
 # RECOVERY, measured twice (#241): the block lifts within ~a day of the LAST
 # refused request — block 1 cleared after ~20.5 h of true silence (silence
@@ -246,31 +256,47 @@ enabled = true
 #
 # Sizing, measured over the 1,214 enabled cities on 2026-08-16: the largest
 # frozen grid is 870 tiles (Moscow), so no city is ever skipped as "exceeds
-# the entire daily budget"; the mean is 57.8, so 1,750 reaches ~30 cities and
-# the 70,168-tile catalog is one full pass in ~40 nights. The budget — not
-# max_batch_hours — is now what ends a maxed Mapillary night.
+# the entire daily budget"; the mean is 57.8, so 1,750 reached ~30 cities and
+# the 70,168-tile catalog was one full pass in ~40 nights, and the budget --
+# not max_batch_hours -- was then what ended a maxed Mapillary night.
+# SUPERSEDED BY THE 2026-09-05 RE-SIZE below: at 3,500 this channel reaches
+# ~60 cities and ~20 nights, and what ends the night is the 40-city cap --
+# every night 09-03..09-08 stopped on it in 6.8-10.6 h against a 12 h
+# max_batch_hours.
 #
-# 1,750 -> 3,500 on 2026-09-05, and read the reason before reading it as a
+# 1,750 -> 3,500, decided 2026-09-05 and deployed only after the 09-09
+# jitter window (below). Read the reason before reading it as a
 # relaxation of the block posture: 1,750 was sized for a 20-city night, and
 # max_cities_per_day went 20 -> 40 in #304 without it following. The first two
 # 40-city nights spent 1,736 and 1,723 against the 1,750 cap while the four
-# 20-city nights before them never passed 1,241. Per-city cost is median 9,
-# p90 81, p99 440, max 870 over 1,398 runs, so a 40-city night wants ~1,560 on
-# the mean and the cap binds whenever two or three metros land together.
+# 20-city nights before them never passed 1,241.
+#
+# SIZE IT ON THE UNBIASED DISTRIBUTION. Over the 1,398 runs collected, cost is
+# median 9, p90 81, max 870, mean 39 -- but that population is biased low
+# because the gate skips exactly the expensive cities: the 85 enabled cities
+# with no Mapillary run average a 728.6 km2 grid vs 131.6 km2 for the 1,132
+# that have one. The unbiased geometry mean is 57.8 (the paragraph above) and
+# the per-city mean over latest runs is 45.2, so a 40-city night demands
+# ~1,800-2,400, not ~1,560. Observation agrees: 09-03 demanded 1,736 spent
+# plus the 484 and 40 it skipped = 2,260. So 3,500 is ~1.5x headroom over a
+# normal night, not 2.2x, and the cap still binds when two or three metros
+# land together.
 #
 # The number that matters is still the per-IP SUM with mapillary_streets
 # below, which is left at 1,750. Since #290 the walk reuses the grid run's
 # census for 0 requests on a paired night, so a paired night is 3,500 + 0 --
 # exactly the combined ceiling #241 already sanctioned, not an increase. An
 # UN-PAIRED night can reach 5,250, which is 1.5x that ceiling and the most
-# this host has been configured for since block 2; that is accepted because
+# this host has been configured for since the 2026-08-22 cut (for ~2 days
+# after block 2 it still sat at 15,000 + 5,000); that is accepted because
 # block 3 falsified daily volume and every 1-8 day window (#286), NOT because
 # volume is known safe. The right fix is one per-IP pool both channels draw
 # from -- a scheduler change, not a config edit. Quote the sum, never this
 # line alone.
 #
 # Timed deliberately after #292's pre-registered jitter window closed
-# (~2026-09-09): raising volume inside it would have given a fourth block two
+# (~2026-09-09), and held at 1,750 in production until it did: raising volume
+# inside the window would have given a fourth block two
 # candidate causes where the test was built to leave one.
 daily_request_budget = 3500
 # Client-side pacing for the tile CDN (issue #198). 60/min is a conservative
@@ -348,9 +374,11 @@ spacing_m = 15
 # the walk is a local spatial join against the tiles. Budgeted in tile requests against the same PER-IP ceiling as the grid
 # channel above (see its comment for the documented limits and how the #214
 # bet resolved), not against the per-app cap: different tokens, one address,
-# so the number that matters is the SUM — 1,750 + 1,750 = 3,500/day as of
-# 2026-08-22 (issue #241), split evenly: a road walk reads the identical
-# tile census as the grid run. Since #290 it REUSES that census rather than
+# so the number that matters is the SUM. That sum is 3,500 on a PAIRED night
+# and 5,250 if the pair splits, as of the 2026-09-05 re-size (#286): the grid
+# channel above is 3,500 and this one is 1,750. It was 1,750 + 1,750 = 3,500,
+# split evenly, from 2026-08-22 (#241) until then — a road walk read the
+# identical tile census as the grid run. Since #290 it REUSES that census rather than
 # re-reading it, so on a paired night this channel spends nothing and this
 # budget is drawn on only when the pair is split apart.
 [providers.mapillary_streets]
