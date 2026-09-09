@@ -47,7 +47,7 @@ from typing import Any, NamedTuple
 
 from tabulate import tabulate
 
-from . import catalog_backup, cgroup_memory, db, driving_plan
+from . import catalog_backup, cgroup_memory, db, driving_plan, panoramax_screen
 from .alerting import AlertConfig, send_alert, should_alert
 from .checkpointing import (
     CENSUS_PROVIDERS,
@@ -73,7 +73,10 @@ from .download_common import (
     HOST_OVERPASS,
     HOST_PANORAMAX,
     SWEEP_INCOMPLETE_EXIT_CODE,
+    DownloadError,
+    HostUnavailableError,
     coerce_jitter,
+    host_exit_code,
     redact_credentials,
 )
 from .download_kartaview import (
@@ -92,6 +95,7 @@ from .download_panoramax import estimate_tile_count as estimate_panoramax_tile_c
 from .json_summarizer import (
     generate_aggregate_v2,
     generate_driving_plan_summary,
+    generate_provider_screen_summary,
     generate_streetwalk_manifest,
     regenerate_run_json,
 )
@@ -2838,13 +2842,13 @@ def _regenerate_published_json(conn, cfg: SchedulerConfig) -> tuple[str, bool]:
     drift into publishing different sets of files — the failure mode being an
     artifact whose companion index still describes the previous state.
 
-    ``complete`` is False when ANY of the three failed. Swallowing a failure and
+    ``complete`` is False when ANY of the four failed. Swallowing a failure and
     returning success would leave a scripted `regenerate-aggregate` unable to
     tell a full rebuild from a partial one, so the outcome is returned rather
     than only logged — and each caller decides what it means for ITS exit code.
 
-    All three go through _tail_artifact, matching what _finish_batch does with
-    the same three functions. An earlier version guarded only the driving-plan
+    All four go through _tail_artifact, matching what _finish_batch does with
+    the three of them it rebuilds. An earlier version guarded only the driving-plan
     join and let the other two propagate, on the reasoning that a caller must
     not publish an aggregate it failed to rebuild. That is the wrong half of the
     trade, and it is the bug this whole path exists to fix: the aggregate's own
@@ -2865,6 +2869,14 @@ def _regenerate_published_json(conn, cfg: SchedulerConfig) -> tuple[str, bool]:
     plan, plan_err = _tail_artifact(
         "driving-plan summary", generate_driving_plan_summary, conn, cfg.data_dir
     )
+    # Rebuilt here but NOT in the nightly tail. `screen-provider` is the only
+    # thing that changes this artifact's inputs and it writes the file itself,
+    # so a nightly rebuild would add a failure surface for a file that cannot
+    # have moved — while THIS command is the prescribed recovery from a stale
+    # or missing published set, which has to include every published file.
+    screen, screen_err = _tail_artifact(
+        "provider screen summary", generate_provider_screen_summary, conn, cfg.data_dir
+    )
 
     def _count(result, key: str, noun: str, filename: str) -> str:
         """One artifact's clause of the summary — its count, or that it is stale."""
@@ -2878,9 +2890,10 @@ def _regenerate_published_json(conn, cfg: SchedulerConfig) -> tuple[str, bool]:
             _count(agg, "cities_count", "cities", "cities.json.gz"),
             _count(manifest, "walks", "walks", "streetwalks.json.gz"),
             _count(plan, "records", "plan records", "driving_plan.json.gz"),
+            _count(screen, "providers", "screened providers", "provider_screen.json.gz"),
         )
     )
-    return summary, not (agg_err or man_err or plan_err)
+    return summary, not (agg_err or man_err or plan_err or screen_err)
 
 
 def cmd_regenerate(cfg: SchedulerConfig, publish: bool = False) -> int:
@@ -2981,6 +2994,265 @@ def _fmt_bytes(n: float) -> str:
             return f"{n:.0f} {unit}" if unit == "B" else f"{n:,.1f} {unit}"
         n /= 1024.0
     raise AssertionError("unreachable: the GB branch always returns")
+
+
+# ── The standing provider growth screen (issue #316) ───────────────────────
+
+# Providers whose catalogue-wide screen is cheap enough to stand as a weekly
+# instrument: one needs a coarse count layer covering a wide area per request.
+# Today that is Panoramax alone — 113 z6 tiles answer all 1,144 enabled cities —
+# and an unrecognised name exits USAGE_EXIT_CODE rather than falling through, so
+# a typo can never spend requests against the wrong host.
+SCREENABLE_PROVIDERS = ("panoramax",)
+
+
+def _screen_pacing(cfg: SchedulerConfig, provider: str) -> tuple[int, float]:
+    """The rate and jitter a screen pass runs at, as (per_minute, jitter).
+
+    Read from the provider's own ``[providers.NAME]`` block when it has one, so
+    that lowering the collection channel's pace during a block lowers the
+    screen's too — they are one host and one IP, and a screen still metronoming
+    at the old rate would be the exact hole the config change was closing. Until
+    that block exists (the channel is still in UNWIRED_CHANNELS, and such a
+    block is dropped at load), this falls back to the collector's own defaults,
+    which is the same 30/min with the same #292 jitter.
+    """
+    rate = panoramax_screen.DEFAULT_TILE_REQUESTS_PER_MINUTE
+    jitter = panoramax_screen.DEFAULT_TILE_JITTER
+    channel = (cfg.providers or {}).get(provider)
+    if channel is not None:
+        if channel.max_requests_per_minute:
+            rate = channel.max_requests_per_minute
+        if channel.jitter is not None:
+            jitter = channel.jitter
+    return rate, jitter
+
+
+def cmd_screen_provider(
+    cfg: SchedulerConfig,
+    provider: str,
+    *,
+    dry_run: bool = False,
+    measure: bool = False,
+    limit: int | None = None,
+    publish: bool = True,
+    allow_collapse: bool = False,
+) -> int:
+    """
+    Re-ask, over the WHOLE catalog, whether a provider has imagery in each city
+    yet — and record the answer as a dated row (issue #316).
+
+    This is the instrument for a provider whose deployments are still ARRIVING.
+    Panoramax's US corpora are months old, not decades, so there is nothing to
+    backfill: a city's growth is only observable if we were already watching
+    when the imagery landed. 113 requests buy that watch for every city we
+    track, which is why it can run weekly rather than being a study somebody
+    remembers to redo.
+
+    Every number written here is an UPPER BOUND — see
+    :mod:`panoramax_screen`. A zero is conclusive and a positive number means
+    "look closer", which is what ``--measure`` and, ultimately, a real
+    collection are for.
+
+    ``--limit`` is MEASURE-ONLY on purpose. A screen is a whole-catalog
+    observation: screening a subset would write a dated row for some cities and
+    not others, and the published series' "cities positive on this date" would
+    then be a count over two different observations. The measure, which is
+    genuinely expensive (~51,000 tiles for every positive city), is the thing
+    that needs bounding.
+
+    Exit codes: 0 on success; USAGE_EXIT_CODE (64) for an unknown provider or a
+    misused flag; 84/85 when Panoramax refused this IP or another local process
+    holds its host lock (the same vocabulary a collection uses, so a wrapper
+    reads them the same way); 1 for anything else.
+    """
+    if provider not in SCREENABLE_PROVIDERS:
+        logger.error(
+            f"Unknown screenable provider {provider!r}. Known: {', '.join(SCREENABLE_PROVIDERS)}."
+        )
+        return USAGE_EXIT_CODE
+    if limit is not None and not measure:
+        logger.error(
+            "--limit is only meaningful with --measure. A screen covers the whole "
+            "catalog by definition: a partial one would write a dated row for some "
+            "cities and not others, and the published series counts cities per date."
+        )
+        return USAGE_EXIT_CODE
+    if limit is not None and limit < 1:
+        logger.error(f"--limit must be >= 1, got {limit}.")
+        return USAGE_EXIT_CODE
+    if measure and limit is None:
+        logger.error(
+            "--measure requires --limit N. Measuring every screened-positive city "
+            "exactly is ~51,000 tiles (about 28 hours at this pace), so the bound "
+            "is required rather than defaulted."
+        )
+        return USAGE_EXIT_CODE
+
+    conn = db.connect(cfg.db_path)
+    cities = {city.city_id: city for city in db.get_all_cities(conn, enabled_only=True)}
+    if not cities:
+        logger.warning("No enabled cities to screen.")
+        return 0
+    rate, jitter = _screen_pacing(cfg, provider)
+
+    if measure:
+        return _run_screen_measure(conn, cities, provider, limit, rate, jitter, dry_run)
+
+    targets = [panoramax_screen.target_from_city(city) for city in cities.values()]
+    tiles, _per_city = panoramax_screen.plan_screen(targets)
+    if dry_run:
+        _emit(
+            f"Screen {provider}: {len(targets)} enabled cities resolve to {len(tiles)} "
+            f"distinct z{panoramax_screen.SCREEN_ZOOM} tiles — {len(tiles)} requests at "
+            f"{rate}/min, about {len(tiles) / max(rate, 1):.1f} min."
+        )
+        return 0
+
+    today = date.today()
+    try:
+        result = panoramax_screen.screen_targets(
+            targets, max_requests_per_minute=rate, jitter=jitter
+        )
+    except HostUnavailableError as e:
+        # 84/85, the same codes a collection reports, so the weekly unit's
+        # failure is legible next to a night's without a second vocabulary.
+        logger.error(f"{provider} screen stopped: {e}")
+        _record_screen_spend(conn, provider, today, getattr(e, "api_requests", 0))
+        return host_exit_code(e)
+    except DownloadError as e:
+        logger.error(f"{provider} screen failed: {e}")
+        _record_screen_spend(conn, provider, today, getattr(e, "api_requests", 0))
+        return 1
+
+    # The requests land in the SAME (date, provider) ledger row a collection
+    # writes. They are the same host reached from the same IP on the same day,
+    # so a budget gate that could not see them would be under-counting our real
+    # load by exactly the amount nobody remembered to add.
+    _record_screen_spend(conn, provider, today, result["api_requests"])
+
+    rows = result["rows"]
+    positive = [row for row in rows if row["pictures_upper_bound"] > 0]
+    if not positive and not allow_collapse:
+        # A catalog that has previously screened positive and now screens empty
+        # everywhere is far more likely to be a changed endpoint or a layer
+        # renamed under us than a platform that deleted its imagery. The all-404
+        # case is already refused inside the screen; this catches the quieter
+        # one, a 200 whose `grid` layer is absent or renamed, where every tile
+        # decodes to nothing and every city would be written a zero it was never
+        # measured at. Refused BEFORE the write, because the damage is the write.
+        known = db.provider_screen_positive_count(conn, provider)
+        if known:
+            logger.error(
+                f"The {provider} screen found imagery in ZERO of {len(rows)} cities, "
+                f"but {known} have screened positive before. That is what a moved or "
+                f"renamed grid layer looks like, not what a platform losing its "
+                f"imagery looks like — refusing to record it. Verify the endpoint "
+                f"({panoramax_screen.SCREEN_URL_TEMPLATE}) by hand, then re-run with "
+                f"--allow-collapse if the collapse is real."
+            )
+            return 1
+
+    written = db.record_provider_screen(conn, provider=provider, screen_date=today, rows=rows)
+    summary = (
+        f"Screened {written} cities against {provider} on {today.isoformat()}: "
+        f"{len(positive)} hold imagery ({len(positive) / len(rows):.1%}), "
+        f"{result['api_requests']} requests over {result['tiles']} "
+        f"z{panoramax_screen.SCREEN_ZOOM} tiles"
+    )
+    logger.info(summary)
+    _emit(summary)
+
+    # Rebuilt HERE rather than in the nightly tail: this command is the only
+    # thing that changes the artifact's inputs, so rebuilding it nightly would
+    # add a failure surface to every night for a file that cannot have moved.
+    screen_doc, screen_err = _tail_artifact(
+        "provider screen summary", generate_provider_screen_summary, conn, cfg.data_dir
+    )
+    if screen_doc is not None:
+        published_cities = screen_doc["providers"].get(provider, {}).get("cities", [])
+        _emit(f"Wrote provider_screen.json.gz ({len(published_cities)} cities).")
+    if publish and cfg.publish_enabled:
+        if _publish(cfg, f"screen-provider {provider}") != 0:
+            logger.error("Publish failed; the screen is cataloged but not public.")
+            return 1
+        _emit("Published to the web server.")
+    return 1 if screen_err else 0
+
+
+def _record_screen_spend(conn, provider: str, usage_date: date, api_requests: int) -> None:
+    """Charge a screen's requests to the day's ledger, even on a failure.
+
+    Even on a failure especially: a pass that was refused halfway still sent
+    what it sent, and a budget gate reading a ledger that forgot the refused
+    attempts would let the next process walk straight back into the same host.
+    """
+    if api_requests:
+        db.add_api_usage(conn, usage_date, api_requests, provider=provider)
+
+
+def _run_screen_measure(
+    conn,
+    cities: dict,
+    provider: str,
+    limit: int,
+    rate: int,
+    jitter: float,
+    dry_run: bool,
+) -> int:
+    """``screen-provider --measure --limit N``: exact counts for the top N.
+
+    The follow-up to a positive screen, and deliberately read-only: it prints,
+    and writes nothing to the catalog. ``provider_screen`` records upper bounds
+    from ONE instrument, and folding a second instrument's exact counts into the
+    same rows would make the series mean different things for different cities
+    depending on which command last touched them. What turns a promising city
+    into data is enrolling it, not measuring it again.
+    """
+    screened = [
+        row
+        for row in db.get_latest_provider_screen(conn, provider)
+        if row["pictures_upper_bound"] > 0 and row["city_id"] in cities
+    ]
+    if not screened:
+        logger.error(
+            f"No enabled city has screened positive for {provider} yet — "
+            f"run `screen-provider {provider}` first."
+        )
+        return 1
+    ranked = sorted(screened, key=lambda r: (-r["pictures_upper_bound"], r["city_id"]))[:limit]
+    targets = [panoramax_screen.target_from_city(cities[row["city_id"]]) for row in ranked]
+    tile_count = panoramax_screen.measure_tile_count(targets)
+    price = (
+        f"Measure {len(targets)} cities at z{panoramax_screen.MEASURE_ZOOM}: "
+        f"{tile_count} tiles at {rate}/min, about {tile_count / max(rate, 1) / 60:.1f} h."
+    )
+    if dry_run:
+        _emit(price)
+        return 0
+    logger.info(price)
+    try:
+        result = panoramax_screen.measure_targets(
+            targets, max_requests_per_minute=rate, jitter=jitter
+        )
+    except HostUnavailableError as e:
+        logger.error(f"{provider} measure stopped: {e}")
+        _record_screen_spend(conn, provider, date.today(), getattr(e, "api_requests", 0))
+        return host_exit_code(e)
+    except DownloadError as e:
+        logger.error(f"{provider} measure failed: {e}")
+        _record_screen_spend(conn, provider, date.today(), getattr(e, "api_requests", 0))
+        return 1
+    _record_screen_spend(conn, provider, date.today(), result["api_requests"])
+    for row, screen in zip(result["rows"], ranked, strict=True):
+        _emit(
+            f"{row['display_name']}: {row['pictures']:,} pictures "
+            f"({row['pictures_360']:,} 360°, {row['pictures_flat']:,} flat) over "
+            f"{row['cells']:,} cells and {row['tiles']:,} tiles — "
+            f"screen upper bound was {screen['pictures_upper_bound']:,}"
+        )
+    _emit(f"{result['api_requests']} requests spent.")
+    return 0
 
 
 def cmd_backup_status(cfg: SchedulerConfig, *, alert: bool = False) -> int:
@@ -6512,6 +6784,48 @@ def build_parser() -> argparse.ArgumentParser:
     p_assess.add_argument(
         "--no-publish", action="store_true", help="Regenerate the published JSON but do not rsync"
     )
+    p_screen = sub.add_parser(
+        "screen-provider",
+        help="Re-ask whether a provider has imagery in each tracked city yet (issue #316)",
+    )
+    _add_global_flags(p_screen)
+    p_screen.add_argument(
+        "provider",
+        metavar="PROVIDER",
+        help=f"Which provider to screen. One of: {', '.join(SCREENABLE_PROVIDERS)}.",
+    )
+    p_screen.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Price the pass (cities, distinct tiles, wall clock) and stop. No request.",
+    )
+    p_screen.add_argument(
+        "--measure",
+        action="store_true",
+        help="Instead of screening, measure the richest already-screened cities "
+        "EXACTLY at the finer zoom. Requires --limit; prints, and writes nothing.",
+    )
+    p_screen.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        metavar="N",
+        help="With --measure, how many cities to measure (richest screen first). "
+        "Meaningless without --measure: a screen covers the whole catalog by "
+        "definition, and a partial one would corrupt the dated series.",
+    )
+    p_screen.add_argument(
+        "--no-publish",
+        action="store_true",
+        help="Record the screen and rebuild the JSON, but do not rsync.",
+    )
+    p_screen.add_argument(
+        "--allow-collapse",
+        action="store_true",
+        help="Record a screen that finds imagery in NO city even though cities have "
+        "screened positive before. Refused by default: that is what a moved grid "
+        "layer looks like, not a platform losing its imagery.",
+    )
     _add_global_flags(
         sub.add_parser(
             "notify-failure", help="Email the recent log (for a systemd OnFailure= hook)"
@@ -6568,6 +6882,16 @@ def main() -> int:
         return cmd_regenerate(cfg, publish=args.publish)
     if args.command == "notify-failure":
         return cmd_notify_failure(cfg)
+    if args.command == "screen-provider":
+        return cmd_screen_provider(
+            cfg,
+            args.provider,
+            dry_run=args.dry_run,
+            measure=args.measure,
+            limit=args.limit,
+            publish=not args.no_publish,
+            allow_collapse=args.allow_collapse,
+        )
     if args.command == "backup-status":
         return cmd_backup_status(cfg, alert=args.alert)
     if args.command == "restore-backup":

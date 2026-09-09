@@ -73,6 +73,7 @@ python scripts/register_frame.py --manifest mapillary_360_cities.csv --overlap-k
 | `run-due [--dry-run]` | The nightly batch: collect stalest-due cities per channel, then the tail (aggregate, manifests, backup, publish) |
 | `run-due --provider mapillary --limit 40` | On-demand single-channel catch-up (#214) — the ONLY supported bulk path; **Mapillary catch-ups are PAUSED** (see provider access below) |
 | `assess-city "Newport, Kentucky" --estimate` | Same-day answer for a partner inquiry about an untracked city (#215); `--estimate` stops after the boundary and cost report, `--yes` runs it |
+| `screen-provider panoramax` | The weekly whole-catalog growth screen (#316): 113 requests answer all 1,144 cities. Writes UPPER BOUNDS, never counts; `--dry-run` prices it, `--measure --limit N` measures the richest exactly and writes nothing |
 | `regenerate-aggregate [--publish]` | Rebuild `cities.json.gz` from the catalog (no collection), optionally rsync |
 | `reconcile-walks [--dry-run]` | Catalog road walks that finished but were never registered |
 | `fetch-driving-plan [--force]` | Snapshot Google's published driving plan out of band; `--from-file`/`--date` backfills a hand-saved snapshot |
@@ -136,7 +137,7 @@ Each area below states its rules here and keeps its evidence in a `docs/` file.
 
 **Data model, pipeline and naming → [`docs/architecture.md`](docs/architecture.md).**
 Every run is an immutable dated snapshot on the city's **frozen grid geometry** (never re-geocoded, shared by all providers, so diffs are meaningful); **no filename provider token means gsv**, so all pre-provider names and published URLs are unchanged.
-The SQLite catalog `data/streetscape_tracker.db` (schema v14, auto-migrated on connect) is the operational source of truth and is **local-only, never rsynced**.
+The SQLite catalog `data/streetscape_tracker.db` (schema v15, auto-migrated on connect) is the operational source of truth and is **local-only, never rsynced**.
 `schedule_state.member` (v13, #248) is the one column where **NULL does not mean "not measured"** — it means "use `scheduler.CHANNEL_DEFAULT_MEMBERSHIP[channel]`", which is code-side so a new provider token cannot silently enrol the catalog (a missing entry is a `KeyError`, never a permissive default).
 Each provider is an independent run series on the same grid: GSV is a *sample* (nearest pano per grid point), Mapillary and KartaView are *censuses* — so coverage rates are cross-provider comparable and raw pano counts are not.
 Official-Google classification is an exact `© Google` match (`analysis.is_google_copyright`, mirrored in `city.js`), never a substring, since photographer names can contain "Google".
@@ -158,6 +159,7 @@ Three Panoramax rules that must survive without a read (#316):
 
 - **The census is the v1 `pictures` layer at z15, never `/api/search`** — search does not paginate, reports no `numberMatched` and SILENTLY IGNORES its own `datetime` filter (measured: 5,045 pictures that the requested windows should have excluded all came back), so an incremental fetch built on it would re-read the whole history and report it as new.
   z15 is the coarsest zoom that serves the layer at all, so a bbox costs ~4x Mapillary's tiles; the shared `tiles_for_bbox` therefore takes zoom as a REQUIRED argument and each provider re-exposes it with its own default.
+  The standing growth screen (#316) reads a DIFFERENT instrument — the v2 `grid` layer at z6, hexagons larger than the cities inside them — so its numbers are upper bounds and never coverage; `hexes_from_tile` takes zoom as a required argument for the same reason.
 - **A 403 or 429 is a per-IP refusal, and a 404 is an EMPTY TILE** — there is no credential, so 403 cannot mean a rejected token; and an empty area answers 200 with no layer, so a 404 means the tile holds nothing.
   A lattice where EVERY tile 404s is therefore a moved endpoint, and is refused rather than published as a city that lost all its imagery.
 - **`type` is two-state and `is_pano` is non-nullable** — the search response's absent field-of-view is an EXIF artifact, not a third imagery state; the raw `type` is published as `image_type` anyway, so a value Panoramax has never served would appear in the data rather than being folded into flat.
@@ -213,7 +215,8 @@ Channels run back-to-back, or concurrently in host-disjoint lanes when `[schedul
 **Publishing happens only at the end**, so a stale public site usually means the batch died or overran, not that the publisher broke.
 Drive manual batches into a file (`>> logs/x.log 2>&1`), never a pipe.
 `systemctl stop` is a real wind-down, not a kill; the unit's `TimeoutStopSec` must stay above the tail's measured components and below `max_batch_hours`.
-Deployment lives in `deploy/` (5 systemd units + its README).
+**The weekly growth screen (`screen-provider`, #316) is scheduled but is NOT part of a night** — its own timer, deliberately far from 02:00 because both take the same Panoramax host lock, and it publishes its own artifact (the nightly tail does not rebuild it, since nothing else changes its inputs).
+Deployment lives in `deploy/` (7 systemd units + its README).
 
 **Operator commands and publishing → [`docs/operations.md`](docs/operations.md).**
 `assess-city` answers a partner inquiry about an untracked city the same day (register + both road walks + the cheap Mapillary grid run + publish).
@@ -279,7 +282,7 @@ Keep any list a doc enumerates **alphabetical**, so two branches adding an entry
   - `undated-imagery-share.md`
 
 - Architecture decisions are recorded in `docs/adr/` — notably **ADR 0001: stay fully static, no backend**; large/dense-city rendering (#77, #58) is fixed with static artifacts (grid-binned overview → PMTiles), never a server.
-- Published JSON artifacts and their schema versions are inventoried in [`docs/architecture.md`](docs/architecture.md): per-run summary v2, aggregate `cities.json.gz` v3, streetwalk manifest v1, driving-plan summary v1.
+- Published JSON artifacts and their schema versions are inventoried in [`docs/architecture.md`](docs/architecture.md): per-run summary v2, aggregate `cities.json.gz` v3, streetwalk manifest v1, driving-plan summary v1, provider screen v1.
 - `data/` contains thousands of files — avoid globbing or listing it wholesale.
 - Legacy pre-2026 data files are undated; they are registered as `is_baseline=1` runs by the migration script and never renamed (published URLs stay stable).
 - Runtime state that must never reach the public web server lives in gitignored siblings of `data/` — `archive/` (#176), `backups/` (#145), `census_cache/` (#290), `checkpoints/` (#239, #256), `locks/` (#208), `logs/` — and the publish rsync only walks `data/`, so anything there is structurally unpublishable.

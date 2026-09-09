@@ -347,5 +347,21 @@ Revisit that only if widening wants Grab-market cities we would not otherwise co
 It exits 0 when it alerted (or alerting is intentionally off) and 1 only when a send was attempted and failed, so the notify unit's own status is meaningful.
 `run-due` returns nonzero on any failed city, so this hook can double-report a failure the in-run threshold alert already covered — accepted, since the alternative is a class of silent nights.
 
+**`screen-provider PROVIDER`** (#316) is the standing growth screen, and it is the one scheduled thing here that is **not** part of a night.
+It re-asks over the whole catalog whether a provider has any imagery in each city yet, reading a coarse count layer where 113 requests answer all 1,144 enabled cities, and writes one dated `provider_screen` row each.
+Panoramax is why it exists: its US corpora are months old rather than decades, so there is no archive to backfill and a city's growth is observable only if we were already watching when the imagery landed.
+
+It runs on its own weekly timer (`deploy/systemd/streetscape-screen-provider.timer`, Mondays at midday Pacific) rather than as a `run-due` tail step, for two reasons that both matter: the question has a different cadence from the nightly slate, and the batch's wall clock is already the binding constraint (#304).
+The timer is deliberately far from 02:00 because both take the same machine-wide Panoramax host lock — an overlap is not a race but a screen that exits **85** and records nothing that week.
+
+Three properties are load-bearing and easy to erode:
+
+- **Every number it records is an upper bound**, summed over map cells larger than the city inside them. A zero is conclusive; a positive number means only "look closer". The column names say `upper_bound` for that reason, and the published artifact carries the caveat as a field.
+- **`--limit` is `--measure`-only.** A screen is a whole-catalog observation: screening a subset would write a dated row for some cities and not others, and the published series' "cities positive on this date" would then count two different observations on one axis. The exact z14 measure is what needs bounding (~51,000 tiles for every positive city), and it prints rather than writing, so one column never means two instruments.
+- **Two refusals, both before the write.** Every tile answering 404 is a moved endpoint (an empty area answers 200 with no layer). And a pass that finds imagery in *no* city, in a catalog where cities have screened positive before, is a renamed layer rather than a platform that deleted its imagery; `--allow-collapse` records it once an operator has checked by hand.
+
+The command writes and publishes `provider_screen.json.gz` itself, and the nightly tail deliberately does not rebuild it — nothing else changes its inputs, so a nightly rebuild would add a failure surface for a file that cannot have moved.
+`regenerate-aggregate` does rebuild it, because that command is the prescribed recovery from a stale published set and has to cover every published file.
+
 **Production reads `config/scheduler.makelab1.toml`, not `config/scheduler.toml`** (passed via `--config`; the filename is historical — the service itself runs on makelab2, guarded by `ConditionHost=makelab2*`).
 The two diverge materially — budgets, absolute paths, `[publish].enabled`/`[publish].local` — so an operational change edited only into the repo default changes nothing in production, and vice versa: keep any comment-level rationale in step across both files.

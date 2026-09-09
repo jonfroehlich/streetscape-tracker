@@ -1,0 +1,19 @@
+# Weekly trigger for streetscape-screen-provider.service (user unit, issue #316).
+[Unit]
+Description=Screen Panoramax coverage across the catalog weekly
+
+[Timer]
+# Monday midday Pacific. Two things pick this slot, and both matter:
+#   - It is nowhere near the nightly batch (02:00, up to ~12 h). Both take the
+#     same machine-wide Panoramax host lock, so an overlap is not a race — it is
+#     a screen that exits 85 (host busy) and records nothing that week.
+#   - The screen is a growth SIGNAL somebody acts on (a city crossing zero is an
+#     enrolment candidate), so it lands when there is a week ahead to act in.
+OnCalendar=Mon *-*-* 12:00:00 America/Los_Angeles
+RandomizedDelaySec=30m
+# A missed week is a permanent hole in the series — the provider's own history
+# is not queryable backwards — so catch up on the next boot rather than skipping.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

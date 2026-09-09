@@ -189,9 +189,16 @@ def _no_tile_census_pacing(monkeypatch):
     Tests that care about pacing (rather than about what the fetch returns)
     monkeypatch ``AsyncRateLimiter`` themselves, which runs after this fixture
     and so wins.
+
+    THREE modules, not two: the Panoramax growth screen (issue #316) imports
+    the limiter into its OWN namespace, so patching the collector's name leaves
+    the screen pacing for real. It is the cheapest caller in the repo — 113
+    requests — and at 30/min that is still nearly four minutes of sleeping per
+    test that drives it.
     """
     from streetscape_metadata_tracker import download_mapillary as dm
     from streetscape_metadata_tracker import download_panoramax as dp
+    from streetscape_metadata_tracker import panoramax_screen as ps
 
     class _NoPacing:
         def __init__(self, max_per_minute, *args, **kwargs):
@@ -202,6 +209,7 @@ def _no_tile_census_pacing(monkeypatch):
 
     monkeypatch.setattr(dm, "AsyncRateLimiter", _NoPacing)
     monkeypatch.setattr(dp, "AsyncRateLimiter", _NoPacing)
+    monkeypatch.setattr(ps, "AsyncRateLimiter", _NoPacing)
 
 
 @pytest.fixture(autouse=True)

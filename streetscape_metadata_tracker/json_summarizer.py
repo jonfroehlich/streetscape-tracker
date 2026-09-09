@@ -1491,3 +1491,120 @@ def generate_driving_plan_summary(conn, data_dir: str) -> dict[str, Any]:
     )
 
     return summary_doc
+
+
+# What each provider's screen actually measured, published beside the numbers.
+# A reader who takes `pictures_upper_bound` for a picture count will overstate
+# every city, so the caveat travels IN the artifact rather than living only in a
+# page's prose — the page is one consumer of this file, not the only one.
+_SCREEN_INSTRUMENTS: dict[str, dict[str, Any]] = {
+    "panoramax": {
+        "endpoint": "https://api.panoramax.xyz/api/map/2/{z}/{x}/{y}.mvt",
+        "layer": "grid",
+        "zoom": 6,
+        "cell": "H3 resolution 6 (~36 km²)",
+        "selection": "hexagons overlapping the city's frozen grid bbox",
+        "attribution": "© Panoramax contributors",
+    },
+}
+
+_SCREEN_CAVEAT = (
+    "Upper bounds, not counts. Each figure sums provider-published counters for "
+    "map cells LARGER than the city inside them, so it over-counts by including "
+    "imagery outside the city's bounding box. A zero is conclusive — the city "
+    "holds no imagery — while a positive number means only that a closer look is "
+    "worth taking. Only a collection run measures coverage."
+)
+
+
+def generate_provider_screen_summary(conn, data_dir: str) -> dict[str, Any]:
+    """
+    Build and write ``provider_screen.json.gz`` (schema v1) — the standing
+    growth screen for providers whose deployments are still arriving (#316).
+
+    Panoramax is why this exists. Its US deployments are months old, not
+    decades: Boise's entire corpus was three months old when phase 1 measured
+    it. So unlike GSV there is nothing to backfill, and the only way a temporal
+    series exists is to be watching before the imagery lands. This artifact is
+    that watch, published: per city the latest upper bound and the date it first
+    went non-zero, plus a catalog-level series per screen date.
+
+    THE ARCHIVE'S OWN START DATE IS PUBLISHED WITH IT, and that is not
+    decoration. A city positive at our first screen has ``first_positive_date``
+    equal to that first screen, which records when WE started looking rather
+    than when the imagery arrived; without ``first_screen_date`` beside it a
+    reader cannot tell that case from a genuine arrival, and every city would
+    look like it appeared the week the instrument shipped.
+
+    Empty table → an empty ``providers`` object, with the file still written so
+    the frontend fetch succeeds.
+
+    Args:
+        conn: open catalog connection (db.connect).
+        data_dir: directory the artifact is written to (alongside cities.json.gz).
+
+    Returns:
+        The summary dict.
+    """
+    cities = {city.city_id: city for city in db.get_all_cities(conn)}
+
+    providers: dict[str, Any] = {}
+    for provider in db.get_screened_providers(conn):
+        firsts = db.get_provider_screen_firsts(conn, provider)
+        series = [dict(row) for row in db.get_provider_screen_series(conn, provider)]
+        rows = []
+        for row in db.get_latest_provider_screen(conn, provider):
+            city = cities.get(row["city_id"])
+            if city is None:
+                # A screen row whose city was deleted from the catalog. Skipped
+                # rather than published nameless: every consumer keys on the
+                # city, and a row nothing can join to is noise in a file every
+                # visitor downloads.
+                continue
+            record: dict[str, Any] = {
+                "city_id": row["city_id"],
+                "display_name": city.display_name,
+                "country_name": city.country_name,
+                "enabled": city.enabled,
+                "screen_date": row["screen_date"],
+                "cells": row["cells"],
+                "pictures_upper_bound": row["pictures_upper_bound"],
+                "pictures_360_upper_bound": row["pictures_360_upper_bound"],
+                "pictures_flat_upper_bound": row["pictures_flat_upper_bound"],
+            }
+            # Absent, not null, for a city that has never screened positive —
+            # the same absent-not-null convention the driving-plan artifact
+            # uses, so `if (rec.first_positive_date)` is a sufficient test.
+            if row["city_id"] in firsts:
+                record["first_positive_date"] = firsts[row["city_id"]]
+            rows.append(record)
+
+        providers[provider] = {
+            "instrument": _SCREEN_INSTRUMENTS.get(provider, {}),
+            "caveat": _SCREEN_CAVEAT,
+            "first_screen_date": series[0]["screen_date"] if series else None,
+            "latest_screen_date": series[-1]["screen_date"] if series else None,
+            "cities": rows,
+            "series": series,
+        }
+
+    summary_doc = {
+        "schema_version": 1,
+        "generated_at": pd.Timestamp.now(tz="UTC").isoformat(),
+        "providers": providers,
+    }
+
+    output_path = os.path.join(data_dir, "provider_screen.json.gz")
+    # create_parent, for the driving-plan summary's reason: the screen runs on
+    # its own weekly timer and can legitimately be the FIRST thing a fresh
+    # deployment writes, before any collection has created data/.
+    _write_json_gz_atomic(output_path, summary_doc, create_parent=True)
+    logger.info(
+        "Wrote provider screen summary for "
+        + (
+            ", ".join(f"{p} ({len(v['cities'])} cities)" for p, v in providers.items())
+            or "no providers"
+        )
+        + f" to {output_path}"
+    )
+    return summary_doc

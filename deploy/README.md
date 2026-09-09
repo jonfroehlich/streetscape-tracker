@@ -754,6 +754,25 @@ It only accepts an **opt-in** channel — one whose default membership is off (`
 `--list` is read-only and accepts any channel; on a default-membership one the answer is every enabled city.
 Per-city exclusion on `gsv`, `mapillary` and the two street channels stays `cities.enabled`, deliberately: a second, less visible way to disable a city is how two operators end up disagreeing about why it stopped collecting.
 
+### The weekly Panoramax growth screen (#316)
+
+Panoramax is the one provider we track whose deployments are still **arriving** — Boise's entire corpus was three months old when it was first measured — so there is nothing to backfill and a city's growth is observable only if we were already watching when the imagery landed.
+`screen-provider` is that watch: it reads a coarse count layer at z6, where 113 requests answer all 1,144 enabled cities, and records one dated row per city.
+
+```bash
+cp deploy/systemd/streetscape-screen-provider.{service,timer} ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now streetscape-screen-provider.timer
+systemctl --user start streetscape-screen-provider.service   # run once now
+```
+
+- Fires **Mondays at 12:00 Pacific** (±30 min), deliberately far from the 02:00 batch: both take the same machine-wide Panoramax host lock, so an overlap is not a race but a screen that exits **85** (host busy) and records nothing that week.
+- Every number it writes is an **upper bound** — the hexagons it sums are larger than the cities inside them. A zero is conclusive ("this city holds nothing"); a positive number means only "look closer". Never quote one as a coverage figure.
+- Price a pass without spending anything: `scheduler screen-provider panoramax --dry-run`.
+- A city crossing zero → non-zero is an **enrolment candidate**, answerable any afternoon: `scheduler screen-provider panoramax --measure --limit 5` measures the richest screened cities exactly, prints, and writes nothing.
+- It publishes `data/provider_screen.json.gz` itself. The nightly batch deliberately does **not** rebuild that file — nothing else changes its inputs — so a stale one means this timer stopped, not that the batch did.
+- **Two refusals are by design, and both exit nonzero without writing.** Every tile answering 404 is a moved endpoint (an empty area answers 200 with no layer). And a pass finding imagery in *no* city, in a catalog where cities have screened positive before, is a renamed layer rather than a platform that deleted its imagery; `--allow-collapse` records it anyway, once you have checked the endpoint by hand.
+
 ### Turning the KartaView channel on in production (#248)
 
 The repo default `config/scheduler.toml` declares `[providers.kartaview]`; **production reads `config/scheduler.makelab1.toml`, which deliberately does not**, so deploying the code changes nothing.
