@@ -237,13 +237,16 @@ enabled = true
 # less load. The even split still matters for the un-paired case, where the
 # two budgets deplete in lockstep and a heavy slate defers the same cities on
 # both channels instead of un-pairing them further. A normal 20-city night
-# (~1,150 tiles per channel) is unaffected. NO `--limit` catch-ups
-# until a rolling multi-day guard exists: these budgets bound any single day,
+# (~1,150 tiles per channel) is unaffected. The `--limit` catch-up ban that used
+# to sit here was LIFTED 2026-09-09 after #292's eleven clean nights
+# (docs/provider-access.md, "The read-out"); catch-ups now resume STAGED, sized
+# in cities. The reasoning it rested on, kept because it is still the exposure
+# argument: these budgets bound any single day,
 # but three consecutive maxed days sum to 10,500 — inside the 3-day
 # uncertainty band above — so only a multi-night catch-up can reach where
 # normal nights cannot. (That 10,500 was 1,750 + 1,750; since the 2026-09-05
 # re-size three maxed days are 10,500 paired and 15,750 un-paired, so the
-# raise widens the blast radius of a catch-up if the ban is ever lifted.)
+# raise widens the blast radius of a catch-up now that the ban is lifted.)
 #
 # RECOVERY, measured twice (#241): the block lifts within ~a day of the LAST
 # refused request — block 1 cleared after ~20.5 h of true silence (silence

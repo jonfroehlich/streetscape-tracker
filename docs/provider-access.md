@@ -96,7 +96,8 @@ That is a decision rather than a task — it identifies this project to the vend
 
 **`[providers.mapillary].daily_request_budget` goes to 3,500; `[providers.mapillary_streets]` stays 1,750.**
 Decided and written 2026-09-05, and deliberately **not deployed** until #292's jitter window closed — production ran at 1,750 every night through 2026-09-09, so read any date before the deploy as the authoring date, not the live configuration.
-It reached production at **~11:00 on 2026-09-09**, ~20 minutes after that morning's 1,750-budget night finished (the 02:00 timer plus an 8.68 h run ends ~10:41), so the first run this figure governs is **09-10**.
+It reached production at **~11:00 on 2026-09-09**, minutes after that morning's 1,750-budget night finished, so the first run this figure governs is **09-10**.
+The margin is **~4 to ~19 minutes**, not a round number: the timer is `OnCalendar=02:00` with `RandomizedDelaySec=15m` (this file records the 08-30 fire at 02:13), so an 8.68 h run ends somewhere in 10:41–10:56.
 Read the live number off the nightly log's own `within daily budgets of …` line rather than off this file or the config comment; for five days they disagreed by design.
 The grid channel's figure doubled for a reason that has nothing to do with the block model, and it is worth separating from one: 1,750 was sized on 2026-08-22 (#241) for a **20-city** night, and `max_cities_per_day` went 20 → 40 on 2026-09-02 (#304) without the budget following.
 The ledger shows that seam precisely — the first two 40-city nights pinned the cap, after four 20-city nights that never came close:
@@ -112,6 +113,8 @@ The ledger shows that seam precisely — the first two 40-city nights pinned the
 
 Sizing it needs the *unbiased* per-city cost, and there are two distributions in this file that must not be confused.
 Over the 1,398 **runs** actually collected, cost is median **9**, p90 **81**, max **870**, mean **39** (percentiles nearest-rank; the p99 is 440 that way and 420 interpolated, which is why only p90 and max are quoted here) — but that population is biased low by construction, because the budget gate skips exactly the expensive cities: the 85 enabled cities with no Mapillary run at all average a **728.6 km²** frozen grid against **131.6 km²** for the 1,132 that have one, and tile count scales with area.
+(Flagged rather than quietly reconciled, per the experiments convention: 85 + 1,132 = **1,217** against the 1,214 enabled cities quoted at the top of this file, so the two counts were measured on different days or under different `enabled` filters.
+The 5.5× area ratio is what the argument rests on and a three-city drift does not move it; re-measure both before quoting either as a count.)
 The unbiased figures are the **geometry** ones at the top of this file (median 12, mean **57.8**, p90 180, p99 480 over all 1,214 enabled cities), and the per-**city** mean over latest runs is **45.2**.
 So a 40-city night demands roughly **1,800–2,400**, not the ~1,560 the run-weighted mean alone would suggest — and the table above confirms it from observation rather than model: 09-03 demanded 1,736 spent **plus** the 484 and 40 it skipped = **2,260** (56.5/city), and 09-04 spent 1,723 across 29 Mapillary cities (59.4/city).
 3,500 is therefore about **1.5x** headroom over a normal 40-city night, not the 2.2x the run mean implies, and the cap still binds on any night carrying two or three metros.
@@ -204,9 +207,9 @@ the nightly systemd unit passes no `--limit` and is unaffected.
 **Catch-ups are un-paused as of 2026-09-09**, on the read-out section below.
 #241's rolling guard was the original condition, and block 3 retired the window it would have guarded.
 Be exact about what the eleven nights establish: the **ordinary nightly cadence** is survivable at this pacing.
-They do not clear the burst shape, because the window contained no burst — it ran at 755–2,260 combined requests/day against a 1,750 grid cap.
+They do not clear the burst shape, because the window contained no burst — its grid spend ran 543–1,736/day against a 1,750 cap, and the six nights the ledger prices combined ran 755–2,260.
 So the pause is lifted because the staging rule below keeps a catch-up close to that measured cadence, **not** because a multi-night burst was tested and survived: the one direct datapoint on a burst is still block 1 (~370 req/min, 10,659 in a day), and it produced a block.
-They resume **staged, never at the ceiling**: the window's highest combined night was **2,260** (2026-09-03), so a catch-up that fills the budget on night one is a volume step no measurement covers.
+They resume **staged, never at the ceiling**: the highest combined night the ledger records is **2,260** (2026-09-03), and five of the eleven nights have no walk figure at all, so a catch-up that fills the budget on night one is a volume step no measurement covers.
 **Quote the per-IP sum when sizing one, never the grid channel's 3,500 alone.** A `--limit` catch-up is single-channel and therefore un-paired by construction — `mapillary_streets` gets no #290 census-cache hit from it — so a catch-up night plus its own walk can reach **5,250**.
 **Size the step in cities, because `--limit N` is a city count and not a spend knob**: per-city cost is median **9**, p90 **81**, max **870**, so an N is a distribution rather than a number and the spend is discovered afterwards.
 Start at `--limit 5` on cities that already have a Mapillary run (~45 requests each on the per-city mean), read the ledger each morning, and widen only after a night lands where you expected.
@@ -286,9 +289,10 @@ Mapillary tile fetches jitter **by default** (`DEFAULT_TILE_JITTER = 0.6`, `--ma
 The budgets were left at 1,750 for the restart because a fourth cut has no mechanism to work through — and were deliberately not raised either until the window below closed, since volume is an axis this test is holding still (the grid channel went to 3,500 on 2026-09-05; see the daily-budget section above).
 
 **This is a pre-registered test, not a fix**, and the prediction is recorded in #286 before the restart.
-Each prior block landed **on the 6th active collection night**: 08-13…08-20 and 08-23…08-28 are each a run of six collecting nights ending in the block.
+Blocks 2 and 3 each landed **on the 6th active collection night**: 08-13…08-20 and 08-23…08-28 are each a run of six collecting nights ending in the block.
+Two observations, not three — block 1 (08-12) came from a bulk catch-up sustaining ~370 req/min rather than from a six-night restart — so this is an n=2 regularity and the read-out below is only as strong as that.
 Those two runs were also 8 calendar days apart, but only because each happened to contain exactly two paused days — so the calendar reading and the active-night reading coincided by accident.
-This restart has no paused days, so the two PREDICTIONS diverge — six active nights lands on 09-04 where the priors' 8-calendar-day spacing would land on 09-06 — and the active-night rule is the one stated here.
+This restart has no paused days, so the two PREDICTIONS diverge — six active nights lands on 09-04, where carrying the priors' 8-calendar-day block-to-block spacing forward from 08-28 lands on 09-05 — and the active-night rule is the one stated here.
 The restart was planned for Mon 2026-08-31 but the deploy landed on Sat 2026-08-29 afternoon, so the first jittered night is the **08-30 02:13 PDT** timer fire and every date below is one day earlier than #286's original table — shifted here rather than silently left pointing at the pre-deploy plan, because moving a pre-registered date *after* the outcome is known is the thing this whole section exists to avoid.
 #286's table also counted the restart night as day 0, which placed its estimate a night later than the 6th active night the rule actually names; both corrections are made here, five nights before night 6, and posted to #286 rather than only recorded locally.
 A fourth block around **2026-09-04/05** — the 6th active night is 09-04 — under jitter and the shared census's halved paired-night spend (issue #290, PR #291) means rate, volume *and* request pattern are all dead, the trigger is cadence (consecutive active days, or a trust score), and the next move is scheduling rest days for the Mapillary channels — not more pacing.
@@ -308,14 +312,16 @@ Night 6 (09-04) is the night both prior blocks landed on and the night #286 name
 Eleven active nights is **1.8× the six-active-night interval that preceded blocks 2 and 3**, so the interval that generated the prediction has been cleared with room to spare.
 Be honest about that interval's strength: it is an **n=2** regularity, not n=3 — block 1 (2026-08-12) came from a bulk catch-up sustaining ~370 req/min, not from a six-night restart — and the read-out is only as strong as the rule it cleared.
 **Grid-channel** spend across the window, per night: 755 / 950 / 1,241 / 1,037 / 1,736 / 1,723 / 862 / 1,343 / 1,593 / 543 / 1,162 requests.
-Those are the `mapillary` column alone, and the quantity the block is keyed on is the **combined** per-IP one: the ledger above pairs 09-03's 1,736 with a 524-request walk for **2,260**, which is the window's highest combined night.
-The walk's per-night spend for 09-05…09-09 is not in that ledger, so read the last five figures as a **floor** on the combined load rather than as the load itself.
+Those are the `mapillary` column alone, and the quantity the block is keyed on is the **combined** per-IP one: the ledger above pairs 09-03's 1,736 with a 524-request walk for **2,260**, the highest combined night the ledger RECORDS.
+The walk's per-night spend for 09-05…09-09 is not in that ledger, so read the last five figures as a **floor** on the combined load rather than as the load itself — and therefore as a reason not to call 2,260 the window's maximum.
+A floor cannot establish a maximum: if any of those five ran un-paired, its walk drew on its own 1,750 budget and the night's combined load exceeded 2,260 (09-07's 1,593 has a 3,343 ceiling).
+Extending the ledger to eleven rows is what would settle it.
 Every one of those nights ran against the **old 1,750** budget — #319's raise reached production at ~11:00 on 09-09, ~20 minutes after the last window night finished, so it first binds on the 09-10 run.
 
 **The decision this records: keep 40/min at `jitter = 0.6` on both Mapillary channels, and do not tune the rate back up.**
 A clean window is evidence that this setting is survivable, not that a faster or more regular one would be — the test moved one axis and can only speak about that axis.
 Two limits on the conclusion were accepted going in and still hold: #290's shared census was bundled into the same restart, so a clean result cannot say which of the two worked, and CV 0.6 is still short of Poisson's 1.0 against an unchanged duty cycle (~44 minutes of unbroken traffic, no gap over ~10 s).
-What the window does **not** license is treating the raised budget as tested: its highest combined night was 2,260 — 65% of the 3,500 #241 sanctioned, and 43% of the 5,250 an un-paired night can reach — so the raised ceiling has been approached and never survived at.
+What the window does **not** license is treating the raised budget as tested: the highest combined night on record was 2,260, which is 65% of the **pre-raise** 3,500 #241 sanctioned but only 43% of the 5,250 an un-paired night can now reach — so the RAISED ceiling was never approached, let alone survived at.
 
 **Separately, a project decision rather than an empirical claim: makelab1 is NOT an escape hatch, even though it demonstrably still works** (verified 2026-08-13: same token, same /24, 200 + 12.4 MB while makelab2 got 302).
 **Project Sidewalk serves Mapillary data off the makelab servers**, so pointing this workload at makelab1 risks earning the same per-IP block on a host that a *production research deployment* depends on.
