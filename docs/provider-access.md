@@ -158,7 +158,12 @@ Consequences, in force until a rolling guard lands: **(1) no `--limit` catch-ups
 The guard itself is a query change, not a schema change (`api_usage` is keyed (usage_date, provider) and already holds the history) — #241 item 3.
 **(2) The budget, not `max_batch_hours`, ended a maxed Mapillary night** while both channels sat at 1,750: that was ~1 h of paced fetching against the ~17,000-tile deadline ceiling, ~30 cities/night at the 57.8-tile mean, and one 70,168-tile catalog pass in **~40 nights**, not ~5.
 Since the 2026-09-05 re-size the grid channel's 3,500 reaches ~60 cities and ~20 nights, and it is the **40-city cap** that ends the night — every night 09-03..09-08 stopped on it in 6.8–10.6 h against `max_batch_hours = 12`.
-No city has ever been skipped as over-budget in either regime (largest grid 870).
+~~No city has ever been skipped as over-budget in either regime (largest grid 870).~~
+**Wrong, and wrong in the way this file already warns about elsewhere (corrected 2026-09-10, #318).**
+870 is the largest grid *that has a run*, and the daily-budget section above says why that population cannot answer this question: "the gate skips exactly the expensive cities", so reading the observed maximum to decide whether the gate ever fired is circular.
+Priced from **geometry** over the enabled catalog instead, exactly one city clears the whole daily budget in either regime: **Anchorage**, ~6,480 z14 tiles on a 105.6 x 83.7 km frozen grid (an oversized one the #166 cap never reached).
+Its signature is the one this arm produces and nothing else does — zero Mapillary runs, `last_success_at` NULL, and `consecutive_failures` **0**, because a permanent skip records no failure — so it was invisible to the nightly alert and to the five-night backstop alike, every night, since the channel began.
+#318 ends that: it now launches capped at whatever the night's remainder affords and finishes across nights, which is what a `--dry-run` preview reports as `launch capped at N; resumes`.
 **(3) If a block ever arrives under this cap**, that is strong evidence for the repeat-offender reading over the fixed window
 — capture the day's `api_usage` row, the elapsed hours from the `run-due` summary line (the `[alerts]` email carries it; nothing else records time-under-load), AND the trailing 3 days' ledger before changing anything.
 
