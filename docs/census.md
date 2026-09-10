@@ -251,8 +251,11 @@ Both times that fired in the six nights 2026-08-30..09-04 it was an end-of-night
 **The cap is checked inside the semaphore, beside #205's abort flag, and it is a SEPARATE flag rather than a second meaning for that one.**
 `fatal` means every remaining tile would fail identically, so the city is over; a cap means the opposite — they are all perfectly fetchable and we are out of budget until tomorrow.
 Folding the two together would make one of the two exit codes wrong whichever way it went.
-It inherits the abort's bound as well as its position: tasks already past the check finish, each spending up to `TILE_MAX_TRIES` requests, so the overshoot is at most `connection_limit × TILE_MAX_TRIES` (25 at the grid defaults) rather than the whole city.
-That is documented on the flag rather than engineered away — stopping requests already in flight would mean cancelling a paced, retrying fetch mid-attempt, which buys ~25 requests and costs the guarantee that every request we made was counted.
+It inherits the abort's position but **not** its bound, and the difference is a reservation: a tile that clears the check adds its request to the running total before releasing control, so the cap is not overshot at all in the ordinary case.
+Without that, every task the semaphore admits clears a check reading a stale `api_requests` and only then queues on the rate limiter — `connection_limit − 1` requests over the cap on every capped night.
+That is not a small residual: `connection_limit` is **50** in production (`config/scheduler.makelab1.toml`), not the argparse default of 5, so the figure to reason with is 49 and never "25 at the defaults" — no scheduled run uses the defaults.
+It was measured on this code with a fetch that actually awaits (cap 200 at `connection_limit` 50 spent 249) and is now pinned by `test_the_cap_is_not_overshot_by_the_tasks_already_in_flight`, which needs a limiter with a real suspension point in it to see anything at all.
+What remains is retries by tiles already in flight, at most `connection_limit × (TILE_MAX_TRIES − 1)`, and that part is documented on the flag rather than engineered away — stopping requests already in flight would mean cancelling a paced, retrying fetch mid-attempt, and would cost the guarantee that every request we made was counted.
 
 **THE RAISE SITS BEFORE THE SETTLE LOOP, AND THAT PLACEMENT IS THE SAFETY ARGUMENT.**
 A tile skipped at the cap returns an *empty census*, not an exception — which is what keeps it uncommitted and therefore owed to the resume.

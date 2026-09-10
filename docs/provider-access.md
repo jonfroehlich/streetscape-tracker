@@ -158,17 +158,31 @@ Consequences, in force until a rolling guard lands: **(1) no `--limit` catch-ups
 The guard itself is a query change, not a schema change (`api_usage` is keyed (usage_date, provider) and already holds the history) — #241 item 3.
 **(2) The budget, not `max_batch_hours`, ended a maxed Mapillary night** while both channels sat at 1,750: that was ~1 h of paced fetching against the ~17,000-tile deadline ceiling, ~30 cities/night at the 57.8-tile mean, and one 70,168-tile catalog pass in **~40 nights**, not ~5.
 Since the 2026-09-05 re-size the grid channel's 3,500 reaches ~60 cities and ~20 nights, and it is the **40-city cap** that ends the night — every night 09-03..09-08 stopped on it in 6.8–10.6 h against `max_batch_hours = 12`.
-~~No city has ever been skipped as over-budget in either regime (largest grid 870).~~
-**Wrong, and wrong in the way this file already warns about elsewhere (corrected 2026-09-10, #318).**
-870 is the largest grid *that has a run*, and the daily-budget section above says why that population cannot answer this question: "the gate skips exactly the expensive cities", so reading the observed maximum to decide whether the gate ever fired is circular.
-Priced from **geometry** instead, exactly one city clears the whole daily budget in either regime: **Anchorage**, ~6,480 z14 tiles on a 105,588 x 83,676 m frozen grid.
-Its catalog signature is the one this arm produces and nothing else does — zero Mapillary runs, `last_success_at` NULL, and `consecutive_failures` **0**, because a permanent skip records no failure — so nothing it did was visible to the nightly alert or to the five-night backstop.
+**No city has ever been skipped as over-budget in either regime, and the largest grid really is 870 — verified on PRODUCTION, 2026-09-10 (#318).**
+The reasoning that briefly overturned this is still worth keeping, because it is sound and only the input was wrong.
+It went: 870 is the largest grid *that has a run*, and the daily-budget section above says why that population cannot answer this question — "the gate skips exactly the expensive cities", so reading the observed maximum to decide whether the gate ever fired is circular.
+Priced from **geometry** instead of from the run table, the dev catalog in a repo checkout showed exactly one city clearing the whole daily budget: **Anchorage**, ~6,480 z14 tiles on a 105,588 x 83,676 m frozen grid, with the catalog signature this arm produces and nothing else does — zero Mapillary runs, `last_success_at` NULL, and `consecutive_failures` **0**, because a permanent skip records no failure.
 
-**MEASURED ON THE DEV CATALOG IN THE REPO CHECKOUT, NOT ON PRODUCTION, and the two may disagree here specifically.**
-That catalog holds 1,144 enabled cities and **three** Mapillary runs against production's ~1,132, so it is a development copy rather than a mirror — and `scheduler.py`'s `city_timeout_seconds` comment states that #166's grid caps took Anchorage to **575** tiles, which would put it under any of these budgets.
-Frozen geometry does not drift on its own, so the most likely reading is that the dev copy predates a resize that `cap_oversized_grids.py` applied on production only.
-**What is certain either way** is the mechanism — a permanent skip records nothing, so a city in this state is invisible for as long as it lasts — and that #318 removes the arm regardless: an over-budget city is now launched capped at whatever the night's remainder affords and finishes across nights, which a `--dry-run` preview reports as `launch capped at N; resumes`.
-**What is worth one query on production** is which of the two Anchorage rows is live there; if it is the uncapped one, this city has collected no Mapillary imagery since the channel began.
+**That geometry is not production's.** A read-only query against the live catalog settles every part of it:
+
+| Measured on makelab2, 2026-09-10 | |
+|---|---|
+| Anchorage's frozen grid | 26,000 x 28,000 m — **575** z14 tiles, i.e. #166's cap did reach it |
+| Anchorage's Mapillary runs | **2**, 2026-07-23 and 2026-07-24, `last_success_at` set, 0 failures |
+| Enabled cities | 1,221 |
+| Largest by geometry | Moscow **870**, then Berlin 832, Togiak 784, London 756, Kyiv 702, Anchorage 575 |
+| Median | **15** tiles |
+| Cities over the 3,500 grid budget | **0** |
+
+So the geometric maximum and the observed maximum are the same number, the circularity that made this worth checking does not bite in practice, and the largest city on the catalog is ~25% of one Mapillary night rather than all of it.
+**The lesson is the dev catalog, not Anchorage**: `data/streetscape_tracker.db` in a checkout is a development copy that predates resizes `cap_oversized_grids.py` applied on production, and quoting its geometry as a production fact is what produced a confident correction of a correct sentence.
+Price a "which cities are too big?" question against production or not at all.
+
+**What #318 changes is the mechanism, not this catalog's arithmetic.**
+An over-budget city is now launched capped at whatever the night's remainder affords and finishes across nights — a `--dry-run` preview reports it as `launch capped at N; resumes` — so the permanent-skip arm is gone before any city grows into it.
+Note what that arm would cost if one did: neither budget arm applies to a resumable channel, so a city needing more than a whole night takes the entire channel budget for `ceil(tiles / budget)` consecutive nights, and every other Mapillary city those nights falls under the launch floor.
+`get_due_cities`' `NULLS FIRST` would put a never-collected city of that size at the head of the queue.
+That is the right trade — the alternative is collecting it never — but it is a whole-night decision that nothing in the log distinguishes from an ordinary night, and today's headroom for it is 870 against 3,500.
 **(3) If a block ever arrives under this cap**, that is strong evidence for the repeat-offender reading over the fixed window
 — capture the day's `api_usage` row, the elapsed hours from the `run-due` summary line (the `[alerts]` email carries it; nothing else records time-under-load), AND the trailing 3 days' ledger before changing anything.
 
@@ -182,7 +196,11 @@ The census now resumes for its **missing tiles only**, through the same `checkpo
 Three things this deliberately does **not** change.
 Resume is strictly **next-invocation**: no in-process retry is added anywhere, because the forum-reported hazard that retrying during a block extends it stands untested in either direction and is not worth testing with production credentials.
 Pacing is untouched at 60/min, and so are both daily budgets — a resumed night is *cheaper*, never faster.
-That still holds after #318, and it is the sentence to read before worrying about the traffic shape a request cap produces: a cap never raises a day's total above the budget, and across nights a city split over two is paid for once instead of re-paid.
+That still holds after #318, and it is the sentence to read before worrying about the traffic shape a request cap produces: across nights, a city split over two is paid for once instead of re-paid.
+What a cap does **not** give is an exact ceiling on the day.
+It is a soft one: a capped crawl may end the night up to `connection_limit × (TILE_MAX_TRIES − 1)` requests over its budget — **200** at production's `connection_limit` of 50 — because tiles already in flight when the cap trips are allowed to finish their retries rather than being cancelled mid-attempt.
+The larger overshoot this originally shipped with, `connection_limit − 1` on every capped night whether or not anything retried, was a defect and is fixed (see [`docs/census.md`](census.md)); the retry residue is deliberate.
+Quote it as a soft ceiling with a 200-request tail, never as "the budget is never exceeded" — on the one host that has blocked this IP three times, the difference between those two statements is the whole reason to state it.
 What it does change is that a night which used to stop *short* of its budget — skipping the city that did not fit the remainder — now spends the remainder exactly.
 Near-ceiling nights become exactly-ceiling nights, which is worth stating rather than discovering, because volume is the axis #292's jitter test was holding still.
 And the pre-flight estimate still prices the whole tile count even when a resume will fetch a fraction of it, which errs high; that is the safe direction for a budget gate and is left alone.
