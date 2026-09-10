@@ -1713,10 +1713,23 @@ def _sweep_requests_within_timeout(
     from the SAME constants as that one or the two drift. That is why the rate
     and the achieved fraction come from ``_crawl_pricing`` rather than from
     KartaView's two module constants, which is what this function used while
-    KartaView was the only channel that could pause: sizing a Mapillary cap at
-    16/min x 0.5 when its own timeout is derived at 40/min x 0.8 under-prices
-    the clock term roughly fourfold, and a cap under the launch floor does not
-    slow a channel down -- it skips the city outright, nightly (#318).
+    KartaView was the only channel that could pause. A cap under the launch
+    floor does not slow a channel down -- it skips the city outright, nightly
+    (#318).
+
+    HOW FAR OFF IT WAS DEPENDS ON WHETHER THE CHANNEL IS CONFIGURED, and both
+    numbers are worth having because only one of them is production's:
+
+    * With a ``[providers.mapillary]`` block, the CONFIGURED rate is used on
+      both sides, so only the fraction was wrong: prod's 40/min gives 40 x 0.5
+      = 20 against the correct 40 x 0.8 = 32, i.e. **1.6x** low.
+    * With no block, the default rate was wrong too: 16 x 0.5 = 8 against
+      DEFAULT_TILE_REQUESTS_PER_MINUTE x 0.8 = 60 x 0.8 = 48, i.e. **6x** low.
+
+    Do not quote a single "fourfold" for this. It came from pairing 16/min
+    (KartaView's DEFAULT) with 40/min (Mapillary's CONFIGURED value) -- two
+    branches this function never takes together, since a configured rate
+    replaces the default on both sides of the fix.
 
     Both directions hold ``_TIMEOUT_FIXED_SLACK_S`` back for process startup,
     the checkpoint write and the tail.
@@ -1811,19 +1824,17 @@ def city_timeout_seconds(
     # any time, and a SIGKILL costs the requests already spent AND counts a
     # failure — the guard must not depend on today's geometry staying capped.
     #
-    # TWO OF THOSE FIGURES ARE CONTRADICTED BY THE DEV CATALOG (noted 2026-09-10,
-    # #318, unresolved). `data/streetscape_tracker.db` in a repo checkout puts
-    # Anchorage at 105,588 x 83,676 m -> ~6,480 tiles (NOT 575) and makes it the
-    # largest frozen grid by 4.9x, with Los Angeles second at 1,326 and four
-    # cities over 870 — so "the largest is 870 (Moscow)" does not hold there
-    # either. That catalog carries 1,144 enabled cities and three Mapillary runs
-    # against production's ~1,132, so it is a development copy and the likeliest
-    # reading is that it predates a resize applied only on production. Left as
-    # written rather than "corrected", because the numbers above may well be the
-    # production truth and this is not the machine that can say. Resolving it is
-    # one query on prod; docs/provider-access.md records why it matters (an
-    # uncapped Anchorage is permanently skipped by the Mapillary budget arm,
-    # recording no failure and reaching no alert).
+    # THE FIGURES ABOVE ARE PRODUCTION'S; A DEV CATALOG CONTRADICTS THEM AND IS
+    # WRONG (checked on makelab2, 2026-09-10, #318). `data/streetscape_tracker.db`
+    # in a repo checkout puts Anchorage at 105,588 x 83,676 m -> ~6,480 tiles and
+    # makes it the largest frozen grid by 4.9x, which briefly got the line above
+    # written off as stale. The live catalog says 26,000 x 28,000 m -> 575 tiles,
+    # with two Mapillary runs on it (2026-07-23/24) and no failures; 1,221
+    # enabled cities, median 15, largest still Moscow at 870, and NOT ONE city
+    # over the 3,500 grid budget. A checkout's catalog predates resizes
+    # `cap_oversized_grids.py` applied only on production, so it is not a source
+    # for any question about geometry. Re-measure on prod rather than trusting
+    # either number here; the derivation stays for the reason given above.
     if provider not in (
         "gsv",
         "gsv_streets",
@@ -1876,7 +1887,12 @@ def city_timeout_seconds(
 # rendered under a name the live path does not use.
 _SWEEP_SKIP_SIBLING = "sibling sweep in flight"
 _SWEEP_SKIP_AGE_WALL = "checkpoint at the age wall"
-_SWEEP_SKIP_FLOOR = "under the calibration floor"
+# "launch floor", not "calibration floor": calibration is KartaView's reason for
+# having one, and since #318 a tile census has this skip too, where the floor
+# buys one tile's retries and there is no ladder to calibrate. The provider's own
+# wording rides in `_CRAWL_PRICING.floor_buys` and reaches the message; this
+# token is the label both share, so it must not name either one's mechanism.
+_SWEEP_SKIP_FLOOR = "under the launch floor"
 
 # How close to CHECKPOINT_MAX_AGE_S a checkpoint may get before the scheduler
 # refuses to add another night to it: ONE night. The wall is measured from the
@@ -1998,10 +2014,17 @@ def _sweep_launch_plan(
       is not self-correcting -- a pause records nothing, so without a failure
       the five-night backstop, the nightly alert and the operator all stay
       unaware while ~60k requests a cycle are discarded.
-    * ``_SWEEP_SKIP_FLOOR`` -- the cap cannot even clear radius calibration. A
-      budget exhausted there raises a plain DownloadError, not
+    * ``_SWEEP_SKIP_FLOOR`` -- the cap cannot clear what this provider's crawl
+      needs to make ANY durable progress. Per provider, because the failure is a
+      different failure: a radius sweep cannot clear its calibration ladder, and
+      a budget exhausted there raises a plain DownloadError rather than
       SweepIncompleteError, so it takes no amnesty and burns a real
-      consecutive_failure to accomplish nothing.
+      consecutive_failure to accomplish nothing; a tile census has no ladder,
+      but a cap under one tile's full retry budget can spend itself whole on a
+      transiently-failing tile, commit nothing, and take the same plain
+      DownloadError for having nothing to resume. ``floor_buys`` carries the
+      per-provider wording into the operator-facing message, so read the number
+      from ``_CRAWL_PRICING`` rather than from this list.
 
     ``est == 0`` means a census already in the shared cache, and it exempts a
     channel from the sibling and floor arms both. Nothing is being crawled: the
@@ -2106,6 +2129,35 @@ def _sweep_launch_plan(
             f"skipping (resumes tomorrow).",
             f"deferred ({request_cap:,} req under the launch floor)",
         )
+
+    if est == 0:
+        # THE CACHED-CENSUS CASE (#290), AND THE ONE PLACE A CAP CAN COME OUT
+        # NON-POSITIVE. `est == 0` means the crawl this channel would do is
+        # already in the shared cache, so the floor above is deliberately not
+        # applied -- there is nothing to fund. But `est` is what the SCHEDULER
+        # predicts, and only the child can know whether the entry is actually
+        # reusable: `reconcile_cache_hit` refuses one older than the consumer's
+        # own checkpoint, and `load_cached_census` refuses one that fails
+        # validation. On either of those the child crawls for real.
+        #
+        # Which is why a non-positive cap is raised to 1 rather than dropped. A
+        # cap of 0 or less makes `_request_cap_args` emit NO FLAG AT ALL --
+        # correct for "spend nothing", catastrophic for "crawl the whole city",
+        # and the grid command carries no `--daily-budget` to catch it either.
+        #
+        # 1, deliberately, and NOT `floor`: the floor is what a crawl needs to
+        # make progress, but this branch is reached precisely when the budget
+        # cannot fund one, and granting a channel more than the night has left
+        # to spend is the failure the budget exists to prevent. A genuine cache
+        # hit is unaffected either way (it issues no request, so no cap binds);
+        # a surprise crawl stops at the first request and takes the honest
+        # `DownloadError` for having nothing to resume, instead of running a
+        # whole city against a per-IP host on an exhausted budget.
+        #
+        # `max`, so a positive remainder is passed through untouched: the walk
+        # in `test_the_calibration_floor_does_not_gate_a_walk_that_costs_nothing`
+        # keeps the 10 requests it actually has, and is bounded by them.
+        request_cap = max(request_cap, 1)
 
     if est > request_cap:
         return plan(
@@ -4161,10 +4213,17 @@ def _request_cap_args(flag: str, request_cap: int | None) -> list[str]:
     and ``est == 0`` is the CACHED-census case (#290). So a night whose budget is
     exactly spent, launching a walk whose census its grid sibling already paid
     for, produces ``remaining == 0`` on a channel that is about to spend nothing
-    at all. Omitting the flag is right there for the same reason the floor is
-    not applied: nothing is going to be crawled, so there is nothing to cap --
-    and refusing the launch instead would skip the one collection of the night
-    that is free, which is what #274's review already fixed once.
+    at all. Refusing the launch would skip the one collection of the night that
+    is free, which is what #274's review already fixed once.
+
+    THIS IS THE BACKSTOP, NOT THE FIX. ``_sweep_launch_plan`` now raises a
+    non-positive cap to the channel's launch floor on exactly that path, so a
+    child that turns out to crawl after all -- the cache entry can be refused by
+    ``reconcile_cache_hit`` or by validation, and only the child finds out -- is
+    bounded rather than uncapped. This clause stays because "no flag" and
+    "unbounded crawl" must not be the same argv on any path that reaches here,
+    including one added later, and because a cap of 0 is still the honest answer
+    for a launch that genuinely cannot spend.
     """
     return [] if request_cap is None or request_cap < 1 else [flag, str(request_cap)]
 

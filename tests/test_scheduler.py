@@ -6576,13 +6576,29 @@ def test_a_mapillary_cap_is_sized_to_its_own_pace_not_the_radius_sweeps(conn):
     there are two of them: the radius sweep is timed at
     DEFAULT_SWEEP_REQUESTS_PER_MINUTE x 0.5, a tile census at
     DEFAULT_TILE_REQUESTS_PER_MINUTE x 0.8. Inverting one channel's clock with
-    the other's constants under-prices Mapillary's cap roughly fourfold at the
-    shipped rates -- and a cap under the launch floor does not slow a channel
-    down, it skips the city outright, every night, silently.
+    the other's constants under-prices Mapillary's cap -- and a cap under the
+    launch floor does not slow a channel down, it skips the city outright,
+    every night, silently.
+
+    BOTH BRANCHES ARE DRIVEN, and that is the point of the second half. A
+    configured rate replaces the default on both sides, so a `ProviderConfig`
+    shadows `_CRAWL_PRICING`'s `default_rate` entirely: with only the configured
+    case here, the per-provider rate table was unpinned and the FULL SUITE
+    passed with Mapillary's row set to KartaView's constant -- the exact defect
+    this test is named for, surviving the test written to catch it. `pc=None` is
+    not a hypothetical branch either: `_sweep_launch_plan` reaches this through
+    `.get(channel)` precisely so a channel with no `[providers.*]` block still
+    prices.
 
     Pinned as the round trip rather than as an arithmetic literal: whatever the
     constants become, the two directions have to agree.
     """
+    from streetscape_metadata_tracker.download_kartaview import (
+        DEFAULT_SWEEP_REQUESTS_PER_MINUTE,
+    )
+    from streetscape_metadata_tracker.download_mapillary import (
+        DEFAULT_TILE_REQUESTS_PER_MINUTE,
+    )
     from streetscape_metadata_tracker.scheduler import (
         _TIMEOUT_FIXED_SLACK_S,
         _sweep_requests_within_timeout,
@@ -6597,6 +6613,26 @@ def test_a_mapillary_cap_is_sized_to_its_own_pace_not_the_radius_sweeps(conn):
     assert sweeps == 60 * 40 * 0.5, "the radius sweep's, at the same configured rate"
     # The walk is priced as its grid sibling, because it IS that crawl.
     assert _sweep_requests_within_timeout(timeout_s, "mapillary_streets", pc) == tiles
+
+    # Unconfigured: now the DEFAULT RATE is live too, so each channel must reach
+    # for its own. Imported under their module-qualified names rather than
+    # compared to literals, because `download_panoramax` exports a
+    # DEFAULT_TILE_REQUESTS_PER_MINUTE of its own with a different value.
+    assert DEFAULT_TILE_REQUESTS_PER_MINUTE != DEFAULT_SWEEP_REQUESTS_PER_MINUTE, (
+        "the two defaults must differ or this half of the test pins nothing"
+    )
+    assert (
+        _sweep_requests_within_timeout(timeout_s, "mapillary", None)
+        == 60 * DEFAULT_TILE_REQUESTS_PER_MINUTE * 0.8
+    )
+    assert (
+        _sweep_requests_within_timeout(timeout_s, "kartaview", None)
+        == 60 * DEFAULT_SWEEP_REQUESTS_PER_MINUTE * 0.5
+    )
+    assert (
+        _sweep_requests_within_timeout(timeout_s, "mapillary_streets", None)
+        == 60 * DEFAULT_TILE_REQUESTS_PER_MINUTE * 0.8
+    )
 
 
 def test_a_resumable_channel_with_no_pricing_row_is_a_keyerror(conn):
@@ -7864,6 +7900,47 @@ def test_the_calibration_floor_does_not_gate_a_walk_that_costs_nothing(
     if should_launch:
         assert walks[0][2]["request_cap"] == 10
         assert walks[0][2]["estimated_requests"] == 0
+
+
+def test_a_free_walk_on_a_spent_budget_is_capped_at_one_not_uncapped(conn, monkeypatch):
+    """ "Costs nothing" is a PREDICTION, and only the child learns otherwise.
+
+    `est == 0` means the census is in the shared cache, so the launch floor is
+    not applied — there is nothing to fund. With the night's budget exactly
+    spent that leaves `request_cap` at 0, and `_request_cap_args` omits the flag
+    for any cap below 1, which is right for "spend nothing" and catastrophic for
+    the case the scheduler cannot see: `reconcile_cache_hit` refuses an entry
+    older than the consumer's own checkpoint and `load_cached_census` refuses
+    one that fails validation, and on either the child crawls for real. Uncapped,
+    on an exhausted budget, against a per-IP host, with no `--daily-budget` on
+    the command to catch it.
+
+    So the cap floors at 1 rather than vanishing. Not at the launch floor: this
+    branch is reached exactly when the budget cannot fund one, and handing a
+    channel more than the night has left is the failure the budget prevents.
+    """
+    from streetscape_metadata_tracker.scheduler import _request_cap_args
+
+    cid = _register(conn, "Bend", width=1000, height=1000, step=20)
+    city = db.resolve_city(conn, cid)
+    _enroll_pair(conn, cid, channels=("kartaview_streets",))
+    _stamp_census_cache(city, "kartaview", fetched_by="kartaview")
+    cfg = _kartaview_pair_cfg()
+    # Nothing left at all, which is what makes the cap non-positive.
+    cfg.providers["kartaview_streets"] = ProviderConfig(enabled=True, daily_request_budget=0)
+
+    calls = []
+    _run_loop_capturing_kwargs(monkeypatch, conn, cfg, calls)
+
+    walks = [c for c in calls if c[1] == "kartaview_streets"]
+    assert walks, "the free walk must still launch — that is the whole point of #290"
+    assert walks[0][2]["estimated_requests"] == 0
+    assert walks[0][2]["request_cap"] == 1, "floored at 1, not dropped and not raised to the floor"
+    # And the flag genuinely reaches the child, which a cap of 0 would not.
+    assert _request_cap_args("--kartaview-max-requests", walks[0][2]["request_cap"]) == [
+        "--kartaview-max-requests",
+        "1",
+    ]
 
 
 # ── The dry run and the live path, one decision (issue #274 review) ──────────
