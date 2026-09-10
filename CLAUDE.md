@@ -76,6 +76,7 @@ python scripts/register_frame.py --manifest mapillary_360_cities.csv --overlap-k
 | `screen-provider panoramax` | The weekly whole-catalog growth screen (#316): 113 requests answer all 1,144 cities. Writes UPPER BOUNDS, never counts; `--dry-run` prices it, `--measure --limit N` measures the richest exactly and writes nothing |
 | `regenerate-aggregate [--publish]` | Rebuild `cities.json.gz` from the catalog (no collection), optionally rsync |
 | `reconcile-walks [--dry-run]` | Catalog road walks that finished but were never registered |
+| `import-bundle DIR [--execute] [--enable]` | Land a laptop investigation's artifacts here (#330): a laptop `data/` dir, read-only, DRY-RUN by default; refuses the bundle WHOLE on a geometry, filename, collision, schema or in-flight-batch problem |
 | `fetch-driving-plan [--force]` | Snapshot Google's published driving plan out of band; `--from-file`/`--date` backfills a hand-saved snapshot |
 | `backup-status [--alert]` | Catalog-backup health; nonzero when the newest backup is missing, >48 h old, or the last attempt failed; `--alert` emails when unhealthy (#193 daily timer) |
 | `restore-backup FILE --to PATH` | Restore a dated backup; refuses an existing destination or orphaned `-wal`/`-shm` |
@@ -236,6 +237,8 @@ Deployment lives in `deploy/` (7 systemd units + its README).
 `assess-city` answers a partner inquiry about an untracked city the same day (register + both road walks + the cheap Mapillary grid run + publish).
 **Answer from street coverage, never grid coverage** — grid points land on water, rail, parkland and rooftops, badly understating a deployment (Highland Heights: 55.6% of grid points vs 92.8% of street-km); a rectangle is not a city, and the pre-flight says so before anything is spent.
 Publishing is declared in config (`[publish].local`), never inherited from the environment, so a hand-run publish and the nightly one take the identical path.
+`import-bundle` lands a laptop investigation here instead of re-collecting it (#330), and three things about it are load-bearing: **it is the only place a filename's geometry is checked against the frozen `cities` row** (every `same_grid_geometry` call compares filename to filename), it copies **only files a catalog row names** — a bundle's `data/` holds one-city aggregates that a directory sync would publish over the real index — and it writes `record_attempt` per imported channel, which is what stops the next night re-paying for the crawl.
+Grid stats are RECOMPUTED from the CSV and walk stats are CARRIED and cross-checked, deliberately; spend reaches `api_usage` only for credentials this host shares (`gsv*`, `kartaview*`), never the per-IP ones.
 
 **Catalog backups → [`docs/catalog-backups.md`](docs/catalog-backups.md).**
 The catalog lives in exactly one place, and lab storage being backed up is something to **verify, not assume**.

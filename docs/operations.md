@@ -51,3 +51,53 @@ So any hand-run publish on makelab2 (`regenerate-aggregate --publish`, and now `
 `[publish].local = true` (set in `scheduler.makelab1.toml`) makes `_publish` pass `--local` explicitly, so the two invocation paths are identical;
 the unit still exports the variable, harmlessly, so a code rollback cannot break nightly publishing.
 `[publish].site_url` is used for nothing but printing operator-facing links.
+
+## Landing a laptop investigation in this catalog: `scheduler import-bundle` (issue #330)
+
+**Added after the 2026-08-22 split.**
+
+An inquiry about an untracked city arrives and the useful window is the next hour, not the next night.
+`assess-city` above answers it, but only from prod — so it competes with the nightly batch for the daily ledgers and, more importantly, for prod's **per-IP** allowance on the three metered hosts, and it can only run outside the batch window.
+Investigating from a laptop avoids all of that and needs no new code: every collector takes `--download-dir`, so a scratch directory becomes a complete, self-describing investigation.
+What `import-bundle` adds is the way back.
+
+```bash
+# 1. Investigate on the laptop — ordinary collector commands, one per provider
+python -m streetscape_street_analyzer.collect "City, Region" --provider kartaview --download-dir /tmp/city/data
+
+# 2. Ship the bundle up. archive/ is gitignored and outside the publish rsync's walk,
+#    so a staged bundle is structurally unpublishable.
+rsync -a /tmp/city/data/ makelab2:~/streetscape-tracker/archive/investigations/city/
+
+# 3. Land it. Dry run is the DEFAULT; it prints exactly the plan --execute carries out.
+scheduler import-bundle archive/investigations/city
+scheduler import-bundle archive/investigations/city --execute --enable
+```
+
+A "bundle" is not a new format — it is exactly the `data/` directory a laptop run already wrote, catalog included, and the importer reads it with a **read-only** connection so it can neither migrate nor mutate the operator's evidence.
+
+**Why the laptop is the right place rather than merely a convenient one.**
+Three of the four providers meter by IP address, not by credential (`docs/provider-access.md`), so moving the work to a laptop isolates it for free and needs no new token.
+GSV is the exception and cuts the other way: Google meters per Cloud **project**, so a laptop walk on `GMAPS_STREETS_API_KEY` draws on exactly the pool prod's own walks draw on — at the collector's default 24,000/min, on top of prod's.
+Pace laptop GSV work explicitly whenever the batch may be running, and note that a run ≥95% `OVER_QUERY_LIMIT` is rejected before cataloging, so the damage would land on prod's in-flight city rather than on the investigation.
+
+**Every refusal happens before anything is written, and rejects the bundle whole.**
+Half an investigation in the catalog is worse than none: `db.add_api_usage` is additive rather than idempotent, so a partial import that the operator retries would double-charge the ledger.
+The collision refusal is what makes a retry safe, and it only makes it safe if the first attempt wrote nothing.
+The refusals are: a bundle on another schema version, a live `-wal` beside its catalog, a geometry that disagrees with this host's frozen grid, a filename this host's generators would not produce, a run or walk that already exists here, an artifact a row names but the bundle lacks, a walk row that disagrees with its own coverage artifact or sample count, and a batch that appears to be in flight.
+
+The geometry check is the load-bearing one, and it did not exist anywhere before this: every `naming.same_grid_geometry` call compares filename to filename, never a filename to the `cities` row.
+A bundle collected on a different rectangle is not a later snapshot of the same series, it is a different series wearing the same `city_id`, and nothing downstream would say so.
+
+**Two asymmetries are deliberate.**
+A grid run's stats are **recomputed** from the copied CSV — one pandas pass through `analysis.calculate_run_stats`, the same call the collector makes — so a stat definition that moved between the two checkouts cannot enter the series as an unattributable step change.
+A road walk's are **carried** from its row and cross-checked against the coverage GeoJSON's own totals and the CSV's row count, because recomputing one means re-running the OSM edge join for a result that can only equal what the artifact beside it already records.
+Second, spend is ledgered only for credentials this host shares — `gsv`, `gsv_streets`, `kartaview`, `kartaview_streets` — under the bundle's own date.
+Charging the per-IP channels here would tighten a budget gate against requests this host never made, on the very channel whose budget is the instrument in an open block investigation.
+
+**The cadence write is the point of the whole exercise.**
+Each imported channel gets `db.record_attempt(success=True)`, the same call `reconcile-walks` makes after a salvage, so the next night does not re-collect what the laptop already paid for.
+A channel with no scheduler arms yet (anything in `UNWIRED_CHANNELS`) is skipped rather than recorded, since a success there would suppress its FIRST real collection once the channel is wired.
+As after `assess-city`, the imported channels are then the *least* stale rows for that city and are **not** due tonight — the closing report says so, because the natural assumption is the opposite.
+
+Three pieces of #330 are deliberately still open: a laptop-side `investigate` driver that runs the collectors and does the rsync itself, a `register-city` subcommand so the laptop asks prod for the frozen grid *before* collecting rather than being checked against it afterward, and a pidfile written by `run-due` to replace the batch check's `ps` heuristic.

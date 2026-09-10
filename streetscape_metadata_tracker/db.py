@@ -1047,6 +1047,29 @@ def register_city(
     return city_id
 
 
+def set_city_enabled(conn: sqlite3.Connection, city_id: str, enabled: bool) -> None:
+    """
+    Turn a registered city's scheduler rotation on or off.
+
+    Separate from ``register_city``'s ``enabled`` argument, which only ever
+    applies at registration (the INSERT is ``OR IGNORE``, so a second call with
+    a different ``enabled`` is silently a no-op). A city registered out of
+    rotation — a sampling-frame city awaiting boundary vetting (issue #110), or
+    one arriving through a laptop investigation (issue #330) — otherwise has no
+    way back in short of hand-editing the catalog.
+
+    Note this is ``cities.enabled``, the city-wide gate, NOT
+    ``schedule_state.member``, the per-channel one. ``get_due_cities`` reads
+    both, and only the second is what ``enroll-city`` writes.
+
+    Raises KeyError if the city is unknown, so a typo cannot be a silent no-op.
+    """
+    cur = conn.execute("UPDATE cities SET enabled = ? WHERE city_id = ?", (int(enabled), city_id))
+    if cur.rowcount == 0:
+        raise KeyError(city_id)
+    conn.commit()
+
+
 def update_city_geometry(
     conn: sqlite3.Connection,
     *,

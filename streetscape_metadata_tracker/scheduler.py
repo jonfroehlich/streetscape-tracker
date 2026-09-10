@@ -14,6 +14,7 @@ Usage (--config accepted on either side of the subcommand):
     python -m streetscape_metadata_tracker.scheduler [--config PATH] run-due [--dry-run] [--limit N] [--provider CHANNEL]
     python -m streetscape_metadata_tracker.scheduler [--config PATH] regenerate-aggregate [--publish]
     python -m streetscape_metadata_tracker.scheduler [--config PATH] reconcile-walks [--date D] [--dry-run]
+    python -m streetscape_metadata_tracker.scheduler [--config PATH] import-bundle DIR [--execute] [--enable]
     python -m streetscape_metadata_tracker.scheduler [--config PATH] fetch-driving-plan [--force] [--from-file P --date D]
     python -m streetscape_metadata_tracker.scheduler [--config PATH] backup-status
     python -m streetscape_metadata_tracker.scheduler [--config PATH] restore-backup PATH [--to DEST]
@@ -47,7 +48,7 @@ from typing import Any, NamedTuple
 
 from tabulate import tabulate
 
-from . import catalog_backup, cgroup_memory, db, driving_plan, panoramax_screen
+from . import bundle_import, catalog_backup, cgroup_memory, db, driving_plan, panoramax_screen
 from .alerting import AlertConfig, send_alert, should_alert
 from .checkpointing import (
     CENSUS_PROVIDERS,
@@ -92,6 +93,7 @@ from .download_mapillary import (
     estimate_tile_count,
 )
 from .download_panoramax import estimate_tile_count as estimate_panoramax_tile_count
+from .fileutils import count_streetwalk_samples
 from .json_summarizer import (
     generate_aggregate_v2,
     generate_driving_plan_summary,
@@ -3695,6 +3697,197 @@ def cmd_reconcile_walks(
 
 
 # ---------------------------------------------------------------------------
+# import-bundle: land a laptop investigation in this catalog (issue #330)
+# ---------------------------------------------------------------------------
+
+
+def _run_due_in_flight() -> str | None:
+    """
+    The command line of a ``run-due`` already running here, or None.
+
+    An import must not land mid-batch for the same reason a deploy must not: the
+    scheduler and every per-city child read the catalog and the data directory
+    this writes into, and a city registered halfway through a night can be
+    picked up by a later channel query in the same run.
+
+    This is a heuristic and the caller says so. It reads `ps` rather than a lock
+    the batch holds, because there is no such lock yet — a pidfile written by
+    ``run-due`` itself is the robust version and is deliberately left to a
+    follow-up. Two failure modes are handled: `ps` being unavailable returns None
+    (advisory checks must never fail the work they speak for), and this process
+    and its parent are excluded, since a `pgrep`-shaped check run over SSH has
+    matched its own command line here before.
+    """
+    try:
+        out = subprocess.run(
+            ["ps", "-eo", "pid=,args="], capture_output=True, text=True, timeout=20
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    mine = {os.getpid(), os.getppid()}
+    for line in out.splitlines():
+        pid_str, _, args = line.strip().partition(" ")
+        try:
+            pid = int(pid_str)
+        except ValueError:
+            continue
+        if pid in mine:
+            continue
+        if "streetscape_metadata_tracker.scheduler" in args and "run-due" in args:
+            return f"pid {pid}: {args.strip()}"
+    return None
+
+
+def _import_cadence_channel(provider: str, *, walk: bool) -> str | None:
+    """
+    The scheduler channel an imported artifact belongs to, or None if there isn't one.
+
+    Writing this is what stops the next night re-collecting what the laptop
+    already paid for — the same ``record_attempt`` call ``reconcile-walks``
+    makes after a salvage, and for the same reason.
+
+    None has two causes, both meaning "do not write a cadence row". A provider
+    with no street channel yet (Panoramax walks, issue #331) has nothing to
+    record against. A channel in ``UNWIRED_CHANNELS`` has a name but no
+    scheduler arms, so a success there would suppress its FIRST real collection
+    once the channel is wired — the opposite of what the row is for.
+    """
+    if walk:
+        channel = next((c for c, p in STREET_CHANNELS.items() if p == provider), None)
+    else:
+        channel = provider if provider in CHANNEL_DEFAULT_MEMBERSHIP else None
+    if channel is None or channel in UNWIRED_CHANNELS:
+        return None
+    return channel
+
+
+def cmd_import_bundle(
+    cfg: SchedulerConfig,
+    bundle_path: str,
+    *,
+    execute: bool = False,
+    enable: bool = False,
+    force: bool = False,
+) -> int:
+    """
+    Land a laptop investigation's artifacts in this host's catalog (issue #330).
+
+    Dry run by default: it prints exactly the plan ``--execute`` would carry
+    out. That default is not politeness — this writes into the production
+    catalog and the published data directory, and `bundle_import` refuses a
+    bundle whole rather than partially, so the printed plan is the whole
+    decision.
+
+    Returns 0 on a clean import (or a clean dry run), ``USAGE_EXIT_CODE`` for
+    any refusal, and 1 when the import landed but its published tail did not.
+    """
+    if not force:
+        busy = _run_due_in_flight()
+        if busy is not None:
+            print(f"REFUSED: a nightly batch appears to be running ({busy}).")
+            print(
+                "  Importing mid-batch writes into the catalog and data directory the "
+                "batch is reading. Wait for it to finish, or pass --force if you are "
+                "certain that line is not a collection run."
+            )
+            return USAGE_EXIT_CODE
+
+    try:
+        bundle = bundle_import.read_bundle(bundle_path)
+    except bundle_import.BundleError as e:
+        print(f"REFUSED: {e}")
+        return USAGE_EXIT_CODE
+
+    conn = db.connect(cfg.db_path)
+    existing, problems = bundle_import.check_bundle(bundle, conn, cfg.data_dir)
+    if problems:
+        print(f"REFUSED: {bundle.city_id} ({len(problems)} problem(s)); nothing was written.")
+        for p in problems:
+            print(f"  - {p}")
+        return USAGE_EXIT_CODE
+
+    mode = "IMPORT" if execute else "DRY RUN"
+    print(f"{mode}: {bundle.city_id} from {bundle.root}")
+    print(
+        f"  city: {'already registered' if existing else 'NEW — would be registered'}"
+        f"{'' if existing else ' ' + ('enabled' if enable else 'DISABLED (pass --enable to collect it)')}"
+    )
+    print(
+        f"  grid: {bundle.city['grid_width_m']}x{bundle.city['grid_height_m']} m, "
+        f"step {bundle.city['step_m']} m, centered "
+        f"{bundle.city['center_lat']:.4f},{bundle.city['center_lon']:.4f}"
+    )
+    for run in bundle.runs:
+        print(
+            f"  run   [{run.provider}] {run.row['run_date']}: "
+            f"{run.row['csv_filename']} (stats recomputed on import)"
+        )
+    for walk in bundle.walks:
+        print(
+            f"  walk  [{walk.provider}/{walk.row['network_type']}] {walk.row['run_date']}: "
+            f"{walk.row['coverage_pct_by_length']}% of "
+            f"{walk.row['length_km']} street-km"
+        )
+    for net in bundle.networks:
+        print(f"  network [{net['network_type']}]: {net['graphml_filename']}")
+    for row in bundle.api_usage:
+        charged = row["provider"] in bundle_import.LEDGERED_PROVIDERS
+        why = "charged here (shared credential)" if charged else "not charged (metered per IP)"
+        print(f"  spend [{row['provider']}] {row['usage_date']}: {row['requests']:,} — {why}")
+
+    if not execute:
+        print("Nothing written. Re-run with --execute to apply.")
+        return 0
+
+    result = bundle_import.apply_bundle(
+        bundle, conn, data_dir=cfg.data_dir, existing=existing, enable=enable
+    )
+    for correction in result.stat_corrections:
+        logger.warning(f"recomputed stat differs from the bundle's: {correction}")
+
+    # The piece that stops the next night re-collecting what was just imported.
+    recorded, skipped = [], []
+    for provider in result.run_providers:
+        channel = _import_cadence_channel(provider, walk=False)
+        (recorded if channel else skipped).append(channel or provider)
+        if channel:
+            db.record_attempt(conn, result.city_id, success=True, provider=channel)
+    for provider in result.walk_providers:
+        channel = _import_cadence_channel(provider, walk=True)
+        (recorded if channel else skipped).append(channel or f"{provider} walk")
+        if channel:
+            db.record_attempt(conn, result.city_id, success=True, provider=channel)
+    db.assign_schedule(conn, cycle_days=cfg.cycle_days, providers=tuple(cfg.enabled_providers()))
+
+    summary, complete = _regenerate_published_json(conn, cfg)
+    print(summary)
+    published = False
+    if cfg.publish_enabled:
+        if _publish(cfg, f"import-bundle {result.city_id} (manual)") == 0:
+            published = True
+        else:
+            logger.error(f"{result.city_id}: imported and cataloged, but the publish failed")
+    else:
+        print("NOTE: publishing is off in config, so nothing was rsynced to the site.")
+
+    print(
+        f"Imported {result.city_id}: {len(result.run_providers)} run(s), "
+        f"{len(result.walk_providers)} walk(s), {len(result.files)} file(s)"
+        f"{'; published' if published else ''}"
+    )
+    if recorded:
+        # Same caution assess-city prints, for the same reason: the natural
+        # thing to assume here is the opposite of true.
+        print(
+            f"  Cadence recorded for {', '.join(sorted(recorded))} — those channels are now "
+            "the LEAST stale rows for this city and are not due tonight."
+        )
+    if skipped:
+        print(f"  No cadence row for {', '.join(sorted(skipped))} (no scheduler channel yet).")
+    return 0 if complete and (published or not cfg.publish_enabled) else 1
+
+
+# ---------------------------------------------------------------------------
 # assess-city: same-day answer for a new city (issue #215)
 # ---------------------------------------------------------------------------
 
@@ -4668,27 +4861,6 @@ def _reconcile_orphaned_run(
     return True
 
 
-def _count_streetwalk_samples(csv_path: Path) -> int | None:
-    """
-    Number of sampled locations in a road-walk snapshot: its data rows.
-
-    The walk writes exactly one row per on-street sample point, so the row count
-    recovers ``sample_points`` — which the artifact itself does not carry and
-    which ``estimate_street_samples`` prefers over every other precedence step
-    when budgeting a later walk of the same city. Counted line-by-line rather
-    than via pandas: the caller may be reconciling a multi-hundred-MB snapshot
-    inside the scheduler's memory-capped cgroup, and only the count is wanted.
-
-    Returns None if the snapshot is missing or unreadable.
-    """
-    try:
-        with gzip.open(csv_path, "rt", encoding="utf-8") as fh:
-            return max(sum(1 for _ in fh) - 1, 0)  # minus the header
-    except (OSError, EOFError, UnicodeDecodeError) as e:
-        logger.warning(f"Could not count samples in {csv_path.name}: {e}")
-        return None
-
-
 def _reconcile_orphaned_walk(
     conn,
     cfg: SchedulerConfig,
@@ -4755,7 +4927,7 @@ def _reconcile_orphaned_walk(
         )
         return False
 
-    sample_points = _count_streetwalk_samples(Path(cfg.data_dir) / csv_name)
+    sample_points = count_streetwalk_samples(Path(cfg.data_dir) / csv_name)
     # .get()-guarded like the other stats: an artifact written before issue
     # #101 carries no such key, and its absence must never fail the salvage.
     breakdown = meta.get("coverage_by_highway")
@@ -7108,6 +7280,35 @@ def build_parser() -> argparse.ArgumentParser:
     p_rec.add_argument(
         "--dry-run", action="store_true", help="List what would be reconciled; no catalog writes"
     )
+    p_imp = sub.add_parser(
+        "import-bundle",
+        help="Land a laptop investigation's artifacts in this catalog (issue #330)",
+    )
+    _add_global_flags(p_imp)
+    p_imp.add_argument(
+        "bundle",
+        help="The laptop data/ directory to import (or a parent containing one)",
+    )
+    # Dry run is the DEFAULT here, unlike reconcile-walks' opt-in --dry-run:
+    # this writes into the production catalog and the published data directory,
+    # and a bundle is refused whole rather than partially, so the printed plan
+    # is the entire decision. Same convention as `enroll-city --all`.
+    p_imp.add_argument(
+        "--execute", action="store_true", help="Actually write. Without it, only report."
+    )
+    p_imp.add_argument(
+        "--enable",
+        action="store_true",
+        help="Put the city into the scheduler rotation. A city arriving through an "
+        "investigation is registered DISABLED without this, because its boundary "
+        "has not been vetted and a fresh city sorts to the head of the next night.",
+    )
+    p_imp.add_argument(
+        "--force",
+        action="store_true",
+        help="Import even though a run-due appears to be in flight (the check is a "
+        "heuristic over `ps`)",
+    )
     p_plan = sub.add_parser(
         "fetch-driving-plan",
         help="Snapshot Google's published Street View driving-plan feed",
@@ -7310,6 +7511,10 @@ def main() -> int:
     if args.command == "reconcile-walks":
         target = date.fromisoformat(args.date) if args.date else None
         return cmd_reconcile_walks(cfg, target_date=target, dry_run=args.dry_run)
+    if args.command == "import-bundle":
+        return cmd_import_bundle(
+            cfg, args.bundle, execute=args.execute, enable=args.enable, force=args.force
+        )
     if args.command == "fetch-driving-plan":
         target = date.fromisoformat(args.date) if args.date else None
         return cmd_fetch_driving_plan(
