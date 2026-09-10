@@ -582,3 +582,19 @@ Two more chassis-level pins came with the same work.
 `foldSearchTerms` is asserted to agree with `matchesSearch` on the same queries, because folding the query once per pass instead of once per row is only an optimization if the two spellings cannot diverge.
 And the per-row search haystack cache is asserted to be keyed by the **field list**, not just the row object — a cache ignoring the field list would serve one caller's haystack to a caller asking about different columns, which is a wrong answer rather than a slow one.
 
+
+## Importing a laptop investigation (issue #330)
+
+**Added after the 2026-08-22 split.**
+
+`tests/test_import_bundle.py`. `scheduler import-bundle` writes into the production catalog and the published data directory from a file its operator copied in, so everything standing between those two facts is pinned, and the refusals are pinned **individually** — a bundle refused for the wrong reason is a bundle whose real problem went unlooked-at.
+
+- Each refusal on its own: another schema version, a live `-wal`, a geometry disagreeing with the frozen grid, a filename the generators would not produce, an existing run for the same `(city, provider, date)`, an artifact a row names but the bundle lacks, a walk row disagreeing with its coverage artifact, a truncated walk CSV, a directory with no catalog, and a batch that looks like it is in flight.
+- **A colliding `csv_filename` under a DIFFERENT composite key**, which the `(city_id, provider, run_date)` check does not catch: that column carries its own `UNIQUE`, so an unguarded import raises `IntegrityError` part-way through rather than refusing cleanly, which is precisely the partial write the whole-bundle rule exists to prevent.
+- Dry run writes nothing — asserted on **rows and on the data directory**, not on the catalog file, which `db.connect` legitimately creates in order to ask it anything.
+- **The bundle's one-city `cities.json.gz` is never copied over this host's.** A bundle's `data/` holds laptop-generated aggregates built over a single-city catalog, so a directory sync would replace the published index with them — a site-wide outage produced by a *successful* import. The copy step is file-by-file over the names catalog rows carry, and the test asserts the aggregate is absent from both `_artifact_sources` and the destination.
+- Grid stats are recomputed rather than carried, pinned by **mutating** the bundle's stored value. A test that only checked the imported number equalled the recomputed one would stay green if the importer carried the bundle's row — the two agree whenever both checkouts are in step, which is exactly when the bug is invisible.
+- Spend reaches `api_usage` only for credentials this host shares, where **the absence is the assertion**: a Mapillary tile spend charged here would tighten a per-IP budget gate against requests this host never made.
+- No cadence row for a channel in `UNWIRED_CHANNELS`, driven by relabelling the bundle's grid run to `panoramax` — a success there would suppress that channel's first real collection once it is wired.
+- Re-running a landed import refuses rather than double-charging, which is what makes `add_api_usage`'s additive write safe to retry.
+- An autouse fixture neutralizes the `ps` scan suite-wide, so neither the suite's own command line nor a real nightly batch on the test machine decides whether these pass.
