@@ -1499,8 +1499,26 @@ async def _fetch_city_images(
     # together would make one of the two exit codes wrong whichever way it went.
     capped = False
 
+    # Requests promised to tiles that are past the cap check but have not yet
+    # counted one. THE CAP GATES ON `api_requests + reserved`, NOT ON
+    # `api_requests` ALONE, and the difference is the whole ordinary overshoot
+    # (issue #318 review). `count_request` fires inside `_fetch_tile`, AFTER
+    # `rate_limiter.acquire()` — so at a paced 40/min every task the semaphore
+    # admits clears a check reading a stale `api_requests`, then queues on the
+    # limiter behind it. Measured on this code with a fetch that actually
+    # awaits: cap 200 at connection_limit 50 spent 249. Reserving at the gate
+    # makes that 200, because the (connection_limit - 1) tasks holding tokens
+    # they have not spent are now visible to the tasks behind them.
+    #
+    # It cannot be reserved per ATTEMPT, only per tile: `_fetch_tile` is
+    # `@backoff`-decorated and may spend up to TILE_MAX_TRIES. Those extra
+    # attempts do land in `api_requests` as they happen, so they close the gate
+    # on tiles not yet admitted; what they cannot do is un-admit a tile already
+    # in flight. That residue is the honest remaining bound, below.
+    reserved = 0
+
     async def fetch_one(x: int, y: int) -> pd.DataFrame:
-        nonlocal fatal, capped
+        nonlocal fatal, capped, reserved
         url = f"{TILE_URL_TEMPLATE.format(z=TILE_ZOOM, x=x, y=y)}?access_token={access_token}"
         async with semaphore:
             # The abort check belongs HERE, inside the semaphore, not at the top
@@ -1519,16 +1537,22 @@ async def _fetch_city_images(
                 # tells those two apart.
                 progress_bar.update(1)
                 return records_to_census([])
-            if max_requests is not None and api_requests >= max_requests:
+            if max_requests is not None and api_requests + reserved >= max_requests:
                 # THE CAP IS CHECKED HERE FOR THE REASON THE ABORT ABOVE IS, and
-                # it inherits the same bound: tasks already past this line
-                # finish, and each may spend up to TILE_MAX_TRIES requests, so
-                # the overshoot is at most connection_limit * TILE_MAX_TRIES
-                # (25 at the grid defaults) rather than the whole city. That is
-                # deliberate and documented on the CLI flag: stopping requests
-                # already in flight would mean cancelling a paced, retrying
-                # fetch mid-attempt, which buys ~25 requests and costs the
-                # guarantee that every request we made was counted.
+                # it inherits that check's shape but not its bound. A tile
+                # admitted here reserves its request before releasing control,
+                # so the cap is not overshot at all in the ordinary case; what
+                # remains is RETRIES BY TILES ALREADY IN FLIGHT, at most
+                # connection_limit * (TILE_MAX_TRIES - 1). Prod runs
+                # connection_limit 50 (config/scheduler.makelab1.toml), NOT the
+                # argparse default of 5, so state that residue as 200 and never
+                # as "25 at the defaults" -- no scheduled run uses the defaults.
+                #
+                # It is a soft ceiling on purpose: stopping requests already in
+                # flight would mean cancelling a paced, retrying fetch
+                # mid-attempt, which costs the guarantee that every request we
+                # made was counted. What is NOT deliberate is a soft ceiling
+                # that misses by a connection_limit on every capped night.
                 #
                 # Returning an empty census WITHOUT committing is what makes
                 # this resumable: an uncommitted tile is not in `done`, so the
@@ -1539,6 +1563,10 @@ async def _fetch_city_images(
                 capped = True
                 progress_bar.update(1)
                 return records_to_census([])
+            # Reserved BEFORE the await, released after it: there is no
+            # suspension point between the check above and this line, so the
+            # loop cannot interleave another task into the gap.
+            reserved += 1
             try:
                 # Pacing/counting happen inside _fetch_tile, per retried attempt.
                 tile_bytes = await _fetch_tile(session, url, timeout, rate_limiter, count_request)
@@ -1552,6 +1580,14 @@ async def _fetch_city_images(
                 # waiting task can slip past the check above.
                 fatal = fatal or e
                 raise
+            finally:
+                # Every exit from the fetch, exception included: a reservation
+                # that leaked would shrink the cap for the rest of the crawl and
+                # eventually close the gate on tiles the budget still covers.
+                # The requests it stood for are in `api_requests` by now,
+                # whether the attempt succeeded, failed or exhausted its
+                # retries, so releasing it double-counts nothing.
+                reserved -= 1
         progress_bar.update(1)
         # Convert to columns HERE, not after the gather: asyncio.gather holds
         # every tile's result until the last one lands, so returning dicts kept

@@ -685,3 +685,133 @@ def test_a_cap_without_a_checkpoint_is_refused_before_any_request(
     with pytest.raises(ValueError, match="max_requests needs a checkpoint_path"):
         _collect(tmp_path, lat, lon, connection_limit=1, max_requests=1)
     assert record == [], "refused before a single tile was asked for"
+
+
+# The two refusal arms and the overshoot, duplicated from the Mapillary census
+# rather than assumed to hold here (#318 review). The code is currently
+# identical, which is the argument for the duplication and not against it: this
+# file exists because the two censuses HAVE diverged before, and a shared
+# invariant tested on only one of them is exactly how the next divergence ships.
+
+
+def test_a_cap_reached_with_a_degraded_checkpoint_fails_rather_than_pausing(
+    monkeypatch, tmp_path, straddling_city
+):
+    """83 tells an operator to re-run; with nothing to resume from, that loops.
+
+    A checkpoint whose commits latched off mid-crawl holds nothing the next
+    invocation can continue from, so the pause line would send an operator to a
+    command that spends the same requests and stops in the same place, forever
+    — and exit 83 is amnestied, so no failure is counted and no alert fires.
+    A plain DownloadError takes none of that amnesty.
+
+    Set up by patching `_open_tile_checkpoint` rather than by omitting the path,
+    because omitting it is what the up-front `ValueError` refuses: testing the
+    runtime arm through the path the caller guard already blocks would exercise
+    neither.
+    """
+    lat, lon = straddling_city
+    real_open = dp._open_tile_checkpoint
+
+    def degraded_open(*args, **kwargs):
+        cp = real_open(*args, **kwargs)
+        if cp is not None:
+            cp.degraded = True
+        return cp
+
+    monkeypatch.setattr(dp, "_open_tile_checkpoint", degraded_open)
+    _stub(monkeypatch, _payloads(lat, lon))
+
+    with pytest.raises(DownloadError) as excinfo:
+        _collect(
+            tmp_path,
+            lat,
+            lon,
+            connection_limit=1,
+            max_requests=1,
+            checkpoint_path=str(tmp_path / "cp"),
+            checkpoint_channel="panoramax",
+        )
+    assert not isinstance(excinfo.value, SweepIncompleteError)
+    assert "nothing can be resumed" in str(excinfo.value).lower()
+    # The spend still reaches the ledger: the request was made either way.
+    assert excinfo.value.api_requests == 1
+
+
+def test_a_cap_that_commits_no_tile_is_a_failure_not_a_pause(
+    monkeypatch, tmp_path, straddling_city
+):
+    """The subtle third way to have nothing to resume: a LIVE, healthy, EMPTY store.
+
+    `_commit_spend` returns early on an empty `done`, deliberately, so a crawl
+    that commits no tile writes no `state.json` at all. A cap whose one in-flight
+    tile fails transiently reaches exactly that state — and it is not
+    hypothetical for Panoramax, whose launch floor is one tile's retries.
+    """
+    lat, lon = straddling_city
+    tiles = _tiles(lat, lon)
+    # The only tile the cap allows is also the one that fails, so `done` is empty
+    # while the checkpoint itself is perfectly healthy.
+    _stub(monkeypatch, _payloads(lat, lon), fail=(tiles[0],))
+
+    with pytest.raises(DownloadError) as excinfo:
+        _collect(
+            tmp_path,
+            lat,
+            lon,
+            connection_limit=1,
+            max_requests=1,
+            checkpoint_path=str(tmp_path / "cp"),
+            checkpoint_channel="panoramax",
+        )
+    assert not isinstance(excinfo.value, SweepIncompleteError), (
+        "an empty checkpoint must not be reported as resumable progress"
+    )
+    assert "nothing can be resumed" in str(excinfo.value).lower()
+
+
+def test_the_cap_is_not_overshot_by_the_tasks_already_in_flight(
+    monkeypatch, tmp_path, straddling_city
+):
+    """Measured as an EQUALITY, which needs a stub that actually suspends.
+
+    `_stub` calls `on_request()` and returns without ever awaiting, so the tasks
+    never interleave and any overshoot is invisible to it. A real fetch awaits
+    the rate limiter first, and every task the semaphore admitted used to clear
+    a check reading a stale `api_requests` before queueing behind it —
+    `connection_limit - 1` requests over the cap, on a host with no credential
+    and no documented rate limit at all.
+    """
+    lat, lon = straddling_city
+    # Wide enough that a runaway would be unmistakable.
+    bbox = dp.grid_bbox(lat, lon, 2000, 2000, 20)
+    tiles = dp.tiles_for_bbox(*bbox)
+    assert len(tiles) > 8, "needs enough tiles for a runaway to be visible"
+
+    record = []
+
+    async def suspending(session, url, timeout, rate_limiter=None, on_request=None, on_empty=None):
+        # Where a real limiter yields: between the cap check and the count.
+        await asyncio.sleep(0)
+        if on_request is not None:
+            on_request()
+        record.append(url)
+        return mapbox_vector_tile.encode([])
+
+    monkeypatch.setattr(dp, "_fetch_tile", suspending)
+
+    connection_limit = 10
+    max_requests = 3
+    with pytest.raises(SweepIncompleteError):
+        asyncio.run(
+            dp.fetch_city_images_async(
+                "Test City",
+                bbox,
+                connection_limit=connection_limit,
+                max_requests=max_requests,
+                checkpoint_path=str(tmp_path / "cp"),
+                checkpoint_channel="panoramax",
+            )
+        )
+    assert len(record) == max_requests, "a capped crawl must spend its cap and no more"
+    assert len(record) < len(tiles), "the cap must stop the city, not merely dent it"

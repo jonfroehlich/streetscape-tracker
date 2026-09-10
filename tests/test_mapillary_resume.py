@@ -1722,14 +1722,26 @@ def test_a_cap_reached_with_no_usable_checkpoint_is_a_failure_not_a_pause(
     assert excinfo.value.api_requests == 1
 
 
-def test_the_cap_overshoots_by_at_most_one_batch_of_retries(monkeypatch, tmp_path):
+def test_the_cap_is_not_overshot_by_the_tasks_already_in_flight(monkeypatch, tmp_path):
     """
-    The bound the flag's help text promises, measured rather than asserted.
+    The cap's real spend, MEASURED — which needs a limiter that actually awaits.
 
-    Tasks already past the in-semaphore check finish, and each may spend up to
-    TILE_MAX_TRIES requests, so the cap is a soft ceiling. What must hold is
-    that the overshoot is bounded by CONCURRENCY and not by the size of the
-    city -- the failure a cap checked only between batches would have.
+    This test asserted a bound of ``max_requests + connection_limit *
+    TILE_MAX_TRIES`` and measured an overshoot of zero, because nothing in the
+    stub chain suspends between the in-semaphore check and ``on_request()``:
+    ``_stub_fetch_tile``'s ``paced`` awaits the limiter, but conftest's
+    ``_NoPacing.acquire`` is a coroutine with no suspension point in it, so the
+    tasks never interleave and ``served == max_requests`` fell out trivially.
+    Twenty requests of slack over a value that could not move is not a
+    measurement, and it is why the review found the overshoot and this did not.
+
+    A real limiter DOES suspend, so every task the semaphore admits used to
+    clear a check reading a stale ``api_requests`` and then queue behind it:
+    ``connection_limit - 1`` requests over the cap on every capped night, and
+    ``connection_limit`` is 50 in production, not the argparse default of 5.
+    The collector now reserves at the gate, so what is left is retries by tiles
+    already in flight. Both facts are asserted: the exact spend, and the bound
+    the flag's help text promises.
     """
     lat, lon = SEATTLE
     # A city wide enough that an unbounded overshoot is unmistakable.
@@ -1737,8 +1749,28 @@ def test_the_cap_overshoots_by_at_most_one_batch_of_retries(monkeypatch, tmp_pat
     tiles = dm.tiles_for_bbox(*bbox)
     assert len(tiles) > 8, "needs enough tiles for a runaway to be visible"
 
+    class _YieldingLimiter:
+        """Pacing with a real suspension point, but no real sleeping.
+
+        ``asyncio.sleep(0)`` is what a genuinely paced limiter has and
+        ``_NoPacing`` lacks: it returns control to the loop, so the tasks behind
+        this one run their cap check while this one holds an unspent token.
+        """
+
+        def __init__(self, max_per_minute, *args, **kwargs):
+            pass
+
+        async def acquire(self):
+            await asyncio.sleep(0)
+
+    monkeypatch.setattr(dm, "AsyncRateLimiter", _YieldingLimiter)
+
     served = _serve(monkeypatch, {})
-    connection_limit = 4
+    # Deliberately fewer requests than the concurrency: pre-fix this spent the
+    # whole first batch of `connection_limit` before any of them had counted,
+    # so the two numbers are 10 and 3 rather than a couple apart.
+    connection_limit = 10
+    max_requests = 3
     with pytest.raises(SweepIncompleteError):
         asyncio.run(
             dm.fetch_city_images_async(
@@ -1746,12 +1778,21 @@ def test_the_cap_overshoots_by_at_most_one_batch_of_retries(monkeypatch, tmp_pat
                 bbox,
                 "MLY|test|token",
                 connection_limit=connection_limit,
-                max_requests=2,
+                max_requests=max_requests,
                 checkpoint_path=str(tmp_path / "cp"),
                 checkpoint_channel="mapillary",
             )
         )
-    assert len(served) <= 2 + connection_limit * dm.TILE_MAX_TRIES
+    assert len(served) == max_requests, (
+        "a capped crawl must spend its cap and no more; an overshoot of "
+        "connection_limit - 1 is what reserving at the gate removes"
+    )
+    # The documented worst case, which the stub cannot reach (stubbing
+    # `_fetch_tile` stubs out its @backoff decorator, so no attempt retries).
+    # Kept as the standing statement of the bound: an edit that reintroduces
+    # a per-attempt overshoot is caught by the equality above, and an edit that
+    # makes it unbounded is caught here.
+    assert len(served) <= max_requests + connection_limit * (dm.TILE_MAX_TRIES - 1)
     assert len(served) < len(tiles), "the cap must stop the city, not merely dent it"
 
 

@@ -399,10 +399,12 @@ def parse_args():
              of the city removed'. What it buys is that the spend survives — the
              run exits 83 and the next invocation resumes from the tiles already
              fetched, so a city that does not fit tonight's remaining budget is
-             collected over two nights instead of skipped. A SOFT ceiling:
-             requests already in flight when it trips are allowed to finish, so
-             the overshoot is bounded by connection_limit x TILE_MAX_TRIES (25
-             at the defaults) rather than by the size of the city. Requires a
+             collected over two nights instead of skipped. A SOFT ceiling, but a
+             tight one: a tile reserves its request at the check, so the cap is
+             not overshot at all unless a tile already in flight retries, and
+             that residue is bounded by connection_limit x (TILE_MAX_TRIES - 1)
+             — 200 at production's connection_limit of 50, which is the number
+             to reason with, not the argparse default of 5. Requires a
              checkpoint to write to. Default: fetch every tile.""",
     )
 
@@ -477,10 +479,12 @@ def parse_args():
              of the city removed'. What it buys is that the spend survives — the
              run exits 83 and the next invocation resumes from the tiles already
              fetched, so a city that does not fit tonight's remaining budget is
-             collected over two nights instead of skipped. A SOFT ceiling:
-             requests already in flight when it trips are allowed to finish, so
-             the overshoot is bounded by connection_limit x TILE_MAX_TRIES (25
-             at the defaults) rather than by the size of the city. Requires a
+             collected over two nights instead of skipped. A SOFT ceiling, but a
+             tight one: a tile reserves its request at the check, so the cap is
+             not overshot at all unless a tile already in flight retries, and
+             that residue is bounded by connection_limit x (TILE_MAX_TRIES - 1)
+             — 200 at production's connection_limit of 50, which is the number
+             to reason with, not the argparse default of 5. Requires a
              checkpoint to write to. Default: fetch every tile.""",
     )
 
