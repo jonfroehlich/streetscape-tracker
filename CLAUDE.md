@@ -69,7 +69,7 @@ python scripts/register_frame.py --manifest mapillary_360_cities.csv --overlap-k
 |---|---|
 | `status` | Per-city schedule and budget status |
 | `assign` | (Re)compute stagger assignments (writes `day_of_cycle` only, so it never un-enrolls a member) |
-| `enroll-city CITY --channel C` | Opt one city into an **opt-in** channel's queue (#248); `--remove`/`--clear`/`--list`; `--all [--limit N] --execute` bulk-enrols cheapest-first (#282) |
+| `enroll-city CITY --channel C` | Set one city's membership on a channel (#248); `--remove`/`--clear` work on ANY channel, bare enrol only on an **opt-in** one; `--list [--excluded]`; `--all [--limit N] --execute` bulk-enrols cheapest-first, opt-in channels only (#282) |
 | `run-due [--dry-run]` | The nightly batch: collect stalest-due cities per channel, then the tail (aggregate, manifests, backup, publish) |
 | `run-due --provider mapillary --limit 40` | On-demand single-channel catch-up (#214) — the ONLY supported bulk path; **Mapillary catch-ups are PAUSED** (see provider access below) |
 | `assess-city "Newport, Kentucky" --estimate` | Same-day answer for a partner inquiry about an untracked city (#215); `--estimate` stops after the boundary and cost report, `--yes` runs it |
@@ -83,7 +83,11 @@ python scripts/register_frame.py --manifest mapillary_360_cities.csv --overlap-k
 
 `run-due` notes: `--limit` (≥1) overrides `[schedule].max_cities_per_day`; an unknown/disabled channel or a bad `--limit` exits 64, not 2; a filtered run advances only the named channels' clocks, **un-pairing those cities' snapshots**.
 `assess-city` notes: a bad `--provider` or an unpaired `--width`/`--height` exits 64; answer from **street coverage, never grid coverage** (see operations below).
-`enroll-city` notes: it only accepts a channel whose default membership is OFF — per-city exclusion on the other four is `cities.enabled`; an unknown channel, a default-membership channel, an unresolvable city or a disabled city exits 64 writing no row; enrolling BEFORE the channel is configured is supported on purpose (it prints a note), or the rollout order is impossible.
+`enroll-city` notes: **the two directions are scoped differently, because each guard was scoped to where it is a no-op.**
+Bare enrol needs an opt-in channel and an enabled city (every enabled city is already a gsv member; a disabled city can never be due), so either exits 64 writing no row.
+**`--remove`/`--clear` work on ANY channel and on a still-DISABLED city** — that is what makes a city collectable on one channel and not another, and pre-setting the exclusion before enabling is the only order that doesn't race the 02:00 timer for a whole city's collection.
+`--all` stays refused on a default-membership channel in every direction (its blast radius is the catalog).
+An unknown or unresolvable target still exits 64; enrolling BEFORE the channel is configured is supported on purpose (it prints a note), or the rollout order is impossible.
 **`--all` is DRY-RUN until `--execute`** (its blast radius is the whole catalog, and it is one keystroke from `--all --remove`), selects only cities the setting would CHANGE (so `--limit N` means N *new* members, never N rows re-touched), orders cheapest-first because a city that finishes its sweep in one night never writes a checkpoint and so never meets the 7-day `CHECKPOINT_MAX_AGE_S`, and prints its total as a **floor**; `--limit`/`--execute` without `--all`, `--all` with `--list`, and `--all` with a CITY all exit 64.
 
 ### One-time and repair scripts (`scripts/`)

@@ -2119,6 +2119,31 @@ def count_channel_members(conn: sqlite3.Connection, provider: str, default_membe
     ).fetchone()[0]
 
 
+def count_channel_exclusions(conn: sqlite3.Connection, provider: str) -> int:
+    """How many cities are EXPLICITLY excluded from this channel (``member = 0``).
+
+    Deliberately not ``count_channel_members``' complement, on both axes:
+
+    * It counts explicit zeroes only, never "everyone the membership clause
+      omits". On an opt-in channel those are wildly different numbers — the
+      second is the whole catalog — and only the first records a decision.
+    * It does **not** filter on ``cities.enabled``. An exclusion pre-set before
+      a city is enabled is a supported and load-bearing state (it is the only
+      rollout order that never exposes the city to a night's collection), so
+      scoping this to enabled cities would report ``0`` immediately after a
+      write that plainly succeeded.
+
+    That second choice means this is *not* ``n_enabled - count_channel_members``
+    on a default-membership channel whenever a pending exclusion exists. One
+    definition, used by both the footer and ``enroll-city --list --excluded``,
+    is worth more than an arithmetic identity that only holds sometimes.
+    """
+    return conn.execute(
+        "SELECT COUNT(*) FROM schedule_state WHERE provider = ? AND member = 0",
+        (provider,),
+    ).fetchone()[0]
+
+
 # ── GSV driving-plan feed (issue #176) ─────────────────────────────────────
 
 

@@ -3343,9 +3343,10 @@ def test_enroll_city_enrolls_and_reports_the_cost_before_it_is_spent(
 
 
 def test_enroll_city_refuses_a_default_membership_channel(conn, monkeypatch, tmp_path):
-    """Per-city exclusion on gsv already has a handle: cities.enabled. A second,
-    less visible way to disable a city is how two operators end up disagreeing
-    about why it stopped collecting."""
+    """ENROLLING on a default-membership channel is the no-op direction: every
+    enabled city is already a member, so a bare enrol cannot make one more of
+    one. Only the exclusion direction is a real write there (see the --remove
+    tests below), and it pays for itself with the footer's visibility."""
     from streetscape_metadata_tracker import scheduler as sched
 
     cid = _register(conn, "Bend", width=1000, height=1000, step=20)
@@ -3359,7 +3360,11 @@ def test_enroll_city_refuses_a_default_membership_channel(conn, monkeypatch, tmp
 def test_enroll_city_refuses_an_unresolvable_or_disabled_city(conn, monkeypatch, tmp_path):
     """Both are the silent zero-row success this command exists to prevent: a
     typo'd slug matches nothing, and a disabled city can never be due on ANY
-    channel because get_due_cities still requires cities.enabled = 1."""
+    channel because get_due_cities still requires cities.enabled = 1.
+
+    Scoped to the ENROL direction only. Pre-setting an exclusion on a disabled
+    city is durable and is the safe rollout order, so --remove/--clear are
+    allowed there — pinned separately below."""
     from streetscape_metadata_tracker import scheduler as sched
 
     cid = _register(conn, "Bend", width=1000, height=1000, step=20)
@@ -3371,6 +3376,178 @@ def test_enroll_city_refuses_an_unresolvable_or_disabled_city(conn, monkeypatch,
     conn.commit()
     assert sched.cmd_enroll_city(cfg, cid, channel="kartaview") == sched.USAGE_EXIT_CODE
     assert db.get_channel_membership(conn, cid, "kartaview") is None
+
+
+def test_enroll_city_excludes_from_a_default_membership_channel(
+    conn, monkeypatch, tmp_path, capsys
+):
+    """The exclusion direction IS allowed on gsv, which is what makes a city
+    collectable on one channel and not another.
+
+    `cities.enabled` is all-or-nothing across all four default-membership
+    channels, so without this there is no way to say "collect this city on
+    Mapillary now, add GSV later" — and for a 40 km-clamped city GSV is 4M grid
+    points, more than a third of a night, against Mapillary's ~500 tiles.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    cid = _register(conn, "Bend", width=1000, height=1000, step=20)
+    cfg = _enroll_cfg(tmp_path, conn, monkeypatch)
+
+    assert sched.cmd_enroll_city(cfg, cid, channel="gsv", remove=True) == 0
+    assert db.get_channel_membership(conn, cid, "gsv") == 0
+    assert "explicitly excluded" in capsys.readouterr().out
+
+    # The behaviour the exclusion is FOR: not due on gsv, still due on its
+    # sibling default-membership channel. tests/test_db.py pins the query half;
+    # this pins that the CLI actually reaches it.
+    kw = dict(today=date.today(), cycle_days=90, grace_days=7, max_consecutive_failures=5)
+    assert db.get_due_cities(conn, default_membership=True, provider="gsv", **kw) == []
+    assert [
+        c.city_id
+        for c in db.get_due_cities(conn, default_membership=True, provider="mapillary", **kw)
+    ] == [cid]
+
+    assert sched.cmd_enroll_city(cfg, cid, channel="gsv", clear=True) == 0
+    assert db.get_channel_membership(conn, cid, "gsv") is None
+
+
+def test_enroll_city_pre_sets_an_exclusion_while_the_city_is_still_disabled(
+    conn, monkeypatch, tmp_path, capsys
+):
+    """Enable-then-exclude is a race against the 02:00 timer; exclude-then-enable
+    is not, so the disabled-city refusal is scoped to the enrol direction.
+
+    A city has no schedule_state rows before it is enabled, so it goes straight
+    to the head of the stalest-due ordering the first night — which is exactly
+    the night a 4M-grid-point city must not be collected on gsv.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    cid = _register(conn, "Bend", width=1000, height=1000, step=20)
+    cfg = _enroll_cfg(tmp_path, conn, monkeypatch)
+    conn.execute("UPDATE cities SET enabled = 0 WHERE city_id = ?", (cid,))
+    conn.commit()
+
+    assert sched.cmd_enroll_city(cfg, cid, channel="gsv", remove=True) == 0
+    assert db.get_channel_membership(conn, cid, "gsv") == 0
+    out = capsys.readouterr().out
+    assert "NOTE" in out and "pre-set" in out, "silence here reads as the write having failed"
+    # The count must not be scoped to enabled cities: derived as
+    # `n_enabled - n_member` it reads "(0 explicitly excluded)" on the very line
+    # confirming an exclusion, because the excluded city is not in n_enabled.
+    assert "(1 explicitly excluded)" in out
+    assert db.count_channel_exclusions(conn, "gsv") == 1
+
+    # ... and it binds the moment the city is enabled, with no second command.
+    conn.execute("UPDATE cities SET enabled = 1 WHERE city_id = ?", (cid,))
+    conn.commit()
+    kw = dict(today=date.today(), cycle_days=90, grace_days=7, max_consecutive_failures=5)
+    assert db.get_due_cities(conn, default_membership=True, provider="gsv", **kw) == []
+    assert [
+        c.city_id
+        for c in db.get_due_cities(conn, default_membership=True, provider="mapillary", **kw)
+    ] == [cid]
+
+
+def test_enroll_all_refuses_a_default_membership_channel(conn, monkeypatch, tmp_path):
+    """--all reaches _bulk_candidates AFTER the write guard, and that helper
+    computes effective membership correctly for default_member=True — so
+    relaxing --remove without this would silently open `--all --remove --channel
+    gsv` against the whole catalog, one keystroke from the kartaview form."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    _register(conn, "Bend", width=1000, height=1000, step=20)
+    cfg = _enroll_cfg(tmp_path, conn, monkeypatch)
+
+    for kwargs in ({"remove": True}, {"clear": True}, {}):
+        assert (
+            sched.cmd_enroll_city(cfg, None, channel="gsv", all_cities=True, **kwargs)
+            == sched.USAGE_EXIT_CODE
+        )
+    assert conn.execute("SELECT COUNT(*) FROM schedule_state").fetchone()[0] == 0
+
+
+def test_enroll_city_excluded_lists_the_explicit_zeroes_and_needs_list(
+    conn, monkeypatch, tmp_path, capsys
+):
+    """Without a way to enumerate exclusions they are invisible: `status` has no
+    city filter and prints the whole catalog, and a plain --list on gsv prints
+    every member while saying nothing about who is missing.
+
+    It lists the EXPLICIT zeroes, not everyone the membership clause omits: on
+    an opt-in channel those are different sets, and only the first records a
+    decision somebody made.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    kept = _register(conn, "Bend", width=1000, height=1000, step=20)
+    dropped = _register(conn, "Krabi", width=1000, height=1000, step=20)
+    cfg = _enroll_cfg(tmp_path, conn, monkeypatch)
+    # Give BOTH cities a gsv row, as the nightly `assign` does. Without this the
+    # only city with a row is the excluded one, and a listing that filtered on
+    # "has a row" rather than "member = 0" would look correct.
+    db.assign_schedule(conn, 90, providers=("gsv", "mapillary"))
+
+    # On an OPT-IN channel, so the only guard that can refuse it is --excluded's
+    # own. Asking this on gsv would be refused by the bare-enrol guard instead
+    # and the assertion would pass with the --excluded check deleted.
+    assert (
+        sched.cmd_enroll_city(cfg, kept, channel="kartaview", excluded=True)
+        == sched.USAGE_EXIT_CODE
+    ), "--excluded without --list would list the members instead: the wrong answer, silently"
+
+    sched.cmd_enroll_city(cfg, dropped, channel="gsv", remove=True)
+    capsys.readouterr()
+
+    assert sched.cmd_enroll_city(cfg, None, channel="gsv", list_only=True, excluded=True) == 0
+    out = capsys.readouterr().out
+    assert dropped in out
+    assert kept not in out, (
+        "a city with a NULL member has a schedule_state row but no decision "
+        "behind it; it is not an exclusion"
+    )
+    assert "1 cities explicitly excluded" in out
+
+
+def test_status_says_excluded_rather_than_not_enrolled_for_an_explicit_zero(
+    conn, monkeypatch, tmp_path, capsys
+):
+    """Two ways of not being a member, two different fixes. A NULL on an opt-in
+    channel is "nobody opted this in yet"; an explicit 0 is "somebody took this
+    out on purpose", and reading it as the former sends an operator looking for
+    an enrolment that was never missing."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    cid = _register(conn, "Bend", width=1000, height=1000, step=20)
+    cfg = _enroll_cfg(tmp_path, conn, monkeypatch)
+    sched.cmd_enroll_city(cfg, cid, channel="gsv", remove=True)
+    capsys.readouterr()
+
+    assert sched.cmd_status(cfg) == 0
+    out = capsys.readouterr().out
+    assert "excluded" in out
+    assert "not enrolled" not in out, "nobody failed to enrol this city; it was taken out"
+    # The footer is the visibility that pays for allowing the exclusion at all.
+    assert "explicitly excluded" in out
+
+
+def test_the_membership_footer_stays_silent_without_an_exclusion(
+    conn, monkeypatch, tmp_path, capsys
+):
+    """The property the footer's docstring has always claimed and nothing pinned:
+    status/assign output is unchanged until an opt-in channel is enabled OR a
+    default-membership channel carries an exclusion. Widening it to print for
+    gsv must not make it print for every gsv."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    _register(conn, "Bend", width=1000, height=1000, step=20)
+    cfg = _enroll_cfg(tmp_path, conn, monkeypatch)
+
+    assert sched.cmd_status(cfg) == 0
+    out = capsys.readouterr().out
+    assert "explicitly excluded" not in out
+    assert "collect this channel" not in out
 
 
 def test_enroll_city_remove_and_clear_are_kept_apart(conn, monkeypatch, tmp_path):

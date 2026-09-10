@@ -2337,6 +2337,14 @@ def cmd_status(cfg: SchedulerConfig) -> int:
         `c.enabled` alone would print `yes` for a non-member whose DUE stays
         permanently blank — which reads as "the scheduler is broken" rather
         than "this city is not enrolled in this channel" (issue #248).
+
+        The two ways of not being a member are printed differently, because
+        they are different events with different fixes. A NULL `member` on an
+        opt-in channel is a city nobody has opted in yet — `not enrolled`, and
+        the fix is `enroll-city`. An explicit `0` is a city somebody took out
+        on purpose, on any channel including a default-membership one — that
+        is `excluded`, and reading it as "never enrolled" would send an
+        operator looking for an enrolment that was never missing.
         """
         if not row["enabled"]:
             return "no"
@@ -2344,8 +2352,9 @@ def cmd_status(cfg: SchedulerConfig) -> int:
         if provider is None:
             return "yes"
         member = row["channel_member"]
-        effective = CHANNEL_DEFAULT_MEMBERSHIP[provider] if member is None else bool(member)
-        return "yes" if effective else "not enrolled"
+        if member is not None:
+            return "yes" if member else "excluded"
+        return "yes" if CHANNEL_DEFAULT_MEMBERSHIP[provider] else "not enrolled"
 
     table = [
         [
@@ -2432,20 +2441,45 @@ def cmd_status(cfg: SchedulerConfig) -> int:
 
 
 def _print_membership_footer(conn, providers) -> None:
-    """Print one enrolment line per configured opt-in channel (issue #248).
+    """Print one membership line per channel that has something to say (issue #248).
 
-    Nothing is printed when every configured channel defaults to member, which
-    is every production config today — so `status` and `assign` output is
-    byte-identical until an opt-in channel is enabled.
+    An opt-in channel always prints, because its whole queue is its membership.
+    A default-membership channel prints only when some city has been explicitly
+    excluded from it — which is the price of letting `enroll-city --remove`
+    touch one at all. The guard that used to refuse those channels outright
+    objected to invisibility, not to the operation: "a second, less visible way
+    to disable a city on gsv is how two operators end up disagreeing about why
+    it stopped collecting." An exclusion that never appears in `status` or
+    `assign` is exactly that failure, so it has to surface here.
+
+    Nothing is printed when every configured channel defaults to member AND
+    carries no exclusions — which is every production config today, so `status`
+    and `assign` output stays byte-identical until an opt-in channel is enabled
+    or somebody excludes a city.
+
+    The two numbers on that line answer two different questions and are NOT
+    each other's complement: ``count_channel_members`` is scoped to enabled
+    cities (how many actually collect this channel tonight), while
+    ``count_channel_exclusions`` counts explicit zeroes whether or not the city
+    is enabled yet — so a pre-set exclusion on a still-disabled city shows up
+    here, which is the whole point of being able to pre-set one.
     """
     n_enabled = conn.execute("SELECT COUNT(*) FROM cities WHERE enabled = 1").fetchone()[0]
     for provider in providers:
-        if not is_opt_in_channel(provider):
-            continue
         n_member = db.count_channel_members(conn, provider, CHANNEL_DEFAULT_MEMBERSHIP[provider])
+        if is_opt_in_channel(provider):
+            print(
+                f"{provider}: {n_member:,} of {n_enabled:,} enabled cities opted in "
+                f"(opt-in channel; enrol with `enroll-city CITY --channel {provider}`)."
+            )
+            continue
+        n_excluded = db.count_channel_exclusions(conn, provider)
+        if not n_excluded:
+            continue
         print(
-            f"{provider}: {n_member:,} of {n_enabled:,} enabled cities opted in "
-            f"(opt-in channel; enrol with `enroll-city CITY --channel {provider}`)."
+            f"{provider}: {n_member:,} of {n_enabled:,} enabled cities collect this "
+            f"channel ({n_excluded:,} explicitly excluded; list them with "
+            f"`enroll-city --channel {provider} --list --excluded`)."
         )
 
 
@@ -2640,11 +2674,12 @@ def cmd_enroll_city(
     remove: bool = False,
     clear: bool = False,
     list_only: bool = False,
+    excluded: bool = False,
     all_cities: bool = False,
     limit: int | None = None,
     execute: bool = False,
 ) -> int:
-    """Opt one city into (or out of) an opt-in channel's nightly queue (issue #248).
+    """Opt one city into (or out of) a channel's nightly queue (issue #248).
 
     There is no existing handle for this. ``cities.enabled`` is flipped with
     hand-written SQL (deploy/README.md, scripts/register_frame.py), and that
@@ -2677,11 +2712,34 @@ def cmd_enroll_city(
 
     ``--list`` is read-only and therefore scoped differently from the rest:
     it accepts any known channel, including a default-membership one, because
-    "who is in this channel's queue" is a true and answerable question there
-    ("every enabled city") with no hazard behind refusing it. It refuses to
-    run beside ``--remove``/``--clear``, which argparse's mutually exclusive
-    group does not cover — those flags would otherwise be accepted, ignored,
-    and exit 0, which is the silent no-op this whole command exists to stop.
+    "who is in this channel's queue" is a true and answerable question there.
+    It refuses to run beside ``--remove``/``--clear``, which argparse's
+    mutually exclusive group does not cover — those flags would otherwise be
+    accepted, ignored, and exit 0, which is the silent no-op this whole command
+    exists to stop. ``--list --excluded`` inverts it to the explicit zeroes,
+    which is the only way to enumerate them: ``status`` has no city filter and
+    prints the whole catalog, and a plain ``--list`` on ``gsv`` prints every
+    member while saying nothing about who is missing.
+
+    **Exclusion on a default-membership channel is supported; enrolment there
+    is not.** ``--remove``/``--clear`` accept any channel, because ``member``
+    is per-(city, channel) and ``get_due_cities`` gates on
+    ``COALESCE(s.member, ?) = 1`` with the channel's default bound — an
+    explicit 0 already excludes a city from ``gsv`` exactly as from
+    ``kartaview``. A bare enrolment there is still refused, because a city that
+    is a member by default cannot be made more of one: that direction really is
+    the silent no-op this command exists to prevent. What the original refusal
+    objected to was invisibility rather than the operation, so the price of
+    allowing it is ``_print_membership_footer`` surfacing every exclusion in
+    ``status`` and ``assign``, and ``status`` printing ``excluded`` rather than
+    ``not enrolled``.
+
+    ``--all`` stays refused on a default-membership channel whatever the
+    direction. Its blast radius is the whole catalog and ``--all --remove
+    --channel gsv`` is one keystroke from ``--all --remove --channel
+    kartaview``; its cheapest-first ordering is a KartaView sweep-cost
+    rationale that means nothing for a GSV grid. Excluding cities from a
+    default channel is a per-city decision, and one at a time is the point.
     """
     try:
         # Channel validation first, before the catalog is even opened, so an
@@ -2698,21 +2756,33 @@ def cmd_enroll_city(
             # having changed nothing. A silent no-op is the exact failure this
             # command exists to prevent; it cannot ship one of its own.
             raise _UsageError("--list cannot be combined with --remove or --clear")
-        # The opt-in guard is scoped to the WRITE path. Listing a channel's
-        # members is read-only and answers correctly for any channel — under a
-        # default-membership channel it is "every enabled city", which is a
-        # true and occasionally useful answer, and refusing it would be a
-        # refusal with no hazard behind it.
-        if not list_only and not is_opt_in_channel(channel):
-            # Per-city exclusion for a default-membership channel already has a
-            # handle: cities.enabled. Shipping a second, less visible way to
-            # disable a city on gsv is how two operators end up disagreeing
-            # about why a city stopped collecting.
+        if excluded and not list_only:
+            # Same shape as the --list/--remove conflict above: accepted and
+            # ignored, it would exit 0 having listed the members rather than
+            # the exclusions — the wrong answer, silently.
+            raise _UsageError("--excluded only applies to --list")
+        # On a default-membership channel only the EXCLUSION direction is a
+        # real write. Enrolling a city that is already a member by default
+        # changes nothing, so it stays refused as the silent no-op it is; the
+        # error now names --remove, since "set cities.enabled = 0" is no longer
+        # the only way to take one city out of one channel.
+        if not list_only and not is_opt_in_channel(channel) and not (remove or clear):
             raise _UsageError(
                 f"--channel {channel}: every enabled city is already a member of this "
-                f"channel. Membership is only settable on an opt-in channel "
-                f"({', '.join(sorted(c for c in CHANNEL_DEFAULT_MEMBERSHIP if is_opt_in_channel(c)))}); "
-                f"to take one city out of {channel}, set cities.enabled = 0."
+                f"channel, so enrolling one changes nothing. To take a single city out "
+                f"of {channel}, use --remove (and --clear to put it back); to stop a "
+                f"city collecting on every channel at once, set cities.enabled = 0."
+            )
+        if all_cities and not is_opt_in_channel(channel):
+            # --all reaches _bulk_candidates AFTER this guard, and that helper
+            # computes effective membership correctly for a default-membership
+            # channel — so without this it would work, over the whole catalog,
+            # in one keystroke. See the docstring.
+            raise _UsageError(
+                f"--channel {channel}: --all is only available on an opt-in channel "
+                f"({', '.join(sorted(c for c in CHANNEL_DEFAULT_MEMBERSHIP if is_opt_in_channel(c)))}). "
+                f"Excluding cities from a default-membership channel is a per-city "
+                f"decision; name one city at a time."
             )
         if remove and clear:
             raise _UsageError("--remove and --clear are mutually exclusive")
@@ -2741,6 +2811,37 @@ def cmd_enroll_city(
     n_enabled = conn.execute("SELECT COUNT(*) FROM cities WHERE enabled = 1").fetchone()[0]
 
     if list_only:
+        if excluded:
+            # The EXPLICIT zeroes, not "everyone the membership clause omits" —
+            # on an opt-in channel those are different sets and only the first
+            # one records a decision somebody made. A city that was simply
+            # never enrolled has a NULL (or no row at all) and does not belong
+            # in an answer to "who did we take out?".
+            #
+            # `cities.enabled = 0` is deliberately NOT filtered here, unlike
+            # the membership listing below: an exclusion pre-set before a city
+            # is enabled is a supported and load-bearing state (it is the only
+            # ordering that never exposes the city to a night's collection),
+            # so hiding it would hide exactly the rows an operator staging a
+            # rollout needs to check.
+            rows = conn.execute(
+                """SELECT c.city_id, c.display_name, c.enabled, s.last_success_at
+                   FROM cities c
+                   JOIN schedule_state s
+                     ON s.city_id = c.city_id AND s.provider = ?
+                   WHERE s.member = 0
+                   ORDER BY c.city_id""",
+                (channel,),
+            ).fetchall()
+            for r in rows:
+                pending = "" if r["enabled"] else "; city disabled, exclusion pre-set"
+                print(
+                    f"{r['city_id']}  ({r['display_name']}; last success "
+                    f"{r['last_success_at'] or 'never'}{pending})"
+                )
+            print(f"{channel}: {len(rows):,} cities explicitly excluded.")
+            _print_unwired_note(cfg, channel)
+            return 0
         rows = conn.execute(
             """SELECT c.city_id, c.display_name, s.member, s.last_success_at
                FROM cities c
@@ -2777,12 +2878,21 @@ def cmd_enroll_city(
             f"zero-row success."
         )
         return USAGE_EXIT_CODE
-    if not city.enabled:
-        # get_due_cities still requires cities.enabled = 1, so enrolling a
+    if not city.enabled and not (remove or clear):
+        # get_due_cities still requires cities.enabled = 1, so ENROLLING a
         # disabled city IS the silent no-op this command exists to prevent.
+        #
+        # An exclusion is the opposite: it is durable, it changes what happens
+        # the moment the city is enabled, and pre-setting it is the ONLY
+        # ordering that is safe. Enable-then-exclude leaves a window in which
+        # the 02:00 timer fires and collects a city we were deferring — and for
+        # a 40 km-clamped city that window costs 4M grid points, which is most
+        # of a night. So the two directions are gated differently on purpose.
         logger.error(
             f"{city.city_id}: cities.enabled = 0, so it can never be due on any "
-            f"channel. Enable the city first; enrolling it now would be a no-op."
+            f"channel. Enable the city first; enrolling it now would be a no-op. "
+            f"(--remove and --clear are allowed here: pre-setting an exclusion "
+            f"before the city is enabled is the safe order.)"
         )
         return USAGE_EXIT_CODE
 
@@ -2809,8 +2919,23 @@ def cmd_enroll_city(
     )
     for line in _enrolment_cost_note(conn, cfg, city, channel):
         print(line)
+    if not city.enabled:
+        # Reached only on the --remove/--clear path, which is allowed here on
+        # purpose. Say so, or "I excluded it and nothing changed" reads as the
+        # write having failed.
+        print(
+            "  NOTE  cities.enabled = 0, so this city collects nothing on any channel "
+            "yet. The setting is pre-set and takes effect when the city is enabled."
+        )
     n_member = db.count_channel_members(conn, channel, CHANNEL_DEFAULT_MEMBERSHIP[channel])
-    print(f"  {channel}: {n_member:,} of {n_enabled:,} enabled cities opted in.")
+    if is_opt_in_channel(channel):
+        print(f"  {channel}: {n_member:,} of {n_enabled:,} enabled cities opted in.")
+    else:
+        n_excluded = db.count_channel_exclusions(conn, channel)
+        print(
+            f"  {channel}: {n_member:,} of {n_enabled:,} enabled cities collect this "
+            f"channel ({n_excluded:,} explicitly excluded)."
+        )
     _print_unwired_note(cfg, channel)
     return 0
 
@@ -6645,7 +6770,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_global_flags(sub.add_parser("assign", help="(Re)compute stagger assignments"))
     p_enroll = sub.add_parser(
         "enroll-city",
-        help="Opt one city into (or out of) an opt-in channel's nightly queue (issue #248)",
+        help="Opt one city into (or out of) a channel's nightly queue (issue #248)",
     )
     _add_global_flags(p_enroll)
     p_enroll.add_argument(
@@ -6655,8 +6780,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--channel",
         required=True,
         metavar="CHANNEL",
-        help="The opt-in channel to enrol in. Only channels whose default membership "
-        "is off are settable here; per-city exclusion on the others is cities.enabled.",
+        help="The channel to set membership on. Enrolling (the bare form) applies "
+        "only to an opt-in channel, since every enabled city is already a member "
+        "of the others; --remove/--clear apply to any channel.",
     )
     g_enroll = p_enroll.add_mutually_exclusive_group()
     g_enroll.add_argument(
@@ -6675,15 +6801,23 @@ def build_parser() -> argparse.ArgumentParser:
         dest="list_only",
         action="store_true",
         help="List the channel's current members and exit; CITY is then optional. "
-        "Read-only, so it accepts a default-membership channel too (the answer "
-        "there is every enabled city). Cannot be combined with --remove/--clear.",
+        "Read-only, so it accepts a default-membership channel too. Cannot be "
+        "combined with --remove/--clear.",
+    )
+    p_enroll.add_argument(
+        "--excluded",
+        action="store_true",
+        help="With --list, list the cities EXPLICITLY excluded from the channel "
+        "(member = 0) instead of its members — including any whose exclusion was "
+        "pre-set while the city is still disabled.",
     )
     p_enroll.add_argument(
         "--all",
         dest="all_cities",
         action="store_true",
         help="Apply to every enabled city the setting would CHANGE, cheapest first "
-        "(issue #282). Takes no CITY. DRY RUN unless --execute is given.",
+        "(issue #282). Opt-in channels only. Takes no CITY. DRY RUN unless "
+        "--execute is given.",
     )
     p_enroll.add_argument(
         "--limit",
@@ -6894,6 +7028,7 @@ def main() -> int:
             remove=args.remove,
             clear=args.clear,
             list_only=args.list_only,
+            excluded=args.excluded,
             all_cities=args.all_cities,
             limit=args.limit,
             execute=args.execute,
