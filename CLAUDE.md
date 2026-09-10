@@ -9,7 +9,7 @@ It is a **router**: each section carries the short, mistake-preventing rules and
 Streetscape Tracker analyzes street-level imagery coverage and temporal patterns in cities **over time**.
 Four providers are collectable — Google Street View (GSV, the default), Mapillary (360° panos only), KartaView, and Panoramax.
 Panoramax is the newest and the only credential-free one; it is collectable by hand but **not yet a scheduler channel** (#316 phase 2, `UNWIRED_CHANNELS`).
-GSV and Mapillary run nightly over **every enabled city**; KartaView is a scheduler channel too but **opt-in**, collecting only the cities an operator enrolled with `scheduler enroll-city` (#248), because one whole-catalog pass prices at ~205,000 requests ≈ 215 h at the configured 16/min.
+GSV and Mapillary run nightly over every enabled city **that has not been excluded from the channel** (`enroll-city --channel gsv --remove`, #301); KartaView is a scheduler channel too but **opt-in**, collecting only the cities an operator enrolled with `scheduler enroll-city` (#248), because one whole-catalog pass prices at ~205,000 requests ≈ 215 h at the configured 16/min.
 The tool samples a geographic grid around a city center, queries each provider's metadata API, and produces immutable dated snapshots per (city, provider), run-to-run change summaries (panos added/removed, capture-date changes, coverage deltas), and interactive map visualizations.
 
 ## READ THIS FIRST: provider API access is the single point of failure
@@ -69,7 +69,7 @@ python scripts/register_frame.py --manifest mapillary_360_cities.csv --overlap-k
 |---|---|
 | `status` | Per-city schedule and budget status |
 | `assign` | (Re)compute stagger assignments (writes `day_of_cycle` only, so it never un-enrolls a member) |
-| `enroll-city CITY --channel C` | Opt one city into an **opt-in** channel's queue (#248); `--remove`/`--clear`/`--list`; `--all [--limit N] --execute` bulk-enrols cheapest-first (#282) |
+| `enroll-city CITY --channel C` | Set one city's membership on a channel (#248); `--remove`/`--clear` work on ANY channel, bare enrol only on an **opt-in** one; `--list [--excluded]`; `--all [--limit N] --execute` bulk-enrols cheapest-first, opt-in channels only (#282) |
 | `run-due [--dry-run]` | The nightly batch: collect stalest-due cities per channel, then the tail (aggregate, manifests, backup, publish) |
 | `run-due --provider mapillary --limit 5` | On-demand single-channel catch-up (#214) — the ONLY supported bulk path; Mapillary catch-ups resumed 2026-09-09 and resume **staged**, so the exemplar is a small N (`--limit` overrides `max_cities_per_day`, so nothing caps it but judgement) (see provider access below) |
 | `assess-city "Newport, Kentucky" --estimate` | Same-day answer for a partner inquiry about an untracked city (#215); `--estimate` stops after the boundary and cost report, `--yes` runs it |
@@ -83,7 +83,14 @@ python scripts/register_frame.py --manifest mapillary_360_cities.csv --overlap-k
 
 `run-due` notes: `--limit` (≥1) overrides `[schedule].max_cities_per_day`; an unknown/disabled channel or a bad `--limit` exits 64, not 2; a filtered run advances only the named channels' clocks, **un-pairing those cities' snapshots**.
 `assess-city` notes: a bad `--provider` or an unpaired `--width`/`--height` exits 64; answer from **street coverage, never grid coverage** (see operations below).
-`enroll-city` notes: it only accepts a channel whose default membership is OFF — per-city exclusion on the other four is `cities.enabled`; an unknown channel, a default-membership channel, an unresolvable city or a disabled city exits 64 writing no row; enrolling BEFORE the channel is configured is supported on purpose (it prints a note), or the rollout order is impossible.
+`enroll-city` notes: **the two directions are scoped differently, because each guard was scoped to where it is a no-op.**
+Bare enrol needs an opt-in channel and an enabled city (every enabled city is already a gsv member; a disabled city can never be due), so either exits 64 writing no row.
+**`--remove`/`--clear` work on ANY channel and on a still-DISABLED city** — that is what makes a city collectable on one channel and not another, and pre-setting the exclusion before enabling is the only order that doesn't race the 02:00 timer for a whole city's collection.
+`--all` stays refused on a default-membership channel in every direction (its blast radius is the catalog).
+An unknown or unresolvable target still exits 64; enrolling BEFORE the channel is configured is supported on purpose (it prints a note), or the rollout order is impossible.
+`--clear` on a pair that has no stored value exits 64 rather than writing a row and printing `unset -> unset` — the one silent no-op the relaxation opened, and the new error text routes operators straight at it.
+`status` prints `excluded` only for an ENABLED city; a disabled one prints `no` on every channel, so a pre-set exclusion shows up in the membership footer's count rather than its own row.
+**`assess-city` skips a channel this city is excluded from** and says so — collecting one would spend its key and then stamp `last_success_at` on a `member = 0` row, a state nothing else produces.
 **`--all` is DRY-RUN until `--execute`** (its blast radius is the whole catalog, and it is one keystroke from `--all --remove`), selects only cities the setting would CHANGE (so `--limit N` means N *new* members, never N rows re-touched), orders cheapest-first because a city that finishes its sweep in one night never writes a checkpoint and so never meets the 7-day `CHECKPOINT_MAX_AGE_S`, and prints its total as a **floor**; `--limit`/`--execute` without `--all`, `--all` with `--list`, and `--all` with a CITY all exit 64.
 
 ### One-time and repair scripts (`scripts/`)
@@ -210,7 +217,11 @@ This is what READ THIS FIRST points at; read it before changing any pacing, retr
 **Scheduler → [`docs/scheduler.md`](docs/scheduler.md).**
 `run-due` collects the stalest-due cities per enabled channel under per-channel daily budgets, then runs a tail — aggregate, streetwalk manifest, driving-plan summary, catalog backup, publish.
 **`get_due_cities`' `NULLS FIRST` put every never-collected city ahead of every refresh, so `[schedule].refresh_slots` reserves a share of the night's cap for cities that gain a SECOND dated interval (#308)** — unset it derives `max_cities_per_day // 4`, `0` is the identity permutation, and it can never refresh early because everything it promotes already cleared the `cycle_days - grace_days` (83 day) wall.
-The BOUNDED opt-in hoist (#248, #282) is applied first and the reserve second, into what the hoist did not take: reserve-first put its promotions at the end of the window and the hoist displaced the window's last cities, so the two reservations cancelled rather than composed.
+The BOUNDED hoist (#248, #282) is applied first and the reserve second, into what the hoist did not take: reserve-first put its promotions at the end of the window and the hoist displaced the window's last cities, so the two reservations cancelled rather than composed.
+**The hoist's key is "STRANDED", meaning not due on the union's rank-0 channel (`providers[0]`, normally gsv) — the mechanism, never the cause (#301).**
+The union is ordered by FIRST APPEARANCE, so a city's position is set by the earliest channel it is due on and anything not due on rank 0 is appended behind the whole gsv block and truncated by the cap.
+Keyed on `all(p in opt_in ...)` instead, a city EXCLUDED from gsv was never rescued — `mapillary` is a default-membership channel — and `refresh_slots` cannot reach it either, since that needs a non-NULL `last_success_at`: measured, ten such cities behind 45 gsv-due ones collected **0 of 10 at prod's 40-city cap, permanently**, with `consecutive_failures` at 0 and no alert.
+The key is the UNION of "not due on rank 0" **or** "due only on opt-in channels", because a filtered widening (`run-due --provider kartaview`) makes rank 0 the opt-in channel itself and strands nobody, while its live-checkpoint preference still has to hold.
 A night's cap is therefore split three ways — `opt_in_cities_per_day`, then `refresh_slots` of the remainder, then stalest-first — and it is the SUM of the two that bounds how much of a night the plain queue still governs (20 of 40 on prod).
 `max_cities_per_day` is 40 and `max_batch_hours` 12 (raised 2026-09-02, #304): the deadline is the intended governor, and the bracket on it is `TimeoutStopSec` < `max_batch_hours` < `TimeoutStartSec` (14 h) less the ~0.45 h bounded tail — past ~13.5 h the unit has to move first.
 Channels run back-to-back, or concurrently in host-disjoint lanes when `[schedule].max_concurrent_channels` > 1 (default 1; channels sharing a per-IP host never overlap, so the effective ceiling is 4 of 6, and raising it in prod is gated only on verifying the two GSV keys live in separate Cloud projects).
@@ -288,7 +299,7 @@ Keep any list a doc enumerates **alphabetical**, so two branches adding an entry
   - `undated-imagery-share.md`
 
 - Architecture decisions are recorded in `docs/adr/` — notably **ADR 0001: stay fully static, no backend**; large/dense-city rendering (#77, #58) is fixed with static artifacts (grid-binned overview → PMTiles), never a server.
-- Published JSON artifacts and their schema versions are inventoried in [`docs/architecture.md`](docs/architecture.md): per-run summary v2, aggregate `cities.json.gz` v3, streetwalk manifest v1, driving-plan summary v1, provider screen v1.
+- Published JSON artifacts and their schema versions are inventoried in [`docs/architecture.md`](docs/architecture.md): per-run summary v2, aggregate `cities.json.gz` v4 (v4 adds `excluded_channels`, absent when empty, so a record is byte-identical to its v3 form for an unexcluded catalog), streetwalk manifest v1, driving-plan summary v1, provider screen v1.
 - `data/` contains thousands of files — avoid globbing or listing it wholesale.
 - Legacy pre-2026 data files are undated; they are registered as `is_baseline=1` runs by the migration script and never renamed (published URLs stay stable).
 - Runtime state that must never reach the public web server lives in gitignored siblings of `data/` — `archive/` (#176), `backups/` (#145), `census_cache/` (#290), `checkpoints/` (#239, #256), `locks/` (#208), `logs/` — and the publish rsync only walks `data/`, so anything there is structurally unpublishable.

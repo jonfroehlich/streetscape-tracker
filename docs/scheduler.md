@@ -295,6 +295,27 @@ That is also why `cmd_run_due` logs `max_concurrent_channels=N` on its opening l
 Measured on prod 2026-09-01: 497 of 1,216 enabled cities had never had a successful scheduled `gsv` run and 506 had only their legacy migrated baseline, so at the then-cap of 20 the never-collected block had ~25 nights left to run — and **until it drains no city gains a second dated interval**, which means `run_diffs`, #101's walk diffs and the run-to-run change summaries this project exists to produce have nothing to compare and never exercise.
 The run history shows it plainly: the batch marched the alphabet, `la*`/`lo*` the week of 2026-08-25 and `ma*`–`mo*` the week of 2026-08-30.
 
+**The hoist's key is STRANDED — not due on the union's rank-0 channel — rather than "due only on an opt-in channel" (#301).**
+The union is ordered by first appearance across `enabled_providers()`, so a city's slate position is set by the earliest channel it is due on, and one not due on `providers[0]` is appended behind every rank-0-due city and then truncated by the city cap.
+Which channel put it there does not change that, and keying on the cause left half the population unrescued: a city excluded from `gsv`/`gsv_streets` fails `all(p in opt_in ...)`, because `mapillary` is a default-membership channel, and `_reserve_refresh_slots` cannot reach it either since that needs a non-NULL `last_success_at` and such a city has never collected.
+Measured before the key changed: ten gsv-excluded cities behind 45 gsv-due ones landed at union positions 45–54 and collected **0 of 10** at prod's 40-city cap — indefinitely, because unlike an ordinary stalled city they never re-enter gsv's due list at all, and with `consecutive_failures` at 0 the night's own starvation diagnostic could not see them.
+The key is the **union** of the two conditions, not a replacement: a filtered widening (`run-due --provider kartaview`) makes rank 0 the opt-in channel, so nothing is stranded by the first half while the live-checkpoint preference below still has to hold.
+`[schedule].opt_in_cities_per_day` keeps its name — renaming a deployed config key to track a widened meaning is not worth a production edit — but it now bounds the rate at which ANY stranded population is worked off, so a KartaView widening and a #301 rollout share it.
+**They share it by round-robin over THREE populations, not by arrival order**, and both halves of that are load-bearing rather than tidy.
+Taken straight down the union the largest group takes every slot, because union order inside one channel's due list is `last_success_at ASC NULLS FIRST, city_id ASC` and a stranded block is all-NULL there, so the winner is decided alphabetically — a lottery on `city_id`, not a rate.
+The three groups are what the reservation has to tell apart, and the question each answers is **whether waiting fixes it**:
+
+1. **excluded from rank 0** (`schedule_state.member = 0`, #301) — permanent; nothing but this reservation ever reaches it;
+2. **due only on opt-in channels** (#248) — effectively permanent while the sibling default channel keeps succeeding;
+3. **transiently not due on rank 0** — its rank-0 clock is merely fresh, and it rejoins the union head by itself within a cycle.
+
+Grouping only on 1-or-2 versus 3 is not enough, and the first attempt at this shipped exactly that: group 3 is prod's documented ~121-city mapillary-only-due population, and sharing a bucket with group 1 it won the same alphabetical lottery, putting the #301 cities back at **0 of 10** on a prod-shaped slate.
+Splitting 1 from 3 is what makes the reservation a rate: measured on the same slate, 4 of 10 to #301, 3 to the KartaView widening, 3 to the transient population.
+**A live checkpoint outranks the rotation across every group**, taken first and in union order — confined to its own group it stops being a guarantee at a reservation of 1, and #239's five nights stop being CONSECUTIVE.
+That take is itself **bounded**, leaving one slot per other non-empty group, because unbounded it is the same starvation a third time: measured, ten stranded resumers in one group displaced the other two groups one-for-one and zeroed both.
+The floor keeps it at one, so at a reservation of 1 the resumer still wins and the #239 guarantee is untouched; any reservation at least as large as the number of stranded groups now guarantees each of them a slot.
+A group leaves the rotation as it empties, so a night with only one stranded population behaves exactly as the straight take did.
+
 **`[schedule].refresh_slots` reserves a share of the night's city cap for cities that will gain a second interval.**
 Unset it derives `max_cities_per_day // 4` (10 of 40 on prod), so the split follows the cap from one place rather than being a second number to keep in step; an explicit integer overrides, and **`0` restores the pure breadth-first order exactly** — the identity permutation, provable by construction rather than argued, the same property `max_concurrent_channels = 1` keeps for #240.
 A bad value warns and falls back to *deriving*, never to 0, because 0 is meaningful here and a typo must not be indistinguishable from a deliberate policy choice; TOML booleans are Python ints, so `false` is excluded explicitly.
@@ -335,13 +356,32 @@ It writes `day_of_cycle` and nothing else, which is what keeps the nightly `assi
 Assignment is **not** enrolment: on an opt-in channel it creates a row per enabled city and leaves `member` NULL, so the channel gains ~1,144 rows that collect nothing.
 `status` and `assign` therefore print a per-channel enrolled count for each opt-in channel — without it, a table of blank `DUE` cells reads as "the flip did not take".
 
-**`enroll-city CITY --channel CHANNEL [--remove | --clear] [--list]`** is the operator handle for `schedule_state.member` (#248), and it exists because hand-SQL has four ways to be a silent no-op here: `day_of_cycle` is `NOT NULL` with no default so a bare `INSERT` fails; an `UPDATE` matches zero rows and exits 0 whenever `assign` has not yet run with the channel enabled; a typo'd slug is the same zero-row success; and NULL/0/1 is three-valued with its meaning in a code-side table.
-It refuses (`USAGE_EXIT_CODE`, changing no row) an unknown channel, a **default-membership** channel (per-city exclusion for `gsv` is `cities.enabled`, and a second less visible way to disable a city is how two operators disagree about why it stopped), an unresolvable city, and a city with `cities.enabled = 0`.
+**`enroll-city CITY --channel CHANNEL [--remove | --clear] [--list [--excluded]]`** is the operator handle for `schedule_state.member` (#248), and it exists because hand-SQL has four ways to be a silent no-op here: `day_of_cycle` is `NOT NULL` with no default so a bare `INSERT` fails; an `UPDATE` matches zero rows and exits 0 whenever `assign` has not yet run with the channel enabled; a typo'd slug is the same zero-row success; and NULL/0/1 is three-valued with its meaning in a code-side table.
+It refuses (`USAGE_EXIT_CODE`, changing no row) an unknown channel, an unresolvable city, and — **in the enrol direction only** — a **default-membership** channel or a city with `cities.enabled = 0`.
+Both of those two are scoped to enrolment because enrolment is where they are no-ops: every enabled city is already a member of `gsv`, and a disabled city can never be due on anything.
+**Exclusion is a real write on any channel** (`--remove` writes `member = 0`, `--clear` restores NULL), and it is what makes a city collectable on one channel and not another — the handle that a purposive batch needs when `cities.enabled` would drag three more channels along with it.
+The original refusal objected to *invisibility* rather than to the operation ("a second less visible way to disable a city is how two operators disagree about why it stopped"), so allowing it is paid for on the visibility side: `status` prints `excluded` rather than `not enrolled` for an explicit `0` on an ENABLED city — a disabled city still prints `no` on every channel, since `cities.enabled = 0` short-circuits the per-channel column, so a pre-set exclusion is visible in the footer's count rather than in its own row — and the membership footer prints a line for any default-membership channel carrying one.
+**Pre-setting an exclusion on a still-disabled city is supported and is the correct rollout order**, since a newly enabled city has no `schedule_state` rows and therefore leads the stalest-due ordering on its first night — enable-then-exclude races the 02:00 timer for a whole city's collection, and for a 40 km-clamped city that race costs 4M grid points.
+**`--all` stays refused on a default-membership channel in every direction**: its blast radius is the whole catalog, `--all --remove --channel gsv` is one keystroke from the `kartaview` form, and its cheapest-first ordering is a KartaView sweep-cost rationale that means nothing for a GSV grid.
 It deliberately does **not** refuse while the channel is still unwired or unconfigured — enrolment must precede the config block or the rollout order is impossible — and prints a `NOTE` saying nothing collects it yet.
 `--remove` writes an explicit `0` and `--clear` restores NULL; the two are indistinguishable to dueness today and kept apart because only the explicit `0` survives a future flip of the channel default.
-`--list` is scoped differently from the rest because it is read-only: it accepts a **default-membership** channel too (the answer there is every enabled city), and it refuses to run beside `--remove`/`--clear`, which argparse's mutually exclusive group does not cover and which would otherwise be accepted, ignored and exit 0.
-A known, deliberate foreclosure: a **kartaview-only city is inexpressible**, since registering one makes it `enabled = 1` and therefore a member of all four default channels.
-Revisit that only if widening wants Grab-market cities we would not otherwise collect.
+`--list` is scoped differently from the rest because it is read-only: it accepts a **default-membership** channel too, and it refuses to run beside `--remove`/`--clear`, which argparse's mutually exclusive group does not cover and which would otherwise be accepted, ignored and exit 0.
+`--list --excluded` inverts it to the **explicit zeroes**, and it is the only way to enumerate them — `status` has no city filter and prints the whole catalog, while a plain `--list` on `gsv` prints every member and says nothing about who is missing.
+It lists explicit zeroes rather than everyone the membership clause omits, because on an opt-in channel those are different sets and only the first records a decision somebody made; and unlike the membership listing it does **not** filter on `cities.enabled`, since a pre-set exclusion on a not-yet-enabled city is exactly the row an operator staging a rollout needs to see.
+A **single-channel city is now expressible** — register it, exclude it from the channels it should not join, then enable it — which is what retires the old foreclosure that a kartaview-only city was impossible because `enabled = 1` made it a member of all four default channels.
+What is still not expressible is a *per-channel enable date*: exclusion is a switch, not a schedule, so staging a batch across nights is a sequence of operator commands rather than a property of the catalog.
+
+**The rollout order, and it verifies BEFORE the point of no return:**
+
+1. `enroll-city CITY --channel gsv --remove` and the same for `gsv_streets`, while the city is still **disabled**.
+2. `enroll-city --channel gsv --list --excluded` — confirm every city you meant is flagged `city disabled, exclusion pre-set`. A mistyped slug exits 64 and writes nothing, so this is the step that catches it, and it has to happen while the city still collects nothing.
+3. `UPDATE cities SET enabled = 1`.
+4. `run-due --dry-run` to confirm no `gsv` lines before the 02:00 timer fires.
+
+Doing (3) before (2) leaves a mistyped or forgotten exclusion on an ENABLED city, exposed to the next timer — which for a 40 km-clamped city is 4M grid points, most of a night.
+Expect the newly enabled cities to arrive through the stranded reservation rather than all at once, since they are not due on gsv and therefore never lead the union.
+They get a **share** of `[schedule].opt_in_cities_per_day`, not all of it: the reservation round-robins across stranded populations, so with a KartaView widening and a transiently-stalled population also in flight the share is about a third of it (measured on a prod-shaped slate: 4 of 10).
+Raise the key for the duration of a rollout rather than expecting ten cities on night one.
 
 **`notify-failure`** emails the recent scheduler-log tail and is wired as the unit's `OnFailure=` hook (`deploy/systemd/streetscape-tracker-notify@.service`), so a crash that never reaches the in-run alerting still produces an email.
 It exits 0 when it alerted (or alerting is intentionally off) and 1 only when a send was attempted and failed, so the notify unit's own status is meaningful.

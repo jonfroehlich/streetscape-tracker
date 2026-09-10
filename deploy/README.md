@@ -755,7 +755,7 @@ python -m streetscape_metadata_tracker.scheduler --config <cfg> \
     enroll-city --channel kartaview --list
 ```
 
-It only accepts an **opt-in** channel — one whose default membership is off (`kartaview` today) — for the WRITE path.
+It accepts an **opt-in** channel — one whose default membership is off (`kartaview` today) — for a bare ENROL. Since #301 the exclusion direction (`--remove`/`--clear`) accepts ANY channel, including `gsv`, and works on a still-disabled city.
 `--list` is read-only and accepts any channel; on a default-membership one the answer is every enabled city.
 Per-city exclusion on `gsv`, `mapillary` and the two street channels stays `cities.enabled`, deliberately: a second, less visible way to disable a city is how two operators end up disagreeing about why it stopped collecting.
 

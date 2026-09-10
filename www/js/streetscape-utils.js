@@ -988,6 +988,9 @@ function adaptCityRecord(rec, provider = "gsv") {
       ...rec,
       provider: "gsv",
       city_id: rec.city_id ?? null,
+      // Always present, so consumers read ONE shape across v1..v4. A v1 record
+      // predates per-channel membership and will never gain it.
+      excluded_channels: [],
       runs: rec.runs || [],
       change: rec.change || null,
       latest_run_date: rec.latest_run_date ?? null,
@@ -1028,6 +1031,13 @@ function adaptCityRecord(rec, provider = "gsv") {
   return {
     provider,
     city_id: rec.city_id,
+    // schema v4 (#301). The channels this city is EXPLICITLY excluded from, so
+    // a page can tell "we decided not to collect this" from "not collected
+    // yet" from "failing" -- three states that were indistinguishable while
+    // `schedule_state.member` reached no published artifact. Always an array,
+    // so a caller writes `.includes("gsv")` rather than guarding for undefined
+    // on every v1/v2/v3 record.
+    excluded_channels: rec.excluded_channels ?? [],
     city: rec.city.name,
     state: rec.city.state,
     country: rec.city.country,

@@ -1071,10 +1071,30 @@ function renderProvider(fitMap = false) {
        of ${cities.length} ${providerInfo.label} cities walked
        (<a href="streets.html">see all</a>)</span>`
     : "";
+  // This map is one provider's view, so a city collected only by ANOTHER
+  // provider has no rectangle, is unfindable in search, and is outside the
+  // count — which was fine while every collected city had a GSV run, and is
+  // not since #301 made a Mapillary-only city expressible. The view stays
+  // per-provider (that is the whole point of the switcher); what changes is
+  // that the gap is stated instead of being silently indistinguishable from
+  // "we collect nothing there".
+  const totalCollected = Array.isArray(rawCitiesData?.cities) ? rawCitiesData.cities.length : 0;
+  const elsewhereCount = Math.max(0, totalCollected - cities.length);
+  // Phrased as a scope note, not an anomaly, and suppressed once it would
+  // dwarf the view it annotates: on the Mapillary view "950 further cities are
+  // collected only by other providers" is literally true and reads as an
+  // outage. Below the view's own count it is the #301-shaped case this exists
+  // for (a handful of cities missing from an otherwise complete GSV map).
+  const elsewhereNote =
+    elsewhereCount && elsewhereCount < cities.length
+      ? `<br><span class="stats-note">${elsewhereCount}
+         ${elsewhereCount === 1 ? "city is" : "cities are"} not in this provider's series
+         — switch provider above, or see <a href="grid.html">all cities</a></span>`
+      : "";
   document.getElementById("stats").innerHTML = `
     <strong>${providerInfo.label} City Coverage Analysis</strong><br>
     ${cities.length} cities analyzed | Updated: ${new Date(meta.generatedAt).toLocaleString()}
-    ${streetsNote}
+    ${streetsNote}${elsewhereNote}
   `;
 
   if (cities.length === 0) {

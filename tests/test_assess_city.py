@@ -702,7 +702,11 @@ def test_the_closing_note_says_which_channels_are_actually_due(conn, monkeypatch
     assert all(due[c] == [] for c in ASSESS_CHANNELS)
 
     assert "due on every channel" not in out
-    assert "no schedule_state row yet, so it is due" in out
+    assert "The GSV grid run is not part of this command" in out
+    # ...and it no longer claims the grid run LEADS the queue unconditionally:
+    # that is true of gsv's own list, and only the union's order while the city
+    # is a gsv member (#301).
+    assert "leads gsv's OWN stalest-first list" in out
     assert "NOT due tonight" in out
     # And the paired-snapshot cost is named, the way run-due --provider names it
     # (issue #214) rather than leaving it to be discovered.
@@ -721,7 +725,7 @@ def test_the_paired_snapshot_note_is_absent_when_nothing_was_collected(
     out = capsys.readouterr().out
     assert "no longer share one run date" not in out
     # The GSV note still applies: that channel was never given a row either way.
-    assert "so it is due" in out
+    assert "The GSV grid run is not part of this command" in out
 
 
 def test_a_failed_channel_records_no_failure(conn, monkeypatch, tmp_path):

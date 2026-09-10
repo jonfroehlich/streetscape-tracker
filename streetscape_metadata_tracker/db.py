@@ -2119,6 +2119,72 @@ def count_channel_members(conn: sqlite3.Connection, provider: str, default_membe
     ).fetchone()[0]
 
 
+def get_channel_exclusions_all(conn: sqlite3.Connection) -> dict[str, list[str]]:
+    """Every explicit ``member = 0``, as ``{city_id: [provider, ...]}``.
+
+    One query for the whole catalog, because the aggregate builder needs this
+    per city and 1,200 point lookups is the shape that makes a nightly tail
+    slow. Sorted providers so the published artifact is byte-stable run to run.
+
+    EXPLICIT zeroes only, deliberately, and that is what makes this publishable
+    at all: a NULL means "use the channel default", which is a code-side table
+    (``scheduler.CHANNEL_DEFAULT_MEMBERSHIP``) rather than a fact about the
+    city, and publishing a derived default would freeze today's table into
+    every artifact. An explicit 0 is a decision somebody made about this city,
+    which is exactly what a reader of the site needs in order to tell "excluded
+    from gsv" from "not collected yet" (issue #301).
+    """
+    out: dict[str, list[str]] = {}
+    for row in conn.execute(
+        "SELECT city_id, provider FROM schedule_state WHERE member = 0 ORDER BY city_id, provider"
+    ):
+        out.setdefault(row["city_id"], []).append(row["provider"])
+    return out
+
+
+def count_channel_exclusions(
+    conn: sqlite3.Connection, provider: str, *, enabled_only: bool = False
+) -> int:
+    """How many cities are EXPLICITLY excluded from this channel (``member = 0``).
+
+    Deliberately not ``count_channel_members``' complement, on both axes:
+
+    * It counts explicit zeroes only, never "everyone the membership clause
+      omits". On an opt-in channel those are wildly different numbers — the
+      second is the whole catalog — and only the first records a decision.
+    * It does **not** filter on ``cities.enabled``. An exclusion pre-set before
+      a city is enabled is a supported and load-bearing state (it is the only
+      rollout order that never exposes the city to a night's collection), so
+      scoping this to enabled cities would report ``0`` immediately after a
+      write that plainly succeeded.
+
+    That second choice means this is *not* ``n_enabled - count_channel_members``
+    on a default-membership channel whenever a pending exclusion exists. One
+    definition, used by both the footer and ``enroll-city --list --excluded``,
+    is worth more than an arithmetic identity that only holds sometimes.
+
+    ``enabled_only=True`` asks the same question scoped the way
+    :func:`count_channel_members` is, and exists so a caller printing BOTH
+    numbers in one sentence can say how many of the exclusions its ``of N
+    enabled cities`` denominator cannot see. Without it the footer read
+    ``1,221 of 1,221 enabled cities collect this channel (10 explicitly
+    excluded)`` during exactly the rollout the unscoped count exists to make
+    visible — two halves of one sentence over two different populations, which
+    reads as the write not having taken.
+    """
+    if enabled_only:
+        return conn.execute(
+            """SELECT COUNT(*) FROM schedule_state s
+               JOIN cities c ON c.city_id = s.city_id
+               WHERE s.provider = ? AND s.member = 0 AND c.enabled = 1""",
+            (provider,),
+        ).fetchone()[0]
+    return conn.execute(
+        "SELECT COUNT(*) FROM schedule_state WHERE provider = ? AND member = 0",
+        (provider,),
+    ).fetchone()[0]
+
+
 # ── GSV driving-plan feed (issue #176) ─────────────────────────────────────
 
 
