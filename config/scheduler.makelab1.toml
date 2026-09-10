@@ -176,9 +176,12 @@ enabled = true
 # sum is 3,500 paired / 5,250 un-paired. The lockstep argument went with it:
 # since #290 the walk's estimate is 0 on a paired night, so the two budgets
 # do not deplete together at all. A
-# normal 20-city night (~1,150 tiles per channel) fits; a catch-up-scale
-# burst is impossible by construction, ON PURPOSE -- no `--limit` catch-ups until a rolling
-# multi-day guard exists (#241). Recovery recipe, measured twice: full
+# normal 20-city night (~1,150 tiles per channel) fits. The `--limit` catch-up
+# ban that used to sit here was LIFTED 2026-09-09 after #292's eleven clean
+# nights (docs/provider-access.md, "The read-out"); catch-ups now resume STAGED,
+# sized in cities and quoted against the per-IP sum, never this line alone. Note
+# a burst is no longer impossible by construction the way it was at 1,750 --
+# that is what the staging rule replaces. Recovery recipe, measured twice: full
 # silence, then one single-request probe; both blocks cleared within ~a day
 # of the last refused request.
 #
