@@ -5188,11 +5188,37 @@ def _collect_due(
 
             # Stable, so within each group the union's stalest-first order is
             # untouched and the choice is only ever "resumers before starters".
-            chosen = set(
-                sorted(stranded, key=lambda i: 0 if _has_live_checkpoint(ordered[i]) else 1)[
-                    :max_opt_in
-                ]
+            by_preference = sorted(
+                stranded, key=lambda i: 0 if _has_live_checkpoint(ordered[i]) else 1
             )
+            # ROUND-ROBIN ACROSS STRANDED POPULATIONS, not straight down the
+            # union. Widening the key merged two groups into one reservation,
+            # and taken in union order the larger group takes every slot: a
+            # catalog carrying ~121 mapillary-only-due cities alongside a
+            # KartaView widening filled all 10 of prod's slots with the former
+            # (they sort earlier inside mapillary's own due list), so the
+            # widening that used to own those slots collected NOTHING and the
+            # #301 cities this key was widened for got in at 0 of 10.
+            #
+            # That is the same starvation one level up, and the fix is the same
+            # shape as #282's bound: share the reservation rather than let
+            # arrival order allocate it. Two groups today -- opt-in-only, and
+            # stranded by rank-0 exclusion -- and a group is dropped from the
+            # rotation as it empties, so a night with only one behaves exactly
+            # as it did before.
+            groups: dict[bool, list[int]] = {}
+            for i in by_preference:
+                key = all(p in opt_in for p in providers_for_city[ordered[i].city_id])
+                groups.setdefault(key, []).append(i)
+            chosen = set()
+            queues = [q for _, q in sorted(groups.items())]
+            while len(chosen) < max_opt_in and any(queues):
+                for q in queues:
+                    if not q:
+                        continue
+                    chosen.add(q.pop(0))
+                    if len(chosen) >= max_opt_in:
+                        break
         keys = [0 if i in chosen else 1 for i in range(len(ordered))]
         # Not `promoted`: that name belongs to the refresh reserve below, and
         # the two counts mean different things in the same scope.

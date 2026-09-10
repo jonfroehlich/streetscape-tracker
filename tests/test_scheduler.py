@@ -2516,6 +2516,51 @@ def test_a_gsv_excluded_city_is_hoisted_rather_than_starved_forever(conn):
     assert "gsv" not in slate.providers_for_city[excluded]
 
 
+def test_the_reservation_is_shared_across_stranded_populations(conn):
+    """Widening the key merged two populations into one reservation, and taken
+    in union order the larger one takes every slot.
+
+    Measured when the key first widened: a catalog carrying a large
+    mapillary-only-due population alongside a KartaView widening filled ALL of
+    prod's ten reserved slots with the former -- they sort earlier inside
+    mapillary's own due list -- so the widening that used to own those slots
+    collected nothing. That is the same starvation one level up, so the
+    reservation round-robins between the groups instead.
+
+    Pinned as "both groups are represented", not as an exact split, because the
+    split moves with the reserve and the point is that neither group can be
+    zeroed by the other.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    # Due only on kartaview: every default channel already succeeded.
+    optin = [_register(conn, f"Aopt{i}", width=1000, height=1000, step=20) for i in range(4)]
+    # Due only on mapillary: excluded from both GSV channels, sorts EARLIER
+    # than the opt-in ids inside the union so it wins a naive union-order take.
+    excluded = [_register(conn, f"Aexc{i}", width=1000, height=1000, step=20) for i in range(4)]
+    db.assign_schedule(conn, 90, providers=("gsv", "gsv_streets", "mapillary", "kartaview"))
+    for cid in optin:
+        db.set_channel_membership(conn, cid, "kartaview", True, cycle_days=90)
+        for channel in ("gsv", "gsv_streets", "mapillary"):
+            db.record_attempt(conn, cid, success=True, provider=channel)
+    for cid in excluded:
+        for channel in ("gsv", "gsv_streets"):
+            db.set_channel_membership(conn, cid, channel, False, cycle_days=90)
+
+    cfg = _sweep_cfg(publish_enabled=False, opt_in_cities_per_day=2)
+    slate = sched._collect_due(
+        conn,
+        cfg,
+        date(2026, 7, 2),
+        ["gsv", "gsv_streets", "mapillary", "kartaview"],
+        max_opt_in=2,
+        max_cities=2,
+    )
+    head = [c.city_id for c in slate.cities][:2]
+    assert any(c in optin for c in head), "the opt-in widening must not be zeroed"
+    assert any(c in excluded for c in head), "the gsv-excluded population must not be zeroed"
+
+
 def test_a_city_due_only_on_an_opt_in_channel_is_hoisted_ahead_of_the_gsv_block(conn):
     """Without this the channel is scoped but never REACHED.
 
