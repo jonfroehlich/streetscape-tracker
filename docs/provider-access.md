@@ -115,6 +115,7 @@ So a 40-city night demands roughly **1,800–2,400**, not the ~1,560 the run-wei
 3,500 is therefore about **1.5x** headroom over a normal 40-city night, not the 2.2x the run mean implies, and the cap still binds on any night carrying two or three metros.
 It bound twice in those six nights, both times on an end-of-night sliver rather than on a city that was ever unaffordable: New York needed 484 with 426 left, and Normal, Illinois needed 40 with 38 left.
 That shape is the argument for the capped-and-resume work in #318 as well as for this raise — the raise fixes the average night, a resumable census fixes the tail.
+**#318 has since landed**, so neither of those two cities would be skipped today: each launches with the remainder as a request cap, spends it, checkpoints the unfetched tiles and finishes the next night.
 
 **What this actually spends.** Since #290 the walk reuses the grid run's census for zero requests on a paired night, and the table above shows `mapillary_streets` spending 0 on five of the six nights.
 The *combined* per-IP load has therefore been running at 755–2,260/day (six-night mean ~1,330) against the 3,500 that #241 sanctioned — about 38% of it on the mean and 65% at the 09-03 peak — so on a paired night 3,500 + 0 restores that sanctioned combined ceiling rather than exceeding it.
@@ -171,7 +172,11 @@ The census now resumes for its **missing tiles only**, through the same `checkpo
 Three things this deliberately does **not** change.
 Resume is strictly **next-invocation**: no in-process retry is added anywhere, because the forum-reported hazard that retrying during a block extends it stands untested in either direction and is not worth testing with production credentials.
 Pacing is untouched at 60/min, and so are both daily budgets — a resumed night is *cheaper*, never faster.
+That still holds after #318, and it is the sentence to read before worrying about the traffic shape a request cap produces: a cap never raises a day's total above the budget, and across nights a city split over two is paid for once instead of re-paid.
+What it does change is that a night which used to stop *short* of its budget — skipping the city that did not fit the remainder — now spends the remainder exactly.
+Near-ceiling nights become exactly-ceiling nights, which is worth stating rather than discovering, because volume is the axis #292's jitter test was holding still.
 And the pre-flight estimate still prices the whole tile count even when a resume will fetch a fraction of it, which errs high; that is the safe direction for a budget gate and is left alone.
+(**#318 changed what that over-pricing costs, not the estimate.** A resumable channel's estimate is no longer *consulted* by either budget gate: the city is launched capped whatever it says. Left in place, the over-pricing would have re-priced a resuming New York at its full 484 and skipped it a second time — which is why "errs high, safe direction" stopped being true the moment the alternative to skipping was capping.)
 
 What it buys, concretely: tiles fetched before a block survive it, a crash between the CSV write and cataloging re-finalizes for ~0 requests, and a night the scheduler winds down mid-city resumes rather than restarting
 — and it is what clears the resume gate on raising `max_concurrent_channels` above 1, since a deadline or SIGTERM under lanes kills up to N children at once instead of one.

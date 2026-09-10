@@ -241,6 +241,36 @@ A grid run has exactly one crawl per channel and passes no variant, which keeps 
 That paragraph closes with "both walks read the same tiles, so the census is identical and nothing downstream would show it" — **still true of checkpoints, where the identity is a hazard.
 The census cache below is where the same identity is exploited instead.**
 
+## A tile census can now stop at a request cap and resume (issue #318)
+
+**A Mapillary grid run that did not fit the night's remaining budget used to be skipped whole and rolled to tomorrow.**
+Both times that fired in the six nights 2026-08-30..09-04 it was an end-of-night sliver rather than a city that was ever unaffordable — New York needed 484 requests with 426 left and collected nothing, Normal IL needed 40 with 38 left.
+#256 gave the census crash-resume, so it continued after an interruption it did not *choose*; what it lacked was a number it could stop itself at, which is why both Mapillary channels stayed `CHANNEL_RESUMABLE` `False` until now.
+`--mapillary-max-requests` (and `--panoramax-max-requests`, the same code in the other tile census) is that number.
+
+**The cap is checked inside the semaphore, beside #205's abort flag, and it is a SEPARATE flag rather than a second meaning for that one.**
+`fatal` means every remaining tile would fail identically, so the city is over; a cap means the opposite — they are all perfectly fetchable and we are out of budget until tomorrow.
+Folding the two together would make one of the two exit codes wrong whichever way it went.
+It inherits the abort's bound as well as its position: tasks already past the check finish, each spending up to `TILE_MAX_TRIES` requests, so the overshoot is at most `connection_limit × TILE_MAX_TRIES` (25 at the grid defaults) rather than the whole city.
+That is documented on the flag rather than engineered away — stopping requests already in flight would mean cancelling a paced, retrying fetch mid-attempt, which buys ~25 requests and costs the guarantee that every request we made was counted.
+
+**THE RAISE SITS BEFORE THE SETTLE LOOP, AND THAT PLACEMENT IS THE SAFETY ARGUMENT.**
+A tile skipped at the cap returns an *empty census*, not an exception — which is what keeps it uncommitted and therefore owed to the resume.
+But past the settle loop an empty census is indistinguishable from a tile the CDN answered with no imagery: it would land in `fetched`, reassemble into the census, and publish absence nobody observed, as an immutable dated snapshot diffing against its predecessor as "every pano in the rest of the city removed".
+Nothing below that line can tell the two apart, so nothing below it ever sees a capped crawl.
+The promotion predicate also gained the completeness term (`done | failed == tiles`) it never needed while nothing could reach it with tiles missing: position WAS the completeness argument, and a cap makes that argument depend on one `if capped: raise` staying above it forever.
+
+**With no usable checkpoint the same stop is a plain `DownloadError`, not a pause.**
+Exit 83 tells an operator "this made progress, run it again", and with nothing to resume from that re-run spends the same requests and stops in the same place — forever, with the spend in the ledger and no run in the catalog.
+So a cap passed without a checkpoint *path* is refused up front as a caller bug (both fall-backs are wrong in a way nothing downstream could see: ignoring the cap silently overspends a per-IP budget, honouring it silently burns one), and a checkpoint that came back `None` or latched `degraded` at runtime takes the plain-error arm.
+
+**Both Mapillary channels flip together, and that is not tidiness.**
+`_sweep_launch_plan`'s sibling arm — the one that stops a walk sweeping a lattice its grid sibling is mid-way through — is asked only of a RESUMABLE street channel.
+Flip the grid alone and the first night its census pauses leaves a *checkpoint*, not a cache entry, so the walk prices at full, takes the old all-or-nothing gates, and crawls the identical z14 lattice a second time against the same per-IP host for an observation the cache would hand it free once the grid finished (#290).
+
+**`panoramax` gets the collector-side cap and stays `False`**, and the reason MOVED rather than persisted: it is no longer "nothing for a cap to stop" but "nothing forwards one" — the channel is in `UNWIRED_CHANNELS` and `_collect_cmd` has no arm for it.
+Flip it in the same commit that adds that arm.
+
 ## The census cache — fetch once per (provider, bbox), reuse across channels (issue #290)
 
 **A completed checkpoint is PROMOTED into `census_cache/<provider>/<city_id>_<bbox>` rather than deleted, and every later consumer of that (provider, city, bbox) observation reads it for zero requests.**
@@ -362,15 +392,15 @@ The hazard is the one `city_timeout_seconds`' Anchorage comment already names, r
 Tier 2 (a first run) is geometry × 1.80×, and is under by ~4× on exactly those metros: Singapore's ~1,273 circles price at ~2,332 requests against the 9,974 actually spent.
 That is survivable in one direction only — #239's checkpoint means the resulting SIGKILL resumes tomorrow instead of discarding the night, bounded at five nights as above — and tier 1 corrects it from the second run onward.
 Note what none of this buys: a metro's honest timeout *exceeds* `max_batch_hours` outright, so the deadline clamp is what bounds it in a real night, and that is the intended outcome rather than a defect.
-**Both budget arms are now resumability-aware (#274), and neither applies to either KartaView channel.**
+**Both budget arms are now resumability-aware (#274), and since #318 neither applies to any of the FOUR channels that checkpoint** — both KartaView's and both Mapillary's.
 They exist because every other channel is all-or-nothing — a partial GSV grid, a partial tile census and a partial road walk are not runs, so refusing to start is the honest answer.
 A sweep is not all-or-nothing: it spends what tonight affords, checkpoints the unvisited roots and exits 83, and nothing is finalized or published until the lattice is complete, so the run is simply dated the day it completes.
 `_run_city_channels` therefore launches an enrolled sweep with `min(budget − used, what its timeout can pace)` as its cap whatever the estimate says, instead of skipping it — the cities the old `est > budget` arm skipped forever (Singapore ~9,974 requests, New York ~12,355) being precisely the ones #239's checkpoint was built for.
 `est` is deliberately not consulted on this branch, because `estimate_kartaview_requests` prices the WHOLE sweep even for a city resuming from a checkpoint (its observed tier reads a `runs` row, and a paused sweep never reaches `register_run`), so gating on it is the over-pricing the branch exists to stop.
 
-The one floor that remains is `_MIN_SWEEP_LAUNCH_REQUESTS`, it is read against the **final cap** rather than the budget remainder, and it is derived rather than chosen.
-A night exhausted during radius **calibration** raises a plain `DownloadError` — "nothing was swept and nothing is checkpointed" — not `SweepIncompleteError`, so it takes none of the exit-83 amnesty and counts a real `consecutive_failure`, and that is as true of a city whose clamped timeout is nearly spent as of one on an exhausted budget.
-The floor is the ladder's own documented bound (`len(RADIUS_LADDER_M) * (probes + retries)`, 30 at the defaults) plus one root cell's full attempt, read from those constants so retuning the ladder carries it along.
+The one floor that remains is `_crawl_pricing(channel).launch_floor`, it is read against the **final cap** rather than the budget remainder, and it is derived rather than chosen.
+For the sweep it is the ladder's own documented bound (`len(RADIUS_LADDER_M) * (probes + retries)`, 30 at the defaults) plus one root cell's full attempt, read from those constants so retuning the ladder carries it along: a night exhausted during radius **calibration** raises a plain `DownloadError` — "nothing was swept and nothing is checkpointed" — not `SweepIncompleteError`, so it takes none of the exit-83 amnesty and counts a real `consecutive_failure`, and that is as true of a city whose clamped timeout is nearly spent as of one on an exhausted budget.
+For a **tile census** it is `TILE_MAX_TRIES`, one tile's full retry budget, and it is a different number because it prevents a different failure: there is no ladder to clear, but a cap under that can be spent whole on a single transiently-404ing tile, commit nothing, and still cost a night and a day of the checkpoint's seven (#318).
 
 **The floor is applied only when the channel is actually going to crawl.**
 A walk whose census is already in the shared cache (#290) prices at 0 and never walks the ladder at all, so the ladder's cost cannot be a reason to defer it — and a nearly-spent budget is exactly the night the free pairing is worth most.
