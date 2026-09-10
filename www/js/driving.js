@@ -821,6 +821,13 @@ function planAreaRowModel(record, today = new Date()) {
     region,
     scope: "area",
     enabled: false,
+    // A plan area is a PLACE, not a city, so it has no channel membership —
+    // but the two row models must stay the same shape, because driving.html
+    // renders both through one set of columns and `planAreaRowModel: produces
+    // the same shape a city row does` pins exactly that. `trackedCellHtml`
+    // short-circuits on `scope !== "city"` before reading this, so the value
+    // is never displayed; its PRESENCE is the contract.
+    gsvExcluded: false,
     verdict: record.verdict ?? "not_listed",
     captureYears: null,
     captureSpanYears: null,
