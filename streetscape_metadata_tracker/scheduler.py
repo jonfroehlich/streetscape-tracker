@@ -95,6 +95,7 @@ from .download_mapillary import (
 from .download_panoramax import (
     DEFAULT_TILE_REQUESTS_PER_MINUTE as DEFAULT_PANORAMAX_REQUESTS_PER_MINUTE,
 )
+from .download_panoramax import TILE_MAX_TRIES as PANORAMAX_TILE_MAX_TRIES
 from .download_panoramax import estimate_tile_count as estimate_panoramax_tile_count
 from .json_summarizer import (
     generate_aggregate_v2,
@@ -1370,8 +1371,12 @@ _MIN_RADIUS_SWEEP_LAUNCH_REQUESTS = len(RADIUS_LADDER_M) * (
 # against, arriving by a different route.
 #
 # Read from the collector's constant rather than pinned at 5, for the same
-# reason the ladder is: retuning the retry budget has to carry the floor.
-_MIN_TILE_CENSUS_LAUNCH_REQUESTS = TILE_MAX_TRIES
+# reason the ladder is: retuning the retry budget has to carry the floor. Each
+# tile census reads ITS OWN -- they are both 5 today, so a single shared name
+# would be latent rather than wrong, which is exactly how it would survive
+# until one of them was retuned and the other's floor silently followed.
+_MIN_MAPILLARY_LAUNCH_REQUESTS = TILE_MAX_TRIES
+_MIN_PANORAMAX_LAUNCH_REQUESTS = PANORAMAX_TILE_MAX_TRIES
 
 
 @dataclass(frozen=True)
@@ -1422,7 +1427,7 @@ _CRAWL_PRICING: dict[str, _CrawlPricing] = {
     "mapillary": _CrawlPricing(
         DEFAULT_TILE_REQUESTS_PER_MINUTE,
         _TILE_ACHIEVED_RATE_FRACTION,
-        _MIN_TILE_CENSUS_LAUNCH_REQUESTS,
+        _MIN_MAPILLARY_LAUNCH_REQUESTS,
         "commit a single tile",
     ),
     # Priced although CHANNEL_RESUMABLE still says False, because the reason it
@@ -1432,7 +1437,7 @@ _CRAWL_PRICING: dict[str, _CrawlPricing] = {
     "panoramax": _CrawlPricing(
         DEFAULT_PANORAMAX_REQUESTS_PER_MINUTE,
         _TILE_ACHIEVED_RATE_FRACTION,
-        _MIN_TILE_CENSUS_LAUNCH_REQUESTS,
+        _MIN_PANORAMAX_LAUNCH_REQUESTS,
         "commit a single tile",
     ),
 }
@@ -1805,6 +1810,20 @@ def city_timeout_seconds(
     # is 575. The derivation stays because a grid can be re-registered larger at
     # any time, and a SIGKILL costs the requests already spent AND counts a
     # failure — the guard must not depend on today's geometry staying capped.
+    #
+    # TWO OF THOSE FIGURES ARE CONTRADICTED BY THE DEV CATALOG (noted 2026-09-10,
+    # #318, unresolved). `data/streetscape_tracker.db` in a repo checkout puts
+    # Anchorage at 105,588 x 83,676 m -> ~6,480 tiles (NOT 575) and makes it the
+    # largest frozen grid by 4.9x, with Los Angeles second at 1,326 and four
+    # cities over 870 — so "the largest is 870 (Moscow)" does not hold there
+    # either. That catalog carries 1,144 enabled cities and three Mapillary runs
+    # against production's ~1,132, so it is a development copy and the likeliest
+    # reading is that it predates a resize applied only on production. Left as
+    # written rather than "corrected", because the numbers above may well be the
+    # production truth and this is not the machine that can say. Resolving it is
+    # one query on prod; docs/provider-access.md records why it matters (an
+    # uncapped Anchorage is permanently skipped by the Mapillary budget arm,
+    # recording no failure and reaching no alert).
     if provider not in (
         "gsv",
         "gsv_streets",
@@ -4122,6 +4141,34 @@ def cmd_assess_city(
     return 1
 
 
+def _request_cap_args(flag: str, request_cap: int | None) -> list[str]:
+    """The ``--*-max-requests`` argv for a resumable child, or nothing.
+
+    ONE helper rather than the same two lines at four launch sites, because the
+    condition is not the obvious one and got written wrong at all four.
+
+    ``None`` means no cap -- crawl to completion -- and is what every manual run
+    and every non-resumable channel gets. **A cap BELOW 1 also means no flag**,
+    and that is the part a plain ``is not None`` misses: the child's
+    ``positive_int`` refuses ``0`` at parse time (deliberately -- a cap of 0
+    stops a crawl before it commits anything and then tells the operator to
+    re-run), so emitting it turns the launch into an argparse **exit 2**, which
+    is a real ``consecutive_failure`` rather than the budget deferral it looks
+    like.
+
+    A cap of 0 reaches here on exactly one path, and it is a path that was
+    working before: ``_sweep_launch_plan``'s floor arm is gated on ``est > 0``,
+    and ``est == 0`` is the CACHED-census case (#290). So a night whose budget is
+    exactly spent, launching a walk whose census its grid sibling already paid
+    for, produces ``remaining == 0`` on a channel that is about to spend nothing
+    at all. Omitting the flag is right there for the same reason the floor is
+    not applied: nothing is going to be crawled, so there is nothing to cap --
+    and refusing the launch instead would skip the one collection of the night
+    that is free, which is what #274's review already fixed once.
+    """
+    return [] if request_cap is None or request_cap < 1 else [flag, str(request_cap)]
+
+
 def _street_collect_cmd(
     cfg: SchedulerConfig,
     city: db.CityRow,
@@ -4214,8 +4261,7 @@ def _street_collect_cmd(
         # --daily-budget is the FULL ceiling because this collector subtracts
         # today's spend itself; the cap arrives already subtracted, because
         # nothing in the child can compute it.
-        if request_cap is not None:
-            cmd += ["--mapillary-max-requests", str(request_cap)]
+        cmd += _request_cap_args("--mapillary-max-requests", request_cap)
     elif channel == "kartaview_streets":
         # The child MUST be told the pace this channel's timeout was derived
         # from. _kartaview_timeout_seconds divides the sweep estimate by the
@@ -4241,8 +4287,7 @@ def _street_collect_cmd(
         # subtraction conventions. --daily-budget is the FULL ceiling because
         # this collector subtracts today's spend itself; the cap arrives already
         # subtracted, because nothing in the child can compute it.
-        if request_cap is not None:
-            cmd += ["--kartaview-max-requests", str(request_cap)]
+        cmd += _request_cap_args("--kartaview-max-requests", request_cap)
     # '--' so a display name can never be parsed as a flag
     cmd += ["--", city.display_name]
     return cmd
@@ -4485,8 +4530,7 @@ def _run_one_city(
         # Same unset-means-omit rule as the pacing flags above, and the value is
         # never < 1: the CLI's positive_int refuses 0 at parse time, and the
         # caller's launch floor is what keeps this side of that.
-        if request_cap is not None:
-            cmd += ["--mapillary-max-requests", str(request_cap)]
+        cmd += _request_cap_args("--mapillary-max-requests", request_cap)
     if provider == "kartaview":
         # Same reason as Mapillary's flag above, plus one specific to this
         # channel: the timeout is DERIVED from the configured rate (#238), so a
@@ -4505,12 +4549,11 @@ def _run_one_city(
         # IP. Exhausting this checkpoints the rest and exits 83 instead, which
         # _run_city_channels amnesties -- so the overrun became a pause.
         #
-        # Same unset-means-omit rule as the rate above, and the value is never
-        # < 1: the CLI's _positive_int refuses 0 at parse time (it used to be
-        # accepted, spend the whole calibration ladder and checkpoint nothing),
-        # and the caller's floor is what keeps this side of that.
-        if request_cap is not None:
-            cmd += ["--kartaview-max-requests", str(request_cap)]
+        # Same unset-means-omit rule as the rate above. A cap below 1 is
+        # omitted too, and NOT because the launch floor covers it -- that arm is
+        # gated on `est > 0`, so a cached census slips past it with a spent
+        # budget. See _request_cap_args.
+        cmd += _request_cap_args("--kartaview-max-requests", request_cap)
     # '--' so a display name can never be parsed as a flag
     cmd += ["--", city.display_name]
     # `conn` on both fallbacks, matching the street arm above (#238). It was

@@ -1776,3 +1776,47 @@ def test_a_capped_census_is_never_promoted_into_the_shared_cache(
 
     assert not os.path.exists(cache_path)
     assert load_census_cache_marker(cache_path) is None
+
+
+def test_a_cap_that_commits_no_tile_is_a_failure_not_a_pause(monkeypatch, tmp_path):
+    """A live, healthy, EMPTY checkpoint is the third way to have nothing to resume.
+
+    `_commit_spend` returns early on an empty `done`, deliberately, so a crawl
+    that commits no tile writes no state.json at all -- the directory is there
+    and holds nothing. Guarding only `None or degraded` called that a pause:
+    "progress is checkpointed at ..., re-run to continue" over an empty
+    directory, exit 83, amnestied, and the next night starts from tile 0 and
+    does the same, forever, with no failure counted and nothing an alert sees.
+
+    Reached the way production would reach it: a cap near the launch floor whose
+    tiles all fail transiently (#168 tolerates per-tile failures rather than
+    aborting, so `fatal` never trips and the cap is what stops the crawl).
+    """
+    lat, lon = SEATTLE
+    bbox = dm.grid_bbox(lat, lon, 4000, 4000, 20)
+    tiles = dm.tiles_for_bbox(*bbox)
+    checkpoint = str(tmp_path / "cp")
+    # Every tile 404s, which is a per-tile failure rather than a whole-city one.
+    _serve(monkeypatch, {}, failing=set(tiles))
+
+    with pytest.raises(dm.DownloadError) as excinfo:
+        asyncio.run(
+            dm.fetch_city_images_async(
+                "Test City",
+                bbox,
+                "MLY|test|token",
+                connection_limit=1,
+                max_requests=1,
+                checkpoint_path=checkpoint,
+                checkpoint_channel="mapillary",
+            )
+        )
+
+    assert not isinstance(excinfo.value, SweepIncompleteError), (
+        "a pause promises a resume; there is nothing here to resume from"
+    )
+    assert "nothing can be resumed" in str(excinfo.value).lower()
+    # The directory holds no commit record, which is the fact the guard reads.
+    assert not os.path.exists(os.path.join(checkpoint, CHECKPOINT_STATE_FILENAME))
+    # And the spend still reaches the caller, because the requests happened.
+    assert excinfo.value.api_requests >= 1

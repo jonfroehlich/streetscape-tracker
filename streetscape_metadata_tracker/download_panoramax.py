@@ -1459,19 +1459,32 @@ async def _fetch_city_images(
             f"{api_requests} requests spent this process, "
             f"{_census_requests_total(checkpoint, api_requests)} in total."
         )
-        if checkpoint is None or checkpoint.degraded:
-            # NOT a pause, because there is nothing to resume FROM: no
-            # checkpoint at all (an unwritable directory --
-            # `_open_tile_checkpoint` fails open), or one whose commits latched
-            # off mid-crawl. A plain DownloadError takes none of the exit-83
-            # amnesty and counts a real failure, which is the honest answer:
-            # calling this progress would tell an operator to re-run a command
-            # that spends the same requests and stops in the same place,
-            # forever. The caller is refused a cap without a checkpoint PATH at
-            # all (see the guard above); this is the runtime half of the same
-            # rule, and it is why that guard is not enough on its own.
+        if checkpoint is None or checkpoint.degraded or not checkpoint.done:
+            # NOT a pause, because there is nothing to resume FROM, in any of
+            # THREE ways. No checkpoint at all (an unwritable directory --
+            # `_open_tile_checkpoint` fails open); one whose commits latched off
+            # mid-crawl; or one that is live and healthy and has committed
+            # NOTHING.
+            #
+            # That third one is the subtle member and it is not hypothetical:
+            # `_commit_spend` returns early on an empty `done`, deliberately, so
+            # a crawl that commits no tile writes no `state.json` at all. A cap
+            # near the launch floor whose in-flight tiles all fail transiently
+            # -- a 404 storm, a partial block -- reaches exactly that state, and
+            # calling it a pause would raise "progress is checkpointed at ...,
+            # re-run to continue" over an empty directory. Exit 83 is amnestied,
+            # so the next night starts from tile 0 and does the same, forever,
+            # with no failure counted and nothing for an alert to see.
+            #
+            # A plain DownloadError takes none of the exit-83 amnesty and counts
+            # a real failure, which is the honest answer: calling this progress
+            # would tell an operator to re-run a command that spends the same
+            # requests and stops in the same place. The caller is refused a cap
+            # without a checkpoint PATH at all (see the guard above); these are
+            # the runtime halves of the same rule, and they are why that guard
+            # is not enough on its own.
             raise interrupted(
-                DownloadError(f"{detail} Nothing is checkpointed, so nothing can be resumed.")
+                DownloadError(f"{detail} No tile is checkpointed, so nothing can be resumed.")
             )
         raise interrupted(
             SweepIncompleteError(

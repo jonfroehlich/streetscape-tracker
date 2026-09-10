@@ -10031,3 +10031,58 @@ def test_the_tail_survives_a_broken_cache_directory(conn, monkeypatch, tmp_path)
     assert sched._finish_batch(
         cfg, conn, "summary", succeeded=1, attempted=1, today=date(2026, 7, 2)
     ) in (0, 1)
+
+
+def test_a_free_cached_walk_on_a_spent_budget_is_launched_without_a_cap(conn):
+    """A cap of 0 must never reach a child, and `is not None` let it.
+
+    The child's positive_int refuses 0 at parse time -- correctly, since a cap
+    of 0 stops a crawl before it commits anything and then tells the operator to
+    re-run -- so emitting it turns the launch into argparse exit 2, a real
+    consecutive_failure rather than the budget deferral it resembles.
+
+    The path is not exotic and it WORKED before this feature: the launch floor
+    is gated on `est > 0`, and `est == 0` is the cached-census case (#290). So a
+    night whose budget is exactly spent, launching a walk whose census its grid
+    sibling already paid for, reaches a launch with `remaining == 0` on a
+    channel about to spend nothing. #274's review already established that this
+    walk must launch -- it is the one free collection of the night -- so the
+    flag is omitted rather than the launch refused.
+
+    Asserted on all four (channel, flag) pairs, since the same two lines were
+    written at four sites and the bug was at all of them.
+    """
+    from streetscape_metadata_tracker.scheduler import _request_cap_args, _street_collect_cmd
+
+    cid = _register(conn, "Bend", width=1000, height=1000, step=20)
+    city = db.resolve_city(conn, cid)
+    today = date(2026, 7, 1)
+
+    for channel, flag in (
+        ("mapillary_streets", "--mapillary-max-requests"),
+        ("kartaview_streets", "--kartaview-max-requests"),
+    ):
+        for cap in (0, -1):
+            cmd = _street_collect_cmd(_sweep_cfg(), city, today, channel, 8, 9_000, cap)
+            assert flag not in cmd, f"{channel} got {flag} {cap}, which argparse refuses"
+
+    # The grid builders reach the same helper; asserted there rather than
+    # through a subprocess capture, since what is under test is the condition
+    # and all four sites now share exactly one copy of it.
+    for flag in ("--mapillary-max-requests", "--kartaview-max-requests"):
+        assert _request_cap_args(flag, 0) == []
+        assert _request_cap_args(flag, -1) == []
+        assert _request_cap_args(flag, None) == []
+        # ...and a real cap still travels, so the guard cannot be "omit always".
+        assert _request_cap_args(flag, 1) == [flag, "1"]
+
+
+def test_each_tile_census_prices_its_launch_floor_from_its_own_retry_budget(conn):
+    """Both are 5 today, which is what makes a shared constant latent rather
+    than wrong -- and exactly how it would survive until one provider's retry
+    budget was retuned and the other's floor silently followed it."""
+    from streetscape_metadata_tracker import download_mapillary, download_panoramax
+    from streetscape_metadata_tracker.scheduler import _crawl_pricing
+
+    assert _crawl_pricing("mapillary").launch_floor == download_mapillary.TILE_MAX_TRIES
+    assert _crawl_pricing("panoramax").launch_floor == download_panoramax.TILE_MAX_TRIES

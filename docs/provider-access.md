@@ -161,9 +161,14 @@ Since the 2026-09-05 re-size the grid channel's 3,500 reaches ~60 cities and ~20
 ~~No city has ever been skipped as over-budget in either regime (largest grid 870).~~
 **Wrong, and wrong in the way this file already warns about elsewhere (corrected 2026-09-10, #318).**
 870 is the largest grid *that has a run*, and the daily-budget section above says why that population cannot answer this question: "the gate skips exactly the expensive cities", so reading the observed maximum to decide whether the gate ever fired is circular.
-Priced from **geometry** over the enabled catalog instead, exactly one city clears the whole daily budget in either regime: **Anchorage**, ~6,480 z14 tiles on a 105.6 x 83.7 km frozen grid (an oversized one the #166 cap never reached).
-Its signature is the one this arm produces and nothing else does — zero Mapillary runs, `last_success_at` NULL, and `consecutive_failures` **0**, because a permanent skip records no failure — so it was invisible to the nightly alert and to the five-night backstop alike, every night, since the channel began.
-#318 ends that: it now launches capped at whatever the night's remainder affords and finishes across nights, which is what a `--dry-run` preview reports as `launch capped at N; resumes`.
+Priced from **geometry** instead, exactly one city clears the whole daily budget in either regime: **Anchorage**, ~6,480 z14 tiles on a 105,588 x 83,676 m frozen grid.
+Its catalog signature is the one this arm produces and nothing else does — zero Mapillary runs, `last_success_at` NULL, and `consecutive_failures` **0**, because a permanent skip records no failure — so nothing it did was visible to the nightly alert or to the five-night backstop.
+
+**MEASURED ON THE DEV CATALOG IN THE REPO CHECKOUT, NOT ON PRODUCTION, and the two may disagree here specifically.**
+That catalog holds 1,144 enabled cities and **three** Mapillary runs against production's ~1,132, so it is a development copy rather than a mirror — and `scheduler.py`'s `city_timeout_seconds` comment states that #166's grid caps took Anchorage to **575** tiles, which would put it under any of these budgets.
+Frozen geometry does not drift on its own, so the most likely reading is that the dev copy predates a resize that `cap_oversized_grids.py` applied on production only.
+**What is certain either way** is the mechanism — a permanent skip records nothing, so a city in this state is invisible for as long as it lasts — and that #318 removes the arm regardless: an over-budget city is now launched capped at whatever the night's remainder affords and finishes across nights, which a `--dry-run` preview reports as `launch capped at N; resumes`.
+**What is worth one query on production** is which of the two Anchorage rows is live there; if it is the uncapped one, this city has collected no Mapillary imagery since the channel began.
 **(3) If a block ever arrives under this cap**, that is strong evidence for the repeat-offender reading over the fixed window
 — capture the day's `api_usage` row, the elapsed hours from the `run-due` summary line (the `[alerts]` email carries it; nothing else records time-under-load), AND the trailing 3 days' ledger before changing anything.
 
