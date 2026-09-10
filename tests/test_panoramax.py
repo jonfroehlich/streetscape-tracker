@@ -532,7 +532,7 @@ def test_a_5xx_is_retried_and_every_attempt_is_paced_and_counted():
     session = _FakeTileSession(_FakeTileResponse(503))
     with pytest.raises(aiohttp.ClientResponseError):
         _fetch(session, rate_limiter=limiter, on_request=lambda: counted.append(1))
-    assert session.calls == dp._TILE_MAX_TRIES
+    assert session.calls == dp.TILE_MAX_TRIES
     assert len(counted) == session.calls == limiter.acquired
 
 

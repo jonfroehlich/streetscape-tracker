@@ -127,6 +127,7 @@ from .checkpointing import (
 )
 from .checkpointing import (
     KARTAVIEW_CHECKPOINT_FORMAT_VERSION,
+    SWEEP_UNIT_ROOT_CELLS,
     CacheEntryUnusableHere,
     CensusCache,
     _write_json_durable,
@@ -164,6 +165,7 @@ from .download_common import (
     AsyncRateLimiter,
     DownloadError,
     HostBlockedError,
+    SweepIncompleteError,
     grid_bbox,
     redact_credentials,
 )
@@ -971,42 +973,6 @@ class CredentialRejectedError(ResponseError):
     Still a ResponseError and still NOT host-typed, per the class above: the
     token is scoped to the CHANNEL, so a sibling channel's cities keep running.
     """
-
-
-class SweepIncompleteError(DownloadError):
-    """
-    The sweep stopped with root cells unvisited, and CHECKPOINTED them (#239).
-
-    Nothing is finalized -- a partial census must never be published as a dated
-    snapshot, because an immutable dated file holding 60% of a city diffs
-    against its predecessor as "every pano in the rest of the city removed".
-    What is different from every other failure here is that the spend survives:
-    the answered cells are on disk and the next attempt resumes from them.
-
-    Deliberately NOT a ``HostUnavailableError``, and the distinction is not
-    academic. ``host_exit_code`` maps those to 81 for KartaView, which the
-    scheduler turns into a night-level breaker skipping every remaining
-    KartaView city -- correct for a refusal, which is a property of the machine,
-    and wrong for this, which is a property of THIS city's budget. The next
-    city's sweep is unaffected and should run.
-
-    This is why ``download_gsv_history``'s ``HarvestIncompleteError``, which
-    subclasses its blocked error, is the wrong precedent to copy: that harvester
-    is a manual script the scheduler never runs, so nothing reads its type as a
-    host verdict.
-
-    Carries ``api_requests`` (this process's spend, for the ledger) and
-    ``api_requests_total`` (the whole sweep's, for the operator), attached by
-    the caller's ``spent`` helper.
-    """
-
-    def __init__(
-        self, message: str, *, checkpoint_path: str, roots_done: int, root_count: int
-    ) -> None:
-        super().__init__(message)
-        self.checkpoint_path = checkpoint_path
-        self.roots_done = roots_done
-        self.root_count = root_count
 
 
 async def _post_nearby(
@@ -2952,8 +2918,12 @@ async def _fetch_city_images(
                 f"{cp.path}; re-running with the same checkpoint path continues it. Nothing "
                 f"is finalized: a partial census must never be published as a dated snapshot.",
                 checkpoint_path=cp.path,
-                roots_done=roots_done,
-                root_count=len(roots),
+                units_done=roots_done,
+                unit_count=len(roots),
+                # The provider names its own unit, so a pause line reads in the
+                # vocabulary of the crawl that produced it rather than in
+                # whichever provider happened to raise this first (#318).
+                unit_name=SWEEP_UNIT_ROOT_CELLS,
             )
         )
 

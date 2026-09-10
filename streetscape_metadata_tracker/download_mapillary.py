@@ -438,7 +438,14 @@ MAX_FAILED_TILE_FRACTION = 0.02
 # later (observed on Chicago, 2026-07-29: z14/4196/6084 404'd through every
 # retry, then returned 2.1M features the next day). Three tries inside a
 # 60-second window was too thin a budget for that.
-_TILE_MAX_TRIES = 5
+#
+# PUBLIC because the scheduler prices its launch floor from it (#318):
+# a request cap that cannot fund ONE tile's worst-case attempt buys no
+# committed progress, and spends a night plus a checkpoint-age day to
+# record none. Read there rather than pinned at 5, so retuning the retry
+# budget carries the floor with it -- the same rule KartaView's radius
+# ladder already follows.
+TILE_MAX_TRIES = 5
 _TILE_MAX_TIME_S = 120
 
 # Client-side pacing for the tile CDN (issue #198). This bounds a limit
@@ -498,7 +505,7 @@ _TILE_ERROR_CONTENT_TYPES = ("text/html", "application/json")
 @backoff.on_exception(
     backoff.expo,
     (asyncio.TimeoutError, aiohttp.ClientError),
-    max_tries=_TILE_MAX_TRIES,
+    max_tries=TILE_MAX_TRIES,
     max_time=_TILE_MAX_TIME_S,
 )
 async def _fetch_tile(
@@ -509,7 +516,7 @@ async def _fetch_tile(
     on_request: Callable[[], None] | None = None,
 ) -> bytes:
     # Pacing and counting sit INSIDE the retried body on purpose (issue #198).
-    # This function may issue up to _TILE_MAX_TRIES requests; taking one token
+    # This function may issue up to TILE_MAX_TRIES requests; taking one token
     # in the caller would let a retrying tile present up to five times the
     # configured rate — during a 429/5xx storm, i.e. exactly when the CDN is
     # least willing to absorb it — and would under-report the same factor to

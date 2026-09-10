@@ -440,7 +440,12 @@ def build_empty_rows(query_lat, query_lon, query_timestamp: str, status) -> pd.D
 # count requests.
 MAX_FAILED_TILE_FRACTION = 0.02
 
-_TILE_MAX_TRIES = 5
+# PUBLIC for the same reason Mapillary's is (#318): one tile's worst-case
+# attempt is what a request cap has to be able to fund before launching is worth
+# anything. Nothing prices a Panoramax launch floor yet -- the channel is in
+# UNWIRED_CHANNELS -- but the constant is exported now so wiring it does not have
+# to rediscover which number the floor comes from.
+TILE_MAX_TRIES = 5
 _TILE_MAX_TIME_S = 120
 
 # Client-side pacing. NOTHING IS DOCUMENTED — no limit in the API docs, none in
@@ -479,7 +484,7 @@ _TILE_ERROR_CONTENT_TYPES = ("text/html", "application/json")
 @backoff.on_exception(
     backoff.expo,
     (asyncio.TimeoutError, aiohttp.ClientError),
-    max_tries=_TILE_MAX_TRIES,
+    max_tries=TILE_MAX_TRIES,
     max_time=_TILE_MAX_TIME_S,
 )
 async def _fetch_tile(
@@ -491,7 +496,7 @@ async def _fetch_tile(
     on_empty: Callable[[], None] | None = None,
 ) -> bytes:
     # Pacing and counting sit INSIDE the retried body (issue #198): this
-    # function may issue up to _TILE_MAX_TRIES requests, and taking one token in
+    # function may issue up to TILE_MAX_TRIES requests, and taking one token in
     # the caller would let a retrying tile present five times the configured
     # rate — during a 5xx storm, i.e. when the host is least able to absorb it —
     # while under-reporting the same factor to the ledger.

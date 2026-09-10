@@ -89,6 +89,7 @@ from .download_kartaview import (
 from .download_mapillary import (
     DEFAULT_TILE_JITTER,
     DEFAULT_TILE_REQUESTS_PER_MINUTE,
+    TILE_MAX_TRIES,
     estimate_tile_count,
 )
 from .download_panoramax import estimate_tile_count as estimate_panoramax_tile_count
@@ -1333,9 +1334,51 @@ _SWEEP_OVERHEAD_MULTIPLIER = 1.80
 # carries this with it. The extra retries + 1 is one root cell's full attempt on
 # top: clearing calibration with nothing left to sweep is a legal pause, but it
 # spends a night and a checkpoint-age day to record zero progress.
-_MIN_SWEEP_LAUNCH_REQUESTS = len(RADIUS_LADDER_M) * (
+_MIN_RADIUS_SWEEP_LAUNCH_REQUESTS = len(RADIUS_LADDER_M) * (
     DEFAULT_CALIBRATION_PROBES + DEFAULT_BACKPRESSURE_RETRIES
 ) + (DEFAULT_BACKPRESSURE_RETRIES + 1)
+
+# The same floor for a TILE census, and it is a different number because the
+# failure it prevents is a different failure (issue #318).
+#
+# A tile census has no calibration ladder -- there is no radius to find, the
+# lattice is `tiles_for_bbox` and it is known before the first request -- so the
+# expensive prologue the constant above exists to fund does not exist here, and
+# a cap of 1 would fund a real, committed, durable tile. What it would NOT fund
+# is that tile's RETRIES: `_fetch_tile` may spend up to TILE_MAX_TRIES requests
+# on one tile against a CDN that 404s transiently (the Chicago tile that failed
+# every retry and served 2.1M features the next day). A cap under that can
+# therefore spend its whole self on one tile, commit nothing, and still cost a
+# night and a day of the checkpoint's seven -- which is exactly the "clearing
+# calibration with nothing left to sweep" case the `+1` above is written
+# against, arriving by a different route.
+#
+# Read from the collector's constant rather than pinned at 5, for the same
+# reason the ladder is: retuning the retry budget has to carry the floor.
+_MIN_TILE_CENSUS_LAUNCH_REQUESTS = TILE_MAX_TRIES
+
+# Which floor a channel gets, and what to call the work it buys. Keyed on the
+# PROVIDER behind the channel via STREET_CHANNELS -- the table that already maps
+# every walk to the provider whose census it reads -- rather than on a fourth
+# per-channel table that would have to be edited beside CHANNEL_RESUMABLE,
+# CHANNEL_HOSTS and CHANNEL_DEFAULT_MEMBERSHIP, and whose forgotten row would
+# fail open.
+#
+# A KeyError for an unknown provider is the point, exactly as in
+# CHANNEL_RESUMABLE: this is only ever asked about a channel that already
+# answered True there, and a resumable channel whose floor nobody has thought
+# about must stop the build rather than inherit somebody else's number.
+_LAUNCH_FLOOR: dict[str, tuple[int, str]] = {
+    "kartaview": (_MIN_RADIUS_SWEEP_LAUNCH_REQUESTS, "clear radius calibration"),
+    "mapillary": (_MIN_TILE_CENSUS_LAUNCH_REQUESTS, "commit a single tile"),
+    "panoramax": (_MIN_TILE_CENSUS_LAUNCH_REQUESTS, "commit a single tile"),
+}
+
+
+def _launch_floor(channel: str) -> tuple[int, str]:
+    """Smallest cap worth launching this resumable channel with, and what it buys."""
+    return _LAUNCH_FLOOR[STREET_CHANNELS.get(channel, channel)]
+
 
 # Floor for a deadline-clamped timeout. A city is only started while the batch
 # deadline still has room, so the clamp should shorten a run — never hand a
@@ -1919,43 +1962,55 @@ def _sweep_launch_plan(
     progress = _sweep_checkpoint_progress(cfg, city, channel)
     age_s = None if progress is None else progress["age_s"]
     if age_s is not None and age_s >= CHECKPOINT_MAX_AGE_S - _CHECKPOINT_AGE_WALL_MARGIN_S:
-        roots_done, root_count = progress["roots_done"], progress["root_count"]
+        done, total = progress["units_done"], progress["unit_count"]
+        units = progress["unit_name"]
         # What is LEFT, priced by the share of the lattice still unvisited.
         # Root cells are not uniform, and `est` is a floor rather than a budget
         # (a Yogyakarta sweep ran 3.0x its geometry estimate), so this is a
         # lower bound on the remaining cost -- which is the safe direction for
         # the question being asked: "could tonight plausibly finish it?" A
-        # nonsense root_count cannot be projected from at all, so it prices the
-        # whole sweep, and a checkpoint that has answered every root is already
+        # nonsense unit count cannot be projected from at all, so it prices the
+        # whole crawl, and a checkpoint that has answered every unit is already
         # finished and only needs its finalize.
-        projected = (
-            est if root_count <= 0 else int(est * max(0, root_count - roots_done) / root_count)
-        )
+        #
+        # A tile census divides more honestly than a radius sweep does: its
+        # tiles ARE uniform and its `est` is the exact tile count rather than a
+        # geometric floor, so for the two Mapillary channels this projection is
+        # the real remaining cost and not a lower bound on it (#318). The
+        # arithmetic is unchanged either way -- what differs is only how much
+        # slack the answer carries.
+        projected = est if total <= 0 else int(est * max(0, total - done) / total)
         if projected > request_cap:
             return plan(
                 _SWEEP_SKIP_AGE_WALL,
                 f"refusing to resume — its checkpoint is {age_s / 86400:.1f} days old "
                 f"(discarded past {CHECKPOINT_MAX_AGE_S / 86400:.0f}) at "
-                f"{roots_done}/{root_count} root cells, and the ~{projected:,} requests "
+                f"{done}/{total} {units}, and the ~{projected:,} requests "
                 f"left will not fit tonight's {request_cap:,} ({clock_note}). Another night "
                 f"would be thrown away with the checkpoint. RECORDED AS A FAILURE so this "
                 f"is alerted rather than re-swept from zero every week: raise "
                 f"[providers.{channel}].daily_request_budget, shrink the city's grid, or "
-                f"delete the checkpoint to start the sweep over deliberately.",
-                f"REFUSED (checkpoint {age_s / 86400:.1f} d old, {roots_done}/{root_count})",
+                f"delete the checkpoint to start the crawl over deliberately.",
+                f"REFUSED (checkpoint {age_s / 86400:.1f} d old, {done}/{total})",
             )
 
-    if est > 0 and request_cap < _MIN_SWEEP_LAUNCH_REQUESTS:
+    floor, floor_buys = _launch_floor(channel)
+    if est > 0 and request_cap < floor:
         binding = (
             "requests left in today's budget"
             if request_cap == remaining
             else f"requests its {timeout_s // 60:,}-minute timeout affords"
         )
+        # The floor is per-provider and so is the reason for it: a radius sweep
+        # has to clear its calibration ladder before it can checkpoint anything,
+        # a tile census has to be able to fund one tile's retries before it can
+        # commit one. Naming which is which keeps the line true of the channel
+        # it is about (#318).
         return plan(
             _SWEEP_SKIP_FLOOR,
-            f"{request_cap:,} {binding} is under the {_MIN_SWEEP_LAUNCH_REQUESTS} needed to "
-            f"clear radius calibration; skipping (resumes tomorrow).",
-            f"deferred ({request_cap:,} req under the calibration floor)",
+            f"{request_cap:,} {binding} is under the {floor} needed to {floor_buys}; "
+            f"skipping (resumes tomorrow).",
+            f"deferred ({request_cap:,} req under the launch floor)",
         )
 
     if est > request_cap:
@@ -5437,8 +5492,12 @@ def _log_channel_error(city_id: str, provider: str, exc: BaseException) -> None:
 
 def _sweep_progress_note(progress: dict | None) -> str:
     """
-    " 3/8 root cells." for a paused sweep; empty when nothing readable is on
-    disk. Takes the dict :func:`_sweep_checkpoint_progress` returns, because the
+    " 3/8 root cells." (or " 12/104 tiles.") for a paused crawl; empty when
+    nothing readable is on disk. The unit comes from the state record rather
+    than from this line, because the two store shapes count different things
+    and a hardcoded noun here would mislabel every tile census (#318).
+
+    Takes the dict :func:`_sweep_checkpoint_progress` returns, because the
     caller needs it for the age-wall warning too and reading the state file
     twice is how two reports of one pause come to disagree.
 
@@ -5456,7 +5515,7 @@ def _sweep_progress_note(progress: dict | None) -> str:
     """
     if progress is None:
         return ""
-    return f" {progress['roots_done']}/{progress['root_count']} root cells."
+    return f" {progress['units_done']}/{progress['unit_count']} {progress['unit_name']}."
 
 
 def _warn_if_checkpoint_near_the_age_wall(

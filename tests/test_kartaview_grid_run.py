@@ -352,7 +352,11 @@ def test_an_incomplete_sweep_propagates_and_publishes_nothing(monkeypatch, tmp_p
 
     async def fake_fetch(city_name, bbox, access_token, **kw):
         raise kv.SweepIncompleteError(
-            "out of budget", checkpoint_path="/cp", roots_done=3, root_count=10
+            "out of budget",
+            checkpoint_path="/cp",
+            units_done=3,
+            unit_count=10,
+            unit_name="root cells",
         )
 
     monkeypatch.setattr(kv, "fetch_city_images_async", fake_fetch)
@@ -371,7 +375,7 @@ def test_an_incomplete_sweep_propagates_and_publishes_nothing(monkeypatch, tmp_p
                 checkpoint_path="/cp",
             )
         )
-    assert excinfo.value.roots_done == 3
+    assert excinfo.value.units_done == 3
     assert discarded == []
     assert not os.path.exists(path)
 

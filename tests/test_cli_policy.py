@@ -648,7 +648,9 @@ def test_an_incomplete_sweep_exits_83_and_publishes_nothing(monkeypatch, catalog
     """
     conn, city_id, data_dir = catalog
     kartaview_configs(monkeypatch)
-    error = SweepIncompleteError("budget", checkpoint_path="/cp", roots_done=2, root_count=16)
+    error = SweepIncompleteError(
+        "budget", checkpoint_path="/cp", units_done=2, unit_count=16, unit_name="root cells"
+    )
     error.api_requests = 4
 
     async def stub(**kwargs):
@@ -689,7 +691,9 @@ def test_a_paused_sweep_alongside_a_real_failure_exits_1_not_83(monkeypatch, cat
 
     async def one_pauses_one_breaks(conn_, args, city_row, run_date, provider, config, vis_path):
         if provider == "mapillary":
-            raise SweepIncompleteError("budget", checkpoint_path="/cp", roots_done=2, root_count=16)
+            raise SweepIncompleteError(
+                "budget", checkpoint_path="/cp", units_done=2, unit_count=16, unit_name="root cells"
+            )
         raise DownloadError("genuinely broken")
 
     monkeypatch.setattr(cli, "_collect_one_run", one_pauses_one_breaks)
@@ -698,7 +702,9 @@ def test_a_paused_sweep_alongside_a_real_failure_exits_1_not_83(monkeypatch, cat
     # ...and with the pause as the ONLY thing that went wrong, the same code
     # path reports it as progress.
     async def only_pauses(conn_, args, city_row, run_date, provider, config, vis_path):
-        raise SweepIncompleteError("budget", checkpoint_path="/cp", roots_done=2, root_count=16)
+        raise SweepIncompleteError(
+            "budget", checkpoint_path="/cp", units_done=2, unit_count=16, unit_name="root cells"
+        )
 
     monkeypatch.setattr(cli, "_collect_one_run", only_pauses)
     assert (
@@ -718,7 +724,9 @@ def test_a_paused_sweep_prints_paused_not_failed(monkeypatch, catalog, capsys):
     """
     conn, city_id, data_dir = catalog
     kartaview_configs(monkeypatch)
-    error = SweepIncompleteError("budget", checkpoint_path="/cp", roots_done=2, root_count=16)
+    error = SweepIncompleteError(
+        "budget", checkpoint_path="/cp", units_done=2, unit_count=16, unit_name="root cells"
+    )
 
     async def stub(**kwargs):
         raise error

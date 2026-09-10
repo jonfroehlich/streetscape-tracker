@@ -7026,9 +7026,9 @@ def test_a_remainder_under_the_calibration_floor_is_still_skipped(
     consecutive_failure. Launching under the floor would burn a failure to
     accomplish nothing, on the very metros this change exists to collect.
     """
-    from streetscape_metadata_tracker.scheduler import _MIN_SWEEP_LAUNCH_REQUESTS
+    from streetscape_metadata_tracker.scheduler import _MIN_RADIUS_SWEEP_LAUNCH_REQUESTS
 
-    budget = _MIN_SWEEP_LAUNCH_REQUESTS + delta
+    budget = _MIN_RADIUS_SWEEP_LAUNCH_REQUESTS + delta
     cid = _register(conn, "Metro", width=20_000, height=20_000, step=20)
     _enroll_kartaview(conn, cid)
     cfg = _sweep_cfg(publish_enabled=False)
@@ -7065,10 +7065,10 @@ def test_the_launch_floor_clears_the_radius_calibration_ladder():
         DEFAULT_CALIBRATION_PROBES,
         RADIUS_LADDER_M,
     )
-    from streetscape_metadata_tracker.scheduler import _MIN_SWEEP_LAUNCH_REQUESTS
+    from streetscape_metadata_tracker.scheduler import _MIN_RADIUS_SWEEP_LAUNCH_REQUESTS
 
     ladder = len(RADIUS_LADDER_M) * (DEFAULT_CALIBRATION_PROBES + DEFAULT_BACKPRESSURE_RETRIES)
-    assert _MIN_SWEEP_LAUNCH_REQUESTS > ladder
+    assert _MIN_RADIUS_SWEEP_LAUNCH_REQUESTS > ladder
 
 
 def test_a_non_resumable_channel_keeps_the_permanent_skip(conn, monkeypatch):
@@ -7199,7 +7199,7 @@ def test_a_cap_the_clock_puts_under_the_calibration_floor_skips_like_an_empty_bu
     pace this slow) as when the budget is, and the budget here is 25x the floor:
     only a floor read against the final cap can refuse this launch.
     """
-    from streetscape_metadata_tracker.scheduler import _MIN_SWEEP_LAUNCH_REQUESTS
+    from streetscape_metadata_tracker.scheduler import _MIN_RADIUS_SWEEP_LAUNCH_REQUESTS
 
     cid = _register(conn, "Bend", width=1_000, height=1_000, step=20)
     _enroll_kartaview(conn, cid)
@@ -7209,7 +7209,7 @@ def test_a_cap_the_clock_puts_under_the_calibration_floor_skips_like_an_empty_bu
     cfg = _sweep_cfg(publish_enabled=False, city_timeout_minutes=60)
     cfg.providers["kartaview"] = ProviderConfig(
         enabled=True,
-        daily_request_budget=_MIN_SWEEP_LAUNCH_REQUESTS * 25,
+        daily_request_budget=_MIN_RADIUS_SWEEP_LAUNCH_REQUESTS * 25,
         max_requests_per_minute=1,
     )
 
@@ -7635,7 +7635,7 @@ def test_the_calibration_floor_does_not_gate_a_walk_that_costs_nothing(
     if cached:
         _stamp_census_cache(city, "kartaview", fetched_by="kartaview")
     cfg = _kartaview_pair_cfg()
-    # Under _MIN_SWEEP_LAUNCH_REQUESTS (34): a remainder that cannot pay for
+    # Under _MIN_RADIUS_SWEEP_LAUNCH_REQUESTS (34): a remainder that cannot pay for
     # calibration, and does not have to when there is nothing to calibrate.
     cfg.providers["kartaview_streets"] = ProviderConfig(enabled=True, daily_request_budget=10)
 

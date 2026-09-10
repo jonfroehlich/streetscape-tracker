@@ -180,8 +180,9 @@ def _paused_sweep(*, spent):
     error = SweepIncompleteError(
         "stopped at the request cap",
         checkpoint_path="/checkpoints/kv",
-        roots_done=3,
-        root_count=8,
+        units_done=3,
+        unit_count=8,
+        unit_name="root cells",
     )
     error.api_requests = spent
     error.api_requests_total = spent
@@ -400,7 +401,7 @@ def test_the_request_cap_reaches_the_sweep_rather_than_only_the_budget_gate(tmp_
 def test_the_walks_request_cap_refuses_nonpositive_values_like_the_grid_flag(tmp_path):
     """
     The grid CLI refuses `--kartaview-max-requests 0` at parse time, because 0
-    spends the whole calibration ladder, checkpoints roots_done=0 and exits 83
+    spends the whole calibration ladder, checkpoints zero cells and exits 83
     printing "re-run the same command to resume" -- a loop the message
     encourages. This copy of the flag carried plain `type=int`, so the guard was
     real on one path and absent on the other: the shape a copied argument always

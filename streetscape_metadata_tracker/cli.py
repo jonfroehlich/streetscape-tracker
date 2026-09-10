@@ -62,6 +62,7 @@ from .download_common import (
     SWEEP_INCOMPLETE_EXIT_CODE,
     HostBusyError,
     HostUnavailableError,
+    SweepIncompleteError,
     host_exit_code,
     jitter_fraction,
     positive_int,
@@ -69,7 +70,6 @@ from .download_common import (
 from .download_kartaview import (
     DEFAULT_REQUEST_TIMEOUT_S,
     DEFAULT_SWEEP_REQUESTS_PER_MINUTE,
-    SweepIncompleteError,
 )
 from .download_mapillary import DEFAULT_TILE_JITTER, DEFAULT_TILE_REQUESTS_PER_MINUTE
 from .download_panoramax import DEFAULT_TILE_JITTER as DEFAULT_PANORAMAX_JITTER
@@ -665,7 +665,7 @@ async def async_main():
                 # Progress, not breakage — logged at INFO with the fraction
                 # done, and deliberately without a traceback.
                 logging.info(
-                    f"{provider} sweep paused at {e.roots_done}/{e.root_count} root cells; "
+                    f"{provider} crawl paused at {e.units_done}/{e.unit_count} {e.unit_name}; "
                     f"re-run to resume from {e.checkpoint_path}"
                 )
                 failed.append(provider)
@@ -710,7 +710,7 @@ async def async_main():
                 paused_provider, pause = incomplete[0]
                 print(
                     f"PAUSED: {paused_provider} checkpointed at "
-                    f"{pause.roots_done}/{pause.root_count} root cells. "
+                    f"{pause.units_done}/{pause.unit_count} {pause.unit_name}. "
                     f"Re-run the same command to resume; nothing was published."
                 )
                 return SWEEP_INCOMPLETE_EXIT_CODE

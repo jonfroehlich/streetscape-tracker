@@ -84,6 +84,7 @@ from streetscape_metadata_tracker.download_common import (
     SWEEP_INCOMPLETE_EXIT_CODE,
     DownloadError,
     HostUnavailableError,
+    SweepIncompleteError,
     host_exit_code,
     jitter_fraction,
     positive_int,
@@ -91,7 +92,6 @@ from streetscape_metadata_tracker.download_common import (
 from streetscape_metadata_tracker.download_gsv import collect_points_async
 from streetscape_metadata_tracker.download_kartaview import (
     DEFAULT_SWEEP_REQUESTS_PER_MINUTE,
-    SweepIncompleteError,
     estimate_sweep_requests,
 )
 from streetscape_metadata_tracker.download_mapillary import (
@@ -561,9 +561,11 @@ def run_collect(args: argparse.Namespace) -> int:
                 # counting a consecutive_failure, and folding this into 1 would
                 # quarantine a city that is making progress every night.
                 logger.info(
-                    "KartaView sweep paused at %s/%s root cells; re-run to resume from %s",
-                    e.roots_done,
-                    e.root_count,
+                    "%s crawl paused at %s/%s %s; re-run to resume from %s",
+                    provider,
+                    e.units_done,
+                    e.unit_count,
+                    e.unit_name,
                     e.checkpoint_path,
                 )
                 return SWEEP_INCOMPLETE_EXIT_CODE
@@ -872,7 +874,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--kartaview-max-requests",
         # Not `int`: 0 here is the same trap the grid CLI refuses at parse time
-        # -- it spends the whole calibration ladder, checkpoints roots_done=0,
+        # -- it spends the whole calibration ladder, checkpoints zero cells,
         # and exits 83 telling the operator to re-run, which loops. The guard
         # was on the grid flag and absent on this copy of it (#273).
         type=positive_int,
