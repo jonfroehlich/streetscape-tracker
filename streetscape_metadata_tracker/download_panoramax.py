@@ -1140,6 +1140,13 @@ async def _fetch_city_images(
         request_timeout: per-request timeout in seconds.
         max_requests_per_minute: client-side pacing cap. <= 0 disables pacing.
         jitter: the #292 gap coefficient of variation.
+        max_requests: stop after this many requests, CHECKPOINT the unfetched
+            tiles and raise :class:`SweepIncompleteError` (issue #318), or None
+            to fetch every tile. A SOFT ceiling: requests already in flight when
+            it trips are allowed to finish, so the overshoot is bounded by
+            ``connection_limit * TILE_MAX_TRIES`` rather than by the size of the
+            city. Requires ``checkpoint_path`` -- capped and uncheckpointed, a
+            crawl discards everything it paid for.
         checkpoint_path: directory to resume from and commit into, or None for
             fetch-everything. Built by the caller, because only the caller knows
             the channel — see :func:`checkpointing.checkpoint_path_for`.
@@ -1162,6 +1169,14 @@ async def _fetch_city_images(
         (``census_fetched_by`` / ``census_fetched_at`` / ``census_reused``).
 
     Raises:
+        ValueError: ``max_requests`` given without a ``checkpoint_path``. A
+            caller bug rather than a runtime condition -- both silent
+            fall-backs are wrong in a way nothing downstream could see, since
+            ignoring the cap overspends a per-IP budget and honouring it burns
+            one for nothing.
+        SweepIncompleteError: the cap was reached with tiles unfetched and the
+            checkpoint holds them. Progress, not breakage: it maps to exit 83,
+            which the scheduler amnesties rather than counting a failure.
         DownloadError: on a refusal or transport failure, carrying
             ``api_requests`` so the caller can still record what it spent.
     """
