@@ -2,7 +2,7 @@
 CLI: road-walk street-coverage collection for a city (issue #99).
 
     python -m streetscape_street_analyzer.collect "Seattle, WA" \
-        [--provider gsv|mapillary] \
+        [--provider gsv|kartaview|mapillary|panoramax] \
         [--spacing 15] [--match-dist 25] [--network-type drive|all_public|...] \
         [--run-date YYYY-MM-DD] [--force] [--refresh] \
         [--connection-limit N] [--max-requests-per-minute R] \
@@ -14,7 +14,7 @@ metres along each edge, and finds the nearest pano at each point, yielding
 **fractional** per-edge coverage. Unlike the grid downloader it scores only
 on-street points, and its association to streets is by construction.
 
-Both providers walk the SAME deterministic sample points, so their coverage
+Every provider walks the SAME deterministic sample points, so their coverage
 percentages are directly comparable — but they reach the imagery very
 differently:
 
@@ -22,15 +22,21 @@ differently:
     to a few hundred thousand), reusing the grid downloader's hardened request
     engine — rate limiter, OVER_QUERY_LIMIT retry, ``.downloading`` resume —
     via ``download_gsv.collect_points_async``.
-  * **mapillary** has no per-point endpoint: it reads the z14 vector-tile
-    census once — a cost set by the bbox area alone (catalog median 12 tiles,
-    max 870), independent of spacing but not of city size — and joins it onto
-    the sample points locally. See ``collect_mapillary``.
+  * **mapillary**, **kartaview** and **panoramax** have no per-point endpoint:
+    each reads ONE census over the frozen bbox — Mapillary's z14 vector tiles,
+    KartaView's radius sweep, Panoramax's z15 vector tiles — and joins it onto
+    the sample points locally, a cost set by the bbox area alone, independent
+    of spacing but not of city size. The join itself lives once in
+    ``census_walk``; each provider supplies three bindings.
 
-Each provider's requests are metered against its own ISOLATED key and ledger
-channel (``GMAPS_STREETS_API_KEY``/``gsv_streets``,
-``MAPILLARY_STREETS_ACCESS_TOKEN``/``mapillary_streets``, issue #141) so a road
-walk can never exhaust the production grid collectors' quota.
+Each provider's requests are metered against its own ISOLATED ledger channel,
+and where there is a credential, its own key (``GMAPS_STREETS_API_KEY``/
+``gsv_streets``, ``MAPILLARY_STREETS_ACCESS_TOKEN``/``mapillary_streets``, issue
+#141) so a road walk can never exhaust the production grid collectors' quota.
+``kartaview_streets`` shares the grid channel's token (one host lock, so no
+parallel burn to isolate) and ``panoramax_streets`` has none at all — but both
+still meter into their own ledger row, which is the half of the isolation that
+bounds a night either way.
 
 Two dated artifacts are written next to the run (both published as ``*.gz``):
 a raw sample snapshot ``..._streetwalk_sp{N}_{DATE}.csv.gz`` (METADATA schema,
@@ -99,6 +105,23 @@ from streetscape_metadata_tracker.download_mapillary import (
     DEFAULT_TILE_REQUESTS_PER_MINUTE,
     estimate_tile_count,
 )
+
+# ALIASED, EVERY NAME OF THEM. Panoramax exports the same four identifiers as
+# download_mapillary -- same spelling, different numbers (30/min not 40, z15 not
+# z14) -- so a bare `from ... import estimate_tile_count` here would not be a
+# name clash the linter flags but a SILENT REBINDING of whichever import came
+# second, and the loser's channel would then be priced and paced by the winner's
+# constants. That is the #268 failure (one provider's cost model wearing
+# another's name) reached through the import list instead of through an `else`.
+from streetscape_metadata_tracker.download_panoramax import (
+    DEFAULT_TILE_JITTER as PANORAMAX_TILE_JITTER,
+)
+from streetscape_metadata_tracker.download_panoramax import (
+    DEFAULT_TILE_REQUESTS_PER_MINUTE as PANORAMAX_TILE_REQUESTS_PER_MINUTE,
+)
+from streetscape_metadata_tracker.download_panoramax import (
+    estimate_tile_count as estimate_panoramax_tile_count,
+)
 from streetscape_metadata_tracker.json_summarizer import generate_streetwalk_manifest
 from streetscape_metadata_tracker.naming import (
     DEFAULT_NETWORK_TYPE,
@@ -111,6 +134,7 @@ from streetscape_metadata_tracker.walk_diff import compute_and_record_walk_diff
 
 from .collect_kartaview import collect_kartaview_street_samples_async
 from .collect_mapillary import collect_mapillary_street_samples_async
+from .collect_panoramax import collect_panoramax_street_samples_async
 from .download_street_network import fetch_street_edges
 from .road_sampling import dedupe_query_points, generate_samples
 from .street_coverage import (
@@ -130,6 +154,13 @@ STREET_BUDGET_CHANNELS = {
     "gsv": "gsv_streets",
     "kartaview": "kartaview_streets",
     "mapillary": "mapillary_streets",
+    # panoramax_streets is a real channel with no credential behind it (issue
+    # #331). The ledger half of the isolation still applies and is the half that
+    # matters here -- a walk's tiles must not be charged to the grid channel's
+    # daily budget -- while the credential half is vacuous, since Panoramax
+    # reads are unauthenticated. See config.CHANNEL_ENV_VARS, where the row is
+    # an empty tuple rather than an omission.
+    "panoramax": "panoramax_streets",
 }
 
 
@@ -182,6 +213,15 @@ STREET_COST_MODELS: dict[str, StreetCostModel] = {
     # from the cache anyway. See docs/experiments/kartaview-sweep-cost.md.
     "kartaview": StreetCostModel(unit="KartaView sweep requests", estimate=estimate_sweep_requests),
     "mapillary": StreetCostModel(unit="Mapillary tile requests", estimate=estimate_tile_count),
+    # EXACT rather than a floor, unlike KartaView's: the z15 lattice over the
+    # frozen bbox is counted from geometry with no imagery-dependent term, so
+    # there is no observed-versus-geometric correction to apply. Note the zoom
+    # in the estimator, not here -- z15 is the coarsest that serves the v1
+    # `pictures` layer at all, so a bbox costs ~4x the Mapillary row above and
+    # the two units are not interchangeable numbers.
+    "panoramax": StreetCostModel(
+        unit="Panoramax tile requests", estimate=estimate_panoramax_tile_count
+    ),
 }
 
 
@@ -498,6 +538,27 @@ def run_collect(args: argparse.Namespace) -> int:
                         census_cache=census_cache,
                     )
                 )
+            elif provider == "panoramax":
+                dict_results = asyncio.run(
+                    collect_panoramax_street_samples_async(
+                        query_points,
+                        city,
+                        # NO TOKEN ARGUMENT. `config` was still loaded above and
+                        # holds access_token=None for this channel; passing it
+                        # would suggest a credential is being honoured when the
+                        # downloader has no parameter for one.
+                        out_csv,
+                        match_dist_m=args.match_dist,
+                        connection_limit=args.connection_limit,
+                        request_timeout=args.timeout,
+                        max_requests_per_minute=args.panoramax_max_requests_per_minute,
+                        jitter=args.panoramax_jitter,
+                        checkpoint_path=checkpoint_path,
+                        checkpoint_channel=budget_channel,
+                        checkpoint_variant=args.network_type,
+                        census_cache=census_cache,
+                    )
+                )
             elif provider == "kartaview":
                 dict_results = asyncio.run(
                     collect_kartaview_street_samples_async(
@@ -709,8 +770,10 @@ def run_collect(args: argparse.Namespace) -> int:
             out_coverage,
             len(manifest["walks"]),
         )
-        # The any-imagery number only says something new for Mapillary; for GSV
-        # it is the 360° number by construction, so don't print it twice.
+        # The any-imagery number only says something new for a provider that
+        # publishes flat imagery too; for GSV it is the 360° number by
+        # construction, so don't print it twice. Tested by equality rather than
+        # by naming providers, so a new census arm needs no edit here.
         any_note = (
             ""
             if totals["coverage_pct_by_length_any"] == totals["coverage_pct_by_length"]
@@ -752,11 +815,12 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Imagery provider to walk (default: gsv). Each is metered against "
             "its own isolated street budget channel (gsv_streets / "
-            "kartaview_streets / mapillary_streets); gsv costs one request per "
-            "sample point, while mapillary reads a tile census and kartaview a "
-            "radius sweep — both priced by the city's bbox area, not by "
-            "spacing, and both free when the paired grid run already cached "
-            "that census. Use --estimate to price a city before spending."
+            "kartaview_streets / mapillary_streets / panoramax_streets); gsv "
+            "costs one request per sample point, while mapillary and panoramax "
+            "read a tile census and kartaview a radius sweep — all three priced "
+            "by the city's bbox area, not by spacing, and all three free when "
+            "the paired grid run already cached that census. Use --estimate to "
+            "price a city before spending."
         ),
     )
     parser.add_argument(
@@ -810,9 +874,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--refetch-census",
         action="store_true",
-        help="""Ask Mapillary again instead of reusing the census the grid run
-             (or the other --network-type) already fetched for this city and
-             bbox (issue #290). DELIBERATELY SEPARATE FROM --force: --force
+        help="""Ask the provider again instead of reusing the census the grid
+             run (or the other --network-type) already fetched for this city
+             and bbox (issue #290). A no-op for gsv, which has no census. DELIBERATELY SEPARATE FROM --force: --force
              clears this run date's artifacts, and a walk whose tail died after
              writing its CSV is re-run with --force and must re-finalize for
              zero requests rather than re-pay a census it already bought.""",
@@ -857,6 +921,32 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--panoramax-max-requests-per-minute",
+        type=int,
+        default=PANORAMAX_TILE_REQUESTS_PER_MINUTE,
+        help=(
+            "Client-side pacing cap for Panoramax tile requests "
+            f"(default: {PANORAMAX_TILE_REQUESTS_PER_MINUTE}); <= 0 disables "
+            "pacing. Its own flag, and DELIBERATELY HALF the Mapillary default "
+            "above: Panoramax documents no rate limit and returns no "
+            "X-RateLimit-*/Retry-After header, so there is no ceiling to pace "
+            "against and the conservative number is the honest one. It is "
+            "volunteer-run infrastructure with no credential identifying us "
+            "(issues #316, #331)"
+        ),
+    )
+    parser.add_argument(
+        "--panoramax-jitter",
+        type=jitter_fraction,
+        default=PANORAMAX_TILE_JITTER,
+        help=(
+            "Randomize the gap between Panoramax tile requests, the same "
+            "shifted-exponential shape and coefficient of variation as "
+            f"--mapillary-jitter (default: {PANORAMAX_TILE_JITTER}; 0 restores "
+            "an exact cadence)"
+        ),
+    )
+    parser.add_argument(
         "--kartaview-max-requests-per-minute",
         type=int,
         default=DEFAULT_SWEEP_REQUESTS_PER_MINUTE,
@@ -894,7 +984,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Today's FULL ceiling for this provider's street budget channel "
-            "(gsv_streets / kartaview_streets / mapillary_streets). Abort when "
+            "(gsv_streets / kartaview_streets / mapillary_streets / "
+            "panoramax_streets). Abort when "
             "the ledger's spend so far plus this collection's estimated "
             "requests would exceed it — pass the whole daily budget, not what "
             "is left of it"

@@ -57,22 +57,30 @@ Scheduler stays on `drive`;
 park trails, typically well beyond 25 m from any road, are much less affected.
 Deferred: `leisure=park` polygon attribution (the honest way to ask "park coverage"), and a city-page selector for the broad artifact.
 
-## Road-walk: both providers, and scheduled
+## Road-walk: four providers, three of them scheduled
 
-**Road-walk: three providers, all scheduled.** `collect.py` takes `--provider {gsv,kartaview,mapillary}`;
-all three walk the SAME deterministic sample points from the same frozen network, so their coverage percentages are directly comparable — but they reach imagery very differently.
+**Road-walk: four providers, three of them scheduled.** `collect.py` takes `--provider {gsv,kartaview,mapillary,panoramax}`;
+all four walk the SAME deterministic sample points from the same frozen network, so their coverage percentages are directly comparable — but they reach imagery very differently.
+`panoramax` (#331) is the one that is runnable **by hand only**: there is no `panoramax_streets` scheduler channel, for the same reason `panoramax` itself is still in `UNWIRED_CHANNELS` — that wiring belongs to the remaining #316 phase-2 work.
 GSV issues one metadata request per sample location (Seattle: 247k).
 **Mapillary has no per-point endpoint at all**: `collect_mapillary.py` reads the z14 tile census once (`download_mapillary.fetch_city_images_async`, extracted so both the grid run and the road walk share the identical fetch/decode) and joins it onto the sample points locally via `gpd.sjoin_nearest` on `estimate_utm_crs()`
 — the same idiom the grid-attribution path uses, so **no new dependency** (there is no scipy).
 Consequence: a Mapillary walk's cost is the tile census — *independent of sample spacing* (Corvallis: 25,555 sample points scored for 42 requests, and a test pins equal `api_requests` across spacing 15 vs 30) but **not independent of city size**, since tile count scales with bbox area: median 12, mean 57.8, max 870 over the catalog (the distribution measured in `docs/provider-access.md`).
 Only the spacing half of that is a real invariant — an earlier version of this documentation claimed both, which would price Moscow like a village.
 Either way it is orders of magnitude below GSV's one-request-per-sample-point, which is why it can run everywhere GSV can't; `collect --estimate` prints the actual figure for a city before spending.
-Each provider meters against its own `api_usage` channel (`gsv_streets` / `kartaview_streets` / `mapillary_streets`), so a road walk can never exhaust a grid collector's quota.
-Two of the three also isolate the **credential**: `gsv_streets` and `mapillary_streets` require their own key, because a walk and a grid run of those providers can be in flight at once and would otherwise burn one quota in parallel.
+Each provider meters against its own `api_usage` channel (`gsv_streets` / `kartaview_streets` / `mapillary_streets` / `panoramax_streets`), so a road walk can never exhaust a grid collector's quota.
+Two of the four also isolate the **credential**: `gsv_streets` and `mapillary_streets` require their own key, because a walk and a grid run of those providers can be in flight at once and would otherwise burn one quota in parallel.
 `kartaview_streets` deliberately does not — it falls back to `KARTAVIEW_ACCESS_TOKEN` when `KARTAVIEW_STREETS_ACCESS_TOKEN` is unset, because one machine-wide `host_lock(HOST_KARTAVIEW)` serializes every KartaView request in the repo, so there is no parallel burn to isolate; on a paired night the walk reuses the grid run's census and spends nothing at all.
+`panoramax_streets` has **no credential at all** — Panoramax reads are unauthenticated — so its row in `config.CHANNEL_ENV_VARS` is an empty tuple exactly like `panoramax`'s, which is what puts it in `CREDENTIAL_FREE_CHANNELS` and makes `load_config` return `{"access_token": None}` rather than raising.
+Dropping the row would not merely under-document the channel; `load_config` would fall through to its final `raise` and the one walk needing no credential would be the one walk that cannot start.
+The ledger half of the isolation still does real work there: it is what keeps a walk's tiles off the grid channel's daily budget.
 It is a **scheduled, opt-in** channel as of #258, enrolled separately from `kartaview` (`enroll-city CITY --channel kartaview_streets`) and ranked immediately after it so the grid sweep is the one that pays.
 **KartaView's walk is priced like Mapillary's, not GSV's**: a radius sweep of the frozen bbox, independent of spacing.
 The first one measured it — Krabi, 2026-08-31, 18,851 samples over 2,144 edges scored from **87 sweep requests**, against 18,851 for the same walk on `gsv_streets`, for slightly HIGHER coverage (85.4% of street-km vs GSV's 82.9%).
+**Panoramax's walk is priced the same way and reads the same instrument as its grid run: the v1 `pictures` layer at z15.**
+Note the zoom rather than assuming Mapillary's — the layer does not exist below z15, so the same bbox costs roughly 4x the tiles (`estimate_tile_count` measured p50 414 / p90 2,400 / max 3,132 over the 20 richest cities phase 1 found).
+Its pace is deliberately **half** Mapillary's (30/min, `--panoramax-max-requests-per-minute`, jittered on the same #292 shape): Panoramax documents no rate limit and returns no `X-RateLimit-*`/`Retry-After` header, so there is no ceiling to pace against and the conservative figure is the honest one.
+The San Luis Obispo sizing that motivated #331 — 2,539 edges, 25,002 samples at 15 m spacing — cost GSV 25,002 requests against Mapillary's ~36 and KartaView's ~64; Panoramax lands in that same census range rather than GSV's.
 The Mapillary arm emits #116's status vocabulary at sample level
 — `OK`/`NO_DATE` for a 360° pano in range, `FLAT_ONLY` (null capture_date) when only flat imagery is, `ZERO_RESULTS` when the sample was measured and nothing is in range, and `REQUEST_FAILED` when it was never measured at all (below)
 — which `compute_streetwalk_coverage` turns into **two numbers per edge**: `coverage_fraction` (360°) and `coverage_fraction_any`, summarized as `coverage_pct_by_length[_any]`.
@@ -83,7 +91,8 @@ GSV emits no FLAT_ONLY, so its any-value equals its 360° value by construction;
 **A census walk's samples under a tile or cell the fetch never got back publish `REQUEST_FAILED`, not `ZERO_RESULTS`.**
 Publishing an unswept sample as `ZERO_RESULTS` records an absence nobody observed into an immutable dated snapshot, and no later reader can tell it from a measured one.
 What this buys is a **legible row**, and deliberately nothing more — see the two consequences below before reading it as a coverage fix.
-The seam is `census_walk.build_streetwalk_rows`' `unmeasured_mask` hook, and each provider passes the SAME helper its own grid run masks with — KartaView's `_points_in_cells` over `failed_cells` (#258), Mapillary's `_points_in_tiles` over `failed_tiles` (#259) — so a city's walk and its grid run cannot disagree about the same unswept ground.
+The seam is `census_walk.build_streetwalk_rows`' `unmeasured_mask` hook, and each provider passes the SAME helper its own grid run masks with — KartaView's `_points_in_cells` over `failed_cells` (#258), Mapillary's `_points_in_tiles` over `failed_tiles` (#259), Panoramax's `_points_in_tiles` over its own `failed_tiles` (#331) — so a city's walk and its grid run cannot disagree about the same unswept ground.
+Panoramax makes the distinction sharper than either sibling: **a 404 there is an EMPTY TILE, not a failure** (an empty area answers 200 with no layer), so a tile genuinely holding no imagery never enters `failed_tiles` — everything in that list is ground the fetch really did not see.
 The mask applies only to samples that matched **nothing**: one that found imagery within `--match-dist` was measured by construction, whatever cell it sits in, so a matched sample inside a failed tile stays matched.
 GSV needs no hook at all, because it queries each sample directly and a failed sample already carries its own `REQUEST_FAILED`.
 
@@ -118,6 +127,7 @@ Consequences for reading a walk's row: `street_walks.api_requests` is legitimate
 Every row's `query_timestamp` carries that observation instant rather than this process's clock, for the same reason.
 `--estimate` and the `--daily-budget` pre-flight both report a cached census as 0 requests; without that the cheapest possible walk is exactly the one a nearly-spent street budget refuses.
 `--force` is cache-transparent — it is about this run date's artifacts — and `--refetch-census` is the opt-out that takes the observation afresh.
+All of this is provider-agnostic: `crawl_store_for` derives the pair for every member of `checkpointing.CENSUS_PROVIDERS`, so the KartaView (#258) and Panoramax (#331) walks inherit the identical arithmetic rather than re-implementing it — a paired Panoramax night prices its walk at 0 for the same reason and through the same code.
 Mechanism: [`docs/census.md`](census.md).
 
 ## Street channels are scheduled like grid providers

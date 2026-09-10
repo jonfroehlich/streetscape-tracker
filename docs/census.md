@@ -451,3 +451,25 @@ The jitter is adopted before any incident rather than after three; see [`provide
 `streetscape_tracker.py --provider panoramax` collects a city, and `naming.KNOWN_PROVIDERS` carries the token so the run reads back under its own schema.
 But `scheduler.UNWIRED_CHANNELS` still holds `panoramax`, so a `[providers.panoramax]` block is dropped with an error rather than run: `estimate_requests`, `city_timeout_seconds`, the `enabled_providers` rank and the `_run_one_city` pacing flag have no arm for it yet, and each of those fails OPEN in the way #238 records.
 `CHANNEL_DEFAULT_MEMBERSHIP["panoramax"]` is already `False`, on a measurement rather than a cost argument: 730 of 1,144 enabled cities screen to a conclusive zero, so a default-membership channel would spend most of its slots confirming absence.
+
+## The Panoramax road walk is the third `CensusWalkSpec` binding (issue #331)
+
+**`streetscape_street_analyzer/collect_panoramax.py` is three bindings and a fetch, and deliberately nothing else.**
+`census_walk.py`'s docstring already said what a census provider's walk is — one fetch over the frozen bbox joined **locally** onto the same deterministic sample points, with that join "and the status vocabulary it produces, identical for every such provider" — and named KartaView as the second caller it was waiting for.
+Panoramax is the third, and the arm is small precisely because nothing about the join, the pano-beats-flat rule, the `OK`/`NO_DATE`/`FLAT_ONLY`/`ZERO_RESULTS` vocabulary or the sample-order restore is written twice.
+
+**The date binding is REUSED from the grid run rather than rewritten.**
+`_panoramax_capture_dates` already holds this provider's rule — an `ISO8601`-pinned parse (mixed precisions in one response otherwise null each other) with the plausibility floor that drops the genuine 1970 epoch sentinel — and it already returns `""` for a rejected date, which is the empty string `CensusWalkSpec` asks for and which becomes `NO_DATE`.
+A second implementation here would be a second date rule, and one city's grid and street artifacts would disagree about the same picture.
+
+**Two hazards are specific to this provider being Mapillary-shaped.**
+`download_panoramax` exports `estimate_tile_count`, `DEFAULT_TILE_REQUESTS_PER_MINUTE`, `DEFAULT_TILE_JITTER` and `grid_bbox` under the SAME spellings as `download_mapillary`, with different numbers behind them (z15 not z14, 30/min not 40).
+So `collect.py` imports every one of them ALIASED: a bare import would not be a clash the linter flags but a silent rebinding of whichever came second, after which the loser's channel is priced and paced by the winner's constants — the #268 failure (one provider's cost model wearing another's name) reached through the import list rather than through an `else`.
+And a **404 is an empty tile**, not a failure, so a tile genuinely holding no imagery never reaches `failed_tiles`; everything the walk's `unmeasured_mask` covers is ground the fetch really did not see.
+
+**`panoramax_streets` is a budget channel with no credential behind it.**
+Its row in `config.CHANNEL_ENV_VARS` is an empty tuple exactly like `panoramax`'s, which is what puts it in `CREDENTIAL_FREE_CHANNELS`; drop the row and `load_config` falls through to its final `raise`, making the one walk that needs no key the one walk that cannot start.
+The ledger half of the isolation still does real work — it is what keeps a walk's tiles off the grid channel's daily budget — while the credential half is vacuous here, one step further than `kartaview_streets`, which has a token to fall back to.
+
+**Collectable by hand, not scheduled**, exactly like the grid channel above it: there is no `panoramax_streets` entry in `scheduler.STREET_CHANNELS`, so a `[providers.panoramax_streets]` block would be ignored as an unknown provider.
+Wiring it is part of the remaining #316 phase-2 work, and it is the same four fail-open arms — plus the decision tables (`CHANNEL_HOSTS`, `CHANNEL_DEFAULT_MEMBERSHIP`, `CHANNEL_RESUMABLE`) whose set-equality tests turn a half-wired channel into a red test rather than a nightly wrong answer.
