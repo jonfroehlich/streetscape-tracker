@@ -301,10 +301,18 @@ Which channel put it there does not change that, and keying on the cause left ha
 Measured before the key changed: ten gsv-excluded cities behind 45 gsv-due ones landed at union positions 45–54 and collected **0 of 10** at prod's 40-city cap — indefinitely, because unlike an ordinary stalled city they never re-enter gsv's due list at all, and with `consecutive_failures` at 0 the night's own starvation diagnostic could not see them.
 The key is the **union** of the two conditions, not a replacement: a filtered widening (`run-due --provider kartaview`) makes rank 0 the opt-in channel, so nothing is stranded by the first half while the live-checkpoint preference below still has to hold.
 `[schedule].opt_in_cities_per_day` keeps its name — renaming a deployed config key to track a widened meaning is not worth a production edit — but it now bounds the rate at which ANY stranded population is worked off, so a KartaView widening and a #301 rollout share it.
-**They share it by round-robin, not by arrival order**, and that is load-bearing rather than tidy: taken straight down the union the larger group takes every slot, because union order inside one channel's due list is `last_success_at ASC NULLS FIRST, city_id ASC` and both groups are all-NULL there, so the winner is decided alphabetically.
-Measured on a prod-shaped slate — a ~121-city mapillary-only-due population beside a KartaView widening and ten #301 cities — the naive take filled all ten of prod's slots with the first group and collected **0 of 50** enrolled KartaView cities and **0 of 10** #301 cities.
-A group leaves the rotation as it empties, so a night with only one stranded population behaves exactly as it did before the key widened.
-The practical consequence for an operator: a #301 rollout arrives at roughly *half* the reservation per night while another widening is in flight, so raise `opt_in_cities_per_day` for the duration rather than expecting ten cities on night one.
+**They share it by round-robin over THREE populations, not by arrival order**, and both halves of that are load-bearing rather than tidy.
+Taken straight down the union the largest group takes every slot, because union order inside one channel's due list is `last_success_at ASC NULLS FIRST, city_id ASC` and a stranded block is all-NULL there, so the winner is decided alphabetically — a lottery on `city_id`, not a rate.
+The three groups are what the reservation has to tell apart, and the question each answers is **whether waiting fixes it**:
+
+1. **excluded from rank 0** (`schedule_state.member = 0`, #301) — permanent; nothing but this reservation ever reaches it;
+2. **due only on opt-in channels** (#248) — effectively permanent while the sibling default channel keeps succeeding;
+3. **transiently not due on rank 0** — its rank-0 clock is merely fresh, and it rejoins the union head by itself within a cycle.
+
+Grouping only on 1-or-2 versus 3 is not enough, and the first attempt at this shipped exactly that: group 3 is prod's documented ~121-city mapillary-only-due population, and sharing a bucket with group 1 it won the same alphabetical lottery, putting the #301 cities back at **0 of 10** on a prod-shaped slate.
+Splitting 1 from 3 is what makes the reservation a rate: measured on the same slate, 4 of 10 to #301, 3 to the KartaView widening, 3 to the transient population.
+**A live checkpoint outranks the rotation across every group**, taken first and in union order — confined to its own group it stops being a guarantee at a reservation of 1, and #239's five nights stop being CONSECUTIVE.
+A group leaves the rotation as it empties, so a night with only one stranded population behaves exactly as the straight take did.
 
 **`[schedule].refresh_slots` reserves a share of the night's city cap for cities that will gain a second interval.**
 Unset it derives `max_cities_per_day // 4` (10 of 40 on prod), so the split follows the cap from one place rather than being a second number to keep in step; an explicit integer overrides, and **`0` restores the pure breadth-first order exactly** — the identity permutation, provable by construction rather than argued, the same property `max_concurrent_channels = 1` keeps for #240.
@@ -369,7 +377,9 @@ What is still not expressible is a *per-channel enable date*: exclusion is a swi
 4. `run-due --dry-run` to confirm no `gsv` lines before the 02:00 timer fires.
 
 Doing (3) before (2) leaves a mistyped or forgotten exclusion on an ENABLED city, exposed to the next timer — which for a 40 km-clamped city is 4M grid points, most of a night.
-Expect the newly enabled cities to arrive through the stranded reservation at `[schedule].opt_in_cities_per_day` per night rather than all at once, since they are not due on gsv and therefore never lead the union.
+Expect the newly enabled cities to arrive through the stranded reservation rather than all at once, since they are not due on gsv and therefore never lead the union.
+They get a **share** of `[schedule].opt_in_cities_per_day`, not all of it: the reservation round-robins across stranded populations, so with a KartaView widening and a transiently-stalled population also in flight the share is about a third of it (measured on a prod-shaped slate: 4 of 10).
+Raise the key for the duration of a rollout rather than expecting ten cities on night one.
 
 **`notify-failure`** emails the recent scheduler-log tail and is wired as the unit's `OnFailure=` hook (`deploy/systemd/streetscape-tracker-notify@.service`), so a crash that never reaches the in-run alerting still produces an email.
 It exits 0 when it alerted (or alerting is intentionally off) and 1 only when a send was attempted and failed, so the notify unit's own status is meaningful.

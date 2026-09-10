@@ -2696,7 +2696,7 @@ def _cmd_enroll_bulk(
         # tranche is that this number is the one being tested against reality.
         print(f"  estimated {total:,} requests for the tranche (a FLOOR, not a budget)")
     else:
-        print(f"  no estimate: {verb}ing spends nothing, it stops future sweeps")
+        print("  no estimate: this spends nothing, it stops future sweeps")
     if limit is not None and len(candidates) > len(selected):
         print(f"  {len(candidates) - len(selected):,} further cities would still be unchanged")
 
@@ -5116,6 +5116,10 @@ def _collect_due(
     # ordering that a 40-line docstring and four superseded rationales in
     # docs/scheduler.md exist to protect.
     opt_in = {p for p in providers if is_opt_in_channel(p)}
+    # Read once for the catalog: _stranded_kind below has to tell a PERMANENT
+    # exclusion from a merely fresh rank-0 clock, and only schedule_state.member
+    # carries that. One indexed scan, not a lookup per city.
+    rank0_exclusions = db.get_channel_exclusions_all(conn)
     # The channel whose due list dictates union order. `providers` is required
     # and non-empty (see the docstring), but read defensively rather than
     # indexing: an empty slate must be an identity, never an IndexError in the
@@ -5186,31 +5190,53 @@ def _collect_due(
                     for p in providers_for_city[city.city_id]
                 )
 
-            # Stable, so within each group the union's stalest-first order is
-            # untouched and the choice is only ever "resumers before starters".
-            by_preference = sorted(
-                stranded, key=lambda i: 0 if _has_live_checkpoint(ordered[i]) else 1
-            )
-            # ROUND-ROBIN ACROSS STRANDED POPULATIONS, not straight down the
-            # union. Widening the key merged two groups into one reservation,
-            # and taken in union order the larger group takes every slot: a
-            # catalog carrying ~121 mapillary-only-due cities alongside a
-            # KartaView widening filled all 10 of prod's slots with the former
-            # (they sort earlier inside mapillary's own due list), so the
-            # widening that used to own those slots collected NOTHING and the
-            # #301 cities this key was widened for got in at 0 of 10.
+            # WHY a city is stranded, because it decides whether waiting fixes
+            # it -- and that is what the reservation has to share across.
             #
-            # That is the same starvation one level up, and the fix is the same
-            # shape as #282's bound: share the reservation rather than let
-            # arrival order allocate it. Two groups today -- opt-in-only, and
-            # stranded by rank-0 exclusion -- and a group is dropped from the
-            # rotation as it empties, so a night with only one behaves exactly
-            # as it did before.
-            groups: dict[bool, list[int]] = {}
-            for i in by_preference:
-                key = all(p in opt_in for p in providers_for_city[ordered[i].city_id])
-                groups.setdefault(key, []).append(i)
-            chosen = set()
+            #   0  EXCLUDED from rank 0 (schedule_state.member = 0, issue #301).
+            #      Permanent: this city never enters rank 0's due list again, so
+            #      nothing but this reservation will ever reach it.
+            #   1  Due only on opt-in channels (#248). Also effectively
+            #      permanent while the sibling default channel keeps succeeding.
+            #   2  Transiently not due on rank 0 -- its rank-0 clock is simply
+            #      fresh. It rejoins the union head on its own in <= one cycle.
+            #
+            # Grouping on "opt-in or not" was not enough, and the first round of
+            # this fix shipped that. Group 2 is the ~121-city mapillary-only-due
+            # population, and it shares a bucket with group 0 under that key --
+            # so the #301 cities lost the same union-order lottery they lost
+            # before, at 0 of 10 on a prod-shaped slate, decided by where their
+            # city_id falls alphabetically among ~130 all-NULL rows. A city
+            # named Zurich waited ~26 nights; one named Aberdeen got night one.
+            # Splitting 0 from 2 is what makes the reservation a RATE rather
+            # than a lottery, and it is also the split that matters: group 2
+            # recovers by itself and group 0 cannot.
+            def _stranded_kind(index: int) -> int:
+                city_id = ordered[index].city_id
+                if rank0 in rank0_exclusions.get(city_id, ()):
+                    return 0
+                if all(p in opt_in for p in providers_for_city[city_id]):
+                    return 1
+                return 2
+
+            # A LIVE CHECKPOINT OUTRANKS THE ROTATION, across every group.
+            # Confined to its own group it stops being a guarantee: at
+            # max_opt_in = 1 with two groups non-empty the rotation hands the
+            # slot to group 0 whether or not group 1's head is a checkpointed
+            # resumer, and #239's five nights stop being CONSECUTIVE -- the
+            # property docs/scheduler.md rests the whole amnesty design on.
+            # Taken first and in union order, it is the same guarantee the
+            # straight take used to provide by construction.
+            resumers = [i for i in stranded if _has_live_checkpoint(ordered[i])]
+            chosen = set(resumers[:max_opt_in])
+
+            # Then round-robin the rest, so no stranded population can be
+            # zeroed by a larger one. A group leaves the rotation as it empties,
+            # so a slate with only one behaves exactly as the straight take did.
+            groups: dict[int, list[int]] = {}
+            for i in stranded:
+                if i not in chosen:
+                    groups.setdefault(_stranded_kind(i), []).append(i)
             queues = [q for _, q in sorted(groups.items())]
             while len(chosen) < max_opt_in and any(queues):
                 for q in queues:

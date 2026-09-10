@@ -295,7 +295,7 @@ Keep any list a doc enumerates **alphabetical**, so two branches adding an entry
   - `undated-imagery-share.md`
 
 - Architecture decisions are recorded in `docs/adr/` — notably **ADR 0001: stay fully static, no backend**; large/dense-city rendering (#77, #58) is fixed with static artifacts (grid-binned overview → PMTiles), never a server.
-- Published JSON artifacts and their schema versions are inventoried in [`docs/architecture.md`](docs/architecture.md): per-run summary v2, aggregate `cities.json.gz` v4 (v4 adds `excluded_channels`, absent when empty), streetwalk manifest v1, driving-plan summary v1, provider screen v1.
+- Published JSON artifacts and their schema versions are inventoried in [`docs/architecture.md`](docs/architecture.md): per-run summary v2, aggregate `cities.json.gz` v4 (v4 adds `excluded_channels`, absent when empty, so a record is byte-identical to its v3 form for an unexcluded catalog), streetwalk manifest v1, driving-plan summary v1, provider screen v1.
 - `data/` contains thousands of files — avoid globbing or listing it wholesale.
 - Legacy pre-2026 data files are undated; they are registered as `is_baseline=1` runs by the migration script and never renamed (published URLs stay stable).
 - Runtime state that must never reach the public web server lives in gitignored siblings of `data/` — `archive/` (#176), `backups/` (#145), `census_cache/` (#290), `checkpoints/` (#239, #256), `locks/` (#208), `logs/` — and the publish rsync only walks `data/`, so anything there is structurally unpublishable.

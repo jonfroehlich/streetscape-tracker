@@ -2417,10 +2417,13 @@ def test_the_hoist_is_the_identity_permutation_without_an_opt_in_channel(conn):
     """PR A's inertness, asserted as element-wise list identity rather than
     "looks the same".
 
-    With every CHANNEL_DEFAULT_MEMBERSHIP value True, `opt_in` is empty, every
-    sort key is 1, and a stable sort on a constant key changes nothing. This
-    pins that against the pre-change union order for a multi-city, multi-channel
-    slate — the shape where a reorder would actually show.
+    With every CHANNEL_DEFAULT_MEMBERSHIP value True and no city excluded from
+    gsv, NOTHING IS STRANDED — every city is due on rank 0 — so every sort key
+    is 1 and a stable sort on a constant key changes nothing. (It used to be
+    explained by `opt_in` being empty, which was a gate the #301 key change
+    deleted; the test still holds, for the reason stated here.) This pins that
+    against the pre-change union order for a multi-city, multi-channel slate —
+    the shape where a reorder would actually show.
     """
     from streetscape_metadata_tracker import scheduler as sched
 
@@ -2559,6 +2562,90 @@ def test_the_reservation_is_shared_across_stranded_populations(conn):
     head = [c.city_id for c in slate.cities][:2]
     assert any(c in optin for c in head), "the opt-in widening must not be zeroed"
     assert any(c in excluded for c in head), "the gsv-excluded population must not be zeroed"
+
+
+def test_a_third_stranded_population_cannot_squeeze_out_the_excluded_one(conn):
+    """The gap the first round of this fix left, and the reason it needed a third key.
+
+    Grouping on "opt-in or not" put the gsv-EXCLUDED cities (#301) in the same
+    bucket as the merely-not-due-on-gsv ones -- prod's documented ~121-city
+    mapillary-only-due population -- and inside a bucket the order is the
+    union's, which for an all-NULL block is alphabetical. So the #301 cities
+    lost the same lottery they lost before the key widened: measured 0 of 10 on
+    a prod-shaped slate, decided by where a city_id sorts.
+
+    The distinction the reservation has to make is whether WAITING fixes it. A
+    fresh gsv clock expires; an explicit `member = 0` never does. `Zzz` sorts
+    last on purpose -- under the two-key version it is the last city reached,
+    not the first.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    # Not due on gsv because its clock is fresh -- transient, recovers by itself.
+    transient = [_register(conn, f"Atrans{i}", width=1000, height=1000, step=20) for i in range(6)]
+    # Not due on gsv because it is EXCLUDED -- permanent, and sorts LAST.
+    excluded = [_register(conn, f"Zzz{i}", width=1000, height=1000, step=20) for i in range(6)]
+    db.assign_schedule(conn, 90, providers=("gsv", "gsv_streets", "mapillary"))
+    for cid in transient:
+        for channel in ("gsv", "gsv_streets"):
+            db.record_attempt(conn, cid, success=True, provider=channel)
+    for cid in excluded:
+        for channel in ("gsv", "gsv_streets"):
+            db.set_channel_membership(conn, cid, channel, False, cycle_days=90)
+
+    cfg = _sweep_cfg(publish_enabled=False, opt_in_cities_per_day=2)
+    slate = sched._collect_due(
+        conn,
+        cfg,
+        date(2026, 7, 2),
+        ["gsv", "gsv_streets", "mapillary"],
+        max_opt_in=2,
+        max_cities=2,
+    )
+    head = [c.city_id for c in slate.cities][:2]
+    assert any(c in excluded for c in head), (
+        "a permanently excluded city must not lose its slot to a transiently stalled one"
+    )
+
+
+def test_a_live_checkpoint_outranks_the_rotation_across_groups(conn, monkeypatch):
+    """The #239 guarantee has to hold ACROSS stranded groups, not inside one.
+
+    Confined to its group it stops being a guarantee: at a reservation of 1 with
+    two groups non-empty, a round-robin hands the slot to whichever group sorts
+    first regardless of whether the other group's head is a checkpointed
+    resumer -- and #239's five nights stop being CONSECUTIVE, which is the
+    property the whole amnesty design rests on. So resumers are taken first,
+    in union order, before the rotation runs at all.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    excluded = _register(conn, "Aexcluded", width=1000, height=1000, step=20)
+    resumer = _register(conn, "Zresumer", width=1000, height=1000, step=20)
+    db.assign_schedule(conn, 90, providers=("gsv", "gsv_streets", "mapillary", "kartaview"))
+    for channel in ("gsv", "gsv_streets"):
+        db.set_channel_membership(conn, excluded, channel, False, cycle_days=90)
+    db.set_channel_membership(conn, resumer, "kartaview", True, cycle_days=90)
+    for channel in ("gsv", "gsv_streets", "mapillary"):
+        db.record_attempt(conn, resumer, success=True, provider=channel)
+
+    monkeypatch.setattr(
+        sched,
+        "_sweep_checkpoint_progress",
+        lambda cfg, city, channel: {"age_s": 1.0} if city.city_id == resumer else None,
+    )
+    cfg = _sweep_cfg(publish_enabled=False, opt_in_cities_per_day=1)
+    slate = sched._collect_due(
+        conn,
+        cfg,
+        date(2026, 7, 2),
+        ["gsv", "gsv_streets", "mapillary", "kartaview"],
+        max_opt_in=1,
+        max_cities=1,
+    )
+    assert [c.city_id for c in slate.cities][0] == resumer, (
+        "the single reserved slot belongs to the live checkpoint, whatever group it is in"
+    )
 
 
 def test_a_city_due_only_on_an_opt_in_channel_is_hoisted_ahead_of_the_gsv_block(conn):

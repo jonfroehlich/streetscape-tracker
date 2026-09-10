@@ -25,7 +25,7 @@
  *
  * Depends on globals from streetscape-utils.js (loaded first):
  * STREETSCAPE_DATA_BASE_URL, fetchGzippedJson, escapeHtml — from
- * table-utils.js: sortRowsBy, formatCellNumber, coverageCellHtml,
+ * table-utils.js: sortRowsBy, formatCellNumber, coverageCellHtml, coverageCellParts,
  * rowHtmlFromColumns, createSortableTable — and from table-controls.js:
  * createTableControls. histogram-slider.js is loaded for the numeric filters,
  * but only table-controls.js talks to it.
@@ -374,16 +374,18 @@ const DRIVING_COLUMNS = [
       "is one, otherwise another provider's — hover a value to see which, since a non-GSV walk " +
       "answers a different question on a page about Google's driving.",
     cell: (r) => {
-      const html = coverageCellHtml(r.streetPct);
       // Only when it is NOT the GSV walk: on this page GSV is the default and
       // annotating every row would be noise.
       if (r.streetPct == null || !r.streetWalkProvider || r.streetWalkProvider === "gsv") {
-        return html;
+        return coverageCellHtml(r.streetPct);
       }
-      return html.replace(
-        "<td",
-        `<td title="${r.streetWalkProvider} road walk — this city has no GSV walk"`,
-      );
+      // Through coverageCellParts rather than String.replace on an assembled
+      // <td>: table-utils.js documents that seam as existing precisely so a
+      // caller can wrap the cell without doing surgery on its markup, and the
+      // surgery breaks silently the day coverageCellHtml's markup changes.
+      const { html, className } = coverageCellParts(r.streetPct);
+      const title = `${r.streetWalkProvider} road walk — this city has no GSV walk`;
+      return `<td class="${className}" title="${escapeHtml(title)}">${html}</td>`;
     },
   },
   {
@@ -764,6 +766,10 @@ function drivingRowModel(city, today = new Date()) {
     // Filled in by mergeStreetCoverage once the streetwalk manifest lands —
     // it is a separate artifact, and the page must render without it.
     streetPct: null,
+    // Same shape-parity contract as gsvExcluded: assigned only by
+    // mergeStreetCoverage, so both row models must declare it or the two
+    // diverge the moment a plan-area row reaches the same cell renderer.
+    streetWalkProvider: null,
     districtCount: city.plan?.districts_total ?? city.plan?.districts?.length ?? null,
     googlePanos: gsv?.google_panos ?? null,
     newestCapture: gsv?.newest_capture ?? null,
@@ -828,6 +834,7 @@ function planAreaRowModel(record, today = new Date()) {
     // short-circuits on `scope !== "city"` before reading this, so the value
     // is never displayed; its PRESENCE is the contract.
     gsvExcluded: false,
+    streetWalkProvider: null,
     verdict: record.verdict ?? "not_listed",
     captureYears: null,
     captureSpanYears: null,
@@ -907,7 +914,15 @@ function mergeStreetCoverage(rows, manifest) {
     // which series the number came from.
     let walk = lookupStreetwalk(manifest, row.cityId, "gsv", "drive");
     let walkProvider = "gsv";
-    if (!walk || walk.coverage_pct_by_length == null) {
+    // ONLY for a city excluded from gsv, which is the case the rationale names.
+    // Applied to every city with no GSV walk it would quietly mix three
+    // providers into one sortable, FILTERABLE column on a page about Google's
+    // driving -- so "street coverage over 80%" would silently mean "some
+    // provider's", the same defect CLAUDE.md records for grid.html's
+    // "Collected by" scope. An excluded city can never have a GSV walk, so
+    // there the column is otherwise blank for a reason that is not about
+    // Google's driving at all.
+    if (row.gsvExcluded && (!walk || walk.coverage_pct_by_length == null)) {
       for (const provider of ["mapillary", "kartaview"]) {
         const alt = lookupStreetwalk(manifest, row.cityId, provider, "drive");
         if (alt && alt.coverage_pct_by_length != null) {

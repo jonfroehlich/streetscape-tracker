@@ -841,9 +841,10 @@ def generate_aggregate_v2(conn, data_dir: str) -> dict[str, Any]:
             "providers": providers_out,
         }
         # schema v4. Absent when there are none, which is every city on every
-        # production config until an operator excludes one -- so the artifact is
-        # byte-identical to v3 for an unexcluded catalog and the key's PRESENCE
-        # is itself the signal.
+        # production config until an operator excludes one -- so each RECORD is
+        # byte-identical to its v3 form for an unexcluded catalog (the document
+        # still differs, by `schema_version`), and the key's PRESENCE is itself
+        # the signal.
         #
         # Without this, `member` reached no published artifact and only
         # `city.enabled` did, so no page could tell "deliberately excluded from
