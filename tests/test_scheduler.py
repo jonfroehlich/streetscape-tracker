@@ -2608,6 +2608,55 @@ def test_a_third_stranded_population_cannot_squeeze_out_the_excluded_one(conn):
     )
 
 
+def test_resumers_cannot_take_the_whole_reservation(conn, monkeypatch):
+    """The global resumer take has to be BOUNDED, or it re-zeroes a group.
+
+    Taken at `max_opt_in`, checkpointed cities in one group consume the whole
+    reservation: measured on a prod-shaped slate they displaced one-for-one,
+    and at ten stranded resumers in one group both other groups went to zero —
+    the same failure class the three-way key exists to remove. Reachable rather
+    than theoretical: a paused sweep records no success, so a city whose gsv
+    succeeded the same night is stranded-with-a-live-checkpoint the next one,
+    and a checkpoint lives seven days.
+
+    Leaving one slot per OTHER non-empty group costs nothing where it matters —
+    see the max_opt_in = 1 case in the next test, where the floor keeps the
+    resumer's guarantee intact.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    # Group 2 (transient): fresh gsv clock, all carrying live checkpoints.
+    transient = [_register(conn, f"Atr{i}", width=1000, height=1000, step=20) for i in range(4)]
+    # Group 0 (permanent): excluded from gsv, no checkpoint, sorts LAST.
+    excluded = [_register(conn, f"Zex{i}", width=1000, height=1000, step=20) for i in range(4)]
+    db.assign_schedule(conn, 90, providers=("gsv", "gsv_streets", "mapillary"))
+    for cid in transient:
+        for channel in ("gsv", "gsv_streets"):
+            db.record_attempt(conn, cid, success=True, provider=channel)
+    for cid in excluded:
+        for channel in ("gsv", "gsv_streets"):
+            db.set_channel_membership(conn, cid, channel, False, cycle_days=90)
+
+    monkeypatch.setattr(
+        sched,
+        "_sweep_checkpoint_progress",
+        lambda cfg, city, channel: {"age_s": 1.0} if city.city_id in transient else None,
+    )
+    cfg = _sweep_cfg(publish_enabled=False, opt_in_cities_per_day=2)
+    slate = sched._collect_due(
+        conn,
+        cfg,
+        date(2026, 7, 2),
+        ["gsv", "gsv_streets", "mapillary"],
+        max_opt_in=2,
+        max_cities=2,
+    )
+    head = [c.city_id for c in slate.cities][:2]
+    assert any(c in excluded for c in head), (
+        "four resumers in one group must not consume a two-slot reservation outright"
+    )
+
+
 def test_a_live_checkpoint_outranks_the_rotation_across_groups(conn, monkeypatch):
     """The #239 guarantee has to hold ACROSS stranded groups, not inside one.
 

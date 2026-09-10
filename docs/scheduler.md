@@ -312,6 +312,8 @@ The three groups are what the reservation has to tell apart, and the question ea
 Grouping only on 1-or-2 versus 3 is not enough, and the first attempt at this shipped exactly that: group 3 is prod's documented ~121-city mapillary-only-due population, and sharing a bucket with group 1 it won the same alphabetical lottery, putting the #301 cities back at **0 of 10** on a prod-shaped slate.
 Splitting 1 from 3 is what makes the reservation a rate: measured on the same slate, 4 of 10 to #301, 3 to the KartaView widening, 3 to the transient population.
 **A live checkpoint outranks the rotation across every group**, taken first and in union order — confined to its own group it stops being a guarantee at a reservation of 1, and #239's five nights stop being CONSECUTIVE.
+That take is itself **bounded**, leaving one slot per other non-empty group, because unbounded it is the same starvation a third time: measured, ten stranded resumers in one group displaced the other two groups one-for-one and zeroed both.
+The floor keeps it at one, so at a reservation of 1 the resumer still wins and the #239 guarantee is untouched; any reservation at least as large as the number of stranded groups now guarantees each of them a slot.
 A group leaves the rotation as it empties, so a night with only one stranded population behaves exactly as the straight take did.
 
 **`[schedule].refresh_slots` reserves a share of the night's city cap for cities that will gain a second interval.**

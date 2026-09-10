@@ -4075,11 +4075,14 @@ def cmd_assess_city(
             f"{excluded_channels[0]} --clear` if that is not what you meant."
         )
         if not channels:
-            logger.error(
+            # Not USAGE_EXIT_CODE: the command was well-formed and the catalog
+            # answered it. "Every assess channel is excluded here" is a true
+            # answer, and 64 would tell an operator they mistyped something.
+            logger.warning(
                 f"{city.city_id}: every assess channel is excluded for this city, so "
-                f"there is nothing to collect and the report would be empty."
+                f"there is nothing to collect. Clear an exclusion to assess it."
             )
-            return USAGE_EXIT_CODE
+            return 0
     print(_assess_preflight_report(cfg, conn, city, today, channels))
 
     if estimate_only:
@@ -5227,8 +5230,26 @@ def _collect_due(
             # property docs/scheduler.md rests the whole amnesty design on.
             # Taken first and in union order, it is the same guarantee the
             # straight take used to provide by construction.
+            # BOUNDED, or it re-creates the starvation one more time. Taken at
+            # `max_opt_in` the resumers can consume the whole reservation, and
+            # measured on the prod-shaped slate they displace one-for-one: at 10
+            # stranded resumers in one group, groups 0 and 1 both went to zero.
+            # That is reachable rather than theoretical -- a paused sweep
+            # records no success, so a city whose gsv succeeded the same night
+            # is stranded-with-a-live-checkpoint the next one, and a KartaView
+            # widening at 502 enrolled cities makes ten at once plausible, with
+            # no drain inside a night (CHECKPOINT_MAX_AGE_S is seven days).
+            #
+            # Leaving one slot per OTHER non-empty group costs the resumers
+            # nothing at the size that matters: at max_opt_in = 1 with two
+            # groups the floor keeps the take at 1, so F4's guarantee -- a live
+            # checkpoint outranks the rotation -- is untouched, while any
+            # max_opt_in >= the number of groups now guarantees every stranded
+            # population a slot. The two invariants only looked like they were
+            # in conflict.
+            n_groups = len({_stranded_kind(i) for i in stranded})
             resumers = [i for i in stranded if _has_live_checkpoint(ordered[i])]
-            chosen = set(resumers[:max_opt_in])
+            chosen = set(resumers[: max(1, max_opt_in - (n_groups - 1))])
 
             # Then round-robin the rest, so no stranded population can be
             # zeroed by a larger one. A group leaves the rotation as it empties,
