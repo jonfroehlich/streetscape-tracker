@@ -27,10 +27,13 @@ wrongly:
     parameter, and ``config.load_config("panoramax_streets")`` returns
     ``access_token=None`` rather than raising. A missing key cannot be the
     reason this walk fails.
-  * **Pacing is deliberately half Mapillary's** (30/min). Panoramax documents no
-    rate limit and returns no ``X-RateLimit-*``/``Retry-After`` header, so the
+  * **Pacing is the lowest tile rate in the repo** (30/min). Panoramax documents
+    no rate limit and returns no ``X-RateLimit-*``/``Retry-After`` header, so the
     figure is a conservative default rather than a measured ceiling — see
-    CLAUDE.md's provider-access rule before changing it.
+    CLAUDE.md's provider-access rule before changing it. It is half the
+    ``download_mapillary`` module's exported 60, but be careful quoting that as
+    the margin: both Mapillary channels RUN at 40 (#292), so the real gap to a
+    host that does document a limit is 25%, not 50%.
 
 Cost tracks bbox AREA, not sample count or ``--spacing`` (pinned by a test), and
 on a paired night it is ZERO: the census cache keys on (provider, city, bbox)

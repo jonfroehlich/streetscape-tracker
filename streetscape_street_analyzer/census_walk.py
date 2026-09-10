@@ -13,14 +13,15 @@ for the same reason ``census.py`` holds the grid pipeline once (see CLAUDE.md):
 the contracts it enforces are invisible in a review of the second copy. Before
 #258 this lived in ``collect_mapillary``, whose own comment said in so many
 words that ``build_streetwalk_rows`` "is Mapillary-specific and will have to be
-generalized" — this is that generalization, and the KartaView walk is the second
-caller it was waiting for.
+generalized" — this is that generalization; the KartaView walk was the second
+caller it was waiting for, and the Panoramax walk (#331) is the third.
 
 What is genuinely per-provider is small and explicit:
 
   * how a census row's capture date is derived (Mapillary stores epoch
     milliseconds; KartaView stores a shot date that is nulled when it is not
-    strictly older than the ingest timestamp),
+    strictly older than the ingest timestamp; Panoramax stores an ISO string at
+    mixed precisions with a genuine 1970 epoch sentinel to drop),
   * the provider's output row schema, via its own ``build_image_rows`` /
     ``build_empty_rows`` bindings of the ``census.py`` core.
 
@@ -69,10 +70,11 @@ class CensusWalkSpec:
         capture_dates_for: ``(census, positions) -> array`` of ISO date strings
             for those census rows. The one genuinely divergent piece: Mapillary
             reads ``captured_at_ms``, KartaView reads ``shot_date`` against
-            ``date_added``. A date the provider's own guard rejects must come
+            ``date_added``, Panoramax parses its ``ts`` string against a
+            plausibility floor. A date the provider's own guard rejects must come
             back as **the empty string**, which becomes NO_DATE below — never a
             dropped sample, because an undated pano still covers (issue #257).
-            Both current bindings emit ``""`` (`.fillna("")`);
+            All three current bindings emit ``""`` (`.fillna("")`);
             ``status_for_capture_dates`` also treats None/NaN/NaT as missing,
             so a binding that returns None is scored correctly rather than
             silently publishing OK with a null date, but ``""`` is the
@@ -219,11 +221,11 @@ def build_streetwalk_rows(
         spec: the provider's :class:`CensusWalkSpec`.
         unmeasured_mask: ``(lats, lons) -> bool array`` marking sample points
             under a tile or cell the fetch never got back — KartaView's
-            ``_points_in_cells`` over ``failed_cells`` (#258) and Mapillary's
-            ``_points_in_tiles`` over ``failed_tiles`` (#259), each the same
-            helper its own GRID run masks with, so the two artifacts agree
-            about the same unswept ground. None for a clean sweep, which pays
-            nothing.
+            ``_points_in_cells`` over ``failed_cells`` (#258), Mapillary's
+            ``_points_in_tiles`` over ``failed_tiles`` (#259) and Panoramax's
+            over its own ``failed_tiles`` (#331), each the same helper its own
+            GRID run masks with, so the two artifacts agree about the same
+            unswept ground. None for a clean sweep, which pays nothing.
 
             Recording an unswept sample as ZERO_RESULTS publishes an absence
             we never observed into an immutable dated snapshot, and nothing

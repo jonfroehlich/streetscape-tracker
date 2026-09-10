@@ -106,13 +106,22 @@ from streetscape_metadata_tracker.download_mapillary import (
     estimate_tile_count,
 )
 
-# ALIASED, EVERY NAME OF THEM. Panoramax exports the same four identifiers as
-# download_mapillary -- same spelling, different numbers (30/min not 40, z15 not
-# z14) -- so a bare `from ... import estimate_tile_count` here would not be a
-# name clash the linter flags but a SILENT REBINDING of whichever import came
-# second, and the loser's channel would then be priced and paced by the winner's
-# constants. That is the #268 failure (one provider's cost model wearing
+# ALIASED, BECAUSE TWO OF THESE NAMES ARE ALREADY BOUND ABOVE TO MAPILLARY'S
+# VALUES. `estimate_tile_count` counts a z15 lattice here against Mapillary's
+# z14 (~4x the tiles for one bbox), and DEFAULT_TILE_REQUESTS_PER_MINUTE is 30
+# against Mapillary's 60. A bare `from ... import estimate_tile_count` would not
+# be a name clash the linter flags but a SILENT REBINDING of whichever import
+# came second, and the loser's channel would then be priced and paced by the
+# winner's constants -- the #268 failure (one provider's cost model wearing
 # another's name) reached through the import list instead of through an `else`.
+#
+# BE PRECISE ABOUT WHICH NAMES ACTUALLY COLLIDE, because a reader who checks an
+# overstated claim and finds it false deletes the aliasing along with it. The
+# two above are the real ones. Of the other names the two modules share,
+# DEFAULT_TILE_JITTER is 0.6 in BOTH (same value, so a mix-up would be
+# invisible rather than harmless -- alias it anyway, since the value is free to
+# diverge), and `grid_bbox` is not a collision at all: both modules re-export
+# the identical `download_common.grid_bbox`, and it is not imported here.
 from streetscape_metadata_tracker.download_panoramax import (
     DEFAULT_TILE_JITTER as PANORAMAX_TILE_JITTER,
 )
@@ -213,12 +222,17 @@ STREET_COST_MODELS: dict[str, StreetCostModel] = {
     # from the cache anyway. See docs/experiments/kartaview-sweep-cost.md.
     "kartaview": StreetCostModel(unit="KartaView sweep requests", estimate=estimate_sweep_requests),
     "mapillary": StreetCostModel(unit="Mapillary tile requests", estimate=estimate_tile_count),
-    # EXACT rather than a floor, unlike KartaView's: the z15 lattice over the
-    # frozen bbox is counted from geometry with no imagery-dependent term, so
-    # there is no observed-versus-geometric correction to apply. Note the zoom
-    # in the estimator, not here -- z15 is the coarsest that serves the v1
-    # `pictures` layer at all, so a bbox costs ~4x the Mapillary row above and
-    # the two units are not interchangeable numbers.
+    # An exact LATTICE count, which is not the same as an exact REQUEST count.
+    # The z15 tiles over the frozen bbox are counted from geometry with no
+    # imagery-dependent term, so unlike KartaView's estimate there is no
+    # pagination term to under-count -- but `count_request` sits INSIDE
+    # download_panoramax._fetch_tile's @backoff body (deliberately, #198), so a
+    # flaky tile bills up to _TILE_MAX_TRIES. Spend can therefore exceed this
+    # figure on a bad night, and the --daily-budget pre-flight below can
+    # correspondingly under-refuse; it is a tight floor, not a ceiling.
+    # Note the zoom in the estimator, not here -- z15 is the coarsest that
+    # serves the v1 `pictures` layer at all, so a bbox costs ~4x the Mapillary
+    # row above and the two units are not interchangeable numbers.
     "panoramax": StreetCostModel(
         unit="Panoramax tile requests", estimate=estimate_panoramax_tile_count
     ),
@@ -927,12 +941,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Client-side pacing cap for Panoramax tile requests "
             f"(default: {PANORAMAX_TILE_REQUESTS_PER_MINUTE}); <= 0 disables "
-            "pacing. Its own flag, and DELIBERATELY HALF the Mapillary default "
-            "above: Panoramax documents no rate limit and returns no "
+            "pacing. Its own flag, and the LOWEST tile pace in the repo: "
+            "Panoramax documents no rate limit and returns no "
             "X-RateLimit-*/Retry-After header, so there is no ceiling to pace "
             "against and the conservative number is the honest one. It is "
-            "volunteer-run infrastructure with no credential identifying us "
-            "(issues #316, #331)"
+            "volunteer-run infrastructure with no credential identifying us. "
+            "Half the Mapillary module's exported 60, though the margin against "
+            "what Mapillary actually RUNS at is smaller -- both Mapillary "
+            "channels are configured to 40 (#292) (issues #316, #331)"
         ),
     )
     parser.add_argument(

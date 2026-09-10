@@ -463,8 +463,10 @@ Panoramax is the third, and the arm is small precisely because nothing about the
 A second implementation here would be a second date rule, and one city's grid and street artifacts would disagree about the same picture.
 
 **Two hazards are specific to this provider being Mapillary-shaped.**
-`download_panoramax` exports `estimate_tile_count`, `DEFAULT_TILE_REQUESTS_PER_MINUTE`, `DEFAULT_TILE_JITTER` and `grid_bbox` under the SAME spellings as `download_mapillary`, with different numbers behind them (z15 not z14, 30/min not 40).
-So `collect.py` imports every one of them ALIASED: a bare import would not be a clash the linter flags but a silent rebinding of whichever came second, after which the loser's channel is priced and paced by the winner's constants — the #268 failure (one provider's cost model wearing another's name) reached through the import list rather than through an `else`.
+`download_panoramax` shares four exported spellings with `download_mapillary`, and **two of them are genuine collisions**: `estimate_tile_count` (a z15 lattice against a z14 one, ~4x the tiles for one bbox) and `DEFAULT_TILE_REQUESTS_PER_MINUTE` (30 against 60).
+So `collect.py` imports them ALIASED: a bare import would not be a clash the linter flags but a silent rebinding of whichever came second, after which the loser's channel is priced and paced by the winner's constants — the #268 failure (one provider's cost model wearing another's name) reached through the import list rather than through an `else`.
+**Be precise about which names collide**, because a reader who checks an overstated claim and finds it false deletes the aliasing with it: `DEFAULT_TILE_JITTER` is 0.6 in BOTH modules, and `grid_bbox` is not a collision at all — both re-export the identical `download_common.grid_bbox`, and `collect.py` does not import it.
+The first version of this paragraph claimed all four differed and quoted Mapillary's rate as 40, which is its PRODUCTION CONFIG value and not what the module exports; a three-reviewer pass caught it.
 And a **404 is an empty tile**, not a failure, so a tile genuinely holding no imagery never reaches `failed_tiles`; everything the walk's `unmeasured_mask` covers is ground the fetch really did not see.
 
 **`panoramax_streets` is a budget channel with no credential behind it.**

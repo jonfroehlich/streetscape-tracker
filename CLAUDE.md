@@ -23,7 +23,7 @@ The tool samples a geographic grid around a city center, queries each provider's
 | GSV | [Street View Static API usage & billing](https://developers.google.com/maps/documentation/streetview/usage-and-billing) + the API's own docs | Google Maps Platform issue tracker; Stack Overflow `google-street-view` tag |
 | KartaView | No developer portal: the single documented figure (100/h anonymous, 1,000/h authenticated) sits in a JS-SPA FAQ, restated by [Bellingcat's toolkit](https://bellingcat.gitbook.io/toolkit/more/all-tools/kartaview) | **None exists** — the `kartaview/openstreetcam.org` tracker is unstaffed, so for this provider there is no early warning at all; pace on the documented number and stage volume changes |
 | Mapillary | [API documentation](https://www.mapillary.com/developer/api-documentation), incl. its rate-limits section | [forum.mapillary.com](https://forum.mapillary.com) — **not optional**: Mapillary's real operational limits are undocumented and described only there |
-| Panoramax | [API docs](https://panoramax.fr) and the OpenAPI spec at `api.panoramax.xyz/openapi.json` — **neither documents any rate limit**, and no `X-RateLimit-*`/`Retry-After` header comes back | [forum.geocommuns.fr](https://forum.geocommuns.fr) and the [OSM community forum](https://community.openstreetmap.org/), both staffed by core developers — so unlike KartaView the pacing question CAN be asked; it has not been (#316), which is why the pace is deliberately half Mapillary's |
+| Panoramax | [API docs](https://panoramax.fr) and the OpenAPI spec at `api.panoramax.xyz/openapi.json` — **neither documents any rate limit**, and no `X-RateLimit-*`/`Retry-After` header comes back | [forum.geocommuns.fr](https://forum.geocommuns.fr) and the [OSM community forum](https://community.openstreetmap.org/), both staffed by core developers — so unlike KartaView the pacing question CAN be asked; it has not been (#316), which is why the pace is the lowest tile rate in the repo, 30/min — half the Mapillary MODULE's exported 60, though both Mapillary channels actually RUN at 40, so the real margin is 25% |
 
 **The documented limit is not necessarily the binding one, and the forum is where you learn that.**
 The 2026-08-12 case study: an undocumented per-IP throttle (302 → login) blocked both our Mapillary apps at ~21% of the documented per-app daily cap, and a forum thread had already described that exact failure, its per-IP scope, and its retry hazard before we sustained 370 req/min into it.
@@ -52,7 +52,7 @@ python -m streetscape_street_analyzer.collect "Seattle, WA" --estimate      # co
 python -m streetscape_street_analyzer.collect "Seattle, WA" --spacing 15
 python -m streetscape_street_analyzer.collect "Seattle, WA" --provider mapillary
 python -m streetscape_street_analyzer.collect "Seattle, WA" --provider kartaview   # free on a paired night (#290 cache)
-python -m streetscape_street_analyzer.collect "Grenoble, France" --provider panoramax  # no credential; z15 tile census (#331)
+python -m streetscape_street_analyzer.collect "Paris, Ile-de-France, France" --provider panoramax  # no credential; z15 tile census (#331)
 python -m streetscape_street_analyzer.collect "Seattle, WA" --network-type all_public   # a SEPARATE walk series, not a replacement
 
 # Worldwide sampling frame (docs/worldwide_sampling.md)

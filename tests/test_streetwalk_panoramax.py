@@ -13,7 +13,9 @@ this arm trustworthy in its own right rather than by analogy to Mapillary:
   * it runs with a COMPLETELY BARE environment -- the one walk with no
     credential at all, which is a contract rather than a convenience;
   * it is priced and paced by PANORAMAX's constants, not Mapillary's, whose
-    module exports the same four identifier names with different numbers;
+    module exports two of the same identifier names with different values
+    (`estimate_tile_count`, z15 vs z14; `DEFAULT_TILE_REQUESTS_PER_MINUTE`,
+    30 vs 60);
   * the census cache (#290): on a paired night the grid run's tiles are this
     walk's census for ZERO requests;
   * a failed tile publishing REQUEST_FAILED rather than ZERO_RESULTS, so an
@@ -92,6 +94,9 @@ def _setup(
     pictures,
     *,
     api_requests=5,
+    api_requests_total=None,
+    census_fetched_by=None,
+    census_fetched_at=None,
     failed_tiles=None,
     edges=None,
     grid_m=200,
@@ -143,9 +148,15 @@ def _setup(
             "census": records_to_census(pictures),
             # Per-process spend and the crawl's cumulative spend are different
             # numbers by design: the first feeds the additive daily ledger, the
-            # second the street_walks row.
+            # second the street_walks row. They DEFAULT to equal, because this
+            # fake never resumes -- but the parameter exists so a test can drive
+            # them apart, which is the only way the two are distinguishable at
+            # all. Left permanently equal, swapping them in the collector's
+            # return dict passed all 14 tests (found by review).
             "api_requests": api_requests,
-            "api_requests_total": api_requests,
+            "api_requests_total": (
+                api_requests if api_requests_total is None else api_requests_total
+            ),
             "checkpoint_path": kwargs.get("checkpoint_path"),
             "tiles": 5,
             "raw_feature_count": len(pictures),
@@ -153,9 +164,13 @@ def _setup(
             # never lands in this list, so everything in it is genuinely
             # unmeasured ground.
             "failed_tiles": list(failed_tiles or []),
-            "census_fetched_by": kwargs.get("checkpoint_channel"),
-            "census_fetched_at": None,
-            "census_reused": False,
+            # Census provenance (#290). Defaults mimic an ordinary fresh fetch:
+            # this channel paid, and nothing was reused.
+            "census_fetched_by": census_fetched_by or kwargs.get("checkpoint_channel"),
+            "census_fetched_at": census_fetched_at,
+            "census_reused": bool(
+                census_fetched_by and census_fetched_by != kwargs.get("checkpoint_channel")
+            ),
         }
 
     monkeypatch.setattr(cp, "fetch_city_images_async", fake_fetch_images)
@@ -277,10 +292,12 @@ def test_the_estimate_prices_z15_tiles_and_issues_no_requests(tmp_path, monkeypa
     """
     --estimate must reach download_panoramax's estimator, not download_mapillary's.
 
-    Both modules export `estimate_tile_count`, `DEFAULT_TILE_REQUESTS_PER_MINUTE`
-    and `DEFAULT_TILE_JITTER` -- the same four spellings, different numbers -- so
-    an unaliased import in collect.py would silently rebind whichever came
-    second and price this channel with the other's z14 lattice. That is the #268
+    Both modules export `estimate_tile_count` and
+    `DEFAULT_TILE_REQUESTS_PER_MINUTE` under one spelling with two different
+    values (z15 vs z14; 30 vs 60), so an unaliased import in collect.py would
+    silently rebind whichever came second and price this channel with the
+    other's z14 lattice. (`DEFAULT_TILE_JITTER` is 0.6 in both and `grid_bbox`
+    is the same re-exported object, so those two are not collisions today.) That is the #268
     failure (one provider's cost model wearing another's name) reached through
     the import list, and it is invisible: a z14 count is a plausible number.
 
@@ -436,6 +453,69 @@ def test_flat_imagery_alone_is_FLAT_ONLY_with_no_capture_date(tmp_path, monkeypa
     assert any_pct > 0, "...but it is any-imagery coverage"
 
 
+# ── Spend, and what a failure still owes the ledger ──────────────────────────
+
+
+def test_the_walk_row_takes_the_crawl_and_the_ledger_takes_this_process(tmp_path, monkeypatch):
+    """
+    The #239/#256 split, on this arm: `street_walks.api_requests` describes the
+    WALK (every resume), while `api_usage` is additive and keyed by (date,
+    provider) so it may only ever receive what THIS process spent.
+
+    Driven apart deliberately (4 vs 19). Every other test in this file leaves
+    the two equal, because the fake never resumes -- and while they were equal
+    everywhere, swapping the two keys in the collector's return dict passed all
+    14 tests. Uncaught, a resumed walk charges last night's tiles against
+    tonight's budget gate and records a fraction of the crawl's cost in the row.
+    """
+    data_dir, _ = _setup(
+        tmp_path,
+        monkeypatch,
+        [_picture("px1", 44.05, -121.30)],
+        api_requests=4,
+        api_requests_total=19,
+    )
+    assert collect.run_collect(_args(data_dir)) == 0
+
+    conn = db.connect(db.get_default_db_path(data_dir))
+    walk = db.get_latest_street_walk(conn, CITY_ID, provider="panoramax")
+    spent = db.get_api_usage(conn, date.fromisoformat(RUN_DATE), provider="panoramax_streets")
+    conn.close()
+    assert walk["api_requests"] == 19, "the row carries the whole crawl"
+    assert spent == 4, "the ledger carries only this process's spend"
+
+
+def test_a_walk_whose_tail_dies_still_records_what_the_census_cost(tmp_path, monkeypatch):
+    """
+    The checkpoint is what turns a tail failure into a PERMANENT loss rather
+    than a wasted night, and is why the collector attaches its spend to the
+    exception.
+
+    Without a checkpoint, a failure after the fetch lost the spend with the
+    process and a re-run bought the tiles again, so nothing went unrecorded.
+    With one, the checkpoint survives COMPLETE and the next invocation
+    re-finalizes it for zero requests -- so a spend missed here lands in no
+    `api_usage` row, EVER.
+
+    Found by review: replacing the collector's `except BaseException` block with
+    a bare `raise` passed all 14 tests, because nothing exercised the path.
+    """
+    data_dir, _ = _setup(tmp_path, monkeypatch, [_picture("px1", 44.05, -121.30)], api_requests=11)
+
+    def explode(*a, **k):
+        raise OSError("no space left on device")
+
+    # After the census is paid for, before the CSV lands -- and NOT a
+    # DownloadError, so this also pins that `except Exception` is wide enough.
+    monkeypatch.setattr(cp, "build_streetwalk_rows", explode)
+
+    assert collect.run_collect(_args(data_dir)) == 1
+    conn = db.connect(db.get_default_db_path(data_dir))
+    spent = db.get_api_usage(conn, date.fromisoformat(RUN_DATE), provider="panoramax_streets")
+    conn.close()
+    assert spent == 11, "the tiles were bought; the ledger has to know even though the walk failed"
+
+
 # ── The census cache is what makes this affordable (#290) ────────────────────
 
 
@@ -466,6 +546,39 @@ def test_the_walk_reads_the_grid_runs_cache_entry(tmp_path, monkeypatch):
     assert calls["checkpoint_channel"] == "panoramax_streets"
     assert calls["checkpoint_variant"] == "drive"
     assert "panoramax_streets" in calls["checkpoint_path"]
+
+
+def test_a_reused_census_costs_the_ledger_nothing_and_says_who_paid(tmp_path, monkeypatch):
+    """
+    The zero has to be LEGIBLE. `street_walks.api_requests = 0` on a fully
+    walked city reads as a bug unless the row also records that the `panoramax`
+    grid channel bought the census and when the provider was observed -- which
+    is what the v14 provenance columns are for (#290).
+
+    Found by review: hardcoding all three provenance fields to None/None/False
+    in the collector's return dict passed all 14 tests, because the fake never
+    returned a reused census. A paired night would then write NULL into exactly
+    the two columns that exist to explain the 0.
+    """
+    data_dir, _ = _setup(
+        tmp_path,
+        monkeypatch,
+        [_picture("px1", 44.05, -121.30)],
+        api_requests=0,
+        api_requests_total=0,
+        census_fetched_by="panoramax",
+        census_fetched_at="2026-07-08T01:02:03+00:00",
+    )
+    assert collect.run_collect(_args(data_dir)) == 0
+
+    conn = db.connect(db.get_default_db_path(data_dir))
+    walk = db.get_latest_street_walk(conn, CITY_ID, provider="panoramax")
+    spent = db.get_api_usage(conn, date.fromisoformat(RUN_DATE), provider="panoramax_streets")
+    conn.close()
+    assert walk["api_requests"] == 0, "a reused census costs nothing"
+    assert spent == 0, "and charges neither ledger"
+    assert walk["census_fetched_by"] == "panoramax", "the GRID channel paid, and the row says so"
+    assert walk["census_fetched_at"] == "2026-07-08T01:02:03+00:00"
 
 
 def test_the_walks_variant_reaches_the_fetch(tmp_path, monkeypatch):

@@ -166,9 +166,9 @@ def checkpoint_path_for(
     nights and a run is dated on the day it COMPLETES, so a date in this path
     would make every night start from zero.
 
-    The CHANNEL is not optional, and it is what keeps the two channel PAIRS
-    apart: ('mapillary', 'mapillary_streets') and ('kartaview',
-    'kartaview_streets'). A road walk sweeps the same frozen bbox with the same
+    The CHANNEL is not optional, and it is what keeps the three channel PAIRS
+    apart: ('mapillary', 'mapillary_streets'), ('kartaview',
+    'kartaview_streets') and ('panoramax', 'panoramax_streets') (#331). A road walk sweeps the same frozen bbox with the same
     geometry the grid run uses, so every geometric validation a loader makes
     would pass and the two channels would resume each other's crawls -- into
     different ledgers, and for Mapillary under different credentials. Each
