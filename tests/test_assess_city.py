@@ -610,13 +610,18 @@ def test_a_disabled_channel_is_not_collected_even_unfiltered(conn, monkeypatch, 
 def test_the_daily_budget_ledger_still_governs_a_manual_run(conn, monkeypatch, tmp_path):
     """
     Inheriting the ledger is a large part of why this is a scheduler subcommand
-    and not a script. The Mapillary GRID run has no other governor — cli.py only
-    ever *records* spend via add_api_usage — so a channel with the day already
-    spent must be skipped here exactly as it would be on a nightly run, and
-    counted as a budget skip rather than a failure.
+    and not a script: a channel with the day already spent must be skipped here
+    exactly as it would be on a nightly run, and counted as a budget skip rather
+    than a failure.
+
+    A budget of ZERO, and the zero is load-bearing since #318. Mapillary is
+    resumable now, so a small-but-nonzero budget no longer skips the channel --
+    it launches the crawl with that many requests as its cap, which is the whole
+    point of the issue. What still refuses a launch is having nothing left to
+    cap at, so an exhausted ledger is the case this test has to encode.
     """
     cfg = _cfg(tmp_path)
-    cfg.providers["mapillary"] = ProviderConfig(enabled=True, daily_request_budget=5)
+    cfg.providers["mapillary"] = ProviderConfig(enabled=True, daily_request_budget=0)
     ran = _stub_collection(monkeypatch, conn)
 
     rc = _assess(tmp_path, cfg=cfg)

@@ -437,15 +437,17 @@ def run_collect(args: argparse.Namespace) -> int:
             # night the paired grid sweep itself pauses -- a checkpoint is not a
             # cache entry, so the walk prices at full.
             #
-            # Scoped to the provider the cap reaches: it is forwarded only to
-            # the KartaView sweep (see the dispatch below), so honouring it for
-            # any other provider would relax a gate nothing enforces.
-            cap = getattr(args, "kartaview_max_requests", None)
-            gated_requests = (
-                min(estimated_requests, cap)
-                if cap is not None and provider == "kartaview"
-                else estimated_requests
-            )
+            # Scoped to the provider the cap reaches, one entry per flag the
+            # dispatch below actually forwards: honouring a cap for a provider
+            # nothing hands it to would relax a gate nothing enforces. Read as a
+            # table rather than as a chain of `provider == ...` so adding the
+            # third capped provider is a row, not a fourth branch that the next
+            # reader has to check for symmetry (issue #318).
+            cap = {
+                "kartaview": getattr(args, "kartaview_max_requests", None),
+                "mapillary": getattr(args, "mapillary_max_requests", None),
+            }.get(provider)
+            gated_requests = min(estimated_requests, cap) if cap is not None else estimated_requests
             if already + gated_requests > args.daily_budget:
                 logger.error(
                     "%s daily budget %d would be exceeded: %d already spent "
@@ -492,6 +494,7 @@ def run_collect(args: argparse.Namespace) -> int:
                         request_timeout=args.timeout,
                         max_requests_per_minute=args.mapillary_max_requests_per_minute,
                         jitter=args.mapillary_jitter,
+                        max_requests=args.mapillary_max_requests,
                         checkpoint_path=checkpoint_path,
                         checkpoint_channel=budget_channel,
                         checkpoint_variant=args.network_type,
@@ -871,6 +874,22 @@ def build_parser() -> argparse.ArgumentParser:
             "1,000/h, which this default sits under (issue #258)"
         ),
     )
+    parser.add_argument(
+        "--mapillary-max-requests",
+        # positive_int for the same reason the KartaView flag below carries it:
+        # 0 is not "off", it is a crawl that stops before committing a tile,
+        # checkpoints nothing, and exits 83 telling the operator to re-run.
+        type=positive_int,
+        default=None,
+        help=(
+            "Stop the walk's Mapillary tile census after this many requests and "
+            "CHECKPOINT the rest. Nothing is published and the run exits "
+            f"{SWEEP_INCOMPLETE_EXIT_CODE}, so the next run resumes rather than "
+            "re-paying (issue #318). A soft ceiling: requests already in flight "
+            "are allowed to finish. Default: fetch every tile."
+        ),
+    )
+
     parser.add_argument(
         "--kartaview-max-requests",
         # Not `int`: 0 here is the same trap the grid CLI refuses at parse time

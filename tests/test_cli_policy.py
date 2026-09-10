@@ -667,6 +667,76 @@ def test_an_incomplete_sweep_exits_83_and_publishes_nothing(monkeypatch, catalog
     assert db.get_api_usage(conn, RUN_DATE, provider="kartaview") == 4
 
 
+def test_a_paused_mapillary_census_exits_83_and_publishes_nothing(monkeypatch, catalog):
+    """The census reached the pause path in #318, and the CLI must classify it.
+
+    Everything about this is the KartaView test above with a different
+    downloader stubbed, which is the point: one exception, one exit code, one
+    aggregation. A second classification arm for the tile census is exactly what
+    hoisting SweepIncompleteError into download_common exists to prevent, so a
+    Mapillary pause has to land on the SAME branch rather than on a parallel one
+    that could drift.
+
+    The unit says "tiles" here and "root cells" above, and that is the whole
+    reason the field is provider-supplied: this string is what an operator reads
+    to decide whether a night made progress.
+    """
+    conn, city_id, data_dir = catalog
+    mapillary_configs(monkeypatch)
+    error = SweepIncompleteError(
+        "request cap", checkpoint_path="/cp", units_done=61, unit_count=104, unit_name="tiles"
+    )
+    error.api_requests = 61
+
+    async def stub(**kwargs):
+        raise error
+
+    monkeypatch.setattr(cli, "download_mapillary_metadata_async", stub)
+    assert (
+        run_cli(monkeypatch, city_id, data_dir, provider="mapillary") == SWEEP_INCOMPLETE_EXIT_CODE
+    )
+    # Nothing published, because a partial census dated today diffs against its
+    # predecessor as "every pano in the rest of the city removed" -- but the
+    # spend IS on the ledger, because those tiles were fetched and the CDN
+    # counted them against the per-IP limit either way.
+    assert db.get_latest_run(conn, city_id, provider="mapillary") is None
+    assert db.get_api_usage(conn, RUN_DATE, provider="mapillary") == 61
+
+
+@pytest.mark.parametrize(
+    ("flag", "provider"),
+    [("--mapillary-max-requests", "mapillary"), ("--panoramax-max-requests", "panoramax")],
+)
+def test_the_tile_census_caps_refuse_zero_at_parse_time(monkeypatch, catalog, flag, provider):
+    """0 is not "off" on any of the three caps, and the guard is shared.
+
+    A cap of 0 stops the crawl before it commits a tile, checkpoints nothing,
+    and exits 83 printing "re-run to resume" -- a loop the message actively
+    encourages. The KartaView flag has refused it since #273; these two are new
+    in #318 and carry the same download_common.positive_int, because a guard
+    real on one copy of an argument and absent on the next is precisely the
+    failure mode that produced that shared helper.
+
+    Driven through run_cli rather than the parser alone, matching the KartaView
+    test above: the property is that the refusal lands BEFORE any work, which a
+    parser-only assertion cannot see.
+    """
+    conn, city_id, data_dir = catalog
+    mapillary_configs(monkeypatch)
+    calls = []
+
+    async def never(**kwargs):
+        calls.append(kwargs)
+        raise AssertionError("no downloader call may happen on a refused value")
+
+    monkeypatch.setattr(cli, f"download_{provider}_metadata_async", never)
+    for bad in ("0", "-5"):
+        with pytest.raises(SystemExit) as excinfo:
+            run_cli(monkeypatch, city_id, data_dir, flag, bad, provider=provider)
+        assert excinfo.value.code == 2
+    assert calls == []
+
+
 def test_a_paused_sweep_alongside_a_real_failure_exits_1_not_83(monkeypatch, catalog):
     """
     The same reasoning as the mixed-host case above: 83 tells the caller to just
@@ -692,7 +762,7 @@ def test_a_paused_sweep_alongside_a_real_failure_exits_1_not_83(monkeypatch, cat
     async def one_pauses_one_breaks(conn_, args, city_row, run_date, provider, config, vis_path):
         if provider == "mapillary":
             raise SweepIncompleteError(
-                "budget", checkpoint_path="/cp", units_done=2, unit_count=16, unit_name="root cells"
+                "budget", checkpoint_path="/cp", units_done=2, unit_count=16, unit_name="tiles"
             )
         raise DownloadError("genuinely broken")
 

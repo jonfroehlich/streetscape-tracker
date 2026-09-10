@@ -43,6 +43,7 @@ from streetscape_metadata_tracker.download_common import (
     HOST_PANORAMAX,
     DownloadError,
     HostBlockedError,
+    SweepIncompleteError,
 )
 from tests.test_panoramax import encode_tile, make_picture
 
@@ -559,3 +560,128 @@ def test_the_crawl_store_paths_are_channel_keyed_date_free_and_outside_data(tmp_
         assert f"{os.sep}data{os.sep}" not in path, (
             "a partial census must never reach the publisher"
         )
+
+
+# ── 5. Stopping at a request cap, and continuing (issue #318) ───────────────
+#
+# Panoramax's crawl is Mapillary's, so the cap is the same code reached through
+# a different module -- which is exactly why it is tested here rather than
+# assumed from the Mapillary suite. The two censuses have diverged before (the
+# zoom, the 404-is-empty rule, `type` being two-state), and a cap that raised
+# the wrong exception or promoted a partial entry would be silent in both.
+#
+# Nothing SCHEDULES Panoramax yet -- CHANNEL_RESUMABLE keeps it False because no
+# launch arm forwards a cap -- so these pin the collector alone, which is the
+# half that has to be right before that flag can flip.
+
+
+def test_a_census_stopped_at_its_cap_pauses_rather_than_failing(
+    monkeypatch, tmp_path, straddling_city
+):
+    """The exception is the exit code: SweepIncompleteError becomes 83, which a
+    scheduler amnesties, where a plain DownloadError becomes 1 and counts a
+    consecutive_failure against the city."""
+    lat, lon = straddling_city
+    tiles = _tiles(lat, lon)
+    checkpoint = str(tmp_path / "cp")
+    record = []
+    _stub(monkeypatch, _payloads(lat, lon), record=record)
+
+    with pytest.raises(SweepIncompleteError) as excinfo:
+        _collect(
+            tmp_path,
+            lat,
+            lon,
+            connection_limit=1,
+            max_requests=1,
+            checkpoint_path=checkpoint,
+            checkpoint_channel="panoramax",
+        )
+
+    error = excinfo.value
+    assert len(record) == 1, "the cap must stop dispatching, not merely be recorded"
+    assert (error.units_done, error.unit_count, error.unit_name) == (1, len(tiles), "tiles")
+    assert error.checkpoint_path == checkpoint
+    assert error.api_requests == 1
+
+
+def test_a_capped_census_resumes_to_the_same_bytes_as_an_uninterrupted_one(
+    monkeypatch, tmp_path, straddling_city
+):
+    """The file's headline contract, reached by the new route.
+
+    A cap skips its remaining tiles by RETURNING rather than raising, which is a
+    different path through the settle loop and the reassembly than the block
+    this file already pins. Landing on the same bytes is what says the choice
+    changed nothing about the artifact -- including the border duplicate, whose
+    winner `dedupe_census` picks by position.
+    """
+    lat, lon = straddling_city
+    payloads = _payloads(lat, lon)
+
+    _stub(monkeypatch, payloads)
+    _whole, whole_path = _collect(tmp_path, lat, lon, name="whole")
+
+    checkpoint = str(tmp_path / "cp")
+    _stub(monkeypatch, payloads)
+    with pytest.raises(SweepIncompleteError):
+        _collect(
+            tmp_path,
+            lat,
+            lon,
+            name="capped",
+            connection_limit=1,
+            max_requests=1,
+            checkpoint_path=checkpoint,
+            checkpoint_channel="panoramax",
+        )
+    assert not os.path.exists(str(tmp_path / "capped.csv.gz")), "nothing is finalized"
+
+    _stub(monkeypatch, payloads)
+    _resumed, resumed_path = _collect(
+        tmp_path,
+        lat,
+        lon,
+        name="resumed",
+        connection_limit=1,
+        checkpoint_path=checkpoint,
+        checkpoint_channel="panoramax",
+    )
+    assert _without_timestamps(_bytes(resumed_path)) == _without_timestamps(_bytes(whole_path))
+
+
+def test_a_capped_census_is_never_promoted_into_the_shared_cache(
+    monkeypatch, tmp_path, straddling_city
+):
+    """A partial entry reused as a census publishes absence nobody observed."""
+    lat, lon = straddling_city
+    cache_path = census_cache_path_for("panoramax", CITY_ID, dp.grid_bbox(lat, lon, 100, 100, 20))
+    _stub(monkeypatch, _payloads(lat, lon))
+
+    with pytest.raises(SweepIncompleteError):
+        _collect(
+            tmp_path,
+            lat,
+            lon,
+            connection_limit=1,
+            max_requests=1,
+            checkpoint_path=str(tmp_path / "cp"),
+            checkpoint_channel="panoramax",
+            census_cache=CensusCache(cache_path, True, None),
+        )
+
+    assert not os.path.exists(cache_path)
+    assert load_census_cache_marker(cache_path) is None
+
+
+def test_a_cap_without_a_checkpoint_is_refused_before_any_request(
+    monkeypatch, tmp_path, straddling_city
+):
+    """Capped and uncheckpointed, a crawl discards everything it paid for."""
+    lat, lon = straddling_city
+    record = []
+    _stub(monkeypatch, _payloads(lat, lon), record=record)
+
+    with pytest.raises(ValueError, match="max_requests needs a checkpoint_path"):
+        _collect(tmp_path, lat, lon, connection_limit=1, max_requests=1)
+    assert record == [], "refused before a single tile was asked for"

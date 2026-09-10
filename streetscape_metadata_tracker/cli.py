@@ -389,6 +389,24 @@ def parse_args():
     )
 
     concurrency_group.add_argument(
+        "--mapillary-max-requests",
+        type=_positive_int,
+        default=None,
+        help="""Stop a Mapillary tile census after this many requests and
+             CHECKPOINT the rest (mapillary provider only, issue #318). Not a
+             sampling knob: nothing is published, because a partial census dated
+             today would diff against its predecessor as 'every pano in the rest
+             of the city removed'. What it buys is that the spend survives — the
+             run exits 83 and the next invocation resumes from the tiles already
+             fetched, so a city that does not fit tonight's remaining budget is
+             collected over two nights instead of skipped. A SOFT ceiling:
+             requests already in flight when it trips are allowed to finish, so
+             the overshoot is bounded by connection_limit x TILE_MAX_TRIES (25
+             at the defaults) rather than by the size of the city. Requires a
+             checkpoint to write to. Default: fetch every tile.""",
+    )
+
+    concurrency_group.add_argument(
         "--kartaview-max-requests-per-minute",
         type=int,
         default=DEFAULT_SWEEP_REQUESTS_PER_MINUTE,
@@ -446,6 +464,24 @@ def parse_args():
              rate is unchanged. Adopted here BEFORE any incident rather than
              after three (issue #292). Default {DEFAULT_PANORAMAX_JITTER}; 0
              restores the exact cadence.""",
+    )
+
+    concurrency_group.add_argument(
+        "--panoramax-max-requests",
+        type=_positive_int,
+        default=None,
+        help="""Stop a Panoramax tile census after this many requests and
+             CHECKPOINT the rest (panoramax provider only, issue #318). Not a
+             sampling knob: nothing is published, because a partial census dated
+             today would diff against its predecessor as 'every pano in the rest
+             of the city removed'. What it buys is that the spend survives — the
+             run exits 83 and the next invocation resumes from the tiles already
+             fetched, so a city that does not fit tonight's remaining budget is
+             collected over two nights instead of skipped. A SOFT ceiling:
+             requests already in flight when it trips are allowed to finish, so
+             the overshoot is bounded by connection_limit x TILE_MAX_TRIES (25
+             at the defaults) rather than by the size of the city. Requires a
+             checkpoint to write to. Default: fetch every tile.""",
     )
 
     parser.add_argument(
@@ -841,6 +877,7 @@ async def _collect_one_run(conn, args, city_row, run_date, provider, config, vis
                 request_timeout=request_timeout,
                 max_requests_per_minute=args.mapillary_max_requests_per_minute,
                 jitter=args.mapillary_jitter,
+                max_requests=args.mapillary_max_requests,
                 checkpoint_path=checkpoint_path,
                 # The channel again, this time INSIDE the commit record: the
                 # path separates channels only as long as every caller derives
@@ -886,6 +923,7 @@ async def _collect_one_run(conn, args, city_row, run_date, provider, config, vis
                 request_timeout=request_timeout,
                 max_requests_per_minute=args.panoramax_max_requests_per_minute,
                 jitter=args.panoramax_jitter,
+                max_requests=args.panoramax_max_requests,
                 checkpoint_path=checkpoint_path,
                 # The channel again, this time INSIDE the commit record: the
                 # path separates channels only as long as every caller derives

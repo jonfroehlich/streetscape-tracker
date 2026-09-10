@@ -40,7 +40,11 @@ from streetscape_metadata_tracker.checkpointing import (
     checkpoint_path_for,
     load_census_cache_marker,
 )
-from streetscape_metadata_tracker.download_common import HOST_MAPILLARY_TILES, HostBlockedError
+from streetscape_metadata_tracker.download_common import (
+    HOST_MAPILLARY_TILES,
+    HostBlockedError,
+    SweepIncompleteError,
+)
 from tests.test_mapillary import (
     GOLDEN_PATH,
     GOLDEN_TIMESTAMP_PLACEHOLDER,
@@ -121,7 +125,18 @@ def _serve(monkeypatch, tiles_by_xy, *, block_after=None, failing=(), served=Non
     return served
 
 
-def _download(tmp_path, lat, lon, checkpoint_path, *, name="run", width=200, height=200, step=20):
+def _download(
+    tmp_path,
+    lat,
+    lon,
+    checkpoint_path,
+    *,
+    name="run",
+    width=200,
+    height=200,
+    step=20,
+    max_requests=None,
+):
     """One full grid collection, serialized so an interruption lands predictably."""
     return asyncio.run(
         dm.download_mapillary_metadata_async(
@@ -136,6 +151,7 @@ def _download(tmp_path, lat, lon, checkpoint_path, *, name="run", width=200, hei
             # One tile at a time: with the default 5, "block after 2 tiles"
             # would depend on scheduling rather than on the count.
             connection_limit=1,
+            max_requests=max_requests,
             checkpoint_path=checkpoint_path,
             checkpoint_channel="mapillary",
         )
@@ -858,6 +874,7 @@ def _fetch(
     reuse=True,
     checkpoint=None,
     run_date=None,
+    max_requests=None,
 ):
     """One census fetch through the real entry point, cache wired up."""
     return asyncio.run(
@@ -866,6 +883,7 @@ def _fetch(
             dm.grid_bbox(lat, lon, 200, 200, 20),
             "MLY|test|token",
             connection_limit=1,
+            max_requests=max_requests,
             checkpoint_path=checkpoint or str(tmp_path / f"cp-{channel}-{variant}"),
             checkpoint_channel=channel,
             checkpoint_variant=variant,
@@ -1461,3 +1479,300 @@ def test_the_walk_and_the_grid_run_share_the_cache_while_splitting_the_checkpoin
     assert census_cache_path_for("mapillary", "seattle--washington", bbox) == census_cache_path_for(
         "mapillary", "seattle--washington", bbox
     )
+
+
+# ── Stopping at a request cap, and continuing (issue #318) ────────────────────
+#
+# The whole point of the section is that a cap is a PAUSE and not a failure, so
+# every test here checks one of the three things that distinguishes those: what
+# survives on disk, what the counters say, and what must NOT happen (a partial
+# census reaching an artifact or the shared cache).
+
+
+def test_a_census_stopped_at_its_cap_pauses_rather_than_failing(
+    monkeypatch, tmp_path, straddling_city
+):
+    """
+    The headline: exit-83's exception, with the progress an operator needs.
+
+    A `SweepIncompleteError` rather than a plain `DownloadError` is what buys
+    the scheduler's amnesty -- a capped night must not count a
+    `consecutive_failure`, five of which quarantine the city for a 90-day cycle
+    for making progress every night.
+    """
+    lat, lon = straddling_city
+    tiles, tiles_by_xy = _golden_tiles(lat, lon)
+    checkpoint = str(tmp_path / "cp")
+
+    served = _serve(monkeypatch, tiles_by_xy)
+    with pytest.raises(SweepIncompleteError) as excinfo:
+        _download(tmp_path, lat, lon, checkpoint, max_requests=1)
+
+    error = excinfo.value
+    assert len(served) == 1, "the cap must stop dispatching, not merely be recorded"
+    assert error.units_done == 1
+    assert error.unit_count == len(tiles)
+    # "root cells" here would be a lie about a z14 tile lattice, and this line
+    # is what an operator reads to decide whether a night made progress.
+    assert error.unit_name == "tiles"
+    assert error.checkpoint_path == checkpoint
+    # The spend has to reach the ledger even though nothing was published: the
+    # requests were made, and the per-IP budget they came out of is the
+    # constraint the cap exists to honour.
+    assert error.api_requests == 1
+    assert error.api_requests_total == 1
+
+
+def test_a_capped_census_writes_no_artifact_and_keeps_its_tiles(
+    monkeypatch, tmp_path, straddling_city
+):
+    """
+    Nothing finalized, everything paid for kept.
+
+    A partial census dated today would diff against its predecessor as "every
+    pano in the rest of the city removed", so the CSV must not exist -- while
+    the committed tile must, or the pause bought nothing over a plain failure.
+    """
+    lat, lon = straddling_city
+    _tiles, tiles_by_xy = _golden_tiles(lat, lon)
+    checkpoint = str(tmp_path / "cp")
+
+    _serve(monkeypatch, tiles_by_xy)
+    with pytest.raises(SweepIncompleteError):
+        _download(tmp_path, lat, lon, checkpoint, name="capped", max_requests=1)
+
+    assert not (tmp_path / "test_mapillary_capped.csv.gz").exists()
+    assert len(_state(checkpoint)["done_tiles"]) == 1
+
+
+def test_a_capped_census_resumes_to_the_same_bytes_as_an_uninterrupted_one(
+    monkeypatch, tmp_path, straddling_city
+):
+    """
+    THE contract, reached by the new route.
+
+    `test_a_resumed_census_writes_the_same_csv_as_an_uninterrupted_one` pins
+    this for a crawl interrupted by a BLOCK -- something that happened to it.
+    A cap is a stop the crawl chose, and it skips its remaining tiles by
+    returning an empty census rather than by raising, which is a different code
+    path through the settle loop and reassembly. Landing on the same golden
+    fixture is what says the choice changed nothing about the artifact.
+    """
+    lat, lon = straddling_city
+    tiles, tiles_by_xy = _golden_tiles(lat, lon)
+    checkpoint = str(tmp_path / "cp")
+
+    _serve(monkeypatch, tiles_by_xy)
+    with pytest.raises(SweepIncompleteError):
+        _download(tmp_path, lat, lon, checkpoint, name="first", max_requests=1)
+
+    served = _serve(monkeypatch, tiles_by_xy)
+    result = _download(tmp_path, lat, lon, checkpoint, name="second")
+    assert len(served) == len(tiles) - 1, "the resume must not re-request the committed tile"
+
+    with gzip.open(result["filename_with_path"], "rt", encoding="utf-8") as f:
+        written = f.read()
+    written = written.replace(result["started_at"], GOLDEN_TIMESTAMP_PLACEHOLDER)
+    _assert_csv_matches_golden(written, GOLDEN_PATH.read_text(encoding="utf-8"))
+
+
+def test_a_tile_skipped_at_the_cap_is_not_committed_as_an_empty_tile(
+    monkeypatch, tmp_path, straddling_city
+):
+    """
+    The failure the raise-before-the-settle-loop ordering exists to prevent.
+
+    A skipped tile returns an EMPTY census, which past that loop is
+    indistinguishable from a tile the CDN answered with no imagery. Committed,
+    it would make the resume skip it and the census publish absence nobody
+    observed. Checked at the checkpoint rather than at the census, because the
+    checkpoint is what a later night reads.
+    """
+    lat, lon = straddling_city
+    tiles, tiles_by_xy = _golden_tiles(lat, lon)
+    checkpoint = str(tmp_path / "cp")
+
+    served = _serve(monkeypatch, tiles_by_xy)
+    with pytest.raises(SweepIncompleteError):
+        _download(tmp_path, lat, lon, checkpoint, max_requests=1)
+
+    committed = {(x, y) for x, y, _rows in _state(checkpoint)["done_tiles"]}
+    assert committed == {served[0]}, "only the tile that was actually fetched"
+    assert set(tiles) - committed, "the rest must still be owed"
+
+
+def test_a_cap_that_the_crawl_never_reaches_finalizes_normally(
+    monkeypatch, tmp_path, straddling_city
+):
+    """
+    A cap is a ceiling, not an instruction to stop.
+
+    The end-of-night sliver this feature exists for (New York needing 484 with
+    426 left) is the case where the cap binds; the ordinary night is the case
+    where it does not, and it must be byte-for-byte what an uncapped run does.
+    """
+    lat, lon = straddling_city
+    tiles, tiles_by_xy = _golden_tiles(lat, lon)
+
+    _serve(monkeypatch, tiles_by_xy)
+    result = _download(tmp_path, lat, lon, str(tmp_path / "cp"), max_requests=len(tiles) + 50)
+
+    with gzip.open(result["filename_with_path"], "rt", encoding="utf-8") as f:
+        written = f.read()
+    written = written.replace(result["started_at"], GOLDEN_TIMESTAMP_PLACEHOLDER)
+    _assert_csv_matches_golden(written, GOLDEN_PATH.read_text(encoding="utf-8"))
+
+
+def test_a_complete_checkpoint_refinalizes_under_a_cap_rather_than_pausing(
+    monkeypatch, tmp_path, straddling_city
+):
+    """
+    The crash-after-fetch-before-catalog recovery must survive a cap.
+
+    Every tile is already committed, so `todo` is empty and no request is
+    issued -- and a cap that paused here would strand a census that is finished
+    and needs only its finalize, on every night forever, because a re-finalize
+    never spends anything that could clear the cap.
+    """
+    lat, lon = straddling_city
+    tiles, tiles_by_xy = _golden_tiles(lat, lon)
+    checkpoint = str(tmp_path / "cp")
+
+    _serve(monkeypatch, tiles_by_xy)
+    with pytest.raises(SweepIncompleteError):
+        _download(tmp_path, lat, lon, checkpoint, name="first", max_requests=1)
+    served = _serve(monkeypatch, tiles_by_xy)
+    _download(tmp_path, lat, lon, checkpoint, name="second")
+    assert len(served) == len(tiles) - 1
+
+    # Third night: the checkpoint was deliberately not discarded, so everything
+    # is done. A cap of 1 is already spent by the crawl's own accounting only if
+    # it asks -- it must not.
+    served = _serve(monkeypatch, tiles_by_xy)
+    result = _download(tmp_path, lat, lon, checkpoint, name="third", max_requests=1)
+    assert served == [], "a re-finalize issues no requests, so no cap can bind"
+    assert result["api_requests"] == 0
+
+
+def test_a_cap_without_a_checkpoint_is_refused_before_any_request(
+    monkeypatch, tmp_path, straddling_city
+):
+    """
+    The two arguments are only meaningful together.
+
+    Capped and uncheckpointed, a crawl stops part-way and discards everything it
+    paid for -- nightly, forever, with the spend in the ledger and no run in the
+    catalog. Both silent fall-backs are wrong (ignoring the cap overspends a
+    per-IP budget, honouring it burns one), so it is a caller bug and says so.
+    """
+    lat, lon = straddling_city
+    _tiles, tiles_by_xy = _golden_tiles(lat, lon)
+    served = _serve(monkeypatch, tiles_by_xy)
+
+    with pytest.raises(ValueError, match="max_requests needs a checkpoint_path"):
+        asyncio.run(
+            dm.fetch_city_images_async(
+                "Test City",
+                dm.grid_bbox(lat, lon, 200, 200, 20),
+                "MLY|test|token",
+                connection_limit=1,
+                max_requests=1,
+            )
+        )
+    assert served == [], "refused before a single tile was asked for"
+
+
+def test_a_cap_reached_with_no_usable_checkpoint_is_a_failure_not_a_pause(
+    monkeypatch, tmp_path, straddling_city
+):
+    """
+    A pause with nothing to resume from would loop forever.
+
+    `_open_tile_checkpoint` FAILS OPEN on an unwritable directory, so a caller
+    can pass a path and still end up crawling unprotected. Exit 83 tells an
+    operator "re-run to continue"; with no store that re-run spends the same
+    requests and stops in the same place, so this raises a plain DownloadError
+    instead -- no amnesty, a real failure, and the five-night backstop
+    eventually quarantines the city rather than burning a budget every night.
+
+    Set up with the checkpoint DEGRADED rather than absent, because absent is
+    refused up front by the guard above -- this is the runtime half of the same
+    rule and needs the path present to reach it at all.
+    """
+    lat, lon = straddling_city
+    _tiles, tiles_by_xy = _golden_tiles(lat, lon)
+    checkpoint = str(tmp_path / "cp")
+
+    real_open = dm._open_tile_checkpoint
+
+    def degraded_open(*args, **kwargs):
+        cp = real_open(*args, **kwargs)
+        if cp is not None:
+            cp.degraded = True
+        return cp
+
+    monkeypatch.setattr(dm, "_open_tile_checkpoint", degraded_open)
+    _serve(monkeypatch, tiles_by_xy)
+
+    with pytest.raises(dm.DownloadError) as excinfo:
+        _download(tmp_path, lat, lon, checkpoint, max_requests=1)
+    assert not isinstance(excinfo.value, SweepIncompleteError)
+    assert "nothing can be resumed" in str(excinfo.value).lower()
+    # The spend still reaches the ledger: the requests were made either way.
+    assert excinfo.value.api_requests == 1
+
+
+def test_the_cap_overshoots_by_at_most_one_batch_of_retries(monkeypatch, tmp_path):
+    """
+    The bound the flag's help text promises, measured rather than asserted.
+
+    Tasks already past the in-semaphore check finish, and each may spend up to
+    TILE_MAX_TRIES requests, so the cap is a soft ceiling. What must hold is
+    that the overshoot is bounded by CONCURRENCY and not by the size of the
+    city -- the failure a cap checked only between batches would have.
+    """
+    lat, lon = SEATTLE
+    # A city wide enough that an unbounded overshoot is unmistakable.
+    bbox = dm.grid_bbox(lat, lon, 4000, 4000, 20)
+    tiles = dm.tiles_for_bbox(*bbox)
+    assert len(tiles) > 8, "needs enough tiles for a runaway to be visible"
+
+    served = _serve(monkeypatch, {})
+    connection_limit = 4
+    with pytest.raises(SweepIncompleteError):
+        asyncio.run(
+            dm.fetch_city_images_async(
+                "Test City",
+                bbox,
+                "MLY|test|token",
+                connection_limit=connection_limit,
+                max_requests=2,
+                checkpoint_path=str(tmp_path / "cp"),
+                checkpoint_channel="mapillary",
+            )
+        )
+    assert len(served) <= 2 + connection_limit * dm.TILE_MAX_TRIES
+    assert len(served) < len(tiles), "the cap must stop the city, not merely dent it"
+
+
+def test_a_capped_census_is_never_promoted_into_the_shared_cache(
+    monkeypatch, tmp_path, straddling_city, cache_path
+):
+    """
+    A partial entry is the one way this feature could produce a WRONG artifact.
+
+    Reused by the paired road walk, it would score every unfetched tile's
+    samples as genuine no-imagery. Promotion sits after every raise, so the
+    pause alone is enough -- and the promotion predicate now also ASSERTS that
+    every tile is accounted for, so a future edit that moves the raise cannot
+    quietly turn this test green by accident.
+    """
+    lat, lon = straddling_city
+    _tiles, tiles_by_xy = _golden_tiles(lat, lon)
+
+    _serve(monkeypatch, tiles_by_xy)
+    with pytest.raises(SweepIncompleteError):
+        _fetch(tmp_path, lat, lon, channel="mapillary", cache_path=cache_path, max_requests=1)
+
+    assert not os.path.exists(cache_path)
+    assert load_census_cache_marker(cache_path) is None
