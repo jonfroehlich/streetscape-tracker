@@ -2910,6 +2910,25 @@ async def _fetch_city_images(
         # below, because `unvisited` put those cells in failed_cells: unmeasured
         # area, refuse. Nothing is finalized either way -- the difference is that
         # here the spend survives to be continued.
+        #
+        # NO `roots_done > 0` TERM HERE, AND THAT IS NOT AN OVERSIGHT (#318
+        # review). The two tile censuses guard their own pause with
+        # `not checkpoint.done` -- a live, healthy, EMPTY checkpoint is a real
+        # state there, because a TileCheckpoint is opened before any tile is
+        # fetched and `_commit_spend` returns early on an empty `done`, so exit
+        # 83 could say "re-run to resume" over an empty directory forever.
+        # A SweepCheckpoint cannot be in that state: it is constructed only
+        # AFTER the radius ladder settles (see the `resumed or SweepCheckpoint`
+        # site), it carries `radius_m`, and `_commit_checkpoint` fires on a
+        # REQUEST interval rather than at a root boundary -- so `cp is not None`
+        # already means the expensive part is durable and a resume skips
+        # calibration even at `roots_done == 0`. That calibration is exactly
+        # what this channel's 34-request launch floor pays for.
+        #
+        # Copying the tile censuses' guard here would therefore convert a
+        # legitimate pause into a counted failure and re-walk the ladder every
+        # night. Same invariant, different store: check that the progress is
+        # durable, not that a particular counter is nonzero.
         raise spent(
             SweepIncompleteError(
                 f"KartaView sweep for {city_name} stopped after {roots_done} of {len(roots)} "
