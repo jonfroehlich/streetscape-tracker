@@ -12,6 +12,11 @@ An edit that changes a rule belongs in both files; anything written since the sp
   "Too small to write up" is not a category: the cost of a short writeup is minutes, and the thing it prevents is re-running a collection to re-learn an answer we already bought.
   Each writeup carries the decision it justifies, the caveats, and how to replicate it.
 
+**One standing exemption, stated so it is a decision rather than a gap: the per-IP block and pacing series lives in [`docs/provider-access.md`](../provider-access.md), not here.**
+That includes #292's pre-registered jitter test and its read-out, which have a treatment, a falsifier, a window and a decision and would otherwise qualify.
+The reason is that each block is only legible beside the ones before it and beside the budgets and limiter settings it moved, and splitting the series across two files is how a reader ends up quoting a retired band as live.
+A measured question that is NOT about provider access still belongs here, block-adjacent or not.
+
 So far, alphabetically — keep that order, so two branches adding a writeup usually insert at different points and merge cleanly:
 
 ### `capture-date-precision.md`

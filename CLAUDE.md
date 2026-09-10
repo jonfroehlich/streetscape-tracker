@@ -71,7 +71,7 @@ python scripts/register_frame.py --manifest mapillary_360_cities.csv --overlap-k
 | `assign` | (Re)compute stagger assignments (writes `day_of_cycle` only, so it never un-enrolls a member) |
 | `enroll-city CITY --channel C` | Opt one city into an **opt-in** channel's queue (#248); `--remove`/`--clear`/`--list`; `--all [--limit N] --execute` bulk-enrols cheapest-first (#282) |
 | `run-due [--dry-run]` | The nightly batch: collect stalest-due cities per channel, then the tail (aggregate, manifests, backup, publish) |
-| `run-due --provider mapillary --limit 40` | On-demand single-channel catch-up (#214) — the ONLY supported bulk path; **Mapillary catch-ups are PAUSED** (see provider access below) |
+| `run-due --provider mapillary --limit 5` | On-demand single-channel catch-up (#214) — the ONLY supported bulk path; Mapillary catch-ups resumed 2026-09-09 and resume **staged**, so the exemplar is a small N (`--limit` overrides `max_cities_per_day`, so nothing caps it but judgement) (see provider access below) |
 | `assess-city "Newport, Kentucky" --estimate` | Same-day answer for a partner inquiry about an untracked city (#215); `--estimate` stops after the boundary and cost report, `--yes` runs it |
 | `screen-provider panoramax` | The weekly whole-catalog growth screen (#316): 113 requests answer all 1,144 cities. Writes UPPER BOUNDS, never counts; `--dry-run` prices it, `--measure --limit N` measures the richest exactly and writes nothing |
 | `regenerate-aggregate [--publish]` | Rebuild `cities.json.gz` from the catalog (no collection), optionally rsync |
@@ -188,10 +188,13 @@ The lifecycle (loader, marker, reuse accounting, `crawl_store_for`) lives once i
 **Provider access, per-IP limits and blocks → [`docs/provider-access.md`](docs/provider-access.md).**
 This is what READ THIS FIRST points at; read it before changing any pacing, retry, concurrency, volume or host decision.
 
-- **Mapillary `--limit` catch-ups are PAUSED**: the second block (2026-08-20) arrived while the 60/min limiter was provably pinned, so the limiter is necessary but not sufficient. #241 read the residue as a rolling 2–3 day accumulation window; **block 3 retired that and every other volume window (#286)**, so the pause now rests only on a multi-night burst being the one shape known to precede a block — never quote #241's bands as live.
-- **Mapillary tile pacing is jittered, never metronomic** (`jitter` in `[providers.mapillary*]`, `--mapillary-jitter`, #292): the third block (2026-08-28) at 1,938/day — after 26,363 ran clean in a day — falsified rate AND daily volume as the trigger (#286), so request regularity is the axis under test; a fourth block ~6 active days after a restart means cadence, not pacing.
+- **Mapillary `--limit` catch-ups resumed 2026-09-09**, after #292's eleven-night jitter window ran clean, and resume **staged**: that window's highest COMBINED night was 2,260 (its 1,736 is the grid column alone), so filling the budget at once is a volume step nothing has measured.
+  Size a step in **cities** — `--limit` is a city count, and per-city cost is median 9 / p90 81 / max 870 over runs actually collected, a distribution biased LOW because the budget gate skips the expensive cities — and quote the **per-IP sum** (5,250 un-paired), never the grid channel's 3,500 alone.
+  Never-collected cities are the EXPENSIVE tail (728.6 km² mean grid vs 131.6), not the cheap start.
+  #241's rolling 2–3 day window is dead — **block 3 retired that and every other volume window (#286)** — so never quote its bands as live.
+- **Mapillary tile pacing is jittered, never metronomic** (`jitter` in `[providers.mapillary*]`, `--mapillary-jitter`, #292): the third block (2026-08-28) at 1,938/day — after 26,363 ran clean in a day — falsified rate AND daily volume as the trigger (#286), so request regularity was the axis under test. **The test passed** — eleven clean nights, 2026-08-30..09-09, against the six-active-night interval that preceded blocks 2 and 3 (an n=2 regularity; block 1 came from a burst) — so keep 40/min at CV 0.6 and do not tune the rate back up.
 - **`jitter` is a coefficient of variation, not a ± range**: each gap is `mean × ((1 − jitter) + jitter × Exponential(1))`, so the mean rate (and every budget and timeout derived from it) is unchanged, the floor is `(1 − jitter) × mean`, and there is no ceiling — the ceiling is the artifact being removed, since Poisson arrivals sit at CV 1.0 and a hard-bounded wobble is invisible to a scorer reading gap statistics.
-- When they resume, the only supported path is `scheduler run-due --provider mapillary --limit N`, **never a detached script** — the bespoke one with none of the scheduler's guards got makelab2 banned by Mapillary and Overpass in one night.
+- The only supported catch-up path is `scheduler run-due --provider mapillary --limit N`, **never a detached script** — the bespoke one with none of the scheduler's guards got makelab2 banned by Mapillary and Overpass in one night.
 - Three third parties meter by **IP, not credential** — Mapillary's tile CDN, `overpass-api.de`, `kartaview.org` — so a per-process limiter cannot honour them alone; `host_lock.py` serializes them across processes.
 - Exit-code families, **none of which records a scheduler failure** (`get_due_cities` filters on `consecutive_failures`, and nothing but a success resets it):
 
@@ -266,6 +269,7 @@ Keep any list a doc enumerates **alphabetical**, so two branches adding an entry
 ## Notes
 
 - **Every measured question gets a writeup in `docs/experiments/`, however small** — including negative, inconclusive and abandoned ones; "too small to write up" is not a category.
+  **One standing exemption**: the per-IP block and pacing series lives in [`docs/provider-access.md`](docs/provider-access.md), #292's pre-registered jitter test included, because a block is only legible beside the ones before it and the budgets it moved.
   The derived numbers (`{topic}_metrics.json`, summary CSVs, figures) are **committed** beside the writeup; only bulk raw collection data is gitignored, in `/experiments/{topic}/` and **never** under `data/`, which is rsynced to a public web server.
   A writeup quotes the **distribution** it summarizes (percentiles and n — the shape is usually the finding), every number traces to committed JSON produced by committed code named in its `generated_by`, and a number contradicting vendor documentation gets flagged, not quietly normalized.
   Rules, rationale and failure modes: [`docs/experiments/README.md`](docs/experiments/README.md).

@@ -355,8 +355,13 @@ which is what earned the 2026-08-14 bans:
 
 ```bash
 python -m streetscape_metadata_tracker.scheduler --config <prod.toml> \
-  run-due --provider mapillary --limit 40
+  run-due --provider mapillary --limit 5
 ```
+
+`--limit` is a **city count, not a spend knob** (per-city Mapillary cost is
+median 9, p90 81, max 870), so a Mapillary catch-up starts small and widens only
+after a night lands where you expected — see the staging rule in
+`docs/provider-access.md`. The old `--limit 40` exemplar here predates that rule.
 
 `--provider` takes enabled channel names (repeatable, or comma-separated) and
 `--limit N` overrides `[schedule].max_cities_per_day` for that invocation only
