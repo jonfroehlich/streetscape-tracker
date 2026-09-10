@@ -656,8 +656,16 @@ const STREET_SEARCH_FIELDS = ["label", "cityId", "providersLabel", "networkLabel
  * on coverage-descending, and `pctBest` is a filter field with no column of
  * its own — sorting by a column the reader cannot see is exactly what
  * createSortableTable's fallback exists to prevent. Privileging one provider
- * in the default order is a real (small) asymmetry, taken knowingly because
- * GSV is the series every city has.
+ * in the default order is a real (small) asymmetry, taken knowingly.
+ *
+ * It used to be justified as "GSV is the series every city has", and since
+ * #301 that is no longer true: a city can be excluded from the gsv channel and
+ * collected only on Mapillary, so its `pct_gsv` is null. Nulls sink in
+ * `sortRowsBy` either way, so no number renders wrong — but such a city lands
+ * at the bottom of an unpaginated ~1,200-row table with an em dash in the
+ * sorted column, and the cause is the sort key rather than the city. The
+ * asymmetry stands, because `pctBest` is still a column the reader cannot see.
+ * The JUSTIFICATION does not.
  */
 const DEFAULT_SORT = { key: "pct_gsv", dir: "desc" };
 

@@ -2465,6 +2465,57 @@ def test_the_hoist_is_the_identity_permutation_without_an_opt_in_channel(conn):
     assert all(providers_for_city[c] == ["gsv", "mapillary"] for c in expected)
 
 
+def test_a_gsv_excluded_city_is_hoisted_rather_than_starved_forever(conn):
+    """Issue #301's population starves WORSE than #248's, and nothing pinned it.
+
+    A city excluded from `gsv`/`gsv_streets` never enters gsv's due list, so the
+    first-appearance union appends it behind every gsv-due city and the cap
+    truncates it. Neither other reservation reaches it: the hoist's original key
+    (`all(p in opt_in ...)`) is False because `mapillary` is a default-membership
+    channel, and `_reserve_refresh_slots` needs a non-NULL `last_success_at`
+    which a never-collected city does not have.
+
+    That makes it strictly worse than the opt-in stall it resembles. An ordinary
+    mapillary-only-due city eventually becomes gsv-due and is pulled to the
+    union head beside its sibling; a PERMANENTLY excluded city never enters
+    gsv's list at all, so it can never re-enter the head. Measured before the
+    key changed: ten such cities behind 45 gsv-due ones sat at union positions
+    45-54 and collected 0 of 10 at prod's 40-city cap, indefinitely, with
+    `consecutive_failures` at 0 and no alert.
+
+    Pinned against the guard it relaxes rather than the happy path: the assert
+    is on the cities INSIDE the cap, so restoring the old `all(p in opt_in ...)`
+    key fails it.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    for i in range(6):
+        _register(conn, f"Ord{i:02d}", width=1000, height=1000, step=20)
+    excluded = _register(conn, "Zmapillaryonly", width=1000, height=1000, step=20)
+    db.assign_schedule(conn, 90, providers=("gsv", "gsv_streets", "mapillary"))
+    # Exactly the #301 rollout: exclude from both GSV channels, leave mapillary.
+    for channel in ("gsv", "gsv_streets"):
+        db.set_channel_membership(conn, excluded, channel, False, cycle_days=90)
+
+    cfg = _sweep_cfg(publish_enabled=False, opt_in_cities_per_day=2)
+    slate = sched._collect_due(
+        conn,
+        cfg,
+        date(2026, 7, 2),
+        ["gsv", "gsv_streets", "mapillary"],
+        max_opt_in=2,
+        max_cities=3,
+    )
+    ordered = [c.city_id for c in slate.cities]
+
+    assert excluded in ordered[:3], (
+        "a gsv-excluded city must reach a capped night; behind the gsv block it never does"
+    )
+    assert ordered[0] == excluded, "it is stranded by the union order, so it leads the slate"
+    assert "mapillary" in slate.providers_for_city[excluded]
+    assert "gsv" not in slate.providers_for_city[excluded]
+
+
 def test_a_city_due_only_on_an_opt_in_channel_is_hoisted_ahead_of_the_gsv_block(conn):
     """Without this the channel is scoped but never REACHED.
 
@@ -3420,7 +3471,8 @@ def test_enroll_city_pre_sets_an_exclusion_while_the_city_is_still_disabled(
 
     A city has no schedule_state rows before it is enabled, so it goes straight
     to the head of the stalest-due ordering the first night — which is exactly
-    the night a 4M-grid-point city must not be collected on gsv.
+    the night a 4M-grid-point city must not be collected on gsv. Pre-setting the
+    exclusion writes the row that keeps it out of gsv's list entirely.
     """
     from streetscape_metadata_tracker import scheduler as sched
 
@@ -3434,10 +3486,16 @@ def test_enroll_city_pre_sets_an_exclusion_while_the_city_is_still_disabled(
     out = capsys.readouterr().out
     assert "NOTE" in out and "pre-set" in out, "silence here reads as the write having failed"
     # The count must not be scoped to enabled cities: derived as
-    # `n_enabled - n_member` it reads "(0 explicitly excluded)" on the very line
+    # `n_enabled - n_member` it reads "0 explicitly excluded" on the very line
     # confirming an exclusion, because the excluded city is not in n_enabled.
-    assert "(1 explicitly excluded)" in out
+    assert "1 explicitly excluded" in out
     assert db.count_channel_exclusions(conn, "gsv") == 1
+    # ...and because the two counts are over DIFFERENT populations, the line has
+    # to say so. Unqualified it read "N of N enabled cities collect this
+    # channel; 1 explicitly excluded" during exactly this rollout, which reads
+    # as the write not having taken -- the confusion the line exists to end.
+    assert "1 of them not yet enabled" in out, "the two counts' scopes must be reconciled"
+    assert db.count_channel_exclusions(conn, "gsv", enabled_only=True) == 0
 
     # ... and it binds the moment the city is enabled, with no second command.
     conn.execute("UPDATE cities SET enabled = 1 WHERE city_id = ?", (cid,))
@@ -3448,6 +3506,49 @@ def test_enroll_city_pre_sets_an_exclusion_while_the_city_is_still_disabled(
         c.city_id
         for c in db.get_due_cities(conn, default_membership=True, provider="mapillary", **kw)
     ] == [cid]
+
+
+def test_enroll_city_flags_reach_cmd_enroll_city_from_the_parser(conn, monkeypatch, tmp_path):
+    """Pin the PASS-THROUGH, not just the default (a recurring miss in this repo).
+
+    Every other `--excluded` test calls `cmd_enroll_city(..., excluded=True)`
+    directly, so deleting `excluded=args.excluded` in `main()` leaves the whole
+    suite green while `--list --excluded` silently lists the MEMBERS instead --
+    the wrong answer, silently, which is the failure `--excluded`'s own guard
+    exists to prevent. Asserted through `build_parser()` so the wiring is what
+    is under test rather than the callee's signature.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    parser = sched.build_parser()
+    ns = parser.parse_args(["enroll-city", "--channel", "gsv", "--list", "--excluded"])
+    assert ns.excluded is True and ns.list_only is True
+    assert parser.parse_args(["enroll-city", "X", "--channel", "gsv", "--remove"]).excluded is False
+
+    # And end to end through main(), which is where the kwarg is actually
+    # passed: the parser can be perfect and the dispatch still drop it.
+    cfg = _enroll_cfg(tmp_path, conn, monkeypatch)
+    monkeypatch.setattr(sched, "load_scheduler_config", lambda path: cfg)
+    monkeypatch.setattr(sched, "setup_logging", lambda cfg, verbose=False: None)
+    seen = {}
+    monkeypatch.setattr(sched, "cmd_enroll_city", lambda cfg, *a, **kw: seen.update(kw) or 0)
+    monkeypatch.setattr(
+        sched.sys,
+        "argv",
+        [
+            "scheduler",
+            "--config",
+            "x.toml",
+            "enroll-city",
+            "--channel",
+            "gsv",
+            "--list",
+            "--excluded",
+        ],
+    )
+    assert sched.main() == 0
+    assert seen.get("excluded") is True, "--excluded must reach cmd_enroll_city"
+    assert seen.get("list_only") is True
 
 
 def test_enroll_all_refuses_a_default_membership_channel(conn, monkeypatch, tmp_path):

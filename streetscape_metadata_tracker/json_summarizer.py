@@ -792,6 +792,8 @@ def generate_aggregate_v2(conn, data_dir: str) -> dict[str, Any]:
     # none of them. progress() draws a bar only when BOTH output streams are
     # terminals; see streetscape_metadata_tracker/progress.py for why tqdm's own
     # disable=None is not enough (it inspects stderr, then flushes both).
+    # One query for the catalog rather than a lookup per city (issue #301).
+    exclusions_by_city = db.get_channel_exclusions_all(conn)
     for city in progress(db.get_all_cities(conn), desc="Aggregating cities", unit="city"):
         runs_by_provider: dict[str, list] = {}
         for run in db.get_runs_for_city(conn, city.city_id, provider=None):
@@ -833,13 +835,24 @@ def generate_aggregate_v2(conn, data_dir: str) -> dict[str, Any]:
 
         if not providers_out:
             continue
-        cities_out.append(
-            {
-                "city_id": city.city_id,
-                "city": city_block,
-                "providers": providers_out,
-            }
-        )
+        record = {
+            "city_id": city.city_id,
+            "city": city_block,
+            "providers": providers_out,
+        }
+        # schema v4. Absent when there are none, which is every city on every
+        # production config until an operator excludes one -- so the artifact is
+        # byte-identical to v3 for an unexcluded catalog and the key's PRESENCE
+        # is itself the signal.
+        #
+        # Without this, `member` reached no published artifact and only
+        # `city.enabled` did, so no page could tell "deliberately excluded from
+        # gsv" from "not collected yet" from "failing". Every mislabel in
+        # driving.html and streets.html traced back to that one gap.
+        excluded = exclusions_by_city.get(city.city_id)
+        if excluded:
+            record["excluded_channels"] = excluded
+        cities_out.append(record)
 
     merged_histograms = {
         provider: merge_capture_date_histograms(jsons)
@@ -847,7 +860,7 @@ def generate_aggregate_v2(conn, data_dir: str) -> dict[str, Any]:
     }
 
     summary = {
-        "schema_version": 3,
+        "schema_version": 4,
         "generated_at": pd.Timestamp.now(tz="UTC").isoformat(),
         "cities_count": len(cities_out),
         "histogram_of_capture_dates": merged_histograms,
@@ -856,7 +869,7 @@ def generate_aggregate_v2(conn, data_dir: str) -> dict[str, Any]:
 
     output_path = os.path.join(data_dir, "cities.json.gz")
     _write_json_gz_atomic(output_path, summary)
-    logger.info(f"Wrote v3 aggregate for {len(cities_out)} cities to {output_path}")
+    logger.info(f"Wrote v4 aggregate for {len(cities_out)} cities to {output_path}")
 
     return summary
 
@@ -1298,6 +1311,7 @@ def generate_driving_plan_summary(conn, data_dir: str) -> dict[str, Any]:
 
     cities_out = []
     matched_city_ids: dict[tuple, list[str]] = {}
+    exclusions_by_city = db.get_channel_exclusions_all(conn)
     for city in db.get_all_cities(conn):
         tier, matched = plan_match.match_city(city, index)
         summary = plan_match.summarize_entries(matched) if matched else None
@@ -1319,6 +1333,15 @@ def generate_driving_plan_summary(conn, data_dir: str) -> dict[str, Any]:
             "enabled": city.enabled,
             "verdict": plan_match.classify(summary, newest, today),
         }
+        # Issue #301. This page's every Google column is derived from the gsv
+        # run, so a city EXCLUDED from gsv renders as "Tracked" with all of them
+        # blank while the legend says blank means "no Google imagery". It means
+        # "we never looked", and only this key can tell the two apart. Absent
+        # when there are none, matching the artifact's absent-not-null
+        # convention.
+        excluded = exclusions_by_city.get(city.city_id)
+        if excluded:
+            record["excluded_channels"] = excluded
         if summary is not None and tier is not None:
             record["plan"] = _plan_block(summary, tier)
         observed = {

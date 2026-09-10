@@ -977,6 +977,37 @@ function findBestMatchingCity(parsedQuery, citiesData, maxDistance = 3) {
   return { match: bestMatch, distance: bestDistance };
 }
 
+/**
+ * Exact (distance 0) match for `queryText` in any provider's view but `skip`.
+ *
+ * The escape hatch for a city that one provider's view does not contain.
+ * `adaptCitiesPayload` filters to the provider asked for, so a Mapillary-only
+ * city is correctly absent from the gsv view -- and `findBestMatchingCity`
+ * will then happily return a NEIGHBOUR within its distance budget rather than
+ * a miss. Asking the other views for an exact match first is what keeps a
+ * fuzzy neighbour from standing in for a city we actually hold.
+ *
+ * Only distance 0 counts here. A second fuzzy search across more views would
+ * multiply the same failure rather than bound it.
+ *
+ * @param {Object} rawCities - the unadapted cities.json.gz payload.
+ * @param {string} queryText - the raw ?city= text.
+ * @param {string} skip - the provider view already searched.
+ * @returns {{provider: string, match: Object}|null}
+ */
+function findExactMatchInAnyProvider(rawCities, queryText, skip) {
+  if (!rawCities) return null;
+  for (const provider of Object.keys(PROVIDERS)) {
+    if (provider === skip) continue;
+    const view = adaptCitiesPayload(rawCities, provider);
+    if (!view.cities.length) continue;
+    const parsed = parseLocationQuery(queryText, view);
+    const result = findBestMatchingCity(parsed, view);
+    if (result.match && result.distance === 0) return { provider, match: result.match };
+  }
+  return null;
+}
+
 // ── Temporal plot ──────────────────────────────────────────────
 
 /**
@@ -1403,13 +1434,15 @@ async function loadData() {
     // this city's run history for the snapshot selector.
     let rawCities = null;
     let citiesData = null;
+    // Declared out here because the ?city= resolution below needs to know which
+    // view it searched in order to widen the search when that view misses.
+    const requestedProvider = urlParams.get("provider");
+    const queryProvider = isKnownProvider(requestedProvider) ? requestedProvider : "gsv";
     try {
       progressText.textContent = "Loading city index…";
       rawCities = await fetchGzippedJson(STREETSCAPE_DATA_BASE_URL + "cities.json.gz");
       // ?city= queries resolve against the requested provider's view
       // (?provider=mapillary), defaulting to GSV
-      const requestedProvider = urlParams.get("provider");
-      const queryProvider = isKnownProvider(requestedProvider) ? requestedProvider : "gsv";
       citiesData = adaptCitiesPayload(rawCities, queryProvider);
     } catch (e) {
       // The ?file= path can still work without the aggregate
@@ -1421,7 +1454,26 @@ async function loadData() {
       if (!citiesData) throw new Error("City index unavailable; cannot resolve ?city= query");
       progressText.textContent = `Finding city data for: ${decodedCityQuery}`;
       const parsedQuery = parseLocationQuery(decodedCityQuery, citiesData);
-      const result = findBestMatchingCity(parsedQuery, citiesData);
+      let result = findBestMatchingCity(parsedQuery, citiesData);
+      // A fuzzy match inside ONE provider's view silently renders a DIFFERENT
+      // city whenever the city asked for is collected only by another provider.
+      // findBestMatchingCity has no exact-match requirement -- it accepts any
+      // weighted Levenshtein distance <= 3 -- so `?city=Charleston, SC` against
+      // the gsv view, which a Mapillary-only Charleston SC is correctly absent
+      // from, resolves to Charleston, WV at distance 2 and renders a complete,
+      // error-free page for the wrong city under the URL the reader typed.
+      // Measured over the committed 1,144-city aggregate: 106 cities (9.3%)
+      // resolve to a different city this way.
+      //
+      // So an INEXACT match is not trusted until every other provider's view
+      // has been asked for an exact one. That view's record carries its own
+      // data_file, and providerGlobal is derived from the filename below, so
+      // adopting it switches the page to the provider that actually has the
+      // city rather than reporting a miss.
+      if (!result.match || result.distance > 0) {
+        const elsewhere = findExactMatchInAnyProvider(rawCities, decodedCityQuery, queryProvider);
+        if (elsewhere) result = { match: elsewhere.match, distance: 0 };
+      }
       if (!result.match) {
         showLoadError(result.error);
         return;

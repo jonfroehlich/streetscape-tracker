@@ -1594,6 +1594,28 @@ def test_driving_page_lists_untracked_plan_areas_as_rows(page: Page, base_url):
     assert errors == []
 
 
+def test_driving_page_says_not_on_gsv_rather_than_tracked_with_blank_columns(page: Page, base_url):
+    """A city EXCLUDED from gsv is not a city Google has not driven (#301).
+
+    Every Google column on this page is derived from the gsv run, so before
+    schema v4 carried `excluded_channels` such a city rendered as "Tracked"
+    with all of them blank — under a legend that says blank means "no Google
+    imagery" / "no Google drive to date". Map Ville is collected (Mapillary)
+    and excluded from both GSV channels, so it must say so.
+    """
+    errors = _capture_errors(page)
+    page.goto(f"{base_url}/driving.html")
+    expect(page.locator("#driving-table-wrap")).to_be_visible()
+
+    row = page.locator("tbody tr", has=page.locator("th", has_text="Map Ville"))
+    expect(row).to_contain_text("Not on GSV")
+    # The label is the whole point: "Tracked" here is the wrong claim, and it
+    # is the string that was rendered before.
+    assert "Tracked" not in row.inner_text()
+
+    assert errors == []
+
+
 def test_driving_page_shows_capture_history_and_plan_revisions(page: Page, base_url):
     """
     The two halves of "the past". The sparkline is the observable drive history

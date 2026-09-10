@@ -238,9 +238,15 @@ function trackedCellHtml(row) {
   if (row.scope !== "city") {
     return '<td><span class="scope-pill scope-area" title="In Google\'s plan, but this project collects no city here">Not tracked</span></td>';
   }
-  return row.enabled
-    ? '<td><span class="scope-pill scope-city" title="Collected on the rolling schedule">Tracked</span></td>'
-    : '<td><span class="scope-pill scope-paused" title="Registered but not currently collected">Paused</span></td>';
+  if (!row.enabled) {
+    return '<td><span class="scope-pill scope-paused" title="Registered but not currently collected">Paused</span></td>';
+  }
+  // "Tracked" with every Google column blank reads as "Google has not driven
+  // here", which is the one thing it does not mean (#301).
+  if (row.gsvExcluded) {
+    return '<td><span class="scope-pill scope-paused" title="Collected, but excluded from the GSV channel — the Google columns on this row are blank because we never looked, not because there is no imagery">Not on GSV</span></td>';
+  }
+  return '<td><span class="scope-pill scope-city" title="Collected on the rolling schedule">Tracked</span></td>';
 }
 
 /**
@@ -364,8 +370,21 @@ const DRIVING_COLUMNS = [
     title:
       "NETWORK measure: share of the city's road-kilometres with imagery, from road-walk " +
       "collection — the closer answer to “was this actually driven”. Blank for cities not yet " +
-      "walked; NOT comparable to grid coverage (different denominator).",
-    cell: (r) => coverageCellHtml(r.streetPct),
+      "walked; NOT comparable to grid coverage (different denominator). GSV's walk where there " +
+      "is one, otherwise another provider's — hover a value to see which, since a non-GSV walk " +
+      "answers a different question on a page about Google's driving.",
+    cell: (r) => {
+      const html = coverageCellHtml(r.streetPct);
+      // Only when it is NOT the GSV walk: on this page GSV is the default and
+      // annotating every row would be noise.
+      if (r.streetPct == null || !r.streetWalkProvider || r.streetWalkProvider === "gsv") {
+        return html;
+      }
+      return html.replace(
+        "<td",
+        `<td title="${r.streetWalkProvider} road walk — this city has no GSV walk"`,
+      );
+    },
   },
   {
     key: "googlePanos",
@@ -384,8 +403,9 @@ const DRIVING_COLUMNS = [
     initial: "desc",
     title:
       "Most recent official © Google capture date observed in the latest snapshot. Blank for a " +
-      "city with no Google imagery, or where the catalog's value is impossible (a corrupt EXIF " +
-      "date) and was therefore suppressed.",
+      "city with no Google imagery, where the catalog's value is impossible (a corrupt EXIF " +
+      "date) and was therefore suppressed, or where the city is excluded from the GSV channel " +
+      "(#301) and was never looked at — the Tracked column says which.",
     cell: (r) => `<td>${escapeHtml(r.newestCapture ?? "—")}</td>`,
   },
   {
@@ -409,7 +429,8 @@ const DRIVING_COLUMNS = [
     title:
       "Median age of the city's official © Google panoramas. A recent newest-capture with a " +
       "high median means a partial refresh, not a full re-drive. Blank where a city's only " +
-      "imagery is third-party photospheres — no Google drive to date.",
+      "imagery is third-party photospheres — no Google drive to date — and also where the " +
+      "city is excluded from the GSV channel (#301), which is not the same claim.",
     cell: (r) =>
       `<td>${r.medianAge == null ? "—" : `${formatCellNumber(r.medianAge, 1)} yrs`}</td>`,
   },
@@ -681,6 +702,11 @@ function drivingRowModel(city, today = new Date()) {
   const observed = city.observed ?? {};
   const gsv = observed.gsv ?? null;
   const mly = observed.mapillary ?? null;
+  // Issue #301: every Google column below is derived from `gsv`, so without
+  // this a city EXCLUDED from gsv is indistinguishable from one Google has
+  // never driven — blank in exactly the same cells, under a legend that says
+  // blank means "no Google imagery".
+  const gsvExcluded = (city.excluded_channels ?? []).includes("gsv");
 
   // [firstYear, counts[]] or nothing. Validated once here so both the sort key
   // and the sparkline renderer can trust it.
@@ -733,6 +759,7 @@ function drivingRowModel(city, today = new Date()) {
     // findable and a late one is not. Area rows carry their record's full list.
     districts: (plan?.districts ?? []).join(" "),
 
+    gsvExcluded,
     coveragePct: gsv?.coverage_rate_pct ?? null,
     // Filled in by mergeStreetCoverage once the streetwalk manifest lands —
     // it is a separate artifact, and the page must render without it.
@@ -866,9 +893,26 @@ function mergeStreetCoverage(rows, manifest) {
   let matched = 0;
   for (const row of rows) {
     if (row.scope !== "city") continue;
-    const walk = lookupStreetwalk(manifest, row.cityId, "gsv", "drive");
+    // GSV first, because this page is about Google's driving — but a city
+    // excluded from gsv (#301) has no GSV walk and would show "—" while a
+    // Mapillary walk covering 85% of its street-km sits in the same manifest.
+    // Falling back keeps the column populated and `streetWalkProvider` says
+    // which series the number came from.
+    let walk = lookupStreetwalk(manifest, row.cityId, "gsv", "drive");
+    let walkProvider = "gsv";
+    if (!walk || walk.coverage_pct_by_length == null) {
+      for (const provider of ["mapillary", "kartaview"]) {
+        const alt = lookupStreetwalk(manifest, row.cityId, provider, "drive");
+        if (alt && alt.coverage_pct_by_length != null) {
+          walk = alt;
+          walkProvider = provider;
+          break;
+        }
+      }
+    }
     if (walk && walk.coverage_pct_by_length != null) {
       row.streetPct = walk.coverage_pct_by_length;
+      row.streetWalkProvider = walkProvider;
       matched += 1;
     }
   }

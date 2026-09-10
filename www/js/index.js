@@ -1071,10 +1071,24 @@ function renderProvider(fitMap = false) {
        of ${cities.length} ${providerInfo.label} cities walked
        (<a href="streets.html">see all</a>)</span>`
     : "";
+  // This map is one provider's view, so a city collected only by ANOTHER
+  // provider has no rectangle, is unfindable in search, and is outside the
+  // count — which was fine while every collected city had a GSV run, and is
+  // not since #301 made a Mapillary-only city expressible. The view stays
+  // per-provider (that is the whole point of the switcher); what changes is
+  // that the gap is stated instead of being silently indistinguishable from
+  // "we collect nothing there".
+  const totalCollected = Array.isArray(rawCitiesData?.cities) ? rawCitiesData.cities.length : 0;
+  const elsewhereCount = Math.max(0, totalCollected - cities.length);
+  const elsewhereNote = elsewhereCount
+    ? `<br><span class="stats-note">${elsewhereCount} further
+       ${elsewhereCount === 1 ? "city is" : "cities are"} collected only by other providers
+       — switch provider above, or see <a href="grid.html">all cities</a></span>`
+    : "";
   document.getElementById("stats").innerHTML = `
     <strong>${providerInfo.label} City Coverage Analysis</strong><br>
     ${cities.length} cities analyzed | Updated: ${new Date(meta.generatedAt).toLocaleString()}
-    ${streetsNote}
+    ${streetsNote}${elsewhereNote}
   `;
 
   if (cities.length === 0) {

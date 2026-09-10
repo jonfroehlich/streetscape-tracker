@@ -468,6 +468,14 @@ def build():
             date(2026, 4, 15),
             grid_origin=(46.00, -119.00),
         )
+        # ...and it is EXCLUDED from gsv rather than merely uncollected there
+        # (#301). The two are indistinguishable in every published artifact
+        # until schema v4 carries `excluded_channels`, and the pages label them
+        # differently: driving.html says "Not on GSV" instead of "Tracked" with
+        # silently blank Google columns. Set here so the fixture exercises the
+        # shape rather than only the code path that formats it.
+        db.set_channel_membership(conn, mapv, "gsv", False, cycle_days=90)
+        db.set_channel_membership(conn, mapv, "gsv_streets", False, cycle_days=90)
 
         # 4) Road-walk coverage artifacts (#155). The city page must render one
         # in place of the grid overlay, while Zero City exercises the "manifest

@@ -449,10 +449,21 @@ def test_aggregate_v2_groups_runs_and_reports_change(conn, data_dir):
 
     summary = generate_aggregate_v2(conn, data_dir)
 
-    assert summary["schema_version"] == 3
+    assert summary["schema_version"] == 4
     assert summary["cities_count"] == 1
     rec = summary["cities"][0]
     assert rec["city_id"] == city_id
+    # schema v4 (#301): absent unless somebody excluded this city, so an
+    # unexcluded catalog publishes byte-identically to v3 and the key's
+    # PRESENCE is the signal a page reads.
+    assert "excluded_channels" not in rec
+
+    db.set_channel_membership(conn, city_id, "gsv", False, cycle_days=90)
+    db.set_channel_membership(conn, city_id, "mapillary", True, cycle_days=90)
+    rec2 = generate_aggregate_v2(conn, data_dir)["cities"][0]
+    assert rec2["excluded_channels"] == ["gsv"], (
+        "explicit zeroes only: an explicit 1 and a NULL are both 'not excluded'"
+    )
     assert rec["city"]["name"] == "Duo"
     gsv = rec["providers"]["gsv"]
     assert len(gsv["runs"]) == 2
@@ -744,6 +755,6 @@ def test_aggregate_survives_a_dead_output_stream(conn, data_dir, monkeypatch):
         except BrokenPipeError:
             pass
 
-    assert summary["schema_version"] == 3
+    assert summary["schema_version"] == 4
     assert os.path.exists(os.path.join(data_dir, "cities.json.gz"))
     assert any(c["city_id"] == city_id for c in summary["cities"])

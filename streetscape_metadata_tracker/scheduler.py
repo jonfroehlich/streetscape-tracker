@@ -2440,6 +2440,57 @@ def cmd_status(cfg: SchedulerConfig) -> int:
     return 0
 
 
+def _describe_membership(channel: str, value: int | None) -> str:
+    """How one stored ``schedule_state.member`` value reads to an operator."""
+    if value is None:
+        default = CHANNEL_DEFAULT_MEMBERSHIP[channel]
+        return f"unset ({'member' if default else 'not a member'} by channel default)"
+    return "MEMBER" if value else "not a member (explicit)"
+
+
+def _has_membership_row(conn, city_id: str, channel: str) -> bool:
+    """Does a ``schedule_state`` row exist at all for this (city, channel)?
+
+    `member IS NULL` and "no row" are indistinguishable through
+    :func:`db.get_channel_membership`, and only the first is a no-op to clear.
+    """
+    return (
+        conn.execute(
+            "SELECT 1 FROM schedule_state WHERE city_id = ? AND provider = ?",
+            (city_id, channel),
+        ).fetchone()
+        is not None
+    )
+
+
+def _exclusion_line(conn, provider, n_member, n_enabled, n_excluded, *, listing: bool) -> str:
+    """One sentence about a default-membership channel carrying exclusions.
+
+    ONE definition, because the footer and ``enroll-city``'s write path print
+    the same claim and a second spelling is how they drift.
+
+    The two counts are over different populations on purpose --
+    ``count_channel_members`` is scoped to ``cities.enabled = 1`` and
+    ``count_channel_exclusions`` deliberately is not -- so the sentence has to
+    say so rather than leave the reader to reconcile them. It did not, and the
+    result during the one rollout the unscoped count exists to support was
+    ``1,221 of 1,221 enabled cities collect this channel (10 explicitly
+    excluded)``: arithmetically fine, and it reads as the exclusion not having
+    been written, which is the exact confusion this whole line was added to end.
+    """
+    pending = n_excluded - db.count_channel_exclusions(conn, provider, enabled_only=True)
+    # Named only when it is non-zero: on the steady state the two populations
+    # agree and the clause would be noise on every `status`.
+    note = f", {pending:,} of them not yet enabled" if pending else ""
+    how = (
+        f" (list them with `enroll-city --channel {provider} --list --excluded`)" if listing else ""
+    )
+    return (
+        f"{provider}: {n_member:,} of {n_enabled:,} enabled cities collect this channel; "
+        f"{n_excluded:,} explicitly excluded{note}{how}."
+    )
+
+
 def _print_membership_footer(conn, providers) -> None:
     """Print one membership line per channel that has something to say (issue #248).
 
@@ -2466,21 +2517,23 @@ def _print_membership_footer(conn, providers) -> None:
     """
     n_enabled = conn.execute("SELECT COUNT(*) FROM cities WHERE enabled = 1").fetchone()[0]
     for provider in providers:
-        n_member = db.count_channel_members(conn, provider, CHANNEL_DEFAULT_MEMBERSHIP[provider])
         if is_opt_in_channel(provider):
+            n_member = db.count_channel_members(
+                conn, provider, CHANNEL_DEFAULT_MEMBERSHIP[provider]
+            )
             print(
                 f"{provider}: {n_member:,} of {n_enabled:,} enabled cities opted in "
                 f"(opt-in channel; enrol with `enroll-city CITY --channel {provider}`)."
             )
             continue
+        # Asked BEFORE the member count, which is the only thing this line needs
+        # to decide whether to print at all. On every production config today
+        # there are no exclusions, so the aggregation below never runs.
         n_excluded = db.count_channel_exclusions(conn, provider)
         if not n_excluded:
             continue
-        print(
-            f"{provider}: {n_member:,} of {n_enabled:,} enabled cities collect this "
-            f"channel ({n_excluded:,} explicitly excluded; list them with "
-            f"`enroll-city --channel {provider} --list --excluded`)."
-        )
+        n_member = db.count_channel_members(conn, provider, CHANNEL_DEFAULT_MEMBERSHIP[provider])
+        print(_exclusion_line(conn, provider, n_member, n_enabled, n_excluded, listing=True))
 
 
 def cmd_assign(cfg: SchedulerConfig) -> int:
@@ -2627,14 +2680,23 @@ def _cmd_enroll_bulk(
     total = sum(e for e, _ in selected)
     verb = "enrol" if target else ("un-enrol" if target is False else "clear")
 
+    # The estimate prices COLLECTING these cities, so it means something for an
+    # enrolment and nothing for its inverse: on `--all --remove` it was pricing
+    # sweeps that are being switched off, which reads as a cost about to be
+    # spent. The cities are still listed -- which ones leave the channel is the
+    # thing to check before --execute -- just not priced.
+    adding = target is True
     print(f"{'WOULD ' if not execute else ''}{verb.upper()} {len(selected):,} cities on {channel}")
     for est, city in selected[:10]:
-        print(f"  {est:>9,} req  {city.city_id}")
+        print(f"  {est:>9,} req  {city.city_id}" if adding else f"  {city.city_id}")
     if len(selected) > 10:
         print(f"  ... and {len(selected) - 10:,} more")
-    # Floor, and said so every time it is printed: the whole point of the
-    # tranche is that this number is the one being tested against reality.
-    print(f"  estimated {total:,} requests for the tranche (a FLOOR, not a budget)")
+    if adding:
+        # Floor, and said so every time it is printed: the whole point of the
+        # tranche is that this number is the one being tested against reality.
+        print(f"  estimated {total:,} requests for the tranche (a FLOOR, not a budget)")
+    else:
+        print(f"  no estimate: {verb}ing spends nothing, it stops future sweeps")
     if limit is not None and len(candidates) > len(selected):
         print(f"  {len(candidates) - len(selected):,} further cities would still be unchanged")
 
@@ -2761,6 +2823,22 @@ def cmd_enroll_city(
             # ignored, it would exit 0 having listed the members rather than
             # the exclusions — the wrong answer, silently.
             raise _UsageError("--excluded only applies to --list")
+        # BEFORE the bare-enrol guard below, so that `--all --channel gsv`
+        # reports the --all restriction rather than advice about --remove that
+        # sends the operator to `--all --remove --channel gsv` and a DIFFERENT
+        # refusal. Bare `--all` carries neither --remove nor --clear, so under
+        # the other order it never reached this message at all.
+        if all_cities and not is_opt_in_channel(channel):
+            # --all reaches _bulk_candidates AFTER this guard, and that helper
+            # computes effective membership correctly for a default-membership
+            # channel — so without this it would work, over the whole catalog,
+            # in one keystroke. See the docstring.
+            raise _UsageError(
+                f"--channel {channel}: --all is only available on an opt-in channel "
+                f"({', '.join(sorted(c for c in CHANNEL_DEFAULT_MEMBERSHIP if is_opt_in_channel(c)))}). "
+                f"Excluding cities from a default-membership channel is a per-city "
+                f"decision; name one city at a time."
+            )
         # On a default-membership channel only the EXCLUSION direction is a
         # real write. Enrolling a city that is already a member by default
         # changes nothing, so it stays refused as the silent no-op it is; the
@@ -2772,17 +2850,6 @@ def cmd_enroll_city(
                 f"channel, so enrolling one changes nothing. To take a single city out "
                 f"of {channel}, use --remove (and --clear to put it back); to stop a "
                 f"city collecting on every channel at once, set cities.enabled = 0."
-            )
-        if all_cities and not is_opt_in_channel(channel):
-            # --all reaches _bulk_candidates AFTER this guard, and that helper
-            # computes effective membership correctly for a default-membership
-            # channel — so without this it would work, over the whole catalog,
-            # in one keystroke. See the docstring.
-            raise _UsageError(
-                f"--channel {channel}: --all is only available on an opt-in channel "
-                f"({', '.join(sorted(c for c in CHANNEL_DEFAULT_MEMBERSHIP if is_opt_in_channel(c)))}). "
-                f"Excluding cities from a default-membership channel is a per-city "
-                f"decision; name one city at a time."
             )
         if remove and clear:
             raise _UsageError("--remove and --clear are mutually exclusive")
@@ -2898,13 +2965,36 @@ def cmd_enroll_city(
 
     before = db.get_channel_membership(conn, city.city_id, channel)
     target = None if clear else (False if remove else True)
+    if clear and before is None and _has_membership_row(conn, city.city_id, channel):
+        # The LAST no-op this command could still ship, and relaxing the
+        # default-membership guard is what opened it: `--clear --channel gsv` on
+        # a city nobody excluded used to be refused by that guard and now
+        # reaches here, writes a row, prints `unset (member by channel default)
+        # -> unset (member by channel default)` and exits 0. Its own docstring
+        # calls a silent no-op the exact failure it exists to prevent, and the
+        # new bare-enrol error actively routes operators here ("--clear to put
+        # it back"), so a mistyped --clear is a plausible command that now
+        # succeeds while doing nothing.
+        #
+        # Scoped to --clear alone, deliberately. Re-running a bare enrol or a
+        # --remove writes the value it names and PRINTS the before/after, which
+        # is a confirmation rather than a silent nothing, and repeat enrolment
+        # is long-standing tested behaviour (the cost note is read that way).
+        # Only --clear can resolve to "no stored value either way".
+        #
+        # `_has_membership_row` is the second term because a city with NO
+        # schedule_state row also reads `before is None`: creating that row is a
+        # real change when assign_schedule has not reached this channel yet, so
+        # --clear there is not a no-op and must not be refused.
+        raise _UsageError(
+            f"{city.city_id} [{channel}]: membership is already "
+            f"{_describe_membership(channel, None)}, so --clear would change nothing. "
+            f"Nothing was written."
+        )
     db.set_channel_membership(conn, city.city_id, channel, target, cycle_days=cfg.cycle_days)
 
     def _describe(value: int | None) -> str:
-        if value is None:
-            default = CHANNEL_DEFAULT_MEMBERSHIP[channel]
-            return f"unset ({'member' if default else 'not a member'} by channel default)"
-        return "MEMBER" if value else "not a member (explicit)"
+        return _describe_membership(channel, value)
 
     after = db.get_channel_membership(conn, city.city_id, channel)
     row = conn.execute(
@@ -2932,10 +3022,7 @@ def cmd_enroll_city(
         print(f"  {channel}: {n_member:,} of {n_enabled:,} enabled cities opted in.")
     else:
         n_excluded = db.count_channel_exclusions(conn, channel)
-        print(
-            f"  {channel}: {n_member:,} of {n_enabled:,} enabled cities collect this "
-            f"channel ({n_excluded:,} explicitly excluded)."
-        )
+        print("  " + _exclusion_line(conn, channel, n_member, n_enabled, n_excluded, listing=False))
     _print_unwired_note(cfg, channel)
     return 0
 
@@ -3629,7 +3716,11 @@ def cmd_reconcile_walks(
 # The GSV GRID run is deliberately absent: it is the expensive half (one request
 # per grid point) and it needs no help arriving. A newly registered city is
 # enabled with last_success_at NULL, which puts it at the head of the next
-# night's stalest-first queue.
+# night's stalest-first queue -- as long as it is a gsv MEMBER. Since #301 a
+# city can be excluded from gsv, and such a city is stranded behind the whole
+# gsv block instead; it arrives through the reservation _collect_due applies,
+# not at the head. That is a reason to leave the grid run out of this command,
+# not a reason to add it: assess-city answers from STREET coverage.
 ASSESS_CHANNELS = ("gsv_streets", "mapillary", "mapillary_streets")
 
 # Below this share of the search rectangle lying inside the city/county
@@ -3844,7 +3935,10 @@ def _assess_answer_report(cfg: SchedulerConfig, conn, city: db.CityRow) -> str:
         lines.append(
             "  No grid run on any provider yet, so there is no city page to link "
             "(generate_aggregate_v2 skips a city with no runs row). The GSV grid run "
-            "lands on the next nightly batch — that channel is due and leads the queue."
+            "lands on the next nightly batch that reaches it — it leads gsv's OWN "
+            "stalest-first list, which is the union's order only while the city is a "
+            "gsv member; excluded from gsv (#301) it is stranded instead and arrives "
+            "through the reservation, at [schedule].opt_in_cities_per_day per night."
         )
     return "\n".join(lines)
 
@@ -3957,6 +4051,35 @@ def cmd_assess_city(
         f"{'Registered' if newly_registered else 'Already registered'}: "
         f"{city.city_id} (geometry is frozen from here on)"
     )
+    # Membership is per-(city, channel) and this command had no idea (#301).
+    # _run_city_channels performs no membership check, so an excluded channel
+    # would be collected here -- spending its key -- and then record_attempt
+    # would stamp last_success_at on a row whose member is 0. `status` would
+    # then show that channel `excluded` WITH a recent success, a state nothing
+    # else can produce and an operator cannot read.
+    #
+    # Dropped rather than refused: the answer this command exists to give comes
+    # from whichever channels the city does collect, and refusing the whole run
+    # because one of three is excluded would be the wrong trade. Said out loud,
+    # because a quietly narrower answer is how the report gets misread.
+    excluded_channels = [
+        c for c in channels if db.get_channel_membership(conn, city.city_id, c) == 0
+    ]
+    if excluded_channels:
+        channels = [c for c in channels if c not in excluded_channels]
+        logger.warning(
+            f"{city.city_id}: excluded from {', '.join(excluded_channels)} "
+            f"(schedule_state.member = 0), so this assessment skips "
+            f"{'it' if len(excluded_channels) == 1 else 'them'}. "
+            f"Clear the exclusion with `enroll-city {city.city_id} --channel "
+            f"{excluded_channels[0]} --clear` if that is not what you meant."
+        )
+        if not channels:
+            logger.error(
+                f"{city.city_id}: every assess channel is excluded for this city, so "
+                f"there is nothing to collect and the report would be empty."
+            )
+            return USAGE_EXIT_CODE
     print(_assess_preflight_report(cfg, conn, city, today, channels))
 
     if estimate_only:
@@ -4079,8 +4202,11 @@ def cmd_assess_city(
     # discovered.
     if newly_registered:
         print(
-            "  The GSV grid run is not part of this command: it has no schedule_state "
-            "row yet, so it is due and leads the next nightly batch's queue."
+            "  The GSV grid run is not part of this command: it is due on the next "
+            "nightly batch and leads gsv's OWN stalest-first list. That is the union's "
+            "order only while the city is a gsv member — `enroll-city --channel gsv "
+            "--remove` (#301) makes it stranded instead, reached through the "
+            "[schedule].opt_in_cities_per_day reservation rather than at the head."
         )
     if succeeded:
         print(
@@ -4824,8 +4950,21 @@ def _collect_due(
     ``providers_for_city``, so a channel absent from this mapping is never
     priced, never budgeted and never launched.
 
-    ``max_opt_in`` is the reservation from issue #282 — how many opt-in-only
-    cities may be promoted to the head of the slate. It is **keyword-only with
+    ``max_opt_in`` is the reservation from issue #282 — how many STRANDED
+    cities may be promoted to the head of the slate. Stranded means "not due on
+    ``providers[0]``", the channel whose due list dictates union order, which is
+    the population the union appends behind every rank-0-due city and the cap
+    then truncates. Opt-in-only cities (#248) are a strict subset; cities
+    excluded from ``gsv`` (#301) are the other half and starve identically, so
+    the key is the mechanism rather than the cause. The key is the UNION of the
+    two — not due on rank 0, **or** due only on opt-in channels — because a
+    filtered widening (``run-due --provider kartaview``) makes rank 0 the opt-in
+    channel itself, stranding nobody by the first half while the live-checkpoint
+    preference below still has to hold. On a nightly run opt-in-only is a subset
+    of not-due-on-gsv and the union collapses to the first half. The CONFIG key keeps its
+    name, ``[schedule].opt_in_cities_per_day`` — renaming a deployed key to
+    track a widened meaning is not worth a production edit — but read it as the
+    rate at which any stranded population is worked off. It is **keyword-only with
     no default**, for the same reason ``providers`` is required and
     ``_run_city_loop``'s ``max_cities`` is: a permissive default here is an
     unbounded hoist one refactor away, and unbounded is the exact failure #282
@@ -4851,7 +4990,7 @@ def _collect_due(
     function's only substantive change to either mechanism.
 
     So the night's arithmetic is ``max_cities`` split three ways: at most
-    ``max_opt_in`` opt-in-only cities, then at most ``refresh_slots`` refreshes
+    ``max_opt_in`` stranded cities, then at most ``refresh_slots`` refreshes
     in what remains, and the rest pure stalest-first. It is the SUM of the two
     reservations that bounds how much of a night the plain queue still governs.
     """
@@ -4937,13 +5076,38 @@ def _collect_due(
     #     below -- without that preference a killed city sorts alphabetically
     #     among the never-run block and the five nights stop being consecutive.
     #
-    # `all`, not `any`, and the choice is the blast radius. A city due on gsv
-    # too needs no hoist (see above), and there is no pairing argument either:
-    # below the city cap it is truncated on both channels together, which pairs
-    # fine. An `any` key would hoist it anyway, displacing the stalest gsv-only
-    # city from a capped night every time a member city comes due. `all`
-    # rescues exactly the stranded case — due ONLY on opt-in channels — and
-    # leaves gsv's ordering strictly untouched.
+    # THE KEY IS "NOT DUE ON THE UNION'S RANK-0 CHANNEL", which is the actual
+    # shape of the starvation rather than one instance of it. The union above is
+    # ordered by FIRST APPEARANCE over `providers`, so a city's position is set
+    # by the earliest channel it is due on; a city not due on `providers[0]` is
+    # therefore appended behind every rank-0-due city and truncated by the cap.
+    # Whether it got there by being enrolled on an opt-in channel or by being
+    # EXCLUDED from gsv (issue #301) does not change the mechanism, and keying
+    # on the cause rather than the mechanism is what left the second population
+    # unrescued: `all(p in opt_in ...)` is False for a gsv-excluded city, since
+    # `mapillary` is a default-membership channel, so nothing hoisted it and
+    # nothing could -- `_reserve_refresh_slots` needs a non-NULL last_success_at
+    # and such a city has never collected. Measured before this key changed: ten
+    # gsv-excluded cities against 45 gsv-due ones landed at union positions
+    # 45-54 and collected 0 of 10 at prod's 40-city cap, permanently, with
+    # consecutive_failures at 0 and no alert.
+    #
+    # An opt-in-only city is a strict SUBSET of this key (it is by definition
+    # not due on gsv), so #248/#282's behaviour is preserved rather than traded
+    # away, and the bound below still applies to the union of both populations.
+    #
+    # Still not `any`. A city due on rank 0 AND an opt-in channel needs no
+    # hoist: it already sits in rank 0's stalest-first list and both channels
+    # run the same night, and below the cap it truncates on both together, which
+    # pairs fine. An `any` key would hoist it anyway, displacing the stalest
+    # gsv-only city from a capped night every time a member city comes due.
+    # This key rescues exactly the stranded case and leaves rank 0's ordering
+    # strictly untouched.
+    #
+    # On a filtered run (`run-due --provider mapillary`) rank 0 IS mapillary, so
+    # every due city is due on it, nothing is stranded, and the reservation is
+    # the identity permutation -- the same inertness the `if opt_in` gate used
+    # to provide, now falling out of the key itself.
     #
     # Reordering the CITY LIST, never the union loop: providers_for_city is
     # passed straight to _run_city_channels, where `pending = list(providers)`
@@ -4952,9 +5116,14 @@ def _collect_due(
     # ordering that a 40-line docstring and four superseded rationales in
     # docs/scheduler.md exist to protect.
     opt_in = {p for p in providers if is_opt_in_channel(p)}
+    # The channel whose due list dictates union order. `providers` is required
+    # and non-empty (see the docstring), but read defensively rather than
+    # indexing: an empty slate must be an identity, never an IndexError in the
+    # nightly path.
+    rank0 = providers[0] if providers else None
     hoisted = 0
     promoted_opt_in = 0
-    if opt_in:
+    if rank0 is not None:
         # BOUNDED since #282. The promotion is now a RESERVATION -- at most
         # `max_opt_in` cities move -- and the bound is what makes the mechanism
         # survive a wide enrolled set. Unbounded, the hoist's success case and
@@ -4997,13 +5166,14 @@ def _collect_due(
         # Probed only when the reservation actually has to choose. At today's
         # enrolled set the whole slate fits and this costs no filesystem reads
         # at all; the cost arrives with the widening, alongside the problem.
-        opt_in_only = [
+        stranded = [
             i
             for i, c in enumerate(ordered)
-            if all(p in opt_in for p in providers_for_city[c.city_id])
+            if rank0 not in providers_for_city[c.city_id]
+            or all(p in opt_in for p in providers_for_city[c.city_id])
         ]
-        if len(opt_in_only) <= max_opt_in:
-            chosen = set(opt_in_only)
+        if len(stranded) <= max_opt_in:
+            chosen = set(stranded)
         else:
 
             def _has_live_checkpoint(city) -> bool:
@@ -5019,7 +5189,7 @@ def _collect_due(
             # Stable, so within each group the union's stalest-first order is
             # untouched and the choice is only ever "resumers before starters".
             chosen = set(
-                sorted(opt_in_only, key=lambda i: 0 if _has_live_checkpoint(ordered[i]) else 1)[
+                sorted(stranded, key=lambda i: 0 if _has_live_checkpoint(ordered[i]) else 1)[
                     :max_opt_in
                 ]
             )
@@ -5044,10 +5214,11 @@ def _collect_due(
         # any of the three.
         first_kept = next((i for i, k in enumerate(keys) if k == 1), len(keys))
         hoisted = sum(1 for k in keys[first_kept:] if k == 0)
-        # Stable sort on a boolean key: with no opt-in channel configured every
-        # key is 1 and this is the identity permutation, which is what makes
-        # PR A's inertness provable by construction rather than argued. (The
-        # `if opt_in` guard is belt-and-braces on the same claim.)
+        # Stable sort on a boolean key: when nothing is stranded every key is 1
+        # and this is the identity permutation, which is what keeps the
+        # mechanism provably inert rather than argued to be. That covers the
+        # no-opt-in-channel config it was originally claimed for AND every
+        # filtered run, where rank 0 is the only channel and strands nobody.
         ordered = [c for _, c in sorted(zip(keys, ordered, strict=True), key=lambda kc: kc[0])]
 
     # The refresh reserve (#308) runs HERE, on what the hoist did not take,
@@ -5077,7 +5248,7 @@ def _collect_due(
     )
     ordered = ordered[:promoted_opt_in] + tail
 
-    if opt_in:
+    if rank0 is not None:
         # The backlog is the number an operator widening a channel actually
         # needs, and it is invisible from `hoisted` alone -- a reservation that
         # is working looks identical whether 3 cities are waiting or 800.
@@ -5096,16 +5267,28 @@ def _collect_due(
         # an opt-in-only city that was not hoisted out of the window, so a count
         # taken before it would report a city as reached that the night will not
         # reach.
-        opt_in_only = [
+        stranded = [
             i
             for i, c in enumerate(ordered)
-            if all(p in opt_in for p in providers_for_city[c.city_id])
+            if rank0 not in providers_for_city[c.city_id]
+            or all(p in opt_in for p in providers_for_city[c.city_id])
         ]
-        reached = sum(1 for i in opt_in_only if i < max_cities)
-        waiting = len(opt_in_only) - reached
+        reached = sum(1 for i in stranded if i < max_cities)
+        waiting = len(stranded) - reached
         if waiting:
+            # Named for what the population actually IS on this run, because it
+            # is mixed now. A filtered widening (`run-due --provider kartaview`)
+            # strands nobody by the rank-0 key and every due city is
+            # opt-in-only, which is the case this line was written for and the
+            # number an operator widening a channel reads. A nightly run mixes
+            # opt-in enrolments with gsv-excluded cities (#301), and there the
+            # honest noun is the mechanism rather than either cause.
+            all_opt_in_only = all(
+                p in opt_in for i in stranded for p in providers_for_city[ordered[i].city_id]
+            )
+            noun = "opt-in-only cities" if all_opt_in_only else f"cities not due on {rank0}"
             logger.info(
-                f"{reached} of {len(opt_in_only)} opt-in-only cities are inside tonight's "
+                f"{reached} of {len(stranded)} {noun} are inside tonight's "
                 f"{max_cities}-city cap ([schedule].opt_in_cities_per_day={max_opt_in} "
                 f"reserved, {promoted_opt_in} promoted); {waiting} wait for a later night"
             )
