@@ -205,7 +205,7 @@ That means one entry in `host_lock.py`, not 25.
 **It is a STAC API**, unauthenticated for read — the only provider here with no credential at all, which is why `config.CHANNEL_ENV_VARS["panoramax"]` is an empty tuple rather than a missing row.
 The vector-tile endpoint `/api/map/{z}/{x}/{y}.mvt` is the census and `census.py`, `checkpointing.py` and the [#290](https://github.com/jonfroehlich/streetscape-tracker/issues/290) cache parameterized onto it as expected.
 `/api/search` did **not**: it cannot count (no pagination, no `numberMatched`) and silently ignores its own `datetime` filter, both measured in phase 1.
-The one surprise in the cost was the zoom — the per-picture layer starts at **z15**, not Mapillary's z14, so the same bbox is ~4x the tiles.
+The one surprise in the cost was the zoom — the per-picture layer starts at **z15**, not Mapillary's z14, so the same bbox is up to ~4x the tiles (one zoom level's asymptote; 2.9x at the catalog median).
 
 Per-picture metadata is **richer than either census provider we have**: `datetime` (capture), `created`/`updated` (ingest — so KartaView's `shot_date >= date_added` guard comes from real fields rather than inference), `license`, `geovisio:producer`, `quality:horizontal_accuracy`, `pers:interior_orientation.field_of_view`, and a `via` link naming the source instance.
 

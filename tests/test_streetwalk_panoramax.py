@@ -51,6 +51,7 @@ from streetscape_metadata_tracker.naming import (
 )
 from streetscape_street_analyzer import collect
 from streetscape_street_analyzer import collect_panoramax as cp
+from tests.conftest import stamp_census_cache
 
 # Same geometry as the GSV, Mapillary and KartaView walk tests, so all four arms
 # are scored over an identical street network and their numbers are comparable.
@@ -97,6 +98,7 @@ def _setup(
     api_requests_total=None,
     census_fetched_by=None,
     census_fetched_at=None,
+    census_reused=None,
     failed_tiles=None,
     edges=None,
     grid_m=200,
@@ -139,6 +141,7 @@ def _setup(
         calls["checkpoint_path"] = kwargs.get("checkpoint_path")
         calls["checkpoint_channel"] = kwargs.get("checkpoint_channel")
         calls["checkpoint_variant"] = kwargs.get("checkpoint_variant")
+        calls["connection_limit"] = kwargs.get("connection_limit")
         calls["max_requests_per_minute"] = kwargs.get("max_requests_per_minute")
         calls["jitter"] = kwargs.get("jitter")
         policy = kwargs.get("census_cache")
@@ -168,8 +171,16 @@ def _setup(
             # this channel paid, and nothing was reused.
             "census_fetched_by": census_fetched_by or kwargs.get("checkpoint_channel"),
             "census_fetched_at": census_fetched_at,
-            "census_reused": bool(
-                census_fetched_by and census_fetched_by != kwargs.get("checkpoint_channel")
+            # DERIVED by default and OVERRIDABLE on purpose. Deriving it alone
+            # makes one state inexpressible -- provenance present, reuse False,
+            # which is what a fresh crawl that checkpointed under its own
+            # channel looks like -- and that is the state the restamp must NOT
+            # fire in. A fixture that cannot say "not reused" cannot fail when
+            # the collector stops asking.
+            "census_reused": (
+                bool(census_fetched_by and census_fetched_by != kwargs.get("checkpoint_channel"))
+                if census_reused is None
+                else census_reused
             ),
         }
 
@@ -606,6 +617,115 @@ def test_refetch_census_opts_out_of_the_reuse(tmp_path, monkeypatch):
     data_dir2, calls2 = _setup(tmp_path / "b", monkeypatch, [_picture("px1", 44.05, -121.30)])
     assert collect.run_collect(_args(data_dir2)) == 0
     assert calls2["reuse_census"] is True
+
+
+def test_the_walk_holds_this_providers_own_number_of_sockets_not_gsvs(tmp_path, monkeypatch):
+    """`--connection-limit` is one flag over four arms whose hosts are not alike.
+
+    Its old default, 50, is a GSV number. Panoramax's own grid run never used
+    it -- `cli.py` passes no connection_limit for this provider, so the
+    downloader's 5 applies -- and a walk inheriting 50 held ten times the
+    sockets open against a volunteer-run instance that publishes no rate limit,
+    returns no `Retry-After` and has no credential to identify us by. The
+    limiter bounds the RATE; sockets held open while an instance is slow are
+    what it does not bound. An explicit flag still wins, in both directions.
+    """
+    data_dir, calls = _setup(tmp_path, monkeypatch, [_picture("px1", 44.05, -121.30)])
+    assert collect.run_collect(_args(data_dir)) == 0
+    assert calls["connection_limit"] == collect.PANORAMAX_WALK_CONNECTION_LIMIT == 5
+    assert collect.GSV_WALK_CONNECTION_LIMIT == 50, "and gsv's own default is untouched"
+
+    data_dir2, calls2 = _setup(tmp_path / "b", monkeypatch, [_picture("px1", 44.05, -121.30)])
+    assert collect.run_collect(_args(data_dir2, **{"connection-limit": 12})) == 0
+    assert calls2["connection_limit"] == 12, "an operator's explicit value is honoured"
+
+
+def test_a_paired_night_prices_this_walk_at_zero_and_the_budget_gate_lets_it_through(
+    tmp_path, monkeypatch, capsys
+):
+    """ "Free on a paired night" is this arm's headline cost claim, and nothing
+    pinned it.
+
+    The grid run tiles the city and promotes its crawl; the walk reads the same
+    (provider, city, bbox) entry for 0 requests. Two halves have to hold for
+    that to be real, and they fail independently: `--estimate` must PRICE it at
+    zero -- an operator deciding whether to spend reads that number -- and the
+    `--daily-budget` pre-flight must not then refuse the one walk that costs
+    nothing, which is precisely what a nearly-spent street budget does if the
+    gate prices the whole census. Both were green with `panoramax` excluded from
+    the cache probe entirely, which is what this asserts against.
+    """
+    data_dir, _ = _setup(tmp_path, monkeypatch, [_picture("px1", 44.05, -121.30)])
+    conn = db.connect(db.get_default_db_path(data_dir))
+    city = db.resolve_city(conn, CITY_QUERY)
+    conn.close()
+    bbox = grid_bbox(
+        city.center_lat, city.center_lon, city.grid_width_m, city.grid_height_m, city.step_m
+    )
+
+    # Uncached, a zero budget refuses the walk -- so the pass below is the cache
+    # doing the work, not a gate that was never armed.
+    assert collect.run_collect(_args(data_dir, **{"daily-budget": 0})) == 1
+    assert collect._cached_census_marker(city, "panoramax", _args(data_dir)) is None
+
+    stamp_census_cache(census_cache_path_for("panoramax", CITY_ID, bbox), "panoramax")
+
+    assert collect._cached_census_marker(city, "panoramax", _args(data_dir)) is not None
+    assert collect.run_collect(_args(data_dir, estimate=True)) == 0
+    assert "0 Panoramax tile requests" in capsys.readouterr().out
+    assert collect.run_collect(_args(data_dir, **{"daily-budget": 0})) == 0
+
+    # --refetch-census prices the fetch it is about to force, not the entry it
+    # is about to ignore.
+    forced = _args(data_dir, **{"refetch-census": True})
+    assert collect._cached_census_marker(city, "panoramax", forced) is None
+
+
+def test_a_reused_census_stamps_its_rows_with_when_panoramax_was_observed(tmp_path, monkeypatch):
+    """Every row of a reused census was fetched by another collection, possibly
+    on an earlier night.
+
+    Stamping `query_timestamp` with this process's clock would record an
+    observation that never happened -- and `json_summarizer` reports the run's
+    start and end from exactly that column, so a walk reusing a grid run's
+    census from the night before would publish a window it never covered. The
+    sibling collectors carry this; deleting the `observation_timestamp` call
+    here left the ENTIRE suite green, which is what this pins.
+    """
+    observed = "2026-07-07T22:15:00+00:00"
+    data_dir, _ = _setup(
+        tmp_path,
+        monkeypatch,
+        [_picture("px1", 44.05, -121.30)],
+        census_fetched_by="panoramax",
+        census_fetched_at=observed,
+    )
+
+    assert collect.run_collect(_args(data_dir)) == 0
+    assert set(_column(_walk_csv(data_dir), "query_timestamp")) == {observed}
+
+
+def test_a_freshly_fetched_census_keeps_this_processs_clock(tmp_path, monkeypatch):
+    """The other side, and the reason the restamp is gated on REUSE rather than
+    on the provenance being present at all.
+
+    A fresh crawl checkpointing under its own channel reports provenance too --
+    its own -- and those rows WERE observed now. Expressing that state needs the
+    fixture to take `census_reused` rather than derive it from whether the
+    fetcher differs, which is why it does.
+    """
+    crawl_start = "2026-07-01T00:00:00+00:00"
+    data_dir, _ = _setup(
+        tmp_path,
+        monkeypatch,
+        [_picture("px1", 44.05, -121.30)],
+        census_fetched_by="panoramax_streets",
+        census_fetched_at=crawl_start,
+        census_reused=False,
+    )
+
+    assert collect.run_collect(_args(data_dir)) == 0
+    assert crawl_start not in set(_column(_walk_csv(data_dir), "query_timestamp"))
 
 
 # ── An unswept sample is not an empty one ───────────────────────────────────

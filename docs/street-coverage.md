@@ -78,10 +78,18 @@ It is a **scheduled, opt-in** channel as of #258, enrolled separately from `kart
 **KartaView's walk is priced like Mapillary's, not GSV's**: a radius sweep of the frozen bbox, independent of spacing.
 The first one measured it — Krabi, 2026-08-31, 18,851 samples over 2,144 edges scored from **87 sweep requests**, against 18,851 for the same walk on `gsv_streets`, for slightly HIGHER coverage (85.4% of street-km vs GSV's 82.9%).
 **Panoramax's walk is priced the same way and reads the same instrument as its grid run: the v1 `pictures` layer at z15.**
-Note the zoom rather than assuming Mapillary's — the layer does not exist below z15, so the same bbox costs roughly 4x the tiles (`estimate_tile_count` measured p50 414 / p90 2,400 / max 3,132 over the 20 richest cities phase 1 found).
+Note the zoom rather than assuming Mapillary's — the layer does not exist below z15, so the same bbox costs **up to** roughly 4x the tiles (`estimate_tile_count` measured p50 414 / p90 2,400 / max 3,132 over the 20 richest cities phase 1 found).
+Four is one zoom level's asymptote, not the ratio a real grid shows: measured against the Mapillary estimator over square grids from 0.2 to 40 km it runs 2.0x-3.9x, and the catalog medians below (35 against 12) put it at 2.9x.
 Its pace is the **lowest tile rate in the repo** (30/min, `--panoramax-max-requests-per-minute`, jittered on the same #292 shape): Panoramax documents no rate limit and returns no `X-RateLimit-*`/`Retry-After` header, so there is no ceiling to pace against and the conservative figure is the honest one.
 It is half the `download_mapillary` module's exported 60 — but do not quote that as the safety margin, because both Mapillary channels are CONFIGURED to 40 (#292), so the real gap to the host that does document a limit is 25%, not 50%.
-The San Luis Obispo sizing that motivated #331 — 2,539 edges, 25,002 samples at 15 m spacing — cost GSV 25,002 requests against Mapillary's ~36 and KartaView's ~64; Panoramax lands in that same census range rather than GSV's.
+The San Luis Obispo sizing that motivated #331 — 2,539 edges, 25,002 samples at 15 m spacing — cost GSV 25,002 requests against Mapillary's ~36 and KartaView's ~64.
+Those four figures are the sizing quoted on the issue, not a committed measurement in this repo: treat them as the order-of-magnitude argument they were, and re-derive from `--estimate` before budgeting anything.
+Panoramax's figure for that bbox is not quoted because nothing here measured it; scaling the z14 count by the ratio above puts it near 100-140 z15 tiles — the census order of magnitude, not GSV's.
+
+**`--connection-limit` defaults per provider, not to one number.**
+It is a single flag over four arms whose hosts are not alike: gsv and mapillary keep 50 (prod configures exactly that for the Mapillary grid channel over the same CDN, so lowering the walk would make the pair disagree), and panoramax takes 5 — what its own grid run already uses, since `cli.py` passes no `connection_limit` for it.
+The rate limiter bounds throughput either way; what the smaller number bounds is sockets held open while a volunteer-run instance is slow, on the one provider that publishes no rate limit, returns no `Retry-After`, and has no credential to identify us by.
+An explicit `--connection-limit` still wins in both directions.
 The Mapillary arm emits #116's status vocabulary at sample level
 — `OK`/`NO_DATE` for a 360° pano in range, `FLAT_ONLY` (null capture_date) when only flat imagery is, `ZERO_RESULTS` when the sample was measured and nothing is in range, and `REQUEST_FAILED` when it was never measured at all (below)
 — which `compute_streetwalk_coverage` turns into **two numbers per edge**: `coverage_fraction` (360°) and `coverage_fraction_any`, summarized as `coverage_pct_by_length[_any]`.
@@ -198,7 +206,8 @@ The backfill cross-checks each artifact's lengths against the row's already-cata
 A road-walk sample is covered when its collected row is PRESENT — `OK` **or** `NO_DATE` — official, and within `--match-dist` m: the same presence vocabulary the grid coverage rate has always used (`analysis.PRESENT_STATUSES`).
 Until 2026-08-24 `compute_streetwalk_coverage` filtered on `status == "OK"` alone, so a 360° pano standing on the street with a capture date the provider's guard had nulled counted as **neither** `covered` nor `covered_any`.
 The grid-attribution half of this same package (`select_pano_points`) had already been corrected in 611bd53 (PR #251, review finding 9); this is the road-walk half catching up, and the two halves now read one definition rather than two.
-Note the doc was ahead of the code here — "Road-walk: both providers, and scheduled" above has described the sample vocabulary as `OK`/`NO_DATE` since #116, which is the definition that was intended all along.
+Note the doc was ahead of the code here — "Road-walk: four providers, three of them scheduled" above has described the sample vocabulary as `OK`/`NO_DATE` since #116, which is the definition that was intended all along.
+(That heading read "both providers, and scheduled" when this sentence was written; it is quoted by its current wording so the pointer survives the next provider too.)
 
 A `NO_DATE` sample covers and **ages nothing**: its `capture_date` is NaT, so it never reaches `nearest_pano_date` or `median_covered_age_years`, exactly as in the grid stats.
 The GSV official-imagery gate is untouched and still applies — an undated third-party pano is still third-party, and the exact `© Google` match is the only thing standing between the two.

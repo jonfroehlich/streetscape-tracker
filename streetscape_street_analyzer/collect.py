@@ -108,7 +108,8 @@ from streetscape_metadata_tracker.download_mapillary import (
 
 # ALIASED, BECAUSE TWO OF THESE NAMES ARE ALREADY BOUND ABOVE TO MAPILLARY'S
 # VALUES. `estimate_tile_count` counts a z15 lattice here against Mapillary's
-# z14 (~4x the tiles for one bbox), and DEFAULT_TILE_REQUESTS_PER_MINUTE is 30
+# z14 (up to ~4x the tiles for one bbox, 2.9x at the catalog median), and
+# DEFAULT_TILE_REQUESTS_PER_MINUTE is 30
 # against Mapillary's 60. A bare `from ... import estimate_tile_count` would not
 # be a name clash the linter flags but a SILENT REBINDING of whichever import
 # came second, and the loser's channel would then be priced and paced by the
@@ -231,8 +232,11 @@ STREET_COST_MODELS: dict[str, StreetCostModel] = {
     # figure on a bad night, and the --daily-budget pre-flight below can
     # correspondingly under-refuse; it is a tight floor, not a ceiling.
     # Note the zoom in the estimator, not here -- z15 is the coarsest that
-    # serves the v1 `pictures` layer at all, so a bbox costs ~4x the Mapillary
-    # row above and the two units are not interchangeable numbers.
+    # serves the v1 `pictures` layer at all, so a bbox costs up to ~4x the
+    # Mapillary row above and the two units are not interchangeable numbers.
+    # ~4 is the asymptote rather than the measurement: a bbox does not divide
+    # evenly, so the ratio runs 2.0x-3.9x over square grids from 0.2 to 40 km
+    # and sits at 2.9x on the catalog median. Quote it as a bound, not a factor.
     "panoramax": StreetCostModel(
         unit="Panoramax tile requests", estimate=estimate_panoramax_tile_count
     ),
@@ -289,6 +293,41 @@ def _cached_census_marker(city, provider: str, args) -> dict | None:
     if provider not in CENSUS_PROVIDERS or args.refetch_census:
         return None
     return census_cache_probe(provider, city.city_id, frozen_bbox(city))
+
+
+# Concurrency defaults, per provider rather than one GSV-sized number for all
+# four arms. gsv and mapillary keep the 50 they have always run at -- prod
+# configures exactly that for the Mapillary GRID channel over the same host, so
+# lowering the walk would make the pair disagree about one CDN.
+#
+# Panoramax is 5 because that is what ITS grid run uses: `cli.py` passes no
+# connection_limit for this provider, so the downloader's own default applies,
+# and a walk quietly holding ten times the sockets against a volunteer-run
+# instance with no documented rate limit, no `Retry-After` and no credential to
+# identify us is the one asymmetry here worth removing. The 30/min limiter
+# bounds the RATE either way; what this bounds is sockets held open while the
+# instance is slow, which is the failure mode an unmetered host shows first.
+GSV_WALK_CONNECTION_LIMIT = 50
+MAPILLARY_WALK_CONNECTION_LIMIT = 50
+PANORAMAX_WALK_CONNECTION_LIMIT = 5
+_WALK_CONNECTION_LIMITS = {
+    "gsv": GSV_WALK_CONNECTION_LIMIT,
+    "mapillary": MAPILLARY_WALK_CONNECTION_LIMIT,
+    "panoramax": PANORAMAX_WALK_CONNECTION_LIMIT,
+}
+
+
+def _walk_connection_limit(args, provider: str) -> int:
+    """An explicit --connection-limit, else this provider's own default.
+
+    Direct indexing, never `.get`: a provider arriving here unlisted is a
+    wiring bug, not a candidate for somebody else's number. Which is why it is
+    called from INSIDE each arm that takes one rather than once above the
+    chain -- kartaview's sweep is serial and has no such argument, so resolving
+    it for every provider made the one channel that needs no answer raise for
+    want of one.
+    """
+    return args.connection_limit or _WALK_CONNECTION_LIMITS[provider]
 
 
 def run_collect(args: argparse.Namespace) -> int:
@@ -406,8 +445,10 @@ def run_collect(args: argparse.Namespace) -> int:
         )
 
         # The provider and network-type tokens are what keep same-night walks
-        # apart. Both providers walk the SAME sample points and the scheduler
-        # runs them on one run_date; and one frozen bbox yields both a 'drive'
+        # apart. EVERY provider walks the same deterministic sample points and
+        # the scheduler runs them on one run_date -- there are four of them now,
+        # which is what turned this from a two-way collision into an n-way one;
+        # and one frozen bbox yields both a 'drive'
         # network and a much larger 'all_public' one. Without either token the
         # second collection would find the first's snapshot already on disk and
         # skip as a silent no-op reported as success.
@@ -528,7 +569,7 @@ def run_collect(args: argparse.Namespace) -> int:
                         out_csv,
                         city_label=city.display_name,
                         batch_size=args.batch_size,
-                        connection_limit=args.connection_limit,
+                        connection_limit=_walk_connection_limit(args, provider),
                         request_timeout=args.timeout,
                         max_retries=args.max_retries,
                         max_requests_per_minute=args.max_requests_per_minute,
@@ -542,7 +583,7 @@ def run_collect(args: argparse.Namespace) -> int:
                         config["access_token"],
                         out_csv,
                         match_dist_m=args.match_dist,
-                        connection_limit=args.connection_limit,
+                        connection_limit=_walk_connection_limit(args, provider),
                         request_timeout=args.timeout,
                         max_requests_per_minute=args.mapillary_max_requests_per_minute,
                         jitter=args.mapillary_jitter,
@@ -563,7 +604,7 @@ def run_collect(args: argparse.Namespace) -> int:
                         # downloader has no parameter for one.
                         out_csv,
                         match_dist_m=args.match_dist,
-                        connection_limit=args.connection_limit,
+                        connection_limit=_walk_connection_limit(args, provider),
                         request_timeout=args.timeout,
                         max_requests_per_minute=args.panoramax_max_requests_per_minute,
                         jitter=args.panoramax_jitter,
@@ -896,7 +937,18 @@ def build_parser() -> argparse.ArgumentParser:
              zero requests rather than re-pay a census it already bought.""",
     )
     parser.add_argument("--batch-size", type=int, default=100)
-    parser.add_argument("--connection-limit", type=int, default=50)
+    # DEFAULTED PER PROVIDER, not here (see `_walk_connection_limit`): 50 is a
+    # GSV-sized number, and the flag is shared by four arms whose hosts are not.
+    parser.add_argument(
+        "--connection-limit",
+        type=int,
+        default=None,
+        help=(
+            "Max concurrent requests. Default is the provider's own: 50 for gsv "
+            f"and mapillary, {PANORAMAX_WALK_CONNECTION_LIMIT} for panoramax, "
+            "which is what its grid run already uses."
+        ),
+    )
     parser.add_argument("--timeout", type=float, default=30.0)
     parser.add_argument("--max-retries", type=int, default=3)
     parser.add_argument(

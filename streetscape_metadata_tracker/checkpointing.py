@@ -199,8 +199,11 @@ def checkpoint_path_for(
     Args:
         city_id: canonical catalog slug.
         bbox: the frozen grid's (min_lon, min_lat, max_lon, max_lat).
-        channel: the collecting channel's name -- 'mapillary' or 'kartaview' for
-            a grid run, 'mapillary_streets' or 'kartaview_streets' for a walk.
+        channel: the collecting channel's name -- the grid half of one of the
+            three pairs ('mapillary', 'kartaview', 'panoramax') or its walk
+            ('mapillary_streets', 'kartaview_streets', 'panoramax_streets').
+            Kept in step with the paragraph above, which is the list a reader
+            checks this against.
         variant: what distinguishes two crawls of one city within one channel,
             or None when the channel is the whole key. Today that is a walk's
             ``--network-type``; a grid run has exactly one crawl per channel and

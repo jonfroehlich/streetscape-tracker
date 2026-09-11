@@ -19,7 +19,9 @@ Three things a reader coming from ``collect_mapillary`` will otherwise assume
 wrongly:
 
   * **The tiles are z15, not z14**, because the v1 ``pictures`` layer does not
-    exist below it — so the same bbox costs ~4x Mapillary's tile count. Nothing
+    exist below it — so the same bbox costs UP TO ~4x Mapillary's tile count
+    (4 is the asymptote, one zoom level; measured 2.0x-3.9x over square grids
+    from 0.2 to 40 km, and 2.9x at the catalog median). Nothing
     here names a zoom; ``download_panoramax.tiles_for_bbox`` owns it, and the
     shared helper takes zoom as a REQUIRED argument so no caller can inherit
     another provider's default.
@@ -44,7 +46,18 @@ second ``--network-type`` is free on top of that.
 The output is a METADATA-schema snapshot, one row per unique sample location,
 exactly like the GSV, Mapillary and KartaView collectors' — so everything
 downstream (``compute_streetwalk_coverage``, the coverage GeoJSON, the catalog
-row, the manifest, the frontend) is shared, not duplicated.
+row, the manifest) is shared, not duplicated.
+
+THE FRONTEND IS THE ONE EXCEPTION, and it is not shared YET. Unlike the
+KartaView collector's version of this paragraph, "streets.html renders it the
+moment one reaches the manifest" is false here: ``www/js/streetscape-utils.js``
+has no ``panoramax`` entry, ``walkProvidersIn()`` intersects the manifest with
+that registry, and ``getProviderFromFilename`` rewrites an unregistered token to
+``gsv``. So a walk collected today publishes into ``streetwalks.json.gz`` and is
+silently dropped from the page -- no column, no "Collected by" option -- exactly
+as ``vis.py`` already warns for the grid side. Issue #334 adds the registry
+entry; until it lands, collect this knowing the artifact is real and the page
+will not show it.
 """
 
 from __future__ import annotations
@@ -148,6 +161,13 @@ async def collect_panoramax_street_samples_async(
     after the download step — and ``api_requests_total`` (the census's spend
     across resumes, for the ``street_walks`` row) and ``checkpoint_path`` (the
     caller's to discard once that row is committed).
+
+    "Identically" means the caller needs no provider arm, NOT that it reads
+    every key: on the walk path ``num_flat_images`` reaches only the log line
+    below — ``street_walks`` has no such column, and the flat magnitude is a
+    GRID-run statistic (``runs.num_flat_images``). It is returned anyway because
+    a key present in two sibling collectors and absent here is the asymmetry
+    that makes the next reader check which one is wrong.
 
     ``api_requests`` is THIS PROCESS's spend and ``api_requests_total`` is the
     crawl's across every resume. They are different numbers and the distinction

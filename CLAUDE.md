@@ -160,7 +160,7 @@ It is columnar (a memory contract, #157), pinned byte-identical by a golden fixt
 Three Panoramax rules that must survive without a read (#316):
 
 - **The census is the v1 `pictures` layer at z15, never `/api/search`** — search does not paginate, reports no `numberMatched` and SILENTLY IGNORES its own `datetime` filter (measured: 5,045 pictures that the requested windows should have excluded all came back), so an incremental fetch built on it would re-read the whole history and report it as new.
-  z15 is the coarsest zoom that serves the layer at all, so a bbox costs ~4x Mapillary's tiles; the shared `tiles_for_bbox` therefore takes zoom as a REQUIRED argument and each provider re-exposes it with its own default.
+  z15 is the coarsest zoom that serves the layer at all, so a bbox costs up to ~4x Mapillary's tiles (the asymptote; 2.9x at the catalog median); the shared `tiles_for_bbox` therefore takes zoom as a REQUIRED argument and each provider re-exposes it with its own default.
   The standing growth screen (#316) reads a DIFFERENT instrument — the v2 `grid` layer at z6, hexagons larger than the cities inside them — so its numbers are upper bounds and never coverage; `hexes_from_tile` takes zoom as a required argument for the same reason.
 - **A 403 or 429 is a per-IP refusal, and a 404 is an EMPTY TILE** — there is no credential, so 403 cannot mean a rejected token; and an empty area answers 200 with no layer, so a 404 means the tile holds nothing.
   A lattice where EVERY tile 404s is therefore a moved endpoint, and is refused rather than published as a city that lost all its imagery.

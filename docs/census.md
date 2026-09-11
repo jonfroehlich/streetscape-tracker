@@ -415,7 +415,7 @@ And it is enormous, because every feature embeds a ~90-key EXIF blob: 1,000 feat
 
 So the census is the v1 map endpoint's `pictures` layer, which starts at **z15** — the coarsest zoom that serves it at all, and therefore the cheapest.
 That is not a tunable and getting it wrong is silent rather than loud: below z15 the layer is absent entirely, so every tile would decode to nothing and the run would publish a city holding no imagery rather than failing.
-The cost that follows is a real difference from Mapillary and not a rounding one: the same bbox is ~4x the tiles, a catalog p50 of 35 against Mapillary's 12, and over the cities actually worth enrolling a p50 of 414 tiles, p90 2,400 and max 3,132 (~104 minutes at the shipped pace).
+The cost that follows is a real difference from Mapillary and not a rounding one: the same bbox is up to ~4x the tiles (the asymptote of one zoom level; measured 2.0x-3.9x over square grids from 0.2 to 40 km), a catalog p50 of 35 against Mapillary's 12, and over the cities actually worth enrolling a p50 of 414 tiles, p90 2,400 and max 3,132 (~104 minutes at the shipped pace).
 `estimate_tile_count` counts that lattice exactly, offline and free, so unlike KartaView's sweep there is no observed-versus-geometric correction to carry.
 
 The v2 endpoint's H3 `grid` layer — aggregated counters rather than rows — is the *screen* instrument phase 1 used to price the whole catalog for 113 requests, and it is not read by the collector at all.
@@ -463,10 +463,12 @@ Panoramax is the third, and the arm is small precisely because nothing about the
 A second implementation here would be a second date rule, and one city's grid and street artifacts would disagree about the same picture.
 
 **Two hazards are specific to this provider being Mapillary-shaped.**
-`download_panoramax` shares four exported spellings with `download_mapillary`, and **two of them are genuine collisions**: `estimate_tile_count` (a z15 lattice against a z14 one, ~4x the tiles for one bbox) and `DEFAULT_TILE_REQUESTS_PER_MINUTE` (30 against 60).
+`collect.py` imports four names from both `download_panoramax` and `download_mapillary`, and **two of them are genuine collisions**: `estimate_tile_count` (a z15 lattice against a z14 one, up to ~4x the tiles for one bbox — 2.9x at the catalog median) and `DEFAULT_TILE_REQUESTS_PER_MINUTE` (30 against 60).
 So `collect.py` imports them ALIASED: a bare import would not be a clash the linter flags but a silent rebinding of whichever came second, after which the loser's channel is priced and paced by the winner's constants — the #268 failure (one provider's cost model wearing another's name) reached through the import list rather than through an `else`.
 **Be precise about which names collide**, because a reader who checks an overstated claim and finds it false deletes the aliasing with it: `DEFAULT_TILE_JITTER` is 0.6 in BOTH modules, and `grid_bbox` is not a collision at all — both re-export the identical `download_common.grid_bbox`, and `collect.py` does not import it.
 The first version of this paragraph claimed all four differed and quoted Mapillary's rate as 40, which is its PRODUCTION CONFIG value and not what the module exports; a three-reviewer pass caught it.
+**And "four" is the count of what THIS CALLER imports, never a property of the two modules**: they share 55 public names, 14 of which resolve to different objects (`TILE_ZOOM`, `TILE_URL_TEMPLATE`, `TileCheckpoint`, `fetch_city_images_async`, `build_image_rows`, `records_to_census`, `tiles_for_bbox`, `load_cached_census`, … — measured, not counted by hand).
+Stated as a module property it invites the next call site to import a fifth name unaliased on the grounds that the list was complete.
 And a **404 is an empty tile**, not a failure, so a tile genuinely holding no imagery never reaches `failed_tiles`; everything the walk's `unmeasured_mask` covers is ground the fetch really did not see.
 
 **`panoramax_streets` is a budget channel with no credential behind it.**
