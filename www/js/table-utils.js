@@ -300,6 +300,63 @@ function providerColumnGroup({
 }
 
 /**
+ * How many leaf columns a DEFAULT preset may show beside the city name.
+ *
+ * Eight, because that is the leaf count of the two-provider Overview that
+ * grid.html and streets.html shipped with and that was measured to fit — not
+ * a round number picked for looking like one. Every count at or below it has
+ * been measured against the content measure (a 1500px page less the 280px
+ * sidebar); above it, both pages overflow.
+ */
+const DEFAULT_PRESET_LEAF_BUDGET = 8;
+
+/**
+ * Drop trailing per-provider GROUPS from a default preset until it fits.
+ *
+ * The pivoted tables put one leaf per COLLECTED provider under each grouped
+ * header (issue #250), so a default preset's width is a function of the
+ * payload rather than of the preset: three metric groups that fit two
+ * providers are ~135px too wide at three and ~400px too wide at four. There
+ * is no pagination or virtualization to fall back on (ADR 0001) and the page
+ * measure is a deliberate typographic choice, so the thing that has to give
+ * is how many groups the DEFAULT shows. Every other preset is an explicit
+ * request and keeps everything it names — the wrap scrolls, which is the
+ * narrow-viewport safety net doing its job rather than the desktop layout.
+ *
+ * Found by issue #334, whose new provider made the e2e width gate fail — but
+ * PRODUCTION WAS ALREADY OVER at the time, by 140px on grid.html and 164px on
+ * streets.html, because KartaView had been a third collected provider since
+ * #248 and the e2e fixture carried only two. The gate was right; it was
+ * pointed at a payload narrower than the real one.
+ *
+ * Drops whole groups from the END, never individual leaves: half a metric
+ * group renders a header spanning columns it no longer has, and dropping the
+ * cheap ungrouped scalars (Street km) would save 100px while losing a column
+ * a reader uses to interpret every percentage beside it.
+ *
+ * @param {Object} preset - A preset descriptor; `columns` is a list of keys.
+ * @param {Object[]} columns - The built column list, for key -> group lookup.
+ * @param {number} [budget=DEFAULT_PRESET_LEAF_BUDGET] - Maximum leaves.
+ * @returns {Object} The preset, or a trimmed copy of it.
+ */
+function fitDefaultPreset(preset, columns, budget = DEFAULT_PRESET_LEAF_BUDGET) {
+  const groupOf = new Map(columns.map((c) => [c.key, c.group?.id ?? null]));
+  const keys = preset.columns;
+
+  const groupOrder = [];
+  for (const key of keys) {
+    const id = groupOf.get(key);
+    if (id && !groupOrder.includes(id)) groupOrder.push(id);
+  }
+
+  const dropped = new Set();
+  const kept = () => keys.filter((key) => !dropped.has(groupOf.get(key)));
+  while (kept().length > budget && groupOrder.length > 0) dropped.add(groupOrder.pop());
+
+  return dropped.size === 0 ? preset : { ...preset, columns: kept() };
+}
+
+/**
  * The "Collected by" option meaning "more than one provider", rather than a
  * provider key. It scopes to nothing in particular, so it reads as unscoped.
  */
@@ -625,6 +682,8 @@ if (typeof module !== "undefined" && module.exports) {
     deltaCellHtml,
     providerCellHtml,
     providerColumnGroup,
+    DEFAULT_PRESET_LEAF_BUDGET,
+    fitDefaultPreset,
     headerCellHtml,
     theadHtml,
     rowHtmlFromColumns,

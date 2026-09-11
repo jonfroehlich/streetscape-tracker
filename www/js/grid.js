@@ -381,12 +381,22 @@ function gridGroupKeys(id, columns = GRID_COLUMNS) {
 function buildGridPresets(columns = GRID_COLUMNS) {
   const groupKeys = (id) => gridGroupKeys(id, columns);
   return [
-    {
-      id: "overview",
-      label: "Overview",
-      title: "The headline read: how much imagery a city has, how fresh it is, and who has more",
-      columns: [...groupKeys("cov"), ...groupKeys("age"), ...groupKeys("collected")],
-    },
+    // The default, and the only one trimmed to the measure: its width grows
+    // with the number of COLLECTED providers, so what fits two overflows at
+    // three (issue #334). "Last collected" is the group that gives way,
+    // because the preset's promise -- how much imagery, how fresh, who has
+    // more -- is coverage, median age and the Δ; when we last scraped is a
+    // different question, and the Provenance preset is one click away.
+    fitDefaultPreset(
+      {
+        id: "overview",
+        label: "Overview",
+        title:
+          "The headline read: how much imagery a city has, how fresh it is, and who has more",
+        columns: [...groupKeys("cov"), ...groupKeys("age"), ...groupKeys("collected")],
+      },
+      columns
+    ),
     {
       id: "compare",
       label: "Compare providers",

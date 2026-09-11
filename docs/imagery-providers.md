@@ -232,8 +232,12 @@ It was read and not asked: the collector paces at 30/min, half the Mapillary cha
 But there is active work on migrating sequences between instances, so picture identity across instance moves is unanswered — if an image can change instance and identity, "removed" in a run-to-run diff could mean "migrated", which would corrupt the one statistic this project exists to produce.
 It is recorded as a standing caveat on every Panoramax diff rather than resolved.
 
-**A second, smaller one found while wiring the frontend:** the meta-catalog hosts no picture viewer (its root is a marketing page), and the tile layer carries no instance, so a run row cannot name which of the 23 instances owns a picture.
-What resolves federation-wide from the id alone is the asset route — `/api/pictures/{id}/sd.jpg` answers 308 to the owning instance — so `vis.PROVIDER_DISPLAY` links the PICTURE rather than a viewer, deliberately, rather than guessing an instance.
+**A second, smaller one found while wiring the frontend, and then CORRECTED by measuring it ([#334](https://github.com/jonfroehlich/streetscape-tracker/issues/334), probed 2026-09-10).**
+What was written here first — that the meta-catalog hosts no picture viewer, its root being a marketing page, so a link would have to guess which of the 23 instances owns a picture — was reasoned rather than probed, and is wrong.
+`https://api.panoramax.xyz/` answers 307 to `/en/index`, whose body embeds `<pnx-viewer endpoint="/api" metacatalog="false">`: the official `@panoramax/web-viewer`, bound to the meta-catalog itself.
+Its permalink parameters are query-string rather than hash (`pic=<uuid>`, `focus=pic`, `map=zoom/lat/lon`; `docs.panoramax.fr/web-viewer/03_URL_settings/`) and survive the redirect, and `GET /api/pictures/<uuid>` answers 200 for a picture from our own run — so the meta-catalog resolves a picture BY ID, without being told its instance.
+The instance is still absent from the tile layer, which is the true half of the original finding; it simply was never needed.
+Both registries therefore link the viewer, `https://api.panoramax.xyz/?focus=pic&pic={id}`, browser-verified on a real picture before shipping, and not the `/api/pictures/{id}/sd.jpg` asset route the JPEG link used.
 
 ### Tencent Street View
 

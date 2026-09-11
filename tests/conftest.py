@@ -11,11 +11,19 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from streetscape_metadata_tracker import db  # noqa: E402
-from streetscape_metadata_tracker.config import METADATA_DTYPES  # noqa: E402
+from streetscape_metadata_tracker.config import (  # noqa: E402
+    METADATA_DTYPES,
+    PANORAMAX_METADATA_DTYPES,
+)
 
 # The run CSV schema, from its single source of truth — a column added to
 # (or reordered in) METADATA_DTYPES flows into every synthetic fixture.
 COLUMNS = list(METADATA_DTYPES)
+
+# Panoramax runs carry four extra columns (issue #316). Taken from the same
+# single source of truth, and in the SAME order the downloader writes them,
+# so a fixture cannot disagree with a real run file about the column set.
+PANORAMAX_COLUMNS = list(PANORAMAX_METADATA_DTYPES)
 
 
 def make_city_df(
@@ -146,6 +154,108 @@ def make_mapillary_city_df(
             )
         )
     return pd.DataFrame(rows, columns=COLUMNS)
+
+
+def make_panoramax_city_df(
+    panos,
+    run_date=date(2026, 1, 15),
+    grid_origin=(44.0, -121.0),
+    n_empty=1,
+    panos_per_point=1,
+    n_flat_only=0,
+):
+    """
+    Build a synthetic Panoramax run DataFrame (issue #316).
+
+    A census like Mapillary's — several OK rows may share one grid point — on
+    the wider PANORAMAX_COLUMNS schema. The two extra things worth knowing,
+    both of which the frontend reads:
+
+      * ``image_type`` is the provider's RAW word, kept beside the boolean it
+        produced. ``equirectangular`` on 360° rows and ``flat`` on FLAT_ONLY
+        ones here, matching the only two values measured across the
+        federation — but a run file records what the provider said, so a
+        consumer must tolerate a third.
+      * ``copyright_info`` is ``© Panoramax contributor <uuid>``: a
+        contributor id, not an official-fleet marker, which is why the
+        provider declares no copyright filter.
+
+    Args:
+        panos: list of (pano_id, capture_date_str)
+        panos_per_point: how many consecutive panos share each grid point
+        n_flat_only: trailing FLAT_ONLY points (issue #116) — flat-imagery
+            presence markers with a representative pano_id/coords but a null
+            capture_date, on grid points distinct from the pano/empty ones
+        run_date, grid_origin, n_empty: as in make_city_df
+
+    Returns raw (string-typed) DataFrame, like a freshly written CSV.
+    """
+    ts = datetime(run_date.year, run_date.month, run_date.day, 12, 0, tzinfo=UTC).isoformat()
+    rows = []
+    lat0, lon0 = grid_origin
+    n_points_used = 0
+    # Panoramax ids are UUIDs on every column that carries one, which is what
+    # makes a `pano_id` usable as a viewer permalink at all.
+    account = "cddcb3f2-9b2f-454b-8f03-da7dd6a966e2"
+    sequence = "af768120-d9b0-483e-a10a-08a2f69753b6"
+    for i, (pano_id, capture) in enumerate(panos):
+        point = i // panos_per_point
+        n_points_used = point + 1
+        rows.append(
+            (
+                lat0 + point * 0.001,
+                lon0,
+                ts,
+                lat0 + point * 0.001 + 0.0001,
+                lon0 + 0.0001,
+                pano_id,
+                capture,
+                f"© Panoramax contributor {account}",
+                "OK",
+                account,
+                sequence,
+                True,
+                "equirectangular",
+            )
+        )
+    for k in range(n_flat_only):
+        point = n_points_used + k
+        rows.append(
+            (
+                lat0 + point * 0.001,
+                lon0,
+                ts,
+                lat0 + point * 0.001 + 0.0001,
+                lon0 + 0.0001,
+                f"flat{k}",
+                None,  # FLAT_ONLY rows carry no capture date
+                f"© Panoramax contributor {account}",
+                "FLAT_ONLY",
+                account,
+                sequence,
+                False,
+                "flat",
+            )
+        )
+    for j in range(n_empty):
+        rows.append(
+            (
+                lat0 + (n_points_used + n_flat_only + j) * 0.001,
+                lon0,
+                ts,
+                None,
+                None,
+                None,
+                None,
+                None,
+                "ZERO_RESULTS",
+                None,
+                None,
+                None,
+                None,
+            )
+        )
+    return pd.DataFrame(rows, columns=PANORAMAX_COLUMNS)
 
 
 def write_city_csv_gz(df, path):

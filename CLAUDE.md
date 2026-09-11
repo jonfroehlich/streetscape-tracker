@@ -265,7 +265,10 @@ All three share **one layout** — a sticky filter sidebar, a one-sentence lead 
 But only `grid.html` and `streets.html` are pivoted to **one row per city**, providers as sub-columns (#250), so "Collected by" is a **scope, not just a row filter** — it redirects what the numeric filters read, or "coverage over 80%" silently means "some provider's".
 A `driving.html` row is a **place**, so it keeps a flat single-row header — the only page that renders that `theadHtml` branch **by default**, never its only caller (grid/streets reach it whenever every grouped column is unchecked, so deleting it breaks them).
 Anything fanning out over the provider registry must gate on presence in the payload — a registered provider is not a collected one.
+**The inverse is silent, so the JS `PROVIDERS` registry is pinned to `naming.KNOWN_PROVIDERS` (#334)**: Panoramax was collectable for three PRs while unregistered, and nothing failed — the fan-outs skipped it and `getProviderFromFilename` resolved its token to gsv, so its run rendered under Google's attribution, ramp and copyright toggle.
+**The default preset of a pivoted table is trimmed to the measure, not fixed** (`fitDefaultPreset`, 8 leaves): three metric groups fit two providers and overflow by 135px at three, and the e2e gate that should have caught it was green against a fixture narrower than production.
 **The KartaView pano link opens an error page and the URL is still correct** (#312): `details/{sequence_id}/{sequence_index}` is the form KartaView's own SPA writes, and their `POST /details` backend answers `osv: null` for every sequence probed **including their own documented example** — so the popup offers the map-view fallback FIRST and nobody should "fix" `viewerUrl`.
+**Panoramax's link is the federation viewer** (`api.panoramax.xyz/?focus=pic&pic={id}`) with NO fallback, browser-verified before shipping — the earlier "the meta-catalog hosts no viewer, so link the JPEG" rationale was reasoned rather than probed, and wrong.
 Mapillary attribution is required by their ToS.
 
 **Tests → [`docs/testing.md`](docs/testing.md).**

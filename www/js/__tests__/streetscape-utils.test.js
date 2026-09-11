@@ -368,12 +368,12 @@ test("an id-addressed viewer builds no link without an id", () => {
 
 test("no registered provider builds a link it has no address for", () => {
   // The sweep the test above is not. That one names gsv and mapillary, so a
-  // provider registered later inherits none of the rule -- and the next one
-  // due here is already written in the unguarded form: vis.PROVIDER_DISPLAY's
-  // panoramax entry (#316 phase 2) interpolates the id unconditionally, and
-  // `https://api.panoramax.xyz/api/pictures//sd.jpg` is a truthy string, so
-  // viewerLinksHtml would render "Open this Panoramax picture" pointing at a
-  // 404 with this whole suite green. Panoramax publishes flat imagery, so a
+  // provider registered later inherits none of the rule -- and this is not
+  // hypothetical: it was written while vis.PROVIDER_DISPLAY's panoramax entry
+  // (#316) interpolated the id unconditionally, predicting that a verbatim
+  // port would render a link to nowhere with this whole suite green.
+  // Panoramax landed here in #334 guarded, which is the sweep working rather
+  // than the prediction being wrong -- and it publishes flat imagery, so a
   // FLAT_ONLY row with no id is the same reachable shape as Mapillary's.
   //
   // KartaView passes vacuously -- it is addressed by (sequence_id,
@@ -384,6 +384,44 @@ test("no registered provider builds a link it has no address for", () => {
     assert.equal(p.viewerUrl("", {}), null, `${key}: empty id`);
     assert.equal(p.viewerUrl(undefined, undefined), null, `${key}: no id and no row`);
   }
+});
+
+test("Panoramax links the federation viewer, addressed by picture id", () => {
+  // Measured 2026-09-10 and browser-verified before shipping (#334): the
+  // meta-catalog root IS the official web-viewer, its permalink params are
+  // query-string, and `/api/pictures/<uuid>` resolves federation-wide -- so a
+  // link needs no instance, which is what the earlier "picture JPEG" rationale
+  // believed it did. A real Ames pano id.
+  assert.equal(
+    PROVIDERS.panoramax.viewerUrl("599c8ad1-3a21-4311-9179-82e31ed23d32", {}),
+    "https://api.panoramax.xyz/?focus=pic&pic=599c8ad1-3a21-4311-9179-82e31ed23d32"
+  );
+
+  // Id-addressed, so an id-less row is unlinkable -- and unlike gsv this is
+  // REACHABLE: Panoramax declares hasFlatImagery, so a FLAT_ONLY popup can be
+  // handed an empty id. (The sweep above asserts the null; this says why it
+  // matters here.)
+  assert.equal(PROVIDERS.panoramax.viewerUrl("", { pano_lat: 42.078, pano_lon: -93.705 }), null);
+
+  // One link and no fallback: the popup offers the viewer alone, because the
+  // viewer works. A second link here would mean #312's rule was copied rather
+  // than read.
+  const html = viewerLinksHtml(PROVIDERS.panoramax, "599c8ad1-3a21-4311-9179-82e31ed23d32", {});
+  assert.equal(html.match(/<a /g).length, 1);
+  assert.match(html, /api\.panoramax\.xyz\/\?focus=pic&pic=/);
+  assert.match(html, /rel="noopener"/);
+});
+
+test("a Panoramax id cannot break out of the href it is interpolated into", () => {
+  // The id-addressed half of the escaping contract below. pano_id is a
+  // nullable STRING column here as everywhere else, and this URL puts it in a
+  // query parameter behind an existing `&`, so an unencoded `&` or `"` would
+  // add a parameter or end the attribute rather than merely look wrong.
+  const url = PROVIDERS.panoramax.viewerUrl('a" onmouseover=alert(1)&x=1', {});
+  for (const bad of ['"', " ", "&x=", "<", ">"]) {
+    assert.equal(url.includes(bad), false, `left ${bad} unencoded in ${url}`);
+  }
+  assert.match(url, /\?focus=pic&pic=a%22/);
 });
 
 test("a row value cannot break out of the href it is interpolated into", () => {
@@ -717,6 +755,20 @@ test("getProviderFromFilename: token detection is prototype-safe", () => {
     "gsv");
 });
 
+test("getProviderFromFilename: a real Panoramax run resolves to panoramax, not gsv", () => {
+  // The actual name of the committed Ames run (issue #334). Before the
+  // registry entry existed this returned "gsv" -- an unknown token falls back
+  // rather than failing -- so city.js rendered 135,389 Panoramax pictures
+  // under Google's attribution, colour ramp and 2007 date floor, behind a
+  // "Google only" toggle whose default mode hid every one of them. Nothing
+  // about that page looked broken, which is why it is pinned here.
+  const name =
+    "ames--iowa--united-states_width_14683_height_11442_step_20_panoramax_2026-09-06.csv.gz";
+  assert.equal(getProviderFromFilename(name), "panoramax");
+  assert.equal(isValidRunFilename(name), true);
+  assert.equal(isKnownProvider("panoramax"), true);
+});
+
 // --- display helpers shared by index.js and city.js -------------------------
 
 test("withAlpha: rgb and rgba inputs gain the alpha; others pass through", () => {
@@ -823,6 +875,7 @@ test("isPlausibleCaptureDate: the mirrored floors match analysis.EARLIEST_PLAUSI
     [PROVIDERS.gsv.earliestPlausibleCapture, 2007],
     [PROVIDERS.mapillary.earliestPlausibleCapture, 2004],
     [PROVIDERS.kartaview.earliestPlausibleCapture, 2004],
+    [PROVIDERS.panoramax.earliestPlausibleCapture, 2004],
   ];
   for (const [floor, year] of floors) {
     assert.equal(floor.getFullYear(), year);

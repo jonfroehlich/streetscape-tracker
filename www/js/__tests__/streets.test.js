@@ -384,6 +384,36 @@ test("the default sort is a VISIBLE column of the default preset", () => {
   assert.ok(STREET_PRESETS[0].columns.includes(DEFAULT_SORT.key));
 });
 
+test("the default preset stops at the measure instead of growing a third time", () => {
+  // The streets half of issue #334's width finding, and the group that gives
+  // way differs: here it is "Median age", not "Last collected", because a
+  // walk's DATE ("Walked") is what says whether the coverage beside it is
+  // current. "Street km" survives the trim because it is an ungrouped scalar
+  // and the denominator every percentage in the row is a percentage of —
+  // dropping trailing KEYS rather than trailing GROUPS would have taken it.
+  const groupsOf = (preset, providers) => {
+    const byKey = new Map(buildStreetColumns(providers).map((c) => [c.key, c.group?.id ?? null]));
+    return [...new Set(preset.columns.map((k) => byKey.get(k)))];
+  };
+  const defaultFor = (providers) => buildStreetPresets(buildStreetColumns(providers))[0];
+
+  const two = defaultFor(["gsv", "mapillary"]);
+  assert.equal(two.columns.length, 8);
+  assert.deepEqual(groupsOf(two, ["gsv", "mapillary"]), ["cov", "walked", "age", null]);
+
+  const three = defaultFor(["gsv", "mapillary", "panoramax"]);
+  assert.ok(three.columns.length <= 8, `${three.columns.length} leaves`);
+  assert.deepEqual(groupsOf(three, ["gsv", "mapillary", "panoramax"]), ["cov", "walked", null]);
+
+  const four = defaultFor(["gsv", "mapillary", "kartaview", "panoramax"]);
+  assert.ok(four.columns.length <= 8, `${four.columns.length} leaves`);
+  assert.ok(four.columns.includes("lengthKm"), "the ungrouped denominator was trimmed away");
+
+  // Only the DEFAULT is trimmed; an explicitly chosen preset keeps what it names.
+  const presets = buildStreetPresets(buildStreetColumns(["gsv", "mapillary", "panoramax"]));
+  assert.ok(presets.find((p) => p.id === "kilometres").columns.length > 8);
+});
+
 test("every column can render a cell, including from a fully null row model", () => {
   const sparse = rowsFor({ city_id: "x", provider: "gsv" })[0];
   for (const col of STREET_COLUMNS) {
