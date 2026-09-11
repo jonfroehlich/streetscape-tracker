@@ -1876,8 +1876,9 @@ def test_a_budget_stop_with_a_checkpoint_continues_tomorrow_rather_than_refusing
     assert isinstance(error, kv.SweepIncompleteError)
     assert "unmeasured" not in str(error)
     assert str(ckpt) in str(error)
-    assert error.roots_done == len(calls) == 2
-    assert error.root_count == 4
+    assert error.units_done == len(calls) == 2
+    assert error.unit_count == 4
+    assert error.unit_name == "root cells"
     assert ckpt.exists() and _state(ckpt)["roots_done"] == 2
 
 

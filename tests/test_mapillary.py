@@ -1560,7 +1560,7 @@ class _SequencedTileSession:
 def test_a_retried_tile_re_paces_and_is_re_counted():
     """One token per HTTP request, not per tile.
 
-    _fetch_tile may issue up to _TILE_MAX_TRIES requests. Pacing in the caller
+    _fetch_tile may issue up to TILE_MAX_TRIES requests. Pacing in the caller
     bought one token for all of them, so a retrying tile could present five
     times the configured rate — during a 429/5xx storm, i.e. exactly when the
     CDN is least willing to absorb it — and report a fifth of its true spend to

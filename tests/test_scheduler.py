@@ -160,8 +160,13 @@ def _stub_collection(
 
     - ``ran`` collects ``(city_id, provider)`` in the order they were launched.
     - ``outcome(city, provider) -> bool`` fakes per-channel success; default True.
-    - ``record_usage`` writes the estimated requests to ``api_usage``, which is
-      what the real pipeline does and what any budget assertion depends on.
+    - ``record_usage`` writes what the child would have spent to ``api_usage``,
+      which is what the real pipeline does and what any budget assertion depends
+      on. For a channel handed a REQUEST CAP that is ``min(estimate, cap)`` and
+      not the estimate: a capped child stops at the cap and checkpoints the
+      rest, so a stub that ledgered the whole estimate would report an overspend
+      the real one cannot produce, and every budget assertion downstream of it
+      would be pinning fiction (issue #318).
     - ``slept`` collects ``sleep_between_cities_s`` calls, for the tests that care
       whether a capped run pauses after its last city.
     """
@@ -177,6 +182,7 @@ def _stub_collection(
         daily_budget=0,
         conn=None,
         remaining_s=None,
+        request_cap=None,
         **_,
     ):
         # The fixture connection from the CLOSURE, not the `conn` parameter: the
@@ -185,7 +191,10 @@ def _stub_collection(
         # thread may touch it (issue #240). The ledger write this fake stands in
         # for really is the child's own, and the child has its own handle.
         if record_usage:
-            db.add_api_usage(conn_, run_today, sched.estimate_requests(city, provider), provider)
+            spend = sched.estimate_requests(city, provider)
+            if request_cap is not None:
+                spend = min(spend, request_cap)
+            db.add_api_usage(conn_, run_today, spend, provider)
         ran.append((city.city_id, provider))
         return outcome(city, provider)
 
@@ -1747,6 +1756,14 @@ def test_limit_reaches_n_cities_even_when_candidates_are_skipped(conn, monkeypat
 
     Here two of the five candidates can never fit any budget, so a pre-truncated
     list of 3 would collect 1. The loop must instead walk past them and reach 3.
+
+    DRIVEN ON gsv, AND THAT IS THE POINT OF THE CHANNEL CHOICE. The skip this
+    test needs is the `est > budget` permanent one, and since #318 that arm no
+    longer applies to Mapillary: a resumable channel launches an over-budget
+    city CAPPED rather than skipping it, so on mapillary all five candidates now
+    process and there is nothing to walk past. gsv is all-or-nothing -- a partial
+    grid is not a run -- so it still produces a candidate the loop must step over
+    without counting, which is the shape this regression lives in.
     """
     from streetscape_metadata_tracker import scheduler as sched
 
@@ -1768,10 +1785,18 @@ def test_limit_reaches_n_cities_even_when_candidates_are_skipped(conn, monkeypat
     _stub_collection(sched, monkeypatch, conn, ran)
 
     rc = sched.cmd_run_due(
-        _mly_cfg(max_cities_per_day=2),
+        _mly_cfg(
+            max_cities_per_day=2,
+            providers={
+                # Sized so the two 400 km grids cannot fit it and the three
+                # 1 km ones can, which is what makes the first two skips.
+                "gsv": ProviderConfig(daily_request_budget=10_000_000),
+                "mapillary": ProviderConfig(daily_request_budget=10_000),
+            },
+        ),
         today=date(2026, 7, 2),
         limit=3,
-        requested_providers=["mapillary"],
+        requested_providers=["gsv"],
     )
 
     assert [city_id for city_id, _ in ran] == ids[2:5], (
@@ -1786,6 +1811,15 @@ def test_limit_still_respects_the_daily_request_budget(conn, monkeypatch):
     The safety property that makes overriding the city cap acceptable: a widened
     run is still bounded by the channel's daily budget ledger, which is the whole
     reason a catch-up goes through the scheduler instead of a script.
+
+    HOW that bound is enforced changed in #318 and the property got TIGHTER, not
+    looser. Mapillary used to skip the city that did not fit the remainder, so a
+    night stopped somewhere under its budget -- here at 3.0 of 3.5 cities' worth,
+    with the last half-city's allowance simply unspent. It is resumable now, so
+    the fourth city launches with that remainder as its cap, pauses, and finishes
+    tomorrow: the night spends its budget EXACTLY, and the city that used to be
+    skipped is collected. The fifth is still refused, because what is left after
+    that cannot fund one tile's retries.
     """
     from streetscape_metadata_tracker import scheduler as sched
 
@@ -1811,11 +1845,11 @@ def test_limit_still_respects_the_daily_request_budget(conn, monkeypatch):
         cfg, today=date(2026, 7, 2), limit=100, requested_providers=["mapillary"]
     )
 
-    assert len(ran) == 3, "--limit must not let a run spend past the daily budget"
+    assert len(ran) == 4, "the city that does not fit the remainder is capped, not skipped"
     spent = db.get_api_usage(conn, date(2026, 7, 2), "mapillary")
-    assert spent == 3 * per_city
-    # The budget, not the city list, is what stopped it: a fourth city would not
-    # have fit, and there were seven more candidates waiting.
+    assert spent == budget, "three whole cities plus the remainder the fourth was capped at"
+    # The budget, not the city list, is what stopped it: a FIFTH city had nothing
+    # left to be capped at, and there were six more candidates waiting.
     assert spent + per_city > budget
     assert len(ids) == 10
     assert rc == 0  # a budget deferral is not a failure
@@ -6881,26 +6915,34 @@ def test_every_scheduled_channel_declares_whether_it_is_resumable():
     assert set(CHANNEL_RESUMABLE) == set(KNOWN_PROVIDERS) | set(STREET_CHANNELS)
 
 
-def test_the_two_kartaview_channels_are_the_resumable_ones():
-    """Mapillary checkpoints its tile census (#256) and is still False here: the
-    property is 'accepts a REQUEST CAP that pauses', and download_mapillary
-    takes only max_requests_per_minute — a pacing knob, with no stop_reason and
-    no SweepIncompleteError. Conflating the two would hand a Mapillary child a
-    budget it has no way to honour.
+def test_the_four_census_channels_are_the_resumable_ones():
+    """The property is 'accepts a REQUEST CAP that pauses', not 'checkpoints'.
 
-    The walk is True with the grid run because it reads the same census by the
-    same radius sweep, so it inherits the same defect: its --daily-budget is a
-    gate priced from a geometric floor, not a ceiling on what the sweep spends.
+    Mapillary was False here for the whole of #256: it checkpointed its tile
+    census, and so resumed after an interruption it did not CHOOSE, but
+    download_mapillary took only max_requests_per_minute — a pacing knob, with
+    no number it could stop itself at. #318 gave it one, and the walk flips
+    beside the grid run because it reads the identical census.
+
+    GSV stays False in both channels and is the control: a partial grid is not
+    a run, so refusing to start is the honest answer and a cap would only
+    produce artifacts nobody can publish. Panoramax is the other control, and a
+    more interesting one — its downloader HAS the cap since #318, so what keeps
+    it False is that nothing forwards one to it (see the table's comment).
     """
     from streetscape_metadata_tracker.scheduler import CHANNEL_RESUMABLE, is_resumable_channel
 
     assert sorted(c for c, v in CHANNEL_RESUMABLE.items() if v) == [
         "kartaview",
         "kartaview_streets",
+        "mapillary",
+        "mapillary_streets",
     ]
     assert is_resumable_channel("kartaview")
-    assert not is_resumable_channel("mapillary")
-    assert not is_resumable_channel("mapillary_streets")
+    assert is_resumable_channel("mapillary")
+    assert is_resumable_channel("mapillary_streets")
+    assert not is_resumable_channel("gsv")
+    assert not is_resumable_channel("panoramax")
 
 
 def test_the_walk_gets_the_request_cap_too_not_only_the_budget_gate(conn):
@@ -6930,10 +6972,21 @@ def test_the_walk_gets_the_request_cap_too_not_only_the_budget_gate(conn):
     assert "--kartaview-max-requests" not in plain
 
 
-def test_a_mapillary_walk_never_gets_a_request_cap(conn):
-    """The cap is scoped to the channels that can honour it. mapillary_streets
-    reads a tile census with no request cap at all, so a flag here would be
-    parsed and dropped while the gate believed it bounded the night."""
+def test_a_mapillary_walk_gets_its_own_cap_and_never_kartaviews(conn):
+    """The cap is scoped to the channel that can honour it, one flag per crawl.
+
+    This test asserted the OPPOSITE until #318 -- "mapillary_streets reads a
+    tile census with no request cap at all, so a flag here would be parsed and
+    dropped while the gate believed it bounded the night". The census has a cap
+    now, so the fail-open moved: the flag has to be here, spelled for THIS
+    provider. Handing a Mapillary child `--kartaview-max-requests` would be an
+    argparse error, and omitting the flag entirely would leave the budget gate
+    believing a night is bounded by a stop nothing sends.
+
+    Both flags together, as for kartaview_streets: --daily-budget is the full
+    ceiling this collector subtracts today's spend from itself, and the cap
+    arrives already subtracted.
+    """
     from streetscape_metadata_tracker.scheduler import _street_collect_cmd
 
     cid = _register(conn, "Bend", width=1000, height=1000, step=20)
@@ -6941,7 +6994,246 @@ def test_a_mapillary_walk_never_gets_a_request_cap(conn):
     cmd = _street_collect_cmd(
         _sweep_cfg(), city, date(2026, 7, 1), "mapillary_streets", 8, 9_000, 1_234
     )
+    assert cmd[cmd.index("--mapillary-max-requests") + 1] == "1234"
+    assert cmd[cmd.index("--daily-budget") + 1] == "9000"
     assert "--kartaview-max-requests" not in cmd
+
+
+def test_a_mapillary_grid_child_gets_the_nights_remaining_budget_as_a_hard_stop(
+    conn, monkeypatch, tmp_path
+):
+    """Issue #318, and the value is asserted rather than the flag's presence.
+
+    A flag pinned only at its default lets the call site hard-code the wrong
+    number -- and the wrong number here is not cosmetic: the cap IS the budget
+    remainder, so a call site passing anything else either overspends a per-IP
+    ledger or pauses a city that could have finished.
+    """
+    cfg = SchedulerConfig(providers={"mapillary": ProviderConfig()})
+    cmd, _ = _grid_cmd(monkeypatch, tmp_path, conn, "mapillary", cfg, request_cap=426)
+    assert cmd[cmd.index("--mapillary-max-requests") + 1] == "426"
+    assert "--kartaview-max-requests" not in cmd
+
+
+def test_an_unset_cap_lets_a_mapillary_census_fetch_every_tile(conn, monkeypatch, tmp_path):
+    """Omitting the flag is the CLI's documented 'fetch every tile'.
+
+    Every direct caller and every manual run still wants that, and it must not
+    degrade to a 0 -- the CLI's positive_int refuses that at parse time, and a
+    cap of 0 would stop the crawl before it committed a tile and then tell the
+    operator to re-run.
+    """
+    cfg = SchedulerConfig(providers={"mapillary": ProviderConfig()})
+    cmd, _ = _grid_cmd(monkeypatch, tmp_path, conn, "mapillary", cfg)
+    assert "--mapillary-max-requests" not in cmd
+
+
+def test_a_mapillary_cap_is_sized_to_its_own_pace_not_the_radius_sweeps(conn):
+    """The clock term reads the constants that TIME this channel, not KartaView's.
+
+    `_sweep_requests_within_timeout` is the inverse of a timeout derivation, and
+    there are two of them: the radius sweep is timed at
+    DEFAULT_SWEEP_REQUESTS_PER_MINUTE x 0.5, a tile census at
+    DEFAULT_TILE_REQUESTS_PER_MINUTE x 0.8. Inverting one channel's clock with
+    the other's constants under-prices Mapillary's cap -- and a cap under the
+    launch floor does not slow a channel down, it skips the city outright,
+    every night, silently.
+
+    BOTH BRANCHES ARE DRIVEN, and that is the point of the second half. A
+    configured rate replaces the default on both sides, so a `ProviderConfig`
+    shadows `_CRAWL_PRICING`'s `default_rate` entirely: with only the configured
+    case here, the per-provider rate table was unpinned and the FULL SUITE
+    passed with Mapillary's row set to KartaView's constant -- the exact defect
+    this test is named for, surviving the test written to catch it. `pc=None` is
+    not a hypothetical branch either: `_sweep_launch_plan` reaches this through
+    `.get(channel)` precisely so a channel with no `[providers.*]` block still
+    prices.
+
+    Pinned as arithmetic literals ON PURPOSE, and it is the weaker half of the
+    pair: retuning a fraction has to come here and edit these numbers, which is
+    the point -- 0.8 and 0.5 are decisions, and a test that recomputed them
+    from the constants would ratify whatever they became. The invariant that
+    survives a retune untouched is the ROUND TRIP, pinned in
+    `test_the_two_timeout_directions_round_trip_through_one_pricing_row`.
+    """
+    from streetscape_metadata_tracker.download_kartaview import (
+        DEFAULT_SWEEP_REQUESTS_PER_MINUTE,
+    )
+    from streetscape_metadata_tracker.download_mapillary import (
+        DEFAULT_TILE_REQUESTS_PER_MINUTE,
+    )
+    from streetscape_metadata_tracker.scheduler import (
+        _TIMEOUT_FIXED_SLACK_S,
+        _sweep_requests_within_timeout,
+    )
+
+    pc = ProviderConfig(max_requests_per_minute=40)
+    timeout_s = _TIMEOUT_FIXED_SLACK_S + 3600  # an hour of actual fetching
+
+    tiles = _sweep_requests_within_timeout(timeout_s, "mapillary", pc)
+    sweeps = _sweep_requests_within_timeout(timeout_s, "kartaview", pc)
+    assert tiles == 60 * 40 * 0.8, "the tile census's own achieved fraction"
+    assert sweeps == 60 * 40 * 0.5, "the radius sweep's, at the same configured rate"
+    # The walk is priced as its grid sibling, because it IS that crawl.
+    assert _sweep_requests_within_timeout(timeout_s, "mapillary_streets", pc) == tiles
+
+    # Unconfigured: now the DEFAULT RATE is live too, so each channel must reach
+    # for its own. Imported under their module-qualified names rather than
+    # compared to literals, because `download_panoramax` exports a
+    # DEFAULT_TILE_REQUESTS_PER_MINUTE of its own with a different value.
+    assert DEFAULT_TILE_REQUESTS_PER_MINUTE != DEFAULT_SWEEP_REQUESTS_PER_MINUTE, (
+        "the two defaults must differ or this half of the test pins nothing"
+    )
+    assert (
+        _sweep_requests_within_timeout(timeout_s, "mapillary", None)
+        == 60 * DEFAULT_TILE_REQUESTS_PER_MINUTE * 0.8
+    )
+    assert (
+        _sweep_requests_within_timeout(timeout_s, "kartaview", None)
+        == 60 * DEFAULT_SWEEP_REQUESTS_PER_MINUTE * 0.5
+    )
+    assert (
+        _sweep_requests_within_timeout(timeout_s, "mapillary_streets", None)
+        == 60 * DEFAULT_TILE_REQUESTS_PER_MINUTE * 0.8
+    )
+
+
+def test_the_two_timeout_directions_round_trip_through_one_pricing_row(conn, monkeypatch):
+    """Forward then inverse must return the request count they started from.
+
+    `_mapillary_timeout_seconds` prices a wall-clock from a tile count;
+    `_sweep_requests_within_timeout` prices a request cap back out of that
+    wall-clock. Composing them cancels the rate and the fraction entirely, so
+    what is left is `tiles x _TIMEOUT_HEADROOM` -- the headroom deliberately
+    not divided out, because a cap already bounds retries.
+
+    THE CANCELLATION IS THE TEST. It holds only while both directions read the
+    same row, which is why retuning the fraction under the test must not move
+    it: the row landed with only the INVERSE consulting it, and the forward
+    functions spelling their own rate and fraction out, so the 1.6x divergence
+    the row exists to remove could be reintroduced from the forward side with
+    the entire suite green. Here that mutation breaks the identity.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    city = db.resolve_city(
+        conn, _register_at(conn, "Anchorage", 61.2, -149.9, width=105588, height=83676)
+    )
+    tiles = sched.estimate_requests(city, "mapillary")
+    assert tiles > 0
+
+    def round_trip(pc):
+        timeout_s = sched._mapillary_timeout_seconds(city, "mapillary", pc, floor=0)
+        return sched._sweep_requests_within_timeout(timeout_s, "mapillary", pc)
+
+    expected = tiles * sched._TIMEOUT_HEADROOM
+    assert round_trip(ProviderConfig(max_requests_per_minute=40)) == pytest.approx(
+        expected, rel=0.001
+    )
+    # ...and unconfigured, where the row's own default_rate is the live term.
+    assert round_trip(None) == pytest.approx(expected, rel=0.001)
+
+    # Retune the fraction: a number BOTH directions read cancels out, so the
+    # identity is untouched. A forward function holding its own copy fails here.
+    monkeypatch.setattr(sched, "_TILE_ACHIEVED_RATE_FRACTION", 0.3)
+    assert round_trip(ProviderConfig(max_requests_per_minute=40)) == pytest.approx(
+        expected, rel=0.001
+    )
+
+
+def test_a_resumable_channel_with_no_pricing_row_is_a_keyerror(conn):
+    """The same posture CHANNEL_RESUMABLE takes, one table along.
+
+    A channel can only reach `_crawl_pricing` by having answered True in
+    CHANNEL_RESUMABLE, so an unpriced one has been declared resumable without
+    anybody deciding what pace it is timed at or what its launch floor buys.
+    Inheriting KartaView's numbers is exactly how a Mapillary cap came to be
+    sized at 16/min; a KeyError stops the build instead.
+    """
+    from streetscape_metadata_tracker.scheduler import _crawl_pricing
+
+    with pytest.raises(KeyError):
+        _crawl_pricing("gsv")
+
+
+def test_a_mapillary_walk_defers_behind_its_grid_siblings_in_flight_crawl(
+    conn, tmp_path, monkeypatch
+):
+    """The #290 saving, now that both Mapillary channels can pause (#318).
+
+    A PAUSED grid census leaves a checkpoint, not a cache entry, so the walk
+    prices at full -- and with the budget gates gone for a resumable channel it
+    would crawl the identical z14 lattice a second time, against the same per-IP
+    host, for an observation the cache hands it free the moment the grid
+    finishes. It defers instead: no failure, no budget skip, its own counter.
+
+    This arm was unreachable for Mapillary until both channels flipped, which is
+    why the two flip together.
+    """
+    from streetscape_metadata_tracker.scheduler import _SWEEP_SKIP_SIBLING, _sweep_launch_plan
+
+    city = _checkpointed_city(
+        conn, tmp_path, monkeypatch, roots_done=3, root_count=8, days_old=0, channel="mapillary"
+    )
+    plan = _sweep_launch_plan(
+        _sweep_cfg(),
+        city,
+        "mapillary_streets",
+        conn,
+        est=400,
+        remaining=10_000,
+        remaining_s=None,
+        city_channels=["mapillary", "mapillary_streets"],
+    )
+    assert plan.skip == _SWEEP_SKIP_SIBLING
+    assert "mapillary has an in-flight checkpoint" in plan.message
+
+
+def test_an_aged_checkpoint_does_not_refuse_a_crawl_that_will_spend_nothing(
+    conn, tmp_path, monkeypatch
+):
+    """The age wall is the one skip that RECORDS A FAILURE, so it is the one
+    that must not fire on a free reuse.
+
+    Three things have to be true at once, and #318 made all three ordinary. The
+    census is in the shared cache, so `est` is 0 and the projection with it. The
+    ledger is OVER its budget, because a capped crawl lets the tiles already in
+    flight finish their retries -- so `remaining` is negative rather than 0.
+    And the channel's own checkpoint is near the wall. `projected > request_cap`
+    is then `0 > -200`: true, and the city takes a consecutive_failure for
+    declining to spend anything. Five of those quarantine it for a 90-day cycle,
+    and nothing about the night looks wrong.
+    """
+    from streetscape_metadata_tracker.scheduler import _SWEEP_SKIP_AGE_WALL, _sweep_launch_plan
+
+    city = _checkpointed_city(
+        conn, tmp_path, monkeypatch, roots_done=3, root_count=800, days_old=6.5, channel="mapillary"
+    )
+    plan = _sweep_launch_plan(
+        _sweep_cfg(),
+        city,
+        "mapillary",
+        conn,
+        est=0,
+        remaining=-200,
+        remaining_s=None,
+        city_channels=["mapillary"],
+    )
+    assert plan.skip != _SWEEP_SKIP_AGE_WALL, "a crawl priced at 0 cannot throw a night away"
+
+    # ...and the arm still fires for the crawl it was written for: same aged
+    # checkpoint, same negative remainder, a census that must actually be paid.
+    refused = _sweep_launch_plan(
+        _sweep_cfg(),
+        city,
+        "mapillary",
+        conn,
+        est=400,
+        remaining=-200,
+        remaining_s=None,
+        city_channels=["mapillary"],
+    )
+    assert refused.skip == _SWEEP_SKIP_AGE_WALL
 
 
 def test_an_unknown_channel_is_a_keyerror_not_a_default():
@@ -7379,21 +7671,37 @@ def _write_sweep_checkpoint(city, channel, *, roots_done, root_count, days_old, 
     Goes through checkpoint_path_for rather than building the directory name,
     for the reason every per-(city, provider) artifact does: the channel and the
     variant are what keep a walk's store from being read as the grid run's.
+
+    THE RECORD IS SHAPED FOR THE CHANNEL'S OWN CRAWL (issue #318). A radius
+    sweep writes `roots_done`/`root_count`; a tile census writes `tile_count`
+    and the `done_tiles` list the resume subtracts from the lattice. Writing the
+    sweep's shape under a Mapillary channel would test `sweep_progress` against
+    a record production never produces -- and reading only that shape is exactly
+    the fail-quiet #318 had to fix, so a fixture that papered over the
+    difference would have kept it invisible.
     """
     from streetscape_metadata_tracker.checkpointing import checkpoint_path_for, frozen_bbox
+    from streetscape_metadata_tracker.scheduler import STREET_CHANNELS
 
     path = checkpoint_path_for(city.city_id, frozen_bbox(city), channel, variant)
     os.makedirs(path, exist_ok=True)
     started = datetime.now(UTC) - timedelta(days=days_old)
+    provider = STREET_CHANNELS.get(channel, channel)
+    if provider in ("mapillary", "panoramax"):
+        # Tile coordinates are arbitrary here: only the COUNT is read back.
+        record = {
+            "tile_count": root_count,
+            "done_tiles": [[x, 0, 1] for x in range(roots_done)],
+            "created_at": started.isoformat(),
+        }
+    else:
+        record = {
+            "roots_done": roots_done,
+            "root_count": root_count,
+            "created_at": started.isoformat(),
+        }
     with open(os.path.join(path, "state.json"), "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "roots_done": roots_done,
-                "root_count": root_count,
-                "created_at": started.isoformat(),
-            },
-            f,
-        )
+        json.dump(record, f)
     return path
 
 
@@ -7485,9 +7793,9 @@ def test_a_remainder_under_the_calibration_floor_is_still_skipped(
     consecutive_failure. Launching under the floor would burn a failure to
     accomplish nothing, on the very metros this change exists to collect.
     """
-    from streetscape_metadata_tracker.scheduler import _MIN_SWEEP_LAUNCH_REQUESTS
+    from streetscape_metadata_tracker.scheduler import _MIN_RADIUS_SWEEP_LAUNCH_REQUESTS
 
-    budget = _MIN_SWEEP_LAUNCH_REQUESTS + delta
+    budget = _MIN_RADIUS_SWEEP_LAUNCH_REQUESTS + delta
     cid = _register(conn, "Metro", width=20_000, height=20_000, step=20)
     _enroll_kartaview(conn, cid)
     cfg = _sweep_cfg(publish_enabled=False)
@@ -7524,10 +7832,10 @@ def test_the_launch_floor_clears_the_radius_calibration_ladder():
         DEFAULT_CALIBRATION_PROBES,
         RADIUS_LADDER_M,
     )
-    from streetscape_metadata_tracker.scheduler import _MIN_SWEEP_LAUNCH_REQUESTS
+    from streetscape_metadata_tracker.scheduler import _MIN_RADIUS_SWEEP_LAUNCH_REQUESTS
 
     ladder = len(RADIUS_LADDER_M) * (DEFAULT_CALIBRATION_PROBES + DEFAULT_BACKPRESSURE_RETRIES)
-    assert _MIN_SWEEP_LAUNCH_REQUESTS > ladder
+    assert _MIN_RADIUS_SWEEP_LAUNCH_REQUESTS > ladder
 
 
 def test_a_non_resumable_channel_keeps_the_permanent_skip(conn, monkeypatch):
@@ -7658,7 +7966,7 @@ def test_a_cap_the_clock_puts_under_the_calibration_floor_skips_like_an_empty_bu
     pace this slow) as when the budget is, and the budget here is 25x the floor:
     only a floor read against the final cap can refuse this launch.
     """
-    from streetscape_metadata_tracker.scheduler import _MIN_SWEEP_LAUNCH_REQUESTS
+    from streetscape_metadata_tracker.scheduler import _MIN_RADIUS_SWEEP_LAUNCH_REQUESTS
 
     cid = _register(conn, "Bend", width=1_000, height=1_000, step=20)
     _enroll_kartaview(conn, cid)
@@ -7668,7 +7976,7 @@ def test_a_cap_the_clock_puts_under_the_calibration_floor_skips_like_an_empty_bu
     cfg = _sweep_cfg(publish_enabled=False, city_timeout_minutes=60)
     cfg.providers["kartaview"] = ProviderConfig(
         enabled=True,
-        daily_request_budget=_MIN_SWEEP_LAUNCH_REQUESTS * 25,
+        daily_request_budget=_MIN_RADIUS_SWEEP_LAUNCH_REQUESTS * 25,
         max_requests_per_minute=1,
     )
 
@@ -7943,6 +8251,74 @@ def _enroll_pair(conn, cid, channels=("kartaview", "kartaview_streets")):
         db.set_channel_membership(conn, cid, channel, True, cycle_days=90)
 
 
+def test_sweep_progress_reads_a_tile_census_record_not_only_a_radius_sweeps(
+    conn, tmp_path, monkeypatch
+):
+    """The fail-quiet #318 had to fix, pinned from both sides.
+
+    `sweep_progress` read `root_count`/`roots_done` and nothing else, and its
+    best-effort `except (OSError, ValueError, KeyError, TypeError)` swallowed the
+    KeyError a tile-census record produced. So it answered None -- which every
+    caller reads as "there is no checkpoint", not as "I could not read one". A
+    crash would have been caught the day Mapillary became resumable; a None is
+    invisible, and what it silently disables is the age wall: the ONE skip that
+    records a failure, and the only thing that can notice a checkpoint being
+    discarded and re-swept from zero every seven days.
+
+    Asserted through both layouts in one test, because the property is that they
+    answer in the SAME vocabulary -- a caller must not have to know which
+    provider wrote the file to read the fraction it is holding.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+    from streetscape_metadata_tracker.checkpointing import sweep_progress
+
+    def read(channel):
+        progress = sched._sweep_checkpoint_progress(_sweep_cfg(), city, channel)
+        assert progress is not None, f"{channel}'s own checkpoint record must be readable"
+        return progress["units_done"], progress["unit_count"], progress["unit_name"]
+
+    city = _checkpointed_city(
+        conn, tmp_path, monkeypatch, roots_done=3, root_count=8, days_old=1, channel="mapillary"
+    )
+    assert read("mapillary") == (3, 8, "tiles")
+
+    _write_sweep_checkpoint(city, "kartaview", roots_done=5, root_count=9, days_old=1)
+    assert read("kartaview") == (5, 9, "root cells")
+
+    # Unreadable is still None, and still without raising: one caller is a
+    # launch gate and the other reports on a night that already succeeded.
+    assert sweep_progress(str(tmp_path / "nothing-here")) is None
+
+
+def test_an_unrecognised_checkpoint_layout_says_so_instead_of_guessing(tmp_path, caplog):
+    """The tile arm is reached by NAME, not as the fall-through `else`.
+
+    A third provider's layout hitting an `else` that assumes "tiles" raises
+    KeyError on `tile_count`, which the best-effort `except` swallows into None
+    -- the same fail-quiet as the test above, arriving after it was fixed, and
+    invisible in exactly the same way. The answer is still None, because no
+    caller may be broken by this function; what must not be silent is that the
+    answer is "I could not read it" rather than "there is nothing here".
+    """
+    import json
+
+    from streetscape_metadata_tracker.checkpointing import _state_path, sweep_progress
+
+    path = str(tmp_path / "crawl")
+    os.makedirs(path, exist_ok=True)
+    with open(_state_path(path), "w", encoding="utf-8") as f:
+        json.dump(
+            {"hex_count": 12, "hexes_done": ["a", "b"], "created_at": "2026-09-01T00:00:00+00:00"},
+            f,
+        )
+
+    with caplog.at_level(logging.WARNING):
+        assert sweep_progress(path) is None
+    assert [r for r in caplog.records if "unrecognised checkpoint layout" in r.getMessage()], (
+        "a layout nobody taught it about has to reach an operator"
+    )
+
+
 def test_a_resumable_walk_names_its_grid_sibling(conn):
     """The pairing is DATA, not a "kartaview" spelled into the launch site.
 
@@ -7962,7 +8338,7 @@ def test_a_resumable_walk_names_its_grid_sibling(conn):
     )
 
     walks = {c for c, resumable in CHANNEL_RESUMABLE.items() if resumable and is_street_channel(c)}
-    assert walks == {"kartaview_streets"}
+    assert walks == {"kartaview_streets", "mapillary_streets"}
     for walk in walks:
         sibling = STREET_CHANNELS[walk]
         assert sibling in CHANNEL_RESUMABLE, "the sibling has to be a scheduled channel"
@@ -8094,7 +8470,7 @@ def test_the_calibration_floor_does_not_gate_a_walk_that_costs_nothing(
     if cached:
         _stamp_census_cache(city, "kartaview", fetched_by="kartaview")
     cfg = _kartaview_pair_cfg()
-    # Under _MIN_SWEEP_LAUNCH_REQUESTS (34): a remainder that cannot pay for
+    # Under _MIN_RADIUS_SWEEP_LAUNCH_REQUESTS (34): a remainder that cannot pay for
     # calibration, and does not have to when there is nothing to calibrate.
     cfg.providers["kartaview_streets"] = ProviderConfig(enabled=True, daily_request_budget=10)
 
@@ -8106,6 +8482,47 @@ def test_the_calibration_floor_does_not_gate_a_walk_that_costs_nothing(
     if should_launch:
         assert walks[0][2]["request_cap"] == 10
         assert walks[0][2]["estimated_requests"] == 0
+
+
+def test_a_free_walk_on_a_spent_budget_is_capped_at_one_not_uncapped(conn, monkeypatch):
+    """ "Costs nothing" is a PREDICTION, and only the child learns otherwise.
+
+    `est == 0` means the census is in the shared cache, so the launch floor is
+    not applied — there is nothing to fund. With the night's budget exactly
+    spent that leaves `request_cap` at 0, and `_request_cap_args` omits the flag
+    for any cap below 1, which is right for "spend nothing" and catastrophic for
+    the case the scheduler cannot see: `reconcile_cache_hit` refuses an entry
+    older than the consumer's own checkpoint and `load_cached_census` refuses
+    one that fails validation, and on either the child crawls for real. Uncapped,
+    on an exhausted budget, against a per-IP host, with no `--daily-budget` on
+    the command to catch it.
+
+    So the cap floors at 1 rather than vanishing. Not at the launch floor: this
+    branch is reached exactly when the budget cannot fund one, and handing a
+    channel more than the night has left is the failure the budget prevents.
+    """
+    from streetscape_metadata_tracker.scheduler import _request_cap_args
+
+    cid = _register(conn, "Bend", width=1000, height=1000, step=20)
+    city = db.resolve_city(conn, cid)
+    _enroll_pair(conn, cid, channels=("kartaview_streets",))
+    _stamp_census_cache(city, "kartaview", fetched_by="kartaview")
+    cfg = _kartaview_pair_cfg()
+    # Nothing left at all, which is what makes the cap non-positive.
+    cfg.providers["kartaview_streets"] = ProviderConfig(enabled=True, daily_request_budget=0)
+
+    calls = []
+    _run_loop_capturing_kwargs(monkeypatch, conn, cfg, calls)
+
+    walks = [c for c in calls if c[1] == "kartaview_streets"]
+    assert walks, "the free walk must still launch — that is the whole point of #290"
+    assert walks[0][2]["estimated_requests"] == 0
+    assert walks[0][2]["request_cap"] == 1, "floored at 1, not dropped and not raised to the floor"
+    # And the flag genuinely reaches the child, which a cap of 0 would not.
+    assert _request_cap_args("--kartaview-max-requests", walks[0][2]["request_cap"]) == [
+        "--kartaview-max-requests",
+        "1",
+    ]
 
 
 # ── The dry run and the live path, one decision (issue #274 review) ──────────
@@ -9265,7 +9682,14 @@ def test_channels_sharing_a_host_never_overlap_even_at_knob_4(conn, monkeypatch)
 
     def spy_timeout(cfg, city, provider, conn=None, remaining_s=None):
         submitted.append(provider)
-        return 600
+        # 180 minutes, the city_timeout_minutes floor, and NOT the 600 s this
+        # returned before #318. 600 is exactly _TIMEOUT_FIXED_SLACK_S, so a
+        # resumable channel stubbed with it affords zero paced requests, falls
+        # under its launch floor and is skipped -- which silently removed a
+        # channel this test's barrier is counting on. A stub standing in for a
+        # derivation has to stay inside that derivation's realistic range once
+        # something starts reading its VALUE rather than just its existence.
+        return 10_800
 
     monkeypatch.setattr(sched, "city_timeout_seconds", spy_timeout)
 
@@ -9449,7 +9873,10 @@ def test_budget_skips_are_final_but_host_deferrals_relaunch(conn, monkeypatch):
 
     city = _lane_city(conn)
     cfg = _street_cfg(max_concurrent_channels=3)
-    # Priced above its entire daily budget, so mapillary can never fit tonight.
+    # A zero budget, so mapillary cannot launch tonight however it is gated.
+    # It used to be the `est > budget` permanent skip; since #318 the channel is
+    # resumable, so what refuses it is the launch floor -- nothing left to cap a
+    # crawl at. Either way it is a decision, which is what this test is about.
     cfg.providers["mapillary"] = ProviderConfig(enabled=True, daily_request_budget=0)
 
     priced: list[str] = []
@@ -9475,7 +9902,17 @@ def test_budget_skips_are_final_but_host_deferrals_relaunch(conn, monkeypatch):
 
     assert "mapillary" not in log.starts()
     assert skipped == 1
-    assert priced.count("mapillary") == 1, (
+    # TWO, and not because the skip is reconsidered. Pricing one channel costs
+    # two `estimate_requests` calls -- `_channel_estimate` for the budget arm and
+    # `city_timeout_seconds` for the timeout -- which is what the two gsv
+    # channels have always cost here. Mapillary showed 1 before #318 only
+    # because `est > budget` skipped it BEFORE the timeout derivation was
+    # reached; it is resumable now, so `_sweep_launch_plan` sizes a cap first and
+    # makes the same two calls. What is actually being pinned is that the count
+    # MATCHES A CHANNEL THAT LAUNCHED -- a skip reconsidered on the next launch
+    # pass would double it again, which is the spin, so the assertion still
+    # fails on the behaviour it was written against.
+    assert priced.count("mapillary") == priced.count("gsv") == 2, (
         "a channel skipped on budget must be priced once and then left alone; "
         "re-pricing it every pass is how a deferral loop turns into a spin"
     )
@@ -9757,7 +10194,14 @@ def test_the_deadline_is_a_submit_gate_and_every_lane_child_gets_its_own_remaini
     def fake_timeout(cfg, city, provider, conn=None, remaining_s=None):
         priced.append((provider, remaining_s, threading.get_ident()))
         clock.work()
-        return 600
+        # 180 minutes, the city_timeout_minutes floor, and NOT the 600 s this
+        # returned before #318. 600 is exactly _TIMEOUT_FIXED_SLACK_S, so a
+        # resumable channel stubbed with it affords zero paced requests, falls
+        # under its launch floor and is skipped -- which silently removed a
+        # channel this test's barrier is counting on. A stub standing in for a
+        # derivation has to stay inside that derivation's realistic range once
+        # something starts reading its VALUE rather than just its existence.
+        return 10_800
 
     monkeypatch.setattr(sched, "city_timeout_seconds", fake_timeout)
     _stub_lane_collection(sched, monkeypatch)
@@ -10246,3 +10690,112 @@ def test_the_tail_survives_a_broken_cache_directory(conn, monkeypatch, tmp_path)
     assert sched._finish_batch(
         cfg, conn, "summary", succeeded=1, attempted=1, today=date(2026, 7, 2)
     ) in (0, 1)
+
+
+def test_a_free_cached_walk_on_a_spent_budget_is_launched_without_a_cap(conn):
+    """A cap of 0 must never reach a child, and `is not None` let it.
+
+    The child's positive_int refuses 0 at parse time -- correctly, since a cap
+    of 0 stops a crawl before it commits anything and then tells the operator to
+    re-run -- so emitting it turns the launch into argparse exit 2, a real
+    consecutive_failure rather than the budget deferral it resembles.
+
+    The path is not exotic and it WORKED before this feature: the launch floor
+    is gated on `est > 0`, and `est == 0` is the cached-census case (#290). So a
+    night whose budget is exactly spent, launching a walk whose census its grid
+    sibling already paid for, reaches a launch with `remaining == 0` on a
+    channel about to spend nothing. #274's review already established that this
+    walk must launch -- it is the one free collection of the night -- so the
+    flag is omitted rather than the launch refused.
+
+    Asserted on all four (channel, flag) pairs, since the same two lines were
+    written at four sites and the bug was at all of them.
+    """
+    from streetscape_metadata_tracker.scheduler import _request_cap_args, _street_collect_cmd
+
+    cid = _register(conn, "Bend", width=1000, height=1000, step=20)
+    city = db.resolve_city(conn, cid)
+    today = date(2026, 7, 1)
+
+    for channel, flag in (
+        ("mapillary_streets", "--mapillary-max-requests"),
+        ("kartaview_streets", "--kartaview-max-requests"),
+    ):
+        for cap in (0, -1):
+            cmd = _street_collect_cmd(_sweep_cfg(), city, today, channel, 8, 9_000, cap)
+            assert flag not in cmd, f"{channel} got {flag} {cap}, which argparse refuses"
+
+    # The grid builders reach the same helper; asserted there rather than
+    # through a subprocess capture, since what is under test is the condition
+    # and all four sites now share exactly one copy of it.
+    for flag in ("--mapillary-max-requests", "--kartaview-max-requests"):
+        assert _request_cap_args(flag, 0) == []
+        assert _request_cap_args(flag, -1) == []
+        assert _request_cap_args(flag, None) == []
+        # ...and a real cap still travels, so the guard cannot be "omit always".
+        assert _request_cap_args(flag, 1) == [flag, "1"]
+
+
+def test_each_tile_census_prices_its_launch_floor_from_its_own_retry_budget(monkeypatch):
+    """Both are 5 today, which is what makes a shared constant latent rather
+    than wrong -- and exactly how it would survive until one provider's retry
+    budget was retuned and the other's floor silently followed it.
+
+    WHICH IS WHY THIS RETUNES ONE. Asserting `launch_floor ==
+    download_panoramax.TILE_MAX_TRIES` is satisfied by ANY wiring while both
+    constants read 5: the row was written with Mapillary's constant once, and
+    this test -- named for that defect -- passed with it in place, as did the
+    other 2,301. Moving one provider's number and watching only that
+    provider's floor follow is the only form of this that can fail, and it
+    works only because the row resolves the module attribute when it is built
+    rather than freezing an alias at import.
+    """
+    from streetscape_metadata_tracker import download_mapillary, download_panoramax
+    from streetscape_metadata_tracker.scheduler import _crawl_pricing
+
+    assert _crawl_pricing("mapillary").launch_floor == download_mapillary.TILE_MAX_TRIES
+    assert _crawl_pricing("panoramax").launch_floor == download_panoramax.TILE_MAX_TRIES
+
+    monkeypatch.setattr(download_panoramax, "TILE_MAX_TRIES", 7)
+    assert _crawl_pricing("panoramax").launch_floor == 7, "reads Panoramax's own constant"
+    assert _crawl_pricing("mapillary").launch_floor == download_mapillary.TILE_MAX_TRIES, (
+        "and Mapillary's floor does not follow it"
+    )
+
+    monkeypatch.setattr(download_mapillary, "TILE_MAX_TRIES", 9)
+    assert _crawl_pricing("mapillary").launch_floor == 9
+    assert _crawl_pricing("panoramax").launch_floor == 7
+
+
+def test_each_tile_census_prices_its_pace_from_its_own_default_rate(monkeypatch):
+    """The other half of the row, and the half with a LIVE difference.
+
+    Panoramax paces at half Mapillary's rate on purpose -- nobody has asked the
+    forum what the instance will tolerate, so the default is deliberately
+    conservative (#316). A row wired to Mapillary's 60 would hand the eventual
+    launch arm twice the pace that decision chose, and `default_rate` is only
+    read when the channel has no `[providers.*]` block, which is exactly the
+    state a newly wired provider is in.
+    """
+    from streetscape_metadata_tracker import download_mapillary, download_panoramax
+    from streetscape_metadata_tracker.scheduler import _crawl_pricing
+
+    assert (
+        download_panoramax.DEFAULT_TILE_REQUESTS_PER_MINUTE
+        != download_mapillary.DEFAULT_TILE_REQUESTS_PER_MINUTE
+    ), "the two defaults must differ or this test pins nothing"
+    assert (
+        _crawl_pricing("panoramax").default_rate
+        == download_panoramax.DEFAULT_TILE_REQUESTS_PER_MINUTE
+    )
+    assert (
+        _crawl_pricing("mapillary").default_rate
+        == download_mapillary.DEFAULT_TILE_REQUESTS_PER_MINUTE
+    )
+
+    monkeypatch.setattr(download_panoramax, "DEFAULT_TILE_REQUESTS_PER_MINUTE", 17)
+    assert _crawl_pricing("panoramax").default_rate == 17
+    assert (
+        _crawl_pricing("mapillary").default_rate
+        == download_mapillary.DEFAULT_TILE_REQUESTS_PER_MINUTE
+    )

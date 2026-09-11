@@ -144,6 +144,7 @@ def _setup(
         calls["checkpoint_path"] = kwargs.get("checkpoint_path")
         calls["checkpoint_channel"] = kwargs.get("checkpoint_channel")
         calls["checkpoint_variant"] = kwargs.get("checkpoint_variant")
+        calls["max_requests"] = kwargs.get("max_requests")
         policy = kwargs.get("census_cache")
         calls["cache_path"] = policy.path if policy else None
         calls["reuse_census"] = policy.reuse if policy else None
@@ -1219,6 +1220,112 @@ def test_the_budget_preflight_does_not_abort_a_free_walk(tmp_path, monkeypatch):
     assert collect.run_collect(_args(data_dir, **{"daily-budget": 0})) == 0
 
 
+def test_the_budget_preflight_does_not_abort_a_free_walk_over_an_overspent_ledger(
+    tmp_path, monkeypatch
+):
+    """The ledger is legitimately OVER the budget when this walk is launched.
+
+    A cap is a soft ceiling (#318): the tiles already in flight when it trips
+    finish their retries, so a capped grid sweep ends up to
+    `connection_limit * (TILE_MAX_TRIES - 1)` -- 200 at prod's 50 -- past the
+    number it was given. The paired walk then runs against a ledger reading
+    MORE than `--daily-budget`, and it is exactly the walk that costs nothing,
+    because the sweep that overspent is the one that filled its census cache.
+
+    Gating on `already + 0 > budget` refuses it with exit 1, a real
+    consecutive_failure; five quarantine the channel for a 90-day cycle. The
+    scheduler half floors a zero cap at 1 so the launch happens at all, so a
+    child that then refuses it puts the two halves back in contradiction.
+    """
+    images = [_image("p1", 44.05, -121.30)]
+    data_dir, _ = _setup(tmp_path, monkeypatch, images, api_requests=0, api_requests_total=0)
+    conn = db.connect(db.get_default_db_path(data_dir))
+    city = db.resolve_city(conn, CITY_QUERY)
+    bbox = grid_bbox(
+        city.center_lat, city.center_lon, city.grid_width_m, city.grid_height_m, city.step_m
+    )
+    # 200 over a budget of 1,750: the documented residue of one capped night.
+    db.add_api_usage(conn, date.fromisoformat(RUN_DATE), 1950, provider="mapillary_streets")
+    conn.close()
+
+    # The gate is relaxed only for a walk that spends NOTHING, so the uncached
+    # walk against that same overspent ledger is still refused.
+    uncached = collect.run_collect(_args(data_dir, **{"daily-budget": 1750}))
+    assert uncached == 1, "an overspent ledger still refuses a census that costs something"
+
+    _stamp_cache_entry(census_cache_path_for("mapillary", CITY_ID, bbox))
+    assert collect.run_collect(_args(data_dir, **{"daily-budget": 1750})) == 0
+
+
 def _stamp_cache_entry(cache_path, *, fetched_by="mapillary"):
     """A marker-only cache entry — what `census_cache_probe` reads."""
     return stamp_census_cache(cache_path, "mapillary", fetched_by=fetched_by)
+
+
+# ── The request cap, on the walk's half of the census (issue #318) ──────────
+
+
+def test_the_request_cap_reaches_the_census_rather_than_only_the_budget_gate(tmp_path, monkeypatch):
+    """
+    --daily-budget only GATES, and the two flags are not redundant.
+
+    The walk's budget check is a pre-flight against a tile-count estimate; the
+    cap is the only thing that bounds what the crawl then spends against a host
+    that meters us by IP and answers a block with a 302 to a login page. A flag
+    parsed and dropped bounds nothing, so this asserts the VALUE at the crawl --
+    and a value that is not the default, so a call site that hardcoded the
+    default or dropped the argument still fails.
+    """
+    data_dir, calls = _setup(tmp_path, monkeypatch, [_image("m1", 44.05, -121.30)])
+    assert collect.run_collect(_args(data_dir, **{"mapillary-max-requests": 426})) == 0
+    assert calls["max_requests"] == 426
+
+    # ...and unset stays unset, rather than a cap nobody asked for silently
+    # truncating a city's census into a permanent hole.
+    data_dir2, calls2 = _setup(tmp_path / "b", monkeypatch, [_image("m1", 44.05, -121.30)])
+    assert collect.run_collect(_args(data_dir2)) == 0
+    assert calls2["max_requests"] is None
+
+
+def test_the_walks_request_cap_refuses_nonpositive_values_like_the_grid_flag(tmp_path):
+    """
+    0 is not "off", it is a crawl that stops before committing a tile and then
+    exits 83 telling the operator to re-run -- a loop the message encourages.
+    Refused at parse time on both paths through download_common.positive_int,
+    because a guard that is real on the grid flag and absent on the walk's copy
+    is the shape a copied argument always takes (#273, and again here).
+    """
+    for bad in ("0", "-5"):
+        with pytest.raises(SystemExit) as excinfo:
+            _args(str(tmp_path), **{"mapillary-max-requests": bad})
+        assert excinfo.value.code == 2
+
+
+def test_a_capped_walk_is_gated_on_the_cap_rather_than_the_whole_censuss_geometry(
+    tmp_path, monkeypatch
+):
+    """
+    The two halves of #318 must not contradict each other.
+
+    The scheduler stopped applying its `est > budget` gate to a resumable
+    channel precisely so a city priced above the remainder is launched CAPPED
+    instead of skipped -- and it hands the child both numbers. If the child then
+    re-gated on the whole census's geometry it would refuse exactly those
+    launches with exit 1: a real consecutive_failure, five of which quarantine
+    the walk for a 90-day cycle. `min(estimate, cap)` is the upper bound on
+    tonight's spend where the bare estimate is not.
+    """
+    data_dir, calls = _setup(tmp_path, monkeypatch, [_image("m1", 44.05, -121.30)])
+    args = _args(data_dir, **{"daily-budget": 3, "mapillary-max-requests": 2})
+    assert collect.run_collect(args) == 0, "gated on the 2 it can spend, not on the whole census"
+    assert calls["max_requests"] == 2
+
+
+def test_an_uncapped_over_budget_walk_is_still_refused(tmp_path, monkeypatch):
+    """The gate is relaxed by the CAP, not removed.
+
+    Without one there is nothing bounding the child, so the pre-flight estimate
+    is the only guard there is and it must still refuse.
+    """
+    data_dir, _calls = _setup(tmp_path, monkeypatch, [_image("m1", 44.05, -121.30)])
+    assert collect.run_collect(_args(data_dir, **{"daily-budget": 0})) == 1

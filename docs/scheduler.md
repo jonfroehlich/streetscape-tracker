@@ -236,12 +236,21 @@ A lane worker calls `_run_one_city` and nothing else; pricing, both budget gates
 The two values `_run_one_city` would otherwise derive from `conn` or the clock are precomputed at the launch site and passed in (`timeout_s`, `estimated_requests`); the scheduler hands the worker `conn=None` deliberately.
 That also keeps the read-then-write budget guard honest — the reads are serialized by being on one thread, in submit order, so two channels cannot both see "under budget" and both spend.
 **At the default of 1 the channel body runs INLINE on the calling thread**, not on a size-1 pool: that is what makes the default byte-equivalent to the pre-#240 loop and what keeps every existing test's `_run_one_city` substitute able to touch the fixture connection.
-**Neither budget gate applies to a channel `CHANNEL_RESUMABLE` marks (#274), which today is the two KartaView channels.**
-Both gates exist because every other channel is all-or-nothing — a partial grid, tile census or road walk is not a run — so refusing to start is honest and `est > budget` is a real dead end.
-A sweep checkpoints, so it is launched with `min(budget − used, what its timeout can pace)` as its cap whatever the estimate says, and its estimate is deliberately not consulted: `estimate_kartaview_requests` prices the whole sweep even for a resuming city, because its observed tier reads a `runs` row and a paused sweep never reaches `register_run`.
-The single floor left is `_MIN_SWEEP_LAUNCH_REQUESTS`, and it is read against that final cap rather than against the budget remainder — a night that runs out during radius *calibration* raises a plain `DownloadError` rather than `SweepIncompleteError`, so it takes no amnesty and counts a real failure, and that is as true of a city started minutes before the batch deadline as of one on a spent budget.
-The floor is derived from the calibration ladder's own bound, so retuning the ladder carries it.
-The floor is applied only when `est > 0`: a walk whose census is already in the shared cache never walks the ladder, so the ladder's cost cannot be a reason to defer a channel that will spend nothing (#290).
+**Neither budget gate applies to a channel `CHANNEL_RESUMABLE` marks (#274, #318), which is the two KartaView channels and the two Mapillary ones.**
+Both gates exist because every other channel is all-or-nothing — a partial grid or road walk is not a run — so refusing to start is honest and `est > budget` is a real dead end.
+A crawl that checkpoints is launched with `min(budget − used, what its timeout can pace)` as its cap whatever the estimate says, and its estimate is deliberately not consulted: it prices the WHOLE crawl even for a resuming city, because a paused one never reaches `register_run`.
+That over-pricing is not a KartaView quirk — `docs/provider-access.md` records the same of the tile census, "the pre-flight estimate still prices the whole tile count even when a resume will fetch a fraction of it" — so New York would be re-priced at 484 and skipped a second time.
+**What this actually changed on the ground:** the live win is the `used + est > budget` deferral becoming a capped launch — the end-of-night sliver that collected nothing from New York at 88% affordable, twice in six nights.
+The permanent `est > budget` arm has **never** fired: measured on production 2026-09-10, no enabled city's geometry clears a whole Mapillary night (1,221 cities, median 15 tiles, largest Moscow at 870 against a 3,500 budget).
+That took a query rather than a glance, because **a "largest grid" figure from a population of collected runs cannot answer it** — the gate skips exactly the expensive cities — and because a dev catalog in a checkout carries pre-#166 geometry that says otherwise; `docs/provider-access.md` has the numbers and the trap.
+Worth knowing before one grows into it: neither budget arm applies to a resumable channel, so a city needing more than a whole night now takes the **entire** channel budget for `ceil(tiles / budget)` consecutive nights, with every other city those nights falling under the launch floor, and `NULLS FIRST` would put a never-collected city of that size first in the queue.
+That is the right trade against collecting it never, but it is a whole-night decision and nothing in the log distinguishes it from an ordinary night.
+A night therefore spends its budget rather than stopping short of it; across nights a resumed city is cheaper, because its tiles are paid once instead of re-paid.
+Not *exactly* its budget, though — a capped crawl lets tiles already in flight finish their retries, so it can end up to `connection_limit × (TILE_MAX_TRIES − 1)` over (200 at prod's 50).
+The single floor left is `_crawl_pricing(channel).launch_floor`, and it is read against that final cap rather than against the budget remainder.
+It is **per provider, because the failure it prevents is a different failure**: a radius sweep that runs out during *calibration* raises a plain `DownloadError` rather than `SweepIncompleteError`, so it takes no amnesty and counts a real failure; a tile census has no ladder, but a cap under one tile's full retry budget can spend itself whole on a transiently-404ing tile, commit nothing, and still cost a night and a day of the checkpoint's seven.
+Both are derived from the collector's own constants — the ladder's documented bound, and `TILE_MAX_TRIES` — so retuning either carries its floor along.
+The floor is applied only when `est > 0`: a walk whose census is already in the shared cache never crawls at all, so the crawl's cost cannot be a reason to defer a channel that will spend nothing (#290).
 
 **A resumable channel has three skips, and only one of them records a failure.**
 The launch decision lives in `_sweep_launch_plan` and is read by both the live launch site and `run-due --dry-run`, so the preview an operator checks before a night cannot disagree with what the night does — it used to print `OVER BUDGET (deferred)` for exactly the metros the live path launches capped.
@@ -249,10 +258,30 @@ The skips, in the order they are asked: a **walk deferred** behind its grid sibl
 The age wall is the one that records a failure, deliberately.
 `CHECKPOINT_MAX_AGE_S` is measured from the checkpoint's first commit and the *child* discards an older one, then re-commits with a fresh stamp — so an under-budgeted city re-sweeps from root 0 every seven days, forever, while every night reads as ordinary progress and a pause records nothing an alert can see.
 Within a night of the wall, with more lattice left than the night's cap can cover, the scheduler logs at WARNING, refuses to launch and records a real failure for that (city, channel), which is what puts it in `attempted − succeeded` for the nightly alert and eventually quarantines the city through the five-night backstop instead of discarding ~60k requests a cycle.
-"Cannot finish tonight" is projected from `roots_done/root_count` against the estimate, so a sweep on its last night with one root cell left is still resumed.
-The property is declared as data, not as `provider == "kartaview"`: `CHANNEL_RESUMABLE` means "accepts a request cap that pauses and checkpoints rather than failing", which is why both Mapillary channels are `False` despite checkpointing their tile census (#256) — `download_mapillary` has a pacing knob and no request cap at all.
-The walk is `True` beside the grid run because it reads the same census by the same radius sweep, so its `--daily-budget` is a gate priced from a geometric floor rather than a ceiling on what the sweep spends; `_street_collect_cmd` passes **both** flags, and they are not redundant — the budget is the full ceiling the collector subtracts today's spend from itself, the cap arrives already subtracted.
-A `True` that nothing downstream reads would be exactly the fail-open the table exists to prevent, which is why the walk's cap is asserted at the command, not merely at the flag's default.
+"Cannot finish tonight" is projected from what the checkpoint has answered against the estimate, so a crawl on its last night with one unit left is still resumed.
+`checkpointing.sweep_progress` reads **both store shapes** to answer that — a radius sweep records `root_count`/`roots_done`, a tile census `tile_count`/`done_tiles` — and reading only the sweep's was a fail-QUIET rather than a crash: its best-effort `except` swallowed the `KeyError` and returned `None`, which every caller reads as "there is no checkpoint", disabling the one arm that can see a checkpoint being discarded weekly.
+Adding a resumable provider means adding its layout there, not only its flag to the table.
+
+The property is declared as data, not as `provider == "kartaview"`: `CHANNEL_RESUMABLE` means "accepts a request cap that pauses and checkpoints rather than failing".
+That is a stronger claim than "checkpoints", and it is why both Mapillary channels were `False` for the whole of #256 — the census resumed after an interruption it did not *choose*, but `download_mapillary` took only a pacing knob and had no number to stop itself at.
+#318 gave it one, so both flip.
+**`panoramax` is the instructive `False`**: its downloader has the identical cap since #318, and what keeps it out is that the grid argv built inline in `_run_one_city` has no arm to forward one — a `True` nothing downstream reads is exactly the fail-open the table exists to prevent.
+Flip it in the same commit that adds the launch arm.
+
+Each walk is `True` beside its grid run because it reads the same census by the same crawl, so its `--daily-budget` is a gate priced from an estimate rather than a ceiling on what the crawl spends; `_street_collect_cmd` passes **both** flags, and they are not redundant — the budget is the full ceiling the collector subtracts today's spend from itself, the cap arrives already subtracted.
+Which is also why each walk's cap is asserted at the command, not merely at the flag's default.
+
+**The clock term must read the constants that TIME the channel, not another provider's.**
+`_sweep_requests_within_timeout` is the inverse of a timeout derivation, and there are two: a radius sweep is timed at `DEFAULT_SWEEP_REQUESTS_PER_MINUTE × 0.5`, a tile census at `DEFAULT_TILE_REQUESTS_PER_MINUTE × 0.8`.
+Inverting one channel's clock with the other's constants under-prices a Mapillary cap — and a cap below the launch floor does not slow a channel down, it **skips the city outright, nightly and silently**.
+By how much depends on whether the channel is configured, and the two answers are far apart: with prod's `[providers.mapillary] max_requests_per_minute = 40` the configured rate is used on both sides, so only the fraction was wrong (40 × 0.5 = 20 against 40 × 0.8 = 32, **1.6×**); with no block at all the default is wrong too (16 × 0.5 = 8 against 60 × 0.8 = 48, **6×**).
+An earlier telling of this said "roughly fourfold at the shipped rates", which is the one case where it is 1.6× — the figure came from pairing KartaView's *default* 16/min with Mapillary's *configured* 40/min, two branches the function never takes together.
+The four numbers that size a resumable launch (default rate, achieved fraction, launch floor, and what that floor buys) therefore live in ONE row per provider (`_CRAWL_PRICING`), so the two directions cannot disagree; an unpriced resumable channel is a `KeyError`, the same posture `CHANNEL_RESUMABLE` takes.
+
+**A resumable channel reached at the very end of a night now defers instead of launching.**
+The clock term holds `_TIMEOUT_FIXED_SLACK_S` back for process startup and the checkpoint write, so once the deadline clamp puts a city's timeout under that, the requests the clock affords is 0, the cap is 0, and the launch-floor arm defers.
+Before #318 the same city launched under a short clamped timeout and was usually SIGKILLed by it — which loses the ledger write and counts a `consecutive_failure`, where the deferral costs neither and the city stays due.
+It is the better trade and it is also a live behaviour change on the busiest channel: expect the tail of a long night to show `deferred (0 req under the launch floor)` where it used to show a killed child.
 
 **Deferral and a final skip are different things and must stay different.**
 A budget skip, a breaker skip and a stop are decisions: the channel leaves the pending list and is never reconsidered tonight.
