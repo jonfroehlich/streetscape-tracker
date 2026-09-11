@@ -88,6 +88,8 @@ const tableGlobals = {
   deltaCellHtml: "readonly",
   providerCellHtml: "readonly",
   providerColumnGroup: "readonly",
+  DEFAULT_PRESET_LEAF_BUDGET: "readonly",
+  fitDefaultPreset: "readonly",
   headerCellHtml: "readonly",
   theadHtml: "readonly",
   rowHtmlFromColumns: "readonly",

@@ -915,15 +915,22 @@ function mergeStreetCoverage(rows, manifest) {
     let walk = lookupStreetwalk(manifest, row.cityId, "gsv", "drive");
     let walkProvider = "gsv";
     // ONLY for a city excluded from gsv, which is the case the rationale names.
-    // Applied to every city with no GSV walk it would quietly mix three
-    // providers into one sortable, FILTERABLE column on a page about Google's
+    // Applied to every city with no GSV walk it would quietly mix every
+    // provider into one sortable, FILTERABLE column on a page about Google's
     // driving -- so "street coverage over 80%" would silently mean "some
     // provider's", the same defect CLAUDE.md records for grid.html's
     // "Collected by" scope. An excluded city can never have a GSV walk, so
     // there the column is otherwise blank for a reason that is not about
     // Google's driving at all.
+    //
+    // Spelled out rather than swept from PROVIDERS because the ORDER is a
+    // preference and not an enumeration: the census providers in the order
+    // they were registered, after gsv above. Omitting one is silent -- a
+    // Panoramax walk was ignored here until #334 -- so a test reads this list
+    // back out of the source and asserts it covers every registered provider
+    // but gsv, which buys the coverage without giving up the order.
     if (row.gsvExcluded && (!walk || walk.coverage_pct_by_length == null)) {
-      for (const provider of ["mapillary", "kartaview"]) {
+      for (const provider of ["mapillary", "kartaview", "panoramax"]) {
         const alt = lookupStreetwalk(manifest, row.cityId, provider, "drive");
         if (alt && alt.coverage_pct_by_length != null) {
           walk = alt;

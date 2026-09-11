@@ -182,10 +182,10 @@ def _id_addressed_viewer_url(template: str):
     """
     Build the viewer-URL builder for a provider addressed BY its image id.
 
-    Mirrors the ``panoId ? ... : null`` guard the gsv and mapillary entries of
-    the PROVIDERS registry in www/js/streetscape-utils.js carry (issue #312):
-    an empty id interpolated into the template yields a TRUTHY string —
-    ``...?pKey=``, ``.../pictures//sd.jpg`` — which every consumer renders as a
+    Mirrors the ``panoId ? ... : null`` guard the gsv, mapillary and panoramax
+    entries of the PROVIDERS registry in www/js/streetscape-utils.js carry
+    (issue #312): an empty id interpolated into the template yields a TRUTHY
+    string — ``...?pKey=``, ``...&pic=`` — which every consumer renders as a
     link to nowhere rather than as no link. None is what they already treat as
     "this row is not addressable".
 
@@ -260,14 +260,12 @@ def _kartaview_map_url(row) -> str | None:
 
 
 # User-facing labels and pano viewer deep-links per provider (mirrors the
-# PROVIDERS registry in www/js/streetscape-utils.js — EXCEPT for panoramax,
-# which is deliberately here and not there until #316 phase 2's frontend PR: a
-# hand-collected panoramax run does reach cities.json.gz, but grid.js and
-# streets.js enumerate that registry, so its rows render nowhere and city.js
-# rewrites an unknown ?provider= to gsv. Per-run maps and popups, which is all
-# this table feeds, work now.) viewer_url takes the whole
-# row besides the pano id because KartaView's viewer is not addressable by photo
-# id; it may return None, which the popup renders as no link at all. Every
+# PROVIDERS registry in www/js/streetscape-utils.js, which has carried a
+# panoramax entry since #334 — the two tables now cover naming.KNOWN_PROVIDERS
+# identically, and a test reads the JS keys back out of the source to keep it
+# that way). viewer_url takes the whole row besides the pano id because
+# KartaView's viewer is not addressable by photo id; it may return None, which
+# the popup renders as no link at all. Every
 # naming.KNOWN_PROVIDERS member must have an entry — a run's map is generated
 # AFTER the run is registered, so a missing one fails a fully successful
 # collection at the last step (a test pins the coverage).
@@ -277,13 +275,14 @@ def _kartaview_map_url(row) -> str | None:
 # backup, which renders one link exactly as before.
 #
 # EVERY entry spells its own viewer_label, and there is deliberately no
-# "View in {label}" default to fall back on. #312 and #316 reached that rule
-# from opposite directions within a week: KartaView's link opens an error page
-# and Panoramax's opens a JPEG rather than a viewer, and a default label would
-# have described both as "View in <provider>". An honest label costs a few
-# words; a label that promises the wrong thing costs a reader's trust in every
-# other link on the page. A missing one is a KeyError at map generation — loud,
-# and at the same moment the missing-entry check above fires.
+# "View in {label}" default to fall back on. #312 is where that rule was
+# earned: KartaView's link opens an error page, and a default label would have
+# described it as "View in KartaView". An honest label costs a few words; a
+# label that promises the wrong thing costs a reader's trust in every other
+# link on the page. A missing one is a KeyError at map generation — loud, and
+# at the same moment the missing-entry check above fires. (Panoramax was the
+# rule's second example until #334 measured its viewer and found one that
+# works; "View in Panoramax" is now literally true, which is the point.)
 PROVIDER_DISPLAY = {
     "gsv": {
         "label": "GSV",
@@ -308,32 +307,33 @@ PROVIDER_DISPLAY = {
         "map_label": "View location on KartaView map",
         "map_url": _kartaview_map_url,
     },
-    # THE PICTURE ITSELF, NOT A 360 VIEWER, and that is measured rather than a
-    # shortcut (probed 2026-09-06, issue #316). Panoramax's interactive viewer
-    # is served by each INSTANCE at its own root, and the federated meta-catalog
-    # we collect from hosts no viewer at all -- its root is a marketing page.
-    # The z15 `pictures` layer carries no instance either (only `via` in the
-    # /api/search response does, and search cannot be the census), so a run row
-    # has no way to name which of the 23 instances owns a picture.
+    # THE FEDERATION'S OWN VIEWER, addressed by picture id. This replaces a
+    # link to the raw JPEG (#316), and the rationale it replaces is worth
+    # keeping visible because it was wrong in the way #312 warns about --
+    # reasoned rather than measured. It held that the meta-catalog we collect
+    # from "hosts no viewer at all, its root is a marketing page", and that a
+    # picture could not be opened without first naming which of the 23
+    # federated instances owns it. Probed 2026-09-10 (issue #334):
     #
-    # What DOES resolve federation-wide from the id alone is the asset route:
-    # /api/pictures/{id}/sd.jpg answers 308 to the owning instance's copy, so
-    # this link always opens the actual imagery. `sd` rather than `hd` because
-    # an equirectangular original is tens of megabytes.
+    #   - https://api.panoramax.xyz/ answers 307 -> /en/index, whose body
+    #     embeds `<pnx-viewer endpoint="/api" metacatalog="false">`: the
+    #     official @panoramax/web-viewer, bound to the meta-catalog. The root
+    #     IS the viewer.
+    #   - Its permalink parameters are query-string, not hash
+    #     (docs.panoramax.fr/web-viewer/03_URL_settings/): `pic=<uuid>` with
+    #     `focus=pic`, and they survive the 307.
+    #   - GET /api/pictures/<uuid> answers 200 for a picture from our own Ames
+    #     run, so the meta-catalog resolves a picture WITHOUT being told its
+    #     instance -- which is the objection that produced the JPEG link.
     #
-    # The alternative was no link at all, which is what the #312 rule prescribes
-    # when the only candidate is a guess -- and a guessed instance is exactly
-    # that. A working link to the picture beats a broken link to a viewer.
+    # Browser-verified on a real Ames picture before shipping, the #312 lesson
+    # applied before rather than after. Hence no map_url: a fallback is for a
+    # provider whose own viewer cannot be relied on, and this one can.
     "panoramax": {
         "label": "Panoramax",
-        # Says what the link opens rather than "View in Panoramax", which would
-        # promise a viewer this link is not. Spelled as every other entry's
-        # label is, because #316 and #312 arrived at the same rule from
-        # opposite directions -- see the note above the table.
-        "viewer_label": "Open this Panoramax picture",
-        "viewer_url": _id_addressed_viewer_url(
-            "https://api.panoramax.xyz/api/pictures/{id}/sd.jpg"
-        ),
+        # Now literally true, which the JPEG link's label could not be.
+        "viewer_label": "View in Panoramax",
+        "viewer_url": _id_addressed_viewer_url("https://api.panoramax.xyz/?focus=pic&pic={id}"),
         "map_label": None,
         "map_url": None,
     },

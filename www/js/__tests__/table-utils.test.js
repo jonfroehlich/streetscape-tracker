@@ -21,6 +21,8 @@ const {
   createSortableTable,
   providerColumnGroup,
   anyImageryLeafTitle,
+  DEFAULT_PRESET_LEAF_BUDGET,
+  fitDefaultPreset,
 } = require("../table-utils.js");
 
 // --- cityDisplayLabel (canonical copy; streets.js's cityLabel aliases it) ---
@@ -492,4 +494,75 @@ test("anyImageryLeafTitle: the branch is the registry flag, the clause is the ca
   // An unregistered provider names itself by key rather than rendering
   // "undefined publishes 360° panoramas only".
   assert.match(anyImageryLeafTitle("nosuch", "Equals grid coverage"), /: nosuch publishes/);
+});
+
+// --- fitDefaultPreset: the default view against the content measure --------
+
+const _cols = (spec) =>
+  spec.flatMap(([group, keys]) =>
+    keys.map((key) => ({ key, group: group ? { id: group } : undefined }))
+  );
+
+test("fitDefaultPreset: a preset already inside the budget is returned untouched", () => {
+  // Identity, not a copy: the caller keeps every other field, and an
+  // unnecessary rebuild is how a preset silently loses one.
+  const columns = _cols([["cov", ["a", "b"]], [null, ["z"]]]);
+  const preset = { id: "overview", label: "Overview", columns: ["a", "b", "z"] };
+  assert.equal(fitDefaultPreset(preset, columns), preset);
+});
+
+test("fitDefaultPreset: trailing GROUPS give way, one at a time, from the end", () => {
+  const columns = _cols([
+    ["cov", ["c1", "c2", "c3", "cd"]],
+    ["age", ["a1", "a2", "a3", "ad"]],
+    ["collected", ["l1", "l2", "l3"]],
+  ]);
+  const preset = {
+    id: "overview",
+    title: "kept",
+    columns: ["c1", "c2", "c3", "cd", "a1", "a2", "a3", "ad", "l1", "l2", "l3"],
+  };
+  const fitted = fitDefaultPreset(preset, columns, 8);
+  assert.deepEqual(fitted.columns, ["c1", "c2", "c3", "cd", "a1", "a2", "a3", "ad"]);
+  assert.equal(fitted.title, "kept", "the trim must not drop the preset's other fields");
+  assert.deepEqual(preset.columns.length, 11, "the input preset was mutated");
+
+  // Tighter still, and the next group from the end goes too.
+  assert.deepEqual(fitDefaultPreset(preset, columns, 5).columns, ["c1", "c2", "c3", "cd"]);
+});
+
+test("fitDefaultPreset: an ungrouped column survives a trim that a key-wise one would take", () => {
+  // The streets case (#334): "Street km" is the denominator every percentage
+  // in the row is a percentage of, and it sits LAST in the preset. Dropping
+  // trailing keys would take it first; dropping trailing groups keeps it.
+  const columns = _cols([
+    ["cov", ["c1", "c2", "c3", "cd"]],
+    ["walked", ["w1", "w2", "w3"]],
+    ["age", ["a1", "a2", "a3"]],
+    [null, ["lengthKm"]],
+  ]);
+  const preset = {
+    id: "overview",
+    columns: ["c1", "c2", "c3", "cd", "w1", "w2", "w3", "a1", "a2", "a3", "lengthKm"],
+  };
+  const fitted = fitDefaultPreset(preset, columns, 8);
+  assert.ok(fitted.columns.includes("lengthKm"));
+  assert.deepEqual(fitted.columns, ["c1", "c2", "c3", "cd", "w1", "w2", "w3", "lengthKm"]);
+});
+
+test("fitDefaultPreset: a preset of ungrouped columns cannot be trimmed, and says so by not trying", () => {
+  // There is nothing group-shaped to drop, so it returns what it was given
+  // rather than looping or truncating mid-metric. The e2e width gate is what
+  // catches this shape if one ever exceeds the measure.
+  const columns = _cols([[null, ["a", "b", "c"]]]);
+  const preset = { id: "overview", columns: ["a", "b", "c"] };
+  assert.deepEqual(fitDefaultPreset(preset, columns, 1).columns, ["a", "b", "c"]);
+});
+
+test("fitDefaultPreset: the budget is the measured two-provider default, not a round number", () => {
+  // Both pages' default presets are three grouped metrics, which comes to
+  // exactly this many leaves at two providers — the widest default that has
+  // been measured to fit (1500px page less the 280px sidebar). Changing it
+  // without re-measuring is what the e2e width gate is there to refuse.
+  assert.equal(DEFAULT_PRESET_LEAF_BUDGET, 8);
 });

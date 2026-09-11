@@ -48,6 +48,12 @@ ALPHA_LATEST = "alpha-city--alphastate--testland_width_100_height_100_step_20_20
 ALPHA_MAPILLARY_LATEST = (
     "alpha-city--alphastate--testland_width_100_height_100_step_20_mapillary_2026-04-15.csv.gz"
 )
+# ...and its Panoramax series (#334), which makes Alpha City the fixture's
+# THREE-provider city: the widest row the pivoted tables are asked to render,
+# and the count at which the default preset stops fitting the measure.
+ALPHA_PANORAMAX_LATEST = (
+    "alpha-city--alphastate--testland_width_100_height_100_step_20_panoramax_2026-04-15.csv.gz"
+)
 ZERO_CITY = "zero-city--zerostate--testland_width_100_height_100_step_20_2026-04-15.csv.gz"
 # The published diff detail between Alpha City's two runs (real compute_run_diff
 # output: one pano_added row), fetched by the city page's change overlay.
@@ -417,6 +423,94 @@ def test_city_page_renders_the_road_walk_street_overlay(page: Page, base_url):
     assert errors == []
 
 
+def test_city_page_renders_a_panoramax_run_as_panoramax(page: Page, base_url):
+    """
+    The defect issue #334 closes, asserted where it was visible rather than at
+    the registry: a Panoramax run rendered AS GSV.
+
+    ``getProviderFromFilename`` resolves an unrecognised token to "gsv" rather
+    than failing, so before the registry entry existed this page showed
+    Google's attribution over Panoramax imagery, the GSV colour ramp, a
+    "Google only" toggle whose default mode hid every marker (no row is
+    ``© Google``), and a ``google.com/maps/...pano=<uuid>`` link to nothing.
+    Nothing on the page looked broken, which is the whole reason this is an
+    e2e test and not a unit one.
+    """
+    errors = _capture_errors(page)
+    page.goto(f"{base_url}/city.html?file={ALPHA_PANORAMAX_LATEST}")
+
+    expect(page.locator("table.legend-stats")).to_be_visible()  # page finished
+
+    # The provider's own attribution, and NOT Google's.
+    attribution = page.locator(".leaflet-control-attribution")
+    expect(attribution).to_contain_text("Panoramax")
+    expect(attribution).not_to_contain_text("© Google")
+
+    # No copyright filter: Panoramax publishes a contributor id, not an
+    # official-fleet marker, so the Google-only radiogroup must not render at
+    # all. Its default mode is what hid every marker.
+    expect(page.locator(".gsv-mode-toggle")).to_have_count(0)
+
+    # ...and the flat-only toggle DOES render, because hasFlatImagery is true
+    # and the fixture run carries a FLAT_ONLY point. This is the pair: the
+    # capability flags decide both, and getting the provider wrong got both
+    # backwards.
+    expect(page.get_by_role("button", name="Toggle flat-only imagery markers")).to_have_count(1)
+
+    # A marker popup links the federation viewer, addressed by picture id.
+    # city.js builds the map with preferCanvas, so a pano marker is painted
+    # pixels rather than an element to locate — click where Leaflet put it and
+    # let its own canvas hit-testing find it, which is what a reader does.
+    at = page.evaluate(
+        """() => {
+             let found = null;
+             map.eachLayer((l) => {
+               if (!found && l.getLatLng && l.getPopup && l.getPopup()) found = l;
+             });
+             if (!found) return null;
+             const pt = map.latLngToContainerPoint(found.getLatLng());
+             const box = map.getContainer().getBoundingClientRect();
+             return { x: box.x + pt.x, y: box.y + pt.y };
+           }"""
+    )
+    assert at, "no pano marker with a popup was drawn"
+    page.mouse.click(at["x"], at["y"])
+    popup = page.locator(".leaflet-popup-content")
+    expect(popup).to_be_visible()
+    link = popup.locator("a").first
+    expect(link).to_have_text("View in Panoramax")
+    href = link.get_attribute("href")
+    assert href.startswith("https://api.panoramax.xyz/?focus=pic&pic="), href
+    # One link, not two: no fallback, because the viewer works (#312's rule
+    # applied in the other direction).
+    expect(popup.locator("a")).to_have_count(1)
+
+    assert errors == []
+
+
+def test_the_provider_toggle_offers_every_registered_provider(page: Page, base_url):
+    """
+    ``?provider=panoramax`` has to survive a reload, which it could not before
+    #334: ``isKnownProvider`` reads the registry, so an unregistered provider
+    was rewritten to gsv on load and the radio group had no option for it.
+    """
+    errors = _capture_errors(page)
+    page.goto(f"{base_url}/index.html?provider=panoramax")
+
+    radios = page.locator('input[name="provider"]')
+    expect(radios).to_have_count(4)  # one per REGISTERED provider
+    expect(page.locator('input[name="provider"][value="panoramax"]')).to_be_checked()
+
+    # Alpha City is the fixture's only Panoramax city, so the map narrows to it.
+    expect(page.locator("path.leaflet-interactive")).to_have_count(1)
+
+    page.reload()
+    expect(page.locator('input[name="provider"][value="panoramax"]')).to_be_checked()
+    expect(page.locator("path.leaflet-interactive")).to_have_count(1)
+
+    assert errors == []
+
+
 def test_site_header_navigates_and_clears_the_floating_panels(page: Page, base_url):
     """
     The shared header is the site's only navigation — before it, street
@@ -529,11 +623,16 @@ def test_streets_provider_cells_open_that_providers_own_walk(page: Page, base_ur
 
     alpha = page.locator("#streets-tbody tr", has_text="Alpha City")
     links = alpha.locator("td a.provider-cell-link")
-    expect(links).to_have_count(6)  # 3 groups x 2 providers; the Δ is not one
+    # 2 groups x 3 providers; the Δ is not one. Two groups rather than three
+    # because the default preset gives one up at three providers (#334) — the
+    # link count is the same as the two-provider table's by coincidence, which
+    # is why the href SET below is the assertion that matters.
+    expect(links).to_have_count(6)
     hrefs = links.evaluate_all("els => els.map(e => e.getAttribute('href'))")
     assert set(hrefs) == {
         f"city.html?file={ALPHA_LATEST}&network=drive",
         f"city.html?file={ALPHA_MAPILLARY_LATEST}&network=drive",
+        f"city.html?file={ALPHA_PANORAMAX_LATEST}&network=drive",
     }, hrefs
     expect(alpha.locator("td.delta-cell a")).to_have_count(0)
 
@@ -732,14 +831,18 @@ def test_grid_page_lists_one_row_per_city(page: Page, base_url):
     expect(page.locator("#grid-thead tr")).to_have_count(2)
     group = page.locator("#grid-thead th.th-group", has_text="Grid coverage")
     expect(group).to_have_count(1)
-    expect(group).to_have_attribute("colspan", "3")  # GSV + Mapillary + Δ
+    # GSV + Mapillary + Panoramax + Δ. One leaf per COLLECTED provider, so
+    # this number is the fixture's provider count plus the Δ, not a constant.
+    expect(group).to_have_attribute("colspan", "4")
     assert group.evaluate("el => el.hasAttribute('data-key')") is False
 
-    # Alpha City is the two-provider city: both leaves populated, and a Δ that
-    # is a real signed number rather than an em-dash.
+    # Alpha City is the three-provider city: every leaf populated, and a Δ
+    # that is a real signed number rather than an em-dash. The Δ is a FIXED
+    # pair (Mapillary − GSV), so a third provider adds a leaf and no Δ.
     alpha = rows.first
     expect(alpha.locator("td.coverage-cell").nth(0)).to_have_text("75.0%")  # GSV
     expect(alpha.locator("td.coverage-cell").nth(1)).to_have_text("66.7%")  # Mapillary
+    expect(alpha.locator("td.coverage-cell").nth(2)).to_have_text("50.0%")  # Panoramax
     expect(alpha.locator("td.delta-cell").first).to_have_text("-8.3 pp")
 
     # Map Ville has no GSV run at all: the union pivot keeps the row, the
@@ -756,7 +859,7 @@ def test_grid_page_lists_one_row_per_city(page: Page, base_url):
         "href", f"city.html?file={ALPHA_LATEST}"
     )
     expect(page.locator("thead").get_by_text("Link to city map")).to_have_count(0)
-    expect(page.locator("#grid-caption")).to_contain_text("3 cities (4 provider series)")
+    expect(page.locator("#grid-caption")).to_contain_text("3 cities (5 provider series)")
 
     # A grouped LEAF header sorts (GSV grid coverage, best first: the 0-pano
     # city sinks, and Map Ville sinks below it because it has no GSV value at
@@ -789,20 +892,23 @@ def test_grid_provider_cells_open_that_providers_own_run(page: Page, base_url):
     page.goto(f"{base_url}/grid.html")
 
     alpha = page.locator("#grid-tbody tr", has_text="Alpha City")
-    # Overview shows two metric groups plus Last collected, so Alpha City's two
-    # providers contribute six linked cells; the Δ cells are not links.
+    # Overview shows two metric groups at this provider count (it drops Last
+    # collected at three, #334), so Alpha City's three providers contribute
+    # six linked cells; the Δ cells are not links.
     links = alpha.locator("td a.provider-cell-link")
     expect(links).to_have_count(6)
     hrefs = links.evaluate_all("els => els.map(e => e.getAttribute('href'))")
     assert set(hrefs) == {
         f"city.html?file={ALPHA_LATEST}",
         f"city.html?file={ALPHA_MAPILLARY_LATEST}",
+        f"city.html?file={ALPHA_PANORAMAX_LATEST}",
     }, hrefs
     expect(alpha.locator("td.delta-cell a")).to_have_count(0)
 
-    # Map Ville has no GSV run: its GSV cells are plain, not links to nowhere.
+    # Map Ville has only a Mapillary run: its other providers' cells are
+    # plain, not links to nowhere.
     map_ville = page.locator("#grid-tbody tr", has_text="Map Ville")
-    expect(map_ville.locator("td a.provider-cell-link")).to_have_count(3)
+    expect(map_ville.locator("td a.provider-cell-link")).to_have_count(2)
 
     # Clicking a Mapillary cell lands on the Mapillary series.
     alpha.locator("td.coverage-cell").nth(1).locator("a").click()
@@ -827,7 +933,7 @@ def test_grid_collected_by_filter_replaces_the_multi_provider_checkbox(page: Pag
     page.locator('select[data-filter="provider"]').select_option("multi")
     expect(rows).to_have_count(1)
     expect(rows.first).to_contain_text("Alpha City")
-    expect(page.locator("#grid-caption")).to_contain_text("1 of 3 cities (2 provider series)")
+    expect(page.locator("#grid-caption")).to_contain_text("1 of 3 cities (3 provider series)")
 
     assert errors == []
 
