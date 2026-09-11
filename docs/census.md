@@ -415,7 +415,7 @@ And it is enormous, because every feature embeds a ~90-key EXIF blob: 1,000 feat
 
 So the census is the v1 map endpoint's `pictures` layer, which starts at **z15** — the coarsest zoom that serves it at all, and therefore the cheapest.
 That is not a tunable and getting it wrong is silent rather than loud: below z15 the layer is absent entirely, so every tile would decode to nothing and the run would publish a city holding no imagery rather than failing.
-The cost that follows is a real difference from Mapillary and not a rounding one: the same bbox is ~4x the tiles, a catalog p50 of 35 against Mapillary's 12, and over the cities actually worth enrolling a p50 of 414 tiles, p90 2,400 and max 3,132 (~104 minutes at the shipped pace).
+The cost that follows is a real difference from Mapillary and not a rounding one: the same bbox is up to ~4x the tiles (the asymptote of one zoom level; measured 2.0x-3.9x over square grids from 0.2 to 40 km), a catalog p50 of 35 against Mapillary's 12, and over the cities actually worth enrolling a p50 of 414 tiles, p90 2,400 and max 3,132 (~104 minutes at the shipped pace).
 `estimate_tile_count` counts that lattice exactly, offline and free, so unlike KartaView's sweep there is no observed-versus-geometric correction to carry.
 
 The v2 endpoint's H3 `grid` layer — aggregated counters rather than rows — is the *screen* instrument phase 1 used to price the whole catalog for 113 requests, and it is not read by the collector at all.
@@ -451,3 +451,29 @@ The jitter is adopted before any incident rather than after three; see [`provide
 `streetscape_tracker.py --provider panoramax` collects a city, and `naming.KNOWN_PROVIDERS` carries the token so the run reads back under its own schema.
 But `scheduler.UNWIRED_CHANNELS` still holds `panoramax`, so a `[providers.panoramax]` block is dropped with an error rather than run: `estimate_requests`, `city_timeout_seconds`, the `enabled_providers` rank and the `_run_one_city` pacing flag have no arm for it yet, and each of those fails OPEN in the way #238 records.
 `CHANNEL_DEFAULT_MEMBERSHIP["panoramax"]` is already `False`, on a measurement rather than a cost argument: 730 of 1,144 enabled cities screen to a conclusive zero, so a default-membership channel would spend most of its slots confirming absence.
+
+## The Panoramax road walk is the third `CensusWalkSpec` binding (issue #331)
+
+**`streetscape_street_analyzer/collect_panoramax.py` is three bindings and a fetch, and deliberately nothing else.**
+`census_walk.py`'s docstring already said what a census provider's walk is — one fetch over the frozen bbox joined **locally** onto the same deterministic sample points, with that join "and the status vocabulary it produces, identical for every such provider" — and named KartaView as the second caller it was waiting for.
+Panoramax is the third, and the arm is small precisely because nothing about the join, the pano-beats-flat rule, the `OK`/`NO_DATE`/`FLAT_ONLY`/`ZERO_RESULTS` vocabulary or the sample-order restore is written twice.
+
+**The date binding is REUSED from the grid run rather than rewritten.**
+`_panoramax_capture_dates` already holds this provider's rule — an `ISO8601`-pinned parse (mixed precisions in one response otherwise null each other) with the plausibility floor that drops the genuine 1970 epoch sentinel — and it already returns `""` for a rejected date, which is the empty string `CensusWalkSpec` asks for and which becomes `NO_DATE`.
+A second implementation here would be a second date rule, and one city's grid and street artifacts would disagree about the same picture.
+
+**Two hazards are specific to this provider being Mapillary-shaped.**
+`collect.py` imports four names from both `download_panoramax` and `download_mapillary`, and **two of them are genuine collisions**: `estimate_tile_count` (a z15 lattice against a z14 one, up to ~4x the tiles for one bbox — 2.9x at the catalog median) and `DEFAULT_TILE_REQUESTS_PER_MINUTE` (30 against 60).
+So `collect.py` imports them ALIASED: a bare import would not be a clash the linter flags but a silent rebinding of whichever came second, after which the loser's channel is priced and paced by the winner's constants — the #268 failure (one provider's cost model wearing another's name) reached through the import list rather than through an `else`.
+**Be precise about which names collide**, because a reader who checks an overstated claim and finds it false deletes the aliasing with it: `DEFAULT_TILE_JITTER` is 0.6 in BOTH modules, and `grid_bbox` is not a collision at all — both re-export the identical `download_common.grid_bbox`, and `collect.py` does not import it.
+The first version of this paragraph claimed all four differed and quoted Mapillary's rate as 40, which is its PRODUCTION CONFIG value and not what the module exports; a three-reviewer pass caught it.
+**And "four" is the count of what THIS CALLER imports, never a property of the two modules**: they share 55 public names, 14 of which resolve to different objects (`TILE_ZOOM`, `TILE_URL_TEMPLATE`, `TileCheckpoint`, `fetch_city_images_async`, `build_image_rows`, `records_to_census`, `tiles_for_bbox`, `load_cached_census`, … — measured, not counted by hand).
+Stated as a module property it invites the next call site to import a fifth name unaliased on the grounds that the list was complete.
+And a **404 is an empty tile**, not a failure, so a tile genuinely holding no imagery never reaches `failed_tiles`; everything the walk's `unmeasured_mask` covers is ground the fetch really did not see.
+
+**`panoramax_streets` is a budget channel with no credential behind it.**
+Its row in `config.CHANNEL_ENV_VARS` is an empty tuple exactly like `panoramax`'s, which is what puts it in `CREDENTIAL_FREE_CHANNELS`; drop the row and `load_config` falls through to its final `raise`, making the one walk that needs no key the one walk that cannot start.
+The ledger half of the isolation still does real work — it is what keeps a walk's tiles off the grid channel's daily budget — while the credential half is vacuous here, one step further than `kartaview_streets`, which has a token to fall back to.
+
+**Collectable by hand, not scheduled**, exactly like the grid channel above it: there is no `panoramax_streets` entry in `scheduler.STREET_CHANNELS`, so a `[providers.panoramax_streets]` block would be ignored as an unknown provider.
+Wiring it is part of the remaining #316 phase-2 work, and it is the same four fail-open arms — plus the decision tables (`CHANNEL_HOSTS`, `CHANNEL_DEFAULT_MEMBERSHIP`, `CHANNEL_RESUMABLE`) whose set-equality tests turn a half-wired channel into a red test rather than a nightly wrong answer.

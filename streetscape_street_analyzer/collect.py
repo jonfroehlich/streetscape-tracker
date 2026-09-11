@@ -2,7 +2,7 @@
 CLI: road-walk street-coverage collection for a city (issue #99).
 
     python -m streetscape_street_analyzer.collect "Seattle, WA" \
-        [--provider gsv|mapillary] \
+        [--provider gsv|kartaview|mapillary|panoramax] \
         [--spacing 15] [--match-dist 25] [--network-type drive|all_public|...] \
         [--run-date YYYY-MM-DD] [--force] [--refresh] \
         [--connection-limit N] [--max-requests-per-minute R] \
@@ -14,7 +14,7 @@ metres along each edge, and finds the nearest pano at each point, yielding
 **fractional** per-edge coverage. Unlike the grid downloader it scores only
 on-street points, and its association to streets is by construction.
 
-Both providers walk the SAME deterministic sample points, so their coverage
+Every provider walks the SAME deterministic sample points, so their coverage
 percentages are directly comparable — but they reach the imagery very
 differently:
 
@@ -22,15 +22,21 @@ differently:
     to a few hundred thousand), reusing the grid downloader's hardened request
     engine — rate limiter, OVER_QUERY_LIMIT retry, ``.downloading`` resume —
     via ``download_gsv.collect_points_async``.
-  * **mapillary** has no per-point endpoint: it reads the z14 vector-tile
-    census once — a cost set by the bbox area alone (catalog median 12 tiles,
-    max 870), independent of spacing but not of city size — and joins it onto
-    the sample points locally. See ``collect_mapillary``.
+  * **mapillary**, **kartaview** and **panoramax** have no per-point endpoint:
+    each reads ONE census over the frozen bbox — Mapillary's z14 vector tiles,
+    KartaView's radius sweep, Panoramax's z15 vector tiles — and joins it onto
+    the sample points locally, a cost set by the bbox area alone, independent
+    of spacing but not of city size. The join itself lives once in
+    ``census_walk``; each provider supplies three bindings.
 
-Each provider's requests are metered against its own ISOLATED key and ledger
-channel (``GMAPS_STREETS_API_KEY``/``gsv_streets``,
-``MAPILLARY_STREETS_ACCESS_TOKEN``/``mapillary_streets``, issue #141) so a road
-walk can never exhaust the production grid collectors' quota.
+Each provider's requests are metered against its own ISOLATED ledger channel,
+and where there is a credential, its own key (``GMAPS_STREETS_API_KEY``/
+``gsv_streets``, ``MAPILLARY_STREETS_ACCESS_TOKEN``/``mapillary_streets``, issue
+#141) so a road walk can never exhaust the production grid collectors' quota.
+``kartaview_streets`` shares the grid channel's token (one host lock, so no
+parallel burn to isolate) and ``panoramax_streets`` has none at all — but both
+still meter into their own ledger row, which is the half of the isolation that
+bounds a night either way.
 
 Two dated artifacts are written next to the run (both published as ``*.gz``):
 a raw sample snapshot ``..._streetwalk_sp{N}_{DATE}.csv.gz`` (METADATA schema,
@@ -99,6 +105,33 @@ from streetscape_metadata_tracker.download_mapillary import (
     DEFAULT_TILE_REQUESTS_PER_MINUTE,
     estimate_tile_count,
 )
+
+# ALIASED, BECAUSE TWO OF THESE NAMES ARE ALREADY BOUND ABOVE TO MAPILLARY'S
+# VALUES. `estimate_tile_count` counts a z15 lattice here against Mapillary's
+# z14 (up to ~4x the tiles for one bbox, 2.9x at the catalog median), and
+# DEFAULT_TILE_REQUESTS_PER_MINUTE is 30
+# against Mapillary's 60. A bare `from ... import estimate_tile_count` would not
+# be a name clash the linter flags but a SILENT REBINDING of whichever import
+# came second, and the loser's channel would then be priced and paced by the
+# winner's constants -- the #268 failure (one provider's cost model wearing
+# another's name) reached through the import list instead of through an `else`.
+#
+# BE PRECISE ABOUT WHICH NAMES ACTUALLY COLLIDE, because a reader who checks an
+# overstated claim and finds it false deletes the aliasing along with it. The
+# two above are the real ones. Of the other names the two modules share,
+# DEFAULT_TILE_JITTER is 0.6 in BOTH (same value, so a mix-up would be
+# invisible rather than harmless -- alias it anyway, since the value is free to
+# diverge), and `grid_bbox` is not a collision at all: both modules re-export
+# the identical `download_common.grid_bbox`, and it is not imported here.
+from streetscape_metadata_tracker.download_panoramax import (
+    DEFAULT_TILE_JITTER as PANORAMAX_TILE_JITTER,
+)
+from streetscape_metadata_tracker.download_panoramax import (
+    DEFAULT_TILE_REQUESTS_PER_MINUTE as PANORAMAX_TILE_REQUESTS_PER_MINUTE,
+)
+from streetscape_metadata_tracker.download_panoramax import (
+    estimate_tile_count as estimate_panoramax_tile_count,
+)
 from streetscape_metadata_tracker.json_summarizer import generate_streetwalk_manifest
 from streetscape_metadata_tracker.naming import (
     DEFAULT_NETWORK_TYPE,
@@ -111,6 +144,7 @@ from streetscape_metadata_tracker.walk_diff import compute_and_record_walk_diff
 
 from .collect_kartaview import collect_kartaview_street_samples_async
 from .collect_mapillary import collect_mapillary_street_samples_async
+from .collect_panoramax import collect_panoramax_street_samples_async
 from .download_street_network import fetch_street_edges
 from .road_sampling import dedupe_query_points, generate_samples
 from .street_coverage import (
@@ -130,6 +164,13 @@ STREET_BUDGET_CHANNELS = {
     "gsv": "gsv_streets",
     "kartaview": "kartaview_streets",
     "mapillary": "mapillary_streets",
+    # panoramax_streets is a real channel with no credential behind it (issue
+    # #331). The ledger half of the isolation still applies and is the half that
+    # matters here -- a walk's tiles must not be charged to the grid channel's
+    # daily budget -- while the credential half is vacuous, since Panoramax
+    # reads are unauthenticated. See config.CHANNEL_ENV_VARS, where the row is
+    # an empty tuple rather than an omission.
+    "panoramax": "panoramax_streets",
 }
 
 
@@ -182,6 +223,23 @@ STREET_COST_MODELS: dict[str, StreetCostModel] = {
     # from the cache anyway. See docs/experiments/kartaview-sweep-cost.md.
     "kartaview": StreetCostModel(unit="KartaView sweep requests", estimate=estimate_sweep_requests),
     "mapillary": StreetCostModel(unit="Mapillary tile requests", estimate=estimate_tile_count),
+    # An exact LATTICE count, which is not the same as an exact REQUEST count.
+    # The z15 tiles over the frozen bbox are counted from geometry with no
+    # imagery-dependent term, so unlike KartaView's estimate there is no
+    # pagination term to under-count -- but `count_request` sits INSIDE
+    # download_panoramax._fetch_tile's @backoff body (deliberately, #198), so a
+    # flaky tile bills up to _TILE_MAX_TRIES. Spend can therefore exceed this
+    # figure on a bad night, and the --daily-budget pre-flight below can
+    # correspondingly under-refuse; it is a tight floor, not a ceiling.
+    # Note the zoom in the estimator, not here -- z15 is the coarsest that
+    # serves the v1 `pictures` layer at all, so a bbox costs up to ~4x the
+    # Mapillary row above and the two units are not interchangeable numbers.
+    # ~4 is the asymptote rather than the measurement: a bbox does not divide
+    # evenly, so the ratio runs 2.0x-3.9x over square grids from 0.2 to 40 km
+    # and sits at 2.9x on the catalog median. Quote it as a bound, not a factor.
+    "panoramax": StreetCostModel(
+        unit="Panoramax tile requests", estimate=estimate_panoramax_tile_count
+    ),
 }
 
 
@@ -235,6 +293,41 @@ def _cached_census_marker(city, provider: str, args) -> dict | None:
     if provider not in CENSUS_PROVIDERS or args.refetch_census:
         return None
     return census_cache_probe(provider, city.city_id, frozen_bbox(city))
+
+
+# Concurrency defaults, per provider rather than one GSV-sized number for all
+# four arms. gsv and mapillary keep the 50 they have always run at -- prod
+# configures exactly that for the Mapillary GRID channel over the same host, so
+# lowering the walk would make the pair disagree about one CDN.
+#
+# Panoramax is 5 because that is what ITS grid run uses: `cli.py` passes no
+# connection_limit for this provider, so the downloader's own default applies,
+# and a walk quietly holding ten times the sockets against a volunteer-run
+# instance with no documented rate limit, no `Retry-After` and no credential to
+# identify us is the one asymmetry here worth removing. The 30/min limiter
+# bounds the RATE either way; what this bounds is sockets held open while the
+# instance is slow, which is the failure mode an unmetered host shows first.
+GSV_WALK_CONNECTION_LIMIT = 50
+MAPILLARY_WALK_CONNECTION_LIMIT = 50
+PANORAMAX_WALK_CONNECTION_LIMIT = 5
+_WALK_CONNECTION_LIMITS = {
+    "gsv": GSV_WALK_CONNECTION_LIMIT,
+    "mapillary": MAPILLARY_WALK_CONNECTION_LIMIT,
+    "panoramax": PANORAMAX_WALK_CONNECTION_LIMIT,
+}
+
+
+def _walk_connection_limit(args, provider: str) -> int:
+    """An explicit --connection-limit, else this provider's own default.
+
+    Direct indexing, never `.get`: a provider arriving here unlisted is a
+    wiring bug, not a candidate for somebody else's number. Which is why it is
+    called from INSIDE each arm that takes one rather than once above the
+    chain -- kartaview's sweep is serial and has no such argument, so resolving
+    it for every provider made the one channel that needs no answer raise for
+    want of one.
+    """
+    return args.connection_limit or _WALK_CONNECTION_LIMITS[provider]
 
 
 def run_collect(args: argparse.Namespace) -> int:
@@ -352,8 +445,10 @@ def run_collect(args: argparse.Namespace) -> int:
         )
 
         # The provider and network-type tokens are what keep same-night walks
-        # apart. Both providers walk the SAME sample points and the scheduler
-        # runs them on one run_date; and one frozen bbox yields both a 'drive'
+        # apart. EVERY provider walks the same deterministic sample points and
+        # the scheduler runs them on one run_date -- there are four of them now,
+        # which is what turned this from a two-way collision into an n-way one;
+        # and one frozen bbox yields both a 'drive'
         # network and a much larger 'all_public' one. Without either token the
         # second collection would find the first's snapshot already on disk and
         # skip as a silent no-op reported as success.
@@ -474,7 +569,7 @@ def run_collect(args: argparse.Namespace) -> int:
                         out_csv,
                         city_label=city.display_name,
                         batch_size=args.batch_size,
-                        connection_limit=args.connection_limit,
+                        connection_limit=_walk_connection_limit(args, provider),
                         request_timeout=args.timeout,
                         max_retries=args.max_retries,
                         max_requests_per_minute=args.max_requests_per_minute,
@@ -488,10 +583,31 @@ def run_collect(args: argparse.Namespace) -> int:
                         config["access_token"],
                         out_csv,
                         match_dist_m=args.match_dist,
-                        connection_limit=args.connection_limit,
+                        connection_limit=_walk_connection_limit(args, provider),
                         request_timeout=args.timeout,
                         max_requests_per_minute=args.mapillary_max_requests_per_minute,
                         jitter=args.mapillary_jitter,
+                        checkpoint_path=checkpoint_path,
+                        checkpoint_channel=budget_channel,
+                        checkpoint_variant=args.network_type,
+                        census_cache=census_cache,
+                    )
+                )
+            elif provider == "panoramax":
+                dict_results = asyncio.run(
+                    collect_panoramax_street_samples_async(
+                        query_points,
+                        city,
+                        # NO TOKEN ARGUMENT. `config` was still loaded above and
+                        # holds access_token=None for this channel; passing it
+                        # would suggest a credential is being honoured when the
+                        # downloader has no parameter for one.
+                        out_csv,
+                        match_dist_m=args.match_dist,
+                        connection_limit=_walk_connection_limit(args, provider),
+                        request_timeout=args.timeout,
+                        max_requests_per_minute=args.panoramax_max_requests_per_minute,
+                        jitter=args.panoramax_jitter,
                         checkpoint_path=checkpoint_path,
                         checkpoint_channel=budget_channel,
                         checkpoint_variant=args.network_type,
@@ -709,8 +825,10 @@ def run_collect(args: argparse.Namespace) -> int:
             out_coverage,
             len(manifest["walks"]),
         )
-        # The any-imagery number only says something new for Mapillary; for GSV
-        # it is the 360° number by construction, so don't print it twice.
+        # The any-imagery number only says something new for a provider that
+        # publishes flat imagery too; for GSV it is the 360° number by
+        # construction, so don't print it twice. Tested by equality rather than
+        # by naming providers, so a new census arm needs no edit here.
         any_note = (
             ""
             if totals["coverage_pct_by_length_any"] == totals["coverage_pct_by_length"]
@@ -752,11 +870,12 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Imagery provider to walk (default: gsv). Each is metered against "
             "its own isolated street budget channel (gsv_streets / "
-            "kartaview_streets / mapillary_streets); gsv costs one request per "
-            "sample point, while mapillary reads a tile census and kartaview a "
-            "radius sweep — both priced by the city's bbox area, not by "
-            "spacing, and both free when the paired grid run already cached "
-            "that census. Use --estimate to price a city before spending."
+            "kartaview_streets / mapillary_streets / panoramax_streets); gsv "
+            "costs one request per sample point, while mapillary and panoramax "
+            "read a tile census and kartaview a radius sweep — all three priced "
+            "by the city's bbox area, not by spacing, and all three free when "
+            "the paired grid run already cached that census. Use --estimate to "
+            "price a city before spending."
         ),
     )
     parser.add_argument(
@@ -810,15 +929,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--refetch-census",
         action="store_true",
-        help="""Ask Mapillary again instead of reusing the census the grid run
-             (or the other --network-type) already fetched for this city and
-             bbox (issue #290). DELIBERATELY SEPARATE FROM --force: --force
+        help="""Ask the provider again instead of reusing the census the grid
+             run (or the other --network-type) already fetched for this city
+             and bbox (issue #290). A no-op for gsv, which has no census. DELIBERATELY SEPARATE FROM --force: --force
              clears this run date's artifacts, and a walk whose tail died after
              writing its CSV is re-run with --force and must re-finalize for
              zero requests rather than re-pay a census it already bought.""",
     )
     parser.add_argument("--batch-size", type=int, default=100)
-    parser.add_argument("--connection-limit", type=int, default=50)
+    # DEFAULTED PER PROVIDER, not here (see `_walk_connection_limit`): 50 is a
+    # GSV-sized number, and the flag is shared by four arms whose hosts are not.
+    parser.add_argument(
+        "--connection-limit",
+        type=int,
+        default=None,
+        help=(
+            "Max concurrent requests. Default is the provider's own: 50 for gsv "
+            f"and mapillary, {PANORAMAX_WALK_CONNECTION_LIMIT} for panoramax, "
+            "which is what its grid run already uses."
+        ),
+    )
     parser.add_argument("--timeout", type=float, default=30.0)
     parser.add_argument("--max-retries", type=int, default=3)
     parser.add_argument(
@@ -854,6 +984,34 @@ def build_parser() -> argparse.ArgumentParser:
             "cadence). Rate and daily volume were both falsified as the per-IP "
             "block trigger, so the metronomic request pattern is the axis under "
             "test (issue #292)"
+        ),
+    )
+    parser.add_argument(
+        "--panoramax-max-requests-per-minute",
+        type=int,
+        default=PANORAMAX_TILE_REQUESTS_PER_MINUTE,
+        help=(
+            "Client-side pacing cap for Panoramax tile requests "
+            f"(default: {PANORAMAX_TILE_REQUESTS_PER_MINUTE}); <= 0 disables "
+            "pacing. Its own flag, and the LOWEST tile pace in the repo: "
+            "Panoramax documents no rate limit and returns no "
+            "X-RateLimit-*/Retry-After header, so there is no ceiling to pace "
+            "against and the conservative number is the honest one. It is "
+            "volunteer-run infrastructure with no credential identifying us. "
+            "Half the Mapillary module's exported 60, though the margin against "
+            "what Mapillary actually RUNS at is smaller -- both Mapillary "
+            "channels are configured to 40 (#292) (issues #316, #331)"
+        ),
+    )
+    parser.add_argument(
+        "--panoramax-jitter",
+        type=jitter_fraction,
+        default=PANORAMAX_TILE_JITTER,
+        help=(
+            "Randomize the gap between Panoramax tile requests, the same "
+            "shifted-exponential shape and coefficient of variation as "
+            f"--mapillary-jitter (default: {PANORAMAX_TILE_JITTER}; 0 restores "
+            "an exact cadence)"
         ),
     )
     parser.add_argument(
@@ -894,7 +1052,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Today's FULL ceiling for this provider's street budget channel "
-            "(gsv_streets / kartaview_streets / mapillary_streets). Abort when "
+            "(gsv_streets / kartaview_streets / mapillary_streets / "
+            "panoramax_streets). Abort when "
             "the ledger's spend so far plus this collection's estimated "
             "requests would exceed it — pass the whole daily budget, not what "
             "is left of it"

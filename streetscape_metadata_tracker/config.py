@@ -208,6 +208,16 @@ CHANNEL_ENV_VARS: dict[str, tuple[str, ...]] = {
     # whose credential story is unusual would be the one provider CLAUDE.md
     # never mentions. Keep the row; document it as "none".
     "panoramax": (),
+    # And its road walk (issue #331), an empty tuple for the same reason and
+    # with one extra consequence. Its two sibling street channels exist to
+    # ISOLATE a quota two processes could burn in parallel; kartaview_streets
+    # already shows that a channel with no quota to isolate need not have its
+    # own token. Here there is no token at all, so the row says only what the
+    # grid channel's says -- and saying it is what keeps the walk inside
+    # CREDENTIAL_FREE_CHANNELS. Drop the row and `load_config` falls through to
+    # the final raise, so the one walk that needs no credential is the one walk
+    # that cannot start.
+    "panoramax_streets": (),
 }
 
 # Channels that need no credential at all, derived from the table above rather
@@ -226,9 +236,10 @@ def load_config(provider: str = "gsv") -> dict[str, Any]:
     Only the requested provider's credential is required, so a machine can
     run one provider without the other's key.
 
-    'panoramax' requires NOTHING and succeeds on any machine: its reads are
-    unauthenticated (issue #316). It is still a declared channel here rather
-    than an exception in the caller — see CREDENTIAL_FREE_CHANNELS.
+    'panoramax' and 'panoramax_streets' require NOTHING and succeed on any
+    machine: Panoramax reads are unauthenticated (issues #316, #331). They are
+    still declared channels here rather than an exception in the caller — see
+    CREDENTIAL_FREE_CHANNELS.
 
     'gsv_streets' and 'mapillary_streets' are ISOLATED credential channels for
     street-coverage collection (issue #99): separate keys so street-sampling

@@ -166,9 +166,9 @@ def checkpoint_path_for(
     nights and a run is dated on the day it COMPLETES, so a date in this path
     would make every night start from zero.
 
-    The CHANNEL is not optional, and it is what keeps the two channel PAIRS
-    apart: ('mapillary', 'mapillary_streets') and ('kartaview',
-    'kartaview_streets'). A road walk sweeps the same frozen bbox with the same
+    The CHANNEL is not optional, and it is what keeps the three channel PAIRS
+    apart: ('mapillary', 'mapillary_streets'), ('kartaview',
+    'kartaview_streets') and ('panoramax', 'panoramax_streets') (#331). A road walk sweeps the same frozen bbox with the same
     geometry the grid run uses, so every geometric validation a loader makes
     would pass and the two channels would resume each other's crawls -- into
     different ledgers, and for Mapillary under different credentials. Each
@@ -199,8 +199,11 @@ def checkpoint_path_for(
     Args:
         city_id: canonical catalog slug.
         bbox: the frozen grid's (min_lon, min_lat, max_lon, max_lat).
-        channel: the collecting channel's name -- 'mapillary' or 'kartaview' for
-            a grid run, 'mapillary_streets' or 'kartaview_streets' for a walk.
+        channel: the collecting channel's name -- the grid half of one of the
+            three pairs ('mapillary', 'kartaview', 'panoramax') or its walk
+            ('mapillary_streets', 'kartaview_streets', 'panoramax_streets').
+            Kept in step with the paragraph above, which is the list a reader
+            checks this against.
         variant: what distinguishes two crawls of one city within one channel,
             or None when the channel is the whole key. Today that is a walk's
             ``--network-type``; a grid run has exactly one crawl per channel and

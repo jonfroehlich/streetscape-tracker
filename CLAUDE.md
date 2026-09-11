@@ -23,7 +23,7 @@ The tool samples a geographic grid around a city center, queries each provider's
 | GSV | [Street View Static API usage & billing](https://developers.google.com/maps/documentation/streetview/usage-and-billing) + the API's own docs | Google Maps Platform issue tracker; Stack Overflow `google-street-view` tag |
 | KartaView | No developer portal: the single documented figure (100/h anonymous, 1,000/h authenticated) sits in a JS-SPA FAQ, restated by [Bellingcat's toolkit](https://bellingcat.gitbook.io/toolkit/more/all-tools/kartaview) | **None exists** — the `kartaview/openstreetcam.org` tracker is unstaffed, so for this provider there is no early warning at all; pace on the documented number and stage volume changes |
 | Mapillary | [API documentation](https://www.mapillary.com/developer/api-documentation), incl. its rate-limits section | [forum.mapillary.com](https://forum.mapillary.com) — **not optional**: Mapillary's real operational limits are undocumented and described only there |
-| Panoramax | [API docs](https://panoramax.fr) and the OpenAPI spec at `api.panoramax.xyz/openapi.json` — **neither documents any rate limit**, and no `X-RateLimit-*`/`Retry-After` header comes back | [forum.geocommuns.fr](https://forum.geocommuns.fr) and the [OSM community forum](https://community.openstreetmap.org/), both staffed by core developers — so unlike KartaView the pacing question CAN be asked; it has not been (#316), which is why the pace is deliberately half Mapillary's |
+| Panoramax | [API docs](https://panoramax.fr) and the OpenAPI spec at `api.panoramax.xyz/openapi.json` — **neither documents any rate limit**, and no `X-RateLimit-*`/`Retry-After` header comes back | [forum.geocommuns.fr](https://forum.geocommuns.fr) and the [OSM community forum](https://community.openstreetmap.org/), both staffed by core developers — so unlike KartaView the pacing question CAN be asked; it has not been (#316), which is why the pace is the lowest tile rate in the repo, 30/min — half the Mapillary MODULE's exported 60, though both Mapillary channels actually RUN at 40, so the real margin is 25% |
 
 **The documented limit is not necessarily the binding one, and the forum is where you learn that.**
 The 2026-08-12 case study: an undocumented per-IP throttle (302 → login) blocked both our Mapillary apps at ~21% of the documented per-app daily cap, and a forum thread had already described that exact failure, its per-IP scope, and its retry hazard before we sustained 370 req/min into it.
@@ -52,6 +52,7 @@ python -m streetscape_street_analyzer.collect "Seattle, WA" --estimate      # co
 python -m streetscape_street_analyzer.collect "Seattle, WA" --spacing 15
 python -m streetscape_street_analyzer.collect "Seattle, WA" --provider mapillary
 python -m streetscape_street_analyzer.collect "Seattle, WA" --provider kartaview   # free on a paired night (#290 cache)
+python -m streetscape_street_analyzer.collect "Paris, Ile-de-France, France" --provider panoramax  # no credential; z15 tile census (#331)
 python -m streetscape_street_analyzer.collect "Seattle, WA" --network-type all_public   # a SEPARATE walk series, not a replacement
 
 # Worldwide sampling frame (docs/worldwide_sampling.md)
@@ -121,7 +122,8 @@ Credentials live in `.env`, loaded per channel by `streetscape_metadata_tracker/
 | `gsv_streets` | `GMAPS_STREETS_API_KEY` | Isolated street-collection key (#99) with its own `api_usage` string, so street experiments can't exhaust production quotas; **live** |
 | `kartaview_streets` | `KARTAVIEW_STREETS_ACCESS_TOKEN` | The one street channel that **falls back to `KARTAVIEW_ACCESS_TOKEN`** rather than requiring its own: one machine-wide `host_lock(HOST_KARTAVIEW)` serializes every KartaView request, so there is no parallel burn to isolate. Scheduled and **opt-in**, enrolled SEPARATELY from `kartaview` (#258) |
 | `mapillary_streets` | `MAPILLARY_STREETS_ACCESS_TOKEN` | Same isolation; **dormant** |
-| `panoramax` | none — unauthenticated read | The only credential-free channel (#316): `CHANNEL_ENV_VARS["panoramax"]` is an **empty tuple**, not a missing row, and `load_config` returns `{"access_token": None}` rather than raising — a channel that raised for a key it does not have would take down every other provider in the same `--provider all` invocation |
+| `panoramax` | none — unauthenticated read | Credential-free (#316): `CHANNEL_ENV_VARS["panoramax"]` is an **empty tuple**, not a missing row, and `load_config` returns `{"access_token": None}` rather than raising — a channel that raised for a key it does not have would take down every other provider in the same `--provider all` invocation |
+| `panoramax_streets` | none — unauthenticated read | The road walk (#331), credential-free for the same reason and an empty tuple for the same one. Its two siblings isolate a QUOTA; here there is no token to isolate, so what the channel buys is the LEDGER row alone — which is still what keeps a walk's tiles off the grid channel's daily budget. Runnable by hand; **not a scheduler channel** |
 
 A run requires EVERY named provider's key up-front, `--provider all` included (fail-fast so the series can't drift); a single-provider run needs only its own key.
 A credential-free channel is the one exception and is declared rather than special-cased (`config.CREDENTIAL_FREE_CHANNELS`, derived from the table above).
@@ -165,7 +167,7 @@ It is columnar (a memory contract, #157), pinned byte-identical by a golden fixt
 Three Panoramax rules that must survive without a read (#316):
 
 - **The census is the v1 `pictures` layer at z15, never `/api/search`** — search does not paginate, reports no `numberMatched` and SILENTLY IGNORES its own `datetime` filter (measured: 5,045 pictures that the requested windows should have excluded all came back), so an incremental fetch built on it would re-read the whole history and report it as new.
-  z15 is the coarsest zoom that serves the layer at all, so a bbox costs ~4x Mapillary's tiles; the shared `tiles_for_bbox` therefore takes zoom as a REQUIRED argument and each provider re-exposes it with its own default.
+  z15 is the coarsest zoom that serves the layer at all, so a bbox costs up to ~4x Mapillary's tiles (the asymptote; 2.9x at the catalog median); the shared `tiles_for_bbox` therefore takes zoom as a REQUIRED argument and each provider re-exposes it with its own default.
   The standing growth screen (#316) reads a DIFFERENT instrument — the v2 `grid` layer at z6, hexagons larger than the cities inside them — so its numbers are upper bounds and never coverage; `hexes_from_tile` takes zoom as a required argument for the same reason.
 - **A 403 or 429 is a per-IP refusal, and a 404 is an EMPTY TILE** — there is no credential, so 403 cannot mean a rejected token; and an empty area answers 200 with no layer, so a 404 means the tile holds nothing.
   A lattice where EVERY tile 404s is therefore a moved endpoint, and is refused rather than published as a city that lost all its imagery.
@@ -247,7 +249,10 @@ Dated copies go through SQLite's online backup API to a per-writer staging file,
 The second active collection modality beside the grid: walk each frozen OSM edge, sample every `--spacing` m, query the provider per sample — association by construction, coverage fractional per edge.
 **A sample counts as covered when its status is PRESENT — `OK` *or* `NO_DATE`, never `OK` alone** (`analysis.PRESENT_STATUSES`, the grid's vocabulary): an undated pano still covers, it just ages nothing — and undated imagery arrives in batches, so the per-run MAX is the number that matters, not the pooled share (#251, #257).
 **Grid coverage and street coverage are different denominators and never substitute for each other** (Seattle: 54.3% grid vs 98.4% street), and each `--network-type` is its own series with its own denominator, never a replacement for another.
-Mapillary walks the same deterministic sample points via a tile census joined locally, so its cost tracks bbox **area**, not sample count or spacing.
+**Every census provider — Mapillary, KartaView, Panoramax — walks the same deterministic sample points via ONE census joined locally**, so its cost tracks bbox **area**, not sample count or spacing, and is 0 on a paired night (#290).
+That join lives once in `streetscape_street_analyzer/census_walk.py`, parameterized by a `CensusWalkSpec` of exactly three bindings (the date rule and the two row-schema builders); a fourth binding would be a claim that the JOIN differs between providers, which is what the module exists to deny.
+Reuse the provider's grid-run date function rather than rewriting it, or one city's grid and street artifacts disagree about the same picture.
+`panoramax` is the third caller (#331) and is runnable by hand only — it has no scheduler channel yet (#316 phase 2).
 Artifact names carry the provider token, and per-network ones the network token — generators in `naming.py` only.
 
 **Google's driving plan → [`docs/driving-plan.md`](docs/driving-plan.md).**
