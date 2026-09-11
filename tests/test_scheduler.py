@@ -6590,8 +6590,12 @@ def test_a_mapillary_cap_is_sized_to_its_own_pace_not_the_radius_sweeps(conn):
     `.get(channel)` precisely so a channel with no `[providers.*]` block still
     prices.
 
-    Pinned as the round trip rather than as an arithmetic literal: whatever the
-    constants become, the two directions have to agree.
+    Pinned as arithmetic literals ON PURPOSE, and it is the weaker half of the
+    pair: retuning a fraction has to come here and edit these numbers, which is
+    the point -- 0.8 and 0.5 are decisions, and a test that recomputed them
+    from the constants would ratify whatever they became. The invariant that
+    survives a retune untouched is the ROUND TRIP, pinned in
+    `test_the_two_timeout_directions_round_trip_through_one_pricing_row`.
     """
     from streetscape_metadata_tracker.download_kartaview import (
         DEFAULT_SWEEP_REQUESTS_PER_MINUTE,
@@ -6632,6 +6636,49 @@ def test_a_mapillary_cap_is_sized_to_its_own_pace_not_the_radius_sweeps(conn):
     assert (
         _sweep_requests_within_timeout(timeout_s, "mapillary_streets", None)
         == 60 * DEFAULT_TILE_REQUESTS_PER_MINUTE * 0.8
+    )
+
+
+def test_the_two_timeout_directions_round_trip_through_one_pricing_row(conn, monkeypatch):
+    """Forward then inverse must return the request count they started from.
+
+    `_mapillary_timeout_seconds` prices a wall-clock from a tile count;
+    `_sweep_requests_within_timeout` prices a request cap back out of that
+    wall-clock. Composing them cancels the rate and the fraction entirely, so
+    what is left is `tiles x _TIMEOUT_HEADROOM` -- the headroom deliberately
+    not divided out, because a cap already bounds retries.
+
+    THE CANCELLATION IS THE TEST. It holds only while both directions read the
+    same row, which is why retuning the fraction under the test must not move
+    it: the row landed with only the INVERSE consulting it, and the forward
+    functions spelling their own rate and fraction out, so the 1.6x divergence
+    the row exists to remove could be reintroduced from the forward side with
+    the entire suite green. Here that mutation breaks the identity.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    city = db.resolve_city(
+        conn, _register_at(conn, "Anchorage", 61.2, -149.9, width=105588, height=83676)
+    )
+    tiles = sched.estimate_requests(city, "mapillary")
+    assert tiles > 0
+
+    def round_trip(pc):
+        timeout_s = sched._mapillary_timeout_seconds(city, "mapillary", pc, floor=0)
+        return sched._sweep_requests_within_timeout(timeout_s, "mapillary", pc)
+
+    expected = tiles * sched._TIMEOUT_HEADROOM
+    assert round_trip(ProviderConfig(max_requests_per_minute=40)) == pytest.approx(
+        expected, rel=0.001
+    )
+    # ...and unconfigured, where the row's own default_rate is the live term.
+    assert round_trip(None) == pytest.approx(expected, rel=0.001)
+
+    # Retune the fraction: a number BOTH directions read cancels out, so the
+    # identity is untouched. A forward function holding its own copy fails here.
+    monkeypatch.setattr(sched, "_TILE_ACHIEVED_RATE_FRACTION", 0.3)
+    assert round_trip(ProviderConfig(max_requests_per_minute=40)) == pytest.approx(
+        expected, rel=0.001
     )
 
 
@@ -6681,6 +6728,53 @@ def test_a_mapillary_walk_defers_behind_its_grid_siblings_in_flight_crawl(
     )
     assert plan.skip == _SWEEP_SKIP_SIBLING
     assert "mapillary has an in-flight checkpoint" in plan.message
+
+
+def test_an_aged_checkpoint_does_not_refuse_a_crawl_that_will_spend_nothing(
+    conn, tmp_path, monkeypatch
+):
+    """The age wall is the one skip that RECORDS A FAILURE, so it is the one
+    that must not fire on a free reuse.
+
+    Three things have to be true at once, and #318 made all three ordinary. The
+    census is in the shared cache, so `est` is 0 and the projection with it. The
+    ledger is OVER its budget, because a capped crawl lets the tiles already in
+    flight finish their retries -- so `remaining` is negative rather than 0.
+    And the channel's own checkpoint is near the wall. `projected > request_cap`
+    is then `0 > -200`: true, and the city takes a consecutive_failure for
+    declining to spend anything. Five of those quarantine it for a 90-day cycle,
+    and nothing about the night looks wrong.
+    """
+    from streetscape_metadata_tracker.scheduler import _SWEEP_SKIP_AGE_WALL, _sweep_launch_plan
+
+    city = _checkpointed_city(
+        conn, tmp_path, monkeypatch, roots_done=3, root_count=800, days_old=6.5, channel="mapillary"
+    )
+    plan = _sweep_launch_plan(
+        _sweep_cfg(),
+        city,
+        "mapillary",
+        conn,
+        est=0,
+        remaining=-200,
+        remaining_s=None,
+        city_channels=["mapillary"],
+    )
+    assert plan.skip != _SWEEP_SKIP_AGE_WALL, "a crawl priced at 0 cannot throw a night away"
+
+    # ...and the arm still fires for the crawl it was written for: same aged
+    # checkpoint, same negative remainder, a census that must actually be paid.
+    refused = _sweep_launch_plan(
+        _sweep_cfg(),
+        city,
+        "mapillary",
+        conn,
+        est=400,
+        remaining=-200,
+        remaining_s=None,
+        city_channels=["mapillary"],
+    )
+    assert refused.skip == _SWEEP_SKIP_AGE_WALL
 
 
 def test_an_unknown_channel_is_a_keyerror_not_a_default():
@@ -7735,6 +7829,35 @@ def test_sweep_progress_reads_a_tile_census_record_not_only_a_radius_sweeps(
     # Unreadable is still None, and still without raising: one caller is a
     # launch gate and the other reports on a night that already succeeded.
     assert sweep_progress(str(tmp_path / "nothing-here")) is None
+
+
+def test_an_unrecognised_checkpoint_layout_says_so_instead_of_guessing(tmp_path, caplog):
+    """The tile arm is reached by NAME, not as the fall-through `else`.
+
+    A third provider's layout hitting an `else` that assumes "tiles" raises
+    KeyError on `tile_count`, which the best-effort `except` swallows into None
+    -- the same fail-quiet as the test above, arriving after it was fixed, and
+    invisible in exactly the same way. The answer is still None, because no
+    caller may be broken by this function; what must not be silent is that the
+    answer is "I could not read it" rather than "there is nothing here".
+    """
+    import json
+
+    from streetscape_metadata_tracker.checkpointing import _state_path, sweep_progress
+
+    path = str(tmp_path / "crawl")
+    os.makedirs(path, exist_ok=True)
+    with open(_state_path(path), "w", encoding="utf-8") as f:
+        json.dump(
+            {"hex_count": 12, "hexes_done": ["a", "b"], "created_at": "2026-09-01T00:00:00+00:00"},
+            f,
+        )
+
+    with caplog.at_level(logging.WARNING):
+        assert sweep_progress(path) is None
+    assert [r for r in caplog.records if "unrecognised checkpoint layout" in r.getMessage()], (
+        "a layout nobody taught it about has to reach an operator"
+    )
 
 
 def test_a_resumable_walk_names_its_grid_sibling(conn):
@@ -10154,12 +10277,66 @@ def test_a_free_cached_walk_on_a_spent_budget_is_launched_without_a_cap(conn):
         assert _request_cap_args(flag, 1) == [flag, "1"]
 
 
-def test_each_tile_census_prices_its_launch_floor_from_its_own_retry_budget(conn):
+def test_each_tile_census_prices_its_launch_floor_from_its_own_retry_budget(monkeypatch):
     """Both are 5 today, which is what makes a shared constant latent rather
     than wrong -- and exactly how it would survive until one provider's retry
-    budget was retuned and the other's floor silently followed it."""
+    budget was retuned and the other's floor silently followed it.
+
+    WHICH IS WHY THIS RETUNES ONE. Asserting `launch_floor ==
+    download_panoramax.TILE_MAX_TRIES` is satisfied by ANY wiring while both
+    constants read 5: the row was written with Mapillary's constant once, and
+    this test -- named for that defect -- passed with it in place, as did the
+    other 2,301. Moving one provider's number and watching only that
+    provider's floor follow is the only form of this that can fail, and it
+    works only because the row resolves the module attribute when it is built
+    rather than freezing an alias at import.
+    """
     from streetscape_metadata_tracker import download_mapillary, download_panoramax
     from streetscape_metadata_tracker.scheduler import _crawl_pricing
 
     assert _crawl_pricing("mapillary").launch_floor == download_mapillary.TILE_MAX_TRIES
     assert _crawl_pricing("panoramax").launch_floor == download_panoramax.TILE_MAX_TRIES
+
+    monkeypatch.setattr(download_panoramax, "TILE_MAX_TRIES", 7)
+    assert _crawl_pricing("panoramax").launch_floor == 7, "reads Panoramax's own constant"
+    assert _crawl_pricing("mapillary").launch_floor == download_mapillary.TILE_MAX_TRIES, (
+        "and Mapillary's floor does not follow it"
+    )
+
+    monkeypatch.setattr(download_mapillary, "TILE_MAX_TRIES", 9)
+    assert _crawl_pricing("mapillary").launch_floor == 9
+    assert _crawl_pricing("panoramax").launch_floor == 7
+
+
+def test_each_tile_census_prices_its_pace_from_its_own_default_rate(monkeypatch):
+    """The other half of the row, and the half with a LIVE difference.
+
+    Panoramax paces at half Mapillary's rate on purpose -- nobody has asked the
+    forum what the instance will tolerate, so the default is deliberately
+    conservative (#316). A row wired to Mapillary's 60 would hand the eventual
+    launch arm twice the pace that decision chose, and `default_rate` is only
+    read when the channel has no `[providers.*]` block, which is exactly the
+    state a newly wired provider is in.
+    """
+    from streetscape_metadata_tracker import download_mapillary, download_panoramax
+    from streetscape_metadata_tracker.scheduler import _crawl_pricing
+
+    assert (
+        download_panoramax.DEFAULT_TILE_REQUESTS_PER_MINUTE
+        != download_mapillary.DEFAULT_TILE_REQUESTS_PER_MINUTE
+    ), "the two defaults must differ or this test pins nothing"
+    assert (
+        _crawl_pricing("panoramax").default_rate
+        == download_panoramax.DEFAULT_TILE_REQUESTS_PER_MINUTE
+    )
+    assert (
+        _crawl_pricing("mapillary").default_rate
+        == download_mapillary.DEFAULT_TILE_REQUESTS_PER_MINUTE
+    )
+
+    monkeypatch.setattr(download_panoramax, "DEFAULT_TILE_REQUESTS_PER_MINUTE", 17)
+    assert _crawl_pricing("panoramax").default_rate == 17
+    assert (
+        _crawl_pricing("mapillary").default_rate
+        == download_mapillary.DEFAULT_TILE_REQUESTS_PER_MINUTE
+    )

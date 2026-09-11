@@ -448,7 +448,22 @@ def run_collect(args: argparse.Namespace) -> int:
                 "mapillary": getattr(args, "mapillary_max_requests", None),
             }.get(provider)
             gated_requests = min(estimated_requests, cap) if cap is not None else estimated_requests
-            if already + gated_requests > args.daily_budget:
+            # `gated_requests > 0` FIRST, because a collection that spends
+            # nothing cannot exceed anything -- and the ledger legitimately
+            # sits OVER the budget by the time this runs. A cap is a soft
+            # ceiling: the tiles already in flight when it trips finish their
+            # retries, so a capped night ends up to
+            # `connection_limit * (TILE_MAX_TRIES - 1)` over (#318). Without
+            # this term the arithmetic refuses exactly the walk the pairing
+            # exists for -- census already in the shared cache, estimate 0 --
+            # with exit 1, a real consecutive_failure.
+            #
+            # The scheduler half of this was fixed once already: `est == 0`
+            # floors the request cap at 1 rather than dropping it, precisely so
+            # the free collection is LAUNCHED. It reached a child that then
+            # refused it, which is why both halves are stated here and in
+            # `_sweep_launch_plan`.
+            if gated_requests > 0 and already + gated_requests > args.daily_budget:
                 logger.error(
                     "%s daily budget %d would be exceeded: %d already spent "
                     "+ %d estimated requests%s. Aborting.",

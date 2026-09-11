@@ -1220,6 +1220,43 @@ def test_the_budget_preflight_does_not_abort_a_free_walk(tmp_path, monkeypatch):
     assert collect.run_collect(_args(data_dir, **{"daily-budget": 0})) == 0
 
 
+def test_the_budget_preflight_does_not_abort_a_free_walk_over_an_overspent_ledger(
+    tmp_path, monkeypatch
+):
+    """The ledger is legitimately OVER the budget when this walk is launched.
+
+    A cap is a soft ceiling (#318): the tiles already in flight when it trips
+    finish their retries, so a capped grid sweep ends up to
+    `connection_limit * (TILE_MAX_TRIES - 1)` -- 200 at prod's 50 -- past the
+    number it was given. The paired walk then runs against a ledger reading
+    MORE than `--daily-budget`, and it is exactly the walk that costs nothing,
+    because the sweep that overspent is the one that filled its census cache.
+
+    Gating on `already + 0 > budget` refuses it with exit 1, a real
+    consecutive_failure; five quarantine the channel for a 90-day cycle. The
+    scheduler half floors a zero cap at 1 so the launch happens at all, so a
+    child that then refuses it puts the two halves back in contradiction.
+    """
+    images = [_image("p1", 44.05, -121.30)]
+    data_dir, _ = _setup(tmp_path, monkeypatch, images, api_requests=0, api_requests_total=0)
+    conn = db.connect(db.get_default_db_path(data_dir))
+    city = db.resolve_city(conn, CITY_QUERY)
+    bbox = grid_bbox(
+        city.center_lat, city.center_lon, city.grid_width_m, city.grid_height_m, city.step_m
+    )
+    # 200 over a budget of 1,750: the documented residue of one capped night.
+    db.add_api_usage(conn, date.fromisoformat(RUN_DATE), 1950, provider="mapillary_streets")
+    conn.close()
+
+    # The gate is relaxed only for a walk that spends NOTHING, so the uncached
+    # walk against that same overspent ledger is still refused.
+    uncached = collect.run_collect(_args(data_dir, **{"daily-budget": 1750}))
+    assert uncached == 1, "an overspent ledger still refuses a census that costs something"
+
+    _stamp_cache_entry(census_cache_path_for("mapillary", CITY_ID, bbox))
+    assert collect.run_collect(_args(data_dir, **{"daily-budget": 1750})) == 0
+
+
 def _stamp_cache_entry(cache_path, *, fetched_by="mapillary"):
     """A marker-only cache entry — what `census_cache_probe` reads."""
     return stamp_census_cache(cache_path, "mapillary", fetched_by=fetched_by)

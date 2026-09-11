@@ -253,7 +253,8 @@ Both times that fired in the six nights 2026-08-30..09-04 it was an end-of-night
 Folding the two together would make one of the two exit codes wrong whichever way it went.
 It inherits the abort's position but **not** its bound, and the difference is a reservation: a tile that clears the check adds its request to the running total before releasing control, so the cap is not overshot at all in the ordinary case.
 Without that, every task the semaphore admits clears a check reading a stale `api_requests` and only then queues on the rate limiter — `connection_limit − 1` requests over the cap on every capped night.
-That is not a small residual: `connection_limit` is **50** in production (`config/scheduler.makelab1.toml`), not the argparse default of 5, so the figure to reason with is 49 and never "25 at the defaults" — no scheduled run uses the defaults.
+That is not a small residual: `connection_limit` is **50** in production (`config/scheduler.makelab1.toml`), not the argparse default of 5, so the figure to reason with is 49 and never the 4 the argparse default of 5 would give — no scheduled run uses the defaults.
+(25 is neither quantity: it is `connection_limit × TILE_MAX_TRIES`, the pre-reservation bound on the OTHER residue, which this sentence is not about.)
 It was measured on this code with a fetch that actually awaits (cap 200 at `connection_limit` 50 spent 249) and is now pinned by `test_the_cap_is_not_overshot_by_the_tasks_already_in_flight`, which needs a limiter with a real suspension point in it to see anything at all.
 What remains is retries by tiles already in flight, at most `connection_limit × (TILE_MAX_TRIES − 1)`, and that part is documented on the flag rather than engineered away — stopping requests already in flight would mean cancelling a paced, retrying fetch mid-attempt, and would cost the guarantee that every request we made was counted.
 
@@ -266,12 +267,15 @@ The promotion predicate also gained the completeness term (`done | failed == til
 **With no usable checkpoint the same stop is a plain `DownloadError`, not a pause.**
 Exit 83 tells an operator "this made progress, run it again", and with nothing to resume from that re-run spends the same requests and stops in the same place — forever, with the spend in the ledger and no run in the catalog.
 So a cap passed without a checkpoint *path* is refused up front as a caller bug (both fall-backs are wrong in a way nothing downstream could see: ignoring the cap silently overspends a per-IP budget, honouring it silently burns one), and a checkpoint that came back `None` or latched `degraded` at runtime takes the plain-error arm.
+**That refusal is the TILE CENSUSES' rule, not a rule of `max_requests`** — KartaView documents and supports the same pairing (`download_kartaview.sweep_city_images`, `max_requests` with `checkpoint_path=None`), where an uncheckpointed stop leaves the rest of the bbox unmeasured and the failed-area check then refuses to finalize, which is a guard the tile censuses do not have.
+Read the refusal as "this collector cannot make an uncheckpointed cap safe", never as "a cap implies a checkpoint everywhere".
 
 **Both Mapillary channels flip together, and that is not tidiness.**
 `_sweep_launch_plan`'s sibling arm — the one that stops a walk sweeping a lattice its grid sibling is mid-way through — is asked only of a RESUMABLE street channel.
 Flip the grid alone and the first night its census pauses leaves a *checkpoint*, not a cache entry, so the walk prices at full, takes the old all-or-nothing gates, and crawls the identical z14 lattice a second time against the same per-IP host for an observation the cache would hand it free once the grid finished (#290).
 
-**`panoramax` gets the collector-side cap and stays `False`**, and the reason MOVED rather than persisted: it is no longer "nothing for a cap to stop" but "nothing forwards one" — the channel is in `UNWIRED_CHANNELS` and `_collect_cmd` has no arm for it.
+**`panoramax` gets the collector-side cap and stays `False`**, and the reason MOVED rather than persisted: it is no longer "nothing for a cap to stop" but "nothing forwards one" — the channel is in `UNWIRED_CHANNELS` and the grid argv, built inline in `_run_one_city`, has no arm for it.
+(There is no `_collect_cmd` to read: only the walk's argv is factored out, as `_street_collect_cmd`.)
 Flip it in the same commit that adds that arm.
 
 ## The census cache — fetch once per (provider, bbox), reuse across channels (issue #290)

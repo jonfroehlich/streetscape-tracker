@@ -719,7 +719,12 @@ def sweep_progress(checkpoint_path: str | None) -> dict | None:
 
     Best-effort and total: every failure is None, because a caller reporting on
     a night that already succeeded in its own terms must never be the thing that
-    breaks it.
+    breaks it. That posture is exactly why the layout branch below names the two
+    shapes it knows and REFUSES a third rather than falling through to the tile
+    arm: swallowed by this `except`, an unrecognised layout is indistinguishable
+    from "no checkpoint", and a provider whose progress silently reads as absent
+    loses the age wall without anything logging that it did. It still answers
+    None for one -- the contract holds -- but it says so first.
     """
     if checkpoint_path is None:
         return None
@@ -730,7 +735,7 @@ def sweep_progress(checkpoint_path: str | None) -> dict | None:
             unit_name = SWEEP_UNIT_ROOT_CELLS
             unit_count = int(state["root_count"])
             units_done = int(state["roots_done"])
-        else:
+        elif "tile_count" in state:
             # A tile census records the tiles it committed rather than a count,
             # because `done_tiles` is also what the resume subtracts from the
             # lattice -- so the count is derived from the list rather than
@@ -738,6 +743,26 @@ def sweep_progress(checkpoint_path: str | None) -> dict | None:
             unit_name = SWEEP_UNIT_TILES
             unit_count = int(state["tile_count"])
             units_done = len(state["done_tiles"])
+        else:
+            # A THIRD shape is not a tile census, and an `else` that assumed it
+            # was would reproduce the exact fail-quiet #318 fixed: the KeyError
+            # on `tile_count` lands in the best-effort `except` below, this
+            # answers None, and every caller reads None as "no checkpoint". The
+            # age wall then never fires for the new provider, silently, which is
+            # the one arm nothing else can see the absence of.
+            #
+            # LOGGED, then None -- not raised. The contract above is that no
+            # caller is ever broken by this function, and an unreadable
+            # checkpoint genuinely is "no progress I can report"; what was
+            # missing is any trace that the answer was a guess. A warning naming
+            # the keys is the difference between a provider whose age wall is
+            # off for a cycle and one an operator can grep for on night one.
+            logger.warning(
+                "unrecognised checkpoint layout at %s (keys: %s); reporting no progress",
+                checkpoint_path,
+                ", ".join(sorted(state)[:6]) or "none",
+            )
+            return None
         started = state.get("created_at")
         age_s = (
             None

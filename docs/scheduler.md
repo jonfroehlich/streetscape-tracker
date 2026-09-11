@@ -265,7 +265,7 @@ Adding a resumable provider means adding its layout there, not only its flag to 
 The property is declared as data, not as `provider == "kartaview"`: `CHANNEL_RESUMABLE` means "accepts a request cap that pauses and checkpoints rather than failing".
 That is a stronger claim than "checkpoints", and it is why both Mapillary channels were `False` for the whole of #256 — the census resumed after an interruption it did not *choose*, but `download_mapillary` took only a pacing knob and had no number to stop itself at.
 #318 gave it one, so both flip.
-**`panoramax` is the instructive `False`**: its downloader has the identical cap since #318, and what keeps it out is that `_collect_cmd` has no arm to forward one — a `True` nothing downstream reads is exactly the fail-open the table exists to prevent.
+**`panoramax` is the instructive `False`**: its downloader has the identical cap since #318, and what keeps it out is that the grid argv built inline in `_run_one_city` has no arm to forward one — a `True` nothing downstream reads is exactly the fail-open the table exists to prevent.
 Flip it in the same commit that adds the launch arm.
 
 Each walk is `True` beside its grid run because it reads the same census by the same crawl, so its `--daily-budget` is a gate priced from an estimate rather than a ceiling on what the crawl spends; `_street_collect_cmd` passes **both** flags, and they are not redundant — the budget is the full ceiling the collector subtracts today's spend from itself, the cap arrives already subtracted.
@@ -277,6 +277,11 @@ Inverting one channel's clock with the other's constants under-prices a Mapillar
 By how much depends on whether the channel is configured, and the two answers are far apart: with prod's `[providers.mapillary] max_requests_per_minute = 40` the configured rate is used on both sides, so only the fraction was wrong (40 × 0.5 = 20 against 40 × 0.8 = 32, **1.6×**); with no block at all the default is wrong too (16 × 0.5 = 8 against 60 × 0.8 = 48, **6×**).
 An earlier telling of this said "roughly fourfold at the shipped rates", which is the one case where it is 1.6× — the figure came from pairing KartaView's *default* 16/min with Mapillary's *configured* 40/min, two branches the function never takes together.
 The four numbers that size a resumable launch (default rate, achieved fraction, launch floor, and what that floor buys) therefore live in ONE row per provider (`_CRAWL_PRICING`), so the two directions cannot disagree; an unpriced resumable channel is a `KeyError`, the same posture `CHANNEL_RESUMABLE` takes.
+
+**A resumable channel reached at the very end of a night now defers instead of launching.**
+The clock term holds `_TIMEOUT_FIXED_SLACK_S` back for process startup and the checkpoint write, so once the deadline clamp puts a city's timeout under that, the requests the clock affords is 0, the cap is 0, and the launch-floor arm defers.
+Before #318 the same city launched under a short clamped timeout and was usually SIGKILLed by it — which loses the ledger write and counts a `consecutive_failure`, where the deferral costs neither and the city stays due.
+It is the better trade and it is also a live behaviour change on the busiest channel: expect the tail of a long night to show `deferred (0 req under the launch floor)` where it used to show a killed child.
 
 **Deferral and a final skip are different things and must stay different.**
 A budget skip, a breaker skip and a stop are decisions: the channel leaves the pending list and is never reconsidered tonight.

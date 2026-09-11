@@ -1546,7 +1546,7 @@ async def _fetch_city_images(
                 # connection_limit * (TILE_MAX_TRIES - 1). Prod runs
                 # connection_limit 50 (config/scheduler.makelab1.toml), NOT the
                 # argparse default of 5, so state that residue as 200 and never
-                # as "25 at the defaults" -- no scheduled run uses the defaults.
+                # as "20 at the defaults" -- no scheduled run uses the defaults.
                 #
                 # It is a soft ceiling on purpose: stopping requests already in
                 # flight would mean cancelling a paced, retrying fetch
@@ -1663,6 +1663,15 @@ async def _fetch_city_images(
     # dated snapshot, diffing against its predecessor as "every pano in the rest
     # of the city removed". Nothing below this line can tell the two apart, so
     # nothing below this line ever sees a capped crawl.
+    #
+    # WHICH ALSO MEANS the settle loop's MAX_FAILED_TILE_FRACTION check does not
+    # run on a capped night -- worth stating, because "nothing below this line"
+    # reads as a pure safety property and it is a trade. Here it costs nothing:
+    # the only night that is NOT capped is one that attempted every tile still
+    # outstanding, so that night's `failed_tiles` is the whole city's unmeasured
+    # set and the tolerance sees it in full. The same sentence is NOT free in
+    # download_panoramax, whose moved-endpoint guard sits in the same stretch
+    # with no such final night to fall back on -- see the note there.
     if capped:
         committed = len(checkpoint.done) if checkpoint is not None else 0
         detail = (

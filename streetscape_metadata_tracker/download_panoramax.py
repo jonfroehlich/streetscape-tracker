@@ -1362,7 +1362,7 @@ async def _fetch_city_images(
                 # so the cap is not overshot at all in the ordinary case; what
                 # remains is RETRIES BY TILES ALREADY IN FLIGHT, at most
                 # connection_limit * (TILE_MAX_TRIES - 1) -- 200 at prod's
-                # connection_limit of 50, never "25 at the defaults", since no
+                # connection_limit of 50, never "20 at the defaults", since no
                 # scheduled run uses the argparse default of 5.
                 #
                 # It is a soft ceiling on purpose: stopping requests already in
@@ -1548,6 +1548,19 @@ async def _fetch_city_images(
     # tiles alone and publish a partial city as a complete one. Two is the bar
     # because a single 404 is a hole worth one tile while two, against a
     # measured baseline of zero in 3,321 requests, is a moved endpoint.
+    #
+    # A CAPPED NIGHT NEVER REACHES THIS, and that is a real gap rather than a
+    # consequence worth restating as a feature. The cap raises
+    # SweepIncompleteError above the settle loop -- deliberately, so a tile the
+    # cap skipped is not committed as an empty one -- which also means neither
+    # this guard nor the MAX_FAILED_TILE_FRACTION check below runs. With at
+    # least one tile already committed on an earlier night, a moved endpoint on
+    # a capped night therefore exits 83, which is amnestied, and repeats nightly
+    # until the checkpoint hits its seven-day wall. The alternative (evaluating
+    # the guard over `done` alone) would refuse cities that are genuinely empty
+    # in the part they got to, so the trade stands -- but a Panoramax channel
+    # wired to launch capped (#316 phase 2) wants an endpoint probe at the START
+    # of a capped run, not this one at the end.
     if len(todo) >= 2 and empty_tiles == len(todo):
         error = DownloadError(
             f"Every one of the {len(todo)} Panoramax tiles requested for {city_name} "

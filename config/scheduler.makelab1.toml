@@ -207,7 +207,7 @@ enabled = true
 # AT the ceiling, not exactly on it. A capped crawl lets the tiles already in
 # flight finish their retries instead of cancelling them mid-attempt, so a
 # capped night can end up to connection_limit x (TILE_MAX_TRIES - 1) over --
-# 200 at the connection_limit = 50 set below, not the 25 the argparse default
+# 200 at the connection_limit = 50 set below, not the 20 the argparse default
 # of 5 would give. Budget this line as a soft ceiling with a 200-request tail.
 #
 # THE NUMBER TO QUOTE IS THE PER-IP SUM WITH mapillary_streets, not this line.

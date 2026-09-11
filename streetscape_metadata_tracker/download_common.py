@@ -211,6 +211,14 @@ class SweepIncompleteError(DownloadError):
     ledger) and ``api_requests_total`` (the whole crawl's, for the operator and
     the catalog row), attached by the caller's spend helper -- ``spent`` in the
     KartaView sweep, ``interrupted`` in both tile censuses.
+
+    WHAT IS NOT SHARED is what a cap means with NO checkpoint, and the three
+    raisers genuinely differ. Both tile censuses refuse that pairing up front as
+    a caller bug: an uncheckpointed stop leaves them nothing to resume from and
+    no guard that would notice. The KartaView sweep supports it and documents
+    it, because there the unmeasured remainder runs into the failed-area check,
+    which refuses to finalize the snapshot on its own. Neither posture is this
+    class's to state -- read each collector's own ``max_requests`` docstring.
     """
 
     def __init__(
