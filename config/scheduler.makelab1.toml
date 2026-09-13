@@ -91,8 +91,40 @@ daily_request_budget = 10000000   # legacy fallback; superseded by [providers.*]
 [providers.gsv]
 enabled = true
 # GSV metadata is free; the real ceiling is the per-minute rate cap (see [download]).
-# 10M/day covers cycling ~1,144 cities on the 90-day schedule with headroom.
-daily_request_budget = 10000000
+# 10M/day covered cycling ~1,144 cities on the 90-day schedule with headroom.
+#
+# 10M -> 15M on 2026-09-13 (#304). 10M stopped being headroom and became the
+# binding ceiling: 2026-09-11/12/13 spent 9,990,643 / 9,997,308 / 9,992,049 of
+# it -- 99.9% every night -- and deferred 20 / 14 / 16 cities for budget.
+#
+# What that deferral costs is easy to misread, so it is written down here. A
+# city whose gsv run does not fit the remainder is NOT dropped from the night:
+# its other channels still run, so it still counts against
+# [schedule].max_cities_per_day. The night therefore processed its full 40
+# cities with HALF of them missing the grid run that is the point of the
+# exercise. Raising this converts those into real runs inside the same 40
+# cities -- it does not add cities, and it adds no requests to any per-IP
+# metered host (Mapillary, KartaView, Overpass), each of which has its own
+# untouched budget.
+#
+# Sized against idle wall clock, not against a quota. Those three nights ran
+# 9.18 / 7.61 / 5.87 h of the 12 h window and ended on the CITY CAP, leaving
+# 2.8-6.1 h unused; at the measured median 30,137 req/min (n=20, see #304)
+# 2.8 h is ~5.1M requests. 15M spends the idle clock and hands the governor
+# back to max_batch_hours, which is what [schedule] says is intended.
+#
+# This does NOT change what Google sees per minute. [download].max_requests_
+# per_minute (48,000, i.e. 80% of the 60,000/min approved for this project)
+# is untouched; only the DURATION at that rate grows. Metadata requests are
+# "available at no charge" and "No quota is consumed when you request
+# metadata" (developers.google.com/maps/documentation/streetview/metadata),
+# so nothing but wall clock is bought here.
+#
+# The larger prize is NOT this number: the channel achieves 51-90% of its
+# configured rate, monotone in the city's coverage (#304, reopened). Closing
+# that buys ~1.6x on the channel that owns two-thirds of the night and costs
+# no wall clock at all. This knob only spends clock that is already idle.
+daily_request_budget = 15000000
 
 # PAUSED 2026-08-28 after the THIRD per-IP block (see the new-issue link in
 # docs/provider-access.md). Not a volume decision: the ledger rules out a fixed
