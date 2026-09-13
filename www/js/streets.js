@@ -498,20 +498,41 @@ function streetGroupKeys(id, columns = STREET_COLUMNS) {
 function buildStreetPresets(columns = STREET_COLUMNS) {
   const groupKeys = (id) => streetGroupKeys(id, columns);
   return [
-    {
-      id: "overview",
-      label: "Overview",
-      // pctAny stays out of the default view now that it is a whole GROUP rather
-      // than one column; the Δ in the 360° group is the headline comparison and
-      // "Kilometres" is one click away.
-      title: "The headline read: who walked what, how much of it, and how fresh",
-      columns: [
-        ...groupKeys("cov"),
-        ...groupKeys("walked"),
-        ...groupKeys("age"),
-        "lengthKm",
-      ],
-    },
+    // The default, and the only one trimmed to the measure: its width grows
+    // with the number of COLLECTED providers, so what fits two overflows at
+    // three (issue #334). "Median age" is the group that gives way there
+    // rather than "Walked", because a walk's DATE is what says whether the
+    // coverage beside it is current -- and "Street km" survives as an
+    // ungrouped scalar, since it is the denominator every percentage in the
+    // row is a percentage of. At FOUR providers "Walked" goes too: unlike
+    // grid.html, giving up the Δ does not save this page, because coverage +
+    // Walked + Street km is nine leaves with no Δ among them.
+    fitDefaultPreset(
+      {
+        id: "overview",
+        label: "Overview",
+        // pctAny stays out of the default view now that it is a whole GROUP
+        // rather than one column; the Δ in the 360° group is the headline
+        // comparison and "Kilometres" is one click away.
+        //
+        // Assembled from the clauses whose columns survive the trim (see
+        // fitDefaultPreset), so each one has to stand alone -- only `cov` is
+        // guaranteed to be there, since groups give way from the end.
+        titleLead: "The headline read:",
+        titleParts: {
+          cov: "how much of a city's streets is covered",
+          walked: "when each provider last walked it",
+          age: "how fresh that imagery is",
+        },
+        columns: [
+          ...groupKeys("cov"),
+          ...groupKeys("walked"),
+          ...groupKeys("age"),
+          "lengthKm",
+        ],
+      },
+      columns
+    ),
     {
       id: "kilometres",
       label: "Kilometres",

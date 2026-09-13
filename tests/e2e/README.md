@@ -15,9 +15,11 @@ frontend's data fetches intercepted so no live data host is needed.
 
 The fixture has three cities, one per render path the test asserts on:
 
-- **Alpha City** — a normal multi-run GSV city (snapshot `<select>` + change line)
+- **Alpha City** — a normal multi-run GSV city (snapshot `<select>` + change line), also collected
+  and walked by Mapillary and Panoramax. The THREE-provider city: the widest row the pivoted
+  tables render, and the count at which the default preset stops fitting the measure (#334).
 - **Zero City** — a 0-pano GSV city (#69/#122: `—` dates, no `Infinity%`/`NaN`)
-- **Map Ville** — a Mapillary city (provider toggle / `?provider=`)
+- **Map Ville** — a Mapillary city (provider toggle / `?provider=`), excluded from both GSV channels
 
 ## Running locally
 

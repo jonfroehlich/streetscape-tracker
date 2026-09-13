@@ -151,6 +151,19 @@ const MAPILLARY_CITY = () =>
     "mapillary"
   );
 
+// A second flat-imagery provider, so the hasFlatImagery branches below are
+// exercised by more than the one fixture that has always driven them. #296's
+// lesson: a capability sweep that reaches a flag through a single provider's
+// record tests one branch per provider, not the branch.
+const PANORAMAX_CITY = () =>
+  adaptCityRecord(
+    v3Record("panoramax", {
+      panorama_counts: { unique_panos: 135389 },
+      any_imagery_coverage_rate_percent: 74.5,
+    }),
+    "panoramax"
+  );
+
 // --- createTooltip: the Google-panos line is a DATA test -------------------
 
 test("createTooltip: a provider that publishes a Google subset gets the Google line", () => {
@@ -204,6 +217,7 @@ test("createTooltip: the any-imagery line follows the widening, not the provider
   try {
     // Mapillary: flat imagery widens the footprint, so the line appears.
     assert.match(createTooltip(MAPILLARY_CITY()).innerHTML, /Any Imagery: 74\.5% \(incl\. flat\)/);
+    assert.match(createTooltip(PANORAMAX_CITY()).innerHTML, /Any Imagery: 74\.5% \(incl\. flat\)/);
     // GSV: adaptCityRecord falls the any-imagery rate back to the 360° rate,
     // so the difference is exactly zero and the line would only repeat Grid
     // Coverage.
@@ -219,6 +233,7 @@ test("createTooltip: the (360°) coverage suffix is driven by hasFlatImagery", (
     // The one label with no value to test: it says what the number EXCLUDES,
     // which is a property of the provider rather than of this record.
     assert.match(createTooltip(MAPILLARY_CITY()).innerHTML, /60\.0% of search points \(360°\)/);
+    assert.match(createTooltip(PANORAMAX_CITY()).innerHTML, /60\.0% of search points \(360°\)/);
     assert.match(createTooltip(GSV_CITY()).innerHTML, /60\.0% of search points</);
     assert.doesNotMatch(createTooltip(GSV_CITY()).innerHTML, /\(360°\)/);
   } finally {

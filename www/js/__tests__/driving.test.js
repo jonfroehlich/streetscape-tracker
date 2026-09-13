@@ -6,6 +6,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const { readFileSync } = require("node:fs");
 
 // The streetwalk manifest helper lives in streetscape-utils.js; the page reads
 // it as a browser global.
@@ -567,6 +568,60 @@ test("a missing manifest degrades the column instead of failing the page", () =>
   const rows = [drivingRowModel(TEL_AVIV, TODAY)];
   assert.equal(mergeStreetCoverage(rows, null), 0);
   assert.equal(rows[0].streetPct, null);
+});
+
+test("a gsv-excluded city falls back to whichever provider did walk it", () => {
+  // #301's case, and the reason #334 had to touch this page at all: the
+  // fallback list is a hand-written array of provider names, so a newly
+  // collectable provider is not ignored loudly — its walk is simply passed
+  // over and the column reads "—" beside a manifest entry that has the
+  // number. Panoramax is asserted specifically because it is the one that
+  // WAS being skipped.
+  const excluded = { ...TEL_AVIV, excluded_channels: ["gsv", "gsv_streets"] };
+  for (const provider of ["mapillary", "kartaview", "panoramax"]) {
+    const rows = [drivingRowModel(excluded, TODAY)];
+    assert.equal(rows[0].gsvExcluded, true);
+    const manifest = {
+      walks: [
+        { city_id: TEL_AVIV.city_id, provider, network_type: "drive", coverage_pct_by_length: 85.4 },
+      ],
+    };
+    assert.equal(mergeStreetCoverage(rows, manifest), 1, provider);
+    assert.equal(rows[0].streetPct, 85.4, provider);
+    assert.equal(rows[0].streetWalkProvider, provider);
+  }
+
+  // ...and a city that is merely unwalked on gsv, rather than excluded from
+  // it, keeps the blank: the column stays "Google's driving", not "somebody's
+  // coverage".
+  const rows = [drivingRowModel(TEL_AVIV, TODAY)];
+  assert.equal(rows[0].gsvExcluded, false);
+  mergeStreetCoverage(rows, {
+    walks: [
+      {
+        city_id: TEL_AVIV.city_id,
+        provider: "panoramax",
+        network_type: "drive",
+        coverage_pct_by_length: 85.4,
+      },
+    ],
+  });
+  assert.equal(rows[0].streetPct, null);
+});
+
+test("the fallback list names every registered provider but gsv", () => {
+  // The coverage the array itself cannot carry. Read back out of the source
+  // rather than swept from PROVIDERS in the page, because the ORDER there is
+  // a deliberate preference (registration order) that a sweep would silently
+  // rewrite — so this pins membership and leaves the order to the author.
+  const src = readFileSync(require.resolve("../driving.js"), "utf8");
+  const m = /for \(const provider of \[([^\]]*)\]\)/.exec(src);
+  assert.ok(m, "driving.js no longer spells its street-walk fallback list as an array");
+  const listed = m[1].match(/"([a-z_]+)"/g).map((q) => q.replaceAll('"', ""));
+  const registered = Object.keys(
+    require("../streetscape-utils.js").PROVIDERS
+  ).filter((k) => k !== "gsv");
+  assert.deepEqual([...listed].sort(), [...registered].sort());
 });
 
 // ── Drive window ──────────────────────────────────────────────────────────
