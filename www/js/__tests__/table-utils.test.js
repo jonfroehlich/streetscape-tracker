@@ -23,6 +23,7 @@ const {
   anyImageryLeafTitle,
   DEFAULT_PRESET_LEAF_BUDGET,
   fitDefaultPreset,
+  presetTitle,
 } = require("../table-utils.js");
 
 // --- cityDisplayLabel (canonical copy; streets.js's cityLabel aliases it) ---
@@ -498,9 +499,15 @@ test("anyImageryLeafTitle: the branch is the registry flag, the clause is the ca
 
 // --- fitDefaultPreset: the default view against the content measure --------
 
-const _cols = (spec) =>
+const _cols = (spec, deltas = []) =>
   spec.flatMap(([group, keys]) =>
-    keys.map((key) => ({ key, group: group ? { id: group } : undefined }))
+    keys.map((key) => ({
+      key,
+      group: group ? { id: group } : undefined,
+      // What providerColumnGroup stamps on the one leaf that is a pairwise
+      // comparison rather than a provider's own value.
+      ...(deltas.includes(key) ? { isGroupDelta: true } : {}),
+    }))
   );
 
 test("fitDefaultPreset: a preset already inside the budget is returned untouched", () => {
@@ -565,4 +572,114 @@ test("fitDefaultPreset: the budget is the measured two-provider default, not a r
   // been measured to fit (1500px page less the 280px sidebar). Changing it
   // without re-measuring is what the e2e width gate is there to refuse.
   assert.equal(DEFAULT_PRESET_LEAF_BUDGET, 8);
+});
+
+test("fitDefaultPreset: the Δ leaves give way BEFORE a whole metric group", () => {
+  // Four providers, which is where the two orderings stop being equivalent:
+  // cov and age are five leaves each with their Δ, so the three groups come to
+  // fourteen and no whole-group subset lands on eight — cov+age is ten WITH the
+  // Δs, and dropping age for them leaves five. Giving up the Δs first lands on
+  // exactly eight and keeps Median age, which is the editorial call: a Δ
+  // compares two NAMED providers while a group carries a number for every one
+  // of them, so the Δ's share of what the row says shrinks as providers are
+  // added.
+  const columns = _cols(
+    [
+      ["cov", ["c1", "c2", "c3", "c4", "covD"]],
+      ["age", ["a1", "a2", "a3", "a4", "ageD"]],
+      ["collected", ["l1", "l2", "l3", "l4"]],
+    ],
+    ["covD", "ageD"]
+  );
+  const preset = { id: "overview", columns: columns.map((c) => c.key) };
+  assert.deepEqual(
+    fitDefaultPreset(preset, columns, 8).columns,
+    ["c1", "c2", "c3", "c4", "a1", "a2", "a3", "a4"]
+  );
+});
+
+test("fitDefaultPreset: a Δ dropped to save a group comes back when the group goes anyway", () => {
+  // Three providers: the three groups are eleven leaves, dropping both Δs
+  // leaves nine, and only then does "collected" go — at which point the Δs are
+  // affordable again and are restored. The candidate order is (everything),
+  // (no Δ), (one group fewer), (one group fewer and no Δ), …, so a group is
+  // never paid for with a Δ that did not need dropping.
+  const columns = _cols(
+    [
+      ["cov", ["c1", "c2", "c3", "covD"]],
+      ["age", ["a1", "a2", "a3", "ageD"]],
+      ["collected", ["l1", "l2", "l3"]],
+    ],
+    ["covD", "ageD"]
+  );
+  const preset = { id: "overview", columns: columns.map((c) => c.key) };
+  const fitted = fitDefaultPreset(preset, columns, 8);
+  assert.deepEqual(fitted.columns, ["c1", "c2", "c3", "covD", "a1", "a2", "a3", "ageD"]);
+});
+
+test("fitDefaultPreset: the title is trimmed with the columns", () => {
+  // The defect this closes: a fixed title is an enumeration, and grid's
+  // promised "how fresh it is" at the provider count where the age group is
+  // the one that gives way. A clause survives iff its group still has a leaf.
+  const columns = _cols(
+    [
+      ["cov", ["c1", "c2", "c3", "c4", "covD"]],
+      ["age", ["a1", "a2", "a3", "a4", "ageD"]],
+      ["collected", ["l1", "l2", "l3", "l4"]],
+    ],
+    ["covD", "ageD"]
+  );
+  const preset = {
+    id: "overview",
+    titleLead: "The headline read:",
+    titleParts: { cov: "how much", age: "how fresh", collected: "when", delta: "who has more" },
+    columns: columns.map((c) => c.key),
+  };
+
+  // Everything fits: every clause, in the map's key order rather than the
+  // column order.
+  assert.equal(
+    fitDefaultPreset(preset, columns, 99).title,
+    "The headline read: how much, how fresh, when, and who has more"
+  );
+  // The Δs went, so "who has more" went with them — and nothing else moved.
+  assert.equal(fitDefaultPreset(preset, columns, 8).title, "The headline read: how much and how fresh");
+  // Down to one group — and its Δ is affordable again, so "who has more" comes
+  // back with it. Two clauses, joined with "and" and no comma.
+  assert.equal(
+    fitDefaultPreset(preset, columns, 5).title,
+    "The headline read: how much and who has more"
+  );
+  // Tighter still: one clause, and no stray conjunction.
+  assert.equal(fitDefaultPreset(preset, columns, 4).title, "The headline read: how much");
+});
+
+test("fitDefaultPreset: a preset that spells a plain title keeps it verbatim", () => {
+  // Only the presets that opt into `titleParts` pay for the assembly; every
+  // other preset (and every non-default one) is left strictly alone.
+  const columns = _cols([["cov", ["c1", "c2", "c3"]], ["age", ["a1", "a2", "a3"]]]);
+  const preset = { id: "compare", title: "fixed", columns: columns.map((c) => c.key) };
+  assert.equal(fitDefaultPreset(preset, columns, 3).title, "fixed");
+});
+
+test("presetTitle: the clause list is Oxford-joined, and an absent one is absent", () => {
+  // Spelled directly because the join is prose and the three shapes read
+  // differently: "a", "a and b", "a, b, and c".
+  const groupOf = (k) => k;
+  const isDelta = () => false;
+  const withParts = (parts) => ({ titleLead: "Lead:", titleParts: parts });
+  const t = (parts, chosen) => presetTitle(withParts(parts), chosen, groupOf, isDelta);
+
+  assert.equal(t({ a: "one", b: "two", c: "three" }, ["a", "b", "c"]), "Lead: one, two, and three");
+  assert.equal(t({ a: "one", b: "two", c: "three" }, ["a", "b"]), "Lead: one and two");
+  assert.equal(t({ a: "one", b: "two", c: "three" }, ["b"]), "Lead: two");
+  // No lead is legal: the clauses are the whole title.
+  assert.equal(
+    presetTitle({ titleParts: { a: "one", b: "two" } }, ["a", "b"], groupOf, isDelta),
+    "one and two"
+  );
+  // A preset with neither is untouched, undefined included — that is what lets
+  // fitDefaultPreset return an already-fitting preset by identity.
+  assert.equal(presetTitle({ columns: [] }, [], groupOf, isDelta), undefined);
+  assert.equal(presetTitle({ title: "fixed" }, [], groupOf, isDelta), "fixed");
 });

@@ -405,8 +405,13 @@ test("the default preset stops at the measure instead of growing a third time", 
   assert.ok(three.columns.length <= 8, `${three.columns.length} leaves`);
   assert.deepEqual(groupsOf(three, ["gsv", "mapillary", "panoramax"]), ["cov", "walked", null]);
 
-  const four = defaultFor(["gsv", "mapillary", "kartaview", "panoramax"]);
+  // A fourth provider takes "Walked" too — unlike grid.html, giving up the Δ
+  // does not save this page, because cov + walked + Street km is nine leaves
+  // with no Δ in it at all. "Street km" still survives, being ungrouped.
+  const FOUR = ["gsv", "mapillary", "kartaview", "panoramax"];
+  const four = defaultFor(FOUR);
   assert.ok(four.columns.length <= 8, `${four.columns.length} leaves`);
+  assert.deepEqual(groupsOf(four, FOUR), ["cov", null]);
   assert.ok(four.columns.includes("lengthKm"), "the ungrouped denominator was trimmed away");
 
   // Only the DEFAULT is trimmed; an explicitly chosen preset keeps what it names.
@@ -918,6 +923,53 @@ test("every scoped field a filter can resolve to exists on a row model", () => {
           `${filter.key} under ${JSON.stringify(values)} reads missing ${field}`
         );
       }
+    }
+  }
+});
+
+test("the default preset's title says what it shows, at every provider count", () => {
+  // The streets half of the same fix: assembled from `titleParts`, so a group
+  // that gives way takes its clause with it. Each clause has to stand alone,
+  // which is why they are not the original sentence's fragments — only `cov`
+  // is guaranteed to be on the page, since groups drop from the end.
+  const titleFor = (providers) => buildStreetPresets(buildStreetColumns(providers))[0].title;
+
+  assert.equal(
+    titleFor(["gsv", "mapillary"]),
+    "The headline read: how much of a city's streets is covered, when each provider " +
+      "last walked it, and how fresh that imagery is"
+  );
+  assert.equal(
+    titleFor(["gsv", "mapillary", "panoramax"]),
+    "The headline read: how much of a city's streets is covered and when each provider " +
+      "last walked it"
+  );
+  assert.equal(
+    titleFor(["gsv", "mapillary", "kartaview", "panoramax"]),
+    "The headline read: how much of a city's streets is covered"
+  );
+});
+
+test("the default preset's title never names a group the trim dropped", () => {
+  const ALL = ["gsv", "mapillary", "kartaview", "panoramax", "fifthparty"];
+  const parts = {
+    cov: "is covered",
+    walked: "last walked it",
+    age: "how fresh that imagery is",
+  };
+  for (let n = 1; n <= ALL.length; n++) {
+    const providers = ALL.slice(0, n);
+    const columns = buildStreetColumns(providers);
+    const preset = buildStreetPresets(columns)[0];
+    const byKey = new Map(columns.map((c) => [c.key, c.group?.id ?? null]));
+    const shown = new Set(preset.columns.map((k) => byKey.get(k)));
+    for (const [id, clause] of Object.entries(parts)) {
+      assert.equal(
+        preset.title.includes(clause),
+        shown.has(id),
+        `${n} providers: title ${preset.title.includes(clause) ? "promises" : "omits"} ` +
+          `"${clause}" but the group is ${shown.has(id) ? "shown" : "dropped"}`
+      );
     }
   }
 });

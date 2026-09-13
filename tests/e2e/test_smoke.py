@@ -54,6 +54,12 @@ ALPHA_MAPILLARY_LATEST = (
 ALPHA_PANORAMAX_LATEST = (
     "alpha-city--alphastate--testland_width_100_height_100_step_20_panoramax_2026-04-15.csv.gz"
 )
+# The OK panoramas in that run (build_fixture.py). Panoramax ids are UUIDs,
+# which is what its viewer permalink is addressed by.
+ALPHA_PANORAMAX_PANO_IDS = (
+    "599c8ad1-3a21-4311-9179-82e31ed23d32",
+    "13662235-dd09-4207-a2cc-530f0b908190",
+)
 ZERO_CITY = "zero-city--zerostate--testland_width_100_height_100_step_20_2026-04-15.csv.gz"
 # The published diff detail between Alpha City's two runs (real compute_run_diff
 # output: one pano_added row), fetched by the city page's change overlay.
@@ -480,7 +486,14 @@ def test_city_page_renders_a_panoramax_run_as_panoramax(page: Page, base_url):
     link = popup.locator("a").first
     expect(link).to_have_text("View in Panoramax")
     href = link.get_attribute("href")
-    assert href.startswith("https://api.panoramax.xyz/?focus=pic&pic="), href
+    # The whole permalink, not just its prefix: a prefix match passes on
+    # `...&pic=undefined` too, and the id is the only part of this URL that is
+    # not a constant. Flat-only markers are off by default (city.js adds them
+    # only when the toggle is on), so the marker clicked above is always one of
+    # the run's two OK panoramas.
+    assert href in {
+        f"https://api.panoramax.xyz/?focus=pic&pic={pano}" for pano in ALPHA_PANORAMAX_PANO_IDS
+    }, href
     # One link, not two: no fallback, because the viewer works (#312's rule
     # applied in the other direction).
     expect(popup.locator("a")).to_have_count(1)

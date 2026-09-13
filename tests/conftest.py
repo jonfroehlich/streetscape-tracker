@@ -180,6 +180,10 @@ def make_panoramax_city_df(
         contributor id, not an official-fleet marker, which is why the
         provider declares no copyright filter.
 
+    Every id column is a UUID, FLAT_ONLY rows included — that is the shape a
+    real run carries, and ``pano_id`` is what the frontend interpolates into
+    the federation viewer's permalink.
+
     Args:
         panos: list of (pano_id, capture_date_str)
         panos_per_point: how many consecutive panos share each grid point
@@ -227,7 +231,14 @@ def make_panoramax_city_df(
                 ts,
                 lat0 + point * 0.001 + 0.0001,
                 lon0 + 0.0001,
-                f"flat{k}",
+                # A UUID like every other Panoramax id, not a ``flat{k}``
+                # placeholder: census.build_image_rows copies the REAL picture
+                # id of the flat image it picked as the point's representative,
+                # and this is the one column a consumer turns into a viewer
+                # permalink (``?focus=pic&pic=``). A placeholder here is a
+                # fixture that does not look like a run file at exactly the
+                # spot where that matters.
+                f"6e4f0b{k:02x}-9c31-4f6a-bd47-7c1e0a5b93{k:02x}",
                 None,  # FLAT_ONLY rows carry no capture date
                 f"© Panoramax contributor {account}",
                 "FLAT_ONLY",

@@ -65,6 +65,18 @@ Eight is the leaf count of the two-provider Overview both pages shipped with and
 There is no pagination or virtualization to absorb that (ADR 0001) and the measure is a deliberate typographic choice, so what gives is how many groups the DEFAULT shows; every other preset is an explicit request and keeps everything it names, with the wrap's `overflow-x` doing its narrow-viewport job.
 Whole groups are dropped from the end rather than individual leaves — half a group renders a header spanning columns it no longer has, and dropping trailing KEYS would take `streets.html`'s ungrouped "Street km", the denominator every percentage in the row is a percentage of.
 Grid gives up "Last collected" (the Provenance preset answers that question in full) and streets gives up "Median age" (a walk's DATE is what says whether the coverage beside it is current).
+
+**The Δ leaves give way before any of that, though — and at four providers the two orderings are not equivalent.**
+A Δ is one pairwise comparison of two NAMED providers while a metric group is one number for every provider, so the Δ's share of what a row tells you shrinks with each provider added.
+Concretely: at four providers `cov` and `age` are five leaves each with their Δ, so the pair is ten and there is no whole-group subset between that and `cov`'s five — trimming groups only left `grid.html`'s Overview showing grid coverage and nothing else, while giving up the Δs lands on exactly eight and keeps Median age.
+A Δ dropped to save a group comes back if that group goes anyway: the candidates are tried in the order (everything), (no Δ), (one group fewer), (one group fewer and no Δ), and the first that fits wins, so a group is never paid for with a Δ that did not need dropping.
+`streets.html` is the case where it does not help — `cov` + `walked` + "Street km" is nine leaves with no Δ in it at all — so that page still gives up "Walked" at four.
+
+**A default preset therefore spells `titleLead` + `titleParts` (group id → clause, plus the reserved `delta`) instead of a finished `title`, and `fitDefaultPreset` assembles the sentence from the clauses whose columns survived.**
+A fixed title is an enumeration, and this codebase has already watched one go stale the moment a provider count moved ([#295](https://github.com/jonfroehlich/streetscape-tracker/issues/295), [#296](https://github.com/jonfroehlich/streetscape-tracker/pull/296) did it to group titles that named providers): grid's Overview promised "how fresh it is" and, at four providers, showed no age column.
+It renders as the preset `<option>`'s hover `title`, so the promise is visible and the missing column is not.
+Clauses are assembled in `titleParts` key order — the author's reading order rather than the column order — and Oxford-joined; a preset carrying a plain `title` (every non-default one) is left strictly alone, identity return included.
+Each clause has to stand alone, since only the first group is guaranteed to survive.
 **The gate that should have caught this was green against a payload narrower than production's**: `test_default_columns_fit_without_scrolling_the_page_sideways` asserts exactly this, but the e2e fixture carried two providers while production had been three deep since KartaView ([#248](https://github.com/jonfroehlich/streetscape-tracker/issues/248)) — measured against live data mid-#334, prod was already 140px/164px over.
 The fixture now carries three, which is why a provider-count assumption in a layout test has to be a property of the fixture and not of the year it was written.
 **(8) A grouped leaf's header button carries `pickerLabel` as its `aria-label`.**

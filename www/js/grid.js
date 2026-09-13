@@ -391,8 +391,18 @@ function buildGridPresets(columns = GRID_COLUMNS) {
       {
         id: "overview",
         label: "Overview",
-        title:
-          "The headline read: how much imagery a city has, how fresh it is, and who has more",
+        // Assembled from the clauses whose columns survive the trim rather
+        // than spelled as one string -- a fixed title is an enumeration, and
+        // this one promised "how fresh it is" at the provider count where the
+        // age group is the one that gives way. Clause order is this map's key
+        // order; `delta` is the reserved id for the Δ leaves.
+        titleLead: "The headline read:",
+        titleParts: {
+          cov: "how much imagery a city has",
+          age: "how fresh it is",
+          collected: "when it was last collected",
+          delta: "who has more",
+        },
         columns: [...groupKeys("cov"), ...groupKeys("age"), ...groupKeys("collected")],
       },
       columns

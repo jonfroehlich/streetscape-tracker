@@ -512,7 +512,16 @@ function buildStreetPresets(columns = STREET_COLUMNS) {
         // pctAny stays out of the default view now that it is a whole GROUP
         // rather than one column; the Δ in the 360° group is the headline
         // comparison and "Kilometres" is one click away.
-        title: "The headline read: who walked what, how much of it, and how fresh",
+        //
+        // Assembled from the clauses whose columns survive the trim (see
+        // fitDefaultPreset), so each one has to stand alone -- only `cov` is
+        // guaranteed to be there, since groups give way from the end.
+        titleLead: "The headline read:",
+        titleParts: {
+          cov: "how much of a city's streets is covered",
+          walked: "when each provider last walked it",
+          age: "how fresh that imagery is",
+        },
         columns: [
           ...groupKeys("cov"),
           ...groupKeys("walked"),

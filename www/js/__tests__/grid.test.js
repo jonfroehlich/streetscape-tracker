@@ -720,9 +720,20 @@ test("the default preset stops at the measure instead of growing a third time", 
   assert.ok(three.columns.length <= 8, `${three.columns.length} leaves`);
   assert.deepEqual(groupsOf(three, ["gsv", "mapillary", "panoramax"]), ["cov", "age"]);
 
-  // ...and it keeps giving way rather than overflowing once at some count.
-  const four = defaultFor(["gsv", "mapillary", "kartaview", "panoramax"]);
-  assert.ok(four.columns.length <= 8, `${four.columns.length} leaves`);
+  // A FOURTH provider costs the Δ leaves rather than a second metric group.
+  // cov and age are five leaves each with their Δ, so the pair is ten and
+  // there is no whole-group subset between that and cov's five — giving up the
+  // pairwise comparison lands on exactly eight and keeps Median age, one of
+  // the page's two headline metrics. Trimming groups only (the first shape of
+  // this fix) showed grid coverage and nothing else.
+  const FOUR = ["gsv", "mapillary", "kartaview", "panoramax"];
+  const four = defaultFor(FOUR);
+  assert.equal(four.columns.length, 8);
+  assert.deepEqual(groupsOf(four, FOUR), ["cov", "age"]);
+  const deltaKeys = new Set(
+    buildGridColumns(FOUR).filter((c) => c.isGroupDelta).map((c) => c.key)
+  );
+  assert.deepEqual(four.columns.filter((k) => deltaKeys.has(k)), []);
 
   // Only the DEFAULT is trimmed: every other preset is an explicit request,
   // and the table wrap scrolls for it.
@@ -837,6 +848,55 @@ test("every scoped field a filter can resolve to exists on a row model", () => {
           `${filter.key} under ${JSON.stringify(values)} reads missing ${field}`
         );
       }
+    }
+  }
+});
+
+test("the default preset's title says what it shows, at every provider count", () => {
+  // The title is assembled from `titleParts` rather than spelled, because a
+  // fixed string is an enumeration and this one went stale exactly the way
+  // #295's group titles did: it promised "how fresh it is" at the count where
+  // Median age is the group that gives way. Spelled out here because these
+  // three strings are the user-visible artifact — they render as the preset
+  // <option>'s hover title.
+  const titleFor = (providers) => buildGridPresets(buildGridColumns(providers))[0].title;
+
+  assert.equal(
+    titleFor(["gsv", "mapillary"]),
+    "The headline read: how much imagery a city has, how fresh it is, when it was " +
+      "last collected, and who has more"
+  );
+  // Three: "Last collected" is gone from the columns and from the sentence.
+  assert.equal(
+    titleFor(["gsv", "mapillary", "panoramax"]),
+    "The headline read: how much imagery a city has, how fresh it is, and who has more"
+  );
+  // Four: the Δs go, so "who has more" goes with them.
+  assert.equal(
+    titleFor(["gsv", "mapillary", "kartaview", "panoramax"]),
+    "The headline read: how much imagery a city has and how fresh it is"
+  );
+});
+
+test("the default preset's title never names a group the trim dropped", () => {
+  // The invariant the three strings above are instances of, swept across every
+  // provider count the page can be handed — including counts nothing collects
+  // today, since that is the direction this defect arrives from.
+  const ALL = ["gsv", "mapillary", "kartaview", "panoramax", "fifthparty"];
+  const parts = { cov: "how much imagery", age: "how fresh", collected: "last collected" };
+  for (let n = 1; n <= ALL.length; n++) {
+    const providers = ALL.slice(0, n);
+    const columns = buildGridColumns(providers);
+    const preset = buildGridPresets(columns)[0];
+    const byKey = new Map(columns.map((c) => [c.key, c.group?.id ?? null]));
+    const shown = new Set(preset.columns.map((k) => byKey.get(k)));
+    for (const [id, clause] of Object.entries(parts)) {
+      assert.equal(
+        preset.title.includes(clause),
+        shown.has(id),
+        `${n} providers: title ${preset.title.includes(clause) ? "promises" : "omits"} ` +
+          `"${clause}" but the group is ${shown.has(id) ? "shown" : "dropped"}`
+      );
     }
   }
 });
