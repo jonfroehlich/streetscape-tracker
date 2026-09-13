@@ -202,7 +202,16 @@ enabled = true
 # is ~1.5x headroom over a normal night, not 2.2x.
 # It bound twice in six nights, both on an end-of-night sliver rather than an
 # unaffordable city (New York wanted 484 with 426 left) -- that tail is #318's
-# capped-and-resume, not this raise.
+# capped-and-resume, not this raise. #318 HAS LANDED, so neither city would be
+# skipped today: each launches with the remainder as a request cap and finishes
+# the next night. A night therefore spends this budget rather than stopping
+# short of it, so near-ceiling nights become at-ceiling ones.
+#
+# AT the ceiling, not exactly on it. A capped crawl lets the tiles already in
+# flight finish their retries instead of cancelling them mid-attempt, so a
+# capped night can end up to connection_limit x (TILE_MAX_TRIES - 1) over --
+# 200 at the connection_limit = 50 set below, not the 20 the argparse default
+# of 5 would give. Budget this line as a soft ceiling with a 200-request tail.
 #
 # THE NUMBER TO QUOTE IS THE PER-IP SUM WITH mapillary_streets, not this line.
 # That channel stays at 1,750 and, since #290, spends 0 on a paired night by

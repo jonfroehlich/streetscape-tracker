@@ -680,13 +680,65 @@ test("the Any-imagery tooltip is derived from hasFlatImagery, not from a provide
   assert.match(titleFor(true), /Google Street View/);
 });
 
-test("the default preset's width tracks the COLLECTED providers, not the registry", () => {
-  // Why the narrowing is a layout fact and not just a tidiness one: the default
-  // view has to fit the page's content measure (1500px − the 280px sidebar)
-  // without scrolling sideways, and it carries three grouped metrics, so each
-  // extra provider is three more ~90px leaves.
-  const widthFor = (providers) => buildGridPresets(buildGridColumns(providers))[0].columns.length;
-  assert.equal(widthFor(["gsv", "mapillary", "thirdparty"]) - widthFor(["gsv", "mapillary"]), 3);
+test("a preset's width tracks the COLLECTED providers, not the registry", () => {
+  // Why the narrowing is a layout fact and not just a tidiness one: the table
+  // has to fit the page's content measure (1500px − the 280px sidebar), and
+  // every grouped metric is one ~90px leaf per provider, so each extra
+  // provider is three more of them across the three groups here.
+  //
+  // Measured on "Compare providers" rather than on the default, which is
+  // capped at DEFAULT_PRESET_LEAF_BUDGET and so stops growing — the two facts
+  // are separate and the cap must not be able to hide this one.
+  const compare = (providers) =>
+    buildGridPresets(buildGridColumns(providers)).find((p) => p.id === "compare").columns.length;
+  assert.equal(compare(["gsv", "mapillary", "thirdparty"]) - compare(["gsv", "mapillary"]), 3);
+});
+
+test("the default preset stops at the measure instead of growing a third time", () => {
+  // Issue #334. The three grouped metrics come to eight leaves at two
+  // providers, which is what the measure holds. The same three groups are
+  // eleven leaves at three providers and the table is then 135px too wide,
+  // with no pagination or virtualization to absorb it (ADR 0001), so the
+  // default drops its last group.
+  //
+  // Not hypothetical when it landed: production had been three providers
+  // deep since KartaView (#248) while the e2e fixture carried two, so the
+  // width gate was green against a payload narrower than the real one.
+  const defaultFor = (providers) => buildGridPresets(buildGridColumns(providers))[0];
+  const groupsOf = (preset, providers) => {
+    const byKey = new Map(buildGridColumns(providers).map((c) => [c.key, c.group?.id ?? null]));
+    return [...new Set(preset.columns.map((k) => byKey.get(k)))];
+  };
+
+  const two = defaultFor(["gsv", "mapillary"]);
+  assert.equal(two.columns.length, 8);
+  assert.deepEqual(groupsOf(two, ["gsv", "mapillary"]), ["cov", "age", "collected"]);
+
+  // A third provider costs "Last collected" — the group whose question the
+  // Provenance preset answers in full — and keeps coverage, age and the Δ.
+  const three = defaultFor(["gsv", "mapillary", "panoramax"]);
+  assert.ok(three.columns.length <= 8, `${three.columns.length} leaves`);
+  assert.deepEqual(groupsOf(three, ["gsv", "mapillary", "panoramax"]), ["cov", "age"]);
+
+  // A FOURTH provider costs the Δ leaves rather than a second metric group.
+  // cov and age are five leaves each with their Δ, so the pair is ten and
+  // there is no whole-group subset between that and cov's five — giving up the
+  // pairwise comparison lands on exactly eight and keeps Median age, one of
+  // the page's two headline metrics. Trimming groups only (the first shape of
+  // this fix) showed grid coverage and nothing else.
+  const FOUR = ["gsv", "mapillary", "kartaview", "panoramax"];
+  const four = defaultFor(FOUR);
+  assert.equal(four.columns.length, 8);
+  assert.deepEqual(groupsOf(four, FOUR), ["cov", "age"]);
+  const deltaKeys = new Set(
+    buildGridColumns(FOUR).filter((c) => c.isGroupDelta).map((c) => c.key)
+  );
+  assert.deepEqual(four.columns.filter((k) => deltaKeys.has(k)), []);
+
+  // Only the DEFAULT is trimmed: every other preset is an explicit request,
+  // and the table wrap scrolls for it.
+  const presets = buildGridPresets(buildGridColumns(["gsv", "mapillary", "panoramax"]));
+  assert.ok(presets.find((p) => p.id === "compare").columns.length > 8);
 });
 
 test("the Δ columns and the Δ filter go away when only one of the pair is collected", () => {
@@ -796,6 +848,55 @@ test("every scoped field a filter can resolve to exists on a row model", () => {
           `${filter.key} under ${JSON.stringify(values)} reads missing ${field}`
         );
       }
+    }
+  }
+});
+
+test("the default preset's title says what it shows, at every provider count", () => {
+  // The title is assembled from `titleParts` rather than spelled, because a
+  // fixed string is an enumeration and this one went stale exactly the way
+  // #295's group titles did: it promised "how fresh it is" at the count where
+  // Median age is the group that gives way. Spelled out here because these
+  // three strings are the user-visible artifact — they render as the preset
+  // <option>'s hover title.
+  const titleFor = (providers) => buildGridPresets(buildGridColumns(providers))[0].title;
+
+  assert.equal(
+    titleFor(["gsv", "mapillary"]),
+    "The headline read: how much imagery a city has, how fresh it is, when it was " +
+      "last collected, and who has more"
+  );
+  // Three: "Last collected" is gone from the columns and from the sentence.
+  assert.equal(
+    titleFor(["gsv", "mapillary", "panoramax"]),
+    "The headline read: how much imagery a city has, how fresh it is, and who has more"
+  );
+  // Four: the Δs go, so "who has more" goes with them.
+  assert.equal(
+    titleFor(["gsv", "mapillary", "kartaview", "panoramax"]),
+    "The headline read: how much imagery a city has and how fresh it is"
+  );
+});
+
+test("the default preset's title never names a group the trim dropped", () => {
+  // The invariant the three strings above are instances of, swept across every
+  // provider count the page can be handed — including counts nothing collects
+  // today, since that is the direction this defect arrives from.
+  const ALL = ["gsv", "mapillary", "kartaview", "panoramax", "fifthparty"];
+  const parts = { cov: "how much imagery", age: "how fresh", collected: "last collected" };
+  for (let n = 1; n <= ALL.length; n++) {
+    const providers = ALL.slice(0, n);
+    const columns = buildGridColumns(providers);
+    const preset = buildGridPresets(columns)[0];
+    const byKey = new Map(columns.map((c) => [c.key, c.group?.id ?? null]));
+    const shown = new Set(preset.columns.map((k) => byKey.get(k)));
+    for (const [id, clause] of Object.entries(parts)) {
+      assert.equal(
+        preset.title.includes(clause),
+        shown.has(id),
+        `${n} providers: title ${preset.title.includes(clause) ? "promises" : "omits"} ` +
+          `"${clause}" but the group is ${shown.has(id) ? "shown" : "dropped"}`
+      );
     }
   }
 });

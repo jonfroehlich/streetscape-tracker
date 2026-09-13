@@ -205,7 +205,7 @@ That means one entry in `host_lock.py`, not 25.
 **It is a STAC API**, unauthenticated for read — the only provider here with no credential at all, which is why `config.CHANNEL_ENV_VARS["panoramax"]` is an empty tuple rather than a missing row.
 The vector-tile endpoint `/api/map/{z}/{x}/{y}.mvt` is the census and `census.py`, `checkpointing.py` and the [#290](https://github.com/jonfroehlich/streetscape-tracker/issues/290) cache parameterized onto it as expected.
 `/api/search` did **not**: it cannot count (no pagination, no `numberMatched`) and silently ignores its own `datetime` filter, both measured in phase 1.
-The one surprise in the cost was the zoom — the per-picture layer starts at **z15**, not Mapillary's z14, so the same bbox is ~4x the tiles.
+The one surprise in the cost was the zoom — the per-picture layer starts at **z15**, not Mapillary's z14, so the same bbox is up to ~4x the tiles (one zoom level's asymptote; 2.9x at the catalog median).
 
 Per-picture metadata is **richer than either census provider we have**: `datetime` (capture), `created`/`updated` (ingest — so KartaView's `shot_date >= date_added` guard comes from real fields rather than inference), `license`, `geovisio:producer`, `quality:horizontal_accuracy`, `pers:interior_orientation.field_of_view`, and a `via` link naming the source instance.
 
@@ -232,8 +232,12 @@ It was read and not asked: the collector paces at 30/min, half the Mapillary cha
 But there is active work on migrating sequences between instances, so picture identity across instance moves is unanswered — if an image can change instance and identity, "removed" in a run-to-run diff could mean "migrated", which would corrupt the one statistic this project exists to produce.
 It is recorded as a standing caveat on every Panoramax diff rather than resolved.
 
-**A second, smaller one found while wiring the frontend:** the meta-catalog hosts no picture viewer (its root is a marketing page), and the tile layer carries no instance, so a run row cannot name which of the 23 instances owns a picture.
-What resolves federation-wide from the id alone is the asset route — `/api/pictures/{id}/sd.jpg` answers 308 to the owning instance — so `vis.PROVIDER_DISPLAY` links the PICTURE rather than a viewer, deliberately, rather than guessing an instance.
+**A second, smaller one found while wiring the frontend, and then CORRECTED by measuring it ([#334](https://github.com/jonfroehlich/streetscape-tracker/issues/334), probed 2026-09-10).**
+What was written here first — that the meta-catalog hosts no picture viewer, its root being a marketing page, so a link would have to guess which of the 23 instances owns a picture — was reasoned rather than probed, and is wrong.
+`https://api.panoramax.xyz/` answers 307 to `/en/index`, whose body embeds `<pnx-viewer endpoint="/api" metacatalog="false">`: the official `@panoramax/web-viewer`, bound to the meta-catalog itself.
+Its permalink parameters are query-string rather than hash (`pic=<uuid>`, `focus=pic`, `map=zoom/lat/lon`; `docs.panoramax.fr/web-viewer/03_URL_settings/`) and survive the redirect, and `GET /api/pictures/<uuid>` answers 200 for a picture from our own run — so the meta-catalog resolves a picture BY ID, without being told its instance.
+The instance is still absent from the tile layer, which is the true half of the original finding; it simply was never needed.
+Both registries therefore link the viewer, `https://api.panoramax.xyz/?focus=pic&pic={id}`, browser-verified on a real picture before shipping, and not the `/api/pictures/{id}/sd.jpg` asset route the JPEG link used.
 
 ### Tencent Street View
 

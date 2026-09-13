@@ -133,9 +133,9 @@ const RENDER_CAP = 40000;
  * `viewerUrl(panoId, row)` takes the whole CSV row, not just the image key,
  * because not every provider addresses an image by its own id: KartaView's
  * viewer is keyed on (sequence_id, sequence_index) and cannot build a link from
- * the photo id at all. GSV and Mapillary ignore the second argument. It may
- * return null — meaning "this row is not addressable" — and the popup builders
- * render that as no link rather than a dead one.
+ * the photo id at all. GSV, Mapillary and Panoramax ignore the second
+ * argument. It may return null — meaning "this row is not addressable" — and
+ * the popup builders render that as no link rather than a dead one.
  *
  * `fallbackViewerUrl(row)` / `fallbackViewerLabel` are the SECOND link a popup
  * may carry, for a provider whose own viewer cannot be relied on (issue #312).
@@ -147,7 +147,7 @@ const PROVIDERS = {
     label: "Google Street View",
     // Column-header form (issue #250). The pivoted grid/streets tables put one
     // sub-column PER PROVIDER under a grouped header, so the leaf label is
-    // repeated across every metric group and has to be short enough that three
+    // repeated across every metric group and has to be short enough that four
     // of them fit a measure. Consumers fall back to `label`, so a provider
     // registered without one still renders.
     shortLabel: "GSV",
@@ -293,6 +293,78 @@ const PROVIDERS = {
     hasCopyrightFilter: false,
     // Overwhelmingly flat dashcam imagery outside the Grab fleet markets, so a
     // coverage number has to say which of the two it counts.
+    hasFlatImagery: true,
+  },
+  panoramax: {
+    label: "Panoramax",
+    shortLabel: "Panoramax",
+    // The third census provider: the z15 `pictures` layer enumerates every
+    // picture in the tile, so the count is unbounded by the grid the way
+    // Mapillary's and KartaView's are, and must not be subtracted from GSV's
+    // sampled one.
+    panoCountingModel: "census",
+    description:
+      "Crowdsourced Panoramax imagery: a census of every picture in the open federation, 360° and flat",
+    panoNoun: "Panoramax Panoramas",
+    // Panoramax (IGN + OSM France) dates from 2022. The ramp anchor only:
+    // imported older imagery (Paris reaches back to 2015) clamps to the dark
+    // end, which getColor already does.
+    launchDate: new Date("2022-01-01"),
+    // 2004, mirroring analysis.EARLIEST_PLAUSIBLE_CAPTURE["panoramax"], and
+    // loose for the same reason the other two census floors are: the
+    // federation carries community uploads of genuinely old photographs. What
+    // it actually drops is the measured 1970-01 epoch sentinel
+    // (docs/experiments/panoramax-feasibility.md). Ties Mapillary and
+    // KartaView, so LOOSEST_EARLIEST_PLAUSIBLE_CAPTURE and the JS/Python
+    // divergence documented below stay unmoved.
+    earliestPlausibleCapture: new Date(2004, 0, 1), // local midnight; see above
+    // No licence named: Panoramax licences are per picture, not per
+    // federation, so a single CC string here would be a claim about 119M
+    // images we have not checked. The published screen artifact says the same.
+    attribution:
+      'Image metadata © <a href="https://panoramax.fr">Panoramax</a> contributors',
+    viewerLabel: "View in Panoramax",
+    // The federation's own viewer, addressed by picture id, and measured
+    // rather than assumed (2026-09-10, issue #334) because the rationale this
+    // replaces was wrong in exactly the way #312 warns about:
+    //
+    //   - `https://api.panoramax.xyz/` 307s to `/en/index`, whose body embeds
+    //     `<pnx-viewer endpoint="/api" metacatalog="false">` — the official
+    //     @panoramax/web-viewer bound to the meta-catalog we collect from.
+    //     The earlier note that "the meta-catalog hosts no viewer, its root is
+    //     a marketing page" was simply untrue.
+    //   - Permalink parameters are QUERY-STRING, not hash
+    //     (docs.panoramax.fr/web-viewer/03_URL_settings/): `pic=<uuid>` plus
+    //     `focus=pic`. They survive the 307.
+    //   - `GET /api/pictures/<uuid>` answers 200 for an Ames row, so the
+    //     meta-catalog resolves a picture without being told which of the 23
+    //     federated instances owns it — the objection that killed this link
+    //     the first time round.
+    //
+    // Browser-verified on a real Ames picture before shipping (the #312 lesson
+    // applied BEFORE, not after): the viewer loads the 360° image. Hence no
+    // fallback below — a fallback is for a provider whose own viewer cannot be
+    // trusted, and this one can.
+    //
+    // Null without an id, for the reason spelled out on the gsv entry:
+    // Panoramax publishes flat imagery, so a FLAT_ONLY popup carrying no id is
+    // the same reachable shape as Mapillary's, and `...&pic=` is a truthy
+    // string that renders as a link to nowhere.
+    viewerUrl: (panoId) =>
+      panoId
+        ? `https://api.panoramax.xyz/?focus=pic&pic=${encodeURIComponent(panoId)}`
+        : null,
+    fallbackViewerLabel: null,
+    fallbackViewerUrl: null,
+    // copyright_info is "© Panoramax contributor <uuid>" on every row: a
+    // contributor id, not an official-fleet marker, so there is no subset to
+    // filter to.
+    hasCopyrightFilter: false,
+    // Load-bearing, not cosmetic. Panoramax publishes both `equirectangular`
+    // and flat, and the split is lopsided and city-dependent — Paris 355,278
+    // of 1,118,155 pictures are 360°, Des Moines 548,451 of 551,060 — so a
+    // registry entry omitting this would render the any-imagery number as if
+    // it equalled the 360° one, which is true only for GSV.
     hasFlatImagery: true,
   },
 };

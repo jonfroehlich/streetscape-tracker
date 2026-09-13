@@ -103,6 +103,41 @@ def test_every_known_provider_has_a_display_entry():
     assert set(vis.PROVIDER_DISPLAY) == set(KNOWN_PROVIDERS)
 
 
+def test_the_js_registry_covers_every_known_provider_too():
+    """
+    The same coverage pin for the browser-side registry, and the hole that
+    made issue #334 possible: Python had this check and JS had none, so
+    panoramax could be — and was, for three PRs — a COLLECTED provider that
+    was not REGISTERED. CLAUDE.md states the inverse rule ("a registered
+    provider is not a collected one"), and every frontend fan-out already
+    gates on presence in the payload, so nothing failed: ``grid.js`` and
+    ``streets.js`` simply skipped its rows, ``index.js`` rewrote
+    ``?provider=panoramax`` to gsv, and ``city.js`` rendered 135,389 Panoramax
+    pictures under Google's attribution, colour ramp and 2007 floor.
+
+    Read out of the source the way
+    ``test_the_js_registry_builds_the_same_kartaview_urls`` does — there is no
+    Node in the fast suite — anchored on the ``const PROVIDERS = {`` block so
+    a key elsewhere in the file cannot satisfy it.
+    """
+    import re
+
+    from streetscape_metadata_tracker.naming import KNOWN_PROVIDERS
+
+    js_path = pathlib.Path(__file__).resolve().parent.parent / "www" / "js" / "streetscape-utils.js"
+    js = js_path.read_text(encoding="utf-8")
+
+    block = re.search(r"^const PROVIDERS = \{$(.*?)^\};$", js, re.MULTILINE | re.DOTALL)
+    assert block, "www/js/streetscape-utils.js no longer spells `const PROVIDERS = {`"
+    keys = set(re.findall(r"^  ([a-z_]+): \{$", block.group(1), re.MULTILINE))
+
+    assert keys == set(KNOWN_PROVIDERS), (
+        "www/js/streetscape-utils.js PROVIDERS and naming.KNOWN_PROVIDERS disagree: "
+        f"only in JS {sorted(keys - set(KNOWN_PROVIDERS))}, "
+        f"only in Python {sorted(set(KNOWN_PROVIDERS) - keys)}"
+    )
+
+
 def test_kartaview_run_builds_a_map():
     """A kartaview run must render (the KeyError regression), link included."""
     rows = [_row("p1", 47.60, -122.33), _row("p2", 47.62, -122.35)]
@@ -249,6 +284,39 @@ def test_the_js_registry_builds_the_same_kartaview_urls():
     assert 'lat === ""' in js and 'lng === ""' in js
 
 
+def test_the_js_registry_builds_the_same_panoramax_url():
+    """
+    The Panoramax half of the hand-maintained-pair problem, and the one that
+    just moved: both copies linked the raw JPEG until #334 measured the
+    federation viewer, and only the JS copy is what a visitor clicks.
+
+    Compares the URL the PYTHON builder actually produces against the JS
+    source rather than grepping for a string the JS obviously contains — the
+    same standard the KartaView parity test above was raised to. A
+    Python-side change of `focus`, of the parameter name, or back to
+    `/api/pictures/{id}/sd.jpg` fails here.
+    """
+    js_path = pathlib.Path(__file__).resolve().parent.parent / "www" / "js" / "streetscape-utils.js"
+    js = js_path.read_text(encoding="utf-8")
+
+    pano_id = "599c8ad1-3a21-4311-9179-82e31ed23d32"  # a real row from the Ames run
+    url = vis.PROVIDER_DISPLAY["panoramax"]["viewer_url"](pano_id, pd.Series({}))
+
+    prefix = "https://api.panoramax.xyz/?focus=pic&pic="
+    assert url == prefix + pano_id
+    assert prefix in js, f"JS registry does not build {url!r}"
+
+    # And the link that was there before is gone from both sides, so a reader
+    # cannot find two answers to "what does a Panoramax popup open?".
+    assert "sd.jpg" not in js
+    assert "sd.jpg" not in pathlib.Path(vis.__file__).read_text(encoding="utf-8")
+
+    # Both copies spell the same label, which is the half a URL test misses:
+    # #312's rule is that the label must describe what the link opens.
+    assert vis.PROVIDER_DISPLAY["panoramax"]["viewer_label"] == "View in Panoramax"
+    assert 'viewerLabel: "View in Panoramax"' in js
+
+
 def test_kartaview_urls_percent_encode_their_row_values():
     """
     Both builders percent-encode everything they take from a row, so a value
@@ -272,7 +340,7 @@ def test_no_display_entry_builds_a_link_it_has_no_address_for():
     The Python half of the JS registry sweep (#312, PR #326), and the reason it
     is a sweep: the browser-side guard shipped naming gsv and mapillary, and
     the three PROVIDER_DISPLAY entries that mirror it kept building
-    ``...?pKey=``, ``...&pano=`` and ``.../pictures//sd.jpg`` from an empty id
+    ``...?pKey=``, ``...&pano=`` and ``...&pic=`` from an empty id
     — truthy strings, so the popup rendered a link to nowhere rather than no
     link.
 
@@ -358,3 +426,4 @@ def test_the_js_registry_guards_its_id_addressed_viewers_too():
     # And that the two id-addressed entries actually carry a conditional.
     assert "panoId\n        ? `https://www.google.com/maps/@" in js
     assert "panoId ? `https://www.mapillary.com/app/?pKey=" in js
+    assert "panoId\n        ? `https://api.panoramax.xyz/?focus=pic&pic=" in js

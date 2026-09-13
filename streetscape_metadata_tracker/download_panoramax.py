@@ -83,6 +83,7 @@ from .census import dedupe_census
 from .checkpointing import (
     CHECKPOINT_MAX_AGE_S,
     PANORAMAX_CHECKPOINT_FORMAT_VERSION,
+    SWEEP_UNIT_TILES,
     CensusCache,
     _bbox_matches,
     _fsync_dir,
@@ -103,6 +104,7 @@ from .download_common import (
     AsyncRateLimiter,
     DownloadError,
     HostBlockedError,
+    SweepIncompleteError,
     grid_bbox,
     points_in_tiles,
     redact_credentials,
@@ -440,7 +442,12 @@ def build_empty_rows(query_lat, query_lon, query_timestamp: str, status) -> pd.D
 # count requests.
 MAX_FAILED_TILE_FRACTION = 0.02
 
-_TILE_MAX_TRIES = 5
+# PUBLIC for the same reason Mapillary's is (#318): one tile's worst-case
+# attempt is what a request cap has to be able to fund before launching is worth
+# anything. Nothing prices a Panoramax launch floor yet -- the channel is in
+# UNWIRED_CHANNELS -- but the constant is exported now so wiring it does not have
+# to rediscover which number the floor comes from.
+TILE_MAX_TRIES = 5
 _TILE_MAX_TIME_S = 120
 
 # Client-side pacing. NOTHING IS DOCUMENTED — no limit in the API docs, none in
@@ -479,7 +486,7 @@ _TILE_ERROR_CONTENT_TYPES = ("text/html", "application/json")
 @backoff.on_exception(
     backoff.expo,
     (asyncio.TimeoutError, aiohttp.ClientError),
-    max_tries=_TILE_MAX_TRIES,
+    max_tries=TILE_MAX_TRIES,
     max_time=_TILE_MAX_TIME_S,
 )
 async def _fetch_tile(
@@ -491,7 +498,7 @@ async def _fetch_tile(
     on_empty: Callable[[], None] | None = None,
 ) -> bytes:
     # Pacing and counting sit INSIDE the retried body (issue #198): this
-    # function may issue up to _TILE_MAX_TRIES requests, and taking one token in
+    # function may issue up to TILE_MAX_TRIES requests, and taking one token in
     # the caller would let a retrying tile present five times the configured
     # rate — during a 5xx storm, i.e. when the host is least able to absorb it —
     # while under-reporting the same factor to the ledger.
@@ -1061,6 +1068,7 @@ async def fetch_city_images_async(
     request_timeout: float = 30,
     max_requests_per_minute: int = DEFAULT_TILE_REQUESTS_PER_MINUTE,
     jitter: float = DEFAULT_TILE_JITTER,
+    max_requests: int | None = None,
     checkpoint_path: str | None = None,
     checkpoint_channel: str | None = None,
     checkpoint_variant: str | None = None,
@@ -1091,6 +1099,7 @@ async def fetch_city_images_async(
                 request_timeout=request_timeout,
                 max_requests_per_minute=max_requests_per_minute,
                 jitter=jitter,
+                max_requests=max_requests,
                 checkpoint_path=checkpoint_path,
                 checkpoint_channel=checkpoint_channel,
                 checkpoint_variant=checkpoint_variant,
@@ -1111,6 +1120,7 @@ async def _fetch_city_images(
     request_timeout: float = 30,
     max_requests_per_minute: int = DEFAULT_TILE_REQUESTS_PER_MINUTE,
     jitter: float = DEFAULT_TILE_JITTER,
+    max_requests: int | None = None,
     checkpoint_path: str | None = None,
     checkpoint_channel: str | None = None,
     checkpoint_variant: str | None = None,
@@ -1130,6 +1140,13 @@ async def _fetch_city_images(
         request_timeout: per-request timeout in seconds.
         max_requests_per_minute: client-side pacing cap. <= 0 disables pacing.
         jitter: the #292 gap coefficient of variation.
+        max_requests: stop after this many requests, CHECKPOINT the unfetched
+            tiles and raise :class:`SweepIncompleteError` (issue #318), or None
+            to fetch every tile. A SOFT ceiling: requests already in flight when
+            it trips are allowed to finish, so the overshoot is bounded by
+            ``connection_limit * TILE_MAX_TRIES`` rather than by the size of the
+            city. Requires ``checkpoint_path`` -- capped and uncheckpointed, a
+            crawl discards everything it paid for.
         checkpoint_path: directory to resume from and commit into, or None for
             fetch-everything. Built by the caller, because only the caller knows
             the channel — see :func:`checkpointing.checkpoint_path_for`.
@@ -1152,9 +1169,35 @@ async def _fetch_city_images(
         (``census_fetched_by`` / ``census_fetched_at`` / ``census_reused``).
 
     Raises:
+        ValueError: ``max_requests`` given without a ``checkpoint_path``. A
+            caller bug rather than a runtime condition -- both silent
+            fall-backs are wrong in a way nothing downstream could see, since
+            ignoring the cap overspends a per-IP budget and honouring it burns
+            one for nothing.
+        SweepIncompleteError: the cap was reached with tiles unfetched and the
+            checkpoint holds them. Progress, not breakage: it maps to exit 83,
+            which the scheduler amnesties rather than counting a failure.
         DownloadError: on a refusal or transport failure, carrying
             ``api_requests`` so the caller can still record what it spent.
     """
+    if max_requests is not None and checkpoint_path is None:
+        # REFUSED HERE, before a single request, because the two arguments are
+        # only meaningful together (issue #318). A cap says "spend this much
+        # tonight and continue tomorrow", and without somewhere to commit to
+        # there is no tomorrow -- the crawl would stop at the cap and throw
+        # every tile it paid for away, nightly, forever, while the ledger showed
+        # the spend and the catalog showed no run.
+        #
+        # A ValueError rather than a quiet fall-back to uncapped, because both
+        # fall-backs are wrong in a way nothing downstream could see: ignoring
+        # the cap silently overspends a per-IP budget, and honouring it silently
+        # burns it. The only caller that passes a cap is the scheduler, which
+        # always passes a checkpoint path with it, so this fires for a
+        # programming error and never for an operator.
+        raise ValueError(
+            "max_requests needs a checkpoint_path: a capped crawl stops part-way, "
+            "and with nothing to resume from that discards everything it spent."
+        )
     tiles = tiles_for_bbox(*bbox)
     logger.info(
         f"Fetching Panoramax metadata for {city_name}: {len(tiles)} z{TILE_ZOOM} "
@@ -1270,8 +1313,27 @@ async def _fetch_city_images(
     # remaining tile would fail identically, so stop issuing them (issue #205).
     fatal: DownloadError | None = None
 
+    # The cap tripped: stop DISPATCHING, and pause rather than fail (issue
+    # #318). A SEPARATE flag from `fatal` rather than a second meaning for it,
+    # because the two say opposite things about the tiles they skip. `fatal`
+    # means every remaining tile would fail identically, so the city is over;
+    # this means every remaining tile is perfectly fetchable and we are simply
+    # out of budget for tonight, so they are owed to tomorrow. Folding them
+    # together would make one of the two exit codes wrong whichever way it went.
+    capped = False
+
+    # Requests promised to tiles that are past the cap check but have not yet
+    # counted one. THE CAP GATES ON `api_requests + reserved`, NOT ON
+    # `api_requests` ALONE -- the same reservation `download_mapillary` makes,
+    # for the same reason and with the same residue; see the long comment there.
+    # In short: `count_request` fires after `rate_limiter.acquire()`, so without
+    # this every task the semaphore admits clears a check reading a stale
+    # `api_requests` and the cap is overshot by connection_limit - 1 as a matter
+    # of course (measured: cap 200 at connection_limit 50 spent 249).
+    reserved = 0
+
     async def fetch_one(x: int, y: int) -> pd.DataFrame:
-        nonlocal fatal
+        nonlocal fatal, capped, reserved
         url = TILE_URL_TEMPLATE.format(z=TILE_ZOOM, x=x, y=y)
         # Per-tile, alongside the whole-city counter: the commit below needs to
         # know whether THIS tile 404ed, not how many did.
@@ -1293,6 +1355,34 @@ async def _fetch_city_images(
                 # must not read like a city that hung at tile 3.
                 progress_bar.update(1)
                 return records_to_census([])
+            if max_requests is not None and api_requests + reserved >= max_requests:
+                # THE CAP IS CHECKED HERE FOR THE REASON THE ABORT ABOVE IS, and
+                # it inherits that check's shape but not its bound. A tile
+                # admitted here reserves its request before releasing control,
+                # so the cap is not overshot at all in the ordinary case; what
+                # remains is RETRIES BY TILES ALREADY IN FLIGHT, at most
+                # connection_limit * (TILE_MAX_TRIES - 1) -- 200 at prod's
+                # connection_limit of 50, never "20 at the defaults", since no
+                # scheduled run uses the argparse default of 5.
+                #
+                # It is a soft ceiling on purpose: stopping requests already in
+                # flight would mean cancelling a paced, retrying fetch
+                # mid-attempt, which costs the guarantee that every request we
+                # made was counted.
+                #
+                # Returning an empty census WITHOUT committing is what makes
+                # this resumable: an uncommitted tile is not in `done`, so the
+                # next invocation's `todo` still holds it. The empty frame never
+                # reaches the census -- the raise below happens before the
+                # settle loop, precisely so a skipped tile cannot be read as a
+                # tile observed to be empty.
+                capped = True
+                progress_bar.update(1)
+                return records_to_census([])
+            # Reserved BEFORE the await, released after it: there is no
+            # suspension point between the check above and this line, so the
+            # loop cannot interleave another task into the gap.
+            reserved += 1
             try:
                 # Pacing/counting happen inside _fetch_tile, per retried attempt.
                 tile_bytes = await _fetch_tile(
@@ -1305,6 +1395,10 @@ async def _fetch_city_images(
                 # cannot discard a city.
                 fatal = fatal or e
                 raise
+            finally:
+                # Every exit from the fetch, exception included: a leaked
+                # reservation would shrink the cap for the rest of the crawl.
+                reserved -= 1
         progress_bar.update(1)
         # Convert to columns HERE, not after the gather: asyncio.gather holds
         # every tile's result until the last one lands, so returning dicts would
@@ -1371,6 +1465,61 @@ async def _fetch_city_images(
     if fatal is not None:
         raise interrupted(fatal)
 
+    # BEFORE THE SETTLE LOOP, and that is the whole safety argument (issue
+    # #318). A tile skipped at the cap returned an EMPTY census rather than an
+    # exception, so from here on it is indistinguishable from a tile the server
+    # answered with no imagery: it would land in `fetched`, reassemble into the
+    # census, and publish absence that was never observed -- as an immutable
+    # dated snapshot, diffing against its predecessor as "every pano in the rest
+    # of the city removed". Nothing below this line can tell the two apart, so
+    # nothing below this line ever sees a capped crawl.
+    if capped:
+        committed = len(checkpoint.done) if checkpoint is not None else 0
+        detail = (
+            f"Panoramax tile census for {city_name} stopped at its "
+            f"{max_requests:,}-request cap with {committed}/{len(tiles)} tiles fetched; "
+            f"{api_requests} requests spent this process, "
+            f"{_census_requests_total(checkpoint, api_requests)} in total."
+        )
+        if checkpoint is None or checkpoint.degraded or not checkpoint.done:
+            # NOT a pause, because there is nothing to resume FROM, in any of
+            # THREE ways. No checkpoint at all (an unwritable directory --
+            # `_open_tile_checkpoint` fails open); one whose commits latched off
+            # mid-crawl; or one that is live and healthy and has committed
+            # NOTHING.
+            #
+            # That third one is the subtle member and it is not hypothetical:
+            # `_commit_spend` returns early on an empty `done`, deliberately, so
+            # a crawl that commits no tile writes no `state.json` at all. A cap
+            # near the launch floor whose in-flight tiles all fail transiently
+            # -- a 404 storm, a partial block -- reaches exactly that state, and
+            # calling it a pause would raise "progress is checkpointed at ...,
+            # re-run to continue" over an empty directory. Exit 83 is amnestied,
+            # so the next night starts from tile 0 and does the same, forever,
+            # with no failure counted and nothing for an alert to see.
+            #
+            # A plain DownloadError takes none of the exit-83 amnesty and counts
+            # a real failure, which is the honest answer: calling this progress
+            # would tell an operator to re-run a command that spends the same
+            # requests and stops in the same place. The caller is refused a cap
+            # without a checkpoint PATH at all (see the guard above); these are
+            # the runtime halves of the same rule, and they are why that guard
+            # is not enough on its own.
+            raise interrupted(
+                DownloadError(f"{detail} No tile is checkpointed, so nothing can be resumed.")
+            )
+        raise interrupted(
+            SweepIncompleteError(
+                f"{detail} Progress is checkpointed at {checkpoint.path}; re-running with "
+                f"the same checkpoint path continues it. Nothing is finalized: a partial "
+                f"census must never be published as a dated snapshot.",
+                checkpoint_path=checkpoint.path,
+                units_done=committed,
+                unit_count=len(tiles),
+                unit_name=SWEEP_UNIT_TILES,
+            )
+        )
+
     fetched: dict[tuple[int, int], pd.DataFrame] = {}
     failed_tiles: list[tuple[int, int]] = []
     first_error: BaseException | None = None
@@ -1399,6 +1548,19 @@ async def _fetch_city_images(
     # tiles alone and publish a partial city as a complete one. Two is the bar
     # because a single 404 is a hole worth one tile while two, against a
     # measured baseline of zero in 3,321 requests, is a moved endpoint.
+    #
+    # A CAPPED NIGHT NEVER REACHES THIS, and that is a real gap rather than a
+    # consequence worth restating as a feature. The cap raises
+    # SweepIncompleteError above the settle loop -- deliberately, so a tile the
+    # cap skipped is not committed as an empty one -- which also means neither
+    # this guard nor the MAX_FAILED_TILE_FRACTION check below runs. With at
+    # least one tile already committed on an earlier night, a moved endpoint on
+    # a capped night therefore exits 83, which is amnestied, and repeats nightly
+    # until the checkpoint hits its seven-day wall. The alternative (evaluating
+    # the guard over `done` alone) would refuse cities that are genuinely empty
+    # in the part they got to, so the trade stands -- but a Panoramax channel
+    # wired to launch capped (#316 phase 2) wants an endpoint probe at the START
+    # of a capped run, not this one at the end.
     if len(todo) >= 2 and empty_tiles == len(todo):
         error = DownloadError(
             f"Every one of the {len(todo)} Panoramax tiles requested for {city_name} "
@@ -1461,6 +1623,16 @@ async def _fetch_city_images(
         and checkpoint is not None
         and not checkpoint.degraded
         and checkpoint.created_at is not None
+        # EVERY TILE ACCOUNTED FOR -- fetched by some night, or recorded failed
+        # (issue #318). This term was absent while it could not be false: the
+        # only ways to reach this line with tiles missing all raised above it,
+        # so the position of the promotion block WAS the completeness argument.
+        # A request cap makes that argument depend on one `if capped: raise`
+        # staying above this line forever. It is the same rule the READER
+        # already applies in `is_complete`, so an entry promoted without it
+        # would be refused and deleted on first use -- silently costing a whole
+        # crawl rather than failing anywhere visible.
+        and checkpoint.done.keys() | set(failed_tiles) == set(tiles)
     ):
         promoted = promote_checkpoint_to_cache(
             checkpoint.path,
@@ -1507,6 +1679,7 @@ async def download_panoramax_metadata_async(
     request_timeout: float = 30,
     max_requests_per_minute: int = DEFAULT_TILE_REQUESTS_PER_MINUTE,
     jitter: float = DEFAULT_TILE_JITTER,
+    max_requests: int | None = None,
     checkpoint_path: str | None = None,
     checkpoint_channel: str | None = None,
     census_cache: CensusCache | None = None,
@@ -1554,6 +1727,7 @@ async def download_panoramax_metadata_async(
         request_timeout=request_timeout,
         max_requests_per_minute=max_requests_per_minute,
         jitter=jitter,
+        max_requests=max_requests,
         checkpoint_path=checkpoint_path,
         checkpoint_channel=checkpoint_channel,
         census_cache=census_cache,

@@ -62,6 +62,7 @@ from .download_common import (
     SWEEP_INCOMPLETE_EXIT_CODE,
     HostBusyError,
     HostUnavailableError,
+    SweepIncompleteError,
     host_exit_code,
     jitter_fraction,
     positive_int,
@@ -69,7 +70,6 @@ from .download_common import (
 from .download_kartaview import (
     DEFAULT_REQUEST_TIMEOUT_S,
     DEFAULT_SWEEP_REQUESTS_PER_MINUTE,
-    SweepIncompleteError,
 )
 from .download_mapillary import DEFAULT_TILE_JITTER, DEFAULT_TILE_REQUESTS_PER_MINUTE
 from .download_panoramax import DEFAULT_TILE_JITTER as DEFAULT_PANORAMAX_JITTER
@@ -389,6 +389,26 @@ def parse_args():
     )
 
     concurrency_group.add_argument(
+        "--mapillary-max-requests",
+        type=_positive_int,
+        default=None,
+        help="""Stop a Mapillary tile census after this many requests and
+             CHECKPOINT the rest (mapillary provider only, issue #318). Not a
+             sampling knob: nothing is published, because a partial census dated
+             today would diff against its predecessor as 'every pano in the rest
+             of the city removed'. What it buys is that the spend survives — the
+             run exits 83 and the next invocation resumes from the tiles already
+             fetched, so a city that does not fit tonight's remaining budget is
+             collected over two nights instead of skipped. A SOFT ceiling, but a
+             tight one: a tile reserves its request at the check, so the cap is
+             not overshot at all unless a tile already in flight retries, and
+             that residue is bounded by connection_limit x (TILE_MAX_TRIES - 1)
+             — 200 at production's connection_limit of 50, which is the number
+             to reason with, not the argparse default of 5. Requires a
+             checkpoint to write to. Default: fetch every tile.""",
+    )
+
+    concurrency_group.add_argument(
         "--kartaview-max-requests-per-minute",
         type=int,
         default=DEFAULT_SWEEP_REQUESTS_PER_MINUTE,
@@ -446,6 +466,26 @@ def parse_args():
              rate is unchanged. Adopted here BEFORE any incident rather than
              after three (issue #292). Default {DEFAULT_PANORAMAX_JITTER}; 0
              restores the exact cadence.""",
+    )
+
+    concurrency_group.add_argument(
+        "--panoramax-max-requests",
+        type=_positive_int,
+        default=None,
+        help="""Stop a Panoramax tile census after this many requests and
+             CHECKPOINT the rest (panoramax provider only, issue #318). Not a
+             sampling knob: nothing is published, because a partial census dated
+             today would diff against its predecessor as 'every pano in the rest
+             of the city removed'. What it buys is that the spend survives — the
+             run exits 83 and the next invocation resumes from the tiles already
+             fetched, so a city that does not fit tonight's remaining budget is
+             collected over two nights instead of skipped. A SOFT ceiling, but a
+             tight one: a tile reserves its request at the check, so the cap is
+             not overshot at all unless a tile already in flight retries, and
+             that residue is bounded by connection_limit x (TILE_MAX_TRIES - 1)
+             — 200 at production's connection_limit of 50, which is the number
+             to reason with, not the argparse default of 5. Requires a
+             checkpoint to write to. Default: fetch every tile.""",
     )
 
     parser.add_argument(
@@ -665,7 +705,7 @@ async def async_main():
                 # Progress, not breakage — logged at INFO with the fraction
                 # done, and deliberately without a traceback.
                 logging.info(
-                    f"{provider} sweep paused at {e.roots_done}/{e.root_count} root cells; "
+                    f"{provider} crawl paused at {e.units_done}/{e.unit_count} {e.unit_name}; "
                     f"re-run to resume from {e.checkpoint_path}"
                 )
                 failed.append(provider)
@@ -710,7 +750,7 @@ async def async_main():
                 paused_provider, pause = incomplete[0]
                 print(
                     f"PAUSED: {paused_provider} checkpointed at "
-                    f"{pause.roots_done}/{pause.root_count} root cells. "
+                    f"{pause.units_done}/{pause.unit_count} {pause.unit_name}. "
                     f"Re-run the same command to resume; nothing was published."
                 )
                 return SWEEP_INCOMPLETE_EXIT_CODE
@@ -841,6 +881,7 @@ async def _collect_one_run(conn, args, city_row, run_date, provider, config, vis
                 request_timeout=request_timeout,
                 max_requests_per_minute=args.mapillary_max_requests_per_minute,
                 jitter=args.mapillary_jitter,
+                max_requests=args.mapillary_max_requests,
                 checkpoint_path=checkpoint_path,
                 # The channel again, this time INSIDE the commit record: the
                 # path separates channels only as long as every caller derives
@@ -886,6 +927,7 @@ async def _collect_one_run(conn, args, city_row, run_date, provider, config, vis
                 request_timeout=request_timeout,
                 max_requests_per_minute=args.panoramax_max_requests_per_minute,
                 jitter=args.panoramax_jitter,
+                max_requests=args.panoramax_max_requests,
                 checkpoint_path=checkpoint_path,
                 # The channel again, this time INSIDE the commit record: the
                 # path separates channels only as long as every caller derives

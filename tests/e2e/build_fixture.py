@@ -22,8 +22,13 @@ The three cities cover the render paths the smoke test asserts on:
     It also carries a **Mapillary** run and a Mapillary road walk, so it is the
     two-provider city the pivoted grid/streets tables (#250) need: without one,
     the cross-provider Δ columns and the union-not-intersection pivot render
-    nothing an assertion can see. And a second, **all_public** walk, for the
-    streets page's network selector.
+    nothing an assertion can see. And a **Panoramax** run and walk (#334), so
+    it is a THREE-provider city: the widest row the shared table chassis is
+    asked to render, which is the count at which the default preset stops
+    fitting the measure — and production had been three deep since KartaView
+    (#248) while this fixture carried two, so the width gate was green against
+    a payload narrower than the real one. And a second, **all_public** walk,
+    for the streets page's network selector.
   * a **0-pano** GSV city (#69/#122) — "—" dates, no ``Infinity%``/``NaN``
   * a **Mapillary-only** city        — provider toggle / ``?provider=``, and
     the one tracked city with no GSV capture date, which the driving-plan join
@@ -66,6 +71,7 @@ from streetscape_metadata_tracker.json_summarizer import (  # noqa: E402
 from tests.conftest import (  # noqa: E402
     make_city_df,
     make_mapillary_city_df,
+    make_panoramax_city_df,
     write_city_csv_gz,
 )
 
@@ -79,9 +85,18 @@ STEP = 20
 
 
 def _run_name(city_id, run_date, provider="gsv"):
-    """Filename for a run's csv.gz (gsv is tokenless, per naming.py)."""
-    token = "" if provider == "gsv" else f"_{provider}"
-    return f"{city_id}_width_{W}_height_{H}_step_{STEP}{token}_{run_date.isoformat()}.csv.gz"
+    """Filename for a run's csv.gz, from the real generator.
+
+    Hand-built here until issue #334, which is the mistake CLAUDE.md names
+    ("never hand-build these names, tests and fixtures included"): the walk
+    path had already been switched to ``naming.generate_streetwalk_filename``
+    after a hand-built token turned out not to match what production emits,
+    and this was the last copy left. A provider token that agreed with nothing
+    is the collision the token exists to prevent.
+    """
+    return (
+        naming.generate_run_filename(city_id, W, H, STEP, run_date, provider=provider) + ".csv.gz"
+    )
 
 
 def _write_summary(csv_path, city_name, state, country, run_date, provider="gsv"):
@@ -177,6 +192,36 @@ def _add_mapillary_run(conn, city_id, city_name, state, country, panos, run_date
     )
 
 
+def _add_panoramax_run(conn, city_id, city_name, state, country, panos, run_date, grid_origin):
+    """A Panoramax census run (issue #334), with flat-only points on purpose.
+
+    ``n_flat_only`` is non-zero so the run's any-imagery coverage exceeds its
+    360° coverage — the distinction ``hasFlatImagery`` exists for, and the one
+    a registry entry that omits the flag renders wrong rather than absent.
+    Panoramax's own split is lopsided and city-dependent (Paris 355,278 of
+    1,118,155 pictures are 360°; Des Moines 548,451 of 551,060), so a fixture
+    where the two numbers coincide would test the easy half.
+    """
+    name = _run_name(city_id, run_date, provider="panoramax")
+    csv_path = os.path.join(FIXTURE_DIR, name)
+    write_city_csv_gz(
+        make_panoramax_city_df(panos, run_date=run_date, grid_origin=grid_origin, n_flat_only=1),
+        csv_path,
+    )
+    json_path, df = _write_summary(
+        csv_path, city_name, state, country, run_date, provider="panoramax"
+    )
+    return _register_run_with_stats(
+        conn,
+        df=df,
+        run_date=run_date,
+        provider="panoramax",
+        city_id=city_id,
+        csv_filename=name,
+        json_filename=os.path.basename(json_path),
+    )
+
+
 def _record_real_diff(conn, city_id, from_run, to_run, from_date, to_date):
     """Diff the two runs with the REAL pipeline code and publish the detail CSV.
 
@@ -206,6 +251,18 @@ def _record_real_diff(conn, city_id, from_run, to_run, from_date, to_date):
         coverage_delta_pct=diff.coverage_delta_pct,
         detail_filename=detail_filename,
     )
+
+
+# The credit a walk's samples carry, per provider. Only ``© Google`` is load-
+# bearing (it is what ``analysis.is_google_copyright`` matches), but a walk
+# labelled with another provider's credit is the kind of fixture detail that
+# reads as a finding later.
+_CREDITS = {
+    "gsv": "© Google",
+    "mapillary": "© Mapillary contributor 42",
+    "kartaview": "© KartaView contributor 42",
+    "panoramax": "© Panoramax contributor cddcb3f2-9b2f-454b-8f03-da7dd6a966e2",
+}
 
 
 def _add_streetwalk(
@@ -275,11 +332,7 @@ def _add_streetwalk(
                 "pano_lon": r.lon if _covered(r) else None,
                 "pano_id": f"sw{r.Index}" if _covered(r) else None,
                 "capture_date": (None if (flat_only or not _covered(r)) else "2022-06-01"),
-                "copyright_info": (
-                    None
-                    if not _covered(r)
-                    else ("© Mapillary contributor 42" if flat_only else "© Google")
-                ),
+                "copyright_info": (None if not _covered(r) else _CREDITS[provider]),
                 "status": (
                     "ZERO_RESULTS" if not _covered(r) else ("FLAT_ONLY" if flat_only else "OK")
                 ),
@@ -418,6 +471,32 @@ def build():
             grid_origin=(44.00, -121.00),
         )
 
+        # ...and a THIRD provider on the same city and the same date (#334).
+        # Two reasons it is Panoramax and it is here rather than on its own
+        # city: the pivoted grid/streets tables put one sub-column per
+        # COLLECTED provider under each grouped header, so a three-provider
+        # city is the widest row the shared chassis is asked to render — the
+        # width question ADR 0001 leaves to the fixture, since there is no
+        # pagination or virtualization to fall back on. And three providers on
+        # one (city, date) is the filename-collision case the provider token
+        # exists to prevent, now exercised beyond a pair.
+        #
+        # Panoramax ids are UUIDs, which is also what the city page's viewer
+        # permalink is addressed by.
+        _add_panoramax_run(
+            conn,
+            alpha,
+            "Alpha City",
+            "Alphastate",
+            "Testland",
+            [
+                ("599c8ad1-3a21-4311-9179-82e31ed23d32", "2024-05-24"),
+                ("13662235-dd09-4207-a2cc-530f0b908190", "2025-05-24"),
+            ],
+            date(2026, 4, 15),
+            grid_origin=(44.00, -121.00),
+        )
+
         # 2) 0-pano GSV city (#69/#122): a run with no panos at all.
         zero = db.register_city(
             conn,
@@ -493,6 +572,19 @@ def build():
             date(2026, 4, 15),
             grid_origin=(44.00, -121.00),
             provider="mapillary",
+            flat_only=True,
+        )
+        # ...and a THIRD provider's walk on the same city, date and network
+        # (#334), so streets.html renders the same three-provider row width
+        # that grid.html now does. Recorded as flat-only imagery: Panoramax
+        # publishes both, so its 360° and any-imagery street-km must differ
+        # for the two columns to be telling a reader anything.
+        _add_streetwalk(
+            conn,
+            alpha,
+            date(2026, 4, 15),
+            grid_origin=(44.00, -121.00),
+            provider="panoramax",
             flat_only=True,
         )
         # ...and once more on the BROAD network, so the streets page's

@@ -381,12 +381,34 @@ function gridGroupKeys(id, columns = GRID_COLUMNS) {
 function buildGridPresets(columns = GRID_COLUMNS) {
   const groupKeys = (id) => gridGroupKeys(id, columns);
   return [
-    {
-      id: "overview",
-      label: "Overview",
-      title: "The headline read: how much imagery a city has, how fresh it is, and who has more",
-      columns: [...groupKeys("cov"), ...groupKeys("age"), ...groupKeys("collected")],
-    },
+    // The default, and the only one trimmed to the measure: its width grows
+    // with the number of COLLECTED providers, so what fits two overflows at
+    // three (issue #334). "Last collected" is the group that gives way there,
+    // because when we last scraped is a different question from how much
+    // imagery there is and how fresh it is, and the Provenance preset is one
+    // click away. At FOUR the Δ leaves go instead of a second group -- see
+    // fitDefaultPreset, which spends the width on a number for every provider
+    // rather than on a comparison of two of them.
+    fitDefaultPreset(
+      {
+        id: "overview",
+        label: "Overview",
+        // Assembled from the clauses whose columns survive the trim rather
+        // than spelled as one string -- a fixed title is an enumeration, and
+        // this one promised "how fresh it is" at the provider count where the
+        // age group is the one that gives way. Clause order is this map's key
+        // order; `delta` is the reserved id for the Δ leaves.
+        titleLead: "The headline read:",
+        titleParts: {
+          cov: "how much imagery a city has",
+          age: "how fresh it is",
+          collected: "when it was last collected",
+          delta: "who has more",
+        },
+        columns: [...groupKeys("cov"), ...groupKeys("age"), ...groupKeys("collected")],
+      },
+      columns
+    ),
     {
       id: "compare",
       label: "Compare providers",
