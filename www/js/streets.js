@@ -500,11 +500,13 @@ function buildStreetPresets(columns = STREET_COLUMNS) {
   return [
     // The default, and the only one trimmed to the measure: its width grows
     // with the number of COLLECTED providers, so what fits two overflows at
-    // three (issue #334). "Median age" is the group that gives way here
+    // three (issue #334). "Median age" is the group that gives way there
     // rather than "Walked", because a walk's DATE is what says whether the
     // coverage beside it is current -- and "Street km" survives as an
     // ungrouped scalar, since it is the denominator every percentage in the
-    // row is a percentage of.
+    // row is a percentage of. At FOUR providers "Walked" goes too: unlike
+    // grid.html, giving up the Δ does not save this page, because coverage +
+    // Walked + Street km is nine leaves with no Δ among them.
     fitDefaultPreset(
       {
         id: "overview",

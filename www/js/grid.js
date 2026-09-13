@@ -383,10 +383,12 @@ function buildGridPresets(columns = GRID_COLUMNS) {
   return [
     // The default, and the only one trimmed to the measure: its width grows
     // with the number of COLLECTED providers, so what fits two overflows at
-    // three (issue #334). "Last collected" is the group that gives way,
-    // because the preset's promise -- how much imagery, how fresh, who has
-    // more -- is coverage, median age and the Δ; when we last scraped is a
-    // different question, and the Provenance preset is one click away.
+    // three (issue #334). "Last collected" is the group that gives way there,
+    // because when we last scraped is a different question from how much
+    // imagery there is and how fresh it is, and the Provenance preset is one
+    // click away. At FOUR the Δ leaves go instead of a second group -- see
+    // fitDefaultPreset, which spends the width on a number for every provider
+    // rather than on a comparison of two of them.
     fitDefaultPreset(
       {
         id: "overview",
