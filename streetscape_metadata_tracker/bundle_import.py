@@ -33,20 +33,36 @@ it only makes it safe if nothing was written the first time.
 Validation is all-or-nothing; the write is not, and cannot be — every ``db``
 writer commits for itself, so an outer transaction here would not hold. What
 stands in for atomicity is ORDER. The ledger is written last, after every row
-that a retry's collision check would refuse on, so a crash part-way through
-leaves an import that can be diagnosed and finished by hand but can never
-double-charge: either the ledger write was not reached, or it was reached and
-the rows in front of it will refuse the retry.
+that a retry's collision check would refuse on AND after the cadence rows, so
+a crash part-way through leaves an import that can be diagnosed and finished
+by hand but can never double-charge: either the ledger write was not reached,
+or it was reached and the rows in front of it will refuse the retry. The
+cadence rows sit inside that ordering on purpose: a crash between the ledger
+and the cadence write would leave a refused retry AND a city the next night
+re-collects, with nothing pointing at why.
+
+**A series is append-only, and this host's copy of it is the one that counts.**
+The collector only ever adds the newest run of a (city, provider) series and
+diffs it against the one before, so every diff on this host describes two
+adjacent runs. A bundle run dated at or before this host's newest for that
+provider would slot into the middle of a series — the existing diff would then
+describe two runs that are no longer adjacent — so it is refused; the same for
+walks per (provider, network_type). And an imported run that extends a series
+gets its diff computed here, by the collector's own function: the bundle's
+catalog held only the laptop's runs, so nothing in it can describe the change
+since this host's previous snapshot.
 """
 
 from __future__ import annotations
 
+import filecmp
 import gzip
 import json
 import logging
 import os
 import shutil
 import sqlite3
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
@@ -55,10 +71,13 @@ from typing import Any
 from . import analysis, db, fileutils
 from .json_summarizer import regenerate_run_json
 from .naming import (
+    KNOWN_PROVIDERS,
     generate_run_filename,
     generate_streetwalk_filename,
+    same_grid_geometry,
     streetwalk_coverage_filename,
 )
+from .walk_diff import compute_and_record_walk_diff
 
 logger = logging.getLogger(__name__)
 
@@ -242,6 +261,19 @@ def read_bundle(path: str | os.PathLike[str]) -> Bundle:
     if not runs and not walks:
         raise BundleError("Bundle holds no runs and no street walks; nothing to import.")
 
+    # A provider this checkout does not know is the schema-drift case the
+    # version check exists for, one table over: the filename generators raise
+    # ValueError on it, which would surface as a traceback rather than the
+    # refusal every other bundle problem gets.
+    for kind, rows in (("run", runs), ("walk", walks)):
+        for r in rows:
+            if r.provider not in KNOWN_PROVIDERS:
+                raise BundleError(
+                    f"Bundle {kind} names provider {r.provider!r}, which this checkout does "
+                    f"not know (known: {', '.join(KNOWN_PROVIDERS)}). Update this host "
+                    "before importing."
+                )
+
     return Bundle(root=root, city=city, runs=runs, walks=walks, networks=networks, api_usage=usage)
 
 
@@ -363,6 +395,21 @@ def check_bundle(
                 f"this host already has a run filed under {run.row['csv_filename']} "
                 "(a different city or provider); refusing to collide"
             )
+        # Append-only (module docstring): landing this run would put it in the
+        # middle of the series, behind a diff that assumes adjacency. Its own
+        # `if`, not the chain's `elif`: a bundle that is both filename-colliding
+        # and out of order has two problems, and a refusal that names only one
+        # sends the operator to fix the wrong thing.
+        if newest := conn.execute(
+            "SELECT run_date FROM runs WHERE city_id = ? AND provider = ? AND run_date > ? "
+            "ORDER BY run_date DESC LIMIT 1",
+            (bundle.city_id, run.provider, run.row["run_date"]),
+        ).fetchone():
+            problems.append(
+                f"this host's newest {run.provider} run is {newest['run_date']}, after the "
+                f"bundle's {run.row['run_date']}; a series is append-only, so an older "
+                "snapshot cannot be inserted behind it"
+            )
     for walk in bundle.walks:
         if conn.execute(
             "SELECT 1 FROM street_walks WHERE city_id = ? AND provider = ? "
@@ -381,6 +428,16 @@ def check_bundle(
                 f"this host already has a walk filed under {walk.row['csv_filename']}; "
                 "refusing to collide"
             )
+        if newest := conn.execute(
+            "SELECT run_date FROM street_walks WHERE city_id = ? AND provider = ? "
+            "AND network_type = ? AND run_date > ? ORDER BY run_date DESC LIMIT 1",
+            (bundle.city_id, walk.provider, walk.row["network_type"], walk.row["run_date"]),
+        ).fetchone():
+            problems.append(
+                f"this host's newest {walk.provider}/{walk.row['network_type']} walk is "
+                f"{newest['run_date']}, after the bundle's {walk.row['run_date']}; a walk "
+                "series is append-only, so an older walk cannot be inserted behind it"
+            )
 
     # Every file a row names has to be here. A catalog row pointing at a missing
     # artifact is invisible to the aggregate and reads as a lost collection.
@@ -394,19 +451,46 @@ def check_bundle(
                 f"street_networks names {net['graphml_filename']} but it is not in "
                 f"{OSM_CACHE_DIRNAME}/"
             )
-        # register_street_network upserts on (city_id, network_type), so an
-        # existing row naming a different file would be replaced without a word.
-        # The graphml IS the network the walk's coverage was measured against.
+            continue
+        # The GraphML IS the network every walk of this city was measured
+        # against, and its name is deterministic per (city_id, network_type) —
+        # no date, no host token — so a bundle's network always names the SAME
+        # file this host already holds. A filename comparison therefore can
+        # never fire; the bytes are what decide. Identical: this host's copy is
+        # kept and nothing is written (apply_bundle skips it). Different: the
+        # bundle's walk was measured on another OSM snapshot than this host's
+        # series, and replacing the file would silently re-base every walk
+        # already cataloged here.
         row = conn.execute(
             "SELECT graphml_filename FROM street_networks WHERE city_id = ? AND network_type = ?",
             (bundle.city_id, net["network_type"]),
         ).fetchone()
-        if row is not None and row["graphml_filename"] != net["graphml_filename"]:
+        if row is None:
+            # No row, but the file may still be on disk (a registration that
+            # failed, a hand-copied cache). osm_cache/ is outside the artifact
+            # sweep above, so this is the only place that file is looked at:
+            # different bytes refuse, identical bytes are harmless to re-copy.
+            stray = Path(data_dir) / OSM_CACHE_DIRNAME / net["graphml_filename"]
+            if stray.is_file() and not filecmp.cmp(src, stray, shallow=False):
+                problems.append(
+                    f"{OSM_CACHE_DIRNAME}/{net['graphml_filename']} already exists here with "
+                    "different bytes and no catalog row; refusing to overwrite a network "
+                    "whose provenance nothing records"
+                )
+            continue
+        ours = Path(data_dir) / OSM_CACHE_DIRNAME / row["graphml_filename"]
+        if not ours.is_file():
+            problems.append(
+                f"this host's catalog names a {net['network_type']} network for this city "
+                f"({row['graphml_filename']}) that is not on disk; repair the network before "
+                "importing a walk measured against another copy of it"
+            )
+        elif not filecmp.cmp(src, ours, shallow=False):
             problems.append(
                 f"this host already has a {net['network_type']} network for this city "
-                f"({row['graphml_filename']}) differing from the bundle's "
-                f"({net['graphml_filename']}); refusing to replace the network a walk was "
-                "measured against"
+                f"({row['graphml_filename']}) and the bundle's differs byte-for-byte; the "
+                "walk was measured on a different frozen network than this host's series, "
+                "and replacing it would re-base every walk already cataloged here"
             )
 
     # Destination collisions on disk. Checked separately from the catalog ones
@@ -464,6 +548,13 @@ class ImportResult:
     usage: list[tuple[str, str, int]] = field(default_factory=list)
     stat_corrections: list[str] = field(default_factory=list)
     networks: list[str] = field(default_factory=list)
+    # Network types this host already held (byte-identical, so nothing was
+    # written for them) — reported so "1 network" vs "kept ours" is visible.
+    networks_kept: list[str] = field(default_factory=list)
+    # Human-readable "provider run_date: diffed against <prev>" lines, one per
+    # imported run or walk that extended a series this host already had.
+    diffs: list[str] = field(default_factory=list)
+    cadence_recorded: list[str] = field(default_factory=list)
 
 
 def apply_bundle(
@@ -473,6 +564,7 @@ def apply_bundle(
     data_dir: str,
     existing: db.CityRow | None,
     enable: bool,
+    cadence_channels: Sequence[str] = (),
 ) -> ImportResult:
     """
     Write the bundle. Call only on a :func:`check_bundle` that returned no problems.
@@ -480,6 +572,12 @@ def apply_bundle(
     Files land before rows, because a row naming a missing artifact is worse
     than an orphan file: the aggregate skips it, so the run reads as lost rather
     than as needing a re-copy.
+
+    ``cadence_channels`` are the scheduler channels to stamp a success on
+    (``db.record_attempt``) — resolved by the caller, since which channel an
+    artifact belongs to is the scheduler's knowledge, not this module's. They
+    are written here rather than by the caller so that they land BEFORE the
+    ledger (module docstring).
     """
     result = ImportResult(city_id=bundle.city_id, registered_city=existing is None)
 
@@ -507,11 +605,23 @@ def apply_bundle(
         assert city_id == bundle.city_id  # check_bundle proved this
     elif enable and not existing.enabled:
         db.set_city_enabled(conn, bundle.city_id, True)
+    city_row = existing or db.resolve_city(conn, bundle.city_id)
+    assert city_row is not None
+
+    # A network this host already holds is kept, not re-copied: check_bundle
+    # proved the bytes identical, and the row it has describes the file it
+    # has. Only a network new to this host lands.
+    new_networks = []
+    for net in bundle.networks:
+        if db.get_street_network(conn, bundle.city_id, net["network_type"]) is None:
+            new_networks.append(net)
+        else:
+            result.networks_kept.append(net["network_type"])
 
     for name in _artifact_sources(bundle):
         _copy_atomic(bundle.root / name, Path(data_dir) / name)
         result.files.append(name)
-    for net in bundle.networks:
+    for net in new_networks:
         name = net["graphml_filename"]
         _copy_atomic(
             bundle.root / OSM_CACHE_DIRNAME / name,
@@ -519,7 +629,7 @@ def apply_bundle(
         )
         result.files.append(f"{OSM_CACHE_DIRNAME}/{name}")
 
-    for net in bundle.networks:
+    for net in new_networks:
         db.register_street_network(
             conn,
             city_id=bundle.city_id,
@@ -528,13 +638,23 @@ def apply_bundle(
             node_count=net["node_count"],
             edge_count=net["edge_count"],
             osmnx_version=net["osmnx_version"],
+            # Carried, not stamped: this is when the OSM snapshot was taken,
+            # which is the provenance a frozen network is judged by.
+            fetched_at=net["fetched_at"],
         )
         result.networks.append(net["network_type"])
 
     for run in bundle.runs:
-        _register_run(bundle, run, conn, data_dir, result)
+        _register_run(bundle, city_row, run, conn, data_dir, result)
     for walk in bundle.walks:
-        _register_walk(walk, conn, result)
+        _register_walk(walk, conn, data_dir, result)
+
+    # Cadence BEFORE the ledger (module docstring): every row a retry would
+    # refuse on is committed, so from here a crash leaves nothing a retry could
+    # double-charge — and the next night must not re-collect what just landed.
+    for channel in cadence_channels:
+        db.record_attempt(conn, bundle.city_id, success=True, provider=channel)
+        result.cadence_recorded.append(channel)
 
     # LAST, deliberately — see the module docstring. Every row a retry would
     # collide on is already committed by this point, so a crash here cannot be
@@ -554,13 +674,15 @@ def apply_bundle(
 
 def _register_run(
     bundle: Bundle,
+    city_row: db.CityRow,
     run: BundleRun,
     conn: sqlite3.Connection,
     data_dir: str,
     result: ImportResult,
 ) -> None:
     """
-    Catalog one grid run, with its stats RECOMPUTED from the copied CSV.
+    Catalog one grid run, with its stats RECOMPUTED from the copied CSV, and
+    diff it against this host's previous run of the same provider.
 
     Recomputing rather than carrying the numbers is what makes the imported row
     indistinguishable from one this host collected: the CSV is the artifact, and
@@ -571,6 +693,14 @@ def _register_run(
     ``num_flat_images`` is the one exception — it is not recoverable from a CSV
     (see scripts/recompute_run_stats.py) — as are the provenance columns, which
     describe the collection rather than the data.
+
+    The diff is the collector's own ``_compute_and_record_diff`` — the bundle's
+    catalog knew only the laptop's runs, so nothing it holds can describe the
+    change since THIS host's previous snapshot, and ``regenerate_run_json``
+    replays a ``run_diffs`` row rather than computing one. Without the row, the
+    JSON's change block is null and ``city.js`` falls back to constructing the
+    detail filename from run history — a 404 on the site for a pair that was
+    never diffed.
     """
     csv_path = os.path.join(data_dir, run.row["csv_filename"])
     df = fileutils.load_city_csv_file(csv_path)
@@ -602,11 +732,50 @@ def _register_run(
     )
     result.run_providers.append(run.provider)
 
+    # The run is committed; from here every failure is cheap (a diff or JSON
+    # rebuilds from artifacts on disk), so neither may fail the import — the
+    # same placement the collector reasons through.
+    prev_run = db.get_previous_run(conn, bundle.city_id, run.run_date, provider=run.provider)
+    if prev_run is not None and not same_grid_geometry(
+        prev_run.csv_filename, run.row["csv_filename"]
+    ):
+        # The collector's own gate (cli.py), restated because check_bundle only
+        # proves the bundle matches this host's CURRENT frozen grid — the
+        # previous run may predate a catalog-only resize (#166) or be an
+        # archival baseline (#93). A cross-geometry diff compares different
+        # sampled areas, and the site renders its added/removed counts as
+        # imagery churn with no grid_aligned check anywhere in www/js.
+        logger.warning(
+            f"{bundle.city_id} [{run.provider}]: previous run {prev_run.run_date} is on a "
+            "different grid geometry; skipping the diff, as the collector would"
+        )
+        prev_run = None
+    if prev_run is not None:
+        # Everything from here is non-fatal, the lazy import included: cli
+        # pulls every downloader in, and an import failure at this point must
+        # not leave a cataloged run with no cadence row and no ledger. It
+        # writes the run_diffs row AND the detail CSV, which is exactly the
+        # pair regenerate_run_json below replays.
+        try:
+            from .cli import _compute_and_record_diff
+
+            _compute_and_record_diff(
+                conn, city_row, prev_run, run_id, run.run_date, df, data_dir, provider=run.provider
+            )
+            result.diffs.append(
+                f"{run.provider} {run.row['run_date']}: diffed against {prev_run.run_date}"
+            )
+        except Exception:
+            logger.exception(
+                f"{bundle.city_id} [{run.provider}]: diff against {prev_run.run_date} failed; "
+                "the run is cataloged, re-diff offline"
+            )
+
     # Regenerated here rather than copied. The bundle's JSON carries a
     # change_from_previous_run block computed against a catalog holding only
-    # this one run — i.e. "no previous run" — while THIS host may well have a
-    # series to diff against. Only the destination can write that block
-    # correctly, so the copied file is replaced immediately.
+    # the laptop's runs — i.e. "no previous run" — while THIS host may have a
+    # series, whose diff was just recorded above. The regeneration replays that
+    # row into the block, so the copied file is replaced immediately.
     try:
         regenerate_run_json(conn, run_id, data_dir)
     except Exception:
@@ -616,7 +785,9 @@ def _register_run(
         )
 
 
-def _register_walk(walk: BundleWalk, conn: sqlite3.Connection, result: ImportResult) -> None:
+def _register_walk(
+    walk: BundleWalk, conn: sqlite3.Connection, data_dir: str, result: ImportResult
+) -> None:
     """
     Catalog one road walk, carrying the bundle's own coverage numbers.
 
@@ -633,7 +804,7 @@ def _register_walk(walk: BundleWalk, conn: sqlite3.Connection, result: ImportRes
     recompute would have caught (a row and an artifact that are not about the
     same walk) at a fraction of the cost.
     """
-    db.register_street_walk(
+    walk_id = db.register_street_walk(
         conn,
         city_id=walk.row["city_id"],
         run_date=walk.run_date,
@@ -661,6 +832,33 @@ def _register_walk(walk: BundleWalk, conn: sqlite3.Connection, result: ImportRes
         finished_at=walk.row["finished_at"],
     )
     result.walk_providers.append(walk.provider)
+
+    # The walk analogue of the run diff above (issue #101), by the same shared
+    # function the collector and the salvage path use; it finds the predecessor
+    # itself and is a no-op on every first walk. Never fails a cataloged walk.
+    try:
+        change = compute_and_record_walk_diff(
+            conn,
+            data_dir=data_dir,
+            city_id=walk.row["city_id"],
+            walk_id=walk_id,
+            run_date=walk.run_date,
+            provider=walk.provider,
+            network_type=walk.row["network_type"],
+            spacing_m=walk.row["spacing_m"],
+            match_dist_m=walk.row["match_dist_m"],
+        )
+    except Exception:
+        logger.exception(
+            f"{walk.row['city_id']} [{walk.provider}/{walk.row['network_type']}]: walk diff "
+            "failed; the walk is cataloged, re-diff offline"
+        )
+        change = None
+    if change is not None:
+        result.diffs.append(
+            f"{walk.provider}/{walk.row['network_type']} walk {walk.row['run_date']}: "
+            f"diffed against {change.get('from')}"
+        )
 
 
 def verify_walk_artifacts(bundle: Bundle) -> list[str]:

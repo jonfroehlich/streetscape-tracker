@@ -3738,27 +3738,46 @@ def _run_due_in_flight() -> str | None:
     return None
 
 
-def _import_cadence_channel(provider: str, *, walk: bool) -> str | None:
+def _import_cadence_channel(
+    cfg: SchedulerConfig, provider: str, *, walk: bool, network_type: str | None = None
+) -> tuple[str | None, str]:
     """
     The scheduler channel an imported artifact belongs to, or None if there isn't one.
+
+    Returns ``(channel, label)``: the channel to stamp a success on, or None
+    with a label saying why not, for the closing report.
 
     Writing this is what stops the next night re-collecting what the laptop
     already paid for — the same ``record_attempt`` call ``reconcile-walks``
     makes after a salvage, and for the same reason.
 
-    None has two causes, both meaning "do not write a cadence row". A provider
+    None has three causes, all meaning "do not write a cadence row". A provider
     with no street channel yet (Panoramax walks, issue #331) has nothing to
     record against. A channel in ``UNWIRED_CHANNELS`` has a name but no
     scheduler arms, so a success there would suppress its FIRST real collection
-    once the channel is wired — the opposite of what the row is for.
+    once the channel is wired — the opposite of what the row is for. And a walk
+    on a network type other than the one the channel is configured to walk
+    (``[providers.<channel>].network_type``, default ``drive``): each type is
+    its own series with its own artifacts, so an ``all_public`` walk landing
+    here says nothing about whether the channel's ``drive`` walk is due — a
+    success stamped from it would suppress a walk nobody has collected.
     """
     if walk:
         channel = next((c for c, p in STREET_CHANNELS.items() if p == provider), None)
+        label = f"{provider}/{network_type} walk"
     else:
         channel = provider if provider in CHANNEL_DEFAULT_MEMBERSHIP else None
-    if channel is None or channel in UNWIRED_CHANNELS:
-        return None
-    return channel
+        label = provider
+    if channel is None:
+        return None, f"{label} (no scheduler channel yet)"
+    if channel in UNWIRED_CHANNELS:
+        return None, f"{label} ({channel} is not wired into the scheduler yet)"
+    if walk:
+        pc = cfg.providers.get(channel)
+        walks = pc.network_type if pc is not None else DEFAULT_NETWORK_TYPE
+        if network_type != walks:
+            return None, f"{label} ({channel} walks {walks!r}, so its cadence is untouched)"
+    return channel, label
 
 
 def cmd_import_bundle(
@@ -3792,14 +3811,18 @@ def cmd_import_bundle(
             )
             return USAGE_EXIT_CODE
 
+    # Reading and checking write nothing, so anything they raise is a refusal
+    # rather than a crash: a bundle whose rows this checkout cannot even name
+    # (a KeyError on a column, a ValueError from a generator) is the same
+    # "not importable here" answer as a BundleError, and it earns the same
+    # exit code rather than a traceback.
+    conn = db.connect(cfg.db_path)
     try:
         bundle = bundle_import.read_bundle(bundle_path)
-    except bundle_import.BundleError as e:
+        existing, problems = bundle_import.check_bundle(bundle, conn, cfg.data_dir)
+    except (bundle_import.BundleError, ValueError, KeyError) as e:
         print(f"REFUSED: {e}")
         return USAGE_EXIT_CODE
-
-    conn = db.connect(cfg.db_path)
-    existing, problems = bundle_import.check_bundle(bundle, conn, cfg.data_dir)
     if problems:
         print(f"REFUSED: {bundle.city_id} ({len(problems)} problem(s)); nothing was written.")
         for p in problems:
@@ -3829,7 +3852,23 @@ def cmd_import_bundle(
             f"{walk.row['length_km']} street-km"
         )
     for net in bundle.networks:
-        print(f"  network [{net['network_type']}]: {net['graphml_filename']}")
+        kept = db.get_street_network(conn, bundle.city_id, net["network_type"]) is not None
+        print(
+            f"  network [{net['network_type']}]: {net['graphml_filename']}"
+            f"{' (this host already has it, byte-identical; kept)' if kept else ''}"
+        )
+    # Resolved BEFORE the write so apply_bundle can stamp them ahead of the
+    # ledger (bundle_import's module docstring on ordering). This is the piece
+    # that stops the next night re-collecting what was just imported.
+    recorded, skipped = [], []
+    for run in bundle.runs:
+        channel, label = _import_cadence_channel(cfg, run.provider, walk=False)
+        (recorded if channel else skipped).append(channel or label)
+    for walk in bundle.walks:
+        channel, label = _import_cadence_channel(
+            cfg, walk.provider, walk=True, network_type=walk.row["network_type"]
+        )
+        (recorded if channel else skipped).append(channel or label)
     for row in bundle.api_usage:
         charged = row["provider"] in bundle_import.LEDGERED_PROVIDERS
         why = "charged here (shared credential)" if charged else "not charged (metered per IP)"
@@ -3840,23 +3879,17 @@ def cmd_import_bundle(
         return 0
 
     result = bundle_import.apply_bundle(
-        bundle, conn, data_dir=cfg.data_dir, existing=existing, enable=enable
+        bundle,
+        conn,
+        data_dir=cfg.data_dir,
+        existing=existing,
+        enable=enable,
+        cadence_channels=sorted(set(recorded)),
     )
     for correction in result.stat_corrections:
         logger.warning(f"recomputed stat differs from the bundle's: {correction}")
-
-    # The piece that stops the next night re-collecting what was just imported.
-    recorded, skipped = [], []
-    for provider in result.run_providers:
-        channel = _import_cadence_channel(provider, walk=False)
-        (recorded if channel else skipped).append(channel or provider)
-        if channel:
-            db.record_attempt(conn, result.city_id, success=True, provider=channel)
-    for provider in result.walk_providers:
-        channel = _import_cadence_channel(provider, walk=True)
-        (recorded if channel else skipped).append(channel or f"{provider} walk")
-        if channel:
-            db.record_attempt(conn, result.city_id, success=True, provider=channel)
+    for line in result.diffs:
+        print(f"  diff  {line}")
     db.assign_schedule(conn, cycle_days=cfg.cycle_days, providers=tuple(cfg.enabled_providers()))
 
     summary, complete = _regenerate_published_json(conn, cfg)
@@ -3875,15 +3908,19 @@ def cmd_import_bundle(
         f"{len(result.walk_providers)} walk(s), {len(result.files)} file(s)"
         f"{'; published' if published else ''}"
     )
-    if recorded:
+    if result.networks_kept:
+        print(f"  Kept this host's {', '.join(result.networks_kept)} network(s) (byte-identical).")
+    if result.cadence_recorded:
         # Same caution assess-city prints, for the same reason: the natural
-        # thing to assume here is the opposite of true.
+        # thing to assume here is the opposite of true. The clock starts NOW,
+        # not at the bundle's run date — a bundle imported N days after it was
+        # collected pushes that city's next collection out by N days.
         print(
-            f"  Cadence recorded for {', '.join(sorted(recorded))} — those channels are now "
-            "the LEAST stale rows for this city and are not due tonight."
+            f"  Cadence recorded for {', '.join(result.cadence_recorded)} — those channels are "
+            "now the LEAST stale rows for this city and are not due tonight."
         )
     if skipped:
-        print(f"  No cadence row for {', '.join(sorted(skipped))} (no scheduler channel yet).")
+        print(f"  No cadence row for {'; '.join(sorted(skipped))}.")
     return 0 if complete and (published or not cfg.publish_enabled) else 1
 
 

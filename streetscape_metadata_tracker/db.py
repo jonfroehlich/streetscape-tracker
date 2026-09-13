@@ -1506,12 +1506,18 @@ def register_street_network(
     node_count: int | None = None,
     edge_count: int | None = None,
     osmnx_version: str | None = None,
+    fetched_at: str | None = None,
 ) -> int:
     """
     Catalog a city's frozen OSM street network. Idempotent on
     (city_id, network_type): a --refresh re-fetch replaces the prior row
     (counts, osmnx version, fetched_at) rather than erroring — the network is
     a frozen asset with replace-on-refresh semantics, not a history.
+
+    ``fetched_at`` defaults to now — the collector calls this right after the
+    download — but a caller cataloging a network fetched elsewhere (the bundle
+    importer, issue #330) passes the original, since it is when the OSM
+    snapshot was taken, not when this row was written.
 
     Returns the network_id.
     """
@@ -1533,7 +1539,7 @@ def register_street_network(
             node_count,
             edge_count,
             osmnx_version,
-            utc_now_iso(),
+            fetched_at or utc_now_iso(),
         ),
     )
     conn.commit()

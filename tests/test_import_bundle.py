@@ -12,6 +12,7 @@ import gzip
 import json
 import os
 import sqlite3
+import sys
 from datetime import date
 
 import pytest
@@ -238,8 +239,13 @@ def test_city_is_registered_disabled_unless_enable_is_passed(cfg, bundle_dir):
 
 
 def test_enable_turns_on_a_city_that_is_already_registered_and_off(cfg, bundle_dir):
-    assert cmd_import_bundle(cfg, str(bundle_dir), execute=True) == 0
-    db.set_city_enabled(db.connect(cfg.db_path), CITY_ID, True)
+    # Through the importer, not db.set_city_enabled directly: the branch under
+    # test is apply_bundle's "existing city, disabled, --enable", which a
+    # helper call would leave unexercised.
+    conn = db.connect(cfg.db_path)
+    db.register_city(conn, **CITY, enabled=False)
+    conn.close()
+    assert cmd_import_bundle(cfg, str(bundle_dir), execute=True, enable=True) == 0
     assert _prod(cfg).execute("SELECT enabled FROM cities").fetchone()[0] == 1
 
 
@@ -463,3 +469,320 @@ def test_re_running_a_landed_import_refuses_rather_than_double_charging(cfg, bun
     before = _prod(cfg).execute("SELECT requests FROM api_usage").fetchone()[0]
     assert cmd_import_bundle(cfg, str(bundle_dir), execute=True) == 64
     assert _prod(cfg).execute("SELECT requests FROM api_usage").fetchone()[0] == before
+
+
+# ── importing into a city this host ALREADY tracks ────────────────────────
+#
+# Every test above lands in an empty catalog. These pre-register the city and
+# give it history, because the re-import path is the one the geometry check
+# exists for — and the one where an importer can quietly re-base a series.
+
+
+def _prod_network(cfg, content):
+    """Register the city on this host with its own frozen drive network."""
+    conn = db.connect(cfg.db_path)
+    db.register_city(conn, **CITY)
+    graphml = f"{CITY_ID}_streets_network.graphml"
+    cache = os.path.join(cfg.data_dir, bundle_import.OSM_CACHE_DIRNAME)
+    os.makedirs(cache, exist_ok=True)
+    path = os.path.join(cache, graphml)
+    with open(path, "w") as fh:
+        fh.write(content)
+    db.register_street_network(
+        conn,
+        city_id=CITY_ID,
+        graphml_filename=graphml,
+        network_type="drive",
+        edge_count=999,
+        osmnx_version="prod-1.0",
+    )
+    conn.close()
+    return path
+
+
+def test_an_existing_byte_identical_network_is_kept_not_rewritten(cfg, bundle_dir):
+    """
+    The GraphML name is deterministic per (city_id, network_type) — no date, no
+    host token — so a bundle's network always names the SAME file this host
+    holds. The bytes decide: identical means this host's row and file are kept
+    and nothing is written for it.
+    """
+    _prod_network(cfg, "<graphml/>")  # what the fixture's bundle carries
+    assert cmd_import_bundle(cfg, str(bundle_dir), execute=True) == 0
+    row = _prod(cfg).execute("SELECT edge_count, osmnx_version FROM street_networks").fetchone()
+    assert (row["edge_count"], row["osmnx_version"]) == (999, "prod-1.0")
+
+
+def test_an_existing_network_with_different_bytes_is_refused(cfg, bundle_dir):
+    """
+    The bundle's walk was measured on another OSM snapshot than this host's
+    series; replacing the file would silently re-base every walk cataloged here.
+    """
+    ours = "<graphml>this host's frozen network</graphml>"
+    path = _prod_network(cfg, ours)
+    assert cmd_import_bundle(cfg, str(bundle_dir), execute=True) == 64
+    assert open(path).read() == ours
+    assert _prod(cfg).execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0
+
+
+def test_a_networks_fetched_at_is_carried_not_restamped(cfg, bundle_dir):
+    """fetched_at is when the OSM snapshot was taken — the network's provenance."""
+    conn = sqlite3.connect(str(bundle_dir / bundle_import.CATALOG_NAME))
+    conn.execute("UPDATE street_networks SET fetched_at = '2026-09-09T12:00:00+00:00'")
+    conn.commit()
+    conn.close()
+    assert cmd_import_bundle(cfg, str(bundle_dir), execute=True) == 0
+    fetched = _prod(cfg).execute("SELECT fetched_at FROM street_networks").fetchone()[0]
+    assert fetched == "2026-09-09T12:00:00+00:00"
+
+
+def _prod_run(cfg, run_date, panos):
+    """Register the city on this host with one Mapillary run (CSV on disk)."""
+    conn = db.connect(cfg.db_path)
+    db.register_city(conn, **CITY)
+    stem = generate_run_filename(
+        CITY_ID,
+        CITY["grid_width_m"],
+        CITY["grid_height_m"],
+        CITY["step_m"],
+        run_date,
+        provider="mapillary",
+    )
+    write_city_csv_gz(
+        make_mapillary_city_df(panos, run_date=run_date),
+        os.path.join(cfg.data_dir, stem + ".csv.gz"),
+    )
+    db.register_run(
+        conn,
+        city_id=CITY_ID,
+        run_date=run_date,
+        csv_filename=stem + ".csv.gz",
+        provider="mapillary",
+        json_filename=stem + ".json.gz",
+    )
+    conn.close()
+
+
+def test_a_run_extending_this_hosts_series_is_diffed_against_the_previous_run(cfg, bundle_dir):
+    """
+    The bundle's catalog knew only the laptop's runs, so nothing in it describes
+    the change since THIS host's previous snapshot — and regenerate_run_json
+    replays a run_diffs row rather than computing one. Without the row the
+    JSON's change block is null and city.js falls back to constructing the
+    detail filename from run history: a 404 on the site.
+    """
+    _prod_run(cfg, date(2026, 6, 1), [("p1", "2024-05-01")])  # the bundle adds p2
+    assert cmd_import_bundle(cfg, str(bundle_dir), execute=True) == 0
+    conn = _prod(cfg)
+    diff = conn.execute("SELECT panos_added, detail_filename FROM run_diffs").fetchone()
+    assert diff is not None and diff["panos_added"] == 1
+    assert os.path.exists(os.path.join(cfg.data_dir, diff["detail_filename"]))
+    _, run_json = _run_names()
+    with gzip.open(os.path.join(cfg.data_dir, run_json), "rt", encoding="utf-8") as fh:
+        change = json.load(fh)["change_from_previous_run"]
+    assert change is not None
+    assert change["diff_file"] == diff["detail_filename"]
+
+
+def test_a_run_older_than_this_hosts_newest_is_refused(cfg, bundle_dir):
+    """A series is append-only: an older snapshot cannot be inserted behind the newest."""
+    _prod_run(cfg, date(2026, 12, 1), [("p1", "2024-05-01")])
+    assert cmd_import_bundle(cfg, str(bundle_dir), execute=True) == 64
+    assert _prod(cfg).execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 1
+
+
+def _prod_walk(cfg, run_date, *, with_artifacts):
+    """Register the city on this host with one GSV drive walk."""
+    conn = db.connect(cfg.db_path)
+    db.register_city(conn, **CITY)
+    stem = generate_streetwalk_filename(
+        CITY_ID,
+        CITY["grid_width_m"],
+        CITY["grid_height_m"],
+        CITY["step_m"],
+        15,
+        run_date,
+        provider="gsv",
+        network_type="drive",
+    )
+    csv_name = stem + ".csv.gz"
+    cov_name = streetwalk_coverage_filename(csv_name)
+    if with_artifacts:
+        _write_walk_artifacts(cfg.data_dir, csv_name, cov_name)
+    db.register_street_walk(
+        conn,
+        city_id=CITY_ID,
+        run_date=run_date,
+        csv_filename=csv_name,
+        provider="gsv",
+        coverage_filename=cov_name,
+        network_type="drive",
+        spacing_m=15,
+        match_dist_m=25.0,
+        sample_points=SAMPLE_POINTS,
+        edges_total=40,
+        coverage_pct_by_length=92.8,
+        length_km=375.1,
+    )
+    conn.close()
+
+
+def test_a_walk_extending_this_hosts_series_is_diffed_against_the_previous_walk(cfg, bundle_dir):
+    _prod_walk(cfg, date(2026, 6, 1), with_artifacts=True)
+    assert cmd_import_bundle(cfg, str(bundle_dir), execute=True) == 0
+    assert _prod(cfg).execute("SELECT COUNT(*) FROM street_walk_diffs").fetchone()[0] == 1
+
+
+def test_a_walk_older_than_this_hosts_newest_is_refused(cfg, bundle_dir):
+    _prod_walk(cfg, date(2026, 12, 1), with_artifacts=False)
+    assert cmd_import_bundle(cfg, str(bundle_dir), execute=True) == 64
+    assert _prod(cfg).execute("SELECT COUNT(*) FROM street_walks").fetchone()[0] == 1
+
+
+def test_a_walk_on_another_network_type_leaves_the_channels_cadence_alone(cfg, bundle_dir):
+    """
+    gsv_streets walks 'drive'. An all_public walk is its own series and says
+    nothing about whether the drive walk is due, so stamping a success from it
+    would suppress a walk nobody has collected.
+    """
+    old_csv, old_cov = _walk_names()
+    new_csv, new_cov = _walk_names(network_type="all_public")
+    conn = sqlite3.connect(str(bundle_dir / bundle_import.CATALOG_NAME))
+    conn.execute(
+        "UPDATE street_walks SET network_type = 'all_public', csv_filename = ?, "
+        "coverage_filename = ?",
+        (new_csv, new_cov),
+    )
+    conn.commit()
+    conn.close()
+    os.rename(bundle_dir / old_csv, bundle_dir / new_csv)
+    os.rename(bundle_dir / old_cov, bundle_dir / new_cov)
+
+    assert cmd_import_bundle(cfg, str(bundle_dir), execute=True, enable=True) == 0
+    channels = {
+        r[0]
+        for r in _prod(cfg).execute(
+            "SELECT provider FROM schedule_state WHERE last_success_at IS NOT NULL"
+        )
+    }
+    assert "gsv_streets" not in channels
+    assert "mapillary" in channels  # the grid run still recorded its own
+
+
+def test_an_unknown_provider_is_refused_not_a_traceback(cfg, bundle_dir):
+    """The filename generators raise ValueError on it; that must read as exit 64."""
+    conn = sqlite3.connect(str(bundle_dir / bundle_import.CATALOG_NAME))
+    conn.execute("UPDATE runs SET provider = 'lookaround'")
+    conn.commit()
+    conn.close()
+    assert cmd_import_bundle(cfg, str(bundle_dir), execute=True) == 64
+
+
+def test_a_crash_at_the_ledger_leaves_the_cadence_rows_already_written(
+    cfg, bundle_dir, monkeypatch
+):
+    """
+    The ledger is the LAST write, after the cadence rows: a crash there leaves
+    a retry refused (the rows exist) AND the city not due tonight. Before this
+    ordering the cadence was written by the caller after the ledger, so the
+    same crash left a refused retry and a city the next night re-collected.
+    """
+
+    def boom(*_a, **_k):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(bundle_import.db, "add_api_usage", boom)
+    with pytest.raises(sqlite3.OperationalError):
+        cmd_import_bundle(cfg, str(bundle_dir), execute=True)
+    channels = {
+        r[0]
+        for r in _prod(cfg).execute(
+            "SELECT provider FROM schedule_state WHERE last_success_at IS NOT NULL"
+        )
+    }
+    assert {"mapillary", "gsv_streets"} <= channels
+    monkeypatch.undo()
+    assert cmd_import_bundle(cfg, str(bundle_dir), execute=True) == 64
+    assert _prod(cfg).execute("SELECT COUNT(*) FROM api_usage").fetchone()[0] == 0
+
+
+def test_a_previous_run_on_another_grid_geometry_is_not_diffed(cfg, bundle_dir):
+    """
+    The collector's own gate, restated: check_bundle proves the bundle matches
+    this host's CURRENT frozen grid, not the previous run's — which predates a
+    catalog-only resize (#166) or is an archival baseline (#93). A
+    cross-geometry diff compares different sampled areas, and the site renders
+    its counts as imagery churn with no grid_aligned check.
+    """
+    conn = db.connect(cfg.db_path)
+    db.register_city(conn, **CITY)
+    earlier = date(2026, 6, 1)
+    stem = generate_run_filename(CITY_ID, 5000, 5000, 50, earlier, provider="mapillary")
+    write_city_csv_gz(
+        make_mapillary_city_df([("p1", "2024-05-01")], run_date=earlier),
+        os.path.join(cfg.data_dir, stem + ".csv.gz"),
+    )
+    db.register_run(
+        conn, city_id=CITY_ID, run_date=earlier, csv_filename=stem + ".csv.gz", provider="mapillary"
+    )
+    conn.close()
+    assert cmd_import_bundle(cfg, str(bundle_dir), execute=True) == 0
+    assert _prod(cfg).execute("SELECT COUNT(*) FROM run_diffs").fetchone()[0] == 0
+
+
+def test_a_graphml_on_disk_with_no_catalog_row_is_not_overwritten(cfg, bundle_dir):
+    """osm_cache/ is outside the artifact sweep, so this is the only guard for a row-less file."""
+    conn = db.connect(cfg.db_path)
+    db.register_city(conn, **CITY)
+    conn.close()
+    cache = os.path.join(cfg.data_dir, bundle_import.OSM_CACHE_DIRNAME)
+    os.makedirs(cache)
+    path = os.path.join(cache, f"{CITY_ID}_streets_network.graphml")
+    with open(path, "w") as fh:
+        fh.write("<graphml>this host's, unregistered</graphml>")
+    assert cmd_import_bundle(cfg, str(bundle_dir), execute=True) == 64
+    assert open(path).read() == "<graphml>this host's, unregistered</graphml>"
+
+
+def test_a_failed_diff_import_does_not_leave_a_half_imported_run(cfg, bundle_dir, monkeypatch):
+    """
+    The lazy `from .cli import` pulls in every downloader; if that fails, the
+    run is already committed, so the failure must be cheap: cadence and ledger
+    still land, and only the diff is missing.
+    """
+    _prod_run(cfg, date(2026, 6, 1), [("p1", "2024-05-01")])
+    monkeypatch.setitem(sys.modules, "streetscape_metadata_tracker.cli", None)
+    assert cmd_import_bundle(cfg, str(bundle_dir), execute=True) == 0
+    conn = _prod(cfg)
+    assert conn.execute("SELECT COUNT(*) FROM run_diffs").fetchone()[0] == 0
+    channels = {
+        r[0]
+        for r in conn.execute(
+            "SELECT provider FROM schedule_state WHERE last_success_at IS NOT NULL"
+        )
+    }
+    assert {"mapillary", "gsv_streets"} <= channels
+    assert conn.execute("SELECT COUNT(*) FROM api_usage").fetchone()[0] == 1
+
+
+def test_every_problem_is_reported_not_just_the_first(cfg, bundle_dir, capsys):
+    """
+    A bundle that is both filename-colliding AND out of order has two problems;
+    a refusal naming only one sends the operator to fix the wrong thing.
+    """
+    _prod_run(cfg, date(2026, 12, 1), [("p1", "2024-05-01")])  # newer than the bundle
+    conn = db.connect(cfg.db_path)
+    db.register_city(conn, **{**CITY, "city_name": "Elsewhere"})
+    run_csv, _ = _run_names()
+    db.register_run(
+        conn,
+        city_id=db.derive_city_id("Elsewhere", "California", "United States"),
+        run_date=RUN_DATE,
+        csv_filename=run_csv,
+        provider="mapillary",
+    )
+    conn.close()
+    assert cmd_import_bundle(cfg, str(bundle_dir), execute=True) == 64
+    out = capsys.readouterr().out
+    assert "refusing to collide" in out
+    assert "append-only" in out
