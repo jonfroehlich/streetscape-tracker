@@ -172,13 +172,78 @@ HOST_BY_BUSY_EXIT_CODE = {code: host for host, code in HOST_BUSY_EXIT_CODES.item
 SWEEP_INCOMPLETE_EXIT_CODE = 83
 
 
+class SweepIncompleteError(DownloadError):
+    """
+    A crawl stopped with work unvisited, and CHECKPOINTED it (#239, #318).
+
+    Nothing is finalized -- a partial census must never be published as a dated
+    snapshot, because an immutable dated file holding 60% of a city diffs
+    against its predecessor as "every pano in the rest of the city removed".
+    What is different from every other failure here is that the spend survives:
+    the answered work is on disk and the next attempt resumes from it.
+
+    Deliberately NOT a ``HostUnavailableError``, and the distinction is not
+    academic. ``host_exit_code`` maps those to a per-host code (81 for
+    KartaView, 75 for Mapillary's tile CDN), which the scheduler turns into a
+    night-level breaker skipping every remaining city on that host -- correct
+    for a refusal, which is a property of the machine, and wrong for this,
+    which is a property of THIS city's budget. The next city's crawl is
+    unaffected and should run.
+
+    This is why ``download_gsv_history``'s ``HarvestIncompleteError``, which
+    subclasses its blocked error, is the wrong precedent to copy: that harvester
+    is a manual script the scheduler never runs, so nothing reads its type as a
+    host verdict.
+
+    LIVES HERE, not in a provider module, because three providers raise it and
+    two entry points classify it. It was ``download_kartaview``'s until #318,
+    which is why its progress fields used to be spelled ``roots_done`` /
+    ``root_count``: a radius sweep counts root cells, and a tile census counts
+    tiles. There is ONE spelling now -- ``units_done`` / ``unit_count`` with the
+    provider naming its own ``unit_name`` -- because the alternative measured
+    out worse in both directions. Keeping the KartaView names would have every
+    Mapillary pause line report "root cells" for a z14 tile census that has
+    none, in the log an operator reads to decide whether a night made progress;
+    a second exception type would give one exit code two classification arms in
+    ``cli.py`` and ``collect.py`` that nothing forces to stay in step.
+
+    Carries ``api_requests`` (this process's spend, for the additive daily
+    ledger) and ``api_requests_total`` (the whole crawl's, for the operator and
+    the catalog row), attached by the caller's spend helper -- ``spent`` in the
+    KartaView sweep, ``interrupted`` in both tile censuses.
+
+    WHAT IS NOT SHARED is what a cap means with NO checkpoint, and the three
+    raisers genuinely differ. Both tile censuses refuse that pairing up front as
+    a caller bug: an uncheckpointed stop leaves them nothing to resume from and
+    no guard that would notice. The KartaView sweep supports it and documents
+    it, because there the unmeasured remainder runs into the failed-area check,
+    which refuses to finalize the snapshot on its own. Neither posture is this
+    class's to state -- read each collector's own ``max_requests`` docstring.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        checkpoint_path: str,
+        units_done: int,
+        unit_count: int,
+        unit_name: str,
+    ) -> None:
+        super().__init__(message)
+        self.checkpoint_path = checkpoint_path
+        self.units_done = units_done
+        self.unit_count = unit_count
+        self.unit_name = unit_name
+
+
 def positive_int(value: str) -> int:
     """
     argparse type for flags where 0 is not "off", it is a trap.
 
     ``--kartaview-max-requests 0`` used to be accepted, spend the full
     calibration ladder (``over_budget()`` is checked only where sweep requests
-    are issued), checkpoint ``roots_done=0``, and exit 83 printing "re-run the
+    are issued), checkpoint zero visited cells, and exit 83 printing "re-run the
     same command to resume" — an infinite loop the message actively encourages.
     Refused at parse time instead, following #214's refuse-before-any-work
     posture for ``run-due --limit``.

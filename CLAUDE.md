@@ -185,6 +185,13 @@ Four KartaView rules that must survive without a read:
 - **HTTP 400 is backpressure here, not a malformed request** — typed permanent it would never be retried or subdivided, and every dense city would collect nothing.
 - The capture-date rule is **`shot_date >= date_added` → NULL — `>=`, not `>`**.
 
+**All four checkpointing channels stop at a request cap and resume rather than being skipped (#318)** — both KartaView's and both Mapillary's — so neither budget gate applies to them and a city that does not fit the night's remainder is launched capped at it instead of rolled to tomorrow.
+The cap is checked inside the semaphore beside the #205 abort and is a SEPARATE flag from it (`fatal` means every remaining tile would fail identically; a cap means the opposite), and the pause is raised **before the settle loop** — past that line a tile skipped at the cap is indistinguishable from a tile the provider answered with no imagery, and would publish absence nobody observed.
+**A cap is a SOFT ceiling and a capped night can end over budget** — so never write "the budget is never exceeded": a tile gates on `api_requests + reserved` (without the reservation every task the semaphore admits clears a stale check and the cap is overshot by `connection_limit − 1` *every* capped night), and what is deliberately left is retries by tiles already in flight, at most `connection_limit × (TILE_MAX_TRIES − 1)` — **200** at prod's `connection_limit = 50`, never the 20 the argparse default of 5 implies.
+**Both Mapillary channels flip together**: `_sweep_launch_plan`'s sibling arm is asked only of a resumable street channel, so flipping the grid alone would have the walk re-crawl the identical lattice against the same per-IP host every night the grid paused.
+`panoramax` has the same collector-side cap and stays `CHANNEL_RESUMABLE` `False` **because nothing forwards one to it**, not because it cannot stop; flip it in the commit that adds its launch arm.
+The launch floor and the pace a cap is sized against are **per provider, in one row each** (`_CRAWL_PRICING`) — sizing a tile census's cap from the radius sweep's constants under-prices it (1.6× at prod's configured rate, 6× with no `[providers.*]` block), and a cap under the floor skips the city rather than slowing it.
+
 A COMPLETED crawl is promoted out of `checkpoints/` into `census_cache/<provider>/<city>_<bbox>`, and every later consumer of that (provider, city, bbox) observation reuses it for **0 requests** (#290) — the paired road walk, a second `--network-type`, KartaView's #258 walk.
 **The cache keys on GEOMETRY and *records* who paid, never keys it** (a channel-keyed entry would reuse nothing, silently); the marker travels INSIDE the directory and the single rename is the commit, so no entry ever exists unstamped — which is what makes the lock-free tail prune safe.
 An in-flight checkpoint is never a cache entry: completeness is the extra check, and promotion is refused for a degraded, interrupted or lagging store.
@@ -209,7 +216,7 @@ This is what READ THIS FIRST points at; read it before changing any pacing, retr
 |---|---|---|
 | Blocked | 75 / 76 / 81 / 84 | The third party refused this IP — trips the night-level breaker |
 | Busy | 79 / 80 / 82 / 85 | Another local process holds the host lock |
-| Sweep incomplete | 83 | A checkpointed partial sweep (#239) — the budget or deadline ran out, not a host condition; amnestied beside the host conditions (#238), while a SIGKILL has no exit code and still counts a failure, so kill-and-resume is bounded at five nights |
+| Crawl incomplete | 83 | A checkpointed partial crawl — the budget or deadline ran out, not a host condition; amnestied beside the host conditions (#238), while a SIGKILL has no exit code and still counts a failure, so kill-and-resume is bounded at five nights. Raised by the KartaView sweep (#239) and, since #318, by either tile census — **with no usable checkpoint the same stop is a plain `DownloadError`**, because "re-run to resume" with nothing to resume from is an instruction that loops forever |
 
 - A blocked or busy night still publishes, alerts unconditionally, and exits nonzero.
 - makelab1 is **not** an escape hatch: Project Sidewalk serves Mapillary data off it, and that trade is never the right one.

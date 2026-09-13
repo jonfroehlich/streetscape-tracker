@@ -84,6 +84,7 @@ from streetscape_metadata_tracker.download_common import (
     SWEEP_INCOMPLETE_EXIT_CODE,
     DownloadError,
     HostUnavailableError,
+    SweepIncompleteError,
     host_exit_code,
     jitter_fraction,
     positive_int,
@@ -91,7 +92,6 @@ from streetscape_metadata_tracker.download_common import (
 from streetscape_metadata_tracker.download_gsv import collect_points_async
 from streetscape_metadata_tracker.download_kartaview import (
     DEFAULT_SWEEP_REQUESTS_PER_MINUTE,
-    SweepIncompleteError,
     estimate_sweep_requests,
 )
 from streetscape_metadata_tracker.download_mapillary import (
@@ -437,16 +437,33 @@ def run_collect(args: argparse.Namespace) -> int:
             # night the paired grid sweep itself pauses -- a checkpoint is not a
             # cache entry, so the walk prices at full.
             #
-            # Scoped to the provider the cap reaches: it is forwarded only to
-            # the KartaView sweep (see the dispatch below), so honouring it for
-            # any other provider would relax a gate nothing enforces.
-            cap = getattr(args, "kartaview_max_requests", None)
-            gated_requests = (
-                min(estimated_requests, cap)
-                if cap is not None and provider == "kartaview"
-                else estimated_requests
-            )
-            if already + gated_requests > args.daily_budget:
+            # Scoped to the provider the cap reaches, one entry per flag the
+            # dispatch below actually forwards: honouring a cap for a provider
+            # nothing hands it to would relax a gate nothing enforces. Read as a
+            # table rather than as a chain of `provider == ...` so adding the
+            # third capped provider is a row, not a fourth branch that the next
+            # reader has to check for symmetry (issue #318).
+            cap = {
+                "kartaview": getattr(args, "kartaview_max_requests", None),
+                "mapillary": getattr(args, "mapillary_max_requests", None),
+            }.get(provider)
+            gated_requests = min(estimated_requests, cap) if cap is not None else estimated_requests
+            # `gated_requests > 0` FIRST, because a collection that spends
+            # nothing cannot exceed anything -- and the ledger legitimately
+            # sits OVER the budget by the time this runs. A cap is a soft
+            # ceiling: the tiles already in flight when it trips finish their
+            # retries, so a capped night ends up to
+            # `connection_limit * (TILE_MAX_TRIES - 1)` over (#318). Without
+            # this term the arithmetic refuses exactly the walk the pairing
+            # exists for -- census already in the shared cache, estimate 0 --
+            # with exit 1, a real consecutive_failure.
+            #
+            # The scheduler half of this was fixed once already: `est == 0`
+            # floors the request cap at 1 rather than dropping it, precisely so
+            # the free collection is LAUNCHED. It reached a child that then
+            # refused it, which is why both halves are stated here and in
+            # `_sweep_launch_plan`.
+            if gated_requests > 0 and already + gated_requests > args.daily_budget:
                 logger.error(
                     "%s daily budget %d would be exceeded: %d already spent "
                     "+ %d estimated requests%s. Aborting.",
@@ -492,6 +509,7 @@ def run_collect(args: argparse.Namespace) -> int:
                         request_timeout=args.timeout,
                         max_requests_per_minute=args.mapillary_max_requests_per_minute,
                         jitter=args.mapillary_jitter,
+                        max_requests=args.mapillary_max_requests,
                         checkpoint_path=checkpoint_path,
                         checkpoint_channel=budget_channel,
                         checkpoint_variant=args.network_type,
@@ -561,9 +579,11 @@ def run_collect(args: argparse.Namespace) -> int:
                 # counting a consecutive_failure, and folding this into 1 would
                 # quarantine a city that is making progress every night.
                 logger.info(
-                    "KartaView sweep paused at %s/%s root cells; re-run to resume from %s",
-                    e.roots_done,
-                    e.root_count,
+                    "%s crawl paused at %s/%s %s; re-run to resume from %s",
+                    provider,
+                    e.units_done,
+                    e.unit_count,
+                    e.unit_name,
                     e.checkpoint_path,
                 )
                 return SWEEP_INCOMPLETE_EXIT_CODE
@@ -870,9 +890,25 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--mapillary-max-requests",
+        # positive_int for the same reason the KartaView flag below carries it:
+        # 0 is not "off", it is a crawl that stops before committing a tile,
+        # checkpoints nothing, and exits 83 telling the operator to re-run.
+        type=positive_int,
+        default=None,
+        help=(
+            "Stop the walk's Mapillary tile census after this many requests and "
+            "CHECKPOINT the rest. Nothing is published and the run exits "
+            f"{SWEEP_INCOMPLETE_EXIT_CODE}, so the next run resumes rather than "
+            "re-paying (issue #318). A soft ceiling: requests already in flight "
+            "are allowed to finish. Default: fetch every tile."
+        ),
+    )
+
+    parser.add_argument(
         "--kartaview-max-requests",
         # Not `int`: 0 here is the same trap the grid CLI refuses at parse time
-        # -- it spends the whole calibration ladder, checkpoints roots_done=0,
+        # -- it spends the whole calibration ladder, checkpoints zero cells,
         # and exits 83 telling the operator to re-run, which loops. The guard
         # was on the grid flag and absent on this copy of it (#273).
         type=positive_int,

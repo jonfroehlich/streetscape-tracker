@@ -39,7 +39,7 @@ import time
 import tomllib
 import traceback
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -47,7 +47,16 @@ from typing import Any, NamedTuple
 
 from tabulate import tabulate
 
-from . import catalog_backup, cgroup_memory, db, driving_plan, panoramax_screen
+from . import (
+    catalog_backup,
+    cgroup_memory,
+    db,
+    download_kartaview,
+    download_mapillary,
+    download_panoramax,
+    driving_plan,
+    panoramax_screen,
+)
 from .alerting import AlertConfig, send_alert, should_alert
 from .checkpointing import (
     CENSUS_PROVIDERS,
@@ -234,13 +243,23 @@ def is_opt_in_channel(name: str) -> bool:
 # failing (issues #273, #274). Not "does it checkpoint at all": the two are
 # different properties and only this one makes a capped launch safe.
 #
-# mapillary and mapillary_streets checkpoint their tile census (#256), and are
-# still False here, because download_mapillary takes only
-# max_requests_per_minute -- a PACING knob. It has no request cap, no
-# stop_reason and no SweepIncompleteError, so a Mapillary census resumes after
-# an interruption it did not choose and has no way to stop itself at a number.
-# Handing one a cap would do nothing; handing it a budget it cannot honour is
-# the overrun this table exists to bound.
+# BOTH MAPILLARY CHANNELS ARE TRUE SINCE #318, and what changed is the child
+# rather than the policy. #256 gave the tile census crash-resume -- it continues
+# after an interruption it did not choose -- but download_mapillary took only
+# max_requests_per_minute, a PACING knob, so there was no number it could stop
+# itself at and a cap handed to it would have done nothing. It has one now
+# (`--mapillary-max-requests`), forwarded by both arms of the command builders
+# below, and exhausting it checkpoints the unfetched tiles and raises
+# SweepIncompleteError.
+#
+# THE TWO FLIP TOGETHER, and that is not tidiness. `_sweep_launch_plan`'s
+# sibling arm -- the one that stops a walk sweeping a lattice its grid sibling
+# is mid-way through -- is asked only of a RESUMABLE street channel. Flip the
+# grid channel alone and the first night its census pauses leaves a checkpoint
+# rather than a cache entry, so the walk prices at full, takes the old
+# all-or-nothing gates, and crawls the identical lattice a second time against
+# the same per-IP host for an observation the cache will hand it free once the
+# grid finishes (#290).
 #
 # Read it as CHANNEL_RESUMABLE[provider], NEVER `.get(p, ...)`, for exactly the
 # reason CHANNEL_DEFAULT_MEMBERSHIP spells out above: either default is a wrong
@@ -265,17 +284,22 @@ CHANNEL_RESUMABLE: dict[str, bool] = {
     "gsv_streets": False,
     "kartaview": True,
     "kartaview_streets": True,
-    "mapillary": False,
-    "mapillary_streets": False,
-    # panoramax is False for the SAME reason the two Mapillary channels are, and
-    # for once that is a comfortable answer rather than a deferred one: it is a
-    # tile census that checkpoints (#316) but takes only a pacing knob, so there
-    # is nothing for a cap to stop. The largest city that would be enrolled is
-    # ~3,132 z15 tiles ≈ 104 minutes at 30/min, under the 180-minute floor, so
-    # no capped launch is needed to keep it inside a night. Revisit this the
-    # moment a bigger city is enrolled OR the downloader grows a request cap —
-    # marking it True with nothing reading the cap downstream is the fail-open
-    # this table was written against.
+    "mapillary": True,
+    "mapillary_streets": True,
+    # panoramax is False, and the reason has MOVED since #318 -- its downloader
+    # grew the identical request cap in the same pass, so "nothing for a cap to
+    # stop" is no longer why. What is missing now is the forwarding: `panoramax`
+    # is in UNWIRED_CHANNELS and the grid argv `_run_one_city` builds inline
+    # (there is no `_collect_cmd`; only the walk's argv is factored out, as
+    # `_street_collect_cmd`) has no arm that would hand a
+    # child `--panoramax-max-requests`, so True here would be exactly the
+    # fail-open this table was written against -- a budget gate believing a
+    # night is bounded by a cap nothing sends.
+    #
+    # It is also not yet needed: the largest city that would be enrolled is
+    # ~3,132 z15 tiles ~ 104 minutes at 30/min, under the 180-minute floor. Flip
+    # it in the same commit that adds the launch arm (#316 phase 2), not before
+    # and not after.
     "panoramax": False,
 }
 
@@ -1333,9 +1357,127 @@ _SWEEP_OVERHEAD_MULTIPLIER = 1.80
 # carries this with it. The extra retries + 1 is one root cell's full attempt on
 # top: clearing calibration with nothing left to sweep is a legal pause, but it
 # spends a night and a checkpoint-age day to record zero progress.
-_MIN_SWEEP_LAUNCH_REQUESTS = len(RADIUS_LADDER_M) * (
+_MIN_RADIUS_SWEEP_LAUNCH_REQUESTS = len(RADIUS_LADDER_M) * (
     DEFAULT_CALIBRATION_PROBES + DEFAULT_BACKPRESSURE_RETRIES
 ) + (DEFAULT_BACKPRESSURE_RETRIES + 1)
+
+# The same floor for a TILE census, and it is a different number because the
+# failure it prevents is a different failure (issue #318).
+#
+# A tile census has no calibration ladder -- there is no radius to find, the
+# lattice is `tiles_for_bbox` and it is known before the first request -- so the
+# expensive prologue the constant above exists to fund does not exist here, and
+# a cap of 1 would fund a real, committed, durable tile. What it would NOT fund
+# is that tile's RETRIES: `_fetch_tile` may spend up to TILE_MAX_TRIES requests
+# on one tile against a CDN that 404s transiently (the Chicago tile that failed
+# every retry and served 2.1M features the next day). A cap under that can
+# therefore spend its whole self on one tile, commit nothing, and still cost a
+# night and a day of the checkpoint's seven -- which is exactly the "clearing
+# calibration with nothing left to sweep" case the `+1` above is written
+# against, arriving by a different route.
+#
+# Read from the collector's constant rather than pinned at 5, for the same
+# reason the ladder is: retuning the retry budget has to carry the floor. Each
+# tile census reads ITS OWN -- they are both 5 today, so a single shared name
+# would be latent rather than wrong, which is exactly how it would survive
+# until one of them was retuned and the other's floor silently followed.
+#
+# AND THE ROW READS IT THROUGH THE MODULE, at call time, which is the only
+# spelling a test can tell apart. `_MIN_PANORAMAX_LAUNCH_REQUESTS =
+# PANORAMAX_TILE_MAX_TRIES` froze the value at import, so wiring this row to
+# Mapillary's constant -- the precise mutation this paragraph is about --
+# produced a row equal, element for element, to the correct one while both
+# constants sat at 5. The suite passed with it in place. Resolving
+# `download_panoramax.TILE_MAX_TRIES` when the row is BUILT means retuning one
+# provider's retry budget moves that provider's floor and no other, and a test
+# can say so.
+
+
+@dataclass(frozen=True)
+class _CrawlPricing:
+    """Everything sizing a resumable channel's launch needs, in ONE row.
+
+    The four values were three separate lookups when #318 added the second and
+    third resumable provider, and separate is how ``_sweep_requests_within_
+    timeout`` came to invert ``_kartaview_timeout_seconds``' constants for a
+    channel that is timed by ``_mapillary_timeout_seconds``. That is the exact
+    drift the forward function's own docstring warns about -- "the two must be
+    read from the same constants or they drift" -- arriving from the direction
+    it did not anticipate: not an edit to one of the pair, but a second provider
+    reaching the pair at all.
+
+    One row per provider is what makes the two directions structurally unable
+    to disagree -- but only because BOTH directions read it. The row landed
+    first with only the inverse (``_sweep_requests_within_timeout``) consulting
+    it while ``_mapillary_timeout_seconds`` and ``_kartaview_timeout_seconds``
+    still spelled their own rate and fraction out, so the exact 1.6x divergence
+    this class exists to remove could be reintroduced from the forward side
+    with the whole suite green. A row nobody reads couples nothing.
+    """
+
+    #: Pace assumed when the channel's [providers.*] block sets none.
+    default_rate: int
+    #: What fraction of that pace the child actually achieves. The tile censuses
+    #: sit near 1 because the limiter is a hard ceiling their fetch tracks
+    #: closely; the serial radius sweep sits at 0.5 because latency, not the
+    #: limiter, can be its binding term. See the constants themselves.
+    achieved_fraction: float
+    #: Smallest cap worth launching with, and what that cap buys -- both
+    #: per-provider because the failure each prevents is a different failure.
+    launch_floor: int
+    floor_buys: str
+
+
+# Keyed on the PROVIDER behind the channel via STREET_CHANNELS -- the table that
+# already maps every walk to the provider whose census it reads -- rather than
+# on a per-CHANNEL table that would have to be edited beside CHANNEL_RESUMABLE,
+# CHANNEL_HOSTS and CHANNEL_DEFAULT_MEMBERSHIP, and whose forgotten row would
+# fail open.
+#
+# A KeyError for an unknown provider is the point, exactly as in
+# CHANNEL_RESUMABLE: this is only ever asked about a channel that already
+# answered True there, and a resumable channel nobody has priced must stop the
+# build rather than inherit somebody else's numbers.
+_CRAWL_PRICING: dict[str, Callable[[], _CrawlPricing]] = {
+    "kartaview": lambda: _CrawlPricing(
+        download_kartaview.DEFAULT_SWEEP_REQUESTS_PER_MINUTE,
+        _SWEEP_ACHIEVED_RATE_FRACTION,
+        _MIN_RADIUS_SWEEP_LAUNCH_REQUESTS,
+        "clear radius calibration",
+    ),
+    "mapillary": lambda: _CrawlPricing(
+        download_mapillary.DEFAULT_TILE_REQUESTS_PER_MINUTE,
+        _TILE_ACHIEVED_RATE_FRACTION,
+        download_mapillary.TILE_MAX_TRIES,
+        "commit a single tile",
+    ),
+    # Priced although CHANNEL_RESUMABLE still says False, because what keeps it
+    # False is the missing WIRING rather than a missing price: the grid argv
+    # built in `_run_one_city` has no arm forwarding a cap, and
+    # `city_timeout_seconds` does not route this provider to
+    # `_mapillary_timeout_seconds`, so it takes the flat floor. A row here is
+    # what lets both be one-liners instead of two decisions taken months later
+    # without this context (#316 phase 2) -- and the timeout one is a one-liner
+    # ONLY because the forward function now prices itself from this row, so
+    # routing panoramax to it picks up 30/min rather than silently inheriting
+    # Mapillary's 60.
+    "panoramax": lambda: _CrawlPricing(
+        download_panoramax.DEFAULT_TILE_REQUESTS_PER_MINUTE,
+        _TILE_ACHIEVED_RATE_FRACTION,
+        download_panoramax.TILE_MAX_TRIES,
+        "commit a single tile",
+    ),
+}
+
+
+def _crawl_pricing(channel: str) -> _CrawlPricing:
+    """How this resumable channel's launch is sized. KeyError if unpriced.
+
+    The row is BUILT HERE rather than frozen at import, so every number in it
+    is the collector's current one. See ``_CRAWL_PRICING``.
+    """
+    return _CRAWL_PRICING[STREET_CHANNELS.get(channel, channel)]()
+
 
 # Floor for a deadline-clamped timeout. A city is only started while the batch
 # deadline still has room, so the clamp should shorten a run — never hand a
@@ -1433,18 +1575,24 @@ def _mapillary_timeout_seconds(
     estimate. Cost is purely tile count, and wall-clock is that divided by the
     pacing rate.
 
-    Uses ``_TILE_ACHIEVED_RATE_FRACTION`` rather than gsv's ``_ACHIEVED_RATE
-    _FRACTION``: here the limiter IS the binding constraint (it is a hard
-    ceiling the fetch tracks closely), where gsv's cap is a project quota the
-    async engine never approaches. Never returns below the configured floor.
+    Both the rate and the achieved fraction come from ``_crawl_pricing`` --
+    the SAME row ``_sweep_requests_within_timeout`` inverts. Restating them
+    here is what let the two drift in the first place, and the drift is silent
+    in both directions: a forward function reading 0.8 while the row says 0.5
+    prices a cap the child cannot reach, which skips the city nightly. That
+    fraction sits near 1 for a tile census because the limiter IS the binding
+    constraint (a hard ceiling the fetch tracks closely), where gsv's
+    ``_ACHIEVED_RATE_FRACTION`` covers a project quota the async engine never
+    approaches. Never returns below the configured floor.
     """
+    pricing = _crawl_pricing(provider)
     # `is None`, not falsy: 0 means "pacing disabled", not "use the default".
     configured = pc.max_requests_per_minute if pc else None
-    rate = DEFAULT_TILE_REQUESTS_PER_MINUTE if configured is None else configured
+    rate = pricing.default_rate if configured is None else configured
     if rate <= 0:  # pacing disabled: nothing to derive from
         return floor
     tiles = estimate_requests(city, provider)  # the same z14 count the budget uses
-    paced_seconds = tiles / (rate * _TILE_ACHIEVED_RATE_FRACTION) * 60.0
+    paced_seconds = tiles / (rate * pricing.achieved_fraction) * 60.0
     return int(max(floor, paced_seconds * _TIMEOUT_HEADROOM + _TIMEOUT_FIXED_SLACK_S))
 
 
@@ -1574,9 +1722,12 @@ def _kartaview_timeout_seconds(
     city falling to the tail of the union and returning months later. The bound
     is still five, and it is still on the SCHEDULE rather than the work.
     """
+    # Rate and fraction from the same row the inverse reads, for the reason
+    # given in `_mapillary_timeout_seconds`: two spellings of one number drift.
+    pricing = _crawl_pricing("kartaview")
     # `is None`, not falsy: 0 means "pacing disabled", not "use the default".
     configured = pc.max_requests_per_minute if pc else None
-    rate = DEFAULT_SWEEP_REQUESTS_PER_MINUTE if configured is None else configured
+    rate = pricing.default_rate if configured is None else configured
     if rate <= 0:  # pacing disabled: nothing to derive from
         return floor
     # Not via _channel_estimate: that helper exists to unify callers who need
@@ -1585,22 +1736,43 @@ def _kartaview_timeout_seconds(
     # because both land in estimate_requests' kartaview arm, which ignores those
     # two arguments; they are not sharing a call site.
     requests = estimate_requests(city, "kartaview", conn=conn)
-    paced_seconds = requests / (rate * _SWEEP_ACHIEVED_RATE_FRACTION) * 60.0
+    paced_seconds = requests / (rate * pricing.achieved_fraction) * 60.0
     return int(max(floor, paced_seconds * _TIMEOUT_HEADROOM + _TIMEOUT_FIXED_SLACK_S))
 
 
-def _sweep_requests_within_timeout(timeout_s: int, pc: ProviderConfig | None) -> int | None:
+def _sweep_requests_within_timeout(
+    timeout_s: int, channel: str, pc: ProviderConfig | None
+) -> int | None:
     """
     Requests a paced sweep can issue inside ``timeout_s``, or None when the
     channel's pace makes that unknowable.
 
-    The INVERSE of :func:`_kartaview_timeout_seconds`, and it lives beside it
-    because the two must be read from the same constants or they drift: that
-    function turns a request count into a wall clock, this one turns a wall
-    clock back into a request count. Both use the channel's configured rate
-    (default ``DEFAULT_SWEEP_REQUESTS_PER_MINUTE``) discounted by
-    ``_SWEEP_ACHIEVED_RATE_FRACTION``, and both hold ``_TIMEOUT_FIXED_SLACK_S``
-    back for process startup, the checkpoint write and the tail.
+    The INVERSE of whichever timeout derivation prices this channel --
+    :func:`_kartaview_timeout_seconds` for the radius sweep,
+    :func:`_mapillary_timeout_seconds` for a tile census -- and it must be read
+    from the SAME constants as that one or the two drift. That is why the rate
+    and the achieved fraction come from ``_crawl_pricing`` rather than from
+    KartaView's two module constants, which is what this function used while
+    KartaView was the only channel that could pause. A cap under the launch
+    floor does not slow a channel down -- it skips the city outright, nightly
+    (#318).
+
+    HOW FAR OFF IT WAS DEPENDS ON WHETHER THE CHANNEL IS CONFIGURED, and both
+    numbers are worth having because only one of them is production's:
+
+    * With a ``[providers.mapillary]`` block, the CONFIGURED rate is used on
+      both sides, so only the fraction was wrong: prod's 40/min gives 40 x 0.5
+      = 20 against the correct 40 x 0.8 = 32, i.e. **1.6x** low.
+    * With no block, the default rate was wrong too: 16 x 0.5 = 8 against
+      DEFAULT_TILE_REQUESTS_PER_MINUTE x 0.8 = 60 x 0.8 = 48, i.e. **6x** low.
+
+    Do not quote a single "fourfold" for this. It came from pairing 16/min
+    (KartaView's DEFAULT) with 40/min (Mapillary's CONFIGURED value) -- two
+    branches this function never takes together, since a configured rate
+    replaces the default on both sides of the fix.
+
+    Both directions hold ``_TIMEOUT_FIXED_SLACK_S`` back for process startup,
+    the checkpoint write and the tail.
 
     WHY THE CALLER NEEDS IT (#273/#274). ``_run_city_channels`` hands a
     resumable sweep ``budget - used`` as its request cap so an overrun becomes a
@@ -1631,13 +1803,14 @@ def _sweep_requests_within_timeout(timeout_s: int, pc: ProviderConfig | None) ->
     pace there is no wall-clock arithmetic to do, and the honest answer is "do
     not bound the cap by the clock" rather than 0, which would skip every city.
     """
+    pricing = _crawl_pricing(channel)
     # `is None`, not falsy: 0 means "pacing disabled", exactly as above.
     configured = pc.max_requests_per_minute if pc else None
-    rate = DEFAULT_SWEEP_REQUESTS_PER_MINUTE if configured is None else configured
+    rate = pricing.default_rate if configured is None else configured
     if rate <= 0:
         return None
     paceable_s = max(0.0, timeout_s - _TIMEOUT_FIXED_SLACK_S)
-    return int(paceable_s / 60.0 * rate * _SWEEP_ACHIEVED_RATE_FRACTION)
+    return int(paceable_s / 60.0 * rate * pricing.achieved_fraction)
 
 
 def city_timeout_seconds(
@@ -1690,6 +1863,18 @@ def city_timeout_seconds(
     # is 575. The derivation stays because a grid can be re-registered larger at
     # any time, and a SIGKILL costs the requests already spent AND counts a
     # failure — the guard must not depend on today's geometry staying capped.
+    #
+    # THE FIGURES ABOVE ARE PRODUCTION'S; A DEV CATALOG CONTRADICTS THEM AND IS
+    # WRONG (checked on makelab2, 2026-09-10, #318). `data/streetscape_tracker.db`
+    # in a repo checkout puts Anchorage at 105,588 x 83,676 m -> ~6,480 tiles and
+    # makes it the largest frozen grid by 4.9x, which briefly got the line above
+    # written off as stale. The live catalog says 26,000 x 28,000 m -> 575 tiles,
+    # with two Mapillary runs on it (2026-07-23/24) and no failures; 1,221
+    # enabled cities, median 15, largest still Moscow at 870, and NOT ONE city
+    # over the 3,500 grid budget. A checkout's catalog predates resizes
+    # `cap_oversized_grids.py` applied only on production, so it is not a source
+    # for any question about geometry. Re-measure on prod rather than trusting
+    # either number here; the derivation stays for the reason given above.
     if provider not in (
         "gsv",
         "gsv_streets",
@@ -1742,7 +1927,12 @@ def city_timeout_seconds(
 # rendered under a name the live path does not use.
 _SWEEP_SKIP_SIBLING = "sibling sweep in flight"
 _SWEEP_SKIP_AGE_WALL = "checkpoint at the age wall"
-_SWEEP_SKIP_FLOOR = "under the calibration floor"
+# "launch floor", not "calibration floor": calibration is KartaView's reason for
+# having one, and since #318 a tile census has this skip too, where the floor
+# buys one tile's retries and there is no ladder to calibrate. The provider's own
+# wording rides in `_CRAWL_PRICING.floor_buys` and reaches the message; this
+# token is the label both share, so it must not name either one's mechanism.
+_SWEEP_SKIP_FLOOR = "under the launch floor"
 
 # How close to CHECKPOINT_MAX_AGE_S a checkpoint may get before the scheduler
 # refuses to add another night to it: ONE night. The wall is measured from the
@@ -1864,10 +2054,17 @@ def _sweep_launch_plan(
       is not self-correcting -- a pause records nothing, so without a failure
       the five-night backstop, the nightly alert and the operator all stay
       unaware while ~60k requests a cycle are discarded.
-    * ``_SWEEP_SKIP_FLOOR`` -- the cap cannot even clear radius calibration. A
-      budget exhausted there raises a plain DownloadError, not
+    * ``_SWEEP_SKIP_FLOOR`` -- the cap cannot clear what this provider's crawl
+      needs to make ANY durable progress. Per provider, because the failure is a
+      different failure: a radius sweep cannot clear its calibration ladder, and
+      a budget exhausted there raises a plain DownloadError rather than
       SweepIncompleteError, so it takes no amnesty and burns a real
-      consecutive_failure to accomplish nothing.
+      consecutive_failure to accomplish nothing; a tile census has no ladder,
+      but a cap under one tile's full retry budget can spend itself whole on a
+      transiently-failing tile, commit nothing, and take the same plain
+      DownloadError for having nothing to resume. ``floor_buys`` carries the
+      per-provider wording into the operator-facing message, so read the number
+      from ``_CRAWL_PRICING`` rather than from this list.
 
     ``est == 0`` means a census already in the shared cache, and it exempts a
     channel from the sibling and floor arms both. Nothing is being crawled: the
@@ -1880,7 +2077,20 @@ def _sweep_launch_plan(
     # enabled without its own [providers.*] block must price, time and cap the
     # same way on every path, and this one also runs under the dry run, which
     # must never raise over a config shape the live path tolerates.
-    affordable = _sweep_requests_within_timeout(timeout_s, (cfg.providers or {}).get(channel))
+    affordable = _sweep_requests_within_timeout(
+        timeout_s, channel, (cfg.providers or {}).get(channel)
+    )
+    # THE CLOCK TERM GOES TO ZERO AT THE END OF A NIGHT, and that is a new skip
+    # rather than a rounding artifact (#318). `_sweep_requests_within_timeout`
+    # holds `_TIMEOUT_FIXED_SLACK_S` back for startup and the checkpoint write,
+    # so once the deadline clamp puts `timeout_s` under that, `affordable` is 0,
+    # the cap is 0, and the floor arm below defers the city. A resumable channel
+    # reached in the last few minutes of a batch therefore stands down where it
+    # used to launch under a short clamped timeout. That is the better trade --
+    # a clamped launch that gets SIGKILLed loses the ledger write and counts a
+    # consecutive_failure, where this defers with neither -- but it is a
+    # behaviour change on the busiest channel, so it is stated rather than
+    # inferred from the arithmetic.
     request_cap = remaining if affordable is None else min(remaining, affordable)
     clock_note = (
         f"{remaining:,} left in the budget, "
@@ -1918,45 +2128,102 @@ def _sweep_launch_plan(
 
     progress = _sweep_checkpoint_progress(cfg, city, channel)
     age_s = None if progress is None else progress["age_s"]
-    if age_s is not None and age_s >= CHECKPOINT_MAX_AGE_S - _CHECKPOINT_AGE_WALL_MARGIN_S:
-        roots_done, root_count = progress["roots_done"], progress["root_count"]
+    # `est > 0` for the same reason the launch floor below carries it, and it is
+    # the one arm here that RECORDS A FAILURE, so it is the one that must not
+    # fire on a crawl that will spend nothing. With a cached census (`est == 0`)
+    # the projection is 0, which clears any positive cap -- but `request_cap` is
+    # `remaining` when the ledger is the binding term, and a capped night ends
+    # OVER its budget on purpose, so `remaining` is legitimately negative. `0 >
+    # -200` is true, and the city takes a consecutive_failure for declining to
+    # spend anything. The floor arm and the child's own budget gate both learned
+    # this; this arm is the third place the same zero has to be let through.
+    if (
+        est > 0
+        and age_s is not None
+        and age_s >= CHECKPOINT_MAX_AGE_S - _CHECKPOINT_AGE_WALL_MARGIN_S
+    ):
+        done, total = progress["units_done"], progress["unit_count"]
+        units = progress["unit_name"]
         # What is LEFT, priced by the share of the lattice still unvisited.
         # Root cells are not uniform, and `est` is a floor rather than a budget
         # (a Yogyakarta sweep ran 3.0x its geometry estimate), so this is a
         # lower bound on the remaining cost -- which is the safe direction for
         # the question being asked: "could tonight plausibly finish it?" A
-        # nonsense root_count cannot be projected from at all, so it prices the
-        # whole sweep, and a checkpoint that has answered every root is already
+        # nonsense unit count cannot be projected from at all, so it prices the
+        # whole crawl, and a checkpoint that has answered every unit is already
         # finished and only needs its finalize.
-        projected = (
-            est if root_count <= 0 else int(est * max(0, root_count - roots_done) / root_count)
-        )
+        #
+        # A tile census divides more honestly than a radius sweep does: its
+        # tiles ARE uniform and its `est` is an exact TILE count rather than a
+        # geometric floor, so for the two Mapillary channels this projection
+        # carries much less slack (#318). It is still a lower bound, not the
+        # real remaining cost: the projection counts tiles and the cap counts
+        # REQUESTS, and one tile can spend up to TILE_MAX_TRIES of them -- which
+        # is the whole reason that constant is also this provider's launch
+        # floor, a few lines below. The arithmetic is unchanged either way.
+        projected = est if total <= 0 else int(est * max(0, total - done) / total)
         if projected > request_cap:
             return plan(
                 _SWEEP_SKIP_AGE_WALL,
                 f"refusing to resume — its checkpoint is {age_s / 86400:.1f} days old "
                 f"(discarded past {CHECKPOINT_MAX_AGE_S / 86400:.0f}) at "
-                f"{roots_done}/{root_count} root cells, and the ~{projected:,} requests "
+                f"{done}/{total} {units}, and the ~{projected:,} requests "
                 f"left will not fit tonight's {request_cap:,} ({clock_note}). Another night "
                 f"would be thrown away with the checkpoint. RECORDED AS A FAILURE so this "
                 f"is alerted rather than re-swept from zero every week: raise "
                 f"[providers.{channel}].daily_request_budget, shrink the city's grid, or "
-                f"delete the checkpoint to start the sweep over deliberately.",
-                f"REFUSED (checkpoint {age_s / 86400:.1f} d old, {roots_done}/{root_count})",
+                f"delete the checkpoint to start the crawl over deliberately.",
+                f"REFUSED (checkpoint {age_s / 86400:.1f} d old, {done}/{total})",
             )
 
-    if est > 0 and request_cap < _MIN_SWEEP_LAUNCH_REQUESTS:
+    pricing = _crawl_pricing(channel)
+    floor, floor_buys = pricing.launch_floor, pricing.floor_buys
+    if est > 0 and request_cap < floor:
         binding = (
             "requests left in today's budget"
             if request_cap == remaining
             else f"requests its {timeout_s // 60:,}-minute timeout affords"
         )
+        # The floor is per-provider and so is the reason for it: a radius sweep
+        # has to clear its calibration ladder before it can checkpoint anything,
+        # a tile census has to be able to fund one tile's retries before it can
+        # commit one. Naming which is which keeps the line true of the channel
+        # it is about (#318).
         return plan(
             _SWEEP_SKIP_FLOOR,
-            f"{request_cap:,} {binding} is under the {_MIN_SWEEP_LAUNCH_REQUESTS} needed to "
-            f"clear radius calibration; skipping (resumes tomorrow).",
-            f"deferred ({request_cap:,} req under the calibration floor)",
+            f"{request_cap:,} {binding} is under the {floor} needed to {floor_buys}; "
+            f"skipping (resumes tomorrow).",
+            f"deferred ({request_cap:,} req under the launch floor)",
         )
+
+    if est == 0:
+        # THE CACHED-CENSUS CASE (#290), AND THE ONE PLACE A CAP CAN COME OUT
+        # NON-POSITIVE. `est == 0` means the crawl this channel would do is
+        # already in the shared cache, so the floor above is deliberately not
+        # applied -- there is nothing to fund. But `est` is what the SCHEDULER
+        # predicts, and only the child can know whether the entry is actually
+        # reusable: `reconcile_cache_hit` refuses one older than the consumer's
+        # own checkpoint, and `load_cached_census` refuses one that fails
+        # validation. On either of those the child crawls for real.
+        #
+        # Which is why a non-positive cap is raised to 1 rather than dropped. A
+        # cap of 0 or less makes `_request_cap_args` emit NO FLAG AT ALL --
+        # correct for "spend nothing", catastrophic for "crawl the whole city",
+        # and the grid command carries no `--daily-budget` to catch it either.
+        #
+        # 1, deliberately, and NOT `floor`: the floor is what a crawl needs to
+        # make progress, but this branch is reached precisely when the budget
+        # cannot fund one, and granting a channel more than the night has left
+        # to spend is the failure the budget exists to prevent. A genuine cache
+        # hit is unaffected either way (it issues no request, so no cap binds);
+        # a surprise crawl stops at the first request and takes the honest
+        # `DownloadError` for having nothing to resume, instead of running a
+        # whole city against a per-IP host on an exhausted budget.
+        #
+        # `max`, so a positive remainder is passed through untouched: the walk
+        # in `test_the_calibration_floor_does_not_gate_a_walk_that_costs_nothing`
+        # keeps the 10 requests it actually has, and is bounded by them.
+        request_cap = max(request_cap, 1)
 
     if est > request_cap:
         return plan(
@@ -4246,6 +4513,41 @@ def cmd_assess_city(
     return 1
 
 
+def _request_cap_args(flag: str, request_cap: int | None) -> list[str]:
+    """The ``--*-max-requests`` argv for a resumable child, or nothing.
+
+    ONE helper rather than the same two lines at four launch sites, because the
+    condition is not the obvious one and got written wrong at all four.
+
+    ``None`` means no cap -- crawl to completion -- and is what every manual run
+    and every non-resumable channel gets. **A cap BELOW 1 also means no flag**,
+    and that is the part a plain ``is not None`` misses: the child's
+    ``positive_int`` refuses ``0`` at parse time (deliberately -- a cap of 0
+    stops a crawl before it commits anything and then tells the operator to
+    re-run), so emitting it turns the launch into an argparse **exit 2**, which
+    is a real ``consecutive_failure`` rather than the budget deferral it looks
+    like.
+
+    A cap of 0 reaches here on exactly one path, and it is a path that was
+    working before: ``_sweep_launch_plan``'s floor arm is gated on ``est > 0``,
+    and ``est == 0`` is the CACHED-census case (#290). So a night whose budget is
+    exactly spent, launching a walk whose census its grid sibling already paid
+    for, produces ``remaining == 0`` on a channel that is about to spend nothing
+    at all. Refusing the launch would skip the one collection of the night that
+    is free, which is what #274's review already fixed once.
+
+    THIS IS THE BACKSTOP, NOT THE FIX. ``_sweep_launch_plan`` now raises a
+    non-positive cap to the channel's launch floor on exactly that path, so a
+    child that turns out to crawl after all -- the cache entry can be refused by
+    ``reconcile_cache_hit`` or by validation, and only the child finds out -- is
+    bounded rather than uncapped. This clause stays because "no flag" and
+    "unbounded crawl" must not be the same argv on any path that reaches here,
+    including one added later, and because a cap of 0 is still the honest answer
+    for a launch that genuinely cannot spend.
+    """
+    return [] if request_cap is None or request_cap < 1 else [flag, str(request_cap)]
+
+
 def _street_collect_cmd(
     cfg: SchedulerConfig,
     city: db.CityRow,
@@ -4321,6 +4623,24 @@ def _street_collect_cmd(
         # own default, which is itself jittered.
         if pc.jitter is not None:
             cmd += ["--mapillary-jitter", str(pc.jitter)]
+        # And the night's REMAINING budget as a hard stop (issue #318). The
+        # budget gate above it is a pre-flight check against an ESTIMATE; this
+        # is the only thing that bounds what the child then spends, and it is
+        # what lets `_sweep_launch_plan` stop skipping a city that does not fit
+        # -- New York needed 484 tile requests with 426 left in the budget and
+        # collected nothing, twice, in six nights. Exhausting it checkpoints the
+        # unfetched tiles and exits 83, which _run_city_channels amnesties.
+        #
+        # Same unset-means-omit rule as the pacing flags above, and the value is
+        # never < 1: the CLI's positive_int refuses 0 at parse time, and the
+        # caller's launch floor is what keeps this side of that.
+        #
+        # Both flags, not one, exactly as for kartaview_streets below: they are
+        # a gate and a stop with opposite subtraction conventions.
+        # --daily-budget is the FULL ceiling because this collector subtracts
+        # today's spend itself; the cap arrives already subtracted, because
+        # nothing in the child can compute it.
+        cmd += _request_cap_args("--mapillary-max-requests", request_cap)
     elif channel == "kartaview_streets":
         # The child MUST be told the pace this channel's timeout was derived
         # from. _kartaview_timeout_seconds divides the sweep estimate by the
@@ -4346,8 +4666,7 @@ def _street_collect_cmd(
         # subtraction conventions. --daily-budget is the FULL ceiling because
         # this collector subtracts today's spend itself; the cap arrives already
         # subtracted, because nothing in the child can compute it.
-        if request_cap is not None:
-            cmd += ["--kartaview-max-requests", str(request_cap)]
+        cmd += _request_cap_args("--kartaview-max-requests", request_cap)
     # '--' so a display name can never be parsed as a flag
     cmd += ["--", city.display_name]
     return cmd
@@ -4579,6 +4898,18 @@ def _run_one_city(
         # And its jitter (issue #292), under the same unset-means-default rule.
         if pc.jitter is not None:
             cmd += ["--mapillary-jitter", str(pc.jitter)]
+        # And the night's REMAINING budget as a hard stop (issue #318). The
+        # budget gate above it is a pre-flight check against an ESTIMATE; this
+        # is the only thing that bounds what the child then spends, and it is
+        # what lets `_sweep_launch_plan` stop skipping a city that does not fit
+        # -- New York needed 484 tile requests with 426 left in the budget and
+        # collected nothing, twice, in six nights. Exhausting it checkpoints the
+        # unfetched tiles and exits 83, which _run_city_channels amnesties.
+        #
+        # Same unset-means-omit rule as the pacing flags above, and the value is
+        # never < 1: the CLI's positive_int refuses 0 at parse time, and the
+        # caller's launch floor is what keeps this side of that.
+        cmd += _request_cap_args("--mapillary-max-requests", request_cap)
     if provider == "kartaview":
         # Same reason as Mapillary's flag above, plus one specific to this
         # channel: the timeout is DERIVED from the configured rate (#238), so a
@@ -4597,12 +4928,11 @@ def _run_one_city(
         # IP. Exhausting this checkpoints the rest and exits 83 instead, which
         # _run_city_channels amnesties -- so the overrun became a pause.
         #
-        # Same unset-means-omit rule as the rate above, and the value is never
-        # < 1: the CLI's _positive_int refuses 0 at parse time (it used to be
-        # accepted, spend the whole calibration ladder and checkpoint nothing),
-        # and the caller's floor is what keeps this side of that.
-        if request_cap is not None:
-            cmd += ["--kartaview-max-requests", str(request_cap)]
+        # Same unset-means-omit rule as the rate above. A cap below 1 is
+        # omitted too, and NOT because the launch floor covers it -- that arm is
+        # gated on `est > 0`, so a cached census slips past it with a spent
+        # budget. See _request_cap_args.
+        cmd += _request_cap_args("--kartaview-max-requests", request_cap)
     # '--' so a display name can never be parsed as a flag
     cmd += ["--", city.display_name]
     # `conn` on both fallbacks, matching the street arm above (#238). It was
@@ -5818,8 +6148,12 @@ def _log_channel_error(city_id: str, provider: str, exc: BaseException) -> None:
 
 def _sweep_progress_note(progress: dict | None) -> str:
     """
-    " 3/8 root cells." for a paused sweep; empty when nothing readable is on
-    disk. Takes the dict :func:`_sweep_checkpoint_progress` returns, because the
+    " 3/8 root cells." (or " 12/104 tiles.") for a paused crawl; empty when
+    nothing readable is on disk. The unit comes from the state record rather
+    than from this line, because the two store shapes count different things
+    and a hardcoded noun here would mislabel every tile census (#318).
+
+    Takes the dict :func:`_sweep_checkpoint_progress` returns, because the
     caller needs it for the age-wall warning too and reading the state file
     twice is how two reports of one pause come to disagree.
 
@@ -5837,7 +6171,7 @@ def _sweep_progress_note(progress: dict | None) -> str:
     """
     if progress is None:
         return ""
-    return f" {progress['roots_done']}/{progress['root_count']} root cells."
+    return f" {progress['units_done']}/{progress['unit_count']} {progress['unit_name']}."
 
 
 def _warn_if_checkpoint_near_the_age_wall(
@@ -6251,8 +6585,12 @@ def _run_city_channels(
                                 deferred_channels[provider] += 1
                                 continue
                             if plan.skip is not None:
-                                # The calibration floor. A budget decision, so it takes
-                                # the budget counter and no failure -- see the plan.
+                                # The LAUNCH floor, for any of the four resumable
+                                # channels -- "calibration" is KartaView's reason for
+                                # having one, and a tile census reaching here has no
+                                # ladder to calibrate (see _SWEEP_SKIP_FLOOR). A budget
+                                # decision, so it takes the budget counter and no
+                                # failure -- see the plan.
                                 logger.info(f"{city.city_id} [{provider}]: {plan.message}")
                                 skipped_budget += 1
                                 continue

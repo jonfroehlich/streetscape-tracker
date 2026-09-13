@@ -99,6 +99,20 @@ KARTAVIEW_CHECKPOINT_FORMAT_VERSION = 2
 # make one bump silently discard the other's checkpoints.
 PANORAMAX_CHECKPOINT_FORMAT_VERSION = 1
 
+# What one unit of checkpointed progress IS, per store shape. A radius sweep
+# counts root cells and a tile census counts tiles, and the difference reaches
+# an operator: it is the noun in every pause line, every resume line and the
+# scheduler's age-wall refusal (issue #318).
+#
+# Declared beside the format versions, and for the same reason -- these are
+# properties of the state record, and `sweep_progress` below has to name the
+# unit for a record it is handed WITHOUT knowing which provider wrote it. The
+# downloaders import the one they raise with, so the string an operator reads in
+# the child's log and the string the scheduler reads out of the state file are
+# the same object rather than two literals that drift apart.
+SWEEP_UNIT_ROOT_CELLS = "root cells"
+SWEEP_UNIT_TILES = "tiles"
+
 STORE_FORMAT_VERSIONS: dict[str, int] = {
     "kartaview": KARTAVIEW_CHECKPOINT_FORMAT_VERSION,
     "mapillary": MAPILLARY_CHECKPOINT_FORMAT_VERSION,
@@ -680,10 +694,22 @@ def sweep_progress(checkpoint_path: str | None) -> dict | None:
     How far the sweep checkpointed at ``checkpoint_path`` has got, or None when
     nothing readable is there.
 
-    Returns ``{"roots_done", "root_count", "age_s"}``. Lives here rather than in
-    the scheduler because it is the state record's layout, and the module that
-    writes a format is the one that should be asked to read it -- the same rule
-    the census seam follows.
+    Returns ``{"units_done", "unit_count", "unit_name", "age_s"}``. Lives here
+    rather than in the scheduler because it is the state record's layout, and
+    the module that writes a format is the one that should be asked to read it
+    -- the same rule the census seam follows.
+
+    IT READS BOTH STORE SHAPES, and until #318 it read only the sweep's. A tile
+    census writes ``tile_count`` / ``done_tiles`` where a radius sweep writes
+    ``root_count`` / ``roots_done``, and the ``KeyError`` that mismatch produced
+    was swallowed by the best-effort ``except`` below -- so handed a Mapillary
+    checkpoint this returned ``None``, which every caller reads as "there is no
+    checkpoint". That is a FAIL-QUIET rather than a crash: the pause line would
+    have reported no progress and, worse, ``_sweep_launch_plan``'s age-wall arm
+    would never fire for a tile census, which is the one arm that exists because
+    nothing downstream can otherwise see a checkpoint being discarded and
+    re-swept from zero every seven days. Adding a resumable provider means
+    adding its layout here, not only its flag to ``CHANNEL_RESUMABLE``.
 
     ``age_s`` is measured from ``created_at``, the FIRST commit, because that is
     what ``CHECKPOINT_MAX_AGE_S`` is enforced against (issue #272): a sweep that
@@ -693,15 +719,50 @@ def sweep_progress(checkpoint_path: str | None) -> dict | None:
 
     Best-effort and total: every failure is None, because a caller reporting on
     a night that already succeeded in its own terms must never be the thing that
-    breaks it.
+    breaks it. That posture is exactly why the layout branch below names the two
+    shapes it knows and REFUSES a third rather than falling through to the tile
+    arm: swallowed by this `except`, an unrecognised layout is indistinguishable
+    from "no checkpoint", and a provider whose progress silently reads as absent
+    loses the age wall without anything logging that it did. It still answers
+    None for one -- the contract holds -- but it says so first.
     """
     if checkpoint_path is None:
         return None
     try:
         with open(_state_path(checkpoint_path), encoding="utf-8") as f:
             state = json.load(f)
-        root_count = int(state["root_count"])
-        roots_done = int(state["roots_done"])
+        if "root_count" in state:
+            unit_name = SWEEP_UNIT_ROOT_CELLS
+            unit_count = int(state["root_count"])
+            units_done = int(state["roots_done"])
+        elif "tile_count" in state:
+            # A tile census records the tiles it committed rather than a count,
+            # because `done_tiles` is also what the resume subtracts from the
+            # lattice -- so the count is derived from the list rather than
+            # stored beside it and allowed to disagree with it.
+            unit_name = SWEEP_UNIT_TILES
+            unit_count = int(state["tile_count"])
+            units_done = len(state["done_tiles"])
+        else:
+            # A THIRD shape is not a tile census, and an `else` that assumed it
+            # was would reproduce the exact fail-quiet #318 fixed: the KeyError
+            # on `tile_count` lands in the best-effort `except` below, this
+            # answers None, and every caller reads None as "no checkpoint". The
+            # age wall then never fires for the new provider, silently, which is
+            # the one arm nothing else can see the absence of.
+            #
+            # LOGGED, then None -- not raised. The contract above is that no
+            # caller is ever broken by this function, and an unreadable
+            # checkpoint genuinely is "no progress I can report"; what was
+            # missing is any trace that the answer was a guess. A warning naming
+            # the keys is the difference between a provider whose age wall is
+            # off for a cycle and one an operator can grep for on night one.
+            logger.warning(
+                "unrecognised checkpoint layout at %s (keys: %s); reporting no progress",
+                checkpoint_path,
+                ", ".join(sorted(state)[:6]) or "none",
+            )
+            return None
         started = state.get("created_at")
         age_s = (
             None
@@ -710,7 +771,12 @@ def sweep_progress(checkpoint_path: str | None) -> dict | None:
         )
     except (OSError, ValueError, KeyError, TypeError):
         return None
-    return {"roots_done": roots_done, "root_count": root_count, "age_s": age_s}
+    return {
+        "units_done": units_done,
+        "unit_count": unit_count,
+        "unit_name": unit_name,
+        "age_s": age_s,
+    }
 
 
 def same_crawl(marker: dict, channel: str | None, variant: str | None) -> bool:
