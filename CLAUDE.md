@@ -77,6 +77,7 @@ python scripts/register_frame.py --manifest mapillary_360_cities.csv --overlap-k
 | `screen-provider panoramax` | The weekly whole-catalog growth screen (#316): 113 requests answer all 1,144 cities. Writes UPPER BOUNDS, never counts; `--dry-run` prices it, `--measure --limit N` measures the richest exactly and writes nothing |
 | `regenerate-aggregate [--publish]` | Rebuild `cities.json.gz` from the catalog (no collection), optionally rsync |
 | `reconcile-walks [--dry-run]` | Catalog road walks that finished but were never registered |
+| `import-bundle DIR [--execute] [--enable]` | Land a laptop investigation's artifacts here (#330): a laptop `data/` dir, read-only, DRY-RUN by default; refuses the bundle WHOLE on a geometry, filename, collision, schema, append-order, network-bytes or in-flight-batch problem |
 | `fetch-driving-plan [--force]` | Snapshot Google's published driving plan out of band; `--from-file`/`--date` backfills a hand-saved snapshot |
 | `backup-status [--alert]` | Catalog-backup health; nonzero when the newest backup is missing, >48 h old, or the last attempt failed; `--alert` emails when unhealthy (#193 daily timer) |
 | `restore-backup FILE --to PATH` | Restore a dated backup; refuses an existing destination or orphaned `-wal`/`-shm` |
@@ -91,7 +92,7 @@ Bare enrol needs an opt-in channel and an enabled city (every enabled city is al
 An unknown or unresolvable target still exits 64; enrolling BEFORE the channel is configured is supported on purpose (it prints a note), or the rollout order is impossible.
 `--clear` on a pair that has no stored value exits 64 rather than writing a row and printing `unset -> unset` — the one silent no-op the relaxation opened, and the new error text routes operators straight at it.
 `status` prints `excluded` only for an ENABLED city; a disabled one prints `no` on every channel, so a pre-set exclusion shows up in the membership footer's count rather than its own row.
-**`assess-city` skips a channel this city is excluded from** and says so — collecting one would spend its key and then stamp `last_success_at` on a `member = 0` row, a state nothing else produces.
+**`assess-city` skips a channel this city is excluded from** and says so — collecting one would spend its key and then stamp `last_success_at` on a `member = 0` row, a state only `import-bundle` otherwise produces (a KartaView bundle landed before `enroll-city`, where the stamp is the point).
 **`--all` is DRY-RUN until `--execute`** (its blast radius is the whole catalog, and it is one keystroke from `--all --remove`), selects only cities the setting would CHANGE (so `--limit N` means N *new* members, never N rows re-touched), orders cheapest-first because a city that finishes its sweep in one night never writes a checkpoint and so never meets the 7-day `CHECKPOINT_MAX_AGE_S`, and prints its total as a **floor**; `--limit`/`--execute` without `--all`, `--all` with `--list`, and `--all` with a CITY all exit 64.
 
 ### One-time and repair scripts (`scripts/`)
@@ -245,6 +246,9 @@ Deployment lives in `deploy/` (7 systemd units + its README).
 `assess-city` answers a partner inquiry about an untracked city the same day (register + both road walks + the cheap Mapillary grid run + publish).
 **Answer from street coverage, never grid coverage** — grid points land on water, rail, parkland and rooftops, badly understating a deployment (Highland Heights: 55.6% of grid points vs 92.8% of street-km); a rectangle is not a city, and the pre-flight says so before anything is spent.
 Publishing is declared in config (`[publish].local`), never inherited from the environment, so a hand-run publish and the nightly one take the identical path.
+`import-bundle` lands a laptop investigation here instead of re-collecting it (#330), and three things about it are load-bearing: **it is the only place a filename's geometry is checked against the frozen `cities` row** (every `same_grid_geometry` call compares filename to filename), it copies **only files a catalog row names** — a bundle's `data/` holds one-city aggregates that a directory sync would publish over the real index — and it writes `record_attempt` per imported channel, which is what stops the next night re-paying for the crawl.
+Grid stats are RECOMPUTED from the CSV and walk stats are CARRIED and cross-checked, deliberately; spend reaches `api_usage` only for credentials this host shares (`gsv*`, `kartaview*`), never the per-IP ones.
+A series is **append-only** (a run or walk at or before this host's newest is refused) and an import that extends one is **diffed here** — the bundle's catalog knew only the laptop's runs; a frozen network this host already holds is **kept**, byte-compared, never replaced.
 
 **Catalog backups → [`docs/catalog-backups.md`](docs/catalog-backups.md).**
 The catalog lives in exactly one place, and lab storage being backed up is something to **verify, not assume**.

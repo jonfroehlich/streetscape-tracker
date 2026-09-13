@@ -1047,6 +1047,29 @@ def register_city(
     return city_id
 
 
+def set_city_enabled(conn: sqlite3.Connection, city_id: str, enabled: bool) -> None:
+    """
+    Turn a registered city's scheduler rotation on or off.
+
+    Separate from ``register_city``'s ``enabled`` argument, which only ever
+    applies at registration (the INSERT is ``OR IGNORE``, so a second call with
+    a different ``enabled`` is silently a no-op). A city registered out of
+    rotation — a sampling-frame city awaiting boundary vetting (issue #110), or
+    one arriving through a laptop investigation (issue #330) — otherwise has no
+    way back in short of hand-editing the catalog.
+
+    Note this is ``cities.enabled``, the city-wide gate, NOT
+    ``schedule_state.member``, the per-channel one. ``get_due_cities`` reads
+    both, and only the second is what ``enroll-city`` writes.
+
+    Raises KeyError if the city is unknown, so a typo cannot be a silent no-op.
+    """
+    cur = conn.execute("UPDATE cities SET enabled = ? WHERE city_id = ?", (int(enabled), city_id))
+    if cur.rowcount == 0:
+        raise KeyError(city_id)
+    conn.commit()
+
+
 def update_city_geometry(
     conn: sqlite3.Connection,
     *,
@@ -1483,12 +1506,18 @@ def register_street_network(
     node_count: int | None = None,
     edge_count: int | None = None,
     osmnx_version: str | None = None,
+    fetched_at: str | None = None,
 ) -> int:
     """
     Catalog a city's frozen OSM street network. Idempotent on
     (city_id, network_type): a --refresh re-fetch replaces the prior row
     (counts, osmnx version, fetched_at) rather than erroring — the network is
     a frozen asset with replace-on-refresh semantics, not a history.
+
+    ``fetched_at`` defaults to now — the collector calls this right after the
+    download — but a caller cataloging a network fetched elsewhere (the bundle
+    importer, issue #330) passes the original, since it is when the OSM
+    snapshot was taken, not when this row was written.
 
     Returns the network_id.
     """
@@ -1510,7 +1539,7 @@ def register_street_network(
             node_count,
             edge_count,
             osmnx_version,
-            utc_now_iso(),
+            fetched_at or utc_now_iso(),
         ),
     )
     conn.commit()

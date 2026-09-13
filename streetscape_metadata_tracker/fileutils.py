@@ -1,4 +1,5 @@
 import glob
+import gzip
 import logging
 import os
 import platform
@@ -230,3 +231,28 @@ def open_in_browser(file_path: str) -> tuple[bool, str | None]:
 
     except Exception as e:
         return False, f"Error opening browser: {str(e)}"
+
+
+def count_streetwalk_samples(csv_path: Path) -> int | None:
+    """
+    Number of sampled locations in a road-walk snapshot: its data rows.
+
+    The walk writes exactly one row per on-street sample point, so the row count
+    recovers ``sample_points`` — which the artifact itself does not carry and
+    which ``estimate_street_samples`` prefers over every other precedence step
+    when budgeting a later walk of the same city. Counted line-by-line rather
+    than via pandas: the caller may be reconciling a multi-hundred-MB snapshot
+    inside the scheduler's memory-capped cgroup, and only the count is wanted.
+
+    Returns None if the snapshot is missing or unreadable.
+
+    Shared by the orphan-walk salvage and the bundle importer (issue #330):
+    both reconstruct a walk's row from artifacts on disk, and a second copy
+    of this would let the two disagree about what a sample is.
+    """
+    try:
+        with gzip.open(csv_path, "rt", encoding="utf-8") as fh:
+            return max(sum(1 for _ in fh) - 1, 0)  # minus the header
+    except (OSError, EOFError, UnicodeDecodeError) as e:
+        logger.warning(f"Could not count samples in {csv_path.name}: {e}")
+        return None
