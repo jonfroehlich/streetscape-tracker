@@ -269,3 +269,57 @@ The rationale this replaced was reasoned rather than measured, and wrong: it hel
 Probed 2026-09-10 ([#334](https://github.com/jonfroehlich/streetscape-tracker/issues/334)): `https://api.panoramax.xyz/` answers 307 to `/en/index`, whose body embeds `<pnx-viewer endpoint="/api" metacatalog="false">` — the official `@panoramax/web-viewer` bound to the meta-catalog; its permalink parameters are query-string rather than hash (`pic=`, `focus=`, `map=`, per `docs.panoramax.fr/web-viewer/03_URL_settings/`) and survive the 307; and `GET /api/pictures/<uuid>` answers 200 for a picture from our own run, so the meta-catalog resolves a picture without being told its instance.
 Browser-verified on a real picture before shipping, which is #312's lesson applied **before** rather than after — and is why there is no fallback: a fallback is for a provider whose own viewer cannot be trusted, and this one can.
 The `withFallback === ["kartaview"]` pin in the node suite is what keeps a later entry from copying the fallback rather than earning one.
+
+## A filename resolves to a provider or to nothing — never to a default (issue #338)
+
+**`getProviderFromFilename` returns `null` for a provider token this build does not know, and `isValidRunFilename` is DEFINED as that lookup succeeding.**
+Until [#338](https://github.com/jonfroehlich/streetscape-tracker/issues/338) it returned `"gsv"` for an unrecognised token, which is what turned [#334](https://github.com/jonfroehlich/streetscape-tracker/issues/334) from a failure into a misrender: `city.js` drew 135,389 Panoramax pictures under Google's attribution, the GSV colour ramp and GSV's 2007 capture-date floor, offered a "Google only" radiogroup whose default mode hid **every** marker because no Panoramax row is `© Google`, and built `google.com/maps/...pano=<uuid>` links to nothing.
+Nothing on that page looked broken, which is the cost of the default: a hard failure would have been caught in minutes.
+
+**The fix separates two cases the old regex could not tell apart.**
+A name with **no token at all** still resolves to `gsv` — that is the naming contract (`docs/architecture.md`) and it must not change, because pre-2026 undated files carry no token and their published URLs have to keep working.
+A name with a token **that is not in `PROVIDERS`** resolves to `null`, matching what `naming.parse_filename` has always done on the Python side: it raises `ValueError` on an unknown token rather than substituting `DEFAULT_PROVIDER`.
+A name that is not a run filename at all — a diff, `cities.json.gz`, a traversal attempt — also resolves to `null`, where it used to answer `"gsv"` as confidently as a real Street View run.
+
+**`RUN_FILENAME_RE` is a deliberately STRICTER subset of `naming.FILENAME_RE`, not a mirror of it**, and the JSDoc says so, because a reviewer reading "mirror" will eventually find the differences and file them as bugs.
+The two answer different questions: Python parses any name the project has ever written, from any path and any extension, while this validates a URL a stranger just handed the browser.
+Four narrowings, all intended — `.csv.gz` only (Python also strips `.json.gz`, `.csv`, `.json`, `.html` or nothing at all), no path component (Python takes the basename; here a separator IS the traversal attempt), no `#`, and integer `_width_`/`_height_` where Python accepts `_width_5000.0_`.
+The float case was checked rather than assumed: **0 of 2,390 names on disk and 0 of 1,161 in the published aggregate** carry float dimensions, and the pre-#338 validator did not accept them either, so nothing changed.
+One divergence runs the other way and predates all of this: an impossible date like `_2026-13-45` is shape-valid in JS and raises in Python, which builds a real `date`. It reaches nothing, because such a name resolves to a file that does not exist.
+
+**What must hold is the overlap, and it is pinned across the language boundary**: `test_the_js_run_filename_regex_agrees_with_python` (`tests/test_naming.py`) reads `RUN_FILENAME_RE` out of the JS source, runs it as a Python pattern, and asserts that any name it resolves to a provider, `parse_filename` resolves to the SAME provider.
+It sweeps `KNOWN_PROVIDERS` through `generate_run_filename` so a new provider is covered the day it is added, and it counts how many names actually resolved — a regex that matched nothing would otherwise make it vacuously green.
+Verified to fail on two real drift modes: dropping the capture group (the #338 shape, where a tokened name reads as gsv) and renaming the const out from under the anchor.
+The direction is deliberately one-way; demanding equality would fail on exactly the hostile inputs the narrowings exist to reject.
+
+**One regex, `RUN_FILENAME_RE`, now backs both functions.**
+`isValidRunFilename` had its own copy of the contract, and the two copies disagreed in exactly the way that mattered: the validator accepted `_notaprovider_` and the lookup then renamed it gsv.
+Defining the validator as `getProviderFromFilename(name) !== null` makes them one decision, so a later widening of either cannot reopen the hole; `test_isValidRunFilename: is exactly 'getProviderFromFilename resolved'` pins the equivalence over a list of names rather than trusting the implementation to stay that way.
+
+**Both call sites refuse rather than degrade, because there is no degraded render available.**
+`city.js` reads the registry entry for attribution, colour ramp, capture-date floor, viewer link and the copyright toggle, so substituting gsv does not produce a partial page — it produces a complete and plausible page about the wrong provider.
+A rejected `?file=` therefore gets its own message naming the file, instead of falling through to the generic "No city specified", which would send the reader looking for a missing parameter.
+
+**A `?file=` that was present and rejected is refused even when `?city=` would resolve something** — the hole a review found in the first version of this fix.
+Refusing only when `?city=` was absent left `?file=<a panoramax run>&city=Ames` rendering Ames's GSV series instead: a complete, error-free page under Google's attribution, in answer to a URL that named a non-Google run, with nothing but a `console.warn` to say so.
+That is the #338 substitution reached through a URL shape the fix did not cover, so the fallback is gone.
+It costs nothing, because **no link builder in `www/` emits both parameters** — `index.js`, `grid.js`, `streets.js`, `driving.js` and `city.js`'s own snapshot selector all emit `?file=` alone — so only a hand-edited or stale URL reaches it, and there naming the fault beats quietly rendering something else.
+
+**The aggregate refusal is defence in depth against a malformed payload, NOT a route a healthy site takes** — the docs said "mid-deploy" first, and that was wrong in an instructive way.
+`data_file.filename` is read out of `providers[<key>].latest`, where the key comes from `Object.keys(PROVIDERS)`, so a frontend that lacks a provider never asks for its view and therefore never sees its `data_file`; a stale cached bundle cannot reach this branch, it is the very thing that hides it.
+What CAN reach it is a published record whose filename disagrees with the provider block holding it.
+The branch stays, because a payload bug is exactly when a plausible wrong page is most expensive — but the aggregate path and the `?file=` path now word their messages differently, and a `targetFile` that is missing entirely says so rather than blaming a provider this page does not know.
+
+**The echoed value is quoted and capped** (`quoteForMessage`, 96 code points).
+`?file=` is attacker-chosen, and naming it in the refusal is what makes the message useful — but an unbounded echo lets a crafted link render hundreds of KB of arbitrary prose on `makeabilitylab.cs.washington.edu`, where "SECURITY ALERT: call +1-555-0100" reads very differently than in a URL bar.
+This is **not** an escaping function and does not stand in for one: markup is harmless here because `showLoadError` writes `textContent`, which is the only writer of `#progress-text` besides the progress messages.
+It is sliced by code point, so a cap landing inside a surrogate pair cannot emit a lone surrogate — a replacement character in an error message about something being malformed reads as our bug.
+
+The rest of the frontend needs no change and gets none: every fan-out over the registry already gates on presence in the payload (`grid.js`, `streets.js`, `index.js`), so an unregistered provider's rows are skipped rather than mislabelled.
+That is the inverse rule — a registered provider is not a collected one — and #334's registry pin (`test_the_js_registry_covers_every_known_provider_too`) is what keeps the collected-but-unregistered state from recurring in the first place.
+This issue is about what happens if it does anyway.
+
+`config.PROVIDER_RUN_DTYPES` has the same `.get(provider, DEFAULT)` shape and was checked while here: it is unreachable with an unknown provider.
+`fileutils.dtypes_for_run_path` reaches the lookup only through `naming.parse_filename`, which raises on an unknown token, or `naming.parse_streetwalk_filename`, which is safe for a sharper reason — `_STREETWALK_FILENAME_RE` embeds a provider alternation built from `KNOWN_PROVIDERS`, so an unknown token fails the regex rather than reaching `match.group("provider")`.
+Left alone deliberately: its fallback catches names the naming contract does not parse at all (fixtures, ad-hoc exports), which is a different question.
+The tests around it are `test_dtypes_for_run_path_picks_the_schema_from_the_provider_token` (which is the one that actually calls the function, and has no unknown-token case) plus the two subset pins, `test_a_run_schema_is_reachable_from_a_filename` and `test_every_known_provider_has_a_run_schema`.

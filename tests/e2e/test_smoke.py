@@ -24,7 +24,9 @@ Assertions (seeded from the manual run):
 """
 
 import functools
+import gzip
 import http.server
+import json
 import os
 import re
 import socketserver
@@ -497,6 +499,136 @@ def test_city_page_renders_a_panoramax_run_as_panoramax(page: Page, base_url):
     # One link, not two: no fallback, because the viewer works (#312's rule
     # applied in the other direction).
     expect(popup.locator("a")).to_have_count(1)
+
+    assert errors == []
+
+
+def test_city_page_refuses_a_run_from_an_unregistered_provider(page: Page, base_url):
+    """
+    Issue #338, the general form of #334: a run whose provider token this
+    build does not know must FAIL, visibly, instead of rendering as Google's.
+
+    The filename below is exactly what ``naming.generate_run_filename`` emits
+    for a provider that has been collected but not registered — which is the
+    state Panoramax was in for three PRs. Before the fix,
+    ``getProviderFromFilename`` answered "gsv" for it and the page went on to
+    fetch, draw and label the run under Google's attribution and colour ramp;
+    the only way to notice was to know what the imagery should have looked
+    like. So the assertion that matters is the negative one: no map legend,
+    no Google attribution, and an error message that names the file.
+
+    No fixture is needed and none exists — refusing before the fetch is part
+    of the behaviour, and a 404 would be a different (and much louder) bug.
+    """
+    errors = _capture_errors(page)
+    unregistered = "alpha-city--alphastate--testland_width_100_height_100_step_20_notaprovider_2026-04-15.csv.gz"
+    page.goto(f"{base_url}/city.html?file={unregistered}")
+
+    # The explicit refusal, naming the file the reader asked for.
+    progress = page.locator("#progress-text")
+    expect(progress).to_be_visible()
+    expect(progress).to_contain_text(unregistered)
+    # ...and NOT the generic "no city specified", which would send the reader
+    # looking for a missing parameter rather than an unknown provider.
+    expect(progress).not_to_contain_text("No city specified")
+
+    # Nothing rendered: the legend table only appears once a run has loaded,
+    # and no provider's attribution — least of all Google's — was added.
+    expect(page.locator("table.legend-stats")).to_have_count(0)
+    expect(page.locator(".leaflet-control-attribution")).not_to_contain_text("Google")
+
+    assert errors == []
+
+
+def test_a_rejected_file_param_is_not_rescued_by_a_city_param(page: Page, base_url):
+    """
+    The hole a review found in the first version of #338's fix: the refusal
+    only fired when ``?city=`` was absent, so adding a city query to the same
+    URL brought the silent misrender straight back.
+
+    ``?file=<a run this build can't render>&city=Alpha City`` used to discard
+    the rejected file and render the CITY match instead — a complete,
+    error-free page under Google's attribution, in answer to a URL that named
+    a non-Google run, with nothing but a ``console.warn`` to say so. That is
+    the same substitution #338 exists to end, reached through a URL shape the
+    first fix did not cover.
+
+    Falling back is safe to drop because nothing produces this shape: every
+    ``city.html`` link builder in ``www/`` (index.js, grid.js, streets.js,
+    driving.js, and city.js's own snapshot selector) emits ``?file=`` alone.
+    Only a hand-edited or stale URL gets here, and naming what is wrong with
+    it beats quietly rendering something else.
+    """
+    errors = _capture_errors(page)
+    unregistered = "alpha-city--alphastate--testland_width_100_height_100_step_20_notaprovider_2026-04-15.csv.gz"
+    page.goto(f"{base_url}/city.html?file={unregistered}&city=Alpha%20City")
+
+    progress = page.locator("#progress-text")
+    expect(progress).to_be_visible()
+    expect(progress).to_contain_text(unregistered)
+
+    # The city query resolves perfectly well — that is the whole danger, and
+    # why these are the assertions. Alpha City's GSV run exists in the fixture,
+    # so before the fix this page rendered it completely.
+    expect(page.locator("table.legend-stats")).to_have_count(0)
+    expect(page.locator(".leaflet-control-attribution")).not_to_contain_text("Google")
+    # The legend's <h4> is where the resolved city's name would appear; its
+    # absence is what says the city query was refused rather than honoured.
+    expect(page.locator("h4", has_text="Alpha City")).to_have_count(0)
+
+    assert errors == []
+
+
+def test_city_page_refuses_an_aggregate_that_names_an_unknown_provider(page: Page, base_url):
+    """
+    The OTHER refusal in city.js — the one on the aggregate path — which a
+    review found had no coverage at all, node or e2e, and which the docs had
+    described as a mid-deploy path it cannot actually be.
+
+    It is not reachable from a URL: ``?file=`` is validated by the same lookup,
+    and an aggregate filename is read out of ``providers[<key>].latest`` where
+    the key comes from ``Object.keys(PROVIDERS)`` — a frontend that lacks a
+    provider never asks for its view. What CAN reach it is a published payload
+    whose filename disagrees with the provider block holding it, so that is
+    what this serves: the real fixture aggregate with Alpha City's *gsv*
+    ``data_file.filename`` rewritten to carry an unregistered token.
+
+    Without this the branch would be dead code that reads correct, which is
+    how the #334 misrender survived three PRs in the first place.
+    """
+    errors = _capture_errors(page)
+
+    with gzip.open(os.path.join(FIXTURE_DIR, "cities.json.gz"), "rt", encoding="utf-8") as f:
+        payload = json.load(f)
+    poisoned_name = "alpha-city--alphastate--testland_width_100_height_100_step_20_notaprovider_2026-04-15.csv.gz"
+    payload["cities"][0]["providers"]["gsv"]["latest"]["data_file"]["filename"] = poisoned_name
+    body = gzip.compress(json.dumps(payload).encode("utf-8"))
+
+    # Registered after the autouse fixture's route, so it wins for this one
+    # artifact and everything else still comes from the committed fixture.
+    page.route(
+        "**/streetscape-tracker/data/cities.json.gz",
+        lambda route: route.fulfill(
+            status=200,
+            body=body,
+            headers={
+                "Content-Type": "application/octet-stream",
+                "Content-Length": str(len(body)),
+                "Access-Control-Allow-Origin": "*",
+            },
+        ),
+    )
+    page.goto(f"{base_url}/city.html?city=Alpha%20City")
+
+    progress = page.locator("#progress-text")
+    expect(progress).to_be_visible()
+    expect(progress).to_contain_text(poisoned_name)
+    # The aggregate-path wording, not the ?file= one: this reader supplied no
+    # file at all, so telling them their file isn't published would be wrong.
+    expect(progress).to_contain_text("the city index lists it")
+
+    expect(page.locator("table.legend-stats")).to_have_count(0)
+    expect(page.locator(".leaflet-control-attribution")).not_to_contain_text("Google")
 
     assert errors == []
 
