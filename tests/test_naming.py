@@ -5,6 +5,8 @@ from datetime import date
 import pytest
 
 from streetscape_metadata_tracker.naming import (
+    DEFAULT_PROVIDER,
+    KNOWN_PROVIDERS,
     generate_base_filename,
     generate_run_filename,
     generate_streetwalk_diff_filename,
@@ -406,3 +408,89 @@ def test_parse_filename_rejects_streetwalk_diff_artifacts():
             parse_filename(name)
         with pytest.raises(ValueError):
             parse_streetwalk_filename(name)
+
+
+def test_the_js_run_filename_regex_agrees_with_python():
+    """
+    The JS copy of this contract must never resolve a provider DIFFERENTLY
+    from ``parse_filename`` — the cross-language pin issue #338 earned.
+
+    #338's whole cause was one contract living in two regexes that drifted:
+    ``isValidRunFilename`` accepted a filename whose provider token
+    ``getProviderFromFilename`` then silently renamed to gsv, and nothing
+    noticed because each regex was self-consistent. That pair is now one
+    ``RUN_FILENAME_RE``, but the *language* boundary is still two copies, and
+    the frontend one is what decides which provider a reader's browser thinks
+    it is looking at. So it is read out of the source and run here, the way
+    ``test_the_js_registry_covers_every_known_provider_too`` reads the
+    registry.
+
+    The pin is deliberately ONE-DIRECTIONAL: whatever JS resolves to a
+    provider, Python must resolve to the SAME provider. The converse is not
+    asserted, because the JS regex is a deliberately stricter subset — it
+    validates a URL a stranger handed the browser, not any name the project
+    has ever written — and its four narrowings (``.csv.gz`` only, no path
+    component, no ``#``, integer dimensions) are documented on the regex
+    itself. A test that demanded equality would fail on exactly the hostile
+    inputs the narrowings exist to reject.
+
+    The JS source is a valid Python pattern here by construction: the regex
+    uses only ``[...]``, ``(?:...)``, one capture group and ``\\d``, with no
+    JS-only syntax. ``re.ASCII`` keeps ``\\d`` from matching Unicode digits,
+    which JS's ``\\d`` never does.
+    """
+    import pathlib
+    import re
+
+    js_path = pathlib.Path(__file__).resolve().parent.parent / "www" / "js" / "streetscape-utils.js"
+    js = js_path.read_text(encoding="utf-8")
+
+    literal = re.search(r"^const RUN_FILENAME_RE =\n  /(.+)/;$", js, re.MULTILINE)
+    assert literal, "www/js/streetscape-utils.js no longer spells `const RUN_FILENAME_RE =`"
+    js_re = re.compile(literal.group(1), re.ASCII)
+
+    # Names JS is expected to RESOLVE (every generation, every provider), plus
+    # names it is expected to REFUSE. Both halves go through the same loop: the
+    # point is that no name anywhere resolves to a provider Python disagrees
+    # with, not that this list is the whole input space.
+    names = [
+        "bend--or_width_5000_height_5000_step_20.csv.gz",
+        "bend--or_width_5000_height_5000_step_20.0.csv.gz",
+        "bend--or_width_5000_height_5000_step_20_2026-07-05.csv.gz",
+        "st.-louis--mo_width_5000_height_5000_step_20_2026-07-05.csv.gz",
+        "bend--or_width_5000_height_5000_step_20_notaprovider_2026-07-05.csv.gz",
+        "bend--or_width_5000_height_5000_step_20_constructor_2026-07-05.csv.gz",
+        "bend--or_width_5000_height_5000_step_20_gsv_history_2026-07-05.csv.gz",
+        "bend--or_diff_2026-04-01_to_2026-07-01.csv.gz",
+        "../../../etc/passwd",
+        "cities.json.gz",
+    ]
+    # Every registered provider's own dated run, built by the generator rather
+    # than spelled, so a new provider is covered the day it is added.
+    for provider in KNOWN_PROVIDERS:
+        names.append(
+            generate_run_filename(
+                "bend--oregon--united-states", 5000, 5000, 20, date(2026, 7, 5), provider=provider
+            )
+            + ".csv.gz"
+        )
+
+    resolved = 0
+    for name in names:
+        match = js_re.match(name)
+        if not match:
+            continue  # JS refuses it outright; nothing to agree about
+        token = match.group(1)
+        if token is not None and token not in KNOWN_PROVIDERS:
+            continue  # JS returns null for an unknown token, same as a raise
+        js_provider = token if token is not None else DEFAULT_PROVIDER
+        # Python must not merely accept it — it must name the SAME provider.
+        assert parse_filename(name).provider == js_provider, (
+            f"{name}: JS resolves {js_provider!r}, Python disagrees"
+        )
+        resolved += 1
+
+    # Guard against the loop passing by never running its body: a regex that
+    # matched nothing, or a rename that emptied the corpus, would otherwise
+    # make this test vacuously green.
+    assert resolved >= len(KNOWN_PROVIDERS) + 4, f"only {resolved} names resolved"

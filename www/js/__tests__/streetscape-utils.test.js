@@ -27,6 +27,8 @@ const {
   isKnownMetric,
   parseFilterParam,
   isValidRunFilename,
+  quoteForMessage,
+  ECHOED_VALUE_MAX_CHARS,
   diffFilenameFor,
   isValidDiffFilename,
   recencyColor,
@@ -888,6 +890,56 @@ test("getProviderFromFilename: a real Panoramax run resolves to panoramax, not g
   assert.equal(getProviderFromFilename(name), "panoramax");
   assert.equal(isValidRunFilename(name), true);
   assert.equal(isKnownProvider("panoramax"), true);
+});
+
+// --- quoteForMessage: echoing an untrusted value back at the reader ---------
+
+test("quoteForMessage: quotes a short value whole and caps a long one", () => {
+  // A real run filename must survive intact -- the message is worthless if it
+  // truncates the thing it is refusing.
+  const realName =
+    "ames--iowa--united-states_width_14683_height_11442_step_20_panoramax_2026-09-06.csv.gz";
+  assert.ok(realName.length <= ECHOED_VALUE_MAX_CHARS);
+  assert.equal(quoteForMessage(realName), `"${realName}"`);
+
+  // Over the cap: truncated, ellipsised, and still delimited at both ends so
+  // the echoed span has a visible end.
+  const long = "x".repeat(ECHOED_VALUE_MAX_CHARS + 500);
+  const quoted = quoteForMessage(long);
+  assert.equal(quoted, `"${"x".repeat(ECHOED_VALUE_MAX_CHARS)}…"`);
+  assert.ok(quoted.length < long.length);
+});
+
+test("quoteForMessage: bounds an attacker's echo on the trusted origin", () => {
+  // ?file= is attacker-chosen and the refusal message renders it on
+  // makeabilitylab.cs.washington.edu. It is not an injection -- showLoadError
+  // writes textContent -- but an UNBOUNDED echo lets a crafted link publish a
+  // paragraph of arbitrary prose under the lab's domain, which is a different
+  // and real problem. Pin the bound, not the wording.
+  const scam = "SECURITY ALERT: your account is locked. Call +1-555-0100 to restore access. "
+    .repeat(40);
+  const quoted = quoteForMessage(scam);
+  assert.equal(Array.from(quoted).length, ECHOED_VALUE_MAX_CHARS + 3); // 2 quotes + ellipsis
+  // ~3,000 characters in, under 100 out: the cap has to bite hard enough that
+  // the message cannot carry a paragraph, not merely trim one.
+  assert.ok(Array.from(quoted).length < scam.length / 10);
+});
+
+test("quoteForMessage: a cap landing mid-emoji does not emit a lone surrogate", () => {
+  // Sliced by code point, not by .length. A lone surrogate is invalid UTF-16
+  // and renders as a replacement character, which looks like OUR bug in an
+  // error message that is already about something being malformed.
+  const emoji = "🛰".repeat(ECHOED_VALUE_MAX_CHARS + 10);
+  const quoted = quoteForMessage(emoji);
+  assert.equal(quoted, `"${"🛰".repeat(ECHOED_VALUE_MAX_CHARS)}…"`);
+  for (const ch of quoted) assert.ok(ch.codePointAt(0) < 0xd800 || ch.codePointAt(0) > 0xdfff);
+});
+
+test("quoteForMessage: non-strings and empties stringify rather than throw", () => {
+  assert.equal(quoteForMessage(null), '""');
+  assert.equal(quoteForMessage(undefined), '""');
+  assert.equal(quoteForMessage(""), '""');
+  assert.equal(quoteForMessage(42), '"42"');
 });
 
 // --- display helpers shared by index.js and city.js -------------------------

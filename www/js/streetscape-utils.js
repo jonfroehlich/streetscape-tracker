@@ -689,16 +689,42 @@ function isKnownProvider(key) {
 }
 
 /**
- * The run-filename contract as one regex — the JS mirror of
- * naming.FILENAME_RE, and the single place both the provider lookup and the
- * `?file=` validator read it from, so the two can never disagree about what
- * a run filename is.
+ * The run-filename contract as one regex, and the single place both the
+ * provider lookup and the `?file=` validator read it from, so the two can
+ * never disagree about what a run filename is.
  *
  * Accepts every generation on disk: legacy undated, the buggy float step an
  * old bug wrote (`_step_20.0`), dated, and provider-tagged. The leading
  * `[^/\\?#]+` is the hostile-input stance — no path separators, no traversal,
  * no query characters — so a crafted `?file=` cannot reach outside the
  * published data directory.
+ *
+ * It is a deliberately STRICTER subset of naming.FILENAME_RE, not a mirror of
+ * it, because the two answer different questions: Python parses any name the
+ * project has ever written, from any path and any extension, while this
+ * validates a URL a stranger just handed the browser. Four narrowings, all
+ * intended — a name Python parses that this rejects is not a bug:
+ *
+ *   - **`.csv.gz` only.** Python strips `.json.gz`, `.csv`, `.json`, `.html`
+ *     or no extension at all; `?file=` names a run CSV or nothing.
+ *   - **No path component.** Python takes the basename of `a/b/x_width_…`;
+ *     here a separator is the traversal attempt itself.
+ *   - **No `#`** (or `?`), which Python allows in a slug.
+ *   - **Integer `_width_`/`_height_`.** Python accepts `_width_5000.0_`; no
+ *     such name exists anywhere in `data/` or the catalog (swept: 0 of 2,390
+ *     on disk, 0 of 1,161 in the published aggregate), and the pre-#338
+ *     validator did not accept them either, so this is the status quo.
+ *
+ * The one divergence in the OTHER direction predates #338 and is left alone:
+ * an impossible date like `_2026-13-45` is shape-valid here and raises in
+ * Python, which builds a real `date`. It reaches nothing — such a name
+ * resolves to a file that does not exist.
+ *
+ * What MUST hold is the overlap: any name this resolves to a provider,
+ * naming.parse_filename resolves to the SAME provider. That is pinned across
+ * the language boundary by test_the_js_run_filename_regex_agrees_with_python
+ * (tests/test_naming.py), which reads this very regex out of the source —
+ * because a contract living in two languages is exactly what #338 was about.
  *
  * Capture group 1 is the OPTIONAL provider token. An ABSENT group and a token
  * this build does not know are two different things, and keeping them
@@ -799,6 +825,44 @@ function escapeHtml(value) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#39;");
+}
+
+/**
+ * Longest run of an untrusted value quoteForMessage will echo back. A real run
+ * filename is ~60-90 characters, so this shows one whole and truncates nothing
+ * a reader needs.
+ */
+const ECHOED_VALUE_MAX_CHARS = 96;
+
+/**
+ * Quote an untrusted value for an on-page message, capped in length.
+ *
+ * An error message that names the thing it refused is worth much more than one
+ * that does not — but `?file=` is attacker-chosen: anyone can send a link
+ * carrying any value at all, and the page renders the result on the lab's own
+ * domain. Before the #338 refusal messages, a rejected `?file=` produced a
+ * fixed string and echoed nothing; now it is quoted back, so an unbounded echo
+ * would let a crafted link render hundreds of KB of arbitrary prose under
+ * `makeabilitylab.cs.washington.edu`. "SECURITY ALERT: call +1-555-0100" reads
+ * very differently there than in a URL bar.
+ *
+ * This is NOT an escaping function and does not stand in for one: the defence
+ * against markup is that showLoadError writes `textContent`, so the value is
+ * text and never parsed as HTML. This bounds LENGTH and marks where the echoed
+ * value starts and stops, which quoting does and truncation alone does not.
+ *
+ * Sliced by code point rather than by `.length`, so a cap landing inside a
+ * surrogate pair cannot emit a lone surrogate.
+ *
+ * @param {*} value - Any value; non-strings are stringified ("" for null/undefined).
+ * @param {number} [maxChars=ECHOED_VALUE_MAX_CHARS] - Cap, in code points.
+ * @returns {string} The value in double quotes, with an ellipsis if truncated.
+ */
+function quoteForMessage(value, maxChars = ECHOED_VALUE_MAX_CHARS) {
+  const chars = Array.from(value == null ? "" : String(value));
+  return chars.length <= maxChars
+    ? `"${chars.join("")}"`
+    : `"${chars.slice(0, maxChars).join("")}…"`;
 }
 
 /**
@@ -1528,6 +1592,8 @@ if (typeof module !== "undefined" && module.exports) {
     escapeHtml,
     viewerLinksHtml,
     isValidRunFilename,
+    quoteForMessage,
+    ECHOED_VALUE_MAX_CHARS,
     diffFilenameFor,
     isValidDiffFilename,
     getProviderFromFilename,
