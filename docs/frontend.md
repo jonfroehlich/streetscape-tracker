@@ -269,3 +269,30 @@ The rationale this replaced was reasoned rather than measured, and wrong: it hel
 Probed 2026-09-10 ([#334](https://github.com/jonfroehlich/streetscape-tracker/issues/334)): `https://api.panoramax.xyz/` answers 307 to `/en/index`, whose body embeds `<pnx-viewer endpoint="/api" metacatalog="false">` — the official `@panoramax/web-viewer` bound to the meta-catalog; its permalink parameters are query-string rather than hash (`pic=`, `focus=`, `map=`, per `docs.panoramax.fr/web-viewer/03_URL_settings/`) and survive the 307; and `GET /api/pictures/<uuid>` answers 200 for a picture from our own run, so the meta-catalog resolves a picture without being told its instance.
 Browser-verified on a real picture before shipping, which is #312's lesson applied **before** rather than after — and is why there is no fallback: a fallback is for a provider whose own viewer cannot be trusted, and this one can.
 The `withFallback === ["kartaview"]` pin in the node suite is what keeps a later entry from copying the fallback rather than earning one.
+
+## A filename resolves to a provider or to nothing — never to a default (issue #338)
+
+**`getProviderFromFilename` returns `null` for a provider token this build does not know, and `isValidRunFilename` is DEFINED as that lookup succeeding.**
+Until [#338](https://github.com/jonfroehlich/streetscape-tracker/issues/338) it returned `"gsv"` for an unrecognised token, which is what turned [#334](https://github.com/jonfroehlich/streetscape-tracker/issues/334) from a failure into a misrender: `city.js` drew 135,389 Panoramax pictures under Google's attribution, the GSV colour ramp and GSV's 2007 capture-date floor, offered a "Google only" radiogroup whose default mode hid **every** marker because no Panoramax row is `© Google`, and built `google.com/maps/...pano=<uuid>` links to nothing.
+Nothing on that page looked broken, which is the cost of the default: a hard failure would have been caught in minutes.
+
+**The fix separates two cases the old regex could not tell apart.**
+A name with **no token at all** still resolves to `gsv` — that is the naming contract (`docs/architecture.md`) and it must not change, because pre-2026 undated files carry no token and their published URLs have to keep working.
+A name with a token **that is not in `PROVIDERS`** resolves to `null`, matching what `naming.parse_filename` has always done on the Python side: it raises `ValueError` on an unknown token rather than substituting `DEFAULT_PROVIDER`.
+A name that is not a run filename at all — a diff, `cities.json.gz`, a traversal attempt — also resolves to `null`, where it used to answer `"gsv"` as confidently as a real Street View run.
+
+**One regex, `RUN_FILENAME_RE`, now backs both functions.**
+`isValidRunFilename` had its own copy of the contract, and the two copies disagreed in exactly the way that mattered: the validator accepted `_notaprovider_` and the lookup then renamed it gsv.
+Defining the validator as `getProviderFromFilename(name) !== null` makes them one decision, so a later widening of either cannot reopen the hole; `test_isValidRunFilename: is exactly 'getProviderFromFilename resolved'` pins the equivalence over a list of names rather than trusting the implementation to stay that way.
+
+**Both call sites refuse rather than degrade, because there is no degraded render available.**
+`city.js` reads the registry entry for attribution, colour ramp, capture-date floor, viewer link and the copyright toggle, so substituting gsv does not produce a partial page — it produces a complete and plausible page about the wrong provider.
+A rejected `?file=` therefore gets its own message naming the file, instead of falling through to the generic "No city specified", which would send the reader looking for a missing parameter.
+The aggregate path is the one that can still surprise: `data_file.filename` comes out of `cities.json.gz` and is **not** validated, so a run published by a provider the deployed frontend does not yet carry arrives there — mid-deploy, or with a stale cached bundle — and is refused by name.
+
+The rest of the frontend needs no change and gets none: every fan-out over the registry already gates on presence in the payload (`grid.js`, `streets.js`, `index.js`), so an unregistered provider's rows are skipped rather than mislabelled.
+That is the inverse rule — a registered provider is not a collected one — and #334's registry pin (`test_the_js_registry_covers_every_known_provider_too`) is what keeps the collected-but-unregistered state from recurring in the first place.
+This issue is about what happens if it does anyway.
+
+`config.PROVIDER_RUN_DTYPES` has the same `.get(provider, DEFAULT)` shape and was checked while here: it is unreachable with an unknown provider, because `fileutils.dtypes_for_run_path` only reaches the lookup after `naming.parse_filename` has already raised on one, and `test_a_run_schema_is_reachable_from_a_filename` pins that path in both directions.
+Left alone deliberately — its fallback catches names the naming contract does not parse at all (fixtures, ad-hoc exports), which is a different question.

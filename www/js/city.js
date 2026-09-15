@@ -816,7 +816,9 @@ function setGsvMode(showAll) {
 const urlParams = new URLSearchParams(window.location.search);
 // ?file= is untrusted input concatenated onto the data base URL, so it is
 // validated against the filename contract (isValidRunFilename): anything
-// else — path traversal, non-run artifacts — is treated as absent.
+// else — path traversal, non-run artifacts, a provider token this build does
+// not know (issue #338) — is treated as absent, and says so below rather than
+// falling through to the generic "no city specified".
 const rawCsvFileParam = urlParams.get("file");
 const csvFile = isValidRunFilename(rawCsvFileParam) ? rawCsvFileParam : null;
 if (rawCsvFileParam && !csvFile) {
@@ -1406,8 +1408,16 @@ function showLoadError(message) {
 
 async function loadData() {
   if (!csvFile && !decodedCityQuery) {
-    showLoadError("No city specified — open this page from the overview map, "
-      + "or add ?file= or ?city= to the URL.");
+    // A rejected ?file= gets its own message. It is a real run name often
+    // enough — a provider token this build does not know (issue #338), a
+    // ".rejected" run, a diff — that reporting it as "no city specified"
+    // sends the reader looking for the wrong mistake.
+    showLoadError(rawCsvFileParam
+      ? `Can't render ${rawCsvFileParam} — that isn't a published run file for `
+        + "an imagery provider this page knows. Open the city from the "
+        + "overview map instead."
+      : "No city specified — open this page from the overview map, "
+        + "or add ?file= or ?city= to the URL.");
     return;
   }
 
@@ -1482,7 +1492,21 @@ async function loadData() {
     }
 
     currentFileGlobal = targetFile;
-    providerGlobal = getProviderFromFilename(targetFile);
+    // targetFile is either the validated ?file= or a data_file.filename out of
+    // the aggregate, which is NOT validated — so this is where a run collected
+    // by a provider the frontend has not registered arrives (issue #338).
+    // Refuse it. Every branch below this line reads the registry entry for
+    // attribution, colour ramp, capture-date floor, viewer link and the
+    // copyright toggle, so substituting gsv does not degrade the page, it
+    // renders a complete and plausible one about the wrong provider.
+    const resolvedProvider = getProviderFromFilename(targetFile);
+    if (resolvedProvider === null) {
+      showLoadError(`Can't render ${targetFile} — it was collected by an `
+        + "imagery provider this page doesn't know about yet. The site is "
+        + "probably mid-deploy; try again later.");
+      return;
+    }
+    providerGlobal = resolvedProvider;
     map.attributionControl.addAttribution(PROVIDERS[providerGlobal].attribution);
 
     // Locate this city's run history for the snapshot selector — only the

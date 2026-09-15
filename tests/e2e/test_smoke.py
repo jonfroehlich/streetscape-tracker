@@ -501,6 +501,43 @@ def test_city_page_renders_a_panoramax_run_as_panoramax(page: Page, base_url):
     assert errors == []
 
 
+def test_city_page_refuses_a_run_from_an_unregistered_provider(page: Page, base_url):
+    """
+    Issue #338, the general form of #334: a run whose provider token this
+    build does not know must FAIL, visibly, instead of rendering as Google's.
+
+    The filename below is exactly what ``naming.generate_run_filename`` emits
+    for a provider that has been collected but not registered — which is the
+    state Panoramax was in for three PRs. Before the fix,
+    ``getProviderFromFilename`` answered "gsv" for it and the page went on to
+    fetch, draw and label the run under Google's attribution and colour ramp;
+    the only way to notice was to know what the imagery should have looked
+    like. So the assertion that matters is the negative one: no map legend,
+    no Google attribution, and an error message that names the file.
+
+    No fixture is needed and none exists — refusing before the fetch is part
+    of the behaviour, and a 404 would be a different (and much louder) bug.
+    """
+    errors = _capture_errors(page)
+    unregistered = "alpha-city--alphastate--testland_width_100_height_100_step_20_notaprovider_2026-04-15.csv.gz"
+    page.goto(f"{base_url}/city.html?file={unregistered}")
+
+    # The explicit refusal, naming the file the reader asked for.
+    progress = page.locator("#progress-text")
+    expect(progress).to_be_visible()
+    expect(progress).to_contain_text(unregistered)
+    # ...and NOT the generic "no city specified", which would send the reader
+    # looking for a missing parameter rather than an unknown provider.
+    expect(progress).not_to_contain_text("No city specified")
+
+    # Nothing rendered: the legend table only appears once a run has loaded,
+    # and no provider's attribution — least of all Google's — was added.
+    expect(page.locator("table.legend-stats")).to_have_count(0)
+    expect(page.locator(".leaflet-control-attribution")).not_to_contain_text("Google")
+
+    assert errors == []
+
+
 def test_the_provider_toggle_offers_every_registered_provider(page: Page, base_url):
     """
     ``?provider=panoramax`` has to survive a reload, which it could not before

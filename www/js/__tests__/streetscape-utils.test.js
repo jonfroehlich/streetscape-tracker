@@ -725,6 +725,64 @@ test("isValidRunFilename: rejects traversal and non-run artifacts", () => {
   assert.equal(isValidRunFilename(null), false);
 });
 
+test("isValidRunFilename: rejects a provider token this build doesn't know", () => {
+  // Issue #338. Structurally this IS a run filename -- it is exactly what
+  // naming.generate_run_filename would emit for a provider we have not
+  // registered -- and it used to pass, whereupon getProviderFromFilename
+  // called it gsv and city.js rendered it as Google's. naming.parse_filename
+  // has always raised ValueError on this name; the JS mirror now refuses it
+  // too, so ?file= treats it as absent rather than as a Street View run.
+  assert.equal(
+    isValidRunFilename("bend--or_width_5000_height_5000_step_20_notaprovider_2026-07-05.csv.gz"),
+    false
+  );
+  // The undated variant of the same mistake (the token is optional and so is
+  // the date, so both orders of "present" have to be checked).
+  assert.equal(
+    isValidRunFilename("bend--or_width_5000_height_5000_step_20_notaprovider.csv.gz"),
+    false
+  );
+  // A prototype member as the token: `PROVIDERS["constructor"]` is truthy, so
+  // a lookup that is not Object.hasOwn-based would accept this one.
+  assert.equal(
+    isValidRunFilename("bend--or_width_5000_height_5000_step_20_constructor_2026-07-05.csv.gz"),
+    false
+  );
+  // ...while a REGISTERED token in the same position still passes, so the
+  // rejection above is about the registry and not about the shape.
+  assert.ok(
+    isValidRunFilename("bend--or_width_5000_height_5000_step_20_kartaview_2026-07-05.csv.gz")
+  );
+});
+
+test("isValidRunFilename: is exactly 'getProviderFromFilename resolved'", () => {
+  // The two used to be separate regexes that had to agree, which is how they
+  // came to disagree: the validator accepted an unknown token and the lookup
+  // silently renamed it gsv (#338). Pinning the equivalence means a future
+  // widening of one cannot open a hole in the other.
+  const names = [
+    "bend--or_width_5000_height_5000_step_20.csv.gz",
+    "bend--or_width_5000_height_5000_step_20.0.csv.gz",
+    "bend--or_width_5000_height_5000_step_20_2026-07-05.csv.gz",
+    "bend--or_width_5000_height_5000_step_20_mapillary_2026-07-05.csv.gz",
+    "bend--or_width_5000_height_5000_step_20_notaprovider_2026-07-05.csv.gz",
+    "bend--or_diff_2026-04-01_to_2026-07-01.csv.gz",
+    "../../../etc/passwd",
+    "cities.json.gz",
+    "",
+    null,
+    undefined,
+    42,
+  ];
+  for (const name of names) {
+    assert.equal(
+      isValidRunFilename(name),
+      getProviderFromFilename(name) !== null,
+      `disagreement on ${JSON.stringify(name)}`
+    );
+  }
+});
+
 // --- isKnownProvider / getProviderFromFilename: prototype-safe lookups ------
 
 test("isKnownProvider: real keys yes, prototype members no", () => {
@@ -746,13 +804,76 @@ test("getProviderFromFilename: token detection is prototype-safe", () => {
   assert.equal(
     getProviderFromFilename("bend--or_width_5000_height_5000_step_20_mapillary_2026-07-05.csv.gz"),
     "mapillary");
-  // Unknown and prototype-member tokens both fall back to gsv.
+  // Unknown and prototype-member tokens are BOTH null, not gsv (#338). A
+  // prototype member is the sharper of the two: `PROVIDERS["constructor"]` is
+  // truthy, so only an Object.hasOwn lookup rejects it.
   assert.equal(
     getProviderFromFilename("bend--or_width_5000_height_5000_step_20_notaprovider_2026-07-05.csv.gz"),
-    "gsv");
+    null);
   assert.equal(
     getProviderFromFilename("bend--or_width_5000_height_5000_step_20_constructor_2026-07-05.csv.gz"),
-    "gsv");
+    null);
+});
+
+test("getProviderFromFilename: no token means gsv, an UNKNOWN token means null", () => {
+  // The distinction issue #338 is entirely about. "No token means gsv" is a
+  // contract that must not change -- pre-2026 undated files carry no token
+  // and their published URLs have to keep resolving -- so the fix could not
+  // simply stop defaulting. Both legacy generations are pinned here beside
+  // the case that now refuses, so a later tightening cannot take the legacy
+  // names with it.
+  assert.equal(
+    getProviderFromFilename("bend--or_width_5000_height_5000_step_20.csv.gz"), "gsv");
+  assert.equal(
+    getProviderFromFilename("bend--or_width_5000_height_5000_step_20.0.csv.gz"), "gsv");
+  assert.equal(
+    getProviderFromFilename("bend--or_width_5000_height_5000_step_20_2026-07-05.csv.gz"), "gsv");
+  // An unknown token, dated and undated.
+  assert.equal(
+    getProviderFromFilename("bend--or_width_5000_height_5000_step_20_notaprovider_2026-07-05.csv.gz"),
+    null);
+  assert.equal(
+    getProviderFromFilename("bend--or_width_5000_height_5000_step_20_notaprovider.csv.gz"),
+    null);
+});
+
+test("getProviderFromFilename: a name that is not a run filename resolves to nothing", () => {
+  // These used to answer "gsv" as confidently as a real Street View run does,
+  // because the old regex only looked for a token and defaulted on a miss --
+  // so a caller could not tell a legacy GSV run from a diff file, an
+  // aggregate, or a traversal attempt. The JS mirror of
+  // naming.parse_filename's "doesn't match expected format" ValueError.
+  for (const notARun of [
+    "bend--or_diff_2026-04-01_to_2026-07-01.csv.gz",
+    "cities.json.gz",
+    "bend--or_width_5000_height_5000_step_20_2026-07-05.csv.gz.rejected",
+    "../other/x_width_1_height_1_step_1_2026-01-01.csv.gz",
+    "a?b_width_1_height_1_step_1_2026-01-01.csv.gz",
+    "",
+    null,
+    undefined,
+    42,
+    {},
+  ]) {
+    assert.equal(getProviderFromFilename(notARun), null,
+      `expected null for ${JSON.stringify(notARun)}`);
+  }
+});
+
+test("getProviderFromFilename: every registered provider round-trips its own filename", () => {
+  // Sweeps the registry rather than naming providers, so adding one cannot
+  // land with a token the lookup does not resolve. Together with
+  // test_the_js_registry_covers_every_known_provider_too (tests/test_vis.py),
+  // which pins PROVIDERS to naming.KNOWN_PROVIDERS, this closes the chain:
+  // every provider Python can WRITE a filename for, JS can READ one for.
+  for (const provider of Object.keys(PROVIDERS)) {
+    // The generation rule from naming.generate_run_filename: gsv emits no
+    // token, everyone else emits theirs.
+    const token = provider === "gsv" ? "" : `_${provider}`;
+    const name = `bend--or_width_5000_height_5000_step_20${token}_2026-07-05.csv.gz`;
+    assert.equal(getProviderFromFilename(name), provider, `round-trip failed for ${provider}`);
+    assert.ok(isValidRunFilename(name), `${provider} run rejected by isValidRunFilename`);
+  }
 });
 
 test("getProviderFromFilename: a real Panoramax run resolves to panoramax, not gsv", () => {

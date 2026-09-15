@@ -689,16 +689,59 @@ function isKnownProvider(key) {
 }
 
 /**
- * Derive the imagery provider from a run data filename (the JS mirror of
- * naming.py: an optional alphabetic token between the step size and the
- * run date; no token means GSV).
+ * The run-filename contract as one regex — the JS mirror of
+ * naming.FILENAME_RE, and the single place both the provider lookup and the
+ * `?file=` validator read it from, so the two can never disagree about what
+ * a run filename is.
  *
- * @param {string} filename - e.g. "bend--or_width_5000_height_5000_step_20_mapillary_2026-07-05.csv.gz"
- * @returns {string} Provider key ("gsv" when no token present).
+ * Accepts every generation on disk: legacy undated, the buggy float step an
+ * old bug wrote (`_step_20.0`), dated, and provider-tagged. The leading
+ * `[^/\\?#]+` is the hostile-input stance — no path separators, no traversal,
+ * no query characters — so a crafted `?file=` cannot reach outside the
+ * published data directory.
+ *
+ * Capture group 1 is the OPTIONAL provider token. An ABSENT group and a token
+ * this build does not know are two different things, and keeping them
+ * distinguishable is the whole point (issue #338): the first is the legacy
+ * "no token means gsv" contract, the second is a file we cannot render.
+ */
+const RUN_FILENAME_RE =
+  /^[^/\\?#]+_width_\d+_height_\d+_step_\d+(?:\.\d+)?(?:_([a-z]+))?(?:_\d{4}-\d{2}-\d{2})?\.csv\.gz$/;
+
+/**
+ * Derive the imagery provider from a run data filename (the JS mirror of
+ * naming.parse_filename: an optional alphabetic token between the step size
+ * and the run date; no token means GSV).
+ *
+ * Three outcomes, and the middle one is why this function exists in this
+ * shape (issue #338):
+ *
+ *   - **no token at all → "gsv"**. This has to stay: pre-2026 undated files
+ *     carry no token and their published URLs must not change.
+ *   - **a token in PROVIDERS → that provider.**
+ *   - **anything else → null**, where "anything else" is a token this build
+ *     has never heard of, or a name that is not a run filename at all.
+ *
+ * Until #338 the third case returned "gsv" too, which made an unregistered
+ * provider's run indistinguishable from a Google one all the way down: #334's
+ * Panoramax runs rendered under Google's attribution, the GSV colour ramp and
+ * GSV's 2007 capture-date floor, behind a "Google only" toggle whose default
+ * mode hid every marker, with popups linking `google.com/maps/...pano=<uuid>`
+ * to nothing. Nothing about that page looked broken. Callers must now handle
+ * null by refusing to render, the way naming.parse_filename raises ValueError
+ * on an unknown token rather than substituting the default.
+ *
+ * @param {*} filename - e.g. "bend--or_width_5000_height_5000_step_20_mapillary_2026-07-05.csv.gz"
+ * @returns {?string} Provider key, or null when the name names no provider
+ *   this build can render.
  */
 function getProviderFromFilename(filename) {
-  const m = /_step_\d+(?:\.\d+)?_([a-z]+)_\d{4}-\d{2}-\d{2}/.exec(filename || "");
-  return m && isKnownProvider(m[1]) ? m[1] : "gsv";
+  const m = typeof filename === "string" ? RUN_FILENAME_RE.exec(filename) : null;
+  if (!m) return null;
+  // `undefined` (group did not participate) is the tokenless legacy form;
+  // a string that isKnownProvider rejects is a token we cannot render.
+  if (m[1] === undefined) return "gsv";
+  return isKnownProvider(m[1]) ? m[1] : null;
 }
 
 /**
@@ -767,13 +810,18 @@ function escapeHtml(value) {
  * path separators / traversal, so a crafted ?file= can never fetch
  * resources outside the published data directory or non-run artifacts.
  *
+ * Defined AS the provider lookup rather than beside it (issue #338), because
+ * naming.parse_filename treats an unknown provider token as exactly as
+ * invalid as a malformed name — both raise ValueError — and a validator that
+ * accepted a name the renderer cannot resolve would just move the silent
+ * fallback one layer up. Two regexes that had to agree is how they drifted.
+ *
  * @param {?string} filename - Candidate filename (no directories).
- * @returns {boolean} True iff it looks like a published run csv.gz.
+ * @returns {boolean} True iff it looks like a published run csv.gz AND names
+ *   a provider in the registry.
  */
 function isValidRunFilename(filename) {
-  if (typeof filename !== "string") return false;
-  return /^[^/\\?#]+_width_\d+_height_\d+_step_\d+(?:\.\d+)?(?:_[a-z]+)?(?:_\d{4}-\d{2}-\d{2})?\.csv\.gz$/
-    .test(filename);
+  return getProviderFromFilename(filename) !== null;
 }
 
 /**

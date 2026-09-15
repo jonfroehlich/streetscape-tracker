@@ -509,7 +509,7 @@ The photographer case renders as **Mapillary, not gsv**: a gsv map keeps only `i
 ### Panoramax in the provider registry (issue #334)
 
 The provider was COLLECTABLE for three PRs before it was REGISTERED, and nothing failed, so the tests added here are about making that state impossible rather than about the entry's fields.
-CLAUDE.md states the rule in the other direction — a registered provider is not a collected one, so every fan-out gates on presence in the payload — and the inverse is silent by construction: `grid.js` and `streets.js` skipped its rows, `index.js` rewrote `?provider=panoramax` to gsv, and `city.js` rendered its run **as GSV**, because `getProviderFromFilename` resolves an unknown token to `"gsv"` rather than refusing.
+CLAUDE.md states the rule in the other direction — a registered provider is not a collected one, so every fan-out gates on presence in the payload — and the inverse is silent by construction: `grid.js` and `streets.js` skipped its rows, `index.js` rewrote `?provider=panoramax` to gsv, and `city.js` rendered its run **as GSV**, because `getProviderFromFilename` resolved an unknown token to `"gsv"` rather than refusing (it returns `null` since [#338](https://github.com/jonfroehlich/streetscape-tracker/issues/338), below).
 
 **The pin that closes it is a coverage check on the JS registry, mirroring the Python one that already existed** (`test_the_js_registry_covers_every_known_provider_too`): it reads the `const PROVIDERS = { … };` block out of `www/js/streetscape-utils.js` with a regex and asserts its top-level keys equal `naming.KNOWN_PROVIDERS`.
 Python has had `test_every_known_provider_has_a_display_entry` since #251; the JS side had nothing, which is exactly the asymmetry that let one registry gain a provider and the other not.
@@ -523,6 +523,29 @@ The registry-wide sweeps (capability flags, `shortLabel`/`panoCountingModel`, th
 Those four are one assertion about the capability flags: getting the provider wrong got all of them backwards at once, and the page still looked fine.
 The marker is clicked by container point rather than by selector, because `city.js` builds the map with `preferCanvas` and a pano marker is painted pixels.
 The counted assertions that moved (`colspan` 3→4, `4 provider series`→`5`, Map Ville's link count 3→2) are all consequences of the third provider; the link COUNT for Alpha City stayed at six by coincidence, which is why the href SET is what the test asserts.
+
+### An unknown provider token resolves to nothing (issue #338)
+
+The follow-on to #334, and the reason that one was a misrender rather than a failure: `getProviderFromFilename` answered `"gsv"` for any token it did not recognise.
+The tests here are about the DISTINCTION, not the refusal — "no token means gsv" is a contract that must not change, so a test that only pinned the new `null` would be satisfied by a fix that broke every legacy URL.
+`test_getProviderFromFilename: no token means gsv, an UNKNOWN token means null` holds both halves in one place: the three tokenless generations (undated, buggy float step, dated) beside the unknown token dated and undated, so a later tightening cannot take the legacy names with it.
+
+**`isValidRunFilename` is pinned as an EQUIVALENCE, not as a second list of accepted names.**
+The two functions carried separate regexes of the same contract, which is how they came to disagree — the validator accepted `_notaprovider_` and the lookup then renamed it gsv — so the fix defines one as the other and `test_isValidRunFilename: is exactly 'getProviderFromFilename resolved'` asserts they agree across every name the suite cares about, invalid inputs (`null`, `undefined`, `42`) included.
+A test of the new behaviour alone would pass against a re-split implementation.
+
+**The round-trip is swept over `PROVIDERS`, not written per provider.**
+`test_getProviderFromFilename: every registered provider round-trips its own filename` builds each provider's filename by `naming.generate_run_filename`'s own rule (gsv emits no token, everyone else emits theirs) and asserts it resolves back to that provider.
+Chained with `test_the_js_registry_covers_every_known_provider_too` (`tests/test_vis.py`, #334), which pins `PROVIDERS` to `naming.KNOWN_PROVIDERS`, that closes the loop: every provider Python can WRITE a filename for, JS can READ one for — and a new provider that lands in the registry without a working token fails here rather than in a browser.
+
+**e2e is where the assertion has to be negative**, `test_city_page_refuses_a_run_from_an_unregistered_provider`.
+It opens `city.html?file=` with a name that is exactly what `generate_run_filename` emits for an unregistered provider, and asserts the progress panel NAMES the file, does not say "No city specified", and that no legend table and no Google attribution appear.
+No fixture backs that filename and none should: refusing before the fetch is the behaviour, and a 404 would be a different and much louder bug.
+The unit tests can only show the function returns `null`; only the browser shows that `null` reaches the reader as a refusal instead of as a blank page or a `TypeError` on `PROVIDERS[null].attribution`.
+
+**Control run before shipping**: with `getProviderFromFilename` and `isValidRunFilename` reverted to their pre-#338 bodies, 5 node tests and the e2e test fail; restored, the full node suite (435) and the full e2e suite (63) pass.
+A test written against a fix is worth what its failure against the defect is worth, and this defect's whole character is that nothing looks wrong.
+
 
 ## The pivoted data tables (issue #250)
 
