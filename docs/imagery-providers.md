@@ -191,10 +191,10 @@ That is the largest provider gap anywhere in the catalog, and it has no open sol
 
 ### Panoramax
 
-**Status: COLLECTOR SHIPPED, channel not yet — tracked in [#316](https://github.com/jonfroehlich/streetscape-tracker/issues/316), phase-1 writeup in [`experiments/panoramax-feasibility.md`](experiments/panoramax-feasibility.md).**
-`streetscape_tracker.py --provider panoramax` collects a city today; `scheduler.UNWIRED_CHANNELS` still refuses a `[providers.panoramax]` block until the cost, timeout, rank and pacing arms land.
+**Status: SCHEDULED, grid and road walk, both opt-in — tracked in [#316](https://github.com/jonfroehlich/streetscape-tracker/issues/316), phase-1 writeup in [`experiments/panoramax-feasibility.md`](experiments/panoramax-feasibility.md).**
+`streetscape_tracker.py --provider panoramax` collects a city by hand, and since [#335](https://github.com/jonfroehlich/streetscape-tracker/issues/335) `[providers.panoramax]` and `[providers.panoramax_streets]` are real config blocks with cost, timeout, rank, pacing and request-cap arms behind them.
 The mechanism and the three ways it differs from the Mapillary census it is modelled on are in [`census.md`](census.md).
-The median tracked city holds nothing (730 of 1,144 screen to a conclusive zero), but ~20 cities hold 16k–1.1M pictures and Des Moines has more 360° pictures on Panoramax than in Mapillary's census of the same bbox — so the recommendation is an **opt-in** channel on the KartaView pattern, never a default-membership one.
+The median tracked city holds nothing (730 of 1,144 screen to a conclusive zero), but ~20 cities hold 16k–1.1M pictures and Des Moines has more 360° pictures on Panoramax than in Mapillary's census of the same bbox — so the channel is **opt-in** on the KartaView pattern, never a default-membership one — which is what shipped.
 
 A federated open imagery commons founded by IGN and OpenStreetMap France, licensed per picture, with **25 registered instances** and ~100 M pictures.
 Two instances hold ~99% of them — IGN at 58.0 M and OSM-FR at 54.0 M — with OSM-HR (4.2 M), Taiwan (1.2 M) and Belgium (0.65 M) next and a long tail of hobbyist servers down to a few thousand pictures.

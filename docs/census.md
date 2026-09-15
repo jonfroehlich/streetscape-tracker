@@ -270,13 +270,15 @@ So a cap passed without a checkpoint *path* is refused up front as a caller bug 
 **That refusal is the TILE CENSUSES' rule, not a rule of `max_requests`** — KartaView documents and supports the same pairing (`download_kartaview.sweep_city_images`, `max_requests` with `checkpoint_path=None`), where an uncheckpointed stop leaves the rest of the bbox unmeasured and the failed-area check then refuses to finalize, which is a guard the tile censuses do not have.
 Read the refusal as "this collector cannot make an uncheckpointed cap safe", never as "a cap implies a checkpoint everywhere".
 
-**Both Mapillary channels flip together, and that is not tidiness.**
+**A provider's two channels flip together, and that is not tidiness.**
 `_sweep_launch_plan`'s sibling arm — the one that stops a walk sweeping a lattice its grid sibling is mid-way through — is asked only of a RESUMABLE street channel.
 Flip the grid alone and the first night its census pauses leaves a *checkpoint*, not a cache entry, so the walk prices at full, takes the old all-or-nothing gates, and crawls the identical z14 lattice a second time against the same per-IP host for an observation the cache would hand it free once the grid finished (#290).
 
-**`panoramax` gets the collector-side cap and stays `False`**, and the reason MOVED rather than persisted: it is no longer "nothing for a cap to stop" but "nothing forwards one" — the channel is in `UNWIRED_CHANNELS` and the grid argv, built inline in `_run_one_city`, has no arm for it.
+**Both Panoramax channels are `True` since #335**, and the history is worth keeping because it is the shape to check before marking any channel resumable.
+`panoramax` had the collector-side cap from #318 and stayed `False` anyway: the reason MOVED rather than persisted, from "nothing for a cap to stop" to "nothing forwards one" — the channel was in `UNWIRED_CHANNELS` and the grid argv, built inline in `_run_one_city`, had no arm for it.
 (There is no `_collect_cmd` to read: only the walk's argv is factored out, as `_street_collect_cmd`.)
-Flip it in the same commit that adds that arm.
+The WALK was a step further back still: `collect_panoramax_street_samples_async` had no `max_requests` parameter at all, so the flag had nothing to reach even once `_street_collect_cmd` sent it.
+Both halves landed in the commit that added the launch arms, which is what the `False` asked for.
 
 ## The census cache — fetch once per (provider, bbox), reuse across channels (issue #290)
 
@@ -484,10 +486,10 @@ A picture the layer does not name is dropped instead.
 **Pacing is 30/min with jitter 0.6**, half the Mapillary channels' configured rate against a host with strictly less published guidance — nothing documents a limit anywhere found, and no `X-RateLimit-*` or `Retry-After` header comes back.
 The jitter is adopted before any incident rather than after three; see [`provider-access.md`](provider-access.md) for the full access survey and for what has and has not been asked.
 
-**Collectable by hand, not scheduled.**
+**Collectable by hand, and scheduled since #335.**
 `streetscape_tracker.py --provider panoramax` collects a city, and `naming.KNOWN_PROVIDERS` carries the token so the run reads back under its own schema.
-But `scheduler.UNWIRED_CHANNELS` still holds `panoramax`, so a `[providers.panoramax]` block is dropped with an error rather than run: `estimate_requests`, `city_timeout_seconds`, the `enabled_providers` rank and the `_run_one_city` pacing flag have no arm for it yet, and each of those fails OPEN in the way #238 records.
-`CHANNEL_DEFAULT_MEMBERSHIP["panoramax"]` is already `False`, on a measurement rather than a cost argument: 730 of 1,144 enabled cities screen to a conclusive zero, so a default-membership channel would spend most of its slots confirming absence.
+`scheduler.UNWIRED_CHANNELS` held `panoramax` until every arm that fails OPEN in the way #238 records had been written — `estimate_requests` (#323), `city_timeout_seconds` (now routed to `_tile_census_timeout_seconds`), the `enabled_providers` rank, and `_run_one_city`'s pace, jitter and request-cap flags — and its entry was removed LAST, which is what that dict's comment asks for.
+`CHANNEL_DEFAULT_MEMBERSHIP["panoramax"]` is `False`, on a measurement rather than a cost argument: 730 of 1,144 enabled cities screen to a conclusive zero, so a default-membership channel would spend most of its slots confirming absence.
 
 ## The Panoramax road walk is the third `CensusWalkSpec` binding (issue #331)
 

@@ -57,11 +57,12 @@ Scheduler stays on `drive`;
 park trails, typically well beyond 25 m from any road, are much less affected.
 Deferred: `leisure=park` polygon attribution (the honest way to ask "park coverage"), and a city-page selector for the broad artifact.
 
-## Road-walk: four providers, three of them scheduled
+## Road-walk: four providers, all four scheduled
 
-**Road-walk: four providers, three of them scheduled.** `collect.py` takes `--provider {gsv,kartaview,mapillary,panoramax}`;
+**Road-walk: four providers, all four scheduled.** `collect.py` takes `--provider {gsv,kartaview,mapillary,panoramax}`;
 all four walk the SAME deterministic sample points from the same frozen network, so their coverage percentages are directly comparable — but they reach imagery very differently.
-`panoramax` (#331) is the one that is runnable **by hand only**: there is no `panoramax_streets` scheduler channel, for the same reason `panoramax` itself is still in `UNWIRED_CHANNELS` — that wiring belongs to the remaining #316 phase-2 work.
+`panoramax_streets` is the newest (#335) and is **opt-in**, enrolled separately from `panoramax` itself: "we want this city's street coverage" is a different question from "we want its grid coverage", and a channel that read its sibling's enrolment would give `schedule_state.member`'s NULL a third meaning.
+Enrol both and the walk is free on a paired night (it ranks immediately after the grid channel, so the census is already in the #290 cache); enrol only the walk and it pays a full z15 census.
 GSV issues one metadata request per sample location (Seattle: 247k).
 **Mapillary has no per-point endpoint at all**: `collect_mapillary.py` reads the z14 tile census once (`download_mapillary.fetch_city_images_async`, extracted so both the grid run and the road walk share the identical fetch/decode) and joins it onto the sample points locally via `gpd.sjoin_nearest` on `estimate_utm_crs()`
 — the same idiom the grid-attribution path uses, so **no new dependency** (there is no scipy).
