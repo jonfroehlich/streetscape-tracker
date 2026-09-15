@@ -414,6 +414,51 @@ def test_the_walks_request_cap_refuses_nonpositive_values_like_its_siblings(tmp_
             _args(str(tmp_path), **{"panoramax-max-requests": bad})
 
 
+def test_a_capped_walk_is_gated_on_the_cap_rather_than_the_whole_censuss_geometry(
+    tmp_path, monkeypatch
+):
+    """
+    The two halves of #335 must not contradict each other, and this hop is the
+    one that had no test on this provider.
+
+    The scheduler stopped applying its `est > budget` gate to a resumable
+    channel precisely so a city priced above the remainder is launched CAPPED
+    instead of skipped, and it hands the child BOTH numbers. If the child then
+    re-gated on the whole census's geometry it would refuse exactly those
+    launches with exit 1: a real `consecutive_failure`, five of which quarantine
+    the walk for a 90-day cycle. `min(estimate, cap)` is the upper bound on
+    tonight's spend where the bare estimate is not.
+
+    The mechanism is one row in `collect.py`'s cap map, scoped per provider so
+    that honouring a cap for a provider nothing forwards one to cannot relax a
+    gate nothing enforces. Deleting the `panoramax` row left the whole suite
+    green while breaking exactly the nights the cap exists for -- remaining
+    budget below the estimate, which is every night a leader city is capped.
+    The sibling pins are `test_streetwalk_mapillary.py`'s test of the same name
+    and `test_streetwalk_kartaview.py`'s equivalent.
+
+    `grid_m=2000` puts the census at 12 tiles, comfortably above both numbers
+    below, so the gate really is being asked a question it could answer either
+    way.
+    """
+    data_dir, calls = _setup(tmp_path, monkeypatch, [_picture("px1", 44.05, -121.30)], grid_m=2000)
+    args = _args(data_dir, **{"daily-budget": 3, "panoramax-max-requests": 2})
+    assert collect.run_collect(args) == 0, "gated on the 2 it can spend, not on the whole census"
+    assert calls["max_requests"] == 2
+
+
+def test_an_uncapped_over_budget_panoramax_walk_is_still_refused(tmp_path, monkeypatch):
+    """The gate is relaxed by the CAP, not removed.
+
+    Without one there is nothing bounding the child, so the pre-flight estimate
+    is the only guard there is and it must still refuse. Pinned beside the case
+    above because a cap map that answered for every provider unconditionally
+    would pass that one and fail this.
+    """
+    data_dir, _calls = _setup(tmp_path, monkeypatch, [_picture("px1", 44.05, -121.30)], grid_m=2000)
+    assert collect.run_collect(_args(data_dir, **{"daily-budget": 3})) == 1
+
+
 # ── The date rule is the grid run's, not a second one ───────────────────────
 
 

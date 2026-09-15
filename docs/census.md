@@ -455,6 +455,7 @@ And it is enormous, because every feature embeds a ~90-key EXIF blob: 1,000 feat
 So the census is the v1 map endpoint's `pictures` layer, which starts at **z15** — the coarsest zoom that serves it at all, and therefore the cheapest.
 That is not a tunable and getting it wrong is silent rather than loud: below z15 the layer is absent entirely, so every tile would decode to nothing and the run would publish a city holding no imagery rather than failing.
 The cost that follows is a real difference from Mapillary and not a rounding one: the same bbox is up to ~4x the tiles (the asymptote of one zoom level; measured 2.0x-3.9x over square grids from 0.2 to 40 km), a catalog p50 of 35 against Mapillary's 12, and over the cities actually worth enrolling a p50 of 414 tiles, p90 2,400 and max 3,132 (~104 minutes at the shipped pace).
+That last figure is RAW PACE and is not the per-city timeout: `scheduler._tile_census_timeout_seconds` divides by the achieved fraction (0.8) and multiplies by the headroom (1.5) plus 600 s of slack, so the max city derives ~206 minutes — above the flat 180-minute floor, which is why that arm is live today rather than latent.
 `estimate_tile_count` counts that lattice exactly, offline and free, so unlike KartaView's sweep there is no observed-versus-geometric correction to carry.
 
 The v2 endpoint's H3 `grid` layer — aggregated counters rather than rows — is the *screen* instrument phase 1 used to price the whole catalog for 113 requests, and it is not read by the collector at all.

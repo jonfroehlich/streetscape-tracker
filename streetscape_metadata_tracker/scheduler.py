@@ -154,16 +154,46 @@ def is_street_channel(name: str) -> bool:
 # 'gsv_streets' needs Overpass because a road walk starts by fetching the
 # city's street network, and 1134 of 1144 enabled cities have no cached
 # GraphML — a first walk always goes to the network.
+#
+# ── THE EFFECTIVE max_concurrent_channels CEILING IS 5 OF 8 ─────────────────
+#
+# ONE present-tense statement, here, because this comment used to carry three
+# of them stacked down the table — each written when its channel landed, each
+# reading as current, and only the last one true. The figure is the largest
+# host-disjoint set over the graph BELOW, so it is re-derived when a channel is
+# added rather than quoted:
+#
+#     gsv          (no per-IP host, always free)
+#   + gsv_streets  (Overpass)
+#   + mapillary    (tiles.mapillary.com)
+#   + kartaview    (kartaview.org)
+#   + panoramax    (api.panoramax.xyz)
+#   = 5, of 8 channels.
+#
+# gsv_streets is the Overpass representative because it is the only Overpass
+# channel with NO second host; substituting any walk gives up that walk's other
+# host and the set drops to 4.
+#
+# The HISTORY, as history: 3 of 4 -> 4 of 5 (kartaview, #248, a host shared with
+# nothing) -> 4 of 6 (kartaview_streets, #258) -> 5 of 7 (panoramax, #316) -> 5
+# of 8 (panoramax_streets, #335). The instructive pair is the last one, where
+# the numerator did NOT move: every walk added brings one more Overpass user,
+# and Overpass admits exactly one talker, so a walk can only ever displace the
+# Overpass channel already in the set. A grid channel on a fresh host raises the
+# numerator; a walk never does. Re-derive for a ninth rather than reasoning from
+# that pattern, though — it is an observation about the hosts these channels
+# happen to use, not a law.
 CHANNEL_HOSTS: dict[str, tuple[str, ...]] = {
     "gsv": (),
     "gsv_streets": (HOST_OVERPASS,),
     "mapillary": (HOST_MAPILLARY_TILES,),
     "mapillary_streets": (HOST_OVERPASS, HOST_MAPILLARY_TILES),
     # kartaview shares its host with nothing, which is why it was the channel
-    # that moved the effective concurrency ceiling from 3-of-4 to 4-of-5.
-    # test_every_scheduled_channel_declares_its_per_ip_hosts asserts set
-    # EQUALITY against KNOWN_PROVIDERS, so a token landing without an entry
-    # here is a red test rather than a channel that silently fails open.
+    # that RAISED the ceiling rather than only widening the denominator (see
+    # the history above). test_every_scheduled_channel_declares_its_per_ip_hosts
+    # asserts set EQUALITY against KNOWN_PROVIDERS, so a token landing without
+    # an entry here is a red test rather than a channel that silently fails
+    # open.
     "kartaview": (HOST_KARTAVIEW,),
     # The walk needs BOTH: it starts at the city's OSM street network and then
     # sweeps kartaview.org for the census it joins against. Overpass is not
@@ -171,41 +201,18 @@ CHANNEL_HOSTS: dict[str, tuple[str, ...]] = {
     # walk of a city always goes to the network, the same reason gsv_streets
     # declares it.
     #
-    # Adding it does NOT lower the effective concurrency ceiling, and the
-    # arithmetic is worth stating because the figure is a property of this
-    # graph rather than a constant: the largest host-disjoint set is gsv (no
-    # host) + ONE of the three Overpass channels + mapillary (tiles) +
-    # kartaview (KV) = 4. So 4 of 6 now, where it was 4 of 5.
+    # Adding it did not lower the ceiling; it widened the denominator only.
+    # The arithmetic lives once, above the table.
     "kartaview_streets": (HOST_OVERPASS, HOST_KARTAVIEW),
-    # api.panoramax.xyz, shared with nothing (issue #316). Re-derive the ceiling
-    # rather than quoting the line above, which is what that line asks for: the
-    # largest host-disjoint set becomes gsv (no host) + ONE of the three Overpass
-    # channels + mapillary (tiles) + kartaview (KV) + panoramax = 5, so 5 of 7.
-    # The denominator moved and so did the numerator this time; neither is a
-    # constant, and the next channel gets the same re-derivation rather than
-    # this number.
+    # api.panoramax.xyz, shared with nothing (issue #316) -- so, like kartaview,
+    # a channel that RAISED the numerator. The current figure is above the
+    # table; do not restate it here.
     "panoramax": (HOST_PANORAMAX,),
     # The Panoramax road walk (issue #335), Overpass for the street network and
     # api.panoramax.xyz for the census it joins against -- the same pair, for
-    # the same two reasons, as kartaview_streets above.
-    #
-    # RE-DERIVED RATHER THAN CARRIED FORWARD, which is what the two paragraphs
-    # above ask of this one. Over the eight-channel graph the largest
-    # host-disjoint set is:
-    #     gsv                (no per-IP host, always free)
-    #   + gsv_streets        (Overpass)
-    #   + mapillary          (tiles)
-    #   + kartaview          (KV)
-    #   + panoramax          (panoramax.xyz)
-    #   = 5, so 5 of 8.
-    # The numerator did NOT move and the denominator did, which is the opposite
-    # of what adding a channel did last time and is worth saying out loud: every
-    # walk added since #258 brings one more Overpass user, and Overpass admits
-    # exactly one talker, so a walk can only ever displace the Overpass channel
-    # already in the set. gsv_streets is the representative because it is the
-    # only Overpass channel with NO second host -- choosing any walk instead
-    # gives up that walk's other host and the set drops to 4. Adding a ninth
-    # channel earns the same derivation, not this number.
+    # the same two reasons, as kartaview_streets above. Like that walk, it
+    # widened the denominator and left the numerator alone. The derivation is
+    # above the table, stated once.
     "panoramax_streets": (HOST_OVERPASS, HOST_PANORAMAX),
 }
 
@@ -336,10 +343,17 @@ CHANNEL_RESUMABLE: dict[str, bool] = {
     # walk grew its in #318). Marking a walk resumable while `_street_collect_cmd`
     # drops the cap is the precise fail-open #318's note warns about.
     #
-    # It buys more here than the old comment's arithmetic suggested. That
-    # comment argued the cap was "not yet needed" because the largest enrollable
-    # city (~3,132 z15 tiles, ~104 min at 30/min) fits under the 180-minute
-    # floor -- but the floor is not what a real night hands a child: the batch
+    # It buys more here than the old comment's arithmetic suggested, and that
+    # comment was WRONG on its own terms. It argued the cap was "not yet needed"
+    # because the largest enrollable city -- ~3,132 z15 tiles, ~104 min at
+    # 30/min -- fits under the 180-minute floor. 104 min is the RAW PACE, not
+    # the derived timeout: `_tile_census_timeout_seconds` budgets the achieved
+    # fraction (0.8) and the headroom (1.5) on top, so that city derives
+    # 3,132 / (30 x 0.8) x 60 = 7,830 s, x 1.5 + 600 = 12,345 s ~ 206 min, which
+    # is ABOVE the floor. The derivation binds TODAY for any city over ~2,720
+    # tiles, not only after a grid is re-registered larger.
+    #
+    # And the floor is not what a real night hands a child anyway: the batch
     # deadline CLAMPS the timeout, and these channels rank last, so they are the
     # ones that see the least of it. Capped, a clamped launch pauses and
     # checkpoints; uncapped, it is SIGKILLed, records no api_usage at all and
@@ -378,8 +392,10 @@ def is_resumable_channel(name: str) -> bool:
 # so being cut short costs a night rather than the crawl. Within the exception
 # the rule applies again -- kartaview's sweep runs to hours on a metro
 # (Singapore ~9,974 requests at 16/min) where the richest Panoramax city
-# measures ~3,132 tiles, ~104 min at 30/min -- so kartaview is the one that
-# would starve everything behind it and keeps the later slot. Their adjacency
+# measures ~3,132 tiles, ~104 min at 30/min (both RAW PACE, which is the right
+# basis for comparing two channels' expense; the derived timeouts are longer)
+# -- so kartaview is the one that would starve everything behind it and keeps
+# the later slot. Their adjacency
 # to each other is the same #290 pairing argument as KartaView's.
 #
 # NOT "newest last". `.get(p, _UNRANKED)` would have produced this exact order
@@ -1681,13 +1697,23 @@ def _tile_census_timeout_seconds(
     more requests — so spacing and network type do not enter, unlike the GSV
     street estimate. Cost is purely tile count, and wall-clock is that divided
     by the pacing rate. Panoramax's tiles are z15 against Mapillary's z14, so
-    the same bbox is ~4x the count at half the pace: the richest enrollable city
-    measures ~3,132 tiles, ~104 minutes at 30/min, against a flat
-    ``city_timeout_minutes`` floor of 180. That is inside the floor today and
-    the derivation is still what must run, for the reason
-    ``city_timeout_seconds`` gives about Anchorage: a frozen grid can be
-    re-registered larger at any time, and a SIGKILL costs the spend already made
-    AND counts a failure.
+    the same bbox is ~4x the count at half the pace.
+
+    **THE DERIVATION BINDS TODAY FOR PANORAMAX, not only after a grid grows.**
+    The richest enrollable city measures ~3,132 tiles, which is ~104 minutes of
+    RAW PACING at 30/min -- and the raw pace is not what this function returns.
+    It divides by the achieved fraction and multiplies by the headroom:
+    ``3,132 / (30 x 0.8) x 60 = 7,830 s``, ``x 1.5 + 600 = 12,345 s ~ 206 min``,
+    against a flat ``city_timeout_minutes`` floor of 180. Any city over ~2,720
+    tiles clears that floor, so the p90 (2,400 -> ~160 min) still takes it and
+    the max does not. Quoting "~104 min, inside the 180-minute floor" -- which
+    this docstring and four comments did -- compares a raw pace against a
+    derived ceiling and gets the live/latent question backwards.
+
+    That it would ALSO be needed after a re-registration is the weaker half of
+    the argument, kept because it is the reason ``city_timeout_seconds`` gives
+    about Anchorage: a frozen grid can be re-registered larger at any time, and
+    a SIGKILL costs the spend already made AND counts a failure.
 
     Both the rate and the achieved fraction come from ``_crawl_pricing`` --
     the SAME row ``_sweep_requests_within_timeout`` inverts. Restating them
@@ -1995,10 +2021,11 @@ def city_timeout_seconds(
     # THE PANORAMAX PAIR IS THE SAME DERIVATION AT DIFFERENT CONSTANTS (#335),
     # which is why it is a token in the tuple below and not an arm of its own.
     # Its census is z15 against Mapillary's z14 and paced at 30/min against 60,
-    # so the same bbox is up to ~4x the tiles at half the rate: the richest
-    # enrollable city measures ~3,132 tiles, ~104 min, still inside the
-    # 180-minute floor today and outside it the moment a grid is re-registered
-    # larger. Falling through to `clamp(floor)` instead — which is what an
+    # so the same bbox is up to ~4x the tiles at half the rate. The richest
+    # enrollable city measures ~3,132 tiles, and its DERIVED timeout is ~206 min
+    # (~104 min of raw pacing, then / 0.8 and x 1.5 plus 600 s) against the
+    # 180-minute floor — so this arm is LIVE today rather than latent against a
+    # future re-registration. Falling through to `clamp(floor)` instead — which is what an
     # unlisted channel does, and what this arm's absence meant while
     # `panoramax` sat in UNWIRED_CHANNELS — is the failure `_kartaview_timeout_
     # seconds` was written for, reached by the other route: a SIGKILLed child
@@ -2983,7 +3010,8 @@ def _enrolment_cost_note(conn, cfg: SchedulerConfig, city: db.CityRow, channel: 
     third and fourth opt-in channels would have enrolled in silence — the
     operator reading this line is the gate #248's risk 1 names, and a silent
     enrolment removes it exactly where the estimate is largest (the richest
-    Panoramax city measures ~3,132 z15 tiles, ~104 min at 30/min).
+    Panoramax city measures ~3,132 z15 tiles, ~104 min of raw pacing at 30/min
+    and a ~206-minute derived timeout).
 
     Empty unless the channel is BOTH opt-in and priced as one crawl. Opt-in
     because this is a note about a decision an operator is making — a
@@ -3002,7 +3030,15 @@ def _enrolment_cost_note(conn, cfg: SchedulerConfig, city: db.CityRow, channel: 
     # bbox, read twice.
     requests = estimate_requests(city, channel, conn=conn)
     pricing = _crawl_pricing(channel)
-    pc = cfg.providers.get(channel)
+    # `(cfg.providers or {})`, the idiom every other site in this module uses.
+    # `__post_init__` fills a None with a gsv-only dict, so a missing config file
+    # does NOT reach here with None -- a review predicted that crash and it does
+    # not reproduce (test_enroll_city_survives_a_config_file_that_does_not_exist
+    # pins why). The guard is here anyway because this and `_import_cadence_
+    # channel` were the only two sites spelling it the other way, and one
+    # spelling of "the providers table may be absent" is what keeps the next
+    # reader from having to re-derive which sites are safe.
+    pc = (cfg.providers or {}).get(channel)
     configured = pc.max_requests_per_minute if pc else None
     rate = pricing.default_rate if configured is None else configured
     # The overhead multiplier is KartaView's radius-sweep calibration and means
@@ -3032,6 +3068,35 @@ def _enrolment_cost_note(conn, cfg: SchedulerConfig, city: db.CityRow, channel: 
             "  NOTE  no prior sweep for this city, so that is the GEOMETRY estimate at the "
             "default r=1000. A city that calibrates to r=500 costs ~4x it, and nothing "
             "caps the child's spend (#273) — treat it as a floor."
+        )
+    # A WALK'S FIGURE IS WHAT AN UNPAIRED WALK PAYS, and saying so is the whole
+    # point of printing it here. `estimate_requests` is cache-blind on purpose
+    # — it also feeds the timeout, where a 0 would collapse a child onto the
+    # flat floor — so the number above is the full crawl even for a walk whose
+    # grid sibling will hand it that census for nothing (#290). Left unsaid,
+    # this note tells an operator the opposite of the rollout advice: it makes
+    # enrolling the pair look like paying twice, when the second channel is the
+    # free one.
+    #
+    # The SIBLING'S MEMBERSHIP is what decides which case this city is in, and
+    # it is a fact the operator is choosing rather than one the cache knows —
+    # a cache entry describes a past night, where the enrolment describes every
+    # future one. Effective membership, not the stored column, for the reason
+    # `_bulk_candidates` spells out: NULL means "use the channel default".
+    if is_street_channel(channel):
+        sibling = STREET_CHANNELS[channel]
+        stored = db.get_channel_membership(conn, city.city_id, sibling)
+        paired = CHANNEL_DEFAULT_MEMBERSHIP[sibling] if stored is None else bool(stored)
+        lines.append(
+            f"  NOTE  that is what an UNPAIRED walk pays. Both channels read one crawl of "
+            f"this bbox, so on a night {sibling} also collects this city the walk reads its "
+            f"census from the shared cache for 0 (#290)."
+            + (
+                f" {sibling} is already a member, so expect 0."
+                if paired
+                else f" {sibling} is NOT a member — enrol it too, or this figure is the"
+                f" standing per-cycle cost."
+            )
         )
     return lines
 
@@ -4201,7 +4266,9 @@ def _import_cadence_channel(
     if channel in UNWIRED_CHANNELS:
         return None, f"{label} ({channel} is not wired into the scheduler yet)"
     if walk:
-        pc = cfg.providers.get(channel)
+        # `(cfg.providers or {})` for the reason given in `_enrolment_cost_note`:
+        # one spelling across the module, not because this path can see a None.
+        pc = (cfg.providers or {}).get(channel)
         walks = pc.network_type if pc is not None else DEFAULT_NETWORK_TYPE
         if network_type != walks:
             return None, f"{label} ({channel} walks {walks!r}, so its cadence is untouched)"

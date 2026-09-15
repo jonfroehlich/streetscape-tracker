@@ -413,6 +413,23 @@ Expect the newly enabled cities to arrive through the stranded reservation rathe
 They get a **share** of `[schedule].opt_in_cities_per_day`, not all of it: the reservation round-robins across stranded populations, so with a KartaView widening and a transiently-stalled population also in flight the share is about a third of it (measured on a prod-shaped slate: 4 of 10).
 Raise the key for the duration of a rollout rather than expecting ten cities on night one.
 
+**Seeding an opt-in channel: DUE IMMEDIATELY is not REACHABLE TONIGHT, and the gap can be weeks.**
+Dueness is per-(city, channel), so a fresh `schedule_state` row has `last_success_at` NULL and the city is due on the next run regardless of any sibling channel's 90-day clock.
+That is the whole of the eligibility question and none of the reachability one — the #328 lesson, arrived at from the enrolment side instead of the exclusion side.
+A newly enrolled city is stranded (not due on rank 0), so it enters the bounded hoist, competing for `opt_in_cities_per_day` (10 on prod) against every other stranded city: mapillary-stranded cities, and every never-collected KartaView-enrolled city from the #282 widening — ~380 of the 502 enrolled on 2026-09-03 still had a NULL `last_success_at`.
+Ordering inside the reservation is live-checkpoint first, then union order, then `city_id`, so a seed city with an unlucky slug can sit behind hundreds of them.
+**So do not wait for the nightly batch to prove a new channel works.** Run it filtered, which makes the new channel rank 0 and therefore strands nobody:
+
+```
+scheduler enroll-city "<city>" --channel panoramax
+scheduler enroll-city "<city>" --channel panoramax_streets    # nearly free when paired
+scheduler run-due --dry-run                                   # prices both, names each child's cap
+scheduler run-due --provider panoramax,panoramax_streets --limit 5
+```
+
+The same recipe is how a KartaView tranche is exercised, and it is the only supported bulk path either way — never a detached script.
+The filtered run advances only those channels' clocks, which for a first collection costs nothing (there is no paired snapshot to un-pair yet).
+
 **`notify-failure`** emails the recent scheduler-log tail and is wired as the unit's `OnFailure=` hook (`deploy/systemd/streetscape-tracker-notify@.service`), so a crash that never reaches the in-run alerting still produces an email.
 It exits 0 when it alerted (or alerting is intentionally off) and 1 only when a send was attempted and failed, so the notify unit's own status is meaningful.
 `run-due` returns nonzero on any failed city, so this hook can double-report a failure the in-run threshold alert already covered — accepted, since the alternative is a class of silent nights.

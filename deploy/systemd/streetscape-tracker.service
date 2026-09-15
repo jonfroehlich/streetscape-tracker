@@ -209,9 +209,11 @@ ReadWritePaths=/cse/web/research/makelab/public/streetscape-tracker
 # #304): that raises in-flight response buffers in proportion to the limit it
 # tests, on top of a two-child case already quoted at 94% of the brake, and no
 # one has put a number on it. Run that experiment at max_concurrent_channels = 1
-# until there is one. It is NOT sized for the 4-of-6 host-disjoint lane ceiling
-# (~76 GiB), and it is still NOT sized for a Detroit DIFF night (the unmeasured
-# two-frame case two paragraphs up). Measure before assuming any of the three.
+# until there is one. It is NOT sized for the full host-disjoint lane ceiling --
+# 5 of 8 since #335, and the ~76 GiB figure was quoted when that ceiling was 4,
+# so it is a FLOOR on what five lanes would want rather than an estimate of it --
+# and it is still NOT sized for a Detroit DIFF night (the unmeasured two-frame
+# case two paragraphs up). Measure before assuming any of the three.
 #
 # The ceiling argument is the BOX's, not the cgroup's, and free RAM is the wrong
 # reading of it: makelab2 has 188 GiB, but it is also the lab fileserver and most
