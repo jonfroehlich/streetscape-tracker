@@ -376,6 +376,29 @@ Describe partial coverage accordingly.
 12 clears both with 1.55 h spare and needs **no** change to the systemd unit; past ~13.5 h `TimeoutStartSec` has to move first, and two costs come with it — the publish lands later in the working day, and a longer nightly window is more sustained hours against the per-IP metered hosts, the axis Mapillary's blocks are currently suspected on (`docs/provider-access.md`).
 Note the second-order effect the 12 h batch has on #273's cap arithmetic, recorded above: at 10 h the clock was the smaller of the two ceilings and the budget remainder was unreachable, and at 12 h that has swapped.
 
+**The GSV daily budget followed a year later than it should have (2026-09-13, #304).**
+`[providers.gsv].daily_request_budget` 10M → 15M.
+The 20 → 40 city raise above was shipped without it, and the budget became the ceiling the cap used to be: 2026-09-11/12/13 spent **9,990,643 / 9,997,308 / 9,992,049** against the 10M cap — 99.9% every night — while deferring 20 / 14 / 16 cities for budget.
+
+Read what that deferral actually costs carefully, because the summary line understates it.
+A city whose gsv run does not fit the remainder keeps running its other channels, so `city_attempted` is true and it still counts against `max_cities_per_day`.
+Those nights therefore processed a full 40 cities with up to half of them missing the grid run that is the point of the night — the loss is in the *composition* of the 40, not in a smaller number.
+Raising the budget converts those into real runs inside the same 40 cities: no extra cities, and no extra requests to any per-IP metered host, since Mapillary, KartaView and Overpass each have their own untouched budgets.
+
+Sized against idle wall clock rather than against a quota.
+Those three nights ran **9.18 / 7.61 / 5.87 h of the 12 h window** and all three ended on the city cap, leaving 2.8–6.1 h unused; at the measured median **30,137 req/min** (n=20) 2.8 h is ~5.1M requests.
+15M spends the idle clock and hands the governor back to `max_batch_hours`, which is what this section already says is intended.
+
+What it does **not** move is the per-minute shape Google sees.
+`[download].max_requests_per_minute` (48,000, 80% of the 60,000/min approved for the project) is untouched, so only the duration at that rate grows.
+Metadata requests are ["available at no charge"](https://developers.google.com/maps/documentation/streetview/metadata) and consume no quota, so wall clock is the only thing being bought — which is also why this knob has no safe-pacing argument to make either way.
+
+`max_cities_per_day` was **left at 40** in the same change, and the reason first recorded here was wrong.
+It was held back as the Overpass knob, on an estimate that the 20 → 40 raise had taken nightly Overpass queries from ~20–40 to ~40–80 against the ~100/day guideline.
+Counting the network downloads in the per-attempt street logs refutes that: **27 / 20 / 14 / 1 / 27 / 5** on 2026-09-10 through 09-15, because most walks load a frozen network from `data/osm_cache` and only a city's first walk queries Overpass.
+Both Overpass refusals in that window (09-13 07:20 and 09-15 02:50) arrived after **1** and **5** downloads — the 09-13 one on that night's first fetch — so our nightly volume is not what tripped them.
+The cap is not bounded by Overpass volume at these rates; it was simply not changed here and remains a separate decision.
+
 ## The subcommand roster, and the production config (added 2026-08-25)
 
 Written 2026-08-25, when the CLAUDE.md rewrite turned its command cheatsheet into a table and two subcommands turned out to be documented nowhere.
