@@ -354,6 +354,62 @@ def is_resumable_channel(name: str) -> bool:
     return CHANNEL_RESUMABLE[name]
 
 
+# Canonical launch order, read by SchedulerConfig.enabled_providers -- which is
+# where the rule and what the order DECIDES are written down. This table carries
+# the per-position argument.
+#
+# The rule: most expensive first, EXCEPT where truncation is cheapest to absorb.
+#
+# kartaview_streets ranks immediately AFTER kartaview, and that adjacency is a
+# COST decision rather than tidiness. The two read one observation: whichever
+# runs first pays the sweep and promotes it into the shared census cache (#290),
+# and the second then prices at 0 through `_channel_estimate`. Ordering the walk
+# before the grid run would work equally well arithmetically -- the saving is
+# symmetric -- but it would put the multi-hour sweep behind a channel that can
+# be deferred by host affinity, so the grid run keeps the earlier slot and the
+# walk inherits a paid-for census. Separating them (anything ranked between) is
+# the only ordering that is actually wrong here, because the truncation argument
+# applies to BOTH and a night that reaches one but not the other pays full price
+# on the next.
+#
+# The two panoramax channels rank LAST, behind kartaview's pair, and the
+# position is argued rather than appended (issue #335). They are the second
+# channel pair the exception covers: a z15 tile census is checkpointed (#323),
+# so being cut short costs a night rather than the crawl. Within the exception
+# the rule applies again -- kartaview's sweep runs to hours on a metro
+# (Singapore ~9,974 requests at 16/min) where the richest Panoramax city
+# measures ~3,132 tiles, ~104 min at 30/min -- so kartaview is the one that
+# would starve everything behind it and keeps the later slot. Their adjacency
+# to each other is the same #290 pairing argument as KartaView's.
+#
+# NOT "newest last". `.get(p, _UNRANKED)` would have produced this exact order
+# for both panoramax channels BY ACCIDENT, which is the worse outcome rather
+# than the harmless one: an unranked channel's position is decided by string
+# comparison against every other unranked name, so it holds only until a second
+# unwritten channel lands beside it, and nothing says which of the two is the
+# decision. That is precisely how kartaview sat ordered correctly while three
+# other arms were fail-open (#238). test_every_scheduled_channel_has_an_explicit
+# _rank asserts set EQUALITY here for the same reason CHANNEL_HOSTS and
+# CHANNEL_RESUMABLE do, and the ranks are asserted DISTINCT because two channels
+# sharing a number are alphabetical between themselves, silently.
+CHANNEL_RANK: dict[str, int] = {
+    "gsv": 0,
+    "gsv_streets": 1,
+    "mapillary": 2,
+    "mapillary_streets": 3,
+    "kartaview": 4,
+    "kartaview_streets": 5,
+    "panoramax": 6,
+    "panoramax_streets": 7,
+}
+
+# Where a name this table does not know sorts. Past every real rank, so an
+# unknown channel cannot displace a decided one -- and NOT a decision about the
+# unknown channel, which is why the set-equality test exists: this fallback is
+# for a config typo or a test fixture, never for a scheduled channel.
+_UNRANKED = 99
+
+
 # Channels that KNOWN_PROVIDERS makes configurable but that the scheduler cannot
 # yet run correctly. load_scheduler_config drops such a block from `providers`
 # and records the error in SchedulerConfig.unwired_channel_errors; the two
@@ -668,52 +724,14 @@ class SchedulerConfig:
         are recorded in docs/scheduler.md. Read them before writing a fifth:
         every one was reasoned from prose adjacent to this docstring instead of
         from the code it describes, which was ~200 lines away the whole time.
+        The table itself is :data:`CHANNEL_RANK`, module-level beside the other
+        per-channel tables — read it for the per-position argument. It was a
+        local inside this method until #335 needed a test that every scheduled
+        channel has an EXPLICIT entry, which a local cannot be asked.
         """
-        # kartaview_streets ranks immediately AFTER kartaview, and that adjacency
-        # is a COST decision rather than tidiness. The two read one observation:
-        # whichever runs first pays the sweep and promotes it into the shared
-        # census cache (#290), and the second then prices at 0 through
-        # `_channel_estimate`. Ordering the walk before the grid run would work
-        # equally well arithmetically — the saving is symmetric — but it would
-        # put the multi-hour sweep behind a channel that can be deferred by host
-        # affinity, so the grid run keeps the earlier slot and the walk inherits
-        # a paid-for census. Separating them (anything ranked between) is the
-        # only ordering that is actually wrong here, because the truncation
-        # argument above applies to BOTH and a night that reaches one but not
-        # the other pays full price on the next.
-        #
-        # The two panoramax channels rank LAST, behind kartaview's pair, and the
-        # position is argued rather than appended (issue #335). The rule is most
-        # expensive first EXCEPT where truncation is cheapest to absorb, and
-        # this is the second channel pair the exception covers: a z15 tile
-        # census is checkpointed (#323), so being cut short costs a night rather
-        # than the crawl. Within the exception the order is the rule again, read
-        # backwards — kartaview's sweep runs to hours on a metro (Singapore
-        # ~9,974 requests at 16/min) where the richest Panoramax city measures
-        # ~3,132 tiles, ~104 min at 30/min, so kartaview is the one that would
-        # starve everything behind it and keeps the later slot.
-        #
-        # What this must NOT be read as is "newest last". `rank.get(p, 99)`
-        # would have produced this exact order for `panoramax` by accident and
-        # the wrong order for `panoramax_streets` (99 for both, then
-        # alphabetical, which splits the pair by putting panoramax_streets
-        # before panoramax and breaks the census pairing the paragraph above
-        # describes). Four fail-open arms is what that dict's fallback cost
-        # KartaView; an explicit entry is the fix, and that pairing argument is
-        # why the entry has to be a PAIR of adjacent ranks rather than one.
-        rank = {
-            "gsv": 0,
-            "gsv_streets": 1,
-            "mapillary": 2,
-            "mapillary_streets": 3,
-            "kartaview": 4,
-            "kartaview_streets": 5,
-            "panoramax": 6,
-            "panoramax_streets": 7,
-        }
         return sorted(
             (p for p, pc in self.providers.items() if pc.enabled),
-            key=lambda p: (rank.get(p, 99), p),
+            key=lambda p: (CHANNEL_RANK.get(p, _UNRANKED), p),
         )
 
 

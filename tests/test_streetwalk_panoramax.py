@@ -30,6 +30,7 @@ from unittest import mock
 
 import geopandas as gpd
 import numpy as np
+import pytest
 from shapely.geometry import LineString
 
 from streetscape_metadata_tracker import db
@@ -144,6 +145,7 @@ def _setup(
         calls["connection_limit"] = kwargs.get("connection_limit")
         calls["max_requests_per_minute"] = kwargs.get("max_requests_per_minute")
         calls["jitter"] = kwargs.get("jitter")
+        calls["max_requests"] = kwargs.get("max_requests")
         policy = kwargs.get("census_cache")
         calls["cache_path"] = policy.path if policy else None
         calls["reuse_census"] = policy.reuse if policy else None
@@ -367,6 +369,49 @@ def test_the_pacing_flags_reach_the_fetch_rather_than_only_being_parsed(tmp_path
     assert collect.run_collect(_args(data_dir2)) == 0
     assert calls2["max_requests_per_minute"] == panoramax_rate
     assert panoramax_rate < mapillary_rate
+
+
+def test_the_request_cap_reaches_the_census_rather_than_only_the_budget_gate(tmp_path, monkeypatch):
+    """
+    The parameter this collector did not have until #335, and why it matters.
+
+    `collect_panoramax_street_samples_async` took a pace and a jitter but no
+    `max_requests` -- its Mapillary sibling grew one in #318 and this one did
+    not -- so there was no number the scheduler could stop it at, and
+    `CHANNEL_RESUMABLE["panoramax_streets"] = True` would have been a claim
+    nothing downstream honoured: the launch site computing a cap, the child
+    never seeing it, and the budget gate believing the night was bounded.
+
+    --daily-budget only GATES. It is a pre-flight check against a tile-count
+    ESTIMATE; the cap is the only thing that bounds what the crawl then spends
+    against a host that meters us by IP and documents no rate limit at all, so
+    there is no server-side backstop for a flag parsed and dropped.
+
+    Asserted as the VALUE at the fetch, and a value that is not the default, so
+    a dispatch arm that hardcoded one or dropped the argument still fails.
+    """
+    data_dir, calls = _setup(tmp_path, monkeypatch, [_picture("px1", 44.05, -121.30)])
+    assert collect.run_collect(_args(data_dir, **{"panoramax-max-requests": 426})) == 0
+    assert calls["max_requests"] == 426
+
+    # ...and unset stays unset, rather than a cap nobody asked for silently
+    # truncating a city's census into a permanent hole in an immutable snapshot.
+    data_dir2, calls2 = _setup(tmp_path / "b", monkeypatch, [_picture("px1", 44.05, -121.30)])
+    assert collect.run_collect(_args(data_dir2)) == 0
+    assert calls2["max_requests"] is None
+
+
+def test_the_walks_request_cap_refuses_nonpositive_values_like_its_siblings(tmp_path):
+    """
+    0 is not "off". It is a crawl that stops before committing a single tile,
+    checkpoints nothing, and exits 83 telling the operator to re-run -- a loop
+    the message actively encourages. Both sibling walk flags carry
+    `positive_int` for exactly this, and a third copy that did not would be the
+    one place the trap survives.
+    """
+    for bad in ("0", "-1"):
+        with pytest.raises(SystemExit):
+            _args(str(tmp_path), **{"panoramax-max-requests": bad})
 
 
 # ── The date rule is the grid run's, not a second one ───────────────────────
