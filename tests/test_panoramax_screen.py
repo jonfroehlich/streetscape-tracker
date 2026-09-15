@@ -733,23 +733,24 @@ def test_a_busy_host_lock_reports_85_and_writes_nothing(data_dir, conn, monkeypa
     assert db.get_latest_provider_screen(conn, "panoramax") == []
 
 
-def test_the_screen_falls_back_to_the_collectors_pace_while_the_channel_is_unwired(tmp_path):
+def test_the_screen_paces_from_the_wired_channels_block(tmp_path):
     """
     Driven through the REAL loader, and that is the whole point of the test.
 
     An earlier version built `SchedulerConfig(providers={"panoramax": ...})` by
     hand and asserted the block won — green against a state
-    `load_scheduler_config` cannot produce, because `panoramax` is in
-    UNWIRED_CHANNELS and such a block is DROPPED at load so nothing can price,
-    budget or launch a channel the scheduler cannot run. So the documented "one
-    host, one pace" coupling did not exist, and the test could not see that.
-    Same shape as the #323 lesson this PR's own docs quote.
+    `load_scheduler_config` could not produce, because `panoramax` was in
+    UNWIRED_CHANNELS and such a block was DROPPED at load. So the documented
+    "one host, one pace" coupling did not exist and the test could not see that,
+    which is why it was rewritten to pin the fallback and to go red the moment
+    the channel was wired.
 
-    What is pinned here is therefore today's real behaviour: a TOML asking for
-    5/min does NOT slow the screen. When #316 PR 3 wires the channel this goes
-    red — which is the intended prompt to update it, `_screen_pacing`'s
-    docstring and docs/provider-access.md together, rather than letting the
-    prose drift back out of step with the code.
+    #335 wired it, so this is the other side of the same assertion: the entry is
+    gone, the block loads, and a TOML asking for 5/min DOES slow the screen. It
+    is still driven through the loader rather than a hand-built config, because
+    what it is really pinning is that the loader hands this function a block at
+    all — the thing that was false before and that a hand-built config cannot
+    tell you.
     """
     toml = tmp_path / "scheduler.toml"
     toml.write_text(
@@ -758,8 +759,29 @@ def test_the_screen_falls_back_to_the_collectors_pace_while_the_channel_is_unwir
         "[providers.panoramax]\nmax_requests_per_minute = 5\njitter = 0.1\n"
     )
     cfg = scheduler.load_scheduler_config(str(toml))
-    assert "panoramax" not in (cfg.providers or {}), "the loader drops an unwired block"
-    assert cfg.unwired_channel_errors, "and records why, for run-due to refuse on"
+    assert "panoramax" in (cfg.providers or {}), "the loader keeps a wired block"
+    assert not cfg.unwired_channel_errors, "and has nothing to refuse run-due on"
+    assert scheduler._screen_pacing(cfg, "panoramax") == (5, 0.1)
+    # Not the collector's constants — the assertion above would pass for the
+    # wrong reason if the fixture happened to restate them.
+    assert (5, 0.1) != (ps.DEFAULT_TILE_REQUESTS_PER_MINUTE, ps.DEFAULT_TILE_JITTER)
+
+
+def test_the_screen_still_falls_back_when_there_is_no_block(tmp_path):
+    """The fallback half, which the wiring did not remove.
+
+    A config with no `[providers.panoramax]` at all still screens, at the
+    collector's own constants. Kept as its own test rather than folded above:
+    "reads the block" and "works without one" are two properties, and the
+    version of this file that tested only one of them is what let the coupling
+    be documented for a release while being false.
+    """
+    toml = tmp_path / "scheduler.toml"
+    toml.write_text(
+        "[schedule]\nmax_cities_per_day = 40\n[providers.gsv]\ndaily_request_budget = 100\n"
+    )
+    cfg = scheduler.load_scheduler_config(str(toml))
+    assert "panoramax" not in (cfg.providers or {})
     assert scheduler._screen_pacing(cfg, "panoramax") == (
         ps.DEFAULT_TILE_REQUESTS_PER_MINUTE,
         ps.DEFAULT_TILE_JITTER,

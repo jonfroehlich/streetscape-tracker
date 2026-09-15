@@ -291,14 +291,24 @@ def test_spend_is_ledgered_only_for_credentials_this_host_shares(cfg, bundle_dir
     assert "mapillary_streets" not in charged
 
 
-def test_no_cadence_row_for_a_channel_the_scheduler_cannot_run(cfg, bundle_dir):
+def test_no_cadence_row_for_a_channel_the_scheduler_cannot_run(cfg, bundle_dir, monkeypatch):
     """
     A success on an unwired channel would suppress its FIRST real collection.
 
-    The bundle's Mapillary GRID run has a channel, so it gets a row. Panoramax
-    is in UNWIRED_CHANNELS, so it must not — even though it is a perfectly good
-    provider token with a perfectly good run.
+    The bundle's Mapillary GRID run has a channel, so it gets a row. An unwired
+    one must not — even though it is a perfectly good provider token with a
+    perfectly good run.
+
+    Driven through a SYNTHETIC UNWIRED_CHANNELS entry since #335, the way the
+    scheduler's own cluster of these tests already is: `panoramax` really was
+    unwired when this was written and is a real channel now, so the dict is
+    empty and the property would otherwise be pinned vacuously. Monkeypatching
+    keeps the mechanism under test — the import path must consult that dict,
+    whatever is in it — rather than deleting the test with the entry.
     """
+    from streetscape_metadata_tracker.scheduler import UNWIRED_CHANNELS
+
+    monkeypatch.setitem(UNWIRED_CHANNELS, "panoramax", "a synthetic test reason")
     conn = db.connect(str(bundle_dir / bundle_import.CATALOG_NAME))
     conn.execute("UPDATE runs SET provider = 'panoramax'")
     run_csv, run_json = _run_names(provider="panoramax")

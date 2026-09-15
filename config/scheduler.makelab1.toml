@@ -357,14 +357,61 @@ max_requests_per_minute = 16
 # The only street channel that falls back, because one machine-wide host lock
 # serializes every KartaView request — there is no parallel burn to isolate.
 #
-# These are now the FIFTH and SIXTH channels. The effective
-# max_concurrent_channels ceiling stays 4, now 4 of 6: the largest host-disjoint
-# set is gsv (no per-IP host) + ONE of the three Overpass channels + mapillary
-# (tile CDN) + kartaview (kartaview.org). Moot at the knob's current value of 1.
+# These are the FIFTH and SIXTH channels. See the panoramax pair below for the
+# current concurrency ceiling — re-derived there rather than restated here,
+# since the figure is a property of the host graph and moves when a channel is
+# added.
 [providers.kartaview_streets]
 enabled = true
 daily_request_budget = 10000
 max_requests_per_minute = 16
+spacing_m = 15
+network_type = "drive"
+
+# Panoramax (issue #335, #316 phase 2) — the THIRD and FOURTH opt-in channels,
+# and the SEVENTH and EIGHTH channels overall. Declaring these blocks enrolls
+# nobody; each nightly queue is exactly the cities `scheduler enroll-city`
+# names for THAT channel.
+#
+# WHY OPT-IN, and it is the clearest case in the catalog: a screen of all 1,144
+# enabled cities found 730 of them — 63.8% — holding no Panoramax imagery AT
+# ALL, and a screened zero is conclusive (every one of the 20 screened-zero
+# control cities measured exactly zero). A default-membership channel would
+# spend most of its nightly slots confirming absence. The imagery is
+# concentrated instead: roughly 20 cities hold 3.16 M pictures between them.
+#
+# THE CONCURRENCY CEILING, RE-DERIVED over the eight-channel host graph rather
+# than carried forward from the line this block replaced: the largest
+# host-disjoint set is gsv (no per-IP host) + gsv_streets (Overpass) + mapillary
+# (tile CDN) + kartaview (kartaview.org) + panoramax (api.panoramax.xyz) = 5,
+# so 5 of 8. The numerator did not move and the denominator did: every walk
+# added since #258 brings one more Overpass user, and Overpass admits exactly
+# one talker. gsv_streets is the representative because it is the only Overpass
+# channel with no SECOND host. Moot at the knob's current value of 1.
+[providers.panoramax]
+enabled = true
+# ~ the richest city measured (3,132 z15 tiles) with room for a second, so one
+# night can finish any single enrolled city. Also a real per-night ceiling, not
+# only a gate: `_run_one_city` hands the child --panoramax-max-requests.
+daily_request_budget = 4000
+# The collector's own DEFAULT_TILE_REQUESTS_PER_MINUTE, restated because
+# _tile_census_timeout_seconds derives every per-city timeout from THIS value —
+# lowering it here without re-reading that function shortens the timeouts too.
+max_requests_per_minute = 30
+# Non-metronomic gaps, the #292 shifted exponential, at the collector's own CV.
+jitter = 0.6
+
+# The Panoramax road walk. Enrolled SEPARATELY from the grid channel above, for
+# the reason kartaview_streets is: street coverage is a different question from
+# grid coverage. Nearly free WHEN PAIRED — both channels read one z15 census of
+# one bbox, the grid run promotes it into the shared cache (#290) and this one
+# prices at 0, which is why it ranks immediately after panoramax. Un-paired it
+# pays a full census, and that is what this budget covers.
+[providers.panoramax_streets]
+enabled = true
+daily_request_budget = 4000
+max_requests_per_minute = 30
+jitter = 0.6
 spacing_m = 15
 network_type = "drive"
 
