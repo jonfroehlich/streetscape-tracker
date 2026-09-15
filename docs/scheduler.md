@@ -393,9 +393,11 @@ What it does **not** move is the per-minute shape Google sees.
 `[download].max_requests_per_minute` (48,000, 80% of the 60,000/min approved for the project) is untouched, so only the duration at that rate grows.
 Metadata requests are ["available at no charge"](https://developers.google.com/maps/documentation/streetview/metadata) and consume no quota, so wall clock is the only thing being bought — which is also why this knob has no safe-pacing argument to make either way.
 
-`max_cities_per_day` was deliberately **left at 40** in the same change.
-It is the knob `docs/provider-access.md` names as the one to re-check against Overpass's ~100 queries/day guideline, the 20 → 40 raise already took the nightly count from ~20–40 to ~40–80, and 2026-09-13 took an Overpass refusal (`Connection refused`, cleared within the hour).
-Raising it to 50 would sit at the guideline on a host that had just refused us, for a smaller gain than the budget delivers on its own — so the two halves were separated rather than shipped together.
+`max_cities_per_day` was **left at 40** in the same change, and the reason first recorded here was wrong.
+It was held back as the Overpass knob, on an estimate that the 20 → 40 raise had taken nightly Overpass queries from ~20–40 to ~40–80 against the ~100/day guideline.
+Counting the network downloads in the per-attempt street logs refutes that: **27 / 20 / 14 / 1 / 27 / 5** on 2026-09-10 through 09-15, because most walks load a frozen network from `data/osm_cache` and only a city's first walk queries Overpass.
+Both Overpass refusals in that window (09-13 07:20 and 09-15 02:50) arrived after **1** and **5** downloads — the 09-13 one on that night's first fetch — so our nightly volume is not what tripped them.
+The cap is not bounded by Overpass volume at these rates; it was simply not changed here and remains a separate decision.
 
 ## The subcommand roster, and the production config (added 2026-08-25)
 
