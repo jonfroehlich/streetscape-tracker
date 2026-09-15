@@ -782,3 +782,11 @@ def test_estimate_says_when_it_fetched_the_network_from_overpass(tmp_path, monke
     assert rc == 0
     out = capsys.readouterr().out
     assert "re-fetched from Overpass and frozen" in out
+
+    # --refresh on a COLD city is an ordinary first fetch, not a re-fetch.
+    os.remove(path)
+    rc = collect.run_collect(_args(data_dir, estimate=True, refresh=True))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "cold, so it was fetched from Overpass" in out
+    assert "re-fetched" not in out

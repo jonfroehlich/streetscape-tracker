@@ -474,6 +474,62 @@ def test_the_reset_test_stays_closed_when_unreachable(monkeypatch):
     assert dc.overpass_serving() is False
 
 
+def test_an_unlimited_instance_is_serving(monkeypatch):
+    """A mirror with no per-IP limit answers `Rate limit: 0` and no slots line
+    at all -- the shape of the endpoint OVERPASS_URL is pointed at DURING an
+    incident, on which a slots-line-only test could never clear the breaker.
+    A limited instance with no slots line is still not serving: there, the
+    slots line is where a refusal would show."""
+    unlimited = "Connected as: 1\nCurrent time: 2026-09-15T14:02:11Z\nRate limit: 0\n"
+    monkeypatch.setattr(dc.requests, "get", lambda *a, **k: _FakeStatus(200, unlimited))
+    assert dc.overpass_serving() is True
+    limited = "Connected as: 1\nCurrent time: 2026-09-15T14:02:11Z\nRate limit: 2\n"
+    monkeypatch.setattr(dc.requests, "get", lambda *a, **k: _FakeStatus(200, limited))
+    assert dc.overpass_serving() is False
+    # And not a substring match: "Rate limit: 0" must be the whole line.
+    tricky = "Connected as: 1\nRate limit: 05\n"
+    monkeypatch.setattr(dc.requests, "get", lambda *a, **k: _FakeStatus(200, tricky))
+    assert dc.overpass_serving() is False
+
+
+def test_a_frozen_network_is_written_atomically(monkeypatch, tmp_path):
+    """An interrupted in-place write left a truncated GraphML that every later
+    reader took for a frozen network -- and the scheduler's frozen-network
+    exemption (issue #341) trusts the file's existence. So the save lands in a
+    .tmp and is renamed in: a save that dies leaves no network, a save that
+    lands leaves no .tmp."""
+    import os
+
+    from tests.test_host_lock import _city_row
+
+    graph = nx.MultiDiGraph()
+    graph.add_edge(1, 2)
+    monkeypatch.setattr(dsn, "_download_graph_named", lambda bbox, nt: graph)
+    city = _city_row()
+    final = dsn.network_cache_path(city.city_id, str(tmp_path))
+
+    def dies(g, p):
+        open(p, "w").write("<graphml><node")  # partial
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(dsn.ox, "save_graphml", dies)
+    with pytest.raises(KeyboardInterrupt):
+        dsn.fetch_graph(city, str(tmp_path))
+    assert not os.path.exists(final), "a dead save must not leave a frozen network"
+
+    seen = {}
+
+    def lands(g, p):
+        seen["path"] = p
+        open(p, "w").close()
+
+    monkeypatch.setattr(dsn.ox, "save_graphml", lands)
+    dsn.fetch_graph(city, str(tmp_path))
+    assert seen["path"] == final + ".tmp"
+    assert os.path.exists(final)
+    assert not os.path.exists(final + ".tmp")
+
+
 def test_a_200_with_an_unfamiliar_body_is_not_serving(monkeypatch):
     """A captive portal, a maintenance page, or a format change all arrive as
     200 + text. None of them is the slots line, so none of them clears it."""

@@ -409,9 +409,12 @@ def run_collect(args: argparse.Namespace) -> int:
             if network_was_frozen and not args.refresh:
                 issued = "No requests issued (--estimate)."
             else:
+                # "re-fetched" only when there WAS a frozen network to replace;
+                # --refresh on a cold city is an ordinary first fetch.
+                refetched = args.refresh and network_was_frozen
                 issued = (
                     "No imagery requests issued (--estimate); the street network was "
-                    f"{'re-fetched' if args.refresh else 'cold, so it was fetched'} from "
+                    f"{'re-fetched' if refetched else 'cold, so it was fetched'} from "
                     "Overpass and frozen."
                 )
             print(

@@ -218,12 +218,12 @@ This is what READ THIS FIRST points at; read it before changing any pacing, retr
 
 | Family | Codes | Meaning |
 |---|---|---|
-| Blocked | 75 / 76 / 81 / 84 | The third party refused this IP — trips the night-level breaker. **Only Overpass (76) is re-checked** (#341): one fail-CLOSED `/status` GET (`download_common.overpass_serving`, 200 + a slots line or it stays latched — the 2026-08-14 ban presented as *connection refused*, so "unreachable" must never read as "clear") on a 45-min cooldown, at most 4 a night; the other hosts latch all night by design (`HOST_RECHECKS`). A walk whose GraphML is already frozen is never breaker-skipped, since it never contacts Overpass |
+| Blocked | 75 / 76 / 81 / 84 | The third party refused this IP — trips the night-level breaker. **Only Overpass (76) is re-checked** (#341): one fail-CLOSED `/status` GET (`download_common.overpass_serving`, 200 + a slots line or it stays latched — the 2026-08-14 ban presented as *connection refused*, so "unreachable" must never read as "clear") on a 45-min cooldown, at most 4 a night; the other hosts latch all night by design (`HOST_RECHECKS`). A walk whose GraphML is already frozen is never skipped *for Overpass's sake* (it never contacts it, and spends no re-check) — its census host still gates it |
 | Busy | 79 / 80 / 82 / 85 | Another local process holds the host lock |
 | Crawl incomplete | 83 | A checkpointed partial crawl — the budget or deadline ran out, not a host condition; amnestied beside the host conditions (#238), while a SIGKILL has no exit code and still counts a failure, so kill-and-resume is bounded at five nights. Raised by the KartaView sweep (#239) and, since #318, by either tile census — **with no usable checkpoint the same stop is a plain `DownloadError`**, because "re-run to resume" with nothing to resume from is an instruction that loops forever |
 
 - A blocked or busy night still publishes, alerts unconditionally, and exits nonzero — a refusal that recovered on re-check too, because it still cost launches.
-- **A refused host STRANDS a city** when its grid run succeeded and its walk did not (#341): not gsv-due for ~83 days, reachable only through the bounded opt-in reservation. The `Done:` line counts them and the alert names them with the `run-due --provider <walk> --limit N` that walks them by hand; `scripts/prefreeze_street_networks.py` is the prevention.
+- **A refused OR locally busy host STRANDS a city** when its grid run succeeded and its walk did not (#341): not gsv-due for ~83 days, reachable only through the bounded opt-in reservation. The `Done:` line counts them and the alert names them with the `run-due --provider <walk> --limit N` that walks them by hand; `scripts/prefreeze_street_networks.py` is the prevention.
 - makelab1 is **not** an escape hatch: Project Sidewalk serves Mapillary data off it, and that trade is never the right one.
 
 **Scheduler → [`docs/scheduler.md`](docs/scheduler.md).**

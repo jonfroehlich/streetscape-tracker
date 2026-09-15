@@ -455,7 +455,17 @@ def fetch_graph(
     logger.info("Downloaded %d nodes / %d edges", graph.number_of_nodes(), graph.number_of_edges())
 
     os.makedirs(_cache_dir(data_dir), exist_ok=True)
-    ox.save_graphml(graph, cache_path)
+    # Written beside the final name and renamed in, never in place (issue
+    # #341): `ox.save_graphml` -> `nx.write_graphml` writes the file it is
+    # given, so a Ctrl-C, SIGTERM or OOM mid-write used to leave a truncated
+    # GraphML that every later reader took for a frozen network -- the cache
+    # hit above never re-fetches, `ox.load_graphml` then fails as a plain city
+    # failure every night, and the scheduler's frozen-network exemption trusts
+    # the file's mere existence. `os.replace` is atomic on one filesystem, so
+    # the final name either holds a complete network or nothing.
+    tmp_path = cache_path + ".tmp"
+    ox.save_graphml(graph, tmp_path)
+    os.replace(tmp_path, cache_path)
     logger.info("Froze street network to %s", cache_path)
     if conn is not None:
         _register(conn, city_row.city_id, network_type, graph)

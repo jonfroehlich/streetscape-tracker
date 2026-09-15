@@ -11174,6 +11174,130 @@ def test_stranding_is_decided_after_the_city_drains(conn, monkeypatch):
 
     assert blocked.stranded == {city.city_id: ["gsv_streets", "mapillary_streets"]}
     assert blocked.skipped[HOST_OVERPASS] == 2
+    assert blocked.skipped_launches == 2
+
+
+def test_a_busy_host_strands_a_city_exactly_like_a_refusal(conn, monkeypatch, caplog):
+    """An exit-80 walk skip does not trip the breaker, but the city still leaves
+    the night with a grid run and no walk. The lock's other holder is most
+    often our own daytime pre-freeze pass overrunning into the timer, which is
+    what makes this the failure #341 is about, reached by the PR's own tool."""
+    from streetscape_metadata_tracker.download_common import HOST_OVERPASS
+
+    alpha = _register(conn, "Alpha", width=1000, height=1000, step=20)
+    beta = _register(conn, "Beta", width=1000, height=1000, step=20)
+
+    def run_one(city, provider):
+        if provider == "gsv_streets" and city.city_id == alpha:
+            return _busy_outcome(HOST_OVERPASS)
+        return True
+
+    cfg = SchedulerConfig(
+        providers={
+            "gsv": ProviderConfig(enabled=True, daily_request_budget=10_000_000),
+            "gsv_streets": ProviderConfig(enabled=True, daily_request_budget=2_000_000),
+        },
+        publish_enabled=False,
+        alerts=AlertConfig(enabled=True, failure_threshold=99),
+    )
+    with caplog.at_level(logging.INFO):
+        rc, alerts = _drive_night(monkeypatch, conn, cfg, run_one)
+
+    assert rc == 1
+    done = [r.message for r in caplog.records if r.message.startswith("Done: ")]
+    assert done and "1 city(ies) STRANDED un-walked by the breaker" in done[0]
+    ((subject, body),) = alerts
+    assert "SKIPPED (host busy)" in subject
+    assert "1 city(ies) STRANDED un-walked" in subject
+    assert "UNAVAILABLE" not in subject, "a busy lock is not the provider refusing us"
+    assert f"{alpha} (gsv_streets)" in body
+    assert beta not in body.split("came out of the night")[1]
+    assert "refused or locally busy host" in body
+
+
+def test_a_two_host_channel_skip_counts_one_launch(conn, monkeypatch):
+    """mapillary_streets needs Overpass AND the tile CDN. With both latched its
+    one skipped launch is attributed to both hosts for the recovery log line,
+    but the summary and alert count launches, not host-attributions."""
+    from streetscape_metadata_tracker import scheduler as sched
+    from streetscape_metadata_tracker.download_common import HOST_MAPILLARY_TILES, HOST_OVERPASS
+
+    city = _lane_city(conn)
+    blocked = sched.HostBreaker()
+    blocked.trip(HOST_OVERPASS)
+    blocked.trip(HOST_MAPILLARY_TILES)
+    monkeypatch.setattr(sched, "_run_one_city", lambda cfg, c, today, provider="gsv", **kw: True)
+    _run_channels(sched, _street_cfg(), conn, city, ["mapillary_streets"], blocked_hosts=blocked)
+
+    assert blocked.skipped == {HOST_OVERPASS: 1, HOST_MAPILLARY_TILES: 1}
+    assert blocked.skipped_launches == 1
+    assert "1 launch(es) skipped while latched" in sched._blocked_summary_note(blocked)
+    assert "1 channel launch(es) were skipped in all" in sched._blocked_alert_note(blocked)
+
+
+def test_a_frozen_walk_spends_no_recheck(conn, monkeypatch, tmp_path):
+    """A re-check is spent only when a launch actually wants the host. A walk on
+    a frozen network does not want Overpass, so it must not be the launch that
+    asks -- Overpass leaves the wanted set before `blocking` is called."""
+    from streetscape_metadata_tracker import scheduler as sched
+    from streetscape_metadata_tracker.download_common import HOST_OVERPASS
+    from streetscape_metadata_tracker.naming import network_cache_path
+
+    probe = _recovering_probe([False])
+    monkeypatch.setitem(sched.HOST_RECHECKS, HOST_OVERPASS, probe)
+    frozen = _lane_city(conn, "Frozen")
+    cold = _lane_city(conn, "Cold")
+    path = network_cache_path(frozen.city_id, str(tmp_path), "drive")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    open(path, "w").close()
+
+    blocked = sched.HostBreaker(cooldown_s=0)
+    blocked.trip(HOST_OVERPASS)
+    ran = []
+    monkeypatch.setattr(
+        sched,
+        "_run_one_city",
+        lambda cfg, c, today, provider="gsv", **kw: ran.append((c.city_id, provider)) or True,
+    )
+    cfg = _street_cfg(data_dir=str(tmp_path))
+    _run_channels(sched, cfg, conn, frozen, ["gsv_streets"], blocked_hosts=blocked)
+    assert ran == [(frozen.city_id, "gsv_streets")]
+    assert probe.calls == [], "the frozen walk never wanted Overpass"
+
+    _run_channels(sched, cfg, conn, cold, ["gsv_streets"], blocked_hosts=blocked)
+    assert len(probe.calls) == 1, "the cold walk is the one that asks"
+    assert ran == [(frozen.city_id, "gsv_streets")]
+
+
+def test_the_breaker_refuses_every_set_operation_that_would_desync_it():
+    """`update` would add a host without latching it; `discard`/`clear` would
+    drop one while `latched` still skips launches, so `bool(breaker)` would tell
+    the alert nothing refused us; `copy` returns a plain set that has forgotten
+    all of it. The docstring's rule is a red test, not a comment."""
+    from streetscape_metadata_tracker.download_common import HOST_OVERPASS
+
+    b = _sched.HostBreaker()
+    b.trip(HOST_OVERPASS)
+    for op in (
+        lambda: b.update({"x"}),
+        lambda: b.discard(HOST_OVERPASS),
+        lambda: b.remove(HOST_OVERPASS),
+        lambda: b.clear(),
+        lambda: b.pop(),
+        lambda: b.copy(),
+        lambda: b.__ior__({"x"}),
+        lambda: b.__isub__({HOST_OVERPASS}),
+        lambda: b.intersection_update(set()),
+    ):
+        with pytest.raises(TypeError, match="HostBreaker"):
+            op()
+    assert b == {HOST_OVERPASS} and b.latched == {HOST_OVERPASS}
+    # Positional construction is refused too: a breaker is never "a set of hosts".
+    with pytest.raises(TypeError):
+        _sched.HostBreaker({HOST_OVERPASS})
+    # Non-mutating reads still work, since the alert and summary rely on them.
+    assert b | {"x"} == {HOST_OVERPASS, "x"}
+    assert sorted(b) == [HOST_OVERPASS]
 
 
 def test_a_plain_set_is_still_accepted_by_the_tail_as_an_all_night_latch(conn, monkeypatch):

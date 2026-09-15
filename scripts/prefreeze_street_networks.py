@@ -20,9 +20,12 @@ What it does, in order:
 2. Keeps the cities inside the night's city cap that are due on at least one
    street channel and have NO frozen GraphML for that channel's configured
    ``network_type``. ``--nights N`` widens the window to N caps' worth of the
-   stalest-first order — an approximation, since each night re-resolves its
-   two reservations, but the order beyond the cap is what the following night
-   draws from.
+   stalest-first order — an approximation twice over: each night re-resolves
+   its two reservations, and a city whose every channel is skipped (budget,
+   breaker, busy lock) does not consume a cap slot, so a real night can reach
+   past the first ``max_cities_per_day`` entries. The order beyond the cap is
+   what those extra slots and the following night draw from, so ``--nights 2``
+   covers both.
 3. Dry run by DEFAULT: prints the list and exits. With ``--execute`` it fetches
    them SERIALLY, one at a time, sleeping ``--pause-s`` between fetches, through
    the same host lock, ``/status`` pre-flight, retry policy and deadline every
@@ -35,9 +38,13 @@ Overpass is not something to keep asking. A city-specific failure (a bbox with
 no drivable ways) is logged and the pass continues.
 
 It refuses to run while a ``run-due`` is in flight on this machine unless
-``--force``: the night and the pass would be two Overpass talkers from one IP,
-which the host lock would serialize but which is still the profile that earned
-the 2026-08-14 ban. Run it in the daytime, well clear of the 02:00 timer.
+``--force`` — checked before EVERY fetch, not once, because a 30-city pass at
+the default pause is well over an hour and a pass started too late is still
+fetching when the 02:00 timer fires. The night and the pass would be two
+Overpass talkers from one IP, which the host lock would serialize but which is
+still the profile that earned the 2026-08-14 ban — and the walk that loses the
+lock exits busy and strands its city for ~83 days (the very failure #341 is
+about). Run it in the daytime, well clear of the timer.
 
 Nothing is published and no imagery request is made. The catalog gains a
 ``street_networks`` row per frozen network, as a walk's own fetch would add.
@@ -150,19 +157,38 @@ def plan_prefreeze(
     return planned
 
 
-def run_prefreeze(conn, cfg, planned, *, pause_s: float) -> tuple[int, int, int | None]:
+def run_prefreeze(
+    conn, cfg, planned, *, pause_s: float, force: bool = False
+) -> tuple[int, int, int | None]:
     """
     Fetch each planned network in order, serially, ``pause_s`` apart.
 
-    Returns ``(frozen, failed_cities, host_exit)``: ``host_exit`` is the exit
-    code of the host condition that stopped the pass, or None if it ran to the
-    end. A city-specific ``DownloadError`` counts in ``failed_cities`` and does
-    not stop the pass.
+    Returns ``(frozen, failed_cities, stop_code)``: ``stop_code`` is the exit
+    code of what stopped the pass early -- a host condition's own code (76
+    blocked / 80 busy), or ``USAGE_EXIT_CODE`` when a ``run-due`` appeared on
+    this machine and ``force`` is False -- or None if it ran to the end. A
+    city-specific ``DownloadError`` counts in ``failed_cities`` and does not
+    stop the pass.
+
+    The in-flight check runs before EVERY fetch (after the pause, so it sees
+    the world the fetch will run in), not once up front: the pass is long and
+    the timer does not wait for it.
     """
     frozen = failed = 0
     for index, (city, network_type, channels) in enumerate(planned):
         if index:
             time.sleep(pause_s)
+        in_flight = _run_due_in_flight()
+        if in_flight and not force:
+            logger.error(
+                "A run-due is in flight on this machine (%s); stopping the pass rather than "
+                "being a second Overpass talker beside it (%d of %d frozen). Wait for the "
+                "night to finish, or pass --force.",
+                in_flight,
+                frozen,
+                len(planned),
+            )
+            return frozen, failed, USAGE_EXIT_CODE
         logger.info(
             "Freezing %s %s network (%d/%d) for %s",
             city.city_id,
@@ -269,22 +295,21 @@ def main(argv=None) -> int:
             print("DRY RUN — nothing fetched. Re-run with --execute to freeze them.")
             return 0
 
-        in_flight = _run_due_in_flight()
-        if in_flight and not args.force:
-            logger.error(
-                "A run-due is in flight on this machine (%s); refusing to be a second "
-                "Overpass talker beside it. Wait for the night to finish, or pass --force.",
-                in_flight,
-            )
-            return USAGE_EXIT_CODE
-
-        frozen, failed, host_exit = run_prefreeze(conn, cfg, planned, pause_s=args.pause_s)
+        frozen, failed, stop_code = run_prefreeze(
+            conn, cfg, planned, pause_s=args.pause_s, force=args.force
+        )
         print(
             f"Froze {frozen} of {len(planned)} network(s)"
             + (f"; {failed} city(ies) had no usable network" if failed else "")
-            + ("; stopped early on a host condition" if host_exit is not None else "")
+            + (
+                "; stopped early: a run-due started on this machine"
+                if stop_code == USAGE_EXIT_CODE
+                else "; stopped early on a host condition"
+                if stop_code is not None
+                else ""
+            )
         )
-        return host_exit if host_exit is not None else 0
+        return stop_code if stop_code is not None else 0
     finally:
         conn.close()
 

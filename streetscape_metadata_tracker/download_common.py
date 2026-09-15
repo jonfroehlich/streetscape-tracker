@@ -109,7 +109,17 @@ OVERPASS_REFERER = "https://github.com/jonfroehlich/streetscape-tracker"
 # or, with both of our slots in use, `Slot available after: <ts>, in N seconds.`
 # Either line means the instance knows this IP and is prepared to serve it; a
 # queued slot is the normal state of a working night (osmnx sleeps it off).
-_OVERPASS_SLOTS_LINE = re.compile(r"\d+ slots? available now|Slot available after: ")
+#
+# An instance that enforces no per-IP limit reports `Rate limit: 0` and no
+# slots line at all -- the shape of the mirrors an operator points OVERPASS_URL
+# at during an incident (issue #209). That is a positive signal too (the
+# instance is telling this IP it is unlimited), and without it the breaker
+# could never clear on exactly the endpoint chosen because the main one was
+# refusing us. Any other `Rate limit: N` still needs a slots line, since on
+# a limited instance the slots line is where a refusal would show.
+_OVERPASS_SLOTS_LINE = re.compile(
+    r"\d+ slots? available now|Slot available after: |^Rate limit: 0\s*$", re.MULTILINE
+)
 
 
 def overpass_url() -> str:
@@ -129,7 +139,8 @@ def overpass_serving(url: str | None = None, *, timeout_s: float = 15.0) -> bool
     * The pre-flight is **fail-open** — anything it cannot read as a refusal
       means "proceed", because a false alarm there skips a healthy city.
     * This is **fail-closed** — only an HTTP 200 whose body carries a
-      parseable slots line returns True. Unreachable, a timeout, a 5xx from a
+      parseable slots line (or ``Rate limit: 0``, an unlimited instance's way
+      of saying the same) returns True. Unreachable, a timeout, a 5xx from a
       front end, a 406, an empty or unfamiliar body: all False, and the breaker
       stays latched.
 

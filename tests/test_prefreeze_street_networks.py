@@ -98,7 +98,9 @@ def _run(monkeypatch, cfg, *args, fetcher=None, in_flight=None):
     slept = []
     monkeypatch.setattr(pf, "load_scheduler_config", lambda path: cfg)
     monkeypatch.setattr(pf, "fetch_graph", fetcher)
-    monkeypatch.setattr(pf, "_run_due_in_flight", lambda: in_flight)
+    monkeypatch.setattr(
+        pf, "_run_due_in_flight", in_flight if callable(in_flight) else (lambda: in_flight)
+    )
     monkeypatch.setattr(pf.time, "sleep", lambda s: slept.append(s))
     rc = pf.main(["--date", TODAY.isoformat(), *[str(a) for a in args]])
     return rc, fetcher, slept
@@ -228,6 +230,18 @@ def test_a_run_due_in_flight_refuses_the_pass_unless_forced(three_cities, data_d
     # A dry run never needs to ask: it touches nothing.
     rc, fetcher, _ = _run(monkeypatch, _cfg(data_dir), in_flight="pid 4242: run-due")
     assert rc == 0
+
+
+def test_a_run_due_that_starts_mid_pass_stops_it(three_cities, data_dir, monkeypatch, capsys):
+    """The guard is asked before EVERY fetch, not once: a pass is long and the
+    timer does not wait for it, and the walk that then loses the Overpass lock
+    exits busy and strands its city -- the failure #341 is about."""
+    alpha, beta, _ = three_cities
+    answers = iter([None, "pid 4242: run-due"])
+    rc, fetcher, _ = _run(monkeypatch, _cfg(data_dir), "--execute", in_flight=lambda: next(answers))
+    assert rc == USAGE_EXIT_CODE
+    assert fetcher.calls == [(alpha, "drive")], "the fetch in hand finished; the next never started"
+    assert "stopped early: a run-due started" in capsys.readouterr().out
 
 
 def test_no_street_channel_means_nothing_to_freeze(three_cities, data_dir, monkeypatch, capsys):

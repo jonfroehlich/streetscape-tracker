@@ -136,9 +136,9 @@ python scripts/prefreeze_street_networks.py --config config/scheduler.makelab1.t
 ```
 
 It predicts the slate the way `run-due` builds it — `_collect_due` over the enabled channels, hoist and refresh reserve included, for **tomorrow's UTC date** (what the 02:00 Pacific timer fire reads; `--date` overrides) — and keeps the cities inside the cap that are due on a street channel and have no frozen GraphML for that channel's `network_type`.
-`--nights N` widens the window to N caps' worth of the stalest-first order, an approximation since each night re-resolves its reservations.
+`--nights N` widens the window to N caps' worth of the stalest-first order, an approximation twice over: each night re-resolves its reservations, and a city whose every channel is skipped does not consume a cap slot, so a real night reaches past the first `max_cities_per_day` entries — `--nights 2` covers both.
 It stops at the first host refusal or busy lock and exits with that host's code (76 / 80), exactly as a collection child does; a bbox with no drivable ways is logged and the pass continues.
-It **refuses to run beside an in-flight `run-due`** unless `--force` — run it in the daytime, clear of the timer.
+It **refuses to run beside an in-flight `run-due`** unless `--force`, checked before *every* fetch rather than once — a pass is long, the timer does not wait for it, and the walk that then loses the Overpass lock exits busy and strands its city (#341) — so run it in the daytime, clear of the timer.
 This is the one script in `scripts/` that makes provider requests, and it is dry-run by default for that reason.
 There is no timer for it yet; scheduling it is a pacing decision to take against the Overpass usage policy first (CLAUDE.md, READ THIS FIRST).
 
