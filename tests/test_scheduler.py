@@ -1009,10 +1009,12 @@ def test_the_repo_default_config_declares_kartaview_as_an_opt_in_channel():
     whose estimate exceeds the daily budget is skipped PERMANENTLY rather than
     deferred (issue #274).
     """
-    from streetscape_metadata_tracker.scheduler import (
-        DEFAULT_SWEEP_REQUESTS_PER_MINUTE,
-        is_opt_in_channel,
-    )
+    # From the collector module rather than re-exported through the scheduler:
+    # #335 dropped that re-export when `_enrolment_cost_note` stopped spelling
+    # KartaView's rate out and started reading `_crawl_pricing`, which is the
+    # one row both directions of the timeout derivation already share.
+    from streetscape_metadata_tracker.download_kartaview import DEFAULT_SWEEP_REQUESTS_PER_MINUTE
+    from streetscape_metadata_tracker.scheduler import is_opt_in_channel
 
     cfg = load_scheduler_config(os.path.join(_PROJECT_ROOT, "config", "scheduler.toml"))
     assert "kartaview" in cfg.enabled_providers()
@@ -1071,6 +1073,8 @@ def test_makelab1_production_config_is_wired():
         "mapillary_streets",
         "kartaview",
         "kartaview_streets",
+        "panoramax",
+        "panoramax_streets",
     ]
     for channel in ("mapillary", "mapillary_streets"):
         pc = cfg.providers[channel]
@@ -1111,6 +1115,31 @@ def test_makelab1_production_config_is_wired():
     # channels, or the three providers would not share a streets.html row.
     assert cfg.providers["kartaview_streets"].spacing_m == 15
     assert cfg.providers["kartaview_streets"].network_type == "drive"
+    # The Panoramax pair (#335), the SEVENTH and EIGHTH channels and the third
+    # and fourth opt-in ones. Declaring them enrols nobody, so shipping them
+    # enabled is safe in exactly the way kartaview's was — and the budget is
+    # pinned exactly for the opposite of kartaview's reason: it is a real per-
+    # night CEILING that `_run_one_city` enforces as --panoramax-max-requests,
+    # not a floor a city must clear, so raising it widens what a night may spend
+    # against a host that documents no rate limit at all.
+    #
+    # 4,000 is ~the richest city measured (3,132 z15 tiles) plus room for a
+    # second. The rate is pinned because two things read it: the child paces at
+    # it, and _tile_census_timeout_seconds derives every per-city timeout from
+    # it. The jitter is pinned because a metronomic pattern is the shape three
+    # Mapillary per-IP blocks put under suspicion (#292), and here there is no
+    # documented limit to say we are inside.
+    for channel in ("panoramax", "panoramax_streets"):
+        pc = cfg.providers[channel]
+        assert pc.enabled, f"{channel} declared in production"
+        assert pc.daily_request_budget == 4_000
+        assert pc.max_requests_per_minute == 30
+        assert pc.jitter == pytest.approx(0.6)
+        assert _sched.is_opt_in_channel(channel), "declaring it must not enrol the catalog"
+    # And the walk walks the same sample points on the same network as the other
+    # three street channels, for the same streets.html reason.
+    assert cfg.providers["panoramax_streets"].spacing_m == 15
+    assert cfg.providers["panoramax_streets"].network_type == "drive"
     # Channel concurrency is OFF in production until both of #240's deploy gates
     # clear: resume for the Mapillary tile census (#256), because a stop now kills
     # N children at once and a killed census re-spends tiles into a per-IP ceiling
@@ -2420,11 +2449,11 @@ def test_get_due_cities_has_no_default_membership_default():
     assert param.kind is inspect.Parameter.KEYWORD_ONLY
 
 
-def test_the_opt_in_channels_today_are_the_two_kartaview_ones_and_panoramax():
-    """Pins the actual policy, not just its shape — the four non-KartaView
-    channels are cheap enough per city that catalog-wide membership is right for
-    them, and flipping one of them to opt-in would silently empty its nightly
-    queue.
+def test_the_opt_in_channels_today_are_the_kartaview_and_panoramax_pairs():
+    """Pins the actual policy, not just its shape — the four remaining channels
+    (the GSV pair and the Mapillary pair) are cheap enough per city that
+    catalog-wide membership is right for them, and flipping one of them to
+    opt-in would silently empty its nightly queue.
 
     Both KartaView channels are opt-in for one reason counted twice: they read
     the SAME radius sweep, and one whole-catalog pass of it is ~186,000 requests
@@ -2433,18 +2462,25 @@ def test_the_opt_in_channels_today_are_the_two_kartaview_ones_and_panoramax():
     coverage stays a separate decision from enrolling it in grid coverage and
     schedule_state.member keeps exactly one meaning for NULL (#258).
 
-    panoramax is opt-in on a different argument, and the difference is worth
-    keeping visible: the KartaView pair is opt-in because a whole-catalog pass
-    is unaffordable, while panoramax is opt-in because 730 of 1,144 enabled
+    The panoramax PAIR is opt-in on a different argument, and the difference is
+    worth keeping visible: the KartaView pair is opt-in because a whole-catalog
+    pass is unaffordable, while panoramax is opt-in because 730 of 1,144 enabled
     cities were MEASURED to hold no Panoramax imagery at all and a screened zero
     is conclusive (issue #316 phase 1). Cost and emptiness are different
     reasons, and a later provider that is cheap AND widely covered would belong
     on the other side of this line.
+
+    panoramax_streets (#335) gets its OWN entry rather than inheriting the grid
+    channel's, for the reason kartaview_streets does — and note that the
+    emptiness argument would in fact carry over, which is what makes it worth
+    saying that it is not the reason. A walk enrolled because its grid sibling
+    was would give schedule_state.member's NULL a third meaning, "whatever the
+    sibling says", so the row is a decision even where it is a foregone one.
     """
     from streetscape_metadata_tracker.scheduler import CHANNEL_DEFAULT_MEMBERSHIP
 
     opt_in = sorted(c for c, default in CHANNEL_DEFAULT_MEMBERSHIP.items() if not default)
-    assert opt_in == ["kartaview", "kartaview_streets", "panoramax"]
+    assert opt_in == ["kartaview", "kartaview_streets", "panoramax", "panoramax_streets"]
 
 
 def test_the_hoist_is_the_identity_permutation_without_an_opt_in_channel(conn):
@@ -6915,7 +6951,7 @@ def test_every_scheduled_channel_declares_whether_it_is_resumable():
     assert set(CHANNEL_RESUMABLE) == set(KNOWN_PROVIDERS) | set(STREET_CHANNELS)
 
 
-def test_the_four_census_channels_are_the_resumable_ones():
+def test_the_six_census_channels_are_the_resumable_ones():
     """The property is 'accepts a REQUEST CAP that pauses', not 'checkpoints'.
 
     Mapillary was False here for the whole of #256: it checkpointed its tile
@@ -6924,11 +6960,18 @@ def test_the_four_census_channels_are_the_resumable_ones():
     no number it could stop itself at. #318 gave it one, and the walk flips
     beside the grid run because it reads the identical census.
 
-    GSV stays False in both channels and is the control: a partial grid is not
-    a run, so refusing to start is the honest answer and a cap would only
-    produce artifacts nobody can publish. Panoramax is the other control, and a
-    more interesting one — its downloader HAS the cap since #318, so what keeps
-    it False is that nothing forwards one to it (see the table's comment).
+    Panoramax was the interesting control for exactly one release: its
+    downloader had the cap from #318 while nothing forwarded one, so what kept
+    it False was the WIRING rather than the child. #335 supplied both halves —
+    the grid arm in `_run_one_city`, and a `max_requests` parameter on
+    `collect_panoramax_street_samples_async`, which had none at all — so the
+    pair flips together the way the Mapillary pair does. Flipping only the grid
+    channel would leave `_sweep_launch_plan`'s sibling arm unasked and let the
+    walk re-crawl the identical z15 lattice every night the grid paused.
+
+    GSV is now the only control, in both channels: a partial grid is not a run,
+    so refusing to start is the honest answer and a cap would only produce
+    artifacts nobody can publish.
     """
     from streetscape_metadata_tracker.scheduler import CHANNEL_RESUMABLE, is_resumable_channel
 
@@ -6937,12 +6980,16 @@ def test_the_four_census_channels_are_the_resumable_ones():
         "kartaview_streets",
         "mapillary",
         "mapillary_streets",
+        "panoramax",
+        "panoramax_streets",
     ]
     assert is_resumable_channel("kartaview")
     assert is_resumable_channel("mapillary")
     assert is_resumable_channel("mapillary_streets")
+    assert is_resumable_channel("panoramax")
+    assert is_resumable_channel("panoramax_streets")
     assert not is_resumable_channel("gsv")
-    assert not is_resumable_channel("panoramax")
+    assert not is_resumable_channel("gsv_streets")
 
 
 def test_the_walk_gets_the_request_cap_too_not_only_the_budget_gate(conn):
@@ -7101,7 +7148,7 @@ def test_a_mapillary_cap_is_sized_to_its_own_pace_not_the_radius_sweeps(conn):
 def test_the_two_timeout_directions_round_trip_through_one_pricing_row(conn, monkeypatch):
     """Forward then inverse must return the request count they started from.
 
-    `_mapillary_timeout_seconds` prices a wall-clock from a tile count;
+    `_tile_census_timeout_seconds` prices a wall-clock from a tile count;
     `_sweep_requests_within_timeout` prices a request cap back out of that
     wall-clock. Composing them cancels the rate and the fraction entirely, so
     what is left is `tiles x _TIMEOUT_HEADROOM` -- the headroom deliberately
@@ -7123,7 +7170,7 @@ def test_the_two_timeout_directions_round_trip_through_one_pricing_row(conn, mon
     assert tiles > 0
 
     def round_trip(pc):
-        timeout_s = sched._mapillary_timeout_seconds(city, "mapillary", pc, floor=0)
+        timeout_s = sched._tile_census_timeout_seconds(city, "mapillary", pc, floor=0)
         return sched._sweep_requests_within_timeout(timeout_s, "mapillary", pc)
 
     expected = tiles * sched._TIMEOUT_HEADROOM
@@ -8338,7 +8385,7 @@ def test_a_resumable_walk_names_its_grid_sibling(conn):
     )
 
     walks = {c for c, resumable in CHANNEL_RESUMABLE.items() if resumable and is_street_channel(c)}
-    assert walks == {"kartaview_streets", "mapillary_streets"}
+    assert walks == {"kartaview_streets", "mapillary_streets", "panoramax_streets"}
     for walk in walks:
         sibling = STREET_CHANNELS[walk]
         assert sibling in CHANNEL_RESUMABLE, "the sibling has to be a scheduled channel"
@@ -10799,3 +10846,573 @@ def test_each_tile_census_prices_its_pace_from_its_own_default_rate(monkeypatch)
         _crawl_pricing("mapillary").default_rate
         == download_mapillary.DEFAULT_TILE_REQUESTS_PER_MINUTE
     )
+
+
+# ── Panoramax as the seventh and eighth channels (issue #335) ────────────────
+#
+# The arms that made `panoramax` schedulable at all and `panoramax_streets` a
+# channel for the first time. Grouped here rather than distributed into the
+# Mapillary and KartaView sections above: what these pin is a CHANNEL PAIR
+# arriving, and every one of them is about the same wiring landing together.
+
+
+def _px_cfg(rate=None, jitter=None, budget=4_000, **overrides):
+    """A config carrying both Panoramax channels.
+
+    `rate` and `jitter` default to None — the "unset" state, which is a distinct
+    contract from any value (it means "leave the collector's own default in
+    force"), so a test that wants the pass-through has to name a NON-default
+    number and a test that wants the omission has to leave them here.
+    """
+    providers = {
+        "panoramax": ProviderConfig(
+            enabled=True, daily_request_budget=budget, max_requests_per_minute=rate, jitter=jitter
+        ),
+        "panoramax_streets": ProviderConfig(
+            enabled=True, daily_request_budget=budget, max_requests_per_minute=rate, jitter=jitter
+        ),
+    }
+    return SchedulerConfig(providers=providers, **overrides)
+
+
+def test_every_scheduled_channel_has_an_explicit_rank():
+    """Set EQUALITY, the same posture as CHANNEL_HOSTS and CHANNEL_RESUMABLE.
+
+    `CHANNEL_RANK` is read with `.get(p, _UNRANKED)` so a config typo cannot
+    raise mid-night, and that fallback is precisely what ordered kartaview by
+    accident until #238 made it a decision. A channel landing without an entry
+    inherits the fallback, ties with every other unranked name, and is ordered
+    ALPHABETICALLY against them — so its position holds only until a second
+    unwritten channel lands beside it, and nothing anywhere says which of the
+    two orderings was intended.
+
+    Asserted against the same union the other three tables use, so one new
+    provider token turns four tables red rather than none.
+    """
+    from streetscape_metadata_tracker.naming import KNOWN_PROVIDERS
+    from streetscape_metadata_tracker.scheduler import CHANNEL_RANK, STREET_CHANNELS
+
+    assert set(CHANNEL_RANK) == set(KNOWN_PROVIDERS) | set(STREET_CHANNELS)
+    # Distinct, or "rank" is not an order: two channels sharing a number fall
+    # back to alphabetical between themselves, silently.
+    assert len(set(CHANNEL_RANK.values())) == len(CHANNEL_RANK)
+
+
+def test_the_panoramax_pair_ranks_last_and_adjacent():
+    """The position AND the adjacency, which are two different decisions.
+
+    Last, because a checkpointed tile census absorbs deadline truncation
+    cheaply — the exception the ordering rule carves out — and behind
+    kartaview's pair because that sweep is the longer of the two.
+
+    Adjacent, because both channels read ONE z15 census: whichever runs first
+    pays it and promotes it into the shared cache (#290), and the second prices
+    at 0. Anything ranked between them is the ordering that is actually wrong.
+    """
+    from streetscape_metadata_tracker.scheduler import CHANNEL_RANK
+
+    cfg = _px_cfg()
+    cfg.providers["gsv"] = ProviderConfig(enabled=True)
+    cfg.providers["kartaview"] = ProviderConfig(enabled=True)
+    cfg.providers["kartaview_streets"] = ProviderConfig(enabled=True)
+    order = cfg.enabled_providers()
+    assert order == ["gsv", "kartaview", "kartaview_streets", "panoramax", "panoramax_streets"]
+
+    # Asserted on the TABLE as well as on one config's order, because a config
+    # that happens to enable nothing between them cannot see a rank that moved:
+    # the property is that no channel at all may be ranked between the pair.
+    assert CHANNEL_RANK["panoramax_streets"] == CHANNEL_RANK["panoramax"] + 1
+    assert CHANNEL_RANK["panoramax"] == max(CHANNEL_RANK.values()) - 1, "last of the pairs"
+
+
+@pytest.mark.parametrize("channel", ["panoramax", "panoramax_streets"])
+def test_the_panoramax_estimate_is_the_z15_lattice_not_the_grid_formula(conn, channel):
+    """The fail-open arm this closes, from the direction the walk channel hits it.
+
+    `estimate_requests`' final `return` is the GSV grid formula — one request
+    per grid point — which for a 5 x 5 km city at 20 m is ~62,500 against a
+    lattice of a few hundred tiles. The grid token has had its arm since #323;
+    `panoramax_streets` is a NEW token, and without widening that arm it would
+    have fallen through to the formula, which is exactly how #238 describes
+    KartaView's budget guard being wrong in both directions at once.
+    """
+    from streetscape_metadata_tracker.download_panoramax import estimate_tile_count
+    from streetscape_metadata_tracker.scheduler import estimate_requests
+
+    city = db.resolve_city(conn, _register(conn, "Bend", width=5000, height=5000, step=20))
+    lattice = estimate_tile_count(
+        city.center_lat, city.center_lon, city.grid_width_m, city.grid_height_m, city.step_m
+    )
+    grid_formula = (city.grid_width_m // city.step_m + 1) * (city.grid_height_m // city.step_m + 1)
+    assert lattice < grid_formula / 10, "the fixture must separate the two, or this pins nothing"
+    assert estimate_requests(city, channel, conn=conn) == lattice
+    # And the walk's cost does NOT track sample spacing: it joins one census
+    # locally, so spacing_m and network_type must not move the number.
+    assert (
+        estimate_requests(city, channel, conn=conn, spacing_m=1, network_type="all_public")
+        == lattice
+    )
+
+
+@pytest.mark.parametrize("channel", ["panoramax", "panoramax_streets"])
+def test_a_paced_panoramax_census_outgrows_the_flat_timeout(conn, channel):
+    """The arm whose ABSENCE was the reason to keep the channel unwired.
+
+    An unlisted channel falls through `city_timeout_seconds`' allow-list to the
+    flat `city_timeout_minutes` floor. Panoramax's layer starts at z15 where
+    Mapillary's is z14 and it paces at half the rate, so the same bbox is far
+    more wall-clock: Anchorage's pre-cap 105 x 84 km grid is tens of thousands
+    of z15 tiles, hours of deliberate sleeping, and a SIGKILL at 180 minutes
+    costs the requests already spent AND counts a failure only a success resets.
+
+    Both channels, because they read the identical census.
+    """
+    from streetscape_metadata_tracker.scheduler import city_timeout_seconds
+
+    city = db.resolve_city(
+        conn, _register_at(conn, "Anchorage", 61.2, -149.9, width=105588, height=83676)
+    )
+    cfg = _px_cfg(rate=30)
+    floor = 180 * 60
+    derived = city_timeout_seconds(cfg, city, channel)
+    assert derived > floor, "a large z15 census must not be squeezed into the flat floor"
+
+
+@pytest.mark.parametrize("channel", ["panoramax", "panoramax_streets"])
+def test_the_panoramax_timeout_reads_the_channels_own_configured_rate(conn, channel):
+    """Not just "above the floor": the CONFIGURED rate has to be the live term.
+
+    A derivation that reached for a constant — or for Mapillary's 60, which is
+    what a shared `_tile_census_timeout_seconds` would have done before
+    `_CRAWL_PRICING` gave each provider its own row — would time every
+    Panoramax run against a pace it never runs at. Halving the rate must double
+    the pacing, so the two timeouts cannot be equal.
+
+    PARAMETRIZED OVER BOTH CHANNELS, because `city_timeout_seconds` reads TWO
+    tuples and only one of them was covered. The allow-list tuple decides
+    "derive or take the flat floor"; a SECOND tuple one line down decides
+    "which derivation". Dropping `panoramax_streets` from the second while
+    leaving it in the first sends the walk to the GSV branch, whose unset rate
+    falls back to `cfg.max_requests_per_minute` (24,000 by default) — the
+    timeout collapses onto the 180-minute floor and the whole suite stayed
+    green. `test_a_paced_panoramax_census_outgrows_the_flat_timeout` cannot see
+    it because `_px_cfg(rate=30)` hands the GSV branch a usable 30/min too; the
+    `unset == rate=DEFAULT` equality below is what catches it, since the GSV
+    branch's unset fallback is 24,000 rather than 30.
+    """
+    from streetscape_metadata_tracker.download_panoramax import DEFAULT_TILE_REQUESTS_PER_MINUTE
+    from streetscape_metadata_tracker.scheduler import city_timeout_seconds
+
+    city = db.resolve_city(
+        conn, _register_at(conn, "Anchorage", 61.2, -149.9, width=105588, height=83676)
+    )
+    fast = city_timeout_seconds(_px_cfg(rate=120), city, channel)
+    slow = city_timeout_seconds(_px_cfg(rate=30), city, channel)
+    assert slow > fast
+    # And an unconfigured channel falls to the PROVIDER's own default, not
+    # Mapillary's and not the GSV `[download]` figure. This is the assertion
+    # that fails both when the pricing row is rewired to Mapillary's constants
+    # while both sit at their shipped values, and when a channel is routed to
+    # the GSV derivation at all.
+    unset = city_timeout_seconds(_px_cfg(rate=None), city, channel)
+    assert unset == city_timeout_seconds(
+        _px_cfg(rate=DEFAULT_TILE_REQUESTS_PER_MINUTE), city, channel
+    )
+
+
+def test_an_unpaced_panoramax_channel_keeps_the_flat_floor(conn):
+    """0 disables pacing, which leaves nothing to derive a duration from — and
+    is a distinct state from unset, which means the collector's default."""
+    from streetscape_metadata_tracker.scheduler import city_timeout_seconds
+
+    city = db.resolve_city(
+        conn, _register_at(conn, "Anchorage", 61.2, -149.9, width=105588, height=83676)
+    )
+    assert city_timeout_seconds(_px_cfg(rate=0), city, "panoramax") == 180 * 60
+
+
+def test_the_panoramax_grid_child_gets_the_pace_the_jitter_and_the_cap(conn, monkeypatch, tmp_path):
+    """All three VALUES, none of them at its default.
+
+    A flag asserted only at its default lets the call site hard-code anything,
+    so every number here is deliberately NOT what the collector would pick on
+    its own: 7/min against a default of 30, 0.25 against 0.6, and a cap only a
+    caller can compute.
+
+    The pace matters twice over. The CLI's own default happens to match this
+    channel's shipped config, so omitting the flag would look harmless — but
+    `_tile_census_timeout_seconds` divides the tile count by the CONFIGURED
+    rate, so a configured rate the child never hears would be measured against
+    a pace it never used, and the disagreement shows up only as a SIGKILL.
+    """
+    cmd, city = _grid_cmd(
+        monkeypatch, tmp_path, conn, "panoramax", _px_cfg(rate=7, jitter=0.25), request_cap=1234
+    )
+    assert cmd[cmd.index("--panoramax-max-requests-per-minute") + 1] == "7"
+    assert cmd[cmd.index("--panoramax-jitter") + 1] == "0.25"
+    assert cmd[cmd.index("--panoramax-max-requests") + 1] == "1234"
+    # The GSV pacing flag is still passed and still untouched — the CLI ignores
+    # it for this provider, and nothing here may change GSV's behaviour.
+    assert "--max-requests-per-minute" in cmd
+    # '--' terminator stays last so a display name is never read as a flag.
+    assert cmd[cmd.index("--") + 1] == city.display_name
+    assert cmd[-1] == city.display_name
+
+
+def test_an_unset_panoramax_knob_leaves_the_collectors_default_in_force(
+    conn, monkeypatch, tmp_path
+):
+    """Omission is the OTHER half of the contract, not an oversight.
+
+    Unset means the collector's own default, and for this channel that default
+    is what the timeout derivation assumes too, so the two agree. Sending the
+    flag anyway would be wrong for the cap in particular: the CLI's
+    positive_int refuses 0 at parse time, so a degraded "0" is a parse error
+    rather than a crawl-to-completion.
+    """
+    cmd, _ = _grid_cmd(monkeypatch, tmp_path, conn, "panoramax", _px_cfg())
+    assert "--panoramax-max-requests-per-minute" not in cmd
+    assert "--panoramax-jitter" not in cmd
+    assert "--panoramax-max-requests" not in cmd
+
+
+def test_a_gsv_grid_child_never_gets_the_panoramax_flags(conn, monkeypatch, tmp_path):
+    """Scoped to the channel that can honour them. Handing a GSV child
+    `--panoramax-jitter` is an argparse error, and a cap on a channel with no
+    checkpoint turns a bounded overrun into a half-collected grid."""
+    cfg = _px_cfg(rate=7, jitter=0.25)
+    cfg.providers["gsv"] = ProviderConfig(enabled=True)
+    cmd, _ = _grid_cmd(monkeypatch, tmp_path, conn, "gsv", cfg, request_cap=1234)
+    for flag in (
+        "--panoramax-max-requests-per-minute",
+        "--panoramax-jitter",
+        "--panoramax-max-requests",
+    ):
+        assert flag not in cmd
+
+
+def test_the_panoramax_walk_child_gets_the_same_three_flags(conn):
+    """The walk crawls the IDENTICAL z15 lattice whenever the pairing misses, so
+    a flag present on the grid side and absent here would make the two channels
+    pace, jitter or stop differently against one per-IP host.
+
+    The cap is the half that could not exist before this issue:
+    `collect_panoramax_street_samples_async` had no `max_requests` parameter at
+    all, so `CHANNEL_RESUMABLE["panoramax_streets"] = True` would have been a
+    claim nothing downstream honoured — the budget gate believing a night was
+    bounded by a stop nothing sends.
+    """
+    from streetscape_metadata_tracker.scheduler import _street_collect_cmd
+
+    city = db.resolve_city(conn, _register(conn, "Bend", width=1000, height=1000, step=20))
+    cfg = _px_cfg(rate=7, jitter=0.25)
+    cmd = _street_collect_cmd(cfg, city, date(2026, 7, 1), "panoramax_streets", 8, 9_000, 1_234)
+
+    assert cmd[cmd.index("--provider") + 1] == "panoramax"
+    assert cmd[cmd.index("--panoramax-max-requests-per-minute") + 1] == "7"
+    assert cmd[cmd.index("--panoramax-jitter") + 1] == "0.25"
+    assert cmd[cmd.index("--panoramax-max-requests") + 1] == "1234"
+    # A gate and a stop, with opposite subtraction conventions: --daily-budget
+    # is the FULL ceiling because this collector subtracts today's spend itself.
+    assert cmd[cmd.index("--daily-budget") + 1] == "9000"
+    # Never another provider's flags — an argparse error in the child.
+    assert "--mapillary-max-requests" not in cmd
+    assert "--kartaview-max-requests" not in cmd
+
+    plain = _street_collect_cmd(cfg, city, date(2026, 7, 1), "panoramax_streets", 8, 9_000)
+    assert "--panoramax-max-requests" not in plain, "unset still means crawl to completion"
+
+
+def test_a_panoramax_walk_reads_its_grid_siblings_cached_census_for_nothing(conn):
+    """The #290 pairing, which is the whole argument for the adjacent rank.
+
+    Both channels read ONE observation of one bbox. The cache keys on the
+    PROVIDER and merely records who paid, so the walk prices at 0 against an
+    entry the grid run stamped — and the budget gates this feeds (`est >
+    budget`, `used + est > budget`) would otherwise defer the cheapest channel
+    of the night on exactly the nights it matters.
+    """
+    from streetscape_metadata_tracker.scheduler import _channel_estimate
+
+    city = db.resolve_city(conn, _register(conn, "Bend", width=5000, height=5000, step=20))
+    cfg = _px_cfg()
+
+    assert _channel_estimate(cfg, city, "panoramax_streets", conn) > 0
+    _stamp_census_cache(city, "panoramax", fetched_by="panoramax")
+    assert _channel_estimate(cfg, city, "panoramax_streets", conn) == 0
+    # And the reverse direction, which production does too: a walk that paid
+    # first hands the grid run a free census.
+    assert _channel_estimate(cfg, city, "panoramax", conn) == 0
+
+
+def test_enroll_city_prices_a_panoramax_enrolment(conn, monkeypatch, tmp_path, capsys):
+    """The gate that would have gone missing silently.
+
+    `_enrolment_cost_note` was gated on `channel != "kartaview"` — written when
+    that was the only opt-in channel, and reading as a statement about WHICH
+    channel rather than about whether one can be priced. The operator seeing
+    the number IS the mitigation for #248's risk 1, and it would have been
+    absent exactly where the estimate is largest.
+
+    The KartaView-specific r=1000 caveat must NOT appear: a tile lattice is
+    recomputed from the frozen bbox on every call and has no equivalent
+    unknown, so printing it here would be a hedge rather than an error bar.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    cid = _register(conn, "Krabi", width=10000, height=10000, step=20)
+    cfg = _enroll_cfg(tmp_path, conn, monkeypatch)
+    cfg.providers["panoramax"] = ProviderConfig(enabled=True, max_requests_per_minute=30)
+
+    assert sched.cmd_enroll_city(cfg, cid, channel="panoramax") == 0
+    out = capsys.readouterr().out
+    city = db.resolve_city(conn, cid)
+    tiles = sched.estimate_requests(city, "panoramax", conn=conn)
+    assert f"~{tiles:,} requests" in out
+    assert "paced at 30/min" in out
+    assert "GEOMETRY estimate" not in out, "that caveat is KartaView's radius, not a lattice"
+    # Bare enrol works at all only because the channel is opt-in.
+    assert sched.is_opt_in_channel("panoramax")
+    assert db.get_channel_membership(conn, cid, "panoramax") == 1
+
+
+def test_a_default_membership_channel_is_still_not_priced_at_enrolment(
+    conn, monkeypatch, tmp_path, capsys
+):
+    """Widening the gate must not start pricing every channel.
+
+    `--remove --channel mapillary` reaches this same line, and a cost figure
+    there reads as a spend about to happen — the reason `_cmd_enroll_bulk`
+    stopped pricing its own inverse. So the gate is "opt-in AND priced as one
+    crawl", not "priced as one crawl".
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    cid = _register(conn, "Krabi", width=10000, height=10000, step=20)
+    cfg = _enroll_cfg(tmp_path, conn, monkeypatch)
+    cfg.providers["mapillary"] = ProviderConfig(enabled=True)
+
+    assert sched.cmd_enroll_city(cfg, cid, channel="mapillary", remove=True) == 0
+    assert "requests" not in capsys.readouterr().out
+
+
+def test_enroll_all_on_panoramax_is_dry_run_and_cheapest_first(conn, monkeypatch, tmp_path, capsys):
+    """`--all` behaves exactly as it does for kartaview, which is the point:
+    the guards are per-CHANNEL-CLASS (opt-in or not), never per channel name.
+
+    Dry-run until --execute because the blast radius is the catalog, and
+    cheapest-first because a city that finishes its crawl in one night never
+    writes a checkpoint and so never meets the 7-day age wall.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    small = _register(conn, "Bend", width=1000, height=1000, step=20)
+    big = _register(conn, "Metro", width=40000, height=40000, step=20)
+    cfg = _enroll_cfg(tmp_path, conn, monkeypatch)
+    cfg.providers["panoramax"] = ProviderConfig(enabled=True)
+
+    assert sched.cmd_enroll_city(cfg, None, channel="panoramax", all_cities=True) == 0
+    out = capsys.readouterr().out
+    assert "WOULD ENROL" in out
+    assert out.index(small) < out.index(big), "cheapest first"
+    assert db.get_channel_membership(conn, small, "panoramax") is None, "dry run writes nothing"
+
+    assert sched.cmd_enroll_city(cfg, None, channel="panoramax", all_cities=True, execute=True) == 0
+    assert db.get_channel_membership(conn, small, "panoramax") == 1
+
+
+def test_assess_city_refuses_an_opt_in_channel_and_says_what_it_does_collect(conn):
+    """The decision, pinned rather than left to be re-litigated.
+
+    assess-city's default path collects every ENABLED channel in
+    ASSESS_CHANNELS, so listing a Panoramax channel would pay a z15 tile census
+    on every assessment of a city with a 63.8% measured chance of holding no
+    Panoramax imagery — and would stamp last_success_at on a `member = 0` row
+    for a city nobody enrolled. So it exits 64 and names the way to get the
+    walk for one city.
+
+    The message is asserted, not only the refusal: it used to explain the GSV
+    grid run for every rejection, which answers a question an operator asking
+    for a Panoramax walk did not ask.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    cfg = _px_cfg()
+    cfg.providers["gsv_streets"] = ProviderConfig(enabled=True)
+    with pytest.raises(sched._UsageError) as excinfo:
+        sched._select_assess_channels(cfg, ["panoramax_streets"])
+    message = str(excinfo.value)
+    assert "gsv_streets" in message, "it has to say what assess-city DOES collect"
+    assert "run-due --provider panoramax_streets" in message
+    assert "GSV grid run" not in message
+    # The gsv rejection keeps its own, still-correct explanation.
+    cfg.providers["gsv"] = ProviderConfig(enabled=True)
+    with pytest.raises(sched._UsageError) as gsv_err:
+        sched._select_assess_channels(cfg, ["gsv"])
+    assert "GSV grid run" in str(gsv_err.value)
+
+
+def test_the_dry_run_prices_both_panoramax_channels_and_the_pairing(conn, monkeypatch, capsys):
+    """The preview is the one thing an operator reads BEFORE a night, and this
+    is the night a rollout actually runs: two channels, one city, one census.
+
+    Both are resumable, so neither takes the `est > budget` arm — the preview
+    must name the cap each child would get rather than reporting a deferral the
+    live path does not make. And the pairing has to be visible: the walk is
+    priced at 0 against the grid run's cached census, which is what makes
+    enrolling both nearly free and enrolling only the walk not.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    cid = _register(conn, "Bend", width=5000, height=5000, step=20)
+    city = db.resolve_city(conn, cid)
+    for channel in ("panoramax", "panoramax_streets"):
+        db.set_channel_membership(conn, cid, channel, True, cycle_days=90)
+    cfg = _px_cfg(rate=30, publish_enabled=False)
+
+    _stub_tail(monkeypatch, sched, conn, [])
+    monkeypatch.setattr(sched, "send_alert", lambda *a, **k: None)
+    sched.cmd_run_due(cfg, today=date(2026, 7, 2), dry_run=True)
+    preview = capsys.readouterr().out
+
+    tiles = sched.estimate_requests(city, "panoramax", conn=conn)
+    assert tiles > 0, "the fixture must cost something, or every line below is vacuous"
+    for channel in ("panoramax", "panoramax_streets"):
+        assert f"{channel:16s} ~{tiles:>9,} req" in preview, (
+            "each channel priced by the z15 lattice, both of them"
+        )
+    assert "OVER BUDGET" not in preview, "a resumable channel is launched capped, not deferred"
+
+    # A city the night cannot finish takes the CAPPED arm rather than the
+    # permanent skip — the inversion #274 made and the reason both channels had
+    # to be CHANNEL_RESUMABLE before they could be scheduled at all.
+    # 10 against this city's 42-tile lattice: over the launch floor (one tile's
+    # retry budget, 5), so the FLOOR arm cannot be what this is exercising, and
+    # under the estimate, so the night genuinely cannot finish the lattice.
+    lean = _px_cfg(rate=30, budget=10, publish_enabled=False)
+    assert 5 < 10 < tiles, "the fixture must sit between the floor and the estimate"
+    sched.cmd_run_due(lean, today=date(2026, 7, 2), dry_run=True)
+    capped = capsys.readouterr().out
+    assert "launch capped at 10; resumes" in capped
+    assert "OVER BUDGET" not in capped
+
+    # With the grid run's census already in the shared cache, the walk prices at
+    # 0 — the pairing, visible in the preview an operator sizes a tranche from.
+    _stamp_census_cache(city, "panoramax", fetched_by="panoramax")
+    sched.cmd_run_due(cfg, today=date(2026, 7, 2), dry_run=True)
+    cached = capsys.readouterr().out
+    assert f"panoramax_streets ~{0:>9,} req" in cached
+    assert "cached census from panoramax" in cached
+    assert "launch capped at" not in cached, "nothing is being crawled, so nothing is capped"
+
+
+def _missing_config_path():
+    """A path that certainly does not exist, for the loader's missing-file arm."""
+    import uuid
+
+    return f"/nonexistent-{uuid.uuid4().hex}/scheduler.toml"
+
+
+def test_enroll_city_survives_a_config_file_that_does_not_exist(conn, monkeypatch, capsys):
+    """A review predicted a crash here. It does not reproduce, and THAT is what
+    this pins — so the next reader does not re-file it.
+
+    The reasoning was: `load_scheduler_config` returns a bare `SchedulerConfig()`
+    for a missing file, `_enrolment_cost_note` reads `cfg.providers.get(...)`
+    unguarded, and every other site in the module writes `(cfg.providers or {})`
+    — so a missing config would `AttributeError` on `None`. The first step is
+    false: `SchedulerConfig.__post_init__` replaces a `None` `providers` with a
+    gsv-only dict, and `dataclasses.replace` re-runs it, so nothing in the repo
+    can hand this function a `None`.
+
+    The guard went in anyway (one spelling of the idiom across the module), and
+    this drives the real path end to end rather than asserting the guard's
+    presence: a non-existent config path, an opt-in channel, a cost note that
+    prints. A test that constructed `providers=None` by hand would be green
+    against a state the loader cannot produce — the mistake
+    `test_the_screen_paces_from_the_wired_channels_block` was rewritten for.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    cid = _register(conn, "Krabi", width=10000, height=10000, step=20)
+    cfg = sched.load_scheduler_config(_missing_config_path())
+    assert cfg.providers, "the loader fills a missing file's providers rather than leaving None"
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+
+    assert sched.cmd_enroll_city(cfg, cid, channel="panoramax") == 0
+    out = capsys.readouterr().out
+    assert "requests" in out, "the cost note still prints off a config with no panoramax block"
+    # And the rate it prices at is the collector's default, since no block
+    # configured one — the branch `pc is None` reaches.
+    from streetscape_metadata_tracker.download_panoramax import DEFAULT_TILE_REQUESTS_PER_MINUTE
+
+    assert f"paced at {DEFAULT_TILE_REQUESTS_PER_MINUTE}/min" in out
+
+
+def test_a_walk_enrolment_says_its_figure_is_the_unpaired_price(
+    conn, monkeypatch, tmp_path, capsys
+):
+    """The note contradicted the rollout advice it exists to support.
+
+    `estimate_requests` is cache-blind on purpose — it also feeds the timeout,
+    where a 0 would collapse a child onto the flat floor — so a walk's line is
+    the FULL crawl even when the pairing will hand it that census for nothing
+    (#290). Printed bare, it makes enrolling the pair look like paying twice
+    when the second channel is the free one.
+
+    Both branches, because the sibling's membership is the fact that decides
+    which case the city is in and it is the operator's lever, not the cache's:
+    a cache entry describes a past night, an enrolment describes every future
+    one.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    cid = _register(conn, "Krabi", width=10000, height=10000, step=20)
+    cfg = _enroll_cfg(tmp_path, conn, monkeypatch)
+    cfg.providers["panoramax"] = ProviderConfig(enabled=True)
+    cfg.providers["panoramax_streets"] = ProviderConfig(enabled=True)
+
+    assert sched.cmd_enroll_city(cfg, cid, channel="panoramax_streets") == 0
+    unpaired = capsys.readouterr().out
+    assert "UNPAIRED walk pays" in unpaired
+    assert "panoramax is NOT a member" in unpaired
+
+    # Enrol the grid sibling and the same command now says to expect 0.
+    assert sched.cmd_enroll_city(cfg, cid, channel="panoramax") == 0
+    capsys.readouterr()
+    assert sched.cmd_enroll_city(cfg, cid, channel="panoramax_streets") == 0
+    paired = capsys.readouterr().out
+    assert "panoramax is already a member, so expect 0" in paired
+
+    # The GRID channel's own note never carries the pairing line: it is the one
+    # that pays, so telling it about a free night would be the same error in
+    # the other direction.
+    assert sched.cmd_enroll_city(cfg, cid, channel="panoramax") == 0
+    assert "UNPAIRED walk pays" not in capsys.readouterr().out
+
+
+def test_the_kartaview_walk_is_priced_at_enrolment_too(conn, monkeypatch, tmp_path, capsys):
+    """A BEHAVIOUR CHANGE on an existing channel, pinned because it had no test.
+
+    `_enrolment_cost_note`'s old `channel != "kartaview"` gate meant
+    `kartaview_streets` — an opt-in channel since #258, with a real per-city
+    cost — printed nothing at enrolment. Widening the gate for Panoramax (#335)
+    gave it a note as a side effect, which is the right outcome and exactly the
+    kind of neighbouring change that ships unnoticed.
+
+    It gets the radius sweep's vocabulary, not the tile lattice's: the 1.80x
+    overhead multiplier and the r=1000 NOTE, because both channels read the
+    same sweep and `_crawl_pricing` maps the walk to its provider.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    cid = _register(conn, "Krabi", width=10000, height=10000, step=20)
+    cfg = _enroll_cfg(tmp_path, conn, monkeypatch)
+
+    assert sched.cmd_enroll_city(cfg, cid, channel="kartaview_streets") == 0
+    out = capsys.readouterr().out
+    assert "requests at 1.80x overhead" in out, "the sweep's vocabulary, not a lattice's"
+    assert "GEOMETRY estimate" in out, "and the r=1000 caveat, since this reads that sweep"
+    assert "paced at 16/min" in out
+    # And the pairing line, naming its own grid sibling rather than Panoramax's.
+    assert "kartaview is NOT a member" in out
