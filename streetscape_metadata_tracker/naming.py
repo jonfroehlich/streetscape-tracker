@@ -383,6 +383,45 @@ STREETWALK_MARKER = "streetwalk"
 
 DEFAULT_NETWORK_TYPE = "drive"
 
+
+# The frozen OSM street network (issues #24/#103): one unpublished GraphML per
+# (city, network type) under data/osm_cache/. Named here rather than in the
+# module that fetches it so the scheduler can ask "is this city's network
+# already frozen?" without importing osmnx (issue #341) -- a walk on a frozen
+# network never contacts Overpass, which is what makes the question worth
+# asking while the Overpass breaker is latched.
+
+
+def osm_cache_dir(data_dir: str) -> str:
+    """Directory of the frozen GraphML networks (unpublished: the rsync whitelist skips it)."""
+    return os.path.join(data_dir, "osm_cache")
+
+
+def network_cache_filename(city_id: str, network_type: str = DEFAULT_NETWORK_TYPE) -> str:
+    """
+    GraphML basename for a city's frozen street network.
+
+    The default 'drive' network keeps the original un-suffixed name so the
+    caches (and catalog rows) predating network_type stay valid; other types
+    (issue #99's 'walk'/'all') get an explicit suffix.
+
+        >>> network_cache_filename("bend--or")
+        'bend--or_streets_network.graphml'
+        >>> network_cache_filename("bend--or", "walk")
+        'bend--or_streets_network_walk.graphml'
+    """
+    if network_type == DEFAULT_NETWORK_TYPE:
+        return f"{city_id}_streets_network.graphml"
+    return f"{city_id}_streets_network_{network_type}.graphml"
+
+
+def network_cache_path(
+    city_id: str, data_dir: str, network_type: str = DEFAULT_NETWORK_TYPE
+) -> str:
+    """Unpublished GraphML path for a city's frozen street network."""
+    return os.path.join(osm_cache_dir(data_dir), network_cache_filename(city_id, network_type))
+
+
 # osmnx network type -> filename token. Underscore is the field separator in
 # this naming scheme, so tokens strip it ('all_public' -> 'allpublic'). The
 # default type maps to the empty string and emits nothing.

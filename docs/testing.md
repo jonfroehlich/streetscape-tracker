@@ -386,6 +386,33 @@ and the **per-writer staging name** — that two pids derive different paths, th
   — one refusal skips that host's channels, only channels that need it, **no** `record_attempt` on a skip, five consecutive blocked nights leaving the city still returned by `get_due_cities`,
   a blocked night alerting below the failure threshold while still publishing, the same for a busy night but with a subject that does **not** claim the provider refused us,
   a busy exit leaving the *next* city's same channel still attempted, and `CHANNEL_HOSTS` covering every scheduled channel since it is read with a fail-open `.get`)
+- The breaker's cooldown re-check (issue #341, `tests/test_scheduler.py` and `tests/test_overpass.py`): a refusal that clears inside the cooldown resumes street channels **the same night**, pinned as the exact launch sequence across three cities with the cooldown at 0 and a probe answering *no, no, yes*
+  — and as one probe call per re-check, none once recovered;
+  the reset predicate `overpass_serving` is **fail-closed** — True only on a 200 with a slots line (a queued slot counts), False for every non-200 tried (403/429/509/406/500/502/503/504), for connection refused and a timeout (the 2026-08-14 ban signature), for an empty, HTML or slots-less 200 body, and it is one request with no retry, sending our UA and Referer rather than the 406-triggering `python-requests` default, at the same endpoint osmnx is told (`DEFAULT_OVERPASS_URL == ox.settings.overpass_url`, and the `OVERPASS_URL` mirror reaching both);
+  at the breaker a raising probe keeps the host latched and still spends its slot;
+  re-checks are single, **spaced from the last failed re-check rather than the trip**, and capped however far a hand-driven clock moves, while a latched host nothing asks about is never probed;
+  a host with no entry in `HOST_RECHECKS` (Mapillary) stays latched all night, and the table is pinned to Overpass alone with the fail-closed predicate rather than the fail-open pre-flight;
+  a recovered host that refuses again re-latches with the trip count and monotone membership saying so;
+  a walk whose GraphML is frozen for the channel's `network_type` is launched under a latched Overpass (an `all_public` cache does not stand in for the `drive` walk) and the exemption relaxes **only** the Overpass entry, so a latched tile CDN still skips the Mapillary walk;
+  the `Done:` line counts and the alert names the stranded cities — the refused child's own city and the breaker-skipped ones, never a city whose grid run failed — with the `run-due --provider gsv_streets --limit N` recovery, and stranding is decided after the city drains;
+  a plain `set` handed to `_finish_batch` still alerts `UNAVAILABLE` as an all-night latch;
+  a **busy** exit (80) on a walk whose grid sibling landed is stranded and named exactly like a refusal, with the subject saying `SKIPPED (host busy)` and `STRANDED`;
+  a skipped two-host channel launch counts **once** in the summary and alert while the per-host counter still attributes it to both;
+  a frozen-network walk under a latched Overpass spends **no** re-check (the probe is asked only once a cold walk wants the host);
+  `update`/`discard`/`remove`/`clear`/`pop`/`copy`/`|=` on the breaker raise rather than desync it;
+  `Rate limit: 0` with no slots line reads as serving while `Rate limit: 2` with no slots line does not;
+  `fetch_graph` writes the GraphML to a `.tmp` and renames, so a save that dies leaves no frozen network and a save that lands leaves no `.tmp`;
+  and the constants are pinned at 45 min and 4 per night.
+  The suite-wide autouse `_no_host_recheck_probe` pins every `HOST_RECHECKS` entry to "still refusing", so recovery is something a test asks for by overriding it, never something the network granted.
+- `scripts/prefreeze_street_networks.py` (`tests/test_prefreeze_street_networks.py`, issue #341): dry-run by default and fetching nothing;
+  `--execute` fetching only the **cold** networks of the night's cap, in slate order, one pause *between* fetches and never a trailing one;
+  `--nights` widening the window and `--limit` capping the pass;
+  each channel's `network_type` frozen separately with two channels on one type sharing a fetch;
+  a city not due tonight not fetched (the slate is `_collect_due`'s, not "every city without a network");
+  a blocked or busy host stopping the pass with that host's exit code (76/80) after one fetch, while a city-specific `DownloadError` does not stop it;
+  an in-flight `run-due` refusing `--execute` unless `--force`, while a dry run never asks, and a `run-due` that appears **mid-pass** stopping it after the fetch in hand;
+  no enabled street channel meaning nothing to freeze; bad flags exiting usage; and the default date being tomorrow UTC.
+- `collect --estimate` on a cold city says the network **was** fetched from Overpass and frozen, on a frozen one says no requests were issued, with `--refresh` on a frozen one says it was re-fetched, and with `--refresh` on a cold one still says fetched, never re-fetched (issue #341).
 
 - Request jitter (issue #292: the spaced pacer sleeps exactly the **shifted exponential** of the injected draw — floor `(1 − j) × mean` plus `j × mean × draw` — keeps the configured **mean** rate and reaches `CV = jitter` over 20,000 real draws, has no burst credit after an idle, exceeds the old uniform draw's hard ceiling (the property the change exists for), `jitter = 0` never draws randomness and sleeps exactly as the bucket did, disabled pacing ignores it, and `[1, ∞)` or a negative is refused by the class, the shared `jitter_fraction` argparse type and `coerce_jitter` alike;
   the census builds its limiter with **the jitter and rate it was given**, not merely with the defaults — the mutation that hardcodes the module default at the construction site must fail, since `--mapillary-jitter 0` is this experiment's control arm;

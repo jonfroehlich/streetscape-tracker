@@ -70,6 +70,9 @@ _REAL_DRIVING_PLAN_HOOK = _sched._fetch_driving_plan_nightly
 _REAL_WRITE_BACKUP = _sched.catalog_backup.write_backup
 _REAL_BACKUP_HOOK = _sched._backup_catalog_nightly
 _REAL_PLAN_SUMMARY = _sched.generate_driving_plan_summary
+# The breaker re-check table (issue #341), saved before conftest's autouse
+# `_no_host_recheck_probe` pins every entry to "still refusing".
+_REAL_HOST_RECHECKS = dict(_sched.HOST_RECHECKS)
 
 
 @pytest.fixture(autouse=True)
@@ -9593,7 +9596,7 @@ def _lane_city(conn, name="Bend"):
 def _run_channels(sched, cfg, conn, city, providers, **overrides):
     """Drive _run_city_channels directly, with the batch's arguments defaulted."""
     kwargs = dict(
-        blocked_hosts=set(),
+        blocked_hosts=sched.HostBreaker(),
         busy_hosts=Counter(),
         deferred_channels=Counter(),
         batch_deadline=None,
@@ -9839,7 +9842,7 @@ def test_a_mapillary_block_at_knob_3_still_means_mapillary_streets_is_never_subm
             _blocked_outcome(HOST_MAPILLARY_TILES) if provider == "mapillary" else True
         ),
     )
-    blocked: set[str] = set()
+    blocked = _sched.HostBreaker()
 
     with caplog.at_level(logging.INFO):
         attempted, succeeded, skipped = _run_channels(
@@ -9885,7 +9888,7 @@ def test_a_busy_exit_at_knob_3_skips_one_channel_without_poisoning_the_lanes(con
             _busy_outcome(HOST_MAPILLARY_TILES) if provider == "mapillary" else True
         ),
     )
-    blocked: set[str] = set()
+    blocked = _sched.HostBreaker()
     busy: Counter[str] = Counter()
 
     attempted, succeeded, skipped = _run_channels(
@@ -10159,7 +10162,7 @@ def test_a_MAIN_thread_error_also_drains_the_siblings_and_still_trips_the_breake
             True if provider == "gsv" else _blocked_outcome(HOST_OVERPASS)
         ),
     )
-    blocked: set[str] = set()
+    blocked = _sched.HostBreaker()
 
     with pytest.raises(sqlite3.OperationalError, match="database is locked"):
         _run_channels(
@@ -10846,6 +10849,528 @@ def test_each_tile_census_prices_its_pace_from_its_own_default_rate(monkeypatch)
         _crawl_pricing("mapillary").default_rate
         == download_mapillary.DEFAULT_TILE_REQUESTS_PER_MINUTE
     )
+
+
+# ---------------------------------------------------------------------------
+# The breaker re-checks on a cooldown, and names what it stranded (issue #341)
+#
+# Before #341 a refusal latched for the whole night. Two Overpass refusals
+# (2026-09-13, 09-15) each cleared within about an hour and stranded 20 cities
+# between them: every skipped city's GSV grid run had succeeded, so it left the
+# night with a grid snapshot and no walk, not gsv-due again for ~83 days, and
+# nothing counted it as a failure. These pin the four changes: a spaced,
+# capped, fail-closed re-check that resumes street channels the same night; a
+# latch that never re-checks a host with no positive reset test; a skip that
+# spares a walk whose network is already frozen; and a Done line + alert that
+# name the stranded cities.
+# ---------------------------------------------------------------------------
+
+
+def _recovering_probe(answers):
+    """A re-check that answers the given sequence, then keeps answering the last."""
+    answers = list(answers)
+    calls = []
+
+    def probe():
+        calls.append(1)
+        return answers.pop(0) if len(answers) > 1 else answers[0]
+
+    probe.calls = calls
+    return probe
+
+
+def _drive_night(monkeypatch, conn, cfg, run_one, today=date(2026, 7, 2)):
+    """_run_loop_with, but returning the alert and the log-visible summary too."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    alerts = []
+    monkeypatch.setattr(
+        sched,
+        "_run_one_city",
+        lambda cfg, city, today, provider="gsv", connection_limit=None, daily_budget=0, conn=None, remaining_s=None, **_: (
+            run_one(city, provider)
+        ),
+    )
+    _stub_tail(monkeypatch, sched, conn, [])
+    monkeypatch.setattr(
+        sched, "send_alert", lambda cfg, subject, body: alerts.append((subject, body))
+    )
+    monkeypatch.setattr(sched, "_recent_log_tail", lambda cfg, n=40: "")
+    rc = sched.cmd_run_due(cfg, today=today)
+    return rc, alerts
+
+
+def test_the_recheck_constants_are_the_documented_ones():
+    """45 min sits inside the ~1 h both measured Overpass refusals took to clear;
+    4 re-checks bound a night to the first three hours after a trip. Changing
+    either is a pacing decision (CLAUDE.md's READ THIS FIRST), not a tune-up."""
+    assert _sched.HOST_RECHECK_COOLDOWN_S == 45 * 60
+    assert _sched.HOST_RECHECKS_PER_NIGHT == 4
+
+
+def test_only_overpass_has_a_reset_test():
+    """A host with no entry keeps the original all-night latch. That is the
+    deliberate answer for Mapillary's tile CDN (a block lasts ~24 h and
+    re-probing it is the retry hazard the forum warned about) and for
+    KartaView and Panoramax, for which no positive reset signal has been
+    measured. Adding one is a decision to record in HOST_RECHECKS' comment."""
+    from streetscape_metadata_tracker.download_common import HOST_OVERPASS, overpass_serving
+
+    assert set(_sched.HOST_RECHECKS) == {HOST_OVERPASS}
+    # Pinned to the fail-CLOSED predicate, never to the fail-open pre-flight.
+    # (conftest swaps the entry for the suite, so compare against the saved
+    # original rather than the live dict.)
+    assert _REAL_HOST_RECHECKS[HOST_OVERPASS] is overpass_serving
+
+
+def test_a_refusal_that_clears_inside_the_cooldown_resumes_street_channels_the_same_night(
+    conn, monkeypatch, caplog
+):
+    """The headline behaviour. Cooldown 0 so every ask re-checks; the probe says
+    'not yet' twice and then 'serving'. Channels run gsv, gsv_streets,
+    mapillary, mapillary_streets per city, so the sequence of re-checks is
+    fully determined by the launch order."""
+    from streetscape_metadata_tracker.download_common import HOST_OVERPASS
+
+    monkeypatch.setattr(_sched, "HOST_RECHECK_COOLDOWN_S", 0)
+    probe = _recovering_probe([False, False, True])
+    monkeypatch.setitem(_sched.HOST_RECHECKS, HOST_OVERPASS, probe)
+
+    for name in ("Alpha", "Beta", "Gamma"):
+        _register(conn, name, width=1000, height=1000, step=20)
+
+    ran = []
+    tripped = []
+
+    def run_one(city, provider):
+        ran.append((city.city_id.split("--")[0], provider))
+        if provider == "gsv_streets" and not tripped:
+            tripped.append(city.city_id)
+            return _blocked_outcome(HOST_OVERPASS)
+        return True
+
+    with caplog.at_level(logging.INFO):
+        rc, alerts = _drive_night(
+            monkeypatch,
+            conn,
+            _street_cfg(
+                publish_enabled=False, alerts=AlertConfig(enabled=True, failure_threshold=99)
+            ),
+            run_one,
+        )
+
+    assert ran == [
+        ("alpha", "gsv"),
+        ("alpha", "gsv_streets"),  # the refusal: trips the breaker
+        ("alpha", "mapillary"),
+        # alpha/mapillary_streets: re-check 1 -> not serving -> skipped
+        ("beta", "gsv"),
+        # beta/gsv_streets: re-check 2 -> not serving -> skipped
+        ("beta", "mapillary"),
+        ("beta", "mapillary_streets"),  # re-check 3 -> serving -> resumed
+        ("gamma", "gsv"),
+        ("gamma", "gsv_streets"),  # no longer latched: no further re-check
+        ("gamma", "mapillary"),
+        ("gamma", "mapillary_streets"),
+    ]
+    assert len(probe.calls) == 3, "one request per re-check, none once recovered"
+
+    # The night is still unhealthy -- a refusal cost it launches and stranded
+    # cities -- but the subject says the host recovered rather than that it is
+    # unavailable, since the operator's next move differs (nothing to wait out).
+    assert rc == 1
+    ((subject, body),) = alerts
+    assert "UNAVAILABLE" not in subject
+    assert "1 host(s) REFUSED then recovered" in subject
+    assert "resumed from the re-check that cleared it" in body
+    done = [r.message for r in caplog.records if r.message.startswith("Done: ")]
+    assert done and "refused this host then recovered on re-check" in done[0]
+    assert "2 launch(es) skipped while latched" in done[0]
+
+
+def test_the_reset_test_is_fail_closed_at_the_breaker(monkeypatch):
+    """A probe that raises, or answers anything falsy, keeps the host latched
+    and still spends its re-check slot -- an exception is not a reason to ask
+    again sooner."""
+    from streetscape_metadata_tracker.download_common import HOST_OVERPASS
+
+    def boom():
+        raise RuntimeError("DNS exploded")
+
+    monkeypatch.setitem(_sched.HOST_RECHECKS, HOST_OVERPASS, boom)
+    breaker = _sched.HostBreaker(cooldown_s=0, max_rechecks=2)
+    breaker.trip(HOST_OVERPASS)
+    assert breaker.blocking((HOST_OVERPASS,)) == {HOST_OVERPASS}
+    assert breaker.rechecks[HOST_OVERPASS] == 1
+    assert breaker.latched == {HOST_OVERPASS}
+    assert breaker.recovered == set()
+
+
+def test_rechecks_are_single_spaced_and_capped(monkeypatch):
+    """Pinned against a hand-driven clock: nothing is asked before the cooldown
+    has elapsed since the trip or the last failed re-check, each due ask is
+    exactly one probe call, and after the cap nothing is ever asked again --
+    however far the clock moves and however many launches want the host."""
+    from streetscape_metadata_tracker.download_common import HOST_OVERPASS
+
+    probe = _recovering_probe([False])
+    monkeypatch.setitem(_sched.HOST_RECHECKS, HOST_OVERPASS, probe)
+    now = {"t": 1000.0}
+    breaker = _sched.HostBreaker(cooldown_s=100, max_rechecks=3, clock=lambda: now["t"])
+    breaker.trip(HOST_OVERPASS)
+
+    for t in (1000.0, 1050.0, 1099.9):
+        now["t"] = t
+        assert breaker.blocking((HOST_OVERPASS,)) == {HOST_OVERPASS}
+        assert probe.calls == [], f"asked before the cooldown at t={t}"
+
+    now["t"] = 1100.0
+    breaker.blocking((HOST_OVERPASS,))
+    assert len(probe.calls) == 1
+    now["t"] = 1150.0
+    breaker.blocking((HOST_OVERPASS,))
+    assert len(probe.calls) == 1, "spaced from the LAST failed re-check, not the trip"
+    now["t"] = 1200.0
+    breaker.blocking((HOST_OVERPASS,))
+    now["t"] = 1300.0
+    breaker.blocking((HOST_OVERPASS,))
+    assert len(probe.calls) == 3
+    for t in (1400.0, 5000.0, 1e9):
+        now["t"] = t
+        assert breaker.blocking((HOST_OVERPASS,)) == {HOST_OVERPASS}
+    assert len(probe.calls) == 3, "capped per night"
+    assert breaker.rechecks[HOST_OVERPASS] == 3
+
+    # A host nothing asks about is never probed, however latched: the
+    # re-check is spent only when a launch actually wants the host.
+    other = _sched.HostBreaker(cooldown_s=0, max_rechecks=3, clock=lambda: 0.0)
+    other.trip(HOST_OVERPASS)
+    other.blocking(())
+    assert other.rechecks[HOST_OVERPASS] == 0
+
+
+def test_a_host_with_no_reset_test_stays_latched_all_night(monkeypatch):
+    from streetscape_metadata_tracker.download_common import HOST_MAPILLARY_TILES
+
+    breaker = _sched.HostBreaker(cooldown_s=0, max_rechecks=99, clock=lambda: 1e12)
+    breaker.trip(HOST_MAPILLARY_TILES)
+    for _ in range(5):
+        assert breaker.blocking((HOST_MAPILLARY_TILES,)) == {HOST_MAPILLARY_TILES}
+    assert breaker.rechecks[HOST_MAPILLARY_TILES] == 0
+    assert breaker.recovered == set()
+
+
+def test_a_recovered_host_that_refuses_again_re_latches(monkeypatch):
+    """Recovery is not amnesty: a later child refused by the same host trips it
+    again, the trip count says so, and the re-check budget keeps counting."""
+    from streetscape_metadata_tracker.download_common import HOST_OVERPASS
+
+    monkeypatch.setitem(_sched.HOST_RECHECKS, HOST_OVERPASS, _recovering_probe([True]))
+    breaker = _sched.HostBreaker(cooldown_s=0, max_rechecks=4)
+    breaker.trip(HOST_OVERPASS)
+    assert breaker.blocking((HOST_OVERPASS,)) == set()
+    assert breaker.recovered == {HOST_OVERPASS}
+    breaker.trip(HOST_OVERPASS)
+    assert breaker.latched == {HOST_OVERPASS}
+    assert breaker.recovered == set()
+    assert breaker.trips[HOST_OVERPASS] == 2
+    assert breaker == {HOST_OVERPASS}, "membership is monotone: refused tonight"
+
+
+def test_a_walk_whose_network_is_frozen_is_not_skipped_by_a_latched_overpass(
+    conn, monkeypatch, tmp_path, caplog
+):
+    """fetch_graph returns a frozen GraphML before it takes the Overpass lock or
+    probes, so that walk is not an Overpass request and the breaker has no
+    reason to skip it. Keyed on the channel's network_type."""
+    from streetscape_metadata_tracker.download_common import HOST_OVERPASS
+    from streetscape_metadata_tracker.naming import network_cache_path
+
+    alpha = _register(conn, "Alpha", width=1000, height=1000, step=20)
+    beta = _register(conn, "Beta", width=1000, height=1000, step=20)
+    gamma = _register(conn, "Gamma", width=1000, height=1000, step=20)
+    # Beta's drive network is frozen; Gamma has only an all_public one, which
+    # says nothing about the 'drive' walk the channel is configured for.
+    for cid, network_type in ((beta, "drive"), (gamma, "all_public")):
+        path = network_cache_path(cid, str(tmp_path), network_type)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        open(path, "w").close()
+
+    ran = []
+
+    def run_one(city, provider):
+        ran.append((city.city_id.split("--")[0], provider))
+        if provider == "gsv_streets" and city.city_id == alpha:
+            return _blocked_outcome(HOST_OVERPASS)
+        return True
+
+    cfg = _street_cfg(publish_enabled=False, data_dir=str(tmp_path))
+    with caplog.at_level(logging.INFO):
+        _drive_night(monkeypatch, conn, cfg, run_one)
+
+    walks = [(c, p) for c, p in ran if p.endswith("_streets")]
+    assert walks == [
+        ("alpha", "gsv_streets"),  # the refusal
+        ("beta", "gsv_streets"),  # frozen: launched despite the latch
+        ("beta", "mapillary_streets"),  # same network, same exemption
+    ], walks
+    assert "street network is already frozen" in caplog.text
+    # Gamma's frozen all_public network does not stand in for the drive walk.
+    assert ("gamma", "gsv_streets") not in ran
+
+
+def test_the_frozen_exemption_relaxes_only_the_overpass_entry(conn, monkeypatch, tmp_path):
+    """A Mapillary walk needs Overpass AND the tile CDN. A frozen network spares
+    it the first; a latched tile CDN still skips it."""
+    from streetscape_metadata_tracker.download_common import HOST_MAPILLARY_TILES, HOST_OVERPASS
+    from streetscape_metadata_tracker.naming import network_cache_path
+
+    alpha = _register(conn, "Alpha", width=1000, height=1000, step=20)
+    beta = _register(conn, "Beta", width=1000, height=1000, step=20)
+    path = network_cache_path(beta, str(tmp_path), "drive")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    open(path, "w").close()
+
+    ran = []
+
+    def run_one(city, provider):
+        ran.append((city.city_id.split("--")[0], provider))
+        if city.city_id == alpha and provider == "gsv_streets":
+            return _blocked_outcome(HOST_OVERPASS)
+        if city.city_id == alpha and provider == "mapillary":
+            return _blocked_outcome(HOST_MAPILLARY_TILES)
+        return True
+
+    _drive_night(
+        monkeypatch, conn, _street_cfg(publish_enabled=False, data_dir=str(tmp_path)), run_one
+    )
+
+    assert ("beta", "gsv_streets") in ran, "Overpass relaxed by the frozen network"
+    assert ("beta", "mapillary_streets") not in ran, "the tile CDN is still latched"
+    assert ("beta", "mapillary") not in ran
+
+
+def test_the_done_line_counts_and_the_alert_names_the_stranded_cities(conn, monkeypatch, caplog):
+    """Stranded = a walk a refused host cost the city (its own refused child, or
+    a breaker skip) whose grid sibling landed tonight. 'host(s) UNAVAILABLE'
+    was true on 09-13 and 09-15 and said nothing about the 4, then 16, cities
+    with no route back for ~83 days."""
+    from streetscape_metadata_tracker.download_common import HOST_OVERPASS
+
+    alpha = _register(conn, "Alpha", width=1000, height=1000, step=20)
+    beta = _register(conn, "Beta", width=1000, height=1000, step=20)
+    gamma = _register(conn, "Gamma", width=1000, height=1000, step=20)
+
+    def run_one(city, provider):
+        # Gamma's grid run fails, so Gamma stays gsv-due and is NOT stranded.
+        if provider == "gsv" and city.city_id == gamma:
+            return False
+        if provider == "gsv_streets" and city.city_id == alpha:
+            return _blocked_outcome(HOST_OVERPASS)
+        return True
+
+    cfg = SchedulerConfig(
+        providers={
+            "gsv": ProviderConfig(enabled=True, daily_request_budget=10_000_000),
+            "gsv_streets": ProviderConfig(enabled=True, daily_request_budget=2_000_000),
+        },
+        publish_enabled=False,
+        alerts=AlertConfig(enabled=True, failure_threshold=99),
+    )
+    with caplog.at_level(logging.INFO):
+        rc, alerts = _drive_night(monkeypatch, conn, cfg, run_one)
+
+    assert rc == 1
+    done = [r.message for r in caplog.records if r.message.startswith("Done: ")]
+    assert done and "2 city(ies) STRANDED un-walked by the breaker" in done[0]
+    ((subject, body),) = alerts
+    assert "1 host(s) UNAVAILABLE" in subject, "never recovered: still latched"
+    assert "2 city(ies) STRANDED un-walked" in subject
+    assert f"{alpha} (gsv_streets)" in body
+    assert f"{beta} (gsv_streets)" in body
+    assert gamma not in body.split("came out of the night")[1], "its grid run failed; it stays due"
+    assert "run-due --provider gsv_streets --limit N" in body
+    assert "~83 days" in body
+    # STRANDED lines are WARNINGs in the log, one per lost walk.
+    stranded_lines = [
+        r for r in caplog.records if "STRANDED" in r.message and r.levelno == logging.WARNING
+    ]
+    assert {r.message.split(" ")[0] for r in stranded_lines} == {alpha, beta}
+
+
+def test_stranding_is_decided_after_the_city_drains(conn, monkeypatch):
+    """With lanes the grid sibling may still be in flight when the walk is
+    skipped, so the record is written once the city is quiet. Driven through
+    _run_city_channels directly with the breaker pre-latched."""
+    from streetscape_metadata_tracker import scheduler as sched
+    from streetscape_metadata_tracker.download_common import HOST_OVERPASS
+
+    city = _lane_city(conn)
+    blocked = sched.HostBreaker()
+    blocked.trip(HOST_OVERPASS)
+
+    monkeypatch.setattr(sched, "_run_one_city", lambda cfg, c, today, provider="gsv", **kw: True)
+    _run_channels(
+        sched,
+        _street_cfg(),
+        conn,
+        city,
+        ["gsv", "gsv_streets", "mapillary", "mapillary_streets"],
+        blocked_hosts=blocked,
+    )
+
+    assert blocked.stranded == {city.city_id: ["gsv_streets", "mapillary_streets"]}
+    assert blocked.skipped[HOST_OVERPASS] == 2
+    assert blocked.skipped_launches == 2
+
+
+def test_a_busy_host_strands_a_city_exactly_like_a_refusal(conn, monkeypatch, caplog):
+    """An exit-80 walk skip does not trip the breaker, but the city still leaves
+    the night with a grid run and no walk. The lock's other holder is most
+    often our own daytime pre-freeze pass overrunning into the timer, which is
+    what makes this the failure #341 is about, reached by the PR's own tool."""
+    from streetscape_metadata_tracker.download_common import HOST_OVERPASS
+
+    alpha = _register(conn, "Alpha", width=1000, height=1000, step=20)
+    beta = _register(conn, "Beta", width=1000, height=1000, step=20)
+
+    def run_one(city, provider):
+        if provider == "gsv_streets" and city.city_id == alpha:
+            return _busy_outcome(HOST_OVERPASS)
+        return True
+
+    cfg = SchedulerConfig(
+        providers={
+            "gsv": ProviderConfig(enabled=True, daily_request_budget=10_000_000),
+            "gsv_streets": ProviderConfig(enabled=True, daily_request_budget=2_000_000),
+        },
+        publish_enabled=False,
+        alerts=AlertConfig(enabled=True, failure_threshold=99),
+    )
+    with caplog.at_level(logging.INFO):
+        rc, alerts = _drive_night(monkeypatch, conn, cfg, run_one)
+
+    assert rc == 1
+    done = [r.message for r in caplog.records if r.message.startswith("Done: ")]
+    assert done and "1 city(ies) STRANDED un-walked by the breaker" in done[0]
+    ((subject, body),) = alerts
+    assert "SKIPPED (host busy)" in subject
+    assert "1 city(ies) STRANDED un-walked" in subject
+    assert "UNAVAILABLE" not in subject, "a busy lock is not the provider refusing us"
+    assert f"{alpha} (gsv_streets)" in body
+    assert beta not in body.split("came out of the night")[1]
+    assert "refused or locally busy host" in body
+
+
+def test_a_two_host_channel_skip_counts_one_launch(conn, monkeypatch):
+    """mapillary_streets needs Overpass AND the tile CDN. With both latched its
+    one skipped launch is attributed to both hosts for the recovery log line,
+    but the summary and alert count launches, not host-attributions."""
+    from streetscape_metadata_tracker import scheduler as sched
+    from streetscape_metadata_tracker.download_common import HOST_MAPILLARY_TILES, HOST_OVERPASS
+
+    city = _lane_city(conn)
+    blocked = sched.HostBreaker()
+    blocked.trip(HOST_OVERPASS)
+    blocked.trip(HOST_MAPILLARY_TILES)
+    monkeypatch.setattr(sched, "_run_one_city", lambda cfg, c, today, provider="gsv", **kw: True)
+    _run_channels(sched, _street_cfg(), conn, city, ["mapillary_streets"], blocked_hosts=blocked)
+
+    assert blocked.skipped == {HOST_OVERPASS: 1, HOST_MAPILLARY_TILES: 1}
+    assert blocked.skipped_launches == 1
+    assert "1 launch(es) skipped while latched" in sched._blocked_summary_note(blocked)
+    assert "1 channel launch(es) were skipped in all" in sched._blocked_alert_note(blocked)
+
+
+def test_a_frozen_walk_spends_no_recheck(conn, monkeypatch, tmp_path):
+    """A re-check is spent only when a launch actually wants the host. A walk on
+    a frozen network does not want Overpass, so it must not be the launch that
+    asks -- Overpass leaves the wanted set before `blocking` is called."""
+    from streetscape_metadata_tracker import scheduler as sched
+    from streetscape_metadata_tracker.download_common import HOST_OVERPASS
+    from streetscape_metadata_tracker.naming import network_cache_path
+
+    probe = _recovering_probe([False])
+    monkeypatch.setitem(sched.HOST_RECHECKS, HOST_OVERPASS, probe)
+    frozen = _lane_city(conn, "Frozen")
+    cold = _lane_city(conn, "Cold")
+    path = network_cache_path(frozen.city_id, str(tmp_path), "drive")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    open(path, "w").close()
+
+    blocked = sched.HostBreaker(cooldown_s=0)
+    blocked.trip(HOST_OVERPASS)
+    ran = []
+    monkeypatch.setattr(
+        sched,
+        "_run_one_city",
+        lambda cfg, c, today, provider="gsv", **kw: ran.append((c.city_id, provider)) or True,
+    )
+    cfg = _street_cfg(data_dir=str(tmp_path))
+    _run_channels(sched, cfg, conn, frozen, ["gsv_streets"], blocked_hosts=blocked)
+    assert ran == [(frozen.city_id, "gsv_streets")]
+    assert probe.calls == [], "the frozen walk never wanted Overpass"
+
+    _run_channels(sched, cfg, conn, cold, ["gsv_streets"], blocked_hosts=blocked)
+    assert len(probe.calls) == 1, "the cold walk is the one that asks"
+    assert ran == [(frozen.city_id, "gsv_streets")]
+
+
+def test_the_breaker_refuses_every_set_operation_that_would_desync_it():
+    """`update` would add a host without latching it; `discard`/`clear` would
+    drop one while `latched` still skips launches, so `bool(breaker)` would tell
+    the alert nothing refused us; `copy` returns a plain set that has forgotten
+    all of it. The docstring's rule is a red test, not a comment."""
+    from streetscape_metadata_tracker.download_common import HOST_OVERPASS
+
+    b = _sched.HostBreaker()
+    b.trip(HOST_OVERPASS)
+    for op in (
+        lambda: b.update({"x"}),
+        lambda: b.discard(HOST_OVERPASS),
+        lambda: b.remove(HOST_OVERPASS),
+        lambda: b.clear(),
+        lambda: b.pop(),
+        lambda: b.copy(),
+        lambda: b.__ior__({"x"}),
+        lambda: b.__isub__({HOST_OVERPASS}),
+        lambda: b.intersection_update(set()),
+    ):
+        with pytest.raises(TypeError, match="HostBreaker"):
+            op()
+    assert b == {HOST_OVERPASS} and b.latched == {HOST_OVERPASS}
+    # Positional construction is refused too: a breaker is never "a set of hosts".
+    with pytest.raises(TypeError):
+        _sched.HostBreaker({HOST_OVERPASS})
+    # Non-mutating reads still work, since the alert and summary rely on them.
+    assert b | {"x"} == {HOST_OVERPASS, "x"}
+    assert sorted(b) == [HOST_OVERPASS]
+
+
+def test_a_plain_set_is_still_accepted_by_the_tail_as_an_all_night_latch(conn, monkeypatch):
+    """_finish_batch's older callers pass a set of host names; that is a breaker
+    that tripped on each and never re-checked, and it alerts exactly as before."""
+    from streetscape_metadata_tracker import scheduler as sched
+    from streetscape_metadata_tracker.download_common import HOST_MAPILLARY_TILES
+
+    _ok_backup(monkeypatch, sched)
+    alerts = []
+    monkeypatch.setattr(sched, "send_alert", lambda cfg, subj, body: alerts.append((subj, body)))
+    monkeypatch.setattr(sched, "_recent_log_tail", lambda cfg, n=40: "")
+    rc = sched._finish_batch(
+        _publishing_cfg(alerts=AlertConfig(enabled=True, recipient="x@y", failure_threshold=99)),
+        conn,
+        "summary",
+        succeeded=0,
+        attempted=0,
+        today=date(2026, 7, 2),
+        blocked_hosts={HOST_MAPILLARY_TILES},
+    )
+    assert rc == 1
+    ((subject, body),) = alerts
+    assert "1 host(s) UNAVAILABLE" in subject
+    assert "STRANDED" not in subject
+    assert "Mapillary" in body and "NO city was marked failed" in body
 
 
 # ── Panoramax as the seventh and eighth channels (issue #335) ────────────────

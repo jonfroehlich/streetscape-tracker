@@ -98,7 +98,7 @@ An unknown or unresolvable target still exits 64; enrolling BEFORE the channel i
 
 ### One-time and repair scripts (`scripts/`)
 
-All are catalog/disk-only (no API calls), dry-run by default, and take `--execute`.
+All are catalog/disk-only (no API calls), dry-run by default, and take `--execute` — except `prefreeze_street_networks.py`, which queries Overpass on purpose.
 
 | Script | Purpose |
 |---|---|
@@ -108,6 +108,7 @@ All are catalog/disk-only (no API calls), dry-run by default, and take `--execut
 | `repair_streetwalk_names.py` | One-time rename of road-walk artifacts collected before streetwalk filenames carried a provider token |
 | `backfill_streetwalk_coverage.py` | Backfill `street_walks.coverage_by_highway` (schema v11, #101) from artifacts on disk |
 | `backfill_streetwalk_length.py` | Backfill the schema v12 `street_walks` columns; exits nonzero if an artifact's lengths contradict the row's cataloged coverage (wrong artifact matched) |
+| `prefreeze_street_networks.py --config config/scheduler.makelab1.toml [--nights N] [--limit N]` | Freeze tonight's walk cities' OSM networks during the day (#341), serially and paced, through the same host lock and probe a walk uses — a walk on a frozen network never contacts Overpass, so a mid-night refusal then strands nothing; refuses while `run-due` is in flight. **Makes Overpass requests** (moved earlier, never added) |
 | `recompute_run_stats.py --provider gsv --regenerate-json` | Re-derive every run's stored stats from its CSV under the current analysis definitions — the repair handle whenever a stats definition moves (#213); a definition change is applied to the WHOLE series in one pass |
 
 The boundary-audit workflow (does a frozen grid actually fit its city?) is a four-script chain, each with a pinning test: `audit_city_boundaries.py` → `build_boundary_review.py` → `apply_decisions.py` → `reregister_boundaries.py`.
@@ -219,11 +220,12 @@ This is what READ THIS FIRST points at; read it before changing any pacing, retr
 
 | Family | Codes | Meaning |
 |---|---|---|
-| Blocked | 75 / 76 / 81 / 84 | The third party refused this IP — trips the night-level breaker |
+| Blocked | 75 / 76 / 81 / 84 | The third party refused this IP — trips the night-level breaker. **Only Overpass (76) is re-checked** (#341): one fail-CLOSED `/status` GET (`download_common.overpass_serving`, 200 + a slots line or it stays latched — the 2026-08-14 ban presented as *connection refused*, so "unreachable" must never read as "clear") on a 45-min cooldown, at most 4 a night; the other hosts latch all night by design (`HOST_RECHECKS`). A walk whose GraphML is already frozen is never skipped *for Overpass's sake* (it never contacts it, and spends no re-check) — its census host still gates it |
 | Busy | 79 / 80 / 82 / 85 | Another local process holds the host lock |
 | Crawl incomplete | 83 | A checkpointed partial crawl — the budget or deadline ran out, not a host condition; amnestied beside the host conditions (#238), while a SIGKILL has no exit code and still counts a failure, so kill-and-resume is bounded at five nights. Raised by the KartaView sweep (#239) and, since #318, by either tile census — **with no usable checkpoint the same stop is a plain `DownloadError`**, because "re-run to resume" with nothing to resume from is an instruction that loops forever |
 
-- A blocked or busy night still publishes, alerts unconditionally, and exits nonzero.
+- A blocked or busy night still publishes, alerts unconditionally, and exits nonzero — a refusal that recovered on re-check too, because it still cost launches.
+- **A refused OR locally busy host STRANDS a city** when its grid run succeeded and its walk did not (#341): not gsv-due for ~83 days, reachable only through the bounded opt-in reservation. The `Done:` line counts them and the alert names them with the `run-due --provider <walk> --limit N` that walks them by hand; `scripts/prefreeze_street_networks.py` is the prevention.
 - makelab1 is **not** an escape hatch: Project Sidewalk serves Mapillary data off it, and that trade is never the right one.
 
 **Scheduler → [`docs/scheduler.md`](docs/scheduler.md).**

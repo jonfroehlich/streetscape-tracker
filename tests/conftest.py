@@ -468,3 +468,28 @@ def _no_overpass_status_probe(monkeypatch):
     from streetscape_street_analyzer import download_street_network as dsn
 
     monkeypatch.setattr(dsn, "_overpass_refusing", lambda url=None: None)
+
+
+@pytest.fixture(autouse=True)
+def _no_host_recheck_probe(monkeypatch):
+    """
+    Pin every breaker re-check (issue #341) to "still refusing" for the suite.
+
+    ``scheduler.HOST_RECHECKS`` maps a per-IP host to a real HTTP probe the
+    breaker runs on a cooldown once that host has refused a child. Nothing in
+    the suite should ever reach one (the default cooldown is 45 min of
+    monotonic time), but the fixture makes that structural rather than a
+    property of the clock: a test that trips the breaker and runs long, or
+    one that shrinks the cooldown, still sends no request anywhere.
+
+    "Still refusing" is the fail-closed answer the real predicate gives when
+    it cannot see a positive signal, so a test that does not override this
+    keeps the pre-#341 all-night latch. Tests of the recovery path override
+    it deliberately (``monkeypatch.setitem`` on the same dict), which is the
+    point: recovery must be something a test asked for, never something the
+    network happened to grant.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    for host in list(sched.HOST_RECHECKS):
+        monkeypatch.setitem(sched.HOST_RECHECKS, host, lambda: False)

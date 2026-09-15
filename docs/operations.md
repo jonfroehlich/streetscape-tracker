@@ -117,3 +117,31 @@ A channel with no scheduler arms yet (anything in `UNWIRED_CHANNELS`, empty toda
 As after `assess-city`, the imported channels are then the *least* stale rows for that city and are **not** due tonight — the closing report says so, because the natural assumption is the opposite.
 
 Three pieces of #330 are deliberately still open: a laptop-side `investigate` driver that runs the collectors and does the rsync itself, a `register-city` subcommand so the laptop asks prod for the frozen grid *before* collecting rather than being checked against it afterward, and a pidfile written by `run-due` to replace the batch check's `ps` heuristic.
+
+## Keeping Overpass out of the night: `scripts/prefreeze_street_networks.py` (issue #341)
+
+A road walk on a frozen network never contacts Overpass — `fetch_graph` returns the cached GraphML before it takes the host lock or probes — and only a city's *first* walk fetches one.
+So a daytime pass that freezes the networks of tonight's walk cities takes nearly all of Overpass out of the nightly window, and turns a mid-night refusal from "strands the rest of the night" into "affects the few cities the pass had not reached".
+It moves existing fetches earlier; it adds none.
+
+```bash
+# What tonight's walks would fetch (dry run is the default; nothing is requested):
+python scripts/prefreeze_street_networks.py --config config/scheduler.makelab1.toml
+
+# Freeze them, serially, two minutes apart, through the same lock and /status probe a walk uses:
+python scripts/prefreeze_street_networks.py --config config/scheduler.makelab1.toml --execute
+
+# Two nights ahead, at most 30 fetches:
+python scripts/prefreeze_street_networks.py --config config/scheduler.makelab1.toml --nights 2 --limit 30 --execute
+```
+
+It predicts the slate the way `run-due` builds it — `_collect_due` over the enabled channels, hoist and refresh reserve included, for **tomorrow's UTC date** (what the 02:00 Pacific timer fire reads; `--date` overrides) — and keeps the cities inside the cap that are due on a street channel and have no frozen GraphML for that channel's `network_type`.
+`--nights N` widens the window to N caps' worth of the stalest-first order, an approximation twice over: each night re-resolves its reservations, and a city whose every channel is skipped does not consume a cap slot, so a real night reaches past the first `max_cities_per_day` entries — `--nights 2` covers both.
+It stops at the first host refusal or busy lock and exits with that host's code (76 / 80), exactly as a collection child does; a bbox with no drivable ways is logged and the pass continues.
+It **refuses to run beside an in-flight `run-due`** unless `--force`, checked before *every* fetch rather than once — a pass is long, the timer does not wait for it, and the walk that then loses the Overpass lock exits busy and strands its city (#341) — so run it in the daytime, clear of the timer.
+This is the one script in `scripts/` that makes provider requests, and it is dry-run by default for that reason.
+There is no timer for it yet; scheduling it is a pacing decision to take against the Overpass usage policy first (CLAUDE.md, READ THIS FIRST).
+
+**Recovering cities a refusal already stranded.**
+The alert names them, with the command: `scheduler run-due --provider gsv_streets --limit N` (or the Mapillary/KartaView walk channel) once Overpass is confirmed serving prod — `curl -A "streetscape_metadata_tracker (jonf@cs.uw.edu)" https://overpass-api.de/api/status` from the host must answer 200 with a slots line, the same test the breaker's re-check applies.
+Their walks will carry a later date than their grid runs, so they stay un-paired either way; a filtered run advances only the named channel's clock.

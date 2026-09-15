@@ -10,6 +10,7 @@ provider importing from another's module.
 import argparse
 import asyncio
 import math
+import os
 import random
 import re
 from collections.abc import Callable, Iterator
@@ -17,6 +18,7 @@ from datetime import datetime
 
 import geopy.distance
 import numpy as np
+import requests
 
 from .progress import progress
 
@@ -74,6 +76,96 @@ HOST_LABELS = {
     HOST_KARTAVIEW: "the KartaView API (kartaview.org)",
     HOST_PANORAMAX: "the Panoramax meta-catalog (api.panoramax.xyz)",
 }
+
+# Overpass endpoint identity, shared by the fetch (download_street_network.py,
+# which hands these to osmnx) and by the scheduler's breaker re-check below,
+# which must NOT import osmnx: the scheduler is a long-lived parent process
+# under a cgroup memory cap, and osmnx drags in geopandas/shapely for what is,
+# here, one GET of a text endpoint. Keeping the strings in one place is what
+# lets the probe stay indistinguishable from the query it speaks for.
+#
+# DEFAULT_OVERPASS_URL must equal osmnx's own `settings.overpass_url` default;
+# tests/test_overpass.py pins that, since a drift would have the re-check ask a
+# different instance than the fetch it is clearing the way for.
+DEFAULT_OVERPASS_URL = "https://overpass-api.de/api"
+# Incident-time escape hatch: point at a mirror when the main instance is
+# refusing this host (issue #209). Read at CALL time everywhere, never at import.
+OVERPASS_URL_ENV = "OVERPASS_URL"
+# The Overpass usage policy asks that clients identify themselves. This also
+# matters mechanically: overpass-api.de answers HTTP 406 to the stock
+# `python-requests/x.y.z` User-Agent (measured 2026-08-15), so a probe sent
+# without these headers reads a healthy instance as refusing.
+OVERPASS_USER_AGENT = "streetscape_metadata_tracker (jonf@cs.uw.edu)"
+OVERPASS_REFERER = "https://github.com/jonfroehlich/streetscape-tracker"
+
+# What a serving /status looks like. overpass-api.de answers, per calling IP::
+#
+#     Connected as: 403941390
+#     Current time: 2026-09-15T14:02:11Z
+#     Announced endpoint: none
+#     Rate limit: 2
+#     2 slots available now.
+#
+# or, with both of our slots in use, `Slot available after: <ts>, in N seconds.`
+# Either line means the instance knows this IP and is prepared to serve it; a
+# queued slot is the normal state of a working night (osmnx sleeps it off).
+#
+# An instance that enforces no per-IP limit reports `Rate limit: 0` and no
+# slots line at all -- the shape of the mirrors an operator points OVERPASS_URL
+# at during an incident (issue #209). That is a positive signal too (the
+# instance is telling this IP it is unlimited), and without it the breaker
+# could never clear on exactly the endpoint chosen because the main one was
+# refusing us. Any other `Rate limit: N` still needs a slots line, since on
+# a limited instance the slots line is where a refusal would show.
+_OVERPASS_SLOTS_LINE = re.compile(
+    r"\d+ slots? available now|Slot available after: |^Rate limit: 0\s*$", re.MULTILINE
+)
+
+
+def overpass_url() -> str:
+    """The Overpass endpoint in force right now: ``$OVERPASS_URL`` or the default."""
+    return os.environ.get(OVERPASS_URL_ENV) or DEFAULT_OVERPASS_URL
+
+
+def overpass_serving(url: str | None = None, *, timeout_s: float = 15.0) -> bool:
+    """
+    Is Overpass positively serving this host right now? (issue #341)
+
+    The scheduler's breaker RESET test, and the mirror image of
+    ``download_street_network._overpass_refusing``, which is the pre-flight.
+    The two answer different questions and fail in opposite directions on
+    purpose, so do not merge them:
+
+    * The pre-flight is **fail-open** — anything it cannot read as a refusal
+      means "proceed", because a false alarm there skips a healthy city.
+    * This is **fail-closed** — only an HTTP 200 whose body carries a
+      parseable slots line (or ``Rate limit: 0``, an unlimited instance's way
+      of saying the same) returns True. Unreachable, a timeout, a 5xx from a
+      front end, a 406, an empty or unfamiliar body: all False, and the breaker
+      stays latched.
+
+    Why the asymmetry matters: the one confirmed abuse ban (2026-08-14)
+    presented as a **TCP connection refused** on :443, not as a 403. A reset
+    test that read "unreachable" as "not refusing" would clear the breaker into
+    a live ban, and the next real fetch would then spend 3–8 minutes inside the
+    host lock re-tripping it. Requiring a positive signal is what makes a
+    re-check safe to run on a cooldown.
+
+    One request, no retries, ``requests`` defaults apart from the timeout and
+    our identifying headers. ``/status`` is unmetered.
+    """
+    base = (url or overpass_url()).rstrip("/")
+    try:
+        response = requests.get(
+            f"{base}/status",
+            timeout=timeout_s,
+            headers={"User-Agent": OVERPASS_USER_AGENT, "Referer": OVERPASS_REFERER},
+        )
+    except Exception:  # noqa: BLE001 - fail closed by contract; see docstring
+        return False
+    if response.status_code != 200:
+        return False
+    return bool(_OVERPASS_SLOTS_LINE.search(response.text or ""))
 
 
 class HostUnavailableError(DownloadError):
