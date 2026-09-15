@@ -8,8 +8,9 @@ It is a **router**: each section carries the short, mistake-preventing rules and
 
 Streetscape Tracker analyzes street-level imagery coverage and temporal patterns in cities **over time**.
 Four providers are collectable — Google Street View (GSV, the default), Mapillary (360° panos only), KartaView, and Panoramax.
-Panoramax is the newest and the only credential-free one; it is collectable by hand but **not yet a scheduler channel** (#316 phase 2, `UNWIRED_CHANNELS`).
-GSV and Mapillary run nightly over every enabled city **that has not been excluded from the channel** (`enroll-city --channel gsv --remove`, #301); KartaView is a scheduler channel too but **opt-in**, collecting only the cities an operator enrolled with `scheduler enroll-city` (#248), because one whole-catalog pass prices at ~205,000 requests ≈ 215 h at the configured 16/min.
+Panoramax is the newest and the only credential-free one.
+GSV and Mapillary run nightly over every enabled city **that has not been excluded from the channel** (`enroll-city --channel gsv --remove`, #301).
+KartaView and Panoramax are scheduled too but **opt-in**, collecting only the cities an operator enrolled with `scheduler enroll-city` — KartaView because one whole-catalog pass prices at ~205,000 requests ≈ 215 h at the configured 16/min (#248), Panoramax because 730 of 1,144 enabled cities were MEASURED to hold no Panoramax imagery at all (#316/#335).
 The tool samples a geographic grid around a city center, queries each provider's metadata API, and produces immutable dated snapshots per (city, provider), run-to-run change summaries (panos added/removed, capture-date changes, coverage deltas), and interactive map visualizations.
 
 ## READ THIS FIRST: provider API access is the single point of failure
@@ -124,8 +125,8 @@ Credentials live in `.env`, loaded per channel by `streetscape_metadata_tracker/
 | `gsv_streets` | `GMAPS_STREETS_API_KEY` | Isolated street-collection key (#99) with its own `api_usage` string, so street experiments can't exhaust production quotas; **live** |
 | `kartaview_streets` | `KARTAVIEW_STREETS_ACCESS_TOKEN` | The one street channel that **falls back to `KARTAVIEW_ACCESS_TOKEN`** rather than requiring its own: one machine-wide `host_lock(HOST_KARTAVIEW)` serializes every KartaView request, so there is no parallel burn to isolate. Scheduled and **opt-in**, enrolled SEPARATELY from `kartaview` (#258) |
 | `mapillary_streets` | `MAPILLARY_STREETS_ACCESS_TOKEN` | Same isolation; **dormant** |
-| `panoramax` | none — unauthenticated read | Credential-free (#316): `CHANNEL_ENV_VARS["panoramax"]` is an **empty tuple**, not a missing row, and `load_config` returns `{"access_token": None}` rather than raising — a channel that raised for a key it does not have would take down every other provider in the same `--provider all` invocation |
-| `panoramax_streets` | none — unauthenticated read | The road walk (#331), credential-free for the same reason and an empty tuple for the same one. Its two siblings isolate a QUOTA; here there is no token to isolate, so what the channel buys is the LEDGER row alone — which is still what keeps a walk's tiles off the grid channel's daily budget. Runnable by hand; **not a scheduler channel** |
+| `panoramax` | none — unauthenticated read | Credential-free (#316); scheduled and **opt-in** since #335: `CHANNEL_ENV_VARS["panoramax"]` is an **empty tuple**, not a missing row, and `load_config` returns `{"access_token": None}` rather than raising — a channel that raised for a key it does not have would take down every other provider in the same `--provider all` invocation |
+| `panoramax_streets` | none — unauthenticated read | The road walk (#331), credential-free for the same reason and an empty tuple for the same one. Its two siblings isolate a QUOTA; here there is no token to isolate, so what the channel buys is the LEDGER row alone — which is still what keeps a walk's tiles off the grid channel's daily budget. Scheduled and **opt-in** since #335, enrolled SEPARATELY from `panoramax` |
 
 A run requires EVERY named provider's key up-front, `--provider all` included (fail-fast so the series can't drift); a single-provider run needs only its own key.
 A credential-free channel is the one exception and is declared rather than special-cased (`config.CREDENTIAL_FREE_CHANNELS`, derived from the table above).
@@ -135,8 +136,8 @@ Three `--provider` flags exist with **different vocabularies** — never conflat
 | Surface | Accepts | Shape |
 |---|---|---|
 | `streetscape_tracker.py --provider` | `gsv`, `mapillary`, `kartaview`, `panoramax`, `all`; the retired `both` still works, with a notice (#247) | Comma-separated list; default `gsv,mapillary` |
-| `scheduler run-due --provider` | The six scheduled channels: `gsv`, `gsv_streets`, `kartaview`, `kartaview_streets`, `mapillary`, `mapillary_streets` | Repeatable or comma-separated; no `all` or `both` |
-| `scheduler assess-city --provider` | `gsv_streets`, `mapillary`, `mapillary_streets` — the GSV grid run is never part of it | Repeatable or comma-separated |
+| `scheduler run-due --provider` | The eight scheduled channels — every `CHANNEL_HOSTS` key, which is where `--help` derives the list from rather than spelling it | Repeatable or comma-separated; no `all` or `both` |
+| `scheduler assess-city --provider` | `gsv_streets`, `mapillary`, `mapillary_streets` — the GSV grid run is never part of it, and neither is any **opt-in** channel (its default path collects every listed channel, so one would be paid for on every assessment and would stamp `last_success_at` on a `member = 0` row) | Repeatable or comma-separated |
 
 `--provider` is always a channel LIST, never a keyword whose meaning drifts with the provider count (#247).
 
@@ -182,18 +183,19 @@ Four KartaView rules that must survive without a read:
   Enrol both for a city and the pair is nearly free — `kartaview_streets` ranks immediately after `kartaview`, so the grid sweep lands in the census cache and the walk prices at 0 (#290); enrol only the walk and it pays a full sweep.
   `_collect_due` hoists a city due *only* on an opt-in channel to the head of the slate (`all`, not `any`) — without which the channel would be scoped but never reached, since the union is gsv-ordered and the city cap truncates from the tail.
   The hoist is **bounded** by `[schedule].opt_in_cities_per_day` (#282; unset = a quarter of the city cap, floored at 1, resolved only in `_opt_in_reservation`), because unbounded it starves every default-membership channel once the enrolled set is wide — so that key is the RATE any widening proceeds at, not a safety margin.
-  With `kartaview_streets` (#258) they are the fifth and sixth channels, and the effective `max_concurrent_channels` ceiling is **4 of 6**: the largest host-disjoint set is gsv (no per-IP host) + ONE of the three Overpass channels + mapillary + kartaview.
-  That figure is a property of the channel set's host graph, never a constant — re-derive it when a channel is added rather than quoting the last number written down.
+  With `kartaview_streets` (#258) they are the fifth and sixth channels; the Panoramax pair (#335) are the seventh and eighth, opt-in for a different reason (measured emptiness, not cost) and enrolled separately from each other for the same reason.
+  The effective `max_concurrent_channels` ceiling is **5 of 8**: the largest host-disjoint set is gsv (no per-IP host) + gsv_streets + mapillary + kartaview + panoramax.
+  That figure is a property of the channel set's host graph, never a constant — re-derive it when a channel is added rather than quoting the last number written down, and note the numerator does not always move: every walk added brings one more Overpass user, and Overpass admits exactly one talker.
   Its cost arms ARE wired (#238): the estimate is the swept-circle lattice × the measured **1.80×**, never the GSV grid formula, and the previous run's observed `runs.api_requests` outranks that geometry as the **larger** of the two, never on its own.
 - **`api_requests` is this process's spend and `api_requests_total` is the sweep's** — `db.add_api_usage` is additive and keyed by (date, provider), so a resumed night reporting the whole sweep would charge last night against tonight's budget gate.
 - **HTTP 400 is backpressure here, not a malformed request** — typed permanent it would never be retried or subdivided, and every dense city would collect nothing.
 - The capture-date rule is **`shot_date >= date_added` → NULL — `>=`, not `>`**.
 
-**All four checkpointing channels stop at a request cap and resume rather than being skipped (#318)** — both KartaView's and both Mapillary's — so neither budget gate applies to them and a city that does not fit the night's remainder is launched capped at it instead of rolled to tomorrow.
+**All six checkpointing channels stop at a request cap and resume rather than being skipped (#318, #335)** — both KartaView's, both Mapillary's and both Panoramax's — so neither budget gate applies to them and a city that does not fit the night's remainder is launched capped at it instead of rolled to tomorrow.
 The cap is checked inside the semaphore beside the #205 abort and is a SEPARATE flag from it (`fatal` means every remaining tile would fail identically; a cap means the opposite), and the pause is raised **before the settle loop** — past that line a tile skipped at the cap is indistinguishable from a tile the provider answered with no imagery, and would publish absence nobody observed.
 **A cap is a SOFT ceiling and a capped night can end over budget** — so never write "the budget is never exceeded": a tile gates on `api_requests + reserved` (without the reservation every task the semaphore admits clears a stale check and the cap is overshot by `connection_limit − 1` *every* capped night), and what is deliberately left is retries by tiles already in flight, at most `connection_limit × (TILE_MAX_TRIES − 1)` — **200** at prod's `connection_limit = 50`, never the 20 the argparse default of 5 implies.
-**Both Mapillary channels flip together**: `_sweep_launch_plan`'s sibling arm is asked only of a resumable street channel, so flipping the grid alone would have the walk re-crawl the identical lattice against the same per-IP host every night the grid paused.
-`panoramax` has the same collector-side cap and stays `CHANNEL_RESUMABLE` `False` **because nothing forwards one to it**, not because it cannot stop; flip it in the commit that adds its launch arm.
+**A provider's two channels flip together**: `_sweep_launch_plan`'s sibling arm is asked only of a resumable street channel, so flipping the grid alone would have the walk re-crawl the identical lattice against the same per-IP host every night the grid paused.
+Panoramax was `False` for one release **because nothing forwarded a cap to it**, not because it could not stop — and its WALK had no `max_requests` parameter at all until #335, which is the shape to check before marking any channel resumable.
 The launch floor and the pace a cap is sized against are **per provider, in one row each** (`_CRAWL_PRICING`) — sizing a tile census's cap from the radius sweep's constants under-prices it (1.6× at prod's configured rate, 6× with no `[providers.*]` block), and a cap under the floor skips the city rather than slowing it.
 
 A COMPLETED crawl is promoted out of `checkpoints/` into `census_cache/<provider>/<city>_<bbox>`, and every later consumer of that (provider, city, bbox) observation reuses it for **0 requests** (#290) — the paired road walk, a second `--network-type`, KartaView's #258 walk.
@@ -236,7 +238,7 @@ Keyed on `all(p in opt_in ...)` instead, a city EXCLUDED from gsv was never resc
 The key is the UNION of "not due on rank 0" **or** "due only on opt-in channels", because a filtered widening (`run-due --provider kartaview`) makes rank 0 the opt-in channel itself and strands nobody, while its live-checkpoint preference still has to hold.
 A night's cap is therefore split three ways — `opt_in_cities_per_day`, then `refresh_slots` of the remainder, then stalest-first — and it is the SUM of the two that bounds how much of a night the plain queue still governs (20 of 40 on prod).
 `max_cities_per_day` is 40 and `max_batch_hours` 12 (raised 2026-09-02, #304): the deadline is the intended governor, and the bracket on it is `TimeoutStopSec` < `max_batch_hours` < `TimeoutStartSec` (14 h) less the ~0.45 h bounded tail — past ~13.5 h the unit has to move first.
-Channels run back-to-back, or concurrently in host-disjoint lanes when `[schedule].max_concurrent_channels` > 1 (default 1; channels sharing a per-IP host never overlap, so the effective ceiling is 4 of 6, and raising it in prod is gated only on verifying the two GSV keys live in separate Cloud projects).
+Channels run back-to-back, or concurrently in host-disjoint lanes when `[schedule].max_concurrent_channels` > 1 (default 1; channels sharing a per-IP host never overlap, so the effective ceiling is 5 of 8, and raising it in prod is gated only on verifying the two GSV keys live in separate Cloud projects).
 **The tail is what makes a night visible, and it only runs if the city loop returns** — every way of ending the loop (deadline, SIGTERM wind-down, unexpected exception) returns counters instead of propagating, and each tail artifact reports a crash rather than raising.
 **Publishing happens only at the end**, so a stale public site usually means the batch died or overran, not that the publisher broke.
 Drive manual batches into a file (`>> logs/x.log 2>&1`), never a pipe.
@@ -265,7 +267,7 @@ The second active collection modality beside the grid: walk each frozen OSM edge
 **Every census provider — Mapillary, KartaView, Panoramax — walks the same deterministic sample points via ONE census joined locally**, so its cost tracks bbox **area**, not sample count or spacing, and is 0 on a paired night (#290).
 That join lives once in `streetscape_street_analyzer/census_walk.py`, parameterized by a `CensusWalkSpec` of exactly three bindings (the date rule and the two row-schema builders); a fourth binding would be a claim that the JOIN differs between providers, which is what the module exists to deny.
 Reuse the provider's grid-run date function rather than rewriting it, or one city's grid and street artifacts disagree about the same picture.
-`panoramax` is the third caller (#331) and is runnable by hand only — it has no scheduler channel yet (#316 phase 2).
+`panoramax` is the third caller (#331), and `panoramax_streets` is a scheduler channel since #335 — **opt-in and enrolled separately from `panoramax`**, so enrolling only the walk pays a full census where enrolling both makes the walk free.
 Artifact names carry the provider token, and per-network ones the network token — generators in `naming.py` only.
 
 **Google's driving plan → [`docs/driving-plan.md`](docs/driving-plan.md).**

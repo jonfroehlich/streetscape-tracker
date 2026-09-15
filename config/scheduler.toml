@@ -522,8 +522,96 @@ daily_request_budget = 10000
 # Not additive with [providers.kartaview]'s: one host lock, so the two channels
 # never talk to kartaview.org at the same moment.
 max_requests_per_minute = 16
-# Match the other two street channels so all three walk the same sample points
-# and land on one comparable streets.html row.
+# Match the other street channels so they all walk the same sample points and
+# land on one comparable streets.html row.
+spacing_m = 15
+network_type = "drive"
+
+# Panoramax (issues #316 phase 2, #335) — the THIRD and FOURTH opt-in channels,
+# and the SEVENTH and EIGHTH channels overall. Declaring either block enrolls
+# nobody:
+#   scheduler enroll-city CITY --channel panoramax
+#   scheduler enroll-city CITY --channel panoramax_streets
+#
+# WHY OPT-IN, and this is the clearest case in CHANNEL_DEFAULT_MEMBERSHIP
+# because it rests on a MEASUREMENT rather than a cost argument (#316 phase 1).
+# A screen of all 1,144 enabled cities found 730 of them — 63.8% — holding no
+# Panoramax imagery AT ALL, and a screened zero is conclusive: every one of the
+# 20 screened-zero control cities measured exactly zero. A default-membership
+# channel would spend most of its nightly slots confirming absence, each slot
+# taken from a city with a second dated interval to gain (#308). The imagery is
+# concentrated instead — roughly 20 cities hold 3.16 M pictures between them —
+# which is the shape enroll-city exists for.
+#
+# WHAT A CITY COSTS: the z15 picture layer over the frozen bbox, so tiles, not
+# points. Measured over the 20 richest cities, `estimate_tile_count` reads p50
+# 414 / p90 2,400 / max 3,132 — which at 30/min is roughly 14 / 80 / 104
+# minutes for ONE city. That is the most expensive tile census in the repo:
+# Panoramax's layer starts at z15 where Mapillary's is z14, so the same bbox is
+# up to ~4x the tiles, and it is paced at half the rate.
+[providers.panoramax]
+enabled = true
+# A per-NIGHT ceiling AND a hard stop, not a floor a city must clear. It is
+# sized at ~the richest city measured (3,132 tiles) plus room for a second, so
+# any single enrolled city finishes in one night; a city priced above it is
+# launched CAPPED at what is left and checkpoints the rest (#274, #318), which
+# is what CHANNEL_RESUMABLE["panoramax"] = True means. The cap is actually
+# enforced — `_run_one_city` hands the child --panoramax-max-requests — so
+# raising this widens what a night may SPEND, not only what it may attempt,
+# against a host that meters by IP and documents no limit at all.
+daily_request_budget = 4000
+# download_panoramax.DEFAULT_TILE_REQUESTS_PER_MINUTE, restated here because
+# two things read it: the child paces at it, and _tile_census_timeout_seconds
+# derives every per-city timeout from it, so lowering it here without
+# re-reading that function silently shortens those timeouts too.
+#
+# It is the LOWEST tile pace in the repo on purpose. Panoramax documents no
+# rate limit and returns no X-RateLimit-*/Retry-After header, so there is no
+# ceiling to pace against and the conservative number is the honest one; it is
+# volunteer-run infrastructure and we carry no credential identifying us. Half
+# the Mapillary module's exported 60, though both Mapillary channels actually
+# RUN at 40 (#292), so the real margin is 25%.
+max_requests_per_minute = 30
+# The #292 shifted-exponential jitter, and also the gaps' coefficient of
+# variation: each gap is mean x ((1 - jitter) + jitter x Exponential(1)), so
+# the mean rate — and every budget and timeout derived from it — is unchanged.
+# Non-zero by default for the reason the Mapillary channels are: after three
+# per-IP blocks there, a metronomic request pattern is the shape being avoided,
+# and here there is no documented limit to say we are inside.
+jitter = 0.6
+
+# The Panoramax road walk (issues #331, #335). Enrolled SEPARATELY from the grid
+# channel above rather than following it, for the reason kartaview_streets is:
+# "we want this city's STREET coverage" is a different question from "we want
+# its grid coverage", and schedule_state.member has exactly one meaning for NULL
+# (use CHANNEL_DEFAULT_MEMBERSHIP), which a channel reading another channel's
+# enrollment would quietly make three.
+#
+# WHAT IT COSTS: on a night where [providers.panoramax] already ran this city,
+# nothing. Both channels read one z15 census of one bbox, the grid run promotes
+# it into the shared census cache (#290), and `_channel_estimate` prices the
+# walk at 0 — which is why it ranks immediately after panoramax in
+# enabled_providers(). Un-paired it pays a full census, which is what this
+# budget has to cover; and while the grid sibling's census of the same bbox is
+# still checkpointed mid-crawl, this walk DEFERS rather than crawling the
+# lattice a second time against the same per-IP host (#274, #290).
+#
+# No credential, exactly like the grid channel: CHANNEL_ENV_VARS declares an
+# empty tuple rather than omitting the row, so `load_config` returns
+# access_token=None instead of raising.
+[providers.panoramax_streets]
+enabled = true
+# Mirrors [providers.panoramax] — the SAME census priced the same way, so a walk
+# that misses its pairing pays exactly what the grid run would have.
+daily_request_budget = 4000
+# Must match the pace the timeout is derived from, and NOT additive with the
+# grid channel's: one machine-wide host_lock(HOST_PANORAMAX) means the two never
+# talk to api.panoramax.xyz at the same moment, so 30/min is their combined
+# ceiling rather than each one's.
+max_requests_per_minute = 30
+jitter = 0.6
+# Match the other street channels so they all walk the same sample points and
+# land on one comparable streets.html row.
 spacing_m = 15
 network_type = "drive"
 

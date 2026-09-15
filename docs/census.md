@@ -270,13 +270,15 @@ So a cap passed without a checkpoint *path* is refused up front as a caller bug 
 **That refusal is the TILE CENSUSES' rule, not a rule of `max_requests`** — KartaView documents and supports the same pairing (`download_kartaview.sweep_city_images`, `max_requests` with `checkpoint_path=None`), where an uncheckpointed stop leaves the rest of the bbox unmeasured and the failed-area check then refuses to finalize, which is a guard the tile censuses do not have.
 Read the refusal as "this collector cannot make an uncheckpointed cap safe", never as "a cap implies a checkpoint everywhere".
 
-**Both Mapillary channels flip together, and that is not tidiness.**
+**A provider's two channels flip together, and that is not tidiness.**
 `_sweep_launch_plan`'s sibling arm — the one that stops a walk sweeping a lattice its grid sibling is mid-way through — is asked only of a RESUMABLE street channel.
 Flip the grid alone and the first night its census pauses leaves a *checkpoint*, not a cache entry, so the walk prices at full, takes the old all-or-nothing gates, and crawls the identical z14 lattice a second time against the same per-IP host for an observation the cache would hand it free once the grid finished (#290).
 
-**`panoramax` gets the collector-side cap and stays `False`**, and the reason MOVED rather than persisted: it is no longer "nothing for a cap to stop" but "nothing forwards one" — the channel is in `UNWIRED_CHANNELS` and the grid argv, built inline in `_run_one_city`, has no arm for it.
+**Both Panoramax channels are `True` since #335**, and the history is worth keeping because it is the shape to check before marking any channel resumable.
+`panoramax` had the collector-side cap from #318 and stayed `False` anyway: the reason MOVED rather than persisted, from "nothing for a cap to stop" to "nothing forwards one" — the channel was in `UNWIRED_CHANNELS` and the grid argv, built inline in `_run_one_city`, had no arm for it.
 (There is no `_collect_cmd` to read: only the walk's argv is factored out, as `_street_collect_cmd`.)
-Flip it in the same commit that adds that arm.
+The WALK was a step further back still: `collect_panoramax_street_samples_async` had no `max_requests` parameter at all, so the flag had nothing to reach even once `_street_collect_cmd` sent it.
+Both halves landed in the commit that added the launch arms, which is what the `False` asked for.
 
 ## The census cache — fetch once per (provider, bbox), reuse across channels (issue #290)
 
@@ -341,7 +343,7 @@ A different channel records 0, and schema v14's `census_fetched_by`/`census_fetc
 
 **Scheduler-side, `_channel_estimate` returns 0 on a cache probe hit while `estimate_requests` stays cache-blind.**
 The gates fed by the first are `est > budget` and `used + est > budget`, so without it the cheapest channel of the night — a walk whose census the grid run bought minutes earlier — is exactly the one a nearly-spent budget defers, and the pairing never happens on the nights it helps most.
-The second also feeds `_mapillary_timeout_seconds`/`_kartaview_timeout_seconds`, where a 0 would collapse a child's timeout onto the flat floor.
+The second also feeds `_tile_census_timeout_seconds`/`_kartaview_timeout_seconds`, where a 0 would collapse a child's timeout onto the flat floor.
 The probe reads the **marker only** — no part files — because it prices every channel of every due city on every night; a hit is therefore a strong hint rather than a promise, and the consumer's own loader still validates and refetches, which is the safe direction.
 Two things narrow how strong: the marker records the provider's commit-record format (`store_format_version`, from the `STORE_FORMAT_VERSIONS` table both providers read their own constant from) and the probe compares it, so a format bump is a MISS at the probe rather than a hit the child then refuses and refetches at full cost with the budget gate already passed and no in-child cap; and the scheduler probes with the window narrowed by `max_batch_hours`, so an entry that would expire between slate time and the child's load is priced as the fetch it will become.
 It also **deletes nothing**, unlike the consumer-side loader: a planning caller holds no host lock, and deleting a refused entry is the job of the consumer that holds it, and of the tail prune.
@@ -453,6 +455,7 @@ And it is enormous, because every feature embeds a ~90-key EXIF blob: 1,000 feat
 So the census is the v1 map endpoint's `pictures` layer, which starts at **z15** — the coarsest zoom that serves it at all, and therefore the cheapest.
 That is not a tunable and getting it wrong is silent rather than loud: below z15 the layer is absent entirely, so every tile would decode to nothing and the run would publish a city holding no imagery rather than failing.
 The cost that follows is a real difference from Mapillary and not a rounding one: the same bbox is up to ~4x the tiles (the asymptote of one zoom level; measured 2.0x-3.9x over square grids from 0.2 to 40 km), a catalog p50 of 35 against Mapillary's 12, and over the cities actually worth enrolling a p50 of 414 tiles, p90 2,400 and max 3,132 (~104 minutes at the shipped pace).
+That last figure is RAW PACE and is not the per-city timeout: `scheduler._tile_census_timeout_seconds` divides by the achieved fraction (0.8) and multiplies by the headroom (1.5) plus 600 s of slack, so the max city derives ~206 minutes — above the flat 180-minute floor, which is why that arm is live today rather than latent.
 `estimate_tile_count` counts that lattice exactly, offline and free, so unlike KartaView's sweep there is no observed-versus-geometric correction to carry.
 
 The v2 endpoint's H3 `grid` layer — aggregated counters rather than rows — is the *screen* instrument phase 1 used to price the whole catalog for 113 requests, and it is not read by the collector at all.
@@ -484,10 +487,10 @@ A picture the layer does not name is dropped instead.
 **Pacing is 30/min with jitter 0.6**, half the Mapillary channels' configured rate against a host with strictly less published guidance — nothing documents a limit anywhere found, and no `X-RateLimit-*` or `Retry-After` header comes back.
 The jitter is adopted before any incident rather than after three; see [`provider-access.md`](provider-access.md) for the full access survey and for what has and has not been asked.
 
-**Collectable by hand, not scheduled.**
+**Collectable by hand, and scheduled since #335.**
 `streetscape_tracker.py --provider panoramax` collects a city, and `naming.KNOWN_PROVIDERS` carries the token so the run reads back under its own schema.
-But `scheduler.UNWIRED_CHANNELS` still holds `panoramax`, so a `[providers.panoramax]` block is dropped with an error rather than run: `estimate_requests`, `city_timeout_seconds`, the `enabled_providers` rank and the `_run_one_city` pacing flag have no arm for it yet, and each of those fails OPEN in the way #238 records.
-`CHANNEL_DEFAULT_MEMBERSHIP["panoramax"]` is already `False`, on a measurement rather than a cost argument: 730 of 1,144 enabled cities screen to a conclusive zero, so a default-membership channel would spend most of its slots confirming absence.
+`scheduler.UNWIRED_CHANNELS` held `panoramax` until every arm that fails OPEN in the way #238 records had been written — `estimate_requests` (#323), `city_timeout_seconds` (now routed to `_tile_census_timeout_seconds`), the `enabled_providers` rank, and `_run_one_city`'s pace, jitter and request-cap flags — and its entry was removed LAST, which is what that dict's comment asks for.
+`CHANNEL_DEFAULT_MEMBERSHIP["panoramax"]` is `False`, on a measurement rather than a cost argument: 730 of 1,144 enabled cities screen to a conclusive zero, so a default-membership channel would spend most of its slots confirming absence.
 
 ## The Panoramax road walk is the third `CensusWalkSpec` binding (issue #331)
 

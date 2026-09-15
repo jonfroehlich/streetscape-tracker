@@ -467,7 +467,13 @@ _TILE_MAX_TIME_S = 120
 #
 # What it costs, over the cities that would actually be enrolled rather than
 # over the catalog: a p50 leader city is 414 z15 tiles (~14 min), p90 2,400
-# (~80 min), max 3,132 (~104 min), against a 12 h batch deadline.
+# (~80 min), max 3,132 (~104 min), against a 12 h batch deadline. Those are RAW
+# PACE -- tiles / this rate -- and the scheduler's per-city timeout is larger by
+# construction: it divides by an achieved fraction and multiplies by a headroom
+# (`scheduler._tile_census_timeout_seconds`), so the max city derives ~206 min,
+# not ~104. Never compare a number from this line against the 180-minute
+# `city_timeout_minutes` floor; that comparison was made four times and was
+# backwards every time.
 DEFAULT_TILE_REQUESTS_PER_MINUTE = 30
 
 # Jitter fraction, the #292 shifted exponential. Non-zero by default for the

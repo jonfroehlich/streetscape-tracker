@@ -147,6 +147,7 @@ async def collect_panoramax_street_samples_async(
     request_timeout: float = 30,
     max_requests_per_minute: int = DEFAULT_TILE_REQUESTS_PER_MINUTE,
     jitter: float = DEFAULT_TILE_JITTER,
+    max_requests: int | None = None,
     checkpoint_path: str | None = None,
     checkpoint_channel: str | None = None,
     checkpoint_variant: str | None = None,
@@ -174,6 +175,16 @@ async def collect_panoramax_street_samples_async(
     is load-bearing: ``db.add_api_usage`` is additive and keyed by (date,
     provider), so a resumed walk reporting the whole crawl would charge last
     night's tiles against tonight's budget gate.
+
+    ``max_requests`` stops the census after that many requests, checkpoints the
+    unfetched tiles and raises ``SweepIncompleteError`` -- the same contract as
+    the Mapillary walk's, and what makes ``panoramax_streets`` a
+    ``CHANNEL_RESUMABLE`` channel rather than one the scheduler can only run
+    all-or-nothing (issue #335). It is threaded here rather than left to the
+    grid run alone because the walk crawls the identical lattice whenever the
+    pairing misses (an un-paired enrolment, an aged cache entry, a night the
+    grid sweep itself paused), so without it the cheapest-looking channel of the
+    night is the one nothing bounds.
 
     **No ``access_token`` parameter, and that is not an omission.** Panoramax
     reads are unauthenticated, so there is no credential to thread; the
@@ -206,6 +217,7 @@ async def collect_panoramax_street_samples_async(
         request_timeout=request_timeout,
         max_requests_per_minute=max_requests_per_minute,
         jitter=jitter,
+        max_requests=max_requests,
         checkpoint_path=checkpoint_path,
         checkpoint_channel=checkpoint_channel,
         checkpoint_variant=checkpoint_variant,

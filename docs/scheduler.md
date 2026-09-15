@@ -233,17 +233,18 @@ Each channel keeps its own limiter and its own daily budget, so no provider is a
 **The safety argument is host affinity.**
 The launch pass computes the set of per-IP hosts the in-flight siblings hold (from `CHANNEL_HOSTS`, never a hardcoded list) and *defers* — leaves pending, silently, reconsidered when a sibling completes — any channel that intersects it.
 So each of Overpass, the Mapillary tile CDN and KartaView sees at most one talker from this process, exactly as before, and the configured `max_requests_per_minute` stays the real figure rather than doubling.
-With today's six channels the effective ceiling is therefore **4**, whatever the knob says: `mapillary_streets` shares Overpass with `gsv_streets` and the tile CDN with `mapillary`, so it always runs after both — which is also the desirable order, since the second street channel of a city then hits the warm GraphML cache instead of racing for the same Overpass fetch.
-`kartaview_streets` (#258) is the third Overpass channel and the second on `kartaview.org`, so the largest host-disjoint set is `gsv` (no per-IP host) + ONE of the three Overpass channels + `mapillary` + `kartaview` = 4 of 6.
-The sixth channel is what this paragraph used to say re-deriving would cost, and it cost exactly that: the ceiling did not move, the denominator did.
-The figure is a property of the channel SET's host graph, never a constant — derive it again for a seventh rather than quoting this number.
+Every walk shares Overpass with every other walk, and shares its provider's host with its own grid channel, so it always runs after both — which is also the desirable order, since the second street channel of a city then hits the warm GraphML cache instead of racing for the same Overpass fetch.
+With today's **eight** channels the largest host-disjoint set is therefore `gsv` (no per-IP host) + `gsv_streets` (Overpass) + `mapillary` (tile CDN) + `kartaview` (kartaview.org) + `panoramax` (api.panoramax.xyz) = **5 of 8** (#335).
+`gsv_streets` is the Overpass representative because it is the only Overpass channel with no SECOND host: picking any walk instead gives up that walk's other host and the set drops to 4.
+Re-deriving has now cost three different answers — 4 of 5, then 4 of 6, then 5 of 7 and 5 of 8 — and the instructive one is the last pair: the NUMERATOR did not move, because every walk added brings one more Overpass user and Overpass admits exactly one talker, so a walk can only ever displace the Overpass channel already in the set.
+The figure is a property of the channel SET's host graph, never a constant — derive it again for a ninth rather than quoting this number.
 The child-side per-host lock (#208) is unchanged and still covers the manual runs the parent cannot see.
 **Everything except the child itself runs on the main thread.**
 A lane worker calls `_run_one_city` and nothing else; pricing, both budget gates, the ledger read, the resource guard, the breaker and *all* classification (busy/blocked/salvage/killed-by-stop/`record_attempt`) stay on the thread that owns the catalog, because `db.connect` opens it `check_same_thread=True`.
 The two values `_run_one_city` would otherwise derive from `conn` or the clock are precomputed at the launch site and passed in (`timeout_s`, `estimated_requests`); the scheduler hands the worker `conn=None` deliberately.
 That also keeps the read-then-write budget guard honest — the reads are serialized by being on one thread, in submit order, so two channels cannot both see "under budget" and both spend.
 **At the default of 1 the channel body runs INLINE on the calling thread**, not on a size-1 pool: that is what makes the default byte-equivalent to the pre-#240 loop and what keeps every existing test's `_run_one_city` substitute able to touch the fixture connection.
-**Neither budget gate applies to a channel `CHANNEL_RESUMABLE` marks (#274, #318), which is the two KartaView channels and the two Mapillary ones.**
+**Neither budget gate applies to a channel `CHANNEL_RESUMABLE` marks (#274, #318, #335), which is the two KartaView channels, the two Mapillary ones and the two Panoramax ones.**
 Both gates exist because every other channel is all-or-nothing — a partial grid or road walk is not a run — so refusing to start is honest and `est > budget` is a real dead end.
 A crawl that checkpoints is launched with `min(budget − used, what its timeout can pace)` as its cap whatever the estimate says, and its estimate is deliberately not consulted: it prices the WHOLE crawl even for a resuming city, because a paused one never reaches `register_run`.
 That over-pricing is not a KartaView quirk — `docs/provider-access.md` records the same of the tile census, "the pre-flight estimate still prices the whole tile count even when a resume will fetch a fraction of it" — so New York would be re-priced at 484 and skipped a second time.
@@ -418,6 +419,23 @@ Doing (3) before (2) leaves a mistyped or forgotten exclusion on an ENABLED city
 Expect the newly enabled cities to arrive through the stranded reservation rather than all at once, since they are not due on gsv and therefore never lead the union.
 They get a **share** of `[schedule].opt_in_cities_per_day`, not all of it: the reservation round-robins across stranded populations, so with a KartaView widening and a transiently-stalled population also in flight the share is about a third of it (measured on a prod-shaped slate: 4 of 10).
 Raise the key for the duration of a rollout rather than expecting ten cities on night one.
+
+**Seeding an opt-in channel: DUE IMMEDIATELY is not REACHABLE TONIGHT, and the gap can be weeks.**
+Dueness is per-(city, channel), so a fresh `schedule_state` row has `last_success_at` NULL and the city is due on the next run regardless of any sibling channel's 90-day clock.
+That is the whole of the eligibility question and none of the reachability one — the #328 lesson, arrived at from the enrolment side instead of the exclusion side.
+A newly enrolled city is stranded (not due on rank 0), so it enters the bounded hoist, competing for `opt_in_cities_per_day` (10 on prod) against every other stranded city: mapillary-stranded cities, and every never-collected KartaView-enrolled city from the #282 widening — ~380 of the 502 enrolled on 2026-09-03 still had a NULL `last_success_at`.
+Ordering inside the reservation is live-checkpoint first, then union order, then `city_id`, so a seed city with an unlucky slug can sit behind hundreds of them.
+**So do not wait for the nightly batch to prove a new channel works.** Run it filtered, which makes the new channel rank 0 and therefore strands nobody:
+
+```
+scheduler enroll-city "<city>" --channel panoramax
+scheduler enroll-city "<city>" --channel panoramax_streets    # nearly free when paired
+scheduler run-due --dry-run                                   # prices both, names each child's cap
+scheduler run-due --provider panoramax,panoramax_streets --limit 5
+```
+
+The same recipe is how a KartaView tranche is exercised, and it is the only supported bulk path either way — never a detached script.
+The filtered run advances only those channels' clocks, which for a first collection costs nothing (there is no paired snapshot to un-pair yet).
 
 **`notify-failure`** emails the recent scheduler-log tail and is wired as the unit's `OnFailure=` hook (`deploy/systemd/streetscape-tracker-notify@.service`), so a crash that never reaches the in-run alerting still produces an email.
 It exits 0 when it alerted (or alerting is intentionally off) and 1 only when a send was attempted and failed, so the notify unit's own status is meaningful.

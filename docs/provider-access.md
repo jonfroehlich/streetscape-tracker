@@ -448,7 +448,7 @@ Widening the enrolled set is a volume change under the top-of-file rule and is t
 
 ## Panoramax documents no limit at all, but is the one locked host with a staffed community (surveyed 2026-09-04, issue #316)
 
-Panoramax is not a collection channel and may never become one — this section exists because the top-of-file rule is about *before*, and phase 1 of [#316](https://github.com/jonfroehlich/streetscape-tracker/issues/316) put read-only traffic on the host.
+Panoramax became a collection channel in [#335](https://github.com/jonfroehlich/streetscape-tracker/issues/335), and this section predates it: it exists because the top-of-file rule is about *before*, and phase 1 of [#316](https://github.com/jonfroehlich/streetscape-tracker/issues/316) put read-only traffic on the host while the answer was still open.
 It records what was found before that traffic, and what paced it.
 
 **Nothing is documented.** No rate limit appears in the API documentation, in the OpenAPI spec at `https://api.panoramax.xyz/openapi.json`, or in any third-party restatement found.
@@ -471,12 +471,15 @@ Until that is answered it is a **known caveat on every Panoramax diff**, not a s
 **What we actually send this host, as of the growth screen (2026-09-09).**
 Two things, both on the same IP and serialized against each other by one machine-wide `host_lock(HOST_PANORAMAX)`:
 
-- **Hand-run collections** — a city's z15 tile census, p50 414 tiles for a leader city, max 3,132.
+- **Nightly collections** — a city's z15 tile census, p50 414 tiles for a leader city, max 3,132, on the two opt-in channels [#335](https://github.com/jonfroehlich/streetscape-tracker/issues/335) wired.
+  Both read ONE census per (city, bbox) and share it through the #290 cache, so an enrolled pair costs what the grid run alone costs, and the budget that bounds a night is the per-IP SUM of the two blocks (4,000 + 4,000 un-paired) rather than either figure alone.
+  Enrolment is the rate this proceeds at: seed a handful of cities, not the ~20 leaders at once.
 - **The weekly screen** ([#316](https://github.com/jonfroehlich/streetscape-tracker/issues/316) phase 2) — **113 requests, once a week**, answering all 1,144 enabled cities off the v2 `grid` layer at z6.
-  That is the entire standing load, and it is small enough that the interesting number is not its volume but its regularity: it fires on a fixed weekday at a fixed hour, so it is the one traffic shape here that a scorer could learn.
+  It is small enough that the interesting number is not its volume but its regularity: it fires on a fixed weekday at a fixed hour, so it is the one traffic shape here that a scorer could learn.
   It is paced and jittered identically to a collection, from the same constants.
-  **What it does NOT yet do is follow a config change**: `panoramax` is still an unwired channel, so `load_scheduler_config` drops a `[providers.panoramax]` block before `_screen_pacing` could read it, and lowering the rate in the TOML leaves next Monday's screen at 30/min.
-  During a block the lever that works is stopping the timer (`systemctl --user stop streetscape-screen-provider.timer`); wiring the channel (#316 PR 3) makes the coupling real, and a test goes red at that moment so this paragraph is updated with it.
+  **It now FOLLOWS a config change, and did not before** (#335): `panoramax` was an unwired channel, so `load_scheduler_config` dropped a `[providers.panoramax]` block before `_screen_pacing` could read it and lowering the rate in the TOML left next Monday's screen at 30/min.
+  The channel is wired, the block loads, and the screen paces from it — one host, one pace.
+  During a block the lever that stops this host's traffic outright is still the timer (`systemctl --user stop streetscape-screen-provider.timer`), plus `enabled = false` on both channel blocks.
 
 Its requests land in the same `(date, provider)` ledger row a collection writes, so a budget gate reading `api_usage` sees the real total rather than the collection's share of it.
 

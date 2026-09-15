@@ -565,6 +565,7 @@ def run_collect(args: argparse.Namespace) -> int:
             cap = {
                 "kartaview": getattr(args, "kartaview_max_requests", None),
                 "mapillary": getattr(args, "mapillary_max_requests", None),
+                "panoramax": getattr(args, "panoramax_max_requests", None),
             }.get(provider)
             gated_requests = min(estimated_requests, cap) if cap is not None else estimated_requests
             # `gated_requests > 0` FIRST, because a collection that spends
@@ -650,6 +651,7 @@ def run_collect(args: argparse.Namespace) -> int:
                         request_timeout=args.timeout,
                         max_requests_per_minute=args.panoramax_max_requests_per_minute,
                         jitter=args.panoramax_jitter,
+                        max_requests=args.panoramax_max_requests,
                         checkpoint_path=checkpoint_path,
                         checkpoint_channel=budget_channel,
                         checkpoint_variant=args.network_type,
@@ -1056,6 +1058,21 @@ def build_parser() -> argparse.ArgumentParser:
             "shifted-exponential shape and coefficient of variation as "
             f"--mapillary-jitter (default: {PANORAMAX_TILE_JITTER}; 0 restores "
             "an exact cadence)"
+        ),
+    )
+    parser.add_argument(
+        "--panoramax-max-requests",
+        # positive_int for the reason both flags above carry it: 0 is not
+        # "off", it is a crawl that stops before committing a tile,
+        # checkpoints nothing, and exits 83 telling the operator to re-run.
+        type=positive_int,
+        default=None,
+        help=(
+            "Stop the walk's Panoramax tile census after this many requests and "
+            "CHECKPOINT the rest. Nothing is published and the run exits "
+            f"{SWEEP_INCOMPLETE_EXIT_CODE}, so the next run resumes rather than "
+            "re-paying (issues #318, #335). A soft ceiling: requests already in "
+            "flight are allowed to finish. Default: fetch every tile."
         ),
     )
     parser.add_argument(
