@@ -414,3 +414,119 @@ def test_a_successful_fetch_still_works_end_to_end(monkeypatch, tmp_path):
     monkeypatch.setattr(dsn.ox, "save_graphml", lambda g, p: open(p, "w").close())
 
     assert dsn.fetch_graph(_city_row(), str(tmp_path)) is graph
+
+
+# ---------------------------------------------------------------------------
+# The breaker's RESET test is fail-closed (issue #341)
+#
+# `_overpass_refusing` above is the pre-flight and is fail-OPEN by contract: a
+# false alarm there skips a healthy city. `overpass_serving` is its mirror
+# image, the predicate the scheduler's breaker uses to decide a latched
+# Overpass may be asked again -- and there the asymmetry runs the other way:
+# the one confirmed abuse ban (2026-08-14) presented as a TCP connection
+# refused, which a fail-open test reads as "not refusing". So only a positive
+# signal clears it.
+# ---------------------------------------------------------------------------
+
+from streetscape_metadata_tracker import download_common as dc  # noqa: E402
+
+_QUEUED = (
+    "Connected as: 403941390\nRate limit: 2\n"
+    "Slot available after: 2026-09-15T14:02:11Z, in 12 seconds.\n"
+)
+
+
+def test_the_reset_test_needs_a_200_with_a_slots_line(monkeypatch):
+    monkeypatch.setattr(dc.requests, "get", lambda *a, **k: _FakeStatus(200, _HEALTHY))
+    assert dc.overpass_serving() is True
+
+
+def test_a_queued_slot_is_serving(monkeypatch):
+    """Both of our slots in use is the normal state of a working night; osmnx
+    sleeps the advertised wait off. The instance knows this IP and will serve it."""
+    monkeypatch.setattr(dc.requests, "get", lambda *a, **k: _FakeStatus(200, _QUEUED))
+    assert dc.overpass_serving() is True
+
+
+@pytest.mark.parametrize("code", [403, 429, 509, 406, 500, 502, 503, 504])
+def test_the_reset_test_stays_closed_on_every_non_200(monkeypatch, code):
+    """The pre-flight treats a 5xx as 'can't tell -- proceed'. Here 'can't tell'
+    keeps the breaker latched: a refusal is not over until the host says so."""
+    monkeypatch.setattr(dc.requests, "get", lambda *a, c=code, **k: _FakeStatus(c, _HEALTHY))
+    assert dc.overpass_serving() is False
+
+
+def test_the_reset_test_stays_closed_when_unreachable(monkeypatch):
+    """The 2026-08-14 ban signature. A reset test that read this as 'not
+    refusing' would clear the breaker straight into a live ban, and the next
+    real fetch would spend 3-8 minutes inside the host lock re-tripping it."""
+
+    def refused(*a, **k):
+        raise requests.exceptions.ConnectionError("[Errno 111] Connection refused")
+
+    monkeypatch.setattr(dc.requests, "get", refused)
+    assert dc.overpass_serving() is False
+
+    def timed_out(*a, **k):
+        raise requests.exceptions.Timeout("read timed out")
+
+    monkeypatch.setattr(dc.requests, "get", timed_out)
+    assert dc.overpass_serving() is False
+
+
+def test_a_200_with_an_unfamiliar_body_is_not_serving(monkeypatch):
+    """A captive portal, a maintenance page, or a format change all arrive as
+    200 + text. None of them is the slots line, so none of them clears it."""
+    for body in ("", "<html>maintenance</html>", "Connected as: 1\nRate limit: 2\n"):
+        monkeypatch.setattr(dc.requests, "get", lambda *a, b=body, **k: _FakeStatus(200, b))
+        assert dc.overpass_serving() is False, body
+
+
+def test_the_reset_test_sends_our_identity_not_the_requests_default(monkeypatch):
+    """overpass-api.de answers 406 to the stock python-requests UA (measured
+    2026-08-15). A re-check sent without our headers would read a healthy
+    instance as refusing and never clear the breaker."""
+    seen = {}
+
+    def capture(url, timeout, headers):
+        seen["url"], seen["headers"] = url, headers
+        return _FakeStatus(200, _HEALTHY)
+
+    monkeypatch.setattr(dc.requests, "get", capture)
+    monkeypatch.delenv(dc.OVERPASS_URL_ENV, raising=False)
+    assert dc.overpass_serving() is True
+    assert seen["headers"]["User-Agent"] == dc.OVERPASS_USER_AGENT
+    assert "python-requests" not in seen["headers"]["User-Agent"]
+    assert seen["headers"]["Referer"] == dc.OVERPASS_REFERER
+    assert seen["url"] == dc.DEFAULT_OVERPASS_URL + "/status"
+
+
+def test_the_reset_test_asks_the_same_instance_the_fetch_uses(monkeypatch):
+    """The scheduler cannot import osmnx, so the re-check carries its own copy
+    of the endpoint and the identity. Both must equal what osmnx is told, or a
+    re-check clears the breaker against a different host than the fetch it is
+    clearing the way for."""
+    monkeypatch.delenv(dc.OVERPASS_URL_ENV, raising=False)
+    monkeypatch.setattr(ox.settings, "overpass_url", "https://overpass-api.de/api")
+    dsn._apply_overpass_url()
+    assert dc.DEFAULT_OVERPASS_URL == ox.settings.overpass_url
+    assert dc.overpass_url() == ox.settings.overpass_url
+    assert ox.settings.http_user_agent == dc.OVERPASS_USER_AGENT
+    assert ox.settings.http_referer == dc.OVERPASS_REFERER
+    # And the mirror override reaches both.
+    monkeypatch.setenv(dc.OVERPASS_URL_ENV, "https://overpass.example.org/api")
+    dsn._apply_overpass_url()
+    assert dc.overpass_url() == ox.settings.overpass_url == "https://overpass.example.org/api"
+    assert dsn.OVERPASS_URL_ENV == dc.OVERPASS_URL_ENV
+
+
+def test_the_reset_test_is_one_request_with_no_retry(monkeypatch):
+    calls = []
+
+    def refused(*a, **k):
+        calls.append(1)
+        raise requests.exceptions.ConnectionError("refused")
+
+    monkeypatch.setattr(dc.requests, "get", refused)
+    assert dc.overpass_serving() is False
+    assert len(calls) == 1

@@ -33,11 +33,20 @@ from streetscape_metadata_tracker import db
 from streetscape_metadata_tracker.db import CityRow
 from streetscape_metadata_tracker.download_common import (
     HOST_OVERPASS,
+    OVERPASS_REFERER,
+    OVERPASS_URL_ENV,
+    OVERPASS_USER_AGENT,
     DownloadError,
     HostBlockedError,
     grid_bbox,
 )
 from streetscape_metadata_tracker.host_lock import host_lock
+from streetscape_metadata_tracker.naming import (
+    DEFAULT_NETWORK_TYPE,
+    network_cache_filename,
+    network_cache_path,
+    osm_cache_dir,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -75,13 +84,14 @@ ox.settings.overpass_rate_limit = True
 # osmnx, which makes us indistinguishable from every other osmnx user on a
 # shared volunteer-run instance. geoutils.py already does this for Nominatim;
 # this is the same courtesy for Overpass, and it is what lets a maintainer
-# contact us rather than simply firewalling the IP (issue #209).
-ox.settings.http_user_agent = "streetscape_metadata_tracker (jonf@cs.uw.edu)"
-ox.settings.http_referer = "https://github.com/jonfroehlich/streetscape-tracker"
+# contact us rather than simply firewalling the IP (issue #209). The strings
+# live in download_common so the scheduler's osmnx-free breaker re-check
+# (issue #341) sends the identical identity.
+ox.settings.http_user_agent = OVERPASS_USER_AGENT
+ox.settings.http_referer = OVERPASS_REFERER
 
-# Incident-time escape hatch: point at a mirror when the main instance is
-# refusing this host.
-OVERPASS_URL_ENV = "OVERPASS_URL"
+# `OVERPASS_URL_ENV` is imported from download_common and re-exported here for
+# the callers and tests that always read it from this module.
 
 
 def _apply_overpass_url() -> None:
@@ -145,29 +155,13 @@ _RETRYABLE_OVERPASS = (
     requests.exceptions.Timeout,
 )
 
-NETWORK_TYPE = "drive"
+NETWORK_TYPE = DEFAULT_NETWORK_TYPE
 
-
-def _cache_dir(data_dir: str) -> str:
-    return os.path.join(data_dir, "osm_cache")
-
-
-def network_cache_filename(city_id: str, network_type: str = NETWORK_TYPE) -> str:
-    """
-    GraphML basename for a city's frozen street network.
-
-    The default 'drive' network keeps the original un-suffixed name so the
-    caches (and catalog rows) predating network_type stay valid; other types
-    (issue #99's 'walk'/'all') get an explicit suffix.
-    """
-    if network_type == NETWORK_TYPE:
-        return f"{city_id}_streets_network.graphml"
-    return f"{city_id}_streets_network_{network_type}.graphml"
-
-
-def network_cache_path(city_id: str, data_dir: str, network_type: str = NETWORK_TYPE) -> str:
-    """Unpublished GraphML path for a city's frozen street network."""
-    return os.path.join(_cache_dir(data_dir), network_cache_filename(city_id, network_type))
+# `network_cache_filename` / `network_cache_path` moved to naming.py (the
+# single source of truth for filenames) so the scheduler can test for a frozen
+# network without importing this module's osmnx stack (issue #341). They are
+# imported above and stay importable from here.
+_cache_dir = osm_cache_dir
 
 
 class _DeadlineExceeded(TimeoutError):

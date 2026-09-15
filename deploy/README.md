@@ -308,6 +308,18 @@ you'll get an email you caused. That is the intended trade: the alternative is a
 skipped collection nobody notices. Prefer running manual work when
 `systemctl --user status streetscape-tracker.service` shows the timer idle.
 
+**Freezing tonight's street networks by day (issue #341).** A walk on a frozen
+GraphML never contacts Overpass, so a daytime pass over the night's walk slate
+takes Overpass out of the nightly window and a mid-night refusal strands
+nothing. Dry-run by default; it refuses to run beside an in-flight `run-due`:
+
+```bash
+python scripts/prefreeze_street_networks.py --config config/scheduler.makelab1.toml            # list
+python scripts/prefreeze_street_networks.py --config config/scheduler.makelab1.toml --execute  # freeze, 2 min apart
+```
+
+No timer ships for it; see docs/operations.md before scheduling one.
+
 Three rules for manual work:
 
 1. **Use the same lock directory as the scheduler.** The unit sets

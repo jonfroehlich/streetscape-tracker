@@ -749,3 +749,36 @@ def test_dispatch_refuses_a_provider_with_no_collector(tmp_path, monkeypatch, ca
     # Nothing was published under the kartaview name -- the failure this prevents
     # is an immutable dated snapshot carrying another provider's data.
     assert not [f for f in os.listdir(data_dir) if "newprovider" in f]
+
+
+def test_estimate_says_when_it_fetched_the_network_from_overpass(tmp_path, monkeypatch, capsys):
+    """`--estimate` issues no IMAGERY request, but on a cold city the call that
+    computes the estimate fetches and freezes the street network first -- one
+    real Overpass query, through the host lock. That is the mechanism
+    scripts/prefreeze_street_networks.py relies on (issue #341), and the
+    report has to say so rather than claim nothing was requested."""
+    data_dir = _setup(tmp_path, monkeypatch)
+    monkeypatch.delenv("GMAPS_STREETS_API_KEY", raising=False)
+
+    rc = collect.run_collect(_args(data_dir, estimate=True))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "No imagery requests issued (--estimate)" in out
+    assert "fetched from Overpass and frozen" in out
+    assert "No requests issued" not in out
+
+    # With the network already frozen, nothing at all was requested.
+    path = naming.network_cache_path(CITY_ID, data_dir, "drive")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    open(path, "w").close()
+    rc = collect.run_collect(_args(data_dir, estimate=True))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "No requests issued (--estimate)." in out
+    assert "Overpass" not in out
+
+    # --refresh re-fetches even a frozen one, and says so.
+    rc = collect.run_collect(_args(data_dir, estimate=True, refresh=True))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "re-fetched from Overpass and frozen" in out

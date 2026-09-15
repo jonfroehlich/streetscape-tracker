@@ -137,6 +137,7 @@ from streetscape_metadata_tracker.naming import (
     DEFAULT_NETWORK_TYPE,
     STREETWALK_NETWORK_TOKENS,
     generate_streetwalk_filename,
+    network_cache_path,
     streetwalk_coverage_filename,
 )
 from streetscape_metadata_tracker.paths import get_default_data_dir
@@ -352,6 +353,13 @@ def run_collect(args: argparse.Namespace) -> int:
         # A cached network costs nothing; a cold one goes to Overpass, which
         # meters by IP — so a busy or blocked host exits with that host's code
         # rather than an anonymous 1 (issue #208).
+        #
+        # Read BEFORE the fetch, because the fetch is what freezes it: the
+        # --estimate report below has to say whether Overpass was just queried,
+        # and after fetch_street_edges returns the network is always frozen.
+        network_was_frozen = os.path.exists(
+            network_cache_path(city.city_id, data_dir, args.network_type)
+        )
         try:
             edges = fetch_street_edges(
                 city, data_dir, refresh=args.refresh, network_type=args.network_type, conn=conn
@@ -393,10 +401,23 @@ def run_collect(args: argparse.Namespace) -> int:
                     f"~{model.estimate(city.center_lat, city.center_lon, city.grid_width_m, city.grid_height_m, city.step_m)}"
                     f" {model.unit} (independent of spacing)"
                 )
+            # "No requests" is only true of IMAGERY requests. A cold city's
+            # network was fetched from Overpass and frozen by the call above
+            # — that is the whole mechanism scripts/prefreeze_street_networks.py
+            # relies on (issue #341) — and saying otherwise sent an operator
+            # looking for a request that had already been made.
+            if network_was_frozen and not args.refresh:
+                issued = "No requests issued (--estimate)."
+            else:
+                issued = (
+                    "No imagery requests issued (--estimate); the street network was "
+                    f"{'re-fetched' if args.refresh else 'cold, so it was fetched'} from "
+                    "Overpass and frozen."
+                )
             print(
                 f"{city.city_id} [{args.network_type}]: {len(edges)} edges, "
                 f"{len(samples)} samples, {cost} "
-                f"(spacing={args.spacing}m). No requests issued (--estimate)."
+                f"(spacing={args.spacing}m). {issued}"
             )
             return 0
 

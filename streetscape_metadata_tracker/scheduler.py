@@ -88,6 +88,7 @@ from .download_common import (
     HostUnavailableError,
     coerce_jitter,
     host_exit_code,
+    overpass_serving,
     redact_credentials,
 )
 from .download_kartaview import (
@@ -116,6 +117,7 @@ from .naming import (
     KNOWN_PROVIDERS,
     STREETWALK_NETWORK_TOKENS,
     generate_streetwalk_filename,
+    network_cache_path,
     streetwalk_coverage_filename,
 )
 from .walk_diff import compute_and_record_walk_diff
@@ -186,6 +188,194 @@ CHANNEL_HOSTS: dict[str, tuple[str, ...]] = {
     # this number.
     "panoramax": (HOST_PANORAMAX,),
 }
+
+# The per-IP host breaker's re-check policy (issue #341).
+#
+# Before #341 a refusal latched for the rest of the night and nothing ever
+# re-asked. That was right for the one condition the breaker was built on -- a
+# Mapillary tile block lasts ~24 h (docs/provider-access.md measures three of
+# them), so re-probing it inside a night is exactly the retry hazard the
+# forum warned about. Overpass turned out to be different: on 2026-09-13 and
+# 09-15 a refusal cleared within about an hour, and the latch then skipped
+# every remaining street channel of the night, stranding 20 cities un-paired
+# for ~83 days (each one's GSV grid run had succeeded, so the city was not due
+# again on gsv, while its walk was never done).
+#
+# So a latched host is re-checked, but only where a POSITIVE reset test exists
+# for it (HOST_RECHECKS): one request, on a cooldown, capped per night. A host
+# with no entry keeps the original all-night latch -- that is the deliberate
+# answer for Mapillary and KartaView, not an omission, and the table is the
+# place to say so if that ever changes.
+#
+# The cooldown is measured from the trip, or from the last re-check that
+# still said "not serving". 45 min sits inside the ~1 h both Overpass
+# refusals took to clear and is far longer than any pacing interval here; the
+# cap of 4 bounds a night's re-checks to the first three hours after a trip
+# (the two measured clears fell inside that) and bounds how many real fetches
+# a host that answers /status but refuses /interpreter could cost -- each
+# re-trip is a 3-8 minute fetch inside the host lock.
+HOST_RECHECK_COOLDOWN_S = 45 * 60
+HOST_RECHECKS_PER_NIGHT = 4
+
+# host -> zero-argument predicate answering "is this host positively serving
+# this IP right now?". FAIL-CLOSED by contract: the predicate returns True only
+# on a positive signal (for Overpass, an HTTP 200 from /status with a
+# parseable slots line) and False on anything else -- unreachable, a timeout,
+# a 5xx, an unfamiliar body. Do NOT reuse the fetch's advisory pre-flight
+# (`download_street_network._overpass_refusing`) here: that one is fail-OPEN
+# on purpose, and the one confirmed abuse ban (2026-08-14) presented as a TCP
+# connection refused, which a fail-open test reads as "not refusing".
+#
+# Read at re-check time via `.get`, so a test can swap an entry and the autouse
+# conftest fixture can pin every entry to "still refusing" -- the suite must
+# never send a real request to a volunteer-run host.
+HOST_RECHECKS: dict[str, Callable[[], bool]] = {
+    HOST_OVERPASS: overpass_serving,
+}
+
+
+class HostBreaker(set):
+    """
+    The night-level per-IP host breaker (issues #208, #341).
+
+    A ``set`` of the hosts that refused this machine at any point tonight --
+    that membership is MONOTONE, so ``bool(breaker)`` still means "a third
+    party refused us tonight" for the alert and the exit status, and a plain
+    ``==`` against a set of host names keeps working. What is new is
+    ``latched``: the subset currently blocking launches. A host leaves
+    ``latched`` (never the set itself) when a re-check says it is serving
+    again, and re-enters it if a later child is refused.
+
+    Trip it with ``add(host)`` (``trip`` is an alias); the other ``set``
+    mutators are not overridden and must not be used to trip or clear it.
+
+    Ask it with ``blocking(hosts)``: the hosts among ``hosts`` that are
+    latched right now, after running any re-check that is due. That is the ONE
+    place a re-check happens, so a re-check is only ever spent when a launch
+    actually wants the host -- a latched host nothing asks about again is
+    never probed.
+
+    ``stranded`` is what a refusal COST, recorded by the launch loop rather
+    than here: cities that came out of the night with a grid run and no road
+    walk because a refused host cost them the walk -- the refused child's own
+    city, and every city the breaker then skipped -- while the grid sibling
+    succeeded. Those are the ones with no route back for ~83 days, and the
+    ``Done:`` line and the alert name them (issue #341).
+
+    ``clock`` is injectable so a test can move time without sleeping. The
+    cooldown and cap are per instance; ``None`` (the default) resolves them
+    from the module constants AT CONSTRUCTION, not at class definition, so a
+    test that monkeypatches ``HOST_RECHECK_COOLDOWN_S`` to 0 gets a breaker
+    that re-checks on every ask -- which is how the loop-level tests exercise
+    the recovery path without a fake clock.
+    """
+
+    def __init__(
+        self,
+        *,
+        cooldown_s: float | None = None,
+        max_rechecks: int | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ):
+        super().__init__()
+        self.cooldown_s = HOST_RECHECK_COOLDOWN_S if cooldown_s is None else cooldown_s
+        self.max_rechecks = HOST_RECHECKS_PER_NIGHT if max_rechecks is None else max_rechecks
+        self._clock = clock
+        self.latched: set[str] = set()
+        self.trips: Counter[str] = Counter()
+        self.rechecks: Counter[str] = Counter()
+        self.recoveries: Counter[str] = Counter()
+        # Channel launches skipped while a host was latched, per host.
+        self.skipped: Counter[str] = Counter()
+        # city_id -> street channels a refused host cost the city while its
+        # grid sibling succeeded tonight. Insertion-ordered: the night's order.
+        self.stranded: dict[str, list[str]] = {}
+        self._next_recheck_at: dict[str, float] = {}
+
+    def add(self, host: str) -> None:
+        """Record that ``host`` refused this machine; latch its channels."""
+        super().add(host)
+        self.latched.add(host)
+        self.trips[host] += 1
+        self._next_recheck_at[host] = self._clock() + self.cooldown_s
+
+    trip = add
+
+    @property
+    def recovered(self) -> set[str]:
+        """Hosts that refused us tonight and are not latched now."""
+        return {host for host in self if host not in self.latched}
+
+    def blocking(self, hosts) -> set[str]:
+        """The hosts among ``hosts`` still latched, after any due re-check."""
+        wanted = self.latched.intersection(hosts)
+        for host in sorted(wanted):
+            self._maybe_recheck(host)
+        return self.latched.intersection(hosts)
+
+    def strand(self, city_id: str, provider: str) -> None:
+        self.stranded.setdefault(city_id, []).append(provider)
+
+    def _maybe_recheck(self, host: str) -> None:
+        probe = HOST_RECHECKS.get(host)
+        if probe is None or self.rechecks[host] >= self.max_rechecks:
+            return
+        now = self._clock()
+        if now < self._next_recheck_at[host]:
+            return
+        # Count and re-arm BEFORE probing, so a probe that raises still spends
+        # its slot and still waits out a cooldown -- an exception is not a
+        # reason to ask again sooner.
+        self.rechecks[host] += 1
+        self._next_recheck_at[host] = now + self.cooldown_s
+        label = HOST_LABELS.get(host, host)
+        left = self.max_rechecks - self.rechecks[host]
+        logger.info(
+            f"Re-checking {label} ({self.rechecks[host]}/{self.max_rechecks} tonight) "
+            f"{self.cooldown_s / 60:g} min after it last refused this host"
+        )
+        try:
+            serving = bool(probe())
+        except Exception:  # noqa: BLE001 - a raising probe is "not serving", never a crash
+            logger.exception(f"Re-check of {label} raised; treating it as still refusing")
+            serving = False
+        if serving:
+            self.latched.discard(host)
+            self.recoveries[host] += 1
+            logger.warning(
+                f"{label} is serving this host again — resuming its channels "
+                f"({self.skipped[host]} launch(es) were skipped while it was latched)"
+            )
+        else:
+            logger.info(
+                f"{label} is still not serving this host; its channels stay skipped"
+                + (
+                    f" (next re-check in {self.cooldown_s / 60:g} min, {left} left tonight)"
+                    if left
+                    else " for the rest of the night (re-checks exhausted)"
+                )
+            )
+
+
+def _walk_network_is_frozen(cfg: "SchedulerConfig", city: db.CityRow, provider: str) -> bool:
+    """
+    True when this street channel's walk of ``city`` would never contact Overpass.
+
+    ``fetch_graph`` returns a frozen GraphML BEFORE taking the Overpass host
+    lock or probing, so a walk on a frozen network is not an Overpass request
+    at all, and a latched Overpass breaker has no reason to skip it (issue
+    #341). Keyed on the channel's configured ``network_type``, because a
+    frozen 'drive' network says nothing about an 'all_public' walk.
+
+    Only ever relaxes the Overpass entry: the other host a walk may need (the
+    Mapillary tile CDN, kartaview.org) is asked for the census regardless.
+    """
+    if not is_street_channel(provider):
+        return False
+    pc = (cfg.providers or {}).get(provider)
+    network_type = pc.network_type if pc is not None else DEFAULT_NETWORK_TYPE
+    return os.path.exists(network_cache_path(city.city_id, cfg.data_dir, network_type))
+
 
 # What a NULL `schedule_state.member` means for each channel (issue #248), i.e.
 # whether a channel's nightly queue is the whole enabled catalog or only the
@@ -4602,7 +4792,7 @@ def cmd_assess_city(
             print("Aborted; nothing collected.")
             return 0
 
-    blocked_hosts: set[str] = set()
+    blocked_hosts = HostBreaker()
     busy_hosts: Counter[str] = Counter()
     # Unreachable for this command as it stands — assess-city's channel
     # vocabulary has no KartaView in it, and the sibling deferral is a property
@@ -6279,11 +6469,7 @@ def cmd_run_due(
     if stop_reason:
         logger.info(f"Stopped early: {stop_reason}")
 
-    blocked_note = (
-        "; ".join(sorted(HOST_LABELS.get(h, h) for h in blocked_hosts)) + " unavailable"
-        if blocked_hosts
-        else ""
-    )
+    blocked_note = _blocked_summary_note(blocked_hosts)
     busy_note = (
         f"{sum(busy_hosts.values())} channel(s) skipped, "
         + _host_names(busy_hosts)
@@ -6313,6 +6499,14 @@ def cmd_run_due(
             else ""
         )
         + (f"; {blocked_note}" if blocked_note else "")
+        # The COUNT here and the names in the [alerts] mail (issue #341): a
+        # stranded city has no route back for ~83 days, and "1 host(s)
+        # UNAVAILABLE" said nothing about that on the two nights it cost 20.
+        + (
+            f"; {len(blocked_hosts.stranded)} city(ies) STRANDED un-walked by the breaker"
+            if blocked_hosts.stranded
+            else ""
+        )
         + (f"; {busy_note}" if busy_note else "")
         + (f"; stopped early ({stop_reason})" if stop_reason else "")
         + (f"; {plan_error}" if plan_error else "")
@@ -6450,7 +6644,7 @@ def _run_city_channels(
     today: date,
     providers: list[str],
     *,
-    blocked_hosts: set[str],
+    blocked_hosts: HostBreaker,
     busy_hosts: Counter[str],
     deferred_channels: Counter[str],
     batch_deadline: float | None,
@@ -6491,8 +6685,17 @@ def _run_city_channels(
     ``blocked_hosts`` and ``busy_hosts`` are owned by the caller and mutated in
     place, because the breaker's scope is the whole run, not one city: a host
     that refused us cannot answer differently for the next city, so its channels
-    stay skipped once seen. A *busy* host is only counted — that condition ends
-    when the other local process does.
+    stay skipped once seen — until the breaker's own re-check says the host is
+    serving again (``HostBreaker.blocking``, issue #341), which is asked here at
+    submit time and nowhere else. A *busy* host is only counted — that
+    condition ends when the other local process does.
+
+    A breaker skip of a street channel whose grid sibling succeeded tonight is
+    recorded on the breaker as a STRANDING (issue #341): the city leaves the
+    night with a grid run and no walk, is not due on the grid channel for
+    another cycle, and so has no route back to the walk except the bounded
+    opt-in reservation. It is decided after the city drains rather than at the
+    skip, because with lanes the sibling may still be in flight at skip time.
 
     ``deferred_channels`` counts, per channel, the walks this city stood down
     because their GRID sibling's sweep of the same lattice is still in flight
@@ -6536,6 +6739,11 @@ def _run_city_channels(
     should not count against the city cap or earn an inter-city sleep.
     """
     attempted = succeeded = skipped_budget = 0
+    # Inputs to the stranding decision at the bottom: which of this city's
+    # channels a refused host cost it -- the child that WAS the refusal, and
+    # every channel the breaker then skipped -- and which channels landed.
+    lost_to_host: list[str] = []
+    succeeded_channels: set[str] = set()
     lanes = max(1, cfg.max_concurrent_channels)
     # `connection_limit` is a HOST budget, so it is divided across lanes rather
     # than handed to each child whole. The resource guard reads host-wide
@@ -6673,8 +6881,30 @@ def _run_city_channels(
                         # this and later cities are still worth running. Deliberately
                         # BEFORE the budget checks — there is no point pricing work
                         # we already know we will not do.
-                        unavailable = blocked_hosts.intersection(CHANNEL_HOSTS.get(provider, ()))
+                        #
+                        # `blocking` rather than a set intersection: it is where a
+                        # latched host gets its cooldown re-check (issue #341), so a
+                        # refusal that cleared mid-night resumes the channel from
+                        # this launch on.
+                        unavailable = blocked_hosts.blocking(CHANNEL_HOSTS.get(provider, ()))
+                        if HOST_OVERPASS in unavailable and _walk_network_is_frozen(
+                            cfg, city, provider
+                        ):
+                            # This walk loads its frozen GraphML and never contacts
+                            # Overpass, so a latched Overpass breaker is no reason to
+                            # skip it (issue #341). Only the Overpass entry is relaxed;
+                            # a walk whose census host is also latched still waits.
+                            logger.info(
+                                f"{city.city_id} [{provider}]: {HOST_LABELS[HOST_OVERPASS]} "
+                                f"refused this host earlier tonight, but this city's "
+                                f"street network is already frozen, so the walk never "
+                                f"contacts it — launching."
+                            )
+                            unavailable = unavailable - {HOST_OVERPASS}
                         if unavailable:
+                            for host in unavailable:
+                                blocked_hosts.skipped[host] += 1
+                            lost_to_host.append(provider)
                             logger.info(
                                 f"{city.city_id} [{provider}]: skipping — "
                                 f"{_host_names(unavailable)} "
@@ -6989,6 +7219,7 @@ def _run_city_channels(
                         # first step, so there is never a paid-for artifact to salvage
                         # here. Keep that true if either fetch ever moves later.
                         blocked_hosts.add(blocked_host)
+                        lost_to_host.append(provider)
                         logger.error(
                             f"{city.city_id} [{provider}]: {HOST_LABELS[blocked_host]} is "
                             f"unavailable to this host — skipping its remaining channels. "
@@ -7090,6 +7321,7 @@ def _run_city_channels(
                     attempted += 1
                     if ok:
                         succeeded += 1
+                        succeeded_channels.add(provider)
                         db.record_attempt(conn, city.city_id, success=True, provider=provider)
                     else:
                         if record_failures:
@@ -7117,6 +7349,26 @@ def _run_city_channels(
     # declined it. Silent when there is nothing left, and deliberately the ONLY
     # call site — see _log_stop_declined on why the wording lives in one place.
     _log_stop_declined(city.city_id, pending)
+
+    # The stranding record (issue #341). A walk a refused host cost this city
+    # -- whether its child was the refusal or the breaker skipped it -- whose
+    # GRID sibling landed tonight leaves the city with a grid run and no road
+    # walk: the grid success moved the city off the gsv-due list for a whole
+    # cycle, and the union the nightly slate is built from is ordered by the
+    # earliest channel a city is due on, so a city due only on a walk channel
+    # sits behind every gsv-due city and reaches a capped night only through
+    # the bounded opt-in reservation. Decided here, after the drain, so it is
+    # correct whether the sibling finished before or after the skip.
+    for provider in lost_to_host:
+        sibling = STREET_CHANNELS.get(provider)
+        if sibling is not None and sibling in succeeded_channels:
+            blocked_hosts.strand(city.city_id, provider)
+            logger.warning(
+                f"{city.city_id} [{provider}]: STRANDED — its {sibling} grid run succeeded "
+                f"tonight but a refused host cost it this walk, so the city leaves the "
+                f"night un-paired and is not due on {sibling} again for "
+                f"~{cfg.cycle_days - cfg.grace_days} days (issue #341)."
+            )
 
     return attempted, succeeded, skipped_budget
 
@@ -7169,7 +7421,7 @@ def _run_city_loop(
     """
     processed = succeeded = attempted = skipped_budget = 0
     stop_reason: str | None = None
-    blocked_hosts: set[str] = set()
+    blocked_hosts = HostBreaker()
     busy_hosts: Counter[str] = Counter()
     deferred_channels: Counter[str] = Counter()
     try:
@@ -7288,6 +7540,88 @@ def _tail_artifact(label: str, fn, conn, data_dir: str) -> tuple[Any, str | None
         return None, f"{label} failed: {type(e).__name__}: {e}"
 
 
+def _as_breaker(blocked_hosts: HostBreaker | set[str] | None) -> HostBreaker:
+    """Coerce the older ``set`` spelling of the breaker to a ``HostBreaker``.
+
+    A plain set of hosts is a breaker that tripped on each of them and never
+    re-checked -- exactly the pre-#341 meaning -- so a caller or test still
+    passing one gets the same alert it always did.
+    """
+    if isinstance(blocked_hosts, HostBreaker):
+        return blocked_hosts
+    breaker = HostBreaker()
+    for host in blocked_hosts or ():
+        breaker.add(host)
+    return breaker
+
+
+def _blocked_summary_note(breaker: HostBreaker) -> str:
+    """The ``Done:`` line's host-refusal clause, empty when nothing refused us."""
+    if not breaker:
+        return ""
+    parts = []
+    if breaker.latched:
+        parts.append(
+            "; ".join(sorted(HOST_LABELS.get(h, h) for h in breaker.latched)) + " unavailable"
+        )
+    if breaker.recovered:
+        parts.append(
+            "; ".join(sorted(HOST_LABELS.get(h, h) for h in breaker.recovered))
+            + " refused this host then recovered on re-check"
+        )
+    skipped = sum(breaker.skipped.values())
+    if skipped:
+        parts.append(f"{skipped} launch(es) skipped while latched")
+    return ", ".join(parts)
+
+
+def _blocked_alert_note(breaker: HostBreaker) -> str:
+    """The [alerts] paragraph about the hosts that refused us, or empty."""
+    if not breaker:
+        return ""
+    note = "This host's IP was refused by " + _host_names(breaker) + "."
+    if breaker.latched:
+        note += (
+            f" Still refusing at the end of the night: {_host_names(breaker.latched)} — its "
+            f"channels were skipped from the first refusal on, apart from re-checks "
+            f"({', '.join(f'{breaker.rechecks[h]} for {HOST_LABELS.get(h, h)}' for h in sorted(breaker.latched))} "
+            f"of {breaker.max_rechecks} allowed per night, {breaker.cooldown_s / 60:g} min apart; "
+            f"a host with no re-check stays latched all night by design, see HOST_RECHECKS)."
+        )
+    if breaker.recovered:
+        note += (
+            f" Serving again before the night ended: {_host_names(breaker.recovered)} — its "
+            f"channels resumed from the re-check that cleared it."
+        )
+    skipped = sum(breaker.skipped.values())
+    note += (
+        f" {skipped} channel launch(es) were skipped in all, and NO city was marked failed, so "
+        f"the skipped channels stay due. If a refusal repeats, check whether another process "
+        f"on this machine is collecting concurrently (issue #208); a refusal that clears within "
+        f"about an hour is the shape seen on 2026-09-13 and 09-15, while the one confirmed ban "
+        f"lasted ~20 h and presented as connection refused (issue #341)."
+    )
+    return note
+
+
+def _stranded_alert_note(cfg: SchedulerConfig, breaker: HostBreaker) -> str:
+    """The [alerts] paragraph naming the cities the breaker stranded, or empty."""
+    if not breaker.stranded:
+        return ""
+    lines = [f"{cid} ({', '.join(channels)})" for cid, channels in breaker.stranded.items()]
+    channels = sorted({c for chans in breaker.stranded.values() for c in chans})
+    per_channel = " or ".join(f"`scheduler run-due --provider {c} --limit N`" for c in channels)
+    return (
+        f"{len(breaker.stranded)} city(ies) came out of the night with a grid run but NO road "
+        f"walk, because a refused host cost them the walk while the grid sibling succeeded. "
+        f"Each is not due on the grid channel again for ~{cfg.cycle_days - cfg.grace_days} days, "
+        f"so nothing re-pairs it and it reaches a capped night only through the bounded "
+        f"[schedule].opt_in_cities_per_day reservation (issue #341). Walk them by hand once the "
+        f"host is confirmed serving this IP — {per_channel} — accepting that the walk will carry "
+        f"a later date than the grid run:\n  " + "\n  ".join(lines)
+    )
+
+
 def _finish_batch(
     cfg: SchedulerConfig,
     conn,
@@ -7298,7 +7632,7 @@ def _finish_batch(
     errored: bool = False,
     backup_error: str | None = None,
     plan_error: str | None = None,
-    blocked_hosts: set[str] | None = None,
+    blocked_hosts: HostBreaker | set[str] | None = None,
     busy_hosts: Counter[str] | None = None,
 ) -> int:
     """Rebuild the published indexes, back up the catalog, publish, alert.
@@ -7452,17 +7786,9 @@ def _finish_batch(
     # fail silently are the entire reason #145 existed: /projects/makeabilitylab
     # went unbacked-up for months because nothing was watching. This is the one
     # thing in the tail that must never degrade quietly.
-    blocked_hosts = blocked_hosts or set()
-    blocked_note = (
-        "This host's IP was refused by "
-        + _host_names(blocked_hosts)
-        + ". Those channels were skipped for the rest of the night and NO city was "
-        "marked failed, so they stay due and lead tomorrow's queue. If this repeats, "
-        "check whether another process on this machine is collecting concurrently "
-        "(issue #208)."
-        if blocked_hosts
-        else ""
-    )
+    blocked_hosts = _as_breaker(blocked_hosts)
+    blocked_note = _blocked_alert_note(blocked_hosts)
+    stranded_note = _stranded_alert_note(cfg, blocked_hosts)
 
     busy_hosts = busy_hosts or Counter()
     busy_note = (
@@ -7507,8 +7833,16 @@ def _finish_batch(
             parts.append(f"{len(tail_errors)} published index(es) FAILED")
         if plan_error:
             parts.append("DRIVING-PLAN FETCH FAILED")
-        if blocked_hosts:
-            parts.append(f"{len(blocked_hosts)} host(s) UNAVAILABLE")
+        if blocked_hosts.latched:
+            parts.append(f"{len(blocked_hosts.latched)} host(s) UNAVAILABLE")
+        if blocked_hosts.recovered:
+            # Recovered is still a refusal that cost the night launches (and
+            # possibly stranded cities), so it is named rather than folded
+            # into a clean subject -- but named as what it is, since the
+            # operator's next move differs: nothing to wait out.
+            parts.append(f"{len(blocked_hosts.recovered)} host(s) REFUSED then recovered")
+        if blocked_hosts.stranded:
+            parts.append(f"{len(blocked_hosts.stranded)} city(ies) STRANDED un-walked")
         if busy_hosts:
             parts.append(f"{sum(busy_hosts.values())} channel(s) SKIPPED (host busy)")
         # The failure count is the subject on an ordinary bad night, and noise
@@ -7525,6 +7859,7 @@ def _finish_batch(
             # failing driving-plan summary means Google's feed changed shape).
             + ("\n\n" + "\n".join(tail_errors) if tail_errors else "")
             + (f"\n\n{blocked_note}" if blocked_note else "")
+            + (f"\n\n{stranded_note}" if stranded_note else "")
             + (f"\n\n{busy_note}" if busy_note else "")
         )
         send_alert(
