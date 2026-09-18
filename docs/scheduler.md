@@ -379,11 +379,13 @@ Note the second-order effect the 12 h batch has on #273's cap arithmetic, record
 **The GSV daily budget followed a year later than it should have (2026-09-13, #304).**
 `[providers.gsv].daily_request_budget` 10M → 15M.
 The 20 → 40 city raise above was shipped without it, and the budget became the ceiling the cap used to be: 2026-09-11/12/13 spent **9,990,643 / 9,997,308 / 9,992,049** against the 10M cap — 99.9% every night — while deferring 20 / 14 / 16 cities for budget.
+That counter is not channel-keyed — one int covers every provider — so read 20 / 14 / 16 as upper bounds on the gsv share rather than as a gsv-only count.
 
 Read what that deferral actually costs carefully, because the summary line understates it.
 A city whose gsv run does not fit the remainder keeps running its other channels, so `city_attempted` is true and it still counts against `max_cities_per_day`.
 Those nights therefore processed a full 40 cities with up to half of them missing the grid run that is the point of the night — the loss is in the *composition* of the 40, not in a smaller number.
-Raising the budget converts those into real runs inside the same 40 cities: no extra cities, and no extra requests to any per-IP metered host, since Mapillary, KartaView and Overpass each have their own untouched budgets.
+Raising the budget converts those into real runs inside the same 40 cities: no extra cities, and no extra requests to any per-IP metered host.
+Mapillary and KartaView keep their own daily budgets, untouched by this line; Overpass is a **host** rather than a provider, so it has no `[providers.*]` budget to leave untouched at all, and this knob sends it nothing either way.
 
 Sized against idle wall clock rather than against a quota.
 Those three nights ran **9.18 / 7.61 / 5.87 h of the 12 h window** and all three ended on the city cap, leaving 2.8–6.1 h unused; at the measured median **30,137 req/min** (n=20) 2.8 h is ~5.1M requests.

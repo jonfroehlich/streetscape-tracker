@@ -96,16 +96,20 @@ enabled = true
 # 10M -> 15M on 2026-09-13 (#304). 10M stopped being headroom and became the
 # binding ceiling: 2026-09-11/12/13 spent 9,990,643 / 9,997,308 / 9,992,049 of
 # it -- 99.9% every night -- and deferred 20 / 14 / 16 cities for budget.
+# That deferral counter is not channel-keyed -- one int covers every
+# provider -- so those are UPPER BOUNDS on the gsv share, not gsv-only counts.
 #
 # What that deferral costs is easy to misread, so it is written down here. A
 # city whose gsv run does not fit the remainder is NOT dropped from the night:
 # its other channels still run, so it still counts against
 # [schedule].max_cities_per_day. The night therefore processed its full 40
-# cities with HALF of them missing the grid run that is the point of the
-# exercise. Raising this converts those into real runs inside the same 40
-# cities -- it does not add cities, and it adds no requests to any per-IP
-# metered host (Mapillary, KartaView, Overpass), each of which has its own
-# untouched budget.
+# cities with UP TO HALF of them missing the grid run that is the point of
+# the exercise. Raising this converts those into real runs inside the same
+# 40 cities -- it does not add cities, and it adds no requests to any
+# per-IP metered host. Mapillary and KartaView keep their own daily budgets,
+# untouched by this line; Overpass is a HOST rather than a provider, so it
+# has no [providers.*] budget to leave untouched at all, and this knob sends
+# it nothing either way.
 #
 # Sized against idle wall clock, not against a quota. Those three nights ran
 # 9.18 / 7.61 / 5.87 h of the 12 h window and ended on the CITY CAP, leaving
