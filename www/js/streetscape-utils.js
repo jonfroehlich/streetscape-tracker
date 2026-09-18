@@ -695,9 +695,17 @@ function isKnownProvider(key) {
  *
  * Accepts every generation on disk: legacy undated, the buggy float step an
  * old bug wrote (`_step_20.0`), dated, and provider-tagged. The leading
- * `[^/\\?#]+` is the hostile-input stance — no path separators, no traversal,
- * no query characters — so a crafted `?file=` cannot reach outside the
- * published data directory.
+ * `[^/\\?#\n]+` is the hostile-input stance — no path separators, no
+ * traversal, no query characters — so a crafted `?file=` cannot reach outside
+ * the published data directory.
+ *
+ * `\n` is excluded for a different reason: alignment, not safety. A negated
+ * character class matches a newline, while Python's `(?P<slug>.+?)` does not
+ * without DOTALL, so without it a slug carrying an embedded newline resolved
+ * a provider HERE and raised ValueError in naming.parse_filename — a real
+ * counterexample to the cross-language invariant below, measured with node
+ * rather than reasoned about. Nothing traversal-related turns on it: `/`,
+ * `\\`, `?` and `#` are already gone, so such a name merely 404s.
  *
  * It is a deliberately STRICTER subset of naming.FILENAME_RE, not a mirror of
  * it, because the two answer different questions: Python parses any name the
@@ -715,10 +723,13 @@ function isKnownProvider(key) {
  *     on disk, 0 of 1,161 in the published aggregate), and the pre-#338
  *     validator did not accept them either, so this is the status quo.
  *
- * The one divergence in the OTHER direction predates #338 and is left alone:
- * an impossible date like `_2026-13-45` is shape-valid here and raises in
- * Python, which builds a real `date`. It reaches nothing — such a name
- * resolves to a file that does not exist.
+ * One divergence survives and is left alone deliberately: an impossible date
+ * like `_2026-13-45` is shape-valid here and raises in Python, which builds a
+ * real `date`. Read it as what it is — a direct counterexample to the
+ * invariant below, since this resolves `gsv` where parse_filename refuses —
+ * and not as a case running the other way. It reaches nothing, because such a
+ * name resolves to a file that cannot exist; the cross-language test pins it
+ * explicitly so the exception stays visible.
  *
  * What MUST hold is the overlap: any name this resolves to a provider,
  * naming.parse_filename resolves to the SAME provider. That is pinned across
@@ -732,7 +743,7 @@ function isKnownProvider(key) {
  * "no token means gsv" contract, the second is a file we cannot render.
  */
 const RUN_FILENAME_RE =
-  /^[^/\\?#]+_width_\d+_height_\d+_step_\d+(?:\.\d+)?(?:_([a-z]+))?(?:_\d{4}-\d{2}-\d{2})?\.csv\.gz$/;
+  /^[^/\\?#\n]+_width_\d+_height_\d+_step_\d+(?:\.\d+)?(?:_([a-z]+))?(?:_\d{4}-\d{2}-\d{2})?\.csv\.gz$/;
 
 /**
  * Derive the imagery provider from a run data filename (the JS mirror of

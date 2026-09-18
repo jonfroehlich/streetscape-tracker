@@ -284,12 +284,17 @@ A name that is not a run filename at all — a diff, `cities.json.gz`, a travers
 **`RUN_FILENAME_RE` is a deliberately STRICTER subset of `naming.FILENAME_RE`, not a mirror of it**, and the JSDoc says so, because a reviewer reading "mirror" will eventually find the differences and file them as bugs.
 The two answer different questions: Python parses any name the project has ever written, from any path and any extension, while this validates a URL a stranger just handed the browser.
 Four narrowings, all intended — `.csv.gz` only (Python also strips `.json.gz`, `.csv`, `.json`, `.html` or nothing at all), no path component (Python takes the basename; here a separator IS the traversal attempt), no `#`, and integer `_width_`/`_height_` where Python accepts `_width_5000.0_`.
+A fifth exclusion, `\n` in the slug, is **alignment rather than narrowing**: a negated character class matches a newline and Python's `.` does not, so an embedded newline resolved a provider in JS and raised `ValueError` in `parse_filename` — measured with real `node` after the fact, and fixed in the JS class because Python is the stricter of the two and nothing legitimate carries a newline.
 The float case was checked rather than assumed: **0 of 2,390 names on disk and 0 of 1,161 in the published aggregate** carry float dimensions, and the pre-#338 validator did not accept them either, so nothing changed.
-One divergence runs the other way and predates all of this: an impossible date like `_2026-13-45` is shape-valid in JS and raises in Python, which builds a real `date`. It reaches nothing, because such a name resolves to a file that does not exist.
+One divergence survives, and the first telling of it here was backwards: an impossible date like `_2026-13-45` is shape-valid in JS and raises in Python, which builds a real `date`.
+That is a **direct counterexample** to the invariant below — JS resolves `gsv`, Python refuses — not a case running the other way.
+It reaches nothing, because such a name resolves to a file that cannot exist, and the cross-language test now pins it explicitly so the exception stays visible instead of being excluded from the corpus.
 
 **What must hold is the overlap, and it is pinned across the language boundary**: `test_the_js_run_filename_regex_agrees_with_python` (`tests/test_naming.py`) reads `RUN_FILENAME_RE` out of the JS source, runs it as a Python pattern, and asserts that any name it resolves to a provider, `parse_filename` resolves to the SAME provider.
 It sweeps `KNOWN_PROVIDERS` through `generate_run_filename` so a new provider is covered the day it is added, and it counts how many names actually resolved — a regex that matched nothing would otherwise make it vacuously green.
-Verified to fail on two real drift modes: dropping the capture group (the #338 shape, where a tokened name reads as gsv) and renaming the const out from under the anchor.
+Verified to fail on three real drift modes: dropping the capture group (the #338 shape, where a tokened name reads as gsv), renaming the const out from under the anchor, and re-admitting `\n` to the slug class.
+Be exact about its reach, since this PR's own thesis is that a contract in two languages drifts silently: it runs the JS pattern **text** through Python's engine, so it can never see a construct the two engines read differently.
+One such construct is live — JS's `$` without `m` is end-of-input while Python's also matches before a trailing newline — and the test translates it to `\Z` rather than leaving the port more permissive than the browser.
 The direction is deliberately one-way; demanding equality would fail on exactly the hostile inputs the narrowings exist to reject.
 
 **One regex, `RUN_FILENAME_RE`, now backs both functions.**

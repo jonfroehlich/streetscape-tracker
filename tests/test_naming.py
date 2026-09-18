@@ -438,6 +438,18 @@ def test_the_js_run_filename_regex_agrees_with_python():
     uses only ``[...]``, ``(?:...)``, one capture group and ``\\d``, with no
     JS-only syntax. ``re.ASCII`` keeps ``\\d`` from matching Unicode digits,
     which JS's ``\\d`` never does.
+
+    Be exact about what that buys, because it is less than it looks: this runs
+    the pattern **text** through Python's engine, never through the JS engine,
+    so any construct the two engines read differently has to be translated
+    below or the port quietly tests something the browser does not do. One
+    does -- see the ``$`` handling -- and it was found by running real ``node``
+    against real ``parse_filename``, not by reading either.
+
+    One name is a genuine EXCEPTION to the invariant rather than a gap in the
+    corpus, and it is pinned at the end rather than left out: an impossible
+    date (``_2026-13-45``) is shape-valid to any regex and raises in Python,
+    which builds a real ``date``.
     """
     import pathlib
     import re
@@ -447,7 +459,14 @@ def test_the_js_run_filename_regex_agrees_with_python():
 
     literal = re.search(r"^const RUN_FILENAME_RE =\n  /(.+)/;$", js, re.MULTILINE)
     assert literal, "www/js/streetscape-utils.js no longer spells `const RUN_FILENAME_RE =`"
-    js_re = re.compile(literal.group(1), re.ASCII)
+    # JS's `$` without the `m` flag means end-of-input; Python's `$` also
+    # matches BEFORE a trailing newline. Untranslated, the port therefore
+    # ACCEPTED "...csv.gz\n", a name real `node` refuses, and this test would
+    # have failed on a name the frontend never resolves at all. Python's `\Z`
+    # is the exact equivalent of JS's `$` here.
+    pattern = literal.group(1)
+    assert pattern.endswith("$"), "RUN_FILENAME_RE no longer ends in an end anchor"
+    js_re = re.compile(pattern[:-1] + r"\Z", re.ASCII)
 
     # Names JS is expected to RESOLVE (every generation, every provider), plus
     # names it is expected to REFUSE. Both halves go through the same loop: the
@@ -464,6 +483,16 @@ def test_the_js_run_filename_regex_agrees_with_python():
         "bend--or_diff_2026-04-01_to_2026-07-01.csv.gz",
         "../../../etc/passwd",
         "cities.json.gz",
+        # Measured against real `node` (2026-09-17); both sat outside the
+        # curated corpus until then. The first is why the JS slug class
+        # excludes \n: a negated character class MATCHES a newline, while
+        # Python's `.` does not without DOTALL, so JS resolved "mapillary" for
+        # a name `parse_filename` refuses outright. Restoring the old class
+        # fails this test instead of passing it silently.
+        "x\ny_width_5000_height_5000_step_20_mapillary_2026-07-05.csv.gz",
+        # The trailing-newline case the `\Z` translation above exists for:
+        # real JS refuses it, and so must the port.
+        "x_width_5000_height_5000_step_20_mapillary_2026-07-05.csv.gz\n",
     ]
     # Every registered provider's own dated run, built by the generator rather
     # than spelled, so a new provider is covered the day it is added.
@@ -494,3 +523,14 @@ def test_the_js_run_filename_regex_agrees_with_python():
     # matched nothing, or a rename that emptied the corpus, would otherwise
     # make this test vacuously green.
     assert resolved >= len(KNOWN_PROVIDERS) + 4, f"only {resolved} names resolved"
+
+    # The one name where JS resolves a provider and Python refuses, kept OUT of
+    # the loop deliberately: it is a real counterexample to the invariant, not
+    # a case the corpus happens to miss, and pinning it is how a later reader
+    # learns the exception exists instead of rediscovering it. It reaches
+    # nothing in practice -- an impossible date names a file that cannot exist,
+    # so the browser 404s after the frontend has validated the name.
+    impossible_date = "bend--or_width_5000_height_5000_step_20_2026-13-45.csv.gz"
+    assert js_re.match(impossible_date), "JS no longer accepts an impossible date"
+    with pytest.raises(ValueError):
+        parse_filename(impossible_date)

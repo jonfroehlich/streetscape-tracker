@@ -561,7 +561,9 @@ The scam-text case asserts the BOUND rather than the wording (~3,000 characters 
 with `getProviderFromFilename` and `isValidRunFilename` reverted to their pre-#338 bodies, 5 node tests and the first e2e test fail;
 with `city.js` at the pre-review commit, the `?city=` rescue test fails;
 with the aggregate refusal deleted, that test fails on the `attribution` TypeError;
-and the cross-language pin fails both when the capture group is dropped and when the const is renamed.
+and the cross-language pin fails when the capture group is dropped, when the const is renamed, and when `\n` is re-admitted to the JS slug class.
+That third mode is the one the pin did not originally cover: the invariant was FALSE as first stated, and two names measured with real `node` proved it — an embedded newline (JS resolved a provider, `parse_filename` raised) and a trailing one (real JS refuses it, Python's `$` did not).
+The first is fixed in the regex, the second in how the test compiles it, and the impossible-date case is pinned as the one surviving exception rather than left out of the corpus.
 A test written against a fix is worth what its failure against the defect is worth.
 
 ## The pivoted data tables (issue #250)
