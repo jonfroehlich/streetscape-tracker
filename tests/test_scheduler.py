@@ -1184,6 +1184,20 @@ def test_makelab1_production_config_is_wired():
     # than a wait), and anything above ~15 s is the old cost returning a nudge at
     # a time on nights that are already deadline-bound.
     assert 1 <= cfg.sleep_between_cities_s <= 15
+    # The GRID channel's budget, pinned here for the first time (#339). It was
+    # the ONE production budget with no guard at all: mutating it to 999 left
+    # the whole suite green, while every other channel's figure in this function
+    # is pinned exactly. 10M -> 15M on 2026-09-13, after three consecutive
+    # nights spent 99.9% of 10M and deferred the gsv run of 20 / 14 / 16 cities
+    # that still counted against max_cities_per_day.
+    #
+    # What this number buys is DURATION, not quota: metadata requests are free
+    # and consume none (the Cloud console reports no daily limit on them at
+    # all), so the only thing it spends is idle wall clock inside
+    # max_batch_hours. That is why it is pinned beside a deadline rather than
+    # beside a rate -- raising it again is a deliberate edit to this line and to
+    # [schedule].max_batch_hours together.
+    assert cfg.providers["gsv"].daily_request_budget == 15_000_000
     # The street channels must keep their ISOLATED budgets: metered under their
     # own api_usage provider strings against separate keys, so a road crawl can
     # never eat the grid collectors' quota.
