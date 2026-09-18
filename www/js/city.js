@@ -816,7 +816,9 @@ function setGsvMode(showAll) {
 const urlParams = new URLSearchParams(window.location.search);
 // ?file= is untrusted input concatenated onto the data base URL, so it is
 // validated against the filename contract (isValidRunFilename): anything
-// else — path traversal, non-run artifacts — is treated as absent.
+// else — path traversal, non-run artifacts, a provider token this build does
+// not know (issue #338) — is treated as absent, and says so below rather than
+// falling through to the generic "no city specified".
 const rawCsvFileParam = urlParams.get("file");
 const csvFile = isValidRunFilename(rawCsvFileParam) ? rawCsvFileParam : null;
 if (rawCsvFileParam && !csvFile) {
@@ -1405,6 +1407,26 @@ function showLoadError(message) {
 }
 
 async function loadData() {
+  // A ?file= that was PRESENT and rejected is refused outright — even when
+  // ?city= is also present and would resolve something.
+  //
+  // Falling back to the city query looks helpful and is the same silent
+  // substitution issue #338 exists to end: `?file=<a panoramax run>&city=Ames`
+  // would quietly drop the run the URL named and render Ames's GSV series
+  // instead, complete and error-free, under Google's attribution. The reader
+  // asked for one provider's imagery and got another's, with nothing on the
+  // page saying so — only a console.warn.
+  //
+  // Nothing generates that URL shape: every builder in www/ (index.js,
+  // grid.js, streets.js, driving.js, and city.js's own snapshot selector)
+  // emits `?file=` alone. So this only reaches a hand-edited or stale URL,
+  // where naming what was wrong with it is the whole value.
+  if (rawCsvFileParam && !csvFile) {
+    showLoadError(`Can't render ${quoteForMessage(rawCsvFileParam)} — that isn't a `
+      + "published run file for an imagery provider this page knows. Open the "
+      + "city from the overview map instead.");
+    return;
+  }
   if (!csvFile && !decodedCityQuery) {
     showLoadError("No city specified — open this page from the overview map, "
       + "or add ?file= or ?city= to the URL.");
@@ -1482,7 +1504,38 @@ async function loadData() {
     }
 
     currentFileGlobal = targetFile;
-    providerGlobal = getProviderFromFilename(targetFile);
+    // Defence in depth against a malformed aggregate, NOT a route a healthy
+    // site takes (issue #338).
+    //
+    // targetFile has exactly two sources and both are already constrained: the
+    // ?file= above passed isValidRunFilename, which IS this lookup succeeding;
+    // and the aggregate name is read out of `providers[<key>].latest`, where
+    // the key came from Object.keys(PROVIDERS). So an unregistered provider's
+    // run cannot arrive here by the obvious route — a frontend that lacks the
+    // provider never asks for its view, and so never sees its data_file. What
+    // CAN arrive is a record whose filename disagrees with the provider block
+    // holding it, which is a published-payload bug rather than a URL.
+    //
+    // It is still a refusal and not a fallback, because there is no degraded
+    // render available: every branch below reads the registry entry for
+    // attribution, colour ramp, capture-date floor, viewer link and the
+    // copyright toggle, so substituting gsv does not produce a partial page,
+    // it produces a complete and plausible one about the wrong provider.
+    const resolvedProvider = getProviderFromFilename(targetFile);
+    if (resolvedProvider === null) {
+      // Two different payload bugs, said apart: a filename that names no
+      // provider we know, versus no filename at all. Blaming an absent
+      // data_file on "a provider this page doesn't know" sends the reader
+      // looking for a deploy problem that isn't there.
+      showLoadError(typeof targetFile === "string" && targetFile !== ""
+        ? `Can't render ${quoteForMessage(targetFile)} — the city index lists it, but `
+          + "it names no imagery provider this page knows about. The site is "
+          + "probably mid-deploy; try again later."
+        : "The city index has no run file for this city, so there is nothing "
+          + "to draw. Please report this.");
+      return;
+    }
+    providerGlobal = resolvedProvider;
     map.attributionControl.addAttribution(PROVIDERS[providerGlobal].attribution);
 
     // Locate this city's run history for the snapshot selector — only the
