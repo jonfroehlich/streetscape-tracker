@@ -6668,6 +6668,21 @@ def cmd_run_due(
         # like the config key so a log line and a TOML line are greppable
         # together — scripts/night_length_analyze.py reads this.
         f"; max_concurrent_channels={cfg.max_concurrent_channels}"
+        # And the other half of that pair, since 2026-09-21. connection_limit is
+        # DIVIDED by the lane count, so above one lane the knob alone does not
+        # determine a child's socket count: 50 over two lanes is 25 and 100 over
+        # two is 50, and only the pair distinguishes them.
+        #
+        # NOT for the one-lane case, which an earlier version of this comment
+        # claimed: MAX_PER_CHILD_CONNECTION_LIMIT pins every one-lane night at
+        # 50 whatever this key says, so a fallback night really IS comparable to
+        # a pre-flip one and grouping them is correct.
+        #
+        # Same greppable name-matches-the-key convention as the line above.
+        # Note scripts/night_length_analyze.py groups on max_concurrent_channels
+        # only and does not parse this field -- it is here for a human reading
+        # the log, and its regex tolerates the extra clause.
+        f"; connection_limit={cfg.connection_limit}"
         # Same reason again, and unconditional unlike the hoist clause below:
         # the refresh reserve is LIVE by default (issue #308), so which policy
         # a night ran under is not recoverable from the config file alone once
@@ -6998,6 +7013,45 @@ def _log_stop_declined(city_id: str, declined: list[str]) -> None:
     )
 
 
+# ── The per-child socket ceiling that backstops the lane division ───────────
+#
+# `[download].connection_limit` is a HOST budget and `_run_city_channels`
+# DIVIDES it across lanes, so the per-child share moves INVERSELY with
+# `max_concurrent_channels`. That makes dropping the knob a socket RAISE, which
+# is the opposite of what every operator reaching for it intends.
+#
+# It is not hypothetical, and all three routes end at one lane:
+#   1. docs/scheduler.md instructs it -- any 79/80 busy-skip on a night with no
+#      manual run "should drop the knob to 1 the same day". Following that
+#      during an incident would double socket counts on every metered host.
+#   2. `_lane_count` is warn-and-fall-back: `= "2"`, `= true` and `= 0` each log
+#      one WARNING and return 1, while `connection_limit` has no validation at
+#      all. A typo reaches the doubled state with nobody intending anything.
+#   3. A staged deploy that lands the config before the knob moves.
+#
+# 50 is not a round number: it is what production ran at for the whole history
+# that deploy/systemd/streetscape-tracker.service was sized against, and that
+# unit says verbatim "Run that experiment at max_concurrent_channels = 1 until
+# there is one" about the #304 connection_limit experiment -- i.e. one lane is
+# the unit's designated SAFE state. Without this clamp, raising
+# connection_limit to 100 would have turned that safe harbour into the hazard.
+#
+# Clamping rather than refusing at config load is deliberate. `_lane_count`'s
+# docstring records why this file does not raise over one key of one section:
+# it would take down every subcommand including backup-status and
+# restore-backup, the incident-time handles -- and route 1 above IS an
+# incident. An operator who just dropped the knob must not also lose the
+# scheduler.
+#
+# Raising per-child sockets is therefore a deliberate edit to THIS constant
+# with a memory measurement behind it, never a side effect of raising
+# connection_limit. Before raising it, note that cli.py rejects
+# connection_limit > batch_size with an argparse exit 2 -- recorded as an
+# ordinary child failure, five of which quarantine a city for a 90-day cycle --
+# so `[download].batch_size` (100) has to move first.
+MAX_PER_CHILD_CONNECTION_LIMIT = 50
+
+
 def _run_city_channels(
     cfg: SchedulerConfig,
     conn,
@@ -7115,7 +7169,7 @@ def _run_city_channels(
     # the full limit. The guard structurally cannot see the load it is about to
     # permit.
     #
-    # What that costs is not uniform, because only three channels carry this
+    # What that costs is not uniform, because only four channels carry this
     # number at all: the gsv grid (download_gsv's TCPConnector), the gsv road
     # walk (the same engine) and the Mapillary road walk. The Mapillary GRID
     # never receives it — cli.py's branch omits the argument, so
@@ -7133,6 +7187,22 @@ def _run_city_channels(
     # knob is a deliberate decision with a measurement behind it; multiplying it
     # silently is not.
     lane_connection_limit = max(1, cfg.connection_limit // lanes)
+    # Backstop, NOT a second policy: see MAX_PER_CHILD_CONNECTION_LIMIT above.
+    # The division alone makes a knob DROP a socket raise, and one lane is the
+    # state operators are instructed into during an incident. Logged at WARNING
+    # because a clamp that bit silently would leave `connection_limit` reading
+    # like a number the children honour when they do not.
+    if lane_connection_limit > MAX_PER_CHILD_CONNECTION_LIMIT:
+        logger.warning(
+            f"[download] connection_limit={cfg.connection_limit} over {lanes} lane(s) "
+            f"is {lane_connection_limit} sockets per child, above the "
+            f"{MAX_PER_CHILD_CONNECTION_LIMIT} production has run at for its whole "
+            f"measured history; clamping to {MAX_PER_CHILD_CONNECTION_LIMIT}. Lower "
+            f"connection_limit to match the lane count, or raise "
+            f"MAX_PER_CHILD_CONNECTION_LIMIT deliberately with a memory measurement "
+            f"(and a batch_size raise) behind it."
+        )
+        lane_connection_limit = MAX_PER_CHILD_CONNECTION_LIMIT
     # Channels not yet launched, in canonical (most-expensive-first) order. A
     # channel LEAVES this list the moment it is launched or finally skipped, so
     # whatever remains at the end is exactly the set nothing was ever asked of —

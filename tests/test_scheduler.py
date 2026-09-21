@@ -1143,15 +1143,53 @@ def test_makelab1_production_config_is_wired():
     # three street channels, for the same streets.html reason.
     assert cfg.providers["panoramax_streets"].spacing_m == 15
     assert cfg.providers["panoramax_streets"].network_type == "drive"
-    # Channel concurrency is OFF in production until both of #240's deploy gates
-    # clear: resume for the Mapillary tile census (#256), because a stop now kills
-    # N children at once and a killed census re-spends tiles into a per-IP ceiling
-    # we have already been blocked by twice; and a console check that the two GSV
-    # keys live in separate Cloud projects, since neither channel holds a per-IP
-    # lock. Pinned here rather than left implicit so raising it is a deliberate
-    # edit to this test and this file together — the same reason the Mapillary
-    # budgets above are pinned exactly.
-    assert cfg.max_concurrent_channels == 1
+    # Channel concurrency went 1 -> 2 in production on 2026-09-21, both of
+    # #240's deploy gates having been answered: #256 landed (resume for the
+    # Mapillary tile census, so a stop that kills N children no longer re-spends
+    # a whole census into a per-IP ceiling we have been blocked by twice), and a
+    # console check that the two GSV keys live in separate Cloud projects, since
+    # neither channel holds a per-IP lock.
+    #
+    # Still pinned exactly rather than asserted as a range, for the reason it
+    # was pinned at 1: raising it has to be a deliberate edit to this test and
+    # that config together.
+    #
+    # 2 and not 3 is a STAGING choice, not a claim that 3 is unusable — an
+    # earlier version of this comment said the largest host-disjoint set was
+    # three, which refutes itself, on evidence that turned out to be Panoramax's
+    # 20 enrolled cities mistaken for the whole opt-in population. Measured on
+    # prod 2026-09-21: kartaview and kartaview_streets 502 enrolled each, so the
+    # live maximum is FOUR (gsv + an Overpass channel + mapillary + kartaview),
+    # and five is unreachable because no city is enrolled in both kartaview and
+    # panoramax. A bump belongs with the memory measurement the systemd unit
+    # asks for, not with a loosened assertion here.
+    assert cfg.max_concurrent_channels == 2
+    # The two lines move together or not at all: `connection_limit` is a HOST
+    # budget that _run_city_channels DIVIDES across lanes, so raising the knob
+    # while leaving this at 50 would have halved the GSV grid child's socket
+    # count — slowing the long pole this change exists to hide work underneath.
+    #
+    # NOT also asserted as `connection_limit // max_concurrent_channels == 50`.
+    # Given the two exact pins above it, 100 // 2 == 50 has no discriminating
+    # power, and the comment it carried ("either number alone can move without
+    # breaking it, the ratio cannot") was backwards — either number moving alone
+    # trips its own pin first and the ratio line is never reached. What that
+    # assertion was reaching for is a claim about BEHAVIOUR, and behaviour is
+    # pinned where behaviour lives: see
+    # test_a_production_child_is_offered_the_divided_socket_share.
+    assert cfg.connection_limit == 100
+    # And the per-child ceiling that backstops the division, pinned as a LITERAL
+    # rather than only through `sched.MAX_PER_CHILD_CONNECTION_LIMIT`. The lane
+    # test asserts against the constant, so it follows the constant anywhere:
+    # measured, setting it to 75 was green across all 393 tests in this file
+    # while every one-lane child silently held 75 sockets. Values in (50, 100)
+    # all slipped through -- which is exactly the accidental-raise direction the
+    # constant exists to prevent.
+    #
+    # 50 is the socket count production ran at for the whole history the systemd
+    # unit's 18.88 GiB measurement was taken over, so raising it is a deliberate
+    # edit HERE as well as a memory measurement.
+    assert _sched.MAX_PER_CHILD_CONNECTION_LIMIT == 50
     # Production leaves BOTH of the night's reservations UNSET, so the derived
     # shares are what actually run. Pinning the resolved numbers and not just
     # the Nones is the point: `is None` alone would still pass if a resolver's
@@ -9652,6 +9690,147 @@ def test_host_disjoint_channels_of_one_city_genuinely_overlap_at_knob_2(conn, mo
 
     assert (attempted, succeeded, skipped) == (2, 2, 0)
     assert log.peak_in_flight() == 2, "both channels must have been in flight together"
+
+
+def _record_lane_connection_limits(sched, monkeypatch):
+    """Capture the `connection_limit` each child is actually offered.
+
+    `_stub_lane_collection`'s fake swallows it into **kwargs and never looks,
+    which is exactly how the division went unpinned: deleting `// lanes` left
+    the whole suite green while every child silently doubled its sockets.
+    """
+    offered: list[int | None] = []
+
+    def fake_run(cfg, city, today, provider="gsv", **kwargs):
+        offered.append(kwargs.get("connection_limit"))
+        return True
+
+    monkeypatch.setattr(sched, "_run_one_city", fake_run)
+    # Neutralize the RESOURCE GUARD, which is a third limiter on this path and a
+    # separate concern from the division and the clamp these tests are about.
+    # `_run_city_channels` calls plan_connection_limit(share, read_system_pressure(),
+    # cfg.resource_guard), the guard is `enabled = True` both by dataclass default
+    # and in the production TOML, and nothing in conftest.py stubs it -- so without
+    # this line the assertions below are assertions about the DEVELOPER'S BOX.
+    # read_system_pressure returns None on macOS (no /proc), which is exactly why
+    # this was green locally while being red anywhere that matters: measured, a
+    # runner with MemAvailable < 8 GiB drops the share to min_connection_limit = 5,
+    # and a box with load5 > 0.9 x ncpu -- makelab2 sits near that during a ZFS
+    # stall -- scales it down proportionally. CLAUDE.md's claim that the suite can
+    # run during a live nightly batch depends on stubs like this one.
+    monkeypatch.setattr(sched, "read_system_pressure", lambda: None)
+    return offered
+
+
+def test_a_production_child_is_offered_the_divided_socket_share(conn, monkeypatch):
+    """The claim #352 rests on, read END TO END off the real production config.
+
+    `[download].connection_limit` went 50 -> 100 in the same change that took
+    `[schedule].max_concurrent_channels` 1 -> 2, on the argument that every
+    child stays on exactly the 50 sockets it had before -- i.e. that the knob
+    buys overlap without paying for it out of the GSV grid run's throughput.
+    Nothing tested that: the config assertions are literals about a TOML file,
+    and a `100 // 2 == 50` line beside them is arithmetic, not behaviour.
+
+    WHAT THIS DOES AND DOES NOT CATCH, measured rather than assumed. It fails on
+    any config change that drops a prod child BELOW 50 (connection_limit back to
+    50 at two lanes, or a knob raise to 4) -- which is the regression the PR's
+    whole justification is about. It does NOT discriminate the division from the
+    clamp: at 100 and two lanes, `100 // 2` and a bare `min(100, 50)` both land
+    on 50, so deleting `// lanes` leaves this GREEN. Verified by mutation.
+
+    The two tests below cover one mutation each, and this one covers neither:
+    delete `// lanes` and only
+    `test_the_divided_share_still_divides_when_the_clamp_does_not_bite` fails;
+    delete the clamp and only
+    `test_dropping_the_knob_to_one_lane_does_not_double_a_childs_sockets` does.
+    All three are needed; none subsumes another.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    cfg = load_scheduler_config(os.path.join(_PROJECT_ROOT, "config", "scheduler.makelab1.toml"))
+    city = _lane_city(conn)
+    offered = _record_lane_connection_limits(sched, monkeypatch)
+
+    _run_channels(sched, cfg, conn, city, ["gsv", "mapillary"])
+
+    assert offered, "no child was launched"
+    assert set(offered) == {50}, f"production child offered {set(offered)}, want 50"
+
+
+def test_the_divided_share_still_divides_when_the_clamp_does_not_bite(conn, monkeypatch):
+    """The clamp is a backstop, not a replacement for the division.
+
+    Pinned separately because a clamp written as `min(connection_limit, 50)` --
+    dropping the `// lanes` -- would pass the production test above by
+    coincidence (100 // 2 and min(100, 50) are both 50) while silently handing
+    every child 50 sockets at three and four lanes too.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    city = _lane_city(conn)
+    offered = _record_lane_connection_limits(sched, monkeypatch)
+
+    _run_channels(
+        sched,
+        _street_cfg(max_concurrent_channels=2, connection_limit=50),
+        conn,
+        city,
+        ["gsv", "mapillary"],
+    )
+
+    assert set(offered) == {25}, f"offered {set(offered)}, want the divided 25"
+
+
+def test_dropping_the_knob_to_one_lane_does_not_double_a_childs_sockets(conn, monkeypatch, caplog):
+    """Division makes a knob DROP a socket raise, which is the trap #352 set.
+
+    At `connection_limit = 100`, one lane is `100 // 1 = 100` -- double what
+    production ran on for its whole history, and the state three separate routes
+    reach without anyone intending it: docs/scheduler.md instructs dropping the
+    knob to 1 on any 79/80 busy-skip, `_lane_count` falls back to 1 on a typo'd
+    value while this key has no validation at all, and a staged deploy lands the
+    config before the knob moves.
+
+    Worse, deploy/systemd/streetscape-tracker.service names one lane as the SAFE
+    state for the #304 connection_limit experiment -- so without the clamp this
+    PR turned the unit's one stated safe harbour into the hazard.
+
+    The WARNING is asserted too: a clamp that bit silently would leave
+    `connection_limit` reading like a number the children honour when they do
+    not.
+    """
+    import logging
+
+    from streetscape_metadata_tracker import scheduler as sched
+
+    city = _lane_city(conn)
+    offered = _record_lane_connection_limits(sched, monkeypatch)
+
+    with caplog.at_level(logging.WARNING, logger=sched.logger.name):
+        _run_channels(
+            sched,
+            _street_cfg(max_concurrent_channels=1, connection_limit=100),
+            conn,
+            city,
+            ["gsv"],
+        )
+
+    assert set(offered) == {sched.MAX_PER_CHILD_CONNECTION_LIMIT}, (
+        f"one lane offered {set(offered)}, want the clamped {sched.MAX_PER_CHILD_CONNECTION_LIMIT}"
+    )
+    # Assert the CONTENT, not just that something was logged. Measured: gutting
+    # the whole six-line f-string down to `logger.warning("clamping")` left the
+    # entire file green -- while satisfying none of the reason the warning exists,
+    # which is that a silent clamp leaves `connection_limit` reading like a number
+    # the children honour when they do not. A message that names neither the
+    # configured value, nor the lane count, nor the share it landed on tells an
+    # operator nothing.
+    clamp_warnings = [r.message for r in caplog.records if "clamping" in r.message]
+    assert clamp_warnings, "the clamp must say it bit"
+    said = clamp_warnings[0]
+    for needle in ("connection_limit=100", "1 lane", "100 sockets per child", "50"):
+        assert needle in said, f"the clamp warning must name {needle!r}; it said: {said}"
 
 
 def test_no_more_than_max_concurrent_channels_are_ever_in_flight(conn, monkeypatch):

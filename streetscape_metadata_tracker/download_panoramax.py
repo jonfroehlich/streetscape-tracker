@@ -1367,9 +1367,16 @@ async def _fetch_city_images(
                 # admitted here reserves its request before releasing control,
                 # so the cap is not overshot at all in the ordinary case; what
                 # remains is RETRIES BY TILES ALREADY IN FLIGHT, at most
-                # connection_limit * (TILE_MAX_TRIES - 1) -- 200 at prod's
-                # connection_limit of 50, never "20 at the defaults", since no
-                # scheduled run uses the argparse default of 5.
+                # connection_limit * (TILE_MAX_TRIES - 1), which for THIS
+                # provider is 20 and not 200: cli.py forwards
+                # --connection-limit only on its gsv arm, so the Panoramax grid
+                # census runs at this module's own default of 5. (The grid
+                # child IS passed the flag -- the argv on prod reads
+                # --connection-limit 50 -- and ignores it, which is why reading
+                # the argv is not enough to know the socket count.) The WALK
+                # took the scheduler's 50 until #358 clamped it to this
+                # provider's own 5, so after that lands both Panoramax channels
+                # sit at 5 and a 20-request tail.
                 #
                 # It is a soft ceiling on purpose: stopping requests already in
                 # flight would mean cancelling a paced, retrying fetch

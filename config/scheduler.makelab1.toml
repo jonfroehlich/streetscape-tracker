@@ -72,19 +72,109 @@ max_batch_hours = 12
 # to pure breadth-first. The reserve cannot refresh a city early — every city
 # it can promote already cleared the cycle_days - grace_days (83 day) wall.
 # refresh_slots = 10
-# Channels of one city, in flight at once (issue #240). Explicit at 1 rather
-# than inherited, because this is the file prod reads and the value is the whole
-# rollout: 1 is today's sequential behaviour. Raising it is deploy-gated on two
-# things that live outside this repo:
-#   1. GMAPS_API_KEY and GMAPS_STREETS_API_KEY confirmed in SEPARATE Google
-#      Cloud projects (they hold no per-IP lock, so a shared project would put
-#      48k+24k req/min on one quota with nothing serializing them). Record the
-#      project IDs and the date of the check here when it is done.
-#   2. Issue #256 landed — resume for the Mapillary tile census. Until then a
-#      killed child re-spends tiles against the per-IP ceiling (3,500/day paired, 5,250 un-paired since 2026-09-05).
-# Go to 2 before 3: gsv is the long pole and already overlaps each short channel
-# in turn at 2, for half the blast radius. See docs/scheduler.md.
-max_concurrent_channels = 1
+# Channels of one city, in flight at once (issue #240). Explicit rather than
+# inherited, because this is the file prod reads and the value is the whole
+# rollout.
+#
+# 1 -> 2 on 2026-09-21. Both of #240's deploy gates are now answered:
+#   1. GMAPS_API_KEY and GMAPS_STREETS_API_KEY in SEPARATE Google Cloud projects
+#      (they hold no per-IP lock, so a shared project would put 48k+24k req/min
+#      on one quota with nothing serializing them).
+#      CLEARED — all three projects queried 2026-09-15, account list re-checked
+#      2026-09-21:
+#        gsv         -> gsv-date-tracker     (634289259936, jonf@cs.washington.edu)
+#                       metadata quota 60,000/min (raised by producerOverride)
+#        gsv_streets -> gsv-streets-tracker  (657654513495, jonf@cs.washington.edu)
+#                       metadata quota 30,000/min (stock default, never raised)
+#      So the two lanes draw on 90,000/min of INDEPENDENT quota rather than
+#      squeezing one pool, which is exactly what this gate asks.
+#
+#      THE TRAP, because it will be walked into otherwise: a THIRD project named
+#      "GSV Tracker Streets" exists on jonfroehlich@gmail.com as
+#      gsv-tracker-streets (683030439566) — the same DISPLAY NAME as
+#      gsv-streets-tracker above, with the ID word-order transposed. It is an
+#      unused decoy (zero traffic in the 14 days before 2026-09-15). Anyone
+#      reading "the streets quota" off it reads the right number off the wrong
+#      project, so always name the project ID AND the account.
+#
+#      Identified by TRAFFIC SIGNATURE rather than by reading key strings: each
+#      project's metadata peak matches one channel's own pacer (gsv_streets at
+#      ~24,000/min, gsv at 48,124 against its 48,000 pacer). That is strong —
+#      one shared project would show combined traffic on one and none on the
+#      other — but it is inference, not a key-to-project read, so re-confirm in
+#      the console if either key is ever rotated.
+#
+#      Worth knowing while raising throughput: gsv_streets paces at 24,000 =
+#      80% of its project's UN-RAISED 30,000 default, so that project is the
+#      cheapest real headroom win and has nothing to do with this knob.
+#   2. Issue #256 landed — resume for the Mapillary tile census — so a stop that
+#      kills N children no longer re-spends a whole census into the per-IP
+#      ceiling (3,500/day paired, 5,250 un-paired since 2026-09-05).
+#
+# 2 AND NOT 3 -- a STAGING decision, not a claim that 3 is unusable.
+#
+# The first version of this comment argued the opposite and was wrong twice. It
+# said "3 buys nothing extra ... largest host-disjoint set of THREE", which
+# refutes itself (a disjoint set of three is precisely the statement that three
+# lanes are fully usable), and it justified that with "today is 20 enrolled
+# cities", which conflated Panoramax's 20 with the whole opt-in population.
+#
+# MEASURED against the prod catalog on 2026-09-21, 1,221 enabled cities:
+#     kartaview          502 enrolled        panoramax           20 enrolled
+#     kartaview_streets  502 enrolled        panoramax_streets   20 enrolled
+# So a city due on gsv + gsv_streets + mapillary + mapillary_streets +
+# kartaview + kartaview_streets is an ORDINARY nightly occurrence rather than a
+# hypothetical, and [schedule].opt_in_cities_per_day reserves ~10 slots a night
+# for opt-in-only cities. For such a city the largest host-disjoint set is FOUR:
+#     gsv          ()                  <- declares no per-IP host
+#     gsv_streets  (overpass)
+#     mapillary    (mapillary tiles)
+#     kartaview    (kartaview)
+# and every remaining channel needs a host one of those four already holds.
+#
+# FIVE IS UNREACHABLE ON ANY CITY TONIGHT, which is a stronger and more
+# perishable statement than the 5-of-8 ceiling quoted elsewhere in this repo: a
+# fifth disjoint lane needs panoramax alongside kartaview, and the overlap of
+# those two enrolled sets is EXACTLY ZERO cities (measured, same date). 5-of-8
+# is a property of the channel set's HOST GRAPH; 4 is what tonight's CATALOG can
+# use. Re-measure both rather than quoting either from memory -- widening
+# Panoramax past its 20 changes the second number without touching the first.
+#
+# So 3 and 4 are genuinely usable, and this still lands at 2, because the win is
+# front-loaded and the blast radius is not: at 2, gsv -- the long pole at 66-76%
+# of the night -- already overlaps each short channel IN TURN, which is where
+# nearly all of the available win is. Going past 2 is gated on the memory
+# measurement below, not on host arithmetic.
+#
+# MEMORY IS THE GATE ON GOING FURTHER, and it is NOT satisfied by argument.
+#
+# An earlier version of this comment said MemoryHigh=40G / MemoryMax=48G were
+# "sized for three concurrent children". THE UNIT SAYS TWO. It was sized for
+# "exactly three THINGS" -- a list -- whose second item is TWO children at once,
+# and that item carries its own warning verbatim: "BE CAREFUL WITH THE
+# ARITHMETIC HERE: 2 x 18.88 = 37.76 GiB is 94% of 40G, i.e. the same margin
+# this paragraph just called unacceptable at one child." Reading a list-item
+# count as a child count licensed exactly the raise it was meant to gate, so
+# check deploy/systemd/streetscape-tracker.service rather than this paragraph.
+#
+# What IS measured: the `cgroup peak` line recorded every night from 2026-09-07
+# to 09-20 reads 1.30-7.89 GiB, 3-20% of MemoryHigh, throttled 0 times. That is
+# fourteen clean nights AT ONE LANE. The unit also asks for a week including a
+# 4M-point city before the knob moves, and that 1.30-7.89 GiB window is itself
+# evidence no such night was in it -- so this is an argument FOR the gate rather
+# than satisfaction of it.
+#
+# The figure to watch is not that range but the WORST city: a single child read
+# 18.88 GiB on 2026-09-01, and a big city is big on every provider at once, so
+# two of those in one city is ~38 GiB — under MemoryMax, over MemoryHigh, i.e.
+# the throttling-hang failure #305 documents rather than a legible OOM. (The
+# unit notes 18.88 is the whole cgroup, baseline B plus one child C, so two
+# children are B + 2C and strictly less than 2(B + C); the doubling is the
+# conservative read and nobody has measured the real headroom.) Read
+# `grep 'cgroup peak'` over the first week at 2 -- INCLUDING a big-city night --
+# before considering 3.
+# See docs/scheduler.md.
+max_concurrent_channels = 2
 daily_request_budget = 10000000   # legacy fallback; superseded by [providers.*]
 
 # Per-provider daily request budgets (own run series, ledger, failure tracking).
@@ -246,7 +336,11 @@ enabled = true
 # AT the ceiling, not exactly on it. A capped crawl lets the tiles already in
 # flight finish their retries instead of cancelling them mid-attempt, so a
 # capped night can end up to connection_limit x (TILE_MAX_TRIES - 1) over --
-# 200 at the connection_limit = 50 set below, not the 20 the argparse default
+# 20, not 200: this is the GRID budget, and cli.py forwards --connection-limit
+# only on its gsv arm, so a Mapillary grid census runs at the downloader's own
+# default of 5. (200 is the Mapillary ROAD WALK's residue -- that one does take
+# the per-child share, 50, being [download].connection_limit below divided
+# across lanes and clamped at scheduler.MAX_PER_CHILD_CONNECTION_LIMIT.) Not the argparse default
 # of 5 would give. Budget this line as a soft ceiling with a 200-request tail.
 #
 # THE NUMBER TO QUOTE IS THE PER-IP SUM WITH mapillary_streets, not this line.
@@ -453,7 +547,62 @@ network_type = "drive"
 
 [download]
 batch_size = 100
-connection_limit = 50
+# 50 -> 100 on 2026-09-21, in the SAME change that raised
+# [schedule].max_concurrent_channels to 2, and meaningless apart from it.
+#
+# This is a HOST budget, so _run_city_channels DIVIDES it across lanes rather than
+# handing it to each child whole: `lane_connection_limit = connection_limit //
+# lanes`. Left at 50, raising to 2 lanes would have given each child 25 — i.e.
+# it would have made the GSV grid run, which is the long pole this whole change
+# exists to hide work underneath, roughly half as fast. 100 // 2 = 50 keeps
+# every child on exactly the socket count it has today, so the knob buys
+# overlap without paying for it out of GSV's throughput.
+#
+# What it genuinely changes is the Google-facing total: gsv + gsv_streets are
+# the only overlapping pair pointing two full-size connectors at one third
+# party, so prod now presents 50 + 50 sockets there instead of 50. That is
+# per-project parity with today ONLY IF the two keys are in separate Cloud
+# projects — which is deploy gate 1 on max_concurrent_channels above, and is
+# the reason these two lines must move together or not at all.
+#
+# A PER-CHILD CEILING NOW BACKSTOPS THIS DIVISION. Dropping the knob back to 1
+# without dropping this line is a real and even INSTRUCTED path -- docs/
+# scheduler.md tells an operator to drop the knob to 1 the same day on any 79/80
+# busy-skip, `_lane_count` falls back to 1 on a typo'd value, and this key has no
+# validation at all -- and 100 // 1 = 100 would have doubled every child's
+# sockets silently, during an incident. scheduler.MAX_PER_CHILD_CONNECTION_LIMIT
+# clamps the divided share and logs when it bites, so every route to one lane
+# lands back on today's 50. That constant, not this line, is where a per-child
+# raise is decided.
+#
+# 3 LANES AT TODAY'S PER-CHILD 50 DOES NEED 150 HERE. An earlier revision of
+# this comment retracted that advice as unsafe, and the retraction was wrong --
+# it described a hazard the clamp above had just closed, in the present tense.
+# Measured per-child share, driving the real lane scheduler:
+#
+#     connection_limit |  1 lane   2 lanes   3 lanes   4 lanes
+#     -----------------+---------------------------------------
+#                   50 |     50       25        16        12
+#                  100 |     50       50        33        25
+#                  150 |     50       50        50        37
+#
+# THE DIVISION, NOT THE CLAMP, IS WHAT SETS THE SHARE ABOVE ONE LANE, so raising
+# MAX_PER_CHILD_CONNECTION_LIMIT is the wrong lever for going to 3: at 100 over
+# 3 lanes each child gets 33 and the clamp never bites, so an operator who
+# raises only the constant gets 33 sockets and no explanation. The constant is
+# the lever for raising a child ABOVE 50, which is a different decision.
+#
+# The old hazard is genuinely gone: the clamp caps every child at 50, and the
+# cli.py guard is `connection_limit > batch_size` with batch_size = 100, so the
+# scheduler can no longer reach it at ANY value of this key. It stays reachable
+# by HAND (`--connection-limit 150` on a manual run) -- see #359, which also
+# argues that an argparse exit 2 should not count a strike against a city.
+#
+# So: 150 for 3 lanes is safe and correct. Raising the per-child count above 50
+# is the separate thing that needs a memory measurement and a batch_size raise
+# first, because the systemd unit is explicitly NOT sized for the #304
+# connection_limit experiment.
+connection_limit = 100
 request_timeout_s = 30.0
 # 60 -> 5 on 2026-09-02 (issue #306). It was never a rate limiter and every
 # mechanism its "spread load" rationale named is now per-request and per-host;

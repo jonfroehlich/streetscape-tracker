@@ -1543,10 +1543,20 @@ async def _fetch_city_images(
                 # admitted here reserves its request before releasing control,
                 # so the cap is not overshot at all in the ordinary case; what
                 # remains is RETRIES BY TILES ALREADY IN FLIGHT, at most
-                # connection_limit * (TILE_MAX_TRIES - 1). Prod runs
-                # connection_limit 50 (config/scheduler.makelab1.toml), NOT the
-                # argparse default of 5, so state that residue as 200 and never
-                # as "20 at the defaults" -- no scheduled run uses the defaults.
+                # connection_limit * (TILE_MAX_TRIES - 1), and this function
+                # serves TWO callers at different socket counts, so the residue
+                # is not one number:
+                #   GRID  (cli.py): 5 sockets -> residue 20. cli.py forwards
+                #     --connection-limit only on its gsv arm, so this census
+                #     takes fetch_city_images_async's own default of 5.
+                #   WALK  (collect.py): the scheduler's per-child share, 50 in
+                #     prod -> residue 200.
+                # Neither is "the argparse default of 5" -- cli.py's
+                # --connection-limit default is 50; the 5 arrives because the
+                # argument is never forwarded. And since 2026-09-21 the walk's
+                # 50 is not [download].connection_limit (100) either: it is that
+                # value divided across lanes and clamped per child at
+                # scheduler.MAX_PER_CHILD_CONNECTION_LIMIT.
                 #
                 # It is a soft ceiling on purpose: stopping requests already in
                 # flight would mean cancelling a paced, retrying fetch
