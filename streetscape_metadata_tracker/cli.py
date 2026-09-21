@@ -403,8 +403,11 @@ def parse_args():
              tight one: a tile reserves its request at the check, so the cap is
              not overshot at all unless a tile already in flight retries, and
              that residue is bounded by connection_limit x (TILE_MAX_TRIES - 1)
-             — 200 at production's connection_limit of 50, which is the number
-             to reason with, not the argparse default of 5. Requires a
+             — 200 at the 50 sockets a production CHILD gets, which is the
+             number to reason with, not the argparse default of 5. Since
+             2026-09-21 that 50 is no longer [download].connection_limit
+             itself (100): the scheduler divides it across lanes and clamps
+             the share at MAX_PER_CHILD_CONNECTION_LIMIT. Requires a
              checkpoint to write to. Default: fetch every tile.""",
     )
 
@@ -483,8 +486,11 @@ def parse_args():
              tight one: a tile reserves its request at the check, so the cap is
              not overshot at all unless a tile already in flight retries, and
              that residue is bounded by connection_limit x (TILE_MAX_TRIES - 1)
-             — 200 at production's connection_limit of 50, which is the number
-             to reason with, not the argparse default of 5. Requires a
+             — 200 at the 50 sockets a production CHILD gets, which is the
+             number to reason with, not the argparse default of 5. Since
+             2026-09-21 that 50 is no longer [download].connection_limit
+             itself (100): the scheduler divides it across lanes and clamps
+             the share at MAX_PER_CHILD_CONNECTION_LIMIT. Requires a
              checkpoint to write to. Default: fetch every tile.""",
     )
 

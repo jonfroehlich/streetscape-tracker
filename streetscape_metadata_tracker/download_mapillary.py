@@ -1543,10 +1543,13 @@ async def _fetch_city_images(
                 # admitted here reserves its request before releasing control,
                 # so the cap is not overshot at all in the ordinary case; what
                 # remains is RETRIES BY TILES ALREADY IN FLIGHT, at most
-                # connection_limit * (TILE_MAX_TRIES - 1). Prod runs
-                # connection_limit 50 (config/scheduler.makelab1.toml), NOT the
-                # argparse default of 5, so state that residue as 200 and never
-                # as "20 at the defaults" -- no scheduled run uses the defaults.
+                # connection_limit * (TILE_MAX_TRIES - 1). A prod CHILD runs
+                # 50, NOT the argparse default of 5, so state that residue as
+                # 200 and never as "20 at the defaults" -- no scheduled run uses
+                # the defaults. Read that 50 off the child, not off the config:
+                # since 2026-09-21 [download].connection_limit is 100 and the
+                # scheduler divides it across lanes, clamped per child at
+                # scheduler.MAX_PER_CHILD_CONNECTION_LIMIT.
                 #
                 # It is a soft ceiling on purpose: stopping requests already in
                 # flight would mean cancelling a paced, retrying fetch

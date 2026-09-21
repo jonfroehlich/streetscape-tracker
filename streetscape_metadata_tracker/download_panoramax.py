@@ -1367,9 +1367,12 @@ async def _fetch_city_images(
                 # admitted here reserves its request before releasing control,
                 # so the cap is not overshot at all in the ordinary case; what
                 # remains is RETRIES BY TILES ALREADY IN FLIGHT, at most
-                # connection_limit * (TILE_MAX_TRIES - 1) -- 200 at prod's
-                # connection_limit of 50, never "20 at the defaults", since no
-                # scheduled run uses the argparse default of 5.
+                # connection_limit * (TILE_MAX_TRIES - 1) -- 200 at the 50 a
+                # prod CHILD gets, never "20 at the defaults", since no
+                # scheduled run uses the argparse default of 5. That 50 is not
+                # [download].connection_limit (100 since 2026-09-21): the
+                # scheduler divides it across lanes and clamps the share at
+                # scheduler.MAX_PER_CHILD_CONNECTION_LIMIT.
                 #
                 # It is a soft ceiling on purpose: stopping requests already in
                 # flight would mean cancelling a paced, retrying fetch

@@ -218,7 +218,7 @@ Incidental coverage of a deprecated spelling trains readers to ignore the notice
 ## Concurrent channel lanes (issue #240)
 
 **Added after the split.**
-Fifteen tests cover the lane scheduler, fourteen in `test_scheduler.py` and one in `test_assess_city.py`.
+Eighteen tests cover the lane scheduler, seventeen in `test_scheduler.py` and one in `test_assess_city.py`.
 They share `_stub_lane_collection`, whose fake records **both** edges of each collection — `("start" | "end", city_id, provider, seq)` under a lock — because everything here is an ordering claim ("did these two overlap?", "was that one ever started?"), and a `seq` taken under the lock beats a timestamp for exactly that.
 It **never touches `conn`**, on purpose: the scheduler hands a worker `conn=None` because `db.connect` is `check_same_thread=True`, so a fake that reached for the fixture handle would go green over a design that cannot work off-thread.
 Every wait carries a 10 s timeout, so a scheduler that has stopped overlapping fails red rather than hanging the suite.
@@ -237,6 +237,16 @@ The assertion there is `blocked_hosts` rather than a counter, because a host ref
 that **every** lane exception reaches the log even though only one can be re-raised (`test_every_lane_exception_is_logged_…`), the `[alerts]` email carrying only that log's tail;
 per-child `remaining_s` priced against the shared deadline at each channel's own submit; every pricing and ledger read landing on the main thread in submit order; a city's lanes draining before the next city is priced (paired snapshots + ledger ordering); knob 1 running **inline on the calling thread** in canonical order with nothing overlapping; the config parser falling back to 1 with a warning for `0`, `-2`, `1.5`, `"three"` and `true` (TOML booleans are Python ints, so a bare `isinstance` check would accept `true` as one lane);
 and, in `test_assess_city.py`, that the operator path inherits the same lane scheduler — pinned there because `ASSESS_CHANNELS` is the shape that would hide a missing affinity rule by luck, since a canonical-order sequential run happens to get it right for the wrong reason.
+**The socket share a child is offered (2026-09-21, #352) is pinned by three tests that cover one mutation each, and none subsumes another** — the trio exists because the first one written covered nothing.
+`connection_limit` is a HOST budget divided across lanes, so `_stub_lane_collection`'s fake swallowing it into `**kwargs` meant deleting `// lanes` left the whole suite green while every child silently doubled its sockets.
+`_record_lane_connection_limits` is the second fake, recording only what each child was offered.
+`test_a_production_child_is_offered_the_divided_socket_share` drives the **real** `scheduler.makelab1.toml` through the lane scheduler and asserts 50 — the end-to-end form of the claim #352 rests on, that raising the knob costs the GSV grid run nothing.
+Measured, it catches **neither** mutation on its own: at `connection_limit = 100` over two lanes, `100 // 2` and a bare `min(100, 50)` both land on 50, so it is green with the division deleted.
+What it does catch is any config change that drops a prod child *below* 50, which is the regression the justification is about — so it is kept, with a docstring that claims exactly that and no more.
+`test_the_divided_share_still_divides_when_the_clamp_does_not_bite` is the one that fails when `// lanes` goes, because at `connection_limit = 50` over two lanes the clamp is inert and only the division can produce 25.
+`test_dropping_the_knob_to_one_lane_does_not_double_a_childs_sockets` is the one that fails when `MAX_PER_CHILD_CONNECTION_LIMIT` goes, and it asserts the WARNING as well as the number: a clamp that bit silently would leave `connection_limit` reading like a figure the children honour when they do not.
+The rule this teaches, and the reason the mutation results are written down here rather than assumed: **a backstop can mask the mechanism it backs up**, so adding a clamp above a division means re-checking that the division is still pinned by something — it was not, and the test that looked like it pinned it did not.
+
 **Deliberately not written:** "our own lanes never produce a 79/80 busy-skip."
 It is vacuous at this seam — busy exits come only from real children hitting the real cross-process lock, never from a fake — so it is carried structurally by the affinity and drain tests and operationally by the rollout watch list in `scheduler.md`.
 **One existing test was redesigned rather than repaired.**
