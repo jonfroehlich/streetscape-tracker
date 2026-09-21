@@ -82,7 +82,9 @@ What does NOT change is that **the document itself must never scroll sideways**:
 `position: sticky; left: 0` on the row header and on the header's corner cell, because a scrolled row whose name has gone is unreadable and reading a date AGAINST a named city is the entire point of the columns that made the table wide.
 Three things it needs that a bare `sticky` does not give, all of them silent when missed: an **opaque background** (the cell is transparent by default and the scrolled columns slide under it), the row's **hover colour repainted** on it (or the city name is the one cell that does not highlight), and `box-shadow` rather than `border-right` for its edge, since under `border-collapse: collapse` a sticky cell's borders are painted by the table's border grid and do not travel with it.
 `test_the_city_column_stays_pinned_while_the_table_scrolls` asserts the behaviour rather than the declaration — `position: sticky` does nothing without a scrolling ancestor, so a `getComputedStyle` check would pass on a page where it never engaged.
-It runs at a 1000px viewport rather than 1440px, and deliberately: the committed fixture carries three providers where production carries four, and three still fit 1440px, so at the wider viewport the test would have nothing to scroll.
+It runs at 1440×900 like every other layout test here.
+It ran at 1000px until [#354](https://github.com/jonfroehlich/streetscape-tracker/issues/354), because the committed fixture carried three providers where production carried four and three still fit 1440px — so at the wider viewport it would have had nothing to scroll and would have passed having exercised nothing.
+The fixture is four deep now, and measured at 1440px the wrap overflows by 174px on `grid.html` and 266px on `streets.html`, so the scroll the test needs is production's own rather than one manufactured by narrowing the window.
 
 **Neither default names a Δ leaf**, filtered on the `isGroupDelta` flag rather than on the "Δ" label — sniffing the glyph would tie a column rule to a character.
 That is no longer a width decision: a Δ is one pairwise comparison of two NAMED providers while a metric group is one number for every provider, so a Δ's share of what a row tells you shrinks with each provider added.
@@ -98,6 +100,7 @@ A preset carrying a plain `title` (every non-default one) is left strictly alone
 
 **Two lessons from #334 are kept even though its rule is gone**, because both are about tests rather than layout.
 The gate that should have caught the original overflow was green against a payload narrower than production's: the e2e fixture carried two providers while production had been three deep since KartaView ([#248](https://github.com/jonfroehlich/streetscape-tracker/issues/248)).
+That happened twice — three against production's four when [#350](https://github.com/jonfroehlich/streetscape-tracker/issues/350) landed — so the second lesson is now enforced rather than remembered: `tests/test_e2e_fixture.py` fails, in the **fast** suite, unless the committed fixture carries a grid run and a road walk for every `naming.KNOWN_PROVIDERS` entry on one city, with omissions named and justified in `build_fixture.FIXTURE_OMITTED_PROVIDERS` ([#354](https://github.com/jonfroehlich/streetscape-tracker/issues/354)).
 And **"fits" is not the same assertion as "says anything"** — that same gate was green throughout the period a date group was missing, because a trimmed table fits by construction.
 `test_streets_default_view_shows_median_age_and_walk_dates` and `test_grid_default_view_shows_when_each_provider_last_collected` are the assertions that encode what the pages must SAY: each date group present, with a populated cell under it.
 

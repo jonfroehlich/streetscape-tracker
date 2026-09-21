@@ -619,7 +619,7 @@ Node adds: the real Ames run filename resolving to `panoramax` (not gsv) and pas
 The registry-wide sweeps (capability flags, `shortLabel`/`panoCountingModel`, the fallback pair, `withFallback === ["kartaview"]`, the id guard, the local-midnight floor, the radio count and the description) all pass without edits — that is what they are for — except the mirrored-floors table, which is spelled out rather than derived precisely so a new provider fails its `floors.length === Object.keys(PROVIDERS).length` self-check instead of being silently excluded from the guarantee.
 `index.test.js` gains a Panoramax city beside the Mapillary one for the `hasFlatImagery` branches, which had been reached through a single provider's record — #296's lesson that a capability sweep with one fixture tests one branch per provider, not the branch.
 
-**e2e:** Alpha City gains a Panoramax run and a Panoramax walk, making it the fixture's three-provider city, and a new smoke test opens its run on `city.html` and asserts the Panoramax attribution, the ABSENCE of the "Google only" radiogroup, the presence of the flat-only toggle, and a popup whose single link is the viewer permalink.
+**e2e:** Alpha City gains a Panoramax run and a Panoramax walk, making it the fixture's three-provider city at the time (four since [#354](https://github.com/jonfroehlich/streetscape-tracker/issues/354)), and a new smoke test opens its run on `city.html` and asserts the Panoramax attribution, the ABSENCE of the "Google only" radiogroup, the presence of the flat-only toggle, and a popup whose single link is the viewer permalink.
 Those four are one assertion about the capability flags: getting the provider wrong got all of them backwards at once, and the page still looked fine.
 The marker is clicked by container point rather than by selector, because `city.js` builds the map with `preferCanvas` and a pano marker is painted pixels.
 The counted assertions that moved (`colspan` 3→4, `4 provider series`→`5`, Map Ville's link count 3→2) are all consequences of the third provider; the link COUNT for Alpha City stayed at six by coincidence, which is why the href SET is what the test asserts.
@@ -706,7 +706,8 @@ Both pages also pin that the default names **no Δ leaf** at any of those counts
 `test_the_page_itself_never_scrolls_sideways` keeps the half of #188's rule that survives, on all three pages: the DOCUMENT may not scroll, however wide the table gets inside its wrap.
 `test_driving_table_still_fits_its_container` keeps the strict assertion on the one page that never needed relaxing, so #350 cannot leak onto it.
 `test_the_city_column_stays_pinned_while_the_table_scrolls` asserts the pin as BEHAVIOUR — scroll the wrap to its far edge and compare the row header's box before and after — because `position: sticky` silently does nothing without a scrolling ancestor and a `getComputedStyle` check would pass on a page where it never engaged; it also asserts the cell is not transparent, which is the other way a pinned column fails visibly and silently.
-That test runs at a **1000px** viewport rather than the 1440px its neighbours use, and the reason is worth keeping: the committed fixture carries three providers where production carries four, three still fit 1440px, so at the wider viewport it would have nothing to scroll and would pass having tested nothing.
+That test ran at a **1000px** viewport rather than the 1440px its neighbours use, because the committed fixture carried three providers where production carried four: three still fit 1440px, so at the wider viewport it would have had nothing to scroll and would have passed having tested nothing.
+It is back at 1440×900 since the fixture gained KartaView ([#354](https://github.com/jonfroehlich/streetscape-tracker/issues/354)) — measured there, the wrap overflows by 174px on `grid.html` and 266px on `streets.html`, so the scroll under test is production's rather than one manufactured by narrowing the window.
 **The assembled title is tested as prose and as an invariant.**
 The user-visible string is spelled out per page (it renders as the preset `<option>`'s hover title), and beside it a sweep over one to five providers asserts, for every clause, that the title names it **iff** its group is still shown — which is the property that failed, and which a spelled string can only sample.
 Since [#350](https://github.com/jonfroehlich/streetscape-tracker/issues/350) that string is the SAME at every provider count, which is itself the assertion: it used to shrink as providers were added, and the shrinking was the symptom of the columns going.
@@ -777,3 +778,60 @@ And the per-row search haystack cache is asserted to be keyed by the **field lis
 - A walk on another `network_type` than its channel walks leaves that channel's cadence alone, asserted by relabelling the bundle's drive walk to `all_public`.
 - An unknown provider is exit 64, not the `ValueError` the filename generators raise.
 - **A crash at the ledger leaves the cadence rows already written**, pinned by making `add_api_usage` raise: the success rows exist, the retry is refused, and the ledger holds nothing. The `--enable` branch for an already-registered, disabled city is reached through the importer, not through the `set_city_enabled` helper it uses.
+
+## The e2e fixture cannot fall behind the provider set (issue #354)
+
+**Added after the 2026-08-22 split.**
+
+`tests/test_e2e_fixture.py`. Every width on the pivoted `grid.html` / `streets.html` tables is a function of the COLLECTED provider count — each metric group renders one leaf per provider — so a fixture one provider short of production renders one column narrower per group, and an overflow gate asked of it is asking a question the payload cannot answer yes to.
+That has happened twice, and both times a layout defect found it rather than a test: the fixture carried two providers while production carried three ([#334](https://github.com/jonfroehlich/streetscape-tracker/issues/334), where `grid.html` was 140px over and `streets.html` 164px on the live site while the gate was green), then three while production carried four ([#350](https://github.com/jonfroehlich/streetscape-tracker/issues/350)/[#351](https://github.com/jonfroehlich/streetscape-tracker/pull/351), which had to run the sticky-column test at 1000px to manufacture a scroll).
+
+Four things about where and what it checks are the whole design — each of the first three a place the obvious version would be weaker, and the fourth the limit of what any of it proves:
+
+- **It reads the committed `tests/e2e/fixture/` artifacts, not `build_fixture.py`.** Those bytes are what a browser renders, so a builder that constructs a fourth provider beside a fixture directory nobody regenerated is the same failure to a reader of `grid.html` — and only the artifacts distinguish the two. The failure message therefore names all three steps, because stopping after the builder edit leaves this red with the code already correct.
+- **It runs in the FAST suite**, not beside the tests it protects. The e2e job is `continue-on-error: true`, so a guard living there can be red for weeks; this one needs no browser and no Playwright to ask its question.
+- **The property is per-ROW, not per-fixture — for CELL POPULATION, not width.**
+  The original wording here said four providers spread over four cities would leave every rendered row three columns narrower than production's, and that is measurably false.
+  `grid.js:pivotGridRows` and `streets.js:walkProvidersIn` build the provider list from the UNION over the whole payload and then emit one leaf per provider on every row, em-dashing the ones a row has nothing for.
+  Moving KartaView onto a different city in the browser reproduced the same 174px/266px overflow the four-on-one-row fixture gives ([#360 review](https://github.com/jonfroehlich/streetscape-tracker/pull/360)).
+  What one rich row buys is that every leaf on it holds a real value, which is what the positional assertions read — Alpha City's 12 `provider-cell-link` hrefs and the `nth(i)` coverage cells, which are identified by nothing but their column position.
+  A row of em-dashes satisfies a union check and pins none of that.
+  Both surfaces are asserted separately, because the two payloads are separate: a provider with a grid run and no walk populates `grid.html`'s cells and leaves `streets.html`'s empty.
+- **What it compares against is the REGISTRY, not production.**
+  `naming.KNOWN_PROVIDERS` is what it reads, so the state that actually caused #334 — collected in production while still unregistered here, where Panoramax sat for three PRs — is outside what it can see; the JS↔Python registry pin is the other half.
+  "The fixture cannot fall behind the registry" is what is enforced; "cannot fall behind production" is what people will remember it as.
+
+The exemption is `build_fixture.FIXTURE_OMITTED_PROVIDERS`, a `{provider: reason}` dict that is empty today.
+It exists so that skipping a provider is a decision someone wrote down rather than an omission nobody noticed, and it is itself checked for the two ways it rots: a key that is no longer in `naming.KNOWN_PROVIDERS` exempts nothing, and a key whose provider IS in the fixture claims a gap that has been closed.
+An empty reason fails too — the reason is the entire difference between an exemption and an omission.
+A fourth test sweeps the other direction, refusing a fixture artifact that names a provider the registry does not list, since `getProviderFromFilename` rendered such a token as gsv before [#338](https://github.com/jonfroehlich/streetscape-tracker/issues/338) and renders it as nothing after.
+It sweeps the FILENAMES as well as the two payloads, which the first version did not: it named `getProviderFromFilename` as the mechanism while reading only the aggregate's `providers` keys and the manifest's `provider` field, so a stray artifact whose name carried an unregistered token — the thing that function mis-resolves, and the way a token reaches `city.html`, which is addressed by run filename — was invisible to it.
+
+**Those four behaviours are TESTS, not control runs.**
+They were five hand-run controls in the first version of this file, and with the dict empty every assertion about it was made over an empty comprehension: deleting all three checks left the file green ([#360 review](https://github.com/jonfroehlich/streetscape-tracker/pull/360) — the repo's own catalogued "satisfiable by the degenerate outcome" shape, on the one lever that can weaken everything above it).
+So the predicates are now functions of their inputs (`_omission_problems`, `_row_gap`, `_expected_providers`) and are parametrized over the dicts that make each one fire: a key that is not a provider, a reason that is empty or whitespace or `None`, a key whose provider the fixture publishes, and the escape hatch that has to keep working — a provider named with a reason and genuinely absent drops out of what the row tests demand.
+`_row_gap` is asserted on the arrangement the guard exists for (a fifth provider nobody collected), on the near-miss that would satisfy a union check (four providers, one per row), and on an empty payload, which reports every provider instead of raising out of an aggregate over no rows.
+
+**Two pins on the bytes**, both from the same review.
+`test_every_committed_run_csv_writes_its_integer_columns_as_integers` reads every committed run CSV as TEXT and requires each `Int64` column to be written as one, then reloads it through `fileutils.load_city_csv_file` and compares the declared dtypes; `test_every_census_builder_writes_its_integer_columns_as_integers` asks the same of the three census builders directly, which is what catches the edit before anyone regenerates.
+Deleting the `sequence_index` cast used to leave the whole fast suite green — only the browser job, the non-blocking one, could see it.
+`test_every_committed_artifact_is_byte_reproducible` requires a zero gzip mtime, no FNAME header and a frozen `generated_at` on every artifact: `build_fixture` stamped the clock into all 24 files, so a regeneration rewrote every blob whether or not any content moved, and on a commit whose whole substance is regenerated artifacts "which of these actually changed" is the review.
+`_normalize_for_commit` is what does it; what stays clock-dependent, deliberately, is `driving_plan.json.gz`'s `years_since_newest_capture`, because the fixture runs the real summarizer and the real summarizer reads `date.today()`.
+
+**The Mapillary builder was on the bare nine columns.**
+`make_kartaview_city_df` and `make_panoramax_city_df` are written against `KARTAVIEW_METADATA_DTYPES` and `PANORAMAX_METADATA_DTYPES`, and the comment above them said so — "a fixture cannot disagree with a real run file about the column set" — while `make_mapillary_city_df`, in the same file, carried the shared core and none of `MAPILLARY_EXTRA_DTYPES`.
+Nothing in `www/` reads any of those seven columns, which is how it survived three providers' worth of edits to that file; it is on `MAPILLARY_COLUMNS` now, so the claim and the code agree.
+
+**What the fixture change itself pinned.**
+`test_city_page_offers_the_kartaview_map_link_before_the_photo_link` is the browser half of [#312](https://github.com/jonfroehlich/streetscape-tracker/issues/312)'s ordering rule, and it was unreachable until a KartaView run existed here: KartaView's is the one viewer addressed by the ROW — `details/{sequence_id}/{sequence_index}` — rather than by an image id, so a pano id alone cannot build it and `viewerLinksHtml`'s node tests are the only coverage the order had.
+It asserts two links in fallback-first order, the map link's `@lat,lon,19z` shape, and the photo link's (sequence, index) address.
+That last assertion failed first time, on a real defect in the new fixture rather than in `www/`: `make_kartaview_city_df` built `sequence_index` from Python ints beside the `None` its ZERO_RESULTS row carries, pandas inferred the column float64, and the written CSV said `0.0` — so the rendered link was `details/11616154/0.0`, which opens nothing.
+It is the same float coercion `config.PROVIDER_RUN_DTYPES` exists to prevent on the read side, arriving on the write side in a fixture claiming to be a run file, and the builder now casts to the nullable `Int64` the downloader uses.
+The link is asserted as ONE address (`details/11616154/1`) rather than as any of indices 0..2, and the marker it clicks is chosen by the pano id in its own popup: "any of three" passes on a `viewerUrl` that hardcodes an index, which is half of what the URL is for.
+Those ids are the real datum `streetscape-utils.js` records as probed — image 2627370567 at sequence 11616154, index 1 — so the fixture no longer reuses a real id under an index it does not have.
+
+**The streets row's four cells hold four distinct numbers, and that is the assertion.**
+A pivoted cell is identified by nothing but its position, and all three census walks read `0.0%` when KartaView was added: swapping kartaview and panoramax in `streets.js:walkProviders()` left the whole 72-test browser suite green.
+So two of the three census walks now carry a few 360° samples (`_add_streetwalk(..., n_pano_samples=N)`), giving 85.1 / 0.0 / 16.0 / 42.7 across the four providers, and the swap fails.
+The Mapillary walk is the one that keeps no 360° samples at all, because `test_streets_page_separates_360_and_any_imagery_coverage` reads it for the widest version of #116's split.
+The grid page's equivalents were discriminating from the start (75.0 / 66.7 / 60.0 / 50.0); only the streets ones looked like it.

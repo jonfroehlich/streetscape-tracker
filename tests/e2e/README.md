@@ -16,8 +16,9 @@ frontend's data fetches intercepted so no live data host is needed.
 The fixture has three cities, one per render path the test asserts on:
 
 - **Alpha City** — a normal multi-run GSV city (snapshot `<select>` + change line), also collected
-  and walked by Mapillary and Panoramax. The THREE-provider city: the widest row the pivoted
-  tables render, and the count at which the default preset stops fitting the measure (#334).
+  and walked by Mapillary, KartaView and Panoramax. The FOUR-provider city: every provider in
+  `naming.KNOWN_PROVIDERS`, which is what production carries, so the tables render production's
+  own width here and the widest row's cells are populated rather than em-dashes (#334, #354).
 - **Zero City** — a 0-pano GSV city (#69/#122: `—` dates, no `Infinity%`/`NaN`)
 - **Map Ville** — a Mapillary city (provider toggle / `?provider=`), excluded from both GSV channels
 
@@ -38,11 +39,19 @@ plugin installed simply skips it.
 ## Regenerating the fixture
 
 Re-run after any schema/format change (aggregate v3, per-run JSON, CSV columns),
-then commit the regenerated `fixture/` files:
+and after a provider is added to `naming.KNOWN_PROVIDERS`, then commit the
+regenerated `fixture/` files:
 
 ```bash
 python tests/e2e/build_fixture.py
 ```
+
+The provider half of that is not left to memory. `tests/test_e2e_fixture.py`
+runs in the **fast** suite (this job is non-blocking, so a guard here would not
+stop anything) and fails unless the committed artifacts carry a grid run and a
+road walk for every known provider on one city. Skipping a provider is possible
+but has to be written down, with the reason, in
+`build_fixture.FIXTURE_OMITTED_PROVIDERS` (#354).
 
 Because the fixture is produced by the same functions the real pipeline runs
 (`generate_city_metadata_summary_as_json`, `generate_aggregate_v2`), it tracks

@@ -52,11 +52,16 @@ function cityLabel(city) {
  * Registry order — every provider the site KNOWS ABOUT.
  *
  * Not the same list as the one the table renders: a provider can be
- * registered and have walked nothing (KartaView is registered but has no road
- * walk at all — `build_streetwalk_rows` is Mapillary-specific in three
- * separate ways), and a leaf column or scope option for such a provider is a
- * column of em-dashes and a filter that selects no rows. See
- * `walkProvidersIn`.
+ * registered and have walked nothing, and a leaf column or scope option for
+ * such a provider is a column of em-dashes and a filter that selects no rows.
+ * See `walkProvidersIn`, which is what the columns actually fan out from.
+ *
+ * This comment used to name KartaView as the example, on the grounds that
+ * `build_streetwalk_rows` was Mapillary-specific in three separate ways. That
+ * stopped being true in #258 (KartaView road walks are a scheduled channel)
+ * and again in #331 (Panoramax's), and all four providers walk in the e2e
+ * fixture as of #354 — so the example is gone rather than swapped for another
+ * provider that will be collected next.
  */
 function walkProviders() {
   return Object.keys(PROVIDERS);
