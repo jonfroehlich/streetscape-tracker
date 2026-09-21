@@ -20,8 +20,7 @@ const {
   createSortableTable,
   providerColumnGroup,
   anyImageryLeafTitle,
-  DEFAULT_PRESET_LEAF_BUDGET,
-  fitDefaultPreset,
+  withPresetTitle,
   presetTitle,
 } = require("../table-utils.js");
 
@@ -478,7 +477,13 @@ test("anyImageryLeafTitle: the branch is the registry flag, the clause is the ca
   assert.match(anyImageryLeafTitle("nosuch", "Equals grid coverage"), /: nosuch publishes/);
 });
 
-// --- fitDefaultPreset: the default view against the content measure --------
+// --- withPresetTitle: a default preset's assembled title ------------------
+//
+// This replaced `fitDefaultPreset` in #350. That function ALSO trimmed a
+// default preset's columns to a leaf budget so the table fit the page measure,
+// and its whole suite went with it -- deliberately: at production's four
+// providers the trim was dropping a DATE group from each pivoted page, and
+// there is no longer a width to trim toward, since the tables scroll.
 
 const _cols = (spec, deltas = []) =>
   spec.flatMap(([group, keys]) =>
@@ -491,156 +496,58 @@ const _cols = (spec, deltas = []) =>
     }))
   );
 
-test("fitDefaultPreset: a preset already inside the budget is returned untouched", () => {
+test("withPresetTitle: a preset that spells no titleParts is returned untouched", () => {
   // Identity, not a copy: the caller keeps every other field, and an
   // unnecessary rebuild is how a preset silently loses one.
   const columns = _cols([["cov", ["a", "b"]], [null, ["z"]]]);
   const preset = { id: "overview", label: "Overview", columns: ["a", "b", "z"] };
-  assert.equal(fitDefaultPreset(preset, columns), preset);
+  assert.equal(withPresetTitle(preset, columns), preset);
 });
 
-test("fitDefaultPreset: trailing GROUPS give way, one at a time, from the end", () => {
-  const columns = _cols([
-    ["cov", ["c1", "c2", "c3", "cd"]],
-    ["age", ["a1", "a2", "a3", "ad"]],
-    ["collected", ["l1", "l2", "l3"]],
-  ]);
+test("withPresetTitle: a preset that spells a plain title keeps it verbatim", () => {
+  const columns = _cols([["cov", ["c1", "c2"]], ["age", ["a1", "a2"]]]);
+  const preset = { id: "compare", title: "fixed", columns: columns.map((c) => c.key) };
+  assert.equal(withPresetTitle(preset, columns).title, "fixed");
+});
+
+test("withPresetTitle: every clause survives, at every provider count", () => {
+  // The regression #350 guards. The title used to be assembled from the
+  // clauses whose columns SURVIVED A TRIM, so at four providers grid's
+  // Overview read "how much imagery a city has and how fresh it is" and
+  // showed no collection date at all. Nothing trims now, so no count drops a
+  // clause -- and a count-swept assertion is what fails if a budget returns.
+  const parts = { cov: "how much", age: "how fresh", collected: "when collected" };
+  for (const n of [1, 2, 3, 4, 5]) {
+    const names = (g) => Array.from({ length: n }, (_, i) => `${g}${i}`);
+    const columns = _cols([
+      ["cov", names("c")],
+      ["age", names("a")],
+      ["collected", names("t")],
+    ]);
+    const preset = {
+      titleLead: "The headline read:",
+      titleParts: parts,
+      columns: columns.map((c) => c.key),
+    };
+    assert.equal(
+      withPresetTitle(preset, columns).title,
+      "The headline read: how much, how fresh, and when collected",
+      `${n} providers`
+    );
+  }
+});
+
+test("withPresetTitle: a clause whose group has no leaves is not promised", () => {
+  // The one filter worth keeping from the trimming version: a group with no
+  // COLLECTED providers builds no leaves, and naming it would promise a
+  // column that is not on the page.
+  const columns = _cols([["cov", ["c1", "c2"]], ["age", ["a1", "a2"]]]);
   const preset = {
-    id: "overview",
-    title: "kept",
-    columns: ["c1", "c2", "c3", "cd", "a1", "a2", "a3", "ad", "l1", "l2", "l3"],
-  };
-  const fitted = fitDefaultPreset(preset, columns, 8);
-  assert.deepEqual(fitted.columns, ["c1", "c2", "c3", "cd", "a1", "a2", "a3", "ad"]);
-  assert.equal(fitted.title, "kept", "the trim must not drop the preset's other fields");
-  assert.deepEqual(preset.columns.length, 11, "the input preset was mutated");
-
-  // Tighter still, and the next group from the end goes too.
-  assert.deepEqual(fitDefaultPreset(preset, columns, 5).columns, ["c1", "c2", "c3", "cd"]);
-});
-
-test("fitDefaultPreset: an ungrouped column survives a trim that a key-wise one would take", () => {
-  // The streets case (#334): "Street km" is the denominator every percentage
-  // in the row is a percentage of, and it sits LAST in the preset. Dropping
-  // trailing keys would take it first; dropping trailing groups keeps it.
-  const columns = _cols([
-    ["cov", ["c1", "c2", "c3", "cd"]],
-    ["walked", ["w1", "w2", "w3"]],
-    ["age", ["a1", "a2", "a3"]],
-    [null, ["lengthKm"]],
-  ]);
-  const preset = {
-    id: "overview",
-    columns: ["c1", "c2", "c3", "cd", "w1", "w2", "w3", "a1", "a2", "a3", "lengthKm"],
-  };
-  const fitted = fitDefaultPreset(preset, columns, 8);
-  assert.ok(fitted.columns.includes("lengthKm"));
-  assert.deepEqual(fitted.columns, ["c1", "c2", "c3", "cd", "w1", "w2", "w3", "lengthKm"]);
-});
-
-test("fitDefaultPreset: a preset of ungrouped columns cannot be trimmed, and says so by not trying", () => {
-  // There is nothing group-shaped to drop, so it returns what it was given
-  // rather than looping or truncating mid-metric. The e2e width gate is what
-  // catches this shape if one ever exceeds the measure.
-  const columns = _cols([[null, ["a", "b", "c"]]]);
-  const preset = { id: "overview", columns: ["a", "b", "c"] };
-  assert.deepEqual(fitDefaultPreset(preset, columns, 1).columns, ["a", "b", "c"]);
-});
-
-test("fitDefaultPreset: the budget is the measured two-provider default, not a round number", () => {
-  // Both pages' default presets are three grouped metrics, which comes to
-  // exactly this many leaves at two providers — the widest default that has
-  // been measured to fit (1500px page less the 280px sidebar). Changing it
-  // without re-measuring is what the e2e width gate is there to refuse.
-  assert.equal(DEFAULT_PRESET_LEAF_BUDGET, 8);
-});
-
-test("fitDefaultPreset: the Δ leaves give way BEFORE a whole metric group", () => {
-  // Four providers, which is where the two orderings stop being equivalent:
-  // cov and age are five leaves each with their Δ, so the three groups come to
-  // fourteen and no whole-group subset lands on eight — cov+age is ten WITH the
-  // Δs, and dropping age for them leaves five. Giving up the Δs first lands on
-  // exactly eight and keeps Median age, which is the editorial call: a Δ
-  // compares two NAMED providers while a group carries a number for every one
-  // of them, so the Δ's share of what the row says shrinks as providers are
-  // added.
-  const columns = _cols(
-    [
-      ["cov", ["c1", "c2", "c3", "c4", "covD"]],
-      ["age", ["a1", "a2", "a3", "a4", "ageD"]],
-      ["collected", ["l1", "l2", "l3", "l4"]],
-    ],
-    ["covD", "ageD"]
-  );
-  const preset = { id: "overview", columns: columns.map((c) => c.key) };
-  assert.deepEqual(
-    fitDefaultPreset(preset, columns, 8).columns,
-    ["c1", "c2", "c3", "c4", "a1", "a2", "a3", "a4"]
-  );
-});
-
-test("fitDefaultPreset: a Δ dropped to save a group comes back when the group goes anyway", () => {
-  // Three providers: the three groups are eleven leaves, dropping both Δs
-  // leaves nine, and only then does "collected" go — at which point the Δs are
-  // affordable again and are restored. The candidate order is (everything),
-  // (no Δ), (one group fewer), (one group fewer and no Δ), …, so a group is
-  // never paid for with a Δ that did not need dropping.
-  const columns = _cols(
-    [
-      ["cov", ["c1", "c2", "c3", "covD"]],
-      ["age", ["a1", "a2", "a3", "ageD"]],
-      ["collected", ["l1", "l2", "l3"]],
-    ],
-    ["covD", "ageD"]
-  );
-  const preset = { id: "overview", columns: columns.map((c) => c.key) };
-  const fitted = fitDefaultPreset(preset, columns, 8);
-  assert.deepEqual(fitted.columns, ["c1", "c2", "c3", "covD", "a1", "a2", "a3", "ageD"]);
-});
-
-test("fitDefaultPreset: the title is trimmed with the columns", () => {
-  // The defect this closes: a fixed title is an enumeration, and grid's
-  // promised "how fresh it is" at the provider count where the age group is
-  // the one that gives way. A clause survives iff its group still has a leaf.
-  const columns = _cols(
-    [
-      ["cov", ["c1", "c2", "c3", "c4", "covD"]],
-      ["age", ["a1", "a2", "a3", "a4", "ageD"]],
-      ["collected", ["l1", "l2", "l3", "l4"]],
-    ],
-    ["covD", "ageD"]
-  );
-  const preset = {
-    id: "overview",
     titleLead: "The headline read:",
-    titleParts: { cov: "how much", age: "how fresh", collected: "when", delta: "who has more" },
+    titleParts: { cov: "how much", age: "how fresh", collected: "when collected" },
     columns: columns.map((c) => c.key),
   };
-
-  // Everything fits: every clause, in the map's key order rather than the
-  // column order.
-  assert.equal(
-    fitDefaultPreset(preset, columns, 99).title,
-    "The headline read: how much, how fresh, when, and who has more"
-  );
-  // The Δs went, so "who has more" went with them — and nothing else moved.
-  assert.equal(fitDefaultPreset(preset, columns, 8).title, "The headline read: how much and how fresh");
-  // Down to one group — and its Δ is affordable again, so "who has more" comes
-  // back with it. Two clauses, joined with "and" and no comma.
-  assert.equal(
-    fitDefaultPreset(preset, columns, 5).title,
-    "The headline read: how much and who has more"
-  );
-  // Tighter still: one clause, and no stray conjunction.
-  assert.equal(fitDefaultPreset(preset, columns, 4).title, "The headline read: how much");
-});
-
-test("fitDefaultPreset: a preset that spells a plain title keeps it verbatim", () => {
-  // Only the presets that opt into `titleParts` pay for the assembly; every
-  // other preset (and every non-default one) is left strictly alone.
-  const columns = _cols([["cov", ["c1", "c2", "c3"]], ["age", ["a1", "a2", "a3"]]]);
-  const preset = { id: "compare", title: "fixed", columns: columns.map((c) => c.key) };
-  assert.equal(fitDefaultPreset(preset, columns, 3).title, "fixed");
+  assert.equal(withPresetTitle(preset, columns).title, "The headline read: how much and how fresh");
 });
 
 test("presetTitle: the clause list is Oxford-joined, and an absent one is absent", () => {
@@ -660,7 +567,7 @@ test("presetTitle: the clause list is Oxford-joined, and an absent one is absent
     "one and two"
   );
   // A preset with neither is untouched, undefined included — that is what lets
-  // fitDefaultPreset return an already-fitting preset by identity.
+  // withPresetTitle return an untitled preset by identity.
   assert.equal(presetTitle({ columns: [] }, [], groupOf, isDelta), undefined);
   assert.equal(presetTitle({ title: "fixed" }, [], groupOf, isDelta), "fixed");
 });

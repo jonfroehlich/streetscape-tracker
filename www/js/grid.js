@@ -366,15 +366,27 @@ const GRID_COLUMNS = buildGridColumns();
  *
  * @param {string} id - Group id.
  * @param {Object[]} [columns] - The build to read; defaults to full-registry.
+ * @param {Object} [opts]
+ * @param {boolean} [opts.includeDelta=true] - Keep the group's Δ leaf. The
+ *   default view asks for `false`; every explicitly chosen preset keeps it.
+ *   Keyed on the `isGroupDelta` flag `providerColumnGroup` stamps, never on
+ *   the "Δ" label — sniffing the glyph would tie a column rule to a
+ *   character. Mirrors `streetGroupKeys` in streets.js.
  */
-function gridGroupKeys(id, columns = GRID_COLUMNS) {
-  return columns.filter((c) => c.group?.id === id).map((c) => c.key);
+function gridGroupKeys(id, columns = GRID_COLUMNS, { includeDelta = true } = {}) {
+  return columns
+    .filter((c) => c.group?.id === id && (includeDelta || c.isGroupDelta !== true))
+    .map((c) => c.key);
 }
 
 /**
- * Column presets. The first is the default and must fit the page's content
- * measure (1500px page − the 280px sidebar) without horizontal scrolling —
- * that is what these exist for.
+ * Column presets. The first is the default.
+ *
+ * It no longer has to fit the page's content measure (#350): at four
+ * collected providers nothing that carries coverage, imagery age AND the
+ * collection date fits 1100px, and "Last collected" is not optional — so the
+ * table scrolls inside its wrap and the city column is pinned
+ * (data-table.css) to keep a scrolled row readable.
  *
  * Built from a column list rather than fixed, so a preset naming a grouped
  * metric lists exactly the leaves that were built — three providers' worth
@@ -385,32 +397,36 @@ function gridGroupKeys(id, columns = GRID_COLUMNS) {
  */
 function buildGridPresets(columns = GRID_COLUMNS) {
   const groupKeys = (id) => gridGroupKeys(id, columns);
+  const metricKeys = (id) => gridGroupKeys(id, columns, { includeDelta: false });
   return [
-    // The default, and the only one trimmed to the measure: its width grows
-    // with the number of COLLECTED providers, so what fits two overflows at
-    // three (issue #334). "Last collected" is the group that gives way there,
-    // because when we last scraped is a different question from how much
-    // imagery there is and how fresh it is, and the Provenance preset is one
-    // click away. At FOUR the Δ leaves go instead of a second group -- see
-    // fitDefaultPreset, which spends the width on a number for every provider
-    // rather than on a comparison of two of them.
-    fitDefaultPreset(
+    // The default. Its width grows with the number of COLLECTED providers,
+    // and since #350 it is allowed to: "Last collected" had been the group
+    // that gave way at three (#334), so at production's four providers this
+    // page showed no collection date at all and the only route to one was the
+    // Provenance preset or the column picker. When a city was last scraped is
+    // not an optional column, and there is no width to find -- a pivoted leaf
+    // is as wide as the PROVIDER NAME in its header. The table scrolls inside
+    // its wrap instead, with the city column pinned (data-table.css).
+    withPresetTitle(
       {
         id: "overview",
         label: "Overview",
-        // Assembled from the clauses whose columns survive the trim rather
-        // than spelled as one string -- a fixed title is an enumeration, and
-        // this one promised "how fresh it is" at the provider count where the
-        // age group is the one that gives way. Clause order is this map's key
-        // order; `delta` is the reserved id for the Δ leaves.
+        // Assembled from `titleParts` rather than spelled as one string -- a
+        // fixed title is an enumeration, and this one promised "how fresh it
+        // is" at the provider count where the age group gave way. Clause
+        // order is this map's key order.
         titleLead: "The headline read:",
         titleParts: {
           cov: "how much imagery a city has",
           age: "how fresh it is",
           collected: "when it was last collected",
-          delta: "who has more",
         },
-        columns: [...groupKeys("cov"), ...groupKeys("age"), ...groupKeys("collected")],
+        // Δ leaves stay out, the same call streets.html makes: a Δ compares
+        // two NAMED providers while the same column spent on a metric group
+        // carries every one of them. Retiring the trim would otherwise have
+        // silently added three Δs this page has not shown since #334.
+        // "Compare providers" and the picker still have them.
+        columns: [...metricKeys("cov"), ...metricKeys("age"), ...metricKeys("collected")],
       },
       columns
     ),

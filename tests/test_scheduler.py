@@ -11841,6 +11841,86 @@ def test_the_panoramax_walk_child_gets_the_same_three_flags(conn):
     assert "--panoramax-max-requests" not in plain, "unset still means crawl to completion"
 
 
+def test_a_scheduled_walk_is_never_handed_more_sockets_than_its_provider_holds(conn):
+    """The host's share and the provider's ceiling are two limits, and both hold.
+
+    `_street_collect_cmd` passed its lane share as `--connection-limit` for
+    EVERY street channel, and the child resolves `args.connection_limit or
+    <this provider's default>` — so `_WALK_CONNECTION_LIMITS` was dead code on
+    every scheduled walk from the day the flag was added. `panoramax_streets`
+    therefore ran at production's 50 from #335 onwards: ten times the 5 chosen
+    for it, held open against a volunteer-run meta-catalog that publishes no
+    rate limit, returns no `Retry-After` and has no credential to identify us
+    by.
+
+    Pinned by handing the argv to the CHILD'S OWN parser and asking the child's
+    own resolver what it would do with it, because that is the only assertion
+    that can tell a fixed scheduler from a table the scheduler overrides:
+    `PANORAMAX_WALK_CONNECTION_LIMIT == 5` was true throughout the period
+    production walked at 50.
+    """
+    from streetscape_metadata_tracker.download_common import SERIAL_WALK_PROVIDERS
+    from streetscape_metadata_tracker.scheduler import STREET_CHANNELS, _street_collect_cmd
+    from streetscape_street_analyzer import collect
+
+    city = db.resolve_city(conn, _register(conn, "Bend", width=1000, height=1000, step=20))
+
+    def child_would_hold(channel, share):
+        cmd = _street_collect_cmd(SchedulerConfig(), city, date(2026, 7, 1), channel, share, 9_000)
+        # cmd[:3] is `python -m streetscape_street_analyzer.collect`; the rest is
+        # this child's argv, parsed here by the parser that will parse it there.
+        args = collect.build_parser().parse_args(cmd[3:])
+        provider = STREET_CHANNELS[channel]
+        if provider in SERIAL_WALK_PROVIDERS:
+            # Its arm never calls `_walk_connection_limit` — there is no pool to
+            # size — so what the flag says is all there is to assert.
+            return args.connection_limit
+        return collect._walk_connection_limit(args, provider)
+
+    # The regression, at exactly the share production configures.
+    assert child_would_hold("panoramax_streets", 50) == 5
+    # And the lane division still bites BELOW that ceiling: the clamp composes
+    # the two limits, it does not replace one with the other.
+    assert child_would_hold("panoramax_streets", 3) == 3
+
+    # The two channels whose own ceiling IS 50 keep the share they are given,
+    # divided (2 lanes) or throttled by the resource guard as it may be.
+    assert child_would_hold("gsv_streets", 50) == 50
+    assert child_would_hold("gsv_streets", 25) == 25
+    assert child_would_hold("mapillary_streets", 8) == 8
+    # ...and are clamped too once a configured share exceeds their own number,
+    # so this is a min in both directions rather than a panoramax special case.
+    assert child_would_hold("gsv_streets", 90) == 50
+    assert child_would_hold("mapillary_streets", 90) == 50
+
+    # kartaview is untouched: its sweep is serial, so the flag it is handed is
+    # the share, unchanged, and nothing downstream reads it.
+    assert child_would_hold("kartaview_streets", 50) == 50
+    kv = _street_collect_cmd(
+        SchedulerConfig(), city, date(2026, 7, 1), "kartaview_streets", 50, 9_000
+    )
+    assert kv[kv.index("--connection-limit") + 1] == "50"
+
+
+def test_every_street_provider_declares_its_socket_ceiling():
+    """Set equality, the posture CHANNEL_HOSTS and CHANNEL_RESUMABLE already take.
+
+    The clamp reads `WALK_CONNECTION_LIMITS.get(provider)` and leaves a miss
+    alone, which is right for kartaview (serial sweep, no pool) and silent for a
+    provider somebody forgot — the exact silence that let `panoramax_streets`
+    walk at 50. Declaring both sets makes that omission a failure here instead.
+    """
+    from streetscape_metadata_tracker.download_common import (
+        SERIAL_WALK_PROVIDERS,
+        WALK_CONNECTION_LIMITS,
+    )
+    from streetscape_metadata_tracker.scheduler import STREET_CHANNELS
+
+    pooled, serial = set(WALK_CONNECTION_LIMITS), set(SERIAL_WALK_PROVIDERS)
+    assert pooled | serial == set(STREET_CHANNELS.values())
+    assert not pooled & serial, "a provider either holds a pool or does not"
+
+
 def test_a_panoramax_walk_reads_its_grid_siblings_cached_census_for_nothing(conn):
     """The #290 pairing, which is the whole argument for the adjacent rank.
 

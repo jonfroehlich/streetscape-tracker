@@ -24,6 +24,7 @@ this arm trustworthy in its own right rather than by analogy to Mapillary:
 """
 
 import gzip
+import logging
 import os
 from datetime import date
 from unittest import mock
@@ -728,6 +729,36 @@ def test_the_walk_holds_this_providers_own_number_of_sockets_not_gsvs(tmp_path, 
     data_dir2, calls2 = _setup(tmp_path / "b", monkeypatch, [_picture("px1", 44.05, -121.30)])
     assert collect.run_collect(_args(data_dir2, **{"connection-limit": 12})) == 0
     assert calls2["connection_limit"] == 12, "an operator's explicit value is honoured"
+
+
+def test_an_explicit_value_over_this_providers_ceiling_is_honoured_but_said_out_loud(
+    tmp_path, monkeypatch, caplog
+):
+    """Honoured, because the operator typing it knows something the table does
+    not. Not SILENT, because the host it protects tells us nothing afterwards:
+    Panoramax publishes no rate limit and returns no `Retry-After`, so a walk
+    holding too many sockets is invisible until the instance refuses us.
+
+    The nightly path no longer reaches this branch at all — the scheduler
+    composes the min of its lane share and this ceiling — so the warning is
+    exactly the hand-typed case it names.
+    """
+    data_dir, calls = _setup(tmp_path, monkeypatch, [_picture("px1", 44.05, -121.30)])
+    with caplog.at_level(logging.WARNING, logger=collect.logger.name):
+        assert collect.run_collect(_args(data_dir, **{"connection-limit": 20})) == 0
+    assert calls["connection_limit"] == 20
+    assert any(
+        "--connection-limit 20 exceeds" in r.getMessage() and "panoramax" in r.getMessage()
+        for r in caplog.records
+    )
+
+    # ...and a value UNDER it says nothing: only exceeding the bound is news.
+    caplog.clear()
+    data_dir2, calls2 = _setup(tmp_path / "b", monkeypatch, [_picture("px1", 44.05, -121.30)])
+    with caplog.at_level(logging.WARNING, logger=collect.logger.name):
+        assert collect.run_collect(_args(data_dir2, **{"connection-limit": 3})) == 0
+    assert calls2["connection_limit"] == 3
+    assert not [r for r in caplog.records if "--connection-limit" in r.getMessage()]
 
 
 def test_a_paired_night_prices_this_walk_at_zero_and_the_budget_gate_lets_it_through(

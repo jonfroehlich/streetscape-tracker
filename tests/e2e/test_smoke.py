@@ -991,26 +991,26 @@ def test_grid_page_lists_one_row_per_city(page: Page, base_url):
     expect(page.locator("#grid-thead tr")).to_have_count(2)
     group = page.locator("#grid-thead th.th-group", has_text="Grid coverage")
     expect(group).to_have_count(1)
-    # GSV + Mapillary + Panoramax + Δ. One leaf per COLLECTED provider, so
-    # this number is the fixture's provider count plus the Δ, not a constant.
-    expect(group).to_have_attribute("colspan", "4")
+    # GSV + Mapillary + Panoramax, and NO Δ: the default preset names no Δ
+    # leaf on either pivoted page since #350, so this is the fixture's
+    # provider count exactly rather than that plus one.
+    expect(group).to_have_attribute("colspan", "3")
     assert group.evaluate("el => el.hasAttribute('data-key')") is False
 
-    # Alpha City is the three-provider city: every leaf populated, and a Δ
-    # that is a real signed number rather than an em-dash. The Δ is a FIXED
-    # pair (Mapillary − GSV), so a third provider adds a leaf and no Δ.
+    # Alpha City is the three-provider city: every leaf populated. The Δ is a
+    # FIXED pair (Mapillary − GSV) and lives in "Compare providers" now, so
+    # the default view carries none at all.
     alpha = rows.first
     expect(alpha.locator("td.coverage-cell").nth(0)).to_have_text("75.0%")  # GSV
     expect(alpha.locator("td.coverage-cell").nth(1)).to_have_text("66.7%")  # Mapillary
     expect(alpha.locator("td.coverage-cell").nth(2)).to_have_text("50.0%")  # Panoramax
-    expect(alpha.locator("td.delta-cell").first).to_have_text("-8.3 pp")
+    expect(alpha.locator("td.delta-cell")).to_have_count(0)
 
-    # Map Ville has no GSV run at all: the union pivot keeps the row, the
-    # missing provider reads as absent, and the Δ has nothing to compare.
+    # Map Ville has no GSV run at all: the union pivot keeps the row and the
+    # missing provider reads as absent.
     map_ville = rows.nth(1)
     expect(map_ville.locator("td.coverage-cell").nth(0)).to_have_text("—")
     expect(map_ville.locator("td.coverage-cell").nth(1)).to_have_text("66.7%")
-    expect(map_ville.locator("td.delta-cell").first).to_have_text("—")
 
     # Rows link to the city page via a run filename, from the row's own name
     # cell — there is no separate "View on map" column (issue #188 follow-up:
@@ -1029,11 +1029,18 @@ def test_grid_page_lists_one_row_per_city(page: Page, base_url):
     expect(page.locator("#grid-tbody tr").first).to_contain_text("Alpha City")
     expect(page.locator("#grid-tbody tr").last).to_contain_text("Map Ville")
 
-    # ...and so does a Δ header, which is the whole point of the pivot.
+    # ...and so does a Δ header, which is the whole point of the pivot. It is
+    # no longer in the DEFAULT view — that width went to "Last collected"
+    # (#350) — so reach it the way a reader does, through an explicitly chosen
+    # preset. The absence assertion comes first, or this would pass on a page
+    # that simply still had the column.
+    expect(page.locator('th[data-key="deltaPct"]')).to_have_count(0)
+    page.locator("#table-preset").select_option("compare")
     page.locator('th[data-key="deltaPct"] button').click()
     expect(page.locator('th[data-key="deltaPct"]')).to_have_attribute("aria-sort", "descending")
     expect(page.locator("#grid-tbody tr").first).to_contain_text("Alpha City")
     assert "sort=deltaPct" in page.url
+    page.locator("#table-preset").select_option("overview")
 
     # And it actually lands on the city page.
     page.locator("#grid-tbody tr", has_text="Alpha City").locator("th a.streets-view-link").click()
@@ -1052,23 +1059,32 @@ def test_grid_provider_cells_open_that_providers_own_run(page: Page, base_url):
     page.goto(f"{base_url}/grid.html")
 
     alpha = page.locator("#grid-tbody tr", has_text="Alpha City")
-    # Overview shows two metric groups at this provider count (it drops Last
-    # collected at three, #334), so Alpha City's three providers contribute
-    # six linked cells; the Δ cells are not links.
+    # 3 groups x 3 providers: coverage, Median age and Last collected all
+    # survive now that the default trims nothing (#350), so Alpha City's three
+    # providers contribute nine linked cells. The href SET below is still the
+    # assertion that matters — a count cannot say WHICH provider's series a
+    # cell opens.
     links = alpha.locator("td a.provider-cell-link")
-    expect(links).to_have_count(6)
+    expect(links).to_have_count(9)
     hrefs = links.evaluate_all("els => els.map(e => e.getAttribute('href'))")
     assert set(hrefs) == {
         f"city.html?file={ALPHA_LATEST}",
         f"city.html?file={ALPHA_MAPILLARY_LATEST}",
         f"city.html?file={ALPHA_PANORAMAX_LATEST}",
     }, hrefs
-    expect(alpha.locator("td.delta-cell a")).to_have_count(0)
+    # A Δ belongs to no one provider, so it is never a link. Asserted in the
+    # preset that HAS one: the default builds no Δ cell at all now, and "no
+    # links inside td.delta-cell" passes trivially against zero of them.
+    page.locator("#table-preset").select_option("compare")
+    compare_row = page.locator("#grid-tbody tr", has_text="Alpha City")
+    expect(compare_row.locator("td.delta-cell").first).to_be_visible()
+    expect(compare_row.locator("td.delta-cell a")).to_have_count(0)
+    page.locator("#table-preset").select_option("overview")
 
     # Map Ville has only a Mapillary run: its other providers' cells are
-    # plain, not links to nowhere.
+    # plain, not links to nowhere. One per metric group.
     map_ville = page.locator("#grid-tbody tr", has_text="Map Ville")
-    expect(map_ville.locator("td a.provider-cell-link")).to_have_count(2)
+    expect(map_ville.locator("td a.provider-cell-link")).to_have_count(3)
 
     # Clicking a Mapillary cell lands on the Mapillary series.
     alpha.locator("td.coverage-cell").nth(1).locator("a").click()
@@ -1947,30 +1963,98 @@ def test_city_name_cell_is_truncated_not_left_to_overflow(page: Page, base_url, 
 
 
 @pytest.mark.parametrize("path", ["grid.html", "streets.html", "driving.html"])
-def test_default_columns_fit_without_scrolling_the_page_sideways(page: Page, base_url, path):
-    """Both tables scrolled horizontally before #188, which is treated as a bug
-    rather than a layout choice. The default preset exists to fit the page's
-    1200px measure at desktop width."""
+def test_the_page_itself_never_scrolls_sideways(page: Page, base_url, path):
+    """The DOCUMENT must not scroll sideways, on any of the three table pages.
+
+    This is the half of #188's rule that survives #350. A wide table is now
+    expected on the two pivoted pages — they carry every metric group at every
+    provider count, which is wider than the measure from three providers up —
+    but it has to stay inside `.streets-table-wrap`. That containment is a
+    real, previously-broken property: the wrap needs `position: relative` or
+    the header's absolutely-positioned `.visually-hidden` span resolves against
+    the initial containing block and drags the whole page sideways with it.
+    """
     errors = _capture_errors(page)
     page.set_viewport_size({"width": 1440, "height": 900})
     page.goto(f"{base_url}/{path}")
     expect(page.locator("tbody tr").first).to_be_visible()
 
-    # The document itself must not scroll sideways...
     overflow = page.evaluate(
         "() => document.documentElement.scrollWidth - document.documentElement.clientWidth"
     )
     assert overflow <= 0, f"{path} scrolls sideways by {overflow}px at 1440px wide"
 
-    # ...nor may the table overflow its own scroll container, which is the
-    # narrow-viewport safety net rather than the desktop layout.
+    assert errors == []
+
+
+def test_driving_table_still_fits_its_container(page: Page, base_url):
+    """`driving.html` keeps the strict fit that the pivoted pages gave up.
+
+    A driving row is a PLACE, with a flat single-row header and no per-provider
+    fan-out, so its width does not grow with the provider count and there is
+    nothing forcing it past the measure. Keeping the assertion here is what
+    stops #350's relaxation leaking onto a page that never needed it.
+    """
+    errors = _capture_errors(page)
+    page.set_viewport_size({"width": 1440, "height": 900})
+    page.goto(f"{base_url}/driving.html")
+    expect(page.locator("tbody tr").first).to_be_visible()
+
     table_overflow = page.evaluate(
         """() => {
              const wrap = document.querySelector('.streets-table-wrap');
              return wrap.scrollWidth - wrap.clientWidth;
            }"""
     )
-    assert table_overflow <= 0, f"{path} table overflows its container by {table_overflow}px"
+    assert table_overflow <= 0, f"driving.html table overflows its container by {table_overflow}px"
+
+    assert errors == []
+
+
+@pytest.mark.parametrize("path", ["grid.html", "streets.html"])
+def test_the_city_column_stays_pinned_while_the_table_scrolls(page: Page, base_url, path):
+    """The pivoted tables scroll sideways now (#350), so the row header is
+    pinned — otherwise a scrolled row has no name, and reading a DATE against a
+    named city is the whole reason those columns made the table wide.
+
+    Asserted as behaviour rather than as a CSS declaration: `position: sticky`
+    silently does nothing without a scrolling ancestor, and an assertion that
+    only read `getComputedStyle` would pass on a page where it never engaged.
+
+    The viewport is deliberately 1000px rather than the 1440px the other
+    layout tests use, and NOT because that is the interesting width. It is
+    because the committed fixture carries three providers while production
+    carries four: three still fit 1440px, so at the wider viewport this test
+    would silently have nothing to scroll — the exact shape of the #334 gate
+    that stayed green against a too-narrow payload. 1000px is above the 900px
+    breakpoint where the sidebar unstacks, so the layout under test is the
+    desktop one either way.
+    """
+    errors = _capture_errors(page)
+    page.set_viewport_size({"width": 1000, "height": 900})
+    page.goto(f"{base_url}/{path}")
+    expect(page.locator("tbody tr").first).to_be_visible()
+
+    wrap = page.locator(".streets-table-wrap")
+    scrollable = wrap.evaluate("el => el.scrollWidth - el.clientWidth")
+    assert scrollable > 0, (
+        f"{path} does not overflow its wrap, so nothing here is under test — "
+        "the default preset was trimmed, or the fixture lost a provider"
+    )
+
+    city = page.locator("#streets-tbody tr, #grid-tbody tr").first.locator("th").first
+    before = city.bounding_box()["x"]
+    wrap.evaluate("el => el.scrollLeft = el.scrollWidth - el.clientWidth")
+    page.wait_for_timeout(100)
+    after = city.bounding_box()["x"]
+
+    assert abs(after - before) <= 1, (
+        f"{path}: the city column moved {after - before:.0f}px when the table was "
+        "scrolled to its far edge; it should stay pinned"
+    )
+    # And it has to be opaque, or the scrolled columns show through it.
+    bg = city.evaluate("el => getComputedStyle(el).backgroundColor")
+    assert "rgba(0, 0, 0, 0)" not in bg, f"{path}: the pinned city cell is transparent ({bg})"
 
     assert errors == []
 
@@ -2001,5 +2085,31 @@ def test_streets_default_view_shows_median_age_and_walk_dates(page: Page, base_u
     # no leaves under it would still satisfy the assertions above.
     ages = page.locator("#streets-tbody td", has_text="yrs")
     assert ages.count() > 0, "Median age header is present but no cell renders an age"
+    walked = page.locator("#streets-tbody td", has_text=re.compile(r"^\d{4}-\d{2}-\d{2}$"))
+    assert walked.count() > 0, "Walked header is present but no cell renders a date"
+
+    assert errors == []
+
+
+def test_grid_default_view_shows_when_each_provider_last_collected(page: Page, base_url):
+    """The grid twin of the test above, and the page where the loss ran longest.
+
+    "Last collected" was the trailing group of grid's Overview, so #334's trim
+    took it from the THIRD provider on — and production has been four deep.
+    The Provenance preset answered the same question, which is why this read as
+    a deferral rather than a defect for two releases; #350 decided a collection
+    date is not something a reader should have to change presets to see.
+    """
+    errors = _capture_errors(page)
+    page.set_viewport_size({"width": 1440, "height": 900})
+    page.goto(f"{base_url}/grid.html")
+    expect(page.locator("#grid-tbody tr").first).to_be_visible()
+
+    groups = page.locator("thead th.th-group")
+    expect(groups.filter(has_text="Median age")).to_have_count(1)
+    expect(groups.filter(has_text="Last collected")).to_have_count(1)
+
+    collected = page.locator("#grid-tbody td", has_text=re.compile(r"^\d{4}-\d{2}-\d{2}$"))
+    assert collected.count() > 0, "Last collected header is present but no cell renders a date"
 
     assert errors == []
