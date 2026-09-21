@@ -43,6 +43,14 @@ global.adaptCitiesPayload = (raw, provider) => ({
 // must follow PROVIDERS, which the provider-column helpers read).
 Object.assign(global, require("../table-utils.js"));
 
+// Cherry-picked, not spread: the label builders moved to streetscape-utils.js,
+// whose real PROVIDERS registry would otherwise replace the stub above and
+// silently retire this file's third-provider coverage.
+{
+  const { cityDisplayLabel, cityFullLabel } = require("../streetscape-utils.js");
+  Object.assign(global, { cityDisplayLabel, cityFullLabel });
+}
+
 const {
   cityLabel,
   indexCitiesByProvider,
@@ -384,39 +392,74 @@ test("the default sort is a VISIBLE column of the default preset", () => {
   assert.ok(STREET_PRESETS[0].columns.includes(DEFAULT_SORT.key));
 });
 
-test("the default preset stops at the measure instead of growing a third time", () => {
-  // The streets half of issue #334's width finding, and the group that gives
-  // way differs: here it is "Median age", not "Last collected", because a
-  // walk's DATE ("Walked") is what says whether the coverage beside it is
-  // current. "Street km" survives the trim because it is an ungrouped scalar
-  // and the denominator every percentage in the row is a percentage of —
-  // dropping trailing KEYS rather than trailing GROUPS would have taken it.
+test("the default preset keeps Median age and gives up Walked instead", () => {
+  // The streets half of issue #334's width finding, re-decided. The trim used
+  // to take "Median age" at three providers, and on THIS page that meant
+  // losing it outright: no other streets preset names it, so it was reachable
+  // only through the column picker. Street coverage and RECENCY together are
+  // what a Project Sidewalk deployment decision reads.
+  //
+  // Groups give way from the END, so the preset's ORDER is the mechanism:
+  // `age` is listed ahead of `walked`, and that is the whole reason a fourth
+  // provider now costs the walk DATE rather than the imagery age. "Street km"
+  // survives either way, being an ungrouped scalar and the denominator every
+  // percentage in the row is a percentage of.
   const groupsOf = (preset, providers) => {
     const byKey = new Map(buildStreetColumns(providers).map((c) => [c.key, c.group?.id ?? null]));
     return [...new Set(preset.columns.map((k) => byKey.get(k)))];
   };
   const defaultFor = (providers) => buildStreetPresets(buildStreetColumns(providers))[0];
 
-  const two = defaultFor(["gsv", "mapillary"]);
-  assert.equal(two.columns.length, 8);
-  assert.deepEqual(groupsOf(two, ["gsv", "mapillary"]), ["cov", "walked", "age", null]);
+  // Exact counts rather than `<= budget` bounds: three providers lands on the
+  // budget EXACTLY, and an inequality cannot tell "fits" from "was trimmed".
+  const TWO = ["gsv", "mapillary"];
+  const two = defaultFor(TWO);
+  assert.equal(two.columns.length, 7);
+  assert.deepEqual(groupsOf(two, TWO), ["cov", "age", "walked", null]);
 
-  const three = defaultFor(["gsv", "mapillary", "panoramax"]);
-  assert.ok(three.columns.length <= 8, `${three.columns.length} leaves`);
-  assert.deepEqual(groupsOf(three, ["gsv", "mapillary", "panoramax"]), ["cov", "walked", null]);
+  const THREE = ["gsv", "mapillary", "panoramax"];
+  const three = defaultFor(THREE);
+  assert.equal(three.columns.length, 10);
+  assert.deepEqual(groupsOf(three, THREE), ["cov", "age", "walked", null]);
 
-  // A fourth provider takes "Walked" too — unlike grid.html, giving up the Δ
-  // does not save this page, because cov + walked + Street km is nine leaves
-  // with no Δ in it at all. "Street km" still survives, being ungrouped.
+  // A fourth provider costs "Walked", and Median age is what survives it.
   const FOUR = ["gsv", "mapillary", "kartaview", "panoramax"];
   const four = defaultFor(FOUR);
-  assert.ok(four.columns.length <= 8, `${four.columns.length} leaves`);
-  assert.deepEqual(groupsOf(four, FOUR), ["cov", null]);
+  assert.equal(four.columns.length, 9);
+  assert.deepEqual(groupsOf(four, FOUR), ["cov", "age", null]);
   assert.ok(four.columns.includes("lengthKm"), "the ungrouped denominator was trimmed away");
 
   // Only the DEFAULT is trimmed; an explicitly chosen preset keeps what it names.
-  const presets = buildStreetPresets(buildStreetColumns(["gsv", "mapillary", "panoramax"]));
-  assert.ok(presets.find((p) => p.id === "kilometres").columns.length > 8);
+  const presets = buildStreetPresets(buildStreetColumns(THREE));
+  assert.ok(presets.find((p) => p.id === "kilometres").columns.length > 10);
+});
+
+test("the default preset carries no Δ leaf, and the other presets still do", () => {
+  // Dropping the Δ is what pays for the third metric group: it compares two
+  // NAMED providers, while the same width spent on a group buys a number for
+  // every one of them. Keyed on the `isGroupDelta` flag providerColumnGroup
+  // stamps rather than on the "Δ" label, so this cannot be satisfied by the
+  // glyph changing.
+  for (const providers of [
+    ["gsv", "mapillary"],
+    ["gsv", "mapillary", "panoramax"],
+    ["gsv", "mapillary", "kartaview", "panoramax"],
+  ]) {
+    const columns = buildStreetColumns(providers);
+    const deltas = new Set(columns.filter((c) => c.isGroupDelta === true).map((c) => c.key));
+    assert.ok(deltas.size > 0, `${providers.length} providers: no Δ built, so this asserts nothing`);
+
+    const [overview, ...rest] = buildStreetPresets(columns);
+    assert.deepEqual(
+      overview.columns.filter((k) => deltas.has(k)),
+      [],
+      `${providers.length} providers: the default preset still names a Δ`
+    );
+    assert.ok(
+      rest.some((p) => p.columns.some((k) => deltas.has(k))),
+      "the Δ became unreachable — it should still be an explicit click away"
+    );
+  }
 });
 
 test("every column can render a cell, including from a fully null row model", () => {
@@ -934,19 +977,18 @@ test("the default preset's title says what it shows, at every provider count", (
   // is guaranteed to be on the page, since groups drop from the end.
   const titleFor = (providers) => buildStreetPresets(buildStreetColumns(providers))[0].title;
 
-  assert.equal(
-    titleFor(["gsv", "mapillary"]),
-    "The headline read: how much of a city's streets is covered, when each provider " +
-      "last walked it, and how fresh that imagery is"
-  );
-  assert.equal(
-    titleFor(["gsv", "mapillary", "panoramax"]),
-    "The headline read: how much of a city's streets is covered and when each provider " +
-      "last walked it"
-  );
+  // Clause order is `titleParts` key order — the author's reading order, which
+  // now matches the column order too (coverage, age, walk date).
+  const ALL_THREE =
+    "The headline read: how much of a city's streets is covered, how fresh that imagery is, " +
+    "and when each provider last walked it";
+  assert.equal(titleFor(["gsv", "mapillary"]), ALL_THREE);
+  assert.equal(titleFor(["gsv", "mapillary", "panoramax"]), ALL_THREE);
+  // At four, "Walked" is the group that gives way, so its clause goes with it
+  // and the age clause stays — the failure #295/#296 taught, in reverse.
   assert.equal(
     titleFor(["gsv", "mapillary", "kartaview", "panoramax"]),
-    "The headline read: how much of a city's streets is covered"
+    "The headline read: how much of a city's streets is covered and how fresh that imagery is"
   );
 });
 

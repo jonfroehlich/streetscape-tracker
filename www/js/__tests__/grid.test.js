@@ -47,6 +47,14 @@ const tableUtils = require("../table-utils.js");
 Object.assign(global, tableUtils);
 const { deltaCellHtml } = tableUtils;
 
+// The two label builders live in streetscape-utils.js (index.html loads only
+// that file), so they are cherry-picked rather than spread wholesale: a blanket
+// Object.assign would overwrite the deliberately fake PROVIDERS registry above
+// with the real one, and the third-provider coverage this file depends on with
+// it.
+const { cityDisplayLabel, cityFullLabel } = require("../streetscape-utils.js");
+Object.assign(global, { cityDisplayLabel, cityFullLabel });
+
 // The real adapter is exercised by streetscape-utils.test.js; here a stub
 // keeps the fixtures readable and, crucially, reproduces the ONE behaviour the
 // pivot depends on: a city with no runs for the provider being adapted is

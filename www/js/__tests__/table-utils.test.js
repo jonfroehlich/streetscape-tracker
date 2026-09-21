@@ -11,7 +11,6 @@ const assert = require("node:assert/strict");
 global.coverageColor = (pct) => `coverage(${pct})`;
 
 const {
-  cityDisplayLabel,
   sortRowsBy,
   formatCellNumber,
   coverageCellHtml,
@@ -26,26 +25,8 @@ const {
   presetTitle,
 } = require("../table-utils.js");
 
-// --- cityDisplayLabel (canonical copy; streets.js's cityLabel aliases it) ---
-
-test("cityDisplayLabel: joins city, state, and country", () => {
-  assert.equal(
-    cityDisplayLabel({
-      city: "Seattle",
-      state: { name: "Washington" },
-      country: { name: "United States" },
-    }),
-    "Seattle, Washington, United States"
-  );
-});
-
-test("cityDisplayLabel: city-states don't repeat, empty records fall to Unknown", () => {
-  assert.equal(
-    cityDisplayLabel({ city: "Singapore", state: { name: "Singapore" }, country: { name: "Singapore" } }),
-    "Singapore, Singapore"
-  );
-  assert.equal(cityDisplayLabel({}), "Unknown");
-});
+// cityDisplayLabel's tests moved to streetscape-utils.test.js with the
+// function itself.
 
 // --- sortRowsBy -------------------------------------------------------------
 
