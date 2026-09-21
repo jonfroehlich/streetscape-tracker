@@ -403,12 +403,13 @@ def parse_args():
              tight one: a tile reserves its request at the check, so the cap is
              not overshot at all unless a tile already in flight retries, and
              that residue is bounded by connection_limit x (TILE_MAX_TRIES - 1)
-             — 200 at the 50 sockets a production CHILD gets, which is the
-             number to reason with, not the argparse default of 5. Since
-             2026-09-21 that 50 is no longer [download].connection_limit
-             itself (100): the scheduler divides it across lanes and clamps
-             the share at MAX_PER_CHILD_CONNECTION_LIMIT. Requires a
-             checkpoint to write to. Default: fetch every tile.""",
+             — 20 on this GRID path, because cli.py forwards
+             --connection-limit only on the gsv arm, so this census runs at
+             the DOWNLOADER's own default of 5 (not this flag's argparse
+             default, which is 50, and not the scheduler's per-child share).
+             The 200 figure belongs to the Mapillary ROAD WALK, which does
+             receive the share. Requires a checkpoint to write to. Default:
+             fetch every tile.""",
     )
 
     concurrency_group.add_argument(
@@ -486,12 +487,13 @@ def parse_args():
              tight one: a tile reserves its request at the check, so the cap is
              not overshot at all unless a tile already in flight retries, and
              that residue is bounded by connection_limit x (TILE_MAX_TRIES - 1)
-             — 200 at the 50 sockets a production CHILD gets, which is the
-             number to reason with, not the argparse default of 5. Since
-             2026-09-21 that 50 is no longer [download].connection_limit
-             itself (100): the scheduler divides it across lanes and clamps
-             the share at MAX_PER_CHILD_CONNECTION_LIMIT. Requires a
-             checkpoint to write to. Default: fetch every tile.""",
+             — 20 on this GRID path, because cli.py forwards
+             --connection-limit only on the gsv arm, so this census runs at
+             the DOWNLOADER's own default of 5 (not this flag's argparse
+             default, which is 50, and not the scheduler's per-child share).
+             The 200 figure belongs to the Mapillary ROAD WALK, which does
+             receive the share. Requires a checkpoint to write to. Default:
+             fetch every tile.""",
     )
 
     parser.add_argument(

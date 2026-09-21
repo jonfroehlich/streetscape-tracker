@@ -209,7 +209,23 @@ ReadWritePaths=/cse/web/research/makelab/public/streetscape-tracker
 # #304): that raises in-flight response buffers in proportion to the limit it
 # tests, on top of a two-child case already quoted at 94% of the brake, and no
 # one has put a number on it. Run that experiment at max_concurrent_channels = 1
-# until there is one. It is NOT sized for the full host-disjoint lane ceiling --
+# until there is one.
+#
+#   2026-09-21 (#352): THAT INSTRUCTION NO LONGER DOES WHAT IT SAYS, and the
+#   sentence is kept rather than deleted because it is what the paragraph's
+#   gate was written around. The scheduler now clamps every child at
+#   scheduler.MAX_PER_CHILD_CONNECTION_LIMIT (50), so raising
+#   [download].connection_limit no longer reaches a child AT ANY LANE COUNT --
+#   measured, 150 over one lane still hands the child 50. Running "that
+#   experiment" at one lane is now a null experiment.
+#   The experiment means raising MAX_PER_CHILD_CONNECTION_LIMIT, which lives in
+#   streetscape_metadata_tracker/scheduler.py, and this paragraph still gates
+#   it: nobody has put a number on the buffer cost, so the gate stands and only
+#   the lever moved. (One lane is still the right place to run it -- at one
+#   lane the clamp is the ONLY thing setting the share, so the constant is the
+#   single variable.)
+#
+# It is NOT sized for the full host-disjoint lane ceiling --
 # 5 of 8 since #335, and the ~76 GiB figure was quoted when that ceiling was 4,
 # so it is a FLOOR on what five lanes would want rather than an estimate of it --
 # and it is still NOT sized for a Detroit DIFF night (the unmeasured two-frame

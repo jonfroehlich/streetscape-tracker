@@ -336,9 +336,11 @@ enabled = true
 # AT the ceiling, not exactly on it. A capped crawl lets the tiles already in
 # flight finish their retries instead of cancelling them mid-attempt, so a
 # capped night can end up to connection_limit x (TILE_MAX_TRIES - 1) over --
-# 200 at the 50 sockets each child actually gets (see [download] below: the
-# connection_limit set there is 100, DIVIDED across lanes and clamped per child
-# at scheduler.MAX_PER_CHILD_CONNECTION_LIMIT = 50), not the 20 the argparse default
+# 20, not 200: this is the GRID budget, and cli.py forwards --connection-limit
+# only on its gsv arm, so a Mapillary grid census runs at the downloader's own
+# default of 5. (200 is the Mapillary ROAD WALK's residue -- that one does take
+# the per-child share, 50, being [download].connection_limit below divided
+# across lanes and clamped at scheduler.MAX_PER_CHILD_CONNECTION_LIMIT.) Not the argparse default
 # of 5 would give. Budget this line as a soft ceiling with a 200-request tail.
 #
 # THE NUMBER TO QUOTE IS THE PER-IP SUM WITH mapillary_streets, not this line.
@@ -548,7 +550,7 @@ batch_size = 100
 # 50 -> 100 on 2026-09-21, in the SAME change that raised
 # [schedule].max_concurrent_channels to 2, and meaningless apart from it.
 #
-# This is a HOST budget, so _run_one_city DIVIDES it across lanes rather than
+# This is a HOST budget, so _run_city_channels DIVIDES it across lanes rather than
 # handing it to each child whole: `lane_connection_limit = connection_limit //
 # lanes`. Left at 50, raising to 2 lanes would have given each child 25 — i.e.
 # it would have made the GSV grid run, which is the long pole this whole change
@@ -573,15 +575,33 @@ batch_size = 100
 # lands back on today's 50. That constant, not this line, is where a per-child
 # raise is decided.
 #
-# SO 3 LANES DOES NOT SIMPLY NEED 150 HERE -- an earlier version of this comment
-# said it did, in two files, and that advice was unsafe in both directions: at 1
-# lane 150 exceeds [download].batch_size above (100), and cli.py rejects
-# connection_limit > batch_size with an argparse exit 2 BEFORE any work, which
-# the scheduler records as an ordinary child failure -- five of which quarantine
-# a city for a 90-day cycle. Going further means: raise batch_size first, raise
-# MAX_PER_CHILD_CONNECTION_LIMIT deliberately with a memory measurement behind
-# it, and only then this number. The systemd unit is explicitly NOT sized for
-# the #304 connection_limit experiment.
+# 3 LANES AT TODAY'S PER-CHILD 50 DOES NEED 150 HERE. An earlier revision of
+# this comment retracted that advice as unsafe, and the retraction was wrong --
+# it described a hazard the clamp above had just closed, in the present tense.
+# Measured per-child share, driving the real lane scheduler:
+#
+#     connection_limit |  1 lane   2 lanes   3 lanes   4 lanes
+#     -----------------+---------------------------------------
+#                   50 |     50       25        16        12
+#                  100 |     50       50        33        25
+#                  150 |     50       50        50        37
+#
+# THE DIVISION, NOT THE CLAMP, IS WHAT SETS THE SHARE ABOVE ONE LANE, so raising
+# MAX_PER_CHILD_CONNECTION_LIMIT is the wrong lever for going to 3: at 100 over
+# 3 lanes each child gets 33 and the clamp never bites, so an operator who
+# raises only the constant gets 33 sockets and no explanation. The constant is
+# the lever for raising a child ABOVE 50, which is a different decision.
+#
+# The old hazard is genuinely gone: the clamp caps every child at 50, and the
+# cli.py guard is `connection_limit > batch_size` with batch_size = 100, so the
+# scheduler can no longer reach it at ANY value of this key. It stays reachable
+# by HAND (`--connection-limit 150` on a manual run) -- see #359, which also
+# argues that an argparse exit 2 should not count a strike against a city.
+#
+# So: 150 for 3 lanes is safe and correct. Raising the per-child count above 50
+# is the separate thing that needs a memory measurement and a batch_size raise
+# first, because the systemd unit is explicitly NOT sized for the #304
+# connection_limit experiment.
 connection_limit = 100
 request_timeout_s = 30.0
 # 60 -> 5 on 2026-09-02 (issue #306). It was never a rate limiter and every

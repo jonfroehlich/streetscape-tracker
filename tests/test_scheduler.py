@@ -1178,6 +1178,18 @@ def test_makelab1_production_config_is_wired():
     # pinned where behaviour lives: see
     # test_a_production_child_is_offered_the_divided_socket_share.
     assert cfg.connection_limit == 100
+    # And the per-child ceiling that backstops the division, pinned as a LITERAL
+    # rather than only through `sched.MAX_PER_CHILD_CONNECTION_LIMIT`. The lane
+    # test asserts against the constant, so it follows the constant anywhere:
+    # measured, setting it to 75 was green across all 393 tests in this file
+    # while every one-lane child silently held 75 sockets. Values in (50, 100)
+    # all slipped through -- which is exactly the accidental-raise direction the
+    # constant exists to prevent.
+    #
+    # 50 is the socket count production ran at for the whole history the systemd
+    # unit's 18.88 GiB measurement was taken over, so raising it is a deliberate
+    # edit HERE as well as a memory measurement.
+    assert _sched.MAX_PER_CHILD_CONNECTION_LIMIT == 50
     # Production leaves BOTH of the night's reservations UNSET, so the derived
     # shares are what actually run. Pinning the resolved numbers and not just
     # the Nones is the point: `is None` alone would still pass if a resolver's
@@ -9694,6 +9706,19 @@ def _record_lane_connection_limits(sched, monkeypatch):
         return True
 
     monkeypatch.setattr(sched, "_run_one_city", fake_run)
+    # Neutralize the RESOURCE GUARD, which is a third limiter on this path and a
+    # separate concern from the division and the clamp these tests are about.
+    # `_run_city_channels` calls plan_connection_limit(share, read_system_pressure(),
+    # cfg.resource_guard), the guard is `enabled = True` both by dataclass default
+    # and in the production TOML, and nothing in conftest.py stubs it -- so without
+    # this line the assertions below are assertions about the DEVELOPER'S BOX.
+    # read_system_pressure returns None on macOS (no /proc), which is exactly why
+    # this was green locally while being red anywhere that matters: measured, a
+    # runner with MemAvailable < 8 GiB drops the share to min_connection_limit = 5,
+    # and a box with load5 > 0.9 x ncpu -- makelab2 sits near that during a ZFS
+    # stall -- scales it down proportionally. CLAUDE.md's claim that the suite can
+    # run during a live nightly batch depends on stubs like this one.
+    monkeypatch.setattr(sched, "read_system_pressure", lambda: None)
     return offered
 
 
@@ -9794,9 +9819,18 @@ def test_dropping_the_knob_to_one_lane_does_not_double_a_childs_sockets(conn, mo
     assert set(offered) == {sched.MAX_PER_CHILD_CONNECTION_LIMIT}, (
         f"one lane offered {set(offered)}, want the clamped {sched.MAX_PER_CHILD_CONNECTION_LIMIT}"
     )
-    assert any("clamping" in r.message for r in caplog.records), (
-        "the clamp must say it bit, and why"
-    )
+    # Assert the CONTENT, not just that something was logged. Measured: gutting
+    # the whole six-line f-string down to `logger.warning("clamping")` left the
+    # entire file green -- while satisfying none of the reason the warning exists,
+    # which is that a silent clamp leaves `connection_limit` reading like a number
+    # the children honour when they do not. A message that names neither the
+    # configured value, nor the lane count, nor the share it landed on tells an
+    # operator nothing.
+    clamp_warnings = [r.message for r in caplog.records if "clamping" in r.message]
+    assert clamp_warnings, "the clamp must say it bit"
+    said = clamp_warnings[0]
+    for needle in ("connection_limit=100", "1 lane", "100 sockets per child", "50"):
+        assert needle in said, f"the clamp warning must name {needle!r}; it said: {said}"
 
 
 def test_no_more_than_max_concurrent_channels_are_ever_in_flight(conn, monkeypatch):
