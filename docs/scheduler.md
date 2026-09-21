@@ -310,6 +310,8 @@ Only three channels carry the number at all: the `gsv` grid, the `gsv` road walk
 The Mapillary **grid** never receives it (`cli.py` omits the argument, so `fetch_city_images_async`'s own default of 5 applies), so the arithmetic is 50 + 50 + 5 at knob 3 rather than 150.
 Combined with affinity, the only overlapping pair that points two full-size connectors at one third party is `gsv` + `gsv_streets` — both Google — which is 100 concurrent sockets on the same endpoints gate (2) below is already about.
 Dividing makes the knob a no-op at 1 and bounded above it; the trade is that a city with a single enabled channel gets the divided share too, so **raise `connection_limit` deliberately when you raise the knob** rather than discovering the multiplication in production.
+A **street** child is then clamped a second time, by its provider's own walk ceiling (`download_common.WALK_CONNECTION_LIMITS`): `_street_collect_cmd` sends `min(share, ceiling)`, so `panoramax_streets` holds at most 5 sockets however this knob and `[download].connection_limit` are set, while the division and the guard still lower it below that.
+Until 2026-09-21 the share was sent unconditionally, which made each provider's own default unreachable on every scheduled walk — see [`docs/street-coverage.md`](street-coverage.md).
 
 **Two things gated raising it in production. The first is now satisfied; the second is still outside this repo.**
 (1) **Resume for every provider**, because a deadline or a `systemctl stop` now kills up to N children at once instead of 1.

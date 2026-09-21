@@ -84,6 +84,7 @@ from .download_common import (
     HOST_OVERPASS,
     HOST_PANORAMAX,
     SWEEP_INCOMPLETE_EXIT_CODE,
+    WALK_CONNECTION_LIMITS,
     DownloadError,
     HostUnavailableError,
     coerce_jitter,
@@ -5282,12 +5283,35 @@ def _street_collect_cmd(
     caller's, using the true sample count rather than the planning estimate.
     """
     pc = (cfg.providers or {}).get(channel) or ProviderConfig()
+    # Two different constraints, and BOTH have to hold, so the child is handed
+    # the smaller of them (issue #99/#331 regression found 2026-09-21):
+    #   * `conn_limit` is this host's socket budget, already divided across
+    #     concurrent lanes and already lowered by the resource guard. It is a
+    #     share of a machine, and says nothing about who is on the other end.
+    #   * `WALK_CONNECTION_LIMITS[provider]` is that provider's own ceiling --
+    #     what the collector would default to if this argv said nothing.
+    # Passing the share unconditionally made the second one dead code on every
+    # scheduled walk: `collect.py` resolves `args.connection_limit or <default>`,
+    # and `args.connection_limit` was never None here. `panoramax_streets` ran
+    # at prod's 50 from #335 onwards -- ten times the 5 chosen for it -- against
+    # a volunteer-run meta-catalog that publishes no rate limit and returns no
+    # `Retry-After`. It is a min rather than a hand-off in either direction
+    # because dropping the share would lose the lane division and the guard's
+    # throttle, and keeping it alone loses the host the ceiling is for.
+    provider = STREET_CHANNELS[channel]
+    # `.get`, deliberately: kartaview is in SERIAL_WALK_PROVIDERS and holds no
+    # pool at all (its arm never calls `_walk_connection_limit`), so there is
+    # nothing to clamp and the share passes through untouched, exactly as
+    # before. A provider in neither set is a wiring bug that
+    # `test_every_street_provider_declares_its_socket_ceiling` refuses.
+    ceiling = WALK_CONNECTION_LIMITS.get(provider)
+    walk_conn_limit = conn_limit if ceiling is None else min(conn_limit, ceiling)
     cmd = [
         sys.executable,
         "-m",
         "streetscape_street_analyzer.collect",
         "--provider",
-        STREET_CHANNELS[channel],
+        provider,
         "--run-date",
         today.isoformat(),
         "--data-dir",
@@ -5303,7 +5327,7 @@ def _street_collect_cmd(
         "--network-type",
         pc.network_type,
         "--connection-limit",
-        str(conn_limit),
+        str(walk_conn_limit),
         "--timeout",
         str(cfg.request_timeout_s),
         # Hard stop before the isolated street ledger overruns today's ceiling.

@@ -77,6 +77,41 @@ HOST_LABELS = {
     HOST_PANORAMAX: "the Panoramax meta-catalog (api.panoramax.xyz)",
 }
 
+# Per-provider socket ceilings for a ROAD WALK (issues #99, #331). One
+# `--connection-limit` flag serves four arms whose hosts are not alike, so 50 --
+# a GSV number -- is a default only two of them should inherit.
+#
+# These live HERE, beside the hosts they are about, rather than beside the
+# collector that reads them, for the same reason the Overpass identity strings
+# below do: the SCHEDULER builds the walk's argv and therefore has to honour
+# them, and importing `streetscape_street_analyzer.collect` to read them would
+# drag osmnx/geopandas into the long-lived parent process under a cgroup memory
+# cap (measured 2026-09-21: 1.04 s to import, both modules resident after).
+#
+# gsv and mapillary keep the 50 they have always walked at. Panoramax is 5
+# because that is what ITS GRID RUN uses -- `cli.py` passes no connection_limit
+# for this provider, so `download_panoramax`'s own default applies -- and a walk
+# quietly holding ten times the sockets against a volunteer-run instance with no
+# documented rate limit, no `Retry-After` and no credential to identify us by is
+# the one asymmetry here worth removing. The rate limiter bounds the RATE either
+# way; what this bounds is sockets held open while the instance is slow, which
+# is the failure mode an unmetered host shows first.
+GSV_WALK_CONNECTION_LIMIT = 50
+MAPILLARY_WALK_CONNECTION_LIMIT = 50
+PANORAMAX_WALK_CONNECTION_LIMIT = 5
+WALK_CONNECTION_LIMITS = {
+    "gsv": GSV_WALK_CONNECTION_LIMIT,
+    "mapillary": MAPILLARY_WALK_CONNECTION_LIMIT,
+    "panoramax": PANORAMAX_WALK_CONNECTION_LIMIT,
+}
+# kartaview is absent ON PURPOSE, and is named here rather than merely left out:
+# its sweep is serial and `collect_kartaview_street_samples_async` takes no
+# `connection_limit` argument at all, so a number would claim a pool it does not
+# hold. Declaring both sets is what makes a provider landing in NEITHER a test
+# failure rather than one that silently inherits whatever the caller passed --
+# which is exactly how `panoramax_streets` came to walk at 50.
+SERIAL_WALK_PROVIDERS = frozenset({"kartaview"})
+
 # Overpass endpoint identity, shared by the fetch (download_street_network.py,
 # which hands these to osmnx) and by the scheduler's breaker re-check below,
 # which must NOT import osmnx: the scheduler is a long-lived parent process

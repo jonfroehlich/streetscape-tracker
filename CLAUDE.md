@@ -268,6 +268,7 @@ The second active collection modality beside the grid: walk each frozen OSM edge
 That join lives once in `streetscape_street_analyzer/census_walk.py`, parameterized by a `CensusWalkSpec` of exactly three bindings (the date rule and the two row-schema builders); a fourth binding would be a claim that the JOIN differs between providers, which is what the module exists to deny.
 Reuse the provider's grid-run date function rather than rewriting it, or one city's grid and street artifacts disagree about the same picture.
 `panoramax` is the third caller (#331), and `panoramax_streets` is a scheduler channel since #335 — **opt-in and enrolled separately from `panoramax`**, so enrolling only the walk pays a full census where enrolling both makes the walk free.
+**A scheduled walk is handed `min(the scheduler's lane share, the provider's own socket ceiling)`** (`download_common.WALK_CONNECTION_LIMITS`; kartaview has none, its sweep being serial): a flag the scheduler passes UNCONDITIONALLY makes the child's own default dead code, which is how `panoramax_streets` held 50 sockets — ten times its number — against a volunteer-run host for its whole first release.
 Artifact names carry the provider token, and per-network ones the network token — generators in `naming.py` only.
 
 **Google's driving plan → [`docs/driving-plan.md`](docs/driving-plan.md).**
