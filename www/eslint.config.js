@@ -91,7 +91,7 @@ const tableGlobals = {
   providerCellHtml: "readonly",
   providerColumnGroup: "readonly",
   DEFAULT_PRESET_LEAF_BUDGET: "readonly",
-  fitDefaultPreset: "readonly",
+  withPresetTitle: "readonly",
   headerCellHtml: "readonly",
   theadHtml: "readonly",
   rowHtmlFromColumns: "readonly",

@@ -392,52 +392,60 @@ test("the default sort is a VISIBLE column of the default preset", () => {
   assert.ok(STREET_PRESETS[0].columns.includes(DEFAULT_SORT.key));
 });
 
-test("the default preset keeps Median age and gives up Walked instead", () => {
-  // The streets half of issue #334's width finding, re-decided. The trim used
-  // to take "Median age" at three providers, and on THIS page that meant
-  // losing it outright: no other streets preset names it, so it was reachable
-  // only through the column picker. Street coverage and RECENCY together are
-  // what a Project Sidewalk deployment decision reads.
+test("the default preset keeps every metric group, at every provider count", () => {
+  // #350. The trim (#334) dropped whole groups from the end of this preset,
+  // and on THIS page the group that went was always a DATE: the walk date at
+  // four providers, and the imagery age at three until #345 reordered them.
+  // Both matter -- street coverage and recency together are what a Project
+  // Sidewalk deployment decision reads, and no other streets preset names the
+  // age group at all, so trimming it was total rather than a deferral.
   //
-  // Groups give way from the END, so the preset's ORDER is the mechanism:
-  // `age` is listed ahead of `walked`, and that is the whole reason a fourth
-  // provider now costs the walk DATE rather than the imagery age. "Street km"
-  // survives either way, being an ungrouped scalar and the denominator every
-  // percentage in the row is a percentage of.
+  // Swept across provider counts rather than asserted at one, because the
+  // defect was a FUNCTION of the count: two providers fit and looked fine
+  // while production, at four, showed neither date. Five is included so the
+  // sweep still covers "one more than we have".
   const groupsOf = (preset, providers) => {
     const byKey = new Map(buildStreetColumns(providers).map((c) => [c.key, c.group?.id ?? null]));
     return [...new Set(preset.columns.map((k) => byKey.get(k)))];
   };
   const defaultFor = (providers) => buildStreetPresets(buildStreetColumns(providers))[0];
 
-  // Exact counts rather than `<= budget` bounds: three providers lands on the
-  // budget EXACTLY, and an inequality cannot tell "fits" from "was trimmed".
-  const TWO = ["gsv", "mapillary"];
-  const two = defaultFor(TWO);
-  assert.equal(two.columns.length, 7);
-  assert.deepEqual(groupsOf(two, TWO), ["cov", "age", "walked", null]);
-
-  const THREE = ["gsv", "mapillary", "panoramax"];
-  const three = defaultFor(THREE);
-  assert.equal(three.columns.length, 10);
-  assert.deepEqual(groupsOf(three, THREE), ["cov", "age", "walked", null]);
-
-  // A fourth provider costs "Walked", and Median age is what survives it.
-  const FOUR = ["gsv", "mapillary", "kartaview", "panoramax"];
-  const four = defaultFor(FOUR);
-  assert.equal(four.columns.length, 9);
-  assert.deepEqual(groupsOf(four, FOUR), ["cov", "age", null]);
-  assert.ok(four.columns.includes("lengthKm"), "the ungrouped denominator was trimmed away");
-
-  // Only the DEFAULT is trimmed; an explicitly chosen preset keeps what it names.
-  const presets = buildStreetPresets(buildStreetColumns(THREE));
-  assert.ok(presets.find((p) => p.id === "kilometres").columns.length > 10);
+  const COUNTS = [
+    ["gsv"],
+    ["gsv", "mapillary"],
+    ["gsv", "mapillary", "panoramax"],
+    ["gsv", "mapillary", "kartaview", "panoramax"],
+    ["gsv", "mapillary", "kartaview", "panoramax", "nosuch"],
+  ];
+  for (const providers of COUNTS) {
+    const preset = defaultFor(providers);
+    // In the order the header RENDERS them (the column registry's order), so
+    // this reads as what a reader sees rather than as an internal list.
+    assert.deepEqual(
+      groupsOf(preset, providers),
+      ["cov", "walked", "age", null],
+      `${providers.length} providers: a metric group is missing from the default`
+    );
+    // Exact, not `<=`: one leaf per provider per group, plus the ungrouped
+    // denominator. An inequality cannot tell a full table from a trimmed one,
+    // which is how the budget hid for two releases.
+    assert.equal(
+      preset.columns.length,
+      providers.length * 3 + 1,
+      `${providers.length} providers: unexpected leaf count`
+    );
+    assert.ok(
+      preset.columns.includes("lengthKm"),
+      "the ungrouped denominator every percentage is a percentage of went missing"
+    );
+  }
 });
 
 test("the default preset carries no Δ leaf, and the other presets still do", () => {
-  // Dropping the Δ is what pays for the third metric group: it compares two
-  // NAMED providers, while the same width spent on a group buys a number for
-  // every one of them. Keyed on the `isGroupDelta` flag providerColumnGroup
+  // Not a width decision any more (#350 retired the budget): a Δ compares two
+  // NAMED providers, while the same column spent on a metric group carries
+  // every one of them, so the Δ's share of what a row says shrinks with each
+  // provider added. Keyed on the `isGroupDelta` flag providerColumnGroup
   // stamps rather than on the "Δ" label, so this cannot be satisfied by the
   // glyph changing.
   for (const providers of [
@@ -971,28 +979,24 @@ test("every scoped field a filter can resolve to exists on a row model", () => {
 });
 
 test("the default preset's title says what it shows, at every provider count", () => {
-  // The streets half of the same fix: assembled from `titleParts`, so a group
-  // that gives way takes its clause with it. Each clause has to stand alone,
-  // which is why they are not the original sentence's fragments — only `cov`
-  // is guaranteed to be on the page, since groups drop from the end.
+  // Assembled from `titleParts` rather than spelled, so it cannot promise a
+  // group that is not on the page (#295/#296). Since #350 nothing is trimmed,
+  // so the sentence is the same at every count — which is the point: it used
+  // to shrink as providers were added, and shrinking was the SYMPTOM of the
+  // columns going.
   const titleFor = (providers) => buildStreetPresets(buildStreetColumns(providers))[0].title;
 
-  // Clause order is `titleParts` key order — the author's reading order, which
-  // now matches the column order too (coverage, age, walk date).
+  // Clause order is `titleParts` key order, and since #350 that matches the
+  // order the header actually renders: coverage, walk date, imagery age.
   const ALL_THREE =
-    "The headline read: how much of a city's streets is covered, how fresh that imagery is, " +
-    "and when each provider last walked it";
+    "The headline read: how much of a city's streets is covered, when each provider last " +
+    "walked it, and how fresh that imagery is";
   assert.equal(titleFor(["gsv", "mapillary"]), ALL_THREE);
   assert.equal(titleFor(["gsv", "mapillary", "panoramax"]), ALL_THREE);
-  // At four, "Walked" is the group that gives way, so its clause goes with it
-  // and the age clause stays — the failure #295/#296 taught, in reverse.
-  assert.equal(
-    titleFor(["gsv", "mapillary", "kartaview", "panoramax"]),
-    "The headline read: how much of a city's streets is covered and how fresh that imagery is"
-  );
+  assert.equal(titleFor(["gsv", "mapillary", "kartaview", "panoramax"]), ALL_THREE);
 });
 
-test("the default preset's title never names a group the trim dropped", () => {
+test("the default preset's title never names a group that is not shown", () => {
   const ALL = ["gsv", "mapillary", "kartaview", "panoramax", "fifthparty"];
   const parts = {
     cov: "is covered",

@@ -285,9 +285,9 @@ function providerColumnGroup({
       title: delta.title,
       group,
       // Marks this leaf as the group's pairwise comparison rather than one
-      // provider's value, which `fitDefaultPreset` needs to know: it is the
-      // one leaf a default preset gives up BEFORE a whole metric group, and
-      // sniffing the "Δ" label for that would tie a layout rule to a glyph.
+      // provider's value. Both pages' DEFAULT presets omit the Δs and build
+      // from this flag rather than by sniffing the "Δ" label, which would tie
+      // a column rule to a glyph.
       isGroupDelta: true,
       cell: (row) => deltaCellHtml(row[delta.key], { unit: delta.unit }),
     });
@@ -296,110 +296,51 @@ function providerColumnGroup({
 }
 
 /**
- * How many leaf columns a DEFAULT preset may show beside the city name.
+ * Give a default preset the title its own `titleParts` spell.
  *
- * Eight, because that is the leaf count of the two-provider Overview that
- * grid.html and streets.html shipped with and that was measured to fit — not
- * a round number picked for looking like one. Every count at or below it has
- * been measured against the content measure (a 1500px page less the 280px
- * sidebar); above it, both pages overflow.
- */
-const DEFAULT_PRESET_LEAF_BUDGET = 8;
-
-/**
- * Trim a default preset — columns AND title — to what the measure holds.
+ * A default preset declares `titleLead` + `titleParts` (group id -> clause,
+ * plus the reserved `delta`) rather than a finished string, because a fixed
+ * title is an enumeration and this codebase has watched one go stale the
+ * moment a provider count moved (#295, #296): grid's Overview promised "how
+ * fresh it is" while showing no age column.
  *
- * The pivoted tables put one leaf per COLLECTED provider under each grouped
- * header (issue #250), so a default preset's width is a function of the
- * payload rather than of the preset: three metric groups that fit two
- * providers are ~135px too wide at three and ~400px too wide at four. There
- * is no pagination or virtualization to fall back on (ADR 0001) and the page
- * measure is a deliberate typographic choice, so the thing that has to give
- * is what the DEFAULT shows. Every other preset is an explicit request and
- * keeps everything it names — the wrap scrolls, which is the narrow-viewport
- * safety net doing its job rather than the desktop layout.
+ * This used to be `fitDefaultPreset`, which ALSO trimmed the preset's columns
+ * to a leaf budget so the table fit the page measure without scrolling
+ * sideways (#334). **That budget is gone (#350.)** At production's four
+ * collected providers it was dropping a whole metric group from each page --
+ * the walk date from streets.html, "Last collected" from grid.html -- and a
+ * collection date is not an optional column: it is half of what a deployment
+ * decision reads. There is no width to find, either, since a pivoted leaf is
+ * as wide as the PROVIDER NAME in its header, so the tables now scroll
+ * horizontally inside their wrap and the city column is pinned
+ * (data-table.css) so a scrolled row keeps its name.
  *
- * Found by issue #334, whose new provider made the e2e width gate fail — but
- * PRODUCTION WAS ALREADY OVER at the time, by 140px on grid.html and 164px on
- * streets.html, because KartaView had been a third collected provider since
- * #248 and the e2e fixture carried only two. The gate was right; it was
- * pointed at a payload narrower than the real one.
- *
- * **What gives way, in order: the Δ leaves first, then whole groups from the
- * END.** The Δ goes first because it is one pairwise comparison of two named
- * providers while a metric group is one number for EVERY provider, so the Δ's
- * share of what the row tells you shrinks with each provider added — and
- * because at four providers the two orderings are not equivalent. Groups-only
- * collapsed grid.html's Overview to `cov` alone (five leaves under a budget of
- * eight, since cov+age is ten WITH the Δs and there is no whole-group subset
- * in between); giving up the Δs first lands it on cov+age at exactly eight,
- * which keeps Median age — one of the page's two headline metrics — instead of
- * spending the same width on a comparison of two of the four.
- *
- * Whole groups, never individual per-provider leaves: half a metric group
- * renders a header spanning columns it no longer has. And never the ungrouped
- * scalars (streets.html's "Street km"), which trailing-KEY trimming would take
- * first and which is the denominator every percentage in the row is a
- * percentage of.
- *
- * **The title is trimmed with the columns**, which is why a default preset
- * spells `titleLead` + `titleParts` (group id → clause, plus the reserved
- * `delta`) instead of a finished `title` string. A fixed string is an
- * enumeration, and this codebase has already watched one go stale the moment a
- * provider count moved (#295, #296): grid's Overview promised "how fresh it
- * is" and, at four providers, showed no age column. Clauses are assembled in
- * `titleParts` key order — the author's reading order, not the column order —
- * and a preset carrying a plain `title` is left alone.
+ * What survives is the title assembly, because the clause filter still does
+ * real work: a group with no collected providers has no leaves, and naming it
+ * would promise a column that is not there.
  *
  * @param {Object} preset - A preset descriptor; `columns` is a list of keys.
- *   Either `title`, or `titleLead` + `titleParts` for a title that tracks the
- *   trim.
+ *   Either `title`, or `titleLead` + `titleParts`.
  * @param {Object[]} columns - The built column list, for key -> group lookup.
- * @param {number} [budget=DEFAULT_PRESET_LEAF_BUDGET] - Maximum leaves.
- * @returns {Object} The preset, or a trimmed copy of it.
+ * @returns {Object} The preset, or a copy carrying the assembled title.
  */
-function fitDefaultPreset(preset, columns, budget = DEFAULT_PRESET_LEAF_BUDGET) {
+function withPresetTitle(preset, columns) {
   const byKey = new Map(columns.map((c) => [c.key, c]));
   const groupOf = (key) => byKey.get(key)?.group?.id ?? null;
   const isDelta = (key) => byKey.get(key)?.isGroupDelta === true;
-  const keys = preset.columns;
 
-  const groupOrder = [];
-  for (const key of keys) {
-    const id = groupOf(key);
-    if (id && !groupOrder.includes(id)) groupOrder.push(id);
-  }
-
-  // Candidates in preference order: keep everything, then give up the Δs,
-  // then a trailing group, then that group's Δs too, and so on. The first
-  // that fits wins; if nothing does there is nothing group-shaped left to
-  // drop, and the last candidate stands (the e2e width gate is what catches
-  // that shape).
-  const candidateFor = (groupsDropped, keepDelta) => {
-    const dropped = new Set(groupOrder.slice(groupOrder.length - groupsDropped));
-    return keys.filter((key) => !dropped.has(groupOf(key)) && (keepDelta || !isDelta(key)));
-  };
-
-  let chosen = keys;
-  outer: for (let dropCount = 0; dropCount <= groupOrder.length; dropCount++) {
-    for (const keepDelta of [true, false]) {
-      chosen = candidateFor(dropCount, keepDelta);
-      if (chosen.length <= budget) break outer;
-    }
-  }
-
-  const title = presetTitle(preset, chosen, groupOf, isDelta);
-  if (chosen.length === keys.length && title === preset.title) return preset;
-  const fitted = { ...preset, columns: chosen };
-  if (title != null) fitted.title = title;
-  return fitted;
+  const title = presetTitle(preset, preset.columns, groupOf, isDelta);
+  if (title === preset.title) return preset;
+  const titled = { ...preset };
+  if (title != null) titled.title = title;
+  return titled;
 }
 
 /**
  * Assemble a preset's hover title from the clauses whose columns survived.
  *
  * Returns the preset's own `title` untouched -- undefined included, so a
- * preset that declares neither is left strictly alone and `fitDefaultPreset`
+ * preset that declares neither is left strictly alone and `withPresetTitle`
  * can still return it by identity. A clause is kept when its group still has
  * a leaf; the reserved `delta` clause when any Δ leaf does.
  *
@@ -752,8 +693,7 @@ if (typeof module !== "undefined" && module.exports) {
     deltaCellHtml,
     providerCellHtml,
     providerColumnGroup,
-    DEFAULT_PRESET_LEAF_BUDGET,
-    fitDefaultPreset,
+    withPresetTitle,
     presetTitle,
     headerCellHtml,
     theadHtml,

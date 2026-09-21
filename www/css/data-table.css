@@ -84,10 +84,11 @@
    taste: a pivoted leaf's width is set by the PROVIDER NAME in its header
    ("Panoramax" renders 111px wide, "GSV" 68px) and not by the value below it,
    so horizontal padding is a per-leaf multiplier — 4px off each side of ten
-   leaves is 80px of measure back. It is what lets the streets default carry
-   coverage, median age AND the walk date at three providers (1077px against
-   the 1100px measure at a 1440px viewport). grid.html and driving.html share
-   this rule and only get narrower, so neither can overflow because of it. */
+   leaves is 80px back. It stays after #350 let the wide tables scroll: the
+   budget it was bought for is gone, but every px here is a px the reader does
+   not have to scroll past, and the same arithmetic says why compacting the
+   VALUES instead would buy nothing. grid.html and driving.html share this
+   rule and only get narrower. */
 .streets-table th,
 .streets-table td {
   padding: 8px;
@@ -191,7 +192,54 @@
   text-overflow: ellipsis;
 }
 
+/* ── The pinned city column ──────────────────────────────────────────────
+   The pivoted defaults carry every metric group since #350, so at four
+   providers both tables are wider than the measure and the wrap really
+   scrolls (it used to only on narrow viewports). A row whose name has
+   scrolled off is unreadable — and reading a date AGAINST a named city is
+   the entire point of the columns that made the table wide — so the row
+   header stays put.
+
+   Three things this needs that a bare `position: sticky` does not give:
+
+   - An OPAQUE background. The cell is transparent by default and the
+     scrolled columns would slide visibly underneath it. `tr:hover` paints
+     the row, so the pinned cell has to repaint on hover as well or the
+     column stops following the pointer (below).
+   - `box-shadow`, not `border-right`, for the divider: under
+     `border-collapse: collapse` a sticky cell's own borders are painted by
+     the table's border grid, which does not travel with it. The `.th-group`
+     rule above uses an inset shadow for a related reason. The `0 -1px` inset
+     re-draws the row rule that collapse likewise drops here.
+   - A `z-index` ordering: the corner cell sits in both the pinned column and
+     the header, so it outranks each of them. */
+.streets-table tbody th,
+.streets-table thead tr:first-child th:first-child {
+  position: sticky;
+  left: 0;
+}
+
+.streets-table tbody th {
+  z-index: 1;
+  background: #fff;
+  box-shadow: inset -1px 0 0 #ddd, inset 0 -1px 0 #eee;
+}
+
+/* Above the body's pinned cells, which scroll up underneath it. */
+.streets-table thead tr:first-child th:first-child {
+  z-index: 2;
+  background: #f0f0f0;
+  box-shadow: inset -1px 0 0 #ddd;
+}
+
 .streets-table tbody tr:hover {
+  background: #fafafa;
+}
+
+/* The pinned cell is opaque, so the row's hover colour has to be repainted
+   on it explicitly — otherwise the city name is the one cell that does not
+   highlight, on the one column a reader is most likely to be tracking. */
+.streets-table tbody tr:hover th {
   background: #fafafa;
 }
 

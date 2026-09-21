@@ -60,33 +60,46 @@ Two halves of the contract are easy to break in opposite directions: the module-
 so such a link degrades to unscoped rather than to a dead scope.
 And this is a layout fact rather than a tidiness one: the default view carries three grouped metrics, so each additional collected provider is three more ~90px leaves against the same 1500 − 280px measure the presets are sized to.
 
-**And at three collected providers the default preset no longer fits, so it drops its last metric group — `fitDefaultPreset` in `table-utils.js`, capped at `DEFAULT_PRESET_LEAF_BUDGET = 8` leaves ([#334](https://github.com/jonfroehlich/streetscape-tracker/issues/334)).**
-Eight is the leaf count of the two-provider Overview both pages shipped with and that was measured to fit, not a round number: at three providers the same three groups are eleven leaves, and the table overflows its container by a measured **135px on `grid.html`** and **172px on `streets.html`** at a 1440px viewport.
-There is no pagination or virtualization to absorb that (ADR 0001) and the measure is a deliberate typographic choice, so what gives is how many groups the DEFAULT shows; every other preset is an explicit request and keeps everything it names, with the wrap's `overflow-x` doing its narrow-viewport job.
-**The budget is a stand-in for a WIDTH, and the two pages' leaves are not the same width, so it is per-page**: `streets.html` passes its own `STREET_PRESET_LEAF_BUDGET = 10`, since it carries a date group `grid.html` does not and its cells are now 8px-padded.
-Measured in Chromium against the three-provider e2e fixture, that default renders 1077px against the 1100px measure at a 1440px viewport, with 1512px checked too.
-Two things paid for the third group, and both are measurements rather than preferences: a pivoted leaf's width is set by the PROVIDER NAME in its header and not by the value under it ("Panoramax" 111px, "GSV" 68px), so 4px off each side of ten leaves returns 80px; and the city cell's cap came 220px → 180px because the label itself got shorter (below).
-Whole groups are dropped from the end rather than individual leaves — half a group renders a header spanning columns it no longer has, and dropping trailing KEYS would take `streets.html`'s ungrouped "Street km", the denominator every percentage in the row is a percentage of.
-Grid gives up "Last collected" (the Provenance preset answers that question in full).
-**Streets gives up "Walked", and keeps "Median age"** ([#345](https://github.com/jonfroehlich/streetscape-tracker/issues/345)) — street coverage and RECENCY together are what a Project Sidewalk deployment decision reads, so coverage with no imagery age beside it is half an answer.
-That reversed an earlier call here, and the reason is that on `streets.html` the trim was not a deferral but a total loss: no other streets preset names the age group, so once it was trimmed the only route to the number was the column picker.
-The preset's column ORDER is the entire mechanism — groups give way from the END, so listing `age` ahead of `walked` is what decides which of the two a fourth provider costs.
+**The default preset of a pivoted page carries every metric group, and the table scrolls sideways when that does not fit ([#350](https://github.com/jonfroehlich/streetscape-tracker/issues/350)).**
+This reverses [#334](https://github.com/jonfroehlich/streetscape-tracker/issues/334), which capped a default at `DEFAULT_PRESET_LEAF_BUDGET = 8` leaves and dropped whole metric groups from the end to keep the table inside the 1500 − 280px measure.
+The budget is gone, `fitDefaultPreset` with it; what remains is `withPresetTitle`, which does only the title half (below).
 
-**The Δ leaves give way before any of that, though — and at four providers the two orderings are not equivalent.**
-A Δ is one pairwise comparison of two NAMED providers while a metric group is one number for every provider, so the Δ's share of what a row tells you shrinks with each provider added.
-Concretely: at four providers `cov` and `age` are five leaves each with their Δ, so the pair is ten and there is no whole-group subset between that and `cov`'s five — trimming groups only left `grid.html`'s Overview showing grid coverage and nothing else, while giving up the Δs lands on exactly eight and keeps Median age.
-A Δ dropped to save a group comes back if that group goes anyway: the candidates are tried in the order (everything), (no Δ), (one group fewer), (one group fewer and no Δ), and the first that fits wins, so a group is never paid for with a Δ that did not need dropping.
-`streets.html` no longer leans on that ordering at all: its default names **no Δ leaf in the first place**, filtered on the `isGroupDelta` flag rather than on the "Δ" label, and dropping that one comparison is what buys the room for a third metric group.
-The Δ is still built and still reachable — every explicitly chosen preset keeps it, and so does the column picker.
+The reason is that the group at the end was always a DATE, and a collection date is not an optional column.
+`grid.html` dropped **"Last collected"** from the third provider on, and production has been four deep since Panoramax; `streets.html` dropped **"Walked"** at four and, before [#345](https://github.com/jonfroehlich/streetscape-tracker/issues/345) reordered the preset, **"Median age"** at three.
+Street coverage and recency together are what a Project Sidewalk deployment decision reads — coverage with no date beside it is half an answer — and on `streets.html` the loss was total rather than a deferral, since no other streets preset names the age group at all.
 
-**A default preset therefore spells `titleLead` + `titleParts` (group id → clause, plus the reserved `delta`) instead of a finished `title`, and `fitDefaultPreset` assembles the sentence from the clauses whose columns survived.**
-A fixed title is an enumeration, and this codebase has already watched one go stale the moment a provider count moved ([#295](https://github.com/jonfroehlich/streetscape-tracker/issues/295), [#296](https://github.com/jonfroehlich/streetscape-tracker/pull/296) did it to group titles that named providers): grid's Overview promised "how fresh it is" and, at four providers, showed no age column.
+**And there was no width to find, which is the measurement that settles it.**
+A pivoted leaf is as wide as the PROVIDER NAME in its header, not as the value under it — measured on the live four-provider site: GSV 95px, Mapillary 98px, KartaView 105px, Panoramax 113px — so compacting dates, or numbers, or anything in the cells buys nothing at all.
+At four providers the "Walked" group alone costs **375px** against a container of **1100px** that the two remaining groups already fill exactly.
+Every lever short of scrolling was measured and none closes a 375px gap: the 12px → 8px cell padding ([#345](https://github.com/jonfroehlich/streetscape-tracker/issues/345)) returns ~80px and is kept anyway, since every px is one the reader does not scroll past.
+
+So the wrap's `overflow-x` becomes the desktop layout rather than the narrow-viewport safety net it was.
+ADR 0001 is untouched — this is horizontal scrolling of one element, not pagination or virtualization.
+What does NOT change is that **the document itself must never scroll sideways**: the table's width has to stay inside `.streets-table-wrap`, which needs `position: relative` or the header's absolutely-positioned `.visually-hidden` span escapes the scroll container and drags the page with it.
+`test_the_page_itself_never_scrolls_sideways` pins that on all three pages, and `driving.html` — one row per PLACE, no provider fan-out, so its width does not grow — keeps the strict fits-its-container assertion in `test_driving_table_still_fits_its_container`.
+
+**The city column is pinned, and that is what makes a scrolling table readable rather than merely wide.**
+`position: sticky; left: 0` on the row header and on the header's corner cell, because a scrolled row whose name has gone is unreadable and reading a date AGAINST a named city is the entire point of the columns that made the table wide.
+Three things it needs that a bare `sticky` does not give, all of them silent when missed: an **opaque background** (the cell is transparent by default and the scrolled columns slide under it), the row's **hover colour repainted** on it (or the city name is the one cell that does not highlight), and `box-shadow` rather than `border-right` for its edge, since under `border-collapse: collapse` a sticky cell's borders are painted by the table's border grid and do not travel with it.
+`test_the_city_column_stays_pinned_while_the_table_scrolls` asserts the behaviour rather than the declaration — `position: sticky` does nothing without a scrolling ancestor, so a `getComputedStyle` check would pass on a page where it never engaged.
+It runs at a 1000px viewport rather than 1440px, and deliberately: the committed fixture carries three providers where production carries four, and three still fit 1440px, so at the wider viewport the test would have nothing to scroll.
+
+**Neither default names a Δ leaf**, filtered on the `isGroupDelta` flag rather than on the "Δ" label — sniffing the glyph would tie a column rule to a character.
+That is no longer a width decision: a Δ is one pairwise comparison of two NAMED providers while a metric group is one number for every provider, so a Δ's share of what a row tells you shrinks with each provider added.
+`grid.html` needed this stated explicitly, because its `groupKeys` had been including the Δs and only the trim was removing them — retiring the trim would otherwise have silently added three columns the page has not shown since [#334](https://github.com/jonfroehlich/streetscape-tracker/issues/334).
+Every explicitly chosen preset keeps its Δ, and so does the column picker.
+
+**A default preset still spells `titleLead` + `titleParts` (group id → clause) instead of a finished `title`, and `withPresetTitle` assembles the sentence.**
+A fixed title is an enumeration, and this codebase has watched one go stale the moment a provider count moved ([#295](https://github.com/jonfroehlich/streetscape-tracker/issues/295), [#296](https://github.com/jonfroehlich/streetscape-tracker/pull/296) did it to group titles that named providers): grid's Overview promised "how fresh it is" and, at four providers, showed no age column.
 It renders as the preset `<option>`'s hover `title`, so the promise is visible and the missing column is not.
-Clauses are assembled in `titleParts` key order — the author's reading order rather than the column order — and Oxford-joined; a preset carrying a plain `title` (every non-default one) is left strictly alone, identity return included.
-Each clause has to stand alone, since only the first group is guaranteed to survive.
-**The gate that should have caught this was green against a payload narrower than production's**: `test_default_columns_fit_without_scrolling_the_page_sideways` asserts exactly this, but the e2e fixture carried two providers while production had been three deep since KartaView ([#248](https://github.com/jonfroehlich/streetscape-tracker/issues/248)) — measured against live data mid-#334, prod was already 140px/164px over.
-The fixture now carries three, which is why a provider-count assumption in a layout test has to be a property of the fixture and not of the year it was written.
-**And "fits" is not the same assertion as "says anything", which is how the loss went unnoticed**: that gate was GREEN the whole time the age column was missing, because a trimmed table fits by construction — so a second e2e test now asserts the Median age and Walked headers are actually THERE, with a populated cell under them.
+The clause filter survives the trim's removal because it still does real work — a group with no collected providers builds no leaves, and naming it would promise a column that is not there — but the sentence no longer SHRINKS as providers are added, and that shrinking was the symptom of the columns going.
+Clauses are Oxford-joined in `titleParts` key order, which on both pages now matches the order the header renders: [#346](https://github.com/jonfroehlich/streetscape-tracker/pull/346) had written `age` ahead of `walked` in the streets preset to steer the trim, which read PRESET order, while the header has always read the column registry's — a mismatch that was invisible while it only moved a trim and is merely misleading now.
+A preset carrying a plain `title` (every non-default one) is left strictly alone, identity return included.
+
+**Two lessons from #334 are kept even though its rule is gone**, because both are about tests rather than layout.
+The gate that should have caught the original overflow was green against a payload narrower than production's: the e2e fixture carried two providers while production had been three deep since KartaView ([#248](https://github.com/jonfroehlich/streetscape-tracker/issues/248)).
+And **"fits" is not the same assertion as "says anything"** — that same gate was green throughout the period a date group was missing, because a trimmed table fits by construction.
+`test_streets_default_view_shows_median_age_and_walk_dates` and `test_grid_default_view_shows_when_each_provider_last_collected` are the assertions that encode what the pages must SAY: each date group present, with a populated cell under it.
 
 **The city label renders the state and country as CODES — "Dublin, IN, US", not "Dublin, Indiana, United States" — and that is the other half of the width budget.**
 Nothing computes them: `json_summarizer.py` has always published `state.code` (`get_state_abbreviation`) and `country.code` (`get_country_code`, ISO alpha-2), and `cityDisplayLabel` simply prefers them, falling back to the full name wherever a code is absent.

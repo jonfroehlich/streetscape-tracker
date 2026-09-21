@@ -496,24 +496,13 @@ function streetGroupKeys(id, columns = STREET_COLUMNS, { includeDelta = true } =
 }
 
 /**
- * How many leaf columns THIS page's default preset may show.
+ * Column presets. The first is the default.
  *
- * Ten, measured, and deliberately not the shared DEFAULT_PRESET_LEAF_BUDGET of
- * eight: the budget is a stand-in for a WIDTH, and these two pages' leaves are
- * not the same width. streets.html carries a date group grid.html does not,
- * and its cells are now 8px-padded (data-table.css), so ten of its leaves plus
- * the city name and "Street km" render 1077px against the 1100px measure at a
- * 1440px viewport — verified in Chromium against the three-provider e2e
- * fixture, with 1512px checked too.
- *
- * At three collected providers that is the whole Overview. At four the trim
- * gives up "Walked" and Median age survives, which is the ordering's point.
- */
-const STREET_PRESET_LEAF_BUDGET = 10;
-
-/**
- * Column presets. The first is the default and must fit the page's content
- * measure (1500px page − the 280px sidebar) without horizontal scrolling.
+ * It no longer has to fit the page's content measure (#350): at four collected
+ * providers nothing that carries coverage, imagery age AND the walk date fits
+ * 1100px, and the walk date is not optional — so the table scrolls inside its
+ * wrap and the city column is pinned (data-table.css) to keep a scrolled row
+ * readable.
  *
  * Built from a column list rather than fixed, so a preset naming a grouped
  * metric lists exactly the leaves that were built.
@@ -525,52 +514,55 @@ function buildStreetPresets(columns = STREET_COLUMNS) {
   const groupKeys = (id) => streetGroupKeys(id, columns);
   const metricKeys = (id) => streetGroupKeys(id, columns, { includeDelta: false });
   return [
-    // The default, and the only one trimmed to the measure: its width grows
-    // with the number of COLLECTED providers, so what fits two overflowed at
-    // three (issue #334). Which group gives way there was re-decided in #345.
+    // The default. Its width grows with the number of COLLECTED providers,
+    // and since #350 it is allowed to: at four providers coverage + imagery
+    // age + the walk date is 12 leaves, and no arrangement of them fits the
+    // 1100px measure, because a pivoted leaf is as wide as the PROVIDER NAME
+    // in its header (GSV 95px, Panoramax 113px) rather than as its values.
     //
-    // **Median age outranks "Walked", and the ORDER here is what enforces
-    // that** -- groups give way from the end, so listing age ahead of walked
-    // is what makes a fourth provider cost the walk DATE rather than the
-    // imagery age. Street coverage and RECENCY together are what a Project
-    // Sidewalk deployment decision reads: coverage with no age beside it is
-    // half an answer, and the trim had been taking the age half since the
-    // third provider landed, on a page where no OTHER preset names it either.
-    // "Street km" survives as an ungrouped scalar, since it is the
-    // denominator every percentage in the row is a percentage of.
+    // What used to give way was a whole metric group (#334), and on this page
+    // that always meant losing a DATE: the walk date at four providers, the
+    // imagery age at three until #345 reordered them. Neither is optional --
+    // street coverage and recency together are what a Project Sidewalk
+    // deployment decision reads, and no other streets preset names the age
+    // group at all. So the table scrolls inside its wrap instead, with the
+    // city column pinned (data-table.css) so a scrolled row keeps its name.
     //
-    // Three groups fit now because the Δ leaves are gone (deliberately -- see
-    // below) and the cells are 8px-padded: ten leaves at three providers
-    // measure 1077px against the 1100px measure at a 1440px viewport.
-    fitDefaultPreset(
+    // "Street km" stays last as the ungrouped denominator every percentage in
+    // the row is a percentage of.
+    withPresetTitle(
       {
         id: "overview",
         label: "Overview",
         // pctAny stays out of the default view now that it is a whole GROUP
-        // rather than one column, and the Δ leaves stay out too: a Δ compares
-        // two NAMED providers, while the same width spent on a metric group
-        // buys a number for EVERY provider -- so the Δ's share of what the row
-        // tells you shrinks with each one added. Both are one click away, in
-        // "Kilometres" and in the column picker.
+        // rather than one column, and the Δ leaves stay out too -- no longer
+        // for width, but because a Δ compares two NAMED providers while the
+        // same column spent on a metric group carries every one of them, so
+        // the Δ's share of what the row says shrinks with each provider
+        // added. Both are one click away, in "Kilometres" and in the picker.
         //
-        // Assembled from the clauses whose columns survive the trim (see
-        // fitDefaultPreset), so each one has to stand alone -- only `cov` is
-        // guaranteed to be there, since groups give way from the end.
+        // Assembled from `titleParts` rather than spelled, so the sentence
+        // cannot promise a group that has no collected providers behind it.
+        // Listed in the order the table RENDERS them, which is the column
+        // registry's order and not this list's -- #346 wrote `age` ahead of
+        // `walked` here to steer the trim, which read preset order, and the
+        // header has always read registry order. With the trim gone that
+        // mismatch is only a way to mislead the next reader, so both the
+        // columns and the clauses below now match what a reader sees.
         titleLead: "The headline read:",
         titleParts: {
           cov: "how much of a city's streets is covered",
-          age: "how fresh that imagery is",
           walked: "when each provider last walked it",
+          age: "how fresh that imagery is",
         },
         columns: [
           ...metricKeys("cov"),
-          ...metricKeys("age"),
           ...metricKeys("walked"),
+          ...metricKeys("age"),
           "lengthKm",
         ],
       },
-      columns,
-      STREET_PRESET_LEAF_BUDGET
+      columns
     ),
     {
       id: "kilometres",
