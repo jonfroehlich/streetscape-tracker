@@ -1582,11 +1582,76 @@ function markerDateStyle(captureDateStr, selectedDateStr) {
     : { fillOpacity: 0.05, radius: 3 };
 }
 
+/**
+ * Build the display label for a city record: "City, ST, CC".
+ *
+ * Lives here rather than in table-utils.js because index.html loads only this
+ * file — index.js used to carry a hand-copied duplicate of the same four lines
+ * and the two were free to drift.
+ *
+ * **State and country render as the CODES the aggregate already publishes**,
+ * falling back to the full name whenever a code is absent. `json_summarizer.py`
+ * fills `state.code` from `get_state_abbreviation` and `country.code` from
+ * `get_country_code` (geoutils.py), so "Dublin, Indiana, United States"
+ * becomes "Dublin, IN, US" with nothing new to compute or keep in sync. The
+ * country is ISO alpha-2 because that is what is stored; it is not shortened
+ * to a friendlier form here, since a per-country display map is one more table
+ * to go stale.
+ *
+ * Two things the fallback buys: a record predating the codes still renders its
+ * full name rather than a blank, and a non-US state — where
+ * `get_state_abbreviation` returns the name unchanged — is simply unaffected.
+ *
+ * The label is what the tables TRUNCATE (data-table.css caps the city cell), so
+ * pair it with `cityFullLabel` for the `title` tooltip and for anything that
+ * searches: abbreviating the searchable string alone would stop "Indiana"
+ * matching Dublin.
+ *
+ * @param {Object} city - Adapted city record.
+ * @returns {string}
+ */
+function cityDisplayLabel(city) {
+  return joinCityLabel(city, true);
+}
+
+/**
+ * The same label with state and country spelled out in full.
+ *
+ * @param {Object} city - Adapted city record.
+ * @returns {string}
+ */
+function cityFullLabel(city) {
+  return joinCityLabel(city, false);
+}
+
+/**
+ * @param {Object} city - Adapted city record.
+ * @param {boolean} abbreviate - Prefer `state.code` / `country.code`.
+ * @returns {string}
+ */
+function joinCityLabel(city, abbreviate) {
+  const name = city.city || city.state?.name || city.country?.name || "Unknown";
+  const parts = [name];
+  // The de-duplication is tested against the NAME even when the code is what
+  // gets rendered, or a city-state would stop recognising itself: Singapore's
+  // state name matches its city name and is dropped, but "SG" would not match
+  // and the label would read "Singapore, SG, Singapore".
+  if (city.state?.name && city.state.name !== name) {
+    parts.push((abbreviate && city.state.code) || city.state.name);
+  }
+  if (city.country?.name) {
+    parts.push((abbreviate && city.country.code) || city.country.name);
+  }
+  return parts.join(", ");
+}
+
 // Node/CommonJS export shim for the unit tests (issue #123). This is a no-op
 // in the browser, where these symbols are plain globals loaded via <script>.
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     STREETSCAPE_DATA_BASE_URL,
+    cityDisplayLabel,
+    cityFullLabel,
     CARTO_BASEMAP_KEY,
     addBasemapLayer,
     RENDER_CAP,

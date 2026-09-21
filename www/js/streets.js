@@ -193,8 +193,11 @@ function walkChangeCellHtml(row, provider) {
  */
 function walkLabelCellHtml(row) {
   const label = escapeHtml(row.label);
+  // Visible text abbreviated, tooltip spelled out: the cell is both truncated
+  // (data-table.css) and abbreviated, and `title` is what answers for each.
+  const title = escapeHtml(row.fullLabel ?? row.label);
   const content = row.filename ? cityPageLink(row.filename, row.networkType, label) : label;
-  return `<th scope="row" title="${label}">${content}</th>`;
+  return `<th scope="row" title="${title}">${content}</th>`;
 }
 
 /**
@@ -480,10 +483,33 @@ const STREET_COLUMNS = buildStreetColumns();
  *
  * @param {string} id - Group id.
  * @param {Object[]} [columns] - The build to read; defaults to full-registry.
+ * @param {Object} [opts]
+ * @param {boolean} [opts.includeDelta=true] - Keep the group's Δ leaf. The
+ *   default view asks for `false`; every explicitly chosen preset keeps it.
+ *   Keyed on the `isGroupDelta` flag `providerColumnGroup` stamps, never on
+ *   the "Δ" label — sniffing the glyph would tie a column rule to a character.
  */
-function streetGroupKeys(id, columns = STREET_COLUMNS) {
-  return columns.filter((c) => c.group?.id === id).map((c) => c.key);
+function streetGroupKeys(id, columns = STREET_COLUMNS, { includeDelta = true } = {}) {
+  return columns
+    .filter((c) => c.group?.id === id && (includeDelta || c.isGroupDelta !== true))
+    .map((c) => c.key);
 }
+
+/**
+ * How many leaf columns THIS page's default preset may show.
+ *
+ * Ten, measured, and deliberately not the shared DEFAULT_PRESET_LEAF_BUDGET of
+ * eight: the budget is a stand-in for a WIDTH, and these two pages' leaves are
+ * not the same width. streets.html carries a date group grid.html does not,
+ * and its cells are now 8px-padded (data-table.css), so ten of its leaves plus
+ * the city name and "Street km" render 1077px against the 1100px measure at a
+ * 1440px viewport — verified in Chromium against the three-provider e2e
+ * fixture, with 1512px checked too.
+ *
+ * At three collected providers that is the whole Overview. At four the trim
+ * gives up "Walked" and Median age survives, which is the ordering's point.
+ */
+const STREET_PRESET_LEAF_BUDGET = 10;
 
 /**
  * Column presets. The first is the default and must fit the page's content
@@ -497,23 +523,35 @@ function streetGroupKeys(id, columns = STREET_COLUMNS) {
  */
 function buildStreetPresets(columns = STREET_COLUMNS) {
   const groupKeys = (id) => streetGroupKeys(id, columns);
+  const metricKeys = (id) => streetGroupKeys(id, columns, { includeDelta: false });
   return [
     // The default, and the only one trimmed to the measure: its width grows
-    // with the number of COLLECTED providers, so what fits two overflows at
-    // three (issue #334). "Median age" is the group that gives way there
-    // rather than "Walked", because a walk's DATE is what says whether the
-    // coverage beside it is current -- and "Street km" survives as an
-    // ungrouped scalar, since it is the denominator every percentage in the
-    // row is a percentage of. At FOUR providers "Walked" goes too: unlike
-    // grid.html, giving up the Δ does not save this page, because coverage +
-    // Walked + Street km is nine leaves with no Δ among them.
+    // with the number of COLLECTED providers, so what fits two overflowed at
+    // three (issue #334). Which group gives way there was re-decided in #345.
+    //
+    // **Median age outranks "Walked", and the ORDER here is what enforces
+    // that** -- groups give way from the end, so listing age ahead of walked
+    // is what makes a fourth provider cost the walk DATE rather than the
+    // imagery age. Street coverage and RECENCY together are what a Project
+    // Sidewalk deployment decision reads: coverage with no age beside it is
+    // half an answer, and the trim had been taking the age half since the
+    // third provider landed, on a page where no OTHER preset names it either.
+    // "Street km" survives as an ungrouped scalar, since it is the
+    // denominator every percentage in the row is a percentage of.
+    //
+    // Three groups fit now because the Δ leaves are gone (deliberately -- see
+    // below) and the cells are 8px-padded: ten leaves at three providers
+    // measure 1077px against the 1100px measure at a 1440px viewport.
     fitDefaultPreset(
       {
         id: "overview",
         label: "Overview",
         // pctAny stays out of the default view now that it is a whole GROUP
-        // rather than one column; the Δ in the 360° group is the headline
-        // comparison and "Kilometres" is one click away.
+        // rather than one column, and the Δ leaves stay out too: a Δ compares
+        // two NAMED providers, while the same width spent on a metric group
+        // buys a number for EVERY provider -- so the Δ's share of what the row
+        // tells you shrinks with each one added. Both are one click away, in
+        // "Kilometres" and in the column picker.
         //
         // Assembled from the clauses whose columns survive the trim (see
         // fitDefaultPreset), so each one has to stand alone -- only `cov` is
@@ -521,17 +559,18 @@ function buildStreetPresets(columns = STREET_COLUMNS) {
         titleLead: "The headline read:",
         titleParts: {
           cov: "how much of a city's streets is covered",
-          walked: "when each provider last walked it",
           age: "how fresh that imagery is",
+          walked: "when each provider last walked it",
         },
         columns: [
-          ...groupKeys("cov"),
-          ...groupKeys("walked"),
-          ...groupKeys("age"),
+          ...metricKeys("cov"),
+          ...metricKeys("age"),
+          ...metricKeys("walked"),
           "lengthKm",
         ],
       },
-      columns
+      columns,
+      STREET_PRESET_LEAF_BUDGET
     ),
     {
       id: "kilometres",
@@ -668,7 +707,7 @@ const STREET_PRESETS = buildStreetPresets();
 const STREET_FILTERS = buildStreetFilters();
 
 /** Row fields the free-text search box looks at. */
-const STREET_SEARCH_FIELDS = ["label", "cityId", "providersLabel", "networkLabel"];
+const STREET_SEARCH_FIELDS = ["label", "cityId", "fullLabel", "providersLabel", "networkLabel"];
 
 /**
  * Default sort: best GSV 360° coverage first.
@@ -734,6 +773,11 @@ function pivotStreetWalks(walks, index) {
         // city's name is provider-independent) — unlike the link, which may
         // not. See indexCitiesByProvider.
         label: cityId,
+        // The spelled-out form of the same name, for the `title` tooltip and
+        // the free-text search — abbreviating the only searchable string would
+        // stop "Indiana" matching Dublin. Both start as the city_id and are
+        // replaced together the moment a named aggregate record turns up.
+        fullLabel: cityId,
         networkType,
         networkLabel: streetNetworkLabel(walk.network_type),
         providers: [],
@@ -793,7 +837,10 @@ function pivotStreetWalks(walks, index) {
     row.edges ??= walk.edges ?? null;
 
     const named = index.get(`${provider}|${cityId}`) ?? index.get(cityId);
-    if (named && row.label === cityId) row.label = cityLabel(named);
+    if (named && row.label === cityId) {
+      row.label = cityLabel(named);
+      row.fullLabel = cityFullLabel(named);
+    }
   }
 
   const pair = streetDeltaPair(providers);

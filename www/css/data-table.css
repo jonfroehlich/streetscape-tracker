@@ -80,9 +80,17 @@
   text-align: left;
 }
 
+/* 8px rather than 12px horizontally, and that is a measurement rather than a
+   taste: a pivoted leaf's width is set by the PROVIDER NAME in its header
+   ("Panoramax" renders 111px wide, "GSV" 68px) and not by the value below it,
+   so horizontal padding is a per-leaf multiplier — 4px off each side of ten
+   leaves is 80px of measure back. It is what lets the streets default carry
+   coverage, median age AND the walk date at three providers (1077px against
+   the 1100px measure at a 1440px viewport). grid.html and driving.html share
+   this rule and only get narrower, so neither can overflow because of it. */
 .streets-table th,
 .streets-table td {
-  padding: 8px 12px;
+  padding: 8px;
   text-align: left;
   white-space: nowrap;
   border-bottom: 1px solid #eee;
@@ -97,7 +105,9 @@
 /* Sort control: looks like a header label, behaves like a button. */
 .streets-table thead th button {
   width: 100%;
-  padding: 8px 12px;
+  /* Matches the th/td padding above — the button fills the header cell, so it
+     is this value, not the th's, that sets a leaf's rendered width. */
+  padding: 8px;
   border: 0;
   background: none;
   font: inherit;
@@ -125,7 +135,7 @@
    centered and unclickable. */
 
 .streets-table thead th.th-group {
-  padding: 6px 12px;
+  padding: 6px 8px;
   text-align: center;
   font-weight: bold;
   border-bottom: 1px solid #ddd;
@@ -167,8 +177,16 @@
      its 1200px measure; the committed e2e fixture never catches this because
      its synthetic city names are short. Truncate with an ellipsis instead and
      carry the untruncated name in `title` (set alongside the cell markup) so
-     it's still available on hover/long-press. */
-  max-width: 220px;
+     it's still available on hover/long-press.
+
+     Narrowed 220px -> 180px once the label itself got shorter: the state and
+     country now render as the codes the aggregate already publishes
+     ("Dublin, IN, US" measures 93px against "Dublin, Indiana, United States"
+     at 198px), so the cap truncates far less often than the old one did at a
+     wider setting. A non-US state does not abbreviate — get_state_abbreviation
+     returns the full name — so those labels do meet the cap sooner; the
+     untruncated name stays in `title` either way. */
+  max-width: 180px;
   overflow: hidden;
   text-overflow: ellipsis;
 }
@@ -191,7 +209,7 @@
    grouped header, plus a Δ column — at 128px each that group alone overflows
    the measure. The bar still reads as a proportion; what goes is slack. */
 .coverage-cell--compact {
-  min-width: 90px;
+  min-width: 86px;
 }
 
 /* The coverage scale runs light-at-high (see coverageColor), so the bar needs

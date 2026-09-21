@@ -662,15 +662,18 @@ function resetHighlights() {
 
 /**
  * Build the display label for a city record.
+ *
+ * A thin alias for the shared builder in streetscape-utils.js. This was a
+ * hand-copied duplicate of those four lines — which is precisely why this page
+ * went on spelling out "Seattle, Washington, United States" while the tables
+ * were free to change how a city is named. Renders "Seattle, WA, US"; use
+ * `cityFullLabel` wherever the spelled-out form is what is wanted.
+ *
  * @param {Object} city
- * @returns {string}  e.g. "Seattle, Washington, United States"
+ * @returns {string}
  */
 function getCityLabel(city) {
-  const name = city.city || city.state?.name || city.country?.name || "Unknown";
-  const parts = [name];
-  if (city.state?.name && city.state.name !== name) parts.push(city.state.name);
-  if (city.country?.name) parts.push(city.country.name);
-  return parts.join(", ");
+  return cityDisplayLabel(city);
 }
 
 /**
@@ -712,7 +715,10 @@ let searchInitialized = false;
 function initCitySearch(cities) {
   // Pre-compute labels and sort alphabetically
   searchEntries = cities
-    .map((city) => ({ city, label: getCityLabel(city) }))
+    // `search` carries the SPELLED-OUT label beside the abbreviated display
+    // one: the visible text is now "Dublin, IN, US", and matching only that
+    // would mean typing "Indiana" or "United States" found nothing.
+    .map((city) => ({ city, label: getCityLabel(city), search: cityFullLabel(city) }))
     .sort((a, b) => a.label.localeCompare(b.label));
 
   if (searchInitialized) return;
@@ -814,8 +820,9 @@ function initCitySearch(cities) {
     const contains = [];
     for (const entry of searchEntries) {
       const lower = entry.label.toLowerCase();
-      if (lower.startsWith(query)) startsWith.push(entry);
-      else if (lower.includes(query)) contains.push(entry);
+      const full = entry.search.toLowerCase();
+      if (lower.startsWith(query) || full.startsWith(query)) startsWith.push(entry);
+      else if (lower.includes(query) || full.includes(query)) contains.push(entry);
     }
     matches = startsWith.concat(contains).slice(0, 15);
     renderMatches();

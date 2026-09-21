@@ -52,7 +52,87 @@ const {
   fetchStreetwalkManifest,
   lookupStreetwalk,
   mergeStreetwalkStats,
+  cityDisplayLabel,
+  cityFullLabel,
 } = require("../streetscape-utils.js");
+
+// --- cityDisplayLabel / cityFullLabel --------------------------------------
+// Moved here from table-utils.test.js with the functions themselves: only this
+// file is loaded by every page, which is why index.js had been carrying a
+// hand-copied duplicate.
+
+test("cityDisplayLabel: renders the published state and country CODES", () => {
+  assert.equal(
+    cityDisplayLabel({
+      city: "Dublin",
+      state: { name: "Indiana", code: "IN" },
+      country: { name: "United States", code: "US" },
+    }),
+    "Dublin, IN, US"
+  );
+});
+
+test("cityDisplayLabel: falls back to the full name wherever a code is absent", () => {
+  // Nothing is computed here — the codes come from the aggregate, and a record
+  // written before they did (or a country pycountry could not resolve, where
+  // get_country_code returns None) still has to render its name rather than a
+  // blank. This is also why every pre-existing expectation in the suite was
+  // unaffected by the change: their fixtures carry no codes.
+  assert.equal(
+    cityDisplayLabel({
+      city: "Seattle",
+      state: { name: "Washington" },
+      country: { name: "United States" },
+    }),
+    "Seattle, Washington, United States"
+  );
+  // A non-US state: get_state_abbreviation returns the name unchanged, so the
+  // code IS the name and the label is simply unabbreviated on that half.
+  assert.equal(
+    cityDisplayLabel({
+      city: "Paris",
+      state: { name: "Ile-de-France", code: "Ile-de-France" },
+      country: { name: "France", code: "FR" },
+    }),
+    "Paris, Ile-de-France, FR"
+  );
+});
+
+test("cityDisplayLabel: a city-state does not repeat itself as a code", () => {
+  // The de-duplication compares NAMES even though a CODE is what renders. Test
+  // it against a record whose code differs from its name, or the assertion
+  // passes for the wrong reason: comparing codes would emit "Singapore, SG".
+  assert.equal(
+    cityDisplayLabel({
+      city: "Singapore",
+      state: { name: "Singapore", code: "SG" },
+      country: { name: "Singapore", code: "SG" },
+    }),
+    "Singapore, SG"
+  );
+  assert.equal(
+    cityDisplayLabel({
+      city: "Singapore",
+      state: { name: "Singapore" },
+      country: { name: "Singapore" },
+    }),
+    "Singapore, Singapore"
+  );
+  assert.equal(cityDisplayLabel({}), "Unknown");
+});
+
+test("cityFullLabel: never abbreviates, even when both codes are present", () => {
+  // This is the string the tooltips and the free-text search read, so it has
+  // to stay spelled out: abbreviating it too would stop "Indiana" matching.
+  const city = {
+    city: "Dublin",
+    state: { name: "Indiana", code: "IN" },
+    country: { name: "United States", code: "US" },
+  };
+  assert.equal(cityFullLabel(city), "Dublin, Indiana, United States");
+  assert.notEqual(cityFullLabel(city), cityDisplayLabel(city));
+  assert.equal(cityFullLabel({}), "Unknown");
+});
 
 // --- adaptCityRecord: v1/v2/v3 aggregate flattening ------------------------
 

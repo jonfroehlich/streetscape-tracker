@@ -728,11 +728,13 @@ def test_streets_page_lists_published_road_walks(page: Page, base_url):
     expect(alpha_row).to_contain_text("85.1%")
     expect(alpha_row).to_contain_text("2026-04-15")
 
-    # Alpha City is walked by BOTH providers: two populated 360° cells and a
-    # real Δ. Map Ville is Mapillary-only, so its GSV cell reads absent.
+    # Alpha City is walked by all three providers. The Δ is deliberately NOT in
+    # the default view any more — giving it up is what pays for the Median age
+    # group — so the row carries a number per provider and no pairwise
+    # comparison. Map Ville is Mapillary-only, so its GSV cell reads absent.
     expect(alpha_row.locator("td.coverage-cell").nth(0)).to_have_text("85.1%")  # GSV
     expect(alpha_row.locator("td.coverage-cell").nth(1)).to_have_text("0.0%")  # Mapillary
-    expect(alpha_row.locator("td.delta-cell").first).to_have_text("-85.1 pp")
+    expect(alpha_row.locator("td.delta-cell")).to_have_count(0)
     expect(rows.nth(1).locator("td.coverage-cell").nth(0)).to_have_text("—")
 
     # The link target comes from the aggregate, not the manifest — plus this
@@ -768,18 +770,25 @@ def test_streets_provider_cells_open_that_providers_own_walk(page: Page, base_ur
 
     alpha = page.locator("#streets-tbody tr", has_text="Alpha City")
     links = alpha.locator("td a.provider-cell-link")
-    # 2 groups x 3 providers; the Δ is not one. Two groups rather than three
-    # because the default preset gives one up at three providers (#334) — the
-    # link count is the same as the two-provider table's by coincidence, which
-    # is why the href SET below is the assertion that matters.
-    expect(links).to_have_count(6)
+    # 3 groups x 3 providers: coverage, Median age and Walked all survive at
+    # three providers now that the default names no Δ, so nothing is trimmed
+    # here. The href SET below is still the assertion that matters — a count
+    # cannot say WHICH provider's series a cell opens.
+    expect(links).to_have_count(9)
     hrefs = links.evaluate_all("els => els.map(e => e.getAttribute('href'))")
     assert set(hrefs) == {
         f"city.html?file={ALPHA_LATEST}&network=drive",
         f"city.html?file={ALPHA_MAPILLARY_LATEST}&network=drive",
         f"city.html?file={ALPHA_PANORAMAX_LATEST}&network=drive",
     }, hrefs
-    expect(alpha.locator("td.delta-cell a")).to_have_count(0)
+    # A Δ belongs to no one provider, so it is never a link. Asserted in the
+    # preset that HAS one: the default builds no Δ cell at all now, and
+    # "no links inside td.delta-cell" passes trivially against zero of them.
+    page.locator("#table-preset").select_option("kilometres")
+    delta = page.locator("#streets-tbody tr", has_text="Alpha City").locator("td.delta-cell")
+    expect(delta).to_have_count(1)
+    expect(delta.locator("a")).to_have_count(0)
+    page.locator("#table-preset").select_option("overview")
 
     # The broad walk's links carry ITS network, not the default.
     page.locator('select[data-filter="network"]').select_option("all_public")
@@ -874,6 +883,12 @@ def test_streets_table_sorts_on_header_click(page: Page, base_url):
     expect(rows.first).to_contain_text("Map Ville")
 
     # A Δ header sorts too — the head-to-head question the pivot exists for.
+    # It is no longer in the DEFAULT view (that width went to Median age), so
+    # reach it the way a reader does, through an explicitly chosen preset. The
+    # absence assertion first, or this would pass on a page that simply still
+    # had the column.
+    expect(page.locator('th[data-key="deltaPct"]')).to_have_count(0)
+    page.locator("#table-preset").select_option("kilometres")
     page.locator('th[data-key="deltaPct"] button').click()
     expect(page.locator('th[data-key="deltaPct"]')).to_have_attribute("aria-sort", "descending")
     # Map Ville has no GSV walk, so its Δ is absent and sinks in both
@@ -1956,5 +1971,35 @@ def test_default_columns_fit_without_scrolling_the_page_sideways(page: Page, bas
            }"""
     )
     assert table_overflow <= 0, f"{path} table overflows its container by {table_overflow}px"
+
+    assert errors == []
+
+
+def test_streets_default_view_shows_median_age_and_walk_dates(page: Page, base_url):
+    """Coverage AND recency are what a Project Sidewalk deployment decision
+    reads, so the streets default has to carry Median age — and no other
+    streets preset names it, which is what made losing it total rather than
+    inconvenient.
+
+    The width gate above cannot catch this, and is the reason it went unnoticed:
+    that test was GREEN precisely because #334's trim had dropped the column at
+    three providers. "Fits" and "says anything useful" are two assertions, and
+    only one of them was being made.
+    """
+    errors = _capture_errors(page)
+    page.set_viewport_size({"width": 1440, "height": 900})
+    page.goto(f"{base_url}/streets.html")
+    expect(page.locator("#streets-tbody tr").first).to_be_visible()
+
+    # The fixture's Alpha City is walked by three providers, which is the count
+    # at which the old trim fired.
+    groups = page.locator("thead th.th-group")
+    expect(groups.filter(has_text="Median age")).to_have_count(1)
+    expect(groups.filter(has_text="Walked")).to_have_count(1)
+
+    # …and the group is populated, not an empty header: a spanning header with
+    # no leaves under it would still satisfy the assertions above.
+    ages = page.locator("#streets-tbody td", has_text="yrs")
+    assert ages.count() > 0, "Median age header is present but no cell renders an age"
 
     assert errors == []

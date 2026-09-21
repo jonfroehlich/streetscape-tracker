@@ -42,6 +42,8 @@ const sharedGlobals = {
   FRESHNESS_BUCKETS: "readonly",
   escapeHtml: "readonly",
   quoteForMessage: "readonly",
+  cityDisplayLabel: "readonly",
+  cityFullLabel: "readonly",
   viewerLinksHtml: "readonly",
   isValidRunFilename: "readonly",
   diffFilenameFor: "readonly",
@@ -76,7 +78,6 @@ const sharedGlobals = {
 // driving.js) CONSUME as globals (table-utils.js is loaded between
 // streetscape-utils.js and the page script).
 const tableGlobals = {
-  cityDisplayLabel: "readonly",
   sortRowsBy: "readonly",
   formatCellNumber: "readonly",
   coverageCellHtml: "readonly",

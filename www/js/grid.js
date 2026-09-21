@@ -119,10 +119,15 @@ function gridProviderLink(provider) {
  */
 function gridLabelCellHtml(row) {
   const label = escapeHtml(row.label);
+  // The visible text is the abbreviated label ("Dublin, IN, US"); the tooltip
+  // is the spelled-out one, so the state and country a reader may not know by
+  // code are always one hover away — the same contract the ellipsis already
+  // had, now covering the abbreviation as well as the truncation.
+  const title = escapeHtml(row.fullLabel ?? row.label);
   const content = row.filename
     ? `<a class="streets-view-link" href="city.html?file=${encodeURIComponent(row.filename)}">${label}</a>`
     : label;
-  return `<th scope="row" title="${label}">${content}</th>`;
+  return `<th scope="row" title="${title}">${content}</th>`;
 }
 
 // ── Columns ───────────────────────────────────────────────────
@@ -541,7 +546,7 @@ const GRID_PRESETS = buildGridPresets();
 const GRID_FILTERS = buildGridFilters();
 
 /** Row fields the free-text search box looks at. */
-const GRID_SEARCH_FIELDS = ["label", "cityId", "providersLabel"];
+const GRID_SEARCH_FIELDS = ["label", "cityId", "fullLabel", "providersLabel"];
 
 /** Default sort: alphabetical, so the page opens as a browsable index. */
 const GRID_DEFAULT_SORT = { key: "label", dir: "asc" };
@@ -633,6 +638,10 @@ function pivotGridRows(rawCities) {
         row = {
           cityId,
           label: city.city_id ? cityDisplayLabel(city) : "Unknown",
+          // The spelled-out label, kept beside the abbreviated one so the
+          // tooltip and the free-text search can both still reach "Indiana"
+          // and "United States" (GRID_SEARCH_FIELDS reads both).
+          fullLabel: city.city_id ? cityFullLabel(city) : "Unknown",
           providers: [],
           providersLabel: "",
           providerCount: 0,

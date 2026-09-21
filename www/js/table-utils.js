@@ -26,20 +26,11 @@
  * PROVIDERS.
  */
 
-/**
- * Build a "City, State, Country" label from an adapted city record.
- * The canonical copy — index.js and streets.js both alias it.
- *
- * @param {Object} city - Adapted city record.
- * @returns {string}
- */
-function cityDisplayLabel(city) {
-  const name = city.city || city.state?.name || city.country?.name || "Unknown";
-  const parts = [name];
-  if (city.state?.name && city.state.name !== name) parts.push(city.state.name);
-  if (city.country?.name) parts.push(city.country.name);
-  return parts.join(", ");
-}
+// `cityDisplayLabel` used to live here. It moved to streetscape-utils.js when
+// it learned to abbreviate: index.html loads that file and not this one, so
+// index.js could not have shared this copy and carried a duplicate instead.
+// Nothing in table-utils.js calls it — grid.js and streets.js do, and both
+// load streetscape-utils.js first.
 
 /**
  * Sort row models by one column. Nulls always sink to the bottom regardless of
@@ -749,7 +740,6 @@ function createSortableTable({ columns, defaultSort, theadEl, tbodyEl, tieKey = 
 // these are plain globals loaded via <script>.
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
-    cityDisplayLabel,
     sortRowsBy,
     formatCellNumber,
     coverageCellHtml,
