@@ -25,7 +25,8 @@ The three cities cover the render paths the smoke test asserts on:
     nothing an assertion can see. And a **Panoramax** run and walk (#334), and
     a **KartaView** run and walk (#354), so it is a FOUR-provider city — every
     provider in ``naming.KNOWN_PROVIDERS``, which is the count production
-    carries and the widest row the shared table chassis is asked to render.
+    carries — so the tables render production's own width here, and the widest
+    row's cells hold real values rather than em-dashes.
     Keeping those two counts equal is not left to memory: the omissions dict
     below is the only supported way to have fewer, and
     ``tests/test_e2e_fixture.py`` enforces it in the FAST suite. And a second,
@@ -45,6 +46,7 @@ data artifacts are kept (mirrors the real publish glob, which excludes the DB).
 import gzip
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -84,6 +86,24 @@ FIXTURE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixture"
 # Shared frozen grid geometry for every fixture city (small, so files stay tiny).
 W = H = 100
 STEP = 20
+
+# The ``generated_at`` every published artifact stamps, frozen (#360 review).
+#
+# ``build_fixture.py`` was not byte-reproducible: ``gzip.open`` writes the
+# current time into each member's MTIME header, and the aggregate, the
+# streetwalk manifest and the driving-plan summary each carry a wall-clock
+# ``generated_at``. Re-running it therefore rewrote all 24 files whether or not
+# a single byte of content had changed, so a diffstat could not tell a reviewer
+# which artifacts actually moved — and on a fixture commit that question is the
+# whole review. ``_normalize_for_commit`` below zeroes the gzip mtime and
+# rewrites this field; together they make the directory content-addressed.
+#
+# What is NOT frozen, and is worth knowing before reading a stray one-line
+# diff: ``driving_plan.json.gz`` carries values derived from ``date.today()``
+# (``years_since_newest_capture``, and in principle a verdict whose window has
+# since closed), because ``generate_driving_plan_summary`` reads the clock
+# itself and the fixture runs the REAL summarizer on purpose.
+FIXTURE_GENERATED_AT = "2026-04-20T00:00:00+00:00"
 
 # Providers deliberately left OUT of the fixture, each mapped to the reason.
 #
@@ -324,6 +344,7 @@ def _add_streetwalk(
     provider="gsv",
     network_type="drive",
     flat_only=False,
+    n_pano_samples=0,
 ):
     """
     Add a road-walk coverage artifact + catalog row for a city (issue #99/#155).
@@ -340,6 +361,15 @@ def _add_streetwalk(
     but no 360° pano: it lifts the any-imagery number while leaving the 360°
     number at zero (issue #116's distinction). Used to give the streets page a
     second provider whose two coverage columns actually differ.
+
+    ``n_pano_samples`` takes the first N of those covered samples back to OK,
+    i.e. a census provider that publishes BOTH — most of them do, and the two
+    numbers are what ``hasFlatImagery`` exists to keep apart. It is here for a
+    test reason as much as a fidelity one: a pivoted row is read by column
+    position, so two providers whose 360° cells both read ``0.0%`` make an
+    ``nth(i)`` assertion pass for the wrong reason, and swapping them in
+    ``streets.js:walkProviders()`` went unnoticed by the whole e2e suite until
+    the walks carried distinct numbers (#360 review).
 
     ``network_type`` selects which OSM network the walk claims to have covered.
     The synthetic two-edge network is the same either way — what matters to the
@@ -372,24 +402,31 @@ def _add_streetwalk(
     def _covered(row):
         return row.edge_id == "1_2" or row.sample_idx == 0
 
-    collected = pd.DataFrame(
-        [
+    rows = []
+    n_covered = 0
+    for r in samples.itertuples():
+        covered = _covered(r)
+        # A covered sample records a 360° pano unless this walk is flat-only,
+        # and the first ``n_pano_samples`` of a flat-only walk record one
+        # anyway — which is how a census provider that publishes both kinds
+        # ends up with a 360° street-km number that is neither zero nor equal
+        # to its any-imagery one.
+        n_covered += covered
+        pano = covered and (not flat_only or n_covered <= n_pano_samples)
+        rows.append(
             {
                 "query_lat": r.lat,
                 "query_lon": r.lon,
-                "pano_lat": r.lat if _covered(r) else None,
-                "pano_lon": r.lon if _covered(r) else None,
-                "pano_id": f"sw{r.Index}" if _covered(r) else None,
-                "capture_date": (None if (flat_only or not _covered(r)) else "2022-06-01"),
-                "copyright_info": (None if not _covered(r) else _CREDITS[provider]),
-                "status": (
-                    "ZERO_RESULTS" if not _covered(r) else ("FLAT_ONLY" if flat_only else "OK")
-                ),
+                "pano_lat": r.lat if covered else None,
+                "pano_lon": r.lon if covered else None,
+                "pano_id": f"sw{r.Index}" if covered else None,
+                "capture_date": ("2022-06-01" if pano else None),
+                "copyright_info": (_CREDITS[provider] if covered else None),
+                "status": ("OK" if pano else ("FLAT_ONLY" if covered else "ZERO_RESULTS")),
                 "query_timestamp": f"{run_date.isoformat()}T00:00:00Z",
             }
-            for r in samples.itertuples()
-        ]
-    )
+        )
+    collected = pd.DataFrame(rows)
 
     # Named by the real generator so the fixture can't drift from the contract
     # (it used to hand-build the provider token, which production code did not
@@ -452,6 +489,35 @@ def _add_streetwalk(
         length_km_covered_any=totals["length_km_covered_any"],
         median_covered_age_years=totals["median_covered_age_years"],
     )
+
+
+def _normalize_for_commit():
+    """Rewrite every artifact so identical content is identical bytes.
+
+    Two sources of churn, both invisible in a decompressed diff: the gzip
+    MTIME header (stamped by ``gzip.open`` on every member, including the ones
+    the pipeline code writes) and the wall-clock ``generated_at`` field. This
+    rewrites the field textually rather than re-serializing the JSON, so the
+    writers keep ownership of the formatting — a re-dumped document would be a
+    silent second normalization nobody asked for.
+
+    ``tests/test_e2e_fixture.py`` pins both, or the next regeneration quietly
+    goes back to timestamped bytes.
+    """
+    stamped = re.compile(r'("generated_at":\s*")[^"]*(")')
+    for name in sorted(os.listdir(FIXTURE_DIR)):
+        path = os.path.join(FIXTURE_DIR, name)
+        with gzip.open(path, "rb") as fh:
+            raw = fh.read()
+        if name.endswith(".json.gz"):
+            text = raw.decode("utf-8")
+            raw = stamped.sub(rf"\g<1>{FIXTURE_GENERATED_AT}\g<2>", text).encode("utf-8")
+        with open(path, "wb") as out:
+            # filename="" as well as mtime=0: gzip.open would otherwise write
+            # the member's own name into the header, which is stable here but
+            # is one more thing the bytes depend on.
+            with gzip.GzipFile(fileobj=out, mode="wb", mtime=0, filename="") as gz:
+                gz.write(raw)
 
 
 def build():
@@ -523,12 +589,17 @@ def build():
         # ...and a THIRD provider on the same city and the same date (#334).
         # Two reasons it is Panoramax and it is here rather than on its own
         # city: the pivoted grid/streets tables put one sub-column per
-        # COLLECTED provider under each grouped header, so the richest single
-        # city is the widest row the shared chassis is asked to render — the
-        # width question ADR 0001 leaves to the fixture, since there is no
-        # pagination or virtualization to fall back on. And three providers on
-        # one (city, date) is the filename-collision case the provider token
-        # exists to prevent, now exercised beyond a pair.
+        # COLLECTED provider under each grouped header, so the PAYLOAD's
+        # provider count sets the table's width — the width question ADR 0001
+        # leaves to the fixture, since there is no pagination or
+        # virtualization to fall back on — and stacking them on one city is
+        # what makes the widest row's cells POPULATED rather than a row of
+        # em-dashes, which is what the positional assertions in test_smoke
+        # read. (The columns themselves come from the union over every city,
+        # so spreading the providers out would render the same width and pin
+        # none of the values; measured in the #360 review.) And three
+        # providers on one (city, date) is the filename-collision case the
+        # provider token exists to prevent, now exercised beyond a pair.
         #
         # Panoramax ids are UUIDs, which is also what the city page's viewer
         # permalink is addressed by.
@@ -558,6 +629,16 @@ def build():
         # Mapillary's 66.7 and Panoramax's 50.0): a pivoted row is read by
         # column position, and two providers sharing a value make an
         # `nth(i)` assertion pass for the wrong reason.
+        #
+        # What buys the four distinct percentages is that each provider's
+        # frame here covers a different number of grid points, so the four
+        # runs report four different `total_search_points` (gsv 4, mapillary
+        # 3, kartaview 5, panoramax 4) on one supposedly frozen grid. That is
+        # a state PRODUCTION cannot be in — the grid is frozen once and shared
+        # by every provider, which is the whole reason cross-provider coverage
+        # rates are comparable — and it is a deliberate fixture simplification,
+        # not a shape any code should learn from. Nothing reads the count
+        # across providers; the pages read each run's own rate.
         _add_kartaview_run(
             conn,
             alpha,
@@ -642,6 +723,11 @@ def build():
         # it is also the collision the provider token exists to prevent, so the
         # two artifacts must not overwrite each other.
         _add_streetwalk(conn, alpha, date(2026, 4, 15), grid_origin=(44.00, -121.00))
+        # Flat-only with NO 360° samples at all, alone among the census walks:
+        # 0.0% against 85.1% is the widest version of #116's split, and
+        # test_streets_page_separates_360_and_any_imagery_coverage reads this
+        # walk for it. The other two carry a few 360° samples so that the four
+        # providers' cells hold four distinct numbers.
         _add_streetwalk(
             conn,
             alpha,
@@ -653,9 +739,11 @@ def build():
         # ...and a THIRD provider's walk on the same city, date and network
         # (#334), so streets.html renders the same row width that grid.html
         # does — the two payloads are separate, and a provider with a run and
-        # no walk widens one page only. Recorded as flat-only imagery: Panoramax
-        # publishes both, so its 360° and any-imagery street-km must differ
-        # for the two columns to be telling a reader anything.
+        # no walk widens one page only. Mostly flat imagery, with a handful of
+        # 360° samples: Panoramax publishes both, so its 360° and any-imagery
+        # street-km must differ for the two columns to be telling a reader
+        # anything — and its 360° number must differ from the OTHER census
+        # walks' or this row's cells cannot be read by position (#360 review).
         _add_streetwalk(
             conn,
             alpha,
@@ -663,15 +751,18 @@ def build():
             grid_origin=(44.00, -121.00),
             provider="panoramax",
             flat_only=True,
+            n_pano_samples=8,
         )
         # ...and a FOURTH (#354), matching the fourth grid run above. The
         # streets page is pivoted on its own payload, so a provider with a run
         # and no walk widens grid.html and leaves streets.html a column short
         # — which is the state that put #350's scroll test on a 1000px
-        # viewport. Flat-only like the other two census walks, and for the
-        # strongest reason of the three: KartaView outside the Grab fleet
-        # markets is dashcam footage, so its 360° street-km genuinely is the
-        # smaller of its two numbers.
+        # viewport. Overwhelmingly flat, and for the strongest reason of the
+        # three: KartaView outside the Grab fleet markets is dashcam footage,
+        # so its 360° street-km genuinely is the smaller of its two numbers.
+        # Not ZERO, though — the grid run above finds Alpha City 60% covered
+        # by KartaView SPHERE imagery, so a walk of the same city reporting no
+        # 360° street at all would be a fixture contradicting itself.
         _add_streetwalk(
             conn,
             alpha,
@@ -679,6 +770,7 @@ def build():
             grid_origin=(44.00, -121.00),
             provider="kartaview",
             flat_only=True,
+            n_pano_samples=3,
         )
         # ...and once more on the BROAD network, so the streets page's
         # network selector has a second series to switch to. Its street-km
@@ -863,6 +955,8 @@ def build():
     finally:
         conn.close()
         shutil.rmtree(db_tmp, ignore_errors=True)
+
+    _normalize_for_commit()
 
     files = sorted(os.listdir(FIXTURE_DIR))
     print(f"Wrote {len(files)} files to {FIXTURE_DIR} ({summary['cities_count']} cities):")

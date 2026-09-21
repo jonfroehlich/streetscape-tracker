@@ -13,6 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from streetscape_metadata_tracker import db  # noqa: E402
 from streetscape_metadata_tracker.config import (  # noqa: E402
     KARTAVIEW_METADATA_DTYPES,
+    MAPILLARY_METADATA_DTYPES,
     METADATA_DTYPES,
     PANORAMAX_METADATA_DTYPES,
 )
@@ -21,10 +22,18 @@ from streetscape_metadata_tracker.config import (  # noqa: E402
 # (or reordered in) METADATA_DTYPES flows into every synthetic fixture.
 COLUMNS = list(METADATA_DTYPES)
 
-# KartaView runs carry nine extra columns (issue #225), Panoramax four
-# (issue #316). Both taken from the same single source of truth, and in the
-# SAME order their downloaders write them, so a fixture cannot disagree with a
-# real run file about the column set.
+# The census providers carry extra columns past that core: Mapillary seven,
+# KartaView nine (issue #225), Panoramax four (issue #316). All three taken
+# from the same single source of truth, and in the SAME order their downloaders
+# write them, so a fixture cannot disagree with a real run file about the
+# column set.
+#
+# Mapillary's builder was on the bare nine until the #360 review, which is the
+# gap that comment described itself as closing: the fixture's "Mapillary run"
+# was missing every column MAPILLARY_EXTRA_DTYPES declares. Nothing in `www/`
+# reads them, so it cost nothing visible — which is exactly why it survived
+# three providers' worth of edits to the file.
+MAPILLARY_COLUMNS = list(MAPILLARY_METADATA_DTYPES)
 KARTAVIEW_COLUMNS = list(KARTAVIEW_METADATA_DTYPES)
 PANORAMAX_COLUMNS = list(PANORAMAX_METADATA_DTYPES)
 
@@ -133,6 +142,13 @@ def make_kartaview_city_df(
     # photos, which is the grouping GSV cannot offer (pano-spacing.md).
     username = "testdriver"
     sequence = "11616154"
+    # The first photo's position WITHIN that drive. 1 rather than 0 because
+    # this sequence is not invented: `streetscape-utils.js` records the probed
+    # real datum "image 2627370567 lives at sequence 11616154, index 1", and
+    # the e2e asserts the exact `details/11616154/1` the viewer is addressed
+    # by. A fixture that reuses a real id under a different index is a small
+    # lie that reads as a finding later.
+    first_index = 1
     # Space-separated, not ISO: that is the shape the API returns, and it is
     # why download_kartaview parses the two date columns separately.
     added = f"{run_date.isoformat()} 21:08:37"
@@ -152,7 +168,7 @@ def make_kartaview_city_df(
                 "OK",
                 username,
                 sequence,
-                i,
+                first_index + i,
                 True,
                 360.0,
                 90.0 + i,
@@ -180,7 +196,7 @@ def make_kartaview_city_df(
                 "FLAT_ONLY",
                 username,
                 sequence,
-                len(panos) + k,
+                first_index + len(panos) + k,
                 False,
                 120.0,  # PLANE imagery: a lens angle, not a full sphere
                 90.0,
@@ -220,6 +236,12 @@ def make_kartaview_city_df(
     # ``details/<sequence>/0.0`` and opens nothing. That is the same float
     # coercion PROVIDER_RUN_DTYPES exists to prevent on the read side; here it
     # would happen on the write side, in a fixture claiming to be a run file.
+    #
+    # Deleting this line left the whole fast suite green (#360 review): only
+    # regenerating the fixture and then running the BROWSER suite caught it,
+    # and that job is `continue-on-error: true`. It is pinned now, on the
+    # committed bytes and for every provider, by
+    # `test_every_committed_run_csv_writes_its_integer_columns_as_integers`.
     df["sequence_index"] = df["sequence_index"].astype("Int64")
     return df
 
@@ -238,6 +260,13 @@ def make_mapillary_city_df(
     Mapillary runs keep every pano: multiple OK rows can share one grid
     point (query_lat/query_lon), and copyright_info names the contributor.
 
+    On the full MAPILLARY_COLUMNS schema — the nine shared columns plus the
+    seven MAPILLARY_EXTRA_DTYPES ones the tile layer hands over for free
+    (creator, organization, sequence, is_pano, on_foot, quality_score,
+    compass_angle). Nothing in ``www/`` reads any of them, which is how this
+    builder stayed on the bare core while its KartaView and Panoramax siblings
+    were written against the real schema (#360 review).
+
     Args:
         panos: list of (pano_id, capture_date_str)
         panos_per_point: how many consecutive panos share each grid point
@@ -252,9 +281,15 @@ def make_mapillary_city_df(
     rows = []
     lat0, lon0 = grid_origin
     n_points_used = 0
+    # One capture drive, as the tile layer reports it. `creator_id` is the same
+    # contributor the copyright string names — they are two spellings of one
+    # fact in a real run, so a fixture where they disagree would make a parity
+    # check pass that should not.
+    sequence = "s6q8Xt0ZPfDVgHkRYcW3aM"
     for i, (pano_id, capture) in enumerate(panos):
         point = i // panos_per_point
         n_points_used = point + 1
+        creator = 100 + i % 3
         rows.append(
             (
                 lat0 + point * 0.001,
@@ -264,12 +299,20 @@ def make_mapillary_city_df(
                 lon0 + 0.0001,
                 pano_id,
                 capture,
-                f"© Mapillary contributor {100 + i % 3}",
+                f"© Mapillary contributor {creator}",
                 "OK",
+                str(creator),
+                None,  # individual contributor, not an organization fleet
+                sequence,
+                True,
+                False,  # vehicle capture, not on foot
+                0.75,
+                90.0 + i,
             )
         )
     for k in range(n_flat_only):
         point = n_points_used + k
+        creator = 200 + k
         rows.append(
             (
                 lat0 + point * 0.001,
@@ -279,8 +322,15 @@ def make_mapillary_city_df(
                 lon0 + 0.0001,
                 f"flat{k}",
                 None,  # FLAT_ONLY rows carry no capture date
-                f"© Mapillary contributor {200 + k}",
+                f"© Mapillary contributor {creator}",
                 "FLAT_ONLY",
+                str(creator),
+                None,
+                sequence,
+                False,  # the flat/perspective imagery issue #116 counts apart
+                True,  # ...and on foot, which is what the score penalizes
+                0.35,
+                90.0,
             )
         )
     for j in range(n_empty):
@@ -295,9 +345,16 @@ def make_mapillary_city_df(
                 None,
                 None,
                 "ZERO_RESULTS",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
             )
         )
-    return pd.DataFrame(rows, columns=COLUMNS)
+    return pd.DataFrame(rows, columns=MAPILLARY_COLUMNS)
 
 
 def make_panoramax_city_df(

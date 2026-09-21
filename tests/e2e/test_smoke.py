@@ -508,6 +508,12 @@ def test_city_page_renders_a_panoramax_run_as_panoramax(page: Page, base_url):
     assert errors == []
 
 
+# The fixture's first KartaView pano, and a real KartaView image id: this is
+# the (image, sequence, index) triple `streetscape-utils.js` records as probed,
+# so the popup link the test below pins is the one a reader would really get.
+KARTAVIEW_PANO_ID = "2627370567"
+
+
 def test_city_page_offers_the_kartaview_map_link_before_the_photo_link(page: Page, base_url):
     """
     #312's rule, asserted where a reader meets it rather than only in node.
@@ -546,23 +552,31 @@ def test_city_page_offers_the_kartaview_map_link_before_the_photo_link(page: Pag
 
     # Markers are painted pixels (preferCanvas), so click where Leaflet put one
     # and let its own hit-testing find it — the same approach as the Panoramax
-    # test, and the same reason.
+    # test, and the same reason. The marker is chosen by the pano id in its own
+    # popup rather than by taking whichever layer comes first, so the photo
+    # link below can be asserted as ONE address: "any of indices 0..2" passes
+    # on a `viewerUrl` that hardcodes an index, which is half the property the
+    # URL exists for (#360 review).
     at = page.evaluate(
-        """() => {
+        """(panoId) => {
              let found = null;
              map.eachLayer((l) => {
-               if (!found && l.getLatLng && l.getPopup && l.getPopup()) found = l;
+               if (found || !l.getLatLng || !l.getPopup || !l.getPopup()) return;
+               const content = l.getPopup().getContent();
+               if (typeof content === "string" && content.includes(panoId)) found = l;
              });
              if (!found) return null;
              const pt = map.latLngToContainerPoint(found.getLatLng());
              const box = map.getContainer().getBoundingClientRect();
              return { x: box.x + pt.x, y: box.y + pt.y };
-           }"""
+           }""",
+        KARTAVIEW_PANO_ID,
     )
     assert at, "no pano marker with a popup was drawn"
     page.mouse.click(at["x"], at["y"])
     popup = page.locator(".leaflet-popup-content")
     expect(popup).to_be_visible()
+    expect(popup).to_contain_text(KARTAVIEW_PANO_ID)  # the marker we meant
 
     links = popup.locator("a")
     expect(links).to_have_count(2)  # the only provider with a fallback
@@ -575,12 +589,12 @@ def test_city_page_offers_the_kartaview_map_link_before_the_photo_link(page: Pag
         links.nth(0).get_attribute("href"),
     ), links.nth(0).get_attribute("href")
     # ...and the photo link on (sequence, index within it), not on the pano id
-    # — which is the reason KartaView's viewerUrl takes the whole row. The
-    # fixture's three OK panos are one drive, indices 0..2; flat-only markers
-    # are off by default, so the clicked marker is one of those three.
-    assert links.nth(1).get_attribute("href") in {
-        f"https://kartaview.org/details/11616154/{i}" for i in range(3)
-    }, links.nth(1).get_attribute("href")
+    # — which is the reason KartaView's viewerUrl takes the whole row. Exactly
+    # this address: the fixture's ids are lifted from the real datum
+    # `streetscape-utils.js` records (image 2627370567 at sequence 11616154,
+    # index 1), so the index is a value carried from the CSV row and not a
+    # constant the builder could have supplied.
+    expect(links.nth(1)).to_have_attribute("href", "https://kartaview.org/details/11616154/1")
 
     assert errors == []
 
@@ -813,14 +827,21 @@ def test_streets_page_lists_published_road_walks(page: Page, base_url):
     # Alpha City is walked by all four providers. The Δ is deliberately NOT in
     # the default view any more — giving it up is what pays for the Median age
     # group — so the row carries a number per provider and no pairwise
-    # comparison. The three census walks are flat-imagery-only, which is why
-    # their 360° street-km is 0.0% while GSV's is 85.1%; that split is the
-    # subject of test_streets_page_separates_360_and_any_imagery_coverage.
+    # comparison. The three census walks are mostly flat imagery, which is why
+    # their 360° street-km sits below GSV's 85.1%; that split is the subject of
+    # test_streets_page_separates_360_and_any_imagery_coverage.
     # Map Ville is Mapillary-only, so its GSV cell reads absent.
+    #
+    # FOUR DISTINCT NUMBERS, and that is the assertion. A pivoted cell is
+    # identified by nothing but its position, so three providers reading
+    # "0.0%" — which is what this fixture used to give them — let the whole
+    # e2e suite pass with kartaview and panoramax swapped in
+    # `streets.js:walkProviders()` (#360 review). The grid twin below was
+    # always discriminating; this one only looked like it.
     expect(alpha_row.locator("td.coverage-cell").nth(0)).to_have_text("85.1%")  # GSV
     expect(alpha_row.locator("td.coverage-cell").nth(1)).to_have_text("0.0%")  # Mapillary
-    expect(alpha_row.locator("td.coverage-cell").nth(2)).to_have_text("0.0%")  # KartaView
-    expect(alpha_row.locator("td.coverage-cell").nth(3)).to_have_text("0.0%")  # Panoramax
+    expect(alpha_row.locator("td.coverage-cell").nth(2)).to_have_text("16.0%")  # KartaView
+    expect(alpha_row.locator("td.coverage-cell").nth(3)).to_have_text("42.7%")  # Panoramax
     expect(alpha_row.locator("td.delta-cell")).to_have_count(0)
     expect(rows.nth(1).locator("td.coverage-cell").nth(0)).to_have_text("—")
 
@@ -890,9 +911,12 @@ def test_streets_provider_cells_open_that_providers_own_walk(page: Page, base_ur
 
 def test_streets_page_separates_360_and_any_imagery_coverage(page: Page, base_url):
     """Alpha City's Mapillary walk is flat-imagery-only: 0% by 360° pano, 85.1%
-    counting any imagery. Pivoted, that split is now one provider's two cells
-    in two different groups — and the group headers are what keep them from
-    reading as one number."""
+    counting any imagery — the widest version of the split, and the reason
+    that walk is the one census walk here with no 360° samples at all (the
+    other two carry a few, so that the four providers' cells hold four
+    distinct numbers). Pivoted, the split is one provider's two cells in two
+    different groups — and the group headers are what keep them from reading
+    as one number."""
     errors = _capture_errors(page)
     page.goto(f"{base_url}/streets.html?preset=kilometres")
 

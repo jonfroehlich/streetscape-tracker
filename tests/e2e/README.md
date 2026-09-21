@@ -17,8 +17,8 @@ The fixture has three cities, one per render path the test asserts on:
 
 - **Alpha City** — a normal multi-run GSV city (snapshot `<select>` + change line), also collected
   and walked by Mapillary, KartaView and Panoramax. The FOUR-provider city: every provider in
-  `naming.KNOWN_PROVIDERS`, which is what production carries, so it is the widest row the pivoted
-  tables render and the payload every width gate here is asked against (#334, #354).
+  `naming.KNOWN_PROVIDERS`, which is what production carries, so the tables render production's
+  own width here and the widest row's cells are populated rather than em-dashes (#334, #354).
 - **Zero City** — a 0-pano GSV city (#69/#122: `—` dates, no `Infinity%`/`NaN`)
 - **Map Ville** — a Mapillary city (provider toggle / `?provider=`), excluded from both GSV channels
 
