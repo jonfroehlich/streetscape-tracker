@@ -393,19 +393,77 @@ jitter = 0.6
 #
 # GSV: one metadata request per on-street sample point, so the ceiling below is
 # a nightly runtime knob rather than a cost limit (metadata is free). Paced by
-# its own key's quota, NOT [download].max_requests_per_minute — the streets key
-# is a fresh key at Google's ~30,000/min default, so 24,000 is ~80% headroom.
+# its own key's quota, NOT [download].max_requests_per_minute.
 #
-# Sizing: the whole frame is ~133M on-street samples at 15 m, so a full pass at
-# 20 cities/night averages ~1.5M/night. The ceiling is 2x that because nightly
-# demand is lumpy, not average — a single Berlin-scale city is ~850k, and three
-# of them landing on one night would exhaust a tighter budget and defer the rest
-# (graceful, but it stalls the first pass). The requests are free; only wall
-# clock is spent, ~1 h/night at the pacing above.
+# 24,000 -> 48,000 on 2026-09-21: Google APPROVED this project's request to raise
+# "Metadata requests per minute" on the Street View Static API from the stock
+# 30,000 to 60,000, so gsv-streets-tracker (657654513495) now matches
+# gsv-date-tracker's limit. 48,000 is the same ~80% of the project ceiling that
+# [download].max_requests_per_minute keeps against the grid project's 60,000, so
+# the convention is unchanged and only the ceiling it is 80% of moved.
+#
+# THE ORDER MATTERS AND IS ONE-WAY: the grant has to be live BEFORE this number
+# moves. Pacing at 48,000 against a 30,000 ceiling does not merely waste
+# requests — it writes OVER_QUERY_LIMIT rows, and a run >= 95% denied is
+# rejected before cataloging, so it throws the night's data away too. If this
+# ever needs reverting, revert it to 24,000 and leave the quota alone.
+#
+# What it buys is WALL CLOCK, not volume: the corpus is fixed, so the same
+# night's work is paced into less time and Google is not asked for more requests
+# in total. HOW MUCH less is not 2x and is not known:
+#   - The figure that tempers it -- "achieves only 51-90% of its CONFIGURED
+#     rate, monotone in the city's coverage" (#304, reopened) -- is the GRID
+#     channel's, measured on the grid, and it self-identifies up at
+#     [providers.gsv] as being about "the channel that owns two-thirds of the
+#     night". THIS channel's achieved rate has never been measured, here or in
+#     docs/experiments/. Do not quote 51-90% as if it were gsv_streets'.
+#   - If the grid's median 30,137 req/min against its own 48,000 cap is what
+#     this engine can actually deliver on this host, then 24,000 -> 48,000 buys
+#     at most ~1.25x rather than ~2x: at 24,000 the pacer was plausibly the
+#     binding constraint, at 48,000 the host is.
+# So expect a real improvement somewhere between 1x and 2x, and MEASURE it
+# afterwards rather than assuming the halving. Cutting the other way, and the
+# reason this is not a new bet: the GSV grid already runs at 48,000 with the
+# same _ACHIEVED_RATE_FRACTION and the same engine on the same host, so 48,000
+# is an already-validated pairing for this code.
+#
+# THE DERIVED CITY TIMEOUT HALVES WITH THIS NUMBER, and today the floor hides
+# it. gsv_streets reaches the fall-through arm of city_timeout_seconds --
+# neither _tile_census_timeout_seconds nor _kartaview_timeout_seconds -- where
+# paced_seconds = estimated / (rate * _ACHIEVED_RATE_FRACTION) * 60, so doubling
+# the rate exactly halves it. What absorbs that is the 180-minute
+# city_timeout_minutes FLOOR: the derived value only exceeds the floor above
+# ~1.36M samples before this change and ~2.72M after, and the largest reachable
+# gsv_streets estimate on prod is ~795k on a drive network at the 40 km grid cap
+# (~932k by the edge-count tier). So every gsv_streets child takes the floor
+# today, before and after, and this change converts a ~2x latent margin into
+# ~1x. Two reachable ways that stops being true, neither exercised today:
+# network_type = "all_public" on this block (_BROAD_NETWORK_MULTIPLIER = 4.0 ->
+# ~3.18M samples, above both thresholds), and scripts/resize_city.py, which
+# bypasses MAX_GRID_DIM_M by design.
+#
+# ONE CANARY IS GONE, IN THE CODE AND NOT ONLY IN THE TEST. Both consumers of
+# this key fall back to [download] when it is unset (city_timeout_seconds and
+# _street_collect_cmd's gsv_streets arm). BEFORE this change, deleting the line
+# below doubled the child's pace 24k -> 48k, which was visible in production
+# behaviour; now the two numbers are equal, so deleting it is a silent no-op.
+# The config test catching a None is the whole mitigation -- do not collapse
+# this key onto [download]'s because the numbers currently match.
+#
+# Sizing: the whole frame is ~133M on-street samples at 15 m spread over the
+# 90-day cycle, so the AVERAGE night is ~1.5M. That average is set by the CYCLE,
+# not by max_cities_per_day -- which read 20 when this paragraph was written and
+# has been 40 since #304 -- so re-deriving it from the cap gets a wrong number.
+# The ceiling is 2x the average because nightly demand is lumpy, not average — a
+# single Berlin-scale city is ~850k, and three of them landing on one night
+# would exhaust a tighter budget and defer the rest (graceful, but it stalls the
+# first pass). The requests are free; only wall clock is spent — ~1 h/night at
+# the 24,000 this block used to set, so ~31 min at the 48,000 it sets now, with
+# the achieved-rate caveat above meaning the real figure lands between them.
 [providers.gsv_streets]
 enabled = true
 daily_request_budget = 3000000
-max_requests_per_minute = 24000
+max_requests_per_minute = 48000
 spacing_m = 15
 
 # Mapillary road-walk: costs the z14 tile census — set by the frozen bbox's area

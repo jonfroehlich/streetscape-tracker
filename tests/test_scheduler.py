@@ -1240,8 +1240,22 @@ def test_makelab1_production_config_is_wired():
     # own api_usage provider strings against separate keys, so a road crawl can
     # never eat the grid collectors' quota.
     assert cfg.providers["gsv_streets"].daily_request_budget == 3_000_000
-    # Paced by the streets key's own quota, not [download]'s 48k grid pacing.
-    assert cfg.providers["gsv_streets"].max_requests_per_minute == 24_000
+    # Paced by the STREETS key's own project quota, which as of 2026-09-21 is
+    # numerically equal to [download].max_requests_per_minute -- and that
+    # equality is a coincidence to be defended, not a duplication to be
+    # removed. Google approved this project's "Metadata requests per minute"
+    # raise from 30,000 to 60,000, so 48,000 is 80% of ITS ceiling exactly as
+    # the grid's 48,000 is 80% of gsv-date-tracker's. Two different projects,
+    # two independently revocable limits, which is the whole reason the keys
+    # were split. Collapsing gsv_streets onto [download]'s knob because the
+    # numbers now match would silently re-couple them, and the next time only
+    # one project's quota moves, the wrong channel would pace to it.
+    #
+    # NOT also asserted as int(0.8 * 60_000): both operands would be literals
+    # in this file, nothing here reads a project ceiling, and the pin above
+    # trips first on any config change. That is 48000 == 48000 with extra
+    # steps, which is worth less than the sentence above it.
+    assert cfg.providers["gsv_streets"].max_requests_per_minute == 48_000
     # The Mapillary budgets are NOT derived from the documented 50,000/day
     # per-app cap — both blocks matched that limit in no attribute (per IP not
     # per app, at 21% and 10% of it, 302 not 4xx). #214's bet that the 60/min
@@ -7368,6 +7382,33 @@ def test_an_unset_gsv_street_pace_falls_back_to_the_download_figure(conn):
 
     cmd = _street_collect_cmd(cfg, city, date(2026, 7, 8), "gsv_streets", 10, 100)
     assert cmd[cmd.index("--max-requests-per-minute") + 1] == str(cfg.max_requests_per_minute)
+
+
+def test_the_gsv_street_child_is_paced_by_its_own_key_not_the_download_knob(conn):
+    """The child must read [providers.gsv_streets], not [download].
+
+    This is the canary the 2026-09-21 raise removed from production BEHAVIOUR:
+    the two knobs are both 48,000 now, so deleting the provider key is a silent
+    no-op on prod rather than the visible 24k -> 48k doubling it used to be.
+    They are 80% of two DIFFERENT projects' independently revocable limits,
+    which is the whole reason the keys were split — so the day only one
+    project's quota moves, collapsing this channel onto [download]'s knob would
+    pace the wrong channel to the wrong ceiling.
+
+    Deliberately uses two numbers that are neither equal nor prod's, so a
+    fallback cannot pass by coincidence — `test_an_unset_gsv_street_pace_falls_
+    back_to_the_download_figure` pins the other direction.
+    """
+    from streetscape_metadata_tracker.scheduler import _street_collect_cmd
+
+    city = db.resolve_city(conn, _register(conn, "Bend", width=5000, height=5000, step=20))
+    cfg = SchedulerConfig(
+        max_requests_per_minute=11_000,
+        providers={"gsv_streets": ProviderConfig(max_requests_per_minute=22_000)},
+    )
+
+    cmd = _street_collect_cmd(cfg, city, date(2026, 7, 8), "gsv_streets", 10, 100)
+    assert cmd[cmd.index("--max-requests-per-minute") + 1] == "22000"
 
 
 def test_mapillary_street_child_gets_the_tile_pace(conn):
