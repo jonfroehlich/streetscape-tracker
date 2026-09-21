@@ -80,11 +80,33 @@ max_batch_hours = 12
 #   1. GMAPS_API_KEY and GMAPS_STREETS_API_KEY in SEPARATE Google Cloud projects
 #      (they hold no per-IP lock, so a shared project would put 48k+24k req/min
 #      on one quota with nothing serializing them).
-#      TODO(jon): record the two project IDs and the date of the console check
-#      here BEFORE deploying this. This is the one gate that cannot be verified
-#      from inside the repo, and it is the gate that matters most at 2 lanes,
-#      because gsv + gsv_streets is the only overlapping pair pointing two
-#      connectors at a single third party.
+#      CLEARED — all three projects queried 2026-09-15, account list re-checked
+#      2026-09-21:
+#        gsv         -> gsv-date-tracker     (634289259936, jonf@cs.washington.edu)
+#                       metadata quota 60,000/min (raised by producerOverride)
+#        gsv_streets -> gsv-streets-tracker  (657654513495, jonf@cs.washington.edu)
+#                       metadata quota 30,000/min (stock default, never raised)
+#      So the two lanes draw on 90,000/min of INDEPENDENT quota rather than
+#      squeezing one pool, which is exactly what this gate asks.
+#
+#      THE TRAP, because it will be walked into otherwise: a THIRD project named
+#      "GSV Tracker Streets" exists on jonfroehlich@gmail.com as
+#      gsv-tracker-streets (683030439566) — the same DISPLAY NAME as
+#      gsv-streets-tracker above, with the ID word-order transposed. It is an
+#      unused decoy (zero traffic in the 14 days before 2026-09-15). Anyone
+#      reading "the streets quota" off it reads the right number off the wrong
+#      project, so always name the project ID AND the account.
+#
+#      Identified by TRAFFIC SIGNATURE rather than by reading key strings: each
+#      project's metadata peak matches one channel's own pacer (gsv_streets at
+#      ~24,000/min, gsv at 48,124 against its 48,000 pacer). That is strong —
+#      one shared project would show combined traffic on one and none on the
+#      other — but it is inference, not a key-to-project read, so re-confirm in
+#      the console if either key is ever rotated.
+#
+#      Worth knowing while raising throughput: gsv_streets paces at 24,000 =
+#      80% of its project's UN-RAISED 30,000 default, so that project is the
+#      cheapest real headroom win and has nothing to do with this knob.
 #   2. Issue #256 landed — resume for the Mapillary tile census — so a stop that
 #      kills N children no longer re-spends a whole census into the per-IP
 #      ceiling (3,500/day paired, 5,250 un-paired since 2026-09-05).
