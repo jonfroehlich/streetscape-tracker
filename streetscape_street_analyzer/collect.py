@@ -87,7 +87,11 @@ from streetscape_metadata_tracker.checkpointing import (
 )
 from streetscape_metadata_tracker.config import load_config
 from streetscape_metadata_tracker.download_common import (
+    GSV_WALK_CONNECTION_LIMIT,
+    MAPILLARY_WALK_CONNECTION_LIMIT,
+    PANORAMAX_WALK_CONNECTION_LIMIT,
     SWEEP_INCOMPLETE_EXIT_CODE,
+    WALK_CONNECTION_LIMITS,
     DownloadError,
     HostUnavailableError,
     SweepIncompleteError,
@@ -296,26 +300,11 @@ def _cached_census_marker(city, provider: str, args) -> dict | None:
     return census_cache_probe(provider, city.city_id, frozen_bbox(city))
 
 
-# Concurrency defaults, per provider rather than one GSV-sized number for all
-# four arms. gsv and mapillary keep the 50 they have always run at -- prod
-# configures exactly that for the Mapillary GRID channel over the same host, so
-# lowering the walk would make the pair disagree about one CDN.
-#
-# Panoramax is 5 because that is what ITS grid run uses: `cli.py` passes no
-# connection_limit for this provider, so the downloader's own default applies,
-# and a walk quietly holding ten times the sockets against a volunteer-run
-# instance with no documented rate limit, no `Retry-After` and no credential to
-# identify us is the one asymmetry here worth removing. The 30/min limiter
-# bounds the RATE either way; what this bounds is sockets held open while the
-# instance is slow, which is the failure mode an unmetered host shows first.
-GSV_WALK_CONNECTION_LIMIT = 50
-MAPILLARY_WALK_CONNECTION_LIMIT = 50
-PANORAMAX_WALK_CONNECTION_LIMIT = 5
-_WALK_CONNECTION_LIMITS = {
-    "gsv": GSV_WALK_CONNECTION_LIMIT,
-    "mapillary": MAPILLARY_WALK_CONNECTION_LIMIT,
-    "panoramax": PANORAMAX_WALK_CONNECTION_LIMIT,
-}
+# The per-provider concurrency defaults now live in `download_common` (they are
+# imported above and re-exported here, so `collect.PANORAMAX_WALK_CONNECTION_LIMIT`
+# still resolves): the SCHEDULER has to honour the same ceilings when it builds
+# this collector's argv, and it must not import this module to learn them --
+# that would pull osmnx and geopandas into the long-lived parent process.
 
 
 def _walk_connection_limit(args, provider: str) -> int:
@@ -327,8 +316,27 @@ def _walk_connection_limit(args, provider: str) -> int:
     chain -- kartaview's sweep is serial and has no such argument, so resolving
     it for every provider made the one channel that needs no answer raise for
     want of one.
+
+    An explicit value still WINS, in both directions, because the operator
+    typing it is the one thing here that knows something this table does not.
+    What it no longer does is win SILENTLY: exceeding the provider's own
+    ceiling is said out loud, since the host that ceiling protects publishes no
+    rate limit and returns no `Retry-After` to tell us afterwards. The
+    scheduler no longer reaches this branch at all -- it composes the min of
+    its lane share and this ceiling itself, rather than overriding it nightly
+    with a number chosen for Google (see `_street_collect_cmd`).
     """
-    return args.connection_limit or _WALK_CONNECTION_LIMITS[provider]
+    ceiling = WALK_CONNECTION_LIMITS[provider]
+    if args.connection_limit and args.connection_limit > ceiling:
+        logger.warning(
+            "--connection-limit %d exceeds the %s walk default of %d; honouring "
+            "the explicit value. That default is a politeness bound on one host, "
+            "not a performance setting.",
+            args.connection_limit,
+            provider,
+            ceiling,
+        )
+    return args.connection_limit or ceiling
 
 
 def run_collect(args: argparse.Namespace) -> int:
@@ -985,14 +993,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=100)
     # DEFAULTED PER PROVIDER, not here (see `_walk_connection_limit`): 50 is a
     # GSV-sized number, and the flag is shared by four arms whose hosts are not.
+    # The numbers are read from the table rather than spelled, because this help
+    # text advertised a default the scheduler then overrode on every scheduled
+    # walk -- a promise no nightly run kept (see `_street_collect_cmd`).
     parser.add_argument(
         "--connection-limit",
         type=int,
         default=None,
         help=(
-            "Max concurrent requests. Default is the provider's own: 50 for gsv "
-            f"and mapillary, {PANORAMAX_WALK_CONNECTION_LIMIT} for panoramax, "
-            "which is what its grid run already uses."
+            "Max concurrent requests. Default is the provider's own: "
+            f"{GSV_WALK_CONNECTION_LIMIT} for gsv and "
+            f"{MAPILLARY_WALK_CONNECTION_LIMIT} for mapillary, "
+            f"{PANORAMAX_WALK_CONNECTION_LIMIT} for panoramax, which is what its "
+            "grid run already uses. A scheduled walk is never handed more than "
+            "its provider's number; an explicit value here still wins, and is "
+            "logged when it exceeds that number."
         ),
     )
     parser.add_argument("--timeout", type=float, default=30.0)
