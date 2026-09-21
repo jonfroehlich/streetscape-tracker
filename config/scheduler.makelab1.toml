@@ -299,8 +299,27 @@ jitter = 0.6
 #
 # GSV: one metadata request per on-street sample point, so the ceiling below is
 # a nightly runtime knob rather than a cost limit (metadata is free). Paced by
-# its own key's quota, NOT [download].max_requests_per_minute — the streets key
-# is a fresh key at Google's ~30,000/min default, so 24,000 is ~80% headroom.
+# its own key's quota, NOT [download].max_requests_per_minute.
+#
+# 24,000 -> 48,000 on 2026-09-21: Google APPROVED this project's request to raise
+# "Metadata requests per minute" on the Street View Static API from the stock
+# 30,000 to 60,000, so gsv-streets-tracker (657654513495) now matches
+# gsv-date-tracker's limit. 48,000 is the same ~80% of the project ceiling that
+# [download].max_requests_per_minute keeps against the grid project's 60,000, so
+# the convention is unchanged and only the ceiling it is 80% of moved.
+#
+# THE ORDER MATTERS AND IS ONE-WAY: the grant has to be live BEFORE this number
+# moves. Pacing at 48,000 against a 30,000 ceiling does not merely waste
+# requests — it writes OVER_QUERY_LIMIT rows, and a run >= 95% denied is
+# rejected before cataloging, so it throws the night's data away too. If this
+# ever needs reverting, revert it to 24,000 and leave the quota alone.
+#
+# What it buys is WALL CLOCK, not volume. The corpus is fixed, so the same
+# night's work is paced into roughly half the time; it does not ask Google for
+# more requests in total. Temper the expectation, though: the channel achieves
+# only 51-90% of its CONFIGURED rate, monotone in the city's coverage (#304,
+# reopened), so the ceiling was never the only thing binding and this will not
+# linearly halve the channel's wall clock.
 #
 # Sizing: the whole frame is ~133M on-street samples at 15 m, so a full pass at
 # 20 cities/night averages ~1.5M/night. The ceiling is 2x that because nightly
@@ -311,7 +330,7 @@ jitter = 0.6
 [providers.gsv_streets]
 enabled = true
 daily_request_budget = 3000000
-max_requests_per_minute = 24000
+max_requests_per_minute = 48000
 spacing_m = 15
 
 # Mapillary road-walk: costs the z14 tile census — set by the frozen bbox's area

@@ -1202,8 +1202,21 @@ def test_makelab1_production_config_is_wired():
     # own api_usage provider strings against separate keys, so a road crawl can
     # never eat the grid collectors' quota.
     assert cfg.providers["gsv_streets"].daily_request_budget == 3_000_000
-    # Paced by the streets key's own quota, not [download]'s 48k grid pacing.
-    assert cfg.providers["gsv_streets"].max_requests_per_minute == 24_000
+    # Paced by the STREETS key's own project quota, which as of 2026-09-21 is
+    # numerically equal to [download].max_requests_per_minute -- and that
+    # equality is a coincidence to be defended, not a duplication to be
+    # removed. Google approved this project's "Metadata requests per minute"
+    # raise from 30,000 to 60,000, so 48,000 is 80% of ITS ceiling exactly as
+    # the grid's 48,000 is 80% of gsv-date-tracker's. Two different projects,
+    # two independently revocable limits, which is the whole reason the keys
+    # were split. Collapsing gsv_streets onto [download]'s knob because the
+    # numbers now match would silently re-couple them, and the next time only
+    # one project's quota moves, the wrong channel would pace to it.
+    assert cfg.providers["gsv_streets"].max_requests_per_minute == 48_000
+    # Still 80% of its project ceiling, stated as the relationship rather than
+    # as a second literal, so a future raise that moves one and not the other
+    # fails here instead of in production against OVER_QUERY_LIMIT.
+    assert cfg.providers["gsv_streets"].max_requests_per_minute == int(0.8 * 60_000)
     # The Mapillary budgets are NOT derived from the documented 50,000/day
     # per-app cap — both blocks matched that limit in no attribute (per IP not
     # per app, at 21% and 10% of it, 302 not 4xx). #214's bet that the 60/min
