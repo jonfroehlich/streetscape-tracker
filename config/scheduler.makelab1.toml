@@ -72,19 +72,44 @@ max_batch_hours = 12
 # to pure breadth-first. The reserve cannot refresh a city early — every city
 # it can promote already cleared the cycle_days - grace_days (83 day) wall.
 # refresh_slots = 10
-# Channels of one city, in flight at once (issue #240). Explicit at 1 rather
-# than inherited, because this is the file prod reads and the value is the whole
-# rollout: 1 is today's sequential behaviour. Raising it is deploy-gated on two
-# things that live outside this repo:
-#   1. GMAPS_API_KEY and GMAPS_STREETS_API_KEY confirmed in SEPARATE Google
-#      Cloud projects (they hold no per-IP lock, so a shared project would put
-#      48k+24k req/min on one quota with nothing serializing them). Record the
-#      project IDs and the date of the check here when it is done.
-#   2. Issue #256 landed — resume for the Mapillary tile census. Until then a
-#      killed child re-spends tiles against the per-IP ceiling (3,500/day paired, 5,250 un-paired since 2026-09-05).
-# Go to 2 before 3: gsv is the long pole and already overlaps each short channel
-# in turn at 2, for half the blast radius. See docs/scheduler.md.
-max_concurrent_channels = 1
+# Channels of one city, in flight at once (issue #240). Explicit rather than
+# inherited, because this is the file prod reads and the value is the whole
+# rollout.
+#
+# 1 -> 2 on 2026-09-21. Both of #240's deploy gates are now answered:
+#   1. GMAPS_API_KEY and GMAPS_STREETS_API_KEY in SEPARATE Google Cloud projects
+#      (they hold no per-IP lock, so a shared project would put 48k+24k req/min
+#      on one quota with nothing serializing them).
+#      TODO(jon): record the two project IDs and the date of the console check
+#      here BEFORE deploying this. This is the one gate that cannot be verified
+#      from inside the repo, and it is the gate that matters most at 2 lanes,
+#      because gsv + gsv_streets is the only overlapping pair pointing two
+#      connectors at a single third party.
+#   2. Issue #256 landed — resume for the Mapillary tile census — so a stop that
+#      kills N children no longer re-spends a whole census into the per-IP
+#      ceiling (3,500/day paired, 5,250 un-paired since 2026-09-05).
+#
+# 2 AND NOT 3, per this file's own prior instruction and the arithmetic below.
+# At 2, gsv — the long pole at 66-76% of the night — already overlaps each short
+# channel IN TURN, which is where nearly all of the available win is, for half
+# the blast radius. 3 buys nothing extra on the city shape prod actually
+# collects: a city due on the four default channels has a largest host-disjoint
+# set of THREE (gsv + gsv_streets holding Overpass + mapillary), and the fourth,
+# mapillary_streets, needs both Overpass and the Mapillary CDN that those two
+# are already holding. 3 only starts paying once kartaview and/or panoramax are
+# due on the same city, which today is 20 enrolled cities and not the catalog.
+#
+# Memory is inside the envelope rather than argued to be: MemoryHigh=40G /
+# MemoryMax=48G were sized for three concurrent children (#305), and the
+# `cgroup peak` line recorded every night since then reads 1.30-7.89 GiB,
+# 3-20% of MemoryHigh, throttled 0 times over 2026-09-07..09-20. The number to
+# keep watching is not that range but the WORST city: a single child read 18.88
+# GiB on 2026-09-01, and a big city is big on every provider at once, so two of
+# those in one city is ~38 GiB — under MemoryMax, over MemoryHigh, i.e. the
+# throttling-hang failure #305 documents rather than a legible OOM. Read
+# `grep 'cgroup peak'` over the first week at 2 before considering 3.
+# See docs/scheduler.md.
+max_concurrent_channels = 2
 daily_request_budget = 10000000   # legacy fallback; superseded by [providers.*]
 
 # Per-provider daily request budgets (own run series, ledger, failure tracking).
@@ -453,7 +478,26 @@ network_type = "drive"
 
 [download]
 batch_size = 100
-connection_limit = 50
+# 50 -> 100 on 2026-09-21, in the SAME change that raised
+# [schedule].max_concurrent_channels to 2, and meaningless apart from it.
+#
+# This is a HOST budget, so _run_one_city DIVIDES it across lanes rather than
+# handing it to each child whole: `lane_connection_limit = connection_limit //
+# lanes`. Left at 50, raising to 2 lanes would have given each child 25 — i.e.
+# it would have made the GSV grid run, which is the long pole this whole change
+# exists to hide work underneath, roughly half as fast. 100 // 2 = 50 keeps
+# every child on exactly the socket count it has today, so the knob buys
+# overlap without paying for it out of GSV's throughput.
+#
+# What it genuinely changes is the Google-facing total: gsv + gsv_streets are
+# the only overlapping pair pointing two full-size connectors at one third
+# party, so prod now presents 50 + 50 sockets there instead of 50. That is
+# per-project parity with today ONLY IF the two keys are in separate Cloud
+# projects — which is deploy gate 1 on max_concurrent_channels above, and is
+# the reason these two lines must move together or not at all.
+#
+# Going to 3 lanes later needs 150 here for the same parity, not 100.
+connection_limit = 100
 request_timeout_s = 30.0
 # 60 -> 5 on 2026-09-02 (issue #306). It was never a rate limiter and every
 # mechanism its "spread load" rationale named is now per-request and per-host;

@@ -1143,15 +1143,30 @@ def test_makelab1_production_config_is_wired():
     # three street channels, for the same streets.html reason.
     assert cfg.providers["panoramax_streets"].spacing_m == 15
     assert cfg.providers["panoramax_streets"].network_type == "drive"
-    # Channel concurrency is OFF in production until both of #240's deploy gates
-    # clear: resume for the Mapillary tile census (#256), because a stop now kills
-    # N children at once and a killed census re-spends tiles into a per-IP ceiling
-    # we have already been blocked by twice; and a console check that the two GSV
-    # keys live in separate Cloud projects, since neither channel holds a per-IP
-    # lock. Pinned here rather than left implicit so raising it is a deliberate
-    # edit to this test and this file together — the same reason the Mapillary
-    # budgets above are pinned exactly.
-    assert cfg.max_concurrent_channels == 1
+    # Channel concurrency went 1 -> 2 in production on 2026-09-21, both of
+    # #240's deploy gates having been answered: #256 landed (resume for the
+    # Mapillary tile census, so a stop that kills N children no longer re-spends
+    # a whole census into a per-IP ceiling we have been blocked by twice), and a
+    # console check that the two GSV keys live in separate Cloud projects, since
+    # neither channel holds a per-IP lock.
+    #
+    # Still pinned exactly rather than asserted as a range, for the reason it
+    # was pinned at 1: raising it has to be a deliberate edit to this test and
+    # that config together. 2 and not 3 is a claim about the city shape prod
+    # collects — a city due on the four default channels has a largest
+    # host-disjoint set of three, and the fourth channel needs hosts the other
+    # three hold — so a bump to 3 belongs with a measurement, not with a
+    # loosened assertion here.
+    assert cfg.max_concurrent_channels == 2
+    # The two lines move together or not at all. `connection_limit` is a HOST
+    # budget that _run_one_city DIVIDES across lanes, so raising the knob while
+    # leaving this at 50 would have halved the GSV grid child's socket count —
+    # slowing down the long pole this change exists to hide work underneath.
+    # Asserting the DERIVED per-lane share is the assertion that carries the
+    # intent: either number alone can move without breaking it, the ratio
+    # cannot. 3 lanes would need 150 here for the same 50.
+    assert cfg.connection_limit == 100
+    assert cfg.connection_limit // cfg.max_concurrent_channels == 50
     # Production leaves BOTH of the night's reservations UNSET, so the derived
     # shares are what actually run. Pinning the resolved numbers and not just
     # the Nones is the point: `is None` alone would still pass if a resolver's
