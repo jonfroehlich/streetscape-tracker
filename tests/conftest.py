@@ -12,6 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from streetscape_metadata_tracker import db  # noqa: E402
 from streetscape_metadata_tracker.config import (  # noqa: E402
+    KARTAVIEW_METADATA_DTYPES,
     METADATA_DTYPES,
     PANORAMAX_METADATA_DTYPES,
 )
@@ -20,9 +21,11 @@ from streetscape_metadata_tracker.config import (  # noqa: E402
 # (or reordered in) METADATA_DTYPES flows into every synthetic fixture.
 COLUMNS = list(METADATA_DTYPES)
 
-# Panoramax runs carry four extra columns (issue #316). Taken from the same
-# single source of truth, and in the SAME order the downloader writes them,
-# so a fixture cannot disagree with a real run file about the column set.
+# KartaView runs carry nine extra columns (issue #225), Panoramax four
+# (issue #316). Both taken from the same single source of truth, and in the
+# SAME order their downloaders write them, so a fixture cannot disagree with a
+# real run file about the column set.
+KARTAVIEW_COLUMNS = list(KARTAVIEW_METADATA_DTYPES)
 PANORAMAX_COLUMNS = list(PANORAMAX_METADATA_DTYPES)
 
 
@@ -78,6 +81,147 @@ def make_city_df(
             )
         )
     return pd.DataFrame(rows, columns=COLUMNS)
+
+
+def make_kartaview_city_df(
+    panos,
+    run_date=date(2026, 1, 15),
+    grid_origin=(44.0, -121.0),
+    n_empty=1,
+    panos_per_point=1,
+    n_flat_only=0,
+):
+    """
+    Build a synthetic KartaView run DataFrame (issue #225).
+
+    A census like Mapillary's and Panoramax's — several OK rows may share one
+    grid point — on the wider KARTAVIEW_COLUMNS schema. The three extra things
+    worth knowing, all of which the frontend reads:
+
+      * ``sequence_id``/``sequence_index`` are what KartaView's viewer is
+        addressed BY (``details/<sequence>/<index>``), not ``pano_id``, so a
+        row missing either builds no photo link. Both are populated here; the
+        null-sequence case has its own node test.
+      * ``is_pano`` is ``projection == "SPHERE"``; the FLAT_ONLY rows are the
+        PLANE dashcam imagery that makes up most of the catalog outside the
+        Grab fleet markets (issue #116).
+      * ``copyright_info`` is ``© KartaView contributor <username>``, an
+        attribution requirement (CC BY-SA 4.0) rather than the official-fleet
+        marker it is for GSV — so nothing downstream may filter on it.
+
+    ``date_added`` is the server-side upload time and is deliberately AFTER
+    every capture date: ``shot_date >= date_added`` is the rejected-as-null
+    case (download_kartaview.shot_date_to_iso_date), and a fixture that tripped
+    it would silently publish a run with no dates at all.
+
+    Args:
+        panos: list of (pano_id, capture_date_str)
+        panos_per_point: how many consecutive panos share each grid point
+        n_flat_only: trailing FLAT_ONLY points (issue #116) — flat-imagery
+            presence markers with a representative pano_id/coords but a null
+            capture_date, on grid points distinct from the pano/empty ones
+        run_date, grid_origin, n_empty: as in make_city_df
+
+    Returns raw (string-typed) DataFrame, like a freshly written CSV.
+    """
+    ts = datetime(run_date.year, run_date.month, run_date.day, 12, 0, tzinfo=UTC).isoformat()
+    rows = []
+    lat0, lon0 = grid_origin
+    n_points_used = 0
+    # KartaView ids are numeric strings on every column that carries one, and
+    # the sequence is the DRIVE these photos came from — one drive, many
+    # photos, which is the grouping GSV cannot offer (pano-spacing.md).
+    username = "testdriver"
+    sequence = "11616154"
+    # Space-separated, not ISO: that is the shape the API returns, and it is
+    # why download_kartaview parses the two date columns separately.
+    added = f"{run_date.isoformat()} 21:08:37"
+    for i, (pano_id, capture) in enumerate(panos):
+        point = i // panos_per_point
+        n_points_used = point + 1
+        rows.append(
+            (
+                lat0 + point * 0.001,
+                lon0,
+                ts,
+                lat0 + point * 0.001 + 0.0001,
+                lon0 + 0.0001,
+                pano_id,
+                capture,
+                f"© KartaView contributor {username}",
+                "OK",
+                username,
+                sequence,
+                i,
+                True,
+                360.0,
+                90.0 + i,
+                added,
+                "CMNT",
+                "12345678",
+            )
+        )
+    for k in range(n_flat_only):
+        point = n_points_used + k
+        rows.append(
+            (
+                lat0 + point * 0.001,
+                lon0,
+                ts,
+                lat0 + point * 0.001 + 0.0001,
+                lon0 + 0.0001,
+                # The real photo id of the flat image picked as this point's
+                # representative, as census.build_image_rows copies it — and
+                # the row still carries a sequence, so the map fallback link
+                # has coordinates and the photo link has an address.
+                f"262737055{k}",
+                None,  # FLAT_ONLY rows carry no capture date
+                f"© KartaView contributor {username}",
+                "FLAT_ONLY",
+                username,
+                sequence,
+                len(panos) + k,
+                False,
+                120.0,  # PLANE imagery: a lens angle, not a full sphere
+                90.0,
+                added,
+                "CMNT",
+                "12345678",
+            )
+        )
+    for j in range(n_empty):
+        rows.append(
+            (
+                lat0 + (n_points_used + n_flat_only + j) * 0.001,
+                lon0,
+                ts,
+                None,
+                None,
+                None,
+                None,
+                None,
+                "ZERO_RESULTS",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        )
+    df = pd.DataFrame(rows, columns=KARTAVIEW_COLUMNS)
+    # ``sequence_index`` has to survive as an INTEGER. The ZERO_RESULTS rows
+    # carry None, which makes pandas infer the whole column float64 — and a
+    # written CSV then says "0.0", which is the position inside a drive that
+    # KartaView's viewer URL is addressed by, so the link becomes
+    # ``details/<sequence>/0.0`` and opens nothing. That is the same float
+    # coercion PROVIDER_RUN_DTYPES exists to prevent on the read side; here it
+    # would happen on the write side, in a fixture claiming to be a run file.
+    df["sequence_index"] = df["sequence_index"].astype("Int64")
+    return df
 
 
 def make_mapillary_city_df(

@@ -50,11 +50,16 @@ ALPHA_LATEST = "alpha-city--alphastate--testland_width_100_height_100_step_20_20
 ALPHA_MAPILLARY_LATEST = (
     "alpha-city--alphastate--testland_width_100_height_100_step_20_mapillary_2026-04-15.csv.gz"
 )
-# ...and its Panoramax series (#334), which makes Alpha City the fixture's
-# THREE-provider city: the widest row the pivoted tables are asked to render,
-# and the count at which the default preset stops fitting the measure.
+# ...its Panoramax series (#334) and its KartaView one (#354), which together
+# make Alpha City the fixture's FOUR-provider city: every provider in
+# naming.KNOWN_PROVIDERS, which is what production carries and therefore the
+# widest row the pivoted tables are asked to render. Keeping those two counts
+# equal is enforced in the fast suite by tests/test_e2e_fixture.py.
 ALPHA_PANORAMAX_LATEST = (
     "alpha-city--alphastate--testland_width_100_height_100_step_20_panoramax_2026-04-15.csv.gz"
+)
+ALPHA_KARTAVIEW_LATEST = (
+    "alpha-city--alphastate--testland_width_100_height_100_step_20_kartaview_2026-04-15.csv.gz"
 )
 # The OK panoramas in that run (build_fixture.py). Panoramax ids are UUIDs,
 # which is what its viewer permalink is addressed by.
@@ -503,6 +508,83 @@ def test_city_page_renders_a_panoramax_run_as_panoramax(page: Page, base_url):
     assert errors == []
 
 
+def test_city_page_offers_the_kartaview_map_link_before_the_photo_link(page: Page, base_url):
+    """
+    #312's rule, asserted where a reader meets it rather than only in node.
+
+    KartaView's ``POST /details`` backend answers ``osv: null`` for every
+    sequence probed, their own documented example included, so the photo link
+    opens "Ups! Sequence cannot be loaded...". The URL is right anyway — it is
+    the form their own SPA writes — so the fix was to offer the map view
+    FIRST, and the ORDER is the whole property: both builders were already
+    correct while every link a visitor clicked was broken, which is why a test
+    over ``viewerUrl`` alone would have stayed green through the bug.
+
+    ``viewerLinksHtml`` has node coverage for that ordering; what only the
+    browser shows is that ``city.js`` reaches the reader through it, on a real
+    run, with the row's ``sequence_id``/``sequence_index`` in hand. KartaView's
+    is the one viewer addressed by the ROW rather than by an image id, so it is
+    also the one that cannot be checked from a pano id alone. Unreachable here
+    until the fixture gained a KartaView run (#354).
+    """
+    errors = _capture_errors(page)
+    page.goto(f"{base_url}/city.html?file={ALPHA_KARTAVIEW_LATEST}")
+
+    expect(page.locator("table.legend-stats")).to_be_visible()  # page finished
+
+    # The provider's own attribution, and NOT Google's.
+    attribution = page.locator(".leaflet-control-attribution")
+    expect(attribution).to_contain_text("KartaView")
+    expect(attribution).not_to_contain_text("© Google")
+
+    # The capability pair, as on the Panoramax run above: a contributor id is
+    # not an official-fleet marker, so no copyright radiogroup — and KartaView
+    # outside the Grab fleet markets is flat dashcam imagery, so the flat-only
+    # toggle does render.
+    expect(page.locator(".gsv-mode-toggle")).to_have_count(0)
+    expect(page.get_by_role("button", name="Toggle flat-only imagery markers")).to_have_count(1)
+
+    # Markers are painted pixels (preferCanvas), so click where Leaflet put one
+    # and let its own hit-testing find it — the same approach as the Panoramax
+    # test, and the same reason.
+    at = page.evaluate(
+        """() => {
+             let found = null;
+             map.eachLayer((l) => {
+               if (!found && l.getLatLng && l.getPopup && l.getPopup()) found = l;
+             });
+             if (!found) return null;
+             const pt = map.latLngToContainerPoint(found.getLatLng());
+             const box = map.getContainer().getBoundingClientRect();
+             return { x: box.x + pt.x, y: box.y + pt.y };
+           }"""
+    )
+    assert at, "no pano marker with a popup was drawn"
+    page.mouse.click(at["x"], at["y"])
+    popup = page.locator(".leaflet-popup-content")
+    expect(popup).to_be_visible()
+
+    links = popup.locator("a")
+    expect(links).to_have_count(2)  # the only provider with a fallback
+    expect(links.nth(0)).to_have_text("View location on KartaView map")
+    expect(links.nth(1)).to_have_text("Exact photo (KartaView's viewer is often broken)")
+
+    # The map link is keyed on the PANO's own position, at z19.
+    assert re.fullmatch(
+        r"https://kartaview\.org/map/@-?\d+(\.\d+)?,-?\d+(\.\d+)?,19z",
+        links.nth(0).get_attribute("href"),
+    ), links.nth(0).get_attribute("href")
+    # ...and the photo link on (sequence, index within it), not on the pano id
+    # — which is the reason KartaView's viewerUrl takes the whole row. The
+    # fixture's three OK panos are one drive, indices 0..2; flat-only markers
+    # are off by default, so the clicked marker is one of those three.
+    assert links.nth(1).get_attribute("href") in {
+        f"https://kartaview.org/details/11616154/{i}" for i in range(3)
+    }, links.nth(1).get_attribute("href")
+
+    assert errors == []
+
+
 def test_city_page_refuses_a_run_from_an_unregistered_provider(page: Page, base_url):
     """
     Issue #338, the general form of #334: a run whose provider token this
@@ -711,7 +793,7 @@ def test_streets_page_lists_published_road_walks(page: Page, base_url):
     link to its map if that join worked.
 
     Since issue #250 a row is a (city, NETWORK) pair with each provider as a
-    sub-column — so the fixture's four walks collapse to two 'drive' rows, and
+    sub-column — so the fixture's five 'drive' walks collapse to two rows, and
     the 'all_public' walk is behind the network selector rather than beside
     them (a different street-km denominator must never share a column).
     """
@@ -728,12 +810,17 @@ def test_streets_page_lists_published_road_walks(page: Page, base_url):
     expect(alpha_row).to_contain_text("85.1%")
     expect(alpha_row).to_contain_text("2026-04-15")
 
-    # Alpha City is walked by all three providers. The Δ is deliberately NOT in
+    # Alpha City is walked by all four providers. The Δ is deliberately NOT in
     # the default view any more — giving it up is what pays for the Median age
     # group — so the row carries a number per provider and no pairwise
-    # comparison. Map Ville is Mapillary-only, so its GSV cell reads absent.
+    # comparison. The three census walks are flat-imagery-only, which is why
+    # their 360° street-km is 0.0% while GSV's is 85.1%; that split is the
+    # subject of test_streets_page_separates_360_and_any_imagery_coverage.
+    # Map Ville is Mapillary-only, so its GSV cell reads absent.
     expect(alpha_row.locator("td.coverage-cell").nth(0)).to_have_text("85.1%")  # GSV
     expect(alpha_row.locator("td.coverage-cell").nth(1)).to_have_text("0.0%")  # Mapillary
+    expect(alpha_row.locator("td.coverage-cell").nth(2)).to_have_text("0.0%")  # KartaView
+    expect(alpha_row.locator("td.coverage-cell").nth(3)).to_have_text("0.0%")  # Panoramax
     expect(alpha_row.locator("td.delta-cell")).to_have_count(0)
     expect(rows.nth(1).locator("td.coverage-cell").nth(0)).to_have_text("—")
 
@@ -770,15 +857,16 @@ def test_streets_provider_cells_open_that_providers_own_walk(page: Page, base_ur
 
     alpha = page.locator("#streets-tbody tr", has_text="Alpha City")
     links = alpha.locator("td a.provider-cell-link")
-    # 3 groups x 3 providers: coverage, Median age and Walked all survive at
-    # three providers now that the default names no Δ, so nothing is trimmed
+    # 3 groups x 4 providers: coverage, Median age and Walked all survive at
+    # four providers now that the default names no Δ, so nothing is trimmed
     # here. The href SET below is still the assertion that matters — a count
     # cannot say WHICH provider's series a cell opens.
-    expect(links).to_have_count(9)
+    expect(links).to_have_count(12)
     hrefs = links.evaluate_all("els => els.map(e => e.getAttribute('href'))")
     assert set(hrefs) == {
         f"city.html?file={ALPHA_LATEST}&network=drive",
         f"city.html?file={ALPHA_MAPILLARY_LATEST}&network=drive",
+        f"city.html?file={ALPHA_KARTAVIEW_LATEST}&network=drive",
         f"city.html?file={ALPHA_PANORAMAX_LATEST}&network=drive",
     }, hrefs
     # A Δ belongs to no one provider, so it is never a link. Asserted in the
@@ -978,7 +1066,7 @@ def test_grid_page_lists_one_row_per_city(page: Page, base_url):
     page.goto(f"{base_url}/grid.html")
 
     rows = page.locator("#grid-tbody tr")
-    expect(rows).to_have_count(3)  # three CITIES, not four (city, provider) series
+    expect(rows).to_have_count(3)  # three CITIES, not six (city, provider) series
 
     # Default sort is alphabetical (a browsable index).
     expect(page.locator('th[data-key="label"]')).to_have_attribute("aria-sort", "ascending")
@@ -991,19 +1079,21 @@ def test_grid_page_lists_one_row_per_city(page: Page, base_url):
     expect(page.locator("#grid-thead tr")).to_have_count(2)
     group = page.locator("#grid-thead th.th-group", has_text="Grid coverage")
     expect(group).to_have_count(1)
-    # GSV + Mapillary + Panoramax, and NO Δ: the default preset names no Δ
-    # leaf on either pivoted page since #350, so this is the fixture's
-    # provider count exactly rather than that plus one.
-    expect(group).to_have_attribute("colspan", "3")
+    # GSV + Mapillary + KartaView + Panoramax, and NO Δ: the default preset
+    # names no Δ leaf on either pivoted page since #350, so this is the
+    # fixture's provider count exactly rather than that plus one.
+    expect(group).to_have_attribute("colspan", "4")
     assert group.evaluate("el => el.hasAttribute('data-key')") is False
 
-    # Alpha City is the three-provider city: every leaf populated. The Δ is a
-    # FIXED pair (Mapillary − GSV) and lives in "Compare providers" now, so
-    # the default view carries none at all.
+    # Alpha City is the four-provider city: every leaf populated, in registry
+    # order. Four distinct percentages, so an `nth(i)` here cannot pass by
+    # landing on the wrong column. The Δ is a FIXED pair (Mapillary − GSV) and
+    # lives in "Compare providers" now, so the default view carries none.
     alpha = rows.first
     expect(alpha.locator("td.coverage-cell").nth(0)).to_have_text("75.0%")  # GSV
     expect(alpha.locator("td.coverage-cell").nth(1)).to_have_text("66.7%")  # Mapillary
-    expect(alpha.locator("td.coverage-cell").nth(2)).to_have_text("50.0%")  # Panoramax
+    expect(alpha.locator("td.coverage-cell").nth(2)).to_have_text("60.0%")  # KartaView
+    expect(alpha.locator("td.coverage-cell").nth(3)).to_have_text("50.0%")  # Panoramax
     expect(alpha.locator("td.delta-cell")).to_have_count(0)
 
     # Map Ville has no GSV run at all: the union pivot keeps the row and the
@@ -1019,7 +1109,10 @@ def test_grid_page_lists_one_row_per_city(page: Page, base_url):
         "href", f"city.html?file={ALPHA_LATEST}"
     )
     expect(page.locator("thead").get_by_text("Link to city map")).to_have_count(0)
-    expect(page.locator("#grid-caption")).to_contain_text("3 cities (5 provider series)")
+    # Rows are cities and the underlying data is per-provider series, so both
+    # counts are reported: Alpha City's four plus one each for Map Ville and
+    # Zero City.
+    expect(page.locator("#grid-caption")).to_contain_text("3 cities (6 provider series)")
 
     # A grouped LEAF header sorts (GSV grid coverage, best first: the 0-pano
     # city sinks, and Map Ville sinks below it because it has no GSV value at
@@ -1059,17 +1152,18 @@ def test_grid_provider_cells_open_that_providers_own_run(page: Page, base_url):
     page.goto(f"{base_url}/grid.html")
 
     alpha = page.locator("#grid-tbody tr", has_text="Alpha City")
-    # 3 groups x 3 providers: coverage, Median age and Last collected all
-    # survive now that the default trims nothing (#350), so Alpha City's three
-    # providers contribute nine linked cells. The href SET below is still the
+    # 3 groups x 4 providers: coverage, Median age and Last collected all
+    # survive now that the default trims nothing (#350), so Alpha City's four
+    # providers contribute twelve linked cells. The href SET below is still the
     # assertion that matters — a count cannot say WHICH provider's series a
     # cell opens.
     links = alpha.locator("td a.provider-cell-link")
-    expect(links).to_have_count(9)
+    expect(links).to_have_count(12)
     hrefs = links.evaluate_all("els => els.map(e => e.getAttribute('href'))")
     assert set(hrefs) == {
         f"city.html?file={ALPHA_LATEST}",
         f"city.html?file={ALPHA_MAPILLARY_LATEST}",
+        f"city.html?file={ALPHA_KARTAVIEW_LATEST}",
         f"city.html?file={ALPHA_PANORAMAX_LATEST}",
     }, hrefs
     # A Δ belongs to no one provider, so it is never a link. Asserted in the
@@ -1109,7 +1203,9 @@ def test_grid_collected_by_filter_replaces_the_multi_provider_checkbox(page: Pag
     page.locator('select[data-filter="provider"]').select_option("multi")
     expect(rows).to_have_count(1)
     expect(rows.first).to_contain_text("Alpha City")
-    expect(page.locator("#grid-caption")).to_contain_text("1 of 3 cities (3 provider series)")
+    # Alpha City alone, and its four series — the series count is summed over
+    # the SHOWN rows, so it narrows with them.
+    expect(page.locator("#grid-caption")).to_contain_text("1 of 3 cities (4 provider series)")
 
     assert errors == []
 
@@ -2021,17 +2117,16 @@ def test_the_city_column_stays_pinned_while_the_table_scrolls(page: Page, base_u
     silently does nothing without a scrolling ancestor, and an assertion that
     only read `getComputedStyle` would pass on a page where it never engaged.
 
-    The viewport is deliberately 1000px rather than the 1440px the other
-    layout tests use, and NOT because that is the interesting width. It is
-    because the committed fixture carries three providers while production
-    carries four: three still fit 1440px, so at the wider viewport this test
-    would silently have nothing to scroll — the exact shape of the #334 gate
-    that stayed green against a too-narrow payload. 1000px is above the 900px
-    breakpoint where the sidebar unstacks, so the layout under test is the
-    desktop one either way.
+    1440×900, the same viewport as every other layout test here. It ran at
+    1000px until #354 because the fixture carried three providers where
+    production carried four, and three fit 1440px — so the wider viewport
+    would have left nothing to scroll and the test would have passed having
+    exercised nothing. The fixture is four deep now, which is production's
+    count, so the ordinary desktop width is once again the case worth asking
+    about.
     """
     errors = _capture_errors(page)
-    page.set_viewport_size({"width": 1000, "height": 900})
+    page.set_viewport_size({"width": 1440, "height": 900})
     page.goto(f"{base_url}/{path}")
     expect(page.locator("tbody tr").first).to_be_visible()
 
@@ -2075,8 +2170,8 @@ def test_streets_default_view_shows_median_age_and_walk_dates(page: Page, base_u
     page.goto(f"{base_url}/streets.html")
     expect(page.locator("#streets-tbody tr").first).to_be_visible()
 
-    # The fixture's Alpha City is walked by three providers, which is the count
-    # at which the old trim fired.
+    # The fixture's Alpha City is walked by four providers — production's
+    # count, and one past the three at which the old trim fired.
     groups = page.locator("thead th.th-group")
     expect(groups.filter(has_text="Median age")).to_have_count(1)
     expect(groups.filter(has_text="Walked")).to_have_count(1)

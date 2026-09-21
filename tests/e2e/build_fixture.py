@@ -22,13 +22,14 @@ The three cities cover the render paths the smoke test asserts on:
     It also carries a **Mapillary** run and a Mapillary road walk, so it is the
     two-provider city the pivoted grid/streets tables (#250) need: without one,
     the cross-provider Δ columns and the union-not-intersection pivot render
-    nothing an assertion can see. And a **Panoramax** run and walk (#334), so
-    it is a THREE-provider city: the widest row the shared table chassis is
-    asked to render, which is the count at which the default preset stops
-    fitting the measure — and production had been three deep since KartaView
-    (#248) while this fixture carried two, so the width gate was green against
-    a payload narrower than the real one. And a second, **all_public** walk,
-    for the streets page's network selector.
+    nothing an assertion can see. And a **Panoramax** run and walk (#334), and
+    a **KartaView** run and walk (#354), so it is a FOUR-provider city — every
+    provider in ``naming.KNOWN_PROVIDERS``, which is the count production
+    carries and the widest row the shared table chassis is asked to render.
+    Keeping those two counts equal is not left to memory: the omissions dict
+    below is the only supported way to have fewer, and
+    ``tests/test_e2e_fixture.py`` enforces it in the FAST suite. And a second,
+    **all_public** walk, for the streets page's network selector.
   * a **0-pano** GSV city (#69/#122) — "—" dates, no ``Infinity%``/``NaN``
   * a **Mapillary-only** city        — provider toggle / ``?provider=``, and
     the one tracked city with no GSV capture date, which the driving-plan join
@@ -70,6 +71,7 @@ from streetscape_metadata_tracker.json_summarizer import (  # noqa: E402
 )
 from tests.conftest import (  # noqa: E402
     make_city_df,
+    make_kartaview_city_df,
     make_mapillary_city_df,
     make_panoramax_city_df,
     write_city_csv_gz,
@@ -82,6 +84,24 @@ FIXTURE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixture"
 # Shared frozen grid geometry for every fixture city (small, so files stay tiny).
 W = H = 100
 STEP = 20
+
+# Providers deliberately left OUT of the fixture, each mapped to the reason.
+#
+# Empty today, and being empty is the point. ``tests/test_e2e_fixture.py``
+# reads this dict and requires the fixture to carry a grid run and a road walk
+# for every provider in ``naming.KNOWN_PROVIDERS`` that is not named here — so
+# the fixture can only trail production by someone writing a line in this dict
+# and saying why. It trailed twice without one (issue #354): production gained
+# KartaView in #248 and the fixture stayed at two providers until #337, then
+# gained Panoramax and the fixture stayed at three until this issue, and both
+# times the gap was found by a layout defect rather than by a test.
+#
+# Every entry is a decision to weaken the browser tests, because each page's
+# width is a function of the COLLECTED provider count: a fixture short one
+# provider renders one column narrower per metric group than production, so an
+# overflow gate can be green against a payload that cannot overflow. Prefer
+# adding the provider.
+FIXTURE_OMITTED_PROVIDERS: dict[str, str] = {}
 
 
 def _run_name(city_id, run_date, provider="gsv"):
@@ -166,6 +186,35 @@ def _add_gsv_run(conn, city_id, city_name, state, country, panos, run_date, grid
         df=df,
         run_date=run_date,
         provider="gsv",
+        city_id=city_id,
+        csv_filename=name,
+        json_filename=os.path.basename(json_path),
+    )
+
+
+def _add_kartaview_run(conn, city_id, city_name, state, country, panos, run_date, grid_origin):
+    """A KartaView census run (issue #354), with a flat-only point on purpose.
+
+    ``n_flat_only`` is non-zero for the same reason it is on the Panoramax run
+    — the any-imagery number has to exceed the 360° one for the two columns to
+    be saying different things — and it is more the norm here than there:
+    outside the Grab fleet markets KartaView is overwhelmingly PLANE dashcam
+    footage, which is why its registry entry declares ``hasFlatImagery``.
+    """
+    name = _run_name(city_id, run_date, provider="kartaview")
+    csv_path = os.path.join(FIXTURE_DIR, name)
+    write_city_csv_gz(
+        make_kartaview_city_df(panos, run_date=run_date, grid_origin=grid_origin, n_flat_only=1),
+        csv_path,
+    )
+    json_path, df = _write_summary(
+        csv_path, city_name, state, country, run_date, provider="kartaview"
+    )
+    return _register_run_with_stats(
+        conn,
+        df=df,
+        run_date=run_date,
+        provider="kartaview",
         city_id=city_id,
         csv_filename=name,
         json_filename=os.path.basename(json_path),
@@ -474,7 +523,7 @@ def build():
         # ...and a THIRD provider on the same city and the same date (#334).
         # Two reasons it is Panoramax and it is here rather than on its own
         # city: the pivoted grid/streets tables put one sub-column per
-        # COLLECTED provider under each grouped header, so a three-provider
+        # COLLECTED provider under each grouped header, so the richest single
         # city is the widest row the shared chassis is asked to render — the
         # width question ADR 0001 leaves to the fixture, since there is no
         # pagination or virtualization to fall back on. And three providers on
@@ -492,6 +541,33 @@ def build():
             [
                 ("599c8ad1-3a21-4311-9179-82e31ed23d32", "2024-05-24"),
                 ("13662235-dd09-4207-a2cc-530f0b908190", "2025-05-24"),
+            ],
+            date(2026, 4, 15),
+            grid_origin=(44.00, -121.00),
+        )
+
+        # ...and a FOURTH, which is what production has carried since #248 and
+        # what this fixture did not (#354). KartaView is not a rounding error
+        # on the real catalog — 295 runs and 268 walks, the third-largest
+        # series on both — and its absence is measurable in the browser rather
+        # than only in the payload: three providers fit a 1440px viewport
+        # exactly and four do not, so every width gate here was asking its
+        # question one column short of the real one.
+        #
+        # Distinct numbers on purpose (60.0% / 80.0%, against GSV's 75.0,
+        # Mapillary's 66.7 and Panoramax's 50.0): a pivoted row is read by
+        # column position, and two providers sharing a value make an
+        # `nth(i)` assertion pass for the wrong reason.
+        _add_kartaview_run(
+            conn,
+            alpha,
+            "Alpha City",
+            "Alphastate",
+            "Testland",
+            [
+                ("2627370567", "2019-07-01"),
+                ("2627370568", "2021-07-01"),
+                ("2627370569", "2023-07-01"),
             ],
             date(2026, 4, 15),
             grid_origin=(44.00, -121.00),
@@ -575,8 +651,9 @@ def build():
             flat_only=True,
         )
         # ...and a THIRD provider's walk on the same city, date and network
-        # (#334), so streets.html renders the same three-provider row width
-        # that grid.html now does. Recorded as flat-only imagery: Panoramax
+        # (#334), so streets.html renders the same row width that grid.html
+        # does — the two payloads are separate, and a provider with a run and
+        # no walk widens one page only. Recorded as flat-only imagery: Panoramax
         # publishes both, so its 360° and any-imagery street-km must differ
         # for the two columns to be telling a reader anything.
         _add_streetwalk(
@@ -585,6 +662,22 @@ def build():
             date(2026, 4, 15),
             grid_origin=(44.00, -121.00),
             provider="panoramax",
+            flat_only=True,
+        )
+        # ...and a FOURTH (#354), matching the fourth grid run above. The
+        # streets page is pivoted on its own payload, so a provider with a run
+        # and no walk widens grid.html and leaves streets.html a column short
+        # — which is the state that put #350's scroll test on a 1000px
+        # viewport. Flat-only like the other two census walks, and for the
+        # strongest reason of the three: KartaView outside the Grab fleet
+        # markets is dashcam footage, so its 360° street-km genuinely is the
+        # smaller of its two numbers.
+        _add_streetwalk(
+            conn,
+            alpha,
+            date(2026, 4, 15),
+            grid_origin=(44.00, -121.00),
+            provider="kartaview",
             flat_only=True,
         )
         # ...and once more on the BROAD network, so the streets page's
