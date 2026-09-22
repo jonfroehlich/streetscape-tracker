@@ -48,9 +48,11 @@ from streetscape_metadata_tracker.download_common import (
     HostBlockedError,
 )
 from streetscape_metadata_tracker.overpass_retry import (
+    OVERPASS_ATTEMPT_SLACK_S,
     OVERPASS_CHILD_STARTUP_RESERVE_S,
     OVERPASS_FINAL_ATTEMPT_RESERVE_S,
     OVERPASS_MIN_RETRY_WAIT_S,
+    OVERPASS_REQUEST_TIMEOUT_S,
     OVERPASS_RETRY_WINDOW_CEILING_S,
     OverpassRetryPolicy,
     RetriesExhausted,
@@ -865,3 +867,21 @@ def test_an_unclamped_production_dispatch_carries_the_configured_window(tmp_path
         estimated_requests=0,
     )
     assert _policy_in(seen["cmd"]) == _NON_DEFAULT
+
+
+def test_the_request_timeout_here_is_the_one_osmnx_uses():
+    """`overpass_retry` carries its own copies of the request timeout and the
+    per-attempt slack, because the SCHEDULER sizes a child's window against them
+    (`policy_for_child_timeout`) and must never import osmnx. A mirror that
+    drifts hands every clamped child a window its timeout cannot hold, silently
+    -- the same hazard `download_common`'s copy of the Overpass endpoint has,
+    and pinned the same way."""
+    assert OVERPASS_REQUEST_TIMEOUT_S == dsn.OVERPASS_TIMEOUT_S
+    assert OVERPASS_REQUEST_TIMEOUT_S == dsn.ox.settings.requests_timeout
+    assert dsn.OVERPASS_ATTEMPT_SLACK_S is OVERPASS_ATTEMPT_SLACK_S, "one slack, not two"
+    assert OVERPASS_FINAL_ATTEMPT_RESERVE_S == OVERPASS_REQUEST_TIMEOUT_S + OVERPASS_ATTEMPT_SLACK_S
+    # And the deadline is the window ceiling plus exactly that reserve, which is
+    # what makes "no attempt starts past the window" mean "one full attempt fits".
+    assert dsn.OVERPASS_DEADLINE_S == int(
+        OVERPASS_RETRY_WINDOW_CEILING_S + OVERPASS_FINAL_ATTEMPT_RESERVE_S
+    )
