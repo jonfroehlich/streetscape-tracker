@@ -9,10 +9,15 @@ provider importing from another's module.
 
 import argparse
 import asyncio
+import contextlib
 import math
 import os
 import random
 import re
+import secrets
+import socket
+import threading
+import urllib.parse
 from collections.abc import Callable, Iterator
 from datetime import datetime
 
@@ -116,7 +121,7 @@ SERIAL_WALK_PROVIDERS = frozenset({"kartaview"})
 # which hands these to osmnx) and by the scheduler's breaker re-check below,
 # which must NOT import osmnx: the scheduler is a long-lived parent process
 # under a cgroup memory cap, and osmnx drags in geopandas/shapely for what is,
-# here, one GET of a text endpoint. Keeping the strings in one place is what
+# here, one tiny interpreter query (#356). Keeping the strings in one place is what
 # lets the probe stay indistinguishable from the query it speaks for.
 #
 # DEFAULT_OVERPASS_URL must equal osmnx's own `settings.overpass_url` default;
@@ -133,28 +138,48 @@ OVERPASS_URL_ENV = "OVERPASS_URL"
 OVERPASS_USER_AGENT = "streetscape_metadata_tracker (jonf@cs.uw.edu)"
 OVERPASS_REFERER = "https://github.com/jonfroehlich/streetscape-tracker"
 
-# What a serving /status looks like. overpass-api.de answers, per calling IP::
+# osmnx's own `settings.http_accept_language` default, restated here so the
+# re-check can build osmnx's exact header set without importing osmnx.
+# download_street_network.py assigns it to osmnx explicitly, as it does the
+# two strings above, and tests/test_overpass.py pins that `overpass_headers()`
+# EQUALS `ox._http._get_http_headers()` -- the builder every osmnx Overpass
+# request goes through.
+OVERPASS_ACCEPT_LANGUAGE = "en"
+
+# The breaker's reset test is an INTERPRETER query, not a /status read (issue
+# #356). On 2026-09-21 a /status-based test cleared the breaker twice and the
+# very next real query was refused both times, 4 and 39 minutes later. /status
+# is a separate, unmetered code path that answered while /interpreter refused
+# us -- and overpass-api.de is more than one backend -- so a clean status was
+# never evidence that the thing a walk needs would work.
 #
-#     Connected as: 403941390
-#     Current time: 2026-09-15T14:02:11Z
-#     Announced endpoint: none
-#     Rate limit: 2
-#     2 slots available now.
+# The query is the cheapest the query engine can be asked that still takes the
+# path a walk takes -- a slot from the per-IP dispatcher and a database read --
+# and it proves it EXECUTED:
 #
-# or, with both of our slots in use, `Slot available after: <ts>, in N seconds.`
-# Either line means the instance knows this IP and is prepared to serve it; a
-# queued slot is the normal state of a working night (osmnx sleeps it off).
+#   * `[timeout:5][maxsize:1048576]` declares 5 s and 1 MiB instead of the
+#     180 s / 512 MiB defaults. Overpass admits a query only if its declared
+#     needs fit the remaining resources, so a small declaration costs the
+#     shared instance almost nothing.
+#   * `node(1);out ids;` is one id-index lookup that returns one id: a database
+#     read, not a scan. Node 1 is NOT required in the answer, so its deletion
+#     some day cannot make the probe fail closed forever.
+#   * `make probe nonce="...";out;` echoes a fresh random token back as an
+#     element. Requiring it makes the answer unforgeable by anything that is
+#     not an interpreter running THIS query: a captive portal, a cached body,
+#     an error page served with a 200, an empty `elements` list.
 #
-# An instance that enforces no per-IP limit reports `Rate limit: 0` and no
-# slots line at all -- the shape of the mirrors an operator points OVERPASS_URL
-# at during an incident (issue #209). That is a positive signal too (the
-# instance is telling this IP it is unlimited), and without it the breaker
-# could never clear on exactly the endpoint chosen because the main one was
-# refusing us. Any other `Rate limit: N` still needs a slots line, since on
-# a limited instance the slots line is where a refusal would show.
-_OVERPASS_SLOTS_LINE = re.compile(
-    r"\d+ slots? available now|Slot available after: |^Rate limit: 0\s*$", re.MULTILINE
+# Measured once from a laptop on 2026-09-22 (not from a production host):
+# HTTP 200, application/json, 278 bytes gzipped, `elements` holding the node-1
+# id and the probe element carrying the nonce.
+OVERPASS_PROBE_QUERY = (
+    '[out:json][timeout:5][maxsize:1048576];node(1);out ids;make probe nonce="{nonce}";out;'
 )
+# Read timeout for the probe. Overpass holds a request for up to 15 s waiting
+# for one of the caller's slots before answering 429 (overpass-doc,
+# "Commons"), and the query may then run up to its declared 5 s; 25 s clears
+# both, so a queued-then-served probe is not misread as a timeout.
+OVERPASS_PROBE_TIMEOUT_S = 25.0
 
 
 def overpass_url() -> str:
@@ -162,9 +187,32 @@ def overpass_url() -> str:
     return os.environ.get(OVERPASS_URL_ENV) or DEFAULT_OVERPASS_URL
 
 
-def overpass_serving(url: str | None = None, *, timeout_s: float = 15.0) -> bool:
+def overpass_headers() -> dict[str, str]:
     """
-    Is Overpass positively serving this host right now? (issue #341)
+    The headers osmnx sends on every Overpass request, built without osmnx.
+
+    Mirrors ``osmnx._http._get_http_headers()``: ``requests``' defaults with
+    the User-Agent, ``referer`` and Accept-Language osmnx is configured with
+    (download_street_network.py assigns it the same three constants). The
+    User-Agent is load-bearing, not a courtesy: overpass-api.de answers HTTP
+    406 to the stock ``python-requests`` one (measured 2026-08-15).
+    """
+    headers = dict(requests.utils.default_headers())
+    headers.update(
+        {
+            "User-Agent": OVERPASS_USER_AGENT,
+            "referer": OVERPASS_REFERER,
+            "Accept-Language": OVERPASS_ACCEPT_LANGUAGE,
+        }
+    )
+    return headers
+
+
+def overpass_serving(
+    url: str | None = None, *, timeout_s: float = OVERPASS_PROBE_TIMEOUT_S
+) -> bool:
+    """
+    Is Overpass positively serving this host's QUERIES right now? (#341, #356)
 
     The scheduler's breaker RESET test, and the mirror image of
     ``download_street_network._overpass_refusing``, which is the pre-flight.
@@ -173,34 +221,129 @@ def overpass_serving(url: str | None = None, *, timeout_s: float = 15.0) -> bool
 
     * The pre-flight is **fail-open** — anything it cannot read as a refusal
       means "proceed", because a false alarm there skips a healthy city.
-    * This is **fail-closed** — only an HTTP 200 whose body carries a
-      parseable slots line (or ``Rate limit: 0``, an unlimited instance's way
-      of saying the same) returns True. Unreachable, a timeout, a 5xx from a
-      front end, a 406, an empty or unfamiliar body: all False, and the breaker
+    * This is **fail-closed** — True only when the interpreter answered
+      :data:`OVERPASS_PROBE_QUERY` with HTTP 200 and a JSON object that has no
+      ``remark`` (where Overpass reports a runtime error, under a 200) and does
+      have the ``probe`` element echoing THIS call's nonce. Connection refused,
+      a timeout, 429 (no slot within 15 s), 403, 406, any 5xx, a non-JSON or
+      unfamiliar body, a missing or stale nonce: all False, and the breaker
       stays latched.
 
-    Why the asymmetry matters: the one confirmed abuse ban (2026-08-14)
-    presented as a **TCP connection refused** on :443, not as a 403. A reset
-    test that read "unreachable" as "not refusing" would clear the breaker into
-    a live ban, and the next real fetch would then spend 3–8 minutes inside the
-    host lock re-tripping it. Requiring a positive signal is what makes a
-    re-check safe to run on a cooldown.
+    Why fail-closed: the one confirmed abuse ban (2026-08-14) presented as a
+    **TCP connection refused** on :443, not as a 403. A reset test that read
+    "unreachable" as "not refusing" would clear the breaker into a live ban.
 
-    One request, no retries, ``requests`` defaults apart from the timeout and
-    our identifying headers. ``/status`` is unmetered.
+    Why the interpreter and not ``/status`` (issue #356): the ``/status`` test
+    was fail-closed and correct as written, and still cleared twice on
+    2026-09-21 into a host that refused the next real query. This one asks the
+    endpoint a walk asks, with osmnx's method (a POST of ``data=``) and
+    osmnx's headers, so the thing measured is the thing that has to work. It
+    deliberately reads no slots line as well: a 200 here means a slot WAS
+    granted, stronger evidence than any status line, and a second request
+    could only add a way to be wrong.
+
+    It also connects the way osmnx does: to the single IPv4 address
+    ``socket.gethostbyname`` returns for the host (see :func:`_pinned_like_osmnx`).
+    What no probe can promise is that the next child resolves the host to the
+    same backend -- that is its own DNS lookup, in its own process.
+
+    One request, no retries. Unlike ``/status`` this request is metered, which
+    is why the query is as small as the engine allows; the breaker spends at
+    most ``scheduler.HOST_RECHECKS_PER_NIGHT`` of them a night.
+
+    ``timeout_s`` is ``requests``' timeout, i.e. a ceiling on the connect and
+    on each read, not on the whole call -- and the DNS lookup ahead of them
+    (see :func:`_pinned_like_osmnx`) takes no timeout at all. So it bounds the
+    usual case, not the worst one; the scheduler's per-night cap is what
+    bounds the worst one.
     """
     base = (url or overpass_url()).rstrip("/")
+    nonce = secrets.token_hex(6)
     try:
-        response = requests.get(
-            f"{base}/status",
-            timeout=timeout_s,
-            headers={"User-Agent": OVERPASS_USER_AGENT, "Referer": OVERPASS_REFERER},
-        )
+        with _pinned_like_osmnx(base):
+            response = requests.post(
+                f"{base}/interpreter",
+                data={"data": OVERPASS_PROBE_QUERY.format(nonce=nonce)},
+                timeout=timeout_s,
+                headers=overpass_headers(),
+            )
+        if response.status_code != 200:
+            return False
+        body = response.json()
     except Exception:  # noqa: BLE001 - fail closed by contract; see docstring
         return False
-    if response.status_code != 200:
+    return _probe_executed(body, nonce)
+
+
+# Serializes the ``socket.getaddrinfo`` patch below. See its docstring: the
+# patch is a process global, so two of them at once would leak the wrapper.
+_PIN_LOCK = threading.Lock()
+
+
+@contextlib.contextmanager
+def _pinned_like_osmnx(base_url: str):
+    """
+    Resolve the Overpass host the way a walk's fetch does, for this block only.
+
+    Before every query osmnx calls ``_http._config_dns``, which resolves the
+    host with ``socket.gethostbyname`` -- ONE address, and always IPv4 -- and
+    patches ``socket.getaddrinfo`` so the request goes there. Its docstring
+    gives the reason: overpass-api.de fronts more than one server (it names
+    gall and lambert), and a status check and a query can otherwise land on
+    different ones. Plain ``requests`` instead takes whatever ``getaddrinfo``
+    prefers, which on a dual-stack host can be IPv6; Overpass identifies a
+    client by its full IPv4 address or its IPv6 /64 (overpass-doc,
+    "Commons"), so an IPv6 probe could be asking about a different client
+    than the IPv4 one the walk is refused as.
+
+    Scoped, unlike osmnx's permanent patch, because the scheduler is a
+    long-lived parent: the original ``getaddrinfo`` is restored on exit, and
+    only this hostname is redirected.
+
+    **Patching a module global is only safe while the patches cannot overlap**,
+    and today they cannot: the sole caller is ``overpass_serving``, which the
+    breaker calls from ``HostBreaker._maybe_recheck`` on the scheduler's main
+    launch thread (a lane's work happens in a subprocess, which does not
+    inherit this process's patch). Two overlapping pins would leak the wrapper
+    for good -- the second saves the first's wrapper as "the original" and puts
+    it back -- so ``_PIN_LOCK`` makes the assumption structural rather than
+    documentary. It is a plain lock, so this must never be nested.
+
+    Two deliberate differences from osmnx, both fail-closed: a lookup failure
+    raises here (osmnx falls back to DNS-over-HTTPS), and the caller turns that
+    into "not serving" rather than reaching for a second resolver to clear a
+    breaker with; and ``socket.gethostbyname`` honours no timeout argument, so
+    the probe's ``timeout_s`` does not bound it -- the resolver's own does.
+    """
+    hostname = urllib.parse.urlsplit(base_url).hostname
+    with _PIN_LOCK:
+        ip = socket.gethostbyname(hostname)
+        original = socket.getaddrinfo
+
+        def _getaddrinfo(host, *args, **kwargs):
+            return original(ip if host == hostname else host, *args, **kwargs)
+
+        socket.getaddrinfo = _getaddrinfo
+        try:
+            yield ip
+        finally:
+            socket.getaddrinfo = original
+
+
+def _probe_executed(body, nonce: str) -> bool:
+    """True only for an interpreter answer that ran this call's probe cleanly."""
+    if not isinstance(body, dict) or "remark" in body:
         return False
-    return bool(_OVERPASS_SLOTS_LINE.search(response.text or ""))
+    elements = body.get("elements")
+    if not isinstance(elements, list):
+        return False
+    return any(
+        isinstance(element, dict)
+        and element.get("type") == "probe"
+        and isinstance(element.get("tags"), dict)
+        and element["tags"].get("nonce") == nonce
+        for element in elements
+    )
 
 
 class HostUnavailableError(DownloadError):

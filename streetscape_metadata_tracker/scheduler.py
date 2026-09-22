@@ -242,16 +242,19 @@ CHANNEL_HOSTS: dict[str, tuple[str, ...]] = {
 # refusals took to clear and is far longer than any pacing interval here; the
 # cap of 4 bounds a night's re-checks to the first three hours after a trip
 # (the two measured clears fell inside that) and bounds how many real fetches
-# a host that answers /status but refuses /interpreter could cost -- each
-# re-trip is a 3-8 minute fetch inside the host lock.
+# a false clear could cost -- each re-trip is a 3-8 minute fetch inside the
+# host lock. That is not hypothetical: on 2026-09-21 the original /status
+# reset test cleared twice into a host that refused the next real query, which
+# is why the test now asks /interpreter itself (issue #356).
 HOST_RECHECK_COOLDOWN_S = 45 * 60
 HOST_RECHECKS_PER_NIGHT = 4
 
 # host -> zero-argument predicate answering "is this host positively serving
 # this IP right now?". FAIL-CLOSED by contract: the predicate returns True only
-# on a positive signal (for Overpass, an HTTP 200 from /status with a
-# parseable slots line) and False on anything else -- unreachable, a timeout,
-# a 5xx, an unfamiliar body. Do NOT reuse the fetch's advisory pre-flight
+# on a positive signal (for Overpass, a tiny /interpreter query answered 200
+# with the random nonce it asked to have echoed, issue #356) and False on
+# anything else -- unreachable, a timeout, a 429/403/406/5xx, a runtime-error
+# remark, an unfamiliar body. Do NOT reuse the fetch's advisory pre-flight
 # (`download_street_network._overpass_refusing`) here: that one is fail-OPEN
 # on purpose, and the one confirmed abuse ban (2026-08-14) presented as a TCP
 # connection refused, which a fail-open test reads as "not refusing".
@@ -266,8 +269,10 @@ HOST_RECHECKS_PER_NIGHT = 4
 # open file description and is not inherited across subprocess.run, so a
 # parent holding it would make every child's timeout=0 acquire fail (issue
 # #208; a source-inspection test pins that this module never imports the lock
-# module). /status is unmetered, so an overlap with a child's query costs
-# nothing on the provider side.
+# module). Since #356 the re-check is a metered query, not an unmetered /status
+# GET, so an overlap with some other process's Overpass query is possible in
+# principle; it would hold one of this IP's two slots for the probe's own run time
+# (declared ceiling 5 s and 1 MiB), at most HOST_RECHECKS_PER_NIGHT times.
 HOST_RECHECKS: dict[str, Callable[[], bool]] = {
     HOST_OVERPASS: overpass_serving,
 }
@@ -303,8 +308,10 @@ class HostBreaker(set):
     ``Done:`` line and the alert name them (issue #341).
 
     A due re-check runs on the launch pass, i.e. the main thread, and holds it
-    for up to the predicate's timeout (15 s) -- at most ``max_rechecks`` times
-    a night. Lanes are unaffected: their bodies are subprocesses that keep
+    for the probe's duration -- normally bounded by its 25 s
+    ``OVERPASS_PROBE_TIMEOUT_S``, though that is ``requests``' per-connect and
+    per-read timeout rather than a total, and the DNS lookup before it has
+    none -- at most ``max_rechecks`` times a night. Lanes are unaffected: their bodies are subprocesses that keep
     running while this thread waits.
 
     ``clock`` is injectable so a test can move time without sleeping. The

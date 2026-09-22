@@ -143,5 +143,6 @@ This is the one script in `scripts/` that makes provider requests, and it is dry
 There is no timer for it yet; scheduling it is a pacing decision to take against the Overpass usage policy first (CLAUDE.md, READ THIS FIRST).
 
 **Recovering cities a refusal already stranded.**
-The alert names them, with the command: `scheduler run-due --provider gsv_streets --limit N` (or the Mapillary/KartaView walk channel) once Overpass is confirmed serving prod — `curl -A "streetscape_metadata_tracker (jonf@cs.uw.edu)" https://overpass-api.de/api/status` from the host must answer 200 with a slots line, the same test the breaker's re-check applies.
+The alert names them, with the command: `scheduler run-due --provider gsv_streets --limit N` (or the Mapillary/KartaView walk channel) once Overpass is confirmed serving prod — `python -c "from streetscape_metadata_tracker.download_common import overpass_serving; print(overpass_serving())"` from the checkout on the host must print `True`, which is the breaker's own re-check: one tiny, metered `/api/interpreter` query sent the way a walk sends it (#356).
+A `curl .../api/status` answering 200 with a slots line is **not** that test — on 2026-09-21 `/status` said serving twice while the next real query was refused.
 Their walks will carry a later date than their grid runs, so they stay un-paired either way; a filtered run advances only the named channel's clock.
