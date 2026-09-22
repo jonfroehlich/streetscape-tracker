@@ -29,4 +29,3 @@ geopandas>=0.14
 shapely>=2.0
 networkx>=3.0
 rtree>=1.0
-tenacity>=8.0

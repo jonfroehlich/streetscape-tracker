@@ -740,3 +740,15 @@ min_connection_limit = 5
 # publish rsync never sees it. See config/scheduler.toml for field docs.
 enabled = true
 archive_dir = "/projects/makeabilitylab/streetscape-tracker/archive/gsv_driving_plan"
+
+[overpass]
+# The Overpass fetch's retry window (issue #357) -- the repo defaults, spelled
+# out so production's value is read here rather than inferred. ~7.5-9.5 min
+# before a walk gives up on a refusing Overpass and exits 76. See
+# config/scheduler.toml for field docs and the enforced 30 s floor / 600 s
+# ceiling.
+retry_max_attempts = 5
+retry_initial_wait_s = 30.0
+retry_max_wait_s = 240.0
+retry_jitter = 0.25
+retry_window_s = 600.0

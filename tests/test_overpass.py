@@ -77,9 +77,9 @@ def test_we_identify_ourselves_to_overpass():
 
 
 def test_only_transport_faults_are_retried():
-    policy = dsn._download_graph.retry
-    assert policy.reraise is True, "callers must see the real error, not RetryError"
-    retryable = policy.retry.exception_types
+    """The predicate is unchanged by #357, which widened HOW LONG, not WHAT.
+    The schedule itself is pinned in tests/test_overpass_retry.py."""
+    retryable = dsn._RETRYABLE_OVERPASS
     assert requests.exceptions.ConnectionError in retryable
     assert requests.exceptions.Timeout in retryable
     # A settled answer must not be re-asked: three attempts bought three
@@ -97,11 +97,11 @@ def test_a_permanent_error_is_attempted_exactly_once(monkeypatch):
 
     monkeypatch.setattr(dsn.ox, "graph_from_bbox", boom)
     with pytest.raises(InsufficientResponseError):
-        dsn._download_graph((0, 0, 1, 1), "drive")
+        dsn._download_graph_retrying((0, 0, 1, 1), "drive", dsn.OverpassRetryPolicy())
     assert len(calls) == 1
 
 
-def test_a_transport_fault_is_retried_then_reraised_as_itself(monkeypatch):
+def test_a_transport_fault_is_retried_and_its_cause_survives(monkeypatch):
     calls = []
 
     def boom(**kwargs):
@@ -109,11 +109,14 @@ def test_a_transport_fault_is_retried_then_reraised_as_itself(monkeypatch):
         raise requests.exceptions.ConnectionError("refused")
 
     monkeypatch.setattr(dsn.ox, "graph_from_bbox", boom)
-    monkeypatch.setattr(dsn._download_graph.retry, "sleep", lambda s: None)
-    # reraise=True: the caller sees ConnectionError, NOT tenacity.RetryError.
-    with pytest.raises(requests.exceptions.ConnectionError):
-        dsn._download_graph((0, 0, 1, 1), "drive")
-    assert len(calls) == 3
+    # conftest's autouse stub makes the waits no-ops and the clock never moves,
+    # so the attempt cap is what binds here.
+    with pytest.raises(HostBlockedError) as excinfo:
+        dsn._download_graph_named((0, 0, 1, 1), "drive")
+    assert len(calls) == dsn.OverpassRetryPolicy().max_attempts
+    # The real exception is one hop away, never a tenacity-style RetryError.
+    assert isinstance(excinfo.value.__cause__, requests.exceptions.ConnectionError)
+    assert "RetryError" not in str(excinfo.value)
 
 
 # ---------------------------------------------------------------------------
@@ -125,7 +128,9 @@ def test_a_refused_connection_is_named_a_host_block(monkeypatch):
     monkeypatch.setattr(
         dsn,
         "_download_graph",
-        lambda bbox, nt: (_ for _ in ()).throw(requests.exceptions.ConnectionError("refused")),
+        lambda bbox, nt, *rest: (_ for _ in ()).throw(
+            requests.exceptions.ConnectionError("refused")
+        ),
     )
     with pytest.raises(HostBlockedError) as excinfo:
         dsn._download_graph_named((0, 0, 1, 1), "drive")
@@ -142,7 +147,7 @@ def test_a_ban_page_is_a_host_block(monkeypatch):
     monkeypatch.setattr(
         dsn,
         "_download_graph",
-        lambda bbox, nt: (_ for _ in ()).throw(ResponseStatusCodeError("403 Forbidden")),
+        lambda bbox, nt, *rest: (_ for _ in ()).throw(ResponseStatusCodeError("403 Forbidden")),
     )
     with pytest.raises(HostBlockedError) as excinfo:
         dsn._download_graph_named((0, 0, 1, 1), "drive")
@@ -158,7 +163,7 @@ def test_an_empty_bbox_is_a_city_failure_not_a_host_block(monkeypatch):
     monkeypatch.setattr(
         dsn,
         "_download_graph",
-        lambda bbox, nt: (_ for _ in ()).throw(InsufficientResponseError("no ways")),
+        lambda bbox, nt, *rest: (_ for _ in ()).throw(InsufficientResponseError("no ways")),
     )
     with pytest.raises(DownloadError) as excinfo:
         dsn._download_graph_named((0, 0, 1, 1), "drive")
@@ -266,8 +271,8 @@ def test_the_probe_never_fails_a_healthy_fetch(monkeypatch):
 
 
 def test_a_refusing_probe_stops_the_fetch_before_any_query(monkeypatch, tmp_path):
-    """The point of the pre-flight: name it in ~1s instead of after three
-    timing-out attempts, having issued nothing."""
+    """The point of the pre-flight: name it in ~1s instead of after the whole
+    retry window (issue #357), having issued nothing."""
     from tests.test_host_lock import _city_row
 
     queried = []
@@ -304,7 +309,7 @@ def test_a_stray_socket_timeout_is_not_reported_as_a_hang(monkeypatch):
     monkeypatch.setattr(
         dsn,
         "_download_graph",
-        lambda bbox, nt: (_ for _ in ()).throw(TimeoutError("socket timed out")),
+        lambda bbox, nt, *rest: (_ for _ in ()).throw(TimeoutError("socket timed out")),
     )
     # Not swallowed into a misleading HostBlockedError — it propagates as itself.
     with pytest.raises(TimeoutError) as excinfo:
@@ -313,10 +318,17 @@ def test_a_stray_socket_timeout_is_not_reported_as_a_hang(monkeypatch):
 
 
 def test_the_deadline_bound_clears_the_worst_legitimate_fetch():
-    """Three tenacity attempts, each a full request timeout plus osmnx's own
-    pre-request slot pause. Derived, so lowering OVERPASS_TIMEOUT_S can't
-    silently leave the bound below the thing it has to clear."""
-    assert dsn.OVERPASS_DEADLINE_S > 3 * dsn.OVERPASS_TIMEOUT_S
+    """The longest retry window a policy may configure, then one full final
+    attempt (a request timeout plus osmnx's pre-request slot pause). Derived,
+    so neither raising the window ceiling nor the request timeout can silently
+    leave the bound below the thing it has to clear (issue #357) -- and the
+    900 s outer limit #357 was asked to keep is still the number."""
+    from streetscape_metadata_tracker.overpass_retry import OVERPASS_RETRY_WINDOW_CEILING_S
+
+    assert dsn.OVERPASS_DEADLINE_S >= (
+        OVERPASS_RETRY_WINDOW_CEILING_S + dsn.OVERPASS_TIMEOUT_S + dsn.OVERPASS_ATTEMPT_SLACK_S
+    )
+    assert dsn.OVERPASS_DEADLINE_S == 900
 
 
 def test_the_deadline_interrupts_a_blocking_call():
@@ -388,7 +400,7 @@ def test_a_mirror_url_can_be_set_without_restarting(monkeypatch, tmp_path):
 
     graph = nx.MultiDiGraph()
     graph.add_edge(1, 2)
-    monkeypatch.setattr(dsn, "_download_graph_named", lambda bbox, nt: graph)
+    monkeypatch.setattr(dsn, "_download_graph_named", lambda bbox, nt, policy=None: graph)
     monkeypatch.setattr(dsn.ox, "save_graphml", lambda g, p: open(p, "w").close())
     monkeypatch.setattr(ox.settings, "overpass_url", "https://overpass-api.de/api")
 
@@ -459,7 +471,8 @@ def test_the_reset_test_stays_closed_on_every_non_200(monkeypatch, code):
 def test_the_reset_test_stays_closed_when_unreachable(monkeypatch):
     """The 2026-08-14 ban signature. A reset test that read this as 'not
     refusing' would clear the breaker straight into a live ban, and the next
-    real fetch would spend 3-8 minutes inside the host lock re-tripping it."""
+    real fetch would spend its whole retry window (issue #357) inside the host
+    lock re-tripping it."""
 
     def refused(*a, **k):
         raise requests.exceptions.ConnectionError("[Errno 111] Connection refused")
@@ -504,7 +517,7 @@ def test_a_frozen_network_is_written_atomically(monkeypatch, tmp_path):
 
     graph = nx.MultiDiGraph()
     graph.add_edge(1, 2)
-    monkeypatch.setattr(dsn, "_download_graph_named", lambda bbox, nt: graph)
+    monkeypatch.setattr(dsn, "_download_graph_named", lambda bbox, nt, policy=None: graph)
     city = _city_row()
     final = dsn.network_cache_path(city.city_id, str(tmp_path))
 

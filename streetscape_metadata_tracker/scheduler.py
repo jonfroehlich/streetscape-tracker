@@ -120,6 +120,7 @@ from .naming import (
     network_cache_path,
     streetwalk_coverage_filename,
 )
+from .overpass_retry import OverpassRetryPolicy, overpass_retry_argv
 from .walk_diff import compute_and_record_walk_diff
 
 # Isolated street-coverage collection channels (issue #99). These ARE scheduled
@@ -243,7 +244,8 @@ CHANNEL_HOSTS: dict[str, tuple[str, ...]] = {
 # cap of 4 bounds a night's re-checks to the first three hours after a trip
 # (the two measured clears fell inside that) and bounds how many real fetches
 # a host that answers /status but refuses /interpreter could cost -- each
-# re-trip is a 3-8 minute fetch inside the host lock.
+# re-trip is a fetch that spends its whole [overpass] retry window inside the
+# host lock (~7.5 min by default since #357, never past the 900 s deadline).
 HOST_RECHECK_COOLDOWN_S = 45 * 60
 HOST_RECHECKS_PER_NIGHT = 4
 
@@ -894,6 +896,10 @@ class SchedulerConfig:
     resource_guard: ResourceGuardConfig = field(default_factory=ResourceGuardConfig)
     # [driving_plan] — nightly driving-plan feed snapshot (issue #176)
     driving_plan: DrivingPlanConfig = field(default_factory=DrivingPlanConfig)
+    # [overpass] — how long a cold road walk keeps asking a refusing Overpass
+    # before it exits 76 and trips the breaker (issue #357). Handed to every
+    # walk child on its argv by _street_collect_cmd; see overpass_retry.py.
+    overpass_retry: OverpassRetryPolicy = field(default_factory=OverpassRetryPolicy)
 
     def __post_init__(self):
         if not self.db_path:
@@ -1055,6 +1061,54 @@ def _lane_count(sched: dict, config_path) -> int:
         )
         return 1
     return value
+
+
+# `[overpass]` key -> OverpassRetryPolicy field. The TOML names carry a
+# `retry_` prefix because the table is named for the HOST, and a later knob
+# about Overpass that is not about retrying should not have to rename these.
+_OVERPASS_RETRY_KEYS = {
+    "retry_max_attempts": "max_attempts",
+    "retry_initial_wait_s": "initial_wait_s",
+    "retry_max_wait_s": "max_wait_s",
+    "retry_jitter": "jitter",
+    "retry_window_s": "window_s",
+}
+
+
+def _overpass_retry(table: dict, config_path) -> OverpassRetryPolicy:
+    """Read ``[overpass]`` into an :class:`OverpassRetryPolicy` (issue #357).
+
+    Same warn-and-fall-back posture as :func:`_lane_count`: one bad key must not
+    take down every subcommand, including the incident-time handles. The whole
+    table falls back to the defaults rather than keeping the valid keys,
+    because the fields constrain each other (``max_wait_s >= initial_wait_s``)
+    and a half-applied policy is a schedule nobody wrote down. The defaults are
+    the conservative direction in any case: every one of them respects the
+    usage policy's 30 s floor and fits inside the fetch's 900 s deadline.
+
+    An unknown key is warned about and ignored rather than failing the table —
+    it is most likely a typo of a real one, and the warning names the real ones.
+    """
+    if not isinstance(table, dict):
+        logger.warning(f"[overpass] in {config_path} is not a table; using the defaults")
+        return OverpassRetryPolicy()
+    kwargs = {}
+    for key, value in table.items():
+        if key not in _OVERPASS_RETRY_KEYS:
+            logger.warning(
+                f"Ignoring unknown key [overpass].{key} in {config_path} "
+                f"(known: {', '.join(sorted(_OVERPASS_RETRY_KEYS))})"
+            )
+            continue
+        kwargs[_OVERPASS_RETRY_KEYS[key]] = value
+    try:
+        return OverpassRetryPolicy(**kwargs)
+    except ValueError as e:
+        logger.warning(
+            f"[overpass] in {config_path} is not a usable retry policy ({e}); using the "
+            f"defaults: {OverpassRetryPolicy()}"
+        )
+        return OverpassRetryPolicy()
 
 
 def _refresh_slots(sched: dict, config_path) -> int | None:
@@ -1240,6 +1294,7 @@ def load_scheduler_config(path: str | None = None) -> SchedulerConfig:
             url=dp.get("url", driving_plan.FEED_URL),
             timeout_s=dp.get("timeout_s", 60.0),
         ),
+        overpass_retry=_overpass_retry(raw.get("overpass", {}), config_path),
     )
 
 
@@ -5335,6 +5390,11 @@ def _street_collect_cmd(
         str(max(0, daily_budget)),
         "--log-level",
         "INFO",
+        # Every walk may be the one that goes to Overpass for its network, so
+        # every walk carries the [overpass] retry policy (issue #357) -- passed
+        # whole and explicitly, so the child never silently runs its own
+        # defaults in place of the configured ones.
+        *overpass_retry_argv(cfg.overpass_retry),
     ]
     if channel == "gsv_streets":
         # `is not None`, not `or`: 0 is documented as "disable pacing", and a

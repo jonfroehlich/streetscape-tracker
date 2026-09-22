@@ -198,7 +198,15 @@ def run_prefreeze(
             ", ".join(channels),
         )
         try:
-            fetch_graph(city, cfg.data_dir, network_type=network_type, conn=conn)
+            fetch_graph(
+                city,
+                cfg.data_dir,
+                network_type=network_type,
+                conn=conn,
+                # The same [overpass] window a nightly walk uses (issue #357):
+                # this pass is the same talker to the same host, earlier.
+                overpass_retry=cfg.overpass_retry,
+            )
         except HostUnavailableError as e:
             # Blocked or busy: the same exit code a collection child would
             # give, and the same reason to stop -- asking again cannot answer

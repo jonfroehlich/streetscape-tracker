@@ -672,6 +672,23 @@ def _no_overpass_status_probe(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_overpass_retry_sleep(monkeypatch):
+    """
+    Never really sleep out the Overpass retry backoff (issue #357).
+
+    The default policy waits 30 s, then 60, 120 and 240 between attempts, so any
+    street test whose stubbed fetch raises a transport fault would otherwise
+    spend minutes asleep. A no-op keeps every attempt; the clock does not move,
+    so the window never binds and a test that wants to measure the schedule
+    installs its own fake clock and sleep (see tests/test_overpass_retry.py),
+    which runs after this fixture and so wins.
+    """
+    from streetscape_street_analyzer import download_street_network as dsn
+
+    monkeypatch.setattr(dsn, "_retry_sleep", lambda seconds: None)
+
+
+@pytest.fixture(autouse=True)
 def _no_host_recheck_probe(monkeypatch):
     """
     Pin every breaker re-check (issue #341) to "still refusing" for the suite.

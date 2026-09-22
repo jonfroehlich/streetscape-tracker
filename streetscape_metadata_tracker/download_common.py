@@ -182,8 +182,9 @@ def overpass_serving(url: str | None = None, *, timeout_s: float = 15.0) -> bool
     Why the asymmetry matters: the one confirmed abuse ban (2026-08-14)
     presented as a **TCP connection refused** on :443, not as a 403. A reset
     test that read "unreachable" as "not refusing" would clear the breaker into
-    a live ban, and the next real fetch would then spend 3–8 minutes inside the
-    host lock re-tripping it. Requiring a positive signal is what makes a
+    a live ban, and the next real fetch would then spend its whole retry window
+    (~7.5 min by default since issue #357, at most the 900 s deadline) inside
+    the host lock re-tripping it. Requiring a positive signal is what makes a
     re-check safe to run on a cooldown.
 
     One request, no retries, ``requests`` defaults apart from the timeout and

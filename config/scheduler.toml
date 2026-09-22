@@ -752,3 +752,38 @@ enabled = true
 #archive_dir = "archive/gsv_driving_plan"   # default: <repo>/archive/gsv_driving_plan
 #url = "https://www.google.com/streetview/static/feed/driving/data.json"
 #timeout_s = 60.0
+
+[overpass]
+# How long a road walk's street-network fetch keeps asking a refusing Overpass
+# before it gives up, exits 76 and trips the night-level breaker (issue #357).
+# Overpass is a HOST, not a [providers.*] channel: every walk channel (and the
+# daytime scripts/prefreeze_street_networks.py pass) fetches its network from
+# the same per-IP instance, so one policy covers them all and the scheduler
+# hands it to every walk child as --overpass-retry-* flags.
+#
+# Only transport faults (connection refused/reset, timeout) are retried, and
+# every one waits on the same schedule: a bare ECONNREFUSED is both a
+# minutes-long flap and the 2026-08-14 abuse ban, and only duration tells them
+# apart (#341). A settled answer (406, a ban page, an empty bbox) is asked once.
+#
+# Failure k is followed by min(retry_max_wait_s, retry_initial_wait_s * 2^(k-1)),
+# stretched by up to retry_jitter (upward only). The fetch stops at
+# retry_max_attempts, or rather than start a wait that would END more than
+# retry_window_s after its first attempt began -- whichever comes first. The
+# defaults below give up after ~7.5-9.5 min (4 attempts when osmnx's 60 s
+# status-fallback pause precedes each, 5 when it does not).
+#
+# Enforced, not advisory: retry_initial_wait_s >= 30 (the Overpass usage
+# policy's pause after a refusal) and retry_window_s <= 600 (the fetch's 900 s
+# deadline must still cover one full final attempt). An invalid table is
+# warned about and replaced by these defaults WHOLE.
+#
+# Cost: the Overpass host lock is held for the window, and the breaker trips
+# at most 1 + 4 re-checks = 5 times a night, so <= ~40 min of a walk lane's
+# wall clock on a night that refuses throughout. See docs/provider-access.md,
+# "(6) The retry window spans minutes, not seconds".
+retry_max_attempts = 5
+retry_initial_wait_s = 30.0
+retry_max_wait_s = 240.0
+retry_jitter = 0.25
+retry_window_s = 600.0

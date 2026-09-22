@@ -144,6 +144,10 @@ from streetscape_metadata_tracker.naming import (
     network_cache_path,
     streetwalk_coverage_filename,
 )
+from streetscape_metadata_tracker.overpass_retry import (
+    add_overpass_retry_arguments,
+    overpass_retry_from_args,
+)
 from streetscape_metadata_tracker.paths import get_default_data_dir
 from streetscape_metadata_tracker.walk_diff import compute_and_record_walk_diff
 
@@ -343,6 +347,15 @@ def run_collect(args: argparse.Namespace) -> int:
     data_dir = args.data_dir
     provider = args.provider
     budget_channel = STREET_BUDGET_CHANNELS[provider]
+    # Validated before anything touches the catalog or the network. The
+    # scheduler only ever passes a policy its own loader accepted, so this
+    # refuses a hand-typed flag -- e.g. a wait under the usage policy's 30 s
+    # floor -- with the same exit argparse gives any other bad flag.
+    try:
+        overpass_retry = overpass_retry_from_args(args)
+    except ValueError as e:
+        logger.error("Invalid --overpass-retry-* flags: %s", e)
+        return 2
     db_path = args.db_path or db.get_default_db_path(data_dir)
     if not os.path.exists(db_path):
         logger.error("Catalog DB not found at %s", db_path)
@@ -370,7 +383,12 @@ def run_collect(args: argparse.Namespace) -> int:
         )
         try:
             edges = fetch_street_edges(
-                city, data_dir, refresh=args.refresh, network_type=args.network_type, conn=conn
+                city,
+                data_dir,
+                refresh=args.refresh,
+                network_type=args.network_type,
+                conn=conn,
+                overpass_retry=overpass_retry,
             )
         except HostUnavailableError as e:
             logger.error("Street network unavailable: %s", e)
@@ -1151,6 +1169,7 @@ def build_parser() -> argparse.ArgumentParser:
             "is left of it"
         ),
     )
+    add_overpass_retry_arguments(parser)
     parser.add_argument("--data-dir", default=get_default_data_dir(), help="Data directory")
     parser.add_argument(
         "--db-path",
