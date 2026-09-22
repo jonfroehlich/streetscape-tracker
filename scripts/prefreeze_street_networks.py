@@ -46,6 +46,13 @@ still the profile that earned the 2026-08-14 ban — and the walk that loses the
 lock exits busy and strands its city for ~83 days (the very failure #341 is
 about). Run it in the daytime, well clear of the timer.
 
+In production it runs daily from ``deploy/systemd/streetscape-prefreeze.timer``
+(issue #355), with ``--alert`` so a pass that does not finish -- a host
+condition, a run-due in flight, a crash, a SIGTERM from the unit's timeout --
+emails the ``[alerts]`` recipient instead of silently leaving tonight's networks
+cold. A pass with nothing cold exits 0 and sends nothing, so the steady state is
+a no-op rather than a daily mail. The unit file carries the pacing rationale.
+
 Nothing is published and no imagery request is made. The catalog gains a
 ``street_networks`` row per frozen network, as a walk's own fetch would add.
 
@@ -63,14 +70,20 @@ Usage:
 import argparse
 import logging
 import os
+import signal
+import socket
 import sys
 import time
+import traceback
 from datetime import UTC, date, datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from streetscape_metadata_tracker import db  # noqa: E402
+from streetscape_metadata_tracker.alerting import send_alert  # noqa: E402
 from streetscape_metadata_tracker.download_common import (  # noqa: E402
+    HOST_BY_BUSY_EXIT_CODE,
+    HOST_BY_EXIT_CODE,
     DownloadError,
     HostUnavailableError,
     host_exit_code,
@@ -222,6 +235,68 @@ def run_prefreeze(
     return frozen, failed, None
 
 
+# The exit status a SIGTERM'd process conventionally reports (128 + 15). Only
+# returned under --alert, the one mode that catches the signal.
+TERMINATED_EXIT_CODE = 128 + signal.SIGTERM
+
+
+class Terminated(BaseException):
+    """
+    SIGTERM, raised in the main thread so ``--alert`` can report it (issue #355).
+
+    Under the timer, SIGTERM is what ``TimeoutStartSec`` sends, and a pass that
+    dies silently leaves the night's cold networks cold with nobody told -- the
+    exposure the timer exists to remove. A BaseException, like
+    KeyboardInterrupt, so a broad ``except Exception`` inside osmnx, requests or
+    tenacity cannot swallow it and carry on fetching. Interrupting a fetch is
+    safe: the GraphML is written to a ``.tmp`` and renamed in (#341), and the
+    host lock is an flock the kernel releases.
+    """
+
+
+def _raise_terminated(signum, frame):
+    raise Terminated(f"signal {signum}")
+
+
+def _describe_stop(stop_code: int) -> str:
+    """The alert subject's reason for a pass that stopped early."""
+    if stop_code == USAGE_EXIT_CODE:
+        return "STOPPED: a run-due is in flight"
+    if stop_code in HOST_BY_EXIT_CODE:
+        return f"STOPPED: {HOST_BY_EXIT_CODE[stop_code]} REFUSED this host (exit {stop_code})"
+    if stop_code in HOST_BY_BUSY_EXIT_CODE:
+        return (
+            f"STOPPED: another local process holds the {HOST_BY_BUSY_EXIT_CODE[stop_code]} "
+            f"lock (exit {stop_code})"
+        )
+    return f"STOPPED (exit {stop_code})"
+
+
+def _still_cold(cfg, planned) -> list[str]:
+    """One line per planned network that is still not frozen on disk."""
+    return [
+        f"  {city.city_id} {network_type} ({', '.join(channels)})"
+        for city, network_type, channels in planned
+        if not os.path.exists(network_cache_path(city.city_id, cfg.data_dir, network_type))
+    ]
+
+
+def _alert(cfg, what: str, report: list[str], extra: list[str]) -> None:
+    """Email ``what`` plus the pass's own output through ``[alerts]``. Never raises."""
+    body = [
+        "The daytime street-network prefreeze pass (issues #341, #355) did not finish.",
+        "Every network it left cold is one Overpass refusal tonight away from stranding",
+        "its city's walk for ~83 days. Re-run it by hand once the cause is cleared:",
+        "  scripts/prefreeze_street_networks.py --config <prod.toml> --nights 2 --execute",
+        "",
+        *report,
+        *extra,
+    ]
+    send_alert(
+        cfg.alerts, f"street-network prefreeze {what} on {socket.gethostname()}", "\n".join(body)
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -256,6 +331,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--force", action="store_true", help="Run even if a run-due is in flight on this machine"
     )
+    p.add_argument(
+        "--alert",
+        action="store_true",
+        help=(
+            "Email the [alerts] recipient when a pass does not finish: a host "
+            "condition, a run-due in flight, a crash, or a SIGTERM (issue #355). "
+            "Silent when it finishes, including when nothing was cold. The exit "
+            "status is unchanged, so a systemd unit still goes red."
+        ),
+    )
     p.add_argument("--verbose", "-v", action="store_true")
     return p
 
@@ -279,34 +364,87 @@ def main(argv=None) -> int:
     cfg = load_scheduler_config(args.config)
     today = date.fromisoformat(args.date) if args.date else next_run_date()
 
+    # Everything the pass prints, so an alert carries the pass's own account
+    # rather than a pointer to a log somebody has to go and find.
+    report: list[str] = []
+    planned: list = []
+    previous_handler = None
+    try:
+        if args.alert:
+            previous_handler = signal.signal(signal.SIGTERM, _raise_terminated)
+        return _run_pass(args, cfg, today, report, planned)
+    except Terminated:
+        # Only reachable under --alert: that is the only mode that installs the handler.
+        logger.error("Terminated by SIGTERM mid-pass (TimeoutStartSec, or a stop).")
+        still = _still_cold(cfg, planned)
+        _alert(
+            cfg,
+            "KILLED by SIGTERM",
+            report,
+            ["", f"Killed with {len(still)} planned network(s) still cold:", *still],
+        )
+        return TERMINATED_EXIT_CODE
+    except Exception:
+        if args.alert:
+            # The still-cold list belongs here as much as on a host stop: what
+            # the reader has to decide is whether tonight is exposed, and a
+            # traceback alone does not answer that.
+            still = _still_cold(cfg, planned)
+            _alert(
+                cfg,
+                "CRASHED",
+                report,
+                [
+                    "",
+                    f"{len(still)} planned network(s) still cold:",
+                    *still,
+                    "",
+                    traceback.format_exc(),
+                ],
+            )
+        raise
+    finally:
+        if previous_handler is not None:
+            signal.signal(signal.SIGTERM, previous_handler)
+
+
+def _run_pass(args, cfg, today: date, report: list[str], planned: list) -> int:
+    """The pass itself; fills ``report`` and ``planned`` in for ``main``'s alerts."""
+
+    def say(line: str) -> None:
+        print(line)
+        report.append(line)
+
     conn = db.connect(cfg.db_path)
     try:
-        planned = plan_prefreeze(conn, cfg, today, nights=args.nights)
-        if args.limit is not None:
-            planned = planned[: args.limit]
+        full = plan_prefreeze(conn, cfg, today, nights=args.nights)
+        planned.extend(full[: args.limit] if args.limit is not None else full)
 
         street = [p for p in cfg.enabled_providers() if is_street_channel(p)]
         if not street:
-            print("No street channel is enabled in this config; nothing to freeze.")
+            say("No street channel is enabled in this config; nothing to freeze.")
             return 0
-        print(
+        say(
             f"{'Would freeze' if not args.execute else 'Freezing'} {len(planned)} cold street "
             f"network(s) for the walk slate of {today} (channels {', '.join(street)}, "
             f"{args.nights} night(s) of the {cfg.max_cities_per_day}-city cap):"
         )
         for city, network_type, channels in planned:
-            print(f"  {city.city_id:60s} {network_type:12s} {', '.join(channels)}")
+            say(f"  {city.city_id:60s} {network_type:12s} {', '.join(channels)}")
+        if len(full) > len(planned):
+            say(f"{len(full) - len(planned)} more cold network(s) are past --limit {args.limit}.")
         if not planned:
-            print("Every walk in that window already has a frozen network.")
+            # The steady state once the backlog is frozen: a no-op, never an alert.
+            say("Every walk in that window already has a frozen network.")
             return 0
         if not args.execute:
-            print("DRY RUN — nothing fetched. Re-run with --execute to freeze them.")
+            say("DRY RUN — nothing fetched. Re-run with --execute to freeze them.")
             return 0
 
         frozen, failed, stop_code = run_prefreeze(
             conn, cfg, planned, pause_s=args.pause_s, force=args.force
         )
-        print(
+        say(
             f"Froze {frozen} of {len(planned)} network(s)"
             + (f"; {failed} city(ies) had no usable network" if failed else "")
             + (
@@ -317,6 +455,14 @@ def main(argv=None) -> int:
                 else ""
             )
         )
+        if stop_code is not None and args.alert:
+            still = _still_cold(cfg, planned)
+            _alert(
+                cfg,
+                _describe_stop(stop_code),
+                report,
+                ["", f"{len(still)} planned network(s) still cold:", *still],
+            )
         return stop_code if stop_code is not None else 0
     finally:
         conn.close()

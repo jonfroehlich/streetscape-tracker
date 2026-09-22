@@ -885,3 +885,32 @@ def test_the_request_timeout_here_is_the_one_osmnx_uses():
     assert dsn.OVERPASS_DEADLINE_S == int(
         OVERPASS_RETRY_WINDOW_CEILING_S + OVERPASS_FINAL_ATTEMPT_RESERVE_S
     )
+
+
+def test_a_signal_raised_during_a_retry_wait_is_not_swallowed():
+    """The prefreeze unit (#355) ends a slow pass with SIGTERM, whose handler
+    raises a `BaseException` (`prefreeze_street_networks.Terminated`) wherever
+    the main thread happens to be -- since #357 that is most often inside a
+    retry wait, which is the longest this process ever blocks. The loop retries
+    only transport faults, so anything the sleep raises propagates; catching
+    broadly here would make the unit's `TimeoutStopSec` unreachable."""
+
+    class Terminated(BaseException):
+        pass
+
+    clock = FakeClock()
+    host = Host(clock)
+
+    def sleep_interrupted_by_a_signal(seconds):
+        raise Terminated("SIGTERM")
+
+    with pytest.raises(Terminated):
+        call_with_retry(
+            host,
+            OverpassRetryPolicy(),
+            retryable=RETRYABLE,
+            sleep=sleep_interrupted_by_a_signal,
+            clock=clock,
+            rand=lambda: 0.0,
+        )
+    assert host.starts == [0], "the signal lands in the first wait, before a second attempt"

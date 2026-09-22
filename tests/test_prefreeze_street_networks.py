@@ -283,3 +283,212 @@ def test_the_default_date_is_tomorrow_utc():
     from datetime import UTC, datetime, timedelta
 
     assert pf.next_run_date() == datetime.now(UTC).date() + timedelta(days=1)
+
+
+# ── --alert: a pass that does not finish is never silent (issue #355) ─────────
+#
+# The timer runs this with nobody watching, and a pass that dies quietly leaves
+# tonight's networks cold -- the exposure the timer exists to remove. So every
+# way a pass can end early mails, and a pass that finishes does not.
+
+
+class _Alerts:
+    def __init__(self):
+        self.sent = []
+        self.configs = []
+
+    def __call__(self, alert_cfg, subject, body):
+        # The config is recorded, not ignored: `send_alert(None, ...)` at the
+        # call site is a silently disabled alert in production, and a fake that
+        # drops its first argument cannot tell the difference.
+        self.configs.append(alert_cfg)
+        self.sent.append((subject, body))
+        return True
+
+
+def _run_alerting(monkeypatch, cfg, *args, **kwargs):
+    alerts = _Alerts()
+    monkeypatch.setattr(pf, "send_alert", alerts)
+    rc, fetcher, slept = _run(monkeypatch, cfg, *args, **kwargs)
+    return rc, fetcher, alerts
+
+
+def test_a_host_refusal_alerts_with_the_networks_it_left_cold(three_cities, data_dir, monkeypatch):
+    alpha, beta, _ = three_cities
+    cfg = _cfg(data_dir)
+    blocked = HostBlockedError("Overpass refused this host", host=HOST_OVERPASS)
+    rc, _, alerts = _run_alerting(
+        monkeypatch, cfg, "--execute", "--alert", fetcher=_Fetcher({alpha: blocked})
+    )
+    assert rc == 76, "--alert must not change the exit status: the unit still goes red"
+    assert len(alerts.sent) == 1
+    subject, body = alerts.sent[0]
+    assert "overpass REFUSED this host (exit 76)" in subject
+    # The body names what is still exposed tonight -- both cities, since the
+    # refusal came on the first fetch -- not merely that something went wrong.
+    assert "2 planned network(s) still cold" in body
+    assert f"  {alpha} drive" in body and f"  {beta} drive" in body
+    # And carries the pass's own printed account.
+    assert "Freezing 2 cold street network(s)" in body
+    # The alert goes out under THIS run's [alerts] config. Passing anything else
+    # -- None, a default AlertConfig -- disables the mail in production while
+    # every assertion above still passes.
+    assert alerts.configs == [cfg.alerts] and alerts.configs[0] is cfg.alerts
+
+
+def test_without_alert_a_host_refusal_sends_nothing(three_cities, data_dir, monkeypatch):
+    alpha, _, _ = three_cities
+    blocked = HostBlockedError("Overpass refused this host", host=HOST_OVERPASS)
+    rc, _, alerts = _run_alerting(
+        monkeypatch, _cfg(data_dir), "--execute", fetcher=_Fetcher({alpha: blocked})
+    )
+    assert rc == 76
+    assert alerts.sent == [], "a hand-run pass reports on the terminal, not by email"
+
+
+def test_a_busy_lock_and_a_run_due_in_flight_alert_with_their_own_reasons(
+    three_cities, data_dir, monkeypatch
+):
+    alpha, beta, _ = three_cities
+    busy = HostBusyError("another process holds the Overpass lock", host=HOST_OVERPASS)
+    rc, _, alerts = _run_alerting(
+        monkeypatch, _cfg(data_dir), "--execute", "--alert", fetcher=_Fetcher({alpha: busy})
+    )
+    assert rc == 80
+    assert [s for s, _ in alerts.sent] == [
+        f"street-network prefreeze STOPPED: another local process holds the overpass lock "
+        f"(exit 80) on {pf.socket.gethostname()}"
+    ]
+
+    # A run-due appearing after the first fetch: only the SECOND network is cold.
+    answers = iter([None, "pid 4242: run-due"])
+    rc, _, alerts = _run_alerting(
+        monkeypatch,
+        _cfg(data_dir),
+        "--execute",
+        "--alert",
+        in_flight=lambda: next(answers),
+    )
+    assert rc == USAGE_EXIT_CODE
+    assert len(alerts.sent) == 1
+    subject, body = alerts.sent[0]
+    assert "STOPPED: a run-due is in flight" in subject
+    assert "1 planned network(s) still cold" in body
+    assert f"  {beta} drive" in body and f"  {alpha} drive" not in body
+
+
+def test_a_pass_that_finishes_sends_nothing(three_cities, data_dir, monkeypatch):
+    """Including the steady state, where nothing is cold: a no-op, never a daily mail."""
+    rc, fetcher, alerts = _run_alerting(monkeypatch, _cfg(data_dir), "--execute", "--alert")
+    assert rc == 0 and len(fetcher.calls) == 2
+    assert alerts.sent == []
+
+    # Now everything in the window is frozen: nothing to fetch, nothing to say.
+    rc, fetcher, alerts = _run_alerting(monkeypatch, _cfg(data_dir), "--execute", "--alert")
+    assert rc == 0 and fetcher.calls == []
+    assert alerts.sent == []
+
+    # A city-specific failure is not a failed pass either (the night would fail
+    # that city the same way; nothing about Overpass is exposed).
+    for cid in three_cities:
+        path = network_cache_path(cid, data_dir, "drive")
+        if os.path.exists(path):
+            os.remove(path)
+    roadless = DownloadError("no drivable ways in this bbox")
+    rc, _, alerts = _run_alerting(
+        monkeypatch,
+        _cfg(data_dir),
+        "--execute",
+        "--alert",
+        fetcher=_Fetcher({three_cities[0]: roadless}),
+    )
+    assert rc == 0
+    assert alerts.sent == []
+
+
+def test_a_crash_alerts_with_the_traceback_and_still_raises(three_cities, data_dir, monkeypatch):
+    alpha, _, _ = three_cities
+    boom = RuntimeError("osmnx changed a signature")
+    alerts = _Alerts()
+    monkeypatch.setattr(pf, "send_alert", alerts)
+    with pytest.raises(RuntimeError, match="osmnx changed a signature"):
+        _run(monkeypatch, _cfg(data_dir), "--execute", "--alert", fetcher=_Fetcher({alpha: boom}))
+    assert len(alerts.sent) == 1
+    subject, body = alerts.sent[0]
+    assert "CRASHED" in subject
+    assert "RuntimeError: osmnx changed a signature" in body
+    # A traceback does not answer "is tonight exposed?", so the crash alert names
+    # the still-cold networks too, exactly as the host-stop and SIGTERM ones do.
+    beta = three_cities[1]
+    assert "2 planned network(s) still cold" in body
+    assert f"  {alpha} drive" in body and f"  {beta} drive" in body
+
+    # Without --alert the crash is just a crash.
+    alerts.sent.clear()
+    with pytest.raises(RuntimeError):
+        _run(monkeypatch, _cfg(data_dir), "--execute", fetcher=_Fetcher({alpha: boom}))
+    assert alerts.sent == []
+
+
+class _SigtermFetcher(_Fetcher):
+    """Delivers SIGTERM on the first fetch by calling the script's handler if
+    it is the one installed -- the way systemd's TimeoutStartSec would, without
+    risking the default disposition (or some other handler) acting on pytest
+    itself when it is not."""
+
+    def __init__(self):
+        super().__init__()
+        self.handlers = []
+
+    def __call__(self, city, data_dir, *, network_type, conn, overpass_retry):
+        # Records the call itself, because when the handler IS installed it
+        # raises here and the base's own recording is never reached.
+        self.calls.append((city.city_id, network_type))
+        handler = pf.signal.getsignal(pf.signal.SIGTERM)
+        self.handlers.append(handler)
+        if handler is pf._raise_terminated:
+            handler(pf.signal.SIGTERM, None)
+        # `overpass_retry` is forwarded rather than dropped: the pass hands
+        # `fetch_graph` the [overpass] retry policy (issue #357), so a stub
+        # that does not take it fails with a TypeError that looks like a
+        # signal-handling bug.
+        return super().__call__(
+            city,
+            data_dir,
+            network_type=network_type,
+            conn=conn,
+            overpass_retry=overpass_retry,
+        )
+
+
+def test_a_sigterm_mid_pass_alerts_and_restores_the_previous_handler(
+    three_cities, data_dir, monkeypatch
+):
+    """TimeoutStartSec ends a slow pass with SIGTERM; under --alert that must
+    mail rather than vanish, and must not leave the handler installed."""
+    alpha, beta, _ = three_cities
+    before = pf.signal.getsignal(pf.signal.SIGTERM)
+    fetcher = _SigtermFetcher()
+    rc, _, alerts = _run_alerting(
+        monkeypatch, _cfg(data_dir), "--execute", "--alert", fetcher=fetcher
+    )
+    assert rc == pf.TERMINATED_EXIT_CODE == 143
+    assert fetcher.calls == [(alpha, "drive")], "nothing is fetched after the signal"
+    assert len(alerts.sent) == 1
+    subject, body = alerts.sent[0]
+    assert "KILLED by SIGTERM" in subject
+    assert "2 planned network(s) still cold" in body and f"  {beta} drive" in body
+    assert pf.signal.getsignal(pf.signal.SIGTERM) == before
+
+    # Without --alert nothing is installed: a SIGTERM keeps its ordinary meaning.
+    fetcher = _SigtermFetcher()
+    rc, _, alerts = _run_alerting(monkeypatch, _cfg(data_dir), "--execute", fetcher=fetcher)
+    assert fetcher.handlers[0] == before
+    assert alerts.sent == []
+
+
+def test_terminated_is_not_an_exception_a_library_can_swallow():
+    """A broad `except Exception` in osmnx or tenacity must not eat the signal
+    and keep fetching past the unit's timeout."""
+    assert not issubclass(pf.Terminated, Exception)
+    assert issubclass(pf.Terminated, BaseException)

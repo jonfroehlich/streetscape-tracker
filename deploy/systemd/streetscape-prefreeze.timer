@@ -1,0 +1,35 @@
+# Daily trigger for streetscape-prefreeze.service (user unit, issue #355).
+[Unit]
+Description=Freeze the next nights' street networks every afternoon
+
+[Timer]
+# 15:00 Pacific, +0-30 min. Three constraints pick this slot; a test pins all three:
+#   - AFTER the nightly batch can still be running. That batch fires by 02:15 and
+#     stops launching at max_batch_hours (12 h), after which its tail runs: the
+#     catalog backup (bounded at 10 min), the aggregate + manifest (7m15s, the
+#     worst measured) and the publish (bounded at 10 min), i.e. under half an hour.
+#     The test bounds that tail by the collection unit's TimeoutStopSec (30 min)
+#     instead -- not because a stop is involved here, but because that directive
+#     is the one number in a FILE that was sized against those same components,
+#     and it is ~3 min more conservative than their sum. So: done by ~14:45.
+#     If a night overruns anyway, the pass refuses before every fetch while a
+#     run-due is in flight, and alerts.
+#   - BEFORE midnight UTC in both PST and PDT (16:00 / 17:00 Pacific). The script
+#     predicts the slate for "tomorrow UTC", which equals the date the next 02:00
+#     Pacific fire reads only if the pass starts on the same UTC day it is on in
+#     Pacific. 15:30 PST is 23:30 UTC; a 17:00 slot would predict a night late
+#     every winter.
+#   - Far enough before 02:00 that TimeoutStartSec (6 h) ends a slow pass by 21:30.
+# No conflict with the weekly screen (Mondays 12:00): that takes the Panoramax
+# host lock, this one Overpass's.
+OnCalendar=*-*-* 15:00:00 America/Los_Angeles
+RandomizedDelaySec=30m
+# NOT Persistent, unlike the other three timers. A catch-up fires at boot, at
+# any hour -- including just before 02:00, where a pass holding the Overpass lock
+# makes the night's first cold walk exit busy (80) and strand its city, the exact
+# failure this unit exists to prevent. A missed afternoon costs little: the
+# previous day's --nights 2 pass already covered most of tonight's slate.
+Persistent=false
+
+[Install]
+WantedBy=timers.target

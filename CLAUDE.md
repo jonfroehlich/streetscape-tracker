@@ -108,7 +108,7 @@ All are catalog/disk-only (no API calls), dry-run by default, and take `--execut
 | `repair_streetwalk_names.py` | One-time rename of road-walk artifacts collected before streetwalk filenames carried a provider token |
 | `backfill_streetwalk_coverage.py` | Backfill `street_walks.coverage_by_highway` (schema v11, #101) from artifacts on disk |
 | `backfill_streetwalk_length.py` | Backfill the schema v12 `street_walks` columns; exits nonzero if an artifact's lengths contradict the row's cataloged coverage (wrong artifact matched) |
-| `prefreeze_street_networks.py --config config/scheduler.makelab1.toml [--nights N] [--limit N]` | Freeze tonight's walk cities' OSM networks during the day (#341), serially and paced, through the same host lock and probe a walk uses — a walk on a frozen network never contacts Overpass, so a mid-night refusal then strands nothing; refuses while `run-due` is in flight. **Makes Overpass requests** (moved earlier, never added) |
+| `prefreeze_street_networks.py --config config/scheduler.makelab1.toml [--nights N] [--limit N]` | Freeze tonight's walk cities' OSM networks during the day (#341), serially and paced, through the same host lock and probe a walk uses — a walk on a frozen network never contacts Overpass, so a mid-night refusal then strands nothing; refuses while `run-due` is in flight. **Makes Overpass requests** (moved earlier, never added); runs daily from `streetscape-prefreeze.timer` (#355) |
 | `recompute_run_stats.py --provider gsv --regenerate-json` | Re-derive every run's stored stats from its CSV under the current analysis definitions — the repair handle whenever a stats definition moves (#213); a definition change is applied to the WHOLE series in one pass |
 
 The boundary-audit workflow (does a frozen grid actually fit its city?) is a four-script chain, each with a pinning test: `audit_city_boundaries.py` → `build_boundary_review.py` → `apply_decisions.py` → `reregister_boundaries.py`.
@@ -224,7 +224,7 @@ This is what READ THIS FIRST points at; read it before changing any pacing, retr
 
 | Family | Codes | Meaning |
 |---|---|---|
-| Blocked | 75 / 76 / 81 / 84 | The third party refused this IP — trips the night-level breaker. **Only Overpass (76) is re-checked** (#341): one fail-CLOSED `/status` GET (`download_common.overpass_serving`, 200 + a slots line or it stays latched — the 2026-08-14 ban presented as *connection refused*, so "unreachable" must never read as "clear") on a 45-min cooldown, at most 4 a night; the other hosts latch all night by design (`HOST_RECHECKS`). A walk whose GraphML is already frozen is never skipped *for Overpass's sake* (it never contacts it, and spends no re-check) — its census host still gates it |
+| Blocked | 75 / 76 / 81 / 84 | The third party refused this IP — trips the night-level breaker. **Only Overpass (76) is re-checked** (#341): one fail-CLOSED `/api/interpreter` query (`download_common.overpass_serving`: the tiniest query, sent as osmnx sends it, 200 + its random nonce echoed or it stays latched — never `/status`, which said serving twice on 2026-09-21 while the next real query was refused (#356); the 2026-08-14 ban presented as *connection refused*, so "unreachable" must never read as "clear") on a 45-min cooldown, at most 4 a night; the other hosts latch all night by design (`HOST_RECHECKS`). A walk whose GraphML is already frozen is never skipped *for Overpass's sake* (it never contacts it, and spends no re-check) — its census host still gates it |
 | Busy | 79 / 80 / 82 / 85 | Another local process holds the host lock |
 | Crawl incomplete | 83 | A checkpointed partial crawl — the budget or deadline ran out, not a host condition; amnestied beside the host conditions (#238), while a SIGKILL has no exit code and still counts a failure, so kill-and-resume is bounded at five nights. Raised by the KartaView sweep (#239) and, since #318, by either tile census — **with no usable checkpoint the same stop is a plain `DownloadError`**, because "re-run to resume" with nothing to resume from is an instruction that loops forever |
 
@@ -248,7 +248,7 @@ Channels run back-to-back, or concurrently in host-disjoint lanes when `[schedul
 Drive manual batches into a file (`>> logs/x.log 2>&1`), never a pipe.
 `systemctl stop` is a real wind-down, not a kill; the unit's `TimeoutStopSec` must stay above the tail's measured components and below `max_batch_hours`.
 **The weekly growth screen (`screen-provider`, #316) is scheduled but is NOT part of a night** — its own timer, deliberately far from 02:00 because both take the same Panoramax host lock, and it publishes its own artifact (the nightly tail does not rebuild it, since nothing else changes its inputs).
-Deployment lives in `deploy/` (7 systemd units + its README).
+Deployment lives in `deploy/` (9 systemd units + its README).
 
 **Operator commands and publishing → [`docs/operations.md`](docs/operations.md).**
 `assess-city` answers a partner inquiry about an untracked city the same day (register + both road walks + the cheap Mapillary grid run + publish).

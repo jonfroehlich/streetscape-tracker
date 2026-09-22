@@ -34,6 +34,7 @@ from streetscape_metadata_tracker import db
 from streetscape_metadata_tracker.db import CityRow
 from streetscape_metadata_tracker.download_common import (
     HOST_OVERPASS,
+    OVERPASS_ACCEPT_LANGUAGE,
     OVERPASS_REFERER,
     OVERPASS_URL_ENV,
     OVERPASS_USER_AGENT,
@@ -97,6 +98,10 @@ ox.settings.overpass_rate_limit = True
 # (issue #341) sends the identical identity.
 ox.settings.http_user_agent = OVERPASS_USER_AGENT
 ox.settings.http_referer = OVERPASS_REFERER
+# osmnx's default already, assigned so the breaker's osmnx-free re-check
+# (`download_common.overpass_headers`, issue #356) sends the identical header
+# set by construction rather than by coincidence.
+ox.settings.http_accept_language = OVERPASS_ACCEPT_LANGUAGE
 
 # `OVERPASS_URL_ENV` is imported from download_common and re-exported here for
 # the callers and tests that always read it from this module.
