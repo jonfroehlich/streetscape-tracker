@@ -16,6 +16,7 @@ import random
 import re
 import secrets
 import socket
+import threading
 import urllib.parse
 from collections.abc import Callable, Iterator
 from datetime import datetime
@@ -249,6 +250,12 @@ def overpass_serving(
     One request, no retries. Unlike ``/status`` this request is metered, which
     is why the query is as small as the engine allows; the breaker spends at
     most ``scheduler.HOST_RECHECKS_PER_NIGHT`` of them a night.
+
+    ``timeout_s`` is ``requests``' timeout, i.e. a ceiling on the connect and
+    on each read, not on the whole call -- and the DNS lookup ahead of them
+    (see :func:`_pinned_like_osmnx`) takes no timeout at all. So it bounds the
+    usual case, not the worst one; the scheduler's per-night cap is what
+    bounds the worst one.
     """
     base = (url or overpass_url()).rstrip("/")
     nonce = secrets.token_hex(6)
@@ -266,6 +273,11 @@ def overpass_serving(
     except Exception:  # noqa: BLE001 - fail closed by contract; see docstring
         return False
     return _probe_executed(body, nonce)
+
+
+# Serializes the ``socket.getaddrinfo`` patch below. See its docstring: the
+# patch is a process global, so two of them at once would leak the wrapper.
+_PIN_LOCK = threading.Lock()
 
 
 @contextlib.contextmanager
@@ -286,21 +298,36 @@ def _pinned_like_osmnx(base_url: str):
 
     Scoped, unlike osmnx's permanent patch, because the scheduler is a
     long-lived parent: the original ``getaddrinfo`` is restored on exit, and
-    only this hostname is redirected. A failed lookup raises, which the caller
-    turns into "not serving".
+    only this hostname is redirected.
+
+    **Patching a module global is only safe while the patches cannot overlap**,
+    and today they cannot: the sole caller is ``overpass_serving``, which the
+    breaker calls from ``HostBreaker._maybe_recheck`` on the scheduler's main
+    launch thread (a lane's work happens in a subprocess, which does not
+    inherit this process's patch). Two overlapping pins would leak the wrapper
+    for good -- the second saves the first's wrapper as "the original" and puts
+    it back -- so ``_PIN_LOCK`` makes the assumption structural rather than
+    documentary. It is a plain lock, so this must never be nested.
+
+    Two deliberate differences from osmnx, both fail-closed: a lookup failure
+    raises here (osmnx falls back to DNS-over-HTTPS), and the caller turns that
+    into "not serving" rather than reaching for a second resolver to clear a
+    breaker with; and ``socket.gethostbyname`` honours no timeout argument, so
+    the probe's ``timeout_s`` does not bound it -- the resolver's own does.
     """
     hostname = urllib.parse.urlsplit(base_url).hostname
-    ip = socket.gethostbyname(hostname)
-    original = socket.getaddrinfo
+    with _PIN_LOCK:
+        ip = socket.gethostbyname(hostname)
+        original = socket.getaddrinfo
 
-    def _getaddrinfo(host, *args, **kwargs):
-        return original(ip if host == hostname else host, *args, **kwargs)
+        def _getaddrinfo(host, *args, **kwargs):
+            return original(ip if host == hostname else host, *args, **kwargs)
 
-    socket.getaddrinfo = _getaddrinfo
-    try:
-        yield ip
-    finally:
-        socket.getaddrinfo = original
+        socket.getaddrinfo = _getaddrinfo
+        try:
+            yield ip
+        finally:
+            socket.getaddrinfo = original
 
 
 def _probe_executed(body, nonce: str) -> bool:

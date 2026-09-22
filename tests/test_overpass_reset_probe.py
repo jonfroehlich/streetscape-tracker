@@ -244,9 +244,12 @@ def test_it_connects_to_the_ipv4_address_osmnx_would_pin(interpreter):
     assert interpreter.calls[0]["url"].startswith("https://overpass-api.de/")
 
 
-def test_the_pin_matches_osmnx_own_resolver(interpreter, monkeypatch):
-    """Cross-check against osmnx itself rather than a restatement of it: run
-    osmnx's `_config_dns` under the same fake DNS and compare addresses."""
+def test_the_pin_resolves_through_the_same_call_osmnx_resolves_through(interpreter, monkeypatch):
+    """Both go through `socket.gethostbyname`, so under one fake resolver they
+    agree. That is ALL this pins -- it cannot show the two would agree against
+    real DNS (nothing offline can), only that the probe does not reach for a
+    different resolver, or for `getaddrinfo`'s IPv6-first answer, than osmnx's
+    `_config_dns` does."""
     assert dc.overpass_serving() is True
     ox._http._config_dns("https://overpass-api.de/api")  # patches socket.getaddrinfo
     osmnx_addr = socket.getaddrinfo("overpass-api.de", 443, 0, socket.SOCK_STREAM)[0][4][0]
@@ -283,6 +286,33 @@ def test_the_pin_is_scoped_to_the_probe_and_to_the_host(interpreter):
     assert socket.getaddrinfo is _dual_stack_getaddrinfo
 
 
+def test_the_pin_is_serialized_and_the_lock_is_released(interpreter):
+    """`socket.getaddrinfo` is a process global, so two overlapping pins would
+    leak the wrapper for good: the second saves the first's wrapper as "the
+    original" and puts it back. Only the breaker's re-check pins today, on one
+    thread, and `_PIN_LOCK` is what keeps that true of a future caller."""
+    held = []
+
+    def reply(nonce):
+        held.append(dc._PIN_LOCK.locked())
+        return 200, _answer(nonce)
+
+    interpreter.reply = reply
+    assert dc.overpass_serving() is True
+    assert held == [True], "the pin must be held for the whole request"
+    assert not dc._PIN_LOCK.locked()
+
+    # And released on the failing paths too, or one refused re-check would
+    # deadlock every later one.
+    def boom(nonce):
+        raise requests.exceptions.ConnectionError("refused")
+
+    interpreter.reply = boom
+    assert dc.overpass_serving() is False
+    assert not dc._PIN_LOCK.locked()
+    assert dc.overpass_serving() is False
+
+
 def test_a_failed_lookup_keeps_it_latched_and_sends_nothing(interpreter, monkeypatch):
     def no_dns(host):
         raise socket.gaierror(-2, "Name or service not known")
@@ -291,6 +321,9 @@ def test_a_failed_lookup_keeps_it_latched_and_sends_nothing(interpreter, monkeyp
     assert dc.overpass_serving() is False
     assert interpreter.calls == []
     assert socket.getaddrinfo is _dual_stack_getaddrinfo
+    assert not dc._PIN_LOCK.locked()
+    # osmnx would fall back to DNS-over-HTTPS here; a breaker is not something
+    # to clear on a second resolver's answer, so this stays "not serving".
 
 
 # ---------------------------------------------------------------------------

@@ -308,8 +308,10 @@ class HostBreaker(set):
     ``Done:`` line and the alert name them (issue #341).
 
     A due re-check runs on the launch pass, i.e. the main thread, and holds it
-    for up to the predicate's timeout (25 s, ``OVERPASS_PROBE_TIMEOUT_S``) --
-    at most ``max_rechecks`` times a night. Lanes are unaffected: their bodies are subprocesses that keep
+    for the probe's duration -- normally bounded by its 25 s
+    ``OVERPASS_PROBE_TIMEOUT_S``, though that is ``requests``' per-connect and
+    per-read timeout rather than a total, and the DNS lookup before it has
+    none -- at most ``max_rechecks`` times a night. Lanes are unaffected: their bodies are subprocesses that keep
     running while this thread waits.
 
     ``clock`` is injectable so a test can move time without sleeping. The
