@@ -140,7 +140,11 @@ It predicts the slate the way `run-due` builds it — `_collect_due` over the en
 It stops at the first host refusal or busy lock and exits with that host's code (76 / 80), exactly as a collection child does; a bbox with no drivable ways is logged and the pass continues.
 It **refuses to run beside an in-flight `run-due`** unless `--force`, checked before *every* fetch rather than once — a pass is long, the timer does not wait for it, and the walk that then loses the Overpass lock exits busy and strands its city (#341) — so run it in the daytime, clear of the timer.
 This is the one script in `scripts/` that makes provider requests, and it is dry-run by default for that reason.
-There is no timer for it yet; scheduling it is a pacing decision to take against the Overpass usage policy first (CLAUDE.md, READ THIS FIRST).
+Since #355 it runs daily from `deploy/systemd/streetscape-prefreeze.timer` at 15:00 Pacific, as `--nights 2 --limit 40 --pause-s 120 --execute --alert`.
+The pacing was taken against the Overpass usage policy first (CLAUDE.md, READ THIS FIRST): a regular application should stay under ~100 queries a day, and `--limit 40` is the city cap, so the pass fetches no more than one night's worth while tonight's slate always fits.
+It moves the nights' own fetches earlier and adds none; the 10 MB/day half of that figure is exceeded by a large city's network on its own, which is a pre-existing property of road walks rather than something the timer introduces.
+`--alert` mails when a pass does not finish — a host condition, a `run-due` in flight, a crash, or a SIGTERM from the unit's `TimeoutStartSec` — naming the networks it left cold, and is silent when nothing was cold.
+The schedule's rationale and install steps are in [`deploy/README.md`](../deploy/README.md); `tests/test_prefreeze_unit.py` pins them.
 
 **Recovering cities a refusal already stranded.**
 The alert names them, with the command: `scheduler run-due --provider gsv_streets --limit N` (or the Mapillary/KartaView walk channel) once Overpass is confirmed serving prod — `curl -A "streetscape_metadata_tracker (jonf@cs.uw.edu)" https://overpass-api.de/api/status` from the host must answer 200 with a slots line, the same test the breaker's re-check applies.

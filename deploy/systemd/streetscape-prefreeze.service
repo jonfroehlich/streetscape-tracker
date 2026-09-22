@@ -1,0 +1,103 @@
+# Daytime street-network prefreeze pass (user unit, issue #355).
+# Install: see deploy/README.md
+#
+# WHY IT EXISTS. A road walk on a FROZEN network never contacts Overpass; only a
+# city's first walk fetches one. scripts/prefreeze_street_networks.py fetches the
+# cold networks of the next nights' walk slate during the day, so a mid-night
+# Overpass refusal has nothing left to strand. It shipped in #343 with no timer,
+# and on 2026-09-21 Overpass refused makelab2 mid-batch: 19 cities stranded
+# un-walked for ~83 days, 18 of them with no frozen network. Measured on prod the
+# same day, 29 of the next night's 40 cities were still cold (72%).
+#
+# PACING (read the Overpass usage policy before changing any of these numbers --
+# CLAUDE.md, READ THIS FIRST). The public instance's policy says a REGULAR
+# application should stay under ~100 queries and ~10 MB a day (wiki.openstreetmap.org
+# /wiki/Overpass_API, "divide those numbers by 100"). This pass MOVES fetches the
+# nights already make; it adds none, so what it changes is when, not how many:
+#   --nights 2   the script's own recommendation: a night can reach past the first
+#                max_cities_per_day entries (a city whose every channel is skipped
+#                takes no cap slot), and the order beyond the cap is what those
+#                extra slots and tomorrow draw from.
+#   --limit 40   = max_cities_per_day, so tonight's slate always fits (the plan is
+#                in slate order, tonight first) while the pass never fetches more
+#                than one night's worth. The one-time backlog (242 cold cities on
+#                2026-09-21) is therefore staged at no more than a night's rate
+#                rather than drained in one pass. A test pins it between the
+#                city cap and 100.
+#   --pause-s 120  two minutes between fetches, on top of the slot wait osmnx
+#                already sleeps off; 40 fetches is ~80 min of pauses.
+# One network is about one Overpass query: osmnx subdivides only above 2,500 km^2
+# (ox.settings.max_query_area_size), and registration caps a grid at 40 km a side
+# (MAX_GRID_DIM_M; only an explicit override exceeds it, and then osmnx splits). The
+# 10 MB/day figure is NOT met by a large city's network on its own -- but the
+# night fetches exactly that network anyway, so this is a pre-existing property
+# of road walks, not something the timer introduces.
+[Unit]
+Description=Streetscape Tracker: freeze the next nights' street networks (issue #355)
+Wants=network-online.target
+After=network-online.target
+# Same shared-NFS-home model as streetscape-tracker.service: $HOME is shared
+# across makelab1 and makelab2, so enablement is identical on both and the
+# active host is pinned by ConditionHost + linger. It must run on the host whose
+# catalog and osm_cache the night reads -- and, since Overpass meters by IP, on
+# the host whose IP the night uses. Cutover = flip this alongside the collection
+# unit's; a test pins the two together.
+ConditionHost=makelab2*
+# Deliberately NO OnFailure=streetscape-tracker-notify@: that unit is not
+# installed on makelab2, points at the repo-default config, and mails the
+# scheduler log tail -- which this script does not write to. The script alerts
+# for itself (--alert below), the backup-check unit's pattern (#193).
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/streetscape-tracker
+# Optional (leading '-'): Overpass takes no credential. Read anyway, because the
+# campus SMTP settings for [alerts] may live there.
+EnvironmentFile=-%h/streetscape-tracker/.env
+# THE SAME real path the collection unit sets, and load-bearing for the reason
+# it is there: PrivateTmp gives this unit its own /tmp, and WorkingDirectory is
+# the %h symlink, which abspath does not resolve -- so any other value would make
+# the Overpass host lock a no-op BETWEEN this pass and a night or a hand-run walk,
+# i.e. two Overpass talkers from one IP, the profile of the 2026-08-14 ban.
+Environment=STREETSCAPE_LOCK_DIR=/projects/makeabilitylab/streetscape-tracker/locks
+# --execute: without it the script is a dry run, and this unit would list the cold
+#   networks every afternoon and freeze none of them, looking healthy throughout.
+# --alert: emails through [alerts] when a pass does not finish (host refused,
+#   lock busy, a run-due in flight, a crash, a SIGTERM from TimeoutStartSec) and
+#   is silent otherwise -- including the steady state, where nothing is cold and
+#   the pass exits 0 having fetched nothing.
+ExecStart=%h/streetscape-tracker/.venv-makelab2/bin/python %h/streetscape-tracker/scripts/prefreeze_street_networks.py --config %h/streetscape-tracker/config/scheduler.makelab1.toml --nights 2 --limit 40 --pause-s 120 --execute --alert
+# The bound that keeps a slow pass out of the nightly window. The timer fires by
+# 15:30 Pacific at the latest, so 6 h ends it by 21:30 -- hours before the 02:00
+# batch -- and a test pins that arithmetic against both timers. A normal pass is
+# ~80 min of pauses plus the fetches; reaching this means something is wrong, and
+# the SIGTERM it sends is caught and alerted (--alert), never silent. Killing a
+# fetch mid-flight is safe: the GraphML is written to .tmp and renamed in (#341),
+# and the host lock is an flock the kernel releases.
+TimeoutStartSec=6h
+
+# Same rationale as the collection unit: this account cannot read the journal.
+StandardOutput=append:/projects/makeabilitylab/streetscape-tracker/logs/streetscape_service_console.log
+StandardError=inherit
+
+# ── Sandboxing (same rationale as streetscape-tracker.service) ─────────
+# Narrow: the checkout only (osm_cache, the catalog's street_networks rows, the
+# lock dir). No docroot -- this never publishes -- so RestrictSUIDSGID can stay ON,
+# as in the backup-check unit.
+PrivateUsers=true
+NoNewPrivileges=true
+RestrictSUIDSGID=true
+PrivateTmp=true
+ProtectSystem=strict
+# Real path, not the %h symlink -- mount namespacing resolves symlinks.
+ReadWritePaths=/projects/makeabilitylab/streetscape-tracker
+
+# One osmnx graph at a time. UNMEASURED: the cap is a guess sized well above a
+# single city's network and far below the nightly unit's 48G, so a runaway is a
+# legible OOM kill rather than a daytime co-tenant squeeze. Read MemoryPeak after
+# the first passes (systemctl --user show streetscape-prefreeze.service -p MemoryPeak)
+# and size it from that. No MemoryHigh, deliberately: a throttle turns an
+# oversized graph into hours of silent reclaim (the collection unit's #157 lesson).
+Nice=15
+MemoryAccounting=true
+MemoryMax=8G

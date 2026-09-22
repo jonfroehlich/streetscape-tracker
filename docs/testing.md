@@ -433,6 +433,14 @@ and the **per-writer staging name** — that two pids derive different paths, th
   a blocked or busy host stopping the pass with that host's exit code (76/80) after one fetch, while a city-specific `DownloadError` does not stop it;
   an in-flight `run-due` refusing `--execute` unless `--force`, while a dry run never asks, and a `run-due` that appears **mid-pass** stopping it after the fetch in hand;
   no enabled street channel meaning nothing to freeze; bad flags exiting usage; and the default date being tomorrow UTC.
+  `--alert` (issue #355) mails exactly once on a refusal, a busy lock, a `run-due` in flight, a crash (with the traceback, still re-raised) and a SIGTERM (exit 143, the previous handler restored), each naming the networks still cold, and never on a finished pass, an empty plan or a city-specific failure;
+  the exit status is unchanged, and the SIGTERM exception is a `BaseException` so a library's `except Exception` cannot swallow it.
+- The prefreeze units (`tests/test_prefreeze_unit.py`, issue #355): the same host, interpreter, `--config`, lock dir and console log as the collection unit;
+  a sandbox no wider than the checkout;
+  an `ExecStart` that parses under the script's own parser with `--execute` and `--alert` and no `--force` or `--date`;
+  `--nights >= 2`, `--limit` between the production city cap and Overpass's 100/day regular-application figure, and `--pause-s` at least the default;
+  a timer that fires after the latest a night can run (its delay, `max_batch_hours` and `TimeoutStopSec`), ends a slow pass an hour before the next 02:00, lands on the same UTC day as its Pacific day in both PST and PDT, and is not `Persistent`;
+  every shipped unit installed by a `cp` line in `deploy/README.md`, and CLAUDE.md's unit count matching the directory.
 - `collect --estimate` on a cold city says the network **was** fetched from Overpass and frozen, on a frozen one says no requests were issued, with `--refresh` on a frozen one says it was re-fetched, and with `--refresh` on a cold one still says fetched, never re-fetched (issue #341).
 
 - Request jitter (issue #292: the spaced pacer sleeps exactly the **shifted exponential** of the injected draw — floor `(1 − j) × mean` plus `j × mean × draw` — keeps the configured **mean** rate and reaches `CV = jitter` over 20,000 real draws, has no burst credit after an idle, exceeds the old uniform draw's hard ceiling (the property the change exists for), `jitter = 0` never draws randomness and sleeps exactly as the bucket did, disabled pacing ignores it, and `[1, ∞)` or a negative is refused by the class, the shared `jitter_fraction` argparse type and `coerce_jitter` alike;
