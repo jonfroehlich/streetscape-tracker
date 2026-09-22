@@ -672,6 +672,39 @@ def _no_overpass_status_probe(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_overpass_retry_sleep(monkeypatch):
+    """
+    Never really sleep out the Overpass retry backoff (issue #357).
+
+    The default policy waits 30 s, then 60, 120 and 240 between attempts, so any
+    street test whose stubbed fetch raises a transport fault would otherwise
+    spend minutes asleep. A no-op keeps every attempt; the clock does not move,
+    so the window never binds and a test that wants to measure the schedule
+    installs its own fake clock and sleep (see tests/test_overpass_retry.py),
+    which runs after this fixture and so wins.
+
+    **It asserts what it is replacing first**, and that is the point of the
+    assertions rather than a nicety: this fixture hides the production binding
+    from every test in the suite, so with it unpinned, replacing
+    ``_retry_sleep`` with this very no-op IN PRODUCTION left all 2,664 tests
+    green -- a build that fires five attempts back to back at a refusing
+    Overpass while the docs call the 30 s floor enforced. Same for the clock (no
+    window would ever bind) and the jitter source. Being autouse, these fail the
+    WHOLE suite rather than one test, which is the right size for a defect that
+    only production can suffer.
+    """
+    import random
+    import time
+
+    from streetscape_street_analyzer import download_street_network as dsn
+
+    assert dsn._retry_sleep is time.sleep, "production must really sleep the Overpass backoff"
+    assert dsn._retry_clock is time.monotonic, "the retry window must be measured on a real clock"
+    assert dsn._retry_random is random.random, "the Overpass backoff jitter must be random"
+    monkeypatch.setattr(dsn, "_retry_sleep", lambda seconds: None)
+
+
+@pytest.fixture(autouse=True)
 def _no_host_recheck_probe(monkeypatch):
     """
     Pin every breaker re-check (issue #341) to "still refusing" for the suite.

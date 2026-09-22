@@ -231,7 +231,10 @@ def overpass_serving(
 
     Why fail-closed: the one confirmed abuse ban (2026-08-14) presented as a
     **TCP connection refused** on :443, not as a 403. A reset test that read
-    "unreachable" as "not refusing" would clear the breaker into a live ban.
+    "unreachable" as "not refusing" would clear the breaker into a live ban --
+    and since issue #357 the next real fetch pays its whole retry window
+    (~7.5 min by default, at most the 900 s deadline) inside the host lock
+    before re-tripping it, so a false clear is dearer than it was.
 
     Why the interpreter and not ``/status`` (issue #356): the ``/status`` test
     was fail-closed and correct as written, and still cleared twice on

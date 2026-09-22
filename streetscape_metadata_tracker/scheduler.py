@@ -120,6 +120,11 @@ from .naming import (
     network_cache_path,
     streetwalk_coverage_filename,
 )
+from .overpass_retry import (
+    OverpassRetryPolicy,
+    overpass_retry_argv,
+    policy_for_child_timeout,
+)
 from .walk_diff import compute_and_record_walk_diff
 
 # Isolated street-coverage collection channels (issue #99). These ARE scheduled
@@ -242,10 +247,14 @@ CHANNEL_HOSTS: dict[str, tuple[str, ...]] = {
 # refusals took to clear and is far longer than any pacing interval here; the
 # cap of 4 bounds a night's re-checks to the first three hours after a trip
 # (the two measured clears fell inside that) and bounds how many real fetches
-# a false clear could cost -- each re-trip is a 3-8 minute fetch inside the
-# host lock. That is not hypothetical: on 2026-09-21 the original /status
-# reset test cleared twice into a host that refused the next real query, which
-# is why the test now asks /interpreter itself (issue #356).
+# a false clear could cost -- each re-trip is a fetch that spends its whole
+# [overpass] retry window inside the host lock (~7.5 min by default since #357,
+# never past the 900 s deadline; it was 3-8 min before). That is not
+# hypothetical: on 2026-09-21 the original /status reset test cleared twice
+# into a host that refused the next real query, which is why the test now asks
+# /interpreter itself (issue #356) -- and why #357's longer window costs less
+# than its arithmetic suggests, since that probe is what a false clear had to
+# get past.
 HOST_RECHECK_COOLDOWN_S = 45 * 60
 HOST_RECHECKS_PER_NIGHT = 4
 
@@ -901,6 +910,10 @@ class SchedulerConfig:
     resource_guard: ResourceGuardConfig = field(default_factory=ResourceGuardConfig)
     # [driving_plan] — nightly driving-plan feed snapshot (issue #176)
     driving_plan: DrivingPlanConfig = field(default_factory=DrivingPlanConfig)
+    # [overpass] — how long a cold road walk keeps asking a refusing Overpass
+    # before it exits 76 and trips the breaker (issue #357). Handed to every
+    # walk child on its argv by _street_collect_cmd; see overpass_retry.py.
+    overpass_retry: OverpassRetryPolicy = field(default_factory=OverpassRetryPolicy)
 
     def __post_init__(self):
         if not self.db_path:
@@ -1062,6 +1075,54 @@ def _lane_count(sched: dict, config_path) -> int:
         )
         return 1
     return value
+
+
+# `[overpass]` key -> OverpassRetryPolicy field. The TOML names carry a
+# `retry_` prefix because the table is named for the HOST, and a later knob
+# about Overpass that is not about retrying should not have to rename these.
+_OVERPASS_RETRY_KEYS = {
+    "retry_max_attempts": "max_attempts",
+    "retry_initial_wait_s": "initial_wait_s",
+    "retry_max_wait_s": "max_wait_s",
+    "retry_jitter": "jitter",
+    "retry_window_s": "window_s",
+}
+
+
+def _overpass_retry(table: dict, config_path) -> OverpassRetryPolicy:
+    """Read ``[overpass]`` into an :class:`OverpassRetryPolicy` (issue #357).
+
+    Same warn-and-fall-back posture as :func:`_lane_count`: one bad key must not
+    take down every subcommand, including the incident-time handles. The whole
+    table falls back to the defaults rather than keeping the valid keys,
+    because the fields constrain each other (``max_wait_s >= initial_wait_s``)
+    and a half-applied policy is a schedule nobody wrote down. The defaults are
+    the conservative direction in any case: every one of them respects the
+    usage policy's 30 s floor and fits inside the fetch's 900 s deadline.
+
+    An unknown key is warned about and ignored rather than failing the table —
+    it is most likely a typo of a real one, and the warning names the real ones.
+    """
+    if not isinstance(table, dict):
+        logger.warning(f"[overpass] in {config_path} is not a table; using the defaults")
+        return OverpassRetryPolicy()
+    kwargs = {}
+    for key, value in table.items():
+        if key not in _OVERPASS_RETRY_KEYS:
+            logger.warning(
+                f"Ignoring unknown key [overpass].{key} in {config_path} "
+                f"(known: {', '.join(sorted(_OVERPASS_RETRY_KEYS))})"
+            )
+            continue
+        kwargs[_OVERPASS_RETRY_KEYS[key]] = value
+    try:
+        return OverpassRetryPolicy(**kwargs)
+    except ValueError as e:
+        logger.warning(
+            f"[overpass] in {config_path} is not a usable retry policy ({e}); using the "
+            f"defaults: {OverpassRetryPolicy()}"
+        )
+        return OverpassRetryPolicy()
 
 
 def _refresh_slots(sched: dict, config_path) -> int | None:
@@ -1247,6 +1308,7 @@ def load_scheduler_config(path: str | None = None) -> SchedulerConfig:
             url=dp.get("url", driving_plan.FEED_URL),
             timeout_s=dp.get("timeout_s", 60.0),
         ),
+        overpass_retry=_overpass_retry(raw.get("overpass", {}), config_path),
     )
 
 
@@ -5275,6 +5337,7 @@ def _street_collect_cmd(
     conn_limit: int,
     daily_budget: int,
     request_cap: int | None = None,
+    child_timeout_s: int | None = None,
 ) -> list[str]:
     """Argv for a road-walk collection of one (city, street channel).
 
@@ -5313,6 +5376,25 @@ def _street_collect_cmd(
     # `test_every_street_provider_declares_its_socket_ceiling` refuses.
     ceiling = WALK_CONNECTION_LIMITS.get(provider)
     walk_conn_limit = conn_limit if ceiling is None else min(conn_limit, ceiling)
+    # The retry window must fit inside the timeout the caller will SIGKILL this
+    # child at (#357 review). `city_timeout_seconds` clamps that timeout down to
+    # what is left of the batch deadline, floored at `_MIN_CLAMPED_TIMEOUT_S`
+    # (300 s) -- below the ~450 s a refusal now costs -- and a SIGKILL carries no
+    # exit code, so it counts a `consecutive_failure` and the breaker never
+    # learns the host refused us. `None` means "caller does not know", which
+    # leaves the configured window alone; production always knows, and
+    # `test_the_production_dispatch_shrinks_the_window_for_a_clamped_child` pins
+    # that it passes it.
+    retry_policy = cfg.overpass_retry
+    if child_timeout_s is not None:
+        retry_policy = policy_for_child_timeout(retry_policy, child_timeout_s)
+        if retry_policy != cfg.overpass_retry:
+            logger.info(
+                f"{city.city_id} [{channel}]: Overpass retry window shortened to "
+                f"{retry_policy.window_s:.0f}s over at most {retry_policy.max_attempts} "
+                f"attempt(s) -- this child is killed at {child_timeout_s}s, and a "
+                f"SIGKILL mid-retry would record no exit code for the breaker"
+            )
     cmd = [
         sys.executable,
         "-m",
@@ -5342,6 +5424,12 @@ def _street_collect_cmd(
         str(max(0, daily_budget)),
         "--log-level",
         "INFO",
+        # Every walk may be the one that goes to Overpass for its network, so
+        # every walk carries the [overpass] retry policy (issue #357) -- passed
+        # whole and explicitly, so the child never silently runs its own
+        # defaults in place of the configured ones, and SHORTENED to what this
+        # child's own timeout can hold (see below).
+        *overpass_retry_argv(retry_policy),
     ]
     if channel == "gsv_streets":
         # `is not None`, not `or`: 0 is documented as "disable pacing", and a
@@ -5600,7 +5688,25 @@ def _run_one_city(
     conn_limit = cfg.connection_limit if connection_limit is None else connection_limit
 
     if is_street_channel(provider):
-        cmd = _street_collect_cmd(cfg, city, today, provider, conn_limit, daily_budget, request_cap)
+        # Derived BEFORE the argv, not after: the child's Overpass retry window
+        # is sized against this number (issue #357 review), so a walk launched
+        # into a deadline-clamped timeout stops retrying in time to exit 76
+        # rather than being SIGKILLed with no exit code at all.
+        child_timeout_s = (
+            city_timeout_seconds(cfg, city, provider, conn=conn, remaining_s=remaining_s)
+            if timeout_s is None
+            else timeout_s
+        )
+        cmd = _street_collect_cmd(
+            cfg,
+            city,
+            today,
+            provider,
+            conn_limit,
+            daily_budget,
+            request_cap,
+            child_timeout_s=child_timeout_s,
+        )
         estimated = (
             _channel_estimate(cfg, city, provider, conn)
             if estimated_requests is None
@@ -5611,11 +5717,6 @@ def _run_one_city(
             f"(~{estimated:,} requests estimated)"
         )
         logger.debug(f"Command: {' '.join(cmd)}")
-        child_timeout_s = (
-            city_timeout_seconds(cfg, city, provider, conn=conn, remaining_s=remaining_s)
-            if timeout_s is None
-            else timeout_s
-        )
         return _run_collection_subprocess(cfg, cmd, child_timeout_s, city, provider, today)
 
     cmd = [

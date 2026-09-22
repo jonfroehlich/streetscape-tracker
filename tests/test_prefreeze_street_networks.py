@@ -80,10 +80,12 @@ class _Fetcher:
 
     def __init__(self, failures=None):
         self.calls = []
+        self.retry_policies = []
         self.failures = dict(failures or {})
 
-    def __call__(self, city, data_dir, *, network_type, conn):
+    def __call__(self, city, data_dir, *, network_type, conn, overpass_retry):
         self.calls.append((city.city_id, network_type))
+        self.retry_policies.append(overpass_retry)
         error = self.failures.pop(city.city_id, None)
         if error is not None:
             raise error
@@ -155,6 +157,21 @@ def test_nights_widens_the_window_and_limit_caps_the_pass(three_cities, data_dir
     rc, fetcher, _ = _run(monkeypatch, _cfg(data_dir), "--execute", "--nights", "2", "--limit", "1")
     assert rc == 0
     assert fetcher.calls == [(alpha, "drive")]
+
+
+def test_the_pass_fetches_with_the_configured_overpass_retry_policy(
+    three_cities, data_dir, monkeypatch
+):
+    """The pre-freeze is the same talker to the same host as a nightly walk,
+    earlier, so it must run the same [overpass] window (issue #357) -- pinned at
+    a NON-default policy, which a hardcoded default could not satisfy."""
+    from streetscape_metadata_tracker.overpass_retry import OverpassRetryPolicy
+
+    configured = OverpassRetryPolicy(max_attempts=2, initial_wait_s=45, window_s=300)
+    rc, fetcher, _ = _run(monkeypatch, _cfg(data_dir, overpass_retry=configured), "--execute")
+    assert rc == 0
+    assert len(fetcher.retry_policies) == 2
+    assert all(policy == configured for policy in fetcher.retry_policies)
 
 
 def test_each_channels_network_type_is_frozen_separately(three_cities, data_dir, monkeypatch):
@@ -423,13 +440,25 @@ class _SigtermFetcher(_Fetcher):
         super().__init__()
         self.handlers = []
 
-    def __call__(self, city, data_dir, *, network_type, conn):
+    def __call__(self, city, data_dir, *, network_type, conn, overpass_retry):
+        # Records the call itself, because when the handler IS installed it
+        # raises here and the base's own recording is never reached.
         self.calls.append((city.city_id, network_type))
         handler = pf.signal.getsignal(pf.signal.SIGTERM)
         self.handlers.append(handler)
         if handler is pf._raise_terminated:
             handler(pf.signal.SIGTERM, None)
-        return super().__call__(city, data_dir, network_type=network_type, conn=conn)
+        # `overpass_retry` is forwarded rather than dropped: the pass hands
+        # `fetch_graph` the [overpass] retry policy (issue #357), so a stub
+        # that does not take it fails with a TypeError that looks like a
+        # signal-handling bug.
+        return super().__call__(
+            city,
+            data_dir,
+            network_type=network_type,
+            conn=conn,
+            overpass_retry=overpass_retry,
+        )
 
 
 def test_a_sigterm_mid_pass_alerts_and_restores_the_previous_handler(

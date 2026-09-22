@@ -17,9 +17,11 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+import random
 import signal
 import sqlite3
 import threading
+import time
 
 import geopandas as gpd
 import networkx as nx
@@ -27,7 +29,6 @@ import osmnx as ox
 import pandas as pd
 import requests
 from osmnx._errors import InsufficientResponseError, ResponseStatusCodeError
-from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from streetscape_metadata_tracker import db
 from streetscape_metadata_tracker.db import CityRow
@@ -47,6 +48,13 @@ from streetscape_metadata_tracker.naming import (
     network_cache_filename,
     network_cache_path,
     osm_cache_dir,
+)
+from streetscape_metadata_tracker.overpass_retry import (
+    OVERPASS_ATTEMPT_SLACK_S,
+    OVERPASS_RETRY_WINDOW_CEILING_S,
+    OverpassRetryPolicy,
+    RetriesExhausted,
+    call_with_retry,
 )
 
 logger = logging.getLogger(__name__)
@@ -126,16 +134,30 @@ _apply_overpass_url()
 # observed from Overpass on 2026-08-15, so this path is live, not theoretical.
 #
 # Derived rather than a flat 15 minutes, because what it has to clear is the
-# worst LEGITIMATE fetch: three tenacity attempts, each a full request timeout
-# plus osmnx's own pre-request pause. That pause is the loose term — with
-# `overpass_rate_limit = True`, `_get_overpass_pause` sleeps the entire slot
-# wait the server advertises, so a busy instance can legitimately add minutes.
-# 120 s of slack per attempt is the assumption being made here; exceeding it is
-# reported as a refusal, which is the conservative direction (the night's other
-# street channels are skipped, no city is blamed, and an alert names the host).
-# If that turns out to fire on healthy-but-busy nights, raise the slack rather
-# than removing the bound — unbounded is how the SIGKILL happens.
-OVERPASS_DEADLINE_S = 3 * (OVERPASS_TIMEOUT_S + 120)  # 900 s
+# worst LEGITIMATE fetch: the longest retry window a policy may configure
+# (issue #357; a retry is only started if its wait ends inside that window),
+# then one full final attempt — a request timeout plus osmnx's own pre-request
+# pause. That pause is the loose term — with `overpass_rate_limit = True`,
+# `_get_overpass_pause` sleeps the entire slot wait the server advertises, so a
+# busy instance can legitimately add minutes. 120 s of slack for it is the
+# assumption being made here; exceeding it is reported as a refusal, which is
+# the conservative direction (the night's other street channels are skipped, no
+# city is blamed, and an alert names the host). If that turns out to fire on
+# healthy-but-busy nights, raise the slack rather than removing the bound —
+# unbounded is how the SIGKILL happens.
+#
+# Until #357 this read `3 * (OVERPASS_TIMEOUT_S + 120)`, "three tenacity
+# attempts"; the value is still 900 s, which #357 kept as the outer limit on
+# purpose, and a timing-out attempt that starts late in the window is now the
+# case the slack covers rather than the third of three.
+# Both terms come from `overpass_retry` rather than being spelled again here:
+# the SCHEDULER sizes a child's window against the same two numbers (see
+# `policy_for_child_timeout`) and cannot import osmnx to read them.
+# `test_the_request_timeout_here_is_the_one_osmnx_uses` pins that module's
+# mirror of OVERPASS_TIMEOUT_S equal to the value actually given to osmnx.
+OVERPASS_DEADLINE_S = int(
+    OVERPASS_RETRY_WINDOW_CEILING_S + OVERPASS_TIMEOUT_S + OVERPASS_ATTEMPT_SLACK_S
+)  # 900 s
 
 # HTTP statuses from /status that mean "this instance is refusing this host".
 #
@@ -152,13 +174,26 @@ _OVERPASS_REFUSAL_STATUSES = frozenset({403, 429, 509})
 
 # Errors worth retrying: transport faults that a second attempt can plausibly
 # fix. Everything else (a ban page, an empty bbox, a malformed response) is a
-# settled answer, and retrying it just spends two more requests to hear it
-# again — which is precisely what we did into a host that had already refused
-# us.
+# settled answer, and retrying it just spends more requests to hear it again —
+# which is precisely what we did into a host that had already refused us.
+#
+# Issue #357 widened HOW LONG these are retried (see `overpass_retry`), and
+# deliberately not WHAT is: every member here waits on the same schedule,
+# because a bare ECONNREFUSED is the signature of both a minutes-long flap and
+# the 2026-08-14 abuse ban, and duration is the only discriminator (#341).
 _RETRYABLE_OVERPASS = (
     requests.exceptions.ConnectionError,
     requests.exceptions.Timeout,
 )
+
+# The retry loop's clock, sleep and jitter source, read at CALL time so a test
+# (and conftest's suite-wide autouse stub) can substitute them — the suite must
+# never really sleep out a multi-minute backoff. `time.sleep` is interruptible
+# by the `_deadline` alarm, which is what keeps the window inside the deadline
+# even if a policy's arithmetic were ever wrong.
+_retry_sleep = time.sleep
+_retry_clock = time.monotonic
+_retry_random = random.random
 
 NETWORK_TYPE = DEFAULT_NETWORK_TYPE
 
@@ -263,20 +298,20 @@ def _overpass_refusing(url: str | None = None) -> str | None:
     return None
 
 
-@retry(
-    # Only transport faults. Without a predicate tenacity retries EVERYTHING,
-    # so a settled answer — a ban page, a bbox with no drivable ways — cost
-    # three round trips to hear three times.
-    retry=retry_if_exception_type(_RETRYABLE_OVERPASS),
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=4, max=10),
-    # Without this the caller sees tenacity.RetryError and the underlying cause
-    # is buried in a __cause__ chain — which is exactly why the 2026-08-14 alert
-    # emails said "RetryError" and never mentioned Overpass.
-    reraise=True,
-)
 def _download_graph(bbox, network_type: str) -> nx.MultiDiGraph:
-    """Download a simplified drive network for the bbox, retrying transport faults."""
+    """
+    ONE attempt at downloading a simplified network for the bbox.
+
+    No retry here: :func:`_download_graph_retrying` owns the schedule (issue
+    #357). Before that this was wrapped in tenacity, whose default retried
+    EVERYTHING and whose ``RetryError`` buried the cause — which is exactly why
+    the 2026-08-14 alert emails said "RetryError" and never mentioned Overpass.
+
+    A retry re-enters ``graph_from_bbox`` from the top, but only re-asks
+    Overpass for sub-queries it has not yet answered: ``ox.settings.use_cache``
+    stores every successful response, so a large bbox that osmnx split into
+    several queries does not re-pay the parts that already landed.
+    """
     # osmnx 2.x expects bbox=(left, bottom, right, top) == (min_lon, min_lat,
     # max_lon, max_lat), exactly what grid_bbox returns.
     return ox.graph_from_bbox(
@@ -288,7 +323,31 @@ def _download_graph(bbox, network_type: str) -> nx.MultiDiGraph:
     )
 
 
-def _download_graph_named(bbox, network_type: str) -> nx.MultiDiGraph:
+def _download_graph_retrying(
+    bbox, network_type: str, policy: OverpassRetryPolicy
+) -> nx.MultiDiGraph:
+    """
+    :func:`_download_graph`, retried on transport faults under ``policy``.
+
+    Only ``_RETRYABLE_OVERPASS`` is retried; anything else propagates on the
+    attempt that raised it. Exhaustion raises
+    :class:`~streetscape_metadata_tracker.overpass_retry.RetriesExhausted`
+    chained from the last fault.
+    """
+    return call_with_retry(
+        lambda: _download_graph(bbox, network_type),
+        policy,
+        retryable=_RETRYABLE_OVERPASS,
+        sleep=_retry_sleep,
+        clock=_retry_clock,
+        rand=_retry_random,
+        what=f"Overpass ({ox.settings.overpass_url})",
+    )
+
+
+def _download_graph_named(
+    bbox, network_type: str, retry_policy: OverpassRetryPolicy | None = None
+) -> nx.MultiDiGraph:
     """
     ``_download_graph`` with a failure vocabulary, bounded in wall clock.
 
@@ -305,7 +364,8 @@ def _download_graph_named(bbox, network_type: str) -> nx.MultiDiGraph:
       malformed. A roadless village must NOT cancel the night's other cities,
       which is why InsufficientResponseError is deliberately not host-scoped.
 
-    A connection refusal that survives three retries is classified host-wide on
+    A connection refusal that outlasts the retry window (``retry_policy``,
+    default :class:`OverpassRetryPolicy`; issue #357) is classified host-wide on
     purpose. A local network outage and a remote ban are indistinguishable from
     here and want the same action anyway (stop, blame no city, alert), so the
     message names both possibilities rather than guessing.
@@ -324,18 +384,21 @@ def _download_graph_named(bbox, network_type: str) -> nx.MultiDiGraph:
     message; the ``/status`` pre-flight above is the mitigation that actually
     catches the realistic version of this.
     """
+    policy = OverpassRetryPolicy() if retry_policy is None else retry_policy
     try:
         with _deadline(OVERPASS_DEADLINE_S):
-            return _download_graph(bbox, network_type)
-    except _RETRYABLE_OVERPASS as e:
+            return _download_graph_retrying(bbox, network_type, policy)
+    except RetriesExhausted as e:
         raise HostBlockedError(
             f"Overpass ({ox.settings.overpass_url}) is unreachable from this host after "
-            f"3 attempts: {e}. Either this machine's IP is blocked — the limit is per-IP, "
-            f"not per-credential, so a different key would not help — or the network is "
-            f"down. Check `curl {ox.settings.overpass_url}/status` FROM THIS HOST; "
-            f"set {OVERPASS_URL_ENV} to a mirror to work around it (issue #209).",
+            f"{e.attempts} attempt(s) over {e.elapsed_s:.0f} s: {e.last}. Either this "
+            f"machine's IP is blocked — the limit is per-IP, not per-credential, so a "
+            f"different key would not help — or the network is down, and the retry "
+            f"window ([overpass] in the scheduler config, issue #357) was too short to "
+            f"tell a flap from a ban. Check `curl {ox.settings.overpass_url}/status` FROM "
+            f"THIS HOST; set {OVERPASS_URL_ENV} to a mirror to work around it (issue #209).",
             host=HOST_OVERPASS,
-        ) from e
+        ) from e.last
     except ResponseStatusCodeError as e:
         raise HostBlockedError(
             f"Overpass ({ox.settings.overpass_url}) refused this host: {e}. This is "
@@ -349,9 +412,11 @@ def _download_graph_named(bbox, network_type: str) -> nx.MultiDiGraph:
         # code and the breaker would never learn the host was refusing us.
         raise HostBlockedError(
             f"Overpass ({ox.settings.overpass_url}) did not complete within "
-            f"{OVERPASS_DEADLINE_S}s: {e}. It answers but will not serve us — most "
-            f"likely repeated 429/504 responses, which osmnx retries internally "
-            f"forever (issue #209).",
+            f"{OVERPASS_DEADLINE_S}s: {e}. Most likely repeated 429/504 responses, which "
+            f"osmnx retries internally forever (issue #209) — i.e. it answers but "
+            f"will not serve us. Since #357 the alarm can also land in a retry "
+            f"wait or a final attempt that ran long, so check the per-attempt log "
+            f"lines above before assuming the 429/504 shape.",
             host=HOST_OVERPASS,
         ) from e
     except InsufficientResponseError as e:
@@ -385,6 +450,7 @@ def fetch_graph(
     refresh: bool = False,
     network_type: str = NETWORK_TYPE,
     conn: sqlite3.Connection | None = None,
+    overpass_retry: OverpassRetryPolicy | None = None,
 ) -> nx.MultiDiGraph:
     """
     Return the city's street graph, from the frozen cache or Overpass.
@@ -400,6 +466,10 @@ def fetch_graph(
     existed, so their ``fetched_at``/``osmnx_version`` reflect load time, not
     the original fetch. Without ``conn`` the module works standalone,
     catalog-free (unit tests, ad-hoc use).
+
+    ``overpass_retry`` is how long a cold fetch keeps asking a refusing
+    Overpass before it gives up (issue #357); None means the defaults of
+    :class:`OverpassRetryPolicy`. A cache hit never consults it.
     """
     # Keep osmnx's raw HTTP response cache inside the (unpublished) osm_cache
     # dir rather than a stray ./cache in the cwd.
@@ -437,7 +507,7 @@ def fetch_graph(
     # return above, so a warm city never contends for it.
     with host_lock(HOST_OVERPASS):
         # Ask before working: one cheap GET names a refusal in ~1s instead of
-        # after three timing-out attempts (issue #209). Inside the lock so the
+        # after the whole retry window (issues #209, #357). Inside the lock so the
         # probe and the fetch see the same serialized world.
         #
         # This is a SECOND /status GET — osmnx makes its own before every query
@@ -456,7 +526,11 @@ def fetch_graph(
                 f"a mirror to work around it (issue #209).",
                 host=HOST_OVERPASS,
             )
-        graph = _download_graph_named(bbox, network_type)
+        # The whole retry window runs INSIDE the lock: a competing process
+        # slipping in between our attempts would be a second talker against a
+        # host that is already refusing this IP (issue #208), which is worse
+        # than making it wait out the window as a busy exit.
+        graph = _download_graph_named(bbox, network_type, overpass_retry)
     logger.info("Downloaded %d nodes / %d edges", graph.number_of_nodes(), graph.number_of_edges())
 
     os.makedirs(_cache_dir(data_dir), exist_ok=True)
@@ -529,7 +603,15 @@ def fetch_street_edges(
     refresh: bool = False,
     network_type: str = NETWORK_TYPE,
     conn: sqlite3.Connection | None = None,
+    overpass_retry: OverpassRetryPolicy | None = None,
 ) -> gpd.GeoDataFrame:
     """Convenience wrapper: fetch the graph and return its edge GeoDataFrame."""
-    graph = fetch_graph(city_row, data_dir, refresh=refresh, network_type=network_type, conn=conn)
+    graph = fetch_graph(
+        city_row,
+        data_dir,
+        refresh=refresh,
+        network_type=network_type,
+        conn=conn,
+        overpass_retry=overpass_retry,
+    )
     return graph_to_edges(graph)
