@@ -318,7 +318,7 @@ python scripts/prefreeze_street_networks.py --config config/scheduler.makelab1.t
 python scripts/prefreeze_street_networks.py --config config/scheduler.makelab1.toml --execute  # freeze, 2 min apart
 ```
 
-No timer ships for it; see docs/operations.md before scheduling one.
+A daily timer runs it (issue #355); see **The daily street-network prefreeze** below.
 
 Three rules for manual work:
 
@@ -790,6 +790,39 @@ systemctl --user start streetscape-screen-provider.service   # run once now
 - It publishes `data/provider_screen.json.gz` itself. The nightly batch deliberately does **not** rebuild that file — nothing else changes its inputs — so a stale one means this timer stopped, not that the batch did.
 - **Three refusals are by design, and each exits nonzero without writing.** Every tile answering 404 is a moved endpoint (an empty area answers 200 with no layer). Tiles answering *with a body* that yields no hexagons at all is a renamed layer — the check that protects the very first run, when there is no history to compare against. A pass where every city reads zero although hexagons decoded is a renamed counter, and that one does need history. `--allow-collapse` records a collapse anyway, once you have checked the endpoint by hand.
 - **Lowering `max_requests_per_minute` in `[providers.panoramax]` DOES slow this screen** since #335 wired the channel and the loader stopped dropping that block — one host, one pace. It did not before, which is the opposite of what the same sentence used to say. If Panoramax refuses us outright, stop the timer: `systemctl --user stop streetscape-screen-provider.timer`.
+
+### The daily street-network prefreeze (#355)
+
+A road walk on a frozen network never contacts Overpass, so freezing the next nights' walk networks by day is what turns a mid-night Overpass refusal into a non-event (#341).
+The script shipped in #343 without a timer and never ran; on 2026-09-21 a refusal stranded 19 cities, 18 of them with no frozen network.
+
+```bash
+cp deploy/systemd/streetscape-prefreeze.{service,timer} ~/.config/systemd/user/
+systemctl --user daemon-reload
+# Look before the first real pass -- this lists the cold networks and fetches nothing:
+.venv-makelab2/bin/python scripts/prefreeze_street_networks.py --config config/scheduler.makelab1.toml --nights 2 --limit 40
+systemctl --user enable --now streetscape-prefreeze.timer
+systemctl --user list-timers streetscape-prefreeze.timer   # next fire
+```
+
+- Fires **daily at 15:00 Pacific** (+0–30 min): after the latest a night can still be running (02:15 + 12 h `max_batch_hours` + its tail — backup 10 min, aggregate ~7 min, publish 10 min — so ≈ 14:45), and before midnight UTC in both PST and PDT, which is what keeps the script's "tomorrow UTC" prediction on the date the next 02:00 fire reads.
+  The test bounds that tail by the collection unit's `TimeoutStopSec` (30 min), which is a number in a file sized against those same components and about 3 min more conservative than their sum; a stop is not involved in a normal night.
+  `TimeoutStartSec=6h` ends a slow pass by 21:30, and `TimeoutStopSec=5min` is there so the SIGTERM's alert outlives systemd's 90-second default — an SMTP relay can spend 30 s per stage.
+- **Not `Persistent`**, unlike the other timers: a catch-up at boot could land just before 02:00 and hold the Overpass lock against the night's first cold walk, which exits busy and strands its city.
+  A missed afternoon costs little, since the previous day's `--nights 2` pass covered most of tonight.
+- Paced for the Overpass usage policy's regular-application figure (under ~100 queries a day): `--limit 40` (the city cap, so tonight always fits) at `--pause-s 120`.
+  It moves fetches the nights would make anyway; it adds none.
+  The 242-city backlog measured on 2026-09-21 is therefore never drained in one pass: a cold city is frozen only once it enters the next two nights' slate, at no more than a night's rate.
+- `--alert` mails through `[alerts]` when a pass **does not finish** — Overpass refused (76), the lock was busy (80), a `run-due` was in flight (64), a crash, or a SIGTERM from `TimeoutStartSec` (143) — naming the networks it left cold.
+  It is **silent** when the pass finishes, including the steady state where nothing is cold.
+  Not wired to `OnFailure=` for the backup-check unit's reason: the notify unit is not installed on makelab2 and mails a log this script does not write.
+- Same `ConditionHost=makelab2*` and the same `STREETSCAPE_LOCK_DIR` as the collection unit: the lock only serializes two processes that derive the same path.
+  **A host cutover must flip it too.**
+  `tests/test_prefreeze_unit.py` pins both, along with the schedule arithmetic above.
+- **`MemoryMax=16G` is unmeasured, and an OOM kill is the one failure that does NOT alert.** A SIGKILL gives the `--alert` path no chance to run, and because the plan is in slate order the same oversized city would head it every afternoon and die the same way, until the night's own walk (which has 48G) freezes that network.
+  So the cap is set high on purpose: well above a single city's drive network, a third of the nightly unit's hard cap, and small against a 188 GiB box whose free memory is mostly reclaimable ZFS ARC.
+  Read `systemctl --user show streetscape-prefreeze.service -p MemoryPeak` after the first few passes and size it from that; a pass that vanishes with no mail and no `Froze N of M` line in the console log is this case, and `systemctl --user status streetscape-prefreeze.service` will say `oom-kill`.
+- To pause it during an Overpass incident: `systemctl --user stop streetscape-prefreeze.timer`.
 
 ### Turning the KartaView channel on in production (#248)
 

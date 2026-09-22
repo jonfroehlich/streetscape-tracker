@@ -151,6 +151,7 @@ A walk whose GraphML is already frozen for the channel's `network_type` is launc
 Decided after the drain rather than at the skip because with lanes the sibling may still be in flight at skip time.
 A refusal that recovered still makes the night unhealthy, with a subject that says `REFUSED then recovered` rather than `UNAVAILABLE`, since the operator's next move differs.
 The daytime `scripts/prefreeze_street_networks.py` is the prevention: it predicts the night's walk slate through `_collect_due` (hoist and refresh reserve included, for tomorrow's UTC date), freezes the cold networks serially and paced, stops on a host condition with that host's exit code, and refuses to run beside an in-flight `run-due` unless forced.
+It runs daily at 15:00 Pacific from `streetscape-prefreeze.timer` (#355), which is not `Persistent`, so a boot-time catch-up can never land beside the 02:00 batch.
 Because makelab1 is shared, a `[resource_guard]` pre-flight (pure `plan_connection_limit`, Linux `/proc` read) lowers each run's `--connection-limit` when host load/free-RAM are tight — on top of the systemd unit's static CPU/RAM caps.
 
 ## Channel order, and the four rationales it did not have (issues #240, #238)
