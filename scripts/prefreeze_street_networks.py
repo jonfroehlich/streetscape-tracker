@@ -378,7 +378,22 @@ def main(argv=None) -> int:
         return TERMINATED_EXIT_CODE
     except Exception:
         if args.alert:
-            _alert(cfg, "CRASHED", report, ["", traceback.format_exc()])
+            # The still-cold list belongs here as much as on a host stop: what
+            # the reader has to decide is whether tonight is exposed, and a
+            # traceback alone does not answer that.
+            still = _still_cold(cfg, planned)
+            _alert(
+                cfg,
+                "CRASHED",
+                report,
+                [
+                    "",
+                    f"{len(still)} planned network(s) still cold:",
+                    *still,
+                    "",
+                    traceback.format_exc(),
+                ],
+            )
         raise
     finally:
         if previous_handler is not None:

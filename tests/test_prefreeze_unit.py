@@ -27,6 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pytest  # noqa: E402
 
 from scripts import prefreeze_street_networks as pf  # noqa: E402
+from streetscape_metadata_tracker import catalog_backup, scheduler  # noqa: E402
 from streetscape_metadata_tracker.scheduler import load_scheduler_config  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -39,6 +40,10 @@ UNIT_CHECKOUT = "%h/streetscape-tracker"
 # numbers by 100 (making less than 100 queries fetching less 10 MB of data per
 # day fine)" -- wiki.openstreetmap.org/wiki/Overpass_API, read 2026-09-22.
 OVERPASS_REGULAR_QUERIES_PER_DAY = 100
+
+# alerting._send_smtp builds its connection with timeout=30, and a relay can
+# spend that per stage (connect, STARTTLS, login, send).
+SMTP_STAGE_TIMEOUT_S = 30
 
 
 def _parse_unit(name: str) -> dict[str, dict[str, list[str]]]:
@@ -78,6 +83,13 @@ def _span_minutes(value: str) -> float:
     )
 
 
+def _bytes(value: str) -> int:
+    """A systemd memory size in bytes; only the spellings these units use."""
+    m = re.fullmatch(r"(\d+)([KMG])?", value)
+    assert m, f"unrecognized size {value!r}"
+    return int(m.group(1)) * {None: 1, "K": 2**10, "M": 2**20, "G": 2**30}[m.group(2)]
+
+
 def _daily_pacific(timer) -> tuple[int, str]:
     """(minutes after local midnight, tz) of a daily `*-*-* HH:MM:SS Zone` OnCalendar."""
     spec = _one(timer, "Timer", "OnCalendar")
@@ -88,6 +100,11 @@ def _daily_pacific(timer) -> tuple[int, str]:
 
 def _exec_argv(unit) -> list[str]:
     return shlex.split(_one(unit, "Service", "ExecStart"))
+
+
+def _shipped_units() -> list[str]:
+    """Every unit file in deploy/systemd, by the one definition both sweeps use."""
+    return sorted(glob.glob(str(UNIT_DIR / "*.service")) + glob.glob(str(UNIT_DIR / "*.timer")))
 
 
 def _in_repo(path: str) -> Path:
@@ -137,14 +154,47 @@ def test_it_runs_where_and_as_the_nightly_batch_does(units):
 
 
 def test_the_sandbox_is_the_checkout_and_nothing_wider(units):
+    """Each directive named here, not just the two that shape the filesystem:
+    dropping any one of them silently widens the unit, and the doc claim is
+    about the sandbox as a whole."""
     svc, collect = units["service"], units["collect"]
+    for directive in ("PrivateUsers", "NoNewPrivileges", "PrivateTmp", "RestrictSUIDSGID"):
+        assert _one(svc, "Service", directive) == "true", directive
     assert _one(svc, "Service", "ProtectSystem") == "strict"
-    assert _one(svc, "Service", "PrivateTmp") == "true"
     rw = svc["Service"]["ReadWritePaths"]
     # The checkout (osm_cache, the catalog, locks/) and nothing else: it never publishes.
     assert rw == [collect["Service"]["ReadWritePaths"][0]]
     assert _env(svc)["STREETSCAPE_LOCK_DIR"].startswith(rw[0] + "/")
-    assert _one(svc, "Service", "MemoryMax")
+    # Optional (leading '-'): Overpass needs no credential, so a missing .env
+    # must not fail the unit -- but [alerts] SMTP settings may live there, so it
+    # is still read. Required, it would fail every pass on a host without one.
+    env_file = _one(svc, "Service", "EnvironmentFile")
+    assert env_file.startswith("-") and env_file.endswith("/.env")
+
+
+def test_the_memory_cap_is_a_daytime_cap_not_the_nightly_one(units):
+    """The VALUE, not merely the presence. Both directions bite: too low and the
+    pass is OOM-killed -- a SIGKILL, so the --alert path never runs and this is
+    the one failure that IS silent, repeating daily while the same oversized
+    city heads the plan; as large as the nightly's, and a daytime job can squeeze
+    the co-tenants this host serves NFS to."""
+    svc, collect = units["service"], units["collect"]
+    ours = _bytes(_one(svc, "Service", "MemoryMax"))
+    nightly = _bytes(_one(collect, "Service", "MemoryMax"))
+    assert 8 * 2**30 < ours < nightly
+    assert "MemoryHigh" not in svc["Service"], (
+        "a soft brake turns an oversized graph into hours of silent reclaim (#157)"
+    )
+
+
+def test_the_stop_timeout_outlives_the_alert_a_sigterm_triggers(units):
+    """TimeoutStartSec ends a slow pass with SIGTERM, and the handler's whole job
+    is to send one mail. systemd's default 90 s can be outlasted by an SMTP relay
+    timing out stage by stage (30 s each in alerting._send_smtp), which would
+    SIGKILL the mail that says the pass died."""
+    stop_s = _span_minutes(_one(units["service"], "Service", "TimeoutStopSec")) * 60
+    assert stop_s >= 4 * SMTP_STAGE_TIMEOUT_S
+    assert stop_s < _span_minutes(_one(units["service"], "Service", "TimeoutStartSec")) * 60
 
 
 def test_the_command_line_fetches_alerts_and_parses(units, args):
@@ -174,10 +224,16 @@ def test_the_pass_covers_tonight_and_stays_inside_overpass_policy(args, prod_cfg
 
 
 def test_it_fires_after_the_night_can_still_be_running(units, prod_cfg):
-    """The nightly fires by 02:00 + its randomized delay, stops launching at
-    max_batch_hours, and has TimeoutStopSec for its tail. A pass starting inside
-    that window refuses (the in-flight check) and alerts -- correct, but a
-    schedule that does it on purpose is a daily false alarm and a lost day."""
+    """The nightly fires by 02:00 + its randomized delay and stops launching at
+    max_batch_hours; then its tail runs -- backup, aggregate + manifest, publish.
+    Only two of those three terms are importable constants, so the bound used
+    here is the collection unit's TimeoutStopSec: a number in a FILE that was
+    sized against those same components, and the more conservative of the two
+    (30 min against their ~27 min sum). A stop is NOT involved in a normal
+    night; this is a stand-in, and the assertion below keeps it an over-estimate.
+    A pass starting inside the night's window refuses (the in-flight check) and
+    alerts -- correct, but a schedule that does it on purpose is a daily false
+    alarm and a lost day."""
     night_start, night_tz = _daily_pacific(units["nightly"])
     ours_start, ours_tz = _daily_pacific(units["timer"])
     assert ours_tz == night_tz == "America/Los_Angeles"
@@ -186,6 +242,11 @@ def test_it_fires_after_the_night_can_still_be_running(units, prod_cfg):
         + _span_minutes(_one(units["nightly"], "Timer", "RandomizedDelaySec"))
         + prod_cfg.max_batch_hours * 60
         + _span_minutes(_one(units["collect"], "Service", "TimeoutStopSec"))
+    )
+    # The stand-in must stay an over-estimate of the tail terms that ARE
+    # importable, or it has stopped standing in for anything.
+    assert _span_minutes(_one(units["collect"], "Service", "TimeoutStopSec")) * 60 >= (
+        catalog_backup.BACKUP_TIMEOUT_S + scheduler.PUBLISH_TIMEOUT_S
     )
     assert ours_start >= night_done, (
         f"prefreeze fires at minute {ours_start}, but the night can run to minute {night_done:.0f}"
@@ -251,12 +312,12 @@ def test_every_unit_is_installed_by_the_deploy_readme():
             installed.update(brace.group(1) + ext for ext in brace.group(2).split(","))
         else:
             installed.add(spec)
-    shipped = {os.path.basename(p) for p in glob.glob(str(UNIT_DIR / "*"))}
+    shipped = {os.path.basename(p) for p in _shipped_units()}
     assert shipped - installed == set(), "units with no install step in deploy/README.md"
 
 
 def test_claude_md_counts_the_units_that_ship():
-    shipped = len(glob.glob(str(UNIT_DIR / "*.service")) + glob.glob(str(UNIT_DIR / "*.timer")))
+    shipped = len(_shipped_units())
     text = (ROOT / "CLAUDE.md").read_text()
     m = re.search(r"Deployment lives in `deploy/` \((\d+) systemd units", text)
     assert m, "CLAUDE.md no longer states the unit count"

@@ -75,6 +75,13 @@ ExecStart=%h/streetscape-tracker/.venv-makelab2/bin/python %h/streetscape-tracke
 # fetch mid-flight is safe: the GraphML is written to .tmp and renamed in (#341),
 # and the host lock is an flock the kernel releases.
 TimeoutStartSec=6h
+# The SIGTERM above has to outlive the alert it triggers. systemd's default is
+# 90 s, and the [alerts] SMTP path can spend 30 s per stage (connect, STARTTLS,
+# login, send) before it gives up -- so the default could SIGKILL the very mail
+# that says the pass died. 5 min covers a worst-case relay timeout with room to
+# spare, and nothing else here has to be waited for: no publish, no catalog
+# write in flight, and an interrupted fetch leaves only a .tmp.
+TimeoutStopSec=5min
 
 # Same rationale as the collection unit: this account cannot read the journal.
 StandardOutput=append:/projects/makeabilitylab/streetscape-tracker/logs/streetscape_service_console.log
@@ -92,12 +99,17 @@ ProtectSystem=strict
 # Real path, not the %h symlink -- mount namespacing resolves symlinks.
 ReadWritePaths=/projects/makeabilitylab/streetscape-tracker
 
-# One osmnx graph at a time. UNMEASURED: the cap is a guess sized well above a
-# single city's network and far below the nightly unit's 48G, so a runaway is a
-# legible OOM kill rather than a daytime co-tenant squeeze. Read MemoryPeak after
-# the first passes (systemctl --user show streetscape-prefreeze.service -p MemoryPeak)
-# and size it from that. No MemoryHigh, deliberately: a throttle turns an
-# oversized graph into hours of silent reclaim (the collection unit's #157 lesson).
+# One osmnx graph at a time. UNMEASURED, and sized high BECAUSE it is unmeasured:
+# an OOM kill here is a SIGKILL, so the --alert path never runs and the pass is
+# the one failure that IS silent -- and because the plan is in slate order, the
+# same oversized city would sit at its head and die the same way every afternoon
+# until the night's own walk (which has 48G) freezes that network. 16G is a
+# guess: well above a single city's drive network, a third of the nightly unit's
+# hard cap, and a small share of a 188 GiB box whose free memory is mostly
+# reclaimable ZFS ARC. Read MemoryPeak after the first passes
+# (systemctl --user show streetscape-prefreeze.service -p MemoryPeak) and size it
+# from that. No MemoryHigh, deliberately: a throttle turns an oversized graph
+# into hours of silent reclaim (the collection unit's #157 lesson).
 Nice=15
 MemoryAccounting=true
-MemoryMax=8G
+MemoryMax=16G

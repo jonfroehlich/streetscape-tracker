@@ -144,6 +144,7 @@ Since #355 it runs daily from `deploy/systemd/streetscape-prefreeze.timer` at 15
 The pacing was taken against the Overpass usage policy first (CLAUDE.md, READ THIS FIRST): a regular application should stay under ~100 queries a day, and `--limit 40` is the city cap, so the pass fetches no more than one night's worth while tonight's slate always fits.
 It moves the nights' own fetches earlier and adds none; the 10 MB/day half of that figure is exceeded by a large city's network on its own, which is a pre-existing property of road walks rather than something the timer introduces.
 `--alert` mails when a pass does not finish — a host condition, a `run-due` in flight, a crash, or a SIGTERM from the unit's `TimeoutStartSec` — naming the networks it left cold, and is silent when nothing was cold.
+The one failure it cannot report is an OOM kill, which is a SIGKILL: read `MemoryPeak` rather than waiting for a mail that cannot arrive.
 The schedule's rationale and install steps are in [`deploy/README.md`](../deploy/README.md); `tests/test_prefreeze_unit.py` pins them.
 
 **Recovering cities a refusal already stranded.**

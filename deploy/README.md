@@ -805,8 +805,9 @@ systemctl --user enable --now streetscape-prefreeze.timer
 systemctl --user list-timers streetscape-prefreeze.timer   # next fire
 ```
 
-- Fires **daily at 15:00 Pacific** (+0–30 min): after the latest a night can still be running (02:15 + 12 h `max_batch_hours` + the 30 min stop budget ≈ 14:45), and before midnight UTC in both PST and PDT, which is what keeps the script's "tomorrow UTC" prediction on the date the next 02:00 fire reads.
-  `TimeoutStartSec=6h` ends a slow pass by 21:30.
+- Fires **daily at 15:00 Pacific** (+0–30 min): after the latest a night can still be running (02:15 + 12 h `max_batch_hours` + its tail — backup 10 min, aggregate ~7 min, publish 10 min — so ≈ 14:45), and before midnight UTC in both PST and PDT, which is what keeps the script's "tomorrow UTC" prediction on the date the next 02:00 fire reads.
+  The test bounds that tail by the collection unit's `TimeoutStopSec` (30 min), which is a number in a file sized against those same components and about 3 min more conservative than their sum; a stop is not involved in a normal night.
+  `TimeoutStartSec=6h` ends a slow pass by 21:30, and `TimeoutStopSec=5min` is there so the SIGTERM's alert outlives systemd's 90-second default — an SMTP relay can spend 30 s per stage.
 - **Not `Persistent`**, unlike the other timers: a catch-up at boot could land just before 02:00 and hold the Overpass lock against the night's first cold walk, which exits busy and strands its city.
   A missed afternoon costs little, since the previous day's `--nights 2` pass covered most of tonight.
 - Paced for the Overpass usage policy's regular-application figure (under ~100 queries a day): `--limit 40` (the city cap, so tonight always fits) at `--pause-s 120`.
@@ -818,7 +819,9 @@ systemctl --user list-timers streetscape-prefreeze.timer   # next fire
 - Same `ConditionHost=makelab2*` and the same `STREETSCAPE_LOCK_DIR` as the collection unit: the lock only serializes two processes that derive the same path.
   **A host cutover must flip it too.**
   `tests/test_prefreeze_unit.py` pins both, along with the schedule arithmetic above.
-- `MemoryMax=8G` is unmeasured; read `systemctl --user show streetscape-prefreeze.service -p MemoryPeak` after the first few passes.
+- **`MemoryMax=16G` is unmeasured, and an OOM kill is the one failure that does NOT alert.** A SIGKILL gives the `--alert` path no chance to run, and because the plan is in slate order the same oversized city would head it every afternoon and die the same way, until the night's own walk (which has 48G) freezes that network.
+  So the cap is set high on purpose: well above a single city's drive network, a third of the nightly unit's hard cap, and small against a 188 GiB box whose free memory is mostly reclaimable ZFS ARC.
+  Read `systemctl --user show streetscape-prefreeze.service -p MemoryPeak` after the first few passes and size it from that; a pass that vanishes with no mail and no `Froze N of M` line in the console log is this case, and `systemctl --user status streetscape-prefreeze.service` will say `oom-kill`.
 - To pause it during an Overpass incident: `systemctl --user stop streetscape-prefreeze.timer`.
 
 ### Turning the KartaView channel on in production (#248)

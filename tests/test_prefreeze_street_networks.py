@@ -278,8 +278,13 @@ def test_the_default_date_is_tomorrow_utc():
 class _Alerts:
     def __init__(self):
         self.sent = []
+        self.configs = []
 
     def __call__(self, alert_cfg, subject, body):
+        # The config is recorded, not ignored: `send_alert(None, ...)` at the
+        # call site is a silently disabled alert in production, and a fake that
+        # drops its first argument cannot tell the difference.
+        self.configs.append(alert_cfg)
         self.sent.append((subject, body))
         return True
 
@@ -293,9 +298,10 @@ def _run_alerting(monkeypatch, cfg, *args, **kwargs):
 
 def test_a_host_refusal_alerts_with_the_networks_it_left_cold(three_cities, data_dir, monkeypatch):
     alpha, beta, _ = three_cities
+    cfg = _cfg(data_dir)
     blocked = HostBlockedError("Overpass refused this host", host=HOST_OVERPASS)
     rc, _, alerts = _run_alerting(
-        monkeypatch, _cfg(data_dir), "--execute", "--alert", fetcher=_Fetcher({alpha: blocked})
+        monkeypatch, cfg, "--execute", "--alert", fetcher=_Fetcher({alpha: blocked})
     )
     assert rc == 76, "--alert must not change the exit status: the unit still goes red"
     assert len(alerts.sent) == 1
@@ -307,6 +313,10 @@ def test_a_host_refusal_alerts_with_the_networks_it_left_cold(three_cities, data
     assert f"  {alpha} drive" in body and f"  {beta} drive" in body
     # And carries the pass's own printed account.
     assert "Freezing 2 cold street network(s)" in body
+    # The alert goes out under THIS run's [alerts] config. Passing anything else
+    # -- None, a default AlertConfig -- disables the mail in production while
+    # every assertion above still passes.
+    assert alerts.configs == [cfg.alerts] and alerts.configs[0] is cfg.alerts
 
 
 def test_without_alert_a_host_refusal_sends_nothing(three_cities, data_dir, monkeypatch):
@@ -390,6 +400,11 @@ def test_a_crash_alerts_with_the_traceback_and_still_raises(three_cities, data_d
     subject, body = alerts.sent[0]
     assert "CRASHED" in subject
     assert "RuntimeError: osmnx changed a signature" in body
+    # A traceback does not answer "is tonight exposed?", so the crash alert names
+    # the still-cold networks too, exactly as the host-stop and SIGTERM ones do.
+    beta = three_cities[1]
+    assert "2 planned network(s) still cold" in body
+    assert f"  {alpha} drive" in body and f"  {beta} drive" in body
 
     # Without --alert the crash is just a crash.
     alerts.sent.clear()
