@@ -59,7 +59,7 @@ from __future__ import annotations
 import logging
 import math
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TypeVar
 
 logger = logging.getLogger(__name__)
@@ -81,6 +81,24 @@ OVERPASS_MIN_RETRY_WAIT_S = 30.0
 # cut the final attempt and report it as a 429/504 hang, so it is refused here
 # rather than silently truncated there.
 OVERPASS_RETRY_WINDOW_CEILING_S = 600.0
+
+# What one final attempt costs after the window closes, and what a walk child
+# needs before its fetch starts. Both are osmnx-free copies of numbers the fetch
+# owns, because the SCHEDULER has to do this arithmetic (see
+# :func:`policy_for_child_timeout`) and must never import the osmnx stack --
+# the same reason ``download_common`` carries its own copy of the Overpass
+# endpoint and identity. ``test_the_request_timeout_here_is_the_one_osmnx_uses``
+# pins the mirror, so a change to ``OVERPASS_TIMEOUT_S`` cannot drift from it.
+OVERPASS_REQUEST_TIMEOUT_S = 180.0
+OVERPASS_ATTEMPT_SLACK_S = 120.0
+OVERPASS_FINAL_ATTEMPT_RESERVE_S = OVERPASS_REQUEST_TIMEOUT_S + OVERPASS_ATTEMPT_SLACK_S  # 300 s
+
+# Everything a walk child does before the retry window can start: interpreter
+# startup and the osmnx/geopandas import chain, the catalog open, the host lock,
+# and the /status pre-flight's own 15 s timeout. Deliberately generous, because
+# what it buys is the difference between exiting 76 (the breaker learns) and
+# being SIGKILLed with no exit code at all (it does not).
+OVERPASS_CHILD_STARTUP_RESERVE_S = 60.0
 
 
 @dataclass(frozen=True)
@@ -174,6 +192,36 @@ class OverpassRetryPolicy:
     def wait_s(self, failures: int, u: float) -> float:
         """The jittered wait after failure ``failures``, for a uniform draw ``u`` in [0, 1)."""
         return self.nominal_wait_s(failures) * (1.0 + self.jitter * u)
+
+
+def policy_for_child_timeout(policy: OverpassRetryPolicy, timeout_s: float) -> OverpassRetryPolicy:
+    """
+    ``policy``, shortened if a child with ``timeout_s`` could not survive it.
+
+    The scheduler SIGKILLs a collection child at its per-city timeout, and that
+    timeout is clamped to what is left of the batch deadline, floored at
+    ``_MIN_CLAMPED_TIMEOUT_S`` (300 s). A refusal now takes at least ~450 s, so
+    a walk launched into a clamped timeout would be killed MID-WINDOW -- and a
+    SIGKILL carries no exit code, so it counts a `consecutive_failure` and the
+    breaker never learns the host refused us. That is strictly worse than the
+    short window this PR replaced, which always finished (issue #357 review).
+
+    So the window handed to the child is the smaller of the configured one and
+    what its timeout can actually hold: the timeout, less one full final attempt
+    (which starts at the window's edge) and less what the child spends getting
+    to the fetch at all. When even that is gone, the child is given a SINGLE
+    attempt -- the fetch still has to happen, and one attempt is the least it
+    can cost.
+
+    Returns ``policy`` unchanged when it already fits, so nothing changes on an
+    unclamped night.
+    """
+    budget = timeout_s - OVERPASS_FINAL_ATTEMPT_RESERVE_S - OVERPASS_CHILD_STARTUP_RESERVE_S
+    if budget >= policy.window_s:
+        return policy
+    if budget <= 0:
+        return replace(policy, max_attempts=1)
+    return replace(policy, window_s=budget)
 
 
 class RetriesExhausted(Exception):

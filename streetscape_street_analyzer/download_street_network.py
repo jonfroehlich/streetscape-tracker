@@ -49,6 +49,7 @@ from streetscape_metadata_tracker.naming import (
     osm_cache_dir,
 )
 from streetscape_metadata_tracker.overpass_retry import (
+    OVERPASS_ATTEMPT_SLACK_S,
     OVERPASS_RETRY_WINDOW_CEILING_S,
     OverpassRetryPolicy,
     RetriesExhausted,
@@ -144,7 +145,11 @@ _apply_overpass_url()
 # attempts"; the value is still 900 s, which #357 kept as the outer limit on
 # purpose, and a timing-out attempt that starts late in the window is now the
 # case the slack covers rather than the third of three.
-OVERPASS_ATTEMPT_SLACK_S = 120
+# Both terms come from `overpass_retry` rather than being spelled again here:
+# the SCHEDULER sizes a child's window against the same two numbers (see
+# `policy_for_child_timeout`) and cannot import osmnx to read them.
+# `test_the_request_timeout_here_is_the_one_osmnx_uses` pins that module's
+# mirror of OVERPASS_TIMEOUT_S equal to the value actually given to osmnx.
 OVERPASS_DEADLINE_S = int(
     OVERPASS_RETRY_WINDOW_CEILING_S + OVERPASS_TIMEOUT_S + OVERPASS_ATTEMPT_SLACK_S
 )  # 900 s
@@ -402,9 +407,11 @@ def _download_graph_named(
         # code and the breaker would never learn the host was refusing us.
         raise HostBlockedError(
             f"Overpass ({ox.settings.overpass_url}) did not complete within "
-            f"{OVERPASS_DEADLINE_S}s: {e}. It answers but will not serve us — most "
-            f"likely repeated 429/504 responses, which osmnx retries internally "
-            f"forever (issue #209).",
+            f"{OVERPASS_DEADLINE_S}s: {e}. Most likely repeated 429/504 responses, which "
+            f"osmnx retries internally forever (issue #209) — i.e. it answers but "
+            f"will not serve us. Since #357 the alarm can also land in a retry "
+            f"wait or a final attempt that ran long, so check the per-attempt log "
+            f"lines above before assuming the 429/504 shape.",
             host=HOST_OVERPASS,
         ) from e
     except InsufficientResponseError as e:

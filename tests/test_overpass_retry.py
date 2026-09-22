@@ -29,9 +29,11 @@ that clock to model osmnx's pre-request pause.
 
 from __future__ import annotations
 
+import inspect
 import itertools
 import logging
 import math
+from dataclasses import replace
 
 import networkx as nx
 import pytest
@@ -46,15 +48,26 @@ from streetscape_metadata_tracker.download_common import (
     HostBlockedError,
 )
 from streetscape_metadata_tracker.overpass_retry import (
+    OVERPASS_CHILD_STARTUP_RESERVE_S,
+    OVERPASS_FINAL_ATTEMPT_RESERVE_S,
     OVERPASS_MIN_RETRY_WAIT_S,
     OVERPASS_RETRY_WINDOW_CEILING_S,
     OverpassRetryPolicy,
     RetriesExhausted,
     call_with_retry,
     overpass_retry_argv,
+    policy_for_child_timeout,
 )
 from streetscape_street_analyzer import collect
 from streetscape_street_analyzer import download_street_network as dsn
+
+# Captured at IMPORT, which happens before conftest's autouse
+# `_no_overpass_retry_sleep` replaces the sleep for every test -- the same
+# technique `tests/test_overpass.py` uses for the /status probe. Read after the
+# fixture has run, `dsn._retry_sleep` is the suite's no-op and pins nothing.
+_PRODUCTION_SLEEP = dsn._retry_sleep
+_PRODUCTION_CLOCK = dsn._retry_clock
+_PRODUCTION_RANDOM = dsn._retry_random
 
 REFUSED = requests.exceptions.ConnectionError("[Errno 111] Connection refused")
 TIMED_OUT = requests.exceptions.ReadTimeout("read timed out")
@@ -115,6 +128,33 @@ def _run(host: Host, clock: FakeClock, policy=None, u=0.0):
         clock=clock,
         rand=lambda: u,
     )
+
+
+# ---------------------------------------------------------------------------
+# The production bindings
+# ---------------------------------------------------------------------------
+
+
+def test_production_really_sleeps_on_a_real_clock_with_real_jitter():
+    """
+    The whole schedule below is measured through injected doubles, so nothing
+    else in this file can see what the module is actually bound to -- and with
+    these unpinned, setting `_retry_sleep = lambda s: None` in production left
+    the entire suite green while shipping five attempts back to back at a
+    refusing Overpass, i.e. the 30 s usage-policy floor this PR calls enforced,
+    unenforced.
+    """
+    import random
+    import time
+
+    assert _PRODUCTION_SLEEP is time.sleep
+    assert _PRODUCTION_CLOCK is time.monotonic
+    assert _PRODUCTION_RANDOM is random.random
+    # And the loop reads them at CALL time (so the fixtures above can swap
+    # them), rather than having captured them into a default argument.
+    signature = inspect.signature(call_with_retry)
+    for name in ("sleep", "clock", "rand"):
+        assert signature.parameters[name].default is inspect.Parameter.empty
 
 
 # ---------------------------------------------------------------------------
@@ -287,6 +327,9 @@ def test_no_attempt_ever_starts_past_the_window_or_closer_than_the_floor(cost, u
     with pytest.raises(RetriesExhausted):
         _run(host, clock, policy, u=u)
     assert host.starts[-1] <= policy.window_s
+    # Implied by the line above given how OVERPASS_DEADLINE_S is derived, and
+    # kept as the standing statement of what that derivation is FOR: it fails
+    # if either term of the deadline moves without the other.
     assert (
         host.starts[-1] + dsn.OVERPASS_TIMEOUT_S + dsn.OVERPASS_ATTEMPT_SLACK_S
         <= dsn.OVERPASS_DEADLINE_S
@@ -555,22 +598,36 @@ def test_no_overpass_table_means_the_defaults(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "bad",
+    ("bad", "sentinel"),
     [
-        "retry_initial_wait_s = 10",  # under the usage policy's 30 s floor
-        "retry_window_s = 1200",  # past what the 900 s deadline covers
-        "retry_max_attempts = 0",
-        "retry_jitter = true",
-        'retry_max_wait_s = "long"',
+        # Each case pairs the offending key with a VALID line on a different
+        # key, so "fell back whole" is distinguishable from "dropped the bad
+        # key and kept the rest" -- which is what the assertion is about.
+        ("retry_initial_wait_s = 10", "retry_max_attempts = 7"),  # under the 30 s floor
+        ("retry_window_s = 1200", "retry_max_attempts = 7"),  # past the 900 s deadline
+        ("retry_max_attempts = 0", "retry_jitter = 0.5"),
+        ("retry_jitter = true", "retry_max_attempts = 7"),
+        ('retry_max_wait_s = "long"', "retry_max_attempts = 7"),
     ],
 )
-def test_an_invalid_table_warns_and_falls_back_to_the_defaults_whole(tmp_path, caplog, bad):
+def test_an_invalid_table_warns_and_falls_back_to_the_defaults_whole(
+    tmp_path, caplog, bad, sentinel
+):
     """Whole, not per key: the fields constrain each other, so keeping the valid
     ones would run a schedule nobody wrote down. And not raised: a load-time
     ValueError takes down every subcommand, backup-status included."""
-    text = f"[overpass]\nretry_max_attempts = 7\n{bad}\n"
-    if bad.startswith("retry_max_attempts"):
-        text = f"[overpass]\n{bad}\n"
+    with caplog.at_level(logging.WARNING):
+        cfg = _load(tmp_path, f"[overpass]\n{sentinel}\n{bad}\n")
+    assert cfg.overpass_retry == OverpassRetryPolicy(), "the sentinel key must not survive"
+    assert "[overpass]" in caplog.text
+
+
+@pytest.mark.parametrize("text", ["overpass = 5\n", 'overpass = "on"\n', "overpass = [1, 2]\n"])
+def test_an_overpass_key_that_is_not_a_table_warns_rather_than_crashing(tmp_path, caplog, text):
+    """`[overpass]` mistyped as a scalar reaches the loader as a non-dict. Left
+    to `.items()` that is an AttributeError out of `load_scheduler_config`,
+    i.e. EVERY subcommand down -- `backup-status` and `restore-backup`, the
+    incident-time handles, included -- over one line of one section."""
     with caplog.at_level(logging.WARNING):
         cfg = _load(tmp_path, text)
     assert cfg.overpass_retry == OverpassRetryPolicy()
@@ -668,3 +725,143 @@ def test_both_shipped_configs_declare_a_valid_overpass_table(name, caplog):
         jitter=table["retry_jitter"],
         window_s=table["retry_window_s"],
     )
+
+
+# ---------------------------------------------------------------------------
+# The end-of-night clamp: a refusal must still EXIT, not be SIGKILLed (#357 review)
+#
+# `city_timeout_seconds` clamps a child's timeout down to what is left of the
+# batch deadline, floored at `_MIN_CLAMPED_TIMEOUT_S` (300 s). A refusal now
+# costs >= ~450 s, so without this a walk launched late is killed mid-window --
+# and a SIGKILL carries NO exit code, so it counts a `consecutive_failure` and
+# the breaker never learns the host refused us. Before this PR a refusal died in
+# ~12 s or ~3.2 min, both inside the floor, so the hazard is new.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("timeout_s", "expected"),
+    [
+        (180 * 60, OverpassRetryPolicy()),  # the unclamped floor: untouched
+        (960, OverpassRetryPolicy()),  # exactly enough for the full window
+        (1200, OverpassRetryPolicy()),  # more than enough
+        (900, OverpassRetryPolicy(window_s=540)),  # shortened
+        (600, OverpassRetryPolicy(window_s=240)),
+        (400, OverpassRetryPolicy(window_s=40)),
+        (360, OverpassRetryPolicy(max_attempts=1)),  # nothing left: one attempt
+        (300, OverpassRetryPolicy(max_attempts=1)),  # _MIN_CLAMPED_TIMEOUT_S
+        (1, OverpassRetryPolicy(max_attempts=1)),
+    ],
+)
+def test_the_window_is_shortened_to_what_the_childs_timeout_can_hold(timeout_s, expected):
+    assert policy_for_child_timeout(OverpassRetryPolicy(), timeout_s) == expected
+
+
+@pytest.mark.parametrize("timeout_s", [300, 330, 400, 500, 600, 750, 900, 960, 1800, 10_800])
+@pytest.mark.parametrize("cost", [0.0, OSMNX_STATUS_FALLBACK_PAUSE_S])
+def test_a_refusal_always_finishes_before_the_child_would_be_killed(timeout_s, cost):
+    """The property the clamp exists for, measured rather than asserted from the
+    arithmetic: play the whole refusal out on a fake clock at maximum jitter and
+    check the last attempt could still finish -- start, plus a full request
+    timeout and osmnx's slot pause, plus what the child spent before the fetch
+    -- inside the timeout it will be SIGKILLed at."""
+    policy = policy_for_child_timeout(OverpassRetryPolicy(), timeout_s)
+    clock = FakeClock()
+    host = Host(clock, cost=cost)
+    with pytest.raises(RetriesExhausted):
+        _run(host, clock, policy, u=U_MAX)
+    # `cost` is NOT added on top: osmnx's pre-request pause is what the
+    # reserve's 120 s of slack is for, and counting it twice would demand a
+    # timeout the fetch's own 900 s deadline does not.
+    worst_case_end = (
+        host.starts[-1] + OVERPASS_FINAL_ATTEMPT_RESERVE_S + OVERPASS_CHILD_STARTUP_RESERVE_S
+    )
+    if timeout_s >= OVERPASS_FINAL_ATTEMPT_RESERVE_S + OVERPASS_CHILD_STARTUP_RESERVE_S:
+        assert worst_case_end <= timeout_s
+    else:
+        # Nothing fits; one attempt is the least the fetch can cost, and the
+        # 900 s deadline is what still bounds it.
+        assert host.starts == [0]
+
+
+def _walk_cmd(cfg, channel="gsv_streets", **kwargs):
+    from datetime import date
+
+    from tests.test_host_lock import _city_row
+
+    return scheduler._street_collect_cmd(
+        cfg, _city_row(), date(2026, 9, 22), channel, 8, 9_000, **kwargs
+    )
+
+
+def _policy_in(cmd):
+    module_at = cmd.index("streetscape_street_analyzer.collect")
+    return collect.overpass_retry_from_args(collect.build_parser().parse_args(cmd[module_at + 1 :]))
+
+
+def test_the_argv_carries_the_shortened_window_for_a_clamped_child(tmp_path):
+    cfg = _load(tmp_path, _NON_DEFAULT_TOML)
+    assert _policy_in(_walk_cmd(cfg, child_timeout_s=10_800)) == _NON_DEFAULT
+    assert _policy_in(_walk_cmd(cfg)) == _NON_DEFAULT, "an unknown timeout leaves it alone"
+    clamped = _policy_in(_walk_cmd(cfg, child_timeout_s=600))
+    assert clamped == policy_for_child_timeout(_NON_DEFAULT, 600)
+    assert clamped == replace(_NON_DEFAULT, window_s=240)
+    assert _policy_in(_walk_cmd(cfg, child_timeout_s=300)).max_attempts == 1
+
+
+@pytest.mark.parametrize("channel", sorted(scheduler.STREET_CHANNELS))
+def test_the_production_dispatch_shrinks_the_window_for_a_clamped_child(
+    tmp_path, monkeypatch, channel
+):
+    """`_run_one_city` is the only production caller, so the clamp is worth
+    nothing unless IT passes the timeout it is about to kill the child at.
+    Derives the timeout BEFORE the argv, which is the edit this pins."""
+    from datetime import date
+
+    from tests.test_host_lock import _city_row
+
+    cfg = _load(tmp_path, _NON_DEFAULT_TOML)
+    seen = {}
+
+    def capture(cfg_, cmd, timeout_s, city, provider, today):
+        seen["cmd"], seen["timeout_s"] = cmd, timeout_s
+        return scheduler.CollectionOutcome(True, "stubbed")
+
+    monkeypatch.setattr(scheduler, "_run_collection_subprocess", capture)
+    scheduler._run_one_city(
+        cfg,
+        _city_row(),
+        date(2026, 9, 22),
+        provider=channel,
+        timeout_s=scheduler._MIN_CLAMPED_TIMEOUT_S,
+        estimated_requests=0,
+    )
+    assert seen["timeout_s"] == scheduler._MIN_CLAMPED_TIMEOUT_S
+    assert _policy_in(seen["cmd"]) == policy_for_child_timeout(
+        _NON_DEFAULT, scheduler._MIN_CLAMPED_TIMEOUT_S
+    )
+    assert _policy_in(seen["cmd"]).max_attempts == 1
+
+
+def test_an_unclamped_production_dispatch_carries_the_configured_window(tmp_path, monkeypatch):
+    from datetime import date
+
+    from tests.test_host_lock import _city_row
+
+    cfg = _load(tmp_path, _NON_DEFAULT_TOML)
+    seen = {}
+
+    def capture(cfg_, cmd, timeout_s, city, provider, today):
+        seen["cmd"] = cmd
+        return scheduler.CollectionOutcome(True, "stubbed")
+
+    monkeypatch.setattr(scheduler, "_run_collection_subprocess", capture)
+    scheduler._run_one_city(
+        cfg,
+        _city_row(),
+        date(2026, 9, 22),
+        provider="gsv_streets",
+        timeout_s=cfg.city_timeout_minutes * 60,
+        estimated_requests=0,
+    )
+    assert _policy_in(seen["cmd"]) == _NON_DEFAULT

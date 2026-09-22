@@ -170,8 +170,6 @@ six==1.17.0
     # via python-dateutil
 tabulate==0.10.0
     # via -r requirements.txt
-tenacity==9.1.4
-    # via -r requirements.txt
 tqdm==4.68.4
     # via -r requirements.txt
 typing-extensions==4.16.0 ; python_full_version < '3.13'

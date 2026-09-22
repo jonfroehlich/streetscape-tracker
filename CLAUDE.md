@@ -219,6 +219,7 @@ This is what READ THIS FIRST points at; read it before changing any pacing, retr
 - The only supported catch-up path is `scheduler run-due --provider mapillary --limit N`, **never a detached script** — the bespoke one with none of the scheduler's guards got makelab2 banned by Mapillary and Overpass in one night.
 - Three third parties meter by **IP, not credential** — Mapillary's tile CDN, `overpass-api.de`, `kartaview.org` — so a per-process limiter cannot honour them alone; `host_lock.py` serializes them across processes.
 - **An Overpass fetch rides out a refusal for the `[overpass]` retry window before it exits 76** (#357; 30/60/120/240 s waits, ~7.5 min, inside the 900 s deadline): widen HOW LONG, never WHAT is retried or by errno, and the 30 s floor between attempts is the usage policy's, enforced rather than defaulted.
+  The window is **shortened per child to fit the timeout it will be SIGKILLed at** (`policy_for_child_timeout`), because the deadline clamp floors a late city at 300 s and a SIGKILL records no exit code for the breaker while still counting a failure — so any change to either number has to be made against the other.
 - Exit-code families, **none of which records a scheduler failure** (`get_due_cities` filters on `consecutive_failures`, and nothing but a success resets it):
 
 | Family | Codes | Meaning |
