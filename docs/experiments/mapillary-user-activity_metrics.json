@@ -1,0 +1,260 @@
+{
+  "windows": [
+    {
+      "catalog_path": "/Users/jonfroehlich/Git/streetscape-tracker/data/streetscape_tracker.db",
+      "cell_km": 10.0,
+      "complete": false,
+      "generated_at": "2026-09-23T13:31:00+00:00",
+      "generated_by": "scripts/mapillary_user_activity.py uwrapid --since 2026-06-24 --until 2026-06-25 --cell-km 10 --max-requests 10 --metrics-json docs/experiments/mapillary-user-activity_metrics.json",
+      "groups": [
+        {
+          "after_last_run": false,
+          "also_in": [],
+          "cell": [
+            331,
+            -921
+          ],
+          "city_id": "houston--texas--united-states",
+          "date": "2026-06-24",
+          "first_capture_utc": "2026-06-25T02:52:16Z",
+          "images": 17251,
+          "last_capture_utc": "2026-06-25T05:09:50Z",
+          "last_mapillary_run": null,
+          "lat": 29.80867,
+          "lon": -95.28266,
+          "never_collected": true,
+          "newer_than_seen": false,
+          "newest_capture_seen": null,
+          "pano_share": 1.0,
+          "sequences": 26
+        },
+        {
+          "after_last_run": false,
+          "also_in": [],
+          "cell": [
+            332,
+            -920
+          ],
+          "city_id": "houston--texas--united-states",
+          "date": "2026-06-24",
+          "first_capture_utc": "2026-06-25T03:58:51Z",
+          "images": 2749,
+          "last_capture_utc": "2026-06-25T05:07:45Z",
+          "last_mapillary_run": null,
+          "lat": 29.82816,
+          "lon": -95.27875,
+          "never_collected": true,
+          "newer_than_seen": false,
+          "newest_capture_seen": null,
+          "pano_share": 1.0,
+          "sequences": 4
+        }
+      ],
+      "images": 20000,
+      "max_requests": 10,
+      "pages": 10,
+      "requests": 10,
+      "since": "2026-06-24",
+      "skipped_unplaceable": 0,
+      "until": "2026-06-25",
+      "username": "uwrapid"
+    },
+    {
+      "catalog_path": "/Users/jonfroehlich/Git/streetscape-tracker/data/streetscape_tracker.db",
+      "cell_km": 10.0,
+      "complete": true,
+      "generated_at": "2026-09-23T13:25:36+00:00",
+      "generated_by": "scripts/mapillary_user_activity.py uwrapid --since 2026-08-26 --until 2026-08-26 --cell-km 10 --max-requests 15 --metrics-json docs/experiments/mapillary-user-activity_metrics.json",
+      "groups": [],
+      "images": 0,
+      "max_requests": 15,
+      "pages": 1,
+      "requests": 1,
+      "since": "2026-08-26",
+      "skipped_unplaceable": 0,
+      "until": "2026-08-26",
+      "username": "uwrapid"
+    },
+    {
+      "catalog_path": "/Users/jonfroehlich/Git/streetscape-tracker/data/streetscape_tracker.db",
+      "cell_km": 10.0,
+      "complete": false,
+      "generated_at": "2026-09-23T13:31:32+00:00",
+      "generated_by": "scripts/mapillary_user_activity.py uwrapid --since 2026-08-27 --until 2026-08-27 --cell-km 10 --max-requests 8 --metrics-json docs/experiments/mapillary-user-activity_metrics.json",
+      "groups": [
+        {
+          "after_last_run": false,
+          "also_in": [],
+          "cell": [
+            530,
+            -881
+          ],
+          "city_id": "spokane--washington--united-states",
+          "date": "2026-08-26",
+          "first_capture_utc": "2026-08-27T06:28:13.500000Z",
+          "images": 8808,
+          "last_capture_utc": "2026-08-27T06:58:19.100000Z",
+          "last_mapillary_run": null,
+          "lat": 47.6612,
+          "lon": -117.46007,
+          "never_collected": true,
+          "newer_than_seen": false,
+          "newest_capture_seen": null,
+          "pano_share": 1.0,
+          "sequences": 10
+        },
+        {
+          "after_last_run": false,
+          "also_in": [],
+          "cell": [
+            530,
+            -882
+          ],
+          "city_id": "spokane--washington--united-states",
+          "date": "2026-08-26",
+          "first_capture_utc": "2026-08-27T06:34:00.500000Z",
+          "images": 6782,
+          "last_capture_utc": "2026-08-27T06:46:53.400000Z",
+          "last_mapillary_run": null,
+          "lat": 47.68904,
+          "lon": -117.50808,
+          "never_collected": true,
+          "newer_than_seen": false,
+          "newest_capture_seen": null,
+          "pano_share": 1.0,
+          "sequences": 8
+        },
+        {
+          "after_last_run": false,
+          "also_in": [],
+          "cell": [
+            529,
+            -882
+          ],
+          "city_id": "spokane--washington--united-states",
+          "date": "2026-08-26",
+          "first_capture_utc": "2026-08-27T06:58:19.200000Z",
+          "images": 326,
+          "last_capture_utc": "2026-08-27T06:59:01.888000Z",
+          "last_mapillary_run": null,
+          "lat": 47.61013,
+          "lon": -117.42067,
+          "never_collected": true,
+          "newer_than_seen": false,
+          "newest_capture_seen": null,
+          "pano_share": 1.0,
+          "sequences": 2
+        },
+        {
+          "after_last_run": false,
+          "also_in": [],
+          "cell": [
+            531,
+            -880
+          ],
+          "city_id": "spokane--washington--united-states",
+          "date": "2026-08-26",
+          "first_capture_utc": "2026-08-27T06:39:52.400000Z",
+          "images": 84,
+          "last_capture_utc": "2026-08-27T06:40:12.200000Z",
+          "last_mapillary_run": null,
+          "lat": 47.70058,
+          "lon": -117.50768,
+          "never_collected": true,
+          "newer_than_seen": false,
+          "newest_capture_seen": null,
+          "pano_share": 1.0,
+          "sequences": 2
+        }
+      ],
+      "images": 16000,
+      "max_requests": 8,
+      "pages": 8,
+      "requests": 8,
+      "since": "2026-08-27",
+      "skipped_unplaceable": 0,
+      "until": "2026-08-27",
+      "username": "uwrapid"
+    },
+    {
+      "catalog_path": "/Users/jonfroehlich/Git/streetscape-tracker/data/streetscape_tracker.db",
+      "cell_km": 10.0,
+      "complete": true,
+      "generated_at": "2026-09-23T13:25:25+00:00",
+      "generated_by": "scripts/mapillary_user_activity.py uwrapid --since 2026-09-15 --until 2026-09-15 --cell-km 10 --max-requests 20 --metrics-json docs/experiments/mapillary-user-activity_metrics.json",
+      "groups": [
+        {
+          "after_last_run": false,
+          "also_in": [],
+          "cell": [
+            531,
+            -880
+          ],
+          "city_id": "spokane--washington--united-states",
+          "date": "2026-09-15",
+          "first_capture_utc": "2026-09-15T22:40:06Z",
+          "images": 18559,
+          "last_capture_utc": "2026-09-15T23:50:35.900000Z",
+          "last_mapillary_run": null,
+          "lat": 47.71708,
+          "lon": -117.48308,
+          "never_collected": true,
+          "newer_than_seen": false,
+          "newest_capture_seen": null,
+          "pano_share": 1.0,
+          "sequences": 298
+        },
+        {
+          "after_last_run": false,
+          "also_in": [],
+          "cell": [
+            530,
+            -881
+          ],
+          "city_id": "spokane--washington--united-states",
+          "date": "2026-09-15",
+          "first_capture_utc": "2026-09-15T23:50:36Z",
+          "images": 1929,
+          "last_capture_utc": "2026-09-16T00:00:00Z",
+          "last_mapillary_run": null,
+          "lat": 47.69525,
+          "lon": -117.4772,
+          "never_collected": true,
+          "newer_than_seen": false,
+          "newest_capture_seen": null,
+          "pano_share": 1.0,
+          "sequences": 33
+        },
+        {
+          "after_last_run": false,
+          "also_in": [],
+          "cell": [
+            530,
+            -882
+          ],
+          "city_id": "spokane--washington--united-states",
+          "date": "2026-09-15",
+          "first_capture_utc": "2026-09-15T23:50:42.700000Z",
+          "images": 1445,
+          "last_capture_utc": "2026-09-15T23:55:11Z",
+          "last_mapillary_run": null,
+          "lat": 47.69688,
+          "lon": -117.49441,
+          "never_collected": true,
+          "newer_than_seen": false,
+          "newest_capture_seen": null,
+          "pano_share": 1.0,
+          "sequences": 24
+        }
+      ],
+      "images": 21933,
+      "max_requests": 20,
+      "pages": 11,
+      "requests": 11,
+      "since": "2026-09-15",
+      "skipped_unplaceable": 0,
+      "until": "2026-09-15",
+      "username": "uwrapid"
+    }
+  ]
+}

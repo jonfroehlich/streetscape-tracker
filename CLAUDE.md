@@ -331,6 +331,7 @@ Keep any list a doc enumerates **alphabetical**, so two branches adding an entry
   - `kartaview-sweep-cost.md`
   - `kartaview-viewer-deeplink.md`
   - `mapillary-image-quality.md`
+  - `mapillary-user-activity.md`
   - `pano-spacing.md`
   - `panoramax-feasibility.md`
   - `publish-duration.md`

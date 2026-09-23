@@ -854,3 +854,18 @@ A pivoted cell is identified by nothing but its position, and all three census w
 So two of the three census walks now carry a few 360° samples (`_add_streetwalk(..., n_pano_samples=N)`), giving 85.1 / 0.0 / 16.0 / 42.7 across the four providers, and the swap fails.
 The Mapillary walk is the one that keeps no 360° samples at all, because `test_streets_page_separates_360_and_any_imagery_coverage` reads it for the widest version of #116's split.
 The grid page's equivalents were discriminating from the start (75.0 / 66.7 / 60.0 / 50.0); only the streets ones looked like it.
+
+## The Mapillary user-activity tool
+
+**Added after the 2026-08-22 split.**
+
+`tests/test_mapillary_user_activity.py`, against an in-memory `_FakeGraph` fetch primitive and an injected clock — no `requests`, no sleeping.
+It pins: the cursor followed to the end with the first request carrying the query (`until` inclusive) and later ones following `paging.next` verbatim;
+a `paging.next` off `graph.mapillary.com` refused, since the session would hand it the token;
+`--max-requests` stopping with the newest pages and `complete: false`, every attempt (retries included) charged against it;
+a 429 retried after its `Retry-After`, retries bounded at `MAX_TRIES`, a 302 and an HTML-on-200 raised as a block after **one** request, and a 401 a plain error rather than a block;
+the pacer never under its floor nor over floor × (1 + jitter);
+the solar day keeping an American afternoon and evening on its own date, cells about `--cell-km` in both directions, and each group's counts, sequences, pano share and UTC first/last;
+the catalog match inside / outside / disabled / never-collected, and `after_last_run` and `newer_than_seen` each shown true without the other (the 2026-08-26 Spokane case), against a catalog opened read-only;
+a missing catalog reported and never created, the GeoJSON's properties, exits 64 / 75 / 83, the metrics upsert replacing a window rather than appending it, and a `makelab*` host refused.
+Each of 24 mutations of the script (one per pinned behaviour) was run after commit and fails at least one test.

@@ -81,6 +81,14 @@ The first pass filtered the paired comparison on image counts alone and admitted
 Relatedly, the median catalog city is **18 drives** (p25 4), so a city's quality "distribution" is usually a handful of observations — and Glendora moves 363 rank places of 388 between image- and drive-weighting.
 The study also settles, over all 271,434 sequences rather than a spot check, that `on_foot` is strictly drive-level and that no drive mixes organizational with individual imagery (zero mixed sequences on both counts), and returns a clean null for organizational capture: drive-weighted, orgs score higher in exactly 50.0% of cities.
 
+### `mapillary-user-activity.md`
+
+Where one heavy Mapillary contributor (`uwrapid`, a 360° rig) mapped lately, and whether production's last Spokane run had it — it had missed both recent batches.
+Three things generalize.
+**(1) A Graph API page caps at 2,000, and a capped answer looks complete**; with `creator_username` the `paging.next` cursor is measured to work (no overlap, newest first), so exact counts cost one request per 2,000 images rather than a sample.
+**(2) The UTC date filed both older batches a day late**, because an American evening is the next UTC day; grouping by mean solar day (UTC + lon/15 h) is free and puts them back — though whether those captures really were evening or a local clock stored as UTC, `captured_at` cannot say.
+**(3) "Captured before our run" is not "seen by our run"**: the August batch predates the September run by 18 days and was still absent, so `scripts/mapillary_user_activity.py` flags `after_last_run` and `newer_than_seen` separately.
+
 ### `pano-spacing.md`
 
 GSV vs Mapillary capture interval — Mapillary samples 1.4–3.5× finer, and **any per-pano analysis must group by `sequence_id` first**: pooling across contributors collapses the measured interval by 2–8× because the nearest image is usually someone else's drive.

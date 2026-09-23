@@ -139,7 +139,7 @@ It predicts the slate the way `run-due` builds it — `_collect_due` over the en
 `--nights N` widens the window to N caps' worth of the stalest-first order, an approximation twice over: each night re-resolves its reservations, and a city whose every channel is skipped does not consume a cap slot, so a real night reaches past the first `max_cities_per_day` entries — `--nights 2` covers both.
 It stops at the first host refusal or busy lock and exits with that host's code (76 / 80), exactly as a collection child does; a bbox with no drivable ways is logged and the pass continues.
 It **refuses to run beside an in-flight `run-due`** unless `--force`, checked before *every* fetch rather than once — a pass is long, the timer does not wait for it, and the walk that then loses the Overpass lock exits busy and strands its city (#341) — so run it in the daytime, clear of the timer.
-This is the one script in `scripts/` that makes provider requests, and it is dry-run by default for that reason.
+This is the one SCHEDULED script in `scripts/` that makes provider requests, and it is dry-run by default for that reason.
 Since #355 it runs daily from `deploy/systemd/streetscape-prefreeze.timer` at 15:00 Pacific, as `--nights 2 --limit 40 --pause-s 120 --execute --alert`.
 The pacing was taken against the Overpass usage policy first (CLAUDE.md, READ THIS FIRST): a regular application should stay under ~100 queries a day, and `--limit 40` is the city cap, so the pass fetches no more than one night's worth while tonight's slate always fits.
 It moves the nights' own fetches earlier and adds none; the 10 MB/day half of that figure is exceeded by a large city's network on its own, which is a pre-existing property of road walks rather than something the timer introduces.
@@ -151,3 +151,27 @@ The schedule's rationale and install steps are in [`deploy/README.md`](../deploy
 The alert names them, with the command: `scheduler run-due --provider gsv_streets --limit N` (or the Mapillary/KartaView walk channel) once Overpass is confirmed serving prod — `python -c "from streetscape_metadata_tracker.download_common import overpass_serving; print(overpass_serving())"` from the checkout on the host must print `True`, which is the breaker's own re-check: one tiny, metered `/api/interpreter` query sent the way a walk sends it (#356).
 A `curl .../api/status` answering 200 with a slots line is **not** that test — on 2026-09-21 `/status` said serving twice while the next real query was refused.
 Their walks will carry a later date than their grid runs, so they stay un-paired either way; a filtered run advances only the named channel's clock.
+
+## Where has a Mapillary contributor mapped lately? `scripts/mapillary_user_activity.py`
+
+**Added after the 2026-08-22 split.**
+
+A laptop-only operator tool for "this user just mapped somewhere — is it a city we track, and do our runs have it?".
+It reads one Graph API endpoint (`/images?creator_username=`), never the tile CDN, and follows the `paging.next` cursor so its counts are exact.
+
+```bash
+# The last 30 days (the default window), grouped by solar day x 10 km cell:
+python scripts/mapillary_user_activity.py uwrapid
+
+# A narrower window, finer cells, a map layer, and production's catalog copied down:
+python scripts/mapillary_user_activity.py uwrapid --since 2026-09-01 --until 2026-09-15 --cell-km 5 --geojson /tmp/uwrapid.geojson --db ~/prod-catalog.db
+```
+
+Each group reports its solar day, centroid, image and sequence counts, pano share and first/last capture (UTC).
+With a catalog, a group inside an enabled city's frozen bbox also carries that city's last Mapillary run date and the newest capture it saw, flagged `AFTER LAST RUN` (captured after it) and `NEWER THAN SEEN` (newer than anything it saw — captured earlier but uploaded later).
+A checkout's catalog is usually a dev copy with almost no Mapillary runs, so pass `--db` a copy of production's to answer the real question; the catalog is opened read-only and the report names the path it read.
+
+The pacing was taken against the provider-access record first (CLAUDE.md, READ THIS FIRST): single-threaded, at least 1 s between requests with jitter that only lengthens a gap, 429/5xx retried at most four times on `Retry-After` or exponential backoff, and a 302 or an HTML page — how Mapillary presents a per-IP block — stops the run at once with exit **75** and is never retried.
+`--max-requests` (default 200, retries included) stops a heavy contributor cleanly with exit **83**; the cursor is newest-first, so a stopped run holds the most recent images and says its counts are lower bounds.
+It refuses a `makelab*` host unless `--allow-collection-host`, and nothing in the scheduler calls it.
+The measurement behind it, including why the UTC date is the wrong grouping key, is [`experiments/mapillary-user-activity.md`](experiments/mapillary-user-activity.md).

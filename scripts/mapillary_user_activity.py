@@ -715,7 +715,12 @@ def refuse_on_collection_host(allow: bool) -> None:
 
 
 def docs_generated_by(args: argparse.Namespace) -> str:
-    """The command that produced a metrics record, from the real arguments."""
+    """The command that produced a metrics record, from the real arguments.
+
+    ``--db`` is deliberately left out: it is a machine-local path, and the
+    record carries it anyway as ``catalog_path``, beside the city fields it
+    decided.
+    """
     parts = [
         "scripts/mapillary_user_activity.py",
         args.username,
