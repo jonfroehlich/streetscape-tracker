@@ -854,3 +854,20 @@ A pivoted cell is identified by nothing but its position, and all three census w
 So two of the three census walks now carry a few 360° samples (`_add_streetwalk(..., n_pano_samples=N)`), giving 85.1 / 0.0 / 16.0 / 42.7 across the four providers, and the swap fails.
 The Mapillary walk is the one that keeps no 360° samples at all, because `test_streets_page_separates_360_and_any_imagery_coverage` reads it for the widest version of #116's split.
 The grid page's equivalents were discriminating from the start (75.0 / 66.7 / 60.0 / 50.0); only the streets ones looked like it.
+
+## The Mapillary user-activity tool
+
+**Added after the 2026-08-22 split.**
+
+`tests/test_mapillary_user_activity.py`, against an in-memory `_FakeGraph` fetch primitive and an injected clock — no `requests`, no sleeping.
+It pins: the cursor followed to the end with the first request carrying the query (`until` inclusive) and later ones following `paging.next` verbatim, **every request at least 1 s after the last on the injected clock**;
+an image re-served on a later page counted once, a repeated cursor stopping the crawl, and an empty page ending it even with a cursor;
+a `paging.next` off `https://graph.mapillary.com` (another host, or plain http) refused, since the session would hand it the token;
+`--max-requests` stopping with the newest pages and `complete: false`, every attempt (retries included) charged against it;
+a 429 retried after its `Retry-After` and still paced to the floor when `Retry-After` is 0, a transport error retried after exactly one backoff, attempts bounded at `MAX_TRIES`, every 3xx and an HTML-on-200 raised as a block after **one** request, and a 401 a plain error rather than a block;
+the production `make_requests_fetch`, over a fake session: `allow_redirects=False`, the token in the `Authorization` header and nowhere in the URL or params, and a transport failure typed transient;
+the pacer never under its floor nor over floor × (1 + jitter);
+the solar day keeping an American afternoon and evening on its own date, cells about `--cell-km` in both directions (east-west checked against a geodesic distance, not the formula under test), and each group's counts, sequences, pano share and UTC first/last, largest first within a day, with unplaceable images counted;
+the catalog match inside / outside / disabled / never-collected, the SMALLEST of two overlapping bboxes winning with the other in `also_in`, the latest Mapillary run (not a newer gsv one) read, and `after_last_run` and `newer_than_seen` each shown true without the other (the 2026-08-26 Spokane case) — including a NULL newest capture — against a catalog opened read-only;
+a missing catalog reported and never created, a catalog at schema 0 or newer than `db.SCHEMA_VERSION` exiting 64, the GeoJSON's properties, exits 64 / 75 / 83, a block on page 2 still reporting page 1, the default `--since` derived from `--until`, catalog paths committed without a home directory, the metrics upsert replacing a window rather than appending it, and a `makelab*` host refused.
+Every mutation of the script listed in the PR (#368) was run after commit and fails at least one test.
