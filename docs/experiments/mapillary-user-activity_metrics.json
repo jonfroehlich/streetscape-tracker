@@ -1,7 +1,7 @@
 {
   "windows": [
     {
-      "catalog_path": "/Users/jonfroehlich/Git/streetscape-tracker/data/streetscape_tracker.db",
+      "catalog_path": "streetscape_tracker.db",
       "cell_km": 10.0,
       "complete": false,
       "generated_at": "2026-09-23T13:31:00+00:00",
@@ -60,7 +60,7 @@
       "username": "uwrapid"
     },
     {
-      "catalog_path": "/Users/jonfroehlich/Git/streetscape-tracker/data/streetscape_tracker.db",
+      "catalog_path": "streetscape_tracker.db",
       "cell_km": 10.0,
       "complete": true,
       "generated_at": "2026-09-23T13:25:36+00:00",
@@ -76,7 +76,7 @@
       "username": "uwrapid"
     },
     {
-      "catalog_path": "/Users/jonfroehlich/Git/streetscape-tracker/data/streetscape_tracker.db",
+      "catalog_path": "streetscape_tracker.db",
       "cell_km": 10.0,
       "complete": false,
       "generated_at": "2026-09-23T13:31:32+00:00",
@@ -177,7 +177,7 @@
       "username": "uwrapid"
     },
     {
-      "catalog_path": "/Users/jonfroehlich/Git/streetscape-tracker/data/streetscape_tracker.db",
+      "catalog_path": "streetscape_tracker.db",
       "cell_km": 10.0,
       "complete": true,
       "generated_at": "2026-09-23T13:25:25+00:00",

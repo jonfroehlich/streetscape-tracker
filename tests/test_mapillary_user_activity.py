@@ -42,12 +42,16 @@ def _img(i, lat, lon, ts, seq="s1", pano=True):
 class _FakeGraph:
     """Serves a scripted list of HttpResults (or exceptions), recording calls."""
 
-    def __init__(self, responses):
+    def __init__(self, responses, clock=None):
         self.responses = list(responses)
         self.calls = []
+        self.clock = clock
+        self.times = []
 
     def __call__(self, url, params):
         self.calls.append((url, params))
+        if self.clock is not None:
+            self.times.append(self.clock.now())
         r = self.responses.pop(0)
         if isinstance(r, Exception):
             raise r
@@ -82,30 +86,39 @@ def _pacer(clock=None):
     return mua.Pacer(1.0, sleep=clock.sleep, clock=clock.now)
 
 
-def _crawl(graph, max_requests=10, sleep=None):
+def _crawl(graph, max_requests=10, sleep=None, clock=None):
     return mua.crawl_user_images(
         "uwrapid",
         date(2026, 9, 15),
         date(2026, 9, 15),
         fetch=graph,
-        pacer=_pacer(),
+        pacer=_pacer(clock),
         max_requests=max_requests,
         sleep=sleep or (lambda s: None),
     )
+
+
+def _gaps(times):
+    return [b - a for a, b in zip(times, times[1:], strict=False)]
 
 
 # ── Pagination ────────────────────────────────────────────────────────────
 
 
 def test_follows_the_cursor_to_the_end_and_counts_exactly():
+    clock = _Clock()
     graph = _FakeGraph(
         [
             _page([_img(1, *SPOKANE, T_0915_2330), _img(2, *SPOKANE, T_0915_2330)], "c1"),
             _page([_img(3, *SPOKANE, T_0915_2330)], "c2"),
             _page([_img(4, *SPOKANE, T_0915_2330)]),
-        ]
+        ],
+        clock=clock,
     )
-    result = _crawl(graph)
+    result = _crawl(graph, clock=clock)
+    # Every request of the crawl is paced, not just the Pacer in isolation.
+    assert len(graph.times) == 3
+    assert min(_gaps(graph.times)) >= 1.0
     assert [i["id"] for i in result.images] == ["1", "2", "3", "4"]
     assert result.complete is True
     assert result.requests == 3
@@ -117,15 +130,56 @@ def test_follows_the_cursor_to_the_end_and_counts_exactly():
     assert graph.calls[2][0].endswith("after=c2")
 
 
-def test_a_cursor_off_the_graph_host_is_refused():
+@pytest.mark.parametrize(
+    "next_url",
+    ["https://evil.example/x", "http://graph.mapillary.com/v1.0/images?after=c1"],
+)
+def test_a_cursor_off_https_graph_is_refused(next_url):
     bad = mua.HttpResult(
         200,
-        json.dumps(
-            {"data": [_img(1, *SPOKANE, T_0915_2330)], "paging": {"next": "https://evil.example/x"}}
-        ),
+        json.dumps({"data": [_img(1, *SPOKANE, T_0915_2330)], "paging": {"next": next_url}}),
     )
-    with pytest.raises(mua.ActivityError, match="off graph.mapillary.com"):
-        _crawl(_FakeGraph([bad]))
+    graph = _FakeGraph([bad])
+    with pytest.raises(mua.ActivityError, match="not https://graph.mapillary.com"):
+        _crawl(graph)
+    assert len(graph.calls) == 1
+
+
+def test_an_image_served_twice_is_counted_once():
+    graph = _FakeGraph(
+        [
+            _page([_img(1, *SPOKANE, T_0915_2330), _img(2, *SPOKANE, T_0915_2330)], "c1"),
+            _page([_img(2, *SPOKANE, T_0915_2330), _img(3, *SPOKANE, T_0915_2330)]),
+        ]
+    )
+    assert [i["id"] for i in _crawl(graph).images] == ["1", "2", "3"]
+
+
+def test_a_repeated_cursor_stops_the_crawl():
+    graph = _FakeGraph(
+        [
+            _page([_img(1, *SPOKANE, T_0915_2330)], "c1"),
+            _page([_img(2, *SPOKANE, T_0915_2330)], "c1"),
+            _page([_img(3, *SPOKANE, T_0915_2330)]),
+        ]
+    )
+    with pytest.raises(mua.ActivityError, match="repeated a cursor"):
+        _crawl(graph)
+    assert len(graph.calls) == 2
+
+
+def test_an_empty_page_ends_the_crawl_even_with_a_cursor():
+    graph = _FakeGraph(
+        [
+            _page([_img(1, *SPOKANE, T_0915_2330)], "c1"),
+            _page([], "c2"),
+            _page([_img(3, *SPOKANE, T_0915_2330)]),
+        ]
+    )
+    result = _crawl(graph)
+    assert result.complete is True
+    assert len(graph.calls) == 2
+    assert [i["id"] for i in result.images] == ["1"]
 
 
 def test_max_requests_stops_cleanly_with_the_newest_images():
@@ -148,17 +202,28 @@ def test_max_requests_stops_cleanly_with_the_newest_images():
 
 def test_429_is_retried_after_retry_after_and_counts_against_the_budget():
     waits = []
+    clock = _Clock()
     graph = _FakeGraph(
         [
+            mua.HttpResult(429, "{}", headers={"Retry-After": "0"}),
             mua.HttpResult(429, "{}", headers={"Retry-After": "7"}),
             _page([_img(1, *SPOKANE, T_0915_2330)]),
-        ]
+        ],
+        clock=clock,
     )
-    result = _crawl(graph, sleep=waits.append)
+
+    def sleep(s):
+        waits.append(s)
+        clock.sleep(s)
+
+    result = _crawl(graph, sleep=sleep, clock=clock)
+    # A retry is paced like any request: even a Retry-After of 0 does not
+    # let it go out sooner than the floor.
+    assert min(_gaps(graph.times)) >= 1.0
     assert result.complete is True
     assert [i["id"] for i in result.images] == ["1"]
-    assert waits == [7.0]
-    assert result.requests == 2  # the refused attempt was a request too
+    assert waits == [0.0, 7.0]
+    assert result.requests == 3  # the refused attempts were requests too
 
 
 def test_retries_are_bounded():
@@ -168,10 +233,22 @@ def test_retries_are_bounded():
     assert len(graph.calls) == mua.MAX_TRIES
 
 
-def test_a_redirect_is_a_block_and_is_never_retried():
+def test_a_transport_error_is_retried_after_one_backoff():
+    waits = []
+    graph = _FakeGraph(
+        [mua.TransientError("ConnectionError"), _page([_img(1, *SPOKANE, T_0915_2330)])]
+    )
+    result = _crawl(graph, sleep=waits.append)
+    assert result.complete is True
+    assert result.requests == 2
+    assert waits == [mua.BACKOFF_BASE_S]
+
+
+@pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
+def test_a_redirect_is_a_block_and_is_never_retried(status):
     graph = _FakeGraph(
         [
-            mua.HttpResult(302, "", headers={"Location": "https://www.mapillary.com/login"}),
+            mua.HttpResult(status, "", headers={"Location": "https://www.mapillary.com/login"}),
             _page([_img(1, *SPOKANE, T_0915_2330)]),
         ]
     )
@@ -233,8 +310,16 @@ def test_cells_are_about_cell_km_wide_in_both_directions():
     # the row index is comparable across rows).
     assert mua.cell_of(south + 1.1 * dlat, west, 10.0)[0] == r0 + 1
     assert mua.cell_of(south, west + 1.1 * dlon, 10.0) == (r0, c0 + 1)
-    # A column at 47.7 N spans ~1.48x the degrees of a latitude row.
-    assert dlon / dlat == pytest.approx(1 / math.cos(math.radians((r0 + 0.5) * dlat)))
+    # An independent check of the widening: two points 9.5 km apart east-west
+    # (measured geodesically, not with the formula under test) share a cell
+    # only if columns really are ~10 km wide at this latitude. Without the
+    # cos widening a column would be 10 km of EQUATORIAL longitude -- ~6.7 km
+    # here -- and they would not.
+    import geopy.distance
+
+    origin = (south + 0.5 * dlat, west + 0.01 * dlon)
+    east = geopy.distance.distance(kilometers=9.5).destination(origin, 90)
+    assert mua.cell_of(*origin, 10.0) == mua.cell_of(east.latitude, east.longitude, 10.0)
 
 
 def test_group_stats():
@@ -256,6 +341,13 @@ def test_group_stats():
     assert spokane["first_capture_utc"] == "2026-09-15T23:29:00Z"
     assert spokane["last_capture_utc"] == "2026-09-15T23:31:00Z"
     assert groups[1]["images"] == 1
+
+
+def test_groups_within_a_day_are_largest_first():
+    # Insertion order (Houston first, one image) differs from size order.
+    imgs = [_img(1, *HOUSTON, T_0915_2330)] + [_img(i, *SPOKANE, T_0915_2330) for i in range(2, 5)]
+    groups = mua.group_images(imgs, 10.0)
+    assert [g["images"] for g in groups] == [3, 1]
 
 
 def test_groups_split_by_day_newest_first():
@@ -332,6 +424,69 @@ def test_imagery_the_run_already_saw_is_not_flagged(conn, data_dir):
     m = mua.match_group(_group(47.717, -117.485, "2026-08-26T20:00:00Z"), _catalog_cities(data_dir))
     assert m["after_last_run"] is False
     assert m["newer_than_seen"] is False
+
+
+def test_overlapping_cities_the_smallest_wins(conn, data_dir):
+    big = _register_spokane(conn)
+    small = db.register_city(
+        conn,
+        city_name="Spokane Valley",
+        state_name="Washington",
+        state_code="WA",
+        country_name="United States",
+        country_code="US",
+        center_lat=SPOKANE[0],
+        center_lon=SPOKANE[1],
+        grid_width_m=2000,
+        grid_height_m=2000,
+        step_m=20,
+    )
+    conn.commit()
+    # The big city is registered first AND sorts first by city_id
+    # ("spokane--..." < "spokane-valley--..."), so only the area sort can put
+    # the small one ahead.
+    m = mua.match_group(_group(*SPOKANE), _catalog_cities(data_dir))
+    assert m["city_id"] == small
+    assert m["also_in"] == [big]
+
+
+def test_a_null_newest_capture_is_newer_than_seen(conn, data_dir):
+    _register_spokane(conn, date(2026, 9, 13), None)
+    m = mua.match_group(_group(47.717, -117.485, "2026-08-26T20:00:00Z"), _catalog_cities(data_dir))
+    assert m["newest_capture_seen"] is None
+    assert m["after_last_run"] is False
+    assert m["newer_than_seen"] is True
+
+
+def test_the_latest_mapillary_run_is_the_one_matched(conn, data_dir):
+    city_id = _register_spokane(conn, date(2026, 6, 1), "2026-01-01")
+    db.register_run(
+        conn,
+        city_id=city_id,
+        run_date=date(2026, 9, 13),
+        csv_filename="spokane_mapillary_2.csv.gz",
+        provider="mapillary",
+        newest_capture_date="2026-04-03",
+    )
+    db.register_run(  # a NEWER gsv run must not be read as the mapillary one
+        conn, city_id=city_id, run_date=date(2026, 9, 20), csv_filename="spokane_gsv.csv.gz"
+    )
+    conn.commit()
+    m = mua.match_group(_group(*SPOKANE), _catalog_cities(data_dir))
+    assert (m["last_mapillary_run"], m["newest_capture_seen"]) == ("2026-09-13", "2026-04-03")
+
+
+@pytest.mark.parametrize("version", [0, 99])
+def test_an_unreadable_catalog_schema_exits_64(tmp_path, capsys, version):
+    import sqlite3
+
+    path = tmp_path / "odd.db"
+    c = sqlite3.connect(path)
+    c.execute(f"PRAGMA user_version = {version}")
+    c.close()
+    graph = _FakeGraph([_page([_img(1, *SPOKANE, T_0915_2330)])])
+    assert mua.run(_args(tmp_path, "--db", str(path)), fetch=graph, pacer=_pacer()) == 64
+    assert f"schema version {version}" in capsys.readouterr().err
 
 
 def test_catalog_match_outside_every_city(conn, data_dir):
@@ -413,6 +568,43 @@ def test_truncated_run_exits_83_and_says_lower_bounds(tmp_path, capsys):
     assert json.loads(gj.read_text())["features"][0]["properties"]["complete"] is False
 
 
+def test_a_block_after_page_one_still_reports_what_was_fetched(tmp_path, capsys):
+    graph = _FakeGraph(
+        [
+            _page([_img(1, *SPOKANE, T_0915_2330), _img(2, *SPOKANE, T_0915_2330)], "c1"),
+            mua.HttpResult(302, ""),
+        ]
+    )
+    gj = tmp_path / "b.geojson"
+    args = _args(tmp_path, "--db", str(tmp_path / "none.db"), "--geojson", str(gj))
+    assert mua.run(args, fetch=graph, pacer=_pacer()) == mua.BLOCKED_EXIT
+    out = capsys.readouterr().out
+    assert "BLOCKED after 1 page(s)" in out
+    assert "LOWER BOUND" in out
+    props = json.loads(gj.read_text())["features"][0]["properties"]
+    assert props["images"] == 2
+    assert props["complete"] is False
+
+
+def test_unplaceable_images_are_counted(tmp_path, capsys):
+    graph = _FakeGraph(
+        [
+            _page(
+                [
+                    _img(1, *SPOKANE, T_0915_2330),
+                    {"id": "2", "captured_at": T_0915_2330, "geometry": None},
+                    {"id": "3", "geometry": {"type": "Point", "coordinates": [-117.4, 47.7]}},
+                ]
+            )
+        ]
+    )
+    path = str(tmp_path / "m.json")
+    args = _args(tmp_path, "--db", str(tmp_path / "none.db"), "--metrics-json", path)
+    mua.run(args, fetch=graph, pacer=_pacer())
+    assert json.loads(open(path).read())["windows"][0]["skipped_unplaceable"] == 2
+    assert "2 images had no geometry or time" in capsys.readouterr().out
+
+
 def test_block_exits_75(tmp_path):
     graph = _FakeGraph([mua.HttpResult(302, "")])
     args = _args(tmp_path, "--db", str(tmp_path / "none.db"))
@@ -433,6 +625,59 @@ def test_metrics_upsert_replaces_the_same_window(tmp_path):
     )
 
 
+# ── The production fetch primitive ────────────────────────────────────────
+
+
+class _FakeResponse:
+    status_code = 302
+    text = ""
+    headers = {"Content-Type": "text/html", "Location": "https://www.mapillary.com/login"}
+
+
+class _FakeSession:
+    def __init__(self):
+        self.headers = {}
+        self.gets = []
+
+    def get(self, url, **kwargs):
+        self.gets.append((url, kwargs))
+        return _FakeResponse()
+
+
+def test_the_requests_fetch_never_follows_redirects_and_keeps_the_token_in_a_header(
+    monkeypatch,
+):
+    import requests
+
+    session = _FakeSession()
+    monkeypatch.setattr(requests, "Session", lambda: session)
+    fetch = mua.make_requests_fetch("MLY|secret|token")
+    params = mua.first_page_params("uwrapid", date(2026, 9, 15), date(2026, 9, 15))
+    res = fetch(mua.GRAPH_IMAGES_URL, params)
+
+    assert session.headers["Authorization"] == "OAuth MLY|secret|token"
+    ((url, kwargs),) = session.gets
+    assert kwargs["allow_redirects"] is False
+    assert kwargs["timeout"] == mua.REQUEST_TIMEOUT_S
+    assert "secret" not in url
+    assert "secret" not in json.dumps(kwargs["params"])
+    # The 302 comes back as a 302, so fetch_page can call it a block.
+    assert res.status == 302
+    assert res.headers["Location"].endswith("/login")
+
+
+def test_the_requests_fetch_turns_transport_failures_into_transient_errors(monkeypatch):
+    import requests
+
+    class _Dead(_FakeSession):
+        def get(self, url, **kwargs):
+            raise requests.ConnectionError("refused")
+
+    monkeypatch.setattr(requests, "Session", _Dead)
+    with pytest.raises(mua.TransientError):
+        mua.make_requests_fetch("t")(mua.GRAPH_IMAGES_URL, None)
+
+
 # ── Usage errors ──────────────────────────────────────────────────────────
 
 
@@ -451,6 +696,36 @@ def test_usage_errors_exit_64(argv):
     with pytest.raises(SystemExit) as exc:
         mua.parse_args(argv)
     assert exc.value.code == mua.USAGE_EXIT
+
+
+def test_since_defaults_to_thirty_days_before_until():
+    args = mua.parse_args(["uwrapid", "--until", "2025-01-31"], today=date(2026, 9, 23))
+    assert (args.since, args.until) == (date(2025, 1, 1), date(2025, 1, 31))
+    args = mua.parse_args(["uwrapid"], today=date(2026, 9, 23))
+    assert (args.since, args.until) == (date(2026, 8, 24), date(2026, 9, 23))
+
+
+def test_portable_path_never_records_a_home_directory():
+    inside = os.path.join(mua.PROJECT_ROOT, "data", "streetscape_tracker.db")
+    assert mua.portable_path(inside) == os.path.join("data", "streetscape_tracker.db")
+    assert mua.portable_path("/Users/someone/elsewhere/prod.db") == "prod.db"
+    assert mua.portable_path(None) is None
+
+
+def test_normalize_metrics_rewrites_only_catalog_paths(tmp_path):
+    path = tmp_path / "m.json"
+    rec = {
+        "username": "u",
+        "since": "a",
+        "until": "b",
+        "catalog_path": "/Users/x/y.db",
+        "images": 5,
+    }
+    path.write_text(json.dumps({"windows": [rec]}))
+    assert mua.normalize_metrics(str(path)) == 1
+    (w,) = json.loads(path.read_text())["windows"]
+    assert w == {**rec, "catalog_path": "y.db"}
+    assert mua.normalize_metrics(str(path)) == 0  # idempotent
 
 
 def test_refuses_a_collection_host(monkeypatch):

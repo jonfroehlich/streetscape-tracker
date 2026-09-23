@@ -98,7 +98,8 @@ An unknown or unresolvable target still exits 64; enrolling BEFORE the channel i
 
 ### One-time and repair scripts (`scripts/`)
 
-All are catalog/disk-only (no API calls), dry-run by default, and take `--execute` — except `prefreeze_street_networks.py`, which queries Overpass on purpose.
+Every script in this table is catalog/disk-only (no API calls), dry-run by default, and takes `--execute` — except `prefreeze_street_networks.py`, which queries Overpass on purpose.
+`scripts/` also holds provider probes and operator tools that are NOT in it and DO call APIs (e.g. `mapillary_user_activity.py`, `docs/operations.md`).
 
 | Script | Purpose |
 |---|---|

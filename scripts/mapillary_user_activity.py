@@ -93,9 +93,13 @@ any date.
 EXIT STATUS
 -----------
   0   complete
-  1   a non-retryable API error (bad token, unknown field, retries exhausted)
-  64  usage error
-  75  the provider refused this IP (302 -> login / HTML on 200); stop and wait
+  1   a non-retryable API error: a bad token (401), the Graph API's per-APP
+      limit (403 "Application request limit reached" -- scoped to the
+      credential, not the IP, so not a block), an unknown field, or 429/5xx
+      still failing after MAX_TRIES attempts
+  64  usage error, a missing token, or a catalog whose schema this code cannot read
+  75  the provider refused this IP (3xx -> login / HTML on 200); stop and wait.
+      Pages fetched before the refusal are still reported, as lower bounds
   83  stopped at --max-requests; the report is the newest images only
 """
 
@@ -163,7 +167,17 @@ class ActivityError(Exception):
 
 
 class BlockedError(ActivityError):
-    """The provider is refusing this IP (302 -> login, or HTML on a 200). Exit 75."""
+    """The provider is refusing this IP (3xx -> login, or HTML on a 200). Exit 75.
+
+    ``partial`` is set by the crawl to what it had gathered before the refusal,
+    so a block on page 2+ still reports those pages.
+    """
+
+    partial: CrawlResult | None = None
+
+
+class CatalogError(Exception):
+    """The catalog exists but this code cannot read it. Exit 64."""
 
 
 class TransientError(Exception):
@@ -220,7 +234,16 @@ def make_requests_fetch(access_token: str) -> Fetch:
 
 class Pacer:
     """At least ``min_interval_s`` between request starts, plus up to
-    ``JITTER_FRACTION`` of it at random. The first request is not delayed."""
+    ``JITTER_FRACTION`` of it at random. The first request is not delayed.
+
+    Deliberately NOT ``download_common.spaced_gap_seconds`` (#292's pacer).
+    That formula keeps a configured MEAN rate and lets individual gaps fall to
+    ``(1 - jitter) * mean`` -- right for the tile census, whose budgets are
+    derived from the mean. This tool's contract is the opposite one: a HARD
+    floor ("never faster than one request per ``--min-interval``"), with jitter
+    only ever lengthening a gap. At a few dozen requests a run the two differ
+    by nothing measurable; the floor is simply the easier promise to check.
+    """
 
     def __init__(
         self,
@@ -361,9 +384,10 @@ def crawl_user_images(
 ) -> CrawlResult:
     """Follow ``paging.next`` until it runs out or the request budget does.
 
-    The next URL is followed only if it stays on ``graph.mapillary.com``: the
+    The next URL is followed only if it is ``https://graph.mapillary.com``: the
     session sends the token on every request, and a cursor that pointed
-    anywhere else would be handed it.
+    anywhere else -- or at plain http -- would hand it over.
+    An empty page ends the crawl even if it carries a cursor.
     """
     images: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
@@ -374,15 +398,19 @@ def crawl_user_images(
     seen_urls: set[str] = set()
 
     while True:
-        page = fetch_page(
-            url,
-            params,
-            fetch=fetch,
-            pacer=pacer,
-            budget=budget,
-            max_requests=max_requests,
-            sleep=sleep,
-        )
+        try:
+            page = fetch_page(
+                url,
+                params,
+                fetch=fetch,
+                pacer=pacer,
+                budget=budget,
+                max_requests=max_requests,
+                sleep=sleep,
+            )
+        except BlockedError as exc:
+            exc.partial = CrawlResult(images, budget[0], complete=False, pages=pages)
+            raise
         if page is None:
             return CrawlResult(images, budget[0], complete=False, pages=pages)
         pages += 1
@@ -396,8 +424,11 @@ def crawl_user_images(
         next_url = (page.get("paging") or {}).get("next")
         if not data or not next_url:
             return CrawlResult(images, budget[0], complete=True, pages=pages)
-        if urlparse(next_url).hostname != GRAPH_HOST:
-            raise ActivityError(f"paging.next points off {GRAPH_HOST}; refusing to follow it")
+        parsed = urlparse(next_url)
+        if parsed.scheme != "https" or parsed.hostname != GRAPH_HOST:
+            raise ActivityError(
+                f"paging.next is not https://{GRAPH_HOST}; refusing to send the token to it"
+            )
         if next_url in seen_urls:
             raise ActivityError("paging.next repeated a cursor already followed; stopping")
         seen_urls.add(next_url)
@@ -490,25 +521,51 @@ def open_catalog_readonly(path: str) -> sqlite3.Connection | None:
 
     Never ``db.connect``: that creates the file and migrates the schema, and
     this tool must not write to a catalog -- least of all production's.
+
+    Raises CatalogError for a file that is not a catalog (``user_version`` 0)
+    or is NEWER than this code's ``db.SCHEMA_VERSION``: ``db.connect`` refuses
+    the latter too, and reading it anyway fails deep inside with a bare
+    TypeError on a column the dataclasses do not know.
     """
     if not os.path.isfile(path):
         return None
     conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=10)
     conn.row_factory = sqlite3.Row
+    try:
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+    except sqlite3.DatabaseError as exc:
+        conn.close()
+        raise CatalogError(f"{path} is not a readable SQLite catalog ({exc})") from None
+    if version == 0 or version > db.SCHEMA_VERSION:
+        conn.close()
+        raise CatalogError(
+            f"{path} has schema version {version}; this code reads 1..{db.SCHEMA_VERSION}. "
+            f"Update this checkout (or pass --db a catalog it can read)."
+        )
     return conn
 
 
 def load_catalog_cities(conn: sqlite3.Connection) -> list[CatalogCity]:
-    """Every enabled city's frozen bbox and latest Mapillary run."""
+    """Every enabled city's frozen bbox and latest Mapillary run.
+
+    Two queries, not one per city: ``db.get_latest_runs_all`` is the latest
+    run of every (city, provider) by ``run_date`` -- the same choice
+    ``db.get_latest_run`` makes. On a run_date tie it can return both rows;
+    the first is kept, as arbitrary as ``get_latest_run``'s LIMIT 1.
+    """
+    latest: dict[str, sqlite3.Row] = {}
+    for row in db.get_latest_runs_all(conn):
+        if row["provider"] == "mapillary":
+            latest.setdefault(row["city_id"], row)
     out = []
     for city in db.get_all_cities(conn, enabled_only=True):
-        run = db.get_latest_run(conn, city.city_id, provider="mapillary")
+        run = latest.get(city.city_id)
         out.append(
             CatalogCity(
                 city_id=city.city_id,
                 bbox=frozen_bbox(city),
-                last_run_date=run.run_date if run else None,
-                newest_capture_date=(run.newest_capture_date or None) if run else None,
+                last_run_date=run["run_date"] if run else None,
+                newest_capture_date=(run["newest_capture_date"] or None) if run else None,
             )
         )
     return out
@@ -573,6 +630,11 @@ def format_report(groups: list[dict[str, Any]], meta: dict[str, Any]) -> str:
     ]
     if meta["complete"]:
         lines.append("Counts are EXACT (cursor followed to the end).")
+    elif meta.get("stop_reason") == "blocked":
+        lines.append(
+            f"BLOCKED after {meta['pages']} page(s): these are the NEWEST {meta['images']} "
+            f"images only, and every count is a LOWER BOUND."
+        )
     else:
         lines.append(
             f"TRUNCATED at --max-requests {meta['max_requests']}: these are the NEWEST "
@@ -643,12 +705,12 @@ def parse_args(argv: list[str] | None = None, *, today: date | None = None) -> a
     p = _UsageParser(
         description="Where has a Mapillary user mapped most recently, and do our runs have it?"
     )
-    p.add_argument("username", help="Mapillary username (creator_username)")
+    p.add_argument("username", nargs="?", help="Mapillary username (creator_username)")
     p.add_argument(
         "--since",
         type=_date_arg,
-        default=today - timedelta(days=DEFAULT_WINDOW_DAYS),
-        help=f"first UTC capture date, inclusive (default: {DEFAULT_WINDOW_DAYS} days ago)",
+        default=None,
+        help=f"first UTC capture date, inclusive (default: {DEFAULT_WINDOW_DAYS} days before --until)",
     )
     p.add_argument(
         "--until",
@@ -685,9 +747,21 @@ def parse_args(argv: list[str] | None = None, *, today: date | None = None) -> a
         action="store_true",
         help="run even on a makelab* host (the nightly batch's IP); think twice",
     )
+    p.add_argument(
+        "--normalize-metrics",
+        default=None,
+        metavar="PATH",
+        help="rewrite PATH's catalog paths into portable form and exit (no network)",
+    )
     p.add_argument("--log-level", default="INFO")
     args = p.parse_args(argv)
 
+    if args.normalize_metrics:
+        return args
+    if args.username is None:
+        p.error("a Mapillary username is required")
+    if args.since is None:
+        args.since = args.until - timedelta(days=DEFAULT_WINDOW_DAYS)
     if not USERNAME_RE.match(args.username):
         p.error(f"not a plausible Mapillary username: {args.username!r}")
     if args.since > args.until:
@@ -738,6 +812,46 @@ def docs_generated_by(args: argparse.Namespace) -> str:
     return " ".join(parts)
 
 
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def portable_path(path: str | None) -> str | None:
+    """A catalog path fit to commit: repo-relative if inside this checkout,
+    else the basename. An absolute home path names a machine and a user and
+    means nothing on any other checkout."""
+    if path is None:
+        return None
+    absolute = os.path.abspath(path)
+    if os.path.commonpath([absolute, PROJECT_ROOT]) == PROJECT_ROOT:
+        return os.path.relpath(absolute, PROJECT_ROOT)
+    return os.path.basename(absolute)
+
+
+def normalize_metrics(path: str) -> int:
+    """Rewrite every record's ``catalog_path`` through ``portable_path``.
+
+    Offline repair for records written before that function existed; touches
+    nothing else, so each record's ``generated_by`` stays true of its data.
+    Returns how many records changed.
+    """
+    with open(path, encoding="utf-8") as fh:
+        doc = json.load(fh)
+    changed = 0
+    for w in doc.get("windows", []):
+        new = portable_path(w.get("catalog_path"))
+        if new != w.get("catalog_path"):
+            w["catalog_path"] = new
+            changed += 1
+    _write_metrics(path, doc)
+    return changed
+
+
+def _write_metrics(path: str, doc: dict[str, Any]) -> None:
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(doc, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+
+
 def upsert_metrics(path: str, record: dict[str, Any]) -> None:
     """Add (or replace) this window's record in a metrics file.
 
@@ -756,9 +870,7 @@ def upsert_metrics(path: str, record: dict[str, Any]) -> None:
     ]
     doc["windows"].append(record)
     doc["windows"].sort(key=lambda w: (w["username"], w["since"], w["until"]))
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump(doc, fh, indent=2, sort_keys=True)
-        fh.write("\n")
+    _write_metrics(path, doc)
 
 
 def run(
@@ -772,6 +884,7 @@ def run(
     """Everything after argument parsing and credential loading."""
     out = out or sys.stdout
     status = EXIT_OK
+    stop_reason = None
     try:
         crawl = crawl_user_images(
             args.username,
@@ -784,7 +897,10 @@ def run(
         )
     except BlockedError as exc:
         print(f"BLOCKED: {exc}", file=sys.stderr)
-        return BLOCKED_EXIT
+        if exc.partial is None or not exc.partial.images:
+            return BLOCKED_EXIT
+        # A block on page 2+: report what the earlier pages already paid for.
+        crawl, stop_reason = exc.partial, "blocked"
     except ActivityError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return EXIT_ERROR
@@ -793,7 +909,11 @@ def run(
     placed = sum(g["images"] for g in groups)
 
     db_path = args.db or db.get_default_db_path(get_default_data_dir())
-    conn = open_catalog_readonly(db_path)
+    try:
+        conn = open_catalog_readonly(db_path)
+    except CatalogError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return USAGE_EXIT
     if conn is None:
         catalog_note = f"No catalog at {db_path}: catalog match skipped."
         catalog_path = None
@@ -809,7 +929,7 @@ def run(
             f"Catalog: {db_path} (read-only; {len(cities)} enabled cities, {n_runs} with a "
             f"Mapillary run). A checkout's catalog is usually a DEV copy, not production's."
         )
-        catalog_path = db_path
+        catalog_path = portable_path(db_path)
 
     meta = {
         "username": args.username,
@@ -820,6 +940,7 @@ def run(
         "pages": crawl.pages,
         "max_requests": args.max_requests,
         "complete": crawl.complete,
+        "stop_reason": stop_reason or ("complete" if crawl.complete else "max_requests"),
         "images": len(crawl.images),
         "skipped_unplaceable": len(crawl.images) - placed,
         "catalog_path": catalog_path,
@@ -838,6 +959,8 @@ def run(
         record["groups"] = groups
         upsert_metrics(args.metrics_json, record)
 
+    if stop_reason == "blocked":
+        return BLOCKED_EXIT
     if not crawl.complete:
         print(
             f"Stopped at --max-requests {args.max_requests}: counts are lower bounds "
@@ -851,6 +974,10 @@ def run(
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     logging.basicConfig(level=args.log_level, format="%(asctime)s %(levelname)s %(message)s")
+    if args.normalize_metrics:
+        changed = normalize_metrics(args.normalize_metrics)
+        print(f"{args.normalize_metrics}: {changed} catalog path(s) made portable")
+        return EXIT_OK
     refuse_on_collection_host(args.allow_collection_host)
 
     # The repo convention: bare load_dotenv() to LOAD (it walks up from this

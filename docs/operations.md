@@ -169,9 +169,11 @@ python scripts/mapillary_user_activity.py uwrapid --since 2026-09-01 --until 202
 
 Each group reports its solar day, centroid, image and sequence counts, pano share and first/last capture (UTC).
 With a catalog, a group inside an enabled city's frozen bbox also carries that city's last Mapillary run date and the newest capture it saw, flagged `AFTER LAST RUN` (captured after it) and `NEWER THAN SEEN` (newer than anything it saw — captured earlier but uploaded later).
-A checkout's catalog is usually a dev copy with almost no Mapillary runs, so pass `--db` a copy of production's to answer the real question; the catalog is opened read-only and the report names the path it read.
+A checkout's catalog is usually a dev copy with almost no Mapillary runs, so pass `--db` a copy of production's to answer the real question; the catalog is opened read-only, a schema newer than the checkout's code exits 64, and the report names the path it read (a metrics record keeps only a repo-relative path or a basename).
+With only `--until`, the window is the 30 days before it.
 
-The pacing was taken against the provider-access record first (CLAUDE.md, READ THIS FIRST): single-threaded, at least 1 s between requests with jitter that only lengthens a gap, 429/5xx retried at most four times on `Retry-After` or exponential backoff, and a 302 or an HTML page — how Mapillary presents a per-IP block — stops the run at once with exit **75** and is never retried.
+The pacing was taken against the provider-access record first (CLAUDE.md, READ THIS FIRST): single-threaded, at least 1 s between requests with jitter that only lengthens a gap, 429/5xx given at most four attempts in all (three retries) on `Retry-After` or exponential backoff, each retry paced like any request, and a 3xx or an HTML page — how Mapillary presents a per-IP block — stops the run at once with exit **75** and is never retried; pages fetched before it are still reported, as lower bounds.
+A 403 "Application request limit reached" is the Graph API's per-APP limit, scoped to the credential rather than the IP, and exits 1 like a bad token.
 `--max-requests` (default 200, retries included) stops a heavy contributor cleanly with exit **83**; the cursor is newest-first, so a stopped run holds the most recent images and says its counts are lower bounds.
 It refuses a `makelab*` host unless `--allow-collection-host`, and nothing in the scheduler calls it.
 The measurement behind it, including why the UTC date is the wrong grouping key, is [`experiments/mapillary-user-activity.md`](experiments/mapillary-user-activity.md).
