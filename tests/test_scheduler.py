@@ -3458,13 +3458,42 @@ def test_the_reserve_promotes_the_stalest_refreshes_into_the_window(conn):
 
     ids = [c.city_id for c in slate.cities]
     assert slate.promoted == 2
-    # The two stalest refreshes are IN the window, at its end so the head stays
-    # breadth-first; the third stays out.
-    assert ids[:4] == never_ids[:2] + refresh_ids[:2]
+    # The two stalest refreshes are IN the window and LEAD it, so they run
+    # whether the cap or the max_batch_hours deadline ends the night; the third
+    # stays out.
+    assert ids[:4] == refresh_ids[:2] + never_ids[:2]
     # The displaced never-collected cities keep their relative order immediately
     # after the window, so they lead TOMORROW rather than falling to the tail.
     assert ids[4:6] == never_ids[2:4]
     assert ids[6:] == refresh_ids[2:]
+
+
+def test_the_reserve_leads_the_slate_when_the_deadline_not_the_cap_ends_the_night(conn):
+    """A cap far above what a night reaches must not turn the reserve off.
+
+    With `max_cities_per_day` set so the 12 h deadline is what stops a night,
+    the whole due slate fits inside the window. The reserve used to return
+    early there (nothing beyond the window to promote from), leaving every
+    refresh behind the NULLS FIRST block — and, when it did promote, it put
+    them at the END of the window, which is exactly where the deadline cuts.
+    Either way a night stopped by the clock ran zero refreshes, silently.
+    """
+    never_ids, refresh_ids = _slate_conn(
+        conn,
+        never=6,
+        refreshes=["2026-01-01T00:00:00+00:00", "2026-02-01T00:00:00+00:00"],
+    )
+
+    cfg = SchedulerConfig(publish_enabled=False, refresh_slots=1, max_cities_per_day=400)
+    slate = _sched._collect_due(
+        conn, cfg, date(2026, 7, 2), ["gsv"], max_opt_in=_reserve(cfg, 400), max_cities=400
+    )
+
+    ids = [c.city_id for c in slate.cities]
+    # A deadline that stops after ANY number of cities still reaches the
+    # stalest refresh first; the other refresh keeps its stalest-first place.
+    assert ids == [refresh_ids[0]] + never_ids + [refresh_ids[1]]
+    assert slate.promoted == 1
 
 
 def test_a_promoted_city_is_never_refreshed_early(conn):
@@ -3519,7 +3548,7 @@ def test_a_refresh_is_any_due_channel_with_a_prior_success(conn):
     )
 
     assert slate.promoted == 1
-    assert [c.city_id for c in slate.cities][:2] == [never_ids[0], mixed]
+    assert [c.city_id for c in slate.cities][:2] == [mixed, never_ids[0]]
     assert slate.providers_for_city[mixed] == ["gsv", "mapillary"]
 
 

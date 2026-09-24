@@ -6054,7 +6054,7 @@ def _reserve_refresh_slots(
     ordered: list[db.CityRow], refresh_ids: set[str], window: int, reserved: int
 ) -> tuple[list[db.CityRow], int]:
     """
-    Give ``reserved`` of the first ``window`` slots to refreshes (issue #308).
+    Put the ``reserved`` stalest refreshes at the HEAD of the slate (issue #308).
 
     ``db.get_due_cities`` orders ``last_success_at ASC NULLS FIRST``, so every
     city that has never succeeded on a channel sits ahead of every city that
@@ -6072,13 +6072,24 @@ def _reserve_refresh_slots(
     construction rather than argued, the same property
     ``max_concurrent_channels = 1`` keeps for #240.
 
-    THE PROMOTION IS ORDER-PRESERVING IN BOTH DIRECTIONS, which is what stops
-    it becoming a churn machine. Promoted refreshes keep their stalest-first
-    relative order and land at the END of the window (so tonight's slate is
-    still breadth-first at its head); the non-refresh cities they displace are
-    the window's LAST ones, kept in their relative order immediately after it,
-    so they lead tomorrow's slate rather than being shuffled back into the
-    ~900-city tail.
+    THE HEAD, NOT THE END OF THE WINDOW. #308 shipped with the promoted
+    refreshes landing at the END of the ``window`` so the night's head stayed
+    breadth-first. That is only safe while the city cap is what ends the night,
+    because then the whole window runs. Once ``max_batch_hours`` is the
+    governor and the cap is set well above what a night reaches, the end of
+    the window is exactly where the deadline stops, so every refresh slot
+    would silently go unrun — and so would the early return this function used
+    to take when the whole slate fit inside the window, which left the
+    refreshes at the tail of the NULLS FIRST order. At the head they run first
+    whichever of the cap or the deadline ends the night.
+
+    What does NOT change is which cities the window holds. The reserved
+    refreshes are the first ``reserved`` refreshes of the whole slate — the
+    ones already inside the window, then the stalest beyond it — so the window
+    holds the same set it did under #308, only reordered, and the non-refresh
+    cities displaced out of it are still the window's last ones, kept in
+    relative order immediately after it so they lead tomorrow's slate rather
+    than being shuffled back into the ~900-city tail.
 
     What this CANNOT do is refresh a city early, and that is not this
     function's doing: ``ordered`` is built from ``db.get_due_cities``, which
@@ -6090,33 +6101,29 @@ def _reserve_refresh_slots(
         ordered: the union slate, stalest-first (mutated: no; a new list).
         refresh_ids: city_ids with a prior success on at least one channel they
             are due on tonight.
-        window: how many cities the night can actually process.
-        reserved: how many of those slots refreshes may take.
+        window: how many cities the night's cap allows.
+        reserved: how many refreshes to lead the slate with.
 
     Returns:
-        ``(reordered, promoted)`` — ``promoted`` counts cities moved INTO the
-        window, so 0 means the slate is unchanged.
+        ``(reordered, promoted)`` — ``promoted`` counts refreshes that actually
+        MOVED (some non-refresh city preceded them), the same definition
+        ``hoisted`` uses, so 0 means the slate is unchanged.
     """
-    if reserved <= 0 or window <= 0 or len(ordered) <= window:
-        # Nothing beyond the window to promote FROM, so there is nothing to
-        # trade. Returning early rather than falling through the arithmetic
-        # keeps the no-op case a literal identity rather than one that happens
-        # to compute the same list.
+    take = min(reserved, window)
+    if take <= 0:
         return ordered, 0
-    have = sum(1 for c in ordered[:window] if c.city_id in refresh_ids)
-    candidates = [c for c in ordered[window:] if c.city_id in refresh_ids]
-    # `window - have` is the third term and it is not redundant with the
-    # caller's clamp: it is what keeps `window - need` non-negative HERE, so a
-    # future caller passing an unclamped `reserved` gets "every slot" rather
-    # than a negative slice, which Python would honour silently by counting
-    # from the end.
-    need = min(reserved - have, len(candidates), window - have)
-    if need <= 0:
+    chosen_idx = [i for i, c in enumerate(ordered) if c.city_id in refresh_ids][:take]
+    if not chosen_idx:
         return ordered, 0
-    promoted = candidates[:need]
-    promoted_ids = {c.city_id for c in promoted}
-    rest = [c for c in ordered if c.city_id not in promoted_ids]
-    return rest[: window - need] + promoted + rest[window - need :], need
+    chosen = set(chosen_idx)
+    # A chosen refresh moves exactly when a non-chosen city precedes it, i.e.
+    # its index is past the chosen prefix it will form.
+    promoted = sum(1 for rank, i in enumerate(chosen_idx) if i != rank)
+    if promoted == 0:
+        return ordered, 0
+    head = [ordered[i] for i in chosen_idx]
+    rest = [c for i, c in enumerate(ordered) if i not in chosen]
+    return head + rest, promoted
 
 
 def _collect_due(
@@ -6182,8 +6189,9 @@ def _collect_due(
     and then evicted out of it.
 
     That eviction is not hypothetical, and it is why this order is the reverse
-    of the one #308 shipped with. ``_reserve_refresh_slots`` lands its promoted
-    refreshes at the END of the window, and an unbounded hoist displaced the
+    of the one #308 shipped with. ``_reserve_refresh_slots`` then landed its
+    promoted refreshes at the END of the window (it leads the slate with them
+    now, see its docstring), and an unbounded hoist displaced the
     window's LAST cities — so refresh-then-hoist evicted precisely what the
     reserve had just promoted. At the derived pair on prod's cap (10 + 10 of
     40) that nullified ``refresh_slots`` outright on exactly the nights a
@@ -6498,7 +6506,7 @@ def _collect_due(
     # `promoted_opt_in` entries ARE the chosen cities by construction, so the
     # hoist's head is a known prefix and the remainder is exactly the window
     # this reserve is entitled to. Applied the other way round it promoted
-    # refreshes to the END of the window and the hoist then displaced the
+    # refreshes to the END of the window (as it did then) and the hoist displaced the
     # window's last cities -- which are the same cities -- so the reserve
     # cancelled itself on precisely the nights the hoist is doing anything.
     #
@@ -6508,8 +6516,9 @@ def _collect_due(
     # what a refresh slot means. _reserve_refresh_slots clamps to the window it
     # is given, so the narrowing binds without the derivation moving.
     #
-    # A hoisted city that is itself a refresh is not counted in the reserve's
-    # `have`, so the night can end up with more refreshes than `refresh_slots`.
+    # A hoisted city that is itself a refresh is not passed to the reserve, so
+    # it does not use up a refresh slot and the night can end up with more
+    # refreshes than `refresh_slots`.
     # That is the right direction: the key is a floor on second intervals, not
     # a ration of them.
     tail, promoted = _reserve_refresh_slots(
