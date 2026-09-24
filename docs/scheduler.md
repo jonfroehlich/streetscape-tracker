@@ -19,6 +19,10 @@ Stagger = `sha256(city_id) % cycle_days`, identical for all providers of a city.
 — the filter is applied in `_collect_due`, whose `providers` argument is **required** (a None-means-everything default put a fail-open path one refactor away from `_select_providers`'s error return, which is now a raised `_UsageError`),
 so a channel absent from `providers_for_city` is never priced, budgeted or launched, and everything else about the night (backup, driving-plan hook, breaker, tail) is unchanged.
 It is not free of consequences, though — see the paired-snapshot note in the Mapillary budget section of `docs/provider-access.md`.
+`run-due --city CITY` (repeatable, never comma-split — queries carry commas) narrows it further to named cities, for a targeted retry that keeps every guard above rather than being run as a bare collector command.
+It is applied in `_collect_due` to each channel's due list BEFORE the union, so both reservations and the logged `hoisted`/`promoted` counts describe the slate that actually runs.
+It **narrows and never forces**: a named city that is not due (fresh clock, failure cap, excluded, disabled) is warned about by name and skipped, and an unresolvable name exits 64 before any schedule write.
+The motivating case was 2026-09-24: Detroit's and Fresno's Mapillary walks had each failed once during the August block and sat at queue positions 66 and 76 of 271, deferred behind the alphabetical never-collected block, with no supported way to reach them.
 
 **Every channel is paced, so every channel's per-city timeout is DERIVED rather than flat, and `city_timeout_minutes` (180) is only the floor.**
 The shape is the same for all of them — `estimated_requests / (rate × achieved_rate_fraction) × _TIMEOUT_HEADROOM + _TIMEOUT_FIXED_SLACK_S`, never below the floor — and what differs is where the request count and the rate come from.
