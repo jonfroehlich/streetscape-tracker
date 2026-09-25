@@ -1025,7 +1025,10 @@ def _opt_in_reservation(cfg: SchedulerConfig, max_cities: int) -> int:
     this key exists to prevent, reached through the flag meant to narrow a run.
     So an explicit value is scaled by the same ratio the cap moved, and only
     then clamped. At ``--limit == max_cities_per_day`` the scaling is the
-    identity, so a nightly run is unaffected.
+    identity, so a nightly run is unaffected. The scaled value is floored at
+    the derived quarter of the narrowed run (never above the configured value),
+    because a cap set as a ceiling far above a night's reach would otherwise
+    round every ``--limit`` catch-up's reservation to 0.
 
     The final clamp to ``max_cities`` stays, and stays at the cap rather than
     below it: a reservation EQUAL to the cap is the unbounded hoist spelled
@@ -1049,7 +1052,15 @@ def _opt_in_reservation(cfg: SchedulerConfig, max_cities: int) -> int:
     else:
         # Round down, so narrowing a run never rounds the reservation UP into a
         # larger share of it than the standing config asks for.
-        reservation = max(0, configured * max_cities // cfg.max_cities_per_day)
+        scaled = configured * max_cities // cfg.max_cities_per_day
+        # ...but never below the DERIVED quarter of the narrowed run (capped at
+        # the configured value). The ratio alone assumes the cap is a night's
+        # size; once the cap is a ceiling far above what a night reaches
+        # (2026-09-25: 10 of 400), it rounds every `--limit` catch-up down to
+        # 0 -- `run-due --provider panoramax --limit 20` would hoist nobody and
+        # a live checkpoint would stop outranking the rotation. The quarter is
+        # the share the derived path already treats as starvation-safe.
+        reservation = max(0, scaled, min(configured, max_cities // _OPT_IN_SLOT_SHARE))
     return max(0, min(reservation, max_cities))
 
 
@@ -6083,13 +6094,15 @@ def _reserve_refresh_slots(
     refreshes at the tail of the NULLS FIRST order. At the head they run first
     whichever of the cap or the deadline ends the night.
 
-    What does NOT change is which cities the window holds. The reserved
-    refreshes are the first ``reserved`` refreshes of the whole slate — the
-    ones already inside the window, then the stalest beyond it — so the window
-    holds the same set it did under #308, only reordered, and the non-refresh
-    cities displaced out of it are still the window's last ones, kept in
-    relative order immediately after it so they lead tomorrow's slate rather
-    than being shuffled back into the ~900-city tail.
+    The reserved refreshes are the first ``reserved`` refreshes of the whole
+    slate — the ones already inside the window, then the stalest beyond it —
+    and the cities displaced out of the window are its last non-chosen ones,
+    kept in relative order immediately after the window so they lead
+    tomorrow's slate rather than being shuffled back into the ~900-city tail.
+    The window's SET usually matches #308's but not always: #308 displaced the
+    window's last cities whatever they were, so it could evict a refresh that
+    already sat inside it. This version never holds fewer refreshes in the
+    window than #308 did.
 
     What this CANNOT do is refresh a city early, and that is not this
     function's doing: ``ordered`` is built from ``db.get_due_cities``, which
@@ -6239,7 +6252,8 @@ def _collect_due(
     # (issue #248). The union above is ordered by first appearance, so the
     # first channel in `providers` — normally gsv, rank 0 — dictates city
     # order and later channels only append cities gsv did not already surface.
-    # _run_city_loop then stops at max_cities_per_day (prod: 20) out of ~949.
+    # _run_city_loop then stops at max_cities_per_day or the max_batch_hours
+    # deadline, whichever comes first, out of ~949.
     #
     # For a city due on both gsv and an opt-in channel that is already right:
     # it sits in gsv's stalest-first list and both channels run the same night.
@@ -6556,7 +6570,11 @@ def _collect_due(
         ]
         reached = sum(1 for i in stranded if i < max_cities)
         waiting = len(stranded) - reached
-        if waiting:
+        # Logged whenever anything is stranded, not only when some fall outside
+        # the cap: with the cap set far above a night's reach (2026-09-25, 400)
+        # nothing ever falls outside it, and the line an operator widening a
+        # channel reads would go silent on exactly the nights the deadline cuts.
+        if stranded:
             # Named for what the population actually IS on this run, because it
             # is mixed now. A filtered widening (`run-due --provider kartaview`)
             # strands nobody by the rank-0 key and every due city is
@@ -6568,10 +6586,15 @@ def _collect_due(
                 p in opt_in for i in stranded for p in providers_for_city[ordered[i].city_id]
             )
             noun = "opt-in-only cities" if all_opt_in_only else f"cities not due on {rank0}"
+            later = (
+                f"{waiting} wait for a later night"
+                if waiting
+                else f"past the first {promoted_opt_in}, the deadline decides how many run"
+            )
             logger.info(
                 f"{reached} of {len(stranded)} {noun} are inside tonight's "
                 f"{max_cities}-city cap ([schedule].opt_in_cities_per_day={max_opt_in} "
-                f"reserved, {promoted_opt_in} promoted); {waiting} wait for a later night"
+                f"reserved, {promoted_opt_in} promoted); {later}"
             )
     return DueSlate(ordered, providers_for_city, hoisted, promoted)
 

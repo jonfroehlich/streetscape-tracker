@@ -26,6 +26,12 @@ What it does, in order:
    past the first ``max_cities_per_day`` entries. The order beyond the cap is
    what those extra slots and the following night draw from, so ``--nights 2``
    covers both.
+   Since 2026-09-25 prod's cap (400) is a ceiling far above what a night
+   reaches, so the window is effectively the whole due slate and ``--nights``
+   no longer narrows anything; ``--limit`` is what bounds a pass. The plan is
+   in slate order either way, so the first ``--limit`` cold networks are
+   tonight's head -- but how many cities a deadline-governed night reaches is
+   not yet measured, so ``--limit 40`` is an assumption to re-check.
 3. Dry run by DEFAULT: prints the list and exits. With ``--execute`` it fetches
    them SERIALLY, one at a time, sleeping ``--pause-s`` between fetches, through
    the same host lock, ``/status`` pre-flight, retry policy and deadline every

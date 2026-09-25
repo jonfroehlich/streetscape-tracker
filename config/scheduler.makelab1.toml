@@ -18,8 +18,8 @@ grace_days = 7
 # the cap at all. max_batch_hours is the real governor — it stops starting
 # cities, clamps the in-flight child and still runs the tail — so this is now
 # high enough to let it be the only one. More cities SEQUENTIALLY does not
-# raise peak memory (max_concurrent_channels = 1 means one child at a time), so
-# #305's MemoryHigh headroom is untouched by this.
+# raise peak memory (cities run one at a time; max_concurrent_channels bounds
+# the children of that one city), so #305's MemoryHigh headroom is untouched.
 #
 # 40 -> 400 on 2026-09-25. 40 still ended light nights on the CAP with clock
 # left over, so this makes max_batch_hours the only limit in practice: 400 is
@@ -32,7 +32,8 @@ max_cities_per_day = 400   # cities/day (a city runs all enabled providers)
 
 # Slots reserved out of max_cities_per_day for cities due ONLY on an opt-in
 # channel (issue #282). Unset means "a quarter of the cap, floored at 1" —
-# 10 at the cap above — and the resolution lives in one place,
+# 100 at the cap above, which is why it is SET below — and the resolution
+# lives in one place,
 # scheduler._opt_in_reservation, so a config that sets this and one that does
 # not cannot disagree about what it means.
 #
@@ -50,11 +51,11 @@ max_cities_per_day = 400   # cities/day (a city runs all enabled providers)
 # Setting it equal to max_cities_per_day re-creates the unbounded hoist by hand
 # (the night then warns); 0 switches the promotion off without un-enrolling.
 #
-# This and refresh_slots below are the night's TWO reservations, both derived
-# as a quarter of the same cap, and they are applied in that order: the refresh
-# reserve promotes first and the bounded hoist promotes ahead of it. At the
-# pair (10 + 10, explicit since the cap went to 400) 20 cities lead the night and
-# the rest is pure stalest-first — raise either one and check the other, since it is the SUM
+# This and refresh_slots below are the night's TWO reservations, applied in
+# that order: the bounded hoist takes the head of the slate, then the refresh
+# reserve leads what the hoist did not take. At the pair (10 + 10, explicit
+# since the cap went to 400) 20 cities lead the night and the rest is pure
+# stalest-first — raise either one and check the other, since it is the SUM
 # that bounds how much of a night the plain queue still governs.
 #
 # Set explicitly on 2026-09-25, when max_cities_per_day went 40 -> 400: the
@@ -78,9 +79,9 @@ city_timeout_minutes = 180
 # (docs/provider-access.md).
 max_batch_hours = 12
 # How many of a capped night's city slots go to cities that will gain a SECOND
-# dated interval (issue #308). Left unset on purpose: it derives
-# max_cities_per_day // 4 (10 of 40 here), so the split follows the cap from
-# one place rather than being a second number to keep in step. Set 0 to go back
+# dated interval (issue #308). Unset it derives max_cities_per_day // 4, which
+# followed the cap while the cap was a night's size; at 400 it would be 100,
+# so it is SET below. Set 0 to go back
 # to pure breadth-first. The reserve cannot refresh a city early — every city
 # it can promote already cleared the cycle_days - grace_days (83 day) wall.
 #
