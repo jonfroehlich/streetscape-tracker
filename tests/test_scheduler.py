@@ -2202,8 +2202,8 @@ def test_city_filter_composes_with_the_provider_filter(conn, monkeypatch):
 
 
 def test_city_filter_resolves_a_query_and_a_city_id_to_one_city(conn, monkeypatch):
-    """Both spellings resolve through db.resolve_city, and naming a city twice
-    must not collect it twice."""
+    """Both spellings resolve through db.resolve_city to the same city. (That it
+    then runs once is the union loop's existing de-duplication, not --city's.)"""
     from streetscape_metadata_tracker import scheduler as sched
 
     salem = _register(conn, "Salem", width=1000, height=1000, step=20)
@@ -2218,6 +2218,71 @@ def test_city_filter_resolves_a_query_and_a_city_id_to_one_city(conn, monkeypatc
     )
 
     assert ran == [(salem, "mapillary")]
+
+
+def test_city_filter_runs_every_named_city_and_only_those(conn, monkeypatch):
+    """The prod use names dozens of cities: every one runs, the unnamed one does not."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    bend = _register(conn, "Bend", width=1000, height=1000, step=20)
+    salem = _register(conn, "Salem", width=1000, height=1000, step=20)
+    eugene = _register(conn, "Eugene", width=1000, height=1000, step=20)
+    ran = []
+    _stub_collection(sched, monkeypatch, conn, ran)
+
+    sched.cmd_run_due(
+        _mly_cfg(),
+        today=date(2026, 7, 2),
+        requested_providers=["mapillary"],
+        requested_cities=[salem, eugene],
+    )
+
+    assert sorted(ran) == sorted([(salem, "mapillary"), (eugene, "mapillary")])
+    assert (bend, "mapillary") not in ran
+
+
+def test_city_filter_is_not_truncated_by_the_nightly_city_cap(conn, monkeypatch):
+    """Naming more cities than max_cities_per_day runs them all: the list is the
+    cap, or the tail of a long --city list would be dropped with no name."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    salem = _register(conn, "Salem", width=1000, height=1000, step=20)
+    eugene = _register(conn, "Eugene", width=1000, height=1000, step=20)
+    ran = []
+    _stub_collection(sched, monkeypatch, conn, ran)
+
+    sched.cmd_run_due(
+        _mly_cfg(max_cities_per_day=1),
+        today=date(2026, 7, 2),
+        requested_providers=["mapillary"],
+        requested_cities=[salem, eugene],
+    )
+
+    assert sorted(ran) == sorted([(salem, "mapillary"), (eugene, "mapillary")])
+
+
+def test_city_filter_names_the_cities_an_explicit_limit_leaves_out(conn, monkeypatch, caplog):
+    """An explicit --limit still caps the run, and the named cities past it are
+    listed by name rather than left to "city cap reached"."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    salem = _register(conn, "Salem", width=1000, height=1000, step=20)
+    eugene = _register(conn, "Eugene", width=1000, height=1000, step=20)
+    ran = []
+    _stub_collection(sched, monkeypatch, conn, ran)
+
+    with caplog.at_level("WARNING"):
+        sched.cmd_run_due(
+            _mly_cfg(),
+            today=date(2026, 7, 2),
+            requested_providers=["mapillary"],
+            requested_cities=[salem, eugene],
+            limit=1,
+        )
+
+    assert len(ran) == 1
+    (left_out,) = {salem, eugene} - {c for c, _ in ran}
+    assert any("--limit is 1" in r.message and left_out in r.message for r in caplog.records)
 
 
 def test_city_filter_skips_and_reports_a_named_city_that_is_not_due(conn, monkeypatch, caplog):

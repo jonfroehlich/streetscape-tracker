@@ -20,6 +20,7 @@ Stagger = `sha256(city_id) % cycle_days`, identical for all providers of a city.
 so a channel absent from `providers_for_city` is never priced, budgeted or launched, and everything else about the night (backup, driving-plan hook, breaker, tail) is unchanged.
 It is not free of consequences, though — see the paired-snapshot note in the Mapillary budget section of `docs/provider-access.md`.
 `run-due --city CITY` (repeatable, never comma-split — queries carry commas) narrows it further to named cities, for a targeted retry that keeps every guard above rather than being run as a bare collector command.
+Without `--limit`, the number of named cities replaces `max_cities_per_day` as the cap, so a 50-city list is never silently cut to 40; with an explicit `--limit` below the count, the named cities past it are logged by name.
 It is applied in `_collect_due` to each channel's due list BEFORE the union, so both reservations and the logged `hoisted`/`promoted` counts describe the slate that actually runs.
 It **narrows and never forces**: a named city that is not due (fresh clock, failure cap, excluded, disabled) is warned about by name and skipped, and an unresolvable name exits 64 before any schedule write.
 The motivating case was 2026-09-24: Detroit's and Fresno's Mapillary walks had each failed once during the August block and sat at queue positions 66 and 76 of 271, deferred behind the alphabetical never-collected block, with no supported way to reach them.

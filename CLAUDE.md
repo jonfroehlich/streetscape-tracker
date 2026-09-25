@@ -86,6 +86,7 @@ python scripts/register_frame.py --manifest mapillary_360_cities.csv --overlap-k
 
 `run-due` notes: `--limit` (≥1) overrides `[schedule].max_cities_per_day`; an unknown/disabled channel or a bad `--limit` exits 64, not 2; a filtered run advances only the named channels' clocks, **un-pairing those cities' snapshots**.
 `--city CITY` (repeatable) is the targeted retry: it narrows the DUE list and never forces, so a named city that is not due is warned about and skipped, and an unknown name exits 64.
+The named list is the run's city cap unless `--limit` is given, in which case the named cities past it are listed by name.
 `assess-city` notes: a bad `--provider` or an unpaired `--width`/`--height` exits 64; answer from **street coverage, never grid coverage** (see operations below).
 `enroll-city` notes: **the two directions are scoped differently, because each guard was scoped to where it is a no-op.**
 Bare enrol needs an opt-in channel and an enabled city (every enabled city is already a gsv member; a disabled city can never be due), so either exits 64 writing no row.

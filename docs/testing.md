@@ -79,7 +79,7 @@ Incidental coverage of a deprecated spelling trains readers to ignore the notice
 ## Scheduler
 
 - Scheduler due/budget/provider-pairing/timeout-derivation logic
-- `run-due --city`: that it narrows the slate to the named city without touching another due city's clock, composes with `--provider`, collects a city named twice (query and `city_id`) once, skips AND warns about a named city that is not due, and exits 64 on an unknown name before the stagger assignment writes anything.
+- `run-due --city`: that it narrows the slate to the named city without touching another due city's clock, composes with `--provider`, resolves a query and a `city_id` to the same city, runs every one of several named cities, is not truncated by `max_cities_per_day`, names the cities an explicit `--limit` leaves out, skips AND warns about a named city that is not due, and exits 64 on an unknown name before the stagger assignment writes anything.
   `test_main_forwards_run_due_city_filter` pins the `main()` pass-through, which the direct `cmd_run_due` tests cannot see: dropping it left all six green and would have run the whole due list.
 - The census cache at the scheduler seam (issue #290): `_channel_estimate` returns 0 on a probe hit and its full estimate otherwise, only the census channels read it (gsv and `gsv_streets` query per point and must not be priced off a Mapillary entry), each channel reads its own PROVIDER's entry,
   an expired entry prices at full cost, and — the one that keeps the two estimators honestly separate — **a cache hit must not collapse a child's timeout**, since `estimate_requests` also feeds `_tile_census_timeout_seconds`.

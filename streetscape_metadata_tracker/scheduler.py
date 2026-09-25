@@ -6790,6 +6790,12 @@ def cmd_run_due(
     # at an explicit --limit would reserve slots in a window the loop never
     # reaches.
     max_cities = limit if limit is not None else cfg.max_cities_per_day
+    # A --city list IS the operator's cap: without this, naming 50 cities on a
+    # 40-city night silently drops the last 10, reported only as "city cap
+    # reached". An explicit --limit still wins, and past it the cities that fall
+    # outside the cap are named below.
+    if only_city_ids is not None and limit is None:
+        max_cities = len(only_city_ids)
     # Resolved BEFORE the slate is built, because the reservation is an input to
     # the ordering rather than a filter applied after it — and against
     # `max_cities`, not `cfg.max_cities_per_day`, so `--limit` scales the split
@@ -6816,6 +6822,14 @@ def cmd_run_due(
                 f"skips it (it narrows the due list and never forces a "
                 f"collection; see `status` for its clock, failure count, "
                 f"membership and enabled flag)"
+            )
+        if len(due) > max_cities:
+            # --limit below the named count. Named, because a city the operator
+            # asked for by name must never go quietly uncollected.
+            logger.warning(
+                f"--city named {len(due)} due cities but --limit is {max_cities}; "
+                f"past the cap, these may not run: "
+                f"{', '.join(c.city_id for c in due[max_cities:])}"
             )
     hoisted = slate.hoisted
     day_cap = min(len(due), max_cities)
