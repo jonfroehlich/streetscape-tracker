@@ -2146,6 +2146,193 @@ def test_run_due_without_a_filter_still_runs_every_enabled_channel(conn, monkeyp
     assert ran == [(cid, "gsv"), (cid, "mapillary")]
 
 
+# ---------------------------------------------------------------------------
+# run-due --city: a targeted retry that keeps every guard. It narrows the DUE
+# list and never forces, so a named city that is not due is reported, not run.
+# ---------------------------------------------------------------------------
+
+
+def test_run_due_parses_the_city_filter():
+    """--city is repeatable (never comma-split: queries carry commas) and is None
+    when absent, which means "every due city", the nightly behaviour."""
+    args = build_parser().parse_args(
+        ["run-due", "--city", "Detroit, Michigan", "--city", "Fresno, California"]
+    )
+    assert args.cities == ["Detroit, Michigan", "Fresno, California"]
+    assert build_parser().parse_args(["run-due"]).cities is None
+
+
+def test_city_filter_runs_only_the_named_city(conn, monkeypatch):
+    """The other due cities are neither launched nor have their clocks moved."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    bend = _register(conn, "Bend", width=1000, height=1000, step=20)
+    salem = _register(conn, "Salem", width=1000, height=1000, step=20)
+    ran = []
+    _stub_collection(sched, monkeypatch, conn, ran)
+
+    rc = sched.cmd_run_due(_mly_cfg(), today=date(2026, 7, 2), requested_cities=[salem])
+
+    assert rc == 0
+    assert ran == [(salem, "gsv"), (salem, "mapillary")]
+    touched = conn.execute(
+        "SELECT COUNT(*) FROM schedule_state WHERE city_id = ? AND last_attempt_at IS NOT NULL",
+        (bend,),
+    ).fetchone()[0]
+    assert touched == 0
+
+
+def test_city_filter_composes_with_the_provider_filter(conn, monkeypatch):
+    """The prod use: retry one channel's walk for a few named cities."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    _register(conn, "Bend", width=1000, height=1000, step=20)
+    salem = _register(conn, "Salem", width=1000, height=1000, step=20)
+    ran = []
+    _stub_collection(sched, monkeypatch, conn, ran)
+
+    sched.cmd_run_due(
+        _mly_cfg(),
+        today=date(2026, 7, 2),
+        requested_providers=["mapillary"],
+        requested_cities=[salem],
+    )
+
+    assert ran == [(salem, "mapillary")]
+
+
+def test_city_filter_resolves_a_query_and_a_city_id_to_one_city(conn, monkeypatch):
+    """Both spellings resolve through db.resolve_city to the same city. (That it
+    then runs once is the union loop's existing de-duplication, not --city's.)"""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    salem = _register(conn, "Salem", width=1000, height=1000, step=20)
+    ran = []
+    _stub_collection(sched, monkeypatch, conn, ran)
+
+    sched.cmd_run_due(
+        _mly_cfg(),
+        today=date(2026, 7, 2),
+        requested_providers=["mapillary"],
+        requested_cities=["Salem, Oregon, United States", salem],
+    )
+
+    assert ran == [(salem, "mapillary")]
+
+
+def test_city_filter_runs_every_named_city_and_only_those(conn, monkeypatch):
+    """The prod use names dozens of cities: every one runs, the unnamed one does not."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    bend = _register(conn, "Bend", width=1000, height=1000, step=20)
+    salem = _register(conn, "Salem", width=1000, height=1000, step=20)
+    eugene = _register(conn, "Eugene", width=1000, height=1000, step=20)
+    ran = []
+    _stub_collection(sched, monkeypatch, conn, ran)
+
+    sched.cmd_run_due(
+        _mly_cfg(),
+        today=date(2026, 7, 2),
+        requested_providers=["mapillary"],
+        requested_cities=[salem, eugene],
+    )
+
+    assert sorted(ran) == sorted([(salem, "mapillary"), (eugene, "mapillary")])
+    assert (bend, "mapillary") not in ran
+
+
+def test_city_filter_is_not_truncated_by_the_nightly_city_cap(conn, monkeypatch):
+    """Naming more cities than max_cities_per_day runs them all: the list is the
+    cap, or the tail of a long --city list would be dropped with no name."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    salem = _register(conn, "Salem", width=1000, height=1000, step=20)
+    eugene = _register(conn, "Eugene", width=1000, height=1000, step=20)
+    ran = []
+    _stub_collection(sched, monkeypatch, conn, ran)
+
+    sched.cmd_run_due(
+        _mly_cfg(max_cities_per_day=1),
+        today=date(2026, 7, 2),
+        requested_providers=["mapillary"],
+        requested_cities=[salem, eugene],
+    )
+
+    assert sorted(ran) == sorted([(salem, "mapillary"), (eugene, "mapillary")])
+
+
+def test_city_filter_names_the_cities_an_explicit_limit_leaves_out(conn, monkeypatch, caplog):
+    """An explicit --limit still caps the run, and the named cities past it are
+    listed by name rather than left to "city cap reached"."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    salem = _register(conn, "Salem", width=1000, height=1000, step=20)
+    eugene = _register(conn, "Eugene", width=1000, height=1000, step=20)
+    ran = []
+    _stub_collection(sched, monkeypatch, conn, ran)
+
+    with caplog.at_level("WARNING"):
+        sched.cmd_run_due(
+            _mly_cfg(),
+            today=date(2026, 7, 2),
+            requested_providers=["mapillary"],
+            requested_cities=[salem, eugene],
+            limit=1,
+        )
+
+    assert len(ran) == 1
+    (left_out,) = {salem, eugene} - {c for c, _ in ran}
+    assert any("--limit is 1" in r.message and left_out in r.message for r in caplog.records)
+
+
+def test_city_filter_skips_and_reports_a_named_city_that_is_not_due(conn, monkeypatch, caplog):
+    """--city never forces: a city whose clock is fresh stays uncollected, and
+    says so, because a named city that silently did nothing reads as a success."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    salem = _register(conn, "Salem", width=1000, height=1000, step=20)
+    conn.execute(
+        "INSERT INTO schedule_state (city_id, provider, day_of_cycle, last_success_at) "
+        "VALUES (?, 'mapillary', 0, '2026-07-01T00:00:00+00:00')",
+        (salem,),
+    )
+    conn.commit()
+    ran = []
+    _stub_collection(sched, monkeypatch, conn, ran)
+
+    with caplog.at_level("WARNING"):
+        rc = sched.cmd_run_due(
+            _mly_cfg(),
+            today=date(2026, 7, 2),
+            requested_providers=["mapillary"],
+            requested_cities=[salem],
+        )
+
+    assert rc == 0
+    assert ran == []
+    assert any(salem in r.message and "not due" in r.message for r in caplog.records)
+
+
+def test_city_filter_rejects_an_unknown_city_before_any_write(conn, monkeypatch):
+    """A typo exits USAGE_EXIT_CODE having launched nothing and written no
+    schedule row -- the stagger assignment runs after the resolution."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    _register(conn, "Salem", width=1000, height=1000, step=20)
+    ran = []
+    _stub_collection(sched, monkeypatch, conn, ran)
+    assigned = []
+    monkeypatch.setattr(sched.db, "assign_schedule", lambda *a, **k: assigned.append(a))
+
+    rc = sched.cmd_run_due(
+        _mly_cfg(), today=date(2026, 7, 2), requested_cities=["Salem", "Nowhereville, Oregon"]
+    )
+
+    assert rc == sched.USAGE_EXIT_CODE
+    assert ran == []
+    assert assigned == []
+
+
 def test_provider_filter_still_registers_stagger_for_every_channel(conn, monkeypatch):
     """assign_schedule runs over the FULL enabled set even under a filter: a
     Mapillary-only catch-up must not leave a newly registered city without a gsv
@@ -6206,7 +6393,7 @@ def _run_main_run_due_raising(monkeypatch, exc, argv):
     monkeypatch.setattr(sched, "load_scheduler_config", lambda path: _publishing_cfg())
     monkeypatch.setattr(sched, "setup_logging", lambda cfg, verbose=False: None)
 
-    def boom(cfg, dry_run=False, limit=None, requested_providers=None):
+    def boom(cfg, dry_run=False, limit=None, requested_providers=None, requested_cities=None):
         raise exc
 
     monkeypatch.setattr(sched, "cmd_run_due", boom)
@@ -6214,6 +6401,26 @@ def _run_main_run_due_raising(monkeypatch, exc, argv):
     alerts = []
     monkeypatch.setattr(sched, "send_alert", lambda cfg, subj, body: alerts.append((subj, body)))
     return sched, alerts
+
+
+def test_main_forwards_run_due_city_filter(monkeypatch):
+    """--city must reach cmd_run_due: a dropped pass-through would silently run
+    the whole due list, which is the opposite of a targeted retry."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    monkeypatch.setattr(
+        sched.sys,
+        "argv",
+        ["scheduler", "run-due", "--provider", "mapillary_streets", "--city", "Detroit, Michigan"],
+    )
+    monkeypatch.setattr(sched, "load_scheduler_config", lambda path: _publishing_cfg())
+    monkeypatch.setattr(sched, "setup_logging", lambda cfg, verbose=False: None)
+    seen = {}
+    monkeypatch.setattr(sched, "cmd_run_due", lambda cfg, **kw: seen.update(kw) or 0)
+
+    assert sched.main() == 0
+    assert seen["requested_cities"] == ["Detroit, Michigan"]
+    assert seen["requested_providers"] == ["mapillary_streets"]
 
 
 def test_main_run_due_dry_run_broken_pipe_does_not_alert(monkeypatch):

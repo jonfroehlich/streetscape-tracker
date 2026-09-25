@@ -6127,6 +6127,7 @@ def _collect_due(
     *,
     max_opt_in: int,
     max_cities: int,
+    only_city_ids: frozenset[str] | None = None,
 ) -> DueSlate:
     """
     Due work for today: an ordered city list (stalest-first, gsv's order
@@ -6195,6 +6196,16 @@ def _collect_due(
     ``max_opt_in`` stranded cities, then at most ``refresh_slots`` refreshes
     in what remains, and the rest pure stalest-first. It is the SUM of the two
     reservations that bounds how much of a night the plain queue still governs.
+
+    ``only_city_ids`` is ``run-due --city``: it NARROWS each channel's due list
+    to the named cities and never widens it, so a named city that is not due
+    (fresh clock, failure cap, excluded, disabled) is simply absent from the
+    slate -- the flag targets a retry, it never forces an early collection.
+    Applied to the per-channel lists BEFORE the union, so both reservations and
+    the ``hoisted``/``promoted`` counts the night logs describe the slate that
+    actually runs. Unlike ``providers`` it has a default, because ``None`` here
+    is the nightly behaviour itself rather than a permissive stand-in for it:
+    every due city, exactly as before the flag existed.
     """
     due_by_provider = {
         provider: db.get_due_cities_with_last_success(
@@ -6208,6 +6219,11 @@ def _collect_due(
         )
         for provider in providers
     }
+    if only_city_ids is not None:
+        due_by_provider = {
+            provider: [(c, ls) for c, ls in due if c.city_id in only_city_ids]
+            for provider, due in due_by_provider.items()
+        }
     ordered, seen = [], set()
     providers_for_city = {}
     # City_ids that will gain a SECOND dated interval tonight: at least one of
@@ -6668,6 +6684,7 @@ def cmd_run_due(
     limit: int | None = None,
     today: date | None = None,
     requested_providers: list[str] | None = None,
+    requested_cities: list[str] | None = None,
 ) -> int:
     """
     Collect all cities due today, within per-provider budgets, publish.
@@ -6689,6 +6706,13 @@ def cmd_run_due(
     a run date with their other channels. That is the feature (catching one
     channel up means moving its clock alone), not a defect — see the warning
     logged below.
+
+    ``requested_cities`` (``--city``, repeatable) narrows the slate to named
+    cities, so a targeted retry -- a walk that failed during a block, say --
+    keeps every guard above instead of being run as a bare collector command.
+    It narrows the DUE list and never forces: a named city that is not due is
+    reported and skipped. An unresolvable name exits ``USAGE_EXIT_CODE``
+    before anything is collected or written.
     """
     # Validate BEFORE opening the catalog, so an operator typo costs nothing.
     # Returning rather than propagating is deliberate: main()'s run-due branch
@@ -6721,6 +6745,21 @@ def cmd_run_due(
         return USAGE_EXIT_CODE
 
     conn = db.connect(cfg.db_path)
+    # Resolved against the catalog, so it cannot precede the connect above; it
+    # still precedes every collection and schedule write, so a typo costs nothing.
+    only_city_ids: frozenset[str] | None = None
+    if requested_cities is not None:
+        resolved = {q: db.resolve_city(conn, q) for q in requested_cities}
+        unknown = [q for q, row in resolved.items() if row is None]
+        if unknown or not resolved:
+            logger.error(
+                f"--city: no catalog city matches {', '.join(repr(q) for q in unknown)}"
+                if unknown
+                else "--city was given no city"
+            )
+            conn.close()
+            return USAGE_EXIT_CODE
+        only_city_ids = frozenset(row.city_id for row in resolved.values())
     if today is None:
         today = datetime.now(UTC).date()
     batch_started = time.monotonic()
@@ -6751,6 +6790,12 @@ def cmd_run_due(
     # at an explicit --limit would reserve slots in a window the loop never
     # reaches.
     max_cities = limit if limit is not None else cfg.max_cities_per_day
+    # A --city list IS the operator's cap: without this, naming 50 cities on a
+    # 40-city night silently drops the last 10, reported only as "city cap
+    # reached". An explicit --limit still wins, and past it the cities that fall
+    # outside the cap are named below.
+    if only_city_ids is not None and limit is None:
+        max_cities = len(only_city_ids)
     # Resolved BEFORE the slate is built, because the reservation is an input to
     # the ordering rather than a filter applied after it — and against
     # `max_cities`, not `cfg.max_cities_per_day`, so `--limit` scales the split
@@ -6758,13 +6803,42 @@ def cmd_run_due(
     # 5-city night. Both of the night's reservations are therefore resolved
     # against the same window the loop will actually use.
     max_opt_in = _opt_in_reservation(cfg, max_cities)
-    slate = _collect_due(conn, cfg, today, providers, max_opt_in=max_opt_in, max_cities=max_cities)
+    slate = _collect_due(
+        conn,
+        cfg,
+        today,
+        providers,
+        max_opt_in=max_opt_in,
+        max_cities=max_cities,
+        only_city_ids=only_city_ids,
+    )
     due, providers_for_city = slate.cities, slate.providers_for_city
+    if only_city_ids is not None:
+        for city_id in sorted(only_city_ids - set(providers_for_city)):
+            # Said out loud, because a named city that silently collected
+            # nothing reads as a success.
+            logger.warning(
+                f"{city_id}: not due today on {', '.join(providers)}, so --city "
+                f"skips it (it narrows the due list and never forces a "
+                f"collection; see `status` for its clock, failure count, "
+                f"membership and enabled flag)"
+            )
+        if len(due) > max_cities:
+            # --limit below the named count. Named, because a city the operator
+            # asked for by name must never go quietly uncollected.
+            logger.warning(
+                f"--city named {len(due)} due cities but --limit is {max_cities}; "
+                f"past the cap, these may not run (approximate: a city skipped "
+                f"inside the cap does not count toward it): "
+                f"{', '.join(c.city_id for c in due[max_cities:])}"
+            )
     hoisted = slate.hoisted
     day_cap = min(len(due), max_cities)
 
     budget_str = ", ".join(f"{cfg.providers[p].daily_request_budget:,} {p}" for p in providers)
     filter_note = f" [--provider {','.join(providers)}]" if requested_providers is not None else ""
+    if only_city_ids is not None:
+        filter_note += f" [--city {','.join(sorted(only_city_ids))}]"
     logger.info(
         f"{len(due)} cities due on {today}{filter_note}; "
         f"processing up to {day_cap} within daily budgets of "
@@ -7942,8 +8016,9 @@ def _run_city_loop(
     ``_run_city_channels`` as ``stop_requested`` (between a city's channels), so
     a stop cannot launch the rest of the in-flight city's work — issue #206.
 
-    ``max_cities`` is ``cfg.max_cities_per_day`` on a nightly run and an explicit
-    ``--limit`` on an on-demand catch-up (issue #214). Required rather than
+    ``max_cities`` is ``cfg.max_cities_per_day`` on a nightly run, an explicit
+    ``--limit`` on an on-demand catch-up (issue #214), or the number of cities a
+    ``--city`` list names when no ``--limit`` is given. Required rather than
     defaulting to the config value, for the same reason ``_collect_due``'s
     ``providers`` is: the caller resolves the policy, and a default here would be
     dead code that also reads as a second opinion on what the cap is.
@@ -7980,9 +8055,10 @@ def _run_city_loop(
     try:
         for city in due:
             if processed >= max_cities:
-                # Named with the number because the cap has two sources now: the
-                # config's nightly max_cities_per_day, or an explicit --limit
-                # overriding it for one on-demand run (issue #214).
+                # Named with the number because the cap has three sources: the
+                # config's nightly max_cities_per_day, an explicit --limit
+                # overriding it for one on-demand run (issue #214), or the length
+                # of a --city list given without --limit.
                 stop_reason = f"city cap reached ({max_cities})"
                 break
             if sigterm_seen.is_set():
@@ -8617,6 +8693,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--limit, this is the supported way to run an on-demand catch-up for one "
         "provider (issue #214) — never a detached bespoke script.",
     )
+    p_run.add_argument(
+        "--city",
+        action="append",
+        dest="cities",
+        metavar="CITY",
+        # Repeatable only, never comma-separated: city queries carry commas
+        # ("Detroit, Michigan").
+        help="Restrict this run to a named city (repeatable; a query or a "
+        "city_id, resolved as enroll-city resolves one). Narrows the due list "
+        "and never forces: a named city that is not due is reported and "
+        f"skipped. An unknown name exits {USAGE_EXIT_CODE}.",
+    )
     p_assess = sub.add_parser(
         "assess-city",
         help="Register a new city, walk its streets on both providers, publish, "
@@ -8810,6 +8898,7 @@ def main() -> int:
                 dry_run=args.dry_run,
                 limit=args.limit,
                 requested_providers=args.providers,
+                requested_cities=args.cities,
             )
         except Exception as exc:
             # A DRY RUN whose stdout reader went away is the one crash here
