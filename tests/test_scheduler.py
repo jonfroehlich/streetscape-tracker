@@ -1199,10 +1199,11 @@ def test_makelab1_production_config_is_wired():
     # the KartaView widening: the enrolled set divided by it is how many nights
     # a full pass takes.
     #
-    # 2026-09-25: the cap went 40 -> 400 so the deadline governs, and both
-    # reservations are now SET at 10 rather than derived, since a quarter of
-    # 400 would be 100 each. Pinning the resolved numbers is still the point.
-    assert cfg.max_cities_per_day == 400
+    # 2026-09-25: the cap began a STAGED raise, 40 -> 80 first (Mapillary
+    # per-IP volume must step up in stages, docs/provider-access.md), and both
+    # reservations are now SET at 10 rather than derived, since a quarter would
+    # move with every step. Pinning the resolved numbers is still the point.
+    assert cfg.max_cities_per_day == 80
     assert cfg.opt_in_cities_per_day == 10
     assert _sched._opt_in_reservation(cfg, cfg.max_cities_per_day) == 10
     assert cfg.refresh_slots == 10

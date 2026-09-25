@@ -19,7 +19,7 @@
 #                takes no cap slot), and the order beyond the cap is what those
 #                extra slots and tomorrow draw from.
 #   --limit 40   the most cities any night has run (the cap until 2026-09-25,
-#                when max_cities_per_day went 40 -> 400 so the deadline governs),
+#                when max_cities_per_day began a staged raise, 40 -> 80 first),
 #                so tonight's head always fits (the plan is in slate order,
 #                tonight first) while the pass never fetches more than one night's
 #                worth. The one-time backlog (242 cold cities on 2026-09-21) is

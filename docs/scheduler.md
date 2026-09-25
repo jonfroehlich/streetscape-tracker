@@ -386,7 +386,7 @@ The floor keeps it at one, so at a reservation of 1 the resumer still wins and t
 A group leaves the rotation as it empties, so a night with only one stranded population behaves exactly as the straight take did.
 
 **`[schedule].refresh_slots` reserves a share of the night's city cap for cities that will gain a second interval.**
-Unset it derives `max_cities_per_day // 4`; deriving let the split follow the cap while the cap was a night's size, but prod SETS it to 10 since the cap went to 400 on 2026-09-25 (the derived 100 was nobody's decision); an explicit integer overrides, and **`0` restores the pure breadth-first order exactly** — the identity permutation, provable by construction rather than argued, the same property `max_concurrent_channels = 1` keeps for #240.
+Unset it derives `max_cities_per_day // 4`; deriving let the split follow the cap while the cap was a night's size, but prod SETS it to 10 since the cap began a staged raise on 2026-09-25 (40 → 80 first), so it does not grow with every step; an explicit integer overrides, and **`0` restores the pure breadth-first order exactly** — the identity permutation, provable by construction rather than argued, the same property `max_concurrent_channels = 1` keeps for #240.
 A bad value warns and falls back to *deriving*, never to 0, because 0 is meaningful here and a typo must not be indistinguishable from a deliberate policy choice; TOML booleans are Python ints, so `false` is excluded explicitly.
 The promotion is order-preserving in both directions: promoted refreshes keep their stalest-first order and **lead** the slate (right after the bounded hoist), and the cities they displace are the window's **last** non-chosen ones, kept in relative order immediately after the window so they lead tomorrow rather than falling back into the ~900-city tail.
 #308 shipped with the refreshes at the **end** of the window instead, so the night's head stayed breadth-first; that is only safe while the city cap ends the night, because then the whole window runs.
@@ -405,7 +405,7 @@ This is the reverse of the order #308 shipped with, and the reversal is a fix ra
 Hoist-then-reserve gives each reservation its own slots, and at a cap too small to hold both the reserve reports `0 promoted` rather than a promotion the night will not reach.
 
 **So a night's cap is split three ways: at most `opt_in_cities_per_day` opt-in-only cities, then at most `refresh_slots` refreshes in what remains, then pure stalest-first.**
-It is the **sum** of the two reservations that bounds how much of a night the plain queue still governs — 20 reserved slots lead a prod night, and the deadline rather than the 400 cap ends it — so raising either one is a decision about the other, and `test_makelab1_production_config_is_wired` pins the sum for that reason.
+It is the **sum** of the two reservations that bounds how much of a night the plain queue still governs — 20 reserved slots lead a prod night, and, as the cap is raised in stages, the deadline increasingly ends it — so raising either one is a decision about the other, and `test_makelab1_production_config_is_wired` pins the sum for that reason.
 A hoisted city that is itself a refresh is not counted against `refresh_slots`, so a night can exceed it: the key is a floor on second intervals, not a ration of them.
 `cmd_run_due` logs `refresh_slots=N (M promoted)` on its opening line **unconditionally**, unlike the `hoisted=` clause, because the reserve is live by default and its derived value follows `max_cities_per_day`, so which policy a night ran under is not recoverable from the config file alone once either knob has moved.
 
@@ -507,7 +507,7 @@ It exits 0 when it alerted (or alerting is intentionally off) and 1 only when a 
 It re-asks over the whole catalog whether a provider has any imagery in each city yet, reading a coarse count layer where 113 requests answer all 1,144 enabled cities, and writes one dated `provider_screen` row each.
 Panoramax is why it exists: its US corpora are months old rather than decades, so there is no archive to backfill and a city's growth is observable only if we were already watching when the imagery landed.
 
-It runs on its own weekly timer (`deploy/systemd/streetscape-screen-provider.timer`, Mondays at midday Pacific) rather than as a `run-due` tail step, for two reasons that both matter: the question has a different cadence from the nightly slate, and the batch's wall clock is already the binding constraint (#304).
+It runs on its own weekly timer (`deploy/systemd/streetscape-screen-provider.timer`, Mondays at 18:00 Pacific, after a full 12 h night's latest end) rather than as a `run-due` tail step, for two reasons that both matter: the question has a different cadence from the nightly slate, and the batch's wall clock is already the binding constraint (#304).
 The timer is deliberately far from 02:00 because both take the same machine-wide Panoramax host lock — an overlap is not a race but a screen that exits **85** and records nothing that week.
 
 Three properties are load-bearing and easy to erode:

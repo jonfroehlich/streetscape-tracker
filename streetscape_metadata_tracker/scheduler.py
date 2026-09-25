@@ -1056,8 +1056,8 @@ def _opt_in_reservation(cfg: SchedulerConfig, max_cities: int) -> int:
         # ...but never below the DERIVED quarter of the narrowed run (capped at
         # the configured value). The ratio alone assumes the cap is a night's
         # size; once the cap is a ceiling far above what a night reaches
-        # (2026-09-25: 10 of 400), it rounds every `--limit` catch-up down to
-        # 0 -- `run-due --provider panoramax --limit 20` would hoist nobody and
+        # (2026-09-25: 10 of a cap raised in stages toward ~400), it rounds
+        # every `--limit` catch-up toward 0 -- `run-due --provider panoramax --limit 20` would hoist nobody and
         # a live checkpoint would stop outranking the rotation. The quarter is
         # the share the derived path already treats as starvation-safe.
         reservation = max(0, scaled, min(configured, max_cities // _OPT_IN_SLOT_SHARE))
@@ -6571,7 +6571,7 @@ def _collect_due(
         reached = sum(1 for i in stranded if i < max_cities)
         waiting = len(stranded) - reached
         # Logged whenever anything is stranded, not only when some fall outside
-        # the cap: with the cap set far above a night's reach (2026-09-25, 400)
+        # the cap: with the cap set above a night's reach (2026-09-25 onward)
         # nothing ever falls outside it, and the line an operator widening a
         # channel reads would go silent on exactly the nights the deadline cuts.
         if stranded:
