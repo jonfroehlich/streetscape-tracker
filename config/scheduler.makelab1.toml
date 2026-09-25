@@ -9,7 +9,7 @@
 cycle_days = 90            # re-collect each city ~quarterly
 grace_days = 7
 # Nightly cap; `run-due --limit N` (N >= 1) overrides it for one invocation
-# (issue #214). At 40, a full pass over the enabled cities is ~31 nights.
+# (issue #214). Set far above what a night reaches, so the deadline governs.
 #
 # Raised from 20 on 2026-09-02 (#304/#308). 20 was never measured, and it was
 # binding on LIGHT nights only, where it wasted the wall clock the deadline
@@ -20,7 +20,15 @@ grace_days = 7
 # high enough to let it be the only one. More cities SEQUENTIALLY does not
 # raise peak memory (max_concurrent_channels = 1 means one child at a time), so
 # #305's MemoryHigh headroom is untouched by this.
-max_cities_per_day = 40    # cities/day (a city runs all enabled providers)
+#
+# 40 -> 400 on 2026-09-25. 40 still ended light nights on the CAP with clock
+# left over, so this makes max_batch_hours the only limit in practice: 400 is
+# far above what 12 h can reach. That is only safe because the refresh reserve
+# now LEADS the slate (it used to end the cap window, which is exactly where a
+# deadline-stopped night cuts, so a clock-ended night would have run zero
+# refreshes). The two reservations below are set explicitly at their old
+# derived values, because deriving them from 400 would reserve 100 + 100.
+max_cities_per_day = 400   # cities/day (a city runs all enabled providers)
 
 # Slots reserved out of max_cities_per_day for cities due ONLY on an opt-in
 # channel (issue #282). Unset means "a quarter of the cap, floored at 1" —
@@ -45,10 +53,14 @@ max_cities_per_day = 40    # cities/day (a city runs all enabled providers)
 # This and refresh_slots below are the night's TWO reservations, both derived
 # as a quarter of the same cap, and they are applied in that order: the refresh
 # reserve promotes first and the bounded hoist promotes ahead of it. At the
-# derived pair (10 + 10 of 40) half the night is reserved and half stays pure
-# stalest-first — raise either one and check the other, since it is the SUM
+# pair (10 + 10, explicit since the cap went to 400) 20 cities lead the night and
+# the rest is pure stalest-first — raise either one and check the other, since it is the SUM
 # that bounds how much of a night the plain queue still governs.
-# opt_in_cities_per_day = 10
+#
+# Set explicitly on 2026-09-25, when max_cities_per_day went 40 -> 400: the
+# derived quarter would have become 100, which is a 10x faster opt-in widening
+# nobody decided on. 10 keeps the rate #282 has been running at.
+opt_in_cities_per_day = 10
 max_consecutive_failures = 5
 city_timeout_minutes = 180
 # Stop STARTING cities after this many hours so the aggregate/manifest/publish
@@ -71,7 +83,12 @@ max_batch_hours = 12
 # one place rather than being a second number to keep in step. Set 0 to go back
 # to pure breadth-first. The reserve cannot refresh a city early — every city
 # it can promote already cleared the cycle_days - grace_days (83 day) wall.
-# refresh_slots = 10
+#
+# Set explicitly on 2026-09-25 for the same reason as opt_in_cities_per_day:
+# at a cap of 400 the derived value would be 100. The reserve now leads the
+# slate after the hoist, so these 10 run whether the cap or the deadline ends
+# the night.
+refresh_slots = 10
 # Channels of one city, in flight at once (issue #240). Explicit rather than
 # inherited, because this is the file prod reads and the value is the whole
 # rollout.
@@ -218,7 +235,12 @@ enabled = true
 # configured rate, monotone in the city's coverage (#304, reopened). Closing
 # that buys ~1.6x on the channel that owns two-thirds of the night and costs
 # no wall clock at all. This knob only spends clock that is already idle.
-daily_request_budget = 15000000
+#
+# 15M -> 35M on 2026-09-25, with max_cities_per_day 40 -> 400. 12 h at the
+# 48,000/min pacer is 34.56M, so 35M is just above what the window can spend:
+# the deadline, not this budget, ends the night. Still free and quota-less, so
+# it buys wall clock only; the per-minute rate Google sees is unchanged.
+daily_request_budget = 35000000
 
 # PAUSED 2026-08-28 after the THIRD per-IP block (see the new-issue link in
 # docs/provider-access.md). Not a volume decision: the ledger rules out a fixed
@@ -460,9 +482,14 @@ jitter = 0.6
 # first pass). The requests are free; only wall clock is spent — ~1 h/night at
 # the 24,000 this block used to set, so ~31 min at the 48,000 it sets now, with
 # the achieved-rate caveat above meaning the real figure lands between them.
+#
+# 3M -> 35M on 2026-09-25, for the same reason as [providers.gsv]: 12 h at
+# this block's 48,000/min is 34.56M, so 35M hands the night to max_batch_hours.
+# The 2x-the-average sizing above was a ceiling for a 40-city night; with the
+# cap at 400 a budget that binds first would defer walks the clock could run.
 [providers.gsv_streets]
 enabled = true
-daily_request_budget = 3000000
+daily_request_budget = 35000000
 max_requests_per_minute = 48000
 spacing_m = 15
 

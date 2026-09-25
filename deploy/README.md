@@ -810,7 +810,7 @@ systemctl --user list-timers streetscape-prefreeze.timer   # next fire
   `TimeoutStartSec=6h` ends a slow pass by 21:30, and `TimeoutStopSec=5min` is there so the SIGTERM's alert outlives systemd's 90-second default — an SMTP relay can spend 30 s per stage.
 - **Not `Persistent`**, unlike the other timers: a catch-up at boot could land just before 02:00 and hold the Overpass lock against the night's first cold walk, which exits busy and strands its city.
   A missed afternoon costs little, since the previous day's `--nights 2` pass covered most of tonight.
-- Paced for the Overpass usage policy's regular-application figure (under ~100 queries a day): `--limit 40` (the city cap, so tonight always fits) at `--pause-s 120`.
+- Paced for the Overpass usage policy's regular-application figure (under ~100 queries a day): `--limit 40` (the most cities any night has run — the cap until it went to 400 on 2026-09-25 — so tonight's head fits) at `--pause-s 120`.
   It moves fetches the nights would make anyway; it adds none.
   The 242-city backlog measured on 2026-09-21 is therefore never drained in one pass: a cold city is frozen only once it enters the next two nights' slate, at no more than a night's rate.
 - `--alert` mails through `[alerts]` when a pass **does not finish** — Overpass refused (76), the lock was busy (80), a `run-due` was in flight (64), a crash, or a SIGTERM from `TimeoutStartSec` (143) — naming the networks it left cold.

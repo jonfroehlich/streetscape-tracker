@@ -40,6 +40,9 @@ UNIT_CHECKOUT = "%h/streetscape-tracker"
 # numbers by 100 (making less than 100 queries fetching less 10 MB of data per
 # day fine)" -- wiki.openstreetmap.org/wiki/Overpass_API, read 2026-09-22.
 OVERPASS_REGULAR_QUERIES_PER_DAY = 100
+# The most cities a production night has run, measured under the old 40-city
+# cap (docs/scheduler.md). Re-measure once nights are deadline-governed.
+NIGHT_REACH_CITIES = 40
 
 # alerting._send_smtp builds its connection with timeout=30, and a relay can
 # spend that per stage (connect, STARTTLS, login, send).
@@ -216,7 +219,12 @@ def test_the_pass_covers_tonight_and_stays_inside_overpass_policy(args, prod_cfg
     # Two nights, per the script's own reasoning: a night reaches past its cap.
     assert args.nights >= 2
     # Tonight's whole slate fits (the plan is in slate order, tonight first)...
-    assert args.limit is not None and args.limit >= prod_cfg.max_cities_per_day
+    # Until 2026-09-25 this was pinned against max_cities_per_day. The cap then
+    # went 40 -> 400 so that max_batch_hours ends the night, and 400 is not a
+    # night's reach (it would also break the Overpass bound below). 40 is the
+    # most cities any night has run, so it is the figure tonight's head is
+    # measured against until a deadline-governed night shows otherwise.
+    assert args.limit is not None and args.limit >= NIGHT_REACH_CITIES
     # ...and one pass stays under the regular-application daily figure, with room
     # for the night's own fetches of whatever the prediction missed.
     assert args.limit < OVERPASS_REGULAR_QUERIES_PER_DAY

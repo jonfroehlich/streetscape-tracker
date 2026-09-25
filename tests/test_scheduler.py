@@ -1198,18 +1198,22 @@ def test_makelab1_production_config_is_wired():
     # 5 to 10 without a line of #282's code changing. That figure is what paces
     # the KartaView widening: the enrolled set divided by it is how many nights
     # a full pass takes.
-    assert cfg.opt_in_cities_per_day is None
+    #
+    # 2026-09-25: the cap went 40 -> 400 so the deadline governs, and both
+    # reservations are now SET at 10 rather than derived, since a quarter of
+    # 400 would be 100 each. Pinning the resolved numbers is still the point.
+    assert cfg.max_cities_per_day == 400
+    assert cfg.opt_in_cities_per_day == 10
     assert _sched._opt_in_reservation(cfg, cfg.max_cities_per_day) == 10
-    assert cfg.refresh_slots is None
+    assert cfg.refresh_slots == 10
     assert cfg.effective_refresh_slots(cfg.max_cities_per_day) == 10
-    # The SUM is the number to read, and it is pinned here rather than left to
-    # be re-derived: 20 of 40 slots are reserved, so half a production night is
-    # still the plain stalest-first queue. Raising either share without this
-    # assertion failing would be raising it against the other one blind.
+    # The SUM is the number to read: 20 reserved slots lead the night, and the
+    # rest is the plain stalest-first queue until the deadline stops it.
+    # Raising either share without this failing would be raising it blind.
     assert (
         _sched._opt_in_reservation(cfg, cfg.max_cities_per_day)
         + cfg.effective_refresh_slots(cfg.max_cities_per_day)
-        == cfg.max_cities_per_day // 2
+        == 20
     )
     # The inter-city pause (issue #306). Pinned in production, not just at the
     # dataclass default, because this is a knob whose only symptom when wrong is
@@ -1235,11 +1239,16 @@ def test_makelab1_production_config_is_wired():
     # max_batch_hours. That is why it is pinned beside a deadline rather than
     # beside a rate -- raising it again is a deliberate edit to this line and to
     # [schedule].max_batch_hours together.
-    assert cfg.providers["gsv"].daily_request_budget == 15_000_000
+    #
+    # 15M -> 35M on 2026-09-25: just above 12 h x 48,000/min (34.56M), so the
+    # deadline rather than the budget ends the night.
+    assert cfg.max_batch_hours == 12
+    assert cfg.providers["gsv"].daily_request_budget == 35_000_000
     # The street channels must keep their ISOLATED budgets: metered under their
     # own api_usage provider strings against separate keys, so a road crawl can
     # never eat the grid collectors' quota.
-    assert cfg.providers["gsv_streets"].daily_request_budget == 3_000_000
+    # 3M -> 35M on 2026-09-25, same deadline-governs sizing as the grid.
+    assert cfg.providers["gsv_streets"].daily_request_budget == 35_000_000
     # Paced by the STREETS key's own project quota, which as of 2026-09-21 is
     # numerically equal to [download].max_requests_per_minute -- and that
     # equality is a coincidence to be defended, not a duplication to be
