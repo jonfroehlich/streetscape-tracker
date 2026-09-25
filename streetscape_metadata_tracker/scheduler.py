@@ -6828,7 +6828,8 @@ def cmd_run_due(
             # asked for by name must never go quietly uncollected.
             logger.warning(
                 f"--city named {len(due)} due cities but --limit is {max_cities}; "
-                f"past the cap, these may not run: "
+                f"past the cap, these may not run (approximate: a city skipped "
+                f"inside the cap does not count toward it): "
                 f"{', '.join(c.city_id for c in due[max_cities:])}"
             )
     hoisted = slate.hoisted
@@ -8015,8 +8016,9 @@ def _run_city_loop(
     ``_run_city_channels`` as ``stop_requested`` (between a city's channels), so
     a stop cannot launch the rest of the in-flight city's work — issue #206.
 
-    ``max_cities`` is ``cfg.max_cities_per_day`` on a nightly run and an explicit
-    ``--limit`` on an on-demand catch-up (issue #214). Required rather than
+    ``max_cities`` is ``cfg.max_cities_per_day`` on a nightly run, an explicit
+    ``--limit`` on an on-demand catch-up (issue #214), or the number of cities a
+    ``--city`` list names when no ``--limit`` is given. Required rather than
     defaulting to the config value, for the same reason ``_collect_due``'s
     ``providers`` is: the caller resolves the policy, and a default here would be
     dead code that also reads as a second opinion on what the cap is.
@@ -8053,9 +8055,10 @@ def _run_city_loop(
     try:
         for city in due:
             if processed >= max_cities:
-                # Named with the number because the cap has two sources now: the
-                # config's nightly max_cities_per_day, or an explicit --limit
-                # overriding it for one on-demand run (issue #214).
+                # Named with the number because the cap has three sources: the
+                # config's nightly max_cities_per_day, an explicit --limit
+                # overriding it for one on-demand run (issue #214), or the length
+                # of a --city list given without --limit.
                 stop_reason = f"city cap reached ({max_cities})"
                 break
             if sigterm_seen.is_set():
