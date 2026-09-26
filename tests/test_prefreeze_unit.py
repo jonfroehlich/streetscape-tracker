@@ -40,6 +40,9 @@ UNIT_CHECKOUT = "%h/streetscape-tracker"
 # numbers by 100 (making less than 100 queries fetching less 10 MB of data per
 # day fine)" -- wiki.openstreetmap.org/wiki/Overpass_API, read 2026-09-22.
 OVERPASS_REGULAR_QUERIES_PER_DAY = 100
+# The most cities a production night has run, measured under the old 40-city
+# cap (docs/scheduler.md). Re-measure once nights are deadline-governed.
+NIGHT_REACH_CITIES = 40
 
 # alerting._send_smtp builds its connection with timeout=30, and a relay can
 # spend that per stage (connect, STARTTLS, login, send).
@@ -216,11 +219,40 @@ def test_the_pass_covers_tonight_and_stays_inside_overpass_policy(args, prod_cfg
     # Two nights, per the script's own reasoning: a night reaches past its cap.
     assert args.nights >= 2
     # Tonight's whole slate fits (the plan is in slate order, tonight first)...
-    assert args.limit is not None and args.limit >= prod_cfg.max_cities_per_day
+    # Until 2026-09-25 this was pinned against max_cities_per_day. The cap then
+    # began a staged raise (40 -> 80 first) toward max_batch_hours ending the
+    # night, so the cap is no longer a night's reach, and at ~100 it would also
+    # break the Overpass bound below. 40 is the most cities any night has run,
+    # so it is the figure tonight's head is measured against until a
+    # deadline-governed night shows otherwise.
+    assert args.limit is not None and args.limit >= NIGHT_REACH_CITIES
     # ...and one pass stays under the regular-application daily figure, with room
     # for the night's own fetches of whatever the prediction missed.
     assert args.limit < OVERPASS_REGULAR_QUERIES_PER_DAY
     assert args.pause_s >= pf.DEFAULT_PAUSE_S
+
+
+def test_the_weekly_screen_fires_after_the_night_can_still_be_running(units, prod_cfg):
+    """The Panoramax screen shares the nightly's Panoramax host lock, so an
+    overlap is a screen that exits 85 and records nothing that week. It fired
+    at Monday 12:00 until 2026-09-25, inside a full 12 h night -- the norm once
+    the city cap began its staged raise. Same bound as the prefreeze test below."""
+    screen = _parse_unit("streetscape-screen-provider.timer")
+    spec = _one(screen, "Timer", "OnCalendar")
+    m = re.fullmatch(r"Mon \*-\*-\* (\d\d):(\d\d):(\d\d) (\S+)", spec)
+    assert m, f"expected a weekly Monday spec with an explicit zone, got {spec!r}"
+    night_start, night_tz = _daily_pacific(units["nightly"])
+    assert m.group(4) == night_tz == "America/Los_Angeles"
+    night_done = (
+        night_start
+        + _span_minutes(_one(units["nightly"], "Timer", "RandomizedDelaySec"))
+        + prod_cfg.max_batch_hours * 60
+        + _span_minutes(_one(units["collect"], "Service", "TimeoutStopSec"))
+    )
+    screen_start = int(m.group(1)) * 60 + int(m.group(2))
+    assert screen_start >= night_done, (
+        f"the screen fires at minute {screen_start}, but the night can run to minute {night_done:.0f}"
+    )
 
 
 def test_it_fires_after_the_night_can_still_be_running(units, prod_cfg):

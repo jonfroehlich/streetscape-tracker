@@ -3,13 +3,17 @@
 Description=Screen Panoramax coverage across the catalog weekly
 
 [Timer]
-# Monday midday Pacific. Two things pick this slot, and both matter:
-#   - It is nowhere near the nightly batch (02:00, up to ~12 h). Both take the
-#     same machine-wide Panoramax host lock, so an overlap is not a race — it is
-#     a screen that exits 85 (host busy) and records nothing that week.
+# Monday evening Pacific. Two things pick this slot, and both matter:
+#   - It is clear of the nightly batch, which starts by 02:15 and may start
+#     cities until 12 h later, then runs its tail (~14:45 at the latest). Both
+#     take the same machine-wide Panoramax host lock, so an overlap is not a
+#     race — it is a screen that exits 85 (host busy) and records nothing that
+#     week. It was 12:00 until 2026-09-25, which a full 12 h night overlapped;
+#     once the city cap began its staged raise, full-length nights became the
+#     norm. tests/test_prefreeze_unit.py pins the ordering.
 #   - The screen is a growth SIGNAL somebody acts on (a city crossing zero is an
 #     enrolment candidate), so it lands when there is a week ahead to act in.
-OnCalendar=Mon *-*-* 12:00:00 America/Los_Angeles
+OnCalendar=Mon *-*-* 18:00:00 America/Los_Angeles
 RandomizedDelaySec=30m
 # A missed week is a permanent hole in the series — the provider's own history
 # is not queryable backwards — so catch up on the next boot rather than skipping.

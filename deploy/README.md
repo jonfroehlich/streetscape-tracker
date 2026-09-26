@@ -783,7 +783,7 @@ systemctl --user enable --now streetscape-screen-provider.timer
 systemctl --user start streetscape-screen-provider.service   # run once now
 ```
 
-- Fires **Mondays at 12:00 Pacific** (±30 min), deliberately far from the 02:00 batch: both take the same machine-wide Panoramax host lock, so an overlap is not a race but a screen that exits **85** (host busy) and records nothing that week.
+- Fires **Mondays at 18:00 Pacific** (up to 30 min late), after the 02:00 batch's latest end (~14:45; it was 12:00 until 2026-09-25, which a full 12 h night overlapped): both take the same machine-wide Panoramax host lock, so an overlap is not a race but a screen that exits **85** (host busy) and records nothing that week.
 - Every number it writes is an **upper bound** — the hexagons it sums are larger than the cities inside them. A zero is conclusive ("this city holds nothing"); a positive number means only "look closer". Never quote one as a coverage figure.
 - Price a pass without spending anything: `scheduler screen-provider panoramax --dry-run`.
 - A city crossing zero → non-zero is an **enrolment candidate**, answerable any afternoon: `scheduler screen-provider panoramax --measure --limit 5` measures the richest screened cities exactly, prints, and writes nothing.
@@ -810,7 +810,7 @@ systemctl --user list-timers streetscape-prefreeze.timer   # next fire
   `TimeoutStartSec=6h` ends a slow pass by 21:30, and `TimeoutStopSec=5min` is there so the SIGTERM's alert outlives systemd's 90-second default — an SMTP relay can spend 30 s per stage.
 - **Not `Persistent`**, unlike the other timers: a catch-up at boot could land just before 02:00 and hold the Overpass lock against the night's first cold walk, which exits busy and strands its city.
   A missed afternoon costs little, since the previous day's `--nights 2` pass covered most of tonight.
-- Paced for the Overpass usage policy's regular-application figure (under ~100 queries a day): `--limit 40` (the city cap, so tonight always fits) at `--pause-s 120`.
+- Paced for the Overpass usage policy's regular-application figure (under ~100 queries a day): `--limit 40` (the most cities any night has run — the cap until its staged raise began on 2026-09-25 — so tonight's head fits) at `--pause-s 120`.
   It moves fetches the nights would make anyway; it adds none.
   The 242-city backlog measured on 2026-09-21 is therefore never drained in one pass: a cold city is frozen only once it enters the next two nights' slate, at no more than a night's rate.
 - `--alert` mails through `[alerts]` when a pass **does not finish** — Overpass refused (76), the lock was busy (80), a `run-due` was in flight (64), a crash, or a SIGTERM from `TimeoutStartSec` (143) — naming the networks it left cold.

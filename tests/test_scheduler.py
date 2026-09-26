@@ -1198,18 +1198,23 @@ def test_makelab1_production_config_is_wired():
     # 5 to 10 without a line of #282's code changing. That figure is what paces
     # the KartaView widening: the enrolled set divided by it is how many nights
     # a full pass takes.
-    assert cfg.opt_in_cities_per_day is None
+    #
+    # 2026-09-25: the cap began a STAGED raise, 40 -> 80 first (Mapillary
+    # per-IP volume must step up in stages, docs/provider-access.md), and both
+    # reservations are now SET at 10 rather than derived, since a quarter would
+    # move with every step. Pinning the resolved numbers is still the point.
+    assert cfg.max_cities_per_day == 80
+    assert cfg.opt_in_cities_per_day == 10
     assert _sched._opt_in_reservation(cfg, cfg.max_cities_per_day) == 10
-    assert cfg.refresh_slots is None
+    assert cfg.refresh_slots == 10
     assert cfg.effective_refresh_slots(cfg.max_cities_per_day) == 10
-    # The SUM is the number to read, and it is pinned here rather than left to
-    # be re-derived: 20 of 40 slots are reserved, so half a production night is
-    # still the plain stalest-first queue. Raising either share without this
-    # assertion failing would be raising it against the other one blind.
+    # The SUM is the number to read: 20 reserved slots lead the night, and the
+    # rest is the plain stalest-first queue until the deadline stops it.
+    # Raising either share without this failing would be raising it blind.
     assert (
         _sched._opt_in_reservation(cfg, cfg.max_cities_per_day)
         + cfg.effective_refresh_slots(cfg.max_cities_per_day)
-        == cfg.max_cities_per_day // 2
+        == 20
     )
     # The inter-city pause (issue #306). Pinned in production, not just at the
     # dataclass default, because this is a knob whose only symptom when wrong is
@@ -1235,11 +1240,16 @@ def test_makelab1_production_config_is_wired():
     # max_batch_hours. That is why it is pinned beside a deadline rather than
     # beside a rate -- raising it again is a deliberate edit to this line and to
     # [schedule].max_batch_hours together.
-    assert cfg.providers["gsv"].daily_request_budget == 15_000_000
+    #
+    # 15M -> 35M on 2026-09-25: just above 12 h x 48,000/min (34.56M), so the
+    # deadline rather than the budget ends the night.
+    assert cfg.max_batch_hours == 12
+    assert cfg.providers["gsv"].daily_request_budget == 35_000_000
     # The street channels must keep their ISOLATED budgets: metered under their
     # own api_usage provider strings against separate keys, so a road crawl can
     # never eat the grid collectors' quota.
-    assert cfg.providers["gsv_streets"].daily_request_budget == 3_000_000
+    # 3M -> 35M on 2026-09-25, same deadline-governs sizing as the grid.
+    assert cfg.providers["gsv_streets"].daily_request_budget == 35_000_000
     # Paced by the STREETS key's own project quota, which as of 2026-09-21 is
     # numerically equal to [download].max_requests_per_minute -- and that
     # equality is a coincidence to be defended, not a duplication to be
@@ -3478,6 +3488,10 @@ def test_waiting_is_measured_against_the_city_cap_not_the_reservation(conn, monk
     with caplog.at_level(logging.INFO, logger="streetscape_scheduler"):
         _sched._collect_due(conn, cfg, date(2026, 7, 2), ["kartaview"], max_opt_in=2, max_cities=6)
     assert "wait for a later night" not in caplog.text, "all six are inside the cap"
+    # ...but the line is still logged: with a cap far above a night's reach
+    # nothing falls outside it, and a line gated on `waiting` went silent.
+    assert "6 of 6 opt-in-only cities are inside tonight's 6-city cap" in caplog.text
+    assert "the deadline decides how many run" in caplog.text
 
     caplog.clear()
     with caplog.at_level(logging.INFO, logger="streetscape_scheduler"):
@@ -3528,6 +3542,27 @@ def test_an_explicit_reservation_scales_with_limit_instead_of_saturating_it():
     # A --limit above the standing cap is not scaled up: the configured number
     # is a reservation, not a ratio the operator asked to preserve.
     assert _sched._opt_in_reservation(cfg, 40) == 5
+
+
+def test_an_explicit_reservation_against_a_ceiling_cap_still_hoists_on_limit():
+    """A cap set far above a night's reach must not round `--limit` to zero.
+
+    Prod's cap went 40 -> 400 (2026-09-25) so the deadline governs, with the
+    reservation set explicitly at 10. Scaled by the ratio alone, `--limit 20`
+    gave 10 * 20 // 400 = 0, so the filtered catch-up this reservation exists
+    for (`run-due --provider kartaview|panoramax --limit N`) hoisted nobody.
+    The floor is the derived quarter of the narrowed run, never above the
+    configured value.
+    """
+    cfg = _sweep_cfg(max_cities_per_day=400, opt_in_cities_per_day=10)
+    assert _sched._opt_in_reservation(cfg, 20) == 5
+    assert _sched._opt_in_reservation(cfg, 40) == 10
+    assert _sched._opt_in_reservation(cfg, 80) == 10, "never above the configured value"
+    assert _sched._opt_in_reservation(cfg, 400) == 10
+    assert _sched._opt_in_reservation(cfg, 3) == 0, "a quarter of 3 rounds to 0, never the night"
+    # 0 still switches the promotion off at every size.
+    off = _sweep_cfg(max_cities_per_day=400, opt_in_cities_per_day=0)
+    assert _sched._opt_in_reservation(off, 20) == 0
 
 
 def test_the_hoist_count_is_on_the_nights_own_record(conn, monkeypatch, caplog):
@@ -3645,13 +3680,63 @@ def test_the_reserve_promotes_the_stalest_refreshes_into_the_window(conn):
 
     ids = [c.city_id for c in slate.cities]
     assert slate.promoted == 2
-    # The two stalest refreshes are IN the window, at its end so the head stays
-    # breadth-first; the third stays out.
-    assert ids[:4] == never_ids[:2] + refresh_ids[:2]
+    # The two stalest refreshes are IN the window and LEAD it, so they run
+    # whether the cap or the max_batch_hours deadline ends the night; the third
+    # stays out.
+    assert ids[:4] == refresh_ids[:2] + never_ids[:2]
     # The displaced never-collected cities keep their relative order immediately
     # after the window, so they lead TOMORROW rather than falling to the tail.
     assert ids[4:6] == never_ids[2:4]
     assert ids[6:] == refresh_ids[2:]
+
+
+def test_the_reserve_leads_the_slate_when_the_deadline_not_the_cap_ends_the_night(conn):
+    """A cap far above what a night reaches must not turn the reserve off.
+
+    With `max_cities_per_day` set so the 12 h deadline is what stops a night,
+    the whole due slate fits inside the window. The reserve used to return
+    early there (nothing beyond the window to promote from), leaving every
+    refresh behind the NULLS FIRST block — and, when it did promote, it put
+    them at the END of the window, which is exactly where the deadline cuts.
+    Either way a night stopped by the clock ran zero refreshes, silently.
+    """
+    never_ids, refresh_ids = _slate_conn(
+        conn,
+        never=6,
+        refreshes=["2026-01-01T00:00:00+00:00", "2026-02-01T00:00:00+00:00"],
+    )
+
+    cfg = SchedulerConfig(publish_enabled=False, refresh_slots=1, max_cities_per_day=400)
+    slate = _sched._collect_due(
+        conn, cfg, date(2026, 7, 2), ["gsv"], max_opt_in=_reserve(cfg, 400), max_cities=400
+    )
+
+    ids = [c.city_id for c in slate.cities]
+    # A deadline that stops after ANY number of cities still reaches the
+    # stalest refresh first; the other refresh keeps its stalest-first place.
+    assert ids == [refresh_ids[0]] + never_ids + [refresh_ids[1]]
+    assert slate.promoted == 1
+
+
+def test_promoted_counts_only_refreshes_that_moved():
+    """`promoted` means MOVED, the definition `hoisted` uses, not "chosen".
+
+    A refresh already at the head is chosen and not moved, so it must not be
+    counted: a night that reordered nothing has to read `promoted=0`, and
+    `len(chosen)` in place of the moved count survived the whole suite until
+    this pinned it.
+    """
+    from types import SimpleNamespace
+
+    slate = [SimpleNamespace(city_id=c) for c in ("R1", "N1", "R2", "N2", "R3")]
+    refresh = {"R1", "R2", "R3"}
+
+    same, promoted = _sched._reserve_refresh_slots(slate, {"R1"}, window=3, reserved=1)
+    assert same is slate and promoted == 0, "already at the head: chosen, not moved"
+
+    out, promoted = _sched._reserve_refresh_slots(slate, refresh, window=3, reserved=2)
+    assert [c.city_id for c in out] == ["R1", "R2", "N1", "N2", "R3"]
+    assert promoted == 1, "R1 stayed put; only R2 moved"
 
 
 def test_a_promoted_city_is_never_refreshed_early(conn):
@@ -3706,7 +3791,7 @@ def test_a_refresh_is_any_due_channel_with_a_prior_success(conn):
     )
 
     assert slate.promoted == 1
-    assert [c.city_id for c in slate.cities][:2] == [never_ids[0], mixed]
+    assert [c.city_id for c in slate.cities][:2] == [mixed, never_ids[0]]
     assert slate.providers_for_city[mixed] == ["gsv", "mapillary"]
 
 

@@ -18,12 +18,14 @@
 #                max_cities_per_day entries (a city whose every channel is skipped
 #                takes no cap slot), and the order beyond the cap is what those
 #                extra slots and tomorrow draw from.
-#   --limit 40   = max_cities_per_day, so tonight's slate always fits (the plan is
-#                in slate order, tonight first) while the pass never fetches more
-#                than one night's worth. The one-time backlog (242 cold cities on
-#                2026-09-21) is therefore staged at no more than a night's rate
-#                rather than drained in one pass. A test pins it between the
-#                city cap and 100.
+#   --limit 40   the most cities any night has run (the cap until 2026-09-25,
+#                when max_cities_per_day began a staged raise, 40 -> 80 first),
+#                so tonight's head always fits (the plan is in slate order,
+#                tonight first) while the pass never fetches more than one night's
+#                worth. The one-time backlog (242 cold cities on 2026-09-21) is
+#                therefore staged at no more than a night's rate rather than
+#                drained in one pass. A test pins it between 40 and 100; raise it
+#                if a deadline-governed night is measured reaching past 40.
 #   --pause-s 120  two minutes between fetches, on top of the slot wait osmnx
 #                already sleeps off; 40 fetches is ~80 min of pauses.
 # One network is about one Overpass query: osmnx subdivides only above 2,500 km^2
