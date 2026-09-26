@@ -7223,6 +7223,34 @@ def test_backup_status_gates_on_the_timer_watchdog_heartbeat_when_configured(
     assert "catalog backup unhealthy" not in sent[-1][0]
 
 
+@pytest.mark.parametrize(
+    "age_h,healthy",
+    [(47.9, True), (48.0, True), (48.1, False)],
+    ids=["under", "exactly-at", "over"],
+)
+def test_backup_status_watchdog_gate_is_inclusive_and_echoes_the_verdict(
+    conn, monkeypatch, tmp_path, capsys, age_h, healthy
+):
+    """The limit is inclusive (`<=`), and the report echoes the heartbeat's own
+    verdict: a stale heartbeat that last said REARMED reads differently from
+    one that last said ok. The age is pinned through `heartbeat_age_hours`, so
+    the exactly-at case is exact rather than a race with the clock."""
+    from streetscape_metadata_tracker import scheduler as sched
+    from streetscape_metadata_tracker import user_timers as ut
+
+    monkeypatch.setattr(sched, "send_alert", lambda a, s, b: True)
+    cfg = _healthy_backups_cfg(conn, monkeypatch, tmp_path, timer_watchdog_max_age_h=48)
+    sched.catalog_backup.write_backup(conn, cfg.backup_dir, date.today())
+    result = ut.WatchdogResult(rearmed=["streetscape-tracker.timer"])
+    ut.write_heartbeat(cfg.log_dir, result, host="makelab2", now=datetime.now(UTC))
+    monkeypatch.setattr(ut, "heartbeat_age_hours", lambda log_dir, now: age_h)
+
+    assert sched.cmd_backup_status(cfg) == (0 if healthy else 1)
+    out = capsys.readouterr().out
+    assert ("— ok" if healthy else "— STALE") in out
+    assert "its verdict then: REARMED: streetscape-tracker.timer" in out
+
+
 def test_backup_status_ignores_the_heartbeat_when_the_gate_is_off(
     conn, monkeypatch, tmp_path, capsys
 ):

@@ -151,12 +151,28 @@ def test_the_deploy_readme_installs_the_crontab_idempotently():
 
 
 def test_no_doc_pauses_a_timer_with_stop():
-    """The daily re-arm undoes `stop` within a day; `disable --now` is the pause."""
-    pattern = re.compile(r"systemctl --user stop streetscape-[a-z-]+\.timer")
+    """The daily re-arm undoes `stop` within a day; `disable --now` is the pause.
+
+    Prose counts as much as the command: the restore runbook's "Stop the timer
+    first" would let a Persistent catch-up night start mid-restore. Docstrings
+    are where operators copy commands from too, so the package's Python is
+    scanned alongside every markdown file.
+    """
+    patterns = [
+        re.compile(r"systemctl (--user )?stop \S+\.timer"),
+        re.compile(r"\bstop (the|a|this|that|each|every) (\w+ )?timers?\b", re.IGNORECASE),
+    ]
     docs = [
         ROOT / "CLAUDE.md",
-        ROOT / "deploy" / "README.md",
-        *sorted((ROOT / "docs").glob("*.md")),
+        *sorted((ROOT / "deploy").rglob("*.md")),
+        *sorted((ROOT / "docs").rglob("*.md")),
+        *sorted((ROOT / "streetscape_metadata_tracker").glob("*.py")),
+        *sorted((ROOT / "scripts").glob("*.py")),
     ]
-    offenders = [str(p.relative_to(ROOT)) for p in docs if pattern.search(p.read_text())]
+    offenders = [
+        f"{p.relative_to(ROOT)}: {m.group(0)!r}"
+        for p in docs
+        for pat in patterns
+        for m in pat.finditer(p.read_text())
+    ]
     assert offenders == []

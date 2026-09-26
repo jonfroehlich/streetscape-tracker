@@ -221,8 +221,8 @@ def test_a_timer_that_stays_inactive_after_start_is_a_failure(cfg, unit_files, s
 
 @pytest.mark.parametrize(
     "load,unit_file",
-    [("loaded", "disabled"), ("masked", "masked")],
-    ids=["disabled", "masked"],
+    [("loaded", "disabled"), ("masked", "masked"), ("masked", "")],
+    ids=["disabled", "masked", "masked-load-state-only"],
 )
 def test_a_disabled_timer_is_a_pause_not_a_failure(cfg, unit_files, sent, capsys, load, unit_file):
     fake = FakeSystemctl()
@@ -258,6 +258,69 @@ def test_a_not_found_timer_is_unhealthy_and_a_reload_can_recover_it(cfg, unit_fi
     fake = fake_for(False)
     assert _run(cfg, fake, rearm=True, alert=True) == 1
     assert "NOT INSTALLED" in sent[-1][0]
+
+
+def test_a_timer_paused_during_the_rearm_is_not_reported_rearmed(cfg, unit_files, sent):
+    """An operator `disable --now` racing the re-arm leaves the timer healthy
+    (paused) but NOT re-armed: the REARMED mail would claim a fix that was a pause."""
+    name = TIMERS[1]
+
+    class PausedOnStart(FakeSystemctl):
+        def __call__(self, args):
+            if list(args)[:1] == ["start"]:
+                self.set(args[1], UnitFileState="disabled")
+            return super().__call__(args)
+
+    fake = PausedOnStart(start_flips=False)
+    fake.set(name, ActiveState="inactive")
+    assert _run(cfg, fake, rearm=True, alert=True) == 0
+    beat = ut.read_heartbeat(cfg.log_dir)
+    assert beat["rearmed"] == []
+    assert beat["paused"] == [name]
+    assert beat["verdict"] == ut.VERDICT_OK
+    assert sent == []
+
+
+def test_one_missing_timer_file_is_not_installed_and_the_rest_are_still_rearmed(
+    cfg, unit_files, sent, capsys
+):
+    """One shipped timer never copied into ~/.config/systemd/user/ is an install
+    gap, not an unmounted home: it must not block the re-arm of the installed
+    timers, nor be reported as UNIT FILES UNREACHABLE."""
+    missing, dead = TIMERS[0], TIMERS[3]
+    (unit_files / missing).unlink()
+    fake = FakeSystemctl()
+    fake.set(missing, LoadState="not-found", ActiveState="inactive", UnitFileState="")
+    fake.set(dead, ActiveState="inactive")
+    assert _run(cfg, fake, rearm=True, alert=True) == 1
+    assert ["start", dead] in fake.calls
+    beat = ut.read_heartbeat(cfg.log_dir)
+    assert beat["rearmed"] == [dead]
+    assert beat["not_installed"] == [missing]
+    assert beat["verdict"] == f"{ut.VERDICT_NOT_INSTALLED}: {missing}"
+    assert ut.VERDICT_FILES_UNREACHABLE not in capsys.readouterr().out
+    assert len(sent) == 1 and ut.VERDICT_NOT_INSTALLED in sent[0][0]
+
+
+# Spelled out, not read from ut.LIVE_MANAGER_STATES: a list derived from the
+# constant under test shrinks with it, and dropping `degraded` would pass.
+@pytest.mark.parametrize(
+    "state", ["degraded", "initializing", "maintenance", "running", "starting"]
+)
+def test_every_live_manager_state_is_reachable(cfg, unit_files, sent, state):
+    """`degraded` above all: one failed nightly service makes the manager
+    degraded, which is exactly the morning a re-arm is needed."""
+    fake = FakeSystemctl(manager=state)
+    fake.set(TIMERS[0], ActiveState="inactive")
+    assert _run(cfg, fake, rearm=True) == 0
+    assert ["start", TIMERS[0]] in fake.calls
+
+
+@pytest.mark.parametrize("state", ["offline", "unknown", ""])
+def test_a_manager_that_does_not_answer_is_unreachable(cfg, unit_files, sent, state):
+    fake = FakeSystemctl(manager=state)
+    assert _run(cfg, fake) == 1
+    assert fake.calls == [["is-system-running"]]
 
 
 # --- waiting for the manager and the files ----------------------------------
@@ -331,7 +394,18 @@ def test_wait_zero_is_a_single_check(cfg, unit_files, sent):
 
 
 def test_bad_wait_or_poll_values_exit_usage(cfg, unit_files, sent):
-    for kw in ({"wait_s": -1}, {"poll_s": 0}, {"poll_s": -5}):
+    nan, inf = float("nan"), float("inf")
+    for kw in (
+        {"wait_s": -1},
+        {"poll_s": 0},
+        {"poll_s": -5},
+        # Non-finite values pass a bare range check (`nan < 0` is False) and
+        # would make the wait loop unbounded.
+        {"wait_s": nan},
+        {"wait_s": inf},
+        {"poll_s": nan},
+        {"poll_s": inf},
+    ):
         fake = FakeSystemctl()
         assert _run(cfg, fake, **kw) == sched.USAGE_EXIT_CODE
         assert fake.calls == []
@@ -367,7 +441,7 @@ def test_alert_does_not_change_the_exit_status(cfg, unit_files, sent):
     assert _run(cfg, fake, rearm=True, alert=True) == 0
 
 
-def test_the_heartbeat_records_the_verdict_atomically(cfg, unit_files, sent):
+def test_the_heartbeat_records_the_verdict(cfg, unit_files, sent):
     fake = FakeSystemctl()
     fake.set(TIMERS[1], ActiveState="inactive")
     fake.set(TIMERS[2], UnitFileState="disabled", ActiveState="inactive")
@@ -383,6 +457,44 @@ def test_the_heartbeat_records_the_verdict_atomically(cfg, unit_files, sent):
     assert beat["inactive"] == [] and beat["not_installed"] == []
     assert os.listdir(cfg.log_dir) == [ut.HEARTBEAT_FILENAME]
     assert ut.heartbeat_age_hours(cfg.log_dir, now + timedelta(hours=3)) == pytest.approx(3.0)
+
+
+def test_a_failed_heartbeat_write_leaves_the_previous_heartbeat_intact(tmp_path, monkeypatch):
+    """Atomicity, tested by breaking a write midway: the old heartbeat must
+    survive whole, and the failed writer must not leave its staging file."""
+    log_dir = str(tmp_path)
+    before = datetime(2026, 9, 25, 15, 30, tzinfo=UTC)
+    ut.write_heartbeat(log_dir, ut.WatchdogResult(), host=PROD_HOST, now=before)
+    good = ut.read_heartbeat(log_dir)
+
+    def half_then_fail(obj, f, **kw):
+        f.write('{"checked_at": "2026-09-26T')
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(ut.json, "dump", half_then_fail)
+    with pytest.raises(RuntimeError):
+        ut.write_heartbeat(log_dir, ut.WatchdogResult(), host=PROD_HOST, now=datetime.now(UTC))
+    assert ut.read_heartbeat(log_dir) == good
+    assert os.listdir(log_dir) == [ut.HEARTBEAT_FILENAME]
+
+
+def test_overlapping_heartbeat_writers_do_not_share_a_staging_file(tmp_path, monkeypatch):
+    """The @reboot run (waiting up to 30 min) and the 08:30 run can overlap.
+    The other writer's staging path is derived THROUGH `_staging_path` under a
+    faked pid, so a shared name makes this fail rather than pass on a name the
+    test invented."""
+    log_dir = str(tmp_path)
+    hb = ut.heartbeat_path(log_dir)
+    monkeypatch.setattr(ut.os, "getpid", lambda: 222)
+    other = ut._staging_path(hb)
+    with open(other, "w") as f:
+        f.write("in flight")
+    monkeypatch.setattr(ut.os, "getpid", lambda: 111)
+    assert ut._staging_path(hb) != other
+    ut.write_heartbeat(log_dir, ut.WatchdogResult(), host=PROD_HOST, now=datetime.now(UTC))
+    with open(other) as f:
+        assert f.read() == "in flight"
+    assert ut.read_heartbeat(log_dir)["host"] == PROD_HOST
 
 
 def test_read_heartbeat_tolerates_a_truncated_file(tmp_path):
@@ -407,3 +519,29 @@ def test_the_subcommand_is_wired():
     )
     args = sched.build_parser().parse_args(["timer-status"])
     assert (args.rearm, args.alert, args.wait_s) == (False, False, 0.0)
+
+
+@pytest.mark.parametrize(
+    "argv,expected",
+    [
+        (
+            ["timer-status", "--rearm", "--alert", "--wait-s", "1234", "--poll-s", "7"],
+            {"rearm": True, "alert": True, "wait_s": 1234.0, "poll_s": 7.0},
+        ),
+        (
+            ["timer-status"],
+            {"rearm": False, "alert": False, "wait_s": 0.0, "poll_s": ut.DEFAULT_POLL_S},
+        ),
+    ],
+    ids=["all-flags", "no-flags"],
+)
+def test_main_forwards_every_timer_status_flag(monkeypatch, cfg, argv, expected):
+    """The parser can be perfect and the dispatch still drop a flag: both
+    directions, so a constant in place of any forwarded arg fails one case."""
+    monkeypatch.setattr(sched.sys, "argv", ["scheduler", "--config", "x.toml", *argv])
+    monkeypatch.setattr(sched, "load_scheduler_config", lambda path: cfg)
+    monkeypatch.setattr(sched, "setup_logging", lambda cfg, verbose=False: None)
+    seen = {}
+    monkeypatch.setattr(sched, "cmd_timer_status", lambda c, **kw: seen.update(kw) or 0)
+    assert sched.main() == 0
+    assert seen == expected

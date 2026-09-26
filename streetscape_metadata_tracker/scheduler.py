@@ -30,6 +30,7 @@ import gzip
 import json
 import logging
 import logging.handlers
+import math
 import os
 import signal
 import socket
@@ -4049,7 +4050,8 @@ def _screen_pacing(cfg: SchedulerConfig, provider: str) -> tuple[int, float]:
     host and one IP, which is the whole point — so the screen and the nightly
     channels cannot be paced apart without saying so here. And the timer is
     still the harder lever when the answer is "stop talking to this host at
-    all": ``systemctl --user stop streetscape-screen-provider.timer``.
+    all": ``systemctl --user disable --now streetscape-screen-provider.timer``
+    (``stop`` alone is undone by the #369 watchdog's daily re-arm).
     """
     rate = panoramax_screen.DEFAULT_TILE_REQUESTS_PER_MINUTE
     jitter = panoramax_screen.DEFAULT_TILE_JITTER
@@ -4481,7 +4483,9 @@ def cmd_timer_status(
     gates on, the give-up path included — the heartbeat measures whether CRON
     runs, not whether the timers do.
     """
-    if wait_s < 0 or poll_s <= 0:
+    # isfinite first: `nan < 0` is False, so NaN (or inf) would slip past the
+    # range check and make the wait loop unbounded.
+    if not (math.isfinite(wait_s) and math.isfinite(poll_s)) or wait_s < 0 or poll_s <= 0:
         print(f"--wait-s must be >= 0 and --poll-s > 0 (got {wait_s:g}, {poll_s:g})")
         return USAGE_EXIT_CODE
     run = run or user_timers.run_systemctl

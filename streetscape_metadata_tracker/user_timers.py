@@ -234,12 +234,20 @@ def manager_reachable(run: Runner) -> bool:
 
 
 def unit_files_visible(names: Sequence[str], user_unit_dir: str | None = None) -> bool:
-    """Whether every installed timer file is visible.
+    """Whether the installed unit directory is visible: ANY shipped timer file.
+
+    This is the mount question, not the install question. ``any`` rather than
+    ``all`` because an unmounted home hides every file at once, while one timer
+    shipped but never installed (a fifth timer pulled but not copied) hides one
+    — and under ``all`` that one missing file would keep the check from
+    re-arming the installed timers AND misreport it as UNIT FILES UNREACHABLE.
+    With ``any``, the missing timer reaches ``check_and_rearm`` and is reported
+    by name as NOT INSTALLED.
 
     The ``isfile`` is also what triggers the autofs mount of the NFS home.
     """
     base = os.path.expanduser(user_unit_dir if user_unit_dir is not None else USER_UNIT_DIR)
-    return all(os.path.isfile(os.path.join(base, n)) for n in names)
+    return any(os.path.isfile(os.path.join(base, n)) for n in names)
 
 
 def timer_state(run: Runner, name: str) -> TimerState:
@@ -340,16 +348,34 @@ def heartbeat_path(log_dir: str) -> str:
     return os.path.join(log_dir, HEARTBEAT_FILENAME)
 
 
+def _staging_path(path: str) -> str:
+    """This process's staging name for ``path`` (see ``write_heartbeat``)."""
+    return f"{path}.{os.getpid()}.tmp"
+
+
 def write_heartbeat(log_dir: str, result: WatchdogResult, *, host: str, now: datetime) -> str:
-    """Write the heartbeat atomically (``.tmp`` then ``os.replace``)."""
+    """Write the heartbeat atomically (a staging file, then ``os.replace``).
+
+    The staging name is per-pid: the ``@reboot`` run (waiting up to 30 min) and
+    the 08:30 run can overlap, and a shared name would let one writer promote
+    or truncate the other's half-written file. A failed write removes its own
+    staging file and leaves the previous heartbeat untouched.
+    """
     os.makedirs(log_dir, exist_ok=True)
     path = heartbeat_path(log_dir)
     payload = {"checked_at": now.astimezone(UTC).isoformat(), "host": host, **result.to_json()}
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, sort_keys=True)
-        f.write("\n")
-    os.replace(tmp, path)
+    tmp = _staging_path(path)
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, sort_keys=True)
+            f.write("\n")
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
     return path
 
 

@@ -650,7 +650,7 @@ What each alert subject means, and the first move:
 | `INACTIVE: …` | An enabled timer is not armed, and `start` did not arm it | `systemctl --user status <x>.timer` |
 | `NOT INSTALLED: …` | The manager has no such unit, even after `daemon-reload` | Is `~/.config/systemd/user/` mounted and holding the file? |
 | `REARMED: …` | The watchdog found and fixed the #369 shape — a reboot, or an operator `stop` | Did the night before publish? If not, `regenerate-aggregate --publish` |
-| `UNIT FILES UNREACHABLE after N s` | The manager answered but the timer files never appeared | The NFS home is not mounted |
+| `UNIT FILES UNREACHABLE after N s` | The manager answered but none of the timer files ever appeared (one missing file is `NOT INSTALLED` instead) | The NFS home is not mounted |
 | `USER MANAGER UNREACHABLE after N s` | `systemctl --user` never answered | `loginctl show-user jonf -p Linger` |
 | `timer watchdog NEVER RAN` / `STALE (N h)` (from `backup-status`) | Cron is not running the watchdog | `crontab -l`, `tail logs/timer_watchdog.log` |
 
@@ -679,8 +679,12 @@ and `backup-status` inventories both:
     restore-backup backups/streetscape_tracker.db.2026-08-07.backup --to /tmp/recovered.db
 ```
 
-`--to` defaults to the configured `db_path`. Stop the timer first, and restore
-to a scratch path and inspect it before putting it in the catalog's place.
+`--to` defaults to the configured `db_path`.
+Pause the nightly timer first with `systemctl --user disable --now streetscape-tracker.timer`
+— not `stop`, which the timer watchdog's daily re-arm undoes (issue #369) —
+then restore to a scratch path and inspect it before putting it in the catalog's place.
+Resume with `enable --now` only once the catalog is back: the timer is `Persistent=true`,
+so re-enabling it after a missed 02:00 starts that night's batch at once.
 
 Two refusals, both deliberate — a restore that quietly does something plausible
 is worse than one that stops:

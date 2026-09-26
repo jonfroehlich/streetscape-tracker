@@ -542,7 +542,8 @@ It cannot be proven from here — `journalctl` for the manager is unreadable by 
 
 **The design: a user crontab on local disk.**
 `deploy/cron/streetscape-tracker.crontab` runs `scheduler timer-status --rearm --alert` at `@reboot` and daily at 08:30 Pacific.
-A user crontab lives in `/var/spool/cron` on local disk, so it does not depend on the NFS home being mounted when the user manager starts; whether makelab2's `crond.service` orders after `autofs` is unverified, and the `@reboot` line does not rely on it: it polls (`--wait-s 1800`, every `--poll-s` 15 s) until BOTH `systemctl --user is-system-running` answers AND every shipped `.timer` file `isfile()`s under `~/.config/systemd/user/`, which is also what triggers the autofs mount.
+A user crontab lives in `/var/spool/cron` on local disk, so it does not depend on the NFS home being mounted when the user manager starts; whether makelab2's `crond.service` orders after `autofs` is unverified, and the `@reboot` line does not rely on it: it polls (`--wait-s 1800`, every `--poll-s` 15 s) until BOTH `systemctl --user is-system-running` answers AND at least one shipped `.timer` file `isfile()`s under `~/.config/systemd/user/`, which is also what triggers the autofs mount.
+Any, not every: an unmounted home hides every file at once, while a timer shipped but never installed hides one — under "every", that one file blocked the re-arm of all the installed timers and was misreported as `UNIT FILES UNREACHABLE`; now it reaches the per-timer check and is reported by name as `NOT INSTALLED`.
 The checkout, the venv and `logs/` are on makelab2's local ZFS pool; the only NFS dependency is the unit files, which is the thing being waited for.
 The check is cause-agnostic on purpose: whatever left a timer enabled-but-inactive — this race, a lost linger, an operator `stop`, a future systemd change — the repair is the one done by hand on 2026-09-23, and the alert fires either way.
 
@@ -569,7 +570,7 @@ The heartbeat measures whether **cron** runs, not whether the timers do (the wat
 Only an off-host monitor or a root-side mechanism closes that, and neither is in scope.
 
 **The pause verb changed.**
-Because the daily line starts any enabled-but-inactive timer, `systemctl --user stop <x>.timer` is now a pause of at most a day.
+Because the daily line starts any enabled-but-inactive timer, the `stop` verb on a `.timer` is now a pause of at most a day.
 The documented pause is `systemctl --user disable --now <x>.timer` (resume: `enable --now`), which the watchdog reports as `paused` and leaves alone; `tests/test_timer_watchdog_crontab.py` refuses the old spelling in any doc.
 `stop` on a `.service` is unaffected.
 
