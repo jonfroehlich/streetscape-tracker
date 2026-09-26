@@ -32,7 +32,8 @@ already gone wrong once:
 - An end-to-end migration test with synthetic fixtures
 - The one snapshot clock (`tests/test_clock.py`, issue #347): under a pinned America/Los_Angeles zone and a frozen 17:30-PDT instant, `clock.snapshot_date_today()` is the UTC date and not the local one; `db.utc_now_iso` reads the same seam;
   and a grep refuses `date.today()`, `datetime.today()` and a naive `datetime.now()` on the collection path (`checkpointing`, `cli`, `scheduler`, the walk collector, the prefreeze script).
-  The grep reads code tokens only, so the comment that names `date.today()` does not trip it, but keeps f-strings, whose braces hold code; its regex and the stripping are self-checked against planted samples so it cannot pass by matching nothing.
+  The grep blanks comments and plain strings in place, so the comment that names `date.today()` does not trip it, but keeps f-strings, whose braces hold code; it keeps each line's own spacing, because re-joining tokens fused `else date.today()` into `elsedate.today()` and the first version missed the very #347 line that way.
+  Its regex and the blanking are self-checked against planted samples so it cannot pass by matching nothing.
   The shared `frozen_utc_clock` and `pacific_local_zone` fixtures live in `conftest.py`, non-autouse; the instant is in the past, so an unfrozen `date.today()` can never coincide with either date it asserts.
 
 ## City registration manifests (issue #110, and the purposive additions)

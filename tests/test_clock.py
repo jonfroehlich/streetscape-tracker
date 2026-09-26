@@ -45,18 +45,27 @@ def _code_lines(source: str) -> dict[int, str]:
     An f-string is KEPT: its braces hold code (``f"publish_{date.today()}"``
     was one of the reads this replaced), and Python 3.11 tokenizes the whole
     f-string as one STRING token where 3.12+ splits out the expression.
+
+    Each line keeps its ORIGINAL spacing, with the dropped spans blanked:
+    re-joining tokens instead fuses ``else date.today()`` into
+    ``elsedate.today()``, where ``\\bdate`` no longer matches -- the first
+    version of this grep missed exactly the #347 line that way.
     """
-    lines: dict[int, list[str]] = {}
+    lines = [list(line) for line in source.splitlines()]
     for tok in tokenize.generate_tokens(io.StringIO(source).readline):
-        if tok.type in (tokenize.COMMENT, tokenize.NL, tokenize.NEWLINE):
-            continue
-        if (
+        is_plain_string = (
             tok.type == tokenize.STRING
             and "f" not in tok.string.split("'")[0].split('"')[0].lower()
-        ):
+        )
+        if tok.type != tokenize.COMMENT and not is_plain_string:
             continue
-        lines.setdefault(tok.start[0], []).append(tok.string)
-    return {n: "".join(parts) for n, parts in lines.items()}
+        (start_row, start_col), (end_row, end_col) = tok.start, tok.end
+        for row in range(start_row, end_row + 1):
+            chars = lines[row - 1]
+            lo = start_col if row == start_row else 0
+            hi = end_col if row == end_row else len(chars)
+            chars[lo:hi] = " " * (hi - lo)
+    return {n: "".join(chars) for n, chars in enumerate(lines, start=1)}
 
 
 def test_snapshot_date_today_is_the_utc_calendar_date_not_the_local_one(
@@ -89,6 +98,9 @@ def test_the_local_calendar_pattern_catches_what_it_claims():
     assert not _LOCAL_CALENDAR_RE.search(stripped.get(2, ""))
     in_fstring = _code_lines('p = f"publish_{date.today().isoformat()}.log"\n')
     assert _LOCAL_CALENDAR_RE.search(in_fstring[1])
+    # A keyword before the call must not hide it (the token-joining bug).
+    after_else = _code_lines("d = parse(x) if x else date.today()\n")
+    assert _LOCAL_CALENDAR_RE.search(after_else[1])
 
 
 def test_no_collection_module_reads_a_local_calendar():
