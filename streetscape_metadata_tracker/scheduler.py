@@ -319,7 +319,10 @@ class HostBreaker(set):
     own city, every city the breaker then skipped, and a city whose child
     found the host busy with another local process -- while the grid sibling
     succeeded. Those are the ones with no route back for ~83 days, and the
-    ``Done:`` line and the alert name them (issue #341).
+    ``Done:`` line and the alert name them (issue #341). The end-of-night
+    retry pass (``_retry_stranded_walks``, issue #380) takes an entry back out
+    with ``unstrand`` when its walk lands, and counts it in
+    ``stranded_recovered``.
 
     A due re-check runs on the launch pass, i.e. the main thread, and holds it
     for the probe's duration -- normally bounded by its 25 s
@@ -359,6 +362,10 @@ class HostBreaker(set):
         # city_id -> street channels a refused host cost the city while its
         # grid sibling succeeded tonight. Insertion-ordered: the night's order.
         self.stranded: dict[str, list[str]] = {}
+        # Stranded walks the end-of-night retry pass then collected (issue
+        # #380). Each one LEFT `stranded` when it landed, so `stranded` is
+        # always what is still un-walked and this is what the pass saved.
+        self.stranded_recovered = 0
         self._next_recheck_at: dict[str, float] = {}
 
     def add(self, host: str) -> None:
@@ -400,6 +407,14 @@ class HostBreaker(set):
 
     def strand(self, city_id: str, provider: str) -> None:
         self.stranded.setdefault(city_id, []).append(provider)
+
+    def unstrand(self, city_id: str, provider: str) -> None:
+        """A stranded walk landed after all (issue #380): forget it, count it."""
+        channels = self.stranded[city_id]
+        channels.remove(provider)
+        if not channels:
+            del self.stranded[city_id]
+        self.stranded_recovered += 1
 
     def _maybe_recheck(self, host: str) -> None:
         probe = HOST_RECHECKS.get(host)
@@ -7264,6 +7279,14 @@ def cmd_run_due(
             if blocked_hosts.stranded
             else ""
         )
+        # Beside it, because the count above is what is STILL stranded (issue
+        # #380): a walk the end-of-night retry landed has left it.
+        + (
+            f"; {blocked_hosts.stranded_recovered} stranded walk(s) recovered by the "
+            f"end-of-night retry"
+            if blocked_hosts.stranded_recovered
+            else ""
+        )
         + (f"; {busy_note}" if busy_note else "")
         + (f"; stopped early ({stop_reason})" if stop_reason else "")
         + (f"; {plan_error}" if plan_error else "")
@@ -8199,6 +8222,137 @@ def _run_city_channels(
     return attempted, succeeded, skipped_budget
 
 
+def _wait_out_recheck_cooldown(stop_requested: threading.Event, seconds: float) -> bool:
+    """Idle for ``seconds``, or until a stop is requested; True if one was.
+
+    ``Event.wait`` rather than ``time.sleep``: PEP 475 makes a sleep RESUME
+    after the SIGTERM handler runs, so a 45-min sleep would spend a whole stop
+    window, while the wait returns the moment ``_stop_on_sigterm`` sets the
+    flag. A named seam so the suite's autouse fixture can make it instant --
+    the suite must never wait out a real cooldown.
+    """
+    return stop_requested.wait(seconds)
+
+
+def _retry_stranded_walks(
+    cfg: SchedulerConfig,
+    conn,
+    today: date,
+    cities: dict[str, db.CityRow],
+    *,
+    blocked_hosts: HostBreaker,
+    busy_hosts: Counter[str],
+    deferred_channels: Counter[str],
+    batch_deadline: float,
+    sigterm_seen: threading.Event,
+    tally: Counter[str],
+) -> str | None:
+    """The end-of-night retry of tonight's stranded walks (issue #380).
+
+    Once the city loop has passed a city nothing asks the breaker on its
+    behalf again, yet a night finishes in ~2-3 h of its 12 h window and an
+    Overpass refusal has cleared on a minutes-to-~1 h scale. So each (city,
+    walk) in ``blocked_hosts.stranded`` is launched again, one walk per
+    ``_run_city_channels`` call, serially, through the SAME breaker, deadline
+    and stop flag -- every guard the loop applies, with nothing new to keep in
+    step. ``today`` is the night's own UTC date, so a recovered walk carries
+    its grid run's ``--run-date`` and the pair survives; never re-derive it.
+
+    The breaker's own re-check is the only probe. A walk it still skips (or
+    whose child is refused again) earns ONE more try, after waiting out the
+    cooldown, and only when a re-check can still be spent on its host and the
+    deadline has room for the wait plus a child's floor timeout -- never a
+    second retry budget beside ``HOST_RECHECKS_PER_NIGHT``.
+
+    Accounting: a walk that lands is ``unstrand``-ed and counted in
+    ``stranded_recovered``; any other outcome KEEPS the original entry. It is
+    never re-derived, because ``_run_city_channels`` strands only when the
+    grid sibling succeeded in the same call, which it cannot in this one.
+    Attempts are added to ``tally`` as they happen, so an exception mid-pass
+    still reports the ones before it.
+
+    Returns ``_STOP_REASON_SIGTERM`` when a stop cut the pass short, else None.
+    """
+    pending = [(cid, walk) for cid, walks in blocked_hosts.stranded.items() for walk in walks]
+    if not pending:
+        return None
+    logger.info(f"End-of-night retry of {len(pending)} stranded walk(s) (issue #380)")
+
+    for attempt in (1, 2):
+        if attempt == 2:
+            now = time.monotonic()
+            waitable = {
+                host
+                for _, walk in pending
+                for host in CHANNEL_HOSTS.get(walk, ())
+                if host in blocked_hosts.latched
+                and host in HOST_RECHECKS
+                and blocked_hosts.rechecks[host] < blocked_hosts.max_rechecks
+            }
+            if not waitable:
+                break
+            if batch_deadline - now <= blocked_hosts.cooldown_s + _MIN_CLAMPED_TIMEOUT_S:
+                logger.info(
+                    f"Not waiting out the {blocked_hosts.cooldown_s / 60:g}-min re-check "
+                    f"cooldown for {len(pending)} stranded walk(s): the batch deadline is too "
+                    f"close; they stay stranded."
+                )
+                break
+            logger.info(
+                f"{_host_names(waitable)} still refusing; waiting "
+                f"{blocked_hosts.cooldown_s / 60:g} min to re-check it once more for "
+                f"{len(pending)} stranded walk(s)"
+            )
+            if _wait_out_recheck_cooldown(sigterm_seen, blocked_hosts.cooldown_s):
+                return _STOP_REASON_SIGTERM
+
+        lost_to_breaker: list[tuple[str, str]] = []
+        for i, (cid, walk) in enumerate(pending):
+            if sigterm_seen.is_set():
+                return _STOP_REASON_SIGTERM
+            # The loop's own start gate: never launch a child the deadline
+            # could only hand its floor timeout.
+            if batch_deadline - time.monotonic() <= _MIN_CLAMPED_TIMEOUT_S:
+                logger.info("Batch deadline reached; the remaining stranded walks stay stranded.")
+                return None
+            skips_before = blocked_hosts.skipped_launches
+            trips_before = sum(blocked_hosts.trips.values())
+            walk_attempted, walk_succeeded, walk_skipped = _run_city_channels(
+                cfg,
+                conn,
+                cities[cid],
+                today,
+                [walk],
+                blocked_hosts=blocked_hosts,
+                busy_hosts=busy_hosts,
+                deferred_channels=deferred_channels,
+                batch_deadline=batch_deadline,
+                stop_requested=sigterm_seen,
+            )
+            tally["attempted"] += walk_attempted
+            tally["succeeded"] += walk_succeeded
+            tally["skipped_budget"] += walk_skipped
+            if walk_succeeded:
+                blocked_hosts.unstrand(cid, walk)
+                logger.warning(
+                    f"{cid} [{walk}]: RECOVERED by the end-of-night retry — no longer "
+                    f"stranded, and paired with tonight's grid run (issue #380)."
+                )
+            elif (
+                blocked_hosts.skipped_launches > skips_before
+                or sum(blocked_hosts.trips.values()) > trips_before
+            ):
+                lost_to_breaker.append((cid, walk))
+            # Serial, and spaced like the loop's cities: Overpass admits one
+            # talker, and every retry may be a cold network fetch.
+            if walk_attempted and i + 1 < len(pending):
+                time.sleep(cfg.sleep_between_cities_s)
+        pending = lost_to_breaker
+        if not pending:
+            break
+    return None
+
+
 def _run_city_loop(
     cfg: SchedulerConfig,
     conn,
@@ -8245,12 +8399,20 @@ def _run_city_loop(
     sibling's in-flight sweep (issue #274). Reported for exactly the reason
     ``busy_hosts`` is, and counted apart from both a failure and a budget skip
     because it is neither.
+
+    After the due list, the walks the breaker stranded tonight get one more
+    chance through ``_retry_stranded_walks`` (issue #380); its runs count in
+    ``attempted``/``succeeded`` but not in ``processed``, since each city was
+    already counted once.
     """
     processed = succeeded = attempted = skipped_budget = 0
     stop_reason: str | None = None
     blocked_hosts = HostBreaker()
     busy_hosts: Counter[str] = Counter()
     deferred_channels: Counter[str] = Counter()
+    # The stranded-walk retry's runs (issue #380), folded in after the `except`
+    # so a pass that raises part-way still reports what it collected.
+    retry_tally: Counter[str] = Counter()
     try:
         for city in due:
             if processed >= max_cities:
@@ -8313,6 +8475,24 @@ def _run_city_loop(
             # — including `--limit 1`, the one-city smoke test.
             if city_attempted and processed < min(len(due), max_cities):
                 time.sleep(cfg.sleep_between_cities_s)
+
+        # Inside the `try`, after every way out of the `for` but the exception
+        # arm, so the #167 guard covers it and a cap-, --city- or --provider-
+        # ended run inherits it. It checks the stop flag and the deadline
+        # itself, so a stopped or out-of-time night passes straight through.
+        pass_stop = _retry_stranded_walks(
+            cfg,
+            conn,
+            today,
+            {city.city_id: city for city in due},
+            blocked_hosts=blocked_hosts,
+            busy_hosts=busy_hosts,
+            deferred_channels=deferred_channels,
+            batch_deadline=batch_deadline,
+            sigterm_seen=sigterm_seen,
+            tally=retry_tally,
+        )
+        stop_reason = stop_reason or pass_stop
     except Exception:
         # One city's unexpected error must not cost the night its publish:
         # everything collected so far is already committed to the catalog but
@@ -8322,6 +8502,9 @@ def _run_city_loop(
         logger.exception("City loop aborted by an unexpected error")
         stop_reason = _STOP_REASON_ERROR
 
+    attempted += retry_tally["attempted"]
+    succeeded += retry_tally["succeeded"]
+    skipped_budget += retry_tally["skipped_budget"]
     return (
         processed,
         succeeded,
@@ -8476,9 +8659,20 @@ def _stranded_alert_note(cfg: SchedulerConfig, breaker: HostBreaker, today: date
 
     A walk is dated the UTC date its command starts, so run the same UTC day
     (``today``) it keeps the grid run's date and the pair survives.
+
+    Names only what is STILL stranded after the end-of-night retry (issue
+    #380), and says how many that pass recovered; a night whose every stranded
+    walk was recovered gets that one sentence and no command.
     """
+    recovered = (
+        f"{breaker.stranded_recovered} stranded walk(s) were recovered by the end-of-night "
+        f"retry, which launched them again through the same breaker after the due list "
+        f"(issue #380); they keep tonight's date and their pairing."
+        if breaker.stranded_recovered
+        else ""
+    )
     if not breaker.stranded:
-        return ""
+        return recovered
     lines = [f"{cid} ({', '.join(channels)})" for cid, channels in breaker.stranded.items()]
     groups: dict[tuple[str, ...], list[str]] = {}
     for cid, channels in breaker.stranded.items():
@@ -8489,7 +8683,7 @@ def _stranded_alert_note(cfg: SchedulerConfig, breaker: HostBreaker, today: date
     return (
         f"{len(breaker.stranded)} city(ies) came out of the night with a grid run but NO road "
         f"walk, because a refused or locally busy host cost them the walk while the grid "
-        f"sibling succeeded. "
+        f"sibling succeeded, and the end-of-night retry (issue #380) could not walk them either. "
         f"Each is not due on the grid channel again for ~{cfg.cycle_days - cfg.grace_days} days, "
         f"so nothing re-pairs it and it reaches a capped night only through the bounded "
         f"[schedule].opt_in_cities_per_day reservation (issue #341):\n  "
@@ -8503,7 +8697,9 @@ def _stranded_alert_note(cfg: SchedulerConfig, breaker: HostBreaker, today: date
         f"append --dry-run to preview. A walk is dated the UTC day its command starts: started "
         f"on {today.isoformat()} (UTC) the walks share the grid runs' date and each pair is "
         f"kept, from the next UTC day they carry a later one. A bare `--limit N` would walk the "
-        f"stalest-due queue instead, not these cities (issue #362).\n" + "\n".join(commands)
+        f"stalest-due queue instead, not these cities (issue #362).\n"
+        + "\n".join(commands)
+        + (f"\n{recovered}" if recovered else "")
     )
 
 

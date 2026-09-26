@@ -477,6 +477,13 @@ In `tests/test_scheduler.py`, `backup-status` gates on the heartbeat only when `
   the alert's pairing sentence prints the night's own UTC date, and `_stranded_alert_note` called directly on a breaker stranded out of order (cities unsorted, one city's channels reversed) prints its channel sets, cities and commands sorted — the night-level fixtures strand in already-sorted order, so they cannot see a lost sort (#376 review);
   a plain `set` handed to `_finish_batch` still alerts `UNAVAILABLE` as an all-night latch;
   a **busy** exit (80) on a walk whose grid sibling landed is stranded and named exactly like a refusal, with the subject saying `SKIPPED (host busy)` and `STRANDED`;
+  the end-of-night retry (#380): a stranded walk whose re-check says serving at the pass is walked, leaves `stranded`, is counted on the `Done:` line and in the alert, and is recorded a success, with no `STRANDED` subject and no recovery command, while its runs count in `attempted` but not in `processed`;
+  one still refused keeps its ORIGINAL entry (never re-derived) and is named with its command, after exactly one wait of the breaker's own cooldown and no more re-checks than the nightly cap;
+  a deadline that cannot hold the cooldown means no wait and no child; a SIGTERM arriving in the wait launches nothing further, names the stop on the `Done:` line and still reaches the tail;
+  a re-check the loop already spent is never spent again by the pass, which then has no reason to wait;
+  the retry's REAL argv carries the night's own `--run-date` on a night dated in the past;
+  and a city whose grid run failed, though the breaker cost it its walk too, is never retried.
+  The suite-wide autouse `_no_recheck_cooldown_wait` makes `_wait_out_recheck_cooldown` instant (it answers whether a stop was requested), so no night-level test waits out a real 45-min cooldown;
   a skipped two-host channel launch counts **once** in the summary and alert while the per-host counter still attributes it to both;
   a frozen-network walk under a latched Overpass spends **no** re-check (the probe is asked only once a cold walk wants the host);
   `update`/`discard`/`remove`/`clear`/`pop`/`copy`/`|=` on the breaker raise rather than desync it;
