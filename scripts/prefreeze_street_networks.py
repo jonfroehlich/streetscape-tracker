@@ -81,11 +81,11 @@ import socket
 import sys
 import time
 import traceback
-from datetime import UTC, date, datetime, timedelta
+from datetime import date, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from streetscape_metadata_tracker import db  # noqa: E402
+from streetscape_metadata_tracker import clock, db  # noqa: E402
 from streetscape_metadata_tracker.alerting import send_alert  # noqa: E402
 from streetscape_metadata_tracker.download_common import (  # noqa: E402
     HOST_BY_BUSY_EXIT_CODE,
@@ -120,14 +120,14 @@ def next_run_date() -> date:
     """
     The catalog date the next nightly ``run-due`` will compute dueness for.
 
-    ``cmd_run_due`` reads ``datetime.now(UTC).date()`` at 02:00 Pacific, which
+    ``cmd_run_due`` reads ``clock.snapshot_date_today()`` (the UTC date) at 02:00 Pacific, which
     is 09:00 or 10:00 UTC the NEXT UTC day for a pass run during a Pacific
     afternoon. Tomorrow UTC is right for that case and one day late for a
     pass run after midnight UTC, and the error is on the safe side: dueness is
     monotone in the date, so a later date can only ADD cities at the staleness
     threshold, never drop one the night will actually reach.
     """
-    return datetime.now(UTC).date() + timedelta(days=1)
+    return clock.snapshot_date_today() + timedelta(days=1)
 
 
 def plan_prefreeze(

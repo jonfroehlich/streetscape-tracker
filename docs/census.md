@@ -322,6 +322,9 @@ KartaView needs one clause more, because its `finally` commit is deliberately be
 It is aged from `crawl_started_at` — the crawl's first commit, when the provider was actually observed — which every promoter records (both promote only a crawl that committed), so a marker without one is refused rather than dated from its completion.
 A multi-night crawl's last commit says nothing about how old its oldest rows are.
 The window cannot see the other direction, and the consumer's `run_date` (carried in `CensusCache`) is that guard: an entry whose crawl finished after the snapshot date being written is refused **without being deleted** — a backdated `--force --run-date` must not publish rows Mapillary served after the snapshot's own ceiling, which `plausible_capture_mask` would then drop as "cannot be true", while the same entry is exactly right for the consumer dated tomorrow.
+Both sides of that comparison are the UTC calendar: `census_cache_marker` stamps `completed_at` from `clock.utc_now()`, and every producer's default `run_date` is `clock.snapshot_date_today()` — the grid CLI, the scheduler (which passes it to both children as `--run-date`) and, since #347, the road-walk collector.
+The walk's default was the local `date.today()`, so west of UTC an evening walk was refused the entry its own grid run had just promoted and re-paid the census against a per-IP host, dated itself a day before that grid run, and wrote its spend to a ledger day the next `run-due` never read; the nightly was unaffected only because the scheduler dates both children itself.
+Nothing on the collection path reads a local calendar (`tests/test_clock.py` refuses one), and a `CensusCache` built with anything but a plain `date` is refused at construction.
 
 **Failed tiles and cells are INHERITED by a cross-channel reuser rather than re-probed.**
 The reuser is republishing the same observation, so the same points read `REQUEST_FAILED` in both artifacts.

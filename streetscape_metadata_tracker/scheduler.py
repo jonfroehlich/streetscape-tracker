@@ -11,12 +11,13 @@ selection is ordered stalest-first).
 Usage (--config accepted on either side of the subcommand):
     python -m streetscape_metadata_tracker.scheduler [--config PATH] status
     python -m streetscape_metadata_tracker.scheduler [--config PATH] assign
-    python -m streetscape_metadata_tracker.scheduler [--config PATH] run-due [--dry-run] [--limit N] [--provider CHANNEL]
+    python -m streetscape_metadata_tracker.scheduler [--config PATH] run-due [--dry-run] [--limit N] [--provider CHANNEL] [--city CITY]...
     python -m streetscape_metadata_tracker.scheduler [--config PATH] regenerate-aggregate [--publish]
     python -m streetscape_metadata_tracker.scheduler [--config PATH] reconcile-walks [--date D] [--dry-run]
     python -m streetscape_metadata_tracker.scheduler [--config PATH] import-bundle DIR [--execute] [--enable]
     python -m streetscape_metadata_tracker.scheduler [--config PATH] fetch-driving-plan [--force] [--from-file P --date D]
     python -m streetscape_metadata_tracker.scheduler [--config PATH] backup-status
+    python -m streetscape_metadata_tracker.scheduler [--config PATH] timer-status [--rearm] [--alert] [--wait-s N]
     python -m streetscape_metadata_tracker.scheduler [--config PATH] restore-backup PATH [--to DEST]
 
 Config: TOML (see config/scheduler.toml). Requires Python 3.11+ (tomllib).
@@ -29,7 +30,9 @@ import gzip
 import json
 import logging
 import logging.handlers
+import math
 import os
+import shlex
 import signal
 import socket
 import sqlite3
@@ -52,12 +55,14 @@ from . import (
     bundle_import,
     catalog_backup,
     cgroup_memory,
+    clock,
     db,
     download_kartaview,
     download_mapillary,
     download_panoramax,
     driving_plan,
     panoramax_screen,
+    user_timers,
 )
 from .alerting import AlertConfig, send_alert, should_alert
 from .checkpointing import (
@@ -883,6 +888,12 @@ class SchedulerConfig:
     # grace_days` (83 days on prod). A "refresh" here is a city at the same
     # staleness wall as every other due city, competing for the same slot.
     refresh_slots: int | None = None
+    # The crossed watchdog (issue #369): `backup-status` goes unhealthy when the
+    # cron timer-watchdog's heartbeat (`user_timers.HEARTBEAT_FILENAME` under
+    # log_dir) is missing or older than this many hours. Cron catches dead
+    # timers; the backup-check timer catches a dead cron. 0 = off, so a laptop
+    # and the repo default are unchanged; prod sets 48.
+    timer_watchdog_max_age_h: float = 0.0
     # [download]
     batch_size: int = 100
     connection_limit: int = 50
@@ -903,6 +914,12 @@ class SchedulerConfig:
     # [paths]
     data_dir: str = str(_PROJECT_ROOT / "data")
     db_path: str = ""
+    # The file this config was loaded from (absolute), or None for a config
+    # built in code or defaulted because the file was missing. The STRANDED
+    # alert prints it as `--config`, so its recovery command runs against the
+    # same catalog, budgets and publish settings the night did -- the repo
+    # default TOML diverges materially from production's (issue #362).
+    config_path: str | None = None
     log_dir: str = str(_PROJECT_ROOT / "logs")
     # Dated catalog backups (issue #145). Its own directory rather than log_dir:
     # that tree is size-rotated, and a backup that ages out with the logs is not
@@ -1299,6 +1316,7 @@ def load_scheduler_config(path: str | None = None) -> SchedulerConfig:
             )
 
     return SchedulerConfig(
+        config_path=str(config_path.absolute()),
         cycle_days=sched.get("cycle_days", 90),
         grace_days=sched.get("grace_days", 7),
         daily_request_budget=sched.get("daily_request_budget", 10_000_000),
@@ -1309,6 +1327,7 @@ def load_scheduler_config(path: str | None = None) -> SchedulerConfig:
         max_batch_hours=sched.get("max_batch_hours", 10.0),
         max_concurrent_channels=_lane_count(sched, config_path),
         refresh_slots=_refresh_slots(sched, config_path),
+        timer_watchdog_max_age_h=float(sched.get("timer_watchdog_max_age_h", 0.0)),
         batch_size=dl.get("batch_size", 100),
         connection_limit=dl.get("connection_limit", 50),
         request_timeout_s=dl.get("request_timeout_s", 30.0),
@@ -2952,7 +2971,7 @@ def _publish(cfg: SchedulerConfig, context: str, alert_on_failure: bool = True) 
         cmd.append("--local")
     logger.info(f"Publishing via {' '.join(cmd[1:])}")
     os.makedirs(cfg.log_dir, exist_ok=True)
-    log_path = Path(cfg.log_dir) / f"publish_{date.today().isoformat()}.log"
+    log_path = Path(cfg.log_dir) / f"publish_{clock.snapshot_date_today().isoformat()}.log"
     # Time the rsync. It is the publish tail's largest component (7,409 published
     # files / 30.75 GB, measured 2026-08-20 — 7,416 is rsync's candidate count,
     # which is a different number) and was its only UNMEASURED one:
@@ -3063,7 +3082,7 @@ _STATUS_MAX_FAILURES = 40
 def cmd_status(cfg: SchedulerConfig) -> int:
     """Print a per-(city, provider) schedule table plus today's budgets."""
     conn = db.connect(cfg.db_path)
-    today = datetime.now(UTC).date()
+    today = clock.snapshot_date_today()
     providers = cfg.enabled_providers()
 
     # `s.member AS channel_member`, aliased rather than bare, because `c.enabled`
@@ -4076,7 +4095,8 @@ def _screen_pacing(cfg: SchedulerConfig, provider: str) -> tuple[int, float]:
     host and one IP, which is the whole point — so the screen and the nightly
     channels cannot be paced apart without saying so here. And the timer is
     still the harder lever when the answer is "stop talking to this host at
-    all": ``systemctl --user stop streetscape-screen-provider.timer``.
+    all": ``systemctl --user disable --now streetscape-screen-provider.timer``
+    (``stop`` alone is undone by the #369 watchdog's daily re-arm).
     """
     rate = panoramax_screen.DEFAULT_TILE_REQUESTS_PER_MINUTE
     jitter = panoramax_screen.DEFAULT_TILE_JITTER
@@ -4170,7 +4190,7 @@ def cmd_screen_provider(
         )
         return 0
 
-    today = date.today()
+    today = clock.snapshot_date_today()
     try:
         result = panoramax_screen.screen_targets(
             targets,
@@ -4299,19 +4319,21 @@ def _run_screen_measure(
         _emit(price)
         return 0
     logger.info(price)
+    # The UTC date, like the run-due budget gate that reads this spend (#347).
+    today = clock.snapshot_date_today()
     try:
         result = panoramax_screen.measure_targets(
             targets, max_requests_per_minute=rate, jitter=jitter
         )
     except HostUnavailableError as e:
         logger.error(f"{provider} measure stopped: {e}")
-        _record_screen_spend(conn, provider, date.today(), getattr(e, "api_requests", 0))
+        _record_screen_spend(conn, provider, today, getattr(e, "api_requests", 0))
         return host_exit_code(e)
     except DownloadError as e:
         logger.error(f"{provider} measure failed: {e}")
-        _record_screen_spend(conn, provider, date.today(), getattr(e, "api_requests", 0))
+        _record_screen_spend(conn, provider, today, getattr(e, "api_requests", 0))
         return 1
-    _record_screen_spend(conn, provider, date.today(), result["api_requests"])
+    _record_screen_spend(conn, provider, today, result["api_requests"])
     for row, screen in zip(result["rows"], ranked, strict=True):
         _emit(
             f"{row['display_name']}: {row['pictures']:,} pictures "
@@ -4409,10 +4431,38 @@ def cmd_backup_status(cfg: SchedulerConfig, *, alert: bool = False) -> int:
         )
         out.append(f"  {'':22s} {asset.path}")
 
+    # The crossed gate (issue #369). On 2026-09-23 this check's own timer came
+    # back inactive after a reboot along with every other user timer, so it
+    # could not report that. The cron watchdog re-arms them and writes a
+    # heartbeat; this check, from a timer, reports when that heartbeat stops.
+    watchdog_ok = True
+    watchdog_age: float | None = None
+    if cfg.timer_watchdog_max_age_h > 0:
+        watchdog_age = user_timers.heartbeat_age_hours(cfg.log_dir, datetime.now(UTC))
+        beat = user_timers.read_heartbeat(cfg.log_dir) or {}
+        out.append("")
+        if watchdog_age is None:
+            watchdog_ok = False
+            out.append(
+                "Timer watchdog (issue #369): NEVER RAN — no readable "
+                f"{user_timers.heartbeat_path(cfg.log_dir)}. Is the crontab installed?"
+            )
+        else:
+            watchdog_ok = watchdog_age <= cfg.timer_watchdog_max_age_h
+            word = "ok" if watchdog_ok else "STALE"
+            out.append(
+                f"Timer watchdog (issue #369): last ran {watchdog_age:,.1f} h ago — {word} "
+                f"(limit {cfg.timer_watchdog_max_age_h:g} h; its verdict then: "
+                f"{beat.get('verdict', 'unknown')})"
+            )
+            if not watchdog_ok:
+                out.append("  Is cron still running user jobs on this host? (crontab -l)")
+
     report = "\n".join(out)
     print(report)
 
-    healthy = st.exists and st.file_count > 0 and not st.stale and bool(last and last.get("ok"))
+    backups_ok = st.exists and st.file_count > 0 and not st.stale and bool(last and last.get("ok"))
+    healthy = backups_ok and watchdog_ok
     if alert and not healthy:
         # Name the reason in the subject: the whole point of the out-of-band
         # check is the case where nobody is reading anything but the subject
@@ -4422,15 +4472,132 @@ def cmd_backup_status(cfg: SchedulerConfig, *, alert: bool = False) -> int:
             why = "NO BACKUPS"
         elif st.stale:
             why = f"STALE ({st.age_hours:,.0f} h old)"
-        else:
+        elif not backups_ok:
             why = "last attempt FAILED"
+        elif watchdog_age is None:
+            why = "timer watchdog NEVER RAN"
+        else:
+            why = f"timer watchdog STALE ({watchdog_age:,.0f} h)"
+        # The subject's head names what is actually wrong: a healthy backup
+        # series with a dead watchdog is not a "catalog backup" problem.
+        head = "catalog backup unhealthy" if not backups_ok else "out-of-band check unhealthy"
         send_alert(
             cfg.alerts,
-            f"catalog backup unhealthy on {socket.gethostname()} — {why}",
+            f"{head} on {socket.gethostname()} — {why}",
             "The out-of-band catalog-backup check (issue #193) found an unhealthy "
             "state.\n\n" + report,
         )
     return 0 if healthy else 1
+
+
+def cmd_timer_status(
+    cfg: SchedulerConfig,
+    *,
+    rearm: bool = False,
+    alert: bool = False,
+    wait_s: float = 0.0,
+    poll_s: float = user_timers.DEFAULT_POLL_S,
+    run: user_timers.Runner | None = None,
+    hostname: str | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+    now: datetime | None = None,
+) -> int:
+    """
+    Check the scheduler's user timers are armed; optionally re-arm and alert (#369).
+
+    After the 2026-09-23 reboot every user timer came back ``enabled`` but
+    ``inactive`` and nothing noticed, because the only watchdog (#193) runs from
+    one of those timers. This is run by a user CRONTAB (``deploy/cron/``) — on
+    local disk, so it survives the NFS-home mount race the timers did not — at
+    ``@reboot`` with ``wait_s`` (the manager and the unit files may not be up
+    yet) and daily with none.
+
+    A DISABLED or MASKED timer is an operator's pause and is reported, never
+    started; an enabled one that is inactive (or not loaded at all) is the #369
+    shape. ``rearm`` runs ``daemon-reload`` once and then ``start`` for each
+    such timer, and trusts only the re-read state afterwards.
+
+    Exit 0 when the manager answered and every non-paused timer is active at
+    the end — a successful re-arm included — else 1; 64 on a bad
+    ``wait_s``/``poll_s``. ``alert`` never changes it, and mails when the
+    verdict is unhealthy OR something was re-armed: a re-arm means a reboot (or
+    similar) happened, and the night before it may sit unpublished.
+
+    On a host that does not match the collection unit's ``ConditionHost=`` it
+    does nothing at all (makelab1 shares the NFS home but has no linger), and
+    every run that reaches the check writes the heartbeat ``backup-status``
+    gates on, the give-up path included — the heartbeat measures whether CRON
+    runs, not whether the timers do.
+    """
+    # isfinite first: `nan < 0` is False, so NaN (or inf) would slip past the
+    # range check and make the wait loop unbounded.
+    if not (math.isfinite(wait_s) and math.isfinite(poll_s)) or wait_s < 0 or poll_s <= 0:
+        print(f"--wait-s must be >= 0 and --poll-s > 0 (got {wait_s:g}, {poll_s:g})")
+        return USAGE_EXIT_CODE
+    run = run or user_timers.run_systemctl
+    host = hostname or socket.gethostname()
+
+    try:
+        glob = user_timers.active_host_glob(user_timers.DEFAULT_UNIT_DIR)
+        names = user_timers.shipped_timers(user_timers.DEFAULT_UNIT_DIR)
+    except (OSError, ValueError) as e:
+        print(f"timer-status: {e}")
+        return 1
+    if not user_timers.is_active_host(host, glob):
+        print(f"{host} is not the active host (ConditionHost={glob}) — nothing to do")
+        return 0
+
+    reachable, visible, waited = user_timers.wait_for_manager(
+        run,
+        names,
+        wait_s=wait_s,
+        poll_s=poll_s,
+        sleep=sleep,
+        clock=clock,
+        user_unit_dir=user_timers.USER_UNIT_DIR,
+    )
+    if reachable and visible:
+        result = user_timers.check_and_rearm(run, names, rearm=rearm)
+    else:
+        result = user_timers.WatchdogResult()
+    result.reachable, result.files_visible = reachable, visible
+    result.waited_s, result.wait_budget_s = waited, wait_s
+
+    out = [f"User timers on {host} (issue #369):"]
+    for s in result.states:
+        rearmed = " (re-armed)" if s.name in result.rearmed else ""
+        out.append(f"  {s.name:40s} {s.word}{rearmed}  next: {s.next_elapse or '-'}")
+    if not reachable:
+        out.append("  the user manager did not answer (loginctl show-user $USER -p Linger)")
+    elif not visible:
+        out.append(
+            f"  unit files not visible under {user_timers.USER_UNIT_DIR} (is the home mounted?)"
+        )
+    out.append(f"Verdict: {result.verdict}")
+    report = "\n".join(out)
+    print(report)
+
+    when = now or datetime.now(UTC)
+    try:
+        path = user_timers.write_heartbeat(cfg.log_dir, result, host=host, now=when)
+        print(f"heartbeat: {path}")
+    except OSError as e:
+        # Still alert and exit on the check itself; backup-status will report
+        # the missing heartbeat on its own.
+        print(f"heartbeat NOT written: {e}")
+
+    if alert and (not result.healthy or result.rearmed):
+        send_alert(
+            cfg.alerts,
+            f"user timers on {host} — {result.verdict}",
+            "The user-timer watchdog (issue #369) found or fixed something.\n\n"
+            + report
+            + "\n\nAfter a REARMED mail, check whether the night before published "
+            "(regenerate-aggregate --publish recovers it). See deploy/README.md, "
+            '"After a reboot: the timer watchdog".',
+        )
+    return 0 if result.healthy else 1
 
 
 def cmd_restore_backup(cfg: SchedulerConfig, backup_path: str, dest: str | None) -> int:
@@ -4469,7 +4636,7 @@ def cmd_reconcile_walks(
     stat-per-candidate rather than a glob, since data/ holds thousands of files.
     """
     conn = db.connect(cfg.db_path)
-    today = target_date or datetime.now(UTC).date()
+    today = target_date or clock.snapshot_date_today()
     channels = [p for p in cfg.enabled_providers() if is_street_channel(p)]
     if not channels:
         print("No street channels enabled; nothing to reconcile.")
@@ -5133,7 +5300,7 @@ def cmd_assess_city(
 
     conn = db.connect(cfg.db_path)
     if today is None:
-        today = datetime.now(UTC).date()
+        today = clock.snapshot_date_today()
 
     try:
         city, newly_registered = resolve_or_register_city(
@@ -6862,7 +7029,7 @@ def cmd_run_due(
             return USAGE_EXIT_CODE
         only_city_ids = frozenset(row.city_id for row in resolved.values())
     if today is None:
-        today = datetime.now(UTC).date()
+        today = clock.snapshot_date_today()
     batch_started = time.monotonic()
     batch_deadline = batch_started + cfg.max_batch_hours * 3600.0
 
@@ -8399,23 +8566,79 @@ def _blocked_alert_note(breaker: HostBreaker) -> str:
     return note
 
 
-def _stranded_alert_note(cfg: SchedulerConfig, breaker: HostBreaker) -> str:
-    """The [alerts] paragraph naming the cities the breaker stranded, or empty."""
+def _recovery_command(
+    cfg: SchedulerConfig, channels: Sequence[str], city_ids: Sequence[str]
+) -> str:
+    """The pasteable ``run-due`` that walks exactly these cities on these channels (#362).
+
+    Every argument goes through ``shlex.quote``: ``sanitize_city_query_str``
+    keeps apostrophes, so ``coeur-d'alene--idaho--united-states`` is a real
+    ``city_id`` and an unquoted paste would open a quotation the shell never
+    closes. A plain slug quotes to itself, so the common case reads clean.
+    ``--config`` goes BEFORE the subcommand, as the systemd unit writes it.
+    No ``--limit``: a ``--city`` list is its own cap (#371).
+
+    Example::
+
+        python -m streetscape_metadata_tracker.scheduler --config /abs/scheduler.toml \\
+            run-due --provider gsv_streets --city salem--oregon--united-states
+    """
+    argv = ["python", "-m", "streetscape_metadata_tracker.scheduler"]
+    if cfg.config_path:
+        argv += ["--config", cfg.config_path]
+    argv += ["run-due", "--provider", ",".join(channels)]
+    for cid in city_ids:
+        argv += ["--city", cid]
+    return " ".join(shlex.quote(a) for a in argv)
+
+
+def _stranded_alert_note(cfg: SchedulerConfig, breaker: HostBreaker, today: date) -> str:
+    """The [alerts] paragraph naming the cities the breaker stranded, or empty.
+
+    It ends with one pasteable recovery command per EXACT set of lost channels,
+    each naming its cities with ``--city``. Two alternatives were wrong:
+
+    - ``run-due --provider <walk> --limit N`` (what this printed before #362)
+      walks the channel's STALEST-DUE cities, and a stranded city sits behind
+      every never-collected one: on 2026-09-22 none of 8 stranded cities was in
+      the first 10 of any walk channel, and Austin's ~640k-request walk led
+      ``gsv_streets``. It spent real budget and walked none of them.
+    - One combined command for every channel and city: a city stranded on
+      ``gsv_streets`` alone because its ``mapillary`` GRID failed tonight is
+      still due on ``mapillary_streets`` (never attempted), so naming it there
+      would pay a full census for an un-paired walk. Grouping by the exact
+      channel set names each city only where it was stranded.
+
+    A walk is dated the UTC date its command starts, so run the same UTC day
+    (``today``) it keeps the grid run's date and the pair survives.
+    """
     if not breaker.stranded:
         return ""
     lines = [f"{cid} ({', '.join(channels)})" for cid, channels in breaker.stranded.items()]
-    channels = sorted({c for chans in breaker.stranded.values() for c in chans})
-    per_channel = " or ".join(f"`scheduler run-due --provider {c} --limit N`" for c in channels)
+    groups: dict[tuple[str, ...], list[str]] = {}
+    for cid, channels in breaker.stranded.items():
+        groups.setdefault(tuple(sorted(set(channels))), []).append(cid)
+    commands = [
+        _recovery_command(cfg, channels, sorted(cids)) for channels, cids in sorted(groups.items())
+    ]
     return (
         f"{len(breaker.stranded)} city(ies) came out of the night with a grid run but NO road "
         f"walk, because a refused or locally busy host, or an argv our own CLI rejected "
         f"(issue #359), cost them the walk while the grid sibling succeeded. "
         f"Each is not due on the grid channel again for ~{cfg.cycle_days - cfg.grace_days} days, "
         f"so nothing re-pairs it and it reaches a capped night only through the bounded "
-        f"[schedule].opt_in_cities_per_day reservation (issue #341). Walk them by hand once the "
-        f"host is confirmed serving this IP (or the rejected flag is fixed) — {per_channel} — "
-        f"accepting that the walk will carry "
-        f"a later date than the grid run:\n  " + "\n  ".join(lines)
+        f"[schedule].opt_in_cities_per_day reservation (issue #341):\n  "
+        + "\n  ".join(lines)
+        + "\n"
+        f"Once the host is confirmed serving this IP (or the rejected flag is fixed), walk EXACTLY these cities with the "
+        f"command(s) below from the project root with the scheduler's venv active, pasted as "
+        f"printed, one after another and never in parallel (a walk that must fetch its "
+        f"street network takes the Overpass host lock, and a census walk its provider's, so a "
+        f"second concurrent one can exit busy and skip); "
+        f"append --dry-run to preview. A walk is dated the UTC day its command starts: started "
+        f"on {today.isoformat()} (UTC) the walks share the grid runs' date and each pair is "
+        f"kept, from the next UTC day they carry a later one. A bare `--limit N` would walk the "
+        f"stalest-due queue instead, not these cities (issue #362).\n" + "\n".join(commands)
     )
 
 
@@ -8625,7 +8848,7 @@ def _finish_batch(
     # thing in the tail that must never degrade quietly.
     blocked_hosts = _as_breaker(blocked_hosts)
     blocked_note = _blocked_alert_note(blocked_hosts)
-    stranded_note = _stranded_alert_note(cfg, blocked_hosts)
+    stranded_note = _stranded_alert_note(cfg, blocked_hosts, today)
 
     busy_hosts = busy_hosts or Counter()
     busy_note = (
@@ -9025,6 +9248,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="Also email the report via [alerts] when unhealthy (for the "
         "out-of-band monitor timer, issue #193). Exit status is unchanged.",
     )
+    p_timers = sub.add_parser(
+        "timer-status",
+        help="Check the user timers are armed, re-arm them, alert (issue #369)",
+    )
+    _add_global_flags(p_timers)
+    p_timers.add_argument(
+        "--rearm",
+        action="store_true",
+        help="daemon-reload once and start every enabled-but-inactive timer. A DISABLED "
+        "timer is a deliberate pause and is never started.",
+    )
+    p_timers.add_argument(
+        "--alert",
+        action="store_true",
+        help="Email via [alerts] when unhealthy or when anything was re-armed. Exit "
+        "status is unchanged.",
+    )
+    p_timers.add_argument(
+        "--wait-s",
+        type=float,
+        default=0.0,
+        help="Poll up to this many seconds for the user manager and the unit files "
+        "(the @reboot line; default 0 = one check).",
+    )
+    p_timers.add_argument(
+        "--poll-s",
+        type=float,
+        default=user_timers.DEFAULT_POLL_S,
+        help=f"Seconds between polls under --wait-s (default {user_timers.DEFAULT_POLL_S:g}).",
+    )
     p_restore = sub.add_parser(
         "restore-backup", help="Restore a dated catalog backup (refuses to clobber a live catalog)"
     )
@@ -9078,6 +9331,10 @@ def main() -> int:
         )
     if args.command == "backup-status":
         return cmd_backup_status(cfg, alert=args.alert)
+    if args.command == "timer-status":
+        return cmd_timer_status(
+            cfg, rearm=args.rearm, alert=args.alert, wait_s=args.wait_s, poll_s=args.poll_s
+        )
     if args.command == "restore-backup":
         return cmd_restore_backup(cfg, args.backup_path, args.dest)
     if args.command == "reconcile-walks":

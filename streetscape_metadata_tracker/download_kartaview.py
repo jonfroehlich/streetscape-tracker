@@ -115,6 +115,7 @@ import pandas as pd
 import pyarrow.parquet as pq
 
 from . import census as census_core
+from . import clock
 from .analysis import EARLIEST_PLAUSIBLE_CAPTURE
 from .checkpointing import (
     CHECKPOINT_DIR_ENV as CHECKPOINT_DIR_ENV,
@@ -1678,7 +1679,7 @@ def load_checkpoint(
         # `consecutive_failures`, so the same stalest city is re-attempted
         # nightly and would refresh its own clock indefinitely. See
         # CHECKPOINT_MAX_AGE_S.
-        age_s = (datetime.now(UTC) - datetime.fromisoformat(cp.created_at)).total_seconds()
+        age_s = (clock.utc_now() - datetime.fromisoformat(cp.created_at)).total_seconds()
         if age_s > CHECKPOINT_MAX_AGE_S:
             discard(
                 f"its first commit landed {age_s / 86400:.1f} days ago, past the "
@@ -1861,7 +1862,7 @@ def _commit_checkpoint(
     # what the age cap is measured against, so it must describe the oldest row
     # this checkpoint holds rather than the last time anything touched the file.
     # `updated_at` still moves, for an operator reading the directory.
-    created_at = cp.created_at or datetime.now(UTC).isoformat()
+    created_at = cp.created_at or clock.utc_now().isoformat()
     frame = concat_census(frames)
     if len(frame):
         tmp = _part_path(cp.path, cp.parts) + ".tmp"
@@ -1893,7 +1894,7 @@ def _commit_checkpoint(
         "api_requests_total": cp.api_requests_total,
         "failed_cells": [_cell_to_dict(c) for c in cp.failed_cells],
         "created_at": created_at,
-        "updated_at": datetime.now(UTC).isoformat(),
+        "updated_at": clock.utc_now().isoformat(),
     }
     _write_json_durable(_state_path(cp.path), state)
     # Only after the record naming it is durable, so a crash cannot leave the

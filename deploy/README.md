@@ -155,6 +155,11 @@ The nightly summary now records the peak, so
 If `enable-linger` is disallowed by policy, ask CSE IT to enable lingering for
 your account.
 
+**Linger alone does not survive a reboot** (issue #369): after the 2026-09-23
+reboot every timer came back `enabled` but `inactive`.
+Install the timer watchdog crontab too — see
+[After a reboot: the timer watchdog](#after-a-reboot-the-timer-watchdog-issue-369).
+
 **`systemctl --user set-property` overrides this unit file, permanently and
 invisibly.** It writes a drop-in under
 `~/.config/systemd/user.control/streetscape-tracker.service.d/`, and drop-ins
@@ -223,6 +228,7 @@ systemctl --user list-timers streetscape-tracker.timer      # next scheduled run
 journalctl --user -u streetscape-tracker.service -f          # live logs
 systemctl --user start streetscape-tracker.service           # trigger a run now
 .venv/bin/python -m streetscape_metadata_tracker.scheduler --config config/scheduler.makelab1.toml status
+.venv-makelab2/bin/python -m streetscape_metadata_tracker.scheduler --config config/scheduler.makelab1.toml timer-status   # are all timers armed? (#369)
 ```
 
 Rotating file logs also go to `logs/streetscape_scheduler.log`, and dated
@@ -583,6 +589,77 @@ systemctl --user start streetscape-backup-check.service   # run once now
   `tests/test_scheduler.py::test_backup_check_unit_matches_the_collection_unit`
   pins that agreement, along with the interpreter and config path.
 
+### After a reboot: the timer watchdog (issue #369)
+
+On 2026-09-23 makelab2 hung and was rebooted, and all four user timers came back
+`enabled` but **`inactive`**.
+Nothing collected, nothing published, and nothing alerted, because the #193 check
+above runs from one of those timers and went down with them.
+The leading (unproven) cause: the user manager started five seconds before
+`autofs` mounted the NFS home, scanned an empty `~/.config/systemd/user/`, and
+never looked again.
+That ordering is root's to fix (ask CSE IT for a `user@.service` drop-in with
+`RequiresMountsFor=/homes/gws/jonf`); until then, and after it too, a user
+**crontab** re-arms the timers.
+A crontab lives in `/var/spool/cron` on local disk, so it survives the mount race,
+and `deploy/cron/streetscape-tracker.crontab` runs
+`scheduler timer-status --rearm --alert` at `@reboot` (waiting up to 30 min for
+the user manager and the unit files) and daily at 08:30 Pacific.
+
+Install on **makelab2 only**, never mid-batch.
+`crontab FILE` would REPLACE the whole table, so the recipe appends, guarded by
+the file's marker line:
+
+```bash
+pgrep -af 'scheduler .*run-due' || echo idle
+crontab -l                                  # look first; "not allowed to use this program" means ask CSE IT
+crontab -l 2>/dev/null | grep -q 'streetscape-tracker timer watchdog' \
+  || (crontab -l 2>/dev/null; cat deploy/cron/streetscape-tracker.crontab) | crontab -
+crontab -l                                  # both lines present, CRON_TZ set
+systemctl status crond --no-pager | head -3 # the system service is readable without the journal
+.venv-makelab2/bin/python -m streetscape_metadata_tracker.scheduler --config config/scheduler.makelab1.toml timer-status
+```
+
+A later edit to the crontab file is NOT picked up by that recipe (the marker is
+already present): `crontab -e` and replace the two lines by hand.
+
+- **Pause a timer with `systemctl --user disable --now <x>.timer`, never `stop`**
+  (resume: `enable --now`).
+  The watchdog treats a DISABLED timer as a deliberate pause and leaves it alone;
+  a stopped-but-enabled one is exactly the reboot shape, and the daily line
+  re-arms it within a day.
+- `--rearm` runs `daemon-reload` once, then `start` for each enabled-but-inactive
+  timer, and trusts only the state it re-reads afterwards.
+  It is safe mid-batch: neither touches a running `.service`.
+- It does nothing on a host that does not match the collection unit's
+  `ConditionHost=` (makelab1 shares the home but has no linger).
+- Output goes to `logs/timer_watchdog.log`; cron's own mail is off (`MAILTO=""`),
+  and alerts go through `[alerts]` SMTP like every other monitor here.
+- Every run writes `logs/timer_watchdog_status.json`, and `backup-status` goes
+  unhealthy when that heartbeat is missing or older than
+  `[schedule].timer_watchdog_max_age_h` (48 h on prod).
+  So the two watchdogs cover each other: cron catches dead timers, the noon
+  backup-check timer catches a dead cron.
+  A hand run of `timer-status` refreshes the heartbeat too, so a dead cron is
+  reported 48 h after the last run of either kind.
+
+What each alert subject means, and the first move:
+
+| Subject ends in | Meaning | First move |
+|---|---|---|
+| `INACTIVE: …` | An enabled timer is not armed, and `start` did not arm it | `systemctl --user status <x>.timer` |
+| `NOT INSTALLED: …` | The manager has no such unit, even after `daemon-reload` | Is `~/.config/systemd/user/` mounted and holding the file? |
+| `REARMED: …` | The watchdog found and fixed the #369 shape — a reboot, or an operator `stop` | Did the night before publish? If not, `regenerate-aggregate --publish` |
+| `UNIT FILES UNREACHABLE after N s` | The manager answered but none of the timer files ever appeared (one missing file is `NOT INSTALLED` instead) | The NFS home is not mounted |
+| `USER MANAGER UNREACHABLE after N s` | `systemctl --user` never answered | `loginctl show-user jonf -p Linger` |
+| `timer watchdog NEVER RAN` / `STALE (N h)` (from `backup-status`) | Cron is not running the watchdog | `crontab -l`, `tail logs/timer_watchdog.log` |
+
+**The honest gap:** if cron stops running user jobs AND the timers are dead, nothing
+alerts.
+Only an off-host or root-side monitor closes that, and neither is ours to run.
+The design, and every alternative rejected, is in
+[`docs/scheduler.md`](../docs/scheduler.md#the-user-timers-after-a-reboot-issue-369-added-2026-09-26).
+
 #### Assets that exist in only one place
 
 Most of `data/` is doubly covered — the project array *and* the docroot's 1-year
@@ -602,8 +679,12 @@ and `backup-status` inventories both:
     restore-backup backups/streetscape_tracker.db.2026-08-07.backup --to /tmp/recovered.db
 ```
 
-`--to` defaults to the configured `db_path`. Stop the timer first, and restore
-to a scratch path and inspect it before putting it in the catalog's place.
+`--to` defaults to the configured `db_path`.
+Pause the nightly timer first with `systemctl --user disable --now streetscape-tracker.timer`
+— not `stop`, which the timer watchdog's daily re-arm undoes (issue #369) —
+then restore to a scratch path and inspect it before putting it in the catalog's place.
+Resume with `enable --now` only once the catalog is back: the timer is `Persistent=true`,
+so re-enabling it after a missed 02:00 starts that night's batch at once.
 
 Two refusals, both deliberate — a restore that quietly does something plausible
 is worse than one that stops:
@@ -789,7 +870,7 @@ systemctl --user start streetscape-screen-provider.service   # run once now
 - A city crossing zero → non-zero is an **enrolment candidate**, answerable any afternoon: `scheduler screen-provider panoramax --measure --limit 5` measures the richest screened cities exactly, prints, and writes nothing.
 - It publishes `data/provider_screen.json.gz` itself. The nightly batch deliberately does **not** rebuild that file — nothing else changes its inputs — so a stale one means this timer stopped, not that the batch did.
 - **Three refusals are by design, and each exits nonzero without writing.** Every tile answering 404 is a moved endpoint (an empty area answers 200 with no layer). Tiles answering *with a body* that yields no hexagons at all is a renamed layer — the check that protects the very first run, when there is no history to compare against. A pass where every city reads zero although hexagons decoded is a renamed counter, and that one does need history. `--allow-collapse` records a collapse anyway, once you have checked the endpoint by hand.
-- **Lowering `max_requests_per_minute` in `[providers.panoramax]` DOES slow this screen** since #335 wired the channel and the loader stopped dropping that block — one host, one pace. It did not before, which is the opposite of what the same sentence used to say. If Panoramax refuses us outright, stop the timer: `systemctl --user stop streetscape-screen-provider.timer`.
+- **Lowering `max_requests_per_minute` in `[providers.panoramax]` DOES slow this screen** since #335 wired the channel and the loader stopped dropping that block — one host, one pace. It did not before, which is the opposite of what the same sentence used to say. If Panoramax refuses us outright, pause the timer: `systemctl --user disable --now streetscape-screen-provider.timer` (`disable`, not `stop`: the #369 watchdog re-arms a stopped-but-enabled timer within a day).
 
 ### The daily street-network prefreeze (#355)
 
@@ -822,7 +903,7 @@ systemctl --user list-timers streetscape-prefreeze.timer   # next fire
 - **`MemoryMax=16G` is unmeasured, and an OOM kill is the one failure that does NOT alert.** A SIGKILL gives the `--alert` path no chance to run, and because the plan is in slate order the same oversized city would head it every afternoon and die the same way, until the night's own walk (which has 48G) freezes that network.
   So the cap is set high on purpose: well above a single city's drive network, a third of the nightly unit's hard cap, and small against a 188 GiB box whose free memory is mostly reclaimable ZFS ARC.
   Read `systemctl --user show streetscape-prefreeze.service -p MemoryPeak` after the first few passes and size it from that; a pass that vanishes with no mail and no `Froze N of M` line in the console log is this case, and `systemctl --user status streetscape-prefreeze.service` will say `oom-kill`.
-- To pause it during an Overpass incident: `systemctl --user stop streetscape-prefreeze.timer`.
+- To pause it during an Overpass incident: `systemctl --user disable --now streetscape-prefreeze.timer` (resume with `enable --now`; a `stop` alone is undone by the #369 watchdog within a day).
 
 ### Turning the KartaView channel on in production (#248)
 

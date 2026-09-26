@@ -24,6 +24,8 @@ Without `--limit`, the number of named cities replaces `max_cities_per_day` as t
 It is applied in `_collect_due` to each channel's due list BEFORE the union, so both reservations and the logged `hoisted`/`promoted` counts describe the slate that actually runs.
 It **narrows and never forces**: a named city that is not due (fresh clock, failure cap, excluded, disabled) is warned about by name and skipped, and an unresolvable name exits 64 before any schedule write.
 The motivating case was 2026-09-24: Detroit's and Fresno's Mapillary walks had each failed once during the August block and sat at queue positions 66 and 76 of 271, deferred behind the alphabetical never-collected block, with no supported way to reach them.
+The STRANDED alert (#341) prints this command with the ids filled in, one per exact set of lost walk channels: a city stranded on one walk because its OTHER grid run failed is still due on that other walk, and a single combined command would pay its census for an un-paired walk (#362).
+It used to print `run-due --provider <walk> --limit N`, which walks the stalest-due queue — on 2026-09-22 none of 8 stranded cities was in the first 10 of any walk channel, and Austin's ~640k-request walk led `gsv_streets`.
 
 **Every channel is paced, so every channel's per-city timeout is DERIVED rather than flat, and `city_timeout_minutes` (180) is only the floor.**
 The shape is the same for all of them — `estimated_requests / (rate × achieved_rate_fraction) × _TIMEOUT_HEADROOM + _TIMEOUT_FIXED_SLACK_S`, never below the floor — and what differs is where the request count and the rate come from.
@@ -154,8 +156,8 @@ A child that exits with a `HOST_EXIT_CODES` status trips the per-IP **host break
 A walk whose GraphML is already frozen for the channel's `network_type` is launched despite a latched Overpass, because it never contacts it.
 **Before a walk exits 76 at all, its fetch rides out the refusal for up to the `[overpass]` retry window** (#357; ~7.5 min by default, 30 s floor between attempts, inside the 900 s fetch deadline) — so a minutes-scale flap no longer trips the breaker, and each trip that does happen costs that window of wall clock in the walk's lane, at most `1 + HOST_RECHECKS_PER_NIGHT` times a night; see "(6)" in [`provider-access.md`](provider-access.md)'s Overpass section.
 **That window is shortened per child to fit the timeout it will be SIGKILLed at** — `_run_one_city` derives the timeout before the argv and passes it to `_street_collect_cmd`, which calls `policy_for_child_timeout` — because the deadline clamp floors a late city at `_MIN_CLAMPED_TIMEOUT_S` (300 s), under the ~450 s a refusal costs, and a SIGKILL records no exit code for the breaker to read while still counting a `consecutive_failure`.
-**Stranding is recorded after the city drains**: a walk an unavailable host cost the city — the refused child itself, a breaker skip, a child that found the host busy with another local process (exit 80, most often our own daytime pre-freeze pass overrunning into the timer), or a child whose argv our own CLI rejected (exit 2, #359) — whose grid sibling (`STREET_CHANNELS[walk]`) succeeded tonight leaves the city with a grid run and no walk and not due on the grid channel for ~83 days.
-So it is counted on the `Done:` line (`N city(ies) STRANDED un-walked` — not "by the breaker", since a busy host and a rejected argv strand a city too), named in the alert with the `run-due --provider <walk> --limit N` recovery, and logged as a `STRANDED` warning per lost walk.
+**Stranding is recorded after the city drains**: a walk an unavailable host cost the city — the refused child itself, a breaker skip, a child that found the host busy with another local process (exit 80, most often our own daytime pre-freeze pass overrunning into the timer), or a child whose argv our own CLI rejected (exit 2, #359) —
+whose grid sibling (`STREET_CHANNELS[walk]`) succeeded tonight leaves the city with a grid run and no walk and not due on the grid channel for ~83 days, so it is counted on the `Done:` line (`N city(ies) STRANDED un-walked` — not "by the breaker", since a busy host and a rejected argv strand a city too), named in the alert beside one pasteable `run-due --provider <walks> --city <id>...` per exact channel set (#362), and logged as a `STRANDED` warning per lost walk.
 Decided after the drain rather than at the skip because with lanes the sibling may still be in flight at skip time.
 **An argv our own CLI rejected is a fourth exit-code family, `ARGV_REJECTED_EXIT_CODE = 2` (issue #359)** — argparse's number, inherited rather than allocated.
 The scheduler builds every child argv itself, so under `run-due` a child exit 2 never means an operator mistyped: it means the config and the CLI disagree.
@@ -541,3 +543,66 @@ The command writes and publishes `provider_screen.json.gz` itself, and the night
 
 **Production reads `config/scheduler.makelab1.toml`, not `config/scheduler.toml`** (passed via `--config`; the filename is historical — the service itself runs on makelab2, guarded by `ConditionHost=makelab2*`).
 The two diverge materially — budgets, absolute paths, `[publish].enabled`/`[publish].local` — so an operational change edited only into the repo default changes nothing in production, and vice versa: keep any comment-level rationale in step across both files.
+
+## The user timers after a reboot (issue #369, added 2026-09-26)
+
+**What was measured.**
+On 2026-09-23 makelab2 hung mid-night (the scheduler log stops at 06:18 PDT, load 165.5, before the tail, so nothing published) and rebooted at 08:15 PDT; the lingering user manager `user@29497.service` entered active at 08:16:09, and `autofs.service` at 08:16:14.
+Afterwards all four user timers — `streetscape-backup-check`, `streetscape-prefreeze`, `streetscape-screen-provider`, `streetscape-tracker` — read `enabled` but `inactive`, while `loginctl` reported `Linger=yes` and `systemctl --user is-system-running` reported `running`.
+Nothing collected or published until the operator ran `daemon-reload` and `start` by hand, and nothing alerted, because the only watchdog (`backup-status --alert`, #193) runs from one of those four timers.
+
+**The leading cause, unproven.**
+The user manager scanned `~/.config/systemd/user/` on the NFS home five seconds before autofs mounted it, found no unit files, and never looked again.
+It cannot be proven from here — `journalctl` for the manager is unreadable by `jonf` — and it cannot be fixed from here either: ordering `user@.service` after the mount is a root-side drop-in (`RequiresMountsFor=/homes/gws/jonf`), an open ask for CSE IT, alongside whose reboot it was.
+
+**The design: a user crontab on local disk.**
+`deploy/cron/streetscape-tracker.crontab` runs `scheduler timer-status --rearm --alert` at `@reboot` and daily at 08:30 Pacific.
+A user crontab lives in `/var/spool/cron` on local disk, so it does not depend on the NFS home being mounted when the user manager starts; whether makelab2's `crond.service` orders after `autofs` is unverified, and the `@reboot` line does not rely on it: it polls (`--wait-s 1800`, every `--poll-s` 15 s) until BOTH `systemctl --user is-system-running` answers AND at least one shipped `.timer` file `isfile()`s under `~/.config/systemd/user/`, which is also what triggers the autofs mount.
+Any, not every: an unmounted home hides every file at once, while a timer shipped but never installed hides one — under "every", that one file blocked the re-arm of all the installed timers and was misreported as `UNIT FILES UNREACHABLE`; now it reaches the per-timer check and is reported by name as `NOT INSTALLED`.
+The checkout, the venv and `logs/` are on makelab2's local ZFS pool; the only NFS dependency is the unit files, which is the thing being waited for.
+The check is cause-agnostic on purpose: whatever left a timer enabled-but-inactive — this race, a lost linger, an operator `stop`, a future systemd change — the repair is the one done by hand on 2026-09-23, and the alert fires either way.
+
+The set of timers is read from the **shipped** `deploy/systemd/*.timer` files, never a second list, and the active host from the collection unit's `ConditionHost=`: on any other host (makelab1 shares the NFS home but has no linger) the command does nothing.
+`XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS` are filled in only when unset, since cron's environment has neither and every `systemctl --user` call then fails `Failed to connect to bus`.
+
+| A timer that is… | Reported as | With `--rearm` | Healthy? |
+|---|---|---|---|
+| loaded and `active` | `active` | left alone | yes |
+| `UnitFileState` `disabled`, `masked` or `masked-runtime` | `paused` | left alone — a deliberate operator pause | yes |
+| loaded, enabled, not `active` (the #369 signature) | `INACTIVE` | one `daemon-reload`, then `start` | only if the re-read state is `active` |
+| `LoadState` not `loaded` | `NOT INSTALLED` | the same `daemon-reload` (the race leaves exactly this), then `start` | only if the re-read state is `active` |
+
+`daemon-reload` is needed because the manager may hold the empty unit map of the scan that raced the mount, and `start` is needed because `daemon-reload` starts nothing and `timers.target` is already active, so its wants are not re-pulled.
+A `start` that returned 0 is never trusted; only the state re-read afterwards counts.
+Exit status is 0 when every non-paused timer is active at the end — a successful re-arm included — and 1 otherwise; `--alert` never changes it.
+`--alert` mails when the verdict is unhealthy **or** anything was re-armed: a re-arm is healthy but not silent, because it means a reboot (or similar) happened and the night before it may sit unpublished, which on 2026-09-23 needed a hand-run `regenerate-aggregate --publish`.
+
+**The crossed heartbeat.**
+Every run that reaches the check — the give-up path included — writes `logs/timer_watchdog_status.json` atomically, and `backup-status` goes unhealthy when it is missing or older than `[schedule].timer_watchdog_max_age_h` (0 = off, the code default; 48 on prod).
+So the two watchdogs cover each other: cron catches dead timers, the noon backup-check timer catches a dead cron.
+The heartbeat measures whether **cron** runs, not whether the timers do (the watchdog alerts on those itself); a hand run refreshes it too, so a dead cron is reported 48 h after the last run of either kind.
+**The honest gap:** if crond stops running user jobs AND the timers are dead, nothing alerts.
+Only an off-host monitor or a root-side mechanism closes that, and neither is in scope.
+
+**The pause verb changed.**
+Because the daily line starts any enabled-but-inactive timer, the `stop` verb on a `.timer` is now a pause of at most a day.
+The documented pause is `systemctl --user disable --now <x>.timer` (resume: `enable --now`), which the watchdog reports as `paused` and leaves alone; `tests/test_timer_watchdog_crontab.py` refuses the old spelling in any doc.
+`stop` on a `.service` is unaffected.
+
+**`Persistent=` interaction.**
+A re-arm after a missed 02:00 fires the nightly batch at once, as the timer itself would at boot — intended.
+The 08:30 slot is chosen so that catch-up night (the 15 min randomized delay, `max_batch_hours`, and the unit's `TimeoutStopSec` as the tail's stand-in) still ends before the next 02:00, and so that it precedes the noon backup-check timer.
+`streetscape-prefreeze.timer` stays `Persistent=false`, so a re-arm never fires a missed afternoon pass.
+
+**Alternatives rejected.**
+
+- A bare `@reboot systemctl --user daemon-reload && start …` line: not self-verifying (a disallowed crontab, a slow manager or a lost linger says nothing), and it would restart a timer an operator paused.
+- A root drop-in for `user@.service`: the real fix, but not ours to deploy; this mechanism keeps working after CSE IT does it.
+- A system crontab or system timer: root.
+- An off-host freshness monitor on `cities.json.gz`: detection only, no re-arm, and it needs a second host somebody operates.
+- Moving the unit files off NFS: every user-unit path is under `~`, and a local `$XDG_CONFIG_DIRS` for the manager needs root.
+- Re-arming from `run-due` or its tail: shares the timers' fate by construction — the #193 lesson again.
+- Restarting `timers.target`: stops every timer of the user, a paused one included; a per-timer `start` is what lets a disabled timer stay paused.
+
+**Unmeasured.**
+The 30-minute `@reboot` wait budget (generous against the 5 s gap measured, and against a slow ZFS import) and the 48 h heartbeat gate (one missed daily run, like `STALE_AFTER_HOURS`) are judgement numbers.

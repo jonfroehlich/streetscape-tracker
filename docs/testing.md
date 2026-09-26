@@ -30,6 +30,12 @@ already gone wrong once:
 - The v13→v14 migration (`census_fetched_by`/`census_fetched_at` on `runs` and `street_walks`, issue #290): the pair arrives NULL on existing rows, `register_run` round-trips it, and it defaults to NULL rather than to the collecting channel — provenance is recorded, never inferred.
   The load-bearing pin is `test_run_row_carries_every_runs_column`: `_row_to_run` builds `RunRow(**dict(row))` from a `SELECT *`, so a column without a matching dataclass field is a `TypeError` on every `get_latest_run` against a migrated catalog, not a missing feature.
 - An end-to-end migration test with synthetic fixtures
+- The one snapshot clock (`tests/test_clock.py`, issue #347): under a pinned America/Los_Angeles zone and a frozen 17:30-PDT instant, `clock.snapshot_date_today()` is the UTC date and not the local one; `db.utc_now_iso` reads the same seam;
+  and a grep refuses `date.today()`, `datetime.today()` and a naive `datetime.now()` on the collection path (`checkpointing`, `cli`, `scheduler`, the walk collector, the prefreeze script).
+  The grep blanks comments and plain strings in place, so the comment that names `date.today()` does not trip it, but keeps f-strings, whose braces hold code; it keeps each line's own spacing, because re-joining tokens fused `else date.today()` into `elsedate.today()` and the first version missed the very #347 line that way.
+  Its regex and the blanking are self-checked against planted samples so it cannot pass by matching nothing.
+  A grep only sees the spellings it names, so the grid CLI's default is also pinned by behaviour, in `tests/test_cli_policy.py`: `async_main` with no `--run-date` under the frozen instant hands `_collect_one_run` the UTC date, which a `datetime.now().date()` or `date.fromtimestamp(time.time())` read — both invisible to the grep — fails.
+  The shared `frozen_utc_clock` and `pacific_local_zone` fixtures live in `conftest.py`, non-autouse; the instant is in the past, so an unfrozen `date.today()` can never coincide with either date it asserts.
 
 ## City registration manifests (issue #110, and the purposive additions)
 
@@ -81,6 +87,7 @@ Incidental coverage of a deprecated spelling trains readers to ignore the notice
 
 - Scheduler due/budget/provider-pairing/timeout-derivation logic
 - `run-due --city`: that it narrows the slate to the named city without touching another due city's clock, composes with `--provider`, resolves a query and a `city_id` to the same city, runs every one of several named cities, is not truncated by `max_cities_per_day`, names the cities an explicit `--limit` leaves out, skips AND warns about a named city that is not due, and exits 64 on an unknown name before the stagger assignment writes anything.
+  The STRANDED alert's `--city` recovery commands are pinned in the #341 section.
   `test_main_forwards_run_due_city_filter` pins the `main()` pass-through, which the direct `cmd_run_due` tests cannot see: dropping it left every direct `--city` test green and would have run the whole due list.
 - The census cache at the scheduler seam (issue #290): `_channel_estimate` returns 0 on a probe hit and its full estimate otherwise, only the census channels read it (gsv and `gsv_streets` query per point and must not be priced off a Mapillary entry), each channel reads its own PROVIDER's entry,
   an expired entry prices at full cost, and — the one that keeps the two estimators honestly separate — **a cache hit must not collapse a child's timeout**, since `estimate_requests` also feeds `_tile_census_timeout_seconds`.
@@ -287,6 +294,11 @@ and `hosts_unavailable` is anchored to the blocked-host note's own `; `-delimite
 - **A degraded walk says so in its own log, and an undamaged one does not** (#259, `tests/test_streetwalk_mapillary.py`), pinned as a pair because each direction fails a different mutation.
   The per-attempt log is the ONLY record that part of an artifact is unmeasured, and the line stops there: a tolerated hole exits 0, and the scheduler copies a child's tail into its own log — the one the `[alerts]` mail quotes — only for a child that FAILED, so a degraded walk sends no mail at all.
   Sharpest on the #290 reuse path, where the walk inherits the crawl's failed tiles for zero requests so no fetch-side "N/M tiles failed" warning fires either, which a third test drives end to end from a promoted cache entry rather than trusting the two halves to meet.
+  That end-to-end test runs under a frozen 17:30-PDT clock with the local zone pinned to America/Los_Angeles and gives the walk NO `--run-date`, asserting both zero requests and the UTC-dated row (#347), because a test that read `date.today()` for both sides could not fail, which is how #347 survived CI on UTC runners.
+  It freezes the LOCAL calendar too (`frozen_local_calendar`, at the same instant, as `collect` reads `date.today()`): with only the UTC clock frozen, `date.today()` reads the real present, AFTER the marker, so a local-dated walk still passes the reuse guard and only the row's date catches it.
+  Frozen together, the #347 regression is refused the entry and re-fetches both tiles, so `served == []` fails on its own.
+  It also asserts the marker's `crawl_started_at` (the checkpoint's `created_at`) and `completed_at` are both the frozen instant, which pins the census checkpoints' stamps to the same clock seam.
+  Its cheap sibling (`test_the_walks_default_run_date_is_the_grid_runs_utc_date`) pins the default date's pass-through to the `CensusCache` the fetch receives, the artifact name, and the `api_usage` ledger day.
   So one test asserts the degraded sample count AND the `unmeasured_desc` both reach the log, and its twin asserts a failed tile covering no sample logs nothing, since a warning claiming damage that did not happen just buries a real one in the single place anybody reads it.
   The count asserted is the RELABELLED subset, not every sample under the failed tile, which is what the message now says.
   A fourth refuses a mask given without a desc, the same contract `census.write_census_grid_run` enforces for the grid tail.
@@ -367,6 +379,7 @@ and `hosts_unavailable` is anchored to the blocked-host note's own `; `-delimite
   and the marker is INSIDE the directory before it is renamed — asserted at the `os.replace` call itself — so a failed marker write or a failed rename leaves the checkpoint exactly as it was, with no stray marker in it, and nothing under the cache name.
   Also: EXDEV falls back to a staging copy renamed into place, since either directory can be pointed at another filesystem by its env override; a stale entry is replaced wholesale rather than merged;
   the window is aged from `crawl_started_at` (a fresh promotion of a ten-day-old crawl is refused, which ageing from `completed_at` would allow; a marker without one is refused, since the builder requires it), last night's entry still reuses, and an entry whose crawl finished after the consumer's `run_date` is refused WITHOUT being deleted;
+  the marker is stamped from the shared UTC clock, an entry finished in a Pacific evening is reused by a consumer dated that UTC day and refused for the local date the old default produced, and a str or `datetime` `run_date` is refused at construction (#347);
   the shared loader skeleton (`load_cached_store`) deletes on the provider's verdict and on a torn store but keeps an entry a `CacheEntryUnusableHere` says is merely not for this caller; the reuse accounting prices `api_requests_total` only for the (channel, variant) that paid, the variant included; the observation timestamp is the crawl's only for a reuse;
   a hit is reconciled with the consumer's own checkpoint — an older one is discarded, a newer one wins, the crawl's own entry with failed work is handed back marker-less for the resume to re-probe, and another channel's holes are inherited;
   the probe opens no parquet footer, refuses a marker whose recorded store format this build cannot read, and deletes nothing; the prune removes expired entries and day-old debris (`<entry>.tmp`, marker-less) while leaving fresh ones, a copy still in progress, stray files and the whole of `checkpoints/` alone;
@@ -398,6 +411,34 @@ the `restore-backup` subcommand restoring and then refusing;
 a backup failure alerting below the failure threshold + exiting nonzero while still publishing;
 and the **per-writer staging name** — that two pids derive different paths, that a concurrent writer's in-flight staging file is neither unlinked nor promoted (its path derived *through* `_staging_path` under a faked pid, so reverting to a shared name makes the test fail rather than pass on a name it invented), and that abandoned staging files are swept by age while a live one survives
 — plus an autouse stub, because `backup_dir` defaults into the working tree and the tail's pre-#145 backup had been dropping fixture-sized files into the repo's `logs/` for as long as it existed.
+
+## The user-timer watchdog (issue #369)
+
+`tests/test_user_timers.py` drives `scheduler timer-status` against `FakeSystemctl`, a pure-Python `systemctl --user` that records every call, so the call SEQUENCE is pinned and not just the verdict:
+the watched set is exactly the four shipped `.timer` files, and none found is an error rather than an empty success;
+`XDG_RUNTIME_DIR`/`DBUS_SESSION_BUS_ADDRESS` are filled only when cron lacks them;
+the active host is read from the collection unit's `ConditionHost=`, and any other host makes no call, writes no heartbeat and sends no mail;
+enabled-but-inactive timers exit 1 and are NOT started without `--rearm`;
+`--rearm` is one `daemon-reload`, a `start` for each broken timer only, and a re-read of those only — and a timer still inactive after `start` stays a failure;
+a `disabled` or `masked` timer is a pause, never started and never unhealthy — `LoadState=masked` alone included — and a timer that comes back paused from the re-arm is not reported re-armed;
+a `not-found` timer is `NOT INSTALLED`, and a reload that installs it lets the re-arm recover it;
+one shipped timer file missing from `~/.config/systemd/user/` is that timer's `NOT INSTALLED`, never `UNIT FILES UNREACHABLE`, and the installed timers are still re-armed;
+every live manager state (`degraded` above all, the state a failed nightly service leaves) is reachable, and `offline`, `unknown` or silence is not;
+`--wait-s` polls until BOTH the manager answers and the unit files are visible, gives up inside its budget (fake clock) still writing the heartbeat, treats 0 as exactly one check, and a negative wait, a non-positive poll or a non-finite value of either exits 64 before any call;
+`--alert` is silent on a quiet day, mails on a re-arm (with the `regenerate-aggregate --publish` hint) and on a failure, and never changes the exit status;
+the heartbeat carries the verdict;
+a write broken midway (a faked `json.dump` that writes half and raises) leaves the previous heartbeat intact and no staging file behind, which is what pins atomicity;
+the staging name is per-pid — another writer's in-flight staging file, its path derived through `_staging_path` under a faked pid, is left alone;
+a truncated or non-object file reads as `None` rather than raising;
+and `main()` forwards `--rearm`, `--alert`, `--wait-s` and `--poll-s`, each with and without the flag.
+`tests/test_timer_watchdog_crontab.py` pins the crontab: exactly `MAILTO=""`, `CRON_TZ`, one `@reboot` and one daily line;
+both commands `cd` to the collection unit's `ReadWritePaths`, run the units' interpreter, and parse under `build_parser()` as `timer-status --rearm --alert` with the prod config;
+the `@reboot` wait is bounded between 10 and 60 minutes and the daily line does not wait;
+the daily slot shares the timers' zone, precedes the backup-check timer, and leaves a `Persistent` catch-up night room to end before the next 02:00;
+both lines log to `logs/timer_watchdog.log`;
+`deploy/README.md` appends the file guarded by the marker its first line carries;
+and no doc or package docstring pauses a timer with the `stop` verb on a `.timer`, as a command or in prose, which the daily re-arm would undo.
+In `tests/test_scheduler.py`, `backup-status` gates on the heartbeat only when `[schedule].timer_watchdog_max_age_h > 0` (NEVER RAN, fresh, and 50 h STALE), the age limit is inclusive and the report echoes the heartbeat's own verdict, a stale backup outranks a stale watchdog in the subject while the body carries both, the key round-trips through the loader, and prod sets it between 24 and 72 h.
 
 ## Per-IP hardening: Mapillary, Overpass and the host lock
 
@@ -439,7 +480,10 @@ and the **per-writer staging name** — that two pids derive different paths, th
   a host with no entry in `HOST_RECHECKS` (Mapillary) stays latched all night, and the table is pinned to Overpass alone with the fail-closed predicate rather than the fail-open pre-flight;
   a recovered host that refuses again re-latches with the trip count and monotone membership saying so;
   a walk whose GraphML is frozen for the channel's `network_type` is launched under a latched Overpass (an `all_public` cache does not stand in for the `drive` walk) and the exemption relaxes **only** the Overpass entry, so a latched tile CDN still skips the Mapillary walk;
-  the `Done:` line counts and the alert names the stranded cities — the refused child's own city and the breaker-skipped ones, never a city whose grid run failed — with the `run-due --provider gsv_streets --limit N` recovery, and stranding is decided after the city drains;
+  the `Done:` line counts and the alert names the stranded cities — the refused child's own city and the breaker-skipped ones, never a city whose grid run failed — with one pasteable `run-due --provider <walks> --city <id>...` per exact channel set (#362), and stranding is decided after the city drains;
+  that command, parsed by the real `build_parser` and dry-run, selects exactly the stranded (city, channel) pairs against a queue whose head is two never-collected decoys (a `--limit 2` control proves the decoys lead it), groups cities by their exact set of lost channels so a city whose other grid failed is never named on the walk it was not stranded on, reaches an opt-in walk channel (`kartaview_streets`) while an un-enrolled city stays unselected, carries `--config` round-tripped from `load_scheduler_config` (and none for a config built in code), and `shlex`-quotes a `city_id` carrying an apostrophe;
+  that `--config` is loaded by a RELATIVE path and stored absolute, then re-loaded from another directory and dry-run under that config;
+  the alert's pairing sentence prints the night's own UTC date, and `_stranded_alert_note` called directly on a breaker stranded out of order (cities unsorted, one city's channels reversed) prints its channel sets, cities and commands sorted — the night-level fixtures strand in already-sorted order, so they cannot see a lost sort (#376 review);
   a plain `set` handed to `_finish_batch` still alerts `UNAVAILABLE` as an all-night latch;
   a **busy** exit (80) on a walk whose grid sibling landed is stranded and named exactly like a refusal, with the subject saying `SKIPPED (host busy)` and `STRANDED`;
   a skipped two-host channel launch counts **once** in the summary and alert while the per-host counter still attributes it to both;
@@ -455,7 +499,7 @@ and the **per-writer staging name** — that two pids derive different paths, th
   a city not due tonight not fetched (the slate is `_collect_due`'s, not "every city without a network");
   a blocked or busy host stopping the pass with that host's exit code (76/80) after one fetch, while a city-specific `DownloadError` does not stop it;
   an in-flight `run-due` refusing `--execute` unless `--force`, while a dry run never asks, and a `run-due` that appears **mid-pass** stopping it after the fetch in hand;
-  no enabled street channel meaning nothing to freeze; bad flags exiting usage; and the default date being tomorrow UTC.
+  no enabled street channel meaning nothing to freeze; bad flags exiting usage; and the default date being tomorrow UTC — a literal under a frozen 17:30-PDT clock (#347), not the same expression on both sides.
   `--alert` (issue #355) mails exactly once on a refusal, a busy lock, a `run-due` in flight, a crash (with the traceback, still re-raised) and a SIGTERM (exit 143, the previous handler restored), each naming the networks still cold, and never on a finished pass, an empty plan or a city-specific failure;
   the exit status is unchanged, and the SIGTERM exception is a `BaseException` so a library's `except Exception` cannot swallow it.
 - The prefreeze units (`tests/test_prefreeze_unit.py`, issue #355): the same host, interpreter, `--config`, lock dir and console log as the collection unit;
@@ -562,6 +606,7 @@ It was renamed from `_no_mapillary_tile_pacing` rather than duplicated, and the 
   A city already positive at the first screen publishes the archive's own start date beside it, or every such city reads as an arrival the week the instrument shipped.
 - **The command's exit vocabulary**: 64 for an unknown provider, for `--limit` without `--measure` (a partial screen would put two observations on one date axis) and for `--measure` without `--limit`; 84/85 for the host conditions, with the refused pass's requests still charged to the day's ledger and no rows written.
   A successful screen charges its requests to the SAME `(date, provider)` row a collection writes — same host, same IP, same day.
+  That day is the UTC one `run-due`'s budget gate reads, asserted as a literal under a frozen 17:30-PDT clock with the local zone pinned to Pacific, for the screen, its refusal and the measure mode alike (#347); the screen row carries the same date.
   That a REFUSED one still charges what it sent is pinned twice on purpose: once at the command, where the fetch is stubbed and the attribute is handed over, and once through the real fetch loop, where the block lands on the third tile and the error must carry three (the refused request went out; `_fetch_tile` counts an attempt before reading its status).
   The pair is the [#323](https://github.com/jonfroehlich/streetscape-tracker/pull/323) lesson written down — a test that supplies the value production computes exercises the one path production never takes.
   And the measure mode prints without touching `provider_screen`, so one column never means two instruments.

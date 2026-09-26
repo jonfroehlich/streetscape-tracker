@@ -148,9 +148,14 @@ The one failure it cannot report is an OOM kill, which is a SIGKILL: read `Memor
 The schedule's rationale and install steps are in [`deploy/README.md`](../deploy/README.md); `tests/test_prefreeze_unit.py` pins them.
 
 **Recovering cities a refusal already stranded.**
-The alert names them, with the command: `scheduler run-due --provider gsv_streets --limit N` (or the Mapillary/KartaView walk channel) once Overpass is confirmed serving prod — `python -c "from streetscape_metadata_tracker.download_common import overpass_serving; print(overpass_serving())"` from the checkout on the host must print `True`, which is the breaker's own re-check: one tiny, metered `/api/interpreter` query sent the way a walk sends it (#356).
+The alert names them and prints one `run-due --provider <walks> --city <id>...` per exact set of lost walk channels (#362), pasteable as printed — `--config` is the night's own, and it runs from the project root with the scheduler's venv active.
+Run them once Overpass is confirmed serving prod — `python -c "from streetscape_metadata_tracker.download_common import overpass_serving; print(overpass_serving())"` from the checkout on the host must print `True`, which is the breaker's own re-check: one tiny, metered `/api/interpreter` query sent the way a walk sends it (#356).
 A `curl .../api/status` answering 200 with a slots line is **not** that test — on 2026-09-21 `/status` said serving twice while the next real query was refused.
-Their walks will carry a later date than their grid runs, so they stay un-paired either way; a filtered run advances only the named channel's clock.
+Run the commands one after another, never in parallel: a walk whose street network is not yet frozen takes the Overpass host lock, and a Mapillary, KartaView or Panoramax walk takes its census host's lock too, so a concurrent second one can exit busy and skip.
+Append `--dry-run` to see exactly which (city, channel) pairs would launch.
+A walk is dated the UTC day its command starts, so started the same UTC date as the night (the alert prints it) the walks share the grid runs' date and each pair is kept; from the next UTC day they carry a later date and stay un-paired.
+A filtered run advances only the named channels' clocks.
+The alert used to print `run-due --provider <walk> --limit N`, which walks the channel's stalest-due queue, not the stranded cities: on 2026-09-22 none of 8 stranded cities was in the first 10 of any walk channel, and Austin's ~640k-request walk led `gsv_streets` (#362).
 
 ## Where has a Mapillary contributor mapped lately? `scripts/mapillary_user_activity.py`
 

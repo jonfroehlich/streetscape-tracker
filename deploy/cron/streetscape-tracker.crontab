@@ -1,0 +1,22 @@
+# streetscape-tracker timer watchdog (issue #369). Install on makelab2 ONLY -- see deploy/README.md.
+#
+# A user crontab lives in /var/spool/cron on local disk, so unlike
+# ~/.config/systemd/user it does not depend on the NFS home being mounted when
+# the user manager starts, and it does not depend on the user manager having
+# loaded anything. After the 2026-09-23 reboot every user timer came back
+# enabled but INACTIVE and nothing alerted; this re-arms them and says so.
+#
+# - MAILTO="": cron's local mail is a mailbox nobody reads; the [alerts] SMTP
+#   mail is the channel, and logs/timer_watchdog.log is the human trail.
+# - cd to the REAL checkout path (the units' ReadWritePaths), never the %h
+#   symlink: cron has no %h, and ~/streetscape-tracker is on the NFS home.
+# - @reboot waits up to 30 min (unmeasured; the issue measured a 5 s gap) for
+#   the user manager AND the unit files; the daily line checks once.
+# - 08:30 Pacific: before the noon backup-check timer, and early enough that a
+#   Persistent catch-up night the re-arm starts ends before the next 02:00.
+# - A timer is paused with `systemctl --user disable --now`, never `stop`, or
+#   the daily line re-arms it.
+MAILTO=""
+CRON_TZ=America/Los_Angeles
+@reboot cd /projects/makeabilitylab/streetscape-tracker && .venv-makelab2/bin/python -m streetscape_metadata_tracker.scheduler --config config/scheduler.makelab1.toml timer-status --rearm --alert --wait-s 1800 >> logs/timer_watchdog.log 2>&1
+30 8 * * * cd /projects/makeabilitylab/streetscape-tracker && .venv-makelab2/bin/python -m streetscape_metadata_tracker.scheduler --config config/scheduler.makelab1.toml timer-status --rearm --alert >> logs/timer_watchdog.log 2>&1

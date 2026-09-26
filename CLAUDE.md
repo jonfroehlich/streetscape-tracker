@@ -80,13 +80,14 @@ python scripts/register_frame.py --manifest mapillary_360_cities.csv --overlap-k
 | `reconcile-walks [--dry-run]` | Catalog road walks that finished but were never registered |
 | `import-bundle DIR [--execute] [--enable]` | Land a laptop investigation's artifacts here (#330): a laptop `data/` dir, read-only, DRY-RUN by default; refuses the bundle WHOLE on a geometry, filename, collision, schema, append-order, network-bytes or in-flight-batch problem |
 | `fetch-driving-plan [--force]` | Snapshot Google's published driving plan out of band; `--from-file`/`--date` backfills a hand-saved snapshot |
-| `backup-status [--alert]` | Catalog-backup health; nonzero when the newest backup is missing, >48 h old, or the last attempt failed; `--alert` emails when unhealthy (#193 daily timer) |
+| `backup-status [--alert]` | Catalog-backup health; nonzero when the newest backup is missing, >48 h old, or the last attempt failed, or (prod) the #369 watchdog's heartbeat is stale; `--alert` emails when unhealthy (#193 daily timer) |
+| `timer-status [--rearm] [--alert] [--wait-s N]` | The user timers' health (#369); `--rearm` daemon-reloads and starts enabled-but-inactive ones, a DISABLED timer is a deliberate pause and is left alone; run by a user **crontab** (`deploy/cron/`), not a timer, at `@reboot` and daily |
 | `restore-backup FILE --to PATH` | Restore a dated backup; refuses an existing destination or orphaned `-wal`/`-shm` |
 | `notify-failure` | Email the recent log (the systemd `OnFailure=` hook) |
 
 `run-due` notes: `--limit` (≥1) overrides `[schedule].max_cities_per_day`; an unknown/disabled channel or a bad `--limit` exits 64, not 2; a filtered run advances only the named channels' clocks, **un-pairing those cities' snapshots**.
 `--city CITY` (repeatable) is the targeted retry: it narrows the DUE list and never forces, so a named city that is not due is warned about and skipped, and an unknown name exits 64.
-The named list is the run's city cap unless `--limit` is given, in which case the named cities past it are listed by name.
+The named list is the run's city cap unless `--limit` is given, in which case the named cities past it are listed by name, and it is what the STRANDED alert prints (#362).
 `assess-city` notes: a bad `--provider` or an unpaired `--width`/`--height` exits 64; answer from **street coverage, never grid coverage** (see operations below).
 `enroll-city` notes: **the two directions are scoped differently, because each guard was scoped to where it is a no-op.**
 Bare enrol needs an opt-in channel and an enabled city (every enabled city is already a gsv member; a disabled city can never be due), so either exits 64 writing no row.
@@ -209,6 +210,7 @@ An in-flight checkpoint is never a cache entry: completeness is the extra check,
 A hit is reconciled with the consumer's own checkpoint (`reconcile_cache_hit`): a newer checkpoint is resumed, an older one discarded, and **the crawl's own entry with failed work is handed back so the resume re-probes it** — a channel never inherits its own holes.
 The lifecycle (loader, marker, reuse accounting, `crawl_store_for`) lives once in `checkpointing.py`; never copy it per provider — the first copies disagreed about what "the same crawl" meant.
 `--refetch-census` opts out; **`--force` stays cache-transparent** (a walk whose tail died must re-finalize for 0, not re-pay the census); a backdated `--run-date` refuses an entry observed after it.
+**A consumer's `run_date` and the marker's `completed_at` are both UTC calendar dates (`clock.snapshot_date_today()`, #347)** — the walk collector's default was the local `date.today()`, so west of UTC an evening walk was refused the entry and re-paid the census; never date a snapshot from a local clock, and `tests/test_clock.py` refuses one on the collection path.
 
 **Provider access, per-IP limits and blocks → [`docs/provider-access.md`](docs/provider-access.md).**
 This is what READ THIS FIRST points at; read it before changing any pacing, retry, concurrency, volume or host decision.
@@ -233,7 +235,7 @@ This is what READ THIS FIRST points at; read it before changing any pacing, retr
 | Argv rejected | 2 | Our own CLI refused the argv the scheduler built (#359) — argparse's number, inherited not allocated; a config/CLI contradiction, never the city's. Classified by the LAUNCHER so every child parser is covered; no `consecutive_failure`, the city stays due; alerts unconditionally, naming each rejection's city, argv, parser `error:` line and child log. Nothing else in `cli.py`/`collect.py` may exit 2 |
 
 - A blocked, busy or argv-rejected night still publishes, alerts unconditionally, and exits nonzero — a refusal that recovered on re-check too, because it still cost launches.
-- **A refused OR locally busy host, or an argv our own CLI rejected (#359), STRANDS a city** when its grid run succeeded and its walk did not (#341): not gsv-due for ~83 days, reachable only through the bounded opt-in reservation. The `Done:` line counts them and the alert names them with the `run-due --provider <walk> --limit N` that walks them by hand; `scripts/prefreeze_street_networks.py` is the prevention.
+- **A refused OR locally busy host, or an argv our own CLI rejected (#359), STRANDS a city** when its grid run succeeded and its walk did not (#341): not gsv-due for ~83 days, reachable only through the bounded opt-in reservation. The `Done:` line counts them and the alert names them and prints the pasteable `run-due --provider <walks> --city <id> ...` (one per exact channel set, `--config` included, #362) that walks EXACTLY them — a bare `--limit N` walks the stalest-due queue instead (Austin's ~640k-request walk led it on 2026-09-22); started the same UTC day, the walks keep the grid runs' date; `scripts/prefreeze_street_networks.py` is the prevention.
 - makelab1 is **not** an escape hatch: Project Sidewalk serves Mapillary data off it, and that trade is never the right one.
 
 **Scheduler → [`docs/scheduler.md`](docs/scheduler.md).**
@@ -254,6 +256,7 @@ Drive manual batches into a file (`>> logs/x.log 2>&1`), never a pipe.
 `systemctl stop` is a real wind-down, not a kill; the unit's `TimeoutStopSec` must stay above the tail's measured components and below `max_batch_hours`.
 **The weekly growth screen (`screen-provider`, #316) is scheduled but is NOT part of a night** — its own timer, deliberately far from 02:00 because both take the same Panoramax host lock, and it publishes its own artifact (the nightly tail does not rebuild it, since nothing else changes its inputs).
 Deployment lives in `deploy/` (9 systemd units + its README).
+**A makelab2 reboot brought every user timer back enabled but INACTIVE (#369)** — most likely the user manager scanned `~/.config/systemd/user/` before the NFS home was mounted — so the re-arm lives in a user crontab on local disk (`deploy/cron/`, `timer-status --rearm --alert`), `backup-status` gates on its heartbeat, and a timer is paused with `disable --now`, never `stop`, or the watchdog re-arms it within a day.
 
 **Operator commands and publishing → [`docs/operations.md`](docs/operations.md).**
 `assess-city` answers a partner inquiry about an untracked city the same day (register + both road walks + the cheap Mapillary grid run + publish).

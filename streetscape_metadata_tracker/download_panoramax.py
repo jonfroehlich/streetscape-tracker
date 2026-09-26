@@ -78,6 +78,7 @@ import pyarrow.parquet as pq
 # Aliased for the reason download_mapillary aliases it: `census` is also the
 # name of the local DataFrame this module passes around.
 from . import census as census_core
+from . import clock
 from .analysis import EARLIEST_PLAUSIBLE_CAPTURE
 from .census import dedupe_census
 from .checkpointing import (
@@ -749,7 +750,7 @@ def load_tile_checkpoint(
         # record on a night that committed NO tile, and a host-blocked night
         # records no consecutive_failure, so a city would refresh its own clock
         # indefinitely. See checkpointing.CHECKPOINT_MAX_AGE_S.
-        age_s = (datetime.now(UTC) - datetime.fromisoformat(state["created_at"])).total_seconds()
+        age_s = (clock.utc_now() - datetime.fromisoformat(state["created_at"])).total_seconds()
         if age_s > CHECKPOINT_MAX_AGE_S:
             discard(
                 f"its first tile was committed {age_s / 86400:.1f} days ago, past the "
@@ -959,7 +960,7 @@ def _write_checkpoint_state(
     age cap is measured against, so it must describe the oldest row this
     checkpoint holds rather than the last time anything touched the file.
     """
-    created_at = cp.created_at or datetime.now(UTC).isoformat()
+    created_at = cp.created_at or clock.utc_now().isoformat()
     state = {
         "format_version": PANORAMAX_CHECKPOINT_FORMAT_VERSION,
         "bbox": list(bbox),
@@ -971,7 +972,7 @@ def _write_checkpoint_state(
         "census_rows": sum(done.values()),
         "api_requests_total": api_requests_total,
         "created_at": created_at,
-        "updated_at": datetime.now(UTC).isoformat(),
+        "updated_at": clock.utc_now().isoformat(),
     }
     _write_json_durable(_state_path(cp.path), state)
     cp.created_at = created_at

@@ -34,7 +34,15 @@ from streetscape_metadata_tracker.download_kartaview import SweepIncompleteError
 from streetscape_metadata_tracker.download_mapillary import DEFAULT_TILE_REQUESTS_PER_MINUTE
 from streetscape_metadata_tracker.fileutils import load_city_csv_file
 from streetscape_metadata_tracker.naming import KNOWN_PROVIDERS, generate_run_filename
-from tests.conftest import COLUMNS, make_city_df, make_mapillary_city_df, write_city_csv_gz
+from tests.conftest import (
+    COLUMNS,
+    EVENING_LOCAL_DATE,
+    EVENING_UTC,
+    EVENING_UTC_DATE,
+    make_city_df,
+    make_mapillary_city_df,
+    write_city_csv_gz,
+)
 
 RUN_DATE = date(2026, 7, 1)
 
@@ -72,13 +80,15 @@ def run_filename(city_id, provider="gsv", run_date=RUN_DATE):
     return f"{base}.csv.gz"
 
 
-def run_cli(monkeypatch, city_id, data_dir, *extra, provider="gsv"):
+def run_cli(monkeypatch, city_id, data_dir, *extra, provider="gsv", run_date=RUN_DATE):
     """
     Invoke the real async_main with patched argv; returns its exit code.
 
     `provider=None` OMITS the flag entirely, which is the only way to exercise
     argparse's default — see
     test_omitting_provider_runs_the_type_function_over_the_default.
+    `run_date=None` likewise omits `--run-date` (see
+    test_the_default_run_date_is_the_utc_calendar_date_not_the_local_one).
     """
     argv = [
         "streetscape_tracker.py",
@@ -86,8 +96,7 @@ def run_cli(monkeypatch, city_id, data_dir, *extra, provider="gsv"):
         *(() if provider is None else ("--provider", provider)),
         "--download-dir",
         data_dir,
-        "--run-date",
-        RUN_DATE.isoformat(),
+        *(() if run_date is None else ("--run-date", run_date.isoformat())),
         "--no-visual",
         "--no-publish-json",
         *extra,
@@ -313,6 +322,37 @@ def test_same_run_date_is_noop(monkeypatch, catalog):
     # Even --force must not duplicate/overwrite the same-date snapshot.
     assert run_cli(monkeypatch, city_id, data_dir, "--force") == 0
     assert calls == []
+
+
+# ── The default run date (issue #347) ───────────────────────────────────────
+
+
+def test_the_default_run_date_is_the_utc_calendar_date_not_the_local_one(
+    monkeypatch, catalog, pacific_local_zone, frozen_utc_clock
+):
+    """
+    With no --run-date at 17:30 PDT, the grid run is dated the UTC day.
+
+    The road walk had the local-calendar bug (#347) and the grid CLI did not,
+    but nothing but the grep in test_clock pinned that: a local read spelled
+    any way the grep does not match (`datetime.now().date()`,
+    `date.fromtimestamp(time.time())`, ...) passed the whole suite. This drives
+    the real default through `async_main` instead. The frozen instant is in
+    the past, so any read of the host's real calendar -- local or UTC -- gives
+    neither date asserted here.
+    """
+    conn, city_id, data_dir = catalog
+    gsv_configs(monkeypatch)
+    frozen_utc_clock(EVENING_UTC)
+    seen = []
+
+    async def record(conn_, args, city_row, run_date, provider, config, vis_path):
+        seen.append(run_date)
+
+    monkeypatch.setattr(cli, "_collect_one_run", record)
+    assert run_cli(monkeypatch, city_id, data_dir, run_date=None) == 0
+    assert seen == [EVENING_UTC_DATE]
+    assert EVENING_UTC_DATE != EVENING_LOCAL_DATE, "the two calendars must disagree here"
 
 
 # ── Systemic-failure rejection ──────────────────────────────────────────────
