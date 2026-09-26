@@ -30,6 +30,7 @@ It **reuses the grid downloader's hardened request engine** — `download_gsv.co
 Budget is **isolated**: the `GMAPS_STREETS_API_KEY` key, metered in `api_usage` under `gsv_streets`, paced by its own `[providers.gsv_streets]` block
 — a first-class scheduled channel (see "Street channels are scheduled like grid providers" below), not a manual-only CLI.
 Writes two dated artifacts: a raw sample snapshot `{city}_..._streetwalk_sp{N}_{DATE}.csv.gz` (METADATA schema, one row per sampled location) and a per-edge `..._coverage.json.gz` GeoJSON (`naming.generate_streetwalk_filename` / `streetwalk_coverage_filename`; `parse_filename` rejects both, like history/streets), cataloged in `street_walks` (UNIQUE(city_id, provider, network_type, run_date)).
+The default `run_date` is the UTC date (`clock.snapshot_date_today()`), the same clock the grid CLI and the scheduler use, so a hand-run grid+walk pair in a Pacific evening lands on one date and the walk reuses the grid run's census (#347).
 Streetwalk names carry a **provider token on the run-filename convention** (after `_step_{S}`, gsv tokenless)
 — both providers walk the same sample points and the scheduler collects them the same night under one run date, so without it the second collection would find the first's snapshot on disk and skip as a silent no-op;
 `scripts/repair_streetwalk_names.py` renames pre-token artifacts.

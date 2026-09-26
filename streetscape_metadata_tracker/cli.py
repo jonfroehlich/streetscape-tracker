@@ -31,11 +31,12 @@ import asyncio
 import logging
 import os
 import sys
-from datetime import UTC, date, datetime
+from datetime import date, datetime
 
 from dotenv import find_dotenv, load_dotenv
 
 from . import (
+    clock,
     config,
     create_visualization_map,
     db,
@@ -652,7 +653,7 @@ async def async_main():
     os.makedirs(args.download_dir, exist_ok=True)
     logging.info(f"Using download directory: {args.download_dir}")
 
-    run_date = args.run_date or datetime.now(UTC).date()
+    run_date = args.run_date or clock.snapshot_date_today()
     db_path = args.db_path or db.get_default_db_path(args.download_dir)
 
     # Already a validated, canonically ordered, non-empty channel list — the

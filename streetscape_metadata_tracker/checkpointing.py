@@ -41,9 +41,10 @@ import os
 import shutil
 import time
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import date, datetime
 from typing import Any, Protocol
 
+from .clock import utc_now, utc_now_iso
 from .download_common import grid_bbox
 from .paths import get_project_root
 
@@ -438,11 +439,30 @@ class CensusCache:
             would otherwise publish rows observed after the snapshot's own
             ceiling, which ``plausible_capture_mask`` then drops as "cannot be
             true". None skips the check, for callers that have no date.
+            It is a **UTC calendar date** -- ``clock.snapshot_date_today()``
+            or an explicit ``--run-date`` -- compared against the marker's UTC
+            ``completed_at`` date, so both sides are one calendar (#347). A
+            consumer that dated itself from a local clock was refused the
+            entry for the last hours of every local day west of UTC. Anything
+            but a plain ``date`` is refused at construction: a str or a
+            ``datetime`` would raise out of
+            :func:`load_census_cache_marker`, which never raises.
     """
 
     path: str
     reuse: bool = True
     run_date: date | None = None
+
+    def __post_init__(self) -> None:
+        run_date = self.run_date
+        if run_date is not None and (
+            not isinstance(run_date, date) or isinstance(run_date, datetime)
+        ):
+            raise TypeError(
+                f"CensusCache.run_date must be a datetime.date, got {type(run_date).__name__}: "
+                f"the reuse guard compares it against the marker's UTC completed_at date, "
+                f"and anything else would raise out of load_census_cache_marker, which never raises"
+            )
 
 
 def census_cache_dir() -> str:
@@ -573,7 +593,7 @@ def census_cache_marker(
         "fetched_by": fetched_by,
         "fetched_variant": fetched_variant,
         "crawl_started_at": crawl_started_at,
-        "completed_at": datetime.now(UTC).isoformat(),
+        "completed_at": utc_now_iso(),
         "api_requests_total": int(api_requests_total),
         "failed": list(failed),
     }
@@ -768,9 +788,7 @@ def sweep_progress(checkpoint_path: str | None) -> dict | None:
             return None
         started = state.get("created_at")
         age_s = (
-            None
-            if not started
-            else (datetime.now(UTC) - datetime.fromisoformat(started)).total_seconds()
+            None if not started else (utc_now() - datetime.fromisoformat(started)).total_seconds()
         )
     except (OSError, ValueError, KeyError, TypeError):
         return None
@@ -922,9 +940,7 @@ def _read_census_cache_marker(
         # not from completed_at. The window bounds how far apart two halves of
         # one dated observation may be, and a multi-night crawl's last commit
         # says nothing about how old its oldest rows are.
-        age_s = (
-            datetime.now(UTC) - datetime.fromisoformat(marker["crawl_started_at"])
-        ).total_seconds()
+        age_s = (utc_now() - datetime.fromisoformat(marker["crawl_started_at"])).total_seconds()
         if age_s > max_age_s:
             return None, (
                 f"the census it holds was fetched {age_s / 86400:.1f} days ago, past the "
@@ -957,6 +973,10 @@ def load_census_cache_marker(
     Today that is the ``run_date`` rule: a crawl that finished after the
     snapshot date being written cannot go into that snapshot, but is exactly
     right for the consumer dated tomorrow.
+    ``completed_at`` is stamped in UTC by :func:`census_cache_marker`, and
+    ``run_date`` is the UTC date every producer defaults to
+    (``clock.snapshot_date_today()``); the comparison is only meaningful
+    because both sides are the same calendar (#347).
 
     FOR CONSUMERS ONLY. Every caller of this is a provider fetch holding its
     host lock, so no second process on this machine is mid-read of the entry
@@ -982,7 +1002,7 @@ def load_census_cache_marker(
         if observed_until is not None and observed_until > run_date:
             logger.warning(
                 f"Not reusing the cached census at {cache_path} for a snapshot dated "
-                f"{run_date}: its crawl finished {observed_until}, after that date, so its "
+                f"{run_date}: its crawl finished {observed_until} (both dates UTC), after that date, so its "
                 f"rows cannot be part of that observation; refetching. The entry stays for "
                 f"consumers dated on or after {observed_until}."
             )

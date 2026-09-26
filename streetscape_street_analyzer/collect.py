@@ -75,8 +75,8 @@ from datetime import UTC, date, datetime
 
 from dotenv import find_dotenv, load_dotenv
 
+from streetscape_metadata_tracker import clock, db
 from streetscape_metadata_tracker import config as cfg
-from streetscape_metadata_tracker import db
 from streetscape_metadata_tracker.analysis import detect_systemic_failure
 from streetscape_metadata_tracker.checkpointing import (
     CENSUS_PROVIDERS,
@@ -368,7 +368,13 @@ def run_collect(args: argparse.Namespace) -> int:
             logger.error("City not found in catalog: %s", args.city)
             return 1
 
-        run_date = date.fromisoformat(args.run_date) if args.run_date else date.today()
+        # UTC, not `date.today()`: the census cache compares this against a UTC
+        # `completed_at`, the scheduler keys `api_usage` by the UTC date, and the
+        # grid CLI is already UTC -- a local date here was refused the census and
+        # dated the walk a day before its own grid run west of UTC (#347).
+        run_date = (
+            date.fromisoformat(args.run_date) if args.run_date else clock.snapshot_date_today()
+        )
 
         # Frozen network → edges (registers the #103 network row via conn).
         # A cached network costs nothing; a cold one goes to Overpass, which
@@ -981,7 +987,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--run-date",
         default=None,
-        help="Collection date YYYY-MM-DD (default: today)",
+        help=(
+            "Collection date YYYY-MM-DD (default: today, UTC -- the same clock the grid run "
+            "and the scheduler date a snapshot by, so an evening walk pairs with its grid run "
+            "and reuses its census; #347)"
+        ),
     )
     parser.add_argument(
         "--force",

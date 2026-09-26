@@ -22,9 +22,10 @@ import os
 import sqlite3
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import date
 from typing import Any
 
+from . import clock
 from .naming import sanitize_city_query_str
 
 logger = logging.getLogger(__name__)
@@ -613,8 +614,8 @@ class RunRow:
 
 
 def utc_now_iso() -> str:
-    """Current UTC time as an ISO 8601 string."""
-    return datetime.now(UTC).isoformat()
+    """Current UTC time as an ISO 8601 string, read from the shared clock (#347)."""
+    return clock.utc_now_iso()
 
 
 def get_default_db_path(data_dir: str) -> str:

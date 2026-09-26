@@ -30,6 +30,12 @@ already gone wrong once:
 - The v13→v14 migration (`census_fetched_by`/`census_fetched_at` on `runs` and `street_walks`, issue #290): the pair arrives NULL on existing rows, `register_run` round-trips it, and it defaults to NULL rather than to the collecting channel — provenance is recorded, never inferred.
   The load-bearing pin is `test_run_row_carries_every_runs_column`: `_row_to_run` builds `RunRow(**dict(row))` from a `SELECT *`, so a column without a matching dataclass field is a `TypeError` on every `get_latest_run` against a migrated catalog, not a missing feature.
 - An end-to-end migration test with synthetic fixtures
+- The one snapshot clock (`tests/test_clock.py`, issue #347): under a pinned America/Los_Angeles zone and a frozen 17:30-PDT instant, `clock.snapshot_date_today()` is the UTC date and not the local one; `db.utc_now_iso` reads the same seam;
+  and a grep refuses `date.today()`, `datetime.today()` and a naive `datetime.now()` on the collection path (`checkpointing`, `cli`, `scheduler`, the walk collector, the prefreeze script).
+  The grep blanks comments and plain strings in place, so the comment that names `date.today()` does not trip it, but keeps f-strings, whose braces hold code; it keeps each line's own spacing, because re-joining tokens fused `else date.today()` into `elsedate.today()` and the first version missed the very #347 line that way.
+  Its regex and the blanking are self-checked against planted samples so it cannot pass by matching nothing.
+  A grep only sees the spellings it names, so the grid CLI's default is also pinned by behaviour, in `tests/test_cli_policy.py`: `async_main` with no `--run-date` under the frozen instant hands `_collect_one_run` the UTC date, which a `datetime.now().date()` or `date.fromtimestamp(time.time())` read — both invisible to the grep — fails.
+  The shared `frozen_utc_clock` and `pacific_local_zone` fixtures live in `conftest.py`, non-autouse; the instant is in the past, so an unfrozen `date.today()` can never coincide with either date it asserts.
 
 ## City registration manifests (issue #110, and the purposive additions)
 
@@ -286,6 +292,11 @@ and `hosts_unavailable` is anchored to the blocked-host note's own `; `-delimite
 - **A degraded walk says so in its own log, and an undamaged one does not** (#259, `tests/test_streetwalk_mapillary.py`), pinned as a pair because each direction fails a different mutation.
   The per-attempt log is the ONLY record that part of an artifact is unmeasured, and the line stops there: a tolerated hole exits 0, and the scheduler copies a child's tail into its own log — the one the `[alerts]` mail quotes — only for a child that FAILED, so a degraded walk sends no mail at all.
   Sharpest on the #290 reuse path, where the walk inherits the crawl's failed tiles for zero requests so no fetch-side "N/M tiles failed" warning fires either, which a third test drives end to end from a promoted cache entry rather than trusting the two halves to meet.
+  That end-to-end test runs under a frozen 17:30-PDT clock with the local zone pinned to America/Los_Angeles and gives the walk NO `--run-date`, asserting both zero requests and the UTC-dated row (#347), because a test that read `date.today()` for both sides could not fail, which is how #347 survived CI on UTC runners.
+  It freezes the LOCAL calendar too (`frozen_local_calendar`, at the same instant, as `collect` reads `date.today()`): with only the UTC clock frozen, `date.today()` reads the real present, AFTER the marker, so a local-dated walk still passes the reuse guard and only the row's date catches it.
+  Frozen together, the #347 regression is refused the entry and re-fetches both tiles, so `served == []` fails on its own.
+  It also asserts the marker's `crawl_started_at` (the checkpoint's `created_at`) and `completed_at` are both the frozen instant, which pins the census checkpoints' stamps to the same clock seam.
+  Its cheap sibling (`test_the_walks_default_run_date_is_the_grid_runs_utc_date`) pins the default date's pass-through to the `CensusCache` the fetch receives, the artifact name, and the `api_usage` ledger day.
   So one test asserts the degraded sample count AND the `unmeasured_desc` both reach the log, and its twin asserts a failed tile covering no sample logs nothing, since a warning claiming damage that did not happen just buries a real one in the single place anybody reads it.
   The count asserted is the RELABELLED subset, not every sample under the failed tile, which is what the message now says.
   A fourth refuses a mask given without a desc, the same contract `census.write_census_grid_run` enforces for the grid tail.
@@ -366,6 +377,7 @@ and `hosts_unavailable` is anchored to the blocked-host note's own `; `-delimite
   and the marker is INSIDE the directory before it is renamed — asserted at the `os.replace` call itself — so a failed marker write or a failed rename leaves the checkpoint exactly as it was, with no stray marker in it, and nothing under the cache name.
   Also: EXDEV falls back to a staging copy renamed into place, since either directory can be pointed at another filesystem by its env override; a stale entry is replaced wholesale rather than merged;
   the window is aged from `crawl_started_at` (a fresh promotion of a ten-day-old crawl is refused, which ageing from `completed_at` would allow; a marker without one is refused, since the builder requires it), last night's entry still reuses, and an entry whose crawl finished after the consumer's `run_date` is refused WITHOUT being deleted;
+  the marker is stamped from the shared UTC clock, an entry finished in a Pacific evening is reused by a consumer dated that UTC day and refused for the local date the old default produced, and a str or `datetime` `run_date` is refused at construction (#347);
   the shared loader skeleton (`load_cached_store`) deletes on the provider's verdict and on a torn store but keeps an entry a `CacheEntryUnusableHere` says is merely not for this caller; the reuse accounting prices `api_requests_total` only for the (channel, variant) that paid, the variant included; the observation timestamp is the crawl's only for a reuse;
   a hit is reconciled with the consumer's own checkpoint — an older one is discarded, a newer one wins, the crawl's own entry with failed work is handed back marker-less for the resume to re-probe, and another channel's holes are inherited;
   the probe opens no parquet footer, refuses a marker whose recorded store format this build cannot read, and deletes nothing; the prune removes expired entries and day-old debris (`<entry>.tmp`, marker-less) while leaving fresh ones, a copy still in progress, stray files and the whole of `checkpoints/` alone;
@@ -446,7 +458,7 @@ and the **per-writer staging name** — that two pids derive different paths, th
   a city not due tonight not fetched (the slate is `_collect_due`'s, not "every city without a network");
   a blocked or busy host stopping the pass with that host's exit code (76/80) after one fetch, while a city-specific `DownloadError` does not stop it;
   an in-flight `run-due` refusing `--execute` unless `--force`, while a dry run never asks, and a `run-due` that appears **mid-pass** stopping it after the fetch in hand;
-  no enabled street channel meaning nothing to freeze; bad flags exiting usage; and the default date being tomorrow UTC.
+  no enabled street channel meaning nothing to freeze; bad flags exiting usage; and the default date being tomorrow UTC — a literal under a frozen 17:30-PDT clock (#347), not the same expression on both sides.
   `--alert` (issue #355) mails exactly once on a refusal, a busy lock, a `run-due` in flight, a crash (with the traceback, still re-raised) and a SIGTERM (exit 143, the previous handler restored), each naming the networks still cold, and never on a finished pass, an empty plan or a city-specific failure;
   the exit status is unchanged, and the SIGTERM exception is a `BaseException` so a library's `except Exception` cannot swallow it.
 - The prefreeze units (`tests/test_prefreeze_unit.py`, issue #355): the same host, interpreter, `--config`, lock dir and console log as the collection unit;
@@ -552,6 +564,7 @@ It was renamed from `_no_mapillary_tile_pacing` rather than duplicated, and the 
   A city already positive at the first screen publishes the archive's own start date beside it, or every such city reads as an arrival the week the instrument shipped.
 - **The command's exit vocabulary**: 64 for an unknown provider, for `--limit` without `--measure` (a partial screen would put two observations on one date axis) and for `--measure` without `--limit`; 84/85 for the host conditions, with the refused pass's requests still charged to the day's ledger and no rows written.
   A successful screen charges its requests to the SAME `(date, provider)` row a collection writes — same host, same IP, same day.
+  That day is the UTC one `run-due`'s budget gate reads, asserted as a literal under a frozen 17:30-PDT clock with the local zone pinned to Pacific, for the screen, its refusal and the measure mode alike (#347); the screen row carries the same date.
   That a REFUSED one still charges what it sent is pinned twice on purpose: once at the command, where the fetch is stubbed and the attribute is handed over, and once through the real fetch loop, where the block lands on the third tile and the error must carry three (the refused request went out; `_fetch_tile` counts an attempt before reading its status).
   The pair is the [#323](https://github.com/jonfroehlich/streetscape-tracker/pull/323) lesson written down — a test that supplies the value production computes exercises the one path production never takes.
   And the measure mode prints without touching `provider_screen`, so one column never means two instruments.
