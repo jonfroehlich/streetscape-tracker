@@ -580,6 +580,14 @@ def test_all_enabled_skips_a_city_no_enabled_street_channel_walks(
     planned = pf.plan_prefreeze_all_enabled(conn, _cfg(data_dir))
     assert [c.city_id for c, _, _ in planned] == [alpha, beta]
 
+    # On an OPT-IN walk channel a NULL member means "not enrolled", so only the
+    # city an operator enrolled is planned -- the channel's default, never True.
+    db.set_channel_membership(conn, beta, "kartaview_streets", True, cycle_days=90)
+    conn.commit()
+    cfg = _cfg(data_dir, providers={"kartaview_streets": ProviderConfig(enabled=True)})
+    planned = pf.plan_prefreeze_all_enabled(conn, cfg)
+    assert [(c.city_id, ch) for c, _, ch in planned] == [(beta, ["kartaview_streets"])]
+
 
 def test_all_enabled_dry_run_fetches_nothing_and_defaults_limit_to_40(
     conn, data_dir, monkeypatch, capsys
