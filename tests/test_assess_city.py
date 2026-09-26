@@ -18,6 +18,7 @@ from streetscape_metadata_tracker import db
 from streetscape_metadata_tracker import scheduler as _sched
 from streetscape_metadata_tracker.boundary_audit import rect_in_boundary_frac
 from streetscape_metadata_tracker.download_common import (
+    ARGV_REJECTED_EXIT_CODE,
     HOST_BUSY_EXIT_CODES,
     HOST_EXIT_CODES,
     HOST_MAPILLARY_TILES,
@@ -854,6 +855,27 @@ def test_a_busy_host_skips_one_channel_without_tripping_the_breaker(conn, monkey
     assert rc == 1
 
 
+def test_assess_city_reports_an_argv_rejection_and_exits_1(conn, monkeypatch, tmp_path, capsys):
+    """
+    Our own CLI refusing the argv the scheduler built (issue #359) records no
+    attempt, so without its own term a rejected channel beside two collected
+    ones scores 2/2 and exits 0 -- an inquiry answered with a channel missing.
+    """
+    rejected = _sched.CollectionOutcome(False, "stubbed", exit_code=ARGV_REJECTED_EXIT_CODE)
+    _stub_collection(
+        monkeypatch,
+        conn,
+        outcome=lambda city, provider: rejected if provider == "mapillary" else True,
+    )
+
+    rc = _assess(tmp_path)
+
+    assert rc == 1
+    assert "1 channel(s) REJECTED by our own CLI" in capsys.readouterr().out
+    row = _state(conn).get("mapillary")
+    assert row is None or row["consecutive_failures"] == 0
+
+
 # --------------------------------------------------------------------------
 # the tail
 # --------------------------------------------------------------------------
@@ -1295,6 +1317,7 @@ def test_assess_city_inherits_the_lane_scheduler_from_the_config_knob(conn, monk
         blocked_hosts=_sched.HostBreaker(),
         busy_hosts=Counter(),
         deferred_channels=Counter(),
+        rejected_argv=_sched.ArgvRejections(),
         batch_deadline=None,
         stop_requested=None,
         record_failures=False,

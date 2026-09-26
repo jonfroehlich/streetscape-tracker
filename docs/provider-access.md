@@ -386,6 +386,7 @@ Where the file lives is the subtle part, and all three constraints bite at once 
 `_run_city_loop` turns the first *refusal* into a **night-level breaker**: that host's channels (`CHANNEL_HOSTS`) are skipped, since the condition is a property of this machine and asking again with the next city cannot answer differently.
 A *busy* exit deliberately does **not** trip it — that condition ends when the other process does, so escalating it would let a two-minute manual Mapillary run cost the batch every Mapillary city of the night;
 it skips one channel of one city and the next city asks again.
+A fourth family, exit `2`, is not a host condition at all: it is the child's own parser refusing the argv the scheduler built (#359), a config/CLI contradiction that is alerted and never charged to the city; the mechanism is in [`scheduler.md`](scheduler.md).
 
 **The breaker re-checks Overpass on a cooldown, and only Overpass (issue #341, 2026-09-15).**
 Until #341 a refusal latched for the rest of the night, which was the right shape for the condition it was built on — a Mapillary tile block lasts ~24 h (three measured above), so re-probing one inside a night is exactly the retry hazard the forum warned about.
