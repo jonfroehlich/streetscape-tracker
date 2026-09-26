@@ -11723,6 +11723,9 @@ def test_the_done_line_counts_and_the_alert_names_the_stranded_cities(conn, monk
         ["run-due", "--provider", "gsv_streets", "--city", alpha, "--city", beta]
     ]
     assert "~83 days" in body
+    # The pairing rule names the night's own UTC date (_drive_night's today),
+    # which is what _finish_batch must thread through (#376 review, F1).
+    assert "started on 2026-07-02 (UTC)" in body
     # STRANDED lines are WARNINGs in the log, one per lost walk.
     stranded_lines = [
         r for r in caplog.records if "STRANDED" in r.message and r.levelno == logging.WARNING
@@ -11964,11 +11967,17 @@ def test_the_stranded_command_reaches_an_opt_in_walk_channel(conn, monkeypatch, 
 
 
 def test_the_stranded_command_carries_the_config_it_ran_under(
-    conn, monkeypatch, tmp_path, data_dir
+    conn, monkeypatch, tmp_path, data_dir, capsys
 ):
     """Prod runs `--config .../scheduler.makelab1.toml`, and the repo default
     diverges materially, so a command without it would run against the wrong
-    catalog, budgets and publish settings."""
+    catalog, budgets and publish settings.
+
+    The config is loaded by a RELATIVE path from its own directory, so the
+    stored path must be made absolute: a relative one would resolve against
+    whatever directory the operator pastes the command in (#376 review, F2).
+    The printed command is then parsed, its `--config` re-loaded, and dry-run
+    under that config, so the round trip is end to end (#376 review, F5)."""
     from streetscape_metadata_tracker.download_common import HOST_OVERPASS
 
     path = tmp_path / "prod.toml"
@@ -11979,8 +11988,10 @@ def test_the_stranded_command_carries_the_config_it_ran_under(
         "[providers.gsv]\nenabled = true\n\n"
         "[providers.gsv_streets]\nenabled = true\n"
     )
-    cfg = load_scheduler_config(str(path))
-    assert cfg.config_path == str(path)
+    monkeypatch.chdir(tmp_path)
+    cfg = load_scheduler_config("prod.toml")
+    assert Path(cfg.config_path).is_absolute()
+    assert Path(cfg.config_path).resolve() == path.resolve()
     assert SchedulerConfig().config_path is None, "a config built in code names no file"
 
     alpha = _register(conn, "Alpha", width=1000, height=1000, step=20)
@@ -11993,14 +12004,21 @@ def test_the_stranded_command_carries_the_config_it_ran_under(
     (command,) = _alert_commands(body)
     assert command == [
         "--config",
-        str(path),
+        cfg.config_path,
         "run-due",
         "--provider",
         "gsv_streets",
         "--city",
         alpha,
     ]
-    assert build_parser().parse_args(command).config == str(path)
+    parsed = build_parser().parse_args(command)
+    assert parsed.config == cfg.config_path
+    # Pasted from another directory, the printed --config still loads the
+    # same file, and dry-running under it selects exactly the stranded pair.
+    monkeypatch.chdir(data_dir)
+    reloaded = load_scheduler_config(parsed.config)
+    assert reloaded.config_path == cfg.config_path
+    assert _dry_run_selection(reloaded, command, capsys) == {(alpha, "gsv_streets")}
 
 
 def test_the_stranded_command_quotes_a_city_id_the_shell_would_split(conn, monkeypatch, capsys):
@@ -12020,6 +12038,39 @@ def test_the_stranded_command_quotes_a_city_id_the_shell_would_split(conn, monke
     (command,) = _alert_commands(body)
     assert command == ["run-due", "--provider", "gsv_streets", "--city", coeur]
     assert _dry_run_selection(cfg, command, capsys) == {(coeur, "gsv_streets")}
+
+
+def test_the_stranded_note_sorts_cities_and_channels_and_prints_its_date():
+    """The night-level tests strand cities in an order that is already sorted,
+    so they cannot see a lost sort (#376 review, F3). Here the breaker records
+    cities out of order and one city's channels in reverse: each command must
+    list its channels sorted, its cities sorted, and the commands in channel-
+    set order. The date is a non-default one, so a hard-coded or shifted date
+    in the pairing sentence fails (#376 review, F1)."""
+    breaker = _sched.HostBreaker()
+    breaker.strand("zeta", "mapillary_streets")
+    breaker.strand("zeta", "gsv_streets")
+    breaker.strand("delta", "gsv_streets")
+    breaker.strand("beta", "gsv_streets")
+    breaker.strand("alpha", "gsv_streets")
+    breaker.strand("alpha", "mapillary_streets")
+
+    body = _sched._stranded_alert_note(SchedulerConfig(), breaker, date(2026, 9, 22))
+
+    assert _alert_commands(body) == [
+        ["run-due", "--provider", "gsv_streets", "--city", "beta", "--city", "delta"],
+        [
+            "run-due",
+            "--provider",
+            "gsv_streets,mapillary_streets",
+            "--city",
+            "alpha",
+            "--city",
+            "zeta",
+        ],
+    ]
+    assert "started on 2026-09-22 (UTC)" in body
+    assert _sched._stranded_alert_note(SchedulerConfig(), _sched.HostBreaker(), date.today()) == ""
 
 
 def test_a_two_host_channel_skip_counts_one_launch(conn, monkeypatch):
