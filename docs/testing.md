@@ -493,6 +493,10 @@ In `tests/test_scheduler.py`, `backup-status` gates on the heartbeat only when `
   no enabled street channel meaning nothing to freeze; bad flags exiting usage; and the default date being tomorrow UTC — a literal under a frozen 17:30-PDT clock (#347), not the same expression on both sides.
   `--alert` (issue #355) mails exactly once on a refusal, a busy lock, a `run-due` in flight, a crash (with the traceback, still re-raised) and a SIGTERM (exit 143, the previous handler restored), each naming the networks still cold, and never on a finished pass, an empty plan or a city-specific failure;
   the exit status is unchanged, and the SIGTERM exception is a `BaseException` so a library's `except Exception` cannot swallow it.
+  `--all-enabled` (issue #381) planning cities the slate mode drops — past the cap, and walked yesterday — while skipping a disabled city, an already-frozen one and one no enabled street channel walks;
+  `--limit` truncating in **staleness** order (never-walked, then oldest walk, not `city_id` order), with two channels on one type sharing a fetch;
+  a dry run fetching nothing with `--limit` defaulting to 40; `--nights` beside it exiting usage;
+  the in-flight `run-due` refusal and the host stop still firing in that mode; and its alert naming `--all-enabled` as the re-run.
 - The prefreeze units (`tests/test_prefreeze_unit.py`, issue #355): the same host, interpreter, `--config`, lock dir and console log as the collection unit;
   a sandbox no wider than the checkout (`PrivateUsers`, `NoNewPrivileges`, `PrivateTmp`, `RestrictSUIDSGID`, `ProtectSystem=strict`, one `ReadWritePaths`, an OPTIONAL `EnvironmentFile`);
   a `MemoryMax` whose VALUE sits above a floor and below the nightly unit's, with no `MemoryHigh` — an OOM here is a SIGKILL, so it is the one failure that cannot alert;

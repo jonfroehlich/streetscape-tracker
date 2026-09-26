@@ -498,3 +498,145 @@ def test_terminated_is_not_an_exception_a_library_can_swallow():
     and keep fetching past the unit's timeout."""
     assert not issubclass(pf.Terminated, Exception)
     assert issubclass(pf.Terminated, BaseException)
+
+
+# ── --all-enabled: drain the whole catalog's cold backlog (issue #381) ────────
+#
+# The slate mode only ever sees cities DUE by the target date, so a cold city
+# the night will not reach is frozen only the night it is walked -- exactly
+# when a refusal strands it. This mode plans every enabled member city instead.
+
+
+def _freeze(data_dir, city_id, network_type="drive"):
+    path = network_cache_path(city_id, data_dir, network_type)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    open(path, "w").close()
+
+
+def test_all_enabled_selects_enabled_cold_cities_past_the_nights_window(
+    three_cities, conn, data_dir, monkeypatch
+):
+    """Past the cap AND not due tonight, both of which the slate mode drops;
+    a disabled city and an already-frozen one are skipped."""
+    alpha, beta, gamma = three_cities
+    delta = _register(conn, "Delta")
+    epsilon = _register(conn, "Epsilon")
+    db.set_city_enabled(conn, delta, False)
+    _freeze(data_dir, epsilon)
+    # Alpha was walked yesterday on every channel, so no night will reach it
+    # for ~83 days -- but its network is cold, which is what this mode is for.
+    db.assign_schedule(conn, 90)
+    for provider in ("gsv", "gsv_streets", "mapillary", "mapillary_streets"):
+        db.record_attempt(conn, alpha, success=True, provider=provider)
+    conn.commit()
+
+    rc, fetcher, _ = _run(monkeypatch, _cfg(data_dir, max_cities_per_day=1), "--execute")
+    assert fetcher.calls == [(beta, "drive")], "the slate mode sees one due city"
+
+    os.remove(network_cache_path(beta, data_dir, "drive"))
+    rc, fetcher, _ = _run(
+        monkeypatch, _cfg(data_dir, max_cities_per_day=1), "--all-enabled", "--execute"
+    )
+    assert rc == 0
+    # Never-walked first (city_id order), then Alpha, whose walk is the freshest.
+    assert fetcher.calls == [(beta, "drive"), (gamma, "drive"), (alpha, "drive")]
+
+
+def test_all_enabled_limit_truncates_in_staleness_order(three_cities, conn, data_dir, monkeypatch):
+    """Stalest-first, NOT city_id order: a city walked long ago outranks one
+    walked recently, and the never-walked outrank both."""
+    alpha, beta, gamma = three_cities
+    db.assign_schedule(conn, 90)
+    for city_id, when in ((alpha, "2026-09-01T00:00:00"), (beta, "2026-03-01T00:00:00")):
+        for provider in ("gsv_streets", "mapillary_streets"):
+            db.record_attempt(conn, city_id, success=True, provider=provider)
+            conn.execute(
+                "UPDATE schedule_state SET last_success_at = ? WHERE city_id = ? AND provider = ?",
+                (when, city_id, provider),
+            )
+    conn.commit()
+
+    planned = pf.plan_prefreeze_all_enabled(conn, _cfg(data_dir))
+    assert [(c.city_id, t) for c, t, _ in planned] == [
+        (gamma, "drive"),
+        (beta, "drive"),
+        (alpha, "drive"),
+    ]
+    assert planned[0][2] == ["gsv_streets", "mapillary_streets"], "one GraphML, both channels"
+
+    rc, fetcher, _ = _run(monkeypatch, _cfg(data_dir), "--all-enabled", "--limit", "2", "--execute")
+    assert rc == 0
+    assert fetcher.calls == [(gamma, "drive"), (beta, "drive")]
+
+
+def test_all_enabled_skips_a_city_no_enabled_street_channel_walks(
+    three_cities, conn, data_dir, monkeypatch
+):
+    """A network no channel will walk is an Overpass request that buys nothing:
+    Gamma is excluded from both walk channels, so it is not planned."""
+    alpha, beta, gamma = three_cities
+    for provider in ("gsv_streets", "mapillary_streets"):
+        db.set_channel_membership(conn, gamma, provider, False, cycle_days=90)
+    planned = pf.plan_prefreeze_all_enabled(conn, _cfg(data_dir))
+    assert [c.city_id for c, _, _ in planned] == [alpha, beta]
+
+
+def test_all_enabled_dry_run_fetches_nothing_and_defaults_limit_to_40(
+    conn, data_dir, monkeypatch, capsys
+):
+    cities = [_register(conn, f"City{i:02d}") for i in range(42)]
+    rc, fetcher, slept = _run(monkeypatch, _cfg(data_dir), "--all-enabled")
+    assert rc == 0
+    assert fetcher.calls == [] and slept == []
+    out = capsys.readouterr().out
+    assert "DRY RUN" in out
+    assert "Would freeze 40 cold street network(s) across every enabled city" in out
+    assert "2 more cold network(s) are past --limit 40." in out
+    assert cities[39] in out and cities[40] not in out
+
+
+def test_all_enabled_and_nights_are_mutually_exclusive(three_cities, data_dir, monkeypatch):
+    rc, fetcher, _ = _run(
+        monkeypatch, _cfg(data_dir), "--all-enabled", "--nights", "1", "--execute"
+    )
+    assert rc == USAGE_EXIT_CODE
+    assert fetcher.calls == []
+
+
+def test_all_enabled_still_stops_on_a_run_due_and_a_host_condition(
+    three_cities, data_dir, monkeypatch
+):
+    """The backlog drain shares the slate mode's guards, not a copy of them."""
+    alpha, _, _ = three_cities
+    rc, fetcher, _ = _run(
+        monkeypatch, _cfg(data_dir), "--all-enabled", "--execute", in_flight="pid 4242: run-due"
+    )
+    assert rc == USAGE_EXIT_CODE
+    assert fetcher.calls == []
+
+    blocked = HostBlockedError("Overpass refused this host", host=HOST_OVERPASS)
+    rc, fetcher, _ = _run(
+        monkeypatch,
+        _cfg(data_dir),
+        "--all-enabled",
+        "--execute",
+        fetcher=_Fetcher({alpha: blocked}),
+    )
+    assert rc == 76
+    assert fetcher.calls == [(alpha, "drive")]
+
+
+def test_all_enabled_alert_names_the_mode_to_rerun(three_cities, data_dir, monkeypatch):
+    alpha, _, _ = three_cities
+    blocked = HostBlockedError("Overpass refused this host", host=HOST_OVERPASS)
+    rc, _, alerts = _run_alerting(
+        monkeypatch,
+        _cfg(data_dir),
+        "--all-enabled",
+        "--execute",
+        "--alert",
+        fetcher=_Fetcher({alpha: blocked}),
+    )
+    assert rc == 76
+    ((_, body),) = alerts.sent
+    assert "--all-enabled --execute" in body and "--nights 2" not in body
