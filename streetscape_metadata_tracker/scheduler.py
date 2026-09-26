@@ -52,6 +52,7 @@ from . import (
     bundle_import,
     catalog_backup,
     cgroup_memory,
+    clock,
     db,
     download_kartaview,
     download_mapillary,
@@ -2916,7 +2917,7 @@ def _publish(cfg: SchedulerConfig, context: str, alert_on_failure: bool = True) 
         cmd.append("--local")
     logger.info(f"Publishing via {' '.join(cmd[1:])}")
     os.makedirs(cfg.log_dir, exist_ok=True)
-    log_path = Path(cfg.log_dir) / f"publish_{date.today().isoformat()}.log"
+    log_path = Path(cfg.log_dir) / f"publish_{clock.snapshot_date_today().isoformat()}.log"
     # Time the rsync. It is the publish tail's largest component (7,409 published
     # files / 30.75 GB, measured 2026-08-20 — 7,416 is rsync's candidate count,
     # which is a different number) and was its only UNMEASURED one:
@@ -3027,7 +3028,7 @@ _STATUS_MAX_FAILURES = 40
 def cmd_status(cfg: SchedulerConfig) -> int:
     """Print a per-(city, provider) schedule table plus today's budgets."""
     conn = db.connect(cfg.db_path)
-    today = datetime.now(UTC).date()
+    today = clock.snapshot_date_today()
     providers = cfg.enabled_providers()
 
     # `s.member AS channel_member`, aliased rather than bare, because `c.enabled`
@@ -4134,7 +4135,7 @@ def cmd_screen_provider(
         )
         return 0
 
-    today = date.today()
+    today = clock.snapshot_date_today()
     try:
         result = panoramax_screen.screen_targets(
             targets,
@@ -4263,19 +4264,21 @@ def _run_screen_measure(
         _emit(price)
         return 0
     logger.info(price)
+    # The UTC date, like the run-due budget gate that reads this spend (#347).
+    today = clock.snapshot_date_today()
     try:
         result = panoramax_screen.measure_targets(
             targets, max_requests_per_minute=rate, jitter=jitter
         )
     except HostUnavailableError as e:
         logger.error(f"{provider} measure stopped: {e}")
-        _record_screen_spend(conn, provider, date.today(), getattr(e, "api_requests", 0))
+        _record_screen_spend(conn, provider, today, getattr(e, "api_requests", 0))
         return host_exit_code(e)
     except DownloadError as e:
         logger.error(f"{provider} measure failed: {e}")
-        _record_screen_spend(conn, provider, date.today(), getattr(e, "api_requests", 0))
+        _record_screen_spend(conn, provider, today, getattr(e, "api_requests", 0))
         return 1
-    _record_screen_spend(conn, provider, date.today(), result["api_requests"])
+    _record_screen_spend(conn, provider, today, result["api_requests"])
     for row, screen in zip(result["rows"], ranked, strict=True):
         _emit(
             f"{row['display_name']}: {row['pictures']:,} pictures "
@@ -4433,7 +4436,7 @@ def cmd_reconcile_walks(
     stat-per-candidate rather than a glob, since data/ holds thousands of files.
     """
     conn = db.connect(cfg.db_path)
-    today = target_date or datetime.now(UTC).date()
+    today = target_date or clock.snapshot_date_today()
     channels = [p for p in cfg.enabled_providers() if is_street_channel(p)]
     if not channels:
         print("No street channels enabled; nothing to reconcile.")
@@ -5097,7 +5100,7 @@ def cmd_assess_city(
 
     conn = db.connect(cfg.db_path)
     if today is None:
-        today = datetime.now(UTC).date()
+        today = clock.snapshot_date_today()
 
     try:
         city, newly_registered = resolve_or_register_city(
@@ -6793,7 +6796,7 @@ def cmd_run_due(
             return USAGE_EXIT_CODE
         only_city_ids = frozenset(row.city_id for row in resolved.values())
     if today is None:
-        today = datetime.now(UTC).date()
+        today = clock.snapshot_date_today()
     batch_started = time.monotonic()
     batch_deadline = batch_started + cfg.max_batch_hours * 3600.0
 

@@ -276,13 +276,19 @@ def test_bad_flags_exit_usage(three_cities, data_dir, monkeypatch, flags):
     assert fetcher.calls == []
 
 
-def test_the_default_date_is_tomorrow_utc():
+def test_the_default_date_is_tomorrow_utc(pacific_local_zone, frozen_utc_clock):
     """cmd_run_due reads the UTC date at 02:00 Pacific, i.e. the NEXT UTC day
     for a pass run in a Pacific afternoon. Later is the safe error: dueness is
-    monotone in the date."""
-    from datetime import UTC, datetime, timedelta
+    monotone in the date.
 
-    assert pf.next_run_date() == datetime.now(UTC).date() + timedelta(days=1)
+    A literal under a frozen 17:30-PDT clock (#347), not the same expression on
+    both sides: 2026-09-01 UTC + 1, where a local read would give 08-31 + 1."""
+    from datetime import date
+
+    from tests.conftest import EVENING_UTC
+
+    frozen_utc_clock(EVENING_UTC)
+    assert pf.next_run_date() == date(2026, 9, 2)
 
 
 # ── --alert: a pass that does not finish is never silent (issue #355) ─────────

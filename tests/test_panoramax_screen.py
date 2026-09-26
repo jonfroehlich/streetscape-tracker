@@ -50,6 +50,7 @@ from streetscape_metadata_tracker.download_common import (
     tiles_for_bbox,
 )
 from streetscape_metadata_tracker.json_summarizer import generate_provider_screen_summary
+from tests.conftest import EVENING_LOCAL_DATE, EVENING_UTC, EVENING_UTC_DATE
 
 DES_MOINES = (41.5868, -93.6250)
 
@@ -571,7 +572,12 @@ def _screened(rows):
     return {"rows": rows, "tiles": len(rows), "api_requests": len(rows), "empty_tiles": 0}
 
 
-def test_a_screen_writes_the_rows_the_ledger_and_the_artifact(data_dir, conn, monkeypatch):
+def test_a_screen_writes_the_rows_the_ledger_and_the_artifact(
+    data_dir, conn, monkeypatch, pacific_local_zone, frozen_utc_clock
+):
+    # A Pacific evening (#347): the ledger and the screen row are UTC-dated,
+    # the day run-due's budget gate reads, never the local calendar's.
+    frozen_utc_clock(EVENING_UTC)
     register(conn, "Des Moines", lat=DES_MOINES[0], lon=DES_MOINES[1])
     conn.commit()
     city_id = db.get_all_cities(conn)[0].city_id
@@ -604,7 +610,9 @@ def test_a_screen_writes_the_rows_the_ledger_and_the_artifact(data_dir, conn, mo
     # The screen's requests reach the SAME (date, provider) row a collection
     # writes: same host, same IP, same day, so a budget gate that could not see
     # them would under-count our real load by exactly what nobody added.
-    assert db.get_api_usage(conn, date.today(), provider="panoramax") == 113
+    assert db.get_api_usage(conn, EVENING_UTC_DATE, provider="panoramax") == 113
+    assert db.get_api_usage(conn, EVENING_LOCAL_DATE, provider="panoramax") == 0
+    assert [row["screen_date"] for row in stored] == [EVENING_UTC_DATE.isoformat()]
     assert os.path.exists(os.path.join(data_dir, "provider_screen.json.gz"))
 
 
@@ -697,8 +705,9 @@ def test_a_first_ever_screen_finding_nothing_is_recorded_rather_than_refused(
 
 
 def test_a_refusal_reports_the_HOST_exit_code_and_still_charges_what_it_spent(
-    data_dir, conn, monkeypatch
+    data_dir, conn, monkeypatch, pacific_local_zone, frozen_utc_clock
 ):
+    frozen_utc_clock(EVENING_UTC)
     register(conn, "Des Moines", lat=DES_MOINES[0], lon=DES_MOINES[1])
     conn.commit()
 
@@ -716,7 +725,8 @@ def test_a_refusal_reports_the_HOST_exit_code_and_still_charges_what_it_spent(
     assert rc == HOST_EXIT_CODES[HOST_PANORAMAX] == 84
     # A refused pass still sent what it sent, and a ledger that forgot those
     # attempts would let the next process walk back into the same host.
-    assert db.get_api_usage(conn, date.today(), provider="panoramax") == 7
+    assert db.get_api_usage(conn, EVENING_UTC_DATE, provider="panoramax") == 7
+    assert db.get_api_usage(conn, EVENING_LOCAL_DATE, provider="panoramax") == 0
     assert db.get_latest_provider_screen(conn, "panoramax") == []
 
 
@@ -804,8 +814,9 @@ def test_a_WIRED_channels_block_would_pace_the_screen(data_dir):
 
 
 def test_measure_needs_a_positive_screen_first_and_never_writes_to_the_catalog(
-    data_dir, conn, monkeypatch
+    data_dir, conn, monkeypatch, pacific_local_zone, frozen_utc_clock
 ):
+    frozen_utc_clock(EVENING_UTC)
     register(conn, "Des Moines", lat=DES_MOINES[0], lon=DES_MOINES[1])
     conn.commit()
     city_id = db.get_all_cities(conn)[0].city_id
@@ -854,6 +865,9 @@ def test_measure_needs_a_positive_screen_first_and_never_writes_to_the_catalog(
         "the measure prints; folding its exact counts into the upper-bound series "
         "would make one column mean two instruments"
     )
+    # ...but its requests are charged, on the UTC ledger day (#347).
+    assert db.get_api_usage(conn, EVENING_UTC_DATE, provider="panoramax") == 240
+    assert db.get_api_usage(conn, EVENING_LOCAL_DATE, provider="panoramax") == 0
 
 
 def test_regenerate_aggregate_rebuilds_the_screen_artifact_too(data_dir, conn, monkeypatch):

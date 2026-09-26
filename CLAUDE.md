@@ -209,6 +209,7 @@ An in-flight checkpoint is never a cache entry: completeness is the extra check,
 A hit is reconciled with the consumer's own checkpoint (`reconcile_cache_hit`): a newer checkpoint is resumed, an older one discarded, and **the crawl's own entry with failed work is handed back so the resume re-probes it** — a channel never inherits its own holes.
 The lifecycle (loader, marker, reuse accounting, `crawl_store_for`) lives once in `checkpointing.py`; never copy it per provider — the first copies disagreed about what "the same crawl" meant.
 `--refetch-census` opts out; **`--force` stays cache-transparent** (a walk whose tail died must re-finalize for 0, not re-pay the census); a backdated `--run-date` refuses an entry observed after it.
+**A consumer's `run_date` and the marker's `completed_at` are both UTC calendar dates (`clock.snapshot_date_today()`, #347)** — the walk collector's default was the local `date.today()`, so west of UTC an evening walk was refused the entry and re-paid the census; never date a snapshot from a local clock, and `tests/test_clock.py` refuses one on the collection path.
 
 **Provider access, per-IP limits and blocks → [`docs/provider-access.md`](docs/provider-access.md).**
 This is what READ THIS FIRST points at; read it before changing any pacing, retry, concurrency, volume or host decision.

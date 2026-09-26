@@ -37,7 +37,13 @@ from types import SimpleNamespace
 import pytest
 
 from streetscape_metadata_tracker import checkpointing as cp
-from tests.conftest import stamp_census_cache
+from streetscape_metadata_tracker import clock
+from tests.conftest import (
+    EVENING_LOCAL_DATE,
+    EVENING_UTC,
+    EVENING_UTC_DATE,
+    stamp_census_cache,
+)
 
 BBOX = (-121.3011234, 44.0491, -121.2988766, 44.0509)
 CITY = "bend--oregon--united-states"
@@ -515,6 +521,56 @@ def test_an_entry_observed_after_the_snapshot_date_is_refused_but_kept(tmp_path,
     assert os.path.isdir(cache_path), "refused for this date, kept for the others"
     assert cp.load_census_cache_marker(cache_path, run_date=finished.date()) is not None
     assert cp.load_census_cache_marker(cache_path, run_date=None) is not None
+
+
+def test_the_marker_is_stamped_from_the_shared_utc_clock(frozen_utc_clock):
+    """
+    `completed_at` is one side of the #347 comparison, so it must come from the
+    same clock every producer's default `run_date` reads -- a builder with its
+    own `datetime.now` would escape a test's freeze and could drift from it.
+    """
+    frozen_utc_clock(EVENING_UTC)
+    assert _marker()["completed_at"] == EVENING_UTC.isoformat()
+
+
+def test_an_entry_finished_in_a_pacific_evening_is_reused_by_a_walk_dated_that_utc_day(
+    tmp_path, caplog, pacific_local_zone, frozen_utc_clock
+):
+    """
+    Issue #347: a grid crawl that finishes at 17:30 PDT stamps `completed_at`
+    on the NEXT UTC day. A consumer dated by the shared clock is that UTC day
+    and reuses it; the local date the walk collector used to default to is a
+    day earlier and is refused -- the re-paid census the issue measured.
+    """
+    frozen_utc_clock(EVENING_UTC)
+    cache_path = _promoted(
+        tmp_path, crawl_started_at=(EVENING_UTC - timedelta(hours=1)).isoformat()
+    )
+
+    assert cp.load_census_cache_marker(cache_path, run_date=clock.snapshot_date_today()) is not None
+
+    # What the old local default produced: refused, and kept for the right date.
+    with caplog.at_level("WARNING"):
+        assert cp.load_census_cache_marker(cache_path, run_date=EVENING_LOCAL_DATE) is None
+    assert "after that date" in caplog.text
+    assert "(both dates UTC)" in caplog.text
+    assert os.path.isdir(cache_path)
+    assert cp.load_census_cache_marker(cache_path, run_date=EVENING_UTC_DATE) is not None
+
+
+def test_a_non_date_run_date_is_refused_at_construction(tmp_path):
+    """
+    The guard compares `run_date` against a `date`; a str (or a datetime) would
+    raise TypeError out of `load_census_cache_marker`, whose contract is that
+    it never raises -- so the wrong type is refused where it is built.
+    """
+    path = str(tmp_path / "cache")
+    with pytest.raises(TypeError, match="run_date"):
+        cp.CensusCache(path, True, "2026-07-08")
+    with pytest.raises(TypeError, match="run_date"):
+        cp.CensusCache(path, True, datetime(2026, 7, 8, tzinfo=UTC))
+    assert cp.CensusCache(path, True, date(2026, 7, 8)).run_date == date(2026, 7, 8)
+    assert cp.CensusCache(path).run_date is None
 
 
 # ── The shared loader skeleton: the providers plug in two checks ───────────
