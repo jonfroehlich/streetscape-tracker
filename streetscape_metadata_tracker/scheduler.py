@@ -11,7 +11,7 @@ selection is ordered stalest-first).
 Usage (--config accepted on either side of the subcommand):
     python -m streetscape_metadata_tracker.scheduler [--config PATH] status
     python -m streetscape_metadata_tracker.scheduler [--config PATH] assign
-    python -m streetscape_metadata_tracker.scheduler [--config PATH] run-due [--dry-run] [--limit N] [--provider CHANNEL]
+    python -m streetscape_metadata_tracker.scheduler [--config PATH] run-due [--dry-run] [--limit N] [--provider CHANNEL] [--city CITY]...
     python -m streetscape_metadata_tracker.scheduler [--config PATH] regenerate-aggregate [--publish]
     python -m streetscape_metadata_tracker.scheduler [--config PATH] reconcile-walks [--date D] [--dry-run]
     python -m streetscape_metadata_tracker.scheduler [--config PATH] import-bundle DIR [--execute] [--enable]
@@ -30,6 +30,7 @@ import json
 import logging
 import logging.handlers
 import os
+import shlex
 import signal
 import socket
 import sqlite3
@@ -867,6 +868,12 @@ class SchedulerConfig:
     # [paths]
     data_dir: str = str(_PROJECT_ROOT / "data")
     db_path: str = ""
+    # The file this config was loaded from (absolute), or None for a config
+    # built in code or defaulted because the file was missing. The STRANDED
+    # alert prints it as `--config`, so its recovery command runs against the
+    # same catalog, budgets and publish settings the night did -- the repo
+    # default TOML diverges materially from production's (issue #362).
+    config_path: str | None = None
     log_dir: str = str(_PROJECT_ROOT / "logs")
     # Dated catalog backups (issue #145). Its own directory rather than log_dir:
     # that tree is size-rotated, and a backup that ages out with the logs is not
@@ -1263,6 +1270,7 @@ def load_scheduler_config(path: str | None = None) -> SchedulerConfig:
             )
 
     return SchedulerConfig(
+        config_path=str(config_path.absolute()),
         cycle_days=sched.get("cycle_days", 90),
         grace_days=sched.get("grace_days", 7),
         daily_request_budget=sched.get("daily_request_budget", 10_000_000),
@@ -8264,22 +8272,78 @@ def _blocked_alert_note(breaker: HostBreaker) -> str:
     return note
 
 
-def _stranded_alert_note(cfg: SchedulerConfig, breaker: HostBreaker) -> str:
-    """The [alerts] paragraph naming the cities the breaker stranded, or empty."""
+def _recovery_command(
+    cfg: SchedulerConfig, channels: Sequence[str], city_ids: Sequence[str]
+) -> str:
+    """The pasteable ``run-due`` that walks exactly these cities on these channels (#362).
+
+    Every argument goes through ``shlex.quote``: ``sanitize_city_query_str``
+    keeps apostrophes, so ``coeur-d'alene--idaho--united-states`` is a real
+    ``city_id`` and an unquoted paste would open a quotation the shell never
+    closes. A plain slug quotes to itself, so the common case reads clean.
+    ``--config`` goes BEFORE the subcommand, as the systemd unit writes it.
+    No ``--limit``: a ``--city`` list is its own cap (#371).
+
+    Example::
+
+        python -m streetscape_metadata_tracker.scheduler --config /abs/scheduler.toml \\
+            run-due --provider gsv_streets --city salem--oregon--united-states
+    """
+    argv = ["python", "-m", "streetscape_metadata_tracker.scheduler"]
+    if cfg.config_path:
+        argv += ["--config", cfg.config_path]
+    argv += ["run-due", "--provider", ",".join(channels)]
+    for cid in city_ids:
+        argv += ["--city", cid]
+    return " ".join(shlex.quote(a) for a in argv)
+
+
+def _stranded_alert_note(cfg: SchedulerConfig, breaker: HostBreaker, today: date) -> str:
+    """The [alerts] paragraph naming the cities the breaker stranded, or empty.
+
+    It ends with one pasteable recovery command per EXACT set of lost channels,
+    each naming its cities with ``--city``. Two alternatives were wrong:
+
+    - ``run-due --provider <walk> --limit N`` (what this printed before #362)
+      walks the channel's STALEST-DUE cities, and a stranded city sits behind
+      every never-collected one: on 2026-09-22 none of 8 stranded cities was in
+      the first 10 of any walk channel, and Austin's ~640k-request walk led
+      ``gsv_streets``. It spent real budget and walked none of them.
+    - One combined command for every channel and city: a city stranded on
+      ``gsv_streets`` alone because its ``mapillary`` GRID failed tonight is
+      still due on ``mapillary_streets`` (never attempted), so naming it there
+      would pay a full census for an un-paired walk. Grouping by the exact
+      channel set names each city only where it was stranded.
+
+    A walk is dated the UTC date its command starts, so run the same UTC day
+    (``today``) it keeps the grid run's date and the pair survives.
+    """
     if not breaker.stranded:
         return ""
     lines = [f"{cid} ({', '.join(channels)})" for cid, channels in breaker.stranded.items()]
-    channels = sorted({c for chans in breaker.stranded.values() for c in chans})
-    per_channel = " or ".join(f"`scheduler run-due --provider {c} --limit N`" for c in channels)
+    groups: dict[tuple[str, ...], list[str]] = {}
+    for cid, channels in breaker.stranded.items():
+        groups.setdefault(tuple(sorted(set(channels))), []).append(cid)
+    commands = [
+        _recovery_command(cfg, channels, sorted(cids)) for channels, cids in sorted(groups.items())
+    ]
     return (
         f"{len(breaker.stranded)} city(ies) came out of the night with a grid run but NO road "
         f"walk, because a refused or locally busy host cost them the walk while the grid "
         f"sibling succeeded. "
         f"Each is not due on the grid channel again for ~{cfg.cycle_days - cfg.grace_days} days, "
         f"so nothing re-pairs it and it reaches a capped night only through the bounded "
-        f"[schedule].opt_in_cities_per_day reservation (issue #341). Walk them by hand once the "
-        f"host is confirmed serving this IP — {per_channel} — accepting that the walk will carry "
-        f"a later date than the grid run:\n  " + "\n  ".join(lines)
+        f"[schedule].opt_in_cities_per_day reservation (issue #341):\n  "
+        + "\n  ".join(lines)
+        + "\n"
+        f"Once the host is confirmed serving this IP, walk EXACTLY these cities with the "
+        f"command(s) below from the project root with the scheduler's venv active, pasted as "
+        f"printed, one after another and never in parallel (every "
+        f"walk shares the Overpass host lock, so a second concurrent one exits busy and skips); "
+        f"append --dry-run to preview. A walk is dated the UTC day its command starts: started "
+        f"on {today.isoformat()} (UTC) the walks share the grid runs' date and each pair is "
+        f"kept, from the next UTC day they carry a later one. A bare `--limit N` would walk the "
+        f"stalest-due queue instead, not these cities (issue #362).\n" + "\n".join(commands)
     )
 
 
@@ -8449,7 +8513,7 @@ def _finish_batch(
     # thing in the tail that must never degrade quietly.
     blocked_hosts = _as_breaker(blocked_hosts)
     blocked_note = _blocked_alert_note(blocked_hosts)
-    stranded_note = _stranded_alert_note(cfg, blocked_hosts)
+    stranded_note = _stranded_alert_note(cfg, blocked_hosts, today)
 
     busy_hosts = busy_hosts or Counter()
     busy_note = (
