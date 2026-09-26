@@ -501,7 +501,7 @@ Two things, both on the same IP and serialized against each other by one machine
   It is paced and jittered identically to a collection, from the same constants.
   **It now FOLLOWS a config change, and did not before** (#335): `panoramax` was an unwired channel, so `load_scheduler_config` dropped a `[providers.panoramax]` block before `_screen_pacing` could read it and lowering the rate in the TOML left next Monday's screen at 30/min.
   The channel is wired, the block loads, and the screen paces from it — one host, one pace.
-  During a block the lever that stops this host's traffic outright is still the timer (`systemctl --user stop streetscape-screen-provider.timer`), plus `enabled = false` on both channel blocks.
+  During a block the lever that stops this host's traffic outright is still the timer (`systemctl --user disable --now streetscape-screen-provider.timer` — `disable`, not `stop`, which the #369 watchdog re-arms within a day), plus `enabled = false` on both channel blocks.
 
 Its requests land in the same `(date, provider)` ledger row a collection writes, so a budget gate reading `api_usage` sees the real total rather than the collection's share of it.
 

@@ -17,6 +17,7 @@ Usage (--config accepted on either side of the subcommand):
     python -m streetscape_metadata_tracker.scheduler [--config PATH] import-bundle DIR [--execute] [--enable]
     python -m streetscape_metadata_tracker.scheduler [--config PATH] fetch-driving-plan [--force] [--from-file P --date D]
     python -m streetscape_metadata_tracker.scheduler [--config PATH] backup-status
+    python -m streetscape_metadata_tracker.scheduler [--config PATH] timer-status [--rearm] [--alert] [--wait-s N]
     python -m streetscape_metadata_tracker.scheduler [--config PATH] restore-backup PATH [--to DEST]
 
 Config: TOML (see config/scheduler.toml). Requires Python 3.11+ (tomllib).
@@ -29,6 +30,7 @@ import gzip
 import json
 import logging
 import logging.handlers
+import math
 import os
 import signal
 import socket
@@ -59,6 +61,7 @@ from . import (
     download_panoramax,
     driving_plan,
     panoramax_screen,
+    user_timers,
 )
 from .alerting import AlertConfig, send_alert, should_alert
 from .checkpointing import (
@@ -848,6 +851,12 @@ class SchedulerConfig:
     # grace_days` (83 days on prod). A "refresh" here is a city at the same
     # staleness wall as every other due city, competing for the same slot.
     refresh_slots: int | None = None
+    # The crossed watchdog (issue #369): `backup-status` goes unhealthy when the
+    # cron timer-watchdog's heartbeat (`user_timers.HEARTBEAT_FILENAME` under
+    # log_dir) is missing or older than this many hours. Cron catches dead
+    # timers; the backup-check timer catches a dead cron. 0 = off, so a laptop
+    # and the repo default are unchanged; prod sets 48.
+    timer_watchdog_max_age_h: float = 0.0
     # [download]
     batch_size: int = 100
     connection_limit: int = 50
@@ -1274,6 +1283,7 @@ def load_scheduler_config(path: str | None = None) -> SchedulerConfig:
         max_batch_hours=sched.get("max_batch_hours", 10.0),
         max_concurrent_channels=_lane_count(sched, config_path),
         refresh_slots=_refresh_slots(sched, config_path),
+        timer_watchdog_max_age_h=float(sched.get("timer_watchdog_max_age_h", 0.0)),
         batch_size=dl.get("batch_size", 100),
         connection_limit=dl.get("connection_limit", 50),
         request_timeout_s=dl.get("request_timeout_s", 30.0),
@@ -4041,7 +4051,8 @@ def _screen_pacing(cfg: SchedulerConfig, provider: str) -> tuple[int, float]:
     host and one IP, which is the whole point — so the screen and the nightly
     channels cannot be paced apart without saying so here. And the timer is
     still the harder lever when the answer is "stop talking to this host at
-    all": ``systemctl --user stop streetscape-screen-provider.timer``.
+    all": ``systemctl --user disable --now streetscape-screen-provider.timer``
+    (``stop`` alone is undone by the #369 watchdog's daily re-arm).
     """
     rate = panoramax_screen.DEFAULT_TILE_REQUESTS_PER_MINUTE
     jitter = panoramax_screen.DEFAULT_TILE_JITTER
@@ -4376,10 +4387,38 @@ def cmd_backup_status(cfg: SchedulerConfig, *, alert: bool = False) -> int:
         )
         out.append(f"  {'':22s} {asset.path}")
 
+    # The crossed gate (issue #369). On 2026-09-23 this check's own timer came
+    # back inactive after a reboot along with every other user timer, so it
+    # could not report that. The cron watchdog re-arms them and writes a
+    # heartbeat; this check, from a timer, reports when that heartbeat stops.
+    watchdog_ok = True
+    watchdog_age: float | None = None
+    if cfg.timer_watchdog_max_age_h > 0:
+        watchdog_age = user_timers.heartbeat_age_hours(cfg.log_dir, datetime.now(UTC))
+        beat = user_timers.read_heartbeat(cfg.log_dir) or {}
+        out.append("")
+        if watchdog_age is None:
+            watchdog_ok = False
+            out.append(
+                "Timer watchdog (issue #369): NEVER RAN — no readable "
+                f"{user_timers.heartbeat_path(cfg.log_dir)}. Is the crontab installed?"
+            )
+        else:
+            watchdog_ok = watchdog_age <= cfg.timer_watchdog_max_age_h
+            word = "ok" if watchdog_ok else "STALE"
+            out.append(
+                f"Timer watchdog (issue #369): last ran {watchdog_age:,.1f} h ago — {word} "
+                f"(limit {cfg.timer_watchdog_max_age_h:g} h; its verdict then: "
+                f"{beat.get('verdict', 'unknown')})"
+            )
+            if not watchdog_ok:
+                out.append("  Is cron still running user jobs on this host? (crontab -l)")
+
     report = "\n".join(out)
     print(report)
 
-    healthy = st.exists and st.file_count > 0 and not st.stale and bool(last and last.get("ok"))
+    backups_ok = st.exists and st.file_count > 0 and not st.stale and bool(last and last.get("ok"))
+    healthy = backups_ok and watchdog_ok
     if alert and not healthy:
         # Name the reason in the subject: the whole point of the out-of-band
         # check is the case where nobody is reading anything but the subject
@@ -4389,15 +4428,132 @@ def cmd_backup_status(cfg: SchedulerConfig, *, alert: bool = False) -> int:
             why = "NO BACKUPS"
         elif st.stale:
             why = f"STALE ({st.age_hours:,.0f} h old)"
-        else:
+        elif not backups_ok:
             why = "last attempt FAILED"
+        elif watchdog_age is None:
+            why = "timer watchdog NEVER RAN"
+        else:
+            why = f"timer watchdog STALE ({watchdog_age:,.0f} h)"
+        # The subject's head names what is actually wrong: a healthy backup
+        # series with a dead watchdog is not a "catalog backup" problem.
+        head = "catalog backup unhealthy" if not backups_ok else "out-of-band check unhealthy"
         send_alert(
             cfg.alerts,
-            f"catalog backup unhealthy on {socket.gethostname()} — {why}",
+            f"{head} on {socket.gethostname()} — {why}",
             "The out-of-band catalog-backup check (issue #193) found an unhealthy "
             "state.\n\n" + report,
         )
     return 0 if healthy else 1
+
+
+def cmd_timer_status(
+    cfg: SchedulerConfig,
+    *,
+    rearm: bool = False,
+    alert: bool = False,
+    wait_s: float = 0.0,
+    poll_s: float = user_timers.DEFAULT_POLL_S,
+    run: user_timers.Runner | None = None,
+    hostname: str | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+    now: datetime | None = None,
+) -> int:
+    """
+    Check the scheduler's user timers are armed; optionally re-arm and alert (#369).
+
+    After the 2026-09-23 reboot every user timer came back ``enabled`` but
+    ``inactive`` and nothing noticed, because the only watchdog (#193) runs from
+    one of those timers. This is run by a user CRONTAB (``deploy/cron/``) — on
+    local disk, so it survives the NFS-home mount race the timers did not — at
+    ``@reboot`` with ``wait_s`` (the manager and the unit files may not be up
+    yet) and daily with none.
+
+    A DISABLED or MASKED timer is an operator's pause and is reported, never
+    started; an enabled one that is inactive (or not loaded at all) is the #369
+    shape. ``rearm`` runs ``daemon-reload`` once and then ``start`` for each
+    such timer, and trusts only the re-read state afterwards.
+
+    Exit 0 when the manager answered and every non-paused timer is active at
+    the end — a successful re-arm included — else 1; 64 on a bad
+    ``wait_s``/``poll_s``. ``alert`` never changes it, and mails when the
+    verdict is unhealthy OR something was re-armed: a re-arm means a reboot (or
+    similar) happened, and the night before it may sit unpublished.
+
+    On a host that does not match the collection unit's ``ConditionHost=`` it
+    does nothing at all (makelab1 shares the NFS home but has no linger), and
+    every run that reaches the check writes the heartbeat ``backup-status``
+    gates on, the give-up path included — the heartbeat measures whether CRON
+    runs, not whether the timers do.
+    """
+    # isfinite first: `nan < 0` is False, so NaN (or inf) would slip past the
+    # range check and make the wait loop unbounded.
+    if not (math.isfinite(wait_s) and math.isfinite(poll_s)) or wait_s < 0 or poll_s <= 0:
+        print(f"--wait-s must be >= 0 and --poll-s > 0 (got {wait_s:g}, {poll_s:g})")
+        return USAGE_EXIT_CODE
+    run = run or user_timers.run_systemctl
+    host = hostname or socket.gethostname()
+
+    try:
+        glob = user_timers.active_host_glob(user_timers.DEFAULT_UNIT_DIR)
+        names = user_timers.shipped_timers(user_timers.DEFAULT_UNIT_DIR)
+    except (OSError, ValueError) as e:
+        print(f"timer-status: {e}")
+        return 1
+    if not user_timers.is_active_host(host, glob):
+        print(f"{host} is not the active host (ConditionHost={glob}) — nothing to do")
+        return 0
+
+    reachable, visible, waited = user_timers.wait_for_manager(
+        run,
+        names,
+        wait_s=wait_s,
+        poll_s=poll_s,
+        sleep=sleep,
+        clock=clock,
+        user_unit_dir=user_timers.USER_UNIT_DIR,
+    )
+    if reachable and visible:
+        result = user_timers.check_and_rearm(run, names, rearm=rearm)
+    else:
+        result = user_timers.WatchdogResult()
+    result.reachable, result.files_visible = reachable, visible
+    result.waited_s, result.wait_budget_s = waited, wait_s
+
+    out = [f"User timers on {host} (issue #369):"]
+    for s in result.states:
+        rearmed = " (re-armed)" if s.name in result.rearmed else ""
+        out.append(f"  {s.name:40s} {s.word}{rearmed}  next: {s.next_elapse or '-'}")
+    if not reachable:
+        out.append("  the user manager did not answer (loginctl show-user $USER -p Linger)")
+    elif not visible:
+        out.append(
+            f"  unit files not visible under {user_timers.USER_UNIT_DIR} (is the home mounted?)"
+        )
+    out.append(f"Verdict: {result.verdict}")
+    report = "\n".join(out)
+    print(report)
+
+    when = now or datetime.now(UTC)
+    try:
+        path = user_timers.write_heartbeat(cfg.log_dir, result, host=host, now=when)
+        print(f"heartbeat: {path}")
+    except OSError as e:
+        # Still alert and exit on the check itself; backup-status will report
+        # the missing heartbeat on its own.
+        print(f"heartbeat NOT written: {e}")
+
+    if alert and (not result.healthy or result.rearmed):
+        send_alert(
+            cfg.alerts,
+            f"user timers on {host} — {result.verdict}",
+            "The user-timer watchdog (issue #369) found or fixed something.\n\n"
+            + report
+            + "\n\nAfter a REARMED mail, check whether the night before published "
+            "(regenerate-aggregate --publish recovers it). See deploy/README.md, "
+            '"After a reboot: the timer watchdog".',
+        )
+    return 0 if result.healthy else 1
 
 
 def cmd_restore_backup(cfg: SchedulerConfig, backup_path: str, dest: str | None) -> int:
@@ -8845,6 +9001,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="Also email the report via [alerts] when unhealthy (for the "
         "out-of-band monitor timer, issue #193). Exit status is unchanged.",
     )
+    p_timers = sub.add_parser(
+        "timer-status",
+        help="Check the user timers are armed, re-arm them, alert (issue #369)",
+    )
+    _add_global_flags(p_timers)
+    p_timers.add_argument(
+        "--rearm",
+        action="store_true",
+        help="daemon-reload once and start every enabled-but-inactive timer. A DISABLED "
+        "timer is a deliberate pause and is never started.",
+    )
+    p_timers.add_argument(
+        "--alert",
+        action="store_true",
+        help="Email via [alerts] when unhealthy or when anything was re-armed. Exit "
+        "status is unchanged.",
+    )
+    p_timers.add_argument(
+        "--wait-s",
+        type=float,
+        default=0.0,
+        help="Poll up to this many seconds for the user manager and the unit files "
+        "(the @reboot line; default 0 = one check).",
+    )
+    p_timers.add_argument(
+        "--poll-s",
+        type=float,
+        default=user_timers.DEFAULT_POLL_S,
+        help=f"Seconds between polls under --wait-s (default {user_timers.DEFAULT_POLL_S:g}).",
+    )
     p_restore = sub.add_parser(
         "restore-backup", help="Restore a dated catalog backup (refuses to clobber a live catalog)"
     )
@@ -8898,6 +9084,10 @@ def main() -> int:
         )
     if args.command == "backup-status":
         return cmd_backup_status(cfg, alert=args.alert)
+    if args.command == "timer-status":
+        return cmd_timer_status(
+            cfg, rearm=args.rearm, alert=args.alert, wait_s=args.wait_s, poll_s=args.poll_s
+        )
     if args.command == "restore-backup":
         return cmd_restore_backup(cfg, args.backup_path, args.dest)
     if args.command == "reconcile-walks":
