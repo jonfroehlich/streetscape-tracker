@@ -9984,7 +9984,7 @@ def _run_channels(sched, cfg, conn, city, providers, **overrides):
         blocked_hosts=sched.HostBreaker(),
         busy_hosts=Counter(),
         deferred_channels=Counter(),
-        rejected_argv=Counter(),
+        rejected_argv=sched.ArgvRejections(),
         batch_deadline=None,
         stop_requested=None,
     )
@@ -11709,7 +11709,7 @@ def test_the_done_line_counts_and_the_alert_names_the_stranded_cities(conn, monk
 
     assert rc == 1
     done = [r.message for r in caplog.records if r.message.startswith("Done: ")]
-    assert done and "2 city(ies) STRANDED un-walked by the breaker" in done[0]
+    assert done and "2 city(ies) STRANDED un-walked" in done[0]
     ((subject, body),) = alerts
     assert "1 host(s) UNAVAILABLE" in subject, "never recovered: still latched"
     assert "2 city(ies) STRANDED un-walked" in subject
@@ -11779,7 +11779,9 @@ def test_a_busy_host_strands_a_city_exactly_like_a_refusal(conn, monkeypatch, ca
 
     assert rc == 1
     done = [r.message for r in caplog.records if r.message.startswith("Done: ")]
-    assert done and "1 city(ies) STRANDED un-walked by the breaker" in done[0]
+    assert done and "1 city(ies) STRANDED un-walked" in done[0]
+    # Not "by the breaker": a busy host and a rejected argv strand a city too (#359).
+    assert "by the breaker" not in done[0]
     ((subject, body),) = alerts
     assert "SKIPPED (host busy)" in subject
     assert "1 city(ies) STRANDED un-walked" in subject
@@ -12715,13 +12717,27 @@ def test_the_subprocess_outcome_names_an_argv_rejection_and_quotes_the_argv(monk
     )
     cfg = _street_cfg(publish_enabled=False)
     cfg.log_dir = str(tmp_path)
-    cmd = [sys.executable, "x.py", "--connection-limit", "150"]
+    secret = "SECRETKEY_abcdef123456"
+    cmd = [sys.executable, "x.py", "--connection-limit", "150", "--api-key", secret]
 
-    monkeypatch.setattr(subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 2))
+    def rejected(*a, stdout=None, **k):
+        # What argparse writes before it exits 2: usage, then `prog: error: ...`.
+        stdout.write("usage: x.py [-h]\n")
+        stdout.write("x.py: error: argument --connection-limit: invalid choice\n")
+        return subprocess.CompletedProcess(a, 2)
+
+    monkeypatch.setattr(sched, "redact_credentials", lambda s: s.replace(secret, "[REDACTED]"))
+    monkeypatch.setattr(subprocess, "run", rejected)
     outcome = sched._run_collection_subprocess(cfg, cmd, 60, city, "gsv", date(2026, 7, 2))
     assert outcome.exit_code == 2
     assert "our own CLI rejected" in outcome.reason
     assert "--connection-limit 150" in outcome.reason
+    # The argv is quoted into a reason that reaches the catalog and the alert
+    # mail, so it goes through the same redaction the child log header does.
+    assert secret not in outcome.reason
+    assert "[REDACTED]" in outcome.reason
+    # The parser's own message names the flag; the alert quotes it per rejection.
+    assert "x.py: error: argument --connection-limit: invalid choice" in outcome.reason
 
     monkeypatch.setattr(subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 1))
     outcome = sched._run_collection_subprocess(cfg, cmd, 60, city, "gsv", date(2026, 7, 2))
@@ -12740,6 +12756,54 @@ def test_the_done_line_counts_argv_rejections_per_channel(conn, monkeypatch, cap
 
     done = [r.message for r in caplog.records if r.message.startswith("Done: ")]
     assert done and "1 launch(es) REJECTED by our own CLI (mapillary)" in done[0]
+
+
+def test_the_alert_names_each_argv_rejection_rather_than_pointing_into_the_log_tail(
+    conn, monkeypatch
+):
+    """The [alerts] mail quotes only the scheduler log's last lines, and on a full
+    night the `exited 2` lines have scrolled out of it -- so the note itself must
+    name the city, the channel and the reason (argv, parser error, child log)."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    bend = _register(conn, "Bend", width=1000, height=1000, step=20)
+    corvallis = _register(conn, "Corvallis", width=1000, height=1000, step=20)
+
+    def run_one(city, provider):
+        if provider == "mapillary":
+            return sched.CollectionOutcome(
+                False,
+                f"exited 2 (argv: x.py {city.city_id}); x.py: error: bad flag "
+                f"(see collect_{city.city_id}_mapillary_2026-07-02.log)",
+                exit_code=2,
+            )
+        return True
+
+    cfg = _street_cfg(publish_enabled=False, alerts=AlertConfig(enabled=True, failure_threshold=99))
+    rc, alerts = _drive_night(monkeypatch, conn, cfg, run_one)
+
+    assert rc == 1
+    ((_subject, body),) = alerts
+    for cid in (bend, corvallis):
+        assert (
+            f"{cid} [mapillary]: exited 2 (argv: x.py {cid}); x.py: error: bad flag "
+            f"(see collect_{cid}_mapillary_2026-07-02.log)"
+        ) in body
+
+
+def test_the_argv_rejection_list_is_capped_and_says_how_many_it_left_out():
+    from streetscape_metadata_tracker import scheduler as sched
+
+    rejected = sched.ArgvRejections()
+    for i in range(sched._ARGV_REJECTIONS_LISTED + 3):
+        rejected.record(f"city-{i}", "gsv", f"reason-{i}")
+
+    note = sched._rejected_argv_alert_note(rejected)
+    assert rejected["gsv"] == sched._ARGV_REJECTIONS_LISTED + 3
+    assert f"city-{sched._ARGV_REJECTIONS_LISTED - 1} [gsv]" in note
+    assert f"city-{sched._ARGV_REJECTIONS_LISTED} [gsv]" not in note
+    assert "... and 3 more" in note
+    assert sched._rejected_argv_alert_note(sched.ArgvRejections()) == ""
 
 
 def test_a_rejected_walk_strands_its_city_exactly_like_a_busy_skip(conn, monkeypatch):

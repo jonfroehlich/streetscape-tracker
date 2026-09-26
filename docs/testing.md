@@ -71,7 +71,7 @@ Incidental coverage of a deprecated spelling trains readers to ignore the notice
 
 ## GSV downloaders, and the history harvester
 
-- `--connection-limit` above `--batch-size` (issue #359, `tests/test_cli_policy.py`): clamped to the batch with a stderr warning and the run proceeds (the downloader receives the batch size), rather than an argparse exit 2; a limit below the batch passes through unwarned, so the clamp is one-directional
+- `--connection-limit` above `--batch-size` (issue #359, `tests/test_cli_policy.py`): clamped to the batch with a stderr warning and the run proceeds (the downloader receives the batch size), rather than an argparse exit 2; a limit below the batch passes through unwarned, so the clamp is one-directional; `tests/test_run_cities.py` pins the same clamp in `run_cities.py`'s parser, which forwards both flags and must not refuse an argv the child accepts
 - GSV history harvester (response parsing, dated-only filter, cross-grid dedup, circuit breaker, resume — endpoint mocked)
 - GSV batch downloader's quota-throttling behavior (OVER_QUERY_LIMIT retry, sub-threshold residual written back as a failure row, over-threshold abort
   — the `fetch_gsv_pano_metadata_async` primitive is monkeypatched to serve responses from memory)
@@ -424,7 +424,8 @@ and the **per-writer staging name** — that two pids derive different paths, th
   the night alerts below the failure threshold, exits 1 and still publishes, under a `REJECTED by our own CLI` subject that claims neither a refusal nor a busy host, with `NO city was marked failed` and the channel in the body;
   the `Done:` line counts rejections per channel (so the counter is threaded back out of `_run_city_loop`);
   the next city's same channel is still asked (not a breaker);
-  `_run_collection_subprocess` names a 2 and quotes the argv in the reason while a 1 does neither;
+  `_run_collection_subprocess` names a 2 and quotes the argv in the reason while a 1 does neither, REDACTS a credential in that argv (the reason reaches the catalog and the mail), and lifts the parser's `prog: error:` line out of the child-log tail;
+  the alert names each rejection by city, channel and reason with the recent-log tail stubbed empty (so the note, not the tail, carries it), and `_rejected_argv_alert_note` caps its list at `_ARGV_REJECTIONS_LISTED` and counts the rest;
   and a rejected walk whose grid sibling landed is STRANDED, with the `run-due --provider gsv_streets --limit N` recovery in the alert.
 - The breaker's cooldown re-check (issue #341, `tests/test_scheduler.py` and `tests/test_overpass_reset_probe.py`): a refusal that clears inside the cooldown resumes street channels **the same night**, pinned as the exact launch sequence across three cities with the cooldown at 0 and a probe answering *no, no, yes*
   — and as one probe call per re-check, none once recovered;

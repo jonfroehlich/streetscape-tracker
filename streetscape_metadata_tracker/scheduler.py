@@ -438,6 +438,41 @@ class HostBreaker(set):
             )
 
 
+class ArgvRejections(Counter):
+    """
+    Launches our own CLI refused at parse time tonight (issue #359).
+
+    A ``Counter`` of channel -> launches, so ``bool()``, ``sum(values())`` and
+    ``sorted()`` read exactly as the other per-channel counters do. What it adds
+    is ``rejections``: one ``(city_id, provider, reason)`` per launch, in launch
+    order, where ``reason`` is the outcome's own -- the redacted argv, the
+    parser's ``error:`` line when the log tail had one, and the child log's name.
+
+    The per-channel count alone could not answer the alert's one question --
+    WHICH flag, for WHICH city -- because the [alerts] mail quotes only the last
+    ``_BATCH_LOG_TAIL_LINES`` of the scheduler log, and on a 40-city night the
+    ``exited 2`` lines have usually scrolled out of it by the time the tail is
+    read. So the alert names each rejection itself, as it does a stranded city.
+
+    Record with ``record(city_id, provider, reason)``; plain ``c[p] += 1`` would
+    count a rejection the alert then cannot name.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.rejections: list[tuple[str, str, str | None]] = []
+
+    def record(self, city_id: str, provider: str, reason: str | None) -> None:
+        self[provider] += 1
+        self.rejections.append((city_id, provider, reason))
+
+
+# How many rejections the alert names one by one. Every one of them is usually
+# the SAME contradiction (one config key, every city), so the first few name it;
+# a whole night's worth would bury the rest of the mail.
+_ARGV_REJECTIONS_LISTED = 10
+
+
 def _walk_network_is_frozen(cfg: "SchedulerConfig", city: db.CityRow, provider: str) -> bool:
     """
     True when this street channel's walk of ``city`` would never contact Overpass.
@@ -5176,7 +5211,7 @@ def cmd_assess_city(
     # Launches our own CLI refused at parse time (issue #359). record_failures
     # is False here anyway, so this is about the ANSWER, not the counter: a
     # rejected channel beside a collected one would otherwise score 1/1.
-    rejected_argv: Counter[str] = Counter()
+    rejected_argv = ArgvRejections()
     attempted, succeeded, skipped_budget = _run_city_channels(
         cfg,
         conn,
@@ -5663,6 +5698,15 @@ def _run_collection_subprocess(
         why = f"timed out after {timeout_s // 60} minutes"
 
     tail = _tail_lines(log_path, _CHILD_LOG_TAIL_LINES)
+    if exit_code == ARGV_REJECTED_EXIT_CODE:
+        # The parser names the offending flag on its last `prog: error: ...`
+        # line. Carried in the reason so the alert can quote it per rejection
+        # without the operator opening the child log (issue #359).
+        parser_error = next(
+            (ln.strip() for ln in reversed(tail.splitlines()) if ": error: " in ln), None
+        )
+        if parser_error:
+            why += f"; {parser_error}"
     message = f"{city.city_id} [{provider}]: {why}; full output in {log_path}"
     if tail:
         message += f"\n--- last {_CHILD_LOG_TAIL_LINES} lines of {log_path.name} ---\n{tail}"
@@ -7119,7 +7163,7 @@ def cmd_run_due(
         # stranded city has no route back for ~83 days, and "1 host(s)
         # UNAVAILABLE" said nothing about that on the two nights it cost 20.
         + (
-            f"; {len(blocked_hosts.stranded)} city(ies) STRANDED un-walked by the breaker"
+            f"; {len(blocked_hosts.stranded)} city(ies) STRANDED un-walked"
             if blocked_hosts.stranded
             else ""
         )
@@ -7314,7 +7358,7 @@ def _run_city_channels(
     blocked_hosts: HostBreaker,
     busy_hosts: Counter[str],
     deferred_channels: Counter[str],
-    rejected_argv: Counter[str],
+    rejected_argv: ArgvRejections,
     batch_deadline: float | None,
     stop_requested: threading.Event | None,
     record_failures: bool = True,
@@ -7953,7 +7997,7 @@ def _run_city_channels(
                         # No salvage: a parse error happens before the child opens
                         # the catalog or writes a file, so there is never an orphan
                         # to reconcile.
-                        rejected_argv[provider] += 1
+                        rejected_argv.record(city.city_id, provider, reason)
                         # A rejected walk strands its city exactly as a busy skip
                         # does: the grid sibling lands, the walk does not, and the
                         # city is not gsv-due for ~83 days.
@@ -8125,7 +8169,7 @@ def _run_city_loop(
     batch_deadline: float,
     sigterm_seen: threading.Event,
     max_cities: int,
-) -> tuple[int, int, int, int, str | None, set[str], Counter[str], Counter[str], Counter[str]]:
+) -> tuple[int, int, int, int, str | None, HostBreaker, Counter[str], Counter[str], ArgvRejections]:
     """Collect due cities until the city cap, the batch deadline, or SIGTERM.
 
     ``sigterm_seen`` is both checked here (between cities) and forwarded to
@@ -8172,7 +8216,7 @@ def _run_city_loop(
     blocked_hosts = HostBreaker()
     busy_hosts: Counter[str] = Counter()
     deferred_channels: Counter[str] = Counter()
-    rejected_argv: Counter[str] = Counter()
+    rejected_argv = ArgvRejections()
     try:
         for city in due:
             if processed >= max_cities:
@@ -8375,6 +8419,36 @@ def _stranded_alert_note(cfg: SchedulerConfig, breaker: HostBreaker) -> str:
     )
 
 
+def _rejected_argv_alert_note(rejected: ArgvRejections) -> str:
+    """The [alerts] paragraph naming each argv our own CLI rejected, or empty.
+
+    Names them one by one, like ``_stranded_alert_note``, rather than pointing
+    into the recent-log tail: the mail quotes only the scheduler log's last
+    ``_BATCH_LOG_TAIL_LINES``, and on a full night the ``exited 2`` lines have
+    usually scrolled out of it (issue #359). Each line is the outcome's own
+    reason -- the redacted argv, the parser's ``error:`` line when the child's
+    log tail had one, and the child log's name.
+    """
+    if not rejected:
+        return ""
+    shown = rejected.rejections[:_ARGV_REJECTIONS_LISTED]
+    lines = [
+        f"{cid} [{provider}]: {reason or 'no reason recorded'}" for cid, provider, reason in shown
+    ]
+    more = len(rejected.rejections) - len(shown)
+    if more > 0:
+        lines.append(f"... and {more} more (every one is logged as `our own CLI rejected`)")
+    return (
+        f"{sum(rejected.values())} launch(es) on {', '.join(sorted(rejected))} were "
+        "refused by OUR OWN command-line parser before doing any work — the scheduler built an "
+        "argv that streetscape_tracker.py / streetscape_street_analyzer.collect rejected, i.e. "
+        "the config and the CLI disagree (issue #359). NO city was marked failed; they stay due "
+        "and lead tomorrow's queue. Fix the config or the CLI, then re-run; nothing was spent. "
+        "Each rejection, with the argv the scheduler built, the parser's own `error:` line "
+        "naming the flag, and the child log that holds the rest:\n  " + "\n  ".join(lines)
+    )
+
+
 def _finish_batch(
     cfg: SchedulerConfig,
     conn,
@@ -8387,7 +8461,7 @@ def _finish_batch(
     plan_error: str | None = None,
     blocked_hosts: HostBreaker | set[str] | None = None,
     busy_hosts: Counter[str] | None = None,
-    rejected_argv: Counter[str] | None = None,
+    rejected_argv: ArgvRejections | None = None,
 ) -> int:
     """Rebuild the published indexes, back up the catalog, publish, alert.
 
@@ -8567,18 +8641,8 @@ def _finish_batch(
         else ""
     )
 
-    rejected_argv = rejected_argv or Counter()
-    rejected_note = (
-        f"{sum(rejected_argv.values())} launch(es) on {', '.join(sorted(rejected_argv))} were "
-        "refused by OUR OWN command-line parser before doing any work — the scheduler built an "
-        "argv that streetscape_tracker.py / streetscape_street_analyzer.collect rejected, i.e. "
-        "the config and the CLI disagree (issue #359). NO city was marked failed; they stay due "
-        "and lead tomorrow's queue. The parser's own message names the flag: read the `error:` "
-        "line in the child log tail quoted in the recent log below, and the argv on the "
-        "`exited 2` line. Fix the config or the CLI, then re-run; nothing was spent."
-        if rejected_argv
-        else ""
-    )
+    rejected_argv = rejected_argv if rejected_argv is not None else ArgvRejections()
+    rejected_note = _rejected_argv_alert_note(rejected_argv)
 
     failures = attempted - succeeded
     unhealthy = (
