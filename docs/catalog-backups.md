@@ -34,6 +34,8 @@ It exits nonzero when the newest copy is missing, **older than `STALE_AFTER_HOUR
 **That exit code needs a caller other than the scheduler** (issue #193): the only thing that would have run it was the process whose absence the age gate detects, so a separate daily user timer (`deploy/systemd/streetscape-backup-check.{service,timer}`, noon Pacific, same `ConditionHost` pin
 — a cutover must flip both) runs `backup-status --alert`, which emails the report through `[alerts]` when unhealthy, stays silent when healthy, names the verdict in the subject, and leaves the exit status alone.
 Deliberately not the `OnFailure=` notify unit: it isn't installed on makelab2 and mails the scheduler log tail rather than the report.
+That timer went down with every other user timer after the 2026-09-23 reboot (issue #369), so `backup-status` also gates on the cron timer-watchdog's heartbeat when `[schedule].timer_watchdog_max_age_h > 0` (48 on prod): cron catches dead timers, and this check catches a dead cron.
+See [the scheduler doc](scheduler.md#the-user-timers-after-a-reboot-issue-369-added-2026-09-26).
 `scheduler restore-backup PATH [--to DEST]` is the incident-time handle for `restore_backup`, drilled end-to-end in the tests.
 
 ## The staging path is per-writer, not per-date (issue #214)

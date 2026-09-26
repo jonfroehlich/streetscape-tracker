@@ -52,6 +52,11 @@ max_cities_per_day = 40
 # (issue #282), so what it can displace is that reservation, never the night.
 # refresh_slots = 10
 
+# Hours before backup-status reports the cron timer-watchdog (issue #369) as
+# stale. Off (0) by default, so a laptop without the crontab stays green; prod
+# sets 48. See docs/scheduler.md, "The user timers after a reboot".
+# timer_watchdog_max_age_h = 48
+
 # Slots reserved out of max_cities_per_day for cities due ONLY on an opt-in
 # channel (issue #282). Unset means "a quarter of the cap, floored at 1" —
 # 10 at the cap above — and the resolution lives in one place,

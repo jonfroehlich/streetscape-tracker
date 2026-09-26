@@ -80,7 +80,8 @@ python scripts/register_frame.py --manifest mapillary_360_cities.csv --overlap-k
 | `reconcile-walks [--dry-run]` | Catalog road walks that finished but were never registered |
 | `import-bundle DIR [--execute] [--enable]` | Land a laptop investigation's artifacts here (#330): a laptop `data/` dir, read-only, DRY-RUN by default; refuses the bundle WHOLE on a geometry, filename, collision, schema, append-order, network-bytes or in-flight-batch problem |
 | `fetch-driving-plan [--force]` | Snapshot Google's published driving plan out of band; `--from-file`/`--date` backfills a hand-saved snapshot |
-| `backup-status [--alert]` | Catalog-backup health; nonzero when the newest backup is missing, >48 h old, or the last attempt failed; `--alert` emails when unhealthy (#193 daily timer) |
+| `backup-status [--alert]` | Catalog-backup health; nonzero when the newest backup is missing, >48 h old, or the last attempt failed, or (prod) the #369 watchdog's heartbeat is stale; `--alert` emails when unhealthy (#193 daily timer) |
+| `timer-status [--rearm] [--alert] [--wait-s N]` | The user timers' health (#369); `--rearm` daemon-reloads and starts enabled-but-inactive ones, a DISABLED timer is a deliberate pause and is left alone; run by a user **crontab** (`deploy/cron/`), not a timer, at `@reboot` and daily |
 | `restore-backup FILE --to PATH` | Restore a dated backup; refuses an existing destination or orphaned `-wal`/`-shm` |
 | `notify-failure` | Email the recent log (the systemd `OnFailure=` hook) |
 
@@ -253,6 +254,7 @@ Drive manual batches into a file (`>> logs/x.log 2>&1`), never a pipe.
 `systemctl stop` is a real wind-down, not a kill; the unit's `TimeoutStopSec` must stay above the tail's measured components and below `max_batch_hours`.
 **The weekly growth screen (`screen-provider`, #316) is scheduled but is NOT part of a night** — its own timer, deliberately far from 02:00 because both take the same Panoramax host lock, and it publishes its own artifact (the nightly tail does not rebuild it, since nothing else changes its inputs).
 Deployment lives in `deploy/` (9 systemd units + its README).
+**A makelab2 reboot brought every user timer back enabled but INACTIVE (#369)** — most likely the user manager scanned `~/.config/systemd/user/` before the NFS home was mounted — so the re-arm lives in a user crontab on local disk (`deploy/cron/`, `timer-status --rearm --alert`), `backup-status` gates on its heartbeat, and a timer is paused with `disable --now`, never `stop`, or the watchdog re-arms it within a day.
 
 **Operator commands and publishing → [`docs/operations.md`](docs/operations.md).**
 `assess-city` answers a partner inquiry about an untracked city the same day (register + both road walks + the cheap Mapillary grid run + publish).

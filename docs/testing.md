@@ -398,6 +398,28 @@ a backup failure alerting below the failure threshold + exiting nonzero while st
 and the **per-writer staging name** — that two pids derive different paths, that a concurrent writer's in-flight staging file is neither unlinked nor promoted (its path derived *through* `_staging_path` under a faked pid, so reverting to a shared name makes the test fail rather than pass on a name it invented), and that abandoned staging files are swept by age while a live one survives
 — plus an autouse stub, because `backup_dir` defaults into the working tree and the tail's pre-#145 backup had been dropping fixture-sized files into the repo's `logs/` for as long as it existed.
 
+## The user-timer watchdog (issue #369)
+
+`tests/test_user_timers.py` drives `scheduler timer-status` against `FakeSystemctl`, a pure-Python `systemctl --user` that records every call, so the call SEQUENCE is pinned and not just the verdict:
+the watched set is exactly the four shipped `.timer` files, and none found is an error rather than an empty success;
+`XDG_RUNTIME_DIR`/`DBUS_SESSION_BUS_ADDRESS` are filled only when cron lacks them;
+the active host is read from the collection unit's `ConditionHost=`, and any other host makes no call, writes no heartbeat and sends no mail;
+enabled-but-inactive timers exit 1 and are NOT started without `--rearm`;
+`--rearm` is one `daemon-reload`, a `start` for each broken timer only, and a re-read of those only — and a timer still inactive after `start` stays a failure;
+a `disabled` or `masked` timer is a pause, never started and never unhealthy;
+a `not-found` timer is `NOT INSTALLED`, and a reload that installs it lets the re-arm recover it;
+`--wait-s` polls until BOTH the manager answers and the unit files are visible, gives up inside its budget (fake clock) still writing the heartbeat, treats 0 as exactly one check, and a negative wait or non-positive poll exits 64 before any call;
+`--alert` is silent on a quiet day, mails on a re-arm (with the `regenerate-aggregate --publish` hint) and on a failure, and never changes the exit status;
+the heartbeat carries the verdict, is written with no `.tmp` left behind, and a truncated or non-object file reads as `None` rather than raising.
+`tests/test_timer_watchdog_crontab.py` pins the crontab: exactly `MAILTO=""`, `CRON_TZ`, one `@reboot` and one daily line;
+both commands `cd` to the collection unit's `ReadWritePaths`, run the units' interpreter, and parse under `build_parser()` as `timer-status --rearm --alert` with the prod config;
+the `@reboot` wait is bounded between 10 and 60 minutes and the daily line does not wait;
+the daily slot shares the timers' zone, precedes the backup-check timer, and leaves a `Persistent` catch-up night room to end before the next 02:00;
+both lines log to `logs/timer_watchdog.log`;
+`deploy/README.md` appends the file guarded by the marker its first line carries;
+and no doc pauses a timer with `systemctl --user stop`, which the daily re-arm would undo.
+In `tests/test_scheduler.py`, `backup-status` gates on the heartbeat only when `[schedule].timer_watchdog_max_age_h > 0` (NEVER RAN, fresh, and 50 h STALE), a stale backup outranks a stale watchdog in the subject while the body carries both, the key round-trips through the loader, and prod sets it between 24 and 72 h.
+
 ## Per-IP hardening: Mapillary, Overpass and the host lock
 
 - Mapillary fail-fast (issue #205: a blocked host and a rejected token each stop within `connection_limit` requests instead of paying for all 361 tiles, `api_requests` equals what was actually issued, a host block is typed while a bad token is not, an HTML error page is also a block, the two #168 guards

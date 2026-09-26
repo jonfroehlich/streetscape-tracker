@@ -528,3 +528,65 @@ The command writes and publishes `provider_screen.json.gz` itself, and the night
 
 **Production reads `config/scheduler.makelab1.toml`, not `config/scheduler.toml`** (passed via `--config`; the filename is historical — the service itself runs on makelab2, guarded by `ConditionHost=makelab2*`).
 The two diverge materially — budgets, absolute paths, `[publish].enabled`/`[publish].local` — so an operational change edited only into the repo default changes nothing in production, and vice versa: keep any comment-level rationale in step across both files.
+
+## The user timers after a reboot (issue #369, added 2026-09-26)
+
+**What was measured.**
+On 2026-09-23 makelab2 hung mid-night (the scheduler log stops at 06:18 PDT, load 165.5, before the tail, so nothing published) and rebooted at 08:15 PDT; the lingering user manager `user@29497.service` entered active at 08:16:09, and `autofs.service` at 08:16:14.
+Afterwards all four user timers — `streetscape-backup-check`, `streetscape-prefreeze`, `streetscape-screen-provider`, `streetscape-tracker` — read `enabled` but `inactive`, while `loginctl` reported `Linger=yes` and `systemctl --user is-system-running` reported `running`.
+Nothing collected or published until the operator ran `daemon-reload` and `start` by hand, and nothing alerted, because the only watchdog (`backup-status --alert`, #193) runs from one of those four timers.
+
+**The leading cause, unproven.**
+The user manager scanned `~/.config/systemd/user/` on the NFS home five seconds before autofs mounted it, found no unit files, and never looked again.
+It cannot be proven from here — `journalctl` for the manager is unreadable by `jonf` — and it cannot be fixed from here either: ordering `user@.service` after the mount is a root-side drop-in (`RequiresMountsFor=/homes/gws/jonf`), an open ask for CSE IT, alongside whose reboot it was.
+
+**The design: a user crontab on local disk.**
+`deploy/cron/streetscape-tracker.crontab` runs `scheduler timer-status --rearm --alert` at `@reboot` and daily at 08:30 Pacific.
+A user crontab lives in `/var/spool/cron` on local disk, so it does not depend on the NFS home being mounted when the user manager starts; whether makelab2's `crond.service` orders after `autofs` is unverified, and the `@reboot` line does not rely on it: it polls (`--wait-s 1800`, every `--poll-s` 15 s) until BOTH `systemctl --user is-system-running` answers AND every shipped `.timer` file `isfile()`s under `~/.config/systemd/user/`, which is also what triggers the autofs mount.
+The checkout, the venv and `logs/` are on makelab2's local ZFS pool; the only NFS dependency is the unit files, which is the thing being waited for.
+The check is cause-agnostic on purpose: whatever left a timer enabled-but-inactive — this race, a lost linger, an operator `stop`, a future systemd change — the repair is the one done by hand on 2026-09-23, and the alert fires either way.
+
+The set of timers is read from the **shipped** `deploy/systemd/*.timer` files, never a second list, and the active host from the collection unit's `ConditionHost=`: on any other host (makelab1 shares the NFS home but has no linger) the command does nothing.
+`XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS` are filled in only when unset, since cron's environment has neither and every `systemctl --user` call then fails `Failed to connect to bus`.
+
+| A timer that is… | Reported as | With `--rearm` | Healthy? |
+|---|---|---|---|
+| loaded and `active` | `active` | left alone | yes |
+| `UnitFileState` `disabled`, `masked` or `masked-runtime` | `paused` | left alone — a deliberate operator pause | yes |
+| loaded, enabled, not `active` (the #369 signature) | `INACTIVE` | one `daemon-reload`, then `start` | only if the re-read state is `active` |
+| `LoadState` not `loaded` | `NOT INSTALLED` | the same `daemon-reload` (the race leaves exactly this), then `start` | only if the re-read state is `active` |
+
+`daemon-reload` is needed because the manager may hold the empty unit map of the scan that raced the mount, and `start` is needed because `daemon-reload` starts nothing and `timers.target` is already active, so its wants are not re-pulled.
+A `start` that returned 0 is never trusted; only the state re-read afterwards counts.
+Exit status is 0 when every non-paused timer is active at the end — a successful re-arm included — and 1 otherwise; `--alert` never changes it.
+`--alert` mails when the verdict is unhealthy **or** anything was re-armed: a re-arm is healthy but not silent, because it means a reboot (or similar) happened and the night before it may sit unpublished, which on 2026-09-23 needed a hand-run `regenerate-aggregate --publish`.
+
+**The crossed heartbeat.**
+Every run that reaches the check — the give-up path included — writes `logs/timer_watchdog_status.json` atomically, and `backup-status` goes unhealthy when it is missing or older than `[schedule].timer_watchdog_max_age_h` (0 = off, the code default; 48 on prod).
+So the two watchdogs cover each other: cron catches dead timers, the noon backup-check timer catches a dead cron.
+The heartbeat measures whether **cron** runs, not whether the timers do (the watchdog alerts on those itself); a hand run refreshes it too, so a dead cron is reported 48 h after the last run of either kind.
+**The honest gap:** if crond stops running user jobs AND the timers are dead, nothing alerts.
+Only an off-host monitor or a root-side mechanism closes that, and neither is in scope.
+
+**The pause verb changed.**
+Because the daily line starts any enabled-but-inactive timer, `systemctl --user stop <x>.timer` is now a pause of at most a day.
+The documented pause is `systemctl --user disable --now <x>.timer` (resume: `enable --now`), which the watchdog reports as `paused` and leaves alone; `tests/test_timer_watchdog_crontab.py` refuses the old spelling in any doc.
+`stop` on a `.service` is unaffected.
+
+**`Persistent=` interaction.**
+A re-arm after a missed 02:00 fires the nightly batch at once, as the timer itself would at boot — intended.
+The 08:30 slot is chosen so that catch-up night (the 15 min randomized delay, `max_batch_hours`, and the unit's `TimeoutStopSec` as the tail's stand-in) still ends before the next 02:00, and so that it precedes the noon backup-check timer.
+`streetscape-prefreeze.timer` stays `Persistent=false`, so a re-arm never fires a missed afternoon pass.
+
+**Alternatives rejected.**
+
+- A bare `@reboot systemctl --user daemon-reload && start …` line: not self-verifying (a disallowed crontab, a slow manager or a lost linger says nothing), and it would restart a timer an operator paused.
+- A root drop-in for `user@.service`: the real fix, but not ours to deploy; this mechanism keeps working after CSE IT does it.
+- A system crontab or system timer: root.
+- An off-host freshness monitor on `cities.json.gz`: detection only, no re-arm, and it needs a second host somebody operates.
+- Moving the unit files off NFS: every user-unit path is under `~`, and a local `$XDG_CONFIG_DIRS` for the manager needs root.
+- Re-arming from `run-due` or its tail: shares the timers' fate by construction — the #193 lesson again.
+- Restarting `timers.target`: stops every timer of the user, a paused one included; a per-timer `start` is what lets a disabled timer stay paused.
+
+**Unmeasured.**
+The 30-minute `@reboot` wait budget (generous against the 5 s gap measured, and against a slow ZFS import) and the 48 h heartbeat gate (one missed daily run, like `STALE_AFTER_HOURS`) are judgement numbers.

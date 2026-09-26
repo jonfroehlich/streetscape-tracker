@@ -1244,6 +1244,10 @@ def test_makelab1_production_config_is_wired():
     # 15M -> 35M on 2026-09-25: just above 12 h x 48,000/min (34.56M), so the
     # deadline rather than the budget ends the night.
     assert cfg.max_batch_hours == 12
+    # The crossed timer-watchdog gate (issue #369): backup-status goes unhealthy
+    # when the cron watchdog's heartbeat stops. Dropped from prod, the gate is
+    # silently off and a dead cron is never reported.
+    assert 24 < cfg.timer_watchdog_max_age_h <= 72
     assert cfg.providers["gsv"].daily_request_budget == 35_000_000
     # The street channels must keep their ISOLATED budgets: metered under their
     # own api_usage provider strings against separate keys, so a road crawl can
@@ -7166,6 +7170,97 @@ def test_alert_subject_names_both_the_backup_and_the_collection_failures(conn, m
     assert len(alerts) == 1
     assert "CATALOG BACKUP FAILED" in alerts[0]
     assert "2 failed collection(s)" in alerts[0]
+
+
+def _healthy_backups_cfg(conn, monkeypatch, tmp_path, **overrides):
+    """A config whose backup series is healthy, logging into tmp_path."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    monkeypatch.setattr(sched.catalog_backup, "write_backup", _REAL_WRITE_BACKUP)
+    cfg = _real_backup_cfg(
+        tmp_path, data_dir=str(tmp_path / "data"), log_dir=str(tmp_path / "logs"), **overrides
+    )
+    cfg.driving_plan.archive_dir = str(tmp_path / "archive")
+    return cfg
+
+
+def test_backup_status_gates_on_the_timer_watchdog_heartbeat_when_configured(
+    conn, monkeypatch, tmp_path, capsys
+):
+    """
+    Issue #369: the #193 check's own timer came back inactive after a reboot
+    with every other user timer. The cron watchdog re-arms them and writes a
+    heartbeat; this check reports when THAT stops — the two cover each other.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+    from streetscape_metadata_tracker import user_timers as ut
+
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(sched, "send_alert", lambda a, s, b: sent.append((s, b)) or True)
+    cfg = _healthy_backups_cfg(conn, monkeypatch, tmp_path, timer_watchdog_max_age_h=48)
+    sched.catalog_backup.write_backup(conn, cfg.backup_dir, date.today())
+
+    # Never ran.
+    assert sched.cmd_backup_status(cfg, alert=True) == 1
+    assert "timer watchdog NEVER RAN" in sent[-1][0]
+    assert "Timer watchdog (issue #369): NEVER RAN" in sent[-1][1]
+
+    # A fresh heartbeat: healthy, silent.
+    now = datetime.now(UTC)
+    ut.write_heartbeat(cfg.log_dir, ut.WatchdogResult(), host="makelab2", now=now)
+    n = len(sent)
+    assert sched.cmd_backup_status(cfg, alert=True) == 0
+    assert len(sent) == n
+    assert "— ok" in capsys.readouterr().out
+
+    # 50 h old: stale, and the subject says so.
+    ut.write_heartbeat(
+        cfg.log_dir, ut.WatchdogResult(), host="makelab2", now=now - timedelta(hours=50)
+    )
+    assert sched.cmd_backup_status(cfg, alert=True) == 1
+    assert "timer watchdog STALE (50 h)" in sent[-1][0]
+    # A healthy backup series is not a "catalog backup" problem.
+    assert "catalog backup unhealthy" not in sent[-1][0]
+
+
+def test_backup_status_ignores_the_heartbeat_when_the_gate_is_off(
+    conn, monkeypatch, tmp_path, capsys
+):
+    from streetscape_metadata_tracker import scheduler as sched
+
+    cfg = _healthy_backups_cfg(conn, monkeypatch, tmp_path)
+    assert cfg.timer_watchdog_max_age_h == 0.0
+    sched.catalog_backup.write_backup(conn, cfg.backup_dir, date.today())
+    assert sched.cmd_backup_status(cfg) == 0
+    assert "Timer watchdog" not in capsys.readouterr().out
+
+
+def test_a_stale_backup_outranks_a_stale_watchdog_in_the_subject(
+    conn, monkeypatch, tmp_path, capsys
+):
+    from streetscape_metadata_tracker import catalog_backup as cb
+    from streetscape_metadata_tracker import scheduler as sched
+
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(sched, "send_alert", lambda a, s, b: sent.append((s, b)) or True)
+    cfg = _healthy_backups_cfg(conn, monkeypatch, tmp_path, timer_watchdog_max_age_h=48)
+    result = sched.catalog_backup.write_backup(conn, cfg.backup_dir, date(2026, 8, 7))
+    old = time.time() - (cb.STALE_AFTER_HOURS + 2) * 3600
+    os.utime(result.path, (old, old))
+
+    assert sched.cmd_backup_status(cfg, alert=True) == 1
+    subject, body = sent[-1]
+    assert "catalog backup unhealthy" in subject and "h old)" in subject
+    assert "timer watchdog" not in subject
+    assert "STALE" in body and "Timer watchdog (issue #369): NEVER RAN" in body
+
+
+def test_timer_watchdog_max_age_round_trips_through_the_loader(tmp_path):
+    p = tmp_path / "s.toml"
+    p.write_text("[schedule]\ntimer_watchdog_max_age_h = 36\n")
+    assert load_scheduler_config(str(p)).timer_watchdog_max_age_h == 36.0
+    p.write_text("[schedule]\ncycle_days = 90\n")
+    assert load_scheduler_config(str(p)).timer_watchdog_max_age_h == 0.0
 
 
 def test_backup_status_subcommand_is_wired(capsys):

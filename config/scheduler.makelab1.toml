@@ -98,6 +98,12 @@ max_batch_hours = 12
 # slate after the hoist, so these 10 run whether the cap or the deadline ends
 # the night.
 refresh_slots = 10
+# The cron timer-watchdog (issue #369) writes logs/timer_watchdog_status.json on
+# every run; backup-status goes unhealthy (and its noon timer alerts) when that
+# heartbeat is missing or older than this. The two watchdogs cover each other:
+# cron catches dead timers, the timer catches dead cron. 0 disables the gate.
+# 48 h tolerates one missed daily run, like STALE_AFTER_HOURS. Unmeasured.
+timer_watchdog_max_age_h = 48
 # Channels of one city, in flight at once (issue #240). Explicit rather than
 # inherited, because this is the file prod reads and the value is the whole
 # rollout.
