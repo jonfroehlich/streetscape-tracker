@@ -71,6 +71,7 @@ Incidental coverage of a deprecated spelling trains readers to ignore the notice
 
 ## GSV downloaders, and the history harvester
 
+- `--connection-limit` above `--batch-size` (issue #359, `tests/test_cli_policy.py`): clamped to the batch with a stderr warning and the run proceeds (the downloader receives the batch size), rather than an argparse exit 2; a limit below the batch passes through unwarned, so the clamp is one-directional
 - GSV history harvester (response parsing, dated-only filter, cross-grid dedup, circuit breaker, resume — endpoint mocked)
 - GSV batch downloader's quota-throttling behavior (OVER_QUERY_LIMIT retry, sub-threshold residual written back as a failure row, over-threshold abort
   — the `fetch_gsv_pano_metadata_async` primitive is monkeypatched to serve responses from memory)
@@ -418,6 +419,13 @@ and the **per-writer staging name** — that two pids derive different paths, th
   — one refusal skips that host's channels, only channels that need it, **no** `record_attempt` on a skip, five consecutive blocked nights leaving the city still returned by `get_due_cities`,
   a blocked night alerting below the failure threshold while still publishing, the same for a busy night but with a subject that does **not** claim the provider refused us,
   a busy exit leaving the *next* city's same channel still attempted, and `CHANNEL_HOSTS` covering every scheduled channel since it is read with a fail-open `.get`)
+- The argv-rejected family (issue #359, `tests/test_scheduler.py`): `ARGV_REJECTED_EXIT_CODE` is argparse's 2 and disjoint from every host, busy, crawl-incomplete and usage code;
+  a child exit 2 records **no** `consecutive_failures`, and six such nights (one past the cap) leave the city still returned by `get_due_cities`;
+  the night alerts below the failure threshold, exits 1 and still publishes, under a `REJECTED by our own CLI` subject that claims neither a refusal nor a busy host, with `NO city was marked failed` and the channel in the body;
+  the `Done:` line counts rejections per channel (so the counter is threaded back out of `_run_city_loop`);
+  the next city's same channel is still asked (not a breaker);
+  `_run_collection_subprocess` names a 2 and quotes the argv in the reason while a 1 does neither;
+  and a rejected walk whose grid sibling landed is STRANDED, with the `run-due --provider gsv_streets --limit N` recovery in the alert.
 - The breaker's cooldown re-check (issue #341, `tests/test_scheduler.py` and `tests/test_overpass_reset_probe.py`): a refusal that clears inside the cooldown resumes street channels **the same night**, pinned as the exact launch sequence across three cities with the cooldown at 0 and a probe answering *no, no, yes*
   — and as one probe call per re-check, none once recovered;
   the reset predicate `overpass_serving` (#356) is pinned against `_Interpreter`, an in-memory `/api/interpreter` that echoes the nonce it is sent, with `requests.get` a tripwire and DNS a no-network dual-stack fake:
@@ -479,6 +487,7 @@ registration capping at the 40 km ceiling and aliasing the query slug so a secon
 — plus the low-fraction warning naming the NKY precedent and a **raising geocoder not failing the run**, exercised through the real probe rather than a stub that returns None;
 success starting only the collected channels' clocks while `gsv` stays absent so the nightly batch still does the grid run, and a failure recording **no** `consecutive_failures`, with six failed runs leaving the city still returned by `get_due_cities`;
 a Mapillary tile block leaving the GSV walk collected while `mapillary_streets` is never asked, an Overpass refusal skipping both walks but not the grid census, and a busy exit skipping one channel only;
+a channel whose argv our own CLI rejected (issue #359) exiting 1 with `N channel(s) REJECTED by our own CLI` in the summary and no `consecutive_failures`, since it records no attempt and would otherwise score the run complete;
 the tail regenerating before publishing, not publishing when nothing succeeded, and publishing a partial success anyway;
 the answer report leading with street-km ahead of grid coverage and carrying the "NOT the deployment number" label, printing the any-imagery split for Mapillary but not for GSV, reading "not walked" rather than 0% for a missing walk, surviving NULL lengths/ages, and building the city-page link from the grid run's CSV filename
 — preferring the Mapillary run, **falling back to the GSV one** and naming which it opened, saying there is no page only when neither exists, and tolerating a `site_url` with no trailing slash, since link building is bare concatenation;

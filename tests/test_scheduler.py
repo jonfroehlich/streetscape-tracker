@@ -9984,6 +9984,7 @@ def _run_channels(sched, cfg, conn, city, providers, **overrides):
         blocked_hosts=sched.HostBreaker(),
         busy_hosts=Counter(),
         deferred_channels=Counter(),
+        rejected_argv=Counter(),
         batch_deadline=None,
         stop_requested=None,
     )
@@ -12547,3 +12548,220 @@ def test_the_kartaview_walk_is_priced_at_enrolment_too(conn, monkeypatch, tmp_pa
     assert "paced at 16/min" in out
     # And the pairing line, naming its own grid sibling rather than Panoramax's.
     assert "kartaview is NOT a member" in out
+
+
+# ---------------------------------------------------------------------------
+# An argv our own CLI rejected (issue #359)
+#
+# The scheduler builds every child argv itself, so a child exit 2 is a
+# config/CLI contradiction, never the city's. It must be alerted loudly and must
+# NOT be recorded as a city failure: five of those quarantined a city for a
+# 90-day cycle with no alert telling it from a city that was not due.
+# ---------------------------------------------------------------------------
+
+
+def _rejected_outcome():
+    from streetscape_metadata_tracker.download_common import ARGV_REJECTED_EXIT_CODE
+    from streetscape_metadata_tracker.scheduler import CollectionOutcome
+
+    return CollectionOutcome(
+        False,
+        "exited 2 (our own CLI rejected the argv the scheduler built; argv: x)",
+        exit_code=ARGV_REJECTED_EXIT_CODE,
+    )
+
+
+def test_argv_rejected_exit_code_is_argparses_and_disjoint_from_every_other_family():
+    """2 is inherited from argparse, not allocated, so the classification only
+    works while no other family reuses it -- and while it IS argparse's number."""
+    from streetscape_metadata_tracker import download_common as dc
+
+    assert dc.ARGV_REJECTED_EXIT_CODE == 2
+    assert dc.ARGV_REJECTED_EXIT_CODE not in set(dc.HOST_EXIT_CODES.values())
+    assert dc.ARGV_REJECTED_EXIT_CODE not in set(dc.HOST_BUSY_EXIT_CODES.values())
+    assert dc.ARGV_REJECTED_EXIT_CODE not in {
+        dc.SWEEP_INCOMPLETE_EXIT_CODE,
+        _sched.USAGE_EXIT_CODE,
+        0,
+        1,
+    }
+
+
+def test_an_argv_rejection_is_not_recorded_as_a_city_failure(conn, monkeypatch):
+    cid = _register(conn, "Bend", width=1000, height=1000, step=20)
+
+    def run_one(city, provider):
+        return _rejected_outcome() if provider == "mapillary" else True
+
+    _run_loop_with(monkeypatch, conn, _street_cfg(publish_enabled=False), run_one)
+
+    row = conn.execute(
+        "SELECT consecutive_failures, last_error FROM schedule_state "
+        "WHERE city_id = ? AND provider = ?",
+        (cid, "mapillary"),
+    ).fetchone()
+    assert row is None or (row["consecutive_failures"] == 0 and row["last_error"] is None)
+
+
+def test_repeated_argv_rejections_never_quarantine_a_city(conn, monkeypatch):
+    """Six nights -- one past the cap -- must leave the city as due as it started."""
+    from streetscape_metadata_tracker import db as sdb
+
+    cid = _register(conn, "Bend", width=1000, height=1000, step=20)
+    cfg = _street_cfg(publish_enabled=False)
+
+    def run_one(city, provider):
+        return _rejected_outcome() if provider == "mapillary" else True
+
+    for day in range(6):
+        _run_loop_with(
+            monkeypatch, conn, cfg, run_one, today=date(2026, 7, 2) + timedelta(days=day)
+        )
+
+    due = sdb.get_due_cities(
+        conn,
+        today=date(2026, 7, 20),
+        cycle_days=1,
+        grace_days=0,
+        max_consecutive_failures=5,
+        default_membership=True,
+        provider="mapillary",
+    )
+    assert cid in [c.city_id for c in due]
+
+
+def test_an_argv_rejected_night_alerts_unconditionally_exits_nonzero_and_still_publishes(
+    conn, monkeypatch
+):
+    """Loud like a busy or blocked night, but named as what it is: the next move
+    is a config edit, not waiting out a ban or hunting a local process."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    _register(conn, "Bend", width=1000, height=1000, step=20)
+
+    published, alerts = [], []
+    monkeypatch.setattr(
+        sched,
+        "_run_one_city",
+        lambda cfg, city, today, provider="gsv", connection_limit=None, daily_budget=0, conn=None, remaining_s=None, **_: (
+            _rejected_outcome() if provider == "mapillary" else True
+        ),
+    )
+    _stub_tail(monkeypatch, sched, conn, published)
+    monkeypatch.setattr(
+        sched, "send_alert", lambda cfg, subject, body: alerts.append((subject, body))
+    )
+
+    rc = sched.cmd_run_due(
+        _street_cfg(
+            publish_enabled=True,
+            alerts=AlertConfig(enabled=True, failure_threshold=99),
+        ),
+        today=date(2026, 7, 2),
+    )
+
+    assert rc == 1
+    assert "publish" in published, "still publishes what was collected (#167)"
+    ((subject, body),) = alerts
+    assert "1 launch(es) REJECTED by our own CLI" in subject
+    assert "UNAVAILABLE" not in subject
+    assert "host busy" not in subject
+    assert "NO city was marked failed" in body
+    assert "launch(es) on mapillary were refused" in body
+
+
+def test_an_argv_rejection_does_not_skip_the_next_citys_same_channel(conn, monkeypatch):
+    """Not a breaker: per-city argv differs (the connection share, the request
+    cap), so a rejection for one city says nothing about the next one's argv."""
+    for name in ("Bend", "Corvallis"):
+        _register(conn, name, width=1000, height=1000, step=20)
+
+    asked = []
+
+    def run_one(city, provider):
+        if provider == "mapillary":
+            asked.append(city.city_id)
+            return _rejected_outcome()
+        return True
+
+    _run_loop_with(monkeypatch, conn, _street_cfg(publish_enabled=False), run_one)
+
+    assert len(asked) == 2
+
+
+def test_the_subprocess_outcome_names_an_argv_rejection_and_quotes_the_argv(monkeypatch, tmp_path):
+    """The child log is appended across attempts, so its argv header can fall
+    outside the quoted tail; the outcome carries the argv itself."""
+    import sys
+
+    from streetscape_metadata_tracker import scheduler as sched
+
+    city = db.CityRow(
+        city_id="bend--or",
+        display_name="Bend, OR",
+        city_name="Bend",
+        state_name="Oregon",
+        state_code="OR",
+        country_name="United States",
+        country_code="US",
+        center_lat=44.05,
+        center_lon=-121.31,
+        grid_width_m=1000,
+        grid_height_m=1000,
+        step_m=20,
+        created_at="2026-01-01T00:00:00+00:00",
+        enabled=True,
+        notes=None,
+    )
+    cfg = _street_cfg(publish_enabled=False)
+    cfg.log_dir = str(tmp_path)
+    cmd = [sys.executable, "x.py", "--connection-limit", "150"]
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 2))
+    outcome = sched._run_collection_subprocess(cfg, cmd, 60, city, "gsv", date(2026, 7, 2))
+    assert outcome.exit_code == 2
+    assert "our own CLI rejected" in outcome.reason
+    assert "--connection-limit 150" in outcome.reason
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 1))
+    outcome = sched._run_collection_subprocess(cfg, cmd, 60, city, "gsv", date(2026, 7, 2))
+    assert "our own CLI rejected" not in outcome.reason
+    assert "--connection-limit 150" not in outcome.reason
+
+
+def test_the_done_line_counts_argv_rejections_per_channel(conn, monkeypatch, caplog):
+    _register(conn, "Bend", width=1000, height=1000, step=20)
+
+    def run_one(city, provider):
+        return _rejected_outcome() if provider == "mapillary" else True
+
+    with caplog.at_level(logging.INFO):
+        _drive_night(monkeypatch, conn, _street_cfg(publish_enabled=False), run_one)
+
+    done = [r.message for r in caplog.records if r.message.startswith("Done: ")]
+    assert done and "1 launch(es) REJECTED by our own CLI (mapillary)" in done[0]
+
+
+def test_a_rejected_walk_strands_its_city_exactly_like_a_busy_skip(conn, monkeypatch):
+    """The grid sibling lands, the walk does not, and the city is not gsv-due
+    for ~83 days -- the same consequence a busy skip has, so the same record."""
+    alpha = _register(conn, "Alpha", width=1000, height=1000, step=20)
+
+    def run_one(city, provider):
+        return _rejected_outcome() if provider == "gsv_streets" else True
+
+    cfg = SchedulerConfig(
+        providers={
+            "gsv": ProviderConfig(enabled=True, daily_request_budget=10_000_000),
+            "gsv_streets": ProviderConfig(enabled=True, daily_request_budget=2_000_000),
+        },
+        publish_enabled=False,
+        alerts=AlertConfig(enabled=True, failure_threshold=99),
+    )
+    rc, alerts = _drive_night(monkeypatch, conn, cfg, run_one)
+
+    assert rc == 1
+    ((subject, body),) = alerts
+    assert "1 city(ies) STRANDED un-walked" in subject
+    assert f"{alpha} (gsv_streets)" in body
+    assert "run-due --provider gsv_streets --limit N" in body

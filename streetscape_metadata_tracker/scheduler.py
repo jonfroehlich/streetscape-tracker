@@ -76,6 +76,7 @@ from .city_registration import (
     resolve_or_register_city,
 )
 from .download_common import (
+    ARGV_REJECTED_EXIT_CODE,
     HOST_BY_BUSY_EXIT_CODE,
     HOST_BY_EXIT_CODE,
     HOST_KARTAVIEW,
@@ -5172,6 +5173,10 @@ def cmd_assess_city(
     # channel silently not collected is exactly what makes an inquiry answer
     # wrong, and #274's counter must not be the one the shared path drops.
     deferred_channels: Counter[str] = Counter()
+    # Launches our own CLI refused at parse time (issue #359). record_failures
+    # is False here anyway, so this is about the ANSWER, not the counter: a
+    # rejected channel beside a collected one would otherwise score 1/1.
+    rejected_argv: Counter[str] = Counter()
     attempted, succeeded, skipped_budget = _run_city_channels(
         cfg,
         conn,
@@ -5181,6 +5186,7 @@ def cmd_assess_city(
         blocked_hosts=blocked_hosts,
         busy_hosts=busy_hosts,
         deferred_channels=deferred_channels,
+        rejected_argv=rejected_argv,
         # No batch deadline: an operator run has nothing queued behind it, and
         # each child still carries its own derived per-city timeout.
         batch_deadline=None,
@@ -5251,6 +5257,11 @@ def cmd_assess_city(
         )
         + blocked_note
         + busy_note
+        + (
+            f", {sum(rejected_argv.values())} channel(s) REJECTED by our own CLI"
+            if rejected_argv
+            else ""
+        )
         + ("; published" if published else "")
     )
     print(f"  {summary}")
@@ -5296,10 +5307,13 @@ def cmd_assess_city(
     #     channel IS the job, and today is the deadline.
     #   - a refused or busy host is never clean, which _finish_batch does agree
     #     with (it alerts unconditionally on either).
+    #   - neither is an argv our own CLI rejected (issue #359). It records no
+    #     attempt, so without this term a rejected channel beside a collected
+    #     one scores attempted == succeeded == 1 and exits 0.
     collected_everything = attempted > 0 and succeeded == attempted
     nothing_deferred = skipped_budget == 0 and not deferred_channels
     hosts_were_fine = not blocked_hosts and not busy_hosts
-    complete = collected_everything and nothing_deferred and hosts_were_fine
+    complete = collected_everything and nothing_deferred and hosts_were_fine and not rejected_argv
     if complete and (published or not publish_wanted):
         return 0
     return 1
@@ -5316,9 +5330,10 @@ def _request_cap_args(flag: str, request_cap: int | None) -> list[str]:
     and that is the part a plain ``is not None`` misses: the child's
     ``positive_int`` refuses ``0`` at parse time (deliberately -- a cap of 0
     stops a crawl before it commits anything and then tells the operator to
-    re-run), so emitting it turns the launch into an argparse **exit 2**, which
-    is a real ``consecutive_failure`` rather than the budget deferral it looks
-    like.
+    re-run), so emitting it turns the launch into an argparse **exit 2** --
+    since #359 an alerted, amnestied config/CLI contradiction rather than a
+    ``consecutive_failure``, but still a nightly alert about a launch that
+    should have been a silent budget deferral, so the clause stays.
 
     A cap of 0 reaches here on exactly one path, and it is a path that was
     working before: ``_sweep_launch_plan``'s floor arm is gated on ``est > 0``,
@@ -5631,6 +5646,16 @@ def _run_collection_subprocess(
             why = f"exited {exit_code} ({HOST_LABELS[blocked]} unavailable to this host)"
         elif busy:
             why = f"exited {exit_code} ({HOST_LABELS[busy]} busy with another local process)"
+        elif exit_code == ARGV_REJECTED_EXIT_CODE:
+            # Our own parser refused the argv this process built (issue #359): a
+            # config/CLI contradiction, never the city's. The parser's message is
+            # in the log tail below; the argv is quoted here because the child log
+            # is appended across attempts, so its header line may fall outside the
+            # tail.
+            why = (
+                f"exited {exit_code} (our own CLI rejected the argv the scheduler built; "
+                f"argv: {redact_credentials(' '.join(cmd))})"
+            )
         else:
             why = f"exited {exit_code}"
     except subprocess.TimeoutExpired:
@@ -7045,6 +7070,7 @@ def cmd_run_due(
             blocked_hosts,
             busy_hosts,
             deferred_channels,
+            rejected_argv,
         ) = _run_city_loop(
             cfg,
             conn,
@@ -7098,6 +7124,14 @@ def cmd_run_due(
             else ""
         )
         + (f"; {busy_note}" if busy_note else "")
+        # Named apart from a failure because nothing about the city failed: our
+        # own CLI refused the argv the scheduler built (issue #359).
+        + (
+            f"; {sum(rejected_argv.values())} launch(es) REJECTED by our own CLI "
+            f"({', '.join(sorted(rejected_argv))})"
+            if rejected_argv
+            else ""
+        )
         + (f"; stopped early ({stop_reason})" if stop_reason else "")
         + (f"; {plan_error}" if plan_error else "")
     )
@@ -7114,6 +7148,7 @@ def cmd_run_due(
         plan_error=plan_error,
         blocked_hosts=blocked_hosts,
         busy_hosts=busy_hosts,
+        rejected_argv=rejected_argv,
     )
 
 
@@ -7259,10 +7294,13 @@ def _log_stop_declined(city_id: str, declined: list[str]) -> None:
 #
 # Raising per-child sockets is therefore a deliberate edit to THIS constant
 # with a memory measurement behind it, never a side effect of raising
-# connection_limit. Before raising it, note that cli.py rejects
-# connection_limit > batch_size with an argparse exit 2 -- recorded as an
-# ordinary child failure, five of which quarantine a city for a 90-day cycle --
-# so `[download].batch_size` (100) has to move first.
+# connection_limit. Before raising it above `[download].batch_size` (100), note
+# that doing so is now a SILENT NO-OP rather than an exit 2: cli.py clamps
+# connection_limit to batch_size with a warning (issue #359), because the
+# GSV engine never has more than batch_size requests in flight. So batch_size
+# still has to move with it -- for the sockets to exist, no longer for the
+# child to start. (A child exit 2 is now its own alerted, amnestied family,
+# ARGV_REJECTED_EXIT_CODE, rather than a consecutive_failure.)
 MAX_PER_CHILD_CONNECTION_LIMIT = 50
 
 
@@ -7276,6 +7314,7 @@ def _run_city_channels(
     blocked_hosts: HostBreaker,
     busy_hosts: Counter[str],
     deferred_channels: Counter[str],
+    rejected_argv: Counter[str],
     batch_deadline: float | None,
     stop_requested: threading.Event | None,
     record_failures: bool = True,
@@ -7334,6 +7373,16 @@ def _run_city_channels(
     walk has to say so somewhere, and the two existing counters would each be a
     lie about why.
 
+    ``rejected_argv`` counts, per channel, children whose argv OUR OWN parser
+    refused (exit ``ARGV_REJECTED_EXIT_CODE``, issue #359). Owned by the caller
+    like ``busy_hosts`` and for the same reason: no ``record_attempt`` is
+    written, so without the counter a night whose every gsv_streets launch died
+    at parse time would report a clean success. It has no default for the
+    reason ``batch_deadline`` has none: a caller that silently inherited a
+    throwaway counter would drop the count from its own summary. Not a breaker
+    -- per-city argv differs (the connection share, the request cap), so the
+    next city's launch is still asked.
+
     ``batch_deadline`` (a ``time.monotonic()`` value) clamps each child's
     timeout so no collection outlives the window reserved for the publish tail;
     None means no deadline, which is right for a single-city operator run. It has
@@ -7371,7 +7420,8 @@ def _run_city_channels(
     # Inputs to the stranding decision at the bottom: which of this city's
     # channels an unavailable host cost it -- the child that WAS the refusal,
     # every channel the breaker then skipped, and a child that found the host
-    # locally busy -- and which channels landed.
+    # locally busy -- or an argv our own CLI rejected (issue #359), and which
+    # channels landed.
     lost_to_host: list[str] = []
     succeeded_channels: set[str] = set()
     lanes = max(1, cfg.max_concurrent_channels)
@@ -7885,6 +7935,38 @@ def _run_city_channels(
                         )
                         continue
 
+                    if exit_code == ARGV_REJECTED_EXIT_CODE:
+                        # Our own CLI refused the argv this process built (issue
+                        # #359). The city did nothing and nothing was spent, so it
+                        # takes the same amnesty as the branches around it and for
+                        # the same reason: get_due_cities filters on
+                        # `consecutive_failures < max_consecutive_failures` and
+                        # nothing but a success resets it, so five of these
+                        # quarantined a city for a 90-day cycle -- silently, since
+                        # no alert told a quarantined city from one that was not
+                        # due. _finish_batch alerts on rejected_argv unconditionally.
+                        #
+                        # Not a breaker: per-city argv differs (the connection
+                        # share, the request cap), so the next city's launch is
+                        # still asked.
+                        #
+                        # No salvage: a parse error happens before the child opens
+                        # the catalog or writes a file, so there is never an orphan
+                        # to reconcile.
+                        rejected_argv[provider] += 1
+                        # A rejected walk strands its city exactly as a busy skip
+                        # does: the grid sibling lands, the walk does not, and the
+                        # city is not gsv-due for ~83 days.
+                        lost_to_host.append(provider)
+                        logger.error(
+                            f"{city.city_id} [{provider}]: our own CLI rejected the argv the "
+                            f"scheduler built -- a config/CLI contradiction, not a city failure. "
+                            f"Not counted against this city; it stays due. Fix the config or the "
+                            f"flag and re-run; the parser's message is in the child log tail "
+                            f"above. ({reason})"
+                        )
+                        continue
+
                     if exit_code == SWEEP_INCOMPLETE_EXIT_CODE:
                         # A sweep that stopped with roots unvisited and CHECKPOINTED
                         # them (issue #239). Progress, not breakage — the cli calls it
@@ -8009,8 +8091,9 @@ def _run_city_channels(
     _log_stop_declined(city.city_id, pending)
 
     # The stranding record (issue #341). A walk an unavailable host cost this
-    # city -- its child was the refusal, the breaker skipped it, or the host
-    # was busy with another local process -- whose GRID sibling landed
+    # city -- its child was the refusal, the breaker skipped it, the host
+    # was busy with another local process, or our own CLI rejected its argv
+    # (issue #359) -- whose GRID sibling landed
     # tonight leaves the city with a grid run and no road
     # walk: the grid success moved the city off the gsv-due list for a whole
     # cycle, and the union the nightly slate is built from is ordered by the
@@ -8024,7 +8107,8 @@ def _run_city_channels(
             blocked_hosts.strand(city.city_id, provider)
             logger.warning(
                 f"{city.city_id} [{provider}]: STRANDED — its {sibling} grid run succeeded "
-                f"tonight but a refused or busy host cost it this walk, so the city leaves the "
+                f"tonight but a refused or busy host, or an argv our own CLI rejected, cost it "
+                f"this walk, so the city leaves the "
                 f"night un-paired and is not due on {sibling} again for "
                 f"~{cfg.cycle_days - cfg.grace_days} days (issue #341)."
             )
@@ -8041,7 +8125,7 @@ def _run_city_loop(
     batch_deadline: float,
     sigterm_seen: threading.Event,
     max_cities: int,
-) -> tuple[int, int, int, int, str | None, set[str], Counter[str], Counter[str]]:
+) -> tuple[int, int, int, int, str | None, set[str], Counter[str], Counter[str], Counter[str]]:
     """Collect due cities until the city cap, the batch deadline, or SIGTERM.
 
     ``sigterm_seen`` is both checked here (between cities) and forwarded to
@@ -8056,7 +8140,7 @@ def _run_city_loop(
     dead code that also reads as a second opinion on what the cap is.
 
     Returns ``(processed, succeeded, attempted, skipped_budget, stop_reason,
-    blocked_hosts, busy_hosts, deferred_channels)``; ``stop_reason`` is None when the whole due
+    blocked_hosts, busy_hosts, deferred_channels, rejected_argv)``; ``stop_reason`` is None when the whole due
     list was worked through. Split out of ``cmd_run_due`` so every way of ending
     the night still reaches the publish tail — an unexpected exception here is
     logged and converted into a stop reason rather than discarding a night's
@@ -8078,12 +8162,17 @@ def _run_city_loop(
     sibling's in-flight sweep (issue #274). Reported for exactly the reason
     ``busy_hosts`` is, and counted apart from both a failure and a budget skip
     because it is neither.
+
+    ``rejected_argv`` counts, per channel, launches our own CLI refused at parse
+    time (issue #359). Reported like ``busy_hosts`` — no ``record_attempt`` is
+    written for them, so this counter is the only place they surface.
     """
     processed = succeeded = attempted = skipped_budget = 0
     stop_reason: str | None = None
     blocked_hosts = HostBreaker()
     busy_hosts: Counter[str] = Counter()
     deferred_channels: Counter[str] = Counter()
+    rejected_argv: Counter[str] = Counter()
     try:
         for city in due:
             if processed >= max_cities:
@@ -8113,6 +8202,7 @@ def _run_city_loop(
                 blocked_hosts=blocked_hosts,
                 busy_hosts=busy_hosts,
                 deferred_channels=deferred_channels,
+                rejected_argv=rejected_argv,
                 batch_deadline=batch_deadline,
                 stop_requested=sigterm_seen,
             )
@@ -8164,6 +8254,7 @@ def _run_city_loop(
         blocked_hosts,
         busy_hosts,
         deferred_channels,
+        rejected_argv,
     )
 
 
@@ -8273,12 +8364,13 @@ def _stranded_alert_note(cfg: SchedulerConfig, breaker: HostBreaker) -> str:
     per_channel = " or ".join(f"`scheduler run-due --provider {c} --limit N`" for c in channels)
     return (
         f"{len(breaker.stranded)} city(ies) came out of the night with a grid run but NO road "
-        f"walk, because a refused or locally busy host cost them the walk while the grid "
-        f"sibling succeeded. "
+        f"walk, because a refused or locally busy host, or an argv our own CLI rejected "
+        f"(issue #359), cost them the walk while the grid sibling succeeded. "
         f"Each is not due on the grid channel again for ~{cfg.cycle_days - cfg.grace_days} days, "
         f"so nothing re-pairs it and it reaches a capped night only through the bounded "
         f"[schedule].opt_in_cities_per_day reservation (issue #341). Walk them by hand once the "
-        f"host is confirmed serving this IP — {per_channel} — accepting that the walk will carry "
+        f"host is confirmed serving this IP (or the rejected flag is fixed) — {per_channel} — "
+        f"accepting that the walk will carry "
         f"a later date than the grid run:\n  " + "\n  ".join(lines)
     )
 
@@ -8295,6 +8387,7 @@ def _finish_batch(
     plan_error: str | None = None,
     blocked_hosts: HostBreaker | set[str] | None = None,
     busy_hosts: Counter[str] | None = None,
+    rejected_argv: Counter[str] | None = None,
 ) -> int:
     """Rebuild the published indexes, back up the catalog, publish, alert.
 
@@ -8328,6 +8421,15 @@ def _finish_batch(
     or because a manual run was holding the lock — would report a clean, silent
     success. They stay separate in the subject line because the operator's next
     move differs: a block is waited out, a busy lock is somebody's stray process.
+
+    ``rejected_argv`` counts, per channel, launches our own CLI refused at parse
+    time (issue #359). It alerts unconditionally and exits nonzero for the same
+    reason: no per-city failure is recorded, so a night whose every launch of a
+    channel died at parse time would otherwise read as clean. Its subject part is
+    separate again because the operator's next move is a config edit, not
+    waiting or hunting a process. Optional here, unlike where it is FILLED
+    (``_run_city_channels``): ``None`` means nothing was rejected, not a dropped
+    count.
     """
     # Every index rebuild goes through _tail_artifact, which reports a failure
     # instead of propagating it — see there for why a lost tail is the worse
@@ -8465,6 +8567,19 @@ def _finish_batch(
         else ""
     )
 
+    rejected_argv = rejected_argv or Counter()
+    rejected_note = (
+        f"{sum(rejected_argv.values())} launch(es) on {', '.join(sorted(rejected_argv))} were "
+        "refused by OUR OWN command-line parser before doing any work — the scheduler built an "
+        "argv that streetscape_tracker.py / streetscape_street_analyzer.collect rejected, i.e. "
+        "the config and the CLI disagree (issue #359). NO city was marked failed; they stay due "
+        "and lead tomorrow's queue. The parser's own message names the flag: read the `error:` "
+        "line in the child log tail quoted in the recent log below, and the argv on the "
+        "`exited 2` line. Fix the config or the CLI, then re-run; nothing was spent."
+        if rejected_argv
+        else ""
+    )
+
     failures = attempted - succeeded
     unhealthy = (
         errored,
@@ -8474,6 +8589,7 @@ def _finish_batch(
         publish_error,
         blocked_hosts,
         busy_hosts,
+        rejected_argv,
     )
     if any(unhealthy) or should_alert(failures, cfg.alerts.failure_threshold):
         host = socket.gethostname()
@@ -8506,6 +8622,8 @@ def _finish_batch(
             parts.append(f"{len(blocked_hosts.stranded)} city(ies) STRANDED un-walked")
         if busy_hosts:
             parts.append(f"{sum(busy_hosts.values())} channel(s) SKIPPED (host busy)")
+        if rejected_argv:
+            parts.append(f"{sum(rejected_argv.values())} launch(es) REJECTED by our own CLI")
         # The failure count is the subject on an ordinary bad night, and noise
         # ("0 failed collection(s)") when something above already carries it.
         if failures or not any(unhealthy):
@@ -8522,6 +8640,7 @@ def _finish_batch(
             + (f"\n\n{blocked_note}" if blocked_note else "")
             + (f"\n\n{stranded_note}" if stranded_note else "")
             + (f"\n\n{busy_note}" if busy_note else "")
+            + (f"\n\n{rejected_note}" if rejected_note else "")
         )
         send_alert(
             cfg.alerts,
