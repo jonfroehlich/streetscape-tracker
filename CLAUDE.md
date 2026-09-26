@@ -87,7 +87,7 @@ python scripts/register_frame.py --manifest mapillary_360_cities.csv --overlap-k
 
 `run-due` notes: `--limit` (≥1) overrides `[schedule].max_cities_per_day`; an unknown/disabled channel or a bad `--limit` exits 64, not 2; a filtered run advances only the named channels' clocks, **un-pairing those cities' snapshots**.
 `--city CITY` (repeatable) is the targeted retry: it narrows the DUE list and never forces, so a named city that is not due is warned about and skipped, and an unknown name exits 64.
-The named list is the run's city cap unless `--limit` is given, in which case the named cities past it are listed by name.
+The named list is the run's city cap unless `--limit` is given, in which case the named cities past it are listed by name, and it is what the STRANDED alert prints (#362).
 `assess-city` notes: a bad `--provider` or an unpaired `--width`/`--height` exits 64; answer from **street coverage, never grid coverage** (see operations below).
 `enroll-city` notes: **the two directions are scoped differently, because each guard was scoped to where it is a no-op.**
 Bare enrol needs an opt-in channel and an enabled city (every enabled city is already a gsv member; a disabled city can never be due), so either exits 64 writing no row.
@@ -234,7 +234,7 @@ This is what READ THIS FIRST points at; read it before changing any pacing, retr
 | Crawl incomplete | 83 | A checkpointed partial crawl — the budget or deadline ran out, not a host condition; amnestied beside the host conditions (#238), while a SIGKILL has no exit code and still counts a failure, so kill-and-resume is bounded at five nights. Raised by the KartaView sweep (#239) and, since #318, by either tile census — **with no usable checkpoint the same stop is a plain `DownloadError`**, because "re-run to resume" with nothing to resume from is an instruction that loops forever |
 
 - A blocked or busy night still publishes, alerts unconditionally, and exits nonzero — a refusal that recovered on re-check too, because it still cost launches.
-- **A refused OR locally busy host STRANDS a city** when its grid run succeeded and its walk did not (#341): not gsv-due for ~83 days, reachable only through the bounded opt-in reservation. The `Done:` line counts them and the alert names them with the `run-due --provider <walk> --limit N` that walks them by hand; `scripts/prefreeze_street_networks.py` is the prevention.
+- **A refused OR locally busy host STRANDS a city** when its grid run succeeded and its walk did not (#341): not gsv-due for ~83 days, reachable only through the bounded opt-in reservation. The `Done:` line counts them and the alert names them and prints the pasteable `run-due --provider <walks> --city <id> ...` (one per exact channel set, `--config` included, #362) that walks EXACTLY them — a bare `--limit N` walks the stalest-due queue instead (Austin's ~640k-request walk led it on 2026-09-22); started the same UTC day, the walks keep the grid runs' date; `scripts/prefreeze_street_networks.py` is the prevention.
 - makelab1 is **not** an escape hatch: Project Sidewalk serves Mapillary data off it, and that trade is never the right one.
 
 **Scheduler → [`docs/scheduler.md`](docs/scheduler.md).**

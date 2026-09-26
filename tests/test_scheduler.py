@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import signal
 import sqlite3
 import subprocess
@@ -11838,8 +11839,16 @@ def test_the_done_line_counts_and_the_alert_names_the_stranded_cities(conn, monk
     assert f"{alpha} (gsv_streets)" in body
     assert f"{beta} (gsv_streets)" in body
     assert gamma not in body.split("came out of the night")[1], "its grid run failed; it stays due"
-    assert "run-due --provider gsv_streets --limit N" in body
+    # One pasteable command naming exactly the stranded pair, sorted, with no
+    # --limit anywhere: the old `--limit N` advice walked the stalest-due queue
+    # (issue #362). A config built in code has no file, so no --config either.
+    assert _alert_commands(body) == [
+        ["run-due", "--provider", "gsv_streets", "--city", alpha, "--city", beta]
+    ]
     assert "~83 days" in body
+    # The pairing rule names the night's own UTC date (_drive_night's today),
+    # which is what _finish_batch must thread through (#376 review, F1).
+    assert "started on 2026-07-02 (UTC)" in body
     # STRANDED lines are WARNINGs in the log, one per lost walk.
     stranded_lines = [
         r for r in caplog.records if "STRANDED" in r.message and r.levelno == logging.WARNING
@@ -11909,6 +11918,282 @@ def test_a_busy_host_strands_a_city_exactly_like_a_refusal(conn, monkeypatch, ca
     assert f"{alpha} (gsv_streets)" in body
     assert beta not in body.split("came out of the night")[1]
     assert "refused or locally busy host" in body
+
+
+def _alert_commands(body):
+    """Every recovery command the STRANDED paragraph prints, as argv lists with
+    the interpreter prefix stripped (issue #362)."""
+    prefix = ["python", "-m", "streetscape_metadata_tracker.scheduler"]
+    out = []
+    for line in body.splitlines():
+        if line.startswith("python -m streetscape_metadata_tracker.scheduler "):
+            argv = shlex.split(line)
+            assert argv[:3] == prefix
+            out.append(argv[3:])
+    return out
+
+
+def _dry_run_selection(cfg, argv, capsys, today=date(2026, 7, 2)):
+    """Parse a printed command with the REAL parser, dry-run it, and return the
+    {(city_id, channel)} pairs the night would launch.
+
+    The dry run prints one `  {city_id} {channel} ~{est} req` line per slot
+    inside the day cap, so the regex recovers exactly the launch set."""
+    args = build_parser().parse_args(argv)
+    assert args.command == "run-due"
+    capsys.readouterr()  # discard whatever the night printed
+    rc = _sched.cmd_run_due(
+        cfg,
+        dry_run=True,
+        limit=args.limit,
+        today=today,
+        requested_providers=args.providers,
+        requested_cities=args.cities,
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    return {(m.group(1), m.group(2)) for m in re.finditer(r"^  (\S+)\s+(\S+)\s+~", out, re.M)}
+
+
+def _gsv_walk_cfg(**overrides):
+    return SchedulerConfig(
+        providers={
+            "gsv": ProviderConfig(enabled=True, daily_request_budget=10_000_000),
+            "gsv_streets": ProviderConfig(enabled=True, daily_request_budget=2_000_000),
+        },
+        publish_enabled=False,
+        alerts=AlertConfig(enabled=True, failure_threshold=99),
+        **overrides,
+    )
+
+
+def test_the_stranded_alerts_command_selects_exactly_the_stranded_cities(conn, monkeypatch, capsys):
+    """The acceptance test for #362. On 2026-09-22 none of 8 stranded cities
+    was in the first 10 of any walk channel's queue, so `--limit N` walked
+    other cities. Two never-collected decoys registered after the night sort
+    AHEAD of the stranded pair on gsv_streets (NULL last_success_at, then
+    city_id), the shape of prod's queue."""
+    from streetscape_metadata_tracker.download_common import HOST_OVERPASS
+
+    wiggins = _register(conn, "Wiggins", width=1000, height=1000, step=20)
+    williams = _register(conn, "Williams", width=1000, height=1000, step=20)
+
+    def run_one(city, provider):
+        if provider == "gsv_streets" and city.city_id == wiggins:
+            return _blocked_outcome(HOST_OVERPASS)
+        return True  # williams' walk is breaker-skipped, never launched
+
+    cfg = _gsv_walk_cfg()
+    _rc, ((_subject, body),) = _drive_night(monkeypatch, conn, cfg, run_one)
+
+    aardvark = _register(conn, "Aardvark", width=1000, height=1000, step=20)
+    bobcat = _register(conn, "Bobcat", width=1000, height=1000, step=20)
+
+    # Control: the old advice really does walk the decoys, so this fixture's
+    # queue has other cities at its head and the assertion below can fail.
+    old_advice = _dry_run_selection(
+        cfg, ["run-due", "--provider", "gsv_streets", "--limit", "2"], capsys
+    )
+    assert old_advice == {(aardvark, "gsv_streets"), (bobcat, "gsv_streets")}
+
+    (command,) = _alert_commands(body)
+    assert _dry_run_selection(cfg, command, capsys) == {
+        (wiggins, "gsv_streets"),
+        (williams, "gsv_streets"),
+    }
+
+
+def test_stranded_commands_are_grouped_by_the_exact_channel_set(conn, monkeypatch, capsys):
+    """Alpha loses both walks; Beta loses only gsv_streets because its mapillary
+    GRID failed, which leaves Beta un-attempted -- and so still DUE -- on
+    mapillary_streets. One combined command would walk Beta there and pay a
+    full census for an un-paired walk; one command per exact channel set
+    names each city only where it was stranded."""
+    from streetscape_metadata_tracker.download_common import HOST_OVERPASS
+
+    alpha = _register(conn, "Alpha", width=1000, height=1000, step=20)
+    beta = _register(conn, "Beta", width=1000, height=1000, step=20)
+
+    def run_one(city, provider):
+        if provider == "gsv_streets" and city.city_id == alpha:
+            return _blocked_outcome(HOST_OVERPASS)
+        if provider == "mapillary" and city.city_id == beta:
+            return False
+        return True
+
+    cfg = _street_cfg(publish_enabled=False, alerts=AlertConfig(enabled=True, failure_threshold=99))
+    _rc, ((_subject, body),) = _drive_night(monkeypatch, conn, cfg, run_one)
+
+    # The trap is real: Beta is still due on the walk it was NOT stranded on.
+    still_due = db.get_due_cities(
+        conn,
+        today=date(2026, 7, 2),
+        cycle_days=cfg.cycle_days,
+        grace_days=cfg.grace_days,
+        max_consecutive_failures=cfg.max_consecutive_failures,
+        default_membership=True,
+        provider="mapillary_streets",
+    )
+    assert beta in {c.city_id for c in still_due}
+
+    commands = _alert_commands(body)
+    assert commands == [
+        ["run-due", "--provider", "gsv_streets", "--city", beta],
+        ["run-due", "--provider", "gsv_streets,mapillary_streets", "--city", alpha],
+    ]
+    assert _dry_run_selection(cfg, commands[0], capsys) == {(beta, "gsv_streets")}
+    assert _dry_run_selection(cfg, commands[1], capsys) == {
+        (alpha, "gsv_streets"),
+        (alpha, "mapillary_streets"),
+    }
+
+
+def test_the_stranded_command_reaches_an_opt_in_walk_channel(conn, monkeypatch, capsys):
+    """`run-due --provider` takes opt-in channels (only assess-city refuses
+    them), and --city honours membership rather than widening it: an
+    un-enrolled city is never selected, stranded or not."""
+    from streetscape_metadata_tracker.download_common import HOST_OVERPASS
+
+    cfg = SchedulerConfig(
+        providers={
+            "kartaview": ProviderConfig(enabled=True, daily_request_budget=200_000),
+            "kartaview_streets": ProviderConfig(enabled=True, daily_request_budget=200_000),
+        },
+        publish_enabled=False,
+        alerts=AlertConfig(enabled=True, failure_threshold=99),
+    )
+    bend = _register(conn, "Bend", width=1000, height=1000, step=20)
+    for channel in ("kartaview", "kartaview_streets"):
+        db.set_channel_membership(conn, bend, channel, True, cycle_days=cfg.cycle_days)
+
+    def run_one(city, provider):
+        if provider == "kartaview_streets":
+            return _blocked_outcome(HOST_OVERPASS)
+        return True
+
+    _rc, ((_subject, body),) = _drive_night(monkeypatch, conn, cfg, run_one)
+
+    aardvark = _register(conn, "Aardvark", width=1000, height=1000, step=20)
+    db.set_channel_membership(conn, aardvark, "kartaview_streets", True, cycle_days=cfg.cycle_days)
+    zebra = _register(conn, "Zebra", width=1000, height=1000, step=20)
+
+    (command,) = _alert_commands(body)
+    assert command == ["run-due", "--provider", "kartaview_streets", "--city", bend]
+    assert _sched._select_providers(cfg, ["kartaview_streets"]) == ["kartaview_streets"]
+    selected = _dry_run_selection(cfg, command, capsys)
+    assert selected == {(bend, "kartaview_streets")}
+    control = _dry_run_selection(
+        cfg, ["run-due", "--provider", "kartaview_streets", "--limit", "1"], capsys
+    )
+    assert control == {(aardvark, "kartaview_streets")}
+    assert zebra not in {c for c, _ in selected | control}
+
+
+def test_the_stranded_command_carries_the_config_it_ran_under(
+    conn, monkeypatch, tmp_path, data_dir, capsys
+):
+    """Prod runs `--config .../scheduler.makelab1.toml`, and the repo default
+    diverges materially, so a command without it would run against the wrong
+    catalog, budgets and publish settings.
+
+    The config is loaded by a RELATIVE path from its own directory, so the
+    stored path must be made absolute: a relative one would resolve against
+    whatever directory the operator pastes the command in (#376 review, F2).
+    The printed command is then parsed, its `--config` re-loaded, and dry-run
+    under that config, so the round trip is end to end (#376 review, F5)."""
+    from streetscape_metadata_tracker.download_common import HOST_OVERPASS
+
+    path = tmp_path / "prod.toml"
+    path.write_text(
+        f'[paths]\ndata_dir = "{data_dir}"\n\n'
+        "[publish]\nenabled = false\n\n"
+        "[alerts]\nenabled = true\nfailure_threshold = 99\n\n"
+        "[providers.gsv]\nenabled = true\n\n"
+        "[providers.gsv_streets]\nenabled = true\n"
+    )
+    monkeypatch.chdir(tmp_path)
+    cfg = load_scheduler_config("prod.toml")
+    assert Path(cfg.config_path).is_absolute()
+    assert Path(cfg.config_path).resolve() == path.resolve()
+    assert SchedulerConfig().config_path is None, "a config built in code names no file"
+
+    alpha = _register(conn, "Alpha", width=1000, height=1000, step=20)
+
+    def run_one(city, provider):
+        return _blocked_outcome(HOST_OVERPASS) if provider == "gsv_streets" else True
+
+    _rc, ((_subject, body),) = _drive_night(monkeypatch, conn, cfg, run_one)
+
+    (command,) = _alert_commands(body)
+    assert command == [
+        "--config",
+        cfg.config_path,
+        "run-due",
+        "--provider",
+        "gsv_streets",
+        "--city",
+        alpha,
+    ]
+    parsed = build_parser().parse_args(command)
+    assert parsed.config == cfg.config_path
+    # Pasted from another directory, the printed --config still loads the
+    # same file, and dry-running under it selects exactly the stranded pair.
+    monkeypatch.chdir(data_dir)
+    reloaded = load_scheduler_config(parsed.config)
+    assert reloaded.config_path == cfg.config_path
+    assert _dry_run_selection(reloaded, command, capsys) == {(alpha, "gsv_streets")}
+
+
+def test_the_stranded_command_quotes_a_city_id_the_shell_would_split(conn, monkeypatch, capsys):
+    """sanitize_city_query_str keeps apostrophes, so a real city_id can open a
+    quotation an unquoted paste never closes."""
+    from streetscape_metadata_tracker.download_common import HOST_OVERPASS
+
+    coeur = _register(conn, "Coeur d'Alene", width=1000, height=1000, step=20)
+    assert "'" in coeur, "the fixture must carry the character under test"
+
+    def run_one(city, provider):
+        return _blocked_outcome(HOST_OVERPASS) if provider == "gsv_streets" else True
+
+    cfg = _gsv_walk_cfg()
+    _rc, ((_subject, body),) = _drive_night(monkeypatch, conn, cfg, run_one)
+
+    (command,) = _alert_commands(body)
+    assert command == ["run-due", "--provider", "gsv_streets", "--city", coeur]
+    assert _dry_run_selection(cfg, command, capsys) == {(coeur, "gsv_streets")}
+
+
+def test_the_stranded_note_sorts_cities_and_channels_and_prints_its_date():
+    """The night-level tests strand cities in an order that is already sorted,
+    so they cannot see a lost sort (#376 review, F3). Here the breaker records
+    cities out of order and one city's channels in reverse: each command must
+    list its channels sorted, its cities sorted, and the commands in channel-
+    set order. The date is a non-default one, so a hard-coded or shifted date
+    in the pairing sentence fails (#376 review, F1)."""
+    breaker = _sched.HostBreaker()
+    breaker.strand("zeta", "mapillary_streets")
+    breaker.strand("zeta", "gsv_streets")
+    breaker.strand("delta", "gsv_streets")
+    breaker.strand("beta", "gsv_streets")
+    breaker.strand("alpha", "gsv_streets")
+    breaker.strand("alpha", "mapillary_streets")
+
+    body = _sched._stranded_alert_note(SchedulerConfig(), breaker, date(2026, 9, 22))
+
+    assert _alert_commands(body) == [
+        ["run-due", "--provider", "gsv_streets", "--city", "beta", "--city", "delta"],
+        [
+            "run-due",
+            "--provider",
+            "gsv_streets,mapillary_streets",
+            "--city",
+            "alpha",
+            "--city",
+            "zeta",
+        ],
+    ]
+    assert "started on 2026-09-22 (UTC)" in body
+    assert _sched._stranded_alert_note(SchedulerConfig(), _sched.HostBreaker(), date.today()) == ""
 
 
 def test_a_two_host_channel_skip_counts_one_launch(conn, monkeypatch):
