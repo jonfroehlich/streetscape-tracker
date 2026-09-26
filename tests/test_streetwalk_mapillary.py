@@ -39,6 +39,7 @@ from streetscape_metadata_tracker import db
 from streetscape_metadata_tracker import download_gsv as dg
 from streetscape_metadata_tracker import download_mapillary as dm
 from streetscape_metadata_tracker.checkpointing import (
+    CENSUS_CACHE_MARKER,
     CensusCache,
     census_cache_path_for,
     checkpoint_path_for,
@@ -543,7 +544,7 @@ def test_a_mask_without_a_description_is_refused(tmp_path, monkeypatch):
 
 
 def test_a_reused_census_carries_its_holes_into_the_walks_own_rows(
-    tmp_path, monkeypatch, pacific_local_zone, frozen_utc_clock
+    tmp_path, monkeypatch, pacific_local_zone, frozen_utc_clock, frozen_local_calendar
 ):
     """
     The #290 reuse path, driven end to end rather than assumed.
@@ -567,6 +568,13 @@ def test_a_reused_census_carries_its_holes_into_the_walks_own_rows(
     UTC day the crawl's marker is stamped on, or the entry is refused and the
     census is re-paid. A test that read `date.today()` for both sides could
     not fail, which is how #347 survived CI on UTC runners.
+
+    BOTH calendars are frozen at the same instant -- the UTC one through the
+    clock seam and the local one as `collect` reads it -- because freezing
+    only UTC leaves `date.today()` on the real present, AFTER the marker, so a
+    local-dated walk would still pass the reuse guard and `served == []` could
+    not fail. Frozen together, the #347 regression is refused the entry and
+    re-fetches both tiles, exactly as it did in production.
     """
     # A 1,400 m grid, the smallest here whose bbox spans TWO z14 tiles -- one
     # to fail and one to succeed. At the usual 200 m the bbox is a single tile,
@@ -587,6 +595,8 @@ def test_a_reused_census_carries_its_holes_into_the_walks_own_rows(
     # local calendar still reads 08-31. The walk below passes no --run-date, so
     # it must date itself by the UTC day for the entry to be reusable (#347).
     frozen_utc_clock(EVENING_UTC)
+    frozen_local_calendar(collect, EVENING_UTC)
+    assert collect.date.today() == EVENING_LOCAL_DATE, "the two calendars must disagree"
     run_date = EVENING_UTC_DATE.isoformat()
     data_dir, _ = _setup(
         tmp_path,
@@ -633,6 +643,12 @@ def test_a_reused_census_carries_its_holes_into_the_walks_own_rows(
     )
     assert crawl["failed_tiles"] == [NORTH_TILE]
     assert os.path.isdir(cache_path), "the crawl must have promoted, or there is nothing to reuse"
+    with open(os.path.join(cache_path, CENSUS_CACHE_MARKER), encoding="utf-8") as f:
+        marker = json.load(f)
+    # The checkpoint's created_at (the marker's crawl_started_at) reads the same
+    # frozen clock as completed_at; off it, the crawl "started" on the real
+    # present, weeks after it finished.
+    assert marker["crawl_started_at"] == marker["completed_at"] == EVENING_UTC.isoformat()
 
     # Anything the walk asks the network for is a bug: the whole point is that
     # it inherits, so a served tile here means it re-probed rather than reused.

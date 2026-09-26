@@ -34,6 +34,7 @@ already gone wrong once:
   and a grep refuses `date.today()`, `datetime.today()` and a naive `datetime.now()` on the collection path (`checkpointing`, `cli`, `scheduler`, the walk collector, the prefreeze script).
   The grep blanks comments and plain strings in place, so the comment that names `date.today()` does not trip it, but keeps f-strings, whose braces hold code; it keeps each line's own spacing, because re-joining tokens fused `else date.today()` into `elsedate.today()` and the first version missed the very #347 line that way.
   Its regex and the blanking are self-checked against planted samples so it cannot pass by matching nothing.
+  A grep only sees the spellings it names, so the grid CLI's default is also pinned by behaviour, in `tests/test_cli_policy.py`: `async_main` with no `--run-date` under the frozen instant hands `_collect_one_run` the UTC date, which a `datetime.now().date()` or `date.fromtimestamp(time.time())` read — both invisible to the grep — fails.
   The shared `frozen_utc_clock` and `pacific_local_zone` fixtures live in `conftest.py`, non-autouse; the instant is in the past, so an unfrozen `date.today()` can never coincide with either date it asserts.
 
 ## City registration manifests (issue #110, and the purposive additions)
@@ -292,6 +293,9 @@ and `hosts_unavailable` is anchored to the blocked-host note's own `; `-delimite
   The per-attempt log is the ONLY record that part of an artifact is unmeasured, and the line stops there: a tolerated hole exits 0, and the scheduler copies a child's tail into its own log — the one the `[alerts]` mail quotes — only for a child that FAILED, so a degraded walk sends no mail at all.
   Sharpest on the #290 reuse path, where the walk inherits the crawl's failed tiles for zero requests so no fetch-side "N/M tiles failed" warning fires either, which a third test drives end to end from a promoted cache entry rather than trusting the two halves to meet.
   That end-to-end test runs under a frozen 17:30-PDT clock with the local zone pinned to America/Los_Angeles and gives the walk NO `--run-date`, asserting both zero requests and the UTC-dated row (#347), because a test that read `date.today()` for both sides could not fail, which is how #347 survived CI on UTC runners.
+  It freezes the LOCAL calendar too (`frozen_local_calendar`, at the same instant, as `collect` reads `date.today()`): with only the UTC clock frozen, `date.today()` reads the real present, AFTER the marker, so a local-dated walk still passes the reuse guard and only the row's date catches it.
+  Frozen together, the #347 regression is refused the entry and re-fetches both tiles, so `served == []` fails on its own.
+  It also asserts the marker's `crawl_started_at` (the checkpoint's `created_at`) and `completed_at` are both the frozen instant, which pins the census checkpoints' stamps to the same clock seam.
   Its cheap sibling (`test_the_walks_default_run_date_is_the_grid_runs_utc_date`) pins the default date's pass-through to the `CensusCache` the fetch receives, the artifact name, and the `api_usage` ledger day.
   So one test asserts the degraded sample count AND the `unmeasured_desc` both reach the log, and its twin asserts a failed tile covering no sample logs nothing, since a warning claiming damage that did not happen just buries a real one in the single place anybody reads it.
   The count asserted is the RELABELLED subset, not every sample under the failed tile, which is what the message now says.

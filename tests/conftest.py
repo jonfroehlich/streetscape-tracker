@@ -746,15 +746,53 @@ def frozen_utc_clock(monkeypatch):
     Freeze ``clock._utc_clock`` (issue #347) at an instant the test picks.
 
     Returns a setter, ``freeze(instant) -> instant``; the instant must be
-    timezone-aware. Everything read through ``streetscape_metadata_tracker.clock``
-    -- snapshot dates, census cache markers, ``db.utc_now_iso`` stamps and the
-    cache's age checks -- then agrees on one clock.
+    timezone-aware. What reads through ``streetscape_metadata_tracker.clock``
+    then agrees on one clock: snapshot dates, the census cache marker's
+    ``completed_at`` and its age check, ``db.utc_now_iso`` stamps, and the three
+    census checkpoints' ``created_at``/``updated_at`` and their age checks.
+
+    What does NOT is every other wall-clock read on the collection path -- a
+    download's ``started_at``/``finished_at`` and the future-capture-date
+    ceilings still call ``datetime.now(UTC)`` directly, so under a frozen
+    instant in the past they read the real present. None of them dates a
+    snapshot or keys the cache or the ledger.
     """
 
     def freeze(instant: datetime) -> datetime:
         assert instant.tzinfo is not None, "freeze an aware instant"
         monkeypatch.setattr(clock, "_utc_clock", lambda: instant)
         return instant
+
+    return freeze
+
+
+@pytest.fixture
+def frozen_local_calendar(monkeypatch):
+    """
+    Freeze ``date.today()`` -- the LOCAL calendar -- as one module sees it.
+
+    Returns a setter, ``freeze(module, instant)``: the module's ``date`` name is
+    replaced by a subclass whose ``today()`` is ``instant`` in the process's
+    local zone, so combine it with ``pacific_local_zone`` (requested first) to
+    make a local read at ``EVENING_UTC`` give ``EVENING_LOCAL_DATE``.
+
+    ``frozen_utc_clock`` alone cannot show #347's symptom: an unfrozen
+    ``date.today()`` reads the real present, which is AFTER the frozen marker,
+    so a local-dated walk still passes the reuse guard and only its date is
+    wrong. Freezing both calendars at the same instant is what makes the
+    regression refuse the census and re-pay it, as it did in production.
+    """
+
+    def freeze(module, instant: datetime) -> None:
+        assert instant.tzinfo is not None, "freeze an aware instant"
+        local_day = instant.astimezone().date()
+
+        class _LocalCalendar(date):
+            @classmethod
+            def today(cls):
+                return local_day
+
+        monkeypatch.setattr(module, "date", _LocalCalendar)
 
     return freeze
 

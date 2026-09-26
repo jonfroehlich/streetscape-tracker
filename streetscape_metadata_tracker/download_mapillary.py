@@ -68,6 +68,7 @@ import pyarrow.parquet as pq
 # functions -- and would break the first time someone called a census
 # helper from one of them, with a DataFrame AttributeError.
 from . import census as census_core
+from . import clock
 
 # A name imported below in the redundant `X as X` form is a RE-EXPORT this
 # module does not itself use (the form is what tells ruff that, rather than a
@@ -805,7 +806,7 @@ def load_tile_checkpoint(
         # night and would refresh its own clock indefinitely. Ageing from the
         # first commit bounds what a single dated snapshot can span, which is
         # what the cap is actually for. See checkpointing.CHECKPOINT_MAX_AGE_S.
-        age_s = (datetime.now(UTC) - datetime.fromisoformat(state["created_at"])).total_seconds()
+        age_s = (clock.utc_now() - datetime.fromisoformat(state["created_at"])).total_seconds()
         if age_s > CHECKPOINT_MAX_AGE_S:
             discard(
                 f"its first tile was committed {age_s / 86400:.1f} days ago, past the "
@@ -1050,7 +1051,7 @@ def _write_checkpoint_state(
     checkpoint holds rather than the last time anything touched the file.
     ``updated_at`` still moves, for an operator reading the directory.
     """
-    created_at = cp.created_at or datetime.now(UTC).isoformat()
+    created_at = cp.created_at or clock.utc_now().isoformat()
     state = {
         "format_version": MAPILLARY_CHECKPOINT_FORMAT_VERSION,
         "bbox": list(bbox),
@@ -1062,7 +1063,7 @@ def _write_checkpoint_state(
         "census_rows": sum(done.values()),
         "api_requests_total": api_requests_total,
         "created_at": created_at,
-        "updated_at": datetime.now(UTC).isoformat(),
+        "updated_at": clock.utc_now().isoformat(),
     }
     _write_json_durable(_state_path(cp.path), state)
     # Only after the record naming it is durable, so a crash cannot leave the

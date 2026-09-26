@@ -44,7 +44,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any, Protocol
 
-from .clock import utc_now
+from .clock import utc_now, utc_now_iso
 from .download_common import grid_bbox
 from .paths import get_project_root
 
@@ -593,7 +593,7 @@ def census_cache_marker(
         "fetched_by": fetched_by,
         "fetched_variant": fetched_variant,
         "crawl_started_at": crawl_started_at,
-        "completed_at": utc_now().isoformat(),
+        "completed_at": utc_now_iso(),
         "api_requests_total": int(api_requests_total),
         "failed": list(failed),
     }
