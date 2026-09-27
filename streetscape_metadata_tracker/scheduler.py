@@ -366,6 +366,13 @@ class HostBreaker(set):
         # #380). Each one LEFT `stranded` when it landed, so `stranded` is
         # always what is still un-walked and this is what the pass saved.
         self.stranded_recovered = 0
+        # (city_id, walk) -> the host that was BUSY with another local process
+        # when this stranded walk was skipped (exit 80, not a refusal). Kept so
+        # the retry pass can take that skip back out of the night's
+        # `busy_hosts` when the walk lands, and `busy_recovered` counts those
+        # per host -- `busy_hosts` then says what is still outstanding.
+        self.busy_stranded: dict[tuple[str, str], str] = {}
+        self.busy_recovered: Counter[str] = Counter()
         self._next_recheck_at: dict[str, float] = {}
 
     def add(self, host: str) -> None:
@@ -405,8 +412,10 @@ class HostBreaker(set):
             self._maybe_recheck(host)
         return self.latched.intersection(hosts)
 
-    def strand(self, city_id: str, provider: str) -> None:
+    def strand(self, city_id: str, provider: str, *, busy_host: str | None = None) -> None:
         self.stranded.setdefault(city_id, []).append(provider)
+        if busy_host is not None:
+            self.busy_stranded[(city_id, provider)] = busy_host
 
     def unstrand(self, city_id: str, provider: str) -> None:
         """A stranded walk landed after all (issue #380): forget it, count it."""
@@ -7563,6 +7572,10 @@ def _run_city_channels(
     # every channel the breaker then skipped, and a child that found the host
     # locally busy -- and which channels landed.
     lost_to_host: list[str] = []
+    # The subset of those lost to a locally BUSY host, and which host, so a
+    # stranding can say so (issue #380: the retry pass un-counts the busy
+    # skip when the walk lands).
+    lost_to_busy: dict[str, str] = {}
     succeeded_channels: set[str] = set()
     lanes = max(1, cfg.max_concurrent_channels)
     # `connection_limit` is a HOST budget, so it is divided across lanes rather
@@ -8036,6 +8049,7 @@ def _run_city_channels(
                         # does not. The lock's other holder is most often our own
                         # daytime pre-freeze pass overrunning into the timer.
                         lost_to_host.append(provider)
+                        lost_to_busy[provider] = busy_host
                         logger.warning(
                             f"{city.city_id} [{provider}]: {HOST_LABELS[busy_host]} is busy with "
                             f"another process on this machine — skipping this channel. Not counted "
@@ -8211,7 +8225,7 @@ def _run_city_channels(
     for provider in lost_to_host:
         sibling = STREET_CHANNELS.get(provider)
         if sibling is not None and sibling in succeeded_channels:
-            blocked_hosts.strand(city.city_id, provider)
+            blocked_hosts.strand(city.city_id, provider, busy_host=lost_to_busy.get(provider))
             logger.warning(
                 f"{city.city_id} [{provider}]: STRANDED — its {sibling} grid run succeeded "
                 f"tonight but a refused or busy host cost it this walk, so the city leaves the "
@@ -8317,6 +8331,12 @@ def _retry_stranded_walks(
                 return None
             skips_before = blocked_hosts.skipped_launches
             trips_before = sum(blocked_hosts.trips.values())
+            # This walk's own busy skip from the loop, if that is what stranded
+            # it. Held apart for the call so `busy_hosts` can end the night
+            # counting only what is still outstanding: un-counted if the walk
+            # lands, and never counted twice if the retry finds it busy again.
+            busy_before = blocked_hosts.busy_stranded.pop((cid, walk), None)
+            busy_snapshot = Counter(busy_hosts)
             walk_attempted, walk_succeeded, walk_skipped = _run_city_channels(
                 cfg,
                 conn,
@@ -8332,6 +8352,25 @@ def _retry_stranded_walks(
             tally["attempted"] += walk_attempted
             tally["succeeded"] += walk_succeeded
             tally["skipped_budget"] += walk_skipped
+            busy_again = busy_hosts - busy_snapshot
+            if walk_succeeded:
+                if busy_before is not None:
+                    # The loop's busy skip is no longer outstanding, so the
+                    # busy paragraph and the night's health stop reporting it.
+                    busy_hosts[busy_before] -= 1
+                    if busy_hosts[busy_before] <= 0:
+                        del busy_hosts[busy_before]
+                    blocked_hosts.busy_recovered[busy_before] += 1
+            elif busy_before is not None:
+                # Still outstanding, and still the loop's one skip: a retry
+                # that found the lock held again is the same channel, not a
+                # second one.
+                blocked_hosts.busy_stranded[(cid, walk)] = busy_before
+                busy_hosts.subtract(busy_again)
+                for host in [h for h, n in busy_hosts.items() if n <= 0]:
+                    del busy_hosts[host]
+            elif busy_again:
+                blocked_hosts.busy_stranded[(cid, walk)] = next(iter(busy_again))
             if walk_succeeded:
                 blocked_hosts.unstrand(cid, walk)
                 logger.warning(
@@ -8668,6 +8707,13 @@ def _stranded_alert_note(cfg: SchedulerConfig, breaker: HostBreaker, today: date
         f"{breaker.stranded_recovered} stranded walk(s) were recovered by the end-of-night "
         f"retry, which launched them again through the same breaker after the due list "
         f"(issue #380); they keep tonight's date and their pairing."
+        + (
+            f" {sum(breaker.busy_recovered.values())} of them had been skipped because "
+            f"{_host_names(breaker.busy_recovered)} was busy with another local process; "
+            f"they landed once the lock freed, so they are no longer counted as busy skips."
+            if breaker.busy_recovered
+            else ""
+        )
         if breaker.stranded_recovered
         else ""
     )

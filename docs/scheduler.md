@@ -164,6 +164,8 @@ The breaker's re-check is the only probe: a walk it still skips, or whose child 
 A busy strand (exit 80) is retried once through the same host lock, and a walk whose network was frozen was never stranded, so it is never retried.
 A walk that lands leaves `stranded` and is counted in `HostBreaker.stranded_recovered` (`N stranded walk(s) recovered by the end-of-night retry` on the `Done:` line and in the alert); anything else **keeps the original entry**, which is never re-derived, because `_run_city_channels` strands only when the grid sibling succeeded in the same call and the retry's call carries the walk alone.
 So the `Done:` count, the subject and the named cities are what is STILL stranded.
+**`busy_hosts` follows the same rule**: a walk stranded by a busy lock (`HostBreaker.busy_stranded`) that the pass lands is taken back out of it and counted in `busy_recovered`, so the busy paragraph (whose "they stay due" would otherwise be false) and the night's health verdict report only busy skips still outstanding; one busy again at the retry stays counted once, not twice.
+
 Retries count in `attempted`/`succeeded`, never in `processed`, and each carries tonight's UTC `--run-date` — a 02:15 Pacific start plus the 12 h `max_batch_hours` ends at 14:15 Pacific, before the UTC rollover in both PDT and PST; never backdate it.
 **Pairing by date is best-effort; cost reuse holds for 7 days.**
 Nothing in `json_summarizer.py`, `analysis.py` or `www/js` joins a walk to its grid run by date: what a shared date buys is the #290 census reuse, which already tolerates `CENSUS_REUSE_MAX_AGE_S` (= `CHECKPOINT_MAX_AGE_S`, 7 days), so a census walk within a week of its grid run is still free, while `gsv_streets` pays per sample either way.

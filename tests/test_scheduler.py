@@ -12177,6 +12177,86 @@ def test_the_retry_walks_on_tonights_run_date(conn, monkeypatch):
     assert row["last_success_at"] is not None
 
 
+def _busy_walk_night(monkeypatch, conn, caplog, busy_times):
+    """Alpha's walk finds Overpass busy locally ``busy_times`` times, then lands;
+    Beta's Mapillary grid is refused, so the night alerts regardless."""
+    from streetscape_metadata_tracker.download_common import HOST_MAPILLARY_TILES, HOST_OVERPASS
+
+    alpha = _register(conn, "Alpha", width=1000, height=1000, step=20)
+    beta = _register(conn, "Beta", width=1000, height=1000, step=20)
+    walks = []
+
+    def run_one(city, provider):
+        if provider == "gsv_streets" and city.city_id == alpha:
+            walks.append(provider)
+            if len(walks) <= busy_times:
+                return _busy_outcome(HOST_OVERPASS)
+        if provider == "mapillary" and city.city_id == beta:
+            return _blocked_outcome(HOST_MAPILLARY_TILES)
+        return True
+
+    cfg = _two_walk_cfg()
+    cfg.providers["mapillary"] = ProviderConfig(enabled=True, daily_request_budget=40_000)
+    with caplog.at_level(logging.INFO):
+        _rc, alerts = _drive_night(monkeypatch, conn, cfg, run_one)
+    ((subject, body),) = alerts
+    return alpha, walks, _done_line(caplog), subject, body
+
+
+def test_a_recovered_busy_strand_is_no_longer_reported_as_a_busy_skip(conn, monkeypatch, caplog):
+    """Found by the #380 pass's own review: a walk stranded by a BUSY lock
+    (exit 80) that the pass then lands must leave `busy_hosts`, or the email
+    keeps saying its channel 'stays due' and the night stays unhealthy for a
+    skip that is no longer outstanding. The recovered note says what it was."""
+    alpha, walks, done, subject, body = _busy_walk_night(monkeypatch, conn, caplog, busy_times=1)
+
+    assert walks == ["gsv_streets", "gsv_streets"], "busy in the loop, landed in the pass"
+    assert "busy locally" not in done
+    assert "SKIPPED (host busy)" not in subject
+    # The busy paragraph, whose "they stay due" is what went stale. (The
+    # Mapillary refusal's own paragraph rightly still says its channels do.)
+    assert "another process on this machine held the lock" not in body
+    assert "1 stranded walk(s) were recovered by the end-of-night retry" in body
+    assert "1 of them had been skipped because the Overpass API" in body
+    assert "STRANDED" not in subject
+
+
+def test_a_night_whose_only_busy_strand_was_recovered_is_healthy(conn, monkeypatch):
+    """With nothing else wrong, a busy strand the pass landed leaves nothing
+    outstanding: the night exits 0 and sends no alert."""
+    from streetscape_metadata_tracker.download_common import HOST_OVERPASS
+
+    alpha = _register(conn, "Alpha", width=1000, height=1000, step=20)
+    walks = []
+
+    def run_one(city, provider):
+        if provider == "gsv_streets" and city.city_id == alpha:
+            walks.append(provider)
+            if len(walks) == 1:
+                return _busy_outcome(HOST_OVERPASS)
+        return True
+
+    rc, alerts = _drive_night(monkeypatch, conn, _two_walk_cfg(), run_one)
+
+    assert walks == ["gsv_streets", "gsv_streets"]
+    assert rc == 0
+    assert alerts == []
+
+
+def test_a_busy_strand_busy_again_at_the_pass_is_counted_once(conn, monkeypatch, caplog):
+    """The lock is still held when the pass retries: the walk stays stranded
+    and the busy paragraph counts ONE skipped channel, not the loop's and the
+    retry's as two."""
+    alpha, walks, done, subject, body = _busy_walk_night(monkeypatch, conn, caplog, busy_times=2)
+
+    assert walks == ["gsv_streets", "gsv_streets"]
+    assert "1 channel(s) skipped, the Overpass API (overpass-api.de) busy locally" in done
+    assert "1 channel(s) SKIPPED (host busy)" in subject
+    assert "1 city(ies) STRANDED un-walked" in subject
+    assert f"{alpha} (gsv_streets)" in body
+    assert "recovered by the end-of-night retry" not in body
+
+
 def test_a_city_whose_grid_run_failed_is_never_retried(conn, monkeypatch):
     """Gamma's walk is lost to the latched host too, but its gsv grid failed,
     so it was never stranded: it stays gsv-due and re-pairs on its own. The

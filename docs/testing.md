@@ -482,7 +482,8 @@ In `tests/test_scheduler.py`, `backup-status` gates on the heartbeat only when `
   a deadline that cannot hold the cooldown means no wait and no child; a SIGTERM arriving in the wait launches nothing further, names the stop on the `Done:` line and still reaches the tail;
   a re-check the loop already spent is never spent again by the pass, which then has no reason to wait;
   the retry's REAL argv carries the night's own `--run-date` on a night dated in the past;
-  and a city whose grid run failed, though the breaker cost it its walk too, is never retried.
+  a city whose grid run failed, though the breaker cost it its walk too, is never retried;
+  and a busy-stranded walk the pass lands leaves `busy_hosts` — no `SKIPPED (host busy)` subject, no busy paragraph, the recovered note naming the busy host, and a night with nothing else wrong exiting 0 with no alert — while one busy again at the retry is counted as ONE skipped channel.
   The suite-wide autouse `_no_recheck_cooldown_wait` makes `_wait_out_recheck_cooldown` instant (it answers whether a stop was requested), so no night-level test waits out a real 45-min cooldown;
   a skipped two-host channel launch counts **once** in the summary and alert while the per-host counter still attributes it to both;
   a frozen-network walk under a latched Overpass spends **no** re-check (the probe is asked only once a cold walk wants the host);
