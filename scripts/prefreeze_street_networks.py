@@ -69,8 +69,10 @@ them) with ``city_id`` as the tiebreaker, so repeated passes make monotone
 progress. Frozen networks are immutable (#103), so the backlog is a one-time
 cost. Everything else -- serial and paced, the host lock and probe, the
 in-flight refusal, the stop on a host condition -- is the same code path.
-``--limit`` defaults to 40 in this mode (the timer's own daily ceiling), and
-``--nights`` is refused beside it. The daily timer stays on the slate mode.
+``--limit`` defaults to 20 in this mode, and ``--nights`` and ``--date`` are
+refused beside it (neither means anything to a pass that ignores dueness). The
+daily timer stays on the slate mode, and it runs EVERY afternoon, so a drain's
+fetches always add to its count.
 
 Nothing is published and no imagery request is made. The catalog gains a
 ``street_networks`` row per frozen network, as a walk's own fetch would add.
@@ -85,7 +87,7 @@ Usage:
     # Look two nights ahead, cap the pass at 30 fetches:
     python scripts/prefreeze_street_networks.py --config ... --nights 2 --limit 30 --execute
 
-    # Drain the whole catalog's cold backlog, 40 networks per afternoon (#381):
+    # Drain the whole catalog's cold backlog, 20 networks per afternoon (#381):
     python scripts/prefreeze_street_networks.py --config ... --all-enabled --execute
 """
 
@@ -132,11 +134,13 @@ logger = logging.getLogger("prefreeze_street_networks")
 # pass (the busiest real night measured in #341) at about an hour.
 DEFAULT_PAUSE_S = 120
 
-# --all-enabled's --limit when none is given (issue #381): the daily timer's own
-# ceiling, so a by-hand backlog pass asks Overpass for no more in an afternoon
-# than the steady state already does. Measured on prod 2026-09-21 the backlog
-# was 242 cold networks, so this drains it over ~6 afternoons, not one burst.
-DEFAULT_ALL_ENABLED_LIMIT = 40
+# --all-enabled's --limit when none is given (issue #381). Overpass's guidance
+# for an app that queries regularly is under ~100 queries a day
+# (docs/provider-access.md), and the nightly walks plus the daily 15:00 timer
+# (up to 40) already spend part of that -- and the timer runs every afternoon,
+# so a drain ALWAYS adds to its count. Measured on prod 2026-09-21 the backlog
+# was 242 cold networks, so this drains it over ~12 afternoons, not one burst.
+DEFAULT_ALL_ENABLED_LIMIT = 20
 
 
 def next_run_date() -> date:
@@ -459,6 +463,11 @@ def main(argv=None) -> int:
     )
     if args.all_enabled and args.nights is not None:
         logger.error("--all-enabled and --nights are mutually exclusive")
+        return USAGE_EXIT_CODE
+    if args.all_enabled and args.date is not None:
+        # The plan is staleness-ordered over the whole catalog; no date enters it,
+        # so accepting one would promise a filter that is not applied.
+        logger.error("--all-enabled and --date are mutually exclusive")
         return USAGE_EXIT_CODE
     if args.nights is None:
         args.nights = 1

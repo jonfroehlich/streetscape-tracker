@@ -104,7 +104,12 @@ def _run(monkeypatch, cfg, *args, fetcher=None, in_flight=None):
         pf, "_run_due_in_flight", in_flight if callable(in_flight) else (lambda: in_flight)
     )
     monkeypatch.setattr(pf.time, "sleep", lambda s: slept.append(s))
-    rc = pf.main(["--date", TODAY.isoformat(), *[str(a) for a in args]])
+    args = [str(a) for a in args]
+    # --all-enabled refuses --date (#381), so it gets none: passing one would
+    # make every all-enabled test exit 64 for the wrong reason, and a test
+    # asserting 64 (the in-flight refusal, --nights) would pass vacuously.
+    date_args = [] if "--all-enabled" in args else ["--date", TODAY.isoformat()]
+    rc = pf.main([*date_args, *args])
     return rc, fetcher, slept
 
 
@@ -589,18 +594,18 @@ def test_all_enabled_skips_a_city_no_enabled_street_channel_walks(
     assert [(c.city_id, ch) for c, _, ch in planned] == [(beta, ["kartaview_streets"])]
 
 
-def test_all_enabled_dry_run_fetches_nothing_and_defaults_limit_to_40(
+def test_all_enabled_dry_run_fetches_nothing_and_defaults_limit_to_20(
     conn, data_dir, monkeypatch, capsys
 ):
-    cities = [_register(conn, f"City{i:02d}") for i in range(42)]
+    cities = [_register(conn, f"City{i:02d}") for i in range(22)]
     rc, fetcher, slept = _run(monkeypatch, _cfg(data_dir), "--all-enabled")
     assert rc == 0
     assert fetcher.calls == [] and slept == []
     out = capsys.readouterr().out
     assert "DRY RUN" in out
-    assert "Would freeze 40 cold street network(s) across every enabled city" in out
-    assert "2 more cold network(s) are past --limit 40." in out
-    assert cities[39] in out and cities[40] not in out
+    assert "Would freeze 20 cold street network(s) across every enabled city" in out
+    assert "2 more cold network(s) are past --limit 20." in out
+    assert cities[19] in out and cities[20] not in out
 
 
 def test_all_enabled_and_nights_are_mutually_exclusive(three_cities, data_dir, monkeypatch):
@@ -609,6 +614,22 @@ def test_all_enabled_and_nights_are_mutually_exclusive(three_cities, data_dir, m
     )
     assert rc == USAGE_EXIT_CODE
     assert fetcher.calls == []
+
+
+def test_all_enabled_refuses_date(three_cities, data_dir, monkeypatch):
+    """No date enters a staleness-ordered plan, so accepting one would promise
+    a filter that is not applied."""
+    fetcher = _Fetcher()
+    monkeypatch.setattr(pf, "load_scheduler_config", lambda path: _cfg(data_dir))
+    monkeypatch.setattr(pf, "fetch_graph", fetcher)
+    monkeypatch.setattr(pf, "_run_due_in_flight", lambda: None)
+    monkeypatch.setattr(pf.time, "sleep", lambda s: None)
+    argv = ["--all-enabled", "--execute"]
+    assert pf.main(["--date", TODAY.isoformat(), *argv]) == USAGE_EXIT_CODE
+    assert fetcher.calls == []
+    # The control: the same invocation without --date runs.
+    assert pf.main(argv) == 0
+    assert len(fetcher.calls) == 3
 
 
 def test_all_enabled_still_stops_on_a_run_due_and_a_host_condition(

@@ -152,15 +152,17 @@ The slate mode only ever sees cities *due* by the target date, and a wider `--ni
 
 ```bash
 python scripts/prefreeze_street_networks.py --config config/scheduler.makelab1.toml --all-enabled            # list
-python scripts/prefreeze_street_networks.py --config config/scheduler.makelab1.toml --all-enabled --execute  # freeze 40
+python scripts/prefreeze_street_networks.py --config config/scheduler.makelab1.toml --all-enabled --execute  # freeze 20
 ```
 
 It plans every enabled city that is a member of at least one enabled street channel and has no frozen GraphML for that channel's `network_type`, stalest-first (never-walked first, then the oldest `last_success_at` among the channels walking that network) with `city_id` as the tiebreaker, so repeated passes make monotone progress.
 Membership is read through `get_due_cities_with_last_success` with its staleness and quarantine gates opened, never a second copy of its membership clause; a quarantined city is included, since its network is just as cold.
-`--limit` defaults to **40** in this mode, the timer's own daily ceiling, so the backlog drains over several afternoons by hand rather than in one burst; `--nights` beside it exits 64.
+`--limit` defaults to **20** in this mode, so the ~240-network backlog drains over ~12 afternoons by hand rather than in one burst; `--nights` or `--date` beside it exits 64, since neither enters a plan that ignores dueness.
 Everything else is the slate mode's code path: serial, `--pause-s` apart, the same lock and probe, the in-flight `run-due` refusal and the stop on a host condition.
 Frozen networks are immutable (#103), so this is a one-time cost, and the daily timer stays on `--nights`.
-Before running it, re-read the Overpass usage policy (READ THIS FIRST): do not raise `--limit` or lower `--pause-s` without that check, and never run it the afternoon of a daytime walk catch-up or before that day's timer pass has finished, since two passes a day double the daily count the 40 was sized against.
+The 20 is sized against the Overpass guidance [`provider-access.md`](provider-access.md) quotes — fewer than ~100 queries a day for an app that queries regularly — which the nightly walks and the daily 15:00 timer (up to 40) already draw on.
+The timer runs every afternoon, so a drain **always** adds to that day's count rather than replacing it, and that is why its default is half the timer's.
+Before running it, re-read the policy (READ THIS FIRST): do not raise `--limit` or lower `--pause-s` without that check, never run it the afternoon of a daytime walk catch-up, and start it only after that day's timer pass has finished.
 
 **Recovering cities a refusal already stranded.**
 The alert names them and prints one `run-due --provider <walks> --city <id>...` per exact set of lost walk channels (#362), pasteable as printed — `--config` is the night's own, and it runs from the project root with the scheduler's venv active.

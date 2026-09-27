@@ -495,7 +495,7 @@ In `tests/test_scheduler.py`, `backup-status` gates on the heartbeat only when `
   the exit status is unchanged, and the SIGTERM exception is a `BaseException` so a library's `except Exception` cannot swallow it.
   `--all-enabled` (issue #381) planning cities the slate mode drops — past the cap, and walked yesterday — while skipping a disabled city, an already-frozen one and one no enabled street channel walks (an explicit exclusion, or no enrolment on an opt-in channel, where a NULL member means out);
   `--limit` truncating in **staleness** order (never-walked, then oldest walk, not `city_id` order), with two channels on one type sharing a fetch;
-  a dry run fetching nothing with `--limit` defaulting to 40; `--nights` beside it exiting usage;
+  a dry run fetching nothing with `--limit` defaulting to 20; `--nights` or `--date` beside it exiting usage;
   the in-flight `run-due` refusal and the host stop still firing in that mode; and its alert naming `--all-enabled` as the re-run.
 - The prefreeze units (`tests/test_prefreeze_unit.py`, issue #355): the same host, interpreter, `--config`, lock dir and console log as the collection unit;
   a sandbox no wider than the checkout (`PrivateUsers`, `NoNewPrivileges`, `PrivateTmp`, `RestrictSUIDSGID`, `ProtectSystem=strict`, one `ReadWritePaths`, an OPTIONAL `EnvironmentFile`);
