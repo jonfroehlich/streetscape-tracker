@@ -104,7 +104,12 @@ def _run(monkeypatch, cfg, *args, fetcher=None, in_flight=None):
         pf, "_run_due_in_flight", in_flight if callable(in_flight) else (lambda: in_flight)
     )
     monkeypatch.setattr(pf.time, "sleep", lambda s: slept.append(s))
-    rc = pf.main(["--date", TODAY.isoformat(), *[str(a) for a in args]])
+    args = [str(a) for a in args]
+    # --all-enabled refuses --date (#381), so it gets none: passing one would
+    # make every all-enabled test exit 64 for the wrong reason, and a test
+    # asserting 64 (the in-flight refusal, --nights) would pass vacuously.
+    date_args = [] if "--all-enabled" in args else ["--date", TODAY.isoformat()]
+    rc = pf.main([*date_args, *args])
     return rc, fetcher, slept
 
 
@@ -498,3 +503,264 @@ def test_terminated_is_not_an_exception_a_library_can_swallow():
     and keep fetching past the unit's timeout."""
     assert not issubclass(pf.Terminated, Exception)
     assert issubclass(pf.Terminated, BaseException)
+
+
+# ── --all-enabled: drain the whole catalog's cold backlog (issue #381) ────────
+#
+# The slate mode only ever sees cities DUE by the target date, so a cold city
+# the night will not reach is frozen only the night it is walked -- exactly
+# when a refusal strands it. This mode plans every enabled member city instead.
+
+
+def _freeze(data_dir, city_id, network_type="drive"):
+    path = network_cache_path(city_id, data_dir, network_type)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    open(path, "w").close()
+
+
+def test_all_enabled_selects_enabled_cold_cities_past_the_nights_window(
+    three_cities, conn, data_dir, monkeypatch
+):
+    """Past the cap AND not due tonight, both of which the slate mode drops;
+    a disabled city and an already-frozen one are skipped."""
+    alpha, beta, gamma = three_cities
+    delta = _register(conn, "Delta")
+    epsilon = _register(conn, "Epsilon")
+    db.set_city_enabled(conn, delta, False)
+    _freeze(data_dir, epsilon)
+    # Alpha was walked yesterday on every channel, so no night will reach it
+    # for ~83 days -- but its network is cold, which is what this mode is for.
+    db.assign_schedule(conn, 90)
+    for provider in ("gsv", "gsv_streets", "mapillary", "mapillary_streets"):
+        db.record_attempt(conn, alpha, success=True, provider=provider)
+    conn.commit()
+
+    rc, fetcher, _ = _run(monkeypatch, _cfg(data_dir, max_cities_per_day=1), "--execute")
+    assert fetcher.calls == [(beta, "drive")], "the slate mode sees one due city"
+
+    os.remove(network_cache_path(beta, data_dir, "drive"))
+    rc, fetcher, _ = _run(
+        monkeypatch, _cfg(data_dir, max_cities_per_day=1), "--all-enabled", "--execute"
+    )
+    assert rc == 0
+    # Never-walked first (city_id order), then Alpha, whose walk is the freshest.
+    assert fetcher.calls == [(beta, "drive"), (gamma, "drive"), (alpha, "drive")]
+
+
+def test_all_enabled_limit_truncates_in_staleness_order(three_cities, conn, data_dir, monkeypatch):
+    """Stalest-first, NOT city_id order: a city walked long ago outranks one
+    walked recently, and the never-walked outrank both."""
+    alpha, beta, gamma = three_cities
+    db.assign_schedule(conn, 90)
+    for city_id, when in ((alpha, "2026-09-01T00:00:00"), (beta, "2026-03-01T00:00:00")):
+        for provider in ("gsv_streets", "mapillary_streets"):
+            db.record_attempt(conn, city_id, success=True, provider=provider)
+            conn.execute(
+                "UPDATE schedule_state SET last_success_at = ? WHERE city_id = ? AND provider = ?",
+                (when, city_id, provider),
+            )
+    conn.commit()
+
+    planned = pf.plan_prefreeze_all_enabled(conn, _cfg(data_dir))
+    assert [(c.city_id, t) for c, t, _ in planned] == [
+        (gamma, "drive"),
+        (beta, "drive"),
+        (alpha, "drive"),
+    ]
+    assert planned[0][2] == ["gsv_streets", "mapillary_streets"], "one GraphML, both channels"
+
+    rc, fetcher, _ = _run(monkeypatch, _cfg(data_dir), "--all-enabled", "--limit", "2", "--execute")
+    assert rc == 0
+    assert fetcher.calls == [(gamma, "drive"), (beta, "drive")]
+
+
+def _set_walked(conn, city_id, provider, when):
+    """Record a success on this channel and backdate it to ``when``."""
+    db.record_attempt(conn, city_id, success=True, provider=provider)
+    conn.execute(
+        "UPDATE schedule_state SET last_success_at = ? WHERE city_id = ? AND provider = ?",
+        (when, city_id, provider),
+    )
+    conn.commit()
+
+
+def _fail(conn, city_id, provider, times):
+    for _ in range(times):
+        db.record_attempt(conn, city_id, success=False, error="no network", provider=provider)
+
+
+def test_all_enabled_staleness_is_the_oldest_channel_and_any_never_walked_wins(
+    three_cities, conn, data_dir
+):
+    """Channels with DIFFERENT timestamps, which is what tells min from max:
+    Alpha (Jan / Sep) is older than Beta (May / May) by its OLDEST walk and
+    younger by its newest; Gamma, walked on one channel and never on the
+    other, is never-walked, as is Delta, which sorts ahead of it by city_id."""
+    alpha, beta, gamma = three_cities
+    delta = _register(conn, "Delta")
+    _set_walked(conn, alpha, "gsv_streets", "2026-01-01T00:00:00")
+    _set_walked(conn, alpha, "mapillary_streets", "2026-09-01T00:00:00")
+    _set_walked(conn, beta, "gsv_streets", "2026-05-01T00:00:00")
+    _set_walked(conn, beta, "mapillary_streets", "2026-05-01T00:00:00")
+    _set_walked(conn, gamma, "mapillary_streets", "2026-02-01T00:00:00")
+
+    planned = pf.plan_prefreeze_all_enabled(conn, _cfg(data_dir))
+    assert [c.city_id for c, _, _ in planned] == [delta, gamma, alpha, beta]
+
+
+def test_all_enabled_skips_a_channel_quarantined_at_the_failure_cap(three_cities, conn, data_dir):
+    """A quarantined channel never walks the city until an operator
+    intervenes, so its network buys nothing tonight. Quarantine is per
+    CHANNEL: a city still walked by another channel is still planned, for it."""
+    alpha, beta, gamma = three_cities
+    cfg = _cfg(data_dir)
+    for provider in ("gsv_streets", "mapillary_streets"):
+        _fail(conn, alpha, provider, cfg.max_consecutive_failures)
+    _fail(conn, beta, "gsv_streets", cfg.max_consecutive_failures)
+
+    planned = pf.plan_prefreeze_all_enabled(conn, cfg)
+    assert [(c.city_id, ch) for c, _, ch in planned] == [
+        (beta, ["mapillary_streets"]),
+        (gamma, ["gsv_streets", "mapillary_streets"]),
+    ]
+
+
+def test_all_enabled_limit_1_passes_move_past_a_city_whose_fetch_keeps_failing(
+    conn, data_dir, monkeypatch, capsys
+):
+    """The PR #382 review's repro: a city whose bbox has no drivable ways fails
+    every fetch and writes no GraphML, so it is cold forever. Failing but not
+    yet quarantined, it goes behind every clean city, so repeated --limit 1
+    passes make progress instead of re-asking it every afternoon."""
+    cities = [_register(conn, f"City{i:02d}") for i in range(4)]
+    roadless = cities[0]
+    for provider in ("gsv_streets", "mapillary_streets"):
+        _fail(conn, roadless, provider, 2)
+
+    def one_pass():
+        fetcher = _Fetcher({roadless: DownloadError("no drivable ways in this bbox")})
+        rc, fetcher, _ = _run(
+            monkeypatch,
+            _cfg(data_dir),
+            "--all-enabled",
+            "--limit",
+            "1",
+            "--execute",
+            fetcher=fetcher,
+        )
+        return rc, fetcher.calls
+
+    assert [one_pass() for _ in range(3)] == [
+        (0, [(cities[1], "drive")]),
+        (0, [(cities[2], "drive")]),
+        (0, [(cities[3], "drive")]),
+    ]
+    capsys.readouterr()
+
+    # Only the failing city is left: it is still asked (it is not quarantined,
+    # and the night would ask it too), but a pass that froze nothing says so.
+    assert one_pass() == (0, [(roadless, "drive")])
+    out = capsys.readouterr().out
+    assert "WARNING: every planned fetch failed (1 of 1); NOTHING was frozen" in out
+
+    # And once the nights have quarantined it, no pass asks at all.
+    for provider in ("gsv_streets", "mapillary_streets"):
+        _fail(conn, roadless, provider, 3)
+    assert one_pass() == (0, [])
+
+
+def test_all_enabled_skips_a_city_no_enabled_street_channel_walks(
+    three_cities, conn, data_dir, monkeypatch
+):
+    """A network no channel will walk is an Overpass request that buys nothing:
+    Gamma is excluded from both walk channels, so it is not planned."""
+    alpha, beta, gamma = three_cities
+    for provider in ("gsv_streets", "mapillary_streets"):
+        db.set_channel_membership(conn, gamma, provider, False, cycle_days=90)
+    planned = pf.plan_prefreeze_all_enabled(conn, _cfg(data_dir))
+    assert [c.city_id for c, _, _ in planned] == [alpha, beta]
+
+    # On an OPT-IN walk channel a NULL member means "not enrolled", so only the
+    # city an operator enrolled is planned -- the channel's default, never True.
+    db.set_channel_membership(conn, beta, "kartaview_streets", True, cycle_days=90)
+    conn.commit()
+    cfg = _cfg(data_dir, providers={"kartaview_streets": ProviderConfig(enabled=True)})
+    planned = pf.plan_prefreeze_all_enabled(conn, cfg)
+    assert [(c.city_id, ch) for c, _, ch in planned] == [(beta, ["kartaview_streets"])]
+
+
+def test_all_enabled_dry_run_fetches_nothing_and_defaults_limit_to_20(
+    conn, data_dir, monkeypatch, capsys
+):
+    cities = [_register(conn, f"City{i:02d}") for i in range(22)]
+    rc, fetcher, slept = _run(monkeypatch, _cfg(data_dir), "--all-enabled")
+    assert rc == 0
+    assert fetcher.calls == [] and slept == []
+    out = capsys.readouterr().out
+    assert "DRY RUN" in out
+    assert "Would freeze 20 cold street network(s) across every enabled city" in out
+    assert "2 more cold network(s) are past --limit 20." in out
+    assert cities[19] in out and cities[20] not in out
+
+
+def test_all_enabled_and_nights_are_mutually_exclusive(three_cities, data_dir, monkeypatch):
+    rc, fetcher, _ = _run(
+        monkeypatch, _cfg(data_dir), "--all-enabled", "--nights", "1", "--execute"
+    )
+    assert rc == USAGE_EXIT_CODE
+    assert fetcher.calls == []
+
+
+def test_all_enabled_refuses_date(three_cities, data_dir, monkeypatch):
+    """No date enters a staleness-ordered plan, so accepting one would promise
+    a filter that is not applied."""
+    fetcher = _Fetcher()
+    monkeypatch.setattr(pf, "load_scheduler_config", lambda path: _cfg(data_dir))
+    monkeypatch.setattr(pf, "fetch_graph", fetcher)
+    monkeypatch.setattr(pf, "_run_due_in_flight", lambda: None)
+    monkeypatch.setattr(pf.time, "sleep", lambda s: None)
+    argv = ["--all-enabled", "--execute"]
+    assert pf.main(["--date", TODAY.isoformat(), *argv]) == USAGE_EXIT_CODE
+    assert fetcher.calls == []
+    # The control: the same invocation without --date runs.
+    assert pf.main(argv) == 0
+    assert len(fetcher.calls) == 3
+
+
+def test_all_enabled_still_stops_on_a_run_due_and_a_host_condition(
+    three_cities, data_dir, monkeypatch
+):
+    """The backlog drain shares the slate mode's guards, not a copy of them."""
+    alpha, _, _ = three_cities
+    rc, fetcher, _ = _run(
+        monkeypatch, _cfg(data_dir), "--all-enabled", "--execute", in_flight="pid 4242: run-due"
+    )
+    assert rc == USAGE_EXIT_CODE
+    assert fetcher.calls == []
+
+    blocked = HostBlockedError("Overpass refused this host", host=HOST_OVERPASS)
+    rc, fetcher, _ = _run(
+        monkeypatch,
+        _cfg(data_dir),
+        "--all-enabled",
+        "--execute",
+        fetcher=_Fetcher({alpha: blocked}),
+    )
+    assert rc == 76
+    assert fetcher.calls == [(alpha, "drive")]
+
+
+def test_all_enabled_alert_names_the_mode_to_rerun(three_cities, data_dir, monkeypatch):
+    alpha, _, _ = three_cities
+    blocked = HostBlockedError("Overpass refused this host", host=HOST_OVERPASS)
+    rc, _, alerts = _run_alerting(
+        monkeypatch,
+        _cfg(data_dir),
+        "--all-enabled",
+        "--execute",
+        "--alert",
+        fetcher=_Fetcher({alpha: blocked}),
+    )
+    assert rc == 76
+    ((_, body),) = alerts.sent
+    assert "--all-enabled --execute" in body and "--nights 2" not in body
