@@ -730,6 +730,22 @@ def _no_host_recheck_probe(monkeypatch):
         monkeypatch.setitem(sched.HOST_RECHECKS, host, lambda: False)
 
 
+@pytest.fixture(autouse=True)
+def _no_recheck_cooldown_wait(monkeypatch):
+    """
+    Make the stranded-walk retry's cooldown wait (issue #380) instant.
+
+    ``_retry_stranded_walks`` waits out the breaker's 45-min cooldown before
+    its one extra try, and every night-level test that strands a walk under the
+    default cooldown reaches it. The stand-in answers what the real wait would
+    at its end -- whether a stop was requested -- without spending the time.
+    Tests that care what was waited override it (``monkeypatch.setattr``).
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    monkeypatch.setattr(sched, "_wait_out_recheck_cooldown", lambda stop, seconds: stop.is_set())
+
+
 # A Pacific evening, the hour #347 was measured in: 17:30 PDT on 2026-08-31 is
 # 00:30 UTC on 2026-09-01, so the UTC and local calendars disagree by a day.
 # The instant is in the PAST relative to any run of the suite, so an unfrozen

@@ -11530,8 +11530,11 @@ def _recovering_probe(answers):
     return probe
 
 
-def _drive_night(monkeypatch, conn, cfg, run_one, today=date(2026, 7, 2)):
-    """_run_loop_with, but returning the alert and the log-visible summary too."""
+def _drive_night(monkeypatch, conn, cfg, run_one, today=date(2026, 7, 2), published=None):
+    """_run_loop_with, but returning the alert and the log-visible summary too.
+
+    ``published`` collects the tail's steps, for a test that asserts it ran.
+    """
     from streetscape_metadata_tracker import scheduler as sched
 
     alerts = []
@@ -11542,7 +11545,7 @@ def _drive_night(monkeypatch, conn, cfg, run_one, today=date(2026, 7, 2)):
             run_one(city, provider)
         ),
     )
-    _stub_tail(monkeypatch, sched, conn, [])
+    _stub_tail(monkeypatch, sched, conn, [] if published is None else published)
     monkeypatch.setattr(
         sched, "send_alert", lambda cfg, subject, body: alerts.append((subject, body))
     )
@@ -11623,6 +11626,11 @@ def test_a_refusal_that_clears_inside_the_cooldown_resumes_street_channels_the_s
         ("gamma", "gsv_streets"),  # no longer latched: no further re-check
         ("gamma", "mapillary"),
         ("gamma", "mapillary_streets"),
+        # The end-of-night retry (issue #380) walks the three the host cost,
+        # in the night's order, with no further re-check.
+        ("alpha", "gsv_streets"),
+        ("alpha", "mapillary_streets"),
+        ("beta", "gsv_streets"),
     ]
     assert len(probe.calls) == 3, "one request per re-check, none once recovered"
 
@@ -11921,6 +11929,663 @@ def test_a_busy_host_strands_a_city_exactly_like_a_refusal(conn, monkeypatch, ca
     assert f"{alpha} (gsv_streets)" in body
     assert beta not in body.split("came out of the night")[1]
     assert "refused or locally busy host" in body
+
+
+# ---------------------------------------------------------------------------
+# The end-of-night stranded-walk retry (issue #380)
+#
+# A night finishes in ~2-3 h of its 12 h window, and an Overpass refusal has
+# cleared on a minutes-to-~1 h scale, yet once the loop passed a city nothing
+# asked the breaker on its behalf again. These pin the pass that does: it
+# walks exactly the stranded (city, walk) pairs, through the same breaker, on
+# tonight's date; a recovery leaves `stranded` and is counted, a failure keeps
+# the original entry; and its one extra try waits out the cooldown only when a
+# re-check is left, the deadline has room, and no stop was asked for.
+# ---------------------------------------------------------------------------
+
+
+def _two_walk_cfg(**overrides):
+    """gsv + gsv_streets only, so a night's walks are one channel per city."""
+    return SchedulerConfig(
+        providers={
+            "gsv": ProviderConfig(enabled=True, daily_request_budget=10_000_000),
+            "gsv_streets": ProviderConfig(enabled=True, daily_request_budget=2_000_000),
+        },
+        publish_enabled=False,
+        alerts=AlertConfig(enabled=True, failure_threshold=99),
+        **overrides,
+    )
+
+
+def _refuse_alpha_first_walk(alpha):
+    """A run_one where Alpha's first walk is refused by Overpass and all else lands."""
+    from streetscape_metadata_tracker.download_common import HOST_OVERPASS
+
+    ran = []
+
+    def run_one(city, provider):
+        ran.append((city.city_id, provider))
+        if provider == "gsv_streets" and city.city_id == alpha and ran.count(ran[-1]) == 1:
+            return _blocked_outcome(HOST_OVERPASS)
+        return True
+
+    return ran, run_one
+
+
+def _record_waits(monkeypatch, stop_on_wait=False):
+    """Replace the cooldown wait with a recorder; optionally a SIGTERM arrives in it."""
+    waits = []
+
+    def wait(stop, seconds):
+        waits.append(seconds)
+        if stop_on_wait:
+            stop.set()
+        return stop.is_set()
+
+    monkeypatch.setattr(_sched, "_wait_out_recheck_cooldown", wait)
+    return waits
+
+
+def _done_line(caplog):
+    done = [r.message for r in caplog.records if r.message.startswith("Done: ")]
+    assert len(done) == 1
+    return done[0]
+
+
+def test_a_stranded_walk_whose_host_serves_again_is_recovered_the_same_night(
+    conn, monkeypatch, caplog
+):
+    """Alpha's walk is refused, Beta's is skipped by a re-check that still says
+    no; at the pass the re-check says serving, both walks run and land, leave
+    `stranded`, and are counted -- so neither the Done line nor the alert
+    reports a STRANDED city, and no recovery command is printed."""
+    from streetscape_metadata_tracker.download_common import HOST_OVERPASS
+
+    monkeypatch.setattr(_sched, "HOST_RECHECK_COOLDOWN_S", 0)
+    probe = _recovering_probe([False, True])
+    monkeypatch.setitem(_sched.HOST_RECHECKS, HOST_OVERPASS, probe)
+    alpha = _register(conn, "Alpha", width=1000, height=1000, step=20)
+    beta = _register(conn, "Beta", width=1000, height=1000, step=20)
+    ran, run_one = _refuse_alpha_first_walk(alpha)
+    waits = _record_waits(monkeypatch)
+
+    with caplog.at_level(logging.INFO):
+        rc, alerts = _drive_night(monkeypatch, conn, _two_walk_cfg(), run_one)
+
+    assert ran == [
+        (alpha, "gsv"),
+        (alpha, "gsv_streets"),  # refused: trips the breaker
+        (beta, "gsv"),
+        # beta/gsv_streets: re-check 1 says no -> skipped -> stranded
+        (alpha, "gsv_streets"),  # the pass: re-check 2 says serving
+        (beta, "gsv_streets"),
+    ]
+    # Every stranded walk landed, yet the refusal still cost the night
+    # launches: unhealthy, alerting, named as recovered (CLAUDE.md's rule).
+    assert rc == 1
+    assert len(probe.calls) == 2
+    assert waits == [], "nothing was left to wait for"
+    done = _done_line(caplog)
+    assert "STRANDED" not in done
+    assert "4/4 runs succeeded across 2 cities" in done, "retries count as runs, not cities"
+    assert "2 stranded walk(s) recovered by the end-of-night retry" in done
+    ((subject, body),) = alerts
+    assert "1 host(s) REFUSED then recovered" in subject
+    assert "STRANDED" not in subject
+    assert "came out of the night" not in body
+    assert "2 stranded walk(s) were recovered by the end-of-night retry" in body
+    assert _alert_commands(body) == []
+    # Recorded as a success, so the walk is no longer due on its channel.
+    for cid in (alpha, beta):
+        row = conn.execute(
+            "SELECT last_success_at FROM schedule_state WHERE city_id = ? AND provider = ?",
+            (cid, "gsv_streets"),
+        ).fetchone()
+        assert row["last_success_at"] is not None, cid
+
+
+def test_a_stranded_walk_still_refused_at_the_pass_keeps_its_entry(conn, monkeypatch, caplog):
+    """The re-check never clears. The pass asks for both walks, asks once more
+    while a re-check is left (at a cooldown of 0 the next one is already due,
+    so there is nothing to wait for), and stops at the nightly cap of four
+    re-checks. No child is launched, both original entries survive (never
+    re-derived: the grid sibling is not in the retry's call), and the alert
+    names both with its recovery command.
+
+    The breaker skipped ONE launch (Beta's, in the loop); the pass's four
+    re-asks are not launches and must not be counted as skips (PR #384
+    review: this night used to report 5)."""
+    from streetscape_metadata_tracker.download_common import HOST_OVERPASS
+
+    monkeypatch.setattr(_sched, "HOST_RECHECK_COOLDOWN_S", 0)
+    probe = _recovering_probe([False])
+    monkeypatch.setitem(_sched.HOST_RECHECKS, HOST_OVERPASS, probe)
+    alpha = _register(conn, "Alpha", width=1000, height=1000, step=20)
+    beta = _register(conn, "Beta", width=1000, height=1000, step=20)
+    ran, run_one = _refuse_alpha_first_walk(alpha)
+    waits = _record_waits(monkeypatch)
+
+    with caplog.at_level(logging.INFO):
+        _rc, alerts = _drive_night(monkeypatch, conn, _two_walk_cfg(), run_one)
+
+    assert ran == [(alpha, "gsv"), (alpha, "gsv_streets"), (beta, "gsv")]
+    # 1 in the loop (Beta's launch), 2 in the pass's first try, 1 after the
+    # wait -- Beta's second ask finds the cap spent and probes nothing.
+    assert len(probe.calls) == _sched.HOST_RECHECKS_PER_NIGHT == 4
+    assert waits == [], "the next re-check was already due"
+    done = _done_line(caplog)
+    assert "2 city(ies) STRANDED un-walked" in done
+    assert "1 launch(es) skipped while latched" in done
+    assert "recovered by the end-of-night retry" not in done
+    ((subject, body),) = alerts
+    assert "2 city(ies) STRANDED un-walked" in subject
+    assert f"{alpha} (gsv_streets)" in body and f"{beta} (gsv_streets)" in body
+    assert "could not walk them either" in body
+    assert " 1 channel launch(es) were skipped in all" in body
+    assert _alert_commands(body) == [
+        ["run-due", "--provider", "gsv_streets", "--city", alpha, "--city", beta]
+    ]
+
+
+def test_the_pass_does_not_wait_when_the_deadline_cannot_hold_the_cooldown(
+    conn, monkeypatch, caplog
+):
+    """A 45-min night under the real 45-min cooldown: the loop runs, the pass's
+    first ask finds no re-check due, and waiting would outlast the batch
+    deadline -- so there is no wait, no child, and the entry is kept."""
+    alpha = _register(conn, "Alpha", width=1000, height=1000, step=20)
+    ran, run_one = _refuse_alpha_first_walk(alpha)
+    waits = _record_waits(monkeypatch)
+
+    with caplog.at_level(logging.INFO):
+        _rc, alerts = _drive_night(monkeypatch, conn, _two_walk_cfg(max_batch_hours=0.75), run_one)
+
+    assert waits == []
+    assert ran == [(alpha, "gsv"), (alpha, "gsv_streets")]
+    assert "the batch deadline is too close" in caplog.text
+    assert "1 city(ies) STRANDED un-walked" in _done_line(caplog)
+    ((_subject, body),) = alerts
+    assert f"{alpha} (gsv_streets)" in body
+
+
+def test_a_sigterm_during_the_pass_still_reaches_the_tail(conn, monkeypatch, caplog):
+    """systemd's stop arrives while the pass waits out the cooldown. The wait
+    returns at once, nothing further is launched, the loop returns its
+    counters with the stop named, and the tail (aggregate, manifest, publish)
+    still runs -- the #167 contract, extended over the new pass."""
+    alpha = _register(conn, "Alpha", width=1000, height=1000, step=20)
+    ran, run_one = _refuse_alpha_first_walk(alpha)
+    waits = _record_waits(monkeypatch, stop_on_wait=True)
+    published = []
+
+    with caplog.at_level(logging.INFO):
+        _rc, alerts = _drive_night(
+            monkeypatch,
+            conn,
+            _two_walk_cfg(),
+            run_one,
+            published=published,
+        )
+
+    assert len(waits) == 1
+    assert ran == [(alpha, "gsv"), (alpha, "gsv_streets")]
+    done = _done_line(caplog)
+    assert f"stopped early ({_sched._STOP_REASON_SIGTERM})" in done
+    assert "1 city(ies) STRANDED un-walked" in done
+    assert "aggregate" in published and "manifest" in published
+    ((_subject, body),) = alerts
+    assert f"{alpha} (gsv_streets)" in body
+
+
+def test_the_pass_spends_no_recheck_the_loop_already_spent(conn, monkeypatch):
+    """At a cap of one, Beta's launch in the loop spends the night's only
+    re-check. The pass asks the breaker, which probes nothing, and has no
+    reason to wait: there is no second retry budget beside the breaker's."""
+    from streetscape_metadata_tracker.download_common import HOST_OVERPASS
+
+    monkeypatch.setattr(_sched, "HOST_RECHECK_COOLDOWN_S", 0)
+    monkeypatch.setattr(_sched, "HOST_RECHECKS_PER_NIGHT", 1)
+    probe = _recovering_probe([False])
+    monkeypatch.setitem(_sched.HOST_RECHECKS, HOST_OVERPASS, probe)
+    alpha = _register(conn, "Alpha", width=1000, height=1000, step=20)
+    _register(conn, "Beta", width=1000, height=1000, step=20)
+    ran, run_one = _refuse_alpha_first_walk(alpha)
+    waits = _record_waits(monkeypatch)
+
+    _drive_night(monkeypatch, conn, _two_walk_cfg(), run_one)
+
+    assert len(probe.calls) == 1, "the loop's one re-check, and none from the pass"
+    assert waits == []
+    assert [p for _, p in ran].count("gsv_streets") == 1
+
+
+def test_the_retry_walks_on_tonights_run_date(conn, monkeypatch):
+    """A recovered walk must carry its grid run's --run-date, or the pair is
+    lost. Captured from the REAL argv (_run_one_city builds it), on a night
+    dated in the past so any re-derived 'today' differs."""
+    from streetscape_metadata_tracker.download_common import HOST_OVERPASS
+
+    monkeypatch.setattr(_sched, "HOST_RECHECK_COOLDOWN_S", 0)
+    monkeypatch.setitem(_sched.HOST_RECHECKS, HOST_OVERPASS, _recovering_probe([True]))
+    alpha = _register(conn, "Alpha", width=1000, height=1000, step=20)
+    walks = []
+
+    def capture(cfg, cmd, timeout_s, city, provider, today):
+        if provider == "gsv_streets":
+            walks.append(cmd[cmd.index("--run-date") + 1])
+            if len(walks) == 1:
+                return _blocked_outcome(HOST_OVERPASS)
+        return _sched.CollectionOutcome(True, "stubbed")
+
+    monkeypatch.setattr(_sched, "_run_collection_subprocess", capture)
+    monkeypatch.setattr(_sched, "_reconcile_orphaned_run", lambda *a, **k: True)
+    _stub_tail(monkeypatch, _sched, conn, [])
+    monkeypatch.setattr(_sched, "send_alert", lambda *a, **k: None)
+    _sched.cmd_run_due(_two_walk_cfg(), today=date(2026, 7, 2))
+
+    assert walks == ["2026-07-02", "2026-07-02"], "the refused walk, then its retry"
+    row = conn.execute(
+        "SELECT last_success_at FROM schedule_state WHERE city_id = ? AND provider = ?",
+        (alpha, "gsv_streets"),
+    ).fetchone()
+    assert row["last_success_at"] is not None
+
+
+def _busy_walk_night(monkeypatch, conn, caplog, busy_times):
+    """Alpha's walk finds Overpass busy locally ``busy_times`` times, then lands;
+    Beta's Mapillary grid is refused, so the night alerts regardless."""
+    from streetscape_metadata_tracker.download_common import HOST_MAPILLARY_TILES, HOST_OVERPASS
+
+    alpha = _register(conn, "Alpha", width=1000, height=1000, step=20)
+    beta = _register(conn, "Beta", width=1000, height=1000, step=20)
+    walks = []
+
+    def run_one(city, provider):
+        if provider == "gsv_streets" and city.city_id == alpha:
+            walks.append(provider)
+            if len(walks) <= busy_times:
+                return _busy_outcome(HOST_OVERPASS)
+        if provider == "mapillary" and city.city_id == beta:
+            return _blocked_outcome(HOST_MAPILLARY_TILES)
+        return True
+
+    cfg = _two_walk_cfg()
+    cfg.providers["mapillary"] = ProviderConfig(enabled=True, daily_request_budget=40_000)
+    with caplog.at_level(logging.INFO):
+        _rc, alerts = _drive_night(monkeypatch, conn, cfg, run_one)
+    ((subject, body),) = alerts
+    return alpha, walks, _done_line(caplog), subject, body
+
+
+def test_a_recovered_busy_strand_is_no_longer_reported_as_a_busy_skip(conn, monkeypatch, caplog):
+    """Found by the #380 pass's own review: a walk stranded by a BUSY lock
+    (exit 80) that the pass then lands must leave `busy_hosts`, or the email
+    keeps saying its channel 'stays due' for a skip that is no longer
+    outstanding. It is named instead as BUSY then recovered, with its host and
+    count, mirroring a refusal that recovered."""
+    alpha, walks, done, subject, body = _busy_walk_night(monkeypatch, conn, caplog, busy_times=1)
+
+    assert walks == ["gsv_streets", "gsv_streets"], "busy in the loop, landed in the pass"
+    assert "busy locally" not in done
+    assert "SKIPPED (host busy)" not in subject
+    assert "1 host(s) BUSY then recovered" in subject
+    assert (
+        "1 stranded walk(s) had been skipped because the Overpass API (overpass-api.de) "
+        "was busy with another process on this machine" in body
+    )
+    # The busy paragraph, whose "they stay due" is what went stale. (The
+    # Mapillary refusal's own paragraph rightly still says its channels do.)
+    assert "another process on this machine held the lock" not in body
+    assert "1 stranded walk(s) were recovered by the end-of-night retry" in body
+    assert "1 of them had been skipped because the Overpass API" in body
+    assert "STRANDED" not in subject
+
+
+def test_a_night_whose_only_busy_strand_was_recovered_still_alerts(conn, monkeypatch):
+    """With nothing else wrong and nothing outstanding, a busy strand the pass
+    landed still makes the night unhealthy: another process held the lock and
+    cost it a launch, most often the pre-freeze pass overrunning, and CLAUDE.md
+    says a busy night alerts unconditionally and exits nonzero. Named as BUSY
+    then recovered, never as a skip that stays due."""
+    from streetscape_metadata_tracker.download_common import HOST_OVERPASS
+
+    alpha = _register(conn, "Alpha", width=1000, height=1000, step=20)
+    walks = []
+
+    def run_one(city, provider):
+        if provider == "gsv_streets" and city.city_id == alpha:
+            walks.append(provider)
+            if len(walks) == 1:
+                return _busy_outcome(HOST_OVERPASS)
+        return True
+
+    rc, alerts = _drive_night(monkeypatch, conn, _two_walk_cfg(), run_one)
+
+    assert walks == ["gsv_streets", "gsv_streets"]
+    assert rc == 1
+    ((subject, body),) = alerts
+    assert subject.startswith("1 host(s) BUSY then recovered on ")
+    assert "failed collection" not in subject
+    assert "1 stranded walk(s) had been skipped because the Overpass API" in body
+    assert "locks/*.lock.owner" in body
+    assert "stay due" not in body
+
+
+def test_a_busy_strand_busy_again_at_the_pass_is_counted_once(conn, monkeypatch, caplog):
+    """The lock is still held when the pass retries: the walk stays stranded
+    and the busy paragraph counts ONE skipped channel, not the loop's and the
+    retry's as two."""
+    alpha, walks, done, subject, body = _busy_walk_night(monkeypatch, conn, caplog, busy_times=2)
+
+    assert walks == ["gsv_streets", "gsv_streets"]
+    assert "1 channel(s) skipped, the Overpass API (overpass-api.de) busy locally" in done
+    assert "1 channel(s) SKIPPED (host busy)" in subject
+    assert "1 city(ies) STRANDED un-walked" in subject
+    assert f"{alpha} (gsv_streets)" in body
+    assert "recovered by the end-of-night retry" not in body
+
+
+def test_the_pass_restores_the_per_host_skip_count_and_retries_an_unlatched_walk(
+    conn, monkeypatch, caplog
+):
+    """PR #384 review, finding 1, per host. Beta's loop skip is the night's one
+    real skip. At the pass Alpha's ask is re-checked (still refusing) and
+    skipped; Beta's ask is re-checked and clears -- and the recovery line must
+    still say ONE launch was skipped, not count Alpha's re-ask. Alpha, no
+    longer latched by anything, is then walked on the second try without a
+    wait."""
+    from streetscape_metadata_tracker.download_common import HOST_OVERPASS
+
+    monkeypatch.setattr(_sched, "HOST_RECHECK_COOLDOWN_S", 0)
+    monkeypatch.setitem(
+        _sched.HOST_RECHECKS, HOST_OVERPASS, _recovering_probe([False, False, True])
+    )
+    alpha = _register(conn, "Alpha", width=1000, height=1000, step=20)
+    beta = _register(conn, "Beta", width=1000, height=1000, step=20)
+    ran, run_one = _refuse_alpha_first_walk(alpha)
+    waits = _record_waits(monkeypatch)
+
+    with caplog.at_level(logging.INFO):
+        _drive_night(monkeypatch, conn, _two_walk_cfg(), run_one)
+
+    assert "(1 launch(es) were skipped while it was latched)" in caplog.text
+    assert [c for c, p in ran if p == "gsv_streets"] == [alpha, beta, alpha]
+    assert waits == []
+    done = _done_line(caplog)
+    assert "1 launch(es) skipped while latched" in done
+    assert "2 stranded walk(s) recovered by the end-of-night retry" in done
+
+
+def test_the_pass_does_not_wait_for_a_walk_a_never_rechecked_host_still_holds(
+    conn, monkeypatch, caplog
+):
+    """PR #384 review, finding 2. Alpha's Mapillary walk is refused by the tile
+    CDN, which is never re-checked; Beta's grid fails and its walk is refused
+    by Overpass, which is. Overpass having a re-check left is no reason to
+    wait 45 min: Alpha's walk cannot launch however long the pass waits."""
+    from streetscape_metadata_tracker.download_common import HOST_MAPILLARY_TILES, HOST_OVERPASS
+
+    alpha = _register(conn, "Alpha", width=1000, height=1000, step=20)
+    beta = _register(conn, "Beta", width=1000, height=1000, step=20)
+    waits = _record_waits(monkeypatch)
+    ran = []
+
+    def run_one(city, provider):
+        ran.append((city.city_id, provider))
+        if city.city_id == alpha and provider == "mapillary_streets":
+            return _blocked_outcome(HOST_MAPILLARY_TILES)
+        if city.city_id == beta and provider == "gsv":
+            return False
+        if city.city_id == beta and provider == "gsv_streets":
+            return _blocked_outcome(HOST_OVERPASS)
+        return True
+
+    cfg = _street_cfg(publish_enabled=False, alerts=AlertConfig(enabled=True, failure_threshold=99))
+    with caplog.at_level(logging.INFO):
+        _drive_night(monkeypatch, conn, cfg, run_one)
+
+    assert waits == []
+    assert "still refuses them, so waiting cannot help" in caplog.text
+    assert ran.count((alpha, "mapillary_streets")) == 1, "never launched again"
+    assert "1 city(ies) STRANDED un-walked" in _done_line(caplog)
+
+
+def test_the_pass_waits_until_the_next_recheck_not_a_flat_cooldown(conn, monkeypatch):
+    """PR #384 review, finding 2. The breaker's next re-check is already
+    under way from the trip, so the wait is what is LEFT of the cooldown --
+    strictly less than it -- never the whole cooldown again."""
+    monkeypatch.setattr(_sched, "HOST_RECHECK_COOLDOWN_S", 600)
+    alpha = _register(conn, "Alpha", width=1000, height=1000, step=20)
+    _ran, run_one = _refuse_alpha_first_walk(alpha)
+    waits = _record_waits(monkeypatch)
+
+    _drive_night(monkeypatch, conn, _two_walk_cfg(), run_one)
+
+    assert len(waits) == 1
+    assert 590 < waits[0] < 600
+
+
+def test_the_wait_gate_leaves_room_for_a_childs_floor_timeout(conn, monkeypatch, caplog):
+    """The gate is `wait + _MIN_CLAMPED_TIMEOUT_S`, not the wait alone: with
+    2850 s of night left and a 2700 s wait, waiting would leave a retried
+    child 150 s, under the 300 s floor the loop never starts a child with.
+    (The 45-min night of the test above cannot see the floor term: 2700 is
+    under 2700 + anything.)"""
+    alpha = _register(conn, "Alpha", width=1000, height=1000, step=20)
+    _ran, run_one = _refuse_alpha_first_walk(alpha)
+    waits = _record_waits(monkeypatch)
+
+    with caplog.at_level(logging.INFO):
+        _drive_night(
+            monkeypatch,
+            conn,
+            _two_walk_cfg(max_batch_hours=(2700 + 150) / 3600),
+            run_one,
+        )
+
+    assert waits == []
+    assert "the batch deadline is too close" in caplog.text
+
+
+def test_a_sigterm_during_the_last_retried_walk_is_reported(conn, monkeypatch, caplog):
+    """PR #384 review, finding 3. The stop lands while the pass's only child
+    runs; that walk lands and nothing is left to ask about, but the night was
+    still stopped and the `Done:` line must say so, as the loop's own
+    after-city check does (issue #206)."""
+    from streetscape_metadata_tracker.download_common import HOST_OVERPASS
+
+    monkeypatch.setattr(_sched, "HOST_RECHECK_COOLDOWN_S", 0)
+    monkeypatch.setitem(_sched.HOST_RECHECKS, HOST_OVERPASS, _recovering_probe([True]))
+    _register(conn, "Alpha", width=1000, height=1000, step=20)
+    stop = threading.Event()
+
+    @contextlib.contextmanager
+    def fake_stop_on_sigterm():
+        yield stop
+
+    monkeypatch.setattr(_sched, "_stop_on_sigterm", fake_stop_on_sigterm)
+    walks = []
+
+    def run_one(city, provider):
+        if provider == "gsv_streets":
+            walks.append(provider)
+            if len(walks) == 1:
+                return _blocked_outcome(HOST_OVERPASS)
+            stop.set()  # systemd's stop, arriving mid-child
+        return True
+
+    with caplog.at_level(logging.INFO):
+        _drive_night(monkeypatch, conn, _two_walk_cfg(), run_one)
+
+    done = _done_line(caplog)
+    assert len(walks) == 2
+    assert "1 stranded walk(s) recovered by the end-of-night retry" in done
+    assert f"stopped early ({_sched._STOP_REASON_SIGTERM})" in done
+
+
+def test_the_pass_reports_its_own_deadline_stop(conn, monkeypatch, caplog):
+    """PR #384 review, finding 3. The loop worked through its whole due list,
+    so it has no stop reason; the pass then finds the deadline too close to
+    launch a child. That is a stop, and the `Done:` line must name it."""
+    alpha = _register(conn, "Alpha", width=1000, height=1000, step=20)
+    clock = _WorkClock(per_unit_s=3400.0)
+    monkeypatch.setattr(_sched.time, "monotonic", clock)
+    _ran, refuse = _refuse_alpha_first_walk(alpha)
+
+    def run_one(city, provider):
+        outcome = refuse(city, provider)
+        if provider == "gsv_streets":
+            clock.work()  # the refusal leaves 200 s of a 1 h night
+        return outcome
+
+    with caplog.at_level(logging.INFO):
+        _drive_night(monkeypatch, conn, _two_walk_cfg(max_batch_hours=1), run_one)
+
+    done = _done_line(caplog)
+    assert (
+        "stopped early (batch deadline reached (1 h) during the end-of-night retry; "
+        "1 stranded walk(s) not retried)" in done
+    )
+
+
+def test_a_cap_ended_night_whose_pass_is_stopped_reports_both(conn, monkeypatch, caplog):
+    """PR #384 review, finding 3. The loop ends on the city cap, then the pass
+    takes systemd's stop during its wait. `stop_reason or pass_stop` kept only
+    the cap; both stopped something, so both are named."""
+    alpha = _register(conn, "Alpha", width=1000, height=1000, step=20)
+    _register(conn, "Beta", width=1000, height=1000, step=20)
+    _ran, run_one = _refuse_alpha_first_walk(alpha)
+    _record_waits(monkeypatch, stop_on_wait=True)
+
+    with caplog.at_level(logging.INFO):
+        _drive_night(monkeypatch, conn, _two_walk_cfg(max_cities_per_day=1), run_one)
+
+    assert f"stopped early (city cap reached (1); {_sched._STOP_REASON_SIGTERM})" in _done_line(
+        caplog
+    )
+
+
+def test_the_pass_forwards_the_nights_argv_rejections(conn, monkeypatch, caplog):
+    """#359 made `rejected_argv` a REQUIRED keyword of `_run_city_channels`.
+    Without it the pass's call raised TypeError on every night with a
+    stranded walk, which #167's handler turned into "stopped early
+    (unexpected error)". Here the retried walk is itself rejected: the one
+    rejection reaches the night's counter and the walk stays stranded."""
+    from streetscape_metadata_tracker.download_common import HOST_OVERPASS
+
+    monkeypatch.setattr(_sched, "HOST_RECHECK_COOLDOWN_S", 0)
+    monkeypatch.setitem(_sched.HOST_RECHECKS, HOST_OVERPASS, _recovering_probe([True]))
+    alpha = _register(conn, "Alpha", width=1000, height=1000, step=20)
+    walks = []
+
+    def run_one(city, provider):
+        if provider == "gsv_streets":
+            walks.append(provider)
+            return _blocked_outcome(HOST_OVERPASS) if len(walks) == 1 else _rejected_outcome()
+        return True
+
+    with caplog.at_level(logging.INFO):
+        _rc, alerts = _drive_night(monkeypatch, conn, _two_walk_cfg(), run_one)
+
+    done = _done_line(caplog)
+    assert len(walks) == 2, "refused in the loop, rejected at the pass"
+    assert "unexpected error" not in done
+    assert "1 launch(es) REJECTED by our own CLI (gsv_streets)" in done
+    assert "1 city(ies) STRANDED un-walked" in done
+    ((_subject, body),) = alerts
+    assert body.count(f"{alpha} [gsv_streets]: exited 2") == 1
+
+
+def test_an_argv_rejected_strand_is_never_retried(conn, monkeypatch, caplog):
+    """Decision on #384 (option A): a walk stranded because our own CLI
+    rejected its argv (exit 2, #359) is NOT retried by the pass. The failure
+    is deterministic, so a retry would only waste a launch, record the same
+    rejection twice and name the city twice in the alert. Even with Overpass
+    serving and a re-check to spare, it stays stranded, counted and listed
+    once."""
+    from streetscape_metadata_tracker.download_common import HOST_OVERPASS
+
+    monkeypatch.setattr(_sched, "HOST_RECHECK_COOLDOWN_S", 0)
+    monkeypatch.setitem(_sched.HOST_RECHECKS, HOST_OVERPASS, _recovering_probe([True]))
+    alpha = _register(conn, "Alpha", width=1000, height=1000, step=20)
+    walks = []
+    waits = _record_waits(monkeypatch)
+
+    def run_one(city, provider):
+        if provider == "gsv_streets":
+            walks.append(provider)
+            return _rejected_outcome()
+        return True
+
+    with caplog.at_level(logging.INFO):
+        rc, alerts = _drive_night(monkeypatch, conn, _two_walk_cfg(), run_one)
+
+    assert walks == ["gsv_streets"], "launched once, in the loop; never by the pass"
+    assert waits == []
+    assert rc == 1
+    done = _done_line(caplog)
+    assert "1 launch(es) REJECTED by our own CLI (gsv_streets)" in done
+    assert "1 city(ies) STRANDED un-walked" in done
+    assert "recovered by the end-of-night retry" not in done
+    ((subject, body),) = alerts
+    assert "1 launch(es) REJECTED by our own CLI" in subject
+    assert "1 city(ies) STRANDED un-walked" in subject
+    # Named once in the rejection list and once in the stranded list.
+    assert body.count(f"{alpha} [gsv_streets]: exited 2") == 1
+    assert body.count(f"{alpha} (gsv_streets)") == 1
+
+
+def test_a_deadline_ended_night_names_the_deadline_once(conn, monkeypatch, caplog):
+    """PR #384 final review, N1. The loop stops at the deadline with Beta
+    unattempted, and the pass then meets the same deadline at its first walk.
+    That is one stop, so the `Done:` line says "batch deadline reached" once."""
+    alpha = _register(conn, "Alpha", width=1000, height=1000, step=20)
+    _register(conn, "Beta", width=1000, height=1000, step=20)
+    clock = _WorkClock(per_unit_s=3400.0)
+    monkeypatch.setattr(_sched.time, "monotonic", clock)
+    _ran, refuse = _refuse_alpha_first_walk(alpha)
+
+    def run_one(city, provider):
+        outcome = refuse(city, provider)
+        if city.city_id == alpha and provider == "gsv_streets":
+            clock.work()  # 200 s of a 1 h night left: under the loop's start gate
+        return outcome
+
+    with caplog.at_level(logging.INFO):
+        _drive_night(monkeypatch, conn, _two_walk_cfg(max_batch_hours=1), run_one)
+
+    done = _done_line(caplog)
+    assert "stopped early (batch deadline reached (1 h); 1 due cities not attempted)" in done
+    assert done.count("batch deadline reached") == 1
+
+
+def test_a_city_whose_grid_run_failed_is_never_retried(conn, monkeypatch):
+    """Gamma's walk is lost to the latched host too, but its gsv grid failed,
+    so it was never stranded: it stays gsv-due and re-pairs on its own. The
+    pass walks what is STRANDED, not every walk the breaker cost the night --
+    even with the host serving again."""
+    from streetscape_metadata_tracker.download_common import HOST_OVERPASS
+
+    monkeypatch.setattr(_sched, "HOST_RECHECK_COOLDOWN_S", 0)
+    monkeypatch.setitem(
+        _sched.HOST_RECHECKS, HOST_OVERPASS, _recovering_probe([False, False, True])
+    )
+    alpha = _register(conn, "Alpha", width=1000, height=1000, step=20)
+    beta = _register(conn, "Beta", width=1000, height=1000, step=20)
+    gamma = _register(conn, "Gamma", width=1000, height=1000, step=20)
+    ran, refuse_alpha = _refuse_alpha_first_walk(alpha)
+
+    def run_one(city, provider):
+        if provider == "gsv" and city.city_id == gamma:
+            ran.append((city.city_id, provider))
+            return False
+        return refuse_alpha(city, provider)
+
+    _drive_night(monkeypatch, conn, _two_walk_cfg(), run_one)
+
+    walks = [cid for cid, p in ran if p == "gsv_streets"]
+    assert walks == [alpha, alpha, beta], "Alpha refused, then the pass: Alpha, Beta"
+    assert gamma not in walks
 
 
 def _alert_commands(body):
