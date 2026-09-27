@@ -425,6 +425,14 @@ class HostBreaker(set):
             del self.stranded[city_id]
         self.stranded_recovered += 1
 
+    def can_recheck(self, host: str) -> bool:
+        """True when ``host`` has a reset test and a re-check left tonight."""
+        return host in HOST_RECHECKS and self.rechecks[host] < self.max_rechecks
+
+    def seconds_until_recheck(self, host: str) -> float:
+        """How long until ``blocking`` would next re-check ``host`` (0 if due now)."""
+        return max(0.0, self._next_recheck_at.get(host, 0.0) - self._clock())
+
     def _maybe_recheck(self, host: str) -> None:
         probe = HOST_RECHECKS.get(host)
         if probe is None or self.rechecks[host] >= self.max_rechecks:
@@ -8273,10 +8281,15 @@ def _retry_stranded_walks(
     its grid run's ``--run-date`` and the pair survives; never re-derive it.
 
     The breaker's own re-check is the only probe. A walk it still skips (or
-    whose child is refused again) earns ONE more try, after waiting out the
-    cooldown, and only when a re-check can still be spent on its host and the
-    deadline has room for the wait plus a child's floor timeout -- never a
-    second retry budget beside ``HOST_RECHECKS_PER_NIGHT``.
+    whose child is refused again) earns ONE more try -- never a second retry
+    budget beside ``HOST_RECHECKS_PER_NIGHT``. Before it the pass waits at most
+    once, until the breaker's next scheduled re-check, and only for walks whose
+    latched hosts can ALL still be re-checked, when the deadline has room for
+    that wait plus a child's floor timeout. The pass's re-asks are not
+    launches, so the breaker's skip counters are restored around each.
+
+    Returns a stop reason -- ``_STOP_REASON_SIGTERM``, or the pass's own
+    deadline stop -- when either cut the pass short, else None.
 
     Accounting: a walk that lands is ``unstrand``-ed and counted in
     ``stranded_recovered``; any other outcome KEEPS the original entry. It is
@@ -8284,8 +8297,6 @@ def _retry_stranded_walks(
     grid sibling succeeded in the same call, which it cannot in this one.
     Attempts are added to ``tally`` as they happen, so an exception mid-pass
     still reports the ones before it.
-
-    Returns ``_STOP_REASON_SIGTERM`` when a stop cut the pass short, else None.
     """
     pending = [(cid, walk) for cid, walks in blocked_hosts.stranded.items() for walk in walks]
     if not pending:
@@ -8294,31 +8305,54 @@ def _retry_stranded_walks(
 
     for attempt in (1, 2):
         if attempt == 2:
-            now = time.monotonic()
-            waitable = {
-                host
-                for _, walk in pending
-                for host in CHANNEL_HOSTS.get(walk, ())
-                if host in blocked_hosts.latched
-                and host in HOST_RECHECKS
-                and blocked_hosts.rechecks[host] < blocked_hosts.max_rechecks
-            }
-            if not waitable:
-                break
-            if batch_deadline - now <= blocked_hosts.cooldown_s + _MIN_CLAMPED_TIMEOUT_S:
+            # A walk is worth waiting for only when EVERY host still latching
+            # it will be re-checked: one also held by a host with no reset
+            # test (the tile CDN, KartaView, Panoramax latch all night by
+            # design) cannot launch however long we wait, and asking again
+            # would only spend an Overpass re-check on it. Those drop out here.
+            # A walk whose hosts all un-latched since its ask (a later ask's
+            # re-check cleared them) needs no wait at all.
+            ready: list[tuple[str, str]] = []
+            waitable: list[tuple[str, str]] = []
+            waitable_hosts: set[str] = set()
+            for cid, walk in pending:
+                latched = _latched_hosts_for(cfg, blocked_hosts, cities[cid], walk)
+                if not latched:
+                    ready.append((cid, walk))
+                elif all(blocked_hosts.can_recheck(h) for h in latched):
+                    waitable.append((cid, walk))
+                    waitable_hosts |= latched
+            dropped = len(pending) - len(ready) - len(waitable)
+            if dropped:
                 logger.info(
-                    f"Not waiting out the {blocked_hosts.cooldown_s / 60:g}-min re-check "
-                    f"cooldown for {len(pending)} stranded walk(s): the batch deadline is too "
-                    f"close; they stay stranded."
+                    f"{dropped} stranded walk(s) stay stranded: a host that is never "
+                    f"re-checked, or has no re-check left tonight, still refuses them, so "
+                    f"waiting cannot help."
                 )
+            if waitable:
+                # Until the breaker's NEXT re-check, not a flat cooldown: it may
+                # be minutes away, and a flat figure both over-waits and makes
+                # this deadline gate give up on nights that had room.
+                wait_s = max(blocked_hosts.seconds_until_recheck(h) for h in waitable_hosts)
+                if batch_deadline - time.monotonic() <= wait_s + _MIN_CLAMPED_TIMEOUT_S:
+                    logger.info(
+                        f"Not waiting {wait_s / 60:.1f} min for the next re-check of "
+                        f"{_host_names(waitable_hosts)} for {len(waitable)} stranded walk(s): "
+                        f"the batch deadline is too close; they stay stranded."
+                    )
+                    waitable = []
+                elif wait_s > 0:
+                    logger.info(
+                        f"{_host_names(waitable_hosts)} still refusing; waiting "
+                        f"{wait_s / 60:.1f} min for its next re-check, once, for "
+                        f"{len(waitable)} stranded walk(s)"
+                    )
+                    if _wait_out_recheck_cooldown(sigterm_seen, wait_s):
+                        return _STOP_REASON_SIGTERM
+            keep = set(ready) | set(waitable)
+            pending = [entry for entry in pending if entry in keep]  # the night's order
+            if not pending:
                 break
-            logger.info(
-                f"{_host_names(waitable)} still refusing; waiting "
-                f"{blocked_hosts.cooldown_s / 60:g} min to re-check it once more for "
-                f"{len(pending)} stranded walk(s)"
-            )
-            if _wait_out_recheck_cooldown(sigterm_seen, blocked_hosts.cooldown_s):
-                return _STOP_REASON_SIGTERM
 
         lost_to_breaker: list[tuple[str, str]] = []
         for i, (cid, walk) in enumerate(pending):
@@ -8328,8 +8362,12 @@ def _retry_stranded_walks(
             # could only hand its floor timeout.
             if batch_deadline - time.monotonic() <= _MIN_CLAMPED_TIMEOUT_S:
                 logger.info("Batch deadline reached; the remaining stranded walks stay stranded.")
-                return None
+                return (
+                    f"batch deadline reached ({cfg.max_batch_hours:g} h) during the end-of-night "
+                    f"retry; {len(pending) - i:,} stranded walk(s) not retried"
+                )
             skips_before = blocked_hosts.skipped_launches
+            skipped_before = Counter(blocked_hosts.skipped)
             trips_before = sum(blocked_hosts.trips.values())
             # This walk's own busy skip from the loop, if that is what stranded
             # it. Held apart for the call so `busy_hosts` can end the night
@@ -8337,18 +8375,27 @@ def _retry_stranded_walks(
             # lands, and never counted twice if the retry finds it busy again.
             busy_before = blocked_hosts.busy_stranded.pop((cid, walk), None)
             busy_snapshot = Counter(busy_hosts)
-            walk_attempted, walk_succeeded, walk_skipped = _run_city_channels(
-                cfg,
-                conn,
-                cities[cid],
-                today,
-                [walk],
-                blocked_hosts=blocked_hosts,
-                busy_hosts=busy_hosts,
-                deferred_channels=deferred_channels,
-                batch_deadline=batch_deadline,
-                stop_requested=sigterm_seen,
-            )
+            try:
+                walk_attempted, walk_succeeded, walk_skipped = _run_city_channels(
+                    cfg,
+                    conn,
+                    cities[cid],
+                    today,
+                    [walk],
+                    blocked_hosts=blocked_hosts,
+                    busy_hosts=busy_hosts,
+                    deferred_channels=deferred_channels,
+                    batch_deadline=batch_deadline,
+                    stop_requested=sigterm_seen,
+                )
+            finally:
+                # A breaker skip HERE re-asks about a walk the loop already
+                # lost -- its launch was counted then. Restored so the `Done:`
+                # line's and the alert's "launch(es) skipped while latched"
+                # keep meaning one channel of one city, not every ask.
+                skipped_by_breaker = blocked_hosts.skipped_launches > skips_before
+                blocked_hosts.skipped_launches = skips_before
+                blocked_hosts.skipped = skipped_before
             tally["attempted"] += walk_attempted
             tally["succeeded"] += walk_succeeded
             tally["skipped_budget"] += walk_skipped
@@ -8377,19 +8424,35 @@ def _retry_stranded_walks(
                     f"{cid} [{walk}]: RECOVERED by the end-of-night retry — no longer "
                     f"stranded, and paired with tonight's grid run (issue #380)."
                 )
-            elif (
-                blocked_hosts.skipped_launches > skips_before
-                or sum(blocked_hosts.trips.values()) > trips_before
-            ):
+            elif skipped_by_breaker or sum(blocked_hosts.trips.values()) > trips_before:
                 lost_to_breaker.append((cid, walk))
             # Serial, and spaced like the loop's cities: Overpass admits one
             # talker, and every retry may be a cold network fetch.
             if walk_attempted and i + 1 < len(pending):
                 time.sleep(cfg.sleep_between_cities_s)
+        # A stop that landed while the LAST walk's child ran is still a stop:
+        # the loop checks after each city for the same reason (issue #206).
+        if sigterm_seen.is_set():
+            return _STOP_REASON_SIGTERM
         pending = lost_to_breaker
         if not pending:
             break
     return None
+
+
+def _latched_hosts_for(
+    cfg: SchedulerConfig, breaker: HostBreaker, city: db.CityRow, walk: str
+) -> set[str]:
+    """The latched hosts that would skip ``walk`` for ``city`` right now.
+
+    Mirrors the launch pass's frozen-network exemption: a walk whose GraphML
+    is frozen never contacts Overpass, so a latched Overpass is not what holds
+    it back.
+    """
+    wanted = set(CHANNEL_HOSTS.get(walk, ()))
+    if HOST_OVERPASS in wanted and _walk_network_is_frozen(cfg, city, walk):
+        wanted.discard(HOST_OVERPASS)
+    return wanted & breaker.latched
 
 
 def _run_city_loop(
@@ -8531,7 +8594,10 @@ def _run_city_loop(
             sigterm_seen=sigterm_seen,
             tally=retry_tally,
         )
-        stop_reason = stop_reason or pass_stop
+        # Both, when both stopped something: a cap-ended loop whose pass then
+        # took a SIGTERM stopped twice, and `or` would hide the second.
+        if pass_stop and pass_stop != stop_reason:
+            stop_reason = f"{stop_reason}; {pass_stop}" if stop_reason else pass_stop
     except Exception:
         # One city's unexpected error must not cost the night its publish:
         # everything collected so far is already committed to the catalog but
