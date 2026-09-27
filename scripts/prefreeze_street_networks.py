@@ -214,19 +214,32 @@ def plan_prefreeze_all_enabled(conn, cfg) -> list[tuple[db.CityRow, str, list[st
     not on disk. The channels' types come from config, never a literal.
 
     Membership and ``last_success_at`` are read through
-    ``get_due_cities_with_last_success`` with its staleness and quarantine
-    gates opened (threshold 0 against the far-future date, an unreachable
-    failure cap), rather than through a second copy of its membership clause:
-    that clause is the part that fails open when a copy is forgotten. A
-    quarantined city is included on purpose -- its network is just as cold,
-    and the quarantine is about collection, not about the city's streets.
+    ``get_due_cities_with_last_success`` with its staleness gate opened
+    (threshold 0 against the far-future date), rather than through a second
+    copy of its membership clause: that clause is the part that fails open when
+    a copy is forgotten. Its quarantine gate is KEPT at
+    ``cfg.max_consecutive_failures``: a quarantined channel never walks the
+    city until an operator intervenes, so freezing for it buys nothing -- and a
+    city whose fetch always fails (a bbox with no drivable ways writes no
+    GraphML) ends up quarantined, so without the gate it was re-planned at the
+    head of every pass forever (PR #382 review).
 
-    Order: a (city, network_type)'s staleness is the OLDEST ``last_success_at``
-    among the member channels walking it, never-walked first (NULLS FIRST, as
-    the scheduler orders), then ``city_id``. Read-only.
+    Order: CLEAN networks first -- one where some member channel walking it has
+    ``consecutive_failures > 0`` goes behind every clean one, so a city that
+    keeps failing, but is not yet quarantined, cannot hold the head of the
+    queue while ``--limit 1`` passes re-ask it. Within each tier, staleness is
+    the OLDEST ``last_success_at`` among the member channels walking it, and
+    any never-walked channel makes it never-walked (NULLS FIRST, as the
+    scheduler orders); then ``city_id``. Read-only.
     """
     street = [p for p in cfg.enabled_providers() if is_street_channel(p)]
-    entries: dict[tuple[str, str], tuple[db.CityRow, list[str], list[str | None]]] = {}
+    failing = {
+        (row["city_id"], row["provider"])
+        for row in conn.execute(
+            "SELECT city_id, provider FROM schedule_state WHERE consecutive_failures > 0"
+        )
+    }
+    entries: dict[tuple[str, str], tuple[db.CityRow, list[str], list[str | None], list[bool]]] = {}
     for channel in street:
         network_type = cfg.providers[channel].network_type
         members = db.get_due_cities_with_last_success(
@@ -234,26 +247,29 @@ def plan_prefreeze_all_enabled(conn, cfg) -> list[tuple[db.CityRow, str, list[st
             today=date.max,
             cycle_days=0,
             grace_days=0,
-            max_consecutive_failures=sys.maxsize,
+            max_consecutive_failures=cfg.max_consecutive_failures,
             default_membership=CHANNEL_DEFAULT_MEMBERSHIP[channel],
             provider=channel,
         )
         for city, last_success_at in members:
             key = (city.city_id, network_type)
             if key not in entries:
-                entries[key] = (city, [], [])
+                entries[key] = (city, [], [], [])
             entries[key][1].append(channel)
             entries[key][2].append(last_success_at)
+            entries[key][3].append((city.city_id, channel) in failing)
 
     def staleness(item):
-        (city_id, network_type), (_, _, successes) = item
+        (city_id, network_type), (_, _, successes, failures) = item
         oldest = None if None in successes else min(successes)
-        # NULLS FIRST, then oldest, then city_id so reruns are monotone.
-        return (oldest is not None, oldest or "", city_id, network_type)
+        # Clean first, then NULLS FIRST, then oldest, then city_id so reruns are monotone.
+        return (any(failures), oldest is not None, oldest or "", city_id, network_type)
 
     return [
         (city, network_type, channels)
-        for (city_id, network_type), (city, channels, _) in sorted(entries.items(), key=staleness)
+        for (city_id, network_type), (city, channels, _, _) in sorted(
+            entries.items(), key=staleness
+        )
         if not os.path.exists(network_cache_path(city_id, cfg.data_dir, network_type))
     ]
 
@@ -416,7 +432,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Plan every enabled city's cold walk network, stalest-first, instead of "
             "the next nights' slate: a by-hand backlog drain (issue #381). Refused "
-            "with --nights"
+            "with --nights or --date"
         ),
     )
     p.add_argument(
@@ -584,6 +600,16 @@ def _run_pass(args, cfg, today: date, report: list[str], planned: list) -> int:
         frozen, failed, stop_code = run_prefreeze(
             conn, cfg, planned, pause_s=args.pause_s, force=args.force
         )
+        if stop_code is None and frozen == 0 and failed:
+            # Not a failed pass by this script's conventions (a city-specific
+            # failure never is, and the night would fail those cities the same
+            # way), so the exit stays 0 -- but "Froze 0" must not read as a clean
+            # pass: every fetch spent an Overpass query and bought nothing.
+            say(
+                f"WARNING: every planned fetch failed ({failed} of {len(planned)}); NOTHING "
+                "was frozen. Those cities have no usable network for Overpass to return, "
+                "and each attempt still spent a query against the daily budget."
+            )
         say(
             f"Froze {frozen} of {len(planned)} network(s)"
             + (f"; {failed} city(ies) had no usable network" if failed else "")

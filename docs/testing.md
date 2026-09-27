@@ -497,6 +497,8 @@ In `tests/test_scheduler.py`, `backup-status` gates on the heartbeat only when `
   `--limit` truncating in **staleness** order (never-walked, then oldest walk, not `city_id` order), with two channels on one type sharing a fetch;
   a dry run fetching nothing with `--limit` defaulting to 20; `--nights` or `--date` beside it exiting usage;
   the in-flight `run-due` refusal and the host stop still firing in that mode; and its alert naming `--all-enabled` as the re-run.
+  From the PR #382 review: staleness over channels with DIFFERENT timestamps (the oldest walk, not the newest, and any never-walked channel making the network never-walked); a channel at the failure cap dropped per channel, not per city;
+  and the review's repro, repeated `--limit 1` passes moving past a city whose fetch always fails, a pass that froze nothing printing its WARNING, and the city dropping out once quarantined.
 - The prefreeze units (`tests/test_prefreeze_unit.py`, issue #355): the same host, interpreter, `--config`, lock dir and console log as the collection unit;
   a sandbox no wider than the checkout (`PrivateUsers`, `NoNewPrivileges`, `PrivateTmp`, `RestrictSUIDSGID`, `ProtectSystem=strict`, one `ReadWritePaths`, an OPTIONAL `EnvironmentFile`);
   a `MemoryMax` whose VALUE sits above a floor and below the nightly unit's, with no `MemoryHigh` — an OOM here is a SIGKILL, so it is the one failure that cannot alert;

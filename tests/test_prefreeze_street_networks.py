@@ -574,6 +574,101 @@ def test_all_enabled_limit_truncates_in_staleness_order(three_cities, conn, data
     assert fetcher.calls == [(gamma, "drive"), (beta, "drive")]
 
 
+def _set_walked(conn, city_id, provider, when):
+    """Record a success on this channel and backdate it to ``when``."""
+    db.record_attempt(conn, city_id, success=True, provider=provider)
+    conn.execute(
+        "UPDATE schedule_state SET last_success_at = ? WHERE city_id = ? AND provider = ?",
+        (when, city_id, provider),
+    )
+    conn.commit()
+
+
+def _fail(conn, city_id, provider, times):
+    for _ in range(times):
+        db.record_attempt(conn, city_id, success=False, error="no network", provider=provider)
+
+
+def test_all_enabled_staleness_is_the_oldest_channel_and_any_never_walked_wins(
+    three_cities, conn, data_dir
+):
+    """Channels with DIFFERENT timestamps, which is what tells min from max:
+    Alpha (Jan / Sep) is older than Beta (May / May) by its OLDEST walk and
+    younger by its newest; Gamma, walked on one channel and never on the
+    other, is never-walked, as is Delta, which sorts ahead of it by city_id."""
+    alpha, beta, gamma = three_cities
+    delta = _register(conn, "Delta")
+    _set_walked(conn, alpha, "gsv_streets", "2026-01-01T00:00:00")
+    _set_walked(conn, alpha, "mapillary_streets", "2026-09-01T00:00:00")
+    _set_walked(conn, beta, "gsv_streets", "2026-05-01T00:00:00")
+    _set_walked(conn, beta, "mapillary_streets", "2026-05-01T00:00:00")
+    _set_walked(conn, gamma, "mapillary_streets", "2026-02-01T00:00:00")
+
+    planned = pf.plan_prefreeze_all_enabled(conn, _cfg(data_dir))
+    assert [c.city_id for c, _, _ in planned] == [delta, gamma, alpha, beta]
+
+
+def test_all_enabled_skips_a_channel_quarantined_at_the_failure_cap(three_cities, conn, data_dir):
+    """A quarantined channel never walks the city until an operator
+    intervenes, so its network buys nothing tonight. Quarantine is per
+    CHANNEL: a city still walked by another channel is still planned, for it."""
+    alpha, beta, gamma = three_cities
+    cfg = _cfg(data_dir)
+    for provider in ("gsv_streets", "mapillary_streets"):
+        _fail(conn, alpha, provider, cfg.max_consecutive_failures)
+    _fail(conn, beta, "gsv_streets", cfg.max_consecutive_failures)
+
+    planned = pf.plan_prefreeze_all_enabled(conn, cfg)
+    assert [(c.city_id, ch) for c, _, ch in planned] == [
+        (beta, ["mapillary_streets"]),
+        (gamma, ["gsv_streets", "mapillary_streets"]),
+    ]
+
+
+def test_all_enabled_limit_1_passes_move_past_a_city_whose_fetch_keeps_failing(
+    conn, data_dir, monkeypatch, capsys
+):
+    """The PR #382 review's repro: a city whose bbox has no drivable ways fails
+    every fetch and writes no GraphML, so it is cold forever. Failing but not
+    yet quarantined, it goes behind every clean city, so repeated --limit 1
+    passes make progress instead of re-asking it every afternoon."""
+    cities = [_register(conn, f"City{i:02d}") for i in range(4)]
+    roadless = cities[0]
+    for provider in ("gsv_streets", "mapillary_streets"):
+        _fail(conn, roadless, provider, 2)
+
+    def one_pass():
+        fetcher = _Fetcher({roadless: DownloadError("no drivable ways in this bbox")})
+        rc, fetcher, _ = _run(
+            monkeypatch,
+            _cfg(data_dir),
+            "--all-enabled",
+            "--limit",
+            "1",
+            "--execute",
+            fetcher=fetcher,
+        )
+        return rc, fetcher.calls
+
+    assert [one_pass() for _ in range(3)] == [
+        (0, [(cities[1], "drive")]),
+        (0, [(cities[2], "drive")]),
+        (0, [(cities[3], "drive")]),
+    ]
+    capsys.readouterr()
+
+    # Only the failing city is left: it is still asked (it is not quarantined,
+    # and the night would ask it too), but a pass that froze nothing says so.
+    assert one_pass() == (0, [(roadless, "drive")])
+    out = capsys.readouterr().out
+    assert "WARNING: every planned fetch failed (1 of 1); NOTHING was frozen" in out
+
+    # And once the nights have quarantined it, no pass asks at all.
+    for provider in ("gsv_streets", "mapillary_streets"):
+        _fail(conn, roadless, provider, 3)
+    assert one_pass() == (0, [])
+
+
 def test_all_enabled_skips_a_city_no_enabled_street_channel_walks(
     three_cities, conn, data_dir, monkeypatch
 ):

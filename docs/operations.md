@@ -156,7 +156,10 @@ python scripts/prefreeze_street_networks.py --config config/scheduler.makelab1.t
 ```
 
 It plans every enabled city that is a member of at least one enabled street channel and has no frozen GraphML for that channel's `network_type`, stalest-first (never-walked first, then the oldest `last_success_at` among the channels walking that network) with `city_id` as the tiebreaker, so repeated passes make monotone progress.
-Membership is read through `get_due_cities_with_last_success` with its staleness and quarantine gates opened, never a second copy of its membership clause; a quarantined city is included, since its network is just as cold.
+Membership is read through `get_due_cities_with_last_success` with its staleness gate opened, never a second copy of its membership clause.
+Its quarantine gate is **kept** at `max_consecutive_failures`, per channel: a quarantined channel never walks the city until an operator intervenes, so freezing for it buys nothing.
+That gate is also what ends a city whose fetch always fails (a bbox with no drivable ways writes no GraphML, so it is cold forever): the nights' own failures quarantine it, and before that it is ordered behind every clean network, so repeated passes move past it rather than re-asking it at the head of each one (PR #382 review).
+A pass whose every fetch failed still exits 0 — a city-specific failure is never a failed pass — but prints `WARNING: every planned fetch failed ... NOTHING was frozen`, because each attempt spent a query against the daily budget.
 `--limit` defaults to **20** in this mode, so the ~240-network backlog drains over ~12 afternoons by hand rather than in one burst; `--nights` or `--date` beside it exits 64, since neither enters a plan that ignores dueness.
 Everything else is the slate mode's code path: serial, `--pause-s` apart, the same lock and probe, the in-flight `run-due` refusal and the stop on a host condition.
 Frozen networks are immutable (#103), so this is a one-time cost, and the daily timer stays on `--nights`.
