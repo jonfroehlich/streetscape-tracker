@@ -8931,6 +8931,24 @@ def _finish_batch(
         else ""
     )
 
+    # A busy skip the end-of-night retry landed (issue #380) is no longer
+    # outstanding, so it left `busy_hosts` and the paragraph above -- but the
+    # lock still had another holder tonight, and that cost launches exactly as
+    # a refusal that recovered on re-check does. So it keeps the night
+    # unhealthy and gets its own paragraph: the operator's next move (find
+    # that process) is unchanged, while "they stay due" would be false.
+    busy_recovered = blocked_hosts.busy_recovered
+    busy_recovered_note = (
+        f"{sum(busy_recovered.values())} stranded walk(s) had been skipped because "
+        f"{_host_names(busy_recovered)} was busy with another process on this machine; "
+        f"the end-of-night retry walked them once the lock freed, so nothing is outstanding "
+        f"(issue #380). The lock's other holder is most often the daytime pre-freeze pass "
+        f"overrunning into the timer — find it (its pid is in locks/*.lock.owner and in the "
+        f"child log tail above) and check whether it should have been running (issue #208)."
+        if busy_recovered
+        else ""
+    )
+
     failures = attempted - succeeded
     unhealthy = (
         errored,
@@ -8940,6 +8958,7 @@ def _finish_batch(
         publish_error,
         blocked_hosts,
         busy_hosts,
+        busy_recovered,
     )
     if any(unhealthy) or should_alert(failures, cfg.alerts.failure_threshold):
         host = socket.gethostname()
@@ -8972,6 +8991,9 @@ def _finish_batch(
             parts.append(f"{len(blocked_hosts.stranded)} city(ies) STRANDED un-walked")
         if busy_hosts:
             parts.append(f"{sum(busy_hosts.values())} channel(s) SKIPPED (host busy)")
+        if busy_recovered:
+            # Mirrors "REFUSED then recovered": still named, as what it is.
+            parts.append(f"{len(busy_recovered)} host(s) BUSY then recovered")
         # The failure count is the subject on an ordinary bad night, and noise
         # ("0 failed collection(s)") when something above already carries it.
         if failures or not any(unhealthy):
@@ -8988,6 +9010,7 @@ def _finish_batch(
             + (f"\n\n{blocked_note}" if blocked_note else "")
             + (f"\n\n{stranded_note}" if stranded_note else "")
             + (f"\n\n{busy_note}" if busy_note else "")
+            + (f"\n\n{busy_recovered_note}" if busy_recovered_note else "")
         )
         send_alert(
             cfg.alerts,

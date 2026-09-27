@@ -483,7 +483,8 @@ In `tests/test_scheduler.py`, `backup-status` gates on the heartbeat only when `
   a re-check the loop already spent is never spent again by the pass, which then has no reason to wait;
   the retry's REAL argv carries the night's own `--run-date` on a night dated in the past;
   a city whose grid run failed, though the breaker cost it its walk too, is never retried;
-  and a busy-stranded walk the pass lands leaves `busy_hosts` — no `SKIPPED (host busy)` subject, no busy paragraph, the recovered note naming the busy host, and a night with nothing else wrong exiting 0 with no alert — while one busy again at the retry is counted as ONE skipped channel.
+  a night whose every stranded walk the pass landed after a refusal still exits nonzero with `REFUSED then recovered` in the subject;
+  and a busy-stranded walk the pass lands leaves `busy_hosts` — no `SKIPPED (host busy)` subject and no "they stay due" busy paragraph — yet a night with nothing else wrong still exits nonzero and alerts `1 host(s) BUSY then recovered`, naming the host, the count and `locks/*.lock.owner`, while one busy again at the retry is counted as ONE skipped channel.
   The suite-wide autouse `_no_recheck_cooldown_wait` makes `_wait_out_recheck_cooldown` instant (it answers whether a stop was requested), so no night-level test waits out a real 45-min cooldown;
   a skipped two-host channel launch counts **once** in the summary and alert while the per-host counter still attributes it to both;
   a frozen-network walk under a latched Overpass spends **no** re-check (the probe is asked only once a cold walk wants the host);

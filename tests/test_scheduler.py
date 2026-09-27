@@ -12007,7 +12007,7 @@ def test_a_stranded_walk_whose_host_serves_again_is_recovered_the_same_night(
     waits = _record_waits(monkeypatch)
 
     with caplog.at_level(logging.INFO):
-        _rc, alerts = _drive_night(monkeypatch, conn, _two_walk_cfg(), run_one)
+        rc, alerts = _drive_night(monkeypatch, conn, _two_walk_cfg(), run_one)
 
     assert ran == [
         (alpha, "gsv"),
@@ -12017,6 +12017,9 @@ def test_a_stranded_walk_whose_host_serves_again_is_recovered_the_same_night(
         (alpha, "gsv_streets"),  # the pass: re-check 2 says serving
         (beta, "gsv_streets"),
     ]
+    # Every stranded walk landed, yet the refusal still cost the night
+    # launches: unhealthy, alerting, named as recovered (CLAUDE.md's rule).
+    assert rc == 1
     assert len(probe.calls) == 2
     assert waits == [], "nothing was left to wait for"
     done = _done_line(caplog)
@@ -12024,6 +12027,7 @@ def test_a_stranded_walk_whose_host_serves_again_is_recovered_the_same_night(
     assert "4/4 runs succeeded across 2 cities" in done, "retries count as runs, not cities"
     assert "2 stranded walk(s) recovered by the end-of-night retry" in done
     ((subject, body),) = alerts
+    assert "1 host(s) REFUSED then recovered" in subject
     assert "STRANDED" not in subject
     assert "came out of the night" not in body
     assert "2 stranded walk(s) were recovered by the end-of-night retry" in body
@@ -12206,13 +12210,19 @@ def _busy_walk_night(monkeypatch, conn, caplog, busy_times):
 def test_a_recovered_busy_strand_is_no_longer_reported_as_a_busy_skip(conn, monkeypatch, caplog):
     """Found by the #380 pass's own review: a walk stranded by a BUSY lock
     (exit 80) that the pass then lands must leave `busy_hosts`, or the email
-    keeps saying its channel 'stays due' and the night stays unhealthy for a
-    skip that is no longer outstanding. The recovered note says what it was."""
+    keeps saying its channel 'stays due' for a skip that is no longer
+    outstanding. It is named instead as BUSY then recovered, with its host and
+    count, mirroring a refusal that recovered."""
     alpha, walks, done, subject, body = _busy_walk_night(monkeypatch, conn, caplog, busy_times=1)
 
     assert walks == ["gsv_streets", "gsv_streets"], "busy in the loop, landed in the pass"
     assert "busy locally" not in done
     assert "SKIPPED (host busy)" not in subject
+    assert "1 host(s) BUSY then recovered" in subject
+    assert (
+        "1 stranded walk(s) had been skipped because the Overpass API (overpass-api.de) "
+        "was busy with another process on this machine" in body
+    )
     # The busy paragraph, whose "they stay due" is what went stale. (The
     # Mapillary refusal's own paragraph rightly still says its channels do.)
     assert "another process on this machine held the lock" not in body
@@ -12221,9 +12231,12 @@ def test_a_recovered_busy_strand_is_no_longer_reported_as_a_busy_skip(conn, monk
     assert "STRANDED" not in subject
 
 
-def test_a_night_whose_only_busy_strand_was_recovered_is_healthy(conn, monkeypatch):
-    """With nothing else wrong, a busy strand the pass landed leaves nothing
-    outstanding: the night exits 0 and sends no alert."""
+def test_a_night_whose_only_busy_strand_was_recovered_still_alerts(conn, monkeypatch):
+    """With nothing else wrong and nothing outstanding, a busy strand the pass
+    landed still makes the night unhealthy: another process held the lock and
+    cost it a launch, most often the pre-freeze pass overrunning, and CLAUDE.md
+    says a busy night alerts unconditionally and exits nonzero. Named as BUSY
+    then recovered, never as a skip that stays due."""
     from streetscape_metadata_tracker.download_common import HOST_OVERPASS
 
     alpha = _register(conn, "Alpha", width=1000, height=1000, step=20)
@@ -12239,8 +12252,13 @@ def test_a_night_whose_only_busy_strand_was_recovered_is_healthy(conn, monkeypat
     rc, alerts = _drive_night(monkeypatch, conn, _two_walk_cfg(), run_one)
 
     assert walks == ["gsv_streets", "gsv_streets"]
-    assert rc == 0
-    assert alerts == []
+    assert rc == 1
+    ((subject, body),) = alerts
+    assert subject.startswith("1 host(s) BUSY then recovered on ")
+    assert "failed collection" not in subject
+    assert "1 stranded walk(s) had been skipped because the Overpass API" in body
+    assert "locks/*.lock.owner" in body
+    assert "stay due" not in body
 
 
 def test_a_busy_strand_busy_again_at_the_pass_is_counted_once(conn, monkeypatch, caplog):
