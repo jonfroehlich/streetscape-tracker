@@ -137,9 +137,19 @@ def parse_args() -> argparse.Namespace:
 
     args = parser.parse_args()
 
-    # Validate batch_size and connection_limit relationship
+    # Clamp, never refuse, exactly as streetscape_tracker.py's own parser does
+    # (issue #359): the GSV engine gathers at most batch_size requests per batch,
+    # so sockets past the batch never get work. Clamped HERE too, before the
+    # value is forwarded, so a batch warns once rather than once per city.
     if args.connection_limit > args.batch_size:
-        parser.error("connection-limit cannot be larger than batch-size")
+        print(
+            f"warning: --connection-limit {args.connection_limit} exceeds --batch-size "
+            f"{args.batch_size}; at most batch-size requests are ever in flight, so the "
+            f"effective connection limit is {args.batch_size}. Raise --batch-size to use "
+            f"more sockets.",
+            file=sys.stderr,
+        )
+        args.connection_limit = args.batch_size
 
     return args
 

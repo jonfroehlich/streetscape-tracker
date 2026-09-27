@@ -147,6 +147,26 @@ It moves the nights' own fetches earlier and adds none; the 10 MB/day half of th
 The one failure it cannot report is an OOM kill, which is a SIGKILL: read `MemoryPeak` rather than waiting for a mail that cannot arrive.
 The schedule's rationale and install steps are in [`deploy/README.md`](../deploy/README.md); `tests/test_prefreeze_unit.py` pins them.
 
+**Draining the cold backlog: `--all-enabled` (issue #381).**
+The slate mode only ever sees cities *due* by the target date, and a wider `--nights` widens the date window, not dueness — so a cold city is otherwise frozen only the night it is walked, exactly when a refusal strands it (on prod 2026-09-21, 242 of 1,221 enabled cities had no frozen `drive` network).
+
+```bash
+python scripts/prefreeze_street_networks.py --config config/scheduler.makelab1.toml --all-enabled            # list
+python scripts/prefreeze_street_networks.py --config config/scheduler.makelab1.toml --all-enabled --execute  # freeze 20
+```
+
+It plans every enabled city that is a member of at least one enabled street channel and has no frozen GraphML for that channel's `network_type`, stalest-first (never-walked first, then the oldest `last_success_at` among the channels walking that network) with `city_id` as the tiebreaker, so repeated passes make monotone progress.
+Membership is read through `get_due_cities_with_last_success` with its staleness gate opened, never a second copy of its membership clause.
+Its quarantine gate is **kept** at `max_consecutive_failures`, per channel: a quarantined channel never walks the city until an operator intervenes, so freezing for it buys nothing.
+That gate is also what ends a city whose fetch always fails (a bbox with no drivable ways writes no GraphML, so it is cold forever): the nights' own failures quarantine it, and before that it is ordered behind every clean network, so repeated passes move past it rather than re-asking it at the head of each one (PR #382 review).
+A pass whose every fetch failed still exits 0 — a city-specific failure is never a failed pass — but prints `WARNING: every planned fetch failed ... NOTHING was frozen`, because each attempt spent a query against the daily budget.
+`--limit` defaults to **20** in this mode, so the ~240-network backlog drains over ~12 afternoons by hand rather than in one burst; `--nights` or `--date` beside it exits 64, since neither enters a plan that ignores dueness.
+Everything else is the slate mode's code path: serial, `--pause-s` apart, the same lock and probe, the in-flight `run-due` refusal and the stop on a host condition.
+Frozen networks are immutable (#103), so this is a one-time cost, and the daily timer stays on `--nights`.
+The 20 is sized against the Overpass guidance [`provider-access.md`](provider-access.md) quotes — fewer than ~100 queries a day for an app that queries regularly — which the nightly walks and the daily 15:00 timer (up to 40) already draw on.
+The timer runs every afternoon, so a drain **always** adds to that day's count rather than replacing it, and that is why its default is half the timer's.
+Before running it, re-read the policy (READ THIS FIRST): do not raise `--limit` or lower `--pause-s` without that check, never run it the afternoon of a daytime walk catch-up, and start it only after that day's timer pass has finished.
+
 **Recovering cities a refusal already stranded.**
 The alert names them and prints one `run-due --provider <walks> --city <id>...` per exact set of lost walk channels (#362), pasteable as printed — `--config` is the night's own, and it runs from the project root with the scheduler's venv active.
 Run them once Overpass is confirmed serving prod — `python -c "from streetscape_metadata_tracker.download_common import overpass_serving; print(overpass_serving())"` from the checkout on the host must print `True`, which is the breaker's own re-check: one tiny, metered `/api/interpreter` query sent the way a walk sends it (#356).

@@ -334,7 +334,9 @@ def parse_args():
         type=int,
         default=100,
         help="""Number of requests to prepare and queue at once.
-             Should be >= connection-limit. Higher values use more memory
+             A larger --connection-limit is clamped to this value with a
+             warning (at most batch-size requests are ever in flight).
+             Higher values use more memory
              but can be more efficient. API limit is 500/second.""",
     )
 
@@ -344,7 +346,8 @@ def parse_args():
         default=50,
         help="""Maximum number of concurrent connections to the API.
              Controls how many requests are actually in-flight at once.
-             Should be <= batch-size. Conservative values prevent overwhelming
+             Clamped to --batch-size, with a warning, when larger: sockets past
+             the batch never get work. Conservative values prevent overwhelming
              the network or API.""",
     )
 
@@ -537,7 +540,19 @@ def parse_args():
         parser.error("--width and --height must be used together")
 
     if args.connection_limit > args.batch_size:
-        parser.error("connection-limit cannot be larger than batch-size")
+        # Inert, not invalid: the GSV engine gathers at most batch_size requests
+        # per batch under a TCPConnector(limit=connection_limit), so sockets past
+        # the batch never get work. A hard refusal here cost a hand-run its
+        # collection and, under the scheduler, quarantined the city (issue #359).
+        # Parse time is before logging is configured (see main()), so stderr.
+        print(
+            f"warning: --connection-limit {args.connection_limit} exceeds --batch-size "
+            f"{args.batch_size}; at most batch-size requests are ever in flight, so the "
+            f"effective connection limit is {args.batch_size}. Raise --batch-size to use "
+            f"more sockets.",
+            file=sys.stderr,
+        )
+        args.connection_limit = args.batch_size
 
     return args
 

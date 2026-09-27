@@ -59,3 +59,27 @@ def test_load_cities_reads_file_skipping_noise(tmp_path):
         ["Seattle,", "WA", "--width", "2000"],
         ["Bend, OR"],
     ]
+
+
+def test_a_connection_limit_above_batch_size_is_clamped_like_the_child_does(monkeypatch, capsys):
+    """run_cities.py forwards both flags to streetscape_tracker.py, whose own
+    parser clamps rather than refuses since issue #359. The batch driver must
+    agree with it -- refusing here would reject an argv the child accepts --
+    and clamps BEFORE forwarding so a batch warns once, not once per city."""
+    import sys
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["run_cities.py", "cities.txt", "--connection-limit", "150", "--batch-size", "100"],
+    )
+    assert run_cities.parse_args().connection_limit == 100
+    assert "exceeds --batch-size" in capsys.readouterr().err
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["run_cities.py", "cities.txt", "--connection-limit", "50", "--batch-size", "100"],
+    )
+    assert run_cities.parse_args().connection_limit == 50
+    assert "exceeds --batch-size" not in capsys.readouterr().err

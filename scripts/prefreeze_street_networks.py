@@ -59,6 +59,21 @@ emails the ``[alerts]`` recipient instead of silently leaving tonight's networks
 cold. A pass with nothing cold exits 0 and sends nothing, so the steady state is
 a no-op rather than a daily mail. The unit file carries the pacing rationale.
 
+``--all-enabled`` (issue #381) is the by-hand BACKLOG drain the slate mode cannot
+be: the slate only ever sees cities due by the target date, so the long tail of
+cold networks is otherwise frozen the night it is walked -- exactly when a
+refusal strands it. It plans every ENABLED city that is a member of at least one
+enabled street channel and has no frozen GraphML for that channel's
+``network_type``, stalest-first (the order the scheduler would eventually walk
+them) with ``city_id`` as the tiebreaker, so repeated passes make monotone
+progress. Frozen networks are immutable (#103), so the backlog is a one-time
+cost. Everything else -- serial and paced, the host lock and probe, the
+in-flight refusal, the stop on a host condition -- is the same code path.
+``--limit`` defaults to 20 in this mode, and ``--nights`` and ``--date`` are
+refused beside it (neither means anything to a pass that ignores dueness). The
+daily timer stays on the slate mode, and it runs EVERY afternoon, so a drain's
+fetches always add to its count.
+
 Nothing is published and no imagery request is made. The catalog gains a
 ``street_networks`` row per frozen network, as a walk's own fetch would add.
 
@@ -71,6 +86,9 @@ Usage:
 
     # Look two nights ahead, cap the pass at 30 fetches:
     python scripts/prefreeze_street_networks.py --config ... --nights 2 --limit 30 --execute
+
+    # Drain the whole catalog's cold backlog, 20 networks per afternoon (#381):
+    python scripts/prefreeze_street_networks.py --config ... --all-enabled --execute
 """
 
 import argparse
@@ -96,6 +114,7 @@ from streetscape_metadata_tracker.download_common import (  # noqa: E402
 )
 from streetscape_metadata_tracker.naming import network_cache_path  # noqa: E402
 from streetscape_metadata_tracker.scheduler import (  # noqa: E402
+    CHANNEL_DEFAULT_MEMBERSHIP,
     DEFAULT_CONFIG_PATH,
     USAGE_EXIT_CODE,
     _collect_due,
@@ -114,6 +133,14 @@ logger = logging.getLogger("prefreeze_street_networks")
 # burst if the server-side wait happens to be zero. Two minutes puts a 27-city
 # pass (the busiest real night measured in #341) at about an hour.
 DEFAULT_PAUSE_S = 120
+
+# --all-enabled's --limit when none is given (issue #381). Overpass's guidance
+# for an app that queries regularly is under ~100 queries a day
+# (docs/provider-access.md), and the nightly walks plus the daily 15:00 timer
+# (up to 40) already spend part of that -- and the timer runs every afternoon,
+# so a drain ALWAYS adds to its count. Measured on prod 2026-09-21 the backlog
+# was 242 cold networks, so this drains it over ~12 afternoons, not one burst.
+DEFAULT_ALL_ENABLED_LIMIT = 20
 
 
 def next_run_date() -> date:
@@ -174,6 +201,77 @@ def plan_prefreeze(
             seen.add(key)
             planned.append((city, network_type, [channel]))
     return planned
+
+
+def plan_prefreeze_all_enabled(conn, cfg) -> list[tuple[db.CityRow, str, list[str]]]:
+    """
+    (city, network_type, channels) for EVERY enabled city's cold walk network,
+    stalest-first (issue #381).
+
+    A (city, network_type) is planned when the city is a member of at least
+    one enabled street channel walking that type -- a network no channel will
+    ever walk is an Overpass request that buys nothing -- and its GraphML is
+    not on disk. The channels' types come from config, never a literal.
+
+    Membership and ``last_success_at`` are read through
+    ``get_due_cities_with_last_success`` with its staleness gate opened
+    (threshold 0 against the far-future date), rather than through a second
+    copy of its membership clause: that clause is the part that fails open when
+    a copy is forgotten. Its quarantine gate is KEPT at
+    ``cfg.max_consecutive_failures``: a quarantined channel never walks the
+    city until an operator intervenes, so freezing for it buys nothing -- and a
+    city whose fetch always fails (a bbox with no drivable ways writes no
+    GraphML) ends up quarantined, so without the gate it was re-planned at the
+    head of every pass forever (PR #382 review).
+
+    Order: CLEAN networks first -- one where some member channel walking it has
+    ``consecutive_failures > 0`` goes behind every clean one, so a city that
+    keeps failing, but is not yet quarantined, cannot hold the head of the
+    queue while ``--limit 1`` passes re-ask it. Within each tier, staleness is
+    the OLDEST ``last_success_at`` among the member channels walking it, and
+    any never-walked channel makes it never-walked (NULLS FIRST, as the
+    scheduler orders); then ``city_id``. Read-only.
+    """
+    street = [p for p in cfg.enabled_providers() if is_street_channel(p)]
+    failing = {
+        (row["city_id"], row["provider"])
+        for row in conn.execute(
+            "SELECT city_id, provider FROM schedule_state WHERE consecutive_failures > 0"
+        )
+    }
+    entries: dict[tuple[str, str], tuple[db.CityRow, list[str], list[str | None], list[bool]]] = {}
+    for channel in street:
+        network_type = cfg.providers[channel].network_type
+        members = db.get_due_cities_with_last_success(
+            conn,
+            today=date.max,
+            cycle_days=0,
+            grace_days=0,
+            max_consecutive_failures=cfg.max_consecutive_failures,
+            default_membership=CHANNEL_DEFAULT_MEMBERSHIP[channel],
+            provider=channel,
+        )
+        for city, last_success_at in members:
+            key = (city.city_id, network_type)
+            if key not in entries:
+                entries[key] = (city, [], [], [])
+            entries[key][1].append(channel)
+            entries[key][2].append(last_success_at)
+            entries[key][3].append((city.city_id, channel) in failing)
+
+    def staleness(item):
+        (city_id, network_type), (_, _, successes, failures) = item
+        oldest = None if None in successes else min(successes)
+        # Clean first, then NULLS FIRST, then oldest, then city_id so reruns are monotone.
+        return (any(failures), oldest is not None, oldest or "", city_id, network_type)
+
+    return [
+        (city, network_type, channels)
+        for (city_id, network_type), (city, channels, _, _) in sorted(
+            entries.items(), key=staleness
+        )
+        if not os.path.exists(network_cache_path(city_id, cfg.data_dir, network_type))
+    ]
 
 
 def run_prefreeze(
@@ -287,13 +385,15 @@ def _still_cold(cfg, planned) -> list[str]:
     ]
 
 
-def _alert(cfg, what: str, report: list[str], extra: list[str]) -> None:
+def _alert(
+    cfg, what: str, report: list[str], extra: list[str], *, mode: str = "--nights 2"
+) -> None:
     """Email ``what`` plus the pass's own output through ``[alerts]``. Never raises."""
     body = [
         "The daytime street-network prefreeze pass (issues #341, #355) did not finish.",
         "Every network it left cold is one Overpass refusal tonight away from stranding",
         "its city's walk for ~83 days. Re-run it by hand once the cause is cleared:",
-        "  scripts/prefreeze_street_networks.py --config <prod.toml> --nights 2 --execute",
+        f"  scripts/prefreeze_street_networks.py --config <prod.toml> {mode} --execute",
         "",
         *report,
         *extra,
@@ -301,6 +401,11 @@ def _alert(cfg, what: str, report: list[str], extra: list[str]) -> None:
     send_alert(
         cfg.alerts, f"street-network prefreeze {what} on {socket.gethostname()}", "\n".join(body)
     )
+
+
+def _mode(args) -> str:
+    """The planning flag a hand re-run should repeat, for the alert body."""
+    return "--all-enabled" if args.all_enabled else "--nights 2"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -319,10 +424,25 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--nights",
         type=int,
-        default=1,
         help="How many nights' worth of the city cap to look ahead (default 1)",
     )
-    p.add_argument("--limit", type=int, help="Freeze at most N networks this pass")
+    p.add_argument(
+        "--all-enabled",
+        action="store_true",
+        help=(
+            "Plan every enabled city's cold walk network, stalest-first, instead of "
+            "the next nights' slate: a by-hand backlog drain (issue #381). Refused "
+            "with --nights or --date"
+        ),
+    )
+    p.add_argument(
+        "--limit",
+        type=int,
+        help=(
+            "Freeze at most N networks this pass "
+            f"(default: no limit, or {DEFAULT_ALL_ENABLED_LIMIT} with --all-enabled)"
+        ),
+    )
     p.add_argument(
         "--pause-s",
         type=float,
@@ -357,6 +477,18 @@ def main(argv=None) -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    if args.all_enabled and args.nights is not None:
+        logger.error("--all-enabled and --nights are mutually exclusive")
+        return USAGE_EXIT_CODE
+    if args.all_enabled and args.date is not None:
+        # The plan is staleness-ordered over the whole catalog; no date enters it,
+        # so accepting one would promise a filter that is not applied.
+        logger.error("--all-enabled and --date are mutually exclusive")
+        return USAGE_EXIT_CODE
+    if args.nights is None:
+        args.nights = 1
+    if args.all_enabled and args.limit is None:
+        args.limit = DEFAULT_ALL_ENABLED_LIMIT
     if args.nights < 1:
         logger.error("--nights must be at least 1 (got %d)", args.nights)
         return USAGE_EXIT_CODE
@@ -388,6 +520,7 @@ def main(argv=None) -> int:
             "KILLED by SIGTERM",
             report,
             ["", f"Killed with {len(still)} planned network(s) still cold:", *still],
+            mode=_mode(args),
         )
         return TERMINATED_EXIT_CODE
     except Exception:
@@ -407,6 +540,7 @@ def main(argv=None) -> int:
                     "",
                     traceback.format_exc(),
                 ],
+                mode=_mode(args),
             )
         raise
     finally:
@@ -423,17 +557,29 @@ def _run_pass(args, cfg, today: date, report: list[str], planned: list) -> int:
 
     conn = db.connect(cfg.db_path)
     try:
-        full = plan_prefreeze(conn, cfg, today, nights=args.nights)
+        if args.all_enabled:
+            full = plan_prefreeze_all_enabled(conn, cfg)
+        else:
+            full = plan_prefreeze(conn, cfg, today, nights=args.nights)
         planned.extend(full[: args.limit] if args.limit is not None else full)
 
         street = [p for p in cfg.enabled_providers() if is_street_channel(p)]
         if not street:
             say("No street channel is enabled in this config; nothing to freeze.")
             return 0
+        scope = (
+            "across every enabled city, stalest-first"
+            if args.all_enabled
+            else f"for the walk slate of {today}"
+        )
+        window = (
+            f"{len(full)} cold in all"
+            if args.all_enabled
+            else f"{args.nights} night(s) of the {cfg.max_cities_per_day}-city cap"
+        )
         say(
             f"{'Would freeze' if not args.execute else 'Freezing'} {len(planned)} cold street "
-            f"network(s) for the walk slate of {today} (channels {', '.join(street)}, "
-            f"{args.nights} night(s) of the {cfg.max_cities_per_day}-city cap):"
+            f"network(s) {scope} (channels {', '.join(street)}, {window}):"
         )
         for city, network_type, channels in planned:
             say(f"  {city.city_id:60s} {network_type:12s} {', '.join(channels)}")
@@ -441,7 +587,11 @@ def _run_pass(args, cfg, today: date, report: list[str], planned: list) -> int:
             say(f"{len(full) - len(planned)} more cold network(s) are past --limit {args.limit}.")
         if not planned:
             # The steady state once the backlog is frozen: a no-op, never an alert.
-            say("Every walk in that window already has a frozen network.")
+            say(
+                "Every enabled city's walk network is already frozen."
+                if args.all_enabled
+                else "Every walk in that window already has a frozen network."
+            )
             return 0
         if not args.execute:
             say("DRY RUN — nothing fetched. Re-run with --execute to freeze them.")
@@ -450,6 +600,16 @@ def _run_pass(args, cfg, today: date, report: list[str], planned: list) -> int:
         frozen, failed, stop_code = run_prefreeze(
             conn, cfg, planned, pause_s=args.pause_s, force=args.force
         )
+        if stop_code is None and frozen == 0 and failed:
+            # Not a failed pass by this script's conventions (a city-specific
+            # failure never is, and the night would fail those cities the same
+            # way), so the exit stays 0 -- but "Froze 0" must not read as a clean
+            # pass: every fetch spent an Overpass query and bought nothing.
+            say(
+                f"WARNING: every planned fetch failed ({failed} of {len(planned)}); NOTHING "
+                "was frozen. Those cities have no usable network for Overpass to return, "
+                "and each attempt still spent a query against the daily budget."
+            )
         say(
             f"Froze {frozen} of {len(planned)} network(s)"
             + (f"; {failed} city(ies) had no usable network" if failed else "")
@@ -468,6 +628,7 @@ def _run_pass(args, cfg, today: date, report: list[str], planned: list) -> int:
                 _describe_stop(stop_code),
                 report,
                 ["", f"{len(still)} planned network(s) still cold:", *still],
+                mode=_mode(args),
             )
         return stop_code if stop_code is not None else 0
     finally:

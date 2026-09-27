@@ -195,6 +195,45 @@ def test_max_requests_per_minute_defaults_to_80pct_of_default_quota(monkeypatch,
     assert calls[0]["max_requests_per_minute"] == 24_000
 
 
+def test_a_connection_limit_above_batch_size_is_clamped_and_warned_not_refused(
+    monkeypatch, catalog, capsys
+):
+    """
+    The surplus is inert -- the GSV engine never has more than batch_size
+    requests in flight -- so refusing it cost a hand-run its collection and,
+    under the scheduler, quarantined the city (issue #359). The clamp is
+    one-directional: a limit below the batch passes through unwarned.
+    """
+    conn, city_id, data_dir = catalog
+    calls = []
+    gsv_configs(monkeypatch)
+    monkeypatch.setattr(cli, "download_gsv_metadata_async", stub_downloader(calls))
+
+    rc = run_cli(
+        monkeypatch,
+        city_id,
+        data_dir,
+        "--force",
+        "--connection-limit",
+        "150",
+        "--batch-size",
+        "100",
+    )
+    assert rc == 0
+    assert calls[0]["connection_limit"] == 100
+    assert "exceeds --batch-size" in capsys.readouterr().err
+
+    # The other direction at the parser: a second collection on the same run
+    # date is a no-op, so this half reads what parse_args hands async_main.
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["streetscape_tracker.py", city_id, "--connection-limit", "50", "--batch-size", "100"],
+    )
+    assert cli.parse_args().connection_limit == 50
+    assert "exceeds --batch-size" not in capsys.readouterr().err
+
+
 def _mapillary_stub(calls):
     return stub_downloader(
         calls, df_factory=lambda: make_mapillary_city_df([("m1", "2023-01-01")]), api_requests=4

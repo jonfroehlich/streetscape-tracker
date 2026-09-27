@@ -444,6 +444,27 @@ HOST_BY_BUSY_EXIT_CODE = {code: host for host, code in HOST_BUSY_EXIT_CODES.item
 # whole cycle for making progress.
 SWEEP_INCOMPLETE_EXIT_CODE = 83
 
+# Our OWN CLI rejected the argv it was handed (issue #359). This is argparse's
+# number, inherited rather than allocated: every child parser exits it on any
+# rejection (parser.error, an ArgumentTypeError from positive_int or the jitter
+# validator), collect.py returns it by hand for a bad --overpass-retry-* flag,
+# and the interpreter itself exits 2 when it cannot open the script path.
+#
+# It is a FOURTH family beside blocked / busy / crawl-incomplete because the
+# scheduler builds every child argv itself, so under run-due a 2 never means an
+# operator typed something wrong -- it means the config and the CLI disagree,
+# which is a condition to alert on loudly and NOT one to count against the city:
+# get_due_cities filters on consecutive_failures < max_consecutive_failures (5)
+# and nothing resets that counter but a success, so five such nights quarantined
+# a city for the rest of its 90-day cycle with no alert distinguishing it from a
+# city that was not due. Classified by the LAUNCHER rather than by a code each
+# child would have to emit, so every parser -- present and future -- is covered.
+#
+# The number carries a constraint the children must keep: nothing else in
+# cli.py or collect.py may exit 2. Both currently return only 0, 1, 83 and the
+# host codes otherwise.
+ARGV_REJECTED_EXIT_CODE = 2
+
 
 class SweepIncompleteError(DownloadError):
     """

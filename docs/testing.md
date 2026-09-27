@@ -77,6 +77,7 @@ Incidental coverage of a deprecated spelling trains readers to ignore the notice
 
 ## GSV downloaders, and the history harvester
 
+- `--connection-limit` above `--batch-size` (issue #359, `tests/test_cli_policy.py`): clamped to the batch with a stderr warning and the run proceeds (the downloader receives the batch size), rather than an argparse exit 2; a limit below the batch passes through unwarned, so the clamp is one-directional; `tests/test_run_cities.py` pins the same clamp in `run_cities.py`'s parser, which forwards both flags and must not refuse an argv the child accepts
 - GSV history harvester (response parsing, dated-only filter, cross-grid dedup, circuit breaker, resume — endpoint mocked)
 - GSV batch downloader's quota-throttling behavior (OVER_QUERY_LIMIT retry, sub-threshold residual written back as a failure row, over-threshold abort
   — the `fetch_gsv_pano_metadata_async` primitive is monkeypatched to serve responses from memory)
@@ -459,6 +460,14 @@ In `tests/test_scheduler.py`, `backup-status` gates on the heartbeat only when `
   — one refusal skips that host's channels, only channels that need it, **no** `record_attempt` on a skip, five consecutive blocked nights leaving the city still returned by `get_due_cities`,
   a blocked night alerting below the failure threshold while still publishing, the same for a busy night but with a subject that does **not** claim the provider refused us,
   a busy exit leaving the *next* city's same channel still attempted, and `CHANNEL_HOSTS` covering every scheduled channel since it is read with a fail-open `.get`)
+- The argv-rejected family (issue #359, `tests/test_scheduler.py`): `ARGV_REJECTED_EXIT_CODE` is argparse's 2 and disjoint from every host, busy, crawl-incomplete and usage code;
+  a child exit 2 records **no** `consecutive_failures`, and six such nights (one past the cap) leave the city still returned by `get_due_cities`;
+  the night alerts below the failure threshold, exits 1 and still publishes, under a `REJECTED by our own CLI` subject that claims neither a refusal nor a busy host, with `NO city was marked failed` and the channel in the body;
+  the `Done:` line counts rejections per channel (so the counter is threaded back out of `_run_city_loop`);
+  the next city's same channel is still asked (not a breaker);
+  `_run_collection_subprocess` names a 2 and quotes the argv in the reason while a 1 does neither, REDACTS a credential in that argv (the reason reaches the catalog and the mail), and lifts the parser's `prog: error:` line out of the child-log tail;
+  the alert names each rejection by city, channel and reason with the recent-log tail stubbed empty (so the note, not the tail, carries it), and `_rejected_argv_alert_note` caps its list at `_ARGV_REJECTIONS_LISTED` and counts the rest;
+  and a rejected walk whose grid sibling landed is STRANDED, with the `run-due --provider gsv_streets --limit N` recovery in the alert.
 - The breaker's cooldown re-check (issue #341, `tests/test_scheduler.py` and `tests/test_overpass_reset_probe.py`): a refusal that clears inside the cooldown resumes street channels **the same night**, pinned as the exact launch sequence across three cities with the cooldown at 0 and a probe answering *no, no, yes*
   — and as one probe call per re-check, none once recovered;
   the reset predicate `overpass_serving` (#356) is pinned against `_Interpreter`, an in-memory `/api/interpreter` that echoes the nonce it is sent, with `requests.get` a tripwire and DNS a no-network dual-stack fake:
@@ -484,6 +493,7 @@ In `tests/test_scheduler.py`, `backup-status` gates on the heartbeat only when `
   a re-check the loop already spent is never spent again by the pass, which then has no reason to wait;
   the retry's REAL argv carries the night's own `--run-date` on a night dated in the past;
   a city whose grid run failed, though the breaker cost it its walk too, is never retried;
+  the pass forwards the night's `rejected_argv` (a retried walk that is itself rejected is counted once and the night does not end `stopped early (unexpected error)`), an argv-rejected strand (exit 2, #359) is never retried — launched once, `1 launch(es) REJECTED`, still `STRANDED`, its city named once in each alert list — and a deadline-ended night whose pass meets the same deadline says `batch deadline reached` once;
   a night whose every stranded walk the pass landed after a refusal still exits nonzero with `REFUSED then recovered` in the subject;
   and a busy-stranded walk the pass lands leaves `busy_hosts` — no `SKIPPED (host busy)` subject and no "they stay due" busy paragraph — yet a night with nothing else wrong still exits nonzero and alerts `1 host(s) BUSY then recovered`, naming the host, the count and `locks/*.lock.owner`, while one busy again at the retry is counted as ONE skipped channel.
   The suite-wide autouse `_no_recheck_cooldown_wait` makes `_wait_out_recheck_cooldown` instant (it answers whether a stop was requested), so no night-level test waits out a real 45-min cooldown;
@@ -503,6 +513,12 @@ In `tests/test_scheduler.py`, `backup-status` gates on the heartbeat only when `
   no enabled street channel meaning nothing to freeze; bad flags exiting usage; and the default date being tomorrow UTC — a literal under a frozen 17:30-PDT clock (#347), not the same expression on both sides.
   `--alert` (issue #355) mails exactly once on a refusal, a busy lock, a `run-due` in flight, a crash (with the traceback, still re-raised) and a SIGTERM (exit 143, the previous handler restored), each naming the networks still cold, and never on a finished pass, an empty plan or a city-specific failure;
   the exit status is unchanged, and the SIGTERM exception is a `BaseException` so a library's `except Exception` cannot swallow it.
+  `--all-enabled` (issue #381) planning cities the slate mode drops — past the cap, and walked yesterday — while skipping a disabled city, an already-frozen one and one no enabled street channel walks (an explicit exclusion, or no enrolment on an opt-in channel, where a NULL member means out);
+  `--limit` truncating in **staleness** order (never-walked, then oldest walk, not `city_id` order), with two channels on one type sharing a fetch;
+  a dry run fetching nothing with `--limit` defaulting to 20; `--nights` or `--date` beside it exiting usage;
+  the in-flight `run-due` refusal and the host stop still firing in that mode; and its alert naming `--all-enabled` as the re-run.
+  From the PR #382 review: staleness over channels with DIFFERENT timestamps (the oldest walk, not the newest, and any never-walked channel making the network never-walked); a channel at the failure cap dropped per channel, not per city;
+  and the review's repro, repeated `--limit 1` passes moving past a city whose fetch always fails, a pass that froze nothing printing its WARNING, and the city dropping out once quarantined.
 - The prefreeze units (`tests/test_prefreeze_unit.py`, issue #355): the same host, interpreter, `--config`, lock dir and console log as the collection unit;
   a sandbox no wider than the checkout (`PrivateUsers`, `NoNewPrivileges`, `PrivateTmp`, `RestrictSUIDSGID`, `ProtectSystem=strict`, one `ReadWritePaths`, an OPTIONAL `EnvironmentFile`);
   a `MemoryMax` whose VALUE sits above a floor and below the nightly unit's, with no `MemoryHigh` — an OOM here is a SIGKILL, so it is the one failure that cannot alert;
@@ -533,6 +549,7 @@ registration capping at the 40 km ceiling and aliasing the query slug so a secon
 — plus the low-fraction warning naming the NKY precedent and a **raising geocoder not failing the run**, exercised through the real probe rather than a stub that returns None;
 success starting only the collected channels' clocks while `gsv` stays absent so the nightly batch still does the grid run, and a failure recording **no** `consecutive_failures`, with six failed runs leaving the city still returned by `get_due_cities`;
 a Mapillary tile block leaving the GSV walk collected while `mapillary_streets` is never asked, an Overpass refusal skipping both walks but not the grid census, and a busy exit skipping one channel only;
+a channel whose argv our own CLI rejected (issue #359) exiting 1 with `N channel(s) REJECTED by our own CLI` in the summary and no `consecutive_failures`, since it records no attempt and would otherwise score the run complete;
 the tail regenerating before publishing, not publishing when nothing succeeded, and publishing a partial success anyway;
 the answer report leading with street-km ahead of grid coverage and carrying the "NOT the deployment number" label, printing the any-imagery split for Mapillary but not for GSV, reading "not walked" rather than 0% for a missing walk, surviving NULL lengths/ages, and building the city-page link from the grid run's CSV filename
 — preferring the Mapillary run, **falling back to the GSV one** and naming which it opened, saying there is no page only when neither exists, and tolerating a `site_url` with no trailing slash, since link building is bare concatenation;
