@@ -1,9 +1,14 @@
 """Diff engine tests: pano set algebra, date changes, coverage transitions."""
 
+import os
+from datetime import date
+
 import pandas as pd
 
 from streetscape_metadata_tracker.diff import compute_run_diff, generate_diff_filename
-from tests.conftest import COLUMNS, make_city_df, make_mapillary_city_df
+from streetscape_metadata_tracker.fileutils import load_city_csv_file
+from streetscape_metadata_tracker.naming import generate_run_filename
+from tests.conftest import COLUMNS, make_city_df, make_mapillary_city_df, write_city_csv_gz
 
 
 def _two_point_df(point_b_status, point_b_pano, point_b_date):
@@ -181,3 +186,31 @@ def test_diff_filename_provider():
         generate_diff_filename("bend--or", "2026-04-01", "2026-07-01", provider="mapillary")
         == "bend--or_diff_mapillary_2026-04-01_to_2026-07-01.csv.gz"
     )
+
+
+# --- issue #367: both sides of a diff come through the query-radius seam -----
+
+
+def test_a_far_pano_in_both_runs_is_neither_churn_nor_coverage(data_dir):
+    """Point A holds the SAME far pano in both runs: absent on both sides, so
+    no add/remove. Point B held only a far pano before and a near one now:
+    that is coverage gained, which it would not be if the far pano had
+    counted."""
+
+    def run(run_date, b_pano, b_offset_deg):
+        df = make_city_df([("far_a", "2024-01-01"), (b_pano, "2024-01-01")], run_date=run_date)
+        df.loc[0, "pano_lat"] = df.loc[0, "query_lat"] + 0.01  # ~1.1 km
+        df.loc[1, "pano_lat"] = df.loc[1, "query_lat"] + b_offset_deg
+        name = generate_run_filename("bend--or", 100, 100, 20, run_date)
+        path = os.path.join(data_dir, name + ".csv.gz")
+        write_city_csv_gz(df, path)
+        return load_city_csv_file(path)
+
+    old = run(date(2026, 1, 15), "far_b", 0.01)
+    new = run(date(2026, 4, 15), "near_b", 0.0001)
+    d = compute_run_diff(old, new)
+
+    assert d.panos_removed == 0  # far_a and far_b were never counted
+    assert d.panos_added == 1  # near_b
+    assert d.points_gained_coverage == 1  # B: far -> near
+    assert d.points_lost_coverage == 0
