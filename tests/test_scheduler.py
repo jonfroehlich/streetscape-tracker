@@ -12098,7 +12098,7 @@ def test_a_stranded_walk_still_refused_at_the_pass_keeps_its_entry(conn, monkeyp
     ((subject, body),) = alerts
     assert "2 city(ies) STRANDED un-walked" in subject
     assert f"{alpha} (gsv_streets)" in body and f"{beta} (gsv_streets)" in body
-    assert "could not walk them either" in body
+    assert "could not walk the host-stranded ones either" in body
     assert " 1 channel launch(es) were skipped in all" in body
     assert _alert_commands(body) == [
         ["run-due", "--provider", "gsv_streets", "--city", alpha, "--city", beta]
@@ -12384,11 +12384,12 @@ def test_the_pass_waits_until_the_next_recheck_not_a_flat_cooldown(conn, monkeyp
 
 
 def test_the_wait_gate_leaves_room_for_a_childs_floor_timeout(conn, monkeypatch, caplog):
-    """The gate is `wait + _MIN_CLAMPED_TIMEOUT_S`, not the wait alone: with
-    2850 s of night left and a 2700 s wait, waiting would leave a retried
-    child 150 s, under the 300 s floor the loop never starts a child with.
-    (The 45-min night of the test above cannot see the floor term: 2700 is
-    under 2700 + anything.)"""
+    """The gate is `wait + _MIN_PACED_LAUNCH_S`, not the wait alone: with
+    3150 s of night left and a 2700 s wait, waiting would leave a retried
+    child 450 s, under the 600 s fixed slack below which no paced child can
+    launch (#373) -- though above the 300 s clamp floor the gate used to add,
+    which is what the 450 s pins. (The 45-min night of the test above cannot
+    see the floor term: 2700 is under 2700 + anything.)"""
     alpha = _register(conn, "Alpha", width=1000, height=1000, step=20)
     _ran, run_one = _refuse_alpha_first_walk(alpha)
     waits = _record_waits(monkeypatch)
@@ -12397,7 +12398,7 @@ def test_the_wait_gate_leaves_room_for_a_childs_floor_timeout(conn, monkeypatch,
         _drive_night(
             monkeypatch,
             conn,
-            _two_walk_cfg(max_batch_hours=(2700 + 150) / 3600),
+            _two_walk_cfg(max_batch_hours=(2700 + 450) / 3600),
             run_one,
         )
 
@@ -14585,3 +14586,152 @@ def test_a_deferral_past_the_deadline_logs_zero_minutes_not_negative(conn, monke
 
     [line] = [r.message for r in caplog.records if "deferring —" in r.message]
     assert "and 0 min remain" in line
+
+
+def test_the_retry_pass_does_not_start_inside_the_dead_zone(conn, monkeypatch, caplog):
+    """A 1 h night: Alpha's Mapillary census lands, its walk is refused by
+    Overpass and stranded, and that refusal leaves 500 s -- above the 300 s
+    clamp floor, below the 600 s fixed slack. The loop is done, and the retry
+    pass must not start: asking would spend a real Overpass re-check and then
+    floor-skip the resumable walk into "deferred for budget" (#373)."""
+    from streetscape_metadata_tracker.download_common import HOST_OVERPASS
+
+    monkeypatch.setattr(_sched, "HOST_RECHECK_COOLDOWN_S", 0)
+    probe = _recovering_probe([True])
+    monkeypatch.setitem(_sched.HOST_RECHECKS, HOST_OVERPASS, probe)
+    alpha = _register(conn, "Alpha", width=1000, height=1000, step=20)
+    now = [1_000.0]
+    monkeypatch.setattr(_sched.time, "monotonic", lambda: now[0])
+    cfg = SchedulerConfig(
+        providers={
+            "mapillary": ProviderConfig(enabled=True, daily_request_budget=40_000),
+            "mapillary_streets": ProviderConfig(enabled=True, daily_request_budget=5_000),
+        },
+        max_batch_hours=1,
+        publish_enabled=False,
+        alerts=AlertConfig(enabled=True, failure_threshold=99),
+    )
+    ran = []
+
+    def run_one(city, provider):
+        ran.append((city.city_id, provider))
+        if provider == "mapillary_streets":
+            now[0] += 3600 - 500
+            return _blocked_outcome(HOST_OVERPASS)
+        return True
+
+    with caplog.at_level(logging.INFO):
+        _drive_night(monkeypatch, conn, cfg, run_one)
+
+    assert ran == [(alpha, "mapillary"), (alpha, "mapillary_streets")]
+    assert probe.calls == [], "no Overpass re-check spent in the dead zone"
+    done = _done_line(caplog)
+    assert "deferred for budget" not in done
+    assert "1 city(ies) STRANDED un-walked" in done
+    assert not any("End-of-night retry" in r.message for r in caplog.records)
+
+
+def test_the_alert_marks_a_deadline_stranding_when_the_night_alerts_for_another_reason(
+    conn, monkeypatch
+):
+    """Alpha's walk is stranded by the deadline, which alone would not alert;
+    Beta's grid run FAILS at failure_threshold 1, which does. The STRANDED
+    paragraph then lists Alpha with its reason, so the operator can tell it
+    from a host stranding (which waits for the host)."""
+    alpha = _register(conn, "Alpha", width=1000, height=1000, step=20)
+    beta = _register(conn, "Beta", width=1000, height=1000, step=20)
+    _no_salvage(_sched, monkeypatch)
+    real = _sched.city_timeout_estimate_seconds
+
+    def estimate(cfg, city, provider, conn=None):
+        if city.city_id == alpha and provider == "gsv_streets":
+            return 10**9
+        return real(cfg, city, provider, conn=conn)
+
+    monkeypatch.setattr(_sched, "city_timeout_estimate_seconds", estimate)
+    cfg = SchedulerConfig(
+        providers={
+            "gsv": ProviderConfig(enabled=True, daily_request_budget=10_000_000),
+            "gsv_streets": ProviderConfig(enabled=True, daily_request_budget=2_000_000),
+        },
+        publish_enabled=False,
+        alerts=AlertConfig(enabled=True, failure_threshold=1),
+    )
+
+    rc, alerts = _drive_night(
+        monkeypatch,
+        conn,
+        cfg,
+        lambda city, provider: not (city.city_id == beta and provider == "gsv"),
+    )
+
+    assert rc == 1
+    [(_subject, body)] = alerts
+    assert f"{alpha} (gsv_streets: the batch deadline)" in body
+    assert "never retries a walk marked `the batch deadline`" in body
+
+
+def test_a_walk_deferred_after_its_grid_FAILED_is_not_stranded(conn, monkeypatch):
+    """The grid run fails and the walk defers: the city is still gsv-due, so
+    it comes back tomorrow with both, and nothing is stranded."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    city = db.resolve_city(conn, _register(conn, "Bend", width=1000, height=1000, step=20))
+    real = sched.city_timeout_estimate_seconds
+    monkeypatch.setattr(
+        sched,
+        "city_timeout_estimate_seconds",
+        lambda cfg_, c, p, conn=None: 7200 if p == "gsv_streets" else real(cfg_, c, p, conn=conn),
+    )
+    monkeypatch.setattr(sched.time, "monotonic", lambda: 0.0)
+    _no_salvage(sched, monkeypatch)
+    monkeypatch.setattr(sched, "_run_one_city", lambda *a, **k: False)
+    breaker = sched.HostBreaker()
+    deferred: Counter[str] = Counter()
+
+    _run_channels(
+        sched,
+        _street_cfg(),
+        conn,
+        city,
+        ["gsv", "gsv_streets"],
+        batch_deadline=3600.0,
+        deadline_deferred=deferred,
+        blocked_hosts=breaker,
+        record_failures=False,
+    )
+
+    assert deferred == Counter({"gsv_streets": 1})
+    assert breaker.stranded == {}
+    assert breaker.deadline_stranded == set()
+
+
+def test_a_deferred_first_WALK_defers_only_itself(conn, monkeypatch):
+    """A city excluded from gsv leads with its walk. A deferred walk has no
+    grid to pair with, so the whole-city rule does not fire: only the walk
+    defers, and the Mapillary census still launches."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    city = db.resolve_city(conn, _register(conn, "Bend", width=1000, height=1000, step=20))
+    real = sched.city_timeout_estimate_seconds
+    monkeypatch.setattr(
+        sched,
+        "city_timeout_estimate_seconds",
+        lambda cfg_, c, p, conn=None: 7200 if p == "gsv_streets" else real(cfg_, c, p, conn=conn),
+    )
+    monkeypatch.setattr(sched.time, "monotonic", lambda: 0.0)
+    launched = _deadline_recorder(sched, monkeypatch)
+    deferred: Counter[str] = Counter()
+
+    _run_channels(
+        sched,
+        _street_cfg(),
+        conn,
+        city,
+        ["gsv_streets", "mapillary"],
+        batch_deadline=3600.0,
+        deadline_deferred=deferred,
+    )
+
+    assert [p for _cid, p, _t in launched] == ["mapillary"]
+    assert deferred == Counter({"gsv_streets": 1})
