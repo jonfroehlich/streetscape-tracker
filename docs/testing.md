@@ -29,6 +29,9 @@ already gone wrong once:
   The v8-to-current ladder test gains a v13 assertion for the reason it exists: a rung that never fires is silent.
 - The v13→v14 migration (`census_fetched_by`/`census_fetched_at` on `runs` and `street_walks`, issue #290): the pair arrives NULL on existing rows, `register_run` round-trips it, and it defaults to NULL rather than to the collecting channel — provenance is recorded, never inferred.
   The load-bearing pin is `test_run_row_carries_every_runs_column`: `_row_to_run` builds `RunRow(**dict(row))` from a `SELECT *`, so a column without a matching dataclass field is a `TypeError` on every `get_latest_run` against a migrated catalog, not a missing feature.
+- The v15→v16 migration and the per-host ledger (`host_usage`, issue #385), in `tests/test_db.py`: the backfill seeds exactly the last two UTC dates of `api_usage`, only for channels in `CHANNEL_METERED_HOST` (gsv, gsv_streets, a two-days-old row and a zero row are each left out), stamped at noon UTC, and a second connect or a hand re-run seeds nothing;
+  `add_api_usage` is the write seam — a metered channel writes one row stamped from the frozen clock, while gsv, a zero spend and `meter_host=False` write none and still charge `api_usage`;
+  `get_host_usage` is inclusive at `since` (a row exactly at the window start counts, one a second earlier does not) and refuses a naive datetime; and `prune_host_usage` drops only rows strictly older than its cutoff.
 - An end-to-end migration test with synthetic fixtures
 - The one snapshot clock (`tests/test_clock.py`, issue #347): under a pinned America/Los_Angeles zone and a frozen 17:30-PDT instant, `clock.snapshot_date_today()` is the UTC date and not the local one; `db.utc_now_iso` reads the same seam;
   and a grep refuses `date.today()`, `datetime.today()` and a naive `datetime.now()` on the collection path (`checkpointing`, `cli`, `scheduler`, the walk collector, the prefreeze script).
@@ -227,6 +230,11 @@ Incidental coverage of a deprecated spelling trains readers to ignore the notice
   — not redundant, since `cmd_run_due` emits its `Done: ...` line *before* `_finish_batch` runs, so a summary-only append never reaches the scheduler log on a healthy night.
   A third pins the **ordering** — read after `generate_aggregate_v2`, because on a big-census night the tail and not the city loop sets the peak (#157) — since the other two pass identically with the call moved to the top of the function.
   Their complement pins silence: an unavailable reading adds nothing to the summary at all.
+- The shared rolling-24h host budget (issue #385), every case through `load_scheduler_config` on a temp TOML: block 4's shape (1,444 spent 9 h earlier on the PREVIOUS UTC date caps the next city at 3,000 − 1,444 and the one after at that minus the first's spend — fails if the window is keyed on the UTC date); the pool shared by both Mapillary channels (the grid's 2,500 leaves the walk 500 whatever the walk's own row says — fails if the read filters by channel);
+  the minimum in both directions, for a capped launch and for a launch-floor skip, with a host-caused skip counted in `deferred_host_budget` and never `skipped_budget`; absent and empty `[hosts]` giving identical launch kwargs with 10,000 in the window, beside the same ledger deferring under a budget so the harness is shown able to see a host term;
+  seven invalid `[hosts.*]` spellings each recorded at load and refusing `run-due` and `assess-city` before the catalog opens; a filtered `--provider mapillary_streets --city` catch-up capped or deferred, with the host named on the city's line and the `Done:` line;
+  the dry run and `status` printing the window and the preview marking the cities the host defers; the per-launch re-read (fails if the window is read once a night); `CHANNEL_METERED_HOST` derived against `CHANNEL_HOSTS` by set equality; and the tail pruning past 30 days and surviving a prune that raises.
+  `test_makelab1_production_config_is_wired` pins prod's 3,000.
 
 ## Concurrent channel lanes (issue #240)
 
@@ -558,6 +566,7 @@ that the pre-flight distinguishes "over the whole daily budget" from "over what 
 that a config with publishing disabled prints the notice beside the link and still exits 0, that `--no-publish` does *not* print it (the operator chose that), and that no `--publish` flag exists at all
 — pinned so the asymmetry reads as a decision rather than an omission;
 and `_publish` passing `--local` iff `[publish].local`, read from the TOML and asserted true in the checked-in prod config.
+The pre-flight also prints each Mapillary channel's rolling-24h tile-CDN window beside its daily line (issue #385) and marks the channel over the HOST's budget when that, not its untouched daily budget, is what it does not fit.
 
 ## Google's driving plan (issue #176)
 
@@ -874,6 +883,7 @@ And the per-row search haystack cache is asserted to be keyed by the **field lis
 - **Importing into a city this host already tracks** — the path where an importer can quietly re-base a series, and one no empty-catalog test reaches. A byte-identical frozen network is kept (this host's row survives untouched); one with different bytes refuses the bundle and leaves this host's file as it was; a network's `fetched_at` is carried, not restamped. A run extending this host's series gets a `run_diffs` row, a detail file, and a non-null change block in its regenerated JSON; a walk extending a walk series gets its `street_walk_diffs` row; a run or walk dated before this host's newest is refused (append-only).
 - A walk on another `network_type` than its channel walks leaves that channel's cadence alone, asserted by relabelling the bundle's drive walk to `all_public`.
 - An unknown provider is exit 64, not the `ValueError` the filename generators raise.
+- Imported spend never reaches this host's rolling-24h window (issue #385): a bundle's KartaView row — ledgered here because the credential is shared, and metered per host — charges `api_usage` and writes no `host_usage`, since the requests came from the laptop's IP.
 - **A crash at the ledger leaves the cadence rows already written**, pinned by making `add_api_usage` raise: the success rows exist, the retry is refused, and the ledger holds nothing. The `--enable` branch for an already-registered, disabled city is reached through the importer, not through the `set_city_enabled` helper it uses.
 
 ## The e2e fixture cannot fall behind the provider set (issue #354)

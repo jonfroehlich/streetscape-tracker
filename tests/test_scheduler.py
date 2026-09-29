@@ -1092,6 +1092,11 @@ def test_makelab1_production_config_is_wired():
     # The walk channel is unchanged: since #290 it spends 0 on a paired night.
     assert cfg.providers["mapillary"].daily_request_budget == 3_500
     assert cfg.providers["mapillary_streets"].daily_request_budget == 1_750
+    # And the pool both of them draw from over a rolling 24 h (#385), added after
+    # block 4. Pinned exactly, with no load error, so a prod change to the one
+    # guard that bounds the pair's combined volume is a red test.
+    assert cfg.host_budgets == {"mapillary_tiles": 3_000}
+    assert cfg.host_budget_errors == []
     # kartaview was turned on in production on 2026-08-28, the separate deploy
     # decision this assertion previously withheld (#248). Enabling the CHANNEL
     # enrols nobody: it is the one opt-in channel, so the nightly queue is exactly

@@ -153,7 +153,7 @@ Each area below states its rules here and keeps its evidence in a `docs/` file.
 
 **Data model, pipeline and naming → [`docs/architecture.md`](docs/architecture.md).**
 Every run is an immutable dated snapshot on the city's **frozen grid geometry** (never re-geocoded, shared by all providers, so diffs are meaningful); **no filename provider token means gsv**, so all pre-provider names and published URLs are unchanged.
-The SQLite catalog `data/streetscape_tracker.db` (schema v15, auto-migrated on connect) is the operational source of truth and is **local-only, never rsynced**.
+The SQLite catalog `data/streetscape_tracker.db` (schema v16, auto-migrated on connect) is the operational source of truth and is **local-only, never rsynced**.
 `schedule_state.member` (v13, #248) is the one column where **NULL does not mean "not measured"** — it means "use `scheduler.CHANNEL_DEFAULT_MEMBERSHIP[channel]`", which is code-side so a new provider token cannot silently enrol the catalog (a missing entry is a `KeyError`, never a permissive default).
 Each provider is an independent run series on the same grid: GSV is a *sample* (nearest pano per grid point), Mapillary and KartaView are *censuses* — so coverage rates are cross-provider comparable and raw pano counts are not.
 Official-Google classification is an exact `© Google` match (`analysis.is_google_copyright`, mirrored in `city.js`), never a substring, since photographer names can contain "Google".
@@ -216,6 +216,7 @@ The lifecycle (loader, marker, reuse accounting, `crawl_store_for`) lives once i
 This is what READ THIS FIRST points at; read it before changing any pacing, retry, concurrency, volume or host decision.
 
 - **Mapillary `--limit` catch-ups resumed 2026-09-09**, after #292's eleven-night jitter window ran clean, and resume **staged**: that window's highest COMBINED night was 2,260 (its 1,736 is the grid column alone), so filling the budget at once is a volume step nothing has measured.
+  **A catch-up draws from the same rolling-24h tile-CDN budget as the night** (`[hosts.mapillary_tiles]`, #385), so it defers rather than stacks.
   Size a step in **cities** — `--limit` is a city count, and per-city cost is median 9 / p90 81 / max 870 over runs actually collected, a distribution biased LOW because the budget gate skips the expensive cities — and quote the **per-IP sum** (5,250 un-paired), never the grid channel's 3,500 alone.
   Never-collected cities are the EXPENSIVE tail (728.6 km² mean grid vs 131.6), not the cheap start.
   #241's rolling 2–3 day window is dead — **block 3 retired that and every other volume window (#286)** — so never quote its bands as live.

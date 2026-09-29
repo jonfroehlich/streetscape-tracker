@@ -128,6 +128,7 @@ The *combined* per-IP load has therefore been running at 755–2,260/day (six-ni
 That is accepted rather than overlooked, on the ground that block 3 (1,938/day, against 26,363 spent clean on 08-14) falsified daily volume and every accumulation window from 1 to 8 days (#286).
 It is **not** accepted on the ground that volume is safe — nothing about this host's behaviour is known safe, and the even split #241 chose still matters on exactly the nights that reach 5,250.
 The structurally correct fix is a single per-IP pool both channels draw from, which is a scheduler change rather than a config edit and is deliberately not attempted here; until it exists, the sum above is the number to quote, never the grid channel's 3,500 alone.
+**#385 has since built that pool** (after block 4, below): both channels now also draw from one rolling-24h tile-CDN budget, so the un-paired 5,250 is no longer reachable inside 24 h while it is set at 3,000.
 
 **Deliberately timed after the jitter window closed.** The #292 restart is a pre-registered test whose read-out condition is "clean through ~2026-09-09", and raising volume inside that window would have handed a fourth block two candidate causes where the design went to real trouble to leave exactly one.
 The cost of waiting was the two skipped cities above.
@@ -248,6 +249,7 @@ They resume **staged, never at the ceiling**: the highest combined night the led
 Start at `--limit 5` on cities that already have a Mapillary run (~45 requests each on the per-city mean), read the ledger each morning, and widen only after a night lands where you expected.
 **Never-collected cities are the expensive tail, not the cheap start**: the 85 enabled cities with no Mapillary run average a **728.6 km²** frozen grid against 131.6 km² for the 1,132 that have one, so a `--limit 10` drawn from them can cost 2,500–3,500 in one night.
 They are the right cities to reach eventually — they cannot un-pair a snapshot that does not exist (see the next section) — but reach them a few at a time and priced individually, never preferentially.
+**A catch-up draws from the same rolling-24h tile-CDN budget as the night** (`[hosts.mapillary_tiles]`, #385), so a daytime `--limit` or `--city` run and the following night can no longer stack; see the block 4 section below.
 `--limit N` does **not** truncate the candidate list to N — a candidate can be skipped without being processed (budget guard, host breaker, busy lock), so pre-slicing let the loop run out of list below N and report a clean night, which is this flag's own bug one layer down.
 
 ## A filtered run is not a narrower nightly run: it un-pairs the cities it touches
@@ -256,6 +258,7 @@ They are the right cities to reach eventually — they cannot un-pair a snapshot
 `--provider mapillary` advances only that channel's clock, so every city it collects stops sharing a run date with its other channels until their cadences happen to re-converge.
 That is what catching a channel up *means* — but it is a real cost to the paired-snapshot property, so `cmd_run_due` logs a warning naming the channels left behind, and a test pins the behaviour.
 Still ungoverned, deliberately: a manual `streetscape_tracker.py --provider mapillary` has no volume check at all (`cli.py` only ever *records* spend via `add_api_usage`), which is fine for the one-city case at a median of 12 tiles.
+Since #385 its spend does land in the rolling tile-CDN window (the write seam is `add_api_usage` itself), so the next scheduler launch sees it; the CLI itself still neither warns nor refuses, because it has no scheduler config to read a budget from.
 
 ## Two `run-due` processes can overlap, and nothing serializes them
 
@@ -360,6 +363,38 @@ What the window does **not** license is treating the raised budget as tested: th
 **Project Sidewalk serves Mapillary data off the makelab servers**, so pointing this workload at makelab1 risks earning the same per-IP block on a host that a *production research deployment* depends on.
 Jon has ruled this out; trading Project Sidewalk's imagery for our nightly batch is never the right trade.
 If collection must move, it moves to a host with nothing else riding on it — and only after reading the forum first (see the top-of-file rule).
+
+## Block 4, and a shared rolling-24h tile budget (issue #385, 2026-09-28)
+
+**The tile CDN blocked makelab2 again at 2026-09-28 02:27 PDT** (HTTP 302 → login, exit 75), 26 minutes into the night and 12 requests into a city's grid run.
+It was the first block in 31 days, a stretch that contained all eleven clean nights of the #292 jitter window.
+
+`api_usage` for the two Mapillary channels, by UTC date (prod catalog, read-only query quoted in #385):
+
+| UTC date | mapillary | mapillary_streets | sum |
+|---|---|---|---|
+| 09-26 | 905 | 1,262 | 2,167 |
+| 09-27 | 1,198 | 1,749 | **2,947** |
+| 09-28 (at block) | 194 | 1,444 | 1,638 |
+
+- 09-27 was the **first night at `max_cities_per_day = 80`** (#372), and its 2,947 is above 2,260, the highest combined night the #292 window recorded — a volume step nothing had measured.
+- The 1,444 on 09-28 is almost entirely a 20-city `run-due --provider mapillary_streets --city …` catch-up that ran 17:05–17:55 PDT on 09-27; starting after 17:00 PDT, it was charged to the **next** UTC date.
+- So roughly **4,600 tile requests landed in the ~24.5 h before the block**, and neither per-channel daily budget was exceeded, because each channel read only its own row for one UTC date.
+
+**What this does not show.** It does not show a rolling 24 h volume limit.
+#286 found no accumulation window from 1 to 8 days that separates blocked from clean periods, and block 4's ~4,600 in 24.5 h is itself below the 5,753 that 08-19 ran clean.
+The live hypotheses are unchanged: a repeat-offender penalty, or some opaque score over volume, regularity and IP history.
+Only onset is recorded here; how long block 4 lasted belongs in the recovery section once it is measured, under that section's tiers.
+
+**What changed: `[hosts.mapillary_tiles] rolling_24h_request_budget = 3000`**, a pool both Mapillary channels draw from on every scheduler path (the nightly batch, `--provider`/`--city`/`--limit` catch-ups, `assess-city`), counted over the last 24 h rather than per UTC date.
+The effective remainder at each launch is the minimum of the channel's own daily remainder and the pool's; the daily budgets are unchanged.
+**It is a staging guard, not a model of Mapillary's threshold.** It enforces the rule this file already stated and 09-27 broke: grow Mapillary volume in stages, never jump to an unmeasured level, and never stack a daytime catch-up on a full night.
+It costs little coverage: one full Mapillary grid refresh of the catalog, summed from each enabled city's latest prod run on 2026-09-28, is **~66,400 requests** (n = 1,205; median 12, p90 160, max 870), about **~800/day** over the ~85-day cycle, and a paired walk reuses its grid run's census for ~0 (#290).
+That sum reads `runs.api_requests`, which is per-process, so resumed crawls under-report it; the true figure is somewhat higher, not multiples higher.
+Like every budget here it is a **soft ceiling**: in-flight retries can overshoot it by `connection_limit × (TILE_MAX_TRIES − 1)`.
+Mechanism, ledger and reporting: `docs/scheduler.md`, the rolling-24h section.
+
+Mapillary's own documentation and forum were re-read before this landed (2026-09-29): the API docs still give only the per-app `tiles.mapillary.com` limit of 50,000 per day, and [thread 10644](https://forum.mapillary.com/t/50-000-requests-day-rate-limit-scope/10644) still ends at this project's own 2026-08-28 question, unanswered, so nothing published speaks to the per-IP layer beyond the staff reply above.
 
 ## Per-IP hosts and the cross-process host lock (issue #208)
 

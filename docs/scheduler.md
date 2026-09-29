@@ -397,6 +397,33 @@ The before/after is a measured question and therefore owes a writeup: `scripts/n
 That is also why `cmd_run_due` logs `max_concurrent_channels=N` **and `connection_limit=N`** on its opening line — which setting a night ran under has to be recoverable from the night's own record, not from an operator's memory of the flip date.
 Both, because the per-child socket count is the pair divided: a night that fell back to one lane would otherwise be grouped with pre-flip one-lane nights while having run at a different share.
 
+## A shared rolling-24h budget per per-IP host (issue #385, added 2026-09-29)
+
+**Every channel on a budgeted per-IP host draws from one pool, counted over the last 24 h rather than per UTC date.**
+It is configured per host token, `[hosts.mapillary_tiles] rolling_24h_request_budget = 3000` on prod, so both Mapillary channels are covered, and so would be a future channel on the same CDN.
+The per-channel `daily_request_budget`s stay exactly as they are.
+**The effective remainder at a launch is the minimum** of the channel's daily remainder and every budgeted host's rolling remainder (`_budget_remainder`, the one reader, shared by the live gate, the dry run and `assess-city`).
+A resumable channel is then capped at that remainder, or deferred under its launch floor, by the machinery above; no new stop path exists.
+With no `[hosts]` section (the repo default), or an empty one, the gate reads exactly what it read before.
+An invalid entry (unknown token, non-positive or non-integer value, a stray key) is recorded at load like an unwired channel, and `run-due` and `assess-city` refuse with 64: falling back to "no budget" would be the fail-open direction.
+
+**It is re-read per launch, never once per night**, because the same night's earlier children on the host have written to the ledger since.
+The two Mapillary channels never overlap (the cross-process host lock, and host-disjoint lanes in-process), so no cross-lane reservation is needed.
+
+**The ledger is `host_usage` (schema v16), written by `db.add_api_usage` itself** for every channel in `download_common.CHANNEL_METERED_HOST`, so no call site can forget it and the ledger is complete whatever the budget config says.
+A child records its spend when it finishes, so a long crawl's whole spend is stamped at its end.
+That shifts spend **later** within the window, which makes the gate slightly more conservative on the following night, never less; there are deliberately no mid-crawl writes.
+The v16 migration backfills the last two UTC dates of metered `api_usage`, stamped at noon UTC, so the first night after deploy is gated; the tail prunes rows older than 30 days, best-effort.
+`import-bundle` writes no host row, since imported spend came from another machine's IP.
+
+**It is a soft ceiling, exactly like the daily budget**: tiles already in flight finish their retries, so a capped night can end up to `connection_limit × (TILE_MAX_TRIES − 1)` over it.
+Never write that it is not exceeded.
+
+A host-governed deferral is logged with the host, its usage and the window start, counted in `deferred_host_budget` rather than `skipped_budget`, and reported on the `Done:` line as `N deferred for the rolling-24h budget of <host>`; a host-capped launch names the host in its cap line.
+`run-due --dry-run`, `scheduler status` and `assess-city`'s pre-flight all print the window.
+A direct `streetscape_tracker.py --provider mapillary` has no scheduler config, so it neither warns nor refuses; its spend still lands in the window through the seam.
+**This is a staging guard on how fast our traffic can change, not a model of Mapillary's per-IP threshold** — see `docs/provider-access.md`, block 4.
+
 ## What a capped night spends its slots on (issue #308, added 2026-09-02)
 
 **Breadth-first was never a decision; it was the shape of a tiebreak, and this section is that tiebreak given a name and a lever.**
