@@ -6770,9 +6770,11 @@ def _collect_due(
             resumers = [i for i in stranded if _has_live_checkpoint(ordered[i])]
             chosen = set(resumers[: max(1, max_opt_in - (n_groups - 1))])
 
-            # Then round-robin the rest, so no stranded population can be
-            # zeroed by a larger one. A group leaves the rotation as it empties,
-            # so a slate with only one behaves exactly as the straight take did.
+            # Then round-robin the rest, so no stranded KIND can be zeroed by a
+            # larger one on a single night. (Within kind 1 that holds only
+            # ACROSS nights, via the offset below: on any one night a channel
+            # can get 0.) A group leaves the rotation as it empties, so a
+            # slate with only one behaves exactly as the straight take did.
             #
             # TWO LEVELS, because the same starvation recurs one level down
             # (issue #348). Inside group 1 union order is first appearance over
