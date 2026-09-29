@@ -90,6 +90,7 @@ from .download_common import (
     HOST_OVERPASS,
     HOST_PANORAMAX,
     SWEEP_INCOMPLETE_EXIT_CODE,
+    SWEEP_STOP_PHRASES,
     WALK_CONNECTION_LIMITS,
     DownloadError,
     HostUnavailableError,
@@ -1764,6 +1765,14 @@ _TIMEOUT_HEADROOM = 1.5
 # Fixed slack (seconds) for process startup, geocode reuse, compression, and
 # the inter-pass retry sleeps that are not part of the paced request time.
 _TIMEOUT_FIXED_SLACK_S = 600
+# What a resumable child's wall-clock budget holds back from its SIGKILL timeout
+# (issue #344): it is told `--*-max-seconds timeout_s - this`. The child measures
+# that budget from its OWN process start (download_common.PROCESS_STARTED_MONOTONIC),
+# so startup is already inside it; what the margin has to cover is what happens
+# AFTER the stop -- the in-flight tiles' retries, the checkpoint write, the
+# ledger write and process exit. 600 s is the same slack the timeout derivation
+# already holds back for the tail, so the two budgets are one number.
+_CRAWL_CLOCK_MARGIN_S = _TIMEOUT_FIXED_SLACK_S
 # max_requests_per_minute is a client-side *ceiling*, not the achieved rate: the
 # async engine undershoots it (connection limit, ~30 ms metadata latency, the
 # resource guard lowering concurrency on a busy host). makelab2 sustained
@@ -2286,6 +2295,29 @@ def _kartaview_timeout_seconds(
     return int(max(floor, paced_seconds * _TIMEOUT_HEADROOM + _TIMEOUT_FIXED_SLACK_S))
 
 
+def _crawl_max_seconds(timeout_s: int) -> int | None:
+    """
+    The wall-clock budget a resumable child is forwarded, or None (issue #344).
+
+    ``timeout_s - _CRAWL_CLOCK_MARGIN_S``, so the child pauses itself (exit 83:
+    checkpointed, ledgered, amnestied) before the parent's SIGKILL could fire.
+    None when that is under 1 s: the child's ``positive_int`` would refuse the
+    flag with exit 2, the trap ``_request_cap_args`` records. Such a launch is
+    already floor-skipped whenever ``est > 0`` (its ``affordable`` is 0); the
+    ``est == 0`` cached-census launch goes out without a clock stop, which is
+    today's behaviour for a crawl expected to spend nothing.
+
+    Example::
+
+        >>> _crawl_max_seconds(3600)
+        3000
+        >>> _crawl_max_seconds(_CRAWL_CLOCK_MARGIN_S) is None
+        True
+    """
+    budget = timeout_s - _CRAWL_CLOCK_MARGIN_S
+    return budget if budget >= 1 else None
+
+
 def _sweep_requests_within_timeout(
     timeout_s: int, channel: str, pc: ProviderConfig | None
 ) -> int | None:
@@ -2340,10 +2372,14 @@ def _sweep_requests_within_timeout(
     it again would halve the cap for a hazard the cap already removes. What is
     left over is the margin: a child that achieves the assumed
     ``rate x _SWEEP_ACHIEVED_RATE_FRACTION`` hits the cap with the headroom
-    still unspent. A child that runs SLOWER than that is still killed, and that
-    is the arm this cannot remove — only a wall-clock stop inside the child can
-    (the option this deliberately did not take, because the child has no clock
-    budget flag).
+    still unspent. A child that runs SLOWER than that used to be killed, and
+    this function cannot remove that arm -- only a wall-clock stop inside the
+    child can. Since #344 the child has one: ``_sweep_launch_plan`` also forwards
+    ``timeout_s - _CRAWL_CLOCK_MARGIN_S`` as ``--*-max-seconds``
+    (:func:`_crawl_max_seconds`), so a slow child pauses on the clock with exit
+    83 instead. The two ceilings compose -- whichever is reached first pauses --
+    and this cap stays the primary one: the clock is the backstop for a child
+    slower than the assumed fraction, not a replacement for pricing it.
 
     Returns None for a channel with pacing disabled (``rate <= 0``): with no
     pace there is no wall-clock arithmetic to do, and the honest answer is "do
@@ -2518,7 +2554,9 @@ class SweepLaunchPlan(NamedTuple):
     ``city [channel]:``) and ``label`` its short form for the dry run's table.
     ``request_cap`` and ``timeout_s`` are the two numbers the child receives,
     and they are decided together deliberately -- see
-    :func:`_sweep_requests_within_timeout`.
+    :func:`_sweep_requests_within_timeout`. ``max_seconds`` is the third, the
+    child's own wall-clock stop, derived from ``timeout_s`` alone (issue #344,
+    :func:`_crawl_max_seconds`); None forwards no flag.
     """
 
     timeout_s: int
@@ -2527,6 +2565,7 @@ class SweepLaunchPlan(NamedTuple):
     skip: str | None
     message: str
     label: str
+    max_seconds: int | None = None
 
 
 def _sweep_checkpoint_progress(cfg: SchedulerConfig, city: db.CityRow, channel: str) -> dict | None:
@@ -2663,7 +2702,15 @@ def _sweep_launch_plan(
     )
 
     def plan(skip: str | None, message: str, label: str) -> SweepLaunchPlan:
-        return SweepLaunchPlan(timeout_s, request_cap, affordable, skip, message, label)
+        return SweepLaunchPlan(
+            timeout_s,
+            request_cap,
+            affordable,
+            skip,
+            message,
+            label,
+            max_seconds=_crawl_max_seconds(timeout_s),
+        )
 
     if est > 0 and is_street_channel(channel):
         # The pairing is read from STREET_CHANNELS, the table that already maps
@@ -5603,6 +5650,18 @@ def _request_cap_args(flag: str, request_cap: int | None) -> list[str]:
     return [] if request_cap is None or request_cap < 1 else [flag, str(request_cap)]
 
 
+def _crawl_clock_args(flag: str, max_seconds: int | None) -> list[str]:
+    """The ``--*-max-seconds`` argv for a resumable child, or nothing (issue #344).
+
+    The clock twin of :func:`_request_cap_args`, with the same contract for the
+    same reason: ``None`` -- every manual run and every non-resumable channel --
+    emits no flag, and so does a value under 1, because the child's
+    ``positive_int`` would reject it with an argparse exit 2. One helper at all
+    six launch sites, so the flag cannot be wired six ways.
+    """
+    return [] if max_seconds is None or max_seconds < 1 else [flag, str(max_seconds)]
+
+
 def _street_collect_cmd(
     cfg: SchedulerConfig,
     city: db.CityRow,
@@ -5612,6 +5671,7 @@ def _street_collect_cmd(
     daily_budget: int,
     request_cap: int | None = None,
     child_timeout_s: int | None = None,
+    max_seconds: int | None = None,
 ) -> list[str]:
     """Argv for a road-walk collection of one (city, street channel).
 
@@ -5745,6 +5805,10 @@ def _street_collect_cmd(
         # today's spend itself; the cap arrives already subtracted, because
         # nothing in the child can compute it.
         cmd += _request_cap_args("--mapillary-max-requests", request_cap)
+        # And its wall-clock stop beside it (issue #344): whichever ceiling the
+        # child reaches first pauses it with exit 83, so a slow crawl stops
+        # itself before the SIGKILL rather than being killed.
+        cmd += _crawl_clock_args("--mapillary-max-seconds", max_seconds)
     elif channel == "kartaview_streets":
         # The child MUST be told the pace this channel's timeout was derived
         # from. _kartaview_timeout_seconds divides the sweep estimate by the
@@ -5771,6 +5835,10 @@ def _street_collect_cmd(
         # this collector subtracts today's spend itself; the cap arrives already
         # subtracted, because nothing in the child can compute it.
         cmd += _request_cap_args("--kartaview-max-requests", request_cap)
+        # And its wall-clock stop beside it (issue #344): whichever ceiling the
+        # child reaches first pauses it with exit 83, so a slow crawl stops
+        # itself before the SIGKILL rather than being killed.
+        cmd += _crawl_clock_args("--kartaview-max-seconds", max_seconds)
     elif channel == "panoramax_streets":
         # The same three flags as the grid channel's arm in `_run_one_city`, and
         # they must be the same three: this walk crawls the IDENTICAL z15
@@ -5792,6 +5860,10 @@ def _street_collect_cmd(
         # `collect_panoramax_street_samples_async` there was nothing here for
         # this line to reach, which is why the channel could not be resumable.
         cmd += _request_cap_args("--panoramax-max-requests", request_cap)
+        # And its wall-clock stop beside it (issue #344): whichever ceiling the
+        # child reaches first pauses it with exit 83, so a slow crawl stops
+        # itself before the SIGKILL rather than being killed.
+        cmd += _crawl_clock_args("--panoramax-max-seconds", max_seconds)
     # '--' so a display name can never be parsed as a flag
     cmd += ["--", city.display_name]
     return cmd
@@ -5824,6 +5896,27 @@ class CollectionOutcome:
 
     def __bool__(self) -> bool:
         return self.ok
+
+
+def _pause_stop_phrase(tail: str) -> str | None:
+    """
+    The ``SWEEP_STOP_PHRASES`` value in the LAST pause line of a child's log tail.
+
+    Last, because the child log is appended across attempts, so an earlier
+    night's pause can still sit in the tail. None when no pause line names one
+    (a child from before issue #344, or a tail too short to reach it).
+
+    Example::
+
+        >>> _pause_stop_phrase("mapillary crawl paused at 3/9 tiles "
+        ...                    "(stopped by its wall-clock budget); re-run ...")
+        'stopped by its wall-clock budget'
+    """
+    for line in reversed(tail.splitlines()):
+        for phrase in SWEEP_STOP_PHRASES.values():
+            if phrase in line:
+                return phrase
+    return None
 
 
 def _child_log_path(cfg: SchedulerConfig, city: db.CityRow, provider: str, today: date) -> Path:
@@ -5904,6 +5997,8 @@ def _run_collection_subprocess(
                 f"exited {exit_code} (our own CLI rejected the argv the scheduler built; "
                 f"argv: {redact_credentials(' '.join(cmd))})"
             )
+        elif exit_code == SWEEP_INCOMPLETE_EXIT_CODE:
+            why = f"exited {exit_code} (crawl paused, progress checkpointed)"
         else:
             why = f"exited {exit_code}"
     except subprocess.TimeoutExpired:
@@ -5920,6 +6015,14 @@ def _run_collection_subprocess(
         )
         if parser_error:
             why += f"; {parser_error}"
+    if exit_code == SWEEP_INCOMPLETE_EXIT_CODE:
+        # WHICH ceiling paused it (issue #344), read back out of the child's own
+        # pause line: the exception never crosses the process boundary, and
+        # "the budget paused it" and "the clock paused it" call for different
+        # responses -- the second says the pricing fraction was optimistic.
+        stop_phrase = _pause_stop_phrase(tail)
+        if stop_phrase:
+            why += f"; {stop_phrase}"
     message = f"{city.city_id} [{provider}]: {why}; full output in {log_path}"
     if tail:
         message += f"\n--- last {_CHILD_LOG_TAIL_LINES} lines of {log_path.name} ---\n{tail}"
@@ -5942,6 +6045,7 @@ def _run_one_city(
     timeout_s: int | None = None,
     estimated_requests: int | None = None,
     request_cap: int | None = None,
+    max_seconds: int | None = None,
 ) -> CollectionOutcome:
     """Collect one (city, channel) in a subprocess.
 
@@ -5967,6 +6071,10 @@ def _run_one_city(
     ``CHANNEL_RESUMABLE`` marks, where exhausting it checkpoints and exits
     ``SWEEP_INCOMPLETE_EXIT_CODE`` instead of failing. ``None`` — the default —
     omits the flag entirely and sweeps to completion.
+
+    ``max_seconds`` is the resumable child's wall-clock stop (issue #344), passed
+    by the caller from ``SweepLaunchPlan.max_seconds`` under the same rule as
+    ``request_cap``: resumable channels only, ``None`` omits the flag.
 
     ``timeout_s`` and ``estimated_requests`` let the CALLER precompute the two
     values this function would otherwise derive here, and exist so this body can
@@ -5999,6 +6107,7 @@ def _run_one_city(
             daily_budget,
             request_cap,
             child_timeout_s=child_timeout_s,
+            max_seconds=max_seconds,
         )
         estimated = (
             _channel_estimate(cfg, city, provider, conn)
@@ -6067,6 +6176,10 @@ def _run_one_city(
         # never < 1: the CLI's positive_int refuses 0 at parse time, and the
         # caller's launch floor is what keeps this side of that.
         cmd += _request_cap_args("--mapillary-max-requests", request_cap)
+        # And its wall-clock stop beside it (issue #344): whichever ceiling the
+        # child reaches first pauses it with exit 83, so a slow crawl stops
+        # itself before the SIGKILL rather than being killed.
+        cmd += _crawl_clock_args("--mapillary-max-seconds", max_seconds)
     if provider == "kartaview":
         # Same reason as Mapillary's flag above, plus one specific to this
         # channel: the timeout is DERIVED from the configured rate (#238), so a
@@ -6090,6 +6203,10 @@ def _run_one_city(
         # gated on `est > 0`, so a cached census slips past it with a spent
         # budget. See _request_cap_args.
         cmd += _request_cap_args("--kartaview-max-requests", request_cap)
+        # And its wall-clock stop beside it (issue #344): whichever ceiling the
+        # child reaches first pauses it with exit 83, so a slow crawl stops
+        # itself before the SIGKILL rather than being killed.
+        cmd += _crawl_clock_args("--kartaview-max-seconds", max_seconds)
     if provider == "panoramax":
         # All three flags, for the three reasons the two arms above give, and
         # this is the arm whose absence kept the channel in UNWIRED_CHANNELS
@@ -6116,6 +6233,10 @@ def _run_one_city(
         # and it is what makes CHANNEL_RESUMABLE["panoramax"] True rather than
         # a claim nothing downstream honours.
         cmd += _request_cap_args("--panoramax-max-requests", request_cap)
+        # And its wall-clock stop beside it (issue #344): whichever ceiling the
+        # child reaches first pauses it with exit 83, so a slow crawl stops
+        # itself before the SIGKILL rather than being killed.
+        cmd += _crawl_clock_args("--panoramax-max-seconds", max_seconds)
     # '--' so a display name can never be parsed as a flag
     cmd += ["--", city.display_name]
     # `conn` on both fallbacks, matching the street arm above (#238). It was
@@ -7908,6 +8029,7 @@ def _run_city_channels(
                         # the whole batch is doing.
                         timeout_s: int | None = None
                         request_cap: int | None = None
+                        max_seconds: int | None = None
 
                         if is_resumable_channel(provider):
                             # NEITHER gate below applies to a channel that can stop
@@ -7963,6 +8085,9 @@ def _run_city_channels(
                                 city_channels=providers,
                             )
                             timeout_s, request_cap = plan.timeout_s, plan.request_cap
+                            # The child's own clock stop, sized from the SAME
+                            # timeout (issue #344). None on every other channel.
+                            max_seconds = plan.max_seconds
                             if plan.skip == _SWEEP_SKIP_AGE_WALL:
                                 # THE ONE SKIP HERE THAT IS RECORDED AS A FAILURE, and
                                 # it has to be. Everything else on this path is
@@ -8086,6 +8211,9 @@ def _run_city_channels(
                             # only knowable here, which is also the thread whose
                             # serialized read-then-write keeps the guard honest.
                             request_cap=request_cap,
+                            # The wall-clock twin of the cap (issue #344): the
+                            # child pauses on whichever it reaches first.
+                            max_seconds=max_seconds,
                         )
                         in_flight[future] = provider
                         hosts_in_flight.update(CHANNEL_HOSTS.get(provider, ()))
@@ -8263,8 +8391,11 @@ def _run_city_channels(
                         # NOTE what this does not cover: a sweep SIGKILLed by the
                         # timeout has no exit code at all and still counts a failure,
                         # because nothing here can tell a kill that checkpointed
-                        # progress from one that made none. That is the standing limit
-                        # on "a kill just resumes tomorrow" — see
+                        # progress from one that made none. Since #344 a resumable
+                        # child is also handed a wall-clock stop that timeout less
+                        # _CRAWL_CLOCK_MARGIN_S, so it pauses itself HERE first; the
+                        # kill is left to a child that outruns its own deadline (its
+                        # in-flight retries outlasting the margin) -- see
                         # _kartaview_timeout_seconds.
                         #
                         # One read of the state file, two records out of it: the
