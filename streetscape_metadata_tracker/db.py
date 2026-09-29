@@ -30,6 +30,10 @@ from .naming import sanitize_city_query_str
 
 logger = logging.getLogger(__name__)
 
+# 16 is contested: PR #388 (the rolling-24h Mapillary host budget) also stamps
+# v16. Whichever of #388 / #392 merges second renumbers its own step to 17.
+# The query-radius columns do not depend on the number -- see
+# _migrate_add_query_radius_columns, which init_schema runs unconditionally.
 SCHEMA_VERSION = 16
 
 _SCHEMA = """
@@ -740,13 +744,17 @@ def init_schema(conn: sqlite3.Connection) -> None:
     # below records the upgrade.
     if user_version == 14:
         user_version = 15
-    # v15 -> v16 (issue #367): runs gains the GSV query-radius pair. Additive
-    # and nullable; every existing row reads NULL until
-    # scripts/recompute_run_stats.py re-derives it under the new definition.
+    # v15 -> v16: see the unconditional query-radius step below.
     if user_version == 15:
-        _migrate_add_query_radius_columns(conn)
         user_version = 16
     conn.executescript(_SCHEMA)
+    # The GSV query-radius pair (issue #367) is added on EVERY connect rather
+    # than on one rung. Another branch (PR #388) also stamps v16, so depending
+    # on merge order a catalog can already read user_version >= 16 without
+    # these columns; a rung-gated step would then never fire. It is idempotent
+    # per column, so on a current catalog it is one PRAGMA table_info and nothing else.
+    # After executescript(_SCHEMA), so a fresh catalog (built current) is a no-op.
+    _migrate_add_query_radius_columns(conn)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
 
@@ -1009,9 +1017,10 @@ _QUERY_RADIUS_RUN_COLUMNS = {"status_out_of_radius": "INTEGER", "query_radius_m"
 def _migrate_add_query_radius_columns(conn: sqlite3.Connection) -> None:
     """Add the GSV query-radius pair to runs (v16, issue #367).
 
-    Named by what it adds rather than by version number, because another
-    in-flight change also targets v16 and whichever lands second renumbers its
-    step: the body is correct at any position in the chain. Idempotent like
+    Named by what it adds rather than by version number, and called by
+    init_schema on every connect rather than from one rung, because another
+    in-flight change also stamps v16 (PR #388): a catalog stamped v16 by that
+    branch must still gain these columns. Idempotent like
     _migrate_v13_to_v14 -- each ADD COLUMN is skipped when the column already
     exists, so an interrupted migration completes on the next connect -- and an
     absent table means the CREATE TABLE in _SCHEMA below builds it current.
@@ -1025,7 +1034,7 @@ def _migrate_add_query_radius_columns(conn: sqlite3.Connection) -> None:
     missing = [c for c in _QUERY_RADIUS_RUN_COLUMNS if c not in cols]
     if not missing:
         return
-    logger.info(f"Migrating catalog schema v15 -> v16 (runs: {', '.join(missing)})")
+    logger.info(f"Migrating catalog: adding GSV query-radius columns (runs: {', '.join(missing)})")
     for column in missing:
         conn.execute(f"ALTER TABLE runs ADD COLUMN {column} {_QUERY_RADIUS_RUN_COLUMNS[column]}")
     conn.commit()

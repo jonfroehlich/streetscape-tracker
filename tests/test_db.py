@@ -1760,7 +1760,7 @@ def test_migrate_v13_to_v14(tmp_path):
     conn2.close()
 
 
-def _v15_catalog(tmp_path, keep=()):
+def _v15_catalog(tmp_path, keep=(), user_version=15):
     """A catalog at v15: db._SCHEMA minus the v16 query-radius columns (except
     any named in ``keep``, to simulate an interrupted migration), with one
     pre-v16 gsv run seeded."""
@@ -1780,7 +1780,7 @@ def _v15_catalog(tmp_path, keep=()):
         """INSERT INTO runs (city_id, provider, run_date, csv_filename, coverage_rate_pct)
            VALUES ('bend--or', 'gsv', '2026-05-01', 'old.csv.gz', 87.5)"""
     )
-    raw.execute("PRAGMA user_version = 15")
+    raw.execute(f"PRAGMA user_version = {user_version}")
     raw.commit()
     raw.close()
     return db_path
@@ -1812,6 +1812,19 @@ def test_an_interrupted_query_radius_migration_completes(tmp_path):
     conn = db.connect(_v15_catalog(tmp_path, keep=("status_out_of_radius",)))
     cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)").fetchall()}
     assert set(db._QUERY_RADIUS_RUN_COLUMNS) <= cols
+    conn.close()
+
+
+def test_a_catalog_already_stamped_v16_without_the_columns_gains_them(tmp_path):
+    """PR #388 also stamps v16, so after the two merge in either order a
+    catalog can read user_version 16 with no query-radius columns. The step is
+    therefore run on EVERY connect, not from the v15 rung -- gated on the rung,
+    this catalog would never gain them and every get_latest_run would read a
+    RunRow without its columns while register_run failed on the INSERT."""
+    conn = db.connect(_v15_catalog(tmp_path, user_version=16))
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)").fetchall()}
+    assert set(db._QUERY_RADIUS_RUN_COLUMNS) <= cols
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
     conn.close()
 
 
