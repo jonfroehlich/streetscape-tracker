@@ -85,7 +85,7 @@ The architecture is in [`docs/architecture.md`](../architecture.md), under "GSV 
 
 - The share is over **rows with a pano**, and GSV holds one row per grid point.
   So 10.4–11.2% is also the share of covered grid points that flip to uncovered at 50 m.
-  That is a large move for a published coverage number, which is why running the repair over the series is left to the operator.
+  That is a large move for a published coverage number, which is why the repair is a REQUIRED deploy step, run over the whole series in one pass before the next nightly run (`docs/operations.md`, "Deploying a stats-definition change").
 - 60 files is a sample.
   `scripts/gsv_query_radius_audit.py --sample 0` measures every cataloged GSV run on disk, and the first full pass of `scripts/recompute_run_stats.py` reports the per-run count on every line.
 - Sending an explicit `radius` in the request would make the intent visible, but it cannot be the bound (see the Teaneck case).

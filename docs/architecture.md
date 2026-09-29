@@ -53,7 +53,7 @@ Every gsv run and walk, every legacy import, and every row salvaged by `_reconci
 
 v16 added `runs.status_out_of_radius` and `runs.query_radius_m` (#367, see "GSV query radius" below), under the ordinary rule: NULL means "computed before the rule existed", until `scripts/recompute_run_stats.py` re-derives the row.
 `query_radius_m` records the tolerance a row's stats were computed under (50.0 for gsv), and stays NULL for census providers, which the rule does not apply to.
-The migration is named by content (`_migrate_add_query_radius_columns`) rather than by number and is idempotent per column, because another in-flight change also targets v16; whichever lands second renumbers its step, and this body is correct at either position.
+The migration is named by content (`_migrate_add_query_radius_columns`) rather than by number and is idempotent per column, because another in-flight change also targets v16; whichever lands second renumbers its step, and the body is also called unconditionally at the end of `init_schema`, so a catalog already stamped v16 by the other change still gains the columns whatever the merge order.
 
 ## Provider model
 
@@ -93,10 +93,10 @@ The rule is **read-side**, because the CSV records what the provider said and is
 The census providers are untouched: they assign panos to grid points from exact tile or bbox geometry, so there is no radius to overshoot.
 So is the road walk, which bounds sample-to-pano distance itself (`street_coverage.DEFAULT_MATCH_DIST_M`, 25 m).
 
-`www/js/city.js` streams the raw CSV, so the rule is mirrored there: `GSV_QUERY_RADIUS_M`, `haversineMeters` and `isWithinQueryRadius` in `streetscape-utils.js`, with `processRows` skipping a far GSV row before it records the pano id.
+`www/js/city.js` streams the raw CSV, so the rule is mirrored there: `GSV_QUERY_RADIUS_M`, `haversineMeters`, `isWithinQueryRadius` and the row-admission predicate `isAdmissiblePanoRow` in `streetscape-utils.js`, with `processRows` asking the predicate before it records the pano id.
 `tests/test_coverage.py` reads the JS source and pins both constants (the radius and the Earth radius) to the Python ones.
 
-**The repair handle is `scripts/recompute_run_stats.py`**, which reads through the loader and so inherits the rule with no copy of its own; its report line names each run's reclassified count (`analysis.out_of_radius_count`), and `--regenerate-json` rebuilds any run that holds a far pano.
+**The repair handle is `scripts/recompute_run_stats.py`**, which reads through the loader and so inherits the rule with no copy of its own; its report line names each run's reclassified count (`analysis.out_of_radius_count`), and `--regenerate-json` rebuilds any run that holds a far pano whose JSON does not already carry `coverage.query_radius_m`, so a second pass rebuilds nothing.
 **Running it is a REQUIRED deploy step, before the next 02:00 timer**: `recompute_run_stats.py --provider gsv` dry, then with `--execute --regenerate-json`, then `scheduler regenerate-aggregate --publish`.
 The exact commands are in [`operations.md`](operations.md), "Deploying a stats-definition change".
 Without it, runs collected after the deploy are cataloged under 50 m while older rows keep the unfiltered `coverage_rate_pct`, and the aggregate and driving page read that stored column, so every re-collected city shows a phantom drop of about 10% (the share of covered points the rule flips in the sample).

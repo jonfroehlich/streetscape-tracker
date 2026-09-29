@@ -75,7 +75,7 @@ cd ~/streetscape-tracker && git pull          # deploy the code; the catalog mig
     --config config/scheduler.makelab1.toml regenerate-aggregate --publish
 ```
 
-`--data-dir` is explicit because the script's default is the checkout's own `data/`, which on prod is not where the catalog lives (`[paths].data_dir`).
+`--data-dir` is passed explicitly so the command names the same catalog `[paths].data_dir` names; on prod the checkout's own `data/` is that directory, so the flag is a statement of intent rather than a correction.
 `--provider gsv` is not only a filter: `--regenerate-json` re-reads every rebuilt run's CSV, and a census CSV is millions of rows.
 Step 2 is a whole-series pass over every GSV CSV, so budget hours rather than minutes; drive it into a file, never a pipe.
 If it cannot finish before 02:00, disable the timer for the night (`systemctl --user disable --now streetscape-tracker.timer`, and `enable --now` after step 3; never `stop`, which the #369 watchdog re-arms) rather than let a night catalog runs beside a half-repaired series.
