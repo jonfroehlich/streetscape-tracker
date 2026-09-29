@@ -52,7 +52,7 @@ They record which channel's credential and ledger actually paid for a shared cen
 Every gsv run and walk, every legacy import, and every row salvaged by `_reconcile_orphaned_run`/`_reconcile_orphaned_walk` (which read artifacts off disk and cannot know) keep NULL.
 `RunRow` gains the two fields as well, and that is not optional: `_row_to_run` builds `RunRow(**dict(row))` from a `SELECT *`, so a column without a matching field is a `TypeError` on every `get_latest_run` against a migrated catalog rather than a missing feature.
 
-v16 added the `host_usage` table (#385): one row per `db.add_api_usage` call on a channel in `download_common.CHANNEL_METERED_HOST`, stamped `clock.utc_now_iso()`, so the `[hosts.*]` budget can sum a host's spend over a rolling 24 h across every channel on it.
+v16 added the `host_usage` table (#385): one row per `db.add_api_usage` call on a channel in `download_common.CHANNEL_METERED_HOST`, stamped `_utc_iso(clock.utc_now())` (always UTC with a `+00:00` offset, so lexical order is chronological), so the `[hosts.*]` budget can sum a host's spend over a rolling 24 h across every channel on it.
 Its rows are **stamped when a child finishes**, not when each request was made, and the migration's backfill rows (the last two UTC dates of metered `api_usage`) are stamped at the **latest instant their spend can have happened** — 23:59:59 UTC of a past date, the migration's own clock for today — so read `recorded_at` as "charged at", never as a request time.
 Rows older than 30 days are pruned by the nightly tail; `import-bundle` writes none (`meter_host=False`).
 
