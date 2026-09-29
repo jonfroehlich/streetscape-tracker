@@ -4,6 +4,7 @@ import json
 import multiprocessing
 import os
 import sqlite3
+import time
 from datetime import UTC, date, datetime, timedelta
 
 import pytest
@@ -2019,8 +2020,13 @@ def test_prune_host_usage_drops_only_rows_older_than_the_cutoff(conn):
     assert [r[0] for r in _host_rows(conn)] == [cutoff.isoformat(), _HOST_NOW.isoformat()]
 
 
-def _race_worker(paths, barrier, errors):
-    """One of the processes racing to first-connect each v15 catalog in ``paths``."""
+def _race_worker(index, paths, barrier, errors):
+    """Racer ``index``, first-connecting each v15 catalog in ``paths`` in step with the others.
+
+    The barrier wait is bounded, so a racer whose peer died stops waiting
+    (``BrokenBarrierError``, a nonzero exit) instead of blocking forever; the
+    parent also aborts the barrier the moment any racer exits nonzero.
+    """
     import time
 
     from streetscape_metadata_tracker import clock
@@ -2037,7 +2043,7 @@ def _race_worker(paths, barrier, errors):
 
     clock.snapshot_date_today = slow_today
     for path in paths:
-        barrier.wait()
+        barrier.wait(timeout=_RACE_BARRIER_TIMEOUT_S)
         try:
             db.connect(path).close()
         except Exception as exc:  # reported, so the parent can fail by name
@@ -2046,6 +2052,10 @@ def _race_worker(paths, barrier, errors):
 
 _RACE_PROCESSES = 4
 _RACE_TRIALS = 8
+# Backstops only: the parent aborts the barrier as soon as a racer dies, so a
+# broken run fails in about a second, not at these limits.
+_RACE_BARRIER_TIMEOUT_S = 30
+_RACE_DEADLINE_S = 60
 
 
 def test_concurrent_first_connects_seed_the_v16_backfill_exactly_once(tmp_path):
@@ -2073,15 +2083,28 @@ def test_concurrent_first_connects_seed_the_v16_backfill_exactly_once(tmp_path):
     ctx = multiprocessing.get_context("spawn")
     barrier = ctx.Barrier(_RACE_PROCESSES)
     errors = ctx.Queue()
+    # daemon, and terminated in `finally`: a racer that dies must FAIL this
+    # test, never leave its peers parked on the barrier where multiprocessing's
+    # atexit join would hang pytest until the CI runner's own timeout.
     procs = [
-        ctx.Process(target=_race_worker, args=(paths, barrier, errors))
-        for _ in range(_RACE_PROCESSES)
+        ctx.Process(target=_race_worker, args=(i, paths, barrier, errors), daemon=True)
+        for i in range(_RACE_PROCESSES)
     ]
-    for proc in procs:
-        proc.start()
-    for proc in procs:
-        proc.join(timeout=120)
-    assert [proc.exitcode for proc in procs] == [0] * _RACE_PROCESSES
+    try:
+        for proc in procs:
+            proc.start()
+        deadline = time.monotonic() + _RACE_DEADLINE_S
+        while any(proc.is_alive() for proc in procs) and time.monotonic() < deadline:
+            if any(proc.exitcode not in (None, 0) for proc in procs):
+                barrier.abort()  # releases every waiter with BrokenBarrierError
+            time.sleep(0.05)
+        exitcodes = [proc.exitcode for proc in procs]
+    finally:
+        for proc in procs:
+            if proc.is_alive():
+                proc.terminate()
+            proc.join(timeout=10)
+    assert exitcodes == [0] * _RACE_PROCESSES
     failures = []
     while not errors.empty():
         failures.append(errors.get())

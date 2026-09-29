@@ -3063,10 +3063,28 @@ def _sweep_launch_plan(
                 f"inside a {timeout_s // 60:,}-minute timeout"
             )
         if clock_walls:
-            lever = (
-                f"the {timeout_s // 60:,}-minute timeout that binds here (raise "
-                f"[schedule].max_batch_hours, or run the city earlier in the night)"
+            # Two different clocks can be the binding term, with different
+            # levers: the batch deadline's clamp (a late launch), or the city's
+            # own derived timeout (a big grid on any launch). Tell them apart
+            # by re-deriving the unclamped value -- cheap, and only on this
+            # already-refusing arm.
+            unclamped_s = (
+                timeout_s
+                if remaining_s is None
+                else city_timeout_seconds(cfg, city, channel, conn=conn, remaining_s=None)
             )
+            if timeout_s < unclamped_s:
+                lever = (
+                    f"the batch deadline, which clamped this launch's timeout to "
+                    f"{timeout_s // 60:,} minutes (raise [schedule].max_batch_hours, or run "
+                    f"the city earlier in the night)"
+                )
+            else:
+                lever = (
+                    f"the city's own {timeout_s // 60:,}-minute derived timeout "
+                    f"([schedule].city_timeout_minutes is its floor; the derivation grows "
+                    f"it with the city's grid)"
+                )
         elif host_walls:
             lever = f"[hosts.{age_wall_host}].{_HOST_BUDGET_KEY}"
         else:

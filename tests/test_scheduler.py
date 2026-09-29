@@ -14249,10 +14249,79 @@ def test_the_dry_run_age_wall_agrees_with_the_live_one(
     assert line.split("req  ", 1)[1] == verdict
 
 
-def test_an_age_wall_the_clock_binds_names_the_timeout_not_a_budget(conn, tmp_path, monkeypatch):
-    """Issue #385 review: when tonight's TIMEOUT is the smaller term, no budget is
-    the lever. A deadline 20 minutes out affords 0 tile requests after the
-    fixed slack, far under the 40,000 the channel has left."""
+def test_the_dry_runs_own_spend_counts_against_a_later_citys_age_wall(
+    conn, tmp_path, monkeypatch, capsys
+):
+    """Issue #385 review: spend the PREVIEW simulates tonight stays in the window
+    at batch end, so it comes off a later city's age-wall ceiling.
+
+    Albany (first by city_id) prices at 2,800 and previews as ok; Bend's
+    6.5-day checkpoint then has ~360 left against a pool tonight can refill to
+    only 3,000 - 2,800 = 200, and the preview must show the refusal the night
+    would make. Adding the simulated spend to ``used`` alone leaves the ceiling
+    at 3,000 and previews a capped launch instead.
+    """
+    from streetscape_metadata_tracker import clock
+    from streetscape_metadata_tracker import scheduler as sched
+
+    now = clock.utc_now()
+    albany = _register(conn, "Albany", width=1000, height=1000, step=20)
+    bend = _checkpointed_city(
+        conn,
+        tmp_path,
+        monkeypatch,
+        roots_done=10,
+        root_count=100,
+        days_old=6.5,
+        channel="mapillary",
+    )
+    assert albany < bend.city_id
+    cfg = _host_budget_cfg(tmp_path)
+    monkeypatch.setattr(
+        sched,
+        "_channel_estimate",
+        lambda cfg_, city, provider, conn_, **k: 2800 if city.city_id == albany else 400,
+    )
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+
+    assert (
+        sched.cmd_run_due(cfg, dry_run=True, today=now.date(), requested_providers=["mapillary"])
+        == 0
+    )
+    lines = capsys.readouterr().out.splitlines()
+    verdict = {
+        cid: next(line for line in lines if cid in line).split("req  ", 1)[1]
+        for cid in (albany, bend.city_id)
+    }
+    assert verdict == {albany: "ok", bend.city_id: "REFUSED (checkpoint 6.5 d old, 10/100)"}
+
+
+@pytest.mark.parametrize(
+    "remaining_s,est,lever",
+    [
+        # A deadline 20 minutes out clamps the timeout: 0 requests after the
+        # fixed slack. The lever is the batch deadline.
+        pytest.param(
+            1200,
+            400,
+            "the batch deadline, which clamped this launch's timeout to",
+            id="the-deadline-clamp",
+        ),
+        # No deadline, and a crawl far larger than the city's own derived
+        # timeout can pace. The lever is that timeout, not the batch.
+        pytest.param(
+            None,
+            10_000_000,
+            "the city's own 180-minute derived timeout ([schedule].city_timeout_minutes",
+            id="the-derived-timeout",
+        ),
+    ],
+)
+def test_an_age_wall_the_clock_binds_names_the_timeout_not_a_budget(
+    conn, tmp_path, monkeypatch, remaining_s, est, lever
+):
+    """Issue #385 review: when a TIMEOUT is the smaller term, no budget is the
+    lever -- and which timeout it is decides what to change."""
     from streetscape_metadata_tracker.scheduler import _SWEEP_SKIP_AGE_WALL, _sweep_launch_plan
 
     city = _checkpointed_city(
@@ -14270,14 +14339,43 @@ def test_an_age_wall_the_clock_binds_names_the_timeout_not_a_budget(conn, tmp_pa
         city,
         "mapillary",
         conn,
-        est=400,
-        remaining=40_000,
-        remaining_s=1200,
+        est=est,
+        remaining=100_000_000,
+        remaining_s=remaining_s,
         city_channels=["mapillary"],
     )
     assert plan.skip == _SWEEP_SKIP_AGE_WALL
-    assert "-minute timeout that binds here (raise [schedule].max_batch_hours" in plan.message
+    assert lever in plan.message
     assert "daily_request_budget" not in plan.message
+    assert "rolling_24h_request_budget" not in plan.message
+
+
+def test_the_age_wall_ceiling_counts_spend_from_exactly_batch_end_minus_24h(
+    conn, tmp_path, monkeypatch, frozen_utc_clock
+):
+    """Issue #385 review: the batch-end boundary, to the second.
+
+    Clock frozen and ``time.monotonic`` pinned, so the live path's
+    ``_batch_end_utc`` puts the batch end exactly 12 h out. A row stamped
+    exactly ``batch_end - 24h`` is still in the window when the batch ends and
+    comes off the ceiling; one a second earlier ages out first and does not.
+    Both are inside the momentary window. Fails if the boundary moves by
+    hours, or if the batch end is not the deadline's wall-clock equivalent.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    frozen_utc_clock(_HB_NOW)
+    monkeypatch.setattr(sched.time, "monotonic", lambda: 5_000.0)
+    boundary = _HB_NOW + timedelta(hours=12) - timedelta(hours=24)
+    _seed_host(conn, 500, boundary, provider="mapillary")
+    _seed_host(conn, 700, boundary - timedelta(seconds=1), provider="mapillary")
+    cfg = _host_budget_cfg(tmp_path)
+
+    batch_end = sched._batch_end_utc(5_000.0 + 12 * 3600)
+    assert batch_end == _HB_NOW + timedelta(hours=12)
+    remainder = sched._budget_remainder(cfg, conn, _HB_TODAY, "mapillary", batch_end=batch_end)
+    assert remainder.remaining == 3000 - 1200, "both rows are in the window right now"
+    assert (remainder.ceiling, remainder.ceiling_host) == (3000 - 500, "mapillary_tiles")
 
 
 def test_a_non_resumable_channel_on_a_budgeted_host_is_deferred_by_the_host(
