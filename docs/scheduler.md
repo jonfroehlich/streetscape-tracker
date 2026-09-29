@@ -54,9 +54,14 @@ A child running **slower** than the assumed `rate × _SWEEP_ACHIEVED_RATE_FRACTI
 Every resumable launch is also handed `--*-max-seconds`, set to `timeout_s − _CRAWL_CLOCK_MARGIN_S` (600 s, the same number as `_TIMEOUT_FIXED_SLACK_S`), from one helper at all six launch sites (`_crawl_clock_args`, the twin of `_request_cap_args`).
 The child measures it from its own process start and checks it at the same tile/cell boundary as the cap, so a slow crawl pauses itself with exit 83 — checkpointed, ledgered, amnestied — exactly as a capped one does.
 The two ceilings compose: whichever is reached first pauses the crawl, the child's pause line names which (`stopped by its request cap` / `stopped by its wall-clock budget`), and the scheduler carries that phrase into the paused child's reason.
-**The SIGKILL arm is now reachable only by a child that ignores its deadline**: a non-resumable channel, or a resumable child whose in-flight retries outlast the margin.
-The `est == 0` cached-census launch whose timeout is at or under the margin gets no clock flag (the child's `positive_int` would refuse it) and keeps the old behaviour.
-That arm does count a `consecutive_failure` and does consume a slot, which is why the five-night bound still exists for it and why the hoist has to put tomorrow's retry in the *first* slot rather than merely in the list.
+**The SIGKILL arm is still reachable, by three routes, and none of them is a slow crawl:**
+
+- a non-resumable channel (`gsv`, `gsv_streets`), which is never handed a clock;
+- a crawl that completes inside its budget and then overruns in its **finalize tail** — grid assignment, the CSV write, the walk's join, stats — because the clock is checked only when a unit is admitted, never after the last one;
+- a launch whose timeout is at or under the 600 s margin, which gets no clock flag at all (the child's `positive_int` would refuse it): the `est == 0` cached-census launch, and an unpaced channel whose `affordable` is None, neither of which the launch floor skips.
+
+In-flight work at the moment the clock trips is not a fourth route in practice: a tile census bounds each in-flight tile's retry chain at `_TILE_MAX_TIME_S` (120 s), so that residue is a few minutes, well inside the margin.
+The SIGKILL arm does count a `consecutive_failure` and does consume a slot, which is why the five-night bound still exists for it and why the hoist has to put tomorrow's retry in the *first* slot rather than merely in the list.
 The union of the per-channel due lists is ordered by first appearance, so `gsv` (rank 0) dictates city order; a city whose `gsv` run succeeded but whose sweep paused sits at the tail of ~949 cities and is truncated by `max_cities_per_day`, returning months later rather than tomorrow.
 The hoist moves a city to the head of the slate when **every** channel it is due on is opt-in — `all`, not `any`, so a city due on `gsv` too keeps its exact union position and `gsv`'s stalest-first ordering is strictly untouched.
 It reorders the **city list only**, never the union loop, because `providers_for_city` is passed straight to `_run_city_channels` where `pending = list(providers)` *is* the launch order.

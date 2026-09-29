@@ -6723,9 +6723,13 @@ def _collect_due(
     #     it is discarded.
     #   * A SIGKILL at the per-city timeout. Since #344 a resumable child
     #     running SLOWER than the assumed rate x _SWEEP_ACHIEVED_RATE_FRACTION
-    #     pauses itself on its forwarded wall-clock budget instead, so this is
-    #     reachable only by a child that outruns its own deadline (in-flight
-    #     retries outlasting _CRAWL_CLOCK_MARGIN_S). The checkpoint on
+    #     pauses itself on its forwarded wall-clock budget instead. What still
+    #     reaches the kill is what that clock cannot see: a non-resumable
+    #     channel; a crawl that finishes inside its budget and overruns in its
+    #     finalize tail (grid assignment, CSV write, the walk's join), since the
+    #     clock is checked only when a unit is admitted; and a launch whose
+    #     timeout is at or under _CRAWL_CLOCK_MARGIN_S, which gets no clock at
+    #     all (see _crawl_max_seconds). The checkpoint on
     #     disk survives, so tomorrow resumes — but the kill has no exit code, so
     #     it counts a consecutive_failure, and `attempted` was incremented, so
     #     it DID consume a city-cap slot. The hoist is what makes tomorrow's
@@ -8411,10 +8415,11 @@ def _run_city_channels(
                         # because nothing here can tell a kill that checkpointed
                         # progress from one that made none. Since #344 a resumable
                         # child is also handed a wall-clock stop that timeout less
-                        # _CRAWL_CLOCK_MARGIN_S, so it pauses itself HERE first; the
-                        # kill is left to a child that outruns its own deadline (its
-                        # in-flight retries outlasting the margin) -- see
-                        # _kartaview_timeout_seconds.
+                        # _CRAWL_CLOCK_MARGIN_S, so a slow crawl pauses itself HERE
+                        # first. The kill is left to what that clock cannot see: a
+                        # finalize tail that overruns after the last unit was
+                        # admitted, and a launch too short to be given a clock at
+                        # all (_crawl_max_seconds) -- see _kartaview_timeout_seconds.
                         #
                         # One read of the state file, two records out of it: the
                         # progress line at INFO, and — only when the checkpoint is
