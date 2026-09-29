@@ -10109,6 +10109,7 @@ def _run_channels(sched, cfg, conn, city, providers, **overrides):
         busy_hosts=Counter(),
         deferred_channels=Counter(),
         rejected_argv=sched.ArgvRejections(),
+        deadline_deferred=Counter(),
         batch_deadline=None,
         stop_requested=None,
     )
@@ -13903,3 +13904,311 @@ def test_a_rejected_walk_strands_its_city_exactly_like_a_busy_skip(conn, monkeyp
     assert f"{alpha} (gsv_streets)" in body
     # The rejected walk gets the same by-name recovery as a busy one (#362).
     assert _alert_commands(body) == [["run-due", "--provider", "gsv_streets", "--city", alpha]]
+
+
+# ── Deadline deferral of non-resumable channels (issue #373) ────────────────
+#
+# Fixture geometry, at SchedulerConfig's 24,000/min and the 180-min floor:
+# a 1 km grid's gsv estimate is 619 s (the 600 s fixed slack plus pacing) and a
+# 20 km grid's is 8,115 s (~2.25 h). Both are BELOW the 10,800 s floor, which
+# is what lets the first test tell the estimate from the floored timeout.
+
+
+def _deadline_recorder(sched, monkeypatch):
+    """Record every launch's channel and timeout; every child succeeds."""
+    launched = []
+
+    def fake_run(cfg, city, today, provider="gsv", **kwargs):
+        launched.append((city.city_id, provider, kwargs.get("timeout_s")))
+        return True
+
+    monkeypatch.setattr(sched, "_run_one_city", fake_run)
+    return launched
+
+
+def _attempt_recorder(sched, monkeypatch):
+    """Spy on db.record_attempt so a test can assert nothing was recorded."""
+    calls = []
+    real = sched.db.record_attempt
+
+    def spy(conn_, city_id, **kwargs):
+        calls.append((city_id, kwargs.get("provider"), kwargs.get("success")))
+        return real(conn_, city_id, **kwargs)
+
+    monkeypatch.setattr(sched.db, "record_attempt", spy)
+    return calls
+
+
+def _gsv_cfg(**overrides):
+    return SchedulerConfig(
+        providers={"gsv": ProviderConfig(enabled=True, daily_request_budget=10_000_000)},
+        **overrides,
+    )
+
+
+def test_the_floor_is_not_the_deadline_predictor(conn, monkeypatch):
+    """A small gsv city (estimate 619 s) with an hour left -- LESS than the
+    180-min floor -- still launches, clamped to the hour exactly as before
+    #373. Predicting with the floored timeout would defer every gsv city for
+    the last three hours of every night."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    city = db.resolve_city(conn, _register(conn, "Bend", width=1000, height=1000, step=20))
+    cfg = _gsv_cfg()
+    assert sched.city_timeout_estimate_seconds(cfg, city, "gsv") < 3600
+    assert sched.city_timeout_seconds(cfg, city, "gsv") > 3600, "the floor must exceed the hour"
+    monkeypatch.setattr(sched.time, "monotonic", lambda: 0.0)
+    launched = _deadline_recorder(sched, monkeypatch)
+    deferred: Counter[str] = Counter()
+
+    result = _run_channels(
+        sched, cfg, conn, city, ["gsv"], batch_deadline=3600.0, deadline_deferred=deferred
+    )
+
+    assert launched == [(city.city_id, "gsv", 3600)]
+    assert result == (1, 1, 0)
+    assert not deferred
+
+
+def test_a_non_resumable_child_that_cannot_fit_is_deferred_not_launched(conn, monkeypatch):
+    """A 2.25 h gsv city with an hour left: nothing launched, nothing recorded
+    (so it stays due and consecutive_failures is untouched), counted per
+    channel, and attempted == 0 so it costs the batch no city-cap slot."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    city = db.resolve_city(conn, _register(conn, "Mid", width=20_000, height=20_000, step=20))
+    cfg = _gsv_cfg()
+    assert sched.city_timeout_estimate_seconds(cfg, city, "gsv") > 2 * 3600
+    monkeypatch.setattr(sched.time, "monotonic", lambda: 0.0)
+    launched = _deadline_recorder(sched, monkeypatch)
+    attempts = _attempt_recorder(sched, monkeypatch)
+    failures_before = conn.execute(
+        "SELECT COALESCE(SUM(consecutive_failures), 0) FROM schedule_state"
+    ).fetchone()[0]
+    deferred: Counter[str] = Counter()
+
+    result = _run_channels(
+        sched, cfg, conn, city, ["gsv"], batch_deadline=3600.0, deadline_deferred=deferred
+    )
+
+    assert launched == []
+    assert attempts == []
+    assert result == (0, 0, 0), "not an attempt, not a budget skip"
+    assert deferred == Counter({"gsv": 1})
+    assert (
+        conn.execute(
+            "SELECT COALESCE(SUM(consecutive_failures), 0) FROM schedule_state"
+        ).fetchone()[0]
+        == failures_before
+    )
+
+
+def test_no_batch_deadline_never_defers(conn, monkeypatch):
+    """The operator / assess-city path passes batch_deadline=None: even a city
+    needing ~19 h launches, with its full unclamped timeout."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    city = db.resolve_city(conn, _register(conn, "Huge", width=60_000, height=60_000, step=20))
+    cfg = _gsv_cfg()
+    launched = _deadline_recorder(sched, monkeypatch)
+    deferred: Counter[str] = Counter()
+
+    _run_channels(sched, cfg, conn, city, ["gsv"], batch_deadline=None, deadline_deferred=deferred)
+
+    assert launched == [(city.city_id, "gsv", sched.city_timeout_seconds(cfg, city, "gsv"))]
+    assert launched[0][2] > 12 * 3600
+    assert not deferred
+
+
+def test_an_unknowable_estimate_never_defers(conn, monkeypatch):
+    """Pacing disabled leaves nothing to derive a need from, so the estimate is
+    None and the child launches under the clamp exactly as before #373."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    city = db.resolve_city(conn, _register(conn, "Huge", width=60_000, height=60_000, step=20))
+    cfg = _gsv_cfg(max_requests_per_minute=0)
+    assert sched.city_timeout_estimate_seconds(cfg, city, "gsv") is None
+    monkeypatch.setattr(sched.time, "monotonic", lambda: 0.0)
+    launched = _deadline_recorder(sched, monkeypatch)
+    deferred: Counter[str] = Counter()
+
+    _run_channels(sched, cfg, conn, city, ["gsv"], batch_deadline=400.0, deadline_deferred=deferred)
+
+    assert launched == [(city.city_id, "gsv", 400)]
+    assert not deferred
+
+
+def test_resumable_channels_take_their_launch_plan_not_the_deadline_gate(conn, monkeypatch):
+    """Every resumable channel, with a need no night could hold: each still
+    reaches _sweep_launch_plan and launches capped, because a capped sweep
+    PAUSES at its cap (exit 83, amnestied) instead of being killed."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    resumable = sorted(p for p in sched.CHANNEL_HOSTS if sched.is_resumable_channel(p))
+    assert len(resumable) == 6
+    city = db.resolve_city(conn, _register(conn, "Mid", width=20_000, height=20_000, step=20))
+    cfg = SchedulerConfig(
+        providers={p: ProviderConfig(enabled=True, daily_request_budget=40_000) for p in resumable}
+    )
+    monkeypatch.setattr(sched, "city_timeout_estimate_seconds", lambda *a, **k: 10**9)
+    monkeypatch.setattr(sched.time, "monotonic", lambda: 0.0)
+    planned = []
+    real_plan = sched._sweep_launch_plan
+
+    def spy_plan(cfg_, city_, channel, *a, **k):
+        planned.append(channel)
+        return real_plan(cfg_, city_, channel, *a, **k)
+
+    monkeypatch.setattr(sched, "_sweep_launch_plan", spy_plan)
+    launched = _deadline_recorder(sched, monkeypatch)
+    deferred: Counter[str] = Counter()
+
+    for channel in resumable:
+        _run_channels(
+            sched, cfg, conn, city, [channel], batch_deadline=3600.0, deadline_deferred=deferred
+        )
+
+    assert planned == resumable
+    assert [p for _cid, p, _t in launched] == resumable
+    assert not deferred
+
+
+def test_a_fully_deferred_city_costs_no_city_cap_slot(conn, monkeypatch):
+    """Cap 1: the first city defers its only channel, so it is not counted,
+    earns no inter-city sleep, and the second (small) city is still collected.
+    The loop hands the per-channel count back in its return tuple."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    big = db.resolve_city(conn, _register(conn, "Mid", width=20_000, height=20_000, step=20))
+    small = db.resolve_city(conn, _register(conn, "Bend", width=1000, height=1000, step=20))
+    monkeypatch.setattr(sched.time, "monotonic", lambda: 0.0)
+    sleeps = []
+    monkeypatch.setattr(sched.time, "sleep", lambda s: sleeps.append(s))
+    launched = _deadline_recorder(sched, monkeypatch)
+
+    result = sched._run_city_loop(
+        _gsv_cfg(),
+        conn,
+        date(2026, 7, 2),
+        [big, small],
+        {big.city_id: ["gsv"], small.city_id: ["gsv"]},
+        3600.0,
+        threading.Event(),
+        max_cities=1,
+    )
+
+    processed, succeeded, attempted, skipped_budget, stop_reason = result[:5]
+    assert launched == [(small.city_id, "gsv", 3600)]
+    assert (processed, succeeded, attempted, skipped_budget) == (1, 1, 1, 0)
+    assert stop_reason is None
+    assert result[-1] == Counter({"gsv": 1})
+    assert sleeps == []
+
+
+def test_the_walk_is_judged_on_its_own_estimate(conn, monkeypatch):
+    """One city, one call: the 2.25 h gsv grid run defers, and its ~35 min
+    gsv_streets walk still launches -- walks key on the frozen network, not
+    on the grid run."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    city = db.resolve_city(conn, _register(conn, "Mid", width=20_000, height=20_000, step=20))
+    cfg = _street_cfg()
+    assert sched.city_timeout_estimate_seconds(cfg, city, "gsv", conn=conn) > 3600
+    assert sched.city_timeout_estimate_seconds(cfg, city, "gsv_streets", conn=conn) < 3600
+    monkeypatch.setattr(sched.time, "monotonic", lambda: 0.0)
+    launched = _deadline_recorder(sched, monkeypatch)
+    deferred: Counter[str] = Counter()
+
+    result = _run_channels(
+        sched,
+        cfg,
+        conn,
+        city,
+        ["gsv", "gsv_streets"],
+        batch_deadline=3600.0,
+        deadline_deferred=deferred,
+    )
+
+    assert [p for _cid, p, _t in launched] == ["gsv_streets"]
+    assert result == (1, 1, 0)
+    assert deferred == Counter({"gsv": 1})
+
+
+def test_a_deadline_deferral_is_on_the_done_line_and_is_not_a_failure(conn, monkeypatch, caplog):
+    """Alpha's two channels need more than any night holds and defer; Beta
+    collects. The Done line names the count per channel apart from the budget
+    and sibling deferrals, and at failure_threshold=1 the night neither alerts
+    nor exits nonzero -- nothing failed, the night was full."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    alpha = _register(conn, "Alpha", width=1000, height=1000, step=20)
+    beta = _register(conn, "Beta", width=1000, height=1000, step=20)
+    real_estimate = sched.city_timeout_estimate_seconds
+
+    def estimate(cfg, city, provider, conn=None):
+        if city.city_id == alpha:
+            return 10**9
+        return real_estimate(cfg, city, provider, conn=conn)
+
+    monkeypatch.setattr(sched, "city_timeout_estimate_seconds", estimate)
+    cfg = SchedulerConfig(
+        providers={
+            "gsv": ProviderConfig(enabled=True, daily_request_budget=10_000_000),
+            "gsv_streets": ProviderConfig(enabled=True, daily_request_budget=2_000_000),
+        },
+        publish_enabled=False,
+        alerts=AlertConfig(enabled=True, failure_threshold=1),
+    )
+    ran = []
+
+    def run_one(city, provider):
+        ran.append((city.city_id, provider))
+        return True
+
+    with caplog.at_level(logging.INFO):
+        rc, alerts = _drive_night(monkeypatch, conn, cfg, run_one)
+
+    assert ran == [(beta, "gsv"), (beta, "gsv_streets")]
+    done = _done_line(caplog)
+    assert "2/2 runs succeeded across 1 cities" in done
+    assert "; 2 channel(s) deferred for the deadline (gsv 1, gsv_streets 1)" in done
+    assert "deferred for budget" not in done
+    assert rc == 0
+    assert alerts == []
+
+
+@pytest.mark.parametrize("remaining_s", [None, 1, 1800, 10**6])
+def test_the_timeout_is_the_clamped_floored_estimate_on_every_arm(conn, remaining_s):
+    """city_timeout_seconds == clamp(max(floor, estimate)), or clamp(floor)
+    when the estimate is None, for every scheduled channel plus an unknown
+    one -- so the deferral's predictor and the child's timeout cannot drift.
+    Both sizes, so both sides of max() are taken on every derived arm."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    channels = sorted(sched.CHANNEL_HOSTS)
+    assert len(channels) == 8
+    cfg = SchedulerConfig(
+        providers={p: ProviderConfig(enabled=True, daily_request_budget=10**7) for p in channels}
+    )
+    floor = cfg.city_timeout_minutes * 60
+    small = db.resolve_city(conn, _register(conn, "Bend", width=1000, height=1000, step=20))
+    giant = db.resolve_city(conn, _register(conn, "Giant", width=150_000, height=150_000, step=20))
+
+    def clamp(v):
+        return v if remaining_s is None else int(max(300, min(v, remaining_s)))
+
+    over_floor = set()
+    for city in (small, giant):
+        for channel in [*channels, "not_a_channel"]:
+            estimate = sched.city_timeout_estimate_seconds(cfg, city, channel, conn=conn)
+            expected = clamp(floor if estimate is None else max(floor, estimate))
+            got = sched.city_timeout_seconds(cfg, city, channel, conn=conn, remaining_s=remaining_s)
+            assert got == expected, (city.city_id, channel)
+            if estimate is not None and estimate > floor:
+                over_floor.add(channel)
+            if city is small:
+                assert estimate is None or estimate < floor, channel
+    assert over_floor == set(channels), "every derived arm must be exercised above the floor"
+    assert sched.city_timeout_estimate_seconds(cfg, giant, "not_a_channel") is None
+    unpaced = SchedulerConfig(max_requests_per_minute=0)
+    assert sched.city_timeout_estimate_seconds(unpaced, giant, "gsv") is None

@@ -1318,6 +1318,7 @@ def test_assess_city_inherits_the_lane_scheduler_from_the_config_knob(conn, monk
         busy_hosts=Counter(),
         deferred_channels=Counter(),
         rejected_argv=_sched.ArgvRejections(),
+        deadline_deferred=Counter(),
         batch_deadline=None,
         stop_requested=None,
         record_failures=False,
@@ -1327,3 +1328,17 @@ def test_assess_city_inherits_the_lane_scheduler_from_the_config_knob(conn, monk
     seq = {(kind, provider): n for kind, provider, n in events}
     assert seq[("start", "mapillary_streets")] > seq[("end", "gsv_streets")]
     assert seq[("start", "mapillary_streets")] > seq[("end", "mapillary")]
+
+
+def test_assess_city_never_defers_for_a_deadline(conn, monkeypatch, tmp_path):
+    """assess-city passes batch_deadline=None, so the #373 deferral can never
+    fire here: even with every channel's derived need past any night, each
+    listed channel -- gsv_streets, the non-resumable one, included -- is
+    collected."""
+    monkeypatch.setattr(_sched, "city_timeout_estimate_seconds", lambda *a, **k: 10**9)
+    ran = _stub_collection(monkeypatch, conn)
+
+    rc = _assess(tmp_path)
+
+    assert rc == 0
+    assert sorted(provider for _cid, provider in ran) == sorted(ASSESS_CHANNELS)

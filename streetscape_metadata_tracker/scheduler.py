@@ -2131,15 +2131,32 @@ def _tile_census_timeout_seconds(
     ``_ACHIEVED_RATE_FRACTION`` covers a project quota the async engine never
     approaches. Never returns below the configured floor.
     """
+    estimate = _tile_census_estimate_seconds(city, provider, pc)
+    return floor if estimate is None else max(floor, estimate)
+
+
+def _tile_census_estimate_seconds(
+    city: db.CityRow, provider: str, pc: ProviderConfig | None
+) -> int | None:
+    """
+    The UNFLOORED derivation behind :func:`_tile_census_timeout_seconds` —
+    headroom and fixed slack included, the configured floor not applied (#373).
+
+    None when pacing is disabled (``rate <= 0``): there is no pace to derive a
+    wall-clock from, which is "unknowable", never 0. Split out rather than
+    reached by passing ``floor=0``, because that call answered 0 for a disabled
+    pace and a real derivation can never be 0 (the fixed slack alone is 600 s),
+    so the two meanings would have shared one value.
+    """
     pricing = _crawl_pricing(provider)
     # `is None`, not falsy: 0 means "pacing disabled", not "use the default".
     configured = pc.max_requests_per_minute if pc else None
     rate = pricing.default_rate if configured is None else configured
     if rate <= 0:  # pacing disabled: nothing to derive from
-        return floor
+        return None
     tiles = estimate_requests(city, provider)  # the same z14 count the budget uses
     paced_seconds = tiles / (rate * pricing.achieved_fraction) * 60.0
-    return int(max(floor, paced_seconds * _TIMEOUT_HEADROOM + _TIMEOUT_FIXED_SLACK_S))
+    return int(paced_seconds * _TIMEOUT_HEADROOM + _TIMEOUT_FIXED_SLACK_S)
 
 
 def _census_reuse_window_s(cfg: SchedulerConfig) -> float:
@@ -2268,6 +2285,17 @@ def _kartaview_timeout_seconds(
     city falling to the tail of the union and returning months later. The bound
     is still five, and it is still on the SCHEDULE rather than the work.
     """
+    estimate = _kartaview_estimate_seconds(city, pc, conn)
+    return floor if estimate is None else max(floor, estimate)
+
+
+def _kartaview_estimate_seconds(city: db.CityRow, pc: ProviderConfig | None, conn) -> int | None:
+    """
+    The UNFLOORED derivation behind :func:`_kartaview_timeout_seconds` (#373).
+
+    None when pacing is disabled, for the reason
+    :func:`_tile_census_estimate_seconds` gives.
+    """
     # Rate and fraction from the same row the inverse reads, for the reason
     # given in `_tile_census_timeout_seconds`: two spellings of one number drift.
     pricing = _crawl_pricing("kartaview")
@@ -2275,7 +2303,7 @@ def _kartaview_timeout_seconds(
     configured = pc.max_requests_per_minute if pc else None
     rate = pricing.default_rate if configured is None else configured
     if rate <= 0:  # pacing disabled: nothing to derive from
-        return floor
+        return None
     # Not via _channel_estimate: that helper exists to unify callers who need
     # spacing_m/network_type out of config, and this channel reads neither --
     # same shape as _tile_census_timeout_seconds. The two agree on the NUMBER
@@ -2283,7 +2311,7 @@ def _kartaview_timeout_seconds(
     # two arguments; they are not sharing a call site.
     requests = estimate_requests(city, "kartaview", conn=conn)
     paced_seconds = requests / (rate * pricing.achieved_fraction) * 60.0
-    return int(max(floor, paced_seconds * _TIMEOUT_HEADROOM + _TIMEOUT_FIXED_SLACK_S))
+    return int(paced_seconds * _TIMEOUT_HEADROOM + _TIMEOUT_FIXED_SLACK_S)
 
 
 def _sweep_requests_within_timeout(
@@ -2388,14 +2416,48 @@ def city_timeout_seconds(
     (issue #167). Without it, a city started just inside the deadline still runs
     its full derived timeout and pushes the batch past the supervisor's ceiling,
     which is the overrun the deadline exists to prevent.
+
+    THE CLAMP ONLY SHORTENS A CHILD THAT FITS (issue #373). A non-resumable
+    channel whose derivation (:func:`city_timeout_estimate_seconds`) exceeds
+    the night's remainder is deferred by ``_run_city_channels`` rather than
+    launched here clamped, because a clamped child that needs longer is
+    SIGKILLed at the deadline and counted as a failure. The floor is not part
+    of that decision: it is a minimum a child is GIVEN, not what it NEEDS.
+
+    Exactly ``clamp(max(floor, estimate))``, or ``clamp(floor)`` when the
+    estimate is None; pinned so the deferral and the timeout cannot drift.
     """
     floor = cfg.city_timeout_minutes * 60
+    estimate = city_timeout_estimate_seconds(cfg, city, provider, conn=conn)
+    value = floor if estimate is None else max(floor, estimate)
+    if remaining_s is None:
+        return value
+    return int(max(_MIN_CLAMPED_TIMEOUT_S, min(value, remaining_s)))
 
-    def clamp(value: int) -> int:
-        if remaining_s is None:
-            return value
-        return int(max(_MIN_CLAMPED_TIMEOUT_S, min(value, remaining_s)))
 
+def city_timeout_estimate_seconds(
+    cfg: SchedulerConfig,
+    city: db.CityRow,
+    provider: str,
+    conn=None,
+) -> int | None:
+    """
+    The derived wall-clock need of one (city, channel) — headroom and fixed
+    slack included, the configured floor and the deadline clamp NOT applied
+    (issue #373).
+
+    None when the channel has no paced derivation (pacing disabled, or a
+    channel outside the derived set), meaning "unknowable": a caller must then
+    not defer on it.
+
+    This, and not :func:`city_timeout_seconds`, is the deadline's PREDICTOR.
+    The floor is 180 min on prod, so predicting with the floored value would
+    defer every non-resumable channel for the last three hours of every night
+    while a median city finishes in minutes. It is still a padded upper bound
+    (``_TIMEOUT_HEADROOM`` over the achieved rate, plus the fixed slack), so it
+    defers some children that would have finished; that is the right trade,
+    because a deferral costs nothing and a kill costs a failure and an alert.
+    """
     # gsv_streets scales exactly like gsv — a 247k-sample city (Seattle) needs
     # ~20 minutes of querying, and a flat floor would SIGKILL the biggest ones.
     #
@@ -2431,7 +2493,7 @@ def city_timeout_seconds(
     # enrollable city measures ~3,132 tiles, and its DERIVED timeout is ~206 min
     # (~104 min of raw pacing, then / 0.8 and x 1.5 plus 600 s) against the
     # 180-minute floor — so this arm is LIVE today rather than latent against a
-    # future re-registration. Falling through to `clamp(floor)` instead — which is what an
+    # future re-registration. Falling through to the flat floor instead — which is what an
     # unlisted channel does, and what this arm's absence meant while
     # `panoramax` sat in UNWIRED_CHANNELS — is the failure `_kartaview_timeout_
     # seconds` was written for, reached by the other route: a SIGKILLed child
@@ -2447,10 +2509,10 @@ def city_timeout_seconds(
         "panoramax",
         "panoramax_streets",
     ):
-        return clamp(floor)
+        return None
     pc = (cfg.providers or {}).get(provider)
     if provider in ("mapillary", "mapillary_streets", "panoramax", "panoramax_streets"):
-        return clamp(_tile_census_timeout_seconds(city, provider, pc, floor))
+        return _tile_census_estimate_seconds(city, provider, pc)
     if provider in ("kartaview", "kartaview_streets"):
         # Same sweep, same derivation. Deliberately NOT discounted for a cache
         # hit: `estimate_requests` stays cache-blind precisely so this timeout
@@ -2458,10 +2520,10 @@ def city_timeout_seconds(
         # given time to fetch one, and a 0 here would collapse it onto the
         # fixed floor — the exact failure #238's arm exists to prevent, arrived
         # at from the other direction.
-        return clamp(_kartaview_timeout_seconds(city, pc, floor, conn))
+        return _kartaview_estimate_seconds(city, pc, conn)
     rate = (pc.max_requests_per_minute if pc else None) or cfg.max_requests_per_minute
     if rate <= 0:
-        return clamp(floor)
+        return None
     spacing = pc.spacing_m if pc else 15
     network_type = pc.network_type if pc else "drive"
     effective_rate = rate * _ACHIEVED_RATE_FRACTION
@@ -2469,7 +2531,7 @@ def city_timeout_seconds(
         city, provider, conn=conn, spacing_m=spacing, network_type=network_type
     )
     paced_seconds = estimated / effective_rate * 60.0
-    return clamp(int(max(floor, paced_seconds * _TIMEOUT_HEADROOM + _TIMEOUT_FIXED_SLACK_S)))
+    return int(paced_seconds * _TIMEOUT_HEADROOM + _TIMEOUT_FIXED_SLACK_S)
 
 
 # ── The resumable-sweep launch decision, made ONCE for both callers ──────────
@@ -5425,6 +5487,10 @@ def cmd_assess_city(
     # is False here anyway, so this is about the ANSWER, not the counter: a
     # rejected channel beside a collected one would otherwise score 1/1.
     rejected_argv = ArgvRejections()
+    # Unreachable by construction: the deadline deferral (issue #373) needs a
+    # batch deadline and this passes None. Owned here because the parameter
+    # has no default; pinned empty by the assess-city suite.
+    deadline_deferred: Counter[str] = Counter()
     attempted, succeeded, skipped_budget = _run_city_channels(
         cfg,
         conn,
@@ -5435,6 +5501,7 @@ def cmd_assess_city(
         busy_hosts=busy_hosts,
         deferred_channels=deferred_channels,
         rejected_argv=rejected_argv,
+        deadline_deferred=deadline_deferred,
         # No batch deadline: an operator run has nothing queued behind it, and
         # each child still carries its own derived per-city timeout.
         batch_deadline=None,
@@ -7328,6 +7395,7 @@ def cmd_run_due(
             busy_hosts,
             deferred_channels,
             rejected_argv,
+            deadline_deferred,
         ) = _run_city_loop(
             cfg,
             conn,
@@ -7369,6 +7437,16 @@ def cmd_run_due(
             f"; {sum(deferred_channels.values())} walk(s) deferred behind a paused sibling "
             f"sweep ({', '.join(sorted(deferred_channels))})"
             if deferred_channels
+            else ""
+        )
+        # Apart from both deferrals above, because the next move differs again:
+        # nothing is over budget and nothing failed -- the night was full, and
+        # these channels stay due for the next one (issue #373).
+        + (
+            f"; {sum(deadline_deferred.values())} channel(s) deferred for the deadline ("
+            + ", ".join(f"{ch} {n}" for ch, n in sorted(deadline_deferred.items()))
+            + ")"
+            if deadline_deferred
             else ""
         )
         + (f"; {blocked_note}" if blocked_note else "")
@@ -7580,6 +7658,7 @@ def _run_city_channels(
     busy_hosts: Counter[str],
     deferred_channels: Counter[str],
     rejected_argv: ArgvRejections,
+    deadline_deferred: Counter[str],
     batch_deadline: float | None,
     stop_requested: threading.Event | None,
     record_failures: bool = True,
@@ -7647,6 +7726,17 @@ def _run_city_channels(
     throwaway counter would drop the count from its own summary. Not a breaker
     -- per-city argv differs (the connection share, the request cap), so the
     next city's launch is still asked.
+
+    ``deadline_deferred`` counts, per channel, NON-resumable launches declined
+    because the channel's derived need (``city_timeout_estimate_seconds``)
+    exceeds what is left of ``batch_deadline`` (issue #373). A clamped launch
+    of such a child would be SIGKILLed at the deadline and recorded as a
+    failure; declining it records nothing, so the city stays due and
+    ``consecutive_failures`` is untouched. Owned by the caller and without a
+    default for ``rejected_argv``'s reason. Resumable channels never reach it:
+    ``_sweep_launch_plan`` already sizes their cap to the clock. Each channel
+    is judged on its own estimate, so a deferred grid run does not defer its
+    walk. With ``batch_deadline=None`` nothing is ever deferred.
 
     ``batch_deadline`` (a ``time.monotonic()`` value) clamps each child's
     timeout so no collection outlives the window reserved for the publish tail;
@@ -8036,6 +8126,37 @@ def _run_city_channels(
                             skipped_budget += 1
                             continue
 
+                        if batch_deadline is not None and not is_resumable_channel(provider):
+                            # Exactly one clock read per non-resumable channel that
+                            # reaches here, reused for the clamp below. A resumable
+                            # channel is excluded because `_sweep_launch_plan` above
+                            # already sized its cap and timeout to the same clock:
+                            # it pauses (exit 83, amnestied) rather than being killed.
+                            remaining_s = batch_deadline - time.monotonic()
+                            # The ESTIMATE, not the floored timeout: the floor is
+                            # 180 min on prod, and predicting with it would defer
+                            # every such channel for the last three hours of every
+                            # night while a median city finishes in minutes (#373).
+                            need_s = city_timeout_estimate_seconds(cfg, city, provider, conn=conn)
+                            if need_s is not None and need_s > remaining_s:
+                                # Not a failure and not a budget skip: nothing is
+                                # recorded, so the city stays due and its
+                                # consecutive_failures are untouched. A clamped
+                                # launch would have been SIGKILLed at the deadline,
+                                # counted as a failure and alerted on.
+                                logger.info(
+                                    f"{city.city_id} [{provider}]: deferring — needs "
+                                    f"~{need_s // 60:,} min and {int(remaining_s) // 60:,} "
+                                    f"min remain before the batch deadline; a clamped "
+                                    f"launch would be killed at the deadline and counted "
+                                    f"as a failure (#373). Not a failure; it stays due."
+                                )
+                                deadline_deferred[provider] += 1
+                                continue
+                            timeout_s = city_timeout_seconds(
+                                cfg, city, provider, conn=conn, remaining_s=remaining_s
+                            )
+
                         conn_limit, throttle_reason = plan_connection_limit(
                             lane_connection_limit, read_system_pressure(), cfg.resource_guard
                         )
@@ -8046,20 +8167,13 @@ def _run_city_channels(
                                 f"{city.city_id} [{provider}]"
                             )
                         if timeout_s is None:
-                            # Exactly one clock read per LAUNCHED channel, here, so the
-                            # deadline is priced by the thread that knows what the whole
-                            # batch is doing. Never let a child run past it; the point of
-                            # the deadline is to reserve time for the publish tail. A
-                            # resumable channel already took this branch above, where its
-                            # cap needed the answer.
-                            remaining_s = (
-                                None
-                                if batch_deadline is None
-                                else batch_deadline - time.monotonic()
-                            )
-                            timeout_s = city_timeout_seconds(
-                                cfg, city, provider, conn=conn, remaining_s=remaining_s
-                            )
+                            # No batch deadline (an operator run): nothing to clamp to
+                            # and nothing to defer for. With a deadline, the gate above
+                            # already derived the clamped timeout from its one clock
+                            # read, so the deadline is priced by the thread that knows
+                            # what the whole batch is doing. A resumable channel took
+                            # its own branch further up, where its cap needed the answer.
+                            timeout_s = city_timeout_seconds(cfg, city, provider, conn=conn)
                         future = _start(
                             provider,
                             connection_limit=conn_limit,
@@ -8417,6 +8531,7 @@ def _retry_stranded_walks(
     busy_hosts: Counter[str],
     deferred_channels: Counter[str],
     rejected_argv: ArgvRejections,
+    deadline_deferred: Counter[str],
     batch_deadline: float,
     sigterm_seen: threading.Event,
     tally: Counter[str],
@@ -8546,6 +8661,7 @@ def _retry_stranded_walks(
                     busy_hosts=busy_hosts,
                     deferred_channels=deferred_channels,
                     rejected_argv=rejected_argv,
+                    deadline_deferred=deadline_deferred,
                     batch_deadline=batch_deadline,
                     stop_requested=sigterm_seen,
                 )
@@ -8625,7 +8741,18 @@ def _run_city_loop(
     batch_deadline: float,
     sigterm_seen: threading.Event,
     max_cities: int,
-) -> tuple[int, int, int, int, str | None, HostBreaker, Counter[str], Counter[str], ArgvRejections]:
+) -> tuple[
+    int,
+    int,
+    int,
+    int,
+    str | None,
+    HostBreaker,
+    Counter[str],
+    Counter[str],
+    ArgvRejections,
+    Counter[str],
+]:
     """Collect due cities until the city cap, the batch deadline, or SIGTERM.
 
     ``sigterm_seen`` is both checked here (between cities) and forwarded to
@@ -8640,8 +8767,9 @@ def _run_city_loop(
     dead code that also reads as a second opinion on what the cap is.
 
     Returns ``(processed, succeeded, attempted, skipped_budget, stop_reason,
-    blocked_hosts, busy_hosts, deferred_channels, rejected_argv)``; ``stop_reason`` is None when the whole due
-    list was worked through. Split out of ``cmd_run_due`` so every way of ending
+    blocked_hosts, busy_hosts, deferred_channels, rejected_argv,
+    deadline_deferred)``; ``stop_reason`` is None when the whole due list was
+    worked through. Split out of ``cmd_run_due`` so every way of ending
     the night still reaches the publish tail — an unexpected exception here is
     logged and converted into a stop reason rather than discarding a night's
     collected data (issue #167).
@@ -8667,6 +8795,12 @@ def _run_city_loop(
     time (issue #359). Reported like ``busy_hosts`` — no ``record_attempt`` is
     written for them, so this counter is the only place they surface.
 
+    ``deadline_deferred`` counts, per channel, non-resumable launches declined
+    because their derived need exceeded what was left of the deadline (issue
+    #373). A city whose every channel deferred has ``attempted == 0``, so it
+    costs no city-cap slot and earns no inter-city sleep, and the next city is
+    still asked: a smaller one may fit.
+
     After the due list, the walks stranded tonight get one more chance through
     ``_retry_stranded_walks`` (issue #380); its runs count in
     ``attempted``/``succeeded`` but not in ``processed``, since each city was
@@ -8678,6 +8812,7 @@ def _run_city_loop(
     busy_hosts: Counter[str] = Counter()
     deferred_channels: Counter[str] = Counter()
     rejected_argv = ArgvRejections()
+    deadline_deferred: Counter[str] = Counter()
     # The stranded-walk retry's runs (issue #380), folded in after the `except`
     # so a pass that raises part-way still reports what it collected.
     retry_tally: Counter[str] = Counter()
@@ -8711,6 +8846,7 @@ def _run_city_loop(
                 busy_hosts=busy_hosts,
                 deferred_channels=deferred_channels,
                 rejected_argv=rejected_argv,
+                deadline_deferred=deadline_deferred,
                 batch_deadline=batch_deadline,
                 stop_requested=sigterm_seen,
             )
@@ -8758,6 +8894,7 @@ def _run_city_loop(
             busy_hosts=busy_hosts,
             deferred_channels=deferred_channels,
             rejected_argv=rejected_argv,
+            deadline_deferred=deadline_deferred,
             batch_deadline=batch_deadline,
             sigterm_seen=sigterm_seen,
             tally=retry_tally,
@@ -8796,6 +8933,7 @@ def _run_city_loop(
         busy_hosts,
         deferred_channels,
         rejected_argv,
+        deadline_deferred,
     )
 
 
