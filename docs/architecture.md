@@ -97,8 +97,10 @@ So is the road walk, which bounds sample-to-pano distance itself (`street_covera
 `tests/test_coverage.py` reads the JS source and pins both constants (the radius and the Earth radius) to the Python ones.
 
 **The repair handle is `scripts/recompute_run_stats.py`**, which reads through the loader and so inherits the rule with no copy of its own; its report line names each run's reclassified count (`analysis.out_of_radius_count`), and `--regenerate-json` rebuilds any run that holds a far pano.
-Running it is the operator's decision: in the sample, 10.4% of covered points flip to uncovered, a large move for a published number.
-Historical `run_diffs` rows were computed under the old definition and are not recomputed by it.
+**Running it is a REQUIRED deploy step, before the next 02:00 timer**: `recompute_run_stats.py --provider gsv` dry, then with `--execute --regenerate-json`, then `scheduler regenerate-aggregate --publish`.
+The exact commands are in [`operations.md`](operations.md), "Deploying a stats-definition change".
+Without it, runs collected after the deploy are cataloged under 50 m while older rows keep the unfiltered `coverage_rate_pct`, and the aggregate and driving page read that stored column, so every re-collected city shows a phantom drop of about 10% (the share of covered points the rule flips in the sample).
+Historical `run_diffs` rows and diff detail CSVs stay under the old definition even after the repair, until a GSV re-diff pass exists; diffs computed after the deploy are correct.
 
 ## Pipeline per run
 
