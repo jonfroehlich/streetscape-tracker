@@ -14486,13 +14486,15 @@ def test_a_channel_no_night_can_hold_warns(conn, monkeypatch, caplog, need_s, wa
         assert warnings == []
 
 
-def test_a_walk_the_deadline_strands_is_named_with_its_recovery_command(conn, monkeypatch, caplog):
+def test_a_walk_the_deadline_strands_is_counted_logged_with_its_command_and_does_not_alert(
+    conn, monkeypatch, caplog
+):
     """Alpha's grid lands, then its walk's need exceeds the remainder. The
-    walk is deferred ONCE (not again by the retry pass, which never sees it),
-    and the city is STRANDED -- not gsv-due for ~83 days -- so the Done line
-    counts it and the alert names it, with its reason and the by-name
-    recovery command. A stranding alone makes the night unhealthy: nothing
-    else would print that command."""
+    walk is deferred ONCE (the retry pass never sees it) and the city is
+    STRANDED -- not gsv-due for ~83 days -- so the Done line counts it. But a
+    deadline stranding alone is routine once nights end on the deadline, so
+    it does NOT alert and the night exits 0; the operator's recovery command
+    is in the stranding's own WARNING line instead."""
     alpha = _register(conn, "Alpha", width=1000, height=1000, step=20)
     real = _sched.city_timeout_estimate_seconds
 
@@ -14514,11 +14516,16 @@ def test_a_walk_the_deadline_strands_is_named_with_its_recovery_command(conn, mo
     assert "; 1 channel(s) deferred for the deadline (gsv_streets 1)" in done
     assert "; 1 city(ies) STRANDED un-walked (1 by the batch deadline)" in done
     assert not any("End-of-night retry" in r.message for r in caplog.records)
-    assert rc == 1
-    [(subject, body)] = alerts
-    assert "1 city(ies) STRANDED un-walked" in subject
-    assert f"{alpha} (gsv_streets: the batch deadline)" in body
-    assert _alert_commands(body) == [["run-due", "--provider", "gsv_streets", "--city", alpha]]
+    assert rc == 0
+    assert alerts == []
+    [line] = [
+        r.message
+        for r in caplog.records
+        if r.levelno == logging.WARNING and "STRANDED" in r.message and "deadline" in r.message
+    ]
+    assert _alert_commands(line.split("keep the pair: ", 1)[1]) == [
+        ["run-due", "--provider", "gsv_streets", "--city", alpha]
+    ]
 
 
 def test_the_retry_pass_never_defers_a_walk_it_cannot_fit(conn, monkeypatch, caplog):

@@ -329,7 +329,10 @@ class HostBreaker(set):
     sibling landed and used the clock, then the walk's own derived need no
     longer fit the remainder and it was deferred. The city is in exactly the
     state a host stranding leaves it in -- not due on the grid channel for
-    ~83 days -- so it is named beside those with the same recovery command.
+    ~83 days -- so it is counted beside those and its WARNING line carries the
+    same recovery command. It does not alert on its own (routine once nights end
+    on the deadline); when the night alerts for another reason it is listed in
+    the STRANDED paragraph, marked ``the batch deadline``.
     ``deadline_stranded`` marks which entries those are, because the retry pass
     must never re-launch one: it would only meet the same deadline.
 
@@ -2510,7 +2513,7 @@ def city_timeout_estimate_seconds(
     a failure and an alert. Two deferrals do cost something, and
     ``_run_city_channels`` handles both: a deferred first channel defers its
     whole city (pairing), and a walk deferred after its grid landed is
-    recorded as a STRANDING and named in the alert.
+    recorded as a STRANDING and logged with its recovery command.
     """
     # gsv_streets scales exactly like gsv — a 247k-sample city (Seattle) needs
     # ~20 minutes of querying, and a flat floor would SIGKILL the biggest ones.
@@ -7498,7 +7501,7 @@ def cmd_run_due(
         # (issue #373). A deferred grid run stays due for the next night; a WALK
         # deferred after its grid landed does not (the grid success moved the
         # city off the gsv-due list), so that one is also counted as STRANDED
-        # below and named in the alert with its recovery command.
+        # below, its recovery command in its own WARNING line (it does not alert).
         + (
             f"; {sum(deadline_deferred.values())} channel(s) deferred for the deadline ("
             + ", ".join(f"{ch} {n}" for ch, n in sorted(deadline_deferred.items()))
@@ -7808,8 +7811,9 @@ def _run_city_channels(
     deadline-defers, so the rule never fires for one. When the first channel
     LAUNCHED, every later channel is still judged on its own estimate -- and a
     walk that then defers while its grid sibling lands is recorded on
-    ``blocked_hosts`` as a deadline STRANDING (issue #373), named in the alert
-    with the same recovery command as a host stranding.
+    ``blocked_hosts`` as a deadline STRANDING (issue #373): counted on the
+    ``Done:`` line and logged with the same recovery command as a host
+    stranding, but it does not make the night unhealthy on its own.
 
     ``batch_deadline`` (a ``time.monotonic()`` value) clamps each child's
     timeout so no collection outlives the window reserved for the publish tail;
@@ -8634,11 +8638,16 @@ def _run_city_channels(
         sibling = STREET_CHANNELS.get(provider)
         if sibling is not None and sibling in succeeded_channels:
             blocked_hosts.strand(city.city_id, provider, deadline=True)
+            # The recovery command is IN the line: a deadline stranding alone
+            # does not alert, so the scheduler log (and the alert's log tail,
+            # when the night is unhealthy for another reason) is where it is.
             logger.warning(
                 f"{city.city_id} [{provider}]: STRANDED — its {sibling} grid run succeeded "
                 f"tonight but the batch deadline left too little time for this walk, so the "
                 f"city leaves the night un-paired and is not due on {sibling} again for "
-                f"~{cfg.cycle_days - cfg.grace_days} days (issues #341, #373)."
+                f"~{cfg.cycle_days - cfg.grace_days} days (issues #341, #373). Walk it the "
+                f"same UTC day to keep the pair: "
+                f"{_recovery_command(cfg, [provider], [city.city_id])}"
             )
 
     return attempted, succeeded, skipped_budget
@@ -9565,11 +9574,11 @@ def _finish_batch(
         busy_hosts,
         busy_recovered,
         rejected_argv,
-        # A stranding alone makes the night unhealthy (issue #373): until then
-        # every stranding came with a refused, busy or rejected host that did,
-        # but a walk the batch DEADLINE stranded comes with none, and the
-        # alert is the only place its recovery command is printed.
-        blocked_hosts.stranded,
+        # Deliberately NOT `blocked_hosts.stranded` (issue #373): a host
+        # stranding already alerts through its host condition, and a DEADLINE
+        # stranding alone is routine once nights end on the deadline -- the
+        # last city of most nights -- so alerting on it would be nightly
+        # noise. Its recovery command is in its own WARNING log line instead.
     )
     if any(unhealthy) or should_alert(failures, cfg.alerts.failure_threshold):
         host = socket.gethostname()
