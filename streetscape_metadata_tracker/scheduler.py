@@ -6773,16 +6773,68 @@ def _collect_due(
             # Then round-robin the rest, so no stranded population can be
             # zeroed by a larger one. A group leaves the rotation as it empties,
             # so a slate with only one behaves exactly as the straight take did.
-            groups: dict[int, list[int]] = {}
+            #
+            # TWO LEVELS, because the same starvation recurs one level down
+            # (issue #348). Inside group 1 union order is first appearance over
+            # `providers`, so a city due only on `panoramax` (rank 6) sorts
+            # behind EVERY city due only on `kartaview` (rank 4) -- and a
+            # KartaView city whose gsv succeeds tonight is opt-in-only
+            # tomorrow, so that queue refills faster than group 1's share of
+            # the reservation drains it. Measured on prod 2026-09-21: Des
+            # Moines was position 51 of 51 in group 1 (kartaview 50, panoramax
+            # 1), and 19 of the 20 newly enrolled Panoramax cities had never
+            # collected, with consecutive_failures at 0 and no alert. So group
+            # 1 is itself a rotation across sub-queues keyed by the city's
+            # LEADING due channel -- the earliest in `providers` it is due on.
+            # A walk-only straggler (due only on kartaview_streets) therefore
+            # gets its own sub-queue, on purpose: it is exactly the population
+            # that otherwise waits behind its own grid channel's. Each
+            # sub-queue keeps union order, so stalest-first holds within a
+            # channel, and with one channel stranded the take is unchanged.
+            # Groups 0 and 2 are single-queue rotations and order as before.
+            class _Rotation:
+                """Round-robin over sub-queues; each ``take`` visits the next."""
+
+                def __init__(self, subqueues: list[list[int]]) -> None:
+                    self._subqueues = [q for q in subqueues if q]
+                    self._cursor = 0
+
+                def __bool__(self) -> bool:
+                    return bool(self._subqueues)
+
+                def take(self) -> int:
+                    q = self._subqueues[self._cursor]
+                    index = q.pop(0)
+                    if q:
+                        self._cursor += 1
+                    else:
+                        del self._subqueues[self._cursor]
+                    if self._cursor >= len(self._subqueues):
+                        self._cursor = 0
+                    return index
+
+            def _leading_channel(index: int) -> str:
+                due = providers_for_city[ordered[index].city_id]
+                return next(p for p in providers if p in due)
+
+            groups: dict[int, dict[str, list[int]]] = {}
             for i in stranded:
                 if i not in chosen:
-                    groups.setdefault(_stranded_kind(i), []).append(i)
-            queues = [q for _, q in sorted(groups.items())]
+                    kind = _stranded_kind(i)
+                    # Only group 1 splits by channel; 0 and 2 share one key.
+                    sub = _leading_channel(i) if kind == 1 else ""
+                    groups.setdefault(kind, {}).setdefault(sub, []).append(i)
+            # Sub-queues rotate in `providers` rank order, not first-seen order.
+            rank = {p: n for n, p in enumerate(providers)}
+            queues = [
+                _Rotation([subs[k] for k in sorted(subs, key=lambda k: rank.get(k, -1))])
+                for _, subs in sorted(groups.items())
+            ]
             while len(chosen) < max_opt_in and any(queues):
                 for q in queues:
                     if not q:
                         continue
-                    chosen.add(q.pop(0))
+                    chosen.add(q.take())
                     if len(chosen) >= max_opt_in:
                         break
         keys = [0 if i in chosen else 1 for i in range(len(ordered))]

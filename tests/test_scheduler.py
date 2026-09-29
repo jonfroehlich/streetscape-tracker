@@ -3038,6 +3038,107 @@ def test_a_live_checkpoint_outranks_the_rotation_across_groups(conn, monkeypatch
     )
 
 
+# The opt-in-only group rotates across CHANNELS, not just across groups (#348).
+_OPT_IN_SLATE = ["gsv", "kartaview", "kartaview_streets", "panoramax", "panoramax_streets"]
+
+
+def _opt_in_only(conn, name, channels):
+    """Register a city due ONLY on ``channels``: enrolled there, gsv fresh."""
+    cid = _register(conn, name, width=1000, height=1000, step=20)
+    db.assign_schedule(conn, 90, providers=tuple(_OPT_IN_SLATE))
+    for channel in channels:
+        db.set_channel_membership(conn, cid, channel, True, cycle_days=90)
+    db.record_attempt(conn, cid, success=True, provider="gsv")
+    return cid
+
+
+def _opt_in_slate(conn, monkeypatch, *, max_opt_in, max_cities=40):
+    from streetscape_metadata_tracker import scheduler as sched
+
+    # No live checkpoints anywhere: the resumer take must not be what decides.
+    monkeypatch.setattr(sched, "_sweep_checkpoint_progress", lambda cfg, city, channel: None)
+    cfg = _sweep_cfg(publish_enabled=False, opt_in_cities_per_day=max_opt_in)
+    return sched._collect_due(
+        conn,
+        cfg,
+        date(2026, 7, 2),
+        list(_OPT_IN_SLATE),
+        max_opt_in=max_opt_in,
+        max_cities=max_cities,
+    )
+
+
+def test_opt_in_reservation_rotates_across_channels_inside_the_opt_in_only_group(conn, monkeypatch):
+    """Issue #348: the prod slate of 2026-09-21, reduced to its shape.
+
+    The union is first appearance over `providers`, so a city due only on
+    `panoramax` (rank 6 on prod) sorts behind EVERY city due only on
+    `kartaview` (rank 4) inside the opt-in-only group, and the group was filled
+    from its head. Measured: Des Moines at position 51 of 51 (kartaview 50,
+    panoramax 1), never collected. The Panoramax city is named to sort FIRST
+    alphabetically, so only the channel rank can put it last.
+
+    Pinned exactly on both sides: the Panoramax city takes one slot and
+    KartaView keeps the other nine -- the rotation shares, it does not invert.
+    """
+    kartaview = [
+        _opt_in_only(conn, f"Kv{i:02d}", ("kartaview", "kartaview_streets")) for i in range(50)
+    ]
+    panoramax = _opt_in_only(conn, "Aaapanoramax", ("panoramax", "panoramax_streets"))
+
+    slate = _opt_in_slate(conn, monkeypatch, max_opt_in=10)
+    head = [c.city_id for c in slate.cities][:10]
+
+    assert panoramax in head, "the lowest-ranked opt-in channel must not be last by construction"
+    assert sum(1 for c in head if c in kartaview) == 9
+    assert slate.providers_for_city[panoramax] == ["panoramax", "panoramax_streets"]
+
+
+def test_a_walk_only_straggler_is_its_own_sub_queue_in_the_rotation(conn, monkeypatch):
+    """The sub-queue key is the LEADING due channel, not the provider family.
+
+    A city due only on `kartaview_streets` (its grid run already succeeded) is
+    the population that otherwise waits behind its own grid channel's queue,
+    so it rotates as its own channel. 50 + 3 + 1 stranded at a reservation of 3
+    must give exactly one slot to each.
+    """
+    grid = [_opt_in_only(conn, f"Kv{i:02d}", ("kartaview", "kartaview_streets")) for i in range(50)]
+    walk_only = []
+    for i in range(3):
+        cid = _opt_in_only(conn, f"Kw{i}", ("kartaview", "kartaview_streets"))
+        db.record_attempt(conn, cid, success=True, provider="kartaview")
+        walk_only.append(cid)
+    panoramax = _opt_in_only(conn, "Pmx", ("panoramax",))
+
+    slate = _opt_in_slate(conn, monkeypatch, max_opt_in=3)
+    head = [c.city_id for c in slate.cities][:3]
+
+    assert all(slate.providers_for_city[c] == ["kartaview_streets"] for c in walk_only)
+    assert sum(1 for c in head if c in grid) == 1
+    assert sum(1 for c in head if c in walk_only) == 1
+    assert sum(1 for c in head if c == panoramax) == 1
+
+
+def test_one_stranded_opt_in_channel_takes_the_reservation_in_union_order(conn, monkeypatch):
+    """With a single opt-in channel stranded the rotation is the straight take.
+
+    Pinned against the ordering the reservation produced before #348: the
+    chosen cities are the first `max_opt_in` of kartaview's own due list, they
+    lead the slate in that order, and every other city keeps its union place.
+    """
+    gsv_due = [_register(conn, f"G{i}", width=1000, height=1000, step=20) for i in range(3)]
+    stranded = [
+        _opt_in_only(conn, f"Kv{i:02d}", ("kartaview", "kartaview_streets")) for i in range(8)
+    ]
+
+    slate = _opt_in_slate(conn, monkeypatch, max_opt_in=5)
+    ordered = [c.city_id for c in slate.cities]
+
+    # Union order: gsv's due list first, then kartaview's -- stranded in id order.
+    assert ordered == stranded[:5] + gsv_due + stranded[5:]
+    assert slate.hoisted == 5
+
+
 def test_a_city_due_only_on_an_opt_in_channel_is_hoisted_ahead_of_the_gsv_block(conn):
     """Without this the channel is scoped but never REACHED.
 
