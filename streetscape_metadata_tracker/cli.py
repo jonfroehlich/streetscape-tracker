@@ -64,6 +64,8 @@ from .download_common import (
     HostBusyError,
     HostUnavailableError,
     SweepIncompleteError,
+    add_crawl_clock_arguments,
+    crawl_deadline_from_budget,
     host_exit_code,
     jitter_fraction,
     positive_int,
@@ -500,6 +502,11 @@ def parse_args():
              fetch every tile.""",
     )
 
+    # --kartaview-max-seconds / --mapillary-max-seconds / --panoramax-max-seconds
+    # (issue #344): the clock stop beside each cap above, declared by the helper
+    # collect.py also calls, so the grid and walk surfaces cannot drift.
+    add_crawl_clock_arguments(concurrency_group)
+
     parser.add_argument(
         "--timeout",
         type=float,
@@ -728,9 +735,11 @@ async def async_main():
             except SweepIncompleteError as e:
                 # Progress, not breakage — logged at INFO with the fraction
                 # done, and deliberately without a traceback.
+                # The stop phrase is what the scheduler reads back out of this
+                # log to say WHICH ceiling paused the crawl (issue #344).
                 logging.info(
-                    f"{provider} crawl paused at {e.units_done}/{e.unit_count} {e.unit_name}; "
-                    f"re-run to resume from {e.checkpoint_path}"
+                    f"{provider} crawl paused at {e.units_done}/{e.unit_count} {e.unit_name} "
+                    f"({e.stop_phrase}); re-run to resume from {e.checkpoint_path}"
                 )
                 failed.append(provider)
                 incomplete.append((provider, e))
@@ -906,6 +915,7 @@ async def _collect_one_run(conn, args, city_row, run_date, provider, config, vis
                 max_requests_per_minute=args.mapillary_max_requests_per_minute,
                 jitter=args.mapillary_jitter,
                 max_requests=args.mapillary_max_requests,
+                deadline_monotonic=crawl_deadline_from_budget(args.mapillary_max_seconds),
                 checkpoint_path=checkpoint_path,
                 # The channel again, this time INSIDE the commit record: the
                 # path separates channels only as long as every caller derives
@@ -927,6 +937,7 @@ async def _collect_one_run(conn, args, city_row, run_date, provider, config, vis
                 request_timeout=request_timeout,
                 max_requests_per_minute=args.kartaview_max_requests_per_minute,
                 max_requests=args.kartaview_max_requests,
+                deadline_monotonic=crawl_deadline_from_budget(args.kartaview_max_seconds),
                 checkpoint_path=checkpoint_path,
                 # The channel again, this time INSIDE the commit record: the
                 # path above separates channels only as long as every caller
@@ -952,6 +963,7 @@ async def _collect_one_run(conn, args, city_row, run_date, provider, config, vis
                 max_requests_per_minute=args.panoramax_max_requests_per_minute,
                 jitter=args.panoramax_jitter,
                 max_requests=args.panoramax_max_requests,
+                deadline_monotonic=crawl_deadline_from_budget(args.panoramax_max_seconds),
                 checkpoint_path=checkpoint_path,
                 # The channel again, this time INSIDE the commit record: the
                 # path separates channels only as long as every caller derives

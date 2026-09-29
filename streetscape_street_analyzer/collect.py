@@ -95,6 +95,8 @@ from streetscape_metadata_tracker.download_common import (
     DownloadError,
     HostUnavailableError,
     SweepIncompleteError,
+    add_crawl_clock_arguments,
+    crawl_deadline_from_budget,
     host_exit_code,
     jitter_fraction,
     positive_int,
@@ -662,6 +664,7 @@ def run_collect(args: argparse.Namespace) -> int:
                         max_requests_per_minute=args.mapillary_max_requests_per_minute,
                         jitter=args.mapillary_jitter,
                         max_requests=args.mapillary_max_requests,
+                        deadline_monotonic=crawl_deadline_from_budget(args.mapillary_max_seconds),
                         checkpoint_path=checkpoint_path,
                         checkpoint_channel=budget_channel,
                         checkpoint_variant=args.network_type,
@@ -684,6 +687,7 @@ def run_collect(args: argparse.Namespace) -> int:
                         max_requests_per_minute=args.panoramax_max_requests_per_minute,
                         jitter=args.panoramax_jitter,
                         max_requests=args.panoramax_max_requests,
+                        deadline_monotonic=crawl_deadline_from_budget(args.panoramax_max_seconds),
                         checkpoint_path=checkpoint_path,
                         checkpoint_channel=budget_channel,
                         checkpoint_variant=args.network_type,
@@ -701,6 +705,7 @@ def run_collect(args: argparse.Namespace) -> int:
                         request_timeout=args.timeout,
                         max_requests_per_minute=args.kartaview_max_requests_per_minute,
                         max_requests=args.kartaview_max_requests,
+                        deadline_monotonic=crawl_deadline_from_budget(args.kartaview_max_seconds),
                         checkpoint_path=checkpoint_path,
                         checkpoint_channel=budget_channel,
                         checkpoint_variant=args.network_type,
@@ -752,12 +757,15 @@ def run_collect(args: argparse.Namespace) -> int:
                 # CLI does (cli.py) -- the scheduler amnesties 83 rather than
                 # counting a consecutive_failure, and folding this into 1 would
                 # quarantine a city that is making progress every night.
+                # The stop phrase is what the scheduler reads back out of this
+                # log to say WHICH ceiling paused the crawl (issue #344).
                 logger.info(
-                    "%s crawl paused at %s/%s %s; re-run to resume from %s",
+                    "%s crawl paused at %s/%s %s (%s); re-run to resume from %s",
                     provider,
                     e.units_done,
                     e.unit_count,
                     e.unit_name,
+                    e.stop_phrase,
                     e.checkpoint_path,
                 )
                 return SWEEP_INCOMPLETE_EXIT_CODE
@@ -1166,6 +1174,9 @@ def build_parser() -> argparse.ArgumentParser:
             "than re-paying (issues #238, #273)"
         ),
     )
+    # --kartaview-max-seconds / --mapillary-max-seconds / --panoramax-max-seconds
+    # (issue #344), declared by the same helper cli.py calls.
+    add_crawl_clock_arguments(parser)
     parser.add_argument(
         "--daily-budget",
         type=int,

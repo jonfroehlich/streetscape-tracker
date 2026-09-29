@@ -163,10 +163,14 @@ from .checkpointing import (
 from .config import KARTAVIEW_METADATA_DTYPES
 from .download_common import (
     HOST_KARTAVIEW,
+    SWEEP_STOP_CLOCK,
+    SWEEP_STOP_REQUESTS,
     AsyncRateLimiter,
     DownloadError,
     HostBlockedError,
     SweepIncompleteError,
+    crawl_budget_seconds,
+    crawl_deadline_passed,
     grid_bbox,
     redact_credentials,
 )
@@ -1928,6 +1932,7 @@ async def download_kartaview_metadata_async(
     request_timeout: float = DEFAULT_REQUEST_TIMEOUT_S,
     max_requests_per_minute: int = DEFAULT_SWEEP_REQUESTS_PER_MINUTE,
     max_requests: int | None = None,
+    deadline_monotonic: float | None = None,
     radius_m: int | None = None,
     checkpoint_path: str | None = None,
     checkpoint_channel: str | None = None,
@@ -1987,6 +1992,7 @@ async def download_kartaview_metadata_async(
         request_timeout=request_timeout,
         max_requests_per_minute=max_requests_per_minute,
         max_requests=max_requests,
+        deadline_monotonic=deadline_monotonic,
         checkpoint_path=checkpoint_path,
         checkpoint_channel=checkpoint_channel,
         census_cache=census_cache,
@@ -2143,6 +2149,7 @@ async def fetch_city_images_async(
     request_timeout: float = DEFAULT_REQUEST_TIMEOUT_S,
     max_requests_per_minute: int = DEFAULT_SWEEP_REQUESTS_PER_MINUTE,
     max_requests: int | None = None,
+    deadline_monotonic: float | None = None,
     retries: int = DEFAULT_BACKPRESSURE_RETRIES,
     calibration_probes: int = DEFAULT_CALIBRATION_PROBES,
     checkpoint_path: str | None = None,
@@ -2182,6 +2189,7 @@ async def fetch_city_images_async(
             request_timeout=request_timeout,
             max_requests_per_minute=max_requests_per_minute,
             max_requests=max_requests,
+            deadline_monotonic=deadline_monotonic,
             retries=retries,
             calibration_probes=calibration_probes,
             checkpoint_path=checkpoint_path,
@@ -2202,6 +2210,7 @@ async def _fetch_city_images(
     request_timeout: float = DEFAULT_REQUEST_TIMEOUT_S,
     max_requests_per_minute: int = DEFAULT_SWEEP_REQUESTS_PER_MINUTE,
     max_requests: int | None = None,
+    deadline_monotonic: float | None = None,
     retries: int = DEFAULT_BACKPRESSURE_RETRIES,
     calibration_probes: int = DEFAULT_CALIBRATION_PROBES,
     checkpoint_path: str | None = None,
@@ -2243,6 +2252,14 @@ async def _fetch_city_images(
             :class:`SweepIncompleteError` instead and publishes nothing either
             way. That is what lets the scheduler hand this the night's remaining
             budget without the figure being a cliff that destroys the spend.
+        deadline_monotonic: an absolute ``time.monotonic()`` value at which to
+            stop the same way (issue #344), or None for no clock stop. Asked
+            wherever ``max_requests`` is -- each cell and page boundary, never
+            mid-request -- so the two compose: whichever is reached first stops
+            the sweep, and the pause message names which. Unlike
+            ``max_requests`` it REQUIRES ``checkpoint_path``: the clock exists
+            for the scheduler's resumable launches, and an uncheckpointed
+            sweep stopped on it would only ever refuse at the area guard.
         retries: backpressure/transport retries before a cell is subdivided.
         calibration_probes: points per rung; a rung passes only if all answer.
         checkpoint_path: directory to checkpoint into, so an interrupted sweep
@@ -2318,6 +2335,16 @@ async def _fetch_city_images(
         HostBlockedError: KartaView is refusing this host. Raised at the FIRST
             refusal rather than after the whole bbox has been paid for (#205).
     """
+    if deadline_monotonic is not None and checkpoint_path is None:
+        # Refused before a request, like the tile censuses' guard (issue #344).
+        # max_requests keeps its documented uncheckpointed meaning -- a
+        # runaway guard whose stop the area check refuses -- but the clock has
+        # no such legacy caller, and a sweep stopped on it with nowhere to
+        # commit would discard everything it paid for.
+        raise ValueError(
+            "deadline_monotonic needs a checkpoint_path: a sweep stopped on the clock "
+            "stops part-way, and with nothing to resume from that discards everything it spent."
+        )
     api_requests = 0
     prior_requests = 0
 
@@ -2334,9 +2361,35 @@ async def _fetch_city_images(
         error.api_requests_total = prior_requests + api_requests
         return error
 
+    # Which ceiling tripped first, for the stop messages (issue #344):
+    # "requests" or "clock". Latched by the first True from over_budget().
+    budget_stop: str | None = None
+
     def over_budget() -> bool:
-        """Has the runaway guard tripped? Asked everywhere a request is issued."""
-        return max_requests is not None and api_requests >= max_requests
+        """
+        Has a stop ceiling tripped? Asked everywhere a request is issued.
+
+        Two ceilings, one answer: the request cap (the runaway guard) and the
+        wall-clock deadline (issue #344). They share every call site and every
+        consequence, so a clock stop checkpoints, ledgers and exits 83 exactly
+        as a cap stop does.
+        """
+        nonlocal budget_stop
+        if max_requests is not None and api_requests >= max_requests:
+            budget_stop = budget_stop or SWEEP_STOP_REQUESTS
+            return True
+        if crawl_deadline_passed(deadline_monotonic):
+            budget_stop = budget_stop or SWEEP_STOP_CLOCK
+            return True
+        return False
+
+    def budget_ran_out() -> str:
+        """The stop reason in words, naming the ceiling that actually fired."""
+        if budget_stop == SWEEP_STOP_CLOCK:
+            return (
+                f"the {crawl_budget_seconds(deadline_monotonic):,}-second wall-clock budget ran out"
+            )
+        return f"the {max_requests}-request budget ran out"
 
     def unvisited(cells: list[Cell]) -> None:
         """
@@ -2760,15 +2813,12 @@ async def _fetch_city_images(
                     while retry_pos < len(retry_queue):
                         if not await _sweep_subtree(retry_queue[retry_pos]):
                             logger.warning(
-                                f"Stopped after {api_requests} requests (max_requests="
-                                f"{max_requests}); {len(retry_queue) - retry_pos} of "
+                                f"Stopped after {api_requests} requests ({budget_ran_out()}); "
+                                f"{len(retry_queue) - retry_pos} of "
                                 f"{len(retry_queue)} previously failed cell(s) not yet "
                                 f"re-probed -- they stay failed in the checkpoint"
                             )
-                            stop_reason = (
-                                f"the {max_requests}-request budget ran out re-probing "
-                                f"previously failed cells"
-                            )
+                            stop_reason = f"{budget_ran_out()} re-probing previously failed cells"
                             break
                         retry_pos += 1
                         retry_bar.update(1)
@@ -2787,20 +2837,19 @@ async def _fetch_city_images(
                         if over_budget():
                             unvisited(roots[index:])
                             logger.warning(
-                                f"Stopped after {api_requests} requests (max_requests="
-                                f"{max_requests}); {len(roots) - index} of {len(roots)} cells "
-                                f"never visited"
+                                f"Stopped after {api_requests} requests ({budget_ran_out()}); "
+                                f"{len(roots) - index} of {len(roots)} cells never visited"
                             )
-                            stop_reason = f"the {max_requests}-request budget ran out"
+                            stop_reason = budget_ran_out()
                             break
                         if not await _sweep_subtree(root):
                             unvisited(roots[index + 1 :])
                             logger.warning(
-                                f"Stopped mid-cell after {api_requests} requests (max_requests="
-                                f"{max_requests}); {len(roots) - index - 1} of {len(roots)} root "
-                                f"cells never visited"
+                                f"Stopped mid-cell after {api_requests} requests "
+                                f"({budget_ran_out()}); {len(roots) - index - 1} of "
+                                f"{len(roots)} root cells never visited"
                             )
-                            stop_reason = f"the {max_requests}-request budget ran out mid-cell"
+                            stop_reason = f"{budget_ran_out()} mid-cell"
                             if cp is None:
                                 # Uncheckpointed, this root is counted the way it
                                 # always was; the rewind below is what replaces it.
@@ -2944,6 +2993,7 @@ async def _fetch_city_images(
                 # vocabulary of the crawl that produced it rather than in
                 # whichever provider happened to raise this first (#318).
                 unit_name=SWEEP_UNIT_ROOT_CELLS,
+                stopped_by=budget_stop,
             )
         )
 
