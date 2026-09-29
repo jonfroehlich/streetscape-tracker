@@ -29,6 +29,17 @@ already gone wrong once:
   The v8-to-current ladder test gains a v13 assertion for the reason it exists: a rung that never fires is silent.
 - The v13→v14 migration (`census_fetched_by`/`census_fetched_at` on `runs` and `street_walks`, issue #290): the pair arrives NULL on existing rows, `register_run` round-trips it, and it defaults to NULL rather than to the collecting channel — provenance is recorded, never inferred.
   The load-bearing pin is `test_run_row_carries_every_runs_column`: `_row_to_run` builds `RunRow(**dict(row))` from a `SELECT *`, so a column without a matching dataclass field is a `TypeError` on every `get_latest_run` against a migrated catalog, not a missing feature.
+- The GSV query radius (issue #367), whose rule lives in `analysis.apply_query_radius`.
+  `tests/test_coverage.py::TestQueryRadius` pins the seam on a frame with panos at 10, 49, 51 m and 3,000 km: coverage is 2 of 5, the two far points are `num_points_out_of_radius` and NOT `num_points_with_errors`, the unique-pano count excludes them, and `calculate_run_stats` puts them in `status_out_of_radius` rather than `status_other` with `query_radius_m` 50.0 (null for Mapillary).
+  The boundary is pinned by a pano whose float distance is EXACTLY 50.0 m, found at test time with `nextafter` rather than hard-coded, because a 49/51 pair cannot tell `>` from `>=`.
+  Beside it: a NaN pano coordinate never reclassifies (unknown is not far), a far NO_DATE pano is reclassified like an OK one, the seam is idempotent (the distance is computed for every row with coordinates, not only present ones), a census frame comes back as the same object, `out_of_radius_count` agrees on a raw and a loaded frame, and the distance stats are great-circle (1 degree of longitude at 60 N is ~55.6 km, not 111), which also moved `tests/test_stats.py`'s single-pano distance from the planar 15.70 m to 13.70 m.
+  `test_the_js_query_radius_agrees_with_python` reads `GSV_QUERY_RADIUS_M` and `EARTH_RADIUS_M` out of `streetscape-utils.js` and compares them to the Python constants.
+- The loader as the query-radius seam (`tests/test_fileutils.py`): a gsv run's far pano loads as `OUT_OF_RADIUS` by default and as the provider's own `OK` under `raw=True`, with no derived column; a Mapillary-named file with the same far pano is untouched, which pins that the gate reads the file's own provider token.
+  `tests/test_archival_import.py`'s round-trip column check reads `raw=True`, since it pins what is on disk.
+- A diff across the seam (`tests/test_diff.py`): the same far pano in both runs is no churn, and a point that held only a far pano before and a near one now GAINS coverage, which it would not if the far pano had counted on the old side.
+- The v15→v16 migration (issue #367): `status_out_of_radius` and `query_radius_m` arrive NULL on an existing row whose other stats survive, reconnecting is idempotent, a catalog holding only one of the two columns (an interrupted migration, or this step reached under a renumbered version) completes rather than failing on the existing column, and `register_run` round-trips the pair.
+- The per-run summary's `coverage.query_radius_m` is null and `num_points_out_of_radius` 0 for a Mapillary run (`tests/test_json_v2.py`), so the summary never claims a tolerance nothing enforced.
+- `scripts/recompute_run_stats.py` as the query-radius repair handle (`tests/test_recompute_run_stats.py`): a run cataloged with a 1.1 km pano as coverage moves from 50% to 25%, gains `status_out_of_radius` 1 and `query_radius_m` 50.0 with `status_other` still 0, its oldest date drops the far pano's, the report line and summary name the reclassified count, `--regenerate-json` rebuilds its JSON with the new coverage block, the CSV stays as written, and a second pass changes nothing.
 - An end-to-end migration test with synthetic fixtures
 - The one snapshot clock (`tests/test_clock.py`, issue #347): under a pinned America/Los_Angeles zone and a frozen 17:30-PDT instant, `clock.snapshot_date_today()` is the UTC date and not the local one; `db.utc_now_iso` reads the same seam;
   and a grep refuses `date.today()`, `datetime.today()` and a naive `datetime.now()` on the collection path (`checkpointing`, `cli`, `scheduler`, the walk collector, the prefreeze script).
@@ -82,6 +93,7 @@ Incidental coverage of a deprecated spelling trains readers to ignore the notice
 - GSV batch downloader's quota-throttling behavior (OVER_QUERY_LIMIT retry, sub-threshold residual written back as a failure row, over-threshold abort
   — the `fetch_gsv_pano_metadata_async` primitive is monkeypatched to serve responses from memory)
 - Tainted-run purge tool
+- The query radius on the collector's side (`tests/test_download_gsv_batch.py`, issue #367): with one of nine points answered by a pano ~1.1 km away, the frame the downloader returns holds one `OUT_OF_RADIUS` row, while the file it wrote still says `OK` everywhere. That returned frame feeds the new run's stats, diff and JSON, so a reload that skipped the seam would make a far pano churn on one side of every diff.
 
 ## Scheduler
 
@@ -681,6 +693,12 @@ Every property is a way the study could publish a confident wrong number:
 
 Frontend node tests cover the streetwalk render seam (manifest lookup + fetch-failure fallback, artifact-URL selection, key normalization, the fractional ramp, and initial view mode) by stubbing Leaflet and the panel's DOM, and `panoDateOrNull`'s reduced-precision shapes (issue #226), asserted on the LOCAL getters rather than `toISOString()`
 — a UTC-built date and a local-built one agree on the ISO string in exactly the timezone that hides the bug, so an ISO comparison passes everywhere and protects nowhere.
+
+### The GSV query radius (issue #367)
+
+`haversineMeters` is great-circle (1 degree of longitude at 60 N is ~55.6 km) and returns NaN, never 0, for a missing coordinate.
+`isWithinQueryRadius` keeps a GSV pano at 49 m, drops one at 51 m and #367's Anchorage-to-Kerala pano, defaults an unset provider to gsv (as `isPlausibleCaptureDate` does), and never filters a census provider or a row whose distance cannot be measured.
+The constants' agreement with Python is pinned from the Python side (`test_the_js_query_radius_agrees_with_python`).
 
 ### Provider viewer links and the KartaView fallback (issue #312)
 

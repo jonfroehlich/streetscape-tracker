@@ -44,6 +44,14 @@ That is why the detection path is differential (keyed bytes vs keyless bytes) ra
 
 Issue #106 — why production stays on the 20 m grid; below ~10 m you buy redundancy, not information, since official panos sit ~10 m apart.
 
+### `gsv-query-radius.md`
+
+Issue #367 — how far from its grid point the pano Google returns actually is, measured over 60 archived GSV files with no API calls.
+**The metadata `radius` is a hint, not a bound**: 10.4% of rows with a pano sat more than 50 m away, 0.04% more than 1 km, and a few on other continents or at Null Island.
+It is not even monotone (in Teaneck a smaller radius returned a farther pano).
+The transferable lesson is the one READ THIS FIRST states for pacing, arriving for a request parameter: a documented parameter describes what you ask for, not what comes back, so check the answer against it.
+The one writeup with no committed metrics JSON, because the sampling script lived in the issue.
+
 ### `kartaview-feasibility.md`
 
 Issue #225 — whether KartaView can be a third provider; it can, as a **census** like Mapillary rather than a GSV-style sample, since its only bulk path is a paginated radius sweep.
