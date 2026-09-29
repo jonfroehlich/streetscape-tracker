@@ -20,7 +20,7 @@ import hashlib
 import logging
 import os
 import sqlite3
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import date
 from typing import Any
@@ -2068,23 +2068,37 @@ def get_channel_membership(conn: sqlite3.Connection, city_id: str, provider: str
     return None if row is None else row["member"]
 
 
-def city_has_collection_history(conn: sqlite3.Connection, city_id: str) -> bool:
-    """Has anything ever been collected for, or attempted against, this city?
+def city_touched_opt_in_channels(
+    conn: sqlite3.Connection,
+    city_id: str,
+    channels: Sequence[str],
+    providers: Sequence[str],
+) -> bool:
+    """Has this city ever been collected on, or attempted on, an opt-in channel?
 
-    True on any ``runs`` row, any ``street_walks`` row, or any
-    ``schedule_state`` row with a ``last_attempt_at``. It is what lets
-    ``assess-city`` treat a city it registered under ``--estimate`` as still NEW
-    on the follow-up run (issue #374): registration alone leaves all three
-    empty, while a city the nightly batch has reached, or that was assessed
-    before, has at least one.
+    True on any ``schedule_state.last_attempt_at`` on one of ``channels``, any
+    ``runs`` row, or any ``street_walks`` row whose provider is one of
+    ``providers`` (the imagery providers behind those channels). It is how
+    ``assess-city`` decides a city is still eligible for #374's automatic
+    opt-in enrolment, and it is keyed on the OPT-IN channels on purpose: a
+    city registered by ``--estimate`` is enabled, so the nightly batch can
+    attempt it on gsv before the follow-up ``--yes`` run, and a history signal
+    that counted that attempt would silently skip the enrolment the documented
+    order exists to produce. Explicit memberships are not read here: they are
+    per pair, and ``enroll_opt_in_channels`` leaves them alone as ``already_set``.
     """
+    ch = list(channels)
+    pv = list(providers)
+    ch_marks = ",".join("?" * len(ch)) or "NULL"
+    pv_marks = ",".join("?" * len(pv)) or "NULL"
     row = conn.execute(
-        """SELECT
-             EXISTS (SELECT 1 FROM runs WHERE city_id = ?)
-             OR EXISTS (SELECT 1 FROM street_walks WHERE city_id = ?)
-             OR EXISTS (SELECT 1 FROM schedule_state
-                        WHERE city_id = ? AND last_attempt_at IS NOT NULL)""",
-        (city_id, city_id, city_id),
+        f"""SELECT
+             EXISTS (SELECT 1 FROM schedule_state WHERE city_id = ?
+                     AND provider IN ({ch_marks}) AND last_attempt_at IS NOT NULL)
+             OR EXISTS (SELECT 1 FROM runs WHERE city_id = ? AND provider IN ({pv_marks}))
+             OR EXISTS (SELECT 1 FROM street_walks
+                        WHERE city_id = ? AND provider IN ({pv_marks}))""",
+        (city_id, *ch, city_id, *pv, city_id, *pv),
     ).fetchone()
     return bool(row[0])
 
@@ -2150,6 +2164,32 @@ def set_channel_membership_bulk(
     conn.executemany(_MEMBERSHIP_UPSERT, rows)
     conn.commit()
     return len(rows)
+
+
+def set_channel_membership_pairs(
+    conn: sqlite3.Connection,
+    rows: Iterable[tuple[str, str]],
+    member: bool | None,
+    *,
+    cycle_days: int,
+) -> int:
+    """Set membership for several (city_id, provider) pairs in ONE transaction.
+
+    The same upsert and ``day_of_cycle`` convention as
+    :func:`set_channel_membership_bulk`, across providers rather than cities —
+    which is what a provider's grid-and-walk pair needs (issue #374): a commit
+    per channel lets a crash between the two leave half a pair, and a pair with
+    one explicit half is then left alone forever. All or nothing: any failure
+    rolls the whole set back. Returns how many rows.
+    """
+    value = None if member is None else (1 if member else 0)
+    params = [
+        (city_id, provider, compute_day_of_cycle(city_id, cycle_days), value, value)
+        for city_id, provider in rows
+    ]
+    with conn:
+        conn.executemany(_MEMBERSHIP_UPSERT, params)
+    return len(params)
 
 
 def count_channel_members(conn: sqlite3.Connection, provider: str, default_membership: bool) -> int:

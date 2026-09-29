@@ -4038,10 +4038,27 @@ class OptInEnrollmentReport:
 
 
 def _kartaview_enrolment_gate(
-    cfg: SchedulerConfig, conn, city: db.CityRow, *, over_threshold_ok: bool, dry_run: bool
+    cfg: SchedulerConfig,
+    conn,
+    city: db.CityRow,
+    *,
+    over_threshold_ok: bool,
+    dry_run: bool,
+    today: date,
+    kartaview_prior_requests: int | None,
 ) -> tuple[str, int | None, str]:
-    """(decision, estimate, reason) for the KartaView pair. Free: no request."""
+    """(decision, estimate, reason) for the KartaView pair. Free: no request.
+
+    ``kartaview_prior_requests`` is a KartaView sweep's observed spend that is
+    not in the catalog YET — ``import-bundle``'s preview, whose bundle carries a
+    KartaView run the executed import will land before pricing. Folded in the
+    way :func:`estimate_kartaview_requests` folds a cataloged prior (the larger
+    of the two), so the preview and the executed import cannot disagree.
+    """
+    del dry_run, today  # the estimate is free and undated
     est = estimate_kartaview_requests(conn, city)
+    if kartaview_prior_requests is not None and kartaview_prior_requests > 0:
+        est = max(est, kartaview_prior_requests)
     ceiling = OPT_IN_KARTAVIEW_ENROLL_MAX_REQUESTS
     if est <= ceiling:
         return "enrolled", est, f"~{est:,} estimated requests <= {ceiling:,} (a floor, #248)"
@@ -4059,15 +4076,26 @@ def _kartaview_enrolment_gate(
     )
 
 
-def _screen_one_city(cfg: SchedulerConfig, conn, city: db.CityRow) -> tuple[int | None, str]:
+def _screen_one_city(
+    cfg: SchedulerConfig, conn, city: db.CityRow, today: date
+) -> tuple[int | None, str]:
     """A ONE-CITY Panoramax screen: ``(upper bound, reason)``, or ``(None, why it failed)``.
 
     The weekly screen's own instrument and code path (``panoramax_screen.
     screen_targets``, the v2 grid layer at z6, under the Panoramax host lock),
     over a single target, so a city enabled mid-week is not left without an
-    answer until Monday's timer. It writes the SAME ``provider_screen`` row the
-    weekly screen would for this city and date, so the weekly series simply
-    continues, and charges its requests to the same ledger row.
+    answer until Monday's timer. Its requests are charged to the day's ledger
+    row (``today``, the caller's UTC run date) whether or not the screen reads.
+
+    **It writes NO ``provider_screen`` row, deliberately.** That table is a
+    series of WHOLE-CATALOG observations: ``db.get_provider_screen_series``
+    groups by ``screen_date`` and the published summary reports each date's
+    cities-screened and cities-positive counts plus ``latest_screen_date``. A
+    one-city row would publish a series point claiming one city was screened
+    that day and move ``latest_screen_date`` — exactly what
+    ``cmd_screen_provider`` refuses a partial screen for. The decision is taken
+    from the in-memory result; the weekly screen records this city on its next
+    pass.
 
     Two of the weekly screen's guards do not transfer, and both are left in the
     SAFE direction:
@@ -4087,12 +4115,22 @@ def _screen_one_city(cfg: SchedulerConfig, conn, city: db.CityRow) -> tuple[int 
     """
     provider = "panoramax"
     rate, jitter = _screen_pacing(cfg, provider)
-    today = clock.snapshot_date_today()
     target = panoramax_screen.target_from_city(city)
+    sent: int | None = None  # known once the screen returns, even if reading it fails
     try:
         result = panoramax_screen.screen_targets(
             [target], max_requests_per_minute=rate, jitter=jitter
         )
+        sent = int(result["api_requests"])
+        row = result["rows"][0]
+        upper = int(row["pictures_upper_bound"])
+        detail = (
+            f"one-city screen {today.isoformat()}: upper bound {upper:,} pictures over "
+            f"{int(row['cells']):,} cell(s), {sent} request(s)"
+        )
+        # Last, so every failure above reaches an except arm with nothing yet
+        # charged, and the arm charges what was sent.
+        _record_screen_spend(conn, provider, today, sent)
     except HostBusyError as e:
         _record_screen_spend(conn, provider, today, getattr(e, "api_requests", 0))
         return None, f"host lock busy, not retried: {e}"
@@ -4107,23 +4145,32 @@ def _screen_one_city(cfg: SchedulerConfig, conn, city: db.CityRow) -> tuple[int 
         # assessment, an import), so an unforeseen failure must not cost that
         # job — and "unknown" enrols nobody, which is the safe reading.
         logger.exception(f"{city.city_id}: one-city Panoramax screen failed unexpectedly")
+        # Charged where the count is known: from the result when the screen
+        # returned and reading it failed, else as the screen stamped it on its
+        # own error. Suppressed, so a failing ledger cannot raise twice.
+        spent = sent if sent is not None else int(getattr(e, "api_requests", 0) or 0)
+        with contextlib.suppress(Exception):
+            _record_screen_spend(conn, provider, today, spent)
         return None, f"screen failed unexpectedly ({type(e).__name__}: {e})"
-    _record_screen_spend(conn, provider, today, result["api_requests"])
-    row = result["rows"][0]
-    db.record_provider_screen(conn, provider=provider, screen_date=today, rows=[row])
-    return (
-        int(row["pictures_upper_bound"]),
-        f"one-city screen {today.isoformat()}: upper bound "
-        f"{int(row['pictures_upper_bound']):,} pictures over {row['cells']:,} cell(s), "
-        f"{result['api_requests']} request(s)",
-    )
+    return upper, detail
 
 
 def _panoramax_enrolment_gate(
-    cfg: SchedulerConfig, conn, city: db.CityRow, *, over_threshold_ok: bool, dry_run: bool
+    cfg: SchedulerConfig,
+    conn,
+    city: db.CityRow,
+    *,
+    over_threshold_ok: bool,
+    dry_run: bool,
+    today: date,
+    kartaview_prior_requests: int | None,
 ) -> tuple[str, int | None, str]:
-    """(decision, upper bound, reason) for the Panoramax pair: a nonzero screen, or nobody."""
-    del over_threshold_ok  # KartaView's flag; Panoramax is gated on a measurement
+    """(decision, upper bound, reason) for the Panoramax pair: a nonzero screen, or nobody.
+
+    ``screen_failed`` is terminal for THIS call — nothing re-runs the gate — so
+    its reason names the remedy rather than leaving the operator to find it.
+    """
+    del over_threshold_ok, kartaview_prior_requests  # KartaView's; this is a measurement
     if dry_run:
         try:
             tiles, _ = panoramax_screen.plan_screen([panoramax_screen.target_from_city(city)])
@@ -4135,12 +4182,29 @@ def _panoramax_enrolment_gate(
             f"decided by a one-city screen ({len(tiles)} z{panoramax_screen.SCREEN_ZOOM} "
             f"tile(s)) when this runs for real; enrolled only on a nonzero upper bound",
         )
-    upper, why = _screen_one_city(cfg, conn, city)
+    upper, why = _screen_one_city(cfg, conn, city, today)
     if upper is None:
-        return "screen_failed", None, f"not enrolled — {why}"
+        return (
+            "screen_failed",
+            None,
+            f"not enrolled — {why}. Remedy: re-check after Monday's `screen-provider "
+            f"panoramax`, then `enroll-city {city.city_id} --channel panoramax` and "
+            f"`enroll-city {city.city_id} --channel panoramax_streets` if it is positive",
+        )
     if upper > 0:
         return "enrolled", upper, why
     return "skipped", upper, f"not enrolled — {why} (a screened zero is conclusive, #316)"
+
+
+def _opt_in_channels_touched(conn, city_id: str) -> bool:
+    """Any attempt, run or walk on an opt-in channel for this city? (issue #374)."""
+    pairs = opt_in_pairs()
+    return db.city_touched_opt_in_channels(
+        conn,
+        city_id,
+        channels=[c for pair in pairs.values() for c in pair],
+        providers=sorted({STREET_CHANNELS.get(c, c) for p in pairs.values() for c in p}),
+    )
 
 
 # One gate per opt-in provider. A provider in opt_in_pairs() with no entry here
@@ -4159,6 +4223,8 @@ def enroll_opt_in_channels(
     *,
     enroll_kartaview_over_threshold: bool,
     dry_run: bool,
+    today: date | None = None,
+    kartaview_prior_requests: int | None = None,
 ) -> OptInEnrollmentReport:
     """Enrol a newly enabled city on the opt-in channels, behind two gates (issue #374).
 
@@ -4186,8 +4252,15 @@ def enroll_opt_in_channels(
 
     ``dry_run`` writes nothing and issues no provider request: the KartaView
     decision is exact (it is free), the Panoramax one is ``pending_screen``.
-    Membership is written through ``db.set_channel_membership``, the writer
-    ``enroll-city`` uses, never a second SQL statement.
+    Membership is written through ``db.set_channel_membership_pairs``, which
+    shares ``enroll-city``'s one upsert and writes a pair's two rows in ONE
+    transaction: two commits could leave half a pair, which ``already_set``
+    would then freeze forever.
+
+    ``today`` dates the screen's ledger charge (the caller's UTC run date;
+    default ``clock.snapshot_date_today()``). ``kartaview_prior_requests`` is an
+    observed KartaView spend not yet in the catalog (``import-bundle``'s
+    preview); see :func:`_kartaview_enrolment_gate`.
 
     Example::
 
@@ -4196,6 +4269,8 @@ def enroll_opt_in_channels(
         )
         print(report.render())
     """
+    if today is None:
+        today = clock.snapshot_date_today()
     report = OptInEnrollmentReport(city_id=city.city_id, dry_run=dry_run)
     for provider, pair in opt_in_pairs().items():
         gate = _OPT_IN_GATES[provider]
@@ -4213,6 +4288,8 @@ def enroll_opt_in_channels(
             city,
             over_threshold_ok=enroll_kartaview_over_threshold,
             dry_run=dry_run,
+            today=today,
+            kartaview_prior_requests=kartaview_prior_requests,
         )
         for channel in pair:
             report.decisions.append(OptInDecision(channel, decision, number, reason))
@@ -4223,10 +4300,9 @@ def enroll_opt_in_channels(
             if note is not None:
                 report.notes.append(note)
         if not dry_run:
-            for channel in pair:
-                db.set_channel_membership(
-                    conn, city.city_id, channel, True, cycle_days=cfg.cycle_days
-                )
+            db.set_channel_membership_pairs(
+                conn, [(city.city_id, c) for c in pair], True, cycle_days=cfg.cycle_days
+            )
     return report
 
 
@@ -5116,6 +5192,20 @@ def _import_cadence_channel(
     return channel, label
 
 
+def _bundle_kartaview_prior(bundle) -> int | None:
+    """The spend of a bundle's newest KartaView run with any, or None (issue #374).
+
+    The same selection as :func:`_prior_kartaview_spend` (newest ``run_date``,
+    ``api_requests > 0``), applied to rows not yet in the catalog.
+    """
+    spent = [
+        (run.row["run_date"], int(run.row["api_requests"]))
+        for run in bundle.runs
+        if run.provider == "kartaview" and (run.row.get("api_requests") or 0) > 0
+    ]
+    return max(spent)[1] if spent else None
+
+
 def cmd_import_bundle(
     cfg: SchedulerConfig,
     bundle_path: str,
@@ -5259,6 +5349,10 @@ def cmd_import_bundle(
                 preview_city,
                 enroll_kartaview_over_threshold=enroll_kartaview,
                 dry_run=True,
+                # The executed import prices AFTER the bundle's runs land, so
+                # its KartaView run's spend is the cataloged prior there;
+                # handed in here, the preview reaches the same decision.
+                kartaview_prior_requests=_bundle_kartaview_prior(bundle),
             ).render()
         )
 
@@ -5723,13 +5817,17 @@ def cmd_assess_city(
     Register a city if new, walk its streets on both providers, publish, and
     print the numbers a deployment inquiry actually turns on (issue #215).
 
-    A NEW city is also enrolled on the opt-in channels through
-    :func:`enroll_opt_in_channels` (issue #374), so its first nightly run
-    collects every provider on one UTC date. "New" is newly registered, or
-    registered by an earlier ``--estimate`` and never collected since
-    (``db.city_has_collection_history``); a re-assessment of a city with
-    history never touches membership. The pre-flight prints the decisions as a
-    dry run; they are written only once the collection is confirmed.
+    A city never touched on an opt-in channel is also enrolled on them through
+    :func:`enroll_opt_in_channels` (issue #374), so its next nightly run
+    collects every provider on one UTC date. "Never touched" is keyed on the
+    OPT-IN channels themselves (:func:`_opt_in_channels_touched`), not on the
+    city's history elsewhere: a city ``--estimate`` registered is enabled, and
+    a night can attempt it on gsv before the follow-up ``--yes`` run. So a
+    long-tracked city that was never on an opt-in channel is enrolled too,
+    behind the same gates; one with any opt-in attempt, run or walk is left
+    alone, and an explicit membership survives per pair as ``already_set``.
+    The pre-flight prints the decisions as a dry run; they are written only
+    once the collection is confirmed.
     ``opt_in=False`` (``--no-opt-in``) skips all of it, and
     ``enroll_kartaview`` (``--enroll-kartaview``) accepts a KartaView estimate
     over :data:`OPT_IN_KARTAVIEW_ENROLL_MAX_REQUESTS` — ``--yes`` never does.
@@ -5823,13 +5921,11 @@ def cmd_assess_city(
     print(_assess_preflight_report(cfg, conn, city, today, channels))
 
     # Issue #374. Decided HERE, before anything is spent, and printed as a dry
-    # run; written only after the confirmation below. "New" has to include a
-    # city an earlier --estimate registered (the documented order is estimate,
-    # then collect), or the follow-up run would read as a re-assessment and
-    # the city would silently never be enrolled.
-    enrol_new_city = opt_in and (
-        newly_registered or not db.city_has_collection_history(conn, city.city_id)
-    )
+    # run; written only after the confirmation below. Keyed on the opt-in
+    # channels alone: an --estimate-registered city is enabled, so a night can
+    # attempt it on gsv before this run, and counting THAT as history would
+    # skip the enrolment the documented estimate-then-collect order is for.
+    enrol_new_city = opt_in and not _opt_in_channels_touched(conn, city.city_id)
     if enrol_new_city:
         print(
             enroll_opt_in_channels(
@@ -5838,14 +5934,15 @@ def cmd_assess_city(
                 city,
                 enroll_kartaview_over_threshold=enroll_kartaview,
                 dry_run=True,
+                today=today,
             ).render()
         )
     elif not opt_in:
         print("  opt-in enrolment skipped (--no-opt-in); membership is unchanged.")
     else:
         print(
-            "  opt-in enrolment unchanged: this city has collection history, so a "
-            "re-assessment leaves its membership alone (set it with enroll-city)."
+            "  opt-in enrolment unchanged: this city has been attempted or collected on "
+            "an opt-in channel, so its membership is left alone (set it with enroll-city)."
         )
 
     if estimate_only:
@@ -5870,7 +5967,12 @@ def cmd_assess_city(
     enrolled_opt_in: list[str] = []
     if enrol_new_city:
         report = enroll_opt_in_channels(
-            cfg, conn, city, enroll_kartaview_over_threshold=enroll_kartaview, dry_run=False
+            cfg,
+            conn,
+            city,
+            enroll_kartaview_over_threshold=enroll_kartaview,
+            dry_run=False,
+            today=today,
         )
         print(report.render())
         enrolled_opt_in = report.enrolled

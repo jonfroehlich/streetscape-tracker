@@ -4648,6 +4648,63 @@ def test_enable_city_no_opt_in_enables_without_enrolling(conn, monkeypatch, tmp_
     assert calls == []
 
 
+def test_enable_city_enrols_before_it_enables(conn, monkeypatch, tmp_path):
+    """
+    The same ordering rule as a pre-set exclusion: the moment the city is
+    enabled the 02:00 timer can reach it, so its opt-in pairs must already be set.
+    """
+    cid, cfg, _calls = _enable_setup(conn, monkeypatch, tmp_path)
+    seen = []
+    real_enable = db.set_city_enabled
+
+    def spy(c, city_id, enabled):
+        seen.append({ch: db.get_channel_membership(c, city_id, ch) for ch in _OPT_IN})
+        real_enable(c, city_id, enabled)
+
+    monkeypatch.setattr(_sched.db, "set_city_enabled", spy)
+
+    assert _sched.cmd_enable_city(cfg, cid) == 0
+    # Exactly one flip, and at that instant every pair is already set.
+    assert seen == [dict.fromkeys(_OPT_IN, 1)]
+
+
+def test_enable_city_assigns_the_default_channels_a_schedule_row(conn, monkeypatch, tmp_path):
+    """`assign_schedule` runs, as after import-bundle, so `status` shows the city's stagger."""
+    cid, cfg, _calls = _enable_setup(conn, monkeypatch, tmp_path)
+
+    assert _sched.cmd_enable_city(cfg, cid) == 0
+
+    rows = {
+        r["provider"]
+        for r in conn.execute("SELECT provider FROM schedule_state WHERE city_id = ?", (cid,))
+    }
+    assert "gsv" in rows
+
+
+def _main_with(monkeypatch, argv, target):
+    monkeypatch.setattr(_sched.sys, "argv", ["scheduler", *argv])
+    monkeypatch.setattr(_sched, "load_scheduler_config", lambda path: _publishing_cfg())
+    monkeypatch.setattr(_sched, "setup_logging", lambda cfg, verbose=False: None)
+    seen = {}
+    monkeypatch.setattr(_sched, target, lambda cfg, *a, **kw: seen.update(kw) or 0)
+    assert _sched.main() == 0
+    return seen
+
+
+def test_main_forwards_enroll_kartaview_to_import_bundle(monkeypatch):
+    seen = _main_with(
+        monkeypatch, ["import-bundle", "d", "--enable", "--enroll-kartaview"], "cmd_import_bundle"
+    )
+    assert seen["enroll_kartaview"] is True
+    assert seen["opt_in"] is True
+
+
+def test_main_forwards_no_opt_in_to_assess_city(monkeypatch):
+    seen = _main_with(monkeypatch, ["assess-city", "Bend, OR", "--no-opt-in"], "cmd_assess_city")
+    assert seen["opt_in"] is False
+    assert seen["enroll_kartaview"] is False
+
+
 def test_enable_city_is_wired_into_the_parser():
     args = _sched.build_parser().parse_args(
         ["enable-city", "Bend", "--dry-run", "--no-opt-in", "--enroll-kartaview"]

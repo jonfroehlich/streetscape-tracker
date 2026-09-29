@@ -1385,17 +1385,17 @@ def _newport(conn):
     return db.resolve_city(conn, db.register_city(conn, **_CITY_ROW))
 
 
-def _enrol(cfg, conn, city, *, over=False, dry_run=False):
+def _enrol(cfg, conn, city, *, over=False, dry_run=False, today=TODAY):
     return _sched.enroll_opt_in_channels(
-        cfg, conn, city, enroll_kartaview_over_threshold=over, dry_run=dry_run
+        cfg, conn, city, enroll_kartaview_over_threshold=over, dry_run=dry_run, today=today
     )
 
 
 def test_a_new_city_ends_enrolled_on_all_four_opt_in_channels(conn, monkeypatch, tmp_path, capsys):
     """
     The #374 happy path: a positive screen and a KartaView estimate under the
-    ceiling (Newport's is 16, the #225 median) enrol all four, and the screen
-    lands the same provider_screen row the weekly screen would write.
+    ceiling (Newport's is 16, the #225 median) enrol all four, and the screen's
+    tiles are charged to the ledger on the ASSESSMENT's run date.
     """
     _stub_collection(monkeypatch, conn)
     calls = _screen(monkeypatch, 42)
@@ -1405,17 +1405,10 @@ def test_a_new_city_ends_enrolled_on_all_four_opt_in_channels(conn, monkeypatch,
     members = _members(conn)
     assert {c: members.get(c) for c in OPT_IN} == dict.fromkeys(OPT_IN, 1)
     # Newport's grown bbox straddles the z6 seam at -84.375°, so two tiles —
-    # and both are charged to the day's ledger, as the weekly screen charges.
+    # both charged, and on `today` (the command's pinned date, never the wall
+    # clock), since that is the date the rest of this run's spend lands on.
     assert len(calls) == 2
-    from streetscape_metadata_tracker import clock
-
-    assert db.get_api_usage(conn, clock.snapshot_date_today(), "panoramax") == 2
-    (row,) = conn.execute(
-        "SELECT pictures_upper_bound FROM provider_screen WHERE provider = 'panoramax' "
-        "AND city_id = ?",
-        (CITY_ID,),
-    ).fetchall()
-    assert row["pictures_upper_bound"] == 42
+    assert db.get_api_usage(conn, TODAY, "panoramax") == 2
     out = capsys.readouterr().out
     assert "arrive with this city's first nightly run" in out
 
@@ -1477,6 +1470,13 @@ def test_a_failed_screen_enrols_neither_and_says_screen_failed(
     assert report.decision("panoramax_streets").decision == "screen_failed"
     assert conn.execute("SELECT COUNT(*) FROM provider_screen").fetchone()[0] == 0
     assert "screen_failed" in report.render()
+    # A failure is terminal for this call, so the line names its remedy.
+    reason = report.decision("panoramax").reason
+    assert f"enroll-city {CITY_ID} --channel panoramax`" in reason
+    assert f"enroll-city {CITY_ID} --channel panoramax_streets`" in reason
+    # The request that got the refusal (or the fault) was SENT, so it is charged:
+    # a ledger that forgot refused attempts lets the next process walk back in.
+    assert db.get_api_usage(conn, TODAY, "panoramax") == 1
 
 
 def test_a_busy_panoramax_lock_is_reported_and_not_retried(conn, tmp_path, monkeypatch):
@@ -1553,21 +1553,163 @@ def test_no_opt_in_writes_no_opt_in_row_and_screens_nothing(conn, monkeypatch, t
     assert conn.execute("SELECT COUNT(*) FROM provider_screen").fetchone()[0] == 0
 
 
-def test_re_assessing_a_collected_city_changes_no_membership(conn, monkeypatch, tmp_path):
+def test_re_assessing_a_city_with_only_default_channel_history_keeps_an_explicit_pair(
+    conn, monkeypatch, tmp_path
+):
     """
-    An operator's `--remove` must survive a re-assessment, and so must every
-    unset pair: a city with collection history is not new, whatever it lacks.
+    Since round 1 of the #374 review "new" is keyed on the OPT-IN channels: a
+    city with gsv history but no opt-in attempt, run or walk IS enrolled —
+    behind the same gates — while an operator's explicit `--remove` on one pair
+    survives as `already_set`, pair-wise.
     """
     _stub_collection(monkeypatch, conn)
-    _assess(tmp_path, opt_in=False)  # history: three channels collected
+    _assess(tmp_path, opt_in=False)  # default-channel history only
+    db.record_attempt(conn, CITY_ID, success=True, provider="gsv")
     db.set_channel_membership(conn, CITY_ID, "panoramax", False, cycle_days=90)
-    before = _members(conn)
+    _screen(monkeypatch, 42)
+
+    _assess(tmp_path)
+
+    members = _members(conn)
+    assert (members["panoramax"], members.get("panoramax_streets")) == (0, None)
+    assert (members["kartaview"], members["kartaview_streets"]) == (1, 1)
+
+
+def _opt_in_touch_attempt(conn):
+    db.record_attempt(conn, CITY_ID, success=False, provider="kartaview", error="boom")
+
+
+def _opt_in_touch_run(conn):
+    db.register_run(
+        conn,
+        city_id=CITY_ID,
+        run_date=TODAY,
+        csv_filename=f"{CITY_ID}_kartaview_{TODAY}.csv.gz",
+        provider="kartaview",
+    )
+
+
+def _opt_in_touch_walk(conn):
+    _register_walk(conn, "panoramax")
+
+
+@pytest.mark.parametrize(
+    "touch",
+    [_opt_in_touch_attempt, _opt_in_touch_run, _opt_in_touch_walk],
+    ids=["opt_in_attempt", "opt_in_run", "opt_in_walk"],
+)
+def test_a_city_touched_on_any_opt_in_channel_is_not_re_enrolled(
+    conn, monkeypatch, tmp_path, touch
+):
+    """Each of the three opt-in history signals, on its own, is enough to leave the city alone."""
+    _stub_collection(monkeypatch, conn)
+    _assess(tmp_path, opt_in=False)
+    touch(conn)
+    before = {c: _members(conn).get(c) for c in OPT_IN}
     calls = _screen(monkeypatch, 42)
 
     _assess(tmp_path)
 
-    assert _members(conn) == before
+    assert {c: _members(conn).get(c) for c in OPT_IN} == before
     assert calls == []
+
+
+def test_a_nightly_gsv_attempt_between_estimate_and_yes_still_enrols(conn, monkeypatch, tmp_path):
+    """
+    The gap round 1 of the review found: `--estimate` registers the city
+    ENABLED, a never-collected city leads gsv's queue, and a 02:00 run between
+    the two commands stamps `last_attempt_at`. An any-channel history gate then
+    read the `--yes` run as a re-assessment — the Montréal/Ottawa failure,
+    through the documented order.
+    """
+    _stub_collection(monkeypatch, conn)
+    _screen(monkeypatch, 42)
+
+    _assess(tmp_path, estimate_only=True)
+    db.record_attempt(conn, CITY_ID, success=True, provider="gsv")
+    _assess(tmp_path)
+
+    members = _members(conn)
+    assert {c: members.get(c) for c in OPT_IN} == dict.fromkeys(OPT_IN, 1)
+
+
+def test_declining_the_confirmation_writes_no_membership_and_screens_nothing(
+    conn, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(_sched.db, "connect", lambda path: conn)
+    monkeypatch.setattr(_sched, "_run_one_city", lambda *a, **k: pytest.fail("collected!"))
+    monkeypatch.setattr(_sched.sys.stdin, "isatty", lambda: True, raising=False)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "n")
+    calls = _screen(monkeypatch, 42)
+
+    assert _sched.cmd_assess_city(_cfg(tmp_path), QUERY, today=TODAY, assume_yes=False) == 0
+
+    assert not any(c in _members(conn) for c in OPT_IN)
+    assert calls == []
+    assert db.get_api_usage(conn, TODAY, "panoramax") == 0
+
+
+def test_a_one_city_screen_publishes_no_screen_series_point(conn, tmp_path, monkeypatch):
+    """
+    `provider_screen` is a series of WHOLE-CATALOG observations, grouped by
+    date and published with `latest_screen_date`. A one-city row would publish
+    a point claiming one city was screened that day, so the enrolment decides
+    from the in-memory result and writes no row.
+    """
+    city = _newport(conn)
+    db.record_provider_screen(
+        conn,
+        provider="panoramax",
+        screen_date=date(2026, 8, 10),
+        rows=[
+            dict(
+                city_id=city.city_id,
+                cells=1,
+                pictures_upper_bound=5,
+                pictures_360_upper_bound=5,
+                pictures_flat_upper_bound=0,
+            )
+        ],
+    )
+
+    def snapshot():
+        return (
+            [tuple(r) for r in db.get_provider_screen_series(conn, "panoramax")],
+            [tuple(r) for r in db.get_latest_provider_screen(conn, "panoramax")],
+        )
+
+    before = snapshot()
+    _screen(monkeypatch, 42)
+
+    report = _enrol(_cfg(tmp_path), conn, city, today=TODAY)
+
+    assert report.decision("panoramax").decision == "enrolled"
+    assert snapshot() == before
+
+
+def test_a_pair_write_is_all_or_nothing(conn, tmp_path, monkeypatch):
+    """
+    Both halves of a pair land in ONE transaction: half a pair would read as
+    `already_set` forever after, so a failure on the second write must leave
+    neither. Injected with a trigger that aborts the walk channel's insert.
+    """
+    import sqlite3
+
+    _screen(monkeypatch, 0)  # Panoramax skipped: only the KartaView pair writes
+    city = _newport(conn)
+    conn.execute(
+        """CREATE TEMP TRIGGER abort_walk BEFORE INSERT ON schedule_state
+           WHEN NEW.provider = 'kartaview_streets'
+           BEGIN SELECT RAISE(ABORT, 'injected failure on the second write'); END"""
+    )
+
+    with pytest.raises(sqlite3.DatabaseError, match="injected"):
+        _enrol(_cfg(tmp_path), conn, city)
+
+    conn.execute("DROP TRIGGER abort_walk")
+    members = _members(conn)
+    assert members.get("kartaview") is None
+    assert members.get("kartaview_streets") is None
 
 
 def test_an_estimate_then_a_collection_still_enrols_the_new_city(conn, monkeypatch, tmp_path):

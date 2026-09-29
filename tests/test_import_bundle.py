@@ -884,3 +884,41 @@ def test_import_bundle_parses_the_opt_in_flags():
 
     args = build_parser().parse_args(["import-bundle", "d", "--enable", "--no-opt-in"])
     assert args.no_opt_in is True and args.enroll_kartaview is False
+
+
+def _relabel_grid_run_as_kartaview(bundle_dir, api_requests):
+    conn = db.connect(str(bundle_dir / bundle_import.CATALOG_NAME))
+    run_csv, run_json = _run_names(provider="kartaview")
+    old_csv, old_json = _run_names(provider="mapillary")
+    conn.execute(
+        "UPDATE runs SET provider = 'kartaview', csv_filename = ?, json_filename = ?, "
+        "api_requests = ?",
+        (run_csv, run_json, api_requests),
+    )
+    conn.commit()
+    conn.close()
+    os.rename(bundle_dir / old_csv, bundle_dir / run_csv)
+    os.rename(bundle_dir / old_json, bundle_dir / run_json)
+
+
+def test_the_preview_prices_kartaview_with_the_bundles_own_sweep_spend(
+    cfg, bundle_dir, monkeypatch, capsys
+):
+    """
+    The executed import prices AFTER the bundle's KartaView run lands, and
+    `estimate_kartaview_requests` takes the larger of geometry (115 for San Luis
+    Obispo) and that run's observed spend. A preview on geometry alone would say
+    `would enrol` for a city the import then leaves at `needs_flag`.
+    """
+    _screen(monkeypatch, 42)
+    _relabel_grid_run_as_kartaview(bundle_dir, api_requests=5_000)
+
+    assert cmd_import_bundle(cfg, str(bundle_dir), enable=True) == 0
+
+    out = capsys.readouterr().out
+    line = next(ln for ln in out.splitlines() if ln.strip().startswith("kartaview "))
+    assert "needs_flag" in line and "5,000" in line
+
+    # And the executed import agrees with its own preview.
+    assert cmd_import_bundle(cfg, str(bundle_dir), execute=True, enable=True) == 0
+    assert _opt_in_members(cfg).get("kartaview") is None
