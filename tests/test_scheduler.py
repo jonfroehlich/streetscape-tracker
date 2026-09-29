@@ -14735,3 +14735,57 @@ def test_a_deferred_first_WALK_defers_only_itself(conn, monkeypatch):
 
     assert [p for _cid, p, _t in launched] == ["mapillary"]
     assert deferred == Counter({"gsv_streets": 1})
+
+
+def test_the_retry_pass_stops_between_walks_inside_the_dead_zone(conn, monkeypatch, caplog):
+    """The PER-WALK gate, apart from the pre-start one: the pass starts with
+    most of a 1 h night left, Alpha's retried walk lands and its child uses
+    the clock down to 500 s. Beta's walk must not be asked: under the 600 s
+    fixed slack a resumable walk can only floor-skip into "deferred for
+    budget", and asking would spend the breaker's attention for nothing."""
+    from streetscape_metadata_tracker.download_common import HOST_OVERPASS
+
+    monkeypatch.setattr(_sched, "HOST_RECHECK_COOLDOWN_S", 0)
+    # Loop: Beta's launch re-checks and is refused (so it strands too); the
+    # pass: Alpha's ask re-checks and clears.
+    probe = _recovering_probe([False, True])
+    monkeypatch.setitem(_sched.HOST_RECHECKS, HOST_OVERPASS, probe)
+    alpha = _register(conn, "Alpha", width=1000, height=1000, step=20)
+    beta = _register(conn, "Beta", width=1000, height=1000, step=20)
+    _record_waits(monkeypatch)
+    now = [1_000.0]
+    monkeypatch.setattr(_sched.time, "monotonic", lambda: now[0])
+    cfg = SchedulerConfig(
+        providers={
+            "mapillary": ProviderConfig(enabled=True, daily_request_budget=40_000),
+            "mapillary_streets": ProviderConfig(enabled=True, daily_request_budget=5_000),
+        },
+        max_batch_hours=1,
+        publish_enabled=False,
+        alerts=AlertConfig(enabled=True, failure_threshold=99),
+    )
+    ran = []
+
+    def run_one(city, provider):
+        ran.append((city.city_id, provider))
+        if provider == "mapillary_streets" and city.city_id == alpha:
+            if ran.count((alpha, "mapillary_streets")) == 1:
+                return _blocked_outcome(HOST_OVERPASS)
+            now[0] = 1_000.0 + 3600 - 500  # the retried child leaves 500 s
+        return True
+
+    with caplog.at_level(logging.INFO):
+        _drive_night(monkeypatch, conn, cfg, run_one)
+
+    assert ran == [
+        (alpha, "mapillary"),
+        (alpha, "mapillary_streets"),
+        (beta, "mapillary"),
+        (alpha, "mapillary_streets"),
+    ]
+    assert len(probe.calls) == 2, "Beta's walk was never asked about in the pass"
+    done = _done_line(caplog)
+    assert "deferred for budget" not in done
+    assert "1 stranded walk(s) recovered" in done
+    assert "1 city(ies) STRANDED un-walked" in done
+    assert "during the end-of-night retry; 1 stranded walk(s) not retried" in done
