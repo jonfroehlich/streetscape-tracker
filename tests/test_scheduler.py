@@ -4576,6 +4576,91 @@ def test_enroll_all_refuses_a_city_argument(conn, monkeypatch, tmp_path):
     assert sched.db.count_channel_members(conn, "kartaview", False) == 0
 
 
+# ── enable-city (issue #374) ────────────────────────────────────────────────
+
+_OPT_IN = ("kartaview", "kartaview_streets", "panoramax", "panoramax_streets")
+
+
+def _enable_setup(conn, monkeypatch, tmp_path, *, enabled=False, upper_bound=42):
+    """A registered city, the catalog pinned to `conn`, and the screen's fetch answered."""
+    from streetscape_metadata_tracker import panoramax_screen
+    from tests.conftest import panoramax_screen_fetch
+
+    cid = _register(conn, "Bend", width=1000, height=1000, step=20)
+    if not enabled:
+        db.set_city_enabled(conn, cid, False)
+    calls = []
+    monkeypatch.setattr(
+        panoramax_screen, "_fetch_tile", panoramax_screen_fetch(upper_bound, calls=calls)
+    )
+    return cid, _enroll_cfg(tmp_path, conn, monkeypatch), calls
+
+
+def test_enable_city_enables_and_enrols_the_opt_in_channels(conn, monkeypatch, tmp_path, capsys):
+    cid, cfg, calls = _enable_setup(conn, monkeypatch, tmp_path)
+
+    assert _sched.cmd_enable_city(cfg, cid) == 0
+
+    assert db.resolve_city(conn, cid).enabled
+    assert {c: db.get_channel_membership(conn, cid, c) for c in _OPT_IN} == dict.fromkeys(
+        _OPT_IN, 1
+    )
+    assert len(calls) == 1, "the one-city screen ran"
+    assert "first nightly run" in capsys.readouterr().out
+
+
+def test_enable_city_refuses_an_unknown_city(conn, monkeypatch, tmp_path):
+    _cid, cfg, calls = _enable_setup(conn, monkeypatch, tmp_path)
+    assert _sched.cmd_enable_city(cfg, "no-such-city") == _sched.USAGE_EXIT_CODE
+    assert calls == []
+
+
+def test_enable_city_refuses_an_already_enabled_city(conn, monkeypatch, tmp_path, caplog):
+    """That path is enroll-city's; re-running the gates on it would be the backfill."""
+    cid, cfg, calls = _enable_setup(conn, monkeypatch, tmp_path, enabled=True)
+    assert _sched.cmd_enable_city(cfg, cid) == _sched.USAGE_EXIT_CODE
+    assert "enroll-city" in caplog.text
+    assert calls == []
+    assert conn.execute("SELECT COUNT(*) FROM schedule_state").fetchone()[0] == 0
+
+
+def test_enable_city_dry_run_writes_nothing(conn, monkeypatch, tmp_path, capsys):
+    cid, cfg, calls = _enable_setup(conn, monkeypatch, tmp_path)
+
+    assert _sched.cmd_enable_city(cfg, cid, dry_run=True) == 0
+
+    assert not db.resolve_city(conn, cid).enabled
+    assert conn.execute("SELECT COUNT(*) FROM schedule_state").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM provider_screen").fetchone()[0] == 0
+    assert calls == []
+    assert "WOULD ENABLE" in capsys.readouterr().out
+
+
+def test_enable_city_no_opt_in_enables_without_enrolling(conn, monkeypatch, tmp_path):
+    cid, cfg, calls = _enable_setup(conn, monkeypatch, tmp_path)
+
+    assert _sched.cmd_enable_city(cfg, cid, opt_in=False) == 0
+
+    assert db.resolve_city(conn, cid).enabled
+    assert {c: db.get_channel_membership(conn, cid, c) for c in _OPT_IN} == dict.fromkeys(
+        _OPT_IN, None
+    )
+    assert calls == []
+
+
+def test_enable_city_is_wired_into_the_parser():
+    args = _sched.build_parser().parse_args(
+        ["enable-city", "Bend", "--dry-run", "--no-opt-in", "--enroll-kartaview"]
+    )
+    assert (args.command, args.city, args.dry_run, args.no_opt_in, args.enroll_kartaview) == (
+        "enable-city",
+        "Bend",
+        True,
+        True,
+        True,
+    )
+
+
 def test_the_enrolment_cost_note_says_when_it_is_the_geometry_tier(
     conn, monkeypatch, tmp_path, capsys
 ):

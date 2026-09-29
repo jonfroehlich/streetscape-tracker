@@ -28,7 +28,7 @@ from streetscape_metadata_tracker.scheduler import (
     SchedulerConfig,
     cmd_import_bundle,
 )
-from tests.conftest import make_mapillary_city_df, write_city_csv_gz
+from tests.conftest import make_mapillary_city_df, panoramax_screen_fetch, write_city_csv_gz
 
 RUN_DATE = date(2026, 9, 10)
 CITY = dict(
@@ -179,6 +179,24 @@ def cfg(tmp_path):
             "mapillary": ProviderConfig(),
             "mapillary_streets": ProviderConfig(),
         },
+    )
+
+
+@pytest.fixture(autouse=True)
+def _no_panoramax_screen_network(monkeypatch):
+    """
+    `--enable` screens the city against Panoramax to gate its opt-in enrolment
+    (issue #374). By default that fetch fails as a connection fault would, so
+    nothing reaches the host; the #374 tests install their own answer.
+    """
+    import aiohttp
+
+    from streetscape_metadata_tracker import panoramax_screen
+
+    monkeypatch.setattr(
+        panoramax_screen,
+        "_fetch_tile",
+        panoramax_screen_fetch(error=aiohttp.ClientError("the suite never reaches Panoramax")),
     )
 
 
@@ -796,3 +814,73 @@ def test_every_problem_is_reported_not_just_the_first(cfg, bundle_dir, capsys):
     out = capsys.readouterr().out
     assert "refusing to collide" in out
     assert "append-only" in out
+
+
+# ── opt-in enrolment when --enable turns the city on (issue #374) ─────────
+
+OPT_IN = ("kartaview", "kartaview_streets", "panoramax", "panoramax_streets")
+
+
+def _screen(monkeypatch, upper_bound):
+    from streetscape_metadata_tracker import panoramax_screen
+
+    calls = []
+    monkeypatch.setattr(
+        panoramax_screen, "_fetch_tile", panoramax_screen_fetch(upper_bound, calls=calls)
+    )
+    return calls
+
+
+def _opt_in_members(cfg):
+    return {
+        r["provider"]: r["member"]
+        for r in _prod(cfg).execute(
+            "SELECT provider, member FROM schedule_state WHERE city_id = ? AND provider IN "
+            "(?, ?, ?, ?)",
+            (CITY_ID, *OPT_IN),
+        )
+    }
+
+
+def test_enable_execute_enrols_the_new_city_on_the_opt_in_channels(cfg, bundle_dir, monkeypatch):
+    _screen(monkeypatch, 42)
+    assert cmd_import_bundle(cfg, str(bundle_dir), execute=True, enable=True) == 0
+    # San Luis Obispo's KartaView estimate is 115, under the 1,000 ceiling.
+    assert _opt_in_members(cfg) == dict.fromkeys(OPT_IN, 1)
+
+
+def test_enable_without_execute_prints_the_decisions_and_writes_nothing(
+    cfg, bundle_dir, monkeypatch, capsys
+):
+    calls = _screen(monkeypatch, 42)
+    assert cmd_import_bundle(cfg, str(bundle_dir), enable=True) == 0
+    out = capsys.readouterr().out
+    assert "opt-in enrolment (#374; DRY RUN, nothing written)" in out
+    assert "would enrol" in out
+    assert calls == [], "the dry run issues no provider request"
+    assert _prod(cfg).execute("SELECT COUNT(*) FROM schedule_state").fetchone()[0] == 0
+
+
+def test_enable_on_an_already_enabled_city_enrols_nothing(cfg, bundle_dir, monkeypatch):
+    """Only an import that ENABLES the city is a new city; this one is not (no backfill)."""
+    conn = db.connect(cfg.db_path)
+    db.register_city(conn, **CITY, enabled=True)
+    conn.close()
+    calls = _screen(monkeypatch, 42)
+    assert cmd_import_bundle(cfg, str(bundle_dir), execute=True, enable=True) == 0
+    assert _opt_in_members(cfg) == {}
+    assert calls == []
+
+
+def test_no_opt_in_on_import_writes_no_opt_in_row(cfg, bundle_dir, monkeypatch):
+    calls = _screen(monkeypatch, 42)
+    assert cmd_import_bundle(cfg, str(bundle_dir), execute=True, enable=True, opt_in=False) == 0
+    assert _opt_in_members(cfg) == {}
+    assert calls == []
+
+
+def test_import_bundle_parses_the_opt_in_flags():
+    from streetscape_metadata_tracker.scheduler import build_parser
+
+    args = build_parser().parse_args(["import-bundle", "d", "--enable", "--no-opt-in"])
+    assert args.no_opt_in is True and args.enroll_kartaview is False

@@ -30,6 +30,7 @@ from streetscape_metadata_tracker.scheduler import (
     SchedulerConfig,
     build_parser,
 )
+from tests.conftest import panoramax_screen_fetch
 
 TODAY = date(2026, 8, 17)
 QUERY = "Newport, Kentucky"
@@ -124,6 +125,25 @@ def _no_boundary_probe(monkeypatch):
     every test — the tests that care about the report patch it back.
     """
     monkeypatch.setattr(_sched, "_boundary_preflight", lambda city: (None, None))
+
+
+@pytest.fixture(autouse=True)
+def _no_panoramax_screen_network(monkeypatch):
+    """
+    A newly registered city is screened against Panoramax to gate its opt-in
+    enrolment (issue #374). Every test here gets a screen whose fetch fails as a
+    connection fault would — so nothing reaches the host, and the default
+    outcome enrols no Panoramax channel. The #374 tests install their own answer.
+    """
+    import aiohttp
+
+    from streetscape_metadata_tracker import panoramax_screen
+
+    monkeypatch.setattr(
+        panoramax_screen,
+        "_fetch_tile",
+        panoramax_screen_fetch(error=aiohttp.ClientError("the suite never reaches Panoramax")),
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -668,8 +688,10 @@ def test_success_starts_only_the_collected_channels_clocks(conn, monkeypatch, tm
     _assess(tmp_path)
 
     state = _state(conn)
-    assert set(state) == set(ASSESS_CHANNELS)
-    assert all(state[c]["last_success_at"] for c in ASSESS_CHANNELS)
+    # Only the clocks: since #374 a new city also gains opt-in MEMBERSHIP rows,
+    # which carry no success and start nothing.
+    started = {c for c, row in state.items() if row["last_success_at"]}
+    assert started == set(ASSESS_CHANNELS)
     assert "gsv" not in state
 
 
@@ -1327,3 +1349,323 @@ def test_assess_city_inherits_the_lane_scheduler_from_the_config_knob(conn, monk
     seq = {(kind, provider): n for kind, provider, n in events}
     assert seq[("start", "mapillary_streets")] > seq[("end", "gsv_streets")]
     assert seq[("start", "mapillary_streets")] > seq[("end", "mapillary")]
+
+
+# --------------------------------------------------------------------------
+# opt-in enrolment of a new city (issue #374)
+# --------------------------------------------------------------------------
+
+OPT_IN = ("kartaview", "kartaview_streets", "panoramax", "panoramax_streets")
+
+
+def _members(conn, city_id=CITY_ID):
+    """``{channel: member}`` for every schedule_state row this city has."""
+    return {
+        r["provider"]: r["member"]
+        for r in conn.execute(
+            "SELECT provider, member FROM schedule_state WHERE city_id = ?", (city_id,)
+        )
+    }
+
+
+def _screen(monkeypatch, upper_bound=None, *, error=None):
+    """Answer the one-city screen's fetch primitive; returns the URL log."""
+    from streetscape_metadata_tracker import panoramax_screen
+
+    calls = []
+    monkeypatch.setattr(
+        panoramax_screen,
+        "_fetch_tile",
+        panoramax_screen_fetch(upper_bound, error=error, calls=calls),
+    )
+    return calls
+
+
+def _newport(conn):
+    return db.resolve_city(conn, db.register_city(conn, **_CITY_ROW))
+
+
+def _enrol(cfg, conn, city, *, over=False, dry_run=False):
+    return _sched.enroll_opt_in_channels(
+        cfg, conn, city, enroll_kartaview_over_threshold=over, dry_run=dry_run
+    )
+
+
+def test_a_new_city_ends_enrolled_on_all_four_opt_in_channels(conn, monkeypatch, tmp_path, capsys):
+    """
+    The #374 happy path: a positive screen and a KartaView estimate under the
+    ceiling (Newport's is 16, the #225 median) enrol all four, and the screen
+    lands the same provider_screen row the weekly screen would write.
+    """
+    _stub_collection(monkeypatch, conn)
+    calls = _screen(monkeypatch, 42)
+
+    assert _assess(tmp_path) == 0
+
+    members = _members(conn)
+    assert {c: members.get(c) for c in OPT_IN} == dict.fromkeys(OPT_IN, 1)
+    # Newport's grown bbox straddles the z6 seam at -84.375°, so two tiles —
+    # and both are charged to the day's ledger, as the weekly screen charges.
+    assert len(calls) == 2
+    from streetscape_metadata_tracker import clock
+
+    assert db.get_api_usage(conn, clock.snapshot_date_today(), "panoramax") == 2
+    (row,) = conn.execute(
+        "SELECT pictures_upper_bound FROM provider_screen WHERE provider = 'panoramax' "
+        "AND city_id = ?",
+        (CITY_ID,),
+    ).fetchall()
+    assert row["pictures_upper_bound"] == 42
+    out = capsys.readouterr().out
+    assert "arrive with this city's first nightly run" in out
+
+
+def test_a_zero_screen_enrols_neither_panoramax_channel(conn, tmp_path, monkeypatch):
+    _screen(monkeypatch, 0)
+    report = _enrol(_cfg(tmp_path), conn, _newport(conn))
+
+    members = _members(conn)
+    assert members.get("panoramax") is None and members.get("panoramax_streets") is None
+    assert report.decision("panoramax").decision == "skipped"
+    assert report.decision("panoramax_streets").decision == "skipped"
+    # KartaView is decided independently, so a zero here costs it nothing.
+    assert members["kartaview"] == members["kartaview_streets"] == 1
+
+
+def _serve_429(monkeypatch):
+    """The REAL fetch primitive, answered 429 by a fake session (a per-IP refusal)."""
+    import aiohttp
+
+    from streetscape_metadata_tracker import download_panoramax, panoramax_screen
+    from tests.test_panoramax_screen import _AsyncCM, _FakeResponse
+
+    class _Always429:
+        def get(self, url, **kwargs):
+            class _Ctx:
+                async def __aenter__(self):
+                    return _FakeResponse(429)
+
+                async def __aexit__(self, *exc):
+                    return False
+
+            return _Ctx()
+
+    monkeypatch.setattr(panoramax_screen, "_fetch_tile", download_panoramax._fetch_tile)
+    monkeypatch.setattr(aiohttp, "ClientSession", lambda **kw: _AsyncCM(_Always429()))
+
+
+@pytest.mark.parametrize("failure", ["http_429", "connection_error"])
+def test_a_failed_screen_enrols_neither_and_says_screen_failed(
+    conn, tmp_path, monkeypatch, failure
+):
+    """
+    Never enrol on "unknown" — and never report a failure as a zero, which is
+    what the DISTINCT decision below pins: a zero is conclusive, a failure is not.
+    """
+    import aiohttp
+
+    if failure == "http_429":
+        _serve_429(monkeypatch)
+    else:
+        _screen(monkeypatch, error=aiohttp.ClientError("connection reset"))
+
+    report = _enrol(_cfg(tmp_path), conn, _newport(conn))
+
+    members = _members(conn)
+    assert members.get("panoramax") is None and members.get("panoramax_streets") is None
+    assert report.decision("panoramax").decision == "screen_failed"
+    assert report.decision("panoramax_streets").decision == "screen_failed"
+    assert conn.execute("SELECT COUNT(*) FROM provider_screen").fetchone()[0] == 0
+    assert "screen_failed" in report.render()
+
+
+def test_a_busy_panoramax_lock_is_reported_and_not_retried(conn, tmp_path, monkeypatch):
+    from filelock import FileLock
+
+    from streetscape_metadata_tracker import host_lock
+    from streetscape_metadata_tracker.download_common import HOST_PANORAMAX
+
+    calls = _screen(monkeypatch, 42)
+    other = FileLock(host_lock.lock_path(HOST_PANORAMAX))
+    other.acquire()
+    try:
+        report = _enrol(_cfg(tmp_path), conn, _newport(conn))
+    finally:
+        other.release()
+
+    assert calls == [], "a busy lock must not be waited out or retried"
+    assert report.decision("panoramax").decision == "screen_failed"
+    # Said as LOCAL contention, never as a refusal: a busy lock is our own
+    # process, and reading it as a per-IP block would send an operator to the
+    # provider-access log for nothing. (Prefix, not substring: the lock path in
+    # the message sits under this test's tmp dir, whose name contains "busy".)
+    assert report.decision("panoramax").reason.startswith("not enrolled — host lock busy")
+    assert "refused this host" not in report.decision("panoramax").reason
+    assert _members(conn).get("panoramax") is None
+
+
+@pytest.mark.parametrize(
+    ("estimate", "over", "expected"),
+    [
+        (1_000, False, 1),  # AT the ceiling enrols: `<=`, not `<`
+        (1_001, False, None),  # one over does not
+        (1_001, True, 1),  # ... unless --enroll-kartaview accepts it
+    ],
+)
+def test_the_kartaview_ceiling_is_inclusive_and_only_the_flag_crosses_it(
+    conn, tmp_path, monkeypatch, estimate, over, expected
+):
+    monkeypatch.setattr(_sched, "estimate_kartaview_requests", lambda conn, city: estimate)
+    report = _enrol(_cfg(tmp_path), conn, _newport(conn), over=over)
+
+    members = _members(conn)
+    assert members.get("kartaview") == expected
+    assert members.get("kartaview_streets") == expected
+    if expected is None:
+        assert report.decision("kartaview").decision == "needs_flag"
+        assert "--enroll-kartaview" in report.decision("kartaview").reason
+
+
+@pytest.mark.parametrize("enroll_kartaview", [False, True])
+def test_yes_alone_never_accepts_an_over_ceiling_kartaview_estimate(
+    conn, monkeypatch, tmp_path, enroll_kartaview
+):
+    _stub_collection(monkeypatch, conn)
+    monkeypatch.setattr(_sched, "estimate_kartaview_requests", lambda conn, city: 5_000)
+
+    _assess(tmp_path, assume_yes=True, enroll_kartaview=enroll_kartaview)
+
+    members = _members(conn)
+    want = 1 if enroll_kartaview else None
+    assert (members.get("kartaview"), members.get("kartaview_streets")) == (want, want)
+
+
+def test_no_opt_in_writes_no_opt_in_row_and_screens_nothing(conn, monkeypatch, tmp_path):
+    _stub_collection(monkeypatch, conn)
+    calls = _screen(monkeypatch, 42)
+
+    _assess(tmp_path, opt_in=False)
+
+    # The row SET, not `member is None`: a row written with a NULL member would
+    # satisfy the weaker check while still being a write this flag forbids.
+    assert set(_members(conn)) == set(ASSESS_CHANNELS)
+    assert calls == []
+    assert conn.execute("SELECT COUNT(*) FROM provider_screen").fetchone()[0] == 0
+
+
+def test_re_assessing_a_collected_city_changes_no_membership(conn, monkeypatch, tmp_path):
+    """
+    An operator's `--remove` must survive a re-assessment, and so must every
+    unset pair: a city with collection history is not new, whatever it lacks.
+    """
+    _stub_collection(monkeypatch, conn)
+    _assess(tmp_path, opt_in=False)  # history: three channels collected
+    db.set_channel_membership(conn, CITY_ID, "panoramax", False, cycle_days=90)
+    before = _members(conn)
+    calls = _screen(monkeypatch, 42)
+
+    _assess(tmp_path)
+
+    assert _members(conn) == before
+    assert calls == []
+
+
+def test_an_estimate_then_a_collection_still_enrols_the_new_city(conn, monkeypatch, tmp_path):
+    """
+    `--estimate` registers the city, so the follow-up run is not "newly
+    registered" — yet it is the documented order, and must not read as a
+    re-assessment that silently skips enrolment.
+    """
+    _stub_collection(monkeypatch, conn)
+    calls = _screen(monkeypatch, 42)
+
+    _assess(tmp_path, estimate_only=True)
+    assert calls == [], "--estimate issues no provider request, the screen included"
+    assert not any(c in _members(conn) for c in OPT_IN), "and writes no membership"
+
+    _assess(tmp_path)
+
+    members = _members(conn)
+    assert {c: members.get(c) for c in OPT_IN} == dict.fromkeys(OPT_IN, 1)
+
+
+def test_the_estimate_previews_the_enrolment_decisions(conn, monkeypatch, tmp_path, capsys):
+    _stub_collection(monkeypatch, conn)
+    _screen(monkeypatch, 42)
+
+    _assess(tmp_path, estimate_only=True)
+
+    out = capsys.readouterr().out
+    assert "DRY RUN, nothing written" in out
+    kartaview_line = next(
+        line for line in out.splitlines() if line.strip().startswith("kartaview ")
+    )
+    assert "would enrol" in kartaview_line
+    assert "pending_screen" in out
+
+
+def test_a_pair_is_enrolled_whole_even_when_the_walk_is_not_configured(conn, tmp_path, monkeypatch):
+    """
+    The walk rides the grid's census for 0 (#290), so a provider's two channels
+    move together — including when only the grid channel has a config block,
+    since enrolment before configuration is supported on purpose.
+    """
+    _screen(monkeypatch, 42)
+    cfg = _cfg(tmp_path)
+    cfg.providers["kartaview"] = ProviderConfig(enabled=True)
+    cfg.providers["panoramax"] = ProviderConfig(enabled=True)
+
+    report = _enrol(cfg, conn, _newport(conn))
+
+    members = _members(conn)
+    assert {c: members.get(c) for c in OPT_IN} == dict.fromkeys(OPT_IN, 1)
+    notes = "\n".join(report.notes)
+    assert "[providers.kartaview_streets] is not enabled" in notes
+    assert "[providers.panoramax_streets] is not enabled" in notes
+    assert "[providers.kartaview] is not" not in notes
+
+
+def test_one_explicit_half_leaves_the_whole_pair_alone(conn, tmp_path, monkeypatch):
+    """An explicit value on EITHER channel of a pair: the other is never enrolled alone."""
+    _screen(monkeypatch, 42)
+    city = _newport(conn)
+    db.set_channel_membership(conn, city.city_id, "kartaview", False, cycle_days=90)
+
+    report = _enrol(_cfg(tmp_path), conn, city)
+
+    members = _members(conn)
+    assert members["kartaview"] == 0
+    assert members.get("kartaview_streets") is None
+    assert report.decision("kartaview_streets").decision == "already_set"
+    assert members["panoramax"] == members["panoramax_streets"] == 1
+
+
+def test_a_dry_run_writes_nothing_and_issues_no_request(conn, tmp_path, monkeypatch):
+    calls = _screen(monkeypatch, 42)
+    city = _newport(conn)
+
+    report = _enrol(_cfg(tmp_path), conn, city, dry_run=True)
+
+    assert _members(conn) == {}
+    assert calls == []
+    assert report.decision("kartaview").decision == "enrolled"  # what it WOULD do
+    assert report.decision("panoramax").decision == "pending_screen"
+
+
+def test_every_opt_in_provider_has_an_enrolment_gate():
+    """A new opt-in provider must bring its own gate, never be silently skipped."""
+    pairs = _sched.opt_in_pairs()
+    assert set(pairs) == set(_sched._OPT_IN_GATES)
+    assert {c for pair in pairs.values() for c in pair} == {
+        c for c in _sched.CHANNEL_DEFAULT_MEMBERSHIP if _sched.is_opt_in_channel(c)
+    }
+    assert set(OPT_IN) == {c for pair in pairs.values() for c in pair}
+    assert all(d in _sched.OPT_IN_DECISIONS for d in ("enrolled", "screen_failed"))
+
+
+def test_assess_city_parses_the_opt_in_flags():
+    args = build_parser().parse_args(["assess-city", "--no-opt-in", "--enroll-kartaview", QUERY])
+    assert args.no_opt_in is True
+    assert args.enroll_kartaview is True
+    defaults = build_parser().parse_args(["assess-city", QUERY])
+    assert defaults.no_opt_in is False and defaults.enroll_kartaview is False

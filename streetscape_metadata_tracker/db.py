@@ -2068,6 +2068,27 @@ def get_channel_membership(conn: sqlite3.Connection, city_id: str, provider: str
     return None if row is None else row["member"]
 
 
+def city_has_collection_history(conn: sqlite3.Connection, city_id: str) -> bool:
+    """Has anything ever been collected for, or attempted against, this city?
+
+    True on any ``runs`` row, any ``street_walks`` row, or any
+    ``schedule_state`` row with a ``last_attempt_at``. It is what lets
+    ``assess-city`` treat a city it registered under ``--estimate`` as still NEW
+    on the follow-up run (issue #374): registration alone leaves all three
+    empty, while a city the nightly batch has reached, or that was assessed
+    before, has at least one.
+    """
+    row = conn.execute(
+        """SELECT
+             EXISTS (SELECT 1 FROM runs WHERE city_id = ?)
+             OR EXISTS (SELECT 1 FROM street_walks WHERE city_id = ?)
+             OR EXISTS (SELECT 1 FROM schedule_state
+                        WHERE city_id = ? AND last_attempt_at IS NOT NULL)""",
+        (city_id, city_id, city_id),
+    ).fetchone()
+    return bool(row[0])
+
+
 def set_channel_membership(
     conn: sqlite3.Connection,
     city_id: str,
