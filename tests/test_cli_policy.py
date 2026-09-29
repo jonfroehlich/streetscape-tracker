@@ -1616,3 +1616,29 @@ def test_each_downloader_hands_its_deadline_to_the_crawl_it_wraps(tmp_path, monk
     with pytest.raises(Reached):
         asyncio.run(outer(**kwargs))
     assert seen["deadline_monotonic"] == 12_345.5
+
+
+@pytest.mark.parametrize("entry", ["cli", "collect"])
+@pytest.mark.parametrize("provider", ["kartaview", "mapillary", "panoramax"])
+def test_every_clock_flag_refuses_zero_at_parse_time(monkeypatch, entry, provider):
+    """
+    0 is not "off" on the clock any more than on a cap (#344 review): a crawl
+    stopped before its first commit exits 83 printing "re-run to resume" -- a
+    loop. Every `--*-max-seconds` flag on BOTH entry points must carry
+    positive_int, so a `type=int` in the shared declaration fails here. 1 is
+    accepted, which pins the boundary rather than a blanket refusal.
+    """
+    from streetscape_street_analyzer import collect
+
+    flag = f"--{provider}-max-seconds"
+
+    def parse(value):
+        if entry == "cli":
+            monkeypatch.setattr(sys, "argv", ["streetscape_tracker.py", "Bend, OR", flag, value])
+            return cli.parse_args()
+        return collect.build_parser().parse_args([flag, value, "--", "Bend, OR"])
+
+    with pytest.raises(SystemExit) as excinfo:
+        parse("0")
+    assert excinfo.value.code == 2
+    assert getattr(parse("1"), f"{provider}_max_seconds") == 1

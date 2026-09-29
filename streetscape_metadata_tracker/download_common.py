@@ -21,6 +21,7 @@ import time
 import urllib.parse
 from collections.abc import Callable, Iterator
 from datetime import datetime
+from typing import Any, Protocol
 
 import geopy.distance
 import numpy as np
@@ -619,7 +620,17 @@ def crawl_deadline_from_budget(max_seconds: int | None) -> float | None:
 CRAWL_CLOCK_PROVIDERS = ("kartaview", "mapillary", "panoramax")
 
 
-def add_crawl_clock_arguments(group: argparse._ActionsContainer) -> None:
+class _ArgumentContainer(Protocol):
+    """What :func:`add_crawl_clock_arguments` needs of its target.
+
+    Both callers' shapes satisfy it -- cli.py passes an argument group and
+    collect.py the parser itself -- without naming argparse's private base.
+    """
+
+    def add_argument(self, *args: Any, **kwargs: Any) -> Any: ...
+
+
+def add_crawl_clock_arguments(group: _ArgumentContainer) -> None:
     """
     Declare ``--{provider}-max-seconds`` for every resumable crawl provider.
 

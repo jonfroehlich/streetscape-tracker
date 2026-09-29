@@ -14155,5 +14155,6 @@ def test_a_paused_childs_reason_names_the_ceiling_that_paused_it(
     cfg = SchedulerConfig(log_dir=str(tmp_path))
     outcome = sched._run_collection_subprocess(cfg, ["x"], 60, city, "mapillary", date(2026, 7, 1))
     assert outcome.exit_code == SWEEP_INCOMPLETE_EXIT_CODE
+    assert "crawl paused" in outcome.reason, "83 must read as a pause, not a bare exit code"
     assert expected in outcome.reason
     assert other not in outcome.reason
