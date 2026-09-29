@@ -6704,10 +6704,11 @@ def _collect_due(
     #     CHECKPOINT_MAX_AGE_S, seven days from the checkpoint's FIRST commit,
     #     after which its rows would be spliced into a snapshot dated today and
     #     it is discarded.
-    #   * A SIGKILL at the per-city timeout. Still reachable, and what it now
-    #     catches is a child running SLOWER than the assumed rate x
-    #     _SWEEP_ACHIEVED_RATE_FRACTION -- the one overrun a request cap cannot
-    #     bound, since only a clock inside the child could. The checkpoint on
+    #   * A SIGKILL at the per-city timeout. Since #344 a resumable child
+    #     running SLOWER than the assumed rate x _SWEEP_ACHIEVED_RATE_FRACTION
+    #     pauses itself on its forwarded wall-clock budget instead, so this is
+    #     reachable only by a child that outruns its own deadline (in-flight
+    #     retries outlasting _CRAWL_CLOCK_MARGIN_S). The checkpoint on
     #     disk survives, so tomorrow resumes — but the kill has no exit code, so
     #     it counts a consecutive_failure, and `attempted` was incremented, so
     #     it DID consume a city-cap slot. The hoist is what makes tomorrow's
