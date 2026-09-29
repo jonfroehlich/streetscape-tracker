@@ -12,9 +12,10 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Any, ClassVar
 
-import numpy as np
 import pandas as pd
 from tabulate import tabulate
+
+from .geoutils import haversine_m
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,95 @@ RETRYABLE_STATUSES = ("OVER_QUERY_LIMIT", "UNKNOWN_ERROR")
 # as a failure row so the grid stays complete (run-to-run diffs require exact
 # grid-key equality), but it is neither "present" nor a provider-side denial.
 REQUEST_FAILED = "REQUEST_FAILED"
+
+# How far a GSV pano may sit from the grid point that asked for it and still
+# count as imagery AT that point (issue #367). 50 m is what the collection
+# always intended: it is Google's documented default `radius` for the metadata
+# endpoint, which download_gsv never overrides. But Google treats `radius` as a
+# search HINT, not a bound -- measured on 60 archived cities, 10.4% of rows
+# with a pano sat more than 50 m from their query point, 0.04% more than 1 km,
+# a few on other continents or at Null Island. It is not even monotone: in
+# Teaneck radius=25 returned a pano 77 m away where radius=50 returned one at
+# 45.8 m. So the bound is enforced HERE, on read (apply_query_radius), rather
+# than trusted from the request.
+#
+# GSV only. The census providers (Mapillary, KartaView, Panoramax) assign a
+# pano to a grid point from exact tile/bbox geometry, so they have no radius to
+# overshoot. The road walk is unaffected too: streetscape_street_analyzer
+# bounds sample-to-pano distance itself (street_coverage.DEFAULT_MATCH_DIST_M,
+# 25 m). Mirrored in www/js/streetscape-utils.js as GSV_QUERY_RADIUS_M, pinned
+# equal by tests/test_coverage.py.
+GSV_QUERY_RADIUS_M = 50.0
+
+# Synthetic status for a GSV row whose pano lies beyond GSV_QUERY_RADIUS_M of
+# its query point (issue #367). Assigned on READ by apply_query_radius and
+# never written to disk: the CSV records what the provider said, so the far
+# pano's id and position survive in the file and a later definition can be
+# re-derived from it (scripts/recompute_run_stats.py). It is an absence by
+# definition -- NOT in PRESENT_STATUSES or ANY_IMAGERY_STATUSES -- and it is a
+# real answer, not an error, so it gets its own bucket (status_out_of_radius,
+# num_points_out_of_radius) rather than falling into status_other, exactly as
+# FLAT_ONLY was split out of it.
+OUT_OF_RADIUS = "OUT_OF_RADIUS"
+
+
+def apply_query_radius(df: pd.DataFrame, provider: str = "gsv") -> pd.DataFrame:
+    """
+    Reclassify GSV panos beyond GSV_QUERY_RADIUS_M of their query point.
+
+    The single seam the rule lives behind (issue #367), the way
+    dated_unique_panos is for capture dates: fileutils.load_city_csv_file calls
+    it for every gsv run file, so every stat, diff, summary and plot downstream
+    of the loader already sees the far panos as OUT_OF_RADIUS.
+
+    For ``provider == "gsv"`` returns a COPY with:
+
+    * ``query_distance_m`` -- haversine metres from (query_lat, query_lon) to
+      (pano_lat, pano_lon) for every row with both positions, NaN otherwise;
+    * ``status`` set to OUT_OF_RADIUS where the row was PRESENT (OK or NO_DATE)
+      and that distance exceeds GSV_QUERY_RADIUS_M. Strictly greater: a pano at
+      exactly the radius is within it. A NaN distance (a missing pano
+      coordinate) never reclassifies -- unknown is not far.
+
+    Idempotent: the distance is computed for every row with coordinates, not
+    only present ones, so a second pass reproduces the same frame.
+
+    Any other provider -- or a frame lacking the four coordinate columns -- is
+    returned unchanged (the same object; nothing is copied).
+
+    Example:
+        >>> df = pd.DataFrame({
+        ...     "query_lat": [47.0, 47.0], "query_lon": [-122.0, -122.0],
+        ...     "pano_lat": [47.0001, 47.01], "pano_lon": [-122.0, -122.0],
+        ...     "status": ["OK", "OK"]})
+        >>> apply_query_radius(df)["status"].tolist()
+        ['OK', 'OUT_OF_RADIUS']
+    """
+    cols = ("query_lat", "query_lon", "pano_lat", "pano_lon")
+    if provider != "gsv" or not all(c in df.columns for c in cols):
+        return df
+    out = df.copy()
+    distance = haversine_m(out["query_lat"], out["query_lon"], out["pano_lat"], out["pano_lon"])
+    out["query_distance_m"] = distance
+    far = out["status"].isin(PRESENT_STATUSES) & (distance > GSV_QUERY_RADIUS_M)
+    out.loc[far, "status"] = OUT_OF_RADIUS
+    return out
+
+
+def out_of_radius_count(df: pd.DataFrame, provider: str = "gsv") -> int:
+    """
+    How many of a run's rows the query-radius rule reclassifies (issue #367).
+
+    Asked through apply_query_radius rather than by counting a status, so the
+    answer is the same for a raw frame and for one that already came through
+    the loader (the seam is idempotent), and a repair pass never carries a
+    second copy of the rule (scripts/recompute_run_stats.py). Always 0 for a
+    provider the rule does not apply to -- answered without touching the frame,
+    since a census run is millions of rows.
+    """
+    if provider != "gsv":
+        return 0
+    return int((apply_query_radius(df, provider)["status"] == OUT_OF_RADIUS).sum())
 
 
 def is_google_copyright(copyright_info: pd.Series) -> pd.Series:
@@ -236,6 +326,11 @@ class CoverageStats:
     num_points_with_any_imagery: int
     any_imagery_coverage_rate: float
     pano_distance_stats: DistanceStats | None = None
+    # Points whose only answer was a GSV pano beyond GSV_QUERY_RADIUS_M
+    # (status OUT_OF_RADIUS, issue #367): uncovered, but a real answer rather
+    # than an error, so it is subtracted out of num_points_with_errors. 0 for
+    # every census provider, which never emits the status.
+    num_points_out_of_radius: int = 0
 
     # A percent-formatted rate field vs a plain count, so to_rows knows to
     # append '%'. Kept as a set so new rate fields only touch one place.
@@ -248,6 +343,7 @@ class CoverageStats:
         "num_points_with_unique_pano_ids": "Unique Panoramas",
         "num_points_without_panos": "Points without Panoramas",
         "num_points_with_errors": "Points with Errors",
+        "num_points_out_of_radius": "Points with Pano Beyond Query Radius",
         "coverage_rate": "Points with Panos / Total Points (360°)",
         "num_points_with_any_imagery": "Points with Any Imagery",
         "any_imagery_coverage_rate": "Any-Imagery Coverage",
@@ -416,8 +512,17 @@ def calculate_coverage_stats(df: pd.DataFrame) -> CoverageStats:
     num_points_without_panos = len(
         df.loc[df["status"] == "ZERO_RESULTS", point_cols].drop_duplicates()
     )
+    # A GSV point whose pano lay beyond the query radius (issue #367) is also a
+    # real answer, not an error. GSV holds one row per point, so these never
+    # overlap the covered or ZERO_RESULTS points.
+    num_points_out_of_radius = len(
+        df.loc[df["status"] == OUT_OF_RADIUS, point_cols].drop_duplicates()
+    )
     num_points_with_errors = (
-        num_total_points - num_points_with_any_imagery - num_points_without_panos
+        num_total_points
+        - num_points_with_any_imagery
+        - num_points_without_panos
+        - num_points_out_of_radius
     )
 
     successful_df_no_duplicates = present_rows.drop_duplicates(subset=["pano_id"]).copy()
@@ -426,18 +531,20 @@ def calculate_coverage_stats(df: pd.DataFrame) -> CoverageStats:
 
     distance_stats = None
     if num_unique_panos > 0:
-        distances = (
-            np.sqrt(
-                (successful_df_no_duplicates["query_lat"] - successful_df_no_duplicates["pano_lat"])
-                ** 2
-                + (
-                    successful_df_no_duplicates["query_lon"]
-                    - successful_df_no_duplicates["pano_lon"]
-                )
-                ** 2
+        # Great-circle metres (issue #367). A frame that came through the loader
+        # already carries query_distance_m from apply_query_radius, so read it
+        # rather than compute it twice. The planar sqrt(dlat^2 + dlon^2) * 111000
+        # this replaced ignored cos(latitude) and overstated every east-west
+        # offset (2x at 60 degrees north).
+        if "query_distance_m" in successful_df_no_duplicates.columns:
+            distances = successful_df_no_duplicates["query_distance_m"]
+        else:
+            distances = haversine_m(
+                successful_df_no_duplicates["query_lat"],
+                successful_df_no_duplicates["query_lon"],
+                successful_df_no_duplicates["pano_lat"],
+                successful_df_no_duplicates["pano_lon"],
             )
-            * 111000
-        )  # Approximate conversion to meters
 
         successful_df_no_duplicates.loc[:, "distance_to_query"] = distances
         logger.debug(f"Distance: {distances}")
@@ -472,6 +579,7 @@ def calculate_coverage_stats(df: pd.DataFrame) -> CoverageStats:
         if num_total_points > 0
         else 0,
         pano_distance_stats=distance_stats,
+        num_points_out_of_radius=num_points_out_of_radius,
     )
 
 
@@ -814,7 +922,14 @@ def calculate_run_stats(df: pd.DataFrame, run_date, provider: str = "gsv") -> di
     # not an error — so it gets its own bucket and is excluded from the
     # status_other error catch-all, mirroring how NO_DATE was split out in v3.
     status_flat_only = int((df["status"] == FLAT_ONLY).sum())
-    status_other = int(len(df) - status_ok - status_no_date - status_zero - status_flat_only)
+    # OUT_OF_RADIUS (issue #367) is a real answer too ("Google's pano for this
+    # point was too far away to count"), split out of status_other the same
+    # way. Counted off the frame in hand: the loader has already applied the
+    # rule, and a raw frame passed straight in carries none of these rows.
+    status_out_of_radius = int((df["status"] == OUT_OF_RADIUS).sum())
+    status_other = int(
+        len(df) - status_ok - status_no_date - status_zero - status_flat_only - status_out_of_radius
+    )
 
     # Pano totals count every present pano (OK or NO_DATE); age stats use only
     # the dated subset, since NO_DATE panos carry no usable capture date.
@@ -851,6 +966,7 @@ def calculate_run_stats(df: pd.DataFrame, run_date, provider: str = "gsv") -> di
         "status_no_date": status_no_date,
         "status_zero_results": status_zero,
         "status_flat_only": status_flat_only,
+        "status_out_of_radius": status_out_of_radius,
         "status_other": status_other,
         "unique_panos": len(unique),
         "unique_google_panos": unique_google_panos,
@@ -859,6 +975,11 @@ def calculate_run_stats(df: pd.DataFrame, run_date, provider: str = "gsv") -> di
         "oldest_capture_date": age_stats.oldest_pano_date,
         "newest_capture_date": age_stats.newest_pano_date,
         "median_pano_age_years": age_stats.median_pano_age_years,
+        # The tolerance this row's coverage was computed under (issue #367);
+        # NULL for providers the rule does not apply to. Stored beside the
+        # counts so a later change of the constant is visible per row rather
+        # than silently mixing two definitions in one city's series.
+        "query_radius_m": GSV_QUERY_RADIUS_M if provider == "gsv" else None,
     }
 
 

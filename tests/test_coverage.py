@@ -7,16 +7,26 @@ proxy: it collapses as the sampling step shrinks (duplicate snaps) and
 made every city's coverage appear to plummet vs the published site.
 """
 
+import math
+import pathlib
+import re
 from datetime import date
 
+import numpy as np
 import pandas as pd
+import pytest
 
 from streetscape_metadata_tracker.analysis import (
+    GSV_QUERY_RADIUS_M,
+    OUT_OF_RADIUS,
+    apply_query_radius,
     calculate_coverage_stats,
     calculate_pano_stats,
     calculate_run_stats,
     detect_systemic_failure,
+    out_of_radius_count,
 )
+from streetscape_metadata_tracker.geoutils import EARTH_RADIUS_M, haversine_m
 from tests.conftest import COLUMNS, make_city_df, make_mapillary_city_df
 
 
@@ -272,3 +282,162 @@ class TestPanoStatsCoverage:
         cov = results.coverage_stats
         assert cov.num_points_without_panos == 1
         assert abs(cov.coverage_rate - 100 * 2 / 3) < 1e-9
+
+
+# --- issue #367: the GSV query radius ----------------------------------------
+
+# Metres per degree along a meridian under the same sphere haversine_m uses, so
+# a pano placed `m / _M_PER_DEG` degrees north of its query point is exactly
+# (to float precision) m metres away.
+_M_PER_DEG = EARTH_RADIUS_M * math.pi / 180
+
+
+def _gsv_frame(pano_offsets_m, statuses=None, n_empty=1):
+    """A GSV run with one grid point per offset: the pano sits that many metres
+    due north of its query point. None as an offset means no pano coordinates
+    (a row whose distance cannot be measured). Plus ``n_empty`` ZERO_RESULTS
+    points."""
+    ts = "2026-01-15T12:00:00+00:00"
+    statuses = statuses or ["OK"] * len(pano_offsets_m)
+    rows = []
+    for i, (m, status) in enumerate(zip(pano_offsets_m, statuses, strict=True)):
+        qlat = 44.0 + i * 0.001
+        plat = None if m is None else qlat + m / _M_PER_DEG
+        plon = None if m is None else -121.0
+        date_ = "2024-06-01" if status == "OK" else None
+        rows.append((qlat, -121.0, ts, plat, plon, f"p{i}", date_, "© Google", status))
+    for j in range(n_empty):
+        qlat = 44.0 + (len(pano_offsets_m) + j) * 0.001
+        rows.append((qlat, -121.0, ts, None, None, None, None, None, "ZERO_RESULTS"))
+    df = pd.DataFrame(rows, columns=COLUMNS)
+    df["capture_date"] = pd.to_datetime(df["capture_date"])
+    return df
+
+
+class TestQueryRadius:
+    def test_far_panos_are_uncovered_answers_not_errors(self):
+        # 10 m and 49 m are within 50 m; 51 m and 3,000 km (issue #367's
+        # continental outliers) are not. 5 points: 4 with a pano + 1 empty.
+        df = apply_query_radius(_gsv_frame([10, 49, 51, 3_000_000]))
+
+        assert df["status"].tolist() == [
+            "OK",
+            "OK",
+            OUT_OF_RADIUS,
+            OUT_OF_RADIUS,
+            "ZERO_RESULTS",
+        ]
+        cov = calculate_coverage_stats(df)
+        assert cov.num_points_with_panos == 2
+        assert cov.coverage_rate == 40.0  # 2 of 5, not 4 of 5
+        assert cov.num_points_out_of_radius == 2
+        assert cov.num_points_with_errors == 0  # a real answer, not an error
+        assert cov.num_points_without_panos == 1
+        assert cov.num_points_with_unique_pano_ids == 2
+        # The distance stats describe only what still counts, in real metres
+        assert cov.pano_distance_stats.max_meters == pytest.approx(49.0, abs=1e-6)
+
+    def test_run_stats_split_out_of_radius_from_status_other(self):
+        df = apply_query_radius(_gsv_frame([10, 49, 51, 3_000_000]))
+        stats = calculate_run_stats(df, date(2026, 1, 15), provider="gsv")
+
+        assert stats["status_ok"] == 2
+        assert stats["status_out_of_radius"] == 2
+        assert stats["status_other"] == 0
+        assert stats["unique_panos"] == 2
+        assert stats["unique_google_panos"] == 2
+        assert stats["coverage_rate_pct"] == 40.0
+        assert stats["query_radius_m"] == GSV_QUERY_RADIUS_M == 50.0
+
+    def test_query_radius_m_is_null_for_a_census_provider(self):
+        df = make_mapillary_city_df([("m1", "2024-06-01")])
+        assert (
+            calculate_run_stats(df, date(2026, 1, 15), provider="mapillary")["query_radius_m"]
+            is None
+        )
+
+    def test_a_pano_exactly_at_the_radius_is_within_it(self):
+        # Strictly greater-than: find a pano latitude whose float distance is
+        # EXACTLY 50.0 on this platform's libm, rather than trusting one.
+        lat = 50.0 / _M_PER_DEG
+        for _ in range(64):
+            if haversine_m(0.0, 0.0, lat, 0.0) == GSV_QUERY_RADIUS_M:
+                break
+            lat = np.nextafter(lat, 1.0 if haversine_m(0.0, 0.0, lat, 0.0) < 50 else 0.0)
+        else:
+            pytest.fail("no float latitude lands exactly on 50.0 m")
+        df = pd.DataFrame(
+            [(0.0, 0.0, "2026-01-15T12:00:00+00:00", lat, 0.0, "edge", None, "© Google", "OK")],
+            columns=COLUMNS,
+        )
+        out = apply_query_radius(df)
+        assert out["query_distance_m"].iloc[0] == 50.0
+        assert out["status"].iloc[0] == "OK"
+
+    def test_a_missing_pano_coordinate_never_reclassifies(self):
+        df = apply_query_radius(_gsv_frame([None, 3_000_000]))
+        assert df["status"].tolist() == ["OK", OUT_OF_RADIUS, "ZERO_RESULTS"]
+        assert pd.isna(df["query_distance_m"].iloc[0])
+
+    def test_a_far_no_date_pano_is_reclassified_too(self):
+        # NO_DATE is present imagery, so the radius applies to it exactly as to OK
+        df = apply_query_radius(_gsv_frame([20, 500], statuses=["NO_DATE", "NO_DATE"]))
+        assert df["status"].tolist() == ["NO_DATE", OUT_OF_RADIUS, "ZERO_RESULTS"]
+
+    def test_the_seam_is_idempotent(self):
+        once = apply_query_radius(_gsv_frame([10, 51]))
+        twice = apply_query_radius(once)
+        pd.testing.assert_frame_equal(once, twice)
+
+    def test_a_census_provider_frame_is_returned_unchanged(self):
+        # Mapillary assigns panos to points from exact tile geometry; a pano
+        # far from the query point is not an overshoot there.
+        df = _gsv_frame([3_000_000])
+        out = apply_query_radius(df, provider="mapillary")
+        assert out is df
+        assert out["status"].tolist() == ["OK", "ZERO_RESULTS"]
+        assert out_of_radius_count(df, "mapillary") == 0
+
+    def test_out_of_radius_count_agrees_on_raw_and_loaded_frames(self):
+        raw = _gsv_frame([10, 51, 3_000_000])
+        assert out_of_radius_count(raw) == 2
+        assert out_of_radius_count(apply_query_radius(raw)) == 2
+
+    def test_distance_stats_are_great_circle_not_planar(self):
+        # 1 degree of longitude at 60 N is ~55.6 km; the planar
+        # sqrt(dlat^2 + dlon^2) * 111000 this replaced said 111 km.
+        assert haversine_m(60.0, 0.0, 60.0, 1.0) == pytest.approx(55_597, abs=1)
+        df = pd.DataFrame(
+            [
+                (
+                    60.0,
+                    0.0,
+                    "2026-01-15T12:00:00+00:00",
+                    60.0,
+                    1.0,
+                    "e",
+                    "2024-06-01",
+                    "© Google",
+                    "OK",
+                )
+            ],
+            columns=COLUMNS,
+        )
+        # Straight into the stats, no seam: DistanceStats computes the distance
+        # itself when query_distance_m is absent.
+        dist = calculate_coverage_stats(df).pano_distance_stats
+        assert dist.max_meters == pytest.approx(55_597, abs=1)
+
+    def test_the_js_query_radius_agrees_with_python(self):
+        """The browser drops the same far panos the published stats do, only
+        while its copy of the constant and the sphere match this one. Read out
+        of the source, as test_the_js_run_filename_regex_agrees_with_python
+        does -- there is no Node in the fast suite."""
+        js = (
+            pathlib.Path(__file__).resolve().parent.parent / "www" / "js" / "streetscape-utils.js"
+        ).read_text(encoding="utf-8")
+        radius = re.search(r"^const GSV_QUERY_RADIUS_M = ([0-9.]+);$", js, re.MULTILINE)
+        earth = re.search(r"^const EARTH_RADIUS_M = ([0-9.]+);$", js, re.MULTILINE)
+        assert radius and earth, "streetscape-utils.js no longer declares the #367 constants"
+        assert float(radius.group(1)) == GSV_QUERY_RADIUS_M
+        assert float(earth.group(1)) == EARTH_RADIUS_M

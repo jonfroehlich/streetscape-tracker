@@ -1760,6 +1760,87 @@ def test_migrate_v13_to_v14(tmp_path):
     conn2.close()
 
 
+def _v15_catalog(tmp_path, keep=()):
+    """A catalog at v15: db._SCHEMA minus the v16 query-radius columns (except
+    any named in ``keep``, to simulate an interrupted migration), with one
+    pre-v16 gsv run seeded."""
+    db_path = str(tmp_path / "v15.db")
+    raw = sqlite3.connect(db_path)
+    raw.executescript(db._SCHEMA)
+    for col in db._QUERY_RADIUS_RUN_COLUMNS:
+        if col not in keep:
+            raw.execute(f"ALTER TABLE runs DROP COLUMN {col}")
+    raw.execute(
+        """INSERT INTO cities (city_id, display_name, city_name, center_lat,
+           center_lon, grid_width_m, grid_height_m, step_m, created_at)
+           VALUES ('bend--or', 'Bend, OR', 'Bend', 44.05, -121.31,
+                   5000, 5000, 20, '2026-01-01T00:00:00+00:00')"""
+    )
+    raw.execute(
+        """INSERT INTO runs (city_id, provider, run_date, csv_filename, coverage_rate_pct)
+           VALUES ('bend--or', 'gsv', '2026-05-01', 'old.csv.gz', 87.5)"""
+    )
+    raw.execute("PRAGMA user_version = 15")
+    raw.commit()
+    raw.close()
+    return db_path
+
+
+def test_migrate_adds_the_query_radius_columns_as_null(tmp_path):
+    """v15 -> v16 (issue #367): runs gains status_out_of_radius and
+    query_radius_m, and a pre-v16 row reads NULL for both -- "computed before
+    the rule existed", which is what recompute_run_stats.py later fills in --
+    while keeping the coverage it was stored with."""
+    conn = db.connect(_v15_catalog(tmp_path))
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)").fetchall()}
+    assert set(db._QUERY_RADIUS_RUN_COLUMNS) <= cols
+    run = db.get_latest_run(conn, "bend--or")
+    assert run.coverage_rate_pct == 87.5
+    assert run.status_out_of_radius is None
+    assert run.query_radius_m is None
+    conn.close()
+    # Idempotent: reopening must not error or re-migrate.
+    db.connect(str(tmp_path / "v15.db")).close()
+
+
+def test_an_interrupted_query_radius_migration_completes(tmp_path):
+    """Named by content and guarded per column, so a catalog stopped between
+    its two ADD COLUMNs -- or one that reaches this step under a different
+    version number after a renumbering -- finishes rather than failing on the
+    column that already exists."""
+    conn = db.connect(_v15_catalog(tmp_path, keep=("status_out_of_radius",)))
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)").fetchall()}
+    assert set(db._QUERY_RADIUS_RUN_COLUMNS) <= cols
+    conn.close()
+
+
+def test_register_run_round_trips_the_query_radius_pair(conn):
+    cid = db.register_city(
+        conn,
+        city_name="Bend",
+        state_name="Oregon",
+        state_code="OR",
+        country_name="United States",
+        country_code="US",
+        center_lat=44.05,
+        center_lon=-121.31,
+        grid_width_m=200,
+        grid_height_m=200,
+        step_m=20,
+    )
+    db.register_run(
+        conn,
+        city_id=cid,
+        run_date=date(2026, 5, 1),
+        csv_filename="r.csv.gz",
+        status_out_of_radius=7,
+        query_radius_m=50.0,
+    )
+    run = db.get_latest_run(conn, cid)
+    assert (run.status_out_of_radius, run.query_radius_m) == (7, 50.0)
+
+
 def test_run_row_carries_every_runs_column(conn):
     """
     `_row_to_run` builds RunRow(**dict(row)) from `SELECT *`, so a column added

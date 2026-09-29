@@ -54,6 +54,9 @@ const {
   mergeStreetwalkStats,
   cityDisplayLabel,
   cityFullLabel,
+  GSV_QUERY_RADIUS_M,
+  haversineMeters,
+  isWithinQueryRadius,
 } = require("../streetscape-utils.js");
 
 // --- cityDisplayLabel / cityFullLabel --------------------------------------
@@ -600,6 +603,34 @@ test("the unknown-provider date floor is the loosest registered one, not a named
   const old = panoDateOrNull("2005-06-01");
   assert.equal(isPlausibleCaptureDate(old, "notaprovider"), true);
   assert.equal(isPlausibleCaptureDate(old, "gsv"), false);
+});
+
+// --- issue #367: the GSV query radius --------------------------------------
+
+test("haversineMeters is great-circle, not planar: 1° of longitude at 60°N is ~55.6 km", () => {
+  // The planar sqrt(dlat²+dlon²)·111000 the Python stats used before #367
+  // said 111 km here; it ignored cos(latitude).
+  assert.ok(Math.abs(haversineMeters(60, 0, 60, 1) - 55597) < 1);
+  assert.ok(Math.abs(haversineMeters(0, 0, 1, 0) - 111195) < 1);
+  // A missing coordinate is NaN, never 0 (0 would read as "on the point").
+  assert.ok(Number.isNaN(haversineMeters(47, -122, null, -122)));
+  assert.ok(Number.isNaN(haversineMeters(47, -122, undefined, -122)));
+});
+
+test("isWithinQueryRadius drops only a GSV pano strictly beyond GSV_QUERY_RADIUS_M", () => {
+  assert.equal(GSV_QUERY_RADIUS_M, 50);
+  // 1 m of latitude is 1/111195 degrees, so these sit at ~49 m and ~51 m.
+  const at = (m) => ({ query_lat: 47, query_lon: -122, pano_lat: 47 + m / 111195, pano_lon: -122 });
+  assert.equal(isWithinQueryRadius(at(49), "gsv"), true);
+  assert.equal(isWithinQueryRadius(at(51), "gsv"), false);
+  // Anchorage query, Kerala pano (#367's worst case): far, and dropped.
+  const kerala = { query_lat: 61.2, query_lon: -149.9, pano_lat: 9.5, pano_lon: 76.34 };
+  assert.equal(isWithinQueryRadius(kerala, "gsv"), false);
+  // An unset provider defaults to gsv, as isPlausibleCaptureDate does.
+  assert.equal(isWithinQueryRadius(kerala, null), false);
+  // Census providers are never filtered; neither is an unmeasurable row.
+  assert.equal(isWithinQueryRadius(kerala, "mapillary"), true);
+  assert.equal(isWithinQueryRadius({ ...kerala, pano_lat: null }, "gsv"), true);
 });
 
 // --- issue #116: any-imagery coverage stratification -----------------------

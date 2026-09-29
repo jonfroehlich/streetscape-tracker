@@ -1365,6 +1365,75 @@ function isPlausibleCaptureDate(date, provider) {
 }
 
 /**
+ * How far a GSV pano may sit from the grid point that asked for it and still
+ * count as imagery AT that point, in metres (issue #367). The JS mirror of
+ * analysis.GSV_QUERY_RADIUS_M, which is the source of truth; the two are
+ * pinned equal by tests/test_coverage.py, which reads this line.
+ *
+ * Google's metadata `radius` (default 50 m, never overridden by our
+ * downloader) is a search hint, not a bound: about one covered GSV point in
+ * ten comes back with a pano further away, a few on other continents. The run
+ * CSV that city.js streams keeps those rows verbatim, so the rule has to be
+ * applied here as well as in the published stats.
+ */
+const GSV_QUERY_RADIUS_M = 50;
+
+/**
+ * Mean Earth radius in metres — the same constant as
+ * geoutils.EARTH_RADIUS_M, so both sides measure one distance identically.
+ */
+const EARTH_RADIUS_M = 6371008.8;
+
+/**
+ * Great-circle distance in metres between two lat/lon points (degrees). The
+ * JS mirror of geoutils.haversine_m. Any non-finite coordinate yields NaN,
+ * never 0, so a missing pano position cannot read as standing on its query
+ * point.
+ *
+ * @example
+ *   haversineMeters(60, 0, 60, 1); // ≈ 55597 — 1° of longitude at 60°N
+ *
+ * @param {number} lat1
+ * @param {number} lon1
+ * @param {number} lat2
+ * @param {number} lon2
+ * @returns {number} Distance in metres, or NaN.
+ */
+function haversineMeters(lat1, lon1, lat2, lon2) {
+  if (![lat1, lon1, lat2, lon2].every((v) => typeof v === "number" && Number.isFinite(v))) {
+    return NaN;
+  }
+  const rad = Math.PI / 180;
+  const phi1 = lat1 * rad;
+  const phi2 = lat2 * rad;
+  const dPhi = phi2 - phi1;
+  const dLambda = (lon2 - lon1) * rad;
+  const a = Math.sin(dPhi / 2) ** 2
+    + Math.cos(phi1) * Math.cos(phi2) * Math.sin(dLambda / 2) ** 2;
+  return 2 * EARTH_RADIUS_M * Math.asin(Math.sqrt(Math.min(1, Math.max(0, a))));
+}
+
+/**
+ * Does this run row's pano count as imagery at its grid point? The JS mirror
+ * of analysis.apply_query_radius (issue #367): false only for a GSV row whose
+ * pano lies strictly further than GSV_QUERY_RADIUS_M from its query point.
+ * Every other provider is always true — the census providers assign panos to
+ * points from exact tile geometry — and so is a row whose distance cannot be
+ * computed: unknown is not far.
+ *
+ * @param {Object} row - A parsed run-CSV row (query_lat/lon, pano_lat/lon).
+ * @param {?string} [provider="gsv"] - Provider key (see PROVIDERS).
+ * @returns {boolean}
+ */
+function isWithinQueryRadius(row, provider) {
+  // `provider || "gsv"` for the same reason as isPlausibleCaptureDate: an
+  // explicit null/"" must not skip the default.
+  if ((provider || "gsv") !== "gsv") return true;
+  const d = haversineMeters(row.query_lat, row.query_lon, row.pano_lat, row.pano_lon);
+  return !(d > GSV_QUERY_RADIUS_M);
+}
+
+/**
  * Parse a pano capture date, returning null when the date is absent
  * (age_stats are all null for a 0-pano run). Guards against
  * `new Date(null)` silently rendering as the Unix epoch (12/31/1969)
@@ -1687,6 +1756,10 @@ if (typeof module !== "undefined" && module.exports) {
     adaptCitiesPayload,
     isGoogleCopyright,
     isPlausibleCaptureDate,
+    GSV_QUERY_RADIUS_M,
+    EARTH_RADIUS_M,
+    haversineMeters,
+    isWithinQueryRadius,
     panoDateOrNull,
     googleSharePercent,
     buildFilledHistogram,
