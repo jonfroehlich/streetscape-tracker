@@ -5719,15 +5719,32 @@ def _street_collect_cmd(
     # leaves the configured window alone; production always knows, and
     # `test_the_production_dispatch_shrinks_the_window_for_a_clamped_child` pins
     # that it passes it.
+    #
+    # When a wall-clock budget is forwarded as well (issue #344), THAT is the
+    # binding clock for this pre-crawl phase, not the kill: `max_seconds` runs
+    # from the child's own process start, the Overpass fetch spends out of it,
+    # and a slow-but-successful fetch that ends past it leaves the census to
+    # turn its FIRST unit away. With nothing committed that is a plain
+    # DownloadError -- a counted consecutive_failure for 0 requests sent -- so
+    # the window is sized against the census deadline whenever there is one.
+    # The request cap cannot produce that failure (the launch floor guarantees
+    # TILE_MAX_TRIES requests); only the clock can be spent before the first.
     retry_policy = cfg.overpass_retry
-    if child_timeout_s is not None:
-        retry_policy = policy_for_child_timeout(retry_policy, child_timeout_s)
+    retry_clock_s = max_seconds if max_seconds is not None else child_timeout_s
+    if retry_clock_s is not None:
+        retry_policy = policy_for_child_timeout(retry_policy, retry_clock_s)
         if retry_policy != cfg.overpass_retry:
+            binding = (
+                f"this child's census stops on the clock at {max_seconds}s, and a "
+                f"fetch that ends past it leaves the census no time to commit anything"
+                if max_seconds is not None
+                else f"this child is killed at {child_timeout_s}s, and a "
+                f"SIGKILL mid-retry would record no exit code for the breaker"
+            )
             logger.info(
                 f"{city.city_id} [{channel}]: Overpass retry window shortened to "
                 f"{retry_policy.window_s:.0f}s over at most {retry_policy.max_attempts} "
-                f"attempt(s) -- this child is killed at {child_timeout_s}s, and a "
-                f"SIGKILL mid-retry would record no exit code for the breaker"
+                f"attempt(s) -- {binding}"
             )
     cmd = [
         sys.executable,

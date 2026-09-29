@@ -811,6 +811,21 @@ def test_the_argv_carries_the_shortened_window_for_a_clamped_child(tmp_path):
     assert _policy_in(_walk_cmd(cfg, child_timeout_s=300)).max_attempts == 1
 
 
+def test_a_forwarded_clock_budget_sizes_the_window_not_the_kill(tmp_path):
+    """Issue #344 review: the census deadline runs from the child's process
+    start and the Overpass fetch spends out of it, so a window sized to the
+    SIGKILL alone can end after the census may no longer admit its first unit
+    -- a plain DownloadError for 0 requests. With `max_seconds` forwarded, the
+    window is sized to IT: the same generous kill timeout that leaves the
+    configured window alone must now shorten it."""
+    cfg = _load(tmp_path, _NON_DEFAULT_TOML)
+    unclocked = _policy_in(_walk_cmd(cfg, child_timeout_s=10_800))
+    assert unclocked == _NON_DEFAULT, "the kill alone leaves this window alone"
+    clocked = _policy_in(_walk_cmd(cfg, child_timeout_s=10_800, max_seconds=600))
+    assert clocked == policy_for_child_timeout(_NON_DEFAULT, 600)
+    assert clocked.window_s < unclocked.window_s
+
+
 @pytest.mark.parametrize("channel", sorted(scheduler.STREET_CHANNELS))
 def test_the_production_dispatch_shrinks_the_window_for_a_clamped_child(
     tmp_path, monkeypatch, channel
