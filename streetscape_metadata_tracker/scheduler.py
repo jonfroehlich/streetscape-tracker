@@ -6792,12 +6792,22 @@ def _collect_due(
             # sub-queue keeps union order, so stalest-first holds within a
             # channel, and with one channel stranded the take is unchanged.
             # Groups 0 and 2 are single-queue rotations and order as before.
+            #
+            # The rotation STARTS at a night-varying sub-queue, the run date's
+            # ordinal modulo the number of non-empty sub-queues. Started at rank
+            # order's head every night it fixes nothing on prod: at max_opt_in =
+            # 10 with all three groups non-empty group 1 gets ~3 slots, and with
+            # four stranded channels the LAST one got 0 every night -- #348 one
+            # level further in. The guarantee is exactly this, and no more:
+            # while the set of non-empty sub-queues is unchanged and group 1
+            # receives >= 1 slot a night, every stranded channel is reached
+            # within (number of sub-queues) consecutive nights.
             class _Rotation:
-                """Round-robin over sub-queues; each ``take`` visits the next."""
+                """Round-robin over sub-queues, starting at ``offset`` mod their count."""
 
-                def __init__(self, subqueues: list[list[int]]) -> None:
+                def __init__(self, subqueues: list[list[int]], offset: int) -> None:
                     self._subqueues = [q for q in subqueues if q]
-                    self._cursor = 0
+                    self._cursor = offset % len(self._subqueues) if self._subqueues else 0
 
                 def __bool__(self) -> bool:
                     return bool(self._subqueues)
@@ -6814,8 +6824,9 @@ def _collect_due(
                     return index
 
             def _leading_channel(index: int) -> str:
-                due = providers_for_city[ordered[index].city_id]
-                return next(p for p in providers if p in due)
+                # Appended in due_by_provider order, whose keys are `providers`
+                # in rank order, so [0] IS the earliest-ranked due channel.
+                return providers_for_city[ordered[index].city_id][0]
 
             groups: dict[int, dict[str, list[int]]] = {}
             for i in stranded:
@@ -6827,7 +6838,10 @@ def _collect_due(
             # Sub-queues rotate in `providers` rank order, not first-seen order.
             rank = {p: n for n, p in enumerate(providers)}
             queues = [
-                _Rotation([subs[k] for k in sorted(subs, key=lambda k: rank.get(k, -1))])
+                _Rotation(
+                    [subs[k] for k in sorted(subs, key=lambda k: rank.get(k, -1))],
+                    today.toordinal(),
+                )
                 for _, subs in sorted(groups.items())
             ]
             while len(chosen) < max_opt_in and any(queues):

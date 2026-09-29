@@ -3139,6 +3139,138 @@ def test_one_stranded_opt_in_channel_takes_the_reservation_in_union_order(conn, 
     assert slate.hoisted == 5
 
 
+_PROD_SLATE = [
+    "gsv",
+    "mapillary",
+    "kartaview",
+    "kartaview_streets",
+    "panoramax",
+    "panoramax_streets",
+]
+_OPT_IN_CHANNELS = _PROD_SLATE[2:]
+
+
+def _prod_shaped_stranded_slate(conn):
+    """Every stranded kind non-empty, and four stranded opt-in channels.
+
+    Returns ``{city_id: label}``, where the label is ``"kind0"``, ``"kind2"``
+    or the city's leading opt-in channel.
+    """
+    labels = {}
+    for i in range(10):
+        labels[_register(conn, f"Exc{i}", width=1000, height=1000, step=20)] = "kind0"
+    for i in range(10):
+        labels[_register(conn, f"Mly{i}", width=1000, height=1000, step=20)] = "kind2"
+    shapes = [
+        ("Kv", 10, "kartaview", ("kartaview", "kartaview_streets")),
+        ("Kw", 3, "kartaview_streets", ("kartaview", "kartaview_streets")),
+        ("Pg", 3, "panoramax", ("panoramax", "panoramax_streets")),
+        ("Pw", 3, "panoramax_streets", ("panoramax", "panoramax_streets")),
+    ]
+    for prefix, n, leading, _ in shapes:
+        for i in range(n):
+            labels[_register(conn, f"{prefix}{i}", width=1000, height=1000, step=20)] = leading
+    db.assign_schedule(conn, 90, providers=tuple(_PROD_SLATE))
+    for cid, label in labels.items():
+        if label == "kind0":
+            db.set_channel_membership(conn, cid, "gsv", False, cycle_days=90)
+            continue
+        db.record_attempt(conn, cid, success=True, provider="gsv")
+        if label == "kind2":
+            continue
+        db.record_attempt(conn, cid, success=True, provider="mapillary")
+        enrolled = next(ch for _, _, lead, ch in shapes if lead == label)
+        for channel in enrolled:
+            db.set_channel_membership(conn, cid, channel, True, cycle_days=90)
+        if label.endswith("_streets"):
+            # A walk-only straggler: its grid sibling already succeeded.
+            db.record_attempt(conn, cid, success=True, provider=label.removesuffix("_streets"))
+    return labels
+
+
+def _chosen_labels(conn, monkeypatch, labels, today, providers, max_opt_in):
+    from collections import Counter
+
+    from streetscape_metadata_tracker import scheduler as sched
+
+    monkeypatch.setattr(sched, "_sweep_checkpoint_progress", lambda cfg, city, channel: None)
+    cfg = _sweep_cfg(publish_enabled=False, opt_in_cities_per_day=max_opt_in)
+    slate = sched._collect_due(
+        conn, cfg, today, list(providers), max_opt_in=max_opt_in, max_cities=60
+    )
+    return Counter(labels[c.city_id] for c in slate.cities[:max_opt_in])
+
+
+def test_the_channel_rotation_reaches_every_stranded_channel_across_nights(conn, monkeypatch):
+    """Review of #348: a rotation starting at rank order's head every night
+    starves the LAST sub-queue whenever group 1 gets fewer slots than it has
+    channels, which on prod it does.
+
+    At max_opt_in = 10 with all three groups non-empty the outer round-robin
+    gives group 0 four slots, groups 1 and 2 three each; with four stranded
+    opt-in channels, a fixed start handed panoramax_streets 0 every night. The
+    start moves with the run date's ordinal, so over four consecutive nights
+    every channel is chosen, and each night skips exactly the channel just
+    before that night's start.
+    """
+    labels = _prod_shaped_stranded_slate(conn)
+    reached = set()
+    for day in range(4):
+        today = date(2026, 7, 2) + timedelta(days=day)
+        got = _chosen_labels(conn, monkeypatch, labels, today, _PROD_SLATE, 10)
+        start = today.toordinal() % 4
+        skipped = _OPT_IN_CHANNELS[(start - 1) % 4]
+        expected = {"kind0": 4, "kind2": 3} | {ch: 1 for ch in _OPT_IN_CHANNELS if ch != skipped}
+        assert dict(got) == expected, f"night {today}"
+        reached |= {ch for ch in _OPT_IN_CHANNELS if got[ch]}
+    assert reached == set(_OPT_IN_CHANNELS), "every stranded channel within four nights"
+
+
+def test_the_channel_rotation_does_not_skip_past_an_emptied_sub_queue(conn, monkeypatch):
+    """A size-1 sub-queue in the MIDDLE empties on its first take; the cursor
+    must then land on the NEXT sub-queue, not the one after it.
+
+    Sub-queues [kartaview x2], [kartaview_streets x1], [panoramax x2], on a date
+    whose ordinal starts the rotation at kartaview, at a reservation of 3: one
+    each. Advancing the cursor past the deleted slot would take a second
+    kartaview and starve panoramax.
+    """
+    kv = [_opt_in_only(conn, f"Kv{i}", ("kartaview", "kartaview_streets")) for i in range(2)]
+    walk = _opt_in_only(conn, "Kw0", ("kartaview", "kartaview_streets"))
+    db.record_attempt(conn, walk, success=True, provider="kartaview")
+    pmx = [_opt_in_only(conn, f"Pg{i}", ("panoramax",)) for i in range(2)]
+    labels = dict.fromkeys(kv, "kartaview") | {walk: "kartaview_streets"}
+    labels |= dict.fromkeys(pmx, "panoramax")
+
+    today = date(2026, 7, 2)
+    today += timedelta(days=-today.toordinal() % 3)
+    assert today.toordinal() % 3 == 0
+    got = _chosen_labels(conn, monkeypatch, labels, today, _OPT_IN_SLATE, 3)
+    assert dict(got) == {"kartaview": 1, "kartaview_streets": 1, "panoramax": 1}
+
+
+def test_the_channel_rotation_starts_in_rank_order_on_a_fixed_date(conn, monkeypatch):
+    """Pins WHICH channel a given night starts at, so the sub-queues are known
+    to rotate in `providers` rank order rather than any other.
+
+    Three sub-queues and a reservation of 1: a date whose ordinal is 0 mod 3
+    starts at kartaview, one that is 2 mod 3 at panoramax. Position 1 is not
+    asked, since it is kartaview_streets in either direction.
+    """
+    kv = _opt_in_only(conn, "Kv0", ("kartaview", "kartaview_streets"))
+    walk = _opt_in_only(conn, "Kw0", ("kartaview", "kartaview_streets"))
+    db.record_attempt(conn, walk, success=True, provider="kartaview")
+    pmx = _opt_in_only(conn, "Pg0", ("panoramax",))
+    labels = {kv: "kartaview", walk: "kartaview_streets", pmx: "panoramax"}
+
+    for residue, leading in ((0, "kartaview"), (2, "panoramax")):
+        today = date(2026, 7, 2)
+        today += timedelta(days=(residue - today.toordinal()) % 3)
+        assert today.toordinal() % 3 == residue
+        got = _chosen_labels(conn, monkeypatch, labels, today, _OPT_IN_SLATE, 1)
+        assert dict(got) == {leading: 1}, f"ordinal {residue} mod 3"
+
+
 def test_a_city_due_only_on_an_opt_in_channel_is_hoisted_ahead_of_the_gsv_block(conn):
     """Without this the channel is scoped but never REACHED.
 
