@@ -136,7 +136,9 @@ class TestNoDateCountsAsPresent:
         return pd.DataFrame(
             [
                 (44.000, -121.0, ts, 44.0001, -121.0001, "ok1", "2020-06-01", "© Google", "OK"),
-                (44.001, -121.0, ts, 44.0011, -121.0011, "nd1", None, "© Google", "NO_DATE"),
+                # Within the 50 m query radius (issue #367); at -121.0011 this
+                # pano sat 88 m east and would read as OUT_OF_RADIUS.
+                (44.001, -121.0, ts, 44.0011, -121.0001, "nd1", None, "© Google", "NO_DATE"),
                 (44.002, -121.0, ts, None, None, None, None, None, "ZERO_RESULTS"),
             ],
             columns=COLUMNS,
@@ -348,6 +350,22 @@ class TestQueryRadius:
         assert stats["unique_google_panos"] == 2
         assert stats["coverage_rate_pct"] == 40.0
         assert stats["query_radius_m"] == GSV_QUERY_RADIUS_M == 50.0
+
+    def test_run_stats_apply_the_rule_to_a_raw_frame_themselves(self):
+        # query_radius_m = 50.0 is a MEASUREMENT: a raw gsv frame handed
+        # straight to calculate_run_stats, with no loader in between, is
+        # counted under the rule it reports.
+        stats = calculate_run_stats(_gsv_frame([10, 3_000_000]), date(2026, 1, 15))
+        assert stats["status_out_of_radius"] == 1
+        assert stats["status_ok"] == 1
+        assert stats["coverage_rate_pct"] == pytest.approx(100 / 3)
+
+    def test_a_gsv_frame_without_coordinates_is_returned_with_a_warning(self, caplog):
+        df = _gsv_frame([3_000_000]).drop(columns=["pano_lat"])
+        with caplog.at_level("WARNING", logger="streetscape_metadata_tracker.analysis"):
+            out = apply_query_radius(df)
+        assert out is df
+        assert "lacks pano_lat" in caplog.text
 
     def test_query_radius_m_is_null_for_a_census_provider(self):
         df = make_mapillary_city_df([("m1", "2024-06-01")])

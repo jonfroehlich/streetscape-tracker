@@ -123,11 +123,24 @@ def apply_query_radius(df: pd.DataFrame, provider: str = "gsv") -> pd.DataFrame:
         >>> apply_query_radius(df)["status"].tolist()
         ['OK', 'OUT_OF_RADIUS']
     """
+    if provider != "gsv":
+        return df
     cols = ("query_lat", "query_lon", "pano_lat", "pano_lon")
-    if provider != "gsv" or not all(c in df.columns for c in cols):
+    missing = [c for c in cols if c not in df.columns]
+    if missing:
+        # Said out loud: a gsv frame the rule cannot be applied to publishes
+        # the unfiltered definition, and that should never be silent.
+        logger.warning(
+            f"apply_query_radius: gsv frame lacks {', '.join(missing)}; returning it unfiltered"
+        )
         return df
     out = df.copy()
-    distance = haversine_m(out["query_lat"], out["query_lon"], out["pano_lat"], out["pano_lon"])
+    # Coerced, because a frame built in memory (not read through the loader's
+    # float schema) can hold None in an object column, which numpy's radians
+    # cannot take; an unparseable coordinate becomes NaN, and NaN never
+    # reclassifies.
+    lat_q, lon_q, lat_p, lon_p = (pd.to_numeric(out[c], errors="coerce") for c in cols)
+    distance = haversine_m(lat_q, lon_q, lat_p, lon_p)
     out["query_distance_m"] = distance
     far = out["status"].isin(PRESENT_STATUSES) & (distance > GSV_QUERY_RADIUS_M)
     out.loc[far, "status"] = OUT_OF_RADIUS
@@ -914,6 +927,11 @@ def calculate_run_stats(df: pd.DataFrame, run_date, provider: str = "gsv") -> di
         Dict matching db.register_run keyword arguments (stats subset).
     """
     now = pd.Timestamp(run_date)
+    # The query-radius rule (issue #367) is applied HERE as well as at the
+    # loader, so the query_radius_m this returns is a measurement of the frame
+    # rather than a claim about how the caller loaded it. Idempotent, so a
+    # frame that already came through the loader is unchanged.
+    df = apply_query_radius(df, provider)
 
     status_ok = int((df["status"] == "OK").sum())
     status_no_date = int((df["status"] == "NO_DATE").sum())
@@ -924,8 +942,7 @@ def calculate_run_stats(df: pd.DataFrame, run_date, provider: str = "gsv") -> di
     status_flat_only = int((df["status"] == FLAT_ONLY).sum())
     # OUT_OF_RADIUS (issue #367) is a real answer too ("Google's pano for this
     # point was too far away to count"), split out of status_other the same
-    # way. Counted off the frame in hand: the loader has already applied the
-    # rule, and a raw frame passed straight in carries none of these rows.
+    # way.
     status_out_of_radius = int((df["status"] == OUT_OF_RADIUS).sum())
     status_other = int(
         len(df) - status_ok - status_no_date - status_zero - status_flat_only - status_out_of_radius
