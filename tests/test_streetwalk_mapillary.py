@@ -75,6 +75,13 @@ CITY_ID = "bend--oregon--united-states"
 RUN_DATE = "2026-07-08"
 
 
+def _host_spend(conn, provider):
+    """What ``provider`` charged to the per-host rolling ledger (issue #385)."""
+    return conn.execute(
+        "SELECT COALESCE(SUM(requests), 0) FROM host_usage WHERE provider = ?", (provider,)
+    ).fetchone()[0]
+
+
 def _edges():
     return gpd.GeoDataFrame(
         {"edge_id": ["1_2", "2_3"], "highway": ["residential", "service"], "length": [222.0, 55.0]},
@@ -249,6 +256,11 @@ def test_panos_along_the_edge_cover_it_and_meter_only_the_streets_channel(tmp_pa
     assert db.get_api_usage(conn, d, provider="mapillary_streets") == 7
     assert db.get_api_usage(conn, d, provider="mapillary") == 0
     assert db.get_api_usage(conn, d, provider="gsv_streets") == 0
+    # The per-host rolling ledger (issue #385), under the channel name the walk
+    # ledgers with -- read from STREET_BUDGET_CHANNELS, so renaming that entry
+    # to something CHANNEL_METERED_HOST does not know is a red test rather than
+    # a walk whose tiles silently stop counting against the tile CDN's window.
+    assert _host_spend(conn, collect.STREET_BUDGET_CHANNELS["mapillary"]) == 7
     conn.close()
 
 
@@ -1073,6 +1085,8 @@ def test_a_walk_whose_tail_dies_still_records_what_the_census_cost(tmp_path, mon
     assert db.get_api_usage(conn, date(2026, 7, 8), provider="mapillary_streets") == 11, (
         "the tiles were bought; the ledger has to know even though the walk failed"
     )
+    # The failed-crawl arm meters the host too (issue #385).
+    assert _host_spend(conn, collect.STREET_BUDGET_CHANNELS["mapillary"]) == 11
 
 
 # --- The shared census cache (issue #290) -----------------------------------

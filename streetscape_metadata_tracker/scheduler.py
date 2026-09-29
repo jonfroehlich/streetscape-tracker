@@ -5883,7 +5883,13 @@ def cmd_assess_city(
     #     attempt, so without this term a rejected channel beside a collected
     #     one scores attempted == succeeded == 1 and exits 0.
     collected_everything = attempted > 0 and succeeded == attempted
-    nothing_deferred = skipped_budget == 0 and not deferred_channels and not deferred_host_budget
+    # `sum(...)`, not the Counter's truthiness, for the host term (issue #385
+    # review): a Counter holding a zero-count key is truthy. Nothing writes one
+    # today (every write is `+= 1`), and this makes that an irrelevance rather
+    # than an invariant to remember.
+    nothing_deferred = (
+        skipped_budget == 0 and not deferred_channels and sum(deferred_host_budget.values()) == 0
+    )
     hosts_were_fine = not blocked_hosts and not busy_hosts
     complete = collected_everything and nothing_deferred and hosts_were_fine and not rejected_argv
     if complete and (published or not publish_wanted):
@@ -9601,9 +9607,12 @@ def _finish_batch(
 
     # Age out the per-host rolling ledger (issue #385). The gate reads 24 h;
     # the rest of the 30 days is for a block's forensics. Best-effort like the
-    # census prune above: a failure is logged and noted in the summary (and so
-    # the [alerts] mail and publish log), never raised -- an unpruned table
-    # costs a few rows a night, a raised one would cost the night's publish.
+    # census prune above: a failure is logged and noted in the summary, never
+    # raised -- an unpruned table costs a few rows a night, a raised one would
+    # cost the night's publish. The summary reaches the publish log whenever
+    # the night publishes, but the [alerts] mail only when the night is
+    # unhealthy for some OTHER reason: a failed prune alone alerts nobody,
+    # which is the right weight for it, so the log line is its real record.
     try:
         pruned_usage = db.prune_host_usage(conn, clock.utc_now() - HOST_USAGE_RETENTION)
         if pruned_usage:
@@ -9630,8 +9639,9 @@ def _finish_batch(
     #
     # Logged as well as appended, and that is not redundancy: the "Done: ..."
     # line is emitted by cmd_run_due BEFORE this function runs, so an append to
-    # `summary` reaches the [alerts] email and the publish log but never the
-    # scheduler log on a healthy night. `grep 'cgroup peak'` over a week of logs
+    # `summary` reaches the publish log (and the [alerts] email, on a night
+    # unhealthy for some other reason) but never the scheduler log on a
+    # healthy night. `grep 'cgroup peak'` over a week of logs
     # is the measurement #305 asks for before max_concurrent_channels is raised.
     memory_note = cgroup_memory.describe_cgroup_memory()
     if memory_note:

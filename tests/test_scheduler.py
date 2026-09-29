@@ -14236,37 +14236,60 @@ def test_the_dry_run_draws_the_host_pool_down_across_both_channels(
     ]
 
 
-@pytest.mark.parametrize("hosts", [None, "[hosts]\n"], ids=["no-section", "empty-table"])
 def test_no_host_budget_configured_is_todays_launch_exactly(
-    conn, monkeypatch, tmp_path, frozen_utc_clock, hosts
+    conn, monkeypatch, tmp_path, frozen_utc_clock
 ):
-    """Absent (or empty) [hosts] reads nothing into the gate, however full the ledger.
+    """Absent, empty or unreachable [hosts] launches byte-identical children.
 
-    10,000 requests sit in the window. Without a budget the launch is capped at
-    the channel's own 2,000 remainder, with kwargs identical across both spellings;
-    with the prod budget the same ledger defers it -- which is what makes the
-    first half a real measurement rather than a harness that could not see a
-    host term at all.
+    Captured at ``_run_collection_subprocess`` -- the REAL ``_run_one_city``
+    builds the argv, so the request-cap flag, the timeout and everything else
+    the gate could move is compared as the child would receive it, for the grid
+    run AND the walk. 10,000 requests sit in the window: with no budget, an
+    empty ``[hosts]`` table, or a budget of 10,000,000 (whose remainder never
+    undercuts the channel's own 2,000) the launches are identical. The same
+    ledger under the prod budget changes them, which is what makes the first
+    three a measurement rather than a harness blind to the host term.
     """
+    from streetscape_metadata_tracker import scheduler as sched
+
     frozen_utc_clock(_HB_NOW)
     _seed_host(conn, 10_000, _HB_NOW - timedelta(hours=1))
     _register(conn, "Bend")
+    launches = []
 
-    launches = {}
-    for key, spelling in (("absent", None), ("this", hosts), ("budgeted", "3000")):
-        # Each night starts from the same catalog: the fake's success would
-        # otherwise make the city not-due for the next spelling.
+    def capture(cfg_, cmd, timeout_s, city, provider, today_):
+        launches.append((provider, tuple(cmd), timeout_s))
+        return sched.CollectionOutcome(True, "stubbed")
+
+    monkeypatch.setattr(sched, "_run_collection_subprocess", capture)
+    monkeypatch.setattr(sched, "_reconcile_orphaned_run", lambda *a, **k: True)
+    monkeypatch.setattr(sched, "_reconcile_orphaned_walk", lambda *a, **k: True)
+    _stub_tail(monkeypatch, sched, conn, [])
+    monkeypatch.setattr(sched, "send_alert", lambda *a, **k: None)
+
+    nights = {}
+    for key, spelling in (
+        ("absent", None),
+        ("empty", "[hosts]\n"),
+        ("unreachable", "10000000"),
+        ("budgeted", "3000"),
+    ):
+        # Each night starts from the same catalog: a success would otherwise
+        # make the city not-due for the next spelling.
         conn.execute("DELETE FROM schedule_state")
         conn.commit()
-        calls = []
-        cfg = _host_budget_cfg(tmp_path, hosts=spelling, mapillary_budget=2000)
+        launches.clear()
+        cfg = _host_budget_cfg(tmp_path, hosts=spelling, mapillary_budget=2000, walk_budget=2000)
         assert cfg.host_budget_errors == []
-        _host_run(monkeypatch, conn, cfg, calls, requested_providers=["mapillary"])
-        launches[key] = [c[2] for c in calls]
+        sched.cmd_run_due(
+            cfg, today=_HB_TODAY, requested_providers=["mapillary", "mapillary_streets"]
+        )
+        nights[key] = list(launches)
 
-    assert [c["request_cap"] for c in launches["absent"]] == [2000]
-    assert launches["this"] == launches["absent"]
-    assert launches["budgeted"] == [], "the same ledger under a budget defers the launch"
+    assert [p for p, _, _ in nights["absent"]] == ["mapillary", "mapillary_streets"]
+    assert nights["empty"] == nights["absent"]
+    assert nights["unreachable"] == nights["absent"]
+    assert nights["budgeted"] != nights["absent"], "the harness can see a host term"
 
 
 @pytest.mark.parametrize(
@@ -14425,7 +14448,12 @@ def test_the_metered_host_map_agrees_with_channel_hosts():
 def test_the_tail_prunes_old_host_usage_and_survives_a_failed_prune(
     conn, monkeypatch, tmp_path, frozen_utc_clock, caplog
 ):
-    """30 days kept, older dropped; a prune that raises is reported, never raised."""
+    """30 days kept, older dropped; a prune that raises is reported, never raised.
+
+    Reported in BOTH places it can be seen: the scheduler log, and the summary
+    the publish log records (asserted through the ``_publish`` the tail hands it
+    to, so the check does not depend on the log line's wording).
+    """
     from streetscape_metadata_tracker import scheduler as sched
 
     frozen_utc_clock(_HB_NOW)
@@ -14441,7 +14469,73 @@ def test_the_tail_prunes_old_host_usage_and_survives_a_failed_prune(
         raise sqlite3.OperationalError("disk I/O error")
 
     monkeypatch.setattr(sched.db, "prune_host_usage", boom)
+    published = []
+    monkeypatch.setattr(
+        sched, "_publish", lambda cfg_, summary, **kw: published.append(summary) or 0
+    )
+    cfg = _host_budget_cfg(
+        tmp_path,
+        hosts="[hosts.mapillary_tiles]\nrolling_24h_request_budget = 3000\n\n"
+        "[publish]\nenabled = true\n",
+    )
+    assert cfg.publish_enabled
     with caplog.at_level(logging.INFO, logger="streetscape_scheduler"):
-        rc = sched._finish_batch(cfg, conn, "run-due test", 0, 0, _HB_TODAY)
-    assert rc == 0
+        rc = sched._finish_batch(cfg, conn, "run-due test", 1, 1, _HB_TODAY)
+    assert rc == 0, "a failed prune alone does not make the night unhealthy"
     assert any("host_usage prune failed" in r.getMessage() for r in caplog.records)
+    assert len(published) == 1
+    assert "; host_usage prune FAILED (OperationalError('disk I/O error'))" in published[0]
+
+
+def test_the_rolling_window_is_24_hours_wide(conn, tmp_path, frozen_utc_clock):
+    """Spend 23 h back is inside the window, spend 25 h back is not.
+
+    Read through ``_budget_remainder``, the gate itself, rather than
+    ``db.get_host_usage`` with a hand-picked ``since``: what is pinned is
+    ``HOST_BUDGET_WINDOW``'s effect on a launch, so moving the constant either
+    way by two hours is a red test.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    frozen_utc_clock(_HB_NOW)
+    _seed_host(conn, 700, _HB_NOW - timedelta(hours=23))
+    _seed_host(conn, 900, _HB_NOW - timedelta(hours=25))
+    cfg = _host_budget_cfg(tmp_path)
+
+    remainder = sched._budget_remainder(cfg, conn, _HB_TODAY, "mapillary")
+    assert (remainder.host, remainder.host_used, remainder.remaining) == (
+        "mapillary_tiles",
+        700,
+        3000 - 700,
+    )
+    assert remainder.window_start == _HB_NOW - timedelta(hours=24)
+
+
+def test_the_stranded_walk_retry_pass_counts_into_the_nights_host_counter(
+    conn, monkeypatch, tmp_path, frozen_utc_clock, caplog
+):
+    """Issue #385 review: the #380 retry pass is handed the CALLER's counter.
+
+    Its walks go through _run_city_channels like the main loop's, so a walk the
+    host's window defers there has to reach the night's ``Done:`` line. Handing
+    the pass a throwaway ``Counter()`` would type-check, run, and lose every
+    such deferral. The pass is faked to record one, so what is pinned is the
+    wiring, not the retry logic (``test_*stranded*`` pin that).
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    frozen_utc_clock(_HB_NOW)
+    _register(conn, "Bend")
+    cfg = _host_budget_cfg(tmp_path)
+
+    def fake_retry(*a, deferred_host_budget, **k):
+        deferred_host_budget["mapillary_tiles"] += 1
+        return None
+
+    monkeypatch.setattr(sched, "_retry_stranded_walks", fake_retry)
+    with caplog.at_level(logging.INFO, logger="streetscape_scheduler"):
+        _host_run(monkeypatch, conn, cfg, [], requested_providers=["mapillary"])
+
+    done = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Done:")]
+    assert len(done) == 1
+    assert "; 1 deferred for the rolling-24h budget of Mapillary's tile CDN" in done[0]
