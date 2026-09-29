@@ -545,12 +545,17 @@ def test_recompute_reclassifies_panos_beyond_the_query_radius(conn, data_dir):
         grid_height_m=1000,
         step_m=20,
     )
-    df = make_city_df([("far", "2020-06-15"), ("near", "2024-01-10")], run_date=run_date, n_empty=2)
+    # The SAME capture date on both panos, so dropping the far one moves no
+    # date column: the query radius is the only reason this run's JSON can be
+    # rebuilt, which is what makes the rebuild assertion a pin on trigger (3).
+    df = make_city_df([("far", "2024-01-10"), ("near", "2024-01-10")], run_date=run_date, n_empty=2)
     df.loc[0, "pano_lat"] = df.loc[0, "query_lat"] + 0.01  # ~1.1 km north
     csv_name = generate_run_filename(cid, 1000, 1000, 20, run_date) + ".csv.gz"
     csv_path = os.path.join(data_dir, csv_name)
     write_city_csv_gz(df, csv_path)
-    # Stored as the pre-#367 pipeline computed it: both panos covered, 2 of 4.
+    dates = calculate_run_stats(load_city_csv_file(csv_path), run_date, provider="gsv")
+    # Stored as the pre-#367 pipeline computed it: both panos covered, 2 of 4,
+    # with date columns that are already right under either definition.
     db.register_run(
         conn,
         city_id=cid,
@@ -565,10 +570,14 @@ def test_recompute_reclassifies_panos_beyond_the_query_radius(conn, data_dir):
         unique_panos=2,
         unique_google_panos=2,
         coverage_rate_pct=50.0,
+        oldest_capture_date=dates["oldest_capture_date"],
+        newest_capture_date=dates["newest_capture_date"],
+        median_pano_age_years=dates["median_pano_age_years"],
     )
 
     result = _run_script(data_dir, "--execute", "--regenerate-json")
     assert result.returncode == 0, result.stderr
+    assert "0 have capture-date columns this pass moves" in result.stdout
     assert "1 pano(s) beyond the query radius" in result.stdout
     assert "1 hold a pano beyond the query radius" in result.stdout
     assert "Rebuilt 1 of 1" in result.stdout
@@ -585,7 +594,6 @@ def test_recompute_reclassifies_panos_beyond_the_query_radius(conn, data_dir):
     assert row["status_other"] == 0  # a real answer, not an error
     assert row["unique_panos"] == 1
     assert row["query_radius_m"] == 50.0
-    assert row["oldest_capture_date"] == "2024-01-10T00:00:00"  # the far pano aged nothing
 
     with gzip.open(csv_path.replace(".csv.gz", ".json.gz"), "rt", encoding="utf-8") as fh:
         published = json.load(fh)
@@ -600,3 +608,9 @@ def test_recompute_reclassifies_panos_beyond_the_query_radius(conn, data_dir):
     rerun = _run_script(data_dir)
     assert rerun.returncode == 0, rerun.stderr
     assert "0 would change" in rerun.stdout
+
+    # Idempotent: the far pano is still in the CSV, but the JSON is already
+    # built under the rule, so a second rebuild pass rebuilds nothing.
+    again = _run_script(data_dir, "--execute", "--regenerate-json")
+    assert again.returncode == 0, again.stderr
+    assert "Rebuilt 0 of 0" in again.stdout

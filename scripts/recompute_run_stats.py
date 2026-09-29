@@ -86,6 +86,8 @@ rebuilt run's CSV, and a Mapillary census run is millions of rows.
 """
 
 import argparse
+import gzip
+import json
 import logging
 import math
 import os
@@ -98,6 +100,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from streetscape_metadata_tracker import db  # noqa: E402
 from streetscape_metadata_tracker.analysis import (  # noqa: E402
+    GSV_QUERY_RADIUS_M,
     calculate_run_stats,
     implausible_capture_date_count,
     out_of_radius_count,
@@ -179,6 +182,25 @@ def _equalish(a, b) -> bool:
     return a == b
 
 
+def _json_has_query_radius(data_dir: str, json_filename: str | None) -> bool:
+    """
+    True when a run's published JSON was already built under the query radius.
+
+    What keeps --regenerate-json's radius trigger (issue #367) idempotent: a
+    run holding a far pano holds it forever -- the CSV is never rewritten -- so
+    without this every later pass would rebuild every such run again. A file
+    that is missing, unreadable or predates the field reads False, i.e. rebuild.
+    """
+    if not json_filename:
+        return False
+    try:
+        with gzip.open(os.path.join(data_dir, json_filename), "rt", encoding="utf-8") as fh:
+            coverage = json.load(fh).get("coverage") or {}
+    except (OSError, EOFError, ValueError):
+        return False
+    return coverage.get("query_radius_m") == GSV_QUERY_RADIUS_M
+
+
 def _age_delta_note(row, stats, n_implausible: int, n_out_of_radius: int = 0) -> str:
     """
     Trailing '; newest X -> Y, …' fragment for the per-run report line, or ''.
@@ -254,7 +276,7 @@ def main() -> int:
     where = "WHERE provider = ?" if args.provider else ""
     params = (args.provider,) if args.provider else ()
     rows = conn.execute(
-        f"""SELECT run_id, city_id, provider, run_date, csv_filename,
+        f"""SELECT run_id, city_id, provider, run_date, csv_filename, json_filename,
                    total_points, status_ok, status_no_date, status_zero_results,
                    status_flat_only, status_out_of_radius, status_other,
                    unique_panos, unique_google_panos, coverage_rate_pct,
@@ -323,12 +345,17 @@ def main() -> int:
             # (3) Issue #367: a gsv pano beyond the query radius. The published
             # JSON counted it as coverage, as a unique pano, and in the age
             # stats, so the file is wrong wherever the rule reclassified a row
-            # -- even on a pass after the catalog was already repaired.
-            if n_implausible or date_moved or n_out_of_radius:
+            # -- even on a pass after the catalog was already repaired. Unless
+            # the JSON is ALREADY built under the rule: the far pano never
+            # leaves the CSV, so without that check this fires on every pass.
+            radius_stale = bool(n_out_of_radius) and not _json_has_query_radius(
+                args.data_dir, r["json_filename"]
+            )
+            if n_implausible or date_moved or radius_stale:
                 json_repairs.append((r["run_id"], r["csv_filename"], n_implausible))
                 if date_moved:
                     n_date_moved += 1
-                if n_out_of_radius:
+                if radius_stale:
                     n_radius += 1
         if changed:
             updates.append((r["run_id"], changed))
