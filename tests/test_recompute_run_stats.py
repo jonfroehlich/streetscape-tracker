@@ -520,3 +520,83 @@ def test_each_date_column_independently_triggers_the_json_rebuild(
     # PUBLISHED file, never whether the stats pass does its job.
     row = conn.execute("SELECT * FROM runs WHERE city_id = ?", (cid,)).fetchone()
     assert row[column] == truth[column]
+
+
+def test_recompute_reclassifies_panos_beyond_the_query_radius(conn, data_dir):
+    """Issue #367's repair, end to end. A run cataloged before the rule counted
+    a pano 1.1 km from its query point as coverage; the pass reads through the
+    loader, so the far pano becomes OUT_OF_RADIUS with no copy of the rule in
+    the script, the stored coverage MOVES, the report line names the
+    reclassified rows, and --regenerate-json republishes the summary -- whose
+    coverage block the city page reads directly."""
+    from streetscape_metadata_tracker.naming import generate_run_filename
+
+    run_date = date(2026, 4, 15)
+    cid = db.register_city(
+        conn,
+        city_name="Bend",
+        state_name="Oregon",
+        state_code="OR",
+        country_name="United States",
+        country_code="US",
+        center_lat=44.0,
+        center_lon=-121.0,
+        grid_width_m=1000,
+        grid_height_m=1000,
+        step_m=20,
+    )
+    df = make_city_df([("far", "2020-06-15"), ("near", "2024-01-10")], run_date=run_date, n_empty=2)
+    df.loc[0, "pano_lat"] = df.loc[0, "query_lat"] + 0.01  # ~1.1 km north
+    csv_name = generate_run_filename(cid, 1000, 1000, 20, run_date) + ".csv.gz"
+    csv_path = os.path.join(data_dir, csv_name)
+    write_city_csv_gz(df, csv_path)
+    # Stored as the pre-#367 pipeline computed it: both panos covered, 2 of 4.
+    db.register_run(
+        conn,
+        city_id=cid,
+        run_date=run_date,
+        csv_filename=csv_name,
+        total_points=4,
+        status_ok=2,
+        status_no_date=0,
+        status_zero_results=2,
+        status_flat_only=0,
+        status_other=0,
+        unique_panos=2,
+        unique_google_panos=2,
+        coverage_rate_pct=50.0,
+    )
+
+    result = _run_script(data_dir, "--execute", "--regenerate-json")
+    assert result.returncode == 0, result.stderr
+    assert "1 pano(s) beyond the query radius" in result.stdout
+    assert "1 hold a pano beyond the query radius" in result.stdout
+    assert "Rebuilt 1 of 1" in result.stdout
+
+    row = conn.execute(
+        """SELECT status_ok, status_out_of_radius, status_other, unique_panos,
+                  coverage_rate_pct, query_radius_m, oldest_capture_date
+           FROM runs WHERE city_id = ?""",
+        (cid,),
+    ).fetchone()
+    assert row["coverage_rate_pct"] == 25.0  # 1 of 4, was 2 of 4
+    assert row["status_ok"] == 1
+    assert row["status_out_of_radius"] == 1
+    assert row["status_other"] == 0  # a real answer, not an error
+    assert row["unique_panos"] == 1
+    assert row["query_radius_m"] == 50.0
+    assert row["oldest_capture_date"] == "2024-01-10T00:00:00"  # the far pano aged nothing
+
+    with gzip.open(csv_path.replace(".csv.gz", ".json.gz"), "rt", encoding="utf-8") as fh:
+        published = json.load(fh)
+    assert published["coverage"]["coverage_rate"] == 25.0
+    assert published["coverage"]["num_points_out_of_radius"] == 1
+    assert published["coverage"]["num_points_with_errors"] == 0
+    assert published["coverage"]["query_radius_m"] == 50.0
+
+    # The CSV is the provider's answer and is never rewritten
+    assert set(load_city_csv_file(csv_path, raw=True)["status"]) == {"OK", "ZERO_RESULTS"}
+
+    rerun = _run_script(data_dir)
+    assert rerun.returncode == 0, rerun.stderr
+    assert "0 would change" in rerun.stdout
