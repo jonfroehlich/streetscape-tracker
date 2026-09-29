@@ -1773,6 +1773,16 @@ _TIMEOUT_FIXED_SLACK_S = 600
 # ledger write and process exit. 600 s is the same slack the timeout derivation
 # already holds back for the tail, so the two budgets are one number.
 _CRAWL_CLOCK_MARGIN_S = _TIMEOUT_FIXED_SLACK_S
+# What a road walk's Overpass retry window holds back from the child's
+# wall-clock budget (issue #344 review), on top of the retry policy's own
+# final-attempt and startup reserves. Those end the worst-case refusal chain AT
+# the budget, which still leaves the census to find its clock already passed at
+# its FIRST unit -- a plain DownloadError, a counted failure for 0 requests.
+# This covers what runs between the fetch and that first admission: building
+# and freezing the osmnx graph, generating the sample points, and one tile's
+# worst retry chain (download_mapillary._TILE_MAX_TIME_S, 120 s). The policy's
+# one-attempt floor still applies when the remainder is gone.
+_CENSUS_START_RESERVE_S = 300
 # max_requests_per_minute is a client-side *ceiling*, not the achieved rate: the
 # async engine undershoots it (connection limit, ~30 ms metadata latency, the
 # resource guard lowering concurrency on a busy host). makelab2 sustained
@@ -5729,8 +5739,12 @@ def _street_collect_cmd(
     # the window is sized against the census deadline whenever there is one.
     # The request cap cannot produce that failure (the launch floor guarantees
     # TILE_MAX_TRIES requests); only the clock can be spent before the first.
+    # _CENSUS_START_RESERVE_S is held back from it for the work between the
+    # fetch and that first unit.
     retry_policy = cfg.overpass_retry
-    retry_clock_s = max_seconds if max_seconds is not None else child_timeout_s
+    retry_clock_s = (
+        max_seconds - _CENSUS_START_RESERVE_S if max_seconds is not None else child_timeout_s
+    )
     if retry_clock_s is not None:
         retry_policy = policy_for_child_timeout(retry_policy, retry_clock_s)
         if retry_policy != cfg.overpass_retry:

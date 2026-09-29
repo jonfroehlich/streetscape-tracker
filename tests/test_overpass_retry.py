@@ -819,11 +819,22 @@ def test_a_forwarded_clock_budget_sizes_the_window_not_the_kill(tmp_path):
     window is sized to IT: the same generous kill timeout that leaves the
     configured window alone must now shorten it."""
     cfg = _load(tmp_path, _NON_DEFAULT_TOML)
-    unclocked = _policy_in(_walk_cmd(cfg, child_timeout_s=10_800))
+    # mapillary_streets, not gsv_streets: production hands `max_seconds` only
+    # to a resumable walk, so that is the channel this has to hold for.
+    walk = "mapillary_streets"
+    unclocked = _policy_in(_walk_cmd(cfg, walk, child_timeout_s=10_800))
     assert unclocked == _NON_DEFAULT, "the kill alone leaves this window alone"
-    clocked = _policy_in(_walk_cmd(cfg, child_timeout_s=10_800, max_seconds=600))
-    assert clocked == policy_for_child_timeout(_NON_DEFAULT, 600)
+    # 1,000 s less the 300 s census-start reserve is 700 s, which the policy's
+    # own 360 s of reserves shorten to a 340 s window. With no census reserve
+    # the same budget leaves 640 s, which fits the configured 480 s window and
+    # changes nothing -- so the reserve is what this pins.
+    clocked = _policy_in(_walk_cmd(cfg, walk, child_timeout_s=10_800, max_seconds=1_000))
+    assert clocked == policy_for_child_timeout(
+        _NON_DEFAULT, 1_000 - scheduler._CENSUS_START_RESERVE_S
+    )
+    assert clocked == replace(_NON_DEFAULT, window_s=340)
     assert clocked.window_s < unclocked.window_s
+    assert scheduler._CENSUS_START_RESERVE_S > 0
 
 
 @pytest.mark.parametrize("channel", sorted(scheduler.STREET_CHANNELS))
