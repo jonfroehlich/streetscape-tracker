@@ -227,6 +227,16 @@ Incidental coverage of a deprecated spelling trains readers to ignore the notice
   — not redundant, since `cmd_run_due` emits its `Done: ...` line *before* `_finish_batch` runs, so a summary-only append never reaches the scheduler log on a healthy night.
   A third pins the **ordering** — read after `generate_aggregate_v2`, because on a big-census night the tail and not the city loop sets the peak (#157) — since the other two pass identically with the call moved to the top of the function.
   Their complement pins silence: an unavailable reading adds nothing to the summary at all.
+- The deadline deferral of non-resumable channels (issue #373), each driven through `_run_city_channels` (or `_run_city_loop` / `cmd_run_due`) with a frozen `time.monotonic` and real fixture geometry, and each run against the mutation named here:
+  `test_the_floor_is_not_the_deadline_predictor` — a 619 s gsv city with an hour left, less than the 180-min floor, still launches clamped to the hour (fails if the gate predicts with the floored `city_timeout_seconds`);
+  `test_a_non_resumable_child_that_cannot_fit_is_deferred_not_launched` — a ~2.25 h city with an hour left: no launch, no `record_attempt`, `consecutive_failures` unchanged, `(0, 0, 0)` returned, counted per channel (fails with the gate removed, or with a `record_attempt(success=False)` on deferral);
+  `test_no_batch_deadline_never_defers` — `batch_deadline=None` launches a ~19 h city with its full timeout;
+  `test_an_unknowable_estimate_never_defers` — pacing disabled makes the estimate None, and the child launches under the clamp as before (fails if None defers);
+  `test_resumable_channels_take_their_launch_plan_not_the_deadline_gate` — all six resumable channels, swept from `CHANNEL_HOSTS` rather than named, reach `_sweep_launch_plan` and launch with a need no night holds (fails if the gate applies to every channel);
+  `test_a_fully_deferred_city_costs_no_city_cap_slot` — cap 1, the first city fully deferred, the second still collected with no inter-city sleep, and the count in the loop's return tuple (fails if a deferral counts as attempted, or the tuple drops the counter);
+  `test_the_walk_is_judged_on_its_own_estimate` — the gsv grid run defers and its `gsv_streets` walk launches in the same call (fails if a grid deferral drops the city's remaining channels);
+  `test_a_deadline_deferral_is_on_the_done_line_and_is_not_a_failure` — the `Done:` line's per-channel count, and rc 0 with no alert at `failure_threshold = 1` (fails if the Done clause is dropped or a deferral counts as an attempt);
+  `test_the_timeout_is_the_clamped_floored_estimate_on_every_arm` — `city_timeout_seconds == clamp(max(floor, city_timeout_estimate_seconds))` on all eight channels plus an unknown one, at four `remaining_s` values and two sizes, with every derived arm exercised above the floor and below it (fails if an arm's estimate returns a floored value).
 
 ## Concurrent channel lanes (issue #240)
 
@@ -547,6 +557,7 @@ registration capping at the 40 km ceiling and aliasing the query slug so a secon
 `rect_in_boundary_frac` measuring the **rectangle** rather than the city
 — 1.0 inside, ≈0.5 half-overlapping, 0.0 disjoint, and None for the Point that Nominatim returns for many places, which must never render as 0%
 — plus the low-fraction warning naming the NKY precedent and a **raising geocoder not failing the run**, exercised through the real probe rather than a stub that returns None;
+`test_assess_city_never_defers_for_a_deadline`: every listed channel is collected even when each one's derived need exceeds any night, because this path passes no batch deadline (issue #373; fails if assess-city passes one);
 success starting only the collected channels' clocks while `gsv` stays absent so the nightly batch still does the grid run, and a failure recording **no** `consecutive_failures`, with six failed runs leaving the city still returned by `get_due_cities`;
 a Mapillary tile block leaving the GSV walk collected while `mapillary_streets` is never asked, an Overpass refusal skipping both walks but not the grid census, and a busy exit skipping one channel only;
 a channel whose argv our own CLI rejected (issue #359) exiting 1 with `N channel(s) REJECTED by our own CLI` in the summary and no `consecutive_failures`, since it records no attempt and would otherwise score the run complete;
