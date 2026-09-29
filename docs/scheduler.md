@@ -402,10 +402,16 @@ Both, because the per-child socket count is the pair divided: a night that fell 
 **Every channel on a budgeted per-IP host draws from one pool, counted over the last 24 h rather than per UTC date.**
 It is configured per host token, `[hosts.mapillary_tiles] rolling_24h_request_budget = 3000` on prod, so both Mapillary channels are covered, and so would be a future channel on the same CDN.
 The per-channel `daily_request_budget`s stay exactly as they are.
-**The effective remainder at a launch is the minimum** of the channel's daily remainder and every budgeted host's rolling remainder (`_budget_remainder`, the one reader, shared by the live gate, the dry run and `assess-city`).
+**The effective remainder at a launch is the minimum** of the channel's daily remainder and every budgeted host's rolling remainder.
+The rule lives once, in `_combine_remainder`: `_budget_remainder` feeds it the ledgers as they stand for the live gate and `assess-city`, and `run-due --dry-run` feeds it one window read plus its own simulated spend per host, so the preview draws the pool down across both channels the way the night will.
+**A host governs only when its remainder is strictly smaller**; on a tie the channel's daily budget is the named term.
 A resumable channel is then capped at that remainder, or deferred under its launch floor, by the machinery above; no new stop path exists.
+**A floor skip is the host's only when the host's window set the cap** (`BudgetRemainder.host_bound`: the host governs AND the cap equals the ledger remainder) — a skip the deadline clamp caused is the clock's, and stays a budget skip even while the host is the smaller ledger term.
+**The age wall asks what tonight could plausibly grant, not what the window holds right now** (`BudgetRemainder.ceiling`: the channel's daily remainder against every budgeted host's FULL budget).
+It is the one arm that records a failure, and at 09:00 UTC after a full night the window holds ~53 of 3,000 while most of the rest frees before the night ends; projected against that, a 6-day checkpoint with a few hundred requests left would be failed and the operator told to raise the wrong budget.
+When the host's full budget is what cannot fit the crawl, the refusal names `[hosts.<token>].rolling_24h_request_budget` as the lever.
 With no `[hosts]` section (the repo default), or an empty one, the gate reads exactly what it read before.
-An invalid entry (unknown token, non-positive or non-integer value, a stray key) is recorded at load like an unwired channel, and `run-due` and `assess-city` refuse with 64: falling back to "no budget" would be the fail-open direction.
+An invalid entry (a token no channel's ledger meters — `[hosts.overpass]` included, which names a real host but could never bind — a non-positive or non-integer value, a stray key) is recorded and logged at load like an unwired channel, and `run-due` and `assess-city` refuse with 64: falling back to "no budget" would be the fail-open direction.
 
 **It is re-read per launch, never once per night**, because the same night's earlier children on the host have written to the ledger since.
 The two Mapillary channels never overlap (the cross-process host lock, and host-disjoint lanes in-process), so no cross-lane reservation is needed.
@@ -413,6 +419,8 @@ The two Mapillary channels never overlap (the cross-process host lock, and host-
 **The ledger is `host_usage` (schema v16), written by `db.add_api_usage` itself** for every channel in `download_common.CHANNEL_METERED_HOST`, so no call site can forget it and the ledger is complete whatever the budget config says.
 A child records its spend when it finishes, so a long crawl's whole spend is stamped at its end.
 That shifts spend **later** within the window, which makes the gate slightly more conservative on the following night, never less; there are deliberately no mid-crawl writes.
+**The design consequence is lumpy credit.** The first Mapillary launch after a full night sees the small remainder and is launched capped at it, and credit returns in lumps as last night's per-crawl stamps age out, so a big crawl fragments into capped slices across the night; the dry run reads the window once and ages nothing, so at preview time it over-reports deferrals the night itself will launch.
+**A child SIGKILLed or crashed mid-crawl writes neither ledger**, since both writes happen when it returns; PR #387 gives resumable children a clock stop, which shrinks that case without closing it.
 The v16 migration backfills the last two UTC dates of metered `api_usage`, each row stamped at the latest instant its spend can have happened — `min(23:59:59 UTC of its date, the migration's clock)` — so the first night after deploy is gated for the **whole** night.
 Noon was the first choice and was wrong: prod's night runs ~09:00–21:00 UTC, so a noon stamp released yesterday's spend at 12:00 UTC, three hours into the first night, while most of it was still inside the true 24 h.
 The late stamp errs the fail-closed way: it can defer up to one night more than a timestamped ledger would have, and it never releases spend earlier than the real requests would have left the window.
