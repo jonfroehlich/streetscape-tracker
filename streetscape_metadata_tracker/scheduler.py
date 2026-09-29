@@ -45,7 +45,7 @@ import traceback
 from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -1003,6 +1003,19 @@ class SchedulerConfig:
     # assess-city could ever act on. Those two refuse (USAGE_EXIT_CODE) while
     # this list is non-empty; everything else proceeds with the error logged.
     unwired_channel_errors: list[str] = field(default_factory=list)
+    # [hosts.<token>] — a rolling-24h request budget per per-IP HOST (issue
+    # #385), keyed by the download_common HOST_* token CHANNEL_HOSTS uses, so
+    # every channel whose hosts include it draws from the one pool. Empty (the
+    # default, and the repo config) means no host budget at all: every gate
+    # reads exactly as it did before #385. A STAGING GUARD on how fast our
+    # traffic can change, not a model of any provider's per-IP threshold.
+    host_budgets: dict[str, int] = field(default_factory=dict)
+    # Invalid [hosts.*] entries, recorded rather than raised for the reason
+    # unwired_channel_errors is: a load-time ValueError would take down
+    # backup-status and restore-backup too. run-due and assess-city REFUSE while
+    # this is non-empty, because falling back to "no budget" would be the
+    # fail-OPEN direction for a guard whose whole job is to hold volume down.
+    host_budget_errors: list[str] = field(default_factory=list)
     # [alerts] — operator email on unhealthy runs (off by default)
     alerts: AlertConfig = field(default_factory=AlertConfig)
     # [resource_guard] — load/RAM-aware concurrency backoff on shared hosts
@@ -1267,6 +1280,61 @@ def _refresh_slots(sched: dict, config_path) -> int | None:
     return value
 
 
+# The one [hosts.*] key (issue #385). Named for its WINDOW so a later per-host
+# knob of a different shape does not have to rename it.
+_HOST_BUDGET_KEY = "rolling_24h_request_budget"
+
+
+def _host_budgets(table: Any, config_path) -> tuple[dict[str, int], list[str]]:
+    """Read ``[hosts.<token>]`` into ``(host_budgets, errors)`` (issue #385).
+
+    Neither of the loader's two usual postures fits, which is why this one
+    RECORDS its errors the way unwired channels are recorded: warn-and-fall-back
+    (``_lane_count``) is right when the fallback is the safe direction, and here
+    the fallback would be "no host budget" -- fail OPEN on a guard whose job is
+    to hold volume down; raising (a load-time ValueError) would take down
+    ``backup-status`` and ``restore-backup``, the incident-time handles. So a bad
+    entry is dropped, its message collected, and the channel-running commands
+    refuse (see ``_config_refusals``) while everything else proceeds.
+
+    A token must be a key of ``HOST_LABELS``; the value a positive int
+    (``isinstance(v, bool)`` excluded, since a TOML ``true`` is a Python int).
+    """
+    budgets: dict[str, int] = {}
+    errors: list[str] = []
+    if table is None:
+        return budgets, errors
+    if not isinstance(table, dict):
+        errors.append(f"[hosts] in {config_path} is not a table of [hosts.<token>] sections.")
+        return budgets, errors
+    for token, section in table.items():
+        where = f"[hosts.{token}] in {config_path}"
+        if token not in HOST_LABELS:
+            errors.append(
+                f"{where} names no known per-IP host (known: {', '.join(sorted(HOST_LABELS))})."
+            )
+            continue
+        if not isinstance(section, dict) or set(section) != {_HOST_BUDGET_KEY}:
+            errors.append(f"{where} must hold exactly one key, {_HOST_BUDGET_KEY}.")
+            continue
+        value = section[_HOST_BUDGET_KEY]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            errors.append(f"{where}: {_HOST_BUDGET_KEY}={value!r} is not a positive integer.")
+            continue
+        budgets[token] = value
+    return budgets, errors
+
+
+def _config_refusals(cfg: SchedulerConfig) -> list[str]:
+    """Every load-time error a channel-running command must refuse on.
+
+    Unwired channel blocks (the loader dropped them) and invalid ``[hosts.*]``
+    budgets (issue #385). Read by ``run-due`` and ``assess-city`` only; the
+    read-only subcommands proceed with the errors in the log.
+    """
+    return [*cfg.unwired_channel_errors, *cfg.host_budget_errors]
+
+
 def load_scheduler_config(path: str | None = None) -> SchedulerConfig:
     """Load scheduler config from TOML; missing file yields defaults."""
     config_path = Path(path) if path else DEFAULT_CONFIG_PATH
@@ -1284,6 +1352,9 @@ def load_scheduler_config(path: str | None = None) -> SchedulerConfig:
     al = raw.get("alerts", {})
     rg = raw.get("resource_guard", {})
     dp = raw.get("driving_plan", {})
+    host_budgets, host_budget_errors = _host_budgets(raw.get("hosts"), config_path)
+    for message in host_budget_errors:
+        logger.error(message)
 
     providers = None
     unwired_channel_errors: list[str] = []
@@ -1394,6 +1465,8 @@ def load_scheduler_config(path: str | None = None) -> SchedulerConfig:
         site_url=pub.get("site_url", ""),
         providers=providers,
         unwired_channel_errors=unwired_channel_errors,
+        host_budgets=host_budgets,
+        host_budget_errors=host_budget_errors,
         alerts=AlertConfig(
             enabled=al.get("enabled", False),
             recipient=al.get("recipient", ""),
@@ -2529,6 +2602,126 @@ class SweepLaunchPlan(NamedTuple):
     label: str
 
 
+# The window a [hosts.*] budget is counted over (issue #385).
+HOST_BUDGET_WINDOW = timedelta(hours=24)
+# How long host_usage rows are kept: the window needs 24 h, and a few days
+# beyond that is what a block's forensics have ever wanted.
+HOST_USAGE_RETENTION = timedelta(days=30)
+
+
+class HostWindow(NamedTuple):
+    """One budgeted host's rolling-24h spend, read at one instant."""
+
+    host: str
+    used: int
+    budget: int
+    window_start: datetime
+
+    @property
+    def remaining(self) -> int:
+        return self.budget - self.used
+
+    def clause(self) -> str:
+        """The operator-facing wording, shared by every reader so they agree."""
+        return (
+            f"the rolling-24h budget of {HOST_LABELS[self.host]} ({self.used:,} of "
+            f"{self.budget:,} used since {self.window_start:%Y-%m-%d %H:%M} UTC)"
+        )
+
+    def status_line(self) -> str:
+        """``mapillary_tiles rolling 24 h: 2,947 / 3,000`` -- status and the dry run."""
+        return f"{self.host} rolling 24 h: {self.used:,} / {self.budget:,}"
+
+
+def _host_windows(
+    cfg: SchedulerConfig, conn, hosts=None, now: datetime | None = None
+) -> list[HostWindow]:
+    """Every budgeted host's window (or only ``hosts``), in sorted token order.
+
+    ``now`` defaults to ``clock.utc_now()`` -- the test seam is
+    ``clock._utc_clock``, never ``datetime.now``.
+    """
+    now = clock.utc_now() if now is None else now
+    start = now - HOST_BUDGET_WINDOW
+    wanted = cfg.host_budgets if hosts is None else [h for h in hosts if h in cfg.host_budgets]
+    return [
+        HostWindow(host, db.get_host_usage(conn, host, start), cfg.host_budgets[host], start)
+        for host in sorted(wanted)
+    ]
+
+
+class BudgetRemainder(NamedTuple):
+    """What one channel may spend at one launch (issue #385).
+
+    ``remaining`` is the MINIMUM of the channel's daily remainder and every
+    budgeted host's rolling-24h remainder. ``host`` names the budgeted host that
+    GOVERNS -- its remainder is strictly under the channel's -- or is None when
+    the channel's own daily budget is the binding term (always, with no
+    ``[hosts.*]`` configured).
+    """
+
+    remaining: int
+    channel_remaining: int
+    host: str | None
+    host_used: int
+    host_budget: int
+    window_start: datetime
+
+    def host_clause(self) -> str:
+        """The governing host's wording, or ``""`` when the channel governs."""
+        if self.host is None:
+            return ""
+        return HostWindow(self.host, self.host_used, self.host_budget, self.window_start).clause()
+
+
+def _budget_remainder(
+    cfg: SchedulerConfig, conn, today: date, provider: str, now: datetime | None = None
+) -> BudgetRemainder:
+    """The effective remainder for ``provider`` right now (issue #385).
+
+    THE ONE READER of both ledgers, so the live gate, the dry run and
+    assess-city cannot disagree. Called PER LAUNCH, never once per night: a
+    night's earlier children on the same host have written ``host_usage`` since.
+
+    A STAGING GUARD on how fast our traffic to a per-IP host can change, and
+    explicitly NOT a model of that provider's threshold -- #286 found no
+    accumulation window from 1 to 8 days that separates blocked Mapillary days
+    from clean ones. What it enforces is the project's staging rule: never jump
+    to an unmeasured volume, and never stack a daytime catch-up on a full night.
+
+    It is a SOFT ceiling, exactly like the daily budget: a capped crawl lets
+    tiles already in flight finish their retries, so a night can end up to
+    ``connection_limit × (TILE_MAX_TRIES − 1)`` over it. Never write that the
+    budget is not exceeded.
+
+    No cross-lane reservation is needed: the two Mapillary channels never run
+    at once (each child takes the cross-process tile-CDN lock, and
+    host-disjoint lanes within this one), so no second talker can spend between
+    this read and the child's launch.
+    """
+    channel_remaining = cfg.providers[provider].daily_request_budget - db.get_api_usage(
+        conn, today, provider
+    )
+    remaining, governing = channel_remaining, None
+    windows = _host_windows(cfg, conn, CHANNEL_HOSTS.get(provider, ()), now=now)
+    for window in windows:
+        if window.remaining < remaining:
+            remaining, governing = window.remaining, window
+    if governing is None:
+        start = (
+            windows[0].window_start if windows else (now or clock.utc_now()) - HOST_BUDGET_WINDOW
+        )
+        return BudgetRemainder(remaining, channel_remaining, None, 0, 0, start)
+    return BudgetRemainder(
+        remaining,
+        channel_remaining,
+        governing.host,
+        governing.used,
+        governing.budget,
+        governing.window_start,
+    )
+
+
 def _sweep_checkpoint_progress(cfg: SchedulerConfig, city: db.CityRow, channel: str) -> dict | None:
     """
     How far the sweep checkpointed for one (city, channel) has got, or None.
@@ -2573,6 +2766,7 @@ def _sweep_launch_plan(
     remaining: int,
     remaining_s: float | None,
     city_channels: Sequence[str],
+    host_clause: str = "",
 ) -> SweepLaunchPlan:
     """
     Launch, or skip and why, for one resumable channel of one city tonight.
@@ -2582,6 +2776,11 @@ def _sweep_launch_plan(
     and ``city_channels`` every channel this city is scheduled on tonight --
     needed for the sibling arm below, which must not defer behind a sweep
     nothing is going to run.
+
+    ``host_clause`` is non-empty when ``remaining`` came from a per-host
+    rolling-24h budget rather than the channel's daily one (issue #385,
+    ``BudgetRemainder.host_clause``), so the log says which ceiling bound.
+    Empty leaves every message byte-identical to the pre-#385 wording.
 
     THE CAP IS THE SMALLER OF TWO CEILINGS, and WHICH one binds is not a
     constant -- it moves with the config, which is exactly why this is a
@@ -2657,8 +2856,12 @@ def _sweep_launch_plan(
     # inferred from the arithmetic.
     request_cap = remaining if affordable is None else min(remaining, affordable)
     clock_note = (
-        f"{remaining:,} left in the budget, "
-        f"{'unpaced' if affordable is None else f'{affordable:,}'} "
+        (
+            f"{remaining:,} left in {host_clause}, "
+            if host_clause
+            else f"{remaining:,} left in the budget, "
+        )
+        + f"{'unpaced' if affordable is None else f'{affordable:,}'} "
         f"inside a {timeout_s // 60:,}-minute timeout"
     )
 
@@ -2744,7 +2947,11 @@ def _sweep_launch_plan(
     floor, floor_buys = pricing.launch_floor, pricing.floor_buys
     if est > 0 and request_cap < floor:
         binding = (
-            "requests left in today's budget"
+            (
+                f"requests left in {host_clause}"
+                if host_clause
+                else "requests left in today's budget"
+            )
             if request_cap == remaining
             else f"requests its {timeout_s // 60:,}-minute timeout affords"
         )
@@ -3252,6 +3459,10 @@ def cmd_status(cfg: SchedulerConfig) -> int:
         used = db.get_api_usage(conn, today, provider)
         budget = cfg.providers[provider].daily_request_budget
         print(f"{provider} budget today: {used:,} / {budget:,} requests used.")
+    # One line per [hosts.*] budget (issue #385): the pool every channel on
+    # that host draws from, over the rolling window the gate reads.
+    for window in _host_windows(cfg, conn):
+        print(f"{window.status_line()} requests used.")
 
     if cfg.driving_plan.enabled:
         latest = db.get_latest_driving_plan_snapshot(conn)
@@ -5122,8 +5333,19 @@ def _assess_preflight_report(
         # tomorrow's fresh budget is the same size — so it needs a config change
         # or a smaller grid, and calling it "deferred" (run-due --dry-run's
         # wording for the other case) would promise a later run that never comes.
+        #
+        # The host term (issue #385) comes from the same helper the live gate
+        # reads, so this line and the collection below cannot disagree: when a
+        # [hosts.*] rolling-24h budget is the smaller remainder, it is what the
+        # launch is capped or deferred by.
+        remainder = _budget_remainder(cfg, conn, today, channel)
         if est > pc.daily_request_budget:
             fits = "  ← EXCEEDS THE ENTIRE DAILY BUDGET; raise it or shrink the grid"
+        elif est > remainder.remaining and remainder.host is not None:
+            fits = (
+                f"  ← OVER {remainder.host}'s rolling-24h budget; launched capped or "
+                f"deferred to a later run"
+            )
         elif est > pc.daily_request_budget - used:
             fits = "  ← OVER REMAINING BUDGET, deferred to a later run"
         else:
@@ -5132,6 +5354,11 @@ def _assess_preflight_report(
             f"    {channel:<18} ~{est:>9,} requests   "
             f"({used:,} of {pc.daily_request_budget:,} spent today){fits}"
         )
+        for window in _host_windows(cfg, conn, CHANNEL_HOSTS.get(channel, ())):
+            lines.append(
+                f"    {'':<18}  {window.host}: {window.used:,} of {window.budget:,} "
+                f"in the last 24 h"
+            )
         # Derived from CHANNEL_HOSTS rather than a hardcoded channel list, and
         # the pacing figure is taken from the channels actually in play: a config
         # can enable mapillary_streets with no [providers.mapillary] section at
@@ -5317,11 +5544,11 @@ def cmd_assess_city(
     ``today`` is injectable so tests can pin a date; production callers omit it.
     """
     # Validate BEFORE opening the catalog or geocoding, so a typo costs nothing.
-    if cfg.unwired_channel_errors:
+    if _config_refusals(cfg):
         # Same refusal as cmd_run_due's, for the same reason: this command
         # launches channels, so it must not run a collection around a config
         # block the loader had to drop. The read-only subcommands proceed.
-        for message in cfg.unwired_channel_errors:
+        for message in _config_refusals(cfg):
             logger.error(message)
         return USAGE_EXIT_CODE
     try:
@@ -5421,6 +5648,10 @@ def cmd_assess_city(
     # channel silently not collected is exactly what makes an inquiry answer
     # wrong, and #274's counter must not be the one the shared path drops.
     deferred_channels: Counter[str] = Counter()
+    # Launches a [hosts.*] rolling-24h budget deferred (issue #385). assess-city
+    # collects Mapillary, so an inquiry on the morning after a full night can
+    # meet the tile CDN's window already spent -- and has to say so.
+    deferred_host_budget: Counter[str] = Counter()
     # Launches our own CLI refused at parse time (issue #359). record_failures
     # is False here anyway, so this is about the ANSWER, not the counter: a
     # rejected channel beside a collected one would otherwise score 1/1.
@@ -5434,6 +5665,7 @@ def cmd_assess_city(
         blocked_hosts=blocked_hosts,
         busy_hosts=busy_hosts,
         deferred_channels=deferred_channels,
+        deferred_host_budget=deferred_host_budget,
         rejected_argv=rejected_argv,
         # No batch deadline: an operator run has nothing queued behind it, and
         # each child still carries its own derived per-city timeout.
@@ -5498,6 +5730,7 @@ def cmd_assess_city(
     summary = (
         f"{succeeded}/{attempted} channel(s) collected"
         + (f", {skipped_budget} skipped on budget" if skipped_budget else "")
+        + _host_budget_note(deferred_host_budget, sep=", ")
         + (
             f", {sum(deferred_channels.values())} deferred behind a sibling sweep"
             if deferred_channels
@@ -5559,7 +5792,7 @@ def cmd_assess_city(
     #     attempt, so without this term a rejected channel beside a collected
     #     one scores attempted == succeeded == 1 and exits 0.
     collected_everything = attempted > 0 and succeeded == attempted
-    nothing_deferred = skipped_budget == 0 and not deferred_channels
+    nothing_deferred = skipped_budget == 0 and not deferred_channels and not deferred_host_budget
     hosts_were_fine = not blocked_hosts and not busy_hosts
     complete = collected_everything and nothing_deferred and hosts_were_fine and not rejected_argv
     if complete and (published or not publish_wanted):
@@ -7031,14 +7264,16 @@ def cmd_run_due(
     # Validate BEFORE opening the catalog, so an operator typo costs nothing.
     # Returning rather than propagating is deliberate: main()'s run-due branch
     # emails an alert on an exception, and a typo is not a nightly crash.
-    if cfg.unwired_channel_errors:
+    if _config_refusals(cfg):
         # The load already dropped the block, so nothing below could launch
         # it — but a night that silently ran AROUND a channel the config asks
         # for would read as a success while collecting nothing on it, the same
-        # shape as the unknown-channel refusal below. Only the channel-running
-        # commands refuse; backup-status and friends proceed with the error in
-        # the log.
-        for message in cfg.unwired_channel_errors:
+        # shape as the unknown-channel refusal below. An invalid [hosts.*]
+        # budget refuses for the mirror-image reason (issue #385): running
+        # without the guard it asked for would be the fail-open direction.
+        # Only the channel-running commands refuse; backup-status and friends
+        # proceed with the error in the log.
+        for message in _config_refusals(cfg):
             logger.error(message)
         return USAGE_EXIT_CODE
     try:
@@ -7241,6 +7476,13 @@ def cmd_run_due(
             for p in providers
         }
         left_str = ", ".join(f"{budget_left[p]:,} {p}" for p in providers)
+        # The per-host rolling-24h pools (issue #385), simulated alongside the
+        # per-channel ones: a preview that ignored them would print "ok" for
+        # the very Mapillary cities the night defers.
+        windows = _host_windows(cfg, conn)
+        host_left = {w.host: w.remaining for w in windows}
+        if windows:
+            left_str += "; " + ", ".join(w.status_line() for w in windows)
         print(f"DRY RUN — would process (budget remaining {left_str}):")
         for city in due[:day_cap]:
             for provider in providers_for_city[city.city_id]:
@@ -7253,6 +7495,12 @@ def cmd_run_due(
                     city, provider, max_age_s=_census_reuse_window_s(cfg)
                 )
                 est = _channel_estimate(cfg, city, provider, conn, cached=marker is not None)
+                # The minimum rule the live gate applies (_budget_remainder),
+                # against the SIMULATED remainders so earlier cities in this
+                # preview draw the pools down the way the night will.
+                budgeted = [h for h in CHANNEL_HOSTS.get(provider, ()) if h in host_left]
+                remaining = min([budget_left[provider], *(host_left[h] for h in budgeted)])
+                host_governs = remaining < budget_left[provider]
                 if is_resumable_channel(provider):
                     # THE SAME DECISION THE LIVE PATH MAKES, from the same
                     # helper (issue #274). `est > budget_left` is the wrong
@@ -7273,17 +7521,28 @@ def cmd_run_due(
                         provider,
                         conn,
                         est=est,
-                        remaining=budget_left[provider],
+                        remaining=remaining,
                         remaining_s=None,
                         city_channels=providers_for_city[city.city_id],
                     )
                     fits = plan.label
+                    if host_governs and (
+                        plan.skip == _SWEEP_SKIP_FLOOR
+                        or (plan.skip is None and est > plan.request_cap)
+                    ):
+                        fits += " [host rolling-24h budget]"
                     # What the night would actually spend on it: a capped launch
                     # stops at the cap, and a skip spends nothing at all.
                     spend = 0 if plan.skip else min(est, plan.request_cap)
+                elif est <= remaining:
+                    fits, spend = "ok", est
                 else:
-                    fits = "ok" if est <= budget_left[provider] else "OVER BUDGET (deferred)"
-                    spend = est if est <= budget_left[provider] else 0
+                    fits = (
+                        "DEFERRED (host rolling-24h budget)"
+                        if host_governs
+                        else "OVER BUDGET (deferred)"
+                    )
+                    spend = 0
                 if marker is not None:
                     payer = marker.get("fetched_by") or "an earlier collection"
                     # Still worth saying when a cached channel is nonetheless
@@ -7296,6 +7555,8 @@ def cmd_run_due(
                     )
                 print(f"  {city.city_id:60s} {provider:16s} ~{est:>9,} req  {fits}")
                 budget_left[provider] -= spend
+                for host in budgeted:
+                    host_left[host] -= spend
         if cfg.driving_plan.enabled:
             print("Would also snapshot the GSV driving-plan feed (issue #176).")
         print(f"Would also back up the catalog to {cfg.backup_dir} (issue #145).")
@@ -7327,6 +7588,7 @@ def cmd_run_due(
             blocked_hosts,
             busy_hosts,
             deferred_channels,
+            deferred_host_budget,
             rejected_argv,
         ) = _run_city_loop(
             cfg,
@@ -7361,6 +7623,10 @@ def cmd_run_due(
         f"run-due {today}{filter_note}: {succeeded}/{attempted} runs succeeded across "
         f"{processed} cities in {elapsed_h:.2f} h"
         + (f"; {skipped_budget} deferred for budget" if skipped_budget else "")
+        # Apart from the line above (issue #385): these channels had budget
+        # left today, and a night governed by the host's rolling window has to
+        # be visible without reading the log.
+        + _host_budget_note(deferred_host_budget)
         # Named apart from the budget deferral because the operator's next move
         # differs: nothing is over budget and nothing failed -- the walk is
         # waiting for its grid sibling's sweep to land in the census cache, and
@@ -7414,6 +7680,18 @@ def cmd_run_due(
         blocked_hosts=blocked_hosts,
         busy_hosts=busy_hosts,
         rejected_argv=rejected_argv,
+    )
+
+
+def _host_budget_note(deferred_host_budget: Counter[str], sep: str = "; ") -> str:
+    """``; N deferred for the rolling-24h budget of <host>`` per host, or ``""``.
+
+    Shared by the ``Done:`` line and assess-city's summary (issue #385).
+    """
+    return "".join(
+        f"{sep}{n} deferred for the rolling-24h budget of {HOST_LABELS[host]}"
+        for host, n in sorted(deferred_host_budget.items())
+        if n
     )
 
 
@@ -7579,6 +7857,7 @@ def _run_city_channels(
     blocked_hosts: HostBreaker,
     busy_hosts: Counter[str],
     deferred_channels: Counter[str],
+    deferred_host_budget: Counter[str],
     rejected_argv: ArgvRejections,
     batch_deadline: float | None,
     stop_requested: threading.Event | None,
@@ -7637,6 +7916,14 @@ def _run_city_channels(
     wrong and nothing was spent — but a night that quietly collected no road
     walk has to say so somewhere, and the two existing counters would each be a
     lie about why.
+
+    ``deferred_host_budget`` counts, per HOST token, launches deferred because
+    a per-host rolling-24h budget (issue #385, ``[hosts.*]``) -- not the
+    channel's own daily budget -- was the binding term. Owned by the caller like
+    ``busy_hosts``, and counted apart from ``skipped_budget`` because the
+    operator's next move differs: the channel has budget left today, but the
+    host has taken its share of the last 24 h across every channel on it. No
+    default, for the reason ``rejected_argv`` has none.
 
     ``rejected_argv`` counts, per channel, children whose argv OUR OWN parser
     refused (exit ``ARGV_REJECTED_EXIT_CODE``, issue #359). Owned by the caller
@@ -7893,8 +8180,19 @@ def _run_city_channels(
                         # as it used to be, because the resumable branch below needs
                         # the remainder to decide anything at all. It is a read on
                         # the one thread that owns the catalog either way.
-                        used = db.get_api_usage(conn, today, provider)
-                        remaining = budget - used
+                        #
+                        # PER LAUNCH, and it has to be (issue #385): the remainder is
+                        # the minimum of this channel's daily one and every budgeted
+                        # host's rolling-24h one, and the host term moves whenever
+                        # ANY channel on that host finishes -- including this same
+                        # night's earlier cities. Hoisting it above the loop would
+                        # hand every Mapillary city the window as it stood at 02:00.
+                        # No cross-lane reservation is needed: the two Mapillary
+                        # channels never overlap (host lock + host-disjoint lanes),
+                        # so nothing else spends on the host between here and the
+                        # launch. See _budget_remainder.
+                        remainder = _budget_remainder(cfg, conn, today, provider)
+                        remaining = remainder.remaining
 
                         # Derived here, ahead of the gates, for the resumable channels
                         # ONLY -- their request cap is sized against the timeout their
@@ -7961,6 +8259,7 @@ def _run_city_channels(
                                     else batch_deadline - time.monotonic()
                                 ),
                                 city_channels=providers,
+                                host_clause=remainder.host_clause(),
                             )
                             timeout_s, request_cap = plan.timeout_s, plan.request_cap
                             if plan.skip == _SWEEP_SKIP_AGE_WALL:
@@ -7999,6 +8298,18 @@ def _run_city_channels(
                                 logger.info(f"{city.city_id} [{provider}]: {plan.message}")
                                 deferred_channels[provider] += 1
                                 continue
+                            if plan.skip is not None and remainder.host is not None:
+                                # The same floor skip, but the HOST's rolling-24h
+                                # budget is what left it short (issue #385). Named
+                                # and counted apart from a channel-budget skip: this
+                                # channel has budget left today, and the operator's
+                                # lever is the host's window, not its daily figure.
+                                logger.info(
+                                    f"{city.city_id} [{provider}]: deferred — "
+                                    f"{remainder.host_clause()}; {plan.message}"
+                                )
+                                deferred_host_budget[remainder.host] += 1
+                                continue
                             if plan.skip is not None:
                                 # The LAUNCH floor, for any of the four resumable
                                 # channels -- "calibration" is KartaView's reason for
@@ -8025,10 +8336,23 @@ def _run_city_channels(
                             )
                             skipped_budget += 1
                             continue
-                        elif used + est > budget:
+                        elif est > remaining and remainder.host is not None:
+                            # Doesn't fit what the HOST has left of its rolling 24 h
+                            # (issue #385). No channel reaches this today -- every
+                            # metered one is resumable and took the branch above --
+                            # but a non-resumable channel on a budgeted host must be
+                            # gated too, and counted where the operator will look.
+                            logger.info(
+                                f"{city.city_id} [{provider}] (~{est:,} req): deferred — "
+                                f"{remainder.host_clause()}."
+                            )
+                            deferred_host_budget[remainder.host] += 1
+                            continue
+                        elif est > remaining:
                             # Doesn't fit in what's LEFT today — try the next (smaller)
                             # city rather than ending the day; this one rolls to tomorrow
-                            # when the budget is fresh.
+                            # when the budget is fresh. `est > remaining` is the old
+                            # `used + est > budget` exactly when no host governs.
                             logger.info(
                                 f"{city.city_id} [{provider}] (~{est:,} req) doesn't fit "
                                 f"remaining budget ({remaining:,} left); skipping."
@@ -8416,6 +8740,7 @@ def _retry_stranded_walks(
     blocked_hosts: HostBreaker,
     busy_hosts: Counter[str],
     deferred_channels: Counter[str],
+    deferred_host_budget: Counter[str],
     rejected_argv: ArgvRejections,
     batch_deadline: float,
     sigterm_seen: threading.Event,
@@ -8545,6 +8870,7 @@ def _retry_stranded_walks(
                     blocked_hosts=blocked_hosts,
                     busy_hosts=busy_hosts,
                     deferred_channels=deferred_channels,
+                    deferred_host_budget=deferred_host_budget,
                     rejected_argv=rejected_argv,
                     batch_deadline=batch_deadline,
                     stop_requested=sigterm_seen,
@@ -8625,7 +8951,18 @@ def _run_city_loop(
     batch_deadline: float,
     sigterm_seen: threading.Event,
     max_cities: int,
-) -> tuple[int, int, int, int, str | None, HostBreaker, Counter[str], Counter[str], ArgvRejections]:
+) -> tuple[
+    int,
+    int,
+    int,
+    int,
+    str | None,
+    HostBreaker,
+    Counter[str],
+    Counter[str],
+    Counter[str],
+    ArgvRejections,
+]:
     """Collect due cities until the city cap, the batch deadline, or SIGTERM.
 
     ``sigterm_seen`` is both checked here (between cities) and forwarded to
@@ -8640,7 +8977,8 @@ def _run_city_loop(
     dead code that also reads as a second opinion on what the cap is.
 
     Returns ``(processed, succeeded, attempted, skipped_budget, stop_reason,
-    blocked_hosts, busy_hosts, deferred_channels, rejected_argv)``; ``stop_reason`` is None when the whole due
+    blocked_hosts, busy_hosts, deferred_channels, deferred_host_budget,
+    rejected_argv)``; ``stop_reason`` is None when the whole due
     list was worked through. Split out of ``cmd_run_due`` so every way of ending
     the night still reaches the publish tail — an unexpected exception here is
     logged and converted into a stop reason rather than discarding a night's
@@ -8663,6 +9001,10 @@ def _run_city_loop(
     ``busy_hosts`` is, and counted apart from both a failure and a budget skip
     because it is neither.
 
+    ``deferred_host_budget`` counts, per host token, launches a per-host
+    rolling-24h budget deferred (issue #385) -- apart from ``skipped_budget``,
+    which is the channel's own daily budget.
+
     ``rejected_argv`` counts, per channel, launches our own CLI refused at parse
     time (issue #359). Reported like ``busy_hosts`` — no ``record_attempt`` is
     written for them, so this counter is the only place they surface.
@@ -8677,6 +9019,7 @@ def _run_city_loop(
     blocked_hosts = HostBreaker()
     busy_hosts: Counter[str] = Counter()
     deferred_channels: Counter[str] = Counter()
+    deferred_host_budget: Counter[str] = Counter()
     rejected_argv = ArgvRejections()
     # The stranded-walk retry's runs (issue #380), folded in after the `except`
     # so a pass that raises part-way still reports what it collected.
@@ -8710,6 +9053,7 @@ def _run_city_loop(
                 blocked_hosts=blocked_hosts,
                 busy_hosts=busy_hosts,
                 deferred_channels=deferred_channels,
+                deferred_host_budget=deferred_host_budget,
                 rejected_argv=rejected_argv,
                 batch_deadline=batch_deadline,
                 stop_requested=sigterm_seen,
@@ -8757,6 +9101,7 @@ def _run_city_loop(
             blocked_hosts=blocked_hosts,
             busy_hosts=busy_hosts,
             deferred_channels=deferred_channels,
+            deferred_host_budget=deferred_host_budget,
             rejected_argv=rejected_argv,
             batch_deadline=batch_deadline,
             sigterm_seen=sigterm_seen,
@@ -8795,6 +9140,7 @@ def _run_city_loop(
         blocked_hosts,
         busy_hosts,
         deferred_channels,
+        deferred_host_budget,
         rejected_argv,
     )
 
@@ -9134,6 +9480,19 @@ def _finish_batch(
     if pruned:
         logger.info(f"Pruned {pruned} expired cached census(es)")
         summary += f"; pruned {pruned} cached census(es)"
+
+    # Age out the per-host rolling ledger (issue #385). The gate reads 24 h;
+    # the rest of the 30 days is for a block's forensics. Best-effort like the
+    # census prune above: a failure is logged and noted in the summary (and so
+    # the [alerts] mail and publish log), never raised -- an unpruned table
+    # costs a few rows a night, a raised one would cost the night's publish.
+    try:
+        pruned_usage = db.prune_host_usage(conn, clock.utc_now() - HOST_USAGE_RETENTION)
+        if pruned_usage:
+            logger.info(f"Pruned {pruned_usage} host_usage row(s) older than 30 days")
+    except Exception as exc:
+        logger.exception("host_usage prune failed")
+        summary += f"; host_usage prune FAILED ({exc!r})"
 
     # How close the night came to the systemd unit's memory cap (issue #305).
     #

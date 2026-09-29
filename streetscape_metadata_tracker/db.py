@@ -22,15 +22,16 @@ import os
 import sqlite3
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
 
 from . import clock
+from .download_common import CHANNEL_METERED_HOST
 from .naming import sanitize_city_query_str
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS cities (
@@ -392,6 +393,33 @@ CREATE TABLE IF NOT EXISTS provider_screen (
 -- with city_id and cannot serve that.
 CREATE INDEX IF NOT EXISTS idx_provider_screen_date
     ON provider_screen(provider, screen_date);
+
+-- v16 (issue #385): a TIMESTAMPED per-host spend ledger beside api_usage.
+-- api_usage is keyed by (usage_date, provider), so it cannot answer "how much
+-- has this per-IP host taken in the last 24 h" -- neither across the two
+-- channels that share a host nor across a UTC date boundary. Block 4
+-- (2026-09-28) fell through exactly that gap: a daytime catch-up charged to
+-- the next UTC date plus the following night, ~4,600 tile requests in ~24.5 h,
+-- with neither channel's daily row over its budget.
+--
+-- One row per add_api_usage call on a channel in
+-- download_common.CHANNEL_METERED_HOST, stamped when the call is made. A
+-- child records its spend when it FINISHES, so a long crawl's whole spend is
+-- stamped at its end: that shifts it LATER within any window, which makes the
+-- rolling gate slightly more conservative on the following night, never less.
+--
+-- Append-only and pruned in the nightly tail (prune_host_usage, 30 days):
+-- the window needs 24 h and forensics a few days more.
+--
+-- recorded_at is clock.utc_now_iso(), always UTC with a +00:00 offset, so
+-- lexical order IS chronological order and get_host_usage compares strings.
+CREATE TABLE IF NOT EXISTS host_usage (
+    recorded_at TEXT NOT NULL,
+    host        TEXT NOT NULL,
+    provider    TEXT NOT NULL,
+    requests    INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS host_usage_host_time ON host_usage(host, recorded_at);
 """
 
 # v1 → v2: add the provider dimension. Three tables need constraint changes
@@ -728,6 +756,11 @@ def init_schema(conn: sqlite3.Connection) -> None:
     # below records the upgrade.
     if user_version == 14:
         user_version = 15
+    # v15 -> v16 (issue #385): the host_usage table, BACKFILLED from the last
+    # two UTC dates of api_usage so the first night after deploy is gated.
+    if user_version == 15:
+        _migrate_v15_to_v16(conn)
+        user_version = 16
     conn.executescript(_SCHEMA)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
@@ -1832,13 +1865,100 @@ def delete_walk_diff_for_walk(conn: sqlite3.Connection, to_walk_id: int) -> None
     conn.commit()
 
 
+_HOST_USAGE_DDL = """
+CREATE TABLE IF NOT EXISTS host_usage (
+    recorded_at TEXT NOT NULL,
+    host        TEXT NOT NULL,
+    provider    TEXT NOT NULL,
+    requests    INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS host_usage_host_time ON host_usage(host, recorded_at);
+"""
+
+# Which UTC dates of api_usage the v16 backfill seeds from: today and
+# yesterday. Two, because a rolling 24 h window read at any time of day can
+# reach back into yesterday's UTC date and no further.
+_HOST_USAGE_BACKFILL_DAYS = 2
+
+
+def _migrate_v15_to_v16(conn: sqlite3.Connection) -> None:
+    """Create ``host_usage`` and seed it from recent ``api_usage`` (v16, issue #385).
+
+    Creates the table itself rather than leaving it to ``_SCHEMA``, because the
+    migration chain runs BEFORE ``executescript(_SCHEMA)`` and the backfill
+    needs somewhere to write.
+
+    **Why a backfill at all:** without one, the first night after deploy reads
+    an empty window and is ungated -- the rolling host budget would start
+    counting from zero on precisely the night after whatever burst prompted it.
+    So every ``api_usage`` row of a channel in ``CHANNEL_METERED_HOST`` whose
+    ``usage_date`` is today or yesterday (UTC, from ``clock.snapshot_date_today``)
+    becomes one ``host_usage`` row stamped at **12:00:00 UTC of that date**. Noon
+    is a guess at where a day's spend sat, and a guess in both directions: some
+    of yesterday's real spend falls out of the window earlier than stamped and
+    some later. It is a one-night approximation that ages out within 24 h.
+
+    gsv/gsv_streets rows are never backfilled -- they are not in the metered
+    map, because Google meters by project, not by IP.
+
+    Idempotent: seeds only an EMPTY table, so a catalog interrupted after the
+    create (or re-run by hand) never double-counts.
+    """
+    conn.executescript(_HOST_USAGE_DDL)
+    if conn.execute("SELECT 1 FROM host_usage LIMIT 1").fetchone() is not None:
+        return
+    has_api_usage = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'api_usage'"
+    ).fetchone()
+    if has_api_usage is None:
+        return
+    today = clock.snapshot_date_today()
+    since = today - timedelta(days=_HOST_USAGE_BACKFILL_DAYS - 1)
+    rows = conn.execute(
+        "SELECT usage_date, provider, requests FROM api_usage WHERE usage_date >= ?",
+        (since.isoformat(),),
+    ).fetchall()
+    seeded = 0
+    for usage_date, provider, requests in rows:
+        host = CHANNEL_METERED_HOST.get(provider)
+        if host is None or not requests or requests <= 0:
+            continue
+        stamp = datetime.combine(date.fromisoformat(usage_date), time(12, 0), tzinfo=UTC)
+        conn.execute(
+            "INSERT INTO host_usage (recorded_at, host, provider, requests) VALUES (?, ?, ?, ?)",
+            (stamp.isoformat(), host, provider, requests),
+        )
+        seeded += 1
+    logger.info(f"Migrating catalog schema v15 -> v16 (host_usage, {seeded} row(s) backfilled)")
+    conn.commit()
+
+
 # ── API budget ledger ──────────────────────────────────────────────────────
 
 
 def add_api_usage(
-    conn: sqlite3.Connection, usage_date: date, n: int, provider: str = "gsv"
+    conn: sqlite3.Connection,
+    usage_date: date,
+    n: int,
+    provider: str = "gsv",
+    *,
+    meter_host: bool = True,
 ) -> None:
-    """Add n requests to the given (date, provider) ledger row."""
+    """Add n requests to the given (date, provider) ledger row.
+
+    Also THE write seam of the per-host rolling ledger (issue #385): when
+    ``meter_host`` is true, ``provider`` is in
+    ``download_common.CHANNEL_METERED_HOST`` and ``n > 0``, one ``host_usage``
+    row is stamped ``clock.utc_now_iso()`` beside the daily one. One seam, so
+    no call site -- the grid CLI, the road walk, the Panoramax screen -- can
+    forget it, and config-independent, so the ledger is complete whatever the
+    ``[hosts.*]`` budgets say.
+
+    ``meter_host=False`` is for spend that did NOT come from this machine's IP:
+    ``bundle_import`` lands a laptop's ledger, and charging it to this host's
+    rolling window would defer tonight's work over requests another address
+    made.
+    """
     conn.execute(
         """INSERT INTO api_usage (usage_date, provider, requests)
            VALUES (?, ?, ?)
@@ -1846,7 +1966,45 @@ def add_api_usage(
            DO UPDATE SET requests = requests + ?""",
         (usage_date.isoformat(), provider, n, n),
     )
+    host = CHANNEL_METERED_HOST.get(provider)
+    if meter_host and host is not None and n > 0:
+        conn.execute(
+            "INSERT INTO host_usage (recorded_at, host, provider, requests) VALUES (?, ?, ?, ?)",
+            (clock.utc_now_iso(), host, provider, n),
+        )
     conn.commit()
+
+
+def _utc_iso(when: datetime) -> str:
+    """``when`` as the UTC ISO string ``host_usage.recorded_at`` is compared in.
+
+    Refuses a naive datetime rather than guessing its zone: the comparison is
+    lexical, and a naive string sorts as if it were UTC whatever it meant.
+    """
+    if when.tzinfo is None or when.utcoffset() is None:
+        raise ValueError(f"host_usage windows need an aware datetime, got naive {when!r}")
+    return when.astimezone(UTC).isoformat()
+
+
+def get_host_usage(conn: sqlite3.Connection, host: str, since: datetime) -> int:
+    """Requests recorded against per-IP ``host`` at or after ``since`` (issue #385).
+
+    INCLUSIVE at ``since``: a row stamped exactly ``now - 24h`` still counts,
+    one a second earlier does not. Every channel on the host is summed -- the
+    whole point is that the two Mapillary channels share one IP and one CDN.
+    """
+    row = conn.execute(
+        "SELECT COALESCE(SUM(requests), 0) FROM host_usage WHERE host = ? AND recorded_at >= ?",
+        (host, _utc_iso(since)),
+    ).fetchone()
+    return int(row[0])
+
+
+def prune_host_usage(conn: sqlite3.Connection, before: datetime) -> int:
+    """Delete ``host_usage`` rows stamped strictly before ``before``; return the count."""
+    cur = conn.execute("DELETE FROM host_usage WHERE recorded_at < ?", (_utc_iso(before),))
+    conn.commit()
+    return cur.rowcount
 
 
 def get_api_usage(conn: sqlite3.Connection, usage_date: date, provider: str = "gsv") -> int:

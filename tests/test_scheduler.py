@@ -10108,6 +10108,7 @@ def _run_channels(sched, cfg, conn, city, providers, **overrides):
         blocked_hosts=sched.HostBreaker(),
         busy_hosts=Counter(),
         deferred_channels=Counter(),
+        deferred_host_budget=Counter(),
         rejected_argv=sched.ArgvRejections(),
         batch_deadline=None,
         stop_requested=None,
