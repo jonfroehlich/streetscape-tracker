@@ -3,7 +3,7 @@
 import json
 import os
 import sqlite3
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
@@ -1864,3 +1864,109 @@ def test_the_provenance_defaults_to_null_not_to_the_collecting_channel(conn):
     )
     run = db.get_latest_run(conn, city_id, provider="gsv")
     assert run.census_fetched_by is None and run.census_fetched_at is None
+
+
+# ── The per-host rolling ledger, schema v16 (issue #385) ────────────────────
+
+_HOST_NOW = datetime(2026, 9, 28, 6, 0, tzinfo=UTC)
+
+
+def _host_rows(conn):
+    return sorted(
+        tuple(r)
+        for r in conn.execute("SELECT recorded_at, host, provider, requests FROM host_usage")
+    )
+
+
+def test_migrate_v15_to_v16_backfills_two_utc_dates_of_metered_channels(tmp_path, frozen_utc_clock):
+    """A v15 catalog gains host_usage, seeded so the first night after deploy is gated.
+
+    Built from db._SCHEMA minus host_usage (so the fixture tracks the code), with
+    api_usage rows chosen so each exclusion is separately observable: a
+    two-days-old metered row (outside the two UTC dates), gsv and gsv_streets
+    rows (Google meters by project, not IP), and a zero-request row. The kept
+    rows are stamped at 12:00 UTC of their usage_date, one row per channel.
+    """
+    frozen_utc_clock(_HOST_NOW)
+    db_path = str(tmp_path / "v15.db")
+    raw = sqlite3.connect(db_path)
+    raw.executescript(db._SCHEMA)
+    raw.execute("DROP TABLE host_usage")
+    for usage_date, provider, n in [
+        ("2026-09-28", "mapillary", 194),
+        ("2026-09-28", "mapillary_streets", 1444),
+        ("2026-09-27", "mapillary", 1198),
+        ("2026-09-27", "kartaview", 16),
+        ("2026-09-26", "mapillary_streets", 1262),  # two dates back: out
+        ("2026-09-28", "gsv", 5_000_000),  # not per-IP: out
+        ("2026-09-27", "gsv_streets", 90_000),  # not per-IP: out
+        ("2026-09-27", "panoramax", 0),  # nothing spent: out
+    ]:
+        raw.execute(
+            "INSERT INTO api_usage (usage_date, provider, requests) VALUES (?, ?, ?)",
+            (usage_date, provider, n),
+        )
+    raw.execute("PRAGMA user_version = 15")
+    raw.commit()
+    raw.close()
+
+    conn = db.connect(db_path)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 16
+    assert _host_rows(conn) == [
+        ("2026-09-27T12:00:00+00:00", "kartaview", "kartaview", 16),
+        ("2026-09-27T12:00:00+00:00", "mapillary_tiles", "mapillary", 1198),
+        ("2026-09-28T12:00:00+00:00", "mapillary_tiles", "mapillary", 194),
+        ("2026-09-28T12:00:00+00:00", "mapillary_tiles", "mapillary_streets", 1444),
+    ]
+    conn.close()
+
+    # Idempotent: a second connect neither re-migrates nor double-seeds, and
+    # re-running the migration by hand on a non-empty table seeds nothing.
+    conn2 = db.connect(db_path)
+    db._migrate_v15_to_v16(conn2)
+    assert len(_host_rows(conn2)) == 4
+    conn2.close()
+
+
+def test_add_api_usage_is_the_host_ledger_write_seam(conn, frozen_utc_clock):
+    """One seam, so no call site can forget it (issue #385).
+
+    A metered channel writes one host_usage row stamped from the shared clock;
+    gsv writes none; meter_host=False (the bundle import) writes none; and a
+    zero spend writes none -- but every one of them still charges api_usage.
+    """
+    frozen_utc_clock(_HOST_NOW)
+    d = date(2026, 9, 28)
+    db.add_api_usage(conn, d, 120, "mapillary")
+    db.add_api_usage(conn, d, 5_000, "gsv")
+    db.add_api_usage(conn, d, 5_000, "gsv_streets")
+    db.add_api_usage(conn, d, 40, "kartaview", meter_host=False)
+    db.add_api_usage(conn, d, 0, "mapillary_streets")
+    assert _host_rows(conn) == [("2026-09-28T06:00:00+00:00", "mapillary_tiles", "mapillary", 120)]
+    assert db.get_api_usage(conn, d, "kartaview") == 40
+    assert db.get_api_usage(conn, d, "gsv") == 5_000
+
+
+def test_the_host_window_is_inclusive_at_its_start(conn):
+    """A row stamped exactly at ``since`` counts; one a second earlier does not."""
+    since = _HOST_NOW - timedelta(hours=24)
+    for stamp, n in [(since, 7), (since - timedelta(seconds=1), 1000), (_HOST_NOW, 3)]:
+        conn.execute(
+            "INSERT INTO host_usage VALUES (?, 'mapillary_tiles', 'mapillary', ?)",
+            (stamp.isoformat(), n),
+        )
+    assert db.get_host_usage(conn, "mapillary_tiles", since) == 10
+    assert db.get_host_usage(conn, "kartaview", since) == 0
+    with pytest.raises(ValueError, match="aware"):
+        db.get_host_usage(conn, "mapillary_tiles", since.replace(tzinfo=None))
+
+
+def test_prune_host_usage_drops_only_rows_older_than_the_cutoff(conn):
+    cutoff = _HOST_NOW - timedelta(days=30)
+    for stamp in (cutoff - timedelta(seconds=1), cutoff, _HOST_NOW):
+        conn.execute(
+            "INSERT INTO host_usage VALUES (?, 'mapillary_tiles', 'mapillary', 1)",
+            (stamp.isoformat(),),
+        )
+    assert db.prune_host_usage(conn, cutoff) == 1
+    assert [r[0] for r in _host_rows(conn)] == [cutoff.isoformat(), _HOST_NOW.isoformat()]

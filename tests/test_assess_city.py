@@ -10,7 +10,7 @@ behaviour is covered by tests/test_streetwalk_collect.py and
 tests/test_streetwalk_mapillary.py.
 """
 
-from datetime import date
+from datetime import UTC, date, datetime
 
 import pytest
 
@@ -408,6 +408,37 @@ def test_the_preflight_prices_every_channel_against_todays_remaining_budget(
     assert cid == CITY_ID
     assert "14,995 of 15,000 spent today" in out
     assert "OVER REMAINING BUDGET, deferred" in out
+
+
+def test_the_preflight_shows_the_tile_cdns_rolling_window(
+    conn, monkeypatch, tmp_path, capsys, frozen_utc_clock
+):
+    """Issue #385: beside each Mapillary channel's daily line, the host's last 24 h.
+
+    2,995 of 3,000 are gone, so the 9-tile grid run does not fit what the HOST
+    has left even though its own daily budget is untouched -- and the pre-flight
+    says which ceiling that is. gsv_streets shares no budgeted host and gets no
+    host line.
+    """
+    _stub_collection(monkeypatch, conn)
+    frozen_utc_clock(datetime(2026, 8, 17, 12, 0, tzinfo=UTC))
+    conn.execute(
+        "INSERT INTO host_usage VALUES ('2026-08-17T09:00:00+00:00', 'mapillary_tiles', "
+        "'mapillary_streets', 2995)"
+    )
+    conn.commit()
+    cfg = _cfg(tmp_path, host_budgets={"mapillary_tiles": 3000})
+
+    _sched.cmd_assess_city(cfg, QUERY, today=TODAY, assume_yes=True, estimate_only=True)
+
+    lines = capsys.readouterr().out.splitlines()
+    host_lines = [
+        line for line in lines if "mapillary_tiles: 2,995 of 3,000 in the last 24 h" in line
+    ]
+    assert len(host_lines) == sum(1 for c in ASSESS_CHANNELS if c.startswith("mapillary"))
+    grid = next(line for line in lines if line.strip().startswith("mapillary "))
+    assert "OVER mapillary_tiles's rolling-24h budget" in grid
+    assert "0 of 15,000 spent today" in grid
 
 
 def test_a_channel_over_the_whole_budget_is_not_called_deferred(
