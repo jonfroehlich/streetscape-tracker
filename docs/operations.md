@@ -118,6 +118,49 @@ As after `assess-city`, the imported channels are then the *least* stale rows fo
 
 Three pieces of #330 are deliberately still open: a laptop-side `investigate` driver that runs the collectors and does the rsync itself, a `register-city` subcommand so the laptop asks prod for the frozen grid *before* collecting rather than being checked against it afterward, and a pidfile written by `run-due` to replace the batch check's `ps` heuristic.
 
+## Enabling a city: one enrolment function behind every path (issue #374)
+
+**Added after the 2026-08-22 split.**
+
+Every path that brought a city into the schedule left the four opt-in channels (`kartaview`, `kartaview_streets`, `panoramax`, `panoramax_streets`) at `schedule_state.member = NULL`, which `CHANNEL_DEFAULT_MEMBERSHIP` reads as "not a member".
+So a new city silently collected GSV and Mapillary only, unless an operator remembered four extra `enroll-city` calls — Montréal and Ottawa (2026-09-24/25) were the measured case.
+Now every enable path calls one function, `scheduler.enroll_opt_in_channels`, and prints its decisions one line per channel:
+
+| Path | Command | When enrolment runs | Preview |
+|---|---|---|---|
+| Frame / hand-registered city | `scheduler enable-city CITY` | Before `cities.enabled` flips, so the first night sees every channel | `--dry-run` |
+| Laptop investigation | `scheduler import-bundle DIR --enable --execute` | After the bundle lands, only when `--enable` actually turns the city on | The default dry run |
+| Partner inquiry | `scheduler assess-city "City, Region"` | After the confirmation, before the walks run, only for a NEW city | The pre-flight; `--estimate` stops there |
+
+All three take `--no-opt-in` (skip enrolment entirely; membership is untouched) and `--enroll-kartaview` (below).
+`enable-city` refuses an unknown city and an already-enabled one with exit 64: changing an enabled city's membership is `enroll-city`'s job, and re-running the gates on the ~1,200 cities already enabled is the backfill #374 keeps out of scope.
+For a city meant to collect on only some channels (the staged rollout in `docs/scheduler.md`), pass `--no-opt-in`, or pre-set `enroll-city --remove` on the opt-in channels too — an explicit value is never overwritten.
+
+**Two gates, one per provider, and a provider's grid and walk channels always move together** — the walk reads the grid's census from the shared cache for 0 requests (#290), so one without the other pays the census twice or never collects.
+
+- **Panoramax** is enrolled only on a **nonzero upper bound** from a one-city screen run at enrolment time.
+  It is the weekly `screen-provider` instrument, not a copy of it: `panoramax_screen.screen_targets` over one target, the v2 `grid` layer at z6, under the Panoramax host lock, paced by `_screen_pacing`, charged to the day's ledger, and writing the same `provider_screen` row the weekly screen would, so Monday's pass simply continues the series.
+  A handful of tiles (Newport, KY straddles a z6 seam and costs 2).
+  A screen that is refused (403/429), busy (the lock is `timeout=0`, so it is reported, never waited out), unreadable or failed in any other way enrols **neither** channel and reports `screen_failed` — never "unknown" read as a zero, since a zero is conclusive (#316) and a failure is not.
+  The weekly screen's catalog-collapse check does not apply to one city (a zero is the ordinary answer for 64% of the catalog); its renamed-layer guard does, so a genuinely empty city spanning two tiles that answer with no hexagon at all reads as `screen_failed`, which is the safe direction.
+- **KartaView** is priced with `estimate_kartaview_requests` and enrolled at or below `OPT_IN_KARTAVIEW_ENROLL_MAX_REQUESTS` (1,000).
+  #225 measured the median sweep at 16 requests (p95 636), so nearly every city passes; the estimate is a FLOOR (Yogyakarta ran 3.0x it, #248).
+  Above the ceiling the pair is `needs_flag`: the estimate is printed and nothing is enrolled unless `--enroll-kartaview` is passed — `--yes` never implies it.
+
+**An explicitly set membership is never overwritten.**
+If either channel of a pair already holds a non-NULL `member`, the whole pair is left alone and reported `already_set`, so an operator's `--remove` survives and a pair is never split by enrolling only its unset half.
+Enrolment is written through `db.set_channel_membership`, the writer `enroll-city` uses; a channel not enabled in this config is still enrolled, with the same `NOTE` `enroll-city` prints, because enrolment before configuration is supported on purpose.
+
+**What "new" means for `assess-city`.**
+A newly registered city, OR one registered by an earlier `--estimate` and never collected since (`db.city_has_collection_history`: no `runs` row, no `street_walks` row, no `schedule_state.last_attempt_at`).
+The second clause is what keeps the documented order — estimate, then collect — from reading as a re-assessment and silently skipping enrolment.
+A city with any history is a re-assessment and its membership is untouched, even where a pair is still unset.
+Every dry run — `--estimate`, `import-bundle` without `--execute`, `enable-city --dry-run` — writes nothing and issues no provider request, so the Panoramax pair previews as `pending_screen` with the tile count its screen will cost.
+
+**Same-date collection comes from the nightly run, not from `assess-city`.**
+`ASSESS_CHANNELS` is unchanged (the opt-in channels stay refusable there, for the reasons at its definition); enrolment is what answers both of those reasons, since the city becomes a member and Panoramax is screened first.
+The closing summary says so in one sentence: the grid runs and the opt-in providers enrolled above arrive with the city's first nightly run, which collects every member channel on one UTC date.
+
 ## Keeping Overpass out of the night: `scripts/prefreeze_street_networks.py` (issue #341)
 
 A road walk on a frozen network never contacts Overpass — `fetch_graph` returns the cached GraphML before it takes the host lock or probes — and only a city's *first* walk fetches one.
