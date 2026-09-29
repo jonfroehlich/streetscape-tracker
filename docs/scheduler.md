@@ -413,7 +413,10 @@ The two Mapillary channels never overlap (the cross-process host lock, and host-
 **The ledger is `host_usage` (schema v16), written by `db.add_api_usage` itself** for every channel in `download_common.CHANNEL_METERED_HOST`, so no call site can forget it and the ledger is complete whatever the budget config says.
 A child records its spend when it finishes, so a long crawl's whole spend is stamped at its end.
 That shifts spend **later** within the window, which makes the gate slightly more conservative on the following night, never less; there are deliberately no mid-crawl writes.
-The v16 migration backfills the last two UTC dates of metered `api_usage`, stamped at noon UTC, so the first night after deploy is gated; the tail prunes rows older than 30 days, best-effort.
+The v16 migration backfills the last two UTC dates of metered `api_usage`, each row stamped at the latest instant its spend can have happened — `min(23:59:59 UTC of its date, the migration's clock)` — so the first night after deploy is gated for the **whole** night.
+Noon was the first choice and was wrong: prod's night runs ~09:00–21:00 UTC, so a noon stamp released yesterday's spend at 12:00 UTC, three hours into the first night, while most of it was still inside the true 24 h.
+The late stamp errs the fail-closed way: it can defer up to one night more than a timestamped ledger would have, and it never releases spend earlier than the real requests would have left the window.
+The tail prunes rows older than 30 days, best-effort.
 `import-bundle` writes no host row, since imported spend came from another machine's IP.
 
 **It is a soft ceiling, exactly like the daily budget**: tiles already in flight finish their retries, so a capped night can end up to `connection_limit × (TILE_MAX_TRIES − 1)` over it.

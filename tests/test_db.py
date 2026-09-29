@@ -1885,7 +1885,9 @@ def test_migrate_v15_to_v16_backfills_two_utc_dates_of_metered_channels(tmp_path
     api_usage rows chosen so each exclusion is separately observable: a
     two-days-old metered row (outside the two UTC dates), gsv and gsv_streets
     rows (Google meters by project, not IP), and a zero-request row. The kept
-    rows are stamped at 12:00 UTC of their usage_date, one row per channel.
+    rows are stamped at the LATEST instant their spend can have happened --
+    23:59:59 UTC of a past date, the migration's own clock for today -- one row
+    per channel.
     """
     frozen_utc_clock(_HOST_NOW)
     db_path = str(tmp_path / "v15.db")
@@ -1913,10 +1915,10 @@ def test_migrate_v15_to_v16_backfills_two_utc_dates_of_metered_channels(tmp_path
     conn = db.connect(db_path)
     assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 16
     assert _host_rows(conn) == [
-        ("2026-09-27T12:00:00+00:00", "kartaview", "kartaview", 16),
-        ("2026-09-27T12:00:00+00:00", "mapillary_tiles", "mapillary", 1198),
-        ("2026-09-28T12:00:00+00:00", "mapillary_tiles", "mapillary", 194),
-        ("2026-09-28T12:00:00+00:00", "mapillary_tiles", "mapillary_streets", 1444),
+        ("2026-09-27T23:59:59+00:00", "kartaview", "kartaview", 16),
+        ("2026-09-27T23:59:59+00:00", "mapillary_tiles", "mapillary", 1198),
+        ("2026-09-28T06:00:00+00:00", "mapillary_tiles", "mapillary", 194),
+        ("2026-09-28T06:00:00+00:00", "mapillary_tiles", "mapillary_streets", 1444),
     ]
     conn.close()
 
@@ -1926,6 +1928,50 @@ def test_migrate_v15_to_v16_backfills_two_utc_dates_of_metered_channels(tmp_path
     db._migrate_v15_to_v16(conn2)
     assert len(_host_rows(conn2)) == 4
     conn2.close()
+
+
+def _v15_catalog(db_path, rows):
+    """A v15 catalog: db._SCHEMA minus host_usage, with ``rows`` in api_usage."""
+    raw = sqlite3.connect(db_path)
+    raw.executescript(db._SCHEMA)
+    raw.execute("DROP TABLE host_usage")
+    raw.executemany("INSERT INTO api_usage (usage_date, provider, requests) VALUES (?, ?, ?)", rows)
+    raw.execute("PRAGMA user_version = 15")
+    raw.commit()
+    raw.close()
+
+
+@pytest.mark.parametrize(
+    "at,counted",
+    [
+        (datetime(2026, 9, 30, 12, 0, 1, tzinfo=UTC), 2947),
+        (datetime(2026, 9, 30, 20, 0, tzinfo=UTC), 2947),
+        (datetime(2026, 9, 30, 23, 59, 59, tzinfo=UTC), 2947),
+        (datetime(2026, 10, 1, 0, 0, 0, tzinfo=UTC), 0),
+    ],
+    ids=["noon-plus-1s", "20h", "last-second", "released"],
+)
+def test_the_backfill_keeps_yesterdays_spend_in_the_window_all_first_night(
+    tmp_path, frozen_utc_clock, at, counted
+):
+    """Issue #385 review: the first night after deploy is gated for the WHOLE night.
+
+    Deployed 09-30 09:00 UTC after a 09-29 night of 2,947. Prod's night runs
+    ~09:00-21:00 UTC, so a noon stamp released that spend at 12:00 UTC on 09-30
+    -- three hours into the night the backfill exists to protect. Stamped at the
+    end of its date, it is still in the window at noon and at 20:00, and leaves
+    one second after 23:59:59. A noon stamp fails every case but the last.
+    """
+    frozen_utc_clock(datetime(2026, 9, 30, 9, 0, tzinfo=UTC))
+    db_path = str(tmp_path / "v15.db")
+    _v15_catalog(
+        db_path, [("2026-09-29", "mapillary", 1198), ("2026-09-29", "mapillary_streets", 1749)]
+    )
+    conn = db.connect(db_path)
+    try:
+        assert db.get_host_usage(conn, "mapillary_tiles", at - timedelta(hours=24)) == counted
+    finally:
+        conn.close()
 
 
 def test_add_api_usage_is_the_host_ledger_write_seam(conn, frozen_utc_clock):
