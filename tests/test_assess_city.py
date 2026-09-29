@@ -1479,6 +1479,28 @@ def test_a_failed_screen_enrols_neither_and_says_screen_failed(
     assert db.get_api_usage(conn, TODAY, "panoramax") == 1
 
 
+def test_an_unforeseen_failure_after_the_screen_returns_still_charges_what_it_sent(
+    conn, tmp_path, monkeypatch
+):
+    """
+    The catch-all arm: the screen RETURNED (its requests were sent) but reading
+    the result failed in a way nobody typed. The decision is still
+    `screen_failed`, and the tiles sent are still charged, from the result's
+    own count — the exception carries none.
+    """
+    from streetscape_metadata_tracker import panoramax_screen
+
+    calls = _screen(monkeypatch, 42)
+    monkeypatch.setattr(panoramax_screen, "screen_row", lambda *a, **k: {"unexpected": "shape"})
+
+    report = _enrol(_cfg(tmp_path), conn, _newport(conn))
+
+    assert report.decision("panoramax").decision == "screen_failed"
+    assert "KeyError" in report.decision("panoramax").reason
+    assert len(calls) == 2
+    assert db.get_api_usage(conn, TODAY, "panoramax") == 2
+
+
 def test_a_busy_panoramax_lock_is_reported_and_not_retried(conn, tmp_path, monkeypatch):
     from filelock import FileLock
 

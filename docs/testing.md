@@ -569,6 +569,7 @@ a one-city screen leaving `get_provider_screen_series` and `get_latest_provider_
 a zero screen enrolling neither Panoramax channel while KartaView is decided independently;
 a failed screen — a 429 through the REAL fetch primitive and a connection fault — enrolling neither and reporting `screen_failed`, asserted as that DISTINCT decision because "failure read as zero" is the mutation that matters, with the reason naming both `enroll-city` remedies and the one request actually sent charged to the ledger on each path (the refusal arm and the unreadable arm);
 a held Panoramax lock reported as local contention with no request and no retry;
+an unforeseen failure AFTER the screen returned (a `screen_row` of the wrong shape) still reading `screen_failed` and charging the tiles sent, from the result's own count, which pins the catch-all arm's charge;
 the KartaView ceiling at its boundary (1,000 enrols, 1,001 is `needs_flag` naming `--enroll-kartaview`, 1,001 with the flag enrols) and `--yes` alone never accepting an over-ceiling estimate through the command;
 `--no-opt-in` leaving the city's row SET equal to the collected channels (not merely `member` NULL) and screening nothing;
 a re-assessment of a city with only default-channel history still enrolling one pair while an explicit `member = 0` on the other survives (`already_set`);
@@ -901,6 +902,7 @@ And the per-row search haystack cache is asserted to be keyed by the **field lis
 - An unknown provider is exit 64, not the `ValueError` the filename generators raise.
 - **`--enable` enrols the city on the opt-in channels (issue #374) only when it actually turns the city on**: `--execute` enrols all four (San Luis Obispo's KartaView estimate is 115), the default dry run prints the decisions and writes no `schedule_state` row and issues no screen request, an already-enabled city enrols nothing (no backfill), `--no-opt-in` writes no opt-in row, and the flags parse.
   A bundle carrying a KartaView run that spent 5,000 requests previews `needs_flag` — the executed import prices after that run lands, so a geometry-only preview (115) would say `would enrol` for a city the import leaves unenrolled — and the executed import agrees.
+  With two KartaView runs in the bundle (older 5,000, newer 10) the preview prices from the NEWER one and says `would enrol`, matching `_prior_kartaview_spend`'s newest-first selection.
   An autouse fixture answers the screen's fetch primitive with a connection fault by default, so no import test can reach Panoramax.
 - **A crash at the ledger leaves the cadence rows already written**, pinned by making `add_api_usage` raise: the success rows exist, the retry is refused, and the ledger holds nothing. The `--enable` branch for an already-registered, disabled city is reached through the importer, not through the `set_city_enabled` helper it uses.
 

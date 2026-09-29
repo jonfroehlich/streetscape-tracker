@@ -922,3 +922,48 @@ def test_the_preview_prices_kartaview_with_the_bundles_own_sweep_spend(
     # And the executed import agrees with its own preview.
     assert cmd_import_bundle(cfg, str(bundle_dir), execute=True, enable=True) == 0
     assert _opt_in_members(cfg).get("kartaview") is None
+
+
+def test_the_preview_prices_kartaview_from_the_bundles_NEWEST_sweep(
+    cfg, bundle_dir, monkeypatch, capsys
+):
+    """
+    Two KartaView runs in one bundle: the preview prices from the NEWER one,
+    as `_prior_kartaview_spend` does (`ORDER BY run_date DESC LIMIT 1`) once
+    they land. The older run's 5,000 must not force `needs_flag` when the
+    newer sweep spent 10.
+    """
+    import shutil
+    from datetime import timedelta
+
+    _screen(monkeypatch, 42)
+    _relabel_grid_run_as_kartaview(bundle_dir, api_requests=10)  # the NEWER run
+    older = RUN_DATE - timedelta(days=100)
+    stem = generate_run_filename(
+        CITY_ID,
+        CITY["grid_width_m"],
+        CITY["grid_height_m"],
+        CITY["step_m"],
+        older,
+        provider="kartaview",
+    )
+    newer_csv, newer_json = _run_names(provider="kartaview")
+    shutil.copy(bundle_dir / newer_csv, bundle_dir / f"{stem}.csv.gz")
+    shutil.copy(bundle_dir / newer_json, bundle_dir / f"{stem}.json.gz")
+    conn = db.connect(str(bundle_dir / bundle_import.CATALOG_NAME))
+    db.register_run(
+        conn,
+        city_id=CITY_ID,
+        run_date=older,
+        csv_filename=f"{stem}.csv.gz",
+        json_filename=f"{stem}.json.gz",
+        provider="kartaview",
+        api_requests=5_000,
+    )
+    conn.close()
+
+    assert cmd_import_bundle(cfg, str(bundle_dir), enable=True) == 0
+
+    out = capsys.readouterr().out
+    line = next(ln for ln in out.splitlines() if ln.strip().startswith("kartaview "))
+    assert "would enrol" in line, line

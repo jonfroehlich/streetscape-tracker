@@ -146,7 +146,8 @@ For a city meant to collect on only some channels (the staged rollout in `docs/s
   The weekly screen records the city on its next pass.
   A screen that is refused (403/429), busy (the lock is `timeout=0`, so it is reported, never waited out), unreadable or failed in any other way enrols **neither** channel and reports `screen_failed` — never "unknown" read as a zero, since a zero is conclusive (#316) and a failure is not.
   Requests actually sent are charged to the ledger on a failure too.
-  Nothing re-runs the gate, so the `screen_failed` line names the remedy: re-check after Monday's `screen-provider panoramax`, then `enroll-city CITY --channel panoramax` and `--channel panoramax_streets` if it is positive.
+  A failed screen records no opt-in attempt, so the gate is not re-run on its own but CAN be: re-running `assess-city` on that city re-runs it, until something collects the city on an opt-in channel.
+  The `screen_failed` line names the remedies: re-check after Monday's `screen-provider panoramax`, then either re-run `assess-city` or run `enroll-city CITY --channel panoramax` and `--channel panoramax_streets` if it is positive.
   `assess-city`, `import-bundle` and `enable-city` still exit 0 on a Panoramax refusal (enrolment is a side decision of each), whereas `screen-provider` exits 84 on the same refusal, so a refusal here is visible only in the report line.
   The weekly screen's catalog-collapse check does not apply to one city (a zero is the ordinary answer for 64% of the catalog); its renamed-layer guard does, so a genuinely empty city spanning two tiles that answer with no hexagon at all reads as `screen_failed`, which is the safe direction.
 - **KartaView** is priced with `estimate_kartaview_requests` and enrolled at or below `OPT_IN_KARTAVIEW_ENROLL_MAX_REQUESTS` (1,000).
