@@ -60,7 +60,10 @@ The two ceilings compose: whichever is reached first pauses the crawl, the child
 - a crawl that completes inside its budget and then overruns in its **finalize tail** — grid assignment, the CSV write, the walk's join, stats — because the clock is checked only when a unit is admitted, never after the last one;
 - a launch whose timeout is at or under the 600 s margin, which gets no clock flag at all (the child's `positive_int` would refuse it): the `est == 0` cached-census launch, and an unpaced channel whose `affordable` is None, neither of which the launch floor skips.
 
-In-flight work at the moment the clock trips is not a fourth route in practice: a tile census bounds each in-flight tile's retry chain at `_TILE_MAX_TIME_S` (120 s), so that residue is a few minutes, well inside the margin.
+In-flight work at the moment the clock trips is not a fourth route in practice, and each crawler bounds it its own way.
+A tile census bounds each in-flight tile's retry chain at `_TILE_MAX_TIME_S` (120 s).
+The KartaView sweep has no tile timer, but it is serial and asks the clock before every probe and every page, so what is in flight is one probe: at most `DEFAULT_BACKPRESSURE_RETRIES + 1` = 4 attempts × (the 60 s `DEFAULT_REQUEST_TIMEOUT_S` + ~3.75 s of pacing at 16/min) ≈ 4–5 min.
+Both residues sit inside the 600 s margin.
 The SIGKILL arm does count a `consecutive_failure` and does consume a slot, which is why the five-night bound still exists for it and why the hoist has to put tomorrow's retry in the *first* slot rather than merely in the list.
 The union of the per-channel due lists is ordered by first appearance, so `gsv` (rank 0) dictates city order; a city whose `gsv` run succeeded but whose sweep paused sits at the tail of ~949 cities and is truncated by `max_cities_per_day`, returning months later rather than tomorrow.
 The hoist moves a city to the head of the slate when **every** channel it is due on is opt-in — `all`, not `any`, so a city due on `gsv` too keeps its exact union position and `gsv`'s stalest-first ordering is strictly untouched.

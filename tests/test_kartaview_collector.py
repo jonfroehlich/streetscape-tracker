@@ -3271,6 +3271,8 @@ def test_a_sweep_clock_without_a_checkpoint_is_refused_before_any_request(
     [
         (1, 1, "requests", "the 1-request budget ran out"),
         (5, 2, "clock", f"the {CLOCK_BUDGET_S}-second wall-clock budget ran out"),
+        # A TIE (both trip at the third root's check) resolves to the cap.
+        (2, 2, "requests", "the 2-request budget ran out"),
     ],
 )
 def test_the_sweep_cap_and_clock_compose_and_the_error_names_the_one_that_fired(

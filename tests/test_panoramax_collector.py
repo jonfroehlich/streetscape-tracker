@@ -895,6 +895,8 @@ def test_a_wall_clock_budget_without_a_checkpoint_is_refused_before_any_request(
     [
         (1, 1, "requests", "1-request cap"),
         (5, 2, "clock", f"{CLOCK_BUDGET_S}-second wall-clock budget"),
+        # A TIE (both trip at the third tile's check) resolves to the cap.
+        (2, 2, "requests", "2-request cap"),
     ],
 )
 def test_the_cap_and_the_clock_compose_and_the_error_names_the_one_that_fired(

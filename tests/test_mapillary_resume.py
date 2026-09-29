@@ -1958,6 +1958,9 @@ def test_a_wall_clock_budget_without_a_checkpoint_is_refused_before_any_request(
         (1, CLOCK_BUDGET_S, 1, "requests", "1-request cap"),
         # The clock binds first: 2 requests, while the cap would allow 5.
         (5, CLOCK_BUDGET_S, 2, "clock", f"{CLOCK_BUDGET_S}-second wall-clock budget"),
+        # A TIE: after 2 requests the cap (2) and the clock (t=120 >= 100) trip
+        # at the same check, and a tie resolves to the request cap (#344 review).
+        (2, CLOCK_BUDGET_S, 2, "requests", "2-request cap"),
     ],
 )
 def test_the_cap_and_the_clock_compose_and_the_error_names_the_one_that_fired(
