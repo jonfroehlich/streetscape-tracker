@@ -40,16 +40,29 @@ The second also feeds the timeout derivations below, where a 0 would collapse a 
 The `achieved_rate_fraction` differs per channel because what falls short of the configured rate differs: gsv uses **0.5** for the async engine's structural undershoot against a project quota it never approaches, Mapillary **0.8** because its limiter is a hard ceiling the concurrent fetch tracks closely, and KartaView **0.5** because its walk is *serial*, so per-request latency cannot hide behind other requests in flight and at 16/min the 3.75 s interval is genuinely comparable to the latency of a 2,000-record page.
 Derived values are then clamped to what is left of the batch deadline (never below `_MIN_CLAMPED_TIMEOUT_S`, 300 s), which is what bounds a metro KartaView sweep whose honest timeout exceeds `max_batch_hours` outright — acceptable only because #239's checkpoint turns that kill into a resume rather than a discarded night.
 **For a NON-resumable channel (`gsv`, `gsv_streets`) the clamp now only shortens a child that fits (#373).**
-Under a batch deadline, `_run_city_channels` compares the channel's derived need, `city_timeout_estimate_seconds`, against what is left, and a channel that needs more is deferred rather than launched clamped: no launch, no `record_attempt`, not attempted, so the city stays due, its `consecutive_failures` are untouched and it costs no city-cap slot.
+Under a batch deadline, `_run_city_channels` compares the channel's derived need, `city_timeout_estimate_seconds`, against what is left, and a channel that needs more is deferred rather than launched clamped: no launch, no `record_attempt`, not attempted, and its `consecutive_failures` are untouched.
+Only a city whose EVERY channel deferred costs no city-cap slot (`attempted == 0`); a city with one channel launched and another deferred takes its slot as usual.
 A clamped launch of the same child would have been SIGKILLed at the deadline, recorded as a failure, alerted on at the default `failure_threshold` of 1, and its ledger write lost — a routine outcome once #372 let nights end on the deadline rather than the city cap.
 **The predictor is the estimate, never the floored timeout.**
 The estimate is the derivation above with the headroom and the fixed slack but without the 180-min floor, and `city_timeout_seconds` is pinned to be exactly `clamp(max(floor, estimate))`, so the two cannot drift.
 The floor is a minimum a child is *given*, not what it *needs*: predicting with it would defer every gsv city for the last three hours of every night while a median one finishes in minutes.
-The estimate is still a padded upper bound, so it defers some children that would have finished, and that is the right trade: a deferral costs nothing, a kill costs a failure and an alert.
+The estimate is still a padded upper bound, so it defers some children that would have finished, and that is the right trade: a deferred grid run costs nothing (it stays due and leads tomorrow), a kill costs a failure and an alert.
+Two deferrals are not free, and each is handled rather than denied:
+
+- **A deferred FIRST channel defers the whole city.** When `providers[0]` (normally `gsv`) defers, every other channel of that city defers with it, each counted and logged once ("deferring the rest of this city so its snapshots stay paired").
+  Run alone, the city's Mapillary census and walks would land tonight while the grid lands on a later date, un-pairing its snapshots — the city is the join point — and they would add per-IP Mapillary volume on a night that bought no grid run.
+  A resumable first channel never deadline-defers, so the rule never fires for one.
+- **A walk deferred AFTER its grid landed is STRANDED by the deadline.** The grid success moved the city off the gsv-due list for ~83 days, exactly as a host stranding does (#341), so the walk is recorded on the breaker's stranded set with the reason "the batch deadline": the `Done:` line counts it (`N city(ies) STRANDED un-walked (K by the batch deadline)`), and the alert names it with the same `run-due --provider gsv_streets --city …` recovery command.
+  A stranding alone makes the night unhealthy (alert + nonzero exit), because the alert is the only place that command is printed.
+  The #380 end-of-night retry never re-launches a deadline stranding, and it prices every other non-resumable walk against the remainder BEFORE its call: one that no longer fits "stays stranded — the deadline" and keeps its original entry, never counted as a deadline deferral too.
+
 An estimate of None (pacing disabled, or a channel with no derivation) never defers, since "unknowable" is not "too long".
-Each channel is judged on its own estimate, so a deferred grid run does not defer its walk — walks key on the frozen network, not on the grid run.
+When the first channel launched, every later channel is judged on its own estimate — walks key on the frozen network, not on the grid run.
 The resumable channels never reach this gate: `_sweep_launch_plan` already sizes their cap to the same clock, so they pause rather than being killed.
-The `Done:` line counts the deferrals per channel (`N channel(s) deferred for the deadline (gsv 3, gsv_streets 2)`), apart from both the budget and the sibling-sweep deferral, and none of them makes a night unhealthy.
+A need beyond the whole `max_batch_hours` window can never fit any night, so it logs a WARNING naming the remedies (shrink the grid, raise `max_batch_hours`, run it manually) instead of the INFO line; nothing tracks repeated deferrals across nights.
+The gate reuses its estimate for the child's timeout (`_clamp_timeout`), so a launched channel reads the catalog for its derivation once.
+Under `_MIN_PACED_LAUNCH_S` (the 600 s fixed slack) left, `_run_city_loop` stops starting cities with the deadline stop reason: every paced estimate is the fixed slack plus its pacing, so no non-resumable channel could fit and no resumable one could afford a request, and walking the rest of the due list would only log a line per channel and count floor-skips as budget deferrals.
+The `Done:` line counts the deferrals per channel (`N channel(s) deferred for the deadline (gsv 3, gsv_streets 2)`), apart from both the budget and the sibling-sweep deferral, and a deferral alone does not make a night unhealthy.
 **But a kill is a resume of the WORK and not of the SCHEDULE, and that is where the acceptance runs out.**
 A *deliberate* pause exits `SWEEP_INCOMPLETE_EXIT_CODE` (83) and is amnestied in `_run_city_channels` beside the blocked- and busy-host conditions, so it can repeat indefinitely; a SIGKILL has no exit code, nothing can tell one that checkpointed progress from one that made none, and it counts a `consecutive_failure` that only a success resets — so five clamped nights quarantine the city for a 90-day cycle.
 A metro sweep that cannot finish inside five nights therefore needs #248's per-(city, provider) dueness, not a larger timeout constant.
@@ -215,7 +228,7 @@ Because makelab1 is shared, a `[resource_guard]` pre-flight (pure `plan_connecti
 **The mechanism is the deadline clamp, and it is the only wall-clock lever ordering has.**
 `remaining_s` is read fresh at every launch — one `time.monotonic()` per *launched* channel (or deadline-deferred one, #373), in the launch pass — and `city_timeout_seconds` clamps the derived timeout down to it, floored at `_MIN_CLAMPED_TIMEOUT_S` (300 s).
 A channel launched later therefore sees less of the batch deadline, and an expensive one launched late can have its timeout truncated to the floor and be SIGKILLed part-way, which costs its whole spend from the daily ledger (`db.add_api_usage` runs in the child, after the download returns).
-Since #373 that kill is reachable only by a child running slower than its own derivation: a non-resumable channel whose estimate exceeds the remainder is deferred instead of launched, and a resumable one is capped by `_sweep_launch_plan`.
+Since #373 that kill is reachable only by a child running slower than its own derivation, or by one whose estimate is None (pacing disabled, so there is no derivation to defer on and it launches under the clamp as before): a non-resumable channel whose estimate exceeds the remainder is deferred instead of launched, and a resumable one is capped by `_sweep_launch_plan`.
 So the channel needing the most wall-clock should start while the most of it remains.
 `test_the_deadline_is_a_submit_gate_and_every_lane_child_gets_its_own_remaining_s` pins this, as a decreasing sequence in submit order.
 
