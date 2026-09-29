@@ -1418,6 +1418,9 @@ async def _fetch_city_images(
                 # tile observed to be empty.
                 capped = True
                 if stop_reason is None:
+                    # The cap is tested first, so a tile that finds BOTH
+                    # ceilings tripped at once reports "requests": a tie
+                    # resolves to the request cap, as in the KartaView sweep.
                     stop_reason = SWEEP_STOP_REQUESTS if over_cap else SWEEP_STOP_CLOCK
                 progress_bar.update(1)
                 return records_to_census([])

@@ -3290,3 +3290,119 @@ def test_the_sweep_cap_and_clock_compose_and_the_error_names_the_one_that_fired(
     assert len(calls) == expected
     assert error.stopped_by == stopped_by
     assert phrase in str(error)
+
+
+def _clock_stop_mid_cell(monkeypatch, tmp_path, fake_crawl_clock):
+    """Root 1 claims three pages; pages 1 and 2 (t=0, 60) are asked, and the
+    page-loop check at t=120 stops the sweep INSIDE the cell."""
+    from streetscape_metadata_tracker.download_common import crawl_deadline_from_budget
+
+    def paged(call):
+        fake_crawl_clock.advance(CLOCK_REQUEST_COST_S)
+        items, _ = _photos(call)
+        return items, 3 * kv.IPP_MAX
+
+    error, calls = _failed_sweep_ckpt(
+        monkeypatch,
+        paged,
+        tmp_path / "sweep",
+        radius_m=500,
+        deadline_monotonic=crawl_deadline_from_budget(CLOCK_BUDGET_S),
+    )
+    assert [c.page for c in calls] == [1, 2], "the clock must stop between pages"
+    return error, "mid-cell"
+
+
+def _clock_stop_in_the_retry_pass(monkeypatch, tmp_path, fake_crawl_clock):
+    """Night one leaves two failed roots; night two re-probes the first
+    (t=0 -> 120) and the check before the second stops the RETRY pass."""
+    from streetscape_metadata_tracker.download_common import crawl_deadline_from_budget
+
+    ckpt = tmp_path / "sweep"
+    seen = []
+    night = {"slow": False}
+
+    def two_bad_roots_once(call):
+        seen.append(call)
+        if len(seen) <= 2:
+            raise kv.ResponseError("HTTP 500")
+        if night["slow"]:
+            fake_crawl_clock.advance(2 * CLOCK_REQUEST_COST_S)
+        return [], 0
+
+    _failed_sweep_ckpt(monkeypatch, two_bad_roots_once, ckpt, retries=0)
+    assert len(_state(ckpt)["failed_cells"]) == 2
+    night["slow"] = True
+    error, calls = _failed_sweep_ckpt(
+        monkeypatch,
+        two_bad_roots_once,
+        ckpt,
+        retries=0,
+        deadline_monotonic=crawl_deadline_from_budget(CLOCK_BUDGET_S),
+    )
+    assert len(calls) == 1, "the clock bounded the retry pass"
+    return error, "re-probing previously failed cells"
+
+
+@pytest.mark.parametrize("stop", [_clock_stop_mid_cell, _clock_stop_in_the_retry_pass])
+def test_every_sweep_stop_site_names_the_clock_when_the_clock_fired(
+    monkeypatch, tmp_path, fake_crawl_clock, stop
+):
+    """
+    #344 review: the root-boundary stop was the only one the clock reached, so
+    hard-coding the mid-cell or retry-pass reason back to the request wording
+    left the suite green. Each site is driven here with the clock alone
+    (``max_requests=None``), which also pins that a clock-only stop never
+    prints "the None-request budget".
+    """
+    error, where = stop(monkeypatch, tmp_path, fake_crawl_clock)
+    assert isinstance(error, kv.SweepIncompleteError)
+    assert error.stopped_by == "clock"
+    assert f"the {CLOCK_BUDGET_S}-second wall-clock budget ran out {where}" in str(error)
+    assert "None-request" not in str(error)
+
+
+@pytest.mark.parametrize(
+    ("max_requests", "calls_made", "names", "remedy"),
+    [
+        (1, 1, "The 1-request budget ran out", "re-run with a larger budget"),
+        (
+            50,
+            2,
+            f"The {CLOCK_BUDGET_S}-second wall-clock budget ran out",
+            "--kartaview-max-seconds",
+        ),
+    ],
+)
+def test_a_stop_during_calibration_names_the_ceiling_that_fired(
+    monkeypatch, tmp_path, fake_crawl_clock, max_requests, calls_made, names, remedy
+):
+    """
+    #344 review: the calibration ladder's stop said "The request budget ran
+    out ... re-run with a larger budget" even when the CLOCK stopped it, which
+    sends the operator to raise a cap that was never reached. Nothing is
+    checkpointed this early, so it is a plain DownloadError either way; what
+    must differ is the ceiling it names and the remedy it gives.
+    """
+    from streetscape_metadata_tracker.download_common import crawl_deadline_from_budget
+
+    def refused_slowly(call):
+        fake_crawl_clock.advance(CLOCK_REQUEST_COST_S)
+        raise kv.BackpressureError("apiCode 690")
+
+    error, calls = _failed_sweep_ckpt(
+        monkeypatch,
+        refused_slowly,
+        tmp_path / "sweep",
+        radius_m=None,
+        calibration_probes=kv.DEFAULT_CALIBRATION_PROBES,
+        max_requests=max_requests,
+        deadline_monotonic=crawl_deadline_from_budget(CLOCK_BUDGET_S),
+    )
+    assert len(calls) == calls_made
+    assert not isinstance(error, kv.SweepIncompleteError), "there is nothing to resume"
+    assert "during radius calibration" in str(error)
+    assert names in str(error)
+    assert remedy in str(error)
+    other = "wall-clock" if "request" in names else "request budget"
+    assert other not in str(error)

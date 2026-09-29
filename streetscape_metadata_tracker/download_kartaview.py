@@ -1196,6 +1196,7 @@ async def calibrate_radius(
     retries: int,
     timeout: aiohttp.ClientTimeout | None = None,
     budget_exhausted: Callable[[], bool] | None = None,
+    describe_budget_stop: Callable[[], tuple[str, str]] | None = None,
 ) -> int | None:
     """
     Find the largest radius this city's server will actually answer.
@@ -1237,13 +1238,17 @@ async def calibrate_radius(
             FIRST probe rather than after the ladder -- a dead token answers
             identically at every rung, so the remaining probes could only
             re-learn it -- and its message sends the operator to the .env.
-        DownloadError: ``budget_exhausted`` (the sweep's ``max_requests``
-            guard, asked before every probe) returned True. Raised rather
+        DownloadError: ``budget_exhausted`` (the sweep's stop ceilings --
+            ``max_requests`` and, since issue #344, the wall-clock deadline --
+            asked before every probe) returned True. Raised rather
             than returned as None, because None means "no rung answers in
             this bbox" and both the log line and the caller's refusal would
             blame the city for a budget the operator set. Nothing is swept
             and nothing is checkpointed at this point, so the message says
-            so instead of pointing at a resume.
+            so instead of pointing at a resume. ``describe_budget_stop``
+            returns ``(what ran out, remedy)`` for that message, so a clock
+            stop names the clock rather than a request budget that was never
+            reached; None keeps the request-budget wording.
         ResponseError: the server gave a definite, unusable non-credential
             answer at every probe (an unparseable body, an HTTP error that is
             neither backpressure nor transport). Surfaced as itself rather
@@ -1262,10 +1267,15 @@ async def calibrate_radius(
                 # max_requests=3 spent up to 30 requests here before the first
                 # root was ever asked, in the parameter the scheduler uses to
                 # hand a channel the night's REMAINING budget.
+                what, remedy = (
+                    describe_budget_stop()
+                    if describe_budget_stop is not None
+                    else ("the request budget ran out", "re-run with a larger budget")
+                )
                 raise DownloadError(
-                    f"The request budget ran out during radius calibration "
+                    f"{what[:1].upper()}{what[1:]} during radius calibration "
                     f"(while probing r={radius} m); nothing was swept and nothing is "
-                    f"checkpointed -- re-run with a larger budget"
+                    f"checkpointed -- {remedy}"
                 )
             _, _, outcome = await _probe_cell(
                 session,
@@ -2375,6 +2385,9 @@ async def _fetch_city_images(
         as a cap stop does.
         """
         nonlocal budget_stop
+        # The cap is tested FIRST, so when both ceilings trip at the same check
+        # the tie resolves to the request cap ("requests"), exactly as it does
+        # in both tile censuses. Either answer would be true; this one is fixed.
         if max_requests is not None and api_requests >= max_requests:
             budget_stop = budget_stop or SWEEP_STOP_REQUESTS
             return True
@@ -2383,13 +2396,27 @@ async def _fetch_city_images(
             return True
         return False
 
+    def stopped_on_clock() -> bool:
+        """Did the clock, rather than the cap, stop this sweep?
+
+        Read from ``budget_stop``, which ``over_budget`` latches on the same
+        True that stops the sweep, so every stop site sees it already set.
+        """
+        return budget_stop == SWEEP_STOP_CLOCK
+
     def budget_ran_out() -> str:
         """The stop reason in words, naming the ceiling that actually fired."""
-        if budget_stop == SWEEP_STOP_CLOCK:
+        if stopped_on_clock():
             return (
                 f"the {crawl_budget_seconds(deadline_monotonic):,}-second wall-clock budget ran out"
             )
         return f"the {max_requests}-request budget ran out"
+
+    def budget_remedy() -> str:
+        """What an operator does about a stop that left nothing to resume."""
+        if stopped_on_clock():
+            return "re-run with a longer wall-clock budget (--kartaview-max-seconds)"
+        return "re-run with a larger budget"
 
     def unvisited(cells: list[Cell]) -> None:
         """
@@ -2572,6 +2599,7 @@ async def _fetch_city_images(
                     retries=retries,
                     timeout=timeout,
                     budget_exhausted=over_budget,
+                    describe_budget_stop=lambda: (budget_ran_out(), budget_remedy()),
                 )
             if radius_m is None:
                 # NOT a host condition, deliberately. A host block shows up as a
