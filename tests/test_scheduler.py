@@ -14022,12 +14022,18 @@ def test_the_budget_is_shared_by_both_channels_on_the_host(
 
 
 @pytest.mark.parametrize(
-    "host_used,mapillary_budget,cap,host_deferred,budget_skipped",
+    "host_used,mapillary_budget,deadline_s,cap,host_deferred,budget_skipped,host_named",
     [
-        pytest.param(2500, 40_000, 500, 0, 0, id="host-governs-the-cap"),
-        pytest.param(0, 800, 800, 0, 0, id="channel-governs-the-cap"),
-        pytest.param(2999, 40_000, None, 1, 0, id="host-governs-the-skip"),
-        pytest.param(0, 1, None, 0, 1, id="channel-governs-the-skip"),
+        pytest.param(2500, 40_000, None, 500, 0, 0, True, id="host-governs-the-cap"),
+        pytest.param(0, 800, None, 800, 0, 0, False, id="channel-governs-the-cap"),
+        pytest.param(2999, 40_000, None, None, 1, 0, True, id="host-governs-the-skip"),
+        pytest.param(0, 1, None, None, 0, 1, False, id="channel-governs-the-skip"),
+        # Host remainder == channel remainder: the CHANNEL is the named term
+        # (strictly smaller governs), so the skip is a plain budget skip.
+        pytest.param(2999, 1, None, None, 0, 1, False, id="a-tie-goes-to-the-channel"),
+        # The host governs the LEDGER term, but a 5 s deadline clamps the clock
+        # term to 0 and that is what put the cap under the floor.
+        pytest.param(2000, 40_000, 5, None, 0, 1, False, id="the-clock-binds-the-skip"),
     ],
 )
 def test_the_remainder_is_the_minimum_and_the_skip_names_its_ceiling(
@@ -14035,17 +14041,24 @@ def test_the_remainder_is_the_minimum_and_the_skip_names_its_ceiling(
     monkeypatch,
     tmp_path,
     frozen_utc_clock,
+    caplog,
     host_used,
     mapillary_budget,
+    deadline_s,
     cap,
     host_deferred,
     budget_skipped,
+    host_named,
 ):
     """Both directions of the minimum, for a capped launch and for a floor skip.
 
     A skip the HOST's window caused is counted in ``deferred_host_budget``, never
     ``skipped_budget``: the channel has budget left today, and the operator's
-    lever is a different knob.
+    lever is a different knob. Two review cases pin WHICH term bound: a tie is
+    the channel's, and a skip the deadline clamp caused is the clock's even
+    while the host is the smaller ledger remainder -- attributing either to the
+    host would send the operator to the wrong knob. A host-capped launch names
+    the host on its cap line, and nothing else does.
     """
     from streetscape_metadata_tracker import scheduler as sched
 
@@ -14054,6 +14067,122 @@ def test_the_remainder_is_the_minimum_and_the_skip_names_its_ceiling(
         _seed_host(conn, host_used, _HB_NOW - timedelta(hours=2))
     cfg = _host_budget_cfg(tmp_path, mapillary_budget=mapillary_budget)
     city = _lane_city(conn)
+    # Over every cap here, so a capped launch logs its cap line.
+    monkeypatch.setattr(sched, "_channel_estimate", lambda *a, **k: 1000)
+    calls = []
+    monkeypatch.setattr(
+        sched,
+        "_run_one_city",
+        lambda cfg_, city_, today_, provider="gsv", **kw: calls.append(kw) or True,
+    )
+    deferred = Counter()
+
+    with caplog.at_level(logging.INFO, logger="streetscape_scheduler"):
+        _attempted, _succeeded, skipped = _run_channels(
+            sched,
+            cfg,
+            conn,
+            city,
+            ["mapillary"],
+            deferred_host_budget=deferred,
+            batch_deadline=None if deadline_s is None else time.monotonic() + deadline_s,
+        )
+
+    assert [c["request_cap"] for c in calls] == ([] if cap is None else [cap])
+    assert deferred == (Counter({"mapillary_tiles": 1}) if host_deferred else Counter())
+    assert skipped == budget_skipped
+    city_lines = [r.getMessage() for r in caplog.records if city.city_id in r.getMessage()]
+    assert city_lines, "every case here logs its decision"
+    named = [line for line in city_lines if "rolling-24h budget of" in line]
+    assert bool(named) == host_named, city_lines
+    if host_named and cap is not None:
+        assert "launching capped" in named[0] and f"{cap:,} left in the rolling-24h" in named[0]
+
+
+def test_a_checkpoint_at_the_age_wall_is_not_failed_on_a_window_that_frees_tonight(
+    conn, tmp_path, monkeypatch, caplog
+):
+    """Issue #385 review: the age wall projects against what TONIGHT can grant.
+
+    At 09:00 UTC after a full night the rolling window holds 53 of 3,000, while
+    the channel has 40,000 left today and most of the window comes back before
+    the night ends. A 6.5-day checkpoint with ~360 requests left must not be
+    refused -- that arm RECORDS A FAILURE and tells the operator to raise the
+    daily budget, the wrong lever -- it launches capped at 53 instead. Comparing
+    against the momentary remainder fails this.
+
+    The same checkpoint is refused when the host's FULL budget is under what is
+    left, and the refusal then names the host's knob.
+    """
+    from streetscape_metadata_tracker import clock
+    from streetscape_metadata_tracker import scheduler as sched
+
+    # Real clock, not frozen: the checkpoint's age is measured from the wall
+    # clock _write_sweep_checkpoint stamps.
+    now = clock.utc_now()
+    city = _checkpointed_city(
+        conn,
+        tmp_path,
+        monkeypatch,
+        roots_done=10,
+        root_count=100,
+        days_old=6.5,
+        channel="mapillary",
+    )
+    monkeypatch.setattr(sched, "_channel_estimate", lambda *a, **k: 400)
+    calls = []
+    monkeypatch.setattr(
+        sched,
+        "_run_one_city",
+        lambda cfg_, city_, today_, provider="gsv", **kw: calls.append(kw) or True,
+    )
+    _seed_host(conn, 2947, now - timedelta(hours=1), provider="mapillary")
+
+    cfg = _host_budget_cfg(tmp_path)
+    attempted, succeeded, _ = _run_channels(sched, cfg, conn, city, ["mapillary"])
+    assert [c["request_cap"] for c in calls] == [53]
+    assert (attempted, succeeded) == (1, 1), "a capped launch, not a recorded failure"
+    row = conn.execute(
+        "SELECT consecutive_failures FROM schedule_state WHERE city_id = ? AND provider = ?",
+        (city.city_id, "mapillary"),
+    ).fetchone()
+    assert row is None or row["consecutive_failures"] == 0
+
+    # A host budget of 300 can never grant the ~360 left, however much of the
+    # window frees tonight: that IS the age wall. 100 are in the window, so the
+    # momentary remainder (200) and the ceiling (300) differ, and the message
+    # has to quote the ceiling it compared against.
+    calls.clear()
+    conn.execute("DELETE FROM host_usage")
+    _seed_host(conn, 100, now - timedelta(hours=1), provider="mapillary")
+    cfg = _host_budget_cfg(tmp_path, hosts="300")
+    with caplog.at_level(logging.WARNING, logger="streetscape_scheduler"):
+        attempted, succeeded, _ = _run_channels(sched, cfg, conn, city, ["mapillary"])
+    assert calls == [] and (attempted, succeeded) == (1, 0)
+    refusal = next(r.getMessage() for r in caplog.records if "refusing to resume" in r.getMessage())
+    assert "raise [hosts.mapillary_tiles].rolling_24h_request_budget" in refusal
+    assert "will not fit tonight's 300 (300 is the most the rolling-24h budget of" in refusal
+
+
+def test_a_non_resumable_channel_on_a_budgeted_host_is_deferred_by_the_host(
+    conn, monkeypatch, tmp_path, frozen_utc_clock, capsys
+):
+    """The all-or-nothing arm, live and in the preview (issue #385 review).
+
+    No metered channel takes it today -- every one is resumable -- so it is
+    reached by patching is_resumable_channel. 1,000 requests do not fit the 10
+    the host has left, although the channel's own 40,000 is untouched: the
+    night counts it in ``deferred_host_budget`` (not ``skipped_budget``) and the
+    dry run labels it as the host's deferral.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    frozen_utc_clock(_HB_NOW)
+    _seed_host(conn, 2990, _HB_NOW - timedelta(hours=1))
+    cfg = _host_budget_cfg(tmp_path)
+    city = _lane_city(conn)
+    monkeypatch.setattr(sched, "is_resumable_channel", lambda channel: False)
+    monkeypatch.setattr(sched, "_channel_estimate", lambda *a, **k: 1000)
     calls = []
     monkeypatch.setattr(
         sched,
@@ -14065,10 +14194,46 @@ def test_the_remainder_is_the_minimum_and_the_skip_names_its_ceiling(
     _attempted, _succeeded, skipped = _run_channels(
         sched, cfg, conn, city, ["mapillary"], deferred_host_budget=deferred
     )
+    assert calls == [] and skipped == 0
+    assert deferred == Counter({"mapillary_tiles": 1})
 
-    assert [c["request_cap"] for c in calls] == ([] if cap is None else [cap])
-    assert deferred == (Counter({"mapillary_tiles": 1}) if host_deferred else Counter())
-    assert skipped == budget_skipped
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+    assert sched.cmd_run_due(cfg, dry_run=True, today=_HB_TODAY) == 0
+    lines = [line for line in capsys.readouterr().out.splitlines() if city.city_id in line]
+    assert lines and all("DEFERRED (host rolling-24h budget)" in line for line in lines), lines
+
+
+def test_the_dry_run_draws_the_host_pool_down_across_both_channels(
+    conn, monkeypatch, tmp_path, frozen_utc_clock, capsys
+):
+    """Three cities x both Mapillary channels at 12 requests each, against a pool of 30.
+
+    The preview applies the live rule (``_combine_remainder``) to a SIMULATED
+    window, so each launch it prints draws the pool down for the next -- across
+    channels, since the pool is the host's: ok, ok, capped at 6, then three
+    deferrals. Without the drawdown all six print "ok" beside a night that
+    defers four of them.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    frozen_utc_clock(_HB_NOW)
+    for name in ("Bend", "Corvallis", "Eugene"):
+        _register(conn, name)
+    cfg = _host_budget_cfg(tmp_path, hosts="30")
+    monkeypatch.setattr(sched, "_channel_estimate", lambda *a, **k: 12)
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+
+    assert sched.cmd_run_due(cfg, dry_run=True, today=_HB_TODAY) == 0
+    rows = [line for line in capsys.readouterr().out.splitlines() if "~       12 req" in line]
+    verdicts = [line.split("req  ", 1)[1] for line in rows]
+    assert verdicts == [
+        "ok",
+        "ok",
+        "launch capped at 6; resumes [host rolling-24h budget]",
+        "deferred (0 req under the launch floor) [host rolling-24h budget]",
+        "deferred (0 req under the launch floor) [host rolling-24h budget]",
+        "deferred (0 req under the launch floor) [host rolling-24h budget]",
+    ]
 
 
 @pytest.mark.parametrize("hosts", [None, "[hosts]\n"], ids=["no-section", "empty-table"])
@@ -14114,11 +14279,23 @@ def test_no_host_budget_configured_is_todays_launch_exactly(
         '[hosts.mapillary_tiles]\nrolling_24h_request_budget = "3000"\n',
         "[hosts.mapillary_tiles]\nrolling_24h_request_budget = 3000\ndaily = 1\n",
         "[hosts.mapillary_tiles]\n",
+        # A real per-IP host no channel's ledger meters: it would load clean and
+        # never bind, so it is refused like a typo (issue #385 review).
+        "[hosts.overpass]\nrolling_24h_request_budget = 3000\n",
     ],
-    ids=["unknown-token", "zero", "negative", "bool", "string", "extra-key", "missing-key"],
+    ids=[
+        "unknown-token",
+        "zero",
+        "negative",
+        "bool",
+        "string",
+        "extra-key",
+        "missing-key",
+        "unmetered-host",
+    ],
 )
 def test_an_invalid_host_budget_refuses_the_channel_running_commands(
-    conn, monkeypatch, tmp_path, block
+    conn, monkeypatch, tmp_path, caplog, block
 ):
     """Invalid [hosts.*] fails at load: recorded, never silently ignored.
 
@@ -14128,9 +14305,17 @@ def test_an_invalid_host_budget_refuses_the_channel_running_commands(
     """
     from streetscape_metadata_tracker import scheduler as sched
 
-    cfg = _host_budget_cfg(tmp_path, hosts=block)
+    with caplog.at_level(logging.ERROR, logger="streetscape_scheduler"):
+        cfg = _host_budget_cfg(tmp_path, hosts=block)
     assert cfg.host_budgets == {}
     assert len(cfg.host_budget_errors) == 1
+    # The loader LOGS each error as it records it, so a read-only subcommand
+    # that proceeds still leaves the reason in the log.
+    assert [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR] == (
+        cfg.host_budget_errors
+    )
+    if "overpass" in block or "tiles_mapillary" in block:
+        assert "metered hosts: kartaview, mapillary_tiles, panoramax" in cfg.host_budget_errors[0]
     connected = []
     monkeypatch.setattr(sched.db, "connect", lambda path: connected.append(path) or conn)
     assert sched.cmd_run_due(cfg, today=_HB_TODAY) == sched.USAGE_EXIT_CODE
@@ -14170,11 +14355,16 @@ def test_a_filtered_walk_catch_up_by_city_is_gated(
     note = "1 deferred for the rolling-24h budget of Mapillary's tile CDN"
     if cap is None:
         assert any(note in d for d in done), done
-        assert any(
-            f"{cid} [mapillary_streets]: deferred — the rolling-24h budget of" in r.getMessage()
-            and "2,999 of 3,000 used since 2026-09-27 06:00 UTC" in r.getMessage()
+        lines = [
+            r.getMessage()
             for r in caplog.records
-        )
+            if r.getMessage().startswith(f"{cid} [mapillary_streets]: deferred — ")
+        ]
+        assert len(lines) == 1, lines
+        # The host clause is named exactly ONCE (the review found it twice:
+        # once as a prefix and again inside plan.message).
+        assert lines[0].count("the rolling-24h budget of Mapillary's tile CDN") == 1
+        assert "2,999 of 3,000 used since 2026-09-27 06:00 UTC" in lines[0]
         assert "deferred for budget" not in done[0]
     else:
         assert not any(note in d for d in done)
