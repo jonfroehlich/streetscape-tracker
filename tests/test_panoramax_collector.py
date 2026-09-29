@@ -815,3 +815,123 @@ def test_the_cap_is_not_overshot_by_the_tasks_already_in_flight(
         )
     assert len(record) == max_requests, "a capped crawl must spend its cap and no more"
     assert len(record) < len(tiles), "the cap must stop the city, not merely dent it"
+
+
+# ── The wall-clock stop (issue #344) ───────────────────────────────────────
+#
+# The cap's twin on the clock, pinned the way the Mapillary census's is: a slow
+# crawl must pause itself before the scheduler's SIGKILL. `fake_crawl_clock` is
+# advanced by the fake fetch, so the deadline is crossed at a known tile.
+
+CLOCK_BUDGET_S = 100
+CLOCK_TILE_COST_S = 60  # tiles 1 and 2 admitted (t=0, 60); tile 3 (t=120) is not
+
+
+def _many_tiles_bbox(lat, lon):
+    bbox = dp.grid_bbox(lat, lon, 2000, 2000, 20)
+    tiles = dp.tiles_for_bbox(*bbox)
+    assert len(tiles) > 8, "needs enough tiles for a part-way stop to be visible"
+    return bbox, tiles
+
+
+def _stub_slowly(monkeypatch, fake_crawl_clock, record):
+    async def slow(session, url, timeout, rate_limiter=None, on_request=None, on_empty=None):
+        if on_request is not None:
+            on_request()
+        fake_crawl_clock.advance(CLOCK_TILE_COST_S)
+        record.append(url)
+        return mapbox_vector_tile.encode([])
+
+    monkeypatch.setattr(dp, "_fetch_tile", slow)
+
+
+def _fetch_clocked(tmp_path, bbox, *, max_requests=None, deadline=None, checkpoint=True):
+    return asyncio.run(
+        dp.fetch_city_images_async(
+            "Test City",
+            bbox,
+            connection_limit=1,
+            max_requests=max_requests,
+            deadline_monotonic=deadline,
+            checkpoint_path=str(tmp_path / "cp") if checkpoint else None,
+            checkpoint_channel="panoramax",
+        )
+    )
+
+
+def test_a_census_past_its_wall_clock_budget_pauses_rather_than_being_killed(
+    monkeypatch, tmp_path, straddling_city, fake_crawl_clock
+):
+    from streetscape_metadata_tracker.download_common import crawl_deadline_from_budget
+
+    bbox, tiles = _many_tiles_bbox(*straddling_city)
+    record = []
+    _stub_slowly(monkeypatch, fake_crawl_clock, record)
+
+    with pytest.raises(SweepIncompleteError) as excinfo:
+        _fetch_clocked(tmp_path, bbox, deadline=crawl_deadline_from_budget(CLOCK_BUDGET_S))
+
+    error = excinfo.value
+    assert len(record) == 2 < len(tiles), "the clock must stop dispatching where it was crossed"
+    assert (error.units_done, error.unit_count) == (2, len(tiles))
+    assert error.stopped_by == "clock"
+    assert f"{CLOCK_BUDGET_S}-second wall-clock budget" in str(error)
+    assert os.path.exists(os.path.join(error.checkpoint_path, CHECKPOINT_STATE_FILENAME))
+
+
+def test_a_wall_clock_budget_without_a_checkpoint_is_refused_before_any_request(
+    monkeypatch, tmp_path, straddling_city, fake_crawl_clock
+):
+    bbox, _tiles = _many_tiles_bbox(*straddling_city)
+    record = []
+    _stub_slowly(monkeypatch, fake_crawl_clock, record)
+    with pytest.raises(ValueError, match="deadline_monotonic needs a checkpoint_path"):
+        _fetch_clocked(tmp_path, bbox, deadline=fake_crawl_clock.now + 1, checkpoint=False)
+    assert record == []
+
+
+@pytest.mark.parametrize(
+    ("max_requests", "expected", "stopped_by", "phrase"),
+    [
+        (1, 1, "requests", "1-request cap"),
+        (5, 2, "clock", f"{CLOCK_BUDGET_S}-second wall-clock budget"),
+    ],
+)
+def test_the_cap_and_the_clock_compose_and_the_error_names_the_one_that_fired(
+    monkeypatch,
+    tmp_path,
+    straddling_city,
+    fake_crawl_clock,
+    max_requests,
+    expected,
+    stopped_by,
+    phrase,
+):
+    from streetscape_metadata_tracker.download_common import crawl_deadline_from_budget
+
+    bbox, _tiles = _many_tiles_bbox(*straddling_city)
+    record = []
+    _stub_slowly(monkeypatch, fake_crawl_clock, record)
+    with pytest.raises(SweepIncompleteError) as excinfo:
+        _fetch_clocked(
+            tmp_path,
+            bbox,
+            max_requests=max_requests,
+            deadline=crawl_deadline_from_budget(CLOCK_BUDGET_S),
+        )
+    assert len(record) == expected
+    assert excinfo.value.stopped_by == stopped_by
+    assert phrase in str(excinfo.value)
+
+
+def test_a_clock_that_runs_out_before_the_first_commit_is_a_failure_not_a_pause(
+    monkeypatch, tmp_path, straddling_city, fake_crawl_clock
+):
+    bbox, _tiles = _many_tiles_bbox(*straddling_city)
+    record = []
+    _stub_slowly(monkeypatch, fake_crawl_clock, record)
+    with pytest.raises(DownloadError) as excinfo:
+        _fetch_clocked(tmp_path, bbox, deadline=fake_crawl_clock.now - 1)
+    assert not isinstance(excinfo.value, SweepIncompleteError)
+    assert "nothing can be resumed" in str(excinfo.value).lower()
+    assert record == []

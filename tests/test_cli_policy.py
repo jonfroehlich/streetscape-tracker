@@ -24,6 +24,7 @@ from streetscape_metadata_tracker.download_common import (
     HOST_BUSY_EXIT_CODES,
     HOST_EXIT_CODES,
     HOST_MAPILLARY_TILES,
+    PROCESS_STARTED_MONOTONIC,
     SWEEP_INCOMPLETE_EXIT_CODE,
     DownloadError,
     HostBlockedError,
@@ -1500,3 +1501,40 @@ def test_a_reused_census_says_so_in_the_summary(monkeypatch, catalog, capsys):
     out = capsys.readouterr().out
     assert "Census REUSED" in out
     assert "fetched by mapillary" in out
+
+
+@pytest.mark.parametrize("provider", ["kartaview", "mapillary", "panoramax"])
+def test_the_wall_clock_budget_reaches_its_own_downloader_as_a_deadline(
+    monkeypatch, catalog, provider
+):
+    """
+    ``--{provider}-max-seconds N`` must arrive as ``deadline_monotonic`` =
+    PROCESS_STARTED_MONOTONIC + N, on THAT provider only (issue #344).
+
+    Three cases per provider, because each pins a different wrong wiring: the
+    flag reaching the downloader at all (not just parsing), measured from process
+    start rather than from "now", and a SIBLING provider's flag not being read
+    in its place -- the copy-paste shape three near-identical dispatch arms
+    invite. Absent, it is None: a manual run has no clock stop.
+    """
+    conn, city_id, data_dir = catalog
+    gsv_configs(monkeypatch)
+    attr = EXPECTED_DOWNLOADER[provider]
+    sibling = next(p for p in ("kartaview", "mapillary", "panoramax") if p != provider)
+
+    def run(*extra, run_date):
+        calls = []
+        monkeypatch.setattr(cli, attr, stub_downloader(calls))
+        # --force and a fresh date per call: the second run of one city inside
+        # 80 days is otherwise a skip, which reaches no downloader at all.
+        exit_code = run_cli(
+            monkeypatch, city_id, data_dir, "--force", *extra, provider=provider, run_date=run_date
+        )
+        assert exit_code == 0
+        return calls[0]["deadline_monotonic"]
+
+    assert run(f"--{provider}-max-seconds", "30", run_date=date(2026, 7, 1)) == (
+        PROCESS_STARTED_MONOTONIC + 30
+    )
+    assert run(run_date=date(2026, 7, 2)) is None
+    assert run(f"--{sibling}-max-seconds", "30", run_date=date(2026, 7, 3)) is None

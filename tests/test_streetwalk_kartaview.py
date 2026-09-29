@@ -130,6 +130,7 @@ def _setup(
         calls["checkpoint_variant"] = kwargs.get("checkpoint_variant")
         calls["max_requests_per_minute"] = kwargs.get("max_requests_per_minute")
         calls["max_requests"] = kwargs.get("max_requests")
+        calls["deadline_monotonic"] = kwargs.get("deadline_monotonic")
         if raises is not None:
             raise raises
         policy = kwargs.get("census_cache")
@@ -587,3 +588,29 @@ def test_cost_is_independent_of_spacing(tmp_path, monkeypatch):
     assert db.get_api_usage(conn, date.fromisoformat(RUN_DATE), provider="kartaview_streets") == 18
     conn.close()
     assert calls["n"] == coarse + 1
+
+
+def test_the_wall_clock_budget_reaches_the_crawl_as_a_deadline_from_process_start(
+    tmp_path, monkeypatch
+):
+    """
+    ``--kartaview-max-seconds N`` must reach the walk's crawl as
+    ``deadline_monotonic = PROCESS_STARTED_MONOTONIC + N`` (issue #344).
+
+    Pinned at the crawl rather than the parser, with a sibling provider's flag
+    as the third case: three near-identical dispatch arms are exactly where one
+    reads another's flag. Unset is None -- a manual walk has no clock stop.
+    """
+    from streetscape_metadata_tracker.download_common import PROCESS_STARTED_MONOTONIC
+
+    data_dir, calls = _setup(tmp_path, monkeypatch, [_image("kv1", 44.05, -121.30)])
+    assert collect.run_collect(_args(data_dir, **{"kartaview-max-seconds": 30})) == 0
+    assert calls["deadline_monotonic"] == PROCESS_STARTED_MONOTONIC + 30
+
+    data_dir2, calls2 = _setup(tmp_path / "b", monkeypatch, [_image("kv1", 44.05, -121.30)])
+    assert collect.run_collect(_args(data_dir2)) == 0
+    assert calls2["deadline_monotonic"] is None
+
+    data_dir3, calls3 = _setup(tmp_path / "c", monkeypatch, [_image("kv1", 44.05, -121.30)])
+    assert collect.run_collect(_args(data_dir3, **{"panoramax-max-seconds": 30})) == 0
+    assert calls3["deadline_monotonic"] is None

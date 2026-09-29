@@ -1861,3 +1861,159 @@ def test_a_cap_that_commits_no_tile_is_a_failure_not_a_pause(monkeypatch, tmp_pa
     assert not os.path.exists(os.path.join(checkpoint, CHECKPOINT_STATE_FILENAME))
     # And the spend still reaches the caller, because the requests happened.
     assert excinfo.value.api_requests >= 1
+
+
+# ── The wall-clock stop (issue #344) ───────────────────────────────────────
+#
+# The request cap's twin on the clock: a crawl SLOWER than the scheduler's
+# assumed achieved-rate fraction must pause itself (exit 83) before the parent's
+# SIGKILL, rather than be killed with no exit code, no ledger write and a
+# consecutive_failure. Each test makes the crawl slow with `fake_crawl_clock`,
+# advanced by the fake fetch, so the deadline is crossed at a known tile.
+
+# A deadline this many seconds after process start, and a fetch that costs this
+# many: tiles 1 and 2 are admitted (t=0, t=60), tile 3 (t=120) is turned away.
+CLOCK_BUDGET_S = 100
+CLOCK_TILE_COST_S = 60
+
+
+def _many_tiles_bbox():
+    """The 4 km bbox the in-flight-overshoot test uses: many tiles, so a stop
+    part-way is distinguishable from both "nothing" and "everything"."""
+    bbox = dm.grid_bbox(SEATTLE[0], SEATTLE[1], 4000, 4000, 20)
+    tiles = dm.tiles_for_bbox(*bbox)
+    assert len(tiles) > 8, "needs enough tiles for a part-way stop to be visible"
+    return bbox, tiles
+
+
+def _serve_slowly(monkeypatch, fake_crawl_clock, **kwargs):
+    """`_serve`, with every request advancing the crawl clock."""
+    served = []
+
+    class _Clocked(list):
+        def append(self, item):
+            fake_crawl_clock.advance(CLOCK_TILE_COST_S)
+            served.append(item)
+
+    _serve(monkeypatch, {}, served=_Clocked(), **kwargs)
+    return served
+
+
+def _fetch_clocked(tmp_path, bbox, *, max_requests=None, deadline=None, checkpoint=True):
+    return asyncio.run(
+        dm.fetch_city_images_async(
+            "Test City",
+            bbox,
+            "MLY|test|token",
+            connection_limit=1,
+            max_requests=max_requests,
+            deadline_monotonic=deadline,
+            checkpoint_path=str(tmp_path / "cp") if checkpoint else None,
+            checkpoint_channel="mapillary",
+        )
+    )
+
+
+def test_a_census_past_its_wall_clock_budget_pauses_rather_than_being_killed(
+    monkeypatch, tmp_path, fake_crawl_clock
+):
+    """The headline: a slow crawl stops ITSELF, checkpointed, with exit 83's error."""
+    from streetscape_metadata_tracker.download_common import crawl_deadline_from_budget
+
+    bbox, tiles = _many_tiles_bbox()
+    served = _serve_slowly(monkeypatch, fake_crawl_clock)
+
+    with pytest.raises(SweepIncompleteError) as excinfo:
+        _fetch_clocked(tmp_path, bbox, deadline=crawl_deadline_from_budget(CLOCK_BUDGET_S))
+
+    error = excinfo.value
+    assert len(served) == 2, "the clock must stop dispatching at the tile it was crossed"
+    assert len(served) < len(tiles)
+    assert error.units_done == 2
+    assert error.stopped_by == "clock"
+    assert f"{CLOCK_BUDGET_S}-second wall-clock budget" in str(error)
+    assert "stopped by its wall-clock budget" == error.stop_phrase
+    # The pause bought something: the paid tiles are on disk for tomorrow.
+    assert len(_state(error.checkpoint_path)["done_tiles"]) == 2
+    assert error.api_requests == 2
+
+
+def test_a_wall_clock_budget_without_a_checkpoint_is_refused_before_any_request(
+    monkeypatch, tmp_path, fake_crawl_clock
+):
+    """Same contract as the cap: stopped part-way with nowhere to commit, a crawl
+    discards everything it paid for."""
+    bbox, _tiles = _many_tiles_bbox()
+    served = _serve_slowly(monkeypatch, fake_crawl_clock)
+
+    with pytest.raises(ValueError, match="deadline_monotonic needs a checkpoint_path"):
+        _fetch_clocked(tmp_path, bbox, deadline=fake_crawl_clock.now + 1, checkpoint=False)
+    assert served == []
+
+
+@pytest.mark.parametrize(
+    ("max_requests", "budget_s", "expected_served", "stopped_by", "phrase"),
+    [
+        # The cap binds first: 1 request, while the clock would allow 2.
+        (1, CLOCK_BUDGET_S, 1, "requests", "1-request cap"),
+        # The clock binds first: 2 requests, while the cap would allow 5.
+        (5, CLOCK_BUDGET_S, 2, "clock", f"{CLOCK_BUDGET_S}-second wall-clock budget"),
+    ],
+)
+def test_the_cap_and_the_clock_compose_and_the_error_names_the_one_that_fired(
+    monkeypatch,
+    tmp_path,
+    fake_crawl_clock,
+    max_requests,
+    budget_s,
+    expected_served,
+    stopped_by,
+    phrase,
+):
+    from streetscape_metadata_tracker.download_common import crawl_deadline_from_budget
+
+    bbox, _tiles = _many_tiles_bbox()
+    served = _serve_slowly(monkeypatch, fake_crawl_clock)
+
+    with pytest.raises(SweepIncompleteError) as excinfo:
+        _fetch_clocked(
+            tmp_path,
+            bbox,
+            max_requests=max_requests,
+            deadline=crawl_deadline_from_budget(budget_s),
+        )
+    assert len(served) == expected_served
+    assert excinfo.value.stopped_by == stopped_by
+    assert phrase in str(excinfo.value)
+
+
+def test_a_clock_that_runs_out_before_the_first_commit_is_a_failure_not_a_pause(
+    monkeypatch, tmp_path, fake_crawl_clock
+):
+    """The three-way rule, reached by the clock: nothing committed, nothing to resume.
+
+    A deadline already behind the clock turns the first tile away, so the store
+    is live, healthy and EMPTY -- exit 83 would say "re-run to continue" over an
+    empty directory, forever, amnestied.
+    """
+    bbox, _tiles = _many_tiles_bbox()
+    served = _serve_slowly(monkeypatch, fake_crawl_clock)
+
+    with pytest.raises(dm.DownloadError) as excinfo:
+        _fetch_clocked(tmp_path, bbox, deadline=fake_crawl_clock.now - 1)
+    assert not isinstance(excinfo.value, SweepIncompleteError)
+    assert "nothing can be resumed" in str(excinfo.value).lower()
+    assert "wall-clock budget" in str(excinfo.value)
+    assert served == []
+
+
+def test_no_deadline_is_no_clock_stop(monkeypatch, tmp_path, fake_crawl_clock):
+    """Every manual run passes None, and a clock that has run far past any
+    budget must then change nothing."""
+    bbox, tiles = _many_tiles_bbox()
+    fake_crawl_clock.advance(10**9)
+    served = _serve_slowly(monkeypatch, fake_crawl_clock)
+
+    result = _fetch_clocked(tmp_path, bbox, deadline=None)
+    assert len(served) == len(tiles)
+    assert result["api_requests"] == len(tiles)

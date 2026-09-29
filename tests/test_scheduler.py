@@ -13903,3 +13903,226 @@ def test_a_rejected_walk_strands_its_city_exactly_like_a_busy_skip(conn, monkeyp
     assert f"{alpha} (gsv_streets)" in body
     # The rejected walk gets the same by-name recovery as a busy one (#362).
     assert _alert_commands(body) == [["run-due", "--provider", "gsv_streets", "--city", alpha]]
+
+
+# ── The child's wall-clock stop (issue #344) ───────────────────────────────
+#
+# A resumable child is handed `--*-max-seconds timeout_s - _CRAWL_CLOCK_MARGIN_S`
+# beside its request cap, so a crawl slower than the assumed achieved-rate
+# fraction pauses itself (exit 83: checkpointed, ledgered, amnestied) before the
+# parent's SIGKILL. Every test here asserts STRICT inequalities against the
+# timeout, because the failure being guarded -- a margin of 0 or less -- makes
+# the child's deadline land on or after the kill, and presence alone cannot see
+# that.
+
+_CLOCK_FLAGS = {
+    "kartaview": "--kartaview-max-seconds",
+    "kartaview_streets": "--kartaview-max-seconds",
+    "mapillary": "--mapillary-max-seconds",
+    "mapillary_streets": "--mapillary-max-seconds",
+    "panoramax": "--panoramax-max-seconds",
+    "panoramax_streets": "--panoramax-max-seconds",
+}
+
+
+def _every_channel_cfg():
+    """All eight scheduled channels enabled, budgets too big to interfere."""
+    providers = {
+        channel: ProviderConfig(enabled=True, daily_request_budget=10_000_000)
+        for channel in ("gsv", "gsv_streets", *_CLOCK_FLAGS)
+    }
+    return SchedulerConfig(providers=providers, publish_enabled=False)
+
+
+def test_the_six_clock_flags_are_exactly_the_resumable_channels():
+    """Set equality, so a channel flipped resumable cannot land without a flag."""
+    from streetscape_metadata_tracker.scheduler import CHANNEL_RESUMABLE
+
+    assert set(_CLOCK_FLAGS) == {c for c, v in CHANNEL_RESUMABLE.items() if v}
+
+
+def test_every_resumable_launch_gets_a_clock_stop_strictly_inside_its_timeout(conn, monkeypatch):
+    """
+    Through the real launch loop, so the plan -> `_run_one_city` hand-off is
+    what is pinned, not only the plan: a `max_seconds` computed and then not
+    passed down reaches no child.
+
+    One night, all eight channels, one city: each resumable launch must carry
+    ``0 < max_seconds < timeout_s`` and exactly ``timeout_s - margin``; each GSV
+    launch must carry None, since a partial grid is not a run and the flag would
+    only produce artifacts nobody can publish.
+    """
+    from streetscape_metadata_tracker.scheduler import _CRAWL_CLOCK_MARGIN_S
+
+    cid = _register(conn, "Metro", width=5_000, height=5_000, step=20)
+    for channel in ("kartaview", "kartaview_streets", "panoramax", "panoramax_streets"):
+        db.set_channel_membership(conn, cid, channel, True, cycle_days=90)
+
+    calls = []
+    _run_loop_capturing_kwargs(monkeypatch, conn, _every_channel_cfg(), calls)
+
+    launched = {provider: kwargs for _cid, provider, kwargs in calls}
+    assert set(launched) == {"gsv", "gsv_streets", *_CLOCK_FLAGS}, "every channel must launch"
+    for channel in _CLOCK_FLAGS:
+        max_seconds, timeout_s = launched[channel]["max_seconds"], launched[channel]["timeout_s"]
+        assert max_seconds is not None, f"{channel} launched with no clock stop"
+        assert 0 < max_seconds < timeout_s, (
+            f"{channel}: a deadline at or past the SIGKILL leaves the kill as the live arm"
+        )
+        assert max_seconds == timeout_s - _CRAWL_CLOCK_MARGIN_S
+    for channel in ("gsv", "gsv_streets"):
+        assert launched[channel].get("max_seconds") is None
+
+
+def test_the_clock_margin_is_the_tail_slack_and_positive():
+    """Pinned against the constant it is documented as, and against zero: the
+    strict inequality above reads the margin, so this is what refuses a margin
+    that was "tuned" to nothing."""
+    from streetscape_metadata_tracker.scheduler import (
+        _CRAWL_CLOCK_MARGIN_S,
+        _TIMEOUT_FIXED_SLACK_S,
+    )
+
+    assert _CRAWL_CLOCK_MARGIN_S == _TIMEOUT_FIXED_SLACK_S == 600
+
+
+@pytest.mark.parametrize("channel", ["kartaview", "mapillary", "panoramax"])
+def test_every_grid_launch_site_emits_its_own_clock_flag(conn, monkeypatch, tmp_path, channel):
+    """The three grid arms of `_run_one_city`, with a value that is not a
+    default, and never a sibling provider's flag."""
+    cfg = SchedulerConfig(providers={channel: ProviderConfig()})
+    cmd, _ = _grid_cmd(monkeypatch, tmp_path, conn, channel, cfg, max_seconds=1234)
+    flag = _CLOCK_FLAGS[channel]
+    assert cmd[cmd.index(flag) + 1] == "1234"
+    assert [a for a in cmd if a.endswith("-max-seconds")] == [flag]
+    assert cmd.index(flag) < cmd.index("--"), "a flag after '--' is read as the city name"
+
+    plain, _ = _grid_cmd(monkeypatch, tmp_path / "b", conn, channel, cfg)
+    assert not [a for a in plain if a.endswith("-max-seconds")], "unset must mean no clock stop"
+
+
+@pytest.mark.parametrize("channel", ["kartaview_streets", "mapillary_streets", "panoramax_streets"])
+def test_every_street_launch_site_emits_its_own_clock_flag(conn, channel):
+    """The three street arms of `_street_collect_cmd`, same three assertions."""
+    from streetscape_metadata_tracker.scheduler import _street_collect_cmd
+
+    cid = _register(conn, "Bend", width=1000, height=1000, step=20)
+    city = db.resolve_city(conn, cid)
+    cfg = _every_channel_cfg()
+    cmd = _street_collect_cmd(cfg, city, date(2026, 7, 1), channel, 8, 9_000, max_seconds=1234)
+    flag = _CLOCK_FLAGS[channel]
+    assert cmd[cmd.index(flag) + 1] == "1234"
+    assert [a for a in cmd if a.endswith("-max-seconds")] == [flag]
+    assert cmd.index(flag) < cmd.index("--")
+
+    plain = _street_collect_cmd(cfg, city, date(2026, 7, 1), channel, 8, 9_000)
+    assert not [a for a in plain if a.endswith("-max-seconds")]
+
+
+def test_a_gsv_child_never_gets_a_clock_flag_even_when_handed_one(conn, monkeypatch, tmp_path):
+    """Non-resumable channels ignore `max_seconds` at the builder too, not only
+    because the loop passes None: a GSV child has no checkpoint to pause into."""
+    from streetscape_metadata_tracker.scheduler import _street_collect_cmd
+
+    grid, city = _grid_cmd(monkeypatch, tmp_path, conn, "gsv", SchedulerConfig(), max_seconds=500)
+    street = _street_collect_cmd(
+        _every_channel_cfg(), city, date(2026, 7, 1), "gsv_streets", 8, 9_000, max_seconds=500
+    )
+    for cmd in (grid, street):
+        assert not [a for a in cmd if a.endswith("-max-seconds")]
+
+
+@pytest.mark.parametrize("timeout_s", [1, 599, 600])
+def test_a_timeout_at_or_under_the_margin_forwards_no_flag_rather_than_a_nonpositive_one(
+    conn, timeout_s
+):
+    """The child's positive_int refuses 0 and below with argparse exit 2 -- the
+    trap `_request_cap_args` records -- so the plan must say None, and the
+    builder must drop anything under 1 even if handed one."""
+    from streetscape_metadata_tracker.scheduler import (
+        _crawl_clock_args,
+        _crawl_max_seconds,
+        _street_collect_cmd,
+    )
+
+    assert _crawl_max_seconds(timeout_s) is None
+    assert _crawl_max_seconds(601) == 1, "the boundary: one second is a real budget"
+    for value in (0, -1, None):
+        assert _crawl_clock_args("--mapillary-max-seconds", value) == []
+    assert _crawl_clock_args("--mapillary-max-seconds", 1) == ["--mapillary-max-seconds", "1"]
+
+    cid = _register(conn, "Bend", width=1000, height=1000, step=20)
+    city = db.resolve_city(conn, cid)
+    cmd = _street_collect_cmd(
+        _every_channel_cfg(), city, date(2026, 7, 1), "mapillary_streets", 8, 9_000, max_seconds=0
+    )
+    assert "--mapillary-max-seconds" not in cmd
+
+
+def test_the_launch_plan_carries_the_clock_stop_it_derived_from_its_own_timeout(conn):
+    """`_sweep_launch_plan` is shared with the dry run; the two must agree."""
+    from streetscape_metadata_tracker.scheduler import _CRAWL_CLOCK_MARGIN_S, _sweep_launch_plan
+
+    cid = _register(conn, "Metro", width=5_000, height=5_000, step=20)
+    city = db.resolve_city(conn, cid)
+    plan = _sweep_launch_plan(
+        _every_channel_cfg(),
+        city,
+        "mapillary",
+        conn,
+        est=100,
+        remaining=10_000,
+        remaining_s=None,
+        city_channels=["mapillary"],
+    )
+    assert plan.skip is None
+    assert 0 < plan.max_seconds < plan.timeout_s
+    assert plan.max_seconds == plan.timeout_s - _CRAWL_CLOCK_MARGIN_S
+
+
+@pytest.mark.parametrize(
+    ("pause_line", "expected"),
+    [
+        (
+            "mapillary crawl paused at 2/9 tiles (stopped by its wall-clock budget); re-run",
+            "stopped by its wall-clock budget",
+        ),
+        (
+            "mapillary crawl paused at 2/9 tiles (stopped by its request cap); re-run",
+            "stopped by its request cap",
+        ),
+    ],
+)
+def test_a_paused_childs_reason_names_the_ceiling_that_paused_it(
+    conn, monkeypatch, tmp_path, pause_line, expected
+):
+    """The night's log has to say whether the budget or the clock paused a crawl,
+    and the exception never crosses the process boundary -- so the scheduler
+    reads the child's own pause line, and the LAST one, since child logs are
+    appended across attempts."""
+    from streetscape_metadata_tracker import scheduler as sched
+    from streetscape_metadata_tracker.download_common import (
+        SWEEP_INCOMPLETE_EXIT_CODE,
+        SWEEP_STOP_PHRASES,
+    )
+
+    other = next(p for p in SWEEP_STOP_PHRASES.values() if p != expected)
+    cid = _register(conn, "Bend", width=1000, height=1000, step=20)
+    city = db.resolve_city(conn, cid)
+
+    def fake_run(cmd, timeout=None, cwd=None, stdout=None, **kwargs):
+        # An earlier attempt's pause first: the reason must name the latest.
+        stdout.write(f"mapillary crawl paused at 1/9 tiles ({other}); re-run\n")
+        stdout.write(pause_line + "\n")
+
+        class R:
+            returncode = SWEEP_INCOMPLETE_EXIT_CODE
+
+        return R()
+
+    monkeypatch.setattr(sched.subprocess, "run", fake_run)
+    cfg = SchedulerConfig(log_dir=str(tmp_path))
+    outcome = sched._run_collection_subprocess(cfg, ["x"], 60, city, "mapillary", date(2026, 7, 1))
+    assert outcome.exit_code == SWEEP_INCOMPLETE_EXIT_CODE
+    assert expected in outcome.reason
+    assert other not in outcome.reason

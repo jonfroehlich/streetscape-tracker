@@ -3204,3 +3204,89 @@ def test_an_unwritable_cache_never_fails_a_sweep(monkeypatch, tmp_path):
     )
     assert calls, "the sweep succeeded"
     assert result["checkpoint_path"] == str(ckpt), "and its checkpoint is still the caller's"
+
+
+# ── The wall-clock stop (issue #344) ───────────────────────────────────────
+#
+# The request cap's twin on the clock. A sweep slower than the scheduler's
+# assumed achieved-rate fraction -- a slow host, a 400-backpressure stretch --
+# must pause itself (exit 83) before the parent's SIGKILL. The responder
+# advances `fake_crawl_clock`, so the deadline is crossed at a known root.
+
+CLOCK_BUDGET_S = 100
+CLOCK_REQUEST_COST_S = 60  # roots 1 and 2 are asked (t=0, 60); root 3 (t=120) is not
+
+
+def _slow_photos(fake_crawl_clock):
+    def responder(call):
+        fake_crawl_clock.advance(CLOCK_REQUEST_COST_S)
+        return _photos(call)
+
+    return responder
+
+
+def test_a_sweep_past_its_wall_clock_budget_pauses_rather_than_being_killed(
+    monkeypatch, tmp_path, fake_crawl_clock
+):
+    from streetscape_metadata_tracker.download_common import crawl_deadline_from_budget
+
+    ckpt = tmp_path / "sweep"
+    error, calls = _failed_sweep_ckpt(
+        monkeypatch,
+        _slow_photos(fake_crawl_clock),
+        ckpt,
+        radius_m=500,
+        deadline_monotonic=crawl_deadline_from_budget(CLOCK_BUDGET_S),
+    )
+    assert isinstance(error, kv.SweepIncompleteError)
+    assert len(calls) == 2, "the clock must stop the sweep at the boundary it was crossed"
+    assert (error.units_done, error.unit_count) == (2, 9)
+    assert error.stopped_by == "clock"
+    assert f"{CLOCK_BUDGET_S}-second wall-clock budget ran out" in str(error)
+    # The pause kept what it paid for, which is what separates it from a kill.
+    assert _state(ckpt)["roots_done"] == 2
+
+
+def test_a_sweep_clock_without_a_checkpoint_is_refused_before_any_request(
+    monkeypatch, fake_crawl_clock
+):
+    """Unlike max_requests, which keeps its uncheckpointed runaway-guard meaning."""
+    calls = _install(monkeypatch, _slow_photos(fake_crawl_clock))
+    with pytest.raises(ValueError, match="deadline_monotonic needs a checkpoint_path"):
+        asyncio.run(
+            kv.fetch_city_images_async(
+                "Testville",
+                BBOX,
+                "tok",
+                max_requests_per_minute=0,
+                radius_m=500,
+                deadline_monotonic=fake_crawl_clock.now + 1,
+            )
+        )
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("max_requests", "expected", "stopped_by", "phrase"),
+    [
+        (1, 1, "requests", "the 1-request budget ran out"),
+        (5, 2, "clock", f"the {CLOCK_BUDGET_S}-second wall-clock budget ran out"),
+    ],
+)
+def test_the_sweep_cap_and_clock_compose_and_the_error_names_the_one_that_fired(
+    monkeypatch, tmp_path, fake_crawl_clock, max_requests, expected, stopped_by, phrase
+):
+    from streetscape_metadata_tracker.download_common import crawl_deadline_from_budget
+
+    error, calls = _failed_sweep_ckpt(
+        monkeypatch,
+        _slow_photos(fake_crawl_clock),
+        tmp_path / "sweep",
+        radius_m=500,
+        max_requests=max_requests,
+        deadline_monotonic=crawl_deadline_from_budget(CLOCK_BUDGET_S),
+    )
+    assert isinstance(error, kv.SweepIncompleteError)
+    assert len(calls) == expected
+    assert error.stopped_by == stopped_by
+    assert phrase in str(error)
