@@ -1434,6 +1434,33 @@ function isWithinQueryRadius(row, provider) {
 }
 
 /**
+ * May city.js draw this run-CSV row as a dated pano marker? The row-admission
+ * half of city.js's processRows, extracted so it can be tested (city.js is a
+ * browser script with no export shim): a dated, located OK row whose pano
+ * counts for its grid point under isWithinQueryRadius (issue #367).
+ *
+ * Deliberately per ROW: processRows dedupes by pano id only AFTER this says
+ * yes, so a pano reached from a far grid point and again from a near one is
+ * still drawn once. The capture-date plausibility check stays in processRows,
+ * because it needs the parsed date it goes on to use.
+ *
+ * @param {Object} row - A parsed run-CSV row.
+ * @param {?string} [provider="gsv"] - Provider key (see PROVIDERS).
+ * @returns {boolean}
+ */
+function isAdmissiblePanoRow(row, provider) {
+  return (
+    row.status === "OK" &&
+    Boolean(row.capture_date) &&
+    Boolean(row.pano_id) &&
+    // == null, not falsy: 0.0 is a valid coordinate (equator/meridian)
+    row.pano_lat != null &&
+    row.pano_lon != null &&
+    isWithinQueryRadius(row, provider)
+  );
+}
+
+/**
  * Parse a pano capture date, returning null when the date is absent
  * (age_stats are all null for a 0-pano run). Guards against
  * `new Date(null)` silently rendering as the Unix epoch (12/31/1969)
@@ -1760,6 +1787,7 @@ if (typeof module !== "undefined" && module.exports) {
     EARTH_RADIUS_M,
     haversineMeters,
     isWithinQueryRadius,
+    isAdmissiblePanoRow,
     panoDateOrNull,
     googleSharePercent,
     buildFilledHistogram,

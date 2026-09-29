@@ -121,7 +121,7 @@ let temporalDataGlobal = [];
 let temporalKeyboardIdx = -1;
 
 // panoDateOrNull(), isGoogleCopyright(), isPlausibleCaptureDate() and
-// isWithinQueryRadius() are shared helpers from streetscape-utils.js (loaded
+// isAdmissiblePanoRow() are shared helpers from streetscape-utils.js (loaded
 // first), reused here for the info-panel dates, the © Google filter, the #213
 // impossible-date guard and the #367 query-radius guard.
 let runsGlobal = [];        // this city's run history from the aggregate
@@ -1690,25 +1690,14 @@ async function loadData() {
           if (showFlatOnly) flatMarker.addTo(map);
           continue;
         }
-        if (
-          row.status !== "OK" ||
-          !row.capture_date ||
-          !row.pano_id ||
-          // == null, not falsy: 0.0 is a valid coordinate (equator/meridian)
-          row.pano_lat == null ||
-          row.pano_lon == null ||
-          processedPanos.has(row.pano_id)
-        ) continue;
-
-        // A GSV pano beyond the query radius is no pano for this point (issue
-        // #367; source of truth analysis.GSV_QUERY_RADIUS_M, applied to the
-        // published stats by fileutils.load_city_csv_file). The CSV keeps the
-        // row as the provider sent it, so it is skipped here too, or the map
-        // and temporal plot would draw panos the coverage number excludes.
-        // Checked BEFORE processedPanos records the id: the distance is per
-        // ROW, so the same pano reached from a nearer grid point still counts
-        // (the Python seam reclassifies rows, not pano ids).
-        if (!isWithinQueryRadius(row, providerGlobal)) continue;
+        // Row admission (status, date, id, position, and the #367 GSV query
+        // radius -- source of truth analysis.GSV_QUERY_RADIUS_M) lives in
+        // isAdmissiblePanoRow, where it is testable. The CSV keeps a far pano
+        // as the provider sent it, so it is refused here too, or the map and
+        // temporal plot would draw panos the coverage number excludes. It is
+        // asked BEFORE processedPanos records the id: the distance is per ROW,
+        // so the same pano reached from a nearer grid point still counts.
+        if (!isAdmissiblePanoRow(row, providerGlobal) || processedPanos.has(row.pano_id)) continue;
 
         processedPanos.add(row.pano_id);
 

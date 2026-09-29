@@ -63,7 +63,7 @@ const sharedGlobals = {
   adaptCitiesPayload: "readonly",
   isGoogleCopyright: "readonly",
   isPlausibleCaptureDate: "readonly",
-  isWithinQueryRadius: "readonly",
+  isAdmissiblePanoRow: "readonly",
   panoDateOrNull: "readonly",
   googleSharePercent: "readonly",
   buildFilledHistogram: "readonly",
