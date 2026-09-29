@@ -14019,6 +14019,37 @@ def test_every_street_launch_site_emits_its_own_clock_flag(conn, channel):
     assert not [a for a in plain if a.endswith("-max-seconds")]
 
 
+@pytest.mark.parametrize("channel", sorted(_sched.CHANNEL_RESUMABLE))
+def test_run_one_city_forwards_max_seconds_on_every_resumable_arm(
+    conn, monkeypatch, tmp_path, channel
+):
+    """
+    Pinned at the layer that CONSUMES the value (#344 review): the loop test
+    stubs `_run_one_city` and the builder tests call `_street_collect_cmd`
+    directly, so `_run_one_city` dropping `max_seconds` on its street arm left
+    the suite green. Every scheduled channel, set-derived, through the real
+    `_run_one_city` with only `subprocess.run` faked: a resumable one must carry
+    its own flag with the caller's value, a non-resumable one must carry none.
+    """
+    cmd, _ = _grid_cmd(
+        monkeypatch,
+        tmp_path,
+        conn,
+        channel,
+        _every_channel_cfg(),
+        timeout_s=7_200,
+        estimated_requests=0,
+        max_seconds=1234,
+    )
+    clock_flags = [a for a in cmd if a.endswith("-max-seconds")]
+    if _sched.CHANNEL_RESUMABLE[channel]:
+        flag = _CLOCK_FLAGS[channel]
+        assert clock_flags == [flag]
+        assert cmd[cmd.index(flag) + 1] == "1234"
+    else:
+        assert clock_flags == [], f"{channel} is not resumable and has nothing to pause into"
+
+
 def test_a_gsv_child_never_gets_a_clock_flag_even_when_handed_one(conn, monkeypatch, tmp_path):
     """Non-resumable channels ignore `max_seconds` at the builder too, not only
     because the loop passes None: a GSV child has no checkpoint to pause into."""

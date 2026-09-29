@@ -10,6 +10,7 @@ and ledger recording for failed downloads. No network.
 """
 
 import asyncio
+import logging
 import os
 import sys
 from datetime import date
@@ -890,6 +891,42 @@ def test_a_paused_sweep_prints_paused_not_failed(monkeypatch, catalog, capsys):
     assert "FAILED" not in out
 
 
+@pytest.mark.parametrize("stopped_by", ["clock", "requests"])
+def test_the_grid_pause_line_names_the_ceiling_the_scheduler_reads_back(
+    monkeypatch, catalog, caplog, stopped_by
+):
+    """
+    Issue #344 review: the scheduler says WHICH ceiling paused a child by
+    reading the child's own pause line (`_pause_stop_phrase`), so that line is
+    a cross-process contract -- and the scheduler-side test feeds a hand-written
+    one. This pins the REAL line cli.py logs, for both kinds.
+    """
+    from streetscape_metadata_tracker.download_common import SWEEP_STOP_PHRASES
+    from streetscape_metadata_tracker.scheduler import _pause_stop_phrase
+
+    conn, city_id, data_dir = catalog
+    mapillary_configs(monkeypatch)
+    error = SweepIncompleteError(
+        "stopped",
+        checkpoint_path="/cp",
+        units_done=2,
+        unit_count=16,
+        unit_name="tiles",
+        stopped_by=stopped_by,
+    )
+
+    async def stub(**kwargs):
+        raise error
+
+    monkeypatch.setattr(cli, "download_mapillary_metadata_async", stub)
+    with caplog.at_level(logging.INFO):
+        assert (
+            run_cli(monkeypatch, city_id, data_dir, provider="mapillary")
+            == SWEEP_INCOMPLETE_EXIT_CODE
+        )
+    assert _pause_stop_phrase(caplog.text) == SWEEP_STOP_PHRASES[stopped_by]
+
+
 def test_the_checkpoint_is_discarded_only_after_the_runs_row_commits(monkeypatch, catalog):
     """
     The discard moved out of the downloader (PR #251 review): the CSV landing
@@ -1538,3 +1575,44 @@ def test_the_wall_clock_budget_reaches_its_own_downloader_as_a_deadline(
     )
     assert run(run_date=date(2026, 7, 2)) is None
     assert run(f"--{sibling}-max-seconds", "30", run_date=date(2026, 7, 3)) is None
+
+
+@pytest.mark.parametrize("provider", ["kartaview", "mapillary", "panoramax"])
+def test_each_downloader_hands_its_deadline_to_the_crawl_it_wraps(tmp_path, monkeypatch, provider):
+    """
+    The hop BETWEEN the two tested layers (#344 review): the CLI test above
+    stubs ``download_{provider}_metadata_async`` itself and the collector tests
+    enter at ``fetch_city_images_async``, so deleting the one
+    ``deadline_monotonic=`` line in the downloader left the suite green. Pinned
+    here at the layer that consumes it, with a value no default could produce.
+    """
+    import importlib
+
+    module = importlib.import_module(f"streetscape_metadata_tracker.download_{provider}")
+    seen = {}
+
+    class Reached(Exception):
+        pass
+
+    async def fake_fetch(*args, **kwargs):
+        seen.update(kwargs)
+        raise Reached
+
+    monkeypatch.setattr(module, "fetch_city_images_async", fake_fetch)
+    outer = getattr(module, f"download_{provider}_metadata_async")
+    kwargs = {
+        "city_name": "Bend",
+        "center_lat": 44.05,
+        "center_lon": -121.31,
+        "grid_width": 1000,
+        "grid_height": 1000,
+        "step_length": 20,
+        "output_csv_gz_path": str(tmp_path / "out.csv.gz"),
+        "deadline_monotonic": 12_345.5,
+        "checkpoint_path": str(tmp_path / "cp"),
+    }
+    if provider != "panoramax":  # the one credential-free provider
+        kwargs["access_token"] = "tok"
+    with pytest.raises(Reached):
+        asyncio.run(outer(**kwargs))
+    assert seen["deadline_monotonic"] == 12_345.5

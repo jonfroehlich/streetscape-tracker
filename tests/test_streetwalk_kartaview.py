@@ -20,6 +20,7 @@ this arm trustworthy in its own right rather than by analogy to Mapillary:
 """
 
 import gzip
+import logging
 import os
 from datetime import date
 
@@ -442,6 +443,29 @@ def test_a_sweep_that_stops_at_its_cap_exits_83_rather_than_failing(tmp_path, mo
     spent = db.get_api_usage(conn, date.fromisoformat(RUN_DATE), provider="kartaview_streets")
     conn.close()
     assert spent == 500
+
+
+@pytest.mark.parametrize("stopped_by", ["clock", "requests"])
+def test_the_walks_pause_line_names_the_ceiling_the_scheduler_reads_back(
+    tmp_path, monkeypatch, caplog, stopped_by
+):
+    """
+    Issue #344 review: the scheduler says WHICH ceiling paused a child by
+    reading the child's own pause line (`_pause_stop_phrase`), so that line is
+    a cross-process contract -- and the scheduler-side test feeds a hand-written
+    one. This pins the REAL line: the error's `stopped_by` must come out of
+    `collect.py`'s log as exactly the phrase the scheduler parses, for both
+    kinds (a blank argument where the phrase goes would lose it silently).
+    """
+    from streetscape_metadata_tracker.download_common import SWEEP_STOP_PHRASES
+    from streetscape_metadata_tracker.scheduler import _pause_stop_phrase
+
+    error = _paused_sweep(spent=5)
+    error.stopped_by = stopped_by
+    data_dir, _ = _setup(tmp_path, monkeypatch, [_image("kv1", 44.05, -121.30)], raises=error)
+    with caplog.at_level(logging.INFO):
+        assert collect.run_collect(_args(data_dir)) == SWEEP_INCOMPLETE_EXIT_CODE
+    assert _pause_stop_phrase(caplog.text) == SWEEP_STOP_PHRASES[stopped_by]
 
 
 def test_a_capped_walk_is_gated_on_the_cap_rather_than_the_whole_sweeps_geometry(
