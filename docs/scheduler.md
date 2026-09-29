@@ -261,6 +261,15 @@ The resolution happens against the run's *effective* cap, so `--limit` scales th
 At `--limit == max_cities_per_day` the scaling is the identity, so a nightly run is unaffected.
 Cities beyond the reservation are **not dropped** — they keep their union position and wait for a later night, which makes the key the *rate* a widening proceeds at: the enrolled set divided by it is how many nights a full pass takes.
 Because they keep that position, "waiting" is measured against the **city cap**, not against the reservation: an unpromoted city inside `max_cities` still collects tonight, so on `run-due --provider kartaview --limit 40` with 40 due cities all 40 run and none wait.
+**The reservation rotates at two levels: across strandedness kinds, and inside the opt-in-only kind across opt-in CHANNELS (#348).**
+The kinds are excluded from rank 0 (#301), due only on opt-in channels (#248), and transiently not due on rank 0; after the live-checkpoint take below, the reservation round-robins across them so no stranded population can be zeroed by a larger one.
+That rule was not enough one level down.
+Inside the opt-in-only kind the union is still first appearance over `enabled_providers()`, so a city due only on `panoramax` (rank 6) sorts behind **every** city due only on `kartaview` (rank 4), and filled from its head the kind hands every slot to KartaView.
+The KartaView queue also refills faster than it drains: a KartaView city whose `gsv` succeeds tonight is opt-in-only tomorrow.
+Measured on the prod slate for 2026-09-21: Des Moines was position 51 of 51 in that kind (kartaview 50, panoramax 1), and 19 of the 20 newly enrolled Panoramax cities had never collected, with `consecutive_failures` at 0 and no alert.
+So the opt-in-only kind is itself a rotation over sub-queues keyed by each city's **leading** due channel — the earliest in `providers` order it is due on — each keeping union order, so stalest-first still holds within a channel.
+A walk-only straggler (due only on `kartaview_streets`) therefore keys on the walk and gets its own sub-queue, deliberately: it is the population that would otherwise wait behind its own grid channel's.
+With a single opt-in channel stranded the take is exactly the straight union-order take it replaced, and the other two kinds are unchanged.
 
 **Which cities take the reserved slots is a real question only once the hoist is bounded, and the answer is a live checkpoint first.**
 `get_due_cities` orders `last_success_at ASC NULLS FIRST, city_id ASC`, and a city SIGKILLed mid-sweep still has NULL there — it never succeeded — so filling the reservation in union order sorts it **alphabetically** among every never-run enrolled city, which during a widening is the whole enrolled set.
