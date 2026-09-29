@@ -1989,13 +1989,12 @@ def add_api_usage(
     rolling window would defer tonight's work over requests another address
     made.
     """
-    # Imported here, not at module level: download_common pulls in numpy, geopy
-    # and requests, and db itself needs none of them -- only a spend write (and
-    # the v16 backfill) reads the map. This keeps db's own import graph as it
-    # was before #385. It does NOT by itself make the incident-time handles
-    # (backup-status, restore-backup) stack-free: the package __init__ already
-    # imports download_gsv, so importing any submodule loads the full stack,
-    # and did before this change too.
+    # Imported here, not at module level, only to keep db's own module-level
+    # imports what they were before #385 (stdlib, clock, naming) and to keep a
+    # db -> download_common edge out of the import graph, where a future import
+    # the other way would make it a cycle. It buys no independence from numpy:
+    # the package __init__ imports download_gsv, so any submodule import loads
+    # the full stack regardless.
     from .download_common import CHANNEL_METERED_HOST
 
     conn.execute(

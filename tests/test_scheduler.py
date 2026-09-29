@@ -14099,20 +14099,60 @@ def test_the_remainder_is_the_minimum_and_the_skip_names_its_ceiling(
         assert "launching capped" in named[0] and f"{cap:,} left in the rolling-24h" in named[0]
 
 
-def test_a_checkpoint_at_the_age_wall_is_not_failed_on_a_window_that_frees_tonight(
-    conn, tmp_path, monkeypatch, caplog
+@pytest.mark.parametrize(
+    "hosts,spent,spent_hours_ago,deadline_h,launched_cap,wall_text",
+    [
+        # Last night's 2,947, stamped 20 h ago, ages out 4 h into a 12 h batch:
+        # tonight can grant nearly all of 3,000, so the crawl launches capped at
+        # the 53 left right now. Fails if the wall reads the MOMENTARY remainder.
+        pytest.param("3000", 2947, 20, 12, 53, None, id="last-nights-spend-frees"),
+        # THIS night's 2,947, stamped 1 h ago, is still in the window when the
+        # batch ends: 53 is all tonight can ever grant, so the crawl could never
+        # finish, and the wall must refuse it (a recorded failure) rather than
+        # launch a capped slice whose checkpoint is discarded next week with no
+        # failure at all. Fails if the ceiling is the host's FULL budget.
+        pytest.param(
+            "3000",
+            2947,
+            1,
+            12,
+            None,
+            "will not fit tonight's 53 (53 left in the rolling-24h budget of",
+            id="tonights-spend-persists",
+        ),
+        # A 300 budget can never grant the ~360 left, however much frees.
+        pytest.param(
+            "300",
+            100,
+            20,
+            12,
+            None,
+            "will not fit tonight's 300 (300 is the most the rolling-24h budget of",
+            id="budget-under-the-crawl",
+        ),
+        # No batch deadline (an operator run): nothing is assumed to age out, so
+        # the ceiling is the momentary remainder -- the conservative reading.
+        pytest.param("3000", 2947, 20, None, None, "will not fit tonight's 53", id="no-deadline"),
+    ],
+)
+def test_the_age_wall_projects_against_what_tonights_batch_can_grant(
+    conn,
+    tmp_path,
+    monkeypatch,
+    caplog,
+    hosts,
+    spent,
+    spent_hours_ago,
+    deadline_h,
+    launched_cap,
+    wall_text,
 ):
-    """Issue #385 review: the age wall projects against what TONIGHT can grant.
+    """Issue #385 review: the age wall's ceiling is the host budget minus the
+    spend still in the window when the BATCH ENDS (``batch_end - 24h`` onward).
 
-    At 09:00 UTC after a full night the rolling window holds 53 of 3,000, while
-    the channel has 40,000 left today and most of the window comes back before
-    the night ends. A 6.5-day checkpoint with ~360 requests left must not be
-    refused -- that arm RECORDS A FAILURE and tells the operator to raise the
-    daily budget, the wrong lever -- it launches capped at 53 instead. Comparing
-    against the momentary remainder fails this.
-
-    The same checkpoint is refused when the host's FULL budget is under what is
-    left, and the refusal then names the host's knob.
+    The channel has 40,000 left, the checkpoint is 6.5 days old with ~360
+    requests to go, and the arm that RECORDS A FAILURE is the question. When it
+    refuses on the host, it names the host's knob.
     """
     from streetscape_metadata_tracker import clock
     from streetscape_metadata_tracker import scheduler as sched
@@ -14136,32 +14176,108 @@ def test_a_checkpoint_at_the_age_wall_is_not_failed_on_a_window_that_frees_tonig
         "_run_one_city",
         lambda cfg_, city_, today_, provider="gsv", **kw: calls.append(kw) or True,
     )
-    _seed_host(conn, 2947, now - timedelta(hours=1), provider="mapillary")
+    _seed_host(conn, spent, now - timedelta(hours=spent_hours_ago), provider="mapillary")
+    cfg = _host_budget_cfg(tmp_path, hosts=hosts)
 
-    cfg = _host_budget_cfg(tmp_path)
-    attempted, succeeded, _ = _run_channels(sched, cfg, conn, city, ["mapillary"])
-    assert [c["request_cap"] for c in calls] == [53]
-    assert (attempted, succeeded) == (1, 1), "a capped launch, not a recorded failure"
+    with caplog.at_level(logging.WARNING, logger="streetscape_scheduler"):
+        attempted, succeeded, _ = _run_channels(
+            sched,
+            cfg,
+            conn,
+            city,
+            ["mapillary"],
+            batch_deadline=None if deadline_h is None else time.monotonic() + deadline_h * 3600,
+        )
+
     row = conn.execute(
         "SELECT consecutive_failures FROM schedule_state WHERE city_id = ? AND provider = ?",
         (city.city_id, "mapillary"),
     ).fetchone()
-    assert row is None or row["consecutive_failures"] == 0
-
-    # A host budget of 300 can never grant the ~360 left, however much of the
-    # window frees tonight: that IS the age wall. 100 are in the window, so the
-    # momentary remainder (200) and the ceiling (300) differ, and the message
-    # has to quote the ceiling it compared against.
-    calls.clear()
-    conn.execute("DELETE FROM host_usage")
-    _seed_host(conn, 100, now - timedelta(hours=1), provider="mapillary")
-    cfg = _host_budget_cfg(tmp_path, hosts="300")
-    with caplog.at_level(logging.WARNING, logger="streetscape_scheduler"):
-        attempted, succeeded, _ = _run_channels(sched, cfg, conn, city, ["mapillary"])
+    if launched_cap is not None:
+        assert [c["request_cap"] for c in calls] == [launched_cap]
+        assert (attempted, succeeded) == (1, 1), "a capped launch, not a recorded failure"
+        assert row is None or row["consecutive_failures"] == 0
+        return
     assert calls == [] and (attempted, succeeded) == (1, 0)
     refusal = next(r.getMessage() for r in caplog.records if "refusing to resume" in r.getMessage())
+    assert wall_text in refusal
     assert "raise [hosts.mapillary_tiles].rolling_24h_request_budget" in refusal
-    assert "will not fit tonight's 300 (300 is the most the rolling-24h budget of" in refusal
+
+
+@pytest.mark.parametrize(
+    "spent_hours_ago,verdict",
+    [
+        pytest.param(20, "launch capped at 53; resumes [host rolling-24h budget]", id="frees"),
+        pytest.param(1, "REFUSED (checkpoint 6.5 d old, 10/100)", id="persists"),
+    ],
+)
+def test_the_dry_run_age_wall_agrees_with_the_live_one(
+    conn, tmp_path, monkeypatch, capsys, spent_hours_ago, verdict
+):
+    """Issue #385 review: the preview passes the SAME age-wall ceiling the night does.
+
+    Its batch is assumed to start now and run ``max_batch_hours`` (10 h here),
+    so 2,947 stamped 20 h ago ages out before it ends and the preview shows the
+    capped launch the night makes; stamped 1 h ago it does not, and the preview
+    shows the refusal. Handing the plan ``remainder.remaining`` (or no batch
+    end) instead turns the first case into a refusal the night never makes.
+    """
+    from streetscape_metadata_tracker import clock
+    from streetscape_metadata_tracker import scheduler as sched
+
+    now = clock.utc_now()
+    city = _checkpointed_city(
+        conn,
+        tmp_path,
+        monkeypatch,
+        roots_done=10,
+        root_count=100,
+        days_old=6.5,
+        channel="mapillary",
+    )
+    _seed_host(conn, 2947, now - timedelta(hours=spent_hours_ago), provider="mapillary")
+    cfg = _host_budget_cfg(tmp_path)
+    assert cfg.max_batch_hours == 10
+    monkeypatch.setattr(sched, "_channel_estimate", lambda *a, **k: 400)
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+
+    assert (
+        sched.cmd_run_due(cfg, dry_run=True, today=now.date(), requested_providers=["mapillary"])
+        == 0
+    )
+    line = next(line for line in capsys.readouterr().out.splitlines() if city.city_id in line)
+    assert line.split("req  ", 1)[1] == verdict
+
+
+def test_an_age_wall_the_clock_binds_names_the_timeout_not_a_budget(conn, tmp_path, monkeypatch):
+    """Issue #385 review: when tonight's TIMEOUT is the smaller term, no budget is
+    the lever. A deadline 20 minutes out affords 0 tile requests after the
+    fixed slack, far under the 40,000 the channel has left."""
+    from streetscape_metadata_tracker.scheduler import _SWEEP_SKIP_AGE_WALL, _sweep_launch_plan
+
+    city = _checkpointed_city(
+        conn,
+        tmp_path,
+        monkeypatch,
+        roots_done=10,
+        root_count=100,
+        days_old=6.5,
+        channel="mapillary",
+    )
+    cfg = _host_budget_cfg(tmp_path)
+    plan = _sweep_launch_plan(
+        cfg,
+        city,
+        "mapillary",
+        conn,
+        est=400,
+        remaining=40_000,
+        remaining_s=1200,
+        city_channels=["mapillary"],
+    )
+    assert plan.skip == _SWEEP_SKIP_AGE_WALL
+    assert "-minute timeout that binds here (raise [schedule].max_batch_hours" in plan.message
+    assert "daily_request_budget" not in plan.message
 
 
 def test_a_non_resumable_channel_on_a_budgeted_host_is_deferred_by_the_host(

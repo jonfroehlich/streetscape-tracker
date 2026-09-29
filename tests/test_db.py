@@ -1,6 +1,7 @@
 """Catalog tests: registration, aliases, runs, diffs, budget, scheduling."""
 
 import json
+import multiprocessing
 import os
 import sqlite3
 from datetime import UTC, date, datetime, timedelta
@@ -2016,3 +2017,78 @@ def test_prune_host_usage_drops_only_rows_older_than_the_cutoff(conn):
         )
     assert db.prune_host_usage(conn, cutoff) == 1
     assert [r[0] for r in _host_rows(conn)] == [cutoff.isoformat(), _HOST_NOW.isoformat()]
+
+
+def _race_worker(paths, barrier, errors):
+    """One of the processes racing to first-connect each v15 catalog in ``paths``."""
+    import time
+
+    from streetscape_metadata_tracker import clock
+
+    clock._utc_clock = lambda: datetime(2026, 9, 30, 9, 0, tzinfo=UTC)
+
+    # WIDEN the race window, which is otherwise microseconds wide: the
+    # migration reads today's date BETWEEN its empty-table check and its
+    # inserts, so a pause here holds every racer inside the window. Measured
+    # without it, dropping BEGIN IMMEDIATE survived 3 of 3 runs of 8 trials.
+    def slow_today():
+        time.sleep(0.05)
+        return clock.utc_now().date()
+
+    clock.snapshot_date_today = slow_today
+    for path in paths:
+        barrier.wait()
+        try:
+            db.connect(path).close()
+        except Exception as exc:  # reported, so the parent can fail by name
+            errors.put(f"{path}: {exc!r}")
+
+
+_RACE_PROCESSES = 4
+_RACE_TRIALS = 8
+
+
+def test_concurrent_first_connects_seed_the_v16_backfill_exactly_once(tmp_path):
+    """Issue #385 review: ``BEGIN IMMEDIATE`` makes the backfill race-safe.
+
+    Four processes first-connect the same v15 catalog at once (a barrier lines
+    them up), over several fresh catalogs. Each must end at v16 with exactly the
+    two backfill rows -- never four, six or eight -- and no process may fail.
+    Without the transaction, two processes can both find ``host_usage`` empty
+    and both seed it; the worker pauses inside that window (see
+    ``_race_worker``), because unwidened it is too narrow to lose reliably. The
+    processes are started once and reused across trials, so the stack is
+    imported four times, not four times per trial.
+    """
+    paths = []
+    for trial in range(_RACE_TRIALS):
+        path = str(tmp_path / f"race{trial}.db")
+        _v15_catalog(
+            path, [("2026-09-29", "mapillary", 1198), ("2026-09-30", "mapillary_streets", 5)]
+        )
+        raw = sqlite3.connect(path)
+        raw.execute("PRAGMA journal_mode=WAL")
+        raw.close()
+        paths.append(path)
+    ctx = multiprocessing.get_context("spawn")
+    barrier = ctx.Barrier(_RACE_PROCESSES)
+    errors = ctx.Queue()
+    procs = [
+        ctx.Process(target=_race_worker, args=(paths, barrier, errors))
+        for _ in range(_RACE_PROCESSES)
+    ]
+    for proc in procs:
+        proc.start()
+    for proc in procs:
+        proc.join(timeout=120)
+    assert [proc.exitcode for proc in procs] == [0] * _RACE_PROCESSES
+    failures = []
+    while not errors.empty():
+        failures.append(errors.get())
+    assert failures == []
+    for path in paths:
+        raw = sqlite3.connect(path)
+        rows = raw.execute("SELECT provider, requests FROM host_usage ORDER BY provider").fetchall()
+        version = raw.execute("PRAGMA user_version").fetchone()[0]
+        raw.close()
+        assert (version, rows) == (16, [("mapillary", 1198), ("mapillary_streets", 5)]), path

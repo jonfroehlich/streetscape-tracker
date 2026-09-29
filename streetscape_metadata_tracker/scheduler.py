@@ -2619,12 +2619,21 @@ HOST_USAGE_RETENTION = timedelta(days=30)
 
 
 class HostWindow(NamedTuple):
-    """One budgeted host's rolling-24h spend, read at one instant."""
+    """One budgeted host's rolling-24h spend, read at one instant.
+
+    ``still_in_window_at_batch_end`` is the part of ``used`` that will NOT have
+    aged out by the end of the batch -- everything stamped at or after
+    ``batch_end - 24h`` (issue #385 review). It is what the age-wall ceiling
+    subtracts: spend that leaves the window before the night ends is credit the
+    night can still use, spend that does not is not. Equal to ``used`` when the
+    caller has no batch end (an operator run), which is the conservative case.
+    """
 
     host: str
     used: int
     budget: int
     window_start: datetime
+    still_in_window_at_batch_end: int
 
     @property
     def remaining(self) -> int:
@@ -2643,20 +2652,39 @@ class HostWindow(NamedTuple):
 
 
 def _host_windows(
-    cfg: SchedulerConfig, conn, hosts=None, now: datetime | None = None
+    cfg: SchedulerConfig,
+    conn,
+    hosts=None,
+    now: datetime | None = None,
+    batch_end: datetime | None = None,
 ) -> list[HostWindow]:
     """Every budgeted host's window (or only ``hosts``), in sorted token order.
 
     ``now`` defaults to ``clock.utc_now()`` -- the test seam is
-    ``clock._utc_clock``, never ``datetime.now``.
+    ``clock._utc_clock``, never ``datetime.now``. ``batch_end`` is the
+    wall-clock instant the batch will stop at (None, or not after ``now``, for a
+    caller with no deadline); it sets ``still_in_window_at_batch_end``.
     """
     now = clock.utc_now() if now is None else now
     start = now - HOST_BUDGET_WINDOW
     wanted = cfg.host_budgets if hosts is None else [h for h in hosts if h in cfg.host_budgets]
-    return [
-        HostWindow(host, db.get_host_usage(conn, host, start), cfg.host_budgets[host], start)
-        for host in sorted(wanted)
-    ]
+    windows = []
+    for host in sorted(wanted):
+        used = db.get_host_usage(conn, host, start)
+        persists = (
+            used
+            if batch_end is None or batch_end <= now
+            else db.get_host_usage(conn, host, batch_end - HOST_BUDGET_WINDOW)
+        )
+        windows.append(HostWindow(host, used, cfg.host_budgets[host], start, persists))
+    return windows
+
+
+def _batch_end_utc(batch_deadline: float | None) -> datetime | None:
+    """The monotonic ``batch_deadline`` as a UTC wall-clock instant, or None."""
+    if batch_deadline is None:
+        return None
+    return clock.utc_now() + timedelta(seconds=max(0.0, batch_deadline - time.monotonic()))
 
 
 class BudgetRemainder(NamedTuple):
@@ -2669,15 +2697,20 @@ class BudgetRemainder(NamedTuple):
     term (always, with no ``[hosts.*]`` configured).
 
     ``ceiling`` is what tonight could plausibly grant this channel at most: the
-    minimum of the channel's daily remainder and every budgeted host's FULL
-    budget, never the momentary window remainder. The two differ because the
-    window FREES during a night -- last night's per-crawl stamps age out -- while
-    a daily remainder does not refill until the next UTC date. The age-wall arm
-    asks "could tonight finish this crawl?", and ``remaining`` is the wrong
-    answer to that at 09:00 UTC after a full night (53 left after 2,947, when
-    most of the 3,000 comes back before the night ends). ``ceiling_host`` names
-    the host whose full budget is that minimum (strictly under the channel's),
-    else None.
+    minimum of the channel's daily remainder and, per budgeted host, its budget
+    minus the spend that will STILL be in the window when the batch ends (stamped
+    at or after ``batch_end - 24h``). The window frees during a night -- last
+    night's per-crawl stamps age out -- while a daily remainder does not refill
+    until the next UTC date, so at 09:00 UTC after a full night ``remaining`` is
+    53 while most of the 3,000 comes back before the night ends. But only what
+    ages out BEFORE the batch ends comes back: late in a night that has itself
+    spent 2,947, the full budget would promise a crawl credit the night never
+    gets, the crawl would launch capped, never finish, and be discarded past
+    the checkpoint age with no failure recorded -- the silent re-sweep the age
+    wall exists to alert on. With no batch end (assess-city, any operator run)
+    the ceiling is the momentary remainder, the conservative pre-fix reading.
+    ``ceiling_host`` names the host that sets that minimum (strictly under the
+    channel's), else None.
     """
 
     remaining: int
@@ -2693,7 +2726,9 @@ class BudgetRemainder(NamedTuple):
         """The governing host's wording, or ``""`` when the channel governs."""
         if self.host is None:
             return ""
-        return HostWindow(self.host, self.host_used, self.host_budget, self.window_start).clause()
+        return HostWindow(
+            self.host, self.host_used, self.host_budget, self.window_start, self.host_used
+        ).clause()
 
     def host_bound(self, request_cap: int) -> bool:
         """Did the HOST's window, rather than the channel or the clock, set ``request_cap``?
@@ -2723,8 +2758,9 @@ def _combine_remainder(
     for window in windows:
         if window.remaining < remaining:
             remaining, governing = window.remaining, window
-        if window.budget < ceiling:
-            ceiling, ceiling_host = window.budget, window.host
+        grantable = window.budget - window.still_in_window_at_batch_end
+        if grantable < ceiling:
+            ceiling, ceiling_host = grantable, window.host
     if governing is None:
         start = windows[0].window_start if windows else window_start
         return BudgetRemainder(
@@ -2743,7 +2779,12 @@ def _combine_remainder(
 
 
 def _budget_remainder(
-    cfg: SchedulerConfig, conn, today: date, provider: str, now: datetime | None = None
+    cfg: SchedulerConfig,
+    conn,
+    today: date,
+    provider: str,
+    now: datetime | None = None,
+    batch_end: datetime | None = None,
 ) -> BudgetRemainder:
     """The effective remainder for ``provider`` right now (issue #385).
 
@@ -2773,7 +2814,9 @@ def _budget_remainder(
     channel_remaining = cfg.providers[provider].daily_request_budget - db.get_api_usage(
         conn, today, provider
     )
-    windows = _host_windows(cfg, conn, CHANNEL_HOSTS.get(provider, ()), now=now)
+    windows = _host_windows(
+        cfg, conn, CHANNEL_HOSTS.get(provider, ()), now=now, batch_end=batch_end
+    )
     return _combine_remainder(channel_remaining, windows, now - HOST_BUDGET_WINDOW)
 
 
@@ -3002,24 +3045,32 @@ def _sweep_launch_plan(
         wall_remaining = remaining if age_wall_remaining is None else age_wall_remaining
         wall_cap = wall_remaining if affordable is None else min(wall_remaining, affordable)
         host_walls = age_wall_host is not None and wall_cap == wall_remaining
+        # When the CLOCK is the smaller term, no budget is the lever: tonight's
+        # timeout is (issue #385 review). Strictly smaller, so a tie keeps
+        # naming the budget exactly as before.
+        clock_walls = affordable is not None and affordable < wall_remaining
         if wall_remaining == remaining:
             wall_note = clock_note
         else:
             wall_note = (
                 (
                     f"{wall_remaining:,} is the most the rolling-24h budget of "
-                    f"{HOST_LABELS[age_wall_host]} grants in 24 h, "
+                    f"{HOST_LABELS[age_wall_host]} can free before the batch ends, "
                     if age_wall_host is not None
                     else f"{wall_remaining:,} left in the budget, "
                 )
                 + f"{'unpaced' if affordable is None else f'{affordable:,}'} "
                 f"inside a {timeout_s // 60:,}-minute timeout"
             )
-        lever = (
-            f"[hosts.{age_wall_host}].{_HOST_BUDGET_KEY}"
-            if host_walls
-            else f"[providers.{channel}].daily_request_budget"
-        )
+        if clock_walls:
+            lever = (
+                f"the {timeout_s // 60:,}-minute timeout that binds here (raise "
+                f"[schedule].max_batch_hours, or run the city earlier in the night)"
+            )
+        elif host_walls:
+            lever = f"[hosts.{age_wall_host}].{_HOST_BUDGET_KEY}"
+        else:
+            lever = f"[providers.{channel}].daily_request_budget"
         if projected > wall_cap:
             return plan(
                 _SWEEP_SKIP_AGE_WALL,
@@ -7582,7 +7633,14 @@ def cmd_run_due(
         # stamps release as it goes, so the preview can list deferrals the
         # night itself will launch.
         preview_now = clock.utc_now()
-        windows = _host_windows(cfg, conn, now=preview_now)
+        # The age-wall ceiling needs a batch end; a preview has no night, so it
+        # assumes one starting now and running its full max_batch_hours.
+        windows = _host_windows(
+            cfg,
+            conn,
+            now=preview_now,
+            batch_end=preview_now + timedelta(hours=cfg.max_batch_hours),
+        )
         host_spent: Counter[str] = Counter()
         if windows:
             left_str += "; " + ", ".join(w.status_line() for w in windows)
@@ -7606,7 +7664,14 @@ def cmd_run_due(
                 remainder = _combine_remainder(
                     budget_left[provider],
                     [
-                        w._replace(used=w.used + host_spent[w.host])
+                        # The preview's own spend happens tonight, so it is
+                        # still in the window at batch end too.
+                        w._replace(
+                            used=w.used + host_spent[w.host],
+                            still_in_window_at_batch_end=(
+                                w.still_in_window_at_batch_end + host_spent[w.host]
+                            ),
+                        )
                         for w in windows
                         if w.host in wanted
                     ],
@@ -8308,7 +8373,13 @@ def _run_city_channels(
                         # channels never overlap (host lock + host-disjoint lanes),
                         # so nothing else spends on the host between here and the
                         # launch. See _budget_remainder.
-                        remainder = _budget_remainder(cfg, conn, today, provider)
+                        # `batch_end` sizes the age-wall ceiling: only spend that
+                        # ages out before the deadline is credit this night can
+                        # use. None on an operator run (assess-city), where the
+                        # ceiling is then the momentary remainder.
+                        remainder = _budget_remainder(
+                            cfg, conn, today, provider, batch_end=_batch_end_utc(batch_deadline)
+                        )
                         remaining = remainder.remaining
 
                         # Derived here, ahead of the gates, for the resumable channels
