@@ -169,6 +169,21 @@ def get_processed_points(file_path: str) -> set:
 PIPELINE_DEPTH = 4
 
 
+def max_requests_in_flight(batch_size: int) -> int:
+    """
+    The most requests the engine can ever have in flight for ``batch_size``:
+    PIPELINE_DEPTH batches' worth. In-flight requests are
+    min(connection_limit, this), so a connection_limit above it opens sockets
+    that never get work -- the bound the CLIs clamp ``--connection-limit`` to
+    (issue #359, re-derived for pipelining in #304).
+
+    Usage:
+        >>> max_requests_in_flight(100)  # doctest: +SKIP
+        400
+    """
+    return PIPELINE_DEPTH * batch_size
+
+
 async def _fetch_batch_async(
     points: list[tuple[float, float, int, int]],
     api_key: str,

@@ -77,7 +77,8 @@ Incidental coverage of a deprecated spelling trains readers to ignore the notice
 
 ## GSV downloaders, and the history harvester
 
-- `--connection-limit` above `--batch-size` (issue #359, `tests/test_cli_policy.py`): clamped to the batch with a stderr warning and the run proceeds (the downloader receives the batch size), rather than an argparse exit 2; a limit below the batch passes through unwarned, so the clamp is one-directional; `tests/test_run_cities.py` pins the same clamp in `run_cities.py`'s parser, which forwards both flags and must not refuse an argv the child accepts
+- `--connection-limit` above what the GSV engine can use (issue #359, `tests/test_cli_policy.py`): clamped with a stderr warning to `download_gsv.max_requests_in_flight(batch_size)`, i.e. `PIPELINE_DEPTH × batch_size` since #304 (one batch before), and the run proceeds, rather than an argparse exit 2;
+  a limit at or below the bound passes through unwarned, including one above a single batch (150 at batch 100), so the clamp is one-directional; `tests/test_run_cities.py` pins the same clamp in `run_cities.py`'s parser, which forwards both flags and must not refuse an argv the child accepts
 - GSV history harvester (response parsing, dated-only filter, cross-grid dedup, circuit breaker, resume — endpoint mocked)
 - GSV batch downloader's quota-throttling behavior (OVER_QUERY_LIMIT retry, sub-threshold residual written back as a failure row, over-threshold abort
   — the `fetch_gsv_pano_metadata_async` primitive is monkeypatched to serve responses from memory)
