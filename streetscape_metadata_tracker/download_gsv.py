@@ -1,4 +1,5 @@
 import asyncio
+import collections
 import gzip
 import logging
 import os
@@ -158,102 +159,116 @@ def get_processed_points(file_path: str) -> set:
         return set()
 
 
-async def process_batch_async(
+# How many batches' requests may be in flight at once (#304). A batch is still
+# WRITTEN only after it completes and strictly in submission order, so the CSV
+# is unchanged; what depth buys is that batch k+1's requests are already on the
+# wire while batch k's slowest response is outstanding. At depth 1 every batch
+# ends in a barrier that idles the socket pool on its slowest request -- that
+# barrier, plus a fresh connector per batch, held dense cities to 38-52% of the
+# configured rate. See docs/experiments/gsv-throughput.md for the depth choice.
+PIPELINE_DEPTH = 4
+
+
+async def _fetch_batch_async(
     points: list[tuple[float, float, int, int]],
     api_key: str,
+    session: aiohttp.ClientSession,
+    timeout: aiohttp.ClientTimeout,
+    limiter: AsyncRateLimiter | None,
+) -> list[Any]:
+    """Issue one batch's requests; each entry is a response dict or an exception."""
+    tasks = [
+        fetch_gsv_pano_metadata_async(lat, lon, api_key, session, timeout, limiter)
+        for lat, lon, _i, _j in points
+    ]
+    return await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def process_batch_async(
+    points: list[tuple[float, float, int, int]],
+    responses: list[Any],
     progress_queue: asyncio.Queue,
     base_file_path: str,
-    timeout: aiohttp.ClientTimeout,
-    connection_limit: int,
     failed_points_queue: asyncio.Queue,
-    limiter: AsyncRateLimiter | None = None,
 ) -> list[dict]:
     """
-    Process a batch of points asynchronously and append results to the
+    Turn one completed batch's responses into rows and append them to the
     in-progress CSV under a file lock (so a second process on the same city
-    can't interleave writes).
+    can't interleave writes). ``responses`` is `_fetch_batch_async`'s result,
+    positionally aligned with ``points``, so rows are written in point order
+    no matter the order the requests completed in.
     """
     results = []
     lock_file = f"{base_file_path}.lock"
 
     try:
-        # Create connection-limited session
-        connector = aiohttp.TCPConnector(limit=connection_limit)
-        async with aiohttp.ClientSession(connector=connector) as session:
-            tasks = []
-            for lat, lon, _i, _j in points:
-                task = fetch_gsv_pano_metadata_async(lat, lon, api_key, session, timeout, limiter)
-                tasks.append(task)
+        batch_results = []
+        for (lat, lon, i, j), response in zip(points, responses, strict=False):
+            if isinstance(response, Exception):
+                logger.error(
+                    f"Error processing point ({lat}, {lon}): {redact_credentials(response)}"
+                )
+                # No body status came back (network/timeout). Carry the
+                # synthetic REQUEST_FAILED reason so a permanently-failed
+                # point can be written back as a failure row.
+                await failed_points_queue.put((lat, lon, i, j, REQUEST_FAILED))
+                continue
 
-            responses = await asyncio.gather(*tasks, return_exceptions=True)
+            # Get the current UTC datetime
+            now_utc = datetime.now(UTC)
 
-            batch_results = []
-            for (lat, lon, i, j), response in zip(points, responses, strict=False):
-                if isinstance(response, Exception):
-                    logger.error(
-                        f"Error processing point ({lat}, {lon}): {redact_credentials(response)}"
-                    )
-                    # No body status came back (network/timeout). Carry the
-                    # synthetic REQUEST_FAILED reason so a permanently-failed
-                    # point can be written back as a failure row.
-                    await failed_points_queue.put((lat, lon, i, j, REQUEST_FAILED))
-                    continue
+            # Format the datetime as ISO 8601
+            query_timestamp = now_utc.isoformat()
 
-                # Get the current UTC datetime
-                now_utc = datetime.now(UTC)
+            status = response["status"]
 
-                # Format the datetime as ISO 8601
-                query_timestamp = now_utc.isoformat()
+            # Retryable statuses (quota throttling as a normal HTTP 200
+            # OVER_QUERY_LIMIT, or a transient UNKNOWN_ERROR) say nothing
+            # about the grid point itself, so route them to the retry
+            # queue rather than writing them as a final row now — a
+            # throttle row written immediately reads as "no imagery" and
+            # corrupts coverage stats and future diffs. If a point is
+            # still retryable after every pass, it is written back as a
+            # failure row at finalize time (grid stays complete) with its
+            # true status preserved here.
+            if status in RETRYABLE_STATUSES:
+                await failed_points_queue.put((lat, lon, i, j, status))
+                continue
 
-                status = response["status"]
+            result = {
+                "query_lat": lat,
+                "query_lon": lon,
+                "query_timestamp": query_timestamp,
+                "pano_lat": None,
+                "pano_lon": None,
+                "pano_id": None,
+                "capture_date": None,
+                "copyright_info": None,
+                "status": status,
+            }
 
-                # Retryable statuses (quota throttling as a normal HTTP 200
-                # OVER_QUERY_LIMIT, or a transient UNKNOWN_ERROR) say nothing
-                # about the grid point itself, so route them to the retry
-                # queue rather than writing them as a final row now — a
-                # throttle row written immediately reads as "no imagery" and
-                # corrupts coverage stats and future diffs. If a point is
-                # still retryable after every pass, it is written back as a
-                # failure row at finalize time (grid stays complete) with its
-                # true status preserved here.
-                if status in RETRYABLE_STATUSES:
-                    await failed_points_queue.put((lat, lon, i, j, status))
-                    continue
+            if status == "OK":
+                # I have found that capture_date can be formatted in a variety of formats like format='%Y-%m' (most commonly) or format='%Y-%m-%d'.
+                # So, we should standardize the data format to make it consistent and easier for others to use once archived in a file
+                capture_date_raw = response.get(
+                    "date", None
+                )  # Get the raw capture date from the API response
+                capture_date_standardized = standardize_capture_date(capture_date_raw)
 
-                result = {
-                    "query_lat": lat,
-                    "query_lon": lon,
-                    "query_timestamp": query_timestamp,
-                    "pano_lat": None,
-                    "pano_lon": None,
-                    "pano_id": None,
-                    "capture_date": None,
-                    "copyright_info": None,
-                    "status": status,
-                }
+                result.update(
+                    {
+                        "pano_lat": response["location"]["lat"],
+                        "pano_lon": response["location"]["lng"],
+                        "pano_id": response["pano_id"],
+                        "copyright_info": response.get("copyright", None),
+                        "capture_date": capture_date_standardized,
+                    }
+                )
+                if not result["capture_date"]:
+                    result["status"] = "NO_DATE"
 
-                if status == "OK":
-                    # I have found that capture_date can be formatted in a variety of formats like format='%Y-%m' (most commonly) or format='%Y-%m-%d'.
-                    # So, we should standardize the data format to make it consistent and easier for others to use once archived in a file
-                    capture_date_raw = response.get(
-                        "date", None
-                    )  # Get the raw capture date from the API response
-                    capture_date_standardized = standardize_capture_date(capture_date_raw)
-
-                    result.update(
-                        {
-                            "pano_lat": response["location"]["lat"],
-                            "pano_lon": response["location"]["lng"],
-                            "pano_id": response["pano_id"],
-                            "copyright_info": response.get("copyright", None),
-                            "capture_date": capture_date_standardized,
-                        }
-                    )
-                    if not result["capture_date"]:
-                        result["status"] = "NO_DATE"
-
-                batch_results.append(result)
-                await progress_queue.put(1)
+            batch_results.append(result)
+            await progress_queue.put(1)
 
         # Every point in this batch failed (all are queued for the retry
         # pass); an empty DataFrame would KeyError on astype and abort the
@@ -495,6 +510,7 @@ async def collect_points_async(
             f"(run lock held); refusing to run concurrently."
         ) from None
 
+    session: aiohttp.ClientSession | None = None
     try:
         all_points = points
 
@@ -545,25 +561,56 @@ async def collect_points_async(
                 logger=logger,
             )
 
-            # Process initial points in batches
-            for i in range(0, len(remaining_points), batch_size):
-                batch_points = remaining_points[i : i + batch_size]
-                api_requests += len(batch_points)
-                await process_batch_async(
-                    batch_points,
-                    api_key,
-                    progress_queue,
-                    file_name_downloading_with_path,
-                    timeout,
-                    connection_limit,
-                    failed_points_queue,
-                    limiter,
-                )
+            # ONE connector for the whole run, initial and retry passes alike
+            # (#304). It used to be built per batch, which re-handshook TLS on
+            # every socket every batch: 50 new connections per 100 requests,
+            # measured 10,000 connects for 20,000 requests.
+            session = aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=connection_limit))
 
-                # Update progress bar
-                while not progress_queue.empty():
-                    await progress_queue.get()
-                    progress_bar.update(1)
+            async def run_pass(pass_points: list[tuple[float, float, int, int]]) -> None:
+                """
+                Collect ``pass_points`` in batches with up to PIPELINE_DEPTH
+                batches in flight, writing each batch in submission order.
+                ``api_requests`` counts a batch when it is scheduled (as the
+                sequential loop did), so a failure mid-pass can over-count by at
+                most (PIPELINE_DEPTH - 1) x batch_size never-sent requests --
+                the conservative direction for the budget ledger.
+                """
+                nonlocal api_requests
+                inflight: collections.deque = collections.deque()
+
+                async def write_oldest() -> None:
+                    batch_points, fut = inflight.popleft()
+                    await process_batch_async(
+                        batch_points,
+                        await fut,
+                        progress_queue,
+                        file_name_downloading_with_path,
+                        failed_points_queue,
+                    )
+                    while not progress_queue.empty():
+                        await progress_queue.get()
+                        progress_bar.update(1)
+
+                try:
+                    for i in range(0, len(pass_points), batch_size):
+                        batch_points = pass_points[i : i + batch_size]
+                        api_requests += len(batch_points)
+                        fut = asyncio.ensure_future(
+                            _fetch_batch_async(batch_points, api_key, session, timeout, limiter)
+                        )
+                        inflight.append((batch_points, fut))
+                        if len(inflight) >= PIPELINE_DEPTH:
+                            await write_oldest()
+                    while inflight:
+                        await write_oldest()
+                finally:
+                    # A write failure must not strand requests still in flight.
+                    for _bp, fut in inflight:
+                        fut.cancel()
+                    await asyncio.gather(*(fut for _bp, fut in inflight), return_exceptions=True)
+
+            await run_pass(remaining_points)
 
             # Process failed points with retries. A retryable API status
             # (OVER_QUERY_LIMIT/UNKNOWN_ERROR) means the provider's per-minute
@@ -591,25 +638,9 @@ async def collect_points_async(
                 )
                 await asyncio.sleep(delay)
 
-                # process_batch_async takes 4-tuples; strip the reason.
+                # run_pass takes 4-tuples; strip the reason.
                 retry_batch = [(lat, lon, gi, gj) for (lat, lon, gi, gj, _r) in failed_points]
-                for start in range(0, len(retry_batch), batch_size):
-                    batch_points = retry_batch[start : start + batch_size]
-                    api_requests += len(batch_points)
-                    await process_batch_async(
-                        batch_points,
-                        api_key,
-                        progress_queue,
-                        file_name_downloading_with_path,
-                        timeout,
-                        connection_limit,
-                        failed_points_queue,
-                        limiter,
-                    )
-
-                while not progress_queue.empty():
-                    await progress_queue.get()
-                    progress_bar.update(1)
+                await run_pass(retry_batch)
 
             # Collect any permanently failed points (still failing after every
             # retry pass), preserving each point's reason.
@@ -698,4 +729,6 @@ async def collect_points_async(
         error.api_requests = api_requests
         raise error from e
     finally:
+        if session is not None:
+            await session.close()
         run_lock.release()
