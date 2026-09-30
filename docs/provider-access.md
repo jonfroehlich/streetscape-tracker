@@ -373,6 +373,7 @@ Both are out-of-band and low-volume; lock them if either ever runs on a schedule
 Chokepoints are the two places every such request in the repo passes through: `download_mapillary.fetch_city_images_async` (grid run *and* road walk) and the download branch of `download_street_network.fetch_graph`
 — placed **after** its cache-hit return, so a warm city never contends, and **outside** `_download_graph` so one hold covers the whole retry stack.
 GSV metadata is deliberately **not** locked: Google meters the Street View Static API per *project*, so two processes share a quota the daily ledger already tracks and serializing them would cost throughput for nothing.
+**That reasoning predates #304 and no longer holds per minute**: each GSV process now actually reaches its 48,000/min, so two processes on the SAME key send ~96,000/min into one 60,000/min project quota — see the #304 section at the end of this file.
 **Only the child ever holds the lock** — `flock` is scoped to an open file description and is not inherited across `subprocess.run`, so a scheduler parent holding it would make every child's `timeout=0` acquire fail;
 a source-inspection test asserts `scheduler.py` never imports the module.
 A stale lock file cannot wedge a night, because the kernel releases `flock` when the fd closes (SIGKILL and OOM included)
@@ -629,6 +630,19 @@ With all three fixed, **the engine sustains the configured rate wherever Google'
   Per the READ THIS FIRST corollary, that is unknown, not unlimited.
 - **Connections**: new TLS handshakes to Google drop from ~50 per 100 requests to ~50 per run.
 - **Bursts**: the one-second start burst (800 tokens at 48,000/min) is unchanged, and so is the rule that over any interval T the bucket admits at most 800 + 800 × T requests.
+
+**Two processes on the same key now oversubscribe its project** (PR #399 review).
+Nothing serializes GSV across processes (the host lock above deliberately skips it), and before #304 that was harmless in practice: two engines each achieving ~30,000/min sat near the quota rather than over it.
+Now each can reach 48,000/min, so any two concurrent processes on one key present ~96,000/min against a 60,000/min quota.
+The realistic pairs:
+
+- a hand-run `streetscape_tracker.py` (gsv) while the nightly `gsv` lane is collecting (both `GMAPS_API_KEY`);
+- `python -m streetscape_street_analyzer.collect --provider gsv`, or `scheduler assess-city` (whose set includes `gsv_streets`), while the nightly `gsv_streets` lane is collecting (both `GMAPS_STREETS_API_KEY`);
+- two hand runs of either.
+
+What it costs is OVER_QUERY_LIMIT answers: the engine retries them after a 20 s quota-reset wait, and a run with more than 1% of points still failing after its retry passes aborts with its checkpoint kept rather than finalizing.
+**No lock is added yet; that is an open decision**, the options being a per-key cross-process lock (which would serialize a hand run behind a multi-hour night), a shared cross-process pacer, or halving the per-process rate while two could overlap.
+Until it is decided: do not start a same-key GSV run while the nightly batch is collecting (check `pgrep -f "scheduler run-due"` or the unit status), or lower `--max-requests-per-minute` on the hand run so the two sum under the quota.
 
 If the first nights after deploy show OVER_QUERY_LIMIT rows, a rise in REQUEST_FAILED, or an HTTP 403/429 from the metadata endpoint, lower `[download].max_requests_per_minute` first.
 Do not revert the connector or the pipelining: they change nothing about the rate, only how much of it is reached.

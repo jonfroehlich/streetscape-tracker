@@ -40,6 +40,10 @@ It would also be the one flag letting a non-prod checkout overwrite prod's `citi
 What the absence needs instead is a **notice**: with publishing off, the printed city-page link describes the catalog and reads exactly like an answer while pointing at stale or absent data, and the only other signal was the *absence* of `; published` from the summary line.
 The realistic victim is not a dev laptop but prod with publishing switched off during a block or a maintenance window.
 Exit stays 0 there, on the same reasoning that makes `--no-publish` exit 0 — only an *attempted* publish that failed is a failure.
+**Do not run it while the nightly batch is collecting** (PR #399 review): its `gsv_streets` walk uses the same key as the nightly `gsv_streets` lane, nothing serializes GSV processes, and since #304 each engine actually reaches its 48,000/min, so the two would present ~96,000/min against that key's 60,000/min project quota.
+The same holds for any hand-run GSV collection (`streetscape_tracker.py`, `collect --provider gsv`) against its nightly twin.
+The failure is OVER_QUERY_LIMIT answers, retried after 20 s waits and, past 1% of points, an aborted run; the full account and the open decision are in [`provider-access.md`](provider-access.md) (the #304 section).
+Check `pgrep -f "scheduler run-due"` first, or pass a lower `--max-requests-per-minute` to a hand run so the two sum under the quota.
 Refusals mirror #214's: an unpaired `--width/--height`, a `--provider` naming the grid channel or an unknown/disabled one, and a config with no assess channel enabled all exit `USAGE_EXIT_CODE` **before the catalog is opened**.
 `--width/--height` without `--lat/--lng` is refused where `cli.py` merely tolerates it, because size alone freezes the grid on the OSM bbox midpoint rather than downtown — the right size in the wrong place, permanently.
 
