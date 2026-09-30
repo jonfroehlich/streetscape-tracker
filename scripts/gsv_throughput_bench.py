@@ -41,7 +41,9 @@ depth4-oldpacer  this checkout's engine at depth 4 with the token bucket's
 
 Every arm runs ``--reps`` times per (scenario, coverage) cell, interleaved, and
 the JSON summarizes each cell with ``experiment_stats.describe``.
-A dirty tracked tree is refused unless ``--allow-dirty``, and recorded either way.
+A dirty tracked tree is refused unless ``--allow-dirty``, and a HEAD that no
+remote-tracking ref contains is refused unless ``--allow-unpushed``; the state and
+the override are both recorded either way.
 """
 
 from __future__ import annotations
@@ -402,7 +404,11 @@ def limiter_bound_summary(cells: list[dict]) -> dict:
     for (scenario, cov, arm), cell in by_key.items():
         steady = cell["steady_req_per_min"]
         if arm == "depth4" and steady.get("n") and lo <= steady["p50"] <= hi:
-            if (scenario, cov, "depth4-oldpacer") in by_key:
+            # Both arms need a steady rate: an old-pacer cell with none
+            # ({"n": 0}) has no p50 to range over, and would otherwise raise
+            # KeyError at the very end of a ~100-minute sweep (#304 review).
+            old_cell = by_key.get((scenario, cov, "depth4-oldpacer"))
+            if old_cell is not None and old_cell["steady_req_per_min"].get("n"):
                 selected.append((scenario, cov))
     fixed = [by_key[(s, c, "depth4")]["steady_req_per_min"]["p50"] for s, c in selected]
     old = [by_key[(s, c, "depth4-oldpacer")]["steady_req_per_min"]["p50"] for s, c in selected]
@@ -423,21 +429,47 @@ def limiter_bound_summary(cells: list[dict]) -> dict:
     return out
 
 
-def tree_state(repo: Path = REPO) -> tuple[str, bool]:
-    """(full HEAD sha, whether any TRACKED file differs from it).
+def tree_state(repo: Path = REPO) -> tuple[str, bool, list[str]]:
+    """(full HEAD sha, whether any TRACKED file differs from it, the
+    remote-tracking refs that contain HEAD).
 
     Untracked files do not count: they cannot change what the engine imports.
+    An empty ref list means HEAD exists only in this clone -- the shape of this
+    study's first record, whose engine_head (bd6ea3f) was a real, clean commit
+    that was later amended away and never pushed, so nobody could check it out.
     """
-    head = subprocess.run(
-        ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
-    ).stdout.strip()
-    status = subprocess.run(
-        ["git", "-C", str(repo), "status", "--porcelain", "--untracked-files=no"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    return head, bool(status)
+
+    def git(*argv: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(repo), *argv], check=True, capture_output=True, text=True
+        ).stdout.strip()
+
+    head = git("rev-parse", "HEAD")
+    status = git("status", "--porcelain", "--untracked-files=no")
+    remotes = [r.strip() for r in git("branch", "-r", "--contains", "HEAD").splitlines()]
+    return head, bool(status), [r for r in remotes if r and "->" not in r]
+
+
+def check_provenance(
+    dirty: bool, remotes: list[str], allow_dirty: bool, allow_unpushed: bool
+) -> None:
+    """Refuse a sweep whose record could not be traced back to its code.
+
+    A dirty tree measures code no commit holds; an unpushed HEAD names a commit
+    nobody else can check out, and one that can still be amended away. Each is
+    overridable, and the record carries both the state and the override.
+    """
+    if dirty and not allow_dirty:
+        raise SystemExit(
+            "refusing to measure a dirty tree: commit or stash tracked changes so "
+            "engine_head names the code measured (or pass --allow-dirty, recorded as such)"
+        )
+    if not remotes and not allow_unpushed:
+        raise SystemExit(
+            "refusing to measure an unpushed HEAD: no remote-tracking ref contains it, so "
+            "engine_head could be amended away (push first, or pass --allow-unpushed, "
+            "recorded as such)"
+        )
 
 
 def _sweep(args: argparse.Namespace) -> None:
@@ -450,15 +482,8 @@ def _sweep(args: argparse.Namespace) -> None:
             check=True,
             capture_output=True,
         )
-    head, dirty = tree_state()
-    if dirty and not args.allow_dirty:
-        # The record names the engine by commit; a dirty tree measures code no
-        # commit holds, which is how this study's first record came to name an
-        # unpushed, later-amended sha.
-        raise SystemExit(
-            "refusing to measure a dirty tree: commit or stash tracked changes so "
-            "engine_head names the code measured (or pass --allow-dirty, recorded as such)"
-        )
+    head, dirty, remotes = tree_state()
+    check_provenance(dirty, remotes, args.allow_dirty, args.allow_unpushed)
     baseline_root = _extract_baseline(args.baseline_ref)
     raw_path = RAW_DIR / "raw.jsonl"
     raw_path.write_text("")  # one run's records, never appended across runs
@@ -523,6 +548,10 @@ def _sweep(args: argparse.Namespace) -> None:
         "generated_at": datetime.now(UTC).isoformat(timespec="seconds"),
         "engine_head": head,
         "engine_tree_dirty": dirty,
+        "engine_head_pushed": bool(remotes),
+        "engine_head_remote_refs": remotes,
+        "allow_dirty": args.allow_dirty,
+        "allow_unpushed": args.allow_unpushed,
         "baseline_ref": args.baseline_ref,
         "machine": {"platform": sys.platform, "python": sys.version.split()[0]},
         "settings": {
@@ -585,6 +614,7 @@ def main() -> None:
     parser.add_argument("--no-cpu-ceiling", dest="cpu_ceiling", action="store_false")
     parser.add_argument("--port0", type=int, default=8800)
     parser.add_argument("--allow-dirty", action="store_true")
+    parser.add_argument("--allow-unpushed", action="store_true")
     parser.add_argument("--docs-dir", default=str(REPO / "docs" / "experiments"))
     args = parser.parse_args()
     {"serve": _serve, "proxy": _proxy, "client": _client}.get(args.cmd, _sweep)(args)
