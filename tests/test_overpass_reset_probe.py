@@ -244,6 +244,21 @@ def test_the_pin_follows_the_mirror_override(interpreter, monkeypatch):
     assert interpreter.calls[0]["connect_to"] == OTHER_V4
 
 
+def test_a_mixed_case_mirror_is_lowercased_so_osmnx_would_pin_the_same_host(
+    interpreter, monkeypatch
+):
+    """Review of #366: osmnx pins its query only when the host urllib3 asks
+    for (lowercase) equals the host as written in the URL. The re-check reads
+    the same OVERPASS_URL the walk hands osmnx, lowercased, so the address it
+    connects to is the one osmnx's pin would give that walk's query."""
+    monkeypatch.setenv(dc.OVERPASS_URL_ENV, "https://Overpass.Example.org/api")
+    assert dc.overpass_url() == "https://overpass.example.org/api"
+    assert dc.overpass_serving() is True
+    assert interpreter.calls[0]["url"] == "https://overpass.example.org/api/interpreter"
+    ox._http._config_dns(dc.overpass_url())  # patches socket.getaddrinfo
+    assert connect_address(dc.overpass_url()) == interpreter.calls[0]["connect_to"] == OTHER_V4
+
+
 def test_the_pin_is_scoped_to_the_probe_and_to_the_host(interpreter):
     """The scheduler is a long-lived parent: unlike osmnx's permanent patch,
     this one must be gone afterwards -- even when the request raises -- and

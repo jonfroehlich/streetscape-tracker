@@ -40,9 +40,19 @@ def recording_gethostbyname(lookups: list):
 
 
 def install(monkeypatch) -> list:
-    """Install both fakes; return the list the lookups are recorded into."""
+    """Install both fakes; return the list the lookups are recorded into.
+
+    Also replaces osmnx's own ``_http._original_getaddrinfo``, which it
+    captured from ``socket`` at IMPORT time: ``_config_dns``'s patch falls
+    through to that capture for any host it does not pin, so without this a
+    test that calls ``_config_dns`` and then resolves an unpinned name would
+    make a real DNS lookup.
+    """
+    import osmnx._http
+
     lookups = []
     monkeypatch.setattr(socket, "getaddrinfo", dual_stack_getaddrinfo)
+    monkeypatch.setattr(osmnx._http, "_original_getaddrinfo", dual_stack_getaddrinfo)
     monkeypatch.setattr(socket, "gethostbyname", recording_gethostbyname(lookups))
     return lookups
 

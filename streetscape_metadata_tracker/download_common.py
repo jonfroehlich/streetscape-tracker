@@ -182,9 +182,36 @@ OVERPASS_PROBE_QUERY = (
 OVERPASS_PROBE_TIMEOUT_S = 25.0
 
 
+def normalize_overpass_url(url: str) -> str:
+    """
+    ``url`` with its host lowercased, so osmnx's address pin can match it.
+
+    osmnx's ``_http._config_dns`` pins a query only when the host it is asked
+    to resolve EQUALS ``urlparse(url).netloc.split(":")[0]`` -- not lowercased
+    -- while urllib3 lowercases the host before it calls ``getaddrinfo``. So a
+    mixed-case ``$OVERPASS_URL`` (``https://Overpass-API.de/api``) would leave
+    osmnx's query unpinned while :func:`_pinned_like_osmnx`, which reads
+    ``urlsplit().hostname`` (always lowercase), pins the probes to IPv4: the
+    probe and the query as two different clients again (issue #366). Hostnames
+    are case-insensitive, so lowercasing where the URL is CONFIGURED changes
+    nothing else. The path is left alone; it is case-sensitive.
+
+    Example::
+
+        >>> normalize_overpass_url("https://Overpass-API.de/api")
+        'https://overpass-api.de/api'
+    """
+    parts = urllib.parse.urlsplit(url)
+    return urllib.parse.urlunsplit(parts._replace(netloc=parts.netloc.lower()))
+
+
 def overpass_url() -> str:
-    """The Overpass endpoint in force right now: ``$OVERPASS_URL`` or the default."""
-    return os.environ.get(OVERPASS_URL_ENV) or DEFAULT_OVERPASS_URL
+    """The Overpass endpoint in force right now: ``$OVERPASS_URL`` or the default.
+
+    Host lowercased (:func:`normalize_overpass_url`), the same form
+    ``download_street_network._apply_overpass_url`` hands osmnx.
+    """
+    return normalize_overpass_url(os.environ.get(OVERPASS_URL_ENV) or DEFAULT_OVERPASS_URL)
 
 
 def overpass_headers() -> dict[str, str]:
@@ -304,13 +331,16 @@ def _pinned_like_osmnx(base_url: str):
     only this hostname is redirected.
 
     **Patching a module global is only safe while the patches cannot overlap**,
-    and today they cannot. There are two callers, one per process:
-    ``overpass_serving``, which the breaker calls from
-    ``HostBreaker._maybe_recheck`` on the scheduler's main launch thread, and
+    and today they cannot. There are two callers.
+    ``overpass_serving`` is called by the breaker from
+    ``HostBreaker._maybe_recheck`` on the scheduler's main launch thread.
     ``download_street_network._overpass_refusing``, the walk's pre-flight
-    (issue #366), which runs in the collection child -- a separate process,
-    which neither inherits nor shares the scheduler's patch. Within the child
-    it runs once per fetch, on the main thread, inside the Overpass host lock.
+    (issue #366), runs in every process that calls ``fetch_graph`` -- the
+    collection child, ``scripts/prefreeze_street_networks.py``,
+    ``streetscape_street_analyzer.analyze`` and the grid-density scripts --
+    none of which is the scheduler, so none inherits or shares its patch.
+    Each of those calls ``fetch_graph`` serially from one thread, once per
+    fetch, inside the Overpass host lock.
     Two overlapping pins would leak the wrapper for good -- the second saves
     the first's wrapper as "the original" and puts it back -- so ``_PIN_LOCK``
     makes the assumption structural rather than documentary. It is a plain
@@ -320,6 +350,12 @@ def _pinned_like_osmnx(base_url: str):
     earlier query. Stacking is harmless: this wrapper maps the hostname to the
     IP, osmnx's then sees an IP literal and passes it through, and this one is
     removed on exit.
+
+    "One address" is osmnx's model, and so is its limit: it assumes the one A
+    record ``gethostbyname`` returns is the one every later lookup returns. A
+    round-robin mirror can answer the probe and the query with different A
+    records, which is the same residual gap the breaker already documents for
+    its re-check.
 
     Two deliberate differences from osmnx: a lookup failure RAISES here (osmnx
     falls back to DNS-over-HTTPS), and what that means is the caller's policy,

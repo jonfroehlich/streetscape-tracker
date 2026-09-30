@@ -201,9 +201,24 @@ class _FakeStatus:
 _HEALTHY = "Connected as: 403941390\nRate limit: 2\n2 slots available now.\n"
 
 
+def _counting(reply):
+    """A `requests.get` stub that counts its calls, so a test asserting the
+    probe's None can also show the GET was really made -- None is ALSO what a
+    lookup failure short-circuiting before the GET returns (#366)."""
+
+    def get(*a, **k):
+        get.calls += 1
+        return reply()
+
+    get.calls = 0
+    return get
+
+
 def test_the_probe_passes_a_healthy_instance(monkeypatch):
-    monkeypatch.setattr(dsn.requests, "get", lambda *a, **k: _FakeStatus(200, _HEALTHY))
+    get = _counting(lambda: _FakeStatus(200, _HEALTHY))
+    monkeypatch.setattr(dsn.requests, "get", get)
     assert _REAL_PROBE() is None
+    assert get.calls == 1
 
 
 def test_the_probe_names_a_refusing_instance(monkeypatch):
@@ -220,8 +235,10 @@ def test_the_probe_treats_a_server_error_as_unknown_not_a_refusal(monkeypatch):
     instance — so refusal is an allow-list, not "anything that isn't 200".
     """
     for code in (500, 502, 503, 504, 406, 404):
-        monkeypatch.setattr(dsn.requests, "get", lambda *a, c=code, **k: _FakeStatus(c, "nope"))
+        get = _counting(lambda c=code: _FakeStatus(c, "nope"))
+        monkeypatch.setattr(dsn.requests, "get", get)
         assert _REAL_PROBE() is None, f"HTTP {code} must not skip the night"
+        assert get.calls == 1, f"HTTP {code} was never asked"
 
 
 def test_a_queued_slot_is_not_a_refusal(monkeypatch):
@@ -234,8 +251,10 @@ def test_a_queued_slot_is_not_a_refusal(monkeypatch):
     """
     for seconds in (5, 120, 600, 3600):
         queued = f"Slot available after: 2026-08-15T18:00:00Z, in {seconds} seconds."
-        monkeypatch.setattr(dsn.requests, "get", lambda *a, t=queued, **k: _FakeStatus(200, t))
+        get = _counting(lambda t=queued: _FakeStatus(200, t))
+        monkeypatch.setattr(dsn.requests, "get", get)
         assert _REAL_PROBE() is None
+        assert get.calls == 1
 
 
 def test_the_probe_survives_an_osmnx_internal_going_away(monkeypatch):
@@ -275,14 +294,18 @@ def test_the_probe_never_fails_a_healthy_fetch(monkeypatch):
     """Advisory only. If the probe itself cannot connect, or the format changes
     under us, we proceed and let the real request produce the real error."""
 
-    def unreachable(*a, **k):
+    def cannot_connect():
         raise requests.exceptions.ConnectionError("probe cannot connect")
 
+    unreachable = _counting(cannot_connect)
     monkeypatch.setattr(dsn.requests, "get", unreachable)
     assert _REAL_PROBE() is None
+    assert unreachable.calls == 1
 
-    monkeypatch.setattr(dsn.requests, "get", lambda *a, **k: _FakeStatus(200, "something new"))
+    changed = _counting(lambda: _FakeStatus(200, "something new"))
+    monkeypatch.setattr(dsn.requests, "get", changed)
     assert _REAL_PROBE() is None
+    assert changed.calls == 1
 
 
 class _StatusEndpoint:
@@ -368,6 +391,48 @@ def test_the_pin_is_held_for_the_get_and_gone_after_it(status_endpoint):
     assert "429" in _REAL_PROBE()
     assert status_endpoint.calls[-1]["connect_to"] == _dns_fakes.V4
     assert not dc._PIN_LOCK.locked()
+
+
+def _osmnx_query_address(url: str) -> str:
+    """Where osmnx's query to ``url`` would connect: its own ``_config_dns``
+    pin (which matches the host AS WRITTEN in the URL), then urllib3's lookup
+    (which always asks for the host lowercased)."""
+    ox._http._config_dns(url)  # patches socket.getaddrinfo; monkeypatch restores it
+    return _dns_fakes.connect_address(url)
+
+
+def test_the_fixture_sees_osmnx_miss_a_mixed_case_host(status_endpoint):
+    """Control for the next test: handed a mixed-case URL raw, osmnx's pin
+    compares ``Overpass.Example.org`` against the lowercase host urllib3 asks
+    for, never matches, and its query takes the IPv6 answer. If this ever
+    passes by pinning, osmnx fixed it and the normalization is belt-and-braces."""
+    assert _osmnx_query_address("https://Overpass.Example.org/api") == _dns_fakes.V6
+
+
+def test_a_mixed_case_mirror_is_one_client_for_the_probe_and_the_query(
+    status_endpoint, monkeypatch
+):
+    """Review of #366: `urlsplit().hostname` lowercases, osmnx's
+    `_hostname_from_url` does not. Unnormalized, a mixed-case OVERPASS_URL had
+    the pre-flight pinned to IPv4 and osmnx's query unpinned -- the #366
+    mismatch in reverse. Lowercasing where the URL is configured makes both
+    land on the same address."""
+    monkeypatch.setenv(dsn.OVERPASS_URL_ENV, "https://Overpass.Example.org/api")
+    dsn._apply_overpass_url()
+    assert ox.settings.overpass_url == "https://overpass.example.org/api"
+
+    assert _REAL_PROBE() is None
+    probe_addr = status_endpoint.calls[0]["connect_to"]
+    assert probe_addr == _osmnx_query_address(ox.settings.overpass_url) == _dns_fakes.OTHER_V4
+
+
+def test_normalizing_the_url_touches_only_the_host():
+    """Hostnames are case-insensitive; paths are not."""
+    assert (
+        dc.normalize_overpass_url("https://Overpass-API.DE:8443/API/Interp")
+        == "https://overpass-api.de:8443/API/Interp"
+    )
+    assert dc.normalize_overpass_url(dc.DEFAULT_OVERPASS_URL) == dc.DEFAULT_OVERPASS_URL
 
 
 def test_a_failed_lookup_is_cant_tell_not_refusing(status_endpoint, monkeypatch):

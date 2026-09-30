@@ -42,6 +42,7 @@ from streetscape_metadata_tracker.download_common import (
     HostBlockedError,
     _pinned_like_osmnx,
     grid_bbox,
+    normalize_overpass_url,
 )
 from streetscape_metadata_tracker.host_lock import host_lock
 from streetscape_metadata_tracker.naming import (
@@ -117,10 +118,15 @@ def _apply_overpass_url() -> None:
     the handle an operator reaches for at 03:00 during an incident, and an
     import-time read cannot be exercised by a test or changed without a
     restart. Idempotent, so calling it per fetch costs nothing.
+
+    The host is lowercased on the way in (``normalize_overpass_url``): osmnx
+    pins its query to one address only when the host urllib3 resolves --
+    always lowercase -- equals the one in this URL, so a mixed-case mirror
+    would leave the query unpinned while the pre-flight is pinned (#366).
     """
     override = os.environ.get(OVERPASS_URL_ENV)
     if override:
-        ox.settings.overpass_url = override
+        ox.settings.overpass_url = normalize_overpass_url(override)
 
 
 _apply_overpass_url()
