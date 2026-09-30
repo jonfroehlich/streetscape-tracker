@@ -411,8 +411,9 @@ def parse_args():
              --connection-limit only on the gsv arm, so this census runs at
              the DOWNLOADER's own default of 5 (not this flag's argparse
              default, which is 50, and not the scheduler's per-child share).
-             The 200 figure belongs to the Mapillary ROAD WALK, which does
-             receive the share. Requires a checkpoint to write to. Default:
+             The road walks receive that share but are clamped to their
+             provider's own 5 (#361), so their residue is 20 too. Requires a
+             checkpoint to write to. Default:
              fetch every tile.""",
     )
 
@@ -495,8 +496,9 @@ def parse_args():
              --connection-limit only on the gsv arm, so this census runs at
              the DOWNLOADER's own default of 5 (not this flag's argparse
              default, which is 50, and not the scheduler's per-child share).
-             The 200 figure belongs to the Mapillary ROAD WALK, which does
-             receive the share. Requires a checkpoint to write to. Default:
+             The road walks receive that share but are clamped to their
+             provider's own 5 (#361), so their residue is 20 too. Requires a
+             checkpoint to write to. Default:
              fetch every tile.""",
     )
 

@@ -151,6 +151,7 @@ def _setup(
         calls["checkpoint_channel"] = kwargs.get("checkpoint_channel")
         calls["checkpoint_variant"] = kwargs.get("checkpoint_variant")
         calls["max_requests"] = kwargs.get("max_requests")
+        calls["connection_limit"] = kwargs.get("connection_limit")
         policy = kwargs.get("census_cache")
         calls["cache_path"] = policy.path if policy else None
         calls["reuse_census"] = policy.reuse if policy else None
@@ -1279,8 +1280,11 @@ def test_the_budget_preflight_does_not_abort_a_free_walk_over_an_overspent_ledge
 
     A cap is a soft ceiling (#318): the tiles already in flight when it trips
     finish their retries, so a capped grid sweep ends up to
-    `connection_limit * (TILE_MAX_TRIES - 1)` -- 200 at prod's 50 -- past the
-    number it was given. The paired walk then runs against a ledger reading
+    `connection_limit * (TILE_MAX_TRIES - 1)` past the number it was given --
+    20 at the grid's 5 sockets, since `cli.py` never forwards
+    `--connection-limit` on the Mapillary arm (the walk has held the same 5
+    since #361). The 200 below is deliberately LARGER than that residue: what
+    is under test is the relaxation's shape, not the size of the overspend. The paired walk then runs against a ledger reading
     MORE than `--daily-budget`, and it is exactly the walk that costs nothing,
     because the sweep that overspent is the one that filled its census cache.
 
@@ -1296,7 +1300,8 @@ def test_the_budget_preflight_does_not_abort_a_free_walk_over_an_overspent_ledge
     bbox = grid_bbox(
         city.center_lat, city.center_lon, city.grid_width_m, city.grid_height_m, city.step_m
     )
-    # 200 over a budget of 1,750: the documented residue of one capped night.
+    # 200 over a budget of 1,750: ten times one capped night's residue at 5
+    # sockets, so the relaxation cannot pass by the overspend being small.
     db.add_api_usage(conn, date.fromisoformat(RUN_DATE), 1950, provider="mapillary_streets")
     conn.close()
 
@@ -1307,6 +1312,28 @@ def test_the_budget_preflight_does_not_abort_a_free_walk_over_an_overspent_ledge
 
     _stamp_cache_entry(census_cache_path_for("mapillary", CITY_ID, bbox))
     assert collect.run_collect(_args(data_dir, **{"daily-budget": 1750})) == 0
+
+
+def test_the_walk_holds_the_grid_channels_5_sockets_on_the_tile_cdn(tmp_path, monkeypatch):
+    """A walk with no flag reaches the census fetch at 5, and an explicit 3 at 3.
+
+    Both Mapillary channels talk to one per-IP host, and the grid census holds
+    5 sockets there because `cli.py` never forwards `--connection-limit` on its
+    Mapillary arm. Until #361 this walk defaulted to 50 -- ten times the grid,
+    on the host that has blocked this IP more than any other.
+
+    Asserted where the sockets are opened (`fetch_city_images_async`), not at
+    the table: the explicit 3 is what makes a DROPPED pass-through visible,
+    since `collect_mapillary_street_samples_async`'s own default is also 5 and
+    would otherwise satisfy the first assertion by accident.
+    """
+    data_dir, calls = _setup(tmp_path, monkeypatch, [_image("p1", 44.05, -121.30)])
+    assert collect.run_collect(_args(data_dir)) == 0
+    assert calls["connection_limit"] == collect.MAPILLARY_WALK_CONNECTION_LIMIT == 5
+
+    data_dir2, calls2 = _setup(tmp_path / "b", monkeypatch, [_image("p1", 44.05, -121.30)])
+    assert collect.run_collect(_args(data_dir2, **{"connection-limit": 3})) == 0
+    assert calls2["connection_limit"] == 3, "an operator's explicit value is honoured"
 
 
 def _stamp_cache_entry(cache_path, *, fetched_by="mapillary"):

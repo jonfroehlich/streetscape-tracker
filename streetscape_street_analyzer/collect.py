@@ -1030,10 +1030,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Max concurrent requests. Default is the provider's own: "
-            f"{GSV_WALK_CONNECTION_LIMIT} for gsv and "
-            f"{MAPILLARY_WALK_CONNECTION_LIMIT} for mapillary, "
-            f"{PANORAMAX_WALK_CONNECTION_LIMIT} for panoramax, which is what its "
-            "grid run already uses. A scheduled walk is never handed more than "
+            f"{GSV_WALK_CONNECTION_LIMIT} for gsv, "
+            f"{MAPILLARY_WALK_CONNECTION_LIMIT} for mapillary and "
+            f"{PANORAMAX_WALK_CONNECTION_LIMIT} for panoramax -- the last two are "
+            "what each one's grid run already uses on the same per-IP host. "
+            "A scheduled walk is never handed more than "
             "its provider's number; an explicit value here still wins, and is "
             "logged when it exceeds that number."
         ),

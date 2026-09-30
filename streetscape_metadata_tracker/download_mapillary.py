@@ -102,6 +102,7 @@ from .config import MAPILLARY_METADATA_DTYPES
 from .download_common import _M_PER_DEG_LAT as _M_PER_DEG_LAT
 from .download_common import (
     HOST_MAPILLARY_TILES,
+    MAPILLARY_TILE_CONNECTION_LIMIT,
     AsyncRateLimiter,
     DownloadError,
     HostBlockedError,
@@ -1193,7 +1194,7 @@ async def fetch_city_images_async(
     city_name: str,
     bbox: tuple[float, float, float, float],
     access_token: str,
-    connection_limit: int = 5,
+    connection_limit: int = MAPILLARY_TILE_CONNECTION_LIMIT,
     request_timeout: float = 30,
     max_requests_per_minute: int = DEFAULT_TILE_REQUESTS_PER_MINUTE,
     jitter: float = DEFAULT_TILE_JITTER,
@@ -1252,7 +1253,7 @@ async def _fetch_city_images(
     city_name: str,
     bbox: tuple[float, float, float, float],
     access_token: str,
-    connection_limit: int = 5,
+    connection_limit: int = MAPILLARY_TILE_CONNECTION_LIMIT,
     request_timeout: float = 30,
     max_requests_per_minute: int = DEFAULT_TILE_REQUESTS_PER_MINUTE,
     jitter: float = DEFAULT_TILE_JITTER,
@@ -1544,20 +1545,20 @@ async def _fetch_city_images(
                 # admitted here reserves its request before releasing control,
                 # so the cap is not overshot at all in the ordinary case; what
                 # remains is RETRIES BY TILES ALREADY IN FLIGHT, at most
-                # connection_limit * (TILE_MAX_TRIES - 1), and this function
-                # serves TWO callers at different socket counts, so the residue
-                # is not one number:
-                #   GRID  (cli.py): 5 sockets -> residue 20. cli.py forwards
-                #     --connection-limit only on its gsv arm, so this census
-                #     takes fetch_city_images_async's own default of 5.
-                #   WALK  (collect.py): the scheduler's per-child share, 50 in
-                #     prod -> residue 200.
-                # Neither is "the argparse default of 5" -- cli.py's
-                # --connection-limit default is 50; the 5 arrives because the
-                # argument is never forwarded. And since 2026-09-21 the walk's
-                # 50 is not [download].connection_limit (100) either: it is that
-                # value divided across lanes and clamped per child at
-                # scheduler.MAX_PER_CHILD_CONNECTION_LIMIT.
+                # connection_limit * (TILE_MAX_TRIES - 1). This function serves
+                # TWO callers, and since #361 both hold the same 5 sockets --
+                # download_common.MAPILLARY_TILE_CONNECTION_LIMIT, this
+                # module's default and the walk's ceiling at once -- so the
+                # residue is 20 on either:
+                #   GRID  (cli.py): cli.py forwards --connection-limit only on
+                #     its gsv arm, so this census takes this module's own
+                #     default. Not "the argparse default of 5" -- cli.py's
+                #     --connection-limit default is 50; the 5 arrives because
+                #     the argument is never forwarded.
+                #   WALK  (collect.py): the scheduler hands it
+                #     min(its per-child share, WALK_CONNECTION_LIMITS["mapillary"])
+                #     = min(50 in prod, 5). Until #361 that ceiling was 50, so a
+                #     capped walk could overshoot by 200.
                 #
                 # It is a soft ceiling on purpose: stopping requests already in
                 # flight would mean cancelling a paced, retrying fetch
@@ -1889,7 +1890,7 @@ async def download_mapillary_metadata_async(
     step_length: float,
     access_token: str,
     output_csv_gz_path: str,
-    connection_limit: int = 5,
+    connection_limit: int = MAPILLARY_TILE_CONNECTION_LIMIT,
     request_timeout: float = 30,
     max_requests_per_minute: int = DEFAULT_TILE_REQUESTS_PER_MINUTE,
     jitter: float = DEFAULT_TILE_JITTER,
