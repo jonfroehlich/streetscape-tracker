@@ -614,3 +614,21 @@ Re-confirm in the console if either key is rotated, and note the identification 
 Raising the knob was also gated on **resume for every provider**, because a deadline or a `systemctl stop` kills N children at once instead of 1 and a killed Mapillary child re-spent its tiles into the ceiling this file exists to defend.
 **That gate is met as of #256** (see the checkpoint section above): every channel now resumes, so the Cloud-project check is the one that remains.
 Mechanism, rollout order and the watch list: [`scheduler.md`](scheduler.md).
+
+## The GSV engine now actually reaches its configured rate (issue #304)
+
+**Added after the split.**
+Until #304 the GSV engine never got near `max_requests_per_minute`: dense cities ran at 38–52% of 48,000/min, and the #304 samples had a 63% median.
+The causes were a fresh connector per batch, a barrier after every batch, and a token bucket that discarded its own sleep overrun ([`experiments/gsv-throughput.md`](experiments/gsv-throughput.md)).
+With all three fixed, **the engine sustains the configured rate wherever Google's mean latency is under ~62 ms**, so what Google sees changes even though no configured number did:
+
+- **Per project**: a sustained ~48,000/min, where prod had achieved a median of about 30,000.
+  That is still 80% of the approved 60,000; the pacer is a ceiling, and now it binds.
+- **Per IP**: with `gsv` and `gsv_streets` in concurrent lanes (prod, since 2026-09-21), the ~96,000/min this file already described as the configured presentation is now what is actually sent, from one IP across two projects.
+  **Google documents no per-IP limit for metadata**, and the metadata docs say only that it is "available at no charge" and consumes no quota.
+  Per the READ THIS FIRST corollary, that is unknown, not unlimited.
+- **Connections**: new TLS handshakes to Google drop from ~50 per 100 requests to ~50 per run.
+- **Bursts**: the one-second start burst (800 tokens at 48,000/min) is unchanged, and so is the rule that over any interval T the bucket admits at most 800 + 800 × T requests.
+
+If the first nights after deploy show OVER_QUERY_LIMIT rows, a rise in REQUEST_FAILED, or an HTTP 403/429 from the metadata endpoint, lower `[download].max_requests_per_minute` first.
+Do not revert the connector or the pipelining: they change nothing about the rate, only how much of it is reached.

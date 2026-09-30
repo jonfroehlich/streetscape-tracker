@@ -337,6 +337,7 @@ Keep any list a doc enumerates **alphabetical**, so two branches adding an entry
   - `capture-date-precision.md`
   - `carto-basemap-key.md`
   - `grid-density.md`
+  - `gsv-throughput.md`
   - `kartaview-feasibility.md`
   - `kartaview-sweep-cost.md`
   - `kartaview-viewer-deeplink.md`

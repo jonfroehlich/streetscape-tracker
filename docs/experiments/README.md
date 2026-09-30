@@ -44,6 +44,17 @@ That is why the detection path is differential (keyed bytes vs keyless bytes) ra
 
 Issue #106 — why production stays on the 20 m grid; below ~10 m you buy redundancy, not information, since official panos sit ~10 m apart.
 
+### `gsv-throughput.md`
+
+Issue #304 — why the GSV grid run reached only 38–90% of its configured 48,000/min in production, worst on the cities with the most imagery.
+Offline: the real engine against a local HTTPS stand-in behind a latency proxy, with no Google request.
+**The client was the bottleneck, and per-OK work was not the cause**: a fresh connector per batch, a barrier after every batch, and a token bucket that zeroed away its own sleep overrun.
+Fixed, the engine holds 48,000/min wherever mean latency is under ~62 ms (50 sockets / 800 per second).
+Two things generalize.
+**(1) A coverage-dependent slowdown can be a barrier, not a per-item cost**: each batch lasts as long as its slowest response, so a slower response class sets the pace as soon as a batch contains any of it.
+**(2) A saturated limiter must be measured, not assumed to deliver its setting**: this one delivered 79–83% once nothing else bound, and was invisible for as long as something else did.
+The latency scenario that reproduces production's curve is a fit, labelled as one, never a measurement of Google.
+
 ### `kartaview-feasibility.md`
 
 Issue #225 — whether KartaView can be a third provider; it can, as a **census** like Mapillary rather than a GSV-style sample, since its only bulk path is a paginated radius sweep.
