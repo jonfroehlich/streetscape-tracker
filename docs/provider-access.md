@@ -632,8 +632,11 @@ With all three fixed, **the engine sustains the configured rate wherever Google'
 - **Bursts**: the one-second start burst (800 tokens at 48,000/min) is unchanged, and so is the rule that over any interval T the bucket admits at most 800 + 800 × T requests.
 
 **Two processes on the same key now oversubscribe its project** (PR #399 review).
+The two keys belong to two Cloud projects, both on the UW account: `gsv` (`GMAPS_API_KEY`) uses project `gsv-date-tracker`, and `gsv_streets` (`GMAPS_STREETS_API_KEY`) uses `gsv-streets-tracker`.
+**The two nightly lanes therefore cannot oversubscribe each other**: they use different keys in separate Cloud projects with independent quotas, so the hazard is only a hand run on the same key as its concurrently running nightly twin, or two hand runs.
+Each project's per-minute quota is 60,000; for `gsv-streets-tracker` that figure is the grant Google approved on 2026-09-21 (raised from 30,000), not a live limit anyone has read back independently.
 Nothing serializes GSV across processes (the host lock above deliberately skips it), and before #304 that was harmless in practice: two engines each achieving ~30,000/min sat near the quota rather than over it.
-Now each can reach 48,000/min, so any two concurrent processes on one key present ~96,000/min against a 60,000/min quota.
+Now each can reach 48,000/min, so any two concurrent processes on one key present ~96,000/min against that project's 60,000/min.
 The realistic pairs:
 
 - a hand-run `streetscape_tracker.py` (gsv) while the nightly `gsv` lane is collecting (both `GMAPS_API_KEY`);
@@ -643,6 +646,13 @@ The realistic pairs:
 What it costs is OVER_QUERY_LIMIT answers: the engine retries them after a 20 s quota-reset wait, and a run with more than 1% of points still failing after its retry passes aborts with its checkpoint kept rather than finalizing.
 **No lock is added yet; that is an open decision**, the options being a per-key cross-process lock (which would serialize a hand run behind a multi-hour night), a shared cross-process pacer, or halving the per-process rate while two could overlap.
 Until it is decided: do not start a same-key GSV run while the nightly batch is collecting (check `pgrep -f "scheduler run-due"` or the unit status), or lower `--max-requests-per-minute` on the hand run so the two sum under the quota.
+
+**`api_requests` counts one per point per pass, not one per HTTP attempt** (PR #399 review).
+The engine adds a batch's points to `api_requests` when it schedules the batch, and the retry passes re-count only the points they re-request.
+But `fetch_gsv_pano_metadata_async` carries a `backoff` decorator (up to 3 tries on a timeout or a client error), and those INNER retries reach the server without touching the counter.
+On genuine timeouts, then, the ledger undercounts what Google received: the review measured up to 3× (every attempt timing out) against a local server at 6 s latency with a 5 s request timeout (production's GSV default is 30 s, so this needs a far slower Google than any night has shown).
+This predates #304 and is not a regression; #304's in-flight semaphore removes the one way pipelining could have manufactured such timeouts (a queued request timing out while it waited for a socket), and `tests/test_gsv_pipelined_collect.py` pins that no backoff retry reaches the server when the server itself is fast.
+Pacing stays correct regardless, because every attempt, inner retries included, takes its own token from the limiter; what can drift is only the `api_usage` ledger and `runs.api_requests`, which read as a floor on a night with many timeouts.
 
 If the first nights after deploy show OVER_QUERY_LIMIT rows, a rise in REQUEST_FAILED, or an HTTP 403/429 from the metadata endpoint, lower `[download].max_requests_per_minute` first.
 Do not revert the connector or the pipelining: they change nothing about the rate, only how much of it is reached.
