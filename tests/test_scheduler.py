@@ -3102,6 +3102,22 @@ def test_a_resumer_the_floor_cut_has_not_served_its_kind(conn, monkeypatch):
     assert _stranded_head_kinds(conn, by_kind, max_opt_in=3) == {0, 1, 2}
 
 
+def test_below_the_kind_count_served_kinds_have_had_their_turn_and_the_rest_fill_in_order(
+    conn, monkeypatch
+):
+    """The documented limitation at max_opt_in < G, pinned rather than only described.
+
+    Three non-empty kinds and max_opt_in = 2: the floor takes the one kind-2
+    resumer, which is kind 2's turn, and the single slot left goes to the
+    lowest-numbered UNSERVED kind, 0. Kind 1 waits this night -- nothing carries
+    state between nights to rotate which kind that is (#393 scopes it out).
+    """
+    by_kind = _stranded_kind_slate(
+        conn, monkeypatch, sizes={0: 3, 1: 3, 2: 3}, resumers_per_kind={2: 1}
+    )
+    assert _stranded_head_kinds(conn, by_kind, max_opt_in=2) == {0, 2}
+
+
 def _kind_resumer_cases():
     """Every non-empty kind subset x every resumer-kind subset of it x 1-2
     resumers per resumer kind: 63 cases."""
