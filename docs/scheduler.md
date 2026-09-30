@@ -357,8 +357,9 @@ The clamp puts it back at 50 and logs that it did; nothing else needs editing in
 **`[download].connection_limit` is divided across lanes, not handed to each child whole.**
 The resource guard reads host-wide pressure and only ever *lowers* its answer, but it is consulted once per child from a sample taken before that child's siblings have ramped — so at N lanes each child reads a quiet box and each takes the full limit, and the guard structurally cannot see the load it is about to permit.
 Only four channels carry the number at all: the `gsv` grid, the `gsv` road walk, the Mapillary road walk and — since #335 — the Panoramax road walk.
-(That fourth one is why #358 exists: it was taking the scheduler's 50 against a volunteer-run host whose own grid channel runs at 5.)
-The Mapillary **grid** never receives it (`cli.py` omits the argument, so `fetch_city_images_async`'s own default of 5 applies), so the arithmetic is 50 + 50 + 5 at knob 3 rather than 150.
+The two census walks then clamp it to their provider's own ceiling of 5 (Panoramax since #358, which exists because that walk was taking the scheduler's 50 against a volunteer-run host whose own grid runs at 5; Mapillary since #361, for the same asymmetry on the tile CDN).
+The Mapillary and Panoramax **grids** never receive it (`cli.py` omits the argument, so each downloader's own default of 5 applies).
+So the only children the share actually sizes are the two GSV ones: at knob 3 each gets `100 // 3 = 33`, and every census child stays at 5.
 Combined with affinity, the only overlapping pair that points two full-size connectors at one third party is `gsv` + `gsv_streets` — both Google — which is 100 concurrent sockets on the same endpoints gate (2) below is already about.
 Dividing makes the knob a no-op at 1 and bounded above it; the trade is that a city with a single enabled channel gets the divided share too, so **raise `connection_limit` deliberately when you raise the knob** rather than discovering the multiplication in production.
 Since 2026-09-21 the divided share is additionally clamped at `MAX_PER_CHILD_CONNECTION_LIMIT` (50, the figure the systemd unit was sized against), which is what makes *lowering* the knob safe on its own — without it, division turns a knob drop into a per-child socket raise.

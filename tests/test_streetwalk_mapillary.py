@@ -65,7 +65,7 @@ from tests.conftest import (
     EVENING_UTC_DATE,
     stamp_census_cache,
 )
-from tests.test_mapillary import _stub_fetch_tile, encode_tile
+from tests.test_mapillary import _in_flight_tracker, _stub_fetch_tile, encode_tile
 
 # ~222 m north-south edge, plus a short spur — same geometry as the GSV test.
 LONG_EDGE = LineString([(-121.30, 44.05), (-121.30, 44.052)])
@@ -1322,10 +1322,12 @@ def test_the_walk_holds_the_grid_channels_5_sockets_on_the_tile_cdn(tmp_path, mo
     Mapillary arm. Until #361 this walk defaulted to 50 -- ten times the grid,
     on the host that has blocked this IP more than any other.
 
-    Asserted where the sockets are opened (`fetch_city_images_async`), not at
+    Asserted at the call into `fetch_city_images_async` (a stub here), not at
     the table: the explicit 3 is what makes a DROPPED pass-through visible,
     since `collect_mapillary_street_samples_async`'s own default is also 5 and
-    would otherwise satisfy the first assertion by accident.
+    would otherwise satisfy the first assertion by accident. Where the sockets
+    are actually opened -- the semaphore -- is measured by
+    `test_the_walk_census_opens_at_most_its_socket_count_at_once` below.
     """
     data_dir, calls = _setup(tmp_path, monkeypatch, [_image("p1", 44.05, -121.30)])
     assert collect.run_collect(_args(data_dir)) == 0
@@ -1334,6 +1336,29 @@ def test_the_walk_holds_the_grid_channels_5_sockets_on_the_tile_cdn(tmp_path, mo
     data_dir2, calls2 = _setup(tmp_path / "b", monkeypatch, [_image("p1", 44.05, -121.30)])
     assert collect.run_collect(_args(data_dir2, **{"connection-limit": 3})) == 0
     assert calls2["connection_limit"] == 3, "an operator's explicit value is honoured"
+
+
+@pytest.mark.parametrize("explicit", [None, 3])
+def test_the_walk_census_opens_at_most_its_socket_count_at_once(tmp_path, monkeypatch, explicit):
+    """The walk's real census fetch peaks at 5 tiles in flight, or at an explicit 3.
+
+    The companion to the grid's `test_the_grid_census_opens_at_most_its_socket_count_at_once`:
+    the whole walk path runs for real (`run_collect` -> `collect_mapillary` ->
+    `fetch_city_images_async` -> the semaphore) with only the tile fetch
+    stubbed, so a constant semaphore or a pass-through dropped anywhere along
+    that chain changes the measured peak rather than a recorded kwarg.
+    """
+    grid_m = 8_000
+    data_dir, _ = _setup(tmp_path, monkeypatch, [], grid_m=grid_m, stub_fetch=False)
+    bbox = grid_bbox(44.05, -121.30, grid_m, grid_m, 20)
+    assert len(dm.tiles_for_bbox(*bbox)) > 20, "the bbox must oversubscribe the pool"
+
+    fetch, peak = _in_flight_tracker()
+    _stub_fetch_tile(monkeypatch, fetch)
+    overrides = {} if explicit is None else {"connection-limit": explicit}
+    assert collect.run_collect(_args(data_dir, **overrides)) == 0
+    assert peak[0] == (collect.MAPILLARY_WALK_CONNECTION_LIMIT if explicit is None else explicit)
+    assert collect.MAPILLARY_WALK_CONNECTION_LIMIT == 5
 
 
 def _stamp_cache_entry(cache_path, *, fetched_by="mapillary"):

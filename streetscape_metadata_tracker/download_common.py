@@ -108,15 +108,19 @@ HOST_LABELS = {
 # Mapillary is 5 for the same reason (#361), and it is ONE number for both of
 # its channels, defined once below as MAPILLARY_TILE_CONNECTION_LIMIT: the grid
 # arm in `cli.py` forwards no `--connection-limit` either, so the grid census
-# runs at `fetch_city_images_async`'s default -- which IS that constant -- and
+# runs at the Mapillary downloader's default -- which IS that constant -- and
 # the walk's ceiling is the same constant, so the two cannot drift apart again.
 # Until #361 the walk held 50 here, on a rationale ("prod configures 50 for the
 # grid over the same CDN") that `cli.py` never made true: the grid was at 5 the
 # whole time, and the walk held ten times its sockets on a per-IP host that has
-# blocked this IP four times (block 4: 2026-09-28, #385). Why 5 is enough: the pacer is FIFO at 40/min, so
-# requests in flight ~= 0.67/s x mean tile latency, and 5 slots keep the paced
-# rate while latency stays under ~7.5 s -- and the grid census has run every
-# night at 5 against the same pacer. Slots past 5 are only ever occupied
+# blocked this IP four times (block 4: 2026-09-28, #385).
+#
+# Why 5 is enough: the pacer is FIFO at 40/min, so requests in flight ~= 0.67/s
+# x mean tile latency, and the grid census has run every night at 5 against the
+# same pacer. With latency that varies, 5 slots lose nothing while mean latency
+# is low and degrade gradually as it grows; the deadline is at risk only well
+# above that, which is the exposure the grid has always carried (reasoned, and
+# simulated at review time -- not measured). Slots past 5 are only ever occupied
 # when the host is SLOW (a slot is also held through a retry's backoff sleep),
 # which is exactly when backpressure is wanted rather than more sockets. It
 # also bounds the two residues downstream of this number: retries past a

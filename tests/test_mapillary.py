@@ -514,6 +514,75 @@ def _run_download(
     return result, served
 
 
+def _in_flight_tracker():
+    """A tile fetcher that records the peak number of calls in flight at once.
+
+    It awaits between entering and leaving, so every task the semaphore admits
+    is suspended inside it together; the peak is therefore the semaphore's
+    size whenever the bbox holds more tiles than that. Returns the fetch and
+    the one-element list the peak lands in.
+    """
+    state = {"now": 0}
+    peak = [0]
+
+    async def fetch(session, url, timeout):
+        m = re.search(r"/2/14/(\d+)/(\d+)\?access_token=", url)
+        assert m, f"unexpected tile URL: {url}"
+        state["now"] += 1
+        peak[0] = max(peak[0], state["now"])
+        try:
+            await asyncio.sleep(0.005)
+        finally:
+            state["now"] -= 1
+        return encode_tile([], int(m.group(1)), int(m.group(2)))
+
+    return fetch, peak
+
+
+# A city large enough to hold many more z14 tiles than any socket count under
+# test, with a coarse step so the grid itself stays small.
+_WIDE_M, _WIDE_STEP = 12_000, 400
+
+
+@pytest.mark.parametrize("explicit", [None, 3])
+def test_the_grid_census_opens_at_most_its_socket_count_at_once(monkeypatch, tmp_path, explicit):
+    """What bounds the sockets is the SEMAPHORE, so that is what is measured (#361).
+
+    Every other connection-limit test reads a number off a signature or a
+    kwargs dict; none of them could see `asyncio.Semaphore(connection_limit)`
+    replaced by a constant, or the value dropped between
+    `download_mapillary_metadata_async` and the function that opens the pool.
+    This drives the grid's own entry point with NO connection_limit -- exactly
+    how `cli.py` calls it -- and asserts the peak in flight is the shared
+    `MAPILLARY_TILE_CONNECTION_LIMIT`, then that an explicit 3 peaks at 3.
+    """
+    from streetscape_metadata_tracker.download_common import MAPILLARY_TILE_CONNECTION_LIMIT
+
+    lat, lon = SEATTLE
+    tiles = dm.tiles_for_bbox(*dm.grid_bbox(lat, lon, _WIDE_M, _WIDE_M, _WIDE_STEP))
+    assert len(tiles) > 4 * MAPILLARY_TILE_CONNECTION_LIMIT, "the bbox must oversubscribe the pool"
+
+    fetch, peak = _in_flight_tracker()
+    _stub_fetch_tile(monkeypatch, fetch)
+    kwargs = {} if explicit is None else {"connection_limit": explicit}
+    asyncio.run(
+        dm.download_mapillary_metadata_async(
+            "Wide City",
+            lat,
+            lon,
+            _WIDE_M,
+            _WIDE_M,
+            _WIDE_STEP,
+            "MLY|test|token",
+            str(tmp_path / "wide_mapillary.csv.gz"),
+            **kwargs,
+        )
+    )
+    expected = MAPILLARY_TILE_CONNECTION_LIMIT if explicit is None else explicit
+    assert MAPILLARY_TILE_CONNECTION_LIMIT == 5
+    assert peak[0] == expected
+
+
 def test_download_end_to_end(monkeypatch, tmp_path, straddling_city):
     lat, lon = straddling_city
     step = 20

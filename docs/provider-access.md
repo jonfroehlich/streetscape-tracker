@@ -200,7 +200,7 @@ The census now resumes for its **missing tiles only**, through the same `checkpo
 
 Three things this deliberately does **not** change.
 Resume is strictly **next-invocation**: no in-process retry is added anywhere, because the forum-reported hazard that retrying during a block extends it stands untested in either direction and is not worth testing with production credentials.
-Pacing is untouched at 60/min, and so are both daily budgets — a resumed night is *cheaper*, never faster.
+Pacing is untouched — both Mapillary channels run at the 40/min `config/scheduler.makelab1.toml` sets (the module default, `DEFAULT_TILE_REQUESTS_PER_MINUTE`, is 60) — and so are both daily budgets: a resumed night is *cheaper*, never faster.
 That still holds after #318, and it is the sentence to read before worrying about the traffic shape a request cap produces: across nights, a city split over two is paid for once instead of re-paid.
 What a cap does **not** give is an exact ceiling on the day.
 It is a soft one: a capped crawl may end the night up to `connection_limit × (TILE_MAX_TRIES − 1)` requests over its budget, because tiles already in flight when the cap trips are allowed to finish their retries rather than being cancelled mid-attempt.
@@ -228,15 +228,18 @@ What is known, in the tiers this file keeps apart:
 - **Documented.** The [API documentation](https://www.mapillary.com/developer/api-documentation) limits tiles to 50,000 per day per app, "(not per minute)".
   It says nothing about concurrent connections.
 - **Reported.** A staff reply in [thread 10644](https://forum.mapillary.com/t/50-000-requests-day-rate-limit-scope/10644) (2026-08-24) says an IP-level layer "might block you earlier" on "a sudden spike".
-  [Thread 5821](https://forum.mapillary.com/t/inconsistent-authentication-issues/5821) reports the blocks as per-IP and that "retrying seemed to extend the block"; [thread 8336](https://forum.mapillary.com/t/receiving-html-response-instead-of-json/8336) reports the HTML page on a 200 that clears in ~24 h.
+  In [thread 5821](https://forum.mapillary.com/t/inconsistent-authentication-issues/5821) a **user**, not staff, reports the blocks as per-IP and that "retrying seemed to extend the block".
+  In [thread 8336](https://forum.mapillary.com/t/receiving-html-response-instead-of-json/8336) the HTML page on a 200 is described, and **staff says** "Rate limits reset every 24 hours" — a statement of policy, not an observed duration.
   **No thread found discusses concurrent connections to the tile CDN**, so concurrency is UNKNOWN, not known-safe.
-- **Ours, correlation only.** Block 4 (2026-09-28 02:27 PDT, recorded with #385) hit the grid channel ~24.5 h after a 1,444-request `mapillary_streets` catch-up that ran at 50 sockets.
+- **Ours, correlation only.** Block 4 (2026-09-28 02:27 PDT, recorded with #385) hit the grid channel ~8.5 h after a 1,444-request `mapillary_streets` catch-up (17:05–17:55 PDT on 09-27) that ran at 50 sockets; ~4,600 tile requests fell in the ~24.5 h before the block.
   Nothing isolates the socket count as a cause — that catch-up also stacked volume on the first 80-city night — and concurrency has never been a variable in the block series at all.
 
 **Why 5 costs no throughput while the host is healthy.**
-The pacer is FIFO at 40/min, so the number of requests in flight is roughly 0.67/s × mean tile latency: 5 slots keep the paced rate while latency stays under ~7.5 s, and the grid census has run every night at 5 against the same pacer.
+The pacer is FIFO at 40/min, so the number of requests in flight is roughly 0.67/s × mean tile latency, and the grid census has run every night at 5 against the same pacer.
+With latency that varies rather than stays constant, 5 slots lose nothing while mean latency is low and degrade gradually as it grows; a deadline is at risk only at mean latencies well above that, which is the exposure the grid has always carried.
 Slots above 5 are occupied only when the host is SLOW — and a slot is also held through a retry's backoff sleep — which is exactly when backpressure is wanted rather than more sockets.
-That is the reasoning, not a measurement: reading prod's collect logs to confirm the grid reaches its paced rate at 5 is the follow-up that would turn it into one.
+That is reasoning, not a measurement, and it is deliberately left qualitative here: the thresholds come from a review-time simulation of `_acquire_spaced` that is not committed.
+Two follow-ups would turn it into evidence: committing that simulation under `docs/experiments/` with its metrics JSON, and reading prod's collect logs to confirm the grid reaches its paced rate at 5.
 
 **Two residues fall with it.**
 Retries past a request cap are bounded by `connection_limit × (TILE_MAX_TRIES − 1)`: 20 at 5, where the walk's 50 allowed 200.
