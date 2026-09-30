@@ -7,8 +7,10 @@ run writes. These tests pin the three halves of that: the written CSV is
 byte-identical to what the sequential engine wrote (golden fixture, with
 requests completing out of order and a retry pass), one session serves the
 whole run, and batch k+1 is on the wire while batch k is still outstanding.
-No network: the fetch primitive is monkeypatched, as in
-tests/test_download_gsv_batch.py.
+The PR's review added what pipelining must not break one level out: a queued
+request's timeout, the failure-path spend, and the run lock under a second
+cancel. No Google traffic: the fetch primitive is monkeypatched, as in
+tests/test_download_gsv_batch.py (one test serves it from a local server).
 """
 
 import asyncio
@@ -149,8 +151,8 @@ def test_written_csv_is_byte_identical_to_the_sequential_engine(
 
 def test_one_session_serves_the_whole_run(tmp_path, monkeypatch, instant_pass_sleep):
     """A fresh ClientSession per batch re-handshook TLS on every socket every
-    batch (10,000 connects per 20,000 requests measured); one must serve every
-    batch AND the retry passes, and be closed at the end."""
+    batch (6,000 connects per 12,000 requests, docs/experiments/gsv-throughput.md);
+    one must serve every batch AND the retry passes, and be closed at the end."""
     made = []
 
     class CountingSession(aiohttp.ClientSession):
@@ -229,12 +231,113 @@ def test_a_write_failure_cancels_the_batches_fetched_ahead(tmp_path, monkeypatch
     out = str(tmp_path / "fail_width_40_height_40_step_20_2026-09-30.csv.gz")
 
     async def run():
-        with pytest.raises(DownloadError):
+        with pytest.raises(DownloadError) as failure:
             await dg.collect_points_async(
                 points, "K", out, batch_size=5, connection_limit=5, max_requests_per_minute=0
             )
-        return [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+        leftover = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+        return leftover, failure.value
 
-    leftover = asyncio.run(run())
+    leftover, error = asyncio.run(run())
     assert leftover == []
     assert len(completed) == 10  # batches 0 and 1 only
+    # The spend the caller records in api_usage: batches 0-3 are scheduled up
+    # front, batch 4 after batch 0's write, then batch 1's write fails. Counting
+    # at write time instead would report 5 or 10, and under-charge the ledger.
+    assert error.api_requests == 25
+
+
+def test_a_queued_request_does_not_time_out_waiting_for_a_socket(tmp_path, monkeypatch):
+    """#304 review: aiohttp's ClientTimeout(total=...) includes the wait for a
+    pooled connection. Pipelining queues PIPELINE_DEPTH x batch_size requests
+    (40 here) on connection_limit sockets (5), so without the engine's slots
+    the tail of the queue waits ~7 latencies for a socket and times out at
+    1.0 s against a 0.2 s server -- where the sequential engine's queue of one
+    batch (10 on 5) never did. Each such timeout is also a backoff retry that
+    reaches the server uncounted.
+
+    A real local HTTP server and the engine's real ClientSession; the fetch has
+    the production one's shape (same backoff decorator, same session.get with
+    the engine's timeout) pointed at localhost, since the production URL is
+    hard-coded to Google.
+    """
+    import backoff
+    from aiohttp import web
+
+    arrivals = []
+    port = {}
+
+    async def meta(_request):
+        arrivals.append(1)
+        await _REAL_SLEEP(0.2)
+        return web.json_response({"status": "ZERO_RESULTS"})
+
+    @backoff.on_exception(
+        backoff.expo, (asyncio.TimeoutError, aiohttp.ClientError), max_tries=3, max_time=60
+    )
+    async def local_fetch(lat, lon, api_key, session, timeout, limiter=None):
+        url = f"http://127.0.0.1:{port['n']}/m?location={lat},{lon}"
+        async with session.get(url, timeout=timeout) as response:
+            return await response.json()
+
+    monkeypatch.setattr(dg, "fetch_gsv_pano_metadata_async", local_fetch)
+    points = _points(40)
+    out = str(tmp_path / "queue_width_40_height_40_step_20_2026-09-30.csv.gz")
+
+    async def run():
+        app = web.Application()
+        app.router.add_get("/m", meta)
+        runner = web.AppRunner(app, access_log=None)
+        await runner.setup()
+        await web.TCPSite(runner, "127.0.0.1", 0).start()
+        port["n"] = runner.addresses[0][1]
+        try:
+            return await dg.collect_points_async(
+                points,
+                "K",
+                out,
+                batch_size=10,
+                connection_limit=5,
+                request_timeout=1.0,
+                max_retries=1,
+                max_requests_per_minute=0,
+            )
+        finally:
+            await runner.cleanup()
+
+    result = asyncio.run(run())
+    assert (result["df"]["status"] == "ZERO_RESULTS").all()
+    assert len(arrivals) == 40  # no backoff retry reached the server
+    assert result["api_requests"] == 40
+
+
+def test_a_second_cancel_during_close_does_not_leak_the_run_lock(tmp_path, monkeypatch):
+    """#304 review: a cancellation delivered while the session was closing
+    skipped ``run_lock.release()``, holding the run lock for the rest of the
+    process's life, so a retry in the same process was refused as "another
+    process is already collecting". close() raising CancelledError stands in
+    for that second cancel."""
+    from filelock import FileLock
+
+    class CancelledOnClose(aiohttp.ClientSession):
+        async def close(self):
+            await super().close()
+            raise asyncio.CancelledError
+
+    async def zero_fetch(lat, lon, api_key, session, timeout, limiter=None):
+        return {"status": "ZERO_RESULTS"}
+
+    monkeypatch.setattr(dg.aiohttp, "ClientSession", CancelledOnClose)
+    monkeypatch.setattr(dg, "fetch_gsv_pano_metadata_async", zero_fetch)
+    out = str(tmp_path / "lock_width_40_height_40_step_20_2026-09-30.csv.gz")
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            dg.collect_points_async(
+                _points(10), "K", out, batch_size=5, connection_limit=5, max_requests_per_minute=0
+            )
+        )
+
+    lock = FileLock(out[: -len(".gz")] + ".downloading.runlock", timeout=0)
+    lock.acquire()  # raises filelock.Timeout if the run lock leaked
+    lock.release()

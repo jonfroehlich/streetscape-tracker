@@ -175,12 +175,28 @@ async def _fetch_batch_async(
     session: aiohttp.ClientSession,
     timeout: aiohttp.ClientTimeout,
     limiter: AsyncRateLimiter | None,
+    slots: asyncio.Semaphore,
 ) -> list[Any]:
-    """Issue one batch's requests; each entry is a response dict or an exception."""
-    tasks = [
-        fetch_gsv_pano_metadata_async(lat, lon, api_key, session, timeout, limiter)
-        for lat, lon, _i, _j in points
-    ]
+    """
+    Issue one batch's requests; each entry is a response dict or an exception.
+
+    Every request, backoff retries included, runs while holding one of
+    ``slots`` -- a semaphore sized to ``connection_limit`` -- so at most
+    ``connection_limit`` requests are ever inside ``session.get`` and none of
+    them waits for a pooled socket. That matters because aiohttp's
+    ``ClientTimeout(total=...)`` counts the pool wait: with PIPELINE_DEPTH x
+    batch_size requests queued on connection_limit sockets (400 on 50 in prod),
+    the tail of the queue would time out at a quarter of the latency the old
+    one-batch queue (100 on 50) could absorb, and each spurious timeout is a
+    retry that takes a token and reaches the server (#304 review). With the
+    slots the timeout clock only runs while a socket is held.
+    """
+
+    async def one(lat: float, lon: float) -> dict[str, Any]:
+        async with slots:
+            return await fetch_gsv_pano_metadata_async(lat, lon, api_key, session, timeout, limiter)
+
+    tasks = [one(lat, lon) for lat, lon, _i, _j in points]
     return await asyncio.gather(*tasks, return_exceptions=True)
 
 
@@ -563,9 +579,12 @@ async def collect_points_async(
 
             # ONE connector for the whole run, initial and retry passes alike
             # (#304). It used to be built per batch, which re-handshook TLS on
-            # every socket every batch: 50 new connections per 100 requests,
-            # measured 10,000 connects for 20,000 requests.
+            # every socket every batch: 50 new connections per 100 requests
+            # (docs/experiments/gsv-throughput.md, the cpu-ceiling cell).
             session = aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=connection_limit))
+            # In-flight requests are bounded by these slots, not by the pool:
+            # see _fetch_batch_async for why the pool must never queue.
+            slots = asyncio.Semaphore(connection_limit)
 
             async def run_pass(pass_points: list[tuple[float, float, int, int]]) -> None:
                 """
@@ -597,7 +616,9 @@ async def collect_points_async(
                         batch_points = pass_points[i : i + batch_size]
                         api_requests += len(batch_points)
                         fut = asyncio.ensure_future(
-                            _fetch_batch_async(batch_points, api_key, session, timeout, limiter)
+                            _fetch_batch_async(
+                                batch_points, api_key, session, timeout, limiter, slots
+                            )
                         )
                         inflight.append((batch_points, fut))
                         if len(inflight) >= PIPELINE_DEPTH:
@@ -729,6 +750,11 @@ async def collect_points_async(
         error.api_requests = api_requests
         raise error from e
     finally:
-        if session is not None:
-            await session.close()
-        run_lock.release()
+        # try/finally, not two statements: a second cancellation delivered while
+        # close() awaits would otherwise skip the release and leak the run lock
+        # for the life of this process (#304 review).
+        try:
+            if session is not None:
+                await session.close()
+        finally:
+            run_lock.release()
