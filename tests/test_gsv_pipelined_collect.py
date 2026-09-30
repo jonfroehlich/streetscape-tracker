@@ -313,10 +313,16 @@ def test_a_queued_request_does_not_time_out_waiting_for_a_socket(tmp_path, monke
 
 def test_a_second_cancel_during_close_does_not_leak_the_run_lock(tmp_path, monkeypatch):
     """#304 review: a cancellation delivered while the session was closing
-    skipped ``run_lock.release()``, holding the run lock for the rest of the
-    process's life, so a retry in the same process was refused as "another
-    process is already collecting". close() raising CancelledError stands in
-    for that second cancel."""
+    skipped ``run_lock.release()``, holding the run lock for as long as the
+    exception's traceback stayed referenced, so a retry in the same process
+    that still held the error was refused as "another process is already
+    collecting". close() raising CancelledError stands in for that second
+    cancel.
+
+    The excinfo is held ACROSS the lock check on purpose: filelock releases
+    on garbage collection, so letting the exception go first would release a
+    leaked lock and pass against the unguarded code (measured: reverting the
+    try/finally passed until the excinfo was held)."""
     from filelock import FileLock
 
     class CancelledOnClose(aiohttp.ClientSession):
@@ -331,7 +337,7 @@ def test_a_second_cancel_during_close_does_not_leak_the_run_lock(tmp_path, monke
     monkeypatch.setattr(dg, "fetch_gsv_pano_metadata_async", zero_fetch)
     out = str(tmp_path / "lock_width_40_height_40_step_20_2026-09-30.csv.gz")
 
-    with pytest.raises(asyncio.CancelledError):
+    with pytest.raises(asyncio.CancelledError) as held:
         asyncio.run(
             dg.collect_points_async(
                 _points(10), "K", out, batch_size=5, connection_limit=5, max_requests_per_minute=0
@@ -340,4 +346,54 @@ def test_a_second_cancel_during_close_does_not_leak_the_run_lock(tmp_path, monke
 
     lock = FileLock(out[: -len(".gz")] + ".downloading.runlock", timeout=0)
     lock.acquire()  # raises filelock.Timeout if the run lock leaked
+    lock.release()
+    assert held.value is not None  # keeps the traceback (and any leaked lock) alive to here
+
+
+def test_a_close_failure_does_not_mask_the_download_error_or_its_spend(
+    tmp_path, monkeypatch, caplog
+):
+    """#304 review: if session.close() raised in the ``finally`` while a
+    DownloadError was propagating, the close error replaced it and the caller
+    lost ``api_requests``, the spend it records in the api_usage ledger. The
+    close error is logged instead, and the run lock is still released."""
+    import logging
+
+    from filelock import FileLock
+
+    class FailingClose(aiohttp.ClientSession):
+        async def close(self):
+            await super().close()
+            raise RuntimeError("simulated close failure")
+
+    async def zero_fetch(lat, lon, api_key, session, timeout, limiter=None):
+        return {"status": "ZERO_RESULTS"}
+
+    async def failing_process(*a, **kw):
+        raise DownloadError("simulated write failure")
+
+    monkeypatch.setattr(dg.aiohttp, "ClientSession", FailingClose)
+    monkeypatch.setattr(dg, "fetch_gsv_pano_metadata_async", zero_fetch)
+    monkeypatch.setattr(dg, "process_batch_async", failing_process)
+    out = str(tmp_path / "close_width_40_height_40_step_20_2026-09-30.csv.gz")
+
+    with caplog.at_level(logging.WARNING, logger=dg.logger.name):
+        with pytest.raises(DownloadError) as held:
+            asyncio.run(
+                dg.collect_points_async(
+                    _points(20),
+                    "K",
+                    out,
+                    batch_size=5,
+                    connection_limit=5,
+                    max_requests_per_minute=0,
+                )
+            )
+
+    # Four batches of five are scheduled before the first write fails.
+    assert held.value.api_requests == 20
+    assert "simulated write failure" in str(held.value)
+    assert "simulated close failure" in caplog.text
+    lock = FileLock(out[: -len(".gz")] + ".downloading.runlock", timeout=0)
+    lock.acquire()
     lock.release()

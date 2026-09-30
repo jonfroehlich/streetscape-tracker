@@ -767,9 +767,22 @@ async def collect_points_async(
     finally:
         # try/finally, not two statements: a second cancellation delivered while
         # close() awaits would otherwise skip the release and leak the run lock
-        # for the life of this process (#304 review).
+        # for as long as that exception's traceback stays referenced (filelock
+        # releases on garbage collection, so a caller holding the error -- a
+        # retry loop, a pytest excinfo -- keeps the lock held) (#304 review).
         try:
             if session is not None:
-                await session.close()
+                try:
+                    await session.close()
+                except Exception as close_error:
+                    # Logged, never raised: raising here would replace an
+                    # in-flight DownloadError, and with it the api_requests the
+                    # caller records as spend (#304 review). The run itself is
+                    # already written or already failed; a close error changes
+                    # neither. CancelledError is not an Exception and still
+                    # propagates.
+                    logger.warning(
+                        f"Closing the GSV session failed: {redact_credentials(close_error)}"
+                    )
         finally:
             run_lock.release()
