@@ -40,7 +40,8 @@ depth4-oldpacer  this checkout's engine at depth 4 with the token bucket's
               pre-#304 ``acquire`` patched back in, to attribute the pacer fix.
 
 Every arm runs ``--reps`` times per (scenario, coverage) cell, interleaved, and
-the JSON reports each cell's median and range.
+the JSON summarizes each cell with ``experiment_stats.describe``.
+A dirty tracked tree is refused unless ``--allow-dirty``, and recorded either way.
 """
 
 from __future__ import annotations
@@ -55,7 +56,6 @@ import random
 import resource
 import socket
 import ssl
-import statistics
 import subprocess
 import sys
 import tempfile
@@ -64,6 +64,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from experiment_stats import describe  # noqa: E402
+
 RAW_DIR = REPO / "experiments" / "gsv-throughput"
 
 # (name, zero_results mean ms, ok mean ms). Lognormal sigma 0.5 for both.
@@ -334,16 +338,106 @@ def _extract_baseline(ref: str) -> Path:
     return dest
 
 
-def _summarize(records: list[dict], key: str) -> dict | None:
-    values = [r[key] for r in records if r.get(key) is not None]
-    if not values:  # e.g. a cpu-ceiling run shorter than the warmup window
-        return None
-    return {
-        "median": statistics.median(values),
-        "min": min(values),
-        "max": max(values),
-        "n": len(values),
+# The fields each cell summarizes, and the resolution each is rounded to.
+_CELL_FIELDS = {
+    "steady_req_per_min": 0,
+    "whole_run_req_per_min": 0,
+    "cpu_ms_per_request": 4,
+    "client_connects": 0,
+    "peak_rss_mb": 1,
+}
+
+# The selection rule behind the writeup's "the old bucket delivered X-Y where
+# it bound": the cells where the FIXED depth-4 engine sits on the configured
+# rate (steady p50 within +/- LIMITER_BAND of 48,000), i.e. where the limiter,
+# not sockets or a refill burst, is the binding constraint. Written down here so
+# the range is recomputable from the committed cells instead of hand-picked.
+CONFIGURED_RATE = 48000
+LIMITER_BAND = 0.005
+
+
+def summarize_cells(records: list[dict]) -> list[dict]:
+    """One entry per (scenario, coverage, arm) present in ``records``, each
+    field summarized by ``experiment_stats.describe`` (n, min, p25..p95, max),
+    so this study quotes the same percentiles as every other writeup.
+
+    A field with no values (a cpu-ceiling run shorter than the warmup window has
+    no steady rate) is carried as ``{"n": 0}``, describe's empty result.
+    """
+    keys: list[tuple] = []
+    for r in records:
+        k = (r["scenario"], r["coverage"], r["arm"])
+        if k not in keys:
+            keys.append(k)
+    cells = []
+    for scenario, cov, arm in keys:
+        recs = [
+            r for r in records if (r["scenario"], r["coverage"], r["arm"]) == (scenario, cov, arm)
+        ]
+        cell = {
+            "scenario": scenario,
+            "coverage": cov,
+            "arm": arm,
+            "zero_ms": recs[0]["zero_ms"],
+            "ok_ms": recs[0]["ok_ms"],
+        }
+        for field, digits in _CELL_FIELDS.items():
+            values = [r[field] for r in recs if r.get(field) is not None]
+            cell[field] = describe(values, digits=digits)
+        cells.append(cell)
+    return cells
+
+
+def limiter_bound_summary(cells: list[dict]) -> dict:
+    """Where the limiter binds (see LIMITER_BAND), what each pacer delivered.
+
+    Returns the rule, the selected (scenario, coverage) cells, and the range of
+    steady p50s for the fixed ``depth4`` arm and the ``depth4-oldpacer`` arm
+    over exactly those cells, with the old bucket's range as a fraction of the
+    configured rate.
+    """
+    lo, hi = CONFIGURED_RATE * (1 - LIMITER_BAND), CONFIGURED_RATE * (1 + LIMITER_BAND)
+    by_key = {(c["scenario"], c["coverage"], c["arm"]): c for c in cells}
+    selected = []
+    for (scenario, cov, arm), cell in by_key.items():
+        steady = cell["steady_req_per_min"]
+        if arm == "depth4" and steady.get("n") and lo <= steady["p50"] <= hi:
+            if (scenario, cov, "depth4-oldpacer") in by_key:
+                selected.append((scenario, cov))
+    fixed = [by_key[(s, c, "depth4")]["steady_req_per_min"]["p50"] for s, c in selected]
+    old = [by_key[(s, c, "depth4-oldpacer")]["steady_req_per_min"]["p50"] for s, c in selected]
+    out = {
+        "rule": (
+            f"cells whose fixed depth4 steady p50 is within +/-{LIMITER_BAND:.1%} of "
+            f"{CONFIGURED_RATE}; ranges are of steady p50 over those cells"
+        ),
+        "cells": [{"scenario": s, "coverage": c} for s, c in selected],
     }
+    if selected:
+        out["depth4_steady_p50"] = {"min": min(fixed), "max": max(fixed)}
+        out["oldpacer_steady_p50"] = {"min": min(old), "max": max(old)}
+        out["oldpacer_fraction_of_configured"] = {
+            "min": round(min(old) / CONFIGURED_RATE, 4),
+            "max": round(max(old) / CONFIGURED_RATE, 4),
+        }
+    return out
+
+
+def tree_state(repo: Path = REPO) -> tuple[str, bool]:
+    """(full HEAD sha, whether any TRACKED file differs from it).
+
+    Untracked files do not count: they cannot change what the engine imports.
+    """
+    head = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+    status = subprocess.run(
+        ["git", "-C", str(repo), "status", "--porcelain", "--untracked-files=no"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    return head, bool(status)
 
 
 def _sweep(args: argparse.Namespace) -> None:
@@ -356,14 +450,18 @@ def _sweep(args: argparse.Namespace) -> None:
             check=True,
             capture_output=True,
         )
+    head, dirty = tree_state()
+    if dirty and not args.allow_dirty:
+        # The record names the engine by commit; a dirty tree measures code no
+        # commit holds, which is how this study's first record came to name an
+        # unpushed, later-amended sha.
+        raise SystemExit(
+            "refusing to measure a dirty tree: commit or stash tracked changes so "
+            "engine_head names the code measured (or pass --allow-dirty, recorded as such)"
+        )
     baseline_root = _extract_baseline(args.baseline_ref)
-    head = subprocess.run(
-        ["git", "-C", str(REPO), "rev-parse", "--short", "HEAD"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
     raw_path = RAW_DIR / "raw.jsonl"
+    raw_path.write_text("")  # one run's records, never appended across runs
     me = [sys.executable, str(Path(__file__).resolve())]
     records: list[dict] = []
     port = args.port0
@@ -418,35 +516,13 @@ def _sweep(args: argparse.Namespace) -> None:
                     proc.terminate()
                     proc.wait()
 
-    cells_out = []
-    for scenario, cov in cells:
-        for arm in ARMS:
-            recs = [
-                r
-                for r in records
-                if r["scenario"] == scenario and r["coverage"] == cov and r["arm"] == arm
-            ]
-            if not recs:
-                continue
-            cells_out.append(
-                {
-                    "scenario": scenario,
-                    "coverage": cov,
-                    "arm": arm,
-                    "zero_ms": recs[0]["zero_ms"],
-                    "ok_ms": recs[0]["ok_ms"],
-                    "steady_req_per_min": _summarize(recs, "steady_req_per_min"),
-                    "whole_run_req_per_min": _summarize(recs, "whole_run_req_per_min"),
-                    "cpu_ms_per_request": _summarize(recs, "cpu_ms_per_request"),
-                    "client_connects": _summarize(recs, "client_connects"),
-                    "peak_rss_mb": _summarize(recs, "peak_rss_mb"),
-                }
-            )
+    cells_out = summarize_cells(records)
     argv = " ".join(sys.argv[1:])
     metrics = {
         "generated_by": f"python scripts/gsv_throughput_bench.py {argv}",
         "generated_at": datetime.now(UTC).isoformat(timespec="seconds"),
         "engine_head": head,
+        "engine_tree_dirty": dirty,
         "baseline_ref": args.baseline_ref,
         "machine": {"platform": sys.platform, "python": sys.version.split()[0]},
         "settings": {
@@ -461,6 +537,7 @@ def _sweep(args: argparse.Namespace) -> None:
         },
         "scenarios_ms": {k: {"zero_results": v[0], "ok": v[1]} for k, v in SCENARIOS.items()},
         "cells": cells_out,
+        "limiter_bound": limiter_bound_summary(cells_out),
     }
     out = Path(args.docs_dir) / "gsv-throughput_metrics.json"
     out.write_text(json.dumps(metrics, indent=2, ensure_ascii=False) + "\n")
@@ -507,6 +584,7 @@ def main() -> None:
     parser.add_argument("--coverages", nargs="+", type=float, default=list(COVERAGES))
     parser.add_argument("--no-cpu-ceiling", dest="cpu_ceiling", action="store_false")
     parser.add_argument("--port0", type=int, default=8800)
+    parser.add_argument("--allow-dirty", action="store_true")
     parser.add_argument("--docs-dir", default=str(REPO / "docs" / "experiments"))
     args = parser.parse_args()
     {"serve": _serve, "proxy": _proxy, "client": _client}.get(args.cmd, _sweep)(args)

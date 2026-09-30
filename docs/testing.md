@@ -77,6 +77,9 @@ Incidental coverage of a deprecated spelling trains readers to ignore the notice
 
 ## GSV downloaders, and the history harvester
 
+- The GSV throughput bench (issue #304, `tests/test_gsv_throughput_bench.py`): every cell is summarized by `experiment_stats.describe`, an empty field is `{"n": 0}`;
+  the "where the limiter binds" range is a written rule (fixed depth-4 steady p50 within ±0.5% of 48,000), so a refill burst above it and a socket-bound cell below it cannot widen the old bucket's quoted range;
+  a dirty tracked tree is refused before anything runs, so the record cannot name a commit it did not measure
 - `--connection-limit` above what the GSV engine can use (issue #359, `tests/test_cli_policy.py`): clamped with a stderr warning to `download_gsv.max_requests_in_flight(batch_size)`, i.e. `PIPELINE_DEPTH × batch_size` since #304 (one batch before), and the run proceeds, rather than an argparse exit 2;
   a limit at or below the bound passes through unwarned, including one above a single batch (150 at batch 100), so the clamp is one-directional; `tests/test_run_cities.py` pins the same clamp in `run_cities.py`'s parser, which forwards both flags and must not refuse an argv the child accepts
 - GSV history harvester (response parsing, dated-only filter, cross-grid dedup, circuit breaker, resume — endpoint mocked)
