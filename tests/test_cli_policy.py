@@ -240,6 +240,23 @@ def test_a_connection_limit_above_the_in_flight_bound_is_clamped_and_warned_not_
     assert cli.parse_args().connection_limit == 150
     assert "exceeds" not in capsys.readouterr().err
 
+    # The boundary itself: a limit of EXACTLY the bound (400 at batch 100) is
+    # usable, so it passes through unwarned (a `>=` clamp would warn on it).
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "streetscape_tracker.py",
+            city_id,
+            "--connection-limit",
+            str(bound),
+            "--batch-size",
+            "100",
+        ],
+    )
+    assert cli.parse_args().connection_limit == bound
+    assert "exceeds" not in capsys.readouterr().err
+
 
 def _mapillary_stub(calls):
     return stub_downloader(

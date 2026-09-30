@@ -96,3 +96,12 @@ def test_a_connection_limit_above_the_in_flight_bound_is_clamped_like_the_child_
     )
     assert run_cities.parse_args().connection_limit == 150
     assert "exceeds" not in capsys.readouterr().err
+
+    # Exactly the bound passes through unwarned (a `>=` clamp would warn).
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["run_cities.py", "cities.txt", "--connection-limit", str(bound), "--batch-size", "100"],
+    )
+    assert run_cities.parse_args().connection_limit == bound
+    assert "exceeds" not in capsys.readouterr().err
