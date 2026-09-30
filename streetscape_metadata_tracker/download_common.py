@@ -304,19 +304,31 @@ def _pinned_like_osmnx(base_url: str):
     only this hostname is redirected.
 
     **Patching a module global is only safe while the patches cannot overlap**,
-    and today they cannot: the sole caller is ``overpass_serving``, which the
-    breaker calls from ``HostBreaker._maybe_recheck`` on the scheduler's main
-    launch thread (a lane's work happens in a subprocess, which does not
-    inherit this process's patch). Two overlapping pins would leak the wrapper
-    for good -- the second saves the first's wrapper as "the original" and puts
-    it back -- so ``_PIN_LOCK`` makes the assumption structural rather than
-    documentary. It is a plain lock, so this must never be nested.
+    and today they cannot. There are two callers, one per process:
+    ``overpass_serving``, which the breaker calls from
+    ``HostBreaker._maybe_recheck`` on the scheduler's main launch thread, and
+    ``download_street_network._overpass_refusing``, the walk's pre-flight
+    (issue #366), which runs in the collection child -- a separate process,
+    which neither inherits nor shares the scheduler's patch. Within the child
+    it runs once per fetch, on the main thread, inside the Overpass host lock.
+    Two overlapping pins would leak the wrapper for good -- the second saves
+    the first's wrapper as "the original" and puts it back -- so ``_PIN_LOCK``
+    makes the assumption structural rather than documentary. It is a plain
+    lock, so this must never be nested.
 
-    Two deliberate differences from osmnx, both fail-closed: a lookup failure
-    raises here (osmnx falls back to DNS-over-HTTPS), and the caller turns that
-    into "not serving" rather than reaching for a second resolver to clear a
-    breaker with; and ``socket.gethostbyname`` honours no timeout argument, so
-    the probe's ``timeout_s`` does not bound it -- the resolver's own does.
+    In the child, osmnx's own permanent patch may already be in place from an
+    earlier query. Stacking is harmless: this wrapper maps the hostname to the
+    IP, osmnx's then sees an IP literal and passes it through, and this one is
+    removed on exit.
+
+    Two deliberate differences from osmnx: a lookup failure RAISES here (osmnx
+    falls back to DNS-over-HTTPS), and what that means is the caller's policy,
+    not this helper's -- the breaker's re-check turns it into "not serving"
+    (fail-closed: a breaker is not a thing to clear on a second resolver's
+    answer), while the walk's advisory pre-flight turns it into "can't tell,
+    proceed" (fail-open: the real fetch resolves the host its own way). And
+    ``socket.gethostbyname`` honours no timeout argument, so a caller's request
+    timeout does not bound it -- the resolver's own does.
     """
     hostname = urllib.parse.urlsplit(base_url).hostname
     with _PIN_LOCK:

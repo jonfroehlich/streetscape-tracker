@@ -18,7 +18,6 @@ probe that drifts back to /status fails loudly instead of passing by accident.
 import json
 import re
 import socket
-import urllib.parse
 
 import osmnx as ox
 import pytest
@@ -27,6 +26,11 @@ import requests
 from streetscape_metadata_tracker import download_common as dc
 from streetscape_metadata_tracker import scheduler as sched
 from streetscape_street_analyzer import download_street_network as dsn
+from tests._dns_fakes import OTHER_V4, connect_address
+from tests._dns_fakes import V4 as _V4
+from tests._dns_fakes import V6 as _V6
+from tests._dns_fakes import dual_stack_getaddrinfo as _dual_stack_getaddrinfo
+from tests._dns_fakes import install as install_fake_dns
 
 _NONCE = re.compile(r'make probe nonce="([0-9a-f]+)";out;')
 
@@ -74,35 +78,19 @@ class _Interpreter:
     def __call__(self, url, data=None, timeout=None, headers=None, **kwargs):
         # Resolve the host exactly as urllib3 would at connect time, so a test
         # can see which address the request would actually have gone to.
-        host = urllib.parse.urlsplit(url).hostname
-        sockaddr = socket.getaddrinfo(host, 443, 0, socket.SOCK_STREAM)[0][4]
         self.calls.append(
             {
                 "url": url,
                 "data": data,
                 "timeout": timeout,
                 "headers": headers,
-                "connect_to": sockaddr[0],
+                "connect_to": connect_address(url),
             }
         )
         assert not kwargs, f"unexpected request options {kwargs}"
         match = _NONCE.search((data or {}).get("data", ""))
         status, text = self.reply(match.group(1) if match else None)
         return _Response(status, text)
-
-
-# A dual-stack host, as makelab2's resolver sees overpass-api.de: getaddrinfo
-# prefers an IPv6 address, gethostbyname can only return IPv4. Documentation
-# ranges (RFC 3849 / RFC 5737), so nothing here could reach a real server.
-_V6 = "2001:db8::2"
-_V4 = "192.0.2.52"
-
-
-def _dual_stack_getaddrinfo(host, port, *args, **kwargs):
-    """No-network resolver: an IP literal resolves to itself, a name to IPv6."""
-    if host in (_V4, "198.51.100.9"):
-        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (host, port))]
-    return [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", (_V6, port, 0, 0))]
 
 
 @pytest.fixture
@@ -114,16 +102,9 @@ def interpreter(monkeypatch):
     def no_get(*a, **k):
         raise AssertionError("the reset test issued a GET -- /status is not the reset test (#356)")
 
-    lookups = []
-
-    def gethostbyname(host):
-        lookups.append(host)
-        return _V4 if host == "overpass-api.de" else "198.51.100.9"
-
     monkeypatch.setattr(dc.requests, "post", fake)
     monkeypatch.setattr(dc.requests, "get", no_get)
-    monkeypatch.setattr(socket, "getaddrinfo", _dual_stack_getaddrinfo)
-    monkeypatch.setattr(socket, "gethostbyname", gethostbyname)
+    lookups = install_fake_dns(monkeypatch)
     monkeypatch.delenv(dc.OVERPASS_URL_ENV, raising=False)
     fake.lookups = lookups
     return fake
@@ -260,7 +241,7 @@ def test_the_pin_follows_the_mirror_override(interpreter, monkeypatch):
     monkeypatch.setenv(dc.OVERPASS_URL_ENV, "https://overpass.example.org/api")
     assert dc.overpass_serving() is True
     assert interpreter.lookups == ["overpass.example.org"]
-    assert interpreter.calls[0]["connect_to"] == "198.51.100.9"
+    assert interpreter.calls[0]["connect_to"] == OTHER_V4
 
 
 def test_the_pin_is_scoped_to_the_probe_and_to_the_host(interpreter):
@@ -289,8 +270,9 @@ def test_the_pin_is_scoped_to_the_probe_and_to_the_host(interpreter):
 def test_the_pin_is_serialized_and_the_lock_is_released(interpreter):
     """`socket.getaddrinfo` is a process global, so two overlapping pins would
     leak the wrapper for good: the second saves the first's wrapper as "the
-    original" and puts it back. Only the breaker's re-check pins today, on one
-    thread, and `_PIN_LOCK` is what keeps that true of a future caller."""
+    original" and puts it back. Its two callers -- this re-check and the walk's
+    pre-flight (#366) -- run in different processes, one thread each, and
+    `_PIN_LOCK` is what keeps that true of a future caller."""
     held = []
 
     def reply(nonce):
