@@ -2998,6 +2998,145 @@ def test_resumers_cannot_take_the_whole_reservation(conn, monkeypatch):
     )
 
 
+_KIND_PREFIX = {0: "Aex", 1: "Bopt", 2: "Ctr"}
+_KIND_CHANNELS = ["gsv", "gsv_streets", "mapillary", "kartaview"]
+
+
+def _stranded_kind_slate(conn, monkeypatch, sizes, resumers_per_kind):
+    """Register `sizes[k]` stranded cities of each kind k (the `_stranded_kind`
+    numbering) beside two ordinary gsv-due cities, and give the first
+    `resumers_per_kind[k]` cities of kind k a live checkpoint.
+
+    Kind 0 is excluded from both GSV channels (#301), kind 1 is due only on
+    kartaview (#248), kind 2 has a fresh gsv clock and is due on mapillary.
+    Returns {kind: [city_id, ...]} in registration order.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    for i in range(2):
+        _register(conn, f"Plain{i}", width=1000, height=1000, step=20)
+    by_kind = {
+        k: [
+            _register(conn, f"{_KIND_PREFIX[k]}{i}", width=1000, height=1000, step=20)
+            for i in range(n)
+        ]
+        for k, n in sizes.items()
+    }
+    db.assign_schedule(conn, 90, providers=tuple(_KIND_CHANNELS))
+    for cid in by_kind.get(0, []):
+        for channel in ("gsv", "gsv_streets"):
+            db.set_channel_membership(conn, cid, channel, False, cycle_days=90)
+    for cid in by_kind.get(1, []):
+        db.set_channel_membership(conn, cid, "kartaview", True, cycle_days=90)
+        for channel in ("gsv", "gsv_streets", "mapillary"):
+            db.record_attempt(conn, cid, success=True, provider=channel)
+    for cid in by_kind.get(2, []):
+        for channel in ("gsv", "gsv_streets"):
+            db.record_attempt(conn, cid, success=True, provider=channel)
+
+    live = {cid for k, n in resumers_per_kind.items() for cid in by_kind[k][:n]}
+    monkeypatch.setattr(
+        sched,
+        "_sweep_checkpoint_progress",
+        lambda cfg, city, channel: {"age_s": 1.0} if city.city_id in live else None,
+    )
+    return by_kind
+
+
+def _stranded_head_kinds(conn, by_kind, max_opt_in):
+    """The kinds represented in the reserved head, after asserting the head is
+    exactly min(max_opt_in, |stranded|) stranded cities."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    kind_of = {cid: k for k, ids in by_kind.items() for cid in ids}
+    cfg = _sweep_cfg(publish_enabled=False, opt_in_cities_per_day=max_opt_in)
+    slate = sched._collect_due(
+        conn,
+        cfg,
+        date(2026, 7, 2),
+        list(_KIND_CHANNELS),
+        max_opt_in=max_opt_in,
+        max_cities=100,
+    )
+    ordered = [c.city_id for c in slate.cities]
+    assert set(kind_of) <= set(ordered), "every stranded city must still be on the slate"
+    n_head = min(max_opt_in, len(kind_of))
+    head = ordered[:n_head]
+    assert all(cid in kind_of for cid in head), (
+        f"the reserved head must be {n_head} stranded cities, got {head}"
+    )
+    # The two ordinary gsv-due cities lead what follows, so a stranded city
+    # right after the head would mean the reservation took more than its share.
+    assert not any(cid in kind_of for cid in ordered[n_head : n_head + 2]), (
+        "exactly min(max_opt_in, |stranded|) cities are hoisted, no more"
+    )
+    return {kind_of[cid] for cid in head}
+
+
+@pytest.mark.parametrize("resumer_kind", [0, 1])
+def test_a_resumer_is_its_kinds_turn_so_every_kind_gets_a_slot(conn, monkeypatch, resumer_kind):
+    """Issue #393: at max_opt_in = the number of kinds, no kind may be zeroed.
+
+    The floor takes max(1, 3 - 2) = 1 resumer; the rotation used to restart at
+    kind 0 regardless of which kind that resumer came from, so the two slots
+    left went to kinds 0 and 1 and kind 2 got nothing. The kind-1 case is the
+    trap in the obvious fix: starting the rotation at the first kind no resumer
+    came from runs 0, 1, 2 with a kind-1 resumer, and zeroes kind 2 the same way.
+    """
+    by_kind = _stranded_kind_slate(
+        conn, monkeypatch, sizes={0: 3, 1: 3, 2: 3}, resumers_per_kind={resumer_kind: 1}
+    )
+    assert _stranded_head_kinds(conn, by_kind, max_opt_in=3) == {0, 1, 2}
+
+
+def test_a_resumer_the_floor_cut_has_not_served_its_kind(conn, monkeypatch):
+    """`served` must be read from the CHOSEN resumers, not all of them (#393).
+
+    Resumers in kinds 0 and 2 with a take of 1: the kind-0 one is chosen and the
+    kind-2 one is cut. Marking kind 2 served anyway would queue it last, behind
+    kind 0, and the two remaining slots would go to kinds 1 and 0.
+    """
+    by_kind = _stranded_kind_slate(
+        conn, monkeypatch, sizes={0: 3, 1: 3, 2: 3}, resumers_per_kind={0: 1, 2: 1}
+    )
+    assert _stranded_head_kinds(conn, by_kind, max_opt_in=3) == {0, 1, 2}
+
+
+def _kind_resumer_cases():
+    """Every non-empty kind subset x every resumer-kind subset of it x 1-2
+    resumers per resumer kind: 63 cases."""
+    import itertools
+
+    cases = []
+    for r in (1, 2, 3):
+        for kinds in itertools.combinations((0, 1, 2), r):
+            for rs in range(len(kinds) + 1):
+                for rkinds in itertools.combinations(kinds, rs):
+                    for counts in itertools.product((1, 2), repeat=len(rkinds)):
+                        cases.append((kinds, dict(zip(rkinds, counts, strict=True))))
+    return cases
+
+
+@pytest.mark.parametrize(("kinds", "resumers"), _kind_resumer_cases())
+def test_every_non_empty_kind_gets_a_slot_once_max_opt_in_reaches_the_kind_count(
+    conn, monkeypatch, kinds, resumers
+):
+    """The per-night guarantee #393 restores, swept through the real _collect_due.
+
+    With G non-empty stranded kinds and max_opt_in >= G, every kind reaches the
+    head, whichever kinds the resumers sit in and however many there are --
+    including more resumers in one kind than the reservation has slots, which
+    is what the n_groups - 1 floor exists for.
+    """
+    by_kind = _stranded_kind_slate(
+        conn, monkeypatch, sizes=dict.fromkeys(kinds, 3), resumers_per_kind=resumers
+    )
+    for max_opt_in in range(len(kinds), len(kinds) + 3):
+        assert _stranded_head_kinds(conn, by_kind, max_opt_in) == set(kinds), (
+            f"max_opt_in={max_opt_in}"
+        )
+
+
 def test_a_live_checkpoint_outranks_the_rotation_across_groups(conn, monkeypatch):
     """The #239 guarantee has to hold ACROSS stranded groups, not inside one.
 

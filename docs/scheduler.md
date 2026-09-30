@@ -422,7 +422,12 @@ Grouping only on 1-or-2 versus 3 is not enough, and the first attempt at this sh
 Splitting 1 from 3 is what makes the reservation a rate: measured on the same slate, 4 of 10 to #301, 3 to the KartaView widening, 3 to the transient population.
 **A live checkpoint outranks the rotation across every group**, taken first and in union order — confined to its own group it stops being a guarantee at a reservation of 1, and #239's five nights stop being CONSECUTIVE.
 That take is itself **bounded**, leaving one slot per other non-empty group, because unbounded it is the same starvation a third time: measured, ten stranded resumers in one group displaced the other two groups one-for-one and zeroed both.
-The floor keeps it at one, so at a reservation of 1 the resumer still wins and the #239 guarantee is untouched; any reservation at least as large as the number of stranded groups now guarantees each of them a slot.
+The floor keeps it at one, so at a reservation of 1 the resumer still wins and the #239 guarantee is untouched.
+**A chosen resumer IS its group's turn (#393)**: the rotation visits the groups no chosen resumer came from first in every pass, the served ones after, each half in group order.
+Restarting at group 1 regardless handed the leftover slots to groups 1 and 2 when the resumer was in group 1, so group 3 got nothing at a reservation of exactly three — and moving the rotation's START to the first unserved group is not enough either, because with the resumer in group 2 that rotation runs 1, 2, 3 and zeroes group 3 the same way.
+Only resumers the floor actually took count as served; one it cut is still in its group's queue, and that group still gets its turn.
+The guarantee is **per night**: with G non-empty stranded groups, a reservation of at least G gives every one of them a slot, because the floor takes at most `reservation − G + 1` resumers and so leaves at least as many slots as there are unserved groups.
+Below G the served groups have had their turn and the rest fill in group order, so the highest-numbered unserved groups wait; rotating which group waits across nights would need state carried between nights, and is not done.
 A group leaves the rotation as it empties, so a night with only one stranded population behaves exactly as the straight take did.
 
 **`[schedule].refresh_slots` reserves a share of the night's city cap for cities that will gain a second interval.**

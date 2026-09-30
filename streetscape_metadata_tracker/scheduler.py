@@ -6762,10 +6762,8 @@ def _collect_due(
             # Leaving one slot per OTHER non-empty group costs the resumers
             # nothing at the size that matters: at max_opt_in = 1 with two
             # groups the floor keeps the take at 1, so F4's guarantee -- a live
-            # checkpoint outranks the rotation -- is untouched, while any
-            # max_opt_in >= the number of groups now guarantees every stranded
-            # population a slot. The two invariants only looked like they were
-            # in conflict.
+            # checkpoint outranks the rotation -- is untouched. The two
+            # invariants only looked like they were in conflict.
             n_groups = len({_stranded_kind(i) for i in stranded})
             resumers = [i for i in stranded if _has_live_checkpoint(ordered[i])]
             chosen = set(resumers[: max(1, max_opt_in - (n_groups - 1))])
@@ -6773,11 +6771,34 @@ def _collect_due(
             # Then round-robin the rest, so no stranded population can be
             # zeroed by a larger one. A group leaves the rotation as it empties,
             # so a slate with only one behaves exactly as the straight take did.
+            #
+            # A CHOSEN resumer IS its group's turn (#393), so the groups no
+            # chosen resumer came from go first in every pass, the served ones
+            # after, each half in group order. Restarting the rotation at group
+            # 0 regardless zeroed group 2 at max_opt_in = 3 with a group-0
+            # resumer -- and starting it at the first UNSERVED group is not
+            # enough either: with the resumer in group 1 that rotation runs
+            # 0, 1, 2 and group 2 is zeroed the same way. `served` reads
+            # `chosen`, not `resumers`: a resumer the floor cut has not served
+            # its group, and that group's queue still holds it.
+            #
+            # The guarantee this delivers is PER NIGHT: with G non-empty groups
+            # and max_opt_in >= G, every non-empty group gets at least one slot.
+            # Trivial when everything fits; otherwise the floor takes at most
+            # max_opt_in - G + 1 resumers, so at least G - 1 slots remain -- or
+            # all max_opt_in >= G of them if no resumer was taken -- which is
+            # at least the G - |served| unserved groups, each with a non-empty
+            # queue, and the first pass visits exactly those first. Below G the
+            # served groups have had their turn, and the rest fill in group
+            # order, so the highest-numbered unserved groups are the ones that
+            # wait. Rotating which group waits ACROSS nights at max_opt_in < G
+            # would need state carried between nights, and is out of scope.
+            served = {_stranded_kind(i) for i in chosen}
             groups: dict[int, list[int]] = {}
             for i in stranded:
                 if i not in chosen:
                     groups.setdefault(_stranded_kind(i), []).append(i)
-            queues = [q for _, q in sorted(groups.items())]
+            queues = [q for _, q in sorted(groups.items(), key=lambda kq: (kq[0] in served, kq[0]))]
             while len(chosen) < max_opt_in and any(queues):
                 for q in queues:
                     if not q:
