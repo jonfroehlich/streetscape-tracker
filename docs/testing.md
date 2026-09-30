@@ -86,6 +86,9 @@ Incidental coverage of a deprecated spelling trains readers to ignore the notice
   one `ClientSession` serves every batch and retry pass and is closed;
   batch k+1 is in flight before batch k finishes (a sequential engine deadlocks there, and a timeout turns that into a failure);
   a write failure cancels the batches fetched ahead (only the batches written or failing ever complete; a mutation that merely awaits them lets all five finish) and leaves no task running
+- The token bucket credits its sleep overrun (issue #304, `tests/test_download_common.py`):
+  with every sleep overrunning by 50%, 100 tokens past the burst take 10 s of fake clock at 600/min, not the 15 s the zeroing bucket took;
+  and after k acquisitions at clock t, k never exceeds capacity + t × rate, whatever the sleeps overran by — the ceiling the credit must not break
 - Tainted-run purge tool
 
 ## Scheduler

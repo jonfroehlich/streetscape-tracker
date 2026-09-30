@@ -729,8 +729,21 @@ class AsyncRateLimiter:
             # this one anyway, and releasing would let them busy-cycle.
             wait = (1.0 - self._tokens) / self._rate
             await asyncio.sleep(wait)
-            self._last_refill = self._now()
-            self._tokens = 0.0
+            # Refill from the clock rather than assuming the sleep lasted
+            # exactly `wait` (#304). A sleep always overruns a little (timer
+            # granularity, other callbacks on the loop), and zeroing the bucket
+            # here threw that overrun away on EVERY saturated acquisition: at
+            # 48,000/min the gap is 1.25 ms, and the limiter delivered 79-83%
+            # of its configured rate (docs/experiments/gsv-throughput.md).
+            # Crediting it cannot exceed the rate: the tokens credited are
+            # exactly the time that elapsed, and the capacity cap still bounds
+            # any burst to one second's worth.
+            now = self._now()
+            self._tokens = min(
+                self._capacity, self._tokens + (now - self._last_refill) * self._rate
+            )
+            self._last_refill = now
+            self._tokens -= 1.0
 
     async def _acquire_spaced(self) -> None:
         # Sleep while holding the lock, for the same reason as the bucket: the
