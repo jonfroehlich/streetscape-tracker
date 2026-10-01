@@ -30,7 +30,7 @@ from .naming import sanitize_city_query_str
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 
 # The v16 per-host ledger (issue #385). One constant, spliced into _SCHEMA
 # below AND executed by _migrate_v15_to_v16, which runs before _SCHEMA and needs
@@ -438,6 +438,30 @@ CREATE INDEX IF NOT EXISTS idx_provider_screen_date
 -- The DDL itself is _HOST_USAGE_DDL, appended below.
 """
     + _HOST_USAGE_DDL
+    + """
+-- v18 (issue #404): which collections were EARLY REFRESHES -- taken by
+-- run-due's fill phase on a night the due slate left under-full, before the
+-- channel's cycle_days - grace_days wall. One row per (city, channel, run
+-- date) the fill collected successfully. A shortened interval is then a fact
+-- in the series rather than something inferred from run dates.
+--
+-- Its own table rather than a column on `runs`, because a walk channel's run
+-- lives in street_walks, and because the migration is then purely additive
+-- (the v2 -> v3 pattern): no function, the CREATE TABLE IF NOT EXISTS builds
+-- it on any older catalog, and pre-#404 code ignores it after a rollback.
+-- prior_success_at is the channel's last success BEFORE the fill run, so the
+-- interval the fill shortened is recorded with it; floor_days is the
+-- [schedule].fill_min_days it was admitted under.
+CREATE TABLE IF NOT EXISTS early_refreshes (
+    city_id          TEXT NOT NULL REFERENCES cities(city_id),
+    provider         TEXT NOT NULL,
+    run_date         TEXT NOT NULL,
+    prior_success_at TEXT NOT NULL,
+    floor_days       INTEGER NOT NULL,
+    recorded_at      TEXT NOT NULL,
+    PRIMARY KEY (city_id, provider, run_date)
+);
+"""
 )
 
 # v1 → v2: add the provider dimension. Three tables need constraint changes
@@ -789,6 +813,10 @@ def init_schema(conn: sqlite3.Connection) -> None:
     if user_version == 16:
         _migrate_add_query_radius_columns(conn)
         user_version = 17
+    # v17 -> v18 (issue #404): the early_refreshes table. Purely additive, so
+    # like v2 -> v3 it needs no migration function.
+    if user_version == 17:
+        user_version = 18
     conn.executescript(_SCHEMA)
     # The GSV query-radius pair (issue #367) is ALSO added on every connect, not
     # only on its rung: while in flight it and PR #388 both stamped v16, so a
@@ -2183,6 +2211,110 @@ def get_host_usage(conn: sqlite3.Connection, host: str, since: datetime) -> int:
         (host, _utc_iso(since)),
     ).fetchone()
     return int(row[0])
+
+
+def record_early_refresh(
+    conn: sqlite3.Connection,
+    city_id: str,
+    provider: str,
+    run_date: date,
+    *,
+    prior_success_at: str,
+    floor_days: int,
+) -> None:
+    """Record that ``provider``'s ``run_date`` collection of a city was an early refresh (#404).
+
+    Written by ``run-due``'s fill phase after the channel succeeded. Idempotent
+    on the key, so a second write for the same night replaces the first.
+    """
+    conn.execute(
+        """INSERT OR REPLACE INTO early_refreshes
+           (city_id, provider, run_date, prior_success_at, floor_days, recorded_at)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (city_id, provider, run_date.isoformat(), prior_success_at, floor_days, utc_now_iso()),
+    )
+    conn.commit()
+
+
+def get_early_refresh_keys(conn: sqlite3.Connection) -> set[tuple[str, str, str]]:
+    """Every early refresh as ``(city_id, provider, run_date)`` (issue #404).
+
+    One query for the catalog, for the aggregate builder, which marks each
+    matching run in ``cities.json.gz``.
+    """
+    return {
+        (row["city_id"], row["provider"], row["run_date"])
+        for row in conn.execute("SELECT city_id, provider, run_date FROM early_refreshes")
+    }
+
+
+def get_fill_candidates(
+    conn: sqlite3.Connection,
+    *,
+    today: date,
+    channels: Sequence[str],
+    default_membership: dict[str, bool],
+    fill_min_days: int,
+    due_threshold_days: int,
+    max_consecutive_failures: int,
+) -> list[tuple[CityRow, dict[str, str]]]:
+    """Cities ``run-due``'s fill phase may refresh early, stalest-first (issue #404).
+
+    A city qualifies when it is enabled, is a member of at least one of
+    ``channels`` (the scheduler passes only DEFAULT-membership channels, so an
+    opt-in enrolment is never what makes a city fill-eligible), and EVERY
+    channel it is a member of has:
+
+    * succeeded before (a never-collected channel is DUE, not a fill);
+    * a last success at least ``fill_min_days`` old -- the floor;
+    * a last success under ``due_threshold_days`` old (``cycle_days -
+      grace_days``), so it is not due: a fill is by construction EARLY, and a
+      due city belongs to the due slate;
+    * fewer than ``max_consecutive_failures`` consecutive failures, so the
+      fill never runs a quarantined channel.
+
+    Whole-city by design: one channel under the floor (or quarantined)
+    disqualifies the city, because the fill never collects a subset of a
+    city's channels.
+
+    Returns ``(city, {channel: last_success_at})`` for the member channels,
+    ordered by the OLDEST channel's last success, then ``city_id`` -- the same
+    stalest-first rule the due slate uses, read on the city's stalest channel.
+    """
+    if not channels:
+        return []
+    states: dict[str, dict[str, sqlite3.Row]] = {}
+    marks = ",".join("?" for _ in channels)
+    for row in conn.execute(
+        f"""SELECT city_id, provider, member, last_success_at, consecutive_failures,
+                   julianday(?) - julianday(last_success_at) AS age_days
+            FROM schedule_state WHERE provider IN ({marks})""",
+        (today.isoformat(), *channels),
+    ):
+        states.setdefault(row["city_id"], {})[row["provider"]] = row
+    out = []
+    for city in get_all_cities(conn, enabled_only=True):
+        rows = states.get(city.city_id, {})
+        members = {}
+        ok = True
+        for channel in channels:
+            row = rows.get(channel)
+            member = row["member"] if row is not None else None
+            if (default_membership[channel] if member is None else member) != 1:
+                continue
+            if (
+                row is None
+                or row["last_success_at"] is None
+                or row["consecutive_failures"] >= max_consecutive_failures
+                or not (fill_min_days <= row["age_days"] < due_threshold_days)
+            ):
+                ok = False
+                break
+            members[channel] = row["last_success_at"]
+        if ok and members:
+            out.append((city, members))
+    out.sort(key=lambda cm: (min(cm[1].values()), cm[0].city_id))
+    return out
 
 
 def prune_host_usage(conn: sqlite3.Connection, before: datetime) -> int:
