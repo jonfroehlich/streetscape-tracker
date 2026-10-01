@@ -78,8 +78,21 @@ The remainder alone was not enough, and the arithmetic says why — with the cav
 At the 10 h batch it was written against, prod's 16/min paced ~9,600 requests against a 10,000 budget, so a fresh night's remainder was **unreachable** outright and a city costing more than its timeout affords was still killed before the cap could bind; at the 12 h batch (raised 2026-09-02) the same rate paces ~11,520 and the budget is the smaller term instead.
 A sweep that reaches its cap stops itself deliberately: exit 83, amnestied, no `consecutive_failure`, no city-cap slot, and the spend still reaches the ledger because the child returns.
 What bounds a paused city is therefore not the five failures but `CHECKPOINT_MAX_AGE_S` — seven days from the checkpoint's **first** commit, after which its rows would be spliced into a snapshot dated today and it is discarded.
-The SIGKILL arm remains, and what it catches now is a child running **slower** than the assumed `rate × _SWEEP_ACHIEVED_RATE_FRACTION` — the one overrun a request cap cannot bound, since only a clock inside the child could.
-That one does count a `consecutive_failure` and does consume a slot, which is why the five-night bound still exists for it and why the hoist has to put tomorrow's retry in the *first* slot rather than merely in the list.
+A child running **slower** than the assumed `rate × _SWEEP_ACHIEVED_RATE_FRACTION` is the one overrun a request cap cannot bound, and since #344 a clock inside the child bounds it.
+Every resumable launch is also handed `--*-max-seconds`, set to `timeout_s − _CRAWL_CLOCK_MARGIN_S` (600 s, the same number as `_TIMEOUT_FIXED_SLACK_S`), from one helper at all six launch sites (`_crawl_clock_args`, the twin of `_request_cap_args`).
+The child measures it from its own process start and checks it at the same tile/cell boundary as the cap, so a slow crawl pauses itself with exit 83 — checkpointed, ledgered, amnestied — exactly as a capped one does.
+The two ceilings compose: whichever is reached first pauses the crawl, the child's pause line names which (`stopped by its request cap` / `stopped by its wall-clock budget`), and the scheduler carries that phrase into the paused child's reason.
+**The SIGKILL arm is still reachable, by three routes, and none of them is a slow crawl:**
+
+- a non-resumable channel (`gsv`, `gsv_streets`), which is never handed a clock;
+- a crawl that completes inside its budget and then overruns in its **finalize tail** — grid assignment, the CSV write, the walk's join, stats — because the clock is checked only when a unit is admitted, never after the last one;
+- a launch whose timeout is at or under the 600 s margin, which gets no clock flag at all (the child's `positive_int` would refuse it): the `est == 0` cached-census launch, and an unpaced channel whose `affordable` is None, neither of which the launch floor skips.
+
+In-flight work at the moment the clock trips is not a fourth route in practice, and each crawler bounds it its own way.
+A tile census bounds each in-flight tile's retry chain at `_TILE_MAX_TIME_S` (120 s).
+The KartaView sweep has no tile timer, but it is serial and asks the clock before every probe and every page, so what is in flight is one probe: at most `DEFAULT_BACKPRESSURE_RETRIES + 1` = 4 attempts × (the 60 s `DEFAULT_REQUEST_TIMEOUT_S` + ~3.75 s of pacing at 16/min) ≈ 4–5 min.
+Both residues sit inside the 600 s margin.
+The SIGKILL arm does count a `consecutive_failure` and does consume a slot, which is why the five-night bound still exists for it and why the hoist has to put tomorrow's retry in the *first* slot rather than merely in the list.
 The union of the per-channel due lists is ordered by first appearance, so `gsv` (rank 0) dictates city order; a city whose `gsv` run succeeded but whose sweep paused sits at the tail of ~949 cities and is truncated by `max_cities_per_day`, returning months later rather than tomorrow.
 The hoist moves a city to the head of the slate when **every** channel it is due on is opt-in — `all`, not `any`, so a city due on `gsv` too keeps its exact union position and `gsv`'s stalest-first ordering is strictly untouched.
 It reorders the **city list only**, never the union loop, because `providers_for_city` is passed straight to `_run_city_channels` where `pending = list(providers)` *is* the launch order.
@@ -239,7 +252,8 @@ So the channel needing the most wall-clock should start while the most of it rem
 **The rule inverts past one point, which is why kartaview ranks last rather than first.**
 "Expensive first" holds only while no single channel is long enough to consume the deadline by itself.
 One that *is* starves everything behind it — put it first and its siblings launch against what is left, down to the floor — so for that channel the question stops being which is most expensive and becomes which can best absorb being truncated.
-A multi-hour KartaView sweep is that channel: last, exactly one channel eats the clamp, and it is the one #239 checkpoints, so a killed sweep resumes instead of re-paying for the cells it already fetched.
+A multi-hour KartaView sweep is that channel: last, exactly one channel eats the clamp, and it is the one #239 checkpoints, so a truncated sweep resumes instead of re-paying for the cells it already fetched.
+Since #344 a truncated resumable child is not killed at all in the ordinary case — its clamped timeout also sizes its wall-clock budget, so it pauses itself with exit 83 before the SIGKILL.
 
 **Since #290 the order also decides who FETCHES and who REUSES.**
 `mapillary` (rank 2) launches before `mapillary_streets` (rank 3), so within a city the grid run pays for the shared z14 census and the walk reads it for zero requests; `kartaview` (4) and `kartaview_streets` (5) are the same pair over the radius sweep, wired in #258.
@@ -249,6 +263,7 @@ Nothing else here has that (Mapillary's checkpoint is #256, and a truncated tile
 **Cheapest is not free, in two ways that both matter.**
 No channel keeps its ledger row through a SIGKILL, whatever its provider.
 And a SIGKILL still counts a `consecutive_failure` — only a *deliberate* pause (exit `SWEEP_INCOMPLETE_EXIT_CODE`) is amnestied — so the resumption that justifies this ranking is itself bounded at five nights.
+For the six resumable channels the wall-clock stop (#344) turns a clamp that used to end in a SIGKILL into that deliberate pause; for the two GSV channels a clamp still ends in the kill.
 Ranking picks who absorbs the truncation; it never makes it free.
 
 **What order also decides**, both verified in the launch pass: which channels have **finished** when a wind-down stops the city, and which claim a lane first when a city has more channels than lanes.

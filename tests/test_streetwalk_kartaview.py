@@ -20,6 +20,7 @@ this arm trustworthy in its own right rather than by analogy to Mapillary:
 """
 
 import gzip
+import logging
 import os
 from datetime import date
 
@@ -134,6 +135,7 @@ def _setup(
         calls["checkpoint_variant"] = kwargs.get("checkpoint_variant")
         calls["max_requests_per_minute"] = kwargs.get("max_requests_per_minute")
         calls["max_requests"] = kwargs.get("max_requests")
+        calls["deadline_monotonic"] = kwargs.get("deadline_monotonic")
         if raises is not None:
             raise raises
         policy = kwargs.get("census_cache")
@@ -453,6 +455,29 @@ def test_a_sweep_that_stops_at_its_cap_exits_83_rather_than_failing(tmp_path, mo
     spent = db.get_api_usage(conn, date.fromisoformat(RUN_DATE), provider="kartaview_streets")
     conn.close()
     assert spent == 500
+
+
+@pytest.mark.parametrize("stopped_by", ["clock", "requests"])
+def test_the_walks_pause_line_names_the_ceiling_the_scheduler_reads_back(
+    tmp_path, monkeypatch, caplog, stopped_by
+):
+    """
+    Issue #344 review: the scheduler says WHICH ceiling paused a child by
+    reading the child's own pause line (`_pause_stop_phrase`), so that line is
+    a cross-process contract -- and the scheduler-side test feeds a hand-written
+    one. This pins the REAL line: the error's `stopped_by` must come out of
+    `collect.py`'s log as exactly the phrase the scheduler parses, for both
+    kinds (a blank argument where the phrase goes would lose it silently).
+    """
+    from streetscape_metadata_tracker.download_common import SWEEP_STOP_PHRASES
+    from streetscape_metadata_tracker.scheduler import _pause_stop_phrase
+
+    error = _paused_sweep(spent=5)
+    error.stopped_by = stopped_by
+    data_dir, _ = _setup(tmp_path, monkeypatch, [_image("kv1", 44.05, -121.30)], raises=error)
+    with caplog.at_level(logging.INFO):
+        assert collect.run_collect(_args(data_dir)) == SWEEP_INCOMPLETE_EXIT_CODE
+    assert _pause_stop_phrase(caplog.text) == SWEEP_STOP_PHRASES[stopped_by]
 
 
 def test_a_capped_walk_is_gated_on_the_cap_rather_than_the_whole_sweeps_geometry(
@@ -785,3 +810,29 @@ def test_cost_is_independent_of_spacing(tmp_path, monkeypatch):
     assert db.get_api_usage(conn, date.fromisoformat(RUN_DATE), provider="kartaview_streets") == 18
     conn.close()
     assert calls["n"] == coarse + 1
+
+
+def test_the_wall_clock_budget_reaches_the_crawl_as_a_deadline_from_process_start(
+    tmp_path, monkeypatch
+):
+    """
+    ``--kartaview-max-seconds N`` must reach the walk's crawl as
+    ``deadline_monotonic = PROCESS_STARTED_MONOTONIC + N`` (issue #344).
+
+    Pinned at the crawl rather than the parser, with a sibling provider's flag
+    as the third case: three near-identical dispatch arms are exactly where one
+    reads another's flag. Unset is None -- a manual walk has no clock stop.
+    """
+    from streetscape_metadata_tracker.download_common import PROCESS_STARTED_MONOTONIC
+
+    data_dir, calls = _setup(tmp_path, monkeypatch, [_image("kv1", 44.05, -121.30)])
+    assert collect.run_collect(_args(data_dir, **{"kartaview-max-seconds": 30})) == 0
+    assert calls["deadline_monotonic"] == PROCESS_STARTED_MONOTONIC + 30
+
+    data_dir2, calls2 = _setup(tmp_path / "b", monkeypatch, [_image("kv1", 44.05, -121.30)])
+    assert collect.run_collect(_args(data_dir2)) == 0
+    assert calls2["deadline_monotonic"] is None
+
+    data_dir3, calls3 = _setup(tmp_path / "c", monkeypatch, [_image("kv1", 44.05, -121.30)])
+    assert collect.run_collect(_args(data_dir3, **{"panoramax-max-seconds": 30})) == 0
+    assert calls3["deadline_monotonic"] is None
