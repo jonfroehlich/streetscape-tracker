@@ -393,6 +393,22 @@ def test_the_pin_is_held_for_the_get_and_gone_after_it(status_endpoint):
     assert not dc._PIN_LOCK.locked()
 
 
+def test_the_pin_stacks_on_osmnx_own_patch_and_hands_it_back(status_endpoint):
+    """The SECOND fetch in one process -- `prefreeze_street_networks.py` walks
+    a night's cities serially -- probes with osmnx's permanent `_config_dns`
+    patch already installed by the first query. The pre-flight must still land
+    on the IPv4 address, and on exit put osmnx's patch back rather than the
+    bare resolver it sat on, or the next query loses its own pin."""
+    ox._http._config_dns(dc.DEFAULT_OVERPASS_URL)  # monkeypatch restores it
+    osmnx_patch = socket.getaddrinfo
+    assert osmnx_patch is not _dns_fakes.dual_stack_getaddrinfo
+
+    assert _REAL_PROBE() is None
+    assert status_endpoint.calls[0]["connect_to"] == _dns_fakes.V4
+    assert socket.getaddrinfo is osmnx_patch
+    assert _dns_fakes.connect_address(dc.DEFAULT_OVERPASS_URL) == _dns_fakes.V4
+
+
 def _osmnx_query_address(url: str) -> str:
     """Where osmnx's query to ``url`` would connect: its own ``_config_dns``
     pin (which matches the host AS WRITTEN in the URL), then urllib3's lookup
@@ -433,6 +449,13 @@ def test_normalizing_the_url_touches_only_the_host():
         == "https://overpass-api.de:8443/API/Interp"
     )
     assert dc.normalize_overpass_url(dc.DEFAULT_OVERPASS_URL) == dc.DEFAULT_OVERPASS_URL
+    # Userinfo is a credential (requests sends it as basic auth), and a
+    # password is case-sensitive: lowercasing the whole netloc would break auth
+    # to a private mirror while every probe of it still answered.
+    assert (
+        dc.normalize_overpass_url("https://Me:PassWord@Mirror.Example.org:8443/api")
+        == "https://Me:PassWord@mirror.example.org:8443/api"
+    )
 
 
 def test_a_failed_lookup_is_cant_tell_not_refusing(status_endpoint, monkeypatch):

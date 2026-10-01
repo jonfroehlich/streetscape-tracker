@@ -194,15 +194,20 @@ def normalize_overpass_url(url: str) -> str:
     ``urlsplit().hostname`` (always lowercase), pins the probes to IPv4: the
     probe and the query as two different clients again (issue #366). Hostnames
     are case-insensitive, so lowercasing where the URL is CONFIGURED changes
-    nothing else. The path is left alone; it is case-sensitive.
+    nothing else. The path is left alone; it is case-sensitive. So is any
+    ``user:password@`` userinfo, which ``requests`` sends as basic auth, so
+    only the part after the last ``@`` is lowercased.
 
     Example::
 
         >>> normalize_overpass_url("https://Overpass-API.de/api")
         'https://overpass-api.de/api'
+        >>> normalize_overpass_url("https://Me:PassWord@Mirror.Example.org/api")
+        'https://Me:PassWord@mirror.example.org/api'
     """
     parts = urllib.parse.urlsplit(url)
-    return urllib.parse.urlunsplit(parts._replace(netloc=parts.netloc.lower()))
+    userinfo, at, hostport = parts.netloc.rpartition("@")
+    return urllib.parse.urlunsplit(parts._replace(netloc=userinfo + at + hostport.lower()))
 
 
 def overpass_url() -> str:
