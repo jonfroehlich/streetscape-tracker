@@ -269,10 +269,14 @@ async def collect_panoramax_street_samples_async(
             # dated snapshot, and no later reader can tell it from a measured
             # one.
             #
-            # Panoramax makes the distinction sharper than either sibling: a 404
-            # is an EMPTY TILE here, not a failure, so a tile that is genuinely
-            # missing imagery never reaches this list — everything in it is
-            # ground the fetch really did not see.
+            # Panoramax makes the distinction sharper than either sibling: an
+            # empty tile answers 204 here (issue #407), a settled answer rather
+            # than a failure, so a tile that is genuinely missing imagery never
+            # reaches this list — everything in it is ground the fetch really
+            # did not see. A 404 is the opposite case: not an empty tile but an
+            # unrouted URL, so it IS in this list and its samples publish
+            # UNKNOWN; a whole lattice of them is refused by the shared census
+            # before any row is built.
             unmeasured_mask=(
                 (lambda lats, lons: _points_in_tiles(lats, lons, failed_tiles))
                 if failed_tiles

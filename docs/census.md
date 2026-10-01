@@ -466,15 +466,21 @@ That last figure is RAW PACE and is not the per-city timeout: `scheduler._tile_c
 
 The v2 endpoint's H3 `grid` layer — aggregated counters rather than rows — is the *screen* instrument phase 1 used to price the whole catalog for 113 requests, and it is not read by the collector at all.
 
-### 2. A 403 or 429 is a per-IP refusal, and a 404 is an empty tile
+### 2. A 403 or 429 is a per-IP refusal, a 204 is an empty tile, and a 404 is not
 
 **There is no credential**, which changes what a 4xx can mean.
 On Mapillary and KartaView a 403 is a rejected token and is deliberately typed as a plain `DownloadError` scoped to the credential; here it cannot be, so **403 and 429 are both `HostBlockedError` at the first request** — stop, never retry, and let the scheduler's night-level breaker see it.
 `HOST_PANORAMAX` is the fourth locked host, with exit codes **84 blocked / 85 busy**, continuing past 83 rather than filling the 77/78 gap that stays open because those are `EX_NOPERM`/`EX_CONFIG`.
 
-**A 404 is an ANSWER, not a failure** — the opposite of Mapillary's reading, and measured rather than assumed: phase 1 saw 0 empty tiles across 3,321 requests *including 20 cities that hold no imagery at all*, because an empty area answers 200 with no picture layer.
-That reading needs a guard, and it is the one piece of this module with no Mapillary counterpart: **a lattice where every tile 404s is refused**.
-An empty city answers 200, so a whole lattice of 404s is what a moved or renamed endpoint looks like — and without the guard the run would finalize 0 panos and `diff.py` would report every pano in the city removed, into an immutable dated snapshot.
+**A 204 is the EMPTY TILE** — measured 2026-10-01 (#407): an ocean tile answers 204 with 0 bytes, the meta-catalog's source returns 204 for an empty tile and never 404, and a z6 world screen the same day saw 201 × 200, 34 × 204 and 0 × 404.
+It is an answer, so it is counted through `on_empty`, returned as `b""` and **committed as a zero-row tile** — most z15 tiles over a real bbox are empty, so holding them back would leave every checkpoint incomplete and every cache entry refused.
+Before #407 a 204 fell through `raise_for_status` (not an error) and `read()` returned `b""`: handled correctly by accident and counted by nobody, while the code and these docs called 404 the empty tile.
+
+**A 404 is NOT an empty tile.** On a host that never 404s a tile route, a 404 means the URL is not one it serves — a moved or renamed endpoint — and the ground under it was never read.
+`_fetch_tile` raises `TileNotServedError`, which is deliberately neither a `DownloadError` (one stray 404 would end the city) nor an `aiohttp.ClientError` (backoff would retry an unrouted path), so a lone 404 is a **failed tile**: REQUEST_FAILED under #168's tolerance, never committed, never a measured absence.
+The guard with no Mapillary counterpart is that **a lattice where every tile 404s is refused by name** as a moved endpoint, before the generic tolerance would refuse it as "N tiles failed" and point the operator at the night instead of the URL.
+**It keys on the 404, never on emptiness**: a lattice of 204s is a city the host says holds nothing, which 730 of 1,144 catalog cities genuinely do, and it publishes as ZERO_RESULTS.
+The growth screen reads the same `_fetch_tile` differently on purpose — any 404 ends its pass (an unread z6 tile is every city under it), and an all-204 pass is refused, since 201 of 235 world tiles hold imagery and a pass of nothing is a meta-catalog serving nothing.
 
 ### 3. `type` is two-state, and the raw value is published anyway
 
@@ -515,7 +521,7 @@ So `collect.py` imports them ALIASED: a bare import would not be a clash the lin
 The first version of this paragraph claimed all four differed and quoted Mapillary's rate as 40, which is its PRODUCTION CONFIG value and not what the module exports; a three-reviewer pass caught it.
 **And "four" is the count of what THIS CALLER imports, never a property of the two modules**: they share 55 public names, 14 of which resolve to different objects (`TILE_ZOOM`, `TILE_URL_TEMPLATE`, `TileCheckpoint`, `fetch_city_images_async`, `build_image_rows`, `records_to_census`, `tiles_for_bbox`, `load_cached_census`, … — measured, not counted by hand).
 Stated as a module property it invites the next call site to import a fifth name unaliased on the grounds that the list was complete.
-And a **404 is an empty tile**, not a failure, so a tile genuinely holding no imagery never reaches `failed_tiles`; everything the walk's `unmeasured_mask` covers is ground the fetch really did not see.
+And an **empty tile answers 204**, an answer rather than a failure, so a tile genuinely holding no imagery never reaches `failed_tiles`; a 404 does, being an unread tile (#407), so everything the walk's `unmeasured_mask` covers is ground the fetch really did not see.
 
 **`panoramax_streets` is a budget channel with no credential behind it.**
 Its row in `config.CHANNEL_ENV_VARS` is an empty tuple exactly like `panoramax`'s, which is what puts it in `CREDENTIAL_FREE_CHANNELS`; drop the row and `load_config` falls through to its final `raise`, making the one walk that needs no key the one walk that cannot start.

@@ -167,9 +167,10 @@ def _setup(
             "checkpoint_path": kwargs.get("checkpoint_path"),
             "tiles": 5,
             "raw_feature_count": len(pictures),
-            # Tiles the fetch never got back. A 404 is an EMPTY tile here and
-            # never lands in this list, so everything in it is genuinely
-            # unmeasured ground.
+            # Tiles the fetch never got back. An empty tile answers 204 here
+            # and never lands in this list, while a 404 is an unread tile and
+            # does (issue #407), so everything in it is genuinely unmeasured
+            # ground.
             "failed_tiles": list(failed_tiles or []),
             # Census provenance (#290). Defaults mimic an ordinary fresh fetch:
             # this channel paid, and nothing was reused.
@@ -884,9 +885,9 @@ def test_a_failed_tile_publishes_request_failed_not_zero_results(tmp_path, monke
     always done this; the walk must too, or the two disagree about the same
     unswept ground.
 
-    Panoramax sharpens the distinction: a 404 is an EMPTY TILE here, not a
-    failure, so a tile genuinely holding no imagery never reaches failed_tiles
-    at all. Everything this mask covers is ground the fetch really did not see.
+    Panoramax sharpens the distinction: an empty tile answers 204 here, an
+    answer and not a failure, so a tile genuinely holding no imagery never
+    reaches failed_tiles at all (a 404 does, being an unread tile; issue #407). Everything this mask covers is ground the fetch really did not see.
 
     The split must follow the TILE boundary rather than some other accident, so
     the unknown rows are asserted to be exactly the samples north of the seam.

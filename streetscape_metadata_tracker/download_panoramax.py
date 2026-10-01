@@ -495,6 +495,19 @@ DEFAULT_TILE_JITTER = 0.6
 _TILE_ERROR_CONTENT_TYPES = ("text/html", "application/json")
 
 
+class TileNotServedError(Exception):
+    """
+    A tile URL the host answered 404 — NOT an empty tile (issue #407).
+
+    Deliberately neither a ``DownloadError`` (which would stop the whole city at
+    the first stray 404, discarding #168's per-tile tolerance) nor an
+    ``aiohttp.ClientError`` (which backoff would retry into an unrouted path).
+    It is a per-tile failure, and its ground is unmeasured: the census marks it
+    REQUEST_FAILED, the checkpoint leaves it uncommitted, and the screen ends
+    its pass on it.
+    """
+
+
 @backoff.on_exception(
     backoff.expo,
     (asyncio.TimeoutError, aiohttp.ClientError),
@@ -509,6 +522,25 @@ async def _fetch_tile(
     on_request: Callable[[], None] | None = None,
     on_empty: Callable[[], None] | None = None,
 ) -> bytes:
+    """
+    Fetch one tile's bytes, classifying the status the way THIS host means it.
+
+    Two statuses carry no body, and they are different answers (issue #407,
+    measured 2026-10-01):
+
+    * **204 No Content is the EMPTY TILE**, returned as ``b""`` and reported
+      through ``on_empty``. It is what the meta-catalog sends for a tile holding
+      no pictures (`routes/map.rs` in its source; an ocean tile answers 204 with
+      0 bytes, and a z6 world screen the same day saw 201 x 200, 34 x 204 and
+      0 x 404). It is a settled observation of absence, like a 200 whose body
+      carries no picture layer.
+    * **404 is NOT an empty tile**, and raises :class:`TileNotServedError`. The
+      meta-catalog never answers a tile route with 404, so one means the URL is
+      not a route this server serves -- a moved or renamed endpoint -- and the
+      ground under it was not observed. Raised rather than returned empty so
+      that no caller can mistake it for absence by forgetting a callback: the
+      bug #407 found was exactly a status handled correctly by accident.
+    """
     # Pacing and counting sit INSIDE the retried body (issue #198): this
     # function may issue up to TILE_MAX_TRIES requests, and taking one token in
     # the caller would let a retrying tile present five times the configured
@@ -545,18 +577,30 @@ async def _fetch_tile(
                 f"needs updating.",
                 host=HOST_PANORAMAX,
             )
-        if response.status == 404:
-            # A tile the host has nothing for — an ANSWER, not a failure, which
-            # is the opposite of Mapillary's reading and is measured rather than
-            # assumed: phase 1 saw 0 empty tiles across 3,321 z14 requests
-            # including 20 cities that hold no imagery at all, because an empty
-            # area comes back 200 with no layer. Counted rather than silent, so
-            # the caller can refuse a run where EVERY tile 404s (see
-            # _fetch_city_images) — which is what a moved endpoint looks like,
-            # and would otherwise publish as "every pano in the city removed".
+        if response.status == 204:
+            # THE EMPTY TILE (issue #407). Before #407 this fell through to
+            # raise_for_status (a 204 is not an error) and read() returned b"",
+            # so it was handled correctly by accident and counted by nobody --
+            # which left the 404 rule below describing an answer the host never
+            # gives. Checked before the Content-Type test on purpose: a 204 has
+            # no body, so whatever type it claims describes nothing.
             if on_empty is not None:
                 on_empty()
             return b""
+        if response.status == 404:
+            # NOT an empty tile: the meta-catalog answers an empty tile with 204
+            # and never sends 404 for a tile route, so a 404 means this URL is
+            # not a route the server knows -- what a MOVED OR RENAMED endpoint
+            # looks like. Raised as a per-tile failure rather than a whole-city
+            # stop (it is neither a DownloadError nor an aiohttp error), so one
+            # stray 404 costs one tile under #168's tolerance while a lattice of
+            # them is refused by name (see _fetch_city_images). Not retried: an
+            # unrouted path does not become routed by asking again.
+            raise TileNotServedError(
+                f"Panoramax answered HTTP 404 for {url}. This host answers an empty "
+                f"tile with 204 and never 404s a tile route, so the tile endpoint "
+                f"has moved or been renamed, or this URL is malformed."
+            )
         if response.status != 200:
             # 5xx raises ClientResponseError, which backoff retries.
             response.raise_for_status()
@@ -1283,7 +1327,9 @@ async def _fetch_city_images(
         )
 
     api_requests = 0
-    empty_tiles = 0
+    # Tiles that answered 404 -- NOT empty tiles, which answer 204 and are
+    # ordinary absence (issue #407). The moved-endpoint guard below reads this.
+    missing_tiles = 0
     timeout = aiohttp.ClientTimeout(total=request_timeout)
     semaphore = asyncio.Semaphore(connection_limit)
     rate_limiter = AsyncRateLimiter(max_requests_per_minute, jitter=jitter)
@@ -1313,9 +1359,9 @@ async def _fetch_city_images(
         nonlocal api_requests
         api_requests += 1
 
-    def count_empty() -> None:
-        nonlocal empty_tiles
-        empty_tiles += 1
+    def count_missing() -> None:
+        nonlocal missing_tiles
+        missing_tiles += 1
 
     def interrupted(err: DownloadError) -> DownloadError:
         """
@@ -1363,15 +1409,6 @@ async def _fetch_city_images(
     async def fetch_one(x: int, y: int) -> pd.DataFrame:
         nonlocal fatal, capped, reserved, stop_reason
         url = TILE_URL_TEMPLATE.format(z=TILE_ZOOM, x=x, y=y)
-        # Per-tile, alongside the whole-city counter: the commit below needs to
-        # know whether THIS tile 404ed, not how many did.
-        answered_404 = False
-
-        def note_empty() -> None:
-            nonlocal answered_404
-            answered_404 = True
-            count_empty()
-
         async with semaphore:
             # The abort check belongs HERE, inside the semaphore: gather starts
             # every task at once and each runs to its first suspension point, so
@@ -1430,9 +1467,14 @@ async def _fetch_city_images(
             reserved += 1
             try:
                 # Pacing/counting happen inside _fetch_tile, per retried attempt.
-                tile_bytes = await _fetch_tile(
-                    session, url, timeout, rate_limiter, count_request, note_empty
-                )
+                tile_bytes = await _fetch_tile(session, url, timeout, rate_limiter, count_request)
+            except TileNotServedError:
+                # A per-tile failure like a 5xx that exhausted its retries --
+                # it lands in `failed_tiles`, uncommitted -- but COUNTED, because
+                # a lattice of them is a moved endpoint and is refused by name
+                # below rather than by the generic tolerance (issue #407).
+                count_missing()
+                raise
             except DownloadError as e:
                 # ONLY DownloadError trips the abort. Per-tile failures (a 5xx
                 # that exhausted its retries, a decode error) must still fan out
@@ -1449,27 +1491,27 @@ async def _fetch_city_images(
         # every tile's result until the last one lands, so returning dicts would
         # keep the entire city's per-picture dicts alive at once (issue #157).
         frame = records_to_census(pictures_from_tile(tile_bytes, x, y))
-        if checkpoint is not None and not answered_404:
+        if checkpoint is not None:
             # Synchronous, inside the coroutine: the loop is single-threaded, so
             # this is atomic with respect to every other tile's commit, and the
             # host lock rules out another process. Only a SUCCESSFUL tile gets
             # here — a failure raised above, and stays refetchable.
             #
-            # A 404 is deliberately NOT committed, even though this run reads it
-            # as an empty tile. The moved-endpoint guard below is evidence that
+            # A 204 IS committed, as a zero-row tile: it is the host's settled
+            # empty-tile answer (issue #407), and at z15 most tiles over a real
+            # bbox are empty, so holding them back would leave every city's
+            # checkpoint incomplete and every census-cache entry refused.
+            #
+            # A 404 never gets here: it raised TileNotServedError above, so it
+            # stays uncommitted like any failed tile. That matters beyond
+            # refetchability. The moved-endpoint guard below is evidence that
             # only exists per invocation — it asks whether everything REQUESTED
-            # answered 404 — so committing one spends that evidence: the run
-            # that correctly refuses would leave a checkpoint in which every
+            # answered 404 — so committing one would spend that evidence: the
+            # run that correctly refuses would leave a checkpoint in which every
             # tile is recorded fetched-and-empty, and the next invocation would
             # find nothing to do, skip the guard, and re-finalize the city from
             # disk as a genuine ZERO_RESULTS snapshot for 0 requests (then
-            # promote that into the shared #290 cache). Leaving it uncommitted
-            # re-asks the question every night, which is the only honest thing
-            # to do with a tile whose meaning a single response cannot settle.
-            # The cost is paid by the case measured at zero in 3,321 phase-1
-            # requests: a city with a scattered 404 never completes its
-            # checkpoint, so it re-fetches that tile on a resume and its cache
-            # entry is refused (and deleted) on the next read.
+            # promote that into the shared #290 cache).
             _commit_tile(
                 checkpoint,
                 x,
@@ -1585,19 +1627,27 @@ async def _fetch_city_images(
         else:
             fetched[(x, y)] = outcome
 
-    # EVERY TILE ANSWERED 404 — refuse rather than publish a city as empty.
-    # A 404 is an ordinary "nothing here" on this host (see _fetch_tile), and a
-    # genuinely empty area answers 200 with no layer, so a whole lattice of them
-    # is what a MOVED OR RENAMED ENDPOINT looks like, not what an empty city
-    # looks like. Without this the run would finalize 0 panos, and against the
-    # previous snapshot `diff.py` would report every pano in the city removed.
+    # EVERY TILE ANSWERED 404 — refuse BY NAME, as a moved endpoint.
+    # The host answers an EMPTY tile with 204 and never sends 404 for a tile
+    # route (issue #407, measured from its source and from 235 live z6 tiles),
+    # so a whole lattice of 404s is what a MOVED OR RENAMED ENDPOINT looks like.
+    # Each 404 is already a failed tile (TileNotServedError), so the tolerance
+    # below would refuse this lattice too -- but as "N tiles failed", pointing
+    # an operator at a flaky night rather than at a URL that needs changing.
+    # This guard runs first so the error says what actually happened.
+    #
+    # KEYED ON THE 404, NEVER ON EMPTINESS. A lattice of 204s is a city the host
+    # says holds nothing, and 730 of 1,144 catalog cities genuinely do; refusing
+    # those would fail two thirds of the catalog over a true answer. Before #407
+    # this guard was keyed on 404 while its comments called 404 the empty-tile
+    # answer and the real one, 204, went uncounted through raise_for_status --
+    # so the trigger was right and the reading behind it was not.
     #
     # Bounded by `len(todo) >= 2`, and it is `todo` rather than `tiles` because
     # a RESUMED run only asks for what it is missing -- a moved endpoint has to
     # be caught there too, or a resume would assemble the census from committed
-    # tiles alone and publish a partial city as a complete one. Two is the bar
-    # because a single 404 is a hole worth one tile while two, against a
-    # measured baseline of zero in 3,321 requests, is a moved endpoint.
+    # tiles alone. Below two, a 404 is one failed tile, and #168's tolerance
+    # below is what prices it.
     #
     # A CAPPED NIGHT NEVER REACHES THIS, and that is a real gap rather than a
     # consequence worth restating as a feature. The cap raises
@@ -1611,10 +1661,10 @@ async def _fetch_city_images(
     # in the part they got to, so the trade stands -- but a Panoramax channel
     # wired to launch capped (#316 phase 2) wants an endpoint probe at the START
     # of a capped run, not this one at the end.
-    if len(todo) >= 2 and empty_tiles == len(todo):
+    if len(todo) >= 2 and missing_tiles == len(todo):
         error = DownloadError(
             f"Every one of the {len(todo)} Panoramax tiles requested for {city_name} "
-            f"answered HTTP 404. An empty area answers 200 with no picture layer, so "
+            f"answered HTTP 404. An empty tile answers 204, never 404, so "
             f"this means the tile endpoint ({TILE_URL_TEMPLATE}) has moved or been "
             f"renamed — refusing to finalize a snapshot claiming the city holds no "
             f"imagery."

@@ -44,16 +44,16 @@ def straddling_city():
     return lat, boundary_lon
 
 
-def _stub_fetch_tile(monkeypatch, fetch, *, empty_tiles=()):
+def _stub_fetch_tile(monkeypatch, fetch):
     """
-    Install ``fetch`` as the tile fetcher, honouring the limiter and the two
-    counters on the stub's behalf.
+    Install ``fetch`` as the tile fetcher, honouring the limiter and the request
+    counter on the stub's behalf.
 
     Stubbing ``_fetch_tile`` also stubs out its retry decorator, which is what
     keeps these instant — but #198 moved pacing and counting INSIDE that
     function deliberately, so a stub ignoring them would leave every city-level
-    test seeing zero requests. ``empty_tiles`` names tiles the stub should treat
-    as a 404, i.e. calling ``on_empty`` as the real fetcher does.
+    test seeing zero requests. Tests about STATUS CODES do not use this: they go
+    through :func:`_run`, which keeps the real `_fetch_tile` (issue #407).
     """
 
     async def paced(session, url, timeout, rate_limiter=None, on_request=None, on_empty=None):
@@ -61,10 +61,7 @@ def _stub_fetch_tile(monkeypatch, fetch, *, empty_tiles=()):
             await rate_limiter.acquire()
         if on_request is not None:
             on_request()
-        body = await fetch(session, url, timeout)
-        if body == b"" and on_empty is not None and url in empty_tiles:
-            on_empty()
-        return body
+        return await fetch(session, url, timeout)
 
     monkeypatch.setattr(dp, "_fetch_tile", paced)
 
@@ -76,23 +73,88 @@ def _tile_xy_from_url(url):
     return int(x), int(y)
 
 
-def _run(monkeypatch, tmp_path, tiles_by_xy, center_lat, center_lon, *, empty=(), **kwargs):
-    served = []
-    empty_urls = set()
+class _TileResponse:
+    def __init__(self, status, body=b""):
+        self.status = status
+        # What the host sends: a vector tile under its own type, and NO body
+        # (and so nothing worth typing) under a 204 or a 404.
+        self.headers = {"Content-Type": "application/vnd.mapbox-vector-tile"} if body else {}
+        self._body = body
 
-    async def fake_fetch(session, url, timeout):
+    async def read(self):
+        return self._body
+
+    def raise_for_status(self):
+        if self.status >= 400:
+            raise RuntimeError(f"HTTP {self.status} reached raise_for_status")
+
+
+class _TileSession:
+    """
+    An in-memory ``aiohttp.ClientSession`` answering each tile URL with a status.
+
+    THE REAL `_fetch_tile` RUNS AGAINST THIS (issue #407). Every status-code
+    test used to stub `_fetch_tile` and call ``on_empty`` by hand, which is how
+    the suite stayed green while the host's real empty-tile answer -- 204 --
+    went through no branch that counted it: a stub decides the classification,
+    so it cannot test it.
+    """
+
+    def __init__(self, answer):
+        self._answer = answer
+
+    def get(self, url, **kwargs):
+        response = self._answer(url)
+
+        class _Ctx:
+            async def __aenter__(self):
+                return response
+
+            async def __aexit__(self, *exc):
+                return False
+
+        return _Ctx()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+def _run(
+    monkeypatch,
+    tmp_path,
+    tiles_by_xy,
+    center_lat,
+    center_lon,
+    *,
+    missing=(),
+    no_content=(),
+    **kwargs,
+):
+    """
+    One grid run through the REAL tile fetcher, over an in-memory session.
+
+    ``missing`` tiles answer 404 and ``no_content`` tiles answer 204 (the host's
+    empty tile); every other tile answers 200 with its payload from
+    ``tiles_by_xy``, or with a tile carrying no picture layer.
+    """
+    served = []
+
+    def answer(url):
         xy = _tile_xy_from_url(url)
         served.append(xy)
         # No credential rides in a Panoramax URL, which is the point.
         assert "access_token" not in url and "key=" not in url
-        if xy in empty:
-            empty_urls.add(url)
-            return b""
-        return tiles_by_xy.get(xy, mapbox_vector_tile.encode([]))
+        if xy in missing:
+            return _TileResponse(404)
+        if xy in no_content:
+            return _TileResponse(204)
+        return _TileResponse(200, tiles_by_xy.get(xy, mapbox_vector_tile.encode([])))
 
-    _stub_fetch_tile(monkeypatch, fake_fetch, empty_tiles=empty_urls)
-    # The set is filled as URLs are seen, and `paced` reads it after `fetch`
-    # returns, so late binding is fine and deliberate.
+    session = _TileSession(answer)
+    monkeypatch.setattr(dp.aiohttp, "ClientSession", lambda **kw: session)
     out_path = str(tmp_path / "test_panoramax_2026-09-06.csv.gz")
     result = asyncio.run(
         dp.download_panoramax_metadata_async(
@@ -249,16 +311,16 @@ def test_a_lattice_that_answers_404_EVERYWHERE_is_refused_rather_than_published(
     monkeypatch, tmp_path, straddling_city
 ):
     """
-    THE GUARD A 404-IS-EMPTY READING NEEDS. On this host a 404 means "nothing at
-    this tile" and an empty area answers 200 with no layer, so a whole lattice
-    of 404s is not an empty city -- it is what a MOVED OR RENAMED endpoint looks
-    like. Without this the run would finalize 0 panos and `diff.py` would report
-    every pano in the city removed, into an immutable dated snapshot.
+    THE MOVED-ENDPOINT GUARD, REACHED THROUGH THE REAL FETCHER (issue #407).
+    This host answers an empty tile with 204 and never 404s a tile route, so a
+    whole lattice of 404s is not an empty city -- it is what a MOVED OR RENAMED
+    endpoint looks like, and it is refused by that name rather than as a pile
+    of failed tiles, so the operator is pointed at the URL and not at the night.
     """
     lat, lon = straddling_city
     tiles = dp.tiles_for_bbox(*dp.grid_bbox(lat, lon, 100, 100, 20))
     with pytest.raises(DownloadError, match="has moved or been renamed"):
-        _run(monkeypatch, tmp_path, {}, lat, lon, empty=set(tiles))
+        _run(monkeypatch, tmp_path, {}, lat, lon, missing=set(tiles))
 
 
 def test_a_404_LATTICE_is_still_refused_on_the_NIGHT_AFTER_it_checkpointed(
@@ -292,7 +354,7 @@ def test_a_404_LATTICE_is_still_refused_on_the_NIGHT_AFTER_it_checkpointed(
                 {},
                 lat,
                 lon,
-                empty=set(tiles),
+                missing=set(tiles),
                 checkpoint_path=checkpoint_path,
                 checkpoint_channel="panoramax",
             )
@@ -309,35 +371,160 @@ def test_a_404_LATTICE_is_still_refused_on_the_NIGHT_AFTER_it_checkpointed(
         )
 
 
-def test_one_404_among_answered_tiles_is_a_hole_not_a_moved_endpoint(
+def test_one_404_among_answered_tiles_is_an_UNREAD_tile_not_a_moved_endpoint(
     monkeypatch, tmp_path, straddling_city
 ):
     """
-    The bound on the guard above, and it matters most on a RESUME: a run
-    finishing its last remaining tile asks for exactly one, and refusing the
-    city over that single 404 would leave the crawl unable to finish on any
-    night. Two 404s against a measured baseline of zero in 3,321 requests is a
-    moved endpoint; one is a tile.
+    The bound on the guard above, and the other half of what a 404 now means.
+
+    A single 404 is not a moved endpoint, so the city is not refused by that
+    name -- it matters most on a RESUME, where a run finishing its last tile
+    asks for exactly one. But it is not an empty tile either (issue #407): the
+    ground under it was never read, so its points publish REQUEST_FAILED under
+    #168's tolerance, never ZERO_RESULTS. Before #407 they published as a
+    MEASURED absence, which no later reader can tell from a real one.
+
+    The tolerance is raised for this test because the fixture is a handful of
+    tiles; one of four is far over the 2% a real city's lattice allows.
     """
     lat, lon = straddling_city
     tiles = dp.tiles_for_bbox(*dp.grid_bbox(lat, lon, 100, 100, 20))
-    result, _, path = _run(monkeypatch, tmp_path, {}, lat, lon, empty={tiles[0]})
-    assert set(_written(path)["status"]) == {"ZERO_RESULTS"}
+    monkeypatch.setattr(dp, "MAX_FAILED_TILE_FRACTION", 0.99)
+    result, _, path = _run(monkeypatch, tmp_path, {}, lat, lon, missing={tiles[0]})
+    statuses = set(_written(path)["status"])
+    assert "REQUEST_FAILED" in statuses, (
+        f"a 404 tile's points must be unmeasured, not empty; got {statuses}"
+    )
+    assert "ZERO_RESULTS" in statuses, "the tiles that answered are still measured"
     assert result["api_requests"] == len(tiles)
+
+
+def test_one_404_at_the_default_tolerance_is_refused_as_failed_tiles_not_as_a_move(
+    monkeypatch, tmp_path, straddling_city
+):
+    """The same lone 404 against the real 2% tolerance: refused, and by the
+    generic tile-failure message -- the moved-endpoint wording is reserved for a
+    lattice where EVERY tile 404s."""
+    lat, lon = straddling_city
+    tiles = dp.tiles_for_bbox(*dp.grid_bbox(lat, lon, 100, 100, 20))
+    with pytest.raises(DownloadError, match="tiles failed") as excinfo:
+        _run(monkeypatch, tmp_path, {}, lat, lon, missing={tiles[0]})
+    assert "has moved or been renamed — refusing" not in str(excinfo.value)
+
+
+def test_a_lattice_of_204s_is_an_EMPTY_CITY_and_publishes_rather_than_refusing(
+    monkeypatch, tmp_path, straddling_city
+):
+    """
+    THE HOST'S REAL EMPTY-TILE ANSWER (issue #407), over every tile.
+
+    204 is what the meta-catalog sends for a tile holding no pictures, and 730
+    of 1,144 catalog cities genuinely hold none, so a lattice of them is a true
+    answer and must collect and publish as ZERO_RESULTS. The guard above keys on
+    the 404 for exactly this reason; keyed on emptiness it would fail two
+    thirds of the catalog.
+    """
+    lat, lon = straddling_city
+    tiles = dp.tiles_for_bbox(*dp.grid_bbox(lat, lon, 100, 100, 20))
+    assert len(tiles) >= 2, "the guard's bound is two tiles; this must clear it"
+    result, served, path = _run(monkeypatch, tmp_path, {}, lat, lon, no_content=set(tiles))
+    assert set(_written(path)["status"]) == {"ZERO_RESULTS"}
+    assert result["api_requests"] == len(tiles) == len(served)
 
 
 def test_an_empty_city_that_answers_200_is_published_as_empty(
     monkeypatch, tmp_path, straddling_city
 ):
     """
-    The other side of the guard above, and the reason it keys on 404 rather than
-    on emptiness: 730 of 1,144 catalog cities genuinely hold no Panoramax
-    imagery, and every one of them must collect and publish as ZERO_RESULTS.
+    The other empty answer: a 200 whose body carries no picture layer, which is
+    what phase 1 saw at z14 (where the layer is not served at all). Equally a
+    measured absence, and it must publish as ZERO_RESULTS exactly as the 204
+    lattice above does.
     """
     lat, lon = straddling_city
     _, _, path = _run(monkeypatch, tmp_path, {}, lat, lon)
     written = _written(path)
     assert set(written["status"]) == {"ZERO_RESULTS"}
+
+
+def test_204_tiles_beside_real_imagery_change_nothing_about_the_imagery(
+    monkeypatch, tmp_path, straddling_city
+):
+    """
+    The common shape over a real bbox: most z15 tiles are empty and a few carry
+    pictures. The 204s must read as empty ground, and the picture-bearing tile
+    must publish exactly as it would have alone.
+    """
+    lat, lon = straddling_city
+    tiles = dp.tiles_for_bbox(*dp.grid_bbox(lat, lon, 100, 100, 20))
+    served_tile = encode_tile([make_picture("only", lon, lat)], *tiles[0])
+    _, _, path = _run(
+        monkeypatch, tmp_path, {tiles[0]: served_tile}, lat, lon, no_content=set(tiles[1:])
+    )
+    written = _written(path)
+    assert "OK" in set(written["status"]), "the served picture must still be found"
+    assert "REQUEST_FAILED" not in set(written["status"]), "a 204 is an answer, not a hole"
+
+
+def test_a_204_is_COMMITTED_and_a_404_is_NOT(monkeypatch, tmp_path, straddling_city):
+    """
+    WHY 204 AND 404 MUST BE TOLD APART AT THE CHECKPOINT.
+
+    A 204 is a settled observation, so it is committed as a zero-row tile; at
+    z15 most tiles over a real bbox are empty, and holding them back would leave
+    every city's checkpoint incomplete and every census-cache entry refused. A
+    404 is an unread tile, so it stays uncommitted and is asked again next time
+    -- which is also what keeps the moved-endpoint guard from being spent by
+    the run that fires it (the night-after test above).
+    """
+    lat, lon = straddling_city
+    tiles = dp.tiles_for_bbox(*dp.grid_bbox(lat, lon, 100, 100, 20))
+    bbox = dp.grid_bbox(lat, lon, 100, 100, 20)
+    checkpoint_path = str(tmp_path / "crawl")
+    # One 404 tile among 204s; the tolerance is raised so the run finishes and
+    # leaves its (incomplete, so unpromoted) checkpoint behind to be read.
+    monkeypatch.setattr(dp, "MAX_FAILED_TILE_FRACTION", 0.99)
+    _run(
+        monkeypatch,
+        tmp_path,
+        {},
+        lat,
+        lon,
+        missing={tiles[0]},
+        no_content=set(tiles[1:]),
+        checkpoint_path=checkpoint_path,
+        checkpoint_channel="panoramax",
+    )
+    done = dp._open_tile_checkpoint(
+        checkpoint_path, bbox=bbox, tiles=tiles, channel="panoramax", variant=None
+    ).done
+    assert done == dict.fromkeys(tiles[1:], 0), (
+        f"every 204 tile must be committed as zero rows and the 404 tile must not; got {done}"
+    )
+
+
+def test_the_walks_census_reports_a_404_tile_as_FAILED_and_a_204_tile_as_not(
+    monkeypatch, straddling_city
+):
+    """
+    The road walk (#331) reads `fetch_city_images_async`'s ``failed_tiles`` to
+    mark samples UNKNOWN rather than ZERO_RESULTS, so this is the walk's half of
+    the rule, pinned at the seam it consumes: the 404 tile is in the list, the
+    204 tile is not.
+    """
+    lat, lon = straddling_city
+    bbox = dp.grid_bbox(lat, lon, 100, 100, 20)
+    tiles = dp.tiles_for_bbox(*bbox)
+    monkeypatch.setattr(dp, "MAX_FAILED_TILE_FRACTION", 0.99)
+
+    def answer(url):
+        xy = _tile_xy_from_url(url)
+        return _TileResponse(404) if xy == tiles[0] else _TileResponse(204)
+
+    monkeypatch.setattr(dp.aiohttp, "ClientSession", lambda **kw: _TileSession(answer))
+    fetched = asyncio.run(dp.fetch_city_images_async("Test City", bbox))
+    assert fetched["failed_tiles"] == [tiles[0]]
+    assert len(fetched["census"]) == 0
 
 
 # ── The two counters, and where each one goes ──────────────────────────────

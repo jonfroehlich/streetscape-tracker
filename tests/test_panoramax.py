@@ -18,10 +18,10 @@ is modelled on, because those are the differences a reader coming from
     schema declares `is_pano` NON-nullable, which is only honest because the
     field has no absent state -- so what is pinned is that an absent type
     produces flat rather than a null.
-  * 403/429 IS A STOP AND 404 IS AN ANSWER. There is no credential here, so a
-    403 cannot be a rejected token; and an empty area answers 200 with no layer,
-    so a 404 means "nothing at this tile" -- which is why a whole lattice of
-    them has to be refused rather than published.
+  * 403/429 IS A STOP, 204 IS THE EMPTY TILE AND 404 IS NOT. There is no
+    credential here, so a 403 cannot be a rejected token; and the host answers
+    a tile holding nothing with 204 and never 404s a tile route (issue #407),
+    so a 404 is an unrouted URL -- an unread tile, never an empty one.
 """
 
 import asyncio
@@ -498,18 +498,50 @@ def test_an_error_page_served_with_a_200_is_a_block_not_a_corrupt_tile():
         _fetch(session)
 
 
-def test_a_404_is_an_EMPTY_TILE_that_is_counted_rather_than_raised():
+def test_a_204_is_the_EMPTY_TILE_counted_and_never_retried():
     """
-    The opposite reading from Mapillary's, and it is measured rather than
-    assumed: phase 1 saw 0 empty tiles across 3,321 requests INCLUDING 20 cities
-    holding no imagery at all, because an empty area answers 200 with no layer.
-    Counted so the caller can refuse a whole lattice of them.
+    What the host actually sends for a tile holding nothing (issue #407,
+    measured 2026-10-01: an ocean tile answered 204 with 0 bytes, and its source
+    returns 204 for an empty tile and never 404). Before #407 a 204 fell through
+    `raise_for_status` (not an error) and `read()` returned b"" -- right by
+    accident, and counted by nobody. Asserted through ``on_empty``, because the
+    accidental path returned the same bytes and only the count tells them apart.
+    """
+    empties = []
+    session = _FakeTileSession(_FakeTileResponse(204))
+    assert _fetch(session, on_empty=lambda: empties.append(1)) == b""
+    assert len(empties) == 1, "a 204 is the empty tile and must be counted as one"
+    assert session.calls == 1, "a 204 is an answer, so it must not be retried"
+
+
+def test_a_204_is_empty_even_if_it_claims_an_error_content_type():
+    """
+    A 204 has no body, so whatever Content-Type rides on it describes nothing.
+    Read before the error-page test, or a proxy that stamps `text/html` on every
+    response would turn the commonest answer over a real bbox into a host block
+    that ends the city.
+    """
+    session = _FakeTileSession(_FakeTileResponse(204, {"Content-Type": "text/html"}))
+    assert _fetch(session) == b""
+
+
+def test_a_404_is_NOT_an_empty_tile_it_is_an_unread_one():
+    """
+    The host never 404s a tile route, so a 404 means the URL is not one it
+    serves: a moved endpoint. Before #407 it was returned as an empty tile, so a
+    stray one published its ground as a MEASURED absence. It now raises a
+    per-tile error that is neither a DownloadError (which would stop the whole
+    city at one stray 404) nor an aiohttp error (which backoff would retry into
+    an unrouted path), and it is not counted as empty.
     """
     empties = []
     session = _FakeTileSession(_FakeTileResponse(404))
-    assert _fetch(session, on_empty=lambda: empties.append(1)) == b""
-    assert len(empties) == 1
-    assert session.calls == 1, "a 404 is an answer, so it must not be retried"
+    with pytest.raises(dp.TileNotServedError, match="404") as excinfo:
+        _fetch(session, on_empty=lambda: empties.append(1))
+    assert not isinstance(excinfo.value, DownloadError)
+    assert not isinstance(excinfo.value, aiohttp.ClientError)
+    assert empties == [], "a 404 is not an empty tile"
+    assert session.calls == 1, "an unrouted path does not become routed by asking again"
 
 
 def test_a_5xx_is_retried_and_every_attempt_is_paced_and_counted():

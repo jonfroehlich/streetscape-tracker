@@ -596,8 +596,9 @@ The tile layers are the answer to all three: they carry a `type` field with no a
 **What the COLLECTOR does, as shipped (#316 phase 2).**
 Same 30/min and the same CV-0.6 jitter as the probe, from `download_common.spaced_gap_seconds` rather than re-derived, and behind `host_lock(HOST_PANORAMAX)` — the fourth locked host, exit codes **84 blocked / 85 busy**.
 **403 and 429 are `HostBlockedError` at the first request**, which is a stronger reading than the other two providers get and follows from there being no credential: on Mapillary and KartaView a 403 is a rejected token and is deliberately scoped to the key, while here it can only be the IP.
-**A 404 is an empty tile rather than a failure** — measured, not assumed: 0 empty tiles across 3,321 phase-1 requests including 20 cities holding nothing, because an empty area answers 200 with no layer.
-The guard that reading needs is that **a lattice where EVERY tile 404s is refused**, since that is what a moved endpoint looks like and the alternative is publishing a city as having lost all its imagery.
+**A 204 is the empty tile, and a 404 is not one** (#407, measured 2026-10-01: an ocean tile answers 204 with 0 bytes, and 235 z6 world tiles answered 201 × 200, 34 × 204, 0 × 404).
+The earlier reading — "a 404 is an empty tile, because an empty area answers 200 with no layer" — rested on phase 1's instrument, which counted only 404s as empty and so could not see a 204 at all.
+A lone 404 is therefore a failed tile, and **a lattice where EVERY tile 404s is refused** by name as a moved endpoint; a lattice of 204s is an empty city and publishes.
 Unlike the probe there is no `refuse_on_collection_host()`: a collector's whole purpose is to run on the collection host, so what protects the nightly batch is the pace, the host lock and the fact that the channel is not scheduled yet.
 
 **One host, not twenty-five.** `api.panoramax.xyz` is a meta-catalog that harvests metadata from every registered instance (23 on 2026-09-04), so a collector would query one host regardless of how many instances join — one `host_lock.py` entry, no per-instance fan-out, and no per-instance rate question.

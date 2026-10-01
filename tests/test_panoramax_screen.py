@@ -11,8 +11,9 @@ What these pin, in the order the instrument is built:
    selection would miss the very hexagon a city sits inside.
 3. **The economy** — the whole catalog dedupes to a handful of z6 tiles, which
    is the only reason this can run weekly.
-4. **The two refusals**. An all-404 pass is a moved endpoint, and a pass that
-   finds nothing anywhere in a catalog that has found something before is a
+4. **The refusals**. A 404 ends the pass (the host never 404s a tile route,
+   so it is an unread tile, issue #407), an all-204 pass is a meta-catalog
+   serving nothing, and a pass that finds nothing anywhere in a catalog that has found something before is a
    renamed layer. Both must refuse rather than write, because the damage in each
    case is a dated row saying "empty" about cities nobody measured.
 5. **The catalog contract** — a screen is idempotent per date, spends into the
@@ -115,7 +116,10 @@ class _FakeSession:
 
     def get(self, url, **kwargs):
         self.urls.append(url)
-        response = self.by_url.get(url, _FakeResponse(404))
+        # An unlisted tile answers 204, the host's real empty-tile answer
+        # (issue #407) -- NOT 404, which this host never sends for a tile route
+        # and which now ends the pass as an unread tile.
+        response = self.by_url.get(url, _FakeResponse(204))
 
         class _Ctx:
             async def __aenter__(self):
@@ -207,9 +211,9 @@ def test_a_seam_hexagon_reporting_zero_on_one_side_still_counts_its_pictures():
 
 
 def test_an_empty_tile_and_a_tile_without_the_layer_are_both_answers():
-    """An area the provider knows nothing about answers 200 with no `grid`
-    layer, and a 404 decodes from empty bytes. Neither is an error, and both
-    must decode to "no hexagons" rather than raising."""
+    """A tile without the `grid` layer answers 200 with other layers, and an
+    empty tile answers 204 with no body (issue #407). Neither is an error, and
+    both must decode to "no hexagons" rather than raising."""
     assert ps.hexes_from_tile(b"", 15, 23, ps.SCREEN_ZOOM) == {}
     other_layer = encode_grid_tile(
         [("h1", (-94.0, 41.0, -93.5, 41.5), counters(1))], 15, 23, layer="pictures"
@@ -311,20 +315,77 @@ def test_the_tiles_are_enumerated_from_the_GROWN_bbox():
 # ── 4. The refusals ────────────────────────────────────────────────────────
 
 
-def test_every_tile_404ing_is_a_moved_endpoint_and_refuses():
+def test_every_tile_204ing_refuses_rather_than_zeroing_the_catalog():
     """
-    On this host an empty area answers 200 with no layer — phase 1 saw zero 404s
-    in 3,321 requests, including 20 cities holding nothing. So an all-404 pass is
-    a renamed URL, and finalizing it would stamp the whole catalog with a zero on
-    the day the endpoint changed.
+    A 204 is a true answer for ONE tile (issue #407) -- but a z6 screen tile is
+    ~5.6 degrees of longitude and 201 of 235 such tiles over the world held
+    imagery on 2026-10-01, so a pass in which EVERY tile is empty is a
+    meta-catalog serving nothing, and recording it would stamp every city zero.
     """
-    with pytest.raises(DownloadError, match="moved or been renamed"):
-        ps._refuse_if_endpoint_moved([(1, 1), (1, 2)], empty_tiles=2)
+    with pytest.raises(DownloadError, match="EVERY tile is empty"):
+        ps._refuse_if_every_tile_empty([(1, 1), (1, 2)], empty_tiles=2)
 
 
-def test_a_single_404_is_a_hole_and_not_an_endpoint_change():
-    ps._refuse_if_endpoint_moved([(1, 1)], empty_tiles=1)  # one tile: no evidence
-    ps._refuse_if_endpoint_moved([(1, 1), (1, 2)], empty_tiles=1)  # not all of them
+def test_a_single_204_is_an_empty_tile_and_not_an_empty_catalog():
+    ps._refuse_if_every_tile_empty([(1, 1)], empty_tiles=1)  # one tile: no evidence
+    ps._refuse_if_every_tile_empty([(1, 1), (1, 2)], empty_tiles=1)  # not all of them
+
+
+def _status_pass(monkeypatch, statuses):
+    """One whole screen pass through the REAL `_fetch_tile` (issue #407), over
+    two z6 tiles answering the given statuses -- a 200 carries one hexagon."""
+    tiles = [(10, 20), (11, 20)]
+    by_url = {}
+    for (x, y), status in zip(tiles, statuses, strict=True):
+        body = b""
+        if status == 200:
+            body = encode_grid_tile(
+                [(f"h{x}", (-94.0, 41.0, -93.0, 42.0), counters(5, 5, 0))], x, y
+            )
+        by_url[tile_url(x, y)] = _FakeResponse(status, body)
+    session = _FakeSession(by_url)
+    monkeypatch.setattr(aiohttp, "ClientSession", lambda **kw: _AsyncCM(session))
+    monkeypatch.setattr(ps, "plan_screen", lambda targets: (tiles, {"c": tiles}))
+    target = ps.ScreenTarget("c", "C", "US", (-94.0, 41.0, -93.0, 42.0))
+    return session, lambda: asyncio.run(ps.screen_targets_async([target]))
+
+
+def test_a_pass_of_204s_through_the_real_fetcher_is_refused_as_EMPTY(monkeypatch):
+    """
+    The pass-level twin of the guard test above, with the status classified by
+    the real fetcher rather than by a stub. Before #407 a 204 was not counted
+    as empty, so this pass was refused only by accident -- by the renamed-layer
+    guard, as "tiles answered with a body" when none had a body at all.
+    """
+    session, run = _status_pass(monkeypatch, [204, 204])
+    with pytest.raises(DownloadError, match="answered HTTP 204") as excinfo:
+        run()
+    assert excinfo.value.api_requests == 2
+    assert len(session.urls) == 2
+
+
+def test_a_204_beside_a_tile_with_imagery_is_an_ordinary_empty_tile(monkeypatch):
+    """The ordinary shape -- 34 of 235 world tiles answered 204 -- must screen,
+    and report the 204 as an empty tile rather than an answering one."""
+    _, run = _status_pass(monkeypatch, [200, 204])
+    out = run()
+    assert out["empty_tiles"] == 1
+    assert out["hexagons"] == 1
+    assert out["api_requests"] == 2
+
+
+def test_a_single_404_ENDS_the_pass_because_it_is_an_unread_tile(monkeypatch):
+    """
+    This host never 404s a tile route (issue #407), so a 404 is a moved endpoint
+    and the tile under it was never read. A screen has no per-tile tolerance --
+    an unread z6 tile is every city under it -- so ONE 404 ends the pass, with
+    the requests already sent stamped for the ledger.
+    """
+    session, run = _status_pass(monkeypatch, [404, 200])
+    with pytest.raises(DownloadError, match="answered HTTP 404") as excinfo:
+        run()
+    assert excinfo.value.api_requests == 1
+    assert len(session.urls) == 1, "the pass must stop at the 404, not read on"
 
 
 def test_a_tile_that_cannot_be_read_ends_the_pass_rather_than_writing_a_hole(monkeypatch):
@@ -628,7 +689,7 @@ def test_a_catalog_wide_zero_is_REFUSED_when_cities_have_screened_positive_befor
     data_dir, conn, monkeypatch
 ):
     """
-    The quiet failure the all-404 guard cannot see: a 200 whose `grid` layer has
+    The quiet failure the empty-tile guard cannot see: a 200 whose `grid` layer has
     been renamed decodes to nothing, and every city would be written a
     conclusive zero it was never measured at. Refused BEFORE the write, because
     the write is the damage.
@@ -936,16 +997,16 @@ def test_a_pass_refused_MIDWAY_charges_the_requests_it_actually_sent(monkeypatch
     assert excinfo.value.api_requests == 3, "the refused request was sent too"
 
 
-def test_an_all_404_pass_charges_the_whole_lattice_it_paid_for(monkeypatch):
-    """The moved-endpoint refusal is the screen's most expensive failure — it
-    comes after every tile was requested — so the ledger must see all of it."""
+def test_an_all_204_pass_charges_the_whole_lattice_it_paid_for(monkeypatch):
+    """The all-empty refusal is the screen's most expensive failure — it comes
+    after every tile was requested — so the ledger must see all of it."""
 
-    async def always_404(session, url, timeout, limiter, on_request, on_empty):
+    async def always_204(session, url, timeout, limiter, on_request, on_empty):
         on_request()
         on_empty()
         return b""
 
-    monkeypatch.setattr(ps, "_fetch_tile", always_404)
+    monkeypatch.setattr(ps, "_fetch_tile", always_204)
     monkeypatch.setattr(ps, "plan_screen", lambda targets: ([(1, 1), (1, 2)], {"c": [(1, 1)]}))
     with pytest.raises(DownloadError) as excinfo:
         asyncio.run(ps.screen_targets_async([ps.ScreenTarget("c", "C", "US", (0, 0, 1, 1))]))
@@ -1077,7 +1138,7 @@ def test_a_corrupt_tile_body_is_a_DownloadError_carrying_its_spend(monkeypatch):
 def test_tiles_that_ANSWER_but_decode_to_nothing_are_refused_with_no_history(monkeypatch):
     """
     A renamed layer (`grid` -> `grid_v2`) answers 200 with a body, so no tile
-    404s and the moved-endpoint guard is blind to it, while every tile decodes to
+    answers 204 or 404 and the empty-tile guard is blind to it, while every tile decodes to
     {}. The catalog-collapse check in the scheduler cannot see it either on a
     first run, because it needs a city to have screened positive before — and an
     empty `provider_screen` is every first run, including production's. Without
@@ -1118,10 +1179,10 @@ def test_tiles_that_ANSWER_but_decode_to_nothing_are_refused_with_no_history(mon
 
 
 def test_one_answering_tile_that_decodes_to_nothing_is_NOT_a_renamed_layer():
-    """The guard is bounded at two answering tiles for the reason the 404 one is:
-    a single genuinely featureless tile proves nothing."""
+    """The guard is bounded at two answering tiles for the reason the empty-tile
+    one is: a single genuinely featureless tile proves nothing."""
     ps._refuse_if_layer_missing([(1, 1)], empty_tiles=0, hexagons=0)
-    # An honestly empty area that 404s is the 404 guard's business, not this one.
+    # Tiles that answered 204 are the empty-tile guard's business, not this one.
     ps._refuse_if_layer_missing([(1, 1), (1, 2)], empty_tiles=2, hexagons=0)
     # And tiles that answered WITH hexagons are simply fine.
     ps._refuse_if_layer_missing([(1, 1), (1, 2)], empty_tiles=0, hexagons=1)
