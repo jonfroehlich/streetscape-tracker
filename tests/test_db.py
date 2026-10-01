@@ -181,6 +181,24 @@ def test_diff_storage(conn, city):
     assert row["panos_added"] == 5 and row["grid_aligned"] == 1
 
 
+def test_update_diff_of_a_missing_row_raises(conn):
+    """A repair that updated nothing must not read as one that succeeded."""
+    with pytest.raises(LookupError):
+        db.update_diff(
+            conn,
+            12345,
+            grid_aligned=True,
+            panos_added=0,
+            panos_removed=0,
+            panos_persisted=0,
+            capture_date_changed=0,
+            points_gained_coverage=None,
+            points_lost_coverage=None,
+            coverage_delta_pct=None,
+            detail_filename=None,
+        )
+
+
 def _diff(conn, city, from_run_id, to_run_id, **overrides):
     kwargs = dict(
         city_id=city,

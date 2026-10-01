@@ -90,6 +90,7 @@ The steps below are per (city, provider, run_date):
    Both families go through one remover, `fileutils.remove_stale_diff_detail`, which tolerates a missing file and logs rather than raises on any other `OSError`, because it runs after a paid-for crawl is cataloged.
    Before #265 the file was only ever written, so a re-diff that came out with no changes, or a skipped walk re-diff, left it in `data/` with nothing pointing at it;
    `scripts/sweep_orphan_diff_details.py` finds those, and a local removal does not reach the web server, since the publish rsync never passes `--delete`.
+   An existing diff is re-derived under the current reader and definitions by `scripts/recompute_run_diffs.py` (#245), which updates the row in place so its `diff_id` — and with it which comparison the published change blocks treat as current — never moves; `recompute_run_stats.py` does not touch diffs.
 6. `json_summarizer.generate_city_metadata_summary_as_json()` — per-run JSON v2, ages pinned to `run_date` (deterministic); gsv runs include the `google_panos` block, other providers only `all_panos`.
    Then `generate_aggregate_v2()` builds `cities.json.gz` (schema v3) from the DB: per city `{city_id, city, providers: {gsv: {latest, runs, change}, mapillary: {...}}}`, with per-provider global histograms.
 
