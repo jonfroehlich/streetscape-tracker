@@ -3312,24 +3312,36 @@ _PROD_SLATE = [
 _OPT_IN_CHANNELS = _PROD_SLATE[2:]
 
 
-def _prod_shaped_stranded_slate(conn):
+_PROD_SHAPE = {
+    "kind0": 10,
+    "kind2": 10,
+    "kartaview": 10,
+    "kartaview_streets": 3,
+    "panoramax": 3,
+    "panoramax_streets": 3,
+}
+
+
+def _prod_shaped_stranded_slate(conn, counts=_PROD_SHAPE):
     """Every stranded kind non-empty, and four stranded opt-in channels.
 
-    Returns ``{city_id: label}``, where the label is ``"kind0"``, ``"kind2"``
-    or the city's leading opt-in channel.
+    ``counts`` maps each label to how many cities carry it (absent = 0); the
+    default is the review's prod shape. Returns ``{city_id: label}``, where the
+    label is ``"kind0"``, ``"kind2"`` or the city's leading opt-in channel.
     """
     labels = {}
-    for i in range(10):
+    for i in range(counts.get("kind0", 0)):
         labels[_register(conn, f"Exc{i}", width=1000, height=1000, step=20)] = "kind0"
-    for i in range(10):
+    for i in range(counts.get("kind2", 0)):
         labels[_register(conn, f"Mly{i}", width=1000, height=1000, step=20)] = "kind2"
     shapes = [
-        ("Kv", 10, "kartaview", ("kartaview", "kartaview_streets")),
-        ("Kw", 3, "kartaview_streets", ("kartaview", "kartaview_streets")),
-        ("Pg", 3, "panoramax", ("panoramax", "panoramax_streets")),
-        ("Pw", 3, "panoramax_streets", ("panoramax", "panoramax_streets")),
+        ("Kv", "kartaview", ("kartaview", "kartaview_streets")),
+        ("Kw", "kartaview_streets", ("kartaview", "kartaview_streets")),
+        ("Pg", "panoramax", ("panoramax", "panoramax_streets")),
+        ("Pw", "panoramax_streets", ("panoramax", "panoramax_streets")),
     ]
-    for prefix, n, leading, _ in shapes:
+    for prefix, leading, _ in shapes:
+        n = counts.get(leading, 0)
         for i in range(n):
             labels[_register(conn, f"{prefix}{i}", width=1000, height=1000, step=20)] = leading
     db.assign_schedule(conn, 90, providers=tuple(_PROD_SLATE))
@@ -3341,7 +3353,7 @@ def _prod_shaped_stranded_slate(conn):
         if label == "kind2":
             continue
         db.record_attempt(conn, cid, success=True, provider="mapillary")
-        enrolled = next(ch for _, _, lead, ch in shapes if lead == label)
+        enrolled = next(ch for _, lead, ch in shapes if lead == label)
         for channel in enrolled:
             db.set_channel_membership(conn, cid, channel, True, cycle_days=90)
         if label.endswith("_streets"):
@@ -3437,6 +3449,39 @@ def test_kartaview_resumers_leave_every_stranded_channel_a_take(conn, monkeypatc
         )
         reached |= {labels[c] for c in head}
     assert reached == {"kind0", "kind2", *_OPT_IN_CHANNELS}
+
+
+def test_a_kind_with_an_unserved_channel_is_not_served_below_the_sub_queue_count(conn, monkeypatch):
+    """A resumer serves its own CHANNEL sub-queue, not its whole kind (#397).
+
+    Kinds 0 and 2 plus kartaview and kartaview_streets: four sub-queues, a
+    reservation of 3. The floor takes max(1, 3 - 3) = 1 resumer, from
+    kartaview. kartaview_streets has had no turn, so kind 1 stays in the front
+    half and the two remaining slots go to kinds 0 and 1 in kind order; kind 2
+    waits. Pinned like the below-G case: it is the documented below-S order,
+    and treating a partly served kind as served would hand kind 2 the slot.
+    """
+    from collections import Counter
+
+    from streetscape_metadata_tracker import scheduler as sched
+
+    labels = _prod_shaped_stranded_slate(
+        conn, {"kind0": 2, "kind2": 2, "kartaview": 2, "kartaview_streets": 2}
+    )
+    resumer = next(cid for cid, label in labels.items() if label == "kartaview")
+    monkeypatch.setattr(
+        sched,
+        "_sweep_checkpoint_progress",
+        lambda cfg, city, channel: {"age_s": 1.0} if city.city_id == resumer else None,
+    )
+    cfg = _sweep_cfg(publish_enabled=False, opt_in_cities_per_day=3)
+    slate = sched._collect_due(
+        conn, cfg, date(2026, 7, 2), list(_PROD_SLATE), max_opt_in=3, max_cities=60
+    )
+    head = [c.city_id for c in slate.cities[:3]]
+    assert resumer in head
+    kinds = Counter("kind1" if labels[c].startswith("kartaview") else labels[c] for c in head)
+    assert kinds == {"kind0": 1, "kind1": 2}
 
 
 def test_a_reservation_of_zero_hoists_no_resumer(conn, monkeypatch):
