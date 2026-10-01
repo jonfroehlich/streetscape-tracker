@@ -718,15 +718,17 @@ batch_size = 100
 # the lever for raising a child ABOVE 50, which is a different decision.
 #
 # The old hazard is genuinely gone: the clamp caps every child at 50, and the
-# cli.py guard is `connection_limit > batch_size` with batch_size = 100, so the
-# scheduler can no longer reach it at ANY value of this key. It stays reachable
-# by HAND (`--connection-limit 150` on a manual run) -- see #359, which also
-# argues that an argparse exit 2 should not count a strike against a city.
+# cli.py guard is `connection_limit > PIPELINE_DEPTH x batch_size` (4 x 100 =
+# 400 since #304 pipelined the GSV engine; it was batch_size alone before), so
+# the scheduler can no longer reach it at ANY value of this key. It stays
+# reachable by HAND (`--connection-limit 500` on a manual run) -- see #359,
+# which also argues that an argparse exit 2 should not count a strike against a
+# city.
 #
 # So: 150 for 3 lanes is safe and correct. Raising the per-child count above 50
-# is the separate thing that needs a memory measurement and a batch_size raise
-# first, because the systemd unit is explicitly NOT sized for the #304
-# connection_limit experiment.
+# is the separate thing that needs a memory measurement first (and a batch_size
+# raise only past 400), because the systemd unit is explicitly NOT sized for
+# the #304 connection_limit experiment.
 connection_limit = 100
 request_timeout_s = 30.0
 # 60 -> 5 on 2026-09-02 (issue #306). It was never a rate limiter and every

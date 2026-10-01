@@ -61,25 +61,47 @@ def test_load_cities_reads_file_skipping_noise(tmp_path):
     ]
 
 
-def test_a_connection_limit_above_batch_size_is_clamped_like_the_child_does(monkeypatch, capsys):
+def test_a_connection_limit_above_the_in_flight_bound_is_clamped_like_the_child_does(
+    monkeypatch, capsys
+):
     """run_cities.py forwards both flags to streetscape_tracker.py, whose own
     parser clamps rather than refuses since issue #359. The batch driver must
     agree with it -- refusing here would reject an argv the child accepts --
-    and clamps BEFORE forwarding so a batch warns once, not once per city."""
+    and clamps BEFORE forwarding so a batch warns once, not once per city. The
+    bound is PIPELINE_DEPTH x batch_size since #304 pipelined the GSV engine."""
     import sys
+
+    from streetscape_metadata_tracker.download_gsv import PIPELINE_DEPTH
+
+    bound = PIPELINE_DEPTH * 100
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_cities.py",
+            "cities.txt",
+            "--connection-limit",
+            str(bound + 50),
+            "--batch-size",
+            "100",
+        ],
+    )
+    assert run_cities.parse_args().connection_limit == bound
+    assert f"exceeds {PIPELINE_DEPTH} x --batch-size 100 = {bound}" in capsys.readouterr().err
 
     monkeypatch.setattr(
         sys,
         "argv",
         ["run_cities.py", "cities.txt", "--connection-limit", "150", "--batch-size", "100"],
     )
-    assert run_cities.parse_args().connection_limit == 100
-    assert "exceeds --batch-size" in capsys.readouterr().err
+    assert run_cities.parse_args().connection_limit == 150
+    assert "exceeds" not in capsys.readouterr().err
 
+    # Exactly the bound passes through unwarned (a `>=` clamp would warn).
     monkeypatch.setattr(
         sys,
         "argv",
-        ["run_cities.py", "cities.txt", "--connection-limit", "50", "--batch-size", "100"],
+        ["run_cities.py", "cities.txt", "--connection-limit", str(bound), "--batch-size", "100"],
     )
-    assert run_cities.parse_args().connection_limit == 50
-    assert "exceeds --batch-size" not in capsys.readouterr().err
+    assert run_cities.parse_args().connection_limit == bound
+    assert "exceeds" not in capsys.readouterr().err

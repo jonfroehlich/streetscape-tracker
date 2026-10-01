@@ -218,6 +218,91 @@ def test_rate_limiter_zero_or_negative_disables(monkeypatch):
     assert sleeps == []
 
 
+def _patch_overrunning_sleep(monkeypatch, clock, overrun):
+    """Every sleep lasts ``seconds * overrun(i)`` -- a real loop never wakes early."""
+    import asyncio as aio
+
+    calls = {"i": 0}
+
+    async def fake_sleep(seconds):
+        clock["t"] += seconds * overrun(calls["i"])
+        calls["i"] += 1
+
+    monkeypatch.setattr(aio, "sleep", fake_sleep)
+
+
+def test_rate_limiter_credits_sleep_overrun_so_it_reaches_its_rate(monkeypatch):
+    """Issue #304: the bucket zeroed itself after every sleep, discarding the
+    overrun, so a saturated limiter ran below its configured rate (79-83% at
+    48,000/min, docs/experiments/gsv-throughput.md). With every sleep
+    overrunning by 50%, 100 tokens past the burst must take ~10 s of clock at
+    600/min, not 15. (The credit is
+    bounded by the one-second capacity, so the bucket needs a capacity above
+    one token for it to show -- 600/min has 10; production's 48,000 has 800.)"""
+    clock, now = _make_clock()
+    _patch_overrunning_sleep(monkeypatch, clock, lambda _i: 1.5)
+    limiter = AsyncRateLimiter(600, time_func=now)  # 10 tokens/s, burst 10
+
+    async def scenario():
+        for _ in range(110):
+            await limiter.acquire()
+
+    _run(scenario())
+    # At most one sleep's overrun (0.05 s past a 0.1 s gap) is left unspent.
+    assert 10.0 - 1e-9 <= clock["t"] <= 10.0 + 0.05 + 1e-9
+
+
+def test_rate_limiter_crediting_the_overrun_never_exceeds_the_rate(monkeypatch):
+    """The ceiling the credit must not break: after k acquisitions at clock t,
+    k <= capacity + t * rate, whatever the sleeps overran by."""
+    import random
+
+    rng = random.Random(304)
+    clock, now = _make_clock()
+    _patch_overrunning_sleep(monkeypatch, clock, lambda _i: 1.0 + rng.random() * 3)
+    limiter = AsyncRateLimiter(600, time_func=now)  # 10 tokens/s, burst 10
+    seen = []
+
+    async def scenario():
+        for _ in range(500):
+            await limiter.acquire()
+            seen.append(clock["t"])
+            if rng.random() < 0.1:
+                clock["t"] += rng.random() * 0.5  # the caller idles now and then
+
+    _run(scenario())
+    for k, t in enumerate(seen, start=1):
+        assert k <= 10 + t * 10 + 1e-6, (k, t)
+
+
+def test_rate_limiter_caps_a_long_sleep_overrun_at_capacity(monkeypatch):
+    """#304 review: the credit after a sleep is capped at the one-second
+    capacity, exactly like the idle refill. A sleep that overruns by seconds
+    (the loop blocked on a synchronous CSV write or a FileLock wait) must not
+    bank those seconds as tokens and release them as one burst. The random
+    ceiling test above cannot see this: its overruns are all under one
+    capacity's worth, where capped and uncapped agree.
+
+    10/s, burst 10: drain, then the 11th acquisition's 0.1 s sleep lasts 5 s.
+    Capped, that leaves 9 tokens, so 9 more go out at once and the 10th
+    sleeps; uncapped it would leave 49."""
+    clock, now = _make_clock()
+    _patch_overrunning_sleep(monkeypatch, clock, lambda i: 50.0 if i == 0 else 1.0)
+    limiter = AsyncRateLimiter(600, time_func=now)  # 10 tokens/s, burst 10
+    after_overrun = []
+
+    async def scenario():
+        for _ in range(11):  # 10 from the burst, the 11th sleeps and overruns
+            await limiter.acquire()
+        t0 = clock["t"]
+        for _ in range(30):
+            await limiter.acquire()
+            after_overrun.append(clock["t"] == t0)
+
+    _run(scenario())
+    assert sum(after_overrun) == 9
+
+
 # ── AsyncRateLimiter jitter (issue #292) ─────────────────────────────────────
 #
 # The spaced pacer is the fourth per-IP hypothesis under test, and the property

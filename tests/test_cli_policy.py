@@ -204,19 +204,24 @@ def test_max_requests_per_minute_defaults_to_80pct_of_default_quota(monkeypatch,
     assert calls[0]["max_requests_per_minute"] == 24_000
 
 
-def test_a_connection_limit_above_batch_size_is_clamped_and_warned_not_refused(
+def test_a_connection_limit_above_the_in_flight_bound_is_clamped_and_warned_not_refused(
     monkeypatch, catalog, capsys
 ):
     """
-    The surplus is inert -- the GSV engine never has more than batch_size
-    requests in flight -- so refusing it cost a hand-run its collection and,
-    under the scheduler, quarantined the city (issue #359). The clamp is
-    one-directional: a limit below the batch passes through unwarned.
+    The surplus is inert -- the GSV engine never has more than PIPELINE_DEPTH x
+    batch_size requests in flight (#304; one batch before it) -- so refusing it
+    cost a hand-run its collection and, under the scheduler, quarantined the
+    city (issue #359). The clamp is one-directional: a limit at or below the
+    bound passes through unwarned, including one above a single batch, which
+    the pipelined engine can now use.
     """
+    from streetscape_metadata_tracker.download_gsv import PIPELINE_DEPTH
+
     conn, city_id, data_dir = catalog
     calls = []
     gsv_configs(monkeypatch)
     monkeypatch.setattr(cli, "download_gsv_metadata_async", stub_downloader(calls))
+    bound = PIPELINE_DEPTH * 100
 
     rc = run_cli(
         monkeypatch,
@@ -224,23 +229,42 @@ def test_a_connection_limit_above_batch_size_is_clamped_and_warned_not_refused(
         data_dir,
         "--force",
         "--connection-limit",
-        "150",
+        str(bound + 50),
         "--batch-size",
         "100",
     )
     assert rc == 0
-    assert calls[0]["connection_limit"] == 100
-    assert "exceeds --batch-size" in capsys.readouterr().err
+    assert calls[0]["connection_limit"] == bound
+    err = capsys.readouterr().err
+    assert f"exceeds {PIPELINE_DEPTH} x --batch-size 100 = {bound}" in err
 
     # The other direction at the parser: a second collection on the same run
     # date is a no-op, so this half reads what parse_args hands async_main.
+    # 150 is above one batch but inside the pipelined bound: no clamp now.
     monkeypatch.setattr(
         sys,
         "argv",
-        ["streetscape_tracker.py", city_id, "--connection-limit", "50", "--batch-size", "100"],
+        ["streetscape_tracker.py", city_id, "--connection-limit", "150", "--batch-size", "100"],
     )
-    assert cli.parse_args().connection_limit == 50
-    assert "exceeds --batch-size" not in capsys.readouterr().err
+    assert cli.parse_args().connection_limit == 150
+    assert "exceeds" not in capsys.readouterr().err
+
+    # The boundary itself: a limit of EXACTLY the bound (400 at batch 100) is
+    # usable, so it passes through unwarned (a `>=` clamp would warn on it).
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "streetscape_tracker.py",
+            city_id,
+            "--connection-limit",
+            str(bound),
+            "--batch-size",
+            "100",
+        ],
+    )
+    assert cli.parse_args().connection_limit == bound
+    assert "exceeds" not in capsys.readouterr().err
 
 
 def _mapillary_stub(calls):
