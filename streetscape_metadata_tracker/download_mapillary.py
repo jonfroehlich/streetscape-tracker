@@ -103,10 +103,15 @@ from .download_common import _M_PER_DEG_LAT as _M_PER_DEG_LAT
 from .download_common import (
     HOST_MAPILLARY_TILES,
     MAPILLARY_TILE_CONNECTION_LIMIT,
+    SWEEP_STOP_CLOCK,
+    SWEEP_STOP_REQUESTS,
     AsyncRateLimiter,
     DownloadError,
     HostBlockedError,
     SweepIncompleteError,
+    crawl_budget_seconds,
+    crawl_ceiling_needs_checkpoint,
+    crawl_deadline_passed,
     redact_credentials,
 )
 from .download_common import assign_to_grid as assign_to_grid
@@ -1199,6 +1204,7 @@ async def fetch_city_images_async(
     max_requests_per_minute: int = DEFAULT_TILE_REQUESTS_PER_MINUTE,
     jitter: float = DEFAULT_TILE_JITTER,
     max_requests: int | None = None,
+    deadline_monotonic: float | None = None,
     checkpoint_path: str | None = None,
     checkpoint_channel: str | None = None,
     checkpoint_variant: str | None = None,
@@ -1235,6 +1241,7 @@ async def fetch_city_images_async(
                 max_requests_per_minute=max_requests_per_minute,
                 jitter=jitter,
                 max_requests=max_requests,
+                deadline_monotonic=deadline_monotonic,
                 checkpoint_path=checkpoint_path,
                 checkpoint_channel=checkpoint_channel,
                 checkpoint_variant=checkpoint_variant,
@@ -1258,6 +1265,7 @@ async def _fetch_city_images(
     max_requests_per_minute: int = DEFAULT_TILE_REQUESTS_PER_MINUTE,
     jitter: float = DEFAULT_TILE_JITTER,
     max_requests: int | None = None,
+    deadline_monotonic: float | None = None,
     checkpoint_path: str | None = None,
     checkpoint_channel: str | None = None,
     checkpoint_variant: str | None = None,
@@ -1288,6 +1296,12 @@ async def _fetch_city_images(
             ``connection_limit * TILE_MAX_TRIES`` rather than by the size of the
             city. Requires ``checkpoint_path`` -- capped and uncheckpointed, a
             crawl discards everything it paid for.
+        deadline_monotonic: an absolute ``time.monotonic()`` value at which to
+            stop the same way (issue #344), or None for no clock stop. Checked
+            beside ``max_requests`` at the same tile boundary and with the same
+            soft-ceiling residue; whichever ceiling is reached first pauses the
+            crawl, and the error names which. Requires ``checkpoint_path``, for
+            the same reason.
         checkpoint_path: directory to resume from and commit into, or None
             for the historical fetch-everything behaviour. Built by the
             caller, because only the caller knows the channel — see
@@ -1327,18 +1341,20 @@ async def _fetch_city_images(
         has MOVED, so the caller's ``discard_checkpoint`` must not chase it.
 
     Raises:
-        ValueError: ``max_requests`` given without a ``checkpoint_path``. A
-            caller bug rather than a runtime condition -- both silent
-            fall-backs are wrong in a way nothing downstream could see, since
-            ignoring the cap overspends a per-IP budget and honouring it burns
-            one for nothing.
-        SweepIncompleteError: the cap was reached with tiles unfetched and the
-            checkpoint holds them. Progress, not breakage: it maps to exit 83,
-            which the scheduler amnesties rather than counting a failure.
+        ValueError: ``max_requests`` or ``deadline_monotonic`` given without
+            a ``checkpoint_path``. A caller bug rather than a runtime
+            condition -- both silent fall-backs are wrong in a way nothing
+            downstream could see, since ignoring the cap overspends a per-IP
+            budget and honouring it burns one for nothing.
+        SweepIncompleteError: the cap or the deadline was reached with tiles
+            unfetched and the checkpoint holds them. Progress, not breakage: it
+            maps to exit 83, which the scheduler amnesties rather than counting
+            a failure.
         DownloadError: on a rejected token or tile transport failure, carrying
             ``api_requests`` so the caller can still record what it spent.
     """
-    if max_requests is not None and checkpoint_path is None:
+    unresumable = crawl_ceiling_needs_checkpoint(max_requests, deadline_monotonic, checkpoint_path)
+    if unresumable is not None:
         # REFUSED HERE, before a single request, because the two arguments are
         # only meaningful together (issue #318). A cap says "spend this much
         # tonight and continue tomorrow", and without somewhere to commit to
@@ -1351,9 +1367,10 @@ async def _fetch_city_images(
         # the cap silently overspends a per-IP budget, and honouring it silently
         # burns it. The only caller that passes a cap is the scheduler, which
         # always passes a checkpoint path with it, so this fires for a
-        # programming error and never for an operator.
+        # programming error and never for an operator. The wall-clock deadline
+        # (issue #344) is the same kind of stop and is refused the same way.
         raise ValueError(
-            "max_requests needs a checkpoint_path: a capped crawl stops part-way, "
+            f"{unresumable} needs a checkpoint_path: a capped crawl stops part-way, "
             "and with nothing to resume from that discards everything it spent."
         )
     tiles = tiles_for_bbox(*bbox)
@@ -1500,6 +1517,10 @@ async def _fetch_city_images(
     # out of budget for tonight, so they are owed to tomorrow. Folding them
     # together would make one of the two exit codes wrong whichever way it went.
     capped = False
+    # WHICH ceiling stopped the crawl, for the pause message (issue #344):
+    # "requests" or "clock". Set by the first tile turned away, so a night that
+    # runs into both reports the one it met first.
+    stop_reason: str | None = None
 
     # Requests promised to tiles that are past the cap check but have not yet
     # counted one. THE CAP GATES ON `api_requests + reserved`, NOT ON
@@ -1520,7 +1541,7 @@ async def _fetch_city_images(
     reserved = 0
 
     async def fetch_one(x: int, y: int) -> pd.DataFrame:
-        nonlocal fatal, capped, reserved
+        nonlocal fatal, capped, reserved, stop_reason
         url = f"{TILE_URL_TEMPLATE.format(z=TILE_ZOOM, x=x, y=y)}?access_token={access_token}"
         async with semaphore:
             # The abort check belongs HERE, inside the semaphore, not at the top
@@ -1539,7 +1560,12 @@ async def _fetch_city_images(
                 # tells those two apart.
                 progress_bar.update(1)
                 return records_to_census([])
-            if max_requests is not None and api_requests + reserved >= max_requests:
+            over_cap = max_requests is not None and api_requests + reserved >= max_requests
+            # The wall-clock budget (issue #344) is checked HERE, beside the cap,
+            # and takes exactly its path below: a clock stop is a pause for the
+            # same reason a cap is, and a tile already in flight finishes its
+            # retries under it with the same residue the cap documents.
+            if over_cap or crawl_deadline_passed(deadline_monotonic):
                 # THE CAP IS CHECKED HERE FOR THE REASON THE ABORT ABOVE IS, and
                 # it inherits that check's shape but not its bound. A tile
                 # admitted here reserves its request before releasing control,
@@ -1573,6 +1599,11 @@ async def _fetch_city_images(
                 # settle loop, precisely so a skipped tile cannot be read as a
                 # tile observed to be empty.
                 capped = True
+                if stop_reason is None:
+                    # The cap is tested first, so a tile that finds BOTH
+                    # ceilings tripped at once reports "requests": a tie
+                    # resolves to the request cap, as in the KartaView sweep.
+                    stop_reason = SWEEP_STOP_REQUESTS if over_cap else SWEEP_STOP_CLOCK
                 progress_bar.update(1)
                 return records_to_census([])
             # Reserved BEFORE the await, released after it: there is no
@@ -1686,9 +1717,13 @@ async def _fetch_city_images(
     # with no such final night to fall back on -- see the note there.
     if capped:
         committed = len(checkpoint.done) if checkpoint is not None else 0
+        if stop_reason == SWEEP_STOP_CLOCK:
+            ceiling = f"{crawl_budget_seconds(deadline_monotonic):,}-second wall-clock budget"
+        else:
+            ceiling = f"{max_requests:,}-request cap"
         detail = (
             f"Mapillary tile census for {city_name} stopped at its "
-            f"{max_requests:,}-request cap with {committed}/{len(tiles)} tiles fetched; "
+            f"{ceiling} with {committed}/{len(tiles)} tiles fetched; "
             f"{api_requests} requests spent this process, "
             f"{_census_requests_total(checkpoint, api_requests)} in total."
         )
@@ -1728,6 +1763,7 @@ async def _fetch_city_images(
                 units_done=committed,
                 unit_count=len(tiles),
                 unit_name=SWEEP_UNIT_TILES,
+                stopped_by=stop_reason,
             )
         )
 
@@ -1895,6 +1931,7 @@ async def download_mapillary_metadata_async(
     max_requests_per_minute: int = DEFAULT_TILE_REQUESTS_PER_MINUTE,
     jitter: float = DEFAULT_TILE_JITTER,
     max_requests: int | None = None,
+    deadline_monotonic: float | None = None,
     checkpoint_path: str | None = None,
     checkpoint_channel: str | None = None,
     census_cache: CensusCache | None = None,
@@ -1944,6 +1981,7 @@ async def download_mapillary_metadata_async(
         max_requests_per_minute=max_requests_per_minute,
         jitter=jitter,
         max_requests=max_requests,
+        deadline_monotonic=deadline_monotonic,
         checkpoint_path=checkpoint_path,
         checkpoint_channel=checkpoint_channel,
         census_cache=census_cache,

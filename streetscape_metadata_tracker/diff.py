@@ -15,11 +15,15 @@ baseline may not (geocoder drift), in which case grid-point stats are None.
 
 import gzip
 import logging
+import os
+import re
 from dataclasses import dataclass, field
 
 import pandas as pd
 
 from .analysis import PRESENT_STATUSES
+from .fileutils import remove_stale_diff_detail
+from .naming import DEFAULT_PROVIDER, KNOWN_PROVIDERS, STREETWALK_DIFF_FILENAME_RE
 
 logger = logging.getLogger(__name__)
 
@@ -218,8 +222,72 @@ def generate_diff_filename(
     return f"{city_id}_diff_{provider_token}{from_date}_to_{to_date}.csv.gz"
 
 
+# The exact shape generate_diff_filename emits, and nothing looser (issue
+# #265): it is what scripts/sweep_orphan_diff_details.py uses to decide which
+# files in data/ are diff details at all, so a match is a licence to delete an
+# unreferenced file. Anchored on the '_diff_[provider_]DATE_to_DATE.csv.gz'
+# TAIL, which no run, walk or JSON artifact ends with — a city slug that
+# happens to contain '_diff_' cannot make a run CSV match. The provider token
+# is the explicit non-default alternation, as the generator never writes
+# 'gsv_'. Pinned against the generator's own output in tests/test_diff.py.
+# Ends in \Z, never $: '$' also matches before a trailing newline, and a
+# licence-to-delete pattern must not accept a name the generator cannot emit.
+_DIFF_PROVIDER_ALT = "|".join(p for p in KNOWN_PROVIDERS if p != DEFAULT_PROVIDER)
+DIFF_DETAIL_FILENAME_RE = re.compile(
+    r"^(?P<slug>.+?)_diff_"
+    rf"(?:(?P<provider>{_DIFF_PROVIDER_ALT})_)?"
+    r"(?P<from_date>\d{4}-\d{2}-\d{2})_to_(?P<to_date>\d{4}-\d{2}-\d{2})\.csv\.gz\Z"
+)
+
+
+def diff_detail_match(filename: str) -> re.Match | None:
+    """The full match of a grid OR walk diff detail basename against the shape
+    its generator emits (``generate_diff_filename`` here,
+    ``naming.generate_streetwalk_diff_filename``), or None. Both patterns
+    capture ``from_date`` and ``to_date``."""
+    return DIFF_DETAIL_FILENAME_RE.fullmatch(filename) or STREETWALK_DIFF_FILENAME_RE.fullmatch(
+        filename
+    )
+
+
+def is_diff_detail_filename(filename: str) -> bool:
+    """True for a grid OR walk diff detail basename (see ``diff_detail_match``)."""
+    return diff_detail_match(filename) is not None
+
+
 def write_diff_detail(diff: RunDiff, output_path: str) -> None:
     """Write the diff's detail rows as a gzipped CSV."""
     with gzip.open(output_path, "wt", encoding="utf-8", newline="") as f:
         diff.detail.to_csv(f, index=False)
     logger.info(f"Wrote diff detail ({len(diff.detail)} rows) to {output_path}")
+
+
+def sync_diff_detail(diff: RunDiff, data_dir: str, detail_name: str) -> str | None:
+    """
+    Make the published detail file at ``detail_name`` match ``diff`` and return
+    the ``detail_filename`` the ``run_diffs`` row should record.
+
+    The one implementation of issue #265's rule for grid diffs — a detail file
+    is a function of the diff result — shared by the collector
+    (``cli._compute_and_record_diff``) and the repair handle
+    (``scripts/recompute_run_diffs.py``, issue #245), so the two cannot drift
+    apart on what a recomputed diff leaves on disk:
+
+    - has changes: the file is (over)written from THIS diff and its name returned;
+    - no changes: any file at the name is removed and ``None`` returned, since a
+      surviving file would be published with no row pointing at it.
+
+    ``detail_name`` always comes from :func:`generate_diff_filename`, never by
+    hand. Removal goes through ``fileutils.remove_stale_diff_detail``, which
+    never raises; a caller that must know whether the file is really gone checks
+    the disk afterwards.
+
+    Usage:
+        name = generate_diff_filename(city_id, prev.run_date, run_date.isoformat(), provider=p)
+        detail_filename = sync_diff_detail(diff, data_dir, name)
+    """
+    if diff.has_changes:
+        write_diff_detail(diff, os.path.join(data_dir, detail_name))
+        return detail_name
+    remove_stale_diff_detail(data_dir, detail_name)
+    return None

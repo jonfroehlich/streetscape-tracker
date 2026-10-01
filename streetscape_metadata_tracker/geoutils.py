@@ -1,5 +1,6 @@
 import logging
 
+import numpy as np
 import pandas as pd
 import pycountry  # for ISO country codes
 import us  # for US states
@@ -354,11 +355,13 @@ class EnhancedLocation:
         """
         Get the midpoint of the OSM bounding box.
 
-        This is the correct grid center for a search rectangle: unlike the
-        geocoder's reported point (location.latitude/longitude), it is
-        guaranteed to sit at the geometric center of the bounding box the
+        This is the correct grid center for an AUTO-SIZED search rectangle:
+        unlike the geocoder's reported point (location.latitude/longitude), it
+        is guaranteed to sit at the geometric center of the bounding box the
         grid dimensions are derived from, so the sampled rectangle actually
-        covers the boundary.
+        covers the boundary. That justification holds only when the dimensions
+        come from this bbox; for explicit --width/--height it does not, and
+        city_registration.choose_center uses the geocoder's point instead (#186).
 
         Returns:
             tuple or None: (latitude, longitude) midpoint if the bounding box
@@ -617,7 +620,13 @@ def get_city_location_data(
 
         if found_loc is not None:
             logging.info(
-                f"Found coordinates for {city_query_str}: {found_loc.latitude}, {found_loc.longitude}"
+                # Not necessarily the grid center: a new city's center is chosen
+                # later by city_registration.choose_center (the OSM bbox midpoint
+                # for an auto-sized grid, this point for an explicitly sized one),
+                # and this line used to be read as confirming the center (#186).
+                f"Geocoder point for {city_query_str}: {found_loc.latitude}, "
+                f"{found_loc.longitude} (the query's reported location; the grid "
+                f"center is chosen separately at registration)"
             )
 
             enhancedLoc = EnhancedLocation(city_query_str, found_loc)
@@ -638,6 +647,41 @@ def get_city_location_data(
     except Exception as e:
         logging.error(f"Error looking up coordinates for {city_query_str}: {str(e)}")
         return None
+
+
+# Mean Earth radius (IUGG), in metres. The spherical model is off by at most
+# ~0.5% against the WGS84 ellipsoid, which is far below the tolerances it is
+# used against (a 50 m query radius, #367). www/js/streetscape-utils.js mirrors
+# this constant so the frontend and the stats agree about a distance.
+EARTH_RADIUS_M = 6_371_008.8
+
+
+def haversine_m(lat1, lon1, lat2, lon2):
+    """
+    Great-circle distance in metres between two points (or arrays of points).
+
+    Vectorized: every argument may be a scalar, a NumPy array or a pandas
+    Series, and the result has the broadcast shape (a Series keeps its index).
+    NaN in any coordinate yields NaN, never 0 -- a missing pano position must
+    not read as a pano standing exactly on its query point.
+
+    Replaces the planar ``sqrt(dlat**2 + dlon**2) * 111000`` the coverage stats
+    used before issue #367, which ignored cos(latitude) and so overstated every
+    east-west offset (by 2x at 60 degrees north).
+
+    Example:
+        >>> round(haversine_m(60.0, 0.0, 60.0, 1.0) / 1000, 1)  # 1 deg lon at 60N
+        55.6
+        >>> round(haversine_m(0.0, 0.0, 1.0, 0.0) / 1000, 1)  # 1 deg of latitude
+        111.2
+    """
+    phi1 = np.radians(lat1)
+    phi2 = np.radians(lat2)
+    dphi = phi2 - phi1
+    dlmb = np.radians(lon2) - np.radians(lon1)
+    a = np.sin(dphi / 2) ** 2 + np.cos(phi1) * np.cos(phi2) * np.sin(dlmb / 2) ** 2
+    # clip: float error can push `a` a hair past 1 for antipodal points
+    return 2 * EARTH_RADIUS_M * np.arcsin(np.sqrt(np.clip(a, 0.0, 1.0)))
 
 
 def get_bounding_box(df: pd.DataFrame) -> dict[str, float]:

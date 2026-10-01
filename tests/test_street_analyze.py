@@ -186,3 +186,27 @@ def test_analyze_error_exits(data_dir, fake_edges, tmp_path_factory):
     assert _run(data_dir, "Bend, Oregon, United States", "--run-date", "2019-01-01") == 1
     empty = str(tmp_path_factory.mktemp("empty"))
     assert _run(empty, "Bend, Oregon, United States") == 1  # no catalog DB
+
+
+def test_a_pano_on_the_street_counts_however_far_its_query_point_was(data_dir, fake_edges):
+    """analyze.py loads the GRID run, so the loader's query-radius gate (issue
+    #367) would fire here -- and must not. This analysis judges a pano by its
+    distance to a STREET (its own match_dist), so a pano standing on the street
+    covers it even when the grid point that found it was ~300 m away. Filtered,
+    the pano would read OUT_OF_RADIUS and the street would go uncovered."""
+    df = pd.DataFrame(
+        {
+            "query_lat": [44.0527],  # ~300 m north of the on-street edge
+            "query_lon": [-121.3095],
+            "query_timestamp": ["2026-07-02T00:00:00+00:00"],
+            "pano_lat": [44.0500],  # on the edge
+            "pano_lon": [-121.3095],
+            "pano_id": ["a"],
+            "capture_date": ["2024-07-01"],
+            "copyright_info": ["© Google"],
+            "status": ["OK"],
+        }
+    )
+    df.to_csv(os.path.join(data_dir, RUN_CSV), index=False, compression="gzip")
+    assert _run(data_dir, "Bend, Oregon, United States") == 0
+    assert _covered_count(data_dir) == 1

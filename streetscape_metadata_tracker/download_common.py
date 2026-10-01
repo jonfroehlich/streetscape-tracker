@@ -17,15 +17,26 @@ import re
 import secrets
 import socket
 import threading
+import time
 import urllib.parse
 from collections.abc import Callable, Iterator
 from datetime import datetime
+from typing import Any, Protocol
 
 import geopy.distance
 import numpy as np
 import requests
 
 from .progress import progress
+
+# This process's start, for a wall-clock budget (issue #344). Read at import,
+# and this module is imported within the first second of every collector
+# process (cli.py and collect.py both reach it through their first imports),
+# so it is the process's start for the purpose of a budget the scheduler sized
+# from ITS subprocess launch: `--*-max-seconds N` means N seconds after this,
+# which is what keeps an import-heavy startup inside the child's budget rather
+# than silently extending past the parent's timeout.
+PROCESS_STARTED_MONOTONIC = time.monotonic()
 
 
 class DownloadError(Exception):
@@ -80,6 +91,34 @@ HOST_LABELS = {
     HOST_OVERPASS: "the Overpass API (overpass-api.de)",
     HOST_KARTAVIEW: "the KartaView API (kartaview.org)",
     HOST_PANORAMAX: "the Panoramax meta-catalog (api.panoramax.xyz)",
+}
+
+# The per-IP host whose requests a channel's ``api_usage`` ledger row COUNTS
+# (issue #385). ``db.add_api_usage`` reads it to stamp a timestamped
+# ``host_usage`` row beside the daily one, so the scheduler can ask "how much
+# has this HOST taken in the last 24 h" across every channel that talks to it
+# and across the UTC date boundary -- the two things the per-(date, channel)
+# ledger cannot answer, and exactly the gap block 4 (2026-09-28) fell through.
+#
+# gsv/gsv_streets are absent: Google meters by project, not by IP, and no
+# channel's ledger counts Overpass requests (a walk's api_usage is its
+# census-host spend), so HOST_OVERPASS never appears here.
+#
+# Lives HERE rather than beside scheduler.CHANNEL_HOSTS because db.py writes
+# through it and must not import the scheduler (circular); this module imports
+# neither. test_the_metered_host_map_agrees_with_channel_hosts pins the two
+# tables together by set equality, so a channel added to one is a red test
+# until it is decided in the other.
+#
+# Config-independent on purpose: the ledger is complete whatever the budget
+# config says, so turning a [hosts.*] budget on later reads a full window.
+CHANNEL_METERED_HOST: dict[str, str] = {
+    "mapillary": HOST_MAPILLARY_TILES,
+    "mapillary_streets": HOST_MAPILLARY_TILES,
+    "kartaview": HOST_KARTAVIEW,
+    "kartaview_streets": HOST_KARTAVIEW,
+    "panoramax": HOST_PANORAMAX,
+    "panoramax_streets": HOST_PANORAMAX,
 }
 
 # Per-provider socket ceilings for a ROAD WALK (issues #99, #331). One
@@ -495,6 +534,20 @@ SWEEP_INCOMPLETE_EXIT_CODE = 83
 ARGV_REJECTED_EXIT_CODE = 2
 
 
+# Which ceiling paused a resumable crawl (issue #344), and the phrase each one
+# is logged under. The phrases are a CONTRACT between the children, which print
+# them in their pause line, and the scheduler, which reads them back out of the
+# child's log tail -- the exception never crosses the process boundary, so this
+# text is the only way a night's log can say "the clock paused it" rather than
+# "the budget paused it". Defined once so neither side can respell them.
+SWEEP_STOP_REQUESTS = "requests"
+SWEEP_STOP_CLOCK = "clock"
+SWEEP_STOP_PHRASES = {
+    SWEEP_STOP_REQUESTS: "stopped by its request cap",
+    SWEEP_STOP_CLOCK: "stopped by its wall-clock budget",
+}
+
+
 class SweepIncompleteError(DownloadError):
     """
     A crawl stopped with work unvisited, and CHECKPOINTED it (#239, #318).
@@ -535,6 +588,10 @@ class SweepIncompleteError(DownloadError):
     the catalog row), attached by the caller's spend helper -- ``spent`` in the
     KartaView sweep, ``interrupted`` in both tile censuses.
 
+    ``stopped_by`` names the ceiling that paused it -- one of
+    ``SWEEP_STOP_PHRASES``' keys, or None when a raiser does not say -- and
+    ``stop_phrase`` is the words the CLIs log for it (issue #344).
+
     WHAT IS NOT SHARED is what a cap means with NO checkpoint, and the three
     raisers genuinely differ. Both tile censuses refuse that pairing up front as
     a caller bug: an uncheckpointed stop leaves them nothing to resume from and
@@ -552,12 +609,19 @@ class SweepIncompleteError(DownloadError):
         units_done: int,
         unit_count: int,
         unit_name: str,
+        stopped_by: str | None = None,
     ) -> None:
         super().__init__(message)
         self.checkpoint_path = checkpoint_path
         self.units_done = units_done
         self.unit_count = unit_count
         self.unit_name = unit_name
+        self.stopped_by = stopped_by
+
+    @property
+    def stop_phrase(self) -> str:
+        """The pause line's words for ``stopped_by``, e.g. "stopped by its request cap"."""
+        return SWEEP_STOP_PHRASES.get(self.stopped_by, "stopped by an unnamed ceiling")
 
 
 def positive_int(value: str) -> int:
@@ -582,6 +646,115 @@ def positive_int(value: str) -> int:
     if number < 1:
         raise argparse.ArgumentTypeError(f"must be >= 1, got {number}")
     return number
+
+
+def crawl_deadline_from_budget(max_seconds: int | None) -> float | None:
+    """
+    The absolute ``time.monotonic()`` deadline for a ``--*-max-seconds`` flag.
+
+    Measured from :data:`PROCESS_STARTED_MONOTONIC`, not from the moment the
+    crawl starts, because the budget the scheduler forwards was sized from the
+    subprocess launch (issue #344): an Overpass fetch or a slow import spent
+    before the census begins is spent out of the same clock the parent's
+    ``city_timeout_seconds`` is running.
+
+    Example::
+
+        >>> crawl_deadline_from_budget(None) is None
+        True
+        >>> crawl_deadline_from_budget(30) == PROCESS_STARTED_MONOTONIC + 30
+        True
+    """
+    if max_seconds is None:
+        return None
+    return PROCESS_STARTED_MONOTONIC + max_seconds
+
+
+# The resumable crawl providers, in the order their `--*-max-seconds` flags are
+# declared. One tuple for BOTH entry points (cli.py and collect.py), so the
+# flag cannot be real on one path and absent on the other -- the shape #273
+# found a copied argument always takes.
+CRAWL_CLOCK_PROVIDERS = ("kartaview", "mapillary", "panoramax")
+
+
+class _ArgumentContainer(Protocol):
+    """What :func:`add_crawl_clock_arguments` needs of its target.
+
+    Both callers' shapes satisfy it -- cli.py passes an argument group and
+    collect.py the parser itself -- without naming argparse's private base.
+    """
+
+    def add_argument(self, *args: Any, **kwargs: Any) -> Any: ...
+
+
+def add_crawl_clock_arguments(group: _ArgumentContainer) -> None:
+    """
+    Declare ``--{provider}-max-seconds`` for every resumable crawl provider.
+
+    Called by both collection CLIs so the two surfaces carry the identical
+    flag. The value is SECONDS SINCE PROCESS START (see
+    :func:`crawl_deadline_from_budget`); read it back with
+    ``getattr(args, f"{provider}_max_seconds")``.
+    """
+    for provider in CRAWL_CLOCK_PROVIDERS:
+        group.add_argument(
+            f"--{provider}-max-seconds",
+            # positive_int for the reason every --*-max-requests flag carries
+            # it: 0 is not "off", it is a crawl that stops before committing
+            # anything and exits 83 telling the operator to re-run.
+            type=positive_int,
+            default=None,
+            help=(
+                f"Stop the {provider} crawl once this many seconds have passed "
+                "since this process started, CHECKPOINT the rest and exit "
+                f"{SWEEP_INCOMPLETE_EXIT_CODE}, exactly as the matching "
+                "--*-max-requests cap does (issue #344). Checked at each "
+                "tile/cell boundary, so a request already in flight finishes. "
+                "The scheduler forwards its city timeout less a margin, so a "
+                "slow crawl pauses instead of being killed. Default: no clock stop."
+            ),
+        )
+
+
+def crawl_deadline_passed(deadline_monotonic: float | None) -> bool:
+    """
+    True once a resumable crawl's wall-clock budget has run out (issue #344).
+
+    Asked at the SAME boundary, and with the same consequence, as the crawl's
+    request cap: a unit not yet started is left unvisited and checkpointed, and
+    a unit already in flight finishes its retries. None means no clock stop.
+    """
+    return deadline_monotonic is not None and time.monotonic() >= deadline_monotonic
+
+
+def crawl_budget_seconds(deadline_monotonic: float) -> int:
+    """
+    The ``--*-max-seconds`` value a deadline was built from, for a stop message.
+
+    Rounded, and floored at 0 so a deadline set before this module's import (a
+    test, never the CLI) cannot print a negative budget.
+    """
+    return max(0, round(deadline_monotonic - PROCESS_STARTED_MONOTONIC))
+
+
+def crawl_ceiling_needs_checkpoint(
+    max_requests: int | None, deadline_monotonic: float | None, checkpoint_path: str | None
+) -> str | None:
+    """
+    The name of a stop ceiling given without a checkpoint path, or None.
+
+    Both ceilings -- the request cap (#318) and the wall-clock budget (#344) --
+    stop a crawl part-way, and without somewhere to commit to that discards
+    everything it paid for, so each tile census refuses either one alone. One
+    helper so the two censuses name the same argument in the same words.
+    """
+    if checkpoint_path is not None:
+        return None
+    if max_requests is not None:
+        return "max_requests"
+    if deadline_monotonic is not None:
+        return "deadline_monotonic"
+    return None
 
 
 def host_exit_code(error: HostUnavailableError) -> int:

@@ -180,3 +180,28 @@ def test_residual_network_failure_written_as_request_failed(tmp_path, monkeypatc
     assert len(df) == 121
     assert set(df["status"]) == {"OK", "REQUEST_FAILED"}
     assert (df["status"] == "REQUEST_FAILED").sum() == 1
+
+
+def test_the_returned_frame_applies_the_query_radius_but_the_file_does_not(tmp_path, monkeypatch):
+    """Issue #367, on the collector's side of the diff. The frame the downloader
+    hands back feeds the catalog stats, the new run's diff and its JSON, so it
+    must come through the query-radius seam exactly as the previous run's
+    reload does -- or a far pano would be churn on one side only. The file on
+    disk still records what Google said."""
+    from streetscape_metadata_tracker.analysis import OUT_OF_RADIUS
+    from streetscape_metadata_tracker.fileutils import load_city_csv_file
+
+    far_point = []
+
+    async def fake_fetch(lat, lon, api_key, session, timeout, limiter=None):
+        response = _ok_response(lat, lon)
+        if not far_point:
+            far_point.append(_point_key(lat, lon))
+            response["location"] = {"lat": lat + 0.01, "lng": lon}  # ~1.1 km away
+        return response
+
+    result, out = _run_download(tmp_path, monkeypatch, fake_fetch, max_requests_per_minute=0)
+
+    assert (result["df"]["status"] == OUT_OF_RADIUS).sum() == 1
+    assert (result["df"]["status"] == "OK").sum() == 8
+    assert set(load_city_csv_file(out, raw=True)["status"]) == {"OK"}

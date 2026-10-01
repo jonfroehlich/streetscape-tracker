@@ -53,17 +53,23 @@ from . import (
 from .analysis import calculate_run_stats, detect_systemic_failure, print_df_summary
 from .checkpointing import crawl_store_for, discard_checkpoint
 from .city_registration import (
+    CENTER_SOURCE_FROZEN,
     CityResolutionError,
     cap_dimensions,
-    resolve_center,
+    choose_center,
+    new_city_identity,
+    registered_city_for_identity,
     resolve_or_register_city,
+    warn_overrides_ignored,
 )
-from .diff import compute_run_diff, generate_diff_filename, write_diff_detail
+from .diff import compute_run_diff, generate_diff_filename, sync_diff_detail
 from .download_common import (
     SWEEP_INCOMPLETE_EXIT_CODE,
     HostBusyError,
     HostUnavailableError,
     SweepIncompleteError,
+    add_crawl_clock_arguments,
+    crawl_deadline_from_budget,
     host_exit_code,
     jitter_fraction,
     positive_int,
@@ -254,7 +260,8 @@ def parse_args():
         type=float,
         default=None,
         help="Search grid width in meters. Only used when the city is not "
-        "yet registered; registered cities reuse frozen geometry. "
+        "yet registered; registered cities reuse frozen geometry. Without "
+        "--lat/--lng the grid is centered on the geocoder's point for the query. "
         "(Default if inference fails: 1000m)",
     )
 
@@ -502,6 +509,11 @@ def parse_args():
              fetch every tile.""",
     )
 
+    # --kartaview-max-seconds / --mapillary-max-seconds / --panoramax-max-seconds
+    # (issue #344): the clock stop beside each cap above, declared by the helper
+    # collect.py also calls, so the grid and walk surfaces cannot drift.
+    add_crawl_clock_arguments(concurrency_group)
+
     parser.add_argument(
         "--timeout",
         type=float,
@@ -595,8 +607,39 @@ def _compute_and_record_diff(
 ):
     """
     Diff the new run against the previous one of the same provider, persist
-    the summary row (and detail csv.gz when there are changes), and return
-    the JSON change block.
+    the summary row, and return the JSON change block.
+
+    The published detail csv.gz is a function of the diff result (issue
+    #265), the rule ``walk_diff.compute_and_record_walk_diff`` shares: written
+    (overwriting) when the diff has changes, removed when it has none. Before
+    #265 it was only ever written, and ``db.record_diff`` is INSERT OR REPLACE,
+    so a recomputed no-change diff replaced the row with a NULL pointer and
+    stranded the file in ``data/`` — published, unreferenced.
+
+    No row lookup is needed, unlike the walk side, because the name the old
+    row held and the name derived here are the same string: both come from
+    the two runs' dates and the provider, and a run date is UNIQUE within a
+    (city, provider) series. A grid run is never replaced in place either.
+    ``register_run`` is a plain INSERT, and the runs table's UNIQUE
+    (city_id, provider, run_date) refuses a duplicate date before any diff is
+    computed; ``_collect_one_run``'s "nothing to do" check is only an early
+    exit for the LATEST run's date. A backdated ``--run-date`` matching an
+    older cataloged run gets past it and is refused before any diff, by the
+    existing-snapshot guard when that run's CSV name is on disk and by the
+    INSERT's UNIQUE constraint otherwise. And a
+    ``runs`` row cannot be deleted while a ``run_diffs`` row references
+    it (foreign keys are on; ``scripts/purge_tainted_runs.py`` removes the
+    diff rows AND their files first). So every call diffs a freshly inserted
+    ``to_run_id``, and the only file this pair can ever have had is the
+    deterministic one — which is what the no-changes branch removes, healing
+    an orphan left by a manually deleted row.
+
+    The "previous run file missing" return cannot strand a file: it fires
+    before any row or file is written, for a ``to_run_id`` that (per the
+    above) has no ``run_diffs`` row yet. A file already sitting at the
+    deterministic name there was orphaned by something else; it is left for
+    ``scripts/sweep_orphan_diff_details.py`` rather than deleted on behalf of
+    a comparison this call never made.
     """
     prev_csv_path = os.path.join(download_dir, prev_run.csv_filename)
     if not os.path.exists(prev_csv_path):
@@ -606,12 +649,11 @@ def _compute_and_record_diff(
     df_old = load_city_csv_file(prev_csv_path)
     diff = compute_run_diff(df_old, df_new)
 
-    detail_filename = None
-    if diff.has_changes:
-        detail_filename = generate_diff_filename(
-            city_row.city_id, prev_run.run_date, run_date.isoformat(), provider=provider
-        )
-        write_diff_detail(diff, os.path.join(download_dir, detail_filename))
+    detail_name = generate_diff_filename(
+        city_row.city_id, prev_run.run_date, run_date.isoformat(), provider=provider
+    )
+    # Written or removed by the one helper the repair script also uses (#245).
+    detail_filename = sync_diff_detail(diff, download_dir, detail_name)
 
     db.record_diff(
         conn,
@@ -730,9 +772,11 @@ async def async_main():
             except SweepIncompleteError as e:
                 # Progress, not breakage — logged at INFO with the fraction
                 # done, and deliberately without a traceback.
+                # The stop phrase is what the scheduler reads back out of this
+                # log to say WHICH ceiling paused the crawl (issue #344).
                 logging.info(
-                    f"{provider} crawl paused at {e.units_done}/{e.unit_count} {e.unit_name}; "
-                    f"re-run to resume from {e.checkpoint_path}"
+                    f"{provider} crawl paused at {e.units_done}/{e.unit_count} {e.unit_name} "
+                    f"({e.stop_phrase}); re-run to resume from {e.checkpoint_path}"
                 )
                 failed.append(provider)
                 incomplete.append((provider, e))
@@ -908,6 +952,7 @@ async def _collect_one_run(conn, args, city_row, run_date, provider, config, vis
                 max_requests_per_minute=args.mapillary_max_requests_per_minute,
                 jitter=args.mapillary_jitter,
                 max_requests=args.mapillary_max_requests,
+                deadline_monotonic=crawl_deadline_from_budget(args.mapillary_max_seconds),
                 checkpoint_path=checkpoint_path,
                 # The channel again, this time INSIDE the commit record: the
                 # path separates channels only as long as every caller derives
@@ -929,6 +974,7 @@ async def _collect_one_run(conn, args, city_row, run_date, provider, config, vis
                 request_timeout=request_timeout,
                 max_requests_per_minute=args.kartaview_max_requests_per_minute,
                 max_requests=args.kartaview_max_requests,
+                deadline_monotonic=crawl_deadline_from_budget(args.kartaview_max_seconds),
                 checkpoint_path=checkpoint_path,
                 # The channel again, this time INSIDE the commit record: the
                 # path above separates channels only as long as every caller
@@ -954,6 +1000,7 @@ async def _collect_one_run(conn, args, city_row, run_date, provider, config, vis
                 max_requests_per_minute=args.panoramax_max_requests_per_minute,
                 jitter=args.panoramax_jitter,
                 max_requests=args.panoramax_max_requests,
+                deadline_monotonic=crawl_deadline_from_budget(args.panoramax_max_seconds),
                 checkpoint_path=checkpoint_path,
                 # The channel again, this time INSIDE the commit record: the
                 # path separates channels only as long as every caller derives
@@ -1154,52 +1201,66 @@ def _check_boundary(conn, args, vis_path: str) -> int:
     from .naming import generate_base_filename
 
     city_row = db.resolve_city(conn, args.city)
+    chosen = None
     if city_row is not None:
-        overrides = [
-            o
-            for o, v in (("--lat/--lng", args.lat), ("--width/--height", args.width))
-            if v is not None
-        ]
-        if overrides:
-            logger.warning(
-                f"{' and '.join(overrides)} ignored: '{args.city}' is already "
-                f"registered as {city_row.city_id} with frozen grid geometry"
-            )
         print(f"'{args.city}' is registered as {city_row.city_id}; previewing its frozen geometry")
-        city_id = city_row.city_id
-        center_lat, center_lng = city_row.center_lat, city_row.center_lon
-        grid_width, grid_height = city_row.grid_width_m, city_row.grid_height_m
-        step = city_row.step_m
     else:
         city_loc_data = get_city_location_data(args.city)
-        if args.lat is not None:
-            center_lat, center_lng = args.lat, args.lng
-        elif city_loc_data:
-            center_lat, center_lng = resolve_center(city_loc_data)
-        else:
+        # The same seam the real registration goes through, so the preview
+        # cannot show a center the run would not freeze (#186).
+        chosen = choose_center(
+            city_loc_data,
+            lat=args.lat,
+            lng=args.lng,
+            explicit_dimensions=args.width is not None,
+        )
+        if chosen is None:
             logging.error(
                 f"Could not find coordinates for {args.city}. "
                 f"Use --lat and --lng to provide them manually."
             )
             return 1
+        # Same canonical id register_city would derive, so the preview filename
+        # matches the files an eventual run will produce — and the same lookup
+        # registration does, because a new SPELLING of a registered city keeps
+        # that city's frozen row, not the center chosen above.
+        city_id, city_row = registered_city_for_identity(
+            conn, new_city_identity(args.city, city_loc_data)
+        )
+        if city_row is not None:
+            print(
+                f"'{args.city}' geocodes to registered city {city_row.city_id}; previewing "
+                f"its frozen geometry (a real run would alias this spelling to it)"
+            )
 
+    if city_row is not None:
+        warn_overrides_ignored(args.city, city_row, lat=args.lat, width=args.width)
+        city_id = city_row.city_id
+        center_lat, center_lng = city_row.center_lat, city_row.center_lon
+        grid_width, grid_height = city_row.grid_width_m, city_row.grid_height_m
+        step = city_row.step_m
+        center_source = CENTER_SOURCE_FROZEN
+    else:
+        center_lat, center_lng, center_source = chosen
         if args.width is not None:
             grid_width, grid_height = args.width, args.height
         else:
             grid_width, grid_height = get_search_dimensions(args.city, 1000, 1000)
             grid_width, grid_height = cap_dimensions(grid_width, grid_height, args.city)
-        step = args.step
-
-        # Same canonical id register_city would derive, so the preview
-        # filename matches the files an eventual run will produce
-        if city_loc_data:
-            city_id = db.derive_city_id(
-                city_loc_data.city, city_loc_data.state, city_loc_data.country
-            )
-        else:
-            city_id = db.derive_city_id(args.city, None, None)
+        # What register_city will actually freeze: it stores int() of each
+        # dimension and the step, so a fractional --width previews as the
+        # value the catalog will hold rather than the one typed.
+        grid_width, grid_height, step = int(grid_width), int(grid_height), int(args.step)
 
     print(f"The search dimensions for {args.city} are {grid_width:.1f}m x {grid_height:.1f}m")
+    # The center too, in the same form a real run prints it: the preview used to
+    # report only dimensions, so a grid frozen in the wrong place was invisible
+    # without opening the HTML (#186).
+    print(
+        f"Grid: {grid_width}m x {grid_height}m, step {step}m, centered at "
+        f"{center_lat:.5f}, {center_lng:.5f}"
+    )
+    print(f"Center source: {center_source}")
 
     base_name = generate_base_filename(city_id, grid_width, grid_height, step)
     boundary_vis_full_path = os.path.join(vis_path, f"{base_name}_search_boundary.html")

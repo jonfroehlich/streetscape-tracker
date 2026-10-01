@@ -10,6 +10,7 @@ from pathlib import Path
 import pandas as pd
 
 from . import naming
+from .analysis import apply_query_radius
 from .config import MAPILLARY_METADATA_DTYPES, PROVIDER_RUN_DTYPES
 from .paths import get_default_data_dir
 
@@ -22,6 +23,26 @@ def get_list_of_city_csv_files(data_dir=None) -> list[str]:
 
     csv_files = glob.glob(os.path.join(data_dir, "**/*.csv.gz"), recursive=True)
     return csv_files
+
+
+def _resolve_run_path(csv_path: str) -> tuple[str | None, str | None]:
+    """
+    ``(kind, provider)`` from a run or road-walk artifact's own filename.
+
+    ``kind`` is ``"run"`` for a grid run, ``"streetwalk"`` for a road walk, and
+    both are None for a name the naming contract does not parse. The one place
+    the loader asks "what is this file?", so the dtype schema and the
+    query-radius gate (issue #367) can never resolve the same path differently.
+    """
+    for kind, parse in (
+        ("run", naming.parse_filename),
+        ("streetwalk", naming.parse_streetwalk_filename),
+    ):
+        try:
+            return kind, parse(csv_path).provider
+        except ValueError:
+            continue
+    return None, None
 
 
 def dtypes_for_run_path(csv_path: str) -> dict:
@@ -43,16 +64,15 @@ def dtypes_for_run_path(csv_path: str) -> dict:
     Args:
         csv_path: path or bare filename of a run or road-walk snapshot CSV.
     """
-    for parse in (naming.parse_filename, naming.parse_streetwalk_filename):
-        try:
-            provider = parse(csv_path).provider
-        except ValueError:
-            continue
-        return PROVIDER_RUN_DTYPES.get(provider, MAPILLARY_METADATA_DTYPES)
-    return MAPILLARY_METADATA_DTYPES
+    _kind, provider = _resolve_run_path(csv_path)
+    if provider is None:
+        return MAPILLARY_METADATA_DTYPES
+    return PROVIDER_RUN_DTYPES.get(provider, MAPILLARY_METADATA_DTYPES)
 
 
-def load_city_csv_file(csv_path: str, dtypes: dict | None = None) -> pd.DataFrame:
+def load_city_csv_file(
+    csv_path: str, dtypes: dict | None = None, *, raw: bool = False
+) -> pd.DataFrame:
     """
     Read a CSV file into a DataFrame, automatically detecting if it's gzipped based on file extension.
     capture_date accepts any ISO 8601 date — day, month or year precision —
@@ -74,6 +94,20 @@ def load_city_csv_file(csv_path: str, dtypes: dict | None = None) -> pd.DataFram
             into float64 and a numeric-looking string id into a float. Pass a
             schema explicitly only when the caller already knows the provider
             and the path may not carry a parseable name.
+        raw: return exactly what is on disk. By default a GSV GRID RUN (the
+            file's own name parses as a run with provider gsv) comes back
+            through analysis.apply_query_radius (issue #367): a pano beyond
+            analysis.GSV_QUERY_RADIUS_M of its query point reads as status
+            OUT_OF_RADIUS and every row gains ``query_distance_m``. The CSV
+            itself is never rewritten -- a run file records what the provider
+            said -- so the rule repeats here, at the one reader everything
+            goes through. Pass ``raw=True`` only where the provider's own
+            answer is what matters: a caller that would write the frame back
+            to a run file, or one (like the grid-attribution street analyzer)
+            that judges a pano by its own position rather than by the query
+            point that found it. Road-walk files and names the contract does
+            not parse are never filtered; the walk bounds sample-to-pano
+            distance itself.
 
     Returns:
         pd.DataFrame: Loaded and processed DataFrame
@@ -155,12 +189,72 @@ def load_city_csv_file(csv_path: str, dtypes: dict | None = None) -> pd.DataFram
         for col, dtype in df.dtypes.items():
             logger.debug(f"  {col:15} {dtype}")
 
+        # The GSV query-radius rule (issue #367), gated on the file's OWN
+        # resolution -- the same one that picked its dtype schema above -- so a
+        # census run or a road walk is never touched however it is opened.
+        if not raw:
+            kind, provider = _resolve_run_path(csv_path)
+            if kind == "run" and provider == "gsv":
+                df = apply_query_radius(df, provider)
+
         return df
 
     except pd.errors.EmptyDataError as e:
         raise ValueError(f"The file {csv_path} is empty") from e
     except pd.errors.ParserError as e:
         raise ValueError(f"Error parsing file {csv_path}: {str(e)}") from e
+
+
+def remove_stale_diff_detail(data_dir: str, filename: str | None) -> bool:
+    """
+    Delete a published diff detail file that no longer describes a recorded
+    diff, returning True only when a file was actually removed (issue #265).
+
+    The one rule behind it, shared by the grid diff (``cli._compute_and_record_diff``)
+    and the walk diff (``walk_diff.compute_and_record_walk_diff``): **a diff
+    detail file is a function of the diff result.** It exists exactly when a
+    recorded diff with changes names it. Both families used to write the file
+    only when a diff had changes and never delete one, so a re-diff that came
+    out with no changes — or was skipped — dropped the row's pointer and left
+    the file in ``data/``, which is rsynced to a public web server.
+
+    Never raises, because every caller runs it after a paid-for crawl is
+    already cataloged (the grid call site is not even failure-guarded):
+
+    - ``None`` or an empty name is a no-op (a row that recorded no file);
+    - a file that is already gone is the normal case, not an error;
+    - any other ``OSError`` (permissions, a stale NFS handle) is logged as a
+      warning and swallowed — a stranded file is a publishing blemish, a
+      failed collection is a lost month;
+    - a name with a path component is refused, logged, and nothing is
+      deleted. These names come from our own catalog and generators, which
+      never emit one, but the name is joined onto ``data_dir`` and an unlink
+      is the one operation where trusting that blindly is not worth a line.
+
+    Usage (the name always comes from a generator or a catalog row, never by hand):
+
+        name = generate_diff_filename(city_id, prev.run_date, run_date.isoformat())
+        if not diff.has_changes:
+            remove_stale_diff_detail(data_dir, name)
+    """
+    if not filename:
+        return False
+    if os.path.basename(filename) != filename or filename in (os.curdir, os.pardir):
+        logger.error(f"Refusing to remove diff detail {filename!r}: not a bare filename")
+        return False
+    path = os.path.join(data_dir, filename)
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        logger.warning(
+            f"Could not remove stale diff detail {path} ({exc}); it stays on disk and "
+            "published, unreferenced — scripts/sweep_orphan_diff_details.py finds it"
+        )
+        return False
+    logger.info(f"Removed stale diff detail {path}")
+    return True
 
 
 def try_open_with_system_command(file_path: str) -> bool:
