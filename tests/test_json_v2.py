@@ -548,9 +548,14 @@ def test_aggregate_marks_only_the_early_refreshed_run(conn, data_dir):
         prior_success_at="2026-01-15T09:00:00+00:00",
         floor_days=30,
     )
-    # Decoys: the right date on another provider, and another date.
+    # Two decoys, neither of which may mark a gsv run: the UNMARKED run's date
+    # on another channel (a channel-blind lookup would mark that run), and gsv's
+    # own channel on a date with no run (a date-blind lookup would mark both).
     db.record_early_refresh(
         conn, city_id, "mapillary", date(2026, 1, 15), prior_success_at="x", floor_days=30
+    )
+    db.record_early_refresh(
+        conn, city_id, "gsv", date(2026, 2, 1), prior_success_at="x", floor_days=30
     )
     runs = generate_aggregate_v2(conn, data_dir)["cities"][0]["providers"]["gsv"]["runs"]
     assert [r.get("early_refresh") for r in runs] == [None, True]

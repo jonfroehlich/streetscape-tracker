@@ -624,7 +624,9 @@ One channel under the floor, or quarantined, disqualifies the city: the fill nev
 Candidates are ordered by the city's **oldest** channel success, then `city_id` — stalest-first, read on the channel that has waited longest.
 Opt-in channels neither qualify nor disqualify a city and are never run (#248, #374); KartaView and Panoramax volume stays explicit (#405).
 
-**Admission is whole-city** (`_fill_verdict`, shared by the live path and the dry run): every channel's `_channel_estimate` must fit that channel's daily remainder; per metered host, the **sum** of its channels' prices must fit both the `[hosts.*]` rolling-24h room and the fill's own `fill_host_ceilings` room; and the summed `city_timeout_estimate_seconds` must fit the deadline.
+**Admission is whole-city** (`_fill_judge`, shared by the live path and the dry run): every channel's `_channel_estimate` must fit that channel's daily remainder; per metered host, the **sum** of its channels' prices must fit both the `[hosts.*]` rolling-24h room and the fill's own `fill_host_ceilings` room; the summed `city_timeout_estimate_seconds` must fit the deadline; and every resumable channel must be one `_sweep_launch_plan` would launch with no skip and a cap at least its price.
+That last test exists because `est <= room` is not what the launch path asks: a 1-tile Mapillary census against a 4-request remainder fits the room but sits under the launch floor, so the launch skipped Mapillary after GSV had run — the GSV-only refresh the fill exists to prevent.
+Each resumable channel is planned against the room it would see at its own launch, after the city's earlier channels on the same host.
 The sum matters on the host because the two Mapillary channels share one IP and one pool, and on the clock because a sum is exact at one lane and conservative at two.
 A walk whose census its grid sibling is about to buy is still priced at the full census unless the cache already holds it — an over-price, which can only decline a city that would have fit.
 Two refusals come before the budget rule, both because the launch path would otherwise collect a subset: a channel whose host refused this machine tonight (read off `HostBreaker.latched`, so no re-check is spent on a city that may not be admitted), and a walk whose street network is not frozen — that walk would query Overpass, a per-IP host with no measured capacity to fill, so **the fill adds no Overpass traffic at all**.
@@ -638,6 +640,16 @@ GSV metadata has no per-IP host and no charge, so on gsv only the daily budget a
 
 **A backlog holds the whole fill** (`_fill_backlog`): any (city, channel) pair the due slate held on a default channel whose `last_attempt_at` predates the batch start was deferred — for budget, a host budget, the deadline, the breaker — or paused, and while one exists the fill does not run, so it stops by itself the night a backlog forms.
 A failure records an attempt and is not a backlog, and an opt-in channel's deferral (Panoramax is budget-bound on its own) does not hold it.
+Nor does a pair no night like this one could run (`_never_fits_tonight`), each logged as such: a non-resumable channel priced over its whole daily budget, one whose need exceeds the whole `max_batch_hours` window (#373), and a walk waiting behind its grid sibling's in-flight checkpoint (the sibling's own pair is the backlog there). Held on those, one oversized city would switch the fill off for good.
+
+**A fill crawl that pauses is resumed by the next fill, first.**
+Admission prices a crawl from its estimate, and a crawl can still outrun it and pause (exit 83). A fill city is not due on that channel, so nothing on the due path resumes it, and its checkpoint is discarded at `CHECKPOINT_MAX_AGE_S` (7 days) with the spend thrown away — while the paused channel's pair is already broken.
+So each fill begins with `_fill_resumers`: every city the fill touched inside that age, not due tonight, with a live checkpoint on a default resumable channel, nearest the age wall first, admitted on its paused channels only, and **not held by a backlog** (nothing else will ever resume it).
+A resume that lands is marked an early refresh against the success the channel still had; the pause line in the log says the channel is not due and the next fill resumes it, rather than "stays due".
+
+**A failing city leaves the fill.** A candidate needs no consecutive failure since its last success on any channel, so the fill can add at most one failure per channel between successes and can never be what quarantines a city that was never due.
+
+**Walks stranded inside the fill** (a host latched, or went busy, between a fill city's grid and its walk) are retried once by the fill's own `_retry_stranded_walks(only=...)` pass. One still stranded is recorded in `HostBreaker.fill_stranded` and gets its own alert paragraph, with **no** recovery command: the walk is not due, so `run-due --city` would skip it, and nothing is lost — it keeps its previous success and comes due on its own clock (the date is printed), or is refreshed with its city by a later fill. The `Done:` line says `(N in the fill, not lost)` beside the STRANDED count.
 
 **It counts toward `max_cities_per_day`**, which stays a ceiling on the whole night; at prod's 80 the cap, a channel budget, the fill ceiling or the deadline ends a filled night, whichever comes first.
 **It never runs on an operator-narrowed run** — `--provider` would fill a subset of each city's channels, `--city` names exactly what the operator wants, and `--limit` is a catch-up's cap — so those runs are exactly what they were.
@@ -646,15 +658,17 @@ A failure records an attempt and is not a backlog, and an opt-in channel's defer
 **What a night says about it.**
 The opening line carries `fill_min_days=N` when set.
 The `Done:` line counts the cities apart — `across 23 cities (15 due, 8 fill)` — and adds `fill (early refresh, >= 30 d): 8 cities, 24/24 runs, 24 early refresh(es) recorded; declined 3 for mapillary_tiles; ended by budget (mapillary_tiles)`.
-`ended by` is one of `city cap (N)`, `deadline (N h)`, `budget (<channel or host>)` (the candidates ran out with the last ones declined for it), `candidates exhausted`, `unfrozen street network`, `host refused tonight`, `held: backlog (...)`, or `received SIGTERM`; a night that never reached it says `fill not reached`, and a narrowed run says `fill off for --limit`.
-An error inside the fill is logged, ends the fill, and makes the night unhealthy, but the tail still publishes (#167).
+`ended by` is one of `city cap (N)`, `deadline (N h)`, `budget (<channel or host>)` (the candidates ran out with the last ones declined for it), `candidates exhausted`, `unfrozen street network`, `host refused tonight`, `held: backlog (...)`, `received SIGTERM`, or `unexpected error in the fill phase`; a night that never reached it says `fill not reached`, and a narrowed run says `fill off for --limit`.
+An error inside the fill is logged under its own wording (not the city loop's), ends the fill, and makes the night unhealthy, but the tail still publishes (#167).
+`scripts/night_length_analyze.py` parses the `(D due, F fill)` split and counts a night that ran fill cities as its own `filled` population, never pooled into `full`: its length is set by the fill's end, not by the due work.
 `run-due --dry-run` previews it through the same `_fill_verdict` against its simulated ledgers, listing what the budgets admit up to the cap; the deadline is the one term a preview cannot price, so it says the deadline decides how many run.
 
 **The series records it.**
-Each fill channel that succeeds is written to `early_refreshes` (catalog v18, `docs/architecture.md`) with its prior success, so a shortened interval is a fact in the catalog rather than something inferred from run dates, and the aggregate marks that run `"early_refresh": true`.
+Each fill channel that succeeds is written to `early_refreshes` (catalog v18, keyed by scheduler channel, with a walk's network type; `docs/architecture.md`) with its prior success, so a shortened interval is a fact in the catalog rather than something inferred from run dates, and the aggregate marks a GRID run `"early_refresh": true` (walk marks are recorded, not yet published).
 Success is read off `schedule_state.last_success_at` having moved since admission, so a skipped or failed channel is never marked.
 
 Not done here: an operator-facing `status` view of fill eligibility, publishing the mark for walks, and any change to Panoramax pacing (#405).
+Open for a decision rather than code: the prod `fill_host_ceilings` value and any ramp of it; sizing the fill's room against TOMORROW's projected due demand on the rolling-24h window (tonight's fill spend is still in the window when tomorrow's due slate starts); and how an opt-in-enrolled city's grid and opt-in dates should align when the fill refreshes only its default channels.
 The provider forums were not re-read for this change: it raises no rate, no budget and no ceiling, and its one new per-IP number (2,260) is a figure this project already measured clean.
 
 ## The subcommand roster, and the production config (added 2026-08-25)

@@ -147,7 +147,7 @@ def _done_line(caplog):
 
 def _early_rows(conn):
     return sorted(
-        (r["city_id"], r["provider"], r["run_date"], r["floor_days"])
+        (r["city_id"], r["channel"], r["run_date"], r["floor_days"])
         for r in conn.execute("SELECT * FROM early_refreshes")
     )
 
@@ -173,7 +173,6 @@ def _candidates(conn, channels=("gsv", "mapillary"), floor=30):
         default_membership=sched.CHANNEL_DEFAULT_MEMBERSHIP,
         fill_min_days=floor,
         due_threshold_days=83,
-        max_consecutive_failures=5,
     )
 
 
@@ -187,6 +186,10 @@ def test_fill_candidates_need_every_member_channel_past_the_floor_and_not_due(co
     _seed(conn, quarantined, "mapillary", 60, failures=5)
     excluded = _city(conn, "Excluded", {"gsv": 45})
     db.set_channel_membership(conn, excluded, "mapillary", False, cycle_days=90)
+    # ONE failure since the last success is enough: the fill never adds the
+    # second, so it cannot be what quarantines a city that was never due.
+    failing = _city(conn, "Failing", {"gsv": 60, "mapillary": 60})
+    _seed(conn, failing, "gsv", 60, failures=1)
     disabled = _city(conn, "Disabled", {"gsv": 60, "mapillary": 60})
     conn.execute("UPDATE cities SET enabled = 0 WHERE city_id = ?", (disabled,))
     conn.commit()
@@ -353,7 +356,10 @@ def test_a_fill_city_is_never_collected_on_a_subset_of_its_channels(conn, monkey
 
     assert ran == [(small, "gsv"), (small, "mapillary")]
     assert {r[0] for r in _early_rows(conn)} == {small}
-    assert "declined 1 for mapillary" in _done_line(caplog)
+    done = _done_line(caplog)
+    assert "declined 1 for mapillary" in done
+    # A decline FOLLOWED by an admission did not end the fill.
+    assert "ended by candidates exhausted" in done
 
 
 def test_budget_drawn_down_by_earlier_fill_cities_declines_a_later_one(conn, monkeypatch, caplog):
@@ -612,6 +618,14 @@ def test_a_failed_fill_channel_is_not_marked_an_early_refresh(conn, monkeypatch)
     _run_night(monkeypatch, conn, _grid_cfg(), outcome=lambda city, p: p == "gsv")
 
     assert _early_rows(conn) == [(cid, "gsv", "2026-10-01", 30)]
+    # One failure recorded -- and the city then leaves the fill (no failure
+    # since the last success is part of eligibility), so the fill can never
+    # stack the five that would quarantine a never-due city.
+    fails = conn.execute(
+        "SELECT consecutive_failures FROM schedule_state WHERE city_id = ? AND provider = ?",
+        (cid, "mapillary"),
+    ).fetchone()[0]
+    assert fails == 1
     row = conn.execute(
         "SELECT prior_success_at FROM early_refreshes WHERE city_id = ?", (cid,)
     ).fetchone()
@@ -642,6 +656,12 @@ def test_a_walk_on_an_unfrozen_network_declines_its_city(conn, monkeypatch, capl
     caplog.clear()
     ran, _ = _run_night(monkeypatch, conn, cfg)
     assert ran == [(cid, "gsv"), (cid, "gsv_streets")]
+    # The walk is marked too, with its network type (for a later street_walks join).
+    rows = conn.execute(
+        "SELECT channel, network_type FROM early_refreshes WHERE city_id = ? ORDER BY channel",
+        (cid,),
+    ).fetchall()
+    assert [tuple(r) for r in rows] == [("gsv", None), ("gsv_streets", "drive")]
 
 
 def test_a_host_refused_tonight_declines_the_fill_city(conn, monkeypatch, caplog):
@@ -672,7 +692,7 @@ def test_an_error_in_the_fill_still_publishes_and_reports_unhealthy(conn, monkey
 
     assert ran == [] and rc != 0
     done = _done_line(caplog)
-    assert "ended by unexpected error in the city loop" in done
+    assert "ended by unexpected error in the fill phase" in done
     assert "stopped early" in done
 
 
@@ -798,5 +818,434 @@ def test_a_v17_catalog_gains_the_early_refreshes_table(tmp_path):
     db.record_early_refresh(
         conn, cid, "gsv", TODAY, prior_success_at="2026-08-01T00:00:00+00:00", floor_days=30
     )
+    # COUNT, not the key set: a set cannot see a duplicate row, so it stays
+    # green with the PRIMARY KEY dropped.
+    assert conn.execute("SELECT COUNT(*) FROM early_refreshes").fetchone()[0] == 1
     assert db.get_early_refresh_keys(conn) == {(cid, "gsv", "2026-10-01")}
     conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Review round (PR #411)
+# ---------------------------------------------------------------------------
+
+
+def _outcome(exit_code):
+    from streetscape_metadata_tracker.scheduler import CollectionOutcome
+
+    return CollectionOutcome(False, f"exited {exit_code}", exit_code=exit_code)
+
+
+def _freeze_network(data_dir, city_id):
+    path = sched.network_cache_path(city_id, data_dir, "drive")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as fh:
+        fh.write("<graphml/>")
+
+
+def _live_checkpoints(monkeypatch, live):
+    """Fake `_sweep_checkpoint_progress`: a live checkpoint for each (city, channel) in ``live``."""
+
+    def progress(cfg, city, channel):
+        if (city.city_id, channel) in live:
+            return {"age_s": 3600.0, "units_done": 1, "unit_count": 2, "unit_name": "tiles"}
+        return None
+
+    monkeypatch.setattr(sched, "_sweep_checkpoint_progress", progress)
+
+
+def test_admission_asks_the_launch_plan_not_only_the_remainder(conn, monkeypatch, caplog, capsys):
+    """Review item 1: a 1-tile census against a 4-request remainder fits
+    ``est <= room`` but sits under the launch floor, so the launch path would
+    SKIP mapillary after gsv ran. Admission now asks the same plan and declines
+    the city; the dry run agrees.
+
+    Killed by dropping the `_fill_launch_refusal` call from `_fill_judge`.
+    """
+    caplog.set_level("INFO")
+    cid = _city(conn, "Tiny", {"gsv": 60, "mapillary": 60}, width=100, height=100)
+    assert sched.estimate_requests(db.resolve_city(conn, cid), "mapillary") <= 4
+    cfg = _grid_cfg(
+        providers={
+            "gsv": ProviderConfig(daily_request_budget=10_000_000),
+            "mapillary": ProviderConfig(daily_request_budget=4),
+        }
+    )
+
+    ran, _ = _run_night(monkeypatch, conn, cfg)
+
+    assert ran == []
+    assert "declined 1 for mapillary" in _done_line(caplog)
+    assert any("the launch would skip it" in r.message for r in caplog.records)
+
+    sched.cmd_run_due(cfg, dry_run=True, today=TODAY)
+    assert "Fill: 0 cities admitted; declined 1 for mapillary." in capsys.readouterr().out
+
+
+def test_a_paused_fill_crawl_is_resumed_first_by_the_next_nights_fill(conn, monkeypatch, caplog):
+    """Review item 2: a fill crawl that pauses (exit 83) is not due on that
+    channel, so nothing on the due path would resume it before its checkpoint
+    expires. Night 1 says so (not "stays due"); night 2's fill resumes it FIRST,
+    on the paused channel only, and marks it an early refresh against the
+    success it still had.
+    """
+    from streetscape_metadata_tracker.download_common import SWEEP_INCOMPLETE_EXIT_CODE
+
+    caplog.set_level("INFO")
+    cid = _city(conn, "Paused", {"gsv": 60, "mapillary": 60})
+    other = _city(conn, "Other", {"gsv": 40, "mapillary": 40})
+    live: set = set()
+    _live_checkpoints(monkeypatch, live)
+
+    def night1(city, provider):
+        if city.city_id == cid and provider == "mapillary":
+            live.add((cid, "mapillary"))
+            return _outcome(SWEEP_INCOMPLETE_EXIT_CODE)
+        return True
+
+    ran, _ = _run_night(monkeypatch, conn, _grid_cfg(max_cities_per_day=1), outcome=night1)
+    assert ran == [(cid, "gsv"), (cid, "mapillary")]
+    assert _early_rows(conn) == [(cid, "gsv", "2026-10-01", 30)]
+    pause = [r.message for r in caplog.records if "sweep paused" in r.message]
+    assert pause and "NOT due, so the next night's fill resumes it first" in pause[0]
+    assert "stays due" not in pause[0]
+
+    tomorrow = TODAY + timedelta(days=1)
+    monkeypatch.setattr(clock, "_utc_clock", lambda: NOW + timedelta(days=1))
+    caplog.clear()
+
+    def night2(city, provider):
+        live.discard((city.city_id, provider))
+        return True
+
+    ran, _ = _run_night(
+        monkeypatch, conn, _grid_cfg(max_cities_per_day=2), outcome=night2, today=tomorrow
+    )
+    assert ran[0] == (cid, "mapillary"), "the orphaned checkpoint is resumed before any new city"
+    assert (cid, "gsv") not in ran
+    assert _cities_in(ran) == [cid, other]
+    rows = _early_rows(conn)
+    assert (cid, "mapillary", "2026-10-02", 30) in rows
+    prior = conn.execute(
+        "SELECT prior_success_at FROM early_refreshes WHERE city_id = ? AND channel = ?",
+        (cid, "mapillary"),
+    ).fetchone()[0]
+    assert prior == (MIDNIGHT - timedelta(days=60)).isoformat()
+    assert "(1 resuming a paused fill crawl)" in _done_line(caplog)
+
+
+def test_a_paused_fill_crawl_is_resumed_even_while_a_backlog_holds_the_fill(
+    conn, monkeypatch, caplog
+):
+    """Nothing else resumes it, so the hold (which waits on due work) does not."""
+    caplog.set_level("INFO")
+    cid = _city(conn, "Paused", {"gsv": 2, "mapillary": 60})
+    db.record_early_refresh(
+        conn, cid, "gsv", TODAY - timedelta(days=2), prior_success_at="x", floor_days=30
+    )
+    _live_checkpoints(monkeypatch, {(cid, "mapillary")})
+    held = _city(conn, "Eligible", {"gsv": 60, "mapillary": 60})
+    due = _city(conn, "Due", {"gsv": 85, "mapillary": 20})
+    # The due city's gsv does not fit what is left today (but would fit a
+    # fresh budget), so it is deferred: a backlog that holds the refresh pass.
+    db.add_api_usage(conn, TODAY, 990_000, "gsv")
+    cfg = _grid_cfg(
+        providers={
+            "gsv": ProviderConfig(daily_request_budget=1_000_000),
+            "mapillary": ProviderConfig(daily_request_budget=3_500),
+        }
+    )
+
+    ran, _ = _run_night(monkeypatch, conn, cfg)
+
+    assert ran == [(cid, "mapillary")]
+    assert all(c not in (held, due) for c, _ in ran)
+    assert "held: backlog (gsv 1 due not attempted)" in _done_line(caplog)
+
+
+def test_sigterm_mid_city_in_the_fill_stops_the_night(conn, monkeypatch, caplog):
+    """Review items 2 and 9: a SIGTERM during a fill city's first channel stops
+    the city (its second channel is not launched), the fill, and the night,
+    which reports it -- and still reaches the tail."""
+    import signal
+
+    caplog.set_level("INFO")
+    a = _city(conn, "Alpha", {"gsv": 70, "mapillary": 70})
+    _city(conn, "Bravo", {"gsv": 60, "mapillary": 60})
+
+    def outcome(city, provider):
+        if city.city_id == a and provider == "gsv":
+            os.kill(os.getpid(), signal.SIGTERM)
+        return True
+
+    ran, rc = _run_night(monkeypatch, conn, _grid_cfg(), outcome=outcome)
+
+    assert ran == [(a, "gsv")]
+    done = _done_line(caplog)
+    assert "ended by received SIGTERM" in done
+    assert "stopped early (received SIGTERM)" in done
+
+
+def test_a_walk_stranded_in_the_fill_is_retried_then_named_without_a_dead_command(
+    conn, monkeypatch, caplog, data_dir
+):
+    """Review item 3: the walk is refused after the fill city's grid landed. The
+    fill's own retry pass asks again; still refused, it is reported as not
+    lost, with the date its own clock makes it due, and WITHOUT the
+    `run-due --city` command (a no-op for a walk that is not due)."""
+    from streetscape_metadata_tracker.download_common import HOST_EXIT_CODES, HOST_OVERPASS
+
+    caplog.set_level("INFO")
+    cid = _city(conn, "Walk", {"gsv": 60, "gsv_streets": 60})
+    _freeze_network(data_dir, cid)
+    cfg = _grid_cfg(
+        data_dir=data_dir,
+        providers={
+            "gsv": ProviderConfig(daily_request_budget=10_000_000),
+            "gsv_streets": ProviderConfig(daily_request_budget=10_000_000),
+        },
+    )
+    ran, _ = _run_night(
+        monkeypatch,
+        conn,
+        cfg,
+        outcome=lambda city, p: (
+            _outcome(HOST_EXIT_CODES[HOST_OVERPASS]) if p == "gsv_streets" else True
+        ),
+    )
+
+    # The fill's launch, then `_retry_stranded_walks`' own two asks (#380's
+    # rule: one retry, and one more after a refusal) -- the pass really ran.
+    assert ran == [(cid, "gsv")] + [(cid, "gsv_streets")] * 3
+    assert _early_rows(conn) == [(cid, "gsv", "2026-10-01", 30)]
+    assert "(1 in the fill, not lost)" in _done_line(caplog)
+    breaker = sched.HostBreaker()
+    breaker.strand(cid, "gsv_streets")
+    breaker.fill_stranded[(cid, "gsv_streets")] = "2026-10-24"
+    note = sched._stranded_alert_note(cfg, breaker, TODAY)
+    assert "stranded by the FILL phase" in note
+    assert f"{cid} (gsv_streets: due on its own clock by 2026-10-24)" in note
+    # No pasteable recovery command (it would be a no-op), and none of the due
+    # paragraph's "~83 days" wording.
+    assert "--provider" not in note and "~83 days" not in note
+
+
+def test_the_fill_strandings_due_date_is_the_walks_own_wall(conn, monkeypatch, data_dir):
+    from streetscape_metadata_tracker.download_common import HOST_EXIT_CODES, HOST_OVERPASS
+
+    cid = _city(conn, "Walk", {"gsv": 60, "gsv_streets": 60})
+    _freeze_network(data_dir, cid)
+    cfg = _grid_cfg(
+        data_dir=data_dir,
+        providers={
+            "gsv": ProviderConfig(daily_request_budget=10_000_000),
+            "gsv_streets": ProviderConfig(daily_request_budget=10_000_000),
+        },
+    )
+    seen = {}
+    real = sched._stranded_alert_note
+
+    def spy(cfg, breaker, today):
+        seen.update(breaker.fill_stranded)
+        return real(cfg, breaker, today)
+
+    monkeypatch.setattr(sched, "_stranded_alert_note", spy)
+    _run_night(
+        monkeypatch,
+        conn,
+        cfg,
+        outcome=lambda city, p: (
+            _outcome(HOST_EXIT_CODES[HOST_OVERPASS]) if p == "gsv_streets" else True
+        ),
+    )
+    # 60 days before 2026-10-01, plus the 83-day wall.
+    assert seen == {(cid, "gsv_streets"): "2026-10-24"}
+
+
+def test_a_due_refresh_deferred_for_budget_holds_the_fill(conn, monkeypatch, caplog):
+    """Review item 4: the hold read on a city ATTEMPTED before (85 days ago),
+    not only a never-attempted one -- killed by dropping the `< since_iso` test."""
+    caplog.set_level("INFO")
+    due = _city(conn, "Refresh", {"gsv": 85, "mapillary": 85})
+    _city(conn, "Eligible", {"gsv": 60, "mapillary": 60})
+    cfg = _grid_cfg(
+        providers={
+            "gsv": ProviderConfig(daily_request_budget=10_000_000),
+            "mapillary": ProviderConfig(daily_request_budget=1),
+        }
+    )
+
+    ran, _ = _run_night(monkeypatch, conn, cfg)
+
+    assert ran == [(due, "gsv")]
+    assert "held: backlog (mapillary 1 due not attempted)" in _done_line(caplog)
+
+
+def test_a_due_pair_that_can_never_fit_does_not_hold_the_fill(conn, monkeypatch, caplog):
+    """Review item 4: a due gsv grid priced over the WHOLE daily budget is
+    skipped every night, so holding on it would switch the fill off for good.
+    Killed by removing the `_never_fits_tonight` exclusion."""
+    caplog.set_level("INFO")
+    giant = _register(conn, "Giant", width=40_000, height=40_000)
+    fill = _city(conn, "Eligible", {"gsv": 60, "mapillary": 60})
+    giant_points = sched.estimate_requests(db.resolve_city(conn, giant), "gsv")
+    small_points = sched.estimate_requests(db.resolve_city(conn, fill), "gsv")
+    budget = giant_points - 1
+    assert small_points < budget
+    cfg = _grid_cfg(
+        providers={
+            "gsv": ProviderConfig(daily_request_budget=budget),
+            "mapillary": ProviderConfig(daily_request_budget=3_500),
+        }
+    )
+
+    ran, _ = _run_night(monkeypatch, conn, cfg)
+
+    assert (giant, "gsv") not in ran
+    assert (fill, "gsv") in ran and (fill, "mapillary") in ran
+    assert any("does not hold the fill" in r.message for r in caplog.records)
+
+
+def test_a_host_that_latches_on_one_fill_city_declines_the_next(conn, monkeypatch, caplog):
+    """Review item 7, live: the tile CDN refuses fill city 1's mapillary, and
+    city 2 is declined whole rather than given a gsv-only refresh. Killed by
+    handing `_fill_admission` a fresh `HostBreaker()`."""
+    from streetscape_metadata_tracker.download_common import HOST_EXIT_CODES, HOST_MAPILLARY_TILES
+
+    caplog.set_level("INFO")
+    a = _city(conn, "Alpha", {"gsv": 70, "mapillary": 70})
+    b = _city(conn, "Bravo", {"gsv": 60, "mapillary": 60})
+
+    def outcome(city, provider):
+        if provider == "mapillary":
+            return _outcome(HOST_EXIT_CODES[HOST_MAPILLARY_TILES])
+        return True
+
+    ran, _ = _run_night(monkeypatch, conn, _grid_cfg(), outcome=outcome)
+
+    assert ran == [(a, "gsv"), (a, "mapillary")]
+    assert all(cid != b for cid, _ in ran)
+    assert "declined 1 for host refused tonight" in _done_line(caplog)
+
+
+def test_a_city_due_tonight_is_never_also_filled(conn, monkeypatch):
+    """Review item 9: a city due only on an opt-in channel runs that channel as
+    a due city and is NOT also filled on gsv/mapillary the same night, however
+    old those are. Killed by dropping the slate exclusion in `_fill_candidates`."""
+    cid = _city(conn, "Stranded", {"gsv": 60, "mapillary": 60})
+    db.set_channel_membership(conn, cid, "kartaview", True, cycle_days=90)
+    cfg = _grid_cfg(
+        providers={
+            "gsv": ProviderConfig(daily_request_budget=10_000_000),
+            "mapillary": ProviderConfig(daily_request_budget=3_500),
+            "kartaview": ProviderConfig(daily_request_budget=10_000),
+        }
+    )
+
+    ran, _ = _run_night(monkeypatch, conn, cfg)
+
+    assert ran == [(cid, "kartaview")]
+    assert _early_rows(conn) == []
+
+
+def test_the_dry_run_draws_its_ledgers_down_across_fill_cities(conn, monkeypatch, capsys):
+    """Review item 9: two identical fill cities, a mapillary budget for one --
+    the second is declined in the preview. Killed by not subtracting an admitted
+    city's price from `budget_left`."""
+    a = _city(conn, "Alpha", {"gsv": 70, "mapillary": 70})
+    b = _city(conn, "Bravo", {"gsv": 60, "mapillary": 60})
+    tiles = sched.estimate_requests(db.resolve_city(conn, a), "mapillary")
+    cfg = _grid_cfg(
+        providers={
+            "gsv": ProviderConfig(daily_request_budget=10_000_000),
+            "mapillary": ProviderConfig(daily_request_budget=tiles + tiles // 2),
+        }
+    )
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+    sched.cmd_run_due(cfg, dry_run=True, today=TODAY)
+    out = capsys.readouterr().out.split("Would FILL", 1)[1]
+    assert a in out and b not in out
+    assert "Fill: 1 cities admitted; declined 1 for mapillary." in out
+
+
+def test_the_dry_run_draws_the_fill_ceiling_down_across_fill_cities(conn, monkeypatch, capsys):
+    """Killed by leaving the preview's own spend out of the host room's `used`."""
+    a = _city(conn, "Alpha", {"gsv": 70, "mapillary": 70})
+    b = _city(conn, "Bravo", {"gsv": 60, "mapillary": 60})
+    tiles = sched.estimate_requests(db.resolve_city(conn, a), "mapillary")
+    cfg = _grid_cfg(fill_host_ceilings={"mapillary_tiles": tiles + tiles // 2})
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+    sched.cmd_run_due(cfg, dry_run=True, today=TODAY)
+    out = capsys.readouterr().out.split("Would FILL", 1)[1]
+    assert a in out and b not in out
+    assert "Fill: 1 cities admitted; declined 1 for mapillary_tiles." in out
+
+
+def test_a_non_default_floor_is_the_one_recorded(conn, monkeypatch):
+    """Killed by recording a constant instead of `cfg.fill_min_days`."""
+    cid = _city(conn, "Old", {"gsv": 50, "mapillary": 50})
+    _city(conn, "Young", {"gsv": 40, "mapillary": 40})
+    ran, _ = _run_night(monkeypatch, conn, _grid_cfg(fill_min_days=45))
+    assert _cities_in(ran) == [cid]
+    assert {r[3] for r in _early_rows(conn)} == {45}
+
+
+def _pair_cfg(data_dir, **kw):
+    return _grid_cfg(
+        data_dir=data_dir,
+        providers={
+            "gsv": ProviderConfig(daily_request_budget=10_000_000),
+            "mapillary": ProviderConfig(daily_request_budget=3_500),
+            "mapillary_streets": ProviderConfig(daily_request_budget=kw.pop("walk_budget", 1_750)),
+        },
+        **kw,
+    )
+
+
+def test_the_mapillary_pair_runs_whole_through_the_fill(conn, monkeypatch, data_dir):
+    cid = _city(conn, "Pair", {"gsv": 60, "mapillary": 60, "mapillary_streets": 60})
+    _freeze_network(data_dir, cid)
+    ran, _ = _run_night(monkeypatch, conn, _pair_cfg(data_dir))
+    assert ran == [(cid, "gsv"), (cid, "mapillary"), (cid, "mapillary_streets")]
+    assert [r[1] for r in _early_rows(conn)] == ["gsv", "mapillary", "mapillary_streets"]
+
+
+def test_a_launch_time_budget_skip_inside_the_fill_is_counted(conn, monkeypatch, caplog, data_dir):
+    """Admission priced the walk against its remainder, then something else
+    spent that remainder before the walk launched: the launch floor-skips it,
+    and the night counts the deferral. Killed by dropping the fill's
+    `skipped_budget` fold."""
+    caplog.set_level("INFO")
+    cid = _city(conn, "Pair", {"gsv": 60, "mapillary": 60, "mapillary_streets": 60})
+    _freeze_network(data_dir, cid)
+    walk = sched.estimate_requests(db.resolve_city(conn, cid), "mapillary_streets")
+    assert walk >= 7
+
+    def outcome(city, provider):
+        if provider == "mapillary":
+            # Another spender draws the walk's daily ledger to 2 under budget.
+            db.add_api_usage(conn, TODAY, walk - 2, "mapillary_streets")
+        return True
+
+    ran, _ = _run_night(monkeypatch, conn, _pair_cfg(data_dir, walk_budget=walk), outcome=outcome)
+    assert ran == [(cid, "gsv"), (cid, "mapillary")]
+    assert "1 deferred for budget" in _done_line(caplog)
+
+
+def test_the_fill_runs_through_two_lanes(conn, monkeypatch, data_dir):
+    """max_concurrent_channels=2: the fill city's channels run in lanes and are
+    all marked. No ledger writes from the fake (lane workers have no catalog)."""
+    cid = _city(conn, "Lanes", {"gsv": 60, "gsv_streets": 60, "mapillary": 60})
+    _freeze_network(data_dir, cid)
+    cfg = _grid_cfg(
+        data_dir=data_dir,
+        max_concurrent_channels=2,
+        providers={
+            "gsv": ProviderConfig(daily_request_budget=10_000_000),
+            "gsv_streets": ProviderConfig(daily_request_budget=10_000_000),
+            "mapillary": ProviderConfig(daily_request_budget=3_500),
+        },
+    )
+    ran, _ = _run_night(monkeypatch, conn, cfg, record_usage=False)
+    assert sorted(ran) == [(cid, "gsv"), (cid, "gsv_streets"), (cid, "mapillary")]
+    assert sorted(r[1] for r in _early_rows(conn)) == ["gsv", "gsv_streets", "mapillary"]
