@@ -406,41 +406,57 @@ Incidental coverage of a deprecated spelling trains readers to ignore the notice
 
 `tests/test_fill_underfull_nights.py` drives `cmd_run_due` with a fake `_run_one_city` that writes what the child would have spent to `api_usage` (and so `host_usage`), under a frozen UTC clock so tonight's stamps sort at the batch start.
 Seeded successes sit at midnight, so a channel's age is a whole number of days, read the way `get_due_cities` reads it.
-A test that builds a second catalog keeps the unpatched `db.connect`, since `_run_night` replaces it for the night.
-Every "killed by" below was run against the committed code (one mutation at a time, file restored after):
+A test that builds a second catalog keeps the unpatched `db.connect`, since `_run_night` replaces it for the night; a lane test writes no ledger, since a lane worker has no catalog handle.
+A live checkpoint is faked by replacing `_sweep_checkpoint_progress`, which both the resumer scan and `_sweep_launch_plan` read.
+Every "killed by" below was run against the committed code, one mutation at a time with the file restored after (42 mutants in the PR #411 review round, the first round's 18 among them, all killed):
 
-- `test_a_backlog_holds_the_whole_fill` — a due city's mapillary deferred for budget holds the fill, and no fill gsv runs either; killed by ignoring the backlog.
+- `test_a_backlog_holds_the_whole_fill` — a never-collected due city's mapillary deferred for budget holds the fill, and no fill gsv runs either; killed by ignoring the backlog.
 - `test_a_backlog_on_an_opt_in_channel_does_not_hold_the_fill` — a KartaView deferral does not stop a gsv/mapillary fill; killed by filling every provider instead of the default-membership ones.
+- `test_a_bad_fill_key_turns_the_fill_off_rather_than_unbounded` and `test_the_loader_reads_the_fill_keys` — eight bad spellings, including a ceiling on unmetered `overpass` and a TOML `true`, each turn the fill off with a warning.
+- `test_a_city_due_tonight_is_never_also_filled` — a city due only on KartaView runs that channel and is not also filled on gsv/mapillary; killed by dropping the slate exclusion in `_fill_candidates`.
 - `test_a_city_is_declined_whole_when_one_channel_does_not_fit` — the pure rule, in both channel orders, and `<=` at an exact fit; killed by dropping the per-channel check.
-- `test_a_due_city_always_runs_before_any_fill_city` — a fill city staler on one channel still runs after the due city.
-- `test_a_failed_due_channel_is_not_a_backlog` — a failure records an attempt, so the fill runs.
-- `test_a_failed_fill_channel_is_not_marked_an_early_refresh` — only a channel whose `last_success_at` moved is written to `early_refreshes`, with its prior success; killed by marking every channel.
-- `test_a_fill_city_is_never_collected_on_a_subset_of_its_channels` — THE acceptance test: a big city whose mapillary does not fit runs on neither channel while a smaller one behind it runs on both; killed by dropping the per-channel check.
+- `test_a_due_city_always_runs_before_any_fill_city`.
+- `test_a_due_pair_that_can_never_fit_does_not_hold_the_fill` — a due gsv grid priced over the whole daily budget is logged and does not hold the fill; killed by letting such pairs hold.
+- `test_a_due_refresh_deferred_for_budget_holds_the_fill` — the hold read on a city ATTEMPTED 85 days ago, not only a never-attempted one.
+- `test_a_failed_due_channel_is_not_a_backlog`.
+- `test_a_failed_fill_channel_is_not_marked_an_early_refresh` — only a channel whose `last_success_at` moved is written, with its prior success, and the failure is recorded once; killed by marking every channel.
+- `test_a_fill_city_is_never_collected_on_a_subset_of_its_channels` — THE acceptance test: a big city whose mapillary does not fit runs on neither channel while a smaller one behind it runs on both, and the fill ends `candidates exhausted`; killed by dropping the per-channel check, and by never clearing the trailing-decline count.
 - `test_a_full_night_is_unchanged_and_the_fill_is_not_reached` — due cities fill the cap: the launch order is identical with the fill on and off; killed by running the fill behind a stopped due loop.
-- `test_a_host_refused_tonight_declines_the_fill_city` — a latched host declines the city at admission, before any budget read.
-- `test_a_v17_catalog_gains_the_early_refreshes_table` — the additive v18 rung, and `record_early_refresh` idempotent on its key.
-- `test_a_walk_on_an_unfrozen_network_declines_its_city` — no Overpass traffic from the fill; once the GraphML is frozen the city runs; killed by admitting an unfrozen walk.
-- `test_an_error_in_the_fill_still_publishes_and_reports_unhealthy`.
-- `test_an_operator_narrowed_run_never_fills` — `--limit`, `--provider` and `--city`, each named on the `Done:` line; killed by letting `--limit` fill.
-- `test_an_under_full_night_refreshes_eligible_cities_stalest_first` — order, the `early_refreshes` rows, and the `Done:` line's due/fill split; killed by not counting fill cities into `processed`.
-- `test_budget_drawn_down_by_earlier_fill_cities_declines_a_later_one` — the ledger is re-read per admission, and the `Done:` line says `ended by budget (mapillary)`; killed by dropping the per-channel check.
-- `test_fill_candidates_need_every_member_channel_past_the_floor_and_not_due` — floor, not-due wall, never-collected, quarantine, exclusion, disabled, and the oldest-channel order; killed by ignoring the floor, ordering freshest-first, ignoring quarantine, and ignoring membership.
-- `test_fill_host_room_is_the_smaller_of_budget_and_ceiling`; killed by ignoring the ceiling.
-- `test_makelab1_fills_at_30_days_under_the_measured_mapillary_ceiling` — prod's 30 and 2,260, the ceiling below the 3,000 host budget, and the repo default off.
-- `test_the_deadline_check_sums_the_channels_needs`; killed by dropping the deadline check, as is `test_the_fill_ends_at_the_deadline_and_says_so`.
-- `test_the_dry_run_previews_the_fill_through_the_same_rule` — the preview admits what the simulated budgets admit, stalest-first, writes nothing; killed by handing the preview unlimited budgets.
-- `test_the_dry_run_says_when_the_fill_is_not_reached_or_held`.
-- `test_the_fill_ceiling_binds_below_the_host_budget` — the live path stops at 2,260 with 3,000 still available, and runs without the ceiling; killed by ignoring the ceiling.
-- `test_the_fill_composes_with_the_hoist_and_the_refresh_reserve` — on two fresh catalogs, the due phase's launch order (hoisted city, then the two promoted refreshes) and the opening line's `hoisted=1`/`(2 promoted)` are identical with the fill on and off, and the fill cities follow.
-- `test_the_fill_never_runs_an_opt_in_channel` — an enrolled city with an old KartaView clock is refreshed on gsv and mapillary only; killed by filling every provider.
-- `test_the_fill_stops_at_the_city_cap` — the due city plus the two stalest fill cities fill a cap of 3; killed by ignoring the cap in the fill.
+- `test_a_host_refused_tonight_declines_the_fill_city` (admission alone) and `test_a_host_that_latches_on_one_fill_city_declines_the_next` (live: the tile CDN refuses city 1's mapillary, city 2 runs nothing); the live one is killed by handing `_fill_admission` a fresh `HostBreaker()`.
+- `test_a_launch_the_plan_would_cap_is_declined` — a plan with no skip but a cap under the price declines the city, and a cap equal to it does not; killed by dropping the `request_cap < est` test.
+- `test_a_launch_time_budget_skip_inside_the_fill_is_counted` — the walk's remainder is spent between admission and its launch, the launch floor-skips it, and the `Done:` line counts it; killed by dropping the fill's `skipped_budget` fold.
+- `test_a_non_default_floor_is_the_one_recorded` — `fill_min_days = 45` admits only the 50-day city and records 45; killed by recording a constant.
+- `test_a_paused_fill_crawl_is_resumed_even_while_a_backlog_holds_the_fill` — the orphan resume runs on its paused channel while a due gsv deferral holds every new fill city; killed by dropping the backlog's `< since_iso` test (which then misses a previously-attempted due pair, so nothing is held).
+- `test_a_paused_fill_crawl_is_resumed_first_by_the_next_nights_fill` — night 1's exit 83 is logged as not due (never "stays due"); night 2 resumes it first, on mapillary only, and marks it against the old success; killed by never resuming orphans and by the old pause wording.
+- `test_a_v17_catalog_gains_the_early_refreshes_table` — the additive v18 rung, and two identical writes leave COUNT(*) = 1; killed by dropping the PRIMARY KEY (a key-set assert could not see it).
+- `test_a_walk_on_an_unfrozen_network_declines_its_city` — no Overpass traffic from the fill; once the GraphML is frozen the city runs and BOTH channels are marked, the walk with network type `drive`; killed by admitting an unfrozen walk, by never marking walk channels, and by dropping walks from the fill.
+- `test_a_walk_stranded_in_the_fill_is_retried_then_named_without_a_dead_command` and `test_the_fill_strandings_due_date_is_the_walks_own_wall` — the fill's own retry pass runs, the `Done:` line says `(1 in the fill, not lost)`, and the alert names the walk's own due date (2026-10-24, its 83-day wall) with no `--provider` recovery command; killed by not recording the stranding, and by printing it in the due paragraph.
+- `test_admission_asks_the_launch_plan_not_only_the_remainder` — a 1-tile census against a 4-request remainder is declined live and in the dry run; killed by not asking the launch plan.
+- `test_an_error_in_the_fill_still_publishes_and_reports_unhealthy` — the fill's own error wording; killed by leaving it out of `errored`.
+- `test_an_operator_narrowed_run_never_fills` — `--limit`, `--provider` and `--city`; killed by letting `--limit` fill.
+- `test_an_opt_in_enrolment_neither_qualifies_nor_disqualifies_a_fill_city`.
+- `test_an_under_full_night_refreshes_eligible_cities_stalest_first` — order, the rows, and the `Done:` line's due/fill split; killed by not counting fill cities into `processed`.
+- `test_budget_drawn_down_by_earlier_fill_cities_declines_a_later_one` — `ended by budget (mapillary)`; killed by dropping the per-channel check.
+- `test_fill_candidates_need_every_member_channel_past_the_floor_and_not_due` — floor, not-due wall, never-collected, quarantine, ONE failure, exclusion, disabled, and the oldest-channel order; killed by ignoring the floor, ordering freshest-first, ignoring failures, and ignoring membership.
+- `test_fill_host_room_is_the_smaller_of_budget_and_ceiling` and `test_the_fill_ceiling_binds_below_the_host_budget`; killed by ignoring the ceiling.
+- `test_makelab1_fills_at_30_days_under_the_measured_mapillary_ceiling`.
+- `test_sigterm_mid_city_in_the_fill_stops_the_night` — a SIGTERM during a fill city's gsv stops its mapillary, the fill and the night; killed by not making a fill SIGTERM the night's stop.
+- `test_the_deadline_check_sums_the_channels_needs` and `test_the_fill_ends_at_the_deadline_and_says_so`; killed by dropping the deadline check.
+- `test_the_dry_run_draws_its_ledgers_down_across_fill_cities` and `test_the_dry_run_draws_the_fill_ceiling_down_across_fill_cities`; killed by not subtracting an admitted city's price, and by leaving the preview's own spend out of the host room.
+- `test_the_dry_run_previews_the_fill_through_the_same_rule` and `test_the_dry_run_says_when_the_fill_is_not_reached_or_held`; the first killed by handing the preview unlimited budgets.
+- `test_the_fill_composes_with_the_hoist_and_the_refresh_reserve` — on two fresh catalogs the due phase's launch order and the opening line's `hoisted=1`/`(2 promoted)` are identical with the fill on and off.
+- `test_the_fill_never_runs_an_opt_in_channel`.
+- `test_the_fill_runs_through_two_lanes` and `test_the_mapillary_pair_runs_whole_through_the_fill`.
+- `test_the_fill_stops_at_the_city_cap`; killed by ignoring the cap in the fill.
 - `test_the_floor_is_inclusive_and_only_the_floor_moves_eligibility`.
-- `test_the_host_check_sums_both_mapillary_channels` — each fits the host room alone, together they do not; killed by checking per channel.
-- `test_the_loader_reads_the_fill_keys` and `test_a_bad_fill_key_turns_the_fill_off_rather_than_unbounded` — eight bad spellings, including a ceiling on unmetered `overpass` and a TOML `true`, each turn the fill off with a warning.
+- `test_the_host_check_sums_both_mapillary_channels`; killed by checking per channel.
 - `test_the_repo_default_has_no_fill_and_logs_nothing_about_it`.
 
-`tests/test_json_v2.py::test_aggregate_marks_only_the_early_refreshed_run` pins the aggregate mark on (city, provider, run date), with decoys on another provider and another date; killed by marking by city alone.
-The existing v4 aggregate test asserts no unmarked run carries the key.
+Elsewhere:
+`tests/test_json_v2.py::test_aggregate_marks_only_the_early_refreshed_run` pins the aggregate mark on (city, channel, run date) with two decoys, the unmarked run's date on another channel and gsv's channel on a date with no run; killed by marking by city alone.
+`tests/test_night_length.py::test_a_filled_night_parses_and_is_never_pooled_into_full` parses the real `(D due, F fill)` line and keeps a filled night out of `full`; killed by dropping the optional group and by pooling.
+`tests/test_purge_tainted_runs.py::test_purge_drops_the_purged_runs_early_refresh_mark_only` and `tests/test_archival_import.py::test_deleting_an_archival_run_drops_its_early_refresh_mark`; each killed by keeping the mark.
+Not pinned: the `only=` filter on the fill's call to `_retry_stranded_walks` (a pass without it would re-ask about due strandings the due pass already retried).
 
 ## Concurrent channel lanes (issue #240)
 
