@@ -259,7 +259,7 @@ Since #344 a truncated resumable child is not killed at all in the ordinary case
 `mapillary` (rank 2) launches before `mapillary_streets` (rank 3), so within a city the grid run pays for the shared z14 census and the walk reads it for zero requests; `kartaview` (4) and `kartaview_streets` (5) are the same pair over the radius sweep, wired in #258.
 Measured on the first KartaView walk (Krabi, 2026-08-31): 87 sweep requests un-paired, against the 18,851 that same walk costs on `gsv_streets` at one request per on-street sample — and 0 on any night the grid run got there first.
 That is a consequence of the existing ranking rather than a new constraint on it — reversing the pair would simply move which channel's ledger carries the spend, and `census_fetched_by` would record that faithfully either way — but it is why the two are ranked adjacently and why nothing should separate them.
-Nothing else here has that (Mapillary's checkpoint is #256, and a truncated tile census re-spends against the per-IP ceiling — 3,500/day on a paired night, 5,250 un-paired since the 2026-09-05 re-size, see docs/provider-access.md).
+Nothing else here has that (Mapillary's checkpoint is #256, and a truncated tile census re-spends against the per-IP ceiling — since #385 the 3,000-per-rolling-24-h host pool, which binds before 5,250, the mere sum of the two daily budgets; see docs/provider-access.md).
 **Cheapest is not free, in two ways that both matter.**
 No channel keeps its ledger row through a SIGKILL, whatever its provider.
 And a SIGKILL still counts a `consecutive_failure` — only a *deliberate* pause (exit `SWEEP_INCOMPLETE_EXIT_CODE`) is amnestied — so the resumption that justifies this ranking is itself bounded at five nights.
@@ -412,7 +412,7 @@ Until 2026-09-21 the share was sent unconditionally, which made each provider's 
 **Two things gated raising it in production. The first is now satisfied; the second is still outside this repo.**
 (1) **Resume for every provider**, because a deadline or a `systemctl stop` now kills up to N children at once instead of 1.
 This is **met as of #256**: GSV grid (`.downloading` sibling), the GSV road walk (same `collect_points_async` engine), KartaView (`checkpoints/`, #239) and both Mapillary channels (`checkpoints/`, #256) all resume,
-so a killed child costs the tiles it had not yet fetched rather than the ones it had — which mattered here because a re-spend lands against the deliberate per-IP ceiling — 3,500/day paired and 5,250 un-paired since 2026-09-05 (#286) — i.e. ban risk rather than merely lost time.
+so a killed child costs the tiles it had not yet fetched rather than the ones it had — which mattered here because a re-spend lands against the deliberate per-IP ceiling — since #385 the 3,000-per-rolling-24-h host pool, which binds before 5,250, the mere sum of the two daily budgets (#286) — i.e. ban risk rather than merely lost time.
 A killed child still records no `api_usage` at all (#238), and that loss multiplies by N — unchanged by the checkpoint, since it is the parent that never sees the number.
 (2) **`gsv` and `gsv_streets` hold no per-IP lock**, because Google meters per Cloud *project* rather than per IP — so running them together is only safe while `GMAPS_API_KEY` and `GMAPS_STREETS_API_KEY` really do live in **separate projects**.
 The projects **are** now recorded — in `config/scheduler.makelab1.toml` beside `max_concurrent_channels`, with the account and the date of the check, as of 2026-09-21; this file said they were recorded nowhere until then.
@@ -441,6 +441,52 @@ The figure still worth watching is not that range but the **worst city** — a s
 The before/after is a measured question and therefore owes a writeup: `scripts/night_length_analyze.py` lands with the code and reads the elapsed distribution (with per-channel `api_usage` and the busy/blocked counts beside it, as the volume control) straight out of `logs/streetscape_scheduler.log*`; `docs/experiments/night-length.md` follows once there are nights on both sides of the flip to compare.
 That is also why `cmd_run_due` logs `max_concurrent_channels=N` **and `connection_limit=N`** on its opening line — which setting a night ran under has to be recoverable from the night's own record, not from an operator's memory of the flip date.
 Both, because the per-child socket count is the pair divided: a night that fell back to one lane would otherwise be grouped with pre-flip one-lane nights while having run at a different share.
+
+## A shared rolling-24h budget per per-IP host (issue #385, added 2026-09-29)
+
+**Every channel on a budgeted per-IP host draws from one pool, counted over the last 24 h rather than per UTC date.**
+It is configured per host token, `[hosts.mapillary_tiles] rolling_24h_request_budget = 3000` on prod, so both Mapillary channels are covered, and so would be a future channel on the same CDN.
+The per-channel `daily_request_budget`s stay exactly as they are.
+**The effective remainder at a launch is the minimum** of the channel's daily remainder and every budgeted host's rolling remainder.
+The rule lives once, in `_combine_remainder`: `_budget_remainder` feeds it the ledgers as they stand for the live gate and `assess-city`, and `run-due --dry-run` feeds it one window read plus its own simulated spend per host, so the preview draws the pool down across both channels the way the night will.
+**A host governs only when its remainder is strictly smaller**; on a tie the channel's daily budget is the named term.
+A resumable channel is then capped at that remainder, or deferred under its launch floor, by the machinery above; no new stop path exists.
+**A floor skip is the host's only when the host's window set the cap** (`BudgetRemainder.host_bound`: the host governs AND the cap equals the ledger remainder) — a skip the deadline clamp caused is the clock's, and stays a budget skip even while the host is the smaller ledger term.
+**The age wall asks what tonight could plausibly grant, not what the window holds right now** (`BudgetRemainder.ceiling`: the channel's daily remainder against, per budgeted host, its budget minus the spend that will still be in the window when the batch ends — everything stamped at or after `batch_end − 24 h`).
+It is the one arm that records a failure, and at 09:00 UTC after a full night the window holds ~53 of 3,000 while most of the rest frees before the night ends; projected against that, a 6-day checkpoint with a few hundred requests left would be failed and the operator told to raise the wrong budget.
+The full budget would be wrong the other way: late in a night that has itself spent ~2,947, none of it ages out before the batch ends, so a crawl the wall passed against 3,000 would launch capped, never finish, and be discarded past `CHECKPOINT_MAX_AGE_S` with no failure recorded — the silent weekly re-sweep the wall exists to alert on.
+`batch_end` is the batch deadline's wall-clock equivalent on the live path and `now + max_batch_hours` in the dry run; `assess-city` and any other caller without a deadline use `now`, so the ceiling is the momentary remainder — the conservative reading on an operator run.
+When the host is what cannot fit the crawl, the refusal names `[hosts.<token>].rolling_24h_request_budget` as the lever; when a timeout is the smaller term it names no budget, but the clock that binds: the batch deadline's clamp on a late launch (`[schedule].max_batch_hours`, or run the city earlier), or the city's own derived timeout (`[schedule].city_timeout_minutes` is its floor, and it grows with the grid).
+With no `[hosts]` section (the repo default), or an empty one, the gate reads exactly what it read before.
+An invalid entry (a token no channel's ledger meters — `[hosts.overpass]` included, which names a real host but could never bind — a non-positive or non-integer value, a stray key) is recorded and logged at load like an unwired channel, and `run-due` and `assess-city` refuse with 64: falling back to "no budget" would be the fail-open direction.
+
+**It is re-read per launch, never once per night**, because the same night's earlier children on the host have written to the ledger since.
+The two Mapillary channels never overlap (the cross-process host lock, and host-disjoint lanes in-process), so no cross-lane reservation is needed.
+
+**The ledger is `host_usage` (schema v16), written by `db.add_api_usage` itself** for every channel in `download_common.CHANNEL_METERED_HOST`, so no call site can forget it and the ledger is complete whatever the budget config says.
+A child records its spend when it finishes, so a long crawl's whole spend is stamped at its end.
+That shifts spend **later** within the window, which makes the gate slightly more conservative on the following night, never less; there are deliberately no mid-crawl writes.
+**The design consequence is lumpy credit.** The first Mapillary launch after a full night sees the small remainder and is launched capped at it, and credit returns in lumps as last night's per-crawl stamps age out, so a big crawl fragments into capped slices across the night; the dry run reads the window once and ages nothing, so at preview time it over-reports deferrals the night itself will launch.
+**A child SIGKILLed or crashed mid-crawl writes neither ledger**, since both writes happen when it returns; PR #387 gives resumable children a clock stop, which shrinks that case without closing it.
+The v16 migration backfills the last two UTC dates of metered `api_usage`, each row stamped at the latest instant its spend can have happened — `min(23:59:59 UTC of its date, the migration's clock)` — so the first night after deploy is gated for the **whole** night.
+Noon was the first choice and was wrong: prod's night runs ~09:00–21:00 UTC, so a noon stamp released yesterday's spend at 12:00 UTC, three hours into the first night, while most of it was still inside the true 24 h.
+The late stamp errs the fail-closed way: it can defer up to one night more than a timestamped ledger would have, and it never releases spend earlier than the real requests would have left the window.
+The tail prunes rows older than 30 days, best-effort.
+`import-bundle` writes no host row, since imported spend came from another machine's IP.
+
+**It is a soft ceiling, exactly like the daily budget**: tiles already in flight finish their retries, so a capped night can end up to `connection_limit × (TILE_MAX_TRIES − 1)` over it.
+Never write that it is not exceeded.
+
+A host-governed deferral is logged with the host, its usage and the window start, counted in `deferred_host_budget` rather than `skipped_budget`, and reported on the `Done:` line as `N deferred for the rolling-24h budget of <host>`; a host-capped launch names the host in its cap line.
+`run-due --dry-run`, `scheduler status` and `assess-city`'s pre-flight all print the window.
+A direct `streetscape_tracker.py --provider mapillary` has no scheduler config, so it neither warns nor refuses; its spend still lands in the window through the seam.
+**This is a staging guard on how fast our traffic can change, not a model of Mapillary's per-IP threshold** — see `docs/provider-access.md`, block 4.
+
+**Deploying v16, and rolling it back.**
+`import-bundle` requires the bundle's catalog to be exactly this host's `SCHEMA_VERSION`, so once v16 is deployed it refuses every v15 laptop bundle: import a waiting bundle **before** deploying, or re-collect it on a v16 checkout.
+Pre-#385 code refuses a v16 catalog ("newer than this code supports") on every subcommand that opens it through `db.connect` — `run-due`, `status`, `assess-city`, `import-bundle` and the rest — so a rollback needs `PRAGMA user_version = 15` set by hand on the catalog first; the extra `host_usage` table is harmless to old code.
+`backup-status` and `restore-backup` read only the backup directory, so they keep working either way.
+Re-deploying after such a rollback does **not** re-backfill (the table is no longer empty), so spend made while rolled back is missing from the window until it would have aged out anyway.
 
 ## What a capped night spends its slots on (issue #308, added 2026-09-02)
 

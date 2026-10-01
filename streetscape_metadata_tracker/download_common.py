@@ -93,6 +93,34 @@ HOST_LABELS = {
     HOST_PANORAMAX: "the Panoramax meta-catalog (api.panoramax.xyz)",
 }
 
+# The per-IP host whose requests a channel's ``api_usage`` ledger row COUNTS
+# (issue #385). ``db.add_api_usage`` reads it to stamp a timestamped
+# ``host_usage`` row beside the daily one, so the scheduler can ask "how much
+# has this HOST taken in the last 24 h" across every channel that talks to it
+# and across the UTC date boundary -- the two things the per-(date, channel)
+# ledger cannot answer, and exactly the gap block 4 (2026-09-28) fell through.
+#
+# gsv/gsv_streets are absent: Google meters by project, not by IP, and no
+# channel's ledger counts Overpass requests (a walk's api_usage is its
+# census-host spend), so HOST_OVERPASS never appears here.
+#
+# Lives HERE rather than beside scheduler.CHANNEL_HOSTS because db.py writes
+# through it and must not import the scheduler (circular); this module imports
+# neither. test_the_metered_host_map_agrees_with_channel_hosts pins the two
+# tables together by set equality, so a channel added to one is a red test
+# until it is decided in the other.
+#
+# Config-independent on purpose: the ledger is complete whatever the budget
+# config says, so turning a [hosts.*] budget on later reads a full window.
+CHANNEL_METERED_HOST: dict[str, str] = {
+    "mapillary": HOST_MAPILLARY_TILES,
+    "mapillary_streets": HOST_MAPILLARY_TILES,
+    "kartaview": HOST_KARTAVIEW,
+    "kartaview_streets": HOST_KARTAVIEW,
+    "panoramax": HOST_PANORAMAX,
+    "panoramax_streets": HOST_PANORAMAX,
+}
+
 # Per-provider socket ceilings for a ROAD WALK (issues #99, #331). One
 # `--connection-limit` flag serves four arms whose hosts are not alike, so 50 --
 # a GSV number -- is a default only two of them should inherit.

@@ -1,9 +1,11 @@
 """Catalog tests: registration, aliases, runs, diffs, budget, scheduling."""
 
 import json
+import multiprocessing
 import os
 import sqlite3
-from datetime import date
+import time
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
@@ -1928,3 +1930,252 @@ def test_the_provenance_defaults_to_null_not_to_the_collecting_channel(conn):
     )
     run = db.get_latest_run(conn, city_id, provider="gsv")
     assert run.census_fetched_by is None and run.census_fetched_at is None
+
+
+# ── The per-host rolling ledger, schema v16 (issue #385) ────────────────────
+
+_HOST_NOW = datetime(2026, 9, 28, 6, 0, tzinfo=UTC)
+
+
+def _host_rows(conn):
+    return sorted(
+        tuple(r)
+        for r in conn.execute("SELECT recorded_at, host, provider, requests FROM host_usage")
+    )
+
+
+def test_migrate_v15_to_v16_backfills_two_utc_dates_of_metered_channels(tmp_path, frozen_utc_clock):
+    """A v15 catalog gains host_usage, seeded so the first night after deploy is gated.
+
+    Built from db._SCHEMA minus host_usage (so the fixture tracks the code), with
+    api_usage rows chosen so each exclusion is separately observable: a
+    two-days-old metered row (outside the two UTC dates), gsv and gsv_streets
+    rows (Google meters by project, not IP), and a zero-request row. The kept
+    rows are stamped at the LATEST instant their spend can have happened --
+    23:59:59 UTC of a past date, the migration's own clock for today -- one row
+    per channel.
+    """
+    frozen_utc_clock(_HOST_NOW)
+    db_path = str(tmp_path / "v15.db")
+    raw = sqlite3.connect(db_path)
+    raw.executescript(db._SCHEMA)
+    raw.execute("DROP TABLE host_usage")
+    for usage_date, provider, n in [
+        ("2026-09-28", "mapillary", 194),
+        ("2026-09-28", "mapillary_streets", 1444),
+        ("2026-09-27", "mapillary", 1198),
+        ("2026-09-27", "kartaview", 16),
+        ("2026-09-26", "mapillary_streets", 1262),  # two dates back: out
+        ("2026-09-28", "gsv", 5_000_000),  # not per-IP: out
+        ("2026-09-27", "gsv_streets", 90_000),  # not per-IP: out
+        ("2026-09-27", "panoramax", 0),  # nothing spent: out
+    ]:
+        raw.execute(
+            "INSERT INTO api_usage (usage_date, provider, requests) VALUES (?, ?, ?)",
+            (usage_date, provider, n),
+        )
+    raw.execute("PRAGMA user_version = 15")
+    raw.commit()
+    raw.close()
+
+    conn = db.connect(db_path)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 16
+    assert _host_rows(conn) == [
+        ("2026-09-27T23:59:59+00:00", "kartaview", "kartaview", 16),
+        ("2026-09-27T23:59:59+00:00", "mapillary_tiles", "mapillary", 1198),
+        ("2026-09-28T06:00:00+00:00", "mapillary_tiles", "mapillary", 194),
+        ("2026-09-28T06:00:00+00:00", "mapillary_tiles", "mapillary_streets", 1444),
+    ]
+    conn.close()
+
+    # Idempotent: a second connect neither re-migrates nor double-seeds, and
+    # re-running the migration by hand on a non-empty table seeds nothing.
+    conn2 = db.connect(db_path)
+    db._migrate_v15_to_v16(conn2)
+    assert len(_host_rows(conn2)) == 4
+    conn2.close()
+
+
+def _v15_catalog(db_path, rows):
+    """A v15 catalog: db._SCHEMA minus host_usage, with ``rows`` in api_usage."""
+    raw = sqlite3.connect(db_path)
+    raw.executescript(db._SCHEMA)
+    raw.execute("DROP TABLE host_usage")
+    raw.executemany("INSERT INTO api_usage (usage_date, provider, requests) VALUES (?, ?, ?)", rows)
+    raw.execute("PRAGMA user_version = 15")
+    raw.commit()
+    raw.close()
+
+
+@pytest.mark.parametrize(
+    "at,counted",
+    [
+        (datetime(2026, 9, 30, 12, 0, 1, tzinfo=UTC), 2947),
+        (datetime(2026, 9, 30, 20, 0, tzinfo=UTC), 2947),
+        (datetime(2026, 9, 30, 23, 59, 59, tzinfo=UTC), 2947),
+        (datetime(2026, 10, 1, 0, 0, 0, tzinfo=UTC), 0),
+    ],
+    ids=["noon-plus-1s", "20h", "last-second", "released"],
+)
+def test_the_backfill_keeps_yesterdays_spend_in_the_window_all_first_night(
+    tmp_path, frozen_utc_clock, at, counted
+):
+    """Issue #385 review: the first night after deploy is gated for the WHOLE night.
+
+    Deployed 09-30 09:00 UTC after a 09-29 night of 2,947. Prod's night runs
+    ~09:00-21:00 UTC, so a noon stamp released that spend at 12:00 UTC on 09-30
+    -- three hours into the night the backfill exists to protect. Stamped at the
+    end of its date, it is still in the window at noon and at 20:00, and leaves
+    one second after 23:59:59. A noon stamp fails every case but the last.
+    """
+    frozen_utc_clock(datetime(2026, 9, 30, 9, 0, tzinfo=UTC))
+    db_path = str(tmp_path / "v15.db")
+    _v15_catalog(
+        db_path, [("2026-09-29", "mapillary", 1198), ("2026-09-29", "mapillary_streets", 1749)]
+    )
+    conn = db.connect(db_path)
+    try:
+        assert db.get_host_usage(conn, "mapillary_tiles", at - timedelta(hours=24)) == counted
+    finally:
+        conn.close()
+
+
+def test_add_api_usage_is_the_host_ledger_write_seam(conn, frozen_utc_clock):
+    """One seam, so no call site can forget it (issue #385).
+
+    A metered channel writes one host_usage row stamped from the shared clock;
+    gsv writes none; meter_host=False (the bundle import) writes none; and a
+    zero spend writes none -- but every one of them still charges api_usage.
+    """
+    frozen_utc_clock(_HOST_NOW)
+    d = date(2026, 9, 28)
+    db.add_api_usage(conn, d, 120, "mapillary")
+    db.add_api_usage(conn, d, 5_000, "gsv")
+    db.add_api_usage(conn, d, 5_000, "gsv_streets")
+    db.add_api_usage(conn, d, 40, "kartaview", meter_host=False)
+    db.add_api_usage(conn, d, 0, "mapillary_streets")
+    assert _host_rows(conn) == [("2026-09-28T06:00:00+00:00", "mapillary_tiles", "mapillary", 120)]
+    assert db.get_api_usage(conn, d, "kartaview") == 40
+    assert db.get_api_usage(conn, d, "gsv") == 5_000
+
+
+def test_the_host_window_is_inclusive_at_its_start(conn):
+    """A row stamped exactly at ``since`` counts; one a second earlier does not."""
+    since = _HOST_NOW - timedelta(hours=24)
+    for stamp, n in [(since, 7), (since - timedelta(seconds=1), 1000), (_HOST_NOW, 3)]:
+        conn.execute(
+            "INSERT INTO host_usage VALUES (?, 'mapillary_tiles', 'mapillary', ?)",
+            (stamp.isoformat(), n),
+        )
+    assert db.get_host_usage(conn, "mapillary_tiles", since) == 10
+    assert db.get_host_usage(conn, "kartaview", since) == 0
+    with pytest.raises(ValueError, match="aware"):
+        db.get_host_usage(conn, "mapillary_tiles", since.replace(tzinfo=None))
+
+
+def test_prune_host_usage_drops_only_rows_older_than_the_cutoff(conn):
+    cutoff = _HOST_NOW - timedelta(days=30)
+    for stamp in (cutoff - timedelta(seconds=1), cutoff, _HOST_NOW):
+        conn.execute(
+            "INSERT INTO host_usage VALUES (?, 'mapillary_tiles', 'mapillary', 1)",
+            (stamp.isoformat(),),
+        )
+    assert db.prune_host_usage(conn, cutoff) == 1
+    assert [r[0] for r in _host_rows(conn)] == [cutoff.isoformat(), _HOST_NOW.isoformat()]
+
+
+def _race_worker(index, paths, barrier, errors):
+    """Racer ``index``, first-connecting each v15 catalog in ``paths`` in step with the others.
+
+    The barrier wait is bounded, so a racer whose peer died stops waiting
+    (``BrokenBarrierError``, a nonzero exit) instead of blocking forever; the
+    parent also aborts the barrier the moment any racer exits nonzero.
+    """
+    import time
+
+    from streetscape_metadata_tracker import clock
+
+    clock._utc_clock = lambda: datetime(2026, 9, 30, 9, 0, tzinfo=UTC)
+
+    # WIDEN the race window, which is otherwise microseconds wide: the
+    # migration reads today's date BETWEEN its empty-table check and its
+    # inserts, so a pause here holds every racer inside the window. Measured
+    # without it, dropping BEGIN IMMEDIATE survived 3 of 3 runs of 8 trials.
+    def slow_today():
+        time.sleep(0.05)
+        return clock.utc_now().date()
+
+    clock.snapshot_date_today = slow_today
+    for path in paths:
+        barrier.wait(timeout=_RACE_BARRIER_TIMEOUT_S)
+        try:
+            db.connect(path).close()
+        except Exception as exc:  # reported, so the parent can fail by name
+            errors.put(f"{path}: {exc!r}")
+
+
+_RACE_PROCESSES = 4
+_RACE_TRIALS = 8
+# Backstops only: the parent aborts the barrier as soon as a racer dies, so a
+# broken run fails in about a second, not at these limits.
+_RACE_BARRIER_TIMEOUT_S = 30
+_RACE_DEADLINE_S = 60
+
+
+def test_concurrent_first_connects_seed_the_v16_backfill_exactly_once(tmp_path):
+    """Issue #385 review: ``BEGIN IMMEDIATE`` makes the backfill race-safe.
+
+    Four processes first-connect the same v15 catalog at once (a barrier lines
+    them up), over several fresh catalogs. Each must end at v16 with exactly the
+    two backfill rows -- never four, six or eight -- and no process may fail.
+    Without the transaction, two processes can both find ``host_usage`` empty
+    and both seed it; the worker pauses inside that window (see
+    ``_race_worker``), because unwidened it is too narrow to lose reliably. The
+    processes are started once and reused across trials, so the stack is
+    imported four times, not four times per trial.
+    """
+    paths = []
+    for trial in range(_RACE_TRIALS):
+        path = str(tmp_path / f"race{trial}.db")
+        _v15_catalog(
+            path, [("2026-09-29", "mapillary", 1198), ("2026-09-30", "mapillary_streets", 5)]
+        )
+        raw = sqlite3.connect(path)
+        raw.execute("PRAGMA journal_mode=WAL")
+        raw.close()
+        paths.append(path)
+    ctx = multiprocessing.get_context("spawn")
+    barrier = ctx.Barrier(_RACE_PROCESSES)
+    errors = ctx.Queue()
+    # daemon, and terminated in `finally`: a racer that dies must FAIL this
+    # test, never leave its peers parked on the barrier where multiprocessing's
+    # atexit join would hang pytest until the CI runner's own timeout.
+    procs = [
+        ctx.Process(target=_race_worker, args=(i, paths, barrier, errors), daemon=True)
+        for i in range(_RACE_PROCESSES)
+    ]
+    try:
+        for proc in procs:
+            proc.start()
+        deadline = time.monotonic() + _RACE_DEADLINE_S
+        while any(proc.is_alive() for proc in procs) and time.monotonic() < deadline:
+            if any(proc.exitcode not in (None, 0) for proc in procs):
+                barrier.abort()  # releases every waiter with BrokenBarrierError
+            time.sleep(0.05)
+        exitcodes = [proc.exitcode for proc in procs]
+    finally:
+        for proc in procs:
+            if proc.is_alive():
+                proc.terminate()
+            proc.join(timeout=10)
+    assert exitcodes == [0] * _RACE_PROCESSES
+    failures = []
+    while not errors.empty():
+        failures.append(errors.get())
+    assert failures == []
+    for path in paths:
+        raw = sqlite3.connect(path)
+        rows = raw.execute("SELECT provider, requests FROM host_usage ORDER BY provider").fetchall()
+        version = raw.execute("PRAGMA user_version").fetchone()[0]
+        raw.close()
+        assert (version, rows) == (16, [("mapillary", 1198), ("mapillary_streets", 5)]), path

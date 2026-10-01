@@ -139,6 +139,13 @@ def gsv_configs(monkeypatch):
 # ── Skip policy ─────────────────────────────────────────────────────────────
 
 
+def _host_spend(conn, provider):
+    """What ``provider`` charged to the per-host rolling ledger (issue #385)."""
+    return conn.execute(
+        "SELECT COALESCE(SUM(requests), 0) FROM host_usage WHERE provider = ?", (provider,)
+    ).fetchone()[0]
+
+
 def test_skip_when_recent_run(monkeypatch, catalog):
     conn, city_id, data_dir = catalog
     db.register_run(
@@ -550,6 +557,10 @@ def test_a_blocked_host_still_records_what_it_spent(monkeypatch, catalog):
 
     run_cli(monkeypatch, city_id, data_dir, provider="mapillary")
     assert db.get_api_usage(conn, RUN_DATE, provider="mapillary") == 5
+    # ...and the per-host rolling ledger (issue #385), through the same seam:
+    # this is the FAILED-download arm's add_api_usage, and the refused requests
+    # are exactly the ones the tile CDN counted against this IP.
+    assert _host_spend(conn, "mapillary") == 5
 
 
 # ── Registration-time grid cap (issue #166) ─────────────────────────────────
@@ -691,6 +702,10 @@ def test_a_resumed_census_row_takes_the_crawl_and_the_ledger_this_process(monkey
     assert db.get_api_usage(conn, RUN_DATE, provider="mapillary") == 9, (
         "the additive daily ledger must carry only this process's spend"
     )
+    # The success arm's add_api_usage meters the host too (issue #385), with the
+    # same per-process figure -- the rolling window counts requests made, and a
+    # resumed crawl's earlier nights were charged on those nights.
+    assert _host_spend(conn, "mapillary") == 9
 
 
 def test_the_census_checkpoint_is_discarded_only_after_the_run_row_lands(monkeypatch, catalog):
