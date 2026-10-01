@@ -183,6 +183,24 @@ def test_diff_storage(conn, city):
     assert row["panos_added"] == 5 and row["grid_aligned"] == 1
 
 
+def test_update_diff_of_a_missing_row_raises(conn):
+    """A repair that updated nothing must not read as one that succeeded."""
+    with pytest.raises(LookupError):
+        db.update_diff(
+            conn,
+            12345,
+            grid_aligned=True,
+            panos_added=0,
+            panos_removed=0,
+            panos_persisted=0,
+            capture_date_changed=0,
+            points_gained_coverage=None,
+            points_lost_coverage=None,
+            coverage_delta_pct=None,
+            detail_filename=None,
+        )
+
+
 def _diff(conn, city, from_run_id, to_run_id, **overrides):
     kwargs = dict(
         city_id=city,
@@ -1585,6 +1603,50 @@ def test_get_previous_street_walk_filters_series_and_date(conn, city):
     assert db.get_previous_street_walk(conn, city, date(2026, 5, 1), provider="mapillary") is None
 
 
+def test_delete_walk_diff_returns_only_the_cleared_walks_names(conn, city):
+    """The names returned are files the caller is about to DELETE (#265), so
+    they must be exactly the rows this call removed: not the diff whose FROM
+    side is this walk (the next walk's live file), and not another series'."""
+    walks = {}
+    for key, run_date, network_type in (
+        ("a", date(2026, 4, 1), "drive"),
+        ("b", date(2026, 7, 1), "drive"),
+        ("c", date(2026, 10, 1), "drive"),
+        ("x", date(2026, 4, 1), "all_public"),
+        ("y", date(2026, 7, 1), "all_public"),
+    ):
+        walks[key] = db.register_street_walk(
+            conn,
+            city_id=city,
+            run_date=run_date,
+            csv_filename=f"{key}_streetwalk.csv.gz",
+            network_type=network_type,
+        )
+    for from_key, to_key in (("a", "b"), ("b", "c"), ("x", "y")):
+        db.record_street_walk_diff(
+            conn,
+            city_id=city,
+            from_walk_id=walks[from_key],
+            to_walk_id=walks[to_key],
+            edges_aligned=1,
+            edges_added=0,
+            edges_removed=0,
+            edges_gained_coverage=1,
+            edges_lost_coverage=0,
+            coverage_fraction_changed=1,
+            nearest_pano_date_changed=0,
+            edges_fully_covered_delta=0,
+            coverage_pct_by_length_delta=1.0,
+            coverage_pct_by_length_any_delta=1.0,
+            detail_filename=f"{from_key}{to_key}.csv.gz",
+        )
+    assert db.delete_walk_diff_for_walk(conn, walks["b"]) == ["ab.csv.gz"]
+    survivors = conn.execute(
+        "SELECT detail_filename FROM street_walk_diffs ORDER BY detail_filename"
+    ).fetchall()
+    assert [r["detail_filename"] for r in survivors] == ["bc.csv.gz", "xy.csv.gz"]
+
+
 def test_record_and_get_walk_diff(conn, city):
     walk_a = db.register_street_walk(
         conn,
@@ -1646,10 +1708,12 @@ def test_record_and_get_walk_diff(conn, city):
     # No diff recorded for the 'from' walk.
     assert db.get_walk_diff_for_walk(conn, walk_a) is None
 
-    # Deleting by 'to' walk drops the row; a second delete is a no-op.
-    db.delete_walk_diff_for_walk(conn, walk_b)
+    # Deleting by 'to' walk drops the row and hands back the detail file it
+    # pointed at, since the caller must delete that file (issue #265); a
+    # second delete is a no-op that names nothing.
+    assert db.delete_walk_diff_for_walk(conn, walk_b) == ["diff.csv.gz"]
     assert db.get_walk_diff_for_walk(conn, walk_b) is None
-    db.delete_walk_diff_for_walk(conn, walk_b)
+    assert db.delete_walk_diff_for_walk(conn, walk_b) == []
     assert conn.execute("SELECT COUNT(*) FROM street_walk_diffs").fetchone()[0] == 0
 
 

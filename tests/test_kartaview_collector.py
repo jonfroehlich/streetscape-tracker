@@ -3204,3 +3204,207 @@ def test_an_unwritable_cache_never_fails_a_sweep(monkeypatch, tmp_path):
     )
     assert calls, "the sweep succeeded"
     assert result["checkpoint_path"] == str(ckpt), "and its checkpoint is still the caller's"
+
+
+# ── The wall-clock stop (issue #344) ───────────────────────────────────────
+#
+# The request cap's twin on the clock. A sweep slower than the scheduler's
+# assumed achieved-rate fraction -- a slow host, a 400-backpressure stretch --
+# must pause itself (exit 83) before the parent's SIGKILL. The responder
+# advances `fake_crawl_clock`, so the deadline is crossed at a known root.
+
+CLOCK_BUDGET_S = 100
+CLOCK_REQUEST_COST_S = 60  # roots 1 and 2 are asked (t=0, 60); root 3 (t=120) is not
+
+
+def _slow_photos(fake_crawl_clock):
+    def responder(call):
+        fake_crawl_clock.advance(CLOCK_REQUEST_COST_S)
+        return _photos(call)
+
+    return responder
+
+
+def test_a_sweep_past_its_wall_clock_budget_pauses_rather_than_being_killed(
+    monkeypatch, tmp_path, fake_crawl_clock
+):
+    from streetscape_metadata_tracker.download_common import crawl_deadline_from_budget
+
+    ckpt = tmp_path / "sweep"
+    error, calls = _failed_sweep_ckpt(
+        monkeypatch,
+        _slow_photos(fake_crawl_clock),
+        ckpt,
+        radius_m=500,
+        deadline_monotonic=crawl_deadline_from_budget(CLOCK_BUDGET_S),
+    )
+    assert isinstance(error, kv.SweepIncompleteError)
+    assert len(calls) == 2, "the clock must stop the sweep at the boundary it was crossed"
+    assert (error.units_done, error.unit_count) == (2, 9)
+    assert error.stopped_by == "clock"
+    assert f"{CLOCK_BUDGET_S}-second wall-clock budget ran out" in str(error)
+    # The pause kept what it paid for, which is what separates it from a kill.
+    assert _state(ckpt)["roots_done"] == 2
+
+
+def test_a_sweep_clock_without_a_checkpoint_is_refused_before_any_request(
+    monkeypatch, fake_crawl_clock
+):
+    """Unlike max_requests, which keeps its uncheckpointed runaway-guard meaning."""
+    calls = _install(monkeypatch, _slow_photos(fake_crawl_clock))
+    with pytest.raises(ValueError, match="deadline_monotonic needs a checkpoint_path"):
+        asyncio.run(
+            kv.fetch_city_images_async(
+                "Testville",
+                BBOX,
+                "tok",
+                max_requests_per_minute=0,
+                radius_m=500,
+                deadline_monotonic=fake_crawl_clock.now + 1,
+            )
+        )
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("max_requests", "expected", "stopped_by", "phrase"),
+    [
+        (1, 1, "requests", "the 1-request budget ran out"),
+        (5, 2, "clock", f"the {CLOCK_BUDGET_S}-second wall-clock budget ran out"),
+        # A TIE (both trip at the third root's check) resolves to the cap.
+        (2, 2, "requests", "the 2-request budget ran out"),
+    ],
+)
+def test_the_sweep_cap_and_clock_compose_and_the_error_names_the_one_that_fired(
+    monkeypatch, tmp_path, fake_crawl_clock, max_requests, expected, stopped_by, phrase
+):
+    from streetscape_metadata_tracker.download_common import crawl_deadline_from_budget
+
+    error, calls = _failed_sweep_ckpt(
+        monkeypatch,
+        _slow_photos(fake_crawl_clock),
+        tmp_path / "sweep",
+        radius_m=500,
+        max_requests=max_requests,
+        deadline_monotonic=crawl_deadline_from_budget(CLOCK_BUDGET_S),
+    )
+    assert isinstance(error, kv.SweepIncompleteError)
+    assert len(calls) == expected
+    assert error.stopped_by == stopped_by
+    assert phrase in str(error)
+
+
+def _clock_stop_mid_cell(monkeypatch, tmp_path, fake_crawl_clock):
+    """Root 1 claims three pages; pages 1 and 2 (t=0, 60) are asked, and the
+    page-loop check at t=120 stops the sweep INSIDE the cell."""
+    from streetscape_metadata_tracker.download_common import crawl_deadline_from_budget
+
+    def paged(call):
+        fake_crawl_clock.advance(CLOCK_REQUEST_COST_S)
+        items, _ = _photos(call)
+        return items, 3 * kv.IPP_MAX
+
+    error, calls = _failed_sweep_ckpt(
+        monkeypatch,
+        paged,
+        tmp_path / "sweep",
+        radius_m=500,
+        deadline_monotonic=crawl_deadline_from_budget(CLOCK_BUDGET_S),
+    )
+    assert [c.page for c in calls] == [1, 2], "the clock must stop between pages"
+    return error, "mid-cell"
+
+
+def _clock_stop_in_the_retry_pass(monkeypatch, tmp_path, fake_crawl_clock):
+    """Night one leaves two failed roots; night two re-probes the first
+    (t=0 -> 120) and the check before the second stops the RETRY pass."""
+    from streetscape_metadata_tracker.download_common import crawl_deadline_from_budget
+
+    ckpt = tmp_path / "sweep"
+    seen = []
+    night = {"slow": False}
+
+    def two_bad_roots_once(call):
+        seen.append(call)
+        if len(seen) <= 2:
+            raise kv.ResponseError("HTTP 500")
+        if night["slow"]:
+            fake_crawl_clock.advance(2 * CLOCK_REQUEST_COST_S)
+        return [], 0
+
+    _failed_sweep_ckpt(monkeypatch, two_bad_roots_once, ckpt, retries=0)
+    assert len(_state(ckpt)["failed_cells"]) == 2
+    night["slow"] = True
+    error, calls = _failed_sweep_ckpt(
+        monkeypatch,
+        two_bad_roots_once,
+        ckpt,
+        retries=0,
+        deadline_monotonic=crawl_deadline_from_budget(CLOCK_BUDGET_S),
+    )
+    assert len(calls) == 1, "the clock bounded the retry pass"
+    return error, "re-probing previously failed cells"
+
+
+@pytest.mark.parametrize("stop", [_clock_stop_mid_cell, _clock_stop_in_the_retry_pass])
+def test_every_sweep_stop_site_names_the_clock_when_the_clock_fired(
+    monkeypatch, tmp_path, fake_crawl_clock, stop
+):
+    """
+    #344 review: the root-boundary stop was the only one the clock reached, so
+    hard-coding the mid-cell or retry-pass reason back to the request wording
+    left the suite green. Each site is driven here with the clock alone
+    (``max_requests=None``), which also pins that a clock-only stop never
+    prints "the None-request budget".
+    """
+    error, where = stop(monkeypatch, tmp_path, fake_crawl_clock)
+    assert isinstance(error, kv.SweepIncompleteError)
+    assert error.stopped_by == "clock"
+    assert f"the {CLOCK_BUDGET_S}-second wall-clock budget ran out {where}" in str(error)
+    assert "None-request" not in str(error)
+
+
+@pytest.mark.parametrize(
+    ("max_requests", "calls_made", "names", "remedy"),
+    [
+        (1, 1, "The 1-request budget ran out", "re-run with a larger budget"),
+        (
+            50,
+            2,
+            f"The {CLOCK_BUDGET_S}-second wall-clock budget ran out",
+            "--kartaview-max-seconds",
+        ),
+    ],
+)
+def test_a_stop_during_calibration_names_the_ceiling_that_fired(
+    monkeypatch, tmp_path, fake_crawl_clock, max_requests, calls_made, names, remedy
+):
+    """
+    #344 review: the calibration ladder's stop said "The request budget ran
+    out ... re-run with a larger budget" even when the CLOCK stopped it, which
+    sends the operator to raise a cap that was never reached. Nothing is
+    checkpointed this early, so it is a plain DownloadError either way; what
+    must differ is the ceiling it names and the remedy it gives.
+    """
+    from streetscape_metadata_tracker.download_common import crawl_deadline_from_budget
+
+    def refused_slowly(call):
+        fake_crawl_clock.advance(CLOCK_REQUEST_COST_S)
+        raise kv.BackpressureError("apiCode 690")
+
+    error, calls = _failed_sweep_ckpt(
+        monkeypatch,
+        refused_slowly,
+        tmp_path / "sweep",
+        radius_m=None,
+        calibration_probes=kv.DEFAULT_CALIBRATION_PROBES,
+        max_requests=max_requests,
+        deadline_monotonic=crawl_deadline_from_budget(CLOCK_BUDGET_S),
+    )
+    assert len(calls) == calls_made
+    assert not isinstance(error, kv.SweepIncompleteError), "there is nothing to resume"
+    assert "during radius calibration" in str(error)
+    assert names in str(error)
+    assert remedy in str(error)
+    other = "wall-clock" if "request" in names else "request budget"
+    assert other not in str(error)

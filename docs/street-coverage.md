@@ -193,9 +193,13 @@ Exact `!=` on fractions is deliberate, not sloppy: under an identical frame each
 `compute_and_record_walk_diff` is the shared orchestrator called by both `collect.py` (after `register_street_walk`, before the manifest refresh, failure-guarded so a diff bug never sinks a paid-for crawl) and `_reconcile_orphaned_walk` (where the collect-side diff was exactly what got lost).
 A `street_walk_diffs` row is written even when nothing changed
 — "diffed, no changes" and "never diffed" are different facts
-— while the published detail file `{city_id}_streetwalkdiff_[PROVIDER_][NETWORK_]{FROM}_to_{TO}.csv.gz` (`naming.generate_streetwalk_diff_filename`; **both** tokens required, since one city can have gsv+mapillary × drive+all_public diffs over the same date pair) is written only when there are changes.
+— while the published detail file `{city_id}_streetwalkdiff_[PROVIDER_][NETWORK_]{FROM}_to_{TO}.csv.gz` (`naming.generate_streetwalk_diff_filename`; **both** tokens required, since one city can have gsv+mapillary × drive+all_public diffs over the same date pair) exists only when the recorded diff has changes.
 A same-day re-collection replaces the walk row in place (the register upsert keeps `walk_id`), so the orchestrator first clears any diff previously recorded into that walk
 — a skipped re-diff (e.g. a changed `--spacing`) must not leave the manifest advertising a change block computed from the replaced artifact.
+**The detail file is a function of the diff result, and the row's pointer is what gets removed** (#265, the rule the grid diff shares, see [`architecture.md`](architecture.md)):
+`db.delete_walk_diff_for_walk` returns the `detail_filename`s of the rows it cleared and the orchestrator removes exactly those files, which covers every early return (including "no previous walk", where no from-date exists to build a name from) and stays right when a backfilled walk has since become the predecessor, where a name re-derived from today's predecessor would miss the old file.
+A diff that still has changes overwrites the file; one that has none also removes the deterministic name, which heals a file stranded with no row before the fix.
+Files stranded before #265 are found by `scripts/sweep_orphan_diff_details.py`.
 Schema v11 also adds `street_walks.coverage_by_highway` — the artifact's per-bucket breakdown stored verbatim so "how did residential coverage change?" is answerable via `json_extract` without reading artifacts off disk;
 NULL means not captured, backfillable from artifacts already on disk via `scripts/backfill_streetwalk_coverage.py`.
 Surfaced as an **absent-not-null** `change` block per manifest entry (most walks are still first walks) and a "Δ coverage" column on `streets.html`.
@@ -250,9 +254,10 @@ Do not read that first delta as a real improvement; it is the fix landing, not G
 It is not confined to the diff table: the delta reaches `street_walk_diffs`, from there the streetwalk manifest's `change` block, and from there the **"Δ coverage" column on `streets.html`** — a published number a reader has no way to distinguish from imagery churn.
 And unlike the coverage numbers themselves it does not wash out on the following walk: a `street_walk_diffs` row is an immutable record of one date pair, so recomputing `street_walks` and the artifacts does not by itself repair a diff already written.
 Issue #262 scopes that correctly — it recomputes affected diff rows through `walk_diff.compute_and_record_walk_diff` and regenerates the manifest, rather than stopping at coverage.
-**The edge it has to handle is the published detail file.**
-`{city_id}_streetwalkdiff_...csv.gz` is written **only when a diff has changes**, so a pair whose only change was the phantom delta recomputes to "no changes", writes no new file — and leaves the old, wrong one sitting in `data/` and on the public server.
-Re-diffing is therefore necessary but not sufficient: a detail file whose diff no longer has changes has to be deleted, not merely not-rewritten.
+**The edge it had to handle was the published detail file, and #265 closed it locally.**
+`{city_id}_streetwalkdiff_...csv.gz` used to be written **only when a diff had changes** and never deleted, so a pair whose only change was the phantom delta recomputed to "no changes" and left the old, wrong file sitting in `data/`.
+The orchestrator now removes it (the row's pointer up front, the deterministic name on no changes), so re-diffing through `compute_and_record_walk_diff` is sufficient for `data/`.
+It is still not sufficient for the public server: the publish rsync never passes `--delete`, so a copy already published stays there until it is removed from the docroot by hand.
 Note also that the artifact cannot repair itself — its per-edge aggregates were already computed under the old definition, so the dropped `NO_DATE` samples are simply not in it, which rules out the cheap artifact-reading design `backfill_streetwalk_coverage.py` and `backfill_streetwalk_length.py` both use.
 Until #262 lands, the affected deltas are the FIRST walk diff of each series after 2026-08-24.
 Most will round to 0.0 — both providers sit at zero through p95 — but the tail renders: production's worst GSV run would shift **0.33** percentage points and its worst Mapillary run **2.7**, and 2.7 points is larger than most real run-to-run coverage changes, so it will read as a substantial imagery refresh rather than as noise.
