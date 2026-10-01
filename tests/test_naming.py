@@ -577,5 +577,12 @@ def test_streetwalk_diff_regex_rejects_near_misses():
         "bend--or_streetwalkdiff_drive_2026-07-08_to_2026-10-01.csv.gz",
         "bend--or_streetwalkdiff_2026-07-08_to_2026-10-01.json.gz",
         "bend--or_diff_2026-07-08_to_2026-10-01.csv.gz",  # a GRID diff
+        # '$' would accept this: it matches before a trailing newline.
+        generate_streetwalk_diff_filename("bend--or", "2026-07-08", "2026-10-01") + "\n",
     ]:
-        assert not is_streetwalk_diff_filename(name), name
+        assert not is_streetwalk_diff_filename(name), repr(name)
+    # The pattern ends in \Z, so a direct .match() cannot accept a newline either.
+    from streetscape_metadata_tracker.naming import STREETWALK_DIFF_FILENAME_RE
+
+    newline = generate_streetwalk_diff_filename("bend--or", "2026-07-08", "2026-10-01") + "\n"
+    assert STREETWALK_DIFF_FILENAME_RE.match(newline) is None

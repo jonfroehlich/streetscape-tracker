@@ -725,3 +725,64 @@ def test_remover_refuses_a_name_with_a_path_component(tmp_path, data_dir):
     victim.write_text("x")
     assert remove_stale_diff_detail(data_dir, "../victim.csv.gz") is False
     assert victim.exists()
+
+
+# ── Removal is scoped to THIS series and THIS walk (#402 review) ───────────
+#
+# A removal is a deletion, so a name derived with one token dropped, or a
+# pointer read from a row this walk does not own, deletes another series' or
+# another walk's LIVE file. These cases plant those neighbours.
+
+
+def test_no_change_rediff_removes_only_its_own_series_file(conn, data_dir):
+    """A (mapillary, all_public) no-change re-diff, beside the three sibling
+    series' files for the SAME date pair. Only its own name may go: a name
+    built without the network token is (mapillary, drive)'s, and one built
+    without the provider is (gsv, all_public)'s."""
+    city_id = _register_city(conn)
+    series = {"provider": "mapillary", "network_type": "all_public"}
+    _register_walk(conn, data_dir, city_id, D0, OLD_FC, **series)
+    walk_id, _ = _register_walk(conn, data_dir, city_id, D2, OLD_FC, **series)
+
+    def plant(provider, network_type):
+        name = generate_streetwalk_diff_filename(
+            city_id, D0.isoformat(), D2.isoformat(), provider, network_type
+        )
+        with open(os.path.join(data_dir, name), "w") as fh:
+            fh.write("x")
+        return os.path.join(data_dir, name)
+
+    own = plant("mapillary", "all_public")
+    siblings = [plant("gsv", "drive"), plant("mapillary", "drive"), plant("gsv", "all_public")]
+    change = compute_and_record_walk_diff(
+        conn,
+        data_dir=data_dir,
+        city_id=city_id,
+        walk_id=walk_id,
+        run_date=D2,
+        spacing_m=15.0,
+        match_dist_m=25.0,
+        fc_new=OLD_FC,
+        **series,
+    )
+    assert change["diff_file"] is None
+    assert not os.path.exists(own)  # the branch was reached
+    assert [os.path.exists(p) for p in siblings] == [True, True, True]
+
+
+def test_rediff_never_removes_the_next_walks_file(conn, data_dir):
+    """Walk B is both the TO side of A->B and the FROM side of B->C. Clearing
+    B's own diff must leave B->C's row and its file alone."""
+    city_id = _register_city(conn)
+    _register_walk(conn, data_dir, city_id, D0, OLD_FC)
+    walk_b, _ = _register_walk(conn, data_dir, city_id, D1, NEW_FC)
+    walk_c, _ = _register_walk(conn, data_dir, city_id, D2, OLD_FC)
+    ab = _rediff(conn, data_dir, city_id, walk_b, D1, NEW_FC)["diff_file"]
+    bc = _rediff(conn, data_dir, city_id, walk_c, D2, OLD_FC)["diff_file"]
+    assert ab and bc
+
+    _register_walk(conn, data_dir, city_id, D1, NEW_FC, spacing_m=30.0)
+    assert _rediff(conn, data_dir, city_id, walk_b, D1, NEW_FC, spacing_m=30.0) is None
+    assert not os.path.exists(os.path.join(data_dir, ab))
+    assert os.path.exists(os.path.join(data_dir, bc))
+    assert db.get_walk_diff_for_walk(conn, walk_c)["detail_filename"] == bc
