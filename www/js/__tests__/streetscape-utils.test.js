@@ -54,6 +54,11 @@ const {
   mergeStreetwalkStats,
   cityDisplayLabel,
   cityFullLabel,
+  GSV_QUERY_RADIUS_M,
+  haversineMeters,
+  isWithinQueryRadius,
+  isAdmissiblePanoRow,
+  EARTH_RADIUS_M,
 } = require("../streetscape-utils.js");
 
 // --- cityDisplayLabel / cityFullLabel --------------------------------------
@@ -600,6 +605,89 @@ test("the unknown-provider date floor is the loosest registered one, not a named
   const old = panoDateOrNull("2005-06-01");
   assert.equal(isPlausibleCaptureDate(old, "notaprovider"), true);
   assert.equal(isPlausibleCaptureDate(old, "gsv"), false);
+});
+
+// --- issue #367: the GSV query radius --------------------------------------
+
+test("haversineMeters is great-circle, not planar: 1° of longitude at 60°N is ~55.6 km", () => {
+  // The planar sqrt(dlat²+dlon²)·111000 the Python stats used before #367
+  // said 111 km here; it ignored cos(latitude).
+  assert.ok(Math.abs(haversineMeters(60, 0, 60, 1) - 55597) < 1);
+  assert.ok(Math.abs(haversineMeters(0, 0, 1, 0) - 111195) < 1);
+  // A missing coordinate is NaN, never 0 (0 would read as "on the point").
+  assert.ok(Number.isNaN(haversineMeters(47, -122, null, -122)));
+  assert.ok(Number.isNaN(haversineMeters(47, -122, undefined, -122)));
+});
+
+test("isWithinQueryRadius drops only a GSV pano strictly beyond GSV_QUERY_RADIUS_M", () => {
+  assert.equal(GSV_QUERY_RADIUS_M, 50);
+  // 1 m of latitude is 1/111195 degrees, so these sit at ~49 m and ~51 m.
+  const at = (m) => ({ query_lat: 47, query_lon: -122, pano_lat: 47 + m / 111195, pano_lon: -122 });
+  assert.equal(isWithinQueryRadius(at(49), "gsv"), true);
+  assert.equal(isWithinQueryRadius(at(51), "gsv"), false);
+  // Anchorage query, Kerala pano (#367's worst case): far, and dropped.
+  const kerala = { query_lat: 61.2, query_lon: -149.9, pano_lat: 9.5, pano_lon: 76.34 };
+  assert.equal(isWithinQueryRadius(kerala, "gsv"), false);
+  // An unset provider defaults to gsv, as isPlausibleCaptureDate does.
+  assert.equal(isWithinQueryRadius(kerala, null), false);
+  // Census providers are never filtered; neither is an unmeasurable row.
+  assert.equal(isWithinQueryRadius(kerala, "mapillary"), true);
+  assert.equal(isWithinQueryRadius({ ...kerala, pano_lat: null }, "gsv"), true);
+});
+
+// One ULP up or down from a double, so a test can land on an exact float.
+function nextFloat(x, up) {
+  const f = new Float64Array([x]);
+  const b = new BigInt64Array(f.buffer);
+  b[0] += up ? 1n : -1n; // x > 0 here, so the bit pattern orders like the value
+  return f[0];
+}
+
+test("isWithinQueryRadius: a pano at EXACTLY GSV_QUERY_RADIUS_M is within it", () => {
+  // Strictly greater-than, as analysis.apply_query_radius. A 49/51 pair
+  // cannot tell > from >=, so walk ULPs until the distance is exactly 50.
+  let lat = GSV_QUERY_RADIUS_M / (EARTH_RADIUS_M * Math.PI / 180);
+  let d = haversineMeters(0, 0, lat, 0);
+  for (let i = 0; i < 64 && d !== GSV_QUERY_RADIUS_M; i++) {
+    lat = nextFloat(lat, d < GSV_QUERY_RADIUS_M);
+    d = haversineMeters(0, 0, lat, 0);
+  }
+  assert.equal(d, GSV_QUERY_RADIUS_M, "no float latitude lands exactly on 50 m");
+  assert.equal(isWithinQueryRadius({ query_lat: 0, query_lon: 0, pano_lat: lat, pano_lon: 0 }, "gsv"), true);
+});
+
+test("isAdmissiblePanoRow: city.js draws a dated, located OK row within the query radius", () => {
+  const ok = {
+    status: "OK", capture_date: "2024-06-01", pano_id: "p",
+    query_lat: 47, query_lon: -122, pano_lat: 47 + 10 / 111195, pano_lon: -122,
+  };
+  assert.equal(isAdmissiblePanoRow(ok, "gsv"), true);
+  // #367: the same row 1.1 km from its query point is not drawn for gsv...
+  const far = { ...ok, pano_lat: 47.01 };
+  assert.equal(isAdmissiblePanoRow(far, "gsv"), false);
+  // ...but is for a census provider, which has no radius to overshoot.
+  assert.equal(isAdmissiblePanoRow(far, "mapillary"), true);
+  // The pre-existing admission rules, now in one place.
+  assert.equal(isAdmissiblePanoRow({ ...ok, status: "NO_DATE" }, "gsv"), false);
+  assert.equal(isAdmissiblePanoRow({ ...ok, capture_date: "" }, "gsv"), false);
+  assert.equal(isAdmissiblePanoRow({ ...ok, pano_id: "" }, "gsv"), false);
+  assert.equal(isAdmissiblePanoRow({ ...ok, pano_lat: null }, "gsv"), false);
+  // 0.0 is a valid coordinate, not a missing one.
+  assert.equal(
+    isAdmissiblePanoRow({ ...ok, query_lat: 0, query_lon: 0, pano_lat: 0, pano_lon: 0 }, "gsv"),
+    true,
+  );
+});
+
+test("city.js processRows admits pano rows only through isAdmissiblePanoRow", () => {
+  // city.js has no export shim, so its call site is pinned by source: a
+  // processRows that stopped asking the helper would draw far GSV panos with
+  // every test above still green.
+  const src = readFileSync(require.resolve("../city.js"), "utf8");
+  const body = src.slice(src.indexOf("function processRows(rows)"));
+  assert.match(body, /if \(!isAdmissiblePanoRow\(row, providerGlobal\) \|\| processedPanos\.has\(row\.pano_id\)\) continue;/);
+  // ...and asks it BEFORE recording the id, so a far row cannot shadow a near one.
+  assert.ok(body.indexOf("isAdmissiblePanoRow(row") < body.indexOf("processedPanos.add(row.pano_id)"));
 });
 
 // --- issue #116: any-imagery coverage stratification -----------------------

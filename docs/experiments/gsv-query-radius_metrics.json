@@ -1,0 +1,886 @@
+{
+  "_about": {
+    "experiment": "gsv-query-radius",
+    "writeup": "docs/experiments/gsv-query-radius.md",
+    "generated_by": "scripts/gsv_query_radius_audit.py --sample 60 --seed 0",
+    "note": "Haversine distance from (query_lat, query_lon) to (pano_lat, pano_lon) over every row with a pano (status OK or NO_DATE, both pano coordinates present) in a seeded sample of the cataloged gsv run CSVs, read RAW (before the issue #367 query-radius rule). Shares are of rows with a pano; GSV holds one row per grid point, so they are also shares of covered grid points. The sampled files come from the catalog's runs.csv_filename, never a data/ glob."
+  },
+  "query_radius_m": 50.0,
+  "candidate_files": 1157,
+  "files_measured": 60,
+  "pano_rows": 4619715,
+  "beyond_m": {
+    "50": {
+      "rows": 518660,
+      "share_pct": 11.227,
+      "files_with_any": 60
+    },
+    "100": {
+      "rows": 124515,
+      "share_pct": 2.695,
+      "files_with_any": 59
+    },
+    "1000": {
+      "rows": 1017,
+      "share_pct": 0.022,
+      "files_with_any": 22
+    }
+  },
+  "per_file_share_beyond_50m_pct": {
+    "n": 60,
+    "min": 1.5,
+    "p10": 5.944,
+    "p25": 9.857,
+    "p50": 12.505,
+    "p75": 16.716,
+    "p90": 19.931,
+    "max": 27.383
+  },
+  "beyond_50m_non_google_copyright": {
+    "rows": 6671,
+    "share_pct": 1.286,
+    "copyright_unknown_rows": 40
+  },
+  "worst_case_per_file": [
+    {
+      "city_id": "vernon--alabama--united-states",
+      "csv_filename": "vernon--alabama_width_5258_height_6065_step_20.csv.gz",
+      "distance_m": 12704465.2,
+      "query": [
+        33.74172678734038,
+        -88.12165275566166
+      ],
+      "pano": [
+        23.15957863702893,
+        57.2672700011494
+      ],
+      "copyright_info": "© Tharaka Abesinghe"
+    },
+    {
+      "city_id": "newark--new-jersey--united-states",
+      "csv_filename": "newark--new-jersey_width_11586_height_12758_step_20.csv.gz",
+      "distance_m": 12043873.9,
+      "query": [
+        40.68360722624388,
+        -74.16337647097963
+      ],
+      "pano": [
+        27.51808131353313,
+        82.04920811206296
+      ],
+      "copyright_info": "© Google"
+    },
+    {
+      "city_id": "istanbul--marmara-region--turkey",
+      "csv_filename": "istanbul--turkey_width_20000_height_20000_step_20.csv.gz",
+      "distance_m": 1137953.3,
+      "query": [
+        41.02219370001716,
+        29.066232649965517
+      ],
+      "pano": [
+        37.22597700789273,
+        41.33278225462507
+      ],
+      "copyright_info": "© haLit Aslan"
+    },
+    {
+      "city_id": "clay--west-virginia--united-states",
+      "csv_filename": "clay--west-virginia_width_40757_height_44904_step_20.csv.gz",
+      "distance_m": 45897.8,
+      "query": [
+        38.529745340342785,
+        -81.16172628886746
+      ],
+      "pano": [
+        38.35792367311191,
+        -81.64091277502669
+      ],
+      "copyright_info": "© Nick Schaer"
+    },
+    {
+      "city_id": "wichita--kansas--united-states",
+      "csv_filename": "wichita--kansas_width_51292_height_38977_step_20.csv.gz",
+      "distance_m": 30426.6,
+      "query": [
+        37.704508695020614,
+        -97.23184567190457
+      ],
+      "pano": [
+        37.59083206727271,
+        -97.54620396381316
+      ],
+      "copyright_info": "© John Dannenberg"
+    },
+    {
+      "city_id": "manchester--vermont--united-states",
+      "csv_filename": "manchester--vermont_width_10843_height_10896_step_20.csv.gz",
+      "distance_m": 29381.0,
+      "query": [
+        43.14108288896822,
+        -73.07334279256334
+      ],
+      "pano": [
+        42.91509933374399,
+        -73.26065181688068
+      ],
+      "copyright_info": "© Andrew Scherer"
+    },
+    {
+      "city_id": "salem--oregon--united-states",
+      "csv_filename": "salem--or_width_14820_height_18378_step_20.csv.gz",
+      "distance_m": 21333.2,
+      "query": [
+        44.985404672436545,
+        -123.00471869866236
+      ],
+      "pano": [
+        44.86670398268867,
+        -122.7918349990689
+      ],
+      "copyright_info": "© Mamallan Krishnan"
+    },
+    {
+      "city_id": "abingdon--virginia--united-states",
+      "csv_filename": "abingdon--virginia_width_8993_height_5130_step_20.csv.gz",
+      "distance_m": 21304.6,
+      "query": [
+        36.71292332354368,
+        -81.99494787890853
+      ],
+      "pano": [
+        36.59392803096988,
+        -82.182125014183
+      ],
+      "copyright_info": "© Michael"
+    },
+    {
+      "city_id": "new-hope--minnesota--united-states",
+      "csv_filename": "new-hope--minnesota_width_2482_height_6492_step_20.csv.gz",
+      "distance_m": 19667.5,
+      "query": [
+        45.044435047436906,
+        -93.39854247906212
+      ],
+      "pano": [
+        44.87525297561254,
+        -93.32563096888376
+      ],
+      "copyright_info": "© Localmn Interactive"
+    },
+    {
+      "city_id": "south-portland--maine--united-states",
+      "csv_filename": "south-portland--maine_width_12664_height_6764_step_20.csv.gz",
+      "distance_m": 7556.4,
+      "query": [
+        43.63662102113934,
+        -70.22590328922408
+      ],
+      "pano": [
+        43.67674529831549,
+        -70.30171103600975
+      ],
+      "copyright_info": "© Liam Piper"
+    },
+    {
+      "city_id": "santa-fe--new-mexico--united-states",
+      "csv_filename": "santa-fe--nm_width_19735_height_18482_step_20.csv.gz",
+      "distance_m": 6944.9,
+      "query": [
+        35.76872409691984,
+        -105.9457547685447
+      ],
+      "pano": [
+        35.82484926269295,
+        -105.9795374195743
+      ],
+      "copyright_info": "© Lisa Hinson"
+    },
+    {
+      "city_id": "miami-gardens--florida--united-states",
+      "csv_filename": "miami-gardens--florida_width_9588_height_6841_step_20.csv.gz",
+      "distance_m": 5210.5,
+      "query": [
+        25.942934263442076,
+        -80.20367411897158
+      ],
+      "pano": [
+        25.91712901017251,
+        -80.16018178040751
+      ],
+      "copyright_info": "© Ben Mace"
+    },
+    {
+      "city_id": "timberville--virginia--united-states",
+      "csv_filename": "timberville--virginia_width_1676_height_3648_step_20.csv.gz",
+      "distance_m": 4633.9,
+      "query": [
+        38.63882673287778,
+        -78.77437062647286
+      ],
+      "pano": [
+        38.67515673498686,
+        -78.74822673279216
+      ],
+      "copyright_info": "© Matt Gilkeson (VigilantEagle)"
+    },
+    {
+      "city_id": "cloudcroft--new-mexico--united-states",
+      "csv_filename": "cloudcroft--new-mexico_width_4419_height_2179_step_20.csv.gz",
+      "distance_m": 4044.4,
+      "query": [
+        32.95802545841077,
+        -105.74464618639207
+      ],
+      "pano": [
+        32.95511651520314,
+        -105.7014378133601
+      ],
+      "copyright_info": "© Dan Morrow"
+    },
+    {
+      "city_id": "dover--tennessee--united-states",
+      "csv_filename": "dover--tennessee_width_7732_height_2961_step_20.csv.gz",
+      "distance_m": 3447.4,
+      "query": [
+        36.47863373273175,
+        -87.86736947099867
+      ],
+      "pano": [
+        36.4854469080239,
+        -87.82975277267317
+      ],
+      "copyright_info": "© American Marketing & Publishing"
+    },
+    {
+      "city_id": "roseburg--oregon--united-states",
+      "csv_filename": "roseburg--oregon_width_10703_height_10109_step_20.csv.gz",
+      "distance_m": 3431.6,
+      "query": [
+        43.24043311484681,
+        -123.40009645485954
+      ],
+      "pano": [
+        43.2658905250708,
+        -123.4240478878771
+      ],
+      "copyright_info": "© John May"
+    },
+    {
+      "city_id": "haltom-city--texas--united-states",
+      "csv_filename": "haltom-city--texas_width_5398_height_9030_step_20.csv.gz",
+      "distance_m": 3381.0,
+      "query": [
+        32.75989859704772,
+        -97.27110261149696
+      ],
+      "pano": [
+        32.78526396492092,
+        -97.29104301976714
+      ],
+      "copyright_info": "© James Mullen"
+    },
+    {
+      "city_id": "city-of-white-plains--new-york--united-states",
+      "csv_filename": "white-plains--new-york_width_5923_height_9726_step_20.csv.gz",
+      "distance_m": 2462.0,
+      "query": [
+        41.040647686505125,
+        -73.78384128019216
+      ],
+      "pano": [
+        41.02921508815505,
+        -73.7587034215042
+      ],
+      "copyright_info": "© George Benaroya"
+    },
+    {
+      "city_id": "topsail-beach--north-carolina--united-states",
+      "csv_filename": "topsail-beach--north-carolina_width_7376_height_6355_step_20.csv.gz",
+      "distance_m": 2056.9,
+      "query": [
+        34.35453064745499,
+        -77.64052938580826
+      ],
+      "pano": [
+        34.37088997748209,
+        -77.63006903403708
+      ],
+      "copyright_info": "© Harvey Payne"
+    },
+    {
+      "city_id": "village-of-clayton--new-york--united-states",
+      "csv_filename": "clayton--new-york_width_4174_height_2866_step_20.csv.gz",
+      "distance_m": 1923.5,
+      "query": [
+        44.24273079653317,
+        -76.08853018363597
+      ],
+      "pano": [
+        44.2271351835079,
+        -76.09897588678666
+      ],
+      "copyright_info": "© Don Cerati"
+    },
+    {
+      "city_id": "edgerton--wisconsin--united-states",
+      "csv_filename": "edgerton--wisconsin_width_5043_height_4561_step_20.csv.gz",
+      "distance_m": 1574.7,
+      "query": [
+        42.84193615940857,
+        -89.08652425127677
+      ],
+      "pano": [
+        42.83398958540465,
+        -89.07053832056526
+      ],
+      "copyright_info": "© Ross Harried"
+    },
+    {
+      "city_id": "carolina-beach--north-carolina--united-states",
+      "csv_filename": "carolina-beach--north-carolina_width_2793_height_5457_step_20.csv.gz",
+      "distance_m": 1006.1,
+      "query": [
+        34.05969349665186,
+        -77.88081498651935
+      ],
+      "pano": [
+        34.06849003682662,
+        -77.8782580083699
+      ],
+      "copyright_info": "© Nick Kendle"
+    },
+    {
+      "city_id": "henry--tennessee--united-states",
+      "csv_filename": "henry--tennessee_width_48471_height_42311_step_20.csv.gz",
+      "distance_m": 752.8,
+      "query": [
+        36.35802555359006,
+        -88.18670306509748
+      ],
+      "pano": [
+        36.36319654011169,
+        -88.1812768000405
+      ],
+      "copyright_info": "© Google"
+    },
+    {
+      "city_id": "sumrall--mississippi--united-states",
+      "csv_filename": "sumrall--mississippi_width_4635_height_4859_step_20.csv.gz",
+      "distance_m": 535.2,
+      "query": [
+        31.41450630523383,
+        -89.52546449835552
+      ],
+      "pano": [
+        31.41931883739321,
+        -89.52557368252745
+      ],
+      "copyright_info": "© Google"
+    },
+    {
+      "city_id": "moultrie--georgia--united-states",
+      "csv_filename": "moultrie--georgia_width_12758_height_13682_step_20.csv.gz",
+      "distance_m": 515.7,
+      "query": [
+        31.21786598228648,
+        -83.73044241897703
+      ],
+      "pano": [
+        31.21381745115476,
+        -83.72779759104097
+      ],
+      "copyright_info": "© Google"
+    },
+    {
+      "city_id": "kerens--texas--united-states",
+      "csv_filename": "kerens--texas_width_4690_height_3713_step_20.csv.gz",
+      "distance_m": 513.4,
+      "query": [
+        32.123698435472704,
+        -96.25012004210242
+      ],
+      "pano": [
+        32.12820602620616,
+        -96.25130283059224
+      ],
+      "copyright_info": "© Google"
+    },
+    {
+      "city_id": "pine-ridge--south-carolina--united-states",
+      "csv_filename": "pine-ridge--south-carolina_width_4190_height_5236_step_20.csv.gz",
+      "distance_m": 510.0,
+      "query": [
+        33.91061004803583,
+        -81.09178018373633
+      ],
+      "pano": [
+        33.90615251203075,
+        -81.09047909914352
+      ],
+      "copyright_info": "© Google"
+    },
+    {
+      "city_id": "keystone--south-dakota--united-states",
+      "csv_filename": "keystone--south-dakota_width_4227_height_2573_step_20.csv.gz",
+      "distance_m": 461.0,
+      "query": [
+        43.886543691380254,
+        -103.42546362215832
+      ],
+      "pano": [
+        43.88489651625964,
+        -103.4307420946768
+      ],
+      "copyright_info": "© Steve Rus"
+    },
+    {
+      "city_id": "woodburn--oregon--united-states",
+      "csv_filename": "woodburn--oregon_width_5617_height_3885_step_20.csv.gz",
+      "distance_m": 447.5,
+      "query": [
+        45.15596285031337,
+        -122.89098112560194
+      ],
+      "pano": [
+        45.15980501029149,
+        -122.8892826831022
+      ],
+      "copyright_info": "© Google"
+    },
+    {
+      "city_id": "big-bend--wisconsin--united-states",
+      "csv_filename": "big-bend--wisconsin_width_2920_height_5390_step_20.csv.gz",
+      "distance_m": 433.4,
+      "query": [
+        42.867719798079584,
+        -88.19133798065774
+      ],
+      "pano": [
+        42.86701132613805,
+        -88.19656758501584
+      ],
+      "copyright_info": "© Google"
+    },
+    {
+      "city_id": "pollock--louisiana--united-states",
+      "csv_filename": "pollock--louisiana_width_7222_height_8522_step_20.csv.gz",
+      "distance_m": 424.3,
+      "query": [
+        31.49633040034161,
+        -92.4022405021583
+      ],
+      "pano": [
+        31.49577067998383,
+        -92.40666764812327
+      ],
+      "copyright_info": "© Google"
+    },
+    {
+      "city_id": "leonard--minnesota--united-states",
+      "csv_filename": "leonard--minnesota_width_1216_height_1630_step_20.csv.gz",
+      "distance_m": 417.3,
+      "query": [
+        47.64794236981867,
+        -95.26530961645392
+      ],
+      "pano": [
+        47.64779146552117,
+        -95.27087612559046
+      ],
+      "copyright_info": "© Google"
+    },
+    {
+      "city_id": "sweeny--texas--united-states",
+      "csv_filename": "sweeny--texas_width_4206_height_3456_step_20.csv.gz",
+      "distance_m": 402.8,
+      "query": [
+        29.032212163115293,
+        -95.71251717641172
+      ],
+      "pano": [
+        29.0293347339926,
+        -95.71000105265756
+      ],
+      "copyright_info": "© Google"
+    },
+    {
+      "city_id": "coffeen--illinois--united-states",
+      "csv_filename": "coffeen--illinois_width_1927_height_2099_step_20.csv.gz",
+      "distance_m": 375.7,
+      "query": [
+        39.081105592833715,
+        -89.39965238354479
+      ],
+      "pano": [
+        39.08087539779822,
+        -89.40399525129261
+      ],
+      "copyright_info": "© Google"
+    },
+    {
+      "city_id": "martin--louisiana--united-states",
+      "csv_filename": "martin--louisiana_width_7232_height_6087_step_20.csv.gz",
+      "distance_m": 374.5,
+      "query": [
+        32.102979722172904,
+        -93.22163761520036
+      ],
+      "pano": [
+        32.10251723045643,
+        -93.22557592157008
+      ],
+      "copyright_info": "© Google"
+    },
+    {
+      "city_id": "madrid--alabama--united-states",
+      "csv_filename": "madrid--alabama_width_3109_height_1640_step_20.csv.gz",
+      "distance_m": 371.9,
+      "query": [
+        31.02906235796539,
+        -85.40290230151953
+      ],
+      "pano": [
+        31.02946838742052,
+        -85.40677633795441
+      ],
+      "copyright_info": "© Google"
+    },
+    {
+      "city_id": "tropic--utah--united-states",
+      "csv_filename": "tropic--utah_width_6056_height_6054_step_20.csv.gz",
+      "distance_m": 364.9,
+      "query": [
+        37.61048485508462,
+        -112.07194189647782
+      ],
+      "pano": [
+        37.61368922915414,
+        -112.0710481660673
+      ],
+      "copyright_info": "© Google"
+    },
+    {
+      "city_id": "cooper--texas--united-states",
+      "csv_filename": "cooper--texas_width_3236_height_2831_step_20.csv.gz",
+      "distance_m": 351.5,
+      "query": [
+        33.38476576544823,
+        -95.69695139216498
+      ],
+      "pano": [
+        33.3820250577366,
+        -95.69506437314011
+      ],
+      "copyright_info": "© Google"
+    },
+    {
+      "city_id": "red-river--new-mexico--united-states",
+      "csv_filename": "red-river--new-mexico_width_3794_height_3293_step_20.csv.gz",
+      "distance_m": 312.0,
+      "query": [
+        36.70587807569272,
+        -105.40554852585278
+      ],
+      "pano": [
+        36.70796212845858,
+        -105.4078927762193
+      ],
+      "copyright_info": "© Don Bri"
+    },
+    {
+      "city_id": "springfield--michigan--united-states",
+      "csv_filename": "springfield--michigan_width_5411_height_2824_step_20.csv.gz",
+      "distance_m": 302.2,
+      "query": [
+        42.32913028507252,
+        -85.23115387299137
+      ],
+      "pano": [
+        42.33123248083789,
+        -85.2334831109788
+      ],
+      "copyright_info": "© Google"
+    },
+    {
+      "city_id": "warren-city--texas--united-states",
+      "csv_filename": "warren-city--texas_width_3103_height_1922_step_20.csv.gz",
+      "distance_m": 287.6,
+      "query": [
+        32.55657755509761,
+        -94.90696856321416
+      ],
+      "pano": [
+        32.55628427205198,
+        -94.91001727045092
+      ],
+      "copyright_info": "© Google"
+    },
+    {
+      "city_id": "joliet--montana--united-states",
+      "csv_filename": "joliet--montana_width_1709_height_1274_step_20.csv.gz",
+      "distance_m": 267.9,
+      "query": [
+        45.480743377993285,
+        -108.9608947327951
+      ],
+      "pano": [
+        45.48224728012809,
+        -108.9635787029631
+      ],
+      "copyright_info": "© Google"
+    },
+    {
+      "city_id": "hilda--south-carolina--united-states",
+      "csv_filename": "hilda--south-carolina_width_3204_height_3200_step_20.csv.gz",
+      "distance_m": 264.6,
+      "query": [
+        33.26653161323873,
+        -81.26405672677166
+      ],
+      "pano": [
+        33.26430798084191,
+        -81.2630428034973
+      ],
+      "copyright_info": "© Google"
+    },
+    {
+      "city_id": "dumfries--virginia--united-states",
+      "csv_filename": "dumfries--virginia_width_3313_height_2662_step_20.csv.gz",
+      "distance_m": 247.5,
+      "query": [
+        38.56452606751632,
+        -77.3407632675591
+      ],
+      "pano": [
+        38.56665146798027,
+        -77.33991860635746
+      ],
+      "copyright_info": "© Google"
+    },
+    {
+      "city_id": "burnettsville--indiana--united-states",
+      "csv_filename": "burnettsville--indiana_width_1714_height_2450_step_20.csv.gz",
+      "distance_m": 235.2,
+      "query": [
+        40.767094002541135,
+        -86.59314413840687
+      ],
+      "pano": [
+        40.76689072181338,
+        -86.59592363065177
+      ],
+      "copyright_info": "© Google"
+    },
+    {
+      "city_id": "ignacio--colorado--united-states",
+      "csv_filename": "ignacio--colorado_width_1355_height_2026_step_20.csv.gz",
+      "distance_m": 229.0,
+      "query": [
+        37.11302120125191,
+        -107.62703737552428
+      ],
+      "pano": [
+        37.11504619858597,
+        -107.6275097521077
+      ],
+      "copyright_info": "© Google"
+    },
+    {
+      "city_id": "minturn--arkansas--united-states",
+      "csv_filename": "minturn--arkansas_width_1798_height_2117_step_20.csv.gz",
+      "distance_m": 225.1,
+      "query": [
+        35.975237537598474,
+        -91.02407390823424
+      ],
+      "pano": [
+        35.97615013499816,
+        -91.026307014943
+      ],
+      "copyright_info": "© Google"
+    },
+    {
+      "city_id": "morgan--minnesota--united-states",
+      "csv_filename": "morgan--minnesota_width_1630_height_1771_step_20.csv.gz",
+      "distance_m": 225.1,
+      "query": [
+        44.41564473973548,
+        -94.9333311274456
+      ],
+      "pano": [
+        44.41731450803686,
+        -94.93172824272747
+      ],
+      "copyright_info": "© Google"
+    },
+    {
+      "city_id": "apalachicola--florida--united-states",
+      "csv_filename": "apalachicola--florida_width_2359_height_2239_step_20.csv.gz",
+      "distance_m": 186.4,
+      "query": [
+        29.73128179366291,
+        -84.9914551041747
+      ],
+      "pano": [
+        29.72997139286903,
+        -84.99025117954241
+      ],
+      "copyright_info": "© J P"
+    },
+    {
+      "city_id": "stuckey--south-carolina--united-states",
+      "csv_filename": "stuckey--south-carolina_width_1830_height_1583_step_20.csv.gz",
+      "distance_m": 165.8,
+      "query": [
+        33.72743089954259,
+        -79.51875811089266
+      ],
+      "pano": [
+        33.72875724410031,
+        -79.51793896024036
+      ],
+      "copyright_info": "© Google"
+    },
+    {
+      "city_id": "mill-creek--west-virginia--united-states",
+      "csv_filename": "mill-creek--west-virginia_width_1859_height_1105_step_20.csv.gz",
+      "distance_m": 153.5,
+      "query": [
+        38.735101062468594,
+        -79.97098998507784
+      ],
+      "pano": [
+        38.73449324186709,
+        -79.96940098315112
+      ],
+      "copyright_info": "© Google"
+    },
+    {
+      "city_id": "downsville--louisiana--united-states",
+      "csv_filename": "downsville--louisiana_width_1223_height_1630_step_20.csv.gz",
+      "distance_m": 152.9,
+      "query": [
+        32.62697615795174,
+        -92.41567857878891
+      ],
+      "pano": [
+        32.62769742975091,
+        -92.4142884087708
+      ],
+      "copyright_info": "© Google"
+    },
+    {
+      "city_id": "west-point--iowa--united-states",
+      "csv_filename": "west-point--iowa_width_1393_height_2096_step_20.csv.gz",
+      "distance_m": 151.0,
+      "query": [
+        40.72223380707867,
+        -91.46041547229277
+      ],
+      "pano": [
+        40.72100785456978,
+        -91.46118605185885
+      ],
+      "copyright_info": "© Google"
+    },
+    {
+      "city_id": "centerfield--utah--united-states",
+      "csv_filename": "centerfield--utah_width_2121_height_2371_step_20.csv.gz",
+      "distance_m": 146.1,
+      "query": [
+        39.120374923334715,
+        -111.82579779710429
+      ],
+      "pano": [
+        39.11908309567394,
+        -111.8261073216576
+      ],
+      "copyright_info": "© Google"
+    },
+    {
+      "city_id": "chicago--illinois--united-states",
+      "csv_filename": "chicago--illinois--united-states_width_1928_height_1977_step_30_2023-11-07.csv.gz",
+      "distance_m": 142.2,
+      "query": [
+        41.87196559999994,
+        -87.62145519353969
+      ],
+      "pano": [
+        41.873191259542,
+        -87.62194393860366
+      ],
+      "copyright_info": null
+    },
+    {
+      "city_id": "lodgepole--nebraska--united-states",
+      "csv_filename": "lodgepole--nebraska_width_2201_height_1334_step_20.csv.gz",
+      "distance_m": 119.6,
+      "query": [
+        41.14484644174829,
+        -102.64273634454894
+      ],
+      "pano": [
+        41.1442566319316,
+        -102.6415423380181
+      ],
+      "copyright_info": "© Google"
+    },
+    {
+      "city_id": "williamsburg--new-mexico--united-states",
+      "csv_filename": "williamsburg--new-mexico_width_1764_height_1790_step_20.csv.gz",
+      "distance_m": 118.6,
+      "query": [
+        33.12256829351505,
+        -107.28778800142912
+      ],
+      "pano": [
+        33.12232632180884,
+        -107.2865473422279
+      ],
+      "copyright_info": "© Google"
+    },
+    {
+      "city_id": "glenwood--utah--united-states",
+      "csv_filename": "glenwood--utah_width_1040_height_1369_step_20.csv.gz",
+      "distance_m": 113.5,
+      "query": [
+        38.76167927292057,
+        -111.98629018834512
+      ],
+      "pano": [
+        38.76258654828077,
+        -111.9868894168477
+      ],
+      "copyright_info": "© Google"
+    },
+    {
+      "city_id": "butte--nebraska--united-states",
+      "csv_filename": "butte--nebraska_width_1209_height_1205_step_20.csv.gz",
+      "distance_m": 108.7,
+      "query": [
+        42.91435558953416,
+        -98.84219310416157
+      ],
+      "pano": [
+        42.91532982941451,
+        -98.8422965991372
+      ],
+      "copyright_info": "© Google"
+    },
+    {
+      "city_id": "palmer--massachusetts--united-states",
+      "csv_filename": "palmer-town--massachusetts_width_50_height_44_step_20.csv.gz",
+      "distance_m": 54.1,
+      "query": [
+        42.18600024430291,
+        -72.3468174511932
+      ],
+      "pano": [
+        42.18633821020435,
+        -72.34728945458467
+      ],
+      "copyright_info": "© Google"
+    }
+  ]
+}

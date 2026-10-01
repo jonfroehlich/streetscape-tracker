@@ -646,6 +646,29 @@ jitter = 0.6
 spacing_m = 15
 network_type = "drive"
 
+# A shared ROLLING-24H request budget per per-IP HOST (issue #385), keyed by the
+# download_common HOST_* token. Every channel whose CHANNEL_HOSTS include the
+# host draws from this one pool -- for Mapillary's tile CDN that is BOTH
+# [providers.mapillary] and [providers.mapillary_streets] -- counted over the
+# last 24 h rather than per UTC date, on every scheduler path: the nightly
+# batch, `run-due --provider ... --city/--limit` catch-ups, and assess-city.
+# The effective remainder at each launch is the MINIMUM of the channel's own
+# daily_request_budget remainder (unchanged above) and this one.
+#
+# Why: block 4 (2026-09-28 02:27 PDT) landed after ~4,600 tile requests in
+# ~24.5 h -- a 20-city mapillary_streets daytime catch-up charged to the NEXT
+# UTC date (1,444) plus the first 80-city night (2,947) -- with neither channel's
+# daily row over its budget, because each read only its own row for one date.
+#
+# This is a STAGING GUARD on how fast our traffic can change, NOT a model of
+# Mapillary's per-IP threshold: #286 found no accumulation window from 1 to 8
+# days that separates blocked days from clean ones. 3,000 is above the ~800/day
+# a steady catalog refresh needs and forbids bursts. A SOFT ceiling like every
+# budget here: in-flight retries can overshoot it by
+# connection_limit x (TILE_MAX_TRIES - 1).
+[hosts.mapillary_tiles]
+rolling_24h_request_budget = 3000
+
 [download]
 batch_size = 100
 # 50 -> 100 on 2026-09-21, in the SAME change that raised

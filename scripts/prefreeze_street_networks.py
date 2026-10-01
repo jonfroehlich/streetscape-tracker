@@ -152,7 +152,10 @@ def next_run_date() -> date:
     afternoon. Tomorrow UTC is right for that case and one day late for a
     pass run after midnight UTC, and the error is on the safe side: dueness is
     monotone in the date, so a later date can only ADD cities at the staleness
-    threshold, never drop one the night will actually reach.
+    threshold, never drop one the night will actually reach. The one exception
+    is the opt-in reservation's channel rotation (#348), whose start is the
+    date's ordinal: a one-day-late date starts it one channel further along,
+    so a stranded opt-in city predicted here may differ from the night's.
     """
     return clock.snapshot_date_today() + timedelta(days=1)
 

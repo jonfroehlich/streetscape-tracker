@@ -1,9 +1,11 @@
 """Catalog tests: registration, aliases, runs, diffs, budget, scheduling."""
 
 import json
+import multiprocessing
 import os
 import sqlite3
-from datetime import date
+import time
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
@@ -179,6 +181,24 @@ def test_diff_storage(conn, city):
     )
     row = db.get_diff_for_run(conn, r2)
     assert row["panos_added"] == 5 and row["grid_aligned"] == 1
+
+
+def test_update_diff_of_a_missing_row_raises(conn):
+    """A repair that updated nothing must not read as one that succeeded."""
+    with pytest.raises(LookupError):
+        db.update_diff(
+            conn,
+            12345,
+            grid_aligned=True,
+            panos_added=0,
+            panos_removed=0,
+            panos_persisted=0,
+            capture_date_changed=0,
+            points_gained_coverage=None,
+            points_lost_coverage=None,
+            coverage_delta_pct=None,
+            detail_filename=None,
+        )
 
 
 def _diff(conn, city, from_run_id, to_run_id, **overrides):
@@ -1583,6 +1603,50 @@ def test_get_previous_street_walk_filters_series_and_date(conn, city):
     assert db.get_previous_street_walk(conn, city, date(2026, 5, 1), provider="mapillary") is None
 
 
+def test_delete_walk_diff_returns_only_the_cleared_walks_names(conn, city):
+    """The names returned are files the caller is about to DELETE (#265), so
+    they must be exactly the rows this call removed: not the diff whose FROM
+    side is this walk (the next walk's live file), and not another series'."""
+    walks = {}
+    for key, run_date, network_type in (
+        ("a", date(2026, 4, 1), "drive"),
+        ("b", date(2026, 7, 1), "drive"),
+        ("c", date(2026, 10, 1), "drive"),
+        ("x", date(2026, 4, 1), "all_public"),
+        ("y", date(2026, 7, 1), "all_public"),
+    ):
+        walks[key] = db.register_street_walk(
+            conn,
+            city_id=city,
+            run_date=run_date,
+            csv_filename=f"{key}_streetwalk.csv.gz",
+            network_type=network_type,
+        )
+    for from_key, to_key in (("a", "b"), ("b", "c"), ("x", "y")):
+        db.record_street_walk_diff(
+            conn,
+            city_id=city,
+            from_walk_id=walks[from_key],
+            to_walk_id=walks[to_key],
+            edges_aligned=1,
+            edges_added=0,
+            edges_removed=0,
+            edges_gained_coverage=1,
+            edges_lost_coverage=0,
+            coverage_fraction_changed=1,
+            nearest_pano_date_changed=0,
+            edges_fully_covered_delta=0,
+            coverage_pct_by_length_delta=1.0,
+            coverage_pct_by_length_any_delta=1.0,
+            detail_filename=f"{from_key}{to_key}.csv.gz",
+        )
+    assert db.delete_walk_diff_for_walk(conn, walks["b"]) == ["ab.csv.gz"]
+    survivors = conn.execute(
+        "SELECT detail_filename FROM street_walk_diffs ORDER BY detail_filename"
+    ).fetchall()
+    assert [r["detail_filename"] for r in survivors] == ["bc.csv.gz", "xy.csv.gz"]
+
+
 def test_record_and_get_walk_diff(conn, city):
     walk_a = db.register_street_walk(
         conn,
@@ -1644,10 +1708,12 @@ def test_record_and_get_walk_diff(conn, city):
     # No diff recorded for the 'from' walk.
     assert db.get_walk_diff_for_walk(conn, walk_a) is None
 
-    # Deleting by 'to' walk drops the row; a second delete is a no-op.
-    db.delete_walk_diff_for_walk(conn, walk_b)
+    # Deleting by 'to' walk drops the row and hands back the detail file it
+    # pointed at, since the caller must delete that file (issue #265); a
+    # second delete is a no-op that names nothing.
+    assert db.delete_walk_diff_for_walk(conn, walk_b) == ["diff.csv.gz"]
     assert db.get_walk_diff_for_walk(conn, walk_b) is None
-    db.delete_walk_diff_for_walk(conn, walk_b)
+    assert db.delete_walk_diff_for_walk(conn, walk_b) == []
     assert conn.execute("SELECT COUNT(*) FROM street_walk_diffs").fetchone()[0] == 0
 
 
@@ -1760,6 +1826,124 @@ def test_migrate_v13_to_v14(tmp_path):
     conn2.close()
 
 
+def _pre_query_radius_catalog(tmp_path, keep=(), user_version=15):
+    """A catalog at v15: db._SCHEMA minus the v17 query-radius columns (except
+    any named in ``keep``, to simulate an interrupted migration), with one
+    pre-v17 gsv run seeded."""
+    db_path = str(tmp_path / "v15.db")
+    raw = sqlite3.connect(db_path)
+    raw.executescript(db._SCHEMA)
+    for col in db._QUERY_RADIUS_RUN_COLUMNS:
+        if col not in keep:
+            raw.execute(f"ALTER TABLE runs DROP COLUMN {col}")
+    raw.execute(
+        """INSERT INTO cities (city_id, display_name, city_name, center_lat,
+           center_lon, grid_width_m, grid_height_m, step_m, created_at)
+           VALUES ('bend--or', 'Bend, OR', 'Bend', 44.05, -121.31,
+                   5000, 5000, 20, '2026-01-01T00:00:00+00:00')"""
+    )
+    raw.execute(
+        """INSERT INTO runs (city_id, provider, run_date, csv_filename, coverage_rate_pct)
+           VALUES ('bend--or', 'gsv', '2026-05-01', 'old.csv.gz', 87.5)"""
+    )
+    raw.execute(f"PRAGMA user_version = {user_version}")
+    raw.commit()
+    raw.close()
+    return db_path
+
+
+def test_migrate_adds_the_query_radius_columns_as_null(tmp_path):
+    """v15 -> v17 (issue #367): runs gains status_out_of_radius and
+    query_radius_m, and a pre-v17 row reads NULL for both -- "computed before
+    the rule existed", which is what recompute_run_stats.py later fills in --
+    while keeping the coverage it was stored with."""
+    conn = db.connect(_pre_query_radius_catalog(tmp_path))
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)").fetchall()}
+    assert set(db._QUERY_RADIUS_RUN_COLUMNS) <= cols
+    run = db.get_latest_run(conn, "bend--or")
+    assert run.coverage_rate_pct == 87.5
+    assert run.status_out_of_radius is None
+    assert run.query_radius_m is None
+    conn.close()
+    # Idempotent: reopening must not error or re-migrate.
+    db.connect(str(tmp_path / "v15.db")).close()
+
+
+def test_an_interrupted_query_radius_migration_completes(tmp_path):
+    """Named by content and guarded per column, so a catalog stopped between
+    its two ADD COLUMNs -- or one that reaches this step under a different
+    version number after a renumbering -- finishes rather than failing on the
+    column that already exists."""
+    conn = db.connect(_pre_query_radius_catalog(tmp_path, keep=("status_out_of_radius",)))
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)").fetchall()}
+    assert set(db._QUERY_RADIUS_RUN_COLUMNS) <= cols
+    conn.close()
+
+
+def test_a_catalog_already_stamped_v16_without_the_columns_gains_them(tmp_path):
+    """A catalog at v16 with no query-radius columns -- prod once #385 is
+    deployed, or a dev catalog either branch stamped while both claimed v16 --
+    gains them on the v16 -> v17 rung (and the unconditional call behind it).
+    Without them every get_latest_run would read a RunRow without its columns
+    while register_run failed on the INSERT."""
+    conn = db.connect(_pre_query_radius_catalog(tmp_path, user_version=16))
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)").fetchall()}
+    assert set(db._QUERY_RADIUS_RUN_COLUMNS) <= cols
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
+    conn.close()
+
+
+def test_a_v15_catalog_takes_both_rungs_backfill_and_columns(tmp_path, frozen_utc_clock):
+    """Prod is at v15 and takes v16 (#385) and v17 (#367) in one connect: the
+    host_usage backfill must seed AND the query-radius columns must land, in
+    that order, ending at v17. Killed by a v17 rung keyed on 15 and placed
+    ahead of the v16 rung: it consumes the v15 stamp and the backfill never
+    runs, while the columns (also added unconditionally) still land."""
+    frozen_utc_clock(_HOST_NOW)
+    db_path = _pre_query_radius_catalog(tmp_path)
+    raw = sqlite3.connect(db_path)
+    raw.execute("DROP TABLE host_usage")
+    raw.execute(
+        "INSERT INTO api_usage (usage_date, provider, requests) VALUES ('2026-09-28', 'mapillary', 194)"
+    )
+    raw.commit()
+    raw.close()
+
+    conn = db.connect(db_path)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 17
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)").fetchall()}
+    assert set(db._QUERY_RADIUS_RUN_COLUMNS) <= cols
+    assert _host_rows(conn) == [("2026-09-28T06:00:00+00:00", "mapillary_tiles", "mapillary", 194)]
+    conn.close()
+
+
+def test_register_run_round_trips_the_query_radius_pair(conn):
+    cid = db.register_city(
+        conn,
+        city_name="Bend",
+        state_name="Oregon",
+        state_code="OR",
+        country_name="United States",
+        country_code="US",
+        center_lat=44.05,
+        center_lon=-121.31,
+        grid_width_m=200,
+        grid_height_m=200,
+        step_m=20,
+    )
+    db.register_run(
+        conn,
+        city_id=cid,
+        run_date=date(2026, 5, 1),
+        csv_filename="r.csv.gz",
+        status_out_of_radius=7,
+        query_radius_m=50.0,
+    )
+    run = db.get_latest_run(conn, cid)
+    assert (run.status_out_of_radius, run.query_radius_m) == (7, 50.0)
+
+
 def test_run_row_carries_every_runs_column(conn):
     """
     `_row_to_run` builds RunRow(**dict(row)) from `SELECT *`, so a column added
@@ -1864,3 +2048,252 @@ def test_the_provenance_defaults_to_null_not_to_the_collecting_channel(conn):
     )
     run = db.get_latest_run(conn, city_id, provider="gsv")
     assert run.census_fetched_by is None and run.census_fetched_at is None
+
+
+# ── The per-host rolling ledger, schema v16 (issue #385) ────────────────────
+
+_HOST_NOW = datetime(2026, 9, 28, 6, 0, tzinfo=UTC)
+
+
+def _host_rows(conn):
+    return sorted(
+        tuple(r)
+        for r in conn.execute("SELECT recorded_at, host, provider, requests FROM host_usage")
+    )
+
+
+def test_migrate_v15_to_v16_backfills_two_utc_dates_of_metered_channels(tmp_path, frozen_utc_clock):
+    """A v15 catalog gains host_usage, seeded so the first night after deploy is gated.
+
+    Built from db._SCHEMA minus host_usage (so the fixture tracks the code), with
+    api_usage rows chosen so each exclusion is separately observable: a
+    two-days-old metered row (outside the two UTC dates), gsv and gsv_streets
+    rows (Google meters by project, not IP), and a zero-request row. The kept
+    rows are stamped at the LATEST instant their spend can have happened --
+    23:59:59 UTC of a past date, the migration's own clock for today -- one row
+    per channel.
+    """
+    frozen_utc_clock(_HOST_NOW)
+    db_path = str(tmp_path / "v15.db")
+    raw = sqlite3.connect(db_path)
+    raw.executescript(db._SCHEMA)
+    raw.execute("DROP TABLE host_usage")
+    for usage_date, provider, n in [
+        ("2026-09-28", "mapillary", 194),
+        ("2026-09-28", "mapillary_streets", 1444),
+        ("2026-09-27", "mapillary", 1198),
+        ("2026-09-27", "kartaview", 16),
+        ("2026-09-26", "mapillary_streets", 1262),  # two dates back: out
+        ("2026-09-28", "gsv", 5_000_000),  # not per-IP: out
+        ("2026-09-27", "gsv_streets", 90_000),  # not per-IP: out
+        ("2026-09-27", "panoramax", 0),  # nothing spent: out
+    ]:
+        raw.execute(
+            "INSERT INTO api_usage (usage_date, provider, requests) VALUES (?, ?, ?)",
+            (usage_date, provider, n),
+        )
+    raw.execute("PRAGMA user_version = 15")
+    raw.commit()
+    raw.close()
+
+    conn = db.connect(db_path)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 17
+    assert _host_rows(conn) == [
+        ("2026-09-27T23:59:59+00:00", "kartaview", "kartaview", 16),
+        ("2026-09-27T23:59:59+00:00", "mapillary_tiles", "mapillary", 1198),
+        ("2026-09-28T06:00:00+00:00", "mapillary_tiles", "mapillary", 194),
+        ("2026-09-28T06:00:00+00:00", "mapillary_tiles", "mapillary_streets", 1444),
+    ]
+    conn.close()
+
+    # Idempotent: a second connect neither re-migrates nor double-seeds, and
+    # re-running the migration by hand on a non-empty table seeds nothing.
+    conn2 = db.connect(db_path)
+    db._migrate_v15_to_v16(conn2)
+    assert len(_host_rows(conn2)) == 4
+    conn2.close()
+
+
+def _v15_catalog(db_path, rows):
+    """A v15 catalog: db._SCHEMA minus host_usage, with ``rows`` in api_usage."""
+    raw = sqlite3.connect(db_path)
+    raw.executescript(db._SCHEMA)
+    raw.execute("DROP TABLE host_usage")
+    raw.executemany("INSERT INTO api_usage (usage_date, provider, requests) VALUES (?, ?, ?)", rows)
+    raw.execute("PRAGMA user_version = 15")
+    raw.commit()
+    raw.close()
+
+
+@pytest.mark.parametrize(
+    "at,counted",
+    [
+        (datetime(2026, 9, 30, 12, 0, 1, tzinfo=UTC), 2947),
+        (datetime(2026, 9, 30, 20, 0, tzinfo=UTC), 2947),
+        (datetime(2026, 9, 30, 23, 59, 59, tzinfo=UTC), 2947),
+        (datetime(2026, 10, 1, 0, 0, 0, tzinfo=UTC), 0),
+    ],
+    ids=["noon-plus-1s", "20h", "last-second", "released"],
+)
+def test_the_backfill_keeps_yesterdays_spend_in_the_window_all_first_night(
+    tmp_path, frozen_utc_clock, at, counted
+):
+    """Issue #385 review: the first night after deploy is gated for the WHOLE night.
+
+    Deployed 09-30 09:00 UTC after a 09-29 night of 2,947. Prod's night runs
+    ~09:00-21:00 UTC, so a noon stamp released that spend at 12:00 UTC on 09-30
+    -- three hours into the night the backfill exists to protect. Stamped at the
+    end of its date, it is still in the window at noon and at 20:00, and leaves
+    one second after 23:59:59. A noon stamp fails every case but the last.
+    """
+    frozen_utc_clock(datetime(2026, 9, 30, 9, 0, tzinfo=UTC))
+    db_path = str(tmp_path / "v15.db")
+    _v15_catalog(
+        db_path, [("2026-09-29", "mapillary", 1198), ("2026-09-29", "mapillary_streets", 1749)]
+    )
+    conn = db.connect(db_path)
+    try:
+        assert db.get_host_usage(conn, "mapillary_tiles", at - timedelta(hours=24)) == counted
+    finally:
+        conn.close()
+
+
+def test_add_api_usage_is_the_host_ledger_write_seam(conn, frozen_utc_clock):
+    """One seam, so no call site can forget it (issue #385).
+
+    A metered channel writes one host_usage row stamped from the shared clock;
+    gsv writes none; meter_host=False (the bundle import) writes none; and a
+    zero spend writes none -- but every one of them still charges api_usage.
+    """
+    frozen_utc_clock(_HOST_NOW)
+    d = date(2026, 9, 28)
+    db.add_api_usage(conn, d, 120, "mapillary")
+    db.add_api_usage(conn, d, 5_000, "gsv")
+    db.add_api_usage(conn, d, 5_000, "gsv_streets")
+    db.add_api_usage(conn, d, 40, "kartaview", meter_host=False)
+    db.add_api_usage(conn, d, 0, "mapillary_streets")
+    assert _host_rows(conn) == [("2026-09-28T06:00:00+00:00", "mapillary_tiles", "mapillary", 120)]
+    assert db.get_api_usage(conn, d, "kartaview") == 40
+    assert db.get_api_usage(conn, d, "gsv") == 5_000
+
+
+def test_the_host_window_is_inclusive_at_its_start(conn):
+    """A row stamped exactly at ``since`` counts; one a second earlier does not."""
+    since = _HOST_NOW - timedelta(hours=24)
+    for stamp, n in [(since, 7), (since - timedelta(seconds=1), 1000), (_HOST_NOW, 3)]:
+        conn.execute(
+            "INSERT INTO host_usage VALUES (?, 'mapillary_tiles', 'mapillary', ?)",
+            (stamp.isoformat(), n),
+        )
+    assert db.get_host_usage(conn, "mapillary_tiles", since) == 10
+    assert db.get_host_usage(conn, "kartaview", since) == 0
+    with pytest.raises(ValueError, match="aware"):
+        db.get_host_usage(conn, "mapillary_tiles", since.replace(tzinfo=None))
+
+
+def test_prune_host_usage_drops_only_rows_older_than_the_cutoff(conn):
+    cutoff = _HOST_NOW - timedelta(days=30)
+    for stamp in (cutoff - timedelta(seconds=1), cutoff, _HOST_NOW):
+        conn.execute(
+            "INSERT INTO host_usage VALUES (?, 'mapillary_tiles', 'mapillary', 1)",
+            (stamp.isoformat(),),
+        )
+    assert db.prune_host_usage(conn, cutoff) == 1
+    assert [r[0] for r in _host_rows(conn)] == [cutoff.isoformat(), _HOST_NOW.isoformat()]
+
+
+def _race_worker(index, paths, barrier, errors):
+    """Racer ``index``, first-connecting each v15 catalog in ``paths`` in step with the others.
+
+    The barrier wait is bounded, so a racer whose peer died stops waiting
+    (``BrokenBarrierError``, a nonzero exit) instead of blocking forever; the
+    parent also aborts the barrier the moment any racer exits nonzero.
+    """
+    import time
+
+    from streetscape_metadata_tracker import clock
+
+    clock._utc_clock = lambda: datetime(2026, 9, 30, 9, 0, tzinfo=UTC)
+
+    # WIDEN the race window, which is otherwise microseconds wide: the
+    # migration reads today's date BETWEEN its empty-table check and its
+    # inserts, so a pause here holds every racer inside the window. Measured
+    # without it, dropping BEGIN IMMEDIATE survived 3 of 3 runs of 8 trials.
+    def slow_today():
+        time.sleep(0.05)
+        return clock.utc_now().date()
+
+    clock.snapshot_date_today = slow_today
+    for path in paths:
+        barrier.wait(timeout=_RACE_BARRIER_TIMEOUT_S)
+        try:
+            db.connect(path).close()
+        except Exception as exc:  # reported, so the parent can fail by name
+            errors.put(f"{path}: {exc!r}")
+
+
+_RACE_PROCESSES = 4
+_RACE_TRIALS = 8
+# Backstops only: the parent aborts the barrier as soon as a racer dies, so a
+# broken run fails in about a second, not at these limits.
+_RACE_BARRIER_TIMEOUT_S = 30
+_RACE_DEADLINE_S = 60
+
+
+def test_concurrent_first_connects_seed_the_v16_backfill_exactly_once(tmp_path):
+    """Issue #385 review: ``BEGIN IMMEDIATE`` makes the backfill race-safe.
+
+    Four processes first-connect the same v15 catalog at once (a barrier lines
+    them up), over several fresh catalogs. Each must end at v17 with exactly the
+    two backfill rows -- never four, six or eight -- and no process may fail.
+    Without the transaction, two processes can both find ``host_usage`` empty
+    and both seed it; the worker pauses inside that window (see
+    ``_race_worker``), because unwidened it is too narrow to lose reliably. The
+    processes are started once and reused across trials, so the stack is
+    imported four times, not four times per trial.
+    """
+    paths = []
+    for trial in range(_RACE_TRIALS):
+        path = str(tmp_path / f"race{trial}.db")
+        _v15_catalog(
+            path, [("2026-09-29", "mapillary", 1198), ("2026-09-30", "mapillary_streets", 5)]
+        )
+        raw = sqlite3.connect(path)
+        raw.execute("PRAGMA journal_mode=WAL")
+        raw.close()
+        paths.append(path)
+    ctx = multiprocessing.get_context("spawn")
+    barrier = ctx.Barrier(_RACE_PROCESSES)
+    errors = ctx.Queue()
+    # daemon, and terminated in `finally`: a racer that dies must FAIL this
+    # test, never leave its peers parked on the barrier where multiprocessing's
+    # atexit join would hang pytest until the CI runner's own timeout.
+    procs = [
+        ctx.Process(target=_race_worker, args=(i, paths, barrier, errors), daemon=True)
+        for i in range(_RACE_PROCESSES)
+    ]
+    try:
+        for proc in procs:
+            proc.start()
+        deadline = time.monotonic() + _RACE_DEADLINE_S
+        while any(proc.is_alive() for proc in procs) and time.monotonic() < deadline:
+            if any(proc.exitcode not in (None, 0) for proc in procs):
+                barrier.abort()  # releases every waiter with BrokenBarrierError
+            time.sleep(0.05)
+        exitcodes = [proc.exitcode for proc in procs]
+    finally:
+        for proc in procs:
+            if proc.is_alive():
+                proc.terminate()
+            proc.join(timeout=10)
+    assert exitcodes == [0] * _RACE_PROCESSES
+    failures = []
+    while not errors.empty():
+        failures.append(errors.get())
+    assert failures == []
+    for path in paths:
+        raw = sqlite3.connect(path)
+        rows = raw.execute("SELECT provider, requests FROM host_usage ORDER BY provider").fetchall()
+        version = raw.execute("PRAGMA user_version").fetchone()[0]
+        raw.close()
+        assert (version, rows) == (17, [("mapillary", 1198), ("mapillary_streets", 5)]), path
