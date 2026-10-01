@@ -6,6 +6,13 @@
 **Issue:** [#316](https://github.com/jonfroehlich/streetscape-tracker/issues/316), phase 1.
 Provider context: [`imagery-providers.md`](../imagery-providers.md).
 
+> **Correction, 2026-10-01 ([#406](https://github.com/jonfroehlich/streetscape-tracker/issues/406)).**
+> This writeup says the v2 z6 screen hexagons are H3 resolution 6, ~36 km² (the "Read this before" section, the instrument table, and the screen's caveat).
+> On 2026-10-01 every one of the 261,913 hexagon ids the same layer served at z6 carried **resolution 7** (~5.2 km²), and the hex counts inside a 10 km disc agree (at most 74, ~4.3 km² each) — see [`panoramax-world-screen.md`](panoramax-world-screen.md).
+> Whether the layer changed after this study or resolution 6 was stated without being read from an id is **unknown**: no phase-1 hexagon id was kept.
+> The screen's logic is unaffected (it selects by overlap and counts whole hexagons, so it is still an upper bound and a zero is still conclusive), but every "a screen hex is larger than the city" sentence below is wrong for the median city at resolution 7.
+> The text below is left as written.
+
 ## Verdict
 
 **The gate as [#316](https://github.com/jonfroehlich/streetscape-tracker/issues/316) phrases it fails: the median tracked city has no Panoramax imagery at all.**

@@ -7,32 +7,43 @@ Issue #406: screen Panoramax 360° imagery OUTSIDE the catalog, region by region
 This is the standing #316 screen (`panoramax_screen.hexes_from_tile`, the v2
 `grid` layer at z6) pointed at whole regions instead of at the catalog's frozen
 grids. Its question is "where outside the catalog is there 360° imagery worth
-registering a city for?"; its answer is a list of res-6 H3 hexagons, which
+registering a city for?"; its answer is a list of H3 hexagons (measured RES 7 on
+2026-10-01, not the res 6 earlier docs state), which
 `panoramax_world_screen_analyze.py` maps onto GeoNames places offline.
 
 PROVENANCE, stated so nobody mistakes this for the code that ran. The
 2026-10-01 pass was collected by a research script kept beside its raw output
 (`experiments/candidate-360-cities-2026-10-01/panoramax/screen_regions.py`,
 gitignored with it). This file is that script made reproducible: the same
-regions, zoom, request order, cap, pacing shape and output schema, but through
-the study tooling the repo already has (`panoramax_feasibility.Fetcher`, the
-#292 jittered pacer, the collection-host refusal). The tile plan is pinned by
-`tests/test_panoramax_world_screen.py` against the 235 tiles the 2026-10-01
-request log records. Three differences: the User-Agent is the study's rather
-than the research one; `Fetcher` retries a 5xx up to three times where the
-research script never retried (none occurred, so the record is unaffected); and
-the shared pacer spaces request STARTS, where the research script slept after
-each response, so a re-run approaches the 30/min mean rather than the 22.4/min
-the 2026-10-01 log shows.
+regions, zoom, request order, request cap and mean rate, and the same
+`hexes.csv` / `requests.log` schema, with `s` measured the same way (the
+request's own latency, from send to body read, never the pacer's sleep). The
+tile plan is pinned by `tests/test_panoramax_world_screen.py` against the 235
+tiles the 2026-10-01 log records. Differences, none of which touches the record:
+the User-Agent is the study's; a 5xx or transport error is retried (the research
+script never retried, and none occurred), with every attempt counted against the
+cap and logged as `attempts`; and the pacer spaces request STARTS, where the
+research script slept after each response, so a re-run approaches the 30/min
+mean rather than the 22.4/min the 2026-10-01 log shows.
 
-PACING. 30/min mean, CV 0.6, sequential, hard cap 250 requests, stop on the
-first 403/429. That is the collector's own Panoramax rate, and the reasons it is
-the conservative end are in `docs/provider-access.md`. Never run it on a
-production collection host: the screen shares the per-IP Panoramax host with the
-nightly channels.
+OUTPUT. Each run writes `requests.log` and `hexes.csv` into `<raw-dir>/panoramax/`,
+the layout `panoramax_world_screen_analyze.py --raw-dir <raw-dir>` reads.
+`<raw-dir>` defaults to `experiments/panoramax-world-screen-<UTC date>/` under
+the repo root (not the cwd), and a `panoramax/` directory that already holds
+anything is refused, dry run included -- an earlier version defaulted to the
+2026-10-01 evidence directory, where `--execute` would have appended to its
+only request log and overwritten its only hexes.csv.
+
+PACING AND THE CAP. 30/min mean, CV 0.6 (#292), sequential, from a laptop
+(`refuse_on_collection_host`). `MAX_REQUESTS` caps ATTEMPTS, retries included,
+and is enforced before every send. A 403/429 stops the pass at once. A tile that
+exhausts its retries, or the cap being reached, also stops it; in every stopped
+case the log's last line is a `stop` record and the run exits nonzero, so the
+analyzer (which refuses any record whose tiles are not exactly the plan) can
+never mistake a partial screen for a complete one.
 
 EMPTY TILES. At z6 the meta-catalog answered an empty tile with **204 No
-Content**, not 404 (34 of 235 on 2026-10-01, and 0 × 404) — the opposite of
+Content**, not 404 (34 of 235 on 2026-10-01, and 0 × 404) -- the opposite of
 what `download_panoramax._fetch_tile` documents for z15. Both are recorded as
 empty here, and the log keeps the status so the two stay distinguishable.
 """
@@ -45,6 +56,8 @@ import json
 import os
 import sys
 import time
+from collections.abc import Callable
+from datetime import UTC, datetime
 from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -75,10 +88,46 @@ REGIONS: dict[str, tuple[float, float, float, float]] = {
 }
 
 MAX_REQUESTS = 250
+MAX_TRIES_PER_TILE = 3
 DEFAULT_RPM = 30
 DEFAULT_JITTER = 0.6
-DEFAULT_RAW_DIR = os.path.join("experiments", "candidate-360-cities-2026-10-01", "panoramax")
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HEX_FIELDS = ["hex_id", "lon", "lat", "nb_pictures", "nb_360_pictures", "nb_flat_pictures", "date"]
+LOGGED_HEADER_PREFIXES = (
+    "x-rate",
+    "ratelimit",
+    "retry",
+    "server",
+    "cache",
+    "x-cache",
+    "cf-",
+    "via",
+    "age",
+)
+
+
+def default_raw_dir(today: str | None = None) -> str:
+    """`<repo>/experiments/panoramax-world-screen-<UTC date>`: never an existing record."""
+    today = today or datetime.now(UTC).strftime("%Y-%m-%d")
+    return os.path.join(REPO, "experiments", f"panoramax-world-screen-{today}")
+
+
+def tile_dir(raw_dir: str) -> str:
+    """Where a pass writes: `<raw_dir>/panoramax`, the analyzer's input layout."""
+    return os.path.join(raw_dir, "panoramax")
+
+
+def refuse_nonempty_dir(raw_dir: str) -> None:
+    """Exit with an error if the pass's output dir already holds anything.
+
+    A run never touches a previous record.
+    """
+    out = tile_dir(raw_dir)
+    if os.path.isdir(out) and os.listdir(out):
+        raise SystemExit(
+            f"Refusing to write into {out!r}: it already holds files, and a run "
+            f"appends to requests.log and rewrites hexes.csv. Pass a fresh --raw-dir."
+        )
 
 
 def plan_tiles(
@@ -129,66 +178,115 @@ def hex_rows(merged: dict[str, dict[str, Any]]) -> list[list[Any]]:
     return rows
 
 
-def collect(raw_dir: str, rpm: int, jitter: float) -> dict[str, int]:
-    """Fetch the plan sequentially, appending to requests.log and writing hexes.csv."""
-    import panoramax_feasibility as pf  # deferred: imports requests/protobuf
+class Stop(Exception):
+    """End the pass; `reason` goes into the log's final `stop` record."""
 
-    plan = plan_tiles()
-    if len(plan) > MAX_REQUESTS:
-        raise SystemExit(f"plan is {len(plan)} tiles, over the {MAX_REQUESTS}-request cap")
-    os.makedirs(raw_dir, exist_ok=True)
-    fetcher = pf.Fetcher(pf.SpacedRateLimiter(rpm, jitter=jitter), timeout_s=60)
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def run_pass(
+    plan: dict[tuple[int, int], str],
+    get: Callable[[str], Any],
+    acquire: Callable[[], None],
+    log,
+    *,
+    max_requests: int = MAX_REQUESTS,
+    max_tries: int = MAX_TRIES_PER_TILE,
+    clock: Callable[[], float] = time.perf_counter,
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    """Fetch every planned tile in sorted order; return (merged hexes, summary).
+
+    `get(url)` returns a response with `status_code`, `content` and `headers`,
+    or raises on a transport error; `acquire()` blocks for the pacer. Both are
+    injected so the cap and the stop paths are testable without a network.
+    `s` is timed around `get` alone, so it is the request's latency and never
+    the pacer's sleep.
+    """
     merged: dict[str, dict[str, Any]] = {}
-    counts = {"200": 0, "204": 0, "404": 0, "other": 0}
-    with open(os.path.join(raw_dir, "requests.log"), "a") as log:
+    sent = 0
+    summary: dict[str, Any] = {"complete": False, "requests": 0, "tiles": 0}
+    try:
+        if len(plan) > max_requests:
+            raise Stop(f"plan is {len(plan)} tiles, over the {max_requests}-request cap")
         for i, (x, y) in enumerate(sorted(plan)):
             url = SCREEN_URL_TEMPLATE.format(z=SCREEN_ZOOM, x=x, y=y)
-            started = time.time()
-            try:
-                response = fetcher.get(url)
-            except pf.BlockedError as exc:
-                print(f"STOP: {exc}")
-                break
-            status = response.status_code
-            headers = {
-                k: v
-                for k, v in response.headers.items()
-                if k.lower().startswith(
-                    (
-                        "x-rate",
-                        "ratelimit",
-                        "retry",
-                        "server",
-                        "cache",
-                        "x-cache",
-                        "cf-",
-                        "via",
-                        "age",
-                    )
-                )
-            }
+            response, latency, attempts, error = None, 0.0, 0, None
+            while attempts < max_tries:
+                if sent >= max_requests:
+                    raise Stop(f"request cap {max_requests} reached at tile {i} ({x},{y})")
+                acquire()
+                sent += 1
+                attempts += 1
+                started = clock()
+                try:
+                    response = get(url)
+                    error = None
+                except Exception as exc:  # transport error: retry within the tile's budget
+                    response, error = None, repr(exc)
+                latency = clock() - started
+                if response is not None and response.status_code < 500:
+                    break
+            status = response.status_code if response is not None else "EXC"
             record = {
                 "i": i,
                 "x": x,
                 "y": y,
                 "region": plan[(x, y)],
                 "status": status,
-                "bytes": len(response.content),
-                "s": round(time.time() - started, 2),
-                "hdrs": headers,
+                "bytes": len(response.content) if response is not None else 0,
+                "s": round(latency, 2),
+                "attempts": attempts,
+                "hdrs": {
+                    k: v
+                    for k, v in (response.headers.items() if response is not None else [])
+                    if k.lower().startswith(LOGGED_HEADER_PREFIXES)
+                },
                 "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             }
+            if error:
+                record["error"] = error
             log.write(json.dumps(record) + "\n")
             log.flush()
-            key = str(status) if str(status) in counts else "other"
-            counts[key] += 1
+            summary["tiles"] = i + 1
+            if status in (403, 429):
+                raise Stop(f"HTTP {status}: per-IP refusal; do not retry into it")
+            if status == "EXC" or (isinstance(status, int) and status >= 500):
+                raise Stop(f"tile ({x},{y}) failed after {attempts} attempts: {error or status}")
             if status == 200 and response.content:
                 merge_hexes(merged, hexes_from_tile(response.content, x, y, SCREEN_ZOOM))
-    with open(os.path.join(raw_dir, "hexes.csv"), "w", newline="") as f:
+        summary["complete"] = True
+    except Stop as stop:
+        log.write(json.dumps({"stop": stop.reason, "requests": sent}) + "\n")
+        log.flush()
+        summary["stop"] = stop.reason
+    summary["requests"] = sent
+    return merged, summary
+
+
+def collect(raw_dir: str, rpm: int, jitter: float) -> dict[str, Any]:
+    """One paced pass into a fresh `<raw_dir>/panoramax/`: requests.log, then hexes.csv."""
+    import panoramax_feasibility as pf  # deferred: imports requests/protobuf
+    import requests
+
+    refuse_nonempty_dir(raw_dir)
+    out = tile_dir(raw_dir)
+    os.makedirs(out, exist_ok=True)
+    limiter = pf.SpacedRateLimiter(rpm, jitter=jitter)
+    session = requests.Session()
+    session.headers["User-Agent"] = (
+        "streetscape-tracker/panoramax-world-screen (+https://github.com/jonfroehlich/streetscape-tracker)"
+    )
+    with open(os.path.join(out, "requests.log"), "a") as log:
+        merged, summary = run_pass(
+            plan_tiles(), lambda url: session.get(url, timeout=60), limiter.acquire, log
+        )
+    with open(os.path.join(out, "hexes.csv"), "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(HEX_FIELDS)
         writer.writerows(hex_rows(merged))
-    return counts
+    return summary
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -196,18 +294,25 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--execute", action="store_true", help="send the requests (default: dry run)"
     )
-    parser.add_argument("--raw-dir", default=DEFAULT_RAW_DIR, help="gitignored output directory")
+    parser.add_argument(
+        "--raw-dir",
+        default=None,
+        help="fresh, gitignored output directory (default: experiments/panoramax-world-screen-<UTC date>)",
+    )
     parser.add_argument("--rpm", type=int, default=DEFAULT_RPM)
     parser.add_argument("--jitter", type=float, default=DEFAULT_JITTER)
     args = parser.parse_args(argv)
+    raw_dir = args.raw_dir or default_raw_dir()
 
     plan = plan_tiles()
-    print(f"plan: {len(plan)} tiles {region_counts(plan)}")
+    print(f"plan: {len(plan)} tiles {region_counts(plan)} -> {raw_dir}")
+    refuse_nonempty_dir(raw_dir)
     if not args.execute:
         return 0
     refuse_on_collection_host()
-    print("done", collect(args.raw_dir, args.rpm, args.jitter))
-    return 0
+    summary = collect(raw_dir, args.rpm, args.jitter)
+    print("done", summary)
+    return 0 if summary["complete"] else 1
 
 
 if __name__ == "__main__":

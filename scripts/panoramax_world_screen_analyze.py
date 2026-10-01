@@ -4,18 +4,25 @@ Issue #406: derive the committed record of the 2026-10-01 candidate-city screen.
     python scripts/panoramax_world_screen_analyze.py --docs-dir docs/experiments
 
 Offline, no network. Reads the gitignored raw outputs of the research pass and
-writes the two committed artifacts `docs/experiments/panoramax-world-screen.md`
+writes the three committed artifacts `docs/experiments/panoramax-world-screen.md`
 quotes from:
 
 - `panoramax-world-screen_metrics.json` -- the request-log summary, the hexagon
   distribution, the place and cluster counts, the ranked new and already-tracked
   clusters, and the Mapillary half (its two Graph probes and its web-research
   table's catalog distances);
-- `panoramax-world-screen_clusters.csv` -- every screened cluster, ranked.
+- `panoramax-world-screen_clusters.csv` -- every screened cluster, ranked;
+- `panoramax-world-screen_places.csv` -- every place over the floor, ranked,
+  with the cluster it joined (so an anchor's bound is traceable to its place).
+
+It REFUSES (exit 65) a request log that is not exactly one complete pass over
+the collector's 235-tile plan: a missing, duplicated or extra tile, a non-empty
+non-200 status, or a `stop` record all mean the hexes describe something other
+than the screen this record claims.
 
 Inputs (all under `--raw-dir`, default the 2026-10-01 pass):
 
-    panoramax/hexes.csv           res-6 hexagons from panoramax_world_screen_collect.py
+    panoramax/hexes.csv           H3 hexagons from panoramax_world_screen_collect.py
     panoramax/requests.log        one JSON line per request (235 tiles + 4 searches)
     prod_catalog_cities.csv       a production catalog snapshot (city_id, lat, lon, enabled)
     mapillary/probe_results.jsonl the Graph API probes
@@ -38,9 +45,11 @@ THE DERIVATION, which reproduces the research pass's `places_ranked.csv` and
 4. A new cluster is a CANDIDATE at `CANDIDATE_MIN_360`, or at `CANDIDATE_MIN_360_NA`
    in the US and Canada (the deployment priority).
 
-Every bound is an UPPER BOUND, never coverage: a res-6 hexagon is ~36 km^2, and
-neighbouring places share hexagons, so their bounds double-count (the metrics
-file quantifies it).
+Every bound is an UPPER BOUND, never coverage: a hexagon is selected by its
+centre but counted whole, and neighbouring places share hexagons, so their
+bounds double-count (the metrics file quantifies it). The hexagons are H3 RES 7
+(~5.2 km^2) -- measured from the ids, recorded as `hexes.h3_resolution_counts`
+-- not the res 6 (~36 km^2) that #316's docs state.
 """
 
 from __future__ import annotations
@@ -55,9 +64,11 @@ import os
 import sys
 from typing import Any
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from experiment_stats import describe  # noqa: E402
+from panoramax_world_screen_collect import plan_tiles  # noqa: E402
 
 TOPIC = "panoramax-world-screen"
 PLACE_RADIUS_KM = 10.0
@@ -93,7 +104,36 @@ CLUSTER_FIELDS = [
     "catalog_city_id",
     "catalog_enabled",
     "catalog_km",
+    "anchor_name",
+    "anchor_in_catalog",
+    "anchor_catalog_city_id",
 ]
+
+PLACE_FIELDS = [
+    "rank",
+    "name",
+    "admin1",
+    "cc",
+    "lat",
+    "lon",
+    "ub_360_10km",
+    "ub_all_10km",
+    "n_hex",
+    "max_hex_360",
+    "newest_hex_date",
+    "in_catalog",
+    "catalog_city_id",
+    "catalog_km",
+    "cluster_rank",
+    "is_anchor",
+]
+
+KM_PER_DEG_LAT = 12742 * math.pi / 360  # ~111.19, the same Earth as haversine_km
+EMPTY_TILE_STATUSES = (204, 404)
+
+
+class IncompleteRecord(ValueError):
+    """The raw record is not one complete pass over the plan; nothing is written."""
 
 
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -128,10 +168,19 @@ class HexIndex:
 def nearest_catalog(
     lat: float, lon: float, catalog: list[dict[str, Any]], radius_km: float = CATALOG_RADIUS_KM
 ) -> tuple[float, dict[str, Any]] | None:
-    """The closest catalog city within `radius_km`, or None (the 25 km reuse rule)."""
+    """The closest catalog city within `radius_km`, or None (the 25 km reuse rule).
+
+    Prefiltered on LATITUDE only, which is safe everywhere (a degree of latitude
+    is the same length at every latitude); longitude is left to the haversine,
+    which handles the poles and the antimeridian. The research pass also cut at
+    0.6 degrees of longitude, which misses a 25 km match above ~68 degrees N
+    and across the antimeridian -- neither occurs in the 2026-10-01 regions, so
+    the record is unchanged by dropping it.
+    """
     best = None
+    lat_window = radius_km / KM_PER_DEG_LAT
     for c in catalog:
-        if abs(c["lat"] - lat) > 0.4 or abs(c["lon"] - lon) > 0.6:
+        if abs(c["lat"] - lat) > lat_window:
             continue
         d = haversine_km(lat, lon, c["lat"], c["lon"])
         if d <= radius_km and (best is None or d < best[0]):
@@ -182,10 +231,18 @@ def cluster_places(
 
 
 def summarize_cluster(cluster: dict[str, Any], catalog: list[dict[str, Any]]) -> dict[str, Any]:
-    """Steps 3-4 for one cluster: the reported row."""
+    """Steps 3-4 for one cluster: the reported row.
+
+    `anchor_in_catalog` repeats step 3 at the ANCHOR's point, the place whose
+    hexagons the bound was summed from. Step 3 is keyed on the population-chosen
+    NAME point instead, and the two disagree for a handful of clusters (listed in
+    the metrics as `tracked_split`), so "tracked" is a statement about where the
+    biggest town in the cluster is, not where the imagery is.
+    """
     anchor = cluster["anchor"]
     named = max(cluster["members"], key=lambda m: m["pop"])
     match = nearest_catalog(named["lat"], named["lon"], catalog)
+    anchor_match = nearest_catalog(anchor["lat"], anchor["lon"], catalog)
     na = named["cc"] in NORTH_AMERICA
     threshold = CANDIDATE_MIN_360_NA if na else CANDIDATE_MIN_360
     return {
@@ -205,7 +262,57 @@ def summarize_cluster(cluster: dict[str, Any], catalog: list[dict[str, Any]]) ->
         "catalog_city_id": match[1]["city_id"] if match else "",
         "catalog_enabled": match[1]["enabled"] if match else "",
         "catalog_km": round(match[0], 1) if match else "",
+        "anchor_name": anchor["name"],
+        "anchor_in_catalog": "yes" if anchor_match else "no",
+        "anchor_catalog_city_id": anchor_match[1]["city_id"] if anchor_match else "",
     }
+
+
+def h3_resolution(hex_id: str) -> int:
+    """An H3 cell's resolution: bits 52-55 of the 64-bit index (the second hex digit).
+
+    Example::
+
+        >>> h3_resolution("8728dc65dffffff")
+        7
+    """
+    return (int(hex_id, 16) >> 52) & 0xF
+
+
+def validate_tile_log(log: list[dict[str, Any]], plan: dict[tuple[int, int], str]) -> None:
+    """Raise IncompleteRecord unless `log` is exactly one complete pass over `plan`."""
+    problems = []
+    stops = [r for r in log if "stop" in r]
+    if stops:
+        problems.append(f"{len(stops)} stop record(s): {stops[0]['stop']!r}")
+    tiles = [r for r in log if "x" in r]
+    seen = collections.Counter((r["x"], r["y"]) for r in tiles)
+    duplicated = sorted(t for t, n in seen.items() if n > 1)
+    missing = sorted(set(plan) - set(seen))
+    extra = sorted(set(seen) - set(plan))
+    if duplicated:
+        problems.append(
+            f"{len(duplicated)} tile(s) logged more than once (two runs?), e.g. {duplicated[0]}"
+        )
+    if missing:
+        problems.append(f"{len(missing)} planned tile(s) never logged, e.g. {missing[0]}")
+    if extra:
+        problems.append(f"{len(extra)} tile(s) outside the plan, e.g. {extra[0]}")
+    bad = sorted(
+        {
+            str(r["status"])
+            for r in tiles
+            if r["status"] != 200 and r["status"] not in EMPTY_TILE_STATUSES
+        }
+    )
+    if bad:
+        problems.append(f"tile status(es) that are neither 200 nor empty: {', '.join(bad)}")
+    if [r["i"] for r in tiles] != list(range(len(tiles))):
+        problems.append("tile indices are not one run's 0..n-1 sequence")
+    if problems:
+        raise IncompleteRecord(
+            f"requests.log is not one complete {len(plan)}-tile pass: " + "; ".join(problems)
+        )
 
 
 # ── Loaders ────────────────────────────────────────────────────────────────
@@ -307,11 +414,14 @@ def summarize_requests(log: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def summarize_hexes(hexes: list[dict[str, Any]]) -> dict[str, Any]:
-    """The distribution of what the screen decoded, per res-6 hexagon."""
+    """The distribution of what the screen decoded, per hexagon."""
     with_360 = [h["nb_360_pictures"] for h in hexes if h["nb_360_pictures"] > 0]
     years = collections.Counter((h["date"] or "")[:4] or "none" for h in hexes)
+    resolutions = collections.Counter(h3_resolution(h["hex_id"]) for h in hexes)
     return {
         "n_hexes": len(hexes),
+        # Measured from the ids, not assumed: #316's docs say res 6.
+        "h3_resolution_counts": {str(k): v for k, v in sorted(resolutions.items())},
         "pictures_total": sum(h["nb_pictures"] for h in hexes),
         "pictures_360_total": sum(h["nb_360_pictures"] for h in hexes),
         "pictures_flat_total": sum(h["nb_flat_pictures"] for h in hexes),
@@ -356,7 +466,7 @@ def summarize_mapillary(
     }
 
 
-def build(raw_dir: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+def build(raw_dir: str) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
     paths = {
         "hexes": os.path.join(raw_dir, "panoramax", "hexes.csv"),
         "requests_log": os.path.join(raw_dir, "panoramax", "requests.log"),
@@ -365,13 +475,43 @@ def build(raw_dir: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         "mapillary_table": os.path.join(raw_dir, "mapillary", "candidates.csv"),
         "geonames": GEONAMES,
     }
+    tile_log = load_jsonl(paths["requests_log"])
+    validate_tile_log(tile_log, plan_tiles())
     hexes = load_hexes(paths["hexes"])
     catalog = load_catalog(paths["catalog"])
     places = load_geonames()
     ranked = place_bounds(places, HexIndex(hexes))
-    rows = [summarize_cluster(c, catalog) for c in cluster_places(ranked)]
-    for i, row in enumerate(rows, 1):
+    clusters = cluster_places(ranked)
+    rows = [summarize_cluster(c, catalog) for c in clusters]
+    cluster_rank: dict[int, int] = {}
+    anchors = {id(c["anchor"]) for c in clusters}
+    for i, (row, cluster) in enumerate(zip(rows, clusters, strict=True), 1):
         row["rank"] = i
+        for m in cluster["members"]:
+            cluster_rank[id(m)] = i
+    place_rows = []
+    for i, p in enumerate(ranked, 1):
+        match = nearest_catalog(p["lat"], p["lon"], catalog)
+        place_rows.append(
+            {
+                "rank": i,
+                "name": p["name"],
+                "admin1": p["admin1"],
+                "cc": p["cc"],
+                "lat": p["lat"],
+                "lon": p["lon"],
+                "ub_360_10km": p["ub_360"],
+                "ub_all_10km": p["ub_all"],
+                "n_hex": p["n_hex"],
+                "max_hex_360": p["max_hex_360"],
+                "newest_hex_date": p["newest_hex_date"],
+                "in_catalog": "yes" if match else "no",
+                "catalog_city_id": match[1]["city_id"] if match else "",
+                "catalog_km": round(match[0], 1) if match else "",
+                "cluster_rank": cluster_rank[id(p)],
+                "is_anchor": "yes" if id(p) in anchors else "no",
+            }
+        )
     new = [r for r in rows if r["in_catalog"] == "no"]
     tracked = [r for r in rows if r["in_catalog"] == "yes"]
     candidates = [r for r in new if r["candidate"] == "yes"]
@@ -417,12 +557,19 @@ def build(raw_dir: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
             "n_cities": len(catalog),
             "enabled": sum(c["enabled"] == "1" for c in catalog),
         },
-        "requests": summarize_requests(load_jsonl(paths["requests_log"])),
+        "requests": summarize_requests(tile_log),
         "hexes": summarize_hexes(hexes),
         "places": {
             "n_geonames": len(places),
             "n_with_bound_ge_min": len(ranked),
-            "n_new": sum(nearest_catalog(p["lat"], p["lon"], catalog) is None for p in ranked),
+            "n_new": sum(r["in_catalog"] == "no" for r in place_rows),
+            # Hexes are selected by centre, so a place deep inside dense imagery
+            # sees about one disc's worth: pi * 10^2 / that count is the area
+            # per hexagon, a check on the resolution read from the ids.
+            "n_hex_per_place": describe([p["n_hex"] for p in ranked], digits=1),
+            "implied_km2_per_hex_at_max_n_hex": round(
+                math.pi * PLACE_RADIUS_KM**2 / max(p["n_hex"] for p in ranked), 2
+            ),
             # Double counting, measured: the place bounds summed against the
             # hexagons they were summed from. Neighbouring places share hexes.
             "sum_of_place_bounds_360": sum(p["ub_360"] for p in ranked),
@@ -449,6 +596,22 @@ def build(raw_dir: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
             ),
             "new_by_country": dict(collections.Counter(r["cc"] for r in candidates).most_common()),
         },
+        # "Tracked" is keyed on the population-chosen name point (step 3).
+        # These are the clusters where the anchor's own point says otherwise.
+        "tracked_split": [
+            {
+                "rank": r["rank"],
+                "name": r["name"],
+                "anchor_name": r["anchor_name"],
+                "tracked_by_name": r["in_catalog"],
+                "tracked_by_anchor": r["anchor_in_catalog"],
+                "ub_360_10km": r["ub_360_10km"],
+                "catalog_city_id": r["catalog_city_id"],
+                "anchor_catalog_city_id": r["anchor_catalog_city_id"],
+            }
+            for r in rows
+            if r["in_catalog"] != r["anchor_in_catalog"]
+        ],
         "top_new": [brief(r) for r in new[:TOP_N]],
         "top_new_us_ca": [brief(r) for r in new if r["cc"] in NORTH_AMERICA][:TOP_N],
         "tracked": [brief(r) for r in tracked],
@@ -456,10 +619,15 @@ def build(raw_dir: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
             load_jsonl(paths["mapillary_probes"]), mapillary_table, catalog
         ),
     }
-    return metrics, rows
+    return metrics, rows, place_rows
 
 
-def write(metrics: dict[str, Any], rows: list[dict[str, Any]], docs_dir: str) -> None:
+def write(
+    metrics: dict[str, Any],
+    rows: list[dict[str, Any]],
+    place_rows: list[dict[str, Any]],
+    docs_dir: str,
+) -> None:
     with open(os.path.join(docs_dir, f"{TOPIC}_metrics.json"), "w") as f:
         json.dump(metrics, f, indent=2, ensure_ascii=False)
         f.write("\n")
@@ -467,6 +635,10 @@ def write(metrics: dict[str, Any], rows: list[dict[str, Any]], docs_dir: str) ->
         writer = csv.DictWriter(f, fieldnames=CLUSTER_FIELDS, lineterminator="\n")
         writer.writeheader()
         writer.writerows(rows)
+    with open(os.path.join(docs_dir, f"{TOPIC}_places.csv"), "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=PLACE_FIELDS, lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(place_rows)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -474,8 +646,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--raw-dir", default=DEFAULT_RAW_DIR)
     parser.add_argument("--docs-dir", default=os.path.join(REPO, "docs", "experiments"))
     args = parser.parse_args(argv)
-    metrics, rows = build(args.raw_dir)
-    write(metrics, rows, args.docs_dir)
+    try:
+        metrics, rows, place_rows = build(args.raw_dir)
+    except IncompleteRecord as exc:
+        print(f"REFUSED: {exc}", file=sys.stderr)
+        return 65
+    write(metrics, rows, place_rows, args.docs_dir)
     c = metrics["clusters"]
     print(
         f"{c['n']} clusters: {c['n_new']} new ({c['n_new_candidates']} candidates), {c['n_tracked']} tracked"

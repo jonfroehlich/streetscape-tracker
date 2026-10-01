@@ -143,6 +143,9 @@
   },
   "hexes": {
     "n_hexes": 261913,
+    "h3_resolution_counts": {
+      "7": 261913
+    },
     "pictures_total": 116562471,
     "pictures_360_total": 51980094,
     "pictures_flat_total": 64582377,
@@ -220,6 +223,17 @@
     "n_geonames": 33976,
     "n_with_bound_ge_min": 2180,
     "n_new": 1324,
+    "n_hex_per_place": {
+      "n": 2180,
+      "min": 3,
+      "p25": 37.0,
+      "p50": 50.0,
+      "p75": 61.0,
+      "p90": 68.0,
+      "p95": 70.0,
+      "max": 74
+    },
+    "implied_km2_per_hex_at_max_n_hex": 4.25,
     "sum_of_place_bounds_360": 180252634,
     "ratio_to_screen_360_total": 3.47
   },
@@ -310,6 +324,68 @@
       "CL": 1
     }
   },
+  "tracked_split": [
+    {
+      "rank": 10,
+      "name": "Cergy-Pontoise",
+      "anchor_name": "Herblay-sur-Seine",
+      "tracked_by_name": "no",
+      "tracked_by_anchor": "yes",
+      "ub_360_10km": 438620,
+      "catalog_city_id": "",
+      "anchor_catalog_city_id": "paris--ile-de-france--france"
+    },
+    {
+      "rank": 38,
+      "name": "Umraniye",
+      "anchor_name": "Sultanbeyli",
+      "tracked_by_name": "yes",
+      "tracked_by_anchor": "no",
+      "ub_360_10km": 109730,
+      "catalog_city_id": "istanbul--marmara-region--turkey",
+      "anchor_catalog_city_id": ""
+    },
+    {
+      "rank": 44,
+      "name": "Antwerp",
+      "anchor_name": "Willebroek",
+      "tracked_by_name": "no",
+      "tracked_by_anchor": "yes",
+      "ub_360_10km": 95750,
+      "catalog_city_id": "",
+      "anchor_catalog_city_id": "brussels--belgium"
+    },
+    {
+      "rank": 48,
+      "name": "Saint-Quentin-en-Yvelines",
+      "anchor_name": "Saint-Cyr-l'École",
+      "tracked_by_name": "no",
+      "tracked_by_anchor": "yes",
+      "ub_360_10km": 88221,
+      "catalog_city_id": "",
+      "anchor_catalog_city_id": "paris--ile-de-france--france"
+    },
+    {
+      "rank": 62,
+      "name": "Leuven",
+      "anchor_name": "Aarschot",
+      "tracked_by_name": "yes",
+      "tracked_by_anchor": "no",
+      "ub_360_10km": 66513,
+      "catalog_city_id": "brussels--belgium",
+      "anchor_catalog_city_id": ""
+    },
+    {
+      "rank": 92,
+      "name": "Aalst",
+      "anchor_name": "Ninove",
+      "tracked_by_name": "no",
+      "tracked_by_anchor": "yes",
+      "ub_360_10km": 40836,
+      "catalog_city_id": "",
+      "anchor_catalog_city_id": "brussels--belgium"
+    }
+  ],
   "top_new": [
     {
       "rank": 1,

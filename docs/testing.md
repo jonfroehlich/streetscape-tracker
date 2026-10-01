@@ -916,11 +916,15 @@ Every property is a way the study could publish a confident wrong number:
 
 ## The Panoramax candidate-city screen (issue #406)
 
-`tests/test_panoramax_world_screen.py` pins `scripts/panoramax_world_screen_{collect,analyze}.py`, offline; the raw outputs are gitignored, so nothing here reads them.
+`tests/test_panoramax_world_screen.py` pins `scripts/panoramax_world_screen_{collect,analyze}.py`, offline; the raw outputs are gitignored, so nothing here reads them (one check that the old evidence dir would be refused skips when it is absent).
+Every distance and threshold is asserted at a LITERAL value placed on both sides of it — the tests compute offsets on their own sphere and never read the module's constant back — and each was checked by mutating the constant and watching the test fail.
 
 - The sampling invariant: the region plan is the **235 tiles** the 2026-10-01 log records, split by region exactly as it was, a tile two regions share belongs to the first, and the dry run sends nothing.
-- The derivation on synthetic hexagons: the 10 km place radius from both sides, the 2,000-picture floor, a cluster reporting its ANCHOR's bound under its most POPULOUS member's name, the 20 km cluster radius, the 25 km catalog radius from both sides, and the US/Canada candidate threshold being the lower one.
-- The committed record against itself: request counts add to 239 with no refusal, the summary CSV regenerates every cluster count the metrics file carries (new, tracked, candidates, disabled), the ranked lists in the metrics are the CSV's rows in order, and no GeoNames population is published.
+- The collector cannot destroy a record: the default output is a fresh dated dir under the repo root, and a `panoramax/` dir that already holds files is refused by both `main` (dry run included) and `collect`, with the file left untouched.
+- The pass, over an injected `get` and pacer: `s` is the request's latency and excludes the pacer's sleep; a 429 stops after one attempt; an exhausted 5xx or transport error ends in a `stop` record, never an uncaught exception; the 250 cap counts retries; a plan over the cap is refused unsent.
+- The analyzer refuses a request log that is not one complete pass: a missing, repeated (two runs) or out-of-plan tile, a failed status, or a `stop` record.
+- The derivation: the 10 km place radius at 9.5 and 10.5 km; the 2,000 floor at 2,000 and 1,999; descending rank order; the 20 km cluster radius at 19.5 and 20.5 km, measured from the ANCHOR (a chain 15 + 15 km splits); a cluster taking its bound and max hex from the anchor, its name and point from the most populous member, and its newest date from any member; the candidate thresholds at 5,000/4,999 and, for both the US and Canada, 2,000/1,999 (Mexico stays at 5,000); the 25 km catalog radius at 24.9 and 25.1 km; a match found at 70°N and across the antimeridian; tracked-by-name vs tracked-by-anchor reported separately; the H3 resolution read from an id.
+- The committed record: its `parameters` equal both the literal values the writeup quotes and the module's constants, its hexagons are all resolution 7, request counts add to 239 with no refusal, the cluster CSV regenerates every cluster count and the `tracked_split` list, the ranked lists are the CSV's rows in order, each cluster's bound is its anchor place's row in the places CSV, and no GeoNames population is published.
 
 ## Frontend node tests
 
