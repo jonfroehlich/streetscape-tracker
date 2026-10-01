@@ -22,7 +22,7 @@ import os
 import sqlite3
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
 
 from . import clock
@@ -30,9 +30,23 @@ from .naming import sanitize_city_query_str
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 17
 
-_SCHEMA = """
+# The v16 per-host ledger (issue #385). One constant, spliced into _SCHEMA
+# below AND executed by _migrate_v15_to_v16, which runs before _SCHEMA and needs
+# the table to backfill into -- so the two can never drift apart.
+_HOST_USAGE_DDL = """
+CREATE TABLE IF NOT EXISTS host_usage (
+    recorded_at TEXT NOT NULL,
+    host        TEXT NOT NULL,
+    provider    TEXT NOT NULL,
+    requests    INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS host_usage_host_time ON host_usage(host, recorded_at);
+"""
+
+_SCHEMA = (
+    """
 CREATE TABLE IF NOT EXISTS cities (
     city_id        TEXT PRIMARY KEY,
     display_name   TEXT NOT NULL,
@@ -103,6 +117,15 @@ CREATE TABLE IF NOT EXISTS runs (
     -- which reads a CSV off disk and cannot know.
     census_fetched_by   TEXT,
     census_fetched_at   TEXT,
+    -- GSV query radius (v17, issue #367). status_out_of_radius counts rows
+    -- whose pano lay beyond query_radius_m of its query point and so were read
+    -- as uncovered (analysis.OUT_OF_RADIUS; split out of status_other like
+    -- status_flat_only). query_radius_m is the tolerance the row's stats were
+    -- computed under -- 50.0 for gsv, NULL for census providers the rule does
+    -- not apply to, and NULL for every row not yet recomputed since v17, which
+    -- is the honest "computed before the rule existed".
+    status_out_of_radius INTEGER,
+    query_radius_m      REAL,
     UNIQUE (city_id, provider, run_date)
 );
 CREATE INDEX IF NOT EXISTS idx_runs_city_date
@@ -392,7 +415,30 @@ CREATE TABLE IF NOT EXISTS provider_screen (
 -- with city_id and cannot serve that.
 CREATE INDEX IF NOT EXISTS idx_provider_screen_date
     ON provider_screen(provider, screen_date);
+
+-- v16 (issue #385): a TIMESTAMPED per-host spend ledger beside api_usage.
+-- api_usage is keyed by (usage_date, provider), so it cannot answer "how much
+-- has this per-IP host taken in the last 24 h" -- neither across the two
+-- channels that share a host nor across a UTC date boundary. Block 4
+-- (2026-09-28) fell through exactly that gap: a daytime catch-up charged to
+-- the next UTC date plus the following night, ~4,600 tile requests in ~24.5 h,
+-- with neither channel's daily row over its budget.
+--
+-- One row per add_api_usage call on a channel in
+-- download_common.CHANNEL_METERED_HOST, stamped when the call is made. A
+-- child records its spend when it FINISHES, so a long crawl's whole spend is
+-- stamped at its end: that shifts it LATER within any window, which makes the
+-- rolling gate slightly more conservative on the following night, never less.
+--
+-- Append-only and pruned in the nightly tail (prune_host_usage, 30 days):
+-- the window needs 24 h and forensics a few days more.
+--
+-- recorded_at is _utc_iso(clock.utc_now()), always UTC with a +00:00 offset,
+-- so lexical order IS chronological order and get_host_usage compares strings.
+-- The DDL itself is _HOST_USAGE_DDL, appended below.
 """
+    + _HOST_USAGE_DDL
+)
 
 # v1 → v2: add the provider dimension. Three tables need constraint changes
 # (a widened UNIQUE / composite PKs), which SQLite only supports via the
@@ -611,6 +657,9 @@ class RunRow:
     # get_latest_run raises on every catalog at v14.
     census_fetched_by: str | None = None
     census_fetched_at: str | None = None
+    # v17 (issue #367); defaulted for the same SELECT * reason as v14's pair.
+    status_out_of_radius: int | None = None
+    query_radius_m: float | None = None
 
 
 def utc_now_iso() -> str:
@@ -728,7 +777,26 @@ def init_schema(conn: sqlite3.Connection) -> None:
     # below records the upgrade.
     if user_version == 14:
         user_version = 15
+    # v15 -> v16 (issue #385): the host_usage table, BACKFILLED from the last
+    # two UTC dates of api_usage so the first night after deploy is gated.
+    if user_version == 15:
+        _migrate_v15_to_v16(conn)
+        user_version = 16
+    # v16 -> v17 (issue #367): the GSV query-radius pair on `runs`. Keyed on
+    # 16 so a v15 catalog takes BOTH rungs in order. The step itself is the
+    # unconditional _migrate_add_query_radius_columns call below; it is run here
+    # too so the rung that records the upgrade is the one that performed it.
+    if user_version == 16:
+        _migrate_add_query_radius_columns(conn)
+        user_version = 17
     conn.executescript(_SCHEMA)
+    # The GSV query-radius pair (issue #367) is ALSO added on every connect, not
+    # only on its rung: while in flight it and PR #388 both stamped v16, so a
+    # catalog touched by either branch alone can read user_version >= 16 without
+    # these columns, and a rung-gated step would then never fire. It is idempotent
+    # per column, so on a current catalog it is one PRAGMA table_info and nothing else.
+    # After executescript(_SCHEMA), so a fresh catalog (built current) is a no-op.
+    _migrate_add_query_radius_columns(conn)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
 
@@ -983,6 +1051,38 @@ def _migrate_v13_to_v14(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+# The v17 query-radius columns on `runs`, name -> SQL type, in DDL order. Named
+# once so the migration and its idempotency guard cannot drift apart.
+_QUERY_RADIUS_RUN_COLUMNS = {"status_out_of_radius": "INTEGER", "query_radius_m": "REAL"}
+
+
+def _migrate_add_query_radius_columns(conn: sqlite3.Connection) -> None:
+    """Add the GSV query-radius pair to runs (v17, issue #367).
+
+    Named by what it adds rather than by version number. init_schema calls it
+    from the v16 -> v17 rung AND on every connect: while in flight this change
+    also stamped v16, colliding with PR #388's host_usage, so a dev catalog
+    stamped v16 or v17 by either branch alone can lack these columns and must
+    still gain them. Idempotent like
+    _migrate_v13_to_v14 -- each ADD COLUMN is skipped when the column already
+    exists, so an interrupted migration completes on the next connect -- and an
+    absent table means the CREATE TABLE in _SCHEMA below builds it current.
+
+    No DEFAULT, deliberately: NULL is "computed before the rule existed", and
+    inventing a 0 would claim every historical run had been checked.
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)").fetchall()}
+    if not cols:
+        return
+    missing = [c for c in _QUERY_RADIUS_RUN_COLUMNS if c not in cols]
+    if not missing:
+        return
+    logger.info(f"Migrating catalog: adding GSV query-radius columns (runs: {', '.join(missing)})")
+    for column in missing:
+        conn.execute(f"ALTER TABLE runs ADD COLUMN {column} {_QUERY_RADIUS_RUN_COLUMNS[column]}")
+    conn.commit()
+
+
 def derive_city_id(city_name: str, state_name: str | None, country_name: str | None) -> str:
     """
     Canonical city id: the sanitized slug of the full (never abbreviated)
@@ -1212,6 +1312,8 @@ def register_run(
     api_requests: int | None = None,
     census_fetched_by: str | None = None,
     census_fetched_at: str | None = None,
+    status_out_of_radius: int | None = None,
+    query_radius_m: float | None = None,
 ) -> int:
     """
     Register a completed collection run. Raises sqlite3.IntegrityError if a
@@ -1228,9 +1330,10 @@ def register_run(
             status_flat_only, status_other, unique_panos, unique_google_panos,
             coverage_rate_pct, any_imagery_coverage_rate_pct, num_flat_images,
             oldest_capture_date, newest_capture_date, median_pano_age_years,
-            api_requests, census_fetched_by, census_fetched_at)
+            api_requests, census_fetched_by, census_fetched_at,
+            status_out_of_radius, query_radius_m)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                   ?, ?)""",
+                   ?, ?, ?, ?)""",
         (
             city_id,
             provider,
@@ -1258,6 +1361,8 @@ def register_run(
             api_requests,
             census_fetched_by,
             census_fetched_at,
+            status_out_of_radius,
+            query_radius_m,
         ),
     )
     conn.commit()
@@ -1377,9 +1482,80 @@ def record_diff(
     return cur.lastrowid
 
 
+def update_diff(
+    conn: sqlite3.Connection,
+    diff_id: int,
+    *,
+    grid_aligned: bool,
+    panos_added: int,
+    panos_removed: int,
+    panos_persisted: int,
+    capture_date_changed: int,
+    points_gained_coverage: int | None,
+    points_lost_coverage: int | None,
+    coverage_delta_pct: float | None,
+    detail_filename: str | None,
+) -> None:
+    """
+    Overwrite an existing diff's recomputed columns IN PLACE, keeping its
+    ``diff_id`` (issue #245's repair handle, ``scripts/recompute_run_diffs.py``).
+
+    Not ``record_diff``: that is INSERT OR REPLACE on (from_run_id, to_run_id),
+    which deletes the row and inserts a new one under a NEW ``diff_id``. The id
+    is not cosmetic — ``get_latest_runs_all`` and ``get_diff_for_run`` pick the
+    MAX ``diff_id`` per ``to_run_id`` ("the most recently computed comparison
+    wins"), so re-recording an OLDER comparison into a run that also has a newer
+    one would silently change which baseline the published change blocks
+    advertise. A repair must not change which comparison is current.
+
+    ``computed_at`` IS refreshed: the row's numbers were recomputed now, and the
+    column records when, not when the pair was first compared. The identity
+    columns (city_id, from_run_id, to_run_id) are never touched.
+
+    Raises ``LookupError`` when no row has ``diff_id`` — a repair that updated
+    nothing must not read as one that succeeded.
+    """
+    cur = conn.execute(
+        """UPDATE run_diffs SET
+             grid_aligned = ?, panos_added = ?, panos_removed = ?, panos_persisted = ?,
+             capture_date_changed = ?, points_gained_coverage = ?,
+             points_lost_coverage = ?, coverage_delta_pct = ?, detail_filename = ?,
+             computed_at = ?
+           WHERE diff_id = ?""",
+        (
+            int(grid_aligned),
+            panos_added,
+            panos_removed,
+            panos_persisted,
+            capture_date_changed,
+            points_gained_coverage,
+            points_lost_coverage,
+            coverage_delta_pct,
+            detail_filename,
+            utc_now_iso(),
+            diff_id,
+        ),
+    )
+    if cur.rowcount != 1:
+        conn.rollback()
+        raise LookupError(f"run_diffs has no row with diff_id {diff_id}")
+    conn.commit()
+
+
 def get_diff_for_run(conn: sqlite3.Connection, to_run_id: int) -> sqlite3.Row | None:
-    """The diff whose 'to' side is the given run, or None."""
-    return conn.execute("SELECT * FROM run_diffs WHERE to_run_id = ?", (to_run_id,)).fetchone()
+    """The diff whose 'to' side is the given run, or None.
+
+    When a run has been diffed against two predecessors (an earlier run was
+    purged and the diff recomputed), the newest ``diff_id`` wins — the same
+    explicit choice ``get_latest_runs_all`` makes, so the per-run JSON's
+    replayed change block, the aggregate's ``change`` block and the driving
+    page cannot advertise different baselines for one run. An unordered
+    ``fetchone`` here returned whichever row SQLite scanned first.
+    """
+    return conn.execute(
+        "SELECT * FROM run_diffs WHERE to_run_id = ? ORDER BY diff_id DESC LIMIT 1",
+        (to_run_id,),
+    ).fetchone()
 
 
 def get_latest_runs_all(conn: sqlite3.Connection) -> list[sqlite3.Row]:
@@ -1819,26 +1995,155 @@ def get_walk_diff_for_walk(conn: sqlite3.Connection, to_walk_id: int) -> sqlite3
     ).fetchone()
 
 
-def delete_walk_diff_for_walk(conn: sqlite3.Connection, to_walk_id: int) -> None:
-    """Drop any recorded diff whose 'to' side is the given walk.
+def delete_walk_diff_for_walk(conn: sqlite3.Connection, to_walk_id: int) -> list[str]:
+    """Drop any recorded diff whose 'to' side is the given walk, returning the
+    detail filenames the deleted rows pointed at (NULL ``detail_filename``
+    omitted).
 
     A same-day re-collection replaces the walk's street_walks row in place
     (the register upsert keeps walk_id), so a diff recorded against the
     replaced artifact is stale the moment the walk is re-registered. The
     orchestrator clears it before deciding whether a fresh diff is possible;
-    a no-op when no diff exists (every nightly walk).
+    a no-op returning ``[]`` when no diff exists (every nightly walk).
+
+    The names are returned because this function touches no files, and the
+    row is the only durable record of which published file it vouched for
+    (issue #265): the caller deletes exactly those files. Removing by the
+    row's own pointer is what stays correct if the walk's predecessor has
+    changed since the diff was recorded — a name re-derived from TODAY's
+    predecessor would miss the file the old row named.
     """
+    rows = conn.execute(
+        "SELECT detail_filename FROM street_walk_diffs WHERE to_walk_id = ?", (to_walk_id,)
+    ).fetchall()
     conn.execute("DELETE FROM street_walk_diffs WHERE to_walk_id = ?", (to_walk_id,))
     conn.commit()
+    return [row["detail_filename"] for row in rows if row["detail_filename"]]
+
+
+# Which UTC dates of api_usage the v16 backfill seeds from: today and
+# yesterday. Two, because a rolling 24 h window read at any time of day can
+# reach back into yesterday's UTC date and no further.
+_HOST_USAGE_BACKFILL_DAYS = 2
+
+
+def _migrate_v15_to_v16(conn: sqlite3.Connection) -> None:
+    """Create ``host_usage`` and seed it from recent ``api_usage`` (v16, issue #385).
+
+    Creates the table itself rather than leaving it to ``_SCHEMA``, because the
+    migration chain runs BEFORE ``executescript(_SCHEMA)`` and the backfill
+    needs somewhere to write.
+
+    **Why a backfill at all:** without one, the first night after deploy reads
+    an empty window and is ungated -- the rolling host budget would start
+    counting from zero on precisely the night after whatever burst prompted it.
+    So every ``api_usage`` row of a channel in ``CHANNEL_METERED_HOST`` whose
+    ``usage_date`` is today or yesterday (UTC, from ``clock.snapshot_date_today``)
+    becomes one ``host_usage`` row.
+
+    **Stamped CONSERVATIVELY, at the latest instant the spend can have
+    happened:** ``min(23:59:59 UTC of its usage_date, the migration's own
+    clock)``. The daily row cannot say when inside its date the requests were
+    made, and the stamp decides when they LEAVE the window, so every other
+    choice under-counts some real spend. Noon was the first choice and the
+    wrong one: prod's night runs ~09:00-21:00 UTC, so most of a night's spend
+    lands after noon, and a noon stamp released it at 12:00 UTC the next day --
+    three hours into the very night the backfill exists to protect -- while
+    ~3/4 of that spend was still inside the true 24 h.
+
+    The cost of the late stamp is fail-closed and bounded: yesterday's spend
+    stays in the window until 23:59:59 UTC today, and today's (at most) until
+    the migration's clock plus 24 h, so the first night after deploy may defer
+    up to one night more than a timestamped ledger would have. That is the
+    direction a staging guard should err in; it never ages out EARLIER than the
+    real spend would have.
+
+    gsv/gsv_streets rows are never backfilled -- they are not in the metered
+    map, because Google meters by project, not by IP.
+
+    Idempotent and race-safe: the empty-table check and the inserts share one
+    ``BEGIN IMMEDIATE`` transaction, so two processes connecting to a v15
+    catalog at once cannot both find the table empty and double-seed it (the
+    second waits on the write lock, then finds the first's rows). A catalog
+    interrupted after the create, or a hand re-run, seeds nothing either.
+    """
+    # Lazy for the reason add_api_usage's is: see there.
+    from .download_common import CHANNEL_METERED_HOST
+
+    conn.executescript(_HOST_USAGE_DDL)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if conn.execute("SELECT 1 FROM host_usage LIMIT 1").fetchone() is not None:
+            conn.rollback()
+            return
+        has_api_usage = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'api_usage'"
+        ).fetchone()
+        if has_api_usage is None:
+            conn.rollback()
+            return
+        now = clock.utc_now()
+        today = clock.snapshot_date_today()
+        since = today - timedelta(days=_HOST_USAGE_BACKFILL_DAYS - 1)
+        rows = conn.execute(
+            "SELECT usage_date, provider, requests FROM api_usage WHERE usage_date >= ?",
+            (since.isoformat(),),
+        ).fetchall()
+        seeded = 0
+        for usage_date, provider, requests in rows:
+            host = CHANNEL_METERED_HOST.get(provider)
+            if host is None or not requests or requests <= 0:
+                continue
+            end_of_date = datetime.combine(
+                date.fromisoformat(usage_date), time(23, 59, 59), tzinfo=UTC
+            )
+            conn.execute(
+                "INSERT INTO host_usage (recorded_at, host, provider, requests) "
+                "VALUES (?, ?, ?, ?)",
+                (_utc_iso(min(end_of_date, now)), host, provider, requests),
+            )
+            seeded += 1
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    logger.info(f"Migrating catalog schema v15 -> v16 (host_usage, {seeded} row(s) backfilled)")
 
 
 # ── API budget ledger ──────────────────────────────────────────────────────
 
 
 def add_api_usage(
-    conn: sqlite3.Connection, usage_date: date, n: int, provider: str = "gsv"
+    conn: sqlite3.Connection,
+    usage_date: date,
+    n: int,
+    provider: str = "gsv",
+    *,
+    meter_host: bool = True,
 ) -> None:
-    """Add n requests to the given (date, provider) ledger row."""
+    """Add n requests to the given (date, provider) ledger row.
+
+    Also THE write seam of the per-host rolling ledger (issue #385): when
+    ``meter_host`` is true, ``provider`` is in
+    ``download_common.CHANNEL_METERED_HOST`` and ``n > 0``, one ``host_usage``
+    row is stamped ``_utc_iso(clock.utc_now())`` beside the daily one. One seam, so
+    no call site -- the grid CLI, the road walk, the Panoramax screen -- can
+    forget it, and config-independent, so the ledger is complete whatever the
+    ``[hosts.*]`` budgets say.
+
+    ``meter_host=False`` is for spend that did NOT come from this machine's IP:
+    ``bundle_import`` lands a laptop's ledger, and charging it to this host's
+    rolling window would defer tonight's work over requests another address
+    made.
+    """
+    # Imported here, not at module level, only to keep db's own module-level
+    # imports what they were before #385 (stdlib, clock, naming) and to keep a
+    # db -> download_common edge out of the import graph, where a future import
+    # the other way would make it a cycle. It buys no independence from numpy:
+    # the package __init__ imports download_gsv, so any submodule import loads
+    # the full stack regardless.
+    from .download_common import CHANNEL_METERED_HOST
+
     conn.execute(
         """INSERT INTO api_usage (usage_date, provider, requests)
            VALUES (?, ?, ?)
@@ -1846,7 +2151,45 @@ def add_api_usage(
            DO UPDATE SET requests = requests + ?""",
         (usage_date.isoformat(), provider, n, n),
     )
+    host = CHANNEL_METERED_HOST.get(provider)
+    if meter_host and host is not None and n > 0:
+        conn.execute(
+            "INSERT INTO host_usage (recorded_at, host, provider, requests) VALUES (?, ?, ?, ?)",
+            (_utc_iso(clock.utc_now()), host, provider, n),
+        )
     conn.commit()
+
+
+def _utc_iso(when: datetime) -> str:
+    """``when`` as the UTC ISO string ``host_usage.recorded_at`` is compared in.
+
+    Refuses a naive datetime rather than guessing its zone: the comparison is
+    lexical, and a naive string sorts as if it were UTC whatever it meant.
+    """
+    if when.tzinfo is None or when.utcoffset() is None:
+        raise ValueError(f"host_usage windows need an aware datetime, got naive {when!r}")
+    return when.astimezone(UTC).isoformat()
+
+
+def get_host_usage(conn: sqlite3.Connection, host: str, since: datetime) -> int:
+    """Requests recorded against per-IP ``host`` at or after ``since`` (issue #385).
+
+    INCLUSIVE at ``since``: a row stamped exactly ``now - 24h`` still counts,
+    one a second earlier does not. Every channel on the host is summed -- the
+    whole point is that the two Mapillary channels share one IP and one CDN.
+    """
+    row = conn.execute(
+        "SELECT COALESCE(SUM(requests), 0) FROM host_usage WHERE host = ? AND recorded_at >= ?",
+        (host, _utc_iso(since)),
+    ).fetchone()
+    return int(row[0])
+
+
+def prune_host_usage(conn: sqlite3.Connection, before: datetime) -> int:
+    """Delete ``host_usage`` rows stamped strictly before ``before``; return the count."""
+    cur = conn.execute("DELETE FROM host_usage WHERE recorded_at < ?", (_utc_iso(before),))
+    conn.commit()
+    return cur.rowcount
 
 
 def get_api_usage(conn: sqlite3.Connection, usage_date: date, provider: str = "gsv") -> int:

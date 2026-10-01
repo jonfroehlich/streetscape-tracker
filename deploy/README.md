@@ -428,8 +428,9 @@ county, and the remainder was largely Cincinnati — whose dense recent GSV woul
 have flattered every figure quoted to the partner. Newport, KY scores 46% on
 today's geometry. When the fraction is low, consider a compact city grid
 alongside the county: pass `--width/--height` **together with `--lat/--lng`**
-(size alone is refused, because it would freeze the grid on the OSM bounding-box
-midpoint rather than downtown — and geometry is frozen forever).
+(size alone is refused, because it would freeze the grid on the geocoder's
+reported point, which is not verified to be downtown — and geometry is frozen
+forever).
 
 Notes:
 

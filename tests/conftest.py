@@ -905,3 +905,40 @@ def panoramax_screen_fetch(upper_bound=None, *, error=None, calls=None):
         )
 
     return fetch
+
+
+class FakeCrawlClock:
+    """A monotonic clock a test advances by hand, as seen by the crawl deadline.
+
+    Starts at ``download_common.PROCESS_STARTED_MONOTONIC``, so a deadline built
+    the way the CLI builds it (``crawl_deadline_from_budget(N)``) is N seconds
+    ahead and the stop message prints N.
+    """
+
+    def __init__(self, start: float) -> None:
+        self.now = start
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+@pytest.fixture
+def fake_crawl_clock(monkeypatch):
+    """
+    Replace the clock ``download_common.crawl_deadline_passed`` reads (issue #344).
+
+    Patched as ``download_common.time`` -- a module whose only use of ``time`` is
+    that deadline check -- rather than ``time.monotonic`` globally, which the
+    asyncio event loop also reads. Returns the :class:`FakeCrawlClock`; a fake
+    fetch calls ``advance`` to make the crawl slow without making the test slow.
+    """
+    from types import SimpleNamespace
+
+    from streetscape_metadata_tracker import download_common
+
+    fake = FakeCrawlClock(download_common.PROCESS_STARTED_MONOTONIC)
+    monkeypatch.setattr(download_common, "time", SimpleNamespace(monotonic=fake.monotonic))
+    return fake

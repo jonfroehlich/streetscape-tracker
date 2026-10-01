@@ -147,8 +147,10 @@ def test_v1_import_end_to_end(source_root, data_dir, tmp_path):
     # No diff: archival runs are the city's earliest
     assert conn.execute("SELECT COUNT(*) FROM run_diffs").fetchone()[0] == 0
 
-    # The written artifact round-trips through the canonical loader
-    df = load_city_csv_file(os.path.join(data_dir, run.csv_filename))
+    # The written artifact round-trips through the canonical loader. raw=True:
+    # this pins what is ON DISK, and the default read adds the derived
+    # query_distance_m column (issue #367).
+    df = load_city_csv_file(os.path.join(data_dir, run.csv_filename), raw=True)
     assert list(df.columns) == [
         "query_lat",
         "query_lon",

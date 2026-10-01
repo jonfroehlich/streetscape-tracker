@@ -665,7 +665,17 @@ def apply_bundle(
             continue
         # The bundle's own usage_date, not today's: api_usage is a per-day
         # record of what a credential spent, and the spend happened then.
-        db.add_api_usage(conn, date.fromisoformat(row["usage_date"]), requests, provider=provider)
+        #
+        # meter_host=False (issue #385): the spend happened on the LAPTOP's IP,
+        # so it must not count against this host's rolling-24h window. The
+        # daily row is still charged, for the credential-sharing reason above.
+        db.add_api_usage(
+            conn,
+            date.fromisoformat(row["usage_date"]),
+            requests,
+            provider=provider,
+            meter_host=False,
+        )
         result.usage.append((row["usage_date"], provider, requests))
 
     conn.commit()
