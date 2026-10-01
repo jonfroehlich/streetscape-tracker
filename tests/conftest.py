@@ -838,6 +838,75 @@ def pacific_local_zone():
         time.tzset()
 
 
+def panoramax_screen_fetch(upper_bound=None, *, error=None, calls=None):
+    """
+    A stand-in for ``panoramax_screen._fetch_tile``, the screen's fetch primitive.
+
+    The one-city Panoramax screen that gates opt-in enrolment (issue #374) runs
+    the weekly screen's real code path, so a test substitutes only the fetch —
+    exactly as ``tests/test_panoramax_screen.py`` does — and everything from the
+    decoder to the ``provider_screen`` row runs for real.
+
+    * ``upper_bound=N`` answers every tile with the WHOLE tile as one hexagon
+      holding ``N`` pictures — the same hexagon id on every tile, so the
+      screen's merge-by-MAX reads ``N`` even for a city straddling two tiles
+      (``0`` is a conclusive zero, not a missing layer).
+    * ``error=exc`` raises ``exc`` instead (e.g. ``aiohttp.ClientError`` for a
+      connection fault; a 429 is best driven through the real fetch instead).
+
+    ``calls``, when given a list, collects each requested URL.
+    """
+    import math
+
+    import mapbox_vector_tile
+
+    from streetscape_metadata_tracker import panoramax_screen as ps
+    from streetscape_metadata_tracker.download_common import lonlat_to_tile_frac
+
+    async def fetch(session, url, timeout, limiter=None, on_request=None, on_empty=None):
+        if calls is not None:
+            calls.append(url)
+        if on_request is not None:
+            on_request()
+        if error is not None:
+            raise error
+        z, x, y = (int(p) for p in url.removesuffix(".mvt").rsplit("/", 3)[1:])
+        n = 2**z
+
+        def lat(row):
+            return math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * row / n))))
+
+        west, east = x / n * 360 - 180, (x + 1) / n * 360 - 180
+        north, south = lat(y), lat(y + 1)
+        box = (west, south, east, north)
+        ring = []
+        for lon, la in ((box[0], box[1]), (box[2], box[1]), (box[2], box[3]), (box[0], box[3])):
+            fx, fy = lonlat_to_tile_frac(lon, la, z)
+            ring.append(((fx - x) * 4096, (1 - (fy - y)) * 4096))
+        ring.append(ring[0])
+        props = {
+            "id": "one-hexagon-everywhere",
+            "nb_pictures": upper_bound,
+            "nb_360_pictures": upper_bound,
+            "nb_flat_pictures": 0,
+        }
+        return mapbox_vector_tile.encode(
+            [
+                {
+                    "name": ps.SCREEN_LAYER,
+                    "features": [
+                        {
+                            "geometry": {"type": "Polygon", "coordinates": [ring]},
+                            "properties": props,
+                        }
+                    ],
+                }
+            ]
+        )
+
+    return fetch
+
+
 class FakeCrawlClock:
     """A monotonic clock a test advances by hand, as seen by the crawl deadline.
 

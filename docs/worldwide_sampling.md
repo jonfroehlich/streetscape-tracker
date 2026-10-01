@@ -175,9 +175,10 @@ scheduler host (makelab2), after the merged code is deployed there.
    before enabling them: `scripts/audit_city_boundaries.py` →
    `scripts/build_boundary_review.py` → human review →
    `scripts/apply_decisions.py`. Swap rejects from `worldwide_candidates.csv`.
-3. **Enable in the scheduler.** Set the vetted cities `enabled = 1`. Provider
-   enablement stays global (both GSV and Mapillary); the scheduler staggers the
-   cities over its cycle.
+3. **Enable in the scheduler.** `scheduler enable-city CITY` for each vetted
+   city (issue #374), which also enrols it on the opt-in channels behind their
+   gates (`docs/operations.md`). Default-membership channels stay global (GSV
+   and Mapillary); the scheduler staggers the cities over its cycle.
 
 ## Purposive additions (non-frame manifests)
 

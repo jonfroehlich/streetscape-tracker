@@ -28,7 +28,12 @@ from streetscape_metadata_tracker.scheduler import (
     SchedulerConfig,
     cmd_import_bundle,
 )
-from tests.conftest import make_city_df, make_mapillary_city_df, write_city_csv_gz
+from tests.conftest import (
+    make_city_df,
+    make_mapillary_city_df,
+    panoramax_screen_fetch,
+    write_city_csv_gz,
+)
 
 RUN_DATE = date(2026, 9, 10)
 CITY = dict(
@@ -179,6 +184,24 @@ def cfg(tmp_path):
             "mapillary": ProviderConfig(),
             "mapillary_streets": ProviderConfig(),
         },
+    )
+
+
+@pytest.fixture(autouse=True)
+def _no_panoramax_screen_network(monkeypatch):
+    """
+    `--enable` screens the city against Panoramax to gate its opt-in enrolment
+    (issue #374). By default that fetch fails as a connection fault would, so
+    nothing reaches the host; the #374 tests install their own answer.
+    """
+    import aiohttp
+
+    from streetscape_metadata_tracker import panoramax_screen
+
+    monkeypatch.setattr(
+        panoramax_screen,
+        "_fetch_tile",
+        panoramax_screen_fetch(error=aiohttp.ClientError("the suite never reaches Panoramax")),
     )
 
 
@@ -816,6 +839,159 @@ def test_every_problem_is_reported_not_just_the_first(cfg, bundle_dir, capsys):
     out = capsys.readouterr().out
     assert "refusing to collide" in out
     assert "append-only" in out
+
+
+# ── opt-in enrolment when --enable turns the city on (issue #374) ─────────
+
+OPT_IN = ("kartaview", "kartaview_streets", "panoramax", "panoramax_streets")
+
+
+def _screen(monkeypatch, upper_bound):
+    from streetscape_metadata_tracker import panoramax_screen
+
+    calls = []
+    monkeypatch.setattr(
+        panoramax_screen, "_fetch_tile", panoramax_screen_fetch(upper_bound, calls=calls)
+    )
+    return calls
+
+
+def _opt_in_members(cfg):
+    return {
+        r["provider"]: r["member"]
+        for r in _prod(cfg).execute(
+            "SELECT provider, member FROM schedule_state WHERE city_id = ? AND provider IN "
+            "(?, ?, ?, ?)",
+            (CITY_ID, *OPT_IN),
+        )
+    }
+
+
+def test_enable_execute_enrols_the_new_city_on_the_opt_in_channels(cfg, bundle_dir, monkeypatch):
+    _screen(monkeypatch, 42)
+    assert cmd_import_bundle(cfg, str(bundle_dir), execute=True, enable=True) == 0
+    # San Luis Obispo's KartaView estimate is 115, under the 1,000 ceiling.
+    assert _opt_in_members(cfg) == dict.fromkeys(OPT_IN, 1)
+
+
+def test_enable_without_execute_prints_the_decisions_and_writes_nothing(
+    cfg, bundle_dir, monkeypatch, capsys
+):
+    calls = _screen(monkeypatch, 42)
+    assert cmd_import_bundle(cfg, str(bundle_dir), enable=True) == 0
+    out = capsys.readouterr().out
+    assert "opt-in enrolment (#374; DRY RUN, nothing written)" in out
+    assert "would enrol" in out
+    assert calls == [], "the dry run issues no provider request"
+    assert _prod(cfg).execute("SELECT COUNT(*) FROM schedule_state").fetchone()[0] == 0
+
+
+def test_enable_on_an_already_enabled_city_enrols_nothing(cfg, bundle_dir, monkeypatch):
+    """Only an import that ENABLES the city is a new city; this one is not (no backfill)."""
+    conn = db.connect(cfg.db_path)
+    db.register_city(conn, **CITY, enabled=True)
+    conn.close()
+    calls = _screen(monkeypatch, 42)
+    assert cmd_import_bundle(cfg, str(bundle_dir), execute=True, enable=True) == 0
+    assert _opt_in_members(cfg) == {}
+    assert calls == []
+
+
+def test_no_opt_in_on_import_writes_no_opt_in_row(cfg, bundle_dir, monkeypatch):
+    calls = _screen(monkeypatch, 42)
+    assert cmd_import_bundle(cfg, str(bundle_dir), execute=True, enable=True, opt_in=False) == 0
+    assert _opt_in_members(cfg) == {}
+    assert calls == []
+
+
+def test_import_bundle_parses_the_opt_in_flags():
+    from streetscape_metadata_tracker.scheduler import build_parser
+
+    args = build_parser().parse_args(["import-bundle", "d", "--enable", "--no-opt-in"])
+    assert args.no_opt_in is True and args.enroll_kartaview is False
+
+
+def _relabel_grid_run_as_kartaview(bundle_dir, api_requests):
+    conn = db.connect(str(bundle_dir / bundle_import.CATALOG_NAME))
+    run_csv, run_json = _run_names(provider="kartaview")
+    old_csv, old_json = _run_names(provider="mapillary")
+    conn.execute(
+        "UPDATE runs SET provider = 'kartaview', csv_filename = ?, json_filename = ?, "
+        "api_requests = ?",
+        (run_csv, run_json, api_requests),
+    )
+    conn.commit()
+    conn.close()
+    os.rename(bundle_dir / old_csv, bundle_dir / run_csv)
+    os.rename(bundle_dir / old_json, bundle_dir / run_json)
+
+
+def test_the_preview_prices_kartaview_with_the_bundles_own_sweep_spend(
+    cfg, bundle_dir, monkeypatch, capsys
+):
+    """
+    The executed import prices AFTER the bundle's KartaView run lands, and
+    `estimate_kartaview_requests` takes the larger of geometry (115 for San Luis
+    Obispo) and that run's observed spend. A preview on geometry alone would say
+    `would enrol` for a city the import then leaves at `needs_flag`.
+    """
+    _screen(monkeypatch, 42)
+    _relabel_grid_run_as_kartaview(bundle_dir, api_requests=5_000)
+
+    assert cmd_import_bundle(cfg, str(bundle_dir), enable=True) == 0
+
+    out = capsys.readouterr().out
+    line = next(ln for ln in out.splitlines() if ln.strip().startswith("kartaview "))
+    assert "needs_flag" in line and "5,000" in line
+
+    # And the executed import agrees with its own preview.
+    assert cmd_import_bundle(cfg, str(bundle_dir), execute=True, enable=True) == 0
+    assert _opt_in_members(cfg).get("kartaview") is None
+
+
+def test_the_preview_prices_kartaview_from_the_bundles_NEWEST_sweep(
+    cfg, bundle_dir, monkeypatch, capsys
+):
+    """
+    Two KartaView runs in one bundle: the preview prices from the NEWER one,
+    as `_prior_kartaview_spend` does (`ORDER BY run_date DESC LIMIT 1`) once
+    they land. The older run's 5,000 must not force `needs_flag` when the
+    newer sweep spent 10.
+    """
+    import shutil
+    from datetime import timedelta
+
+    _screen(monkeypatch, 42)
+    _relabel_grid_run_as_kartaview(bundle_dir, api_requests=10)  # the NEWER run
+    older = RUN_DATE - timedelta(days=100)
+    stem = generate_run_filename(
+        CITY_ID,
+        CITY["grid_width_m"],
+        CITY["grid_height_m"],
+        CITY["step_m"],
+        older,
+        provider="kartaview",
+    )
+    newer_csv, newer_json = _run_names(provider="kartaview")
+    shutil.copy(bundle_dir / newer_csv, bundle_dir / f"{stem}.csv.gz")
+    shutil.copy(bundle_dir / newer_json, bundle_dir / f"{stem}.json.gz")
+    conn = db.connect(str(bundle_dir / bundle_import.CATALOG_NAME))
+    db.register_run(
+        conn,
+        city_id=CITY_ID,
+        run_date=older,
+        csv_filename=f"{stem}.csv.gz",
+        json_filename=f"{stem}.json.gz",
+        provider="kartaview",
+        api_requests=5_000,
+    )
+    conn.close()
+
+    assert cmd_import_bundle(cfg, str(bundle_dir), enable=True) == 0
+
+    out = capsys.readouterr().out
+    line = next(ln for ln in out.splitlines() if ln.strip().startswith("kartaview "))
+    assert "would enrol" in line, line
 
 
 def _gsv_run_with_far_pano(run_date):

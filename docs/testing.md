@@ -197,6 +197,10 @@ Incidental coverage of a deprecated spelling trains readers to ignore the notice
   The rotation's night-varying start is pinned by `test_the_channel_rotation_reaches_every_stranded_channel_across_nights`, the review's prod shape (10 gsv-excluded, 10 mapillary-only-due, 10 + 3 + 3 + 3 on the four opt-in channels, reservation 10) run over four consecutive dates: each night's chosen multiset is exact (4 / 3 and one each for the three channels from that night's start), and all four channels are reached; a start fixed at 0 starves `panoramax_streets` and is red.
   `test_the_channel_rotation_does_not_skip_past_an_emptied_sub_queue` puts a size-1 sub-queue in the MIDDLE, so a cursor advanced past the deleted slot takes a second `kartaview` and starves `panoramax`; `test_the_channel_rotation_starts_in_rank_order_on_a_fixed_date` pins the start channel for two residues, the two that differ under a reversed sort.
   `_opt_in_reservation` is pinned on the derived share, an explicit override AND the clamp, because a test asserting only the default would let a call site hardcode its own figure.
+  `enable-city` (issue #374) is pinned on its four outcomes: it enables and enrols (one screen request), refuses an unknown city and an already-enabled one with exit 64 and no request or row, `--dry-run` leaves the city disabled with no `schedule_state` or `provider_screen` row and no request, and `--no-opt-in` enables without enrolling; plus its parser wiring.
+  It enrols BEFORE it enables (a spy on `set_city_enabled` sees all four members already set) and runs `assign_schedule` (a `gsv` row appears).
+  `main()` passes `--enroll-kartaview` through to `cmd_import_bundle` and `--no-opt-in` through to `cmd_assess_city`, pinned by stubbing the `cmd_*` and asserting its kwargs, not the parsed args.
+  The gates themselves are pinned in the #215 section's #374 paragraph.
   `enroll-city`'s refusals are pinned as `USAGE_EXIT_CODE` with **no row written** — an unknown channel, an unresolvable city, and (in the **enrol** direction only) a default-membership channel or a disabled city — alongside the two it deliberately does not refuse: an unwired or unconfigured channel, since enrolment has to precede the config block or the rollout order is impossible.
   The exclusion direction is pinned as the opposite on both of those axes, because both refusals were scoped to where they are no-ops: `--remove` on `gsv` writes a 0 and the city stops being due there while its sibling default-membership channel still is, and `--remove` on a *disabled* city writes the same 0 and binds the moment the city is enabled — the ordering that does not race the 02:00 timer.
   Each of those is pinned against the guard it relaxes rather than against the happy path, so a test that would pass with the guard restored is not the test: the disabled-city case asserts dueness AFTER re-enabling, and the `--excluded` misuse case is asked on an **opt-in** channel, since asking it on `gsv` would be refused by the bare-enrol guard and pass with `--excluded`'s own check deleted.
@@ -729,6 +733,28 @@ and `_publish` passing `--local` iff `[publish].local`, read from the TOML and a
 The pre-flight also prints each Mapillary channel's rolling-24h tile-CDN window beside its daily line (issue #385) and marks the channel over the HOST's budget when that, not its untouched daily budget, is what it does not fit (`test_the_preflight_shows_the_tile_cdns_rolling_window`, on a config read through the loader; killed by removing that branch).
 On the collection path, a window with 1 of 3,000 left defers both Mapillary channels: the summary names the host's window and the command does not exit "complete" (`test_a_host_deferral_leaves_the_inquiry_incomplete_and_says_why`; killed by dropping `_host_budget_note` from the summary, and by dropping the host term from `nothing_deferred`).
 
+Opt-in enrolment of a new city (issue #374), in the same file, driven through the one-city screen's **fetch primitive** (`panoramax_screen._fetch_tile`, via `tests.conftest.panoramax_screen_fetch`) so everything from the decoder to the decision runs for real; an autouse fixture answers that primitive with a connection fault by default, so no test here or in `tests/test_import_bundle.py` can reach Panoramax:
+a new city with a positive screen and Newport's 16-request KartaView estimate ending `member = 1` on all four opt-in channels, with a ledger charge equal to the tiles fetched on the command's pinned `today` (not the wall clock);
+a one-city screen leaving `get_provider_screen_series` and `get_latest_provider_screen` unchanged, since a row would publish a one-city series point and move `latest_screen_date`;
+a zero screen enrolling neither Panoramax channel while KartaView is decided independently;
+a failed screen — a 429 through the REAL fetch primitive and a connection fault — enrolling neither and reporting `screen_failed`, asserted as that DISTINCT decision because "failure read as zero" is the mutation that matters, with the reason naming both `enroll-city` remedies and the one request actually sent charged to the ledger on each path (the refusal arm and the unreadable arm);
+a held Panoramax lock reported as local contention with no request and no retry;
+an unforeseen failure AFTER the screen returned (a `screen_row` of the wrong shape) still reading `screen_failed` and charging the tiles sent, from the result's own count, which pins the catch-all arm's charge;
+the KartaView ceiling at its boundary (1,000 enrols, 1,001 is `needs_flag` naming `--enroll-kartaview`, 1,001 with the flag enrols) and `--yes` alone never accepting an over-ceiling estimate through the command;
+`--no-opt-in` leaving the city's row SET equal to the collected channels (not merely `member` NULL) and screening nothing;
+a re-assessment of a city with only default-channel history still enrolling one pair while an explicit `member = 0` on the other survives (`already_set`);
+a city touched on an opt-in channel — an attempt, a run, or a walk, each on its own — enrolling nothing and screening nothing;
+`--estimate` then a collection still enrolling;
+`--estimate` then a nightly gsv attempt then `--yes` still enrolling all four, the gap an any-channel history gate fell into;
+a declined confirmation writing no membership, issuing no screen and charging nothing;
+a pair's two writes landing all-or-nothing, pinned by a trigger that aborts the walk channel's insert;
+the estimate previewing the decisions (`would enrol`, `pending_screen`);
+a pair enrolled whole when only its grid channel is configured, with the walk's `NOTE`;
+one explicit half leaving the whole pair alone (`already_set`);
+a dry run writing nothing and issuing no request;
+every opt-in provider having a gate (set equality, so a new opt-in provider cannot be silently skipped);
+and the two flags parsing.
+
 ## Google's driving plan (issue #176)
 
 - Driving-plan archive (issue #176: dirty-date survival, hash dedupe leaving a snapshot row but no artifact/entries, the Yes→No `publish` transition queried across changed snapshots, the same-day politeness gate not touching the network, forced re-ingest idempotency, the v9→v10 migration, and the `run-due` hook firing on zero-due nights without ever failing one
@@ -1054,6 +1080,10 @@ And the per-row search haystack cache is asserted to be keyed by the **field lis
 - **Importing into a city this host already tracks** — the path where an importer can quietly re-base a series, and one no empty-catalog test reaches. A byte-identical frozen network is kept (this host's row survives untouched); one with different bytes refuses the bundle and leaves this host's file as it was; a network's `fetched_at` is carried, not restamped. A run extending this host's series gets a `run_diffs` row, a detail file, and a non-null change block in its regenerated JSON; a walk extending a walk series gets its `street_walk_diffs` row; a run or walk dated before this host's newest is refused (append-only).
 - A walk on another `network_type` than its channel walks leaves that channel's cadence alone, asserted by relabelling the bundle's drive walk to `all_public`.
 - An unknown provider is exit 64, not the `ValueError` the filename generators raise.
+- **`--enable` enrols the city on the opt-in channels (issue #374) only when it actually turns the city on**: `--execute` enrols all four (San Luis Obispo's KartaView estimate is 115), the default dry run prints the decisions and writes no `schedule_state` row and issues no screen request, an already-enabled city enrols nothing (no backfill), `--no-opt-in` writes no opt-in row, and the flags parse.
+  A bundle carrying a KartaView run that spent 5,000 requests previews `needs_flag` — the executed import prices after that run lands, so a geometry-only preview (115) would say `would enrol` for a city the import leaves unenrolled — and the executed import agrees.
+  With two KartaView runs in the bundle (older 5,000, newer 10) the preview prices from the NEWER one and says `would enrol`, matching `_prior_kartaview_spend`'s newest-first selection.
+  An autouse fixture answers the screen's fetch primitive with a connection fault by default, so no import test can reach Panoramax.
 - Imported spend never reaches this host's rolling-24h window (issue #385): a bundle's KartaView row — ledgered here because the credential is shared, and metered per host — charges `api_usage` and writes no `host_usage`, since the requests came from the laptop's IP; killed by `meter_host=True` in `bundle_import`.
 - **A crash at the ledger leaves the cadence rows already written**, pinned by making `add_api_usage` raise: the success rows exist, the retry is refused, and the ledger holds nothing. The `--enable` branch for an already-registered, disabled city is reached through the importer, not through the `set_city_enabled` helper it uses.
 

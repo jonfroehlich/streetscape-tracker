@@ -618,7 +618,7 @@ What is still not expressible is a *per-channel enable date*: exclusion is a swi
 
 1. `enroll-city CITY --channel gsv --remove` and the same for `gsv_streets`, while the city is still **disabled**.
 2. `enroll-city --channel gsv --list --excluded` — confirm every city you meant is flagged `city disabled, exclusion pre-set`. A mistyped slug exits 64 and writes nothing, so this is the step that catches it, and it has to happen while the city still collects nothing.
-3. `UPDATE cities SET enabled = 1`.
+3. `enable-city CITY --no-opt-in` (#374) — `--no-opt-in` because the point of this order is that the city joins ONLY the channels it was not excluded from; without it the opt-in pairs are enrolled behind their gates (`docs/operations.md`).
 4. `run-due --dry-run` to confirm no `gsv` lines before the 02:00 timer fires.
 
 Doing (3) before (2) leaves a mistyped or forgotten exclusion on an ENABLED city, exposed to the next timer — which for a 40 km-clamped city is 4M grid points, most of a night.
