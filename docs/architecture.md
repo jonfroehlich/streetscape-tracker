@@ -13,11 +13,21 @@ Every run of a city is an immutable dated file `{city_id}_width_W_height_H_step_
 The CSV is never rewritten: a run file records what the provider said on that date, and every later correction happens in readers or in the catalog (see [`capture-dates.md`](capture-dates.md) for the canonical example).
 
 Each city's grid geometry is **frozen at registration** — future runs never re-geocode, so grids align exactly and diffs are meaningful; geometry is shared by all providers.
+
+A new city's center is chosen in exactly one place, `city_registration.choose_center`, which both the real registration and `--check-boundary` call (#186).
+Explicit `--lat/--lng` always win.
+An auto-sized grid is centered on the OSM bbox midpoint, because its dimensions are derived from that same bbox, so the rectangle covers the boundary (#91) — unless the 40 km cap clamped them, in which case the midpoint still centers the sampled window.
+Explicit `--width/--height` without a center take the **geocoder's reported point** instead: the midpoint's justification is gone once the caller sized the grid, and it centered Goiânia's downtown-sized grid 4.3 km off downtown on a ~42 km municipality.
+The geocoder's point is not verified to be downtown either — a better source is #185 — which is why `assess-city` still refuses size without a center.
+A query that misses the catalog but geocodes to a city already registered under another spelling is not new: `register_city`'s `INSERT OR IGNORE` keeps the existing row, so both paths ask `registered_city_for_identity` before using a chosen center and treat that city as registered — frozen geometry, overrides ignored with a warning — and the real registration also aliases the new spelling and returns `newly_registered` False (the preview registers nothing, aliases included).
+`--check-boundary` prints the center it previews and its source (or `frozen catalog geometry`), with the grid in the same `Grid: WxH, step S, centered at LAT, LON` form a real run prints — integer dimensions, because `register_city` stores `int()` of each — and registration logs the same source.
+Nothing already registered moves; the rule applies only at registration.
+
 Legacy pre-2026 undated files are registered as `is_baseline=1` runs by `scripts/migrate_to_db.py` and are never renamed, so published URLs stay stable.
 
 ## The catalog
 
-The SQLite catalog `data/streetscape_tracker.db` (`streetscape_metadata_tracker/db.py`, stdlib sqlite3/WAL, no ORM; schema v16, auto-migrated on connect) is the operational source of truth.
+The SQLite catalog `data/streetscape_tracker.db` (`streetscape_metadata_tracker/db.py`, stdlib sqlite3/WAL, no ORM; schema v17, auto-migrated on connect) is the operational source of truth.
 It is **local-only and never rsynced** — it lives in exactly one place, which is why the dated backups in [`catalog-backups.md`](catalog-backups.md) exist.
 
 | Table | Key / uniqueness | Holds |
@@ -27,6 +37,7 @@ It is **local-only and never rsynced** — it lives in exactly one place, which 
 | `runs` | UNIQUE(city_id, provider, run_date) | Per-run stats incl. the #213 capture-date columns and the v14 census provenance; `unique_google_panos` is NULL for non-gsv runs |
 | `run_diffs` | UNIQUE(from_run_id, to_run_id) | Run-to-run change counters + detail filename |
 | `api_usage` | PK(usage_date, provider) | Daily request-budget ledger; **additive** (`add_api_usage`); streets channels metered under their own strings (#99) |
+| `host_usage` | index(host, recorded_at) | Timestamped per-HOST spend (#385, v16), one row per `add_api_usage` on a channel in `CHANNEL_METERED_HOST`; read over a rolling 24 h by the `[hosts.*]` budget gate, pruned after 30 days |
 | `schedule_state` | PK(city_id, provider) | Stagger day, last attempt/success, `consecutive_failures` (reset only by a success), `member` (per-channel membership, #248) |
 | `history_harvests` | UNIQUE(city_id, provider, harvest_date) | Out-of-band GSV capture-history harvests (#2) |
 | `street_networks` | UNIQUE(city_id, network_type) | Frozen OSM networks (#103); GraphML lives unpublished under `data/osm_cache/` |
@@ -51,9 +62,14 @@ They record which channel's credential and ledger actually paid for a shared cen
 Every gsv run and walk, every legacy import, and every row salvaged by `_reconcile_orphaned_run`/`_reconcile_orphaned_walk` (which read artifacts off disk and cannot know) keep NULL.
 `RunRow` gains the two fields as well, and that is not optional: `_row_to_run` builds `RunRow(**dict(row))` from a `SELECT *`, so a column without a matching field is a `TypeError` on every `get_latest_run` against a migrated catalog rather than a missing feature.
 
-v16 added `runs.status_out_of_radius` and `runs.query_radius_m` (#367, see "GSV query radius" below), under the ordinary rule: NULL means "computed before the rule existed", until `scripts/recompute_run_stats.py` re-derives the row.
+v16 added the `host_usage` table (#385): one row per `db.add_api_usage` call on a channel in `download_common.CHANNEL_METERED_HOST`, stamped `_utc_iso(clock.utc_now())` (always UTC with a `+00:00` offset, so lexical order is chronological), so the `[hosts.*]` budget can sum a host's spend over a rolling 24 h across every channel on it.
+Its rows are **stamped when a child finishes**, not when each request was made, and the migration's backfill rows (the last two UTC dates of metered `api_usage`) are stamped at the **latest instant their spend can have happened** — 23:59:59 UTC of a past date, the migration's own clock for today — so read `recorded_at` as "charged at", never as a request time.
+Rows older than 30 days are pruned by the nightly tail; `import-bundle` writes none (`meter_host=False`).
+
+v17 added `runs.status_out_of_radius` and `runs.query_radius_m` (#367, see "GSV query radius" below), under the ordinary rule: NULL means "computed before the rule existed", until `scripts/recompute_run_stats.py` re-derives the row.
 `query_radius_m` records the tolerance a row's stats were computed under (50.0 for gsv), and stays NULL for census providers, which the rule does not apply to.
-The migration is named by content (`_migrate_add_query_radius_columns`) rather than by number and is idempotent per column, because another in-flight change also targets v16; whichever lands second renumbers its step, and the body is also called unconditionally at the end of `init_schema`, so a catalog already stamped v16 by the other change still gains the columns whatever the merge order.
+The migration is named by content (`_migrate_add_query_radius_columns`) rather than by number and is idempotent per column.
+It runs on the v16 → v17 rung, so a v15 catalog takes #385's v16 backfill first and then this step, and it is also called unconditionally at the end of `init_schema`: both changes stamped v16 while in flight, so a catalog touched by either branch alone can read v16 or later without the columns and still gains them.
 
 ## Provider model
 
@@ -122,6 +138,16 @@ The steps below are per (city, provider, run_date):
    — csv renamed `*.rejected` (excluded from the publish glob), nonzero exit so the scheduler counts a failure.
    Otherwise `analysis.calculate_run_stats()` + `db.register_run()`.
 5. `diff.compute_run_diff()` vs the previous run of the same provider → `run_diffs` row + published detail file (`{city_id}_diff_[PROVIDER_]{FROM}_to_{TO}.csv.gz`; gsv keeps the tokenless form).
+   **A diff detail file is a function of the diff result, and the row's pointer is what gets removed** (#265): written (overwriting) when the diff has changes, removed when it has none, and for road walks also removed by the cleared row's own `detail_filename` before any re-diff decides anything (`db.delete_walk_diff_for_walk` returns those names).
+   Both families go through one remover, `fileutils.remove_stale_diff_detail`, which tolerates a missing file and logs rather than raises on any other `OSError`, because it runs after a paid-for crawl is cataloged.
+   Before #265 the file was only ever written, so a re-diff that came out with no changes, or a skipped walk re-diff, left it in `data/` with nothing pointing at it;
+   `scripts/sweep_orphan_diff_details.py` finds those, and a local removal does not reach the web server, since the publish rsync never passes `--delete`.
+   **Both collectors write the file BEFORE committing the row that names it, on purpose**: the per-run JSON, the aggregate and the streetwalk manifest all copy a row's `detail_filename` into a published `diff_file` link, so a row naming a file not yet written is the worse state, a dead link, while a briefly unreferenced file is linked from nowhere.
+   The cost lands on the sweep, which must not mistake a diff being written for an orphan.
+   It therefore lists the directory before reading the catalog, never deletes a file younger than `--min-age-hours` (24 by default), re-checks each name against both tables just before unlinking it, and refuses `--execute` while a `run-due` is in flight.
+   It opens the catalog read-only (`mode=rw` plus `PRAGMA query_only`, never `db.connect`, which would migrate it; `mode=ro` was measured to leave `-wal`/`-shm` sidecars behind on a WAL catalog).
+   It refuses a catalog of another schema version or one with no runs or walks, and it refuses `--execute` against a catalog that looks older than the disk, i.e. an unreferenced diff dated after its newest run or walk.
+   An existing diff is re-derived under the current reader and definitions by `scripts/recompute_run_diffs.py` (#245), which updates the row in place so its `diff_id` — and with it which comparison the published change blocks treat as current — never moves; `recompute_run_stats.py` does not touch diffs.
 6. `json_summarizer.generate_city_metadata_summary_as_json()` — per-run JSON v2, ages pinned to `run_date` (deterministic); gsv runs include the `google_panos` block, other providers only `all_panos`.
    Then `generate_aggregate_v2()` builds `cities.json.gz` (schema v3) from the DB: per city `{city_id, city, providers: {gsv: {latest, runs, change}, mapillary: {...}}}`, with per-provider global histograms.
 

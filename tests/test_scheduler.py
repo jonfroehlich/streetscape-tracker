@@ -1092,6 +1092,11 @@ def test_makelab1_production_config_is_wired():
     # The walk channel is unchanged: since #290 it spends 0 on a paired night.
     assert cfg.providers["mapillary"].daily_request_budget == 3_500
     assert cfg.providers["mapillary_streets"].daily_request_budget == 1_750
+    # And the pool both of them draw from over a rolling 24 h (#385), added after
+    # block 4. Pinned exactly, with no load error, so a prod change to the one
+    # guard that bounds the pair's combined volume is a red test.
+    assert cfg.host_budgets == {"mapillary_tiles": 3_000}
+    assert cfg.host_budget_errors == []
     # kartaview was turned on in production on 2026-08-28, the separate deploy
     # decision this assertion previously withheld (#248). Enabling the CHANNEL
     # enrols nobody: it is the one opt-in channel, so the nightly queue is exactly
@@ -10108,7 +10113,9 @@ def _run_channels(sched, cfg, conn, city, providers, **overrides):
         blocked_hosts=sched.HostBreaker(),
         busy_hosts=Counter(),
         deferred_channels=Counter(),
+        deferred_host_budget=Counter(),
         rejected_argv=sched.ArgvRejections(),
+        deadline_deferred=Counter(),
         batch_deadline=None,
         stop_requested=None,
     )
@@ -10904,7 +10911,24 @@ def test_the_deadline_is_a_submit_gate_and_every_lane_child_gets_its_own_remaini
         # something starts reading its VALUE rather than just its existence.
         return 10_800
 
+    # A NON-resumable channel's timeout comes from `_clamp_timeout`, fed the
+    # estimate its deadline gate already derived (#373), so the clock read is
+    # recorded there; the estimate spy says which channel it belongs to and
+    # answers a need that fits, so nothing is deferred.
+    asking = []
+
+    def fake_estimate(cfg, city, provider, conn=None):
+        asking.append(provider)
+        return 619
+
+    def fake_clamp(cfg, estimate, remaining_s):
+        priced.append((asking[-1], remaining_s, threading.get_ident()))
+        clock.work()
+        return 10_800
+
     monkeypatch.setattr(sched, "city_timeout_seconds", fake_timeout)
+    monkeypatch.setattr(sched, "city_timeout_estimate_seconds", fake_estimate)
+    monkeypatch.setattr(sched, "_clamp_timeout", fake_clamp)
     _stub_lane_collection(sched, monkeypatch)
 
     _run_channels(
@@ -12080,7 +12104,7 @@ def test_a_stranded_walk_still_refused_at_the_pass_keeps_its_entry(conn, monkeyp
     ((subject, body),) = alerts
     assert "2 city(ies) STRANDED un-walked" in subject
     assert f"{alpha} (gsv_streets)" in body and f"{beta} (gsv_streets)" in body
-    assert "could not walk them either" in body
+    assert "could not walk the host-stranded ones either" in body
     assert " 1 channel launch(es) were skipped in all" in body
     assert _alert_commands(body) == [
         ["run-due", "--provider", "gsv_streets", "--city", alpha, "--city", beta]
@@ -12366,11 +12390,12 @@ def test_the_pass_waits_until_the_next_recheck_not_a_flat_cooldown(conn, monkeyp
 
 
 def test_the_wait_gate_leaves_room_for_a_childs_floor_timeout(conn, monkeypatch, caplog):
-    """The gate is `wait + _MIN_CLAMPED_TIMEOUT_S`, not the wait alone: with
-    2850 s of night left and a 2700 s wait, waiting would leave a retried
-    child 150 s, under the 300 s floor the loop never starts a child with.
-    (The 45-min night of the test above cannot see the floor term: 2700 is
-    under 2700 + anything.)"""
+    """The gate is `wait + _MIN_PACED_LAUNCH_S`, not the wait alone: with
+    3150 s of night left and a 2700 s wait, waiting would leave a retried
+    child 450 s, under the 600 s fixed slack below which no paced child can
+    launch (#373) -- though above the 300 s clamp floor the gate used to add,
+    which is what the 450 s pins. (The 45-min night of the test above cannot
+    see the floor term: 2700 is under 2700 + anything.)"""
     alpha = _register(conn, "Alpha", width=1000, height=1000, step=20)
     _ran, run_one = _refuse_alpha_first_walk(alpha)
     waits = _record_waits(monkeypatch)
@@ -12379,7 +12404,7 @@ def test_the_wait_gate_leaves_room_for_a_childs_floor_timeout(conn, monkeypatch,
         _drive_night(
             monkeypatch,
             conn,
-            _two_walk_cfg(max_batch_hours=(2700 + 150) / 3600),
+            _two_walk_cfg(max_batch_hours=(2700 + 450) / 3600),
             run_one,
         )
 
@@ -13903,3 +13928,1969 @@ def test_a_rejected_walk_strands_its_city_exactly_like_a_busy_skip(conn, monkeyp
     assert f"{alpha} (gsv_streets)" in body
     # The rejected walk gets the same by-name recovery as a busy one (#362).
     assert _alert_commands(body) == [["run-due", "--provider", "gsv_streets", "--city", alpha]]
+
+
+# ── The child's wall-clock stop (issue #344) ───────────────────────────────
+#
+# A resumable child is handed `--*-max-seconds timeout_s - _CRAWL_CLOCK_MARGIN_S`
+# beside its request cap, so a crawl slower than the assumed achieved-rate
+# fraction pauses itself (exit 83: checkpointed, ledgered, amnestied) before the
+# parent's SIGKILL. Every test here asserts STRICT inequalities against the
+# timeout, because the failure being guarded -- a margin of 0 or less -- makes
+# the child's deadline land on or after the kill, and presence alone cannot see
+# that.
+
+_CLOCK_FLAGS = {
+    "kartaview": "--kartaview-max-seconds",
+    "kartaview_streets": "--kartaview-max-seconds",
+    "mapillary": "--mapillary-max-seconds",
+    "mapillary_streets": "--mapillary-max-seconds",
+    "panoramax": "--panoramax-max-seconds",
+    "panoramax_streets": "--panoramax-max-seconds",
+}
+
+
+def _every_channel_cfg():
+    """All eight scheduled channels enabled, budgets too big to interfere."""
+    providers = {
+        channel: ProviderConfig(enabled=True, daily_request_budget=10_000_000)
+        for channel in ("gsv", "gsv_streets", *_CLOCK_FLAGS)
+    }
+    return SchedulerConfig(providers=providers, publish_enabled=False)
+
+
+def test_the_six_clock_flags_are_exactly_the_resumable_channels():
+    """Set equality, so a channel flipped resumable cannot land without a flag."""
+    from streetscape_metadata_tracker.scheduler import CHANNEL_RESUMABLE
+
+    assert set(_CLOCK_FLAGS) == {c for c, v in CHANNEL_RESUMABLE.items() if v}
+
+
+def test_every_resumable_launch_gets_a_clock_stop_strictly_inside_its_timeout(conn, monkeypatch):
+    """
+    Through the real launch loop, so the plan -> `_run_one_city` hand-off is
+    what is pinned, not only the plan: a `max_seconds` computed and then not
+    passed down reaches no child.
+
+    One night, all eight channels, one city: each resumable launch must carry
+    ``0 < max_seconds < timeout_s`` and exactly ``timeout_s - margin``; each GSV
+    launch must carry None, since a partial grid is not a run and the flag would
+    only produce artifacts nobody can publish.
+    """
+    from streetscape_metadata_tracker.scheduler import _CRAWL_CLOCK_MARGIN_S
+
+    cid = _register(conn, "Metro", width=5_000, height=5_000, step=20)
+    for channel in ("kartaview", "kartaview_streets", "panoramax", "panoramax_streets"):
+        db.set_channel_membership(conn, cid, channel, True, cycle_days=90)
+
+    calls = []
+    _run_loop_capturing_kwargs(monkeypatch, conn, _every_channel_cfg(), calls)
+
+    launched = {provider: kwargs for _cid, provider, kwargs in calls}
+    assert set(launched) == {"gsv", "gsv_streets", *_CLOCK_FLAGS}, "every channel must launch"
+    for channel in _CLOCK_FLAGS:
+        max_seconds, timeout_s = launched[channel]["max_seconds"], launched[channel]["timeout_s"]
+        assert max_seconds is not None, f"{channel} launched with no clock stop"
+        assert 0 < max_seconds < timeout_s, (
+            f"{channel}: a deadline at or past the SIGKILL leaves the kill as the live arm"
+        )
+        assert max_seconds == timeout_s - _CRAWL_CLOCK_MARGIN_S
+    for channel in ("gsv", "gsv_streets"):
+        assert launched[channel].get("max_seconds") is None
+
+
+def test_the_clock_margin_is_the_tail_slack_and_positive():
+    """Pinned against the constant it is documented as, and against zero: the
+    strict inequality above reads the margin, so this is what refuses a margin
+    that was "tuned" to nothing."""
+    from streetscape_metadata_tracker.scheduler import (
+        _CRAWL_CLOCK_MARGIN_S,
+        _TIMEOUT_FIXED_SLACK_S,
+    )
+
+    assert _CRAWL_CLOCK_MARGIN_S == _TIMEOUT_FIXED_SLACK_S == 600
+
+
+@pytest.mark.parametrize("channel", ["kartaview", "mapillary", "panoramax"])
+def test_every_grid_launch_site_emits_its_own_clock_flag(conn, monkeypatch, tmp_path, channel):
+    """The three grid arms of `_run_one_city`, with a value that is not a
+    default, and never a sibling provider's flag."""
+    cfg = SchedulerConfig(providers={channel: ProviderConfig()})
+    cmd, _ = _grid_cmd(monkeypatch, tmp_path, conn, channel, cfg, max_seconds=1234)
+    flag = _CLOCK_FLAGS[channel]
+    assert cmd[cmd.index(flag) + 1] == "1234"
+    assert [a for a in cmd if a.endswith("-max-seconds")] == [flag]
+    assert cmd.index(flag) < cmd.index("--"), "a flag after '--' is read as the city name"
+
+    plain, _ = _grid_cmd(monkeypatch, tmp_path / "b", conn, channel, cfg)
+    assert not [a for a in plain if a.endswith("-max-seconds")], "unset must mean no clock stop"
+
+
+@pytest.mark.parametrize("channel", ["kartaview_streets", "mapillary_streets", "panoramax_streets"])
+def test_every_street_launch_site_emits_its_own_clock_flag(conn, channel):
+    """The three street arms of `_street_collect_cmd`, same three assertions."""
+    from streetscape_metadata_tracker.scheduler import _street_collect_cmd
+
+    cid = _register(conn, "Bend", width=1000, height=1000, step=20)
+    city = db.resolve_city(conn, cid)
+    cfg = _every_channel_cfg()
+    cmd = _street_collect_cmd(cfg, city, date(2026, 7, 1), channel, 8, 9_000, max_seconds=1234)
+    flag = _CLOCK_FLAGS[channel]
+    assert cmd[cmd.index(flag) + 1] == "1234"
+    assert [a for a in cmd if a.endswith("-max-seconds")] == [flag]
+    assert cmd.index(flag) < cmd.index("--")
+
+    plain = _street_collect_cmd(cfg, city, date(2026, 7, 1), channel, 8, 9_000)
+    assert not [a for a in plain if a.endswith("-max-seconds")]
+
+
+@pytest.mark.parametrize("channel", sorted(_sched.CHANNEL_RESUMABLE))
+def test_run_one_city_forwards_max_seconds_on_every_resumable_arm(
+    conn, monkeypatch, tmp_path, channel
+):
+    """
+    Pinned at the layer that CONSUMES the value (#344 review): the loop test
+    stubs `_run_one_city` and the builder tests call `_street_collect_cmd`
+    directly, so `_run_one_city` dropping `max_seconds` on its street arm left
+    the suite green. Every scheduled channel, set-derived, through the real
+    `_run_one_city` with only `subprocess.run` faked: a resumable one must carry
+    its own flag with the caller's value, a non-resumable one must carry none.
+    """
+    cmd, _ = _grid_cmd(
+        monkeypatch,
+        tmp_path,
+        conn,
+        channel,
+        _every_channel_cfg(),
+        timeout_s=7_200,
+        estimated_requests=0,
+        max_seconds=1234,
+    )
+    clock_flags = [a for a in cmd if a.endswith("-max-seconds")]
+    if _sched.CHANNEL_RESUMABLE[channel]:
+        flag = _CLOCK_FLAGS[channel]
+        assert clock_flags == [flag]
+        assert cmd[cmd.index(flag) + 1] == "1234"
+    else:
+        assert clock_flags == [], f"{channel} is not resumable and has nothing to pause into"
+
+
+def test_a_gsv_child_never_gets_a_clock_flag_even_when_handed_one(conn, monkeypatch, tmp_path):
+    """Non-resumable channels ignore `max_seconds` at the builder too, not only
+    because the loop passes None: a GSV child has no checkpoint to pause into."""
+    from streetscape_metadata_tracker.scheduler import _street_collect_cmd
+
+    grid, city = _grid_cmd(monkeypatch, tmp_path, conn, "gsv", SchedulerConfig(), max_seconds=500)
+    street = _street_collect_cmd(
+        _every_channel_cfg(), city, date(2026, 7, 1), "gsv_streets", 8, 9_000, max_seconds=500
+    )
+    for cmd in (grid, street):
+        assert not [a for a in cmd if a.endswith("-max-seconds")]
+
+
+@pytest.mark.parametrize("timeout_s", [1, 599, 600])
+def test_a_timeout_at_or_under_the_margin_forwards_no_flag_rather_than_a_nonpositive_one(
+    conn, timeout_s
+):
+    """The child's positive_int refuses 0 and below with argparse exit 2 -- the
+    trap `_request_cap_args` records -- so the plan must say None, and the
+    builder must drop anything under 1 even if handed one."""
+    from streetscape_metadata_tracker.scheduler import (
+        _crawl_clock_args,
+        _crawl_max_seconds,
+        _street_collect_cmd,
+    )
+
+    assert _crawl_max_seconds(timeout_s) is None
+    assert _crawl_max_seconds(601) == 1, "the boundary: one second is a real budget"
+    for value in (0, -1, None):
+        assert _crawl_clock_args("--mapillary-max-seconds", value) == []
+    assert _crawl_clock_args("--mapillary-max-seconds", 1) == ["--mapillary-max-seconds", "1"]
+
+    cid = _register(conn, "Bend", width=1000, height=1000, step=20)
+    city = db.resolve_city(conn, cid)
+    cmd = _street_collect_cmd(
+        _every_channel_cfg(), city, date(2026, 7, 1), "mapillary_streets", 8, 9_000, max_seconds=0
+    )
+    assert "--mapillary-max-seconds" not in cmd
+
+
+def test_the_launch_plan_carries_the_clock_stop_it_derived_from_its_own_timeout(conn):
+    """`_sweep_launch_plan` is shared with the dry run; the two must agree."""
+    from streetscape_metadata_tracker.scheduler import _CRAWL_CLOCK_MARGIN_S, _sweep_launch_plan
+
+    cid = _register(conn, "Metro", width=5_000, height=5_000, step=20)
+    city = db.resolve_city(conn, cid)
+    plan = _sweep_launch_plan(
+        _every_channel_cfg(),
+        city,
+        "mapillary",
+        conn,
+        est=100,
+        remaining=10_000,
+        remaining_s=None,
+        city_channels=["mapillary"],
+    )
+    assert plan.skip is None
+    assert 0 < plan.max_seconds < plan.timeout_s
+    assert plan.max_seconds == plan.timeout_s - _CRAWL_CLOCK_MARGIN_S
+
+
+@pytest.mark.parametrize(
+    ("pause_line", "expected"),
+    [
+        (
+            "mapillary crawl paused at 2/9 tiles (stopped by its wall-clock budget); re-run",
+            "stopped by its wall-clock budget",
+        ),
+        (
+            "mapillary crawl paused at 2/9 tiles (stopped by its request cap); re-run",
+            "stopped by its request cap",
+        ),
+    ],
+)
+def test_a_paused_childs_reason_names_the_ceiling_that_paused_it(
+    conn, monkeypatch, tmp_path, pause_line, expected
+):
+    """The night's log has to say whether the budget or the clock paused a crawl,
+    and the exception never crosses the process boundary -- so the scheduler
+    reads the child's own pause line, and the LAST one, since child logs are
+    appended across attempts."""
+    from streetscape_metadata_tracker import scheduler as sched
+    from streetscape_metadata_tracker.download_common import (
+        SWEEP_INCOMPLETE_EXIT_CODE,
+        SWEEP_STOP_PHRASES,
+    )
+
+    other = next(p for p in SWEEP_STOP_PHRASES.values() if p != expected)
+    cid = _register(conn, "Bend", width=1000, height=1000, step=20)
+    city = db.resolve_city(conn, cid)
+
+    def fake_run(cmd, timeout=None, cwd=None, stdout=None, **kwargs):
+        # An earlier attempt's pause first: the reason must name the latest.
+        stdout.write(f"mapillary crawl paused at 1/9 tiles ({other}); re-run\n")
+        stdout.write(pause_line + "\n")
+
+        class R:
+            returncode = SWEEP_INCOMPLETE_EXIT_CODE
+
+        return R()
+
+    monkeypatch.setattr(sched.subprocess, "run", fake_run)
+    cfg = SchedulerConfig(log_dir=str(tmp_path))
+    outcome = sched._run_collection_subprocess(cfg, ["x"], 60, city, "mapillary", date(2026, 7, 1))
+    assert outcome.exit_code == SWEEP_INCOMPLETE_EXIT_CODE
+    assert "crawl paused" in outcome.reason, "83 must read as a pause, not a bare exit code"
+    assert expected in outcome.reason
+    assert other not in outcome.reason
+
+
+# ── Deadline deferral of non-resumable channels (issue #373) ────────────────
+#
+# Fixture geometry, at SchedulerConfig's 24,000/min and the 180-min floor:
+# a 1 km grid's gsv estimate is 619 s (the 600 s fixed slack plus pacing) and a
+# 20 km grid's is 8,115 s (~2.25 h). Both are BELOW the 10,800 s floor, which
+# is what lets the first test tell the estimate from the floored timeout.
+
+
+def _deadline_recorder(sched, monkeypatch):
+    """Record every launch's channel and timeout; every child succeeds."""
+    launched = []
+
+    def fake_run(cfg, city, today, provider="gsv", **kwargs):
+        launched.append((city.city_id, provider, kwargs.get("timeout_s")))
+        return True
+
+    monkeypatch.setattr(sched, "_run_one_city", fake_run)
+    return launched
+
+
+def _attempt_recorder(sched, monkeypatch):
+    """Spy on db.record_attempt so a test can assert nothing was recorded."""
+    calls = []
+    real = sched.db.record_attempt
+
+    def spy(conn_, city_id, **kwargs):
+        calls.append((city_id, kwargs.get("provider"), kwargs.get("success")))
+        return real(conn_, city_id, **kwargs)
+
+    monkeypatch.setattr(sched.db, "record_attempt", spy)
+    return calls
+
+
+def _gsv_cfg(**overrides):
+    return SchedulerConfig(
+        providers={"gsv": ProviderConfig(enabled=True, daily_request_budget=10_000_000)},
+        **overrides,
+    )
+
+
+def test_the_floor_is_not_the_deadline_predictor(conn, monkeypatch):
+    """A small gsv city (estimate 619 s) with an hour left -- LESS than the
+    180-min floor -- still launches, clamped to the hour exactly as before
+    #373. Predicting with the floored timeout would defer every gsv city for
+    the last three hours of every night."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    city = db.resolve_city(conn, _register(conn, "Bend", width=1000, height=1000, step=20))
+    cfg = _gsv_cfg()
+    assert sched.city_timeout_estimate_seconds(cfg, city, "gsv") < 3600
+    assert sched.city_timeout_seconds(cfg, city, "gsv") > 3600, "the floor must exceed the hour"
+    monkeypatch.setattr(sched.time, "monotonic", lambda: 0.0)
+    launched = _deadline_recorder(sched, monkeypatch)
+    deferred: Counter[str] = Counter()
+
+    result = _run_channels(
+        sched, cfg, conn, city, ["gsv"], batch_deadline=3600.0, deadline_deferred=deferred
+    )
+
+    assert launched == [(city.city_id, "gsv", 3600)]
+    assert result == (1, 1, 0)
+    assert not deferred
+
+
+def test_a_non_resumable_child_that_cannot_fit_is_deferred_not_launched(conn, monkeypatch):
+    """A 2.25 h gsv city with an hour left: nothing launched, nothing recorded
+    (so it stays due and consecutive_failures is untouched), counted per
+    channel, and attempted == 0 so it costs the batch no city-cap slot."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    city = db.resolve_city(conn, _register(conn, "Mid", width=20_000, height=20_000, step=20))
+    cfg = _gsv_cfg()
+    assert sched.city_timeout_estimate_seconds(cfg, city, "gsv") > 2 * 3600
+    monkeypatch.setattr(sched.time, "monotonic", lambda: 0.0)
+    launched = _deadline_recorder(sched, monkeypatch)
+    attempts = _attempt_recorder(sched, monkeypatch)
+    failures_before = conn.execute(
+        "SELECT COALESCE(SUM(consecutive_failures), 0) FROM schedule_state"
+    ).fetchone()[0]
+    deferred: Counter[str] = Counter()
+
+    result = _run_channels(
+        sched, cfg, conn, city, ["gsv"], batch_deadline=3600.0, deadline_deferred=deferred
+    )
+
+    assert launched == []
+    assert attempts == []
+    assert result == (0, 0, 0), "not an attempt, not a budget skip"
+    assert deferred == Counter({"gsv": 1})
+    assert (
+        conn.execute(
+            "SELECT COALESCE(SUM(consecutive_failures), 0) FROM schedule_state"
+        ).fetchone()[0]
+        == failures_before
+    )
+
+
+def test_no_batch_deadline_never_defers(conn, monkeypatch):
+    """The operator / assess-city path passes batch_deadline=None: even a city
+    needing ~19 h launches, with its full unclamped timeout."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    city = db.resolve_city(conn, _register(conn, "Huge", width=60_000, height=60_000, step=20))
+    cfg = _gsv_cfg()
+    launched = _deadline_recorder(sched, monkeypatch)
+    deferred: Counter[str] = Counter()
+
+    _run_channels(sched, cfg, conn, city, ["gsv"], batch_deadline=None, deadline_deferred=deferred)
+
+    assert launched == [(city.city_id, "gsv", sched.city_timeout_seconds(cfg, city, "gsv"))]
+    assert launched[0][2] > 12 * 3600
+    assert not deferred
+
+
+def test_an_unknowable_estimate_never_defers(conn, monkeypatch):
+    """Pacing disabled leaves nothing to derive a need from, so the estimate is
+    None and the child launches under the clamp exactly as before #373."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    city = db.resolve_city(conn, _register(conn, "Huge", width=60_000, height=60_000, step=20))
+    cfg = _gsv_cfg(max_requests_per_minute=0)
+    assert sched.city_timeout_estimate_seconds(cfg, city, "gsv") is None
+    monkeypatch.setattr(sched.time, "monotonic", lambda: 0.0)
+    launched = _deadline_recorder(sched, monkeypatch)
+    deferred: Counter[str] = Counter()
+
+    _run_channels(sched, cfg, conn, city, ["gsv"], batch_deadline=400.0, deadline_deferred=deferred)
+
+    assert launched == [(city.city_id, "gsv", 400)]
+    assert not deferred
+
+
+def test_resumable_channels_take_their_launch_plan_not_the_deadline_gate(conn, monkeypatch):
+    """Every resumable channel, with a need no night could hold: each still
+    reaches _sweep_launch_plan and launches capped, because a capped sweep
+    PAUSES at its cap (exit 83, amnestied) instead of being killed."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    resumable = sorted(p for p in sched.CHANNEL_HOSTS if sched.is_resumable_channel(p))
+    assert len(resumable) == 6
+    city = db.resolve_city(conn, _register(conn, "Mid", width=20_000, height=20_000, step=20))
+    cfg = SchedulerConfig(
+        providers={p: ProviderConfig(enabled=True, daily_request_budget=40_000) for p in resumable}
+    )
+    monkeypatch.setattr(sched, "city_timeout_estimate_seconds", lambda *a, **k: 10**9)
+    monkeypatch.setattr(sched.time, "monotonic", lambda: 0.0)
+    planned = []
+    real_plan = sched._sweep_launch_plan
+
+    def spy_plan(cfg_, city_, channel, *a, **k):
+        planned.append(channel)
+        return real_plan(cfg_, city_, channel, *a, **k)
+
+    monkeypatch.setattr(sched, "_sweep_launch_plan", spy_plan)
+    launched = _deadline_recorder(sched, monkeypatch)
+    deferred: Counter[str] = Counter()
+
+    for channel in resumable:
+        _run_channels(
+            sched, cfg, conn, city, [channel], batch_deadline=3600.0, deadline_deferred=deferred
+        )
+
+    assert planned == resumable
+    assert [p for _cid, p, _t in launched] == resumable
+    assert not deferred
+
+
+def test_a_fully_deferred_city_costs_no_city_cap_slot(conn, monkeypatch):
+    """Cap 1: the first city defers its only channel, so it is not counted,
+    earns no inter-city sleep, and the second (small) city is still collected.
+    The loop hands the per-channel count back in its return tuple."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    big = db.resolve_city(conn, _register(conn, "Mid", width=20_000, height=20_000, step=20))
+    small = db.resolve_city(conn, _register(conn, "Bend", width=1000, height=1000, step=20))
+    monkeypatch.setattr(sched.time, "monotonic", lambda: 0.0)
+    sleeps = []
+    monkeypatch.setattr(sched.time, "sleep", lambda s: sleeps.append(s))
+    launched = _deadline_recorder(sched, monkeypatch)
+
+    result = sched._run_city_loop(
+        _gsv_cfg(),
+        conn,
+        date(2026, 7, 2),
+        [big, small],
+        {big.city_id: ["gsv"], small.city_id: ["gsv"]},
+        3600.0,
+        threading.Event(),
+        max_cities=1,
+    )
+
+    processed, succeeded, attempted, skipped_budget, stop_reason = result[:5]
+    assert launched == [(small.city_id, "gsv", 3600)]
+    assert (processed, succeeded, attempted, skipped_budget) == (1, 1, 1, 0)
+    assert stop_reason is None
+    assert result[-1] == Counter({"gsv": 1})
+    assert sleeps == []
+
+
+@pytest.mark.parametrize("lanes", [1, 2])
+def test_a_deferred_first_channel_defers_the_whole_city(conn, monkeypatch, caplog, lanes):
+    """One city, one call: the 2.25 h gsv grid run -- the city's FIRST channel
+    -- defers, so its ~35 min walk and both Mapillary channels defer with it,
+    each counted, logged once. Run alone they would land tonight and the grid
+    later, un-pairing the city, and add per-IP Mapillary volume on a night
+    that bought no grid run. Both lane counts, since with lanes the rest of
+    the city would otherwise launch in the same pass."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    city = db.resolve_city(conn, _register(conn, "Mid", width=20_000, height=20_000, step=20))
+    cfg = _street_cfg(max_concurrent_channels=lanes)
+    assert sched.city_timeout_estimate_seconds(cfg, city, "gsv", conn=conn) > 3600
+    assert sched.city_timeout_estimate_seconds(cfg, city, "gsv_streets", conn=conn) < 3600
+    monkeypatch.setattr(sched.time, "monotonic", lambda: 0.0)
+    launched = _deadline_recorder(sched, monkeypatch)
+    deferred: Counter[str] = Counter()
+    providers = ["gsv", "gsv_streets", "mapillary", "mapillary_streets"]
+
+    with caplog.at_level(logging.INFO):
+        result = _run_channels(
+            sched, cfg, conn, city, providers, batch_deadline=3600.0, deadline_deferred=deferred
+        )
+
+    assert launched == []
+    assert result == (0, 0, 0)
+    assert deferred == Counter(dict.fromkeys(providers, 1))
+    rest = [r.message for r in caplog.records if "deferring the rest of this city" in r.message]
+    assert rest == [
+        f"{city.city_id}: deferring the rest of this city "
+        f"(gsv_streets, mapillary, mapillary_streets) so its snapshots stay paired (#373)."
+    ]
+
+
+def test_a_walk_is_judged_on_its_own_estimate_once_its_grid_launched(conn, monkeypatch):
+    """The grid fits and launches; the walk's own need does not fit and it
+    defers alone. With the grid landed, that walk is recorded as a DEADLINE
+    stranding on the breaker -- the city is not gsv-due for ~83 days."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    city = db.resolve_city(conn, _register(conn, "Bend", width=1000, height=1000, step=20))
+    cfg = _street_cfg()
+    real = sched.city_timeout_estimate_seconds
+    monkeypatch.setattr(
+        sched,
+        "city_timeout_estimate_seconds",
+        lambda cfg_, c, p, conn=None: 7200 if p == "gsv_streets" else real(cfg_, c, p, conn=conn),
+    )
+    monkeypatch.setattr(sched.time, "monotonic", lambda: 0.0)
+    launched = _deadline_recorder(sched, monkeypatch)
+    deferred: Counter[str] = Counter()
+    breaker = sched.HostBreaker()
+
+    result = _run_channels(
+        sched,
+        cfg,
+        conn,
+        city,
+        ["gsv", "gsv_streets"],
+        batch_deadline=3600.0,
+        deadline_deferred=deferred,
+        blocked_hosts=breaker,
+    )
+
+    assert [p for _cid, p, _t in launched] == ["gsv"]
+    assert result == (1, 1, 0)
+    assert deferred == Counter({"gsv_streets": 1})
+    assert breaker.stranded == {city.city_id: ["gsv_streets"]}
+    assert breaker.deadline_stranded == {(city.city_id, "gsv_streets")}
+    assert not breaker, "no host refused anything"
+
+
+def test_a_deadline_deferral_is_on_the_done_line_and_is_not_a_failure(conn, monkeypatch, caplog):
+    """Alpha's two channels need more than any night holds and defer; Beta
+    collects. The Done line names the count per channel apart from the budget
+    and sibling deferrals, and at failure_threshold=1 the night neither alerts
+    nor exits nonzero -- nothing failed, the night was full."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    alpha = _register(conn, "Alpha", width=1000, height=1000, step=20)
+    beta = _register(conn, "Beta", width=1000, height=1000, step=20)
+    real_estimate = sched.city_timeout_estimate_seconds
+
+    def estimate(cfg, city, provider, conn=None):
+        if city.city_id == alpha:
+            return 10**9
+        return real_estimate(cfg, city, provider, conn=conn)
+
+    monkeypatch.setattr(sched, "city_timeout_estimate_seconds", estimate)
+    cfg = SchedulerConfig(
+        providers={
+            "gsv": ProviderConfig(enabled=True, daily_request_budget=10_000_000),
+            "gsv_streets": ProviderConfig(enabled=True, daily_request_budget=2_000_000),
+        },
+        publish_enabled=False,
+        alerts=AlertConfig(enabled=True, failure_threshold=1),
+    )
+    ran = []
+
+    def run_one(city, provider):
+        ran.append((city.city_id, provider))
+        return True
+
+    with caplog.at_level(logging.INFO):
+        rc, alerts = _drive_night(monkeypatch, conn, cfg, run_one)
+
+    assert ran == [(beta, "gsv"), (beta, "gsv_streets")]
+    done = _done_line(caplog)
+    assert "2/2 runs succeeded across 1 cities" in done
+    assert "; 2 channel(s) deferred for the deadline (gsv 1, gsv_streets 1)" in done
+    assert "deferred for budget" not in done
+    assert rc == 0
+    assert alerts == []
+
+
+@pytest.mark.parametrize("remaining_s", [None, 1, 1800, 10**6])
+def test_the_timeout_is_the_clamped_floored_estimate_on_every_arm(conn, remaining_s):
+    """city_timeout_seconds == clamp(max(floor, estimate)), or clamp(floor)
+    when the estimate is None, for every scheduled channel plus an unknown
+    one -- so the deferral's predictor and the child's timeout cannot drift.
+    Both sizes, so both sides of max() are taken on every derived arm."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    channels = sorted(sched.CHANNEL_HOSTS)
+    assert len(channels) == 8
+    cfg = SchedulerConfig(
+        providers={p: ProviderConfig(enabled=True, daily_request_budget=10**7) for p in channels}
+    )
+    floor = cfg.city_timeout_minutes * 60
+    small = db.resolve_city(conn, _register(conn, "Bend", width=1000, height=1000, step=20))
+    giant = db.resolve_city(conn, _register(conn, "Giant", width=150_000, height=150_000, step=20))
+
+    def clamp(v):
+        return v if remaining_s is None else int(max(300, min(v, remaining_s)))
+
+    over_floor = set()
+    for city in (small, giant):
+        for channel in [*channels, "not_a_channel"]:
+            estimate = sched.city_timeout_estimate_seconds(cfg, city, channel, conn=conn)
+            expected = clamp(floor if estimate is None else max(floor, estimate))
+            got = sched.city_timeout_seconds(cfg, city, channel, conn=conn, remaining_s=remaining_s)
+            assert got == expected, (city.city_id, channel)
+            if estimate is not None and estimate > floor:
+                over_floor.add(channel)
+            if city is small:
+                assert estimate is None or estimate < floor, channel
+    assert over_floor == set(channels), "every derived arm must be exercised above the floor"
+    assert sched.city_timeout_estimate_seconds(cfg, giant, "not_a_channel") is None
+    unpaced = SchedulerConfig(max_requests_per_minute=0)
+    assert sched.city_timeout_estimate_seconds(unpaced, giant, "gsv") is None
+
+
+# Literal timeouts computed by the PRE-#373 `city_timeout_seconds` (commit
+# 2a94a68) on the fixture geometry above, all eight channels enabled at their
+# defaults. The refactor into estimate + `_clamp_timeout` was checked against
+# that formula on 120 (city, channel, remaining_s) shapes with no difference;
+# these are the ones where a derived arm clears the floor, plus both clamps.
+# Hard-coded so a later refactor cannot move a child's timeout silently -- the
+# equality test above would stay green if the estimate and the timeout moved
+# TOGETHER.
+_PRE_373_TIMEOUTS = [
+    ("Bend", 1000, "gsv", None, 10_800),
+    ("Giant", 150_000, "gsv", None, 422_587),
+    ("Giant", 150_000, "gsv", 7200, 7200),
+    ("Giant", 150_000, "gsv", 1, 300),
+    ("Giant", 150_000, "gsv_streets", None, 84_412),
+    ("Giant", 150_000, "kartaview", None, 230_268),
+    ("Giant", 150_000, "mapillary", None, 14_628),
+    ("Giant", 150_000, "panoramax", None, 110_895),
+]
+
+
+@pytest.mark.parametrize("name, width, channel, remaining_s, expected", _PRE_373_TIMEOUTS)
+def test_the_timeout_numbers_are_the_pre_373_ones(
+    conn, name, width, channel, remaining_s, expected
+):
+    from streetscape_metadata_tracker import scheduler as sched
+
+    channels = sorted(sched.CHANNEL_HOSTS)
+    cfg = SchedulerConfig(
+        providers={p: ProviderConfig(enabled=True, daily_request_budget=10**7) for p in channels}
+    )
+    city = db.resolve_city(conn, _register(conn, name, width=width, height=width, step=20))
+
+    got = sched.city_timeout_seconds(cfg, city, channel, conn=conn, remaining_s=remaining_s)
+
+    assert got == expected
+
+
+def test_the_loop_stops_once_no_paced_channel_can_launch(conn, monkeypatch, caplog):
+    """500 s left -- above the 300 s clamp floor, below the 600 s fixed slack
+    every paced derivation carries. No non-resumable channel can fit and no
+    resumable one can afford a request, so the loop stops with the deadline
+    reason instead of walking all 30 cities: nothing deferred or budget-skipped
+    is counted, and the log is not a line per channel. At 601 s it still asks."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    cities = [
+        db.resolve_city(conn, _register(conn, f"C{i:02d}", width=1000, height=1000, step=20))
+        for i in range(30)
+    ]
+    cfg = _street_cfg()
+    providers = {
+        c.city_id: ["gsv", "gsv_streets", "mapillary", "mapillary_streets"] for c in cities
+    }
+    monkeypatch.setattr(sched.time, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(sched.time, "sleep", lambda s: None)
+    launched = _deadline_recorder(sched, monkeypatch)
+
+    with caplog.at_level(logging.INFO):
+        result = sched._run_city_loop(
+            cfg, conn, date(2026, 7, 2), cities, providers, 500.0, threading.Event(), max_cities=80
+        )
+
+    processed, succeeded, attempted, skipped_budget, stop_reason = result[:5]
+    assert stop_reason == (
+        f"batch deadline reached ({cfg.max_batch_hours:g} h); 30 due cities not attempted"
+    )
+    assert (processed, succeeded, attempted, skipped_budget) == (0, 0, 0, 0)
+    assert result[-1] == Counter()
+    assert launched == []
+    assert len(caplog.records) < 5
+
+    asked = []
+    real = sched._run_city_channels
+    monkeypatch.setattr(
+        sched, "_run_city_channels", lambda *a, **k: asked.append(a[2]) or real(*a, **k)
+    )
+    sched._run_city_loop(
+        cfg, conn, date(2026, 7, 2), cities, providers, 601.0, threading.Event(), max_cities=80
+    )
+    assert asked, "above the fixed slack the loop still starts cities"
+
+
+def test_the_deadline_gate_subtracts_the_clock(conn, monkeypatch):
+    """The clock at 100,000 and the deadline an hour after it: a 2.25 h city
+    defers. Every other test freezes the clock at 0, where comparing the need
+    against `batch_deadline` itself reads the same as against the remainder."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    city = db.resolve_city(conn, _register(conn, "Mid", width=20_000, height=20_000, step=20))
+    monkeypatch.setattr(sched.time, "monotonic", lambda: 100_000.0)
+    launched = _deadline_recorder(sched, monkeypatch)
+    deferred: Counter[str] = Counter()
+
+    _run_channels(
+        sched, _gsv_cfg(), conn, city, ["gsv"], batch_deadline=103_600.0, deadline_deferred=deferred
+    )
+
+    assert launched == []
+    assert deferred == Counter({"gsv": 1})
+
+
+@pytest.mark.parametrize("need_s, launches", [(3600, True), (3601, False)])
+def test_the_deadline_gate_boundary(conn, monkeypatch, need_s, launches):
+    """With 3,600 s left a need of exactly 3,600 s launches (clamped to it) and
+    3,601 s defers: the gate is a strict `>` against the remainder, no slack."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    city = db.resolve_city(conn, _register(conn, "Bend", width=1000, height=1000, step=20))
+    monkeypatch.setattr(sched.time, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(sched, "city_timeout_estimate_seconds", lambda *a, **k: need_s)
+    launched = _deadline_recorder(sched, monkeypatch)
+    deferred: Counter[str] = Counter()
+
+    _run_channels(
+        sched, _gsv_cfg(), conn, city, ["gsv"], batch_deadline=3600.0, deadline_deferred=deferred
+    )
+
+    assert launched == ([(city.city_id, "gsv", 3600)] if launches else [])
+    assert deferred == (Counter() if launches else Counter({"gsv": 1}))
+
+
+def test_the_walk_predictor_reads_the_catalog(conn, monkeypatch):
+    """A frozen street network's edge count is what prices a gsv_streets walk;
+    without the catalog handle the estimate falls back to the grid-area proxy,
+    which for this city is a tenth of it -- the #373 kill straight back. So
+    the gate must pass `conn`: the walk defers only because it did."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    city = db.resolve_city(conn, _register(conn, "Bend", width=1000, height=1000, step=20))
+    conn.execute(
+        "INSERT INTO street_networks (city_id, network_type, graphml_filename, node_count,"
+        " edge_count, fetched_at) VALUES (?, 'drive', 'x.graphml', 1, 200000, '2026-07-01')",
+        (city.city_id,),
+    )
+    conn.commit()
+    cfg = _street_cfg()
+    with_conn = sched.city_timeout_estimate_seconds(cfg, city, "gsv_streets", conn=conn)
+    without = sched.city_timeout_estimate_seconds(cfg, city, "gsv_streets")
+    assert without < 3600 < with_conn
+    monkeypatch.setattr(sched.time, "monotonic", lambda: 0.0)
+    launched = _deadline_recorder(sched, monkeypatch)
+    deferred: Counter[str] = Counter()
+
+    _run_channels(
+        sched, cfg, conn, city, ["gsv_streets"], batch_deadline=3600.0, deadline_deferred=deferred
+    )
+
+    assert launched == []
+    assert deferred == Counter({"gsv_streets": 1})
+
+
+def test_a_launched_channel_derives_its_estimate_once(conn, monkeypatch):
+    """The gate's estimate is handed to `_clamp_timeout`, not re-derived by
+    `city_timeout_seconds`: a launched gsv channel reads `estimate_requests`
+    twice -- once for the budget (`_channel_estimate`), once for its wall-clock
+    derivation -- never three times."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    city = db.resolve_city(conn, _register(conn, "Bend", width=1000, height=1000, step=20))
+    monkeypatch.setattr(sched.time, "monotonic", lambda: 0.0)
+    launched = _deadline_recorder(sched, monkeypatch)
+    calls = []
+    real = sched.estimate_requests
+
+    def spy(*a, **k):
+        calls.append(a[1])
+        return real(*a, **k)
+
+    monkeypatch.setattr(sched, "estimate_requests", spy)
+
+    _run_channels(sched, _gsv_cfg(), conn, city, ["gsv"], batch_deadline=3600.0)
+
+    assert launched == [(city.city_id, "gsv", 3600)]
+    assert calls == ["gsv", "gsv"]
+
+
+@pytest.mark.parametrize("need_s, warns", [(12 * 3600 + 1, True), (12 * 3600, False)])
+def test_a_channel_no_night_can_hold_warns(conn, monkeypatch, caplog, need_s, warns):
+    """Before #373 a child that could never fit was killed, alerted on and
+    quarantined after five nights; deferred, it must not become one INFO line
+    a night forever. A need past the whole max_batch_hours window WARNS with
+    the remedies; one that could fit an emptier night stays INFO."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    city = db.resolve_city(conn, _register(conn, "Bend", width=1000, height=1000, step=20))
+    monkeypatch.setattr(sched.time, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(sched, "city_timeout_estimate_seconds", lambda *a, **k: need_s)
+    _deadline_recorder(sched, monkeypatch)
+    deferred: Counter[str] = Counter()
+
+    with caplog.at_level(logging.INFO):
+        _run_channels(
+            sched,
+            _gsv_cfg(max_batch_hours=12),
+            conn,
+            city,
+            ["gsv"],
+            batch_deadline=3600.0,
+            deadline_deferred=deferred,
+        )
+
+    assert deferred == Counter({"gsv": 1})
+    warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+    if warns:
+        assert len(warnings) == 1
+        assert "can NEVER fit a night" in warnings[0]
+        assert "max_batch_hours = 12 h" in warnings[0]
+        assert "resize_city.py" in warnings[0] and "--force" in warnings[0]
+    else:
+        assert warnings == []
+
+
+def test_a_walk_the_deadline_strands_is_counted_logged_with_its_command_and_does_not_alert(
+    conn, monkeypatch, caplog
+):
+    """Alpha's grid lands, then its walk's need exceeds the remainder. The
+    walk is deferred ONCE (the retry pass never sees it) and the city is
+    STRANDED -- not gsv-due for ~83 days -- so the Done line counts it. But a
+    deadline stranding alone is routine once nights end on the deadline, so
+    it does NOT alert and the night exits 0; the operator's recovery command
+    is in the stranding's own WARNING line instead."""
+    alpha = _register(conn, "Alpha", width=1000, height=1000, step=20)
+    real = _sched.city_timeout_estimate_seconds
+
+    def estimate(cfg, city, provider, conn=None):
+        return 10**9 if provider == "gsv_streets" else real(cfg, city, provider, conn=conn)
+
+    monkeypatch.setattr(_sched, "city_timeout_estimate_seconds", estimate)
+    ran = []
+
+    def run_one(city, provider):
+        ran.append((city.city_id, provider))
+        return True
+
+    with caplog.at_level(logging.INFO):
+        rc, alerts = _drive_night(monkeypatch, conn, _two_walk_cfg(), run_one)
+
+    assert ran == [(alpha, "gsv")]
+    done = _done_line(caplog)
+    assert "; 1 channel(s) deferred for the deadline (gsv_streets 1)" in done
+    assert "; 1 city(ies) STRANDED un-walked (1 by the batch deadline)" in done
+    assert not any("End-of-night retry" in r.message for r in caplog.records)
+    assert rc == 0
+    assert alerts == []
+    [line] = [
+        r.message
+        for r in caplog.records
+        if r.levelno == logging.WARNING and "STRANDED" in r.message and "deadline" in r.message
+    ]
+    assert _alert_commands(line.split("keep the pair: ", 1)[1]) == [
+        ["run-due", "--provider", "gsv_streets", "--city", alpha]
+    ]
+
+
+def test_the_retry_pass_never_defers_a_walk_it_cannot_fit(conn, monkeypatch, caplog):
+    """Alpha's walk is refused by Overpass and stranded; by the retry pass the
+    host serves again but the walk no longer fits the remainder. The pass
+    prices it BEFORE its call, so it stays stranded for its original reason
+    and is never counted as a deadline deferral too -- one walk, one report."""
+    from streetscape_metadata_tracker.download_common import HOST_OVERPASS
+
+    monkeypatch.setattr(_sched, "HOST_RECHECK_COOLDOWN_S", 0)
+    monkeypatch.setitem(_sched.HOST_RECHECKS, HOST_OVERPASS, _recovering_probe([True]))
+    alpha = _register(conn, "Alpha", width=1000, height=1000, step=20)
+    ran, run_one = _refuse_alpha_first_walk(alpha)
+    _record_waits(monkeypatch)
+    in_pass = {"on": False}
+    real_pass = _sched._retry_stranded_walks
+
+    def wrapped(*a, **k):
+        in_pass["on"] = True
+        return real_pass(*a, **k)
+
+    monkeypatch.setattr(_sched, "_retry_stranded_walks", wrapped)
+    real = _sched.city_timeout_estimate_seconds
+
+    def estimate(cfg, city, provider, conn=None):
+        if in_pass["on"] and provider == "gsv_streets":
+            return 10**9
+        return real(cfg, city, provider, conn=conn)
+
+    monkeypatch.setattr(_sched, "city_timeout_estimate_seconds", estimate)
+
+    with caplog.at_level(logging.INFO):
+        _drive_night(monkeypatch, conn, _two_walk_cfg(), run_one)
+
+    assert ran == [(alpha, "gsv"), (alpha, "gsv_streets")], "the pass launched nothing"
+    done = _done_line(caplog)
+    assert "deferred for the deadline" not in done
+    assert "; 1 city(ies) STRANDED un-walked" in done
+    assert "by the batch deadline" not in done, "the host reason, not the deadline"
+    assert any(
+        r.message.startswith(f"{alpha} [gsv_streets]: stays stranded — the deadline")
+        for r in caplog.records
+    )
+
+
+def test_a_deferral_past_the_deadline_logs_zero_minutes_not_negative(conn, monkeypatch, caplog):
+    """A serial sibling can run past the deadline, leaving the remainder
+    negative when the next channel is priced; the log says 0 min, not -1."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    city = db.resolve_city(conn, _register(conn, "Bend", width=1000, height=1000, step=20))
+    monkeypatch.setattr(sched.time, "monotonic", lambda: 3630.0)
+    _deadline_recorder(sched, monkeypatch)
+
+    with caplog.at_level(logging.INFO):
+        _run_channels(sched, _gsv_cfg(), conn, city, ["gsv"], batch_deadline=3600.0)
+
+    [line] = [r.message for r in caplog.records if "deferring —" in r.message]
+    assert "and 0 min remain" in line
+
+
+def test_the_retry_pass_does_not_start_inside_the_dead_zone(conn, monkeypatch, caplog):
+    """A 1 h night: Alpha's Mapillary census lands, its walk is refused by
+    Overpass and stranded, and that refusal leaves 500 s -- above the 300 s
+    clamp floor, below the 600 s fixed slack. The loop is done, and the retry
+    pass must not start: asking would spend a real Overpass re-check and then
+    floor-skip the resumable walk into "deferred for budget" (#373)."""
+    from streetscape_metadata_tracker.download_common import HOST_OVERPASS
+
+    monkeypatch.setattr(_sched, "HOST_RECHECK_COOLDOWN_S", 0)
+    probe = _recovering_probe([True])
+    monkeypatch.setitem(_sched.HOST_RECHECKS, HOST_OVERPASS, probe)
+    alpha = _register(conn, "Alpha", width=1000, height=1000, step=20)
+    now = [1_000.0]
+    monkeypatch.setattr(_sched.time, "monotonic", lambda: now[0])
+    cfg = SchedulerConfig(
+        providers={
+            "mapillary": ProviderConfig(enabled=True, daily_request_budget=40_000),
+            "mapillary_streets": ProviderConfig(enabled=True, daily_request_budget=5_000),
+        },
+        max_batch_hours=1,
+        publish_enabled=False,
+        alerts=AlertConfig(enabled=True, failure_threshold=99),
+    )
+    ran = []
+
+    def run_one(city, provider):
+        ran.append((city.city_id, provider))
+        if provider == "mapillary_streets":
+            now[0] += 3600 - 500
+            return _blocked_outcome(HOST_OVERPASS)
+        return True
+
+    with caplog.at_level(logging.INFO):
+        _drive_night(monkeypatch, conn, cfg, run_one)
+
+    assert ran == [(alpha, "mapillary"), (alpha, "mapillary_streets")]
+    assert probe.calls == [], "no Overpass re-check spent in the dead zone"
+    done = _done_line(caplog)
+    assert "deferred for budget" not in done
+    assert "1 city(ies) STRANDED un-walked" in done
+    assert not any("End-of-night retry" in r.message for r in caplog.records)
+
+
+def test_the_alert_marks_a_deadline_stranding_when_the_night_alerts_for_another_reason(
+    conn, monkeypatch
+):
+    """Alpha's walk is stranded by the deadline, which alone would not alert;
+    Beta's grid run FAILS at failure_threshold 1, which does. The STRANDED
+    paragraph then lists Alpha with its reason, so the operator can tell it
+    from a host stranding (which waits for the host)."""
+    alpha = _register(conn, "Alpha", width=1000, height=1000, step=20)
+    beta = _register(conn, "Beta", width=1000, height=1000, step=20)
+    _no_salvage(_sched, monkeypatch)
+    real = _sched.city_timeout_estimate_seconds
+
+    def estimate(cfg, city, provider, conn=None):
+        if city.city_id == alpha and provider == "gsv_streets":
+            return 10**9
+        return real(cfg, city, provider, conn=conn)
+
+    monkeypatch.setattr(_sched, "city_timeout_estimate_seconds", estimate)
+    cfg = SchedulerConfig(
+        providers={
+            "gsv": ProviderConfig(enabled=True, daily_request_budget=10_000_000),
+            "gsv_streets": ProviderConfig(enabled=True, daily_request_budget=2_000_000),
+        },
+        publish_enabled=False,
+        alerts=AlertConfig(enabled=True, failure_threshold=1),
+    )
+
+    rc, alerts = _drive_night(
+        monkeypatch,
+        conn,
+        cfg,
+        lambda city, provider: not (city.city_id == beta and provider == "gsv"),
+    )
+
+    assert rc == 1
+    [(_subject, body)] = alerts
+    assert f"{alpha} (gsv_streets: the batch deadline)" in body
+    assert "never retries a walk marked `the batch deadline`" in body
+
+
+def test_a_walk_deferred_after_its_grid_FAILED_is_not_stranded(conn, monkeypatch):
+    """The grid run fails and the walk defers: the city is still gsv-due, so
+    it comes back tomorrow with both, and nothing is stranded."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    city = db.resolve_city(conn, _register(conn, "Bend", width=1000, height=1000, step=20))
+    real = sched.city_timeout_estimate_seconds
+    monkeypatch.setattr(
+        sched,
+        "city_timeout_estimate_seconds",
+        lambda cfg_, c, p, conn=None: 7200 if p == "gsv_streets" else real(cfg_, c, p, conn=conn),
+    )
+    monkeypatch.setattr(sched.time, "monotonic", lambda: 0.0)
+    _no_salvage(sched, monkeypatch)
+    monkeypatch.setattr(sched, "_run_one_city", lambda *a, **k: False)
+    breaker = sched.HostBreaker()
+    deferred: Counter[str] = Counter()
+
+    _run_channels(
+        sched,
+        _street_cfg(),
+        conn,
+        city,
+        ["gsv", "gsv_streets"],
+        batch_deadline=3600.0,
+        deadline_deferred=deferred,
+        blocked_hosts=breaker,
+        record_failures=False,
+    )
+
+    assert deferred == Counter({"gsv_streets": 1})
+    assert breaker.stranded == {}
+    assert breaker.deadline_stranded == set()
+
+
+def test_a_deferred_first_WALK_defers_only_itself(conn, monkeypatch):
+    """A city excluded from gsv leads with its walk. A deferred walk has no
+    grid to pair with, so the whole-city rule does not fire: only the walk
+    defers, and the Mapillary census still launches."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    city = db.resolve_city(conn, _register(conn, "Bend", width=1000, height=1000, step=20))
+    real = sched.city_timeout_estimate_seconds
+    monkeypatch.setattr(
+        sched,
+        "city_timeout_estimate_seconds",
+        lambda cfg_, c, p, conn=None: 7200 if p == "gsv_streets" else real(cfg_, c, p, conn=conn),
+    )
+    monkeypatch.setattr(sched.time, "monotonic", lambda: 0.0)
+    launched = _deadline_recorder(sched, monkeypatch)
+    deferred: Counter[str] = Counter()
+
+    _run_channels(
+        sched,
+        _street_cfg(),
+        conn,
+        city,
+        ["gsv_streets", "mapillary"],
+        batch_deadline=3600.0,
+        deadline_deferred=deferred,
+    )
+
+    assert [p for _cid, p, _t in launched] == ["mapillary"]
+    assert deferred == Counter({"gsv_streets": 1})
+
+
+def test_the_retry_pass_stops_between_walks_inside_the_dead_zone(conn, monkeypatch, caplog):
+    """The PER-WALK gate, apart from the pre-start one: the pass starts with
+    most of a 1 h night left, Alpha's retried walk lands and its child uses
+    the clock down to 500 s. Beta's walk must not be asked: under the 600 s
+    fixed slack a resumable walk can only floor-skip into "deferred for
+    budget", and asking would spend the breaker's attention for nothing."""
+    from streetscape_metadata_tracker.download_common import HOST_OVERPASS
+
+    monkeypatch.setattr(_sched, "HOST_RECHECK_COOLDOWN_S", 0)
+    # Loop: Beta's launch re-checks and is refused (so it strands too); the
+    # pass: Alpha's ask re-checks and clears.
+    probe = _recovering_probe([False, True])
+    monkeypatch.setitem(_sched.HOST_RECHECKS, HOST_OVERPASS, probe)
+    alpha = _register(conn, "Alpha", width=1000, height=1000, step=20)
+    beta = _register(conn, "Beta", width=1000, height=1000, step=20)
+    _record_waits(monkeypatch)
+    now = [1_000.0]
+    monkeypatch.setattr(_sched.time, "monotonic", lambda: now[0])
+    cfg = SchedulerConfig(
+        providers={
+            "mapillary": ProviderConfig(enabled=True, daily_request_budget=40_000),
+            "mapillary_streets": ProviderConfig(enabled=True, daily_request_budget=5_000),
+        },
+        max_batch_hours=1,
+        publish_enabled=False,
+        alerts=AlertConfig(enabled=True, failure_threshold=99),
+    )
+    ran = []
+
+    def run_one(city, provider):
+        ran.append((city.city_id, provider))
+        if provider == "mapillary_streets" and city.city_id == alpha:
+            if ran.count((alpha, "mapillary_streets")) == 1:
+                return _blocked_outcome(HOST_OVERPASS)
+            now[0] = 1_000.0 + 3600 - 500  # the retried child leaves 500 s
+        return True
+
+    with caplog.at_level(logging.INFO):
+        _drive_night(monkeypatch, conn, cfg, run_one)
+
+    assert ran == [
+        (alpha, "mapillary"),
+        (alpha, "mapillary_streets"),
+        (beta, "mapillary"),
+        (alpha, "mapillary_streets"),
+    ]
+    assert len(probe.calls) == 2, "Beta's walk was never asked about in the pass"
+    done = _done_line(caplog)
+    assert "deferred for budget" not in done
+    assert "1 stranded walk(s) recovered" in done
+    assert "1 city(ies) STRANDED un-walked" in done
+    assert "during the end-of-night retry; 1 stranded walk(s) not retried" in done
+
+
+# ── A shared rolling-24h budget per per-IP host (issue #385) ────────────────
+#
+# Block 4 (2026-09-28 02:27 PDT) landed after ~4,600 tile requests in ~24.5 h:
+# a daytime mapillary_streets catch-up charged to the NEXT UTC date, plus the
+# first 80-city night. Neither channel's daily budget was exceeded, because each
+# read only its own api_usage row for one UTC date. These pin the pool both
+# Mapillary channels now draw from, counted over a rolling 24 h.
+
+_HB_NOW = datetime(2026, 9, 28, 6, 0, tzinfo=UTC)
+_HB_TODAY = _HB_NOW.date()
+
+
+def _host_budget_cfg(tmp_path, *, hosts="3000", mapillary_budget=40_000, walk_budget=5_000):
+    """Load a Mapillary-pair config THROUGH the loader (never hand-built).
+
+    ``hosts`` is the [hosts.mapillary_tiles] budget as TOML text, None for no
+    [hosts] section at all, or a raw TOML block when it starts with ``[``.
+    """
+    if hosts is None:
+        hosts_block = ""
+    elif hosts.startswith("["):
+        hosts_block = hosts
+    else:
+        hosts_block = f"[hosts.mapillary_tiles]\nrolling_24h_request_budget = {hosts}\n"
+    path = tmp_path / "hosts.toml"
+    path.write_text(
+        "[providers.gsv]\nenabled = false\n\n"
+        f"[providers.mapillary]\nenabled = true\ndaily_request_budget = {mapillary_budget}\n"
+        "max_requests_per_minute = 40\njitter = 0.6\n\n"
+        f"[providers.mapillary_streets]\nenabled = true\ndaily_request_budget = {walk_budget}\n"
+        "max_requests_per_minute = 40\njitter = 0.6\n\n"
+        f'[paths]\ndata_dir = "{tmp_path / "data"}"\nlog_dir = "{tmp_path / "logs"}"\n'
+        f'backup_dir = "{tmp_path / "backups"}"\n\n' + hosts_block
+    )
+    return load_scheduler_config(str(path))
+
+
+def _seed_host(conn, n, at, provider="mapillary_streets"):
+    """Put ``n`` tile requests in host_usage at ``at`` -- and nowhere else."""
+    conn.execute(
+        "INSERT INTO host_usage VALUES (?, 'mapillary_tiles', ?, ?)", (at.isoformat(), provider, n)
+    )
+    conn.commit()
+
+
+def _host_run(monkeypatch, conn, cfg, calls, *, spend=0, **run_kwargs):
+    """cmd_run_due with a fake child that ledgers ``min(spend, cap)`` the way the real one does.
+
+    The spend goes through ``db.add_api_usage`` -- the real write seam -- so the
+    next launch's read sees it exactly as it would in production.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    def fake(cfg_, city, today_, provider="gsv", request_cap=None, **kwargs):
+        calls.append((city.city_id, provider, dict(kwargs, request_cap=request_cap)))
+        n = spend if request_cap is None else min(spend, request_cap)
+        if n:
+            db.add_api_usage(conn, today_, n, provider)
+        return True
+
+    monkeypatch.setattr(sched, "_run_one_city", fake)
+    _stub_tail(monkeypatch, sched, conn, [])
+    monkeypatch.setattr(sched, "send_alert", lambda *a, **k: None)
+    return sched.cmd_run_due(cfg, today=_HB_TODAY, **run_kwargs)
+
+
+def _caps(calls, provider):
+    return [c[2]["request_cap"] for c in calls if c[1] == provider]
+
+
+def test_block_4s_catch_up_then_night_is_gated_across_the_utc_boundary(
+    conn, monkeypatch, tmp_path, frozen_utc_clock
+):
+    """Block 4's shape: 1,444 from a catch-up 9 h ago, on the PREVIOUS UTC date.
+
+    The channel's own daily row is empty (the catch-up was the other channel,
+    and yesterday), so only a rolling window that reaches back across midnight
+    can see it. Each city's cap is 3,000 minus the catch-up minus what this
+    night's earlier city already spent.
+    """
+    frozen_utc_clock(_HB_NOW - timedelta(hours=9))
+    db.add_api_usage(conn, _HB_TODAY - timedelta(days=1), 1444, "mapillary_streets")
+    frozen_utc_clock(_HB_NOW)
+    for name in ("Bend", "Corvallis"):
+        _register(conn, name)
+    cfg = _host_budget_cfg(tmp_path)
+
+    calls = []
+    _host_run(monkeypatch, conn, cfg, calls, spend=300, requested_providers=["mapillary"])
+
+    assert _caps(calls, "mapillary") == [3000 - 1444, 3000 - 1444 - 300]
+
+
+def test_the_budget_is_shared_by_both_channels_on_the_host(
+    conn, monkeypatch, tmp_path, frozen_utc_clock
+):
+    """The grid channel's 2,500 leaves the walk 500, whatever the walk's own row says."""
+    frozen_utc_clock(_HB_NOW - timedelta(hours=1))
+    db.add_api_usage(conn, _HB_TODAY, 2500, "mapillary")
+    frozen_utc_clock(_HB_NOW)
+    _register(conn, "Bend")
+    cfg = _host_budget_cfg(tmp_path)
+    assert db.get_api_usage(conn, _HB_TODAY, "mapillary_streets") == 0
+
+    calls = []
+    _host_run(monkeypatch, conn, cfg, calls, requested_providers=["mapillary_streets"])
+
+    assert _caps(calls, "mapillary_streets") == [500]
+
+
+@pytest.mark.parametrize(
+    "host_used,mapillary_budget,deadline_s,cap,host_deferred,budget_skipped,host_named",
+    [
+        pytest.param(2500, 40_000, None, 500, 0, 0, True, id="host-governs-the-cap"),
+        pytest.param(0, 800, None, 800, 0, 0, False, id="channel-governs-the-cap"),
+        pytest.param(2999, 40_000, None, None, 1, 0, True, id="host-governs-the-skip"),
+        pytest.param(0, 1, None, None, 0, 1, False, id="channel-governs-the-skip"),
+        # Host remainder == channel remainder: the CHANNEL is the named term
+        # (strictly smaller governs), so the skip is a plain budget skip.
+        pytest.param(2999, 1, None, None, 0, 1, False, id="a-tie-goes-to-the-channel"),
+        # The host governs the LEDGER term, but a 5 s deadline clamps the clock
+        # term to 0 and that is what put the cap under the floor.
+        pytest.param(2000, 40_000, 5, None, 0, 1, False, id="the-clock-binds-the-skip"),
+    ],
+)
+def test_the_remainder_is_the_minimum_and_the_skip_names_its_ceiling(
+    conn,
+    monkeypatch,
+    tmp_path,
+    frozen_utc_clock,
+    caplog,
+    host_used,
+    mapillary_budget,
+    deadline_s,
+    cap,
+    host_deferred,
+    budget_skipped,
+    host_named,
+):
+    """Both directions of the minimum, for a capped launch and for a floor skip.
+
+    A skip the HOST's window caused is counted in ``deferred_host_budget``, never
+    ``skipped_budget``: the channel has budget left today, and the operator's
+    lever is a different knob. Two review cases pin WHICH term bound: a tie is
+    the channel's, and a skip the deadline clamp caused is the clock's even
+    while the host is the smaller ledger remainder -- attributing either to the
+    host would send the operator to the wrong knob. A host-capped launch names
+    the host on its cap line, and nothing else does.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    frozen_utc_clock(_HB_NOW)
+    if host_used:
+        _seed_host(conn, host_used, _HB_NOW - timedelta(hours=2))
+    cfg = _host_budget_cfg(tmp_path, mapillary_budget=mapillary_budget)
+    city = _lane_city(conn)
+    # Over every cap here, so a capped launch logs its cap line.
+    monkeypatch.setattr(sched, "_channel_estimate", lambda *a, **k: 1000)
+    calls = []
+    monkeypatch.setattr(
+        sched,
+        "_run_one_city",
+        lambda cfg_, city_, today_, provider="gsv", **kw: calls.append(kw) or True,
+    )
+    deferred = Counter()
+
+    with caplog.at_level(logging.INFO, logger="streetscape_scheduler"):
+        _attempted, _succeeded, skipped = _run_channels(
+            sched,
+            cfg,
+            conn,
+            city,
+            ["mapillary"],
+            deferred_host_budget=deferred,
+            batch_deadline=None if deadline_s is None else time.monotonic() + deadline_s,
+        )
+
+    assert [c["request_cap"] for c in calls] == ([] if cap is None else [cap])
+    assert deferred == (Counter({"mapillary_tiles": 1}) if host_deferred else Counter())
+    assert skipped == budget_skipped
+    city_lines = [r.getMessage() for r in caplog.records if city.city_id in r.getMessage()]
+    assert city_lines, "every case here logs its decision"
+    named = [line for line in city_lines if "rolling-24h budget of" in line]
+    assert bool(named) == host_named, city_lines
+    if host_named and cap is not None:
+        assert "launching capped" in named[0] and f"{cap:,} left in the rolling-24h" in named[0]
+
+
+@pytest.mark.parametrize(
+    "hosts,spent,spent_hours_ago,deadline_h,launched_cap,wall_text",
+    [
+        # Last night's 2,947, stamped 20 h ago, ages out 4 h into a 12 h batch:
+        # tonight can grant nearly all of 3,000, so the crawl launches capped at
+        # the 53 left right now. Fails if the wall reads the MOMENTARY remainder.
+        pytest.param("3000", 2947, 20, 12, 53, None, id="last-nights-spend-frees"),
+        # THIS night's 2,947, stamped 1 h ago, is still in the window when the
+        # batch ends: 53 is all tonight can ever grant, so the crawl could never
+        # finish, and the wall must refuse it (a recorded failure) rather than
+        # launch a capped slice whose checkpoint is discarded next week with no
+        # failure at all. Fails if the ceiling is the host's FULL budget.
+        pytest.param(
+            "3000",
+            2947,
+            1,
+            12,
+            None,
+            "will not fit tonight's 53 (53 left in the rolling-24h budget of",
+            id="tonights-spend-persists",
+        ),
+        # A 300 budget can never grant the ~360 left, however much frees.
+        pytest.param(
+            "300",
+            100,
+            20,
+            12,
+            None,
+            "will not fit tonight's 300 (300 is the most the rolling-24h budget of",
+            id="budget-under-the-crawl",
+        ),
+        # No batch deadline (an operator run): nothing is assumed to age out, so
+        # the ceiling is the momentary remainder -- the conservative reading.
+        pytest.param("3000", 2947, 20, None, None, "will not fit tonight's 53", id="no-deadline"),
+    ],
+)
+def test_the_age_wall_projects_against_what_tonights_batch_can_grant(
+    conn,
+    tmp_path,
+    monkeypatch,
+    caplog,
+    hosts,
+    spent,
+    spent_hours_ago,
+    deadline_h,
+    launched_cap,
+    wall_text,
+):
+    """Issue #385 review: the age wall's ceiling is the host budget minus the
+    spend still in the window when the BATCH ENDS (``batch_end - 24h`` onward).
+
+    The channel has 40,000 left, the checkpoint is 6.5 days old with ~360
+    requests to go, and the arm that RECORDS A FAILURE is the question. When it
+    refuses on the host, it names the host's knob.
+    """
+    from streetscape_metadata_tracker import clock
+    from streetscape_metadata_tracker import scheduler as sched
+
+    # Real clock, not frozen: the checkpoint's age is measured from the wall
+    # clock _write_sweep_checkpoint stamps.
+    now = clock.utc_now()
+    city = _checkpointed_city(
+        conn,
+        tmp_path,
+        monkeypatch,
+        roots_done=10,
+        root_count=100,
+        days_old=6.5,
+        channel="mapillary",
+    )
+    monkeypatch.setattr(sched, "_channel_estimate", lambda *a, **k: 400)
+    calls = []
+    monkeypatch.setattr(
+        sched,
+        "_run_one_city",
+        lambda cfg_, city_, today_, provider="gsv", **kw: calls.append(kw) or True,
+    )
+    _seed_host(conn, spent, now - timedelta(hours=spent_hours_ago), provider="mapillary")
+    cfg = _host_budget_cfg(tmp_path, hosts=hosts)
+
+    with caplog.at_level(logging.WARNING, logger="streetscape_scheduler"):
+        attempted, succeeded, _ = _run_channels(
+            sched,
+            cfg,
+            conn,
+            city,
+            ["mapillary"],
+            batch_deadline=None if deadline_h is None else time.monotonic() + deadline_h * 3600,
+        )
+
+    row = conn.execute(
+        "SELECT consecutive_failures FROM schedule_state WHERE city_id = ? AND provider = ?",
+        (city.city_id, "mapillary"),
+    ).fetchone()
+    if launched_cap is not None:
+        assert [c["request_cap"] for c in calls] == [launched_cap]
+        assert (attempted, succeeded) == (1, 1), "a capped launch, not a recorded failure"
+        assert row is None or row["consecutive_failures"] == 0
+        return
+    assert calls == [] and (attempted, succeeded) == (1, 0)
+    refusal = next(r.getMessage() for r in caplog.records if "refusing to resume" in r.getMessage())
+    assert wall_text in refusal
+    assert "raise [hosts.mapillary_tiles].rolling_24h_request_budget" in refusal
+
+
+@pytest.mark.parametrize(
+    "spent_hours_ago,verdict",
+    [
+        pytest.param(20, "launch capped at 53; resumes [host rolling-24h budget]", id="frees"),
+        pytest.param(1, "REFUSED (checkpoint 6.5 d old, 10/100)", id="persists"),
+    ],
+)
+def test_the_dry_run_age_wall_agrees_with_the_live_one(
+    conn, tmp_path, monkeypatch, capsys, spent_hours_ago, verdict
+):
+    """Issue #385 review: the preview passes the SAME age-wall ceiling the night does.
+
+    Its batch is assumed to start now and run ``max_batch_hours`` (10 h here),
+    so 2,947 stamped 20 h ago ages out before it ends and the preview shows the
+    capped launch the night makes; stamped 1 h ago it does not, and the preview
+    shows the refusal. Handing the plan ``remainder.remaining`` (or no batch
+    end) instead turns the first case into a refusal the night never makes.
+    """
+    from streetscape_metadata_tracker import clock
+    from streetscape_metadata_tracker import scheduler as sched
+
+    now = clock.utc_now()
+    city = _checkpointed_city(
+        conn,
+        tmp_path,
+        monkeypatch,
+        roots_done=10,
+        root_count=100,
+        days_old=6.5,
+        channel="mapillary",
+    )
+    _seed_host(conn, 2947, now - timedelta(hours=spent_hours_ago), provider="mapillary")
+    cfg = _host_budget_cfg(tmp_path)
+    assert cfg.max_batch_hours == 10
+    monkeypatch.setattr(sched, "_channel_estimate", lambda *a, **k: 400)
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+
+    assert (
+        sched.cmd_run_due(cfg, dry_run=True, today=now.date(), requested_providers=["mapillary"])
+        == 0
+    )
+    line = next(line for line in capsys.readouterr().out.splitlines() if city.city_id in line)
+    assert line.split("req  ", 1)[1] == verdict
+
+
+def test_the_dry_runs_own_spend_counts_against_a_later_citys_age_wall(
+    conn, tmp_path, monkeypatch, capsys
+):
+    """Issue #385 review: spend the PREVIEW simulates tonight stays in the window
+    at batch end, so it comes off a later city's age-wall ceiling.
+
+    Albany (first by city_id) prices at 2,800 and previews as ok; Bend's
+    6.5-day checkpoint then has ~360 left against a pool tonight can refill to
+    only 3,000 - 2,800 = 200, and the preview must show the refusal the night
+    would make. Adding the simulated spend to ``used`` alone leaves the ceiling
+    at 3,000 and previews a capped launch instead.
+    """
+    from streetscape_metadata_tracker import clock
+    from streetscape_metadata_tracker import scheduler as sched
+
+    now = clock.utc_now()
+    albany = _register(conn, "Albany", width=1000, height=1000, step=20)
+    bend = _checkpointed_city(
+        conn,
+        tmp_path,
+        monkeypatch,
+        roots_done=10,
+        root_count=100,
+        days_old=6.5,
+        channel="mapillary",
+    )
+    assert albany < bend.city_id
+    cfg = _host_budget_cfg(tmp_path)
+    monkeypatch.setattr(
+        sched,
+        "_channel_estimate",
+        lambda cfg_, city, provider, conn_, **k: 2800 if city.city_id == albany else 400,
+    )
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+
+    assert (
+        sched.cmd_run_due(cfg, dry_run=True, today=now.date(), requested_providers=["mapillary"])
+        == 0
+    )
+    lines = capsys.readouterr().out.splitlines()
+    verdict = {
+        cid: next(line for line in lines if cid in line).split("req  ", 1)[1]
+        for cid in (albany, bend.city_id)
+    }
+    assert verdict == {albany: "ok", bend.city_id: "REFUSED (checkpoint 6.5 d old, 10/100)"}
+
+
+@pytest.mark.parametrize(
+    "remaining_s,est,lever",
+    [
+        # A deadline 20 minutes out clamps the timeout: 0 requests after the
+        # fixed slack. The lever is the batch deadline.
+        pytest.param(
+            1200,
+            400,
+            "the batch deadline, which clamped this launch's timeout to",
+            id="the-deadline-clamp",
+        ),
+        # No deadline, and a crawl far larger than the city's own derived
+        # timeout can pace. The lever is that timeout, not the batch.
+        pytest.param(
+            None,
+            10_000_000,
+            "the city's own 180-minute derived timeout ([schedule].city_timeout_minutes",
+            id="the-derived-timeout",
+        ),
+    ],
+)
+def test_an_age_wall_the_clock_binds_names_the_timeout_not_a_budget(
+    conn, tmp_path, monkeypatch, remaining_s, est, lever
+):
+    """Issue #385 review: when a TIMEOUT is the smaller term, no budget is the
+    lever -- and which timeout it is decides what to change."""
+    from streetscape_metadata_tracker.scheduler import _SWEEP_SKIP_AGE_WALL, _sweep_launch_plan
+
+    city = _checkpointed_city(
+        conn,
+        tmp_path,
+        monkeypatch,
+        roots_done=10,
+        root_count=100,
+        days_old=6.5,
+        channel="mapillary",
+    )
+    cfg = _host_budget_cfg(tmp_path)
+    plan = _sweep_launch_plan(
+        cfg,
+        city,
+        "mapillary",
+        conn,
+        est=est,
+        remaining=100_000_000,
+        remaining_s=remaining_s,
+        city_channels=["mapillary"],
+    )
+    assert plan.skip == _SWEEP_SKIP_AGE_WALL
+    assert lever in plan.message
+    assert "daily_request_budget" not in plan.message
+    assert "rolling_24h_request_budget" not in plan.message
+
+
+def test_the_age_wall_ceiling_counts_spend_from_exactly_batch_end_minus_24h(
+    conn, tmp_path, monkeypatch, frozen_utc_clock
+):
+    """Issue #385 review: the batch-end boundary, to the second.
+
+    Clock frozen and ``time.monotonic`` pinned, so the live path's
+    ``_batch_end_utc`` puts the batch end exactly 12 h out. A row stamped
+    exactly ``batch_end - 24h`` is still in the window when the batch ends and
+    comes off the ceiling; one a second earlier ages out first and does not.
+    Both are inside the momentary window. Fails if the boundary moves by
+    hours, or if the batch end is not the deadline's wall-clock equivalent.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    frozen_utc_clock(_HB_NOW)
+    monkeypatch.setattr(sched.time, "monotonic", lambda: 5_000.0)
+    boundary = _HB_NOW + timedelta(hours=12) - timedelta(hours=24)
+    _seed_host(conn, 500, boundary, provider="mapillary")
+    _seed_host(conn, 700, boundary - timedelta(seconds=1), provider="mapillary")
+    cfg = _host_budget_cfg(tmp_path)
+
+    batch_end = sched._batch_end_utc(5_000.0 + 12 * 3600)
+    assert batch_end == _HB_NOW + timedelta(hours=12)
+    remainder = sched._budget_remainder(cfg, conn, _HB_TODAY, "mapillary", batch_end=batch_end)
+    assert remainder.remaining == 3000 - 1200, "both rows are in the window right now"
+    assert (remainder.ceiling, remainder.ceiling_host) == (3000 - 500, "mapillary_tiles")
+
+
+def test_a_non_resumable_channel_on_a_budgeted_host_is_deferred_by_the_host(
+    conn, monkeypatch, tmp_path, frozen_utc_clock, capsys
+):
+    """The all-or-nothing arm, live and in the preview (issue #385 review).
+
+    No metered channel takes it today -- every one is resumable -- so it is
+    reached by patching is_resumable_channel. 1,000 requests do not fit the 10
+    the host has left, although the channel's own 40,000 is untouched: the
+    night counts it in ``deferred_host_budget`` (not ``skipped_budget``) and the
+    dry run labels it as the host's deferral.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    frozen_utc_clock(_HB_NOW)
+    _seed_host(conn, 2990, _HB_NOW - timedelta(hours=1))
+    cfg = _host_budget_cfg(tmp_path)
+    city = _lane_city(conn)
+    monkeypatch.setattr(sched, "is_resumable_channel", lambda channel: False)
+    monkeypatch.setattr(sched, "_channel_estimate", lambda *a, **k: 1000)
+    calls = []
+    monkeypatch.setattr(
+        sched,
+        "_run_one_city",
+        lambda cfg_, city_, today_, provider="gsv", **kw: calls.append(kw) or True,
+    )
+    deferred = Counter()
+
+    _attempted, _succeeded, skipped = _run_channels(
+        sched, cfg, conn, city, ["mapillary"], deferred_host_budget=deferred
+    )
+    assert calls == [] and skipped == 0
+    assert deferred == Counter({"mapillary_tiles": 1})
+
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+    assert sched.cmd_run_due(cfg, dry_run=True, today=_HB_TODAY) == 0
+    lines = [line for line in capsys.readouterr().out.splitlines() if city.city_id in line]
+    assert lines and all("DEFERRED (host rolling-24h budget)" in line for line in lines), lines
+
+
+def test_the_dry_run_draws_the_host_pool_down_across_both_channels(
+    conn, monkeypatch, tmp_path, frozen_utc_clock, capsys
+):
+    """Three cities x both Mapillary channels at 12 requests each, against a pool of 30.
+
+    The preview applies the live rule (``_combine_remainder``) to a SIMULATED
+    window, so each launch it prints draws the pool down for the next -- across
+    channels, since the pool is the host's: ok, ok, capped at 6, then three
+    deferrals. Without the drawdown all six print "ok" beside a night that
+    defers four of them.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    frozen_utc_clock(_HB_NOW)
+    for name in ("Bend", "Corvallis", "Eugene"):
+        _register(conn, name)
+    cfg = _host_budget_cfg(tmp_path, hosts="30")
+    monkeypatch.setattr(sched, "_channel_estimate", lambda *a, **k: 12)
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+
+    assert sched.cmd_run_due(cfg, dry_run=True, today=_HB_TODAY) == 0
+    rows = [line for line in capsys.readouterr().out.splitlines() if "~       12 req" in line]
+    verdicts = [line.split("req  ", 1)[1] for line in rows]
+    assert verdicts == [
+        "ok",
+        "ok",
+        "launch capped at 6; resumes [host rolling-24h budget]",
+        "deferred (0 req under the launch floor) [host rolling-24h budget]",
+        "deferred (0 req under the launch floor) [host rolling-24h budget]",
+        "deferred (0 req under the launch floor) [host rolling-24h budget]",
+    ]
+
+
+def test_no_host_budget_configured_is_todays_launch_exactly(
+    conn, monkeypatch, tmp_path, frozen_utc_clock
+):
+    """Absent, empty or unreachable [hosts] launches byte-identical children.
+
+    Captured at ``_run_collection_subprocess`` -- the REAL ``_run_one_city``
+    builds the argv, so the request-cap flag, the timeout and everything else
+    the gate could move is compared as the child would receive it, for the grid
+    run AND the walk. 10,000 requests sit in the window: with no budget, an
+    empty ``[hosts]`` table, or a budget of 10,000,000 (whose remainder never
+    undercuts the channel's own 2,000) the launches are identical. The same
+    ledger under the prod budget changes them, which is what makes the first
+    three a measurement rather than a harness blind to the host term.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    frozen_utc_clock(_HB_NOW)
+    _seed_host(conn, 10_000, _HB_NOW - timedelta(hours=1))
+    _register(conn, "Bend")
+    launches = []
+
+    def capture(cfg_, cmd, timeout_s, city, provider, today_):
+        launches.append((provider, tuple(cmd), timeout_s))
+        return sched.CollectionOutcome(True, "stubbed")
+
+    monkeypatch.setattr(sched, "_run_collection_subprocess", capture)
+    monkeypatch.setattr(sched, "_reconcile_orphaned_run", lambda *a, **k: True)
+    monkeypatch.setattr(sched, "_reconcile_orphaned_walk", lambda *a, **k: True)
+    _stub_tail(monkeypatch, sched, conn, [])
+    monkeypatch.setattr(sched, "send_alert", lambda *a, **k: None)
+
+    nights = {}
+    for key, spelling in (
+        ("absent", None),
+        ("empty", "[hosts]\n"),
+        ("unreachable", "10000000"),
+        ("budgeted", "3000"),
+    ):
+        # Each night starts from the same catalog: a success would otherwise
+        # make the city not-due for the next spelling.
+        conn.execute("DELETE FROM schedule_state")
+        conn.commit()
+        launches.clear()
+        cfg = _host_budget_cfg(tmp_path, hosts=spelling, mapillary_budget=2000, walk_budget=2000)
+        assert cfg.host_budget_errors == []
+        sched.cmd_run_due(
+            cfg, today=_HB_TODAY, requested_providers=["mapillary", "mapillary_streets"]
+        )
+        nights[key] = list(launches)
+
+    assert [p for p, _, _ in nights["absent"]] == ["mapillary", "mapillary_streets"]
+    assert nights["empty"] == nights["absent"]
+    assert nights["unreachable"] == nights["absent"]
+    assert nights["budgeted"] != nights["absent"], "the harness can see a host term"
+
+
+@pytest.mark.parametrize(
+    "block",
+    [
+        "[hosts.tiles_mapillary]\nrolling_24h_request_budget = 3000\n",
+        "[hosts.mapillary_tiles]\nrolling_24h_request_budget = 0\n",
+        "[hosts.mapillary_tiles]\nrolling_24h_request_budget = -5\n",
+        "[hosts.mapillary_tiles]\nrolling_24h_request_budget = true\n",
+        '[hosts.mapillary_tiles]\nrolling_24h_request_budget = "3000"\n',
+        "[hosts.mapillary_tiles]\nrolling_24h_request_budget = 3000\ndaily = 1\n",
+        "[hosts.mapillary_tiles]\n",
+        # A real per-IP host no channel's ledger meters: it would load clean and
+        # never bind, so it is refused like a typo (issue #385 review).
+        "[hosts.overpass]\nrolling_24h_request_budget = 3000\n",
+    ],
+    ids=[
+        "unknown-token",
+        "zero",
+        "negative",
+        "bool",
+        "string",
+        "extra-key",
+        "missing-key",
+        "unmetered-host",
+    ],
+)
+def test_an_invalid_host_budget_refuses_the_channel_running_commands(
+    conn, monkeypatch, tmp_path, caplog, block
+):
+    """Invalid [hosts.*] fails at load: recorded, never silently ignored.
+
+    Ignoring it would fall back to NO budget -- the fail-open direction for a
+    guard whose job is to hold volume down -- so run-due and assess-city refuse
+    with USAGE_EXIT_CODE before the catalog is opened.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    with caplog.at_level(logging.ERROR, logger="streetscape_scheduler"):
+        cfg = _host_budget_cfg(tmp_path, hosts=block)
+    assert cfg.host_budgets == {}
+    assert len(cfg.host_budget_errors) == 1
+    # The loader LOGS each error as it records it, so a read-only subcommand
+    # that proceeds still leaves the reason in the log.
+    assert [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR] == (
+        cfg.host_budget_errors
+    )
+    if "overpass" in block or "tiles_mapillary" in block:
+        assert "metered hosts: kartaview, mapillary_tiles, panoramax" in cfg.host_budget_errors[0]
+    connected = []
+    monkeypatch.setattr(sched.db, "connect", lambda path: connected.append(path) or conn)
+    assert sched.cmd_run_due(cfg, today=_HB_TODAY) == sched.USAGE_EXIT_CODE
+    assert sched.cmd_assess_city(cfg, "Bend, OR") == sched.USAGE_EXIT_CODE
+    assert connected == []
+
+
+@pytest.mark.parametrize("host_used,cap", [(2900, 100), (2999, None)])
+def test_a_filtered_walk_catch_up_by_city_is_gated(
+    conn, monkeypatch, tmp_path, frozen_utc_clock, caplog, host_used, cap
+):
+    """`run-due --provider mapillary_streets --city ...` -- the 09-27 burst's own path.
+
+    Capped at what the host has left, or deferred under the launch floor with
+    the host named on the city's line AND on the Done: line.
+    """
+    frozen_utc_clock(_HB_NOW)
+    _seed_host(conn, host_used, _HB_NOW - timedelta(hours=3), provider="mapillary")
+    cid = _register(conn, "Bend")
+    _register(conn, "Corvallis")
+    cfg = _host_budget_cfg(tmp_path)
+
+    calls = []
+    with caplog.at_level(logging.INFO, logger="streetscape_scheduler"):
+        _host_run(
+            monkeypatch,
+            conn,
+            cfg,
+            calls,
+            requested_providers=["mapillary_streets"],
+            requested_cities=[cid],
+        )
+
+    assert _caps(calls, "mapillary_streets") == ([] if cap is None else [cap])
+    assert {c[0] for c in calls} <= {cid}
+    done = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Done:")]
+    note = "1 deferred for the rolling-24h budget of Mapillary's tile CDN"
+    if cap is None:
+        assert any(note in d for d in done), done
+        lines = [
+            r.getMessage()
+            for r in caplog.records
+            if r.getMessage().startswith(f"{cid} [mapillary_streets]: deferred — ")
+        ]
+        assert len(lines) == 1, lines
+        # The host clause is named exactly ONCE (the review found it twice:
+        # once as a prefix and again inside plan.message).
+        assert lines[0].count("the rolling-24h budget of Mapillary's tile CDN") == 1
+        assert "2,999 of 3,000 used since 2026-09-27 06:00 UTC" in lines[0]
+        assert "deferred for budget" not in done[0]
+    else:
+        assert not any(note in d for d in done)
+
+
+def test_dry_run_and_status_print_the_host_window(
+    conn, monkeypatch, tmp_path, frozen_utc_clock, capsys
+):
+    """The preview and the status table both show the pool, and the preview marks
+    the cities the host would defer -- rather than "ok" beside a night that
+    defers them."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    frozen_utc_clock(_HB_NOW)
+    _seed_host(conn, 2998, _HB_NOW - timedelta(hours=1))
+    _register(conn, "Bend")
+    cfg = _host_budget_cfg(tmp_path)
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+
+    assert sched.cmd_run_due(cfg, dry_run=True, today=_HB_TODAY) == 0
+    out = capsys.readouterr().out
+    assert "mapillary_tiles rolling 24 h: 2,998 / 3,000" in out.splitlines()[0]
+    city_lines = [line for line in out.splitlines() if "bend--oregon" in line]
+    assert len(city_lines) == 2 and all("[host rolling-24h budget]" in line for line in city_lines)
+
+    assert sched.cmd_status(cfg) == 0
+    assert "mapillary_tiles rolling 24 h: 2,998 / 3,000 requests used." in capsys.readouterr().out
+
+
+def test_a_second_city_sees_the_first_citys_spend(conn, monkeypatch, tmp_path, frozen_utc_clock):
+    """The host term is re-read PER LAUNCH: the night's own earlier child wrote to it."""
+    frozen_utc_clock(_HB_NOW)
+    for name in ("Bend", "Corvallis"):
+        _register(conn, name)
+    cfg = _host_budget_cfg(tmp_path)
+
+    calls = []
+    _host_run(monkeypatch, conn, cfg, calls, spend=1000, requested_providers=["mapillary"])
+
+    assert _caps(calls, "mapillary") == [3000, 2000]
+
+
+def test_the_metered_host_map_agrees_with_channel_hosts():
+    """Every channel with a non-Overpass per-IP host is metered, on exactly that host.
+
+    Derived from CHANNEL_HOSTS rather than a named list, so a ninth channel on a
+    per-IP host is a red test until someone decides what its ledger counts.
+    """
+    from streetscape_metadata_tracker.download_common import CHANNEL_METERED_HOST, HOST_OVERPASS
+    from streetscape_metadata_tracker.scheduler import CHANNEL_HOSTS
+
+    per_ip = {c: set(hosts) - {HOST_OVERPASS} for c, hosts in CHANNEL_HOSTS.items()}
+    assert set(CHANNEL_METERED_HOST) == {c for c, hosts in per_ip.items() if hosts}
+    for channel, host in CHANNEL_METERED_HOST.items():
+        assert per_ip[channel] == {host}, channel
+
+
+def test_the_tail_prunes_old_host_usage_and_survives_a_failed_prune(
+    conn, monkeypatch, tmp_path, frozen_utc_clock, caplog
+):
+    """30 days kept, older dropped; a prune that raises is reported, never raised.
+
+    Reported in BOTH places it can be seen: the scheduler log, and the summary
+    the publish log records (asserted through the ``_publish`` the tail hands it
+    to, so the check does not depend on the log line's wording).
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    frozen_utc_clock(_HB_NOW)
+    _seed_host(conn, 5, _HB_NOW - timedelta(days=31))
+    _seed_host(conn, 7, _HB_NOW - timedelta(days=29))
+    _register(conn, "Bend")
+    cfg = _host_budget_cfg(tmp_path)
+
+    assert _host_run(monkeypatch, conn, cfg, [], requested_providers=["mapillary"]) == 0
+    assert [r[0] for r in conn.execute("SELECT requests FROM host_usage")] == [7]
+
+    def boom(*a, **k):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(sched.db, "prune_host_usage", boom)
+    published = []
+    monkeypatch.setattr(
+        sched, "_publish", lambda cfg_, summary, **kw: published.append(summary) or 0
+    )
+    cfg = _host_budget_cfg(
+        tmp_path,
+        hosts="[hosts.mapillary_tiles]\nrolling_24h_request_budget = 3000\n\n"
+        "[publish]\nenabled = true\n",
+    )
+    assert cfg.publish_enabled
+    with caplog.at_level(logging.INFO, logger="streetscape_scheduler"):
+        rc = sched._finish_batch(cfg, conn, "run-due test", 1, 1, _HB_TODAY)
+    assert rc == 0, "a failed prune alone does not make the night unhealthy"
+    assert any("host_usage prune failed" in r.getMessage() for r in caplog.records)
+    assert len(published) == 1
+    assert "; host_usage prune FAILED (OperationalError('disk I/O error'))" in published[0]
+
+
+def test_the_rolling_window_is_24_hours_wide(conn, tmp_path, frozen_utc_clock):
+    """Spend 23 h back is inside the window, spend 25 h back is not.
+
+    Read through ``_budget_remainder``, the gate itself, rather than
+    ``db.get_host_usage`` with a hand-picked ``since``: what is pinned is
+    ``HOST_BUDGET_WINDOW``'s effect on a launch, so moving the constant either
+    way by two hours is a red test.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    frozen_utc_clock(_HB_NOW)
+    _seed_host(conn, 700, _HB_NOW - timedelta(hours=23))
+    _seed_host(conn, 900, _HB_NOW - timedelta(hours=25))
+    cfg = _host_budget_cfg(tmp_path)
+
+    remainder = sched._budget_remainder(cfg, conn, _HB_TODAY, "mapillary")
+    assert (remainder.host, remainder.host_used, remainder.remaining) == (
+        "mapillary_tiles",
+        700,
+        3000 - 700,
+    )
+    assert remainder.window_start == _HB_NOW - timedelta(hours=24)
+
+
+def test_the_stranded_walk_retry_pass_counts_into_the_nights_host_counter(
+    conn, monkeypatch, tmp_path, frozen_utc_clock, caplog
+):
+    """Issue #385 review: the #380 retry pass is handed the CALLER's counter.
+
+    Its walks go through _run_city_channels like the main loop's, so a walk the
+    host's window defers there has to reach the night's ``Done:`` line. Handing
+    the pass a throwaway ``Counter()`` would type-check, run, and lose every
+    such deferral. The pass is faked to record one, so what is pinned is the
+    wiring, not the retry logic (``test_*stranded*`` pin that).
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    frozen_utc_clock(_HB_NOW)
+    _register(conn, "Bend")
+    cfg = _host_budget_cfg(tmp_path)
+
+    def fake_retry(*a, deferred_host_budget, **k):
+        deferred_host_budget["mapillary_tiles"] += 1
+        return None
+
+    monkeypatch.setattr(sched, "_retry_stranded_walks", fake_retry)
+    with caplog.at_level(logging.INFO, logger="streetscape_scheduler"):
+        _host_run(monkeypatch, conn, cfg, [], requested_providers=["mapillary"])
+
+    done = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Done:")]
+    assert len(done) == 1
+    assert "; 1 deferred for the rolling-24h budget of Mapillary's tile CDN" in done[0]

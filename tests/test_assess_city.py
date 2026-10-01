@@ -10,7 +10,7 @@ behaviour is covered by tests/test_streetwalk_collect.py and
 tests/test_streetwalk_mapillary.py.
 """
 
-from datetime import date
+from datetime import UTC, date, datetime
 
 import pytest
 
@@ -238,16 +238,17 @@ def test_bad_arguments_exit_usage_without_opening_the_catalog(conn, monkeypatch,
 
 def test_the_size_without_center_refusal_explains_itself(conn, monkeypatch, tmp_path, caplog):
     """
-    cli.py tolerates --width/--height alone and centers the grid on the OSM
-    bounding-box midpoint, which for a river-bounded place is not downtown — and
-    the geometry is frozen forever. This command refuses instead, so the message
-    has to say why and name the flags that fix it.
+    cli.py accepts --width/--height alone and centers the grid on the
+    geocoder's reported point (#186), which nobody has verified is downtown
+    (#185) — and the geometry is frozen forever. This command refuses instead,
+    so the message has to say why and name the flags that fix it.
     """
     with caplog.at_level("ERROR"):
         rc, _connected = _refusal(monkeypatch, tmp_path, conn, width=5000, height=5000)
 
     assert rc == _sched.USAGE_EXIT_CODE
-    assert "bounding-box midpoint" in caplog.text
+    assert "geocoder's reported point" in caplog.text
+    assert "bounding-box midpoint" not in caplog.text
     assert "--lat/--lng" in caplog.text
 
 
@@ -408,6 +409,94 @@ def test_the_preflight_prices_every_channel_against_todays_remaining_budget(
     assert cid == CITY_ID
     assert "14,995 of 15,000 spent today" in out
     assert "OVER REMAINING BUDGET, deferred" in out
+
+
+def _hosts_cfg(tmp_path, host_budget=3000):
+    """``_cfg``'s four channels plus a [hosts.mapillary_tiles] budget, THROUGH the loader.
+
+    The host budget is the one setting here a hand-built ``SchedulerConfig``
+    could hold in a shape the loader would refuse (issue #385 review), so these
+    tests read it from TOML the way production does.
+    """
+    path = tmp_path / "assess-hosts.toml"
+    path.write_text(
+        "[providers.gsv]\nenabled = true\ndaily_request_budget = 10000000\n\n"
+        "[providers.gsv_streets]\nenabled = true\ndaily_request_budget = 3000000\n\n"
+        "[providers.mapillary]\nenabled = true\ndaily_request_budget = 15000\n"
+        "max_requests_per_minute = 60\n\n"
+        "[providers.mapillary_streets]\nenabled = true\ndaily_request_budget = 5000\n"
+        "max_requests_per_minute = 60\n\n"
+        f'[paths]\ndata_dir = "{tmp_path / "data"}"\nlog_dir = "{tmp_path / "logs"}"\n'
+        f'backup_dir = "{tmp_path / "backups"}"\n\n'
+        f"[hosts.mapillary_tiles]\nrolling_24h_request_budget = {host_budget}\n"
+    )
+    cfg = _sched.load_scheduler_config(str(path))
+    assert cfg.host_budgets == {HOST_MAPILLARY_TILES: host_budget}
+    assert cfg.host_budget_errors == []
+    return cfg
+
+
+def _seed_tile_window(conn, n, at="2026-08-17T09:00:00+00:00"):
+    conn.execute(
+        "INSERT INTO host_usage VALUES (?, 'mapillary_tiles', 'mapillary_streets', ?)", (at, n)
+    )
+    conn.commit()
+
+
+def test_the_preflight_shows_the_tile_cdns_rolling_window(
+    conn, monkeypatch, tmp_path, capsys, frozen_utc_clock
+):
+    """Issue #385: beside each Mapillary channel's daily line, the host's last 24 h.
+
+    2,995 of 3,000 are gone, so the 9-tile grid run does not fit what the HOST
+    has left even though its own daily budget is untouched -- and the pre-flight
+    says which ceiling that is. gsv_streets shares no budgeted host and gets no
+    host line.
+    """
+    _stub_collection(monkeypatch, conn)
+    frozen_utc_clock(datetime(2026, 8, 17, 12, 0, tzinfo=UTC))
+    _seed_tile_window(conn, 2995)
+    cfg = _hosts_cfg(tmp_path)
+
+    _sched.cmd_assess_city(cfg, QUERY, today=TODAY, assume_yes=True, estimate_only=True)
+
+    lines = capsys.readouterr().out.splitlines()
+    host_lines = [
+        line for line in lines if "mapillary_tiles: 2,995 of 3,000 in the last 24 h" in line
+    ]
+    assert len(host_lines) == sum(1 for c in ASSESS_CHANNELS if c.startswith("mapillary"))
+    grid = next(line for line in lines if line.strip().startswith("mapillary "))
+    assert "OVER mapillary_tiles's rolling-24h budget" in grid
+    assert "0 of 15,000 spent today" in grid
+
+
+def test_a_host_deferral_leaves_the_inquiry_incomplete_and_says_why(
+    conn, monkeypatch, tmp_path, capsys, frozen_utc_clock
+):
+    """Issue #385 review: assess-city's COLLECTION path, not just its pre-flight.
+
+    The morning after a full night the tile CDN's window has 1 of 3,000 left:
+    both Mapillary channels are deferred under the launch floor by the host,
+    and only the GSV walk runs. The summary has to name the host's window, and
+    the command must not exit "complete" -- an inquiry answered without its
+    Mapillary half is not answered. Fails if the summary drops
+    ``_host_budget_note`` or ``nothing_deferred`` drops its host term.
+    """
+    ran = _stub_collection(monkeypatch, conn)
+    frozen_utc_clock(datetime(2026, 8, 17, 12, 0, tzinfo=UTC))
+    _seed_tile_window(conn, 2999)
+    cfg = _hosts_cfg(tmp_path)
+
+    rc = _sched.cmd_assess_city(cfg, QUERY, today=TODAY, assume_yes=True, publish=False)
+
+    assert [p for _, p in ran] == ["gsv_streets"]
+    summary = next(
+        line for line in capsys.readouterr().out.splitlines() if "channel(s) collected" in line
+    )
+    assert summary.strip().startswith("1/1 channel(s) collected")
+    assert "2 deferred for the rolling-24h budget of Mapillary's tile CDN" in summary
+    assert "skipped on budget" not in summary
+    assert rc == 1, "a host deferral is not a complete answer"
 
 
 def test_a_channel_over_the_whole_budget_is_not_called_deferred(
@@ -1317,7 +1406,9 @@ def test_assess_city_inherits_the_lane_scheduler_from_the_config_knob(conn, monk
         blocked_hosts=_sched.HostBreaker(),
         busy_hosts=Counter(),
         deferred_channels=Counter(),
+        deferred_host_budget=Counter(),
         rejected_argv=_sched.ArgvRejections(),
+        deadline_deferred=Counter(),
         batch_deadline=None,
         stop_requested=None,
         record_failures=False,
@@ -1327,3 +1418,17 @@ def test_assess_city_inherits_the_lane_scheduler_from_the_config_knob(conn, monk
     seq = {(kind, provider): n for kind, provider, n in events}
     assert seq[("start", "mapillary_streets")] > seq[("end", "gsv_streets")]
     assert seq[("start", "mapillary_streets")] > seq[("end", "mapillary")]
+
+
+def test_assess_city_never_defers_for_a_deadline(conn, monkeypatch, tmp_path):
+    """assess-city passes batch_deadline=None, so the #373 deferral can never
+    fire here: even with every channel's derived need past any night, each
+    listed channel -- gsv_streets, the non-resumable one, included -- is
+    collected."""
+    monkeypatch.setattr(_sched, "city_timeout_estimate_seconds", lambda *a, **k: 10**9)
+    ran = _stub_collection(monkeypatch, conn)
+
+    rc = _assess(tmp_path)
+
+    assert rc == 0
+    assert sorted(provider for _cid, provider in ran) == sorted(ASSESS_CHANNELS)

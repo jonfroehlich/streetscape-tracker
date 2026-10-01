@@ -291,6 +291,26 @@ def test_spend_is_ledgered_only_for_credentials_this_host_shares(cfg, bundle_dir
     assert "mapillary_streets" not in charged
 
 
+def test_imported_spend_never_reaches_this_hosts_rolling_window(cfg, bundle_dir):
+    """Issue #385: imported spend happened on the LAPTOP's IP.
+
+    KartaView is the one channel that is both ledgered here (the credential is
+    shared, so its daily row is charged) AND metered per host, so it is the case
+    where the two ledgers must disagree: the daily row lands, the host_usage row
+    must not -- or this host's rolling-24h window would defer tonight's work
+    over requests another address made.
+    """
+    laptop = db.connect(str(bundle_dir / bundle_import.CATALOG_NAME))
+    db.add_api_usage(laptop, RUN_DATE, 50, provider="kartaview")
+    laptop.close()
+
+    assert cmd_import_bundle(cfg, str(bundle_dir), execute=True) == 0
+    prod = _prod(cfg)
+    charged = dict(prod.execute("SELECT provider, requests FROM api_usage").fetchall())
+    assert charged.get("kartaview") == 50, "the daily ledger is still charged"
+    assert prod.execute("SELECT COUNT(*) FROM host_usage").fetchone()[0] == 0
+
+
 def test_no_cadence_row_for_a_channel_the_scheduler_cannot_run(cfg, bundle_dir, monkeypatch):
     """
     A success on an unwired channel would suppress its FIRST real collection.

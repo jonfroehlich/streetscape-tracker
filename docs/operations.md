@@ -41,7 +41,8 @@ What the absence needs instead is a **notice**: with publishing off, the printed
 The realistic victim is not a dev laptop but prod with publishing switched off during a block or a maintenance window.
 Exit stays 0 there, on the same reasoning that makes `--no-publish` exit 0 — only an *attempted* publish that failed is a failure.
 Refusals mirror #214's: an unpaired `--width/--height`, a `--provider` naming the grid channel or an unknown/disabled one, and a config with no assess channel enabled all exit `USAGE_EXIT_CODE` **before the catalog is opened**.
-`--width/--height` without `--lat/--lng` is refused where `cli.py` merely tolerates it, because size alone freezes the grid on the OSM bbox midpoint rather than downtown — the right size in the wrong place, permanently.
+`--width/--height` without `--lat/--lng` is refused where `cli.py` accepts it.
+`cli.py` now centers such a grid on the geocoder's reported point rather than the OSM bbox midpoint (#186), but nobody has verified that point is downtown (#185), and an assessment freezes geometry for a partner answer — a guess there is the right size in possibly the wrong place, permanently.
 
 ## Publishing is declared in config, not inherited from the environment (`[publish].local`)
 

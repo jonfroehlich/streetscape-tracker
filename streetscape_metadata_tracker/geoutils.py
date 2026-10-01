@@ -355,11 +355,13 @@ class EnhancedLocation:
         """
         Get the midpoint of the OSM bounding box.
 
-        This is the correct grid center for a search rectangle: unlike the
-        geocoder's reported point (location.latitude/longitude), it is
-        guaranteed to sit at the geometric center of the bounding box the
+        This is the correct grid center for an AUTO-SIZED search rectangle:
+        unlike the geocoder's reported point (location.latitude/longitude), it
+        is guaranteed to sit at the geometric center of the bounding box the
         grid dimensions are derived from, so the sampled rectangle actually
-        covers the boundary.
+        covers the boundary. That justification holds only when the dimensions
+        come from this bbox; for explicit --width/--height it does not, and
+        city_registration.choose_center uses the geocoder's point instead (#186).
 
         Returns:
             tuple or None: (latitude, longitude) midpoint if the bounding box
@@ -618,7 +620,13 @@ def get_city_location_data(
 
         if found_loc is not None:
             logging.info(
-                f"Found coordinates for {city_query_str}: {found_loc.latitude}, {found_loc.longitude}"
+                # Not necessarily the grid center: a new city's center is chosen
+                # later by city_registration.choose_center (the OSM bbox midpoint
+                # for an auto-sized grid, this point for an explicitly sized one),
+                # and this line used to be read as confirming the center (#186).
+                f"Geocoder point for {city_query_str}: {found_loc.latitude}, "
+                f"{found_loc.longitude} (the query's reported location; the grid "
+                f"center is chosen separately at registration)"
             )
 
             enhancedLoc = EnhancedLocation(city_query_str, found_loc)
