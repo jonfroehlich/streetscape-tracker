@@ -3484,6 +3484,54 @@ def test_a_kind_with_an_unserved_channel_is_not_served_below_the_sub_queue_count
     assert kinds == {"kind0": 1, "kind1": 2}
 
 
+@pytest.mark.parametrize("day", range(2))
+def test_a_transient_kind_is_one_sub_queue_whatever_its_leading_channel(conn, monkeypatch, day):
+    """Only kind 1 splits by channel; kind 2 is ONE sub-queue in the floor (#397).
+
+    Two kind-2 cities lead on gsv_streets (only gsv succeeded) and three lead on
+    mapillary (both GSV channels succeeded) and carry live checkpoints; one
+    kind-1 city is due only on kartaview. That is S = 2 sub-queues, so at a
+    reservation of 3 the floor takes 3 - 1 = 2 resumers, kind 2 is served, and
+    the last slot goes to kind 1. Keying kind 2 by its leading channel too makes
+    S = 3 and the take 1, and then kind 2 -- still holding an "unserved"
+    gsv_streets sub-queue -- takes a front-half slot that is not a resumer's.
+    Run on two consecutive dates so either rotation offset is exercised.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    for i in range(2):
+        _register(conn, f"Plain{i}", width=1000, height=1000, step=20)
+    walk_led = [_register(conn, f"Ctw{i}", width=1000, height=1000, step=20) for i in range(2)]
+    resumers = [_register(conn, f"Ctm{i}", width=1000, height=1000, step=20) for i in range(3)]
+    opt_in = _register(conn, "Bopt0", width=1000, height=1000, step=20)
+    db.assign_schedule(conn, 90, providers=tuple(_KIND_CHANNELS))
+    for cid in walk_led:
+        db.record_attempt(conn, cid, success=True, provider="gsv")
+    for cid in resumers:
+        for channel in ("gsv", "gsv_streets"):
+            db.record_attempt(conn, cid, success=True, provider=channel)
+    db.set_channel_membership(conn, opt_in, "kartaview", True, cycle_days=90)
+    for channel in ("gsv", "gsv_streets", "mapillary"):
+        db.record_attempt(conn, opt_in, success=True, provider=channel)
+    monkeypatch.setattr(
+        sched,
+        "_sweep_checkpoint_progress",
+        lambda cfg, city, channel: {"age_s": 1.0} if city.city_id in resumers else None,
+    )
+
+    cfg = _sweep_cfg(publish_enabled=False, opt_in_cities_per_day=3)
+    slate = sched._collect_due(
+        conn,
+        cfg,
+        date(2026, 7, 2) + timedelta(days=day),
+        list(_KIND_CHANNELS),
+        max_opt_in=3,
+        max_cities=100,
+    )
+    head = [c.city_id for c in slate.cities[:3]]
+    assert set(head) == {*resumers[:2], opt_in}, head
+
+
 def test_a_reservation_of_zero_hoists_no_resumer(conn, monkeypatch):
     """`max_opt_in = 0` switches promotion OFF, live checkpoints included.
 
