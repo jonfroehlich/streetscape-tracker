@@ -5182,7 +5182,9 @@ def cmd_screen_provider(
     if not positive and not allow_collapse:
         # THE THIRD AND LAST COLLAPSE CHECK, and the only one that can see a
         # renamed COUNTER. Two structural guards already ran inside the screen
-        # and neither needs any history: every tile answering 404 is a moved
+        # and neither needs any history: a pass in which every tile answered 204
+        # (or one that met a 404, which ends the pass outright, issue #407) is a
+        # meta-catalog serving nothing or a moved
         # endpoint, and tiles answering with a body from which not one hexagon
         # decodes is a renamed LAYER. What neither can see is a schema change
         # that keeps the layer and the features while renaming or re-typing the

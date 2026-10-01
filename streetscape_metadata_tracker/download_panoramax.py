@@ -495,6 +495,40 @@ DEFAULT_TILE_JITTER = 0.6
 _TILE_ERROR_CONTENT_TYPES = ("text/html", "application/json")
 
 
+class PanoramaxCollapseError(DownloadError):
+    """
+    A census that found NO imagery for a city whose previous run of the same
+    series held some (issue #407 review).
+
+    An empty census is a true answer for an empty city, so on its own it is
+    never refused. After a positive run it is also exactly what a meta-catalog
+    that lost its index -- answering 204 for every tile -- produces, and
+    publishing it writes "every picture in the city removed" into an immutable
+    dated snapshot. The caller decides whether the series was positive (the
+    downloader has no catalog); the operator overrides with
+    ``--allow-panoramax-collapse`` once the loss is verified as real.
+
+    A plain ``DownloadError`` in every other respect: not a per-IP refusal (the
+    host answered, nothing tripped a block), and not a resumable stop (nothing
+    is left to fetch). So it takes the ordinary failure path -- exit 1, a
+    counted ``consecutive_failure`` and an alert -- which is what a real
+    collapse needs: it keeps failing, visibly, until someone decides.
+    """
+
+
+def _refuse_collapsed_census(city_name: str, num_images: int, refuse: bool) -> None:
+    """Raise :class:`PanoramaxCollapseError` when ``refuse`` and the census is empty."""
+    if refuse and num_images == 0:
+        raise PanoramaxCollapseError(
+            f"The Panoramax census for {city_name} holds NO imagery, but the previous "
+            f"run of this series held some. That is what a meta-catalog serving 204 "
+            f"for every tile looks like as much as a city losing all its pictures, so "
+            f"it is refused rather than published as every picture removed. Check "
+            f"{TILE_URL_TEMPLATE} by hand, then re-run with --allow-panoramax-collapse "
+            f"if the loss is real."
+        )
+
+
 class TileNotServedError(Exception):
     """
     A tile URL the host answered 404 — NOT an empty tile (issue #407).
@@ -1130,6 +1164,7 @@ async def fetch_city_images_async(
     checkpoint_channel: str | None = None,
     checkpoint_variant: str | None = None,
     census_cache: CensusCache | None = None,
+    refuse_empty_census: bool = False,
 ) -> dict[str, Any]:
     """
     Fetch a city's Panoramax tile census, serialized against other processes.
@@ -1162,6 +1197,7 @@ async def fetch_city_images_async(
                 checkpoint_channel=checkpoint_channel,
                 checkpoint_variant=checkpoint_variant,
                 census_cache=census_cache,
+                refuse_empty_census=refuse_empty_census,
             )
         except BaseException:
             # A city that failed before committing anything would otherwise
@@ -1184,6 +1220,7 @@ async def _fetch_city_images(
     checkpoint_channel: str | None = None,
     checkpoint_variant: str | None = None,
     census_cache: CensusCache | None = None,
+    refuse_empty_census: bool = False,
 ) -> dict[str, Any]:
     """
     Fetch and dedupe every Panoramax picture in a bbox from the z15 tiles.
@@ -1224,6 +1261,14 @@ async def _fetch_city_images(
             COMPLETE census another consumer already paid for is reused here for
             zero requests, and a census this call completes is PROMOTED into it
             on the way out.
+        refuse_empty_census: raise :class:`PanoramaxCollapseError` rather than
+            return a census holding no imagery. The CALLER sets it, from the
+            series' history: True when the previous run of this (city, series)
+            held imagery and the operator has not passed
+            ``--allow-panoramax-collapse``. Checked on BOTH routes -- a fresh
+            crawl BEFORE it is promoted, so a refused census never reaches the
+            shared cache, and a cache reuse, so an entry another consumer
+            accepted cannot publish here unrefused.
 
     Returns:
         Dict with ``census``, ``api_requests`` (THIS call's spend, for the
@@ -1291,13 +1336,16 @@ async def _fetch_city_images(
             channel=checkpoint_channel,
             variant=checkpoint_variant,
         ):
-            return _reuse_cached_census(
+            reused = _reuse_cached_census(
                 cached,
                 city_name=city_name,
                 tiles=tiles,
                 checkpoint_channel=checkpoint_channel,
                 checkpoint_variant=checkpoint_variant,
             )
+            # Zero requests were spent, so there is nothing to stamp.
+            _refuse_collapsed_census(city_name, reused["num_images"], refuse_empty_census)
+            return reused
 
     checkpoint = _open_tile_checkpoint(
         checkpoint_path,
@@ -1643,11 +1691,22 @@ async def _fetch_city_images(
     # answer and the real one, 204, went uncounted through raise_for_status --
     # so the trigger was right and the reading behind it was not.
     #
-    # Bounded by `len(todo) >= 2`, and it is `todo` rather than `tiles` because
-    # a RESUMED run only asks for what it is missing -- a moved endpoint has to
-    # be caught there too, or a resume would assemble the census from committed
-    # tiles alone. Below two, a 404 is one failed tile, and #168's tolerance
-    # below is what prices it.
+    # THE WHOLE LATTICE, NEVER THIS INVOCATION'S SHARE OF IT, so the guard can
+    # never refuse a city the tolerance below would accept. A 404 is never
+    # committed, so "every tile of the city answered 404" means this run asked
+    # for every tile (`todo == tiles`) and got 404 for each. Keyed on `todo`, as
+    # it was before, it refused a RESUME: a 324-tile city with two persistent
+    # 404s publishes at 0.6% on night 1, and every re-run that only re-asks for
+    # those two -- a dead tail re-finalized, `--force` inside the checkpoint's
+    # seven days, or `reconcile_cache_hit` handing the crawl's own cache entry
+    # back so its failed tiles are re-probed -- has `todo == [a, b]`, both 404,
+    # and would be refused as a moved endpoint, a counted failure repeating
+    # until the seven-day wall. A resume whose remaining tiles all 404 is
+    # instead priced by the tolerance, which says "endpoint" itself when every
+    # failure it counts was a 404.
+    #
+    # No lower bound on the lattice: a one-tile city that 404s is wholly
+    # unmeasured either way, and naming the cause is the better refusal.
     #
     # A CAPPED NIGHT NEVER REACHES THIS, and that is a real gap rather than a
     # consequence worth restating as a feature. The cap raises
@@ -1661,9 +1720,9 @@ async def _fetch_city_images(
     # in the part they got to, so the trade stands -- but a Panoramax channel
     # wired to launch capped (#316 phase 2) wants an endpoint probe at the START
     # of a capped run, not this one at the end.
-    if len(todo) >= 2 and missing_tiles == len(todo):
+    if tiles and missing_tiles == len(tiles):
         error = DownloadError(
-            f"Every one of the {len(todo)} Panoramax tiles requested for {city_name} "
+            f"Every one of the {len(tiles)} Panoramax tiles requested for {city_name} "
             f"answered HTTP 404. An empty tile answers 204, never 404, so "
             f"this means the tile endpoint ({TILE_URL_TEMPLATE}) has moved or been "
             f"renamed — refusing to finalize a snapshot claiming the city holds no "
@@ -1678,10 +1737,20 @@ async def _fetch_city_images(
         failed_fraction = len(failed_tiles) / len(tiles)
         detail = f"{len(failed_tiles)}/{len(tiles)} tiles failed: {redact_credentials(first_error)}"
         if failed_fraction > MAX_FAILED_TILE_FRACTION:
+            # Every failure a 404: the same evidence the whole-lattice guard
+            # above reads, met on a resume where the earlier nights' tiles were
+            # already committed. Said here, so the operator is pointed at the
+            # URL rather than at a flaky night.
+            cause = (
+                " Every failed tile answered HTTP 404, which this host never sends "
+                "for a live tile route: the tile endpoint has probably moved."
+                if missing_tiles == len(failed_tiles)
+                else ""
+            )
             error = DownloadError(
                 f"Panoramax tile download failed: {detail} "
                 f"({failed_fraction:.1%} > {MAX_FAILED_TILE_FRACTION:.0%} tolerated); "
-                f"refusing to finalize an incomplete snapshot"
+                f"refusing to finalize an incomplete snapshot.{cause}"
             )
             raise interrupted(error) from first_error
         logger.warning(f"Continuing with {detail}; affected grid points marked REQUEST_FAILED")
@@ -1707,6 +1776,19 @@ async def _fetch_city_images(
     # the same per-tile frames, so dropping fewer frees nothing (issue #157).
     del results, settled, fetched
     census = dedupe_census(census)
+
+    # THE COLLAPSE GUARD, BEFORE PROMOTION (issue #407 review). Read off the
+    # assembled census rather than off this run's 204 count, because only the
+    # census survives every route here: on a resume or a re-finalize the empty
+    # tiles were committed on an earlier night and this run saw none of them.
+    # Raised before the promotion block so a refused census never becomes the
+    # shared entry a walk would reuse for 0 requests; the checkpoint keeps its
+    # committed tiles, so a re-run re-finalizes from disk and is refused again
+    # until the operator decides (or the seven-day wall forces a fresh crawl).
+    try:
+        _refuse_collapsed_census(city_name, len(census), refuse_empty_census)
+    except DownloadError as e:
+        raise interrupted(e) from None
 
     # PROMOTION IS THE LAST STATEMENT BEFORE THE RETURN, and that placement is
     # the safety argument (issue #290). Everything above it can raise, and a
@@ -1784,6 +1866,7 @@ async def download_panoramax_metadata_async(
     checkpoint_path: str | None = None,
     checkpoint_channel: str | None = None,
     census_cache: CensusCache | None = None,
+    refuse_empty_census: bool = False,
 ) -> dict[str, Any]:
     """
     Fetch Panoramax picture metadata for a city and write it as a run csv.gz.
@@ -1833,6 +1916,7 @@ async def download_panoramax_metadata_async(
         checkpoint_path=checkpoint_path,
         checkpoint_channel=checkpoint_channel,
         census_cache=census_cache,
+        refuse_empty_census=refuse_empty_census,
     )
     # A reused census is stamped with when the provider was observed, a fresh
     # one with this process's clock; see checkpointing.observation_timestamp.
@@ -1863,7 +1947,7 @@ async def download_panoramax_metadata_async(
             capture_dates_for=_panoramax_capture_dates,
             image_columns=_panoramax_image_columns,
             dtypes=PANORAMAX_METADATA_DTYPES,
-            # A tile that never downloaded leaves its grid points UNKNOWN rather
+            # A tile that never downloaded leaves its grid points REQUEST_FAILED rather
             # than empty (issue #168); a clean fetch passes None and pays nothing.
             unmeasured_mask=(
                 (lambda lats, lons: _points_in_tiles(lats, lons, failed_tiles))

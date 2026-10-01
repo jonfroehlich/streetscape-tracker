@@ -672,6 +672,20 @@ def run_collect(args: argparse.Namespace) -> int:
                     )
                 )
             elif provider == "panoramax":
+                # The walk series' own history, for the shared census's
+                # collapse guard (issue #407 review): its previous walk of this
+                # network, strictly before run_date.
+                refuse_empty_census = not args.allow_panoramax_collapse and (
+                    db.street_walk_held_imagery(
+                        db.get_previous_street_walk(
+                            conn,
+                            city.city_id,
+                            run_date,
+                            provider="panoramax",
+                            network_type=args.network_type,
+                        )
+                    )
+                )
                 dict_results = asyncio.run(
                     collect_panoramax_street_samples_async(
                         query_points,
@@ -692,6 +706,7 @@ def run_collect(args: argparse.Namespace) -> int:
                         checkpoint_channel=budget_channel,
                         checkpoint_variant=args.network_type,
                         census_cache=census_cache,
+                        refuse_empty_census=refuse_empty_census,
                     )
                 )
             elif provider == "kartaview":
@@ -1025,6 +1040,16 @@ def build_parser() -> argparse.ArgumentParser:
              clears this run date's artifacts, and a walk whose tail died after
              writing its CSV is re-run with --force and must re-finalize for
              zero requests rather than re-pay a census it already bought.""",
+    )
+    parser.add_argument(
+        "--allow-panoramax-collapse",
+        action="store_true",
+        help="""Publish a Panoramax walk whose census holds NO imagery even
+             though this series' previous walk (same city and --network-type)
+             covered some street length (issue #407). Without it such a walk is
+             refused (exit 1): a meta-catalog answering 204 for every tile looks
+             exactly like a city that lost every picture. Ignored by other
+             providers.""",
     )
     parser.add_argument("--batch-size", type=int, default=100)
     # DEFAULTED PER PROVIDER, not here (see `_walk_connection_limit`): 50 is a

@@ -15,6 +15,7 @@ and names the same gap.
 
 import asyncio
 import gzip
+import re
 
 import mapbox_vector_tile
 import pandas as pd
@@ -22,8 +23,14 @@ import pytest
 
 from streetscape_metadata_tracker import analysis
 from streetscape_metadata_tracker import download_panoramax as dp
+from streetscape_metadata_tracker.checkpointing import CensusCache, load_census_cache_marker
 from streetscape_metadata_tracker.config import PANORAMAX_METADATA_DTYPES
-from streetscape_metadata_tracker.download_common import DownloadError
+from streetscape_metadata_tracker.download_common import (
+    DownloadError,
+    HostUnavailableError,
+    SweepIncompleteError,
+    tile_frac_to_lonlat,
+)
 from tests.test_panoramax import encode_tile, make_picture
 
 # Centred on a z15 tile x-boundary so the bbox spans two tiles and a border
@@ -488,8 +495,10 @@ def test_a_204_is_COMMITTED_and_a_404_is_NOT(monkeypatch, tmp_path, straddling_c
     tiles = dp.tiles_for_bbox(*dp.grid_bbox(lat, lon, 100, 100, 20))
     bbox = dp.grid_bbox(lat, lon, 100, 100, 20)
     checkpoint_path = str(tmp_path / "crawl")
-    # One 404 tile among 204s; the tolerance is raised so the run finishes and
-    # leaves its (incomplete, so unpromoted) checkpoint behind to be read.
+    # One 404 tile among 204s; the tolerance is raised so the run finishes.
+    # No census cache is passed, so nothing is promoted and the checkpoint is
+    # left behind to be read. (With a cache it WOULD promote, failed tile and
+    # all -- see the promotion test below.)
     monkeypatch.setattr(dp, "MAX_FAILED_TILE_FRACTION", 0.99)
     _run(
         monkeypatch,
@@ -515,7 +524,7 @@ def test_the_walks_census_reports_a_404_tile_as_FAILED_and_a_204_tile_as_not(
 ):
     """
     The road walk (#331) reads `fetch_city_images_async`'s ``failed_tiles`` to
-    mark samples UNKNOWN rather than ZERO_RESULTS, so this is the walk's half of
+    mark samples REQUEST_FAILED rather than ZERO_RESULTS, so this is the walk's half of
     the rule, pinned at the seam it consumes: the 404 tile is in the list, the
     204 tile is not.
     """
@@ -578,3 +587,311 @@ def test_a_failure_after_the_fetch_still_carries_the_spend(monkeypatch, tmp_path
         )
     assert excinfo.value.api_requests > 0
     assert excinfo.value.api_requests_total == excinfo.value.api_requests
+
+
+# ── #407 review: the guard is never stricter than the tolerance ─────────────
+#
+# A 404 is never committed, so a re-run only re-asks for the tiles that 404ed.
+# The moved-endpoint guard used to read THIS invocation's `todo`, and refused
+# exactly those re-runs. Each route that produces one is tested: a plain resume
+# from a retained checkpoint, and the crawl's own cache entry handed back by
+# `reconcile_cache_hit` so its failed tiles are re-probed.
+
+
+def _night(monkeypatch, tmp_path, lat, lon, *, missing, tolerance, **kwargs):
+    monkeypatch.setattr(dp, "MAX_FAILED_TILE_FRACTION", tolerance)
+    return _run(monkeypatch, tmp_path, {}, lat, lon, missing=missing, **kwargs)
+
+
+def test_a_RESUME_whose_remaining_tiles_all_404_is_priced_by_the_tolerance_not_refused(
+    monkeypatch, tmp_path, straddling_city
+):
+    """
+    Night 1 publishes with two 404 tiles inside the tolerance and keeps its
+    checkpoint (no cache, so nothing is promoted); night 2 asks for those two
+    alone, both 404 again. The tolerance accepted this city once and nothing has
+    changed, so it must accept it again -- keyed on `todo` the guard refused it
+    as a moved endpoint, a counted failure every night until the seven-day wall.
+    (The tolerance is raised because the fixture is four tiles: two of four
+    stands in for the measured case, two of 324.)
+    """
+    lat, lon = straddling_city
+    tiles = dp.tiles_for_bbox(*dp.grid_bbox(lat, lon, 100, 100, 20))
+    assert len(tiles) >= 3, "the resume must leave committed tiles beside the two 404s"
+    bad = set(tiles[:2])
+    checkpoint = dict(checkpoint_path=str(tmp_path / "crawl"), checkpoint_channel="panoramax")
+    _night(monkeypatch, tmp_path, lat, lon, missing=bad, tolerance=0.99, **checkpoint)
+
+    result, served, path = _night(
+        monkeypatch, tmp_path, lat, lon, missing=bad, tolerance=0.99, **checkpoint
+    )
+    assert sorted(served) == sorted(bad), "night 2 must re-ask for the 404 tiles only"
+    assert "REQUEST_FAILED" in set(_written(path)["status"])
+    assert result["api_requests"] == 2
+
+
+def test_a_resume_of_404s_OVER_the_tolerance_is_refused_as_failed_tiles_naming_the_endpoint(
+    monkeypatch, tmp_path, straddling_city
+):
+    """The same resume against the real 2% tolerance: refused by the tolerance,
+    which says the endpoint has probably moved because every failure it counted
+    was a 404 -- and NOT by the whole-lattice guard, whose wording is reserved
+    for a lattice in which every tile 404ed."""
+    lat, lon = straddling_city
+    tiles = dp.tiles_for_bbox(*dp.grid_bbox(lat, lon, 100, 100, 20))
+    bad = set(tiles[:2])
+    checkpoint = dict(checkpoint_path=str(tmp_path / "crawl"), checkpoint_channel="panoramax")
+    _night(monkeypatch, tmp_path, lat, lon, missing=bad, tolerance=0.99, **checkpoint)
+
+    with pytest.raises(DownloadError, match="tiles failed") as excinfo:
+        _night(monkeypatch, tmp_path, lat, lon, missing=bad, tolerance=0.02, **checkpoint)
+    message = str(excinfo.value)
+    assert "Every failed tile answered HTTP 404" in message
+    assert not re.search(_MOVED_ENDPOINT, message)
+
+
+def test_a_CACHE_HANDBACK_of_the_crawls_own_404s_is_priced_by_the_tolerance_not_refused(
+    monkeypatch, tmp_path, straddling_city
+):
+    """
+    The other route to a two-tile `todo`. Night 1 promotes into the census cache
+    with its 404 tiles recorded as failed (item 3 below pins that); night 2 is
+    the same channel, so `reconcile_cache_hit` hands the entry back to the
+    checkpoint path and the crawl re-probes only its failed tiles. Both 404
+    again, and the city must publish exactly as it did on night 1.
+    """
+    lat, lon = straddling_city
+    tiles = dp.tiles_for_bbox(*dp.grid_bbox(lat, lon, 100, 100, 20))
+    bad = set(tiles[:2])
+    store = dict(
+        checkpoint_path=str(tmp_path / "crawl"),
+        checkpoint_channel="panoramax",
+        census_cache=CensusCache(str(tmp_path / "cache")),
+    )
+    _night(monkeypatch, tmp_path, lat, lon, missing=bad, tolerance=0.99, **store)
+
+    result, served, _ = _night(
+        monkeypatch, tmp_path, lat, lon, missing=bad, tolerance=0.99, **store
+    )
+    assert sorted(served) == sorted(bad), "the handback must re-probe the failed tiles only"
+    assert result["api_requests"] == 2
+
+
+def _one_tile_city():
+    """A centre in the MIDDLE of a z15 tile, and a grid small enough to stay in it."""
+    x, y = dp.tiles_for_bbox(*dp.grid_bbox(SEATTLE[0], SEATTLE[1], 20, 20, 20))[0]
+    lon, lat = tile_frac_to_lonlat(x + 0.5, y + 0.5, dp.TILE_ZOOM)
+    assert dp.tiles_for_bbox(*dp.grid_bbox(lat, lon, 40, 40, 20)) == [(x, y)]
+    return lat, lon, (x, y)
+
+
+def test_a_ONE_TILE_city_that_404s_is_refused_as_a_moved_endpoint(monkeypatch, tmp_path):
+    """No lower bound on the whole-lattice guard: one tile that 404s is a city
+    wholly unmeasured, and the refusal should say why rather than "1/1 tiles
+    failed"."""
+    lat, lon, tile = _one_tile_city()
+    with pytest.raises(DownloadError, match=_MOVED_ENDPOINT):
+        _run(monkeypatch, tmp_path, {}, lat, lon, missing={tile}, width=40, height=40)
+
+
+# ── #407 review: a lone 404 promotes, and its walk reuse stays unmeasured ───
+
+
+def test_a_lone_404_PROMOTES_with_its_tile_recorded_failed_and_the_walk_reuse_keeps_it_unmeasured(
+    monkeypatch, tmp_path, straddling_city
+):
+    """
+    A census with a tolerated 404 is complete in the #318 sense -- every tile
+    fetched or recorded failed -- so it promotes into the #290 cache, and the
+    marker carries the failed tile. That is what keeps the hole honest for the
+    road walk reusing it for 0 requests: its samples under that tile publish
+    REQUEST_FAILED, the rest ZERO_RESULTS, exactly as the grid run's points did.
+    """
+    from types import SimpleNamespace
+
+    from streetscape_street_analyzer.collect_panoramax import (
+        collect_panoramax_street_samples_async,
+    )
+
+    lat, lon = straddling_city
+    tiles = dp.tiles_for_bbox(*dp.grid_bbox(lat, lon, 100, 100, 20))
+    bad = tiles[0]
+    cache = CensusCache(str(tmp_path / "cache"))
+    grid, _, _ = _night(
+        monkeypatch,
+        tmp_path,
+        lat,
+        lon,
+        missing={bad},
+        tolerance=0.99,
+        checkpoint_path=str(tmp_path / "crawl-grid"),
+        checkpoint_channel="panoramax",
+        census_cache=cache,
+    )
+    assert grid["checkpoint_path"] is None, "the census must have been promoted (the dir MOVED)"
+    marker = load_census_cache_marker(cache.path, run_date=None)
+    assert marker is not None
+    assert marker["failed"] == [[bad[0], bad[1]]]
+
+    # One sample at the centre of every tile, so each tile's verdict is visible.
+    points = []
+    for i, (x, y) in enumerate(tiles):
+        p_lon, p_lat = tile_frac_to_lonlat(x + 0.5, y + 0.5, dp.TILE_ZOOM)
+        points.append((p_lat, p_lon, i, 0))
+    city = SimpleNamespace(
+        city_id="test-city",
+        display_name="Test City",
+        center_lat=lat,
+        center_lon=lon,
+        grid_width_m=100,
+        grid_height_m=100,
+        step_m=20,
+    )
+
+    def no_request(url):
+        raise AssertionError(f"a reused census must issue no request, asked for {url}")
+
+    monkeypatch.setattr(dp.aiohttp, "ClientSession", lambda **kw: _TileSession(no_request))
+    out = str(tmp_path / "walk.csv.gz")
+    walk = asyncio.run(
+        collect_panoramax_street_samples_async(
+            points,
+            city,
+            out,
+            match_dist_m=20,
+            checkpoint_path=str(tmp_path / "crawl-walk"),
+            checkpoint_channel="panoramax_streets",
+            census_cache=cache,
+        )
+    )
+    assert walk["census_reused"] is True
+    assert walk["api_requests"] == 0
+    statuses = list(_written(out)["status"])
+    assert statuses[0] == "REQUEST_FAILED", "the walk sample under the 404 tile is unmeasured"
+    assert set(statuses[1:]) == {"ZERO_RESULTS"}
+
+
+# ── #407 review: the history-aware collapse guard ───────────────────────────
+
+
+def test_an_EMPTY_census_is_REFUSED_when_the_caller_says_the_series_was_positive(
+    monkeypatch, tmp_path, straddling_city
+):
+    """
+    A lattice of 204s after a positive run: what a meta-catalog that lost its
+    index produces, and what would publish as "every picture removed". Refused
+    as a plain DownloadError -- not a per-IP refusal, not a resumable pause --
+    and BEFORE promotion, so no walk can reuse the empty census for free.
+    """
+    lat, lon = straddling_city
+    tiles = dp.tiles_for_bbox(*dp.grid_bbox(lat, lon, 100, 100, 20))
+    cache = CensusCache(str(tmp_path / "cache"))
+    with pytest.raises(dp.PanoramaxCollapseError, match="previous run of this series") as excinfo:
+        _run(
+            monkeypatch,
+            tmp_path,
+            {},
+            lat,
+            lon,
+            no_content=set(tiles),
+            checkpoint_path=str(tmp_path / "crawl"),
+            checkpoint_channel="panoramax",
+            census_cache=cache,
+            refuse_empty_census=True,
+        )
+    error = excinfo.value
+    assert isinstance(error, DownloadError)
+    assert not isinstance(error, (HostUnavailableError, SweepIncompleteError))
+    assert error.api_requests == len(tiles), "the refused crawl's spend must reach the ledger"
+    assert load_census_cache_marker(cache.path, run_date=None) is None, (
+        "a refused census must never be promoted into the shared cache"
+    )
+
+
+def test_a_refused_collapse_is_refused_AGAIN_when_re_finalized_from_its_checkpoint(
+    monkeypatch, tmp_path, straddling_city
+):
+    """The 204 tiles are committed (they are answers), so the next invocation
+    finds nothing to fetch and re-finalizes from disk. The guard reads the
+    assembled census rather than this run's 204 count, so it still holds."""
+    lat, lon = straddling_city
+    tiles = dp.tiles_for_bbox(*dp.grid_bbox(lat, lon, 100, 100, 20))
+    kwargs = dict(
+        no_content=set(tiles),
+        checkpoint_path=str(tmp_path / "crawl"),
+        checkpoint_channel="panoramax",
+        refuse_empty_census=True,
+    )
+    with pytest.raises(dp.PanoramaxCollapseError):
+        _run(monkeypatch, tmp_path, {}, lat, lon, **kwargs)
+    with pytest.raises(dp.PanoramaxCollapseError) as excinfo:
+        _, served, _ = _run(monkeypatch, tmp_path, {}, lat, lon, **kwargs)
+    assert excinfo.value.api_requests == 0, "the re-finalize issues no request"
+
+
+def test_an_empty_CACHE_ENTRY_is_refused_on_reuse_for_a_positive_series(
+    monkeypatch, tmp_path, straddling_city
+):
+    """An entry another consumer accepted (no positive history, or an override)
+    must not publish unrefused through a consumer whose series WAS positive."""
+    lat, lon = straddling_city
+    bbox = dp.grid_bbox(lat, lon, 100, 100, 20)
+    tiles = dp.tiles_for_bbox(*bbox)
+    cache = CensusCache(str(tmp_path / "cache"))
+    _run(
+        monkeypatch,
+        tmp_path,
+        {},
+        lat,
+        lon,
+        no_content=set(tiles),
+        checkpoint_path=str(tmp_path / "crawl-grid"),
+        checkpoint_channel="panoramax",
+        census_cache=cache,
+    )
+    assert load_census_cache_marker(cache.path, run_date=None) is not None
+
+    def no_request(url):
+        raise AssertionError(f"a reused census must issue no request, asked for {url}")
+
+    monkeypatch.setattr(dp.aiohttp, "ClientSession", lambda **kw: _TileSession(no_request))
+    with pytest.raises(dp.PanoramaxCollapseError):
+        asyncio.run(
+            dp.fetch_city_images_async(
+                "Test City",
+                bbox,
+                checkpoint_path=str(tmp_path / "crawl-walk"),
+                checkpoint_channel="panoramax_streets",
+                census_cache=cache,
+                refuse_empty_census=True,
+            )
+        )
+
+
+def test_an_empty_census_PUBLISHES_without_positive_history(monkeypatch, tmp_path, straddling_city):
+    """The default -- no prior run, a prior zero, or an operator override all
+    reach the downloader as refuse_empty_census=False -- publishes ZERO_RESULTS."""
+    lat, lon = straddling_city
+    tiles = dp.tiles_for_bbox(*dp.grid_bbox(lat, lon, 100, 100, 20))
+    _, _, path = _run(
+        monkeypatch, tmp_path, {}, lat, lon, no_content=set(tiles), refuse_empty_census=False
+    )
+    assert set(_written(path)["status"]) == {"ZERO_RESULTS"}
+
+
+def test_a_census_WITH_imagery_is_never_refused_by_the_collapse_guard(
+    monkeypatch, tmp_path, straddling_city
+):
+    lat, lon = straddling_city
+    tiles = dp.tiles_for_bbox(*dp.grid_bbox(lat, lon, 100, 100, 20))
+    served_tile = encode_tile([make_picture("only", lon, lat)], *tiles[0])
+    _, _, path = _run(
+        monkeypatch,
+        tmp_path,
+        {tiles[0]: served_tile},
+        lat,
+        lon,
+        no_content=set(tiles[1:]),
+        refuse_empty_census=True,
+    )
+    assert "OK" in set(_written(path)["status"])

@@ -322,7 +322,7 @@ def test_every_tile_204ing_refuses_rather_than_zeroing_the_catalog():
     imagery on 2026-10-01, so a pass in which EVERY tile is empty is a
     meta-catalog serving nothing, and recording it would stamp every city zero.
     """
-    with pytest.raises(DownloadError, match="EVERY tile is empty"):
+    with pytest.raises(DownloadError, match="in ANY tile this screen asked for"):
         ps._refuse_if_every_tile_empty([(1, 1), (1, 2)], empty_tiles=2)
 
 
@@ -1240,3 +1240,26 @@ def test_the_screen_unit_can_be_stopped_without_SIGKILLing_a_publish():
     )
     start = re.search(r"^TimeoutStartSec=(\d+)m$", unit, re.MULTILINE)
     assert start and stop_s < int(start.group(1)) * 60, "and stay under TimeoutStartSec"
+
+
+# ── #407 review: the bounded measure reports an exact zero ─────────────────
+
+
+def test_a_MEASURE_whose_tiles_all_answer_204_reports_an_EXACT_ZERO_rather_than_refusing(
+    monkeypatch,
+):
+    """
+    A measure follows a POSITIVE screen, and the screen's upper bound came from
+    a z6 hexagon far larger than the city -- so a city whose own z14 tiles all
+    answer 204 holds nothing, and that is the precise answer the measure exists
+    to give. The weekly screen's all-204 refusal is therefore NOT applied here:
+    with no override flag it would make the instrument unable to say "zero".
+    It prints rather than writes, so a wrong zero damages no series.
+    """
+    session = _FakeSession({})  # every tile answers the default 204
+    monkeypatch.setattr(aiohttp, "ClientSession", lambda **kw: _AsyncCM(session))
+    target = ps.ScreenTarget("dm", "Des Moines", "United States", (-93.70, 41.55, -93.60, 41.62))
+    assert ps.measure_tile_count([target]) >= 2, "the refusal's bound is two tiles"
+    out = asyncio.run(ps.measure_targets_async([target]))
+    assert out["rows"][0]["pictures"] == 0
+    assert out["empty_tiles"] == out["tiles"] == len(session.urls)

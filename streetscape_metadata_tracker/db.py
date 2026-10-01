@@ -1404,6 +1404,44 @@ def get_previous_run(
     return _row_to_run(row) if row else None
 
 
+def run_held_imagery(run: RunRow | None) -> bool:
+    """
+    Did this run observe ANY imagery? False for None (no run at all).
+
+    Read from every column that can say so rather than one, because the census
+    providers fill them differently: ``unique_panos`` counts 360° pictures only
+    and ``num_flat_images`` is NULL on rows collected before it existed, while
+    the status counts carry any point that matched a picture of either kind.
+    Backs the Panoramax collapse guard (issue #407 review): an empty census is
+    refused only when the previous run of the same series was positive.
+    """
+    if run is None:
+        return False
+    counts = (
+        run.unique_panos,
+        run.num_flat_images,
+        run.status_ok,
+        run.status_no_date,
+        run.status_flat_only,
+    )
+    return any((value or 0) > 0 for value in counts)
+
+
+def street_walk_held_imagery(walk: sqlite3.Row | None) -> bool:
+    """
+    Did this road walk cover ANY street length? False for None (no walk).
+
+    The walk-series twin of :func:`run_held_imagery`. A walk's own record of
+    imagery is street coverage -- it stores no picture count -- so a census
+    with pictures that matched no sample reads as not positive here. That is the
+    permissive direction: such a series is never refused, only left unguarded.
+    """
+    if walk is None:
+        return False
+    keys = ("coverage_pct_by_length", "coverage_pct_by_length_any", "length_km_covered")
+    return any((walk[key] or 0) > 0 for key in keys)
+
+
 def get_runs_for_city(
     conn: sqlite3.Connection, city_id: str, provider: str | None = "gsv"
 ) -> list[RunRow]:

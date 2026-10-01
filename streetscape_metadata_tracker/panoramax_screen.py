@@ -654,9 +654,12 @@ def _refuse_if_every_tile_empty(
     if len(tiles) >= 2 and empty_tiles == len(tiles):
         error = DownloadError(
             f"Every one of the {len(tiles)} Panoramax screen tiles answered HTTP 204 "
-            f"(no content). An empty tile is ordinary, but a screen in which EVERY tile "
-            f"is empty means {SCREEN_URL_TEMPLATE} served no imagery anywhere it was "
-            f"asked — refusing to record a screen claiming the whole catalog holds none."
+            f"(no content). An empty tile is ordinary, but {SCREEN_URL_TEMPLATE} served "
+            f"no imagery in ANY tile this screen asked for — not credible for the weekly "
+            f"pass, and for a one-city screen it may be a genuinely empty area, which "
+            f"this guard cannot tell from an emptied index. Refusing to record every "
+            f"city screened as conclusively empty; a one-city screen refused here "
+            f"enrols nobody."
         )
         # Carried for the same reason the fetch stamps it: this refusal comes
         # AFTER the whole lattice was requested, so it is the most expensive
@@ -804,7 +807,15 @@ async def measure_targets_async(
             request_timeout=request_timeout,
             label=f"Measuring Panoramax z{MEASURE_ZOOM} tiles",
         )
-    _refuse_if_every_tile_empty(tile_list, empty_tiles, api_requests=api_requests)
+    # NO all-204 refusal here, unlike the screen (issue #407 review). A measure
+    # is a bounded follow-up over a few cities' z14 tiles, and a city that
+    # screened positive at z6 can genuinely hold nothing at z14 -- its upper
+    # bound came from a hexagon far larger than the city. So every tile
+    # answering 204 is a legitimate EXACT zero, and refusing it (with no
+    # override) would make the instrument unable to report the one answer it
+    # exists to sharpen. It prints rather than writes, so a wrong zero damages no
+    # series. A 404 still ends the pass in `_fetch_screen_tiles`, and tiles that
+    # answer with a body and decode nothing are still a renamed layer.
     _refuse_if_layer_missing(
         tile_list, empty_tiles, sum(len(h) for h in by_tile.values()), api_requests=api_requests
     )

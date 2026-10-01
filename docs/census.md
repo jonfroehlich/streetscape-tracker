@@ -473,14 +473,33 @@ On Mapillary and KartaView a 403 is a rejected token and is deliberately typed a
 `HOST_PANORAMAX` is the fourth locked host, with exit codes **84 blocked / 85 busy**, continuing past 83 rather than filling the 77/78 gap that stays open because those are `EX_NOPERM`/`EX_CONFIG`.
 
 **A 204 is the EMPTY TILE** — measured 2026-10-01 (#407): an ocean tile answers 204 with 0 bytes, the meta-catalog's source returns 204 for an empty tile and never 404, and a z6 world screen the same day saw 201 × 200, 34 × 204 and 0 × 404.
-It is an answer, so it is counted through `on_empty`, returned as `b""` and **committed as a zero-row tile** — most z15 tiles over a real bbox are empty, so holding them back would leave every checkpoint incomplete and every cache entry refused.
+It is an answer, so `_fetch_tile` returns `b""` and reports it through `on_empty` — which the growth screen counts and the grid collector deliberately does not pass, because nothing there reads the count — and the collector **commits it as a zero-row tile** — most z15 tiles over a real bbox are empty, so holding them back would leave every checkpoint incomplete and every cache entry refused.
 Before #407 a 204 fell through `raise_for_status` (not an error) and `read()` returned `b""`: handled correctly by accident and counted by nobody, while the code and these docs called 404 the empty tile.
 
 **A 404 is NOT an empty tile.** On a host that never 404s a tile route, a 404 means the URL is not one it serves — a moved or renamed endpoint — and the ground under it was never read.
 `_fetch_tile` raises `TileNotServedError`, which is deliberately neither a `DownloadError` (one stray 404 would end the city) nor an `aiohttp.ClientError` (backoff would retry an unrouted path), so a lone 404 is a **failed tile**: REQUEST_FAILED under #168's tolerance, never committed, never a measured absence.
 The guard with no Mapillary counterpart is that **a lattice where every tile 404s is refused by name** as a moved endpoint, before the generic tolerance would refuse it as "N tiles failed" and point the operator at the night instead of the URL.
+**It reads the WHOLE lattice, never this invocation's share**, so it can never refuse a city the tolerance accepts.
+A 404 is never committed, so every re-run asks again for exactly the tiles that 404ed — a resume, a re-finalize under `--force`, or `reconcile_cache_hit` handing the crawl's own cache entry back so its failed tiles are re-probed.
+Keyed on `todo`, a 324-tile city with two persistent 404s published at 0.6% on night 1 and was refused as a moved endpoint on every re-run until the seven-day wall.
+A resume whose remaining tiles all 404 is priced by the tolerance instead, which names the endpoint itself when every failure it counted was a 404.
 **It keys on the 404, never on emptiness**: a lattice of 204s is a city the host says holds nothing, which 730 of 1,144 catalog cities genuinely do, and it publishes as ZERO_RESULTS.
+
+**An empty census after a positive run is refused (the collapse guard).**
+A meta-catalog that lost its index would answer 204 for every tile, which looks exactly like a city that lost every picture, and published it reads as "every picture removed".
+So `refuse_empty_census` (on `fetch_city_images_async` and both wrappers) raises `PanoramaxCollapseError` when the census holds no imagery, and the CALLER arms it from the series' history, because only the caller has a catalog.
+The grid run (`cli.py`) arms it when the previous Panoramax run of the city held imagery (`db.run_held_imagery`); the road walk (`collect.py`) arms it when the previous walk of the same city and `--network-type` covered any street length (`db.street_walk_held_imagery`).
+`--allow-panoramax-collapse` on either CLI disarms it, and the accepted empty run becomes the series' new baseline.
+It reads the assembled census, not this run's 204 count, because only the census survives every route: on a re-finalize the 204 tiles were committed earlier and this run saw none.
+It runs before promotion, so a refused census never becomes the shared entry a walk would reuse for free, and it is checked on cache reuse too.
+**It exits 1, the ordinary failure family**: it is not a per-IP refusal (blocked codes would trip the night's breaker for every other Panoramax city), and not a resumable pause (exit 83 is amnestied, which would hide a real collapse forever).
+A counted `consecutive_failure` and an alert are what a collapse needs until someone decides.
+
+**A tolerated 404 promotes.** A census with failed tiles inside the tolerance is complete in the #318 sense (every tile fetched or recorded failed), so it is promoted into the #290 cache with the 404 tiles in the marker's `failed` list.
+A road walk reusing it for 0 requests therefore marks its samples under those tiles REQUEST_FAILED, exactly as the grid run marked its points.
+
 The growth screen reads the same `_fetch_tile` differently on purpose — any 404 ends its pass (an unread z6 tile is every city under it), and an all-204 pass is refused, since 201 of 235 world tiles hold imagery and a pass of nothing is a meta-catalog serving nothing.
+The bounded z14 **measure does not apply that refusal**: it follows a positive screen whose upper bound came from a hexagon far larger than the city, so a city whose own tiles all answer 204 is a legitimate exact zero, and the measure prints rather than writes.
 
 ### 3. `type` is two-state, and the raw value is published anyway
 
