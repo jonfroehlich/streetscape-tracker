@@ -275,6 +275,34 @@ def test_rate_limiter_crediting_the_overrun_never_exceeds_the_rate(monkeypatch):
         assert k <= 10 + t * 10 + 1e-6, (k, t)
 
 
+def test_rate_limiter_caps_a_long_sleep_overrun_at_capacity(monkeypatch):
+    """#304 review: the credit after a sleep is capped at the one-second
+    capacity, exactly like the idle refill. A sleep that overruns by seconds
+    (the loop blocked on a synchronous CSV write or a FileLock wait) must not
+    bank those seconds as tokens and release them as one burst. The random
+    ceiling test above cannot see this: its overruns are all under one
+    capacity's worth, where capped and uncapped agree.
+
+    10/s, burst 10: drain, then the 11th acquisition's 0.1 s sleep lasts 5 s.
+    Capped, that leaves 9 tokens, so 9 more go out at once and the 10th
+    sleeps; uncapped it would leave 49."""
+    clock, now = _make_clock()
+    _patch_overrunning_sleep(monkeypatch, clock, lambda i: 50.0 if i == 0 else 1.0)
+    limiter = AsyncRateLimiter(600, time_func=now)  # 10 tokens/s, burst 10
+    after_overrun = []
+
+    async def scenario():
+        for _ in range(11):  # 10 from the burst, the 11th sleeps and overruns
+            await limiter.acquire()
+        t0 = clock["t"]
+        for _ in range(30):
+            await limiter.acquire()
+            after_overrun.append(clock["t"] == t0)
+
+    _run(scenario())
+    assert sum(after_overrun) == 9
+
+
 # ── AsyncRateLimiter jitter (issue #292) ─────────────────────────────────────
 #
 # The spaced pacer is the fourth per-IP hypothesis under test, and the property
