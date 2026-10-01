@@ -665,7 +665,9 @@ def _no_overpass_status_probe(monkeypatch):
     Returning None means "nothing looks wrong, proceed", which is the same
     answer the real probe gives when it cannot tell. Tests that exercise the
     probe monkeypatch ``requests.get`` (or the probe itself) directly, which
-    runs after this fixture and so wins.
+    runs after this fixture and so wins -- and must fake DNS as well
+    (``tests/_dns_fakes.py``), since the real probe resolves the host itself
+    to pin its GET to osmnx's address (issue #366).
     """
     from streetscape_street_analyzer import download_street_network as dsn
 

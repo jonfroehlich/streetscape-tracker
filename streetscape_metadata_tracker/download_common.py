@@ -221,9 +221,41 @@ OVERPASS_PROBE_QUERY = (
 OVERPASS_PROBE_TIMEOUT_S = 25.0
 
 
+def normalize_overpass_url(url: str) -> str:
+    """
+    ``url`` with its host lowercased, so osmnx's address pin can match it.
+
+    osmnx's ``_http._config_dns`` pins a query only when the host it is asked
+    to resolve EQUALS ``urlparse(url).netloc.split(":")[0]`` -- not lowercased
+    -- while urllib3 lowercases the host before it calls ``getaddrinfo``. So a
+    mixed-case ``$OVERPASS_URL`` (``https://Overpass-API.de/api``) would leave
+    osmnx's query unpinned while :func:`_pinned_like_osmnx`, which reads
+    ``urlsplit().hostname`` (always lowercase), pins the probes to IPv4: the
+    probe and the query as two different clients again (issue #366). Hostnames
+    are case-insensitive, so lowercasing where the URL is CONFIGURED changes
+    nothing else. The path is left alone; it is case-sensitive. So is any
+    ``user:password@`` userinfo, which ``requests`` sends as basic auth, so
+    only the part after the last ``@`` is lowercased.
+
+    Example::
+
+        >>> normalize_overpass_url("https://Overpass-API.de/api")
+        'https://overpass-api.de/api'
+        >>> normalize_overpass_url("https://Me:PassWord@Mirror.Example.org/api")
+        'https://Me:PassWord@mirror.example.org/api'
+    """
+    parts = urllib.parse.urlsplit(url)
+    userinfo, at, hostport = parts.netloc.rpartition("@")
+    return urllib.parse.urlunsplit(parts._replace(netloc=userinfo + at + hostport.lower()))
+
+
 def overpass_url() -> str:
-    """The Overpass endpoint in force right now: ``$OVERPASS_URL`` or the default."""
-    return os.environ.get(OVERPASS_URL_ENV) or DEFAULT_OVERPASS_URL
+    """The Overpass endpoint in force right now: ``$OVERPASS_URL`` or the default.
+
+    Host lowercased (:func:`normalize_overpass_url`), the same form
+    ``download_street_network._apply_overpass_url`` hands osmnx.
+    """
+    return normalize_overpass_url(os.environ.get(OVERPASS_URL_ENV) or DEFAULT_OVERPASS_URL)
 
 
 def overpass_headers() -> dict[str, str]:
@@ -343,19 +375,40 @@ def _pinned_like_osmnx(base_url: str):
     only this hostname is redirected.
 
     **Patching a module global is only safe while the patches cannot overlap**,
-    and today they cannot: the sole caller is ``overpass_serving``, which the
-    breaker calls from ``HostBreaker._maybe_recheck`` on the scheduler's main
-    launch thread (a lane's work happens in a subprocess, which does not
-    inherit this process's patch). Two overlapping pins would leak the wrapper
-    for good -- the second saves the first's wrapper as "the original" and puts
-    it back -- so ``_PIN_LOCK`` makes the assumption structural rather than
-    documentary. It is a plain lock, so this must never be nested.
+    and today they cannot. There are two callers.
+    ``overpass_serving`` is called by the breaker from
+    ``HostBreaker._maybe_recheck`` on the scheduler's main launch thread.
+    ``download_street_network._overpass_refusing``, the walk's pre-flight
+    (issue #366), runs in every process that calls ``fetch_graph`` -- the
+    collection child, ``scripts/prefreeze_street_networks.py``,
+    ``streetscape_street_analyzer.analyze`` and the grid-density scripts --
+    none of which is the scheduler, so none inherits or shares its patch.
+    Each of those calls ``fetch_graph`` serially from one thread, once per
+    fetch, inside the Overpass host lock.
+    Two overlapping pins would leak the wrapper for good -- the second saves
+    the first's wrapper as "the original" and puts it back -- so ``_PIN_LOCK``
+    makes the assumption structural rather than documentary. It is a plain
+    lock, so this must never be nested.
 
-    Two deliberate differences from osmnx, both fail-closed: a lookup failure
-    raises here (osmnx falls back to DNS-over-HTTPS), and the caller turns that
-    into "not serving" rather than reaching for a second resolver to clear a
-    breaker with; and ``socket.gethostbyname`` honours no timeout argument, so
-    the probe's ``timeout_s`` does not bound it -- the resolver's own does.
+    In the child, osmnx's own permanent patch may already be in place from an
+    earlier query. Stacking is harmless: this wrapper maps the hostname to the
+    IP, osmnx's then sees an IP literal and passes it through, and this one is
+    removed on exit.
+
+    "One address" is osmnx's model, and so is its limit: it assumes the one A
+    record ``gethostbyname`` returns is the one every later lookup returns. A
+    round-robin mirror can answer the probe and the query with different A
+    records, which is the same residual gap the breaker already documents for
+    its re-check.
+
+    Two deliberate differences from osmnx: a lookup failure RAISES here (osmnx
+    falls back to DNS-over-HTTPS), and what that means is the caller's policy,
+    not this helper's -- the breaker's re-check turns it into "not serving"
+    (fail-closed: a breaker is not a thing to clear on a second resolver's
+    answer), while the walk's advisory pre-flight turns it into "can't tell,
+    proceed" (fail-open: the real fetch resolves the host its own way). And
+    ``socket.gethostbyname`` honours no timeout argument, so a caller's request
+    timeout does not bound it -- the resolver's own does.
     """
     hostname = urllib.parse.urlsplit(base_url).hostname
     with _PIN_LOCK:
