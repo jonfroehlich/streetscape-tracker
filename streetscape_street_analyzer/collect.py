@@ -1091,7 +1091,8 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Client-side pacing cap for Panoramax tile requests "
             f"(default: {PANORAMAX_TILE_REQUESTS_PER_MINUTE}); <= 0 disables "
-            "pacing. Its own flag, and the LOWEST tile pace in the repo: "
+            "pacing. Its own flag, and the LOWEST default tile pace in the repo "
+            "(production runs 60/min since #405 stage 1): "
             "Panoramax documents no rate limit and returns no "
             "X-RateLimit-*/Retry-After header, so there is no ceiling to pace "
             "against and the conservative number is the honest one. It is "

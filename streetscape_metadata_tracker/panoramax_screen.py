@@ -46,7 +46,9 @@ layer; neither reimplements the other.
 
 PACING AND REFUSALS ARE THE COLLECTOR'S, IMPORTED. Same host, same absence of
 any documented limit, same per-IP exposure — so the screen paces at the same
-30/min with the same #292 jitter, takes the same machine-wide
+rate as the collection channel (`[providers.panoramax]`: the collector default
+30/min, production 60/min since #405 stage 1) with the same #292 jitter, takes
+the same machine-wide
 `host_lock(HOST_PANORAMAX)`, and reads HTTP status through the collector's
 `_fetch_tile`, which is the single place in the repo that says what a 403, a
 redirect, a 404 or an HTML body means on this host. 113 requests a week is a
@@ -520,7 +522,8 @@ async def _fetch_screen_tiles(
     Fetch and decode `tiles` SEQUENTIALLY, returning (by_tile, requests, empties).
 
     Sequential on purpose, and it costs nothing worth having: at 113 tiles and
-    30/min the pass takes under four minutes either way, while concurrency would
+    the default 30/min the pass takes under four minutes (under two at
+    production's 60/min since #405) either way, while concurrency would
     buy a burst shape against a volunteer-run host for no operational gain. The
     collector fans out because a leader city is thousands of tiles; this does not
     because the whole catalog is 113.

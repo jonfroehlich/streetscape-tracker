@@ -632,15 +632,29 @@ network_type = "drive"
 #   - reported by the maintainer, and it is about BURSTS: "several thousand
 #     requests at once" (forum.geocommuns.fr 3298, 2026-07-02) and a 150-200
 #     req/s job making 80,000+ requests, ~25% of the catalog's traffic
-#     (forum.openstreetmap.fr 44813, 2026-07-18), so the catalog serves ~320k
-#     requests/day. A one-off ~900-request query was called fine.
-#   - ours: 0.5 req/s and 4,000/day was ~1.25% of that traffic; stage 1 is
-#     1 req/s, still two orders of magnitude below either incident's rate.
+#     (forum.openstreetmap.fr 44813, 2026-07-18). A one-off ~900-request query
+#     was called fine. "~320k requests/day" is OUR inference (80,000 / 0.25,
+#     read as a day): the post names no window, so treat it as an assumption.
+#   - ours, against that assumed 320k/day: stage 0 (30/min, 4,000 x 2) was at
+#     most ~2.5%; stage 1 (60/min, 8,000 x 2 = 16,000) is at most ~5%; stage 2
+#     (12,000 x 2 = 24,000) would be ~7.5% -- beside the 25% the maintainer
+#     complained about. Only the 150-200 req/s incident has a RATE; stage 1's
+#     1 req/s is 150-200x below it. The "several thousand at once" report is a
+#     burst with no stated rate, and our jittered, single-lock pacing never
+#     bursts.
 # The forum was deliberately NOT asked (#405). Jitter (0.6) and the host lock
 # are unchanged; the collector already sends a User-Agent naming the project.
 #
 # THE GATE TO STAGE 2 (90/min, 12,000/day each): seven clean nights at these
 # values -- no 403/429/redirect (a HostBlockedError, exit 84), no 5xx cluster.
+# How to CHECK it each morning (the full recipe is in docs/provider-access.md):
+#   blocks: any exit 84 in that night's scheduler log or alert email.
+#   5xx:    grep -h 'Panoramax tile retry: HTTP 5' \
+#             logs/collect_*_panoramax*_<date>.log | wc -l
+#           -- one WARNING per RETRIED request (download_panoramax.
+#           TILE_RETRY_LOG_PHRASE, added for this gate: before it a 5xx that
+#           recovered on its next try left no trace), plus a "... gave up"
+#           line when a tile's retries ran out.
 # A trip REVERTS to the previous stage (30 / 4,000) and is recorded in
 # docs/provider-access.md. Each stage is its own PR; enrolment of the 41
 # screen-positive tracked cities proceeds in tranches only after this holds.
@@ -657,9 +671,13 @@ daily_request_budget = 8000
 # seconds derives every per-city timeout from THIS value, so doubling it halves
 # the derivation: the richest city (3,132 tiles) now derives ~108 min, under
 # the 180-minute city_timeout_minutes floor, which therefore binds again for
-# any city under ~5,440 tiles. That floor affords 8,160 requests at this pace
-# (_sweep_requests_within_timeout), just above the 8,000 budget, so a capped
-# launch is sized by the budget rather than the clock.
+# any city of 5,440 tiles or fewer. That floor affords 8,160 requests at this
+# pace (_sweep_requests_within_timeout), just above the 8,000 budget, so a
+# capped launch is sized by the budget rather than the clock -- BUT ONLY when
+# the child's timeout is the unclamped 180-minute floor. _sweep_launch_plan
+# prices the cap from the DEADLINE-CLAMPED timeout, and the Panoramax pair
+# ranks last, so late in a long night the batch deadline shortens the timeout
+# and the clock, not this budget, sizes the cap.
 max_requests_per_minute = 60
 # Non-metronomic gaps, the #292 shifted exponential, at the collector's own CV.
 jitter = 0.6

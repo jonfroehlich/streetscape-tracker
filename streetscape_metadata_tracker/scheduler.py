@@ -745,8 +745,9 @@ def is_resumable_channel(name: str) -> bool:
 # so being cut short costs a night rather than the crawl. Within the exception
 # the rule applies again -- kartaview's sweep runs to hours on a metro
 # (Singapore ~9,974 requests at 16/min) where the richest Panoramax city
-# measures ~3,132 tiles, ~104 min at 30/min (both RAW PACE, which is the right
-# basis for comparing two channels' expense; the derived timeouts are longer)
+# measures ~3,132 tiles, ~104 min at the default 30/min, ~52 min at prod's 60
+# since #405 (all RAW PACE, which is the right basis for comparing two
+# channels' expense; the derived timeouts are longer)
 # -- so kartaview is the one that would starve everything behind it and keeps
 # the later slot. Their adjacency
 # to each other is the same #290 pairing argument as KartaView's.
@@ -3983,8 +3984,9 @@ def _enrolment_cost_note(conn, cfg: SchedulerConfig, city: db.CityRow, channel: 
     third and fourth opt-in channels would have enrolled in silence — the
     operator reading this line is the gate #248's risk 1 names, and a silent
     enrolment removes it exactly where the estimate is largest (the richest
-    Panoramax city measures ~3,132 z15 tiles, ~104 min of raw pacing at 30/min
-    and a ~206-minute derived timeout).
+    Panoramax city measures ~3,132 z15 tiles, ~104 min of raw pacing at the
+    default 30/min and a ~206-minute derived timeout; at production's 60/min
+    since #405 stage 1, ~52 min and ~108 min).
 
     Empty unless the channel is BOTH opt-in and priced as one crawl. Opt-in
     because this is a note about a decision an operator is making — a
