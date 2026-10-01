@@ -59,7 +59,8 @@ Everything measured here is written up in `docs/experiments/capture-date-precisi
 ## The diffs the strict reader recorded, and why the comparison stays day-exact (issue #245)
 
 Written after the split (2026-09-30), as #226's follow-up.
-**#226 fixed the reader but left `run_diffs` alone, and two diffs carried its error.** `diff.compute_run_diff` compares capture dates as strings, so under the strict reader every pano of a month-precision baseline compared as `None` against a real date on the later side
+**#226 fixed the reader but left `run_diffs` alone, and two diffs carried its error.**
+`diff.compute_run_diff` compares capture dates as strings, so under the strict reader every pano of a month-precision baseline compared as `None` against a real date on the later side
 — a capture-date change recorded for every persisted pano.
 On prod (measured 2026-08-22, per the issue) exactly 2 of the 443 diffs computed against a legacy baseline came from a month-precision one: Amsterdam's (71,233 of 71,233 persisted panos "re-dated") and Auckland's (82,156 of 82,204).
 The 100.0% / 99.9% shares are the signature; no real re-drive touches every persisted pano.
@@ -67,7 +68,8 @@ The published detail CSVs, `cities.json.gz`'s `change` block and the city page's
 
 **The repair handle is `scripts/recompute_run_diffs.py`**, the diff twin of `recompute_run_stats.py`: it re-derives existing `run_diffs` rows from both runs' CSVs through the current loader, behind the collector's own gates (both CSVs present, `same_grid_geometry`), dry-run by default.
 It updates a row IN PLACE rather than through `db.record_diff`, because INSERT OR REPLACE mints a new `diff_id` and the published change blocks pick the newest `diff_id` per run — re-recording an older comparison would change which baseline the site advertises.
-Its detail file goes through the collector's own `diff.sync_diff_detail` (#265: written when the diff has changes, removed when it has none), and `--regenerate-json` replays each repaired row into its to-run's per-run JSON.
+Its detail file goes through the collector's own `diff.sync_diff_detail` (#265: written when the diff has changes, removed when it has none), and `--regenerate-json` checks every in-scope to-run's per-run JSON against the row it replays and rebuilds it when they disagree, so a re-run heals a JSON an aborted pass left stale.
+Deletion is guarded (#403 review): a stored pointer that is not the row's own deterministic name is removed only when it is diff-detail-shaped and no other row names it, so a corrupt pointer can never take a run CSV or another diff's file with it.
 `--provider gsv` is the scope for both known repairs: a census CSV is millions of rows, and every diff loads two.
 
 **No precision-aware comparison was added, because the predicted false positive does not occur.**
@@ -75,7 +77,8 @@ The issue expected the NEXT diff of such a city to compare the baseline's `2022-
 But a modern GSV run does not hold `2022-09-15`: the Street View metadata API in practice serves `YYYY-MM`, `download_common.standardize_capture_date` pins reduced precision to the 1st before a row is written, and `docs/experiments/capture-date-precision.md` (finding 3) measured **148,455,698 of 148,455,698 GSV day-shaped dates — 100.00% — on the 1st**.
 Archival imports (`scripts/import_archival_scrapes.py`) append `-01` to a month the same way, and every month-precision file the sweep found is GSV.
 So both sides read 2022-09-01 and compare EQUAL; `tests/test_diff.py` pins that end to end (writer → CSV → real loader → diff), with a genuinely re-dated pano as the negative control.
-A precision-aware comparison would only have hidden real month-level changes behind a rule nothing needs.
+For GSV a precision-aware comparison would be a no-op, since there is nothing finer than a month to hide.
+For a provider with genuine day precision it could only hide real day-level re-dates.
 **What would re-open the question:** any GSV writer emitting genuine day precision (`standardize_capture_date` passes a `YYYY-MM-DD` through unchanged, so an API change would arrive silently — re-run the experiment's `sweep`), or a month-precision baseline for a census provider, whose runs carry real day precision (Mapillary's 3.00% on the 1st is what that looks like).
 
 ## Historical capture-date harvester (`download_gsv_history.py`, issue #2)
