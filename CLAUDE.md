@@ -155,9 +155,10 @@ Each area below states its rules here and keeps its evidence in a `docs/` file.
 
 **Data model, pipeline and naming → [`docs/architecture.md`](docs/architecture.md).**
 Every run is an immutable dated snapshot on the city's **frozen grid geometry** (never re-geocoded, shared by all providers, so diffs are meaningful); **no filename provider token means gsv**, so all pre-provider names and published URLs are unchanged.
-The SQLite catalog `data/streetscape_tracker.db` (schema v16, auto-migrated on connect) is the operational source of truth and is **local-only, never rsynced**.
+The SQLite catalog `data/streetscape_tracker.db` (schema v17, auto-migrated on connect) is the operational source of truth and is **local-only, never rsynced**.
 `schedule_state.member` (v13, #248) is the one column where **NULL does not mean "not measured"** — it means "use `scheduler.CHANNEL_DEFAULT_MEMBERSHIP[channel]`", which is code-side so a new provider token cannot silently enrol the catalog (a missing entry is a `KeyError`, never a permissive default).
 Each provider is an independent run series on the same grid: GSV is a *sample* (nearest pano per grid point), Mapillary and KartaView are *censuses* — so coverage rates are cross-provider comparable and raw pano counts are not.
+**GSV "covered" means a present pano within `analysis.GSV_QUERY_RADIUS_M` (50 m — Google's `radius` is a hint, not a bound, #367)**, applied at the loader seam (`fileutils.load_city_csv_file`) and mirrored in `city.js`; the CSV keeps the far pano, and `scripts/recompute_run_stats.py` is the repair handle.
 Official-Google classification is an exact `© Google` match (`analysis.is_google_copyright`, mirrored in `city.js`), never a substring, since photographer names can contain "Google".
 `streetscape_metadata_tracker/naming.py` is the single source of truth for filenames; `sanitize_city_query_str` must never change (canonical `city_id`s and legacy slugs depend on it).
 **Every per-(city, provider) artifact puts the provider token right after `_step_{S}`** (gsv emits none): a name that omits it silently collides the moment two providers share a run date, and the second collection then skips as a successful no-op — so **never hand-build these names**, tests and fixtures included (`tests/e2e/build_fixture.py` calls the generators).
@@ -342,6 +343,7 @@ Keep any list a doc enumerates **alphabetical**, so two branches adding an entry
   - `capture-date-precision.md`
   - `carto-basemap-key.md`
   - `grid-density.md`
+  - `gsv-query-radius.md`
   - `kartaview-feasibility.md`
   - `kartaview-sweep-cost.md`
   - `kartaview-viewer-deeplink.md`

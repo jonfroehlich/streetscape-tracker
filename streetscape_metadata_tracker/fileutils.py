@@ -10,6 +10,7 @@ from pathlib import Path
 import pandas as pd
 
 from . import naming
+from .analysis import apply_query_radius
 from .config import MAPILLARY_METADATA_DTYPES, PROVIDER_RUN_DTYPES
 from .paths import get_default_data_dir
 
@@ -22,6 +23,26 @@ def get_list_of_city_csv_files(data_dir=None) -> list[str]:
 
     csv_files = glob.glob(os.path.join(data_dir, "**/*.csv.gz"), recursive=True)
     return csv_files
+
+
+def _resolve_run_path(csv_path: str) -> tuple[str | None, str | None]:
+    """
+    ``(kind, provider)`` from a run or road-walk artifact's own filename.
+
+    ``kind`` is ``"run"`` for a grid run, ``"streetwalk"`` for a road walk, and
+    both are None for a name the naming contract does not parse. The one place
+    the loader asks "what is this file?", so the dtype schema and the
+    query-radius gate (issue #367) can never resolve the same path differently.
+    """
+    for kind, parse in (
+        ("run", naming.parse_filename),
+        ("streetwalk", naming.parse_streetwalk_filename),
+    ):
+        try:
+            return kind, parse(csv_path).provider
+        except ValueError:
+            continue
+    return None, None
 
 
 def dtypes_for_run_path(csv_path: str) -> dict:
@@ -43,16 +64,15 @@ def dtypes_for_run_path(csv_path: str) -> dict:
     Args:
         csv_path: path or bare filename of a run or road-walk snapshot CSV.
     """
-    for parse in (naming.parse_filename, naming.parse_streetwalk_filename):
-        try:
-            provider = parse(csv_path).provider
-        except ValueError:
-            continue
-        return PROVIDER_RUN_DTYPES.get(provider, MAPILLARY_METADATA_DTYPES)
-    return MAPILLARY_METADATA_DTYPES
+    _kind, provider = _resolve_run_path(csv_path)
+    if provider is None:
+        return MAPILLARY_METADATA_DTYPES
+    return PROVIDER_RUN_DTYPES.get(provider, MAPILLARY_METADATA_DTYPES)
 
 
-def load_city_csv_file(csv_path: str, dtypes: dict | None = None) -> pd.DataFrame:
+def load_city_csv_file(
+    csv_path: str, dtypes: dict | None = None, *, raw: bool = False
+) -> pd.DataFrame:
     """
     Read a CSV file into a DataFrame, automatically detecting if it's gzipped based on file extension.
     capture_date accepts any ISO 8601 date — day, month or year precision —
@@ -74,6 +94,20 @@ def load_city_csv_file(csv_path: str, dtypes: dict | None = None) -> pd.DataFram
             into float64 and a numeric-looking string id into a float. Pass a
             schema explicitly only when the caller already knows the provider
             and the path may not carry a parseable name.
+        raw: return exactly what is on disk. By default a GSV GRID RUN (the
+            file's own name parses as a run with provider gsv) comes back
+            through analysis.apply_query_radius (issue #367): a pano beyond
+            analysis.GSV_QUERY_RADIUS_M of its query point reads as status
+            OUT_OF_RADIUS and every row gains ``query_distance_m``. The CSV
+            itself is never rewritten -- a run file records what the provider
+            said -- so the rule repeats here, at the one reader everything
+            goes through. Pass ``raw=True`` only where the provider's own
+            answer is what matters: a caller that would write the frame back
+            to a run file, or one (like the grid-attribution street analyzer)
+            that judges a pano by its own position rather than by the query
+            point that found it. Road-walk files and names the contract does
+            not parse are never filtered; the walk bounds sample-to-pano
+            distance itself.
 
     Returns:
         pd.DataFrame: Loaded and processed DataFrame
@@ -154,6 +188,14 @@ def load_city_csv_file(csv_path: str, dtypes: dict | None = None) -> pd.DataFram
         logger.debug("\nDataFrame dtypes after conversion:")
         for col, dtype in df.dtypes.items():
             logger.debug(f"  {col:15} {dtype}")
+
+        # The GSV query-radius rule (issue #367), gated on the file's OWN
+        # resolution -- the same one that picked its dtype schema above -- so a
+        # census run or a road walk is never touched however it is opened.
+        if not raw:
+            kind, provider = _resolve_run_path(csv_path)
+            if kind == "run" and provider == "gsv":
+                df = apply_query_radius(df, provider)
 
         return df
 

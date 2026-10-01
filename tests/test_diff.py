@@ -256,6 +256,72 @@ def test_diff_filename_provider():
     )
 
 
+# --- issue #367: both sides of a diff come through the query-radius seam -----
+
+
+def test_a_far_pano_in_both_runs_is_neither_churn_nor_coverage(data_dir):
+    """Point A holds the SAME far pano in both runs: absent on both sides, so
+    no add/remove. Point B held only a far pano before and a near one now:
+    that is coverage gained, which it would not be if the far pano had
+    counted."""
+
+    def run(run_date, b_pano, b_offset_deg):
+        df = make_city_df([("far_a", "2024-01-01"), (b_pano, "2024-01-01")], run_date=run_date)
+        df.loc[0, "pano_lat"] = df.loc[0, "query_lat"] + 0.01  # ~1.1 km
+        df.loc[1, "pano_lat"] = df.loc[1, "query_lat"] + b_offset_deg
+        name = generate_run_filename("bend--or", 100, 100, 20, run_date)
+        path = os.path.join(data_dir, name + ".csv.gz")
+        write_city_csv_gz(df, path)
+        return load_city_csv_file(path)
+
+    old = run(date(2026, 1, 15), "far_b", 0.01)
+    new = run(date(2026, 4, 15), "near_b", 0.0001)
+    d = compute_run_diff(old, new)
+
+    assert d.panos_removed == 0  # far_a and far_b were never counted
+    assert d.panos_added == 1  # near_b
+    assert d.points_gained_coverage == 1  # B: far -> near
+    assert d.points_lost_coverage == 0
+
+
+def test_the_collectors_recorded_diff_sees_no_churn_from_a_far_pano(conn, data_dir):
+    """cli._compute_and_record_diff reloads the PREVIOUS run itself and takes
+    the new frame from the downloader (a loader reload). Both must come
+    through the query-radius seam, or the same far pano is present on one side
+    only and every diff records it as churn."""
+    cid = db.register_city(
+        conn,
+        city_name="Bend",
+        state_name="Oregon",
+        state_code="OR",
+        country_name="United States",
+        country_code="US",
+        center_lat=44.0,
+        center_lon=-121.0,
+        grid_width_m=100,
+        grid_height_m=100,
+        step_m=20,
+    )
+    frames = {}
+    for run_date in (date(2026, 1, 15), date(2026, 4, 15)):
+        df = make_city_df([("far", "2024-01-01"), ("near", "2024-01-01")], run_date=run_date)
+        df.loc[0, "pano_lat"] = df.loc[0, "query_lat"] + 0.01  # ~1.1 km
+        name = generate_run_filename(cid, 100, 100, 20, run_date) + ".csv.gz"
+        write_city_csv_gz(df, os.path.join(data_dir, name))
+        run_id = db.register_run(conn, city_id=cid, run_date=run_date, csv_filename=name)
+        frames[run_date] = (run_id, load_city_csv_file(os.path.join(data_dir, name)))
+
+    prev_run = db.get_previous_run(conn, cid, date(2026, 4, 15))
+    assert prev_run.run_date == "2026-01-15"
+    new_id, df_new = frames[date(2026, 4, 15)]
+    _compute_and_record_diff(
+        conn, db.resolve_city(conn, cid), prev_run, new_id, date(2026, 4, 15), df_new, data_dir
+    )
+    row = db.get_diff_for_run(conn, new_id)
+    assert (row["panos_added"], row["panos_removed"]) == (0, 0)
+    assert (row["points_gained_coverage"], row["points_lost_coverage"]) == (0, 0)
+
+
 # ── The detail file is a function of the diff result (issue #265) ──────────
 #
 # Driven through the real cli._compute_and_record_diff, with every argument

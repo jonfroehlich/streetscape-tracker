@@ -30,7 +30,7 @@ from .naming import sanitize_city_query_str
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 
 # The v16 per-host ledger (issue #385). One constant, spliced into _SCHEMA
 # below AND executed by _migrate_v15_to_v16, which runs before _SCHEMA and needs
@@ -117,6 +117,15 @@ CREATE TABLE IF NOT EXISTS runs (
     -- which reads a CSV off disk and cannot know.
     census_fetched_by   TEXT,
     census_fetched_at   TEXT,
+    -- GSV query radius (v17, issue #367). status_out_of_radius counts rows
+    -- whose pano lay beyond query_radius_m of its query point and so were read
+    -- as uncovered (analysis.OUT_OF_RADIUS; split out of status_other like
+    -- status_flat_only). query_radius_m is the tolerance the row's stats were
+    -- computed under -- 50.0 for gsv, NULL for census providers the rule does
+    -- not apply to, and NULL for every row not yet recomputed since v17, which
+    -- is the honest "computed before the rule existed".
+    status_out_of_radius INTEGER,
+    query_radius_m      REAL,
     UNIQUE (city_id, provider, run_date)
 );
 CREATE INDEX IF NOT EXISTS idx_runs_city_date
@@ -648,6 +657,9 @@ class RunRow:
     # get_latest_run raises on every catalog at v14.
     census_fetched_by: str | None = None
     census_fetched_at: str | None = None
+    # v17 (issue #367); defaulted for the same SELECT * reason as v14's pair.
+    status_out_of_radius: int | None = None
+    query_radius_m: float | None = None
 
 
 def utc_now_iso() -> str:
@@ -770,7 +782,21 @@ def init_schema(conn: sqlite3.Connection) -> None:
     if user_version == 15:
         _migrate_v15_to_v16(conn)
         user_version = 16
+    # v16 -> v17 (issue #367): the GSV query-radius pair on `runs`. Keyed on
+    # 16 so a v15 catalog takes BOTH rungs in order. The step itself is the
+    # unconditional _migrate_add_query_radius_columns call below; it is run here
+    # too so the rung that records the upgrade is the one that performed it.
+    if user_version == 16:
+        _migrate_add_query_radius_columns(conn)
+        user_version = 17
     conn.executescript(_SCHEMA)
+    # The GSV query-radius pair (issue #367) is ALSO added on every connect, not
+    # only on its rung: while in flight it and PR #388 both stamped v16, so a
+    # catalog touched by either branch alone can read user_version >= 16 without
+    # these columns, and a rung-gated step would then never fire. It is idempotent
+    # per column, so on a current catalog it is one PRAGMA table_info and nothing else.
+    # After executescript(_SCHEMA), so a fresh catalog (built current) is a no-op.
+    _migrate_add_query_radius_columns(conn)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
 
@@ -1025,6 +1051,38 @@ def _migrate_v13_to_v14(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+# The v17 query-radius columns on `runs`, name -> SQL type, in DDL order. Named
+# once so the migration and its idempotency guard cannot drift apart.
+_QUERY_RADIUS_RUN_COLUMNS = {"status_out_of_radius": "INTEGER", "query_radius_m": "REAL"}
+
+
+def _migrate_add_query_radius_columns(conn: sqlite3.Connection) -> None:
+    """Add the GSV query-radius pair to runs (v17, issue #367).
+
+    Named by what it adds rather than by version number. init_schema calls it
+    from the v16 -> v17 rung AND on every connect: while in flight this change
+    also stamped v16, colliding with PR #388's host_usage, so a dev catalog
+    stamped v16 or v17 by either branch alone can lack these columns and must
+    still gain them. Idempotent like
+    _migrate_v13_to_v14 -- each ADD COLUMN is skipped when the column already
+    exists, so an interrupted migration completes on the next connect -- and an
+    absent table means the CREATE TABLE in _SCHEMA below builds it current.
+
+    No DEFAULT, deliberately: NULL is "computed before the rule existed", and
+    inventing a 0 would claim every historical run had been checked.
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)").fetchall()}
+    if not cols:
+        return
+    missing = [c for c in _QUERY_RADIUS_RUN_COLUMNS if c not in cols]
+    if not missing:
+        return
+    logger.info(f"Migrating catalog: adding GSV query-radius columns (runs: {', '.join(missing)})")
+    for column in missing:
+        conn.execute(f"ALTER TABLE runs ADD COLUMN {column} {_QUERY_RADIUS_RUN_COLUMNS[column]}")
+    conn.commit()
+
+
 def derive_city_id(city_name: str, state_name: str | None, country_name: str | None) -> str:
     """
     Canonical city id: the sanitized slug of the full (never abbreviated)
@@ -1254,6 +1312,8 @@ def register_run(
     api_requests: int | None = None,
     census_fetched_by: str | None = None,
     census_fetched_at: str | None = None,
+    status_out_of_radius: int | None = None,
+    query_radius_m: float | None = None,
 ) -> int:
     """
     Register a completed collection run. Raises sqlite3.IntegrityError if a
@@ -1270,9 +1330,10 @@ def register_run(
             status_flat_only, status_other, unique_panos, unique_google_panos,
             coverage_rate_pct, any_imagery_coverage_rate_pct, num_flat_images,
             oldest_capture_date, newest_capture_date, median_pano_age_years,
-            api_requests, census_fetched_by, census_fetched_at)
+            api_requests, census_fetched_by, census_fetched_at,
+            status_out_of_radius, query_radius_m)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                   ?, ?)""",
+                   ?, ?, ?, ?)""",
         (
             city_id,
             provider,
@@ -1300,6 +1361,8 @@ def register_run(
             api_requests,
             census_fetched_by,
             census_fetched_at,
+            status_out_of_radius,
+            query_radius_m,
         ),
     )
     conn.commit()

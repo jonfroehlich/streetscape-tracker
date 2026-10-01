@@ -1826,6 +1826,124 @@ def test_migrate_v13_to_v14(tmp_path):
     conn2.close()
 
 
+def _pre_query_radius_catalog(tmp_path, keep=(), user_version=15):
+    """A catalog at v15: db._SCHEMA minus the v17 query-radius columns (except
+    any named in ``keep``, to simulate an interrupted migration), with one
+    pre-v17 gsv run seeded."""
+    db_path = str(tmp_path / "v15.db")
+    raw = sqlite3.connect(db_path)
+    raw.executescript(db._SCHEMA)
+    for col in db._QUERY_RADIUS_RUN_COLUMNS:
+        if col not in keep:
+            raw.execute(f"ALTER TABLE runs DROP COLUMN {col}")
+    raw.execute(
+        """INSERT INTO cities (city_id, display_name, city_name, center_lat,
+           center_lon, grid_width_m, grid_height_m, step_m, created_at)
+           VALUES ('bend--or', 'Bend, OR', 'Bend', 44.05, -121.31,
+                   5000, 5000, 20, '2026-01-01T00:00:00+00:00')"""
+    )
+    raw.execute(
+        """INSERT INTO runs (city_id, provider, run_date, csv_filename, coverage_rate_pct)
+           VALUES ('bend--or', 'gsv', '2026-05-01', 'old.csv.gz', 87.5)"""
+    )
+    raw.execute(f"PRAGMA user_version = {user_version}")
+    raw.commit()
+    raw.close()
+    return db_path
+
+
+def test_migrate_adds_the_query_radius_columns_as_null(tmp_path):
+    """v15 -> v17 (issue #367): runs gains status_out_of_radius and
+    query_radius_m, and a pre-v17 row reads NULL for both -- "computed before
+    the rule existed", which is what recompute_run_stats.py later fills in --
+    while keeping the coverage it was stored with."""
+    conn = db.connect(_pre_query_radius_catalog(tmp_path))
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)").fetchall()}
+    assert set(db._QUERY_RADIUS_RUN_COLUMNS) <= cols
+    run = db.get_latest_run(conn, "bend--or")
+    assert run.coverage_rate_pct == 87.5
+    assert run.status_out_of_radius is None
+    assert run.query_radius_m is None
+    conn.close()
+    # Idempotent: reopening must not error or re-migrate.
+    db.connect(str(tmp_path / "v15.db")).close()
+
+
+def test_an_interrupted_query_radius_migration_completes(tmp_path):
+    """Named by content and guarded per column, so a catalog stopped between
+    its two ADD COLUMNs -- or one that reaches this step under a different
+    version number after a renumbering -- finishes rather than failing on the
+    column that already exists."""
+    conn = db.connect(_pre_query_radius_catalog(tmp_path, keep=("status_out_of_radius",)))
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)").fetchall()}
+    assert set(db._QUERY_RADIUS_RUN_COLUMNS) <= cols
+    conn.close()
+
+
+def test_a_catalog_already_stamped_v16_without_the_columns_gains_them(tmp_path):
+    """A catalog at v16 with no query-radius columns -- prod once #385 is
+    deployed, or a dev catalog either branch stamped while both claimed v16 --
+    gains them on the v16 -> v17 rung (and the unconditional call behind it).
+    Without them every get_latest_run would read a RunRow without its columns
+    while register_run failed on the INSERT."""
+    conn = db.connect(_pre_query_radius_catalog(tmp_path, user_version=16))
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)").fetchall()}
+    assert set(db._QUERY_RADIUS_RUN_COLUMNS) <= cols
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
+    conn.close()
+
+
+def test_a_v15_catalog_takes_both_rungs_backfill_and_columns(tmp_path, frozen_utc_clock):
+    """Prod is at v15 and takes v16 (#385) and v17 (#367) in one connect: the
+    host_usage backfill must seed AND the query-radius columns must land, in
+    that order, ending at v17. Killed by a v17 rung keyed on 15 and placed
+    ahead of the v16 rung: it consumes the v15 stamp and the backfill never
+    runs, while the columns (also added unconditionally) still land."""
+    frozen_utc_clock(_HOST_NOW)
+    db_path = _pre_query_radius_catalog(tmp_path)
+    raw = sqlite3.connect(db_path)
+    raw.execute("DROP TABLE host_usage")
+    raw.execute(
+        "INSERT INTO api_usage (usage_date, provider, requests) VALUES ('2026-09-28', 'mapillary', 194)"
+    )
+    raw.commit()
+    raw.close()
+
+    conn = db.connect(db_path)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 17
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)").fetchall()}
+    assert set(db._QUERY_RADIUS_RUN_COLUMNS) <= cols
+    assert _host_rows(conn) == [("2026-09-28T06:00:00+00:00", "mapillary_tiles", "mapillary", 194)]
+    conn.close()
+
+
+def test_register_run_round_trips_the_query_radius_pair(conn):
+    cid = db.register_city(
+        conn,
+        city_name="Bend",
+        state_name="Oregon",
+        state_code="OR",
+        country_name="United States",
+        country_code="US",
+        center_lat=44.05,
+        center_lon=-121.31,
+        grid_width_m=200,
+        grid_height_m=200,
+        step_m=20,
+    )
+    db.register_run(
+        conn,
+        city_id=cid,
+        run_date=date(2026, 5, 1),
+        csv_filename="r.csv.gz",
+        status_out_of_radius=7,
+        query_radius_m=50.0,
+    )
+    run = db.get_latest_run(conn, cid)
+    assert (run.status_out_of_radius, run.query_radius_m) == (7, 50.0)
+
+
 def test_run_row_carries_every_runs_column(conn):
     """
     `_row_to_run` builds RunRow(**dict(row)) from `SELECT *`, so a column added
@@ -1979,7 +2097,7 @@ def test_migrate_v15_to_v16_backfills_two_utc_dates_of_metered_channels(tmp_path
     raw.close()
 
     conn = db.connect(db_path)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 16
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 17
     assert _host_rows(conn) == [
         ("2026-09-27T23:59:59+00:00", "kartaview", "kartaview", 16),
         ("2026-09-27T23:59:59+00:00", "mapillary_tiles", "mapillary", 1198),
@@ -2126,7 +2244,7 @@ def test_concurrent_first_connects_seed_the_v16_backfill_exactly_once(tmp_path):
     """Issue #385 review: ``BEGIN IMMEDIATE`` makes the backfill race-safe.
 
     Four processes first-connect the same v15 catalog at once (a barrier lines
-    them up), over several fresh catalogs. Each must end at v16 with exactly the
+    them up), over several fresh catalogs. Each must end at v17 with exactly the
     two backfill rows -- never four, six or eight -- and no process may fail.
     Without the transaction, two processes can both find ``host_usage`` empty
     and both seed it; the worker pauses inside that window (see
@@ -2178,4 +2296,4 @@ def test_concurrent_first_connects_seed_the_v16_backfill_exactly_once(tmp_path):
         rows = raw.execute("SELECT provider, requests FROM host_usage ORDER BY provider").fetchall()
         version = raw.execute("PRAGMA user_version").fetchone()[0]
         raw.close()
-        assert (version, rows) == (16, [("mapillary", 1198), ("mapillary_streets", 5)]), path
+        assert (version, rows) == (17, [("mapillary", 1198), ("mapillary_streets", 5)]), path

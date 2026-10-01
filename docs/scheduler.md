@@ -486,6 +486,7 @@ A direct `streetscape_tracker.py --provider mapillary` has no scheduler config, 
 `import-bundle` requires the bundle's catalog to be exactly this host's `SCHEMA_VERSION`, so once v16 is deployed it refuses every v15 laptop bundle: import a waiting bundle **before** deploying, or re-collect it on a v16 checkout.
 Pre-#385 code refuses a v16 catalog ("newer than this code supports") on every subcommand that opens it through `db.connect` — `run-due`, `status`, `assess-city`, `import-bundle` and the rest — so a rollback needs `PRAGMA user_version = 15` set by hand on the catalog first; the extra `host_usage` table is harmless to old code.
 `backup-status` and `restore-backup` read only the backup directory, so they keep working either way.
+Rolling back past #367 (v17) as well needs more than the stamp: old code builds `RunRow(**dict(row))` from `SELECT * FROM runs`, so the two query-radius columns must be dropped (`ALTER TABLE runs DROP COLUMN status_out_of_radius`, then `query_radius_m`) before it can read a run.
 Re-deploying after such a rollback does **not** re-backfill (the table is no longer empty), so spend made while rolled back is missing from the window until it would have aged out anyway.
 
 ## What a capped night spends its slots on (issue #308, added 2026-09-02)

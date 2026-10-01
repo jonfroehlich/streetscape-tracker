@@ -13,6 +13,7 @@ import pandas as pd
 
 from . import db, driving_plan, panoramax_screen, plan_match
 from .analysis import (
+    GSV_QUERY_RADIUS_M,
     PRESENT_STATUSES,
     calculate_coverage_stats,
     calculate_pano_stats,
@@ -458,7 +459,13 @@ def generate_city_metadata_summary_as_json(
             "end_time": end_time.isoformat() if end_time is not None else None,
             "duration_seconds": duration_seconds,
         },
-        "coverage": asdict(coverage_stats),
+        # num_points_out_of_radius rides in via asdict; query_radius_m names the
+        # tolerance it was counted against (issue #367), null for providers the
+        # rule does not apply to. Both additive, so schema_version stays 2.
+        "coverage": {
+            **asdict(coverage_stats),
+            "query_radius_m": GSV_QUERY_RADIUS_M if provider == "gsv" else None,
+        },
         "all_panos": {
             "duplicate_stats": asdict(all_pano_stats.duplicate_stats),
             "age_stats": asdict(all_pano_stats.age_stats),

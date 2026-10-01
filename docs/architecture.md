@@ -27,7 +27,7 @@ Legacy pre-2026 undated files are registered as `is_baseline=1` runs by `scripts
 
 ## The catalog
 
-The SQLite catalog `data/streetscape_tracker.db` (`streetscape_metadata_tracker/db.py`, stdlib sqlite3/WAL, no ORM; schema v16, auto-migrated on connect) is the operational source of truth.
+The SQLite catalog `data/streetscape_tracker.db` (`streetscape_metadata_tracker/db.py`, stdlib sqlite3/WAL, no ORM; schema v17, auto-migrated on connect) is the operational source of truth.
 It is **local-only and never rsynced** — it lives in exactly one place, which is why the dated backups in [`catalog-backups.md`](catalog-backups.md) exist.
 
 | Table | Key / uniqueness | Holds |
@@ -66,6 +66,11 @@ v16 added the `host_usage` table (#385): one row per `db.add_api_usage` call on 
 Its rows are **stamped when a child finishes**, not when each request was made, and the migration's backfill rows (the last two UTC dates of metered `api_usage`) are stamped at the **latest instant their spend can have happened** — 23:59:59 UTC of a past date, the migration's own clock for today — so read `recorded_at` as "charged at", never as a request time.
 Rows older than 30 days are pruned by the nightly tail; `import-bundle` writes none (`meter_host=False`).
 
+v17 added `runs.status_out_of_radius` and `runs.query_radius_m` (#367, see "GSV query radius" below), under the ordinary rule: NULL means "computed before the rule existed", until `scripts/recompute_run_stats.py` re-derives the row.
+`query_radius_m` records the tolerance a row's stats were computed under (50.0 for gsv), and stays NULL for census providers, which the rule does not apply to.
+The migration is named by content (`_migrate_add_query_radius_columns`) rather than by number and is idempotent per column.
+It runs on the v16 → v17 rung, so a v15 catalog takes #385's v16 backfill first and then this step, and it is also called unconditionally at the end of `init_schema`: both changes stamped v16 while in flight, so a catalog touched by either branch alone can read v16 or later without the columns and still gains them.
+
 ## Provider model
 
 Each provider is an independent run series on the same frozen grid.
@@ -80,6 +85,38 @@ Every provider writes the identical 9-column **core** (`config.METADATA_DTYPES`)
 So coverage rates are cross-provider comparable, but raw pano counts are census-vs-sample and are not.
 `runs.unique_google_panos` is NULL for non-gsv runs.
 Official-Google classification is an exact `© Google` match (`analysis.is_google_copyright`, shared by stats/JSON/vis and mirrored in `city.js`) — never a substring, since photographer names can contain "Google".
+
+### GSV query radius (#367)
+
+**For GSV, "covered" means a present pano within `analysis.GSV_QUERY_RADIUS_M` (50 m) of the grid point that asked for it.**
+The downloader sends no `radius`, so Google applies its documented default of 50 m; but Google treats `radius` as a search hint, not a bound.
+Measured over 60 archived cities in [#367](https://github.com/jonfroehlich/streetscape-tracker/issues/367): 10.4% of rows with a pano sat more than 50 m from their query point, 2.2% more than 100 m and 0.04% more than 1 km, a few on other continents, at Null Island, or with `pano_lat == pano_lon`.
+It is not even monotone: in Teaneck `radius=25` returned a pano 77 m away where `radius=50` returned one at 45.8 m.
+The writeup is [`experiments/gsv-query-radius.md`](experiments/gsv-query-radius.md).
+
+The rule is **read-side**, because the CSV records what the provider said and is never rewritten:
+
+- `analysis.apply_query_radius` is the one place it lives.
+  For gsv it returns a copy with a `query_distance_m` column (haversine, `geoutils.haversine_m`) and a present (OK or NO_DATE) row beyond the radius re-statused `OUT_OF_RADIUS`; strictly greater than, and a NaN distance never reclassifies.
+  Any other provider comes back unchanged.
+- `fileutils.load_city_csv_file` calls it for every file whose own name parses as a **gsv grid run**, reusing the resolution that picks the file's dtype schema, so every stat, diff, summary and map downstream of the loader sees the same frame.
+  Both sides of a diff come through it (the collector's returned frame is a loader reload), so a far pano is absent on both and makes no phantom churn.
+- `raw=True` returns the file as written.
+  Its one production caller is the grid-attribution street analyzer (`streetscape_street_analyzer/analyze.py`), which judges a pano by its distance to a street, bounded by its own `match_dist`, so a pano on a street but far from the grid point is real coverage there.
+- `OUT_OF_RADIUS` is an absence by definition (in neither `PRESENT_STATUSES` nor `ANY_IMAGERY_STATUSES`) and a real answer rather than an error, so it is counted in its own bucket (`status_out_of_radius`, `num_points_out_of_radius`), the way `FLAT_ONLY` was split out of `status_other`.
+- The pano-distance stats read `query_distance_m` rather than recompute it; the planar `* 111000` formula they used before ignored cos(latitude) and overstated east-west distance (2x at 60 degrees north).
+
+The census providers are untouched: they assign panos to grid points from exact tile or bbox geometry, so there is no radius to overshoot.
+So is the road walk, which bounds sample-to-pano distance itself (`street_coverage.DEFAULT_MATCH_DIST_M`, 25 m).
+
+`www/js/city.js` streams the raw CSV, so the rule is mirrored there: `GSV_QUERY_RADIUS_M`, `haversineMeters`, `isWithinQueryRadius` and the row-admission predicate `isAdmissiblePanoRow` in `streetscape-utils.js`, with `processRows` asking the predicate before it records the pano id.
+`tests/test_coverage.py` reads the JS source and pins both constants (the radius and the Earth radius) to the Python ones.
+
+**The repair handle is `scripts/recompute_run_stats.py`**, which reads through the loader and so inherits the rule with no copy of its own; its report line names each run's reclassified count (`analysis.out_of_radius_count`), and `--regenerate-json` rebuilds any run that holds a far pano whose JSON does not already carry `coverage.query_radius_m`, so a second pass rebuilds nothing.
+**Running it is a REQUIRED deploy step, before the next 02:00 timer**: `recompute_run_stats.py --provider gsv` dry, then with `--execute --regenerate-json`, then `scheduler regenerate-aggregate --publish`.
+The exact commands are in [`operations.md`](operations.md), "Deploying a stats-definition change".
+Without it, runs collected after the deploy are cataloged under 50 m while older rows keep the unfiltered `coverage_rate_pct`, and the aggregate and driving page read that stored column, so every re-collected city shows a phantom drop of about 10% (the share of covered points the rule flips in the sample).
+Historical `run_diffs` rows and diff detail CSVs stay under the old definition even after the repair, until a GSV re-diff pass exists; diffs computed after the deploy are correct.
 
 ## Pipeline per run
 
@@ -143,6 +180,9 @@ Every published JSON artifact carries a `schema_version`; the frontend's `adaptC
 | Streetwalk manifest | `streetwalks.json.gz` | 1 |
 | Driving-plan summary | `driving_plan.json.gz` | 1 |
 | Provider screen | `provider_screen.json.gz` | 1 |
+
+The per-run summary stays at 2 across #367's additions to its `coverage` block (`num_points_out_of_radius`, and `query_radius_m`, which is null for census providers): both are additive, and no existing key changed shape.
+A summary written before #367 simply lacks them, and its coverage figures are the old definition until the run's JSON is rebuilt.
 
 The streetwalk manifest's version deliberately stayed 1 across the v12 catalog additions: every one of them is additive, and no existing key changed shape or meaning.
 The four scalar v12 keys (`length_km`, `length_km_covered`, `length_km_covered_any`, `median_covered_age_years`) are written unconditionally, so on a walk cataloged before v12 they are **present carrying `null`**, not absent; only the optional `coverage_by_highway` and `change` blocks are omitted when they have nothing to say.
