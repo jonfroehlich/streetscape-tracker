@@ -3003,6 +3003,163 @@ def test_resumers_cannot_take_the_whole_reservation(conn, monkeypatch):
     )
 
 
+_KIND_PREFIX = {0: "Aex", 1: "Bopt", 2: "Ctr"}
+_KIND_CHANNELS = ["gsv", "gsv_streets", "mapillary", "kartaview"]
+
+
+def _stranded_kind_slate(conn, monkeypatch, sizes, resumers_per_kind):
+    """Register `sizes[k]` stranded cities of each kind k (the `_stranded_kind`
+    numbering) beside two ordinary gsv-due cities, and give the first
+    `resumers_per_kind[k]` cities of kind k a live checkpoint.
+
+    Kind 0 is excluded from both GSV channels (#301), kind 1 is due only on
+    kartaview (#248), kind 2 has a fresh gsv clock and is due on mapillary.
+    Returns {kind: [city_id, ...]} in registration order.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    for i in range(2):
+        _register(conn, f"Plain{i}", width=1000, height=1000, step=20)
+    by_kind = {
+        k: [
+            _register(conn, f"{_KIND_PREFIX[k]}{i}", width=1000, height=1000, step=20)
+            for i in range(n)
+        ]
+        for k, n in sizes.items()
+    }
+    db.assign_schedule(conn, 90, providers=tuple(_KIND_CHANNELS))
+    for cid in by_kind.get(0, []):
+        for channel in ("gsv", "gsv_streets"):
+            db.set_channel_membership(conn, cid, channel, False, cycle_days=90)
+    for cid in by_kind.get(1, []):
+        db.set_channel_membership(conn, cid, "kartaview", True, cycle_days=90)
+        for channel in ("gsv", "gsv_streets", "mapillary"):
+            db.record_attempt(conn, cid, success=True, provider=channel)
+    for cid in by_kind.get(2, []):
+        for channel in ("gsv", "gsv_streets"):
+            db.record_attempt(conn, cid, success=True, provider=channel)
+
+    live = {cid for k, n in resumers_per_kind.items() for cid in by_kind[k][:n]}
+    monkeypatch.setattr(
+        sched,
+        "_sweep_checkpoint_progress",
+        lambda cfg, city, channel: {"age_s": 1.0} if city.city_id in live else None,
+    )
+    return by_kind
+
+
+def _stranded_head_kinds(conn, by_kind, max_opt_in):
+    """The kinds represented in the reserved head, after asserting the head is
+    exactly min(max_opt_in, |stranded|) stranded cities."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    kind_of = {cid: k for k, ids in by_kind.items() for cid in ids}
+    cfg = _sweep_cfg(publish_enabled=False, opt_in_cities_per_day=max_opt_in)
+    slate = sched._collect_due(
+        conn,
+        cfg,
+        date(2026, 7, 2),
+        list(_KIND_CHANNELS),
+        max_opt_in=max_opt_in,
+        max_cities=100,
+    )
+    ordered = [c.city_id for c in slate.cities]
+    assert set(kind_of) <= set(ordered), "every stranded city must still be on the slate"
+    n_head = min(max_opt_in, len(kind_of))
+    head = ordered[:n_head]
+    assert all(cid in kind_of for cid in head), (
+        f"the reserved head must be {n_head} stranded cities, got {head}"
+    )
+    # The two ordinary gsv-due cities lead what follows, so a stranded city
+    # right after the head would mean the reservation took more than its share.
+    assert not any(cid in kind_of for cid in ordered[n_head : n_head + 2]), (
+        "exactly min(max_opt_in, |stranded|) cities are hoisted, no more"
+    )
+    return {kind_of[cid] for cid in head}
+
+
+@pytest.mark.parametrize("resumer_kind", [0, 1])
+def test_a_resumer_is_its_kinds_turn_so_every_kind_gets_a_slot(conn, monkeypatch, resumer_kind):
+    """Issue #393: at max_opt_in = the number of kinds, no kind may be zeroed.
+
+    The floor takes max(1, 3 - 2) = 1 resumer; the rotation used to restart at
+    kind 0 regardless of which kind that resumer came from, so the two slots
+    left went to kinds 0 and 1 and kind 2 got nothing. The kind-1 case is the
+    trap in the obvious fix: starting the rotation at the first kind no resumer
+    came from runs 0, 1, 2 with a kind-1 resumer, and zeroes kind 2 the same way.
+    """
+    by_kind = _stranded_kind_slate(
+        conn, monkeypatch, sizes={0: 3, 1: 3, 2: 3}, resumers_per_kind={resumer_kind: 1}
+    )
+    assert _stranded_head_kinds(conn, by_kind, max_opt_in=3) == {0, 1, 2}
+
+
+def test_a_resumer_the_floor_cut_has_not_served_its_kind(conn, monkeypatch):
+    """`served` must be read from the CHOSEN resumers, not all of them (#393).
+
+    Resumers in kinds 0 and 2 with a take of 1: the kind-0 one is chosen and the
+    kind-2 one is cut. Marking kind 2 served anyway would queue it last, behind
+    kind 0, and the two remaining slots would go to kinds 1 and 0.
+    """
+    by_kind = _stranded_kind_slate(
+        conn, monkeypatch, sizes={0: 3, 1: 3, 2: 3}, resumers_per_kind={0: 1, 2: 1}
+    )
+    assert _stranded_head_kinds(conn, by_kind, max_opt_in=3) == {0, 1, 2}
+
+
+def test_below_the_kind_count_served_kinds_have_had_their_turn_and_the_rest_fill_in_order(
+    conn, monkeypatch
+):
+    """The documented limitation at max_opt_in < G, pinned rather than only described.
+
+    Three non-empty kinds and max_opt_in = 2: the floor takes the one kind-2
+    resumer, which is kind 2's turn, and the single slot left goes to the
+    lowest-numbered UNSERVED kind, 0. Kind 1 waits this night -- nothing carries
+    state between nights to rotate which kind that is (#393 scopes it out).
+    """
+    by_kind = _stranded_kind_slate(
+        conn, monkeypatch, sizes={0: 3, 1: 3, 2: 3}, resumers_per_kind={2: 1}
+    )
+    assert _stranded_head_kinds(conn, by_kind, max_opt_in=2) == {0, 2}
+
+
+def _kind_resumer_cases():
+    """Every non-empty kind subset x every resumer-kind subset of it x 1-2
+    resumers per resumer kind: 63 cases."""
+    import itertools
+
+    cases = []
+    for r in (1, 2, 3):
+        for kinds in itertools.combinations((0, 1, 2), r):
+            for rs in range(len(kinds) + 1):
+                for rkinds in itertools.combinations(kinds, rs):
+                    for counts in itertools.product((1, 2), repeat=len(rkinds)):
+                        cases.append((kinds, dict(zip(rkinds, counts, strict=True))))
+    return cases
+
+
+@pytest.mark.parametrize(("kinds", "resumers"), _kind_resumer_cases())
+def test_every_non_empty_kind_gets_a_slot_once_max_opt_in_reaches_the_kind_count(
+    conn, monkeypatch, kinds, resumers
+):
+    """The per-night guarantee #393 restores, swept through the real _collect_due.
+
+    With G non-empty stranded kinds and max_opt_in >= G, every kind reaches the
+    head, whichever kinds the resumers sit in and however many there are --
+    including more resumers in one kind than the reservation has slots, which
+    is what the (sub-queues - 1) floor exists for. Kind 1 here is one channel,
+    so sub-queues and kinds coincide; the multi-channel case is
+    test_kartaview_resumers_leave_every_stranded_channel_a_take.
+    """
+    by_kind = _stranded_kind_slate(
+        conn, monkeypatch, sizes=dict.fromkeys(kinds, 3), resumers_per_kind=resumers
+    )
+    for max_opt_in in range(len(kinds), len(kinds) + 3):
+        assert _stranded_head_kinds(conn, by_kind, max_opt_in) == set(kinds), (
+            f"max_opt_in={max_opt_in}"
+        )
+
+
 def test_a_live_checkpoint_outranks_the_rotation_across_groups(conn, monkeypatch):
     """The #239 guarantee has to hold ACROSS stranded groups, not inside one.
 
@@ -3155,24 +3312,36 @@ _PROD_SLATE = [
 _OPT_IN_CHANNELS = _PROD_SLATE[2:]
 
 
-def _prod_shaped_stranded_slate(conn):
+_PROD_SHAPE = {
+    "kind0": 10,
+    "kind2": 10,
+    "kartaview": 10,
+    "kartaview_streets": 3,
+    "panoramax": 3,
+    "panoramax_streets": 3,
+}
+
+
+def _prod_shaped_stranded_slate(conn, counts=_PROD_SHAPE):
     """Every stranded kind non-empty, and four stranded opt-in channels.
 
-    Returns ``{city_id: label}``, where the label is ``"kind0"``, ``"kind2"``
-    or the city's leading opt-in channel.
+    ``counts`` maps each label to how many cities carry it (absent = 0); the
+    default is the review's prod shape. Returns ``{city_id: label}``, where the
+    label is ``"kind0"``, ``"kind2"`` or the city's leading opt-in channel.
     """
     labels = {}
-    for i in range(10):
+    for i in range(counts.get("kind0", 0)):
         labels[_register(conn, f"Exc{i}", width=1000, height=1000, step=20)] = "kind0"
-    for i in range(10):
+    for i in range(counts.get("kind2", 0)):
         labels[_register(conn, f"Mly{i}", width=1000, height=1000, step=20)] = "kind2"
     shapes = [
-        ("Kv", 10, "kartaview", ("kartaview", "kartaview_streets")),
-        ("Kw", 3, "kartaview_streets", ("kartaview", "kartaview_streets")),
-        ("Pg", 3, "panoramax", ("panoramax", "panoramax_streets")),
-        ("Pw", 3, "panoramax_streets", ("panoramax", "panoramax_streets")),
+        ("Kv", "kartaview", ("kartaview", "kartaview_streets")),
+        ("Kw", "kartaview_streets", ("kartaview", "kartaview_streets")),
+        ("Pg", "panoramax", ("panoramax", "panoramax_streets")),
+        ("Pw", "panoramax_streets", ("panoramax", "panoramax_streets")),
     ]
-    for prefix, n, leading, _ in shapes:
+    for prefix, leading, _ in shapes:
+        n = counts.get(leading, 0)
         for i in range(n):
             labels[_register(conn, f"{prefix}{i}", width=1000, height=1000, step=20)] = leading
     db.assign_schedule(conn, 90, providers=tuple(_PROD_SLATE))
@@ -3184,7 +3353,7 @@ def _prod_shaped_stranded_slate(conn):
         if label == "kind2":
             continue
         db.record_attempt(conn, cid, success=True, provider="mapillary")
-        enrolled = next(ch for _, _, lead, ch in shapes if lead == label)
+        enrolled = next(ch for _, lead, ch in shapes if lead == label)
         for channel in enrolled:
             db.set_channel_membership(conn, cid, channel, True, cycle_days=90)
         if label.endswith("_streets"):
@@ -3229,6 +3398,161 @@ def test_the_channel_rotation_reaches_every_stranded_channel_across_nights(conn,
         assert dict(got) == expected, f"night {today}"
         reached |= {ch for ch in _OPT_IN_CHANNELS if got[ch]}
     assert reached == set(_OPT_IN_CHANNELS), "every stranded channel within four nights"
+
+
+@pytest.mark.parametrize("n_resumers", range(11))
+def test_kartaview_resumers_leave_every_stranded_channel_a_take(conn, monkeypatch, n_resumers):
+    """The resumer floor counts each opt-in CHANNEL as its own sub-queue (#397).
+
+    Resumers reach the opt-in-only kind without passing through its channel
+    rotation. Counted per KIND, the floor on #348's prod-shaped slate (six
+    sub-queues: kinds 0 and 2, four opt-in channels) let 8 live KartaView
+    checkpoints take 8 of 10 slots, kinds 0 and 2 one each, and
+    kartaview_streets, panoramax and panoramax_streets 0 on every night those
+    checkpoints stayed live -- up to seven days. Counted per sub-queue the take
+    is at most 10 - (6 - 1) = 5, which pins the cost as well as the cure.
+
+    Swept over every resumer count the KartaView queue can hold, across one
+    full rotation period (four nights for four channels): each night takes
+    exactly min(r, 5) resumers and gives the opt-in-only kind at least one slot
+    BEYOND them, and every kind and every stranded channel is reached. At
+    r >= 8 the old per-kind floor fails the per-night half on night one.
+    """
+    from collections import Counter
+
+    from streetscape_metadata_tracker import scheduler as sched
+
+    labels = _prod_shaped_stranded_slate(conn)
+    live = [cid for cid, label in labels.items() if label == "kartaview"][:n_resumers]
+    monkeypatch.setattr(
+        sched,
+        "_sweep_checkpoint_progress",
+        lambda cfg, city, channel: {"age_s": 1.0} if city.city_id in live else None,
+    )
+    cfg = _sweep_cfg(publish_enabled=False, opt_in_cities_per_day=10)
+    reached = set()
+    for day in range(4):
+        today = date(2026, 7, 2) + timedelta(days=day)
+        slate = sched._collect_due(
+            conn, cfg, today, list(_PROD_SLATE), max_opt_in=10, max_cities=60
+        )
+        head = [c.city_id for c in slate.cities[:10]]
+        # The floor's take: the first min(r, 5) resumers in union order. A
+        # resumer it cut stays in the kartaview sub-queue, and the rotation may
+        # still reach it as that channel's ordinary turn.
+        floor_take = live[: min(n_resumers, 5)]
+        assert set(floor_take) <= set(head), f"night {today}"
+        beyond = Counter(labels[c] for c in head if c not in floor_take)
+        assert beyond["kind0"] and beyond["kind2"], f"night {today}: {dict(beyond)}"
+        assert sum(beyond[ch] for ch in _OPT_IN_CHANNELS) >= 1, (
+            f"night {today}: the opt-in-only kind got no slot beyond its resumers"
+        )
+        reached |= {labels[c] for c in head}
+    assert reached == {"kind0", "kind2", *_OPT_IN_CHANNELS}
+
+
+def test_a_kind_with_an_unserved_channel_is_not_served_below_the_sub_queue_count(conn, monkeypatch):
+    """A resumer serves its own CHANNEL sub-queue, not its whole kind (#397).
+
+    Kinds 0 and 2 plus kartaview and kartaview_streets: four sub-queues, a
+    reservation of 3. The floor takes max(1, 3 - 3) = 1 resumer, from
+    kartaview. kartaview_streets has had no turn, so kind 1 stays in the front
+    half and the two remaining slots go to kinds 0 and 1 in kind order; kind 2
+    waits. Pinned like the below-G case: it is the documented below-S order,
+    and treating a partly served kind as served would hand kind 2 the slot.
+    """
+    from collections import Counter
+
+    from streetscape_metadata_tracker import scheduler as sched
+
+    labels = _prod_shaped_stranded_slate(
+        conn, {"kind0": 2, "kind2": 2, "kartaview": 2, "kartaview_streets": 2}
+    )
+    resumer = next(cid for cid, label in labels.items() if label == "kartaview")
+    monkeypatch.setattr(
+        sched,
+        "_sweep_checkpoint_progress",
+        lambda cfg, city, channel: {"age_s": 1.0} if city.city_id == resumer else None,
+    )
+    cfg = _sweep_cfg(publish_enabled=False, opt_in_cities_per_day=3)
+    slate = sched._collect_due(
+        conn, cfg, date(2026, 7, 2), list(_PROD_SLATE), max_opt_in=3, max_cities=60
+    )
+    head = [c.city_id for c in slate.cities[:3]]
+    assert resumer in head
+    kinds = Counter("kind1" if labels[c].startswith("kartaview") else labels[c] for c in head)
+    assert kinds == {"kind0": 1, "kind1": 2}
+
+
+@pytest.mark.parametrize("day", range(2))
+def test_a_transient_kind_is_one_sub_queue_whatever_its_leading_channel(conn, monkeypatch, day):
+    """Only kind 1 splits by channel; kind 2 is ONE sub-queue in the floor (#397).
+
+    Two kind-2 cities lead on gsv_streets (only gsv succeeded) and three lead on
+    mapillary (both GSV channels succeeded) and carry live checkpoints; one
+    kind-1 city is due only on kartaview. That is S = 2 sub-queues, so at a
+    reservation of 3 the floor takes 3 - 1 = 2 resumers, kind 2 is served, and
+    the last slot goes to kind 1. Keying kind 2 by its leading channel too makes
+    S = 3 and the take 1, and then kind 2 -- still holding an "unserved"
+    gsv_streets sub-queue -- takes a front-half slot that is not a resumer's.
+    Run on two consecutive dates so either rotation offset is exercised.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    for i in range(2):
+        _register(conn, f"Plain{i}", width=1000, height=1000, step=20)
+    walk_led = [_register(conn, f"Ctw{i}", width=1000, height=1000, step=20) for i in range(2)]
+    resumers = [_register(conn, f"Ctm{i}", width=1000, height=1000, step=20) for i in range(3)]
+    opt_in = _register(conn, "Bopt0", width=1000, height=1000, step=20)
+    db.assign_schedule(conn, 90, providers=tuple(_KIND_CHANNELS))
+    for cid in walk_led:
+        db.record_attempt(conn, cid, success=True, provider="gsv")
+    for cid in resumers:
+        for channel in ("gsv", "gsv_streets"):
+            db.record_attempt(conn, cid, success=True, provider=channel)
+    db.set_channel_membership(conn, opt_in, "kartaview", True, cycle_days=90)
+    for channel in ("gsv", "gsv_streets", "mapillary"):
+        db.record_attempt(conn, opt_in, success=True, provider=channel)
+    monkeypatch.setattr(
+        sched,
+        "_sweep_checkpoint_progress",
+        lambda cfg, city, channel: {"age_s": 1.0} if city.city_id in resumers else None,
+    )
+
+    cfg = _sweep_cfg(publish_enabled=False, opt_in_cities_per_day=3)
+    slate = sched._collect_due(
+        conn,
+        cfg,
+        date(2026, 7, 2) + timedelta(days=day),
+        list(_KIND_CHANNELS),
+        max_opt_in=3,
+        max_cities=100,
+    )
+    head = [c.city_id for c in slate.cities[:3]]
+    assert set(head) == {*resumers[:2], opt_in}, head
+
+
+def test_a_reservation_of_zero_hoists_no_resumer(conn, monkeypatch):
+    """`max_opt_in = 0` switches promotion OFF, live checkpoints included.
+
+    `_opt_in_reservation` documents 0 as off, and `run-due --limit 3` derives
+    it (3 // 4). The floor was a bare max(1, ...), so it still hoisted one
+    resumer ahead of the gsv-due cities on a night that reserved nothing.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    by_kind = _stranded_kind_slate(
+        conn, monkeypatch, sizes={0: 2, 1: 2}, resumers_per_kind={0: 1, 1: 1}
+    )
+
+    cfg = _sweep_cfg(publish_enabled=False, opt_in_cities_per_day=0)
+    slate = sched._collect_due(
+        conn, cfg, date(2026, 7, 2), list(_KIND_CHANNELS), max_opt_in=0, max_cities=100
+    )
+    stranded = {cid for ids in by_kind.values() for cid in ids}
+    # Union order puts the two gsv-due cities first; nothing may move ahead.
+    assert not any(c.city_id in stranded for c in slate.cities[:2])
+    assert slate.hoisted == 0
 
 
 def test_the_channel_rotation_does_not_skip_past_an_emptied_sub_queue(conn, monkeypatch):

@@ -8020,16 +8020,42 @@ def _collect_due(
             # widening at 502 enrolled cities makes ten at once plausible, with
             # no drain inside a night (CHECKPOINT_MAX_AGE_S is seven days).
             #
-            # Leaving one slot per OTHER non-empty group costs the resumers
-            # nothing at the size that matters: at max_opt_in = 1 with two
-            # groups the floor keeps the take at 1, so F4's guarantee -- a live
-            # checkpoint outranks the rotation -- is untouched, while any
-            # max_opt_in >= the number of groups now guarantees every stranded
-            # population a slot. The two invariants only looked like they were
-            # in conflict.
-            n_groups = len({_stranded_kind(i) for i in stranded})
+            # Leaving one slot per OTHER non-empty SUB-QUEUE costs the resumers
+            # nothing at the size that matters: at max_opt_in = 1 the floor
+            # keeps the take at 1, so F4's guarantee -- a live checkpoint
+            # outranks the rotation -- is untouched. The two invariants only
+            # looked like they were in conflict.
+            #
+            # A sub-queue, not a kind, because kind 1 is itself a rotation over
+            # channels (below, #348), and resumers reach it WITHOUT passing
+            # through that rotation. Counted per kind, the floor let them
+            # absorb kind 1's whole share: on #390's prod-shaped slate (10
+            # slots, kinds 0 and 2 non-empty, four stranded opt-in channels) 8
+            # live KartaView checkpoints took 8 slots, kinds 0 and 2 one each,
+            # and kartaview_streets, panoramax and panoramax_streets got 0 on
+            # every night those checkpoints stayed live -- up to seven days.
+            # Counted per sub-queue the floor there is 5, not 8: resumers drain
+            # slower, which they can afford (CHECKPOINT_MAX_AGE_S is seven
+            # days), and kind 1 keeps a rotation take every night.
+            #
+            # Never more than `max_opt_in`, so a reservation of 0 -- which
+            # _opt_in_reservation documents as switching promotion OFF, and
+            # which `run-due --limit 3` derives -- hoists nothing. The bare
+            # max(1, ...) took one resumer even then.
+            def _leading_channel(index: int) -> str:
+                # Appended in due_by_provider order, whose keys are `providers`
+                # in rank order, so [0] IS the earliest-ranked due channel.
+                return providers_for_city[ordered[index].city_id][0]
+
+            def _sub_queue(index: int) -> tuple[int, str]:
+                # Only kind 1 splits by channel; kinds 0 and 2 are one queue.
+                kind = _stranded_kind(index)
+                return kind, _leading_channel(index) if kind == 1 else ""
+
+            n_sub_queues = len({_sub_queue(i) for i in stranded})
             resumers = [i for i in stranded if _has_live_checkpoint(ordered[i])]
-            chosen = set(resumers[: max(1, max_opt_in - (n_groups - 1))])
+            take = min(max_opt_in, max(1, max_opt_in - (n_sub_queues - 1)))
+            chosen = set(resumers[:take])
 
             # Then round-robin the rest, so no stranded KIND can be zeroed by a
             # larger one on a single night. (Within kind 1 that holds only
@@ -8063,8 +8089,10 @@ def _collect_due(
             # four stranded channels the LAST one got 0 every night -- #348 one
             # level further in. The guarantee is exactly this, and no more:
             # while the set of non-empty sub-queues is unchanged and group 1
-            # receives >= 1 slot a night, every stranded channel is reached
-            # within (number of sub-queues) consecutive nights.
+            # receives >= 1 slot a night BEYOND ITS RESUMERS, every stranded
+            # channel is reached within (number of sub-queues) consecutive
+            # nights. The per-sub-queue floor above is what delivers that slot
+            # at max_opt_in >= S (see the per-night guarantee below).
             class _Rotation:
                 """Round-robin over sub-queues, starting at ``offset`` mod their count."""
 
@@ -8086,18 +8114,46 @@ def _collect_due(
                         self._cursor = 0
                     return index
 
-            def _leading_channel(index: int) -> str:
-                # Appended in due_by_provider order, whose keys are `providers`
-                # in rank order, so [0] IS the earliest-ranked due channel.
-                return providers_for_city[ordered[index].city_id][0]
-
+            # A CHOSEN resumer IS its sub-queue's turn (#393), so a kind goes
+            # to the back of every pass only once EVERY sub-queue it still
+            # holds has had one; the rest go first, each half in kind order.
+            # Restarting the rotation at kind 0 regardless zeroed kind 2 at
+            # max_opt_in = 3 with a kind-0 resumer -- and starting it at the
+            # first UNSERVED kind is not enough either: with the resumer in
+            # kind 1 that rotation runs 0, 1, 2 and kind 2 is zeroed the same
+            # way. `served` reads `chosen`, not `resumers`: a resumer the floor
+            # cut has not served its sub-queue, and that queue still holds it.
+            # Kinds 0 and 2 are one sub-queue each, so for them this is exactly
+            # "a resumer served its kind"; kind 1 stays at the front while any
+            # of its channels has been served by no resumer.
+            #
+            # The guarantee this delivers is PER NIGHT. Let S be the number of
+            # non-empty sub-queues (kinds 0 and 2 count one each, kind 1 one per
+            # stranded channel) and G <= S the number of non-empty kinds. With
+            # max_opt_in >= S, every non-empty kind gets at least one slot, and
+            # every kind holding a sub-queue no resumer served gets a slot
+            # beyond its resumers. Trivial when everything fits; otherwise the
+            # floor takes at most max_opt_in - S + 1 resumers, so at least
+            # S - 1 slots remain -- or all max_opt_in >= S if none was taken.
+            # A front-half kind has an unserved sub-queue, so the front half is
+            # at most G kinds, and at most G - 1 when a resumer was taken and
+            # kind 1 holds a single channel (then S - 1 >= G - 1); with two or
+            # more kind-1 channels S - 1 >= G. Either way the first pass visits
+            # every front-half kind. Below S the served kinds have had their
+            # turn, and the rest fill in kind order, so the highest-numbered
+            # unserved kinds are the ones that wait. Rotating which kind waits
+            # ACROSS nights at max_opt_in < S would need state carried between
+            # nights, and is out of scope.
+            served = {_sub_queue(i) for i in chosen}
             groups: dict[int, dict[str, list[int]]] = {}
             for i in stranded:
                 if i not in chosen:
-                    kind = _stranded_kind(i)
-                    # Only group 1 splits by channel; 0 and 2 share one key.
-                    sub = _leading_channel(i) if kind == 1 else ""
+                    kind, sub = _sub_queue(i)
                     groups.setdefault(kind, {}).setdefault(sub, []).append(i)
+
+            def _all_served(kind: int) -> bool:
+                return all((kind, sub) in served for sub in groups[kind])
+
             # Sub-queues rotate in `providers` rank order, not first-seen order.
             rank = {p: n for n, p in enumerate(providers)}
             queues = [
@@ -8105,7 +8161,7 @@ def _collect_due(
                     [subs[k] for k in sorted(subs, key=lambda k: rank.get(k, -1))],
                     today.toordinal(),
                 )
-                for _, subs in sorted(groups.items())
+                for _, subs in sorted(groups.items(), key=lambda kq: (_all_served(kq[0]), kq[0]))
             ]
             while len(chosen) < max_opt_in and any(queues):
                 for q in queues:
