@@ -555,8 +555,9 @@ That is a materially better access position than KartaView's empty room, and it 
 
 **It has NOT been asked, and that is a decision rather than an oversight (2026-09-06).**
 Phase 2's collector shipped without a forum post, on the reading that CLAUDE.md's standing rule is to READ a provider's docs and community before changing how we call it — which phase 1's survey did, and which this section is the record of — while *posting* a question was #316's own addition rather than the rule's.
-What that leaves is a pace chosen from nothing the provider said, which is exactly why it is conservative: 30/min, half the Mapillary channels', against the one host here that publishes no number at all.
-Re-read both forums before any change that raises volume, rate or concurrency, and treat a reply there as outranking the number in `config/scheduler.toml`.
+What that left was a pace chosen from nothing the provider said, which is exactly why it started conservative: 30/min, three quarters of the Mapillary channels' 40, against the one host here that publishes no number at all.
+Production has since been raised to 60/min under a staged plan (#405, below); the collector's own default and the repo-default config stay at 30.
+Re-read both forums before any change that raises volume, rate or concurrency, and treat a reply there as outranking the number in `config/scheduler.makelab1.toml`.
 
 **Two questions still belong in a post, and the second is not a courtesy question.**
 What sustained rate the meta-catalog is comfortable with; and whether a picture's identity survives a sequence being migrated between instances.
@@ -567,7 +568,7 @@ Until that is answered it is a **known caveat on every Panoramax diff**, not a s
 Two things, both on the same IP and serialized against each other by one machine-wide `host_lock(HOST_PANORAMAX)`:
 
 - **Nightly collections** — a city's z15 tile census, p50 414 tiles for a leader city, max 3,132, on the two opt-in channels [#335](https://github.com/jonfroehlich/streetscape-tracker/issues/335) wired.
-  Both read ONE census per (city, bbox) and share it through the #290 cache, so an enrolled pair costs what the grid run alone costs, and the budget that bounds a night is the per-IP SUM of the two blocks (4,000 + 4,000 un-paired) rather than either figure alone.
+  Both read ONE census per (city, bbox) and share it through the #290 cache, so an enrolled pair costs what the grid run alone costs, and the budget that bounds a night is the per-IP SUM of the two blocks (8,000 + 8,000 un-paired in production since #405 stage 1; 4,000 + 4,000 before) rather than either figure alone.
   Enrolment is the rate this proceeds at: seed a handful of cities, not the ~20 leaders at once.
 - **The weekly screen** ([#316](https://github.com/jonfroehlich/streetscape-tracker/issues/316) phase 2) — **113 requests, once a week**, answering all 1,144 enabled cities off the v2 `grid` layer at z6.
   It is small enough that the interesting number is not its volume but its regularity: it fires on a fixed weekday at a fixed hour, so it is the one traffic shape here that a scorer could learn.
@@ -594,11 +595,35 @@ And **`filter=field_of_view=360` returns none of the EXIF-less pictures** (17 of
 The tile layers are the answer to all three: they carry a `type` field with no absent state, and they are the instrument [`experiments/panoramax-feasibility.md`](experiments/panoramax-feasibility.md) actually uses.
 
 **What the COLLECTOR does, as shipped (#316 phase 2).**
-Same 30/min and the same CV-0.6 jitter as the probe, from `download_common.spaced_gap_seconds` rather than re-derived, and behind `host_lock(HOST_PANORAMAX)` — the fourth locked host, exit codes **84 blocked / 85 busy**.
+Same 30/min default (production: 60/min since #405 stage 1, below) and the same CV-0.6 jitter as the probe, from `download_common.spaced_gap_seconds` rather than re-derived, and behind `host_lock(HOST_PANORAMAX)` — the fourth locked host, exit codes **84 blocked / 85 busy**.
 **403 and 429 are `HostBlockedError` at the first request**, which is a stronger reading than the other two providers get and follows from there being no credential: on Mapillary and KartaView a 403 is a rejected token and is deliberately scoped to the key, while here it can only be the IP.
 **A 404 is an empty tile rather than a failure** — measured, not assumed: 0 empty tiles across 3,321 phase-1 requests including 20 cities holding nothing, because an empty area answers 200 with no layer.
 The guard that reading needs is that **a lattice where EVERY tile 404s is refused**, since that is what a moved endpoint looks like and the alternative is publishing a city as having lost all its imagery.
 Unlike the probe there is no `refuse_on_collection_host()`: a collector's whole purpose is to run on the collection host, so what protects the nightly batch is the pace, the host lock and the fact that the channel is not scheduled yet.
+
+**The staged raise (issue #405; stage 1 configured 2026-10-01, live from its deploy).**
+On 2026-10-01 Panoramax was the one budget-bound channel: the grid channel spent its whole 4,000 and the walk 2,651, three cities were deferred for budget, and Salt Lake City launched capped at 409 and paused (exit 83), with only 20 cities enrolled and 41 more tracked cities screening positive at ≥1,000 360° pictures.
+What a second read of docs, source and forums found that day:
+
+- **Documented: still nothing** — no limit, no 429 contract, no `Retry-After` and no fair-use text in the OpenAPI spec, docs.panoramax.fr, the API landing page or the OSM wiki.
+- **Measured: tile caching** — tiles carry `Cache-Control: public, max-age=86400` at z6 and `max-age=3600` at z15, so a tile is never worth re-fetching inside its window.
+- **Reported by the maintainer, and about BURSTS** — forum.geocommuns.fr thread 3298 (2026-07-02) calls several thousand requests at once "très violent" and says rate-limiting has not been needed yet but will come because of bots; forum.openstreetmap.fr thread 44813 (2026-07-18) describes a 150–200 req/s job of 80,000+ requests as ~25% of the meta-catalog's traffic (so ~320k requests/day), calls a one-off ~900-request query fine, and offers the weekly GeoParquet dumps at `https://api.panoramax.xyz/data/` as the bulk path.
+- **Source** — `api.panoramax.xyz` is `gitlab.com/panoramax/server/meta-catalog`, a Rust/actix-web service whose `main.rs` wires no rate-limit, concurrency or timeout middleware; whatever limit exists lives in an unpublished nginx in front of it.
+
+Our 0.5 req/s and 4,000/day was ~1.25% of that traffic and far below either incident's rate, so the raise proceeds in stages, both channels together, with the forum deliberately not asked:
+
+| Stage | `max_requests_per_minute` | `daily_request_budget` (each channel) | Gate to the next stage |
+|---|---|---|---|
+| 0 (until 2026-10-01) | 30 | 4,000 | |
+| **1 (current)** | **60** | **8,000** | **7 clean nights**: no 403/429/redirect, no 5xx cluster |
+| 2 | 90 | 12,000 | another 7 clean nights |
+
+- **Each stage is its own PR** to `config/scheduler.makelab1.toml`, with its date and evidence in the comment block, and the pinning test in `tests/test_scheduler.py` moves with it.
+- **The trip wire is the existing latch**: 403/429/redirect is a `HostBlockedError` (exit 84) at the first request. A trip **reverts to the previous stage** and the night is recorded in this section.
+- **Jitter stays 0.6 and the host lock stays**; the collector already sends a `User-Agent` naming the project and its repository.
+- **What it changes downstream.** `_tile_census_timeout_seconds` divides by the configured rate, so at 60/min the richest enrollable city (3,132 tiles) derives ~108 min, under the 180-minute floor that now times every enrolled city; that floor affords 8,160 requests at this pace, just above the 8,000 budget, so a capped launch is sized by the budget rather than the clock. The per-IP sum is 16,000 un-paired, ~5.6 h of the host lock at the 0.8 achieved fraction. The weekly growth screen paces from the same block, so it runs twice as fast too.
+- **Enrolment of the 41 screen-positive tracked cities proceeds in tranches only after stage 1 holds.**
+- Whole-catalog screening should move to the weekly parquet dump for 0 API requests; that is a separate ticket.
 
 **One host, not twenty-five.** `api.panoramax.xyz` is a meta-catalog that harvests metadata from every registered instance (23 on 2026-09-04), so a collector would query one host regardless of how many instances join — one `host_lock.py` entry, no per-instance fan-out, and no per-instance rate question.
 The corollary is that all of our load lands on one volunteer-run endpoint rather than being spread across the federation, which argues for the conservative end of any pacing range rather than against it.

@@ -620,16 +620,47 @@ network_type = "drive"
 # added since #258 brings one more Overpass user, and Overpass admits exactly
 # one talker. gsv_streets is the representative because it is the only Overpass
 # channel with no SECOND host. Moot at the knob's current value of 1.
+#
+# STAGE 1 OF A STAGED RAISE (issue #405, 2026-10-01): 30 -> 60/min and
+# 4,000 -> 8,000/day on BOTH channels together. Why it is safe to try:
+#   - documented: still nothing. The OpenAPI spec, docs.panoramax.fr, the API
+#     landing page and the OSM wiki carry no limit, no 429 contract, no
+#     Retry-After and no fair-use text.
+#   - source: api.panoramax.xyz is gitlab.com/panoramax/server/meta-catalog, a
+#     Rust/actix-web service whose main.rs wires no rate-limit, concurrency or
+#     timeout middleware; whatever limit exists is in an unpublished nginx.
+#   - reported by the maintainer, and it is about BURSTS: "several thousand
+#     requests at once" (forum.geocommuns.fr 3298, 2026-07-02) and a 150-200
+#     req/s job making 80,000+ requests, ~25% of the catalog's traffic
+#     (forum.openstreetmap.fr 44813, 2026-07-18), so the catalog serves ~320k
+#     requests/day. A one-off ~900-request query was called fine.
+#   - ours: 0.5 req/s and 4,000/day was ~1.25% of that traffic; stage 1 is
+#     1 req/s, still two orders of magnitude below either incident's rate.
+# The forum was deliberately NOT asked (#405). Jitter (0.6) and the host lock
+# are unchanged; the collector already sends a User-Agent naming the project.
+#
+# THE GATE TO STAGE 2 (90/min, 12,000/day each): seven clean nights at these
+# values -- no 403/429/redirect (a HostBlockedError, exit 84), no 5xx cluster.
+# A trip REVERTS to the previous stage (30 / 4,000) and is recorded in
+# docs/provider-access.md. Each stage is its own PR; enrolment of the 41
+# screen-positive tracked cities proceeds in tranches only after this holds.
 [providers.panoramax]
 enabled = true
-# ~ the richest city measured (3,132 z15 tiles) with room for a second, so one
-# night can finish any single enrolled city. Also a real per-night ceiling, not
-# only a gate: `_run_one_city` hands the child --panoramax-max-requests.
-daily_request_budget = 4000
-# The collector's own DEFAULT_TILE_REQUESTS_PER_MINUTE, restated because
-# _tile_census_timeout_seconds derives every per-city timeout from THIS value —
-# lowering it here without re-reading that function shortens the timeouts too.
-max_requests_per_minute = 30
+# Was ~the richest city measured (3,132 z15 tiles) with room for a second; at
+# 8,000 a night can finish the richest city AND its unpaired walk, or two more.
+# A real per-night ceiling, not only a gate: `_run_one_city` hands the child
+# --panoramax-max-requests. The per-IP SUM over both channels is now 16,000
+# un-paired, ~5.6 h of this host's lock at 60/min x 0.8 achieved.
+daily_request_budget = 8000
+# Twice the collector's own DEFAULT_TILE_REQUESTS_PER_MINUTE (30, unchanged:
+# laptop runs and the repo default stay conservative). _tile_census_timeout_
+# seconds derives every per-city timeout from THIS value, so doubling it halves
+# the derivation: the richest city (3,132 tiles) now derives ~108 min, under
+# the 180-minute city_timeout_minutes floor, which therefore binds again for
+# any city under ~5,440 tiles. That floor affords 8,160 requests at this pace
+# (_sweep_requests_within_timeout), just above the 8,000 budget, so a capped
+# launch is sized by the budget rather than the clock.
+max_requests_per_minute = 60
 # Non-metronomic gaps, the #292 shifted exponential, at the collector's own CV.
 jitter = 0.6
 
@@ -638,11 +669,13 @@ jitter = 0.6
 # grid coverage. Nearly free WHEN PAIRED — both channels read one z15 census of
 # one bbox, the grid run promotes it into the shared cache (#290) and this one
 # prices at 0, which is why it ranks immediately after panoramax. Un-paired it
-# pays a full census, and that is what this budget covers.
+# pays a full census, and that is what this budget covers. Raised in lockstep
+# with the grid channel (#405 stage 1): one host lock serializes the two, so
+# 60/min is their COMBINED ceiling, never each one's.
 [providers.panoramax_streets]
 enabled = true
-daily_request_budget = 4000
-max_requests_per_minute = 30
+daily_request_budget = 8000
+max_requests_per_minute = 60
 jitter = 0.6
 spacing_m = 15
 network_type = "drive"
