@@ -527,81 +527,7 @@ def test_the_walks_variant_reaches_the_fetch(tmp_path, monkeypatch):
     assert calls["checkpoint_variant"] == "all_public"
 
 
-# ── An unswept sample is not an empty one ───────────────────────────────────
-
-
-def test_a_failed_cell_publishes_request_failed_not_zero_results(tmp_path, monkeypatch):
-    """
-    A cell the sweep never got back leaves its samples UNKNOWN.
-
-    Street coverage is a share of samples, so recording an unswept sample as
-    ZERO_RESULTS publishes an absence we never observed -- into an immutable
-    dated snapshot that understates the city permanently. The grid run has
-    always done this; the walk must too, or the two disagree about the same
-    unswept ground. Mapillary's walk closed the same gap in #259.
-    """
-    # A SMALL cell over the north end of the long edge, so the run carries both
-    # kinds at once. A whole-city failed cell would be 100% REQUEST_FAILED,
-    # which detect_systemic_failure rejects outright (correctly -- that is a
-    # broken credential, not a coverage measurement), and would prove nothing
-    # about the discrimination this test is actually about. The real sweep
-    # refuses to finalize past MAX_FAILED_AREA_FRACTION for the same reason.
-    failed = [Cell(lat=44.0519, lon=-121.30, size_m=60.0)]
-    images = [_image("kv1", 44.0500, -121.30)]
-    data_dir, _ = _setup(tmp_path, monkeypatch, images, failed_cells=failed)
-
-    assert collect.run_collect(_args(data_dir)) == 0
-    body = _rows(_walk_csv(data_dir))
-    status_i = body[0].split(",").index("status")
-    statuses = [r.split(",")[status_i] for r in body[1:]]
-    assert "REQUEST_FAILED" in statuses, (
-        f"samples under an unswept cell must be REQUEST_FAILED, got {set(statuses)}"
-    )
-    # ...and the rest of the city, which WAS swept, still reads as measured.
-    assert {"ZERO_RESULTS", "OK"} & set(statuses), "only the unswept samples may be REQUEST_FAILED"
-
-
-def test_a_clean_sweep_still_publishes_zero_results(tmp_path, monkeypatch):
-    """
-    The other half of the pair: with no failed cells, an empty bbox is a
-    MEASURED absence and must read ZERO_RESULTS.
-
-    Without this, marking everything REQUEST_FAILED would pass the test above
-    while destroying the ordinary case -- the coverage denominator depends on
-    telling observed emptiness from unobserved ground.
-    """
-    data_dir, _ = _setup(tmp_path, monkeypatch, [], failed_cells=[])
-
-    assert collect.run_collect(_args(data_dir)) == 0
-    body = _rows(_walk_csv(data_dir))
-    statuses = {r.split(",")[body[0].split(",").index("status")] for r in body[1:]}
-    assert statuses == {"ZERO_RESULTS"}
-
-
-# ── Cost is bbox area, not sample count ─────────────────────────────────────
-
-
-def test_cost_is_independent_of_spacing(tmp_path, monkeypatch):
-    """
-    The defining property of a census arm, and the reason its --estimate text
-    says "independent of spacing": halving the spacing doubles the sample points
-    and changes the request count not at all.
-    """
-    images = [_image("kv1", 44.0500, -121.30)]
-    data_dir, calls = _setup(tmp_path, monkeypatch, images, api_requests=9)
-
-    assert collect.run_collect(_args(data_dir, spacing=15)) == 0
-    coarse = calls["n"]
-    assert collect.run_collect(_args(data_dir, spacing=5, force=True)) == 0
-
-    conn = db.connect(db.get_default_db_path(data_dir))
-    # Two collections, each 9 requests -- the sweep is paid per RUN, not per sample.
-    assert db.get_api_usage(conn, date.fromisoformat(RUN_DATE), provider="kartaview_streets") == 18
-    conn.close()
-    assert calls["n"] == coarse + 1
-
-
-# ── Spend, and what a failure still owes the ledger (#333) ──────────────────
+# ── Spend, provenance, and what a failure still owes the ledger (#333) ─────
 
 
 def test_the_walk_row_takes_the_crawl_and_the_ledger_takes_this_process(tmp_path, monkeypatch):
@@ -689,7 +615,9 @@ def test_a_reused_census_says_who_paid_for_it_and_when(tmp_path, monkeypatch):
     The fixture's defaults return this channel as the payer and no timestamp,
     and no test read either column back, so hardcoding either field to None in
     the collector's return dict passed every KartaView test (#333). Non-default
-    values on both, asserted on the row, make the pass-through observable.
+    values on both, asserted on the row, kill a hardcoded None -- but NOT a
+    hardcoded "kartaview", which is this test's own expected payer; the fresh
+    census test below asserts the walk's own channel and closes that half.
     """
     observed = "2026-07-07T22:15:00+00:00"
     data_dir, _ = _setup(
@@ -740,3 +668,120 @@ def test_a_reused_census_stamps_its_rows_with_when_kartaview_was_observed(tmp_pa
     ts_i = body[0].split(",").index("query_timestamp")
     stamps = {r.split(",")[ts_i] for r in body[1:]}
     assert stamps == {observed}, f"every row must carry the observation time, got {stamps}"
+
+
+def test_a_freshly_fetched_census_keeps_this_processs_clock(tmp_path, monkeypatch):
+    """The other side of the restamp, and the reason it is gated on REUSE
+    rather than on the provenance being present at all.
+
+    A fresh sweep that checkpointed reports provenance too -- its OWN channel
+    and the checkpoint's `created_at` (`download_kartaview.fetch_city_images_async`
+    returns `census_fetched_by: checkpoint_channel`, `census_fetched_at:
+    cp.created_at` and `census_reused: False`), and `collect` always hands a
+    KartaView walk a checkpoint path. So a walk resumed across nights carries a
+    prior night's `created_at`, and those rows were nonetheless observed NOW.
+
+    The fixture's old defaults (`census_fetched_at=None`) could not express that
+    state, so three wrong implementations passed every KartaView test (#401
+    review): restamping whenever a timestamp is present, writing the row's
+    `census_fetched_at` from the restamped clock, and hardcoding
+    `census_fetched_by` to the grid channel. The payer asserted here is the
+    walk's own channel, which test 3's grid-channel payer cannot distinguish
+    from that hardcoded constant on its own.
+    """
+    crawl_start = "2026-07-01T00:00:00+00:00"
+    data_dir, _ = _setup(
+        tmp_path,
+        monkeypatch,
+        [_image("kv1", 44.05, -121.30)],
+        census_fetched_at=crawl_start,
+        census_reused=False,
+    )
+    assert collect.run_collect(_args(data_dir)) == 0
+
+    conn = db.connect(db.get_default_db_path(data_dir))
+    walk = db.get_latest_street_walk(conn, CITY_ID, provider="kartaview")
+    conn.close()
+    assert walk["census_fetched_by"] == "kartaview_streets", (
+        "this channel paid, and the row says so"
+    )
+    assert walk["census_fetched_at"] == crawl_start, "provenance is the crawl's, not the clock's"
+
+    body = _rows(_walk_csv(data_dir))
+    ts_i = body[0].split(",").index("query_timestamp")
+    stamps = {r.split(",")[ts_i] for r in body[1:]}
+    assert crawl_start not in stamps, "a fresh census is stamped with this process's clock"
+
+
+# ── An unswept sample is not an empty one ───────────────────────────────────
+
+
+def test_a_failed_cell_publishes_request_failed_not_zero_results(tmp_path, monkeypatch):
+    """
+    A cell the sweep never got back leaves its samples UNKNOWN.
+
+    Street coverage is a share of samples, so recording an unswept sample as
+    ZERO_RESULTS publishes an absence we never observed -- into an immutable
+    dated snapshot that understates the city permanently. The grid run has
+    always done this; the walk must too, or the two disagree about the same
+    unswept ground. Mapillary's walk closed the same gap in #259.
+    """
+    # A SMALL cell over the north end of the long edge, so the run carries both
+    # kinds at once. A whole-city failed cell would be 100% REQUEST_FAILED,
+    # which detect_systemic_failure rejects outright (correctly -- that is a
+    # broken credential, not a coverage measurement), and would prove nothing
+    # about the discrimination this test is actually about. The real sweep
+    # refuses to finalize past MAX_FAILED_AREA_FRACTION for the same reason.
+    failed = [Cell(lat=44.0519, lon=-121.30, size_m=60.0)]
+    images = [_image("kv1", 44.0500, -121.30)]
+    data_dir, _ = _setup(tmp_path, monkeypatch, images, failed_cells=failed)
+
+    assert collect.run_collect(_args(data_dir)) == 0
+    body = _rows(_walk_csv(data_dir))
+    status_i = body[0].split(",").index("status")
+    statuses = [r.split(",")[status_i] for r in body[1:]]
+    assert "REQUEST_FAILED" in statuses, (
+        f"samples under an unswept cell must be REQUEST_FAILED, got {set(statuses)}"
+    )
+    # ...and the rest of the city, which WAS swept, still reads as measured.
+    assert {"ZERO_RESULTS", "OK"} & set(statuses), "only the unswept samples may be REQUEST_FAILED"
+
+
+def test_a_clean_sweep_still_publishes_zero_results(tmp_path, monkeypatch):
+    """
+    The other half of the pair: with no failed cells, an empty bbox is a
+    MEASURED absence and must read ZERO_RESULTS.
+
+    Without this, marking everything REQUEST_FAILED would pass the test above
+    while destroying the ordinary case -- the coverage denominator depends on
+    telling observed emptiness from unobserved ground.
+    """
+    data_dir, _ = _setup(tmp_path, monkeypatch, [], failed_cells=[])
+
+    assert collect.run_collect(_args(data_dir)) == 0
+    body = _rows(_walk_csv(data_dir))
+    statuses = {r.split(",")[body[0].split(",").index("status")] for r in body[1:]}
+    assert statuses == {"ZERO_RESULTS"}
+
+
+# ── Cost is bbox area, not sample count ─────────────────────────────────────
+
+
+def test_cost_is_independent_of_spacing(tmp_path, monkeypatch):
+    """
+    The defining property of a census arm, and the reason its --estimate text
+    says "independent of spacing": halving the spacing doubles the sample points
+    and changes the request count not at all.
+    """
+    images = [_image("kv1", 44.0500, -121.30)]
+    data_dir, calls = _setup(tmp_path, monkeypatch, images, api_requests=9)
+
+    assert collect.run_collect(_args(data_dir, spacing=15)) == 0
+    coarse = calls["n"]
+    assert collect.run_collect(_args(data_dir, spacing=5, force=True)) == 0
+
+    conn = db.connect(db.get_default_db_path(data_dir))
+    # Two collections, each 9 requests -- the sweep is paid per RUN, not per sample.
+    assert db.get_api_usage(conn, date.fromisoformat(RUN_DATE), provider="kartaview_streets") == 18
+    conn.close()
+    assert calls["n"] == coarse + 1
