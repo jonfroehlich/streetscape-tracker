@@ -5102,7 +5102,7 @@ def _assess_preflight_report(
                 "partner. Consider a\n"
                 "    compact city grid instead: --width/--height TOGETHER WITH "
                 "--lat/--lng (size alone\n"
-                "    centers on the OSM bbox midpoint, not downtown)."
+                "    centers on the geocoder's point, not a verified downtown)."
             )
 
     lines.append("  cost")
@@ -5330,14 +5330,16 @@ def cmd_assess_city(
         if (width is None) != (height is None):
             raise _UsageError("--width and --height must be given together")
         if width is not None and lat is None:
-            # cli.py tolerates this and silently centers the grid on the OSM
-            # bounding-box midpoint, which for an irregular or river-bounded
-            # place is not downtown — the grid ends up the right SIZE in the
-            # wrong PLACE, frozen forever. Refusing is the cheap fix.
+            # cli.py accepts this and centers the grid on the geocoder's
+            # reported point (#186) — better than the OSM bbox midpoint, but
+            # nobody has verified that point is downtown (#185), and this
+            # command freezes geometry for a partner answer. Refusing is the
+            # cheap fix.
             raise _UsageError(
                 "--width/--height without --lat/--lng would freeze the grid on the "
-                "OSM bounding-box midpoint rather than the city center. Pass "
-                "--lat/--lng too (or omit both and let the boundary derive them)."
+                "geocoder's reported point, which is not verified to be the city "
+                "center. Pass --lat/--lng too (or omit both and let the boundary "
+                "derive them)."
             )
         channels = _select_assess_channels(cfg, requested_providers)
     except _UsageError as e:
@@ -9534,8 +9536,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="Grid width in meters. Must be given with --height AND --lat/--lng, "
-        "because size alone would center the grid on the OSM bounding-box "
-        "midpoint rather than the city.",
+        "because size alone would center the grid on the geocoder's point, "
+        "which is not verified to be the city center.",
     )
     p_assess.add_argument(
         "--height", type=float, default=None, help="Grid height in meters. See --width."
