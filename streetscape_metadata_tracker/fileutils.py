@@ -163,6 +163,58 @@ def load_city_csv_file(csv_path: str, dtypes: dict | None = None) -> pd.DataFram
         raise ValueError(f"Error parsing file {csv_path}: {str(e)}") from e
 
 
+def remove_stale_diff_detail(data_dir: str, filename: str | None) -> bool:
+    """
+    Delete a published diff detail file that no longer describes a recorded
+    diff, returning True only when a file was actually removed (issue #265).
+
+    The one rule behind it, shared by the grid diff (``cli._compute_and_record_diff``)
+    and the walk diff (``walk_diff.compute_and_record_walk_diff``): **a diff
+    detail file is a function of the diff result.** It exists exactly when a
+    recorded diff with changes names it. Both families used to write the file
+    only when a diff had changes and never delete one, so a re-diff that came
+    out with no changes — or was skipped — dropped the row's pointer and left
+    the file in ``data/``, which is rsynced to a public web server.
+
+    Never raises, because every caller runs it after a paid-for crawl is
+    already cataloged (the grid call site is not even failure-guarded):
+
+    - ``None`` or an empty name is a no-op (a row that recorded no file);
+    - a file that is already gone is the normal case, not an error;
+    - any other ``OSError`` (permissions, a stale NFS handle) is logged as a
+      warning and swallowed — a stranded file is a publishing blemish, a
+      failed collection is a lost month;
+    - a name with a path component is refused, logged, and nothing is
+      deleted. These names come from our own catalog and generators, which
+      never emit one, but the name is joined onto ``data_dir`` and an unlink
+      is the one operation where trusting that blindly is not worth a line.
+
+    Usage (the name always comes from a generator or a catalog row, never by hand):
+
+        name = generate_diff_filename(city_id, prev.run_date, run_date.isoformat())
+        if not diff.has_changes:
+            remove_stale_diff_detail(data_dir, name)
+    """
+    if not filename:
+        return False
+    if os.path.basename(filename) != filename or filename in (os.curdir, os.pardir):
+        logger.error(f"Refusing to remove diff detail {filename!r}: not a bare filename")
+        return False
+    path = os.path.join(data_dir, filename)
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        logger.warning(
+            f"Could not remove stale diff detail {path} ({exc}); it stays on disk and "
+            "published, unreferenced — scripts/sweep_orphan_diff_details.py finds it"
+        )
+        return False
+    logger.info(f"Removed stale diff detail {path}")
+    return True
+
+
 def try_open_with_system_command(file_path: str) -> bool:
     """
     Attempt to open file using system-specific commands as fallback.

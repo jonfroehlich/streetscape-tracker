@@ -238,16 +238,17 @@ def test_bad_arguments_exit_usage_without_opening_the_catalog(conn, monkeypatch,
 
 def test_the_size_without_center_refusal_explains_itself(conn, monkeypatch, tmp_path, caplog):
     """
-    cli.py tolerates --width/--height alone and centers the grid on the OSM
-    bounding-box midpoint, which for a river-bounded place is not downtown — and
-    the geometry is frozen forever. This command refuses instead, so the message
-    has to say why and name the flags that fix it.
+    cli.py accepts --width/--height alone and centers the grid on the
+    geocoder's reported point (#186), which nobody has verified is downtown
+    (#185) — and the geometry is frozen forever. This command refuses instead,
+    so the message has to say why and name the flags that fix it.
     """
     with caplog.at_level("ERROR"):
         rc, _connected = _refusal(monkeypatch, tmp_path, conn, width=5000, height=5000)
 
     assert rc == _sched.USAGE_EXIT_CODE
-    assert "bounding-box midpoint" in caplog.text
+    assert "geocoder's reported point" in caplog.text
+    assert "bounding-box midpoint" not in caplog.text
     assert "--lat/--lng" in caplog.text
 
 
@@ -1318,6 +1319,7 @@ def test_assess_city_inherits_the_lane_scheduler_from_the_config_knob(conn, monk
         busy_hosts=Counter(),
         deferred_channels=Counter(),
         rejected_argv=_sched.ArgvRejections(),
+        deadline_deferred=Counter(),
         batch_deadline=None,
         stop_requested=None,
         record_failures=False,
@@ -1327,3 +1329,17 @@ def test_assess_city_inherits_the_lane_scheduler_from_the_config_knob(conn, monk
     seq = {(kind, provider): n for kind, provider, n in events}
     assert seq[("start", "mapillary_streets")] > seq[("end", "gsv_streets")]
     assert seq[("start", "mapillary_streets")] > seq[("end", "mapillary")]
+
+
+def test_assess_city_never_defers_for_a_deadline(conn, monkeypatch, tmp_path):
+    """assess-city passes batch_deadline=None, so the #373 deferral can never
+    fire here: even with every channel's derived need past any night, each
+    listed channel -- gsv_streets, the non-resumable one, included -- is
+    collected."""
+    monkeypatch.setattr(_sched, "city_timeout_estimate_seconds", lambda *a, **k: 10**9)
+    ran = _stub_collection(monkeypatch, conn)
+
+    rc = _assess(tmp_path)
+
+    assert rc == 0
+    assert sorted(provider for _cid, provider in ran) == sorted(ASSESS_CHANNELS)

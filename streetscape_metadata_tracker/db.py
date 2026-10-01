@@ -1377,9 +1377,80 @@ def record_diff(
     return cur.lastrowid
 
 
+def update_diff(
+    conn: sqlite3.Connection,
+    diff_id: int,
+    *,
+    grid_aligned: bool,
+    panos_added: int,
+    panos_removed: int,
+    panos_persisted: int,
+    capture_date_changed: int,
+    points_gained_coverage: int | None,
+    points_lost_coverage: int | None,
+    coverage_delta_pct: float | None,
+    detail_filename: str | None,
+) -> None:
+    """
+    Overwrite an existing diff's recomputed columns IN PLACE, keeping its
+    ``diff_id`` (issue #245's repair handle, ``scripts/recompute_run_diffs.py``).
+
+    Not ``record_diff``: that is INSERT OR REPLACE on (from_run_id, to_run_id),
+    which deletes the row and inserts a new one under a NEW ``diff_id``. The id
+    is not cosmetic — ``get_latest_runs_all`` and ``get_diff_for_run`` pick the
+    MAX ``diff_id`` per ``to_run_id`` ("the most recently computed comparison
+    wins"), so re-recording an OLDER comparison into a run that also has a newer
+    one would silently change which baseline the published change blocks
+    advertise. A repair must not change which comparison is current.
+
+    ``computed_at`` IS refreshed: the row's numbers were recomputed now, and the
+    column records when, not when the pair was first compared. The identity
+    columns (city_id, from_run_id, to_run_id) are never touched.
+
+    Raises ``LookupError`` when no row has ``diff_id`` — a repair that updated
+    nothing must not read as one that succeeded.
+    """
+    cur = conn.execute(
+        """UPDATE run_diffs SET
+             grid_aligned = ?, panos_added = ?, panos_removed = ?, panos_persisted = ?,
+             capture_date_changed = ?, points_gained_coverage = ?,
+             points_lost_coverage = ?, coverage_delta_pct = ?, detail_filename = ?,
+             computed_at = ?
+           WHERE diff_id = ?""",
+        (
+            int(grid_aligned),
+            panos_added,
+            panos_removed,
+            panos_persisted,
+            capture_date_changed,
+            points_gained_coverage,
+            points_lost_coverage,
+            coverage_delta_pct,
+            detail_filename,
+            utc_now_iso(),
+            diff_id,
+        ),
+    )
+    if cur.rowcount != 1:
+        conn.rollback()
+        raise LookupError(f"run_diffs has no row with diff_id {diff_id}")
+    conn.commit()
+
+
 def get_diff_for_run(conn: sqlite3.Connection, to_run_id: int) -> sqlite3.Row | None:
-    """The diff whose 'to' side is the given run, or None."""
-    return conn.execute("SELECT * FROM run_diffs WHERE to_run_id = ?", (to_run_id,)).fetchone()
+    """The diff whose 'to' side is the given run, or None.
+
+    When a run has been diffed against two predecessors (an earlier run was
+    purged and the diff recomputed), the newest ``diff_id`` wins — the same
+    explicit choice ``get_latest_runs_all`` makes, so the per-run JSON's
+    replayed change block, the aggregate's ``change`` block and the driving
+    page cannot advertise different baselines for one run. An unordered
+    ``fetchone`` here returned whichever row SQLite scanned first.
+    """
+    return conn.execute(
+        "SELECT * FROM run_diffs WHERE to_run_id = ? ORDER BY diff_id DESC LIMIT 1",
+        (to_run_id,),
+    ).fetchone()
 
 
 def get_latest_runs_all(conn: sqlite3.Connection) -> list[sqlite3.Row]:
@@ -1819,17 +1890,30 @@ def get_walk_diff_for_walk(conn: sqlite3.Connection, to_walk_id: int) -> sqlite3
     ).fetchone()
 
 
-def delete_walk_diff_for_walk(conn: sqlite3.Connection, to_walk_id: int) -> None:
-    """Drop any recorded diff whose 'to' side is the given walk.
+def delete_walk_diff_for_walk(conn: sqlite3.Connection, to_walk_id: int) -> list[str]:
+    """Drop any recorded diff whose 'to' side is the given walk, returning the
+    detail filenames the deleted rows pointed at (NULL ``detail_filename``
+    omitted).
 
     A same-day re-collection replaces the walk's street_walks row in place
     (the register upsert keeps walk_id), so a diff recorded against the
     replaced artifact is stale the moment the walk is re-registered. The
     orchestrator clears it before deciding whether a fresh diff is possible;
-    a no-op when no diff exists (every nightly walk).
+    a no-op returning ``[]`` when no diff exists (every nightly walk).
+
+    The names are returned because this function touches no files, and the
+    row is the only durable record of which published file it vouched for
+    (issue #265): the caller deletes exactly those files. Removing by the
+    row's own pointer is what stays correct if the walk's predecessor has
+    changed since the diff was recorded — a name re-derived from TODAY's
+    predecessor would miss the file the old row named.
     """
+    rows = conn.execute(
+        "SELECT detail_filename FROM street_walk_diffs WHERE to_walk_id = ?", (to_walk_id,)
+    ).fetchall()
     conn.execute("DELETE FROM street_walk_diffs WHERE to_walk_id = ?", (to_walk_id,))
     conn.commit()
+    return [row["detail_filename"] for row in rows if row["detail_filename"]]
 
 
 # ── API budget ledger ──────────────────────────────────────────────────────
