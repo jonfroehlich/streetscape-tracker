@@ -3147,7 +3147,9 @@ def test_every_non_empty_kind_gets_a_slot_once_max_opt_in_reaches_the_kind_count
     With G non-empty stranded kinds and max_opt_in >= G, every kind reaches the
     head, whichever kinds the resumers sit in and however many there are --
     including more resumers in one kind than the reservation has slots, which
-    is what the n_groups - 1 floor exists for.
+    is what the (sub-queues - 1) floor exists for. Kind 1 here is one channel,
+    so sub-queues and kinds coincide; the multi-channel case is
+    test_kartaview_resumers_leave_every_stranded_channel_a_take.
     """
     by_kind = _stranded_kind_slate(
         conn, monkeypatch, sizes=dict.fromkeys(kinds, 3), resumers_per_kind=resumers
@@ -3384,6 +3386,80 @@ def test_the_channel_rotation_reaches_every_stranded_channel_across_nights(conn,
         assert dict(got) == expected, f"night {today}"
         reached |= {ch for ch in _OPT_IN_CHANNELS if got[ch]}
     assert reached == set(_OPT_IN_CHANNELS), "every stranded channel within four nights"
+
+
+@pytest.mark.parametrize("n_resumers", range(11))
+def test_kartaview_resumers_leave_every_stranded_channel_a_take(conn, monkeypatch, n_resumers):
+    """The resumer floor counts each opt-in CHANNEL as its own sub-queue (#397).
+
+    Resumers reach the opt-in-only kind without passing through its channel
+    rotation. Counted per KIND, the floor on #348's prod-shaped slate (six
+    sub-queues: kinds 0 and 2, four opt-in channels) let 8 live KartaView
+    checkpoints take 8 of 10 slots, kinds 0 and 2 one each, and
+    kartaview_streets, panoramax and panoramax_streets 0 on every night those
+    checkpoints stayed live -- up to seven days. Counted per sub-queue the take
+    is at most 10 - (6 - 1) = 5, which pins the cost as well as the cure.
+
+    Swept over every resumer count the KartaView queue can hold, across one
+    full rotation period (four nights for four channels): each night takes
+    exactly min(r, 5) resumers and gives the opt-in-only kind at least one slot
+    BEYOND them, and every kind and every stranded channel is reached. At
+    r >= 8 the old per-kind floor fails the per-night half on night one.
+    """
+    from collections import Counter
+
+    from streetscape_metadata_tracker import scheduler as sched
+
+    labels = _prod_shaped_stranded_slate(conn)
+    live = [cid for cid, label in labels.items() if label == "kartaview"][:n_resumers]
+    monkeypatch.setattr(
+        sched,
+        "_sweep_checkpoint_progress",
+        lambda cfg, city, channel: {"age_s": 1.0} if city.city_id in live else None,
+    )
+    cfg = _sweep_cfg(publish_enabled=False, opt_in_cities_per_day=10)
+    reached = set()
+    for day in range(4):
+        today = date(2026, 7, 2) + timedelta(days=day)
+        slate = sched._collect_due(
+            conn, cfg, today, list(_PROD_SLATE), max_opt_in=10, max_cities=60
+        )
+        head = [c.city_id for c in slate.cities[:10]]
+        # The floor's take: the first min(r, 5) resumers in union order. A
+        # resumer it cut stays in the kartaview sub-queue, and the rotation may
+        # still reach it as that channel's ordinary turn.
+        floor_take = live[: min(n_resumers, 5)]
+        assert set(floor_take) <= set(head), f"night {today}"
+        beyond = Counter(labels[c] for c in head if c not in floor_take)
+        assert beyond["kind0"] and beyond["kind2"], f"night {today}: {dict(beyond)}"
+        assert sum(beyond[ch] for ch in _OPT_IN_CHANNELS) >= 1, (
+            f"night {today}: the opt-in-only kind got no slot beyond its resumers"
+        )
+        reached |= {labels[c] for c in head}
+    assert reached == {"kind0", "kind2", *_OPT_IN_CHANNELS}
+
+
+def test_a_reservation_of_zero_hoists_no_resumer(conn, monkeypatch):
+    """`max_opt_in = 0` switches promotion OFF, live checkpoints included.
+
+    `_opt_in_reservation` documents 0 as off, and `run-due --limit 3` derives
+    it (3 // 4). The floor was a bare max(1, ...), so it still hoisted one
+    resumer ahead of the gsv-due cities on a night that reserved nothing.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    by_kind = _stranded_kind_slate(
+        conn, monkeypatch, sizes={0: 2, 1: 2}, resumers_per_kind={0: 1, 1: 1}
+    )
+
+    cfg = _sweep_cfg(publish_enabled=False, opt_in_cities_per_day=0)
+    slate = sched._collect_due(
+        conn, cfg, date(2026, 7, 2), list(_KIND_CHANNELS), max_opt_in=0, max_cities=100
+    )
+    stranded = {cid for ids in by_kind.values() for cid in ids}
+    # Union order puts the two gsv-due cities first; nothing may move ahead.
+    assert not any(c.city_id in stranded for c in slate.cities[:2])
+    assert slate.hoisted == 0
 
 
 def test_the_channel_rotation_does_not_skip_past_an_emptied_sub_queue(conn, monkeypatch):
