@@ -602,6 +602,61 @@ Counting the network downloads in the per-attempt street logs refutes that: **27
 Both Overpass refusals in that window (09-13 07:20 and 09-15 02:50) arrived after **1** and **5** downloads — the 09-13 one on that night's first fetch — so our nightly volume is not what tripped them.
 The cap is not bounded by Overpass volume at these rates; it was simply not changed here and remains a separate decision.
 
+## Filling an under-full night (issue #404, added 2026-10-01)
+
+**`cycle_days` is a guarantee, not a target, and until #404 nothing spent the capacity a short due slate left idle.**
+Measured on prod 2026-10-01 (1,223 enabled cities), every channel had 0 never-collected and 0 overdue cities: 09-30 took 80 of 95 due and 10-01 the last 15, in 4.16 h of a 12 h window.
+At a 90-day cycle the steady state is ~15 cities a night, and October is a trough (~7 a night), so the cap and the deadline had stopped being what ended a night.
+Cutting `cycle_days` was rejected in the issue: at 45 days 578 cities fall due at once (33,584 Mapillary tiles), which the Mapillary budget drains over 10–15 nights while GSV races ahead un-paired.
+
+**A night's work is now four tiers, in this order, and only the first three are reservations of the cap:**
+
+1. at most `opt_in_cities_per_day` stranded cities (the bounded hoist, #248/#282/#301);
+2. at most `refresh_slots` due refreshes in what the hoist left (#308);
+3. the rest of the due slate, stalest-first;
+4. the **fill**: early refreshes of cities that are not due at all.
+
+The fill composes with the two reservations by construction rather than by argument: they reorder the due slate inside `_collect_due`, and the fill never touches that slate — it runs in `_run_fill` after `_run_city_loop` returns, so the due phase's launch order is identical with the fill on or off (`test_the_fill_composes_with_the_hoist_and_the_refresh_reserve` pins it, with the opening line's `hoisted=`/`promoted` counts).
+It runs only when the due loop **ended on its own** — no cap, deadline, SIGTERM or error stop — which is what "fill never outranks a due city" means mechanically.
+
+**Eligibility** (`db.get_fill_candidates`): an enabled city whose every default-membership channel it is a member of has succeeded before, at least `[schedule].fill_min_days` ago, under `cycle_days - grace_days` ago (so it is not due), and with fewer than `max_consecutive_failures` failures.
+One channel under the floor, or quarantined, disqualifies the city: the fill never collects a subset.
+Candidates are ordered by the city's **oldest** channel success, then `city_id` — stalest-first, read on the channel that has waited longest.
+Opt-in channels neither qualify nor disqualify a city and are never run (#248, #374); KartaView and Panoramax volume stays explicit (#405).
+
+**Admission is whole-city** (`_fill_verdict`, shared by the live path and the dry run): every channel's `_channel_estimate` must fit that channel's daily remainder; per metered host, the **sum** of its channels' prices must fit both the `[hosts.*]` rolling-24h room and the fill's own `fill_host_ceilings` room; and the summed `city_timeout_estimate_seconds` must fit the deadline.
+The sum matters on the host because the two Mapillary channels share one IP and one pool, and on the clock because a sum is exact at one lane and conservative at two.
+A walk whose census its grid sibling is about to buy is still priced at the full census unless the cache already holds it — an over-price, which can only decline a city that would have fit.
+Two refusals come before the budget rule, both because the launch path would otherwise collect a subset: a channel whose host refused this machine tonight (read off `HostBreaker.latched`, so no re-check is spent on a city that may not be admitted), and a walk whose street network is not frozen — that walk would query Overpass, a per-IP host with no measured capacity to fill, so **the fill adds no Overpass traffic at all**.
+A declined city is skipped and the next one asked, as the due loop does for a budget skip; the ledgers are re-read per admission, so earlier fill cities' spend counts.
+The motivating case is in the issue: today a due city whose Mapillary run does not fit still gets its GSV run, which un-pairs its snapshots and strands it behind the hoist (#301, #341); a fill city never does.
+
+**The fill ceiling is lower than the budget on purpose.**
+Prod sets `fill_host_ceilings = { mapillary_tiles = 2260 }` under the 3,000 `[hosts.mapillary_tiles]` budget: 2,260 is the highest combined night the #292 window measured clean (`docs/provider-access.md`), which #404 says to start at.
+The due slate keeps the whole 3,000, and the fill takes only what is left under 2,260 — so the fill fills unused capacity and never raises any ceiling; raising the ceiling toward the budget is a separate, staged decision.
+GSV metadata has no per-IP host and no charge, so on gsv only the daily budget and the deadline bound it.
+
+**A backlog holds the whole fill** (`_fill_backlog`): any (city, channel) pair the due slate held on a default channel whose `last_attempt_at` predates the batch start was deferred — for budget, a host budget, the deadline, the breaker — or paused, and while one exists the fill does not run, so it stops by itself the night a backlog forms.
+A failure records an attempt and is not a backlog, and an opt-in channel's deferral (Panoramax is budget-bound on its own) does not hold it.
+
+**It counts toward `max_cities_per_day`**, which stays a ceiling on the whole night; at prod's 80 the cap, a channel budget, the fill ceiling or the deadline ends a filled night, whichever comes first.
+**It never runs on an operator-narrowed run** — `--provider` would fill a subset of each city's channels, `--city` names exactly what the operator wants, and `--limit` is a catch-up's cap — so those runs are exactly what they were.
+`fill_min_days` unset (the repo default) means no fill and no change to any log line; a bad value, or a bad ceiling, warns and turns the fill **off** (fail-closed is off here, since the fill only adds traffic — unlike `[hosts.*]`, where dropping a bad entry would fail open and the channel-running commands refuse instead).
+
+**What a night says about it.**
+The opening line carries `fill_min_days=N` when set.
+The `Done:` line counts the cities apart — `across 23 cities (15 due, 8 fill)` — and adds `fill (early refresh, >= 30 d): 8 cities, 24/24 runs, 24 early refresh(es) recorded; declined 3 for mapillary_tiles; ended by budget (mapillary_tiles)`.
+`ended by` is one of `city cap (N)`, `deadline (N h)`, `budget (<channel or host>)` (the candidates ran out with the last ones declined for it), `candidates exhausted`, `unfrozen street network`, `host refused tonight`, `held: backlog (...)`, or `received SIGTERM`; a night that never reached it says `fill not reached`, and a narrowed run says `fill off for --limit`.
+An error inside the fill is logged, ends the fill, and makes the night unhealthy, but the tail still publishes (#167).
+`run-due --dry-run` previews it through the same `_fill_verdict` against its simulated ledgers, listing what the budgets admit up to the cap; the deadline is the one term a preview cannot price, so it says the deadline decides how many run.
+
+**The series records it.**
+Each fill channel that succeeds is written to `early_refreshes` (catalog v18, `docs/architecture.md`) with its prior success, so a shortened interval is a fact in the catalog rather than something inferred from run dates, and the aggregate marks that run `"early_refresh": true`.
+Success is read off `schedule_state.last_success_at` having moved since admission, so a skipped or failed channel is never marked.
+
+Not done here: an operator-facing `status` view of fill eligibility, publishing the mark for walks, and any change to Panoramax pacing (#405).
+The provider forums were not re-read for this change: it raises no rate, no budget and no ceiling, and its one new per-IP number (2,260) is a figure this project already measured clean.
+
 ## The subcommand roster, and the production config (added 2026-08-25)
 
 Written 2026-08-25, when the CLAUDE.md rewrite turned its command cheatsheet into a table and two subcommands turned out to be documented nowhere.

@@ -27,7 +27,7 @@ Legacy pre-2026 undated files are registered as `is_baseline=1` runs by `scripts
 
 ## The catalog
 
-The SQLite catalog `data/streetscape_tracker.db` (`streetscape_metadata_tracker/db.py`, stdlib sqlite3/WAL, no ORM; schema v17, auto-migrated on connect) is the operational source of truth.
+The SQLite catalog `data/streetscape_tracker.db` (`streetscape_metadata_tracker/db.py`, stdlib sqlite3/WAL, no ORM; schema v18, auto-migrated on connect) is the operational source of truth.
 It is **local-only and never rsynced** — it lives in exactly one place, which is why the dated backups in [`catalog-backups.md`](catalog-backups.md) exist.
 
 | Table | Key / uniqueness | Holds |
@@ -70,6 +70,10 @@ v17 added `runs.status_out_of_radius` and `runs.query_radius_m` (#367, see "GSV 
 `query_radius_m` records the tolerance a row's stats were computed under (50.0 for gsv), and stays NULL for census providers, which the rule does not apply to.
 The migration is named by content (`_migrate_add_query_radius_columns`) rather than by number and is idempotent per column.
 It runs on the v16 → v17 rung, so a v15 catalog takes #385's v16 backfill first and then this step, and it is also called unconditionally at the end of `init_schema`: both changes stamped v16 while in flight, so a catalog touched by either branch alone can read v16 or later without the columns and still gains them.
+
+v18 added the `early_refreshes` table (#404): one row per (city, channel, run date) that `run-due`'s fill phase collected before the channel's cycle wall, with the channel's prior success and the `fill_min_days` it was admitted under.
+It is purely additive (no migration function), so pre-#404 code reads a v18 catalog once `user_version` is set back to 17, ignoring the table.
+The aggregate surfaces it as `"early_refresh": true` on a grid run's `runs[]` entry, **present only when true**, so every other record is byte-identical and `cities.json.gz` stays schema v4; walk channels are recorded in the table but not yet published.
 
 ## Provider model
 

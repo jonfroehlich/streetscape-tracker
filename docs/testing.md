@@ -402,6 +402,46 @@ Incidental coverage of a deprecated spelling trains readers to ignore the notice
     `test_a_walk_whose_tail_dies_still_records_what_the_census_cost` and `test_panos_along_the_edge_cover_it_and_meter_only_the_streets_channel` (`tests/test_streetwalk_mapillary.py`, read under `collect.STREET_BUDGET_CHANNELS["mapillary"]`, so renaming that entry kills them too);
     and `test_a_screen_writes_the_rows_the_ledger_and_the_artifact` (`tests/test_panoramax_screen.py`).
 
+## Filling under-full nights (issue #404)
+
+`tests/test_fill_underfull_nights.py` drives `cmd_run_due` with a fake `_run_one_city` that writes what the child would have spent to `api_usage` (and so `host_usage`), under a frozen UTC clock so tonight's stamps sort at the batch start.
+Seeded successes sit at midnight, so a channel's age is a whole number of days, read the way `get_due_cities` reads it.
+A test that builds a second catalog keeps the unpatched `db.connect`, since `_run_night` replaces it for the night.
+Every "killed by" below was run against the committed code (one mutation at a time, file restored after):
+
+- `test_a_backlog_holds_the_whole_fill` — a due city's mapillary deferred for budget holds the fill, and no fill gsv runs either; killed by ignoring the backlog.
+- `test_a_backlog_on_an_opt_in_channel_does_not_hold_the_fill` — a KartaView deferral does not stop a gsv/mapillary fill; killed by filling every provider instead of the default-membership ones.
+- `test_a_city_is_declined_whole_when_one_channel_does_not_fit` — the pure rule, in both channel orders, and `<=` at an exact fit; killed by dropping the per-channel check.
+- `test_a_due_city_always_runs_before_any_fill_city` — a fill city staler on one channel still runs after the due city.
+- `test_a_failed_due_channel_is_not_a_backlog` — a failure records an attempt, so the fill runs.
+- `test_a_failed_fill_channel_is_not_marked_an_early_refresh` — only a channel whose `last_success_at` moved is written to `early_refreshes`, with its prior success; killed by marking every channel.
+- `test_a_fill_city_is_never_collected_on_a_subset_of_its_channels` — THE acceptance test: a big city whose mapillary does not fit runs on neither channel while a smaller one behind it runs on both; killed by dropping the per-channel check.
+- `test_a_full_night_is_unchanged_and_the_fill_is_not_reached` — due cities fill the cap: the launch order is identical with the fill on and off; killed by running the fill behind a stopped due loop.
+- `test_a_host_refused_tonight_declines_the_fill_city` — a latched host declines the city at admission, before any budget read.
+- `test_a_v17_catalog_gains_the_early_refreshes_table` — the additive v18 rung, and `record_early_refresh` idempotent on its key.
+- `test_a_walk_on_an_unfrozen_network_declines_its_city` — no Overpass traffic from the fill; once the GraphML is frozen the city runs; killed by admitting an unfrozen walk.
+- `test_an_error_in_the_fill_still_publishes_and_reports_unhealthy`.
+- `test_an_operator_narrowed_run_never_fills` — `--limit`, `--provider` and `--city`, each named on the `Done:` line; killed by letting `--limit` fill.
+- `test_an_under_full_night_refreshes_eligible_cities_stalest_first` — order, the `early_refreshes` rows, and the `Done:` line's due/fill split; killed by not counting fill cities into `processed`.
+- `test_budget_drawn_down_by_earlier_fill_cities_declines_a_later_one` — the ledger is re-read per admission, and the `Done:` line says `ended by budget (mapillary)`; killed by dropping the per-channel check.
+- `test_fill_candidates_need_every_member_channel_past_the_floor_and_not_due` — floor, not-due wall, never-collected, quarantine, exclusion, disabled, and the oldest-channel order; killed by ignoring the floor, ordering freshest-first, ignoring quarantine, and ignoring membership.
+- `test_fill_host_room_is_the_smaller_of_budget_and_ceiling`; killed by ignoring the ceiling.
+- `test_makelab1_fills_at_30_days_under_the_measured_mapillary_ceiling` — prod's 30 and 2,260, the ceiling below the 3,000 host budget, and the repo default off.
+- `test_the_deadline_check_sums_the_channels_needs`; killed by dropping the deadline check, as is `test_the_fill_ends_at_the_deadline_and_says_so`.
+- `test_the_dry_run_previews_the_fill_through_the_same_rule` — the preview admits what the simulated budgets admit, stalest-first, writes nothing; killed by handing the preview unlimited budgets.
+- `test_the_dry_run_says_when_the_fill_is_not_reached_or_held`.
+- `test_the_fill_ceiling_binds_below_the_host_budget` — the live path stops at 2,260 with 3,000 still available, and runs without the ceiling; killed by ignoring the ceiling.
+- `test_the_fill_composes_with_the_hoist_and_the_refresh_reserve` — on two fresh catalogs, the due phase's launch order (hoisted city, then the two promoted refreshes) and the opening line's `hoisted=1`/`(2 promoted)` are identical with the fill on and off, and the fill cities follow.
+- `test_the_fill_never_runs_an_opt_in_channel` — an enrolled city with an old KartaView clock is refreshed on gsv and mapillary only; killed by filling every provider.
+- `test_the_fill_stops_at_the_city_cap` — the due city plus the two stalest fill cities fill a cap of 3; killed by ignoring the cap in the fill.
+- `test_the_floor_is_inclusive_and_only_the_floor_moves_eligibility`.
+- `test_the_host_check_sums_both_mapillary_channels` — each fits the host room alone, together they do not; killed by checking per channel.
+- `test_the_loader_reads_the_fill_keys` and `test_a_bad_fill_key_turns_the_fill_off_rather_than_unbounded` — eight bad spellings, including a ceiling on unmetered `overpass` and a TOML `true`, each turn the fill off with a warning.
+- `test_the_repo_default_has_no_fill_and_logs_nothing_about_it`.
+
+`tests/test_json_v2.py::test_aggregate_marks_only_the_early_refreshed_run` pins the aggregate mark on (city, provider, run date), with decoys on another provider and another date; killed by marking by city alone.
+The existing v4 aggregate test asserts no unmarked run carries the key.
+
 ## Concurrent channel lanes (issue #240)
 
 **Added after the split.**
