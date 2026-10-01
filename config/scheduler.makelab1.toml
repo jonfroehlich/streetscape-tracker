@@ -373,12 +373,13 @@ enabled = true
 # AT the ceiling, not exactly on it. A capped crawl lets the tiles already in
 # flight finish their retries instead of cancelling them mid-attempt, so a
 # capped night can end up to connection_limit x (TILE_MAX_TRIES - 1) over --
-# 20, not 200: this is the GRID budget, and cli.py forwards --connection-limit
-# only on its gsv arm, so a Mapillary grid census runs at the downloader's own
-# default of 5. (200 is the Mapillary ROAD WALK's residue -- that one does take
-# the per-child share, 50, being [download].connection_limit below divided
-# across lanes and clamped at scheduler.MAX_PER_CHILD_CONNECTION_LIMIT.) Not the argparse default
-# of 5 would give. Budget this line as a soft ceiling with a 200-request tail.
+# 20: cli.py forwards --connection-limit only on its gsv arm, so a Mapillary
+# grid census runs at the downloader's own default of 5, and since #361 the
+# Mapillary ROAD WALK is clamped to the same 5 (it is handed
+# min(the per-child share, download_common.WALK_CONNECTION_LIMITS["mapillary"])),
+# so its residue is 20 too, not the 200 its old ceiling of 50 allowed.
+# [download].connection_limit below is GSV's socket budget and does not move
+# this. Budget this line as a soft ceiling with a 20-request tail.
 #
 # THE NUMBER TO QUOTE IS THE PER-IP SUM WITH mapillary_streets, not this line.
 # That channel stays at 1,750 and, since #290, spends 0 on a paired night by

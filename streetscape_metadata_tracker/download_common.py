@@ -123,7 +123,7 @@ CHANNEL_METERED_HOST: dict[str, str] = {
 
 # Per-provider socket ceilings for a ROAD WALK (issues #99, #331). One
 # `--connection-limit` flag serves four arms whose hosts are not alike, so 50 --
-# a GSV number -- is a default only two of them should inherit.
+# a GSV number -- is a default only gsv should inherit.
 #
 # These live HERE, beside the hosts they are about, rather than beside the
 # collector that reads them, for the same reason the Overpass identity strings
@@ -132,16 +132,45 @@ CHANNEL_METERED_HOST: dict[str, str] = {
 # drag osmnx/geopandas into the long-lived parent process under a cgroup memory
 # cap (measured 2026-09-21: 1.04 s to import, both modules resident after).
 #
-# gsv and mapillary keep the 50 they have always walked at. Panoramax is 5
-# because that is what ITS GRID RUN uses -- `cli.py` passes no connection_limit
-# for this provider, so `download_panoramax`'s own default applies -- and a walk
-# quietly holding ten times the sockets against a volunteer-run instance with no
-# documented rate limit, no `Retry-After` and no credential to identify us by is
-# the one asymmetry here worth removing. The rate limiter bounds the RATE either
-# way; what this bounds is sockets held open while the instance is slow, which
-# is the failure mode an unmetered host shows first.
+# gsv keeps the 50 it has always walked at: Google's metadata endpoint is not a
+# per-IP host here, and its own grid arm is the one `cli.py` forwards
+# `--connection-limit` to.
+#
+# Panoramax is 5 because that is what ITS GRID RUN uses -- `cli.py` passes no
+# connection_limit for this provider, so `download_panoramax`'s own default
+# applies -- and a walk quietly holding ten times the sockets against a
+# volunteer-run instance with no documented rate limit, no `Retry-After` and no
+# credential to identify us by is an asymmetry worth removing. The rate limiter
+# bounds the RATE either way; what this bounds is sockets held open while the
+# instance is slow, which is the failure mode an unmetered host shows first.
+#
+# Mapillary is 5 for the same reason (#361), and it is ONE number for both of
+# its channels, defined once below as MAPILLARY_TILE_CONNECTION_LIMIT: the grid
+# arm in `cli.py` forwards no `--connection-limit` either, so the grid census
+# runs at the Mapillary downloader's default -- which IS that constant -- and
+# the walk's ceiling is the same constant, so the two cannot drift apart again.
+# Until #361 the walk held 50 here, on a rationale ("prod configures 50 for the
+# grid over the same CDN") that `cli.py` never made true: the grid was at 5 the
+# whole time, and the walk held ten times its sockets on a per-IP host that has
+# blocked this IP four times (block 4: 2026-09-28, #385).
+#
+# Why 5 is enough: the pacer is FIFO at 40/min, so requests in flight ~= 0.67/s
+# x mean tile latency, and the grid census has run every night at 5 against the
+# same pacer. With latency that varies, 5 slots lose nothing while mean latency
+# is low and degrade gradually as it grows; the deadline is at risk only well
+# above that, which is the exposure the grid has always carried (reasoned, and
+# simulated at review time -- not measured). Slots past 5 are only ever occupied
+# when the host is SLOW (a slot is also held through a retry's backoff sleep),
+# which is exactly when backpressure is wanted rather than more sockets. It
+# also bounds the two residues downstream of this number: retries past a
+# request cap, connection_limit x (TILE_MAX_TRIES - 1) = 20 rather than 200,
+# and requests refused after a block is seen (#205), <= connection_limit = 5
+# rather than 50. Concurrency has never been a variable in the block series,
+# so this is a conservative choice under an unknown, not a measured limit
+# (docs/provider-access.md, "Socket concurrency (#361)").
+MAPILLARY_TILE_CONNECTION_LIMIT = 5
 GSV_WALK_CONNECTION_LIMIT = 50
-MAPILLARY_WALK_CONNECTION_LIMIT = 50
+MAPILLARY_WALK_CONNECTION_LIMIT = MAPILLARY_TILE_CONNECTION_LIMIT
 PANORAMAX_WALK_CONNECTION_LIMIT = 5
 WALK_CONNECTION_LIMITS = {
     "gsv": GSV_WALK_CONNECTION_LIMIT,

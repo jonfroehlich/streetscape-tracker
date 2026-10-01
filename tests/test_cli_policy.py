@@ -281,6 +281,52 @@ def test_mapillary_tile_pace_defaults_to_the_conservative_tile_rate(monkeypatch,
     assert calls[0]["max_requests_per_minute"] == DEFAULT_TILE_REQUESTS_PER_MINUTE
 
 
+def test_the_mapillary_grid_and_walk_hold_one_socket_count_on_the_tile_cdn(monkeypatch, catalog):
+    """The grid's effective connection limit IS the walk's ceiling (#361).
+
+    Both channels talk to `tiles.mapillary.com`, which meters by IP. The grid
+    arm forwards no `--connection-limit`, so its sockets are whatever the
+    downloader defaults to; the walk's are `WALK_CONNECTION_LIMITS["mapillary"]`.
+    Until #361 those were 5 and 50, under a comment claiming they were equal.
+
+    Two halves, because either alone is vacuous: the parity of the two numbers
+    says nothing if the grid arm starts forwarding the flag (the default would
+    then be dead and the grid would hold 50), and the absence of the flag says
+    nothing about what the default is. A non-default `--connection-limit 17`
+    is passed so that a forwarded value would be visible rather than masked.
+    """
+    import inspect
+
+    from streetscape_metadata_tracker import download_mapillary as dm
+    from streetscape_metadata_tracker.download_common import (
+        MAPILLARY_TILE_CONNECTION_LIMIT,
+        WALK_CONNECTION_LIMITS,
+    )
+
+    def default_of(fn):
+        return inspect.signature(fn).parameters["connection_limit"].default
+
+    from streetscape_street_analyzer import collect_mapillary
+
+    grid_default = default_of(dm.download_mapillary_metadata_async)
+    assert grid_default == default_of(dm.fetch_city_images_async)
+    # The two defaults no production caller reaches today -- every caller
+    # passes the value -- pinned anyway, because the next caller that omits it
+    # inherits whatever they say, on the same per-IP host.
+    assert grid_default == default_of(dm._fetch_city_images)
+    assert grid_default == default_of(collect_mapillary.collect_mapillary_street_samples_async)
+    assert grid_default == WALK_CONNECTION_LIMITS["mapillary"]
+    assert WALK_CONNECTION_LIMITS["mapillary"] == MAPILLARY_TILE_CONNECTION_LIMIT == 5
+
+    conn, city_id, data_dir = catalog
+    calls = []
+    gsv_configs(monkeypatch)
+    monkeypatch.setattr(cli, "download_mapillary_metadata_async", _mapillary_stub(calls))
+    rc = run_cli(monkeypatch, city_id, data_dir, "--connection-limit", "17", provider="mapillary")
+    assert rc == 0
+    assert "connection_limit" not in calls[0], "the grid arm must take the downloader's default"
+
+
 def test_mapillary_jitter_threads_to_the_downloader(monkeypatch, catalog):
     """The jitter is the axis under test after three per-IP blocks (issue #292):
     the flag must reach the downloader."""

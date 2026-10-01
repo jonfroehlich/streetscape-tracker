@@ -13692,15 +13692,20 @@ def test_a_scheduled_walk_is_never_handed_more_sockets_than_its_provider_holds(c
     # the two limits, it does not replace one with the other.
     assert child_would_hold("panoramax_streets", 3) == 3
 
-    # The two channels whose own ceiling IS 50 keep the share they are given,
-    # divided (2 lanes) or throttled by the resource guard as it may be.
+    # The Mapillary walk is the same clamp at the same number (#361): its grid
+    # channel holds 5 sockets on the same per-IP tile CDN, and until #361 the
+    # walk held production's full share of 50 there -- ten times the grid.
+    assert child_would_hold("mapillary_streets", 50) == 5
+    assert child_would_hold("mapillary_streets", 3) == 3
+    assert child_would_hold("mapillary_streets", 90) == 5
+
+    # The one channel whose own ceiling IS 50 keeps the share it is given,
+    # divided (2 lanes) or throttled by the resource guard as it may be...
     assert child_would_hold("gsv_streets", 50) == 50
     assert child_would_hold("gsv_streets", 25) == 25
-    assert child_would_hold("mapillary_streets", 8) == 8
-    # ...and are clamped too once a configured share exceeds their own number,
-    # so this is a min in both directions rather than a panoramax special case.
+    # ...and is clamped too once a configured share exceeds its own number,
+    # so this is a min in both directions rather than a per-provider special case.
     assert child_would_hold("gsv_streets", 90) == 50
-    assert child_would_hold("mapillary_streets", 90) == 50
 
     # kartaview is untouched: its sweep is serial, so the flag it is handed is
     # the share, unchanged, and nothing downstream reads it.

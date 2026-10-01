@@ -201,12 +201,14 @@ The census now resumes for its **missing tiles only**, through the same `checkpo
 
 Three things this deliberately does **not** change.
 Resume is strictly **next-invocation**: no in-process retry is added anywhere, because the forum-reported hazard that retrying during a block extends it stands untested in either direction and is not worth testing with production credentials.
-Pacing is untouched at 60/min, and so are both daily budgets — a resumed night is *cheaper*, never faster.
+Pacing is untouched — both Mapillary channels run at the 40/min `config/scheduler.makelab1.toml` sets (the module default, `DEFAULT_TILE_REQUESTS_PER_MINUTE`, is 60) — and so are both daily budgets: a resumed night is *cheaper*, never faster.
 That still holds after #318, and it is the sentence to read before worrying about the traffic shape a request cap produces: across nights, a city split over two is paid for once instead of re-paid.
 What a cap does **not** give is an exact ceiling on the day.
-It is a soft one: a capped crawl may end the night up to `connection_limit × (TILE_MAX_TRIES − 1)` requests over its budget — **20 on a grid census and 200 on a Mapillary road walk**, because the two run at different socket counts: `cli.py` forwards `--connection-limit` only on its `gsv` arm, so a Mapillary or Panoramax *grid* takes the downloader's own default of 5, while a *walk* takes the scheduler's per-child share of 50 (`[download].connection_limit`, 100 since 2026-09-21, divided across lanes and clamped at `MAX_PER_CHILD_CONNECTION_LIMIT`) — because tiles already in flight when the cap trips are allowed to finish their retries rather than being cancelled mid-attempt.
+It is a soft one: a capped crawl may end the night up to `connection_limit × (TILE_MAX_TRIES − 1)` requests over its budget, because tiles already in flight when the cap trips are allowed to finish their retries rather than being cancelled mid-attempt.
+That is **20 on both Mapillary channels**: `cli.py` forwards `--connection-limit` only on its `gsv` arm, so the *grid* takes the downloader's own default of 5, and since #361 the *walk* is clamped to the same 5 (see the socket-concurrency section below).
+Until #361 the walk took the scheduler's whole per-child share of 50, and its residue was 200.
 The larger overshoot this originally shipped with, `connection_limit − 1` on every capped night whether or not anything retried, was a defect and is fixed (see [`docs/census.md`](census.md)); the retry residue is deliberate.
-Quote it as a soft ceiling with a 200-request tail, never as "the budget is never exceeded" — on the one host that has blocked this IP three times, the difference between those two statements is the whole reason to state it.
+Quote it as a soft ceiling with a 20-request tail, never as "the budget is never exceeded" — on the one host that has blocked this IP more than any other, the difference between those two statements is the whole reason to state it.
 What it does change is that a night which used to stop *short* of its budget — skipping the city that did not fit the remainder — now spends the remainder exactly.
 Near-ceiling nights become exactly-ceiling nights, which is worth stating rather than discovering, because volume is the axis #292's jitter test was holding still.
 And the pre-flight estimate still prices the whole tile count even when a resume will fetch a fraction of it, which errs high; that is the safe direction for a budget gate and is left alone.
@@ -214,6 +216,37 @@ And the pre-flight estimate still prices the whole tile count even when a resume
 
 What it buys, concretely: tiles fetched before a block survive it, a crash between the CSV write and cataloging re-finalizes for ~0 requests, and a night the scheduler winds down mid-city resumes rather than restarting
 — and it is what clears the resume gate on raising `max_concurrent_channels` above 1, since a deadline or SIGTERM under lanes kills up to N children at once instead of one.
+
+## Socket concurrency (#361, 2026-09-30)
+
+**Both Mapillary channels now hold at most 5 concurrent sockets on `tiles.mapillary.com`; until #361 the road walk held 50.**
+The grid census was always at 5 — `cli.py` forwards `--connection-limit` only on its `gsv` arm, so the Mapillary grid takes the downloader's own default — while the walk took the scheduler's whole per-child share.
+The comment that justified the walk's 50 said production configures 50 for the grid over the same CDN; `cli.py` never did, so the pair disagreed by 10×, in the direction nobody had written down.
+The number now lives once, as `download_common.MAPILLARY_TILE_CONNECTION_LIMIT`: it is both the downloader's default and the walk's entry in `WALK_CONNECTION_LIMITS`, so the two channels cannot drift apart again.
+
+What is known, in the tiers this file keeps apart:
+
+- **Documented.** The [API documentation](https://www.mapillary.com/developer/api-documentation) limits tiles to 50,000 per day per app, "(not per minute)".
+  It says nothing about concurrent connections.
+- **Reported.** A staff reply in [thread 10644](https://forum.mapillary.com/t/50-000-requests-day-rate-limit-scope/10644) (2026-08-24) says an IP-level layer "might block you earlier" on "a sudden spike".
+  In [thread 5821](https://forum.mapillary.com/t/inconsistent-authentication-issues/5821) a **user**, not staff, reports the blocks as per-IP and that "retrying seemed to extend the block".
+  In [thread 8336](https://forum.mapillary.com/t/receiving-html-response-instead-of-json/8336) the HTML page on a 200 is described, and **staff says** "Rate limits reset every 24 hours" — a statement of policy, not an observed duration.
+  **No thread found discusses concurrent connections to the tile CDN**, so concurrency is UNKNOWN, not known-safe.
+- **Ours, correlation only.** Block 4 (2026-09-28 02:27 PDT, recorded with #385) hit the grid channel ~8.5 h after a 1,444-request `mapillary_streets` catch-up (17:05–17:55 PDT on 09-27) that ran at 50 sockets; ~4,600 tile requests fell in the ~24.5 h before the block.
+  Nothing isolates the socket count as a cause — that catch-up also stacked volume on the first 80-city night — and concurrency has never been a variable in the block series at all.
+
+**Why 5 costs no throughput while the host is healthy.**
+The pacer is FIFO at 40/min, so the number of requests in flight is roughly 0.67/s × mean tile latency, and the grid census has run every night at 5 against the same pacer.
+With latency that varies rather than stays constant, 5 slots lose nothing while mean latency is low and degrade gradually as it grows; a deadline is at risk only at mean latencies well above that, which is the exposure the grid has always carried.
+Slots above 5 are occupied only when the host is SLOW — and a slot is also held through a retry's backoff sleep — which is exactly when backpressure is wanted rather than more sockets.
+That is reasoning, not a measurement, and it is deliberately left qualitative here: the thresholds come from a review-time simulation of `_acquire_spaced` that is not committed.
+Two follow-ups would turn it into evidence: committing that simulation under `docs/experiments/` with its metrics JSON, and reading prod's collect logs to confirm the grid reaches its paced rate at 5.
+
+**Two residues fall with it.**
+Retries past a request cap are bounded by `connection_limit × (TILE_MAX_TRIES − 1)`: 20 at 5, where the walk's 50 allowed 200.
+And requests refused after a block is first seen (#205's fail-fast, `<= connection_limit`) fall from up to 50 to up to 5 — on the one host where the forum reports that refused retries extend the block.
+
+This is a conservative choice under an unknown, not a limit anyone measured, and it changes a traffic property during a staged period: deploying it beside the 80-city cap check or the #385 rolling budget means two treatments at once, so the deploy order is an operator's decision, recorded when it is made.
 
 ## A paired night now costs one census, not two (issue #290)
 

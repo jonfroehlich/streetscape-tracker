@@ -9170,9 +9170,12 @@ def _run_city_channels(
     #
     # What that costs is not uniform, because only four channels carry this
     # number at all: the gsv grid (download_gsv's TCPConnector), the gsv road
-    # walk (the same engine) and the Mapillary road walk. The Mapillary GRID
-    # never receives it — cli.py's branch omits the argument, so
-    # fetch_city_images_async's own default of 5 applies. Combined with affinity
+    # walk (the same engine), and the Mapillary and Panoramax road walks -- and
+    # those two are clamped to their provider's own ceiling of 5 in
+    # _street_collect_cmd (#358, #361), so only the two gsv children are sized
+    # by it. The Mapillary and Panoramax GRIDS never receive it -- cli.py's
+    # branches omit the argument, so each downloader's own default of 5
+    # applies. Combined with affinity
     # (mapillary/mapillary_streets share the tile CDN, gsv_streets/
     # mapillary_streets share Overpass), the only overlapping pair that points
     # two full-size connectors at ONE third party is gsv + gsv_streets, both of
