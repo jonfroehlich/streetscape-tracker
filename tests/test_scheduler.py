@@ -1063,7 +1063,9 @@ def test_production_panoramax_stage_one_derived_figures(conn, monkeypatch):
     half of 8,000). And the derived timeout of the richest enrollable city
     (3,132 z15 tiles) falls UNDER that floor at 60/min -- ~108 min -- where at
     30/min it derived ~206 min, so the floor is what times every enrolled city
-    today; a city over ~5,440 tiles is where the derivation binds again.
+    today; a city over 5,440 tiles is where the derivation binds again
+    (5,440 derives exactly the floor, 5,441 one second past it -- both pinned,
+    so the threshold the comments quote is exact rather than approximate).
     """
     cfg = load_scheduler_config(os.path.join(_PROJECT_ROOT, "config", "scheduler.makelab1.toml"))
     floor_s = cfg.city_timeout_minutes * 60
@@ -1079,7 +1081,12 @@ def test_production_panoramax_stage_one_derived_figures(conn, monkeypatch):
             f"{pc.max_requests_per_minute}/min, under the {pc.daily_request_budget} "
             f"budget -- the rate and the budget were not raised together"
         )
-        for tiles, expected in ((3_132, floor_s), (5_440, floor_s), (6_000, 11_850)):
+        for tiles, expected in (
+            (3_132, floor_s),
+            (5_440, floor_s),
+            (5_441, floor_s + 1),
+            (6_000, 11_850),
+        ):
             monkeypatch.setattr(_sched, "estimate_requests", lambda *a, _t=tiles, **k: _t)
             assert _sched.city_timeout_seconds(cfg, city, channel, conn) == expected, (
                 channel,
@@ -14117,6 +14124,27 @@ def test_a_panoramax_walk_reads_its_grid_siblings_cached_census_for_nothing(conn
     # And the reverse direction, which production does too: a walk that paid
     # first hands the grid run a free census.
     assert _channel_estimate(cfg, city, "panoramax", conn) == 0
+
+
+@pytest.mark.parametrize("channel", ["panoramax", "panoramax_streets"])
+def test_the_enrolment_note_prices_at_the_CONFIGURED_panoramax_rate(conn, channel):
+    """The printed pace is the channel's configured one, never the collector's.
+
+    The test above configures 30/min, which IS the collector default, so a
+    `_enrolment_cost_note` that ignored the configured rate passed it. Since
+    #405 stage 1 production runs 60/min, so that mutation would print twice the
+    real wall clock to the operator deciding whether to enrol. Asserted at a
+    value that is neither the default nor prod's, and through prod's own config.
+    """
+    city = db.resolve_city(conn, _register(conn, "Krabi", width=10000, height=10000, step=20))
+    tiles = estimate_requests(city, channel, conn=conn)
+    assert tiles > 0
+    (line, *_rest) = _sched._enrolment_cost_note(conn, _px_cfg(rate=45), city, channel)
+    assert f"~{tiles:,} requests" in line
+    assert line.endswith(f"(~{tiles / 45:.0f} min paced at 45/min)"), line
+    prod = load_scheduler_config(os.path.join(_PROJECT_ROOT, "config", "scheduler.makelab1.toml"))
+    (prod_line, *_rest) = _sched._enrolment_cost_note(conn, prod, city, channel)
+    assert "paced at 60/min" in prod_line, prod_line
 
 
 def test_enroll_city_prices_a_panoramax_enrolment(conn, monkeypatch, tmp_path, capsys):

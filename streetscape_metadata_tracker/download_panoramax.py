@@ -48,9 +48,9 @@ NO CREDENTIAL. Reads are unauthenticated, so there is no token in the URL, no
 `.env` entry to fail fast on, and no per-channel key isolation to build. What
 replaces the credential as the thing to be careful with is the host itself: one
 volunteer-run meta-catalog absorbing all of our load however wide the federation
-grows, publishing no rate limit of any kind. Pacing is therefore deliberately
-half Mapillary's (see DEFAULT_TILE_REQUESTS_PER_MINUTE) and 403/429 is a stop
-rather than a retry.
+grows, publishing no rate limit of any kind. The DEFAULT pace is therefore
+deliberately below Mapillary's (see DEFAULT_TILE_REQUESTS_PER_MINUTE; production
+runs faster since #405 stage 1) and 403/429 is a stop rather than a retry.
 
 The census CHECKPOINTS and is PROMOTED into the shared cache exactly as
 Mapillary's is; the tile-keyed reassembly contract, the fails-open posture and
@@ -466,10 +466,16 @@ _TILE_MAX_TIME_S = 120
 # as the nightly batch, which is exactly how both Mapillary bans took out
 # channels that had done nothing wrong.
 #
-# 30/min is phase 1's figure — half the Mapillary channels' configured rate
-# against a host with strictly less published guidance, which is the intended
-# direction of the asymmetry. It is not a measurement of anything Panoramax
-# said; raising it is a volume change under the top-of-file rule in CLAUDE.md.
+# 30/min is phase 1's figure, and it is the DEFAULT only: below the Mapillary
+# channels' 40 against a host with strictly less published guidance. It is not
+# a measurement of anything Panoramax said; raising it is a volume change under
+# the top-of-file rule in CLAUDE.md. Production DOES raise it, reversing the
+# asymmetry: 60/min since #405 stage 1 (config/scheduler.makelab1.toml),
+# acceptable because Mapillary and Panoramax are separate hosts with separate
+# limits, and #405's evidence -- no limiter in the meta-catalog's source, the
+# maintainer's complaints only about 150-200 req/s bursts -- is about this one.
+# This constant stays at 30 so laptop runs and the repo default stay
+# conservative.
 #
 # What it costs, over the cities that would actually be enrolled rather than
 # over the catalog: a p50 leader city is 414 z15 tiles (~14 min), p90 2,400
@@ -495,11 +501,48 @@ DEFAULT_TILE_JITTER = 0.6
 _TILE_ERROR_CONTENT_TYPES = ("text/html", "application/json")
 
 
+# The fixed phrase every RETRIED tile request logs, and the one an operator
+# greps for (issue #405). Without it a 5xx that recovered on a later try was
+# invisible: backoff retried it silently, the tile committed, and the night read
+# as clean -- which made #405's "no 5xx cluster" stage gate unobservable. Kept
+# a constant so the docs, the config comment and the test all name one string.
+TILE_RETRY_LOG_PHRASE = "Panoramax tile retry"
+
+
+def _retry_cause(exc: BaseException | None) -> str:
+    """``HTTP 503`` for a status error, else the exception's class name."""
+    status = getattr(exc, "status", None)
+    return f"HTTP {status}" if isinstance(status, int) else type(exc).__name__
+
+
+def _log_tile_retry(details: dict) -> None:
+    """backoff ``on_backoff`` handler: one WARNING per retried tile request.
+
+    Example line (the gate check greps ``Panoramax tile retry: HTTP 5``)::
+
+        Panoramax tile retry: HTTP 503 on try 1 of 5, waiting 0.8s
+    """
+    logger.warning(
+        f"{TILE_RETRY_LOG_PHRASE}: {_retry_cause(details.get('exception'))} on try "
+        f"{details.get('tries')} of {TILE_MAX_TRIES}, waiting {details.get('wait', 0.0):.1f}s"
+    )
+
+
+def _log_tile_giveup(details: dict) -> None:
+    """backoff ``on_giveup`` handler: the tile's retries are exhausted."""
+    logger.warning(
+        f"{TILE_RETRY_LOG_PHRASE} gave up: {_retry_cause(details.get('exception'))} "
+        f"after {details.get('tries')} tries"
+    )
+
+
 @backoff.on_exception(
     backoff.expo,
     (asyncio.TimeoutError, aiohttp.ClientError),
     max_tries=TILE_MAX_TRIES,
     max_time=_TILE_MAX_TIME_S,
+    on_backoff=_log_tile_retry,
+    on_giveup=_log_tile_giveup,
 )
 async def _fetch_tile(
     session: aiohttp.ClientSession,
