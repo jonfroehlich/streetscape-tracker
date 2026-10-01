@@ -612,6 +612,14 @@ def test_a_screen_writes_the_rows_the_ledger_and_the_artifact(
     # them would under-count our real load by exactly what nobody added.
     assert db.get_api_usage(conn, EVENING_UTC_DATE, provider="panoramax") == 113
     assert db.get_api_usage(conn, EVENING_LOCAL_DATE, provider="panoramax") == 0
+    # ...and the per-host rolling ledger (issue #385): the screen's 113 requests
+    # hit the same per-IP meta-catalog a collection does.
+    assert [
+        tuple(r)
+        for r in conn.execute(
+            "SELECT host, SUM(requests) FROM host_usage WHERE provider = 'panoramax' GROUP BY host"
+        )
+    ] == [("panoramax", 113)]
     assert [row["screen_date"] for row in stored] == [EVENING_UTC_DATE.isoformat()]
     assert os.path.exists(os.path.join(data_dir, "provider_screen.json.gz"))
 

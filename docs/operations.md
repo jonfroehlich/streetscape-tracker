@@ -45,7 +45,8 @@ The same holds for any hand-run GSV collection (`streetscape_tracker.py`, `colle
 The failure is OVER_QUERY_LIMIT answers, retried after 20 s waits and, past 1% of points, an aborted run; the full account and the open decision are in [`provider-access.md`](provider-access.md) (the #304 section).
 Check `pgrep -f "scheduler run-due"` first, or pass a lower `--max-requests-per-minute` to a hand run so the two sum under the quota.
 Refusals mirror #214's: an unpaired `--width/--height`, a `--provider` naming the grid channel or an unknown/disabled one, and a config with no assess channel enabled all exit `USAGE_EXIT_CODE` **before the catalog is opened**.
-`--width/--height` without `--lat/--lng` is refused where `cli.py` merely tolerates it, because size alone freezes the grid on the OSM bbox midpoint rather than downtown — the right size in the wrong place, permanently.
+`--width/--height` without `--lat/--lng` is refused where `cli.py` accepts it.
+`cli.py` now centers such a grid on the geocoder's reported point rather than the OSM bbox midpoint (#186), but nobody has verified that point is downtown (#185), and an assessment freezes geometry for a partner answer — a guess there is the right size in possibly the wrong place, permanently.
 
 ## Publishing is declared in config, not inherited from the environment (`[publish].local`)
 
@@ -55,6 +56,39 @@ So any hand-run publish on makelab2 (`regenerate-aggregate --publish`, and now `
 `[publish].local = true` (set in `scheduler.makelab1.toml`) makes `_publish` pass `--local` explicitly, so the two invocation paths are identical;
 the unit still exports the variable, harmlessly, so a code rollback cannot break nightly publishing.
 `[publish].site_url` is used for nothing but printing operator-facing links.
+
+## Deploying a stats-definition change
+
+Written for the GSV query radius (issue #367), and the procedure for any change to what a stored stat means.
+**The repair is a required deploy step, not an optional follow-up.**
+The night after the code lands, every newly collected run is cataloged under the new definition while every older row keeps the old one.
+The aggregate (`cities.json.gz`) and the driving page read the STORED `runs` columns, so every re-collected city would show a step change that is only the definition moving — for #367, a phantom drop of about 10% in GSV coverage.
+
+Stop nothing, but finish these before the next 02:00 timer fires:
+
+```bash
+cd ~/streetscape-tracker && git pull          # deploy the code; the catalog migrates on first connect
+# 1. Dry run: prints every run that would change, and why. Read it before step 2.
+.venv-makelab2/bin/python scripts/recompute_run_stats.py \
+    --data-dir /projects/makeabilitylab/streetscape-tracker/data --provider gsv
+# 2. Apply to the catalog AND rebuild the affected per-run JSONs.
+.venv-makelab2/bin/python scripts/recompute_run_stats.py \
+    --data-dir /projects/makeabilitylab/streetscape-tracker/data --provider gsv \
+    --execute --regenerate-json >> logs/recompute_367.log 2>&1
+# 3. Rebuild the aggregate from the repaired catalog and publish it.
+.venv-makelab2/bin/python -m streetscape_metadata_tracker.scheduler \
+    --config config/scheduler.makelab1.toml regenerate-aggregate --publish
+```
+
+`--data-dir` is passed explicitly so the command names the same catalog `[paths].data_dir` names; on prod the checkout's own `data/` is that directory, so the flag is a statement of intent rather than a correction.
+`--provider gsv` is not only a filter: `--regenerate-json` re-reads every rebuilt run's CSV, and a census CSV is millions of rows.
+Step 2 is a whole-series pass over every GSV CSV, so budget hours rather than minutes; drive it into a file, never a pipe.
+If it cannot finish before 02:00, disable the timer for the night (`systemctl --user disable --now streetscape-tracker.timer`, and `enable --now` after step 3; never `stop`, which the #369 watchdog re-arms) rather than let a night catalog runs beside a half-repaired series.
+
+**What the repair does NOT move.**
+Historical `run_diffs` rows and the published diff detail CSVs stay under the old definition: `recompute_run_stats.py` re-derives run stats, never diffs, and nothing re-diffs a GSV series yet.
+So after #367 a city's "Changes since" panel for an old pair can still count a far pano as added or removed, until a GSV re-diff pass exists (a follow-up).
+Diffs computed from the deploy on are correct, because both of their sides load through the new rule.
 
 ## Landing a laptop investigation in this catalog: `scheduler import-bundle` (issue #330)
 
@@ -121,6 +155,58 @@ A channel with no scheduler arms yet (anything in `UNWIRED_CHANNELS`, empty toda
 As after `assess-city`, the imported channels are then the *least* stale rows for that city and are **not** due tonight — the closing report says so, because the natural assumption is the opposite.
 
 Three pieces of #330 are deliberately still open: a laptop-side `investigate` driver that runs the collectors and does the rsync itself, a `register-city` subcommand so the laptop asks prod for the frozen grid *before* collecting rather than being checked against it afterward, and a pidfile written by `run-due` to replace the batch check's `ps` heuristic.
+
+## Enabling a city: one enrolment function behind every path (issue #374)
+
+**Added after the 2026-08-22 split.**
+
+Every path that brought a city into the schedule left the four opt-in channels (`kartaview`, `kartaview_streets`, `panoramax`, `panoramax_streets`) at `schedule_state.member = NULL`, which `CHANNEL_DEFAULT_MEMBERSHIP` reads as "not a member".
+So a new city silently collected GSV and Mapillary only, unless an operator remembered four extra `enroll-city` calls — Montréal and Ottawa (2026-09-24/25) were the measured case.
+Now every enable path calls one function, `scheduler.enroll_opt_in_channels`, and prints its decisions one line per channel:
+
+| Path | Command | When enrolment runs | Preview |
+|---|---|---|---|
+| Frame / hand-registered city | `scheduler enable-city CITY` | Before `cities.enabled` flips, so the first night sees every channel | `--dry-run` |
+| Laptop investigation | `scheduler import-bundle DIR --enable --execute` | After the bundle lands, only when `--enable` actually turns the city on | The default dry run |
+| Partner inquiry | `scheduler assess-city "City, Region"` | After the confirmation, before the walks run, only for a city never touched on an opt-in channel | The pre-flight; `--estimate` stops there |
+
+All three take `--no-opt-in` (skip enrolment entirely; membership is untouched) and `--enroll-kartaview` (below).
+`enable-city` refuses an unknown city and an already-enabled one with exit 64: changing an enabled city's membership is `enroll-city`'s job, and re-running the gates on the ~1,200 cities already enabled is the backfill #374 keeps out of scope.
+For a city meant to collect on only some channels (the staged rollout in `docs/scheduler.md`), pass `--no-opt-in`, or pre-set `enroll-city --remove` on the opt-in channels too — an explicit value is never overwritten.
+
+**Two gates, one per provider, and a provider's grid and walk channels always move together** — the walk reads the grid's census from the shared cache for 0 requests (#290), so one without the other pays the census twice or never collects.
+
+- **Panoramax** is enrolled only on a **nonzero upper bound** from a one-city screen run at enrolment time.
+  It is the weekly `screen-provider` instrument, not a copy of it: `panoramax_screen.screen_targets` over one target, the v2 `grid` layer at z6, under the Panoramax host lock, paced by `_screen_pacing`, and charged to the ledger on the command's own UTC run date.
+  A handful of tiles (Newport, KY straddles a z6 seam and costs 2).
+  **It writes NO `provider_screen` row**, and decides from the in-memory result instead.
+  That table is a series of WHOLE-CATALOG observations: `db.get_provider_screen_series` groups by `screen_date`, and the published summary reports each date's cities-screened and cities-positive counts plus `latest_screen_date`, so a one-city row would publish a point claiming one city was screened that day — the partial screen `cmd_screen_provider` refuses to write.
+  The weekly screen records the city on its next pass.
+  A screen that is refused (403/429), busy (the lock is `timeout=0`, so it is reported, never waited out), unreadable or failed in any other way enrols **neither** channel and reports `screen_failed` — never "unknown" read as a zero, since a zero is conclusive (#316) and a failure is not.
+  Requests actually sent are charged to the ledger on a failure too.
+  A failed screen records no opt-in attempt, so the gate is not re-run on its own but CAN be: re-running `assess-city` on that city re-runs it, until something collects the city on an opt-in channel.
+  The `screen_failed` line names the remedies: re-check after Monday's `screen-provider panoramax`, then either re-run `assess-city` or run `enroll-city CITY --channel panoramax` and `--channel panoramax_streets` if it is positive.
+  `assess-city`, `import-bundle` and `enable-city` still exit 0 on a Panoramax refusal (enrolment is a side decision of each), whereas `screen-provider` exits 84 on the same refusal, so a refusal here is visible only in the report line.
+  The weekly screen's catalog-collapse check does not apply to one city (a zero is the ordinary answer for 64% of the catalog); its renamed-layer guard does, so a genuinely empty city spanning two tiles that answer with no hexagon at all reads as `screen_failed`, which is the safe direction.
+- **KartaView** is priced with `estimate_kartaview_requests` and enrolled at or below `OPT_IN_KARTAVIEW_ENROLL_MAX_REQUESTS` (1,000).
+  #225 measured the median sweep at 16 requests (p95 636), so nearly every city passes; the estimate is a FLOOR (Yogyakarta ran 3.0x it, #248).
+  Above the ceiling the pair is `needs_flag`: the estimate is printed and nothing is enrolled unless `--enroll-kartaview` is passed — `--yes` never implies it.
+
+**An explicitly set membership is never overwritten.**
+If either channel of a pair already holds a non-NULL `member`, the whole pair is left alone and reported `already_set`, so an operator's `--remove` survives and a pair is never split by enrolling only its unset half.
+Enrolment is written through `db.set_channel_membership_pairs`, which shares `enroll-city`'s one upsert and writes a pair's two rows in ONE transaction — two commits could leave half a pair, which `already_set` would then freeze forever.
+A channel not enabled in this config is still enrolled, with the same `NOTE` `enroll-city` prints, because enrolment before configuration is supported on purpose.
+
+**What "new" means for `assess-city`: never touched on an OPT-IN channel.**
+`db.city_touched_opt_in_channels` is true on any `schedule_state.last_attempt_at` on an opt-in channel, or any `runs` or `street_walks` row from `kartaview` or `panoramax`; such a city is left alone entirely.
+It is keyed on the opt-in channels, never on the city's history elsewhere, because `--estimate` registers the city ENABLED: a never-collected city leads gsv's queue, so a 02:00 run between `--estimate` and `--yes` (or after a declined confirmation) stamps a gsv `last_attempt_at`, and an any-channel history gate read the follow-up run as a re-assessment — the Montréal/Ottawa failure, through the documented order.
+The consequence is deliberate: re-assessing a long-tracked city that has never been on an opt-in channel enrols it behind the same gates.
+`--no-opt-in` is the opt-out, and explicit memberships are handled per pair, so an explicit `--remove` on one pair survives as `already_set` while the other pair is still decided.
+Every dry run — `--estimate`, `import-bundle` without `--execute`, `enable-city --dry-run` — writes nothing and issues no provider request, so the Panoramax pair previews as `pending_screen` with the tile count its screen will cost.
+
+**Same-date collection comes from the nightly run, not from `assess-city`.**
+`ASSESS_CHANNELS` is unchanged (the opt-in channels stay refusable there, for the reasons at its definition); enrolment is what answers both of those reasons, since the city becomes a member and Panoramax is screened first.
+The closing summary says so in one sentence: the grid runs and the opt-in providers enrolled above arrive with the city's first nightly run, which collects every member channel on one UTC date.
 
 ## Keeping Overpass out of the night: `scripts/prefreeze_street_networks.py` (issue #341)
 
