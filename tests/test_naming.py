@@ -534,3 +534,55 @@ def test_the_js_run_filename_regex_agrees_with_python():
     assert js_re.match(impossible_date), "JS no longer accepts an impossible date"
     with pytest.raises(ValueError):
         parse_filename(impossible_date)
+
+
+def test_streetwalk_diff_regex_matches_exactly_what_the_generator_emits():
+    """Pinned against the generator for every provider x network type (issue
+    #265): the orphan sweep deletes only names this regex matches, so a shape
+    it misses is an orphan it can never find."""
+    from streetscape_metadata_tracker.naming import (
+        STREETWALK_DIFF_FILENAME_RE,
+        STREETWALK_NETWORK_TOKENS,
+        is_streetwalk_diff_filename,
+    )
+
+    for provider in KNOWN_PROVIDERS:
+        for network_type, token in STREETWALK_NETWORK_TOKENS.items():
+            name = generate_streetwalk_diff_filename(
+                "st.-louis--mo", "2026-07-08", "2026-10-01", provider, network_type
+            )
+            m = STREETWALK_DIFF_FILENAME_RE.match(name)
+            assert m, name
+            assert m["slug"] == "st.-louis--mo"
+            assert (m["provider"] or DEFAULT_PROVIDER) == provider
+            assert (m["network"] or "") == token
+            assert (m["from_date"], m["to_date"]) == ("2026-07-08", "2026-10-01")
+            assert is_streetwalk_diff_filename(name)
+
+
+def test_streetwalk_diff_regex_rejects_near_misses():
+    """Names the sweep must never delete as a walk diff."""
+    from streetscape_metadata_tracker.naming import (
+        generate_streetwalk_filename,
+        is_streetwalk_diff_filename,
+        streetwalk_coverage_filename,
+    )
+
+    walk = generate_streetwalk_filename("bend--or", 5000, 5000, 20, 15, date(2026, 7, 8))
+    walk += ".csv.gz"
+    for name in [
+        walk,
+        streetwalk_coverage_filename(walk),
+        "bend--or_streetwalkdiff_gsv_2026-07-08_to_2026-10-01.csv.gz",
+        "bend--or_streetwalkdiff_drive_2026-07-08_to_2026-10-01.csv.gz",
+        "bend--or_streetwalkdiff_2026-07-08_to_2026-10-01.json.gz",
+        "bend--or_diff_2026-07-08_to_2026-10-01.csv.gz",  # a GRID diff
+        # '$' would accept this: it matches before a trailing newline.
+        generate_streetwalk_diff_filename("bend--or", "2026-07-08", "2026-10-01") + "\n",
+    ]:
+        assert not is_streetwalk_diff_filename(name), repr(name)
+    # The pattern ends in \Z, so a direct .match() cannot accept a newline either.
+    from streetscape_metadata_tracker.naming import STREETWALK_DIFF_FILENAME_RE
+
+    newline = generate_streetwalk_diff_filename("bend--or", "2026-07-08", "2026-10-01") + "\n"
+    assert STREETWALK_DIFF_FILENAME_RE.match(newline) is None

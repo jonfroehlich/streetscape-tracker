@@ -88,19 +88,20 @@ def test_single_pano_distance_stdev_is_zero_not_none():
     """DistanceStats deliberately uses 0.0 (not None) for the n=1 stdev —
     the opposite convention from AgeStats — so pin both here.
 
-    conftest offsets each pano 0.0001° in lat and lon from its query point:
-    dist = sqrt(0.0001^2 + 0.0001^2) * 111000 = 0.0001 * 1.4142136 * 111000
-         = 15.6978 m.
+    conftest offsets each pano 0.0001° in lat and lon from its query point at
+    latitude 44°. Great-circle (issue #367): 11.12 m north and
+    11.12 * cos(44°) = 8.00 m east, so 13.6975 m. (The planar formula this
+    replaced said 15.6978 m -- it ignored cos(latitude).)
     """
     df = make_city_df([("solo", CAPTURE_4Y)])
     dist = calculate_coverage_stats(df).pano_distance_stats
 
     assert dist is not None
     assert dist.stdev_meters == 0.0
-    assert dist.min_meters == pytest.approx(15.6978, abs=1e-3)
-    assert dist.max_meters == pytest.approx(15.6978, abs=1e-3)
-    assert dist.avg_meters == pytest.approx(15.6978, abs=1e-3)
-    assert dist.median_meters == pytest.approx(15.6978, abs=1e-3)
+    assert dist.min_meters == pytest.approx(13.6975, abs=1e-3)
+    assert dist.max_meters == pytest.approx(13.6975, abs=1e-3)
+    assert dist.avg_meters == pytest.approx(13.6975, abs=1e-3)
+    assert dist.median_meters == pytest.approx(13.6975, abs=1e-3)
 
 
 def test_zero_pano_run_all_stats_none_not_nan():

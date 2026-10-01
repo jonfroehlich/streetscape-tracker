@@ -118,7 +118,13 @@ def run_analysis(args: argparse.Namespace) -> int:
             return 1
 
         logger.info("Analyzing %s (%s, run %s)", city.city_id, args.provider, run.run_date)
-        df = load_city_csv_file(csv_path)
+        # raw=True: the GSV query-radius rule (issue #367) judges a pano by its
+        # distance from the GRID POINT that found it, which is the grid's
+        # question. This analysis asks a different one -- is a pano within
+        # match_dist of a STREET -- and bounds that distance itself, so a pano
+        # 80 m from its query point but standing on a street is real coverage
+        # here. Filtering it would under-count street coverage.
+        df = load_city_csv_file(csv_path, raw=True)
         panos = select_pano_points(df, args.provider)
         logger.info("Selected %d located panos", len(panos))
         if len(panos) == 0:

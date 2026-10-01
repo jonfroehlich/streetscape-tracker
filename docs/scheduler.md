@@ -39,6 +39,34 @@ The first is what the budget gates (`est > budget`, `used + est > budget`) and t
 The second also feeds the timeout derivations below, where a 0 would collapse a child's timeout onto the flat floor; and since a probe is marker-only, a hit is a strong hint rather than a promise — narrowed two ways, by comparing the marker's recorded store format against this build's and by probing with the window less `max_batch_hours`, so a format bump or a mid-batch expiry is a miss rather than a free-priced fetch — and the child may still fetch for real.
 The `achieved_rate_fraction` differs per channel because what falls short of the configured rate differs: gsv uses **0.5** for the async engine's structural undershoot against a project quota it never approaches, Mapillary **0.8** because its limiter is a hard ceiling the concurrent fetch tracks closely, and KartaView **0.5** because its walk is *serial*, so per-request latency cannot hide behind other requests in flight and at 16/min the 3.75 s interval is genuinely comparable to the latency of a 2,000-record page.
 Derived values are then clamped to what is left of the batch deadline (never below `_MIN_CLAMPED_TIMEOUT_S`, 300 s), which is what bounds a metro KartaView sweep whose honest timeout exceeds `max_batch_hours` outright — acceptable only because #239's checkpoint turns that kill into a resume rather than a discarded night.
+**For a NON-resumable channel (`gsv`, `gsv_streets`) the clamp now only shortens a child that fits (#373).**
+Under a batch deadline, `_run_city_channels` compares the channel's derived need, `city_timeout_estimate_seconds`, against what is left, and a channel that needs more is deferred rather than launched clamped: no launch, no `record_attempt`, not attempted, and its `consecutive_failures` are untouched.
+Only a city whose EVERY channel deferred costs no city-cap slot (`attempted == 0`); a city with one channel launched and another deferred takes its slot as usual.
+A clamped launch of the same child would have been SIGKILLed at the deadline, recorded as a failure, alerted on at the default `failure_threshold` of 1, and its ledger write lost — a routine outcome once #372 let nights end on the deadline rather than the city cap.
+**The predictor is the estimate, never the floored timeout.**
+The estimate is the derivation above with the headroom and the fixed slack but without the 180-min floor, and `city_timeout_seconds` is pinned to be exactly `clamp(max(floor, estimate))`, so the two cannot drift.
+The floor is a minimum a child is *given*, not what it *needs*: predicting with it would defer every gsv city for the last three hours of every night while a median one finishes in minutes.
+The estimate is still a padded upper bound, so it defers some children that would have finished, and that is the right trade: a deferred grid run costs nothing (it stays due and leads tomorrow), a kill costs a failure and an alert.
+Two deferrals are not free, and each is handled rather than denied:
+
+- **A deferred FIRST grid channel defers the whole city.** When `providers[0]` (normally `gsv`) is a grid run and defers, every other channel of that city defers with it, each counted and logged once ("deferring the rest of this city so its snapshots stay paired").
+  Run alone, the city's Mapillary census and walks would land tonight while the grid lands on a later date, un-pairing its snapshots — the city is the join point — and they would add per-IP Mapillary volume on a night that bought no grid run.
+  A resumable first channel never deadline-defers, so the rule never fires for one.
+  Nor does it when the first channel is a WALK — a city excluded from gsv can lead with `gsv_streets` — since a walk has no grid to pair with, and dragging the city's censuses along would only cost them a night: only the walk defers.
+- **A walk deferred AFTER its grid landed is STRANDED by the deadline.** The grid success moved the city off the gsv-due list for ~83 days, exactly as a host stranding does (#341), so the walk is recorded on the breaker's stranded set with the reason "the batch deadline": the `Done:` line counts it (`N city(ies) STRANDED un-walked (K by the batch deadline)`), and its own WARNING log line carries the by-name `run-due --provider gsv_streets --city …` recovery command.
+  A deadline stranding alone does **not** make the night unhealthy: once nights end on the deadline the last city of most nights can strand a walk, so alerting on it would be nightly noise, and the walk is still reachable through the bounded opt-in hoist.
+  The command therefore lives in the scheduler log — and in the alert's log tail, and beside the host strandings in the STRANDED paragraph (marked `the batch deadline`), whenever the night is unhealthy for another reason.
+  The #380 end-of-night retry never re-launches a deadline stranding, and it prices every other non-resumable walk against the remainder BEFORE its call: one that no longer fits "stays stranded — the deadline" and keeps its original entry, never counted as a deadline deferral too.
+
+An estimate of None (pacing disabled, or a channel with no derivation) never defers, since "unknowable" is not "too long".
+When the first channel launched, every later channel is judged on its own estimate — walks key on the frozen network, not on the grid run.
+The resumable channels never reach this gate: `_sweep_launch_plan` already sizes their cap to the same clock, so they pause rather than being killed.
+That is true of the gate, not of the counter: the whole-city rule counts a deferred grid run's resumable siblings in `deadline_deferred` too.
+A need beyond the whole `max_batch_hours` window can never fit any night, so it logs a WARNING naming the remedies (shrink the grid, raise `max_batch_hours`, run it manually) instead of the INFO line; nothing tracks repeated deferrals across nights.
+The gate reuses its estimate for the child's timeout (`_clamp_timeout`), so a launched channel reads the catalog for its derivation once.
+Under `_MIN_PACED_LAUNCH_S` (the 600 s fixed slack) left, `_run_city_loop` stops starting cities with the deadline stop reason: every paced estimate is the fixed slack plus its pacing, so no non-resumable channel could fit and no resumable one could afford a request, and walking the rest of the due list would only log a line per channel and count floor-skips as budget deferrals.
+The #380 retry pass gates on the same constant — before its start line, before its wait, and before each walk — or it would start inside the same 300–600 s dead zone, spend a real Overpass re-check and floor-skip a resumable walk into "deferred for budget".
+The `Done:` line counts the deferrals per channel (`N channel(s) deferred for the deadline (gsv 3, gsv_streets 2)`), apart from both the budget and the sibling-sweep deferral, and a deferral alone does not make a night unhealthy.
 **But a kill is a resume of the WORK and not of the SCHEDULE, and that is where the acceptance runs out.**
 A *deliberate* pause exits `SWEEP_INCOMPLETE_EXIT_CODE` (83) and is amnestied in `_run_city_channels` beside the blocked- and busy-host conditions, so it can repeat indefinitely; a SIGKILL has no exit code, nothing can tell one that checkpointed progress from one that made none, and it counts a `consecutive_failure` that only a success resets — so five clamped nights quarantine the city for a 90-day cycle.
 A metro sweep that cannot finish inside five nights therefore needs #248's per-(city, provider) dueness, not a larger timeout constant.
@@ -50,14 +78,27 @@ The remainder alone was not enough, and the arithmetic says why — with the cav
 At the 10 h batch it was written against, prod's 16/min paced ~9,600 requests against a 10,000 budget, so a fresh night's remainder was **unreachable** outright and a city costing more than its timeout affords was still killed before the cap could bind; at the 12 h batch (raised 2026-09-02) the same rate paces ~11,520 and the budget is the smaller term instead.
 A sweep that reaches its cap stops itself deliberately: exit 83, amnestied, no `consecutive_failure`, no city-cap slot, and the spend still reaches the ledger because the child returns.
 What bounds a paused city is therefore not the five failures but `CHECKPOINT_MAX_AGE_S` — seven days from the checkpoint's **first** commit, after which its rows would be spliced into a snapshot dated today and it is discarded.
-The SIGKILL arm remains, and what it catches now is a child running **slower** than the assumed `rate × _SWEEP_ACHIEVED_RATE_FRACTION` — the one overrun a request cap cannot bound, since only a clock inside the child could.
-That one does count a `consecutive_failure` and does consume a slot, which is why the five-night bound still exists for it and why the hoist has to put tomorrow's retry in the *first* slot rather than merely in the list.
+A child running **slower** than the assumed `rate × _SWEEP_ACHIEVED_RATE_FRACTION` is the one overrun a request cap cannot bound, and since #344 a clock inside the child bounds it.
+Every resumable launch is also handed `--*-max-seconds`, set to `timeout_s − _CRAWL_CLOCK_MARGIN_S` (600 s, the same number as `_TIMEOUT_FIXED_SLACK_S`), from one helper at all six launch sites (`_crawl_clock_args`, the twin of `_request_cap_args`).
+The child measures it from its own process start and checks it at the same tile/cell boundary as the cap, so a slow crawl pauses itself with exit 83 — checkpointed, ledgered, amnestied — exactly as a capped one does.
+The two ceilings compose: whichever is reached first pauses the crawl, the child's pause line names which (`stopped by its request cap` / `stopped by its wall-clock budget`), and the scheduler carries that phrase into the paused child's reason.
+**The SIGKILL arm is still reachable, by three routes, and none of them is a slow crawl:**
+
+- a non-resumable channel (`gsv`, `gsv_streets`), which is never handed a clock;
+- a crawl that completes inside its budget and then overruns in its **finalize tail** — grid assignment, the CSV write, the walk's join, stats — because the clock is checked only when a unit is admitted, never after the last one;
+- a launch whose timeout is at or under the 600 s margin, which gets no clock flag at all (the child's `positive_int` would refuse it): the `est == 0` cached-census launch, and an unpaced channel whose `affordable` is None, neither of which the launch floor skips.
+
+In-flight work at the moment the clock trips is not a fourth route in practice, and each crawler bounds it its own way.
+A tile census bounds each in-flight tile's retry chain at `_TILE_MAX_TIME_S` (120 s).
+The KartaView sweep has no tile timer, but it is serial and asks the clock before every probe and every page, so what is in flight is one probe: at most `DEFAULT_BACKPRESSURE_RETRIES + 1` = 4 attempts × (the 60 s `DEFAULT_REQUEST_TIMEOUT_S` + ~3.75 s of pacing at 16/min) ≈ 4–5 min.
+Both residues sit inside the 600 s margin.
+The SIGKILL arm does count a `consecutive_failure` and does consume a slot, which is why the five-night bound still exists for it and why the hoist has to put tomorrow's retry in the *first* slot rather than merely in the list.
 The union of the per-channel due lists is ordered by first appearance, so `gsv` (rank 0) dictates city order; a city whose `gsv` run succeeded but whose sweep paused sits at the tail of ~949 cities and is truncated by `max_cities_per_day`, returning months later rather than tomorrow.
 The hoist moves a city to the head of the slate when **every** channel it is due on is opt-in — `all`, not `any`, so a city due on `gsv` too keeps its exact union position and `gsv`'s stalest-first ordering is strictly untouched.
 It reorders the **city list only**, never the union loop, because `providers_for_city` is passed straight to `_run_city_channels` where `pending = list(providers)` *is* the launch order.
 
 **The tail — aggregate, streetwalk manifest, catalog backup, publish — is what makes a night visible, and it only runs if the city loop returns**, so every way of ending the loop goes through `_run_city_loop`,
-which always returns counters instead of propagating: a `[schedule].max_batch_hours` deadline (12 h) stops *starting* cities and clamps the in-flight child's timeout to what's left,
+which always returns counters instead of propagating: a `[schedule].max_batch_hours` deadline (12 h) stops *starting* cities, defers a non-resumable channel whose derived need exceeds what is left (#373), and clamps every other in-flight child's timeout to it,
 a SIGTERM handler turns systemd's stop into a wind-down request checked between cities *and between a city's channels*, and an unexpected exception is logged, published anyway, and then reported as an unhealthy night (nonzero exit + alert, so publishing can't hide a bug).
 **The tail also prunes the shared census cache** (`prune_census_cache`, #290), beside the backup and the publish and with the same best-effort posture — it swallows its own filesystem errors, because the prune is housekeeping and the publish and the alert come after it.
 That prune is the only thing bounding the cache's size: an entry is written for every census a night fetches and is not overwritten until that city comes round again, ~80 days later.
@@ -175,7 +216,7 @@ The one rejection the scheduler could plausibly provoke, `connection_limit > bat
 After the `for city in due` loop, and inside the same `try` so the #167 guard covers it, `_retry_stranded_walks` launches each stranded (city, walk) again, one walk per `_run_city_channels` call and serially, through the night's own breaker, `batch_deadline` and stop flag — so a `--city`, `--limit` or `--provider` run inherits it, and a stopped or out-of-time night passes straight through.
 The breaker's re-check is the only probe: a walk it still skips, or whose child is refused again, gets ONE more try, and there is no retry budget beside `HOST_RECHECKS_PER_NIGHT`.
 Before that try the pass waits at most once (`_wait_out_recheck_cooldown`, an `Event.wait`, so a SIGTERM ends it at once), and only for walks whose latched hosts are ALL re-checkable with a re-check left — a walk also held by a host that is never re-checked (the tile CDN, KartaView, Panoramax) cannot launch however long the pass waits, so it is dropped rather than made to cost the night 45 min and an Overpass re-check (PR #384 review).
-The wait runs until the breaker's NEXT scheduled re-check (`HostBreaker.seconds_until_recheck`), not a flat cooldown, and the deadline gate uses that same figure plus `_MIN_CLAMPED_TIMEOUT_S`; a walk whose hosts all cleared in the meantime is retried without waiting.
+The wait runs until the breaker's NEXT scheduled re-check (`HostBreaker.seconds_until_recheck`), not a flat cooldown, and the deadline gate uses that same figure plus `_MIN_PACED_LAUNCH_S` (600 s, #373); a walk whose hosts all cleared in the meantime is retried without waiting.
 The pass's re-asks are not launches: `skipped_launches` and `skipped[host]` are restored around each one, so "launch(es) skipped while latched" still counts one channel of one city.
 A stop that ends the pass is reported like any other — a SIGTERM that lands during the last retried child, or the pass's own deadline exit (`batch deadline reached (… h) during the end-of-night retry`) — and joins the loop's reason when both stopped something (`city cap reached (N); received SIGTERM`).
 A busy strand (exit 80) is retried through the same host lock.
@@ -202,24 +243,27 @@ Because makelab1 is shared, a `[resource_guard]` pre-flight (pure `plan_connecti
 `SchedulerConfig.enabled_providers` returns a fixed rank — gsv, `gsv_streets`, mapillary, `mapillary_streets`, kartaview — and the docstring there states the rule; this section holds the mechanism and the history, because the docstring was the wrong size for it and because being the collision point for every branch that touched the ordering is how the wrong versions kept getting copied.
 
 **The mechanism is the deadline clamp, and it is the only wall-clock lever ordering has.**
-`remaining_s` is read fresh at every launch — one `time.monotonic()` per *launched* channel, in the launch pass — and `city_timeout_seconds` clamps the derived timeout down to it, floored at `_MIN_CLAMPED_TIMEOUT_S` (300 s).
+`remaining_s` is read fresh at every launch — one `time.monotonic()` per *launched* channel (or deadline-deferred one, #373), in the launch pass — and `city_timeout_seconds` clamps the derived timeout down to it, floored at `_MIN_CLAMPED_TIMEOUT_S` (300 s).
 A channel launched later therefore sees less of the batch deadline, and an expensive one launched late can have its timeout truncated to the floor and be SIGKILLed part-way, which costs its whole spend from the daily ledger (`db.add_api_usage` runs in the child, after the download returns).
+Since #373 that kill is reachable only by a child running slower than its own derivation, or by one whose estimate is None (pacing disabled, so there is no derivation to defer on and it launches under the clamp as before): a non-resumable channel whose estimate exceeds the remainder is deferred instead of launched, and a resumable one is capped by `_sweep_launch_plan`.
 So the channel needing the most wall-clock should start while the most of it remains.
 `test_the_deadline_is_a_submit_gate_and_every_lane_child_gets_its_own_remaining_s` pins this, as a decreasing sequence in submit order.
 
 **The rule inverts past one point, which is why kartaview ranks last rather than first.**
 "Expensive first" holds only while no single channel is long enough to consume the deadline by itself.
 One that *is* starves everything behind it — put it first and its siblings launch against what is left, down to the floor — so for that channel the question stops being which is most expensive and becomes which can best absorb being truncated.
-A multi-hour KartaView sweep is that channel: last, exactly one channel eats the clamp, and it is the one #239 checkpoints, so a killed sweep resumes instead of re-paying for the cells it already fetched.
+A multi-hour KartaView sweep is that channel: last, exactly one channel eats the clamp, and it is the one #239 checkpoints, so a truncated sweep resumes instead of re-paying for the cells it already fetched.
+Since #344 a truncated resumable child is not killed at all in the ordinary case — its clamped timeout also sizes its wall-clock budget, so it pauses itself with exit 83 before the SIGKILL.
 
 **Since #290 the order also decides who FETCHES and who REUSES.**
 `mapillary` (rank 2) launches before `mapillary_streets` (rank 3), so within a city the grid run pays for the shared z14 census and the walk reads it for zero requests; `kartaview` (4) and `kartaview_streets` (5) are the same pair over the radius sweep, wired in #258.
 Measured on the first KartaView walk (Krabi, 2026-08-31): 87 sweep requests un-paired, against the 18,851 that same walk costs on `gsv_streets` at one request per on-street sample — and 0 on any night the grid run got there first.
 That is a consequence of the existing ranking rather than a new constraint on it — reversing the pair would simply move which channel's ledger carries the spend, and `census_fetched_by` would record that faithfully either way — but it is why the two are ranked adjacently and why nothing should separate them.
-Nothing else here has that (Mapillary's checkpoint is #256, and a truncated tile census re-spends against the per-IP ceiling — 3,500/day on a paired night, 5,250 un-paired since the 2026-09-05 re-size, see docs/provider-access.md).
+Nothing else here has that (Mapillary's checkpoint is #256, and a truncated tile census re-spends against the per-IP ceiling — since #385 the 3,000-per-rolling-24-h host pool, which binds before 5,250, the mere sum of the two daily budgets; see docs/provider-access.md).
 **Cheapest is not free, in two ways that both matter.**
 No channel keeps its ledger row through a SIGKILL, whatever its provider.
 And a SIGKILL still counts a `consecutive_failure` — only a *deliberate* pause (exit `SWEEP_INCOMPLETE_EXIT_CODE`) is amnestied — so the resumption that justifies this ranking is itself bounded at five nights.
+For the six resumable channels the wall-clock stop (#344) turns a clamp that used to end in a SIGKILL into that deliberate pause; for the two GSV channels a clamp still ends in the kill.
 Ranking picks who absorbs the truncation; it never makes it free.
 
 **What order also decides**, both verified in the launch pass: which channels have **finished** when a wind-down stops the city, and which claim a lane first when a city has more channels than lanes.
@@ -235,8 +279,9 @@ Every one was reasoned from prose adjacent to the docstring instead of from the 
 - **"Lane occupancy": a long pole first would make the others queue behind it.**
   Above one lane it takes **one** lane while the others take the rest, so the queueing harm cannot occur — and as a wall-clock argument it points at rank **0**, since submitting last makes the city finish later.
 - **"Deadline priority": rank a channel last and it is the first thing a truncated night drops.**
-  The batch deadline is checked in `_run_city_loop`, **between cities**; the launch pass has no deadline gate at all — only the lane cap, the SIGTERM submit gate, host affinity and the budget guards.
+  The batch deadline is checked in `_run_city_loop`, **between cities**; the launch pass had no deadline gate at all — only the lane cap, the SIGTERM submit gate, host affinity and the budget guards.
   Once a city starts, every one of its channels is attempted whatever the order, so truncation does not operate at channel granularity.
+  Since #373 the launch pass does have one, for non-resumable channels only, and it still does not make this rationale true: it defers a channel for its own NEED against the remainder, never for its rank.
 - **"It can afford to absorb the clamp, because #239 checkpoints it."**
   True of the work and false of the schedule, until #238's review: `SWEEP_INCOMPLETE_EXIT_CODE` appeared nowhere in `scheduler.py`, so a checkpointed pause reached `record_attempt(success=False)` exactly like a crash, and `get_due_cities` filters on `consecutive_failures` with only a success resetting it.
   Absorbing truncation was not cheap, it was cheap*er*.
@@ -261,6 +306,18 @@ The resolution happens against the run's *effective* cap, so `--limit` scales th
 At `--limit == max_cities_per_day` the scaling is the identity, so a nightly run is unaffected.
 Cities beyond the reservation are **not dropped** — they keep their union position and wait for a later night, which makes the key the *rate* a widening proceeds at: the enrolled set divided by it is how many nights a full pass takes.
 Because they keep that position, "waiting" is measured against the **city cap**, not against the reservation: an unpromoted city inside `max_cities` still collects tonight, so on `run-due --provider kartaview --limit 40` with 40 due cities all 40 run and none wait.
+**The reservation rotates at two levels: across strandedness kinds, and inside the opt-in-only kind across opt-in CHANNELS (#348).**
+The kinds are excluded from rank 0 (#301), due only on opt-in channels (#248), and transiently not due on rank 0; after the live-checkpoint take below, the reservation round-robins across them.
+That rule was not enough one level down.
+Inside the opt-in-only kind the union is still first appearance over `enabled_providers()`, so a city due only on `panoramax` (rank 6) sorts behind **every** city due only on `kartaview` (rank 4), and filled from its head the kind hands every slot to KartaView.
+The KartaView queue also refills faster than it drains: a KartaView city whose `gsv` succeeds tonight is opt-in-only tomorrow.
+Measured on the prod slate for 2026-09-21: Des Moines was position 51 of 51 in that kind (kartaview 50, panoramax 1), and 19 of the 20 newly enrolled Panoramax cities had never collected, with `consecutive_failures` at 0 and no alert.
+So the opt-in-only kind is itself a rotation over sub-queues keyed by each city's **leading** due channel — the earliest in `providers` order it is due on — each keeping union order, so stalest-first still holds within a channel.
+A walk-only straggler (due only on `kartaview_streets`) therefore keys on the walk and gets its own sub-queue, deliberately: it is the population that would otherwise wait behind its own grid channel's.
+With a single opt-in channel stranded the take is exactly the straight union-order take it replaced, and the other two kinds are unchanged.
+**The channel rotation starts at a night-varying sub-queue** — the run date's ordinal modulo the number of non-empty sub-queues — because a start fixed at rank order's head fixes nothing on prod.
+At a reservation of 10 with all three kinds non-empty the opt-in-only kind gets about 3 slots, so with four stranded channels (`kartaview`, `kartaview_streets`, `panoramax`, `panoramax_streets`) a fixed start handed `panoramax_streets` 0 every night.
+The guarantee is exactly this and no more: while the set of non-empty sub-queues is unchanged and the opt-in-only kind receives at least 1 slot a night, every stranded channel is reached within (number of sub-queues) consecutive nights.
 
 **Which cities take the reserved slots is a real question only once the hoist is bounded, and the answer is a live checkpoint first.**
 `get_due_cities` orders `last_success_at ASC NULLS FIRST, city_id ASC`, and a city SIGKILLed mid-sweep still has NULL there — it never succeeded — so filling the reservation in union order sorts it **alphabetically** among every never-run enrolled city, which during a widening is the whole enrolled set.
@@ -367,7 +424,7 @@ Until 2026-09-21 the share was sent unconditionally, which made each provider's 
 **Two things gated raising it in production. The first is now satisfied; the second is still outside this repo.**
 (1) **Resume for every provider**, because a deadline or a `systemctl stop` now kills up to N children at once instead of 1.
 This is **met as of #256**: GSV grid (`.downloading` sibling), the GSV road walk (same `collect_points_async` engine), KartaView (`checkpoints/`, #239) and both Mapillary channels (`checkpoints/`, #256) all resume,
-so a killed child costs the tiles it had not yet fetched rather than the ones it had — which mattered here because a re-spend lands against the deliberate per-IP ceiling — 3,500/day paired and 5,250 un-paired since 2026-09-05 (#286) — i.e. ban risk rather than merely lost time.
+so a killed child costs the tiles it had not yet fetched rather than the ones it had — which mattered here because a re-spend lands against the deliberate per-IP ceiling — since #385 the 3,000-per-rolling-24-h host pool, which binds before 5,250, the mere sum of the two daily budgets (#286) — i.e. ban risk rather than merely lost time.
 A killed child still records no `api_usage` at all (#238), and that loss multiplies by N — unchanged by the checkpoint, since it is the parent that never sees the number.
 (2) **`gsv` and `gsv_streets` hold no per-IP lock**, because Google meters per Cloud *project* rather than per IP — so running them together is only safe while `GMAPS_API_KEY` and `GMAPS_STREETS_API_KEY` really do live in **separate projects**.
 The projects **are** now recorded — in `config/scheduler.makelab1.toml` beside `max_concurrent_channels`, with the account and the date of the check, as of 2026-09-21; this file said they were recorded nowhere until then.
@@ -396,6 +453,53 @@ The figure still worth watching is not that range but the **worst city** — a s
 The before/after is a measured question and therefore owes a writeup: `scripts/night_length_analyze.py` lands with the code and reads the elapsed distribution (with per-channel `api_usage` and the busy/blocked counts beside it, as the volume control) straight out of `logs/streetscape_scheduler.log*`; `docs/experiments/night-length.md` follows once there are nights on both sides of the flip to compare.
 That is also why `cmd_run_due` logs `max_concurrent_channels=N` **and `connection_limit=N`** on its opening line — which setting a night ran under has to be recoverable from the night's own record, not from an operator's memory of the flip date.
 Both, because the per-child socket count is the pair divided: a night that fell back to one lane would otherwise be grouped with pre-flip one-lane nights while having run at a different share.
+
+## A shared rolling-24h budget per per-IP host (issue #385, added 2026-09-29)
+
+**Every channel on a budgeted per-IP host draws from one pool, counted over the last 24 h rather than per UTC date.**
+It is configured per host token, `[hosts.mapillary_tiles] rolling_24h_request_budget = 3000` on prod, so both Mapillary channels are covered, and so would be a future channel on the same CDN.
+The per-channel `daily_request_budget`s stay exactly as they are.
+**The effective remainder at a launch is the minimum** of the channel's daily remainder and every budgeted host's rolling remainder.
+The rule lives once, in `_combine_remainder`: `_budget_remainder` feeds it the ledgers as they stand for the live gate and `assess-city`, and `run-due --dry-run` feeds it one window read plus its own simulated spend per host, so the preview draws the pool down across both channels the way the night will.
+**A host governs only when its remainder is strictly smaller**; on a tie the channel's daily budget is the named term.
+A resumable channel is then capped at that remainder, or deferred under its launch floor, by the machinery above; no new stop path exists.
+**A floor skip is the host's only when the host's window set the cap** (`BudgetRemainder.host_bound`: the host governs AND the cap equals the ledger remainder) — a skip the deadline clamp caused is the clock's, and stays a budget skip even while the host is the smaller ledger term.
+**The age wall asks what tonight could plausibly grant, not what the window holds right now** (`BudgetRemainder.ceiling`: the channel's daily remainder against, per budgeted host, its budget minus the spend that will still be in the window when the batch ends — everything stamped at or after `batch_end − 24 h`).
+It is the one arm that records a failure, and at 09:00 UTC after a full night the window holds ~53 of 3,000 while most of the rest frees before the night ends; projected against that, a 6-day checkpoint with a few hundred requests left would be failed and the operator told to raise the wrong budget.
+The full budget would be wrong the other way: late in a night that has itself spent ~2,947, none of it ages out before the batch ends, so a crawl the wall passed against 3,000 would launch capped, never finish, and be discarded past `CHECKPOINT_MAX_AGE_S` with no failure recorded — the silent weekly re-sweep the wall exists to alert on.
+`batch_end` is the batch deadline's wall-clock equivalent on the live path and `now + max_batch_hours` in the dry run; `assess-city` and any other caller without a deadline use `now`, so the ceiling is the momentary remainder — the conservative reading on an operator run.
+When the host is what cannot fit the crawl, the refusal names `[hosts.<token>].rolling_24h_request_budget` as the lever; when a timeout is the smaller term it names no budget, but the clock that binds: the batch deadline's clamp on a late launch (`[schedule].max_batch_hours`, or run the city earlier), or the city's own derived timeout (`[schedule].city_timeout_minutes` is its floor, and it grows with the grid).
+With no `[hosts]` section (the repo default), or an empty one, the gate reads exactly what it read before.
+An invalid entry (a token no channel's ledger meters — `[hosts.overpass]` included, which names a real host but could never bind — a non-positive or non-integer value, a stray key) is recorded and logged at load like an unwired channel, and `run-due` and `assess-city` refuse with 64: falling back to "no budget" would be the fail-open direction.
+
+**It is re-read per launch, never once per night**, because the same night's earlier children on the host have written to the ledger since.
+The two Mapillary channels never overlap (the cross-process host lock, and host-disjoint lanes in-process), so no cross-lane reservation is needed.
+
+**The ledger is `host_usage` (schema v16), written by `db.add_api_usage` itself** for every channel in `download_common.CHANNEL_METERED_HOST`, so no call site can forget it and the ledger is complete whatever the budget config says.
+A child records its spend when it finishes, so a long crawl's whole spend is stamped at its end.
+That shifts spend **later** within the window, which makes the gate slightly more conservative on the following night, never less; there are deliberately no mid-crawl writes.
+**The design consequence is lumpy credit.** The first Mapillary launch after a full night sees the small remainder and is launched capped at it, and credit returns in lumps as last night's per-crawl stamps age out, so a big crawl fragments into capped slices across the night; the dry run reads the window once and ages nothing, so at preview time it over-reports deferrals the night itself will launch.
+**A child SIGKILLed or crashed mid-crawl writes neither ledger**, since both writes happen when it returns; PR #387 gives resumable children a clock stop, which shrinks that case without closing it.
+The v16 migration backfills the last two UTC dates of metered `api_usage`, each row stamped at the latest instant its spend can have happened — `min(23:59:59 UTC of its date, the migration's clock)` — so the first night after deploy is gated for the **whole** night.
+Noon was the first choice and was wrong: prod's night runs ~09:00–21:00 UTC, so a noon stamp released yesterday's spend at 12:00 UTC, three hours into the first night, while most of it was still inside the true 24 h.
+The late stamp errs the fail-closed way: it can defer up to one night more than a timestamped ledger would have, and it never releases spend earlier than the real requests would have left the window.
+The tail prunes rows older than 30 days, best-effort.
+`import-bundle` writes no host row, since imported spend came from another machine's IP.
+
+**It is a soft ceiling, exactly like the daily budget**: tiles already in flight finish their retries, so a capped night can end up to `connection_limit × (TILE_MAX_TRIES − 1)` over it.
+Never write that it is not exceeded.
+
+A host-governed deferral is logged with the host, its usage and the window start, counted in `deferred_host_budget` rather than `skipped_budget`, and reported on the `Done:` line as `N deferred for the rolling-24h budget of <host>`; a host-capped launch names the host in its cap line.
+`run-due --dry-run`, `scheduler status` and `assess-city`'s pre-flight all print the window.
+A direct `streetscape_tracker.py --provider mapillary` has no scheduler config, so it neither warns nor refuses; its spend still lands in the window through the seam.
+**This is a staging guard on how fast our traffic can change, not a model of Mapillary's per-IP threshold** — see `docs/provider-access.md`, block 4.
+
+**Deploying v16, and rolling it back.**
+`import-bundle` requires the bundle's catalog to be exactly this host's `SCHEMA_VERSION`, so once v16 is deployed it refuses every v15 laptop bundle: import a waiting bundle **before** deploying, or re-collect it on a v16 checkout.
+Pre-#385 code refuses a v16 catalog ("newer than this code supports") on every subcommand that opens it through `db.connect` — `run-due`, `status`, `assess-city`, `import-bundle` and the rest — so a rollback needs `PRAGMA user_version = 15` set by hand on the catalog first; the extra `host_usage` table is harmless to old code.
+`backup-status` and `restore-backup` read only the backup directory, so they keep working either way.
+Rolling back past #367 (v17) as well needs more than the stamp: old code builds `RunRow(**dict(row))` from `SELECT * FROM runs`, so the two query-radius columns must be dropped (`ALTER TABLE runs DROP COLUMN status_out_of_radius`, then `query_radius_m`) before it can read a run.
+Re-deploying after such a rollback does **not** re-backfill (the table is no longer empty), so spend made while rolled back is missing from the window until it would have aged out anyway.
 
 ## What a capped night spends its slots on (issue #308, added 2026-09-02)
 
@@ -455,7 +559,7 @@ Describe partial coverage accordingly.
 
 **Two knobs moved with it, and neither was measured before (2026-09-02).**
 `max_cities_per_day` 20 → 40: 20 bound only on *light* nights and threw away wall clock the deadline had already granted — 2026-08-30 stopped at 20 cities after **6.77 h** of a 10 h window, while 2026-08-27 hit the deadline at 14 cities and never reached the cap at all (#304).
-`max_batch_hours` is the real governor — it stops starting cities, clamps the in-flight child and still runs the tail — so the cap is now high enough to let it be the only one, and more cities *sequentially* does not raise peak memory (one collection child at a time at `max_concurrent_channels = 1`), leaving #305's `MemoryHigh` headroom untouched.
+`max_batch_hours` is the real governor — it stops starting cities, clamps the in-flight child (or, since #373, defers a non-resumable one that would not fit) and still runs the tail — so the cap is now high enough to let it be the only one, and more cities *sequentially* does not raise peak memory (one collection child at a time at `max_concurrent_channels = 1`), leaving #305's `MemoryHigh` headroom untouched.
 That last clause is about the **cap**, not about the knob, and it stopped describing production on 2026-09-21: at `max_concurrent_channels = 2` a city runs up to two collection children at once, so the headroom is no longer untouched — it is spent deliberately, against the measurement recorded in the lanes section above.
 `max_batch_hours` 10 → 12: 10 was a "comfortably below `TimeoutStartSec`" figure with nothing behind it, and the real bracket is `TimeoutStopSec` (30 min) < `max_batch_hours` < `TimeoutStartSec` (14 h) less the bounded tail (`PUBLISH_TIMEOUT_S` + `_MEASURED_TAIL_AGGREGATE_S` + `BACKUP_TIMEOUT_S` = 1,635 s ≈ 0.45 h).
 12 clears both with 1.55 h spare and needs **no** change to the systemd unit; past ~13.5 h `TimeoutStartSec` has to move first, and two costs come with it — the publish lands later in the working day, and a longer nightly window is more sustained hours against the per-IP metered hosts, the axis Mapillary's blocks are currently suspected on (`docs/provider-access.md`).
@@ -514,7 +618,7 @@ What is still not expressible is a *per-channel enable date*: exclusion is a swi
 
 1. `enroll-city CITY --channel gsv --remove` and the same for `gsv_streets`, while the city is still **disabled**.
 2. `enroll-city --channel gsv --list --excluded` — confirm every city you meant is flagged `city disabled, exclusion pre-set`. A mistyped slug exits 64 and writes nothing, so this is the step that catches it, and it has to happen while the city still collects nothing.
-3. `UPDATE cities SET enabled = 1`.
+3. `enable-city CITY --no-opt-in` (#374) — `--no-opt-in` because the point of this order is that the city joins ONLY the channels it was not excluded from; without it the opt-in pairs are enrolled behind their gates (`docs/operations.md`).
 4. `run-due --dry-run` to confirm no `gsv` lines before the 02:00 timer fires.
 
 Doing (3) before (2) leaves a mistyped or forgotten exclusion on an ENABLED city, exposed to the next timer — which for a 40 km-clamped city is 4M grid points, most of a night.

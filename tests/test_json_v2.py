@@ -74,7 +74,9 @@ def test_no_date_pano_counted_in_json(data_dir):
     df_raw = pd.DataFrame(
         [
             (44.000, -121.0, ts, 44.0001, -121.0001, "ok1", "2020-01-15", "© Google", "OK"),
-            (44.001, -121.0, ts, 44.0011, -121.0011, "nd1", None, "© Google", "NO_DATE"),
+            # Within the 50 m query radius (issue #367): a pano 88 m east
+            # would now read as OUT_OF_RADIUS, which is not what this pins.
+            (44.001, -121.0, ts, 44.0011, -121.0001, "nd1", None, "© Google", "NO_DATE"),
             (44.002, -121.0, ts, None, None, None, None, None, "ZERO_RESULTS"),
         ],
         columns=COLUMNS,
@@ -308,6 +310,10 @@ def test_mapillary_run_json(data_dir):
     assert all(
         k.startswith("© Mapillary contributor") for k in data["all_panos"]["top_10_photographers"]
     )
+    # The GSV query radius (issue #367) is not a census concept: the summary
+    # says so with null rather than claiming a tolerance nothing enforced.
+    assert data["coverage"]["query_radius_m"] is None
+    assert data["coverage"]["num_points_out_of_radius"] == 0
 
 
 def test_mapillary_flat_only_stratifies_coverage_in_json_and_aggregate(conn, data_dir):
