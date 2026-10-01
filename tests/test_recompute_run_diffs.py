@@ -316,8 +316,8 @@ def test_recomputing_an_older_comparison_keeps_the_newer_one_current(conn, data_
 
     assert advertised()[city_id] == D1.isoformat()
     assert _main(data_dir, "--execute", "--regenerate-json", "--no-publish-json") == 0
-    assert _row(conn, stale_id)["capture_date_changed"] == GENUINE["capture_date_changed"]
     assert advertised()[city_id] == D1.isoformat()
+    assert _row(conn, stale_id)["capture_date_changed"] == GENUINE["capture_date_changed"]
     # The rebuilt per-run JSON replays the SAME comparison the aggregate reads.
     json_name = conn.execute("SELECT json_filename FROM runs WHERE run_id = ?", (c[0],)).fetchone()
     with gzip.open(os.path.join(data_dir, json_name[0]), "rt") as fh:
