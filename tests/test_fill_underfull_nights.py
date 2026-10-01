@@ -882,6 +882,51 @@ def test_admission_asks_the_launch_plan_not_only_the_remainder(conn, monkeypatch
     assert "Fill: 0 cities admitted; declined 1 for mapillary." in capsys.readouterr().out
 
 
+def test_a_launch_the_plan_would_cap_is_declined(conn, monkeypatch):
+    """The plan's other refusal: no skip, but a cap under the price -- the
+    clock's doing, since the budget terms are already checked above it. The
+    city would pause un-paired, so it is declined. Driven through a stub plan
+    because the deadline sum normally declines first; killed by dropping the
+    `request_cap < est` test."""
+    cid = _city(conn, "Capped", {"gsv": 60, "mapillary": 60})
+    city = db.resolve_city(conn, cid)
+    monkeypatch.setattr(
+        sched,
+        "_sweep_launch_plan",
+        lambda *a, **k: sched.SweepLaunchPlan(60, 3, 3, None, "", ""),
+    )
+    v = sched._fill_launch_refusal(
+        _grid_cfg(),
+        conn,
+        city,
+        ["gsv", "mapillary"],
+        est={"gsv": 100, "mapillary": 10},
+        channel_room={"gsv": 10**9, "mapillary": 3_500},
+        host_room={},
+        remaining_s=10_000.0,
+    )
+    assert v is not None and not v.admit and v.blocker == "mapillary"
+    assert "cap it at 3 of ~10" in v.message
+    monkeypatch.setattr(
+        sched,
+        "_sweep_launch_plan",
+        lambda *a, **k: sched.SweepLaunchPlan(60, 10, 10, None, "", ""),
+    )
+    assert (
+        sched._fill_launch_refusal(
+            _grid_cfg(),
+            conn,
+            city,
+            ["gsv", "mapillary"],
+            est={"gsv": 100, "mapillary": 10},
+            channel_room={"gsv": 10**9, "mapillary": 3_500},
+            host_room={},
+            remaining_s=10_000.0,
+        )
+        is None
+    ), "a cap equal to the price launches whole"
+
+
 def test_a_paused_fill_crawl_is_resumed_first_by_the_next_nights_fill(conn, monkeypatch, caplog):
     """Review item 2: a fill crawl that pauses (exit 83) is not due on that
     channel, so nothing on the due path would resume it before its checkpoint
