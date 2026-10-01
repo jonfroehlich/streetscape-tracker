@@ -16,11 +16,13 @@ Each city's grid geometry is **frozen at registration** — future runs never re
 
 A new city's center is chosen in exactly one place, `city_registration.choose_center`, which both the real registration and `--check-boundary` call (#186).
 Explicit `--lat/--lng` always win.
-An auto-sized grid is centered on the OSM bbox midpoint, because its dimensions are derived from that same bbox, so the rectangle covers the boundary (#91).
+An auto-sized grid is centered on the OSM bbox midpoint, because its dimensions are derived from that same bbox, so the rectangle covers the boundary (#91) — unless the 40 km cap clamped them, in which case the midpoint still centers the sampled window.
 Explicit `--width/--height` without a center take the **geocoder's reported point** instead: the midpoint's justification is gone once the caller sized the grid, and it centered Goiânia's downtown-sized grid 4.3 km off downtown on a ~42 km municipality.
 The geocoder's point is not verified to be downtown either — a better source is #185 — which is why `assess-city` still refuses size without a center.
-`--check-boundary` prints the center it previews and its source, in the same `centered at LAT, LON` form a real run prints, and registration logs the same source.
+A query that misses the catalog but geocodes to a city already registered under another spelling is not new: `register_city`'s `INSERT OR IGNORE` keeps the existing row, so both paths ask `registered_city_for_identity` before using a chosen center and treat that city as registered — frozen geometry, overrides ignored with a warning — and the real registration also aliases the new spelling and returns `newly_registered` False (the preview registers nothing, aliases included).
+`--check-boundary` prints the center it previews and its source (or `frozen catalog geometry`), with the grid in the same `Grid: WxH, step S, centered at LAT, LON` form a real run prints — integer dimensions, because `register_city` stores `int()` of each — and registration logs the same source.
 Nothing already registered moves; the rule applies only at registration.
+
 Legacy pre-2026 undated files are registered as `is_baseline=1` runs by `scripts/migrate_to_db.py` and are never renamed, so published URLs stay stable.
 
 ## The catalog

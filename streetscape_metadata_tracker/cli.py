@@ -57,7 +57,10 @@ from .city_registration import (
     CityResolutionError,
     cap_dimensions,
     choose_center,
+    new_city_identity,
+    registered_city_for_identity,
     resolve_or_register_city,
+    warn_overrides_ignored,
 )
 from .diff import compute_run_diff, generate_diff_filename, write_diff_detail
 from .download_common import (
@@ -1154,23 +1157,9 @@ def _check_boundary(conn, args, vis_path: str) -> int:
     from .naming import generate_base_filename
 
     city_row = db.resolve_city(conn, args.city)
+    chosen = None
     if city_row is not None:
-        overrides = [
-            o
-            for o, v in (("--lat/--lng", args.lat), ("--width/--height", args.width))
-            if v is not None
-        ]
-        if overrides:
-            logger.warning(
-                f"{' and '.join(overrides)} ignored: '{args.city}' is already "
-                f"registered as {city_row.city_id} with frozen grid geometry"
-            )
         print(f"'{args.city}' is registered as {city_row.city_id}; previewing its frozen geometry")
-        city_id = city_row.city_id
-        center_lat, center_lng = city_row.center_lat, city_row.center_lon
-        grid_width, grid_height = city_row.grid_width_m, city_row.grid_height_m
-        step = city_row.step_m
-        center_source = CENTER_SOURCE_FROZEN
     else:
         city_loc_data = get_city_location_data(args.city)
         # The same seam the real registration goes through, so the preview
@@ -1187,23 +1176,37 @@ def _check_boundary(conn, args, vis_path: str) -> int:
                 f"Use --lat and --lng to provide them manually."
             )
             return 1
-        center_lat, center_lng, center_source = chosen
+        # Same canonical id register_city would derive, so the preview filename
+        # matches the files an eventual run will produce — and the same lookup
+        # registration does, because a new SPELLING of a registered city keeps
+        # that city's frozen row, not the center chosen above.
+        city_id, city_row = registered_city_for_identity(
+            conn, new_city_identity(args.city, city_loc_data)
+        )
+        if city_row is not None:
+            print(
+                f"'{args.city}' geocodes to registered city {city_row.city_id}; previewing "
+                f"its frozen geometry (a real run would alias this spelling to it)"
+            )
 
+    if city_row is not None:
+        warn_overrides_ignored(args.city, city_row, lat=args.lat, width=args.width)
+        city_id = city_row.city_id
+        center_lat, center_lng = city_row.center_lat, city_row.center_lon
+        grid_width, grid_height = city_row.grid_width_m, city_row.grid_height_m
+        step = city_row.step_m
+        center_source = CENTER_SOURCE_FROZEN
+    else:
+        center_lat, center_lng, center_source = chosen
         if args.width is not None:
             grid_width, grid_height = args.width, args.height
         else:
             grid_width, grid_height = get_search_dimensions(args.city, 1000, 1000)
             grid_width, grid_height = cap_dimensions(grid_width, grid_height, args.city)
-        step = args.step
-
-        # Same canonical id register_city would derive, so the preview
-        # filename matches the files an eventual run will produce
-        if city_loc_data:
-            city_id = db.derive_city_id(
-                city_loc_data.city, city_loc_data.state, city_loc_data.country
-            )
-        else:
-            city_id = db.derive_city_id(args.city, None, None)
+        # What register_city will actually freeze: it stores int() of each
+        # dimension and the step, so a fractional --width previews as the
+        # value the catalog will hold rather than the one typed.
+        grid_width, grid_height, step = int(grid_width), int(grid_height), int(args.step)
 
     print(f"The search dimensions for {args.city} are {grid_width:.1f}m x {grid_height:.1f}m")
     # The center too, in the same form a real run prints it: the preview used to

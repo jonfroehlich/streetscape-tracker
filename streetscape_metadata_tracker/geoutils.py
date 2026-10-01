@@ -619,11 +619,13 @@ def get_city_location_data(
 
         if found_loc is not None:
             logging.info(
-                # Not the grid center: a new city's center is chosen later by
-                # city_registration.choose_center and is usually the OSM bbox
-                # midpoint, and this line used to be read as confirming it (#186).
+                # Not necessarily the grid center: a new city's center is chosen
+                # later by city_registration.choose_center (the OSM bbox midpoint
+                # for an auto-sized grid, this point for an explicitly sized one),
+                # and this line used to be read as confirming the center (#186).
                 f"Geocoder point for {city_query_str}: {found_loc.latitude}, "
-                f"{found_loc.longitude} (the query's reported location, not the grid center)"
+                f"{found_loc.longitude} (the query's reported location; the grid "
+                f"center is chosen separately at registration)"
             )
 
             enhancedLoc = EnhancedLocation(city_query_str, found_loc)

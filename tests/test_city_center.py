@@ -43,6 +43,14 @@ EXPLICIT = (-16.7000, -49.3000)  # what an operator would pass as --lat/--lng
 
 AUTO_DIMS = (30_000.0, 36_000.0)  # what the stubbed boundary derives (under the 40 km cap)
 EXPLICIT_DIMS = (10_000.0, 12_000.0)
+# register_city stores int() of each dimension, so a fractional --width is
+# frozen truncated; the preview must show what will be frozen, not what was typed.
+FRACTIONAL_DIMS = (2_500.5, 3_100.7)
+FRACTIONAL_FROZEN = (2_500, 3_100)
+
+# A second spelling of the same city: the catalog has no alias for it yet, but
+# the (stubbed) geocode returns the same identity, so it derives QUERY's city_id.
+SECOND_SPELLING = "Goiania GO"
 
 
 class _Loc:
@@ -81,11 +89,19 @@ def geocode(monkeypatch):
     return state
 
 
+def _cli_args(query=QUERY, *, lat=None, lng=None, width=None, height=None, step=20):
+    """The parsed-argv shape both CLI entry points read."""
+    return types.SimpleNamespace(
+        city=query, lat=lat, lng=lng, width=width, height=height, step=step
+    )
+
+
 @pytest.fixture
 def preview(monkeypatch, tmp_path):
     """
     Run the real ``cli._check_boundary`` with its map and browser stubbed.
-    Returns a callable (conn, **args) -> (exit_code, previewed (lat, lng)).
+    Returns a callable (conn, query=QUERY, **args) ->
+    (exit_code, previewed (lat, lng), previewed (width, height, step)).
     """
     drawn = []
 
@@ -94,26 +110,36 @@ def preview(monkeypatch, tmp_path):
             pass
 
     def fake_display(city, lat, lng, width, height, step):
-        drawn.append((lat, lng))
+        drawn.append(((lat, lng), (width, height, step)))
         return FakeMap()
 
     monkeypatch.setattr(cli, "display_search_area", fake_display)
     monkeypatch.setattr(cli, "open_in_browser", lambda path: (True, ""))
 
-    def run(conn, *, lat=None, lng=None, width=None, height=None, step=20):
-        args = types.SimpleNamespace(
-            city=QUERY, lat=lat, lng=lng, width=width, height=height, step=step
-        )
-        rc = cli._check_boundary(conn, args, str(tmp_path))
-        return rc, (drawn[-1] if drawn else None)
+    def run(conn, query=QUERY, **kwargs):
+        rc = cli._check_boundary(conn, _cli_args(query, **kwargs), str(tmp_path))
+        center, dims = drawn[-1] if drawn else (None, None)
+        return rc, center, dims
 
     return run
 
 
-def _register(conn, **kwargs):
-    row, newly = resolve_or_register_city(conn, query=QUERY, **kwargs)
+def _register(conn, query=QUERY, **kwargs):
+    row, newly = resolve_or_register_city(conn, query=query, **kwargs)
     # Assert on the CATALOG row, not the return value alone: the frozen row is
     # what every future run reads.
+    stored = db.resolve_city(conn, row.city_id)
+    return (stored.center_lat, stored.center_lon), stored, newly
+
+
+def _run_registration(conn, query=QUERY, **kwargs):
+    """
+    Registration through the real run's call site, ``cli._resolve_geometry``,
+    with the same args object the preview receives — so the argv-to-keyword
+    mapping there is pinned too (a dropped --width or swapped lat/lng in it
+    would otherwise be invisible).
+    """
+    row, newly = cli._resolve_geometry(conn, _cli_args(query, **kwargs))
     stored = db.resolve_city(conn, row.city_id)
     return (stored.center_lat, stored.center_lon), stored, newly
 
@@ -203,6 +229,12 @@ ARG_COMBOS = [
         CENTER_SOURCE_EXPLICIT,
         id="explicit-center-and-size",
     ),
+    pytest.param(
+        _dims(FRACTIONAL_DIMS),
+        GEOCODER_POINT,
+        CENTER_SOURCE_GEOCODER_EXPLICIT_DIMS,
+        id="fractional-size",
+    ),
 ]
 
 
@@ -212,23 +244,25 @@ def test_the_preview_and_the_registration_choose_the_identical_center(
 ):
     """
     The parity #186 is about: the preview runs first (it registers nothing),
-    then the real registration with identical args, and both must land on
-    the same point — the expected one, so a shared wrong answer fails too.
+    then the real run's registration (``cli._resolve_geometry``) with the SAME
+    args object, and both must land on the same point — the expected one, so a
+    shared wrong answer fails too — and on the same frozen dimensions and step.
     """
-    rc, previewed = preview(conn, **args)
+    rc, previewed, previewed_dims = preview(conn, **args)
     assert rc == 0
     assert db.resolve_city(conn, QUERY) is None, "a preview must not register"
 
-    registered, _row, newly = _register(conn, **args)
+    registered, row, newly = _run_registration(conn, **args)
     assert newly
     assert previewed == registered == expected
+    assert previewed_dims == (row.grid_width_m, row.grid_height_m, row.step_m)
 
 
 @pytest.mark.parametrize("args, expected, source", ARG_COMBOS)
 def test_the_preview_prints_its_center_and_where_it_came_from(
     conn, geocode, preview, capsys, args, expected, source
 ):
-    rc, _ = preview(conn, **args)
+    rc, _, _dims_ = preview(conn, **args)
     assert rc == 0
     out = capsys.readouterr().out
     # The same form the real run prints after resolving geometry.
@@ -238,7 +272,7 @@ def test_the_preview_prints_its_center_and_where_it_came_from(
 
 def test_the_preview_without_a_bbox_prints_the_fallback_source(conn, geocode, preview, capsys):
     geocode["loc"] = _Loc(bbox_center=None)
-    rc, previewed = preview(conn)
+    rc, previewed, _dims_ = preview(conn)
     assert rc == 0
     assert previewed == GEOCODER_POINT
     assert f"Center source: {CENTER_SOURCE_GEOCODER_NO_BBOX}" in capsys.readouterr().out
@@ -255,7 +289,7 @@ def test_a_registered_city_previews_and_resolves_its_frozen_center(conn, geocode
     capsys.readouterr()
 
     overrides = {**_center(EXPLICIT), **_dims(EXPLICIT_DIMS)}
-    rc, previewed = preview(conn, **overrides)
+    rc, previewed, _dims_ = preview(conn, **overrides)
     assert rc == 0
     assert previewed == BBOX_MIDPOINT
     assert f"Center source: {CENTER_SOURCE_FROZEN}" in capsys.readouterr().out
@@ -264,3 +298,51 @@ def test_a_registered_city_previews_and_resolves_its_frozen_center(conn, geocode
     assert not newly
     assert again == BBOX_MIDPOINT
     assert (row.grid_width_m, row.grid_height_m) == AUTO_DIMS
+
+
+def test_a_fractional_size_previews_the_dimensions_that_will_be_frozen(
+    conn, geocode, preview, capsys
+):
+    rc, _, dims = preview(conn, **_dims(FRACTIONAL_DIMS))
+    assert rc == 0
+    assert dims == (*FRACTIONAL_FROZEN, 20)
+    out = capsys.readouterr().out
+    assert f"Grid: {FRACTIONAL_FROZEN[0]}m x {FRACTIONAL_FROZEN[1]}m, step 20m, centered at" in out
+
+
+def test_a_new_spelling_of_a_registered_city_is_previewed_and_resolved_as_registered(
+    conn, geocode, preview, capsys, caplog
+):
+    """
+    A query with no alias yet that geocodes to an existing city_id is NOT a new
+    city: register_city's INSERT OR IGNORE keeps the existing row, so the
+    preview and the registration must both report its frozen geometry rather
+    than a center they would never freeze (#400 review). The overrides-ignored
+    warning fires, the spelling is aliased by the real registration only, and
+    newly_registered is False.
+    """
+    frozen, first, _ = _register(conn)
+    assert frozen == BBOX_MIDPOINT
+    assert db.resolve_city(conn, SECOND_SPELLING) is None, "no alias yet, or this tests nothing"
+    capsys.readouterr()
+
+    with caplog.at_level("WARNING"):
+        rc, previewed, dims = preview(conn, SECOND_SPELLING, **_dims(EXPLICIT_DIMS))
+    assert rc == 0
+    assert previewed == BBOX_MIDPOINT
+    assert dims == (*AUTO_DIMS, 20)
+    assert f"Center source: {CENTER_SOURCE_FROZEN}" in capsys.readouterr().out
+    assert "--width/--height ignored" in caplog.text
+    assert db.resolve_city(conn, SECOND_SPELLING) is None, "a preview must not alias"
+
+    caplog.clear()
+    with caplog.at_level("INFO", logger=cr.__name__):
+        center, row, newly = _run_registration(conn, SECOND_SPELLING, **_dims(EXPLICIT_DIMS))
+    assert not newly
+    assert row.city_id == first.city_id
+    assert center == BBOX_MIDPOINT
+    assert (row.grid_width_m, row.grid_height_m) == AUTO_DIMS
+    assert "--width/--height ignored" in caplog.text
+    assert "Grid center" not in caplog.text, "logged a center that was never frozen"
+    alias = db.resolve_city(conn, SECOND_SPELLING)
+    assert alias is not None and alias.city_id == first.city_id
