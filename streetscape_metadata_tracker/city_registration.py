@@ -49,10 +49,15 @@ class CityResolutionError(RuntimeError):
 
 def resolve_center(city_loc_data):
     """
-    Grid center from a geocode result: the OSM bounding-box midpoint when
-    available (correct — the grid dimensions are derived from that same bbox,
-    so the sampled rectangle actually covers the boundary), else the geocoder's
-    reported point as a fallback. Returns (lat, lng) or None.
+    Grid center for an AUTO-SIZED grid: the OSM bounding-box midpoint when
+    available (correct only because the grid dimensions are derived from that
+    same bbox, so the sampled rectangle actually covers the boundary), else the
+    geocoder's reported point as a fallback. Returns (lat, lng) or None.
+
+    A new city's center is chosen by ``choose_center``, which calls this only
+    on the auto-sizing path; use this directly only where the dimensions also
+    come from the bbox (register_frame.py) or where the caller explicitly asked
+    for the bbox midpoint (resize_city.py --recenter-osm).
     """
     if city_loc_data is None:
         return None
@@ -60,6 +65,72 @@ def resolve_center(city_loc_data):
     if center is not None:
         return center
     return (city_loc_data.latitude, city_loc_data.longitude)
+
+
+# Where a grid center came from, as printed by --check-boundary and logged at
+# registration. One vocabulary for both, so the preview and the real run can be
+# compared by eye as well as by coordinate.
+CENTER_SOURCE_EXPLICIT = "explicit --lat/--lng"
+CENTER_SOURCE_GEOCODER_EXPLICIT_DIMS = (
+    "geocoder point (--width/--height were explicit, so the OSM bbox midpoint does not apply)"
+)
+CENTER_SOURCE_BBOX_MIDPOINT = "OSM bbox midpoint (the grid is sized from that bbox)"
+CENTER_SOURCE_GEOCODER_NO_BBOX = "geocoder point (the geocode result carried no OSM bbox)"
+CENTER_SOURCE_FROZEN = "frozen catalog geometry"
+
+
+def choose_center(
+    city_loc_data,
+    *,
+    lat: float | None,
+    lng: float | None,
+    explicit_dimensions: bool,
+) -> tuple[float, float, str] | None:
+    """
+    The center a NEW city's grid is frozen on, and where it came from.
+
+    This is the one place that decision is made: ``resolve_or_register_city``
+    (the real registration) and ``cli._check_boundary`` (the preview) both
+    call it, so a preview cannot show a center the run would not freeze
+    (issue #186 — the two used to carry their own copies of the branch).
+
+    The rule, in precedence order:
+
+    1. Explicit ``lat``/``lng`` always win.
+    2. Explicit dimensions -> the geocoder's reported point. The OSM bbox
+       midpoint is justified ONLY when the grid dimensions are derived from
+       that same bbox; once the caller sized the grid themselves, the midpoint
+       centers a box on neither the boundary nor the city (Goiânia: 4.3 km off
+       downtown, because the municipality runs ~42 km north-south). The
+       geocoder's point is not verified to be downtown either — choosing a
+       better "downtown" source is #185 — but it is at least the place the
+       geocoder reports for the query.
+    3. Auto-sized grid -> the OSM bbox midpoint (``resolve_center``), falling
+       back to the geocoder's point when the result carries no bbox.
+
+    Returns:
+        (lat, lng, source) where source is one of the CENTER_SOURCE_*
+        strings, or None when there is no explicit center and no geocode
+        result (the caller decides whether that is an error or an exit code).
+
+    Example:
+        >>> choose_center(loc, lat=None, lng=None, explicit_dimensions=True)
+        (loc.latitude, loc.longitude, CENTER_SOURCE_GEOCODER_EXPLICIT_DIMS)
+    """
+    if lat is not None:
+        return lat, lng, CENTER_SOURCE_EXPLICIT
+    if city_loc_data is None:
+        return None
+    if explicit_dimensions:
+        return (
+            city_loc_data.latitude,
+            city_loc_data.longitude,
+            CENTER_SOURCE_GEOCODER_EXPLICIT_DIMS,
+        )
+    center_lat, center_lng = resolve_center(city_loc_data)
+    if city_loc_data.bbox_center is not None:
+        return center_lat, center_lng, CENTER_SOURCE_BBOX_MIDPOINT
+    return center_lat, center_lng, CENTER_SOURCE_GEOCODER_NO_BBOX
 
 
 def cap_dimensions(grid_width, grid_height, city):
@@ -96,8 +167,9 @@ def resolve_or_register_city(
 
     Note ``width``/``height`` bypass MAX_GRID_DIM_M entirely — that is the
     documented override — and, given without ``lat``/``lng``, they are applied
-    around the OSM bounding-box midpoint rather than downtown. Callers that
-    can refuse that combination should (see scheduler's assess-city).
+    around the geocoder's reported point (``choose_center``, #186), which
+    nobody has verified is downtown (#185). Callers that can refuse that
+    combination should (see scheduler's assess-city).
 
     Args:
         conn: open catalog connection (db.connect)
@@ -132,18 +204,17 @@ def resolve_or_register_city(
     # Unknown city: geocode once and register with frozen geometry
     city_loc_data = get_city_location_data(query)
 
-    if lat is not None:
-        center_lat, center_lng = lat, lng
-        # logger, not print: this module is imported by the scheduler as well as
-        # the CLI, and a library that writes to stdout puts its own diagnostics
-        # in the middle of a report the caller is composing.
-        logger.info(f"Using user-provided coordinates: {center_lat}, {center_lng}")
-    elif city_loc_data:
-        center_lat, center_lng = resolve_center(city_loc_data)
-    else:
+    chosen = choose_center(city_loc_data, lat=lat, lng=lng, explicit_dimensions=width is not None)
+    if chosen is None:
         raise CityResolutionError(
             f"Could not find coordinates for {query}. Provide them manually with --lat/--lng."
         )
+    center_lat, center_lng, center_source = chosen
+    # logger, not print: this module is imported by the scheduler as well as
+    # the CLI, and a library that writes to stdout puts its own diagnostics in
+    # the middle of a report the caller is composing. Same vocabulary as
+    # --check-boundary's output, so a preview and a run can be compared.
+    logger.info(f"Grid center {center_lat:.5f}, {center_lng:.5f} from {center_source}")
 
     if width is not None:
         grid_width, grid_height = width, height

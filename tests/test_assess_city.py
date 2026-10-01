@@ -238,16 +238,17 @@ def test_bad_arguments_exit_usage_without_opening_the_catalog(conn, monkeypatch,
 
 def test_the_size_without_center_refusal_explains_itself(conn, monkeypatch, tmp_path, caplog):
     """
-    cli.py tolerates --width/--height alone and centers the grid on the OSM
-    bounding-box midpoint, which for a river-bounded place is not downtown — and
-    the geometry is frozen forever. This command refuses instead, so the message
-    has to say why and name the flags that fix it.
+    cli.py accepts --width/--height alone and centers the grid on the
+    geocoder's reported point (#186), which nobody has verified is downtown
+    (#185) — and the geometry is frozen forever. This command refuses instead,
+    so the message has to say why and name the flags that fix it.
     """
     with caplog.at_level("ERROR"):
         rc, _connected = _refusal(monkeypatch, tmp_path, conn, width=5000, height=5000)
 
     assert rc == _sched.USAGE_EXIT_CODE
-    assert "bounding-box midpoint" in caplog.text
+    assert "geocoder's reported point" in caplog.text
+    assert "bounding-box midpoint" not in caplog.text
     assert "--lat/--lng" in caplog.text
 
 

@@ -53,9 +53,10 @@ from . import (
 from .analysis import calculate_run_stats, detect_systemic_failure, print_df_summary
 from .checkpointing import crawl_store_for, discard_checkpoint
 from .city_registration import (
+    CENTER_SOURCE_FROZEN,
     CityResolutionError,
     cap_dimensions,
-    resolve_center,
+    choose_center,
     resolve_or_register_city,
 )
 from .diff import compute_run_diff, generate_diff_filename, write_diff_detail
@@ -254,7 +255,8 @@ def parse_args():
         type=float,
         default=None,
         help="Search grid width in meters. Only used when the city is not "
-        "yet registered; registered cities reuse frozen geometry. "
+        "yet registered; registered cities reuse frozen geometry. Without "
+        "--lat/--lng the grid is centered on the geocoder's point for the query. "
         "(Default if inference fails: 1000m)",
     )
 
@@ -1168,18 +1170,24 @@ def _check_boundary(conn, args, vis_path: str) -> int:
         center_lat, center_lng = city_row.center_lat, city_row.center_lon
         grid_width, grid_height = city_row.grid_width_m, city_row.grid_height_m
         step = city_row.step_m
+        center_source = CENTER_SOURCE_FROZEN
     else:
         city_loc_data = get_city_location_data(args.city)
-        if args.lat is not None:
-            center_lat, center_lng = args.lat, args.lng
-        elif city_loc_data:
-            center_lat, center_lng = resolve_center(city_loc_data)
-        else:
+        # The same seam the real registration goes through, so the preview
+        # cannot show a center the run would not freeze (#186).
+        chosen = choose_center(
+            city_loc_data,
+            lat=args.lat,
+            lng=args.lng,
+            explicit_dimensions=args.width is not None,
+        )
+        if chosen is None:
             logging.error(
                 f"Could not find coordinates for {args.city}. "
                 f"Use --lat and --lng to provide them manually."
             )
             return 1
+        center_lat, center_lng, center_source = chosen
 
         if args.width is not None:
             grid_width, grid_height = args.width, args.height
@@ -1198,6 +1206,14 @@ def _check_boundary(conn, args, vis_path: str) -> int:
             city_id = db.derive_city_id(args.city, None, None)
 
     print(f"The search dimensions for {args.city} are {grid_width:.1f}m x {grid_height:.1f}m")
+    # The center too, in the same form a real run prints it: the preview used to
+    # report only dimensions, so a grid frozen in the wrong place was invisible
+    # without opening the HTML (#186).
+    print(
+        f"Grid: {grid_width}m x {grid_height}m, step {step}m, centered at "
+        f"{center_lat:.5f}, {center_lng:.5f}"
+    )
+    print(f"Center source: {center_source}")
 
     base_name = generate_base_filename(city_id, grid_width, grid_height, step)
     boundary_vis_full_path = os.path.join(vis_path, f"{base_name}_search_boundary.html")
