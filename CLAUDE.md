@@ -355,6 +355,7 @@ Keep any list a doc enumerates **alphabetical**, so two branches adding an entry
   - `mapillary-user-activity.md`
   - `pano-spacing.md`
   - `panoramax-feasibility.md`
+  - `panoramax-world-screen.md`
   - `publish-duration.md`
   - `undated-imagery-share.md`
 

@@ -123,6 +123,16 @@ Four things generalize beyond Panoramax.
 **(3) The control group is not garnish.** One screened-zero city measured 2 pictures, and that single row falsified the screen: the v1 z6 lattice the API root advertises silently OMITS populated cells (2.5–23.9% fewer pictures than v2's H3 grid over identical extents). Without controls the whole study would have rested on an instrument known to be lossy only in retrospect. The same pass also found a margin applied where cells are filtered and not where tiles are chosen, which vanished at tile seams for 108 cities.
 **(4) A "third state" can be an instrument artifact.** The search response's EXIF `field_of_view` is missing for 36% of pictures, while the tile `type` has no absent state; looking the same 2,136 pictures up in the tiles typed every one `flat`. Reconcile per picture before adding a bucket to a data model.
 
+### `panoramax-world-screen.md`
+
+Issue #406 — the #316 z6 screen pointed at eight regions instead of the catalog, to find untracked cities with 360° imagery worth registering: 235 tiles plus 4 searches, no refusal.
+The untracked supply is French municipal and metropolitan programmes (148 of 322 candidates; Strasbourg's bound is six times Des Moines'), while the 17 US candidates top out at 69,541 and the two probed were single drives.
+Three things generalize.
+**(1) Summing an upper bound over overlapping neighbourhoods inflates it multiplicatively**: the 2,180 place bounds add to 3.47× the pictures the screen decoded, so clustering is what makes the list readable and only rank order is robust.
+**(2) A reuse radius is not a coverage test**: Layton, Utah (320,065 360°) counts as "tracked" because it is 18.1 km from Ogden's point, while almost certainly outside Ogden's grid.
+**(3) An empty tile answered 204 on this host, not the 404 every Panoramax module and doc expects** — harmless by the code's reading, but invisible to the "every tile empty" guard.
+The Mapillary half is web research plus a Graph probe that stopped at request 2 on a payload-size 500 (`limit=2000`), so 42 of 44 planned probes were never sent; its one answer was a single-creator sweep.
+
 ### `publish-duration.md`
 
 Issues #218/#230 — how long the nightly publish actually takes, so `scheduler.PUBLISH_TIMEOUT_S` is sized rather than guessed;

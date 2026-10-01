@@ -914,6 +914,14 @@ Every property is a way the study could publish a confident wrong number:
 - The committed record (skipped until it exists): each summary recomputes from its own raw block — `access` included, or the recompute KeyErrors the night that stage joins the record — an unrun stage is an explicit null, no measured in-bbox count exceeds its city's screen upper bound, and **every control measured zero**, which is the one test that turns "a zero screen is conclusive" from an assumption into a measurement.
   The two tile instruments agree within the larger of 5% and **2 pictures**, with a second test asserting the absolute half is still needed: a ratio band alone silently demands EXACT agreement on any city where one picture exceeds 5%, and three of the eight cross-check cities are that small (Aberdeen 3, Pierre 7, Ridgeley 28).
 
+## The Panoramax candidate-city screen (issue #406)
+
+`tests/test_panoramax_world_screen.py` pins `scripts/panoramax_world_screen_{collect,analyze}.py`, offline; the raw outputs are gitignored, so nothing here reads them.
+
+- The sampling invariant: the region plan is the **235 tiles** the 2026-10-01 log records, split by region exactly as it was, a tile two regions share belongs to the first, and the dry run sends nothing.
+- The derivation on synthetic hexagons: the 10 km place radius from both sides, the 2,000-picture floor, a cluster reporting its ANCHOR's bound under its most POPULOUS member's name, the 20 km cluster radius, the 25 km catalog radius from both sides, and the US/Canada candidate threshold being the lower one.
+- The committed record against itself: request counts add to 239 with no refusal, the summary CSV regenerates every cluster count the metrics file carries (new, tracked, candidates, disabled), the ranked lists in the metrics are the CSV's rows in order, and no GeoNames population is published.
+
 ## Frontend node tests
 
 Frontend node tests cover the streetwalk render seam (manifest lookup + fetch-failure fallback, artifact-URL selection, key normalization, the fractional ramp, and initial view mode) by stubbing Leaflet and the panel's DOM, and `panoDateOrNull`'s reduced-precision shapes (issue #226), asserted on the LOCAL getters rather than `toISOString()`
