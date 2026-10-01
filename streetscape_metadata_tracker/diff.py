@@ -15,11 +15,13 @@ baseline may not (geocoder drift), in which case grid-point stats are None.
 
 import gzip
 import logging
+import re
 from dataclasses import dataclass, field
 
 import pandas as pd
 
 from .analysis import PRESENT_STATUSES
+from .naming import DEFAULT_PROVIDER, KNOWN_PROVIDERS, STREETWALK_DIFF_FILENAME_RE
 
 logger = logging.getLogger(__name__)
 
@@ -216,6 +218,39 @@ def generate_diff_filename(
     """
     provider_token = "" if provider == "gsv" else f"{provider}_"
     return f"{city_id}_diff_{provider_token}{from_date}_to_{to_date}.csv.gz"
+
+
+# The exact shape generate_diff_filename emits, and nothing looser (issue
+# #265): it is what scripts/sweep_orphan_diff_details.py uses to decide which
+# files in data/ are diff details at all, so a match is a licence to delete an
+# unreferenced file. Anchored on the '_diff_[provider_]DATE_to_DATE.csv.gz'
+# TAIL, which no run, walk or JSON artifact ends with — a city slug that
+# happens to contain '_diff_' cannot make a run CSV match. The provider token
+# is the explicit non-default alternation, as the generator never writes
+# 'gsv_'. Pinned against the generator's own output in tests/test_diff.py.
+# Ends in \Z, never $: '$' also matches before a trailing newline, and a
+# licence-to-delete pattern must not accept a name the generator cannot emit.
+_DIFF_PROVIDER_ALT = "|".join(p for p in KNOWN_PROVIDERS if p != DEFAULT_PROVIDER)
+DIFF_DETAIL_FILENAME_RE = re.compile(
+    r"^(?P<slug>.+?)_diff_"
+    rf"(?:(?P<provider>{_DIFF_PROVIDER_ALT})_)?"
+    r"(?P<from_date>\d{4}-\d{2}-\d{2})_to_(?P<to_date>\d{4}-\d{2}-\d{2})\.csv\.gz\Z"
+)
+
+
+def diff_detail_match(filename: str) -> re.Match | None:
+    """The full match of a grid OR walk diff detail basename against the shape
+    its generator emits (``generate_diff_filename`` here,
+    ``naming.generate_streetwalk_diff_filename``), or None. Both patterns
+    capture ``from_date`` and ``to_date``."""
+    return DIFF_DETAIL_FILENAME_RE.fullmatch(filename) or STREETWALK_DIFF_FILENAME_RE.fullmatch(
+        filename
+    )
+
+
+def is_diff_detail_filename(filename: str) -> bool:
+    """True for a grid OR walk diff detail basename (see ``diff_detail_match``)."""
+    return diff_detail_match(filename) is not None
 
 
 def write_diff_detail(diff: RunDiff, output_path: str) -> None:

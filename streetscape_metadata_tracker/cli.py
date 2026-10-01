@@ -81,7 +81,7 @@ from .download_panoramax import DEFAULT_TILE_JITTER as DEFAULT_PANORAMAX_JITTER
 from .download_panoramax import (
     DEFAULT_TILE_REQUESTS_PER_MINUTE as DEFAULT_PANORAMAX_REQUESTS_PER_MINUTE,
 )
-from .fileutils import load_city_csv_file
+from .fileutils import load_city_csv_file, remove_stale_diff_detail
 from .json_summarizer import (
     generate_aggregate_v2,
     generate_city_metadata_summary_as_json,
@@ -598,8 +598,39 @@ def _compute_and_record_diff(
 ):
     """
     Diff the new run against the previous one of the same provider, persist
-    the summary row (and detail csv.gz when there are changes), and return
-    the JSON change block.
+    the summary row, and return the JSON change block.
+
+    The published detail csv.gz is a function of the diff result (issue
+    #265), the rule ``walk_diff.compute_and_record_walk_diff`` shares: written
+    (overwriting) when the diff has changes, removed when it has none. Before
+    #265 it was only ever written, and ``db.record_diff`` is INSERT OR REPLACE,
+    so a recomputed no-change diff replaced the row with a NULL pointer and
+    stranded the file in ``data/`` — published, unreferenced.
+
+    No row lookup is needed, unlike the walk side, because the name the old
+    row held and the name derived here are the same string: both come from
+    the two runs' dates and the provider, and a run date is UNIQUE within a
+    (city, provider) series. A grid run is never replaced in place either.
+    ``register_run`` is a plain INSERT, and the runs table's UNIQUE
+    (city_id, provider, run_date) refuses a duplicate date before any diff is
+    computed; ``_collect_one_run``'s "nothing to do" check is only an early
+    exit for the LATEST run's date. A backdated ``--run-date`` matching an
+    older cataloged run gets past it and is refused before any diff, by the
+    existing-snapshot guard when that run's CSV name is on disk and by the
+    INSERT's UNIQUE constraint otherwise. And a
+    ``runs`` row cannot be deleted while a ``run_diffs`` row references
+    it (foreign keys are on; ``scripts/purge_tainted_runs.py`` removes the
+    diff rows AND their files first). So every call diffs a freshly inserted
+    ``to_run_id``, and the only file this pair can ever have had is the
+    deterministic one — which is what the no-changes branch removes, healing
+    an orphan left by a manually deleted row.
+
+    The "previous run file missing" return cannot strand a file: it fires
+    before any row or file is written, for a ``to_run_id`` that (per the
+    above) has no ``run_diffs`` row yet. A file already sitting at the
+    deterministic name there was orphaned by something else; it is left for
+    ``scripts/sweep_orphan_diff_details.py`` rather than deleted on behalf of
+    a comparison this call never made.
     """
     prev_csv_path = os.path.join(download_dir, prev_run.csv_filename)
     if not os.path.exists(prev_csv_path):
@@ -609,12 +640,15 @@ def _compute_and_record_diff(
     df_old = load_city_csv_file(prev_csv_path)
     diff = compute_run_diff(df_old, df_new)
 
+    detail_name = generate_diff_filename(
+        city_row.city_id, prev_run.run_date, run_date.isoformat(), provider=provider
+    )
     detail_filename = None
     if diff.has_changes:
-        detail_filename = generate_diff_filename(
-            city_row.city_id, prev_run.run_date, run_date.isoformat(), provider=provider
-        )
+        detail_filename = detail_name
         write_diff_detail(diff, os.path.join(download_dir, detail_filename))
+    else:
+        remove_stale_diff_detail(download_dir, detail_name)
 
     db.record_diff(
         conn,

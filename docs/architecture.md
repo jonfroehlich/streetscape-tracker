@@ -96,6 +96,15 @@ The steps below are per (city, provider, run_date):
    — csv renamed `*.rejected` (excluded from the publish glob), nonzero exit so the scheduler counts a failure.
    Otherwise `analysis.calculate_run_stats()` + `db.register_run()`.
 5. `diff.compute_run_diff()` vs the previous run of the same provider → `run_diffs` row + published detail file (`{city_id}_diff_[PROVIDER_]{FROM}_to_{TO}.csv.gz`; gsv keeps the tokenless form).
+   **A diff detail file is a function of the diff result, and the row's pointer is what gets removed** (#265): written (overwriting) when the diff has changes, removed when it has none, and for road walks also removed by the cleared row's own `detail_filename` before any re-diff decides anything (`db.delete_walk_diff_for_walk` returns those names).
+   Both families go through one remover, `fileutils.remove_stale_diff_detail`, which tolerates a missing file and logs rather than raises on any other `OSError`, because it runs after a paid-for crawl is cataloged.
+   Before #265 the file was only ever written, so a re-diff that came out with no changes, or a skipped walk re-diff, left it in `data/` with nothing pointing at it;
+   `scripts/sweep_orphan_diff_details.py` finds those, and a local removal does not reach the web server, since the publish rsync never passes `--delete`.
+   **Both collectors write the file BEFORE committing the row that names it, on purpose**: the per-run JSON, the aggregate and the streetwalk manifest all copy a row's `detail_filename` into a published `diff_file` link, so a row naming a file not yet written is the worse state, a dead link, while a briefly unreferenced file is linked from nowhere.
+   The cost lands on the sweep, which must not mistake a diff being written for an orphan.
+   It therefore lists the directory before reading the catalog, never deletes a file younger than `--min-age-hours` (24 by default), re-checks each name against both tables just before unlinking it, and refuses `--execute` while a `run-due` is in flight.
+   It opens the catalog read-only (`mode=rw` plus `PRAGMA query_only`, never `db.connect`, which would migrate it; `mode=ro` was measured to leave `-wal`/`-shm` sidecars behind on a WAL catalog).
+   It refuses a catalog of another schema version or one with no runs or walks, and it refuses `--execute` against a catalog that looks older than the disk, i.e. an unreferenced diff dated after its newest run or walk.
 6. `json_summarizer.generate_city_metadata_summary_as_json()` — per-run JSON v2, ages pinned to `run_date` (deterministic); gsv runs include the `google_panos` block, other providers only `all_panos`.
    Then `generate_aggregate_v2()` builds `cities.json.gz` (schema v3) from the DB: per city `{city_id, city, providers: {gsv: {latest, runs, change}, mapillary: {...}}}`, with per-provider global histograms.
 
