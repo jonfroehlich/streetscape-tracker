@@ -16,9 +16,10 @@ from datetime import date
 
 import pandas as pd
 
-from streetscape_metadata_tracker.analysis import calculate_run_stats
+from streetscape_metadata_tracker.analysis import OUT_OF_RADIUS, calculate_run_stats
 from streetscape_metadata_tracker.fileutils import load_city_csv_file
-from tests.conftest import make_city_df, write_city_csv_gz
+from streetscape_metadata_tracker.naming import generate_run_filename, generate_streetwalk_filename
+from tests.conftest import make_city_df, make_mapillary_city_df, write_city_csv_gz
 
 RUN_DATE = date(2026, 1, 15)
 
@@ -138,3 +139,61 @@ def test_absent_dates_stay_nat(data_dir):
     # 3 rows: two panos plus make_city_df's trailing ZERO_RESULTS point
     assert len(df) == 3
     assert df["capture_date"].isna().sum() == 2
+
+
+# --- issue #367: the loader is the query-radius seam ------------------------
+
+
+def _with_far_pano(df):
+    """Move the first pano ~1.1 km north of its query point (0.01 degrees)."""
+    df = df.copy()
+    df.loc[0, "pano_lat"] = float(df.loc[0, "query_lat"]) + 0.01
+    return df
+
+
+def _run_path(data_dir, provider):
+    name = generate_run_filename("bend--oregon--united-states", 100, 100, 20, RUN_DATE, provider)
+    return os.path.join(data_dir, name + ".csv.gz")
+
+
+def test_a_gsv_run_loads_its_far_pano_as_out_of_radius(data_dir):
+    """The default read applies the rule; raw=True returns the file as written,
+    which still records what Google said."""
+    path = _run_path(data_dir, "gsv")
+    write_city_csv_gz(
+        _with_far_pano(make_city_df([("far", "2024-01-01"), ("near", "2024-01-01")])), path
+    )
+
+    loaded = load_city_csv_file(path)
+    assert loaded["status"].tolist() == [OUT_OF_RADIUS, "OK", "ZERO_RESULTS"]
+    assert loaded["query_distance_m"].iloc[0] > 1000
+
+    raw = load_city_csv_file(path, raw=True)
+    assert raw["status"].tolist() == ["OK", "OK", "ZERO_RESULTS"]
+    assert "query_distance_m" not in raw.columns
+
+
+def test_a_census_run_is_never_filtered_by_the_loader(data_dir):
+    """Gated on the file's OWN provider token: a Mapillary census assigns
+    panos to points from exact tile geometry, so a far one is not an overshoot."""
+    path = _run_path(data_dir, "mapillary")
+    write_city_csv_gz(_with_far_pano(make_mapillary_city_df([("m1", "2024-01-01")])), path)
+
+    loaded = load_city_csv_file(path)
+    assert loaded["status"].iloc[0] == "OK"
+    assert "query_distance_m" not in loaded.columns
+
+
+def test_a_gsv_road_walk_is_never_filtered_by_the_loader(data_dir):
+    """A gsv road walk carries the gsv provider (no token) but is not a GRID
+    run: its sample-to-pano distance is bounded by the walk's own match
+    distance, so the gate reads the file KIND as well as the provider."""
+    name = generate_streetwalk_filename(
+        "bend--oregon--united-states", 100, 100, 20, 15, RUN_DATE, provider="gsv"
+    )
+    path = os.path.join(data_dir, name + ".csv.gz")
+    write_city_csv_gz(_with_far_pano(make_city_df([("far", "2024-01-01")])), path)
+
+    loaded = load_city_csv_file(path)
+    assert loaded["status"].iloc[0] == "OK"
+    assert "query_distance_m" not in loaded.columns

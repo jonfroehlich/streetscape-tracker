@@ -811,6 +811,32 @@ def test_the_argv_carries_the_shortened_window_for_a_clamped_child(tmp_path):
     assert _policy_in(_walk_cmd(cfg, child_timeout_s=300)).max_attempts == 1
 
 
+def test_a_forwarded_clock_budget_sizes_the_window_not_the_kill(tmp_path):
+    """Issue #344 review: the census deadline runs from the child's process
+    start and the Overpass fetch spends out of it, so a window sized to the
+    SIGKILL alone can end after the census may no longer admit its first unit
+    -- a plain DownloadError for 0 requests. With `max_seconds` forwarded, the
+    window is sized to IT: the same generous kill timeout that leaves the
+    configured window alone must now shorten it."""
+    cfg = _load(tmp_path, _NON_DEFAULT_TOML)
+    # mapillary_streets, not gsv_streets: production hands `max_seconds` only
+    # to a resumable walk, so that is the channel this has to hold for.
+    walk = "mapillary_streets"
+    unclocked = _policy_in(_walk_cmd(cfg, walk, child_timeout_s=10_800))
+    assert unclocked == _NON_DEFAULT, "the kill alone leaves this window alone"
+    # 1,000 s less the 300 s census-start reserve is 700 s, which the policy's
+    # own 360 s of reserves shorten to a 340 s window. With no census reserve
+    # the same budget leaves 640 s, which fits the configured 480 s window and
+    # changes nothing -- so the reserve is what this pins.
+    clocked = _policy_in(_walk_cmd(cfg, walk, child_timeout_s=10_800, max_seconds=1_000))
+    assert clocked == policy_for_child_timeout(
+        _NON_DEFAULT, 1_000 - scheduler._CENSUS_START_RESERVE_S
+    )
+    assert clocked == replace(_NON_DEFAULT, window_s=340)
+    assert clocked.window_s < unclocked.window_s
+    assert scheduler._CENSUS_START_RESERVE_S > 0
+
+
 @pytest.mark.parametrize("channel", sorted(scheduler.STREET_CHANNELS))
 def test_the_production_dispatch_shrinks_the_window_for_a_clamped_child(
     tmp_path, monkeypatch, channel

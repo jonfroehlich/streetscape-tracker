@@ -28,7 +28,7 @@ from streetscape_metadata_tracker.scheduler import (
     SchedulerConfig,
     cmd_import_bundle,
 )
-from tests.conftest import make_mapillary_city_df, write_city_csv_gz
+from tests.conftest import make_city_df, make_mapillary_city_df, write_city_csv_gz
 
 RUN_DATE = date(2026, 9, 10)
 CITY = dict(
@@ -289,6 +289,26 @@ def test_spend_is_ledgered_only_for_credentials_this_host_shares(cfg, bundle_dir
     charged = dict(_prod(cfg).execute("SELECT provider, requests FROM api_usage").fetchall())
     assert charged == {"gsv_streets": SAMPLE_POINTS}
     assert "mapillary_streets" not in charged
+
+
+def test_imported_spend_never_reaches_this_hosts_rolling_window(cfg, bundle_dir):
+    """Issue #385: imported spend happened on the LAPTOP's IP.
+
+    KartaView is the one channel that is both ledgered here (the credential is
+    shared, so its daily row is charged) AND metered per host, so it is the case
+    where the two ledgers must disagree: the daily row lands, the host_usage row
+    must not -- or this host's rolling-24h window would defer tonight's work
+    over requests another address made.
+    """
+    laptop = db.connect(str(bundle_dir / bundle_import.CATALOG_NAME))
+    db.add_api_usage(laptop, RUN_DATE, 50, provider="kartaview")
+    laptop.close()
+
+    assert cmd_import_bundle(cfg, str(bundle_dir), execute=True) == 0
+    prod = _prod(cfg)
+    charged = dict(prod.execute("SELECT provider, requests FROM api_usage").fetchall())
+    assert charged.get("kartaview") == 50, "the daily ledger is still charged"
+    assert prod.execute("SELECT COUNT(*) FROM host_usage").fetchone()[0] == 0
 
 
 def test_no_cadence_row_for_a_channel_the_scheduler_cannot_run(cfg, bundle_dir, monkeypatch):
@@ -796,3 +816,61 @@ def test_every_problem_is_reported_not_just_the_first(cfg, bundle_dir, capsys):
     out = capsys.readouterr().out
     assert "refusing to collide" in out
     assert "append-only" in out
+
+
+def _gsv_run_with_far_pano(run_date):
+    """A GSV run whose first pano sits ~1.1 km from its query point (issue #367)."""
+    df = make_city_df(
+        [("far", "2024-05-01"), ("near", "2024-05-01")],
+        run_date=run_date,
+        grid_origin=(CITY["center_lat"], CITY["center_lon"]),
+        n_empty=2,
+    )
+    df.loc[0, "pano_lat"] = df.loc[0, "query_lat"] + 0.01
+    return df
+
+
+def test_an_imported_gsv_run_is_cataloged_and_diffed_under_the_query_radius(cfg, bundle_dir):
+    """The importer's frame feeds both the catalog stats AND the diff against
+    this host's previous run. The previous run is reloaded through the
+    query-radius seam by the collector's own diff, so the imported frame must
+    come through it too, or a far pano present in both runs reads as a pano
+    ADDED by the import."""
+    stem = generate_run_filename(
+        CITY_ID, CITY["grid_width_m"], CITY["grid_height_m"], CITY["step_m"], date(2026, 6, 1)
+    )
+    conn = db.connect(cfg.db_path)
+    db.register_city(conn, **CITY)
+    write_city_csv_gz(
+        _gsv_run_with_far_pano(date(2026, 6, 1)), os.path.join(cfg.data_dir, stem + ".csv.gz")
+    )
+    db.register_run(
+        conn,
+        city_id=CITY_ID,
+        run_date=date(2026, 6, 1),
+        csv_filename=stem + ".csv.gz",
+        json_filename=stem + ".json.gz",
+    )
+    conn.close()
+
+    run_csv, run_json = _run_names(provider="gsv")
+    bconn = db.connect(str(bundle_dir / bundle_import.CATALOG_NAME))
+    write_city_csv_gz(_gsv_run_with_far_pano(RUN_DATE), str(bundle_dir / run_csv))
+    (bundle_dir / run_json).write_bytes(gzip.compress(b'{"metadata": {"schema_version": 2}}'))
+    db.register_run(
+        bconn, city_id=CITY_ID, run_date=RUN_DATE, csv_filename=run_csv, json_filename=run_json
+    )
+    bconn.close()
+
+    assert cmd_import_bundle(cfg, str(bundle_dir), execute=True) == 0
+    prod = _prod(cfg)
+    row = prod.execute(
+        "SELECT run_id, status_out_of_radius, coverage_rate_pct FROM runs WHERE csv_filename = ?",
+        (run_csv,),
+    ).fetchone()
+    assert row["status_out_of_radius"] == 1
+    assert row["coverage_rate_pct"] == 25.0  # 1 of 4 points, not 2 of 4
+    diff = prod.execute(
+        "SELECT panos_added, panos_removed FROM run_diffs WHERE to_run_id = ?", (row["run_id"],)
+    ).fetchone()
+    assert (diff["panos_added"], diff["panos_removed"]) == (0, 0)

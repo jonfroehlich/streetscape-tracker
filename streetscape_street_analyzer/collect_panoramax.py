@@ -148,6 +148,7 @@ async def collect_panoramax_street_samples_async(
     max_requests_per_minute: int = DEFAULT_TILE_REQUESTS_PER_MINUTE,
     jitter: float = DEFAULT_TILE_JITTER,
     max_requests: int | None = None,
+    deadline_monotonic: float | None = None,
     checkpoint_path: str | None = None,
     checkpoint_channel: str | None = None,
     checkpoint_variant: str | None = None,
@@ -186,6 +187,9 @@ async def collect_panoramax_street_samples_async(
     grid sweep itself paused), so without it the cheapest-looking channel of the
     night is the one nothing bounds.
 
+    ``deadline_monotonic`` is the same stop on the clock (issue #344), forwarded
+    to the census untouched; see :func:`download_panoramax._fetch_city_images`.
+
     **No ``access_token`` parameter, and that is not an omission.** Panoramax
     reads are unauthenticated, so there is no credential to thread; the
     ``panoramax_streets`` channel is declared credential-free in
@@ -218,6 +222,7 @@ async def collect_panoramax_street_samples_async(
         max_requests_per_minute=max_requests_per_minute,
         jitter=jitter,
         max_requests=max_requests,
+        deadline_monotonic=deadline_monotonic,
         checkpoint_path=checkpoint_path,
         checkpoint_channel=checkpoint_channel,
         checkpoint_variant=checkpoint_variant,

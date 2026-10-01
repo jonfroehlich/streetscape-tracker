@@ -41,7 +41,8 @@ What the absence needs instead is a **notice**: with publishing off, the printed
 The realistic victim is not a dev laptop but prod with publishing switched off during a block or a maintenance window.
 Exit stays 0 there, on the same reasoning that makes `--no-publish` exit 0 — only an *attempted* publish that failed is a failure.
 Refusals mirror #214's: an unpaired `--width/--height`, a `--provider` naming the grid channel or an unknown/disabled one, and a config with no assess channel enabled all exit `USAGE_EXIT_CODE` **before the catalog is opened**.
-`--width/--height` without `--lat/--lng` is refused where `cli.py` merely tolerates it, because size alone freezes the grid on the OSM bbox midpoint rather than downtown — the right size in the wrong place, permanently.
+`--width/--height` without `--lat/--lng` is refused where `cli.py` accepts it.
+`cli.py` now centers such a grid on the geocoder's reported point rather than the OSM bbox midpoint (#186), but nobody has verified that point is downtown (#185), and an assessment freezes geometry for a partner answer — a guess there is the right size in possibly the wrong place, permanently.
 
 ## Publishing is declared in config, not inherited from the environment (`[publish].local`)
 
@@ -51,6 +52,39 @@ So any hand-run publish on makelab2 (`regenerate-aggregate --publish`, and now `
 `[publish].local = true` (set in `scheduler.makelab1.toml`) makes `_publish` pass `--local` explicitly, so the two invocation paths are identical;
 the unit still exports the variable, harmlessly, so a code rollback cannot break nightly publishing.
 `[publish].site_url` is used for nothing but printing operator-facing links.
+
+## Deploying a stats-definition change
+
+Written for the GSV query radius (issue #367), and the procedure for any change to what a stored stat means.
+**The repair is a required deploy step, not an optional follow-up.**
+The night after the code lands, every newly collected run is cataloged under the new definition while every older row keeps the old one.
+The aggregate (`cities.json.gz`) and the driving page read the STORED `runs` columns, so every re-collected city would show a step change that is only the definition moving — for #367, a phantom drop of about 10% in GSV coverage.
+
+Stop nothing, but finish these before the next 02:00 timer fires:
+
+```bash
+cd ~/streetscape-tracker && git pull          # deploy the code; the catalog migrates on first connect
+# 1. Dry run: prints every run that would change, and why. Read it before step 2.
+.venv-makelab2/bin/python scripts/recompute_run_stats.py \
+    --data-dir /projects/makeabilitylab/streetscape-tracker/data --provider gsv
+# 2. Apply to the catalog AND rebuild the affected per-run JSONs.
+.venv-makelab2/bin/python scripts/recompute_run_stats.py \
+    --data-dir /projects/makeabilitylab/streetscape-tracker/data --provider gsv \
+    --execute --regenerate-json >> logs/recompute_367.log 2>&1
+# 3. Rebuild the aggregate from the repaired catalog and publish it.
+.venv-makelab2/bin/python -m streetscape_metadata_tracker.scheduler \
+    --config config/scheduler.makelab1.toml regenerate-aggregate --publish
+```
+
+`--data-dir` is passed explicitly so the command names the same catalog `[paths].data_dir` names; on prod the checkout's own `data/` is that directory, so the flag is a statement of intent rather than a correction.
+`--provider gsv` is not only a filter: `--regenerate-json` re-reads every rebuilt run's CSV, and a census CSV is millions of rows.
+Step 2 is a whole-series pass over every GSV CSV, so budget hours rather than minutes; drive it into a file, never a pipe.
+If it cannot finish before 02:00, disable the timer for the night (`systemctl --user disable --now streetscape-tracker.timer`, and `enable --now` after step 3; never `stop`, which the #369 watchdog re-arms) rather than let a night catalog runs beside a half-repaired series.
+
+**What the repair does NOT move.**
+Historical `run_diffs` rows and the published diff detail CSVs stay under the old definition: `recompute_run_stats.py` re-derives run stats, never diffs, and nothing re-diffs a GSV series yet.
+So after #367 a city's "Changes since" panel for an old pair can still count a far pano as added or removed, until a GSV re-diff pass exists (a follow-up).
+Diffs computed from the deploy on are correct, because both of their sides load through the new rule.
 
 ## Landing a laptop investigation in this catalog: `scheduler import-bundle` (issue #330)
 

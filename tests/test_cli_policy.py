@@ -10,6 +10,7 @@ and ledger recording for failed downloads. No network.
 """
 
 import asyncio
+import logging
 import os
 import sys
 from datetime import date
@@ -24,6 +25,7 @@ from streetscape_metadata_tracker.download_common import (
     HOST_BUSY_EXIT_CODES,
     HOST_EXIT_CODES,
     HOST_MAPILLARY_TILES,
+    PROCESS_STARTED_MONOTONIC,
     SWEEP_INCOMPLETE_EXIT_CODE,
     DownloadError,
     HostBlockedError,
@@ -135,6 +137,13 @@ def gsv_configs(monkeypatch):
 
 
 # ── Skip policy ─────────────────────────────────────────────────────────────
+
+
+def _host_spend(conn, provider):
+    """What ``provider`` charged to the per-host rolling ledger (issue #385)."""
+    return conn.execute(
+        "SELECT COALESCE(SUM(requests), 0) FROM host_usage WHERE provider = ?", (provider,)
+    ).fetchone()[0]
 
 
 def test_skip_when_recent_run(monkeypatch, catalog):
@@ -548,6 +557,10 @@ def test_a_blocked_host_still_records_what_it_spent(monkeypatch, catalog):
 
     run_cli(monkeypatch, city_id, data_dir, provider="mapillary")
     assert db.get_api_usage(conn, RUN_DATE, provider="mapillary") == 5
+    # ...and the per-host rolling ledger (issue #385), through the same seam:
+    # this is the FAILED-download arm's add_api_usage, and the refused requests
+    # are exactly the ones the tile CDN counted against this IP.
+    assert _host_spend(conn, "mapillary") == 5
 
 
 # ── Registration-time grid cap (issue #166) ─────────────────────────────────
@@ -689,6 +702,10 @@ def test_a_resumed_census_row_takes_the_crawl_and_the_ledger_this_process(monkey
     assert db.get_api_usage(conn, RUN_DATE, provider="mapillary") == 9, (
         "the additive daily ledger must carry only this process's spend"
     )
+    # The success arm's add_api_usage meters the host too (issue #385), with the
+    # same per-process figure -- the rolling window counts requests made, and a
+    # resumed crawl's earlier nights were charged on those nights.
+    assert _host_spend(conn, "mapillary") == 9
 
 
 def test_the_census_checkpoint_is_discarded_only_after_the_run_row_lands(monkeypatch, catalog):
@@ -887,6 +904,42 @@ def test_a_paused_sweep_prints_paused_not_failed(monkeypatch, catalog, capsys):
     out = capsys.readouterr().out
     assert "PAUSED: kartaview checkpointed at 2/16 root cells" in out
     assert "FAILED" not in out
+
+
+@pytest.mark.parametrize("stopped_by", ["clock", "requests"])
+def test_the_grid_pause_line_names_the_ceiling_the_scheduler_reads_back(
+    monkeypatch, catalog, caplog, stopped_by
+):
+    """
+    Issue #344 review: the scheduler says WHICH ceiling paused a child by
+    reading the child's own pause line (`_pause_stop_phrase`), so that line is
+    a cross-process contract -- and the scheduler-side test feeds a hand-written
+    one. This pins the REAL line cli.py logs, for both kinds.
+    """
+    from streetscape_metadata_tracker.download_common import SWEEP_STOP_PHRASES
+    from streetscape_metadata_tracker.scheduler import _pause_stop_phrase
+
+    conn, city_id, data_dir = catalog
+    mapillary_configs(monkeypatch)
+    error = SweepIncompleteError(
+        "stopped",
+        checkpoint_path="/cp",
+        units_done=2,
+        unit_count=16,
+        unit_name="tiles",
+        stopped_by=stopped_by,
+    )
+
+    async def stub(**kwargs):
+        raise error
+
+    monkeypatch.setattr(cli, "download_mapillary_metadata_async", stub)
+    with caplog.at_level(logging.INFO):
+        assert (
+            run_cli(monkeypatch, city_id, data_dir, provider="mapillary")
+            == SWEEP_INCOMPLETE_EXIT_CODE
+        )
+    assert _pause_stop_phrase(caplog.text) == SWEEP_STOP_PHRASES[stopped_by]
 
 
 def test_the_checkpoint_is_discarded_only_after_the_runs_row_commits(monkeypatch, catalog):
@@ -1500,3 +1553,107 @@ def test_a_reused_census_says_so_in_the_summary(monkeypatch, catalog, capsys):
     out = capsys.readouterr().out
     assert "Census REUSED" in out
     assert "fetched by mapillary" in out
+
+
+@pytest.mark.parametrize("provider", ["kartaview", "mapillary", "panoramax"])
+def test_the_wall_clock_budget_reaches_its_own_downloader_as_a_deadline(
+    monkeypatch, catalog, provider
+):
+    """
+    ``--{provider}-max-seconds N`` must arrive as ``deadline_monotonic`` =
+    PROCESS_STARTED_MONOTONIC + N, on THAT provider only (issue #344).
+
+    Three cases per provider, because each pins a different wrong wiring: the
+    flag reaching the downloader at all (not just parsing), measured from process
+    start rather than from "now", and a SIBLING provider's flag not being read
+    in its place -- the copy-paste shape three near-identical dispatch arms
+    invite. Absent, it is None: a manual run has no clock stop.
+    """
+    conn, city_id, data_dir = catalog
+    gsv_configs(monkeypatch)
+    attr = EXPECTED_DOWNLOADER[provider]
+    sibling = next(p for p in ("kartaview", "mapillary", "panoramax") if p != provider)
+
+    def run(*extra, run_date):
+        calls = []
+        monkeypatch.setattr(cli, attr, stub_downloader(calls))
+        # --force and a fresh date per call: the second run of one city inside
+        # 80 days is otherwise a skip, which reaches no downloader at all.
+        exit_code = run_cli(
+            monkeypatch, city_id, data_dir, "--force", *extra, provider=provider, run_date=run_date
+        )
+        assert exit_code == 0
+        return calls[0]["deadline_monotonic"]
+
+    assert run(f"--{provider}-max-seconds", "30", run_date=date(2026, 7, 1)) == (
+        PROCESS_STARTED_MONOTONIC + 30
+    )
+    assert run(run_date=date(2026, 7, 2)) is None
+    assert run(f"--{sibling}-max-seconds", "30", run_date=date(2026, 7, 3)) is None
+
+
+@pytest.mark.parametrize("provider", ["kartaview", "mapillary", "panoramax"])
+def test_each_downloader_hands_its_deadline_to_the_crawl_it_wraps(tmp_path, monkeypatch, provider):
+    """
+    The hop BETWEEN the two tested layers (#344 review): the CLI test above
+    stubs ``download_{provider}_metadata_async`` itself and the collector tests
+    enter at ``fetch_city_images_async``, so deleting the one
+    ``deadline_monotonic=`` line in the downloader left the suite green. Pinned
+    here at the layer that consumes it, with a value no default could produce.
+    """
+    import importlib
+
+    module = importlib.import_module(f"streetscape_metadata_tracker.download_{provider}")
+    seen = {}
+
+    class Reached(Exception):
+        pass
+
+    async def fake_fetch(*args, **kwargs):
+        seen.update(kwargs)
+        raise Reached
+
+    monkeypatch.setattr(module, "fetch_city_images_async", fake_fetch)
+    outer = getattr(module, f"download_{provider}_metadata_async")
+    kwargs = {
+        "city_name": "Bend",
+        "center_lat": 44.05,
+        "center_lon": -121.31,
+        "grid_width": 1000,
+        "grid_height": 1000,
+        "step_length": 20,
+        "output_csv_gz_path": str(tmp_path / "out.csv.gz"),
+        "deadline_monotonic": 12_345.5,
+        "checkpoint_path": str(tmp_path / "cp"),
+    }
+    if provider != "panoramax":  # the one credential-free provider
+        kwargs["access_token"] = "tok"
+    with pytest.raises(Reached):
+        asyncio.run(outer(**kwargs))
+    assert seen["deadline_monotonic"] == 12_345.5
+
+
+@pytest.mark.parametrize("entry", ["cli", "collect"])
+@pytest.mark.parametrize("provider", ["kartaview", "mapillary", "panoramax"])
+def test_every_clock_flag_refuses_zero_at_parse_time(monkeypatch, entry, provider):
+    """
+    0 is not "off" on the clock any more than on a cap (#344 review): a crawl
+    stopped before its first commit exits 83 printing "re-run to resume" -- a
+    loop. Every `--*-max-seconds` flag on BOTH entry points must carry
+    positive_int, so a `type=int` in the shared declaration fails here. 1 is
+    accepted, which pins the boundary rather than a blanket refusal.
+    """
+    from streetscape_street_analyzer import collect
+
+    flag = f"--{provider}-max-seconds"
+
+    def parse(value):
+        if entry == "cli":
+            monkeypatch.setattr(sys, "argv", ["streetscape_tracker.py", "Bend, OR", flag, value])
+            return cli.parse_args()
+        return collect.build_parser().parse_args([flag, value, "--", "Bend, OR"])
+
+    with pytest.raises(SystemExit) as excinfo:
+        parse("0")
+    assert excinfo.value.code == 2
+    assert getattr(parse("1"), f"{provider}_max_seconds") == 1
