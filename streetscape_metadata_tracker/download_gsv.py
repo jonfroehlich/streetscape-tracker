@@ -508,6 +508,13 @@ async def collect_points_async(
     if max_requests_per_minute > 0:
         logger.info(f"Client-side rate limit: {max_requests_per_minute} requests/minute")
 
+    # A connection_limit below 1 used to mean "no limit" to TCPConnector; since
+    # #304 it also sizes the in-flight semaphore, where 0 would block every
+    # request forever with no timeout running (aiohttp's clock starts inside
+    # the slot). Refuse it up front rather than hang a run (#304 review).
+    if connection_limit < 1:
+        raise ValueError(f"connection_limit must be at least 1, got {connection_limit}")
+
     # Derive working file paths from the requested output path
     if not output_csv_gz_path.endswith(".csv.gz"):
         raise ValueError(f"output_csv_gz_path must end in .csv.gz, got: {output_csv_gz_path}")
@@ -606,9 +613,14 @@ async def collect_points_async(
                 Collect ``pass_points`` in batches with up to PIPELINE_DEPTH
                 batches in flight, writing each batch in submission order.
                 ``api_requests`` counts a batch when it is scheduled (as the
-                sequential loop did), so a failure mid-pass can over-count by at
-                most (PIPELINE_DEPTH - 1) x batch_size never-sent requests --
-                the conservative direction for the budget ledger.
+                sequential loop did), so a failure mid-pass can count up to
+                (PIPELINE_DEPTH - 1) x batch_size more requests than the
+                sequential engine would have: the batches fetched ahead, which
+                are cancelled and may or may not have reached the server --
+                the conservative direction for the budget ledger. A kill
+                likewise loses up to PIPELINE_DEPTH x batch_size answered but
+                unwritten requests (one batch before #304), which a same-date
+                resume re-requests.
                 """
                 nonlocal api_requests
                 inflight: collections.deque = collections.deque()

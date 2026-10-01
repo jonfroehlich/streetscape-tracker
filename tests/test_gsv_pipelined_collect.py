@@ -397,3 +397,34 @@ def test_a_close_failure_does_not_mask_the_download_error_or_its_spend(
     lock = FileLock(out[: -len(".gz")] + ".downloading.runlock", timeout=0)
     lock.acquire()
     lock.release()
+
+
+@pytest.mark.parametrize("bad", [0, -1])
+def test_a_connection_limit_below_one_is_refused_not_hung(tmp_path, monkeypatch, bad):
+    """#304 review: ``connection_limit`` now also sizes the in-flight
+    semaphore. Before #304, 0 reached only ``TCPConnector(limit=0)``, which
+    aiohttp reads as "no limit"; as a semaphore size it would block every
+    request forever, and no timeout runs while a request waits for its slot.
+    It must be refused before the run lock is taken, not hang a run. The
+    wait_for turns a regression into a failure rather than a hung suite."""
+    calls = []
+
+    async def zero_fetch(lat, lon, api_key, session, timeout, limiter=None):
+        calls.append(1)
+        return {"status": "ZERO_RESULTS"}
+
+    monkeypatch.setattr(dg, "fetch_gsv_pano_metadata_async", zero_fetch)
+    out = str(tmp_path / "zero_width_40_height_40_step_20_2026-09-30.csv.gz")
+
+    async def run():
+        return await asyncio.wait_for(
+            dg.collect_points_async(
+                _points(4), "K", out, batch_size=2, connection_limit=bad, max_requests_per_minute=0
+            ),
+            timeout=5,
+        )
+
+    with pytest.raises(ValueError, match="connection_limit must be at least 1"):
+        asyncio.run(run())
+    assert calls == []
+    assert not os.path.exists(out[: -len(".gz")] + ".downloading.runlock")

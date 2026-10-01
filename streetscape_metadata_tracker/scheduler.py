@@ -7742,7 +7742,7 @@ def _run_city_channels(
             f"measured history; clamping to {MAX_PER_CHILD_CONNECTION_LIMIT}. Lower "
             f"connection_limit to match the lane count, or raise "
             f"MAX_PER_CHILD_CONNECTION_LIMIT deliberately with a memory measurement "
-            f"(and a batch_size raise) behind it."
+            f"behind it (and a batch_size raise only past PIPELINE_DEPTH x batch_size)."
         )
         lane_connection_limit = MAX_PER_CHILD_CONNECTION_LIMIT
     # Channels not yet launched, in canonical (most-expensive-first) order. A
