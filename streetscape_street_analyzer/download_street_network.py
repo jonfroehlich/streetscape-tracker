@@ -40,7 +40,9 @@ from streetscape_metadata_tracker.download_common import (
     OVERPASS_USER_AGENT,
     DownloadError,
     HostBlockedError,
+    _pinned_like_osmnx,
     grid_bbox,
+    normalize_overpass_url,
 )
 from streetscape_metadata_tracker.host_lock import host_lock
 from streetscape_metadata_tracker.naming import (
@@ -116,10 +118,15 @@ def _apply_overpass_url() -> None:
     the handle an operator reaches for at 03:00 during an incident, and an
     import-time read cannot be exercised by a test or changed without a
     restart. Idempotent, so calling it per fetch costs nothing.
+
+    The host is lowercased on the way in (``normalize_overpass_url``): osmnx
+    pins its query to one address only when the host urllib3 resolves --
+    always lowercase -- equals the one in this URL, so a mixed-case mirror
+    would leave the query unpinned while the pre-flight is pinned (#366).
     """
     override = os.environ.get(OVERPASS_URL_ENV)
     if override:
-        ox.settings.overpass_url = override
+        ox.settings.overpass_url = normalize_overpass_url(override)
 
 
 _apply_overpass_url()
@@ -282,6 +289,19 @@ def _overpass_refusing(url: str | None = None) -> str | None:
     also keeps the probe indistinguishable from the query it is speaking for,
     which is what the Overpass usage policy asks for.
 
+    It also CONNECTS the way osmnx does (issue #366), through
+    ``download_common._pinned_like_osmnx``: osmnx resolves the host with
+    ``socket.gethostbyname`` -- one address, always IPv4 -- and pins its query
+    there, while plain ``requests`` takes whatever ``getaddrinfo`` prefers, which
+    on a dual-stack host can be IPv6. Overpass identifies a client by its full
+    IPv4 address or its IPv6 /64, so an unpinned probe could be asking about a
+    different client than the one the walk is about to be. A failed lookup
+    raises inside the guard below and so returns None, fail-OPEN like every
+    other can't-tell: the real fetch then resolves the host its own way (osmnx
+    falls back to DNS-over-HTTPS) and produces the real error if there is one.
+    ``gethostbyname`` takes no timeout, so the 15 s bounds the GET, not the
+    lookup.
+
     The whole body is guarded, not just the request. ``ox._http`` is a private
     osmnx API and ``requirements.txt`` pins ``osmnx>=2.0`` with no ceiling, so a
     rename would otherwise raise ``AttributeError`` from an advisory pre-flight
@@ -290,7 +310,9 @@ def _overpass_refusing(url: str | None = None) -> str | None:
     """
     try:
         base = (url or ox.settings.overpass_url).rstrip("/")
-        response = requests.get(f"{base}/status", timeout=15, headers=ox._http._get_http_headers())
+        headers = ox._http._get_http_headers()
+        with _pinned_like_osmnx(base):
+            response = requests.get(f"{base}/status", timeout=15, headers=headers)
         if response.status_code in _OVERPASS_REFUSAL_STATUSES:
             return f"its status endpoint answered HTTP {response.status_code}"
     except Exception:  # noqa: BLE001 - advisory by contract; see docstring
@@ -517,6 +539,9 @@ def fetch_graph(
         # ours answers "is this host refused?" and is the only thing that can
         # short-circuit. /status is unmetered, so the extra request costs
         # nothing. Do not "de-duplicate" these into one.
+        #
+        # It connects to the one IPv4 address osmnx's query will (issue #366),
+        # so the probe and the query are the same client to Overpass.
         refusing = _overpass_refusing()
         if refusing:
             raise HostBlockedError(

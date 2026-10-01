@@ -123,7 +123,7 @@ CHANNEL_METERED_HOST: dict[str, str] = {
 
 # Per-provider socket ceilings for a ROAD WALK (issues #99, #331). One
 # `--connection-limit` flag serves four arms whose hosts are not alike, so 50 --
-# a GSV number -- is a default only two of them should inherit.
+# a GSV number -- is a default only gsv should inherit.
 #
 # These live HERE, beside the hosts they are about, rather than beside the
 # collector that reads them, for the same reason the Overpass identity strings
@@ -132,16 +132,45 @@ CHANNEL_METERED_HOST: dict[str, str] = {
 # drag osmnx/geopandas into the long-lived parent process under a cgroup memory
 # cap (measured 2026-09-21: 1.04 s to import, both modules resident after).
 #
-# gsv and mapillary keep the 50 they have always walked at. Panoramax is 5
-# because that is what ITS GRID RUN uses -- `cli.py` passes no connection_limit
-# for this provider, so `download_panoramax`'s own default applies -- and a walk
-# quietly holding ten times the sockets against a volunteer-run instance with no
-# documented rate limit, no `Retry-After` and no credential to identify us by is
-# the one asymmetry here worth removing. The rate limiter bounds the RATE either
-# way; what this bounds is sockets held open while the instance is slow, which
-# is the failure mode an unmetered host shows first.
+# gsv keeps the 50 it has always walked at: Google's metadata endpoint is not a
+# per-IP host here, and its own grid arm is the one `cli.py` forwards
+# `--connection-limit` to.
+#
+# Panoramax is 5 because that is what ITS GRID RUN uses -- `cli.py` passes no
+# connection_limit for this provider, so `download_panoramax`'s own default
+# applies -- and a walk quietly holding ten times the sockets against a
+# volunteer-run instance with no documented rate limit, no `Retry-After` and no
+# credential to identify us by is an asymmetry worth removing. The rate limiter
+# bounds the RATE either way; what this bounds is sockets held open while the
+# instance is slow, which is the failure mode an unmetered host shows first.
+#
+# Mapillary is 5 for the same reason (#361), and it is ONE number for both of
+# its channels, defined once below as MAPILLARY_TILE_CONNECTION_LIMIT: the grid
+# arm in `cli.py` forwards no `--connection-limit` either, so the grid census
+# runs at the Mapillary downloader's default -- which IS that constant -- and
+# the walk's ceiling is the same constant, so the two cannot drift apart again.
+# Until #361 the walk held 50 here, on a rationale ("prod configures 50 for the
+# grid over the same CDN") that `cli.py` never made true: the grid was at 5 the
+# whole time, and the walk held ten times its sockets on a per-IP host that has
+# blocked this IP four times (block 4: 2026-09-28, #385).
+#
+# Why 5 is enough: the pacer is FIFO at 40/min, so requests in flight ~= 0.67/s
+# x mean tile latency, and the grid census has run every night at 5 against the
+# same pacer. With latency that varies, 5 slots lose nothing while mean latency
+# is low and degrade gradually as it grows; the deadline is at risk only well
+# above that, which is the exposure the grid has always carried (reasoned, and
+# simulated at review time -- not measured). Slots past 5 are only ever occupied
+# when the host is SLOW (a slot is also held through a retry's backoff sleep),
+# which is exactly when backpressure is wanted rather than more sockets. It
+# also bounds the two residues downstream of this number: retries past a
+# request cap, connection_limit x (TILE_MAX_TRIES - 1) = 20 rather than 200,
+# and requests refused after a block is seen (#205), <= connection_limit = 5
+# rather than 50. Concurrency has never been a variable in the block series,
+# so this is a conservative choice under an unknown, not a measured limit
+# (docs/provider-access.md, "Socket concurrency (#361)").
+MAPILLARY_TILE_CONNECTION_LIMIT = 5
 GSV_WALK_CONNECTION_LIMIT = 50
-MAPILLARY_WALK_CONNECTION_LIMIT = 50
+MAPILLARY_WALK_CONNECTION_LIMIT = MAPILLARY_TILE_CONNECTION_LIMIT
 PANORAMAX_WALK_CONNECTION_LIMIT = 5
 WALK_CONNECTION_LIMITS = {
     "gsv": GSV_WALK_CONNECTION_LIMIT,
@@ -221,9 +250,41 @@ OVERPASS_PROBE_QUERY = (
 OVERPASS_PROBE_TIMEOUT_S = 25.0
 
 
+def normalize_overpass_url(url: str) -> str:
+    """
+    ``url`` with its host lowercased, so osmnx's address pin can match it.
+
+    osmnx's ``_http._config_dns`` pins a query only when the host it is asked
+    to resolve EQUALS ``urlparse(url).netloc.split(":")[0]`` -- not lowercased
+    -- while urllib3 lowercases the host before it calls ``getaddrinfo``. So a
+    mixed-case ``$OVERPASS_URL`` (``https://Overpass-API.de/api``) would leave
+    osmnx's query unpinned while :func:`_pinned_like_osmnx`, which reads
+    ``urlsplit().hostname`` (always lowercase), pins the probes to IPv4: the
+    probe and the query as two different clients again (issue #366). Hostnames
+    are case-insensitive, so lowercasing where the URL is CONFIGURED changes
+    nothing else. The path is left alone; it is case-sensitive. So is any
+    ``user:password@`` userinfo, which ``requests`` sends as basic auth, so
+    only the part after the last ``@`` is lowercased.
+
+    Example::
+
+        >>> normalize_overpass_url("https://Overpass-API.de/api")
+        'https://overpass-api.de/api'
+        >>> normalize_overpass_url("https://Me:PassWord@Mirror.Example.org/api")
+        'https://Me:PassWord@mirror.example.org/api'
+    """
+    parts = urllib.parse.urlsplit(url)
+    userinfo, at, hostport = parts.netloc.rpartition("@")
+    return urllib.parse.urlunsplit(parts._replace(netloc=userinfo + at + hostport.lower()))
+
+
 def overpass_url() -> str:
-    """The Overpass endpoint in force right now: ``$OVERPASS_URL`` or the default."""
-    return os.environ.get(OVERPASS_URL_ENV) or DEFAULT_OVERPASS_URL
+    """The Overpass endpoint in force right now: ``$OVERPASS_URL`` or the default.
+
+    Host lowercased (:func:`normalize_overpass_url`), the same form
+    ``download_street_network._apply_overpass_url`` hands osmnx.
+    """
+    return normalize_overpass_url(os.environ.get(OVERPASS_URL_ENV) or DEFAULT_OVERPASS_URL)
 
 
 def overpass_headers() -> dict[str, str]:
@@ -343,19 +404,40 @@ def _pinned_like_osmnx(base_url: str):
     only this hostname is redirected.
 
     **Patching a module global is only safe while the patches cannot overlap**,
-    and today they cannot: the sole caller is ``overpass_serving``, which the
-    breaker calls from ``HostBreaker._maybe_recheck`` on the scheduler's main
-    launch thread (a lane's work happens in a subprocess, which does not
-    inherit this process's patch). Two overlapping pins would leak the wrapper
-    for good -- the second saves the first's wrapper as "the original" and puts
-    it back -- so ``_PIN_LOCK`` makes the assumption structural rather than
-    documentary. It is a plain lock, so this must never be nested.
+    and today they cannot. There are two callers.
+    ``overpass_serving`` is called by the breaker from
+    ``HostBreaker._maybe_recheck`` on the scheduler's main launch thread.
+    ``download_street_network._overpass_refusing``, the walk's pre-flight
+    (issue #366), runs in every process that calls ``fetch_graph`` -- the
+    collection child, ``scripts/prefreeze_street_networks.py``,
+    ``streetscape_street_analyzer.analyze`` and the grid-density scripts --
+    none of which is the scheduler, so none inherits or shares its patch.
+    Each of those calls ``fetch_graph`` serially from one thread, once per
+    fetch, inside the Overpass host lock.
+    Two overlapping pins would leak the wrapper for good -- the second saves
+    the first's wrapper as "the original" and puts it back -- so ``_PIN_LOCK``
+    makes the assumption structural rather than documentary. It is a plain
+    lock, so this must never be nested.
 
-    Two deliberate differences from osmnx, both fail-closed: a lookup failure
-    raises here (osmnx falls back to DNS-over-HTTPS), and the caller turns that
-    into "not serving" rather than reaching for a second resolver to clear a
-    breaker with; and ``socket.gethostbyname`` honours no timeout argument, so
-    the probe's ``timeout_s`` does not bound it -- the resolver's own does.
+    In the child, osmnx's own permanent patch may already be in place from an
+    earlier query. Stacking is harmless: this wrapper maps the hostname to the
+    IP, osmnx's then sees an IP literal and passes it through, and this one is
+    removed on exit.
+
+    "One address" is osmnx's model, and so is its limit: it assumes the one A
+    record ``gethostbyname`` returns is the one every later lookup returns. A
+    round-robin mirror can answer the probe and the query with different A
+    records, which is the same residual gap the breaker already documents for
+    its re-check.
+
+    Two deliberate differences from osmnx: a lookup failure RAISES here (osmnx
+    falls back to DNS-over-HTTPS), and what that means is the caller's policy,
+    not this helper's -- the breaker's re-check turns it into "not serving"
+    (fail-closed: a breaker is not a thing to clear on a second resolver's
+    answer), while the walk's advisory pre-flight turns it into "can't tell,
+    proceed" (fail-open: the real fetch resolves the host its own way). And
+    ``socket.gethostbyname`` honours no timeout argument, so a caller's request
+    timeout does not bound it -- the resolver's own does.
     """
     hostname = urllib.parse.urlsplit(base_url).hostname
     with _PIN_LOCK:
@@ -902,8 +984,21 @@ class AsyncRateLimiter:
             # this one anyway, and releasing would let them busy-cycle.
             wait = (1.0 - self._tokens) / self._rate
             await asyncio.sleep(wait)
-            self._last_refill = self._now()
-            self._tokens = 0.0
+            # Refill from the clock rather than assuming the sleep lasted
+            # exactly `wait` (#304). A sleep always overruns a little (timer
+            # granularity, other callbacks on the loop), and zeroing the bucket
+            # here threw that overrun away on EVERY saturated acquisition: at
+            # 48,000/min the gap is 1.25 ms, and the limiter delivered 79-83%
+            # of its configured rate (docs/experiments/gsv-throughput.md).
+            # Crediting it cannot exceed the rate: the tokens credited are
+            # exactly the time that elapsed, and the capacity cap still bounds
+            # any burst to one second's worth.
+            now = self._now()
+            self._tokens = min(
+                self._capacity, self._tokens + (now - self._last_refill) * self._rate
+            )
+            self._last_refill = now
+            self._tokens -= 1.0
 
     async def _acquire_spaced(self) -> None:
         # Sleep while holding the lock, for the same reason as the bucket: the

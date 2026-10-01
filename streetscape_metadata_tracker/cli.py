@@ -74,6 +74,7 @@ from .download_common import (
     jitter_fraction,
     positive_int,
 )
+from .download_gsv import PIPELINE_DEPTH, max_requests_in_flight
 from .download_kartaview import (
     DEFAULT_REQUEST_TIMEOUT_S,
     DEFAULT_SWEEP_REQUESTS_PER_MINUTE,
@@ -341,8 +342,9 @@ def parse_args():
         type=int,
         default=100,
         help="""Number of requests to prepare and queue at once.
-             A larger --connection-limit is clamped to this value with a
-             warning (at most batch-size requests are ever in flight).
+             The GSV engine keeps a few batches in flight at once, so a
+             --connection-limit above that many batches' worth is clamped to it
+             with a warning (no more requests are ever in flight).
              Higher values use more memory
              but can be more efficient. API limit is 500/second.""",
     )
@@ -353,9 +355,9 @@ def parse_args():
         default=50,
         help="""Maximum number of concurrent connections to the API.
              Controls how many requests are actually in-flight at once.
-             Clamped to --batch-size, with a warning, when larger: sockets past
-             the batch never get work. Conservative values prevent overwhelming
-             the network or API.""",
+             Clamped, with a warning, to the few batches' worth of requests the
+             GSV engine keeps in flight: sockets past that never get work.
+             Conservative values prevent overwhelming the network or API.""",
     )
 
     concurrency_group.add_argument(
@@ -418,8 +420,9 @@ def parse_args():
              --connection-limit only on the gsv arm, so this census runs at
              the DOWNLOADER's own default of 5 (not this flag's argparse
              default, which is 50, and not the scheduler's per-child share).
-             The 200 figure belongs to the Mapillary ROAD WALK, which does
-             receive the share. Requires a checkpoint to write to. Default:
+             The road walks receive that share but are clamped to their
+             provider's own 5 (#361), so their residue is 20 too. Requires a
+             checkpoint to write to. Default:
              fetch every tile.""",
     )
 
@@ -502,8 +505,9 @@ def parse_args():
              --connection-limit only on the gsv arm, so this census runs at
              the DOWNLOADER's own default of 5 (not this flag's argparse
              default, which is 50, and not the scheduler's per-child share).
-             The 200 figure belongs to the Mapillary ROAD WALK, which does
-             receive the share. Requires a checkpoint to write to. Default:
+             The road walks receive that share but are clamped to their
+             provider's own 5 (#361), so their residue is 20 too. Requires a
+             checkpoint to write to. Default:
              fetch every tile.""",
     )
 
@@ -551,20 +555,22 @@ def parse_args():
     if (args.width is None) != (args.height is None):
         parser.error("--width and --height must be used together")
 
-    if args.connection_limit > args.batch_size:
-        # Inert, not invalid: the GSV engine gathers at most batch_size requests
-        # per batch under a TCPConnector(limit=connection_limit), so sockets past
-        # the batch never get work. A hard refusal here cost a hand-run its
-        # collection and, under the scheduler, quarantined the city (issue #359).
-        # Parse time is before logging is configured (see main()), so stderr.
+    in_flight_cap = max_requests_in_flight(args.batch_size)
+    if args.connection_limit > in_flight_cap:
+        # Inert, not invalid: the GSV engine keeps PIPELINE_DEPTH batches in
+        # flight (#304), so at most PIPELINE_DEPTH x batch_size requests exist to
+        # occupy sockets and any past that never get work. A hard refusal here
+        # cost a hand-run its collection and, under the scheduler, quarantined
+        # the city (issue #359). Parse time is before logging is configured
+        # (see main()), so stderr.
         print(
-            f"warning: --connection-limit {args.connection_limit} exceeds --batch-size "
-            f"{args.batch_size}; at most batch-size requests are ever in flight, so the "
-            f"effective connection limit is {args.batch_size}. Raise --batch-size to use "
-            f"more sockets.",
+            f"warning: --connection-limit {args.connection_limit} exceeds "
+            f"{PIPELINE_DEPTH} x --batch-size {args.batch_size} = {in_flight_cap}; at "
+            f"most that many requests are ever in flight, so the effective connection "
+            f"limit is {in_flight_cap}. Raise --batch-size to use more sockets.",
             file=sys.stderr,
         )
-        args.connection_limit = args.batch_size
+        args.connection_limit = in_flight_cap
 
     return args
 

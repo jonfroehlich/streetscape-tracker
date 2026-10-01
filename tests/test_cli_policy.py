@@ -204,19 +204,24 @@ def test_max_requests_per_minute_defaults_to_80pct_of_default_quota(monkeypatch,
     assert calls[0]["max_requests_per_minute"] == 24_000
 
 
-def test_a_connection_limit_above_batch_size_is_clamped_and_warned_not_refused(
+def test_a_connection_limit_above_the_in_flight_bound_is_clamped_and_warned_not_refused(
     monkeypatch, catalog, capsys
 ):
     """
-    The surplus is inert -- the GSV engine never has more than batch_size
-    requests in flight -- so refusing it cost a hand-run its collection and,
-    under the scheduler, quarantined the city (issue #359). The clamp is
-    one-directional: a limit below the batch passes through unwarned.
+    The surplus is inert -- the GSV engine never has more than PIPELINE_DEPTH x
+    batch_size requests in flight (#304; one batch before it) -- so refusing it
+    cost a hand-run its collection and, under the scheduler, quarantined the
+    city (issue #359). The clamp is one-directional: a limit at or below the
+    bound passes through unwarned, including one above a single batch, which
+    the pipelined engine can now use.
     """
+    from streetscape_metadata_tracker.download_gsv import PIPELINE_DEPTH
+
     conn, city_id, data_dir = catalog
     calls = []
     gsv_configs(monkeypatch)
     monkeypatch.setattr(cli, "download_gsv_metadata_async", stub_downloader(calls))
+    bound = PIPELINE_DEPTH * 100
 
     rc = run_cli(
         monkeypatch,
@@ -224,23 +229,42 @@ def test_a_connection_limit_above_batch_size_is_clamped_and_warned_not_refused(
         data_dir,
         "--force",
         "--connection-limit",
-        "150",
+        str(bound + 50),
         "--batch-size",
         "100",
     )
     assert rc == 0
-    assert calls[0]["connection_limit"] == 100
-    assert "exceeds --batch-size" in capsys.readouterr().err
+    assert calls[0]["connection_limit"] == bound
+    err = capsys.readouterr().err
+    assert f"exceeds {PIPELINE_DEPTH} x --batch-size 100 = {bound}" in err
 
     # The other direction at the parser: a second collection on the same run
     # date is a no-op, so this half reads what parse_args hands async_main.
+    # 150 is above one batch but inside the pipelined bound: no clamp now.
     monkeypatch.setattr(
         sys,
         "argv",
-        ["streetscape_tracker.py", city_id, "--connection-limit", "50", "--batch-size", "100"],
+        ["streetscape_tracker.py", city_id, "--connection-limit", "150", "--batch-size", "100"],
     )
-    assert cli.parse_args().connection_limit == 50
-    assert "exceeds --batch-size" not in capsys.readouterr().err
+    assert cli.parse_args().connection_limit == 150
+    assert "exceeds" not in capsys.readouterr().err
+
+    # The boundary itself: a limit of EXACTLY the bound (400 at batch 100) is
+    # usable, so it passes through unwarned (a `>=` clamp would warn on it).
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "streetscape_tracker.py",
+            city_id,
+            "--connection-limit",
+            str(bound),
+            "--batch-size",
+            "100",
+        ],
+    )
+    assert cli.parse_args().connection_limit == bound
+    assert "exceeds" not in capsys.readouterr().err
 
 
 def _mapillary_stub(calls):
@@ -279,6 +303,52 @@ def test_mapillary_tile_pace_defaults_to_the_conservative_tile_rate(monkeypatch,
 
     assert run_cli(monkeypatch, city_id, data_dir, provider="mapillary") == 0
     assert calls[0]["max_requests_per_minute"] == DEFAULT_TILE_REQUESTS_PER_MINUTE
+
+
+def test_the_mapillary_grid_and_walk_hold_one_socket_count_on_the_tile_cdn(monkeypatch, catalog):
+    """The grid's effective connection limit IS the walk's ceiling (#361).
+
+    Both channels talk to `tiles.mapillary.com`, which meters by IP. The grid
+    arm forwards no `--connection-limit`, so its sockets are whatever the
+    downloader defaults to; the walk's are `WALK_CONNECTION_LIMITS["mapillary"]`.
+    Until #361 those were 5 and 50, under a comment claiming they were equal.
+
+    Two halves, because either alone is vacuous: the parity of the two numbers
+    says nothing if the grid arm starts forwarding the flag (the default would
+    then be dead and the grid would hold 50), and the absence of the flag says
+    nothing about what the default is. A non-default `--connection-limit 17`
+    is passed so that a forwarded value would be visible rather than masked.
+    """
+    import inspect
+
+    from streetscape_metadata_tracker import download_mapillary as dm
+    from streetscape_metadata_tracker.download_common import (
+        MAPILLARY_TILE_CONNECTION_LIMIT,
+        WALK_CONNECTION_LIMITS,
+    )
+
+    def default_of(fn):
+        return inspect.signature(fn).parameters["connection_limit"].default
+
+    from streetscape_street_analyzer import collect_mapillary
+
+    grid_default = default_of(dm.download_mapillary_metadata_async)
+    assert grid_default == default_of(dm.fetch_city_images_async)
+    # The two defaults no production caller reaches today -- every caller
+    # passes the value -- pinned anyway, because the next caller that omits it
+    # inherits whatever they say, on the same per-IP host.
+    assert grid_default == default_of(dm._fetch_city_images)
+    assert grid_default == default_of(collect_mapillary.collect_mapillary_street_samples_async)
+    assert grid_default == WALK_CONNECTION_LIMITS["mapillary"]
+    assert WALK_CONNECTION_LIMITS["mapillary"] == MAPILLARY_TILE_CONNECTION_LIMIT == 5
+
+    conn, city_id, data_dir = catalog
+    calls = []
+    gsv_configs(monkeypatch)
+    monkeypatch.setattr(cli, "download_mapillary_metadata_async", _mapillary_stub(calls))
+    rc = run_cli(monkeypatch, city_id, data_dir, "--connection-limit", "17", provider="mapillary")
+    assert rc == 0
+    assert "connection_limit" not in calls[0], "the grid arm must take the downloader's default"
 
 
 def test_mapillary_jitter_threads_to_the_downloader(monkeypatch, catalog):

@@ -201,12 +201,14 @@ The census now resumes for its **missing tiles only**, through the same `checkpo
 
 Three things this deliberately does **not** change.
 Resume is strictly **next-invocation**: no in-process retry is added anywhere, because the forum-reported hazard that retrying during a block extends it stands untested in either direction and is not worth testing with production credentials.
-Pacing is untouched at 60/min, and so are both daily budgets — a resumed night is *cheaper*, never faster.
+Pacing is untouched — both Mapillary channels run at the 40/min `config/scheduler.makelab1.toml` sets (the module default, `DEFAULT_TILE_REQUESTS_PER_MINUTE`, is 60) — and so are both daily budgets: a resumed night is *cheaper*, never faster.
 That still holds after #318, and it is the sentence to read before worrying about the traffic shape a request cap produces: across nights, a city split over two is paid for once instead of re-paid.
 What a cap does **not** give is an exact ceiling on the day.
-It is a soft one: a capped crawl may end the night up to `connection_limit × (TILE_MAX_TRIES − 1)` requests over its budget — **20 on a grid census and 200 on a Mapillary road walk**, because the two run at different socket counts: `cli.py` forwards `--connection-limit` only on its `gsv` arm, so a Mapillary or Panoramax *grid* takes the downloader's own default of 5, while a *walk* takes the scheduler's per-child share of 50 (`[download].connection_limit`, 100 since 2026-09-21, divided across lanes and clamped at `MAX_PER_CHILD_CONNECTION_LIMIT`) — because tiles already in flight when the cap trips are allowed to finish their retries rather than being cancelled mid-attempt.
+It is a soft one: a capped crawl may end the night up to `connection_limit × (TILE_MAX_TRIES − 1)` requests over its budget, because tiles already in flight when the cap trips are allowed to finish their retries rather than being cancelled mid-attempt.
+That is **20 on both Mapillary channels**: `cli.py` forwards `--connection-limit` only on its `gsv` arm, so the *grid* takes the downloader's own default of 5, and since #361 the *walk* is clamped to the same 5 (see the socket-concurrency section below).
+Until #361 the walk took the scheduler's whole per-child share of 50, and its residue was 200.
 The larger overshoot this originally shipped with, `connection_limit − 1` on every capped night whether or not anything retried, was a defect and is fixed (see [`docs/census.md`](census.md)); the retry residue is deliberate.
-Quote it as a soft ceiling with a 200-request tail, never as "the budget is never exceeded" — on the one host that has blocked this IP three times, the difference between those two statements is the whole reason to state it.
+Quote it as a soft ceiling with a 20-request tail, never as "the budget is never exceeded" — on the one host that has blocked this IP more than any other, the difference between those two statements is the whole reason to state it.
 What it does change is that a night which used to stop *short* of its budget — skipping the city that did not fit the remainder — now spends the remainder exactly.
 Near-ceiling nights become exactly-ceiling nights, which is worth stating rather than discovering, because volume is the axis #292's jitter test was holding still.
 And the pre-flight estimate still prices the whole tile count even when a resume will fetch a fraction of it, which errs high; that is the safe direction for a budget gate and is left alone.
@@ -214,6 +216,37 @@ And the pre-flight estimate still prices the whole tile count even when a resume
 
 What it buys, concretely: tiles fetched before a block survive it, a crash between the CSV write and cataloging re-finalizes for ~0 requests, and a night the scheduler winds down mid-city resumes rather than restarting
 — and it is what clears the resume gate on raising `max_concurrent_channels` above 1, since a deadline or SIGTERM under lanes kills up to N children at once instead of one.
+
+## Socket concurrency (#361, 2026-09-30)
+
+**Both Mapillary channels now hold at most 5 concurrent sockets on `tiles.mapillary.com`; until #361 the road walk held 50.**
+The grid census was always at 5 — `cli.py` forwards `--connection-limit` only on its `gsv` arm, so the Mapillary grid takes the downloader's own default — while the walk took the scheduler's whole per-child share.
+The comment that justified the walk's 50 said production configures 50 for the grid over the same CDN; `cli.py` never did, so the pair disagreed by 10×, in the direction nobody had written down.
+The number now lives once, as `download_common.MAPILLARY_TILE_CONNECTION_LIMIT`: it is both the downloader's default and the walk's entry in `WALK_CONNECTION_LIMITS`, so the two channels cannot drift apart again.
+
+What is known, in the tiers this file keeps apart:
+
+- **Documented.** The [API documentation](https://www.mapillary.com/developer/api-documentation) limits tiles to 50,000 per day per app, "(not per minute)".
+  It says nothing about concurrent connections.
+- **Reported.** A staff reply in [thread 10644](https://forum.mapillary.com/t/50-000-requests-day-rate-limit-scope/10644) (2026-08-24) says an IP-level layer "might block you earlier" on "a sudden spike".
+  In [thread 5821](https://forum.mapillary.com/t/inconsistent-authentication-issues/5821) a **user**, not staff, reports the blocks as per-IP and that "retrying seemed to extend the block".
+  In [thread 8336](https://forum.mapillary.com/t/receiving-html-response-instead-of-json/8336) the HTML page on a 200 is described, and **staff says** "Rate limits reset every 24 hours" — a statement of policy, not an observed duration.
+  **No thread found discusses concurrent connections to the tile CDN**, so concurrency is UNKNOWN, not known-safe.
+- **Ours, correlation only.** Block 4 (2026-09-28 02:27 PDT, recorded with #385) hit the grid channel ~8.5 h after a 1,444-request `mapillary_streets` catch-up (17:05–17:55 PDT on 09-27) that ran at 50 sockets; ~4,600 tile requests fell in the ~24.5 h before the block.
+  Nothing isolates the socket count as a cause — that catch-up also stacked volume on the first 80-city night — and concurrency has never been a variable in the block series at all.
+
+**Why 5 costs no throughput while the host is healthy.**
+The pacer is FIFO at 40/min, so the number of requests in flight is roughly 0.67/s × mean tile latency, and the grid census has run every night at 5 against the same pacer.
+With latency that varies rather than stays constant, 5 slots lose nothing while mean latency is low and degrade gradually as it grows; a deadline is at risk only at mean latencies well above that, which is the exposure the grid has always carried.
+Slots above 5 are occupied only when the host is SLOW — and a slot is also held through a retry's backoff sleep — which is exactly when backpressure is wanted rather than more sockets.
+That is reasoning, not a measurement, and it is deliberately left qualitative here: the thresholds come from a review-time simulation of `_acquire_spaced` that is not committed.
+Two follow-ups would turn it into evidence: committing that simulation under `docs/experiments/` with its metrics JSON, and reading prod's collect logs to confirm the grid reaches its paced rate at 5.
+
+**Two residues fall with it.**
+Retries past a request cap are bounded by `connection_limit × (TILE_MAX_TRIES − 1)`: 20 at 5, where the walk's 50 allowed 200.
+And requests refused after a block is first seen (#205's fail-fast, `<= connection_limit`) fall from up to 50 to up to 5 — on the one host where the forum reports that refused retries extend the block.
+
+This is a conservative choice under an unknown, not a limit anyone measured, and it changes a traffic property during a staged period: deploying it beside the 80-city cap check or the #385 rolling budget means two treatments at once, so the deploy order is an operator's decision, recorded when it is made.
 
 ## A paired night now costs one census, not two (issue #290)
 
@@ -409,6 +442,7 @@ Both are out-of-band and low-volume; lock them if either ever runs on a schedule
 Chokepoints are the two places every such request in the repo passes through: `download_mapillary.fetch_city_images_async` (grid run *and* road walk) and the download branch of `download_street_network.fetch_graph`
 — placed **after** its cache-hit return, so a warm city never contends, and **outside** `_download_graph` so one hold covers the whole retry stack.
 GSV metadata is deliberately **not** locked: Google meters the Street View Static API per *project*, so two processes share a quota the daily ledger already tracks and serializing them would cost throughput for nothing.
+**That reasoning predates #304 and no longer holds per minute**: each GSV process now actually reaches its 48,000/min, so two processes on the SAME key send ~96,000/min into one 60,000/min project quota — see the #304 section at the end of this file.
 **Only the child ever holds the lock** — `flock` is scoped to an open file description and is not inherited across `subprocess.run`, so a scheduler parent holding it would make every child's `timeout=0` acquire fail;
 a source-inspection test asserts `scheduler.py` never imports the module.
 A stale lock file cannot wedge a night, because the kernel releases `flock` when the fd closes (SIGKILL and OOM included)
@@ -452,8 +486,10 @@ It also **connects the way osmnx does**: before every query osmnx's `_http._conf
 Plain `requests` takes whatever `getaddrinfo` prefers, which on a dual-stack host can be IPv6, and Overpass identifies a client by its full IPv4 address or its IPv6 /64 ("Commons" again) — so an IPv6 probe may be asking about a different client from the IPv4 one a walk is refused as.
 Whether the 2026-09-21 `/status` probes actually went over IPv6 was **not measured**; it is one candidate mechanism beside the backend split, and the pin (scoped to the probe and to that hostname, restored afterwards, since the scheduler is a long-lived parent) removes both differences we can control.
 Patching `socket.getaddrinfo` is a process global, so two overlapping pins would leak the wrapper permanently — the second would save the first's wrapper as "the original" and restore it.
-Today only the breaker's re-check pins, on the scheduler's main launch thread (a lane does its work in a subprocess, which inherits nothing), and `_PIN_LOCK` makes that structural rather than an unwritten assumption a later caller could break.
-Two differences from osmnx are deliberate, both fail-closed: a failed lookup is **not** retried over DNS-over-HTTPS the way osmnx retries it (a breaker is not a thing to clear on a second resolver's answer), and `gethostbyname` takes no timeout, which is part of why the probe's 25 s is the usual bound rather than a hard one.
+Two callers pin: the breaker's re-check, on the scheduler's main launch thread (a lane does its work in a subprocess, which inherits nothing), and since #366 the walk's `/status` pre-flight (item (4) below), in every process that calls `fetch_graph` — the collection child, `scripts/prefreeze_street_networks.py`, `analyze.py` and the grid-density scripts — each calling it serially from one thread and none of them the scheduler.
+`_PIN_LOCK` makes "never overlapping" structural rather than an unwritten assumption a later caller could break.
+Two differences from osmnx are deliberate: a failed lookup is **not** retried over DNS-over-HTTPS the way osmnx retries it, and `gethostbyname` takes no timeout, which is part of why the probe's 25 s is the usual bound rather than a hard one.
+What a failed lookup MEANS is the caller's policy: here it keeps the breaker latched (fail-closed — a breaker is not a thing to clear on a second resolver's answer), while the pre-flight reads it as can't-tell and proceeds (fail-open).
 **What it still cannot promise** is that the next child resolves `overpass-api.de` to the backend the probe reached — the child does its own `gethostbyname` before its query — so a false clear stays possible, bounded by the cap of four.
 A successful probe is deliberately **not** reused as the next fetch's pre-flight: the pre-flight runs in a different process inside the host lock, is an unmetered `/status` GET, and coupling the two across a process boundary would buy one request.
 A frozen network is also written atomically now (`<name>.graphml.tmp` then `os.replace`), because the frozen-network exemption trusts the file's existence and an interrupted in-place write used to leave a truncated GraphML that failed the city every night until deleted by hand.
@@ -592,6 +628,11 @@ So refusal is an **allow-list** (`403/429/509`) rather than "anything that isn't
 and the **whole body** is wrapped in `except Exception`, since `ox._http` is private under an unpinned `osmnx>=2.0` and an `AttributeError` from an advisory probe would fail every street collection on the machine, inside the host lock, before any real request.
 It must send our headers, because `overpass-api.de` answers **HTTP 406 to the stock `python-requests` User-Agent** (measured 2026-08-15; every other UA returned 200), so a probe using the default would have read that 406 as a block and skipped every city of every night.
 It reuses `ox._http._get_http_headers()` so the probe is indistinguishable from the query it speaks for.
+It also **connects** where the query will (#366): the GET runs inside `download_common._pinned_like_osmnx`, the same IPv4 pin as the breaker's re-check above, because an unpinned GET on dual-stack makelab2 could go over IPv6 — a different client to Overpass, whose refusal would latch the host and strand the city (#341) though the query's IPv4 address was being served.
+That mismatch was latent, not a demonstrated cause of any stranding (the 2026-09-21 refusals were `Errno 111` from the fetch itself).
+A failed lookup inside the pin is one more can't-tell and returns None; the real fetch resolves the host its own way.
+"The one IPv4 address" assumes the single A record `gethostbyname` returns stays the one the query gets; a round-robin mirror can break that, the same residual gap the breaker's re-check has (above).
+The configured URL's host is **lowercased** (`download_common.normalize_overpass_url`, applied by both `overpass_url()` and `_apply_overpass_url`), because osmnx's `_config_dns` pins only when the host urllib3 resolves — always lowercase — equals the host as written in the URL: a mixed-case `OVERPASS_URL` would otherwise leave osmnx's query unpinned while both probes were pinned, the #366 mismatch in reverse.
 It is a **second** `/status` GET on top of osmnx's own, deliberately: osmnx's answers "how long until a slot?" and never short-circuits, `/status` is unmetered, and the duplication is the price of the fast refusal.
 **(5) osmnx's 429/504 handler recurses without a depth limit** (`_overpass.py:477-486`: `time.sleep(55)` then re-call itself), so a rate-limit-flavoured refusal never fails
 — it hangs until the scheduler SIGKILLs the child, and a SIGKILL carries **no exit code**, so the breaker never learns.
@@ -650,3 +691,44 @@ Re-confirm in the console if either key is rotated, and note the identification 
 Raising the knob was also gated on **resume for every provider**, because a deadline or a `systemctl stop` kills N children at once instead of 1 and a killed Mapillary child re-spent its tiles into the ceiling this file exists to defend.
 **That gate is met as of #256** (see the checkpoint section above): every channel now resumes, so the Cloud-project check is the one that remains.
 Mechanism, rollout order and the watch list: [`scheduler.md`](scheduler.md).
+
+## The GSV engine now actually reaches its configured rate (issue #304)
+
+**Added after the split.**
+Until #304 the GSV engine never got near `max_requests_per_minute`: dense cities ran at 38–52% of 48,000/min, and the #304 samples had a 63% median.
+The causes were a fresh connector per batch, a barrier after every batch, and a token bucket that discarded its own sleep overrun ([`experiments/gsv-throughput.md`](experiments/gsv-throughput.md)).
+With all three fixed, **the engine sustains the configured rate wherever Google's mean latency is under ~62 ms**, so what Google sees changes even though no configured number did:
+
+- **Per project**: a sustained ~48,000/min, where prod had achieved a median of about 30,000.
+  That is still 80% of the approved 60,000; the pacer is a ceiling, and now it binds.
+- **Per IP**: with `gsv` and `gsv_streets` in concurrent lanes (prod, since 2026-09-21), the ~96,000/min this file already described as the configured presentation is now what is actually sent, from one IP across two projects.
+  **Google documents no per-IP limit for metadata**, and the metadata docs say only that it is "available at no charge" and consumes no quota.
+  Per the READ THIS FIRST corollary, that is unknown, not unlimited.
+- **Connections**: new TLS handshakes to Google drop from ~50 per 100 requests to ~50 per run.
+- **Bursts**: the one-second start burst (800 tokens at 48,000/min) is unchanged, and so is the rule that over any interval T the bucket admits at most 800 + 800 × T requests.
+
+**Two processes on the same key now oversubscribe its project** (PR #399 review).
+The two keys belong to two Cloud projects, both on the UW account: `gsv` (`GMAPS_API_KEY`) uses project `gsv-date-tracker`, and `gsv_streets` (`GMAPS_STREETS_API_KEY`) uses `gsv-streets-tracker`.
+**The two nightly lanes therefore cannot oversubscribe each other**: they use different keys in separate Cloud projects with independent quotas, so the hazard is only a hand run on the same key as its concurrently running nightly twin, or two hand runs.
+Each project's per-minute quota is 60,000; for `gsv-streets-tracker` that figure is the grant Google approved on 2026-09-21 (raised from 30,000), not a live limit anyone has read back independently.
+Nothing serializes GSV across processes (the host lock above deliberately skips it), and before #304 that was harmless in practice: two engines each achieving ~30,000/min sat near the quota rather than over it.
+Now each can reach 48,000/min, so any two concurrent processes on one key present ~96,000/min against that project's 60,000/min.
+The realistic pairs:
+
+- a hand-run `streetscape_tracker.py` (gsv) while the nightly `gsv` lane is collecting (both `GMAPS_API_KEY`);
+- `python -m streetscape_street_analyzer.collect --provider gsv`, or `scheduler assess-city` (whose set includes `gsv_streets`), while the nightly `gsv_streets` lane is collecting (both `GMAPS_STREETS_API_KEY`);
+- two hand runs of either.
+
+What it costs is OVER_QUERY_LIMIT answers: the engine retries them after a 20 s quota-reset wait, and a run with more than 1% of points still failing after its retry passes aborts with its checkpoint kept rather than finalizing.
+**No lock is added yet; that is an open decision**, the options being a per-key cross-process lock (which would serialize a hand run behind a multi-hour night), a shared cross-process pacer, or halving the per-process rate while two could overlap.
+Until it is decided: do not start a same-key GSV run while the nightly batch is collecting (check `pgrep -f "scheduler run-due"` or the unit status), or lower `--max-requests-per-minute` on the hand run so the two sum under the quota.
+
+**`api_requests` counts one per point per pass, not one per HTTP attempt** (PR #399 review).
+The engine adds a batch's points to `api_requests` when it schedules the batch, and the retry passes re-count only the points they re-request.
+But `fetch_gsv_pano_metadata_async` carries a `backoff` decorator (up to 3 tries on a timeout or a client error), and those INNER retries reach the server without touching the counter.
+On genuine timeouts, then, the ledger undercounts what Google received: the review measured up to 3× (every attempt timing out) against a local server at 6 s latency with a 5 s request timeout (production's GSV default is 30 s, so this needs a far slower Google than any night has shown).
+This predates #304 and is not a regression; #304's in-flight semaphore removes the one way pipelining could have manufactured such timeouts (a queued request timing out while it waited for a socket), and `tests/test_gsv_pipelined_collect.py` pins that no backoff retry reaches the server when the server itself is fast.
+Pacing stays correct regardless, because every attempt, inner retries included, takes its own token from the limiter; what can drift is only the `api_usage` ledger and `runs.api_requests`, which read as a floor on a night with many timeouts.
+
+If the first nights after deploy show OVER_QUERY_LIMIT rows, a rise in REQUEST_FAILED, or an HTTP 403/429 from the metadata endpoint, lower `[download].max_requests_per_minute` first.
+Do not revert the connector or the pipelining: they change nothing about the rate, only how much of it is reached.

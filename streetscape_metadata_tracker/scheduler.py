@@ -1892,11 +1892,15 @@ _CENSUS_START_RESERVE_S = 300
 # timeout derivation must budget for the achieved rate, or a big city's download
 # alone eats the whole floor and the child is SIGKILLed during the diff/JSON
 # tail (leaving a valid run row with no JSON — see cmd_run_due reconciliation).
+# #304 removed most of that undershoot (docs/experiments/gsv-throughput.md: the
+# engine now holds the cap wherever mean latency is under ~62 ms). 0.5 stays
+# until prod nights re-measure the achieved rate, because over-timing is the
+# harmless direction and under-timing is the failure this constant prevents.
 _ACHIEVED_RATE_FRACTION = 0.5
 # The Mapillary equivalent, and much closer to 1 on purpose: the tile limiter is
 # a hard client-side ceiling the fetch tracks closely (one token, one request —
 # retries included since #198), where the GSV figure above is a project quota
-# the async engine never approaches. The shortfall being budgeted for here is
+# the async engine never approached before #304. The shortfall being budgeted for here is
 # per-request latency and the occasional retry, not structural undershoot.
 _TILE_ACHIEVED_RATE_FRACTION = 0.8
 # The KartaView equivalent, and LOWER than the Mapillary one rather than higher.
@@ -2265,7 +2269,7 @@ def _tile_census_timeout_seconds(
     fraction sits near 1 for a tile census because the limiter IS the binding
     constraint (a hard ceiling the fetch tracks closely), where gsv's
     ``_ACHIEVED_RATE_FRACTION`` covers a project quota the async engine never
-    approaches. Never returns below the configured floor.
+    approached before #304. Never returns below the configured floor.
     """
     estimate = _tile_census_estimate_seconds(city, provider, pc)
     return floor if estimate is None else max(floor, estimate)
@@ -9039,12 +9043,14 @@ def _log_stop_declined(city_id: str, declined: list[str]) -> None:
 #
 # Raising per-child sockets is therefore a deliberate edit to THIS constant
 # with a memory measurement behind it, never a side effect of raising
-# connection_limit. Before raising it above `[download].batch_size` (100), note
-# that doing so is now a SILENT NO-OP rather than an exit 2: cli.py clamps
-# connection_limit to batch_size with a warning (issue #359), because the
-# GSV engine never has more than batch_size requests in flight. So batch_size
-# still has to move with it -- for the sockets to exist, no longer for the
-# child to start. (A child exit 2 is now its own alerted, amnestied family,
+# connection_limit. Before raising it above PIPELINE_DEPTH x
+# `[download].batch_size` (4 x 100 = 400), note that doing so is a SILENT
+# NO-OP rather than an exit 2: cli.py clamps connection_limit to
+# download_gsv.max_requests_in_flight(batch_size) with a warning (issue #359),
+# because the GSV engine keeps PIPELINE_DEPTH batches in flight and never has
+# more requests than that (#304; it was one batch, 100, before). So past 400
+# batch_size still has to move with it -- for the sockets to exist, no longer
+# for the child to start. (A child exit 2 is now its own alerted, amnestied family,
 # ARGV_REJECTED_EXIT_CODE, rather than a consecutive_failure.)
 MAX_PER_CHILD_CONNECTION_LIMIT = 50
 
@@ -9226,9 +9232,12 @@ def _run_city_channels(
     #
     # What that costs is not uniform, because only four channels carry this
     # number at all: the gsv grid (download_gsv's TCPConnector), the gsv road
-    # walk (the same engine) and the Mapillary road walk. The Mapillary GRID
-    # never receives it — cli.py's branch omits the argument, so
-    # fetch_city_images_async's own default of 5 applies. Combined with affinity
+    # walk (the same engine), and the Mapillary and Panoramax road walks -- and
+    # those two are clamped to their provider's own ceiling of 5 in
+    # _street_collect_cmd (#358, #361), so only the two gsv children are sized
+    # by it. The Mapillary and Panoramax GRIDS never receive it -- cli.py's
+    # branches omit the argument, so each downloader's own default of 5
+    # applies. Combined with affinity
     # (mapillary/mapillary_streets share the tile CDN, gsv_streets/
     # mapillary_streets share Overpass), the only overlapping pair that points
     # two full-size connectors at ONE third party is gsv + gsv_streets, both of
@@ -9255,7 +9264,7 @@ def _run_city_channels(
             f"measured history; clamping to {MAX_PER_CHILD_CONNECTION_LIMIT}. Lower "
             f"connection_limit to match the lane count, or raise "
             f"MAX_PER_CHILD_CONNECTION_LIMIT deliberately with a memory measurement "
-            f"(and a batch_size raise) behind it."
+            f"behind it (and a batch_size raise only past PIPELINE_DEPTH x batch_size)."
         )
         lane_connection_limit = MAX_PER_CHILD_CONNECTION_LIMIT
     # Channels not yet launched, in canonical (most-expensive-first) order. A

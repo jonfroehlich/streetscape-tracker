@@ -19,6 +19,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+from streetscape_metadata_tracker.download_gsv import PIPELINE_DEPTH, max_requests_in_flight
 from streetscape_metadata_tracker.paths import get_default_data_dir, get_project_root
 
 
@@ -138,18 +139,20 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
 
     # Clamp, never refuse, exactly as streetscape_tracker.py's own parser does
-    # (issue #359): the GSV engine gathers at most batch_size requests per batch,
-    # so sockets past the batch never get work. Clamped HERE too, before the
-    # value is forwarded, so a batch warns once rather than once per city.
-    if args.connection_limit > args.batch_size:
+    # (issue #359): the GSV engine keeps PIPELINE_DEPTH batches in flight
+    # (#304), so sockets past PIPELINE_DEPTH x batch_size never get work.
+    # Clamped HERE too, before the value is forwarded, so a batch warns once
+    # rather than once per city.
+    in_flight_cap = max_requests_in_flight(args.batch_size)
+    if args.connection_limit > in_flight_cap:
         print(
-            f"warning: --connection-limit {args.connection_limit} exceeds --batch-size "
-            f"{args.batch_size}; at most batch-size requests are ever in flight, so the "
-            f"effective connection limit is {args.batch_size}. Raise --batch-size to use "
-            f"more sockets.",
+            f"warning: --connection-limit {args.connection_limit} exceeds "
+            f"{PIPELINE_DEPTH} x --batch-size {args.batch_size} = {in_flight_cap}; at "
+            f"most that many requests are ever in flight, so the effective connection "
+            f"limit is {in_flight_cap}. Raise --batch-size to use more sockets.",
             file=sys.stderr,
         )
-        args.connection_limit = args.batch_size
+        args.connection_limit = in_flight_cap
 
     return args
 

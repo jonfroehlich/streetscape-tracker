@@ -11,8 +11,11 @@ retried settled answers, no typed failure to act on, and an unbounded hang.
 No network: `requests.get` / `ox.graph_from_bbox` are stubbed. Note conftest's
 autouse `_no_overpass_status_probe` stubs the pre-flight suite-wide, so the
 tests here that care about it re-stub `requests.get` and call the real probe.
+DNS is faked module-wide too (`_no_real_dns`): since #366 the real probe
+resolves the host itself, through `download_common._pinned_like_osmnx`.
 """
 
+import socket
 import time
 
 import networkx as nx
@@ -21,6 +24,7 @@ import pytest
 import requests
 from osmnx._errors import InsufficientResponseError, ResponseStatusCodeError
 
+from streetscape_metadata_tracker import download_common as dc
 from streetscape_metadata_tracker.download_common import (
     HOST_OVERPASS,
     DownloadError,
@@ -28,12 +32,23 @@ from streetscape_metadata_tracker.download_common import (
     HostUnavailableError,
 )
 from streetscape_street_analyzer import download_street_network as dsn
+from tests import _dns_fakes
 
 # Captured at import, which happens BEFORE conftest's autouse
 # `_no_overpass_status_probe` replaces the module attribute. The tests below
 # that exercise the probe itself call this rather than `dsn._overpass_refusing`,
 # which would otherwise be the suite-wide stub.
 _REAL_PROBE = dsn._overpass_refusing
+
+
+@pytest.fixture(autouse=True)
+def _no_real_dns(monkeypatch):
+    """The real pre-flight resolves the Overpass host itself (issue #366), so
+    every test here that calls `_REAL_PROBE` would otherwise make a real DNS
+    lookup -- network access, and offline a `gaierror` that turns each
+    "refusing" assertion into a silent can't-tell. Installed for the whole
+    module; the recorded lookups are returned for the tests that read them."""
+    return _dns_fakes.install(monkeypatch)
 
 
 # ---------------------------------------------------------------------------
@@ -186,9 +201,24 @@ class _FakeStatus:
 _HEALTHY = "Connected as: 403941390\nRate limit: 2\n2 slots available now.\n"
 
 
+def _counting(reply):
+    """A `requests.get` stub that counts its calls, so a test asserting the
+    probe's None can also show the GET was really made -- None is ALSO what a
+    lookup failure short-circuiting before the GET returns (#366)."""
+
+    def get(*a, **k):
+        get.calls += 1
+        return reply()
+
+    get.calls = 0
+    return get
+
+
 def test_the_probe_passes_a_healthy_instance(monkeypatch):
-    monkeypatch.setattr(dsn.requests, "get", lambda *a, **k: _FakeStatus(200, _HEALTHY))
+    get = _counting(lambda: _FakeStatus(200, _HEALTHY))
+    monkeypatch.setattr(dsn.requests, "get", get)
     assert _REAL_PROBE() is None
+    assert get.calls == 1
 
 
 def test_the_probe_names_a_refusing_instance(monkeypatch):
@@ -205,8 +235,10 @@ def test_the_probe_treats_a_server_error_as_unknown_not_a_refusal(monkeypatch):
     instance — so refusal is an allow-list, not "anything that isn't 200".
     """
     for code in (500, 502, 503, 504, 406, 404):
-        monkeypatch.setattr(dsn.requests, "get", lambda *a, c=code, **k: _FakeStatus(c, "nope"))
+        get = _counting(lambda c=code: _FakeStatus(c, "nope"))
+        monkeypatch.setattr(dsn.requests, "get", get)
         assert _REAL_PROBE() is None, f"HTTP {code} must not skip the night"
+        assert get.calls == 1, f"HTTP {code} was never asked"
 
 
 def test_a_queued_slot_is_not_a_refusal(monkeypatch):
@@ -219,8 +251,10 @@ def test_a_queued_slot_is_not_a_refusal(monkeypatch):
     """
     for seconds in (5, 120, 600, 3600):
         queued = f"Slot available after: 2026-08-15T18:00:00Z, in {seconds} seconds."
-        monkeypatch.setattr(dsn.requests, "get", lambda *a, t=queued, **k: _FakeStatus(200, t))
+        get = _counting(lambda t=queued: _FakeStatus(200, t))
+        monkeypatch.setattr(dsn.requests, "get", get)
         assert _REAL_PROBE() is None
+        assert get.calls == 1
 
 
 def test_the_probe_survives_an_osmnx_internal_going_away(monkeypatch):
@@ -260,14 +294,184 @@ def test_the_probe_never_fails_a_healthy_fetch(monkeypatch):
     """Advisory only. If the probe itself cannot connect, or the format changes
     under us, we proceed and let the real request produce the real error."""
 
-    def unreachable(*a, **k):
+    def cannot_connect():
         raise requests.exceptions.ConnectionError("probe cannot connect")
 
+    unreachable = _counting(cannot_connect)
     monkeypatch.setattr(dsn.requests, "get", unreachable)
     assert _REAL_PROBE() is None
+    assert unreachable.calls == 1
 
-    monkeypatch.setattr(dsn.requests, "get", lambda *a, **k: _FakeStatus(200, "something new"))
+    changed = _counting(lambda: _FakeStatus(200, "something new"))
+    monkeypatch.setattr(dsn.requests, "get", changed)
     assert _REAL_PROBE() is None
+    assert changed.calls == 1
+
+
+class _StatusEndpoint:
+    """In-memory /api/status that records where each GET would have connected."""
+
+    def __init__(self, reply=None):
+        self.reply = reply or (lambda: _FakeStatus(200, _HEALTHY))
+        self.calls = []
+
+    def __call__(self, url, **kwargs):
+        self.calls.append(
+            {
+                "url": url,
+                "connect_to": _dns_fakes.connect_address(url),
+                "pin_held": dc._PIN_LOCK.locked(),
+            }
+        )
+        return self.reply()
+
+
+@pytest.fixture
+def status_endpoint(monkeypatch):
+    fake = _StatusEndpoint()
+    monkeypatch.setattr(dsn.requests, "get", fake)
+    monkeypatch.setattr(ox.settings, "overpass_url", dc.DEFAULT_OVERPASS_URL)
+    return fake
+
+
+def test_the_probe_connects_to_the_ipv4_address_osmnx_would_pin(status_endpoint, _no_real_dns):
+    """Issue #366. osmnx resolves the host with gethostbyname (one address,
+    IPv4 only) and pins its query there; plain requests on a dual-stack host
+    would take the IPv6 answer -- and Overpass identifies a client by its IPv4
+    address or its IPv6 /64, so an unpinned pre-flight can be asking about a
+    different client from the one the walk is. A false "refusing" from that
+    other client latches Overpass for the night and strands the city (#341)."""
+    assert _REAL_PROBE() is None
+    assert _no_real_dns == ["overpass-api.de"]
+    assert status_endpoint.calls[0]["connect_to"] == _dns_fakes.V4
+    # Only the address is pinned: the URL, and so SNI and the Host header,
+    # still name the host.
+    assert status_endpoint.calls[0]["url"] == "https://overpass-api.de/api/status"
+
+
+def test_the_probe_and_the_query_connect_to_the_same_address(status_endpoint):
+    """Under one fake resolver, the pre-flight lands where osmnx's own
+    `_config_dns` sends the query. That is ALL this pins -- nothing offline can
+    compare the two against real DNS -- but it is what makes the pre-flight's
+    answer about the query's client rather than a neighbour's."""
+    assert _REAL_PROBE() is None
+    ox._http._config_dns(dc.DEFAULT_OVERPASS_URL)  # patches socket.getaddrinfo
+    osmnx_addr = _dns_fakes.connect_address(dc.DEFAULT_OVERPASS_URL)
+    assert status_endpoint.calls[0]["connect_to"] == osmnx_addr == _dns_fakes.V4
+
+
+def test_the_pin_follows_the_endpoint_the_probe_asks(status_endpoint, _no_real_dns, monkeypatch):
+    """Both an explicit url and osmnx's configured one (where the OVERPASS_URL
+    mirror lands) are resolved and pinned -- not the default host."""
+    assert _REAL_PROBE("https://overpass.example.org/api") is None
+    monkeypatch.setattr(ox.settings, "overpass_url", "https://mirror.example.net/api")
+    assert _REAL_PROBE() is None
+    assert _no_real_dns == ["overpass.example.org", "mirror.example.net"]
+    assert [c["connect_to"] for c in status_endpoint.calls] == [_dns_fakes.OTHER_V4] * 2
+
+
+def test_the_pin_is_held_for_the_get_and_gone_after_it(status_endpoint):
+    """The pin is taken ON the pre-flight's GET and released on every path, or
+    one failed pre-flight would leave `getaddrinfo` patched (or `_PIN_LOCK`
+    held) for the rest of the child."""
+    assert _REAL_PROBE() is None
+    assert status_endpoint.calls[0]["pin_held"] is True
+    assert socket.getaddrinfo is _dns_fakes.dual_stack_getaddrinfo
+    assert not dc._PIN_LOCK.locked()
+
+    def boom():
+        raise requests.exceptions.ConnectionError("[Errno 111] Connection refused")
+
+    status_endpoint.reply = boom
+    assert _REAL_PROBE() is None
+    assert socket.getaddrinfo is _dns_fakes.dual_stack_getaddrinfo
+    assert not dc._PIN_LOCK.locked()
+
+    status_endpoint.reply = lambda: _FakeStatus(429, "rate limited")
+    assert "429" in _REAL_PROBE()
+    assert status_endpoint.calls[-1]["connect_to"] == _dns_fakes.V4
+    assert not dc._PIN_LOCK.locked()
+
+
+def test_the_pin_stacks_on_osmnx_own_patch_and_hands_it_back(status_endpoint):
+    """The SECOND fetch in one process -- `prefreeze_street_networks.py` walks
+    a night's cities serially -- probes with osmnx's permanent `_config_dns`
+    patch already installed by the first query. The pre-flight must still land
+    on the IPv4 address, and on exit put osmnx's patch back rather than the
+    bare resolver it sat on, or the next query loses its own pin."""
+    ox._http._config_dns(dc.DEFAULT_OVERPASS_URL)  # monkeypatch restores it
+    osmnx_patch = socket.getaddrinfo
+    assert osmnx_patch is not _dns_fakes.dual_stack_getaddrinfo
+
+    assert _REAL_PROBE() is None
+    assert status_endpoint.calls[0]["connect_to"] == _dns_fakes.V4
+    assert socket.getaddrinfo is osmnx_patch
+    assert _dns_fakes.connect_address(dc.DEFAULT_OVERPASS_URL) == _dns_fakes.V4
+
+
+def _osmnx_query_address(url: str) -> str:
+    """Where osmnx's query to ``url`` would connect: its own ``_config_dns``
+    pin (which matches the host AS WRITTEN in the URL), then urllib3's lookup
+    (which always asks for the host lowercased)."""
+    ox._http._config_dns(url)  # patches socket.getaddrinfo; monkeypatch restores it
+    return _dns_fakes.connect_address(url)
+
+
+def test_the_fixture_sees_osmnx_miss_a_mixed_case_host(status_endpoint):
+    """Control for the next test: handed a mixed-case URL raw, osmnx's pin
+    compares ``Overpass.Example.org`` against the lowercase host urllib3 asks
+    for, never matches, and its query takes the IPv6 answer. If this ever
+    passes by pinning, osmnx fixed it and the normalization is belt-and-braces."""
+    assert _osmnx_query_address("https://Overpass.Example.org/api") == _dns_fakes.V6
+
+
+def test_a_mixed_case_mirror_is_one_client_for_the_probe_and_the_query(
+    status_endpoint, monkeypatch
+):
+    """Review of #366: `urlsplit().hostname` lowercases, osmnx's
+    `_hostname_from_url` does not. Unnormalized, a mixed-case OVERPASS_URL had
+    the pre-flight pinned to IPv4 and osmnx's query unpinned -- the #366
+    mismatch in reverse. Lowercasing where the URL is configured makes both
+    land on the same address."""
+    monkeypatch.setenv(dsn.OVERPASS_URL_ENV, "https://Overpass.Example.org/api")
+    dsn._apply_overpass_url()
+    assert ox.settings.overpass_url == "https://overpass.example.org/api"
+
+    assert _REAL_PROBE() is None
+    probe_addr = status_endpoint.calls[0]["connect_to"]
+    assert probe_addr == _osmnx_query_address(ox.settings.overpass_url) == _dns_fakes.OTHER_V4
+
+
+def test_normalizing_the_url_touches_only_the_host():
+    """Hostnames are case-insensitive; paths are not."""
+    assert (
+        dc.normalize_overpass_url("https://Overpass-API.DE:8443/API/Interp")
+        == "https://overpass-api.de:8443/API/Interp"
+    )
+    assert dc.normalize_overpass_url(dc.DEFAULT_OVERPASS_URL) == dc.DEFAULT_OVERPASS_URL
+    # Userinfo is a credential (requests sends it as basic auth), and a
+    # password is case-sensitive: lowercasing the whole netloc would break auth
+    # to a private mirror while every probe of it still answered.
+    assert (
+        dc.normalize_overpass_url("https://Me:PassWord@Mirror.Example.org:8443/api")
+        == "https://Me:PassWord@mirror.example.org:8443/api"
+    )
+
+
+def test_a_failed_lookup_is_cant_tell_not_refusing(status_endpoint, monkeypatch):
+    """The OPPOSITE of the breaker's re-check, deliberately. There a failed
+    lookup keeps Overpass latched (fail-closed); here it is one more
+    can't-tell, so the walk proceeds and the real fetch resolves the host its
+    own way (osmnx falls back to DNS-over-HTTPS). Nothing is sent."""
+
+    def no_dns(host):
+        raise socket.gaierror(-2, "Name or service not known")
+
+    monkeypatch.setattr(socket, "gethostbyname", no_dns)
+    assert _REAL_PROBE() is None
+    assert status_endpoint.calls == []
+    assert socket.getaddrinfo is _dns_fakes.dual_stack_getaddrinfo
+    assert not dc._PIN_LOCK.locked()
 
 
 def test_a_refusing_probe_stops_the_fetch_before_any_query(monkeypatch, tmp_path):

@@ -41,6 +41,7 @@ import pandas as pd
 
 from streetscape_metadata_tracker.census import census_is_pano
 from streetscape_metadata_tracker.checkpointing import CensusCache, observation_timestamp
+from streetscape_metadata_tracker.download_common import MAPILLARY_TILE_CONNECTION_LIMIT
 from streetscape_metadata_tracker.download_mapillary import (
     DEFAULT_TILE_JITTER,
     DEFAULT_TILE_REQUESTS_PER_MINUTE,
@@ -114,7 +115,7 @@ async def collect_mapillary_street_samples_async(
     access_token: str,
     output_csv_gz_path: str,
     match_dist_m: float,
-    connection_limit: int = 5,
+    connection_limit: int = MAPILLARY_TILE_CONNECTION_LIMIT,
     request_timeout: float = 30,
     max_requests_per_minute: int = DEFAULT_TILE_REQUESTS_PER_MINUTE,
     jitter: float = DEFAULT_TILE_JITTER,
