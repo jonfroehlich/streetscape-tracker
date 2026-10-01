@@ -1644,10 +1644,12 @@ def test_record_and_get_walk_diff(conn, city):
     # No diff recorded for the 'from' walk.
     assert db.get_walk_diff_for_walk(conn, walk_a) is None
 
-    # Deleting by 'to' walk drops the row; a second delete is a no-op.
-    db.delete_walk_diff_for_walk(conn, walk_b)
+    # Deleting by 'to' walk drops the row and hands back the detail file it
+    # pointed at, since the caller must delete that file (issue #265); a
+    # second delete is a no-op that names nothing.
+    assert db.delete_walk_diff_for_walk(conn, walk_b) == ["diff.csv.gz"]
     assert db.get_walk_diff_for_walk(conn, walk_b) is None
-    db.delete_walk_diff_for_walk(conn, walk_b)
+    assert db.delete_walk_diff_for_walk(conn, walk_b) == []
     assert conn.execute("SELECT COUNT(*) FROM street_walk_diffs").fetchone()[0] == 0
 
 

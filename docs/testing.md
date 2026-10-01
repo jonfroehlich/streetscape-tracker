@@ -30,6 +30,15 @@ already gone wrong once:
 - The v13→v14 migration (`census_fetched_by`/`census_fetched_at` on `runs` and `street_walks`, issue #290): the pair arrives NULL on existing rows, `register_run` round-trips it, and it defaults to NULL rather than to the collecting channel — provenance is recorded, never inferred.
   The load-bearing pin is `test_run_row_carries_every_runs_column`: `_row_to_run` builds `RunRow(**dict(row))` from a `SELECT *`, so a column without a matching dataclass field is a `TypeError` on every `get_latest_run` against a migrated catalog, not a missing feature.
 - An end-to-end migration test with synthetic fixtures
+- **A diff detail file is a function of the diff result** (issue #265), on the grid side in `tests/test_diff.py`, through the real `cli._compute_and_record_diff` with every argument the collector passes:
+  a pair that wrote a detail file and is recomputed to no changes removes it and records `detail_filename = NULL`, parametrized over gsv and mapillary because the name is derived and a dropped `provider` argument would remove the wrong one;
+  a diff that still has changes overwrites a stale file, asserted on CONTENT (a stale file and a fresh one both exist);
+  and the "previous run file missing" return records nothing and deletes nothing.
+  The walk twins, the shared remover's own cases and `db.delete_walk_diff_for_walk`'s returned names are listed under street coverage below.
+- The diff-detail filename shapes the orphan sweep keys on (issue #265): `diff.DIFF_DETAIL_FILENAME_RE` and `naming.STREETWALK_DIFF_FILENAME_RE` are pinned against their generators' own output for every provider (and, for walks, every network type), and against near misses the sweep must never delete — a run CSV and JSON whose slug contains `_diff_`, an explicit `gsv_` token, an unknown provider, a wrong extension, a grid diff offered as a walk diff.
+- `scripts/sweep_orphan_diff_details.py` (`tests/test_sweep_orphan_diff_details.py`): the dry run deletes nothing; `--execute` removes exactly the orphans (one per family, on non-default provider and network tokens) while referenced details, run CSVs and JSON, walk artifacts and a `_diff_`-slugged run survive;
+  a row whose file is missing is reported and the catalog left byte-for-byte as it was;
+  and `main` refuses a `--db-path` that does not exist (before `db.connect` could create it) and a catalog with no runs, since judged against either every diff detail would be an orphan.
 - The one snapshot clock (`tests/test_clock.py`, issue #347): under a pinned America/Los_Angeles zone and a frozen 17:30-PDT instant, `clock.snapshot_date_today()` is the UTC date and not the local one; `db.utc_now_iso` reads the same seam;
   and a grep refuses `date.today()`, `datetime.today()` and a naive `datetime.now()` on the collection path (`checkpointing`, `cli`, `scheduler`, the walk collector, the prefreeze script).
   The grep blanks comments and plain strings in place, so the comment that names `date.today()` does not trip it, but keeps f-strings, whose braces hold code; it keeps each line's own spacing, because re-joining tokens fused `else date.today()` into `elsedate.today()` and the first version missed the very #347 line that way.
@@ -340,6 +349,13 @@ and `hosts_unavailable` is anchored to the blocked-host note's own `; `-delimite
   The fixture helper `_collected` takes a `no_date_pred` that wins over `covered_pred` (a located pano with a null `capture_date` — the status and the date have to disagree in exactly one direction) and a `date` that may be a callable, so each covered sample can carry its own.
 - Streetwalk-name repair script
 - Walk-to-walk diffs (issue #101: gained/lost transitions vs. bare fraction shifts, overlapping counters yielding one detail row, intersection-only diffing of a refreshed network, series isolation across provider/network_type, the spacing/match-dist skip gates, "diffed, no changes" recording a row but no detail file, the v10→v11 migration, and the `coverage_by_highway` backfill script)
+- The walk diff's detail-file lifecycle (issue #265, `tests/test_walk_diff.py`), each case starting from a diff that already wrote a file:
+  a same-date re-collection at a new `--spacing` leaves no file (the issue's reproduction, needing no data change);
+  a re-diff to no changes removes the file and records `detail_filename = NULL`; one that still has changes rewrites it, asserted on content;
+  the "no previous walk" return and a backfilled walk that became the predecessor both remove the file the CLEARED ROW named, which no name derived from today's predecessor reaches;
+  the no-changes branch heals an unreferenced file at the deterministic name, and the has-changes write truncates one;
+  a file already gone is tolerated without a warning, and an unlink raising `OSError` is logged while the diff is still recorded.
+  `fileutils.remove_stale_diff_detail` itself refuses a name with a path component, and `db.delete_walk_diff_for_walk` returns the names it cleared (`tests/test_db.py`).
 - v12 street-length columns (the v11→v12 migration preserving rows and **resuming after a partial migration**
   — the columns are added one ALTER at a time, so a guard checking only the first would strand the rest; the collector and salvage paths persisting the lengths,
   salvage tolerating a pre-v12 artifact rather than raising and forcing a full-cost re-crawl; the manifest publishing the lengths,

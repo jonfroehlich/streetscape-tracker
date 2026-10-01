@@ -86,6 +86,10 @@ The steps below are per (city, provider, run_date):
    — csv renamed `*.rejected` (excluded from the publish glob), nonzero exit so the scheduler counts a failure.
    Otherwise `analysis.calculate_run_stats()` + `db.register_run()`.
 5. `diff.compute_run_diff()` vs the previous run of the same provider → `run_diffs` row + published detail file (`{city_id}_diff_[PROVIDER_]{FROM}_to_{TO}.csv.gz`; gsv keeps the tokenless form).
+   **A diff detail file is a function of the diff result, and the row's pointer is what gets removed** (#265): written (overwriting) when the diff has changes, removed when it has none, and for road walks also removed by the cleared row's own `detail_filename` before any re-diff decides anything (`db.delete_walk_diff_for_walk` returns those names).
+   Both families go through one remover, `fileutils.remove_stale_diff_detail`, which tolerates a missing file and logs rather than raises on any other `OSError`, because it runs after a paid-for crawl is cataloged.
+   Before #265 the file was only ever written, so a re-diff that came out with no changes, or a skipped walk re-diff, left it in `data/` with nothing pointing at it;
+   `scripts/sweep_orphan_diff_details.py` finds those, and a local removal does not reach the web server, since the publish rsync never passes `--delete`.
 6. `json_summarizer.generate_city_metadata_summary_as_json()` — per-run JSON v2, ages pinned to `run_date` (deterministic); gsv runs include the `google_panos` block, other providers only `all_panos`.
    Then `generate_aggregate_v2()` builds `cities.json.gz` (schema v3) from the DB: per city `{city_id, city, providers: {gsv: {latest, runs, change}, mapillary: {...}}}`, with per-provider global histograms.
 

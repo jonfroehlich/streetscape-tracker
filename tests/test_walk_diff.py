@@ -10,7 +10,9 @@ from datetime import date
 import pandas as pd
 import pytest
 
-from streetscape_metadata_tracker import db
+from streetscape_metadata_tracker import db, fileutils
+from streetscape_metadata_tracker.fileutils import remove_stale_diff_detail
+from streetscape_metadata_tracker.naming import generate_streetwalk_diff_filename
 from streetscape_metadata_tracker.walk_diff import (
     DETAIL_COLUMNS,
     compute_and_record_walk_diff,
@@ -518,3 +520,208 @@ def test_recollection_with_changed_frame_clears_stale_diff(conn, data_dir):
     )
     assert change is None
     assert _walk_diff_rows(conn) == []  # the stale diff row is gone
+
+
+# ── The detail file is a function of the diff result (issue #265) ──────────
+#
+# Every case starts from a state the bug produced: a walk diff that wrote a
+# detail file, followed by a re-collection or re-diff. Two removals are pinned
+# separately because they reach different files: the cleared row's OWN
+# pointer (every early return, and a predecessor that changed) and the
+# deterministic name in the no-changes branch (a file no row points at).
+
+D0, D1, D2 = date(2026, 4, 1), date(2026, 5, 1), date(2026, 7, 1)
+OLD_FC = _fc(
+    [_edge("1-2", fraction=0.0, pano_date=None), _edge("2-3", fraction=0.5)],
+    totals={"coverage_pct_by_length": 25.0, "coverage_pct_by_length_any": 25.0},
+)
+NEW_FC = _fc(
+    [_edge("1-2", fraction=0.8), _edge("2-3", fraction=0.5)],
+    totals={"coverage_pct_by_length": 65.0, "coverage_pct_by_length_any": 65.0},
+)
+
+
+def _rediff(conn, data_dir, city_id, walk_id, run_date, fc, *, spacing_m=15.0):
+    return compute_and_record_walk_diff(
+        conn,
+        data_dir=data_dir,
+        city_id=city_id,
+        walk_id=walk_id,
+        run_date=run_date,
+        provider="gsv",
+        network_type="drive",
+        spacing_m=spacing_m,
+        match_dist_m=25.0,
+        fc_new=fc,
+    )
+
+
+def _diffed_pair(conn, data_dir):
+    """Walks at D0 and D2 whose diff has changes and wrote a detail file."""
+    city_id = _register_city(conn)
+    from_walk_id, _ = _register_walk(conn, data_dir, city_id, D0, OLD_FC)
+    walk_id, _ = _register_walk(conn, data_dir, city_id, D2, NEW_FC)
+    change = _rediff(conn, data_dir, city_id, walk_id, D2, NEW_FC)
+    detail_path = os.path.join(data_dir, change["diff_file"])
+    assert os.path.exists(detail_path)
+    return city_id, from_walk_id, walk_id, detail_path
+
+
+def _read_detail(path):
+    with gzip.open(path, "rt") as fh:
+        return pd.read_csv(fh)
+
+
+def _deterministic_detail(data_dir, city_id, from_date, to_date):
+    name = generate_streetwalk_diff_filename(city_id, from_date.isoformat(), to_date.isoformat())
+    return os.path.join(data_dir, name)
+
+
+def test_recollection_at_new_spacing_removes_the_stale_detail_file(conn, data_dir):
+    """The issue's sharpest reproduction, needing no data change: re-collect
+    the same date at a different --spacing. The frame gate skips the diff,
+    and the file the cleared row pointed at must not survive it."""
+    city_id, _, walk_id, detail_path = _diffed_pair(conn, data_dir)
+    _register_walk(conn, data_dir, city_id, D2, NEW_FC, spacing_m=30.0)
+    assert _rediff(conn, data_dir, city_id, walk_id, D2, NEW_FC, spacing_m=30.0) is None
+    assert _walk_diff_rows(conn) == []
+    assert not os.path.exists(detail_path)
+
+
+def test_rediff_to_no_changes_removes_the_file_and_records_null(conn, data_dir):
+    city_id, _, walk_id, detail_path = _diffed_pair(conn, data_dir)
+    _register_walk(conn, data_dir, city_id, D2, OLD_FC)  # re-collected: now identical
+    change = _rediff(conn, data_dir, city_id, walk_id, D2, OLD_FC)
+    assert change is not None
+    assert change["diff_file"] is None
+    rows = _walk_diff_rows(conn)
+    assert len(rows) == 1
+    assert rows[0]["detail_filename"] is None
+    assert not os.path.exists(detail_path)
+
+
+def test_rediff_that_still_has_changes_rewrites_the_file(conn, data_dir):
+    """The happy path keeps a file, and it is THIS diff's file: asserted on
+    content, since the old file and a fresh one both 'exist'."""
+    city_id, _, walk_id, detail_path = _diffed_pair(conn, data_dir)
+    assert _read_detail(detail_path)["new_coverage_fraction"].tolist() == [0.8]
+    newer = _fc(
+        [_edge("1-2", fraction=0.3), _edge("2-3", fraction=0.5)],
+        totals={"coverage_pct_by_length": 40.0, "coverage_pct_by_length_any": 40.0},
+    )
+    _register_walk(conn, data_dir, city_id, D2, newer)
+    change = _rediff(conn, data_dir, city_id, walk_id, D2, newer)
+    assert os.path.join(data_dir, change["diff_file"]) == detail_path
+    assert _read_detail(detail_path)["new_coverage_fraction"].tolist() == [0.3]
+    assert _walk_diff_rows(conn)[0]["detail_filename"] == change["diff_file"]
+
+
+def test_has_changes_overwrites_an_unreferenced_file_at_the_same_name(conn, data_dir):
+    """No row points at the stale file here, so the up-front removal cannot
+    reach it: only the write itself replaces it, and it must truncate."""
+    city_id = _register_city(conn)
+    _register_walk(conn, data_dir, city_id, D0, OLD_FC)
+    walk_id, _ = _register_walk(conn, data_dir, city_id, D2, NEW_FC)
+    stale = _deterministic_detail(data_dir, city_id, D0, D2)
+    with gzip.open(stale, "wt") as fh:
+        fh.write("stale,content\nfrom,before\n")
+    _rediff(conn, data_dir, city_id, walk_id, D2, NEW_FC)
+    back = _read_detail(stale)
+    assert list(back.columns) == DETAIL_COLUMNS
+    assert back["edge_id"].tolist() == ["1-2"]
+
+
+def test_no_changes_heals_an_orphan_at_the_deterministic_name(conn, data_dir):
+    """A file stranded before #265 has no row pointing at it, so only the
+    no-changes branch's removal by name can reach it."""
+    city_id = _register_city(conn)
+    _register_walk(conn, data_dir, city_id, D0, OLD_FC)
+    walk_id, _ = _register_walk(conn, data_dir, city_id, D2, OLD_FC)
+    orphan = _deterministic_detail(data_dir, city_id, D0, D2)
+    with open(orphan, "w") as fh:
+        fh.write("x")
+    assert _rediff(conn, data_dir, city_id, walk_id, D2, OLD_FC)["diff_file"] is None
+    assert not os.path.exists(orphan)
+
+
+def test_no_previous_walk_removes_the_file_the_cleared_row_pointed_at(conn, data_dir):
+    """'No previous walk' returns before any from-date exists, so no name can
+    be derived there; only the cleared row's own pointer reaches the file.
+    The predecessor is moved out of the series in place, which leaves the
+    stale diff row (and its foreign key) exactly as the first diff wrote it."""
+    city_id, from_walk_id, walk_id, detail_path = _diffed_pair(conn, data_dir)
+    conn.execute(
+        "UPDATE street_walks SET network_type = 'all_public' WHERE walk_id = ?", (from_walk_id,)
+    )
+    conn.commit()
+    assert _rediff(conn, data_dir, city_id, walk_id, D2, NEW_FC) is None
+    assert _walk_diff_rows(conn) == []
+    assert not os.path.exists(detail_path)
+
+
+def test_changed_predecessor_removes_the_old_rows_file_not_todays_name(conn, data_dir):
+    """A walk backfilled between the pair makes it the new predecessor, so a
+    name re-derived from TODAY's predecessor (D1->D2) is not the file the old
+    row named (D0->D2). Removing by the row's pointer is what reaches it."""
+    city_id, _, walk_id, detail_path = _diffed_pair(conn, data_dir)
+    _register_walk(conn, data_dir, city_id, D1, NEW_FC)
+    change = _rediff(conn, data_dir, city_id, walk_id, D2, NEW_FC)
+    assert change["from"] == D1.isoformat()
+    assert change["diff_file"] is None  # D1 and D2 are identical
+    assert not os.path.exists(detail_path)
+    assert not os.path.exists(_deterministic_detail(data_dir, city_id, D1, D2))
+
+
+def test_a_missing_detail_file_at_delete_time_is_tolerated(conn, data_dir, caplog):
+    """The row points at a file that is already gone: nothing raises, nothing
+    is reported as a failure, and the skip still clears the row."""
+    city_id, _, walk_id, detail_path = _diffed_pair(conn, data_dir)
+    os.remove(detail_path)
+    _register_walk(conn, data_dir, city_id, D2, NEW_FC, spacing_m=30.0)
+    with caplog.at_level("WARNING"):
+        assert _rediff(conn, data_dir, city_id, walk_id, D2, NEW_FC, spacing_m=30.0) is None
+    assert _walk_diff_rows(conn) == []
+    assert "Could not remove" not in caplog.text
+
+
+def test_an_unlink_oserror_is_logged_and_the_diff_still_recorded(
+    conn, data_dir, caplog, monkeypatch
+):
+    """A failed unlink must never sink a paid-for crawl's diff: the warning is
+    logged, the file stays (and is the sweep's to find), the row is written."""
+    city_id, _, walk_id, detail_path = _diffed_pair(conn, data_dir)
+    _register_walk(conn, data_dir, city_id, D2, OLD_FC)
+
+    def refuse(path):
+        raise PermissionError(13, "Permission denied", path)
+
+    monkeypatch.setattr(fileutils.os, "remove", refuse)
+    with caplog.at_level("WARNING"):
+        change = _rediff(conn, data_dir, city_id, walk_id, D2, OLD_FC)
+    assert change is not None
+    assert change["diff_file"] is None
+    rows = _walk_diff_rows(conn)
+    assert len(rows) == 1
+    assert rows[0]["detail_filename"] is None
+    assert os.path.exists(detail_path)
+    assert "Could not remove stale diff detail" in caplog.text
+
+
+# ── remove_stale_diff_detail, the one remover both diff families share ─────
+
+
+def test_remover_reports_a_missing_file_quietly(data_dir, caplog):
+    with caplog.at_level("WARNING"):
+        assert (
+            remove_stale_diff_detail(data_dir, "absent_diff_2026-04-01_to_2026-07-01.csv.gz")
+            is False
+        )
+        assert remove_stale_diff_detail(data_dir, None) is False
+    assert caplog.text == ""
+
+
+def test_remover_refuses_a_name_with_a_path_component(tmp_path, data_dir):
+    victim = tmp_path / "victim.csv.gz"
+    victim.write_text("x")
+    assert remove_stale_diff_detail(data_dir, "../victim.csv.gz") is False
+    assert victim.exists()

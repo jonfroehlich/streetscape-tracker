@@ -1819,17 +1819,30 @@ def get_walk_diff_for_walk(conn: sqlite3.Connection, to_walk_id: int) -> sqlite3
     ).fetchone()
 
 
-def delete_walk_diff_for_walk(conn: sqlite3.Connection, to_walk_id: int) -> None:
-    """Drop any recorded diff whose 'to' side is the given walk.
+def delete_walk_diff_for_walk(conn: sqlite3.Connection, to_walk_id: int) -> list[str]:
+    """Drop any recorded diff whose 'to' side is the given walk, returning the
+    detail filenames the deleted rows pointed at (NULL ``detail_filename``
+    omitted).
 
     A same-day re-collection replaces the walk's street_walks row in place
     (the register upsert keeps walk_id), so a diff recorded against the
     replaced artifact is stale the moment the walk is re-registered. The
     orchestrator clears it before deciding whether a fresh diff is possible;
-    a no-op when no diff exists (every nightly walk).
+    a no-op returning ``[]`` when no diff exists (every nightly walk).
+
+    The names are returned because this function touches no files, and the
+    row is the only durable record of which published file it vouched for
+    (issue #265): the caller deletes exactly those files. Removing by the
+    row's own pointer is what stays correct if the walk's predecessor has
+    changed since the diff was recorded — a name re-derived from TODAY's
+    predecessor would miss the file the old row named.
     """
+    rows = conn.execute(
+        "SELECT detail_filename FROM street_walk_diffs WHERE to_walk_id = ?", (to_walk_id,)
+    ).fetchall()
     conn.execute("DELETE FROM street_walk_diffs WHERE to_walk_id = ?", (to_walk_id,))
     conn.commit()
+    return [row["detail_filename"] for row in rows if row["detail_filename"]]
 
 
 # ── API budget ledger ──────────────────────────────────────────────────────

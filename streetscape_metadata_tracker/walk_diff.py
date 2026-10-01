@@ -36,6 +36,7 @@ import numpy as np
 import pandas as pd
 
 from . import db
+from .fileutils import remove_stale_diff_detail
 from .naming import generate_streetwalk_diff_filename
 
 logger = logging.getLogger(__name__)
@@ -329,22 +330,32 @@ def compute_and_record_walk_diff(
     resume once two same-frame walks exist), or a missing previous artifact.
 
     The DB row is recorded even when nothing changed — "diffed, no changes"
-    and "never diffed" are different facts — but the detail file is only
-    written when there are changes, mirroring the grid diff.
+    and "never diffed" are different facts — but the published detail file is
+    a function of the diff result, mirroring the grid diff (issue #265): it
+    exists only when the recorded diff has changes, is OVERWRITTEN when a
+    re-diff still has changes, and is removed when it no longer does.
 
     Any diff previously recorded into this walk is cleared up front: a
     same-day re-collection replaces the street_walks row in place (the
     register upsert keeps walk_id), so a diff recorded by the earlier
     collection describes a replaced artifact — the happy path re-records it
     below, and a skip (e.g. the re-collection changed --spacing) must not
-    leave the manifest advertising a stale change block.
+    leave the manifest advertising a stale change block. The detail file that
+    cleared row pointed at is removed in the same step, by the ROW'S OWN
+    pointer: that one seam covers every early return below (including "no
+    previous walk", where no from-date exists to build a name from), and it
+    stays right even if the predecessor changed since the old diff was
+    recorded, which a name re-derived from today's predecessor would not.
+    The no-changes branch additionally removes the deterministic name, which
+    heals a file no row points at (an orphan from before #265).
 
     Args:
         fc_new: the new walk's coverage FeatureCollection when the caller
             already holds it in memory (the collector does); loaded from the
             walk's cataloged coverage_filename otherwise.
     """
-    db.delete_walk_diff_for_walk(conn, walk_id)
+    for stale_detail in db.delete_walk_diff_for_walk(conn, walk_id):
+        remove_stale_diff_detail(data_dir, stale_detail)
 
     prev = db.get_previous_street_walk(
         conn, city_id, run_date, provider=provider, network_type=network_type
@@ -396,16 +407,21 @@ def compute_and_record_walk_diff(
 
     diff = compute_walk_diff(fc_old, fc_new)
 
+    # Named unconditionally: the file at this name is either rewritten from
+    # this diff or removed, never left describing a previous computation.
+    detail_name = generate_streetwalk_diff_filename(
+        city_id,
+        prev["run_date"],
+        run_date.isoformat(),
+        provider=provider,
+        network_type=network_type,
+    )
     detail_filename = None
     if diff.has_changes:
-        detail_filename = generate_streetwalk_diff_filename(
-            city_id,
-            prev["run_date"],
-            run_date.isoformat(),
-            provider=provider,
-            network_type=network_type,
-        )
+        detail_filename = detail_name
         write_walk_diff_detail(diff, os.path.join(data_dir, detail_filename))
+    else:
+        remove_stale_diff_detail(data_dir, detail_name)
 
     db.record_street_walk_diff(
         conn,
