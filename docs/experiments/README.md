@@ -52,7 +52,7 @@ Offline: the real engine against a local HTTPS stand-in behind a latency proxy, 
 Fixed, the engine holds 48,000/min wherever mean latency is under ~62 ms (50 sockets / 800 per second).
 Two things generalize.
 **(1) A coverage-dependent slowdown can be a barrier, not a per-item cost**: each batch lasts as long as its slowest response, so a slower response class sets the pace as soon as a batch contains any of it.
-**(2) A saturated limiter must be measured, not assumed to deliver its setting**: this one delivered 79–83% once nothing else bound, and was invisible for as long as something else did.
+**(2) A saturated limiter must be measured, not assumed to deliver its setting**: this one delivered 82–88% once nothing else bound (79–83% in the first, hand-picked reading), and was invisible for as long as something else did.
 The latency scenario that reproduces production's curve is a fit, labelled as one, never a measurement of Google.
 
 ### `kartaview-feasibility.md`
