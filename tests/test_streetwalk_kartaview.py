@@ -89,6 +89,10 @@ def _setup(
     images,
     *,
     api_requests=9,
+    api_requests_total=None,
+    census_fetched_by=None,
+    census_fetched_at=None,
+    census_reused=False,
     failed_cells=None,
     token=None,
     raises=None,
@@ -137,14 +141,22 @@ def _setup(
         calls["reuse_census"] = policy.reuse if policy else None
         return {
             "census": records_to_census(images),
+            # This process's spend and the whole sweep's. The fake never
+            # resumes, so the total defaults to this process's figure; left
+            # permanently equal, swapping the two anywhere between the sweep
+            # and the catalog passed every test here (#333).
             "api_requests": api_requests,
-            "api_requests_total": api_requests,
+            "api_requests_total": (
+                api_requests if api_requests_total is None else api_requests_total
+            ),
             "checkpoint_path": kwargs.get("checkpoint_path"),
             "cells_visited": 4,
             "failed_cells": failed_cells or [],
-            "census_fetched_by": kwargs.get("checkpoint_channel"),
-            "census_fetched_at": None,
-            "census_reused": False,
+            # Census provenance (#290). Defaults mimic an ordinary fresh sweep:
+            # this channel paid, and nothing was reused.
+            "census_fetched_by": census_fetched_by or kwargs.get("checkpoint_channel"),
+            "census_fetched_at": census_fetched_at,
+            "census_reused": census_reused,
         }
 
     monkeypatch.setattr(ck, "fetch_city_images_async", fake_sweep)
@@ -587,3 +599,144 @@ def test_cost_is_independent_of_spacing(tmp_path, monkeypatch):
     assert db.get_api_usage(conn, date.fromisoformat(RUN_DATE), provider="kartaview_streets") == 18
     conn.close()
     assert calls["n"] == coarse + 1
+
+
+# ── Spend, and what a failure still owes the ledger (#333) ──────────────────
+
+
+def test_the_walk_row_takes_the_crawl_and_the_ledger_takes_this_process(tmp_path, monkeypatch):
+    """
+    The #239/#256 split, on the channel that actually resumes across nights:
+    `street_walks.api_requests` describes the WALK (every resume), while
+    `api_usage` is additive and keyed by (date, provider), so it may only ever
+    receive what THIS process spent.
+
+    Driven apart deliberately (37 vs 412: neither is a multiple of the other,
+    nor of any other count in this fixture). Every other test in this file
+    leaves the two equal because the fake never resumes, and while they were
+    equal everywhere, swapping the two keys in the collector's return dict
+    passed every KartaView test (#333). Uncaught, a sweep resumed after spending
+    375 requests on a prior night reports 412 to tonight's budget gate, against
+    a host that meters by IP and sends no Retry-After.
+
+    The fixture's sweep is the UN-cached path: it replaces
+    `fetch_city_images_async` wholesale, so the census cache is never consulted
+    and this process's spend is the non-zero 37 it returns, not a paired night's 0.
+    """
+    data_dir, _ = _setup(
+        tmp_path,
+        monkeypatch,
+        [_image("kv1", 44.05, -121.30)],
+        api_requests=37,
+        api_requests_total=412,
+    )
+    assert collect.run_collect(_args(data_dir)) == 0
+
+    conn = db.connect(db.get_default_db_path(data_dir))
+    walk = db.get_latest_street_walk(conn, CITY_ID, provider="kartaview")
+    spent = db.get_api_usage(conn, date.fromisoformat(RUN_DATE), provider="kartaview_streets")
+    conn.close()
+    assert walk["api_requests"] == 412, "the row carries the whole sweep"
+    assert spent == 37, "the ledger carries only this process's spend"
+
+
+def test_a_walk_whose_tail_dies_still_records_what_this_process_spent(tmp_path, monkeypatch):
+    """
+    The checkpoint is what turns a tail failure into a PERMANENT loss rather
+    than a wasted night, and is why the collector attaches its spend to the
+    exception.
+
+    With a checkpoint, the sweep survives COMPLETE and the next invocation
+    re-finalizes it for zero requests -- so a spend missed here lands in no
+    `api_usage` row, EVER. And the figure attached has to be THIS process's:
+    the failure path feeds the same additive ledger the success path does, so
+    charging the whole sweep there is the #333 swap by another route.
+
+    The two figures are driven apart (37 vs 412) so the test pins WHICH one the
+    failure path charges, not merely that it charges something.
+    """
+    data_dir, _ = _setup(
+        tmp_path,
+        monkeypatch,
+        [_image("kv1", 44.05, -121.30)],
+        api_requests=37,
+        api_requests_total=412,
+    )
+
+    def explode(*a, **k):
+        raise OSError("no space left on device")
+
+    # After the sweep is paid for, before the CSV lands -- and NOT a
+    # DownloadError, so this also pins that `collect`'s `except Exception` is
+    # wide enough to see it.
+    monkeypatch.setattr(ck, "build_streetwalk_rows", explode)
+
+    assert collect.run_collect(_args(data_dir)) == 1
+    assert not os.path.exists(_walk_csv(data_dir)), "a failed tail publishes nothing"
+    conn = db.connect(db.get_default_db_path(data_dir))
+    spent = db.get_api_usage(conn, date.fromisoformat(RUN_DATE), provider="kartaview_streets")
+    conn.close()
+    assert spent == 37, "the requests were bought; the ledger has to know, at this process's figure"
+
+
+def test_a_reused_census_says_who_paid_for_it_and_when(tmp_path, monkeypatch):
+    """
+    The zero has to be LEGIBLE. `street_walks.api_requests = 0` on a fully
+    walked city reads as a bug unless the row also records that the
+    `kartaview` grid channel bought the census and when the provider was
+    observed -- which is what the v14 provenance columns are for (#290).
+
+    The fixture's defaults return this channel as the payer and no timestamp,
+    and no test read either column back, so hardcoding either field to None in
+    the collector's return dict passed every KartaView test (#333). Non-default
+    values on both, asserted on the row, make the pass-through observable.
+    """
+    observed = "2026-07-07T22:15:00+00:00"
+    data_dir, _ = _setup(
+        tmp_path,
+        monkeypatch,
+        [_image("kv1", 44.05, -121.30)],
+        api_requests=0,
+        census_fetched_by="kartaview",
+        census_fetched_at=observed,
+        census_reused=True,
+    )
+    assert collect.run_collect(_args(data_dir)) == 0
+
+    conn = db.connect(db.get_default_db_path(data_dir))
+    walk = db.get_latest_street_walk(conn, CITY_ID, provider="kartaview")
+    spent = db.get_api_usage(conn, date.fromisoformat(RUN_DATE), provider="kartaview_streets")
+    conn.close()
+    assert walk["api_requests"] == 0, "a reused census costs nothing"
+    assert spent == 0, "and charges no ledger"
+    assert walk["census_fetched_by"] == "kartaview", "the GRID channel paid, and the row says so"
+    assert walk["census_fetched_at"] == observed
+
+
+def test_a_reused_census_stamps_its_rows_with_when_kartaview_was_observed(tmp_path, monkeypatch):
+    """Every row of a reused census was fetched by another collection, possibly
+    on an earlier night.
+
+    Stamping `query_timestamp` with this process's clock would record an
+    observation that never happened -- and `json_summarizer` reports the run's
+    start and end from exactly that column, so a walk reusing a grid run's
+    sweep from the night before would publish a window it never covered.
+    Replacing `observation_timestamp(fetched, started_at)` with `started_at`
+    left every KartaView test green (#333), as it had the Panoramax file.
+    """
+    observed = "2026-07-07T22:15:00+00:00"
+    data_dir, _ = _setup(
+        tmp_path,
+        monkeypatch,
+        [_image("kv1", 44.05, -121.30)],
+        api_requests=0,
+        census_fetched_by="kartaview",
+        census_fetched_at=observed,
+        census_reused=True,
+    )
+    assert collect.run_collect(_args(data_dir)) == 0
+
+    body = _rows(_walk_csv(data_dir))
+    ts_i = body[0].split(",").index("query_timestamp")
+    stamps = {r.split(",")[ts_i] for r in body[1:]}
+    assert stamps == {observed}, f"every row must carry the observation time, got {stamps}"
