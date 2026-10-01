@@ -297,8 +297,15 @@ def test_the_mapillary_grid_and_walk_hold_one_socket_count_on_the_tile_cdn(monke
     def default_of(fn):
         return inspect.signature(fn).parameters["connection_limit"].default
 
+    from streetscape_street_analyzer import collect_mapillary
+
     grid_default = default_of(dm.download_mapillary_metadata_async)
     assert grid_default == default_of(dm.fetch_city_images_async)
+    # The two defaults no production caller reaches today -- every caller
+    # passes the value -- pinned anyway, because the next caller that omits it
+    # inherits whatever they say, on the same per-IP host.
+    assert grid_default == default_of(dm._fetch_city_images)
+    assert grid_default == default_of(collect_mapillary.collect_mapillary_street_samples_async)
     assert grid_default == WALK_CONNECTION_LIMITS["mapillary"]
     assert WALK_CONNECTION_LIMITS["mapillary"] == MAPILLARY_TILE_CONNECTION_LIMIT == 5
 
