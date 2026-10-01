@@ -307,6 +307,13 @@ def test_an_undownloaded_tile_marks_its_points_REQUEST_FAILED_not_ZERO_RESULTS(
     assert list(mask) == [True, False]
 
 
+# The moved-endpoint GUARD's own wording. Not "has moved or been renamed": each
+# 404 also raises TileNotServedError saying that, so the generic tile-failure
+# refusal carries the phrase too, and a match on it stayed green with the guard
+# deleted (found by mutation, #407).
+_MOVED_ENDPOINT = r"Every one of the \d+ Panoramax tiles requested for .* answered HTTP 404"
+
+
 def test_a_lattice_that_answers_404_EVERYWHERE_is_refused_rather_than_published(
     monkeypatch, tmp_path, straddling_city
 ):
@@ -319,7 +326,7 @@ def test_a_lattice_that_answers_404_EVERYWHERE_is_refused_rather_than_published(
     """
     lat, lon = straddling_city
     tiles = dp.tiles_for_bbox(*dp.grid_bbox(lat, lon, 100, 100, 20))
-    with pytest.raises(DownloadError, match="has moved or been renamed"):
+    with pytest.raises(DownloadError, match=_MOVED_ENDPOINT):
         _run(monkeypatch, tmp_path, {}, lat, lon, missing=set(tiles))
 
 
@@ -347,7 +354,7 @@ def test_a_404_LATTICE_is_still_refused_on_the_NIGHT_AFTER_it_checkpointed(
     checkpoint_path = str(tmp_path / "crawl")
 
     for night in (1, 2):
-        with pytest.raises(DownloadError, match="has moved or been renamed"):
+        with pytest.raises(DownloadError, match=_MOVED_ENDPOINT):
             _run(
                 monkeypatch,
                 tmp_path,
