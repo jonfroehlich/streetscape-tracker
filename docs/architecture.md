@@ -105,6 +105,7 @@ The steps below are per (city, provider, run_date):
    It therefore lists the directory before reading the catalog, never deletes a file younger than `--min-age-hours` (24 by default), re-checks each name against both tables just before unlinking it, and refuses `--execute` while a `run-due` is in flight.
    It opens the catalog read-only (`mode=rw` plus `PRAGMA query_only`, never `db.connect`, which would migrate it; `mode=ro` was measured to leave `-wal`/`-shm` sidecars behind on a WAL catalog).
    It refuses a catalog of another schema version or one with no runs or walks, and it refuses `--execute` against a catalog that looks older than the disk, i.e. an unreferenced diff dated after its newest run or walk.
+   An existing diff is re-derived under the current reader and definitions by `scripts/recompute_run_diffs.py` (#245), which updates the row in place so its `diff_id` — and with it which comparison the published change blocks treat as current — never moves; `recompute_run_stats.py` does not touch diffs.
 6. `json_summarizer.generate_city_metadata_summary_as_json()` — per-run JSON v2, ages pinned to `run_date` (deterministic); gsv runs include the `google_panos` block, other providers only `all_panos`.
    Then `generate_aggregate_v2()` builds `cities.json.gz` (schema v3) from the DB: per city `{city_id, city, providers: {gsv: {latest, runs, change}, mapillary: {...}}}`, with per-provider global histograms.
 

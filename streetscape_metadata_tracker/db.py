@@ -1377,9 +1377,80 @@ def record_diff(
     return cur.lastrowid
 
 
+def update_diff(
+    conn: sqlite3.Connection,
+    diff_id: int,
+    *,
+    grid_aligned: bool,
+    panos_added: int,
+    panos_removed: int,
+    panos_persisted: int,
+    capture_date_changed: int,
+    points_gained_coverage: int | None,
+    points_lost_coverage: int | None,
+    coverage_delta_pct: float | None,
+    detail_filename: str | None,
+) -> None:
+    """
+    Overwrite an existing diff's recomputed columns IN PLACE, keeping its
+    ``diff_id`` (issue #245's repair handle, ``scripts/recompute_run_diffs.py``).
+
+    Not ``record_diff``: that is INSERT OR REPLACE on (from_run_id, to_run_id),
+    which deletes the row and inserts a new one under a NEW ``diff_id``. The id
+    is not cosmetic — ``get_latest_runs_all`` and ``get_diff_for_run`` pick the
+    MAX ``diff_id`` per ``to_run_id`` ("the most recently computed comparison
+    wins"), so re-recording an OLDER comparison into a run that also has a newer
+    one would silently change which baseline the published change blocks
+    advertise. A repair must not change which comparison is current.
+
+    ``computed_at`` IS refreshed: the row's numbers were recomputed now, and the
+    column records when, not when the pair was first compared. The identity
+    columns (city_id, from_run_id, to_run_id) are never touched.
+
+    Raises ``LookupError`` when no row has ``diff_id`` — a repair that updated
+    nothing must not read as one that succeeded.
+    """
+    cur = conn.execute(
+        """UPDATE run_diffs SET
+             grid_aligned = ?, panos_added = ?, panos_removed = ?, panos_persisted = ?,
+             capture_date_changed = ?, points_gained_coverage = ?,
+             points_lost_coverage = ?, coverage_delta_pct = ?, detail_filename = ?,
+             computed_at = ?
+           WHERE diff_id = ?""",
+        (
+            int(grid_aligned),
+            panos_added,
+            panos_removed,
+            panos_persisted,
+            capture_date_changed,
+            points_gained_coverage,
+            points_lost_coverage,
+            coverage_delta_pct,
+            detail_filename,
+            utc_now_iso(),
+            diff_id,
+        ),
+    )
+    if cur.rowcount != 1:
+        conn.rollback()
+        raise LookupError(f"run_diffs has no row with diff_id {diff_id}")
+    conn.commit()
+
+
 def get_diff_for_run(conn: sqlite3.Connection, to_run_id: int) -> sqlite3.Row | None:
-    """The diff whose 'to' side is the given run, or None."""
-    return conn.execute("SELECT * FROM run_diffs WHERE to_run_id = ?", (to_run_id,)).fetchone()
+    """The diff whose 'to' side is the given run, or None.
+
+    When a run has been diffed against two predecessors (an earlier run was
+    purged and the diff recomputed), the newest ``diff_id`` wins — the same
+    explicit choice ``get_latest_runs_all`` makes, so the per-run JSON's
+    replayed change block, the aggregate's ``change`` block and the driving
+    page cannot advertise different baselines for one run. An unordered
+    ``fetchone`` here returned whichever row SQLite scanned first.
+    """
+    return conn.execute(
+        "SELECT * FROM run_diffs WHERE to_run_id = ? ORDER BY diff_id DESC LIMIT 1",
+        (to_run_id,),
+    ).fetchone()
 
 
 def get_latest_runs_all(conn: sqlite3.Connection) -> list[sqlite3.Row]:

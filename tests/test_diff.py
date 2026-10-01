@@ -17,6 +17,7 @@ from streetscape_metadata_tracker.diff import (
     generate_diff_filename,
     is_diff_detail_filename,
 )
+from streetscape_metadata_tracker.download_common import standardize_capture_date
 from streetscape_metadata_tracker.fileutils import load_city_csv_file
 from streetscape_metadata_tracker.naming import (
     KNOWN_PROVIDERS,
@@ -182,6 +183,58 @@ def test_duplicate_pano_ids_deduped_keeping_newest_date():
     d = compute_run_diff(old, new)
     assert d.panos_persisted == 1
     assert d.capture_date_changed == 0  # newest old date matches new date
+
+
+# ── A month-precision baseline compares EQUAL to its GSV successor (#245) ───
+#
+# Issue #245 predicted that the next diff of a legacy month-precision baseline
+# would report a capture-date change for nearly every pano ('2022-09-01' vs a
+# real '2022-09-15') and proposed a precision-aware comparison. It does not:
+# the GSV writer pins the API's YYYY-MM to the 1st (standardize_capture_date;
+# its "2024-05" -> "2024-05-01" case is in tests/test_download_common.py), and
+# docs/experiments/capture-date-precision.md measured 100.00% of GSV day-shaped
+# dates on the 1st. So both sides read 2022-09-01 through the post-#244 loader.
+# These pin that equality END TO END — writer -> CSV -> real loader -> diff —
+# so a reader or writer change that reopens the question fails here.
+
+
+def _loaded_run(data_dir, run_date, panos):
+    name = generate_run_filename("bend--oregon--united-states", 1000, 1000, 20, run_date)
+    path = write_city_csv_gz(make_city_df(panos, run_date=run_date), f"{data_dir}/{name}.csv.gz")
+    return load_city_csv_file(path)
+
+
+def _gsv_written(api_dates):
+    """Dates as the GSV collector writes them: the API's string through
+    standardize_capture_date."""
+    return [(pano_id, standardize_capture_date(raw)) for pano_id, raw in api_dates]
+
+
+def test_month_precision_baseline_equals_its_first_pinned_successor(data_dir):
+    legacy = [("p1", "2022-09"), ("p2", "2019-01"), ("p3", "2015-12")]
+    baseline = _loaded_run(data_dir, date(2024, 12, 15), legacy)
+    later = _loaded_run(data_dir, date(2026, 7, 1), _gsv_written(legacy))
+    d = compute_run_diff(baseline, later)
+    assert d.panos_persisted == 3
+    assert d.capture_date_changed == 0
+    assert not d.has_changes
+
+
+def test_month_precision_baseline_still_reports_a_genuine_redate(data_dir):
+    """The negative control: without it the test above would pass for a
+    comparison that never reports anything."""
+    legacy = [("p1", "2022-09"), ("p2", "2019-01"), ("p3", "2015-12")]
+    redriven = [("p1", "2022-09"), ("p2", "2019-02"), ("p3", "2015-12")]
+    baseline = _loaded_run(data_dir, date(2024, 12, 15), legacy)
+    later = _loaded_run(data_dir, date(2026, 7, 1), _gsv_written(redriven))
+    d = compute_run_diff(baseline, later)
+    assert d.capture_date_changed == 1
+    (row,) = d.detail.itertuples()
+    assert (row.pano_id, row.old_capture_date, row.new_capture_date) == (
+        "p2",
+        "2019-01-01",
+        "2019-02-01",
+    )
 
 
 def test_diff_filename():

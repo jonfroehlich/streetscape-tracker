@@ -62,7 +62,7 @@ from .city_registration import (
     resolve_or_register_city,
     warn_overrides_ignored,
 )
-from .diff import compute_run_diff, generate_diff_filename, write_diff_detail
+from .diff import compute_run_diff, generate_diff_filename, sync_diff_detail
 from .download_common import (
     SWEEP_INCOMPLETE_EXIT_CODE,
     HostBusyError,
@@ -81,7 +81,7 @@ from .download_panoramax import DEFAULT_TILE_JITTER as DEFAULT_PANORAMAX_JITTER
 from .download_panoramax import (
     DEFAULT_TILE_REQUESTS_PER_MINUTE as DEFAULT_PANORAMAX_REQUESTS_PER_MINUTE,
 )
-from .fileutils import load_city_csv_file, remove_stale_diff_detail
+from .fileutils import load_city_csv_file
 from .json_summarizer import (
     generate_aggregate_v2,
     generate_city_metadata_summary_as_json,
@@ -643,12 +643,8 @@ def _compute_and_record_diff(
     detail_name = generate_diff_filename(
         city_row.city_id, prev_run.run_date, run_date.isoformat(), provider=provider
     )
-    detail_filename = None
-    if diff.has_changes:
-        detail_filename = detail_name
-        write_diff_detail(diff, os.path.join(download_dir, detail_filename))
-    else:
-        remove_stale_diff_detail(download_dir, detail_name)
+    # Written or removed by the one helper the repair script also uses (#245).
+    detail_filename = sync_diff_detail(diff, download_dir, detail_name)
 
     db.record_diff(
         conn,
