@@ -605,10 +605,15 @@ def _compute_and_record_diff(
     No row lookup is needed, unlike the walk side, because the name the old
     row held and the name derived here are the same string: both come from
     the two runs' dates and the provider, and a run date is UNIQUE within a
-    (city, provider) series. A grid run is never replaced in place either —
-    ``_collect_one_run`` answers "nothing to do" for a date already
-    cataloged, ``register_run`` is a plain INSERT that refuses a duplicate,
-    and a ``runs`` row cannot be deleted while a ``run_diffs`` row references
+    (city, provider) series. A grid run is never replaced in place either.
+    ``register_run`` is a plain INSERT, and the runs table's UNIQUE
+    (city_id, provider, run_date) refuses a duplicate date before any diff is
+    computed; ``_collect_one_run``'s "nothing to do" check is only an early
+    exit for the LATEST run's date. A backdated ``--run-date`` matching an
+    older cataloged run gets past it and is refused before any diff, by the
+    existing-snapshot guard when that run's CSV name is on disk and by the
+    INSERT's UNIQUE constraint otherwise. And a
+    ``runs`` row cannot be deleted while a ``run_diffs`` row references
     it (foreign keys are on; ``scripts/purge_tainted_runs.py`` removes the
     diff rows AND their files first). So every call diffs a freshly inserted
     ``to_run_id``, and the only file this pair can ever have had is the

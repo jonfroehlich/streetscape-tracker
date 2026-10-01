@@ -643,16 +643,17 @@ def generate_streetwalk_diff_filename(
 # the explicit provider and network alternations (longest-first, as in
 # _STREETWALK_FILENAME_RE) rather than wildcards, and anchored on the
 # 'DATE_to_DATE.csv.gz' tail. Pinned against the generator in test_naming.py.
+# \Z rather than $, which would also accept a trailing newline.
 STREETWALK_DIFF_FILENAME_RE = re.compile(
     r"^(?P<slug>.+?)_" + STREETWALK_DIFF_MARKER + rf"(?:_(?P<provider>{_STREETWALK_PROVIDER_ALT}))?"
     rf"(?:_(?P<network>{_STREETWALK_NETWORK_ALT}))?"
-    r"_(?P<from_date>\d{4}-\d{2}-\d{2})_to_(?P<to_date>\d{4}-\d{2}-\d{2})\.csv\.gz$"
+    r"_(?P<from_date>\d{4}-\d{2}-\d{2})_to_(?P<to_date>\d{4}-\d{2}-\d{2})\.csv\.gz\Z"
 )
 
 
 def is_streetwalk_diff_filename(filename: str) -> bool:
     """True when ``filename`` has the exact shape of a walk diff detail file."""
-    return bool(STREETWALK_DIFF_FILENAME_RE.match(filename))
+    return STREETWALK_DIFF_FILENAME_RE.fullmatch(filename) is not None
 
 
 def same_grid_geometry(filename_a: str, filename_b: str) -> bool:
