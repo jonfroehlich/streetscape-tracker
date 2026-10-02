@@ -40,18 +40,27 @@ DATA_SOURCES = REPO_ROOT / "data_sources"
 # display name and a URL, and the slug is permanent.
 ASCII_SPELLING_OVERRIDES = {"2692969": "Malmo"}
 
-# Two cities whose GeoNames-derived query matches the WRONG OSM feature, caught
-# before registration by comparing each geocoded center against the GeoNames
-# coordinates (the 50 km --max-center-km guard sees neither):
+# Three cities whose GeoNames-derived query freezes the wrong grid. Two match
+# the WRONG OSM feature, caught before registration by comparing each geocoded
+# center against the GeoNames coordinates (the 50 km --max-center-km guard sees
+# neither):
 #   Sandusky -> "Sandusky County, Ohio", a different county ~36 km west of the
 #     city, which is in Erie County.
 #   Brussels -> the City of Brussels commune (8.7x13.1 km), about a fifth of the
 #     19-commune Brussels-Capital Region the coverage number is meant to describe.
+# The third is a different failure mode, caught only AFTER registration (#302):
+#   Copenhagen -> a polygon-less place/city node, so get_search_dimensions fell
+#     back to the node's bbox: 20.1x35.6 km (717 km2), ~15 km into countryside
+#     and the Oresund. The catalog was re-registered from "Copenhagen
+#     Municipality, Denmark" (17.7x13.3 km) with resize_city.py while it had no
+#     runs; this row is what keeps a fresh registration from re-freezing the bad
+#     box, since geometry is frozen and no later run can correct it.
 # An override changes only the GEOCODE query. Identity — and so the frozen
 # city_id — still comes from the GeoNames city/admin/country columns.
 QUERY_OVERRIDES = {
     "5170691": "Sandusky, Erie County, Ohio, United States",
     "2800866": "Bruxelles-Capitale, Belgium",
+    "2618425": "Copenhagen Municipality, Denmark",
 }
 
 # Permanent slugs, frozen at registration. Order matches the manifest.
