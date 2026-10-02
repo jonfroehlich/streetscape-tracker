@@ -1,0 +1,162 @@
+geonameid,name,lat,lon,cc,admin1,pop,admin_name,km_in_disc,km_per_km2,top_creator,top_share,n_creators,foot_share,median_captured,newest_captured,catalog_city,catalog_km,inside_catalog_grid,top_creator_username
+5323525,Altadena,34.18973,-118.13118,US,CA,42777,California,322.43,25.658,107708041466249,1.0,1,0.0,2025-02-18,2025-09-24,bradbury--california--united-states,15.5,,uwrapid
+5776715,Kaysville,41.03522,-111.93855,US,UT,30472,Utah,219.22,17.445,100380679425438,1.0,1,0.002,2025-08-16,2026-03-28,ogden--utah--united-states,21.1,,flug32
+4769339,Lexington,37.78402,-79.44282,US,VA,7262,Virginia,210.93,16.785,2594900967557296,1.0,1,0.0,2026-04-08,2026-04-09,covington--virginia--united-states,47.9,,TimmonsPavement
+4778626,Petersburg,37.22793,-77.40193,US,VA,32477,Virginia,203.01,16.155,2594900967557296,0.944,2,0.0,2025-10-21,2025-11-07,richmond--virginia--united-states,34.0,,TimmonsPavement
+4880889,Waterloo,42.49276,-92.34296,US,IA,68460,Iowa,196.05,15.601,1217125923851741,0.864,2,0.001,2026-08-06,2026-09-29,fredericksburg--iowa--united-states,53.8,,FeetAndInches
+5349803,Foothill Farms,38.67877,-121.35114,US,CA,33121,California,175.6,13.974,713819173436997,1.0,1,0.0,2026-03-11,2026-03-15,sacramento--california--united-states,16.2,,marker_geo1
+4737676,Trophy Club,32.9979,-97.18362,US,TX,11759,Texas,173.59,13.814,1520840613058761,1.0,1,0.0,2026-08-25,2026-09-08,haltom-city--texas--united-states,21.2,,GIStrophyclub
+5379566,Orangevale,38.67851,-121.22578,US,CA,33960,California,170.85,13.595,713819173436997,1.0,1,0.0,2026-02-09,2026-03-04,sacramento--california--united-states,24.3,,marker_geo1
+5385941,Rancho Cordova,38.58907,-121.30273,US,CA,71017,California,168.58,13.415,713819173436997,1.0,1,0.0,2026-04-17,2026-04-24,sacramento--california--united-states,14.1,,marker_geo1
+5403191,Tracy,37.73987,-121.42618,US,CA,87075,California,167.2,13.305,713819173436997,1.0,1,0.0,2026-07-10,2026-07-13,san-jose--california--united-states,60.3,,marker_geo1
+5854718,Waipi'o Acres,21.46485,-158.01331,US,HI,5531,Hawaii,166.77,13.271,100186595565848,1.0,1,0.0,2025-09-08,2025-09-10,honolulu--hawaii--united-states,24.1,,hmhtb
+5380748,Palo Alto,37.44188,-122.14302,US,CA,66853,California,165.37,13.16,1073094253999318,0.981,2,0.0,2025-01-22,2025-10-18,monte-sereno--california--united-states,26.4,,pixelpete
+5086321,Francestown,42.98758,-71.81258,US,NH,1571,New Hampshire,158.8,12.637,1139817854492667,1.0,1,0.0,2025-08-30,2026-08-08,concord--new-hampshire--united-states,33.1,,Lanka6359
+5375480,Mountain View,37.38605,-122.08385,US,CA,80435,California,157.68,12.548,1073094253999318,0.712,3,0.0,2025-05-24,2026-03-10,monte-sereno--california--united-states,18.4,,pixelpete
+5090096,New Boston,42.97619,-71.69396,US,NH,4934,New Hampshire,152.72,12.153,1139817854492667,1.0,1,0.0,2025-09-12,2026-08-10,concord--new-hampshire--united-states,28.6,,Lanka6359
+5855070,'Ewa Gentry,21.33999,-158.03039,US,HI,22690,Hawaii,150.99,12.016,100186595565848,1.0,1,0.0,2025-09-04,2025-09-19,honolulu--hawaii--united-states,20.9,,hmhtb
+7262791,Royal Kunia,21.39392,-158.0267,US,HI,14525,Hawaii,149.37,11.886,100186595565848,1.0,1,0.0,2025-09-11,2025-09-19,honolulu--hawaii--united-states,21.6,,hmhtb
+4764826,Hopewell,37.30432,-77.2872,US,VA,22378,Virginia,146.68,11.673,2594900967557296,1.0,1,0.0,2025-12-11,2025-12-16,richmond--virginia--united-states,30.5,,TimmonsPavement
+5253352,Fond du Lac,43.775,-88.43883,US,WI,42933,Wisconsin,142.5,11.34,1766048554791666,0.998,2,0.0,2025-07-01,2026-08-07,mount-calvary--wisconsin--united-states,16.5,,FDL_Engineering
+5347287,Fair Oaks,38.64463,-121.27217,US,CA,30912,California,141.52,11.261,713819173436997,1.0,1,0.0,2026-03-06,2026-04-23,sacramento--california--united-states,18.9,,marker_geo1
+5400065,Sunnyslope,34.01196,-117.43338,US,CA,5153,California,139.79,11.124,1432009608267357,0.997,2,0.0,2026-07-15,2026-09-09,glendora--california--united-states,40.3,,inlandurbanist
+4850699,Cedar Falls,42.52776,-92.44547,US,IA,41255,Iowa,139.77,11.123,1217125923851741,0.888,2,0.003,2026-08-18,2026-08-31,ackley--iowa--united-states,49.8,,FeetAndInches
+4930183,Bedford,42.49065,-71.27617,US,MA,12502,Massachusetts,139.43,11.095,100515802193182,1.0,1,0.0,2025-10-17,2026-07-20,waltham--massachusetts--united-states,13.2,,mapillary01730
+5386834,Redwood City,37.48522,-122.23635,US,CA,85288,California,135.27,10.765,1073094253999318,0.981,2,0.0,2025-07-04,2026-05-03,monte-sereno--california--united-states,35.1,,pixelpete
+5773304,Cottonwood Heights,40.61967,-111.81021,US,UT,34343,Utah,132.78,10.566,104273298482293,0.812,4,0.0,2026-07-14,2026-07-15,kearns--utah--united-states,16.8,,rking
+5127835,Mount Vernon,40.9126,-73.83708,US,NY,68628,New York,132.1,10.512,104273298482293,1.0,1,0.0,2025-04-16,2025-04-17,city-of-rye--new-york--united-states,13.9,,rking
+5511077,Reno,39.52963,-119.8138,US,NV,264165,Nevada,129.63,10.316,713819173436997,1.0,1,0.0,2025-08-01,2025-08-08,carson-city--nevada--united-states,40.3,,marker_geo1
+7261418,Heber-Overgaard,34.41414,-110.56956,US,AZ,2822,Arizona,129.42,10.299,100515802193182,1.0,1,0.0,2025-07-30,2026-04-26,show-low--arizona--united-states,52.6,,mapillary01730
+5563397,Eureka,40.80207,-124.16367,US,CA,27017,California,125.64,9.998,713819173436997,1.0,1,0.0,2026-05-26,2026-05-30,talent--oregon--united-states,197.0,,marker_geo1
+5089746,Mont Vernon,42.89453,-71.67424,US,NH,2166,New Hampshire,124.63,9.918,1139817854492667,1.0,1,0.0,2025-09-04,2026-08-10,fitchburg--massachusetts--united-states,36.0,,Lanka6359
+4838633,Middletown,41.56232,-72.65065,US,CT,46756,Connecticut,122.47,9.746,102956495281411,0.962,2,0.0,2025-01-02,2026-05-07,meriden--connecticut--united-states,13.3,,ctroadway360
+4452808,Apex,35.73265,-78.85029,US,NC,45585,North Carolina,116.85,9.298,697526486672885,1.0,1,0.0,2025-09-29,2025-10-17,morrisville--north-carolina--united-states,10.4,,connormckinnis
+4760232,Front Royal,38.91817,-78.19444,US,VA,15070,Virginia,114.96,9.148,2594900967557296,0.951,2,0.0,2026-08-15,2026-08-15,boyce--virginia--united-states,22.7,,TimmonsPavement
+7262761,Makakilo,21.35237,-158.08655,US,HI,18248,Hawaii,114.77,9.133,100186595565848,1.0,1,0.0,2025-09-04,2025-09-20,honolulu--hawaii--united-states,26.8,,hmhtb
+5350159,Foster City,37.55855,-122.27108,US,CA,33477,California,114.75,9.131,1073094253999318,1.0,1,0.0,2025-11-10,2026-01-12,san-francisco--california--united-states,27.4,,pixelpete
+4106458,Conway,35.0887,-92.4421,US,AR,64980,Arkansas,112.48,8.951,1587142233032939,1.0,1,0.0,2026-08-10,2026-09-26,menifee--arkansas--united-states,12.0,,noahheffron
+5597955,Kuna,43.49183,-116.42012,US,ID,17226,Idaho,109.41,8.706,713819173436997,1.0,1,0.0,2026-07-27,2026-07-30,meridian--idaho--united-states,13.2,,marker_geo1
+4902754,Morton,40.61282,-89.45926,US,IL,16306,Illinois,108.86,8.663,104273298482293,1.0,1,0.0,2025-07-23,2025-07-23,bay-view-gardens--illinois--united-states,22.7,,rking
+5777332,Lindon,40.34329,-111.72076,US,UT,10810,Utah,108.52,8.636,104273298482293,0.827,2,0.0,2025-09-23,2026-09-13,saratoga-springs--utah--united-states,16.6,,rking
+4237767,Eldorado,37.81366,-88.4381,US,IL,4064,Illinois,108.21,8.611,102816358629821,1.0,1,0.686,2026-04-05,2026-09-30,henderson--kentucky--united-states,74.9,,Dale_Hat
+5703670,Elko,40.83242,-115.76312,US,NV,20279,Nevada,108.16,8.607,104273298482293,1.0,1,0.0,2026-03-17,2026-03-19,hollister--idaho--united-states,195.5,,rking
+5410430,Woodland,38.67852,-121.7733,US,CA,58567,California,103.91,8.269,713819173436997,1.0,1,0.0,2025-10-22,2025-10-24,sacramento--california--united-states,30.1,,marker_geo1
+4385835,Eureka,38.50255,-90.6279,US,MO,10602,Missouri,101.94,8.112,104273298482293,0.964,2,0.0,2025-10-01,2026-06-22,crestwood--missouri--united-states,22.1,,rking
+7176039,Vineyard,38.46449,-121.34692,US,CA,24836,California,100.78,8.02,713819173436997,1.0,1,0.0,2026-01-23,2026-01-25,sacramento--california--united-states,14.7,,marker_geo1
+5582392,Sterling,40.62554,-103.20771,US,CO,14104,Colorado,100.35,7.986,104273298482293,1.0,1,0.0,2025-03-18,2025-03-19,iliff--colorado--united-states,18.8,,rking
+4933743,Concord,42.46037,-71.34895,US,MA,16810,Massachusetts,96.05,7.643,100515802193182,0.789,3,0.141,2025-10-18,2026-09-15,waltham--massachusetts--united-states,13.2,,mapillary01730
+5387687,Rio Linda,38.69101,-121.44857,US,CA,15106,California,95.32,7.585,713819173436997,1.0,1,0.0,2026-02-10,2026-02-26,sacramento--california--united-states,14.4,,marker_geo1
+5082636,Amherst,42.86147,-71.62535,US,NH,613,New Hampshire,94.19,7.495,1139817854492667,1.0,1,0.0,2025-09-04,2026-08-01,fitchburg--massachusetts--united-states,34.0,,Lanka6359
+5387854,Riverdale,36.43106,-119.85958,US,CA,3153,California,93.4,7.433,713819173436997,1.0,1,0.0,2025-05-30,2025-06-01,hanford--california--united-states,22.3,,marker_geo1
+5382146,Perris,33.78252,-117.22865,US,CA,74971,California,92.49,7.36,104273298482293,1.0,1,0.0,2025-03-12,2025-03-13,glendora--california--united-states,69.3,,rking
+5213681,State College,40.79339,-77.86,US,PA,42161,Pennsylvania,92.48,7.359,397575076604285,1.0,1,0.0,2025-03-30,2026-08-05,thompsontown--pennsylvania--united-states,58.4,,mcox16801
+4206502,Locust Grove,33.34595,-84.10908,US,GA,5790,Georgia,90.7,7.218,1254163303570318,1.0,1,0.0,2026-07-21,2026-08-05,williamson--georgia--united-states,29.7,,CM-FDC
+5338783,Colton,34.0739,-117.31365,US,CA,54621,California,89.85,7.15,1432009608267357,1.0,1,0.0,2026-08-04,2026-09-18,glendora--california--united-states,49.2,,inlandurbanist
+5388319,Rocklin,38.79073,-121.23578,US,CA,61213,California,89.38,7.113,713819173436997,1.0,1,0.0,2026-01-09,2026-01-11,sacramento--california--united-states,32.1,,marker_geo1
+5779548,Payson,40.0444,-111.73215,US,UT,19548,Utah,89.2,7.098,104273298482293,1.0,1,0.0,2025-06-19,2025-06-19,saratoga-springs--utah--united-states,36.3,,rking
+5512862,Sparks,39.53491,-119.75269,US,NV,96094,Nevada,88.91,7.075,713819173436997,1.0,1,0.0,2025-08-03,2025-08-12,carson-city--nevada--united-states,40.9,,marker_geo1
+5778352,Millcreek,40.68689,-111.87549,US,UT,62139,Utah,88.55,7.046,104273298482293,0.907,4,0.0,2025-08-05,2026-06-07,salt-lake-city--utah--united-states,10.7,,rking
+5118693,Glens Falls,43.30952,-73.64401,US,NY,14291,New York,88.39,7.034,108818314681901,0.992,2,0.0,2025-11-11,2026-08-05,town-of-lake-george--new-york--united-states,14.1,,giblet
+4636442,Lewisburg,35.44924,-86.78889,US,TN,11480,Tennessee,87.89,6.994,104273298482293,1.0,1,0.0,2026-08-12,2026-08-13,petersburg--tennessee--united-states,19.9,,rking
+5368233,Loomis,38.82129,-121.193,US,CA,6836,California,87.13,6.934,713819173436997,1.0,1,0.0,2025-08-14,2026-01-11,sacramento--california--united-states,37.1,,marker_geo1
+5367314,Live Oak,36.98356,-121.98052,US,CA,17158,California,85.57,6.809,713819173436997,1.0,1,0.0,2025-05-11,2025-05-23,monte-sereno--california--united-states,28.5,,marker_geo1
+13117920,Kalaheo Hillside,21.4162,-157.75255,US,HI,3256,Hawaii,85.52,6.805,100186595565848,1.0,1,0.0,2025-09-15,2025-09-18,honolulu--hawaii--united-states,12.3,,hmhtb
+5558953,Arcata,40.86652,-124.08284,US,CA,17843,California,84.4,6.716,713819173436997,1.0,1,0.0,2026-05-28,2026-05-30,talent--oregon--united-states,187.3,,marker_geo1
+4710963,Mexia,31.67989,-96.4822,US,TX,7406,Texas,82.77,6.587,1178503163952549,1.0,1,0.0,2026-07-24,2026-07-24,hubbard--texas--united-states,35.7,,MEW-Utilities
+4855806,Evansdale,42.46915,-92.28102,US,IA,4812,Iowa,82.48,6.564,1217125923851741,0.942,2,0.0,2026-08-27,2026-08-28,fredericksburg--iowa--united-states,55.6,,FeetAndInches
+5583997,Ammon,43.46964,-111.96664,US,ID,14960,Idaho,81.77,6.507,104273298482293,1.0,1,0.0,2026-05-13,2026-05-14,shelley--idaho--united-states,16.4,,rking
+4130430,Searcy,35.25064,-91.73625,US,AR,24196,Arkansas,79.54,6.33,104273298482293,1.0,1,0.0,2025-05-06,2025-05-07,mount-vernon--arkansas--united-states,35.3,,rking
+5567770,McKinleyville,40.94652,-124.10062,US,CA,15177,California,78.76,6.268,713819173436997,1.0,1,0.0,2026-05-29,2026-05-30,talent--oregon--united-states,181.0,,marker_geo1
+5854189,Waianae,21.43785,-158.18555,US,HI,13177,Hawaii,78.67,6.26,100186595565848,1.0,1,0.0,2025-09-11,2025-09-12,honolulu--hawaii--united-states,38.8,,hmhtb
+4556165,Yukon,35.50672,-97.76254,US,OK,25892,Oklahoma,77.7,6.183,104273298482293,0.955,2,0.0,2025-09-10,2026-06-17,warr-acres--oklahoma--united-states,13.1,,rking
+5324400,Aptos,36.97717,-121.8994,US,CA,6220,California,76.61,6.097,713819173436997,1.0,1,0.0,2025-05-21,2025-05-22,monte-sereno--california--united-states,30.2,,marker_geo1
+5290663,Coolidge,32.97784,-111.51762,US,AZ,12297,Arizona,76.38,6.078,104273298482293,1.0,1,0.0,2025-08-26,2025-08-28,casa-grande--arizona--united-states,26.0,,rking
+5366375,Lincoln,38.89156,-121.29301,US,CA,49757,California,75.48,6.007,4367263200177747,0.982,2,0.002,2026-06-17,2026-09-24,sacramento--california--united-states,39.5,,CycleMaster
+4932328,Carlisle,42.52926,-71.3495,US,MA,4799,Massachusetts,75.41,6.001,100515802193182,1.0,1,0.0,2025-10-10,2026-09-22,waltham--massachusetts--united-states,19.5,,mapillary01730
+5793832,Ephrata,47.31764,-119.55365,US,WA,8047,Washington,74.44,5.923,104273298482293,1.0,1,0.0,2025-03-18,2025-03-18,coulee-city--washington--united-states,38.5,,rking
+5778601,Mount Olympus,40.6855,-111.78854,US,UT,6748,Utah,73.92,5.883,104273298482293,0.9,2,0.0,2025-08-07,2025-09-27,salt-lake-city--utah--united-states,15.1,,rking
+5856516,'Ahuimanu,21.44472,-157.83778,US,HI,8810,Hawaii,73.82,5.875,100186595565848,1.0,1,0.0,2025-09-12,2025-09-12,honolulu--hawaii--united-states,12.6,,hmhtb
+4893392,Galesburg,40.94782,-90.37124,US,IL,31273,Illinois,71.7,5.706,109472691287712,1.0,1,0.0,2025-05-07,2026-05-11,bay-view-gardens--illinois--united-states,72.6,,galesburggis
+5329408,Bloomington,34.07029,-117.39588,US,CA,23851,California,71.5,5.69,1432009608267357,1.0,1,0.0,2026-08-15,2026-09-24,glendora--california--united-states,41.9,,inlandurbanist
+5205849,Phoenixville,40.13038,-75.51491,US,PA,16658,Pennsylvania,70.93,5.645,882263693611401,1.0,1,0.0,2025-03-12,2025-03-12,red-hill--pennsylvania--united-states,27.7,,DTadd24-Hopeworks
+7315230,Horizon West,28.43383,-81.6227,US,FL,14000,Florida,69.64,5.542,104273298482293,1.0,1,0.0,2025-01-09,2025-01-23,orlando--florida--united-states,30.6,,rking
+5978126,Hudson,45.45008,-74.14922,CA,10,5088,Quebec,68.81,5.475,103793315269003,1.0,1,0.0,2025-11-25,2025-11-27,montreal--quebec--canada,45.6,,zombiegraph
+5563839,Fortuna,40.59819,-124.15728,US,CA,12000,California,68.03,5.414,713819173436997,1.0,1,0.0,2026-05-10,2026-05-15,talent--oregon--united-states,215.6,,marker_geo1
+5247214,Burlington,42.67807,-88.2762,US,WI,10650,Wisconsin,67.99,5.41,104273298482293,1.0,1,0.0,2026-03-19,2026-03-20,big-bend--wisconsin--united-states,24.8,,rking
+5385793,Ramona,33.04171,-116.86808,US,CA,20292,California,67.81,5.397,713819173436997,1.0,1,0.0,2025-01-03,2025-01-03,santee--california--united-states,23.2,,marker_geo1
+5026416,Fergus Falls,46.28302,-96.07756,US,MN,13281,Minnesota,67.6,5.379,1361362982257515,1.0,1,0.116,2026-04-07,2026-04-09,elizabeth--minnesota--united-states,11.5,,GIS_ISG
+4481150,Moyock,36.5246,-76.17827,US,NC,3759,North Carolina,66.97,5.33,104214208486349,1.0,1,0.0,2025-05-18,2025-10-11,elizabeth-city--north-carolina--united-states,25.1,,vorpalblade
+5851889,Pacific Palisades,21.42562,-157.95349,US,HI,6997,Hawaii,64.97,5.17,100186595565848,1.0,1,0.0,2025-08-26,2025-08-27,honolulu--hawaii--united-states,16.6,,hmhtb
+5330427,Boyes Hot Springs,38.3138,-122.48193,US,CA,6656,California,64.74,5.152,713819173436997,1.0,1,0.0,2025-09-04,2025-09-04,napa--california--united-states,15.6,,marker_geo1
+5325187,Atwater,37.34772,-120.60908,US,CA,29237,California,63.88,5.083,102105792034485,1.0,1,0.0,2026-09-18,2026-09-30,fresno--california--united-states,95.7,,technodino
+4612862,Chattanooga,35.04563,-85.30968,US,TN,181099,Tennessee,63.55,5.057,2341374186295825,1.0,1,0.0,2026-07-24,2026-09-14,signal-mountain--tennessee--united-states,11.5,,jarielj
+4270269,De Soto,38.97917,-94.96858,US,KS,6074,Kansas,62.77,4.995,104273298482293,1.0,1,0.0,2026-03-31,2026-03-31,bonner-springs--kansas--united-states,13.3,,rking
+5082292,Wymore,40.12222,-96.66252,US,NE,1414,Nebraska,62.17,4.947,1413045892697651,1.0,1,0.0,2025-01-03,2025-01-03,liberty--nebraska--united-states,15.9,,1335
+4839822,Norwalk,41.1176,-73.4079,US,CT,88485,Connecticut,62.1,4.942,102956495281411,0.939,2,0.0,2025-04-03,2026-09-21,stamford--connecticut--united-states,14.1,,ctroadway360
+5594956,Hailey,43.51963,-114.31532,US,ID,8134,Idaho,62.07,4.94,104273298482293,1.0,1,0.0,2025-05-13,2025-05-14,castleford--idaho--united-states,120.0,,rking
+5004188,Oak Park,42.45948,-83.18271,US,MI,29752,Michigan,61.64,4.905,104740425095586,1.0,1,0.0,2026-02-16,2026-08-31,hamtramck--michigan--united-states,12.5,,codgis
+5088262,Keene,42.93369,-72.27814,US,NH,23265,New Hampshire,61.5,4.894,104774341764404,0.969,2,0.044,2025-07-16,2026-02-17,newfane--vermont--united-states,34.9,,henryu
+5851349,Nanakuli,21.39362,-158.15429,US,HI,12666,Hawaii,61.04,4.857,100186595565848,1.0,1,0.0,2025-09-12,2025-09-12,honolulu--hawaii--united-states,34.4,,hmhtb
+4782691,Rocky Mount,36.99764,-79.89198,US,VA,4799,Virginia,60.01,4.776,104273298482293,1.0,1,0.0,2025-07-23,2025-07-24,roanoke--virginia--united-states,31.4,,rking
+5008278,Saint Johns,43.00114,-84.55915,US,MI,7865,Michigan,59.76,4.756,107426641493478,1.0,1,0.0,2026-06-28,2026-06-29,laingsburg--michigan--united-states,21.0,,treestryder
+5277142,Verona,42.99083,-89.53318,US,WI,12540,Wisconsin,58.86,4.684,101433775432524,0.731,2,0.0,2025-11-14,2026-08-02,madison--wisconsin--united-states,15.0,,vgxhc
+5571188,Shelter Cove,40.03042,-124.07309,US,CA,693,California,56.49,4.495,713819173436997,1.0,1,0.0,2026-05-01,2026-05-31,healdsburg--california--united-states,188.7,,marker_geo1
+5218853,West Pittston,41.32758,-75.79297,US,PA,4772,Pennsylvania,55.63,4.427,104273298482293,1.0,1,0.0,2026-04-08,2026-04-08,vandling--pennsylvania--united-states,43.3,,rking
+4350049,California,38.3004,-76.50745,US,MD,11857,Maryland,55.11,4.386,840811535511279,0.827,2,0.0,2026-04-14,2026-04-21,church-creek--maryland--united-states,38.2,,stmaryscounty1
+5093821,Troy,42.82397,-72.18119,US,NH,1221,New Hampshire,54.74,4.356,104774341764404,1.0,1,0.0,2025-06-21,2025-07-18,fitchburg--massachusetts--united-states,40.6,,henryu
+5019588,Buffalo,45.17191,-93.87469,US,MN,16026,Minnesota,54.59,4.344,4145640949091364,1.0,1,0.0,2026-05-11,2026-05-25,new-hope--minnesota--united-states,41.3,,ablevi202
+6155721,St. Catharines,43.17126,-79.24267,CA,08,136803,Ontario,54.5,4.337,1459245085093841,1.0,1,0.0,2025-07-22,2025-07-29,city-of-niagara-falls--new-york--united-states,20.6,,dfoden
+5284202,Clinton,41.27871,-72.52759,US,CT,3368,Connecticut,54.32,4.323,104273298482293,0.683,2,0.0,2025-07-16,2026-02-02,fenwick--connecticut--united-states,14.5,,rking
+4839704,North Haven,41.39093,-72.85954,US,CT,24093,Connecticut,53.6,4.265,102956495281411,0.896,3,0.0,2025-08-20,2026-08-26,new-haven--connecticut--united-states,10.7,,ctroadway360
+4373426,White Marsh,39.38372,-76.43218,US,MD,9513,Maryland,53.04,4.221,1532803437981226,0.929,2,0.0,2026-09-24,2026-09-29,port-deposit--maryland--united-states,37.7,,Rossitransportationgroup
+5854857,Whitmore Village,21.51429,-158.02464,US,HI,4499,Hawaii,51.95,4.134,100186595565848,1.0,1,0.0,2025-09-07,2025-09-20,honolulu--hawaii--united-states,28.7,,hmhtb
+5323401,Alpine,32.83505,-116.76641,US,CA,14236,California,51.56,4.103,713819173436997,1.0,1,0.0,2025-01-24,2025-01-24,santee--california--united-states,20.9,,marker_geo1
+5250402,Delavan Lake,42.58418,-88.6326,US,WI,2649,Wisconsin,51.27,4.08,1006984308465014,1.0,1,0.0,2026-08-17,2026-08-17,clinton--wisconsin--united-states,19.1,,UAS_ISG
+5574093,Yreka,41.73542,-122.63447,US,CA,7597,California,51.19,4.074,713819173436997,0.956,2,0.0,2025-08-12,2025-11-24,talent--oregon--united-states,57.2,,marker_geo1
+5284283,Colchester,41.57565,-72.33203,US,CT,4781,Connecticut,50.81,4.044,102956495281411,1.0,1,0.0,2025-12-09,2026-02-04,norwich--connecticut--united-states,20.3,,ctroadway360
+5377266,North Auburn,38.93129,-121.08189,US,CA,13022,California,50.3,4.003,713819173436997,1.0,1,0.0,2025-07-21,2025-07-28,sacramento--california--united-states,52.7,,marker_geo1
+4157092,Gotha,28.52778,-81.52313,US,FL,1915,Florida,50.22,3.996,104273298482293,1.0,1,0.0,2025-01-15,2025-01-16,orlando--florida--united-states,19.8,,rking
+4945055,Needham,42.28343,-71.23283,US,MA,28886,Massachusetts,49.74,3.958,1139817854492667,0.891,3,0.0,2025-11-04,2026-07-20,waltham--massachusetts--united-states,10.2,,Lanka6359
+4462759,Currituck,36.44988,-76.01548,US,NC,0,North Carolina,49.52,3.941,104214208486349,1.0,1,0.0,2025-05-18,2025-05-18,elizabeth-city--north-carolina--united-states,24.7,,vorpalblade
+5249259,Como,42.61224,-88.48232,US,WI,2631,Wisconsin,49.51,3.94,1361362982257515,0.829,2,0.0,2025-12-02,2026-07-06,clinton--wisconsin--united-states,31.8,,GIS_ISG
+5334320,Carmel-by-the-Sea,36.55524,-121.92329,US,CA,3897,California,49.01,3.9,1073094253999318,1.0,1,0.0,2026-03-10,2026-03-13,monte-sereno--california--united-states,76.3,,pixelpete
+4926613,South Haven,41.54198,-87.13726,US,IN,5282,Indiana,48.62,3.869,1243749034432301,1.0,1,0.0,2025-10-21,2025-10-21,gary--indiana--united-states,16.6,,ZachJ_POCO
+4367417,Rossmoor,39.10372,-77.07109,US,MD,8453,Maryland,48.58,3.866,1532803437981226,0.783,3,0.0,2026-07-13,2026-07-27,laytonsville--maryland--united-states,13.2,,Rossitransportationgroup
+5328724,Biola,36.80217,-120.01627,US,CA,1623,California,48.38,3.85,713819173436997,1.0,1,0.0,2025-06-10,2025-06-10,fresno--california--united-states,20.0,,marker_geo1
+4922501,Lake Dalecarlia,41.33087,-87.39476,US,IN,1355,Indiana,48.28,3.842,577870925372666,1.0,1,0.0,2026-08-10,2026-08-26,schererville--indiana--united-states,17.2,,tnugent
+7728581,Shorewood Forest,41.46315,-87.14472,US,IN,2708,Indiana,48.04,3.823,1243749034432301,1.0,1,0.0,2025-11-03,2025-11-03,gary--indiana--united-states,20.5,,ZachJ_POCO
+4930577,Billerica,42.55843,-71.26895,US,MA,39904,Massachusetts,47.92,3.813,100515802193182,0.99,2,0.0,2025-10-01,2025-11-09,waltham--massachusetts--united-states,20.5,,mapillary01730
+5410125,Winters,38.52491,-121.9708,US,CA,7034,California,47.65,3.792,104273298482293,1.0,1,0.0,2026-02-03,2026-02-03,napa--california--united-states,39.3,,rking
+5375938,Muscoy,34.15418,-117.34421,US,CA,10644,California,47.31,3.765,1432009608267357,0.916,2,0.0,2026-08-30,2026-09-23,glendora--california--united-states,45.8,,inlandurbanist
+4167533,Palm Beach Shores,26.77812,-80.0356,US,FL,1208,Florida,46.4,3.693,644361521792978,1.0,1,0.0,2025-10-14,2025-10-15,west-palm-beach--florida--united-states,10.1,,eyoung_wsb
+6077251,Montreal-Est,45.63202,-73.5075,CA,10,3850,Quebec,46.3,3.684,401411729320080,0.784,2,0.0,2025-07-04,2026-08-09,montreal--quebec--canada,15.1,,VdM
+4177617,Wedgefield,28.48778,-81.07729,US,FL,6705,Florida,46.27,3.682,104273298482293,1.0,1,0.0,2025-01-07,2025-01-07,orlando--florida--united-states,24.0,,rking
+5356864,Highgrove,34.01585,-117.33338,US,CA,3988,California,45.42,3.615,1432009608267357,1.0,1,0.0,2026-07-31,2026-09-18,glendora--california--united-states,48.9,,inlandurbanist
+5414264,Blende,38.24584,-104.56858,US,CO,878,Colorado,44.66,3.554,713819173436997,1.0,1,0.0,2025-07-05,2025-07-06,colorado-springs--colorado--united-states,71.9,,marker_geo1
+5854171,Waialua,21.57688,-158.13154,US,HI,3860,Hawaii,44.25,3.521,100186595565848,1.0,1,0.0,2025-06-25,2025-06-25,honolulu--hawaii--united-states,41.5,,hmhtb
+4504476,Toms River,39.95373,-74.19792,US,NJ,88791,New Jersey,44.03,3.504,106180081621374,0.933,2,0.0,2025-11-18,2026-08-29,interlaken--new-jersey--united-states,34.7,,DrivingRoundTown
+5306523,New River,33.91587,-112.13599,US,AZ,14952,Arizona,43.15,3.434,100515802193182,1.0,1,0.0,2026-01-04,2026-01-20,carefree--arizona--united-states,22.6,,mapillary01730
+5364192,Ladera,37.39994,-122.1983,US,CA,1426,California,42.37,3.372,1073094253999318,1.0,1,0.0,2025-04-30,2025-08-14,monte-sereno--california--united-states,25.8,,pixelpete
+5127315,Monsey,41.11121,-74.06848,US,NY,18412,New York,42.29,3.365,1536223904740965,1.0,1,0.0,2026-07-16,2026-08-12,waldwick--new-jersey--united-states,11.9,,ramapogis
+4353084,Derwood,39.11733,-77.16109,US,MD,2381,Maryland,42.23,3.36,100679358847088,0.632,2,0.0,2026-06-13,2026-07-27,laytonsville--maryland--united-states,10.3,,GEdwardJohnson
+5784731,White City,40.56578,-111.86438,US,UT,5407,Utah,41.92,3.336,3562572504050839,1.0,1,0.051,2025-06-09,2025-10-03,kearns--utah--united-states,15.3,,jburtonmsd
+5771826,Bountiful,40.88939,-111.88077,US,UT,43784,Utah,41.32,3.288,1351157065439574,0.69,2,0.0,2025-09-28,2025-12-27,salt-lake-city--utah--united-states,13.0,,dknelson9876
+4845926,Windsor Locks,41.92926,-72.62731,US,CT,12498,Connecticut,41.05,3.267,102956495281411,1.0,1,0.0,2025-03-24,2026-03-31,hartford--connecticut--united-states,19.1,,ctroadway360
+5345171,Easton,36.65023,-119.7907,US,CA,2083,California,40.92,3.256,713819173436997,0.966,2,0.0,2025-06-03,2025-06-05,fresno--california--united-states,15.0,,marker_geo1
+4931737,Burlington,42.50482,-71.19561,US,MA,24498,Massachusetts,40.86,3.252,100515802193182,1.0,1,0.0,2025-10-23,2025-11-11,malden--massachusetts--united-states,13.6,,mapillary01730
+5100381,Leisure Knoll,40.01901,-74.29209,US,NJ,2490,New Jersey,40.78,3.245,106180081621374,1.0,1,0.0,2026-03-06,2026-08-08,interlaken--new-jersey--united-states,33.5,,DrivingRoundTown
+5356868,Highland,34.12834,-117.20865,US,CA,54854,California,40.64,3.234,1432009608267357,1.0,1,0.0,2026-08-24,2026-09-05,glendora--california--united-states,58.3,,inlandurbanist
+5086911,Greenfield,42.95064,-71.8723,US,NH,1765,New Hampshire,40.62,3.232,1139817854492667,1.0,1,0.0,2025-09-04,2026-07-06,concord--new-hampshire--united-states,39.4,,Lanka6359
+5094329,Weare,43.0948,-71.73063,US,NH,8583,New Hampshire,40.56,3.227,1139817854492667,1.0,1,0.0,2026-01-02,2026-08-09,concord--new-hampshire--united-states,20.0,,Lanka6359
+4335096,New Roads,30.70157,-91.43622,US,LA,4697,Louisiana,40.28,3.206,104273298482293,1.0,1,0.0,2025-02-25,2025-02-26,krotz-springs--louisiana--united-states,35.4,,rking
+4148012,Bithlo,28.55472,-81.10645,US,FL,8268,Florida,40.08,3.19,104273298482293,1.0,1,0.0,2025-01-11,2025-01-11,orlando--florida--united-states,21.6,,rking
+5380883,Palos Verdes Estates,33.80105,-118.39245,US,CA,13682,California,39.99,3.182,100438652206281,1.0,1,0.0,2025-01-15,2025-01-15,paramount--california--united-states,23.2,,GoProMAX3M
+4350831,Cedonia,39.33221,-76.53206,US,MD,3168,Maryland,39.83,3.17,1532803437981226,1.0,1,0.0,2026-09-24,2026-09-29,annapolis--maryland--united-states,39.5,,Rossitransportationgroup
+5364937,Lanare,36.43051,-119.93097,US,CA,589,California,38.97,3.101,713819173436997,1.0,1,0.0,2025-05-30,2025-06-01,hanford--california--united-states,27.9,,marker_geo1
+4881096,Webster City,42.46942,-93.81605,US,IA,7814,Iowa,38.97,3.101,108891598508567,1.0,1,0.0,2026-09-04,2026-09-29,dows--iowa--united-states,33.3,,Hopen111
+5027943,Gilbert,47.48882,-92.46491,US,MN,1792,Minnesota,38.97,3.101,1259166012234566,1.0,1,0.0,2025-06-26,2026-04-26,grand-rapids--minnesota--united-states,85.0,,RS-EH-MAPR-1
+5347903,Felton,37.05134,-122.0733,US,CA,4057,California,38.68,3.078,713819173436997,1.0,1,0.0,2025-05-10,2025-05-22,monte-sereno--california--united-states,22.3,,marker_geo1
+5091002,Peterborough,42.87064,-71.95175,US,NH,3103,New Hampshire,38.34,3.051,1139817854492667,0.865,2,0.0,2026-06-30,2026-07-06,fitchburg--massachusetts--united-states,33.9,,Lanka6359
+5048496,Stacy,45.39802,-92.98744,US,MN,1470,Minnesota,38.32,3.049,645084397752674,1.0,1,0.0,2025-04-19,2026-07-05,lexington--minnesota--united-states,32.2,,quickness805
+5782320,Sunset,41.13633,-112.03105,US,UT,5183,Utah,38.21,3.04,104273298482293,0.744,2,0.0,2025-07-30,2025-11-01,ogden--utah--united-states,10.7,,rking
+5848280,Kapa'a,22.07521,-159.31895,US,HI,10699,Hawaii,37.87,3.014,24387967214162256,1.0,1,0.0,2025-08-06,2025-08-08,honolulu--hawaii--united-states,174.7,,KauaiGIS

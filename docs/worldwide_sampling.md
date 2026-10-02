@@ -186,6 +186,9 @@ The frame is a *stratified sample*, so it deliberately does not contain every ci
 Cities added for a specific reason live in their own manifest in the same format, registered by the same script — never appended to `worldwide_frame.csv`, which is the deterministic output of `build_worldwide_frame.py` and must keep tracing to it.
 
 - `mapillary_360_cities.csv` (2026-08-31, 14 cities) — cities with a documented city-scale Mapillary 360° capture program that the catalog did not already track: BikeOttawa, Kaart in Melbourne, the Lithuanian Road Administration (Vilnius), Ramani Huria (Dar es Salaam), Mapillary's own showcase municipalities (Clovis NM, Johns Creek GA, and Sandusky as the seat of Erie County OH), Mapillary's home city (Malmo), and the CompleteTheMap Europe target cities Prague, Copenhagen, Munich, Milan, Barcelona and Brussels.
+- `mapillary_discovery_cities.csv` (2026-10-02, 25 cities) — the first tranche of the Mapillary discovery screen (#383, `docs/experiments/mapillary-discovery-screen.md`): uncatalogued North American towns with dense, recent, single-uploader 360° sequence coverage.
+  Unlike `mapillary_360_cities.csv` it HAS a generator, `scripts/mapillary_discovery_analyze.py`, which is its provenance; it carries one geocode-query override (Fond du Lac, whose plain query matched the county) and drops apostrophes from names (`Waipi'o Acres` -> `Waipio Acres`).
+  Registered with `--overlap-km 5 --notes-label "mapillary discovery screen 2026-10-02"`.
 
 Two things differ from a frame registration:
 
